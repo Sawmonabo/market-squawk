@@ -16,6 +16,8 @@ from typing import Any
 ALLOWED_DUPLICATES: dict[str, tuple[str, ...]] = {
     "getrandom": ("0.2.17", "0.3.4", "0.4.3"),
     "hashbrown": ("0.12.3", "0.17.1"),
+    # rust-bitcoin 0.32 uses the current crate; secp256k1 retains the 0.2 wire helper.
+    "hex-conservative": ("0.2.2", "1.2.0"),
     "r-efi": ("5.3.0", "6.0.0"),
     "rand": ("0.8.7", "0.9.5"),
     "rand_chacha": ("0.3.1", "0.9.0"),
