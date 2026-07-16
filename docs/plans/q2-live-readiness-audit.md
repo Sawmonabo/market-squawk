@@ -1,9 +1,17 @@
 # Q2 live-runtime readiness audit
 
+> **Resolution update (2026-07-16):** The Task 5-7 prerequisites identified by this frozen
+> preflight are implemented, and Task 8 production/test lanes are complete through `c1faab0`.
+> The exact focused live/application fmt, strict Clippy, test, release-build, and diff gate passes.
+> See the [Task 8 implementation report](../reports/q2-task8-implementation.md). The findings below
+> remain the historical contract rationale; statements that Task 8 is blocked or unimplemented are
+> superseded. The grouped Quarter 2 review is still pending and no checkpoint approval is implied.
+
 **Audit date:** 2026-07-16  
 **Frozen root reviewed:** `4c8d72cbf01179e568b2d2dff4b71aab5ad06ffb`
-**Disposition:** Task 7 is implementation-ready after the Task 5 P0 contracts below are closed;
-Task 8 remains blocked on Task 7's lease and capability linearization contracts.
+**Original disposition (superseded by the resolution update above):** Task 7 was implementation-
+ready after the Task 5 P0 contracts below closed; Task 8 was blocked on Task 7's lease and
+capability linearization contracts at the frozen audit baseline.
 
 This preflight reviewed the Task 5/6 work in progress, the controlling Stage 1 plan, the domain
 identity and live-evidence APIs, and the locally resolved Tokio 1.52.3, ArcSwap 1.9.2, and UUID

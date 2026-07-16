@@ -21,11 +21,21 @@ Stage 0: complete (commit 66d30fe, planning/research controls committed; baselin
 
 ## Quarter 2: Tasks 5-8
 
-- Task 5: pending
-- Task 6: pending
-- Task 7: pending
-- Task 8: pending
-- Quarter 2 review: pending
+- Task 5: implementation complete through source/capture/current-batch integration commits
+  `8edfe41`, `921f56f`, `d75176a`, and `3bdca01`; evidence in
+  `.superpowers/sdd/q2-task5-sources-report.md` plus the compact-policy and routing-evidence
+  follow-ups.
+- Task 6: implementation complete through platform/capture commits `e3d1bd8`, `ad64388`, and
+  `349aa08`; evidence in `.superpowers/sdd/q2-task6-platform-report.md` and
+  `.superpowers/sdd/q2-capture-bridge-report.md`.
+- Task 7: implementation complete at `247044e`; evidence in
+  `.superpowers/sdd/q2-task7-live-report.md`.
+- Task 8: implementation and deterministic test lanes complete at `c1faab0`; production/runtime
+  behavior and the exact combined gate are recorded in
+  `docs/reports/q2-task8-implementation.md`. Final documentation commit and root integration may
+  advance the checkpoint head without changing the tested production behavior.
+- Quarter 2 review: pending at the exact integrated Tasks 5-8 head. No approval is implied by lane
+  completion or focused green gates.
 
 ## Quarter 3: Tasks 9-12
 
@@ -60,3 +70,12 @@ Stage 0: complete (commit 66d30fe, planning/research controls committed; baselin
   evidence, bounded registry wire/reconstruction, transactional retry coalescing, logarithmic
   canonical-prefix retry lookup, pre-allocation growth rejection, source-authority wording, and
   directional supersession of stale audit reports. Approval applies only to exact commit `08d2ab2`.
+- Quarter 2 Task 8 focused gate at `c1faab0`: formatting; strict locked all-target/all-feature
+  Clippy for `market-squawk-live` and `market-squawk`; all-feature tests for both packages; release
+  builds for both packages; and diff-check all exited zero against the regenerated integrated lock.
+  The live library has 74 passing unit tests plus integration/property/compile-fail suites, and the
+  application has 5 focused diagnostic/runtime-composition tests. No performance claim is made.
+- Quarter 2 grouped review must inspect exact-generation invalidation ordering, actor terminal
+  invalidation order, reader permits charged per retained shard generation, clean replacement,
+  application diagnostic quarantine/deletion trigger, and the absence of prohibited evasion
+  surfaces. Review remains pending.

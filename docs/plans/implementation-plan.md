@@ -112,6 +112,39 @@ Each task in a stage plan ends in a focused commit after its tests pass. Before 
 Each stage ends with a separate release-gate commit that updates documentation and verification
 evidence. No stage is marked complete from a partial test run.
 
+## Q2 Tasks 1-8 implementation progress
+
+The live foundation through Task 8 is implemented in the isolated integration lane and documented
+in the [Q2 Task 8 implementation report](../reports/q2-task8-implementation.md). The exact Task 8
+crate gate passes formatting, strict all-target/all-feature Clippy, all-feature tests, and diff
+checks. Q2 is **not** marked complete here: the root owner must integrate the one authoritative
+`Cargo.lock`, run the full workspace/release gate, and complete the grouped Tasks 5-8 review at the
+exact integrated head.
+
+Working Task 8 deliverables are:
+
+- [x] frozen routing V1 byte contract, full hash vectors, and deterministic shard indices;
+- [x] checked runtime/route/snapshot configuration and conservative peak-memory ceiling;
+- [x] exact pre-feed current-generation binding with no unbound publish surface;
+- [x] nonblocking count, byte, and per-message admission with invalidation-before-return;
+- [x] deterministic single-writer shard actors with transactional Task 7 processing and explicit
+  feature/strategy revalidation seams;
+- [x] complete startup readiness, terminal invalidation, bounded shutdown, abort-and-await, and
+  clean runtime replacement;
+- [x] crate-private `ArcSwap` publication, per-shard retained-reader accounting, sorted aggregate
+  revisions, and bounded coalesced notifications; and
+- [x] application `LiveRuntimeComposition` plus explicit `DiagnosticEngine` quarantine and deletion
+  trigger.
+
+The following live-quarter work remains mandatory and is not claimed by Task 8:
+
+- [ ] Task 9 actor-owned online feature state;
+- [ ] Task 10 typed strategy, capability issue/consume, comprehensive risk, and dispatch;
+- [ ] Task 11 production Coinbase/Kraken current-batch adapters;
+- [ ] Task 12 live fuzz and benchmark harnesses;
+- [ ] Task 13 bounded shared CLI/MCP live services and diagnostic-engine deletion; and
+- [ ] Task 14 integrated performance, security, and release-hardening evidence.
+
 ## Stage 0: Planning and verified rename baseline
 
 **Produces:** Reviewed architecture/gap/plan documents and a clean, compatible Market Squawk rename
@@ -163,37 +196,38 @@ unforgeable risk approval; migrated Coinbase, paper, CLI, and MCP v0.1 behavior;
 
 ### Mandatory deliverables
 
-- [ ] Virtual workspace with resolver 3 and inherited metadata/lints.
+- [x] Virtual workspace with resolver 3 and inherited metadata/lints.
 - [ ] Non-empty initial crates and adapters with an acyclic dependency graph.
-- [ ] Private validated identity, financial, time, quality, coverage, and provenance types.
-- [ ] Complete `MarketEvent`/`ResearchObservation` contracts needed by later stages.
-- [ ] Separate `FairValueHierarchy`, `MarketDepth`, `DataQuality`, `StreamIntegrityState`,
+- [x] Private validated identity, financial, time, quality, coverage, and provenance types.
+- [x] Complete `MarketEvent`/`ResearchObservation` contracts needed by later stages.
+- [x] Separate `FairValueHierarchy`, `MarketDepth`, `DataQuality`, `StreamIntegrityState`,
   `CaptureIntegrityState`, audit-only `QualificationAssessment`, and `ExecutionEligibility`.
-- [ ] Domain assessments expose `AssessmentStatus`/`EligibilityFailures` audit diagnostics but no
+- [x] Domain assessments expose `AssessmentStatus`/`EligibilityFailures` audit diagnostics but no
   execution-eligibility API; archive provenance is unit `Ineligible` and cannot construct,
   deserialize, clone, or substitute for live current authority.
-- [ ] Live provenance carries explicit validated `available_at`, a durable assessment reference
+- [x] Live provenance carries explicit validated `available_at`, a durable assessment reference
   rather than a full assessment, and no serialized execution authority.
-- [ ] Live provenance owns one complete `LiveEvidenceBinding`; its archive record state is derived,
+- [x] Live provenance owns one complete `LiveEvidenceBinding`; its archive record state is derived,
   while a caller-supplied archival classification and opaque assessment reference are retained
   as audit assertions. Provenance does not dereference or prove
   the external assessment relationship.
-- [ ] `SourceMetadataProvider`, `LiveMarketSource`, and `ExtractionSource` contracts.
-- [ ] Explicit endpoint/network policy and provider budget contracts.
-- [ ] Raw capture no longer waits for writer acknowledgement.
-- [ ] Platform capture consumes one registry-issued generic authority bundle through domain traits;
+- [x] `SourceMetadataProvider`, `LiveMarketSource`, and `ExtractionSource` contracts.
+- [x] Explicit endpoint/network policy and provider budget contracts.
+- [x] Raw capture no longer waits for writer acknowledgement.
+- [x] Platform capture consumes one registry-issued generic authority bundle through domain traits;
   `platform -> sources`, loose capability composition, receipt erasure, and diagnostic-receipt
   promotion are forbidden.
-- [ ] Capture/shard overflow tests prove fail-closed quarantine behavior.
-- [ ] Versioned stable shard routing and single-writer ownership.
-- [ ] Immutable bounded snapshots for application services.
-- [ ] Stateful live authority issuer and opaque non-Serde/non-`Clone`, single-use, policy-expiring
+- [x] Capture/shard overflow tests prove fail-closed quarantine behavior.
+- [x] Versioned stable shard routing and single-writer ownership.
+- [x] Immutable bounded snapshots for application services.
+- [x] Stateful live authority issuer and opaque non-Serde/non-`Clone`, single-use, policy-expiring
   `LiveExecutionCapability` bound to authoritative metadata/session/instrument state.
 - [ ] `OrderIntent`, capability-consuming risk service, publicly nameable but privately
   constructible `ApprovedOrder`, one-time dispatcher, and `ExecutionAdapter` contract.
 - [ ] Current features and paper behavior migrated behind new contracts without being mislabeled
   complete paper execution.
-- [ ] Existing CLI/MCP behavior preserved through application services.
+- [x] Existing CLI/MCP compatibility behavior remains runnable and is structurally quarantined from
+  the production live runtime; full shared services remain Task 13.
 - [ ] Current Coinbase path explicitly capped at `DirectUnverified` until Stage 2 qualification.
 - [ ] Required Rust 1.97 locked workspace commands and Stage 1 security checks pass.
 

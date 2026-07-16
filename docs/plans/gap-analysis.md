@@ -6,6 +6,8 @@
 - Evidence baseline: [`current-state.md`](../architecture/current-state.md)
 - Target contract: [`target-state.md`](../architecture/target-state.md)
 - Research evidence: [deep-research report](../research/2026-07-15-market-squawk/final-report.md)
+- Latest live-runtime evidence:
+  [Q2 Task 8 implementation report](../reports/q2-task8-implementation.md)
 
 ## Status definitions
 
@@ -27,7 +29,7 @@ producer and consumer do not count as implemented.
 | --- | --- | --- | --- | --- |
 | P-01 | Local-first platform | Partial | Current capture, journal, CLI, and MCP are local; most product domains are missing. | 1-7 |
 | P-02 | Direct live market ingestion | Partial | Coinbase public WebSocket works; required Kraken and broader contracts are missing. | 2 |
-| P-03 | Low-latency signals and automated actions | Partial | Five features and a paper bot exist, but qualification, sharding, and realistic execution do not. | 1-2, 5 |
+| P-03 | Low-latency signals and automated actions | Partial | Production qualification, current authority, deterministic sharding, and bounded state are implemented. Task 8 intentionally returns `NoStrategy`; production features, risk, and execution remain. | 1-2, 5 |
 | P-04 | Historical and point-in-time research | Missing | No research storage, observations, revisions, or PIT builder. | 3-4 |
 | P-05 | Modeling, prediction, and backtesting | Missing | No registry, bundles, inference, datasets, or backtester. | 4 |
 | P-06 | Fundamentals, filings, macro, portfolio, alternative data | Missing | No required extraction adapters or datasets. | 3-4 |
@@ -35,8 +37,8 @@ producer and consumer do not count as implemented.
 | P-08 | ASC 820 and IFRS 13 analysis | Missing | No valuation domain or evidence rules. | 6 |
 | P-09 | Local MCP access | Partial | Five local stdio tools work; lifecycle, service domains, cancellation, audit, and bounds are incomplete. | 6 |
 | P-10 | No paid software/API/cloud/external DB/container/telemetry requirement | Implemented | Current v0.1 has none; all later dependencies must preserve this gate. | All |
-| P-11 | Optional paid/licensed adapters do not become mandatory | Missing | No adapter metadata/configuration contract yet. | 1-3 |
-| P-12 | Provider restrictions handled by adapters, persistence, cache, health, failover, coverage | Partial | Coinbase reconnect exists; budgets, cache, persistent health, failover, and coverage types are absent. | 1-3 |
+| P-11 | Optional paid/licensed adapters do not become mandatory | Implemented | Source authorization, coverage, endpoint, and secret contracts do not impose a paid dependency; concrete optional adapters can remain replaceable. | All |
+| P-12 | Provider restrictions handled by adapters, persistence, cache, health, failover, coverage | Partial | Typed shared budgets, retry/backoff, source health, authorization, and coverage are implemented. Persistent cache/health and production-adapter failover remain. | 1-3 |
 | P-13 | No access-control or quota evasion | Implemented | Security/README reject it; production schemas and tests must preserve exclusion. | 1, 7 |
 | P-14 | Optional paid/licensed feed adapters | Intentionally deferred | They are not required for the complete local release; typed source/authorization/coverage contracts remain available without introducing a paid dependency. | Post-release |
 
@@ -44,65 +46,65 @@ producer and consumer do not count as implemented.
 
 | ID | Requirement | Status | Evidence and closure | Stage |
 | --- | --- | --- | --- | --- |
-| Q-01 | Separate `FairValueHierarchy` | Missing | No fair-value types. | 1, 6 |
-| Q-02 | Separate `MarketDepth` | Missing | Depth is implicit price-level behavior. | 1 |
-| Q-03 | Exact `DataQuality` taxonomy | Missing | `QualityState` is an operational state, not data quality. | 1 |
-| Q-04 | Only `DirectVerified` eligible by default | Unsafe | `QualityState::Valid` permits paper action without the required evidence. | 1 |
-| Q-05 | Known source, venue, instrument | Incorrect | Source/product strings exist; internal venue/instrument identity does not. | 1 |
-| Q-06 | Direct venue or authorized broker delivery | Partial | Coinbase is direct; authorization and source metadata are not typed. | 1-2 |
-| Q-07 | Valid sequence progression | Unsafe | Heartbeat monotonicity is checked, not update-level continuity. | 1-2 |
-| Q-08 | Snapshot/update consistency | Partial | Delta-before-snapshot and reconnect recovery exist; connection generation and atomic validation do not. | 1-2 |
-| Q-09 | Checksum where supported | Missing | Kraken checksum adapter absent. | 2 |
-| Q-10 | Valid exchange and receive timestamps | Partial | Receive time exists and some timestamps parse; complete sanity policy is absent. | 1-2 |
-| Q-11 | Freshness within limits | Partial | Book receive-time staleness exists; clock/timestamp and source-specific limits are incomplete. | 1-2 |
-| Q-12 | Valid trading status | Missing | Source status is not instrument/venue trading status. | 1-2 |
-| Q-13 | Valid price/quantity precision | Partial | Positive Decimal parsing exists; instrument tick/lot exactness does not. | 1-2 |
-| Q-14 | Explicit source coverage | Missing | Coinbase single-venue/non-consolidated coverage is not recorded. | 1-2 |
-| Q-15 | Non-verified quality restricted to research/display/manual use | Unsafe | Paper bot can act on operational `Valid` Coinbase Level 2 data. | 1 |
-| Q-16 | Level 2/3 valuation inputs never promoted to Level 1 or execution quality | Missing | Types and conversion barriers do not exist. | 1, 6 |
+| Q-01 | Separate `FairValueHierarchy` | Implemented | The domain type is distinct and is not an input to live qualification or authority. | All |
+| Q-02 | Separate `MarketDepth` | Implemented | Typed top-of-book, price-level, and order-level classifications are independent of quality and valuation hierarchy. | All |
+| Q-03 | Exact `DataQuality` taxonomy | Implemented | The exact closed taxonomy is a private-invariant domain type separate from integrity. | All |
+| Q-04 | Only `DirectVerified` eligible by default | Partial | Current production authority can be minted only from complete `DirectVerified` evidence, and Task 8 has no strategy/action path. Task 10 must prove the final risk/dispatch consumer; the old paper calculation is diagnostic-only. | 1, 5 |
+| Q-05 | Known source, venue, instrument | Implemented | Typed identities and exact source/venue/instrument route bindings are required by current batches and processors. | All |
+| Q-06 | Direct venue or authorized broker delivery | Implemented | Delivery and authorization evidence are typed qualification inputs; absent or inconsistent evidence fails closed. | All |
+| Q-07 | Valid sequence progression | Implemented | Transactional generation-owned sequence state rejects duplicates, gaps, regression, and rule transplants where sequence is required. | All |
+| Q-08 | Snapshot/update consistency | Implemented | Generation state, snapshot applicability/origin, transactional rollback, and current-generation revalidation are implemented. | All |
+| Q-09 | Checksum where supported | Partial | Closed provider checksum profiles and Kraken V2 golden CRC32 validation are implemented; the production Kraken stream adapter remains Task 11. | 2 |
+| Q-10 | Valid exchange and receive timestamps | Implemented | Exact timestamps and independent source/market/transport/future-skew/idle policies participate in qualification. | All |
+| Q-11 | Freshness within limits | Implemented | Qualification derives the conservative exact deadline across independent policies and current-source validity. | All |
+| Q-12 | Valid trading status | Implemented | Typed generation-bound status is revisioned, snapshotted, and required by qualification. | All |
+| Q-13 | Valid price/quantity precision | Implemented | Exact provider lexemes normalize through current tick/lot definitions without rounding. | All |
+| Q-14 | Explicit source coverage | Implemented | Typed bounded coverage records include domain, topology, delay, consolidation, membership, and current policy binding. | All |
+| Q-15 | Non-verified quality restricted to research/display/manual use | Implemented | Non-verified states cannot obtain production capability; compatibility MCP/replay/paper behavior is explicitly diagnostic. | All |
+| Q-16 | Level 2/3 valuation inputs never promoted to Level 1 or execution quality | Implemented | Type separation and absence of hierarchy-to-quality/authority conversions enforce the boundary; the valuation service itself remains Task 6. | All |
 
 ## 3. Architecture and hot path
 
 | ID | Requirement | Status | Evidence and closure | Stage |
 | --- | --- | --- | --- | --- |
-| A-01 | Shared domain with independent live and research pipelines | Missing | One live-focused monolith exists; research plane absent. | 1, 3 |
+| A-01 | Shared domain with independent live and research pipelines | Partial | Shared live/research domain contracts and an independent production live crate exist; the research pipeline is not implemented. | 1, 3 |
 | A-02 | Local control plane with CLI, SQLite, MCP | Partial | CLI/MCP exist; SQLite and application services absent. | 1, 3, 6 |
-| A-03 | No SQLite/DataFusion/Parquet/Python/MCP/LLM in live path | Partial | Those components are absent; MCP shares the global engine lock. | 1, 3, 6 |
-| A-04 | No arbitrary filesystem work in live path | Unsafe | Source awaits journal serialization/write acknowledgement before publication. | 1 |
+| A-03 | No SQLite/DataFusion/Parquet/Python/MCP/LLM in live path | Implemented | The live crate dependency graph and actor path contain none of these; diagnostic MCP cannot access production actor state. | All |
+| A-04 | No arbitrary filesystem work in live path | Implemented | Raw capture is a bounded asynchronous side branch; Task 8 performs no filesystem operation. | All |
 | A-05 | No unrelated network work in live path | Implemented | Only source WebSocket traffic exists in current event path. | All |
 | A-06 | No unbounded queue writes | Implemented | Journal and event queues are bounded. | All |
-| A-07 | Persistence and reporting outside event-to-action path | Unsafe | Capture acknowledgement is a prerequisite for the decoded event. | 1 |
-| A-08 | CLI and MCP share application services | Missing | Both bind directly to current concrete engine/replay code. | 1, 6 |
+| A-07 | Persistence and reporting outside event-to-action path | Implemented | Capture admission does not await disk; snapshots/health are separate bounded authority-free outputs. | All |
+| A-08 | CLI and MCP share application services | Partial | `LiveRuntimeComposition` is the production app owner, but compatibility CLI/MCP still consume the diagnostic engine until Task 13. | 1, 6 |
 
 ## 4. Rust baseline and conventions
 
 | ID | Requirement | Status | Evidence and closure | Stage |
 | --- | --- | --- | --- | --- |
-| R-01 | Rust 1.97.0 toolchain | Incorrect | Repository pins 1.85.0; installed stable is 1.95.0. | 1 |
-| R-02 | Edition 2024 and resolver 3 | Partial | Edition 2024 exists; no virtual workspace or explicit resolver. | 1 |
-| R-03 | Workspace members `apps/*`, `crates/*`, `adapters/*` | Missing | Single package. | 1-6 |
-| R-04 | Inherited workspace metadata and lints | Missing | Package-local metadata/lints only. | 1 |
-| R-05 | Required strict lint policy | Incorrect | `clippy::all` warns and required deny lints are absent. | 1 |
+| R-01 | Rust 1.97.0 toolchain | Implemented | `rust-toolchain.toml` pins stable 1.97.0 and workspace MSRV is 1.97. | All |
+| R-02 | Edition 2024 and resolver 3 | Implemented | The virtual workspace uses Edition 2024 and resolver 3. | All |
+| R-03 | Workspace members `apps/*`, `crates/*`, `adapters/*` | Partial | Working app/domain/platform/sources/live packages use `apps/*` and `crates/*`; `adapters/*` is added atomically with Task 11's first working adapter rather than empty crates. | 1-6 |
+| R-04 | Inherited workspace metadata and lints | Implemented | Every current package inherits workspace version, edition, Rust version, license, and lint tables. | All |
+| R-05 | Required strict lint policy | Implemented | Workspace lints deny unsafe code, unused results, Clippy all, unwrap, expect, panic, todo, and unimplemented paths. | All |
 | R-06 | Committed `Cargo.lock`, stable Rust, stable fallbacks | Implemented | Lockfile exists and stable Rust is used. | All |
-| R-07 | Mature baseline libraries | Partial | Core live libraries exist; Reqwest, Arrow, Parquet, DataFusion, SQLite, Thiserror, Proptest, Criterion, fuzzing are missing. | 1-4, 7 |
+| R-07 | Mature baseline libraries | Partial | Tokio, Serde, WebSockets, Thiserror, Proptest, ArcSwap, and core live libraries are in use; research/storage/modeling/benchmark/fuzz dependencies arrive with working consumers. | 1-4, 7 |
 | R-08 | Rust naming and rustfmt conventions | Partial | Most names/style comply; full workspace checks and API review remain. | 1-7 |
-| R-09 | Financial values not interchangeable primitives | Incorrect | Public Decimals and Strings lack scale/identity invariants. | 1 |
-| R-10 | Scaled integers in live path | Missing | Decimal is used in the book and bot. | 1 |
-| R-11 | Tick/lot definition and checked adapter conversion | Missing | Positive Decimal validation only. | 1-2 |
+| R-09 | Financial values not interchangeable primitives | Implemented | Production domain and live state use private typed identities, prices, quantities, sizes, currency, money, and basis points. | All |
+| R-10 | Scaled integers in live path | Implemented | Production books and canonical live values use `PriceTicks` and `QuantityLots`; Decimal remains only in diagnostic compatibility code. | All |
+| R-11 | Tick/lot definition and checked adapter conversion | Implemented | Exact provider lexemes convert through current instrument definitions without implicit rounding. | All |
 | R-12 | Decimal/Decimal128 for accounting/analytics | Partial | Decimal is used; Arrow Decimal128 absent. | 3-4 |
-| R-13 | Explicit currency, scale, rounding, checked arithmetic | Missing | No currency/scale/rounding types; multiplication is unchecked. | 1, 4-5 |
+| R-13 | Explicit currency, scale, rounding, checked arithmetic | Implemented | Domain money/currency/tick/lot/rounding types and checked live conversions/arithmetic are implemented. | All |
 | R-14 | No float for money/orders/balances/cost basis/fees | Implemented | Current financial path uses Decimal. | All |
-| R-15 | Private fields and invariant-preserving constructors | Incorrect | Most public domain and risk structs expose fields. | 1 |
-| R-16 | Typed `Result`, no production unwrap/expect/panic | Partial | Production scan is clean; libraries use `anyhow` rather than typed errors. | 1 |
+| R-15 | Private fields and invariant-preserving constructors | Partial | Production domain/source/live structs preserve invariants; diagnostic compatibility DTOs retain public fields until their Task 13 deletion. | 1 |
+| R-16 | Typed `Result`, no production unwrap/expect/panic | Implemented | Library crates expose typed errors and the strict lints pass; `anyhow` remains at the app boundary. | All |
 | R-17 | Complete rustdoc contracts | Partial | Crate comments and a few comments exist; public API documentation is incomplete. | 1-7 |
 
 ## 5. Source framework and adapters
 
 | ID | Requirement | Status | Evidence and closure | Stage |
 | --- | --- | --- | --- | --- |
-| S-01 | Separate metadata/live/extraction contracts | Incorrect | One live-only `MarketSource` combines journal and events. | 1 |
-| S-02 | Live source classes extensible to WS/REST/broker/FIX/native | Missing | Only Coinbase WebSocket concrete source. | 1-2 |
-| S-03 | Research file/database/filing/macro/portfolio source classes | Missing | No extraction framework. | 3 |
+| S-01 | Separate metadata/live/extraction contracts | Implemented | `SourceMetadataProvider`, `LiveMarketSource`, and `ExtractionSource` are separate typed contracts. | All |
+| S-02 | Live source classes extensible to WS/REST/broker/FIX/native | Partial | Bounded protocol/source metadata and live contracts exist; production adapter implementations remain. | 1-2 |
+| S-03 | Research file/database/filing/macro/portfolio source classes | Partial | Bounded discovery/extraction contracts and records exist; working research adapters remain Task 3. | 3 |
 | S-04 | Working Coinbase book and trade adapter | Partial | Level 2, heartbeat, matches work; production qualification/coverage are incomplete. | 2 |
 | S-05 | Working Kraken book adapter with checksum | Missing | No adapter. | 2 |
 | S-06 | Working SEC filings and Company Facts | Missing | No adapter. | 3 |
@@ -112,8 +114,8 @@ producer and consumer do not count as implemented.
 | S-10 | Working CSV, JSON/NDJSON, Parquet | Missing | No file extraction adapters. | 3 |
 | S-11 | Working portfolio holdings/transactions | Missing | No portfolio adapter. | 3-4 |
 | S-12 | Working paper execution adapter | Incorrect | Immediate in-engine fills do not implement the adapter contract or realism. | 5 |
-| S-13 | Synthetic source never represented as production | Incorrect | `MockSource` is compiled into the application and exposed as a `MarketSource` CLI command; move it to test/diagnostic support with no production registration or qualification path. | 1 |
-| S-14 | Equity coverage disclosure | Missing | No equity adapter or coverage metadata type. | 1-3 |
+| S-13 | Synthetic source never represented as production | Implemented | `MockSource` is explicitly diagnostic and structurally cannot create a current batch or bind production ingress. | All |
+| S-14 | Equity coverage disclosure | Partial | Coverage delay/topology/consolidation/membership contracts exist; no production equity adapter publishes them yet. | 1-3 |
 | S-15 | Working XML and Excel extraction | Missing | No bounded parser, schema policy, or formula/entity safety. | 3 |
 | S-16 | Working SQLite and database-export extraction | Missing | No read-only export adapter or allowlisted schema contract. | 3 |
 | S-17 | Working OFX/QFX and broker-export extraction | Missing | No financial-export parser, raw-record preservation, or reconciliation. | 3 |
@@ -123,39 +125,39 @@ producer and consumer do not count as implemented.
 
 | ID | Requirement | Status | Evidence and closure | Stage |
 | --- | --- | --- | --- | --- |
-| D-01 | Internal instrument identity independent of symbols | Missing | Product string is the identity. | 1 |
-| D-02 | Ticker/venue, CUSIP, ISIN, SEDOL, FIGI | Missing | No identifier registry. | 1, 3 |
-| D-03 | OCC, futures, crypto pair/chain, provider IDs | Missing | No typed identities. | 1-3 |
-| D-04 | Symbol history, mergers, delistings, rolls, corporate actions | Missing | No lifecycle model. | 3-4 |
-| D-05 | Complete canonical live event enum | Partial | Book/trade exists; quote, auction, halt, instrument status, corporate action are missing. | 1-2 |
-| D-06 | Separate research observation enum | Missing | No research domain. | 1, 3 |
-| D-07 | Canonical live provenance fields | Partial | Source, timestamps, raw envelope exist; internal IDs, schema, quality, coverage, hash/reference are incomplete. | 1 |
-| D-08 | Research effective/published/revision/superseded semantics | Missing | No research observations. | 1, 3 |
+| D-01 | Internal instrument identity independent of symbols | Implemented | `InstrumentId` is provider-independent and current routes bind it separately from venue/provider symbols. | All |
+| D-02 | Ticker/venue, CUSIP, ISIN, SEDOL, FIGI | Implemented | Validated types, evidence records, conflicts, supersession, and an in-memory identity registry are implemented; durable catalog storage remains Task 3. | All |
+| D-03 | OCC, futures, crypto pair/chain, provider IDs | Implemented | Validated derivative, digital-asset, chain, and provider identity types are implemented. | All |
+| D-04 | Symbol history, mergers, delistings, rolls, corporate actions | Partial | Effective symbol/lifecycle/roll/corporate-action contracts are implemented; durable ingestion and analytical treatment remain. | 3-4 |
+| D-05 | Complete canonical live event enum | Implemented | Trade, quote, snapshot, delta, auction, halt, status, and corporate-action variants have typed payloads. | All |
+| D-06 | Separate research observation enum | Implemented | Filing, fundamental, macro, position, transaction, corporate-action, and alternative-data variants are separate from live events. | All |
+| D-07 | Canonical live provenance fields | Implemented | Schema/source/instrument/venue identifiers, source reference/hash, exact timestamps, quality/evidence binding, and assessment reference are typed. | All |
+| D-08 | Research effective/published/revision/superseded semantics | Implemented | The research time/provenance contracts preserve effective, publication, availability, ingestion, revision, and supersession dimensions; storage remains Task 3. | All |
 | D-09 | Look-ahead prevention without live-feed mirroring | Missing | No point-in-time storage/builder. | 3-4 |
 
 ## 7. Live processing, concurrency, integrity, and books
 
 | ID | Requirement | Status | Evidence and closure | Stage |
 | --- | --- | --- | --- | --- |
-| L-01 | Reader -> decode -> validate -> shard -> state -> strategy -> risk -> execution | Incorrect | Journal acknowledgement precedes decode; no shard or execution adapter. | 1-2, 5 |
-| L-02 | Raw capture async; decisions do not wait for persistence | Unsafe | Current source awaits writer acknowledgement. | 1 |
-| L-03 | Stable deterministic shard ownership | Missing | One global engine task and lock. | 1 |
-| L-04 | Shard owns books/windows/features/strategy/risk | Missing | Global engine owns all products. | 1-2 |
-| L-05 | Explicit bounded overflow invalidation/degradation | Incorrect | Bounded `send().await` has no integrity transition. | 1 |
-| L-06 | Sequence continuity, duplicates, out-of-order | Partial | Heartbeat non-monotonic detection only. | 1-2 |
-| L-07 | Snapshot/delta ordering | Partial | Delta-before-snapshot and reconnect reset exist; generation/sequence replay incomplete. | 1-2 |
-| L-08 | Checksums | Missing | No supported-source checksum implementation. | 2 |
-| L-09 | Connection generations | Missing | UUID exists in raw envelope but not validated canonical state. | 1-2 |
-| L-10 | Timestamp sanity | Partial | Parsing exists; sanity/clock bounds absent. | 1-2 |
-| L-11 | Tick/lot precision | Missing | No instrument definition enforcement. | 1-2 |
-| L-12 | Book consistency | Partial | Crossed book check exists; negative/atomic/depth/checksum invariants incomplete. | 1-2 |
-| L-13 | Trading/venue status | Missing | No typed status gate. | 1-2 |
-| L-14 | Market freshness distinct from heartbeat | Implemented | Heartbeats do not refresh book freshness. | All |
-| L-15 | Quarantine until resynchronized/revalidated | Partial | Fresh snapshot clears hard invalidity; complete evidence requalification absent. | 1-2 |
-| L-16 | Top/price/order depth support | Partial | Price-level depth works; explicit top/order-level contracts absent. | 1-2 |
-| L-17 | Snapshot, incremental, delete-zero, configurable depth | Partial | First three work; depth is unbounded/not configured. | 2 |
-| L-18 | Best bid/ask, crossed, staleness | Partial | Best/crossed and external quality staleness exist; typed book freshness incomplete. | 1-2 |
-| L-19 | Venue-specific checksum rules | Missing | Kraken adapter absent. | 2 |
+| L-01 | Reader -> decode -> validate -> shard -> state -> strategy -> risk -> execution | Partial | Capture/current-batch validation, deterministic shard admission, and transactional state are production contracts. The actor intentionally returns `NoStrategy`; Tasks 9-10 attach features, strategy, risk, and execution at its revalidation seams. | 1-2, 5 |
+| L-02 | Raw capture async; decisions do not wait for persistence | Implemented | Task 6 capture admission is bounded and asynchronous; Task 8 consumes receipt-validated current batches and performs no persistence work. | All |
+| L-03 | Stable deterministic shard ownership | Implemented | Routing V1 freezes byte encoding and FNV-1a golden vectors; one actor is the sole writer for every route assigned to its shard. | All |
+| L-04 | Shard owns books/windows/features/strategy/risk | Partial | Actors own route processors, books, generation state, revisions, snapshots, and the reserved feature/strategy state boundary. Task 9-10 state is not yet attached. | 1-2 |
+| L-05 | Explicit bounded overflow invalidation/degradation | Implemented | Count, retained-byte, per-message, closed, and accounting failures synchronously invalidate the exact generation before returning. | All |
+| L-06 | Sequence continuity, duplicates, out-of-order | Implemented | The transactional sequence validator handles progression, duplicates, out-of-order/gap outcomes, generation rollover, and rollback on rejected candidates. | All |
+| L-07 | Snapshot/delta ordering | Implemented | Generation-owned state requires initialization snapshots, rejects invalid delta ordering, preserves snapshot-origin identity, and revalidates current generation. | All |
+| L-08 | Checksums | Implemented | The closed checksum engine validates provider-declared canonicalization profiles and rejects profile/evidence mismatches; production Kraken adapter integration remains L-19. | All |
+| L-09 | Connection generations | Implemented | Current source allocations and route generation registries bind exact typed connection generations; refresh, rollover, transplant, and exit invalidation are tested. | All |
+| L-10 | Timestamp sanity | Implemented | Qualification enforces independent market, transport, source, future-skew, idle, wall-deadline, and monotonic capability limits. | All |
+| L-11 | Tick/lot precision | Implemented | Adapter-boundary normalization converts exact decimal lexemes through instrument tick/lot definitions with checked representability. | All |
+| L-12 | Book consistency | Implemented | Price-level updates are message-atomic with bounded rollback, strict ordering, delete-zero, depth, crossed-book, checksum, and last-good-state invariants. | All |
+| L-13 | Trading/venue status | Implemented | Typed generation-bound shared trading status participates in qualification, revisions, snapshot diagnostics, and capability invalidation. | All |
+| L-14 | Market freshness distinct from heartbeat | Implemented | Connection/heartbeat health cannot refresh market-price freshness; qualification retains separate limits and exact deadlines. | All |
+| L-15 | Quarantine until resynchronized/revalidated | Implemented | Invalid generations cannot issue action and must receive a current validated snapshot and complete evidence before returning to healthy state. | All |
+| L-16 | Top/price/order depth support | Partial | Top-of-book and configurable bounded price-level depth are implemented. Order-level ownership remains required when a production source supplies it. | 2 |
+| L-17 | Snapshot, incremental, delete-zero, configurable depth | Implemented | Transactional snapshots/deltas, delete-zero behavior, checked configured depth, and exact output-depth metadata are tested. | All |
+| L-18 | Best bid/ask, crossed, staleness | Implemented | The production book maintains extrema, rejects crossed candidates, and qualification/snapshots preserve typed freshness state. | All |
+| L-19 | Venue-specific checksum rules | Partial | Provider checksum profiles and Kraken canonical CRC32 rules are implemented and golden-tested; the production Kraken stream adapter that supplies them is Task 11. | 2 |
 
 ## 8. Research storage and datasets
 
@@ -257,15 +259,15 @@ producer and consumer do not count as implemented.
 
 | ID | Requirement | Status | Evidence and closure | Stage |
 | --- | --- | --- | --- | --- |
-| O-01 | Target virtual workspace structure | Missing | Single package. | 1-6 |
+| O-01 | Target virtual workspace structure | Partial | The virtual workspace has working app/domain/platform/sources/live packages; later production crates/adapters are added with their first consumers. | 1-6 |
 | O-02 | No empty crates; focused files below 500-700 lines | Implemented | Current files are focused; future plan forbids empty crates. | All |
-| O-03 | Config precedence defaults/file/env/CLI | Partial | Defaults/env/CLI exist; config file and full typed merge absent. | 1 |
+| O-03 | Config precedence defaults/file/env/CLI | Implemented | Validated configuration composes defaults, bounded TOML, supplied environment, and CLI overrides in the required order. | All |
 | O-04 | No telemetry or hidden outbound requests | Implemented | Current binary has no beacon; source connection is explicit. | All |
 | O-05 | Local storage and structured human/JSON logs | Implemented | Present. | All |
-| O-06 | Secret redaction | Missing | No secret type or tests. | 1, 7 |
+| O-06 | Secret redaction | Implemented | Secret references and zeroized values have redacted debug behavior and bounded parsing; concrete keyring/encryption providers remain O-07. | All |
 | O-07 | OS keyring and encrypted fallback | Missing | No credentials currently. | 3, 5 |
-| O-08 | Source/execution endpoint allowlists | Missing | Coinbase `with_url` accepts arbitrary URLs. | 1-2, 5 |
-| O-09 | Controlled artifact directory | Missing | No artifact service. | 1, 6 |
+| O-08 | Source/execution endpoint allowlists | Partial | Typed endpoint/redirect/query policies exist for production adapters; compatibility Coinbase test URL injection is diagnostic and Task 11 must consume the policy. | 1-2, 5 |
+| O-09 | Controlled artifact directory | Partial | Confined `ArtifactRoot`/resolved-path primitives are implemented; the shared artifact publication service remains Task 13. | 1, 6 |
 | O-10 | Dependency lock, vulnerability, license, credential, artifact checks | Partial | Lockfile and git-history gitleaks pass; other policies/checks absent. | 1, 7 |
 | O-11 | No OpenTelemetry v1 dependency | Implemented | No OTEL. | All |
 | O-12 | Optional future observability adapter | Intentionally deferred | Version 1 intentionally has local tracing and no OpenTelemetry dependency; a future adapter may be added without changing live-domain contracts. | Post-release |
@@ -274,16 +276,16 @@ producer and consumer do not count as implemented.
 
 | ID | Requirement | Status | Evidence and closure | Stage |
 | --- | --- | --- | --- | --- |
-| X-01 | Financial parsing/normalization tests | Partial | Decimal parsing tests exist; ticks/lots/rounding property tests absent. | 1 |
-| X-02 | Instrument resolution tests | Missing | No resolver. | 1, 3 |
-| X-03 | Sequence/checksum/book/queue/reconnect/quality tests | Partial | Book/reconnect/basic quality exist; checksum/overflow/generation incomplete. | 1-2 |
+| X-01 | Financial parsing/normalization tests | Implemented | Exact decimal, ticks/lots, rounding/rejection, overflow, and financial property tests pass. | All |
+| X-02 | Instrument resolution tests | Partial | Typed identity records, evidence/conflict/supersession, symbol scope, and in-memory registry tests pass; durable catalog resolution remains Task 3. | 1, 3 |
+| X-03 | Sequence/checksum/book/queue/reconnect/quality tests | Partial | Transactional sequence, Kraken checksum, book/property, current-generation overflow, lifecycle, and qualification tests pass; production adapter reconnect/resync remains Task 11. | 1-2 |
 | X-04 | PIT/revision/corporate-action tests | Missing | No research plane. | 3-4 |
 | X-05 | Feature/model/portfolio/risk/paper/fair-value tests | Partial | Five features/basic risk only. | 2, 4-6 |
 | X-06 | MCP schema/result/CLI integration tests | Partial | MCP init/arguments/rate and smoke tests exist; full surface absent. | 6 |
 | X-07 | External network tests separate | Implemented | Current live integration uses a local server; public endpoint is not in default suite. | All |
-| X-08 | Property tests | Missing | No Proptest. | 1-7 |
+| X-08 | Property tests | Partial | Financial and order-book properties are implemented; later analytical/portfolio/execution properties remain. | 1-7 |
 | X-09 | Required fuzz targets | Missing | No fuzz workspace. | 2-3, 6-7 |
-| X-10 | Required format/clippy/test/release commands | Incorrect | Single-package 1.85 variants pass; workspace 1.97 commands cannot run. | 1 |
+| X-10 | Required format/clippy/test/release commands | Partial | Exact Task 8 live/app locked fmt, strict Clippy, tests, and release build pass on Rust 1.97; the grouped full-workspace quarter gate remains. | 1 |
 | X-11 | Dependency/vulnerability/license/credential/artifact checks | Partial | Gitleaks history scan passes; others absent. | 1, 7 |
 | X-12 | Decoder/queue/book/feature/strategy/risk performance measures | Missing | No benchmark harness. | 7 |
 | X-13 | Arrow/Parquet/DataFusion performance measures | Missing | Research plane absent. | 7 |
@@ -299,7 +301,7 @@ producer and consumer do not count as implemented.
 | G-02 | Target-state architecture document | Implemented | `docs/architecture/target-state.md`. | Planning |
 | G-03 | Gap analysis with required classifications | Implemented | This document. | Planning |
 | G-04 | Concrete implementation plan | Implemented | Seven-stage controlling plan plus an executable TDD Stage 1 plan are linked from `docs/plans/implementation-plan.md`. | Planning |
-| G-05 | Repository runnable after every stage | Partial | Current baseline is runnable; aggregate script is broken. | All |
+| G-05 | Repository runnable after every stage | Implemented | Diagnostic CLI compatibility and production live/app packages build and test after Task 8; each remaining checkpoint must preserve this gate. | All |
 | G-06 | No mocks/scaffolding counted as production | Implemented | Audit and target explicitly enforce this rule. | All |
 | G-07 | Complete local release demonstration | Missing | Only a narrow v0.1 subset exists. | 1-7 |
 | G-08 | Replay optional, not core | Implemented | Replay exists but target architecture does not require historical/live equivalence. | All |
@@ -316,17 +318,20 @@ producer and consumer do not count as implemented.
 
 ## Critical path
 
-The highest-risk gaps are not the missing feature count; they are contracts that would contaminate
-every later feature if left unchanged:
+The live foundations that would have contaminated later work are now closed through Task 8:
+typed identity/finance, quality separation, asynchronous capture, exact current-source authority,
+transactional qualification, deterministic ownership, bounded overflow invalidation, immutable
+snapshots, and supervised lifecycle.
 
-1. Primitive identity and financial values
-2. Conflated operational quality and execution eligibility
-3. Persistence acknowledgement in the event path
-4. Global mutable engine and undefined overflow semantics
-5. Forgeable intent-to-fill boundary
-6. Missing point-in-time and provenance semantics
-7. Missing provider coverage and access policy
+The current highest-risk gaps are the next real consumers of those contracts:
 
-Stage 1 closes these cross-cutting contracts before Stage 2 adds live sources or Stage 3 adds
-research data. Later stages then implement every required production capability against stable,
-testable boundaries.
+1. actor-owned online features without weakening current-state revalidation;
+2. typed strategy, capability-consuming risk, and final dispatch with no bypass;
+3. production Coinbase/Kraken adapters that bind before opening their feeds;
+4. point-in-time research storage, revision preservation, and provider-compliant ingestion;
+5. realistic paper execution and portfolio reconciliation; and
+6. integrated fuzz, performance, dependency/license, and release evidence.
+
+Tasks 9-14 close the live-quarter items at the existing seams. Research and later product stages
+remain mandatory complete-release work; no missing capability is counted as implemented merely
+because its domain contract exists.

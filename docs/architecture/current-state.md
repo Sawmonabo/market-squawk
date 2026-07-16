@@ -1,352 +1,296 @@
-# Market Squawk Current State
+# Market Squawk current state
 
 ## Document control
 
 - Audit date: 2026-07-16
 - Repository: `market-squawk`
-- Branch observed: `main`
-- Audited commit: `c568ef0`
-- Working tree: modified by an in-progress `market-engine` to `market-squawk` rename
-- Evidence: repository inspection, fresh local verification, and the persisted
+- Implementation baseline: Q2 Tasks 1-8 through production commit `09f2b33` and deterministic
+  Task 8 test head `c1faab0`
+- Evidence: repository inspection, locked local verification,
+  [Q2 live-readiness audit](../plans/q2-live-readiness-audit.md),
+  [Q2 Task 8 implementation report](../reports/q2-task8-implementation.md), and the
   [deep-research report](../research/2026-07-15-market-squawk/final-report.md)
 
-This document describes software that exists in the repository. Roadmap text, interfaces without a
-working consumer, mocks, and synthetic fixtures are not counted as production capability.
+This document describes working software at the stated baseline. Interfaces, synthetic fixtures,
+diagnostic compatibility code, and roadmap text are not counted as production capability.
 
 ## Executive assessment
 
-The repository contains a runnable single-package Rust v0.1 live-market prototype. It implements a
-public Coinbase Exchange WebSocket source, CRC-framed local raw capture, a single in-memory
-price-level book per product, five top-of-book features, a basic feed-health state machine, a
-hardcoded momentum paper bot, elementary pre-trade checks, journal replay, five local MCP tools,
-and a small CLI.
+Market Squawk is now a Rust 1.97 virtual workspace with four production contract crates, one
+application composition crate, asynchronous raw capture, a fail-closed current-source registry, a
+transactional live processor, deterministic single-writer shards, exact count-and-byte admission,
+bounded immutable snapshots, and supervised runtime lifecycle.
 
-It is not yet the specified Market Squawk platform. The research plane, required source adapters,
-canonical instrument identity, execution-quality evidence, sharded single-writer runtime,
-realistic paper execution, portfolio accounting, modeling, fair-value analysis, full MCP surface,
-release audits, fuzzing, and performance evidence are absent. Two current behaviors are unsafe
-against the target specification:
+The most important live safety boundary is implemented: only an owned, receipt-validated
+`CurrentDecodedProviderBatch` carrying the exact current source allocation can bind to production
+ingress. A serialized assessment, replay record, diagnostic event, health snapshot, caller-authored
+quality value, or stale generation cannot reconstruct current execution authority. Queue failure,
+actor exit, shutdown, and runtime replacement invalidate the relevant one-way authority before
+returning or exiting.
 
-1. A raw journal append is acknowledged by the writer before the decoded event is published, so
-   event processing waits on persistence work.
-2. A snapshot can set operational quality to `Valid` and permit a paper action without proving the
-   complete `DirectVerified` evidence contract.
+This is not the complete local release. Production Coinbase/Kraken adapters, online feature and
+strategy integration, comprehensive risk and paper execution, the research plane, analytical
+storage, modeling, portfolios, fair-value analysis, complete MCP/CLI services, fuzzing,
+benchmarks, audits, and release evidence remain in their assigned implementation tasks. No
+performance claim has been made.
 
-## Repository and package shape
+## Workspace and toolchain
 
-The root `Cargo.toml` defines one package, one library, and one binary. There is no virtual
-workspace and no `apps/`, `crates/`, or `adapters/` boundary.
+The root is a virtual Cargo workspace:
 
 ```text
 market-squawk/
+├── apps/
+│   └── market-squawk/
+├── crates/
+│   ├── market-squawk-domain/
+│   ├── market-squawk-live/
+│   ├── market-squawk-platform/
+│   └── market-squawk-sources/
+├── docs/
+├── scripts/
 ├── Cargo.toml
 ├── Cargo.lock
 ├── rust-toolchain.toml
-├── src/
-│   ├── bot.rs
-│   ├── config.rs
-│   ├── domain.rs
-│   ├── engine.rs
-│   ├── features.rs
-│   ├── journal.rs
-│   ├── lib.rs
-│   ├── main.rs
-│   ├── mcp.rs
-│   ├── order_book.rs
-│   ├── quality.rs
-│   ├── replay.rs
-│   ├── risk.rs
-│   └── source/
-│       ├── coinbase.rs
-│       ├── mock.rs
-│       └── mod.rs
-├── tests/
-│   ├── coinbase_decode.rs
-│   ├── coinbase_source.rs
-│   ├── engine.rs
-│   ├── journal.rs
-│   ├── order_book.rs
-│   ├── quality.rs
-│   ├── replay.rs
-│   └── risk.rs
-└── scripts/
-    ├── smoke_mcp.py
-    └── verify.sh
+└── rustfmt.toml
 ```
 
-The Rust source and deterministic tests are small enough to migrate deliberately. No existing
-source file exceeds 500 lines; `src/mcp.rs` is the largest at 441 lines.
+`adapters/*` is intentionally not a workspace glob yet because no production adapter crate exists;
+Task 11 adds the directory with the first working adapter rather than creating empty crates.
 
-## Toolchain, metadata, and lints
+Implemented baseline controls include:
 
-### Implemented
+- Rust 1.97.0 stable, Edition 2024, resolver 3;
+- inherited workspace version, license, Rust version, and lint policy;
+- `unsafe_code = "forbid"`, denied unused results, and strict Clippy policies for unwrap, expect,
+  panic, todo, and unimplemented paths;
+- a committed workspace lockfile owned by the integrated root;
+- 100-column rustfmt and focused source modules; and
+- typed `thiserror` errors in library crates with `anyhow` restricted to the application boundary.
 
-- Rust Edition 2024 is declared.
-- `rustfmt` uses a 100-character width.
-- `Cargo.lock` exists and locked builds work.
-- `unsafe_code = "forbid"` is configured for the package.
-- The release profile enables optimization, thin LTO, one codegen unit, abort-on-panic, and symbol
-  stripping.
+The workspace currently has no Arrow, Parquet, DataFusion, SQLite, ONNX, keyring, encryption,
+Criterion, or cargo-fuzz implementation. Those dependencies are added only with their working
+consumers in later tasks.
 
-### Mismatches
+## Shared domain
 
-- `rust-toolchain.toml` pins Rust 1.85.0.
-- `Cargo.toml` declares `rust-version = "1.85"`.
-- The required version is Rust 1.97.0, released 2026-07-09.
-- The locally installed default `stable` toolchain is Rust 1.95.0; Rust 1.97.0 is not installed in
-  the audited environment.
-- There is no `[workspace]` table or explicit `resolver = "3"`.
-- Package metadata is not inherited from `[workspace.package]`.
-- Clippy `all` is only `warn`, not `deny`.
-- The required `cargo`, `unwrap_used`, `expect_used`, `panic`, `todo`, and `unimplemented` policies
-  are absent.
-- Library modules use `anyhow` rather than typed `thiserror` errors.
-- Public APIs do not consistently document units, invariants, time semantics, or errors.
+`market-squawk-domain` contains private, validated identity and financial types, including
+`InstrumentId`, `VenueId`, `SourceId`, provider identities, ticker and venue symbols, CUSIP, ISIN,
+SEDOL, FIGI, OCC option identity, futures identity, crypto pair and chain addresses,
+`SequenceNumber`, `PriceTicks`, `QuantityLots`, `BasisPoints`, tick/lot sizes, currency, money,
+rounding policy, and exact decimal conversion.
 
-## Dependency state
+Instrument definitions and identity records cover provider mappings, effective intervals, symbol
+changes, lifecycle transitions, contract rolls, evidence, conflicts, supersession, and rights/
+entitlement metadata. The registry contracts are in memory; durable SQLite catalog persistence is
+not yet implemented.
 
-The package currently depends on Tokio, Serde, Tokio-Tungstenite, Chrono, Rust Decimal, Clap,
-Tracing, UUID, CRC32, `parking_lot`, `fs2`, `futures-util`, `async-trait`, and `anyhow`.
+The domain keeps these concepts separate:
 
-Missing target dependencies include Arrow, Parquet, DataFusion, SQLite integration, Reqwest,
-`thiserror`, cancellation-token support, Proptest, Criterion, fuzzing infrastructure, native or
-ONNX-compatible inference, secret storage, encryption support, and dependency/advisory/license
-policy tooling.
+- `FairValueHierarchy`;
+- `MarketDepth`;
+- `DataQuality`;
+- `StreamIntegrityState` and capture integrity;
+- audit-only qualification assessments; and
+- process-local execution authority.
 
-The audit does not infer target versions merely from research. Exact releases, features, MSRVs,
-transitive licenses, and native artifacts require a locked Rust 1.97 build spike.
+Canonical live events cover trades, quotes, snapshots, deltas, auctions, halts, instrument status,
+and corporate actions. Research observations cover filing, fundamental, macro, position,
+transaction, corporate-action, and alternative-data shapes. Live and research provenance retain
+separate availability and time semantics. The research types are contracts only; there is no
+working research producer or durable dataset yet.
 
-## Domain model
+## Source contracts and current authority
 
-`src/domain.rs` exposes `RawEnvelope`, `Side`, `PriceLevel`, `BookChange`, and `MarketEvent`.
-`MarketEvent` currently contains book snapshots, book deltas, trades, heartbeats, and source status.
-Prices and quantities are parsed as `rust_decimal::Decimal`, avoiding binary floating point.
+`market-squawk-sources` separates live and extraction source contracts. Source metadata includes
+typed capabilities, coverage topology and delay, numeric policy, protocol profile, checksum and
+sequence profiles, freshness limits, authorization, and provider identity. Network policy includes
+endpoint rules, redirect authorization, bounded requests, retry/backoff, shared provider budgets,
+and quota-health outcomes. These are working contract types with deterministic tests, not yet a
+complete adapter fleet.
 
-Source names and products are unvalidated `String` fields, public fields expose invariants, and
-price/quantity values do not carry an instrument tick or lot scale. The repository has no:
+The live decoder boundary produces bounded, source-normalized batches with exact decimal lexemes,
+sequence/snapshot/checksum/status evidence, frame identity, and checked retained-byte accounting.
+The authoritative registry binds metadata, session generation, health epoch, capture allocation,
+frame ordinal, live scope, and current deadlines. It produces nonempty homogeneous route batches
+of `CurrentProviderObservation` values while preserving wire order.
 
-- `InstrumentId`, `VenueId`, `SourceId`, or provider-independent identity
-- Identifier registry for ticker, CUSIP, ISIN, SEDOL, FIGI, OCC, futures, crypto, or chain address
-- Symbol history, merger, delisting, contract roll, or corporate-action identity policy
-- `SequenceNumber`, `PriceTicks`, `QuantityLots`, or `BasisPoints`
-- Currency type or currency-aware `Money`
-- Explicit rounding policy or checked live-path scaled-integer representation
-- Schema-versioned canonical record envelope
-- Complete provenance, source reference, or payload hash on canonical events
-- Research observation hierarchy or research time/revision semantics
+`CurrentDecodedProviderBatch` is owned, non-Serde, and process-local. Its exact
+`CurrentSourceAuthorityLease` can be obtained before a feed starts, allowing Task 8 to perform the
+pre-feed route binding handshake without trusting the first data batch.
 
-## Classification state
+The application still includes a working public Coinbase WebSocket reader and synthetic mock feed
+for diagnostic capture, replay, and compatibility MCP display. They use the private app-local
+diagnostic event model and are not production adapters: they do not produce current batches and
+cannot enter the production runtime. The required production Coinbase and Kraken adapters are
+Task 11 work.
 
-`src/quality.rs` defines operational states: `Initializing`, `Valid`, `Stale`, `GapDetected`,
-`ChecksumFailed`, `Divergent`, and `Quarantined`. These are useful stream-integrity states, but they
-do not implement the required `DataQuality` taxonomy.
+## Raw capture and local platform
 
-There is no `FairValueHierarchy`, `MarketDepth`, `ExecutionEligibility`, source coverage type, or
-qualification-evidence record. `QualityState::Valid` currently serves as the paper-risk tradability
-gate, which is broader than `DirectVerified` and therefore unsafe for the target contract.
+`market-squawk-platform` implements local configuration, confined paths, controlled artifact
+roots, MSJ1 journal compatibility, and generic asynchronous capture. The capture queue is bounded
+by count and retained bytes; admission success is independent of disk completion. Capture
+authority is supplied as one registry-owned bundle, and a concrete admission receipt binds the
+exact frame ordinal, digest, receive time, source allocation, and one-way health lease.
 
-## Live source framework
+Full/closed queues, byte-accounting failure, writer append/flush/shutdown failure, rotation
+failure, control drop, and task abortion degrade the exact capture allocation. The writer owns a
+degradation capability and can never create or restore source authority. MSJ1 is diagnostic audit
+storage and cannot reconstruct a raw current frame, capture receipt, or live capability.
 
-The current source trait is:
+Configuration precedence is implemented as safe defaults, optional TOML file, supplied
+`MARKET_SQUAWK_*` environment, then CLI overrides. Local secret references and redacted/zeroized
+secret values exist, but OS keyring and authenticated-encrypted fallback providers are not yet
+implemented.
 
-```rust
-#[async_trait]
-pub trait MarketSource: Send {
-    async fn run(
-        self: Box<Self>,
-        journal: JournalSink,
-        events: mpsc::Sender<MarketEvent>,
-        cancel: watch::Receiver<bool>,
-    ) -> anyhow::Result<()>;
-}
-```
+## Transactional live processing
 
-It combines raw capture, decoded publication, and cancellation in one live-only contract. It has no
-source metadata provider, coverage declaration, capability declaration, typed source error, raw
-sink abstraction, discovery contract, or extraction contract.
+`market-squawk-live` normalizes provider decimal lexemes exactly through instrument tick/lot
+definitions and rejects rounding, negative values, invalid delete semantics, and range overflow.
+Its bounded price-level book implements snapshot initialization, incremental absolute updates,
+delete-on-zero, configured depth, strict order, extrema, crossed-book detection, message-atomic
+rollback, and last-good-state preservation.
 
-### Coinbase adapter
+Sequence handling covers supported/unsupported rules, exact progression, duplicates, gaps,
+regression, snapshot applicability, and generation reset. The checksum engine has a closed
+provider-profile dispatch and a tested Kraken WebSocket v2 CRC32 canonicalization over exact
+lexemes and top-N scope. Typed shared trading status participates in qualification and authority
+revisions.
 
-The working adapter connects to Coinbase Exchange, subscribes to `level2`, `heartbeat`, and
-`matches`, reconnects with capped exponential backoff, journals exact text frames, parses decimals,
-and emits snapshot, delta, heartbeat, trade, subscription, error, and connection-status events. It
-also supports an alternate URL for local integration testing.
+Qualification derives `DirectVerified` only from complete exact evidence: current source and
+capture allocations, authorized direct delivery, declared coverage, connection generation,
+sequence/snapshot/checksum policy, precision, book integrity, status, and independent freshness
+limits. Domain assessments remain audit data. Only the process-local processor can mint the
+non-Clone, non-Serde `LiveExecutionCapability`, and it binds exact one-way runtime, shard,
+generation, status, state-revision, deadline, nonce, and evidence dimensions.
 
-It does not:
+Task 8 currently performs no production strategy or execution. The actor applies and revalidates
+current state at the future feature boundary and again at the future strategy/issuer boundary,
+then records `NoStrategy` without minting an unused capability.
 
-- Maintain Coinbase full-channel sequence replay.
-- Establish update-level sequence continuity for Level 2 messages.
-- Validate a Level 2 checksum; the chosen official channel documents none.
-- Validate an internal instrument and venue mapping.
-- Enforce instrument tick and lot precision from status metadata.
-- Record source coverage as single-venue/non-consolidated.
-- Carry connection generation in canonical events.
-- Qualify the stream as `DirectVerified` with complete evidence.
-- Apply a typed endpoint allowlist, proxy policy, redirect policy, or timeout policy.
+## Deterministic shard runtime
 
-### Other sources
+Routing V1 hashes the explicit `MSQKSHARD` byte domain, version tag, big-endian venue-byte length,
+venue UTF-8 bytes, and UUID network bytes with fixed FNV-1a constants. The frozen Coinbase vector
+hashes to `0x28edee9cb1852659` and routes to shard 9 of 16. Golden tests lock full hashes and shard
+indices across counts, Unicode and delimiter cases, and serialization round trips.
 
-The only other source is deterministic `MockSource`. Its behavior is appropriate for tests and
-offline smoke runs, but it is currently compiled into the production library and exposed as a CLI
-source through `market-squawk mock`. That representation is incorrect under the target contract;
-the implementation must move behind test support or an explicitly diagnostic generator that cannot
-enter production source registration or execution qualification. Kraken and all required extraction
-adapters are missing.
+Each actor is the single writer for its configured routes and owns processors, generation
+registries, order books, revisions, snapshot construction, and future strategy-local state.
+Production ingress has two stages:
 
-## Raw capture and replay
+1. bounded/cancellable pre-feed registration binds an exact current source lease and route; and
+2. `BoundShardIngress::try_publish` performs nonblocking count and byte admission for an exact
+   `CurrentDecodedProviderBatch`.
 
-Implemented capture behavior includes `MSJ1` magic, length/CRC32/JSON records, a 64 MiB record cap,
-full validation before append, an OS single-writer lock, truncation/corruption detection, a bounded
-writer queue, and durable flush at checkpoints and shutdown. Coinbase replay uses the current
-decoder and engine.
+No unbound publish method exists. Private retained-size calculation charges the batch, generation
+admission, command, and shared allocation. Count-full, byte-full, overweight, checked-cost,
+wrong-route, source-transplant, closed, and stale-authority failures invalidate the exact bound
+generation before returning.
 
-`JournalSink::append` sends an append command and awaits a one-shot acknowledgement. The Coinbase
-reader awaits that function before decoding and publishing the event. Processing therefore depends
-on the journal task consuming the queue and performing serialization and buffered file writes. It
-does not call `sync_data` per event, but it still violates persistence independence.
+Startup validates all capacities/routes and a conservative peak-memory model before allocating.
+Every actor publishes an initial immutable `Ready` snapshot before the runtime escapes. Partial
+startup is aborted and awaited. Shutdown invalidates authority before draining; a deadline causes
+abort-and-await, never detach. Replacement starts a fresh incarnation only after complete former
+shutdown.
 
-The committed predecessor used `MEJ1` and `.mej`; the working tree changes those to `MSJ1` and
-`.msj`. There is no dual-reader compatibility or explicit migration, so existing user data can
-become unreadable after the rename.
+## Immutable snapshots and control-plane reads
 
-## Live engine and concurrency
+Actors build bounded authority-free snapshots from one committed owner state after the action
+decision. DTOs include routing version/count, runtime incarnation, shard identity, lifecycle,
+snapshot revision, exact timestamps, stream and status revisions, generation/health information,
+book depths, provenance, and dimension-specific completeness.
 
-`Engine` owns every product in one `HashMap`. A single Tokio task receives all events through a
-bounded channel and obtains a write lock on `Arc<RwLock<Engine>>` for every event. MCP reads through
-the same lock.
+Crate-private `ArcSwap` cells publish complete generations without reader backpressure. A
+single-shard lease charges one reader permit; an aggregate lease charges one per retained shard
+generation and returns a sorted per-shard revision vector instead of a fabricated global `as_of`.
+Slow readers may exhaust the configured retention budget but cannot block publication. Keyed
+snapshot notifications are separate bounded coalescing hints; health events are bounded
+best-effort diagnostics and never restore authority.
 
-Implemented integrity behavior includes delta-before-snapshot quarantine, disconnect invalidation,
-crossed-book quarantine, heartbeat/book-freshness separation, and fresh-snapshot recovery.
+## Application boundary, CLI, replay, and MCP
 
-Missing or incorrect behavior includes:
+`LiveRuntimeComposition` owns the production runtime and exposes checked startup, exact pre-feed
+binding, bounded snapshot readers, incarnation and memory metrics, health/notification polling,
+clean replacement, and explicit complete shutdown. It does not expose actor senders, snapshot
+cells, authority issuers, unbound publication, or event conversion.
 
-- No stable `(venue_id, instrument_id)` shard function or versioned hash
-- No per-shard state owner
-- No queue overflow event or financial integrity policy
-- `send().await` pauses readers instead of invalidating an overloaded stream
-- No connection-generation, sequence, checksum, precision, trading-status, or coverage gate
-- No bounded immutable snapshot publication
-- MCP contention on the global engine lock
-- No measured memory bound under sustained bursts
+The previous public `Engine` is now `DiagnosticEngine`. Its domain module is private and exported
+only through explicit `Diagnostic*` aliases. The compatibility Coinbase/mock path, replay, five
+existing MCP tools, and historical paper calculation remain runnable but cannot accept a current
+batch or mint production authority. CLI/MCP wording identifies this as diagnostic simulation.
 
-## Order books and online features
+The deletion trigger is precise: production Task 11 adapters must emit receipt-validated current
+batches after pre-feed binding, and Task 13 services must consume Task 8 immutable snapshots. The
+diagnostic engine is then removed rather than promoted.
 
-The current price-level book supports snapshot replacement, absolute-size updates, delete-on-zero,
-best bid/ask, level counts, and crossed-book detection. It lacks configurable depth, order-level
-state, venue checksum views, message-atomic validation, and property tests.
+The CLI still implements only `init`, diagnostic `mock`, diagnostic `capture`, diagnostic/offline
+`mcp`, and `replay`. The MCP server remains local stdio with bounded lines, typed input schemas,
+unknown-field rejection, and a local rate limiter, but it does not implement the complete required
+tool domains, durable audit, controlled large artifacts, or cancellation/deadline service layer.
 
-The current feature set is midpoint, spread, spread basis points, microprice, and top-level
-imbalance. Order-flow imbalance, depth-weighted price, aggressor imbalance, rolling VWAP, volume
-velocity, momentum, returns, volatility, cross-venue divergence, liquidity, and slippage estimates
-are missing.
+## Research, analytics, modeling, portfolio, execution, and valuation
 
-## Strategy, risk, and paper execution
+These complete-release planes are not yet implemented:
 
-`MomentumBot` keeps a 20-observation midpoint history. A five-basis-point move produces a fixed
-quantity limit intent at the midpoint. `RiskKernel` checks kill switch, operational feed state,
-book age, positive values, notional, and absolute position. `PaperAccount::fill` immediately fills
-the entire quantity at the intent price.
+- SQLite catalog and migrations;
+- Arrow exchange, Parquet datasets/manifests, compaction, lineage, and DataFusion queries;
+- file, SEC, FRED/ALFRED, BLS, Treasury, and portfolio extraction adapters;
+- point-in-time joins, vintage/revision storage, corporate-action policy, and dataset builder;
+- production online features beyond the quarantined compatibility kernels;
+- batch analytics, feature registry, model bundles, native/ONNX inference, and backtesting;
+- portfolio accounting, reconciliation, performance, exposure, attribution, and scenarios;
+- typed strategies, comprehensive risk, realistic paper execution, and execution adapters; and
+- ASC 820/IFRS 13 valuation evidence, classification, override, and approval services.
 
-Missing or unsafe elements include:
+The domain contracts already prevent fair-value hierarchy, market depth, data quality, and live
+execution authority from being substituted for one another. Later implementations consume those
+contracts; their existence alone is not counted as the production capability.
 
-- No canonical `Strategy` or `ExecutionAdapter` trait
-- Incomplete order intent: no model, order type, time in force, expiration, slippage, required
-  quality, or structured reasons
-- No unforgeable `ApprovedOrder` boundary
-- No account/instrument eligibility, exposure, leverage, capital, loss, drawdown, order-rate, or
-  duplicate controls
-- Risk gates `QualityState::Valid`, not `DirectVerified`
-- No order-state machine, latency, spreads, queue position, slippage, fees, partial fills, rejects,
-  cancellation, balances, reconciliation, or idempotency key
-- No durable audit record for each risk decision
+## Verification state
 
-## Research and analytical plane
-
-The research plane is missing. There is no SQLite catalog, Arrow batch, Parquet dataset writer,
-manifest, schema registry, compaction, DataFusion session, point-in-time filter, research
-observation model, dataset builder, or lineage store.
-
-SEC, FRED/ALFRED, BLS, Treasury, CSV, JSON/NDJSON, Parquet, and portfolio adapters are absent. No
-provider budget, SEC identity, FRED key handling, BLS chunking, Treasury pagination, cache,
-bulk-reconciliation path, or separately gated network tests exist.
-
-## Analytics, modeling, portfolio, and valuation
-
-Apart from five online features, the batch analytics, feature registry, point-in-time dataset,
-label/leakage controls, model bundles, inference backends, backtester, and predictions are missing.
-
-`PaperAccount` is not a portfolio system. Accounts, source imports, holdings, transactions, cash
-flows, cost basis, lots, income, performance, exposures, attribution, rebalancing, reconciliation,
-and scenarios are missing.
-
-Fair-value types, evidence, methods, classification rules, ruleset versions, overrides, approvals,
-and explanations are also missing.
-
-## MCP and CLI
-
-The hand-written stdio server implements initialization, ping, tool listing/calling, and five tools:
-`Market.GetSnapshot`, `Market.GetQuality`, `Bot.GetStatus`, `Journal.GetSummary`, and
-`Risk.TriggerKillSwitch`. It keeps protocol output on stdout, bounds request lines, rejects unknown
-arguments, and applies a per-process call limit.
-
-It lacks complete lifecycle enforcement, progress/cancellation, deadlines, per-tool result/time/
-instrument bounds, audit persistence, controlled artifacts, most required domains, and a shared
-application-service layer. Snapshot output can grow with every observed product.
-
-The CLI implements `init`, `mock`, `capture`, `mcp`, and `replay`. The remaining required command
-groups are missing, and commands call concrete engine/source code rather than complete shared
-services.
-
-## Configuration, privacy, and operations
-
-Implemented elements are local storage, a few CLI/environment overrides, human or JSON tracing to
-stderr, no telemetry beacon, no cloud dependency, and no live credentials.
-
-Missing elements include the local configuration file, full precedence model, typed source config,
-endpoint allowlists, secret redaction tests, OS keyring/encrypted fallback, provider budgets,
-controlled artifacts, persistent source health/cursors, structured audit, SQLite lifecycle,
-service supervision, dependency/advisory/license policy, SBOM, and build provenance.
-
-The project correctly documents that quota evasion, identity rotation, anti-bot bypass, stealth
-scraping, and access-control circumvention are non-goals.
-
-## Tests and verification
-
-Fresh audit results:
+The exact combined Task 8 live/application gate passed at the deterministic test head:
 
 ```text
-cargo fmt --all -- --check                           PASS
-cargo clippy --locked --all-targets --all-features   PASS
-cargo test --locked --all-targets --all-features     PASS (24 tests)
-cargo build --release --locked                       PASS
-gitleaks git --redact                                PASS
-./scripts/verify.sh                                  FAIL (missing scripts/check_brand.py)
+cargo fmt --all --check                                                        PASS
+cargo clippy -p market-squawk-live -p market-squawk \
+  --all-targets --all-features --locked -- -D warnings                        PASS
+cargo test -p market-squawk-live -p market-squawk --all-features --locked      PASS
+cargo build -p market-squawk-live -p market-squawk \
+  --all-features --release --locked                                             PASS
+git diff --check                                                               PASS
 ```
 
-The deterministic suite covers Coinbase decoding and a local WebSocket session, journal integrity,
-book updates, operational quality, replay, engine recovery, and basic risk. External network tests
-are not in the default suite.
+The live suite includes 74 unit tests plus compile-fail authority privacy, price-level book,
+property, Kraken checksum, conversion, real-registry overflow, sequence, 15 public sharding/config,
+and state-machine integration tests. The focused application suite also covers diagnostic
+quarantine and real runtime startup, metrics, bounded reads/notifications/health, shutdown,
+replacement, and typed configuration failure.
 
-Missing verification includes Rust 1.97 workspace commands, property tests, fuzz targets,
-benchmarks, sustained-burst/memory tests, point-in-time and revision tests, model/portfolio/
-valuation/full-MCP tests, dependency and license audits, working-tree credential scanning,
-generated-artifact checks, SBOM, and provenance validation.
+The root integration owner generates and reviews the one authoritative merged `Cargo.lock` and
+runs the full required workspace fmt, strict Clippy, test, and release-build gate at the Q2
+checkpoint. This Task 8 worktree does not mark Q2 complete before that integration and review.
 
-## Working-tree ownership and migration risk
+There are no final fuzz targets, Criterion benchmarks, sustained-burst harness, dependency/license
+audit gate, SBOM, or complete release-hardening report yet. No 100,000 events/s or sub-millisecond
+p99 claim is made before Task 14 measures the integrated pipeline on documented hardware.
 
-The working tree contains an uncommitted product rename created before this audit. Those changes
-belong to the user and must be preserved. Before workspace migration:
+## Security and access boundary
 
-1. Review the rename diff and add the missing brand checker.
-2. Add dual journal read compatibility.
-3. Verify current behavior.
-4. Commit the rename as a focused baseline, or obtain explicit direction to carry it uncommitted.
-5. Create an isolated worktree for Stage 1 execution.
+The application remains local-first with no mandatory paid software/API, cloud, external database,
+container runtime, telemetry, or OpenTelemetry dependency. Outbound source connections are explicit;
+there is no analytics beacon.
 
-## Conclusion
+Identity/account rotation to evade limits, TLS/browser fingerprint concealment, CAPTCHA or
+anti-bot bypass, proxy rotation intended to defeat blocking, and distributed quota evasion are
+classified as unsafe and are absent from production schemas and implementation. Provider access is
+designed around declared identity, authorization, shared budgets, bounded retry, caching in the
+future research plane, explicit coverage, and fail-closed source health.
 
-The prototype supplies tested behavior and fixtures, but its types and concurrency must not become
-the implicit contracts for the full product. The safe migration preserves working Coinbase,
-journal, book, CLI, and MCP behavior while replacing primitive identity, operational-only quality,
-synchronous capture acknowledgement, the global engine lock, and direct paper filling with the
-target domain, qualification, sharding, risk, and execution boundaries.
+## Current conclusion
+
+The cross-cutting live contracts that later features depend on are now real and tested: typed
+identity and exact finance, current-source/capture authority, transactional qualification,
+deterministic ownership, bounded admission, immutable snapshots, and supervised lifecycle. The
+next work should attach features, strategy/risk, and real adapters to these seams without reopening
+the authority boundary or routing diagnostic/replay values into production.

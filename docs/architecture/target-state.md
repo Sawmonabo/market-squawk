@@ -8,6 +8,8 @@
 - Cost boundary: no mandatory paid software, API, cloud, database service, container runtime, or
   telemetry infrastructure
 - Research basis: [Market Squawk deep research](../research/2026-07-15-market-squawk/final-report.md)
+- Latest realized live boundary:
+  [Q2 Task 8 implementation report](../reports/q2-task8-implementation.md)
 
 ## Architectural principles
 
@@ -475,13 +477,20 @@ initializing snapshot identity/digest.
 
 ### Stable sharding
 
-Shard routing is `stable_hash_v1(venue_id, instrument_id) % shard_count`. The algorithm, byte
-encoding, and version are explicit and covered by golden/property tests. Each shard task owns all
-mutable books, rolling windows, feature state, strategy state, and local risk state for its
-instruments. No other task obtains a mutable reference.
+Shard routing is `stable_hash_v1(venue_id, instrument_id) % shard_count`. V1 hashes ASCII
+`MSQKSHARD`, tag `0x01`, the venue UTF-8 byte length as a big-endian `u16`, the venue bytes, and the
+instrument UUID's 16 network-order bytes with fixed FNV-1a 64-bit constants. The version, byte
+encoding, full hash, and shard indices are explicit and covered by golden/property tests. Each
+shard task owns all mutable books, rolling windows, feature state, strategy state, and local risk
+state for its instruments. No other task obtains a mutable reference.
 
 Shard-count changes are restart-time configuration changes with an explicit state-rebuild policy;
 they do not remap live state dynamically.
+
+Task 8 realizes this boundary with pre-feed exact-generation binding, nonblocking count-and-byte
+admission, a checked peak-memory model, one writer per route, complete readiness before ingress,
+and invalidation-before-return on every admission failure. The persisted implementation evidence is
+the [Q2 Task 8 report](../reports/q2-task8-implementation.md).
 
 ### Audit assessment and current execution authority
 
@@ -547,6 +556,11 @@ producer. Optional notifications are separate bounded, coalescing hints. A snaps
 builds bounded views and a sorted per-shard revision vector for application services; it never
 fabricates a single-instant cross-shard `as_of`. CLI and MCP receive bounded DTOs and never obtain
 the snapshot cell, leases, issuer, nonce state, mutable shard state, or event-handler access.
+
+Reader retention is bounded by returned shard generation: a single-shard lease consumes one
+permit, while an aggregate lease consumes one permit for every retained shard. Slow readers can
+therefore exhaust only the explicitly modeled retention allowance; publication remains independent.
+Runtime shutdown closes new reads without mutating already retained authority-free DTOs.
 
 ### Strategies, inference, and risk
 
@@ -714,6 +728,10 @@ are absent from production configuration.
   changes.
 - Model, feature, ruleset, source schema, and dataset versions are immutable identifiers.
 - No migration silently reinterprets data quality, time semantics, currency, scale, or hierarchy.
+- The legacy application engine is named `DiagnosticEngine`, its app-local event types are private
+  and explicitly prefixed `Diagnostic*`, and it has no conversion into current production batches.
+  It is deleted only after Task 11 adapters emit receipt-validated current batches after pre-feed
+  binding and Task 13 services consume Task 8 immutable snapshots.
 
 ## Verification and release gates
 
