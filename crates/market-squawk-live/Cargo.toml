@@ -1,0 +1,27 @@
+[package]
+name = "market-squawk-live"
+description = "Deterministic live market state, integrity qualification, and execution authority"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+license.workspace = true
+repository = "https://github.com/Sawmonabo/market-squawk"
+publish = false
+
+[dependencies]
+crc32fast.workspace = true
+market-squawk-domain = { path = "../market-squawk-domain" }
+market-squawk-sources = { path = "../market-squawk-sources" }
+rust_decimal.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+static_assertions.workspace = true
+trybuild.workspace = true
+
+[lints]
+workspace = true
