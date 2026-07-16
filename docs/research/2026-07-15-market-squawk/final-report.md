@@ -238,7 +238,8 @@ quarantine/resynchronization. Coinbase `full` is only a candidate after sequence
 and all local gates; Kraken requires atomic decimal-preserving checksum validation on every
 eligible update. A heartbeat updates connection health, not market freshness.
 
-The research side ingests raw immutable provider objects, normalizes them into versioned Arrow
+The research side ingests provider objects and retains fetched response bodies immutably by content
+hash; provider URLs remain mutable locator metadata. It normalizes records into versioned Arrow
 batches, publishes validated Parquet through manifests, and queries bounded DataFusion contexts.
 SQLite stores cursors, registries, manifests, and audit/control state—not per-event facts. PIT joins
 filter on defensible availability and supersession and include delisted instruments, historical

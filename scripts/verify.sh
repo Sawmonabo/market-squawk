@@ -8,6 +8,7 @@ python3 scripts/check_duplicate_dependencies.py
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-targets --all-features --locked
+cargo test --doc --workspace --all-features --locked
 cargo build --workspace --all-features --release --locked
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
 cargo build -p market-squawk --all-features --locked

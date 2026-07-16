@@ -330,8 +330,9 @@ git commit -m "build: establish Rust 1.97 virtual workspace"
 
 Cover empty/oversized venue IDs, UUID round trips, ticker/venue-symbol validation, CUSIP/ISIN/SEDOL
 check digits, FIGI syntax, OCC option identity, every FIX `MonthYear` form (`YYYYMM`, `YYYYMMDD`,
-and `YYYYMMwN`), independent tag 541 maturity dates, leg-local tag 610 maturity designators,
-optional futures lifecycle dates, crypto pair/chain-address normalization, zero tick/lot sizes,
+and `YYYYMMwN`), independent tag 541 maturity dates, leg-local tag 610 and 611 claims,
+optional first/last-trade, expiration, notice, delivery, and settlement lifecycle dates, CAIP-2
+envelope parsing and namespace-profile qualification, crypto pair/chain-address normalization, zero tick/lot sizes,
 negative quantities where forbidden, exact decimal normalization, inexact scale rejection, and
 checked overflow:
 
@@ -370,12 +371,20 @@ must cite their authoritative specification in rustdoc/tests; a syntactically va
 still not proof that an instrument exists. Provide borrowed views, `Display`, Serde, and only
 semantically valid conversions. Do not implement `Deref<Target = String>` or public tuple fields.
 
-Model FIX Latest EP307 maturity claims without collapsing them. Tag 200 is a structured
-`MaturityMonthYear` designator that preserves `YYYYMM`, `YYYYMMDD`, or `YYYYMMwN`; tag 541 is a
-separate optional `LocalMktDate`; tag 610 is the same structured designator scoped to one leg.
-First/last trade, notice, delivery, settlement, and other lifecycle dates remain optional,
-source-evidenced fields. Never synthesize one claim from another or reduce a day/week designator to
-a month.
+Model the rendered FIX Latest EP307 maturity claims without collapsing them. Tag 200 is a
+structured `MaturityMonthYear` designator that preserves `YYYYMM`, `YYYYMMDD`, or `YYYYMMwN`; tag
+541 is a separate optional `LocalMktDate`; tag 610 is the same structured designator scoped to one
+leg, and tag 611 is that leg's separate maturity date. First/last trade, expiration, notice,
+delivery, settlement, and other lifecycle dates remain optional, source-evidenced fields. Never
+synthesize one claim from another or reduce a day/week designator to a month. Retain the canonical
+URLs, access instant/timezone, rendered edition, response-body SHA-256, and relevant tag/datatype
+section in `docs/research/2026-07-16-q1-contract-decisions.md` because `FIX.Latest` is a moving alias.
+
+Treat `ChainId` as a case-sensitive CAIP-2 envelope, not namespace proof. Add explicit profile
+validation before a chain becomes registry-qualified: `eip155` uses the base-10 form of the chain
+ID returned by `eth_chainId`; `solana` uses the first 32 characters of the genesis hash returned by
+`getGenesisHash`. Validate Solana addresses independently as fixed 32-byte base58 public keys. Do
+not describe the chain ID, a mutable RPC endpoint, or an unversioned URL as immutable evidence.
 
 Add `InstrumentDefinition` with private instrument ID, asset class, primary currency, tick/lot rules,
 venue mappings, identifiers, and trading status. Symbol history, corporate-action transitions,
@@ -384,11 +393,17 @@ record contracts are defined here so storage cannot later invent incompatible id
 
 Provider-native identity assertions use a versioned `ProviderIdentityRecord`, not an unqualified
 string or a field on `VenueMapping`. Bind every record to the provider `SourceId`, stable
-`InstrumentId`, immutable `PayloadReference`, provider source timestamp when supplied, local
-`observed_at`, authoritative metadata revision/evidence, and effective interval. Exact duplicate
-evidence is idempotent; the same provider namespace/revision/key with a different immutable payload
-is a conflict and is quarantined; a newer evidenced provider revision appends a new assertion and
-supersedes the prior assertion without deleting or overwriting history.
+`InstrumentId`, content evidence, provider source timestamp when supplied, local `observed_at`,
+authoritative metadata revision/evidence, and effective interval. `ContentHash` is immutable
+content evidence; a `SourceReference` must name a version-pinned object/record or be paired with a
+retained content digest. A mutable URL alone is insufficient.
+
+Put deterministic ingestion semantics in the provider-identity registry, not in vector equality:
+the same natural key, metadata revision, normalized assertion, interval, and content evidence is an
+idempotent no-op; a same-natural-key/same-revision disagreement is retained and quarantined as a
+typed conflict; a temporally valid newer evidenced revision appends a new assertion and marks the
+prior assertion superseded without deleting or mutating it. Equal arrival timestamps never decide
+a winner. Expose typed ingest outcomes so adapters cannot reinterpret duplicate/conflict behavior.
 
 - [ ] **Step 3: Implement exact scaled values**
 
@@ -429,8 +444,14 @@ git commit -m "feat(domain): add validated identities and scaled values"
 - Create: `crates/market-squawk-domain/src/research.rs`
 - Modify: `crates/market-squawk-domain/src/lib.rs`
 - Create: `crates/market-squawk-domain/tests/classification.rs`
+- Create: `crates/market-squawk-domain/tests/classification_type_separation.rs`
 - Create: `crates/market-squawk-domain/tests/provenance.rs`
-- Create: `crates/market-squawk-domain/tests/qualification_assessment.rs`
+- Create: `crates/market-squawk-domain/tests/provenance_boundaries.rs`
+- Create: `crates/market-squawk-domain/tests/live_authority_boundary.rs`
+- Create: `crates/market-squawk-domain/tests/live_timing_contracts.rs`
+- Create: `crates/market-squawk-domain/tests/live_trust_contracts.rs`
+- Create: `crates/market-squawk-domain/tests/composite_schema_compatibility.rs`
+- Create: `crates/market-squawk-domain/tests/canonical_events.rs`
 
 - [ ] **Step 1: Write separation and audit-assessment tests**
 
@@ -445,17 +466,18 @@ Fair-value hierarchy is not an input to live quality assessment:
 fn archival_assessment_is_never_current_execution_authority()
     -> Result<(), Box<dyn std::error::Error>>
 {
-    let assessment = QualificationAssessment::try_from(complete_bound_audit_inputs(
-        DataQuality::DirectVerified,
-    ))?;
+    let assessment = QualificationAssessment::try_from(valid_assessment_input()?)?;
     assert_eq!(
-        assessment.policy_status(),
-        AssessmentPolicyStatus::Satisfied
+        assessment.assessment_status_at(assessment.evaluated_at()),
+        AssessmentStatus::Satisfied
     );
+    assert!(assessment.failures().is_empty());
+    let archival = recorded_live_provenance_fixture(&assessment)?;
     assert_eq!(
-        assessment.execution_eligibility(),
-        ExecutionEligibility::Ineligible(EligibilityReason::RequiresCurrentRequalification)
+        archival.execution_eligibility(),
+        ExecutionEligibility::Ineligible
     );
+    assert!(archival.requires_requalification());
     Ok(())
 }
 ```
@@ -464,7 +486,9 @@ Run:
 
 ```bash
 cargo test -p market-squawk-domain --test classification
-cargo test -p market-squawk-domain --test qualification_assessment
+cargo test -p market-squawk-domain --test classification_type_separation
+cargo test -p market-squawk-domain --test live_trust_contracts
+cargo test -p market-squawk-domain --test live_authority_boundary
 ```
 
 Expected: FAIL because the classification and assessment types are absent.
@@ -472,10 +496,12 @@ Expected: FAIL because the classification and assessment types are absent.
 - [ ] **Step 2: Implement independent enums without conversion shortcuts**
 
 Add the exact `FairValueHierarchy`, `MarketDepth`, and `DataQuality` variants from the product spec,
-plus `StreamIntegrityState`, `CaptureIntegrityState`, `ExecutionEligibility`, and typed ineligibility
-reasons. Do not implement conversions among taxonomy/operational types or any ordinal comparison
-that implies evidentiary equivalence. Runtime tests must test actual behavior; do not add a
-tautological runtime assertion that merely compares one enum variant to another.
+plus `StreamIntegrityState`, `CaptureIntegrityState::{Disabled, Healthy, Incomplete}`, and the unit
+variants `ExecutionEligibility::{Eligible, Ineligible}`. Detailed qualification diagnostics live in
+`EligibilityFailures`, not inside archive-facing execution eligibility. Do not implement
+conversions among taxonomy/operational types or any ordinal comparison that implies evidentiary
+equivalence. Runtime tests must test actual behavior; do not add a tautological runtime assertion
+that merely compares one enum variant to another.
 
 - [ ] **Step 3: Implement a bound, audit-only qualification assessment**
 
@@ -489,12 +515,28 @@ trading/venue/instrument status, precision result, stream integrity, and capture
 component repeats or references the same binding key; construction fails on any transplant,
 missing required evidence, impossible time ordering, or inconsistent capability/result pair.
 
-The assessment computes a typed `AssessmentPolicyStatus` with all satisfied/failed policy reason
-codes and the recorded `DataQuality`. That status is useful for audit and replay comparison only.
-The public domain API exposes no promotion method, `QualifiedCurrent` value, opaque authority, or
-execution-eligible constructor. `QualificationAssessment::execution_eligibility()` is always
-`Ineligible(RequiresCurrentRequalification)`, including after Serde round trips. Only Task 7's
-stateful live issuer may create current execution authority.
+The assessment derives `EligibilityFailures` and the recorded `DataQuality`; callers supply neither.
+`assessment_status_at(at) -> AssessmentStatus` returns `Satisfied` only when there are no failures,
+`at` is within the inclusive assessment window, and coverage is effective at `at`. The public API
+also exposes `failures()` and `has_failure(EligibilityFailure)` for durable diagnostics. These are
+useful for audit and replay comparison only. The public domain API exposes no
+`execution_eligibility` method, promotion method, `QualifiedCurrent` value, opaque authority, or
+execution-eligible constructor. Only Task 7's stateful live issuer may create current execution
+authority.
+
+Implement custom `Deserialize` for `QualificationAssessment`. Deny unknown fields, reconstruct via
+`QualificationAssessmentInput` and `TryFrom`, recompute the derived quality/failures/evaluation
+window, and reject a wire record whose retained `recorded_quality`, `failures`, `evaluated_at`, or
+`valid_until` differs from the recomputed value. A durable Serde round trip must preserve the audit
+record without manufacturing runtime authority.
+
+Use the neutral `DigestAlgorithm::{Sha256, Blake3}` root type (`PayloadHashAlgorithm` remains only a
+compatibility alias). Construct `EvidenceDigest` with an explicit algorithm and bytes. Bind
+canonical state with `CanonicalStateDigest` plus a `CanonicalizationRule` containing its rule ID and
+one-based `RuleVersion`; algorithm, bytes, rule ID, and version all participate in equality.
+`LiveEvidenceBinding::payload_digest()` returns `EvidenceDigest`, while
+`canonical_state_digest()` and `BookStateBinding::state_digest()` expose the rule-qualified digest.
+Never infer the algorithm or canonicalization rule from a field name, payload source, or byte width.
 
 - [ ] **Step 4: Implement canonical time and provenance**
 
@@ -511,17 +553,38 @@ pub struct LiveProvenance {
     received_at: Timestamp,
     available_at: Timestamp,
     ingested_at: Timestamp,
-    quality: DataQuality,
+    recorded_quality: DataQuality,
+    recorded_coverage: CoverageStatus,
     payload_reference: PayloadReference,
+    assessment_reference: Option<SourceIdentifier>,
 }
 ```
 
-Live provenance may retain an archival `QualificationAssessment` and a recorded
-`DirectVerified` classification, but its archive-facing execution eligibility is always
-`Ineligible(RequiresCurrentRequalification)`. Deserialization must preserve the record for
-audit/research and must never manufacture Task 7's capability. `ResearchProvenance` adds
+`DecodedLiveProvenanceInput::new` takes `(binding, source_timestamp, received_at, available_at,
+ingested_at, recorded_quality, recorded_coverage, payload_reference)` in that order.
+`RecordedLiveProvenanceInput::new` takes the same fields followed by `assessment_reference`.
+`LiveProvenance::available_at()` returns the required availability instant and
+`assessment_reference()` returns only the optional durable reference.
+
+Live provenance retains only a durable assessment reference, not a full
+`QualificationAssessment`. It may record a `DirectVerified` historical classification only with
+that reference, but its archive-facing execution eligibility is always the unit variant
+`Ineligible` and `requires_requalification()` remains true. Enforce
+`received_at <= available_at <= ingested_at` in constructors and deserialization, require
+`available_at` on the wire with no default, preserve the record for audit/research, and never
+manufacture Task 7's capability. Decoder construction rejects a caller-authored
+`DirectVerified`; recorded assessment construction carries the quality derived by the referenced
+assessment. `ResearchProvenance` adds
 `effective_at`, `published_at`, evidenced/unknown availability, `revision`, and `superseded_at`;
 constructors reject impossible time ordering without inventing unavailable timestamps.
+
+Run:
+
+```bash
+cargo test -p market-squawk-domain --test provenance
+cargo test -p market-squawk-domain --test provenance_boundaries
+cargo test -p market-squawk-domain --test composite_schema_compatibility
+```
 
 - [ ] **Step 5: Add canonical event families**
 
@@ -554,12 +617,15 @@ Payload structs may contain only fields whose invariants are enforceable now and
 appropriate provenance/time contract. Do not combine the two families into a universal event or add
 empty marker payloads.
 
+Run: `cargo test -p market-squawk-domain --test canonical_events --locked`
+
 - [ ] **Step 6: Verify and commit**
 
 ```bash
-cargo test -p market-squawk-domain --all-features
-cargo clippy -p market-squawk-domain --all-targets --all-features -- -D warnings
-cargo doc -p market-squawk-domain --no-deps
+cargo test -p market-squawk-domain --all-features --locked
+cargo test --doc -p market-squawk-domain --all-features --locked
+cargo clippy -p market-squawk-domain --all-targets --all-features --locked -- -D warnings
+RUSTDOCFLAGS='-D warnings' cargo doc -p market-squawk-domain --all-features --no-deps --locked
 git diff --check
 git add crates/market-squawk-domain
 git commit -m "feat(domain): separate quality integrity and provenance"
@@ -1572,6 +1638,7 @@ cargo --version
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-features --locked
+cargo test --doc --workspace --all-features --locked
 cargo build --workspace --all-features --release --locked
 python3 scripts/check_brand.py
 python3 scripts/check_workspace_boundaries.py
@@ -1655,8 +1722,8 @@ git commit -m "docs: record verified Stage 1 foundation"
   invariant-preserving fields.
 - [ ] Fair-value hierarchy, market depth, data quality, integrity, and execution eligibility cannot
   be confused through public conversions.
-- [ ] Domain assessments and all archival/replay provenance remain execution-ineligible and cannot
-  mint or deserialize live current authority.
+- [ ] Domain assessments expose audit status/failures but no eligibility API; archival/replay
+  provenance is unit `Ineligible`; neither can mint or deserialize live current authority.
 - [ ] Capture and shard queues are bounded; overflow is observable and execution-ineligible.
 - [ ] Live state has deterministic single-writer ownership and immutable bounded snapshots.
 - [ ] Coinbase cannot exceed `DirectUnverified` in Stage 1.

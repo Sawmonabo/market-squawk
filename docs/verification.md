@@ -51,7 +51,14 @@ The repository now pins Rust 1.97.0 and runs one fail-fast local/CI entry point:
 
 That entry point checks the brand allowlist, Python policy-helper tests, workspace inheritance,
 reviewed duplicate-dependency inventory, workspace formatting, strict all-target/all-feature
-Clippy, the complete workspace test suite, a release build, rustdoc with warnings denied, CLI help,
-the deterministic 101-event offline mock, and a timeout-bounded local stdio MCP interaction. The
-current measured result is recorded after the Quarter 1 correction review rather than copying the
-historical 24-test claim forward.
+Clippy, the locked all-target/all-feature workspace suite, an explicit locked all-feature workspace
+doctest pass, a release build, rustdoc with warnings denied, CLI help, the deterministic 101-event
+offline mock, and a timeout-bounded local stdio MCP interaction. A policy-helper regression test
+pins the exact `cargo test --doc --workspace --all-features --locked` command so document examples
+cannot silently fall out of the gate. `cargo doc` remains a separate warning-denied documentation
+build; it is not treated as a substitute for running doctests.
+
+The historical 24-test count above applies only to the pre-workspace artifact. Current harness and
+doctest counts are read from the fresh release-gate transcript and will be recorded in the
+commit-specific Stage 1 verification record after the Quarter 1 correction review. This living
+overview intentionally does not copy a count across commits whose test corpus changed.

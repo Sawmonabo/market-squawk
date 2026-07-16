@@ -61,10 +61,10 @@ ALLOWED_OCCURRENCES = {
     ("docs/architecture/current-state.md", 208, 3): AllowedOccurrence(
         f"The committed predecessor used `{TOKENS[3]}` and `{TOKENS[2]}`; the working tree changes those to `MSJ1` and"
     ),
-    ("docs/architecture/target-state.md", 550, 2): AllowedOccurrence(
+    ("docs/architecture/target-state.md", 585, 2): AllowedOccurrence(
         f"- Readers accept committed `{TOKENS[3]}/{TOKENS[2]}` and renamed `MSJ1/.msj` journals."
     ),
-    ("docs/architecture/target-state.md", 550, 3): AllowedOccurrence(
+    ("docs/architecture/target-state.md", 585, 3): AllowedOccurrence(
         f"- Readers accept committed `{TOKENS[3]}/{TOKENS[2]}` and renamed `MSJ1/.msj` journals."
     ),
     ("docs/plans/implementation-plan.md", 132, 2): AllowedOccurrence(
@@ -100,10 +100,10 @@ ALLOWED_OCCURRENCES = {
     ("docs/superpowers/plans/2026-07-16-market-squawk-stage-1-foundation.md", 154, 3): AllowedOccurrence(
         f"`{TOKENS[1]}`, `{TOKENS[2]}`, or `{TOKENS[3]}` occurrence."
     ),
-    ("docs/superpowers/plans/2026-07-16-market-squawk-stage-1-foundation.md", 1653, 2): AllowedOccurrence(
+    ("docs/superpowers/plans/2026-07-16-market-squawk-stage-1-foundation.md", 1720, 2): AllowedOccurrence(
         f"- [ ] Legacy `{TOKENS[3]}/{TOKENS[2]}` journals read; current writes use `MSJ1/.msj`."
     ),
-    ("docs/superpowers/plans/2026-07-16-market-squawk-stage-1-foundation.md", 1653, 3): AllowedOccurrence(
+    ("docs/superpowers/plans/2026-07-16-market-squawk-stage-1-foundation.md", 1720, 3): AllowedOccurrence(
         f"- [ ] Legacy `{TOKENS[3]}/{TOKENS[2]}` journals read; current writes use `MSJ1/.msj`."
     ),
 }

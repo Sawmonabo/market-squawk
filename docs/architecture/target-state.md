@@ -162,13 +162,37 @@ kept distinct from registry resolution. Effective-time identity records preserve
 mergers, delistings, contract rolls, and corporate actions without changing internal
 `InstrumentId` identity.
 
-Futures identities preserve FIX Latest EP307 tag 200 `MonthYear` forms (`YYYYMM`, `YYYYMMDD`, or
-`YYYYMMwN`) without reducing day/week designators to a month. Tag 541 maturity date, leg-scoped tag
-610 designators, and optional lifecycle dates remain independent sourced claims. Provider identity
-records bind the provider namespace/native ID and stable instrument to an immutable payload
-reference, source/first-observed timestamps, authoritative metadata revision/evidence, and effective
-interval. Exact evidence duplicates are idempotent, conflicting same-revision payloads are
-quarantined, and a newer evidenced revision appends/supersedes without overwriting history.
+Futures identities preserve the rendered FIX Latest EP307 tag 200 `MonthYear` forms (`YYYYMM`,
+`YYYYMMDD`, or `YYYYMMwN`) without reducing day/week designators to a month. Tag 541 maturity date,
+leg-scoped tag 610 and 611 claims, and independently supplied lifecycle dates remain separate.
+Lifecycle data includes first/last trade, expiration, notice, delivery, and settlement dates; no
+field is synthesized from another. The dated official-source evidence and response-body hashes are
+retained in the [Quarter 1 contract decisions](../research/2026-07-16-q1-contract-decisions.md).
+
+Provider identity records bind the provider namespace/native ID and stable instrument to content
+evidence, source/first-observed timestamps, authoritative metadata revision/evidence, and effective
+interval. A content hash is immutable evidence; an external source reference is accepted as such
+only when it identifies a version-pinned object/record or is paired with a retained content digest.
+A mutable URL by itself is not immutable evidence. Registry ingestion has deterministic outcomes:
+an exact evidence duplicate is an idempotent no-op, a same-natural-key/same-revision disagreement is
+retained and quarantined as a conflict, and a temporally valid newer revision appends a new record
+and supersedes rather than mutates the prior record.
+
+`ChainId` validates and preserves the case-sensitive CAIP-2 envelope only. Namespace-specific
+qualification is separate: `eip155` references are base-10 chain IDs derived from `eth_chainId`,
+while `solana` references are the first 32 characters of the genesis hash. Solana account/mint
+addresses remain separately validated 32-byte base58 public keys. Generic CAIP-2 syntax never proves
+that a chain exists or that a namespace-specific reference is canonical.
+
+Digest semantics are algorithm-qualified and domain-neutral. `DigestAlgorithm::{Sha256, Blake3}`
+is the canonical root type; `PayloadHashAlgorithm` remains a compatibility alias. An
+`EvidenceDigest` is constructed with `EvidenceDigest::new(algorithm, bytes)` and equality includes
+both fields. Canonical state uses `CanonicalStateDigest::new(evidence_digest,
+CanonicalizationRule::new(rule_id, rule_version))`; equality additionally includes the rule ID and
+one-based rule version. `LiveEvidenceBinding::payload_digest()` returns the algorithm-qualified
+payload digest, while `canonical_state_digest()` and `BookStateBinding::state_digest()` return the
+rule-qualified state digest. Neither an algorithm nor a canonicalization rule is inferred from
+bytes, field names, or provider defaults.
 
 ### Separate classification types
 
@@ -217,29 +241,38 @@ pub enum StreamIntegrityState {
 pub enum CaptureIntegrityState {
     Disabled,
     Healthy,
-    Backpressured,
-    WriterFailed,
+    Incomplete,
 }
 
 pub enum ExecutionEligibility {
     Eligible,
-    Ineligible(EligibilityReason),
+    Ineligible,
 }
 ```
 
 No implicit or infallible conversion exists among these types.
 
-`ExecutionEligibility` in serialized domain data is an archive/control-plane explanation, not a
-bearer capability. Archive-facing provenance and audit assessments are always
-`Ineligible(RequiresCurrentRequalification)`, even when they retain a historical
-`DirectVerified` classification.
+`ExecutionEligibility` in serialized domain data is an archive/control-plane status, not a bearer
+capability. Archive-facing live provenance always returns the unit variant `Ineligible`, even when
+it retains a historical `DirectVerified` classification and assessment reference. A
+`QualificationAssessment` deliberately exposes no `execution_eligibility` method.
+
+`QualificationAssessment` derives `recorded_quality` and an `EligibilityFailures` bit set from its
+bound inputs. Callers supply neither derived field. Its audit-only result is queried with
+`assessment_status_at(at) -> AssessmentStatus`; callers can inspect `failures()` or
+`has_failure(EligibilityFailure)`. `Satisfied` is still not runtime authority. Custom Serde
+deserialization rejects unknown fields, reconstructs through `QualificationAssessmentInput` and
+`TryFrom`, and rejects any tampered derived quality, failures, evaluated time, or validity deadline.
 
 ### Provenance and time
 
 Every canonical live record includes schema version, source, internal instrument, venue where
-applicable, source identifier, connection generation, source timestamp, receive time, ingestion
-time, data quality, source coverage, payload hash/reference, and optional audit assessment. Serde
-round trips retain recorded classification/evidence but can never mint current execution authority.
+applicable, source identifier, connection generation, source timestamp, receive time, explicit
+availability time, ingestion time, data quality, source coverage, payload hash/reference, and an
+optional durable assessment reference. It does not embed a full `QualificationAssessment`.
+Construction and deserialization enforce `received_at <= available_at <= ingested_at` and do not
+default a missing wire `available_at`. Serde round trips retain recorded classification/evidence but
+can never mint current execution authority.
 
 Every research observation additionally includes effective/reference time, publication time when
 known, availability time when evidenced, local first-observed time, revision identity, and
@@ -351,8 +384,10 @@ The domain `QualificationAssessment` is a durable audit explanation. It binds on
 metadata revision, authorization and scoped coverage record, venue, instrument, channel/event/depth,
 session generation, payload and canonical-state revision, snapshot/sequence/checksum evidence,
 source/receive/assessment timing window, freshness, status, precision, and stream/capture integrity.
-It records typed policy results and `DataQuality`, but is always execution-ineligible and exposes no
-promotion method or current capability. `FairValueHierarchy` is not an assessment input.
+It derives an `EligibilityFailures` set and `DataQuality`, exposes
+`assessment_status_at(at) -> AssessmentStatus`, and has invariant-preserving durable Serde. It
+exposes no execution-eligibility method, promotion method, or current capability.
+`FairValueHierarchy` is not an assessment input.
 
 The stateful `market-squawk-live` authority issuer is the only component that can mint the opaque,
 non-Serde, non-`Clone`, single-use, short-lived `LiveExecutionCapability` accepted by risk. Before

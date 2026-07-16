@@ -42,8 +42,9 @@ key. ([SEC developer FAQ](https://www.sec.gov/about/webmaster-frequently-asked-q
 ceiling, a truthful stable user agent, bounded concurrency, response caching, and
 capped exponential backoff with jitter for throttling or transient failures. Stop and
 degrade source health after a retry budget; do not rotate identities, IPs, proxies, or
-headers to evade blocking. Cache immutable raw responses by source URL and payload
-hash, and prefer bulk archives for backfill to reduce load.
+headers to evade blocking. Cache raw response bodies by payload hash and retain the
+request URL as mutable locator metadata, not as immutable identity. Prefer bulk
+archives for backfill to reduce load.
 
 **Confirmed.** Every FRED web-service request requires a 32-character lowercase
 alphanumeric API key. FRED directs developers to use a distinct key per application

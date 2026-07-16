@@ -16,26 +16,23 @@ unsafe Rust, or access-limit-evasion behavior was added.
 
 ## Official FIX evidence
 
-The following primary FIX Trading Community resources were read on 2026-07-16 and are retained here
-because `/FIX.Latest/` is a moving specification endpoint:
+`/FIX.Latest/` is a moving specification endpoint. A reproducibility correction re-fetched the five
+canonical pages at `2026-07-16T05:27:26-04:00` (`America/New_York`, EDT) with
+`curl --fail --location --silent --show-error` and SHA-256 hashed each response body:
 
-- [FIX Latest EP307 FIXML datatypes](https://fiximate.fixtrading.org/en/FIX.Latest/fixml_datatypes.html)
-  identified itself as `FIX.Latest_EP307`. Its `MonthYear` entry lists the three formats `YYYYMM`,
-  `YYYYMMDD`, and `YYYYMMWW`, with valid values `YYYY=0000-9999`, `MM=01-12`, `DD=01-31`, and
-  week codes `w1` through `w5`.
-- [MaturityMonthYear(200)](https://fiximate.fixtrading.org/en/FIX.Latest/tag200.html) identified
-  itself as `FIX.Latest_EP307` and lists `YYYYMM`, `YYYYMMDD`, and `YYYYMMwN`; it explicitly treats
-  the appended date or week as a way to distinguish products in the same month.
-- [LegMaturityMonthYear(610)](https://fiximate.fixtrading.org/en/FIX.Latest/tag610.html) identified
-  itself as `FIX.Latest_EP307` and delegates its `MonthYear` semantics to tag 200.
-- [MaturityDate(541)](https://fiximate.fixtrading.org/en/FIX.Latest/tag541.html) identified itself as
-  `FIX.Latest_EP307` and defines the instrument-level maturity date separately.
-- [LegMaturityDate(611)](https://fiximate.fixtrading.org/en/FIX.Latest/tag611.html) defines the leg
-  maturity date separately from tag 610. On the access date its rendered page header said
-  `FIX.Latest_EP302` even though the URL is the official `FIX.Latest` endpoint; this report preserves
-  that observed edition discrepancy rather than relabeling it.
-- [EP307 extension package](https://fixtrading.org/packages/ep307-seclending-trade-enhancements-phase-2/)
-  was the official FIX Trading Community EP307 package page and showed a 2026-07-14 update date.
+| Canonical URL | Rendered edition | SHA-256 | Relevant section |
+| --- | --- | --- | --- |
+| [MaturityMonthYear (200)](https://fiximate.fixtrading.org/en/FIX.Latest/tag200.html) | `FIX.Latest_EP307` | `7721110c47caf818497ac2b23d7ca7f12cd43278fe416ef2e9ddaa9652ba20b5` | Field 200 formats and disambiguation |
+| [MaturityDate (541)](https://fiximate.fixtrading.org/en/FIX.Latest/tag541.html) | `FIX.Latest_EP307` | `187ecfeb096a0be4a2a23175f717857960514fb20452328e2df0ba982678adee` | Field 541 `LocalMktDate` |
+| [LegMaturityMonthYear (610)](https://fiximate.fixtrading.org/en/FIX.Latest/tag610.html) | `FIX.Latest_EP307` | `b16873961ae1c27be3c3bd914cbbc841cfd503fb371aef5ec291a91d740e3191` | Leg field 610 and tag-200 delegation |
+| [LegMaturityDate (611)](https://fiximate.fixtrading.org/en/FIX.Latest/tag611.html) | `FIX.Latest_EP307` | `27b63acc02ddc4437dc454e6bb79dbc54a6d68428a7ecc1acd1653764067e3c9` | Leg field 611, separate from 610 |
+| [FIXML datatypes](https://fiximate.fixtrading.org/en/FIX.Latest/fixml_datatypes.html) | `FIX.Latest_EP307` | `7ba910d037e37c57056db1cbdb65cd84b1790326d5666dd5a94f856ffc43a586` | `MonthYear` and `LocalMktDate` rows |
+
+The earlier version of this report recorded `FIX.Latest_EP302` for tag 611 but retained neither an
+access timestamp nor a response-body digest. The current page and raw response body unambiguously
+render EP307. Because the alias can move and the earlier bytes were not retained, this correction
+cannot determine whether the old observation was a transient edition or a reporting error; it
+preserves that discrepancy here instead of silently rewriting the evidence history.
 
 The Rust parser follows the valid-value list: exact six- or eight-character wire values, four-digit
 years including `0000`, months 01-12, appended days 01-31, and lowercase week codes w1-w5.
@@ -48,9 +45,10 @@ years including `0000`, months 01-12, appended days 01-31, and lowercase week co
 - `FromStr`, `TryFrom<&str>`, `Display`, and Serde all use the source FIX string representation.
 - Top-level `MaturityMonthYear(200)` and leg `LegMaturityMonthYear(610)` use the same typed value.
 - `MaturityDate(541)` remains in lifecycle dates and `LegMaturityDate(611)` is a separate leg field.
-- The futures identity owns `source_id`, immutable `source_reference`, optional source timestamp,
-  local observation timestamp, and immutable metadata revision. This evidence remains present when
-  lifecycle dates are empty.
+- The futures identity owns `source_id`, `source_reference`, optional source timestamp, local
+  observation timestamp, and metadata revision. A source reference is immutable evidence only when
+  it names a version-pinned object/record or is paired with a retained content digest; a mutable URL
+  is not made immutable by storing it in the type.
 - Lifecycle dates are empty-permitted, preserve every optional date, and retain relational checks.
 - Week-distinct legs are not collapsed merely because their provider security text is the same.
 - Custom deserialization routes through checked constructors and denies unknown fields.
@@ -65,8 +63,9 @@ years including `0000`, months 01-12, appended days 01-31, and lowercase week co
 
 ### Provider identity evidence
 
-- Added `ProviderIdentityRecordInput` with immutable payload/source-object evidence, optional source
-  timestamp, local observation timestamp, immutable metadata revision, and effective interval.
+- Added `ProviderIdentityRecordInput` with payload/source-object evidence, optional source timestamp,
+  local observation timestamp, metadata revision, and effective interval. Version-pinned object
+  identity or a retained content hash is required before calling that evidence immutable.
 - Custom Serde denies unknown fields and constructs through the named input.
 - Exact record equality is the exact-duplicate-evidence policy.
 - Repeated observations and distinct metadata revisions for the same logical mapping are retained.

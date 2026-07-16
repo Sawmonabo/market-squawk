@@ -169,8 +169,11 @@ unforgeable risk approval; migrated Coinbase, paper, CLI, and MCP v0.1 behavior;
 - [ ] Complete `MarketEvent`/`ResearchObservation` contracts needed by later stages.
 - [ ] Separate `FairValueHierarchy`, `MarketDepth`, `DataQuality`, `StreamIntegrityState`,
   `CaptureIntegrityState`, audit-only `QualificationAssessment`, and `ExecutionEligibility`.
-- [ ] Archive/domain assessments are always execution-ineligible and cannot construct, deserialize,
-  clone, or substitute for live current authority.
+- [ ] Domain assessments expose `AssessmentStatus`/`EligibilityFailures` audit diagnostics but no
+  execution-eligibility API; archive provenance is unit `Ineligible` and cannot construct,
+  deserialize, clone, or substitute for live current authority.
+- [ ] Live provenance carries explicit validated `available_at`, a durable assessment reference
+  rather than a full assessment, and no serialized execution authority.
 - [ ] `SourceMetadataProvider`, `LiveMarketSource`, and `ExtractionSource` contracts.
 - [ ] Explicit endpoint/network policy and provider budget contracts.
 - [ ] Raw capture no longer waits for writer acknowledgement.
