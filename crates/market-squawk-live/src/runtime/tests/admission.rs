@@ -2,6 +2,7 @@ use std::mem::size_of;
 use std::sync::Arc;
 
 use market_squawk_sources::CurrentSourceAuthorityLease;
+use market_squawk_sources::ProviderBookLevel;
 use tokio::sync::{Semaphore, mpsc};
 
 #[allow(
@@ -141,6 +142,41 @@ fn exact_command_cost_and_permit_live_through_dequeue_until_drop() -> TestResult
         harness.byte_budget.available_permits(),
         usize::try_from(retained)?
     );
+    Ok(())
+}
+
+#[test]
+fn nested_book_storage_is_rejected_between_old_and_closed_shape_estimates() -> TestResult {
+    const LEVEL_COUNT: usize = 10_000;
+
+    let mut source = SourceHarness::try_new("source-nested", 1, INSTRUMENT_ONE)?;
+    let (lease, batch) = source.book_snapshot_batch("snapshot-1", 1, LEVEL_COUNT)?;
+    let (registry, preview) = admission(&lease)?;
+    let corrected = command_cost(&batch, &preview)?;
+    let nested_allocation = LEVEL_COUNT
+        .checked_mul(size_of::<ProviderBookLevel>())
+        .ok_or("nested allocation overflow")?;
+    let former = usize::try_from(corrected)?
+        .checked_sub(nested_allocation)
+        .ok_or("corrected charge did not include nested allocation")?;
+    let maximum = former
+        .checked_add(nested_allocation / 2)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or("message limit overflow")?;
+    assert!(former < usize::try_from(maximum)?);
+    assert!(maximum < corrected);
+    drop(registry);
+
+    let mut harness = harness(&lease, route(INSTRUMENT_ONE)?, 1, corrected, maximum)?;
+    assert_eq!(
+        harness.ingress.try_publish(batch),
+        Err(LiveIngressError::MessageTooLarge {
+            retained: corrected,
+            maximum,
+        })
+    );
+    assert!(harness.receiver.try_recv().is_err());
+    assert!(harness.admission.validate_at(now()?).is_err());
     Ok(())
 }
 

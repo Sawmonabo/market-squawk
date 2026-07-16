@@ -109,32 +109,38 @@ impl ProviderNormalizedObservation {
     fn deep_retained_bytes(&self) -> Result<usize, DecodeError> {
         let timestamp_rule = match &self.timestamp {
             ProviderTimestampEvidence::AuthoritativelyAbsent(rule) => {
-                rule.provider_rule().as_str().len()
+                rule.provider_rule().retained_bytes()
             }
-            ProviderTimestampEvidence::Provided { rule, .. } => rule.provider_rule().as_str().len(),
+            ProviderTimestampEvidence::Provided { rule, .. } => {
+                rule.provider_rule().retained_bytes()
+            }
         };
         let snapshot_bytes = match &self.snapshot {
             ProviderSnapshotEvidence::InitializingSnapshot { provider_reference } => {
                 provider_reference
                     .as_ref()
-                    .map_or(0, |value| value.as_str().len())
+                    .map_or(0, SourceIdentifier::retained_bytes)
             }
             ProviderSnapshotEvidence::Delta {
                 provider_snapshot_reference,
             } => provider_snapshot_reference
                 .as_ref()
-                .map_or(0, |value| value.as_str().len()),
-            ProviderSnapshotEvidence::NotApplicable(rule) => rule.provider_rule().as_str().len(),
+                .map_or(0, SourceIdentifier::retained_bytes),
+            ProviderSnapshotEvidence::NotApplicable(rule) => {
+                rule.provider_rule().retained_bytes()
+            }
         };
         let checksum_bytes = match &self.checksum {
             ProviderChecksumEvidence::Provided { value, rule } => {
-                checked_sum([value.as_str().len(), rule.provider_rule().as_str().len()])?
+                checked_sum([value.retained_bytes(), rule.provider_rule().retained_bytes()])?
             }
-            ProviderChecksumEvidence::Unsupported { rule } => rule.provider_rule().as_str().len(),
+            ProviderChecksumEvidence::Unsupported { rule } => {
+                rule.provider_rule().retained_bytes()
+            }
         };
         checked_sum([
-            self.source_identifier.as_str().len(),
-            self.venue.as_str().len(),
+            self.source_identifier.retained_bytes(),
+            self.venue.retained_bytes(),
             timestamp_rule,
             snapshot_bytes,
             checksum_bytes,
@@ -215,8 +221,7 @@ impl DecodedProviderBatch {
         let shallow = std::mem::size_of::<Self>()
             .checked_add(
                 self.observations
-                    .len()
-                    .checked_mul(std::mem::size_of::<ProviderNormalizedObservation>())
+                    .checked_allocation_bytes()
                     .ok_or(DecodeError::RetainedSizeOverflow)?,
             )
             .ok_or(DecodeError::RetainedSizeOverflow)?;
@@ -326,7 +331,56 @@ fn is_decimal_lexeme(value: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::ProviderDecimalLexeme;
+    use std::error::Error;
+    use std::mem::size_of;
+
+    use market_squawk_domain::{
+        AggressorSide, AuctionPhase, CorporateActionKind, HaltTransition, IntegrityRule,
+        MarketDepth, RuleVersion, SourceIdentifier, Timestamp, TradingStatus,
+    };
+    use rust_decimal::Decimal;
+
+    use super::{
+        ProviderAggressorEvidence, ProviderBookChange, ProviderBookLevel, ProviderBookSide,
+        ProviderDecimalLexeme, ProviderObservationPayload, ProviderPrice, ProviderQuantity,
+        ProviderStatusEvidence,
+    };
+
+    type TestResult<T = ()> = Result<T, Box<dyn Error>>;
+
+    fn id(value: &str) -> TestResult<SourceIdentifier> {
+        Ok(SourceIdentifier::try_from(value)?)
+    }
+
+    fn rule(value: &str) -> TestResult<IntegrityRule> {
+        Ok(IntegrityRule::new(id(value)?, RuleVersion::new(1)?))
+    }
+
+    fn level() -> TestResult<ProviderBookLevel> {
+        Ok(ProviderBookLevel::new(
+            ProviderPrice::new(ProviderDecimalLexeme::try_new("1")?),
+            ProviderQuantity::new(ProviderDecimalLexeme::try_new("2")?),
+        ))
+    }
+
+    fn levels(count: usize) -> TestResult<Vec<ProviderBookLevel>> {
+        (0..count).map(|_| level()).collect()
+    }
+
+    fn changes(count: usize) -> TestResult<Vec<ProviderBookChange>> {
+        (0..count)
+            .map(|index| {
+                Ok(ProviderBookChange::new(
+                    if index % 2 == 0 {
+                        ProviderBookSide::Bid
+                    } else {
+                        ProviderBookSide::Ask
+                    },
+                    level()?,
+                ))
+            })
+            .collect()
+    }
 
     #[test]
     fn exact_decimal_grammar_rejects_non_finite_and_partial_values() {
@@ -350,5 +404,109 @@ mod tests {
                 "{invalid}"
             );
         }
+    }
+
+    #[test]
+    fn decimal_lexeme_reports_spare_string_capacity() -> TestResult {
+        let mut value = String::with_capacity(128);
+        value.push('1');
+        let lexeme = ProviderDecimalLexeme {
+            lexeme: value,
+            decimal: Decimal::ONE,
+        };
+
+        assert!(lexeme.retained_bytes() >= 128);
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_retained_bytes_include_every_nested_level_allocation() -> TestResult {
+        for count in [1_usize, 10_000, 20_000] {
+            let bid_count = count.min(10_000);
+            let ask_count = count.saturating_sub(bid_count);
+            let payload = ProviderObservationPayload::book_snapshot(
+                MarketDepth::PriceLevel,
+                levels(bid_count)?,
+                levels(ask_count)?,
+            )?;
+            let expected = count
+                .checked_mul(size_of::<ProviderBookLevel>() + 2)
+                .ok_or("snapshot fixture size overflow")?;
+
+            assert_eq!(payload.deep_retained_bytes()?, expected, "count={count}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn delta_retained_bytes_include_every_nested_change_allocation() -> TestResult {
+        for count in [1_usize, 10_000, 20_000] {
+            let payload = ProviderObservationPayload::book_delta(
+                MarketDepth::PriceLevel,
+                changes(count)?,
+            )?;
+            let expected = count
+                .checked_mul(size_of::<ProviderBookChange>() + 2)
+                .ok_or("delta fixture size overflow")?;
+
+            assert_eq!(payload.deep_retained_bytes()?, expected, "count={count}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn every_payload_variant_has_closed_dynamic_accounting() -> TestResult {
+        let status = || -> TestResult<ProviderStatusEvidence> {
+            Ok(ProviderStatusEvidence::new(id("status")?, rule("status-rule")?))
+        };
+        let payloads = vec![
+            ProviderObservationPayload::Trade {
+                trade_id: id("trade")?,
+                price: ProviderPrice::new(ProviderDecimalLexeme::try_new("1")?),
+                quantity: ProviderQuantity::new(ProviderDecimalLexeme::try_new("2")?),
+                aggressor: ProviderAggressorEvidence::new(
+                    AggressorSide::Buy,
+                    Some(id("buy")?),
+                    rule("aggressor-rule")?,
+                ),
+            },
+            ProviderObservationPayload::quote(Some(level()?), Some(level()?))?,
+            ProviderObservationPayload::book_snapshot(
+                MarketDepth::PriceLevel,
+                levels(1)?,
+                levels(1)?,
+            )?,
+            ProviderObservationPayload::book_delta(
+                MarketDepth::PriceLevel,
+                changes(1)?,
+            )?,
+            ProviderObservationPayload::Auction {
+                provider_code: id("auction")?,
+                rule: rule("auction-rule")?,
+                phase: AuctionPhase::Opening,
+                price: Some(ProviderPrice::new(ProviderDecimalLexeme::try_new("1")?)),
+                paired_quantity: ProviderQuantity::new(ProviderDecimalLexeme::try_new("2")?),
+            },
+            ProviderObservationPayload::TradingHalt {
+                status: status()?,
+                transition: HaltTransition::Halted,
+                reason: id("reason")?,
+            },
+            ProviderObservationPayload::InstrumentStatus {
+                status: status()?,
+                trading_status: TradingStatus::Active,
+            },
+            ProviderObservationPayload::CorporateAction {
+                action_id: id("action")?,
+                rule: rule("action-rule")?,
+                effective_at: Timestamp::from_unix_nanos(1),
+                kind: CorporateActionKind::Delisting,
+            },
+        ];
+
+        for payload in payloads {
+            assert!(payload.deep_retained_bytes()? > 0, "{payload:?}");
+        }
+        Ok(())
     }
 }

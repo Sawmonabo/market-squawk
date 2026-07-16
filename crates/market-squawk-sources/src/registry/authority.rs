@@ -428,18 +428,10 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
                             .and_then(|bytes| bytes.checked_add(provider))
                             .ok_or(RegistryError::RetainedSizeOverflow)
                     })?;
-                let authority_allocation = current_authority_shared_allocation_charge()?;
-                let frame_allocation = current_frame_shared_allocation_charge()?;
-                let retained_bytes = observations
-                    .len()
-                    .checked_mul(std::mem::size_of::<CurrentProviderObservation>())
-                    .and_then(|bytes| {
-                        bytes.checked_add(std::mem::size_of::<CurrentDecodedProviderBatch>())
-                    })
-                    .and_then(|bytes| bytes.checked_add(policy_allocations))
-                    .and_then(|bytes| bytes.checked_add(authority_allocation))
-                    .and_then(|bytes| bytes.checked_add(frame_allocation))
-                    .ok_or(RegistryError::RetainedSizeOverflow)?;
+                let retained_bytes = current_routed_batch_retained_bytes(
+                    observations.len(),
+                    policy_allocations,
+                )?;
                 let observations = observations.into_boxed_slice();
                 let authority = observations
                     .first()

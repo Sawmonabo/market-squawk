@@ -115,7 +115,7 @@ impl ProviderDecimalLexeme {
     }
 
     fn retained_bytes(&self) -> usize {
-        self.lexeme.len()
+        self.lexeme.capacity()
     }
 }
 

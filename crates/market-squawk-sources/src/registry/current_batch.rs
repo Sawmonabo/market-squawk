@@ -266,6 +266,21 @@ fn current_frame_shared_allocation_charge() -> Result<usize, RegistryError> {
         .ok_or(RegistryError::RetainedSizeOverflow)
 }
 
+fn current_routed_batch_retained_bytes(
+    observation_count: usize,
+    policy_and_provider_allocations: usize,
+) -> Result<usize, RegistryError> {
+    let authority_allocation = current_authority_shared_allocation_charge()?;
+    let frame_allocation = current_frame_shared_allocation_charge()?;
+    observation_count
+        .checked_mul(std::mem::size_of::<CurrentProviderObservation>())
+        .and_then(|bytes| bytes.checked_add(std::mem::size_of::<CurrentDecodedProviderBatch>()))
+        .and_then(|bytes| bytes.checked_add(policy_and_provider_allocations))
+        .and_then(|bytes| bytes.checked_add(authority_allocation))
+        .and_then(|bytes| bytes.checked_add(frame_allocation))
+        .ok_or(RegistryError::RetainedSizeOverflow)
+}
+
 /// Exact static and runtime policy retained with one current observation.
 #[derive(Debug)]
 pub struct CurrentLivePolicy {
@@ -481,13 +496,16 @@ impl IntoIterator for CurrentDecodedProviderBatches {
 
 #[cfg(test)]
 mod stream_key_tests {
+    use std::mem::size_of;
     use std::collections::HashSet;
 
     use market_squawk_domain::{
         InstrumentId, ProviderChannel, ProviderProduct, SourceId, SourceIdentifier, VenueId,
     };
 
-    use super::CurrentStreamKey;
+    use super::{
+        CurrentProviderObservation, CurrentStreamKey, current_routed_batch_retained_bytes,
+    };
 
     fn key(
         source: &str,
@@ -519,6 +537,20 @@ mod stream_key_tests {
         ]);
 
         assert_eq!(keys.len(), 6);
+        Ok(())
+    }
+
+    #[test]
+    fn routed_batch_charges_shared_authority_and_frame_allocations_once()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const PER_OBSERVATION_DYNAMIC: usize = 137;
+        let one = current_routed_batch_retained_bytes(1, PER_OBSERVATION_DYNAMIC)?;
+        let two = current_routed_batch_retained_bytes(2, PER_OBSERVATION_DYNAMIC * 2)?;
+
+        assert_eq!(
+            two.checked_sub(one),
+            Some(size_of::<CurrentProviderObservation>() + PER_OBSERVATION_DYNAMIC)
+        );
         Ok(())
     }
 }

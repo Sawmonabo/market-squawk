@@ -160,14 +160,14 @@ impl ProviderObservationPayload {
                 quantity,
                 aggressor,
             } => checked_sum([
-                trade_id.as_str().len(),
+                trade_id.retained_bytes(),
                 price.0.retained_bytes(),
                 quantity.0.retained_bytes(),
                 aggressor
                     .provider_code
                     .as_ref()
-                    .map_or(0, |value| value.as_str().len()),
-                aggressor.rule.provider_rule().as_str().len(),
+                    .map_or(0, SourceIdentifier::retained_bytes),
+                aggressor.rule.provider_rule().retained_bytes(),
             ])?,
             Self::Quote { bid, ask } => {
                 checked_sum(bid.iter().chain(ask.iter()).flat_map(|level| {
@@ -177,27 +177,41 @@ impl ProviderObservationPayload {
                     ]
                 }))?
             }
-            Self::BookSnapshot(value) => checked_sum(
+            Self::BookSnapshot(value) => checked_sum([
                 value
                     .bids
-                    .as_slice()
-                    .iter()
-                    .chain(value.asks.as_slice())
-                    .flat_map(|level| {
-                        [
-                            level.price.0.retained_bytes(),
-                            level.quantity.0.retained_bytes(),
-                        ]
-                    }),
-            )?,
-            Self::BookDelta(value) => {
+                    .checked_allocation_bytes()
+                    .ok_or(DecodeError::RetainedSizeOverflow)?,
+                value
+                    .asks
+                    .checked_allocation_bytes()
+                    .ok_or(DecodeError::RetainedSizeOverflow)?,
+                checked_sum(
+                    value
+                        .bids
+                        .as_slice()
+                        .iter()
+                        .chain(value.asks.as_slice())
+                        .flat_map(|level| {
+                            [
+                                level.price.0.retained_bytes(),
+                                level.quantity.0.retained_bytes(),
+                            ]
+                        }),
+                )?,
+            ])?,
+            Self::BookDelta(value) => checked_sum([
+                value
+                    .changes
+                    .checked_allocation_bytes()
+                    .ok_or(DecodeError::RetainedSizeOverflow)?,
                 checked_sum(value.changes.as_slice().iter().flat_map(|change| {
                     [
                         change.level.price.0.retained_bytes(),
                         change.level.quantity.0.retained_bytes(),
                     ]
-                }))?
-            }
+                }))?,
+            ])?,
             Self::Auction {
                 provider_code,
                 rule,
@@ -205,25 +219,25 @@ impl ProviderObservationPayload {
                 paired_quantity,
                 ..
             } => checked_sum([
-                provider_code.as_str().len(),
-                rule.provider_rule().as_str().len(),
+                provider_code.retained_bytes(),
+                rule.provider_rule().retained_bytes(),
                 price.as_ref().map_or(0, |value| value.0.retained_bytes()),
                 paired_quantity.0.retained_bytes(),
             ])?,
             Self::TradingHalt { status, reason, .. } => checked_sum([
-                status.status.as_str().len(),
-                status.rule.provider_rule().as_str().len(),
-                reason.as_str().len(),
+                status.status.retained_bytes(),
+                status.rule.provider_rule().retained_bytes(),
+                reason.retained_bytes(),
             ])?,
             Self::InstrumentStatus { status, .. } => checked_sum([
-                status.status.as_str().len(),
-                status.rule.provider_rule().as_str().len(),
+                status.status.retained_bytes(),
+                status.rule.provider_rule().retained_bytes(),
             ])?,
             Self::CorporateAction {
                 action_id, rule, ..
             } => checked_sum([
-                action_id.as_str().len(),
-                rule.provider_rule().as_str().len(),
+                action_id.retained_bytes(),
+                rule.provider_rule().retained_bytes(),
             ])?,
         };
         Ok(bytes)

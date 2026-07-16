@@ -43,6 +43,10 @@ impl<T, const MAX: usize> BoundedVec<T, MAX> {
         self.0.is_empty()
     }
 
+    pub(crate) fn checked_allocation_bytes(&self) -> Option<usize> {
+        self.0.capacity().checked_mul(std::mem::size_of::<T>())
+    }
+
     pub(crate) fn into_vec(self) -> Vec<T> {
         self.0
     }
@@ -73,7 +77,7 @@ where
         let mut values = Vec::with_capacity(initial_capacity);
         while values.len() < MAX {
             let Some(value) = sequence.next_element()? else {
-                return Ok(BoundedVec(values));
+                return Ok(BoundedVec(values.into_boxed_slice().into_vec()));
             };
             values.push(value);
         }
@@ -82,7 +86,7 @@ where
                 "sequence exceeds maximum capacity {MAX}"
             )))
         } else {
-            Ok(BoundedVec(values))
+            Ok(BoundedVec(values.into_boxed_slice().into_vec()))
         }
     }
 }
@@ -209,3 +213,34 @@ impl fmt::Display for BoundExceeded {
 }
 
 impl std::error::Error for BoundExceeded {}
+
+#[cfg(test)]
+mod tests {
+    use std::mem::size_of;
+
+    use super::BoundedVec;
+
+    #[test]
+    fn bounded_vec_reports_its_complete_backing_allocation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let values = BoundedVec::<u64, 4>::try_new(vec![1, 2, 3, 4])?;
+
+        assert_eq!(
+            values.checked_allocation_bytes(),
+            Some(4 * size_of::<u64>())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn deserialization_normalizes_spare_sequence_capacity() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let values: BoundedVec<u64, 8> = serde_json::from_str("[1,2,3]")?;
+
+        assert_eq!(
+            values.checked_allocation_bytes(),
+            Some(3 * size_of::<u64>())
+        );
+        Ok(())
+    }
+}

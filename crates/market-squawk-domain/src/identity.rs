@@ -135,6 +135,13 @@ macro_rules! bounded_identity {
             pub fn as_str(&self) -> &str {
                 &self.0
             }
+
+            /// Returns bytes retained by the identifier's owned string allocation.
+            ///
+            /// This can exceed [`Self::as_str`] length when construction retained spare capacity.
+            pub fn retained_bytes(&self) -> usize {
+                self.0.capacity()
+            }
         }
 
         impl TryFrom<&str> for $name {
@@ -299,5 +306,22 @@ impl<'de> Deserialize<'de> for ConnectionGeneration {
     {
         let value = u64::deserialize(deserializer)?;
         Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SourceIdentifier;
+
+    #[test]
+    fn bounded_identity_reports_retained_capacity_not_only_encoded_length()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut value = String::with_capacity(SourceIdentifier::MAX_LENGTH);
+        value.push_str("id");
+        let identifier = SourceIdentifier::try_from(value)?;
+
+        assert_eq!(identifier.as_str().len(), 2);
+        assert!(identifier.retained_bytes() >= SourceIdentifier::MAX_LENGTH);
+        Ok(())
     }
 }

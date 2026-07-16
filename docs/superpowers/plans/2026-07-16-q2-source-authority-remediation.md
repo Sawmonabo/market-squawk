@@ -38,7 +38,7 @@ Proptest for invariants, and deterministic thread/barrier tests for concurrency.
 
 **Files:**
 
-- Modify: `crates/market-squawk-domain/src/bounded.rs`
+- Modify: `crates/market-squawk-sources/src/bounded.rs`
 - Modify: `crates/market-squawk-sources/src/decoder/payload.rs`
 - Modify: `crates/market-squawk-sources/src/decoder/batch.rs`
 - Modify: relevant source retained-size tests under `crates/market-squawk-sources/tests/`

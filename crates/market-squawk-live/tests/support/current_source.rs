@@ -24,7 +24,7 @@ use market_squawk_sources::{
     CurrentHealthReporter, CurrentSourceAuthorityLease, CurrentSourceSession, DecodedProviderBatch,
     DecoderEvidence, EndpointPolicy, FreshnessPolicy, HistoricalCapability, InstrumentCoverage,
     LiveCoverageDeclaration, LiveCoverageRule, LiveProtocolProfile, NetworkAccessPolicy,
-    ProviderAggressorEvidence, ProviderBudgetPolicy, ProviderChecksumEvidence,
+    ProviderAggressorEvidence, ProviderBookLevel, ProviderBudgetPolicy, ProviderChecksumEvidence,
     ProviderDecimalLexeme, ProviderNormalizedObservation, ProviderNumericPolicy,
     ProviderObservationPayload, ProviderPrice, ProviderQuantity, ProviderSequenceEvidence,
     ProviderSnapshotEvidence, ProviderTimestampEvidence, RawFrameFactory, RegisteredSource,
@@ -163,11 +163,14 @@ fn metadata(source: &str, revision: &str, instrument_id: &str) -> TestResult<Sou
     let live = LiveCoverageDeclaration::try_new(
         ProviderProduct::new(id("advanced-trade")?),
         ProviderChannel::new(id("market-data")?),
-        vec![LiveCoverageRule::try_new(
-            LiveEventClass::Trade,
-            None,
-            non_book,
-        )?],
+        vec![
+            LiveCoverageRule::try_new(LiveEventClass::Trade, None, non_book)?,
+            LiveCoverageRule::try_new(
+                LiveEventClass::BookSnapshot,
+                Some(market_squawk_domain::MarketDepth::PriceLevel),
+                SnapshotApplicability::Required,
+            )?,
+        ],
     )?;
     let coverage = SourceCoverage::try_instrument(
         evidence(3),
@@ -411,6 +414,75 @@ impl SourceHarness {
                     rule("coinbase-aggressor")?,
                 ),
             },
+        )?;
+        let decoded = DecodedProviderBatch::try_new(decoder, vec![observation])?;
+        let evaluated_at = now()?;
+        let current = self
+            .registry
+            .validate_current_authority(&self.session, evaluated_at)?;
+        let lease = current.try_current_lease(evaluated_at)?;
+        let batches = current.validate_decoded_batch_owned(decoded, receipt)?;
+        let mut batches = batches.into_iter();
+        let batch = batches.next().ok_or("missing routed current batch")?;
+        if batches.next().is_some() {
+            return Err("fixture unexpectedly produced multiple routes".into());
+        }
+        Ok((lease, batch))
+    }
+
+    #[allow(
+        dead_code,
+        reason = "the shared fixture's nested-book helper is used by private admission tests"
+    )]
+    pub(super) fn book_snapshot_batch(
+        &mut self,
+        source_identifier: &str,
+        sequence: u64,
+        level_count: usize,
+    ) -> TestResult<(CurrentSourceAuthorityLease, CurrentDecodedProviderBatch)> {
+        let frame_at = next_after(self.last_frame_at)?;
+        self.last_frame_at = frame_at;
+        let frame = self.frames.try_frame(
+            frame_at,
+            TransportFrameKind::Binary,
+            source_identifier.as_bytes().to_vec().into(),
+        )?;
+        self.capture_admission.preflight(&frame)?;
+        let receipt = self.capture_admission.issue_after_enqueue(&frame)?;
+        self.capture_admission.validate_active(&frame)?;
+        let validated = self.session.validate_live_frame(&frame)?;
+        let decoder = DecoderEvidence::from_validated_frame(&validated, rule("coinbase-decoder")?);
+        let levels = (0..level_count)
+            .map(|_| {
+                Ok(ProviderBookLevel::new(
+                    ProviderPrice::new(ProviderDecimalLexeme::try_new("100.00")?),
+                    ProviderQuantity::new(ProviderDecimalLexeme::try_new("1.00")?),
+                ))
+            })
+            .collect::<TestResult<Vec<_>>>()?;
+        let observation = ProviderNormalizedObservation::try_new(
+            id(source_identifier)?,
+            VenueId::try_from(VENUE)?,
+            instrument(&self.instrument_id)?,
+            ProviderTimestampEvidence::Provided {
+                value: frame_at,
+                rule: rule("coinbase-timestamp")?,
+            },
+            ProviderSequenceEvidence::Provided {
+                value: SequenceNumber::new(sequence),
+                rule: rule("coinbase-sequence")?,
+            },
+            ProviderSnapshotEvidence::InitializingSnapshot {
+                provider_reference: Some(id(source_identifier)?),
+            },
+            ProviderChecksumEvidence::Unsupported {
+                rule: rule("coinbase-no-checksum")?,
+            },
+            ProviderObservationPayload::book_snapshot(
+                market_squawk_domain::MarketDepth::PriceLevel,
+                levels,
+                Vec::new(),
+            )?,
         )?;
         let decoded = DecodedProviderBatch::try_new(decoder, vec![observation])?;
         let evaluated_at = now()?;
