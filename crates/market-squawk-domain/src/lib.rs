@@ -30,8 +30,9 @@ pub use financial::{
 };
 pub use identifiers::{
     BitcoinAddressType, BitcoinNetwork, ChainAddress, ChainAddressRole, ChainAddressRule, ChainId,
-    ContractMonth, CryptoPair, CryptoProductType, Cusip, Figi, FuturesContractIdentity, FuturesLeg,
-    FuturesLegSide, FuturesLifecycleDates, FuturesSecurityType, IdentifierError, Isin,
+    ContractMonth, CryptoPair, CryptoProductType, Cusip, Figi, FuturesContractIdentity,
+    FuturesContractIdentityInput, FuturesLeg, FuturesLegSide, FuturesLifecycleDateFields,
+    FuturesLifecycleDates, FuturesLifecycleDatesInput, FuturesSecurityType, IdentifierError, Isin,
     OccOptionIdentity, OptionKind, Sedol, Ticker, VenueSymbol,
 };
 pub use identity::{
@@ -40,10 +41,10 @@ pub use identity::{
 };
 pub use instrument::{
     AssetClass, AssignmentVerification, ContractRollMapping, EffectiveInterval, ExternalIdentifier,
-    ExternalIdentifierRecord, IdentifierEntitlement, IdentifierRightsPolicyReference,
-    IdentifierSyntaxVerification, InstrumentDefinition, InstrumentError, LifecycleTransition,
-    LifecycleTransitionKind, ProviderIdentityRecord, SymbolIdentityRecord, TradingStatus,
-    VenueMapping,
+    ExternalIdentifierRecord, ExternalIdentifierRecordInput, IdentifierEntitlement,
+    IdentifierRightsPolicyReference, IdentifierSyntaxVerification, InstrumentDefinition,
+    InstrumentDefinitionInput, InstrumentError, LifecycleTransition, LifecycleTransitionKind,
+    ProviderIdentityRecord, SymbolIdentityRecord, TradingStatus, VenueMapping,
 };
 pub use market::{
     AggressorSide, AuctionEvent, AuctionPhase, BookChange, BookDeltaEvent, BookLevel,

@@ -4,9 +4,11 @@ use market_squawk_domain::{
     AssetClass, AssignmentVerification, BasisPoints, CalendarDate, ChainAddress, ChainAddressRole,
     ChainId, ConnectionGeneration, ContractMonth, ContractRollMapping, CryptoPair,
     CryptoProductType, Currency, Cusip, Denomination, EffectiveInterval, ExternalIdentifier,
-    ExternalIdentifierRecord, Figi, FinancialError, FuturesContractIdentity, FuturesLifecycleDates,
-    FuturesSecurityType, IdentifierEntitlement, IdentifierError, IdentifierRightsPolicyReference,
-    IdentityError, InstrumentDefinition, InstrumentError, InstrumentId, Isin, LifecycleTransition,
+    ExternalIdentifierRecord, ExternalIdentifierRecordInput, Figi, FinancialError,
+    FuturesContractIdentity, FuturesContractIdentityInput, FuturesLifecycleDateFields,
+    FuturesLifecycleDates, FuturesLifecycleDatesInput, FuturesSecurityType, IdentifierEntitlement,
+    IdentifierError, IdentifierRightsPolicyReference, IdentityError, InstrumentDefinition,
+    InstrumentDefinitionInput, InstrumentError, InstrumentId, Isin, LifecycleTransition,
     LifecycleTransitionKind, LotSize, Money, OccOptionIdentity, OptionKind, PayloadReference,
     PriceError, PriceTicks, ProviderIdentityRecord, ProviderInstrumentId, QuantityError,
     QuantityLots, RoundingPolicy, Sedol, SequenceNumber, SourceId, SourceIdentifier,
@@ -389,31 +391,30 @@ fn futures_identity_uses_venue_fields_instead_of_parsing_a_universal_symbol()
         Err(IdentifierError::InvalidDate)
     );
     let expiry = ContractMonth::new(2026, 3)?;
-    let lifecycle = FuturesLifecycleDates::try_new(
-        SourceId::try_from("cme-reference")?,
-        PayloadReference::SourceReference(SourceIdentifier::try_from("security-definition:1")?),
-        Timestamp::from_unix_nanos(1),
-        Some(CalendarDate::new(2026, 3, 20)?),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-    )?;
-    let contract = FuturesContractIdentity::try_new(
-        VenueId::try_from("XCME")?,
-        ProviderInstrumentId::try_from("123456")?,
-        SourceIdentifier::try_from("8")?,
-        ProviderInstrumentId::try_from("ES")?,
-        VenueSymbol::try_from("ESH6")?,
-        FuturesSecurityType::Future,
-        expiry,
+    let lifecycle = FuturesLifecycleDates::try_new(FuturesLifecycleDatesInput {
+        source_id: SourceId::try_from("cme-reference")?,
+        source_reference: PayloadReference::SourceReference(SourceIdentifier::try_from(
+            "security-definition:1",
+        )?),
+        observed_at: Timestamp::from_unix_nanos(1),
+        dates: FuturesLifecycleDateFields {
+            maturity_date: Some(CalendarDate::new(2026, 3, 20)?),
+            ..FuturesLifecycleDateFields::default()
+        },
+    })?;
+    let contract = FuturesContractIdentity::try_new(FuturesContractIdentityInput {
+        venue_id: VenueId::try_from("XCME")?,
+        security_id: ProviderInstrumentId::try_from("123456")?,
+        security_id_source: SourceIdentifier::try_from("8")?,
+        product_code: ProviderInstrumentId::try_from("ES")?,
+        native_symbol: VenueSymbol::try_from("ESH6")?,
+        security_type: FuturesSecurityType::Future,
+        contract_month: Some(expiry),
         lifecycle,
-        Vec::new(),
-    )?;
+        legs: Vec::new(),
+    })?;
     assert_eq!(contract.native_symbol().as_str(), "ESH6");
-    assert_eq!(contract.contract_month(), expiry);
+    assert_eq!(contract.contract_month(), Some(expiry));
     Ok(())
 }
 
@@ -559,36 +560,41 @@ fn instrument_definition_owns_precision_mappings_identifiers_and_status()
 -> Result<(), Box<dyn std::error::Error>> {
     let id = InstrumentId::try_from(Uuid::parse_str("936da01f-9abd-4d9d-80c7-02af85c822a8")?)?;
     let venue = VenueId::try_from("XNAS")?;
-    let mapping = VenueMapping::new(
-        venue.clone(),
-        VenueSymbol::try_from("AAPL")?,
-        Some(ProviderInstrumentId::try_from("AAPL.O")?),
+    let mapping = VenueMapping::new(venue.clone(), VenueSymbol::try_from("AAPL")?);
+    let provider_identity = ProviderIdentityRecord::new(
+        id,
+        SourceId::try_from("user-reference")?,
+        ProviderInstrumentId::try_from("AAPL.O")?,
+        EffectiveInterval::new(Timestamp::from_unix_nanos(1), None)?,
     );
     let identifier = ExternalIdentifier::Isin(Isin::try_from("US0378331005")?);
-    let identifier_record = ExternalIdentifierRecord::new(
+    let identifier_record = ExternalIdentifierRecord::new(ExternalIdentifierRecordInput {
         identifier,
-        AssignmentVerification::Unverified,
-        SourceId::try_from("user-reference")?,
-        PayloadReference::SourceReference(SourceIdentifier::try_from("instrument-row:1")?),
-        None,
-        Timestamp::from_unix_nanos(1),
-        EffectiveInterval::new(Timestamp::from_unix_nanos(1), None)?,
-        IdentifierRightsPolicyReference::new(
+        assignment_verification: AssignmentVerification::Unverified,
+        source_id: SourceId::try_from("user-reference")?,
+        source_reference: PayloadReference::SourceReference(SourceIdentifier::try_from(
+            "instrument-row:1",
+        )?),
+        source_timestamp: None,
+        observed_at: Timestamp::from_unix_nanos(1),
+        validity: EffectiveInterval::new(Timestamp::from_unix_nanos(1), None)?,
+        rights_policy: IdentifierRightsPolicyReference::new(
             SourceIdentifier::try_from("policy:user-local-v1")?,
             IdentifierEntitlement::UserOwned,
             SourceIdentifier::try_from("user-provided")?,
         ),
-    );
-    let definition = InstrumentDefinition::try_new(
-        id,
-        AssetClass::Equity,
-        Denomination::Currency(Currency::try_from("USD")?),
-        TickSize::try_from_decimal(Decimal::new(1, 2))?,
-        LotSize::try_from_decimal(Decimal::ONE)?,
-        vec![mapping.clone()],
-        vec![identifier_record.clone()],
-        TradingStatus::Active,
-    )?;
+    });
+    let definition = InstrumentDefinition::try_new(InstrumentDefinitionInput {
+        instrument_id: id,
+        asset_class: AssetClass::Equity,
+        primary_denomination: Denomination::Currency(Currency::try_from("USD")?),
+        tick_size: TickSize::try_from_decimal(Decimal::new(1, 2))?,
+        lot_size: LotSize::try_from_decimal(Decimal::ONE)?,
+        venue_mappings: vec![mapping.clone()],
+        provider_identities: vec![provider_identity.clone()],
+        identifiers: vec![identifier_record.clone()],
+        trading_status: TradingStatus::Active,
+    })?;
     assert_eq!(definition.instrument_id(), id);
     assert_eq!(definition.asset_class(), AssetClass::Equity);
     assert_eq!(
@@ -598,20 +604,25 @@ fn instrument_definition_owns_precision_mappings_identifiers_and_status()
     assert_eq!(definition.tick_size().as_decimal(), Decimal::new(1, 2));
     assert_eq!(definition.lot_size().as_decimal(), Decimal::ONE);
     assert_eq!(definition.venue_mappings(), std::slice::from_ref(&mapping));
+    assert_eq!(
+        definition.provider_identities(),
+        std::slice::from_ref(&provider_identity)
+    );
     assert_eq!(definition.identifiers(), &[identifier_record]);
     assert_eq!(definition.trading_status(), TradingStatus::Active);
 
     assert_eq!(
-        InstrumentDefinition::try_new(
-            id,
-            AssetClass::Equity,
-            Denomination::Currency(Currency::try_from("USD")?),
-            TickSize::try_from_decimal(Decimal::new(1, 2))?,
-            LotSize::try_from_decimal(Decimal::ONE)?,
-            vec![mapping.clone(), mapping],
-            Vec::new(),
-            TradingStatus::Active,
-        ),
+        InstrumentDefinition::try_new(InstrumentDefinitionInput {
+            instrument_id: id,
+            asset_class: AssetClass::Equity,
+            primary_denomination: Denomination::Currency(Currency::try_from("USD")?),
+            tick_size: TickSize::try_from_decimal(Decimal::new(1, 2))?,
+            lot_size: LotSize::try_from_decimal(Decimal::ONE)?,
+            venue_mappings: vec![mapping.clone(), mapping],
+            provider_identities: Vec::new(),
+            identifiers: Vec::new(),
+            trading_status: TradingStatus::Active,
+        }),
         Err(InstrumentError::DuplicateVenueMapping { venue })
     );
     Ok(())

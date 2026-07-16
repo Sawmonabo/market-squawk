@@ -246,7 +246,8 @@ mod digital_assets;
 mod securities;
 
 pub use derivatives::{
-    ContractMonth, FuturesContractIdentity, FuturesLeg, FuturesLegSide, FuturesLifecycleDates,
+    ContractMonth, FuturesContractIdentity, FuturesContractIdentityInput, FuturesLeg,
+    FuturesLegSide, FuturesLifecycleDateFields, FuturesLifecycleDates, FuturesLifecycleDatesInput,
     FuturesSecurityType, OccOptionIdentity, OptionKind,
 };
 pub use digital_assets::{

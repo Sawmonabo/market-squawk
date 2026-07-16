@@ -1,11 +1,11 @@
 use market_squawk_domain::{
     AssetClass, AssignmentVerification, ContractRollMapping, Currency, Denomination,
-    EffectiveInterval, ExternalIdentifier, ExternalIdentifierRecord, IdentifierEntitlement,
-    IdentifierRightsPolicyReference, IdentifierSyntaxVerification, InstrumentDefinition,
-    InstrumentError, InstrumentId, Isin, LifecycleTransition, LifecycleTransitionKind, LotSize,
-    PayloadHash, PayloadHashAlgorithm, PayloadReference, ProviderIdentityRecord,
-    ProviderInstrumentId, SourceId, SourceIdentifier, SymbolIdentityRecord, TickSize, Timestamp,
-    TradingStatus, VenueId, VenueMapping, VenueSymbol,
+    EffectiveInterval, ExternalIdentifier, ExternalIdentifierRecord, ExternalIdentifierRecordInput,
+    IdentifierEntitlement, IdentifierRightsPolicyReference, IdentifierSyntaxVerification,
+    InstrumentDefinition, InstrumentDefinitionInput, InstrumentError, InstrumentId, Isin,
+    LifecycleTransition, LifecycleTransitionKind, LotSize, PayloadHash, PayloadHashAlgorithm,
+    PayloadReference, ProviderIdentityRecord, ProviderInstrumentId, SourceId, SourceIdentifier,
+    SymbolIdentityRecord, TickSize, Timestamp, TradingStatus, VenueId, VenueMapping, VenueSymbol,
 };
 use rust_decimal::Decimal;
 use uuid::Uuid;
@@ -24,14 +24,19 @@ fn rights() -> Result<IdentifierRightsPolicyReference, Box<dyn std::error::Error
 
 fn identifier_record() -> Result<ExternalIdentifierRecord, Box<dyn std::error::Error>> {
     Ok(ExternalIdentifierRecord::new(
-        ExternalIdentifier::Isin(Isin::try_from("US0378331005")?),
-        AssignmentVerification::VerifiedAssigned,
-        SourceId::try_from("anna-reference")?,
-        PayloadReference::ContentHash(PayloadHash::new(PayloadHashAlgorithm::Sha256, [3_u8; 32])),
-        Some(Timestamp::from_unix_nanos(90)),
-        Timestamp::from_unix_nanos(100),
-        EffectiveInterval::new(Timestamp::from_unix_nanos(80), None)?,
-        rights()?,
+        ExternalIdentifierRecordInput {
+            identifier: ExternalIdentifier::Isin(Isin::try_from("US0378331005")?),
+            assignment_verification: AssignmentVerification::VerifiedAssigned,
+            source_id: SourceId::try_from("anna-reference")?,
+            source_reference: PayloadReference::ContentHash(PayloadHash::new(
+                PayloadHashAlgorithm::Sha256,
+                [3_u8; 32],
+            )),
+            source_timestamp: Some(Timestamp::from_unix_nanos(90)),
+            observed_at: Timestamp::from_unix_nanos(100),
+            validity: EffectiveInterval::new(Timestamp::from_unix_nanos(80), None)?,
+            rights_policy: rights()?,
+        },
     ))
 }
 
@@ -102,32 +107,34 @@ fn definition_uses_typed_denomination_and_rejects_duplicate_identifiers()
     let id = instrument("936da01f-9abd-4d9d-80c7-02af85c822a8")?;
     let settlement_asset = instrument("7d9e9f3e-b62d-4fce-a85f-fad3ca549c97")?;
     let record = identifier_record()?;
-    let definition = InstrumentDefinition::try_new(
-        id,
-        AssetClass::Crypto,
-        Denomination::Asset(settlement_asset),
-        TickSize::try_from_decimal(Decimal::new(1, 2))?,
-        LotSize::try_from_decimal(Decimal::ONE)?,
-        Vec::new(),
-        vec![record.clone()],
-        TradingStatus::Active,
-    )?;
+    let definition = InstrumentDefinition::try_new(InstrumentDefinitionInput {
+        instrument_id: id,
+        asset_class: AssetClass::Crypto,
+        primary_denomination: Denomination::Asset(settlement_asset),
+        tick_size: TickSize::try_from_decimal(Decimal::new(1, 2))?,
+        lot_size: LotSize::try_from_decimal(Decimal::ONE)?,
+        venue_mappings: Vec::new(),
+        provider_identities: Vec::new(),
+        identifiers: vec![record.clone()],
+        trading_status: TradingStatus::Active,
+    })?;
     assert_eq!(
         definition.primary_denomination(),
         Denomination::Asset(settlement_asset)
     );
     assert_eq!(definition.identifiers(), std::slice::from_ref(&record));
     assert_eq!(
-        InstrumentDefinition::try_new(
-            id,
-            AssetClass::Equity,
-            Denomination::Currency(Currency::try_from("USD")?),
-            TickSize::try_from_decimal(Decimal::new(1, 2))?,
-            LotSize::try_from_decimal(Decimal::ONE)?,
-            Vec::new(),
-            vec![record.clone(), record],
-            TradingStatus::Active,
-        ),
+        InstrumentDefinition::try_new(InstrumentDefinitionInput {
+            instrument_id: id,
+            asset_class: AssetClass::Equity,
+            primary_denomination: Denomination::Currency(Currency::try_from("USD")?),
+            tick_size: TickSize::try_from_decimal(Decimal::new(1, 2))?,
+            lot_size: LotSize::try_from_decimal(Decimal::ONE)?,
+            venue_mappings: Vec::new(),
+            provider_identities: Vec::new(),
+            identifiers: vec![record.clone(), record],
+            trading_status: TradingStatus::Active,
+        }),
         Err(InstrumentError::DuplicateExternalIdentifier)
     );
     Ok(())
@@ -138,20 +145,23 @@ fn identity_records_and_mappings_expose_complete_borrowed_state()
 -> Result<(), Box<dyn std::error::Error>> {
     let id = instrument("936da01f-9abd-4d9d-80c7-02af85c822a8")?;
     let validity = EffectiveInterval::new(Timestamp::from_unix_nanos(1), None)?;
-    let mapping = VenueMapping::new(
-        VenueId::try_from("XNAS")?,
-        VenueSymbol::try_from("AAPL")?,
-        Some(ProviderInstrumentId::try_from("AAPL.O")?),
-    );
+    let mapping = VenueMapping::new(VenueId::try_from("XNAS")?, VenueSymbol::try_from("AAPL")?);
     assert_eq!(mapping.venue_id().as_str(), "XNAS");
     assert_eq!(mapping.venue_symbol().as_str(), "AAPL");
-    assert_eq!(
-        mapping
-            .provider_instrument_id()
-            .map(ProviderInstrumentId::as_str),
-        Some("AAPL.O")
-    );
     assert_eq!(mapping.to_string(), "XNAS:AAPL");
+    assert!(
+        serde_json::to_value(&mapping)?
+            .get("provider_instrument_id")
+            .is_none()
+    );
+    assert!(
+        serde_json::from_value::<VenueMapping>(serde_json::json!({
+            "venue_id": "XNAS",
+            "venue_symbol": "AAPL",
+            "provider_instrument_id": "AAPL.O"
+        }))
+        .is_err()
+    );
 
     let symbol = SymbolIdentityRecord::new(
         id,
@@ -195,5 +205,93 @@ fn identity_records_and_mappings_expose_complete_borrowed_state()
     assert_eq!(roll.to_instrument_id(), successor);
     assert_eq!(roll.effective_at(), effective_at);
     assert!(roll.to_string().contains("->"));
+    Ok(())
+}
+
+#[test]
+fn provider_identity_text_is_qualified_by_source_in_instrument_definition()
+-> Result<(), Box<dyn std::error::Error>> {
+    let id = instrument("936da01f-9abd-4d9d-80c7-02af85c822a8")?;
+    let validity = EffectiveInterval::new(Timestamp::from_unix_nanos(1), None)?;
+    let first = ProviderIdentityRecord::new(
+        id,
+        SourceId::try_from("vendor-alpha")?,
+        ProviderInstrumentId::try_from("12345")?,
+        validity,
+    );
+    let second = ProviderIdentityRecord::new(
+        id,
+        SourceId::try_from("vendor-beta")?,
+        ProviderInstrumentId::try_from("12345")?,
+        validity,
+    );
+    let definition = InstrumentDefinition::try_new(InstrumentDefinitionInput {
+        instrument_id: id,
+        asset_class: AssetClass::Equity,
+        primary_denomination: Denomination::Currency(Currency::try_from("USD")?),
+        tick_size: TickSize::try_from_decimal(Decimal::new(1, 2))?,
+        lot_size: LotSize::try_from_decimal(Decimal::ONE)?,
+        venue_mappings: vec![VenueMapping::new(
+            VenueId::try_from("XNAS")?,
+            VenueSymbol::try_from("ACME")?,
+        )],
+        provider_identities: vec![first.clone(), second.clone()],
+        identifiers: Vec::new(),
+        trading_status: TradingStatus::Active,
+    })?;
+
+    assert_eq!(definition.provider_identities(), &[first.clone(), second]);
+    assert_ne!(
+        definition.provider_identities()[0].source_id(),
+        definition.provider_identities()[1].source_id()
+    );
+    assert_eq!(
+        definition.provider_identities()[0]
+            .provider_instrument_id()
+            .as_str(),
+        definition.provider_identities()[1]
+            .provider_instrument_id()
+            .as_str()
+    );
+
+    let mut ambiguous_wire = serde_json::to_value(&definition)?;
+    ambiguous_wire["provider_instrument_id"] = serde_json::json!("12345");
+    assert!(serde_json::from_value::<InstrumentDefinition>(ambiguous_wire).is_err());
+
+    let definition_input = || -> Result<InstrumentDefinitionInput, Box<dyn std::error::Error>> {
+        Ok(InstrumentDefinitionInput {
+            instrument_id: id,
+            asset_class: AssetClass::Equity,
+            primary_denomination: Denomination::Currency(Currency::try_from("USD")?),
+            tick_size: TickSize::try_from_decimal(Decimal::new(1, 2))?,
+            lot_size: LotSize::try_from_decimal(Decimal::ONE)?,
+            venue_mappings: Vec::new(),
+            provider_identities: Vec::new(),
+            identifiers: Vec::new(),
+            trading_status: TradingStatus::Active,
+        })
+    };
+    let mut duplicate = definition_input()?;
+    duplicate.provider_identities = vec![first.clone(), first];
+    assert_eq!(
+        InstrumentDefinition::try_new(duplicate),
+        Err(InstrumentError::DuplicateProviderIdentity)
+    );
+
+    let other_id = instrument("7d9e9f3e-b62d-4fce-a85f-fad3ca549c97")?;
+    let mut mismatched = definition_input()?;
+    mismatched.provider_identities = vec![ProviderIdentityRecord::new(
+        other_id,
+        SourceId::try_from("vendor-alpha")?,
+        ProviderInstrumentId::try_from("12345")?,
+        validity,
+    )];
+    assert_eq!(
+        InstrumentDefinition::try_new(mismatched),
+        Err(InstrumentError::ProviderIdentityInstrumentMismatch {
+            definition: id,
+            record: other_id,
+        })
+    );
     Ok(())
 }

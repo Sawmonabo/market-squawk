@@ -1,6 +1,6 @@
 use market_squawk_domain::{
     Currency, FinancialError, LotSize, Money, PriceError, PriceTicks, QuantityError, QuantityLots,
-    TickSize,
+    RoundingPolicy, TickSize,
 };
 use num_bigint::BigInt;
 use proptest::prelude::*;
@@ -8,11 +8,100 @@ use proptest::test_runner::Config;
 use rust_decimal::Decimal;
 
 const MAX_DECIMAL_MANTISSA: i128 = 79_228_162_514_264_337_593_543_950_335;
+const ROUNDING_POLICIES: [RoundingPolicy; 5] = [
+    RoundingPolicy::NearestEven,
+    RoundingPolicy::AwayFromZero,
+    RoundingPolicy::TowardZero,
+    RoundingPolicy::Floor,
+    RoundingPolicy::Ceiling,
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RatioOracleError {
     Inexact,
     Overflow,
+}
+
+proptest! {
+    #![proptest_config(Config {
+        cases: 4_096,
+        failure_persistence: None,
+        ..Config::default()
+    })]
+
+    #[test]
+    fn explicit_price_rounding_matches_independent_bigint_rational_oracle(
+        value_high in any::<u32>(),
+        value_low in any::<u64>(),
+        value_negative in any::<bool>(),
+        value_scale in 0_u32..=Decimal::MAX_SCALE,
+        increment_high in any::<u32>(),
+        increment_low in any::<u64>(),
+        increment_scale in 0_u32..=Decimal::MAX_SCALE,
+    ) {
+        let Some(value) = decimal_from_parts(value_high, value_low, value_negative, value_scale)
+        else {
+            return Ok(());
+        };
+        let Some(increment) = positive_decimal_from_parts(
+            increment_high,
+            increment_low,
+            increment_scale,
+        ) else {
+            return Ok(());
+        };
+        let tick_result = TickSize::try_from_decimal(increment);
+        prop_assert!(tick_result.is_ok());
+        let Some(tick) = tick_result.ok() else {
+            return Ok(());
+        };
+
+        for policy in ROUNDING_POLICIES {
+            let actual = PriceTicks::from_decimal_rounded(value, tick, policy);
+            match rounded_ratio_oracle(value, tick.as_decimal(), policy) {
+                Some(expected) => prop_assert_eq!(actual, Ok(PriceTicks::new(expected))),
+                None => prop_assert_eq!(actual, Err(PriceError::Overflow)),
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_quantity_rounding_matches_independent_bigint_rational_oracle(
+        value_high in any::<u32>(),
+        value_low in any::<u64>(),
+        value_scale in 0_u32..=Decimal::MAX_SCALE,
+        increment_high in any::<u32>(),
+        increment_low in any::<u64>(),
+        increment_scale in 0_u32..=Decimal::MAX_SCALE,
+    ) {
+        let Some(value) = decimal_from_parts(value_high, value_low, false, value_scale) else {
+            return Ok(());
+        };
+        let Some(increment) = positive_decimal_from_parts(
+            increment_high,
+            increment_low,
+            increment_scale,
+        ) else {
+            return Ok(());
+        };
+        let lot_result = LotSize::try_from_decimal(increment);
+        prop_assert!(lot_result.is_ok());
+        let Some(lot) = lot_result.ok() else {
+            return Ok(());
+        };
+
+        for policy in ROUNDING_POLICIES {
+            let actual = QuantityLots::from_decimal_rounded(value, lot, policy);
+            match rounded_ratio_oracle(value, lot.as_decimal(), policy) {
+                Some(expected) => {
+                    let expected = QuantityLots::new(expected);
+                    prop_assert!(expected.is_ok());
+                    prop_assert_eq!(actual, expected);
+                }
+                None => prop_assert_eq!(actual, Err(QuantityError::Overflow)),
+            }
+        }
+    }
 }
 
 fn decimal_from_parts(high: u32, low: u64, is_negative: bool, scale: u32) -> Option<Decimal> {
@@ -34,6 +123,93 @@ fn ratio_oracle(value: Decimal, increment: Decimal) -> Result<i64, RatioOracleEr
         return Err(RatioOracleError::Inexact);
     }
     i64::try_from(numerator / denominator).map_err(|_| RatioOracleError::Overflow)
+}
+
+/// Independently rounds the exact rational represented by two decimals.
+///
+/// This deliberately does not share factor cancellation, sign conversion, or rounding helpers
+/// with the production kernel. `BigInt` makes the pre-rounding quotient exact at every Decimal
+/// scale before the final, independently checked `i64` conversion.
+fn rounded_ratio_oracle(value: Decimal, increment: Decimal, policy: RoundingPolicy) -> Option<i64> {
+    let is_negative = value.is_sign_negative();
+    let numerator =
+        BigInt::from(value.mantissa().unsigned_abs()) * BigInt::from(10_u8).pow(increment.scale());
+    let denominator =
+        BigInt::from(increment.mantissa().unsigned_abs()) * BigInt::from(10_u8).pow(value.scale());
+    let mut quotient = &numerator / &denominator;
+    let remainder = numerator % &denominator;
+    let has_remainder = remainder != BigInt::from(0_u8);
+    let increment_magnitude = match policy {
+        RoundingPolicy::NearestEven => {
+            let doubled_remainder = &remainder * BigInt::from(2_u8);
+            doubled_remainder > denominator
+                || (doubled_remainder == denominator
+                    && &quotient % BigInt::from(2_u8) != BigInt::from(0_u8))
+        }
+        RoundingPolicy::AwayFromZero => has_remainder,
+        RoundingPolicy::TowardZero => false,
+        RoundingPolicy::Floor => is_negative && has_remainder,
+        RoundingPolicy::Ceiling => !is_negative && has_remainder,
+    };
+    if increment_magnitude {
+        quotient += BigInt::from(1_u8);
+    }
+    if is_negative {
+        quotient = -quotient;
+    }
+    i64::try_from(quotient).ok()
+}
+
+#[test]
+fn explicit_rounding_checks_i64_boundaries_after_rounding() -> Result<(), Box<dyn std::error::Error>>
+{
+    let unit_tick = TickSize::try_from_decimal(Decimal::ONE)?;
+    let unit_lot = LotSize::try_from_decimal(Decimal::ONE)?;
+    let above_max = Decimal::try_from_i128_with_scale(i128::from(i64::MAX) * 10 + 1, 1)?;
+    let below_min = Decimal::try_from_i128_with_scale(i128::from(i64::MIN) * 10 - 1, 1)?;
+
+    for policy in [
+        RoundingPolicy::NearestEven,
+        RoundingPolicy::TowardZero,
+        RoundingPolicy::Floor,
+    ] {
+        assert_eq!(
+            PriceTicks::from_decimal_rounded(above_max, unit_tick, policy),
+            Ok(PriceTicks::new(i64::MAX))
+        );
+        assert_eq!(
+            QuantityLots::from_decimal_rounded(above_max, unit_lot, policy),
+            QuantityLots::new(i64::MAX)
+        );
+    }
+    for policy in [RoundingPolicy::AwayFromZero, RoundingPolicy::Ceiling] {
+        assert_eq!(
+            PriceTicks::from_decimal_rounded(above_max, unit_tick, policy),
+            Err(PriceError::Overflow)
+        );
+        assert_eq!(
+            QuantityLots::from_decimal_rounded(above_max, unit_lot, policy),
+            Err(QuantityError::Overflow)
+        );
+    }
+
+    for policy in [
+        RoundingPolicy::NearestEven,
+        RoundingPolicy::TowardZero,
+        RoundingPolicy::Ceiling,
+    ] {
+        assert_eq!(
+            PriceTicks::from_decimal_rounded(below_min, unit_tick, policy),
+            Ok(PriceTicks::new(i64::MIN))
+        );
+    }
+    for policy in [RoundingPolicy::AwayFromZero, RoundingPolicy::Floor] {
+        assert_eq!(
+            PriceTicks::from_decimal_rounded(below_min, unit_tick, policy),
+            Err(PriceError::Overflow)
+        );
+    }
+    Ok(())
 }
 
 fn is_power_of_ten(mut value: u64) -> bool {

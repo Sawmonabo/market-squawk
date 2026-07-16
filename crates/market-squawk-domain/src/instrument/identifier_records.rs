@@ -158,19 +158,43 @@ pub struct ExternalIdentifierRecord {
     rights_policy: IdentifierRightsPolicyReference,
 }
 
+/// Complete evidence input for constructing [`ExternalIdentifierRecord`].
+///
+/// Syntax verification is intentionally absent because it is derived from `identifier` and
+/// cannot be asserted by callers.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct ExternalIdentifierRecordInput {
+    /// Validated typed external identifier.
+    pub identifier: ExternalIdentifier,
+    /// Authoritative assignment verification result.
+    pub assignment_verification: AssignmentVerification,
+    /// Evidence source namespace.
+    pub source_id: SourceId,
+    /// Immutable source evidence.
+    pub source_reference: PayloadReference,
+    /// Source timestamp when supplied.
+    pub source_timestamp: Option<Timestamp>,
+    /// Local first-observation time.
+    pub observed_at: Timestamp,
+    /// Half-open interval during which this attachment applies.
+    pub validity: EffectiveInterval,
+    /// Versioned data-rights decision.
+    pub rights_policy: IdentifierRightsPolicyReference,
+}
+
 impl ExternalIdentifierRecord {
     /// Constructs an evidence-bearing attachment from a validated identifier.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        identifier: ExternalIdentifier,
-        assignment_verification: AssignmentVerification,
-        source_id: SourceId,
-        source_reference: PayloadReference,
-        source_timestamp: Option<Timestamp>,
-        observed_at: Timestamp,
-        validity: EffectiveInterval,
-        rights_policy: IdentifierRightsPolicyReference,
-    ) -> Self {
+    pub fn new(input: ExternalIdentifierRecordInput) -> Self {
+        let ExternalIdentifierRecordInput {
+            identifier,
+            assignment_verification,
+            source_id,
+            source_reference,
+            source_timestamp,
+            observed_at,
+            validity,
+            rights_policy,
+        } = input;
         let syntax_verification = identifier.syntax_verification();
         Self {
             identifier,
@@ -287,15 +311,15 @@ impl<'de> Deserialize<'de> for ExternalIdentifierRecord {
         D: Deserializer<'de>,
     {
         let wire = ExternalIdentifierRecordWire::deserialize(deserializer)?;
-        Ok(Self::new(
-            wire.identifier,
-            wire.assignment_verification,
-            wire.source_id,
-            wire.source_reference,
-            wire.source_timestamp,
-            wire.observed_at,
-            wire.validity,
-            wire.rights_policy,
-        ))
+        Ok(Self::new(ExternalIdentifierRecordInput {
+            identifier: wire.identifier,
+            assignment_verification: wire.assignment_verification,
+            source_id: wire.source_id,
+            source_reference: wire.source_reference,
+            source_timestamp: wire.source_timestamp,
+            observed_at: wire.observed_at,
+            validity: wire.validity,
+            rights_policy: wire.rights_policy,
+        }))
     }
 }

@@ -11,8 +11,9 @@ use crate::{
 mod identifier_records;
 
 pub use identifier_records::{
-    AssignmentVerification, ExternalIdentifier, ExternalIdentifierRecord, IdentifierEntitlement,
-    IdentifierRightsPolicyReference, IdentifierSyntaxVerification,
+    AssignmentVerification, ExternalIdentifier, ExternalIdentifierRecord,
+    ExternalIdentifierRecordInput, IdentifierEntitlement, IdentifierRightsPolicyReference,
+    IdentifierSyntaxVerification,
 };
 
 /// A broad instrument asset family, separate from Task 4 evidence classifications.
@@ -57,23 +58,20 @@ pub enum TradingStatus {
 
 /// An instrument's symbol mapping in one venue namespace.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct VenueMapping {
     venue_id: VenueId,
     venue_symbol: VenueSymbol,
-    provider_instrument_id: Option<ProviderInstrumentId>,
 }
 
 impl VenueMapping {
-    /// Constructs a venue symbol mapping with an optional source-native instrument ID.
-    pub fn new(
-        venue_id: VenueId,
-        venue_symbol: VenueSymbol,
-        provider_instrument_id: Option<ProviderInstrumentId>,
-    ) -> Self {
+    /// Constructs a venue symbol mapping.
+    ///
+    /// Source-native IDs belong in source-qualified [`ProviderIdentityRecord`] values.
+    pub fn new(venue_id: VenueId, venue_symbol: VenueSymbol) -> Self {
         Self {
             venue_id,
             venue_symbol,
-            provider_instrument_id,
         }
     }
 
@@ -85,11 +83,6 @@ impl VenueMapping {
     /// Returns the venue-native symbol.
     pub const fn venue_symbol(&self) -> &VenueSymbol {
         &self.venue_symbol
-    }
-
-    /// Returns the source-native instrument identity when supplied.
-    pub const fn provider_instrument_id(&self) -> Option<&ProviderInstrumentId> {
-        self.provider_instrument_id.as_ref()
     }
 }
 
@@ -113,6 +106,15 @@ pub enum InstrumentError {
     },
     /// An instrument definition attached the same typed identifier more than once.
     DuplicateExternalIdentifier,
+    /// An instrument definition attached the same source-qualified provider identity twice.
+    DuplicateProviderIdentity,
+    /// A provider identity referenced a different stable instrument.
+    ProviderIdentityInstrumentMismatch {
+        /// Stable instrument owned by the definition.
+        definition: InstrumentId,
+        /// Stable instrument carried by the provider record.
+        record: InstrumentId,
+    },
 }
 
 impl fmt::Display for InstrumentError {
@@ -130,6 +132,13 @@ impl fmt::Display for InstrumentError {
             Self::DuplicateExternalIdentifier => {
                 formatter.write_str("duplicate external identifier attachment")
             }
+            Self::DuplicateProviderIdentity => {
+                formatter.write_str("duplicate source-qualified provider identity attachment")
+            }
+            Self::ProviderIdentityInstrumentMismatch { definition, record } => write!(
+                formatter,
+                "provider identity instrument {record} does not match definition {definition}"
+            ),
         }
     }
 }
@@ -477,8 +486,32 @@ pub struct InstrumentDefinition {
     tick_size: TickSize,
     lot_size: LotSize,
     venue_mappings: Vec<VenueMapping>,
+    provider_identities: Vec<ProviderIdentityRecord>,
     identifiers: Vec<ExternalIdentifierRecord>,
     trading_status: TradingStatus,
+}
+
+/// Complete current reference-master input for constructing [`InstrumentDefinition`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InstrumentDefinitionInput {
+    /// Stable internal instrument identity.
+    pub instrument_id: InstrumentId,
+    /// Broad asset family.
+    pub asset_class: AssetClass,
+    /// Explicit settlement denomination.
+    pub primary_denomination: Denomination,
+    /// Exact price increment.
+    pub tick_size: TickSize,
+    /// Exact quantity increment.
+    pub lot_size: LotSize,
+    /// Current venue-symbol mappings.
+    pub venue_mappings: Vec<VenueMapping>,
+    /// Source-qualified provider identity records.
+    pub provider_identities: Vec<ProviderIdentityRecord>,
+    /// Evidence-bearing external identifier records.
+    pub identifiers: Vec<ExternalIdentifierRecord>,
+    /// Current reference-master trading status.
+    pub trading_status: TradingStatus,
 }
 
 impl InstrumentDefinition {
@@ -488,17 +521,18 @@ impl InstrumentDefinition {
     ///
     /// Rejects duplicate current mappings for one venue. Historical mappings belong in
     /// [`SymbolIdentityRecord`] intervals.
-    #[allow(clippy::too_many_arguments)]
-    pub fn try_new(
-        instrument_id: InstrumentId,
-        asset_class: AssetClass,
-        primary_denomination: Denomination,
-        tick_size: TickSize,
-        lot_size: LotSize,
-        venue_mappings: Vec<VenueMapping>,
-        identifiers: Vec<ExternalIdentifierRecord>,
-        trading_status: TradingStatus,
-    ) -> Result<Self, InstrumentError> {
+    pub fn try_new(input: InstrumentDefinitionInput) -> Result<Self, InstrumentError> {
+        let InstrumentDefinitionInput {
+            instrument_id,
+            asset_class,
+            primary_denomination,
+            tick_size,
+            lot_size,
+            venue_mappings,
+            provider_identities,
+            identifiers,
+            trading_status,
+        } = input;
         for (index, mapping) in venue_mappings.iter().enumerate() {
             if venue_mappings
                 .iter()
@@ -508,6 +542,21 @@ impl InstrumentDefinition {
                 return Err(InstrumentError::DuplicateVenueMapping {
                     venue: mapping.venue_id.clone(),
                 });
+            }
+        }
+        for (index, record) in provider_identities.iter().enumerate() {
+            if record.instrument_id() != instrument_id {
+                return Err(InstrumentError::ProviderIdentityInstrumentMismatch {
+                    definition: instrument_id,
+                    record: record.instrument_id(),
+                });
+            }
+            if provider_identities
+                .iter()
+                .skip(index + 1)
+                .any(|candidate| candidate == record)
+            {
+                return Err(InstrumentError::DuplicateProviderIdentity);
             }
         }
         for (index, record) in identifiers.iter().enumerate() {
@@ -526,6 +575,7 @@ impl InstrumentDefinition {
             tick_size,
             lot_size,
             venue_mappings,
+            provider_identities,
             identifiers,
             trading_status,
         })
@@ -561,6 +611,11 @@ impl InstrumentDefinition {
         &self.venue_mappings
     }
 
+    /// Returns source-qualified provider identities without collapsing source namespaces.
+    pub fn provider_identities(&self) -> &[ProviderIdentityRecord] {
+        &self.provider_identities
+    }
+
     /// Returns syntactically validated external identifiers.
     pub fn identifiers(&self) -> &[ExternalIdentifierRecord] {
         &self.identifiers
@@ -573,6 +628,7 @@ impl InstrumentDefinition {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct InstrumentDefinitionWire {
     instrument_id: InstrumentId,
     asset_class: AssetClass,
@@ -580,6 +636,8 @@ struct InstrumentDefinitionWire {
     tick_size: TickSize,
     lot_size: LotSize,
     venue_mappings: Vec<VenueMapping>,
+    #[serde(default)]
+    provider_identities: Vec<ProviderIdentityRecord>,
     identifiers: Vec<ExternalIdentifierRecord>,
     trading_status: TradingStatus,
 }
@@ -590,16 +648,17 @@ impl<'de> Deserialize<'de> for InstrumentDefinition {
         D: Deserializer<'de>,
     {
         let wire = InstrumentDefinitionWire::deserialize(deserializer)?;
-        Self::try_new(
-            wire.instrument_id,
-            wire.asset_class,
-            wire.primary_denomination,
-            wire.tick_size,
-            wire.lot_size,
-            wire.venue_mappings,
-            wire.identifiers,
-            wire.trading_status,
-        )
+        Self::try_new(InstrumentDefinitionInput {
+            instrument_id: wire.instrument_id,
+            asset_class: wire.asset_class,
+            primary_denomination: wire.primary_denomination,
+            tick_size: wire.tick_size,
+            lot_size: wire.lot_size,
+            venue_mappings: wire.venue_mappings,
+            provider_identities: wire.provider_identities,
+            identifiers: wire.identifiers,
+            trading_status: wire.trading_status,
+        })
         .map_err(serde::de::Error::custom)
     }
 }
