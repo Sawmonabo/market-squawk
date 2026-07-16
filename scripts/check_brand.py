@@ -58,7 +58,7 @@ ALLOWED_OCCURRENCES = {
     ("crates/market-squawk-platform/src/paths.rs", 232, 3): AllowedOccurrence(
         f"    /// Legacy `{TOKENS[3]}/{TOKENS[2]}` format."
     ),
-    ("crates/market-squawk-platform/src/raw_record.rs", 160, 3): AllowedOccurrence(
+    ("crates/market-squawk-platform/src/raw_record.rs", 163, 3): AllowedOccurrence(
         f"/// `{TOKENS[3]}` and `MSJ1` historically accepted nil UUIDs and otherwise unconstrained field values as"
     ),
     ("crates/market-squawk-platform/tests/journal_compatibility.rs", 50, 3): AllowedOccurrence(
@@ -85,10 +85,10 @@ ALLOWED_OCCURRENCES = {
     ("docs/architecture/current-state.md", 208, 3): AllowedOccurrence(
         f"The committed predecessor used `{TOKENS[3]}` and `{TOKENS[2]}`; the working tree changes those to `MSJ1` and"
     ),
-    ("docs/architecture/target-state.md", 595, 2): AllowedOccurrence(
+    ("docs/architecture/target-state.md", 709, 2): AllowedOccurrence(
         f"- Readers accept committed `{TOKENS[3]}/{TOKENS[2]}` and renamed `MSJ1/.msj` journals."
     ),
-    ("docs/architecture/target-state.md", 595, 3): AllowedOccurrence(
+    ("docs/architecture/target-state.md", 709, 3): AllowedOccurrence(
         f"- Readers accept committed `{TOKENS[3]}/{TOKENS[2]}` and renamed `MSJ1/.msj` journals."
     ),
     ("docs/plans/implementation-plan.md", 132, 2): AllowedOccurrence(
@@ -124,10 +124,13 @@ ALLOWED_OCCURRENCES = {
     ("docs/superpowers/plans/2026-07-16-market-squawk-stage-1-foundation.md", 154, 3): AllowedOccurrence(
         f"`{TOKENS[1]}`, `{TOKENS[2]}`, or `{TOKENS[3]}` occurrence."
     ),
-    ("docs/superpowers/plans/2026-07-16-market-squawk-stage-1-foundation.md", 1732, 2): AllowedOccurrence(
+    ("docs/research/2026-07-16-journal-durability.md", 97, 3): AllowedOccurrence(
+        f"- Literal legacy `{TOKENS[3]}` fixtures remain read-only. New writes use only `MSJ1`; existing legacy data"
+    ),
+    ("docs/superpowers/plans/2026-07-16-market-squawk-stage-1-foundation.md", 1842, 2): AllowedOccurrence(
         f"- [ ] Legacy `{TOKENS[3]}/{TOKENS[2]}` journals read; current writes use `MSJ1/.msj`."
     ),
-    ("docs/superpowers/plans/2026-07-16-market-squawk-stage-1-foundation.md", 1732, 3): AllowedOccurrence(
+    ("docs/superpowers/plans/2026-07-16-market-squawk-stage-1-foundation.md", 1842, 3): AllowedOccurrence(
         f"- [ ] Legacy `{TOKENS[3]}/{TOKENS[2]}` journals read; current writes use `MSJ1/.msj`."
     ),
 }

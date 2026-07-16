@@ -1,7 +1,7 @@
 //! CRC-framed current and legacy raw-capture journals.
 //!
 //! `MEJ1` and `MSJ1` preserve source-faithful diagnostic bytes, raw connection identity, and
-//! receive metadata. They do not persist the out-of-band [`crate::CaptureGenerationKey`] or live
+//! receive metadata. They do not persist the out-of-band capture authority identity or live
 //! authority state. Journal replay is therefore permanently execution-ineligible and cannot
 //! reconstruct current capture, registry, sequence, checksum, freshness, or venue authority.
 

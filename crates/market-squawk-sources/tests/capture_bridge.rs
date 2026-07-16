@@ -128,7 +128,12 @@ async fn platform_returns_exact_registry_receipt_and_later_degradation_revokes_c
     )?;
     let batch = DecodedProviderBatch::try_new(evidence, vec![observation])?;
     let receipt = publisher.try_publish(&frame)?;
-    let current_batch = current.validate_decoded_batch_owned(batch, receipt)?;
+    let current_batches = current.validate_decoded_batch_owned(batch, receipt)?;
+    assert_eq!(current_batches.len(), 1);
+    let current_batch = current_batches
+        .into_iter()
+        .next()
+        .ok_or("validated frame produced no routed batch")?;
     current_batch.validate_at(Timestamp::from_unix_nanos(3))?;
 
     drop(control);
