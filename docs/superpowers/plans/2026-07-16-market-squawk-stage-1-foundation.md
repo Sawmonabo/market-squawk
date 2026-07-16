@@ -393,10 +393,12 @@ record contracts are defined here so storage cannot later invent incompatible id
 
 Provider-native identity assertions use a versioned `ProviderIdentityRecord`, not an unqualified
 string or a field on `VenueMapping`. Bind every record to the provider `SourceId`, stable
-`InstrumentId`, content evidence, provider source timestamp when supplied, local `observed_at`,
-authoritative metadata revision/evidence, and effective interval. `ProviderIdentityEvidence` requires
-an algorithm-qualified digest; an optional `ProviderIdentityLocator` retains explicit reference and
-version identities as retrieval metadata, never evidence. A bare mutable URL is unrepresentable.
+`InstrumentId`, content evidence, timestamps, effective interval, and caller/source-supplied revision
+and predecessor claims bound to exact content evidence. Authority must be established separately by
+the applicable registered source and source-specific adapter verification; these
+caller/source-supplied values do not establish it. `ProviderIdentityEvidence` retains zero or more
+bounded canonical version-pinned locators (`ProviderIdentityEvidence::MAX_LOCATORS = 64`) as
+non-substantive retrieval metadata; a bare URL is not evidence.
 
 Put deterministic ingestion semantics in the provider-identity registry, not in vector equality:
 content-equivalent reingestion is idempotent at the logical-assertion layer and creates no second
@@ -1773,10 +1775,13 @@ Use the neutral `ExactPayloadEvidence` contract whenever an identity assertion p
 source evidence. It requires an algorithm-qualified `EvidenceDigest`; its optional
 `VersionPinnedSourceLocator` retains bounded caller/source-supplied locator and version-pin metadata
 for retrieval without independently proving the pin immutable or replacing the digest. Bind a
-futures identity's typed `MetadataRevision` and exact security-definition evidence atomically in
-`RevisionBoundPayloadEvidence`. Authoritative `ExternalIdentifierRecord` assignment evidence uses
-`ExactPayloadEvidence` directly. The strict wire rejects omitted content evidence and unknown fields,
-including generic/bare `PayloadReference` values, moving URLs without a digest, and missing locator
-versions. It preserves the explicit digest algorithm as part of evidence identity; changing the
-explicit algorithm while retaining the same bytes produces distinct valid evidence rather than a
+futures identity's caller/source-supplied `MetadataRevision` and exact security-definition evidence
+atomically in `RevisionBoundPayloadEvidence`; the binding preserves association but does not by
+itself establish revision authority. Authority must be established separately by the applicable
+registered source and source-specific adapter verification; these caller/source-supplied values do
+not establish it. `ExternalIdentifierRecord` retains `ExactPayloadEvidence` for its supplied
+assignment claim. The strict wire rejects omitted content evidence and unknown fields, including
+generic/bare `PayloadReference` values, moving URLs without a digest, and missing locator versions.
+It preserves the explicit digest algorithm as part of evidence identity; changing the explicit
+algorithm while retaining the same bytes produces distinct valid evidence rather than a
 deserialization error.

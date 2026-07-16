@@ -1,5 +1,11 @@
 # Q1 Final Provider Evidence Correction Report
 
+> **SUPERSEDED:** This historical lane report predates locator-equivalent provider assertions.
+> In the current contract, locator metadata is non-substantive retrieval metadata and does not
+> participate in assertion identity. Use the [Quarter 1 Checkpoint Correction Report](q1-checkpoint-correction-report.md),
+> [current target architecture](../../docs/architecture/target-state.md), and
+> [Quarter 1 contract decisions](../../docs/research/2026-07-16-q1-contract-decisions.md).
+
 Date: 2026-07-16
 
 Branch: `fix/q1-final-provider-evidence`

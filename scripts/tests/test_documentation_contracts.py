@@ -28,6 +28,9 @@ PROVIDER_IDENTITIES_SOURCE = (
     ROOT / "crates" / "market-squawk-domain" / "src" / "instrument" / "provider_identities.rs"
 )
 STALE_DOMAIN_REPORT = ROOT / ".superpowers" / "sdd" / "q1-final-domain-contracts-report.md"
+STALE_PROVIDER_EVIDENCE_REPORT = (
+    ROOT / ".superpowers" / "sdd" / "q1-final-provider-evidence-report.md"
+)
 EXACT_IDENTITY_REPORT = (
     ROOT / ".superpowers" / "sdd" / "q1-fix-exact-identity-evidence-report.md"
 )
@@ -132,6 +135,68 @@ class DocumentationContractTests(unittest.TestCase):
                 )
                 self.assertNotIn("idempotent no-op", source)
 
+    def test_provider_identity_docs_bound_revision_authority_and_locator_cardinality(
+        self,
+    ) -> None:
+        sections = (
+            (
+                TARGET_ARCHITECTURE,
+                "Provider identity records bind",
+                "`ChainId` validates",
+            ),
+            (
+                Q1_CONTRACT_DECISIONS,
+                "## Provider identity qualification",
+                "## Chain namespace evidence",
+            ),
+            (
+                STAGE_ONE_PLAN,
+                "Provider-native identity assertions use",
+                "- [ ] **Step 3: Implement exact scaled values**",
+            ),
+        )
+        for path, start_marker, end_marker in sections:
+            with self.subTest(path=path.relative_to(ROOT)):
+                document = path.read_text()
+                section = " ".join(
+                    document[
+                        document.index(start_marker) : document.index(end_marker)
+                    ].split()
+                )
+                self.assertIn(
+                    "caller/source-supplied revision and predecessor claims", section
+                )
+                self.assertIn(
+                    "Authority must be established separately by the applicable registered "
+                    "source and source-specific adapter verification",
+                    section,
+                )
+                self.assertIn(
+                    "these caller/source-supplied values do not establish it", section
+                )
+                self.assertIn(
+                    "zero or more bounded canonical version-pinned locators", section
+                )
+                self.assertIn("`ProviderIdentityEvidence::MAX_LOCATORS = 64`", section)
+                self.assertNotIn("authoritative metadata revision/evidence", section)
+                self.assertNotIn("authoritative source-metadata revision", section)
+                self.assertNotIn("valid newer authoritative revision", section)
+
+    def test_exact_evidence_docs_do_not_treat_a_revision_binding_as_authority(self) -> None:
+        for path in (TARGET_ARCHITECTURE, Q1_CONTRACT_DECISIONS, STAGE_ONE_PLAN):
+            with self.subTest(path=path.relative_to(ROOT)):
+                source = normalized_source(path)
+                self.assertIn(
+                    "the binding preserves association but does not by itself establish revision authority",
+                    source,
+                )
+                self.assertIn(
+                    "Authority must be established separately by the applicable registered "
+                    "source and source-specific adapter verification",
+                    source,
+                )
+                self.assertNotIn("exact payload evidence that established it", source)
+
     def test_metadata_revision_rustdoc_limits_the_identifier_claim(self) -> None:
         source = normalized_source(METADATA_BINDING_SOURCE)
 
@@ -170,6 +235,19 @@ class DocumentationContractTests(unittest.TestCase):
         self.assertIn("`RevisionBoundPayloadEvidence`", changelog)
         self.assertIn("legacy `source_reference`", changelog)
         self.assertIn("`provider_identity_registry`", changelog)
+
+    def test_stale_provider_evidence_report_has_a_directional_supersession_banner(
+        self,
+    ) -> None:
+        banner = STALE_PROVIDER_EVIDENCE_REPORT.read_text()[:1_000]
+
+        self.assertIn("SUPERSEDED", banner)
+        self.assertIn("q1-checkpoint-correction-report.md", banner)
+        self.assertIn("../../docs/architecture/target-state.md", banner)
+        self.assertIn(
+            "../../docs/research/2026-07-16-q1-contract-decisions.md", banner
+        )
+        self.assertIn("locator metadata is non-substantive retrieval metadata", banner)
 
 
 if __name__ == "__main__":

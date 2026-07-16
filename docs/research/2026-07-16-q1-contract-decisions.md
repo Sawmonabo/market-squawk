@@ -57,13 +57,16 @@ pin as retrieval metadata; the type does not independently prove that pin immuta
 never replaces the mandatory digest. A moving `FIX.Latest` or provider URL is therefore
 structurally insufficient by itself.
 
-`FuturesContractIdentity` carries `RevisionBoundPayloadEvidence`, which atomically binds its typed
-`MetadataRevision` to the exact payload evidence that established it. Authoritative assignment
-evidence on `ExternalIdentifierRecord` uses `ExactPayloadEvidence` directly. The strict wire
-rejects omitted content evidence and unknown fields, including the former bare
-`source_reference` shape and a locator without a version pin. The wire preserves the explicit digest
-algorithm as part of evidence identity; changing the explicit algorithm while retaining the same
-bytes produces distinct valid evidence rather than a deserialization error.
+`FuturesContractIdentity` carries `RevisionBoundPayloadEvidence`, which atomically retains its
+caller/source-supplied `MetadataRevision` with exact payload evidence for that revision claim; the
+binding preserves association but does not by itself establish revision authority. Authority must
+be established separately by the applicable registered source and source-specific adapter
+verification; these caller/source-supplied values do not establish it. `ExternalIdentifierRecord`
+retains `ExactPayloadEvidence` for its supplied assignment claim. The strict wire rejects omitted
+content evidence and unknown fields, including the former bare `source_reference` shape and a
+locator without a version pin. The wire preserves the explicit digest algorithm as part of evidence
+identity; changing the explicit algorithm while retaining the same bytes produces distinct valid
+evidence rather than a deserialization error.
 
 ## Provider identity qualification
 
@@ -73,12 +76,15 @@ the venue and venue symbol. Every provider-native assertion is retained as a ver
 
 - provider `SourceId`/namespace and provider-native identifier;
 - stable internal `InstrumentId`;
-- mandatory algorithm-qualified content evidence, plus an optional provider object/record locator
-  carrying a separate explicit version identity; the locator can aid retrieval but can never replace
-  the retained digest, so a bare or mutable URL is not representable as evidence;
+- mandatory algorithm-qualified content evidence plus zero or more bounded canonical version-pinned
+  locators (`ProviderIdentityEvidence::MAX_LOCATORS = 64`); these are non-substantive retrieval
+  metadata and never replace the digest, so a bare or mutable URL is not evidence;
 - provider source timestamp when supplied and local first-`observed_at` timestamp;
-- authoritative source-metadata revision plus the evidence/reference that established it; and
+- caller/source-supplied revision and predecessor claims bound to exact content evidence;
 - asserted effective interval and later supersession evidence.
+
+Authority must be established separately by the applicable registered source and source-specific
+adapter verification; these caller/source-supplied values do not establish it.
 
 Identical provider-ID text from different sources is therefore distinct. Registry ingestion uses a
 deterministic natural key and returns a typed outcome. Content-equivalent reingestion is idempotent
@@ -87,7 +93,7 @@ coalesces bounded locator and observation metadata and returns `ObservationCoale
 repeat with no new metadata leaves canonical registry state unchanged. The same natural key and
 metadata revision with a different payload, interval, or normalized mapping is a conflict: retain
 the competing evidence, quarantine the mapping, and never choose by arrival order. A temporally
-valid newer authoritative revision appends a new immutable assertion and explicitly supersedes the
+valid newer evidenced revision appends a new immutable assertion and explicitly supersedes the
 prior assertion, which remains queryable. A changed mapping without a newer evidenced revision is a
 quarantined conflict, not an in-place correction.
 
