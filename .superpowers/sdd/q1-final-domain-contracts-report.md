@@ -1,7 +1,9 @@
 # Q1 Final Domain Contracts Report
 
-Date: 2026-07-16  
-Branch: `fix/q1-final-domain-contracts`  
+Date: 2026-07-16
+
+Branch: `fix/q1-final-domain-contracts`
+
 Scope: provider/instrument identity, derivatives lifecycle, digital-asset identity, and strict
 initial-domain wire contracts.
 
