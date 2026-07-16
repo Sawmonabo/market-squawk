@@ -41,8 +41,8 @@ scripts, or documentation outside this persisted report.
 ### Futures lifecycle
 
 - `first_trade_date` and `settlement_date` are independent optional source claims in
-  `FuturesLifecycleDates`, covered by the containing `FuturesContractIdentity` payload reference,
-  source timestamp, observation timestamp, and metadata revision.
+  `FuturesLifecycleDates`, covered by the containing `FuturesContractIdentity` exact payload
+  evidence, source timestamp, observation timestamp, and typed metadata revision binding.
 - No lifecycle field is synthesized from another field. Empty, first-trade-only, and
   settlement-only values round-trip independently.
 - Relation-specific errors cover first trade versus last trade/expiration/settlement, last trade

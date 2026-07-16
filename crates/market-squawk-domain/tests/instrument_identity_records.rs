@@ -1,13 +1,13 @@
 use market_squawk_domain::{
     AssetClass, AssignmentVerification, ContractRollMapping, Currency, Denomination,
-    EffectiveInterval, EvidenceDigest, ExternalIdentifier, ExternalIdentifierRecord,
-    ExternalIdentifierRecordInput, IdentifierEntitlement, IdentifierRightsPolicyReference,
-    IdentifierSyntaxVerification, InstrumentDefinition, InstrumentDefinitionInput, InstrumentError,
-    InstrumentId, Isin, LifecycleTransition, LifecycleTransitionKind, LotSize, MetadataRevision,
-    PayloadHash, PayloadHashAlgorithm, PayloadReference, ProviderIdentityEvidence,
-    ProviderIdentityRecord, ProviderIdentityRecordInput, ProviderInstrumentId, SourceId,
-    SourceIdentifier, SymbolIdentityRecord, TickSize, Timestamp, TradingStatus, VenueId,
-    VenueMapping, VenueSymbol,
+    EffectiveInterval, EvidenceDigest, ExactPayloadEvidence, ExternalIdentifier,
+    ExternalIdentifierRecord, ExternalIdentifierRecordInput, IdentifierEntitlement,
+    IdentifierRightsPolicyReference, IdentifierSyntaxVerification, InstrumentDefinition,
+    InstrumentDefinitionInput, InstrumentError, InstrumentId, Isin, LifecycleTransition,
+    LifecycleTransitionKind, LotSize, MetadataRevision, PayloadHashAlgorithm,
+    ProviderIdentityEvidence, ProviderIdentityRecord, ProviderIdentityRecordInput,
+    ProviderInstrumentId, SourceId, SourceIdentifier, SymbolIdentityRecord, TickSize, Timestamp,
+    TradingStatus, VenueId, VenueMapping, VenueSymbol,
 };
 use rust_decimal::Decimal;
 use uuid::Uuid;
@@ -30,7 +30,7 @@ fn identifier_record() -> Result<ExternalIdentifierRecord, Box<dyn std::error::E
             identifier: ExternalIdentifier::Isin(Isin::try_from("US0378331005")?),
             assignment_verification: AssignmentVerification::VerifiedAssigned,
             source_id: SourceId::try_from("anna-reference")?,
-            source_reference: PayloadReference::ContentHash(PayloadHash::new(
+            source_evidence: ExactPayloadEvidence::from_content_digest(EvidenceDigest::new(
                 PayloadHashAlgorithm::Sha256,
                 [3_u8; 32],
             )),
@@ -81,10 +81,7 @@ fn external_identifier_record_retains_verification_provenance_time_and_rights()
         AssignmentVerification::VerifiedAssigned
     );
     assert_eq!(record.source_id().as_str(), "anna-reference");
-    assert!(matches!(
-        record.source_reference(),
-        PayloadReference::ContentHash(_)
-    ));
+    assert_eq!(record.source_evidence().content_digest().bytes(), [3; 32]);
     assert_eq!(
         record.source_timestamp(),
         Some(Timestamp::from_unix_nanos(90))

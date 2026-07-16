@@ -1,14 +1,20 @@
 use std::str::FromStr;
 
 use market_squawk_domain::{
-    FuturesContractIdentity, FuturesContractIdentityInput, FuturesLeg, FuturesLegInput,
-    FuturesLegSide, FuturesLifecycleDates, FuturesSecurityType, MaturityMonthYear, PayloadHash,
-    PayloadHashAlgorithm, PayloadReference, ProviderInstrumentId, SourceId, SourceIdentifier,
-    Timestamp, VenueId, VenueSymbol,
+    EvidenceDigest, ExactPayloadEvidence, FuturesContractIdentity, FuturesContractIdentityInput,
+    FuturesLeg, FuturesLegInput, FuturesLegSide, FuturesLifecycleDates, FuturesSecurityType,
+    MaturityMonthYear, MetadataRevision, PayloadHashAlgorithm, ProviderInstrumentId,
+    RevisionBoundPayloadEvidence, SourceId, SourceIdentifier, Timestamp, VenueId, VenueSymbol,
 };
 
-fn evidence() -> PayloadReference {
-    PayloadReference::ContentHash(PayloadHash::new(PayloadHashAlgorithm::Sha256, [17; 32]))
+fn evidence() -> Result<RevisionBoundPayloadEvidence, Box<dyn std::error::Error>> {
+    Ok(RevisionBoundPayloadEvidence::new(
+        MetadataRevision::new(SourceIdentifier::try_from("cme-sd:2026-03-01:42")?),
+        ExactPayloadEvidence::from_content_digest(EvidenceDigest::new(
+            PayloadHashAlgorithm::Sha256,
+            [17; 32],
+        )),
+    ))
 }
 
 fn leg(
@@ -35,10 +41,9 @@ fn identity_input(
 ) -> Result<FuturesContractIdentityInput, Box<dyn std::error::Error>> {
     Ok(FuturesContractIdentityInput {
         source_id: SourceId::try_from("cme-security-definition")?,
-        source_reference: evidence(),
+        source_evidence: evidence()?,
         source_timestamp: Some(Timestamp::from_unix_nanos(900)),
         observed_at: Timestamp::from_unix_nanos(1_000),
-        metadata_revision: SourceIdentifier::try_from("cme-sd:2026-03-01:42")?,
         venue_id: VenueId::try_from("XCME")?,
         security_id: ProviderInstrumentId::try_from("ES-WEEKLY-SPREAD")?,
         security_id_source: SourceIdentifier::try_from("8")?,
@@ -105,14 +110,14 @@ fn tag_200_only_outright_keeps_identity_evidence_without_inventing_dates()
     );
     assert!(identity.lifecycle().is_empty());
     assert_eq!(identity.source_id().as_str(), "cme-security-definition");
-    assert_eq!(identity.source_reference(), &evidence());
+    assert_eq!(identity.source_evidence(), &evidence()?);
     assert_eq!(
         identity.source_timestamp(),
         Some(Timestamp::from_unix_nanos(900))
     );
     assert_eq!(identity.observed_at(), Timestamp::from_unix_nanos(1_000));
     assert_eq!(
-        identity.metadata_revision().as_str(),
+        identity.metadata_revision().as_source_identifier().as_str(),
         "cme-sd:2026-03-01:42"
     );
 
@@ -158,7 +163,7 @@ fn tag_610_week_legs_remain_distinct_and_tag_611_is_separate()
         identity.legs()[0].maturity_date(),
         Some(market_squawk_domain::CalendarDate::new(2026, 3, 6)?)
     );
-    assert_eq!(identity.source_reference(), &evidence());
+    assert_eq!(identity.source_evidence(), &evidence()?);
     assert_eq!(
         serde_json::from_value::<FuturesContractIdentity>(serde_json::to_value(&identity)?)?,
         identity

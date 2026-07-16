@@ -617,6 +617,17 @@ Market Squawk does not implement identity/account rotation to evade limits, brow
 concealment, CAPTCHA/anti-bot bypass, blocking-evasion proxies, or distributed quota evasion. These
 behaviors are prohibited by design review, configuration schemas, tests, and source policy.
 
+## Exact identity evidence invariant
+
+Source-authored identity assertions use neutral exact-evidence contracts. `ExactPayloadEvidence`
+always carries an algorithm-qualified content digest. Its optional `VersionPinnedSourceLocator`
+retains bounded caller/source-supplied locator and version-pin metadata for retrieval, but does not
+independently prove that version immutable and never replaces the digest. `FuturesContractIdentity`
+uses `RevisionBoundPayloadEvidence` so its typed `MetadataRevision` cannot be retained without the
+exact payload evidence that established it. Authoritative `ExternalIdentifierRecord` assignment
+evidence uses the same mandatory digest contract. A moving `FIX.Latest` or provider URL cannot
+qualify either identity assertion by itself.
+
 ## Target-state completion
 
 The release is complete only when the required live and research adapters, verified qualification,

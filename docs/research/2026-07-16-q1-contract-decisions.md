@@ -48,6 +48,21 @@ preserves each supplied claim independently:
 This prevents adapters from manufacturing or weakening evidence for daily/weekly contracts,
 independently identified multileg products, or source records that omit a maturity field.
 
+## Exact identity payload evidence
+
+Identity assertions that promise exact source evidence do not use generic `PayloadReference`
+values. `ExactPayloadEvidence` requires an algorithm-qualified `EvidenceDigest`. An optional
+`VersionPinnedSourceLocator` preserves a bounded caller/source-supplied locator and separate version
+pin as retrieval metadata; the type does not independently prove that pin immutable, and the pin
+never replaces the mandatory digest. A moving `FIX.Latest` or provider URL is therefore
+structurally insufficient by itself.
+
+`FuturesContractIdentity` carries `RevisionBoundPayloadEvidence`, which atomically binds its typed
+`MetadataRevision` to the exact payload evidence that established it. Authoritative assignment
+evidence on `ExternalIdentifierRecord` uses `ExactPayloadEvidence` directly. Their strict wire
+contracts reject the former bare `source_reference` shape, a locator without a version pin,
+missing content evidence, unknown fields, and algorithm-erasing substitutions.
+
 ## Provider identity qualification
 
 `ProviderInstrumentId` is meaningful only inside a provider namespace. A `VenueMapping` stores only

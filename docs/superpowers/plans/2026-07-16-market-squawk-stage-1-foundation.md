@@ -1766,3 +1766,14 @@ git commit -m "docs: record verified Stage 1 foundation"
   [`source-inventory.json`](../../research/2026-07-15-market-squawk/source-inventory.json).
 - Pinned security-tool release checks are recorded in
   [`tooling-refresh-2026-07-16.md`](../../research/2026-07-15-market-squawk/tooling-refresh-2026-07-16.md).
+
+## Quarter 1 exact identity evidence correction
+
+Use the neutral `ExactPayloadEvidence` contract whenever an identity assertion promises exact
+source evidence. It requires an algorithm-qualified `EvidenceDigest`; its optional
+`VersionPinnedSourceLocator` retains bounded caller/source-supplied locator and version-pin metadata
+for retrieval without independently proving the pin immutable or replacing the digest. Bind a
+futures identity's typed `MetadataRevision` and exact security-definition evidence atomically in
+`RevisionBoundPayloadEvidence`. Authoritative `ExternalIdentifierRecord` assignment evidence uses
+`ExactPayloadEvidence` directly. Strict wires reject generic/bare `PayloadReference` values, moving
+URLs without a digest, missing locator versions, unknown fields, and algorithm transplants.

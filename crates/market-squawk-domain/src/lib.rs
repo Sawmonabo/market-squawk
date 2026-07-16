@@ -3,6 +3,7 @@
 mod classification;
 mod denomination;
 mod digest;
+mod evidence;
 mod financial;
 mod identifiers;
 mod identity;
@@ -34,6 +35,9 @@ pub use classification::{
 pub use denomination::Denomination;
 pub use digest::DigestAlgorithm;
 pub use digest::DigestAlgorithm as PayloadHashAlgorithm;
+pub use evidence::{
+    ExactPayloadEvidence, RevisionBoundPayloadEvidence, VersionPinnedSourceLocator,
+};
 pub use financial::{
     BasisPoints, Currency, FinancialError, LotSize, Money, PriceError, PriceTicks, QuantityError,
     QuantityLots, RoundingPolicy, TickSize,

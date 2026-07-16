@@ -6,8 +6,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use super::EffectiveInterval;
 use crate::{
-    ChainAddress, CryptoPair, Cusip, Figi, FuturesContractIdentity, Isin, OccOptionIdentity,
-    PayloadReference, Sedol, SourceId, SourceIdentifier, Ticker, Timestamp,
+    ChainAddress, CryptoPair, Cusip, ExactPayloadEvidence, Figi, FuturesContractIdentity, Isin,
+    OccOptionIdentity, Sedol, SourceId, SourceIdentifier, Ticker, Timestamp,
 };
 
 /// A syntactically validated external identifier.
@@ -157,7 +157,7 @@ pub struct ExternalIdentifierRecord {
     syntax_verification: IdentifierSyntaxVerification,
     assignment_verification: AssignmentVerification,
     source_id: SourceId,
-    source_reference: PayloadReference,
+    source_evidence: ExactPayloadEvidence,
     source_timestamp: Option<Timestamp>,
     observed_at: Timestamp,
     validity: EffectiveInterval,
@@ -176,8 +176,8 @@ pub struct ExternalIdentifierRecordInput {
     pub assignment_verification: AssignmentVerification,
     /// Evidence source namespace.
     pub source_id: SourceId,
-    /// Immutable source evidence.
-    pub source_reference: PayloadReference,
+    /// Mandatory content evidence for the exact source payload establishing the assignment.
+    pub source_evidence: ExactPayloadEvidence,
     /// Source timestamp when supplied.
     pub source_timestamp: Option<Timestamp>,
     /// Local first-observation time.
@@ -195,7 +195,7 @@ impl ExternalIdentifierRecord {
             identifier,
             assignment_verification,
             source_id,
-            source_reference,
+            source_evidence,
             source_timestamp,
             observed_at,
             validity,
@@ -207,7 +207,7 @@ impl ExternalIdentifierRecord {
             syntax_verification,
             assignment_verification,
             source_id,
-            source_reference,
+            source_evidence,
             source_timestamp,
             observed_at,
             validity,
@@ -235,9 +235,9 @@ impl ExternalIdentifierRecord {
         &self.source_id
     }
 
-    /// Returns immutable source evidence.
-    pub const fn source_reference(&self) -> &PayloadReference {
-        &self.source_reference
+    /// Returns exact digest-backed source evidence establishing the assignment.
+    pub const fn source_evidence(&self) -> &ExactPayloadEvidence {
+        &self.source_evidence
     }
 
     /// Returns the source timestamp when supplied.
@@ -272,7 +272,7 @@ struct ExternalIdentifierRecordWireRef<'a> {
     identifier: &'a ExternalIdentifier,
     assignment_verification: AssignmentVerification,
     source_id: &'a SourceId,
-    source_reference: &'a PayloadReference,
+    source_evidence: &'a ExactPayloadEvidence,
     source_timestamp: Option<Timestamp>,
     observed_at: Timestamp,
     validity: EffectiveInterval,
@@ -288,7 +288,7 @@ impl Serialize for ExternalIdentifierRecord {
             identifier: &self.identifier,
             assignment_verification: self.assignment_verification,
             source_id: &self.source_id,
-            source_reference: &self.source_reference,
+            source_evidence: &self.source_evidence,
             source_timestamp: self.source_timestamp,
             observed_at: self.observed_at,
             validity: self.validity,
@@ -304,7 +304,7 @@ struct ExternalIdentifierRecordWire {
     identifier: ExternalIdentifier,
     assignment_verification: AssignmentVerification,
     source_id: SourceId,
-    source_reference: PayloadReference,
+    source_evidence: ExactPayloadEvidence,
     source_timestamp: Option<Timestamp>,
     observed_at: Timestamp,
     validity: EffectiveInterval,
@@ -321,7 +321,7 @@ impl<'de> Deserialize<'de> for ExternalIdentifierRecord {
             identifier: wire.identifier,
             assignment_verification: wire.assignment_verification,
             source_id: wire.source_id,
-            source_reference: wire.source_reference,
+            source_evidence: wire.source_evidence,
             source_timestamp: wire.source_timestamp,
             observed_at: wire.observed_at,
             validity: wire.validity,

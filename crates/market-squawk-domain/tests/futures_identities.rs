@@ -1,13 +1,19 @@
 use market_squawk_domain::{
-    CalendarDate, FuturesContractIdentity, FuturesContractIdentityInput, FuturesLeg,
-    FuturesLegInput, FuturesLegSide, FuturesLifecycleDateFields, FuturesLifecycleDates,
-    FuturesSecurityType, IdentifierError, MaturityMonthYear, PayloadHash, PayloadHashAlgorithm,
-    PayloadReference, ProviderInstrumentId, SourceId, SourceIdentifier, Timestamp, VenueId,
-    VenueSymbol,
+    CalendarDate, EvidenceDigest, ExactPayloadEvidence, FuturesContractIdentity,
+    FuturesContractIdentityInput, FuturesLeg, FuturesLegInput, FuturesLegSide,
+    FuturesLifecycleDateFields, FuturesLifecycleDates, FuturesSecurityType, IdentifierError,
+    MaturityMonthYear, MetadataRevision, PayloadHashAlgorithm, ProviderInstrumentId,
+    RevisionBoundPayloadEvidence, SourceId, SourceIdentifier, Timestamp, VenueId, VenueSymbol,
 };
 
-fn reference() -> PayloadReference {
-    PayloadReference::ContentHash(PayloadHash::new(PayloadHashAlgorithm::Sha256, [7; 32]))
+fn evidence() -> Result<RevisionBoundPayloadEvidence, Box<dyn std::error::Error>> {
+    Ok(RevisionBoundPayloadEvidence::new(
+        MetadataRevision::new(SourceIdentifier::try_from("security-definition:42")?),
+        ExactPayloadEvidence::from_content_digest(EvidenceDigest::new(
+            PayloadHashAlgorithm::Sha256,
+            [7; 32],
+        )),
+    ))
 }
 
 fn lifecycle() -> Result<FuturesLifecycleDates, Box<dyn std::error::Error>> {
@@ -34,10 +40,9 @@ fn identity_input(
 ) -> Result<FuturesContractIdentityInput, Box<dyn std::error::Error>> {
     Ok(FuturesContractIdentityInput {
         source_id: SourceId::try_from("cme-reference")?,
-        source_reference: reference(),
+        source_evidence: evidence()?,
         source_timestamp: Some(Timestamp::from_unix_nanos(900)),
         observed_at: Timestamp::from_unix_nanos(1_000),
-        metadata_revision: SourceIdentifier::try_from("security-definition:42")?,
         venue_id: VenueId::try_from("XCME")?,
         security_id: ProviderInstrumentId::try_from("calendar-spread")?,
         security_id_source: SourceIdentifier::try_from("8")?,

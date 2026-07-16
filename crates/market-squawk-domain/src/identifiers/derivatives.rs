@@ -5,8 +5,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use super::{IdentifierError, VenueSymbol};
 use crate::{
-    CalendarDate, PayloadReference, ProviderInstrumentId, SourceId, SourceIdentifier, Timestamp,
-    VenueId,
+    CalendarDate, MetadataRevision, ProviderInstrumentId, RevisionBoundPayloadEvidence, SourceId,
+    SourceIdentifier, Timestamp, VenueId,
 };
 
 #[path = "derivatives/maturity_month_year.rs"]
@@ -357,10 +357,9 @@ impl<'de> Deserialize<'de> for FuturesLeg {
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct FuturesContractIdentity {
     source_id: SourceId,
-    source_reference: PayloadReference,
+    source_evidence: RevisionBoundPayloadEvidence,
     source_timestamp: Option<Timestamp>,
     observed_at: Timestamp,
-    metadata_revision: SourceIdentifier,
     venue_id: VenueId,
     security_id: ProviderInstrumentId,
     security_id_source: SourceIdentifier,
@@ -389,15 +388,13 @@ pub struct FuturesContractIdentity {
 pub struct FuturesContractIdentityInput {
     /// Reference-data source namespace.
     pub source_id: SourceId,
-    /// Immutable reference to the exact security-definition payload.
-    pub source_reference: PayloadReference,
+    /// Metadata revision atomically bound to exact security-definition payload evidence.
+    pub source_evidence: RevisionBoundPayloadEvidence,
     /// Source-authored timestamp when the definition carries one.
     #[serde(default)]
     pub source_timestamp: Option<Timestamp>,
     /// Local first-observation timestamp for this payload.
     pub observed_at: Timestamp,
-    /// Immutable provider publication, version, or mapping revision identifier.
-    pub metadata_revision: SourceIdentifier,
     /// Venue namespace in which the security identity is valid.
     pub venue_id: VenueId,
     /// Source-native security identifier.
@@ -431,10 +428,9 @@ impl FuturesContractIdentity {
     pub fn try_new(input: FuturesContractIdentityInput) -> Result<Self, IdentifierError> {
         let FuturesContractIdentityInput {
             source_id,
-            source_reference,
+            source_evidence,
             source_timestamp,
             observed_at,
-            metadata_revision,
             venue_id,
             security_id,
             security_id_source,
@@ -473,10 +469,9 @@ impl FuturesContractIdentity {
         }
         Ok(Self {
             source_id,
-            source_reference,
+            source_evidence,
             source_timestamp,
             observed_at,
-            metadata_revision,
             venue_id,
             security_id,
             security_id_source,
@@ -494,9 +489,9 @@ impl FuturesContractIdentity {
         &self.source_id
     }
 
-    /// Returns the immutable source payload evidence.
-    pub const fn source_reference(&self) -> &PayloadReference {
-        &self.source_reference
+    /// Returns the metadata revision and exact digest-backed source payload evidence.
+    pub const fn source_evidence(&self) -> &RevisionBoundPayloadEvidence {
+        &self.source_evidence
     }
 
     /// Returns the source-authored timestamp when supplied.
@@ -509,9 +504,9 @@ impl FuturesContractIdentity {
         self.observed_at
     }
 
-    /// Returns the immutable source metadata revision.
-    pub const fn metadata_revision(&self) -> &SourceIdentifier {
-        &self.metadata_revision
+    /// Returns the source metadata revision bound to the exact payload evidence.
+    pub const fn metadata_revision(&self) -> &MetadataRevision {
+        self.source_evidence.metadata_revision()
     }
 
     /// Returns the venue namespace.

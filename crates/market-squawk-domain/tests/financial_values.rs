@@ -3,24 +3,32 @@ use std::str::FromStr;
 use market_squawk_domain::{
     AssetClass, AssignmentVerification, BasisPoints, CalendarDate, ChainAddress, ChainAddressRole,
     ChainId, ConnectionGeneration, ContractRollMapping, CryptoPair, CryptoProductType, Currency,
-    Cusip, Denomination, EffectiveInterval, EvidenceDigest, EvmChainId, ExternalIdentifier,
-    ExternalIdentifierRecord, ExternalIdentifierRecordInput, Figi, FinancialError,
-    FuturesContractIdentity, FuturesContractIdentityInput, FuturesLifecycleDateFields,
-    FuturesLifecycleDates, FuturesSecurityType, IdentifierEntitlement, IdentifierError,
-    IdentifierRightsPolicyReference, IdentityError, InstrumentDefinition,
+    Cusip, Denomination, EffectiveInterval, EvidenceDigest, EvmChainId, ExactPayloadEvidence,
+    ExternalIdentifier, ExternalIdentifierRecord, ExternalIdentifierRecordInput, Figi,
+    FinancialError, FuturesContractIdentity, FuturesContractIdentityInput,
+    FuturesLifecycleDateFields, FuturesLifecycleDates, FuturesSecurityType, IdentifierEntitlement,
+    IdentifierError, IdentifierRightsPolicyReference, IdentityError, InstrumentDefinition,
     InstrumentDefinitionInput, InstrumentError, InstrumentId, Isin, LifecycleTransition,
     LifecycleTransitionKind, LotSize, MaturityMonthYear, MetadataRevision, Money,
-    OccOptionIdentity, OptionKind, PayloadHashAlgorithm, PayloadReference, PriceError, PriceTicks,
+    OccOptionIdentity, OptionKind, PayloadHashAlgorithm, PriceError, PriceTicks,
     ProviderIdentityEvidence, ProviderIdentityRecord, ProviderIdentityRecordInput,
-    ProviderInstrumentId, QuantityError, QuantityLots, RoundingPolicy, Sedol, SequenceNumber,
-    SolanaChainId, SourceId, SourceIdentifier, SymbolIdentityRecord, TickSize, Ticker, TimeError,
-    Timestamp, TradingStatus, VenueId, VenueMapping, VenueSymbol,
+    ProviderInstrumentId, QuantityError, QuantityLots, RevisionBoundPayloadEvidence,
+    RoundingPolicy, Sedol, SequenceNumber, SolanaChainId, SourceId, SourceIdentifier,
+    SymbolIdentityRecord, TickSize, Ticker, TimeError, Timestamp, TradingStatus, VenueId,
+    VenueMapping, VenueSymbol,
 };
 use rust_decimal::Decimal;
 use uuid::Uuid;
 
 fn provider_evidence(byte: u8) -> ProviderIdentityEvidence {
     ProviderIdentityEvidence::from_content_digest(EvidenceDigest::new(
+        PayloadHashAlgorithm::Sha256,
+        [byte; 32],
+    ))
+}
+
+fn exact_evidence(byte: u8) -> ExactPayloadEvidence {
+    ExactPayloadEvidence::from_content_digest(EvidenceDigest::new(
         PayloadHashAlgorithm::Sha256,
         [byte; 32],
     ))
@@ -416,14 +424,16 @@ fn futures_identity_uses_venue_fields_instead_of_parsing_a_universal_symbol()
         maturity_date: Some(CalendarDate::new(2026, 3, 20)?),
         ..FuturesLifecycleDateFields::default()
     })?;
-    let source_reference =
-        PayloadReference::SourceReference(SourceIdentifier::try_from("security-definition:1")?);
     let contract = FuturesContractIdentity::try_new(FuturesContractIdentityInput {
         source_id: SourceId::try_from("cme-reference")?,
-        source_reference,
+        source_evidence: RevisionBoundPayloadEvidence::new(
+            MetadataRevision::new(SourceIdentifier::try_from(
+                "security-definition-revision:1",
+            )?),
+            exact_evidence(1),
+        ),
         source_timestamp: None,
         observed_at: Timestamp::from_unix_nanos(1),
-        metadata_revision: SourceIdentifier::try_from("security-definition-revision:1")?,
         venue_id: VenueId::try_from("XCME")?,
         security_id: ProviderInstrumentId::try_from("123456")?,
         security_id_source: SourceIdentifier::try_from("8")?,
@@ -607,9 +617,7 @@ fn instrument_definition_owns_precision_mappings_identifiers_and_status()
         identifier,
         assignment_verification: AssignmentVerification::Unverified,
         source_id: SourceId::try_from("user-reference")?,
-        source_reference: PayloadReference::SourceReference(SourceIdentifier::try_from(
-            "instrument-row:1",
-        )?),
+        source_evidence: exact_evidence(13),
         source_timestamp: None,
         observed_at: Timestamp::from_unix_nanos(1),
         validity: EffectiveInterval::new(Timestamp::from_unix_nanos(1), None)?,
