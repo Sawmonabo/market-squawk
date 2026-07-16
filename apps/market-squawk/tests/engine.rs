@@ -1,21 +1,20 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use market_squawk::{
-    Engine,
-    domain::{BookChange, MarketEvent, PriceLevel, Side},
-    quality::QualityState,
+    DiagnosticBookChange, DiagnosticEngine, DiagnosticMarketEvent, DiagnosticPriceLevel,
+    DiagnosticSide, quality::QualityState,
 };
 use rust_decimal::Decimal;
 
 #[test]
-fn delta_before_snapshot_is_quarantined() -> Result<()> {
-    let mut engine = Engine::new(5_000, false);
+fn diagnostic_delta_before_snapshot_is_quarantined() -> Result<()> {
+    let mut engine = DiagnosticEngine::new(5_000, false);
     let now = Utc::now();
-    engine.handle(MarketEvent::BookDelta {
+    engine.handle(DiagnosticMarketEvent::BookDelta {
         source: "test".to_owned(),
         product: "BTC-USD".to_owned(),
-        changes: vec![BookChange {
-            side: Side::Buy,
+        changes: vec![DiagnosticBookChange {
+            side: DiagnosticSide::Buy,
             price: Decimal::from(100_u32),
             size: Decimal::ONE,
         }],
@@ -27,27 +26,28 @@ fn delta_before_snapshot_is_quarantined() -> Result<()> {
     let product = snapshot.products.get("BTC-USD").context("product state")?;
     assert_eq!(product.quality.state, QualityState::Quarantined);
     assert!(product.features.is_none());
+    assert_eq!(snapshot.processed_events, 1);
     Ok(())
 }
 
 #[test]
-fn source_disconnect_requires_a_fresh_snapshot() -> Result<()> {
-    let mut engine = Engine::new(5_000, false);
+fn diagnostic_disconnect_requires_a_fresh_snapshot() -> Result<()> {
+    let mut engine = DiagnosticEngine::new(5_000, false);
     let now = Utc::now();
-    engine.handle(MarketEvent::BookSnapshot {
+    engine.handle(DiagnosticMarketEvent::BookSnapshot {
         source: "test".to_owned(),
         product: "BTC-USD".to_owned(),
-        bids: vec![PriceLevel {
+        bids: vec![DiagnosticPriceLevel {
             price: Decimal::from(100_u32),
             size: Decimal::ONE,
         }],
-        asks: vec![PriceLevel {
+        asks: vec![DiagnosticPriceLevel {
             price: Decimal::from(101_u32),
             size: Decimal::ONE,
         }],
         received_at: now,
     });
-    engine.handle(MarketEvent::SourceStatus {
+    engine.handle(DiagnosticMarketEvent::SourceStatus {
         source: "test".to_owned(),
         status: "disconnected".to_owned(),
         detail: None,
@@ -62,14 +62,14 @@ fn source_disconnect_requires_a_fresh_snapshot() -> Result<()> {
     assert_eq!(product.quality.state, QualityState::Quarantined);
     assert!(product.features.is_none());
 
-    engine.handle(MarketEvent::BookSnapshot {
+    engine.handle(DiagnosticMarketEvent::BookSnapshot {
         source: "test".to_owned(),
         product: "BTC-USD".to_owned(),
-        bids: vec![PriceLevel {
+        bids: vec![DiagnosticPriceLevel {
             price: Decimal::from(100_u32),
             size: Decimal::ONE,
         }],
-        asks: vec![PriceLevel {
+        asks: vec![DiagnosticPriceLevel {
             price: Decimal::from(101_u32),
             size: Decimal::ONE,
         }],
@@ -81,5 +81,6 @@ fn source_disconnect_requires_a_fresh_snapshot() -> Result<()> {
         recovered.products["BTC-USD"].quality.state,
         QualityState::Valid
     );
+    assert_eq!(recovered.processed_events, 3);
     Ok(())
 }
