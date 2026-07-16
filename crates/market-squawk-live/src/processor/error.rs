@@ -126,7 +126,6 @@ impl LiveApplyError {
             | Self::UnsupportedPayloadChecksum
             | Self::CapabilityExpired
             | Self::Source(_)
-            | Self::Authority(_)
             | Self::GenerationState(_)
             | Self::Sequence(_)
             | Self::Checksum(_)
@@ -136,6 +135,13 @@ impl LiveApplyError {
             | Self::Integrity(_)
             | Self::Market(_)
             | Self::Identity(_) => false,
+            Self::Authority(error) => matches!(
+                error,
+                AuthorityError::RevisionExhausted
+                    | AuthorityError::NonceRegistryInitialization
+                    | AuthorityError::NonceInvariant
+                    | AuthorityError::ClockRange
+            ),
         }
     }
 }

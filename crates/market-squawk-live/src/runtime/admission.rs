@@ -87,14 +87,20 @@ impl ShardCommand {
         let admission_bytes = admission
             .retained_bytes()
             .map_err(|_| LiveIngressError::RetainedSizeOverflow)?;
-        let retained = batch
-            .retained_bytes()
-            .checked_add(size_of::<Self>())
-            .and_then(|value| value.checked_add(admission_bytes))
-            .and_then(|value| value.checked_add(COMMAND_SHARED_ALLOCATION_CHARGE))
-            .ok_or(LiveIngressError::RetainedSizeOverflow)?;
-        u32::try_from(retained).map_err(|_| LiveIngressError::RetainedSizeOverflow)
+        checked_command_retained_bytes(batch.retained_bytes(), admission_bytes)
     }
+}
+
+fn checked_command_retained_bytes(
+    batch_bytes: usize,
+    admission_bytes: usize,
+) -> Result<u32, LiveIngressError> {
+    let retained = batch_bytes
+        .checked_add(size_of::<ShardCommand>())
+        .and_then(|value| value.checked_add(admission_bytes))
+        .and_then(|value| value.checked_add(COMMAND_SHARED_ALLOCATION_CHARGE))
+        .ok_or(LiveIngressError::RetainedSizeOverflow)?;
+    u32::try_from(retained).map_err(|_| LiveIngressError::RetainedSizeOverflow)
 }
 
 #[derive(Debug)]
