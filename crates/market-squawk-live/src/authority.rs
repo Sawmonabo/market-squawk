@@ -605,6 +605,16 @@ mod tests {
     }
 
     #[test]
+    fn dropping_an_owner_release_invalidates_every_retained_lease() {
+        let lease = {
+            let owner = GenerationLeaseOwner::new(11);
+            owner.lease()
+        };
+
+        assert_eq!(lease.validate(), Err(LeaseError::Revoked));
+    }
+
+    #[test]
     fn nonce_registry_is_fixed_capacity_single_use_and_epoch_bound()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut registry = NonceRegistry::new(2)?;

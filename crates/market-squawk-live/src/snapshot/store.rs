@@ -10,7 +10,8 @@ use super::{
     LiveRuntimeSnapshotLease, LiveSnapshotLease, LiveSnapshotReader, ShardSnapshot,
     ShardSnapshotRevision, SnapshotReadError,
 };
-use crate::{ShardCount, ShardId};
+use crate::{ShardCount, ShardId, ShardRoutingVersion};
+use thiserror::Error;
 
 #[derive(Debug)]
 struct SnapshotCell {
@@ -22,14 +23,34 @@ struct SnapshotCell {
 #[derive(Debug)]
 pub(crate) struct SnapshotPublisher {
     cell: Arc<SnapshotCell>,
+    routing_version: ShardRoutingVersion,
+    shard_count: ShardCount,
+    runtime_incarnation: std::num::NonZeroU64,
     notification: mpsc::Sender<()>,
     dropped_notifications: Arc<AtomicU64>,
 }
 
 impl SnapshotPublisher {
-    pub(crate) fn publish(&self, snapshot: ShardSnapshot) -> Result<(), SnapshotReadError> {
-        if snapshot.shard_id() != self.cell.shard {
-            return Err(SnapshotReadError::UnknownShard);
+    pub(crate) fn publish(&self, snapshot: ShardSnapshot) -> Result<(), SnapshotPublishError> {
+        if snapshot.shard_id() != self.cell.shard
+            || snapshot.routing_version() != self.routing_version
+            || snapshot.shard_count() != self.shard_count
+            || snapshot.runtime_incarnation() != self.runtime_incarnation
+        {
+            return Err(SnapshotPublishError::IdentityTransplant);
+        }
+        let current = self.cell.value.load();
+        let expected = current
+            .snapshot_revision()
+            .get()
+            .checked_add(1)
+            .and_then(std::num::NonZeroU64::new)
+            .ok_or(SnapshotPublishError::RevisionExhausted)?;
+        if snapshot.snapshot_revision() != expected {
+            return Err(SnapshotPublishError::NonSuccessorRevision {
+                current: current.snapshot_revision().get(),
+                proposed: snapshot.snapshot_revision().get(),
+            });
         }
         self.cell.value.store(Arc::new(snapshot));
         if matches!(
@@ -48,6 +69,17 @@ impl SnapshotPublisher {
     pub(crate) fn dropped_notifications(&self) -> u64 {
         self.dropped_notifications.load(Ordering::Relaxed)
     }
+}
+
+/// Fail-closed immutable publication rejection.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum SnapshotPublishError {
+    #[error("snapshot routing, shard, or runtime incarnation identity was transplanted")]
+    IdentityTransplant,
+    #[error("snapshot revision exhausted")]
+    RevisionExhausted,
+    #[error("snapshot revision {proposed} is not the exact successor of {current}")]
+    NonSuccessorRevision { current: u64, proposed: u64 },
 }
 
 /// Shared authority-free snapshot cells and one global retained-reader budget.
@@ -73,9 +105,13 @@ impl SnapshotPlane {
             return Err(SnapshotReadError::Closed);
         }
         let cell = self.cell(shard)?;
+        let permit_count = u32::from(self.count.get());
         let permit = Arc::clone(&self.readers)
-            .try_acquire_owned()
-            .map_err(|_| SnapshotReadError::ReaderLimitReached)?;
+            .try_acquire_many_owned(permit_count)
+            .map_err(|error| match error {
+                tokio::sync::TryAcquireError::NoPermits => SnapshotReadError::ReaderLimitReached,
+                tokio::sync::TryAcquireError::Closed => SnapshotReadError::Closed,
+            })?;
         Ok(LiveSnapshotLease::new(cell.value.load_full(), permit))
     }
 
@@ -83,9 +119,15 @@ impl SnapshotPlane {
         if self.closed.load(Ordering::Acquire) {
             return Err(SnapshotReadError::Closed);
         }
-        let permit = Arc::clone(&self.readers)
-            .try_acquire_owned()
-            .map_err(|_| SnapshotReadError::ReaderLimitReached)?;
+        let permit =
+            Arc::clone(&self.readers)
+                .try_acquire_owned()
+                .map_err(|error| match error {
+                    tokio::sync::TryAcquireError::NoPermits => {
+                        SnapshotReadError::ReaderLimitReached
+                    }
+                    tokio::sync::TryAcquireError::Closed => SnapshotReadError::Closed,
+                })?;
         let mut snapshots = Vec::new();
         snapshots
             .try_reserve_exact(self.cells.len())
@@ -160,13 +202,20 @@ pub(crate) fn create_snapshot_plane(
         {
             return Err(SnapshotReadError::UnknownShard);
         }
+        let shard = snapshot.shard_id();
+        let routing_version = snapshot.routing_version();
+        let shard_count = snapshot.shard_count();
+        let runtime_incarnation = snapshot.runtime_incarnation();
         let cell = Arc::new(SnapshotCell {
-            shard: snapshot.shard_id(),
+            shard,
             value: ArcSwap::from_pointee(snapshot),
         });
         let (notification, receiver) = mpsc::channel(1);
         publishers.push(SnapshotPublisher {
             cell: Arc::clone(&cell),
+            routing_version,
+            shard_count,
+            runtime_incarnation,
             notification,
             dropped_notifications: Arc::new(AtomicU64::new(0)),
         });

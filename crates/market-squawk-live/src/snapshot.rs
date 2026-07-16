@@ -14,17 +14,11 @@ use tokio::sync::OwnedSemaphorePermit;
 use crate::{ShardCount, ShardId, ShardKey, ShardRoutingVersion};
 
 #[path = "snapshot/store.rs"]
-#[allow(
-    dead_code,
-    reason = "Task 8 actor/lifecycle production wiring consumes the private store in the next slice"
-)]
 mod store;
 
-#[allow(
-    unused_imports,
-    reason = "Task 8 actor/lifecycle production wiring consumes these private handles next"
-)]
-pub(crate) use store::{SnapshotPublisher, create_snapshot_plane};
+pub(crate) use store::{
+    SnapshotPlaneBundle, SnapshotPublishError, SnapshotPublisher, create_snapshot_plane,
+};
 
 /// Hard bound aligned with one shard's preallocated route table.
 pub(crate) const MAX_SNAPSHOT_ROUTES: usize = 64;
@@ -60,10 +54,6 @@ pub struct SnapshotDimension {
 }
 
 impl SnapshotDimension {
-    #[allow(
-        dead_code,
-        reason = "the Task 8 actor snapshot builder consumes this checked constructor"
-    )]
     pub(crate) fn from_counts(
         available: usize,
         returned: usize,
@@ -145,10 +135,6 @@ pub struct BookLevelSnapshot {
 }
 
 impl BookLevelSnapshot {
-    #[allow(
-        dead_code,
-        reason = "the Task 8 actor snapshot builder consumes this authority-free conversion"
-    )]
     pub(crate) const fn new(price: PriceTicks, quantity: QuantityLots) -> Self {
         Self { price, quantity }
     }
@@ -209,10 +195,10 @@ pub struct StreamSnapshot {
     pub(crate) state_revision: u64,
     pub(crate) snapshot_origin_revision: Option<u64>,
     pub(crate) health_epoch: u64,
-    pub(crate) source_valid_until: Option<Timestamp>,
+    pub(crate) source_valid_until: Timestamp,
     pub(crate) source_timestamp: Option<Timestamp>,
-    pub(crate) received_at: Option<Timestamp>,
-    pub(crate) evaluated_at: Option<Timestamp>,
+    pub(crate) received_at: Timestamp,
+    pub(crate) evaluated_at: Timestamp,
     pub(crate) configured_depth: u32,
     pub(crate) state_bid_depth: usize,
     pub(crate) state_ask_depth: usize,
@@ -253,16 +239,16 @@ impl StreamSnapshot {
     pub const fn health_epoch(&self) -> u64 {
         self.health_epoch
     }
-    pub const fn source_valid_until(&self) -> Option<Timestamp> {
+    pub const fn source_valid_until(&self) -> Timestamp {
         self.source_valid_until
     }
     pub const fn source_timestamp(&self) -> Option<Timestamp> {
         self.source_timestamp
     }
-    pub const fn received_at(&self) -> Option<Timestamp> {
+    pub const fn received_at(&self) -> Timestamp {
         self.received_at
     }
-    pub const fn evaluated_at(&self) -> Option<Timestamp> {
+    pub const fn evaluated_at(&self) -> Timestamp {
         self.evaluated_at
     }
     pub const fn configured_depth(&self) -> u32 {
@@ -393,6 +379,14 @@ impl SnapshotLimits {
         maximum_levels_per_side: u32,
         maximum_retained_bytes: u32,
     ) -> Result<Self, SnapshotLimitsError> {
+        let minimum_retained_bytes = u32::try_from(std::mem::size_of::<ShardSnapshot>())
+            .map_err(|_| SnapshotLimitsError::TruthfulBaseUnrepresentable)?;
+        if maximum_retained_bytes < minimum_retained_bytes {
+            return Err(SnapshotLimitsError::BelowTruthfulBase {
+                value: maximum_retained_bytes,
+                minimum: minimum_retained_bytes,
+            });
+        }
         Ok(Self {
             maximum_routes: checked_usize("maximum_routes", maximum_routes, MAX_SNAPSHOT_ROUTES)?,
             maximum_streams_per_route: checked_usize(
@@ -502,8 +496,12 @@ impl LiveRuntimeSnapshotLease {
         }
     }
 
-    pub fn snapshots(&self) -> &[Arc<ShardSnapshot>] {
-        &self.snapshots
+    /// Iterates borrowed DTOs while this one retained-reader permit remains held.
+    ///
+    /// The underlying runtime-owned `Arc` values are intentionally never exposed, so callers
+    /// cannot clone them and retain unbounded historical publications after dropping this lease.
+    pub fn snapshots(&self) -> impl ExactSizeIterator<Item = &ShardSnapshot> {
+        self.snapshots.iter().map(Arc::as_ref)
     }
     pub fn revisions(&self) -> &[ShardSnapshotRevision] {
         &self.revisions
@@ -571,14 +569,14 @@ pub enum SnapshotLimitsError {
         value: u64,
         maximum: u64,
     },
+    #[error("snapshot retained-byte limit {value} is below truthful base size {minimum}")]
+    BelowTruthfulBase { value: u32, minimum: u32 },
+    #[error("truthful base snapshot size cannot be represented")]
+    TruthfulBaseUnrepresentable,
 }
 
 /// Snapshot construction invariant or checked-retained-size failure.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-#[allow(
-    dead_code,
-    reason = "the Task 8 actor snapshot builder maps these fail-closed construction errors"
-)]
 pub(crate) enum SnapshotBuildError {
     #[error("snapshot count cannot be represented")]
     CountOverflow,
@@ -590,6 +588,8 @@ pub(crate) enum SnapshotBuildError {
     RevisionExhausted,
     #[error("system clock is outside the supported timestamp range")]
     ClockRange,
+    #[error("committed stream seed omitted required provenance time")]
+    IncompleteStreamProvenance,
 }
 
 /// Bounded retained-reader or shard lookup failure.

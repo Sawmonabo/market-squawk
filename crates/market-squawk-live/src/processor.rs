@@ -29,7 +29,7 @@ mod status;
 #[path = "processor/stream.rs"]
 mod stream;
 
-use error::LiveApplyError;
+pub(crate) use error::LiveApplyError;
 #[allow(
     unused_imports,
     reason = "Task 8 control-plane binding consumes the registry and exit handle"

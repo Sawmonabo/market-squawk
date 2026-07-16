@@ -22,8 +22,11 @@ pub use normalization::{
     NormalizationError, normalize_delta_quantity, normalize_positive_quantity, normalize_price,
 };
 pub use runtime::{
-    LiveRouteConfig, LiveRouteConfigInput, LiveRuntimeConfig, LiveRuntimeConfigError,
-    LiveRuntimeConfigInput,
+    BoundShardIngress, LiveIngressBindError, LiveIngressError, LiveRouteConfig,
+    LiveRouteConfigInput, LiveRuntime, LiveRuntimeConfig, LiveRuntimeConfigError,
+    LiveRuntimeConfigInput, LiveRuntimeHealthEvent, LiveRuntimeHealthKind, LiveRuntimeIngress,
+    LiveRuntimeReplaceError, LiveRuntimeShutdown, LiveRuntimeStartError, RegistrationFailure,
+    ShardShutdownOutcome, ShardShutdownStatus,
 };
 pub use sharding::{
     ShardCount, ShardId, ShardKey, ShardRouter, ShardRoutingError, ShardRoutingVersion,

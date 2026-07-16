@@ -90,3 +90,52 @@ pub(crate) enum LiveApplyError {
     #[error(transparent)]
     Identity(#[from] market_squawk_domain::IdentityError),
 }
+
+impl LiveApplyError {
+    /// Classifies irrecoverable owner-state/configuration failures separately from exact-source
+    /// rejection. The actor invalidates shard/runtime authority for every `true` variant.
+    pub(crate) const fn is_fatal_to_actor(&self) -> bool {
+        match self {
+            Self::InvalidStreamCapacity { .. }
+            | Self::InvalidGenerationCapacity
+            | Self::InvalidCapabilityLifetime
+            | Self::InvalidSnapshotLimits
+            | Self::SnapshotRetainedSizeOverflow
+            | Self::Allocation
+            | Self::StreamCapacityExhausted
+            | Self::GenerationCapacityExhausted
+            | Self::StatusCapacityExhausted
+            | Self::StatusRevisionExhausted
+            | Self::StatusCommitConflict
+            | Self::StreamStateMissing
+            | Self::StateRevisionExhausted
+            | Self::StateRevisionConflict
+            | Self::CandidateEventAlreadyBuilt => true,
+            Self::InstrumentMismatch
+            | Self::VenueMismatch
+            | Self::BindingMismatch
+            | Self::StatusGenerationMismatch
+            | Self::GenerationAdmissionTransplant
+            | Self::GenerationNotAdvanced
+            | Self::Quarantined
+            | Self::SnapshotRequired
+            | Self::SnapshotPolicyMismatch
+            | Self::PayloadClassMismatch
+            | Self::ChecksumProfileMismatch
+            | Self::InvalidChecksumValue
+            | Self::UnsupportedPayloadChecksum
+            | Self::CapabilityExpired
+            | Self::Source(_)
+            | Self::Authority(_)
+            | Self::GenerationState(_)
+            | Self::Sequence(_)
+            | Self::Checksum(_)
+            | Self::ProviderBook(_)
+            | Self::Normalization(_)
+            | Self::Qualification(_)
+            | Self::Integrity(_)
+            | Self::Market(_)
+            | Self::Identity(_) => false,
+        }
+    }
+}

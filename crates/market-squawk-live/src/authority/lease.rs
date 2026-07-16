@@ -42,6 +42,12 @@ impl<D> OneWayLeaseOwner<D> {
     }
 }
 
+impl<D> Drop for OneWayLeaseOwner<D> {
+    fn drop(&mut self) {
+        self.invalidate();
+    }
+}
+
 /// O(1)-clone validation-only view of a one-way allocation.
 #[derive(Debug)]
 pub(crate) struct OneWayLease<D> {

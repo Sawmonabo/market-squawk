@@ -51,7 +51,7 @@ impl GenerationAdmission {
         self.generation.invalidate();
     }
 
-    pub(super) const fn source(&self) -> &CurrentSourceAuthorityLease {
+    pub(crate) const fn source(&self) -> &CurrentSourceAuthorityLease {
         &self.source
     }
 
@@ -59,11 +59,22 @@ impl GenerationAdmission {
         self.generation.clone()
     }
 
-    pub(super) fn validate_at(&self, at: Timestamp) -> Result<(), LiveApplyError> {
+    pub(crate) fn validate_at(&self, at: Timestamp) -> Result<(), LiveApplyError> {
         self.source.validate_at(at)?;
         self.registry.validate().map_err(AuthorityError::from)?;
         self.generation.validate().map_err(AuthorityError::from)?;
         Ok(())
+    }
+
+    /// Returns a conservative checked charge for the admission handle and shared identities.
+    pub(crate) fn retained_bytes(&self) -> Result<usize, LiveApplyError> {
+        std::mem::size_of::<Self>()
+            .checked_add(market_squawk_domain::SourceId::MAX_LENGTH)
+            .and_then(|value| value.checked_add(market_squawk_domain::VenueId::MAX_LENGTH))
+            .and_then(|value| {
+                value.checked_add(2 * market_squawk_domain::SourceIdentifier::MAX_LENGTH)
+            })
+            .ok_or(LiveApplyError::SnapshotRetainedSizeOverflow)
     }
 }
 

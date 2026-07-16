@@ -104,3 +104,7 @@ fn multiply(left: u64, right: u64) -> Result<u64, LiveRuntimeConfigError> {
     left.checked_mul(right)
         .ok_or(LiveRuntimeConfigError::CapacityOverflow)
 }
+
+#[cfg(test)]
+#[path = "tests/config_memory.rs"]
+mod tests;
