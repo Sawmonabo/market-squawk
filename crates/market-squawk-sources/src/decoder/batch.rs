@@ -106,6 +106,7 @@ impl ProviderNormalizedObservation {
         &self.payload
     }
 
+    /// Returns every allocation uniquely owned by this observation, excluding inline storage.
     pub(crate) fn dynamic_retained_bytes(&self) -> Result<usize, DecodeError> {
         let timestamp_rule = match &self.timestamp {
             ProviderTimestampEvidence::AuthoritativelyAbsent(rule) => {
@@ -142,6 +143,7 @@ impl ProviderNormalizedObservation {
             self.source_identifier.retained_bytes(),
             self.venue.retained_bytes(),
             timestamp_rule,
+            sequence_dynamic_retained_bytes(&self.sequence),
             snapshot_bytes,
             checksum_bytes,
             self.payload.deep_retained_bytes()?,
@@ -220,6 +222,7 @@ impl DecodedProviderBatch {
                     .ok_or(DecodeError::RetainedSizeOverflow)?,
             )
             .ok_or(DecodeError::RetainedSizeOverflow)?;
+        let evidence = self.evidence.dynamic_retained_bytes()?;
         let deep = checked_sum(
             self.observations
                 .as_slice()
@@ -228,7 +231,8 @@ impl DecodedProviderBatch {
                 .collect::<Result<Vec<_>, _>>()?,
         )?;
         shallow
-            .checked_add(deep)
+            .checked_add(evidence)
+            .and_then(|bytes| bytes.checked_add(deep))
             .ok_or(DecodeError::RetainedSizeOverflow)
     }
 }
@@ -289,6 +293,15 @@ fn checked_sum(values: impl IntoIterator<Item = usize>) -> Result<usize, DecodeE
     })
 }
 
+fn sequence_dynamic_retained_bytes(sequence: &ProviderSequenceEvidence) -> usize {
+    match sequence {
+        ProviderSequenceEvidence::Provided { rule, .. }
+        | ProviderSequenceEvidence::Unsupported { rule } => {
+            rule.provider_rule().retained_bytes()
+        }
+    }
+}
+
 fn is_decimal_lexeme(value: &[u8]) -> bool {
     let mut index = usize::from(value.first() == Some(&b'-'));
     let integer_start = index;
@@ -328,18 +341,22 @@ fn is_decimal_lexeme(value: &[u8]) -> bool {
 mod tests {
     use std::error::Error;
     use std::mem::size_of;
+    use std::num::NonZeroU64;
 
     use market_squawk_domain::{
-        AggressorSide, AuctionPhase, CorporateActionKind, HaltTransition, IntegrityRule,
-        MarketDepth, RuleVersion, SourceIdentifier, Timestamp, TradingStatus,
+        AggressorSide, AuctionPhase, ConnectionGeneration, CorporateActionKind, DigestAlgorithm,
+        EvidenceDigest, HaltTransition, IntegrityRule, MarketDepth, MetadataRevision, RuleVersion,
+        SourceId, SourceIdentifier, Timestamp, TradingStatus,
     };
     use rust_decimal::Decimal;
 
     use super::{
-        ProviderAggressorEvidence, ProviderBookChange, ProviderBookLevel, ProviderBookSide,
-        ProviderDecimalLexeme, ProviderObservationPayload, ProviderPrice, ProviderQuantity,
-        ProviderStatusEvidence,
+        DecoderEvidence, FrameId, FrameSessionBinding, ProviderAggressorEvidence,
+        ProviderBookChange, ProviderBookLevel, ProviderBookSide, ProviderDecimalLexeme,
+        ProviderObservationPayload, ProviderPrice, ProviderQuantity, ProviderSequenceEvidence,
+        ProviderStatusEvidence, sequence_dynamic_retained_bytes,
     };
+    use crate::SessionId;
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -411,6 +428,80 @@ mod tests {
         };
 
         assert!(lexeme.retained_bytes() >= 128);
+        Ok(())
+    }
+
+    #[test]
+    fn sequence_evidence_charges_its_capacity_heavy_rule_exactly() -> TestResult {
+        let compact = ProviderSequenceEvidence::Unsupported { rule: rule("x")? };
+        let mut provider_rule = String::with_capacity(SourceIdentifier::MAX_LENGTH);
+        provider_rule.push('x');
+        let retained_capacity = provider_rule.capacity();
+        let expanded = ProviderSequenceEvidence::Unsupported {
+            rule: IntegrityRule::new(
+                SourceIdentifier::try_from(provider_rule)?,
+                RuleVersion::new(1)?,
+            ),
+        };
+
+        assert_eq!(
+            sequence_dynamic_retained_bytes(&expanded)
+                .checked_sub(sequence_dynamic_retained_bytes(&compact)),
+            retained_capacity.checked_sub("x".len())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn decoder_evidence_charges_binding_and_rule_allocations_exactly() -> TestResult {
+        fn expanded(value: &str, capacity: usize) -> String {
+            let mut expanded = String::with_capacity(capacity);
+            expanded.push_str(value);
+            expanded
+        }
+        fn evidence(
+            source: SourceId,
+            revision: SourceIdentifier,
+            session: SourceIdentifier,
+            decoder: SourceIdentifier,
+        ) -> TestResult<DecoderEvidence> {
+            Ok(DecoderEvidence {
+                binding: FrameSessionBinding::new(
+                    source,
+                    MetadataRevision::new(revision),
+                    SessionId::new(session),
+                    ConnectionGeneration::new(1)?,
+                ),
+                frame_id: FrameId::new(
+                    NonZeroU64::new(1).ok_or("frame fixture must be nonzero")?,
+                ),
+                received_at: Timestamp::from_unix_nanos(1),
+                payload_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, [1; 32]),
+                decoder_rule: IntegrityRule::new(decoder, RuleVersion::new(1)?),
+            })
+        }
+        let compact = evidence(
+            SourceId::try_from("s")?,
+            id("r")?,
+            id("i")?,
+            id("d")?,
+        )?;
+        let expanded = evidence(
+            SourceId::try_from(expanded("s", SourceId::MAX_LENGTH))?,
+            SourceIdentifier::try_from(expanded("r", SourceIdentifier::MAX_LENGTH))?,
+            SourceIdentifier::try_from(expanded("i", SourceIdentifier::MAX_LENGTH))?,
+            SourceIdentifier::try_from(expanded("d", SourceIdentifier::MAX_LENGTH))?,
+        )?;
+        let expected_delta = (SourceId::MAX_LENGTH - 1)
+            .checked_add((SourceIdentifier::MAX_LENGTH - 1) * 3)
+            .ok_or("decoder evidence fixture overflow")?;
+
+        assert_eq!(
+            expanded
+                .dynamic_retained_bytes()?
+                .checked_sub(compact.dynamic_retained_bytes()?),
+            Some(expected_delta)
+        );
         Ok(())
     }
 

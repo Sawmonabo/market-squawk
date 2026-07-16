@@ -73,6 +73,16 @@ impl DecoderEvidence {
     pub const fn decoder_rule(&self) -> &IntegrityRule {
         &self.decoder_rule
     }
+
+    /// Returns the shared session-identity allocation plus the owned decoder-rule allocation.
+    ///
+    /// The inline [`Self`] storage is deliberately excluded.
+    pub(crate) fn dynamic_retained_bytes(&self) -> Result<usize, DecodeError> {
+        self.binding
+            .shared_allocation_charge()
+            .and_then(|bytes| bytes.checked_add(self.decoder_rule.provider_rule().retained_bytes()))
+            .ok_or(DecodeError::RetainedSizeOverflow)
+    }
 }
 
 /// Exact validated provider decimal lexeme, retained until tick/lot conversion.

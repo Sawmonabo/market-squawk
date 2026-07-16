@@ -120,6 +120,26 @@ impl FrameSessionBinding {
     pub fn shares_allocation_with(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
+
+    /// Returns the exact allocation reachable through this shared identity once.
+    ///
+    /// Cloned bindings share the same allocation and must be deduplicated by their owning object
+    /// graph before this charge is added.
+    pub(crate) fn shared_allocation_charge(&self) -> Option<usize> {
+        std::mem::size_of::<FrameSessionIdentity>()
+            .checked_add(self.0.source_id.retained_bytes())
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    self.0
+                        .metadata_revision
+                        .as_source_identifier()
+                        .retained_bytes(),
+                )
+            })
+            .and_then(|bytes| {
+                bytes.checked_add(self.0.session_id.as_source_identifier().retained_bytes())
+            })
+    }
 }
 
 /// Exact bounded live payload captured before provider decoding.

@@ -431,10 +431,17 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
                             .and_then(|bytes| bytes.checked_add(provider))
                             .ok_or(RegistryError::RetainedSizeOverflow)
                     })?;
+                let frame_shared_allocation = observations
+                    .first()
+                    .ok_or(RegistryError::DecoderProfileMismatch)?
+                    .frame_evidence
+                    .shared_allocation_charge()?;
                 let retained_bytes = current_routed_batch_retained_bytes(
                     key.dynamic_retained_bytes(),
                     observations.len(),
                     observation_unique_allocations,
+                    current_authority_shared_allocation_charge()?,
+                    frame_shared_allocation,
                 )?;
                 let observations = observations.into_boxed_slice();
                 let authority = observations

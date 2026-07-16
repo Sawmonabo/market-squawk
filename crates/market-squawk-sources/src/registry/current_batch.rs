@@ -38,6 +38,16 @@ impl CurrentFrameEvidence {
     pub fn decoder_rule(&self) -> &market_squawk_domain::IntegrityRule {
         self.0.decoder_rule()
     }
+
+    fn shared_allocation_charge(&self) -> Result<usize, RegistryError> {
+        std::mem::size_of::<crate::DecoderEvidence>()
+            .checked_add(
+                self.0
+                    .dynamic_retained_bytes()
+                    .map_err(|_| RegistryError::RetainedSizeOverflow)?,
+            )
+            .ok_or(RegistryError::RetainedSizeOverflow)
+    }
 }
 
 impl CurrentBatchKey {
@@ -249,24 +259,7 @@ fn current_policy_conservative_allocation_charge() -> Result<usize, RegistryErro
 
 fn current_authority_shared_allocation_charge() -> Result<usize, RegistryError> {
     std::mem::size_of::<SessionLeaseState>()
-        .checked_add(SourceId::MAX_LENGTH)
-        .and_then(|bytes| {
-            market_squawk_domain::SourceIdentifier::MAX_LENGTH
-                .checked_mul(2)
-                .and_then(|identity_bytes| bytes.checked_add(identity_bytes))
-        })
-        .and_then(|bytes| bytes.checked_add(256))
-        .ok_or(RegistryError::RetainedSizeOverflow)
-}
-
-fn current_frame_shared_allocation_charge() -> Result<usize, RegistryError> {
-    std::mem::size_of::<crate::DecoderEvidence>()
-        .checked_add(SourceId::MAX_LENGTH)
-        .and_then(|bytes| {
-            market_squawk_domain::SourceIdentifier::MAX_LENGTH
-                .checked_mul(3)
-                .and_then(|identity_bytes| bytes.checked_add(identity_bytes))
-        })
+        .checked_add(256)
         .ok_or(RegistryError::RetainedSizeOverflow)
 }
 
@@ -274,16 +267,16 @@ fn current_routed_batch_retained_bytes(
     batch_key_allocation: usize,
     observation_count: usize,
     observation_unique_allocations: usize,
+    authority_shared_allocation: usize,
+    frame_shared_allocation: usize,
 ) -> Result<usize, RegistryError> {
-    let authority_allocation = current_authority_shared_allocation_charge()?;
-    let frame_allocation = current_frame_shared_allocation_charge()?;
     observation_count
         .checked_mul(std::mem::size_of::<CurrentProviderObservation>())
         .and_then(|bytes| bytes.checked_add(std::mem::size_of::<CurrentDecodedProviderBatch>()))
         .and_then(|bytes| bytes.checked_add(batch_key_allocation))
         .and_then(|bytes| bytes.checked_add(observation_unique_allocations))
-        .and_then(|bytes| bytes.checked_add(authority_allocation))
-        .and_then(|bytes| bytes.checked_add(frame_allocation))
+        .and_then(|bytes| bytes.checked_add(authority_shared_allocation))
+        .and_then(|bytes| bytes.checked_add(frame_shared_allocation))
         .ok_or(RegistryError::RetainedSizeOverflow)
 }
 
@@ -553,11 +546,13 @@ mod stream_key_tests {
     -> Result<(), Box<dyn std::error::Error>> {
         const PER_OBSERVATION_DYNAMIC: usize = 137;
         const SECOND_OBSERVATION_DYNAMIC: usize = 211;
-        let one = current_routed_batch_retained_bytes(53, 1, PER_OBSERVATION_DYNAMIC)?;
+        let one = current_routed_batch_retained_bytes(53, 1, PER_OBSERVATION_DYNAMIC, 97, 101)?;
         let two = current_routed_batch_retained_bytes(
             53,
             2,
             PER_OBSERVATION_DYNAMIC + SECOND_OBSERVATION_DYNAMIC,
+            97,
+            101,
         )?;
 
         assert_eq!(
@@ -577,8 +572,9 @@ mod stream_key_tests {
         };
 
         assert!(key.dynamic_retained_bytes() >= VenueId::MAX_LENGTH);
-        let without_key = current_routed_batch_retained_bytes(0, 1, 0)?;
-        let with_key = current_routed_batch_retained_bytes(key.dynamic_retained_bytes(), 1, 0)?;
+        let without_key = current_routed_batch_retained_bytes(0, 1, 0, 0, 0)?;
+        let with_key =
+            current_routed_batch_retained_bytes(key.dynamic_retained_bytes(), 1, 0, 0, 0)?;
         assert_eq!(
             with_key.checked_sub(without_key),
             Some(key.dynamic_retained_bytes())
