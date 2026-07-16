@@ -60,6 +60,28 @@ async fn complete_startup_publishes_every_ready_shard_before_runtime_escape() ->
 }
 
 #[tokio::test]
+async fn exact_aggregate_reader_budget_supports_one_complete_runtime_lease() -> TestResult {
+    let config = config(2, 2, Duration::from_secs(1))?;
+    let runtime = LiveRuntime::start(config, vec![route()?]).await?;
+    let aggregate = runtime.snapshots().try_load_all()?;
+    assert_eq!(aggregate.snapshots().count(), 2);
+    assert!(matches!(
+        runtime.snapshots().try_load(ShardId::new(0, 2)?),
+        Err(SnapshotReadError::ReaderLimitReached)
+    ));
+    assert!(matches!(
+        runtime.snapshots().try_load_all(),
+        Err(SnapshotReadError::ReaderLimitReached)
+    ));
+    drop(aggregate);
+    let single = runtime.snapshots().try_load(ShardId::new(0, 2)?)?;
+    drop(single);
+    assert_eq!(runtime.snapshots().try_load_all()?.snapshots().count(), 2);
+    assert!(runtime.shutdown().await.is_complete());
+    Ok(())
+}
+
+#[tokio::test]
 async fn readiness_failure_is_typed_by_exact_shard_and_never_waits_for_order() -> TestResult {
     let first = ShardId::new(0, 2)?;
     let second = ShardId::new(1, 2)?;

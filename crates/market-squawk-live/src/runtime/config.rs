@@ -520,9 +520,11 @@ mod tests {
     #[test]
     fn aggregate_snapshot_reader_budget_covers_every_shard_exactly()
     -> Result<(), Box<dyn std::error::Error>> {
-        let exact = LiveRuntimeConfig::try_new(valid_input()?)?;
+        let mut exact_input = valid_input()?;
+        exact_input.maximum_retained_snapshot_readers = 2;
+        let exact = LiveRuntimeConfig::try_new(exact_input)?;
         assert_eq!(exact.shard_count().get(), 2);
-        assert_eq!(exact.maximum_retained_snapshot_readers().get(), 4);
+        assert_eq!(exact.maximum_retained_snapshot_readers().get(), 2);
 
         let mut below = valid_input()?;
         below.maximum_retained_snapshot_readers = 1;
