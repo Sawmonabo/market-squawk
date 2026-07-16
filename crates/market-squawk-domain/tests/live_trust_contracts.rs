@@ -325,6 +325,14 @@ fn complete_key_rejects_transplant_across_every_identity_dimension() -> Result<(
             ..base_spec.clone()
         },
         BindingSpec {
+            snapshot_state_id: "snapshot-state-41",
+            ..base_spec.clone()
+        },
+        BindingSpec {
+            snapshot_state_digest: 9,
+            ..base_spec.clone()
+        },
+        BindingSpec {
             depth: market_squawk_domain::MarketDepth::OrderLevel,
             ..base_spec
         },
@@ -399,6 +407,61 @@ fn snapshot_initialization_is_explicit_even_without_provider_sequence() -> Resul
     assert!(evidence.is_initialized());
     assert_eq!(evidence.snapshot_sequence(), None);
     assert!(!SnapshotEvidence::uninitialized(generation).is_initialized());
+    Ok(())
+}
+
+#[test]
+fn book_delta_binds_snapshot_origin_separately_from_current_state() -> Result<(), Box<dyn Error>> {
+    let binding = binding(&BindingSpec::default())?;
+    let book = binding.book_state().ok_or("missing book state")?;
+    assert_ne!(book.state_id(), book.snapshot_state_id());
+    assert_ne!(book.state_digest(), book.snapshot_state_digest());
+
+    let input = assessment_input(
+        binding.clone(),
+        None,
+        binding,
+        Timestamp::from_unix_nanos(1_020),
+    )?;
+    let assessment = QualificationAssessment::try_from(input)?;
+    assert_eq!(
+        assessment.assessment_status_at(Timestamp::from_unix_nanos(1_020)),
+        AssessmentStatus::Satisfied
+    );
+    Ok(())
+}
+
+#[test]
+fn book_snapshot_requires_current_state_to_equal_snapshot_origin() -> Result<(), Box<dyn Error>> {
+    let invalid = binding(&BindingSpec {
+        event_class: LiveEventClass::BookSnapshot,
+        ..BindingSpec::default()
+    })?;
+    let invalid_input = assessment_input(
+        invalid.clone(),
+        None,
+        invalid,
+        Timestamp::from_unix_nanos(1_020),
+    )?;
+    assert_eq!(
+        QualificationAssessment::try_from(invalid_input),
+        Err(QualificationError::BookStateMismatch)
+    );
+
+    let valid_spec = BindingSpec {
+        event_class: LiveEventClass::BookSnapshot,
+        book_state_id: "snapshot-state-40",
+        state_digest: 3,
+        ..BindingSpec::default()
+    };
+    let valid = binding(&valid_spec)?;
+    let valid_input = assessment_input(
+        valid.clone(),
+        None,
+        valid,
+        Timestamp::from_unix_nanos(1_020),
+    )?;
+    QualificationAssessment::try_from(valid_input)?;
     Ok(())
 }
 

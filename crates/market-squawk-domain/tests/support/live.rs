@@ -37,6 +37,8 @@ pub(crate) struct BindingSpec {
     pub payload_digest: u8,
     pub state_digest: u8,
     pub book_state_id: &'static str,
+    pub snapshot_state_digest: u8,
+    pub snapshot_state_id: &'static str,
     pub depth: MarketDepth,
 }
 
@@ -57,6 +59,8 @@ impl Default for BindingSpec {
             payload_digest: 1,
             state_digest: 2,
             book_state_id: "book-state-42",
+            snapshot_state_digest: 3,
+            snapshot_state_id: "snapshot-state-40",
             depth: MarketDepth::PriceLevel,
         }
     }
@@ -70,11 +74,23 @@ pub(crate) fn binding(spec: &BindingSpec) -> Result<LiveEvidenceBinding, Box<dyn
             RuleVersion::new(1)?,
         ),
     );
+    let snapshot_state_digest = CanonicalStateDigest::new(
+        EvidenceDigest::new(
+            PayloadHashAlgorithm::Sha256,
+            [spec.snapshot_state_digest; 32],
+        ),
+        CanonicalizationRule::new(
+            SourceIdentifier::try_from("market-squawk.book.price-level-v1")?,
+            RuleVersion::new(1)?,
+        ),
+    );
     let book_state = if spec.event_class.requires_book_state() {
-        Some(BookStateBinding::new(
+        Some(BookStateBinding::new_with_snapshot_origin(
             spec.depth,
             SourceIdentifier::try_from(spec.book_state_id)?,
             state_digest.clone(),
+            SourceIdentifier::try_from(spec.snapshot_state_id)?,
+            snapshot_state_digest,
         ))
     } else {
         None
@@ -304,8 +320,8 @@ pub(crate) fn assessment_input_with_relations(
             },
             |snapshot_book| {
                 Ok((
-                    snapshot_book.state_id().clone(),
-                    snapshot_book.state_digest().clone(),
+                    snapshot_book.snapshot_state_id().clone(),
+                    snapshot_book.snapshot_state_digest().clone(),
                 ))
             },
         )?;

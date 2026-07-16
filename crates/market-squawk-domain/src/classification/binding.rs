@@ -162,19 +162,45 @@ pub struct BookStateBinding {
     depth: MarketDepth,
     state_id: SourceIdentifier,
     state_digest: CanonicalStateDigest,
+    snapshot_state_id: SourceIdentifier,
+    snapshot_state_digest: CanonicalStateDigest,
 }
 
 impl BookStateBinding {
-    /// Constructs an order-book state binding.
-    pub const fn new(
+    /// Constructs a snapshot book state whose current state is its own initialization origin.
+    pub fn new(
         depth: MarketDepth,
         state_id: SourceIdentifier,
         state_digest: CanonicalStateDigest,
     ) -> Self {
         Self {
             depth,
+            snapshot_state_id: state_id.clone(),
+            snapshot_state_digest: state_digest.clone(),
             state_id,
             state_digest,
+        }
+    }
+
+    /// Constructs a current book state with an explicit initializing-snapshot origin.
+    ///
+    /// A delta normally changes the current state identity and digest while retaining the exact
+    /// snapshot identity and digest from which the generation was initialized. Keeping both in
+    /// the immutable binding prevents either current state or snapshot lineage from being
+    /// transplanted independently.
+    pub const fn new_with_snapshot_origin(
+        depth: MarketDepth,
+        state_id: SourceIdentifier,
+        state_digest: CanonicalStateDigest,
+        snapshot_state_id: SourceIdentifier,
+        snapshot_state_digest: CanonicalStateDigest,
+    ) -> Self {
+        Self {
+            depth,
+            state_id,
+            state_digest,
+            snapshot_state_id,
+            snapshot_state_digest,
         }
     }
 
@@ -191,6 +217,16 @@ impl BookStateBinding {
     /// Returns the canonical-state digest.
     pub const fn state_digest(&self) -> &CanonicalStateDigest {
         &self.state_digest
+    }
+
+    /// Returns the exact snapshot identity that initialized the current generation.
+    pub const fn snapshot_state_id(&self) -> &SourceIdentifier {
+        &self.snapshot_state_id
+    }
+
+    /// Returns the initializing snapshot's canonical state digest.
+    pub const fn snapshot_state_digest(&self) -> &CanonicalStateDigest {
+        &self.snapshot_state_digest
     }
 }
 

@@ -11,7 +11,7 @@ use super::{
     SnapshotApplicability, SnapshotConsistency, SnapshotState, SourceAuthorization,
     StreamIntegrityState, TimestampIntegrity,
 };
-use crate::{Timestamp, TradingStatus};
+use crate::{LiveEventClass, Timestamp, TradingStatus};
 
 #[path = "qualification/input.rs"]
 mod input;
@@ -474,8 +474,11 @@ fn validate_relations(input: &QualificationAssessmentInput) -> Result<(), Qualif
     }
     if let (Some(book), SnapshotState::Initialized(initialized)) =
         (input.binding.book_state(), snapshot.state())
-        && (book.state_id() != initialized.snapshot_identity()
-            || book.state_digest() != initialized.state_digest())
+        && (book.snapshot_state_id() != initialized.snapshot_identity()
+            || book.snapshot_state_digest() != initialized.state_digest()
+            || (input.binding.event_class() == LiveEventClass::BookSnapshot
+                && (book.state_id() != book.snapshot_state_id()
+                    || book.state_digest() != book.snapshot_state_digest())))
     {
         return Err(QualificationError::BookStateMismatch);
     }
