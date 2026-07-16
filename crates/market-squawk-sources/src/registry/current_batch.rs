@@ -55,6 +55,7 @@ impl CurrentBatchKey {
 /// O(1)-clone session/health/capture authority retained by queued observations.
 #[derive(Clone, Debug)]
 pub struct CurrentSourceAuthorityLease {
+    registry_id: u64,
     binding: FrameSessionBinding,
     health_epoch: u64,
     valid_until: Timestamp,
@@ -83,10 +84,25 @@ impl CurrentSourceAuthorityLease {
     pub const fn binding(&self) -> &FrameSessionBinding {
         &self.binding
     }
+
+    /// Returns the exact registry health epoch bound into this lease.
+    pub const fn health_epoch(&self) -> u64 {
+        self.health_epoch
+    }
+
+    /// Returns the inclusive static/runtime health deadline bound into this lease.
+    pub const fn valid_until(&self) -> Timestamp {
+        self.valid_until
+    }
+
+    /// Returns whether two opaque leases originate from the same process-local registry lineage.
+    pub fn shares_registry_lineage_with(&self, other: &Self) -> bool {
+        self.registry_id == other.registry_id
+    }
 }
 
 /// Full mutable stream-state identity inside one instrument-owned shard.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct CurrentStreamKey {
     source_id: SourceId,
     venue: VenueId,
@@ -392,6 +408,14 @@ impl CurrentDecodedProviderBatch {
         self.retained_bytes
     }
 
+    /// Returns the opaque current source lease required for pre-admission generation binding.
+    ///
+    /// This validation-only capability is non-Serde and cannot be reconstructed from frame IDs,
+    /// session fields, archived batches, or caller-authored health values.
+    pub const fn current_lease(&self) -> &CurrentSourceAuthorityLease {
+        &self.authority
+    }
+
     /// Revalidates the batch's current source, health, capture, and inclusive deadline authority.
     ///
     /// # Errors
@@ -452,6 +476,50 @@ impl IntoIterator for CurrentDecodedProviderBatches {
 
     fn into_iter(self) -> Self::IntoIter {
         CurrentBatchIter(self.batches.into_vec().into_iter())
+    }
+}
+
+#[cfg(test)]
+mod stream_key_tests {
+    use std::collections::HashSet;
+
+    use market_squawk_domain::{
+        InstrumentId, ProviderChannel, ProviderProduct, SourceId, SourceIdentifier, VenueId,
+    };
+
+    use super::CurrentStreamKey;
+
+    fn key(
+        source: &str,
+        venue: &str,
+        instrument: &str,
+        product: &str,
+        channel: &str,
+    ) -> Result<CurrentStreamKey, Box<dyn std::error::Error>> {
+        Ok(CurrentStreamKey {
+            source_id: SourceId::try_from(source)?,
+            venue: VenueId::try_from(venue)?,
+            instrument: instrument.parse::<InstrumentId>()?,
+            provider_product: ProviderProduct::new(SourceIdentifier::try_from(product)?),
+            provider_channel: ProviderChannel::new(SourceIdentifier::try_from(channel)?),
+        })
+    }
+
+    #[test]
+    fn hash_identity_separates_all_five_dimensions() -> Result<(), Box<dyn std::error::Error>> {
+        let first_instrument = "018f0000-0000-7000-8000-000000000001";
+        let second_instrument = "018f0000-0000-7000-8000-000000000002";
+        let keys = HashSet::from([
+            key("kraken-primary", "kraken", first_instrument, "BTC/USD", "book")?,
+            key("kraken-secondary", "kraken", first_instrument, "BTC/USD", "book")?,
+            key("kraken-primary", "coinbase", first_instrument, "BTC/USD", "book")?,
+            key("kraken-primary", "kraken", second_instrument, "BTC/USD", "book")?,
+            key("kraken-primary", "kraken", first_instrument, "XBT/USD", "book")?,
+            key("kraken-primary", "kraken", first_instrument, "BTC/USD", "level3")?,
+        ]);
+
+        assert_eq!(keys.len(), 6);
+        Ok(())
     }
 }
 

@@ -201,12 +201,50 @@ pub struct ValidatedCurrentSourceAuthority<'a> {
     validated: ValidatedSourceSession<'a>,
     health: &'a CurrentHealthAuthority,
     attestation: Option<&'a InstrumentUniverseAttestation>,
+    validated_at: Timestamp,
 }
 
 impl<'a> ValidatedCurrentSourceAuthority<'a> {
     /// Returns current registry-owned metadata.
     pub const fn metadata(&self) -> &'a SourceMetadata {
         self.validated.metadata
+    }
+
+    /// Issues an owned opaque source lease for pre-feed generation registration.
+    ///
+    /// The returned value retains the exact process-local session allocation, current health
+    /// epoch, capture generation, and inclusive deadline. It is intentionally non-serializable;
+    /// replayed or reconstructed identity data cannot mint it.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a stale session, changed health epoch, unhealthy capture generation, or expired
+    /// current-health deadline.
+    pub fn try_current_lease(
+        &self,
+        at: Timestamp,
+    ) -> Result<CurrentSourceAuthorityLease, RegistryError> {
+        self.validated.session.validate_current_lease()?;
+        if at < self.validated_at
+            || !self
+            .validated
+            .session
+            .lease
+            .validate_health_epoch(self.health.epoch, at)
+            || !self.validated.session.capture.is_healthy()
+        {
+            return Err(RegistryError::HealthNotQualified);
+        }
+        let lease = CurrentSourceAuthorityLease {
+            registry_id: self.validated.session.registry_id,
+            binding: self.validated.session.binding.clone(),
+            health_epoch: self.health.epoch,
+            valid_until: self.health.valid_until,
+            lease: Arc::clone(&self.validated.session.lease),
+            capture: self.validated.session.capture.clone(),
+        };
+        lease.validate_at(at)?;
+        Ok(lease)
     }
 
     /// Narrows current health authority to an exact venue/instrument/event/depth tuple.
@@ -278,6 +316,7 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
             metadata_revision: self.validated.session.binding.metadata_revision().clone(),
         };
         Ok(ValidatedLiveScope {
+            registry_id: self.validated.session.registry_id,
             binding: self.validated.session.binding.clone(),
             venue: venue.clone(),
             instrument,
@@ -423,6 +462,7 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
 /// Opaque current authority for one exact live coverage tuple.
 #[derive(Debug)]
 pub struct ValidatedLiveScope {
+    registry_id: u64,
     binding: FrameSessionBinding,
     venue: VenueId,
     instrument: InstrumentId,
@@ -551,6 +591,7 @@ impl ValidatedLiveScope {
             provider_channel: self.provider_channel.clone(),
         };
         let authority = CurrentSourceAuthorityLease {
+            registry_id: self.registry_id,
             binding: self.binding,
             health_epoch: self.health_epoch,
             valid_until: self.valid_until,

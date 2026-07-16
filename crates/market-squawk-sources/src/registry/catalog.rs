@@ -7,6 +7,20 @@ pub struct AuthoritativeSourceRegistry {
     history: BTreeMap<SourceId, SourceAuthorityHistory>,
 }
 
+impl Drop for AuthoritativeSourceRegistry {
+    fn drop(&mut self) {
+        // Registry lifetime is an authority dimension. Retained session, capture, frame, and
+        // pre-feed handles must fail closed once their sole authoritative owner exits.
+        for entry in self.entries.values_mut() {
+            if let Some(active) = entry.active.take() {
+                active.lease.invalidate();
+                active.capture.mark_incomplete();
+            }
+            entry.health_authority = None;
+        }
+    }
+}
+
 impl AuthoritativeSourceRegistry {
     /// Creates an empty registry with a process-unique instance identity.
     ///
@@ -654,6 +668,7 @@ impl AuthoritativeSourceRegistry {
             validated,
             health,
             attestation,
+            validated_at: at,
         })
     }
 
