@@ -365,3 +365,7 @@ pub enum LiveIngressError {
     #[error("trusted system clock is outside the supported range")]
     ClockRange,
 }
+
+#[cfg(test)]
+#[path = "tests/admission.rs"]
+mod tests;

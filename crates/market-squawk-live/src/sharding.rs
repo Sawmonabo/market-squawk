@@ -244,3 +244,7 @@ mod tests {
         assert!(ShardId::new(u16::MAX, 1).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "sharding/tests.rs"]
+mod contract_tests;
