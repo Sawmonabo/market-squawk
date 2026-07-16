@@ -1,0 +1,438 @@
+/// Mandatory availability time with explicit evidence basis.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AvailabilityEvidence {
+    /// Availability was directly observed.
+    Observed { available_at: Timestamp },
+    /// Availability is estimated under an exact versioned rule.
+    Estimated {
+        available_at: Timestamp,
+        rule: IntegrityRule,
+    },
+}
+
+impl AvailabilityEvidence {
+    /// Returns mandatory point-in-time availability.
+    pub const fn available_at(&self) -> Timestamp {
+        match self {
+            Self::Observed { available_at } | Self::Estimated { available_at, .. } => *available_at,
+        }
+    }
+}
+
+/// One bounded normalized record carrying full discovery and extraction lineage.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtractionRecord {
+    source_id: SourceId,
+    metadata_revision: MetadataRevision,
+    dataset: SourceIdentifier,
+    discovery_request_id: DiscoveryRequestId,
+    extraction_request_id: ExtractionRequestId,
+    object_id: SourceIdentifier,
+    object_evidence: ExactPayloadEvidence,
+    schema: SourceIdentifier,
+    evidence: ExactPayloadEvidence,
+    effective_at: Timestamp,
+    published_at: Option<Timestamp>,
+    availability: AvailabilityEvidence,
+    revision: SourceIdentifier,
+    superseded_at: Option<Timestamp>,
+    payload: BoundedBytes<MAX_EXTRACTION_RECORD_BYTES>,
+}
+
+impl ExtractionRecord {
+    /// Constructs one request-bound, point-in-time normalized record.
+    ///
+    /// # Errors
+    ///
+    /// Rejects oversized payloads and invalid publication/availability/supersession ordering.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "point-in-time evidence remains explicit"
+    )]
+    pub fn try_new(
+        request: &ExtractionRequest,
+        schema: SourceIdentifier,
+        evidence: ExactPayloadEvidence,
+        effective_at: Timestamp,
+        published_at: Option<Timestamp>,
+        availability: AvailabilityEvidence,
+        revision: SourceIdentifier,
+        superseded_at: Option<Timestamp>,
+        payload: Bytes,
+    ) -> Result<Self, ExtractionError> {
+        Self::try_from_parts(
+            request.object.source_id.clone(),
+            request.object.metadata_revision.clone(),
+            request.object.dataset.clone(),
+            request.object.discovery_request_id,
+            request.request_id,
+            request.object.object_id.clone(),
+            request.object.evidence.clone(),
+            schema,
+            evidence,
+            effective_at,
+            published_at,
+            availability,
+            revision,
+            superseded_at,
+            payload,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "wire validation preserves exact lineage"
+    )]
+    fn try_from_parts(
+        source_id: SourceId,
+        metadata_revision: MetadataRevision,
+        dataset: SourceIdentifier,
+        discovery_request_id: DiscoveryRequestId,
+        extraction_request_id: ExtractionRequestId,
+        object_id: SourceIdentifier,
+        object_evidence: ExactPayloadEvidence,
+        schema: SourceIdentifier,
+        evidence: ExactPayloadEvidence,
+        effective_at: Timestamp,
+        published_at: Option<Timestamp>,
+        availability: AvailabilityEvidence,
+        revision: SourceIdentifier,
+        superseded_at: Option<Timestamp>,
+        payload: Bytes,
+    ) -> Result<Self, ExtractionError> {
+        let available_at = availability.available_at();
+        if published_at.is_some_and(|published| available_at < published)
+            || superseded_at.is_some_and(|superseded| {
+                superseded <= effective_at
+                    || published_at.is_some_and(|published| superseded < published)
+                    || superseded < available_at
+            })
+        {
+            return Err(ExtractionError::InvalidPointInTimeOrdering);
+        }
+        Ok(Self {
+            source_id: normalize_source_id(&source_id)?,
+            metadata_revision: normalize_metadata_revision(&metadata_revision)?,
+            dataset: normalize_identifier(&dataset)?,
+            discovery_request_id,
+            extraction_request_id,
+            object_id: normalize_identifier(&object_id)?,
+            object_evidence: normalize_evidence(&object_evidence)?,
+            schema: normalize_identifier(&schema)?,
+            evidence: normalize_evidence(&evidence)?,
+            effective_at,
+            published_at,
+            availability,
+            revision: normalize_identifier(&revision)?,
+            superseded_at,
+            payload: BoundedBytes::try_from_bytes(payload)
+                .map_err(|error| ExtractionError::RecordTooLarge { max: error.max })?,
+        })
+    }
+
+    /// Returns exact normalized payload bytes.
+    pub fn payload(&self) -> &Bytes {
+        self.payload.as_bytes()
+    }
+
+    /// Returns mandatory evidenced availability.
+    pub const fn available_at(&self) -> Timestamp {
+        self.availability.available_at()
+    }
+
+    /// Returns availability evidence basis.
+    pub const fn availability(&self) -> &AvailabilityEvidence {
+        &self.availability
+    }
+
+    /// Returns source revision/vintage identity.
+    pub const fn revision(&self) -> &SourceIdentifier {
+        &self.revision
+    }
+
+    /// Returns exclusive supersession time when known.
+    pub const fn superseded_at(&self) -> Option<Timestamp> {
+        self.superseded_at
+    }
+
+    pub(crate) fn matches_request(&self, request: &ExtractionRequest) -> bool {
+        self.source_id == request.object.source_id
+            && self.metadata_revision == request.object.metadata_revision
+            && self.dataset == request.object.dataset
+            && self.discovery_request_id == request.object.discovery_request_id
+            && self.extraction_request_id == request.request_id
+            && self.object_id == request.object.object_id
+            && self.object_evidence == request.object.evidence
+    }
+
+    pub(crate) fn retained_bytes(&self) -> Result<u64, ExtractionError> {
+        let dynamic = checked_usize_sum([
+            self.source_id.as_str().len(),
+            self.metadata_revision.as_source_identifier().as_str().len(),
+            self.dataset.as_str().len(),
+            self.object_id.as_str().len(),
+            evidence_dynamic_bytes(&self.object_evidence)?,
+            self.schema.as_str().len(),
+            evidence_dynamic_bytes(&self.evidence)?,
+            self.revision.as_str().len(),
+            self.payload.retained_bytes(),
+        ])?;
+        u64::try_from(
+            size_of::<Self>()
+                .checked_add(dynamic)
+                .ok_or(ExtractionError::ByteCountOverflow)?,
+        )
+        .map_err(|_| ExtractionError::ByteCountOverflow)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExtractionRecordWire {
+    source_id: SourceId,
+    metadata_revision: MetadataRevision,
+    dataset: SourceIdentifier,
+    discovery_request_id: DiscoveryRequestId,
+    extraction_request_id: ExtractionRequestId,
+    object_id: SourceIdentifier,
+    object_evidence: ExactPayloadEvidence,
+    schema: SourceIdentifier,
+    evidence: ExactPayloadEvidence,
+    effective_at: Timestamp,
+    published_at: Option<Timestamp>,
+    availability: AvailabilityEvidence,
+    revision: SourceIdentifier,
+    superseded_at: Option<Timestamp>,
+    payload: BoundedBytes<MAX_EXTRACTION_RECORD_BYTES>,
+}
+
+impl<'de> Deserialize<'de> for ExtractionRecord {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ExtractionRecordWire::deserialize(deserializer)?;
+        Self::try_from_parts(
+            wire.source_id,
+            wire.metadata_revision,
+            wire.dataset,
+            wire.discovery_request_id,
+            wire.extraction_request_id,
+            wire.object_id,
+            wire.object_evidence,
+            wire.schema,
+            wire.evidence,
+            wire.effective_at,
+            wire.published_at,
+            wire.availability,
+            wire.revision,
+            wire.superseded_at,
+            wire.payload.as_bytes().clone(),
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+/// Discovery or normalized extraction invariant failure.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum ExtractionError {
+    #[error("{field} exceeds maximum {max}")]
+    LimitTooLarge { field: &'static str, max: u64 },
+    #[error("discovery result exceeds requested maximum {requested}")]
+    DiscoveryLimitExceeded { requested: u16 },
+    #[error("extraction record exceeds maximum bytes {max}")]
+    RecordTooLarge { max: usize },
+    #[error("extraction result exceeds requested record maximum {requested}")]
+    RecordLimitExceeded { requested: u32 },
+    #[error("extraction result exceeds requested byte maximum {requested}")]
+    ByteLimitExceeded { requested: u64 },
+    #[error("extraction byte count overflow")]
+    ByteCountOverflow,
+    #[error("record availability/publication/supersession ordering is invalid")]
+    InvalidPointInTimeOrdering,
+    #[error("discovery or extraction request identity does not match")]
+    RequestBindingMismatch,
+    #[error("source identity or metadata revision does not match")]
+    SourceBindingMismatch,
+    #[error("extraction record object evidence does not match its exact request")]
+    ObjectBindingMismatch,
+}
+
+fn discovery_request_id(
+    dataset: &SourceIdentifier,
+    effective_at: Option<Timestamp>,
+    max_results: NonZeroU16,
+    deadline: Timestamp,
+) -> DiscoveryRequestId {
+    let mut hash = Sha256::new();
+    hash.update(b"market-squawk/discovery-request/v2");
+    hash_field(&mut hash, b"dataset", dataset.as_str().as_bytes());
+    hash_optional_timestamp(&mut hash, b"effective_at", effective_at);
+    hash_field(&mut hash, b"max_results", &max_results.get().to_be_bytes());
+    hash_field(&mut hash, b"deadline", &deadline.unix_nanos().to_be_bytes());
+    DiscoveryRequestId(EvidenceDigest::new(
+        DigestAlgorithm::Sha256,
+        hash.finalize().into(),
+    ))
+}
+
+fn extraction_request_id(
+    object: &SourceObject,
+    max_records: NonZeroU32,
+    max_bytes: NonZeroU64,
+    deadline: Timestamp,
+) -> ExtractionRequestId {
+    let mut hash = Sha256::new();
+    hash.update(b"market-squawk/extraction-request/v2");
+    hash_field(
+        &mut hash,
+        b"source_id",
+        object.source_id.as_str().as_bytes(),
+    );
+    hash_field(
+        &mut hash,
+        b"metadata_revision",
+        object
+            .metadata_revision
+            .as_source_identifier()
+            .as_str()
+            .as_bytes(),
+    );
+    hash_field(&mut hash, b"dataset", object.dataset.as_str().as_bytes());
+    hash_field(
+        &mut hash,
+        b"discovery_request_id",
+        object.discovery_request_id.0.bytes().as_ref(),
+    );
+    hash_field(
+        &mut hash,
+        b"object_id",
+        object.object_id.as_str().as_bytes(),
+    );
+    hash_field(
+        &mut hash,
+        b"media_type",
+        object.media_type.as_str().as_bytes(),
+    );
+    hash_evidence(&mut hash, b"object_evidence", &object.evidence);
+    hash_field(
+        &mut hash,
+        b"effective_starts_at",
+        &object.effective.starts_at().unix_nanos().to_be_bytes(),
+    );
+    hash_optional_timestamp(&mut hash, b"effective_ends_at", object.effective.ends_at());
+    hash_optional_timestamp(&mut hash, b"published_at", object.published_at);
+    hash_optional_u64(&mut hash, b"expected_bytes", object.expected_bytes);
+    hash_field(&mut hash, b"max_records", &max_records.get().to_be_bytes());
+    hash_field(&mut hash, b"max_bytes", &max_bytes.get().to_be_bytes());
+    hash_field(&mut hash, b"deadline", &deadline.unix_nanos().to_be_bytes());
+    ExtractionRequestId(EvidenceDigest::new(
+        DigestAlgorithm::Sha256,
+        hash.finalize().into(),
+    ))
+}
+
+fn hash_evidence(hash: &mut Sha256, tag: &[u8], evidence: &ExactPayloadEvidence) {
+    let digest = evidence.content_digest();
+    let algorithm = match digest.algorithm() {
+        DigestAlgorithm::Sha256 => [1_u8],
+        DigestAlgorithm::Blake3 => [2_u8],
+    };
+    hash_field(hash, tag, b"exact-payload-evidence/v1");
+    hash_field(hash, b"digest_algorithm", &algorithm);
+    hash_field(hash, b"digest_bytes", &digest.bytes());
+    if let Some(locator) = evidence.version_pinned_locator() {
+        hash_field(hash, b"locator_presence", &[1]);
+        hash_field(
+            hash,
+            b"locator_reference",
+            locator.reference().as_str().as_bytes(),
+        );
+        hash_field(
+            hash,
+            b"locator_version",
+            locator.version().as_str().as_bytes(),
+        );
+    } else {
+        hash_field(hash, b"locator_presence", &[0]);
+    }
+}
+
+fn hash_optional_timestamp(hash: &mut Sha256, tag: &[u8], value: Option<Timestamp>) {
+    let mut encoded = [0_u8; 9];
+    if let Some(value) = value {
+        encoded[0] = 1;
+        encoded[1..].copy_from_slice(&value.unix_nanos().to_be_bytes());
+    }
+    hash_field(hash, tag, &encoded);
+}
+
+fn hash_optional_u64(hash: &mut Sha256, tag: &[u8], value: Option<u64>) {
+    let mut encoded = [0_u8; 9];
+    if let Some(value) = value {
+        encoded[0] = 1;
+        encoded[1..].copy_from_slice(&value.to_be_bytes());
+    }
+    hash_field(hash, tag, &encoded);
+}
+
+fn hash_field(hash: &mut Sha256, tag: &[u8], value: &[u8]) {
+    hash.update((tag.len() as u64).to_be_bytes());
+    hash.update(tag);
+    hash.update((value.len() as u64).to_be_bytes());
+    hash.update(value);
+}
+
+fn normalize_identifier(value: &SourceIdentifier) -> Result<SourceIdentifier, ExtractionError> {
+    SourceIdentifier::try_from(value.as_str()).map_err(|_| ExtractionError::SourceBindingMismatch)
+}
+
+fn normalize_source_id(value: &SourceId) -> Result<SourceId, ExtractionError> {
+    SourceId::try_from(value.as_str()).map_err(|_| ExtractionError::SourceBindingMismatch)
+}
+
+fn normalize_metadata_revision(
+    value: &MetadataRevision,
+) -> Result<MetadataRevision, ExtractionError> {
+    normalize_identifier(value.as_source_identifier()).map(MetadataRevision::new)
+}
+
+fn normalize_evidence(
+    evidence: &ExactPayloadEvidence,
+) -> Result<ExactPayloadEvidence, ExtractionError> {
+    match evidence.version_pinned_locator() {
+        Some(locator) => Ok(ExactPayloadEvidence::with_version_pinned_locator(
+            evidence.content_digest(),
+            VersionPinnedSourceLocator::new(
+                normalize_identifier(locator.reference())?,
+                normalize_identifier(locator.version())?,
+            ),
+        )),
+        None => Ok(ExactPayloadEvidence::from_content_digest(
+            evidence.content_digest(),
+        )),
+    }
+}
+
+fn evidence_dynamic_bytes(evidence: &ExactPayloadEvidence) -> Result<usize, ExtractionError> {
+    evidence.version_pinned_locator().map_or(Ok(0), |locator| {
+        checked_usize_sum([
+            locator.reference().as_str().len(),
+            locator.version().as_str().len(),
+        ])
+    })
+}
+
+fn usize_to_u64(value: usize) -> Result<u64, ExtractionError> {
+    u64::try_from(value).map_err(|_| ExtractionError::ByteCountOverflow)
+}
+
+fn checked_usize_sum(values: impl IntoIterator<Item = usize>) -> Result<usize, ExtractionError> {
+    values.into_iter().try_fold(0_usize, |total, value| {
+        total
+            .checked_add(value)
+            .ok_or(ExtractionError::ByteCountOverflow)
+    })
+}

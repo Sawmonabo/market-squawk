@@ -15,6 +15,7 @@ anyhow = "1.0"
 async-trait = "0.1"
 bs58 = "0.5"
 bitcoin = { version = "=0.32.102", default-features = false, features = ["std"] }
+bytes = "1.10"
 chrono = { version = "0.4", features = ["clock", "serde"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 crc32fast = "1.4"
@@ -26,9 +27,11 @@ proptest = "1.7"
 rust_decimal = { version = "1.36", features = ["serde-with-str"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10"
 sha3 = "0.10"
 static_assertions = "1.1"
 tempfile = "3.15"
+thiserror = "2.0"
 tokio = { version = "1.43", features = [
     "io-std",
     "io-util",
@@ -39,10 +42,12 @@ tokio = { version = "1.43", features = [
     "sync",
     "time",
 ] }
+tokio-util = "0.7"
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 uuid = { version = "1.12", features = ["serde", "v4", "v5"] }
+url = "2.5"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
