@@ -94,6 +94,9 @@ pub enum NetworkPolicyError {
     /// A provider budget field was internally inconsistent.
     #[error("invalid provider budget policy")]
     InvalidBudgetPolicy,
+    /// A provider/account scope conflicts with the evidenced authorization mode or basis.
+    #[error("provider budget scope conflicts with authorization identity")]
+    InvalidBudgetScope,
 }
 
 /// Explicit connect, read, total, redirect, and response-size bounds.

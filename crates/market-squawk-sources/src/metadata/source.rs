@@ -260,12 +260,19 @@ impl SourceMetadata {
         {
             return Err(SourceMetadataError::MissingRemoteNetworkPolicy);
         }
-        if input
-            .budget
-            .as_ref()
-            .is_some_and(|budget| budget.scope().as_source_identifier() != &input.provider)
-        {
-            return Err(SourceMetadataError::BudgetProviderMismatch);
+        if let Some(budget) = &input.budget {
+            let expected = crate::BudgetScope::for_authorization(
+                input.provider.clone(),
+                &input.authorization,
+            )
+            .map_err(|_| SourceMetadataError::BudgetAuthorizationMismatch)?;
+            if budget.scope() != &expected {
+                return Err(if budget.scope().as_source_identifier() != &input.provider {
+                    SourceMetadataError::BudgetProviderMismatch
+                } else {
+                    SourceMetadataError::BudgetAuthorizationMismatch
+                });
+            }
         }
         Ok(Self {
             schema_version: input.schema_version,
@@ -477,6 +484,9 @@ pub enum SourceMetadataError {
     /// Shared budget scope names a different provider.
     #[error("provider budget scope does not match source provider")]
     BudgetProviderMismatch,
+    /// Shared budget account qualification conflicts with authorization mode or evidence basis.
+    #[error("provider budget account scope does not match authorization mode and basis")]
+    BudgetAuthorizationMismatch,
 }
 
 fn interval_contains(interval: EffectiveInterval, at: Timestamp) -> bool {

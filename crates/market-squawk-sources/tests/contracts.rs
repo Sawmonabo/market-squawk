@@ -83,6 +83,26 @@ fn macro_and_local_sources_need_no_fake_asset_or_network_endpoint() -> TestResul
 }
 
 #[test]
+fn metadata_deserialization_rejects_budget_scope_ambiguous_for_authorization() -> TestResult {
+    let metadata = direct_metadata("source-a", "revision-a", 0, None)?;
+    let wire = serde_json::to_string(&metadata)?;
+    let user_authorized = wire.replacen(
+        "\"mode\":\"public_interface\"",
+        "\"mode\":\"user_authorized\"",
+        1,
+    );
+    assert!(serde_json::from_str::<SourceMetadata>(&user_authorized).is_err());
+
+    let account_qualified_public = wire.replacen(
+        "\"authorization_account\":null",
+        "\"authorization_account\":\"unexpected-account\"",
+        1,
+    );
+    assert!(serde_json::from_str::<SourceMetadata>(&account_qualified_public).is_err());
+    Ok(())
+}
+
+#[test]
 fn raw_frames_share_session_identity_and_bound_exact_bytes() -> TestResult {
     let mut registry = AuthoritativeSourceRegistry::try_new()?;
     let registered = registry.register(

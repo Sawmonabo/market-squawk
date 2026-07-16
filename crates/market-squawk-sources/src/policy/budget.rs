@@ -26,6 +26,29 @@ impl BudgetScope {
         }
     }
 
+    /// Derives the only valid provider/account scope for an evidenced authorization grant.
+    ///
+    /// # Errors
+    ///
+    /// Rejects local user-owned authorization because it must not have a remote provider budget.
+    pub fn for_authorization(
+        provider: SourceIdentifier,
+        authorization: &crate::AuthorizationGrant,
+    ) -> Result<Self, NetworkPolicyError> {
+        match authorization.mode() {
+            crate::AuthorizationMode::PublicInterface => Ok(Self::new(provider)),
+            crate::AuthorizationMode::UserAuthorized | crate::AuthorizationMode::Licensed => {
+                Ok(Self::with_authorization_account(
+                    provider,
+                    authorization.basis().as_source_identifier().clone(),
+                ))
+            }
+            crate::AuthorizationMode::UserOwnedLocal => {
+                Err(NetworkPolicyError::InvalidBudgetScope)
+            }
+        }
+    }
+
     /// Returns the configured scope key.
     pub const fn as_source_identifier(&self) -> &SourceIdentifier {
         &self.provider

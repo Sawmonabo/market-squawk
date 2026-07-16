@@ -55,6 +55,67 @@ mod tests {
         )
     }
 
+    fn authorization(
+        mode: crate::AuthorizationMode,
+        basis: &str,
+    ) -> Result<crate::AuthorizationGrant, NetworkPolicyError> {
+        use market_squawk_domain::{
+            AuthorizationBasis, DigestAlgorithm, EffectiveInterval, EvidenceDigest,
+            ExactPayloadEvidence,
+        };
+
+        Ok(crate::AuthorizationGrant::new(
+            mode,
+            AuthorizationBasis::new(
+                SourceIdentifier::try_from(basis)
+                    .map_err(|_| NetworkPolicyError::InvalidBudgetPolicy)?,
+            ),
+            ExactPayloadEvidence::from_content_digest(EvidenceDigest::new(
+                DigestAlgorithm::Sha256,
+                [7; 32],
+            )),
+            EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)
+                .map_err(|_| NetworkPolicyError::InvalidBudgetPolicy)?,
+        ))
+    }
+
+    #[test]
+    fn budget_scope_is_exhaustively_derived_from_authorization_mode_and_basis()
+    -> Result<(), NetworkPolicyError> {
+        let provider = SourceIdentifier::try_from("provider")
+            .map_err(|_| NetworkPolicyError::InvalidBudgetPolicy)?;
+        let public = authorization(crate::AuthorizationMode::PublicInterface, "public-terms")?;
+        let user = authorization(crate::AuthorizationMode::UserAuthorized, "account-a")?;
+        let licensed = authorization(crate::AuthorizationMode::Licensed, "license-a")?;
+        let local = authorization(crate::AuthorizationMode::UserOwnedLocal, "local-file")?;
+
+        assert_eq!(
+            BudgetScope::for_authorization(provider.clone(), &public)?,
+            BudgetScope::new(provider.clone())
+        );
+        assert_eq!(
+            BudgetScope::for_authorization(provider.clone(), &user)?,
+            BudgetScope::with_authorization_account(
+                provider.clone(),
+                SourceIdentifier::try_from("account-a")
+                    .map_err(|_| NetworkPolicyError::InvalidBudgetPolicy)?,
+            )
+        );
+        assert_eq!(
+            BudgetScope::for_authorization(provider.clone(), &licensed)?,
+            BudgetScope::with_authorization_account(
+                provider.clone(),
+                SourceIdentifier::try_from("license-a")
+                    .map_err(|_| NetworkPolicyError::InvalidBudgetPolicy)?,
+            )
+        );
+        assert_eq!(
+            BudgetScope::for_authorization(provider, &local),
+            Err(NetworkPolicyError::InvalidBudgetScope)
+        );
+        Ok(())
+    }
+
     #[test]
     fn monotonic_window_ignores_forward_and_backward_wall_clock_changes()
     -> Result<(), NetworkPolicyError> {
