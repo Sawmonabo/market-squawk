@@ -10,9 +10,9 @@ cargo check --locked --all-targets --all-features
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-targets --all-features
 ./scripts/verify.sh
-python3 scripts/smoke_mcp.py ./target/debug/market-engine
+python3 scripts/smoke_mcp.py ./target/debug/market-squawk
 cargo build --release --locked
-python3 scripts/smoke_mcp.py ./target/release/market-engine
+python3 scripts/smoke_mcp.py ./target/release/market-squawk
 ```
 
 Results:
@@ -32,8 +32,8 @@ Results:
 The sandbox could not contact the public Coinbase endpoint, so an external live capture was not claimed. The adapter was verified end to end against a local WebSocket server using Coinbase-format messages. A normal local machine with outbound network access should run this final source check:
 
 ```bash
-market-engine capture --products BTC-USD --seconds 10
-market-engine replay --source coinbase-exchange
+market-squawk capture --products BTC-USD --seconds 10
+market-squawk replay --source coinbase-exchange
 ```
 
 ## Reproducibility

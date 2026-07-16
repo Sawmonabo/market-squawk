@@ -1,6 +1,9 @@
 use std::{
+    error::Error,
+    fmt,
     fs::{File, OpenOptions},
     io::{BufReader, BufWriter, Read, Write},
+    num::TryFromIntError,
     path::{Path, PathBuf},
 };
 
@@ -11,8 +14,86 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::domain::RawEnvelope;
 
-const MAGIC: &[u8; 4] = b"MEJ1";
+const CURRENT_MAGIC: &[u8; 4] = b"MSJ1";
 const MAX_RECORD_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JournalFormat {
+    LegacyMej1,
+    MarketSquawkMsj1,
+}
+
+impl TryFrom<[u8; 4]> for JournalFormat {
+    type Error = JournalError;
+
+    fn try_from(value: [u8; 4]) -> std::result::Result<Self, Self::Error> {
+        match &value {
+            b"MEJ1" => Ok(Self::LegacyMej1),
+            b"MSJ1" => Ok(Self::MarketSquawkMsj1),
+            _ => Err(JournalError::UnsupportedMagic(value)),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum JournalError {
+    UnsupportedMagic([u8; 4]),
+    Io {
+        context: String,
+        source: std::io::Error,
+    },
+    InvalidRecord(String),
+    Json(serde_json::Error),
+    LengthOverflow(TryFromIntError),
+}
+
+impl JournalError {
+    fn io(context: impl Into<String>, source: std::io::Error) -> Self {
+        Self::Io {
+            context: context.into(),
+            source,
+        }
+    }
+}
+
+impl fmt::Display for JournalError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedMagic(magic) => {
+                write!(formatter, "unsupported journal magic: {magic:?}")
+            }
+            Self::Io { context, source } => write!(formatter, "{context}: {source}"),
+            Self::InvalidRecord(message) => formatter.write_str(message),
+            Self::Json(source) => write!(formatter, "invalid journal payload: {source}"),
+            Self::LengthOverflow(source) => {
+                write!(formatter, "journal record length overflow: {source}")
+            }
+        }
+    }
+}
+
+impl Error for JournalError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Io { source, .. } => Some(source),
+            Self::Json(source) => Some(source),
+            Self::LengthOverflow(source) => Some(source),
+            Self::UnsupportedMagic(_) | Self::InvalidRecord(_) => None,
+        }
+    }
+}
+
+impl From<serde_json::Error> for JournalError {
+    fn from(source: serde_json::Error) -> Self {
+        Self::Json(source)
+    }
+}
+
+impl From<TryFromIntError> for JournalError {
+    fn from(source: TryFromIntError) -> Self {
+        Self::LengthOverflow(source)
+    }
+}
 
 pub struct JournalWriter {
     path: PathBuf,
@@ -43,7 +124,7 @@ impl JournalWriter {
 
         let mut writer = BufWriter::new(file);
         if is_new {
-            writer.write_all(MAGIC)?;
+            writer.write_all(CURRENT_MAGIC)?;
             writer.flush()?;
         }
 
@@ -170,68 +251,95 @@ impl JournalSink {
     }
 }
 
-pub struct JournalReader {
-    reader: BufReader<File>,
+pub struct JournalReader<R = File> {
+    reader: BufReader<R>,
     offset: u64,
+    format: Option<JournalFormat>,
 }
 
-impl JournalReader {
-    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+impl JournalReader<File> {
+    pub fn open(path: impl AsRef<Path>) -> std::result::Result<Self, JournalError> {
         let path = path.as_ref();
-        let file = File::open(path)
-            .with_context(|| format!("failed to open journal {}", path.display()))?;
-        let mut reader = BufReader::new(file);
-        let mut magic = [0_u8; 4];
-        reader.read_exact(&mut magic)?;
-        if &magic != MAGIC {
-            bail!("invalid journal header in {}", path.display());
+        let file = File::open(path).map_err(|source| {
+            JournalError::io(format!("failed to open journal {}", path.display()), source)
+        })?;
+        let mut reader = Self::new(file);
+        reader.ensure_format()?;
+        Ok(reader)
+    }
+}
+
+impl<R: Read> JournalReader<R> {
+    pub fn new(reader: R) -> Self {
+        Self {
+            reader: BufReader::new(reader),
+            offset: 4,
+            format: None,
         }
-        Ok(Self { reader, offset: 4 })
     }
 
-    pub fn next_record(&mut self) -> Result<Option<RawEnvelope>> {
+    fn ensure_format(&mut self) -> std::result::Result<JournalFormat, JournalError> {
+        if let Some(format) = self.format {
+            return Ok(format);
+        }
+
+        let mut magic = [0_u8; 4];
+        self.reader
+            .read_exact(&mut magic)
+            .map_err(|source| JournalError::io("truncated journal header", source))?;
+        let format = JournalFormat::try_from(magic)?;
+        self.format = Some(format);
+        Ok(format)
+    }
+
+    pub fn next_record(&mut self) -> std::result::Result<Option<RawEnvelope>, JournalError> {
+        self.ensure_format()?;
+
         let mut length_bytes = [0_u8; 4];
-        let first_byte_count = self.reader.read(&mut length_bytes[..1])?;
+        let first_byte_count = self
+            .reader
+            .read(&mut length_bytes[..1])
+            .map_err(|source| JournalError::io("failed to read journal record length", source))?;
         if first_byte_count == 0 {
             return Ok(None);
         }
         self.reader
             .read_exact(&mut length_bytes[1..])
-            .context("truncated record length")?;
+            .map_err(|source| JournalError::io("truncated record length", source))?;
 
         let mut crc_bytes = [0_u8; 4];
         self.reader
             .read_exact(&mut crc_bytes)
-            .context("truncated record checksum")?;
+            .map_err(|source| JournalError::io("truncated record checksum", source))?;
         let length = u32::from_le_bytes(length_bytes) as usize;
         if length > MAX_RECORD_BYTES {
-            bail!(
+            return Err(JournalError::InvalidRecord(format!(
                 "journal record at offset {} is too large: {length}",
                 self.offset
-            );
+            )));
         }
 
         let expected_crc = u32::from_le_bytes(crc_bytes);
         let mut payload = vec![0_u8; length];
         self.reader
             .read_exact(&mut payload)
-            .context("truncated record payload")?;
+            .map_err(|source| JournalError::io("truncated record payload", source))?;
 
         let mut hasher = Hasher::new();
         hasher.update(&payload);
         let actual_crc = hasher.finalize();
         if actual_crc != expected_crc {
-            bail!(
+            return Err(JournalError::InvalidRecord(format!(
                 "journal checksum mismatch at offset {}: expected={expected_crc}, actual={actual_crc}",
                 self.offset
-            );
+            )));
         }
 
         self.offset += 8 + u64::try_from(length)?;
         Ok(Some(serde_json::from_slice(&payload)?))
     }
 
-    pub fn read_all(mut self) -> Result<Vec<RawEnvelope>> {
+    pub fn read_all(mut self) -> std::result::Result<Vec<RawEnvelope>, JournalError> {
         let mut records = Vec::new();
         while let Some(record) = self.next_record()? {
             records.push(record);

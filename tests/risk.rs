@@ -1,5 +1,5 @@
 use chrono::{Duration, Utc};
-use market_engine::{
+use market_squawk::{
     bot::OrderIntent,
     domain::Side,
     quality::FeedQuality,

@@ -1,5 +1,5 @@
 use chrono::Utc;
-use market_engine::{domain::MarketEvent, source::coinbase::decode_message};
+use market_squawk::{domain::MarketEvent, source::coinbase::decode_message};
 use rust_decimal::Decimal;
 use serde_json::json;
 
@@ -68,7 +68,7 @@ fn decodes_match_side_as_the_maker_side() {
         MarketEvent::Trade { maker_side, .. } => maker_side,
         _ => panic!("expected trade"),
     };
-    assert_eq!(maker_side, market_engine::domain::Side::Sell);
+    assert_eq!(maker_side, market_squawk::domain::Side::Sell);
 }
 
 #[test]

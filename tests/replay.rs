@@ -1,12 +1,12 @@
 use chrono::Utc;
-use market_engine::{domain::RawEnvelope, journal::JournalWriter, replay::replay_coinbase_journal};
+use market_squawk::{domain::RawEnvelope, journal::JournalWriter, replay::replay_coinbase_journal};
 use tempfile::tempdir;
 use uuid::Uuid;
 
 #[test]
 fn coinbase_journal_replay_rebuilds_the_order_book() {
     let directory = tempdir().expect("temp directory");
-    let path = directory.path().join("coinbase.mej");
+    let path = directory.path().join("coinbase.msj");
     let connection_id = Uuid::new_v4();
     let received_at = Utc::now();
     let payload = br#"{

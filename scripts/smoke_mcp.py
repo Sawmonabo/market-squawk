@@ -21,7 +21,7 @@ def request(process: subprocess.Popen[str], payload: dict) -> dict:
 
 def main() -> int:
     if len(sys.argv) != 2:
-        print("usage: smoke_mcp.py /path/to/market-engine", file=sys.stderr)
+        print("usage: smoke_mcp.py /path/to/market-squawk", file=sys.stderr)
         return 2
 
     binary = pathlib.Path(sys.argv[1]).resolve()
@@ -47,7 +47,7 @@ def main() -> int:
                     },
                 },
             )
-            assert initialized["result"]["serverInfo"]["name"] == "market-engine"
+            assert initialized["result"]["serverInfo"]["name"] == "market-squawk"
 
             tools = request(
                 process,

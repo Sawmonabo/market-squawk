@@ -1,16 +1,59 @@
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 
-use market_engine::{
+use market_squawk::{
     domain::RawEnvelope,
-    journal::{JournalReader, JournalWriter},
+    journal::{JournalError, JournalReader, JournalWriter},
 };
 use tempfile::tempdir;
 use uuid::Uuid;
 
+fn fixture_with_magic(magic: [u8; 4]) -> Vec<u8> {
+    let envelope = RawEnvelope::new(
+        "fixture-source",
+        Uuid::nil(),
+        Some(1),
+        None,
+        br#"{"price":"100.00"}"#.to_vec(),
+    );
+    let payload = serde_json::to_vec(&envelope).expect("serialize fixture envelope");
+    let length = u32::try_from(payload.len()).expect("fixture payload fits in a journal record");
+
+    let mut bytes = magic.to_vec();
+    bytes.extend_from_slice(&length.to_le_bytes());
+    bytes.extend_from_slice(&crc32fast::hash(&payload).to_le_bytes());
+    bytes.extend_from_slice(&payload);
+    bytes
+}
+
+#[test]
+fn reads_legacy_mej1_header() -> Result<(), Box<dyn std::error::Error>> {
+    let bytes = fixture_with_magic(*b"MEJ1");
+    let records = JournalReader::new(Cursor::new(bytes)).read_all()?;
+    assert_eq!(records.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn reads_current_msj1_header() -> Result<(), Box<dyn std::error::Error>> {
+    let bytes = fixture_with_magic(*b"MSJ1");
+    let records = JournalReader::new(Cursor::new(bytes)).read_all()?;
+    assert_eq!(records.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn rejects_unknown_journal_magic() {
+    let bytes = fixture_with_magic(*b"XXXX");
+    assert!(matches!(
+        JournalReader::new(Cursor::new(bytes)).read_all(),
+        Err(JournalError::UnsupportedMagic(_))
+    ));
+}
+
 #[test]
 fn journal_round_trip_preserves_raw_envelope() {
     let directory = tempdir().expect("temp directory");
-    let path = directory.path().join("test.mej");
+    let path = directory.path().join("test.msj");
     let expected = RawEnvelope::new(
         "test-source",
         Uuid::new_v4(),
@@ -33,7 +76,7 @@ fn journal_round_trip_preserves_raw_envelope() {
 #[test]
 fn journal_detects_payload_corruption() {
     let directory = tempdir().expect("temp directory");
-    let path = directory.path().join("test.mej");
+    let path = directory.path().join("test.msj");
     let record = RawEnvelope::new(
         "test-source",
         Uuid::new_v4(),
@@ -70,7 +113,7 @@ fn journal_detects_payload_corruption() {
 #[test]
 fn journal_rejects_a_truncated_record_length() {
     let directory = tempdir().expect("temp directory");
-    let path = directory.path().join("test.mej");
+    let path = directory.path().join("test.msj");
     let mut writer = JournalWriter::open(&path).expect("open writer");
     writer.flush().expect("flush header");
     drop(writer);
@@ -92,7 +135,7 @@ fn journal_rejects_a_truncated_record_length() {
 #[test]
 fn journal_writer_refuses_to_append_to_a_truncated_existing_journal() {
     let directory = tempdir().expect("temp directory");
-    let path = directory.path().join("test.mej");
+    let path = directory.path().join("test.msj");
     let record = RawEnvelope::new(
         "test-source",
         Uuid::new_v4(),
@@ -123,7 +166,7 @@ fn journal_writer_refuses_to_append_to_a_truncated_existing_journal() {
 #[test]
 fn journal_allows_only_one_writer_per_file() {
     let directory = tempdir().expect("temp directory");
-    let path = directory.path().join("test.mej");
+    let path = directory.path().join("test.msj");
     let _first = JournalWriter::open(&path).expect("first writer obtains lock");
 
     let error = JournalWriter::open(&path)

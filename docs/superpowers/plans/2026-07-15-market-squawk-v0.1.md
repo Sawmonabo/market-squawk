@@ -1,4 +1,4 @@
-# Market Engine v0.1 Implementation Plan
+# Market Squawk v0.1 Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -72,7 +72,7 @@
 
 **Files:** `src/mcp.rs`, `src/main.rs`, `scripts/smoke_mcp.py`
 
-**Produces:** `market-engine` commands and local stdio MCP protocol support.
+**Produces:** `market-squawk` commands and local stdio MCP protocol support.
 
 - [x] Write MCP initialization test first.
 - [x] Implement bounded tools and typed schemas.

@@ -1,5 +1,5 @@
 use chrono::{Duration, Utc};
-use market_engine::quality::{FeedQuality, QualityState};
+use market_squawk::quality::{FeedQuality, QualityState};
 
 #[test]
 fn heartbeat_does_not_make_an_uninitialized_book_tradable() {

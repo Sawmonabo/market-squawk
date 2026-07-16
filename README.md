@@ -1,4 +1,6 @@
-# Market Engine
+# Market Squawk
+
+**Turn market noise into market state.**
 
 A local-first Rust engine for live market-data capture, loss-aware order-book processing, deterministic replay, incremental financial features, paper-only bot evaluation, and Model Context Protocol access.
 
@@ -48,34 +50,34 @@ Prerequisites:
 cargo build --release --locked
 
 # Create local state
-./target/release/market-engine init
+./target/release/market-squawk init
 
 # Fully offline deterministic smoke run
-./target/release/market-engine mock --events 100
+./target/release/market-squawk mock --events 100
 
 # Capture public BTC-USD and ETH-USD data for 30 seconds
-./target/release/market-engine capture \
+./target/release/market-squawk capture \
   --products BTC-USD,ETH-USD \
   --seconds 30
 
 # Validate the journal and rebuild the ending market state
-./target/release/market-engine replay --source coinbase-exchange
+./target/release/market-squawk replay --source coinbase-exchange
 ```
 
-All local data defaults to `.market-engine/`. Override it with `--data-dir` or `MARKET_ENGINE_DATA_DIR`.
+All local data defaults to `.market-squawk/`. Override it with `--data-dir` or `MARKET_SQUAWK_DATA_DIR`.
 
 ## Local MCP server
 
 Offline mode is useful for verifying protocol integration without opening a market-data connection:
 
 ```bash
-market-engine mcp --offline
+market-squawk mcp --offline
 ```
 
 Live mode starts the Coinbase source and MCP server in the same process:
 
 ```bash
-market-engine mcp --products BTC-USD,ETH-USD
+market-squawk mcp --products BTC-USD,ETH-USD
 ```
 
 Generic MCP client configuration:
@@ -83,8 +85,8 @@ Generic MCP client configuration:
 ```json
 {
   "mcpServers": {
-    "market-engine": {
-      "command": "/absolute/path/to/market-engine",
+    "market-squawk": {
+      "command": "/absolute/path/to/market-squawk",
       "args": [
         "--data-dir",
         "/absolute/path/to/market-data",
@@ -155,7 +157,7 @@ Paper orders are rejected unless the relevant book is `VALID`, recently updated 
 
 ## Journal format
 
-Each `.mej` file starts with `MEJ1`, followed by records:
+Each `.msj` file starts with `MSJ1`, followed by records:
 
 ```text
 u32 little-endian payload length
@@ -180,7 +182,7 @@ A future format version may add segmented files, stronger cryptographic segment 
 The optional bot exists to exercise the complete live path without risking capital:
 
 ```bash
-market-engine capture --products BTC-USD --paper-bot
+market-squawk capture --products BTC-USD --paper-bot
 ```
 
 It is intentionally simple and not an investment recommendation. It generates fixed-size momentum intents after a warm-up window. Every intent passes through the deterministic risk kernel before a paper fill is recorded.
@@ -196,7 +198,7 @@ This runs locked dependency verification, formatting checks, Clippy with warning
 To exercise MCP after building:
 
 ```bash
-python3 scripts/smoke_mcp.py ./target/debug/market-engine
+python3 scripts/smoke_mcp.py ./target/debug/market-squawk
 ```
 
 ## Repository boundaries

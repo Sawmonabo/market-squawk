@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use market_engine::{
+use market_squawk::{
     domain::MarketEvent,
     journal::{JournalReader, JournalSink},
     source::{MarketSource, coinbase::CoinbaseSource},
@@ -63,7 +63,7 @@ async fn coinbase_source_journals_and_publishes_local_websocket_messages() {
     });
 
     let directory = tempdir().expect("temp directory");
-    let journal_path = directory.path().join("coinbase.mej");
+    let journal_path = directory.path().join("coinbase.msj");
     let (journal, journal_task) = JournalSink::spawn(&journal_path, 32).expect("journal sink");
     let (event_sender, mut event_receiver) = mpsc::channel(32);
     let (cancel_sender, cancel_receiver) = watch::channel(false);

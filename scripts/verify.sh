@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+python3 scripts/check_brand.py
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-targets --all-features

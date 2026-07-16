@@ -150,7 +150,7 @@ impl McpServer {
                     "tools": { "listChanged": false }
                 },
                 "serverInfo": {
-                    "name": "market-engine",
+                    "name": "market-squawk",
                     "version": env!("CARGO_PKG_VERSION")
                 },
                 "instructions": "Local, read-rich market data server. Bot actions are paper-only; risk controls fail closed."
@@ -396,7 +396,7 @@ mod tests {
     fn initialize_advertises_tools_without_live_execution() {
         let server = McpServer::new(
             Arc::new(RwLock::new(Engine::new(5_000, false))),
-            PathBuf::from("unused.mej"),
+            PathBuf::from("unused.msj"),
         );
         let response = server
             .handle_request(&json!({
@@ -406,7 +406,7 @@ mod tests {
                 "params": {}
             }))
             .expect("request should produce a response");
-        assert_eq!(response["result"]["serverInfo"]["name"], "market-engine");
+        assert_eq!(response["result"]["serverInfo"]["name"], "market-squawk");
         assert_eq!(response["result"]["protocolVersion"], PROTOCOL_VERSION);
     }
 
@@ -414,7 +414,7 @@ mod tests {
     fn tool_arguments_reject_unknown_fields() {
         let server = McpServer::new(
             Arc::new(RwLock::new(Engine::new(5_000, false))),
-            PathBuf::from("unused.mej"),
+            PathBuf::from("unused.msj"),
         );
         let response = server
             .handle_request(&json!({

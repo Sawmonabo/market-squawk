@@ -18,4 +18,5 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - run: python3 scripts/check_brand.py
       - run: ./scripts/verify.sh

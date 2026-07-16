@@ -15,7 +15,7 @@ pub struct EngineConfig {
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
-            data_dir: PathBuf::from(".market-engine"),
+            data_dir: PathBuf::from(".market-squawk"),
             products: vec!["BTC-USD".to_owned()],
             stale_after_ms: 5_000,
             journal_queue_capacity: 16_384,
@@ -47,7 +47,7 @@ impl AppPaths {
 
     #[must_use]
     pub fn journal_file(&self, source: &str) -> PathBuf {
-        self.journal_dir().join(format!("{source}.mej"))
+        self.journal_dir().join(format!("{source}.msj"))
     }
 
     #[must_use]

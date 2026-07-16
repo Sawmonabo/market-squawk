@@ -1,18 +1,18 @@
 [package]
-name = "market-engine"
+name = "market-squawk"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Local-first, event-sourced live market-data engine with deterministic replay and MCP access"
-repository = "https://github.com/Sawmonabo/market-engine"
+repository = "https://github.com/Sawmonabo/market-squawk"
 publish = false
 
 [lib]
-name = "market_engine"
+name = "market_squawk"
 path = "src/lib.rs"
 
 [[bin]]
-name = "market-engine"
+name = "market-squawk"
 path = "src/main.rs"
 
 [dependencies]

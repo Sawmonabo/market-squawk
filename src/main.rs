@@ -2,7 +2,7 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
-use market_engine::{
+use market_squawk::{
     AppPaths, Engine, EngineConfig,
     journal::{JournalSink, JournalWriter},
     mcp::McpServer,
@@ -15,14 +15,14 @@ use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
-#[command(name = "market-engine")]
+#[command(name = "market-squawk")]
 #[command(about = "Local-first live market-data capture, replay, paper bots, and MCP")]
 #[command(version)]
 struct Cli {
-    #[arg(long, env = "MARKET_ENGINE_DATA_DIR", default_value = ".market-engine")]
+    #[arg(long, env = "MARKET_SQUAWK_DATA_DIR", default_value = ".market-squawk")]
     data_dir: PathBuf,
 
-    #[arg(long, env = "MARKET_ENGINE_LOG", default_value = "info")]
+    #[arg(long, env = "MARKET_SQUAWK_LOG", default_value = "info")]
     log: String,
 
     #[arg(long)]
@@ -185,7 +185,7 @@ async fn run_source(
     config: EngineConfig,
     source: Box<dyn MarketSource>,
     mode: RunMode,
-) -> Result<market_engine::EngineSnapshot> {
+) -> Result<market_squawk::EngineSnapshot> {
     let paths = AppPaths::new(&config.data_dir);
     paths.initialize()?;
     let journal_path = paths.journal_file(match mode {
