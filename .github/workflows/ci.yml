@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   verify:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       # actions/checkout v6.0.2, verified release commit (2026-01-09).
@@ -27,3 +27,47 @@ jobs:
       - run: rustc --version
       - run: cargo --version
       - run: ./scripts/verify.sh
+
+  macos:
+    runs-on: macos-15-intel
+    timeout-minutes: 60
+    steps:
+      # actions/checkout v6.0.2, verified release commit (2026-01-09).
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      # dtolnay/rust-toolchain generic action, verified commit (2026-06-30).
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: 1.97.0
+      # Swatinem/rust-cache v2.9.1, verified release commit (2026-03-12).
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+      - run: rustc --version
+      - run: cargo --version
+      - run: cargo build --workspace --all-features --locked
+      - run: cargo test -p market-squawk-platform --all-features --locked --test path_confinement
+      - run: cargo test -p market-squawk-platform --all-features --locked --test journal_compatibility
+      - run: cargo test -p market-squawk-platform --all-features --locked --test capture_lifecycle
+      - run: cargo test -p market-squawk-platform --all-features --locked --test capture_authority_bridge
+
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 60
+    steps:
+      # actions/checkout v6.0.2, verified release commit (2026-01-09).
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      # dtolnay/rust-toolchain generic action, verified commit (2026-06-30).
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: 1.97.0
+      # Swatinem/rust-cache v2.9.1, verified release commit (2026-03-12).
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+      - run: rustc --version
+      - run: cargo --version
+      - run: cargo build --workspace --all-features --locked
+      - run: cargo test -p market-squawk-platform --all-features --locked --test path_confinement
+      - run: cargo test -p market-squawk-platform --all-features --locked --test journal_compatibility
+      - run: cargo test -p market-squawk-platform --all-features --locked --test capture_lifecycle
+      - run: cargo test -p market-squawk-platform --all-features --locked --test capture_authority_bridge
