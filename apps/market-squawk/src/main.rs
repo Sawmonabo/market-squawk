@@ -13,8 +13,8 @@ use market_squawk_domain::{
     CaptureAuthorityIdentity, ConnectionGeneration, MetadataRevision, SourceId, SourceIdentifier,
 };
 use market_squawk_platform::{
-    CaptureWriterPolicy, ConfigOverrides, ConfigSources, DiagnosticCaptureBundle,
-    raw_capture_channel, spawn_capture_writer,
+    CaptureShutdownStatus, CaptureWriterPolicy, ConfigOverrides, ConfigSources,
+    DiagnosticCaptureBundle, PendingCaptureWriter, raw_capture_channel, spawn_capture_writer,
 };
 use parking_lot::RwLock;
 use tokio::sync::{mpsc, watch};
@@ -137,7 +137,8 @@ async fn main() -> Result<()> {
                 Some(paper_bot),
             )?;
             let source: Box<dyn MarketSource> = Box::new(MockSource::new(product, events));
-            let snapshot = run_source(config, source, RunMode::UntilSourceStops).await?;
+            let disposition = run_source(config, source, RunMode::UntilSourceStops).await?;
+            let snapshot = finish_run_source(disposition).await?;
             println!("{}", serde_json::to_string_pretty(&snapshot)?);
         }
         Command::Capture {
@@ -153,7 +154,8 @@ async fn main() -> Result<()> {
             )?;
             let source: Box<dyn MarketSource> = Box::new(CoinbaseSource::new(products));
             let mode = seconds.map_or(RunMode::UntilInterrupted, RunMode::ForDuration);
-            let snapshot = run_source(config, source, mode).await?;
+            let disposition = run_source(config, source, mode).await?;
+            let snapshot = finish_run_source(disposition).await?;
             println!("{}", serde_json::to_string_pretty(&snapshot)?);
         }
         Command::Mcp {
@@ -172,7 +174,8 @@ async fn main() -> Result<()> {
                 run_offline_mcp(config, journal_format.map(Into::into)).await?;
             } else {
                 let source: Box<dyn MarketSource> = Box::new(CoinbaseSource::new(products));
-                let _ = run_source(config, source, RunMode::Mcp).await?;
+                let disposition = run_source(config, source, RunMode::Mcp).await?;
+                let _snapshot = finish_run_source(disposition).await?;
             }
         }
         Command::Replay {
@@ -262,11 +265,33 @@ enum RunMode {
     Mcp,
 }
 
+#[derive(Debug)]
+enum RunSourceDisposition {
+    Complete(DiagnosticEngineSnapshot),
+    CapturePending(PendingCaptureWriter<DiagnosticCaptureBundle>),
+}
+
+async fn finish_run_source(disposition: RunSourceDisposition) -> Result<DiagnosticEngineSnapshot> {
+    match disposition {
+        RunSourceDisposition::Complete(snapshot) => Ok(snapshot),
+        RunSourceDisposition::CapturePending(mut pending) => {
+            pending.wait_until_terminated().await;
+            let termination = pending
+                .try_reap()?
+                .cloned()
+                .ok_or_else(|| anyhow!("terminated capture worker had no final report"))?;
+            Err(anyhow!(
+                "raw capture shutdown deadline elapsed; final worker report: {termination:?}"
+            ))
+        }
+    }
+}
+
 async fn run_source(
     config: AppConfig,
     source: Box<dyn MarketSource>,
     mode: RunMode,
-) -> Result<DiagnosticEngineSnapshot> {
+) -> Result<RunSourceDisposition> {
     let paths = AppPaths::prepare(config.data_dir())?;
     let source_name = match mode {
         RunMode::UntilSourceStops => "mock",
@@ -376,13 +401,22 @@ async fn run_source(
         source_error = flatten_source_result(source_task.await);
     }
 
-    let capture_outcome = capture_handle.shutdown(config.capture_shutdown()).await;
-    if capture_outcome.is_incomplete() {
+    let event_result = event_task.await.context("event processor task panicked");
+    let mut pending_capture = capture_handle.shutdown(config.capture_shutdown());
+    let shutdown_status = pending_capture.wait_until_deadline().await;
+    if shutdown_status == CaptureShutdownStatus::DeadlineElapsed {
+        return Ok(RunSourceDisposition::CapturePending(pending_capture));
+    }
+    let capture_termination = pending_capture
+        .try_reap()?
+        .cloned()
+        .ok_or_else(|| anyhow!("terminated capture worker had no final report"))?;
+    if capture_termination.outcome().is_incomplete() {
         return Err(anyhow!(
-            "raw capture shutdown was incomplete: {capture_outcome:?}"
+            "raw capture shutdown was incomplete: {capture_termination:?}"
         ));
     }
-    event_task.await.context("event processor task panicked")?;
+    event_result?;
 
     if let Some(error) = source_error {
         error!(error = %format!("{error:#}"), "source stopped with an error");
@@ -394,7 +428,7 @@ async fn run_source(
         processed_events = snapshot.processed_events,
         "run completed"
     );
-    Ok(snapshot)
+    Ok(RunSourceDisposition::Complete(snapshot))
 }
 
 fn flatten_source_result(
@@ -420,4 +454,25 @@ async fn run_offline_mcp(
     McpServer::new(diagnostic_engine, journal_path)
         .serve_stdio()
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DiagnosticCaptureBundle, PendingCaptureWriter, RunSourceDisposition};
+
+    fn retain_pending_owner(
+        disposition: RunSourceDisposition,
+    ) -> Option<PendingCaptureWriter<DiagnosticCaptureBundle>> {
+        match disposition {
+            RunSourceDisposition::Complete(_snapshot) => None,
+            RunSourceDisposition::CapturePending(pending) => Some(pending),
+        }
+    }
+
+    #[test]
+    fn pending_disposition_retains_the_concrete_capture_owner_type() {
+        let _type_check: fn(
+            RunSourceDisposition,
+        ) -> Option<PendingCaptureWriter<DiagnosticCaptureBundle>> = retain_pending_owner;
+    }
 }

@@ -10,7 +10,8 @@ use market_squawk_domain::{
     StreamIntegrityState, Timestamp, VenueId,
 };
 use market_squawk_platform::{
-    CaptureWriterPolicy, MemoryCaptureSink, raw_capture_channel, spawn_capture_writer,
+    CaptureShutdownStatus, CaptureWriterPolicy, MemoryCaptureSink, raw_capture_channel,
+    spawn_capture_writer,
 };
 use market_squawk_sources::{
     AuthoritativeSourceRegistry, AuthorizationHealth, BudgetHealth, ConnectionLiveness,
@@ -143,7 +144,15 @@ async fn platform_returns_exact_registry_receipt_and_later_degradation_revokes_c
     ));
     assert_eq!(publisher.integrity(), CaptureIntegrityState::Incomplete);
 
-    let _outcome = writer_handle.shutdown(Duration::from_secs(1)).await;
+    let mut pending = writer_handle.shutdown(Duration::from_secs(1));
+    assert_eq!(
+        pending.wait_until_deadline().await,
+        CaptureShutdownStatus::WorkerTerminated
+    );
+    let termination = pending
+        .try_reap()?
+        .ok_or("terminated capture worker did not retain a final report")?;
+    assert!(!termination.outcome().is_incomplete());
     Ok(())
 }
 

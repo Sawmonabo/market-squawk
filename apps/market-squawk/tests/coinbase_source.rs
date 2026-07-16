@@ -1,6 +1,6 @@
 use std::{num::NonZeroUsize, time::Duration};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use futures_util::{SinkExt, StreamExt};
 use market_squawk::{
     DiagnosticMarketEvent as MarketEvent,
@@ -11,8 +11,8 @@ use market_squawk_domain::{
     CaptureAuthorityIdentity, ConnectionGeneration, MetadataRevision, SourceId, SourceIdentifier,
 };
 use market_squawk_platform::{
-    CaptureWriterPolicy, DiagnosticCaptureBundle, LocalPaths, raw_capture_channel,
-    spawn_capture_writer,
+    CaptureShutdownStatus, CaptureWriterPolicy, DiagnosticCaptureBundle, LocalPaths,
+    raw_capture_channel, spawn_capture_writer,
 };
 use serde_json::Value;
 use tempfile::tempdir;
@@ -124,8 +124,15 @@ async fn coinbase_source_journals_and_publishes_local_websocket_messages() -> Re
 
     cancel_sender.send(true)?;
     source_task.await??;
-    let capture_outcome = capture_handle.shutdown(Duration::from_secs(2)).await;
-    assert!(!capture_outcome.is_incomplete());
+    let mut pending_capture = capture_handle.shutdown(Duration::from_secs(2));
+    assert_eq!(
+        pending_capture.wait_until_deadline().await,
+        CaptureShutdownStatus::WorkerTerminated
+    );
+    let capture_termination = pending_capture
+        .try_reap()?
+        .ok_or_else(|| anyhow!("terminated capture worker did not retain a final report"))?;
+    assert!(!capture_termination.outcome().is_incomplete());
     server.await??;
 
     let records = JournalReader::open(&journal_path)?.read_all()?;

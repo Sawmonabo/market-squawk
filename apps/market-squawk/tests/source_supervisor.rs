@@ -13,9 +13,9 @@ use market_squawk_domain::{
     SourceId, SourceIdentifier,
 };
 use market_squawk_platform::{
-    CaptureWriterHandle, CaptureWriterPolicy, DiagnosticCaptureBundle, DiagnosticCaptureReceipt,
-    MemoryCaptureSink, RawCaptureControl, RawCapturePublisher, raw_capture_channel,
-    spawn_capture_writer,
+    CaptureShutdownStatus, CaptureWorkerTermination, CaptureWriterHandle, CaptureWriterPolicy,
+    DiagnosticCaptureBundle, DiagnosticCaptureReceipt, MemoryCaptureSink, RawCaptureControl,
+    RawCapturePublisher, raw_capture_channel, spawn_capture_writer,
 };
 use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
@@ -94,6 +94,19 @@ fn activated_capture() -> Result<ActivatedCapture, Box<dyn std::error::Error>> {
         identity,
         connection_id,
     })
+}
+
+async fn shutdown_and_reap(
+    handle: CaptureWriterHandle<DiagnosticCaptureBundle>,
+) -> Result<CaptureWorkerTermination, Box<dyn std::error::Error>> {
+    let mut pending = handle.shutdown(Duration::from_secs(1));
+    if pending.wait_until_deadline().await != CaptureShutdownStatus::WorkerTerminated {
+        return Err("capture worker exceeded the fixed test deadline".into());
+    }
+    pending
+        .try_reap()?
+        .cloned()
+        .ok_or_else(|| "terminated capture worker did not retain a final report".into())
 }
 
 #[derive(Debug)]
@@ -182,8 +195,8 @@ async fn only_the_supervisor_rotates_after_a_typed_reconnect_outcome()
         assert!(!receipts[1].generation_is_complete());
     }
     assert_eq!(publisher.integrity(), CaptureIntegrityState::Incomplete);
-    let outcome = capture_handle.shutdown(Duration::from_secs(1)).await;
-    assert!(!outcome.is_incomplete());
+    let termination = shutdown_and_reap(capture_handle).await?;
+    assert!(!termination.outcome().is_incomplete());
     Ok(())
 }
 
@@ -209,9 +222,9 @@ async fn normal_and_cancelled_source_completion_invalidate_the_active_allocation
         assert_eq!(publisher.integrity(), CaptureIntegrityState::Incomplete);
         assert_eq!(publisher.accounting_invariant_failures(), 0);
         assert!(
-            !writer_handle
-                .shutdown(Duration::from_secs(1))
-                .await
+            !shutdown_and_reap(writer_handle)
+                .await?
+                .outcome()
                 .is_incomplete()
         );
     }
@@ -238,9 +251,9 @@ async fn source_error_invalidates_the_active_allocation() -> Result<(), Box<dyn 
     assert_eq!(publisher.integrity(), CaptureIntegrityState::Incomplete);
     assert_eq!(publisher.accounting_invariant_failures(), 0);
     assert!(
-        !writer_handle
-            .shutdown(Duration::from_secs(1))
-            .await
+        !shutdown_and_reap(writer_handle)
+            .await?
+            .outcome()
             .is_incomplete()
     );
     Ok(())
@@ -273,9 +286,9 @@ async fn aborting_the_supervisor_invalidates_the_active_allocation()
     assert_eq!(publisher.integrity(), CaptureIntegrityState::Incomplete);
     assert_eq!(publisher.accounting_invariant_failures(), 0);
     assert!(
-        !writer_handle
-            .shutdown(Duration::from_secs(1))
-            .await
+        !shutdown_and_reap(writer_handle)
+            .await?
+            .outcome()
             .is_incomplete()
     );
     Ok(())
