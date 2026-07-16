@@ -58,13 +58,13 @@ impl FeedQuality {
     pub fn observe_heartbeat(&mut self, at: DateTime<Utc>, sequence: u64) {
         self.last_heartbeat_at = Some(at);
 
-        if let Some(previous) = self.last_sequence {
-            if sequence <= previous {
-                self.mark_quarantined(format!(
-                    "non-monotonic heartbeat sequence: previous={previous}, current={sequence}"
-                ));
-                return;
-            }
+        if let Some(previous) = self.last_sequence
+            && sequence <= previous
+        {
+            self.mark_quarantined(format!(
+                "non-monotonic heartbeat sequence: previous={previous}, current={sequence}"
+            ));
+            return;
         }
 
         self.last_sequence = Some(sequence);
@@ -73,17 +73,17 @@ impl FeedQuality {
     /// Record a contiguous sequence for sources that explicitly guarantee contiguous numbering.
     pub fn observe_contiguous(&mut self, at: DateTime<Utc>, sequence: u64) {
         self.last_heartbeat_at = Some(at);
-        if let Some(previous) = self.last_sequence {
-            if sequence != previous.saturating_add(1) {
-                self.state = QualityState::GapDetected;
-                self.reason = Some(format!(
-                    "sequence gap: expected={}, received={sequence}",
-                    previous.saturating_add(1)
-                ));
-                self.gap_count = self.gap_count.saturating_add(1);
-                self.last_sequence = Some(sequence);
-                return;
-            }
+        if let Some(previous) = self.last_sequence
+            && sequence != previous.saturating_add(1)
+        {
+            self.state = QualityState::GapDetected;
+            self.reason = Some(format!(
+                "sequence gap: expected={}, received={sequence}",
+                previous.saturating_add(1)
+            ));
+            self.gap_count = self.gap_count.saturating_add(1);
+            self.last_sequence = Some(sequence);
+            return;
         }
 
         self.last_sequence = Some(sequence);

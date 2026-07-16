@@ -1,49 +1,59 @@
-[package]
-name = "market-squawk"
-version = "0.1.0"
+[workspace]
+resolver = "3"
+# Task 11 adds `adapters/*` atomically with the first working adapter crate.
+members = ["apps/*", "crates/*"]
+default-members = ["apps/market-squawk"]
+
+[workspace.package]
 edition = "2024"
-rust-version = "1.85"
-description = "Local-first, event-sourced live market-data engine with deterministic replay and MCP access"
-repository = "https://github.com/Sawmonabo/market-squawk"
-publish = false
+rust-version = "1.97"
+version = "0.1.0"
+license = "Apache-2.0 OR MIT"
 
-[lib]
-name = "market_squawk"
-path = "src/lib.rs"
-
-[[bin]]
-name = "market-squawk"
-path = "src/main.rs"
-
-[dependencies]
+[workspace.dependencies]
 anyhow = "1.0"
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["clock", "serde"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 crc32fast = "1.4"
-futures-util = "0.3"
 fs2 = "0.4"
+futures-util = "0.3"
 parking_lot = "0.12"
 rust_decimal = { version = "1.36", features = ["serde-with-str"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tokio = { version = "1.43", features = ["io-std", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tempfile = "3.15"
+tokio = { version = "1.43", features = [
+    "io-std",
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 uuid = { version = "1.12", features = ["serde", "v4", "v5"] }
 
-[dev-dependencies]
-tempfile = "3.15"
-
-[lints.rust]
+[workspace.lints.rust]
 unsafe_code = "forbid"
+unreachable_pub = "warn"
+unused_must_use = "deny"
+missing_debug_implementations = "warn"
 
-[lints.clippy]
-all = { level = "warn", priority = -1 }
-module_name_repetitions = "allow"
-missing_errors_doc = "allow"
-missing_panics_doc = "allow"
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+# Transitive platform and protocol stacks intentionally resolve independent major versions.
+multiple_crate_versions = "allow"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
 
 [profile.release]
 opt-level = 3

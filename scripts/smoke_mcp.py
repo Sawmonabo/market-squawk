@@ -20,11 +20,13 @@ def request(process: subprocess.Popen[str], payload: dict) -> dict:
 
 
 def main() -> int:
-    if len(sys.argv) != 2:
-        print("usage: smoke_mcp.py /path/to/market-squawk", file=sys.stderr)
+    if len(sys.argv) > 2:
+        print("usage: smoke_mcp.py [/path/to/market-squawk]", file=sys.stderr)
         return 2
 
-    binary = pathlib.Path(sys.argv[1]).resolve()
+    binary = pathlib.Path(
+        sys.argv[1] if len(sys.argv) == 2 else "target/debug/market-squawk"
+    ).resolve()
     with tempfile.TemporaryDirectory() as data_dir:
         process = subprocess.Popen(
             [str(binary), "--data-dir", data_dir, "mcp", "--offline"],

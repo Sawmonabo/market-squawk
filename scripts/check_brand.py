@@ -20,8 +20,8 @@ TOKENS = (
 # Keys are (repository-relative path, one-based line, TOKENS index). Exact locations keep
 # compatibility references visible and prevent a path-wide exception from hiding new branding.
 ALLOWED_OCCURRENCES = {
-    ("src/journal.rs", 31, 3),
-    ("tests/journal.rs", 30, 3),
+    ("apps/market-squawk/src/journal.rs", 31, 3),
+    ("apps/market-squawk/tests/journal.rs", 31, 3),
     ("docs/architecture/current-state.md", 9, 0),
     ("docs/architecture/current-state.md", 208, 2),
     ("docs/architecture/current-state.md", 208, 3),

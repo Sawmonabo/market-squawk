@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use market_squawk::{
     domain::MarketEvent,
@@ -15,23 +16,19 @@ use tokio::{
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
 #[tokio::test]
-async fn coinbase_source_journals_and_publishes_local_websocket_messages() {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind local websocket server");
-    let address = listener.local_addr().expect("local server address");
+async fn coinbase_source_journals_and_publishes_local_websocket_messages() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
 
     let server = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.expect("accept client");
-        let mut socket = accept_async(stream).await.expect("websocket handshake");
+        let (stream, _) = listener.accept().await?;
+        let mut socket = accept_async(stream).await?;
         let subscription = socket
             .next()
             .await
-            .expect("subscription frame")
-            .expect("valid subscription frame")
-            .into_text()
-            .expect("text subscription");
-        let subscription: Value = serde_json::from_str(&subscription).expect("subscription JSON");
+            .context("subscription frame")??
+            .into_text()?;
+        let subscription: Value = serde_json::from_str(&subscription)?;
         assert_eq!(subscription["type"], "subscribe");
         assert_eq!(subscription["product_ids"][0], "BTC-USD");
 
@@ -40,31 +37,27 @@ async fn coinbase_source_journals_and_publishes_local_websocket_messages() {
                 r#"{"type":"snapshot","product_id":"BTC-USD","bids":[["100.00","2.00"]],"asks":[["101.00","3.00"]]}"#
                     .into(),
             ))
-            .await
-            .expect("send snapshot");
+            .await?;
         socket
             .send(Message::Text(
                 r#"{"type":"heartbeat","sequence":42,"last_trade_id":7,"product_id":"BTC-USD","time":"2026-07-15T20:00:00Z"}"#
                     .into(),
             ))
-            .await
-            .expect("send heartbeat");
+            .await?;
 
         while let Some(message) = socket.next().await {
-            match message.expect("valid client frame") {
+            match message? {
                 Message::Close(_) => break,
-                Message::Ping(payload) => socket
-                    .send(Message::Pong(payload))
-                    .await
-                    .expect("send pong"),
+                Message::Ping(payload) => socket.send(Message::Pong(payload)).await?,
                 _ => {}
             }
         }
+        Ok::<(), anyhow::Error>(())
     });
 
-    let directory = tempdir().expect("temp directory");
+    let directory = tempdir()?;
     let journal_path = directory.path().join("coinbase.msj");
-    let (journal, journal_task) = JournalSink::spawn(&journal_path, 32).expect("journal sink");
+    let (journal, journal_task) = JournalSink::spawn(&journal_path, 32)?;
     let (event_sender, mut event_receiver) = mpsc::channel(32);
     let (cancel_sender, cancel_receiver) = watch::channel(false);
     let source: Box<dyn MarketSource> = Box::new(
@@ -77,7 +70,7 @@ async fn coinbase_source_journals_and_publishes_local_websocket_messages() {
 
     tokio::time::timeout(Duration::from_secs(5), async {
         while !(saw_snapshot && saw_heartbeat) {
-            match event_receiver.recv().await.expect("source event") {
+            match event_receiver.recv().await.context("source event")? {
                 MarketEvent::BookSnapshot { product, .. } => {
                     assert_eq!(product, "BTC-USD");
                     saw_snapshot = true;
@@ -92,27 +85,20 @@ async fn coinbase_source_journals_and_publishes_local_websocket_messages() {
                 _ => {}
             }
         }
+        Ok::<(), anyhow::Error>(())
     })
     .await
-    .expect("source messages arrived before timeout");
+    .context("source messages arrived before timeout")??;
 
-    cancel_sender.send(true).expect("cancel source");
-    source_task
-        .await
-        .expect("source task join")
-        .expect("source stops cleanly");
-    journal.shutdown().await.expect("journal shutdown");
-    journal_task
-        .await
-        .expect("journal task join")
-        .expect("journal writer stops cleanly");
-    server.await.expect("server task join");
+    cancel_sender.send(true)?;
+    source_task.await??;
+    journal.shutdown().await?;
+    journal_task.await??;
+    server.await??;
 
-    let records = JournalReader::open(&journal_path)
-        .expect("open journal")
-        .read_all()
-        .expect("read journal");
+    let records = JournalReader::open(&journal_path)?.read_all()?;
     assert_eq!(records.len(), 2);
     assert!(records[0].payload.starts_with(b"{\"type\":\"snapshot\""));
     assert!(records[1].payload.starts_with(b"{\"type\":\"heartbeat\""));
+    Ok(())
 }

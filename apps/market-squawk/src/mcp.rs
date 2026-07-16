@@ -49,7 +49,7 @@ impl ToolRateLimiter {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct McpServer {
     engine: SharedEngine,
     journal_path: PathBuf,
@@ -393,7 +393,7 @@ mod tests {
     use parking_lot::RwLock;
 
     #[test]
-    fn initialize_advertises_tools_without_live_execution() {
+    fn initialize_advertises_tools_without_live_execution() -> Result<(), &'static str> {
         let server = McpServer::new(
             Arc::new(RwLock::new(Engine::new(5_000, false))),
             PathBuf::from("unused.msj"),
@@ -405,13 +405,14 @@ mod tests {
                 "method": "initialize",
                 "params": {}
             }))
-            .expect("request should produce a response");
+            .ok_or("request should produce a response")?;
         assert_eq!(response["result"]["serverInfo"]["name"], "market-squawk");
         assert_eq!(response["result"]["protocolVersion"], PROTOCOL_VERSION);
+        Ok(())
     }
 
     #[test]
-    fn tool_arguments_reject_unknown_fields() {
+    fn tool_arguments_reject_unknown_fields() -> Result<(), &'static str> {
         let server = McpServer::new(
             Arc::new(RwLock::new(Engine::new(5_000, false))),
             PathBuf::from("unused.msj"),
@@ -426,8 +427,9 @@ mod tests {
                     "arguments": { "unexpected": true }
                 }
             }))
-            .expect("request should produce a response");
+            .ok_or("request should produce a response")?;
         assert_eq!(response["error"]["code"], -32602);
+        Ok(())
     }
 
     #[test]

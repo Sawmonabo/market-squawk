@@ -1,3 +1,4 @@
+use anyhow::{Context, Result};
 use market_squawk::{
     domain::{BookChange, PriceLevel, Side},
     features::OnlineFeatures,
@@ -6,7 +7,7 @@ use market_squawk::{
 use rust_decimal::Decimal;
 
 #[test]
-fn snapshot_and_delta_update_top_of_book_and_features() {
+fn snapshot_and_delta_update_top_of_book_and_features() -> Result<()> {
     let mut book = OrderBook::default();
     book.apply_snapshot(
         &[
@@ -31,7 +32,7 @@ fn snapshot_and_delta_update_top_of_book_and_features() {
         ],
     );
 
-    let initial = book.top().expect("top of book");
+    let initial = book.top().context("top of book")?;
     assert_eq!(initial.bid, Decimal::from(100_u32));
     assert_eq!(initial.ask, Decimal::from(101_u32));
 
@@ -48,13 +49,14 @@ fn snapshot_and_delta_update_top_of_book_and_features() {
         },
     ]);
 
-    let updated = book.top().expect("updated top of book");
+    let updated = book.top().context("updated top of book")?;
     assert_eq!(updated.bid, Decimal::new(1005, 1));
     assert_eq!(updated.ask, Decimal::from(101_u32));
 
-    let features = OnlineFeatures::from_top(&updated).expect("valid features");
+    let features = OnlineFeatures::from_top(&updated).context("valid features")?;
     assert_eq!(features.mid_price, Decimal::new(10075, 2));
     assert_eq!(features.spread, Decimal::new(5, 1));
+    Ok(())
 }
 
 #[test]

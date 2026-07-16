@@ -1,3 +1,4 @@
+use anyhow::{Context, Result};
 use chrono::Utc;
 use market_squawk::{
     Engine,
@@ -7,7 +8,7 @@ use market_squawk::{
 use rust_decimal::Decimal;
 
 #[test]
-fn delta_before_snapshot_is_quarantined() {
+fn delta_before_snapshot_is_quarantined() -> Result<()> {
     let mut engine = Engine::new(5_000, false);
     let now = Utc::now();
     engine.handle(MarketEvent::BookDelta {
@@ -23,13 +24,14 @@ fn delta_before_snapshot_is_quarantined() {
     });
 
     let snapshot = engine.snapshot();
-    let product = snapshot.products.get("BTC-USD").expect("product state");
+    let product = snapshot.products.get("BTC-USD").context("product state")?;
     assert_eq!(product.quality.state, QualityState::Quarantined);
     assert!(product.features.is_none());
+    Ok(())
 }
 
 #[test]
-fn source_disconnect_requires_a_fresh_snapshot() {
+fn source_disconnect_requires_a_fresh_snapshot() -> Result<()> {
     let mut engine = Engine::new(5_000, false);
     let now = Utc::now();
     engine.handle(MarketEvent::BookSnapshot {
@@ -53,7 +55,10 @@ fn source_disconnect_requires_a_fresh_snapshot() {
     });
 
     let disconnected = engine.snapshot();
-    let product = disconnected.products.get("BTC-USD").expect("product state");
+    let product = disconnected
+        .products
+        .get("BTC-USD")
+        .context("product state")?;
     assert_eq!(product.quality.state, QualityState::Quarantined);
     assert!(product.features.is_none());
 
@@ -76,4 +81,5 @@ fn source_disconnect_requires_a_fresh_snapshot() {
         recovered.products["BTC-USD"].quality.state,
         QualityState::Valid
     );
+    Ok(())
 }

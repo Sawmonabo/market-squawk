@@ -1,10 +1,11 @@
+use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use market_squawk::{domain::MarketEvent, source::coinbase::decode_message};
 use rust_decimal::Decimal;
 use serde_json::json;
 
 #[test]
-fn decodes_level_two_snapshot_without_floating_point() {
+fn decodes_level_two_snapshot_without_floating_point() -> Result<()> {
     let event = decode_message(
         &json!({
             "type": "snapshot",
@@ -13,20 +14,19 @@ fn decodes_level_two_snapshot_without_floating_point() {
             "asks": [["100.20", "2.50"]]
         }),
         Utc::now(),
-    )
-    .expect("decode succeeds")
-    .expect("snapshot is supported");
+    )?
+    .context("snapshot is supported")?;
 
-    let (bids, asks) = match event {
-        MarketEvent::BookSnapshot { bids, asks, .. } => (bids, asks),
-        _ => panic!("expected snapshot"),
+    let MarketEvent::BookSnapshot { bids, asks, .. } = event else {
+        bail!("expected snapshot");
     };
     assert_eq!(bids[0].price, Decimal::new(10010, 2));
     assert_eq!(asks[0].size, Decimal::new(250, 2));
+    Ok(())
 }
 
 #[test]
-fn decodes_heartbeat_sequence_for_gap_detection() {
+fn decodes_heartbeat_sequence_for_gap_detection() -> Result<()> {
     let event = decode_message(
         &json!({
             "type": "heartbeat",
@@ -36,19 +36,18 @@ fn decodes_heartbeat_sequence_for_gap_detection() {
             "time": "2026-07-15T20:00:00Z"
         }),
         Utc::now(),
-    )
-    .expect("decode succeeds")
-    .expect("heartbeat is supported");
+    )?
+    .context("heartbeat is supported")?;
 
-    let sequence = match event {
-        MarketEvent::Heartbeat { sequence, .. } => sequence,
-        _ => panic!("expected heartbeat"),
+    let MarketEvent::Heartbeat { sequence, .. } = event else {
+        bail!("expected heartbeat");
     };
     assert_eq!(sequence, 90);
+    Ok(())
 }
 
 #[test]
-fn decodes_match_side_as_the_maker_side() {
+fn decodes_match_side_as_the_maker_side() -> Result<()> {
     let event = decode_message(
         &json!({
             "type": "match",
@@ -60,20 +59,19 @@ fn decodes_match_side_as_the_maker_side() {
             "time": "2026-07-15T20:00:00Z"
         }),
         Utc::now(),
-    )
-    .expect("decode succeeds")
-    .expect("match is supported");
+    )?
+    .context("match is supported")?;
 
-    let maker_side = match event {
-        MarketEvent::Trade { maker_side, .. } => maker_side,
-        _ => panic!("expected trade"),
+    let MarketEvent::Trade { maker_side, .. } = event else {
+        bail!("expected trade");
     };
     assert_eq!(maker_side, market_squawk::domain::Side::Sell);
+    Ok(())
 }
 
 #[test]
-fn rejects_an_invalid_present_exchange_timestamp() {
-    let error = decode_message(
+fn rejects_an_invalid_present_exchange_timestamp() -> Result<()> {
+    let Err(error) = decode_message(
         &json!({
             "type": "l2update",
             "product_id": "BTC-USD",
@@ -81,8 +79,10 @@ fn rejects_an_invalid_present_exchange_timestamp() {
             "time": "not-a-timestamp"
         }),
         Utc::now(),
-    )
-    .expect_err("invalid timestamps must fail decoding");
+    ) else {
+        bail!("invalid timestamps must fail decoding");
+    };
 
     assert!(error.to_string().contains("invalid RFC 3339 timestamp"));
+    Ok(())
 }

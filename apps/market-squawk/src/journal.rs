@@ -95,6 +95,7 @@ impl From<TryFromIntError> for JournalError {
     }
 }
 
+#[derive(Debug)]
 pub struct JournalWriter {
     path: PathBuf,
     writer: BufWriter<File>,
@@ -251,6 +252,7 @@ impl JournalSink {
     }
 }
 
+#[derive(Debug)]
 pub struct JournalReader<R = File> {
     reader: BufReader<R>,
     offset: u64,
