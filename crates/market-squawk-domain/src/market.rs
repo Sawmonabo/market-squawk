@@ -7,7 +7,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{
     InstrumentId, LiveProvenance, MarketDepth, Money, PriceTicks, QuantityLots, SequenceNumber,
-    SourceIdentifier, Timestamp, TradingStatus, VenueSymbol,
+    SourceIdentifier, Timestamp, TradingStatus, VenueId, VenueSymbol,
 };
 
 #[path = "market/events.rs"]
@@ -173,6 +173,8 @@ pub enum CorporateActionKind {
     Delisting,
     /// Venue symbol change for the same stable instrument.
     SymbolChange {
+        /// Venue namespace in which the symbol changed.
+        venue_id: VenueId,
         /// Prior venue symbol.
         previous: VenueSymbol,
         /// New venue symbol.
@@ -231,6 +233,8 @@ pub enum MarketEventError {
     SelfMerger,
     /// A symbol-change action does not change the symbol.
     UnchangedSymbol,
+    /// A symbol-change action's venue disagrees with record provenance.
+    CorporateActionVenueMismatch,
 }
 
 impl fmt::Display for MarketEventError {
@@ -252,6 +256,9 @@ impl fmt::Display for MarketEventError {
                 formatter.write_str("merger successor must be a distinct instrument")
             }
             Self::UnchangedSymbol => formatter.write_str("symbol change requires distinct symbols"),
+            Self::CorporateActionVenueMismatch => {
+                formatter.write_str("symbol-change venue must match event provenance")
+            }
         }
     }
 }

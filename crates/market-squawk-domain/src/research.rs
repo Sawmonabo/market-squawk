@@ -54,12 +54,16 @@ pub enum ResearchObservation {
 pub enum ResearchError {
     /// Instrument-scoped research data lacks stable instrument identity.
     MissingInstrument,
+    /// A venue-scoped research observation lacks venue identity.
+    MissingVenue,
     /// Persisted positions must have a nonzero absolute quantity.
     ZeroPosition,
     /// A merger successor is the same stable instrument.
     SelfMerger,
     /// A symbol-change action does not change the symbol.
     UnchangedSymbol,
+    /// A symbol-change action's venue disagrees with research provenance.
+    CorporateActionVenueMismatch,
 }
 
 impl fmt::Display for ResearchError {
@@ -68,11 +72,17 @@ impl fmt::Display for ResearchError {
             Self::MissingInstrument => {
                 formatter.write_str("research observation requires an instrument")
             }
+            Self::MissingVenue => {
+                formatter.write_str("venue-scoped research observation requires a venue")
+            }
             Self::ZeroPosition => formatter.write_str("portfolio position must be nonzero"),
             Self::SelfMerger => {
                 formatter.write_str("merger successor must be a distinct instrument")
             }
             Self::UnchangedSymbol => formatter.write_str("symbol change requires distinct symbols"),
+            Self::CorporateActionVenueMismatch => {
+                formatter.write_str("symbol-change venue must match research provenance")
+            }
         }
     }
 }
@@ -95,8 +105,22 @@ pub(super) fn validate_corporate_action(
         CorporateActionKind::Merger { successor } if *successor == instrument_id => {
             Err(ResearchError::SelfMerger)
         }
-        CorporateActionKind::SymbolChange { previous, current } if previous == current => {
-            Err(ResearchError::UnchangedSymbol)
+        CorporateActionKind::SymbolChange {
+            venue_id,
+            previous,
+            current,
+        } => {
+            let provenance_venue = context
+                .provenance()
+                .venue_id()
+                .ok_or(ResearchError::MissingVenue)?;
+            if provenance_venue != venue_id {
+                return Err(ResearchError::CorporateActionVenueMismatch);
+            }
+            if previous == current {
+                return Err(ResearchError::UnchangedSymbol);
+            }
+            Ok(())
         }
         _ => Ok(()),
     }

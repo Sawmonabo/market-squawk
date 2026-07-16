@@ -496,8 +496,20 @@ impl CorporateActionEvent {
             CorporateActionKind::Merger { successor } if *successor == instrument_id => {
                 return Err(MarketEventError::SelfMerger);
             }
-            CorporateActionKind::SymbolChange { previous, current } if previous == current => {
-                return Err(MarketEventError::UnchangedSymbol);
+            CorporateActionKind::SymbolChange {
+                venue_id,
+                previous,
+                current,
+            } => {
+                let provenance_venue = provenance
+                    .venue_id()
+                    .ok_or(MarketEventError::MissingVenue)?;
+                if provenance_venue != venue_id {
+                    return Err(MarketEventError::CorporateActionVenueMismatch);
+                }
+                if previous == current {
+                    return Err(MarketEventError::UnchangedSymbol);
+                }
             }
             _ => {}
         }
