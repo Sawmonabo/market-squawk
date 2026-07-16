@@ -19,7 +19,7 @@ use current_source::{
     INSTRUMENT_ONE, INSTRUMENT_TWO, SourceHarness, TestResult, route, route_config, runtime_config,
 };
 
-fn rejection_runtime_config() -> TestResult<LiveRuntimeConfig> {
+fn rejection_runtime_config(maximum_streams_per_route: usize) -> TestResult<LiveRuntimeConfig> {
     let base = runtime_config(8, 8 * 1024 * 1024, 4 * 1024 * 1024)?;
     Ok(LiveRuntimeConfig::try_new(LiveRuntimeConfigInput {
         routing_version: base.routing_version(),
@@ -29,6 +29,7 @@ fn rejection_runtime_config() -> TestResult<LiveRuntimeConfig> {
         maximum_message_bytes: base.maximum_message_bytes().get(),
         maximum_routes_per_shard: base.maximum_routes_per_shard().get(),
         maximum_sources_per_route: base.maximum_sources_per_route().get(),
+        maximum_streams_per_route,
         registration_control_capacity: base.registration_control_capacity().get(),
         registration_deadline: base.registration_deadline(),
         health_event_capacity: base.health_event_capacity().get(),
@@ -60,7 +61,7 @@ async fn bind(
 async fn rejected_first_observation_is_quarantined_without_killing_other_routes_or_shutdown()
 -> TestResult {
     let mut runtime = LiveRuntime::start(
-        rejection_runtime_config()?,
+        rejection_runtime_config(4)?,
         vec![route_config(INSTRUMENT_ONE)?, route_config(INSTRUMENT_TWO)?],
     )
     .await?;

@@ -118,6 +118,7 @@ pub(super) fn runtime_config(
         maximum_message_bytes,
         maximum_routes_per_shard: 4,
         maximum_sources_per_route: 4,
+        maximum_streams_per_route: 4,
         registration_control_capacity: 4,
         registration_deadline: Duration::from_secs(2),
         health_event_capacity: 16,

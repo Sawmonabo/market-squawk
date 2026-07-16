@@ -39,7 +39,7 @@ pub(crate) use generation::{
 };
 use snapshot::build_snapshot_seed;
 pub(crate) use snapshot::{ProcessorSnapshotLimits, ProcessorSnapshotSeed};
-use status::StatusBook;
+use status::{SharedStatus, StatusBook, StatusKey};
 use stream::{StreamState, preview_stream};
 
 use crate::authority::{
@@ -50,7 +50,16 @@ use crate::qualification::build_qualified_event;
 use crate::{AuthorityError, ConsumedLiveAuthority, DepthLimit, LiveExecutionCapability};
 
 /// Hard bound for independently keyed source/product/channel streams per instrument owner.
-const MAX_STREAMS_PER_INSTRUMENT: usize = 64;
+pub(crate) const MAX_STREAMS_PER_INSTRUMENT: usize = 64;
+
+/// Inline persistent ownership charged once per independently keyed stream.
+///
+/// The concrete state includes sequence, checksum, provenance, generation/revision authority,
+/// scaled/exact book containers, the stream hash entry, and its separately keyed status entry.
+pub(crate) const fn persistent_stream_inline_bytes() -> usize {
+    std::mem::size_of::<(CurrentStreamKey, StreamState)>()
+        + std::mem::size_of::<(StatusKey, SharedStatus)>()
+}
 
 /// Exact Task 8-owned shard and runtime liveness bindings used by every capability.
 ///
@@ -99,10 +108,18 @@ pub(crate) struct InstrumentLiveProcessor<C: TrustedClock> {
     source_generations: HashMap<market_squawk_domain::SourceId, ConnectionGeneration>,
     statuses: StatusBook,
     max_streams: usize,
+    max_sources: usize,
     liveness: ProcessorLivenessBinding,
     authority: AuthorityGate,
     clock: C,
     maximum_capability_lifetime: Duration,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceGenerationTransition {
+    Current,
+    Insert,
+    Replace,
 }
 
 impl InstrumentLiveProcessor<SystemTrustedClock> {
@@ -114,6 +131,8 @@ impl InstrumentLiveProcessor<SystemTrustedClock> {
     pub(crate) fn new_system(
         definition: InstrumentDefinition,
         depth: DepthLimit,
+        max_streams: usize,
+        max_sources: usize,
         nonce_capacity: usize,
         nonce_reclaim_budget: usize,
         maximum_capability_lifetime: Duration,
@@ -122,7 +141,8 @@ impl InstrumentLiveProcessor<SystemTrustedClock> {
         Self::try_new(
             definition,
             depth,
-            MAX_STREAMS_PER_INSTRUMENT,
+            max_streams,
+            max_sources,
             nonce_capacity,
             nonce_reclaim_budget,
             maximum_capability_lifetime,
@@ -141,6 +161,7 @@ impl<C: TrustedClock> InstrumentLiveProcessor<C> {
         definition: InstrumentDefinition,
         depth: DepthLimit,
         max_streams: usize,
+        max_sources: usize,
         nonce_capacity: usize,
         nonce_reclaim_budget: usize,
         maximum_capability_lifetime: Duration,
@@ -153,6 +174,9 @@ impl<C: TrustedClock> InstrumentLiveProcessor<C> {
                 maximum: MAX_STREAMS_PER_INSTRUMENT,
             });
         }
+        if max_sources == 0 || max_sources > MAX_STREAMS_PER_INSTRUMENT {
+            return Err(LiveApplyError::InvalidGenerationCapacity);
+        }
         if maximum_capability_lifetime.is_zero() {
             return Err(LiveApplyError::InvalidCapabilityLifetime);
         }
@@ -163,7 +187,7 @@ impl<C: TrustedClock> InstrumentLiveProcessor<C> {
             .map_err(|_| LiveApplyError::Allocation)?;
         let mut source_generations = HashMap::new();
         source_generations
-            .try_reserve(max_streams)
+            .try_reserve(max_sources)
             .map_err(|_| LiveApplyError::Allocation)?;
         Ok(Self {
             definition,
@@ -172,6 +196,7 @@ impl<C: TrustedClock> InstrumentLiveProcessor<C> {
             source_generations,
             statuses: StatusBook::try_new(max_streams)?,
             max_streams,
+            max_sources,
             liveness,
             authority: AuthorityGate::new(nonce_capacity, nonce_reclaim_budget)?,
             clock,
@@ -227,8 +252,7 @@ impl<C: TrustedClock> InstrumentLiveProcessor<C> {
         let now = self.clock.now()?;
         self.validate_observation(&current, cursor, now.wall())?;
         let key = current.stream_key().clone();
-        self.prepare_source_generation(&current, &cursor.admission)?;
-        self.prepare_stream(&current, &cursor.admission)?;
+        self.prepare_generation_and_stream(&current, &cursor.admission)?;
         let staged_status = match self
             .statuses
             .stage(&current, self.definition.trading_status())
@@ -392,15 +416,29 @@ impl<C: TrustedClock> InstrumentLiveProcessor<C> {
         )
     }
 
-    fn prepare_stream(
+    fn prepare_generation_and_stream(
         &mut self,
         current: &CurrentProviderObservation,
         admission: &GenerationAdmission,
     ) -> Result<(), LiveApplyError> {
         let key = current.stream_key();
+        let source_id = key.source_id();
         let generation = current.frame_evidence().binding().connection_generation();
+        let source_transition = match self.source_generations.get(source_id).copied() {
+            Some(existing) if existing > generation => {
+                return Err(LiveApplyError::GenerationNotAdvanced);
+            }
+            Some(existing) if existing == generation => SourceGenerationTransition::Current,
+            Some(_) => SourceGenerationTransition::Replace,
+            None if self.source_generations.len() >= self.max_sources => {
+                return Err(LiveApplyError::GenerationCapacityExhausted);
+            }
+            None => SourceGenerationTransition::Insert,
+        };
         if let Some(existing) = self.streams.get(key) {
-            if generation == existing.connection_generation() {
+            if generation == existing.connection_generation()
+                && source_transition == SourceGenerationTransition::Current
+            {
                 if existing
                     .generation_lease()
                     .shares_allocation_with(&admission.generation())
@@ -412,46 +450,37 @@ impl<C: TrustedClock> InstrumentLiveProcessor<C> {
             if generation < existing.connection_generation() {
                 return Err(LiveApplyError::GenerationNotAdvanced);
             }
-        } else if self.streams.len() >= self.max_streams {
+        }
+
+        let retained_streams = if source_transition == SourceGenerationTransition::Replace {
+            self.streams
+                .keys()
+                .filter(|candidate| candidate.source_id() != source_id)
+                .count()
+        } else if self.streams.contains_key(key) {
+            self.streams.len().saturating_sub(1)
+        } else {
+            self.streams.len()
+        };
+        if retained_streams >= self.max_streams {
             return Err(LiveApplyError::StreamCapacityExhausted);
         }
-        if let Some(existing) = self.streams.get_mut(key) {
-            existing.quarantine();
-        }
+
+        // Construct every fallible replacement before revoking the committed generation. This
+        // keeps a source cutover and all of its stream invalidation at one single-writer commit
+        // point; capacity or protocol-resolution failure leaves the former state untouched.
         let state = StreamState::new(
             generation,
             admission.generation(),
             current.policy().protocol(),
             self.depth,
         )?;
-        self.streams.insert(key.clone(), state);
-        Ok(())
-    }
-
-    fn prepare_source_generation(
-        &mut self,
-        current: &CurrentProviderObservation,
-        admission: &GenerationAdmission,
-    ) -> Result<(), LiveApplyError> {
-        let source_id = current.stream_key().source_id();
-        let generation = current.frame_evidence().binding().connection_generation();
-        match self.source_generations.get(source_id).copied() {
-            Some(existing) if existing > generation => {
-                return Err(LiveApplyError::GenerationNotAdvanced);
-            }
-            Some(existing) if existing == generation => return Ok(()),
-            None if self.source_generations.len() >= self.max_streams => {
-                return Err(LiveApplyError::GenerationCapacityExhausted);
-            }
-            Some(_) | None => {}
+        if source_transition != SourceGenerationTransition::Current {
+            // Revalidate immediately before the now-infallible generation commit. Same-generation
+            // stream additions already passed top-level validation and need no extra clock read.
+            admission.validate_at(self.clock.now()?.wall())?;
         }
-
-        // A source-generation cutover invalidates and removes multiple authority allocations.
-        // Revalidate immediately before that irreversible control-path mutation. Same-generation
-        // events already passed the top-level validation and return above without another clock
-        // read on the per-event path.
-        admission.validate_at(self.clock.now()?.wall())?;
-        if self.source_generations.contains_key(source_id) {
+        if source_transition == SourceGenerationTransition::Replace {
             self.streams.retain(|key, state| {
                 if key.source_id() == source_id {
                     state.quarantine();
@@ -461,9 +490,14 @@ impl<C: TrustedClock> InstrumentLiveProcessor<C> {
                 }
             });
             self.statuses.invalidate_source(source_id);
+        } else if let Some(existing) = self.streams.get_mut(key) {
+            existing.quarantine();
         }
-        self.source_generations
-            .insert(source_id.clone(), generation);
+        if source_transition != SourceGenerationTransition::Current {
+            self.source_generations
+                .insert(source_id.clone(), generation);
+        }
+        self.streams.insert(key.clone(), state);
         Ok(())
     }
 

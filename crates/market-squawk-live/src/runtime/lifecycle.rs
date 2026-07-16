@@ -173,6 +173,7 @@ impl LiveRuntime {
                 shard_owner,
                 routes: shard_routes,
                 maximum_sources_per_route: config.maximum_sources_per_route().get(),
+                maximum_streams_per_route: config.maximum_streams_per_route().get(),
                 mailbox,
                 registrations,
                 snapshot_limits: config.snapshot_limits(),

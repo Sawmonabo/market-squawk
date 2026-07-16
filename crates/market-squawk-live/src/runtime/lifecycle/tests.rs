@@ -275,6 +275,7 @@ async fn actor_exit_invalidates_shared_runtime_before_completion_is_observed() -
         shard_owner,
         routes: Vec::new(),
         maximum_sources_per_route: 1,
+        maximum_streams_per_route: 1,
         mailbox: mpsc::channel(1).1,
         registrations: mpsc::channel(1).1,
         snapshot_limits: config.snapshot_limits(),

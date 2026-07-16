@@ -41,6 +41,7 @@ pub(super) fn config(
         maximum_message_bytes: 8 * 1024,
         maximum_routes_per_shard: 4,
         maximum_sources_per_route: 2,
+        maximum_streams_per_route: 4,
         registration_control_capacity: 2,
         registration_deadline: Duration::from_secs(1),
         health_event_capacity: 16,

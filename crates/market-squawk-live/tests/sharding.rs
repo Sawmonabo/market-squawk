@@ -6,9 +6,9 @@ use market_squawk_domain::{
     InstrumentId, LotSize, TickSize, TradingStatus, VenueId, VenueMapping, VenueSymbol,
 };
 use market_squawk_live::{
-    DepthLimit, LiveRouteConfig, LiveRouteConfigInput, LiveRuntimeConfig, LiveRuntimeConfigError,
-    LiveRuntimeConfigInput, ShardCount, ShardId, ShardKey, ShardRouter, ShardRoutingError,
-    ShardRoutingVersion, SnapshotLimits,
+    DepthLimit, LiveRouteConfig, LiveRouteConfigInput, LiveRuntime, LiveRuntimeConfig,
+    LiveRuntimeConfigError, LiveRuntimeConfigInput, LiveRuntimeStartError, ShardCount, ShardId,
+    ShardKey, ShardRouter, ShardRoutingError, ShardRoutingVersion, SnapshotLimits,
 };
 use rust_decimal::Decimal;
 
@@ -71,6 +71,7 @@ fn runtime_input() -> TestResult<LiveRuntimeConfigInput> {
         maximum_message_bytes: 262_144,
         maximum_routes_per_shard: 8,
         maximum_sources_per_route: 8,
+        maximum_streams_per_route: 8,
         registration_control_capacity: 8,
         registration_deadline: Duration::from_secs(1),
         health_event_capacity: 64,
@@ -92,6 +93,7 @@ fn memory_input(maximum_runtime_bytes: u64) -> TestResult<LiveRuntimeConfigInput
         maximum_message_bytes: 512,
         maximum_routes_per_shard: 1,
         maximum_sources_per_route: 2,
+        maximum_streams_per_route: 2,
         registration_control_capacity: 2,
         registration_deadline: Duration::from_secs(1),
         health_event_capacity: 4,
@@ -286,6 +288,7 @@ fn runtime_config_rejects_every_zero_capacity_and_duration() -> TestResult {
     zero_capacity!(maximum_message_bytes);
     zero_capacity!(maximum_routes_per_shard);
     zero_capacity!(maximum_sources_per_route);
+    zero_capacity!(maximum_streams_per_route);
     zero_capacity!(registration_control_capacity);
     zero_capacity!(health_event_capacity);
     zero_capacity!(snapshot_event_budget);
@@ -331,13 +334,44 @@ fn runtime_config_enforces_exact_public_hard_limits() -> TestResult {
             ));
         }};
     }
-    hard_limit!(shard_count, 64);
     hard_limit!(mailbox_count_per_shard, 1_000_000);
     hard_limit!(maximum_routes_per_shard, 64);
-    hard_limit!(maximum_sources_per_route, 64);
+    hard_limit!(maximum_streams_per_route, 64);
     hard_limit!(registration_control_capacity, 65_536);
     hard_limit!(health_event_capacity, 65_536);
     hard_limit!(snapshot_event_budget, 1_000_000);
+
+    let mut exact_shards = runtime_input()?;
+    exact_shards.shard_count = 64;
+    exact_shards.maximum_retained_snapshot_readers = 64;
+    LiveRuntimeConfig::try_new(exact_shards)?;
+    let mut over_shards = runtime_input()?;
+    over_shards.shard_count = 65;
+    over_shards.maximum_retained_snapshot_readers = 65;
+    assert!(matches!(
+        LiveRuntimeConfig::try_new(over_shards),
+        Err(LiveRuntimeConfigError::CapacityExceedsHardLimit {
+            field: "shard_count",
+            value: 65,
+            maximum: 64,
+        })
+    ));
+
+    let mut exact_sources = runtime_input()?;
+    exact_sources.maximum_sources_per_route = 64;
+    exact_sources.maximum_streams_per_route = 64;
+    LiveRuntimeConfig::try_new(exact_sources)?;
+    let mut over_sources = runtime_input()?;
+    over_sources.maximum_sources_per_route = 65;
+    over_sources.maximum_streams_per_route = 64;
+    assert!(matches!(
+        LiveRuntimeConfig::try_new(over_sources),
+        Err(LiveRuntimeConfigError::CapacityExceedsHardLimit {
+            field: "maximum_sources_per_route",
+            value: 65,
+            maximum: 64,
+        })
+    ));
 
     let mut exact_permits = runtime_input()?;
     exact_permits.mailbox_bytes_per_shard = u32::MAX;
@@ -497,7 +531,7 @@ fn route_validation_rejects_duplicates_and_per_shard_overflow() -> TestResult {
 
 #[test]
 fn estimated_peak_bytes_matches_golden_and_exact_ceiling_boundary() -> TestResult {
-    const EXPECTED_PEAK_BYTES: u64 = 215_680;
+    const EXPECTED_PEAK_BYTES: u64 = 247_584;
     let routes = [route_config("coinbase", INSTRUMENT_ONE, 4, 8, 1)?];
 
     let config = LiveRuntimeConfig::try_new(memory_input(EXPECTED_PEAK_BYTES)?)?;
@@ -513,6 +547,29 @@ fn estimated_peak_bytes_matches_golden_and_exact_ceiling_boundary() -> TestResul
             estimated: EXPECTED_PEAK_BYTES,
             ceiling,
         }) if ceiling == EXPECTED_PEAK_BYTES - 1
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_start_rejects_a_ceiling_that_only_charged_one_book_per_route() -> TestResult {
+    let route = route_config("coinbase", INSTRUMENT_ONE, 4, 8, 1)?;
+    let mut one_stream = memory_input(u64::MAX)?;
+    one_stream.maximum_sources_per_route = 1;
+    one_stream.maximum_streams_per_route = 1;
+    let former_ceiling = LiveRuntimeConfig::try_new(one_stream)?
+        .estimated_peak_bytes(std::slice::from_ref(&route))?
+        .get();
+
+    let mut fully_charged = memory_input(former_ceiling)?;
+    fully_charged.maximum_sources_per_route = 1;
+    fully_charged.maximum_streams_per_route = 64;
+    let config = LiveRuntimeConfig::try_new(fully_charged)?;
+    assert!(matches!(
+        LiveRuntime::start(config, vec![route]).await,
+        Err(LiveRuntimeStartError::Config(
+            LiveRuntimeConfigError::PeakMemoryExceedsCeiling { ceiling, .. }
+        )) if ceiling == former_ceiling
     ));
     Ok(())
 }

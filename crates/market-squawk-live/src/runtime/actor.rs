@@ -44,6 +44,7 @@ pub(crate) struct ShardActorInput {
     pub(crate) shard_owner: ShardLeaseOwner,
     pub(crate) routes: Vec<LiveRouteConfig>,
     pub(crate) maximum_sources_per_route: usize,
+    pub(crate) maximum_streams_per_route: usize,
     pub(crate) mailbox: mpsc::Receiver<ShardCommand>,
     pub(crate) registrations: mpsc::Receiver<RegistrationCommand>,
     pub(crate) snapshot_limits: SnapshotLimits,
@@ -199,6 +200,8 @@ impl ShardActor {
             let processor = InstrumentLiveProcessor::new_system(
                 route.definition().clone(),
                 route.depth(),
+                input.maximum_streams_per_route,
+                input.maximum_sources_per_route,
                 route.nonce_capacity().get(),
                 route.nonce_reclaim_budget().get(),
                 route.maximum_capability_lifetime(),

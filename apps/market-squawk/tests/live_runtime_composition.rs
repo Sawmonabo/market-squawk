@@ -57,6 +57,7 @@ fn runtime_config() -> TestResult<LiveRuntimeConfig> {
         maximum_message_bytes: 64 * 1024,
         maximum_routes_per_shard: 4,
         maximum_sources_per_route: 4,
+        maximum_streams_per_route: 4,
         registration_control_capacity: 8,
         registration_deadline: Duration::from_secs(1),
         health_event_capacity: 16,

@@ -8,9 +8,10 @@ use market_squawk_domain::{
 use rust_decimal::Decimal;
 
 use super::{
-    ACTOR_FIXED_BYTES, BOOK_LEVEL_BYTES, CHANNEL_COMMAND_SLOT_BYTES, CONTROL_SLOT_BYTES,
-    HEALTH_EVENT_BYTES, NONCE_SLOT_BYTES, ROUTE_FIXED_BYTES, SNAPSHOT_NOTIFICATION_BYTES,
-    SOURCE_STREAM_BYTES, add, estimate_peak_bytes, multiply,
+    ACTOR_FIXED_BYTES, CHANNEL_COMMAND_SLOT_BYTES, CONTROL_SLOT_BYTES, EXACT_BOOK_LEVEL_BYTES,
+    HEALTH_EVENT_BYTES, NONCE_SLOT_BYTES, ROUTE_FIXED_BYTES, SCALED_BOOK_LEVEL_BYTES,
+    SNAPSHOT_NOTIFICATION_BYTES, SOURCE_ADMISSION_BYTES, add, estimate_peak_bytes, multiply,
+    persistent_stream_bytes,
 };
 use crate::runtime::{
     LiveRouteConfig, LiveRouteConfigInput, LiveRuntimeConfig, LiveRuntimeConfigError,
@@ -65,6 +66,7 @@ fn input() -> TestResult<LiveRuntimeConfigInput> {
         maximum_message_bytes: 512,
         maximum_routes_per_shard: 8,
         maximum_sources_per_route: 2,
+        maximum_streams_per_route: 2,
         registration_control_capacity: 2,
         registration_deadline: Duration::from_secs(1),
         health_event_capacity: 4,
@@ -99,34 +101,87 @@ fn checked_arithmetic_accepts_exact_maximum_and_rejects_overflow() -> TestResult
 }
 
 #[test]
-fn route_state_nonce_source_and_book_terms_have_exact_deltas() -> TestResult {
+fn route_state_nonce_source_stream_and_dual_book_terms_have_exact_deltas() -> TestResult {
     let base_route = route(INSTRUMENT_ONE, 4, 8)?;
     let base = estimate(input()?, std::slice::from_ref(&base_route))?;
 
     let second_route = route(INSTRUMENT_TWO, 4, 8)?;
     let with_second = estimate(input()?, &[base_route.clone(), second_route])?;
-    let expected_route =
-        ROUTE_FIXED_BYTES + 8 * NONCE_SLOT_BYTES + 2 * SOURCE_STREAM_BYTES + 8 * BOOK_LEVEL_BYTES;
+    let expected_route = ROUTE_FIXED_BYTES
+        + 8 * NONCE_SLOT_BYTES
+        + 2 * SOURCE_ADMISSION_BYTES
+        + 2 * persistent_stream_bytes(4)?;
     assert_eq!(with_second - base, expected_route);
 
     let larger_nonce = estimate(input()?, &[route(INSTRUMENT_ONE, 4, 9)?])?;
     assert_eq!(larger_nonce - base, NONCE_SLOT_BYTES);
 
     let deeper_book = estimate(input()?, &[route(INSTRUMENT_ONE, 5, 8)?])?;
-    assert_eq!(deeper_book - base, 2 * BOOK_LEVEL_BYTES);
+    assert_eq!(
+        deeper_book - base,
+        2 * 2 * (SCALED_BOOK_LEVEL_BYTES + EXACT_BOOK_LEVEL_BYTES)
+    );
 
-    let mut more_sources = input()?;
+    let mut more_streams = input()?;
+    more_streams.maximum_streams_per_route = 3;
+    let more_streams_input = more_streams.clone();
+    let more_streams = estimate(more_streams, std::slice::from_ref(&base_route))?;
+    assert_eq!(more_streams - base, persistent_stream_bytes(4)?);
+
+    let mut more_sources = more_streams_input;
     more_sources.maximum_sources_per_route = 3;
     let more_sources = estimate(more_sources, &[base_route])?;
-    assert_eq!(more_sources - base, SOURCE_STREAM_BYTES);
+    assert_eq!(more_sources - more_streams, SOURCE_ADMISSION_BYTES);
+    Ok(())
+}
+
+#[test]
+fn one_route_charges_every_persistent_book_for_one_or_sixty_four_streams() -> TestResult {
+    let routes = [route(INSTRUMENT_ONE, 10, 8)?];
+    let mut one = input()?;
+    one.maximum_sources_per_route = 1;
+    one.maximum_streams_per_route = 1;
+    let one = estimate(one, &routes)?;
+
+    let mut sixty_four = input()?;
+    sixty_four.maximum_sources_per_route = 1;
+    sixty_four.maximum_streams_per_route = 64;
+    let sixty_four = estimate(sixty_four, &routes)?;
+    assert_eq!(sixty_four - one, 63 * persistent_stream_bytes(10)?);
+    Ok(())
+}
+
+#[test]
+fn expanded_stream_accounting_rejects_the_former_single_book_ceiling() -> TestResult {
+    let routes = [route(INSTRUMENT_ONE, 10, 8)?];
+    let mut one = input()?;
+    one.maximum_sources_per_route = 1;
+    one.maximum_streams_per_route = 1;
+    let former_ceiling = estimate(one, &routes)?;
+
+    let mut expanded = input()?;
+    expanded.maximum_sources_per_route = 1;
+    expanded.maximum_streams_per_route = 64;
+    expanded.maximum_runtime_bytes = former_ceiling;
+    let expanded = LiveRuntimeConfig::try_new(expanded)?;
+    let expected = former_ceiling + 63 * persistent_stream_bytes(10)?;
+    assert!(matches!(
+        estimate_peak_bytes(&expanded, &routes),
+        Err(LiveRuntimeConfigError::PeakMemoryExceedsCeiling {
+            estimated,
+            ceiling,
+        }) if estimated == expected && ceiling == former_ceiling
+    ));
     Ok(())
 }
 
 #[test]
 fn one_more_shard_charges_mailbox_candidate_control_snapshot_and_actor() -> TestResult {
     let route = route(INSTRUMENT_ONE, 4, 8)?;
-    let base = estimate(input()?, std::slice::from_ref(&route))?;
-    let mut three_shards = input()?;
+    let mut base_input = input()?;
+    base_input.maximum_retained_snapshot_readers = 3;
+    let mut three_shards = base_input.clone();
+    let base = estimate(base_input, std::slice::from_ref(&route))?;
     three_shards.shard_count = 3;
     let three_shards = estimate(three_shards, &[route])?;
 

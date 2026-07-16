@@ -102,7 +102,6 @@ impl LiveApplyError {
             | Self::InvalidSnapshotLimits
             | Self::SnapshotRetainedSizeOverflow
             | Self::Allocation
-            | Self::StreamCapacityExhausted
             | Self::GenerationCapacityExhausted
             | Self::StatusCapacityExhausted
             | Self::StatusRevisionExhausted
@@ -112,6 +111,7 @@ impl LiveApplyError {
             | Self::StateRevisionConflict
             | Self::CandidateEventAlreadyBuilt => true,
             Self::InstrumentMismatch
+            | Self::StreamCapacityExhausted
             | Self::VenueMismatch
             | Self::BindingMismatch
             | Self::StatusGenerationMismatch

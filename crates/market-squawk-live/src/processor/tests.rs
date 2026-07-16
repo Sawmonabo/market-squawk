@@ -48,12 +48,27 @@ fn processor_with_lifetime(
     ShardLeaseOwner,
     RuntimeLeaseOwner,
 )> {
+    processor_with_capacities(clock, 8, 8, nonce_capacity, maximum_capability_lifetime)
+}
+
+fn processor_with_capacities(
+    clock: ScriptedTrustedClock,
+    max_streams: usize,
+    max_sources: usize,
+    nonce_capacity: usize,
+    maximum_capability_lifetime: Duration,
+) -> TestResult<(
+    InstrumentLiveProcessor<ScriptedTrustedClock>,
+    ShardLeaseOwner,
+    RuntimeLeaseOwner,
+)> {
     let shard = ShardLeaseOwner::new(11);
     let runtime = RuntimeLeaseOwner::new(13);
     let processor = InstrumentLiveProcessor::try_new(
         definition()?,
         DepthLimit::new(4)?,
-        8,
+        max_streams,
+        max_sources,
         nonce_capacity,
         1,
         maximum_capability_lifetime,
@@ -61,6 +76,101 @@ fn processor_with_lifetime(
         clock,
     )?;
     Ok((processor, shard, runtime))
+}
+
+#[test]
+fn rejected_new_stream_does_not_consume_source_generation_capacity() -> TestResult {
+    let mut first = SourceHarness::try_new("source-a", 1)?;
+    let mut second = SourceHarness::try_new("source-b", 1)?;
+    let (first_lease, first_batch) = first.batch("trade-a", 1, trade()?, non_book_snapshot()?)?;
+    let (second_lease, second_batch) =
+        second.batch("trade-b", 1, trade()?, non_book_snapshot()?)?;
+    let mut registry = GenerationAuthorityRegistry::try_new(2)?;
+    let first_admission =
+        registry.bind_current(&first_lease, Timestamp::from_unix_nanos(EVALUATED_AT))?;
+    let second_admission =
+        registry.bind_current(&second_lease, Timestamp::from_unix_nanos(EVALUATED_AT))?;
+    let (mut processor, _shard, _runtime) =
+        processor_with_capacities(fixed_clock()?, 1, 2, 4, Duration::from_nanos(100_000))?;
+
+    let _ = apply_one(&mut processor, &first_admission, first_batch)?;
+    let mut rejected = processor.accept_batch(second_batch, &second_admission)?;
+    assert!(matches!(
+        processor.apply_next(&mut rejected),
+        Err(LiveApplyError::StreamCapacityExhausted)
+    ));
+    assert_eq!(processor.streams.len(), 1);
+    assert_eq!(processor.source_generations.len(), 1);
+    assert!(
+        processor
+            .source_generations
+            .contains_key(first_lease.binding().source_id())
+    );
+    assert!(
+        !processor
+            .source_generations
+            .contains_key(second_lease.binding().source_id())
+    );
+    Ok(())
+}
+
+#[test]
+fn failed_generation_replacement_preserves_the_former_processor_state() -> TestResult {
+    let base_mono = Instant::now();
+    let current = ClockReading::new(Timestamp::from_unix_nanos(EVALUATED_AT), base_mono);
+    let expired = ClockReading::new(
+        Timestamp::from_unix_nanos(VALID_UNTIL + 1),
+        base_mono
+            .checked_add(Duration::from_nanos(u64::try_from(
+                VALID_UNTIL - EVALUATED_AT + 1,
+            )?))
+            .ok_or("expired instant overflow")?,
+    );
+    let clock = ScriptedTrustedClock::try_new(vec![
+        current, current, current, current, current, current, expired,
+    ])?;
+    let mut source = SourceHarness::try_new("source-a", 1)?;
+    let (first_lease, first_batch) = source.batch("trade-1", 1, trade()?, non_book_snapshot()?)?;
+    let mut registry = GenerationAuthorityRegistry::try_new(1)?;
+    let first_admission =
+        registry.bind_current(&first_lease, Timestamp::from_unix_nanos(EVALUATED_AT))?;
+    let (mut processor, _shard, _runtime) = processor(clock, 4)?;
+    let _ = apply_one(&mut processor, &first_admission, first_batch)?;
+
+    let mut source = source.rollover(2, HEALTH_AT + 1)?;
+    let (second_lease, second_batch) =
+        source.batch("trade-2", 2, trade()?, non_book_snapshot()?)?;
+    let second_admission =
+        registry.bind_current(&second_lease, Timestamp::from_unix_nanos(EVALUATED_AT))?;
+    let stream_key = processor
+        .streams
+        .keys()
+        .next()
+        .ok_or("missing former stream")?
+        .clone();
+    let former_revision = processor
+        .streams
+        .get(&stream_key)
+        .ok_or("missing former stream")?
+        .revision();
+    let mut replacement = processor.accept_batch(second_batch, &second_admission)?;
+
+    assert!(processor.apply_next(&mut replacement).is_err());
+    assert_eq!(processor.streams.len(), 1);
+    let retained = processor
+        .streams
+        .get(&stream_key)
+        .ok_or("former stream was removed by failed replacement")?;
+    assert_eq!(retained.connection_generation().get(), 1);
+    assert_eq!(retained.revision(), former_revision);
+    assert_eq!(
+        processor
+            .source_generations
+            .get(first_lease.binding().source_id())
+            .map(|value| value.get()),
+        Some(1)
+    );
+    Ok(())
 }
 
 fn apply_one(

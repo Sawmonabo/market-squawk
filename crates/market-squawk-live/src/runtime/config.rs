@@ -7,6 +7,7 @@ use std::time::Duration;
 use market_squawk_domain::InstrumentDefinition;
 use thiserror::Error;
 
+use crate::processor::MAX_STREAMS_PER_INSTRUMENT;
 use crate::{
     DepthLimit, ShardCount, ShardKey, ShardRouter, ShardRoutingVersion, SnapshotLimits,
     SnapshotLimitsError,
@@ -31,6 +32,8 @@ pub struct LiveRuntimeConfigInput {
     pub maximum_message_bytes: u32,
     pub maximum_routes_per_shard: usize,
     pub maximum_sources_per_route: usize,
+    /// Maximum independently keyed source/product/channel streams retained by one route owner.
+    pub maximum_streams_per_route: usize,
     pub registration_control_capacity: usize,
     pub registration_deadline: Duration,
     pub health_event_capacity: usize,
@@ -53,6 +56,7 @@ pub struct LiveRuntimeConfig {
     maximum_message_bytes: NonZeroU32,
     maximum_routes_per_shard: NonZeroUsize,
     maximum_sources_per_route: NonZeroUsize,
+    maximum_streams_per_route: NonZeroUsize,
     registration_control_capacity: NonZeroUsize,
     registration_deadline: Duration,
     health_event_capacity: NonZeroUsize,
@@ -92,6 +96,28 @@ impl LiveRuntimeConfig {
             "maximum_retained_snapshot_readers",
             input.maximum_retained_snapshot_readers,
         )?;
+        if maximum_retained_snapshot_readers.get() < u32::from(shard_count.get()) {
+            return Err(LiveRuntimeConfigError::SnapshotReadersBelowShardCount {
+                readers: maximum_retained_snapshot_readers.get(),
+                shards: shard_count.get(),
+            });
+        }
+        let maximum_sources_per_route = checked_usize(
+            "maximum_sources_per_route",
+            input.maximum_sources_per_route,
+            MAX_SOURCES_PER_ROUTE,
+        )?;
+        let maximum_streams_per_route = checked_usize(
+            "maximum_streams_per_route",
+            input.maximum_streams_per_route,
+            MAX_STREAMS_PER_INSTRUMENT,
+        )?;
+        if maximum_sources_per_route > maximum_streams_per_route {
+            return Err(LiveRuntimeConfigError::SourcesExceedStreams {
+                sources: maximum_sources_per_route.get(),
+                streams: maximum_streams_per_route.get(),
+            });
+        }
         let config = Self {
             routing_version: input.routing_version,
             shard_count,
@@ -103,11 +129,8 @@ impl LiveRuntimeConfig {
                 input.maximum_routes_per_shard,
                 MAX_ROUTES_PER_SHARD,
             )?,
-            maximum_sources_per_route: checked_usize(
-                "maximum_sources_per_route",
-                input.maximum_sources_per_route,
-                MAX_SOURCES_PER_ROUTE,
-            )?,
+            maximum_sources_per_route,
+            maximum_streams_per_route,
             registration_control_capacity: checked_usize(
                 "registration_control_capacity",
                 input.registration_control_capacity,
@@ -205,6 +228,9 @@ impl LiveRuntimeConfig {
     }
     pub const fn maximum_sources_per_route(&self) -> NonZeroUsize {
         self.maximum_sources_per_route
+    }
+    pub const fn maximum_streams_per_route(&self) -> NonZeroUsize {
+        self.maximum_streams_per_route
     }
     pub const fn registration_control_capacity(&self) -> NonZeroUsize {
         self.registration_control_capacity
@@ -386,6 +412,10 @@ pub enum LiveRuntimeConfigError {
     },
     #[error("maximum message bytes {message} exceeds mailbox bytes {mailbox}")]
     MessageExceedsMailbox { message: u32, mailbox: u32 },
+    #[error("maximum sources per route {sources} exceeds maximum streams per route {streams}")]
+    SourcesExceedStreams { sources: usize, streams: usize },
+    #[error("maximum retained snapshot readers {readers} is below configured shard count {shards}")]
+    SnapshotReadersBelowShardCount { readers: u32, shards: u16 },
     #[error("route instrument differs from its instrument definition")]
     RouteInstrumentMismatch,
     #[error("route venue is absent from its instrument definition")]
@@ -423,6 +453,7 @@ mod tests {
             maximum_message_bytes: 262_144,
             maximum_routes_per_shard: 8,
             maximum_sources_per_route: 8,
+            maximum_streams_per_route: 8,
             registration_control_capacity: 8,
             registration_deadline: Duration::from_secs(1),
             health_event_capacity: 64,
@@ -441,6 +472,7 @@ mod tests {
         assert_eq!(config.shard_count().get(), 2);
         assert_eq!(config.mailbox_bytes_per_shard().get(), 1_048_576);
         assert_eq!(config.maximum_message_bytes().get(), 262_144);
+        assert_eq!(config.maximum_streams_per_route().get(), 8);
         assert_eq!(config.maximum_runtime_bytes().get(), 256 * 1024 * 1024);
         Ok(())
     }
@@ -466,6 +498,43 @@ mod tests {
         let mut input = valid_input()?;
         input.maximum_message_bytes = input.mailbox_bytes_per_shard + 1;
         assert!(LiveRuntimeConfig::try_new(input).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn every_admitted_source_has_capacity_for_at_least_one_stream()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut input = valid_input()?;
+        input.maximum_sources_per_route = 3;
+        input.maximum_streams_per_route = 2;
+        assert!(matches!(
+            LiveRuntimeConfig::try_new(input),
+            Err(crate::LiveRuntimeConfigError::SourcesExceedStreams {
+                sources: 3,
+                streams: 2,
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn aggregate_snapshot_reader_budget_covers_every_shard_exactly()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let exact = LiveRuntimeConfig::try_new(valid_input()?)?;
+        assert_eq!(exact.shard_count().get(), 2);
+        assert_eq!(exact.maximum_retained_snapshot_readers().get(), 4);
+
+        let mut below = valid_input()?;
+        below.maximum_retained_snapshot_readers = 1;
+        assert!(matches!(
+            LiveRuntimeConfig::try_new(below),
+            Err(
+                crate::LiveRuntimeConfigError::SnapshotReadersBelowShardCount {
+                    readers: 1,
+                    shards: 2,
+                }
+            )
+        ));
         Ok(())
     }
 }

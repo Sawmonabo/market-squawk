@@ -3,14 +3,30 @@
 use std::mem::size_of;
 use std::num::NonZeroU64;
 
-use market_squawk_domain::BookLevel;
+use market_squawk_domain::{BookLevel, SourceId, SourceIdentifier, VenueId};
+use market_squawk_sources::ProviderBookLevel;
 
 use super::{LiveRouteConfig, LiveRuntimeConfig, LiveRuntimeConfigError};
 
 const ROUTE_FIXED_BYTES: u64 = 32 * 1024;
-const SOURCE_STREAM_BYTES: u64 = 8 * 1024;
+/// Admission and generation-registry ownership per distinct source.
+const SOURCE_ADMISSION_BYTES: u64 = 8 * 1024;
 const NONCE_SLOT_BYTES: u64 = 192;
-const BOOK_LEVEL_BYTES: u64 = size_of::<BookLevel>() as u64 + 64;
+/// Allocator and tree-node overhead added to one scaled price/quantity level.
+const SCALED_BOOK_LEVEL_BYTES: u64 = size_of::<BookLevel>() as u64 + 64;
+/// One exact provider level, two conservatively bounded lexeme allocations, and tree node.
+///
+/// `SourceIdentifier::MAX_LENGTH` is larger than the decoder's decimal-lexeme cap, so this charge
+/// remains conservative without coupling the live crate to a private parser constant.
+const EXACT_BOOK_LEVEL_BYTES: u64 =
+    size_of::<ProviderBookLevel>() as u64 + (2 * SourceIdentifier::MAX_LENGTH) as u64 + 64;
+/// Heap-owned authority cells and allocator slack retained by one stream/status allocation.
+const STREAM_AUTHORITY_ALLOCATION_BYTES: u64 = 4 * 1024;
+/// Maximum owned text behind source, venue, product, and channel identities in a stream key.
+const STREAM_KEY_ALLOCATION_BYTES: u64 =
+    (SourceId::MAX_LENGTH + VenueId::MAX_LENGTH + 2 * SourceIdentifier::MAX_LENGTH) as u64;
+/// Hash-table node/slack for a stream entry and its status entry.
+const STREAM_MAP_ALLOCATION_BYTES: u64 = 2 * 128;
 const ACTOR_FIXED_BYTES: u64 = 64 * 1024;
 const CHANNEL_COMMAND_SLOT_BYTES: u64 = 128;
 const CONTROL_SLOT_BYTES: u64 = 256;
@@ -36,11 +52,16 @@ pub(super) fn estimate_peak_bytes(
             total,
             multiply(
                 config.maximum_sources_per_route().get() as u64,
-                SOURCE_STREAM_BYTES,
+                SOURCE_ADMISSION_BYTES,
             )?,
         )?;
-        let levels = multiply(route.depth().get() as u64, 2)?;
-        total = add(total, multiply(levels, BOOK_LEVEL_BYTES)?)?;
+        total = add(
+            total,
+            multiply(
+                config.maximum_streams_per_route().get() as u64,
+                persistent_stream_bytes(route.depth().get())?,
+            )?,
+        )?;
     }
 
     let mailbox_per_shard = add(
@@ -93,6 +114,24 @@ pub(super) fn estimate_peak_bytes(
         });
     }
     NonZeroU64::new(total).ok_or(LiveRuntimeConfigError::CapacityOverflow)
+}
+
+fn persistent_stream_bytes(depth: usize) -> Result<u64, LiveRuntimeConfigError> {
+    let levels = multiply(depth as u64, 2)?;
+    let dual_book_level = add(SCALED_BOOK_LEVEL_BYTES, EXACT_BOOK_LEVEL_BYTES)?;
+    let book_bytes = multiply(levels, dual_book_level)?;
+    let inline = u64::try_from(crate::processor::persistent_stream_inline_bytes())
+        .map_err(|_| LiveRuntimeConfigError::CapacityOverflow)?;
+    // Charge owned identity text separately even though the inline String handles are already in
+    // the structural size; this represents their maximum heap allocation, not duplicate objects.
+    // The inline `size_of` keeps any future sequence/checksum/provenance growth in the model.
+    add(
+        add(
+            add(inline, STREAM_KEY_ALLOCATION_BYTES)?,
+            STREAM_MAP_ALLOCATION_BYTES,
+        )?,
+        add(STREAM_AUTHORITY_ALLOCATION_BYTES, book_bytes)?,
+    )
 }
 
 fn add(left: u64, right: u64) -> Result<u64, LiveRuntimeConfigError> {
