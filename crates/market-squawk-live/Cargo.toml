@@ -9,12 +9,16 @@ repository = "https://github.com/Sawmonabo/market-squawk"
 publish = false
 
 [dependencies]
+arc-swap.workspace = true
 crc32fast.workspace = true
 market-squawk-domain = { path = "../market-squawk-domain" }
 market-squawk-sources = { path = "../market-squawk-sources" }
 rust_decimal.workspace = true
+serde.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

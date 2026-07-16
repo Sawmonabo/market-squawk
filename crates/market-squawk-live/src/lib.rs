@@ -7,6 +7,9 @@ mod normalization;
 mod processor;
 mod provider_book;
 mod qualification;
+mod runtime;
+mod sharding;
+mod snapshot;
 mod state;
 
 pub use authority::{AuthorityError, ConsumedLiveAuthority, LiveExecutionCapability};
@@ -18,4 +21,12 @@ pub use integrity::{
 pub use normalization::{
     NormalizationError, normalize_delta_quantity, normalize_positive_quantity, normalize_price,
 };
+pub use runtime::{
+    LiveRouteConfig, LiveRouteConfigInput, LiveRuntimeConfig, LiveRuntimeConfigError,
+    LiveRuntimeConfigInput,
+};
+pub use sharding::{
+    ShardCount, ShardId, ShardKey, ShardRouter, ShardRoutingError, ShardRoutingVersion,
+};
+pub use snapshot::{SnapshotLimits, SnapshotLimitsError};
 pub use state::{GenerationPhase, GenerationStateError, GenerationStateMachine};
