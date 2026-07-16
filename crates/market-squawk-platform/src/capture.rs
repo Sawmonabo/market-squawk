@@ -97,6 +97,53 @@ struct GenerationCaptureState<B: CaptureAuthorityBundle> {
     accepting: AtomicBool,
 }
 
+#[derive(Debug, Default)]
+struct CaptureCompletionAccounting {
+    records_written: u64,
+    revoked: bool,
+    records_written_at_revocation: u64,
+    late_records_written: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CaptureCompletionSnapshot {
+    records_written: u64,
+    records_written_at_revocation: u64,
+    late_records_written: u64,
+}
+
+impl CaptureCompletionAccounting {
+    fn record_completed_append(&mut self) -> Option<u64> {
+        let next = self.records_written.checked_add(1)?;
+        let next_late = if self.revoked {
+            Some(self.late_records_written.checked_add(1)?)
+        } else {
+            None
+        };
+        self.records_written = next;
+        if let Some(next_late) = next_late {
+            self.late_records_written = next_late;
+        }
+        Some(next)
+    }
+
+    fn revoke(&mut self) -> CaptureCompletionSnapshot {
+        if !self.revoked {
+            self.revoked = true;
+            self.records_written_at_revocation = self.records_written;
+        }
+        self.snapshot()
+    }
+
+    const fn snapshot(&self) -> CaptureCompletionSnapshot {
+        CaptureCompletionSnapshot {
+            records_written: self.records_written,
+            records_written_at_revocation: self.records_written_at_revocation,
+            late_records_written: self.late_records_written,
+        }
+    }
+}
+
 impl<B: CaptureAuthorityBundle> GenerationCaptureState<B> {
     fn new(
         identity: CaptureAuthorityIdentity,
@@ -121,7 +168,7 @@ struct CaptureState<B: CaptureAuthorityBundle> {
     active: ArcSwap<GenerationCaptureState<B>>,
     lifecycle_transition: std::sync::Mutex<()>,
     writer_lifecycle: AtomicU8,
-    records_written: AtomicU64,
+    completion_accounting: std::sync::Mutex<CaptureCompletionAccounting>,
     health_sender: mpsc::SyncSender<CaptureHealthEvent>,
     health_receiver: std::sync::Mutex<mpsc::Receiver<CaptureHealthEvent>>,
     dropped_health_events: AtomicU64,
@@ -190,10 +237,35 @@ impl<B: CaptureAuthorityBundle> CaptureState<B> {
         }
     }
 
-    fn increment_written(&self, current: u64) -> Option<u64> {
-        let next = current.checked_add(1)?;
-        self.records_written.store(next, Ordering::Release);
-        Some(next)
+    fn record_completed_append(&self) -> Option<u64> {
+        let mut accounting = match self.completion_accounting.lock() {
+            Ok(accounting) => accounting,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        accounting.record_completed_append()
+    }
+
+    fn revoke_writer_for_shutdown(&self, reason: CaptureHealthReason) -> CaptureCompletionSnapshot {
+        let mut accounting = match self.completion_accounting.lock() {
+            Ok(accounting) => accounting,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let _transition = match self.lifecycle_transition.lock() {
+            Ok(transition) => transition,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        self.mark_current_incomplete(reason);
+        self.writer_lifecycle
+            .store(WRITER_STOPPED, Ordering::Release);
+        accounting.revoke()
+    }
+
+    fn completion_snapshot(&self) -> CaptureCompletionSnapshot {
+        let accounting = match self.completion_accounting.lock() {
+            Ok(accounting) => accounting,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        accounting.snapshot()
     }
 
     fn try_reserve_queue_bytes(self: &Arc<Self>, bytes: usize) -> Option<QueueByteReservation<B>> {
@@ -566,7 +638,7 @@ pub fn raw_capture_channel<B: CaptureAuthorityBundle>(
         )),
         lifecycle_transition: std::sync::Mutex::new(()),
         writer_lifecycle: AtomicU8::new(WRITER_NOT_STARTED),
-        records_written: AtomicU64::new(0),
+        completion_accounting: std::sync::Mutex::new(CaptureCompletionAccounting::default()),
         health_sender,
         health_receiver: std::sync::Mutex::new(health_receiver),
         dropped_health_events: AtomicU64::new(0),
@@ -602,21 +674,68 @@ pub use diagnostic::{
 };
 pub use policy::{CaptureWriterPolicy, CaptureWriterPolicyError};
 pub use writer::{
-    CaptureDestination, CaptureDestinationError, CaptureShutdown, CaptureSink, CaptureSinkError,
-    CaptureStorageErrorClass, CaptureWriterHandle, CaptureWriterOutcome, CaptureWriterSpawnError,
-    MemoryCaptureSink, spawn_capture_writer,
+    CaptureDestination, CaptureDestinationError, CaptureIoContext, CaptureShutdownStatus,
+    CaptureSink, CaptureSinkError, CaptureStorageErrorClass, CaptureWorkerReapError,
+    CaptureWorkerTermination, CaptureWriterHandle, CaptureWriterOutcome, CaptureWriterSpawnError,
+    MemoryCaptureSink, PendingCaptureWriter, spawn_capture_writer,
 };
 
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Barrier};
 
-    use super::saturating_atomic_increment;
+    use super::{CaptureCompletionAccounting, saturating_atomic_increment};
 
     #[test]
     fn diagnostic_counter_increment_saturates_at_the_numeric_limit() {
         let counter = AtomicU64::new(u64::MAX);
         saturating_atomic_increment(&counter);
         assert_eq!(counter.load(Ordering::Acquire), u64::MAX);
+    }
+
+    #[test]
+    fn revocation_linearizes_before_accounting_commit_after_sink_success()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let accounting = Arc::new(std::sync::Mutex::new(CaptureCompletionAccounting::default()));
+        let sink_succeeded = Arc::new(Barrier::new(2));
+        let accounting_allowed = Arc::new(Barrier::new(2));
+        let worker_accounting = Arc::clone(&accounting);
+        let worker_sink_succeeded = Arc::clone(&sink_succeeded);
+        let worker_accounting_allowed = Arc::clone(&accounting_allowed);
+        let worker = std::thread::spawn(move || {
+            // The sink operation has returned success, but its completion is not authoritative
+            // until it acquires the accounting lock and commits below.
+            worker_sink_succeeded.wait();
+            worker_accounting_allowed.wait();
+            let mut accounting = match worker_accounting.lock() {
+                Ok(accounting) => accounting,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            accounting.record_completed_append()
+        });
+
+        sink_succeeded.wait();
+        let at_revocation = {
+            let mut accounting = match accounting.lock() {
+                Ok(accounting) => accounting,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            accounting.revoke()
+        };
+        accounting_allowed.wait();
+        let committed = worker
+            .join()
+            .map_err(|_panic| "completion-accounting worker panicked")?;
+        let final_snapshot = match accounting.lock() {
+            Ok(accounting) => accounting.snapshot(),
+            Err(poisoned) => poisoned.into_inner().snapshot(),
+        };
+
+        assert_eq!(committed, Some(1));
+        assert_eq!(at_revocation.records_written_at_revocation, 0);
+        assert_eq!(final_snapshot.records_written, 1);
+        assert_eq!(final_snapshot.late_records_written, 1);
+        Ok(())
     }
 }

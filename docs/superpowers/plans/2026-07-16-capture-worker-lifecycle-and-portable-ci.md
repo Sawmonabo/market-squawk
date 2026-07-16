@@ -4,7 +4,7 @@
 
 **Goal:** Make capture shutdown revoke authority at its deadline without claiming a blocked OS writer terminated, retain a reapable owner and two-party destination fence until join, persist late-write accounting, and add immutable-action cross-platform CI coverage.
 
-**Architecture:** `CaptureWriterHandle::shutdown` synchronously consumes the handle and returns a `PendingCaptureWriter`; borrowing async waits report deadline versus observed thread exit, while `try_reap` joins only after `JoinHandle::is_finished`. A process-wide weak registry is held by separate worker and owner guards, so a destination is not reusable until both worker exit and owner join. The application handles pending ownership as typed state, and CI policy is enforced locally by Python tests.
+**Architecture:** `CaptureWriterHandle::shutdown` synchronously consumes the handle and returns a `PendingCaptureWriter`; borrowing async waits report deadline versus observed thread exit, while `try_reap` joins only after [`JoinHandle::is_finished`](https://doc.rust-lang.org/1.97.0/std/thread/struct.JoinHandle.html#method.is_finished) reports true, making join expected to return quickly without promising a hard real-time bound. A process-wide weak registry is held by separate worker and owner guards, so a destination is not reusable until both worker exit and owner join. The application handles pending ownership as typed state, and CI policy is enforced locally by Python tests.
 
 **Tech Stack:** Rust 1.97, Tokio, standard OS threads and synchronization, SHA-256 destination identities, GitHub Actions, Python `unittest`.
 

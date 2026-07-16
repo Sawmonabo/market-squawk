@@ -28,11 +28,11 @@ platform path, journal, and capture suites.
 ### Approved: deadline revocation plus an explicitly owned pending worker
 
 The writer remains a dedicated OS thread. At shutdown, capture authority is revoked synchronously
-and queued reservations are released. If the worker finishes before the deadline, shutdown returns
-a terminated report. If it is still inside append or flush, shutdown returns a `PendingCaptureWriter`
-that owns the thread join handle, completion channel, and deadline snapshot. The pending owner can be
-queried, nonblockingly polled, or asynchronously reaped. Its `Drop` joins synchronously as fail-closed
-misuse behavior; it never spawns a hidden background reaper and never silently detaches the worker.
+and queued reservations are released at the deadline. Shutdown always returns a
+`PendingCaptureWriter` that owns the thread join handle, completion channel, and deadline snapshot;
+borrowing async waits distinguish an observed worker exit from deadline expiry. Its `Drop` joins
+synchronously as fail-closed misuse behavior; it never spawns a hidden background reaper and never
+silently detaches the worker.
 
 The worker and lifecycle owner each hold one strong side of an exact, process-wide, weak-registry
 destination lease. The worker side remains held until thread exit. The owner side remains held until
@@ -73,8 +73,10 @@ handle, revokes authority, requests bounded cooperative shutdown, and returns a
 
 After `WorkerTerminated`, `try_reap(&mut self)` performs `JoinHandle::join`, persists and returns
 `CaptureWorkerTermination`, and releases the owner half of the destination fence. `try_reap` refuses
-to join while `is_finished()` is false. This makes every join executed from the async application
-path nonblocking by construction.
+to join while `is_finished()` is false. Rust 1.97 documents that a true
+[`JoinHandle::is_finished`](https://doc.rust-lang.org/1.97.0/std/thread/struct.JoinHandle.html#method.is_finished)
+means the associated thread has finished its main function, so the subsequent join is expected to
+return quickly; this is not presented as a hard real-time nonblocking guarantee.
 
 `CaptureWorkerTermination` records:
 
@@ -116,20 +118,27 @@ exists. Tests and CLI composition explicitly reap or return that owner.
 
 ## Destination fencing
 
-Every `CaptureSink` publishes a stable `CaptureDestination` identity before its worker starts.
-`JournalWriter` derives it from its confined journal path using a domain-separated SHA-256 digest;
-test and alternative sinks use an explicit bounded destination label. The digest prevents path or
-label content from appearing in public debug output.
+Every `CaptureSink` publishes a stable, collision-resistant `CaptureDestination` identity for its
+underlying physical endpoint before its worker starts. Every handle in the process that can reach
+the same storage must return the same identity; per-instance or random aliases are forbidden for
+shared alternative storage. `JournalWriter` derives the identity from its prepared canonical root
+using a domain-separated SHA-256 digest, while test and alternative sinks use an explicit bounded
+destination label. The digest prevents path or label content from appearing in public debug output.
 
 A process-local registry atomically acquires one weak/reclaimable entry per destination during
 `spawn_capture_writer`. Two strong guards are created: one moves into the writer thread and one into
 the `CaptureWriterHandle`, then into `PendingCaptureWriter` at shutdown. The worker guard is released
 only on thread exit. The owner guard is released only after the thread was joined and its final
-outcome persisted. The registry removes dead weak entries opportunistically. A spawn attempt for an
-already upgraded destination entry returns a typed `DestinationBusy` error. The existing
+outcome persisted. The last lease drop removes its exact weak entry with a pointer check, and the
+registry has an explicit capacity bound. A spawn attempt for a still-strong destination entry
+returns a typed `DestinationBusy` error without upgrading a weak pointer while holding the registry
+mutex. The existing
 per-allocation lifecycle atomic independently prevents a second writer for the same
 `RawCaptureWriter` allocation. Journal file locking remains an additional OS-level fence and is
-tested through late completion and reap.
+tested through late completion and reap. The process-local registry is not cross-process exclusion:
+custom sinks shared across processes must provide their own operating-system or storage-level
+ownership primitive. The prepared journal's exclusive file lock supplies that separate protection
+for `JournalWriter`.
 
 The destination identity is part of the sink contract, so independent constructors cannot omit the
 fence. Test-only convenience sinks receive unique destinations by default and can be constructed
@@ -176,8 +185,8 @@ The TDD sequence begins with failing integration tests for:
 6. a successor remaining rejected after `is_finished()` becomes true but before `try_reap` joins the
    worker and releases the owner fence;
 7. queue-byte reservations being released at deadline;
-8. a journal destination/file lock remaining unavailable until the old worker is reaped, then being
-   reusable; and
+8. a journal's OS file lock releasing on worker exit while its in-process destination remains busy
+   until the finished owner is explicitly reaped, then being reusable; and
 9. drop behavior joining rather than silently detaching.
 
 Existing capture authority, writer failure, rotation, source-supervisor, and journal compatibility

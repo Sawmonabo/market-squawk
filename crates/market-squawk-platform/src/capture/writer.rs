@@ -20,6 +20,7 @@ use super::{
 };
 
 const MAX_CAPTURE_DESTINATION_LABEL_BYTES: usize = 1_024;
+const MAX_ACTIVE_CAPTURE_DESTINATIONS: usize = 1_024;
 const CAPTURE_DESTINATION_DOMAIN: &[u8] = b"MSQKCAPTUREDESTINATION\x01";
 
 /// Redacted exact identity for one capture storage destination.
@@ -28,6 +29,12 @@ pub struct CaptureDestination([u8; 32]);
 
 impl CaptureDestination {
     /// Constructs a destination from one bounded non-secret alternative-sink label.
+    ///
+    /// Every handle for the same underlying physical endpoint in this process must use the same
+    /// stable, collision-resistant label. Per-instance or random aliases are valid only for truly
+    /// independent storage. This identity provides no cross-process exclusion; custom sinks shared
+    /// by multiple processes must also enforce an operating-system or storage-level ownership
+    /// primitive.
     ///
     /// # Errors
     ///
@@ -95,32 +102,145 @@ pub enum CaptureDestinationError {
 }
 
 #[derive(Debug)]
-struct CaptureDestinationLease;
+struct CaptureDestinationLease {
+    destination: CaptureDestination,
+}
 
-static CAPTURE_DESTINATION_FENCES: OnceLock<
-    std::sync::Mutex<HashMap<CaptureDestination, Weak<CaptureDestinationLease>>>,
-> = OnceLock::new();
+impl Drop for CaptureDestinationLease {
+    fn drop(&mut self) {
+        let Some(registry) = CAPTURE_DESTINATION_FENCES.get() else {
+            return;
+        };
+        let mut registry = match registry.lock() {
+            Ok(registry) => registry,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        registry.remove_if_matches(&self.destination, self as *const Self);
+    }
+}
+
+#[derive(Debug, Default)]
+struct CaptureDestinationFenceRegistry {
+    leases: HashMap<CaptureDestination, Weak<CaptureDestinationLease>>,
+}
+
+impl CaptureDestinationFenceRegistry {
+    fn try_acquire(
+        &mut self,
+        destination: &CaptureDestination,
+    ) -> Result<
+        (Arc<CaptureDestinationLease>, Arc<CaptureDestinationLease>),
+        CaptureDestinationFenceError,
+    > {
+        if self
+            .leases
+            .get(destination)
+            .is_some_and(|lease| lease.strong_count() > 0)
+        {
+            return Err(CaptureDestinationFenceError::Busy);
+        }
+        self.leases.remove(destination);
+        if self.leases.len() >= MAX_ACTIVE_CAPTURE_DESTINATIONS {
+            return Err(CaptureDestinationFenceError::Capacity);
+        }
+        let lease = Arc::new(CaptureDestinationLease {
+            destination: destination.clone(),
+        });
+        self.leases
+            .insert(destination.clone(), Arc::downgrade(&lease));
+        Ok((Arc::clone(&lease), lease))
+    }
+
+    fn remove_if_matches(
+        &mut self,
+        destination: &CaptureDestination,
+        lease: *const CaptureDestinationLease,
+    ) {
+        if self
+            .leases
+            .get(destination)
+            .is_some_and(|retained| std::ptr::eq(retained.as_ptr(), lease))
+        {
+            self.leases.remove(destination);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CaptureDestinationFenceError {
+    Busy,
+    Capacity,
+}
+
+static CAPTURE_DESTINATION_FENCES: OnceLock<std::sync::Mutex<CaptureDestinationFenceRegistry>> =
+    OnceLock::new();
 
 fn acquire_destination_fence(
     destination: &CaptureDestination,
-) -> Option<(Arc<CaptureDestinationLease>, Arc<CaptureDestinationLease>)> {
-    let registry = CAPTURE_DESTINATION_FENCES.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+) -> Result<
+    (Arc<CaptureDestinationLease>, Arc<CaptureDestinationLease>),
+    CaptureDestinationFenceError,
+> {
+    let registry = CAPTURE_DESTINATION_FENCES
+        .get_or_init(|| std::sync::Mutex::new(CaptureDestinationFenceRegistry::default()));
     let mut registry = match registry.lock() {
         Ok(registry) => registry,
         Err(poisoned) => poisoned.into_inner(),
     };
-    registry.retain(|_destination, lease| lease.strong_count() > 0);
-    if registry.get(destination).and_then(Weak::upgrade).is_some() {
-        return None;
+    registry.try_acquire(destination)
+}
+
+/// Cooperative capture-I/O shutdown observation.
+///
+/// A successful checkpoint permits entering the next bounded sink operation. It does not prove an
+/// already-running operating-system call was cancelled or completed.
+#[derive(Clone, Debug)]
+pub struct CaptureIoContext {
+    shutdown_requested: Arc<AtomicBool>,
+    shutdown_deadline: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+}
+
+impl CaptureIoContext {
+    fn new(
+        shutdown_requested: Arc<AtomicBool>,
+        shutdown_deadline: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+    ) -> Self {
+        Self {
+            shutdown_requested,
+            shutdown_deadline,
+        }
     }
-    let lease = Arc::new(CaptureDestinationLease);
-    registry.insert(destination.clone(), Arc::downgrade(&lease));
-    Some((Arc::clone(&lease), lease))
+
+    /// Fails when the configured shutdown deadline has elapsed.
+    ///
+    /// This is an operation-boundary check only. It never cancels a call already inside the sink.
+    pub fn checkpoint(&self) -> Result<(), CaptureSinkError> {
+        if self.deadline_reached() {
+            Err(CaptureSinkError::ShutdownDeadline)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn shutdown_requested(&self) -> bool {
+        self.shutdown_requested.load(Ordering::Acquire)
+    }
+
+    fn deadline_reached(&self) -> bool {
+        let deadline = match self.shutdown_deadline.lock() {
+            Ok(deadline) => *deadline,
+            Err(poisoned) => *poisoned.into_inner(),
+        };
+        deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
+    }
 }
 
 /// Typed storage failure returned to the supervised capture writer.
 #[derive(Debug, Error)]
 pub enum CaptureSinkError {
+    /// Cooperative shutdown reached its deadline at an operation boundary.
+    #[error("capture shutdown deadline reached")]
+    ShutdownDeadline,
     /// Journal storage rejected a record or flush.
     #[error(transparent)]
     Journal(#[from] JournalError),
@@ -154,12 +274,25 @@ pub enum CaptureStorageErrorClass {
 
 /// Synchronous diagnostic storage contract consumed only by the background writer.
 pub trait CaptureSink: fmt::Debug + Send + 'static {
-    /// Returns the exact process-local destination fence identity.
+    /// Returns the mandatory stable identity of the underlying physical storage endpoint.
+    ///
+    /// Separate sink handles that can write the same endpoint must return an equal,
+    /// collision-resistant identity for the entire process lifetime. Alternative sinks must not
+    /// assign per-instance or random aliases to shared storage. This process-local fence does not
+    /// provide cross-process exclusion, so a sink reachable from multiple processes must enforce
+    /// its own operating-system or storage-level ownership primitive.
+    ///
+    /// [`JournalWriter`] derives this identity from its prepared canonical root and separately
+    /// retains the journal's exclusive file lock.
     fn destination(&self) -> CaptureDestination;
     /// Appends one bounded diagnostic record.
-    fn append(&mut self, record: &CapturedRawRecord) -> Result<(), CaptureSinkError>;
+    fn append(
+        &mut self,
+        record: &CapturedRawRecord,
+        context: &CaptureIoContext,
+    ) -> Result<(), CaptureSinkError>;
     /// Flushes buffered records durably according to the sink contract.
-    fn flush(&mut self) -> Result<(), CaptureSinkError>;
+    fn flush(&mut self, context: &CaptureIoContext) -> Result<(), CaptureSinkError>;
 }
 
 impl CaptureSink for JournalWriter {
@@ -167,11 +300,17 @@ impl CaptureSink for JournalWriter {
         CaptureDestination::for_journal(self.path())
     }
 
-    fn append(&mut self, captured: &CapturedRawRecord) -> Result<(), CaptureSinkError> {
+    fn append(
+        &mut self,
+        captured: &CapturedRawRecord,
+        context: &CaptureIoContext,
+    ) -> Result<(), CaptureSinkError> {
+        context.checkpoint()?;
         self.append(captured.record()).map_err(Into::into)
     }
 
-    fn flush(&mut self) -> Result<(), CaptureSinkError> {
+    fn flush(&mut self, context: &CaptureIoContext) -> Result<(), CaptureSinkError> {
+        context.checkpoint()?;
         self.flush().map_err(Into::into)
     }
 }
@@ -204,13 +343,18 @@ impl CaptureSink for MemoryCaptureSink {
         self.destination.clone()
     }
 
-    fn append(&mut self, record: &CapturedRawRecord) -> Result<(), CaptureSinkError> {
+    fn append(
+        &mut self,
+        record: &CapturedRawRecord,
+        context: &CaptureIoContext,
+    ) -> Result<(), CaptureSinkError> {
+        context.checkpoint()?;
         self.records.push(record.clone());
         Ok(())
     }
 
-    fn flush(&mut self) -> Result<(), CaptureSinkError> {
-        Ok(())
+    fn flush(&mut self, context: &CaptureIoContext) -> Result<(), CaptureSinkError> {
+        context.checkpoint()
     }
 }
 
@@ -236,10 +380,17 @@ impl CaptureWriterOutcome {
     pub const fn is_incomplete(&self) -> bool {
         matches!(self, Self::Incomplete { .. })
     }
-}
 
-/// Alias emphasizing shutdown result semantics.
-pub type CaptureShutdown = CaptureWriterOutcome;
+    /// Returns the final number of successfully appended records.
+    pub const fn records_written(&self) -> u64 {
+        match self {
+            Self::Complete { records_written }
+            | Self::Incomplete {
+                records_written, ..
+            } => *records_written,
+        }
+    }
+}
 
 /// Failure to start the dedicated capture writer thread.
 #[derive(Debug, Error)]
@@ -250,6 +401,9 @@ pub enum CaptureWriterSpawnError {
         /// Redacted exact destination identity.
         destination: CaptureDestination,
     },
+    /// The bounded process-wide active-destination registry is full.
+    #[error("active capture destination capacity is exhausted")]
+    DestinationCapacity,
     /// The operating system rejected dedicated thread creation.
     #[error("failed to start dedicated capture writer thread: {source}")]
     Thread {
@@ -263,14 +417,80 @@ pub enum CaptureWriterSpawnError {
 #[derive(Debug)]
 pub struct CaptureWriterHandle<B: CaptureAuthorityBundle> {
     thread: Option<std::thread::JoinHandle<()>>,
-    completion: tokio::sync::oneshot::Receiver<CaptureWriterOutcome>,
+    completion: Arc<tokio::sync::Notify>,
+    final_outcome: Arc<std::sync::Mutex<Option<CaptureWriterOutcome>>>,
     wake_sender: Option<mpsc::SyncSender<CaptureMessage<B>>>,
-    shutdown_requested: Arc<AtomicBool>,
-    shutdown_deadline: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+    io_context: CaptureIoContext,
     receiver: Arc<std::sync::Mutex<mpsc::Receiver<CaptureMessage<B>>>>,
     state: Arc<CaptureState<B>>,
     destination_fence: Option<Arc<CaptureDestinationLease>>,
     completed: bool,
+}
+
+/// Result of waiting on a retained capture worker without joining it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CaptureShutdownStatus {
+    /// The worker thread exited but its lifecycle owner has not joined it yet.
+    WorkerTerminated,
+    /// Capture authority was revoked at the deadline while the worker was still running.
+    DeadlineElapsed,
+}
+
+/// Final joined capture worker report.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CaptureWorkerTermination {
+    outcome: CaptureWriterOutcome,
+    records_written_at_revocation: u64,
+    final_records_written: u64,
+    late_records_written: u64,
+}
+
+impl CaptureWorkerTermination {
+    /// Returns the fail-closed storage outcome persisted after join.
+    pub const fn outcome(&self) -> &CaptureWriterOutcome {
+        &self.outcome
+    }
+
+    /// Returns records known complete when shutdown revoked positive authority.
+    pub const fn records_written_at_revocation(&self) -> u64 {
+        self.records_written_at_revocation
+    }
+
+    /// Returns all successful appends observed after worker join.
+    pub const fn final_records_written(&self) -> u64 {
+        self.final_records_written
+    }
+
+    /// Returns successful appends completed after authority revocation.
+    pub const fn late_records_written(&self) -> u64 {
+        self.late_records_written
+    }
+}
+
+/// Nonblocking reap failure.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum CaptureWorkerReapError {
+    /// Joining is forbidden until thread termination is independently observable.
+    #[error("capture worker is still running")]
+    WorkerStillRunning,
+}
+
+/// Explicit lifecycle owner for a shutdown-requested capture worker.
+#[derive(Debug)]
+#[must_use = "pending capture workers must remain owned and be explicitly reaped"]
+pub struct PendingCaptureWriter<B: CaptureAuthorityBundle> {
+    thread: Option<std::thread::JoinHandle<()>>,
+    completion: Arc<tokio::sync::Notify>,
+    final_outcome: Arc<std::sync::Mutex<Option<CaptureWriterOutcome>>>,
+    wake_sender: Option<mpsc::SyncSender<CaptureMessage<B>>>,
+    io_context: CaptureIoContext,
+    receiver: Arc<std::sync::Mutex<mpsc::Receiver<CaptureMessage<B>>>>,
+    state: Arc<CaptureState<B>>,
+    destination_fence: Option<Arc<CaptureDestinationLease>>,
+    deadline: std::time::Instant,
+    records_written_at_revocation: u64,
+    termination: Option<CaptureWorkerTermination>,
+    deadline_recorded: bool,
 }
 
 fn writer_failed<B: CaptureAuthorityBundle>(
@@ -299,7 +519,11 @@ fn diagnostic_uuid_inputs<F: RawCaptureFrameView>(frame: &F) -> (Uuid, Uuid) {
             .as_bytes(),
         frame.session_identifier().as_str().as_bytes(),
     ] {
-        generation.extend_from_slice(&u64::try_from(field.len()).unwrap_or(u64::MAX).to_be_bytes());
+        generation.extend_from_slice(
+            &u64::try_from(field.len())
+                .map_or(u64::MAX, |length| length)
+                .to_be_bytes(),
+        );
         generation.extend_from_slice(field);
     }
     generation.extend_from_slice(&frame.connection_generation().get().to_be_bytes());
@@ -337,39 +561,68 @@ fn diagnostic_record<B: CaptureAuthorityBundle>(
     ))
 }
 
+#[derive(Debug, Default)]
+struct CaptureWriterProgress {
+    records_written: u64,
+    since_flush: usize,
+}
+
 fn append_frame<B: CaptureAuthorityBundle, S: CaptureSink>(
     sink: &mut S,
     allocation: &Arc<GenerationCaptureState<B>>,
     frame: &B::Frame,
     state: &CaptureState<B>,
-    records_written: &mut u64,
-    since_flush: &mut usize,
+    progress: &mut CaptureWriterProgress,
     policy: CaptureWriterPolicy,
+    io_context: &CaptureIoContext,
 ) -> Result<(), CaptureWriterOutcome> {
     let captured = diagnostic_record(allocation, frame).map_err(|_error| {
         state.mark_incomplete_for_generation(allocation, CaptureHealthReason::DiagnosticConversion);
         state.mark_writer_failed();
         CaptureWriterOutcome::Incomplete {
-            records_written: *records_written,
+            records_written: progress.records_written,
             reason: CaptureHealthReason::DiagnosticConversion,
         }
     })?;
-    if sink.append(&captured).is_err() {
-        state.mark_incomplete_for_generation(allocation, CaptureHealthReason::WriterFailed);
-        return Err(writer_failed(state, *records_written));
+    if io_context.deadline_reached() {
+        return Err(shutdown_deadline_outcome(state, progress.records_written));
     }
-    let Some(next) = state.increment_written(*records_written) else {
-        state.mark_incomplete_for_generation(allocation, CaptureHealthReason::WriterFailed);
-        return Err(writer_failed(state, *records_written));
-    };
-    *records_written = next;
-    *since_flush = since_flush.saturating_add(1);
-    if *since_flush >= policy.flush_every_records.get() {
-        if sink.flush().is_err() {
-            state.mark_incomplete_for_generation(allocation, CaptureHealthReason::WriterFailed);
-            return Err(writer_failed(state, *records_written));
+    match sink.append(&captured, io_context) {
+        Ok(()) => {}
+        Err(CaptureSinkError::ShutdownDeadline) => {
+            return Err(shutdown_deadline_outcome(state, progress.records_written));
         }
-        *since_flush = 0;
+        Err(_error) => {
+            state.mark_incomplete_for_generation(allocation, CaptureHealthReason::WriterFailed);
+            return Err(writer_failed(state, progress.records_written));
+        }
+    }
+    // A successful append is committed accounting even if shutdown elapsed while the sink was
+    // blocked. Count it before the post-I/O checkpoint so late durable work is never erased.
+    let Some(next) = state.record_completed_append() else {
+        state.mark_incomplete_for_generation(allocation, CaptureHealthReason::WriterFailed);
+        return Err(writer_failed(state, progress.records_written));
+    };
+    progress.records_written = next;
+    progress.since_flush = progress.since_flush.saturating_add(1);
+    if io_context.deadline_reached() {
+        return Err(shutdown_deadline_outcome(state, progress.records_written));
+    }
+    if progress.since_flush >= policy.flush_every_records.get() {
+        match sink.flush(io_context) {
+            Ok(()) => {}
+            Err(CaptureSinkError::ShutdownDeadline) => {
+                return Err(shutdown_deadline_outcome(state, progress.records_written));
+            }
+            Err(_error) => {
+                state.mark_incomplete_for_generation(allocation, CaptureHealthReason::WriterFailed);
+                return Err(writer_failed(state, progress.records_written));
+            }
+        }
+        progress.since_flush = 0;
+        if io_context.deadline_reached() {
+            return Err(shutdown_deadline_outcome(state, progress.records_written));
+        }
     }
     Ok(())
 }
@@ -395,16 +648,6 @@ fn receive_timeout<B: CaptureAuthorityBundle>(
     receiver.recv_timeout(timeout)
 }
 
-fn drain_pending<B: CaptureAuthorityBundle>(
-    receiver: &std::sync::Mutex<mpsc::Receiver<CaptureMessage<B>>>,
-) {
-    let receiver = match receiver.lock() {
-        Ok(receiver) => receiver,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    while receiver.try_recv().is_ok() {}
-}
-
 fn try_drain_pending<B: CaptureAuthorityBundle>(
     receiver: &std::sync::Mutex<mpsc::Receiver<CaptureMessage<B>>>,
 ) {
@@ -420,9 +663,9 @@ fn process_message<B: CaptureAuthorityBundle, S: CaptureSink>(
     message: CaptureMessage<B>,
     sink: &mut S,
     state: &CaptureState<B>,
-    records_written: &mut u64,
-    since_flush: &mut usize,
+    progress: &mut CaptureWriterProgress,
     policy: CaptureWriterPolicy,
+    io_context: &CaptureIoContext,
 ) -> Result<(), CaptureWriterOutcome> {
     match message {
         CaptureMessage::Record {
@@ -439,51 +682,47 @@ fn process_message<B: CaptureAuthorityBundle, S: CaptureSink>(
                 &allocation,
                 &frame,
                 state,
-                records_written,
-                since_flush,
+                progress,
                 policy,
+                io_context,
             )
         }
         CaptureMessage::Wake => Ok(()),
     }
 }
 
-fn shutdown_deadline_reached(
-    shutdown_deadline: &std::sync::Mutex<Option<std::time::Instant>>,
-) -> bool {
-    let deadline = match shutdown_deadline.lock() {
-        Ok(deadline) => *deadline,
-        Err(poisoned) => *poisoned.into_inner(),
-    };
-    deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
-}
-
 fn deadline_after(duration: Duration) -> std::time::Instant {
     let now = std::time::Instant::now();
-    now.checked_add(duration).unwrap_or(now)
+    now.checked_add(duration).map_or(now, |deadline| deadline)
+}
+
+fn shutdown_deadline_outcome<B: CaptureAuthorityBundle>(
+    state: &CaptureState<B>,
+    records_written: u64,
+) -> CaptureWriterOutcome {
+    state.mark_current_incomplete(CaptureHealthReason::ShutdownDeadline);
+    CaptureWriterOutcome::Incomplete {
+        records_written,
+        reason: CaptureHealthReason::ShutdownDeadline,
+    }
 }
 
 fn drain_and_flush<B: CaptureAuthorityBundle, S: CaptureSink>(
     writer: &RawCaptureWriter<B>,
     sink: &mut S,
     state: &CaptureState<B>,
-    records_written: &mut u64,
-    since_flush: &mut usize,
+    progress: &mut CaptureWriterProgress,
     policy: CaptureWriterPolicy,
-    shutdown_deadline: &std::sync::Mutex<Option<std::time::Instant>>,
+    io_context: &CaptureIoContext,
 ) -> CaptureWriterOutcome {
     loop {
-        if shutdown_deadline_reached(shutdown_deadline) {
-            state.mark_current_incomplete(CaptureHealthReason::ShutdownDeadline);
-            return CaptureWriterOutcome::Incomplete {
-                records_written: *records_written,
-                reason: CaptureHealthReason::ShutdownDeadline,
-            };
+        if io_context.deadline_reached() {
+            return shutdown_deadline_outcome(state, progress.records_written);
         }
         match try_receive(writer) {
             Ok(message) => {
                 if let Err(outcome) =
-                    process_message(message, sink, state, records_written, since_flush, policy)
+                    process_message(message, sink, state, progress, policy, io_context)
                 {
                     return outcome;
                 }
@@ -491,19 +730,22 @@ fn drain_and_flush<B: CaptureAuthorityBundle, S: CaptureSink>(
             Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
         }
     }
-    if shutdown_deadline_reached(shutdown_deadline) {
-        state.mark_current_incomplete(CaptureHealthReason::ShutdownDeadline);
-        return CaptureWriterOutcome::Incomplete {
-            records_written: *records_written,
-            reason: CaptureHealthReason::ShutdownDeadline,
-        };
+    if io_context.deadline_reached() {
+        return shutdown_deadline_outcome(state, progress.records_written);
     }
-    if sink.flush().is_err() {
-        return writer_failed(state, *records_written);
+    match sink.flush(io_context) {
+        Ok(()) => {}
+        Err(CaptureSinkError::ShutdownDeadline) => {
+            return shutdown_deadline_outcome(state, progress.records_written);
+        }
+        Err(_error) => return writer_failed(state, progress.records_written),
+    }
+    if io_context.deadline_reached() {
+        return shutdown_deadline_outcome(state, progress.records_written);
     }
     state.mark_writer_stopped();
     CaptureWriterOutcome::Complete {
-        records_written: *records_written,
+        records_written: progress.records_written,
     }
 }
 
@@ -511,24 +753,21 @@ fn run_capture_writer<B: CaptureAuthorityBundle, S: CaptureSink>(
     writer: RawCaptureWriter<B>,
     mut sink: S,
     policy: CaptureWriterPolicy,
-    shutdown_requested: &AtomicBool,
-    shutdown_deadline: &std::sync::Mutex<Option<std::time::Instant>>,
+    io_context: &CaptureIoContext,
 ) -> CaptureWriterOutcome {
     let state = Arc::clone(&writer.state);
-    let mut records_written = 0_u64;
-    let mut since_flush = 0_usize;
+    let mut progress = CaptureWriterProgress::default();
     let mut next_flush_at = deadline_after(policy.flush_interval);
     loop {
-        if shutdown_requested.load(Ordering::Acquire) {
+        if io_context.shutdown_requested() {
             stop_accepting(&state);
             return drain_and_flush(
                 &writer,
                 &mut sink,
                 &state,
-                &mut records_written,
-                &mut since_flush,
+                &mut progress,
                 policy,
-                shutdown_deadline,
+                io_context,
             );
         }
         let wait_duration = next_flush_at.saturating_duration_since(std::time::Instant::now());
@@ -538,18 +777,27 @@ fn run_capture_writer<B: CaptureAuthorityBundle, S: CaptureSink>(
                     message,
                     &mut sink,
                     &state,
-                    &mut records_written,
-                    &mut since_flush,
+                    &mut progress,
                     policy,
+                    io_context,
                 ) {
                     return outcome;
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                if since_flush > 0 && sink.flush().is_err() {
-                    return writer_failed(&state, records_written);
+                if progress.since_flush > 0 {
+                    match sink.flush(io_context) {
+                        Ok(()) => {}
+                        Err(CaptureSinkError::ShutdownDeadline) => {
+                            return shutdown_deadline_outcome(&state, progress.records_written);
+                        }
+                        Err(_error) => return writer_failed(&state, progress.records_written),
+                    }
+                    if io_context.deadline_reached() {
+                        return shutdown_deadline_outcome(&state, progress.records_written);
+                    }
                 }
-                since_flush = 0;
+                progress.since_flush = 0;
                 next_flush_at = deadline_after(policy.flush_interval);
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -558,18 +806,26 @@ fn run_capture_writer<B: CaptureAuthorityBundle, S: CaptureSink>(
                     &writer,
                     &mut sink,
                     &state,
-                    &mut records_written,
-                    &mut since_flush,
+                    &mut progress,
                     policy,
-                    shutdown_deadline,
+                    io_context,
                 );
             }
         }
         if std::time::Instant::now() >= next_flush_at {
-            if since_flush > 0 && sink.flush().is_err() {
-                return writer_failed(&state, records_written);
+            if progress.since_flush > 0 {
+                match sink.flush(io_context) {
+                    Ok(()) => {}
+                    Err(CaptureSinkError::ShutdownDeadline) => {
+                        return shutdown_deadline_outcome(&state, progress.records_written);
+                    }
+                    Err(_error) => return writer_failed(&state, progress.records_written),
+                }
+                if io_context.deadline_reached() {
+                    return shutdown_deadline_outcome(&state, progress.records_written);
+                }
             }
-            since_flush = 0;
+            progress.since_flush = 0;
             next_flush_at = deadline_after(policy.flush_interval);
         }
     }
@@ -583,11 +839,17 @@ pub fn spawn_capture_writer<B: CaptureAuthorityBundle, S: CaptureSink>(
 ) -> Result<CaptureWriterHandle<B>, CaptureWriterSpawnError> {
     let destination = sink.destination();
     let (worker_destination_fence, owner_destination_fence) =
-        acquire_destination_fence(&destination).ok_or_else(|| {
-            CaptureWriterSpawnError::DestinationBusy {
-                destination: destination.clone(),
+        match acquire_destination_fence(&destination) {
+            Ok(fences) => fences,
+            Err(CaptureDestinationFenceError::Busy) => {
+                return Err(CaptureWriterSpawnError::DestinationBusy {
+                    destination: destination.clone(),
+                });
             }
-        })?;
+            Err(CaptureDestinationFenceError::Capacity) => {
+                return Err(CaptureWriterSpawnError::DestinationCapacity);
+            }
+        };
     let state = Arc::clone(&writer.state);
     let receiver = Arc::clone(&writer.receiver);
     writer
@@ -604,22 +866,28 @@ pub fn spawn_capture_writer<B: CaptureAuthorityBundle, S: CaptureSink>(
         })?;
     let shutdown_requested = Arc::new(AtomicBool::new(false));
     let shutdown_deadline = Arc::new(std::sync::Mutex::new(None));
-    let thread_shutdown = Arc::clone(&shutdown_requested);
-    let thread_deadline = Arc::clone(&shutdown_deadline);
+    let io_context = CaptureIoContext::new(shutdown_requested, shutdown_deadline);
+    let thread_context = io_context.clone();
     let wake_sender = writer
         .sender
         .take()
         .ok_or_else(|| CaptureWriterSpawnError::Thread {
             source: std::io::Error::other("capture writer control sender is unavailable"),
         })?;
-    let (completion_sender, completion) = tokio::sync::oneshot::channel();
+    let completion = Arc::new(tokio::sync::Notify::new());
+    let thread_completion = Arc::clone(&completion);
+    let final_outcome = Arc::new(std::sync::Mutex::new(None));
+    let thread_outcome = Arc::clone(&final_outcome);
     let thread = std::thread::Builder::new()
         .name("market-squawk-capture".to_owned())
         .spawn(move || {
             let _worker_destination_fence = worker_destination_fence;
-            let outcome =
-                run_capture_writer(writer, sink, policy, &thread_shutdown, &thread_deadline);
-            let _completion_result = completion_sender.send(outcome);
+            let outcome = run_capture_writer(writer, sink, policy, &thread_context);
+            match thread_outcome.lock() {
+                Ok(mut retained) => *retained = Some(outcome),
+                Err(poisoned) => *poisoned.into_inner() = Some(outcome),
+            }
+            thread_completion.notify_one();
         })
         .map_err(|source| {
             state.mark_writer_failed();
@@ -628,9 +896,9 @@ pub fn spawn_capture_writer<B: CaptureAuthorityBundle, S: CaptureSink>(
     Ok(CaptureWriterHandle {
         thread: Some(thread),
         completion,
+        final_outcome,
         wake_sender: Some(wake_sender),
-        shutdown_requested,
-        shutdown_deadline,
+        io_context,
         receiver,
         state,
         destination_fence: Some(owner_destination_fence),
@@ -640,73 +908,320 @@ pub fn spawn_capture_writer<B: CaptureAuthorityBundle, S: CaptureSink>(
 
 impl<B: CaptureAuthorityBundle> CaptureWriterHandle<B> {
     fn request_shutdown(&self) {
-        self.shutdown_requested.store(true, Ordering::Release);
+        self.io_context
+            .shutdown_requested
+            .store(true, Ordering::Release);
         if let Some(sender) = &self.wake_sender {
             let _wake_result = sender.try_send(CaptureMessage::Wake);
         }
     }
 
-    fn join_finished_thread(&mut self) -> bool {
-        let joined = self
-            .thread
-            .take()
-            .is_none_or(|thread| thread.join().is_ok());
-        self.destination_fence.take();
-        joined
-    }
-
-    /// Waits for natural writer completion and joins the dedicated thread.
-    pub async fn wait(mut self) -> CaptureWriterOutcome {
-        self.wake_sender.take();
-        let outcome = match (&mut self.completion).await {
-            Ok(outcome) if self.join_finished_thread() => outcome,
-            Ok(_) | Err(_) => writer_failed(
-                &self.state,
-                self.state.records_written.load(Ordering::Acquire),
-            ),
-        };
-        drain_pending(&self.receiver);
-        self.completed = true;
-        outcome
-    }
-
-    /// Requests cooperative drain and waits only to the explicit deadline.
-    pub async fn shutdown(mut self, deadline: Duration) -> CaptureShutdown {
+    /// Consumes the ordinary handle, revokes positive authority, and returns explicit worker
+    /// supervision ownership.
+    ///
+    /// The returned owner must be retained across its borrowing async wait and explicitly reaped.
+    /// No thread termination is implied by this synchronous transition.
+    pub fn shutdown(mut self, deadline: Duration) -> PendingCaptureWriter<B> {
         let absolute_deadline = deadline_after(deadline);
-        match self.shutdown_deadline.lock() {
+        match self.io_context.shutdown_deadline.lock() {
             Ok(mut configured) => *configured = Some(absolute_deadline),
             Err(poisoned) => *poisoned.into_inner() = Some(absolute_deadline),
         }
+        let revocation = self
+            .state
+            .revoke_writer_for_shutdown(CaptureHealthReason::WriterStopped);
         self.request_shutdown();
-        self.wake_sender.take();
-        let outcome = match tokio::time::timeout(deadline, &mut self.completion).await {
-            Ok(Ok(outcome)) if self.join_finished_thread() => outcome,
-            Ok(Ok(_)) | Ok(Err(_)) => writer_failed(
-                &self.state,
-                self.state.records_written.load(Ordering::Acquire),
-            ),
-            Err(_elapsed) => {
-                stop_accepting(&self.state);
-                try_drain_pending(&self.receiver);
-                self.state
-                    .mark_current_incomplete(CaptureHealthReason::ShutdownDeadline);
-                CaptureWriterOutcome::Incomplete {
-                    records_written: self.state.records_written.load(Ordering::Acquire),
-                    reason: CaptureHealthReason::ShutdownDeadline,
-                }
-            }
-        };
         self.completed = true;
-        outcome
+        PendingCaptureWriter {
+            thread: self.thread.take(),
+            completion: Arc::clone(&self.completion),
+            final_outcome: Arc::clone(&self.final_outcome),
+            wake_sender: self.wake_sender.take(),
+            io_context: self.io_context.clone(),
+            receiver: Arc::clone(&self.receiver),
+            state: Arc::clone(&self.state),
+            destination_fence: self.destination_fence.take(),
+            deadline: absolute_deadline,
+            records_written_at_revocation: revocation.records_written_at_revocation,
+            termination: None,
+            deadline_recorded: false,
+        }
     }
 }
 
 impl<B: CaptureAuthorityBundle> Drop for CaptureWriterHandle<B> {
     fn drop(&mut self) {
         if !self.completed {
+            let revocation = self
+                .state
+                .revoke_writer_for_shutdown(CaptureHealthReason::WriterFailed);
             self.request_shutdown();
             try_drain_pending(&self.receiver);
-            self.state.mark_writer_failed();
+            self.wake_sender.take();
+            let joined = self
+                .thread
+                .take()
+                .is_none_or(|thread| thread.join().is_ok());
+            let _termination = termination_after_join(
+                &self.state,
+                &self.final_outcome,
+                revocation.records_written_at_revocation,
+                joined,
+            );
+            self.destination_fence.take();
         }
+    }
+}
+
+impl<B: CaptureAuthorityBundle> PendingCaptureWriter<B> {
+    /// Returns whether the OS thread has exited. The destination remains fenced until reap.
+    pub fn is_worker_terminated(&self) -> bool {
+        self.thread
+            .as_ref()
+            .is_none_or(std::thread::JoinHandle::is_finished)
+    }
+
+    /// Waits until either the configured deadline elapses or thread exit is observable.
+    ///
+    /// This method borrows the owner and never joins or transfers it to another task.
+    pub async fn wait_until_deadline(&mut self) -> CaptureShutdownStatus {
+        loop {
+            if self.is_worker_terminated() {
+                return CaptureShutdownStatus::WorkerTerminated;
+            }
+            let now = std::time::Instant::now();
+            if now >= self.deadline {
+                self.record_deadline();
+                return CaptureShutdownStatus::DeadlineElapsed;
+            }
+            let remaining = self.deadline.saturating_duration_since(now);
+            tokio::select! {
+                () = self.completion.notified() => {}
+                () = tokio::time::sleep(remaining) => {}
+            }
+        }
+    }
+
+    /// Waits until thread exit is observable without joining it.
+    ///
+    /// This method borrows the owner, so cancellation leaves join ownership with the caller.
+    pub async fn wait_until_terminated(&mut self) {
+        while !self.is_worker_terminated() {
+            tokio::select! {
+                () = self.completion.notified() => {}
+                () = tokio::time::sleep(Duration::from_millis(1)) => {}
+            }
+        }
+    }
+
+    /// Joins an already-terminated worker and persists its final report before releasing the
+    /// destination fence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CaptureWorkerReapError::WorkerStillRunning`] rather than blocking when thread exit
+    /// is not yet independently observable.
+    pub fn try_reap(
+        &mut self,
+    ) -> Result<Option<&CaptureWorkerTermination>, CaptureWorkerReapError> {
+        if self.termination.is_some() {
+            return Ok(self.termination.as_ref());
+        }
+        let Some(thread) = self.thread.as_ref() else {
+            return Ok(None);
+        };
+        if !thread.is_finished() {
+            return Err(CaptureWorkerReapError::WorkerStillRunning);
+        }
+        let joined = self
+            .thread
+            .take()
+            .is_some_and(|thread| thread.join().is_ok());
+        self.persist_termination(joined);
+        Ok(self.termination.as_ref())
+    }
+
+    fn record_deadline(&mut self) {
+        if self.deadline_recorded {
+            return;
+        }
+        try_drain_pending(&self.receiver);
+        self.state
+            .mark_current_incomplete(CaptureHealthReason::ShutdownDeadline);
+        self.deadline_recorded = true;
+    }
+
+    fn persist_termination(&mut self, joined: bool) {
+        let termination = termination_after_join(
+            &self.state,
+            &self.final_outcome,
+            self.records_written_at_revocation,
+            joined,
+        );
+        self.termination = Some(termination);
+        // The report is now retained in the lifecycle owner. Only this point may release the owner
+        // side of the two-party destination fence.
+        self.destination_fence.take();
+    }
+
+    fn request_shutdown(&self) {
+        self.io_context
+            .shutdown_requested
+            .store(true, Ordering::Release);
+        if let Some(sender) = &self.wake_sender {
+            let _wake_result = sender.try_send(CaptureMessage::Wake);
+        }
+    }
+}
+
+impl<B: CaptureAuthorityBundle> Drop for PendingCaptureWriter<B> {
+    fn drop(&mut self) {
+        if self.termination.is_some() {
+            return;
+        }
+        self.request_shutdown();
+        try_drain_pending(&self.receiver);
+        self.wake_sender.take();
+        let joined = self
+            .thread
+            .take()
+            .is_none_or(|thread| thread.join().is_ok());
+        self.persist_termination(joined);
+    }
+}
+
+fn termination_after_join<B: CaptureAuthorityBundle>(
+    state: &CaptureState<B>,
+    final_outcome: &std::sync::Mutex<Option<CaptureWriterOutcome>>,
+    records_written_at_revocation: u64,
+    joined: bool,
+) -> CaptureWorkerTermination {
+    let retained = match final_outcome.lock() {
+        Ok(mut retained) => retained.take(),
+        Err(poisoned) => poisoned.into_inner().take(),
+    };
+    let accounting = state.completion_snapshot();
+    let expected_late = accounting
+        .records_written
+        .checked_sub(records_written_at_revocation);
+    let accounting_valid = accounting.records_written_at_revocation
+        == records_written_at_revocation
+        && expected_late == Some(accounting.late_records_written);
+    let outcome_matches = retained
+        .as_ref()
+        .is_some_and(|outcome| outcome.records_written() == accounting.records_written);
+    let outcome = if joined && accounting_valid && outcome_matches {
+        match retained {
+            Some(outcome) => outcome,
+            None => writer_failed(state, accounting.records_written),
+        }
+    } else {
+        state.mark_current_incomplete(CaptureHealthReason::AccountingInvariant);
+        writer_failed(state, accounting.records_written)
+    };
+    CaptureWorkerTermination {
+        outcome,
+        records_written_at_revocation,
+        final_records_written: accounting.records_written,
+        late_records_written: expected_late.map_or(0, |late| late),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Barrier};
+    use std::time::{Duration, Instant};
+
+    use super::{
+        CaptureDestination, CaptureDestinationFenceError, CaptureDestinationFenceRegistry,
+        MAX_ACTIVE_CAPTURE_DESTINATIONS, acquire_destination_fence,
+    };
+
+    #[test]
+    fn destination_registry_rejects_capacity_without_unbounded_growth()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut registry = CaptureDestinationFenceRegistry::default();
+        let mut retained = Vec::with_capacity(MAX_ACTIVE_CAPTURE_DESTINATIONS);
+        for index in 0..MAX_ACTIVE_CAPTURE_DESTINATIONS {
+            let destination = CaptureDestination::try_named(&format!("registry-capacity-{index}"))?;
+            let leases = registry
+                .try_acquire(&destination)
+                .map_err(|error| format!("unexpected registry acquisition failure: {error:?}"))?;
+            retained.push(leases);
+        }
+        let overflow = CaptureDestination::try_named("registry-capacity-overflow")?;
+        assert!(matches!(
+            registry.try_acquire(&overflow),
+            Err(CaptureDestinationFenceError::Capacity)
+        ));
+        assert_eq!(registry.leases.len(), MAX_ACTIVE_CAPTURE_DESTINATIONS);
+        drop(retained);
+        Ok(())
+    }
+
+    #[test]
+    fn destination_registry_churn_removes_each_exact_dead_lease()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for index in 0..MAX_ACTIVE_CAPTURE_DESTINATIONS.saturating_mul(2) {
+            let destination = CaptureDestination::try_named(&format!("registry-churn-{index}"))?;
+            let (worker, owner) = acquire_destination_fence(&destination)
+                .map_err(|error| format!("unexpected registry acquisition failure: {error:?}"))?;
+            drop(worker);
+            drop(owner);
+            let registry = super::CAPTURE_DESTINATION_FENCES
+                .get()
+                .ok_or("destination registry was not initialized")?;
+            let registry = match registry.lock() {
+                Ok(registry) => registry,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            assert!(!registry.leases.contains_key(&destination));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn final_lease_drop_can_race_same_destination_acquisition_without_deadlock()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for index in 0..64 {
+            let destination =
+                CaptureDestination::try_named(&format!("registry-drop-race-{index}"))?;
+            let (worker, owner) = acquire_destination_fence(&destination)
+                .map_err(|error| format!("unexpected registry acquisition failure: {error:?}"))?;
+            drop(worker);
+            let race_start = Arc::new(Barrier::new(2));
+            let drop_race_start = Arc::clone(&race_start);
+            let (drop_complete_sender, drop_complete_receiver) = std::sync::mpsc::sync_channel(1);
+            let drop_thread = std::thread::spawn(move || {
+                drop_race_start.wait();
+                drop(owner);
+                let _sent = drop_complete_sender.send(());
+            });
+
+            race_start.wait();
+            let acquisition_deadline = Instant::now() + Duration::from_secs(1);
+            let replacement = loop {
+                match acquire_destination_fence(&destination) {
+                    Ok(leases) => break leases,
+                    Err(CaptureDestinationFenceError::Busy)
+                        if Instant::now() < acquisition_deadline =>
+                    {
+                        std::thread::yield_now();
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "same-destination race did not acquire before deadline: {error:?}"
+                        )
+                        .into());
+                    }
+                }
+            };
+            drop_complete_receiver.recv_timeout(Duration::from_secs(1))?;
+            drop_thread
+                .join()
+                .map_err(|_panic| "destination lease drop thread panicked")?;
+            drop(replacement);
+        }
+        Ok(())
     }
 }

@@ -9,9 +9,10 @@ use market_squawk_domain::{
     MetadataRevision, RawCaptureFrameView, SourceId, SourceIdentifier, Timestamp,
 };
 use market_squawk_platform::{
-    CaptureDestination, CapturePublishError, CaptureSink, CaptureSinkError,
-    CaptureStorageErrorClass, CaptureWriterPolicy, CapturedRawRecord, MemoryCaptureSink,
-    raw_capture_channel, spawn_capture_writer,
+    CaptureDestination, CaptureIoContext, CapturePublishError, CaptureShutdownStatus, CaptureSink,
+    CaptureSinkError, CaptureStorageErrorClass, CaptureWorkerTermination, CaptureWriterHandle,
+    CaptureWriterPolicy, CapturedRawRecord, MemoryCaptureSink, raw_capture_channel,
+    spawn_capture_writer,
 };
 use static_assertions::{assert_impl_all, assert_not_impl_any};
 
@@ -320,6 +321,20 @@ fn frame(
     })
 }
 
+async fn shutdown_and_reap(
+    handle: CaptureWriterHandle<TestBundle>,
+    deadline: Duration,
+) -> Result<CaptureWorkerTermination, Box<dyn std::error::Error>> {
+    let mut pending = handle.shutdown(deadline);
+    if pending.wait_until_deadline().await == CaptureShutdownStatus::DeadlineElapsed {
+        pending.wait_until_terminated().await;
+    }
+    pending
+        .try_reap()?
+        .cloned()
+        .ok_or_else(|| "terminated capture worker did not retain a final report".into())
+}
+
 #[tokio::test]
 async fn concrete_associated_receipt_is_issued_only_after_bounded_enqueue()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -338,8 +353,8 @@ async fn concrete_associated_receipt_is_issued_only_after_bounded_enqueue()
     assert!(receipt.is_healthy());
     assert_eq!(issued.load(Ordering::Acquire), 1);
 
-    let outcome = handle.shutdown(Duration::from_secs(1)).await;
-    assert!(!outcome.is_incomplete());
+    let termination = shutdown_and_reap(handle, Duration::from_secs(1)).await?;
+    assert!(!termination.outcome().is_incomplete());
     Ok(())
 }
 
@@ -355,7 +370,11 @@ impl CaptureSink for GatedSink {
         self.destination.clone()
     }
 
-    fn append(&mut self, _record: &CapturedRawRecord) -> Result<(), CaptureSinkError> {
+    fn append(
+        &mut self,
+        _record: &CapturedRawRecord,
+        _context: &CaptureIoContext,
+    ) -> Result<(), CaptureSinkError> {
         if let Some(entered) = self.entered.take() {
             entered
                 .send(())
@@ -367,7 +386,7 @@ impl CaptureSink for GatedSink {
         Ok(())
     }
 
-    fn flush(&mut self) -> Result<(), CaptureSinkError> {
+    fn flush(&mut self, _context: &CaptureIoContext) -> Result<(), CaptureSinkError> {
         Ok(())
     }
 }
@@ -402,7 +421,7 @@ async fn queue_saturation_degrades_exact_generation_without_issuing_a_third_rece
     assert!(!second.is_healthy());
 
     release_sender.send(())?;
-    let _outcome = handle.shutdown(Duration::from_secs(1)).await;
+    let _termination = shutdown_and_reap(handle, Duration::from_secs(1)).await?;
     assert_eq!(publisher.queued_bytes(), 0);
     Ok(())
 }
@@ -435,7 +454,7 @@ async fn whole_bundle_rotation_invalidates_old_receipt_and_accepts_only_new_bind
     let current = publisher.try_publish(&frame(second_identity, 1)?)?;
     assert!(current.is_healthy());
 
-    let _outcome = handle.shutdown(Duration::from_secs(1)).await;
+    let _termination = shutdown_and_reap(handle, Duration::from_secs(1)).await?;
     Ok(())
 }
 
@@ -447,13 +466,17 @@ impl CaptureSink for FailingSink {
         self.0.clone()
     }
 
-    fn append(&mut self, _record: &CapturedRawRecord) -> Result<(), CaptureSinkError> {
+    fn append(
+        &mut self,
+        _record: &CapturedRawRecord,
+        _context: &CaptureIoContext,
+    ) -> Result<(), CaptureSinkError> {
         Err(CaptureSinkError::storage(
             CaptureStorageErrorClass::Unavailable,
         ))
     }
 
-    fn flush(&mut self) -> Result<(), CaptureSinkError> {
+    fn flush(&mut self, _context: &CaptureIoContext) -> Result<(), CaptureSinkError> {
         Ok(())
     }
 }
@@ -472,7 +495,12 @@ async fn writer_failure_invalidates_an_already_issued_concrete_receipt()
     control.activate_initial()?;
     let receipt = publisher.try_publish(&frame(identity, 1)?)?;
 
-    assert!(handle.wait().await.is_incomplete());
+    assert!(
+        shutdown_and_reap(handle, Duration::from_secs(1))
+            .await?
+            .outcome()
+            .is_incomplete()
+    );
     assert!(!receipt.is_healthy());
     assert_eq!(publisher.integrity(), CaptureIntegrityState::Incomplete);
     assert_eq!(publisher.queued_bytes(), 0);
@@ -490,13 +518,17 @@ impl CaptureSink for RecordingSink {
         self.destination.clone()
     }
 
-    fn append(&mut self, record: &CapturedRawRecord) -> Result<(), CaptureSinkError> {
+    fn append(
+        &mut self,
+        record: &CapturedRawRecord,
+        _context: &CaptureIoContext,
+    ) -> Result<(), CaptureSinkError> {
         self.sender
             .send(record.clone())
             .map_err(|_error| CaptureSinkError::storage(CaptureStorageErrorClass::Other))
     }
 
-    fn flush(&mut self) -> Result<(), CaptureSinkError> {
+    fn flush(&mut self, _context: &CaptureIoContext) -> Result<(), CaptureSinkError> {
         Ok(())
     }
 }
@@ -528,7 +560,7 @@ async fn writer_converts_exact_frame_to_bounded_diagnostic_record_without_author
     assert!(!captured.record().event_id().is_nil());
     assert!(!captured.record().connection_id().is_nil());
 
-    let _outcome = handle.shutdown(Duration::from_secs(1)).await;
+    let _termination = shutdown_and_reap(handle, Duration::from_secs(1)).await?;
     Ok(())
 }
 
@@ -554,7 +586,7 @@ async fn retained_size_overflow_is_synchronous_and_terminal_before_enqueue()
     assert_eq!(issued.load(Ordering::Acquire), 0);
     assert_eq!(publisher.integrity(), CaptureIntegrityState::Incomplete);
     assert_eq!(publisher.queued_bytes(), 0);
-    let _outcome = handle.shutdown(Duration::from_secs(1)).await;
+    let _termination = shutdown_and_reap(handle, Duration::from_secs(1)).await?;
     Ok(())
 }
 
@@ -582,7 +614,7 @@ async fn transplanted_frame_is_rejected_without_poisoning_the_current_exact_allo
     assert_eq!(publisher.integrity(), CaptureIntegrityState::Healthy);
     assert!(publisher.try_publish(&frame(current, 1)?).is_ok());
 
-    let _outcome = handle.shutdown(Duration::from_secs(1)).await;
+    let _termination = shutdown_and_reap(handle, Duration::from_secs(1)).await?;
     Ok(())
 }
 
@@ -620,7 +652,7 @@ async fn rotation_rejects_wrong_session_and_nonincreasing_whole_bundles()
         Err(market_squawk_platform::CaptureGenerationError::NotNewer)
     );
     assert_eq!(publisher.integrity(), CaptureIntegrityState::Healthy);
-    let _outcome = handle.shutdown(Duration::from_secs(1)).await;
+    let _termination = shutdown_and_reap(handle, Duration::from_secs(1)).await?;
     Ok(())
 }
 
@@ -632,11 +664,15 @@ impl CaptureSink for SlowFlushSink {
         self.0.clone()
     }
 
-    fn append(&mut self, _record: &CapturedRawRecord) -> Result<(), CaptureSinkError> {
+    fn append(
+        &mut self,
+        _record: &CapturedRawRecord,
+        _context: &CaptureIoContext,
+    ) -> Result<(), CaptureSinkError> {
         Ok(())
     }
 
-    fn flush(&mut self) -> Result<(), CaptureSinkError> {
+    fn flush(&mut self, _context: &CaptureIoContext) -> Result<(), CaptureSinkError> {
         std::thread::sleep(Duration::from_millis(50));
         Ok(())
     }
@@ -659,9 +695,9 @@ async fn shutdown_deadline_invalidates_authority_and_releases_queued_bytes()
     let receipt = publisher.try_publish(&frame(identity, 1)?)?;
 
     assert!(
-        handle
-            .shutdown(Duration::from_millis(1))
-            .await
+        shutdown_and_reap(handle, Duration::from_millis(1))
+            .await?
+            .outcome()
             .is_incomplete()
     );
     assert!(!receipt.is_healthy());

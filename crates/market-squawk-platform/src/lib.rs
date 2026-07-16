@@ -8,12 +8,13 @@ mod raw_record;
 
 pub use capture::{
     CaptureDestination, CaptureDestinationError, CaptureGenerationError, CaptureHealthEvent,
-    CaptureHealthReason, CaptureHealthSnapshot, CapturePublishError, CaptureShutdown, CaptureSink,
-    CaptureSinkError, CaptureStorageErrorClass, CaptureWriterHandle, CaptureWriterOutcome,
+    CaptureHealthReason, CaptureHealthSnapshot, CaptureIoContext, CapturePublishError,
+    CaptureShutdownStatus, CaptureSink, CaptureSinkError, CaptureStorageErrorClass,
+    CaptureWorkerReapError, CaptureWorkerTermination, CaptureWriterHandle, CaptureWriterOutcome,
     CaptureWriterPolicy, CaptureWriterPolicyError, CaptureWriterSpawnError, CapturedRawRecord,
     DiagnosticCaptureBundle, DiagnosticCaptureError, DiagnosticCaptureFrame,
-    DiagnosticCaptureReceipt, MemoryCaptureSink, RawCaptureControl, RawCapturePublisher,
-    RawCaptureWriter, raw_capture_channel, spawn_capture_writer,
+    DiagnosticCaptureReceipt, MemoryCaptureSink, PendingCaptureWriter, RawCaptureControl,
+    RawCapturePublisher, RawCaptureWriter, raw_capture_channel, spawn_capture_writer,
 };
 pub use config::{
     AppConfig, ConfigError, ConfigOverrides, ConfigSources, SecretError, SecretProvider,
