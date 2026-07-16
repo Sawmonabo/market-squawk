@@ -133,16 +133,16 @@ pub(super) fn build_snapshot_seed(
             .ok_or(LiveApplyError::SnapshotRetainedSizeOverflow)?;
         let bids = state
             .book()
-            .bid_levels_limited(bid_count)?
-            .into_iter()
-            .map(|level| BookLevelSnapshot::new(level.price(), level.quantity()))
+            .scaled_bid_iter()
+            .take(bid_count)
+            .map(|(price, quantity)| BookLevelSnapshot::new(price, quantity))
             .collect::<Vec<_>>()
             .into_boxed_slice();
         let asks = state
             .book()
-            .ask_levels_limited(ask_count)?
-            .into_iter()
-            .map(|level| BookLevelSnapshot::new(level.price(), level.quantity()))
+            .scaled_ask_iter()
+            .take(ask_count)
+            .map(|(price, quantity)| BookLevelSnapshot::new(price, quantity))
             .collect::<Vec<_>>()
             .into_boxed_slice();
         let (trading_status, trading_status_revision) = statuses

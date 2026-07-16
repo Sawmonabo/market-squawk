@@ -129,30 +129,6 @@ impl ProviderBook {
             .collect()
     }
 
-    pub(crate) fn bid_levels_limited(
-        &self,
-        limit: usize,
-    ) -> Result<Vec<BookLevel>, ProviderBookError> {
-        self.scaled_bid_iter()
-            .take(limit)
-            .map(|(price, quantity)| {
-                BookLevel::new(price, quantity).map_err(ProviderBookError::from)
-            })
-            .collect()
-    }
-
-    pub(crate) fn ask_levels_limited(
-        &self,
-        limit: usize,
-    ) -> Result<Vec<BookLevel>, ProviderBookError> {
-        self.scaled_ask_iter()
-            .take(limit)
-            .map(|(price, quantity)| {
-                BookLevel::new(price, quantity).map_err(ProviderBookError::from)
-            })
-            .collect()
-    }
-
     pub(crate) fn bid_level_count(&self) -> usize {
         self.scaled_bid_iter().len()
     }
