@@ -4,8 +4,11 @@ use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-use super::{LiveEventClass, LiveEvidenceBinding, MarketDepth, MetadataRevision, ProviderProduct};
-use crate::{Timestamp, VenueId};
+use super::{
+    AssessmentValidity, LiveEventClass, LiveEvidenceBinding, MarketDepth, MetadataRevision,
+    ProviderChannel, ProviderProduct,
+};
+use crate::{SourceId, Timestamp, VenueId};
 
 /// Provider-declared delivery delay for a coverage scope.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -45,8 +48,10 @@ pub enum CoverageStatus {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CoverageScope {
+    source_id: SourceId,
     venue_id: VenueId,
     provider_product: ProviderProduct,
+    provider_channel: ProviderChannel,
     event_class: LiveEventClass,
     depth: Option<MarketDepth>,
     delay: CoverageDelay,
@@ -59,8 +64,10 @@ pub struct CoverageScope {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CoverageScopeWire {
+    source_id: SourceId,
     venue_id: VenueId,
     provider_product: ProviderProduct,
+    provider_channel: ProviderChannel,
     event_class: LiveEventClass,
     depth: Option<MarketDepth>,
     delay: CoverageDelay,
@@ -77,8 +84,10 @@ impl<'de> Deserialize<'de> for CoverageScope {
     {
         let wire = CoverageScopeWire::deserialize(deserializer)?;
         Self::new(
+            wire.source_id,
             wire.venue_id,
             wire.provider_product,
+            wire.provider_channel,
             wire.event_class,
             wire.depth,
             wire.delay,
@@ -102,8 +111,10 @@ impl CoverageScope {
         reason = "coverage metadata scope is an atomic provider declaration"
     )]
     pub fn new(
+        source_id: SourceId,
         venue_id: VenueId,
         provider_product: ProviderProduct,
+        provider_channel: ProviderChannel,
         event_class: LiveEventClass,
         depth: Option<MarketDepth>,
         delay: CoverageDelay,
@@ -121,9 +132,14 @@ impl CoverageScope {
         if event_class.requires_book_state() && depth.is_none() {
             return Err(CoverageError::MissingBookDepth);
         }
+        if !event_class.requires_book_state() && depth.is_some() {
+            return Err(CoverageError::UnexpectedNonBookDepth);
+        }
         Ok(Self {
+            source_id,
             venue_id,
             provider_product,
+            provider_channel,
             event_class,
             depth,
             delay,
@@ -134,6 +150,11 @@ impl CoverageScope {
         })
     }
 
+    /// Returns the covered source identity.
+    pub const fn source_id(&self) -> &SourceId {
+        &self.source_id
+    }
+
     /// Returns the covered venue.
     pub const fn venue_id(&self) -> &VenueId {
         &self.venue_id
@@ -141,6 +162,10 @@ impl CoverageScope {
     /// Returns the covered provider product.
     pub const fn provider_product(&self) -> &ProviderProduct {
         &self.provider_product
+    }
+    /// Returns the covered provider channel.
+    pub const fn provider_channel(&self) -> &ProviderChannel {
+        &self.provider_channel
     }
     /// Returns the covered event class.
     pub const fn event_class(&self) -> LiveEventClass {
@@ -220,11 +245,17 @@ impl SourceCoverageRecord {
         scope: CoverageScope,
         status: CoverageStatus,
     ) -> Result<Self, CoverageError> {
+        if scope.source_id != *binding.source_id() {
+            return Err(CoverageError::BindingMismatch(CoverageDimension::Source));
+        }
         if scope.venue_id != *binding.venue_id() {
             return Err(CoverageError::BindingMismatch(CoverageDimension::Venue));
         }
         if scope.provider_product != *binding.provider_product() {
             return Err(CoverageError::BindingMismatch(CoverageDimension::Product));
+        }
+        if scope.provider_channel != *binding.provider_channel() {
+            return Err(CoverageError::BindingMismatch(CoverageDimension::Channel));
         }
         if scope.event_class != binding.event_class() {
             return Err(CoverageError::BindingMismatch(
@@ -276,13 +307,19 @@ impl SourceCoverageRecord {
     }
 }
 
+impl AssessmentValidity for SourceCoverageRecord {}
+
 /// Coverage dimension implicated in a transplant attempt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CoverageDimension {
+    /// Source mismatch.
+    Source,
     /// Venue mismatch.
     Venue,
     /// Provider product mismatch.
     Product,
+    /// Provider channel mismatch.
+    Channel,
     /// Event class mismatch.
     EventClass,
     /// Market depth mismatch.
@@ -300,6 +337,8 @@ pub enum CoverageError {
     InvalidEffectiveInterval,
     /// A book scope omitted depth.
     MissingBookDepth,
+    /// A non-book scope supplied market depth.
+    UnexpectedNonBookDepth,
     /// A scope field does not match the live binding.
     BindingMismatch(CoverageDimension),
     /// A sufficient status contradicts delayed or explicitly partial metadata.
@@ -314,6 +353,9 @@ impl fmt::Display for CoverageError {
                 formatter.write_str("coverage effective interval is reversed")
             }
             Self::MissingBookDepth => formatter.write_str("book-event coverage requires depth"),
+            Self::UnexpectedNonBookDepth => {
+                formatter.write_str("non-book coverage must not declare market depth")
+            }
             Self::BindingMismatch(dimension) => write!(
                 formatter,
                 "coverage {dimension:?} does not match evidence binding"

@@ -14,10 +14,10 @@ mod qualification;
 mod timing;
 
 pub use integrity::{
-    ChecksumCapability, ChecksumEvidence, ChecksumScope, ChecksumValue, InitializedSnapshot,
-    IntegrityCapabilities, IntegrityEvidenceError, IntegrityRule, RuleVersion, SequenceCapability,
-    SequenceEvidence, SequenceValidationRule, SnapshotApplicability, SnapshotEvidence,
-    SnapshotState,
+    ChecksumCapability, ChecksumEvidence, ChecksumScope, ChecksumTarget, ChecksumValue,
+    InitializedSnapshot, IntegrityCapabilities, IntegrityEvidenceError, IntegrityRule,
+    PayloadChecksumScope, RuleVersion, SequenceCapability, SequenceEvidence,
+    SequenceValidationRule, SnapshotApplicability, SnapshotEvidence, SnapshotState,
 };
 pub use qualification::{
     AssessmentStatus, EligibilityFailure, EligibilityFailures, IntegrityAssessmentSet,
@@ -76,6 +76,8 @@ pub enum DataQuality {
     /// Observation isolated because an integrity invariant failed.
     Quarantined,
 }
+
+impl AssessmentValidity for DataQuality {}
 
 /// Operational integrity of a decoded live stream.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -207,6 +209,8 @@ pub enum BookIntegrity {
     Crossed,
     /// Book consistency has not been established.
     Unknown,
+    /// No order-book structural assessment applies to this event class.
+    NotApplicable,
 }
 
 /// Result of the atomic source/receive/evaluation timing assessment.
@@ -231,8 +235,9 @@ pub enum FreshnessState {
     Unknown,
 }
 pub use binding::{
-    AuthorizationBasis, BindingError, BookStateBinding, BoundAssessment, EvidenceDigest,
-    LiveEventClass, LiveEvidenceBinding, MetadataRevision, ProviderChannel, ProviderProduct,
+    AssessmentValidity, AuthorizationBasis, BindingError, BookStateBinding, BoundAssessment,
+    EvidenceDigest, LiveEventClass, LiveEvidenceBinding, MetadataRevision, ProviderChannel,
+    ProviderProduct,
 };
 pub use coverage::{
     CoverageConsolidation, CoverageDelay, CoverageDimension, CoverageError, CoverageScope,

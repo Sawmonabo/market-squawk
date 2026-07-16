@@ -43,8 +43,10 @@ fn coverage_is_scoped_and_bound_to_effective_provider_metadata() -> Result<(), B
     let coverage = SourceCoverageRecord::new(
         binding.clone(),
         CoverageScope::new(
+            SourceId::try_from("coinbase-direct")?,
             VenueId::try_from("COINBASE")?,
             ProviderProduct::new(SourceIdentifier::try_from("BTC-USD")?),
+            ProviderChannel::new(SourceIdentifier::try_from("level2")?),
             LiveEventClass::BookDelta,
             Some(MarketDepth::PriceLevel),
             CoverageDelay::RealTime,

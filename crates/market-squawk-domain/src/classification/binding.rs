@@ -182,6 +182,8 @@ impl LiveEvidenceBinding {
             if state.state_digest != canonical_state_digest {
                 return Err(BindingError::CanonicalStateDigestMismatch);
             }
+        } else if book_state.is_some() {
+            return Err(BindingError::UnexpectedBookState);
         }
         Ok(Self {
             source_id,
@@ -314,6 +316,19 @@ pub struct BoundAssessment<T> {
     result: T,
 }
 
+/// Evidence-specific upper bound for a caller-supplied assessment validity window.
+///
+/// Most assessment results have no intrinsic clock deadline beyond the window supplied by their
+/// evaluator. Timing evidence is different: its retained market/source timestamps and checked
+/// policy determine an objective latest valid instant. Implementations are owned by the domain so
+/// downstream callers cannot weaken that limit for domain evidence types.
+pub trait AssessmentValidity {
+    /// Returns the inclusive intrinsic expiry, when the evidence itself determines one.
+    fn maximum_valid_until(&self) -> Option<Timestamp> {
+        None
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, bound(deserialize = "T: Deserialize<'de>"))]
 struct BoundAssessmentWire<T> {
@@ -325,7 +340,7 @@ struct BoundAssessmentWire<T> {
 
 impl<'de, T> Deserialize<'de> for BoundAssessment<T>
 where
-    T: Deserialize<'de>,
+    T: AssessmentValidity + Deserialize<'de>,
 {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -342,7 +357,10 @@ where
     }
 }
 
-impl<T> BoundAssessment<T> {
+impl<T> BoundAssessment<T>
+where
+    T: AssessmentValidity,
+{
     /// Constructs a checked inclusive validity interval.
     ///
     /// # Errors
@@ -356,6 +374,12 @@ impl<T> BoundAssessment<T> {
     ) -> Result<Self, BindingError> {
         if valid_until < evaluated_at {
             return Err(BindingError::ValidityBeforeEvaluation);
+        }
+        if result
+            .maximum_valid_until()
+            .is_some_and(|maximum| valid_until > maximum)
+        {
+            return Err(BindingError::ValidityExceedsEvidence);
         }
         Ok(Self {
             binding,
@@ -392,8 +416,12 @@ impl<T> BoundAssessment<T> {
 pub enum BindingError {
     /// A book event omitted its exact book-state identity.
     MissingBookState,
+    /// A non-book event supplied an order-book state binding.
+    UnexpectedBookState,
     /// An assessment expiry precedes its evaluation instant.
     ValidityBeforeEvaluation,
+    /// An assessment expiry exceeds an objective deadline derived from its retained evidence.
+    ValidityExceedsEvidence,
     /// Bound book state and canonical-state digests disagree.
     CanonicalStateDigestMismatch,
 }
@@ -404,8 +432,14 @@ impl fmt::Display for BindingError {
             Self::MissingBookState => {
                 formatter.write_str("book events require a book-state binding")
             }
+            Self::UnexpectedBookState => {
+                formatter.write_str("non-book events must not retain book state")
+            }
             Self::ValidityBeforeEvaluation => {
                 formatter.write_str("valid-until must not precede evaluated-at")
+            }
+            Self::ValidityExceedsEvidence => {
+                formatter.write_str("valid-until exceeds the evidence-derived deadline")
             }
             Self::CanonicalStateDigestMismatch => {
                 formatter.write_str("book-state digest must match canonical-state digest")

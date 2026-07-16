@@ -4,7 +4,7 @@ use std::fmt;
 
 use serde::Serialize;
 
-use super::{FreshnessState, TimestampIntegrity};
+use super::{AssessmentValidity, FreshnessState, TimestampIntegrity};
 use crate::{ConnectionGeneration, Timestamp};
 
 /// A failure to construct or evaluate live timing evidence.
@@ -233,6 +233,35 @@ impl LiveTimingAssessment {
     pub const fn freshness(self) -> FreshnessState {
         self.freshness
     }
+
+    /// Returns the inclusive latest instant permitted by both source-age and market-age policy.
+    ///
+    /// The deadline exists only when the retained assessment established valid timestamps and a
+    /// fresh market event. It uses `i128` arithmetic and clamps a mathematical deadline beyond the
+    /// representable timestamp domain to [`i64::MAX`]. Static future-skew and transport checks were
+    /// already applied atomically by [`Self::assess`].
+    pub fn maximum_valid_instant(self) -> Option<Timestamp> {
+        if self.timestamp_integrity != TimestampIntegrity::Valid
+            || self.freshness != FreshnessState::Fresh
+        {
+            return None;
+        }
+        let event = self.latest_market_event?;
+        let source_timestamp = event.source_timestamp?;
+        let source_deadline = i128::from(source_timestamp.unix_nanos())
+            + i128::from(self.policy.maximum_source_age_nanos);
+        let market_deadline = i128::from(event.received_at.unix_nanos())
+            + i128::from(self.policy.maximum_market_age_nanos);
+        Some(Timestamp::from_unix_nanos(clamp_timestamp(
+            source_deadline.min(market_deadline),
+        )))
+    }
+}
+
+impl AssessmentValidity for LiveTimingAssessment {
+    fn maximum_valid_until(&self) -> Option<Timestamp> {
+        self.maximum_valid_instant()
+    }
 }
 
 fn elapsed(earlier: Timestamp, later: Timestamp) -> i128 {
@@ -241,4 +270,8 @@ fn elapsed(earlier: Timestamp, later: Timestamp) -> i128 {
 
 fn signed_delta(earlier: Timestamp, later: Timestamp) -> i128 {
     i128::from(later.unix_nanos()) - i128::from(earlier.unix_nanos())
+}
+
+fn clamp_timestamp(value: i128) -> i64 {
+    value.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
 }

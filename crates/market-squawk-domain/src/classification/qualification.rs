@@ -5,30 +5,21 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    BookIntegrity, BoundAssessment, CaptureIntegrityState, ChecksumCapability, ChecksumEvidence,
-    ChecksumIntegrity, CoverageStatus, DataQuality, DeliveryEvidence, FreshnessState,
-    IntegrityCapabilities, LiveEvidenceBinding, LiveTimingAssessment, PrecisionIntegrity,
-    SequenceCapability, SequenceEvidence, SequenceIntegrity, SnapshotApplicability,
-    SnapshotConsistency, SnapshotEvidence, SnapshotState, SourceAuthorization,
-    SourceCoverageRecord, StreamIntegrityState, TimestampIntegrity,
+    BookIntegrity, BoundAssessment, CaptureIntegrityState, ChecksumCapability, ChecksumIntegrity,
+    ChecksumTarget, CoverageStatus, DataQuality, DeliveryEvidence, FreshnessState,
+    LiveEvidenceBinding, PrecisionIntegrity, SequenceCapability, SequenceIntegrity,
+    SnapshotApplicability, SnapshotConsistency, SnapshotState, SourceAuthorization,
+    StreamIntegrityState, TimestampIntegrity,
 };
-use crate::{SourceIdentifier, Timestamp, TradingStatus};
+use crate::{Timestamp, TradingStatus};
 
-/// Durable identity of a retained live-policy assessment.
-#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
-#[serde(transparent)]
-pub struct QualificationAssessmentId(SourceIdentifier);
+#[path = "qualification/input.rs"]
+mod input;
 
-impl QualificationAssessmentId {
-    /// Constructs a bounded assessment identity.
-    pub const fn new(value: SourceIdentifier) -> Self {
-        Self(value)
-    }
-    /// Returns the retained audit reference.
-    pub const fn as_source_identifier(&self) -> &SourceIdentifier {
-        &self.0
-    }
-}
+pub use input::{
+    IntegrityAssessmentSet, MarketAssessmentSet, QualificationAssessmentId,
+    QualificationAssessmentInput, SourcePolicyAssessment,
+};
 
 /// One explicit reason a policy assessment did not satisfy direct-verified conditions.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -96,187 +87,6 @@ pub enum AssessmentStatus {
     Rejected,
 }
 
-/// Source-registry values assessed as one metadata revision.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct SourcePolicyAssessment {
-    quality_ceiling: DataQuality,
-    integrity_capabilities: IntegrityCapabilities,
-    source_authorization: SourceAuthorization,
-    delivery_evidence: DeliveryEvidence,
-    snapshot_applicability: SnapshotApplicability,
-}
-
-impl SourcePolicyAssessment {
-    /// Constructs a cohesive source-registry policy result.
-    pub const fn new(
-        quality_ceiling: DataQuality,
-        integrity_capabilities: IntegrityCapabilities,
-        source_authorization: SourceAuthorization,
-        delivery_evidence: DeliveryEvidence,
-        snapshot_applicability: SnapshotApplicability,
-    ) -> Self {
-        Self {
-            quality_ceiling,
-            integrity_capabilities,
-            source_authorization,
-            delivery_evidence,
-            snapshot_applicability,
-        }
-    }
-
-    /// Returns the source quality ceiling.
-    pub const fn quality_ceiling(&self) -> DataQuality {
-        self.quality_ceiling
-    }
-    /// Returns declared integrity capabilities.
-    pub const fn integrity_capabilities(&self) -> IntegrityCapabilities {
-        self.integrity_capabilities
-    }
-    /// Returns source authorization.
-    pub const fn source_authorization(&self) -> SourceAuthorization {
-        self.source_authorization
-    }
-    /// Returns the delivery relationship.
-    pub const fn delivery_evidence(&self) -> DeliveryEvidence {
-        self.delivery_evidence
-    }
-    /// Returns snapshot applicability for the exact event class.
-    pub const fn snapshot_applicability(&self) -> &SnapshotApplicability {
-        &self.snapshot_applicability
-    }
-}
-
-/// Integrity assessments that must describe the exact same live observation.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct IntegrityAssessmentSet {
-    sequence: BoundAssessment<SequenceEvidence>,
-    snapshot: BoundAssessment<SnapshotEvidence>,
-    checksum: BoundAssessment<ChecksumEvidence>,
-    timing: BoundAssessment<LiveTimingAssessment>,
-}
-
-impl IntegrityAssessmentSet {
-    /// Groups independently evaluated integrity evidence.
-    pub const fn new(
-        sequence: BoundAssessment<SequenceEvidence>,
-        snapshot: BoundAssessment<SnapshotEvidence>,
-        checksum: BoundAssessment<ChecksumEvidence>,
-        timing: BoundAssessment<LiveTimingAssessment>,
-    ) -> Self {
-        Self {
-            sequence,
-            snapshot,
-            checksum,
-            timing,
-        }
-    }
-    /// Returns sequence evidence.
-    pub const fn sequence(&self) -> &BoundAssessment<SequenceEvidence> {
-        &self.sequence
-    }
-    /// Returns snapshot evidence.
-    pub const fn snapshot(&self) -> &BoundAssessment<SnapshotEvidence> {
-        &self.snapshot
-    }
-    /// Returns checksum evidence.
-    pub const fn checksum(&self) -> &BoundAssessment<ChecksumEvidence> {
-        &self.checksum
-    }
-    /// Returns timing evidence.
-    pub const fn timing(&self) -> &BoundAssessment<LiveTimingAssessment> {
-        &self.timing
-    }
-}
-
-/// Market-state assessments that must describe the exact same live observation.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct MarketAssessmentSet {
-    trading_status: BoundAssessment<TradingStatus>,
-    precision: BoundAssessment<PrecisionIntegrity>,
-    coverage: BoundAssessment<SourceCoverageRecord>,
-    book: BoundAssessment<BookIntegrity>,
-    stream: BoundAssessment<StreamIntegrityState>,
-    capture: BoundAssessment<CaptureIntegrityState>,
-}
-
-impl MarketAssessmentSet {
-    /// Groups independently evaluated market-state evidence.
-    pub const fn new(
-        trading_status: BoundAssessment<TradingStatus>,
-        precision: BoundAssessment<PrecisionIntegrity>,
-        coverage: BoundAssessment<SourceCoverageRecord>,
-        book: BoundAssessment<BookIntegrity>,
-        stream: BoundAssessment<StreamIntegrityState>,
-        capture: BoundAssessment<CaptureIntegrityState>,
-    ) -> Self {
-        Self {
-            trading_status,
-            precision,
-            coverage,
-            book,
-            stream,
-            capture,
-        }
-    }
-    /// Returns trading status.
-    pub const fn trading_status(&self) -> &BoundAssessment<TradingStatus> {
-        &self.trading_status
-    }
-    /// Returns precision evidence.
-    pub const fn precision(&self) -> &BoundAssessment<PrecisionIntegrity> {
-        &self.precision
-    }
-    /// Returns coverage evidence.
-    pub const fn coverage(&self) -> &BoundAssessment<SourceCoverageRecord> {
-        &self.coverage
-    }
-    /// Returns book evidence.
-    pub const fn book(&self) -> &BoundAssessment<BookIntegrity> {
-        &self.book
-    }
-    /// Returns stream evidence.
-    pub const fn stream(&self) -> &BoundAssessment<StreamIntegrityState> {
-        &self.stream
-    }
-    /// Returns capture evidence.
-    pub const fn capture(&self) -> &BoundAssessment<CaptureIntegrityState> {
-        &self.capture
-    }
-}
-
-/// Cohesive input to relational live-policy assessment.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct QualificationAssessmentInput {
-    assessment_id: QualificationAssessmentId,
-    binding: LiveEvidenceBinding,
-    source_policy: BoundAssessment<SourcePolicyAssessment>,
-    integrity: IntegrityAssessmentSet,
-    market: MarketAssessmentSet,
-}
-
-impl QualificationAssessmentInput {
-    /// Collects complete evidence without accepting an eligibility or quality result.
-    pub const fn new(
-        assessment_id: QualificationAssessmentId,
-        binding: LiveEvidenceBinding,
-        source_policy: BoundAssessment<SourcePolicyAssessment>,
-        integrity: IntegrityAssessmentSet,
-        market: MarketAssessmentSet,
-    ) -> Self {
-        Self {
-            assessment_id,
-            binding,
-            source_policy,
-            integrity,
-            market,
-        }
-    }
-}
-
 /// Component named in a relational construction failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QualificationComponent {
@@ -325,6 +135,12 @@ pub enum QualificationError {
     BookStateMismatch,
     /// Snapshot claims initialization after the snapshot assessment instant.
     SnapshotInitializedAfterEvaluation,
+    /// Snapshot applicability does not match the bound event class.
+    SnapshotEventClassMismatch,
+    /// The checksum target does not match the bound event class.
+    ChecksumEventClassMismatch,
+    /// Book-integrity applicability does not match the bound event class.
+    BookIntegrityEventClassMismatch,
 }
 
 impl fmt::Display for QualificationError {
@@ -356,6 +172,15 @@ impl fmt::Display for QualificationError {
             }
             Self::SnapshotInitializedAfterEvaluation => {
                 formatter.write_str("snapshot initialization occurs after assessment")
+            }
+            Self::SnapshotEventClassMismatch => {
+                formatter.write_str("snapshot applicability does not match event class")
+            }
+            Self::ChecksumEventClassMismatch => {
+                formatter.write_str("checksum target does not match event class")
+            }
+            Self::BookIntegrityEventClassMismatch => {
+                formatter.write_str("book-integrity applicability does not match event class")
             }
         }
     }
@@ -559,26 +384,33 @@ fn validate_relations(input: &QualificationAssessmentInput) -> Result<(), Qualif
             component: QualificationComponent::Checksum,
         });
     }
-    if let (Some(sequence), Some(snapshot)) = (
-        input.integrity.sequence.result().snapshot_sequence(),
-        input.integrity.snapshot.result().snapshot_sequence(),
-    ) && sequence != snapshot
-    {
-        return Err(QualificationError::EvidenceDisagreement {
-            component: QualificationComponent::Snapshot,
-        });
-    }
-    if let (Some(sequence), Some(snapshot)) = (
-        input.integrity.sequence.result().observed_sequence(),
-        input.integrity.snapshot.result().observed_sequence(),
-    ) && sequence != snapshot
-    {
-        return Err(QualificationError::EvidenceDisagreement {
-            component: QualificationComponent::Sequence,
-        });
+    let is_book = input.binding.event_class().requires_book_state();
+    if is_book && capabilities.sequence() == SequenceCapability::Provided {
+        if input.integrity.sequence.result().snapshot_sequence()
+            != input.integrity.snapshot.result().snapshot_sequence()
+        {
+            return Err(QualificationError::EvidenceDisagreement {
+                component: QualificationComponent::Snapshot,
+            });
+        }
+        if input.integrity.sequence.result().observed_sequence()
+            != input.integrity.snapshot.result().observed_sequence()
+        {
+            return Err(QualificationError::EvidenceDisagreement {
+                component: QualificationComponent::Sequence,
+            });
+        }
     }
 
     let snapshot = input.integrity.snapshot.result();
+    if is_book
+        != matches!(
+            input.source_policy.result().snapshot_applicability(),
+            SnapshotApplicability::Required
+        )
+    {
+        return Err(QualificationError::SnapshotEventClassMismatch);
+    }
     match input.source_policy.result().snapshot_applicability() {
         SnapshotApplicability::Required => {
             if !snapshot.is_initialized() {
@@ -591,12 +423,7 @@ fn validate_relations(input: &QualificationAssessmentInput) -> Result<(), Qualif
             }
         }
     }
-    if input.binding.event_class().requires_book_state()
-        && (!matches!(
-            input.source_policy.result().snapshot_applicability(),
-            SnapshotApplicability::Required
-        ) || !snapshot.is_initialized())
-    {
+    if is_book && !snapshot.is_initialized() {
         return Err(QualificationError::BookSnapshotRequired);
     }
     if let (Some(book), SnapshotState::Initialized(initialized)) =
@@ -611,14 +438,31 @@ fn validate_relations(input: &QualificationAssessmentInput) -> Result<(), Qualif
     {
         return Err(QualificationError::SnapshotInitializedAfterEvaluation);
     }
-    if let (Some(book), Some(scope)) = (
-        input.binding.book_state(),
-        input.integrity.checksum.result().scope(),
-    ) && scope.depth() != book.depth()
-    {
-        return Err(QualificationError::EvidenceDisagreement {
-            component: QualificationComponent::Checksum,
-        });
+    let checksum = input.integrity.checksum.result();
+    match (is_book, checksum.capability(), checksum.target()) {
+        (true, ChecksumCapability::Provided, Some(ChecksumTarget::Book(scope))) => {
+            let book = input
+                .binding
+                .book_state()
+                .ok_or(QualificationError::ChecksumEventClassMismatch)?;
+            if scope.depth() != book.depth() {
+                return Err(QualificationError::EvidenceDisagreement {
+                    component: QualificationComponent::Checksum,
+                });
+            }
+        }
+        (false, ChecksumCapability::Provided, Some(ChecksumTarget::Payload(_)))
+        | (_, ChecksumCapability::Unsupported, None) => {}
+        _ => return Err(QualificationError::ChecksumEventClassMismatch),
+    }
+    match (is_book, *input.market.book.result()) {
+        (true, BookIntegrity::NotApplicable) | (false, BookIntegrity::Consistent) => {
+            return Err(QualificationError::BookIntegrityEventClassMismatch);
+        }
+        (false, BookIntegrity::Crossed | BookIntegrity::Unknown) => {
+            return Err(QualificationError::BookIntegrityEventClassMismatch);
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -739,7 +583,12 @@ fn derive_failures(input: &QualificationAssessmentInput, at: Timestamp) -> Eligi
     if input.market.coverage.result().status_at(at) != CoverageStatus::Sufficient {
         failures.insert(EligibilityFailure::Coverage);
     }
-    if *input.market.book.result() != BookIntegrity::Consistent {
+    let expected_book_integrity = if input.binding.event_class().requires_book_state() {
+        BookIntegrity::Consistent
+    } else {
+        BookIntegrity::NotApplicable
+    };
+    if *input.market.book.result() != expected_book_integrity {
         failures.insert(EligibilityFailure::BookIntegrity);
     }
     if *input.market.stream.result() != StreamIntegrityState::Healthy {

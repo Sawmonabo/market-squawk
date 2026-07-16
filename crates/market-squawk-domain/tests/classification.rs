@@ -7,18 +7,16 @@ use market_squawk_domain::{
     BindingError, BookStateBinding, BoundAssessment, ChecksumCapability, ChecksumEvidence,
     ChecksumIntegrity, ChecksumScope, ChecksumValue, CoverageConsolidation, CoverageDelay,
     CoverageDimension, CoverageError, CoverageScope, CoverageStatus, DataQuality, EvidenceDigest,
-    FairValueHierarchy, IntegrityEvidenceError, LiveEventClass, LiveEvidenceBinding, MarketDepth,
+    IntegrityEvidenceError, LiveEventClass, LiveEvidenceBinding, MarketDepth,
     QualificationAssessment, SequenceCapability, SequenceEvidence, SequenceIntegrity,
     SequenceNumber, SequenceValidationRule, SourceCoverageRecord, SourceIdentifier, Timestamp,
 };
 use support::live::{BindingSpec, binding, rule, valid_assessment_input};
 
 #[test]
-fn fair_value_depth_quality_and_policy_status_remain_independent() -> Result<(), Box<dyn Error>> {
+fn live_qualification_is_derived_without_fair_value_classification() -> Result<(), Box<dyn Error>> {
     let assessment = QualificationAssessment::try_from(valid_assessment_input()?)?;
 
-    assert_eq!(FairValueHierarchy::Level3, FairValueHierarchy::Level3);
-    assert_eq!(MarketDepth::OrderLevel, MarketDepth::OrderLevel);
     assert_eq!(assessment.recorded_quality(), DataQuality::DirectVerified);
     assert_eq!(
         assessment.assessment_status_at(Timestamp::from_unix_nanos(1_020)),
@@ -43,7 +41,7 @@ fn sequence_and_checksum_results_are_derived_from_retained_operands() -> Result<
     assert_eq!(sequence.integrity(), SequenceIntegrity::Valid);
     assert_eq!(sequence.previous_sequence(), Some(SequenceNumber::new(41)));
 
-    let checksum = ChecksumEvidence::validate(
+    let checksum = ChecksumEvidence::validate_book(
         ChecksumCapability::Provided,
         Some(rule("provider.checksum.crc32")?),
         generation,
@@ -77,7 +75,7 @@ fn unsupported_capability_cannot_be_paired_with_supplied_evidence() -> Result<()
         Err(IntegrityEvidenceError::CapabilityContradiction { .. })
     ));
     assert!(matches!(
-        ChecksumEvidence::validate(
+        ChecksumEvidence::validate_book(
             ChecksumCapability::Unsupported,
             Some(rule("provider.checksum")?),
             generation,
@@ -147,8 +145,10 @@ fn book_binding_requires_exact_state_identity() -> Result<(), Box<dyn Error>> {
 fn coverage_scope_is_independently_checked_against_binding() -> Result<(), Box<dyn Error>> {
     let binding = binding(&BindingSpec::default())?;
     let wrong_venue = CoverageScope::new(
+        binding.source_id().clone(),
         market_squawk_domain::VenueId::try_from("KRAKEN")?,
         binding.provider_product().clone(),
+        binding.provider_channel().clone(),
         binding.event_class(),
         binding.book_state().map(BookStateBinding::depth),
         CoverageDelay::RealTime,
@@ -163,8 +163,10 @@ fn coverage_scope_is_independently_checked_against_binding() -> Result<(), Box<d
     );
 
     let delayed = CoverageScope::new(
+        binding.source_id().clone(),
         binding.venue_id().clone(),
         binding.provider_product().clone(),
+        binding.provider_channel().clone(),
         binding.event_class(),
         binding.book_state().map(BookStateBinding::depth),
         CoverageDelay::Delayed(1),

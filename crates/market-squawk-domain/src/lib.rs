@@ -13,21 +13,21 @@ mod time;
 mod version;
 
 pub use classification::{
-    AssessmentStatus, AuthorizationBasis, BindingError, BookIntegrity, BookStateBinding,
-    BoundAssessment, CaptureIntegrityState, ChecksumCapability, ChecksumEvidence,
-    ChecksumIntegrity, ChecksumScope, ChecksumValue, ClassificationError, CoverageConsolidation,
-    CoverageDelay, CoverageDimension, CoverageError, CoverageScope, CoverageStatus, DataQuality,
-    DeliveryEvidence, EligibilityFailure, EligibilityFailures, EvidenceDigest,
-    ExecutionEligibility, FairValueHierarchy, FreshnessState, InitializedSnapshot,
+    AssessmentStatus, AssessmentValidity, AuthorizationBasis, BindingError, BookIntegrity,
+    BookStateBinding, BoundAssessment, CaptureIntegrityState, ChecksumCapability, ChecksumEvidence,
+    ChecksumIntegrity, ChecksumScope, ChecksumTarget, ChecksumValue, ClassificationError,
+    CoverageConsolidation, CoverageDelay, CoverageDimension, CoverageError, CoverageScope,
+    CoverageStatus, DataQuality, DeliveryEvidence, EligibilityFailure, EligibilityFailures,
+    EvidenceDigest, ExecutionEligibility, FairValueHierarchy, FreshnessState, InitializedSnapshot,
     IntegrityAssessmentSet, IntegrityCapabilities, IntegrityEvidenceError, IntegrityRule,
     LiveEventClass, LiveEvidenceBinding, LiveTimingAssessment, LiveTimingPolicy,
-    MarketAssessmentSet, MarketDepth, MarketEventTiming, MetadataRevision, PrecisionIntegrity,
-    ProviderChannel, ProviderProduct, QualificationAssessment, QualificationAssessmentId,
-    QualificationAssessmentInput, QualificationComponent, QualificationError, RuleVersion,
-    SequenceCapability, SequenceEvidence, SequenceIntegrity, SequenceValidationRule,
-    SnapshotApplicability, SnapshotConsistency, SnapshotEvidence, SnapshotState,
-    SourceAuthorization, SourceCoverageRecord, SourcePolicyAssessment, StreamIntegrityState,
-    TimestampIntegrity,
+    MarketAssessmentSet, MarketDepth, MarketEventTiming, MetadataRevision, PayloadChecksumScope,
+    PrecisionIntegrity, ProviderChannel, ProviderProduct, QualificationAssessment,
+    QualificationAssessmentId, QualificationAssessmentInput, QualificationComponent,
+    QualificationError, RuleVersion, SequenceCapability, SequenceEvidence, SequenceIntegrity,
+    SequenceValidationRule, SnapshotApplicability, SnapshotConsistency, SnapshotEvidence,
+    SnapshotState, SourceAuthorization, SourceCoverageRecord, SourcePolicyAssessment,
+    StreamIntegrityState, TimestampIntegrity,
 };
 pub use denomination::Denomination;
 pub use financial::{

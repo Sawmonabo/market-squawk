@@ -13,7 +13,7 @@ use market_squawk_domain::{
     DeliveryEvidence, EvidenceDigest, InitializedSnapshot, InstrumentId, IntegrityAssessmentSet,
     IntegrityCapabilities, IntegrityRule, LiveEventClass, LiveEvidenceBinding,
     LiveTimingAssessment, LiveTimingPolicy, MarketAssessmentSet, MarketDepth, MarketEventTiming,
-    MetadataRevision, PrecisionIntegrity, ProviderChannel, ProviderProduct,
+    MetadataRevision, PayloadChecksumScope, PrecisionIntegrity, ProviderChannel, ProviderProduct,
     QualificationAssessmentId, QualificationAssessmentInput, RuleVersion, SequenceCapability,
     SequenceEvidence, SequenceNumber, SequenceValidationRule, SnapshotApplicability,
     SnapshotEvidence, SourceAuthorization, SourceCoverageRecord, SourceId, SourceIdentifier,
@@ -104,6 +104,68 @@ pub(crate) enum Component {
     Capture,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ChecksumFixture {
+    Book,
+    Payload,
+    Unsupported,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SnapshotPolicyFixture {
+    Required,
+    NotApplicable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RelationalEvidenceSpec {
+    pub checksum: ChecksumFixture,
+    pub snapshot_policy: SnapshotPolicyFixture,
+    pub snapshot_initialized: bool,
+    pub sequence_snapshot: Option<u64>,
+    pub sequence_previous: Option<u64>,
+    pub sequence_observed: Option<u64>,
+    pub sequence_uninitialized: bool,
+    pub sequence_unsupported: bool,
+    pub snapshot_sequence: Option<u64>,
+    pub snapshot_observed: Option<u64>,
+    pub book_integrity: BookIntegrity,
+}
+
+impl RelationalEvidenceSpec {
+    pub(crate) fn for_event(event_class: LiveEventClass) -> Self {
+        if event_class.requires_book_state() {
+            Self {
+                checksum: ChecksumFixture::Book,
+                snapshot_policy: SnapshotPolicyFixture::Required,
+                snapshot_initialized: true,
+                sequence_snapshot: Some(40),
+                sequence_previous: Some(41),
+                sequence_observed: Some(42),
+                sequence_uninitialized: false,
+                sequence_unsupported: false,
+                snapshot_sequence: Some(40),
+                snapshot_observed: Some(42),
+                book_integrity: BookIntegrity::Consistent,
+            }
+        } else {
+            Self {
+                checksum: ChecksumFixture::Payload,
+                snapshot_policy: SnapshotPolicyFixture::NotApplicable,
+                snapshot_initialized: false,
+                sequence_snapshot: Some(40),
+                sequence_previous: Some(41),
+                sequence_observed: Some(42),
+                sequence_uninitialized: false,
+                sequence_unsupported: false,
+                snapshot_sequence: None,
+                snapshot_observed: None,
+                book_integrity: BookIntegrity::NotApplicable,
+            }
+        }
+    }
+}
+
 fn selected(
     component: Component,
     override_component: Option<Component>,
@@ -122,6 +184,23 @@ pub(crate) fn assessment_input(
     override_component: Option<Component>,
     replacement: LiveEvidenceBinding,
     strictest_valid_until: Timestamp,
+) -> Result<QualificationAssessmentInput, Box<dyn Error>> {
+    let spec = RelationalEvidenceSpec::for_event(base.event_class());
+    assessment_input_with_relations(
+        base,
+        override_component,
+        replacement,
+        strictest_valid_until,
+        spec,
+    )
+}
+
+pub(crate) fn assessment_input_with_relations(
+    base: LiveEvidenceBinding,
+    override_component: Option<Component>,
+    replacement: LiveEvidenceBinding,
+    strictest_valid_until: Timestamp,
+    spec: RelationalEvidenceSpec,
 ) -> Result<QualificationAssessmentInput, Box<dyn Error>> {
     let evaluated_at = Timestamp::from_unix_nanos(1_010);
     let ordinary_valid_until = Timestamp::from_unix_nanos(1_100);
@@ -152,12 +231,20 @@ pub(crate) fn assessment_input(
     let stream_binding = selected(Component::Stream, override_component, &base, &replacement);
     let capture_binding = selected(Component::Capture, override_component, &base, &replacement);
 
-    let snapshot_applicability = if base.event_class().requires_book_state() {
-        SnapshotApplicability::Required
-    } else {
-        SnapshotApplicability::NotApplicable {
+    let snapshot_applicability = match spec.snapshot_policy {
+        SnapshotPolicyFixture::Required => SnapshotApplicability::Required,
+        SnapshotPolicyFixture::NotApplicable => SnapshotApplicability::NotApplicable {
             metadata_rule: rule("provider.snapshot.not-applicable")?,
-        }
+        },
+    };
+    let checksum_capability = match spec.checksum {
+        ChecksumFixture::Unsupported => ChecksumCapability::Unsupported,
+        ChecksumFixture::Book | ChecksumFixture::Payload => ChecksumCapability::Provided,
+    };
+    let sequence_capability = if spec.sequence_unsupported {
+        SequenceCapability::Unsupported
+    } else {
+        SequenceCapability::Provided
     };
     let source_policy = BoundAssessment::new(
         source_binding,
@@ -165,39 +252,65 @@ pub(crate) fn assessment_input(
         ordinary_valid_until,
         SourcePolicyAssessment::new(
             DataQuality::DirectVerified,
-            IntegrityCapabilities::new(SequenceCapability::Provided, ChecksumCapability::Provided),
+            IntegrityCapabilities::new(sequence_capability, checksum_capability),
             SourceAuthorization::Authorized,
             DeliveryEvidence::DirectVenue,
             snapshot_applicability,
         ),
     )?;
     let sequence_generation = sequence_binding.connection_generation();
-    let sequence = BoundAssessment::new(
-        sequence_binding,
-        evaluated_at,
-        ordinary_valid_until,
+    let sequence_result = if spec.sequence_unsupported {
+        SequenceEvidence::unsupported(sequence_generation)
+    } else if spec.sequence_uninitialized {
+        SequenceEvidence::uninitialized(
+            rule("provider.sequence.consecutive")?,
+            SequenceValidationRule::Consecutive,
+            sequence_generation,
+            spec.sequence_snapshot.map(SequenceNumber::new),
+        )
+    } else {
         SequenceEvidence::validate(
             SequenceCapability::Provided,
             Some(rule("provider.sequence.consecutive")?),
             SequenceValidationRule::Consecutive,
             sequence_generation,
-            Some(SequenceNumber::new(40)),
-            Some(SequenceNumber::new(41)),
-            Some(SequenceNumber::new(42)),
-        )?,
+            spec.sequence_snapshot.map(SequenceNumber::new),
+            spec.sequence_previous.map(SequenceNumber::new),
+            spec.sequence_observed.map(SequenceNumber::new),
+        )?
+    };
+    let sequence = BoundAssessment::new(
+        sequence_binding,
+        evaluated_at,
+        ordinary_valid_until,
+        sequence_result,
     )?;
     let snapshot_generation = snapshot_binding.connection_generation();
-    let snapshot_result = if let Some(snapshot_book) = snapshot_binding.book_state() {
+    let snapshot_result = if spec.snapshot_initialized {
+        let (snapshot_identity, snapshot_digest) = snapshot_binding.book_state().map_or_else(
+            || {
+                Ok::<_, Box<dyn Error>>((
+                    SourceIdentifier::try_from("non-book-snapshot")?,
+                    snapshot_binding.canonical_state_digest(),
+                ))
+            },
+            |snapshot_book| {
+                Ok((
+                    snapshot_book.state_id().clone(),
+                    snapshot_book.state_digest(),
+                ))
+            },
+        )?;
         SnapshotEvidence::assess_initialized(
             InitializedSnapshot::new(
                 snapshot_generation,
-                snapshot_book.state_id().clone(),
-                snapshot_book.state_digest(),
+                snapshot_identity,
+                snapshot_digest,
                 Timestamp::from_unix_nanos(900),
-                Some(SequenceNumber::new(40)),
+                spec.snapshot_sequence.map(SequenceNumber::new),
             ),
             snapshot_generation,
-            Some(SequenceNumber::new(42)),
+            spec.snapshot_observed.map(SequenceNumber::new),
         )?
     } else {
         SnapshotEvidence::uninitialized(snapshot_generation)
@@ -209,25 +322,41 @@ pub(crate) fn assessment_input(
         snapshot_result,
     )?;
     let checksum_generation = checksum_binding.connection_generation();
-    let checksum_depth = checksum_binding
-        .book_state()
-        .map_or(MarketDepth::TopOfBook, BookStateBinding::depth);
+    let checksum_result = match spec.checksum {
+        ChecksumFixture::Book => {
+            let checksum_depth = checksum_binding
+                .book_state()
+                .map_or(MarketDepth::TopOfBook, BookStateBinding::depth);
+            ChecksumEvidence::validate_book(
+                ChecksumCapability::Provided,
+                Some(rule("provider.checksum.crc32")?),
+                checksum_generation,
+                Some(ChecksumScope::new(
+                    checksum_depth,
+                    10,
+                    SourceIdentifier::try_from("top-ten-bid-ask")?,
+                )?),
+                Some(ChecksumValue::new(10)),
+                Some(ChecksumValue::new(10)),
+            )?
+        }
+        ChecksumFixture::Payload => ChecksumEvidence::validate_payload(
+            ChecksumCapability::Provided,
+            Some(rule("provider.payload-checksum.crc32")?),
+            checksum_generation,
+            Some(PayloadChecksumScope::new(SourceIdentifier::try_from(
+                "canonical-event-payload",
+            )?)),
+            Some(ChecksumValue::new(10)),
+            Some(ChecksumValue::new(10)),
+        )?,
+        ChecksumFixture::Unsupported => ChecksumEvidence::unsupported(checksum_generation),
+    };
     let checksum = BoundAssessment::new(
         checksum_binding,
         evaluated_at,
         ordinary_valid_until,
-        ChecksumEvidence::validate(
-            ChecksumCapability::Provided,
-            Some(rule("provider.checksum.crc32")?),
-            checksum_generation,
-            Some(ChecksumScope::new(
-                checksum_depth,
-                10,
-                SourceIdentifier::try_from("top-ten-bid-ask")?,
-            )?),
-            Some(ChecksumValue::new(10)),
-            Some(ChecksumValue::new(10)),
-        )?,
+        checksum_result,
     )?;
     let timing_generation = timing_binding.connection_generation();
     let timing = BoundAssessment::new(
@@ -270,7 +399,7 @@ pub(crate) fn assessment_input(
             book_binding,
             evaluated_at,
             ordinary_valid_until,
-            BookIntegrity::Consistent,
+            spec.book_integrity,
         )?,
         BoundAssessment::new(
             stream_binding,
@@ -304,8 +433,10 @@ pub(crate) fn coverage_record(
 ) -> Result<SourceCoverageRecord, Box<dyn Error>> {
     let book_depth = binding.book_state().map(BookStateBinding::depth);
     let scope = CoverageScope::new(
+        binding.source_id().clone(),
         binding.venue_id().clone(),
         binding.provider_product().clone(),
+        binding.provider_channel().clone(),
         binding.event_class(),
         book_depth,
         CoverageDelay::RealTime,

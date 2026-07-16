@@ -17,8 +17,3 @@ assert_not_impl_any!(
         Into<ExecutionEligibility>,
         TryInto<ExecutionEligibility>
 );
-
-#[test]
-fn classification_taxonomies_have_no_implicit_execution_conversion() {
-    // The durable assertions above fail this test target at compile time if a conversion is added.
-}

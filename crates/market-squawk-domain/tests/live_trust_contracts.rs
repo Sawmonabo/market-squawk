@@ -3,11 +3,16 @@ mod support;
 use std::error::Error;
 
 use market_squawk_domain::{
-    AssessmentStatus, ClassificationError, FreshnessState, LiveEventClass, LiveTimingAssessment,
-    LiveTimingPolicy, MarketEventTiming, QualificationAssessment, QualificationComponent,
-    QualificationError, SnapshotEvidence, Timestamp, TimestampIntegrity,
+    AssessmentStatus, CoverageConsolidation, CoverageDelay, CoverageDimension, CoverageError,
+    CoverageScope, CoverageStatus, LiveEventClass, LiveEvidenceBinding, MarketDepth,
+    MetadataRevision, ProviderChannel, ProviderProduct, QualificationAssessment,
+    QualificationComponent, QualificationError, SnapshotEvidence, SourceCoverageRecord, SourceId,
+    SourceIdentifier, Timestamp, VenueId,
 };
-use support::live::{BindingSpec, Component, assessment_input, binding, valid_assessment_input};
+use support::live::{
+    BindingSpec, ChecksumFixture, Component, RelationalEvidenceSpec, SnapshotPolicyFixture,
+    assessment_input, assessment_input_with_relations, binding, valid_assessment_input,
+};
 
 #[test]
 fn archive_assessment_never_returns_execution_authority() -> Result<(), Box<dyn Error>> {
@@ -25,18 +30,191 @@ fn archive_assessment_never_returns_execution_authority() -> Result<(), Box<dyn 
 }
 
 #[test]
-fn strictest_expiry_is_inclusive_then_queue_delay_rejects_at_plus_one_nanosecond()
--> Result<(), Box<dyn Error>> {
-    let assessment = QualificationAssessment::try_from(valid_assessment_input()?)?;
+fn coverage_rejects_source_and_channel_transplants() -> Result<(), Box<dyn Error>> {
+    let base = binding(&BindingSpec::default())?;
+    let scope = CoverageScope::new(
+        base.source_id().clone(),
+        base.venue_id().clone(),
+        base.provider_product().clone(),
+        base.provider_channel().clone(),
+        base.event_class(),
+        base.book_state()
+            .map(market_squawk_domain::BookStateBinding::depth),
+        CoverageDelay::RealTime,
+        CoverageConsolidation::SingleVenue,
+        Timestamp::from_unix_nanos(900),
+        Some(Timestamp::from_unix_nanos(2_000)),
+        base.metadata_revision().clone(),
+    )?;
 
-    assert_eq!(assessment.valid_until(), Timestamp::from_unix_nanos(1_020));
-    assert_eq!(
-        assessment.assessment_status_at(Timestamp::from_unix_nanos(1_020)),
-        AssessmentStatus::Satisfied
-    );
-    assert_eq!(
-        assessment.assessment_status_at(Timestamp::from_unix_nanos(1_021)),
-        AssessmentStatus::Rejected
+    for replacement in [
+        binding(&BindingSpec {
+            source: "kraken-direct",
+            ..BindingSpec::default()
+        })?,
+        binding(&BindingSpec {
+            channel: "level3",
+            ..BindingSpec::default()
+        })?,
+    ] {
+        assert!(
+            SourceCoverageRecord::new(replacement, scope.clone(), CoverageStatus::Sufficient)
+                .is_err()
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn coverage_rejects_transplants_across_every_binding_dimension() -> Result<(), Box<dyn Error>> {
+    let base = binding(&BindingSpec::default())?;
+    let scope = |source: &str,
+                 venue: &str,
+                 product: &str,
+                 channel: &str,
+                 event_class: LiveEventClass,
+                 depth: MarketDepth,
+                 revision: &str|
+     -> Result<CoverageScope, Box<dyn Error>> {
+        Ok(CoverageScope::new(
+            SourceId::try_from(source)?,
+            VenueId::try_from(venue)?,
+            ProviderProduct::new(SourceIdentifier::try_from(product)?),
+            ProviderChannel::new(SourceIdentifier::try_from(channel)?),
+            event_class,
+            Some(depth),
+            CoverageDelay::RealTime,
+            CoverageConsolidation::SingleVenue,
+            Timestamp::from_unix_nanos(900),
+            Some(Timestamp::from_unix_nanos(2_000)),
+            MetadataRevision::new(SourceIdentifier::try_from(revision)?),
+        )?)
+    };
+    let cases = [
+        (
+            scope(
+                "kraken-direct",
+                "COINBASE",
+                "BTC-USD",
+                "level2",
+                LiveEventClass::BookDelta,
+                MarketDepth::PriceLevel,
+                "coinbase-advanced-trade-v3",
+            )?,
+            CoverageDimension::Source,
+        ),
+        (
+            scope(
+                "coinbase-direct",
+                "KRAKEN",
+                "BTC-USD",
+                "level2",
+                LiveEventClass::BookDelta,
+                MarketDepth::PriceLevel,
+                "coinbase-advanced-trade-v3",
+            )?,
+            CoverageDimension::Venue,
+        ),
+        (
+            scope(
+                "coinbase-direct",
+                "COINBASE",
+                "ETH-USD",
+                "level2",
+                LiveEventClass::BookDelta,
+                MarketDepth::PriceLevel,
+                "coinbase-advanced-trade-v3",
+            )?,
+            CoverageDimension::Product,
+        ),
+        (
+            scope(
+                "coinbase-direct",
+                "COINBASE",
+                "BTC-USD",
+                "level3",
+                LiveEventClass::BookDelta,
+                MarketDepth::PriceLevel,
+                "coinbase-advanced-trade-v3",
+            )?,
+            CoverageDimension::Channel,
+        ),
+        (
+            scope(
+                "coinbase-direct",
+                "COINBASE",
+                "BTC-USD",
+                "level2",
+                LiveEventClass::BookSnapshot,
+                MarketDepth::PriceLevel,
+                "coinbase-advanced-trade-v3",
+            )?,
+            CoverageDimension::EventClass,
+        ),
+        (
+            scope(
+                "coinbase-direct",
+                "COINBASE",
+                "BTC-USD",
+                "level2",
+                LiveEventClass::BookDelta,
+                MarketDepth::OrderLevel,
+                "coinbase-advanced-trade-v3",
+            )?,
+            CoverageDimension::Depth,
+        ),
+        (
+            scope(
+                "coinbase-direct",
+                "COINBASE",
+                "BTC-USD",
+                "level2",
+                LiveEventClass::BookDelta,
+                MarketDepth::PriceLevel,
+                "coinbase-advanced-trade-v4",
+            )?,
+            CoverageDimension::MetadataRevision,
+        ),
+    ];
+
+    for (transplanted, dimension) in cases {
+        assert_eq!(
+            SourceCoverageRecord::new(base.clone(), transplanted, CoverageStatus::Sufficient,),
+            Err(CoverageError::BindingMismatch(dimension))
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn non_book_binding_rejects_retained_book_state() -> Result<(), Box<dyn Error>> {
+    let book = binding(&BindingSpec::default())?;
+    let mut wire = serde_json::to_value(book)?;
+    wire["event_class"] = serde_json::json!("trade");
+
+    assert!(serde_json::from_value::<LiveEvidenceBinding>(wire).is_err());
+    Ok(())
+}
+
+#[test]
+fn non_book_coverage_rejects_market_depth() -> Result<(), Box<dyn Error>> {
+    assert!(
+        CoverageScope::new(
+            SourceId::try_from("coinbase-direct")?,
+            VenueId::try_from("COINBASE")?,
+            ProviderProduct::new(SourceIdentifier::try_from("BTC-USD")?),
+            market_squawk_domain::ProviderChannel::new(SourceIdentifier::try_from("ticker")?),
+            LiveEventClass::Trade,
+            Some(MarketDepth::TopOfBook),
+            CoverageDelay::RealTime,
+            CoverageConsolidation::SingleVenue,
+            Timestamp::from_unix_nanos(900),
+            None,
+            market_squawk_domain::MetadataRevision::new(SourceIdentifier::try_from(
+                "coinbase-advanced-trade-v3",
+            )?),
+        )
+        .is_err()
     );
     Ok(())
 }
@@ -231,85 +409,207 @@ fn non_book_events_require_explicit_metadata_backed_snapshot_non_applicability()
     Ok(())
 }
 
-fn timing(
-    source_at: Option<i64>,
-    received_at: i64,
-    evaluated_at: i64,
-    policy: LiveTimingPolicy,
-) -> Result<LiveTimingAssessment, Box<dyn Error>> {
-    Ok(LiveTimingAssessment::assess(
-        market_squawk_domain::ConnectionGeneration::new(7)?,
-        Some(MarketEventTiming::new(
-            source_at.map(Timestamp::from_unix_nanos),
-            Timestamp::from_unix_nanos(received_at),
-        )),
-        Some(Timestamp::from_unix_nanos(evaluated_at)),
-        Timestamp::from_unix_nanos(evaluated_at),
-        policy,
-    )?)
-}
-
 #[test]
-fn atomic_timing_rejects_stale_source_and_heartbeat_cannot_refresh_market()
--> Result<(), Box<dyn Error>> {
-    let policy = LiveTimingPolicy::new(5, 25, 50, 20)?;
-    let stale_source = timing(Some(900), 1_000, 1_010, policy)?;
-    assert_eq!(
-        stale_source.timestamp_integrity(),
-        TimestampIntegrity::Invalid
+fn checksum_target_and_book_integrity_follow_event_semantics() -> Result<(), Box<dyn Error>> {
+    let book_binding = binding(&BindingSpec::default())?;
+    let mut book_with_payload = RelationalEvidenceSpec::for_event(LiveEventClass::BookDelta);
+    book_with_payload.checksum = ChecksumFixture::Payload;
+    assert!(
+        QualificationAssessment::try_from(assessment_input_with_relations(
+            book_binding.clone(),
+            None,
+            book_binding.clone(),
+            Timestamp::from_unix_nanos(1_020),
+            book_with_payload,
+        )?)
+        .is_err()
     );
-    assert_eq!(stale_source.freshness(), FreshnessState::Fresh);
 
-    let heartbeat_only = LiveTimingAssessment::assess(
-        market_squawk_domain::ConnectionGeneration::new(7)?,
-        Some(MarketEventTiming::new(
-            Some(Timestamp::from_unix_nanos(1_000)),
-            Timestamp::from_unix_nanos(1_000),
-        )),
-        Some(Timestamp::from_unix_nanos(2_000)),
-        Timestamp::from_unix_nanos(2_000),
-        LiveTimingPolicy::new(0, 2_000, 2_000, 10)?,
-    )?;
-    assert_eq!(heartbeat_only.freshness(), FreshnessState::Stale);
+    let mut book_not_applicable = RelationalEvidenceSpec::for_event(LiveEventClass::BookDelta);
+    book_not_applicable.book_integrity = market_squawk_domain::BookIntegrity::NotApplicable;
+    assert!(
+        QualificationAssessment::try_from(assessment_input_with_relations(
+            book_binding.clone(),
+            None,
+            book_binding,
+            Timestamp::from_unix_nanos(1_020),
+            book_not_applicable,
+        )?)
+        .is_err()
+    );
+
+    let trade_binding = binding(&BindingSpec {
+        event_class: LiveEventClass::Trade,
+        ..BindingSpec::default()
+    })?;
+    let mut trade_with_book = RelationalEvidenceSpec::for_event(LiveEventClass::Trade);
+    trade_with_book.checksum = ChecksumFixture::Book;
+    assert!(
+        QualificationAssessment::try_from(assessment_input_with_relations(
+            trade_binding.clone(),
+            None,
+            trade_binding.clone(),
+            Timestamp::from_unix_nanos(1_020),
+            trade_with_book,
+        )?)
+        .is_err()
+    );
+
+    let mut trade_book_consistent = RelationalEvidenceSpec::for_event(LiveEventClass::Trade);
+    trade_book_consistent.book_integrity = market_squawk_domain::BookIntegrity::Consistent;
+    assert!(
+        QualificationAssessment::try_from(assessment_input_with_relations(
+            trade_binding.clone(),
+            None,
+            trade_binding,
+            Timestamp::from_unix_nanos(1_020),
+            trade_book_consistent,
+        )?)
+        .is_err()
+    );
     Ok(())
 }
 
 #[test]
-fn timing_boundaries_and_i64_extremes_use_checked_wide_arithmetic() -> Result<(), Box<dyn Error>> {
-    let policy = LiveTimingPolicy::new(5, 25, 50, 20)?;
-    assert_eq!(
-        timing(Some(975), 1_000, 1_020, policy)?.timestamp_integrity(),
-        TimestampIntegrity::Valid
-    );
-    assert_eq!(
-        timing(Some(974), 1_000, 1_020, policy)?.timestamp_integrity(),
-        TimestampIntegrity::Invalid
-    );
-    assert_eq!(
-        timing(Some(995), 1_000, 1_021, policy)?.freshness(),
-        FreshnessState::Stale
+fn snapshot_policy_is_required_for_books_and_not_applicable_for_non_books()
+-> Result<(), Box<dyn Error>> {
+    let book_binding = binding(&BindingSpec::default())?;
+    let mut book_not_applicable = RelationalEvidenceSpec::for_event(LiveEventClass::BookDelta);
+    book_not_applicable.snapshot_policy = SnapshotPolicyFixture::NotApplicable;
+    book_not_applicable.snapshot_initialized = false;
+    book_not_applicable.snapshot_sequence = None;
+    book_not_applicable.snapshot_observed = None;
+    assert!(
+        QualificationAssessment::try_from(assessment_input_with_relations(
+            book_binding.clone(),
+            None,
+            book_binding,
+            Timestamp::from_unix_nanos(1_020),
+            book_not_applicable,
+        )?)
+        .is_err()
     );
 
-    let edge = timing(
-        Some(i64::MIN),
-        i64::MIN,
-        i64::MAX,
-        LiveTimingPolicy::new(0, i64::MAX as u64, i64::MAX as u64, i64::MAX as u64)?,
-    )?;
-    assert_eq!(edge.timestamp_integrity(), TimestampIntegrity::Invalid);
-    assert_eq!(edge.freshness(), FreshnessState::Stale);
-    assert_eq!(
-        LiveTimingAssessment::assess(
-            market_squawk_domain::ConnectionGeneration::new(7)?,
-            Some(MarketEventTiming::new(
-                Some(Timestamp::from_unix_nanos(2)),
-                Timestamp::from_unix_nanos(2),
-            )),
+    let trade_binding = binding(&BindingSpec {
+        event_class: LiveEventClass::Trade,
+        ..BindingSpec::default()
+    })?;
+    let mut trade_required = RelationalEvidenceSpec::for_event(LiveEventClass::Trade);
+    trade_required.snapshot_policy = SnapshotPolicyFixture::Required;
+    trade_required.snapshot_initialized = true;
+    trade_required.snapshot_sequence = Some(40);
+    trade_required.snapshot_observed = Some(42);
+    assert!(
+        QualificationAssessment::try_from(assessment_input_with_relations(
+            trade_binding.clone(),
             None,
-            Timestamp::from_unix_nanos(1),
-            policy,
-        ),
-        Err(ClassificationError::EvaluationBeforeReceive)
+            trade_binding,
+            Timestamp::from_unix_nanos(1_020),
+            trade_required,
+        )?)
+        .is_err()
     );
+    Ok(())
+}
+
+#[test]
+fn metadata_backed_unsupported_checksum_remains_explicitly_supported() -> Result<(), Box<dyn Error>>
+{
+    for event_class in [LiveEventClass::BookDelta, LiveEventClass::Trade] {
+        let evidence_binding = binding(&BindingSpec {
+            event_class,
+            ..BindingSpec::default()
+        })?;
+        let mut spec = RelationalEvidenceSpec::for_event(event_class);
+        spec.checksum = ChecksumFixture::Unsupported;
+        let assessment = QualificationAssessment::try_from(assessment_input_with_relations(
+            evidence_binding.clone(),
+            None,
+            evidence_binding,
+            Timestamp::from_unix_nanos(1_020),
+            spec,
+        )?)?;
+        assert_eq!(
+            assessment.recorded_quality(),
+            market_squawk_domain::DataQuality::DirectVerified
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn metadata_backed_unsupported_sequence_is_retained_but_never_direct_verified()
+-> Result<(), Box<dyn Error>> {
+    let base = binding(&BindingSpec::default())?;
+    let mut spec = RelationalEvidenceSpec::for_event(LiveEventClass::BookDelta);
+    spec.sequence_unsupported = true;
+    spec.snapshot_sequence = None;
+    spec.snapshot_observed = None;
+    let assessment = QualificationAssessment::try_from(assessment_input_with_relations(
+        base.clone(),
+        None,
+        base,
+        Timestamp::from_unix_nanos(1_020),
+        spec,
+    )?)?;
+
+    assert_eq!(
+        assessment.recorded_quality(),
+        market_squawk_domain::DataQuality::DirectUnverified
+    );
+    assert!(assessment.has_failure(market_squawk_domain::EligibilityFailure::SequenceIntegrity));
+    Ok(())
+}
+
+#[test]
+fn provided_book_sequences_reject_every_partial_or_contradictory_option_pair()
+-> Result<(), Box<dyn Error>> {
+    let base = binding(&BindingSpec::default())?;
+    let mut cases = Vec::new();
+
+    let mut sequence_snapshot_missing =
+        RelationalEvidenceSpec::for_event(LiveEventClass::BookDelta);
+    sequence_snapshot_missing.sequence_snapshot = None;
+    cases.push(sequence_snapshot_missing);
+
+    let mut snapshot_snapshot_missing =
+        RelationalEvidenceSpec::for_event(LiveEventClass::BookDelta);
+    snapshot_snapshot_missing.snapshot_sequence = None;
+    cases.push(snapshot_snapshot_missing);
+
+    let mut snapshot_sequences_differ =
+        RelationalEvidenceSpec::for_event(LiveEventClass::BookDelta);
+    snapshot_sequences_differ.snapshot_sequence = Some(39);
+    cases.push(snapshot_sequences_differ);
+
+    let mut snapshot_observed_missing =
+        RelationalEvidenceSpec::for_event(LiveEventClass::BookDelta);
+    snapshot_observed_missing.snapshot_observed = None;
+    cases.push(snapshot_observed_missing);
+
+    let mut sequence_observed_missing =
+        RelationalEvidenceSpec::for_event(LiveEventClass::BookDelta);
+    sequence_observed_missing.sequence_uninitialized = true;
+    sequence_observed_missing.sequence_previous = None;
+    sequence_observed_missing.sequence_observed = None;
+    cases.push(sequence_observed_missing);
+
+    let mut observed_sequences_differ =
+        RelationalEvidenceSpec::for_event(LiveEventClass::BookDelta);
+    observed_sequences_differ.snapshot_observed = Some(43);
+    cases.push(observed_sequences_differ);
+
+    for spec in cases {
+        assert!(
+            QualificationAssessment::try_from(assessment_input_with_relations(
+                base.clone(),
+                None,
+                base.clone(),
+                Timestamp::from_unix_nanos(1_020),
+                spec,
+            )?)
+            .is_err()
+        );
+    }
     Ok(())
 }
