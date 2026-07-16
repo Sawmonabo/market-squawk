@@ -21,6 +21,9 @@ assert_not_impl_any!(market_squawk_sources::RegisteredSource: Clone, serde::Seri
 assert_not_impl_any!(market_squawk_sources::CurrentSourceSession: Clone, serde::Serialize, serde::de::DeserializeOwned);
 assert_impl_all!(market_squawk_sources::CurrentDecodedProviderBatch: Send);
 assert_not_impl_any!(market_squawk_sources::CurrentDecodedProviderBatch: Clone, serde::Serialize, serde::de::DeserializeOwned);
+assert_impl_all!(market_squawk_sources::CurrentDecodedProviderBatches: Send);
+assert_not_impl_any!(market_squawk_sources::CurrentDecodedProviderBatches: Clone, serde::Serialize, serde::de::DeserializeOwned);
+assert_not_impl_any!(market_squawk_sources::CurrentFrameEvidence: serde::Serialize, serde::de::DeserializeOwned);
 assert_not_impl_any!(market_squawk_sources::CaptureAdmissionIssuer: Clone, Sync, serde::Serialize);
 assert_not_impl_any!(market_squawk_sources::CaptureInitializationControl: Clone, Sync, serde::Serialize);
 assert_not_impl_any!(market_squawk_sources::CaptureGenerationCapabilities: Clone, Sync, serde::Serialize, serde::de::DeserializeOwned);
@@ -259,6 +262,9 @@ fn current_authority_is_scoped_by_venue_instrument_event_and_depth() -> TestResu
     let mut covered_instruments = (1_u128..4_096)
         .map(|value| InstrumentId::from_str(&format!("{value:032x}")))
         .collect::<Result<Vec<_>, _>>()?;
+    let other_instrument = *covered_instruments
+        .first()
+        .ok_or("maximum-universe fixture must not be empty")?;
     covered_instruments.push(instrument);
     let mut registry = AuthoritativeSourceRegistry::try_new()?;
     let registered = registry.register(
@@ -400,46 +406,70 @@ fn current_authority_is_scoped_by_venue_instrument_event_and_depth() -> TestResu
         &current_validated,
         IntegrityRule::new(source_identifier("coinbase-decoder")?, RuleVersion::new(1)?),
     );
-    let current_observation = ProviderNormalizedObservation::try_new(
-        source_identifier("trade-2")?,
-        VenueId::try_from("coinbase")?,
-        instrument,
-        ProviderTimestampEvidence::Provided {
-            value: Timestamp::from_unix_nanos(4),
-            rule: rule("coinbase-timestamp")?,
-        },
-        ProviderSequenceEvidence::Provided {
-            value: SequenceNumber::new(2),
-            rule: rule("coinbase-sequence")?,
-        },
-        ProviderSnapshotEvidence::NotApplicable(rule("trade-no-snapshot-v1")?),
-        ProviderChecksumEvidence::Unsupported {
-            rule: rule("coinbase-no-checksum")?,
-        },
-        ProviderObservationPayload::Trade {
-            trade_id: source_identifier("trade-2")?,
-            price: ProviderPrice::new(ProviderDecimalLexeme::try_new("100.00")?),
-            quantity: ProviderQuantity::new(ProviderDecimalLexeme::try_new("1.00")?),
-            aggressor: ProviderAggressorEvidence::new(
-                AggressorSide::Buy,
-                Some(source_identifier("BUY")?),
-                rule("coinbase-aggressor")?,
-            ),
-        },
-    )?;
-    let current_batch = current.validate_decoded_batch_owned(
+    let current_payload_digest = current_evidence.payload_digest();
+    let make_current_observation =
+        |instrument: InstrumentId, trade_id: &str, sequence: u64| -> TestResult<_> {
+            Ok(ProviderNormalizedObservation::try_new(
+                source_identifier(trade_id)?,
+                VenueId::try_from("coinbase")?,
+                instrument,
+                ProviderTimestampEvidence::Provided {
+                    value: Timestamp::from_unix_nanos(4),
+                    rule: rule("coinbase-timestamp")?,
+                },
+                ProviderSequenceEvidence::Provided {
+                    value: SequenceNumber::new(sequence),
+                    rule: rule("coinbase-sequence")?,
+                },
+                ProviderSnapshotEvidence::NotApplicable(rule("trade-no-snapshot-v1")?),
+                ProviderChecksumEvidence::Unsupported {
+                    rule: rule("coinbase-no-checksum")?,
+                },
+                ProviderObservationPayload::Trade {
+                    trade_id: source_identifier(trade_id)?,
+                    price: ProviderPrice::new(ProviderDecimalLexeme::try_new("100.00")?),
+                    quantity: ProviderQuantity::new(ProviderDecimalLexeme::try_new("1.00")?),
+                    aggressor: ProviderAggressorEvidence::new(
+                        AggressorSide::Buy,
+                        Some(source_identifier("BUY")?),
+                        rule("coinbase-aggressor")?,
+                    ),
+                },
+            )?)
+        };
+    let first_current_observation = make_current_observation(instrument, "trade-2", 2)?;
+    let other_observation = make_current_observation(other_instrument, "trade-3", 3)?;
+    let second_current_observation = make_current_observation(instrument, "trade-4", 4)?;
+    let current_batches = current.validate_decoded_batch_owned(
         DecodedProviderBatch::try_new(
             current_evidence,
-            vec![current_observation.clone(), current_observation],
+            vec![
+                first_current_observation,
+                other_observation,
+                second_current_observation,
+            ],
         )?,
         current_receipt,
     )?;
+    let mut routed_batches = current_batches.into_iter();
+    assert_eq!(routed_batches.len(), 2);
+    let current_batch = routed_batches
+        .next()
+        .ok_or("current routing collection lost its first batch")?;
+    assert_eq!(current_batch.key().instrument(), instrument);
     assert!(current_batch.retained_bytes() < 128 * 1024);
     let mut current_observations = current_batch.into_observations();
     assert_eq!(current_observations.len(), 2);
     let current_observation = current_observations
         .next()
         .ok_or("current batch lost its observation")?;
+    assert_eq!(
+        current_observation
+            .observation()
+            .source_identifier()
+            .as_str(),
+        "trade-2"
+    );
     let coverage = current_observation.policy().coverage();
     assert_eq!(coverage.source_id().as_str(), "source-a");
     assert_eq!(coverage.venue().as_str(), "coinbase");
@@ -463,5 +493,46 @@ fn current_authority_is_scoped_by_venue_instrument_event_and_depth() -> TestResu
         coverage.metadata_revision().as_source_identifier().as_str(),
         "revision-a"
     );
+    assert_eq!(
+        current_observation.frame_evidence().frame_id(),
+        current_frame.frame_id()
+    );
+    assert_eq!(
+        current_observation.frame_evidence().received_at(),
+        current_frame.received_at()
+    );
+    assert_eq!(
+        current_observation.frame_evidence().payload_digest(),
+        current_payload_digest
+    );
+    assert!(
+        current_observation
+            .frame_evidence()
+            .binding()
+            .shares_allocation_with(current_frame.binding())
+    );
+    assert_eq!(
+        current_observation
+            .frame_evidence()
+            .decoder_rule()
+            .provider_rule()
+            .as_str(),
+        "coinbase-decoder"
+    );
+    let second_current_observation = current_observations
+        .next()
+        .ok_or("current batch lost its second observation")?;
+    assert_eq!(
+        second_current_observation
+            .observation()
+            .source_identifier()
+            .as_str(),
+        "trade-4"
+    );
+    let other_batch = routed_batches
+        .next()
+        .ok_or("current routing collection lost its second batch")?;
+    assert_eq!(other_batch.key().instrument(), other_instrument);
+    assert_eq!(other_batch.into_observations().len(), 1);
     Ok(())
 }

@@ -61,10 +61,11 @@ pub use policy::{
     SharedProviderBudget,
 };
 pub use registry::{
-    AuthoritativeSourceRegistry, CurrentBatchKey, CurrentCoveragePolicy,
-    CurrentDecodedProviderBatch, CurrentHealthReporter, CurrentHealthUpdate, CurrentLivePolicy,
-    CurrentObservationIter, CurrentProviderObservation, CurrentSourceAuthorityLease,
-    CurrentSourceSession, CurrentStreamKey, InstrumentUniverseAttestation, RawFrameFactory,
-    RegisteredSource, RegistryAuthorityState, RegistryError, ValidatedCurrentSourceAuthority,
-    ValidatedLiveScope, ValidatedSourceSession,
+    AuthoritativeSourceRegistry, CurrentBatchIter, CurrentBatchKey, CurrentCoveragePolicy,
+    CurrentDecodedProviderBatch, CurrentDecodedProviderBatches, CurrentFrameEvidence,
+    CurrentHealthReporter, CurrentHealthUpdate, CurrentLivePolicy, CurrentObservationIter,
+    CurrentProviderObservation, CurrentSourceAuthorityLease, CurrentSourceSession,
+    CurrentStreamKey, InstrumentUniverseAttestation, RawFrameFactory, RegisteredSource,
+    RegistryAuthorityState, RegistryError, ValidatedCurrentSourceAuthority, ValidatedLiveScope,
+    ValidatedSourceSession,
 };

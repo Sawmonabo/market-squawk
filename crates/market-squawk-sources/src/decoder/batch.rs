@@ -141,6 +141,12 @@ impl ProviderNormalizedObservation {
             self.payload.deep_retained_bytes()?,
         ])
     }
+
+    pub(crate) fn retained_bytes(&self) -> Result<usize, DecodeError> {
+        std::mem::size_of::<Self>()
+            .checked_add(self.deep_retained_bytes()?)
+            .ok_or(DecodeError::RetainedSizeOverflow)
+    }
 }
 
 /// Intrinsically bounded pre-state observations emitted by one synchronous decode call.
@@ -162,13 +168,8 @@ impl DecodedProviderBatch {
         evidence: DecoderEvidence,
         observations: Vec<ProviderNormalizedObservation>,
     ) -> Result<Self, DecodeError> {
-        let Some(first) = observations.first() else {
+        if observations.is_empty() {
             return Err(DecodeError::EmptyBatch);
-        };
-        if observations.iter().skip(1).any(|observation| {
-            observation.venue() != first.venue() || observation.instrument() != first.instrument()
-        }) {
-            return Err(DecodeError::MixedRoutingScope);
         }
         let observations = BoundedVec::try_new(observations)
             .map_err(|error| DecodeError::TooManyEvents { max: error.max })?;
@@ -201,8 +202,8 @@ impl DecodedProviderBatch {
         self.observations.as_slice()
     }
 
-    pub(crate) fn into_observations(self) -> Vec<ProviderNormalizedObservation> {
-        self.observations.into_vec()
+    pub(crate) fn into_parts(self) -> (DecoderEvidence, Vec<ProviderNormalizedObservation>) {
+        (self.evidence, self.observations.into_vec())
     }
 
     /// Returns checked deep retained bytes for the closed decoded shape.
@@ -254,9 +255,6 @@ pub enum DecodeError {
     /// Decoder emitted no provider observation for an accepted frame.
     #[error("decoded provider batch must not be empty")]
     EmptyBatch,
-    /// One batch crossed deterministic venue/instrument routing ownership.
-    #[error("decoded provider batch must be homogeneous by venue and instrument")]
-    MixedRoutingScope,
     /// Provider evidence dimensions contradict event/state semantics.
     #[error("provider evidence is relationally inconsistent")]
     InvalidProviderEvidence,

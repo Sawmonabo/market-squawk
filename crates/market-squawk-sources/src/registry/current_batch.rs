@@ -1,8 +1,43 @@
 /// Private deterministic shard-routing key for one homogeneous batch.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct CurrentBatchKey {
     venue: VenueId,
     instrument: InstrumentId,
+}
+
+/// Exact receipt-validated raw-frame and decoder evidence shared across routed observations.
+#[derive(Clone, Debug)]
+pub struct CurrentFrameEvidence(Arc<crate::DecoderEvidence>);
+
+impl CurrentFrameEvidence {
+    fn new(evidence: crate::DecoderEvidence) -> Self {
+        Self(Arc::new(evidence))
+    }
+
+    /// Returns the exact current-session binding carried by the decoded frame.
+    pub fn binding(&self) -> &FrameSessionBinding {
+        self.0.binding()
+    }
+
+    /// Returns the nonzero generation-local raw-frame identity.
+    pub fn frame_id(&self) -> crate::FrameId {
+        self.0.frame_id()
+    }
+
+    /// Returns the trusted local raw-frame receive time.
+    pub fn received_at(&self) -> Timestamp {
+        self.0.received_at()
+    }
+
+    /// Returns the SHA-256 digest of the exact raw transport payload.
+    pub fn payload_digest(&self) -> market_squawk_domain::EvidenceDigest {
+        self.0.payload_digest()
+    }
+
+    /// Returns the exact metadata-bound decoder rule.
+    pub fn decoder_rule(&self) -> &market_squawk_domain::IntegrityRule {
+        self.0.decoder_rule()
+    }
 }
 
 impl CurrentBatchKey {
@@ -204,6 +239,17 @@ fn current_authority_shared_allocation_charge() -> Result<usize, RegistryError> 
         .ok_or(RegistryError::RetainedSizeOverflow)
 }
 
+fn current_frame_shared_allocation_charge() -> Result<usize, RegistryError> {
+    std::mem::size_of::<crate::DecoderEvidence>()
+        .checked_add(SourceId::MAX_LENGTH)
+        .and_then(|bytes| {
+            market_squawk_domain::SourceIdentifier::MAX_LENGTH
+                .checked_mul(3)
+                .and_then(|identity_bytes| bytes.checked_add(identity_bytes))
+        })
+        .ok_or(RegistryError::RetainedSizeOverflow)
+}
+
 /// Exact static and runtime policy retained with one current observation.
 #[derive(Debug)]
 pub struct CurrentLivePolicy {
@@ -271,12 +317,24 @@ impl CurrentLivePolicy {
 /// Intact current provider observation plus exact policy and current-authority lease.
 #[derive(Debug)]
 pub struct CurrentProviderObservation {
+    key: CurrentBatchKey,
+    frame_evidence: CurrentFrameEvidence,
     observation: crate::ProviderNormalizedObservation,
     policy: CurrentLivePolicy,
     authority: CurrentSourceAuthorityLease,
 }
 
 impl CurrentProviderObservation {
+    /// Returns the deterministic venue/instrument routing key.
+    pub const fn key(&self) -> &CurrentBatchKey {
+        &self.key
+    }
+
+    /// Returns exact receipt-validated raw-frame and decoder evidence.
+    pub const fn frame_evidence(&self) -> &CurrentFrameEvidence {
+        &self.frame_evidence
+    }
+
     pub const fn observation(&self) -> &crate::ProviderNormalizedObservation {
         &self.observation
     }
@@ -284,6 +342,11 @@ impl CurrentProviderObservation {
         &self.policy
     }
     pub const fn authority(&self) -> &CurrentSourceAuthorityLease {
+        &self.authority
+    }
+
+    /// Returns the current process-local source authority lease.
+    pub const fn current_lease(&self) -> &CurrentSourceAuthorityLease {
         &self.authority
     }
 
@@ -319,17 +382,76 @@ pub struct CurrentDecodedProviderBatch {
 }
 
 impl CurrentDecodedProviderBatch {
+    /// Returns the deterministic venue/instrument shard-routing key.
     pub const fn key(&self) -> &CurrentBatchKey {
         &self.key
     }
+
+    /// Returns the conservative retained-memory charge for bounded-queue admission.
     pub const fn retained_bytes(&self) -> usize {
         self.retained_bytes
     }
+
+    /// Revalidates the batch's current source, health, capture, and inclusive deadline authority.
+    ///
+    /// # Errors
+    ///
+    /// Fails after source/capture degradation, generation rollover, health revision, or deadline
+    /// expiry.
     pub fn validate_at(&self, at: Timestamp) -> Result<(), RegistryError> {
         self.authority.validate_at(at)
     }
+
+    /// Consumes the homogeneous routing batch in original provider wire order.
     pub fn into_observations(self) -> CurrentObservationIter {
         CurrentObservationIter(self.observations.into_vec().into_iter())
+    }
+}
+
+/// Bounded routed batches produced from one receipt-validated provider frame.
+#[derive(Debug)]
+pub struct CurrentDecodedProviderBatches {
+    batches: Box<[CurrentDecodedProviderBatch]>,
+}
+
+impl CurrentDecodedProviderBatches {
+    /// Returns the number of distinct venue/instrument routing groups.
+    pub fn len(&self) -> usize {
+        self.batches.len()
+    }
+
+    /// Returns whether the validated frame produced no routing groups.
+    ///
+    /// Construction rejects empty decoded frames, so production values always return false.
+    pub fn is_empty(&self) -> bool {
+        self.batches.is_empty()
+    }
+}
+
+/// Exact-size consuming iterator preserving first-key and per-key wire order.
+#[derive(Debug)]
+pub struct CurrentBatchIter(std::vec::IntoIter<CurrentDecodedProviderBatch>);
+
+impl Iterator for CurrentBatchIter {
+    type Item = CurrentDecodedProviderBatch;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0.size_hint()
+    }
+}
+
+impl ExactSizeIterator for CurrentBatchIter {}
+
+impl IntoIterator for CurrentDecodedProviderBatches {
+    type Item = CurrentDecodedProviderBatch;
+    type IntoIter = CurrentBatchIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        CurrentBatchIter(self.batches.into_vec().into_iter())
     }
 }
 

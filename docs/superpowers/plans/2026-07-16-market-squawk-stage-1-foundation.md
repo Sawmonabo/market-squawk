@@ -756,11 +756,13 @@ allowing capture before decode without making the adapter depend on platform/liv
 implementations.
 
 The borrowing validation view is only for synchronous inspection. Actor admission consumes the
-decoded batch together with an exact successful raw-capture admission receipt and returns an owned,
-`Send + 'static`, non-Serde `CurrentDecodedProviderBatch`. That envelope retains the exact private
-session, current-health, runtime-subscription, capture-generation, and raw-frame evidence
-allocations needed for O(1) actor-time revalidation; a bare or deserialized batch cannot cross the
-production shard-ingress boundary.
+decoded frame together with an exact successful raw-capture admission receipt and returns an owned,
+`Send + 'static`, non-Serde `CurrentDecodedProviderBatches`. One provider frame may contain multiple
+venue/instrument scopes; registry admission groups it into nonempty homogeneous
+`CurrentDecodedProviderBatch` values while preserving first-key and per-key wire order. Every
+intact `CurrentProviderObservation` retains shared exact frame identity, receive time, payload
+digest, decoder rule, current session/health/subscription/capture authority, and compact static
+policy. A bare or deserialized batch cannot cross the production shard-ingress boundary.
 
 The registry owns one process-local capture allocation per source connection generation. It issues
 exactly one registry-only-constructible, non-`Clone`, non-Serde

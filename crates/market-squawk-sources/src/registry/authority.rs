@@ -308,7 +308,7 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
         &self,
         batch: crate::DecodedProviderBatch,
         receipt: crate::CaptureAdmissionReceipt,
-    ) -> Result<CurrentDecodedProviderBatch, RegistryError> {
+    ) -> Result<CurrentDecodedProviderBatches, RegistryError> {
         self.validated.session.validate_current_lease()?;
         if !self
             .validated
@@ -353,48 +353,70 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
             }
             observation_authorities.push(scope);
         }
-        let retained_bytes = batch
-            .retained_bytes()
-            .map_err(|_| RegistryError::RetainedSizeOverflow)?;
-        let first = batch
-            .observations()
-            .first()
-            .ok_or(RegistryError::DecoderProfileMismatch)?;
-        let key = CurrentBatchKey {
-            venue: first.venue().clone(),
-            instrument: first.instrument(),
-        };
-        let observations = batch
-            .into_observations()
+        let (decoder_evidence, provider_observations) = batch.into_parts();
+        let frame_evidence = CurrentFrameEvidence::new(decoder_evidence);
+        let observations = provider_observations
             .into_iter()
             .zip(observation_authorities)
-            .map(|(observation, scope)| scope.into_current_observation(observation))
+            .map(|(observation, scope)| {
+                scope.into_current_observation(observation, frame_evidence.clone())
+            })
+            .collect::<Result<Vec<_>, RegistryError>>()?;
+        let mut positions: HashMap<CurrentBatchKey, usize> =
+            HashMap::with_capacity(observations.len());
+        let mut groups: Vec<(CurrentBatchKey, Vec<CurrentProviderObservation>)> = Vec::new();
+        for observation in observations {
+            let key = observation.key().clone();
+            if let Some(index) = positions.get(&key).copied() {
+                groups[index].1.push(observation);
+            } else {
+                let index = groups.len();
+                positions.insert(key.clone(), index);
+                groups.push((key, vec![observation]));
+            }
+        }
+        let batches = groups
+            .into_iter()
+            .map(|(key, observations)| {
+                let policy_allocations =
+                    observations.iter().try_fold(0_usize, |total, observation| {
+                        let provider = observation
+                            .observation
+                            .retained_bytes()
+                            .map_err(|_| RegistryError::RetainedSizeOverflow)?;
+                        total
+                            .checked_add(observation.policy.deep_allocation_charge()?)
+                            .and_then(|bytes| bytes.checked_add(provider))
+                            .ok_or(RegistryError::RetainedSizeOverflow)
+                    })?;
+                let authority_allocation = current_authority_shared_allocation_charge()?;
+                let frame_allocation = current_frame_shared_allocation_charge()?;
+                let retained_bytes = observations
+                    .len()
+                    .checked_mul(std::mem::size_of::<CurrentProviderObservation>())
+                    .and_then(|bytes| {
+                        bytes.checked_add(std::mem::size_of::<CurrentDecodedProviderBatch>())
+                    })
+                    .and_then(|bytes| bytes.checked_add(policy_allocations))
+                    .and_then(|bytes| bytes.checked_add(authority_allocation))
+                    .and_then(|bytes| bytes.checked_add(frame_allocation))
+                    .ok_or(RegistryError::RetainedSizeOverflow)?;
+                let observations = observations.into_boxed_slice();
+                let authority = observations
+                    .first()
+                    .ok_or(RegistryError::DecoderProfileMismatch)?
+                    .authority
+                    .clone();
+                Ok(CurrentDecodedProviderBatch {
+                    key,
+                    retained_bytes,
+                    authority,
+                    observations,
+                })
+            })
             .collect::<Result<Vec<_>, RegistryError>>()?
             .into_boxed_slice();
-        let policy_allocations = observations.iter().try_fold(0_usize, |total, observation| {
-            total
-                .checked_add(observation.policy.deep_allocation_charge()?)
-                .ok_or(RegistryError::RetainedSizeOverflow)
-        })?;
-        let authority_allocation = current_authority_shared_allocation_charge()?;
-        let structural = observations
-            .len()
-            .checked_mul(std::mem::size_of::<CurrentProviderObservation>())
-            .and_then(|bytes| retained_bytes.checked_add(bytes))
-            .and_then(|bytes| bytes.checked_add(policy_allocations))
-            .and_then(|bytes| bytes.checked_add(authority_allocation))
-            .ok_or(RegistryError::RetainedSizeOverflow)?;
-        let authority = observations
-            .first()
-            .ok_or(RegistryError::DecoderProfileMismatch)?
-            .authority
-            .clone();
-        Ok(CurrentDecodedProviderBatch {
-            key,
-            retained_bytes: structural,
-            authority,
-            observations,
-        })
+        Ok(CurrentDecodedProviderBatches { batches })
     }
 }
 
@@ -516,6 +538,7 @@ impl ValidatedLiveScope {
     fn into_current_observation(
         self,
         observation: crate::ProviderNormalizedObservation,
+        frame_evidence: CurrentFrameEvidence,
     ) -> Result<CurrentProviderObservation, RegistryError> {
         let crate::SourceProtocolProfile::Live(protocol) = self.protocol else {
             return Err(RegistryError::DecoderProfileMismatch);
@@ -534,7 +557,13 @@ impl ValidatedLiveScope {
             lease: self.lease,
             capture: self.capture,
         };
+        let key = CurrentBatchKey {
+            venue: self.venue.clone(),
+            instrument: self.instrument,
+        };
         Ok(CurrentProviderObservation {
+            key,
+            frame_evidence,
             observation,
             policy: CurrentLivePolicy {
                 stream_key,

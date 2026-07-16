@@ -218,7 +218,8 @@ pub struct CurrentDecodedProviderBatch { /* nonempty and homogeneous */ }
 
 impl CurrentDecodedProviderBatch {
     pub fn key(&self) -> &CurrentBatchKey;
-    pub fn retained_bytes(&self) -> Result<usize, DecodeError>;
+    pub fn retained_bytes(&self) -> usize;
+    pub fn validate_at(&self, at: Timestamp) -> Result<(), RegistryError>;
     pub fn into_observations(self) -> CurrentObservationIter;
 }
 
@@ -232,15 +233,27 @@ impl ExactSizeIterator for CurrentObservationIter {}
 
 #[derive(Debug)]
 pub struct CurrentProviderObservation {
-    /* exact observation + exact per-observation policy + current lease */
+    /* exact frame evidence + observation + exact per-observation policy + current lease */
 }
 
 impl CurrentProviderObservation {
     pub fn key(&self) -> &CurrentBatchKey;
     pub fn stream_key(&self) -> &CurrentStreamKey;
+    pub fn frame_evidence(&self) -> &CurrentFrameEvidence;
     pub fn observation(&self) -> &ProviderNormalizedObservation;
     pub fn policy(&self) -> &CurrentLivePolicy;
     pub fn current_lease(&self) -> &CurrentSourceAuthorityLease;
+}
+
+#[derive(Clone, Debug)]
+pub struct CurrentFrameEvidence { /* private Arc<DecoderEvidence> */ }
+
+impl CurrentFrameEvidence {
+    pub fn binding(&self) -> &FrameSessionBinding;
+    pub fn frame_id(&self) -> FrameId;
+    pub fn received_at(&self) -> Timestamp;
+    pub fn payload_digest(&self) -> EvidenceDigest;
+    pub fn decoder_rule(&self) -> &IntegrityRule;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -304,7 +317,14 @@ impl ValidatedCurrentSourceAuthority<'_> {
 `CurrentProviderObservation` from every `ValidatedLiveScope`, group by `CurrentBatchKey`, and return
 `CurrentDecodedProviderBatches`. There is deliberately no public `into_parts` that separates a bare
 observation from its policy and lease. Task 7 consumes the intact value and rechecks the lease at
-apply and issuance time.
+apply and issuance time. The checked retained-memory calculation is performed while the private
+batch is constructed, so its public `retained_bytes()` getter is infallible. Every routed batch
+conservatively charges shared frame and authority allocations as if it were retained independently.
+
+The implemented grouping contract preserves first-key order and wire order within each key. Every
+grouped observation shares immutable `CurrentFrameEvidence` for the exact receipt-validated raw
+frame; grouping never drops or reconstructs the binding, frame ordinal, receive time, payload
+digest, or metadata-bound decoder rule.
 
 `CurrentBatchKey(venue, instrument)` is only the deterministic Task 8 routing key. Mutable Task 7
 stream state is keyed by `CurrentStreamKey(source, venue, instrument, provider product, provider
