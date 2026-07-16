@@ -30,6 +30,22 @@ pub enum IdentifierError {
     InvalidAddress,
     /// A mixed-case EVM address did not satisfy EIP-55.
     InvalidAddressChecksum,
+    /// A valid Bitcoin address was not valid for the explicitly requested network.
+    InvalidAddressNetwork,
+    /// Futures lifecycle evidence did not contain any lifecycle date.
+    MissingLifecycleDate,
+    /// Futures lifecycle dates were not in a valid relational order.
+    InvalidLifecycleOrdering,
+    /// A futures leg position or ratio was zero.
+    ZeroLegRatio,
+    /// A futures leg position was zero.
+    ZeroLegPosition,
+    /// Multileg futures legs were not ordered from one without gaps.
+    InvalidLegOrdering,
+    /// An outright contract had legs, or a multileg contract lacked at least two legs.
+    InvalidLegStructure,
+    /// A multileg contract repeated a source-qualified leg security identity.
+    DuplicateLeg,
 }
 
 impl fmt::Display for IdentifierError {
@@ -52,6 +68,26 @@ impl fmt::Display for IdentifierError {
             }
             Self::InvalidAddress => formatter.write_str("address does not match its protocol rule"),
             Self::InvalidAddressChecksum => formatter.write_str("EVM address checksum is invalid"),
+            Self::InvalidAddressNetwork => {
+                formatter.write_str("Bitcoin address is not valid for the requested network")
+            }
+            Self::MissingLifecycleDate => {
+                formatter.write_str("futures lifecycle evidence requires at least one date")
+            }
+            Self::InvalidLifecycleOrdering => {
+                formatter.write_str("futures lifecycle dates are not relationally ordered")
+            }
+            Self::ZeroLegRatio => formatter.write_str("futures leg ratio must be nonzero"),
+            Self::ZeroLegPosition => formatter.write_str("futures leg position must be nonzero"),
+            Self::InvalidLegOrdering => {
+                formatter.write_str("futures leg positions must be ordered from one without gaps")
+            }
+            Self::InvalidLegStructure => {
+                formatter.write_str("futures legs do not match the security type")
+            }
+            Self::DuplicateLeg => {
+                formatter.write_str("futures multileg identity contains a duplicate leg")
+            }
         }
     }
 }
@@ -210,9 +246,11 @@ mod digital_assets;
 mod securities;
 
 pub use derivatives::{
-    ContractMonth, FuturesContractIdentity, FuturesSecurityType, OccOptionIdentity, OptionKind,
+    ContractMonth, FuturesContractIdentity, FuturesLeg, FuturesLegSide, FuturesLifecycleDates,
+    FuturesSecurityType, OccOptionIdentity, OptionKind,
 };
 pub use digital_assets::{
-    ChainAddress, ChainAddressRole, ChainAddressRule, ChainId, CryptoPair, CryptoProductType,
+    BitcoinAddressType, BitcoinNetwork, ChainAddress, ChainAddressRole, ChainAddressRule, ChainId,
+    CryptoPair, CryptoProductType,
 };
 pub use securities::{Cusip, Figi, Isin, Sedol};

@@ -10,6 +10,7 @@ publish = false
 
 [dependencies]
 bs58 = { workspace = true }
+bitcoin = { workspace = true }
 num-bigint = { workspace = true }
 rust_decimal = { workspace = true }
 serde = { workspace = true }

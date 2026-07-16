@@ -7,13 +7,92 @@ use serde::{Deserialize, Serialize};
 pub enum TimeError {
     /// Signed Unix-nanosecond arithmetic exceeded `i64`.
     Overflow,
+    /// A civil calendar date had an invalid year, month, or day.
+    InvalidCalendarDate,
 }
 
 impl fmt::Display for TimeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Overflow => formatter.write_str("timestamp arithmetic overflow"),
+            Self::InvalidCalendarDate => formatter.write_str("invalid Gregorian calendar date"),
         }
+    }
+}
+
+/// A proleptic Gregorian civil date without an invented time of day or time zone.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct CalendarDate {
+    year: u16,
+    month: u8,
+    day: u8,
+}
+
+impl CalendarDate {
+    /// Constructs a valid calendar date.
+    ///
+    /// # Errors
+    ///
+    /// Rejects year zero, months outside 1 through 12, and days outside the selected month.
+    pub const fn new(year: u16, month: u8, day: u8) -> Result<Self, TimeError> {
+        let days = match month {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 if is_leap_year(year) => 29,
+            2 => 28,
+            _ => return Err(TimeError::InvalidCalendarDate),
+        };
+        if year == 0 || day == 0 || day > days {
+            Err(TimeError::InvalidCalendarDate)
+        } else {
+            Ok(Self { year, month, day })
+        }
+    }
+
+    /// Returns the Gregorian year.
+    pub const fn year(self) -> u16 {
+        self.year
+    }
+
+    /// Returns the month from 1 through 12.
+    pub const fn month(self) -> u8 {
+        self.month
+    }
+
+    /// Returns the day of month.
+    pub const fn day(self) -> u8 {
+        self.day
+    }
+}
+
+const fn is_leap_year(year: u16) -> bool {
+    year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400))
+}
+
+impl fmt::Display for CalendarDate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{:04}-{:02}-{:02}",
+            self.year, self.month, self.day
+        )
+    }
+}
+
+#[derive(Deserialize)]
+struct CalendarDateWire {
+    year: u16,
+    month: u8,
+    day: u8,
+}
+
+impl<'de> Deserialize<'de> for CalendarDate {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = CalendarDateWire::deserialize(deserializer)?;
+        Self::new(wire.year, wire.month, wire.day).map_err(serde::de::Error::custom)
     }
 }
 

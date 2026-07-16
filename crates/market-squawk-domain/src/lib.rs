@@ -1,6 +1,7 @@
 //! Shared invariant-preserving Market Squawk domain contracts.
 
 mod classification;
+mod denomination;
 mod financial;
 mod identifiers;
 mod identity;
@@ -19,23 +20,27 @@ pub use classification::{
     SnapshotConsistency, SourceAuthorization, SourceCoverageEvidence, StreamIntegrityState,
     TimestampIntegrity,
 };
+pub use denomination::Denomination;
 pub use financial::{
     BasisPoints, Currency, FinancialError, LotSize, Money, PriceError, PriceTicks, QuantityError,
     QuantityLots, RoundingPolicy, TickSize,
 };
 pub use identifiers::{
-    ChainAddress, ChainAddressRole, ChainAddressRule, ChainId, ContractMonth, CryptoPair,
-    CryptoProductType, Cusip, Figi, FuturesContractIdentity, FuturesSecurityType, IdentifierError,
-    Isin, OccOptionIdentity, OptionKind, Sedol, Ticker, VenueSymbol,
+    BitcoinAddressType, BitcoinNetwork, ChainAddress, ChainAddressRole, ChainAddressRule, ChainId,
+    ContractMonth, CryptoPair, CryptoProductType, Cusip, Figi, FuturesContractIdentity, FuturesLeg,
+    FuturesLegSide, FuturesLifecycleDates, FuturesSecurityType, IdentifierError, Isin,
+    OccOptionIdentity, OptionKind, Sedol, Ticker, VenueSymbol,
 };
 pub use identity::{
     ConnectionGeneration, IdentityError, InstrumentId, ProviderInstrumentId, SequenceNumber,
     SourceId, SourceIdentifier, VenueId,
 };
 pub use instrument::{
-    AssetClass, ContractRollMapping, EffectiveInterval, ExternalIdentifier, InstrumentDefinition,
-    InstrumentError, LifecycleTransition, LifecycleTransitionKind, ProviderIdentityRecord,
-    SymbolIdentityRecord, TradingStatus, VenueMapping,
+    AssetClass, AssignmentVerification, ContractRollMapping, EffectiveInterval, ExternalIdentifier,
+    ExternalIdentifierRecord, IdentifierEntitlement, IdentifierRightsPolicyReference,
+    IdentifierSyntaxVerification, InstrumentDefinition, InstrumentError, LifecycleTransition,
+    LifecycleTransitionKind, ProviderIdentityRecord, SymbolIdentityRecord, TradingStatus,
+    VenueMapping,
 };
 pub use market::{
     AggressorSide, AuctionEvent, AuctionPhase, BookChange, BookDeltaEvent, BookLevel,
@@ -52,5 +57,5 @@ pub use research::{
     FundamentalObservation, MacroObservation, PositionObservation, PositionSide, ResearchError,
     ResearchObservation, TransactionObservation,
 };
-pub use time::{TimeError, Timestamp};
+pub use time::{CalendarDate, TimeError, Timestamp};
 pub use version::{SchemaVersion, SchemaVersionError};

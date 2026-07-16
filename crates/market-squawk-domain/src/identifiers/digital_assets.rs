@@ -1,5 +1,8 @@
 use std::fmt;
+use std::str::FromStr;
 
+use bitcoin::address::{Address, NetworkUnchecked};
+use bitcoin::{AddressType, Network};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha3::{Digest, Keccak256};
 
@@ -24,7 +27,7 @@ pub enum CryptoProductType {
 ///
 /// It never guesses delimiters, quote suffixes, or global BTC/XBT aliases. The raw product ID and
 /// separate base/quote source identities are preserved; syntax does not prove product existence.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct CryptoPair {
     venue_id: VenueId,
     raw_product_id: ProviderInstrumentId,
@@ -58,6 +61,11 @@ impl CryptoPair {
         })
     }
 
+    /// Returns the venue namespace that defines all source-side pair fields.
+    pub const fn venue_id(&self) -> &VenueId {
+        &self.venue_id
+    }
+
     /// Returns the unmodified venue product ID.
     pub const fn raw_product_id(&self) -> &ProviderInstrumentId {
         &self.raw_product_id
@@ -66,6 +74,16 @@ impl CryptoPair {
     /// Returns the source-aware base asset identity.
     pub const fn base_asset_id(&self) -> &ProviderInstrumentId {
         &self.base_asset_id
+    }
+
+    /// Returns the source-aware quote asset identity.
+    pub const fn quote_asset_id(&self) -> &ProviderInstrumentId {
+        &self.quote_asset_id
+    }
+
+    /// Returns the venue product family.
+    pub const fn product_type(&self) -> CryptoProductType {
+        self.product_type
     }
 }
 
@@ -106,12 +124,26 @@ impl<'de> Deserialize<'de> for CryptoPair {
 /// This validates only the [CAIP-2 grammar](https://standards.chainagnostic.org/CAIPs/caip-2), not
 /// chain existence or canonical reference semantics.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ChainId(String);
+pub struct ChainId {
+    canonical: String,
+    namespace: String,
+    reference: String,
+}
 
 impl ChainId {
     /// Returns the source-preserved chain identifier.
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.canonical
+    }
+
+    /// Returns the CAIP-2 namespace.
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    /// Returns the CAIP-2 reference.
+    pub fn reference(&self) -> &str {
+        &self.reference
     }
 }
 
@@ -129,11 +161,15 @@ impl TryFrom<&str> for ChainId {
         let reference_valid = (1..=32).contains(&reference.len())
             && reference
                 .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
         if !namespace_valid || !reference_valid || reference.contains(':') {
             return Err(IdentifierError::InvalidChainId);
         }
-        Ok(Self(value.to_owned()))
+        Ok(Self {
+            canonical: value.to_owned(),
+            namespace: namespace.to_owned(),
+            reference: reference.to_owned(),
+        })
     }
 }
 
@@ -147,7 +183,7 @@ impl TryFrom<String> for ChainId {
 
 impl fmt::Display for ChainId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
+        self.canonical.fmt(formatter)
     }
 }
 
@@ -156,7 +192,7 @@ impl Serialize for ChainId {
     where
         S: Serializer,
     {
-        serializer.serialize_str(&self.0)
+        serializer.serialize_str(&self.canonical)
     }
 }
 
@@ -192,6 +228,74 @@ pub enum ChainAddressRule {
     EvmHex20Eip55,
     /// 32-byte case-sensitive Solana base58 public key.
     SolanaBase58PublicKey,
+    /// Bitcoin Base58, Bech32, or Bech32m address validated by rust-bitcoin.
+    BitcoinAddress,
+}
+
+/// Bitcoin network required during address parsing.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BitcoinNetwork {
+    /// Bitcoin production network.
+    Mainnet,
+    /// Bitcoin testnet3 network.
+    Testnet,
+    /// Bitcoin testnet4 network.
+    Testnet4,
+    /// Bitcoin signet network.
+    Signet,
+    /// Local Bitcoin regression-test network.
+    Regtest,
+}
+
+impl From<BitcoinNetwork> for Network {
+    fn from(value: BitcoinNetwork) -> Self {
+        match value {
+            BitcoinNetwork::Mainnet => Self::Bitcoin,
+            BitcoinNetwork::Testnet => Self::Testnet,
+            BitcoinNetwork::Testnet4 => Self::Testnet4,
+            BitcoinNetwork::Signet => Self::Signet,
+            BitcoinNetwork::Regtest => Self::Regtest,
+        }
+    }
+}
+
+/// Supported Bitcoin address family after network validation.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BitcoinAddressType {
+    /// Legacy pay-to-public-key-hash Base58 address.
+    P2pkh,
+    /// Legacy pay-to-script-hash Base58 address.
+    P2sh,
+    /// Version-zero pay-to-witness-public-key-hash Bech32 address.
+    P2wpkh,
+    /// Version-zero pay-to-witness-script-hash Bech32 address.
+    P2wsh,
+    /// Version-one pay-to-Taproot Bech32m address.
+    P2tr,
+}
+
+impl TryFrom<AddressType> for BitcoinAddressType {
+    type Error = IdentifierError;
+
+    fn try_from(value: AddressType) -> Result<Self, Self::Error> {
+        match value {
+            AddressType::P2pkh => Ok(Self::P2pkh),
+            AddressType::P2sh => Ok(Self::P2sh),
+            AddressType::P2wpkh => Ok(Self::P2wpkh),
+            AddressType::P2wsh => Ok(Self::P2wsh),
+            AddressType::P2tr => Ok(Self::P2tr),
+            _ => Err(IdentifierError::InvalidAddress),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum ChainAddressPayload {
+    Evm([u8; 20]),
+    Solana([u8; 32]),
+    BitcoinScript(Vec<u8>),
 }
 
 /// A chain-qualified, protocol-specifically validated address.
@@ -200,14 +304,16 @@ pub enum ChainAddressRule {
 /// the 32-byte public-key contract documented by [Solana accounts](https://solana.com/docs/core/accounts).
 /// The type exposes no universal address parser, does not infer chains, and does not prove on-chain
 /// account/contract existence or token semantics.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ChainAddress {
     chain_id: ChainId,
     submitted: String,
     canonical: String,
-    decoded_bytes: Vec<u8>,
+    payload: ChainAddressPayload,
     role: ChainAddressRole,
     rule: ChainAddressRule,
+    bitcoin_network: Option<BitcoinNetwork>,
+    bitcoin_address_type: Option<BitcoinAddressType>,
 }
 
 impl ChainAddress {
@@ -233,24 +339,26 @@ impl ChainAddress {
         if has_lower && has_upper && !valid_eip55(body) {
             return Err(IdentifierError::InvalidAddressChecksum);
         }
-        let mut decoded = Vec::with_capacity(20);
+        let mut decoded = [0_u8; 20];
         let bytes = body.as_bytes();
-        for pair in bytes.chunks_exact(2) {
+        for (index, pair) in bytes.chunks_exact(2).enumerate() {
             let Some(high) = pair.first().and_then(|byte| hex_nibble(*byte)) else {
                 return Err(IdentifierError::InvalidAddress);
             };
             let Some(low) = pair.get(1).and_then(|byte| hex_nibble(*byte)) else {
                 return Err(IdentifierError::InvalidAddress);
             };
-            decoded.push(high * 16 + low);
+            decoded[index] = high * 16 + low;
         }
         Ok(Self {
             chain_id,
             submitted: submitted.to_owned(),
             canonical: format!("0x{}", body.to_ascii_lowercase()),
-            decoded_bytes: decoded,
+            payload: ChainAddressPayload::Evm(decoded),
             role,
             rule: ChainAddressRule::EvmHex20Eip55,
+            bitcoin_network: None,
+            bitcoin_address_type: None,
         })
     }
 
@@ -264,25 +372,86 @@ impl ChainAddress {
         submitted: &str,
         role: ChainAddressRole,
     ) -> Result<Self, IdentifierError> {
-        let decoded = bs58::decode(submitted)
-            .into_vec()
+        if submitted.is_empty() || submitted.len() > 44 {
+            return Err(IdentifierError::InvalidAddress);
+        }
+        let mut decoded = [0_u8; 32];
+        let decoded_length = bs58::decode(submitted)
+            .onto(&mut decoded[..])
             .map_err(|_| IdentifierError::InvalidAddress)?;
-        if decoded.len() != 32 {
+        if decoded_length != decoded.len() {
             return Err(IdentifierError::InvalidAddress);
         }
         Ok(Self {
             chain_id,
             submitted: submitted.to_owned(),
-            canonical: submitted.to_owned(),
-            decoded_bytes: decoded,
+            canonical: bs58::encode(decoded).into_string(),
+            payload: ChainAddressPayload::Solana(decoded),
             role,
             rule: ChainAddressRule::SolanaBase58PublicKey,
+            bitcoin_network: None,
+            bitcoin_address_type: None,
+        })
+    }
+
+    /// Validates a bounded, network-qualified Bitcoin legacy, SegWit, or Taproot address.
+    ///
+    /// Parsing and network validation use rust-bitcoin 0.32, whose address implementation
+    /// follows BIP 13/16, BIP 173, BIP 341, and BIP 350. In particular, witness version zero
+    /// requires Bech32 while witness versions one through sixteen require Bech32m.
+    ///
+    /// # Errors
+    ///
+    /// Rejects input over the BIP 173 90-character bound, invalid encodings, unsupported address
+    /// families, or addresses invalid for `network`.
+    pub fn try_bitcoin(
+        chain_id: ChainId,
+        submitted: &str,
+        role: ChainAddressRole,
+        network: BitcoinNetwork,
+    ) -> Result<Self, IdentifierError> {
+        if submitted.is_empty() || submitted.len() > 90 || !submitted.is_ascii() {
+            return Err(IdentifierError::InvalidAddress);
+        }
+        let bitcoin_network: Network = network.into();
+        let genesis_hash = bitcoin::blockdata::constants::genesis_block(bitcoin_network)
+            .block_hash()
+            .to_string();
+        let Some(expected_reference) = genesis_hash.get(..32) else {
+            return Err(IdentifierError::InvalidChainId);
+        };
+        if chain_id.namespace() != "bip122" || chain_id.reference() != expected_reference {
+            return Err(IdentifierError::InvalidChainId);
+        }
+        let unchecked = Address::<NetworkUnchecked>::from_str(submitted)
+            .map_err(|_| IdentifierError::InvalidAddress)?;
+        let checked = unchecked
+            .require_network(bitcoin_network)
+            .map_err(|_| IdentifierError::InvalidAddressNetwork)?;
+        let address_type = checked
+            .address_type()
+            .ok_or(IdentifierError::InvalidAddress)
+            .and_then(BitcoinAddressType::try_from)?;
+        Ok(Self {
+            chain_id,
+            submitted: submitted.to_owned(),
+            canonical: checked.to_string(),
+            payload: ChainAddressPayload::BitcoinScript(checked.script_pubkey().into_bytes()),
+            role,
+            rule: ChainAddressRule::BitcoinAddress,
+            bitcoin_network: Some(network),
+            bitcoin_address_type: Some(address_type),
         })
     }
 
     /// Returns the explicitly supplied chain identity.
     pub const fn chain_id(&self) -> &ChainId {
         &self.chain_id
+    }
+
+    /// Returns the source-submitted text before canonical protocol rendering.
+    pub fn submitted(&self) -> &str {
+        &self.submitted
     }
 
     /// Returns the protocol-defined canonical display retained alongside submitted text.
@@ -292,7 +461,47 @@ impl ChainAddress {
 
     /// Returns the losslessly decoded identity bytes.
     pub fn decoded_bytes(&self) -> &[u8] {
-        &self.decoded_bytes
+        match &self.payload {
+            ChainAddressPayload::Evm(bytes) => bytes,
+            ChainAddressPayload::Solana(bytes) => bytes,
+            ChainAddressPayload::BitcoinScript(bytes) => bytes,
+        }
+    }
+
+    /// Returns the fixed-width EVM address bytes when this is an EVM address.
+    pub const fn evm_address_bytes(&self) -> Option<&[u8; 20]> {
+        match &self.payload {
+            ChainAddressPayload::Evm(bytes) => Some(bytes),
+            ChainAddressPayload::Solana(_) | ChainAddressPayload::BitcoinScript(_) => None,
+        }
+    }
+
+    /// Returns the fixed-width Solana public key when this is a Solana address.
+    pub const fn solana_public_key(&self) -> Option<&[u8; 32]> {
+        match &self.payload {
+            ChainAddressPayload::Solana(bytes) => Some(bytes),
+            ChainAddressPayload::Evm(_) | ChainAddressPayload::BitcoinScript(_) => None,
+        }
+    }
+
+    /// Returns the explicitly selected semantic role.
+    pub const fn role(&self) -> ChainAddressRole {
+        self.role
+    }
+
+    /// Returns the protocol rule that performed validation.
+    pub const fn rule(&self) -> ChainAddressRule {
+        self.rule
+    }
+
+    /// Returns the required Bitcoin network when this is a Bitcoin address.
+    pub const fn bitcoin_network(&self) -> Option<BitcoinNetwork> {
+        self.bitcoin_network
+    }
+
+    /// Returns the decoded Bitcoin address family when this is a Bitcoin address.
+    pub const fn bitcoin_address_type(&self) -> Option<BitcoinAddressType> {
+        self.bitcoin_address_type
     }
 }
 
@@ -331,12 +540,40 @@ fn hex_nibble(byte: u8) -> Option<u8> {
     }
 }
 
+#[derive(Serialize)]
+struct ChainAddressWireRef<'a> {
+    chain_id: &'a ChainId,
+    submitted: &'a str,
+    role: ChainAddressRole,
+    rule: ChainAddressRule,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bitcoin_network: Option<BitcoinNetwork>,
+}
+
+impl Serialize for ChainAddress {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        ChainAddressWireRef {
+            chain_id: &self.chain_id,
+            submitted: &self.submitted,
+            role: self.role,
+            rule: self.rule,
+            bitcoin_network: self.bitcoin_network,
+        }
+        .serialize(serializer)
+    }
+}
+
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ChainAddressWire {
     chain_id: ChainId,
     submitted: String,
     role: ChainAddressRole,
     rule: ChainAddressRule,
+    bitcoin_network: Option<BitcoinNetwork>,
 }
 
 impl<'de> Deserialize<'de> for ChainAddress {
@@ -345,13 +582,17 @@ impl<'de> Deserialize<'de> for ChainAddress {
         D: Deserializer<'de>,
     {
         let wire = ChainAddressWire::deserialize(deserializer)?;
-        match wire.rule {
-            ChainAddressRule::EvmHex20Eip55 => {
+        match (wire.rule, wire.bitcoin_network) {
+            (ChainAddressRule::EvmHex20Eip55, None) => {
                 Self::try_evm(wire.chain_id, &wire.submitted, wire.role)
             }
-            ChainAddressRule::SolanaBase58PublicKey => {
+            (ChainAddressRule::SolanaBase58PublicKey, None) => {
                 Self::try_solana(wire.chain_id, &wire.submitted, wire.role)
             }
+            (ChainAddressRule::BitcoinAddress, Some(network)) => {
+                Self::try_bitcoin(wire.chain_id, &wire.submitted, wire.role, network)
+            }
+            _ => Err(IdentifierError::InvalidAddress),
         }
         .map_err(serde::de::Error::custom)
     }

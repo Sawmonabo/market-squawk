@@ -1,9 +1,13 @@
 use std::fmt;
+use std::num::{NonZeroU16, NonZeroU32};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::{IdentifierError, VenueSymbol};
-use crate::{ProviderInstrumentId, SourceIdentifier, VenueId};
+use crate::{
+    CalendarDate, PayloadReference, ProviderInstrumentId, SourceId, SourceIdentifier, Timestamp,
+    VenueId,
+};
 
 /// OCC option type encoded in the fixed-width OSI identifier.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -241,12 +245,281 @@ pub enum FuturesSecurityType {
     Daily,
 }
 
+/// Source-evidenced contract lifecycle dates, independent of the contract month.
+///
+/// Exchange reference data can supply only some dates. This contract never manufactures missing
+/// values, but it requires at least one observed lifecycle date and enforces relational ranges.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+pub struct FuturesLifecycleDates {
+    source_id: SourceId,
+    source_reference: PayloadReference,
+    observed_at: Timestamp,
+    maturity_date: Option<CalendarDate>,
+    expiration_date: Option<CalendarDate>,
+    last_trade_date: Option<CalendarDate>,
+    first_notice_date: Option<CalendarDate>,
+    last_notice_date: Option<CalendarDate>,
+    first_delivery_date: Option<CalendarDate>,
+    last_delivery_date: Option<CalendarDate>,
+}
+
+impl FuturesLifecycleDates {
+    /// Constructs source-evidenced lifecycle dates without inventing absent fields.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an empty date set, last trade after expiration, a reversed notice range, or a
+    /// reversed delivery range.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        source_id: SourceId,
+        source_reference: PayloadReference,
+        observed_at: Timestamp,
+        maturity_date: Option<CalendarDate>,
+        expiration_date: Option<CalendarDate>,
+        last_trade_date: Option<CalendarDate>,
+        first_notice_date: Option<CalendarDate>,
+        last_notice_date: Option<CalendarDate>,
+        first_delivery_date: Option<CalendarDate>,
+        last_delivery_date: Option<CalendarDate>,
+    ) -> Result<Self, IdentifierError> {
+        if [
+            maturity_date,
+            expiration_date,
+            last_trade_date,
+            first_notice_date,
+            last_notice_date,
+            first_delivery_date,
+            last_delivery_date,
+        ]
+        .iter()
+        .all(Option::is_none)
+        {
+            return Err(IdentifierError::MissingLifecycleDate);
+        }
+        if last_trade_date
+            .zip(expiration_date)
+            .is_some_and(|(last, expiration)| last > expiration)
+            || first_notice_date
+                .zip(last_notice_date)
+                .is_some_and(|(first, last)| first > last)
+            || first_delivery_date
+                .zip(last_delivery_date)
+                .is_some_and(|(first, last)| first > last)
+        {
+            return Err(IdentifierError::InvalidLifecycleOrdering);
+        }
+        Ok(Self {
+            source_id,
+            source_reference,
+            observed_at,
+            maturity_date,
+            expiration_date,
+            last_trade_date,
+            first_notice_date,
+            last_notice_date,
+            first_delivery_date,
+            last_delivery_date,
+        })
+    }
+
+    /// Returns the reference-data source.
+    pub const fn source_id(&self) -> &SourceId {
+        &self.source_id
+    }
+
+    /// Returns immutable source payload evidence.
+    pub const fn source_reference(&self) -> &PayloadReference {
+        &self.source_reference
+    }
+
+    /// Returns when Market Squawk first observed this lifecycle record.
+    pub const fn observed_at(&self) -> Timestamp {
+        self.observed_at
+    }
+
+    /// Returns the source maturity date.
+    pub const fn maturity_date(&self) -> Option<CalendarDate> {
+        self.maturity_date
+    }
+
+    /// Returns the source expiration date.
+    pub const fn expiration_date(&self) -> Option<CalendarDate> {
+        self.expiration_date
+    }
+
+    /// Returns the last trading date.
+    pub const fn last_trade_date(&self) -> Option<CalendarDate> {
+        self.last_trade_date
+    }
+
+    /// Returns the first notice date.
+    pub const fn first_notice_date(&self) -> Option<CalendarDate> {
+        self.first_notice_date
+    }
+
+    /// Returns the last notice date.
+    pub const fn last_notice_date(&self) -> Option<CalendarDate> {
+        self.last_notice_date
+    }
+
+    /// Returns the first delivery date.
+    pub const fn first_delivery_date(&self) -> Option<CalendarDate> {
+        self.first_delivery_date
+    }
+
+    /// Returns the last delivery date.
+    pub const fn last_delivery_date(&self) -> Option<CalendarDate> {
+        self.last_delivery_date
+    }
+}
+
+#[derive(Deserialize)]
+struct FuturesLifecycleDatesWire {
+    source_id: SourceId,
+    source_reference: PayloadReference,
+    observed_at: Timestamp,
+    maturity_date: Option<CalendarDate>,
+    expiration_date: Option<CalendarDate>,
+    last_trade_date: Option<CalendarDate>,
+    first_notice_date: Option<CalendarDate>,
+    last_notice_date: Option<CalendarDate>,
+    first_delivery_date: Option<CalendarDate>,
+    last_delivery_date: Option<CalendarDate>,
+}
+
+impl<'de> Deserialize<'de> for FuturesLifecycleDates {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = FuturesLifecycleDatesWire::deserialize(deserializer)?;
+        Self::try_new(
+            wire.source_id,
+            wire.source_reference,
+            wire.observed_at,
+            wire.maturity_date,
+            wire.expiration_date,
+            wire.last_trade_date,
+            wire.first_notice_date,
+            wire.last_notice_date,
+            wire.first_delivery_date,
+            wire.last_delivery_date,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+/// Economic direction of a component in an ordered futures multileg identity.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FuturesLegSide {
+    /// Buy the leg.
+    Buy,
+    /// Sell the leg.
+    Sell,
+}
+
+/// One source-qualified component of a venue-defined futures multileg security.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+pub struct FuturesLeg {
+    position: NonZeroU16,
+    security_id: ProviderInstrumentId,
+    security_id_source: SourceIdentifier,
+    contract_month: Option<ContractMonth>,
+    side: FuturesLegSide,
+    ratio: NonZeroU32,
+}
+
+impl FuturesLeg {
+    /// Constructs a leg with an explicit one-based position and nonzero ratio.
+    ///
+    /// # Errors
+    ///
+    /// Rejects position zero or ratio zero.
+    pub fn try_new(
+        position: u16,
+        security_id: ProviderInstrumentId,
+        security_id_source: SourceIdentifier,
+        contract_month: Option<ContractMonth>,
+        side: FuturesLegSide,
+        ratio: u32,
+    ) -> Result<Self, IdentifierError> {
+        Ok(Self {
+            position: NonZeroU16::new(position).ok_or(IdentifierError::ZeroLegPosition)?,
+            security_id,
+            security_id_source,
+            contract_month,
+            side,
+            ratio: NonZeroU32::new(ratio).ok_or(IdentifierError::ZeroLegRatio)?,
+        })
+    }
+
+    /// Returns the one-based ordered position.
+    pub const fn position(&self) -> u16 {
+        self.position.get()
+    }
+
+    /// Returns the venue/source security identity for the leg.
+    pub const fn security_id(&self) -> &ProviderInstrumentId {
+        &self.security_id
+    }
+
+    /// Returns the source scheme for the leg security identity.
+    pub const fn security_id_source(&self) -> &SourceIdentifier {
+        &self.security_id_source
+    }
+
+    /// Returns the separately supplied leg contract month when applicable.
+    pub const fn contract_month(&self) -> Option<ContractMonth> {
+        self.contract_month
+    }
+
+    /// Returns the economic leg side.
+    pub const fn side(&self) -> FuturesLegSide {
+        self.side
+    }
+
+    /// Returns the nonzero integer leg ratio.
+    pub const fn ratio(&self) -> u32 {
+        self.ratio.get()
+    }
+}
+
+#[derive(Deserialize)]
+struct FuturesLegWire {
+    position: u16,
+    security_id: ProviderInstrumentId,
+    security_id_source: SourceIdentifier,
+    contract_month: Option<ContractMonth>,
+    side: FuturesLegSide,
+    ratio: u32,
+}
+
+impl<'de> Deserialize<'de> for FuturesLeg {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = FuturesLegWire::deserialize(deserializer)?;
+        Self::try_new(
+            wire.position,
+            wire.security_id,
+            wire.security_id_source,
+            wire.contract_month,
+            wire.side,
+            wire.ratio,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
 /// A structured futures identity; deliberately not a universal root/month-symbol parser.
 ///
 /// CFTC large-trader layouts and CME security definitions keep exchange security identifiers,
 /// identifier sources, product codes, native symbols, and expiry fields separate. Existence and
 /// contract economics require licensed venue reference data.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct FuturesContractIdentity {
     venue_id: VenueId,
     security_id: ProviderInstrumentId,
@@ -255,11 +528,19 @@ pub struct FuturesContractIdentity {
     native_symbol: VenueSymbol,
     security_type: FuturesSecurityType,
     contract_month: ContractMonth,
+    lifecycle: FuturesLifecycleDates,
+    legs: Vec<FuturesLeg>,
 }
 
 impl FuturesContractIdentity {
     /// Constructs a futures identity from separately sourced venue metadata fields.
-    pub fn new(
+    ///
+    /// # Errors
+    ///
+    /// Multileg securities require at least two distinct legs in consecutive one-based order;
+    /// outright and daily securities reject legs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
         venue_id: VenueId,
         security_id: ProviderInstrumentId,
         security_id_source: SourceIdentifier,
@@ -267,8 +548,34 @@ impl FuturesContractIdentity {
         native_symbol: VenueSymbol,
         security_type: FuturesSecurityType,
         contract_month: ContractMonth,
-    ) -> Self {
-        Self {
+        lifecycle: FuturesLifecycleDates,
+        legs: Vec<FuturesLeg>,
+    ) -> Result<Self, IdentifierError> {
+        match security_type {
+            FuturesSecurityType::SpreadOrMultileg if legs.len() < 2 => {
+                return Err(IdentifierError::InvalidLegStructure);
+            }
+            FuturesSecurityType::Future | FuturesSecurityType::Daily if !legs.is_empty() => {
+                return Err(IdentifierError::InvalidLegStructure);
+            }
+            FuturesSecurityType::SpreadOrMultileg
+            | FuturesSecurityType::Future
+            | FuturesSecurityType::Daily => {}
+        }
+        for (index, leg) in legs.iter().enumerate() {
+            let expected =
+                u16::try_from(index + 1).map_err(|_| IdentifierError::InvalidLegOrdering)?;
+            if leg.position() != expected {
+                return Err(IdentifierError::InvalidLegOrdering);
+            }
+            if legs.iter().skip(index + 1).any(|candidate| {
+                candidate.security_id == leg.security_id
+                    && candidate.security_id_source == leg.security_id_source
+            }) {
+                return Err(IdentifierError::DuplicateLeg);
+            }
+        }
+        Ok(Self {
             venue_id,
             security_id,
             security_id_source,
@@ -276,7 +583,29 @@ impl FuturesContractIdentity {
             native_symbol,
             security_type,
             contract_month,
-        }
+            lifecycle,
+            legs,
+        })
+    }
+
+    /// Returns the venue namespace.
+    pub const fn venue_id(&self) -> &VenueId {
+        &self.venue_id
+    }
+
+    /// Returns the venue/source security identity.
+    pub const fn security_id(&self) -> &ProviderInstrumentId {
+        &self.security_id
+    }
+
+    /// Returns the scheme identifying `security_id`.
+    pub const fn security_id_source(&self) -> &SourceIdentifier {
+        &self.security_id_source
+    }
+
+    /// Returns the source product or commodity code.
+    pub const fn product_code(&self) -> &ProviderInstrumentId {
+        &self.product_code
     }
 
     /// Returns the unmodified venue-native symbol.
@@ -287,5 +616,60 @@ impl FuturesContractIdentity {
     /// Returns the separately supplied contract month.
     pub const fn contract_month(&self) -> ContractMonth {
         self.contract_month
+    }
+
+    /// Returns the venue reference-data security type.
+    pub const fn security_type(&self) -> FuturesSecurityType {
+        self.security_type
+    }
+
+    /// Returns source-evidenced lifecycle dates.
+    pub const fn lifecycle(&self) -> &FuturesLifecycleDates {
+        &self.lifecycle
+    }
+
+    /// Returns ordered multileg components, empty for non-multileg securities.
+    pub fn legs(&self) -> &[FuturesLeg] {
+        &self.legs
+    }
+}
+
+impl fmt::Display for FuturesContractIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}:{}", self.venue_id, self.security_id)
+    }
+}
+
+#[derive(Deserialize)]
+struct FuturesContractIdentityWire {
+    venue_id: VenueId,
+    security_id: ProviderInstrumentId,
+    security_id_source: SourceIdentifier,
+    product_code: ProviderInstrumentId,
+    native_symbol: VenueSymbol,
+    security_type: FuturesSecurityType,
+    contract_month: ContractMonth,
+    lifecycle: FuturesLifecycleDates,
+    legs: Vec<FuturesLeg>,
+}
+
+impl<'de> Deserialize<'de> for FuturesContractIdentity {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = FuturesContractIdentityWire::deserialize(deserializer)?;
+        Self::try_new(
+            wire.venue_id,
+            wire.security_id,
+            wire.security_id_source,
+            wire.product_code,
+            wire.native_symbol,
+            wire.security_type,
+            wire.contract_month,
+            wire.lifecycle,
+            wire.legs,
+        )
+        .map_err(serde::de::Error::custom)
     }
 }

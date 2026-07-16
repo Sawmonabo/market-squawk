@@ -44,7 +44,7 @@ impl PayloadHash {
 }
 
 /// Durable evidence identifying the exact source payload behind a canonical record.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum PayloadReference {
     /// Algorithm-qualified content digest.

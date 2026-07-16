@@ -3,9 +3,16 @@ use std::fmt;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{
-    ChainAddress, CryptoPair, Currency, Cusip, Figi, FuturesContractIdentity, InstrumentId, Isin,
-    LotSize, OccOptionIdentity, ProviderInstrumentId, Sedol, SourceId, TickSize, Ticker, Timestamp,
+    Denomination, InstrumentId, LotSize, ProviderInstrumentId, SourceId, TickSize, Timestamp,
     VenueId, VenueSymbol,
+};
+
+#[path = "instrument/identifier_records.rs"]
+mod identifier_records;
+
+pub use identifier_records::{
+    AssignmentVerification, ExternalIdentifier, ExternalIdentifierRecord, IdentifierEntitlement,
+    IdentifierRightsPolicyReference, IdentifierSyntaxVerification,
 };
 
 /// A broad instrument asset family, separate from Task 4 evidence classifications.
@@ -48,35 +55,8 @@ pub enum TradingStatus {
     Delisted,
 }
 
-/// A syntactically validated external identifier.
-///
-/// Every variant remains syntax/checksum-only. Registry assignment, existence, lifecycle, source,
-/// and licensed-data rights must be established separately.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
-pub enum ExternalIdentifier {
-    /// Ticker alias.
-    Ticker(Ticker),
-    /// CUSIP syntax/checksum value.
-    Cusip(Cusip),
-    /// ISIN syntax/checksum value.
-    Isin(Isin),
-    /// SEDOL syntax/checksum value.
-    Sedol(Sedol),
-    /// FIGI syntax/checksum value.
-    Figi(Figi),
-    /// OCC fixed-width option identity.
-    OccOption(OccOptionIdentity),
-    /// Structured venue futures identity.
-    Futures(FuturesContractIdentity),
-    /// Structured venue crypto pair.
-    CryptoPair(CryptoPair),
-    /// Chain-qualified protocol-specific address.
-    ChainAddress(ChainAddress),
-}
-
 /// An instrument's symbol mapping in one venue namespace.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct VenueMapping {
     venue_id: VenueId,
     venue_symbol: VenueSymbol,
@@ -106,6 +86,17 @@ impl VenueMapping {
     pub const fn venue_symbol(&self) -> &VenueSymbol {
         &self.venue_symbol
     }
+
+    /// Returns the source-native instrument identity when supplied.
+    pub const fn provider_instrument_id(&self) -> Option<&ProviderInstrumentId> {
+        self.provider_instrument_id.as_ref()
+    }
+}
+
+impl fmt::Display for VenueMapping {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}:{}", self.venue_id, self.venue_symbol)
+    }
 }
 
 /// Instrument-definition or effective-identity invariant failure.
@@ -120,6 +111,8 @@ pub enum InstrumentError {
         /// Duplicated venue.
         venue: VenueId,
     },
+    /// An instrument definition attached the same typed identifier more than once.
+    DuplicateExternalIdentifier,
 }
 
 impl fmt::Display for InstrumentError {
@@ -133,6 +126,9 @@ impl fmt::Display for InstrumentError {
             }
             Self::DuplicateVenueMapping { venue } => {
                 write!(formatter, "duplicate current venue mapping for {venue}")
+            }
+            Self::DuplicateExternalIdentifier => {
+                formatter.write_str("duplicate external identifier attachment")
             }
         }
     }
@@ -190,7 +186,7 @@ impl<'de> Deserialize<'de> for EffectiveInterval {
 }
 
 /// A venue-symbol validity record retaining stable internal identity.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct SymbolIdentityRecord {
     instrument_id: InstrumentId,
     venue_id: VenueId,
@@ -214,14 +210,35 @@ impl SymbolIdentityRecord {
         }
     }
 
+    /// Returns the stable internal instrument identity.
+    pub const fn instrument_id(&self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    /// Returns the venue namespace.
+    pub const fn venue_id(&self) -> &VenueId {
+        &self.venue_id
+    }
+
+    /// Returns the source-preserved venue symbol.
+    pub const fn venue_symbol(&self) -> &VenueSymbol {
+        &self.venue_symbol
+    }
+
     /// Returns the effective interval.
     pub const fn validity(&self) -> EffectiveInterval {
         self.validity
     }
 }
 
+impl fmt::Display for SymbolIdentityRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}:{}", self.venue_id, self.venue_symbol)
+    }
+}
+
 /// A provider-instrument-ID validity record retaining stable internal identity.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct ProviderIdentityRecord {
     instrument_id: InstrumentId,
     source_id: SourceId,
@@ -249,6 +266,31 @@ impl ProviderIdentityRecord {
     pub const fn instrument_id(&self) -> InstrumentId {
         self.instrument_id
     }
+
+    /// Returns the provider/source namespace.
+    pub const fn source_id(&self) -> &SourceId {
+        &self.source_id
+    }
+
+    /// Returns the source-native instrument identity.
+    pub const fn provider_instrument_id(&self) -> &ProviderInstrumentId {
+        &self.provider_instrument_id
+    }
+
+    /// Returns the half-open effective interval.
+    pub const fn validity(&self) -> EffectiveInterval {
+        self.validity
+    }
+}
+
+impl fmt::Display for ProviderIdentityRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{}:{}",
+            self.source_id, self.provider_instrument_id
+        )
+    }
 }
 
 /// The identity-level lifecycle transition persisted before canonical Task 4 event payloads exist.
@@ -265,7 +307,7 @@ pub enum LifecycleTransitionKind {
 }
 
 /// An effective identity lifecycle transition.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct LifecycleTransition {
     instrument_id: InstrumentId,
     effective_at: Timestamp,
@@ -299,6 +341,33 @@ impl LifecycleTransition {
     pub const fn effective_at(self) -> Timestamp {
         self.effective_at
     }
+
+    /// Returns the instrument undergoing the lifecycle transition.
+    pub const fn instrument_id(self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    /// Returns the typed lifecycle transition.
+    pub const fn kind(self) -> LifecycleTransitionKind {
+        self.kind
+    }
+}
+
+impl fmt::Display for LifecycleTransition {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{}@{}:",
+            self.instrument_id,
+            self.effective_at.unix_nanos()
+        )?;
+        match self.kind {
+            LifecycleTransitionKind::Merger { successor } => {
+                write!(formatter, "merger:{successor}")
+            }
+            LifecycleTransitionKind::Delisting => formatter.write_str("delisting"),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -320,7 +389,7 @@ impl<'de> Deserialize<'de> for LifecycleTransition {
 }
 
 /// An effective mapping from an expiring contract identity to its roll successor.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct ContractRollMapping {
     from_instrument_id: InstrumentId,
     to_instrument_id: InstrumentId,
@@ -353,6 +422,28 @@ impl ContractRollMapping {
     pub const fn to_instrument_id(self) -> InstrumentId {
         self.to_instrument_id
     }
+
+    /// Returns the expiring source instrument.
+    pub const fn from_instrument_id(self) -> InstrumentId {
+        self.from_instrument_id
+    }
+
+    /// Returns when the roll mapping becomes effective.
+    pub const fn effective_at(self) -> Timestamp {
+        self.effective_at
+    }
+}
+
+impl fmt::Display for ContractRollMapping {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{}->{}@{}",
+            self.from_instrument_id,
+            self.to_instrument_id,
+            self.effective_at.unix_nanos()
+        )
+    }
 }
 
 #[derive(Deserialize)]
@@ -382,11 +473,11 @@ impl<'de> Deserialize<'de> for ContractRollMapping {
 pub struct InstrumentDefinition {
     instrument_id: InstrumentId,
     asset_class: AssetClass,
-    primary_currency: Currency,
+    primary_denomination: Denomination,
     tick_size: TickSize,
     lot_size: LotSize,
     venue_mappings: Vec<VenueMapping>,
-    identifiers: Vec<ExternalIdentifier>,
+    identifiers: Vec<ExternalIdentifierRecord>,
     trading_status: TradingStatus,
 }
 
@@ -401,11 +492,11 @@ impl InstrumentDefinition {
     pub fn try_new(
         instrument_id: InstrumentId,
         asset_class: AssetClass,
-        primary_currency: Currency,
+        primary_denomination: Denomination,
         tick_size: TickSize,
         lot_size: LotSize,
         venue_mappings: Vec<VenueMapping>,
-        identifiers: Vec<ExternalIdentifier>,
+        identifiers: Vec<ExternalIdentifierRecord>,
         trading_status: TradingStatus,
     ) -> Result<Self, InstrumentError> {
         for (index, mapping) in venue_mappings.iter().enumerate() {
@@ -419,10 +510,19 @@ impl InstrumentDefinition {
                 });
             }
         }
+        for (index, record) in identifiers.iter().enumerate() {
+            if identifiers
+                .iter()
+                .skip(index + 1)
+                .any(|candidate| candidate.identifier() == record.identifier())
+            {
+                return Err(InstrumentError::DuplicateExternalIdentifier);
+            }
+        }
         Ok(Self {
             instrument_id,
             asset_class,
-            primary_currency,
+            primary_denomination,
             tick_size,
             lot_size,
             venue_mappings,
@@ -441,9 +541,9 @@ impl InstrumentDefinition {
         self.asset_class
     }
 
-    /// Returns the primary denomination currency.
-    pub const fn primary_currency(&self) -> Currency {
-        self.primary_currency
+    /// Returns the explicitly typed primary settlement denomination.
+    pub const fn primary_denomination(&self) -> Denomination {
+        self.primary_denomination
     }
 
     /// Returns the exact price increment.
@@ -462,7 +562,7 @@ impl InstrumentDefinition {
     }
 
     /// Returns syntactically validated external identifiers.
-    pub fn identifiers(&self) -> &[ExternalIdentifier] {
+    pub fn identifiers(&self) -> &[ExternalIdentifierRecord] {
         &self.identifiers
     }
 
@@ -476,11 +576,11 @@ impl InstrumentDefinition {
 struct InstrumentDefinitionWire {
     instrument_id: InstrumentId,
     asset_class: AssetClass,
-    primary_currency: Currency,
+    primary_denomination: Denomination,
     tick_size: TickSize,
     lot_size: LotSize,
     venue_mappings: Vec<VenueMapping>,
-    identifiers: Vec<ExternalIdentifier>,
+    identifiers: Vec<ExternalIdentifierRecord>,
     trading_status: TradingStatus,
 }
 
@@ -493,7 +593,7 @@ impl<'de> Deserialize<'de> for InstrumentDefinition {
         Self::try_new(
             wire.instrument_id,
             wire.asset_class,
-            wire.primary_currency,
+            wire.primary_denomination,
             wire.tick_size,
             wire.lot_size,
             wire.venue_mappings,
