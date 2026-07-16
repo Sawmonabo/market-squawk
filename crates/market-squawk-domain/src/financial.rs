@@ -1,7 +1,14 @@
 use std::fmt;
 
-use rust_decimal::{Decimal, RoundingStrategy};
+use rust_decimal::Decimal;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+mod exact_decimal;
+
+use exact_decimal::{
+    RatioError, RoundMode, exact_add, exact_product, exact_ratio_to_i64, exact_subtract,
+    rounded_ratio_to_i64,
+};
 
 /// A general financial-value invariant failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -133,13 +140,13 @@ pub enum RoundingPolicy {
 }
 
 impl RoundingPolicy {
-    const fn strategy(self) -> RoundingStrategy {
+    const fn mode(self) -> RoundMode {
         match self {
-            Self::NearestEven => RoundingStrategy::MidpointNearestEven,
-            Self::AwayFromZero => RoundingStrategy::AwayFromZero,
-            Self::TowardZero => RoundingStrategy::ToZero,
-            Self::Floor => RoundingStrategy::ToNegativeInfinity,
-            Self::Ceiling => RoundingStrategy::ToPositiveInfinity,
+            Self::NearestEven => RoundMode::NearestEven,
+            Self::AwayFromZero => RoundMode::AwayFromZero,
+            Self::TowardZero => RoundMode::TowardZero,
+            Self::Floor => RoundMode::Floor,
+            Self::Ceiling => RoundMode::Ceiling,
         }
     }
 }
@@ -268,13 +275,11 @@ impl PriceTicks {
     /// Returns [`PriceError::InexactTick`] when `value` is not an integral tick count, or
     /// [`PriceError::Overflow`] when that count does not fit in `i64`.
     pub fn try_from_decimal(value: Decimal, tick: TickSize) -> Result<Self, PriceError> {
-        let quotient = value.checked_div(tick.0).ok_or(PriceError::Overflow)?;
-        if !quotient.fract().is_zero() {
-            return Err(PriceError::InexactTick);
+        match exact_ratio_to_i64(value, tick.0) {
+            Ok(ticks) => Ok(Self(ticks)),
+            Err(RatioError::Inexact) => Err(PriceError::InexactTick),
+            Err(RatioError::Overflow) => Err(PriceError::Overflow),
         }
-        decimal_to_i64(quotient)
-            .map(Self)
-            .ok_or(PriceError::Overflow)
     }
 
     /// Converts a provider decimal using the caller-selected rounding policy.
@@ -287,11 +292,9 @@ impl PriceTicks {
         tick: TickSize,
         policy: RoundingPolicy,
     ) -> Result<Self, PriceError> {
-        let quotient = value.checked_div(tick.0).ok_or(PriceError::Overflow)?;
-        let rounded = quotient.round_dp_with_strategy(0, policy.strategy());
-        decimal_to_i64(rounded)
+        rounded_ratio_to_i64(value, tick.0, policy.mode())
             .map(Self)
-            .ok_or(PriceError::Overflow)
+            .map_err(|_| PriceError::Overflow)
     }
 
     /// Converts ticks back to an exact provider decimal using checked arithmetic.
@@ -300,9 +303,7 @@ impl PriceTicks {
     ///
     /// Returns [`PriceError::Overflow`] when the decimal result is unrepresentable.
     pub fn checked_to_decimal(self, tick: TickSize) -> Result<Decimal, PriceError> {
-        Decimal::from(self.0)
-            .checked_mul(tick.0)
-            .ok_or(PriceError::Overflow)
+        exact_product([Decimal::from(self.0), tick.0]).map_err(|()| PriceError::Overflow)
     }
 
     /// Adds tick counts using checked integer arithmetic.
@@ -342,17 +343,13 @@ impl PriceTicks {
         lot: LotSize,
         currency: Currency,
     ) -> Result<Money, FinancialError> {
-        let price = self.checked_to_decimal(tick)?.normalize();
-        let units = quantity.checked_to_decimal(lot)?.normalize();
-        let product_scale = price
-            .scale()
-            .checked_add(units.scale())
-            .filter(|scale| *scale <= Decimal::MAX_SCALE)
-            .ok_or(FinancialError::Overflow)?;
-        let amount = price
-            .checked_mul(units)
-            .filter(|product| product.scale() == product_scale)
-            .ok_or(FinancialError::Overflow)?;
+        let amount = exact_product([
+            Decimal::from(self.0),
+            tick.0,
+            Decimal::from(quantity.0),
+            lot.0,
+        ])
+        .map_err(|()| FinancialError::Overflow)?;
         Ok(Money::new(amount, currency))
     }
 }
@@ -389,13 +386,11 @@ impl QuantityLots {
         if value.is_sign_negative() {
             return Err(QuantityError::NegativeQuantity);
         }
-        let quotient = value.checked_div(lot.0).ok_or(QuantityError::Overflow)?;
-        if !quotient.fract().is_zero() {
-            return Err(QuantityError::InexactLot);
+        match exact_ratio_to_i64(value, lot.0) {
+            Ok(lots) => Self::new(lots),
+            Err(RatioError::Inexact) => Err(QuantityError::InexactLot),
+            Err(RatioError::Overflow) => Err(QuantityError::Overflow),
         }
-        decimal_to_i64(quotient)
-            .ok_or(QuantityError::Overflow)
-            .and_then(Self::new)
     }
 
     /// Converts a provider decimal using the caller-selected rounding policy.
@@ -412,10 +407,8 @@ impl QuantityLots {
         if value.is_sign_negative() {
             return Err(QuantityError::NegativeQuantity);
         }
-        let quotient = value.checked_div(lot.0).ok_or(QuantityError::Overflow)?;
-        let rounded = quotient.round_dp_with_strategy(0, policy.strategy());
-        decimal_to_i64(rounded)
-            .ok_or(QuantityError::Overflow)
+        rounded_ratio_to_i64(value, lot.0, policy.mode())
+            .map_err(|_| QuantityError::Overflow)
             .and_then(Self::new)
     }
 
@@ -425,9 +418,7 @@ impl QuantityLots {
     ///
     /// Returns [`QuantityError::Overflow`] when the decimal result is unrepresentable.
     pub fn checked_to_decimal(self, lot: LotSize) -> Result<Decimal, QuantityError> {
-        Decimal::from(self.0)
-            .checked_mul(lot.0)
-            .ok_or(QuantityError::Overflow)
+        exact_product([Decimal::from(self.0), lot.0]).map_err(|()| QuantityError::Overflow)
     }
 
     /// Adds nonnegative lot counts using checked integer arithmetic.
@@ -472,10 +463,6 @@ impl<'de> Deserialize<'de> for QuantityLots {
         let value = i64::deserialize(deserializer)?;
         Self::new(value).map_err(serde::de::Error::custom)
     }
-}
-
-fn decimal_to_i64(value: Decimal) -> Option<i64> {
-    i64::try_from(value).ok()
 }
 
 /// A normalized three-letter currency code.
@@ -577,7 +564,7 @@ impl BasisPoints {
 }
 
 /// An exact decimal amount paired with its currency.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct Money {
     amount: Decimal,
     currency: Currency,
@@ -609,12 +596,9 @@ impl Money {
     /// Rejects mixed currencies and decimal overflow.
     pub fn checked_add(self, other: Self) -> Result<Self, FinancialError> {
         self.ensure_same_currency(other)?;
-        let exact_scale = self.amount.scale().max(other.amount.scale());
-        self.amount
-            .checked_add(other.amount)
-            .filter(|amount| amount.scale() == exact_scale)
+        exact_add(self.amount, other.amount)
             .map(|amount| Self::new(amount, self.currency))
-            .ok_or(FinancialError::Overflow)
+            .map_err(|()| FinancialError::Overflow)
     }
 
     /// Subtracts amounts when their currencies match.
@@ -624,12 +608,9 @@ impl Money {
     /// Rejects mixed currencies and decimal overflow.
     pub fn checked_sub(self, other: Self) -> Result<Self, FinancialError> {
         self.ensure_same_currency(other)?;
-        let exact_scale = self.amount.scale().max(other.amount.scale());
-        self.amount
-            .checked_sub(other.amount)
-            .filter(|amount| amount.scale() == exact_scale)
+        exact_subtract(self.amount, other.amount)
             .map(|amount| Self::new(amount, self.currency))
-            .ok_or(FinancialError::Overflow)
+            .map_err(|()| FinancialError::Overflow)
     }
 
     fn ensure_same_currency(self, other: Self) -> Result<(), FinancialError> {
@@ -641,5 +622,21 @@ impl Money {
                 right: other.currency,
             })
         }
+    }
+}
+
+impl<'de> Deserialize<'de> for Money {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct MoneyFields {
+            amount: Decimal,
+            currency: Currency,
+        }
+
+        let fields = MoneyFields::deserialize(deserializer)?;
+        Ok(Self::new(fields.amount, fields.currency))
     }
 }
