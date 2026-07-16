@@ -754,6 +754,21 @@ separate. The app composes a configured `LiveMarketSource` and source-specific `
 allowing capture before decode without making the adapter depend on platform/live runtime
 implementations.
 
+The borrowing validation view is only for synchronous inspection. Actor admission consumes the
+decoded batch together with an exact successful raw-capture admission receipt and returns an owned,
+`Send + 'static`, non-Serde `CurrentDecodedProviderBatch`. That envelope retains the exact private
+session, current-health, runtime-subscription, capture-generation, and raw-frame evidence
+allocations needed for O(1) actor-time revalidation; a bare or deserialized batch cannot cross the
+production shard-ingress boundary.
+
+The registry owns one process-local capture allocation per source connection generation. It splits
+that allocation into an opaque current-capture health view, a non-`Clone` admission issuer moved
+into platform capture composition, and a cloneable degradation-only capability. Capture state is
+one-way within an allocation: `Initializing -> Healthy -> Incomplete`; `Incomplete` is terminal and
+recovery allocates a new generation. A successful admission receipt is owned, non-Serde, and bound
+to the exact session/generation allocation, raw payload digest, receive time, and frame identity.
+Replay, audit health DTOs, and reconstructed values cannot manufacture it.
+
 - [ ] **Step 4: Implement bounded, policy-compliant provider budgets**
 
 The rate policy represents published limits, local concurrency, backoff, `Retry-After`, and cooldown.
@@ -834,11 +849,20 @@ than blocking the event-to-action path.
 
 - [ ] **Step 4: Implement a non-blocking capture publisher**
 
-`RawCapturePublisher::try_publish` uses bounded `mpsc::Sender::try_send`; it returns only enqueue
-status. The writer task produces separate metrics/health and never sends per-frame acknowledgements.
-On full/closed channel, atomically set `CaptureIntegrityState::Incomplete` and emit a control-plane
-health event. The associated market stream becomes execution-ineligible until a new connection
-generation is synchronized.
+`RawCapturePublisher::try_publish` uses bounded `mpsc::Sender::try_send`; it returns an owned,
+non-Serde admission receipt on success, never a disk acknowledgement. The writer task produces
+separate metrics/health and never sends per-frame acknowledgements. On full/closed channel, writer
+failure, or shutdown deadline, atomically degrade the registry-issued exact-generation capture
+allocation before returning and emit a best-effort bounded control-plane health event. The
+associated market stream becomes execution-ineligible until a new connection generation and
+capture allocation are established.
+
+The cloneable publisher can admit and degrade only. A separate non-`Clone` control handle owns
+initial activation and generation rotation; no publisher clone, public value key, audit snapshot,
+or application callback can promote capture health. Capture readiness means the supervised capture
+path is ready and is independent of market/book snapshot synchronization. Same-generation
+degradation is terminal. Control transitions use RCU/one-way state or a bounded wait and cannot
+spin indefinitely on an in-flight publisher.
 
 - [ ] **Step 5: Rewire and verify compatibility**
 
@@ -943,6 +967,14 @@ and active-session handles to the shard's instrument-owned state; there is no pu
 loose metadata, audit assessment, health result enums, or timestamps. Test-only issuers are behind
 `cfg(test)`/non-default test support and their outputs are not accepted by production risk wiring.
 
+The issuer additionally binds the exact one-way source-generation execution lease, capture/current-
+health allocation, shard-liveness lease, runtime incarnation, and checked instrument-state revision.
+Issuance checks those leases before and after bounded nonce registration; a concurrent invalidation
+retires the nonce and fails closed. Capability consumption and the later risk/dispatch boundaries
+recheck the same allocations with Acquire semantics. Overflow, source rollover, health/capture
+degradation, and shard exit publish Release invalidation before returning or exiting. State-revision
+overflow quarantines instead of wrapping. This is the linearization contract used by Task 8.
+
 The issuer derives `DataQuality` and a policy-bound `valid_until`; callers supply neither. Expiry is
 the earliest applicable deadline from the source event's freshness budget, receive/source time
 sanity policy, metadata/authorization/coverage interval, session/state validity, and configured
@@ -1038,25 +1070,64 @@ unspecified hash. Persist the routing version with snapshots/diagnostics. For ve
 UUID `018f0000-0000-7000-8000-000000000001`, the V1 hash is `0x28edee9cb1852659` and routes to
 shard 9 of 16; use that exact golden vector in Step 1.
 
-- [ ] **Step 3: Implement single-writer shard tasks**
+- [ ] **Step 3: Implement single-writer shard tasks with count-and-byte admission**
 
-Each shard task owns its instrument books, rolling state, strategy state, and local risk counters.
-Ingress uses a bounded `mpsc` mailbox and `try_send`. No state mutex is shared between shards. A
-control task supervises join failures and cancellation but never mutates an instrument directly.
+Each shard task owns its instrument books, rolling state, strategy state, issuer/nonce state, and
+local risk counters. The only production ingress accepts Task 5's owned
+`CurrentDecodedProviderBatch`; a bare decoded batch or canonical event cannot enter the actor.
+Ingress uses bounded Tokio `mpsc` count admission plus an exact byte-permit budget and per-message
+byte limit, all with nonblocking `try_*` operations. A private closed command enum computes checked
+deep retained bytes for every nested provider observation; callers cannot undercount through a
+trait. The byte permit remains owned until command processing or discard completes. Validate zero,
+overflow, and Tokio maximum-permit configuration before constructing primitives. No state mutex is
+shared between shards. A supervisor owns and joins exactly the configured shard tasks; it never
+mutates an instrument directly and exposes ingress only after every shard reports ready.
 
-- [ ] **Step 4: Make saturation fail closed**
+- [ ] **Step 4: Make saturation, closure, and actor exit synchronously fail closed**
 
-On `Full`, mark the affected source/instrument generation `Quarantined`, increment a bounded metric,
-publish a control-plane health event, and require resynchronization. On `Closed`, mark the shard
-unavailable. Test that a message after overflow cannot reach a strategy or risk evaluator.
+Every exact source/venue/instrument/session generation has a process-local one-way execution lease;
+recovery allocates a new lease. Before returning any count-full, byte-full, overweight, checked-cost,
+or closed error, `ShardIngress::try_publish` synchronously invalidates the exact bound lease. It does
+not attempt to enqueue quarantine into the already-full mailbox, and safety never depends on a
+best-effort health event. The actor rechecks the lease before apply and immediately before features,
+strategy, and issuance, so already queued commands from an invalidated generation are diagnostic-
+only and cannot mutate a new generation or produce action. Closure/actor exit first invalidates a
+one-way shard-liveness lease and all affected generation authority. Fixed-size bounded health events
+are audit mirrors only; dropped-event counters saturate.
 
-- [ ] **Step 5: Publish bounded immutable snapshots**
+Add deterministic interleaving/model tests for issue/consume/risk/dispatch versus overflow and
+actor exit. An operation whose final authority Acquire linearizes before invalidation may finish;
+anything beginning after the admission API returns overflow must observe invalidation. Repeated
+faults are idempotent, stale nonce reclamation is incremental and bounded, and no producer-thread
+path scans a collection.
 
-Build `Arc<MarketSnapshot>` values on the owning shard. Snapshot requests return a clone of the
-latest immutable value through a watch channel; they do not lock live state or enqueue unbounded
-work. Apply explicit maximum instrument/depth/result sizes and indicate truncation in metadata.
+- [ ] **Step 5: Publish bounded immutable snapshots without reader backpressure**
 
-- [ ] **Step 6: Verify and commit**
+Build complete `Arc<MarketSnapshot>` values on the owning shard after the action decision and at a
+bounded coalesced cadence/event budget, then atomically publish through a crate-private
+`ArcSwap<MarketSnapshot>`. Do not use Tokio `watch` as the value store: an outstanding receiver
+borrow can hold its internal read lock and block the shard producer. Optional notification is a
+separate coalescing bounded `try_send(())` hint; readers always load the latest immutable value.
+
+Apply explicit instrument/depth/result bounds and dimension-specific completeness/truncation
+metadata. Include routing version/count, runtime incarnation, shard ID, source/session generation,
+state and snapshot revision, health epoch, and observed/evaluated/published times. Per-shard
+snapshots are atomic; cross-shard services return a sorted bounded revision vector rather than
+fabricating one global `as_of`. External services receive bounded DTOs, never the `ArcSwap`, issuer,
+lease, nonce, capability, or mutable state. Held/slow readers cannot block publication, and retained
+snapshot memory is bounded by a documented trusted-reader contract.
+
+- [ ] **Step 6: Implement supervised lifecycle and bounded shutdown**
+
+Static routing version/count define one runtime incarnation. A change invalidates all prior ingress
+and authority, clears state, reconnects sources, and requires fresh snapshots; live remapping is not
+supported. Partial startup cancels and joins already-started shards. Shutdown invalidates authority,
+closes ingress, cancels actors, discards queued market commands while releasing every permit,
+publishes terminal diagnostics best-effort, and joins all tasks to a deadline. Deadline aborts are
+also awaited; no task is silently detached. An actor drop guard invalidates shard liveness on every
+normal, error, cancellation, or panic/unwind path.
+
+- [ ] **Step 7: Verify and commit**
 
 ```bash
 cargo test -p market-squawk-live --all-features

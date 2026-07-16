@@ -353,6 +353,14 @@ one exact authorization, venue/instrument membership, provider product/channel, 
 runtime subscription, effective deadline, delivery mode, and validation profile. Callers cannot
 assemble this scope from loose metadata or a self-reported healthy snapshot.
 
+The registry also issues one process-local, one-way capture allocation for each connection
+generation. Platform capture owns a non-`Clone` admission issuer and a degradation-only handle; a
+cloneable publisher cannot promote or rotate capture health. Successful enqueue returns an owned,
+non-Serde admission receipt bound to the exact generation allocation and raw-frame digest/timing.
+The registry consumes that receipt with the decoded provider batch to produce the owned,
+`Send + 'static` current-batch envelope admitted to a shard. Same-generation degradation is
+terminal, and audit/replay values cannot reconstruct either receipt or current authority.
+
 ### Provider access policy
 
 Each provider has one local shared request budget. All workers for the same provider/account share
@@ -391,12 +399,15 @@ socket/protocol reader
           execution adapter
 ```
 
-The source reader never waits for disk completion. A raw-capture enqueue failure emits an integrity
-control event and prevents that frame from producing an executable action. A shard enqueue failure
-quarantines the affected source/instrument/generation and requires resynchronization. No critical
-message is silently discarded. The decoder never owns a second order book and cannot pre-assert
-precision, checksum, sequence, or canonical-state success. The shard computes the post-apply
-canonical state digest while retaining the exact initializing snapshot identity/digest.
+The source reader never waits for disk completion. A raw-capture enqueue failure synchronously
+degrades the exact registry-owned capture allocation before emitting a best-effort integrity event
+and prevents that frame from producing an executable action. Shard ingress is bounded by both
+message count and checked deep retained bytes. An admission failure synchronously invalidates the
+exact source/instrument/generation execution lease before returning; it never attempts to enqueue
+quarantine into the full mailbox. No critical message is silently discarded. The decoder never
+owns a second order book and cannot pre-assert precision, checksum, sequence, or canonical-state
+success. The shard computes the post-apply canonical state digest while retaining the exact
+initializing snapshot identity/digest.
 
 ### Stable sharding
 
@@ -445,6 +456,14 @@ evidence is converted against the current instrument tick/lot definition before 
 exists. `AllDeclared` coverage requires a registry-owned universe attestation; partial or otherwise
 unproven membership cannot qualify for immediate automated action.
 
+The capability also binds one-way exact-generation and shard-liveness lease allocations, runtime
+incarnation, capture allocation, and checked state revision. Overflow, rollover, degradation, and
+actor exit publish Release invalidation before returning or exiting. Issuance checks authority
+before and after bounded nonce registration; consumption, risk, and dispatch recheck with Acquire
+semantics. Already queued commands from an invalidated generation are diagnostic-only. This makes
+authority revocation linearizable without a registry lookup, database query, lock, or collection
+scan in the live path.
+
 Capability expiry is policy-derived as the earliest freshness, metadata/authorization/coverage, or
 maximum-lifetime deadline. Loss of any required evidence changes quality to `Quarantined` or
 `Stale`, revokes outstanding capability nonces, clears executable features/signals, and requires
@@ -457,9 +476,13 @@ after message-atomic application and the documented top-ten CRC32 validation pas
 
 ### Immutable control-plane snapshots
 
-Each shard publishes a bounded immutable snapshot after state transitions. A snapshot aggregator
-builds bounded views for application services. CLI and MCP never lock mutable shard state or run in
-the event handler.
+Each shard builds complete bounded immutable snapshots after the action decision at a configured
+coalesced cadence, then atomically publishes the latest `Arc` through a crate-private `ArcSwap`.
+Tokio `watch` is not the snapshot value store because an outstanding receiver borrow may block its
+producer. Optional notifications are separate bounded, coalescing hints. A snapshot aggregator
+builds bounded views and a sorted per-shard revision vector for application services; it never
+fabricates a single-instant cross-shard `as_of`. CLI and MCP receive bounded DTOs and never obtain
+the snapshot cell, leases, issuer, nonce state, mutable shard state, or event-handler access.
 
 ### Strategies, inference, and risk
 
