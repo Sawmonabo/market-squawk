@@ -1,5 +1,10 @@
 # Q1 Final Domain Contracts Report
 
+> **SUPERSEDED:** This historical lane report predates the integrated provider-registry contract.
+> Use the [Quarter 1 Checkpoint Correction Report](q1-checkpoint-correction-report.md) and current
+> authoritative architecture/decision documents for present wire and ingestion semantics. Claims
+> below are retained only as historical implementation evidence and are not current authority.
+
 Date: 2026-07-16
 
 Branch: `fix/q1-final-domain-contracts`

@@ -170,13 +170,13 @@ field is synthesized from another. The dated official-source evidence and respon
 retained in the [Quarter 1 contract decisions](../research/2026-07-16-q1-contract-decisions.md).
 
 Provider identity records bind the provider namespace/native ID and stable instrument to content
-evidence, source/first-observed timestamps, authoritative metadata revision/evidence, and effective
-interval. `ProviderIdentityEvidence` requires an algorithm-qualified digest; an optional
-`ProviderIdentityLocator` retains explicit reference/version identities as retrieval metadata, never
-evidence. A bare URL is unrepresentable. Registry ingestion has deterministic outcomes:
-an exact evidence duplicate is an idempotent no-op, a same-natural-key/same-revision disagreement is
-retained and quarantined as a conflict, and a temporally valid newer revision appends a new record
-and supersedes rather than mutates the prior record.
+evidence, source/first-observed timestamps, metadata revision/evidence, and effective interval.
+`ProviderIdentityEvidence` requires an algorithm-qualified digest; its optional locator remains
+retrieval metadata, never evidence; a bare URL is unrepresentable. Content-equivalent reingestion is
+idempotent at the logical-assertion layer: it creates no second logical assertion. The registry
+deterministically coalesces bounded locator and observation metadata and returns
+`ObservationCoalesced`; an exact repeat with no new metadata leaves canonical registry state
+unchanged. Same-revision divergence is quarantined; a valid newer revision appends and supersedes.
 
 `ChainId` validates and preserves the case-sensitive CAIP-2 envelope only. Namespace-specific
 qualification is separate: `eip155` references are base-10 chain IDs derived from `eth_chainId`,
@@ -626,7 +626,10 @@ independently prove that version immutable and never replaces the digest. `Futur
 uses `RevisionBoundPayloadEvidence` so its typed `MetadataRevision` cannot be retained without the
 exact payload evidence that established it. Authoritative `ExternalIdentifierRecord` assignment
 evidence uses the same mandatory digest contract. A moving `FIX.Latest` or provider URL cannot
-qualify either identity assertion by itself.
+qualify either identity assertion by itself. The strict wire rejects omitted content evidence and
+unknown fields, including legacy generic-reference shapes. It preserves the explicit digest
+algorithm as part of evidence identity; changing the explicit algorithm while retaining the same
+bytes produces distinct valid evidence rather than a deserialization error.
 
 ## Target-state completion
 

@@ -61,9 +61,10 @@ policy suite subsequently passed 17 tests.
   requirements; FIX tags 200, 541, 610, and 611 remain independent claims.
 - Distinguished generic CAIP-2 envelope validation from `eip155` and `solana` namespace-profile
   qualification.
-- Defined deterministic provider-registry ingestion: exact duplicate evidence is an idempotent
-  no-op, same-revision disagreement is retained/quarantined, and a valid newer revision appends and
-  supersedes without mutation or deletion.
+- Defined deterministic provider-registry ingestion: content-equivalent reingestion creates no
+  second logical assertion, deterministically coalesces bounded locator and observation metadata,
+  and returns `ObservationCoalesced`; an exact repeat with no new metadata leaves canonical state
+  unchanged. Same-revision disagreement is retained/quarantined, and valid newer revisions append.
 - Corrected language that treated mutable URLs or aliases as immutable. Provider identity evidence
   always includes an algorithm-qualified content digest; an optional locator carries explicit
   reference and version identities but remains non-authoritative retrieval metadata.

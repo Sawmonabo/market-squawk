@@ -10,6 +10,10 @@ All notable changes to this project are documented here.
 - Added exact tick, lot, money, and notional conversions with checked arithmetic and property tests.
 - Added verified instrument identifiers, network-qualified digital-asset addresses, futures identity,
   venue-scoped symbol changes, and explicit asset-versus-currency denomination.
+- Migrated authoritative identity wires to `ExactPayloadEvidence` and
+  `RevisionBoundPayloadEvidence`; legacy `source_reference` shapes are rejected, and
+  `InstrumentDefinition` now serializes its checked provider state as `provider_identity_registry`
+  rather than separate provider-identity and conflict vectors.
 - Added generation-bound timing, sequence, checksum, coverage, and live qualification evidence;
   persisted quality assertions require current runtime requalification before executable use.
 - Kept live and research provenance independent, including point-in-time publication, revision, and

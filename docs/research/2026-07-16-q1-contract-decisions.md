@@ -59,9 +59,11 @@ structurally insufficient by itself.
 
 `FuturesContractIdentity` carries `RevisionBoundPayloadEvidence`, which atomically binds its typed
 `MetadataRevision` to the exact payload evidence that established it. Authoritative assignment
-evidence on `ExternalIdentifierRecord` uses `ExactPayloadEvidence` directly. Their strict wire
-contracts reject the former bare `source_reference` shape, a locator without a version pin,
-missing content evidence, unknown fields, and algorithm-erasing substitutions.
+evidence on `ExternalIdentifierRecord` uses `ExactPayloadEvidence` directly. The strict wire
+rejects omitted content evidence and unknown fields, including the former bare
+`source_reference` shape and a locator without a version pin. The wire preserves the explicit digest
+algorithm as part of evidence identity; changing the explicit algorithm while retaining the same
+bytes produces distinct valid evidence rather than a deserialization error.
 
 ## Provider identity qualification
 
@@ -79,14 +81,15 @@ the venue and venue symbol. Every provider-native assertion is retained as a ver
 - asserted effective interval and later supersession evidence.
 
 Identical provider-ID text from different sources is therefore distinct. Registry ingestion uses a
-deterministic natural key and returns a typed outcome. Reingesting the same natural key, metadata
-revision, normalized assertion, effective interval, and content evidence is an idempotent no-op; it
-does not append a second assertion merely because the local observation time differs. The same
-natural key and metadata revision with a different payload, interval, or normalized mapping is a
-conflict: retain the competing evidence, quarantine the mapping, and never choose by arrival order.
-A temporally valid newer authoritative revision appends a new immutable assertion and explicitly
-supersedes the prior assertion, which remains queryable. A changed mapping without a newer evidenced
-revision is a quarantined conflict, not an in-place correction.
+deterministic natural key and returns a typed outcome. Content-equivalent reingestion is idempotent
+at the logical-assertion layer: it creates no second logical assertion. The registry deterministically
+coalesces bounded locator and observation metadata and returns `ObservationCoalesced`; an exact
+repeat with no new metadata leaves canonical registry state unchanged. The same natural key and
+metadata revision with a different payload, interval, or normalized mapping is a conflict: retain
+the competing evidence, quarantine the mapping, and never choose by arrival order. A temporally
+valid newer authoritative revision appends a new immutable assertion and explicitly supersedes the
+prior assertion, which remains queryable. A changed mapping without a newer evidenced revision is a
+quarantined conflict, not an in-place correction.
 
 ## Chain namespace evidence
 

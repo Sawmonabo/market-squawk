@@ -36,6 +36,27 @@ fn exact_payload_evidence_requires_a_digest_and_preserves_algorithm_identity()
 }
 
 #[test]
+fn changing_the_explicit_algorithm_deserializes_as_distinct_valid_evidence()
+-> Result<(), Box<dyn std::error::Error>> {
+    let original = ExactPayloadEvidence::from_content_digest(digest(DigestAlgorithm::Sha256, 8));
+    let mut changed_wire = serde_json::to_value(&original)?;
+    changed_wire["content_digest"]["algorithm"] = serde_json::json!("blake3");
+
+    let changed = serde_json::from_value::<ExactPayloadEvidence>(changed_wire)?;
+
+    assert_eq!(
+        changed.content_digest().algorithm(),
+        DigestAlgorithm::Blake3
+    );
+    assert_eq!(
+        changed.content_digest().bytes(),
+        original.content_digest().bytes()
+    );
+    assert_ne!(changed, original);
+    Ok(())
+}
+
+#[test]
 fn exact_payload_locator_is_optional_but_requires_a_separate_version()
 -> Result<(), Box<dyn std::error::Error>> {
     let locator = VersionPinnedSourceLocator::new(

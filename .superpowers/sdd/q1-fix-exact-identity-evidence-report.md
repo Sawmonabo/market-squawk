@@ -79,8 +79,8 @@ git diff --check
 ```
 
 The full `./scripts/verify.sh` repository gate passed on the final formatted implementation tree.
-It covered policy and generated-artifact checks, formatting, workspace Clippy with warnings denied,
-the full workspace test suite, release compilation, strict rustdoc, and local smoke checks.
+It covered the policy checks available on that branch, formatting, workspace Clippy with warnings
+denied, the full workspace test suite, release compilation, strict rustdoc, and local smoke checks.
 
 ## Explicit exclusions
 

@@ -399,11 +399,11 @@ an algorithm-qualified digest; an optional `ProviderIdentityLocator` retains exp
 version identities as retrieval metadata, never evidence. A bare mutable URL is unrepresentable.
 
 Put deterministic ingestion semantics in the provider-identity registry, not in vector equality:
-the same natural key, metadata revision, normalized assertion, interval, and content evidence is an
-idempotent no-op; a same-natural-key/same-revision disagreement is retained and quarantined as a
-typed conflict; a temporally valid newer evidenced revision appends a new assertion and marks the
-prior assertion superseded without deleting or mutating it. Equal arrival timestamps never decide
-a winner. Expose typed ingest outcomes so adapters cannot reinterpret duplicate/conflict behavior.
+content-equivalent reingestion is idempotent at the logical-assertion layer and creates no second
+logical assertion. The registry deterministically coalesces bounded locator and observation metadata
+and returns `ObservationCoalesced`; an exact repeat with no new metadata leaves canonical registry
+state unchanged. Same-revision disagreement is quarantined; a valid newer revision appends and
+supersedes without mutation. Expose typed outcomes so adapters cannot reinterpret this behavior.
 
 - [ ] **Step 3: Implement exact scaled values**
 
@@ -1775,5 +1775,8 @@ source evidence. It requires an algorithm-qualified `EvidenceDigest`; its option
 for retrieval without independently proving the pin immutable or replacing the digest. Bind a
 futures identity's typed `MetadataRevision` and exact security-definition evidence atomically in
 `RevisionBoundPayloadEvidence`. Authoritative `ExternalIdentifierRecord` assignment evidence uses
-`ExactPayloadEvidence` directly. Strict wires reject generic/bare `PayloadReference` values, moving
-URLs without a digest, missing locator versions, unknown fields, and algorithm transplants.
+`ExactPayloadEvidence` directly. The strict wire rejects omitted content evidence and unknown fields,
+including generic/bare `PayloadReference` values, moving URLs without a digest, and missing locator
+versions. It preserves the explicit digest algorithm as part of evidence identity; changing the
+explicit algorithm while retaining the same bytes produces distinct valid evidence rather than a
+deserialization error.

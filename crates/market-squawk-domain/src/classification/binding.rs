@@ -33,7 +33,7 @@ macro_rules! source_identifier_newtype {
 
 source_identifier_newtype!(
     MetadataRevision,
-    "Immutable revision of the authoritative source metadata used by an assessment."
+    "Bounded caller/source-supplied revision identity; authority and immutability are established by surrounding evidence and registration, not by this identifier alone."
 );
 source_identifier_newtype!(
     AuthorizationBasis,
