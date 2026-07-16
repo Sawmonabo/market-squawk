@@ -196,9 +196,15 @@ pub struct CurrentProviderObservation {
 
 impl CurrentProviderObservation {
     pub fn key(&self) -> &CurrentBatchKey;
+    pub fn stream_key(&self) -> &CurrentStreamKey;
     pub fn observation(&self) -> &ProviderNormalizedObservation;
     pub fn policy(&self) -> &CurrentLivePolicy;
     pub fn current_lease(&self) -> &CurrentSourceAuthorityLease;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CurrentStreamKey {
+    /* source, venue, instrument, provider product, and provider channel */
 }
 
 #[derive(Clone, Debug)]
@@ -256,6 +262,12 @@ impl ValidatedCurrentSourceAuthority<'_> {
 `CurrentDecodedProviderBatches`. There is deliberately no public `into_parts` that separates a bare
 observation from its policy and lease. Task 7 consumes the intact value and rechecks the lease at
 apply and issuance time.
+
+`CurrentBatchKey(venue, instrument)` is only the deterministic Task 8 routing key. Mutable Task 7
+stream state is keyed by `CurrentStreamKey(source, venue, instrument, provider product, provider
+channel)`, with revision/session/generation bound by the one-way current-authority lease. Two
+authorized sources or channels routed to the same instrument shard must retain independent books,
+sequence/snapshot state, health, and capability authority.
 
 The remaining provider payload shapes should be equivalent to:
 
