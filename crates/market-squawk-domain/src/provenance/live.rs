@@ -106,11 +106,14 @@ impl RecordedLiveProvenanceInput {
 
 /// Provenance carried by every canonical live market event.
 ///
-/// This is a serializable archive/research record, never an execution capability. In particular,
-/// a recorded `DirectVerified` classification is only a historical assertion linked to retained
-/// evidence. [`Self::execution_eligibility`] therefore always returns `Ineligible`. The stateful
-/// live-plane evaluator introduced with the source registry owns the future short-lived,
-/// non-serializable execution token; the domain crate intentionally defines no such token.
+/// This is a serializable archive/research record, never an execution capability. A recorded
+/// `DirectVerified` classification is only a caller-supplied archival assertion paired with an
+/// opaque assessment reference. This record does not retain assessment evidence, does not
+/// dereference the reference, and proves neither its existence nor its relationship to the recorded
+/// classification. It never grants current execution authority, and
+/// [`Self::execution_eligibility`] therefore always returns `Ineligible`. The stateful live-plane
+/// evaluator introduced with the source registry owns the future short-lived, non-serializable
+/// execution token; the domain crate intentionally defines no such token.
 ///
 /// ```compile_fail
 /// use market_squawk_domain::LiveProvenance;
@@ -254,7 +257,7 @@ impl LiveProvenance {
     pub const fn recorded_coverage(&self) -> CoverageStatus {
         self.recorded_coverage
     }
-    /// Returns retained payload evidence.
+    /// Returns the retained content digest or opaque source-side record identity.
     pub const fn payload_reference(&self) -> &PayloadReference {
         &self.payload_reference
     }

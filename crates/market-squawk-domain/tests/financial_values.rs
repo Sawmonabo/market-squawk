@@ -255,6 +255,19 @@ fn currency_is_normalized_and_money_requires_matching_currency()
 }
 
 #[test]
+fn money_wire_is_exact_and_rejects_nested_unknown_fields() -> Result<(), Box<dyn std::error::Error>>
+{
+    let money = Money::new(Decimal::new(12_345, 2), Currency::try_from("USD")?);
+    let canonical = serde_json::to_value(money)?;
+    assert_eq!(serde_json::from_value::<Money>(canonical.clone())?, money);
+
+    let mut unexpected = canonical;
+    unexpected["unrecognized_nested_field"] = serde_json::json!(true);
+    assert!(serde_json::from_value::<Money>(unexpected).is_err());
+    Ok(())
+}
+
+#[test]
 fn basis_points_are_exact_and_checked() -> Result<(), Box<dyn std::error::Error>> {
     let one_percent = BasisPoints::new(100);
     assert_eq!(one_percent.get(), 100);

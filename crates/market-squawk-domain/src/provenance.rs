@@ -44,7 +44,10 @@ impl PayloadHash {
     }
 }
 
-/// Durable evidence identifying the exact source payload behind a canonical record.
+/// A content digest or opaque source-side record locator retained for provenance.
+///
+/// A [`Self::SourceReference`] is only a bounded identity supplied by its caller. It carries no
+/// inherent existence, immutability, or retrievability guarantee.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(
     deny_unknown_fields,
@@ -55,7 +58,7 @@ impl PayloadHash {
 pub enum PayloadReference {
     /// Algorithm-qualified content digest.
     ContentHash(PayloadHash),
-    /// Bounded provider, file-manifest, or capture-record reference.
+    /// Opaque provider, file-manifest, or capture-record identity.
     SourceReference(SourceIdentifier),
 }
 
@@ -78,7 +81,9 @@ pub enum ProvenanceError {
     SupersededNotAfterAvailable,
     /// Revision numbers are one-based.
     ZeroRevision,
-    /// Decoding cannot author `DirectVerified`; it requires a successful qualification.
+    /// Decoder output cannot claim `DirectVerified`; a recorded label is only a caller-supplied
+    /// archival assertion paired with an opaque reference and does not prove successful
+    /// qualification.
     UnqualifiedDirectVerified,
     /// A recorded direct-verified label lacks its required assessment reference.
     MissingAssessmentReference,

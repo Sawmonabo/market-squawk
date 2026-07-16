@@ -126,7 +126,7 @@ pub struct ResearchProvenanceInput {
     pub ingested_at: Timestamp,
     /// Evidentiary data-quality class.
     pub quality: DataQuality,
-    /// Immutable payload evidence.
+    /// Content digest or opaque source record identity with no inherent immutability guarantee.
     pub payload_reference: PayloadReference,
     /// Explicit point-in-time availability evidence.
     pub availability: AvailabilityEvidence,
@@ -238,7 +238,9 @@ impl ResearchProvenance {
         self.quality
     }
 
-    /// Returns retained payload evidence.
+    /// Returns the retained content digest or opaque source record identity.
+    ///
+    /// A source reference has no inherent immutability guarantee.
     pub const fn payload_reference(&self) -> &PayloadReference {
         &self.payload_reference
     }

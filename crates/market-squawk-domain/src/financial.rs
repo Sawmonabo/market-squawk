@@ -631,6 +631,7 @@ impl<'de> Deserialize<'de> for Money {
         D: Deserializer<'de>,
     {
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct MoneyFields {
             amount: Decimal,
             currency: Currency,
