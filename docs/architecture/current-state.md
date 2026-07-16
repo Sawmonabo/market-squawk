@@ -4,11 +4,12 @@
 
 - Audit date: 2026-07-16
 - Repository: `market-squawk`
-- Implementation baseline: Q2 Tasks 1-8 through production commit `09f2b33` and deterministic
-  Task 8 test head `c1faab0`
+- Reviewed implementation baseline: integrated Q2 Tasks 1–8 commit `581d4fd` (rejected pending the
+  Q2-R01–Q2-R15 remediation ledger)
 - Evidence: repository inspection, locked local verification,
   [Q2 live-readiness audit](../plans/q2-live-readiness-audit.md),
-  [Q2 Task 8 implementation report](../reports/q2-task8-implementation.md), and the
+  [Q2 Task 8 implementation report](../reports/q2-task8-implementation.md),
+  [Q2 checkpoint rejection ledger](../reports/q2-checkpoint-review.md), and
   [deep-research report](../research/2026-07-15-market-squawk/final-report.md)
 
 This document describes working software at the stated baseline. Interfaces, synthetic fixtures,
@@ -33,6 +34,32 @@ strategy integration, comprehensive risk and paper execution, the research plane
 storage, modeling, portfolios, fair-value analysis, complete MCP/CLI services, fuzzing,
 benchmarks, audits, and release evidence remain in their assigned implementation tasks. No
 performance claim has been made.
+
+## Quarter 2 production-readiness correction
+
+The exact integrated Tasks 5–8 checkpoint `581d4fd` was rejected by both independent reviewers.
+The components below exist and their focused tests remain useful evidence, but the following
+cross-component properties are not accepted as production-ready until the linked Q2-R findings are
+closed and re-reviewed:
+
+- decoded/current-batch byte accounting omits nested book/change allocations (Q2-R01);
+- caller-authored future health and budget state can outlive or contradict authoritative current
+  conditions (Q2-R02–Q2-R05);
+- recoverable first-event rejection can later terminate a shard through incomplete snapshot
+  provenance (Q2-R06);
+- persistent and transient snapshot memory are undercounted (Q2-R07–Q2-R08);
+- snapshot timers can starve control/data queues and public snapshot deserialization bypasses
+  invariants (Q2-R09–Q2-R10);
+- a blocked capture sink can outlive a timeout after supervision ownership is discarded (Q2-R11);
+  and
+- failure atomicity, aggregate-reader configuration, Windows CI, and cadence semantics require the
+  recorded hardening corrections (Q2-R12–Q2-R15).
+
+Consequently, statements later in this document describing exact byte or peak-memory bounds,
+complete current health, route-local rejection, clean capture-worker shutdown, and bounded
+snapshot input are descriptions of the pre-review implementation intent, not accepted guarantees.
+The [checkpoint ledger](../reports/q2-checkpoint-review.md) is authoritative until a replacement
+commit closes each item with code and regression evidence.
 
 ## Workspace and toolchain
 
