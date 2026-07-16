@@ -203,9 +203,11 @@ tests remain green. No test uses `unwrap`, `expect`, or intentional panic paths.
 ## Portable CI
 
 The Linux job keeps `./scripts/verify.sh` on the GA `ubuntu-24.04` image. Separate
-`macos-15-intel` and `windows-2025` jobs perform locked all-feature workspace builds and explicit
-locked platform tests for path confinement, journal compatibility, capture lifecycle, and the
-capture authority bridge. These explicit labels were checked on 2026-07-16 against GitHub's
+`macos-15-intel` and `windows-2025` jobs perform locked all-feature workspace builds and locked
+all-workspace, all-target, all-feature tests. That gate compiles cfg-specific unit, integration,
+example, and benchmark targets across every crate, including platform path confinement, journal
+compatibility, capture lifecycle, and capture authority coverage. These explicit labels were
+checked on 2026-07-16 against GitHub's
 [hosted-runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)
 and the official [runner-images repository](https://github.com/actions/runner-images). The preview
 `ubuntu-26.04` image and mutable `*-latest` aliases are deliberately excluded.

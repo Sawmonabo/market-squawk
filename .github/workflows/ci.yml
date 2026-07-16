@@ -45,10 +45,7 @@ jobs:
       - run: rustc --version
       - run: cargo --version
       - run: cargo build --workspace --all-features --locked
-      - run: cargo test -p market-squawk-platform --all-features --locked --test path_confinement
-      - run: cargo test -p market-squawk-platform --all-features --locked --test journal_compatibility
-      - run: cargo test -p market-squawk-platform --all-features --locked --test capture_lifecycle
-      - run: cargo test -p market-squawk-platform --all-features --locked --test capture_authority_bridge
+      - run: cargo test --workspace --all-targets --all-features --locked
 
   windows:
     runs-on: windows-2025
@@ -67,7 +64,4 @@ jobs:
       - run: rustc --version
       - run: cargo --version
       - run: cargo build --workspace --all-features --locked
-      - run: cargo test -p market-squawk-platform --all-features --locked --test path_confinement
-      - run: cargo test -p market-squawk-platform --all-features --locked --test journal_compatibility
-      - run: cargo test -p market-squawk-platform --all-features --locked --test capture_lifecycle
-      - run: cargo test -p market-squawk-platform --all-features --locked --test capture_authority_bridge
+      - run: cargo test --workspace --all-targets --all-features --locked

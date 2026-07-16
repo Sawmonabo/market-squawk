@@ -285,7 +285,7 @@ git commit -m "fix(app): retain capture shutdown ownership through reap"
 
 - [ ] **Step 1: Write the failing CI workflow policy tests**
 
-The standard-library test must assert all action references match `@[0-9a-f]{40}`, every checkout step's bounded block contains `persist-credentials: false`, `*-latest` is absent, the exact GA labels are present, Linux still runs `./scripts/verify.sh`, and macOS/Windows contain locked workspace build plus explicit path/journal/capture platform commands.
+The standard-library test must assert all action references match `@[0-9a-f]{40}`, every checkout step's bounded block contains `persist-credentials: false`, `*-latest` is absent, the exact GA labels are present, Linux still runs `./scripts/verify.sh`, and macOS/Windows contain locked workspace build plus locked all-workspace/all-target/all-feature tests.
 
 - [ ] **Step 2: Run the policy test and verify RED**
 
@@ -304,10 +304,7 @@ Retain the existing immutable action SHAs. Use `ubuntu-24.04`, `macos-15-intel`,
 
 ```yaml
 - run: cargo build --workspace --all-features --locked
-- run: cargo test -p market-squawk-platform --all-features --locked --test path_confinement
-- run: cargo test -p market-squawk-platform --all-features --locked --test journal_compatibility
-- run: cargo test -p market-squawk-platform --all-features --locked --test capture_lifecycle
-- run: cargo test -p market-squawk-platform --all-features --locked --test capture_authority_bridge
+- run: cargo test --workspace --all-targets --all-features --locked
 ```
 
 - [ ] **Step 4: Verify CI policy GREEN**

@@ -9,10 +9,7 @@ WORKFLOW = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.y
 ACTION_PIN = re.compile(r"^[^@\s]+@[0-9a-f]{40}$")
 PORTABLE_COMMANDS = (
     "cargo build --workspace --all-features --locked",
-    "cargo test -p market-squawk-platform --all-features --locked --test path_confinement",
-    "cargo test -p market-squawk-platform --all-features --locked --test journal_compatibility",
-    "cargo test -p market-squawk-platform --all-features --locked --test capture_lifecycle",
-    "cargo test -p market-squawk-platform --all-features --locked --test capture_authority_bridge",
+    "cargo test --workspace --all-targets --all-features --locked",
 )
 
 
@@ -88,7 +85,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("runs-on: ubuntu-24.04", linux)
         self.assertIn("- run: ./scripts/verify.sh", linux)
 
-    def test_macos_and_windows_run_locked_portable_platform_coverage(self) -> None:
+    def test_macos_and_windows_run_locked_all_target_workspace_coverage(self) -> None:
         workflow = WORKFLOW.read_text()
         for job_name, runner in (
             ("macos", "macos-15-intel"),
