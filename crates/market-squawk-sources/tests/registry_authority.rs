@@ -327,6 +327,40 @@ fn process_coordinator_interns_registry_and_restored_budget_allocations() -> Tes
                 .ok_or("restored coordinated budget missing")?
         )
     );
+
+    let permit = match first_budget.try_acquire() {
+        BudgetDecision::Ready(permit) => permit,
+        other => return Err(format!("unexpected coordinated acquire: {other:?}").into()),
+    };
+    assert!(matches!(
+        second_budget.try_acquire(),
+        BudgetDecision::Unavailable(
+            market_squawk_sources::BudgetUnavailableReason::ConcurrencyExhausted
+        )
+    ));
+    permit.release();
+    assert!(matches!(
+        second_budget.try_acquire(),
+        BudgetDecision::Ready(_)
+    ));
+
+    let cooldown = match second_budget.apply_retry_after(RetryAfter::Delay(
+        NonZeroU64::new(60_000_000_000).ok_or("nonzero retry delay")?,
+    )) {
+        BudgetDecision::WaitUntil(deadline) => deadline,
+        other => return Err(format!("unexpected coordinated cooldown: {other:?}").into()),
+    };
+    assert!(matches!(
+        first_budget.try_acquire(),
+        BudgetDecision::WaitUntil(deadline) if deadline == cooldown
+    ));
+    assert!(matches!(
+        restored_source
+            .budget()
+            .ok_or("restored coordinated budget missing")?
+            .try_acquire(),
+        BudgetDecision::WaitUntil(deadline) if deadline == cooldown
+    ));
     Ok(())
 }
 
