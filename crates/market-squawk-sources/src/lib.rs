@@ -20,7 +20,14 @@ mod registry;
 /// plus worst-case alignment padding is a stable, allocator-metadata-independent upper charge for
 /// the language-visible control block. Callers add `size_of::<T>()` and `T`'s owned allocations.
 pub(crate) const fn conservative_arc_control_block_charge<T>() -> usize {
-    (2 * std::mem::size_of::<usize>()) + (std::mem::align_of::<T>() - 1)
+    let value_alignment = std::mem::align_of::<T>();
+    let counter_alignment = std::mem::align_of::<usize>();
+    let allocation_alignment = if value_alignment > counter_alignment {
+        value_alignment
+    } else {
+        counter_alignment
+    };
+    (2 * std::mem::size_of::<usize>()) + (allocation_alignment - 1)
 }
 
 pub use capture::{
@@ -78,3 +85,33 @@ pub use registry::{
     RegistryAuthorityState, RegistryError, ValidatedCurrentSourceAuthority, ValidatedLiveScope,
     ValidatedSourceSession,
 };
+
+#[cfg(test)]
+mod allocation_charge_tests {
+    use std::sync::atomic::AtomicU8;
+
+    use super::conservative_arc_control_block_charge;
+
+    #[repr(align(64))]
+    struct OverAligned(u8);
+
+    #[test]
+    fn arc_control_charge_covers_small_atomic_and_over_aligned_layouts() {
+        let counter_bytes = 2 * std::mem::size_of::<usize>();
+        let counter_padding = std::mem::align_of::<usize>() - 1;
+        assert_eq!(
+            conservative_arc_control_block_charge::<u8>(),
+            counter_bytes + counter_padding
+        );
+        assert!(
+            conservative_arc_control_block_charge::<AtomicU8>() >= counter_bytes + counter_padding
+        );
+        assert_eq!(
+            conservative_arc_control_block_charge::<OverAligned>(),
+            counter_bytes + std::mem::align_of::<OverAligned>() - 1
+        );
+        assert_eq!(std::mem::size_of::<OverAligned>(), 64);
+        let OverAligned(value) = OverAligned(7);
+        assert_eq!(value, 7);
+    }
+}
