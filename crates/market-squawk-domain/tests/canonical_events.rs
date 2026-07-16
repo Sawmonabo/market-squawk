@@ -2,20 +2,20 @@ use std::error::Error;
 use std::str::FromStr;
 
 use market_squawk_domain::{
-    AggressorSide, AlternativeDataObservation, AuctionEvent, AuctionPhase, BookDeltaEvent,
-    BookLevel, BookSnapshotEvent, CorporateActionEvent, CorporateActionKind,
-    CorporateActionObservation, DataQuality, FilingObservation, FundamentalObservation,
-    HaltTransition, InstrumentId, InstrumentStatusEvent, MacroObservation, MarketDepth,
-    MarketEvent, MarketEventError, MarketSide, PayloadReference, PositionObservation, PositionSide,
-    PriceTicks, Provenance, QuantityLots, QuoteEvent, ResearchContext, ResearchError,
-    ResearchObservation, ResearchTime, RevisionNumber, SchemaVersion, SourceId, SourceIdentifier,
-    Timestamp, TradeEvent, TradingHaltEvent, TradingStatus, TransactionObservation, VenueId,
+    AggressorSide, AlternativeDataObservation, AuctionEvent, AuctionPhase, AvailabilityEvidence,
+    BookDeltaEvent, BookLevel, BookSnapshotEvent, ConnectionGeneration, CorporateActionEvent,
+    CorporateActionKind, CorporateActionObservation, DataQuality, FilingObservation,
+    FundamentalObservation, HaltTransition, InstrumentId, InstrumentStatusEvent, LiveProvenance,
+    MacroObservation, MarketDepth, MarketEvent, MarketEventError, MarketSide, PayloadReference,
+    PositionObservation, PositionSide, PriceTicks, QuantityLots, QuoteEvent, ResearchContext,
+    ResearchError, ResearchObservation, ResearchProvenance, ResearchTime, RevisionNumber,
+    SourceCoverageEvidence, SourceId, SourceIdentifier, Timestamp, TradeEvent, TradingHaltEvent,
+    TradingStatus, TransactionObservation, VenueId,
 };
 use rust_decimal::Decimal;
 
-fn live_provenance(instrument: bool) -> Result<Provenance, Box<dyn Error>> {
-    Provenance::new(
-        SchemaVersion::CURRENT,
+fn live_provenance(instrument: bool) -> Result<LiveProvenance, Box<dyn Error>> {
+    LiveProvenance::decoded(
         SourceId::try_from("direct-feed")?,
         if instrument {
             Some(InstrumentId::from_str(
@@ -28,9 +28,10 @@ fn live_provenance(instrument: bool) -> Result<Provenance, Box<dyn Error>> {
         SourceIdentifier::try_from("trade-7")?,
         Some(Timestamp::from_unix_nanos(100)),
         Timestamp::from_unix_nanos(110),
-        Timestamp::from_unix_nanos(110),
         Timestamp::from_unix_nanos(120),
-        DataQuality::DirectVerified,
+        DataQuality::DirectUnverified,
+        ConnectionGeneration::new(7)?,
+        SourceCoverageEvidence::Explicit,
         PayloadReference::SourceReference(SourceIdentifier::try_from("capture:7")?),
     )
     .map_err(Into::into)
@@ -38,7 +39,27 @@ fn live_provenance(instrument: bool) -> Result<Provenance, Box<dyn Error>> {
 
 fn research_context(instrument: bool) -> Result<ResearchContext, Box<dyn Error>> {
     ResearchContext::new(
-        live_provenance(instrument)?,
+        ResearchProvenance::new(
+            SourceId::try_from("historical-file")?,
+            if instrument {
+                Some(InstrumentId::from_str(
+                    "0187f5f1-6fc2-7fa2-bf05-2ce5354c55cb",
+                )?)
+            } else {
+                None
+            },
+            None,
+            SourceIdentifier::try_from("record-7")?,
+            None,
+            Timestamp::from_unix_nanos(110),
+            Timestamp::from_unix_nanos(120),
+            DataQuality::OfficialDelayed,
+            PayloadReference::SourceReference(SourceIdentifier::try_from("fixture:7")?),
+            AvailabilityEvidence::evidenced(
+                Timestamp::from_unix_nanos(100),
+                SourceIdentifier::try_from("release-calendar")?,
+            ),
+        )?,
         ResearchTime::new(
             Timestamp::from_unix_nanos(90),
             Some(Timestamp::from_unix_nanos(100)),
@@ -186,7 +207,7 @@ fn market_payload_fields_are_available_through_typed_views() -> Result<(), Box<d
     )?;
 
     assert_eq!(trade.aggressor_side(), AggressorSide::Buy);
-    assert_eq!(quote.provenance().quality(), DataQuality::DirectVerified);
+    assert_eq!(quote.provenance().quality(), DataQuality::DirectUnverified);
     assert_eq!(snapshot.depth(), MarketDepth::PriceLevel);
     assert_eq!(snapshot.sequence(), None);
     assert_eq!(delta.depth(), MarketDepth::PriceLevel);

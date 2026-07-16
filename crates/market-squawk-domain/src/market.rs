@@ -6,7 +6,7 @@ use std::num::NonZeroU32;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{
-    InstrumentId, MarketDepth, Money, PriceTicks, Provenance, QuantityLots, SequenceNumber,
+    InstrumentId, LiveProvenance, MarketDepth, Money, PriceTicks, QuantityLots, SequenceNumber,
     SourceIdentifier, Timestamp, TradingStatus, VenueSymbol,
 };
 
@@ -97,6 +97,7 @@ impl BookLevel {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BookLevelWire {
     price: PriceTicks,
     quantity: QuantityLots,
@@ -114,6 +115,7 @@ impl<'de> Deserialize<'de> for BookLevel {
 
 /// An incremental book change; zero quantity explicitly deletes the level.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct BookChange {
     side: MarketSide,
     price: PriceTicks,
@@ -148,7 +150,7 @@ impl BookChange {
 
 /// A typed corporate action shared by live and research payloads.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
 pub enum CorporateActionKind {
     /// Share split with an exact nonzero ratio.
     Split {
@@ -180,7 +182,12 @@ pub enum CorporateActionKind {
 
 /// A canonical live-market event.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "event", content = "payload", rename_all = "snake_case")]
+#[serde(
+    deny_unknown_fields,
+    tag = "event",
+    content = "payload",
+    rename_all = "snake_case"
+)]
 pub enum MarketEvent {
     /// Executed trade.
     Trade(TradeEvent),
@@ -252,7 +259,7 @@ impl fmt::Display for MarketEventError {
 impl std::error::Error for MarketEventError {}
 
 pub(super) fn validate_market_provenance(
-    provenance: &Provenance,
+    provenance: &LiveProvenance,
     venue_required: bool,
 ) -> Result<InstrumentId, MarketEventError> {
     let instrument_id = provenance

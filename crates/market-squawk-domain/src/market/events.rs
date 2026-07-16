@@ -4,7 +4,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use super::{
     AggressorSide, AuctionPhase, BookChange, BookLevel, CorporateActionKind, HaltTransition,
-    MarketDepth, MarketEventError, Provenance, SequenceNumber, SourceIdentifier, Timestamp,
+    LiveProvenance, MarketDepth, MarketEventError, SequenceNumber, SourceIdentifier, Timestamp,
     TradingStatus, validate_book, validate_market_provenance,
 };
 use crate::{PriceTicks, QuantityLots};
@@ -12,7 +12,7 @@ use crate::{PriceTicks, QuantityLots};
 /// Executed trade payload.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct TradeEvent {
-    provenance: Provenance,
+    provenance: LiveProvenance,
     price: PriceTicks,
     quantity: QuantityLots,
     aggressor_side: AggressorSide,
@@ -21,7 +21,7 @@ pub struct TradeEvent {
 impl TradeEvent {
     /// Constructs a positive-quantity venue trade.
     pub fn new(
-        provenance: Provenance,
+        provenance: LiveProvenance,
         price: PriceTicks,
         quantity: QuantityLots,
         aggressor_side: AggressorSide,
@@ -39,7 +39,7 @@ impl TradeEvent {
     }
 
     /// Returns common provenance.
-    pub const fn provenance(&self) -> &Provenance {
+    pub const fn provenance(&self) -> &LiveProvenance {
         &self.provenance
     }
 
@@ -60,8 +60,9 @@ impl TradeEvent {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TradeEventWire {
-    provenance: Provenance,
+    provenance: LiveProvenance,
     price: PriceTicks,
     quantity: QuantityLots,
     aggressor_side: AggressorSide,
@@ -86,7 +87,7 @@ impl<'de> Deserialize<'de> for TradeEvent {
 /// One- or two-sided quote payload.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct QuoteEvent {
-    provenance: Provenance,
+    provenance: LiveProvenance,
     bid: Option<BookLevel>,
     ask: Option<BookLevel>,
 }
@@ -94,7 +95,7 @@ pub struct QuoteEvent {
 impl QuoteEvent {
     /// Constructs a nonempty, uncrossed venue quote.
     pub fn new(
-        provenance: Provenance,
+        provenance: LiveProvenance,
         bid: Option<BookLevel>,
         ask: Option<BookLevel>,
     ) -> Result<Self, MarketEventError> {
@@ -115,7 +116,7 @@ impl QuoteEvent {
     }
 
     /// Returns common provenance.
-    pub const fn provenance(&self) -> &Provenance {
+    pub const fn provenance(&self) -> &LiveProvenance {
         &self.provenance
     }
 
@@ -131,8 +132,9 @@ impl QuoteEvent {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct QuoteEventWire {
-    provenance: Provenance,
+    provenance: LiveProvenance,
     bid: Option<BookLevel>,
     ask: Option<BookLevel>,
 }
@@ -150,7 +152,7 @@ impl<'de> Deserialize<'de> for QuoteEvent {
 /// Complete order-book image for a source connection generation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct BookSnapshotEvent {
-    provenance: Provenance,
+    provenance: LiveProvenance,
     depth: MarketDepth,
     bids: Vec<BookLevel>,
     asks: Vec<BookLevel>,
@@ -160,7 +162,7 @@ pub struct BookSnapshotEvent {
 impl BookSnapshotEvent {
     /// Constructs an uncrossed snapshot in strict best-to-worst side order.
     pub fn new(
-        provenance: Provenance,
+        provenance: LiveProvenance,
         depth: MarketDepth,
         bids: Vec<BookLevel>,
         asks: Vec<BookLevel>,
@@ -178,7 +180,7 @@ impl BookSnapshotEvent {
     }
 
     /// Returns common provenance.
-    pub const fn provenance(&self) -> &Provenance {
+    pub const fn provenance(&self) -> &LiveProvenance {
         &self.provenance
     }
 
@@ -204,8 +206,9 @@ impl BookSnapshotEvent {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BookSnapshotEventWire {
-    provenance: Provenance,
+    provenance: LiveProvenance,
     depth: MarketDepth,
     bids: Vec<BookLevel>,
     asks: Vec<BookLevel>,
@@ -232,7 +235,7 @@ impl<'de> Deserialize<'de> for BookSnapshotEvent {
 /// Nonempty incremental order-book changes for one source message.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct BookDeltaEvent {
-    provenance: Provenance,
+    provenance: LiveProvenance,
     depth: MarketDepth,
     changes: Vec<BookChange>,
     sequence: Option<SequenceNumber>,
@@ -241,7 +244,7 @@ pub struct BookDeltaEvent {
 impl BookDeltaEvent {
     /// Constructs one atomic nonempty provider delta.
     pub fn new(
-        provenance: Provenance,
+        provenance: LiveProvenance,
         depth: MarketDepth,
         changes: Vec<BookChange>,
         sequence: Option<SequenceNumber>,
@@ -259,7 +262,7 @@ impl BookDeltaEvent {
     }
 
     /// Returns common provenance.
-    pub const fn provenance(&self) -> &Provenance {
+    pub const fn provenance(&self) -> &LiveProvenance {
         &self.provenance
     }
 
@@ -280,8 +283,9 @@ impl BookDeltaEvent {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BookDeltaEventWire {
-    provenance: Provenance,
+    provenance: LiveProvenance,
     depth: MarketDepth,
     changes: Vec<BookChange>,
     sequence: Option<SequenceNumber>,
@@ -301,7 +305,7 @@ impl<'de> Deserialize<'de> for BookDeltaEvent {
 /// Auction indication or result.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct AuctionEvent {
-    provenance: Provenance,
+    provenance: LiveProvenance,
     phase: AuctionPhase,
     indicative_price: Option<PriceTicks>,
     paired_quantity: QuantityLots,
@@ -310,7 +314,7 @@ pub struct AuctionEvent {
 impl AuctionEvent {
     /// Constructs a venue-scoped auction payload.
     pub fn new(
-        provenance: Provenance,
+        provenance: LiveProvenance,
         phase: AuctionPhase,
         indicative_price: Option<PriceTicks>,
         paired_quantity: QuantityLots,
@@ -325,7 +329,7 @@ impl AuctionEvent {
     }
 
     /// Returns common provenance.
-    pub const fn provenance(&self) -> &Provenance {
+    pub const fn provenance(&self) -> &LiveProvenance {
         &self.provenance
     }
 
@@ -346,8 +350,9 @@ impl AuctionEvent {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AuctionEventWire {
-    provenance: Provenance,
+    provenance: LiveProvenance,
     phase: AuctionPhase,
     indicative_price: Option<PriceTicks>,
     paired_quantity: QuantityLots,
@@ -372,7 +377,7 @@ impl<'de> Deserialize<'de> for AuctionEvent {
 /// Trading-halt or resumption payload with a source reason code.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct TradingHaltEvent {
-    provenance: Provenance,
+    provenance: LiveProvenance,
     transition: HaltTransition,
     reason: SourceIdentifier,
 }
@@ -380,7 +385,7 @@ pub struct TradingHaltEvent {
 impl TradingHaltEvent {
     /// Constructs a venue-scoped halt transition.
     pub fn new(
-        provenance: Provenance,
+        provenance: LiveProvenance,
         transition: HaltTransition,
         reason: SourceIdentifier,
     ) -> Result<Self, MarketEventError> {
@@ -393,7 +398,7 @@ impl TradingHaltEvent {
     }
 
     /// Returns common provenance.
-    pub const fn provenance(&self) -> &Provenance {
+    pub const fn provenance(&self) -> &LiveProvenance {
         &self.provenance
     }
 
@@ -409,8 +414,9 @@ impl TradingHaltEvent {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TradingHaltEventWire {
-    provenance: Provenance,
+    provenance: LiveProvenance,
     transition: HaltTransition,
     reason: SourceIdentifier,
 }
@@ -428,19 +434,22 @@ impl<'de> Deserialize<'de> for TradingHaltEvent {
 /// Instrument trading-status update.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct InstrumentStatusEvent {
-    provenance: Provenance,
+    provenance: LiveProvenance,
     status: TradingStatus,
 }
 
 impl InstrumentStatusEvent {
     /// Constructs a venue-scoped status payload.
-    pub fn new(provenance: Provenance, status: TradingStatus) -> Result<Self, MarketEventError> {
+    pub fn new(
+        provenance: LiveProvenance,
+        status: TradingStatus,
+    ) -> Result<Self, MarketEventError> {
         validate_market_provenance(&provenance, true)?;
         Ok(Self { provenance, status })
     }
 
     /// Returns common provenance.
-    pub const fn provenance(&self) -> &Provenance {
+    pub const fn provenance(&self) -> &LiveProvenance {
         &self.provenance
     }
 
@@ -451,8 +460,9 @@ impl InstrumentStatusEvent {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct InstrumentStatusEventWire {
-    provenance: Provenance,
+    provenance: LiveProvenance,
     status: TradingStatus,
 }
 
@@ -469,7 +479,7 @@ impl<'de> Deserialize<'de> for InstrumentStatusEvent {
 /// Corporate action distributed on a live channel.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct CorporateActionEvent {
-    provenance: Provenance,
+    provenance: LiveProvenance,
     effective_at: Timestamp,
     action: CorporateActionKind,
 }
@@ -477,7 +487,7 @@ pub struct CorporateActionEvent {
 impl CorporateActionEvent {
     /// Constructs an instrument-scoped action and validates relational variants.
     pub fn new(
-        provenance: Provenance,
+        provenance: LiveProvenance,
         effective_at: Timestamp,
         action: CorporateActionKind,
     ) -> Result<Self, MarketEventError> {
@@ -499,7 +509,7 @@ impl CorporateActionEvent {
     }
 
     /// Returns common provenance.
-    pub const fn provenance(&self) -> &Provenance {
+    pub const fn provenance(&self) -> &LiveProvenance {
         &self.provenance
     }
 
@@ -515,8 +525,9 @@ impl CorporateActionEvent {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CorporateActionEventWire {
-    provenance: Provenance,
+    provenance: LiveProvenance,
     effective_at: Timestamp,
     action: CorporateActionKind,
 }

@@ -1,17 +1,24 @@
 //! Independent data, valuation, depth, integrity, and execution classifications.
 
-use std::fmt;
+use serde::{Deserialize, Serialize};
 
-use serde::{Deserialize, Deserializer, Serialize};
-
-use crate::Timestamp;
-
+#[path = "classification/integrity.rs"]
+mod integrity;
 #[path = "classification/qualification.rs"]
 mod qualification;
+#[path = "classification/timing.rs"]
+mod timing;
 
-pub use qualification::{
-    EligibilityFailure, EligibilityFailures, QualificationEvidence, QualificationEvidenceInput,
+pub use integrity::{
+    ChecksumCapability, ChecksumEvidence, ChecksumScope, ChecksumValue, IntegrityCapabilities,
+    IntegrityEvidenceError, IntegrityRule, RuleVersion, SequenceCapability, SequenceEvidence,
+    SequenceValidationRule, SnapshotEvidence,
 };
+pub use qualification::{
+    EligibilityFailure, EligibilityFailures, QualificationComponent, QualificationError,
+    QualificationEvidence, QualificationEvidenceId, QualificationEvidenceInput,
+};
+pub use timing::{ClassificationError, LiveTimingAssessment, LiveTimingPolicy, MarketEventTiming};
 
 /// Fair-value input hierarchy under ASC 820 and IFRS 13.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -91,7 +98,7 @@ pub enum StreamIntegrityState {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CaptureIntegrityState {
-    /// Capture is explicitly disabled.
+    /// Capture is explicitly disabled by policy.
     Disabled,
     /// Capture is keeping up without known loss.
     Healthy,
@@ -119,25 +126,25 @@ pub enum SourceAuthorization {
     Unauthorized,
 }
 
-/// Delivery relationship established independently of a source's authorization status.
+/// Delivery relationship established independently of source authorization.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeliveryEvidence {
     /// Data arrived directly from the identified trading venue.
     DirectVenue,
-    /// Data arrived from a broker explicitly authorized for the account and market-data use.
+    /// Data arrived from a broker explicitly authorized for this market-data use.
     AuthorizedBroker,
-    /// Data arrived through an aggregator, redistribution path, or other indirect channel.
+    /// Data arrived through an aggregator or redistribution path.
     Indirect,
     /// The delivery relationship has not been established.
     Unknown,
 }
 
-/// Result of provider-specific sequence validation.
+/// Derived result of provider-specific sequence validation.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SequenceIntegrity {
-    /// Sequence progression was valid.
+    /// Sequence progression was valid under the retained provider rule.
     Valid,
     /// Authoritative metadata establishes that the protocol supplies no sequence.
     NotSupported,
@@ -147,7 +154,7 @@ pub enum SequenceIntegrity {
     Uninitialized,
 }
 
-/// Result of snapshot and incremental-update consistency validation.
+/// Derived result of snapshot and incremental-update consistency validation.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SnapshotConsistency {
@@ -159,7 +166,7 @@ pub enum SnapshotConsistency {
     Uninitialized,
 }
 
-/// Result of a provider-specific checksum capability and validation check.
+/// Derived result of a provider-specific checksum validation check.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChecksumIntegrity {
@@ -207,17 +214,17 @@ pub enum BookIntegrity {
     Unknown,
 }
 
-/// Sanity result for exchange and receive timestamps.
+/// Result of the atomic source/receive/evaluation timing assessment.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TimestampIntegrity {
-    /// A source timestamp exists and is within configured future skew.
+    /// Source time exists and all configured timing bounds pass.
     Valid,
-    /// The source timestamp is missing or implausibly later than receive time.
+    /// Source time is missing, too old, or outside the allowed receive-time skew.
     Invalid,
 }
 
-/// Freshness derived only from a valid market event, never from a heartbeat.
+/// Freshness derived only from the latest market event, never from a heartbeat.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FreshnessState {
@@ -227,235 +234,4 @@ pub enum FreshnessState {
     Stale,
     /// No market event has established freshness.
     Unknown,
-}
-
-/// A failure to assess time-based evidence.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ClassificationError {
-    /// A nanosecond limit cannot be represented by the timestamp scalar.
-    DurationTooLarge,
-    /// An observation claims to occur after the evaluation instant.
-    ObservationAfterEvaluation,
-}
-
-impl fmt::Display for ClassificationError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::DurationTooLarge => {
-                formatter.write_str("nanosecond evidence limit exceeds signed timestamp range")
-            }
-            Self::ObservationAfterEvaluation => {
-                formatter.write_str("evidence observation occurs after evaluation time")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ClassificationError {}
-
-/// Exchange/receive timestamp values and their derived sanity result.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-pub struct EventTimingEvidence {
-    source_timestamp: Option<Timestamp>,
-    received_at: Timestamp,
-    maximum_future_skew_nanos: u64,
-    integrity: TimestampIntegrity,
-}
-
-#[derive(Deserialize)]
-struct EventTimingEvidenceWire {
-    source_timestamp: Option<Timestamp>,
-    received_at: Timestamp,
-    maximum_future_skew_nanos: u64,
-    integrity: TimestampIntegrity,
-}
-
-impl<'de> Deserialize<'de> for EventTimingEvidence {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let wire = EventTimingEvidenceWire::deserialize(deserializer)?;
-        let evidence = Self::assess(
-            wire.source_timestamp,
-            wire.received_at,
-            wire.maximum_future_skew_nanos,
-        )
-        .map_err(serde::de::Error::custom)?;
-        if evidence.integrity != wire.integrity {
-            return Err(serde::de::Error::custom(
-                "serialized timestamp integrity does not match timestamp evidence",
-            ));
-        }
-        Ok(evidence)
-    }
-}
-
-impl EventTimingEvidence {
-    /// Assesses timestamp sanity using an explicit source-clock skew allowance.
-    ///
-    /// A missing source timestamp is retained as invalid evidence instead of inventing one.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ClassificationError::DurationTooLarge`] when the skew limit exceeds `i64`.
-    pub fn assess(
-        source_timestamp: Option<Timestamp>,
-        received_at: Timestamp,
-        maximum_future_skew_nanos: u64,
-    ) -> Result<Self, ClassificationError> {
-        let maximum_future_skew = i64::try_from(maximum_future_skew_nanos)
-            .map_err(|_| ClassificationError::DurationTooLarge)?;
-        let integrity = match source_timestamp {
-            Some(source_at) => {
-                let latest_allowed = received_at
-                    .checked_add_nanos(maximum_future_skew)
-                    .unwrap_or(Timestamp::from_unix_nanos(i64::MAX));
-                if source_at <= latest_allowed {
-                    TimestampIntegrity::Valid
-                } else {
-                    TimestampIntegrity::Invalid
-                }
-            }
-            None => TimestampIntegrity::Invalid,
-        };
-        Ok(Self {
-            source_timestamp,
-            received_at,
-            maximum_future_skew_nanos,
-            integrity,
-        })
-    }
-
-    /// Returns the derived timestamp-sanity state.
-    pub const fn integrity(self) -> TimestampIntegrity {
-        self.integrity
-    }
-
-    /// Returns the source timestamp without manufacturing a missing value.
-    pub const fn source_timestamp(self) -> Option<Timestamp> {
-        self.source_timestamp
-    }
-
-    /// Returns when the frame reached the local process.
-    pub const fn received_at(self) -> Timestamp {
-        self.received_at
-    }
-
-    /// Returns the configured source-clock future-skew allowance in nanoseconds.
-    pub const fn maximum_future_skew_nanos(self) -> u64 {
-        self.maximum_future_skew_nanos
-    }
-}
-
-/// Market-event and heartbeat timestamps with market-only freshness derivation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-pub struct FreshnessEvidence {
-    last_market_event_at: Option<Timestamp>,
-    last_heartbeat_at: Option<Timestamp>,
-    evaluated_at: Timestamp,
-    maximum_age_nanos: u64,
-    state: FreshnessState,
-}
-
-#[derive(Deserialize)]
-struct FreshnessEvidenceWire {
-    last_market_event_at: Option<Timestamp>,
-    last_heartbeat_at: Option<Timestamp>,
-    evaluated_at: Timestamp,
-    maximum_age_nanos: u64,
-    state: FreshnessState,
-}
-
-impl<'de> Deserialize<'de> for FreshnessEvidence {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let wire = FreshnessEvidenceWire::deserialize(deserializer)?;
-        let evidence = Self::assess(
-            wire.last_market_event_at,
-            wire.last_heartbeat_at,
-            wire.evaluated_at,
-            wire.maximum_age_nanos,
-        )
-        .map_err(serde::de::Error::custom)?;
-        if evidence.state != wire.state {
-            return Err(serde::de::Error::custom(
-                "serialized freshness state does not match market timestamps",
-            ));
-        }
-        Ok(evidence)
-    }
-}
-
-impl FreshnessEvidence {
-    /// Assesses freshness from `last_market_event_at`; heartbeat time is retained only for liveness.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ClassificationError::DurationTooLarge`] for an unrepresentable age or
-    /// [`ClassificationError::ObservationAfterEvaluation`] for future observations.
-    pub fn assess(
-        last_market_event_at: Option<Timestamp>,
-        last_heartbeat_at: Option<Timestamp>,
-        evaluated_at: Timestamp,
-        maximum_age_nanos: u64,
-    ) -> Result<Self, ClassificationError> {
-        let maximum_age =
-            i64::try_from(maximum_age_nanos).map_err(|_| ClassificationError::DurationTooLarge)?;
-        for observation in [last_market_event_at, last_heartbeat_at]
-            .into_iter()
-            .flatten()
-        {
-            if observation > evaluated_at {
-                return Err(ClassificationError::ObservationAfterEvaluation);
-            }
-        }
-        let state = match last_market_event_at {
-            Some(market_at) => {
-                let oldest_fresh = evaluated_at
-                    .checked_sub_nanos(maximum_age)
-                    .unwrap_or(Timestamp::from_unix_nanos(i64::MIN));
-                if market_at >= oldest_fresh {
-                    FreshnessState::Fresh
-                } else {
-                    FreshnessState::Stale
-                }
-            }
-            None => FreshnessState::Unknown,
-        };
-        Ok(Self {
-            last_market_event_at,
-            last_heartbeat_at,
-            evaluated_at,
-            maximum_age_nanos,
-            state,
-        })
-    }
-
-    /// Returns the newest valid market event used for freshness.
-    pub const fn last_market_event_at(self) -> Option<Timestamp> {
-        self.last_market_event_at
-    }
-
-    /// Returns the newest heartbeat used only for connection liveness.
-    pub const fn last_heartbeat_at(self) -> Option<Timestamp> {
-        self.last_heartbeat_at
-    }
-
-    /// Returns the instant at which freshness was assessed.
-    pub const fn evaluated_at(self) -> Timestamp {
-        self.evaluated_at
-    }
-
-    /// Returns the configured maximum market-event age in nanoseconds.
-    pub const fn maximum_age_nanos(self) -> u64 {
-        self.maximum_age_nanos
-    }
-
-    /// Returns the market-only freshness result.
-    pub const fn state(self) -> FreshnessState {
-        self.state
-    }
 }

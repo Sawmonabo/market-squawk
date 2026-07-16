@@ -2,33 +2,102 @@ use std::error::Error;
 use std::str::FromStr;
 
 use market_squawk_domain::{
-    BookIntegrity, CaptureIntegrityState, ChecksumIntegrity, ConnectionGeneration, DataQuality,
-    DeliveryEvidence, EligibilityFailure, EventTimingEvidence, ExecutionEligibility,
-    FairValueHierarchy, FreshnessEvidence, FreshnessState, InstrumentId, MarketDepth,
-    PrecisionIntegrity, QualificationEvidence, QualificationEvidenceInput, SequenceIntegrity,
-    SnapshotConsistency, SourceAuthorization, SourceCoverageEvidence, SourceId,
-    StreamIntegrityState, Timestamp, TradingStatus, VenueId,
+    BookIntegrity, CaptureIntegrityState, ChecksumCapability, ChecksumEvidence, ChecksumScope,
+    ChecksumValue, ConnectionGeneration, DataQuality, DeliveryEvidence, EligibilityFailure,
+    ExecutionEligibility, FairValueHierarchy, InstrumentId, IntegrityCapabilities, IntegrityRule,
+    LiveTimingAssessment, LiveTimingPolicy, MarketDepth, MarketEventTiming, PrecisionIntegrity,
+    QualificationEvidence, QualificationEvidenceId, QualificationEvidenceInput, RuleVersion,
+    SequenceCapability, SequenceEvidence, SequenceNumber, SequenceValidationRule, SnapshotEvidence,
+    SourceAuthorization, SourceCoverageEvidence, SourceId, SourceIdentifier, StreamIntegrityState,
+    Timestamp, TradingStatus, VenueId,
 };
 
-fn qualification_input(
-    quality: DataQuality,
-    hierarchy: Option<FairValueHierarchy>,
-) -> Result<QualificationEvidenceInput, Box<dyn Error>> {
-    let received_at = Timestamp::from_unix_nanos(1_000);
+fn generation() -> Result<ConnectionGeneration, Box<dyn Error>> {
+    ConnectionGeneration::new(7).map_err(Into::into)
+}
+
+fn rule(name: &str) -> Result<IntegrityRule, Box<dyn Error>> {
+    Ok(IntegrityRule::new(
+        SourceIdentifier::try_from(name)?,
+        RuleVersion::new(1)?,
+    ))
+}
+
+fn sequence(
+    previous: Option<u64>,
+    observed: Option<u64>,
+) -> Result<SequenceEvidence, Box<dyn Error>> {
+    match observed {
+        Some(observed) => Ok(SequenceEvidence::validate(
+            SequenceCapability::Provided,
+            Some(rule("provider.sequence.consecutive")?),
+            SequenceValidationRule::Consecutive,
+            generation()?,
+            Some(SequenceNumber::new(40)),
+            previous.map(SequenceNumber::new),
+            Some(SequenceNumber::new(observed)),
+        )?),
+        None => Ok(SequenceEvidence::uninitialized(
+            rule("provider.sequence.consecutive")?,
+            SequenceValidationRule::Consecutive,
+            generation()?,
+            Some(SequenceNumber::new(40)),
+        )),
+    }
+}
+
+fn checksum(expected: u64, computed: u64) -> Result<ChecksumEvidence, Box<dyn Error>> {
+    Ok(ChecksumEvidence::validate(
+        ChecksumCapability::Provided,
+        Some(rule("provider.checksum.crc32")?),
+        generation()?,
+        Some(ChecksumScope::new(
+            MarketDepth::PriceLevel,
+            10,
+            SourceIdentifier::try_from("top-ten-bid-ask")?,
+        )?),
+        Some(ChecksumValue::new(expected)),
+        Some(ChecksumValue::new(computed)),
+    )?)
+}
+
+fn timing(
+    source_at: Option<i64>,
+    received_at: i64,
+    evaluated_at: i64,
+) -> Result<LiveTimingAssessment, Box<dyn Error>> {
+    Ok(LiveTimingAssessment::assess(
+        generation()?,
+        Some(MarketEventTiming::new(
+            source_at.map(Timestamp::from_unix_nanos),
+            Timestamp::from_unix_nanos(received_at),
+        )),
+        None,
+        Timestamp::from_unix_nanos(evaluated_at),
+        LiveTimingPolicy::new(5, 50, 100, 50)?,
+    )?)
+}
+
+fn base_input() -> Result<QualificationEvidenceInput, Box<dyn Error>> {
     Ok(QualificationEvidenceInput::new(
-        quality,
-        hierarchy,
+        QualificationEvidenceId::new(SourceIdentifier::try_from("qualification:7:42")?),
+        DataQuality::DirectVerified,
+        IntegrityCapabilities::new(SequenceCapability::Provided, ChecksumCapability::Provided),
         SourceAuthorization::Authorized,
         DeliveryEvidence::DirectVenue,
         SourceId::try_from("direct-feed")?,
         VenueId::try_from("XNYS")?,
         InstrumentId::from_str("0187f5f1-6fc2-7fa2-bf05-2ce5354c55cb")?,
-        ConnectionGeneration::new(7)?,
-        SequenceIntegrity::Valid,
-        SnapshotConsistency::Consistent,
-        ChecksumIntegrity::Valid,
-        EventTimingEvidence::assess(Some(received_at), received_at, 0)?,
-        FreshnessEvidence::assess(Some(received_at), None, received_at, 50)?,
+        generation()?,
+        sequence(Some(41), Some(42))?,
+        SnapshotEvidence::assess(
+            generation()?,
+            generation()?,
+            Some(SequenceNumber::new(40)),
+            Some(SequenceNumber::new(42)),
+        )?,
+        checksum(10, 10)?,
+        timing(Some(995), 1_000, 1_010)?,
         TradingStatus::Active,
         PrecisionIntegrity::Valid,
         SourceCoverageEvidence::Explicit,
@@ -38,97 +107,29 @@ fn qualification_input(
     ))
 }
 
-#[test]
-fn classification_domains_remain_independent() {
-    let hierarchy = FairValueHierarchy::Level2;
-    let depth = MarketDepth::OrderLevel;
-    let quality = DataQuality::DirectUnverified;
-
-    assert_eq!(hierarchy, FairValueHierarchy::Level2);
-    assert_eq!(depth, MarketDepth::OrderLevel);
-    assert_eq!(quality, DataQuality::DirectUnverified);
-}
-
-#[test]
-// The controlling Task 4 contract explicitly exercises the `TryFrom` call shape. Production owns
-// the infallible `From` implementation, so this resolves through the standard blanket conversion.
-#[allow(clippy::unnecessary_fallible_conversions)]
-fn modeled_level_two_evidence_is_not_execution_eligible() -> Result<(), Box<dyn Error>> {
-    let evidence = QualificationEvidence::try_from(qualification_input(
-        DataQuality::Modeled,
-        Some(FairValueHierarchy::Level2),
-    )?)?;
-
+fn assert_ineligible(
+    input: QualificationEvidenceInput,
+    failure: EligibilityFailure,
+) -> Result<(), Box<dyn Error>> {
+    let evidence = QualificationEvidence::try_from(input)?;
     assert_eq!(
         evidence.execution_eligibility(),
         ExecutionEligibility::Ineligible
     );
-    assert!(evidence.has_failure(EligibilityFailure::QualityNotDirectVerified));
-    assert!(evidence.has_failure(EligibilityFailure::FairValueEvidenceNotLevel1));
+    assert!(evidence.has_failure(failure));
     Ok(())
 }
 
 #[test]
-fn level_two_evidence_cannot_authorize_execution_even_with_direct_quality()
+fn classification_domains_remain_independent_and_level_three_is_not_live_input()
 -> Result<(), Box<dyn Error>> {
-    let evidence: QualificationEvidence = qualification_input(
-        DataQuality::DirectVerified,
-        Some(FairValueHierarchy::Level2),
-    )?
-    .into();
+    let hierarchy = FairValueHierarchy::Level3;
+    let depth = MarketDepth::OrderLevel;
+    let evidence = QualificationEvidence::try_from(base_input()?)?;
 
-    assert_eq!(
-        evidence.execution_eligibility(),
-        ExecutionEligibility::Ineligible
-    );
-    assert!(evidence.has_failure(EligibilityFailure::FairValueEvidenceNotLevel1));
-    Ok(())
-}
-
-#[test]
-fn complete_direct_evidence_is_execution_eligible() -> Result<(), Box<dyn Error>> {
-    let evidence: QualificationEvidence = qualification_input(
-        DataQuality::DirectVerified,
-        Some(FairValueHierarchy::Level1),
-    )?
-    .into();
-
-    assert_eq!(
-        evidence.execution_eligibility(),
-        ExecutionEligibility::Eligible
-    );
-    assert_eq!(
-        evidence.source_authorization(),
-        SourceAuthorization::Authorized
-    );
-    assert_eq!(evidence.delivery_evidence(), DeliveryEvidence::DirectVenue);
-    assert_eq!(evidence.sequence_integrity(), SequenceIntegrity::Valid);
-    assert_eq!(
-        evidence.snapshot_consistency(),
-        SnapshotConsistency::Consistent
-    );
-    assert_eq!(evidence.checksum_integrity(), ChecksumIntegrity::Valid);
-    assert_eq!(
-        evidence.event_timing().integrity(),
-        market_squawk_domain::TimestampIntegrity::Valid
-    );
-    assert_eq!(evidence.event_timing().maximum_future_skew_nanos(), 0);
-    assert_eq!(evidence.trading_status(), TradingStatus::Active);
-    assert_eq!(evidence.precision_integrity(), PrecisionIntegrity::Valid);
-    assert_eq!(evidence.source_coverage(), SourceCoverageEvidence::Explicit);
-    assert_eq!(evidence.book_integrity(), BookIntegrity::Consistent);
-    assert_eq!(evidence.stream_integrity(), StreamIntegrityState::Healthy);
-    assert_eq!(evidence.capture_integrity(), CaptureIntegrityState::Healthy);
-    assert!(evidence.failures().is_empty());
-    Ok(())
-}
-
-#[test]
-fn ordinary_direct_market_data_needs_no_fair_value_assertion() -> Result<(), Box<dyn Error>> {
-    let evidence: QualificationEvidence =
-        qualification_input(DataQuality::DirectVerified, None)?.into();
-
-    assert_eq!(evidence.fair_value_hierarchy(), None);
+    assert_eq!(hierarchy, FairValueHierarchy::Level3);
+    assert_eq!(depth, MarketDepth::OrderLevel);
+    assert_eq!(evidence.quality(), DataQuality::DirectVerified);
     assert_eq!(
         evidence.execution_eligibility(),
         ExecutionEligibility::Eligible
@@ -137,89 +138,209 @@ fn ordinary_direct_market_data_needs_no_fair_value_assertion() -> Result<(), Box
 }
 
 #[test]
-fn heartbeat_does_not_update_market_freshness() -> Result<(), Box<dyn Error>> {
-    let market_at = Timestamp::from_unix_nanos(1_000);
-    let heartbeat_at = Timestamp::from_unix_nanos(2_000);
-    let evaluated_at = Timestamp::from_unix_nanos(2_000);
-
-    let freshness =
-        FreshnessEvidence::assess(Some(market_at), Some(heartbeat_at), evaluated_at, 100)?;
-
-    assert_eq!(freshness.last_market_event_at(), Some(market_at));
-    assert_eq!(freshness.last_heartbeat_at(), Some(heartbeat_at));
-    assert_eq!(freshness.evaluated_at(), evaluated_at);
-    assert_eq!(freshness.maximum_age_nanos(), 100);
-    assert_eq!(freshness.state(), FreshnessState::Stale);
+fn every_non_direct_quality_ceiling_fails_closed() -> Result<(), Box<dyn Error>> {
+    for ceiling in [
+        DataQuality::DirectUnverified,
+        DataQuality::OfficialDelayed,
+        DataQuality::Aggregated,
+        DataQuality::Indicative,
+        DataQuality::Modeled,
+        DataQuality::Estimated,
+        DataQuality::Stale,
+        DataQuality::Quarantined,
+    ] {
+        let evidence =
+            QualificationEvidence::try_from(base_input()?.with_quality_ceiling(ceiling))?;
+        assert_eq!(
+            evidence.execution_eligibility(),
+            ExecutionEligibility::Ineligible
+        );
+        assert!(evidence.has_failure(EligibilityFailure::QualityCeiling));
+        assert_ne!(evidence.quality(), DataQuality::DirectVerified);
+    }
     Ok(())
 }
 
 #[test]
-fn capture_failure_fails_closed() -> Result<(), Box<dyn Error>> {
-    let input = qualification_input(
-        DataQuality::DirectVerified,
-        Some(FairValueHierarchy::Level1),
-    )?
-    .with_capture_integrity(CaptureIntegrityState::Incomplete);
-    let evidence: QualificationEvidence = input.into();
-
+fn every_nonaffirmative_authorization_and_delivery_variant_fails_closed()
+-> Result<(), Box<dyn Error>> {
+    assert_ineligible(
+        base_input()?.with_source_authorization(SourceAuthorization::Unauthorized),
+        EligibilityFailure::SourceUnauthorized,
+    )?;
+    for delivery in [DeliveryEvidence::Indirect, DeliveryEvidence::Unknown] {
+        assert_ineligible(
+            base_input()?.with_delivery_evidence(delivery),
+            EligibilityFailure::DeliveryNotDirect,
+        )?;
+    }
+    let broker = QualificationEvidence::try_from(
+        base_input()?.with_delivery_evidence(DeliveryEvidence::AuthorizedBroker),
+    )?;
     assert_eq!(
-        evidence.execution_eligibility(),
-        ExecutionEligibility::Ineligible
+        broker.execution_eligibility(),
+        ExecutionEligibility::Eligible
     );
-    assert!(evidence.has_failure(EligibilityFailure::CaptureIntegrity));
     Ok(())
 }
 
 #[test]
-fn unsupported_sequence_is_not_immediate_action_evidence() -> Result<(), Box<dyn Error>> {
-    let evidence: QualificationEvidence = qualification_input(DataQuality::DirectVerified, None)?
-        .with_sequence_integrity(SequenceIntegrity::NotSupported)
-        .into();
+fn every_nonaffirmative_sequence_and_snapshot_state_fails_closed() -> Result<(), Box<dyn Error>> {
+    assert_ineligible(
+        base_input()?
+            .with_sequence_evidence(sequence(Some(41), Some(43))?)
+            .with_snapshot_evidence(SnapshotEvidence::assess(
+                generation()?,
+                generation()?,
+                Some(SequenceNumber::new(40)),
+                Some(SequenceNumber::new(43)),
+            )?),
+        EligibilityFailure::SequenceIntegrity,
+    )?;
+    assert_ineligible(
+        base_input()?.with_sequence_evidence(sequence(None, None)?),
+        EligibilityFailure::SequenceIntegrity,
+    )?;
+    assert_ineligible(
+        base_input()?
+            .with_integrity_capabilities(IntegrityCapabilities::new(
+                SequenceCapability::Unsupported,
+                ChecksumCapability::Provided,
+            ))
+            .with_sequence_evidence(SequenceEvidence::unsupported(generation()?)),
+        EligibilityFailure::SequenceIntegrity,
+    )?;
 
-    assert_eq!(
-        evidence.execution_eligibility(),
-        ExecutionEligibility::Ineligible
-    );
-    assert!(evidence.has_failure(EligibilityFailure::SequenceIntegrity));
+    let inconsistent_sequence = sequence(Some(41), Some(39))?;
+    let inconsistent_snapshot = SnapshotEvidence::assess(
+        generation()?,
+        generation()?,
+        Some(SequenceNumber::new(40)),
+        Some(SequenceNumber::new(39)),
+    )?;
+    let inconsistent = QualificationEvidence::try_from(
+        base_input()?
+            .with_sequence_evidence(inconsistent_sequence)
+            .with_snapshot_evidence(inconsistent_snapshot),
+    )?;
+    assert!(inconsistent.has_failure(EligibilityFailure::SnapshotConsistency));
+    assert_eq!(inconsistent.quality(), DataQuality::Quarantined);
+
+    assert_ineligible(
+        base_input()?.with_snapshot_evidence(SnapshotEvidence::uninitialized(generation()?)),
+        EligibilityFailure::SnapshotConsistency,
+    )?;
     Ok(())
 }
 
 #[test]
-fn authorized_indirect_delivery_cannot_synthesize_eligibility() -> Result<(), Box<dyn Error>> {
-    let evidence: QualificationEvidence = qualification_input(DataQuality::DirectVerified, None)?
-        .with_delivery_evidence(DeliveryEvidence::Indirect)
-        .into();
-
-    assert_eq!(
-        evidence.execution_eligibility(),
-        ExecutionEligibility::Ineligible
-    );
-    assert!(evidence.has_failure(EligibilityFailure::DeliveryNotDirect));
+fn every_nonaffirmative_checksum_state_fails_closed_under_supported_metadata()
+-> Result<(), Box<dyn Error>> {
+    assert_ineligible(
+        base_input()?.with_checksum_evidence(checksum(10, 11)?),
+        EligibilityFailure::ChecksumIntegrity,
+    )?;
+    assert_ineligible(
+        base_input()?.with_checksum_evidence(ChecksumEvidence::unchecked(
+            rule("provider.checksum.crc32")?,
+            generation()?,
+            ChecksumScope::new(
+                MarketDepth::PriceLevel,
+                10,
+                SourceIdentifier::try_from("top-ten-bid-ask")?,
+            )?,
+        )),
+        EligibilityFailure::ChecksumIntegrity,
+    )?;
     Ok(())
 }
 
 #[test]
-fn deserialization_cannot_forge_derived_time_integrity() -> Result<(), Box<dyn Error>> {
-    let received_at = Timestamp::from_unix_nanos(100);
-    let mut value = serde_json::to_value(EventTimingEvidence::assess(None, received_at, 0)?)?;
-    value["integrity"] = serde_json::json!("valid");
-
-    assert!(serde_json::from_value::<EventTimingEvidence>(value).is_err());
-    Ok(())
-}
-
-#[test]
-fn deserialization_cannot_forge_market_freshness() -> Result<(), Box<dyn Error>> {
-    let market_at = Timestamp::from_unix_nanos(100);
-    let evaluated_at = Timestamp::from_unix_nanos(1_000);
-    let mut value = serde_json::to_value(FreshnessEvidence::assess(
-        Some(market_at),
+fn every_nonaffirmative_timing_and_freshness_state_fails_closed() -> Result<(), Box<dyn Error>> {
+    assert_ineligible(
+        base_input()?.with_timing(timing(None, 1_000, 1_010)?),
+        EligibilityFailure::EventTiming,
+    )?;
+    assert_ineligible(
+        base_input()?.with_timing(timing(Some(995), 1_000, 1_100)?),
+        EligibilityFailure::MarketFreshness,
+    )?;
+    let unknown = LiveTimingAssessment::assess(
+        generation()?,
         None,
-        evaluated_at,
-        10,
-    )?)?;
-    value["state"] = serde_json::json!("fresh");
+        Some(Timestamp::from_unix_nanos(1_010)),
+        Timestamp::from_unix_nanos(1_010),
+        LiveTimingPolicy::new(5, 50, 100, 50)?,
+    )?;
+    let unknown_evidence = QualificationEvidence::try_from(base_input()?.with_timing(unknown))?;
+    assert!(unknown_evidence.has_failure(EligibilityFailure::EventTiming));
+    assert!(unknown_evidence.has_failure(EligibilityFailure::MarketFreshness));
+    Ok(())
+}
 
-    assert!(serde_json::from_value::<FreshnessEvidence>(value).is_err());
+#[test]
+fn every_nonaffirmative_status_precision_coverage_and_book_variant_fails_closed()
+-> Result<(), Box<dyn Error>> {
+    for status in [
+        TradingStatus::Halted,
+        TradingStatus::Inactive,
+        TradingStatus::Delisted,
+    ] {
+        assert_ineligible(
+            base_input()?.with_trading_status(status),
+            EligibilityFailure::TradingStatus,
+        )?;
+    }
+    assert_ineligible(
+        base_input()?.with_precision_integrity(PrecisionIntegrity::Invalid),
+        EligibilityFailure::Precision,
+    )?;
+    for coverage in [
+        SourceCoverageEvidence::Insufficient,
+        SourceCoverageEvidence::Unknown,
+    ] {
+        assert_ineligible(
+            base_input()?.with_source_coverage(coverage),
+            EligibilityFailure::Coverage,
+        )?;
+    }
+    for book in [BookIntegrity::Crossed, BookIntegrity::Unknown] {
+        assert_ineligible(
+            base_input()?.with_book_integrity(book),
+            EligibilityFailure::BookIntegrity,
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn every_nonhealthy_stream_state_and_incomplete_capture_fail_closed() -> Result<(), Box<dyn Error>>
+{
+    for state in [
+        StreamIntegrityState::Initializing,
+        StreamIntegrityState::Synchronizing,
+        StreamIntegrityState::Validating,
+        StreamIntegrityState::Stale,
+        StreamIntegrityState::GapDetected,
+        StreamIntegrityState::ChecksumFailed,
+        StreamIntegrityState::Divergent,
+        StreamIntegrityState::Quarantined,
+    ] {
+        assert_ineligible(
+            base_input()?.with_stream_integrity(state),
+            EligibilityFailure::StreamIntegrity,
+        )?;
+    }
+    assert_ineligible(
+        base_input()?.with_capture_integrity(CaptureIntegrityState::Incomplete),
+        EligibilityFailure::CaptureIntegrity,
+    )?;
+    let disabled = QualificationEvidence::try_from(
+        base_input()?.with_capture_integrity(CaptureIntegrityState::Disabled),
+    )?;
+    assert_eq!(
+        disabled.execution_eligibility(),
+        ExecutionEligibility::Eligible
+    );
     Ok(())
 }

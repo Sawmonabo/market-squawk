@@ -26,7 +26,12 @@ pub enum PositionSide {
 
 /// A canonical research observation, deliberately separate from [`crate::MarketEvent`].
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "observation", content = "payload", rename_all = "snake_case")]
+#[serde(
+    deny_unknown_fields,
+    tag = "observation",
+    content = "payload",
+    rename_all = "snake_case"
+)]
 pub enum ResearchObservation {
     /// Regulatory or issuer filing.
     Filing(FilingObservation),

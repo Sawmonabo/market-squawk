@@ -2,13 +2,15 @@ use std::error::Error;
 use std::str::FromStr;
 
 use market_squawk_domain::{
-    DataQuality, InstrumentId, PayloadReference, Provenance, ProvenanceError, ResearchContext,
-    ResearchTime, RevisionNumber, SchemaVersion, SourceId, SourceIdentifier, Timestamp, VenueId,
+    AvailabilityEvidence, DataQuality, InstrumentId, PayloadReference, ProvenanceError,
+    ResearchContext, ResearchProvenance, ResearchTime, RevisionNumber, SchemaVersion, SourceId,
+    SourceIdentifier, Timestamp, VenueId,
 };
 
-fn valid_provenance() -> Result<Provenance, Box<dyn Error>> {
-    Provenance::new(
-        SchemaVersion::CURRENT,
+fn valid_provenance(
+    availability: AvailabilityEvidence,
+) -> Result<ResearchProvenance, Box<dyn Error>> {
+    ResearchProvenance::new(
         SourceId::try_from("sec-edgar")?,
         Some(InstrumentId::from_str(
             "0187f5f1-6fc2-7fa2-bf05-2ce5354c55cb",
@@ -17,41 +19,42 @@ fn valid_provenance() -> Result<Provenance, Box<dyn Error>> {
         SourceIdentifier::try_from("0000320193-26-000001")?,
         None,
         Timestamp::from_unix_nanos(200),
-        Timestamp::from_unix_nanos(100),
         Timestamp::from_unix_nanos(300),
         DataQuality::OfficialDelayed,
         PayloadReference::SourceReference(SourceIdentifier::try_from(
             "edgar/data/320193/filing.json",
         )?),
+        availability,
     )
     .map_err(Into::into)
 }
 
 #[test]
-fn provenance_retains_absent_source_timestamp_without_invention() -> Result<(), Box<dyn Error>> {
-    let provenance = valid_provenance()?;
+fn research_provenance_retains_unknown_source_and_availability_times() -> Result<(), Box<dyn Error>>
+{
+    let provenance = valid_provenance(AvailabilityEvidence::unknown())?;
 
+    assert_eq!(provenance.schema_version(), SchemaVersion::CURRENT);
     assert_eq!(provenance.source_timestamp(), None);
+    assert_eq!(provenance.availability().reported_at(), None);
     assert_eq!(provenance.received_at(), Timestamp::from_unix_nanos(200));
-    assert_eq!(provenance.available_at(), Timestamp::from_unix_nanos(100));
     assert_eq!(provenance.ingested_at(), Timestamp::from_unix_nanos(300));
     Ok(())
 }
 
 #[test]
-fn provenance_rejects_local_receive_after_ingestion() -> Result<(), Box<dyn Error>> {
-    let result = Provenance::new(
-        SchemaVersion::CURRENT,
+fn research_provenance_rejects_receive_after_ingestion() -> Result<(), Box<dyn Error>> {
+    let result = ResearchProvenance::new(
         SourceId::try_from("fred")?,
         None,
         None,
         SourceIdentifier::try_from("GDP")?,
         None,
         Timestamp::from_unix_nanos(400),
-        Timestamp::from_unix_nanos(100),
         Timestamp::from_unix_nanos(300),
         DataQuality::OfficialDelayed,
         PayloadReference::SourceReference(SourceIdentifier::try_from("GDP:2026-Q1")?),
+        AvailabilityEvidence::unknown(),
     );
 
     assert!(matches!(
@@ -62,34 +65,36 @@ fn provenance_rejects_local_receive_after_ingestion() -> Result<(), Box<dyn Erro
 }
 
 #[test]
-fn provenance_rejects_availability_after_ingestion() -> Result<(), Box<dyn Error>> {
-    let result = Provenance::new(
-        SchemaVersion::CURRENT,
-        SourceId::try_from("fred")?,
-        None,
-        None,
-        SourceIdentifier::try_from("GDP")?,
+fn research_provenance_rejects_reported_availability_after_ingestion() -> Result<(), Box<dyn Error>>
+{
+    let result = ResearchProvenance::new(
+        SourceId::try_from("sec-edgar")?,
+        Some(InstrumentId::from_str(
+            "0187f5f1-6fc2-7fa2-bf05-2ce5354c55cb",
+        )?),
+        Some(VenueId::try_from("XNYS")?),
+        SourceIdentifier::try_from("0000320193-26-000001")?,
         None,
         Timestamp::from_unix_nanos(200),
-        Timestamp::from_unix_nanos(400),
         Timestamp::from_unix_nanos(300),
         DataQuality::OfficialDelayed,
-        PayloadReference::SourceReference(SourceIdentifier::try_from("GDP:2026-Q1")?),
+        PayloadReference::SourceReference(SourceIdentifier::try_from("filing.json")?),
+        AvailabilityEvidence::local_first_observed(Timestamp::from_unix_nanos(400)),
     );
 
     assert!(matches!(
         result,
-        Err(ProvenanceError::AvailableAfterIngested)
+        Err(ProvenanceError::AvailabilityAfterIngested)
     ));
     Ok(())
 }
 
 #[test]
-fn deserialization_cannot_bypass_provenance_ordering() -> Result<(), Box<dyn Error>> {
-    let mut value = serde_json::to_value(valid_provenance()?)?;
+fn deserialization_cannot_bypass_research_ordering() -> Result<(), Box<dyn Error>> {
+    let mut value = serde_json::to_value(valid_provenance(AvailabilityEvidence::unknown())?)?;
     value["received_at"] = serde_json::json!(400);
 
-    assert!(serde_json::from_value::<Provenance>(value).is_err());
+    assert!(serde_json::from_value::<ResearchProvenance>(value).is_err());
     Ok(())
 }
 
@@ -101,7 +106,13 @@ fn research_context_preserves_point_in_time_fields() -> Result<(), Box<dyn Error
         RevisionNumber::new(2)?,
         Some(Timestamp::from_unix_nanos(250)),
     )?;
-    let context = ResearchContext::new(valid_provenance()?, time)?;
+    let context = ResearchContext::new(
+        valid_provenance(AvailabilityEvidence::evidenced(
+            Timestamp::from_unix_nanos(100),
+            SourceIdentifier::try_from("sec-acceptance")?,
+        ))?,
+        time,
+    )?;
 
     assert_eq!(
         context.time().effective_at(),
@@ -127,10 +138,14 @@ fn research_context_rejects_availability_before_publication() -> Result<(), Box<
         RevisionNumber::new(1)?,
         None,
     )?;
+    let provenance = valid_provenance(AvailabilityEvidence::evidenced(
+        Timestamp::from_unix_nanos(100),
+        SourceIdentifier::try_from("release-calendar")?,
+    ))?;
 
     assert!(matches!(
-        ResearchContext::new(valid_provenance()?, time),
-        Err(ProvenanceError::AvailableBeforePublished)
+        ResearchContext::new(provenance, time),
+        Err(ProvenanceError::AvailabilityBeforePublished)
     ));
     Ok(())
 }

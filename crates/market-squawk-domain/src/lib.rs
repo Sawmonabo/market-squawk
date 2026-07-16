@@ -13,12 +13,15 @@ mod time;
 mod version;
 
 pub use classification::{
-    BookIntegrity, CaptureIntegrityState, ChecksumIntegrity, ClassificationError, DataQuality,
-    DeliveryEvidence, EligibilityFailure, EligibilityFailures, EventTimingEvidence,
-    ExecutionEligibility, FairValueHierarchy, FreshnessEvidence, FreshnessState, MarketDepth,
-    PrecisionIntegrity, QualificationEvidence, QualificationEvidenceInput, SequenceIntegrity,
-    SnapshotConsistency, SourceAuthorization, SourceCoverageEvidence, StreamIntegrityState,
-    TimestampIntegrity,
+    BookIntegrity, CaptureIntegrityState, ChecksumCapability, ChecksumEvidence, ChecksumIntegrity,
+    ChecksumScope, ChecksumValue, ClassificationError, DataQuality, DeliveryEvidence,
+    EligibilityFailure, EligibilityFailures, ExecutionEligibility, FairValueHierarchy,
+    FreshnessState, IntegrityCapabilities, IntegrityEvidenceError, IntegrityRule,
+    LiveTimingAssessment, LiveTimingPolicy, MarketDepth, MarketEventTiming, PrecisionIntegrity,
+    QualificationComponent, QualificationError, QualificationEvidence, QualificationEvidenceId,
+    QualificationEvidenceInput, RuleVersion, SequenceCapability, SequenceEvidence,
+    SequenceIntegrity, SequenceValidationRule, SnapshotConsistency, SnapshotEvidence,
+    SourceAuthorization, SourceCoverageEvidence, StreamIntegrityState, TimestampIntegrity,
 };
 pub use denomination::Denomination;
 pub use financial::{
@@ -49,8 +52,9 @@ pub use market::{
     TradingHaltEvent,
 };
 pub use provenance::{
-    PayloadHash, PayloadHashAlgorithm, PayloadReference, Provenance, ProvenanceError,
-    ResearchContext, ResearchTime, RevisionNumber,
+    AvailabilityEvidence, LiveProvenance, LiveVerificationState, PayloadHash, PayloadHashAlgorithm,
+    PayloadReference, ProvenanceError, ResearchContext, ResearchProvenance, ResearchTime,
+    RevisionNumber,
 };
 pub use research::{
     AlternativeDataObservation, CorporateActionObservation, FilingObservation,

@@ -1,12 +1,19 @@
-//! Validated record provenance and point-in-time research metadata.
+//! Validated live provenance and point-in-time research metadata.
 
 use std::fmt;
-use std::num::NonZeroU32;
 
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 
-use crate::{
-    DataQuality, InstrumentId, SchemaVersion, SourceId, SourceIdentifier, Timestamp, VenueId,
+use crate::{SchemaVersion, SchemaVersionError, SourceIdentifier};
+
+#[path = "provenance/live.rs"]
+mod live;
+#[path = "provenance/research.rs"]
+mod research;
+
+pub use live::{LiveProvenance, LiveVerificationState};
+pub use research::{
+    AvailabilityEvidence, ResearchContext, ResearchProvenance, ResearchTime, RevisionNumber,
 };
 
 /// Hash algorithm identifying how a retained payload digest was produced.
@@ -21,6 +28,7 @@ pub enum PayloadHashAlgorithm {
 
 /// An algorithm-qualified 256-bit content digest.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PayloadHash {
     algorithm: PayloadHashAlgorithm,
     digest: [u8; 32],
@@ -45,29 +53,48 @@ impl PayloadHash {
 
 /// Durable evidence identifying the exact source payload behind a canonical record.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
-#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+#[serde(
+    deny_unknown_fields,
+    tag = "kind",
+    content = "value",
+    rename_all = "snake_case"
+)]
 pub enum PayloadReference {
     /// Algorithm-qualified content digest.
     ContentHash(PayloadHash),
-    /// Bounded provider, object-store, file-manifest, or capture-record reference.
+    /// Bounded provider, file-manifest, or capture-record reference.
     SourceReference(SourceIdentifier),
 }
 
-/// A provenance or research-time invariant failure.
+/// A live/research provenance or point-in-time invariant failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProvenanceError {
     /// Local receive time is later than local ingestion time.
     ReceivedAfterIngested,
-    /// Point-in-time availability is later than ingestion time.
-    AvailableAfterIngested,
+    /// Availability evidence is later than local ingestion.
+    AvailabilityAfterIngested,
     /// A source claims availability before its known publication time.
-    AvailableBeforePublished,
+    AvailabilityBeforePublished,
     /// A superseding revision is not strictly later than publication.
     SupersededNotAfterPublished,
-    /// A superseding revision is not strictly later than initial availability.
+    /// A superseding revision is not strictly later than conservative availability.
     SupersededNotAfterAvailable,
     /// Revision numbers are one-based.
     ZeroRevision,
+    /// Decoding cannot author `DirectVerified`; it requires a successful qualification.
+    UnqualifiedDirectVerified,
+    /// Qualification evidence was not eligible and direct verified.
+    QualificationNotEligible,
+    /// Qualification evidence describes a different source, venue, instrument, or generation.
+    QualificationIdentityMismatch,
+    /// Qualification timing does not describe the decoded market event.
+    QualificationTimingMismatch,
+    /// Qualification coverage does not match decoded provenance.
+    QualificationCoverageMismatch,
+    /// A recorded direct-verified label lacks its required evidence identity.
+    MissingQualificationEvidenceId,
+    /// Serialized input uses an unsupported schema version.
+    SchemaVersion(SchemaVersionError),
 }
 
 impl fmt::Display for ProvenanceError {
@@ -76,333 +103,59 @@ impl fmt::Display for ProvenanceError {
             Self::ReceivedAfterIngested => {
                 formatter.write_str("receive time must not be later than ingestion time")
             }
-            Self::AvailableAfterIngested => {
-                formatter.write_str("availability time must not be later than ingestion time")
+            Self::AvailabilityAfterIngested => {
+                formatter.write_str("availability evidence must not be later than ingestion time")
             }
-            Self::AvailableBeforePublished => {
-                formatter.write_str("availability time must not precede known publication time")
+            Self::AvailabilityBeforePublished => {
+                formatter.write_str("availability evidence must not precede publication time")
             }
             Self::SupersededNotAfterPublished => {
-                formatter.write_str("superseded time must be later than known publication time")
+                formatter.write_str("superseded time must be later than publication time")
             }
             Self::SupersededNotAfterAvailable => {
-                formatter.write_str("superseded time must be later than initial availability time")
+                formatter.write_str("superseded time must be later than conservative availability")
             }
             Self::ZeroRevision => formatter.write_str("revision number must be nonzero"),
+            Self::UnqualifiedDirectVerified => {
+                formatter.write_str("decoded provenance cannot claim direct-verified quality")
+            }
+            Self::QualificationNotEligible => formatter
+                .write_str("direct-verified provenance requires successful qualification evidence"),
+            Self::QualificationIdentityMismatch => formatter.write_str(
+                "qualification source, venue, instrument, or generation does not match provenance",
+            ),
+            Self::QualificationTimingMismatch => {
+                formatter.write_str("qualification timing does not match provenance")
+            }
+            Self::QualificationCoverageMismatch => {
+                formatter.write_str("qualification coverage does not match provenance")
+            }
+            Self::MissingQualificationEvidenceId => formatter.write_str(
+                "recorded direct-verified provenance requires a qualification evidence identity",
+            ),
+            Self::SchemaVersion(error) => error.fmt(formatter),
         }
     }
 }
 
-impl std::error::Error for ProvenanceError {}
-
-/// Provenance common to canonical live and research records.
-///
-/// `available_at` is when the observation could first be used point-in-time. It can precede the
-/// local `received_at` for historical extraction, so only each value's relationship to local
-/// `ingested_at` is universally ordered.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct Provenance {
-    schema_version: SchemaVersion,
-    source_id: SourceId,
-    instrument_id: Option<InstrumentId>,
-    venue_id: Option<VenueId>,
-    source_identifier: SourceIdentifier,
-    source_timestamp: Option<Timestamp>,
-    received_at: Timestamp,
-    available_at: Timestamp,
-    ingested_at: Timestamp,
-    quality: DataQuality,
-    payload_reference: PayloadReference,
-}
-
-impl Provenance {
-    /// Constructs ordered record provenance without manufacturing optional identifiers or times.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProvenanceError::ReceivedAfterIngested`] or
-    /// [`ProvenanceError::AvailableAfterIngested`] for impossible local ordering.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        schema_version: SchemaVersion,
-        source_id: SourceId,
-        instrument_id: Option<InstrumentId>,
-        venue_id: Option<VenueId>,
-        source_identifier: SourceIdentifier,
-        source_timestamp: Option<Timestamp>,
-        received_at: Timestamp,
-        available_at: Timestamp,
-        ingested_at: Timestamp,
-        quality: DataQuality,
-        payload_reference: PayloadReference,
-    ) -> Result<Self, ProvenanceError> {
-        if received_at > ingested_at {
-            return Err(ProvenanceError::ReceivedAfterIngested);
+impl std::error::Error for ProvenanceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::SchemaVersion(error) => Some(error),
+            _ => None,
         }
-        if available_at > ingested_at {
-            return Err(ProvenanceError::AvailableAfterIngested);
-        }
-        Ok(Self {
-            schema_version,
-            source_id,
-            instrument_id,
-            venue_id,
-            source_identifier,
-            source_timestamp,
-            received_at,
-            available_at,
-            ingested_at,
-            quality,
-            payload_reference,
-        })
-    }
-
-    /// Returns the record schema version.
-    pub const fn schema_version(&self) -> SchemaVersion {
-        self.schema_version
-    }
-
-    /// Returns the source namespace.
-    pub const fn source_id(&self) -> &SourceId {
-        &self.source_id
-    }
-
-    /// Returns the stable instrument identity when applicable.
-    pub const fn instrument_id(&self) -> Option<InstrumentId> {
-        self.instrument_id
-    }
-
-    /// Returns the venue identity when applicable.
-    pub const fn venue_id(&self) -> Option<&VenueId> {
-        self.venue_id.as_ref()
-    }
-
-    /// Returns the source-native record identifier.
-    pub const fn source_identifier(&self) -> &SourceIdentifier {
-        &self.source_identifier
-    }
-
-    /// Returns the source timestamp without inventing a missing value.
-    pub const fn source_timestamp(&self) -> Option<Timestamp> {
-        self.source_timestamp
-    }
-
-    /// Returns when the source payload reached this process.
-    pub const fn received_at(&self) -> Timestamp {
-        self.received_at
-    }
-
-    /// Returns when the observation first became usable point-in-time.
-    pub const fn available_at(&self) -> Timestamp {
-        self.available_at
-    }
-
-    /// Returns when the canonical record was ingested locally.
-    pub const fn ingested_at(&self) -> Timestamp {
-        self.ingested_at
-    }
-
-    /// Returns the record's evidentiary quality class.
-    pub const fn quality(&self) -> DataQuality {
-        self.quality
-    }
-
-    /// Returns the retained payload evidence.
-    pub const fn payload_reference(&self) -> &PayloadReference {
-        &self.payload_reference
     }
 }
 
-#[derive(Deserialize)]
-struct ProvenanceWire {
-    schema_version: SchemaVersion,
-    source_id: SourceId,
-    instrument_id: Option<InstrumentId>,
-    venue_id: Option<VenueId>,
-    source_identifier: SourceIdentifier,
-    source_timestamp: Option<Timestamp>,
-    received_at: Timestamp,
-    available_at: Timestamp,
-    ingested_at: Timestamp,
-    quality: DataQuality,
-    payload_reference: PayloadReference,
-}
-
-impl<'de> Deserialize<'de> for Provenance {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let wire = ProvenanceWire::deserialize(deserializer)?;
-        Self::new(
-            wire.schema_version,
-            wire.source_id,
-            wire.instrument_id,
-            wire.venue_id,
-            wire.source_identifier,
-            wire.source_timestamp,
-            wire.received_at,
-            wire.available_at,
-            wire.ingested_at,
-            wire.quality,
-            wire.payload_reference,
-        )
-        .map_err(serde::de::Error::custom)
+impl From<SchemaVersionError> for ProvenanceError {
+    fn from(value: SchemaVersionError) -> Self {
+        Self::SchemaVersion(value)
     }
 }
 
-/// A one-based revision number for a research observation.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
-#[serde(transparent)]
-pub struct RevisionNumber(NonZeroU32);
-
-impl RevisionNumber {
-    /// Constructs a one-based revision number.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProvenanceError::ZeroRevision`] for zero.
-    pub fn new(value: u32) -> Result<Self, ProvenanceError> {
-        NonZeroU32::new(value)
-            .map(Self)
-            .ok_or(ProvenanceError::ZeroRevision)
-    }
-
-    /// Returns the primitive revision number.
-    pub const fn get(self) -> u32 {
-        self.0.get()
-    }
-}
-
-/// Effective, publication, revision, and supersession time for research data.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-pub struct ResearchTime {
-    effective_at: Timestamp,
-    published_at: Option<Timestamp>,
-    revision: RevisionNumber,
-    superseded_at: Option<Timestamp>,
-}
-
-impl ResearchTime {
-    /// Constructs research time metadata without manufacturing an unavailable publication time.
-    ///
-    /// # Errors
-    ///
-    /// Rejects a superseding time at or before a known publication time.
-    pub fn new(
-        effective_at: Timestamp,
-        published_at: Option<Timestamp>,
-        revision: RevisionNumber,
-        superseded_at: Option<Timestamp>,
-    ) -> Result<Self, ProvenanceError> {
-        if let (Some(published), Some(superseded)) = (published_at, superseded_at)
-            && superseded <= published
-        {
-            return Err(ProvenanceError::SupersededNotAfterPublished);
-        }
-        Ok(Self {
-            effective_at,
-            published_at,
-            revision,
-            superseded_at,
-        })
-    }
-
-    /// Returns the observation's reference or effective time.
-    pub const fn effective_at(self) -> Timestamp {
-        self.effective_at
-    }
-
-    /// Returns the publication time when the source supplies it.
-    pub const fn published_at(self) -> Option<Timestamp> {
-        self.published_at
-    }
-
-    /// Returns the one-based revision number.
-    pub const fn revision(self) -> RevisionNumber {
-        self.revision
-    }
-
-    /// Returns when this revision ceased being the current vintage.
-    pub const fn superseded_at(self) -> Option<Timestamp> {
-        self.superseded_at
-    }
-}
-
-#[derive(Deserialize)]
-struct ResearchTimeWire {
-    effective_at: Timestamp,
-    published_at: Option<Timestamp>,
-    revision: RevisionNumber,
-    superseded_at: Option<Timestamp>,
-}
-
-impl<'de> Deserialize<'de> for ResearchTime {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let wire = ResearchTimeWire::deserialize(deserializer)?;
-        Self::new(
-            wire.effective_at,
-            wire.published_at,
-            wire.revision,
-            wire.superseded_at,
-        )
-        .map_err(serde::de::Error::custom)
-    }
-}
-
-/// Provenance combined with research-specific point-in-time semantics.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct ResearchContext {
-    provenance: Provenance,
-    time: ResearchTime,
-}
-
-impl ResearchContext {
-    /// Combines provenance and research time after cross-contract ordering checks.
-    ///
-    /// # Errors
-    ///
-    /// Rejects availability before known publication and supersession at or before availability.
-    pub fn new(provenance: Provenance, time: ResearchTime) -> Result<Self, ProvenanceError> {
-        if let Some(published_at) = time.published_at
-            && provenance.available_at < published_at
-        {
-            return Err(ProvenanceError::AvailableBeforePublished);
-        }
-        if let Some(superseded_at) = time.superseded_at
-            && superseded_at <= provenance.available_at
-        {
-            return Err(ProvenanceError::SupersededNotAfterAvailable);
-        }
-        Ok(Self { provenance, time })
-    }
-
-    /// Returns common record provenance.
-    pub const fn provenance(&self) -> &Provenance {
-        &self.provenance
-    }
-
-    /// Returns research-specific point-in-time metadata.
-    pub const fn time(&self) -> ResearchTime {
-        self.time
-    }
-}
-
-#[derive(Deserialize)]
-struct ResearchContextWire {
-    provenance: Provenance,
-    time: ResearchTime,
-}
-
-impl<'de> Deserialize<'de> for ResearchContext {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let wire = ResearchContextWire::deserialize(deserializer)?;
-        Self::new(wire.provenance, wire.time).map_err(serde::de::Error::custom)
-    }
+pub(super) fn ensure_current_schema(schema_version: SchemaVersion) -> Result<(), ProvenanceError> {
+    schema_version
+        .ensure_supported()
+        .map(|_| ())
+        .map_err(Into::into)
 }

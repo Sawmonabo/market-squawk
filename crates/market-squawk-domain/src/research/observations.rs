@@ -48,6 +48,7 @@ impl FilingObservation {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FilingObservationWire {
     context: ResearchContext,
     form_type: SourceIdentifier,
@@ -112,6 +113,7 @@ impl FundamentalObservation {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FundamentalObservationWire {
     context: ResearchContext,
     concept: SourceIdentifier,
@@ -177,6 +179,7 @@ impl MacroObservation {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MacroObservationWire {
     context: ResearchContext,
     series: SourceIdentifier,
@@ -245,6 +248,7 @@ impl PositionObservation {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PositionObservationWire {
     context: ResearchContext,
     account_id: SourceIdentifier,
@@ -270,6 +274,7 @@ impl<'de> Deserialize<'de> for PositionObservation {
 
 /// Preserved source transaction identity and classification.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct TransactionObservation {
     context: ResearchContext,
     account_id: SourceIdentifier,
@@ -344,6 +349,7 @@ impl CorporateActionObservation {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CorporateActionObservationWire {
     context: ResearchContext,
     action: CorporateActionKind,
@@ -414,6 +420,7 @@ impl AlternativeDataObservation {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AlternativeDataObservationWire {
     context: ResearchContext,
     dataset: SourceIdentifier,
