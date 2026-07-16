@@ -40,12 +40,15 @@ impl CurrentFrameEvidence {
     }
 
     fn shared_allocation_charge(&self) -> Result<usize, RegistryError> {
+        let dynamic = self
+            .0
+            .dynamic_retained_bytes()
+            .map_err(|_| RegistryError::RetainedSizeOverflow)?;
         std::mem::size_of::<crate::DecoderEvidence>()
-            .checked_add(
-                self.0
-                    .dynamic_retained_bytes()
-                    .map_err(|_| RegistryError::RetainedSizeOverflow)?,
-            )
+            .checked_add(crate::conservative_arc_control_block_charge::<
+                crate::DecoderEvidence,
+            >())
+            .and_then(|bytes| bytes.checked_add(dynamic))
             .ok_or(RegistryError::RetainedSizeOverflow)
     }
 }
@@ -112,6 +115,19 @@ impl CurrentSourceAuthorityLease {
     /// Returns whether two opaque leases originate from the same process-local registry lineage.
     pub fn shares_registry_lineage_with(&self, other: &Self) -> bool {
         self.registry_id == other.registry_id
+    }
+
+    fn shared_allocation_charge(&self) -> Result<usize, RegistryError> {
+        std::mem::size_of::<SessionLeaseState>()
+            .checked_add(crate::conservative_arc_control_block_charge::<
+                SessionLeaseState,
+            >())
+            .and_then(|bytes| {
+                self.capture
+                    .shared_allocation_charge()
+                    .and_then(|capture| bytes.checked_add(capture))
+            })
+            .ok_or(RegistryError::RetainedSizeOverflow)
     }
 }
 
@@ -254,12 +270,6 @@ fn current_policy_conservative_allocation_charge() -> Result<usize, RegistryErro
     source_identifiers
         .checked_add(source_ids)
         .and_then(|bytes| bytes.checked_add(venues))
-        .ok_or(RegistryError::RetainedSizeOverflow)
-}
-
-fn current_authority_shared_allocation_charge() -> Result<usize, RegistryError> {
-    std::mem::size_of::<SessionLeaseState>()
-        .checked_add(256)
         .ok_or(RegistryError::RetainedSizeOverflow)
 }
 

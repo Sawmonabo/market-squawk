@@ -14,6 +14,15 @@ mod metadata;
 mod policy;
 mod registry;
 
+/// Conservative charge for the allocation metadata every `Arc<T>` retains independently of `T`.
+///
+/// Rust does not expose the standard library's control-block layout. Two atomic `usize` counters
+/// plus worst-case alignment padding is a stable, allocator-metadata-independent upper charge for
+/// the language-visible control block. Callers add `size_of::<T>()` and `T`'s owned allocations.
+pub(crate) const fn conservative_arc_control_block_charge<T>() -> usize {
+    (2 * std::mem::size_of::<usize>()) + (std::mem::align_of::<T>() - 1)
+}
+
 pub use capture::{
     CaptureAdmissionError, CaptureAdmissionIssuer, CaptureAdmissionReceipt,
     CaptureDegradationCapability, CaptureGenerationCapabilities, CaptureGenerationHealth,

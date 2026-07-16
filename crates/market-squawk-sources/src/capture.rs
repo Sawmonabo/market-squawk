@@ -139,6 +139,13 @@ impl CaptureGenerationLease {
         Arc::ptr_eq(&self.state, &other.state)
     }
 
+    /// Returns the conservative charge for the shared capture state and its `Arc` control block.
+    pub(crate) fn shared_allocation_charge(&self) -> Option<usize> {
+        std::mem::size_of::<CaptureGenerationState>().checked_add(
+            crate::conservative_arc_control_block_charge::<CaptureGenerationState>(),
+        )
+    }
+
     pub(crate) fn mark_incomplete(&self) {
         self.state
             .state

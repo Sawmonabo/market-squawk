@@ -436,11 +436,16 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
                     .ok_or(RegistryError::DecoderProfileMismatch)?
                     .frame_evidence
                     .shared_allocation_charge()?;
+                let authority_shared_allocation = observations
+                    .first()
+                    .ok_or(RegistryError::DecoderProfileMismatch)?
+                    .authority
+                    .shared_allocation_charge()?;
                 let retained_bytes = current_routed_batch_retained_bytes(
                     key.dynamic_retained_bytes(),
                     observations.len(),
                     observation_unique_allocations,
-                    current_authority_shared_allocation_charge()?,
+                    authority_shared_allocation,
                     frame_shared_allocation,
                 )?;
                 let observations = observations.into_boxed_slice();

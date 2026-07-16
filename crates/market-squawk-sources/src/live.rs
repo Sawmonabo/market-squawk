@@ -127,7 +127,10 @@ impl FrameSessionBinding {
     /// graph before this charge is added.
     pub(crate) fn shared_allocation_charge(&self) -> Option<usize> {
         std::mem::size_of::<FrameSessionIdentity>()
-            .checked_add(self.0.source_id.retained_bytes())
+            .checked_add(crate::conservative_arc_control_block_charge::<
+                FrameSessionIdentity,
+            >())
+            .and_then(|bytes| bytes.checked_add(self.0.source_id.retained_bytes()))
             .and_then(|bytes| {
                 bytes.checked_add(
                     self.0
