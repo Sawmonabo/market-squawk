@@ -2,15 +2,15 @@ use std::error::Error;
 use std::str::FromStr;
 
 use market_squawk_domain::{
-    CorporateActionEvent, CorporateActionKind, CorporateActionObservation, DataQuality,
-    InstrumentId, MarketEventError, PayloadReference, Provenance, ResearchContext, ResearchError,
-    ResearchTime, RevisionNumber, SchemaVersion, SourceId, SourceIdentifier, Timestamp, VenueId,
+    AvailabilityEvidence, ConnectionGeneration, CorporateActionEvent, CorporateActionKind,
+    CorporateActionObservation, DataQuality, InstrumentId, LiveProvenance, MarketEventError,
+    PayloadReference, ResearchContext, ResearchError, ResearchProvenance, ResearchTime,
+    RevisionNumber, SourceCoverageEvidence, SourceId, SourceIdentifier, Timestamp, VenueId,
     VenueSymbol,
 };
 
-fn provenance(venue: Option<&str>) -> Result<Provenance, Box<dyn Error>> {
-    Provenance::new(
-        SchemaVersion::CURRENT,
+fn live_provenance(venue: Option<&str>) -> Result<LiveProvenance, Box<dyn Error>> {
+    LiveProvenance::decoded(
         SourceId::try_from("reference-feed")?,
         Some(InstrumentId::from_str(
             "0187f5f1-6fc2-7fa2-bf05-2ce5354c55cb",
@@ -19,17 +19,39 @@ fn provenance(venue: Option<&str>) -> Result<Provenance, Box<dyn Error>> {
         SourceIdentifier::try_from("symbol-change-1")?,
         Some(Timestamp::from_unix_nanos(100)),
         Timestamp::from_unix_nanos(110),
+        Timestamp::from_unix_nanos(120),
+        DataQuality::DirectUnverified,
+        ConnectionGeneration::new(1)?,
+        SourceCoverageEvidence::Explicit,
+        PayloadReference::SourceReference(SourceIdentifier::try_from("record:1")?),
+    )
+    .map_err(Into::into)
+}
+
+fn research_provenance(venue: Option<&str>) -> Result<ResearchProvenance, Box<dyn Error>> {
+    ResearchProvenance::new(
+        SourceId::try_from("reference-feed")?,
+        Some(InstrumentId::from_str(
+            "0187f5f1-6fc2-7fa2-bf05-2ce5354c55cb",
+        )?),
+        venue.map(VenueId::try_from).transpose()?,
+        SourceIdentifier::try_from("symbol-change-1")?,
+        Some(Timestamp::from_unix_nanos(100)),
         Timestamp::from_unix_nanos(110),
         Timestamp::from_unix_nanos(120),
         DataQuality::OfficialDelayed,
         PayloadReference::SourceReference(SourceIdentifier::try_from("record:1")?),
+        AvailabilityEvidence::evidenced(
+            Timestamp::from_unix_nanos(110),
+            SourceIdentifier::try_from("source-publication-record")?,
+        ),
     )
     .map_err(Into::into)
 }
 
 fn research_context(venue: Option<&str>) -> Result<ResearchContext, Box<dyn Error>> {
     ResearchContext::new(
-        provenance(venue)?,
+        research_provenance(venue)?,
         ResearchTime::new(
             Timestamp::from_unix_nanos(90),
             Some(Timestamp::from_unix_nanos(100)),
@@ -52,7 +74,7 @@ fn action(venue: &str) -> Result<CorporateActionKind, Box<dyn Error>> {
 fn symbol_change_requires_matching_venue_in_live_and_research() -> Result<(), Box<dyn Error>> {
     assert!(
         CorporateActionEvent::new(
-            provenance(Some("XNYS"))?,
+            live_provenance(Some("XNYS"))?,
             Timestamp::from_unix_nanos(500),
             action("XNYS")?,
         )
@@ -64,7 +86,7 @@ fn symbol_change_requires_matching_venue_in_live_and_research() -> Result<(), Bo
 
     assert!(matches!(
         CorporateActionEvent::new(
-            provenance(Some("XNYS"))?,
+            live_provenance(Some("XNYS"))?,
             Timestamp::from_unix_nanos(500),
             action("XNAS")?,
         ),
@@ -77,7 +99,7 @@ fn symbol_change_requires_matching_venue_in_live_and_research() -> Result<(), Bo
 
     assert!(matches!(
         CorporateActionEvent::new(
-            provenance(None)?,
+            live_provenance(None)?,
             Timestamp::from_unix_nanos(500),
             action("XNYS")?,
         ),
