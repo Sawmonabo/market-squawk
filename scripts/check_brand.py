@@ -28,10 +28,10 @@ class AllowedOccurrence(NamedTuple):
 # line and the exact occurrence count, so changed, duplicated, missing, and stale references fail.
 ALLOWED_OCCURRENCES = {
     (".gitattributes", 2, 2): AllowedOccurrence(f"*{TOKENS[2]} binary"),
-    ("apps/market-squawk/tests/journal.rs", 48, 3): AllowedOccurrence(
+    ("apps/market-squawk/tests/journal.rs", 47, 3): AllowedOccurrence(
         f'    let bytes = fixture_with_magic(*b"{TOKENS[3]}")?;'
     ),
-    ("apps/market-squawk/tests/journal.rs", 95, 3): AllowedOccurrence(
+    ("apps/market-squawk/tests/journal.rs", 94, 3): AllowedOccurrence(
         f'    let original = fixture_with_magic(*b"{TOKENS[3]}")?;'
     ),
     ("apps/market-squawk/tests/journal_path_integration.rs", 34, 2): AllowedOccurrence(
@@ -76,28 +76,19 @@ ALLOWED_OCCURRENCES = {
     ("README.md", 204, 3): AllowedOccurrence(
         f"Readers retain bounded compatibility with legacy `{TOKENS[3]}/{TOKENS[2]}` journals, but writers never create or"
     ),
-    ("docs/architecture/current-state.md", 9, 0): AllowedOccurrence(
-        f"- Working tree: modified by an in-progress `{TOKENS[0]}` to `market-squawk` rename"
-    ),
-    ("docs/architecture/current-state.md", 208, 2): AllowedOccurrence(
-        f"The committed predecessor used `{TOKENS[3]}` and `{TOKENS[2]}`; the working tree changes those to `MSJ1` and"
-    ),
-    ("docs/architecture/current-state.md", 208, 3): AllowedOccurrence(
-        f"The committed predecessor used `{TOKENS[3]}` and `{TOKENS[2]}`; the working tree changes those to `MSJ1` and"
-    ),
-    ("docs/architecture/target-state.md", 709, 2): AllowedOccurrence(
+    ("docs/architecture/target-state.md", 723, 2): AllowedOccurrence(
         f"- Readers accept committed `{TOKENS[3]}/{TOKENS[2]}` and renamed `MSJ1/.msj` journals."
     ),
-    ("docs/architecture/target-state.md", 709, 3): AllowedOccurrence(
+    ("docs/architecture/target-state.md", 723, 3): AllowedOccurrence(
         f"- Readers accept committed `{TOKENS[3]}/{TOKENS[2]}` and renamed `MSJ1/.msj` journals."
     ),
-    ("docs/plans/implementation-plan.md", 132, 2): AllowedOccurrence(
+    ("docs/plans/implementation-plan.md", 165, 2): AllowedOccurrence(
         f"- [ ] Confirm `{TOKENS[3]}/{TOKENS[2]}` and `MSJ1/.msj` backward read compatibility."
     ),
-    ("docs/plans/implementation-plan.md", 132, 3): AllowedOccurrence(
+    ("docs/plans/implementation-plan.md", 165, 3): AllowedOccurrence(
         f"- [ ] Confirm `{TOKENS[3]}/{TOKENS[2]}` and `MSJ1/.msj` backward read compatibility."
     ),
-    ("docs/plans/implementation-plan.md", 148, 3): AllowedOccurrence(
+    ("docs/plans/implementation-plan.md", 181, 3): AllowedOccurrence(
         f"- [ ] Add `{TOKENS[3]}` and `MSJ1` reader fixtures before changing journal code."
     ),
     ("docs/superpowers/plans/2026-07-16-market-squawk-stage-1-foundation.md", 41, 2): AllowedOccurrence(

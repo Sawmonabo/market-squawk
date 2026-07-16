@@ -25,7 +25,7 @@ impl DepthLimit {
     ///
     /// # Errors
     ///
-    /// Rejects zero and depths greater than [`MAX_BOOK_DEPTH`].
+    /// Rejects zero and depths greater than 10,000 levels per side.
     pub fn new(value: usize) -> Result<Self, BookError> {
         let value = NonZeroUsize::new(value).ok_or(BookError::InvalidDepth {
             requested: value,
