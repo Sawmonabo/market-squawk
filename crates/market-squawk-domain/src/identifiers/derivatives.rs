@@ -78,8 +78,10 @@ impl FuturesLifecycleDates {
     ///
     /// # Errors
     ///
-    /// Rejects last trade after expiration, a reversed notice range, or a reversed delivery range.
-    /// An empty set is valid and faithfully represents a source record with no lifecycle fields.
+    /// Returns a relation-specific [`IdentifierError`] when first trade follows last trade,
+    /// expiration, or settlement; last trade follows expiration or settlement; expiration or
+    /// maturity follows settlement; or the notice or delivery range is reversed. An empty set is
+    /// valid and faithfully represents a source record with no lifecycle fields.
     pub fn try_new(fields: FuturesLifecycleDateFields) -> Result<Self, IdentifierError> {
         let FuturesLifecycleDateFields {
             first_trade_date,

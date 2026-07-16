@@ -64,8 +64,9 @@ policy suite subsequently passed 17 tests.
 - Defined deterministic provider-registry ingestion: exact duplicate evidence is an idempotent
   no-op, same-revision disagreement is retained/quarantined, and a valid newer revision appends and
   supersedes without mutation or deletion.
-- Corrected language that treated mutable URLs or aliases as immutable. Content hashes or
-  version-pinned object/record references are the evidence identity; URLs remain locator metadata.
+- Corrected language that treated mutable URLs or aliases as immutable. Provider identity evidence
+  always includes an algorithm-qualified content digest; an optional locator carries explicit
+  reference and version identities but remains non-authoritative retrieval metadata.
 
 ## Persisted external evidence
 

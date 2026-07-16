@@ -7,9 +7,80 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use super::{EffectiveInterval, InstrumentError};
 use crate::{
-    InstrumentId, MetadataRevision, PayloadHashAlgorithm, PayloadReference, ProviderInstrumentId,
-    SourceId, Timestamp,
+    DigestAlgorithm, EvidenceDigest, InstrumentId, MetadataRevision, ProviderInstrumentId,
+    SourceId, SourceIdentifier, Timestamp,
 };
+
+/// A provider object locator with an explicit immutable provider version identity.
+///
+/// The locator is retained only to retrieve or explain the source object. The separately required
+/// content digest in [`ProviderIdentityEvidence`] remains the authoritative evidence identity.
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderIdentityLocator {
+    reference: SourceIdentifier,
+    version: SourceIdentifier,
+}
+
+impl ProviderIdentityLocator {
+    /// Constructs a bounded provider locator with an explicit version identity.
+    pub const fn new(reference: SourceIdentifier, version: SourceIdentifier) -> Self {
+        Self { reference, version }
+    }
+
+    /// Returns the provider object or record locator.
+    pub const fn reference(&self) -> &SourceIdentifier {
+        &self.reference
+    }
+
+    /// Returns the provider-supplied immutable object or record version.
+    pub const fn version(&self) -> &SourceIdentifier {
+        &self.version
+    }
+}
+
+/// Immutable, algorithm-qualified content evidence for a provider identity assertion.
+///
+/// A content digest is mandatory. A version-pinned locator is optional metadata and can never
+/// replace the digest, so a bare URL or mutable object name is not representable as evidence.
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderIdentityEvidence {
+    content_digest: EvidenceDigest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    version_pinned_locator: Option<ProviderIdentityLocator>,
+}
+
+impl ProviderIdentityEvidence {
+    /// Constructs provider evidence from an algorithm-qualified content digest.
+    pub const fn from_content_digest(content_digest: EvidenceDigest) -> Self {
+        Self {
+            content_digest,
+            version_pinned_locator: None,
+        }
+    }
+
+    /// Constructs provider evidence with an independently versioned source locator.
+    pub const fn with_version_pinned_locator(
+        content_digest: EvidenceDigest,
+        version_pinned_locator: ProviderIdentityLocator,
+    ) -> Self {
+        Self {
+            content_digest,
+            version_pinned_locator: Some(version_pinned_locator),
+        }
+    }
+
+    /// Returns the mandatory algorithm-qualified content digest.
+    pub const fn content_digest(&self) -> EvidenceDigest {
+        self.content_digest
+    }
+
+    /// Returns the optional provider locator and its explicit version identity.
+    pub const fn version_pinned_locator(&self) -> Option<&ProviderIdentityLocator> {
+        self.version_pinned_locator.as_ref()
+    }
+}
 
 /// Natural namespace key for a provider-native instrument identity.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -44,12 +115,12 @@ impl ProviderIdentityKey {
 #[serde(deny_unknown_fields)]
 pub struct ProviderIdentitySupersession {
     predecessor: MetadataRevision,
-    evidence: PayloadReference,
+    evidence: ProviderIdentityEvidence,
 }
 
 impl ProviderIdentitySupersession {
     /// Constructs an evidence-backed predecessor edge.
-    pub const fn new(predecessor: MetadataRevision, evidence: PayloadReference) -> Self {
+    pub const fn new(predecessor: MetadataRevision, evidence: ProviderIdentityEvidence) -> Self {
         Self {
             predecessor,
             evidence,
@@ -62,7 +133,7 @@ impl ProviderIdentitySupersession {
     }
 
     /// Returns immutable evidence for the revision transition.
-    pub const fn evidence(&self) -> &PayloadReference {
+    pub const fn evidence(&self) -> &ProviderIdentityEvidence {
         &self.evidence
     }
 }
@@ -73,7 +144,7 @@ pub struct ProviderIdentityRecord {
     instrument_id: InstrumentId,
     source_id: SourceId,
     provider_instrument_id: ProviderInstrumentId,
-    source_reference: PayloadReference,
+    evidence: ProviderIdentityEvidence,
     source_timestamp: Option<Timestamp>,
     observation_timestamps: Vec<Timestamp>,
     metadata_revision: MetadataRevision,
@@ -91,8 +162,8 @@ pub struct ProviderIdentityRecordInput {
     pub source_id: SourceId,
     /// Source-native instrument identity.
     pub provider_instrument_id: ProviderInstrumentId,
-    /// Immutable reference to the exact source object containing the assertion.
-    pub source_reference: PayloadReference,
+    /// Mandatory content digest and optional version-pinned locator for the exact source assertion.
+    pub evidence: ProviderIdentityEvidence,
     /// Source-authored timestamp when supplied.
     pub source_timestamp: Option<Timestamp>,
     /// Local time this exact assertion was observed.
@@ -113,7 +184,7 @@ impl ProviderIdentityRecord {
             instrument_id: input.instrument_id,
             source_id: input.source_id,
             provider_instrument_id: input.provider_instrument_id,
-            source_reference: input.source_reference,
+            evidence: input.evidence,
             source_timestamp: input.source_timestamp,
             observation_timestamps: vec![input.observed_at],
             metadata_revision: input.metadata_revision,
@@ -142,9 +213,9 @@ impl ProviderIdentityRecord {
         ProviderIdentityKey::new(self.source_id.clone(), self.provider_instrument_id.clone())
     }
 
-    /// Returns the immutable source-object evidence.
-    pub const fn source_reference(&self) -> &PayloadReference {
-        &self.source_reference
+    /// Returns the immutable content evidence for the source assertion.
+    pub const fn evidence(&self) -> &ProviderIdentityEvidence {
+        &self.evidence
     }
 
     /// Returns the source-authored timestamp when supplied.
@@ -181,7 +252,7 @@ impl ProviderIdentityRecord {
         self.instrument_id == other.instrument_id
             && self.source_id == other.source_id
             && self.provider_instrument_id == other.provider_instrument_id
-            && self.source_reference == other.source_reference
+            && self.evidence == other.evidence
             && self.source_timestamp == other.source_timestamp
             && self.metadata_revision == other.metadata_revision
             && self.validity == other.validity
@@ -216,7 +287,7 @@ struct ProviderIdentityRecordWire {
     instrument_id: InstrumentId,
     source_id: SourceId,
     provider_instrument_id: ProviderInstrumentId,
-    source_reference: PayloadReference,
+    evidence: ProviderIdentityEvidence,
     source_timestamp: Option<Timestamp>,
     observation_timestamps: Vec<Timestamp>,
     metadata_revision: MetadataRevision,
@@ -242,7 +313,7 @@ impl<'de> Deserialize<'de> for ProviderIdentityRecord {
             instrument_id: wire.instrument_id,
             source_id: wire.source_id,
             provider_instrument_id: wire.provider_instrument_id,
-            source_reference: wire.source_reference,
+            evidence: wire.evidence,
             source_timestamp: wire.source_timestamp,
             observation_timestamps: observations,
             metadata_revision: wire.metadata_revision,
@@ -504,7 +575,7 @@ fn compare_records(left: &ProviderIdentityRecord, right: &ProviderIdentityRecord
                 .cmp(right.metadata_revision.as_source_identifier())
         })
         .then_with(|| left.instrument_id.cmp(&right.instrument_id))
-        .then_with(|| compare_payload_reference(&left.source_reference, &right.source_reference))
+        .then_with(|| compare_evidence(&left.evidence, &right.evidence))
         .then_with(|| left.source_timestamp.cmp(&right.source_timestamp))
         .then_with(|| left.validity.starts_at().cmp(&right.validity.starts_at()))
         .then_with(|| left.validity.ends_at().cmp(&right.validity.ends_at()))
@@ -527,30 +598,44 @@ fn compare_supersession(
             .predecessor()
             .as_source_identifier()
             .cmp(right.predecessor().as_source_identifier())
-            .then_with(|| compare_payload_reference(left.evidence(), right.evidence())),
+            .then_with(|| compare_evidence(left.evidence(), right.evidence())),
     }
 }
 
-fn compare_payload_reference(left: &PayloadReference, right: &PayloadReference) -> Ordering {
+fn compare_evidence(left: &ProviderIdentityEvidence, right: &ProviderIdentityEvidence) -> Ordering {
+    digest_algorithm_rank(left.content_digest().algorithm())
+        .cmp(&digest_algorithm_rank(right.content_digest().algorithm()))
+        .then_with(|| {
+            left.content_digest()
+                .bytes()
+                .cmp(&right.content_digest().bytes())
+        })
+        .then_with(|| {
+            compare_locator(
+                left.version_pinned_locator(),
+                right.version_pinned_locator(),
+            )
+        })
+}
+
+fn compare_locator(
+    left: Option<&ProviderIdentityLocator>,
+    right: Option<&ProviderIdentityLocator>,
+) -> Ordering {
     match (left, right) {
-        (PayloadReference::ContentHash(left), PayloadReference::ContentHash(right)) => {
-            payload_algorithm_rank(left.algorithm())
-                .cmp(&payload_algorithm_rank(right.algorithm()))
-                .then_with(|| left.digest().cmp(&right.digest()))
-        }
-        (PayloadReference::ContentHash(_), PayloadReference::SourceReference(_)) => Ordering::Less,
-        (PayloadReference::SourceReference(_), PayloadReference::ContentHash(_)) => {
-            Ordering::Greater
-        }
-        (PayloadReference::SourceReference(left), PayloadReference::SourceReference(right)) => {
-            left.cmp(right)
-        }
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Less,
+        (Some(_), None) => Ordering::Greater,
+        (Some(left), Some(right)) => left
+            .reference()
+            .cmp(right.reference())
+            .then_with(|| left.version().cmp(right.version())),
     }
 }
 
-const fn payload_algorithm_rank(algorithm: PayloadHashAlgorithm) -> u8 {
+const fn digest_algorithm_rank(algorithm: DigestAlgorithm) -> u8 {
     match algorithm {
-        PayloadHashAlgorithm::Sha256 => 0,
-        PayloadHashAlgorithm::Blake3 => 1,
+        DigestAlgorithm::Sha256 => 0,
+        DigestAlgorithm::Blake3 => 1,
     }
 }

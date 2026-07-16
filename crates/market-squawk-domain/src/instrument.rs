@@ -18,8 +18,9 @@ pub use identifier_records::{
     IdentifierSyntaxVerification,
 };
 pub use provider_identities::{
-    ProviderIdentityConflict, ProviderIdentityConflictReason, ProviderIdentityKey,
-    ProviderIdentityRecord, ProviderIdentityRecordInput, ProviderIdentitySupersession,
+    ProviderIdentityConflict, ProviderIdentityConflictReason, ProviderIdentityEvidence,
+    ProviderIdentityKey, ProviderIdentityLocator, ProviderIdentityRecord,
+    ProviderIdentityRecordInput, ProviderIdentitySupersession,
 };
 
 /// A broad instrument asset family, separate from Task 4 evidence classifications.
@@ -531,8 +532,19 @@ impl InstrumentDefinition {
     ///
     /// # Errors
     ///
-    /// Rejects duplicate current mappings for one venue. Historical mappings belong in
-    /// [`SymbolIdentityRecord`] intervals.
+    /// Returns [`InstrumentError::DuplicateVenueMapping`] for multiple current mappings in one
+    /// venue; historical mappings belong in [`SymbolIdentityRecord`] intervals. Returns
+    /// [`InstrumentError::ProviderIdentityInstrumentMismatch`] when an accepted provider assertion
+    /// names a different stable instrument and [`InstrumentError::DuplicateExternalIdentifier`]
+    /// when the same typed external identifier is attached more than once.
+    ///
+    /// Provider revision graphs additionally return
+    /// [`InstrumentError::MissingProviderIdentitySupersession`],
+    /// [`InstrumentError::MissingProviderIdentityPredecessor`],
+    /// [`InstrumentError::ProviderIdentitySupersessionCycle`],
+    /// [`InstrumentError::AmbiguousProviderIdentitySuccessor`], or
+    /// [`InstrumentError::InvalidProviderIdentityTransition`] when their evidence is incomplete,
+    /// cyclic, branching, or temporally overlapping.
     pub fn try_new(input: InstrumentDefinitionInput) -> Result<Self, InstrumentError> {
         let InstrumentDefinitionInput {
             instrument_id,

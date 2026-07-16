@@ -56,8 +56,9 @@ the venue and venue symbol. Every provider-native assertion is retained as a ver
 
 - provider `SourceId`/namespace and provider-native identifier;
 - stable internal `InstrumentId`;
-- content evidence: a content hash, or a version-pinned object/record reference paired with a
-  retained digest; a mutable URL alone is never treated as immutable evidence;
+- mandatory algorithm-qualified content evidence, plus an optional provider object/record locator
+  carrying a separate explicit version identity; the locator can aid retrieval but can never replace
+  the retained digest, so a bare or mutable URL is not representable as evidence;
 - provider source timestamp when supplied and local first-`observed_at` timestamp;
 - authoritative source-metadata revision plus the evidence/reference that established it; and
 - asserted effective interval and later supersession evidence.

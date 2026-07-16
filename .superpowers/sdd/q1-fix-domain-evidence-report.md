@@ -46,9 +46,9 @@ years including `0000`, months 01-12, appended days 01-31, and lowercase week co
 - Top-level `MaturityMonthYear(200)` and leg `LegMaturityMonthYear(610)` use the same typed value.
 - `MaturityDate(541)` remains in lifecycle dates and `LegMaturityDate(611)` is a separate leg field.
 - The futures identity owns `source_id`, `source_reference`, optional source timestamp, local
-  observation timestamp, and metadata revision. A source reference is immutable evidence only when
-  it names a version-pinned object/record or is paired with a retained content digest; a mutable URL
-  is not made immutable by storing it in the type.
+  observation timestamp, and metadata revision. Provider identity assertions use the stronger
+  `ProviderIdentityEvidence` contract described below; a generic futures source locator does not
+  become immutable merely because it is retained.
 - Lifecycle dates are empty-permitted, preserve every optional date, and retain relational checks.
 - Week-distinct legs are not collapsed merely because their provider security text is the same.
 - Custom deserialization routes through checked constructors and denies unknown fields.
@@ -63,9 +63,10 @@ years including `0000`, months 01-12, appended days 01-31, and lowercase week co
 
 ### Provider identity evidence
 
-- Added `ProviderIdentityRecordInput` with payload/source-object evidence, optional source timestamp,
-  local observation timestamp, metadata revision, and effective interval. Version-pinned object
-  identity or a retained content hash is required before calling that evidence immutable.
+- Added `ProviderIdentityRecordInput` with mandatory algorithm-qualified content evidence, optional
+  source timestamp, local observation timestamp, metadata revision, and effective interval. An
+  optional `ProviderIdentityLocator` retains separately validated reference and version identities,
+  but the locator can never replace the content digest.
 - Custom Serde denies unknown fields and constructs through the named input.
 - Exact record equality is the exact-duplicate-evidence policy.
 - Repeated observations and distinct metadata revisions for the same logical mapping are retained.

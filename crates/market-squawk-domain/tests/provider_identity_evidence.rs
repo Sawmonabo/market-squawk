@@ -1,9 +1,10 @@
 use market_squawk_domain::{
-    AssetClass, Currency, Denomination, EffectiveInterval, InstrumentDefinition,
+    AssetClass, Currency, Denomination, EffectiveInterval, EvidenceDigest, InstrumentDefinition,
     InstrumentDefinitionInput, InstrumentError, InstrumentId, LotSize, MetadataRevision,
-    PayloadHash, PayloadHashAlgorithm, PayloadReference, ProviderIdentityConflictReason,
-    ProviderIdentityRecord, ProviderIdentityRecordInput, ProviderIdentitySupersession,
-    ProviderInstrumentId, SourceId, SourceIdentifier, TickSize, Timestamp, TradingStatus,
+    PayloadHashAlgorithm, ProviderIdentityConflictReason, ProviderIdentityEvidence,
+    ProviderIdentityLocator, ProviderIdentityRecord, ProviderIdentityRecordInput,
+    ProviderIdentitySupersession, ProviderInstrumentId, SourceId, SourceIdentifier, TickSize,
+    Timestamp, TradingStatus,
 };
 use proptest::prelude::*;
 use rust_decimal::Decimal;
@@ -17,8 +18,11 @@ fn revision(value: &str) -> Result<MetadataRevision, Box<dyn std::error::Error>>
     Ok(MetadataRevision::new(SourceIdentifier::try_from(value)?))
 }
 
-fn reference(digest: u8) -> PayloadReference {
-    PayloadReference::ContentHash(PayloadHash::new(PayloadHashAlgorithm::Sha256, [digest; 32]))
+fn reference(digest: u8) -> ProviderIdentityEvidence {
+    ProviderIdentityEvidence::from_content_digest(EvidenceDigest::new(
+        PayloadHashAlgorithm::Sha256,
+        [digest; 32],
+    ))
 }
 
 fn record(
@@ -33,7 +37,7 @@ fn record(
         instrument_id: mapped_instrument,
         source_id: SourceId::try_from("vendor-alpha")?,
         provider_instrument_id: ProviderInstrumentId::try_from("12345")?,
-        source_reference: reference(digest),
+        evidence: reference(digest),
         source_timestamp: Some(Timestamp::from_unix_nanos(99)),
         observed_at: Timestamp::from_unix_nanos(observed_at),
         metadata_revision: revision(revision_name)?,
@@ -360,5 +364,77 @@ fn provider_identity_wire_is_strict_and_canonical() -> Result<(), Box<dyn std::e
     let mut unknown = wire;
     unknown["untrusted_note"] = serde_json::json!(true);
     assert!(serde_json::from_value::<ProviderIdentityRecord>(unknown).is_err());
+    Ok(())
+}
+
+#[test]
+fn provider_evidence_requires_a_digest_and_retains_an_explicit_version_pin()
+-> Result<(), Box<dyn std::error::Error>> {
+    let bytes = [19; 32];
+    let locator = ProviderIdentityLocator::new(
+        SourceIdentifier::try_from("provider-object:instrument/12345")?,
+        SourceIdentifier::try_from("metadata-version:42")?,
+    );
+    let sha = ProviderIdentityEvidence::with_version_pinned_locator(
+        EvidenceDigest::new(PayloadHashAlgorithm::Sha256, bytes),
+        locator.clone(),
+    );
+    let blake = ProviderIdentityEvidence::with_version_pinned_locator(
+        EvidenceDigest::new(PayloadHashAlgorithm::Blake3, bytes),
+        locator,
+    );
+
+    assert_ne!(sha, blake);
+    assert_eq!(
+        sha.content_digest().algorithm(),
+        PayloadHashAlgorithm::Sha256
+    );
+    assert_eq!(sha.content_digest().bytes(), bytes);
+    assert_eq!(
+        sha.version_pinned_locator()
+            .map(ProviderIdentityLocator::version)
+            .map(SourceIdentifier::as_str),
+        Some("metadata-version:42")
+    );
+    assert_eq!(
+        serde_json::from_value::<ProviderIdentityEvidence>(serde_json::to_value(&sha)?)?,
+        sha
+    );
+    Ok(())
+}
+
+#[test]
+fn provider_evidence_wire_rejects_bare_locators_and_tampering()
+-> Result<(), Box<dyn std::error::Error>> {
+    let bare_locator = serde_json::json!({
+        "version_pinned_locator": {
+            "reference": "https://provider.example/current/instrument/12345",
+            "version": "metadata-version:42"
+        }
+    });
+    assert!(serde_json::from_value::<ProviderIdentityEvidence>(bare_locator).is_err());
+
+    let locator_without_version = serde_json::json!({
+        "content_digest": {
+            "algorithm": "sha256",
+            "bytes": vec![7; 32]
+        },
+        "version_pinned_locator": {
+            "reference": "provider-object:instrument/12345"
+        }
+    });
+    assert!(serde_json::from_value::<ProviderIdentityEvidence>(locator_without_version).is_err());
+
+    let legacy_bare_reference = serde_json::json!({
+        "kind": "source_reference",
+        "value": "https://provider.example/current/instrument/12345"
+    });
+    assert!(serde_json::from_value::<ProviderIdentityEvidence>(legacy_bare_reference).is_err());
+
+    let mut unknown = serde_json::to_value(ProviderIdentityEvidence::from_content_digest(
+        EvidenceDigest::new(PayloadHashAlgorithm::Sha256, [7; 32]),
+    ))?;
+    unknown["trusted_without_digest"] = serde_json::json!(true);
+    assert!(serde_json::from_value::<ProviderIdentityEvidence>(unknown).is_err());
     Ok(())
 }

@@ -55,9 +55,10 @@ pub use instrument::{
     ExternalIdentifierRecord, ExternalIdentifierRecordInput, IdentifierEntitlement,
     IdentifierRightsPolicyReference, IdentifierSyntaxVerification, InstrumentDefinition,
     InstrumentDefinitionInput, InstrumentError, LifecycleTransition, LifecycleTransitionKind,
-    ProviderIdentityConflict, ProviderIdentityConflictReason, ProviderIdentityKey,
-    ProviderIdentityRecord, ProviderIdentityRecordInput, ProviderIdentitySupersession,
-    SymbolIdentityRecord, TradingStatus, VenueMapping,
+    ProviderIdentityConflict, ProviderIdentityConflictReason, ProviderIdentityEvidence,
+    ProviderIdentityKey, ProviderIdentityLocator, ProviderIdentityRecord,
+    ProviderIdentityRecordInput, ProviderIdentitySupersession, SymbolIdentityRecord, TradingStatus,
+    VenueMapping,
 };
 pub use market::{
     AggressorSide, AuctionEvent, AuctionPhase, BookChange, BookDeltaEvent, BookLevel,

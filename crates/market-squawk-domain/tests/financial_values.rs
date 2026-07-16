@@ -3,21 +3,28 @@ use std::str::FromStr;
 use market_squawk_domain::{
     AssetClass, AssignmentVerification, BasisPoints, CalendarDate, ChainAddress, ChainAddressRole,
     ChainId, ConnectionGeneration, ContractRollMapping, CryptoPair, CryptoProductType, Currency,
-    Cusip, Denomination, EffectiveInterval, EvmChainId, ExternalIdentifier,
+    Cusip, Denomination, EffectiveInterval, EvidenceDigest, EvmChainId, ExternalIdentifier,
     ExternalIdentifierRecord, ExternalIdentifierRecordInput, Figi, FinancialError,
     FuturesContractIdentity, FuturesContractIdentityInput, FuturesLifecycleDateFields,
     FuturesLifecycleDates, FuturesSecurityType, IdentifierEntitlement, IdentifierError,
     IdentifierRightsPolicyReference, IdentityError, InstrumentDefinition,
     InstrumentDefinitionInput, InstrumentError, InstrumentId, Isin, LifecycleTransition,
     LifecycleTransitionKind, LotSize, MaturityMonthYear, MetadataRevision, Money,
-    OccOptionIdentity, OptionKind, PayloadReference, PriceError, PriceTicks,
-    ProviderIdentityRecord, ProviderIdentityRecordInput, ProviderInstrumentId, QuantityError,
-    QuantityLots, RoundingPolicy, Sedol, SequenceNumber, SolanaChainId, SourceId, SourceIdentifier,
-    SymbolIdentityRecord, TickSize, Ticker, TimeError, Timestamp, TradingStatus, VenueId,
-    VenueMapping, VenueSymbol,
+    OccOptionIdentity, OptionKind, PayloadHashAlgorithm, PayloadReference, PriceError, PriceTicks,
+    ProviderIdentityEvidence, ProviderIdentityRecord, ProviderIdentityRecordInput,
+    ProviderInstrumentId, QuantityError, QuantityLots, RoundingPolicy, Sedol, SequenceNumber,
+    SolanaChainId, SourceId, SourceIdentifier, SymbolIdentityRecord, TickSize, Ticker, TimeError,
+    Timestamp, TradingStatus, VenueId, VenueMapping, VenueSymbol,
 };
 use rust_decimal::Decimal;
 use uuid::Uuid;
+
+fn provider_evidence(byte: u8) -> ProviderIdentityEvidence {
+    ProviderIdentityEvidence::from_content_digest(EvidenceDigest::new(
+        PayloadHashAlgorithm::Sha256,
+        [byte; 32],
+    ))
+}
 
 #[test]
 fn instrument_id_round_trips_uuid_text_and_serde() -> Result<(), Box<dyn std::error::Error>> {
@@ -526,9 +533,7 @@ fn identity_lifecycle_records_keep_effective_time_and_stable_instrument_ids()
         instrument_id: current,
         source_id: SourceId::try_from("nasdaq-reference")?,
         provider_instrument_id: ProviderInstrumentId::try_from("ACME.O")?,
-        source_reference: PayloadReference::SourceReference(SourceIdentifier::try_from(
-            "nasdaq-reference:ACME.O:1",
-        )?),
+        evidence: provider_evidence(11),
         source_timestamp: None,
         observed_at: effective_at,
         metadata_revision: MetadataRevision::new(SourceIdentifier::try_from(
@@ -575,9 +580,7 @@ fn instrument_definition_owns_precision_mappings_identifiers_and_status()
         instrument_id: id,
         source_id: SourceId::try_from("user-reference")?,
         provider_instrument_id: ProviderInstrumentId::try_from("AAPL.O")?,
-        source_reference: PayloadReference::SourceReference(SourceIdentifier::try_from(
-            "instrument-row:1",
-        )?),
+        evidence: provider_evidence(12),
         source_timestamp: None,
         observed_at: Timestamp::from_unix_nanos(1),
         metadata_revision: MetadataRevision::new(SourceIdentifier::try_from(

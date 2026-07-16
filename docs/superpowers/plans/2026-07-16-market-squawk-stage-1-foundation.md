@@ -394,9 +394,9 @@ record contracts are defined here so storage cannot later invent incompatible id
 Provider-native identity assertions use a versioned `ProviderIdentityRecord`, not an unqualified
 string or a field on `VenueMapping`. Bind every record to the provider `SourceId`, stable
 `InstrumentId`, content evidence, provider source timestamp when supplied, local `observed_at`,
-authoritative metadata revision/evidence, and effective interval. `ContentHash` is immutable
-content evidence; a `SourceReference` must name a version-pinned object/record or be paired with a
-retained content digest. A mutable URL alone is insufficient.
+authoritative metadata revision/evidence, and effective interval. `ProviderIdentityEvidence` requires
+an algorithm-qualified digest; an optional `ProviderIdentityLocator` retains explicit reference and
+version identities as retrieval metadata, never evidence. A bare mutable URL is unrepresentable.
 
 Put deterministic ingestion semantics in the provider-identity registry, not in vector equality:
 the same natural key, metadata revision, normalized assertion, interval, and content evidence is an

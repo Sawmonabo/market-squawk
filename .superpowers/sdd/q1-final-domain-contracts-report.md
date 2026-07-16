@@ -15,7 +15,9 @@ scripts, or documentation outside this persisted report.
 ### Deterministic provider identity ingestion
 
 - `ProviderIdentityRecord` now separates an immutable normalized assertion from sorted, unique
-  local `observation_timestamps`.
+  local `observation_timestamps`. Its `ProviderIdentityEvidence` always carries an
+  algorithm-qualified content digest; an optional `ProviderIdentityLocator` retains separate
+  reference and version identities but cannot replace that digest.
 - The natural key is the typed `ProviderIdentityKey` (`SourceId`, `ProviderInstrumentId`), and
   revision identity uses the shared `MetadataRevision` type.
 - Assertions with identical immutable evidence, mapping, effective claim, and revision coalesce
@@ -23,8 +25,8 @@ scripts, or documentation outside this persisted report.
 - Divergent assertions for the same natural key and revision are retained in a deterministic
   `ProviderIdentityConflict` with
   `ProviderIdentityConflictReason::SameRevisionDivergence`; no input-order winner is selected.
-- `ProviderIdentitySupersession` carries a typed predecessor revision plus immutable payload
-  evidence. The normalizer rejects missing predecessor evidence, missing predecessors, cycles,
+- `ProviderIdentitySupersession` carries a typed predecessor revision plus the same mandatory
+  content-digest evidence. The normalizer rejects missing predecessor evidence, missing predecessors, cycles,
   branches, overlapping successors, and successors of open-ended assertions with typed
   `InstrumentError` variants.
 - `InstrumentDefinition` stores accepted assertions and quarantined conflicts separately.

@@ -1,12 +1,13 @@
 use market_squawk_domain::{
     AssetClass, AssignmentVerification, ContractRollMapping, Currency, Denomination,
-    EffectiveInterval, ExternalIdentifier, ExternalIdentifierRecord, ExternalIdentifierRecordInput,
-    IdentifierEntitlement, IdentifierRightsPolicyReference, IdentifierSyntaxVerification,
-    InstrumentDefinition, InstrumentDefinitionInput, InstrumentError, InstrumentId, Isin,
-    LifecycleTransition, LifecycleTransitionKind, LotSize, MetadataRevision, PayloadHash,
-    PayloadHashAlgorithm, PayloadReference, ProviderIdentityRecord, ProviderIdentityRecordInput,
-    ProviderInstrumentId, SourceId, SourceIdentifier, SymbolIdentityRecord, TickSize, Timestamp,
-    TradingStatus, VenueId, VenueMapping, VenueSymbol,
+    EffectiveInterval, EvidenceDigest, ExternalIdentifier, ExternalIdentifierRecord,
+    ExternalIdentifierRecordInput, IdentifierEntitlement, IdentifierRightsPolicyReference,
+    IdentifierSyntaxVerification, InstrumentDefinition, InstrumentDefinitionInput, InstrumentError,
+    InstrumentId, Isin, LifecycleTransition, LifecycleTransitionKind, LotSize, MetadataRevision,
+    PayloadHash, PayloadHashAlgorithm, PayloadReference, ProviderIdentityEvidence,
+    ProviderIdentityRecord, ProviderIdentityRecordInput, ProviderInstrumentId, SourceId,
+    SourceIdentifier, SymbolIdentityRecord, TickSize, Timestamp, TradingStatus, VenueId,
+    VenueMapping, VenueSymbol,
 };
 use rust_decimal::Decimal;
 use uuid::Uuid;
@@ -52,7 +53,7 @@ fn provider_identity(
         instrument_id,
         source_id: SourceId::try_from(source_id)?,
         provider_instrument_id: ProviderInstrumentId::try_from(provider_instrument_id)?,
-        source_reference: PayloadReference::ContentHash(PayloadHash::new(
+        evidence: ProviderIdentityEvidence::from_content_digest(EvidenceDigest::new(
             PayloadHashAlgorithm::Sha256,
             [evidence_byte; 32],
         )),

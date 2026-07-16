@@ -171,9 +171,9 @@ retained in the [Quarter 1 contract decisions](../research/2026-07-16-q1-contrac
 
 Provider identity records bind the provider namespace/native ID and stable instrument to content
 evidence, source/first-observed timestamps, authoritative metadata revision/evidence, and effective
-interval. A content hash is immutable evidence; an external source reference is accepted as such
-only when it identifies a version-pinned object/record or is paired with a retained content digest.
-A mutable URL by itself is not immutable evidence. Registry ingestion has deterministic outcomes:
+interval. `ProviderIdentityEvidence` requires an algorithm-qualified digest; an optional
+`ProviderIdentityLocator` retains explicit reference/version identities as retrieval metadata, never
+evidence. A bare URL is unrepresentable. Registry ingestion has deterministic outcomes:
 an exact evidence duplicate is an idempotent no-op, a same-natural-key/same-revision disagreement is
 retained and quarantined as a conflict, and a temporally valid newer revision appends a new record
 and supersedes rather than mutates the prior record.
