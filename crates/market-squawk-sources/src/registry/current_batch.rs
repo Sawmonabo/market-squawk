@@ -50,6 +50,10 @@ impl CurrentBatchKey {
     pub const fn instrument(&self) -> InstrumentId {
         self.instrument
     }
+
+    fn dynamic_retained_bytes(&self) -> usize {
+        self.venue.retained_bytes()
+    }
 }
 
 /// O(1)-clone session/health/capture authority retained by queued observations.
@@ -227,7 +231,7 @@ const CURRENT_POLICY_MAX_SOURCE_IDENTIFIERS: usize = 32;
 const CURRENT_POLICY_MAX_SOURCE_IDS: usize = 2;
 const CURRENT_POLICY_MAX_VENUE_IDS: usize = 2;
 
-fn current_policy_deep_allocation_charge() -> Result<usize, RegistryError> {
+fn current_policy_conservative_allocation_charge() -> Result<usize, RegistryError> {
     let source_identifiers = market_squawk_domain::SourceIdentifier::MAX_LENGTH
         .checked_mul(CURRENT_POLICY_MAX_SOURCE_IDENTIFIERS)
         .ok_or(RegistryError::RetainedSizeOverflow)?;
@@ -267,15 +271,17 @@ fn current_frame_shared_allocation_charge() -> Result<usize, RegistryError> {
 }
 
 fn current_routed_batch_retained_bytes(
+    batch_key_allocation: usize,
     observation_count: usize,
-    policy_and_provider_allocations: usize,
+    observation_unique_allocations: usize,
 ) -> Result<usize, RegistryError> {
     let authority_allocation = current_authority_shared_allocation_charge()?;
     let frame_allocation = current_frame_shared_allocation_charge()?;
     observation_count
         .checked_mul(std::mem::size_of::<CurrentProviderObservation>())
         .and_then(|bytes| bytes.checked_add(std::mem::size_of::<CurrentDecodedProviderBatch>()))
-        .and_then(|bytes| bytes.checked_add(policy_and_provider_allocations))
+        .and_then(|bytes| bytes.checked_add(batch_key_allocation))
+        .and_then(|bytes| bytes.checked_add(observation_unique_allocations))
         .and_then(|bytes| bytes.checked_add(authority_allocation))
         .and_then(|bytes| bytes.checked_add(frame_allocation))
         .ok_or(RegistryError::RetainedSizeOverflow)
@@ -341,7 +347,10 @@ impl CurrentLivePolicy {
     }
 
     fn deep_allocation_charge(&self) -> Result<usize, RegistryError> {
-        current_policy_deep_allocation_charge()
+        // This closed policy shape is charged at its documented identifier maxima. It is
+        // intentionally conservative because several nested domain wrappers do not expose their
+        // internal allocation capacities; the bound is per retained policy clone.
+        current_policy_conservative_allocation_charge()
     }
 }
 
@@ -503,9 +512,8 @@ mod stream_key_tests {
         InstrumentId, ProviderChannel, ProviderProduct, SourceId, SourceIdentifier, VenueId,
     };
 
-    use super::{
-        CurrentProviderObservation, CurrentStreamKey, current_routed_batch_retained_bytes,
-    };
+    use super::{CurrentBatchKey, CurrentProviderObservation, CurrentStreamKey,
+        current_routed_batch_retained_bytes};
 
     fn key(
         source: &str,
@@ -544,12 +552,36 @@ mod stream_key_tests {
     fn routed_batch_charges_shared_authority_and_frame_allocations_once()
     -> Result<(), Box<dyn std::error::Error>> {
         const PER_OBSERVATION_DYNAMIC: usize = 137;
-        let one = current_routed_batch_retained_bytes(1, PER_OBSERVATION_DYNAMIC)?;
-        let two = current_routed_batch_retained_bytes(2, PER_OBSERVATION_DYNAMIC * 2)?;
+        const SECOND_OBSERVATION_DYNAMIC: usize = 211;
+        let one = current_routed_batch_retained_bytes(53, 1, PER_OBSERVATION_DYNAMIC)?;
+        let two = current_routed_batch_retained_bytes(
+            53,
+            2,
+            PER_OBSERVATION_DYNAMIC + SECOND_OBSERVATION_DYNAMIC,
+        )?;
 
         assert_eq!(
             two.checked_sub(one),
-            Some(size_of::<CurrentProviderObservation>() + PER_OBSERVATION_DYNAMIC)
+            Some(size_of::<CurrentProviderObservation>() + SECOND_OBSERVATION_DYNAMIC)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn batch_key_charges_retained_venue_capacity() -> Result<(), Box<dyn std::error::Error>> {
+        let mut venue = String::with_capacity(VenueId::MAX_LENGTH);
+        venue.push('x');
+        let key = CurrentBatchKey {
+            venue: VenueId::try_from(venue)?,
+            instrument: "018f0000-0000-7000-8000-000000000001".parse()?,
+        };
+
+        assert!(key.dynamic_retained_bytes() >= VenueId::MAX_LENGTH);
+        let without_key = current_routed_batch_retained_bytes(0, 1, 0)?;
+        let with_key = current_routed_batch_retained_bytes(key.dynamic_retained_bytes(), 1, 0)?;
+        assert_eq!(
+            with_key.checked_sub(without_key),
+            Some(key.dynamic_retained_bytes())
         );
         Ok(())
     }

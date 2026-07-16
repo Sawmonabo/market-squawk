@@ -106,7 +106,7 @@ impl ProviderNormalizedObservation {
         &self.payload
     }
 
-    fn deep_retained_bytes(&self) -> Result<usize, DecodeError> {
+    pub(crate) fn dynamic_retained_bytes(&self) -> Result<usize, DecodeError> {
         let timestamp_rule = match &self.timestamp {
             ProviderTimestampEvidence::AuthoritativelyAbsent(rule) => {
                 rule.provider_rule().retained_bytes()
@@ -148,11 +148,6 @@ impl ProviderNormalizedObservation {
         ])
     }
 
-    pub(crate) fn retained_bytes(&self) -> Result<usize, DecodeError> {
-        std::mem::size_of::<Self>()
-            .checked_add(self.deep_retained_bytes()?)
-            .ok_or(DecodeError::RetainedSizeOverflow)
-    }
 }
 
 /// Intrinsically bounded pre-state observations emitted by one synchronous decode call.
@@ -229,7 +224,7 @@ impl DecodedProviderBatch {
             self.observations
                 .as_slice()
                 .iter()
-                .map(ProviderNormalizedObservation::deep_retained_bytes)
+                .map(ProviderNormalizedObservation::dynamic_retained_bytes)
                 .collect::<Result<Vec<_>, _>>()?,
         )?;
         shallow

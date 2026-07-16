@@ -417,20 +417,24 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
         let batches = groups
             .into_iter()
             .map(|(key, observations)| {
-                let policy_allocations =
+                let observation_unique_allocations =
                     observations.iter().try_fold(0_usize, |total, observation| {
                         let provider = observation
                             .observation
-                            .retained_bytes()
+                            .dynamic_retained_bytes()
                             .map_err(|_| RegistryError::RetainedSizeOverflow)?;
                         total
                             .checked_add(observation.policy.deep_allocation_charge()?)
+                            .and_then(|bytes| {
+                                bytes.checked_add(observation.key.dynamic_retained_bytes())
+                            })
                             .and_then(|bytes| bytes.checked_add(provider))
                             .ok_or(RegistryError::RetainedSizeOverflow)
                     })?;
                 let retained_bytes = current_routed_batch_retained_bytes(
+                    key.dynamic_retained_bytes(),
                     observations.len(),
-                    policy_allocations,
+                    observation_unique_allocations,
                 )?;
                 let observations = observations.into_boxed_slice();
                 let authority = observations
