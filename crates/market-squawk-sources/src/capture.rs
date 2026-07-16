@@ -5,7 +5,10 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
-use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, Timestamp};
+use market_squawk_domain::{
+    CaptureAuthorityError, CaptureAuthorityIdentity, CaptureIntegrityState, DigestAlgorithm,
+    EvidenceDigest, Timestamp,
+};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -88,6 +91,27 @@ impl CaptureGenerationCapabilities {
         CaptureDegradationCapability,
     ) {
         (self.initialization, self.admission, self.degradation)
+    }
+}
+
+impl market_squawk_domain::CaptureAuthorityBundle for CaptureGenerationCapabilities {
+    type Frame = RawMarketFrame;
+    type Receipt = CaptureAdmissionReceipt;
+    type Initializer = CaptureInitializationControl;
+    type Admission = CaptureAdmissionIssuer;
+    type Degradation = CaptureDegradationCapability;
+
+    fn identity(&self) -> CaptureAuthorityIdentity {
+        CaptureAuthorityIdentity::new(
+            self.binding.source_id().clone(),
+            self.binding.metadata_revision().clone(),
+            self.binding.session_id().as_source_identifier().clone(),
+            self.binding.connection_generation(),
+        )
+    }
+
+    fn into_parts(self) -> (Self::Initializer, Self::Admission, Self::Degradation) {
+        CaptureGenerationCapabilities::into_parts(self)
     }
 }
 
@@ -192,6 +216,41 @@ impl CaptureAdmissionIssuer {
     }
 }
 
+impl market_squawk_domain::CaptureAdmission<RawMarketFrame> for CaptureAdmissionIssuer {
+    type Receipt = CaptureAdmissionReceipt;
+
+    fn preflight(&self, frame: &RawMarketFrame) -> Result<(), CaptureAuthorityError> {
+        CaptureAdmissionIssuer::preflight(self, frame).map_err(|error| self.to_domain_error(error))
+    }
+
+    fn issue_after_enqueue(
+        &mut self,
+        frame: &RawMarketFrame,
+    ) -> Result<Self::Receipt, CaptureAuthorityError> {
+        CaptureAdmissionIssuer::issue_after_enqueue(self, frame)
+            .map_err(|error| self.to_domain_error(error))
+    }
+
+    fn validate_active(&self, frame: &RawMarketFrame) -> Result<(), CaptureAuthorityError> {
+        CaptureAdmissionIssuer::validate_active(self, frame)
+            .map_err(|error| self.to_domain_error(error))
+    }
+}
+
+impl CaptureAdmissionIssuer {
+    fn to_domain_error(&self, error: CaptureAdmissionError) -> CaptureAuthorityError {
+        match error {
+            CaptureAdmissionError::BindingMismatch => CaptureAuthorityError::FrameBindingMismatch,
+            CaptureAdmissionError::Incomplete => CaptureAuthorityError::GenerationIncomplete,
+            CaptureAdmissionError::NotHealthy => match self.lease.health() {
+                CaptureGenerationHealth::Initializing => CaptureAuthorityError::GenerationNotReady,
+                CaptureGenerationHealth::Healthy => CaptureAuthorityError::FrameRejected,
+                CaptureGenerationHealth::Incomplete => CaptureAuthorityError::GenerationIncomplete,
+            },
+        }
+    }
+}
+
 /// Non-clone supervisor-only capture initialization capability.
 ///
 /// This handle is never passed to raw-frame sinks or source callbacks.
@@ -228,6 +287,17 @@ impl CaptureInitializationControl {
     }
 }
 
+impl market_squawk_domain::CaptureInitializer for CaptureInitializationControl {
+    fn mark_healthy(&mut self) -> Result<(), CaptureAuthorityError> {
+        CaptureInitializationControl::mark_healthy(self).map_err(|error| match error {
+            CaptureAdmissionError::Incomplete | CaptureAdmissionError::NotHealthy => {
+                CaptureAuthorityError::GenerationIncomplete
+            }
+            CaptureAdmissionError::BindingMismatch => CaptureAuthorityError::FrameBindingMismatch,
+        })
+    }
+}
+
 /// Cloneable failure-only capability; it cannot initialize, promote, admit, or rotate capture.
 #[derive(Clone, Debug)]
 pub struct CaptureDegradationCapability {
@@ -242,6 +312,20 @@ impl CaptureDegradationCapability {
     /// Irreversibly marks this exact generation incomplete.
     pub fn mark_incomplete(&self) {
         self.lease.mark_incomplete();
+    }
+}
+
+impl market_squawk_domain::CaptureDegradation for CaptureDegradationCapability {
+    fn mark_incomplete(&self) {
+        CaptureDegradationCapability::mark_incomplete(self);
+    }
+
+    fn integrity(&self) -> CaptureIntegrityState {
+        if self.lease.is_healthy() {
+            CaptureIntegrityState::Healthy
+        } else {
+            CaptureIntegrityState::Incomplete
+        }
     }
 }
 

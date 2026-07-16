@@ -9,10 +9,11 @@ use market_squawk::{
     source_supervisor::SourceSupervisor,
 };
 use market_squawk_domain::{
-    CaptureIntegrityState, ConnectionGeneration, MetadataRevision, SourceId, SourceIdentifier,
+    CaptureAuthorityIdentity, CaptureIntegrityState, ConnectionGeneration, MetadataRevision,
+    SourceId, SourceIdentifier,
 };
 use market_squawk_platform::{
-    CaptureAdmissionReceipt, CaptureGenerationKey, CaptureWriterHandle, CaptureWriterPolicy,
+    CaptureWriterHandle, CaptureWriterPolicy, DiagnosticCaptureBundle, DiagnosticCaptureReceipt,
     MemoryCaptureSink, RawCaptureControl, RawCapturePublisher, raw_capture_channel,
     spawn_capture_writer,
 };
@@ -22,7 +23,7 @@ use uuid::Uuid;
 #[derive(Debug)]
 struct ReconnectOnceSource {
     sessions: usize,
-    receipts: Arc<std::sync::Mutex<Vec<CaptureAdmissionReceipt>>>,
+    receipts: Arc<std::sync::Mutex<Vec<DiagnosticCaptureReceipt>>>,
 }
 
 #[async_trait]
@@ -54,35 +55,45 @@ impl MarketSource for ReconnectOnceSource {
     }
 }
 
-fn initial_key() -> Result<CaptureGenerationKey, Box<dyn std::error::Error>> {
-    Ok(CaptureGenerationKey::new(
-        SourceId::try_from("source-a")?,
-        MetadataRevision::new(SourceIdentifier::try_from("revision-a")?),
-        SourceIdentifier::try_from("session-a")?,
-        ConnectionGeneration::new(1)?,
+fn initial_identity() -> Result<(CaptureAuthorityIdentity, Uuid), Box<dyn std::error::Error>> {
+    Ok((
+        CaptureAuthorityIdentity::new(
+            SourceId::try_from("source-a")?,
+            MetadataRevision::new(SourceIdentifier::try_from("revision-a")?),
+            SourceIdentifier::try_from("session-a")?,
+            ConnectionGeneration::new(1)?,
+        ),
         Uuid::new_v4(),
     ))
 }
 
-fn activated_capture() -> Result<
-    (
-        RawCapturePublisher,
-        RawCaptureControl,
-        CaptureWriterHandle,
-        CaptureGenerationKey,
-    ),
-    Box<dyn std::error::Error>,
-> {
-    let key = initial_key()?;
+#[derive(Debug)]
+struct ActivatedCapture {
+    publisher: RawCapturePublisher<DiagnosticCaptureBundle>,
+    control: RawCaptureControl<DiagnosticCaptureBundle>,
+    writer_handle: CaptureWriterHandle<DiagnosticCaptureBundle>,
+    identity: CaptureAuthorityIdentity,
+    connection_id: Uuid,
+}
+
+fn activated_capture() -> Result<ActivatedCapture, Box<dyn std::error::Error>> {
+    let (identity, connection_id) = initial_identity()?;
     let capacity = NonZeroUsize::new(8).ok_or("invalid fixed test capacity")?;
-    let (publisher, mut control, writer) = raw_capture_channel(capacity, key.clone());
+    let (publisher, mut control, writer) =
+        raw_capture_channel(capacity, DiagnosticCaptureBundle::new(identity.clone()));
     let writer_handle = spawn_capture_writer(
         writer,
         MemoryCaptureSink::default(),
         CaptureWriterPolicy::default(),
     )?;
-    control.activate_initial(&key)?;
-    Ok((publisher, control, writer_handle, key))
+    control.activate_initial()?;
+    Ok(ActivatedCapture {
+        publisher,
+        control,
+        writer_handle,
+        identity,
+        connection_id,
+    })
 }
 
 #[derive(Debug)]
@@ -133,21 +144,23 @@ impl MarketSource for HangingSource {
 #[tokio::test]
 async fn only_the_supervisor_rotates_after_a_typed_reconnect_outcome()
 -> Result<(), Box<dyn std::error::Error>> {
-    let key = initial_key()?;
+    let (identity, connection_id) = initial_identity()?;
     let capacity = NonZeroUsize::new(8).ok_or("invalid fixed test capacity")?;
-    let (publisher, mut control, writer) = raw_capture_channel(capacity, key.clone());
+    let (publisher, mut control, writer) =
+        raw_capture_channel(capacity, DiagnosticCaptureBundle::new(identity.clone()));
     let capture_handle = spawn_capture_writer(
         writer,
         MemoryCaptureSink::default(),
         CaptureWriterPolicy::default(),
     )?;
-    control.activate_initial(&key)?;
+    control.activate_initial()?;
     let receipts = Arc::new(std::sync::Mutex::new(Vec::new()));
     let source: Box<dyn MarketSource> = Box::new(ReconnectOnceSource {
         sessions: 0,
         receipts: Arc::clone(&receipts),
     });
-    let supervisor = SourceSupervisor::new(publisher.clone(), control, key.clone());
+    let supervisor =
+        SourceSupervisor::new(publisher.clone(), control, identity.clone(), connection_id);
     let (events, _event_receiver) = mpsc::channel(8);
     let (_cancel_sender, cancel) = watch::channel(false);
 
@@ -157,17 +170,16 @@ async fn only_the_supervisor_rotates_after_a_typed_reconnect_outcome()
     )
     .await??;
 
-    let current = publisher.key()?;
-    assert_eq!(current.generation().get(), 2);
-    assert_ne!(current.connection_id(), key.connection_id());
+    let current = publisher.identity();
+    assert_eq!(current.connection_generation().get(), 2);
     {
         let receipts = match receipts.lock() {
             Ok(receipts) => receipts,
             Err(poisoned) => poisoned.into_inner(),
         };
         assert_eq!(receipts.len(), 2);
-        assert!(!receipts[0].allocation_is_healthy());
-        assert!(!receipts[1].allocation_is_healthy());
+        assert!(!receipts[0].generation_is_complete());
+        assert!(!receipts[1].generation_is_complete());
     }
     assert_eq!(publisher.integrity(), CaptureIntegrityState::Incomplete);
     let outcome = capture_handle.shutdown(Duration::from_secs(1)).await;
@@ -179,8 +191,14 @@ async fn only_the_supervisor_rotates_after_a_typed_reconnect_outcome()
 async fn normal_and_cancelled_source_completion_invalidate_the_active_allocation()
 -> Result<(), Box<dyn std::error::Error>> {
     for outcome in [SourceRunOutcome::Completed, SourceRunOutcome::Cancelled] {
-        let (publisher, control, writer_handle, key) = activated_capture()?;
-        let supervisor = SourceSupervisor::new(publisher.clone(), control, key);
+        let ActivatedCapture {
+            publisher,
+            control,
+            writer_handle,
+            identity,
+            connection_id,
+        } = activated_capture()?;
+        let supervisor = SourceSupervisor::new(publisher.clone(), control, identity, connection_id);
         let (events, _event_receiver) = mpsc::channel(1);
         let (_cancel_sender, cancel) = watch::channel(false);
 
@@ -203,8 +221,14 @@ async fn normal_and_cancelled_source_completion_invalidate_the_active_allocation
 #[tokio::test]
 async fn source_error_invalidates_the_active_allocation() -> Result<(), Box<dyn std::error::Error>>
 {
-    let (publisher, control, writer_handle, key) = activated_capture()?;
-    let supervisor = SourceSupervisor::new(publisher.clone(), control, key);
+    let ActivatedCapture {
+        publisher,
+        control,
+        writer_handle,
+        identity,
+        connection_id,
+    } = activated_capture()?;
+    let supervisor = SourceSupervisor::new(publisher.clone(), control, identity, connection_id);
     let (events, _event_receiver) = mpsc::channel(1);
     let (_cancel_sender, cancel) = watch::channel(false);
 
@@ -225,8 +249,14 @@ async fn source_error_invalidates_the_active_allocation() -> Result<(), Box<dyn 
 #[tokio::test]
 async fn aborting_the_supervisor_invalidates_the_active_allocation()
 -> Result<(), Box<dyn std::error::Error>> {
-    let (publisher, control, writer_handle, key) = activated_capture()?;
-    let supervisor = SourceSupervisor::new(publisher.clone(), control, key);
+    let ActivatedCapture {
+        publisher,
+        control,
+        writer_handle,
+        identity,
+        connection_id,
+    } = activated_capture()?;
+    let supervisor = SourceSupervisor::new(publisher.clone(), control, identity, connection_id);
     let (events, _event_receiver) = mpsc::channel(1);
     let (_cancel_sender, cancel) = watch::channel(false);
     let task = tokio::spawn(supervisor.run(Box::new(HangingSource), events, cancel));

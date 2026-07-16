@@ -2,8 +2,9 @@ mod common;
 
 use bytes::Bytes;
 use market_squawk_domain::{
-    CaptureIntegrityState, ConnectionGeneration, CoverageConsolidation, CoverageDelay,
-    DeliveryEvidence, ProviderChannel, ProviderProduct, StreamIntegrityState, Timestamp,
+    CaptureAuthorityBundle, CaptureDegradation, CaptureIntegrityState, ConnectionGeneration,
+    CoverageConsolidation, CoverageDelay, DeliveryEvidence, ProviderChannel, ProviderProduct,
+    RawCaptureFrameView, StreamIntegrityState, Timestamp,
 };
 use market_squawk_sources::{
     AuthoritativeSourceRegistry, AuthorizationHealth, BudgetDecision, BudgetHealth,
@@ -31,6 +32,71 @@ assert_not_impl_any!(market_squawk_sources::CurrentHealthReporter: Clone, Sync, 
 assert_not_impl_any!(market_squawk_sources::CurrentHealthUpdate: Clone, serde::Serialize, serde::de::DeserializeOwned);
 assert_not_impl_any!(market_squawk_sources::RawFrameFactory: Clone, Sync, serde::Serialize, serde::de::DeserializeOwned);
 assert_not_impl_any!(market_squawk_sources::CurrentCoveragePolicy: serde::Serialize, serde::de::DeserializeOwned);
+assert_impl_all!(market_squawk_sources::RawMarketFrame: RawCaptureFrameView);
+assert_impl_all!(market_squawk_sources::CaptureGenerationCapabilities: CaptureAuthorityBundle);
+
+#[test]
+fn domain_capture_bundle_retains_exact_registry_identity_and_one_way_health() -> TestResult {
+    let mut registry = AuthoritativeSourceRegistry::try_new()?;
+    let registered = registry.register(
+        direct_metadata("source-a", "revision-a", 0, None)?,
+        Timestamp::from_unix_nanos(1),
+    )?;
+    let session = registry.begin_session(
+        &registered,
+        SessionId::new(source_identifier("session-a")?),
+        ConnectionGeneration::new(1)?,
+        Timestamp::from_unix_nanos(1),
+    )?;
+    let bundle = registry.take_capture_generation_capabilities(&session)?;
+    let identity = bundle.identity();
+    assert_eq!(identity.source_id().as_str(), "source-a");
+    assert_eq!(
+        identity.metadata_revision().as_source_identifier().as_str(),
+        "revision-a"
+    );
+    assert_eq!(identity.session_identifier().as_str(), "session-a");
+    assert_eq!(identity.connection_generation().get(), 1);
+
+    let (mut initializer, _admission, degradation) = bundle.into_parts();
+    assert_eq!(degradation.integrity(), CaptureIntegrityState::Incomplete);
+    market_squawk_domain::CaptureInitializer::mark_healthy(&mut initializer)?;
+    assert_eq!(degradation.integrity(), CaptureIntegrityState::Healthy);
+    degradation.mark_incomplete();
+    assert_eq!(degradation.integrity(), CaptureIntegrityState::Incomplete);
+    Ok(())
+}
+
+#[test]
+fn raw_frame_view_reports_exact_generation_local_identity_and_deep_bound() -> TestResult {
+    let mut registry = AuthoritativeSourceRegistry::try_new()?;
+    let registered = registry.register(
+        direct_metadata("source-a", "revision-a", 0, None)?,
+        Timestamp::from_unix_nanos(1),
+    )?;
+    let session = registry.begin_session(
+        &registered,
+        SessionId::new(source_identifier("session-a")?),
+        ConnectionGeneration::new(1)?,
+        Timestamp::from_unix_nanos(1),
+    )?;
+    let mut factory = registry.take_raw_frame_factory(&session)?;
+    let frame = factory.try_frame(
+        Timestamp::from_unix_nanos(2),
+        TransportFrameKind::Binary,
+        Bytes::from_static(b"frame"),
+    )?;
+
+    assert_eq!(RawCaptureFrameView::source_id(&frame).as_str(), "source-a");
+    assert_eq!(
+        RawCaptureFrameView::session_identifier(&frame).as_str(),
+        "session-a"
+    );
+    assert_eq!(RawCaptureFrameView::frame_ordinal(&frame).get(), 1);
+    assert_eq!(RawCaptureFrameView::payload(&frame), b"frame");
+    assert!(RawCaptureFrameView::retained_bytes(&frame) >= frame.retained_payload_bytes());
+    Ok(())
+}
 
 #[test]
 fn handles_reject_registry_transplant_and_session_resurrection() -> TestResult {

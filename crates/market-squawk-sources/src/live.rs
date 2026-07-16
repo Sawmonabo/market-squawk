@@ -59,6 +59,11 @@ impl FrameId {
     pub const fn get(self) -> u64 {
         self.0.get()
     }
+
+    /// Returns the typed nonzero ordinal for dependency-neutral capture composition.
+    pub const fn as_nonzero(self) -> NonZeroU64 {
+        self.0
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -215,6 +220,55 @@ impl RawMarketFrame {
     /// Returns the shared immutable session binding.
     pub const fn binding(&self) -> &FrameSessionBinding {
         &self.binding
+    }
+}
+
+impl market_squawk_domain::RawCaptureFrameView for RawMarketFrame {
+    fn source_id(&self) -> &SourceId {
+        self.source_id()
+    }
+
+    fn metadata_revision(&self) -> &MetadataRevision {
+        self.metadata_revision()
+    }
+
+    fn session_identifier(&self) -> &SourceIdentifier {
+        self.session_id().as_source_identifier()
+    }
+
+    fn connection_generation(&self) -> ConnectionGeneration {
+        self.connection_generation()
+    }
+
+    fn frame_ordinal(&self) -> NonZeroU64 {
+        self.frame_id().as_nonzero()
+    }
+
+    fn received_at(&self) -> Timestamp {
+        self.received_at()
+    }
+
+    fn payload(&self) -> &[u8] {
+        self.payload()
+    }
+
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .checked_add(std::mem::size_of::<FrameSessionIdentity>())
+            .and_then(|bytes| bytes.checked_add(self.source_id().as_str().len()))
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    self.metadata_revision()
+                        .as_source_identifier()
+                        .as_str()
+                        .len(),
+                )
+            })
+            .and_then(|bytes| {
+                bytes.checked_add(self.session_id().as_source_identifier().as_str().len())
+            })
+            .and_then(|bytes| bytes.checked_add(self.retained_payload_bytes()))
+            .unwrap_or(usize::MAX)
     }
 }
 

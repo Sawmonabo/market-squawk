@@ -1,21 +1,20 @@
 //! Supervised capture-sink storage outside the live event-to-action path.
 
-use std::{
-    fmt,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-        mpsc,
-    },
-    time::Duration,
-};
+use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
+use std::time::Duration;
 
-use crate::{JournalError, JournalWriter};
+use bytes::Bytes;
+use market_squawk_domain::{CaptureAuthorityBundle, RawCaptureFrameView};
 use thiserror::Error;
+use uuid::Uuid;
+
+use crate::{JournalError, JournalWriter, RawCaptureRecord, RawCaptureRecordError};
 
 use super::{
     CaptureHealthReason, CaptureMessage, CaptureState, CaptureWriterPolicy, CapturedRawRecord,
-    RawCaptureWriter, WRITER_NOT_STARTED, WRITER_RUNNING, WRITER_STOPPED,
+    GenerationCaptureState, RawCaptureWriter, WRITER_NOT_STARTED, WRITER_RUNNING,
 };
 
 /// Typed storage failure returned to the supervised capture writer.
@@ -48,13 +47,13 @@ pub enum CaptureStorageErrorClass {
     Corruption,
     /// A configured or physical capacity bound was exceeded.
     Capacity,
-    /// An unclassified storage failure occurred; no free-form value is retained.
+    /// An unclassified storage failure occurred.
     Other,
 }
 
-/// Synchronous storage contract consumed only by the supervised background writer.
+/// Synchronous diagnostic storage contract consumed only by the background writer.
 pub trait CaptureSink: fmt::Debug + Send + 'static {
-    /// Appends one validated compatibility record.
+    /// Appends one bounded diagnostic record.
     fn append(&mut self, record: &CapturedRawRecord) -> Result<(), CaptureSinkError>;
     /// Flushes buffered records durably according to the sink contract.
     fn flush(&mut self) -> Result<(), CaptureSinkError>;
@@ -62,8 +61,6 @@ pub trait CaptureSink: fmt::Debug + Send + 'static {
 
 impl CaptureSink for JournalWriter {
     fn append(&mut self, captured: &CapturedRawRecord) -> Result<(), CaptureSinkError> {
-        // MSJ1 is a committed raw diagnostic wire. The exact live key stays out of band, and the
-        // journal API explicitly reports that replay authority is unavailable by format.
         self.append(captured.record()).map_err(Into::into)
     }
 
@@ -134,18 +131,21 @@ pub struct CaptureWriterSpawnError {
 
 /// Supervised dedicated writer-thread handle.
 #[derive(Debug)]
-pub struct CaptureWriterHandle {
+pub struct CaptureWriterHandle<B: CaptureAuthorityBundle> {
     thread: Option<std::thread::JoinHandle<()>>,
     completion: tokio::sync::oneshot::Receiver<CaptureWriterOutcome>,
-    wake_sender: Option<mpsc::SyncSender<CaptureMessage>>,
+    wake_sender: Option<mpsc::SyncSender<CaptureMessage<B>>>,
     shutdown_requested: Arc<AtomicBool>,
     shutdown_deadline: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
-    receiver: Arc<std::sync::Mutex<mpsc::Receiver<CaptureMessage>>>,
-    state: Arc<CaptureState>,
+    receiver: Arc<std::sync::Mutex<mpsc::Receiver<CaptureMessage<B>>>>,
+    state: Arc<CaptureState<B>>,
     completed: bool,
 }
 
-fn writer_failed(state: &CaptureState, records_written: u64) -> CaptureWriterOutcome {
+fn writer_failed<B: CaptureAuthorityBundle>(
+    state: &CaptureState<B>,
+    records_written: u64,
+) -> CaptureWriterOutcome {
     state.mark_writer_failed();
     CaptureWriterOutcome::Incomplete {
         records_written,
@@ -153,33 +153,89 @@ fn writer_failed(state: &CaptureState, records_written: u64) -> CaptureWriterOut
     }
 }
 
-fn stop_accepting(state: &CaptureState) {
-    let active = state.active.load_full();
-    active.accepting.store(false, Ordering::Release);
-    state
-        .writer_lifecycle
-        .store(WRITER_STOPPED, Ordering::Release);
+fn stop_accepting<B: CaptureAuthorityBundle>(state: &CaptureState<B>) {
+    state.stop_writer(CaptureHealthReason::WriterStopped);
 }
 
-fn append_captured<S: CaptureSink>(
+fn diagnostic_uuid_inputs<F: RawCaptureFrameView>(frame: &F) -> (Uuid, Uuid) {
+    let mut generation = Vec::with_capacity(256);
+    for field in [
+        frame.source_id().as_str().as_bytes(),
+        frame
+            .metadata_revision()
+            .as_source_identifier()
+            .as_str()
+            .as_bytes(),
+        frame.session_identifier().as_str().as_bytes(),
+    ] {
+        generation.extend_from_slice(&u64::try_from(field.len()).unwrap_or(u64::MAX).to_be_bytes());
+        generation.extend_from_slice(field);
+    }
+    generation.extend_from_slice(&frame.connection_generation().get().to_be_bytes());
+    let connection_id = Uuid::new_v5(&Uuid::NAMESPACE_OID, &generation);
+    let mut event = Vec::with_capacity(24);
+    event.extend_from_slice(connection_id.as_bytes());
+    event.extend_from_slice(&frame.frame_ordinal().get().to_be_bytes());
+    (connection_id, Uuid::new_v5(&Uuid::NAMESPACE_OID, &event))
+}
+
+fn diagnostic_record<B: CaptureAuthorityBundle>(
+    allocation: &Arc<GenerationCaptureState<B>>,
+    frame: &B::Frame,
+) -> Result<CapturedRawRecord, RawCaptureRecordError> {
+    let (connection_id, event_id) = diagnostic_uuid_inputs(frame);
+    let nanos = frame.received_at().unix_nanos();
+    let seconds = nanos.div_euclid(1_000_000_000);
+    let subsecond = u32::try_from(nanos.rem_euclid(1_000_000_000))
+        .map_err(|_error| RawCaptureRecordError::InvalidReceivedAt)?;
+    let received_at = chrono::DateTime::from_timestamp(seconds, subsecond)
+        .ok_or(RawCaptureRecordError::InvalidReceivedAt)?;
+    let record = RawCaptureRecord::try_new_live(
+        event_id,
+        Arc::from(frame.source_id().as_str()),
+        connection_id,
+        None,
+        None,
+        received_at,
+        Bytes::copy_from_slice(frame.payload()),
+    )?;
+    Ok(CapturedRawRecord::new(
+        Arc::clone(&allocation.identity),
+        frame.frame_ordinal(),
+        record,
+    ))
+}
+
+fn append_frame<B: CaptureAuthorityBundle, S: CaptureSink>(
     sink: &mut S,
-    captured: &CapturedRawRecord,
-    state: &CaptureState,
+    allocation: &Arc<GenerationCaptureState<B>>,
+    frame: &B::Frame,
+    state: &CaptureState<B>,
     records_written: &mut u64,
     since_flush: &mut usize,
     policy: CaptureWriterPolicy,
 ) -> Result<(), CaptureWriterOutcome> {
-    let append_result = sink.append(captured);
-    if append_result.is_err() {
+    let captured = diagnostic_record(allocation, frame).map_err(|_error| {
+        state.mark_incomplete_for_generation(allocation, CaptureHealthReason::DiagnosticConversion);
+        state.mark_writer_failed();
+        CaptureWriterOutcome::Incomplete {
+            records_written: *records_written,
+            reason: CaptureHealthReason::DiagnosticConversion,
+        }
+    })?;
+    if sink.append(&captured).is_err() {
+        state.mark_incomplete_for_generation(allocation, CaptureHealthReason::WriterFailed);
         return Err(writer_failed(state, *records_written));
     }
     let Some(next) = state.increment_written(*records_written) else {
+        state.mark_incomplete_for_generation(allocation, CaptureHealthReason::WriterFailed);
         return Err(writer_failed(state, *records_written));
     };
     *records_written = next;
     *since_flush = since_flush.saturating_add(1);
     if *since_flush >= policy.flush_every_records.get() {
         if sink.flush().is_err() {
+            state.mark_incomplete_for_generation(allocation, CaptureHealthReason::WriterFailed);
             return Err(writer_failed(state, *records_written));
         }
         *since_flush = 0;
@@ -187,7 +243,9 @@ fn append_captured<S: CaptureSink>(
     Ok(())
 }
 
-fn try_receive(writer: &RawCaptureWriter) -> Result<CaptureMessage, mpsc::TryRecvError> {
+fn try_receive<B: CaptureAuthorityBundle>(
+    writer: &RawCaptureWriter<B>,
+) -> Result<CaptureMessage<B>, mpsc::TryRecvError> {
     let receiver = match writer.receiver.lock() {
         Ok(receiver) => receiver,
         Err(poisoned) => poisoned.into_inner(),
@@ -195,10 +253,10 @@ fn try_receive(writer: &RawCaptureWriter) -> Result<CaptureMessage, mpsc::TryRec
     receiver.try_recv()
 }
 
-fn receive_timeout(
-    writer: &RawCaptureWriter,
+fn receive_timeout<B: CaptureAuthorityBundle>(
+    writer: &RawCaptureWriter<B>,
     timeout: Duration,
-) -> Result<CaptureMessage, mpsc::RecvTimeoutError> {
+) -> Result<CaptureMessage<B>, mpsc::RecvTimeoutError> {
     let receiver = match writer.receiver.lock() {
         Ok(receiver) => receiver,
         Err(poisoned) => poisoned.into_inner(),
@@ -206,7 +264,9 @@ fn receive_timeout(
     receiver.recv_timeout(timeout)
 }
 
-fn drain_pending_reservations(receiver: &std::sync::Mutex<mpsc::Receiver<CaptureMessage>>) {
+fn drain_pending<B: CaptureAuthorityBundle>(
+    receiver: &std::sync::Mutex<mpsc::Receiver<CaptureMessage<B>>>,
+) {
     let receiver = match receiver.lock() {
         Ok(receiver) => receiver,
         Err(poisoned) => poisoned.into_inner(),
@@ -214,7 +274,9 @@ fn drain_pending_reservations(receiver: &std::sync::Mutex<mpsc::Receiver<Capture
     while receiver.try_recv().is_ok() {}
 }
 
-fn try_drain_pending_reservations(receiver: &std::sync::Mutex<mpsc::Receiver<CaptureMessage>>) {
+fn try_drain_pending<B: CaptureAuthorityBundle>(
+    receiver: &std::sync::Mutex<mpsc::Receiver<CaptureMessage<B>>>,
+) {
     let receiver = match receiver.try_lock() {
         Ok(receiver) => receiver,
         Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
@@ -223,10 +285,57 @@ fn try_drain_pending_reservations(receiver: &std::sync::Mutex<mpsc::Receiver<Cap
     while receiver.try_recv().is_ok() {}
 }
 
-fn drain_and_flush<S: CaptureSink>(
-    writer: &RawCaptureWriter,
+fn process_message<B: CaptureAuthorityBundle, S: CaptureSink>(
+    message: CaptureMessage<B>,
     sink: &mut S,
-    state: &CaptureState,
+    state: &CaptureState<B>,
+    records_written: &mut u64,
+    since_flush: &mut usize,
+    policy: CaptureWriterPolicy,
+) -> Result<(), CaptureWriterOutcome> {
+    match message {
+        CaptureMessage::Record {
+            allocation,
+            frame,
+            reservation,
+        } => {
+            // The bounded-queue permit covers work awaiting the single writer. Once dequeued, the
+            // writer owns the frame outside the queue budget; release before potentially blocking
+            // sink I/O so handle-drop and deadline-detach can reclaim every queued permit.
+            drop(reservation);
+            append_frame(
+                sink,
+                &allocation,
+                &frame,
+                state,
+                records_written,
+                since_flush,
+                policy,
+            )
+        }
+        CaptureMessage::Wake => Ok(()),
+    }
+}
+
+fn shutdown_deadline_reached(
+    shutdown_deadline: &std::sync::Mutex<Option<std::time::Instant>>,
+) -> bool {
+    let deadline = match shutdown_deadline.lock() {
+        Ok(deadline) => *deadline,
+        Err(poisoned) => *poisoned.into_inner(),
+    };
+    deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
+}
+
+fn deadline_after(duration: Duration) -> std::time::Instant {
+    let now = std::time::Instant::now();
+    now.checked_add(duration).unwrap_or(now)
+}
+
+fn drain_and_flush<B: CaptureAuthorityBundle, S: CaptureSink>(
+    writer: &RawCaptureWriter<B>,
+    sink: &mut S,
+    state: &CaptureState<B>,
     records_written: &mut u64,
     since_flush: &mut usize,
     policy: CaptureWriterPolicy,
@@ -241,18 +350,13 @@ fn drain_and_flush<S: CaptureSink>(
             };
         }
         match try_receive(writer) {
-            Ok(CaptureMessage::Record {
-                captured,
-                reservation,
-            }) => {
-                drop(reservation);
-                let append_result =
-                    append_captured(sink, &captured, state, records_written, since_flush, policy);
-                if let Err(outcome) = append_result {
+            Ok(message) => {
+                if let Err(outcome) =
+                    process_message(message, sink, state, records_written, since_flush, policy)
+                {
                     return outcome;
                 }
             }
-            Ok(CaptureMessage::Wake) => {}
             Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
         }
     }
@@ -272,26 +376,8 @@ fn drain_and_flush<S: CaptureSink>(
     }
 }
 
-fn shutdown_deadline_reached(
-    shutdown_deadline: &std::sync::Mutex<Option<std::time::Instant>>,
-) -> bool {
-    let deadline = match shutdown_deadline.lock() {
-        Ok(deadline) => *deadline,
-        Err(poisoned) => *poisoned.into_inner(),
-    };
-    deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
-}
-
-fn deadline_after(duration: Duration) -> std::time::Instant {
-    let now = std::time::Instant::now();
-    match now.checked_add(duration) {
-        Some(deadline) => deadline,
-        None => now,
-    }
-}
-
-fn run_capture_writer<S: CaptureSink>(
-    writer: RawCaptureWriter,
+fn run_capture_writer<B: CaptureAuthorityBundle, S: CaptureSink>(
+    writer: RawCaptureWriter<B>,
     mut sink: S,
     policy: CaptureWriterPolicy,
     shutdown_requested: &AtomicBool,
@@ -316,24 +402,18 @@ fn run_capture_writer<S: CaptureSink>(
         }
         let wait_duration = next_flush_at.saturating_duration_since(std::time::Instant::now());
         match receive_timeout(&writer, wait_duration) {
-            Ok(CaptureMessage::Record {
-                captured,
-                reservation,
-            }) => {
-                drop(reservation);
-                let append_result = append_captured(
+            Ok(message) => {
+                if let Err(outcome) = process_message(
+                    message,
                     &mut sink,
-                    &captured,
                     &state,
                     &mut records_written,
                     &mut since_flush,
                     policy,
-                );
-                if let Err(outcome) = append_result {
+                ) {
                     return outcome;
                 }
             }
-            Ok(CaptureMessage::Wake) => {}
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if since_flush > 0 && sink.flush().is_err() {
                     return writer_failed(&state, records_written);
@@ -365,14 +445,11 @@ fn run_capture_writer<S: CaptureSink>(
 }
 
 /// Starts one supervised dedicated capture writer thread.
-///
-/// Publication remains synchronous `try_send` with no per-frame acknowledgement. Filesystem
-/// writes and durable flushes never execute on a Tokio cooperative worker.
-pub fn spawn_capture_writer<S: CaptureSink>(
-    mut writer: RawCaptureWriter,
+pub fn spawn_capture_writer<B: CaptureAuthorityBundle, S: CaptureSink>(
+    mut writer: RawCaptureWriter<B>,
     sink: S,
     policy: CaptureWriterPolicy,
-) -> Result<CaptureWriterHandle, CaptureWriterSpawnError> {
+) -> Result<CaptureWriterHandle<B>, CaptureWriterSpawnError> {
     let state = Arc::clone(&writer.state);
     let receiver = Arc::clone(&writer.receiver);
     writer
@@ -421,7 +498,7 @@ pub fn spawn_capture_writer<S: CaptureSink>(
     })
 }
 
-impl CaptureWriterHandle {
+impl<B: CaptureAuthorityBundle> CaptureWriterHandle<B> {
     fn request_shutdown(&self) {
         self.shutdown_requested.store(true, Ordering::Release);
         if let Some(sender) = &self.wake_sender {
@@ -445,16 +522,12 @@ impl CaptureWriterHandle {
                 self.state.records_written.load(Ordering::Acquire),
             ),
         };
-        drain_pending_reservations(&self.receiver);
+        drain_pending(&self.receiver);
         self.completed = true;
         outcome
     }
 
     /// Requests cooperative drain and waits only to the explicit deadline.
-    ///
-    /// A blocking operating-system filesystem call cannot be force-cancelled safely. On deadline
-    /// expiry this returns Incomplete immediately, permanently fails capture health closed, and
-    /// detaches the already-stopping writer thread.
     pub async fn shutdown(mut self, deadline: Duration) -> CaptureShutdown {
         let absolute_deadline = deadline_after(deadline);
         match self.shutdown_deadline.lock() {
@@ -471,7 +544,7 @@ impl CaptureWriterHandle {
             ),
             Err(_elapsed) => {
                 stop_accepting(&self.state);
-                try_drain_pending_reservations(&self.receiver);
+                try_drain_pending(&self.receiver);
                 self.state
                     .mark_current_incomplete(CaptureHealthReason::ShutdownDeadline);
                 CaptureWriterOutcome::Incomplete {
@@ -485,55 +558,12 @@ impl CaptureWriterHandle {
     }
 }
 
-impl Drop for CaptureWriterHandle {
+impl<B: CaptureAuthorityBundle> Drop for CaptureWriterHandle<B> {
     fn drop(&mut self) {
         if !self.completed {
             self.request_shutdown();
-            try_drain_pending_reservations(&self.receiver);
+            try_drain_pending(&self.receiver);
             self.state.mark_writer_failed();
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::{num::NonZeroUsize, time::Duration};
-
-    use market_squawk_domain::{
-        ConnectionGeneration, MetadataRevision, SourceId, SourceIdentifier,
-    };
-    use uuid::Uuid;
-
-    use super::{CaptureWriterPolicy, MemoryCaptureSink, spawn_capture_writer};
-    use crate::{CaptureGenerationKey, raw_capture_channel};
-
-    #[test]
-    fn dropping_a_handle_never_waits_for_the_receiver_lock()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let key = CaptureGenerationKey::new(
-            SourceId::try_from("source-a")?,
-            MetadataRevision::new(SourceIdentifier::try_from("revision-a")?),
-            SourceIdentifier::try_from("session-a")?,
-            ConnectionGeneration::new(1)?,
-            Uuid::from_u128(1),
-        );
-        let (_publisher, _control, writer) = raw_capture_channel(NonZeroUsize::MIN, key);
-        let retained_receiver = std::sync::Arc::clone(&writer.receiver);
-        let receiver_guard = match retained_receiver.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let handle = spawn_capture_writer(
-            writer,
-            MemoryCaptureSink::default(),
-            CaptureWriterPolicy::default(),
-        )?;
-        let started = std::time::Instant::now();
-
-        drop(handle);
-
-        assert!(started.elapsed() < Duration::from_millis(50));
-        drop(receiver_guard);
-        Ok(())
     }
 }

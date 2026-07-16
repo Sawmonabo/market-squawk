@@ -9,10 +9,12 @@ use market_squawk::{
     source::{MarketSource, coinbase::CoinbaseSource, mock::MockSource},
     source_supervisor::SourceSupervisor,
 };
-use market_squawk_domain::{ConnectionGeneration, MetadataRevision, SourceId, SourceIdentifier};
+use market_squawk_domain::{
+    CaptureAuthorityIdentity, ConnectionGeneration, MetadataRevision, SourceId, SourceIdentifier,
+};
 use market_squawk_platform::{
-    CaptureGenerationKey, CaptureWriterPolicy, ConfigOverrides, ConfigSources, raw_capture_channel,
-    spawn_capture_writer,
+    CaptureWriterPolicy, ConfigOverrides, ConfigSources, DiagnosticCaptureBundle,
+    raw_capture_channel, spawn_capture_writer,
 };
 use parking_lot::RwLock;
 use tokio::sync::{mpsc, watch};
@@ -216,18 +218,15 @@ fn load_config(
     ))?)
 }
 
-fn capture_key(source: &str) -> Result<CaptureGenerationKey> {
+fn capture_identity(source: &str) -> Result<(CaptureAuthorityIdentity, uuid::Uuid)> {
     let source_id = SourceId::try_from(source)?;
     let revision = MetadataRevision::new(SourceIdentifier::try_from("app-stage1-v1")?);
     let connection_id = uuid::Uuid::new_v4();
     let session_text = format!("{source}-{connection_id}");
     let session = SourceIdentifier::try_from(session_text.as_str())?;
     let generation = ConnectionGeneration::new(1)?;
-    Ok(CaptureGenerationKey::new(
-        source_id,
-        revision,
-        session,
-        generation,
+    Ok((
+        CaptureAuthorityIdentity::new(source_id, revision, session, generation),
         connection_id,
     ))
 }
@@ -274,15 +273,17 @@ async fn run_source(
         RunMode::UntilInterrupted | RunMode::ForDuration(_) | RunMode::Mcp => "coinbase-exchange",
     };
     let journal_path = paths.journal_write_file(source_name)?;
-    let capture_key = capture_key(source_name)?;
-    let (publisher, mut capture_control, capture_writer) =
-        raw_capture_channel(config.journal_queue_capacity(), capture_key.clone());
+    let (capture_identity, connection_id) = capture_identity(source_name)?;
+    let (publisher, mut capture_control, capture_writer) = raw_capture_channel(
+        config.journal_queue_capacity(),
+        DiagnosticCaptureBundle::new(capture_identity.clone()),
+    );
     let journal = paths.open_journal_writer(source_name)?;
     let flush_batch = std::num::NonZeroUsize::new(256)
         .ok_or_else(|| anyhow!("capture flush batch invariant failed"))?;
     let writer_policy = CaptureWriterPolicy::try_new(flush_batch, config.capture_flush_interval())?;
     let capture_handle = spawn_capture_writer(capture_writer, journal, writer_policy)?;
-    capture_control.activate_initial(&capture_key)?;
+    capture_control.activate_initial()?;
     let engine = Arc::new(RwLock::new(Engine::new(
         duration_millis_i64(config.stale_after())?,
         config.paper_bot_enabled(),
@@ -311,7 +312,8 @@ async fn run_source(
         }
     });
 
-    let supervisor = SourceSupervisor::new(publisher, capture_control, capture_key);
+    let supervisor =
+        SourceSupervisor::new(publisher, capture_control, capture_identity, connection_id);
     let mut source_task = tokio::spawn(supervisor.run(source, event_sender, cancel_receiver));
 
     let mut source_completed = false;

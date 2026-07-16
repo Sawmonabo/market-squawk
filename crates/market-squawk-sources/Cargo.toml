@@ -20,9 +20,11 @@ tokio-util = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
+market-squawk-platform = { path = "../market-squawk-platform" }
 proptest = { workspace = true }
 serde_json = { workspace = true }
 static_assertions = { workspace = true }
+tokio = { workspace = true }
 
 [lints]
 workspace = true

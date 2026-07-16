@@ -7,7 +7,59 @@
 use std::fmt;
 use std::num::NonZeroU64;
 
-use crate::{ConnectionGeneration, MetadataRevision, SourceId, SourceIdentifier, Timestamp};
+use crate::{
+    CaptureIntegrityState, ConnectionGeneration, MetadataRevision, SourceId, SourceIdentifier,
+    Timestamp,
+};
+
+/// Immutable diagnostic identity of one registry-issued capture generation.
+///
+/// This value is deliberately data only: it supports local health reporting and journal
+/// attribution but cannot establish capture or execution authority.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct CaptureAuthorityIdentity {
+    source_id: SourceId,
+    metadata_revision: MetadataRevision,
+    session_identifier: SourceIdentifier,
+    connection_generation: ConnectionGeneration,
+}
+
+impl CaptureAuthorityIdentity {
+    /// Constructs a complete diagnostic identity from validated domain components.
+    pub const fn new(
+        source_id: SourceId,
+        metadata_revision: MetadataRevision,
+        session_identifier: SourceIdentifier,
+        connection_generation: ConnectionGeneration,
+    ) -> Self {
+        Self {
+            source_id,
+            metadata_revision,
+            session_identifier,
+            connection_generation,
+        }
+    }
+
+    /// Returns the registered source identity.
+    pub const fn source_id(&self) -> &SourceId {
+        &self.source_id
+    }
+
+    /// Returns the exact immutable metadata revision.
+    pub const fn metadata_revision(&self) -> &MetadataRevision {
+        &self.metadata_revision
+    }
+
+    /// Returns the source-defined connection-session identifier.
+    pub const fn session_identifier(&self) -> &SourceIdentifier {
+        &self.session_identifier
+    }
+
+    /// Returns the nonzero source connection generation.
+    pub const fn connection_generation(&self) -> ConnectionGeneration {
+        self.connection_generation
+    }
+}
 
 /// A source-registry capture authority operation failed closed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -125,6 +177,9 @@ pub trait CaptureAdmission<Frame>: fmt::Debug + Send + 'static {
 pub trait CaptureDegradation: Clone + fmt::Debug + Send + Sync + 'static {
     /// Irreversibly marks the exact generation incomplete.
     fn mark_incomplete(&self);
+
+    /// Returns the current one-way capture-integrity state for diagnostics and fail-closed gates.
+    fn integrity(&self) -> CaptureIntegrityState;
 }
 
 /// Once-issued whole-generation capture wiring authority.
@@ -143,6 +198,9 @@ pub trait CaptureAuthorityBundle: fmt::Debug + Send + Sized + 'static {
     type Admission: CaptureAdmission<Self::Frame, Receipt = Self::Receipt>;
     /// Cloneable degradation-only authority.
     type Degradation: CaptureDegradation;
+
+    /// Returns immutable diagnostic identity without separating any authority capability.
+    fn identity(&self) -> CaptureAuthorityIdentity;
 
     /// Consumes this once-issued bundle into capabilities for its one private allocation.
     fn into_parts(self) -> (Self::Initializer, Self::Admission, Self::Degradation);

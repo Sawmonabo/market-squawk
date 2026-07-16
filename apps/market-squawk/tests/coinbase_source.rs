@@ -7,9 +7,11 @@ use market_squawk::{
     journal::JournalReader,
     source::{CaptureContext, MarketSource, coinbase::CoinbaseSource},
 };
-use market_squawk_domain::{ConnectionGeneration, MetadataRevision, SourceId, SourceIdentifier};
+use market_squawk_domain::{
+    CaptureAuthorityIdentity, ConnectionGeneration, MetadataRevision, SourceId, SourceIdentifier,
+};
 use market_squawk_platform::{
-    CaptureGenerationKey, CaptureWriterPolicy, LocalPaths, raw_capture_channel,
+    CaptureWriterPolicy, DiagnosticCaptureBundle, LocalPaths, raw_capture_channel,
     spawn_capture_writer,
 };
 use serde_json::Value;
@@ -63,23 +65,23 @@ async fn coinbase_source_journals_and_publishes_local_websocket_messages() -> Re
     let directory = tempdir()?;
     let paths = LocalPaths::prepare(directory.path().join("data"))?;
     let journal_path = paths.journal_write_file("coinbase-exchange")?;
-    let key = CaptureGenerationKey::new(
+    let identity = CaptureAuthorityIdentity::new(
         SourceId::try_from("coinbase-exchange")?,
         MetadataRevision::new(SourceIdentifier::try_from("test-v1")?),
         SourceIdentifier::try_from("test-session")?,
         ConnectionGeneration::new(1)?,
-        uuid::Uuid::new_v4(),
     );
+    let connection_id = uuid::Uuid::new_v4();
     let (publisher, mut control, writer) = raw_capture_channel(
         NonZeroUsize::new(32).ok_or_else(|| anyhow::anyhow!("invalid test capacity"))?,
-        key.clone(),
+        DiagnosticCaptureBundle::new(identity.clone()),
     );
     let capture_handle = spawn_capture_writer(
         writer,
         paths.open_journal_writer("coinbase-exchange")?,
         CaptureWriterPolicy::default(),
     )?;
-    control.activate_initial(&key)?;
+    control.activate_initial()?;
     let (event_sender, mut event_receiver) = mpsc::channel(32);
     let (cancel_sender, cancel_receiver) = watch::channel(false);
     let mut source: Box<dyn MarketSource> = Box::new(
@@ -89,7 +91,7 @@ async fn coinbase_source_journals_and_publishes_local_websocket_messages() -> Re
     let source_task = tokio::spawn(async move {
         source
             .run_session(
-                CaptureContext::new(publisher, key),
+                CaptureContext::new(publisher, identity, connection_id),
                 event_sender,
                 cancel_receiver,
             )

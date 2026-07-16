@@ -133,6 +133,9 @@ struct RawCaptureRecordWireRef<'a> {
 /// Validation failure for a newly captured live frame.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum RawCaptureRecordError {
+    /// The domain receive timestamp could not be represented by the compatibility journal wire.
+    #[error("raw capture receive timestamp is outside the compatibility wire range")]
+    InvalidReceivedAt,
     /// The locally assigned event identifier must not be nil for new live capture.
     #[error("new live-capture event identifier must not be nil")]
     NilEventId,

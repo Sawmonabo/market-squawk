@@ -16,8 +16,8 @@ mod time;
 mod version;
 
 pub use capture::{
-    CaptureAdmission, CaptureAuthorityBundle, CaptureAuthorityError, CaptureDegradation,
-    CaptureInitializer, RawCaptureFrameView,
+    CaptureAdmission, CaptureAuthorityBundle, CaptureAuthorityError, CaptureAuthorityIdentity,
+    CaptureDegradation, CaptureInitializer, RawCaptureFrameView,
 };
 pub use classification::{
     AssessmentStatus, AssessmentValidity, AuthorizationBasis, BindingError, BookIntegrity,

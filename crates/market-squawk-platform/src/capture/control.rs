@@ -2,128 +2,151 @@
 
 use std::sync::{Arc, atomic::Ordering};
 
-use market_squawk_domain::{CaptureIntegrityState, ConnectionGeneration};
+use market_squawk_domain::{
+    CaptureAuthorityBundle, CaptureAuthorityError, CaptureAuthorityIdentity, CaptureDegradation,
+    CaptureInitializer, CaptureIntegrityState,
+};
 use thiserror::Error;
 
-use super::{
-    CaptureGenerationKey, CaptureHealthReason, CaptureState, GENERATION_INVALIDATED,
-    GenerationCaptureState, HEALTHY, WRITER_RUNNING,
-};
+use super::{CaptureHealthReason, CaptureState, GenerationCaptureState, WRITER_RUNNING};
 
-/// Generation-reset failure.
+/// Whole-bundle generation transition failure.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum CaptureGenerationError {
-    /// Source, metadata revision, and session must not be transplanted into an existing channel.
-    #[error("capture generation reset changed the registered source/session binding")]
+    /// Source, metadata revision, or session changed within one channel.
+    #[error("capture generation rotation changed the registered source/session binding")]
     BindingMismatch {
-        /// Active exact binding.
-        current: Arc<CaptureGenerationKey>,
-        /// Requested exact binding.
-        received: Arc<CaptureGenerationKey>,
+        /// Active exact audit identity.
+        current: Arc<CaptureAuthorityIdentity>,
+        /// Received exact audit identity.
+        received: Arc<CaptureAuthorityIdentity>,
     },
-    /// Recovery requires a strictly newer capture allocation.
-    #[error("capture generation must advance beyond {current}; received {received}")]
-    NotNewer {
-        /// Active generation.
-        current: ConnectionGeneration,
-        /// Requested generation.
-        received: ConnectionGeneration,
-    },
-    /// A new connection generation must use a distinct raw-wire connection identity.
-    #[error("capture generation rotation must change the raw connection identity")]
-    ConnectionNotRotated,
-    /// A dead writer cannot be made healthy by changing generation state.
+    /// Recovery requires a strictly newer registry-issued generation.
+    #[error("capture generation must strictly advance")]
+    NotNewer,
+    /// A dead writer cannot be made healthy by changing authority bundles.
     #[error("capture writer is unavailable; create and synchronize a new capture channel")]
     WriterUnavailable,
-    /// A capture fault invalidated this generation; recovery requires rotation first.
-    #[error("capture generation was invalidated and must advance before synchronization")]
-    GenerationMustAdvance,
+    /// Concrete registry initialization failed closed.
+    #[error("capture generation initialization failed: {0}")]
+    Authority(#[from] CaptureAuthorityError),
 }
 
 /// Non-clone owner of positive capture-allocation lifecycle transitions.
 #[derive(Debug)]
-pub struct RawCaptureControl {
-    pub(super) state: Arc<CaptureState>,
+pub struct RawCaptureControl<B: CaptureAuthorityBundle> {
+    pub(super) state: Arc<CaptureState<B>>,
+    pub(super) initializer: Option<B::Initializer>,
 }
 
-impl RawCaptureControl {
+impl<B: CaptureAuthorityBundle> RawCaptureControl<B> {
     /// Irreversibly invalidates the current allocation without creating a successor.
     pub fn invalidate_current(&mut self) {
         let active = self.state.active.load_full();
-        active.accepting.store(false, Ordering::Release);
         self.state
             .mark_incomplete_for_generation(&active, CaptureHealthReason::SupervisorStopped);
     }
 
-    /// Activates the exact initial allocation after its supervised writer is running.
-    pub fn activate_initial(
-        &mut self,
-        key: &CaptureGenerationKey,
-    ) -> Result<(), CaptureGenerationError> {
+    /// Activates the initial registry allocation after its supervised writer is running.
+    pub fn activate_initial(&mut self) -> Result<(), CaptureGenerationError> {
+        let _transition = match self.state.lifecycle_transition.lock() {
+            Ok(transition) => transition,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         let active = self.state.active.load_full();
-        if active.key.as_ref() != key {
-            return Err(CaptureGenerationError::BindingMismatch {
-                current: Arc::clone(&active.key),
-                received: Arc::new(key.clone()),
-            });
-        }
         if self.state.writer_lifecycle.load(Ordering::Acquire) != WRITER_RUNNING {
             return Err(CaptureGenerationError::WriterUnavailable);
         }
-        if active.integrity.load(Ordering::Acquire) == GENERATION_INVALIDATED {
-            return Err(CaptureGenerationError::GenerationMustAdvance);
+        let Some(initializer) = self.initializer.as_mut() else {
+            return if active.integrity() == CaptureIntegrityState::Healthy {
+                Ok(())
+            } else {
+                Err(CaptureGenerationError::Authority(
+                    CaptureAuthorityError::GenerationIncomplete,
+                ))
+            };
+        };
+        if let Err(error) = initializer.mark_healthy() {
+            self.state
+                .mark_incomplete_for_generation(&active, CaptureHealthReason::AuthorityRejected);
+            return Err(error.into());
         }
-        active.integrity.store(HEALTHY, Ordering::Release);
+        self.initializer = None;
         Ok(())
     }
 
-    /// Replaces the active allocation with a strictly newer healthy capture generation.
+    /// Replaces the active allocation using a new whole registry-issued authority bundle.
     ///
-    /// RCU replacement never waits for a publisher. Receipts from the prior allocation retain its
-    /// exact key and cannot become evidence for this allocation.
-    pub fn rotate_generation(
-        &mut self,
-        key: CaptureGenerationKey,
-    ) -> Result<(), CaptureGenerationError> {
+    /// The complete successor is validated and initialized before the old allocation is
+    /// Release-invalidated and RCU-replaced. A rejected successor is degraded without disturbing
+    /// a still-current healthy predecessor.
+    pub fn rotate_generation(&mut self, bundle: B) -> Result<(), CaptureGenerationError> {
+        let identity = bundle.identity();
+        let (mut initializer, admission, degradation) = bundle.into_parts();
+        let _transition = match self.state.lifecycle_transition.lock() {
+            Ok(transition) => transition,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         let active = self.state.active.load_full();
-        if !active.key.same_binding_except_generation(&key) {
+        if !same_session(active.identity.as_ref(), &identity) {
+            degradation.mark_incomplete();
             return Err(CaptureGenerationError::BindingMismatch {
-                current: Arc::clone(&active.key),
-                received: Arc::new(key),
+                current: Arc::clone(&active.identity),
+                received: Arc::new(identity),
             });
         }
-        if key.generation() <= active.key.generation() {
-            return Err(CaptureGenerationError::NotNewer {
-                current: active.key.generation(),
-                received: key.generation(),
-            });
-        }
-        if key.connection_id() == active.key.connection_id() {
-            return Err(CaptureGenerationError::ConnectionNotRotated);
+        if identity.connection_generation() <= active.identity.connection_generation() {
+            degradation.mark_incomplete();
+            return Err(CaptureGenerationError::NotNewer);
         }
         if self.state.writer_lifecycle.load(Ordering::Acquire) != WRITER_RUNNING {
+            degradation.mark_incomplete();
+            self.state
+                .mark_incomplete_for_generation(&active, CaptureHealthReason::WriterUnavailable);
             return Err(CaptureGenerationError::WriterUnavailable);
         }
-        active.accepting.store(false, Ordering::Release);
-        active
-            .integrity
-            .store(GENERATION_INVALIDATED, Ordering::Release);
+        if let Err(error) = initializer.mark_healthy() {
+            degradation.mark_incomplete();
+            return Err(error.into());
+        }
+        if self.state.writer_lifecycle.load(Ordering::Acquire) != WRITER_RUNNING {
+            degradation.mark_incomplete();
+            self.state
+                .mark_incomplete_for_generation(&active, CaptureHealthReason::WriterUnavailable);
+            return Err(CaptureGenerationError::WriterUnavailable);
+        }
+        self.state
+            .mark_incomplete_for_generation(&active, CaptureHealthReason::SupervisorStopped);
         self.state
             .active
             .store(Arc::new(GenerationCaptureState::new(
-                key,
-                CaptureIntegrityState::Healthy,
+                identity,
+                admission,
+                degradation,
             )));
+        if self.state.writer_lifecycle.load(Ordering::Acquire) != WRITER_RUNNING {
+            let installed = self.state.active.load_full();
+            self.state
+                .mark_incomplete_for_generation(&installed, CaptureHealthReason::WriterUnavailable);
+            return Err(CaptureGenerationError::WriterUnavailable);
+        }
+        self.initializer = None;
         Ok(())
     }
 
-    /// Returns the exact active allocation.
-    pub fn key(&self) -> Arc<CaptureGenerationKey> {
-        Arc::clone(&self.state.active.load_full().key)
+    /// Returns active audit identity.
+    pub fn identity(&self) -> Arc<CaptureAuthorityIdentity> {
+        Arc::clone(&self.state.active.load_full().identity)
     }
 }
 
-impl Drop for RawCaptureControl {
+fn same_session(current: &CaptureAuthorityIdentity, received: &CaptureAuthorityIdentity) -> bool {
+    current.source_id() == received.source_id()
+        && current.metadata_revision() == received.metadata_revision()
+        && current.session_identifier() == received.session_identifier()
+}
+
+impl<B: CaptureAuthorityBundle> Drop for RawCaptureControl<B> {
     fn drop(&mut self) {
         self.invalidate_current();
     }
