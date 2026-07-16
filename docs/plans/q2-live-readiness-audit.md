@@ -268,6 +268,8 @@ impl CurrentCoveragePolicy {
     pub fn depth(&self) -> Option<MarketDepth>;
     pub fn delay(&self) -> CoverageDelay;
     pub fn consolidation(&self) -> CoverageConsolidation;
+    pub fn delivery(&self) -> DeliveryEvidence;
+    pub fn evidence(&self) -> &ExactPayloadEvidence;
     pub fn effective_from(&self) -> Timestamp;
     pub fn effective_until(&self) -> Option<Timestamp>;
     pub fn metadata_revision(&self) -> &MetadataRevision;

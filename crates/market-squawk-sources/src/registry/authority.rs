@@ -253,6 +253,30 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
             .map_or(self.health.valid_until, |until| {
                 until.min(self.health.valid_until)
             });
+        let topology = self.validated.metadata.coverage().topology();
+        let consolidation = if topology.is_single_venue() {
+            CoverageConsolidation::SingleVenue
+        } else if topology.is_consolidated() {
+            CoverageConsolidation::Consolidated
+        } else {
+            CoverageConsolidation::Partial
+        };
+        let static_coverage = self.validated.metadata.coverage();
+        let coverage = CurrentCoveragePolicy {
+            source_id: self.validated.session.binding.source_id().clone(),
+            venue: venue.clone(),
+            provider_product: live.provider_product().clone(),
+            provider_channel: live.provider_channel().clone(),
+            event_class,
+            depth,
+            delay: static_coverage.delay(),
+            consolidation,
+            delivery: static_coverage.delivery(),
+            evidence: static_coverage.evidence().clone(),
+            effective_from: static_coverage.effective_interval().starts_at(),
+            effective_until: static_coverage.inclusive_coverage_deadline(),
+            metadata_revision: self.validated.session.binding.metadata_revision().clone(),
+        };
         Ok(ValidatedLiveScope {
             binding: self.validated.session.binding.clone(),
             venue: venue.clone(),
@@ -266,7 +290,7 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
             freshness: self.validated.metadata.freshness_policy(),
             quality_ceiling: self.validated.metadata.quality_ceiling(),
             static_authorization: self.validated.metadata.authorization().clone(),
-            static_coverage: self.validated.metadata.coverage().clone(),
+            coverage,
             valid_until,
             health_epoch: self.health.epoch,
             lease: Arc::clone(&self.validated.session.lease),
@@ -347,10 +371,18 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
             .map(|(observation, scope)| scope.into_current_observation(observation))
             .collect::<Result<Vec<_>, RegistryError>>()?
             .into_boxed_slice();
+        let policy_allocations = observations.iter().try_fold(0_usize, |total, observation| {
+            total
+                .checked_add(observation.policy.deep_allocation_charge()?)
+                .ok_or(RegistryError::RetainedSizeOverflow)
+        })?;
+        let authority_allocation = current_authority_shared_allocation_charge()?;
         let structural = observations
             .len()
             .checked_mul(std::mem::size_of::<CurrentProviderObservation>())
             .and_then(|bytes| retained_bytes.checked_add(bytes))
+            .and_then(|bytes| bytes.checked_add(policy_allocations))
+            .and_then(|bytes| bytes.checked_add(authority_allocation))
             .ok_or(RegistryError::RetainedSizeOverflow)?;
         let authority = observations
             .first()
@@ -381,7 +413,7 @@ pub struct ValidatedLiveScope {
     freshness: crate::FreshnessPolicy,
     quality_ceiling: market_squawk_domain::DataQuality,
     static_authorization: crate::AuthorizationGrant,
-    static_coverage: crate::SourceCoverage,
+    coverage: CurrentCoveragePolicy,
     valid_until: Timestamp,
     health_epoch: u64,
     lease: Arc<SessionLeaseState>,
@@ -509,13 +541,11 @@ impl ValidatedLiveScope {
                 quality_ceiling: self.quality_ceiling,
                 static_authorization: self.static_authorization,
                 runtime_authorization: self.authorization,
-                static_coverage: self.static_coverage,
+                coverage: self.coverage,
                 runtime_coverage: self.runtime_coverage,
                 rule: self.rule,
                 protocol: *protocol,
                 freshness: self.freshness,
-                provider_product: self.provider_product,
-                provider_channel: self.provider_channel,
                 valid_until: self.valid_until,
                 universe_evidence: self.universe_evidence,
             },

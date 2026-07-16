@@ -8,8 +8,9 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
 use market_squawk_domain::SchemaVersion;
 use market_squawk_domain::{
-    ConnectionGeneration, EffectiveInterval, ExactPayloadEvidence, InstrumentId, LiveEventClass,
-    MarketDepth, MetadataRevision, ProviderProduct, SourceId, Timestamp, VenueId,
+    ConnectionGeneration, CoverageConsolidation, CoverageDelay, DeliveryEvidence,
+    EffectiveInterval, ExactPayloadEvidence, InstrumentId, LiveEventClass, MarketDepth,
+    MetadataRevision, ProviderProduct, SourceId, Timestamp, VenueId,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;

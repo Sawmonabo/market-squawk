@@ -42,6 +42,24 @@ pub(crate) fn direct_metadata(
     starts_at: i64,
     ends_at: Option<i64>,
 ) -> TestResult<SourceMetadata> {
+    direct_metadata_with_instruments(
+        source,
+        revision,
+        starts_at,
+        ends_at,
+        vec![market_squawk_domain::InstrumentId::from_str(
+            "4c74ab95-53b9-42ad-9b66-0ed403b88fed",
+        )?],
+    )
+}
+
+pub(crate) fn direct_metadata_with_instruments(
+    source: &str,
+    revision: &str,
+    starts_at: i64,
+    ends_at: Option<i64>,
+    instruments: Vec<market_squawk_domain::InstrumentId>,
+) -> TestResult<SourceMetadata> {
     let source_id = SourceId::try_from(source)?;
     let revision = MetadataRevision::new(source_identifier(revision)?);
     let revision_evidence =
@@ -77,9 +95,7 @@ pub(crate) fn direct_metadata(
         effective,
         vec![AssetClass::Crypto],
         CoverageTopology::single_venue(VenueId::try_from("coinbase")?),
-        InstrumentCoverage::enumerated(vec![market_squawk_domain::InstrumentId::from_str(
-            "4c74ab95-53b9-42ad-9b66-0ed403b88fed",
-        )?])?,
+        InstrumentCoverage::enumerated(instruments)?,
         Some(live),
         CoverageDelay::RealTime,
         DeliveryEvidence::DirectVenue,

@@ -83,6 +83,127 @@ impl CurrentStreamKey {
     }
 }
 
+/// Compact exact coverage projection retained with one current provider observation.
+///
+/// The registry creates this value only after proving exact instrument membership. It therefore
+/// retains the selected scope and never the metadata declaration's potentially 4,096-instrument
+/// universe.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CurrentCoveragePolicy {
+    source_id: SourceId,
+    venue: VenueId,
+    provider_product: market_squawk_domain::ProviderProduct,
+    provider_channel: market_squawk_domain::ProviderChannel,
+    event_class: LiveEventClass,
+    depth: Option<MarketDepth>,
+    delay: CoverageDelay,
+    consolidation: CoverageConsolidation,
+    delivery: DeliveryEvidence,
+    evidence: ExactPayloadEvidence,
+    effective_from: Timestamp,
+    effective_until: Option<Timestamp>,
+    metadata_revision: MetadataRevision,
+}
+
+impl CurrentCoveragePolicy {
+    /// Returns the registered source identity.
+    pub const fn source_id(&self) -> &SourceId {
+        &self.source_id
+    }
+
+    /// Returns the exact covered venue.
+    pub const fn venue(&self) -> &VenueId {
+        &self.venue
+    }
+
+    /// Returns the exact provider product.
+    pub const fn provider_product(&self) -> &market_squawk_domain::ProviderProduct {
+        &self.provider_product
+    }
+
+    /// Returns the exact provider channel.
+    pub const fn provider_channel(&self) -> &market_squawk_domain::ProviderChannel {
+        &self.provider_channel
+    }
+
+    /// Returns the exact event class.
+    pub const fn event_class(&self) -> LiveEventClass {
+        self.event_class
+    }
+
+    /// Returns market depth for book events.
+    pub const fn depth(&self) -> Option<MarketDepth> {
+        self.depth
+    }
+
+    /// Returns declared delivery delay semantics.
+    pub const fn delay(&self) -> CoverageDelay {
+        self.delay
+    }
+
+    /// Returns the declared venue-consolidation class.
+    pub const fn consolidation(&self) -> CoverageConsolidation {
+        self.consolidation
+    }
+
+    /// Returns the independently declared direct/indirect delivery relationship.
+    pub const fn delivery(&self) -> DeliveryEvidence {
+        self.delivery
+    }
+
+    /// Returns the exact static coverage declaration evidence.
+    pub const fn evidence(&self) -> &ExactPayloadEvidence {
+        &self.evidence
+    }
+
+    /// Returns the first effective instant.
+    pub const fn effective_from(&self) -> Timestamp {
+        self.effective_from
+    }
+
+    /// Returns the inclusive final effective instant, if bounded.
+    pub const fn effective_until(&self) -> Option<Timestamp> {
+        self.effective_until
+    }
+
+    /// Returns the exact source-metadata revision.
+    pub const fn metadata_revision(&self) -> &MetadataRevision {
+        &self.metadata_revision
+    }
+}
+
+const CURRENT_POLICY_MAX_SOURCE_IDENTIFIERS: usize = 32;
+const CURRENT_POLICY_MAX_SOURCE_IDS: usize = 2;
+const CURRENT_POLICY_MAX_VENUE_IDS: usize = 2;
+
+fn current_policy_deep_allocation_charge() -> Result<usize, RegistryError> {
+    let source_identifiers = market_squawk_domain::SourceIdentifier::MAX_LENGTH
+        .checked_mul(CURRENT_POLICY_MAX_SOURCE_IDENTIFIERS)
+        .ok_or(RegistryError::RetainedSizeOverflow)?;
+    let source_ids = SourceId::MAX_LENGTH
+        .checked_mul(CURRENT_POLICY_MAX_SOURCE_IDS)
+        .ok_or(RegistryError::RetainedSizeOverflow)?;
+    let venues = VenueId::MAX_LENGTH
+        .checked_mul(CURRENT_POLICY_MAX_VENUE_IDS)
+        .ok_or(RegistryError::RetainedSizeOverflow)?;
+    source_identifiers
+        .checked_add(source_ids)
+        .and_then(|bytes| bytes.checked_add(venues))
+        .ok_or(RegistryError::RetainedSizeOverflow)
+}
+
+fn current_authority_shared_allocation_charge() -> Result<usize, RegistryError> {
+    std::mem::size_of::<SessionLeaseState>()
+        .checked_add(SourceId::MAX_LENGTH)
+        .and_then(|bytes| {
+            market_squawk_domain::SourceIdentifier::MAX_LENGTH
+                .checked_mul(2)
+                .and_then(|identity_bytes| bytes.checked_add(identity_bytes))
+        })
+        .and_then(|bytes| bytes.checked_add(256))
+        .ok_or(RegistryError::RetainedSizeOverflow)
+}
+
 /// Exact static and runtime policy retained with one current observation.
 #[derive(Debug)]
 pub struct CurrentLivePolicy {
@@ -90,13 +211,11 @@ pub struct CurrentLivePolicy {
     quality_ceiling: market_squawk_domain::DataQuality,
     static_authorization: crate::AuthorizationGrant,
     runtime_authorization: crate::AuthorizationHealth,
-    static_coverage: crate::SourceCoverage,
+    coverage: CurrentCoveragePolicy,
     runtime_coverage: crate::CoverageHealth,
     rule: crate::LiveCoverageRule,
     protocol: crate::LiveProtocolProfile,
     freshness: crate::FreshnessPolicy,
-    provider_product: market_squawk_domain::ProviderProduct,
-    provider_channel: market_squawk_domain::ProviderChannel,
     valid_until: Timestamp,
     universe_evidence: Option<ExactPayloadEvidence>,
 }
@@ -115,8 +234,9 @@ impl CurrentLivePolicy {
     pub const fn runtime_authorization(&self) -> &crate::AuthorizationHealth {
         &self.runtime_authorization
     }
-    pub const fn static_coverage(&self) -> &crate::SourceCoverage {
-        &self.static_coverage
+    /// Returns the compact exact-scope coverage projection.
+    pub const fn coverage(&self) -> &CurrentCoveragePolicy {
+        &self.coverage
     }
     pub const fn runtime_coverage(&self) -> &crate::CoverageHealth {
         &self.runtime_coverage
@@ -131,16 +251,20 @@ impl CurrentLivePolicy {
         self.freshness
     }
     pub const fn provider_product(&self) -> &market_squawk_domain::ProviderProduct {
-        &self.provider_product
+        self.coverage.provider_product()
     }
     pub const fn provider_channel(&self) -> &market_squawk_domain::ProviderChannel {
-        &self.provider_channel
+        self.coverage.provider_channel()
     }
     pub const fn valid_until(&self) -> Timestamp {
         self.valid_until
     }
     pub const fn universe_evidence(&self) -> Option<&ExactPayloadEvidence> {
         self.universe_evidence.as_ref()
+    }
+
+    fn deep_allocation_charge(&self) -> Result<usize, RegistryError> {
+        current_policy_deep_allocation_charge()
     }
 }
 

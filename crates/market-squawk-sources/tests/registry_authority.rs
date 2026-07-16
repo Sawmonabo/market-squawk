@@ -2,8 +2,8 @@ mod common;
 
 use bytes::Bytes;
 use market_squawk_domain::{
-    CaptureIntegrityState, ConnectionGeneration, ProviderChannel, ProviderProduct,
-    StreamIntegrityState, Timestamp,
+    CaptureIntegrityState, ConnectionGeneration, CoverageConsolidation, CoverageDelay,
+    DeliveryEvidence, ProviderChannel, ProviderProduct, StreamIntegrityState, Timestamp,
 };
 use market_squawk_sources::{
     AuthoritativeSourceRegistry, AuthorizationHealth, BudgetDecision, BudgetHealth,
@@ -12,7 +12,10 @@ use market_squawk_sources::{
 };
 use static_assertions::{assert_impl_all, assert_not_impl_any};
 
-use common::{TestResult, direct_metadata, exact_evidence, source_identifier};
+use common::{
+    TestResult, direct_metadata, direct_metadata_with_instruments, exact_evidence,
+    source_identifier,
+};
 
 assert_not_impl_any!(market_squawk_sources::RegisteredSource: Clone, serde::Serialize, serde::de::DeserializeOwned);
 assert_not_impl_any!(market_squawk_sources::CurrentSourceSession: Clone, serde::Serialize, serde::de::DeserializeOwned);
@@ -24,6 +27,7 @@ assert_not_impl_any!(market_squawk_sources::CaptureGenerationCapabilities: Clone
 assert_not_impl_any!(market_squawk_sources::CurrentHealthReporter: Clone, Sync, serde::Serialize);
 assert_not_impl_any!(market_squawk_sources::CurrentHealthUpdate: Clone, serde::Serialize, serde::de::DeserializeOwned);
 assert_not_impl_any!(market_squawk_sources::RawFrameFactory: Clone, Sync, serde::Serialize, serde::de::DeserializeOwned);
+assert_not_impl_any!(market_squawk_sources::CurrentCoveragePolicy: serde::Serialize, serde::de::DeserializeOwned);
 
 #[test]
 fn handles_reject_registry_transplant_and_session_resurrection() -> TestResult {
@@ -251,9 +255,14 @@ fn current_authority_is_scoped_by_venue_instrument_event_and_depth() -> TestResu
         ProviderTimestampEvidence,
     };
 
+    let instrument = InstrumentId::from_str("4c74ab95-53b9-42ad-9b66-0ed403b88fed")?;
+    let mut covered_instruments = (1_u128..4_096)
+        .map(|value| InstrumentId::from_str(&format!("{value:032x}")))
+        .collect::<Result<Vec<_>, _>>()?;
+    covered_instruments.push(instrument);
     let mut registry = AuthoritativeSourceRegistry::try_new()?;
     let registered = registry.register(
-        direct_metadata("source-a", "revision-a", 0, None)?,
+        direct_metadata_with_instruments("source-a", "revision-a", 0, None, covered_instruments)?,
         Timestamp::from_unix_nanos(1),
     )?;
     let session = registry.begin_session(
@@ -306,7 +315,6 @@ fn current_authority_is_scoped_by_venue_instrument_event_and_depth() -> TestResu
     let update = health_reporter.report(health)?;
     registry.record_health(&session, update)?;
     let current = registry.validate_current_authority(&session, Timestamp::from_unix_nanos(2))?;
-    let instrument = InstrumentId::from_str("4c74ab95-53b9-42ad-9b66-0ed403b88fed")?;
     current.validate_live_scope(
         &VenueId::try_from("coinbase")?,
         instrument,
@@ -377,6 +385,83 @@ fn current_authority_is_scoped_by_venue_instrument_event_and_depth() -> TestResu
                 None,
             )
             .is_err()
+    );
+
+    let current_frame = frames.try_frame(
+        Timestamp::from_unix_nanos(4),
+        TransportFrameKind::Binary,
+        Bytes::from_static(b"current-payload"),
+    )?;
+    capture_admission.preflight(&current_frame)?;
+    let current_receipt = capture_admission.issue_after_enqueue(&current_frame)?;
+    capture_admission.validate_active(&current_frame)?;
+    let current_validated = session.validate_live_frame(&current_frame)?;
+    let current_evidence = DecoderEvidence::from_validated_frame(
+        &current_validated,
+        IntegrityRule::new(source_identifier("coinbase-decoder")?, RuleVersion::new(1)?),
+    );
+    let current_observation = ProviderNormalizedObservation::try_new(
+        source_identifier("trade-2")?,
+        VenueId::try_from("coinbase")?,
+        instrument,
+        ProviderTimestampEvidence::Provided {
+            value: Timestamp::from_unix_nanos(4),
+            rule: rule("coinbase-timestamp")?,
+        },
+        ProviderSequenceEvidence::Provided {
+            value: SequenceNumber::new(2),
+            rule: rule("coinbase-sequence")?,
+        },
+        ProviderSnapshotEvidence::NotApplicable(rule("trade-no-snapshot-v1")?),
+        ProviderChecksumEvidence::Unsupported {
+            rule: rule("coinbase-no-checksum")?,
+        },
+        ProviderObservationPayload::Trade {
+            trade_id: source_identifier("trade-2")?,
+            price: ProviderPrice::new(ProviderDecimalLexeme::try_new("100.00")?),
+            quantity: ProviderQuantity::new(ProviderDecimalLexeme::try_new("1.00")?),
+            aggressor: ProviderAggressorEvidence::new(
+                AggressorSide::Buy,
+                Some(source_identifier("BUY")?),
+                rule("coinbase-aggressor")?,
+            ),
+        },
+    )?;
+    let current_batch = current.validate_decoded_batch_owned(
+        DecodedProviderBatch::try_new(
+            current_evidence,
+            vec![current_observation.clone(), current_observation],
+        )?,
+        current_receipt,
+    )?;
+    assert!(current_batch.retained_bytes() < 128 * 1024);
+    let mut current_observations = current_batch.into_observations();
+    assert_eq!(current_observations.len(), 2);
+    let current_observation = current_observations
+        .next()
+        .ok_or("current batch lost its observation")?;
+    let coverage = current_observation.policy().coverage();
+    assert_eq!(coverage.source_id().as_str(), "source-a");
+    assert_eq!(coverage.venue().as_str(), "coinbase");
+    assert_eq!(
+        coverage.provider_product().as_source_identifier().as_str(),
+        "direct-product"
+    );
+    assert_eq!(
+        coverage.provider_channel().as_source_identifier().as_str(),
+        "trades"
+    );
+    assert_eq!(coverage.event_class(), LiveEventClass::Trade);
+    assert_eq!(coverage.depth(), None);
+    assert_eq!(coverage.delay(), CoverageDelay::RealTime);
+    assert_eq!(coverage.consolidation(), CoverageConsolidation::SingleVenue);
+    assert_eq!(coverage.delivery(), DeliveryEvidence::DirectVenue);
+    assert_eq!(coverage.evidence(), &exact_evidence(3));
+    assert_eq!(coverage.effective_from(), Timestamp::from_unix_nanos(0));
+    assert_eq!(coverage.effective_until(), None);
+    assert_eq!(
+        coverage.metadata_revision().as_source_identifier().as_str(),
+        "revision-a"
     );
     Ok(())
 }
