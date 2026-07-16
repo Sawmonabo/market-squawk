@@ -105,20 +105,6 @@ impl SnapshotPlane {
             return Err(SnapshotReadError::Closed);
         }
         let cell = self.cell(shard)?;
-        let permit_count = u32::from(self.count.get());
-        let permit = Arc::clone(&self.readers)
-            .try_acquire_many_owned(permit_count)
-            .map_err(|error| match error {
-                tokio::sync::TryAcquireError::NoPermits => SnapshotReadError::ReaderLimitReached,
-                tokio::sync::TryAcquireError::Closed => SnapshotReadError::Closed,
-            })?;
-        Ok(LiveSnapshotLease::new(cell.value.load_full(), permit))
-    }
-
-    pub(crate) fn try_load_all(&self) -> Result<LiveRuntimeSnapshotLease, SnapshotReadError> {
-        if self.closed.load(Ordering::Acquire) {
-            return Err(SnapshotReadError::Closed);
-        }
         let permit =
             Arc::clone(&self.readers)
                 .try_acquire_owned()
@@ -128,6 +114,20 @@ impl SnapshotPlane {
                     }
                     tokio::sync::TryAcquireError::Closed => SnapshotReadError::Closed,
                 })?;
+        Ok(LiveSnapshotLease::new(cell.value.load_full(), permit))
+    }
+
+    pub(crate) fn try_load_all(&self) -> Result<LiveRuntimeSnapshotLease, SnapshotReadError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(SnapshotReadError::Closed);
+        }
+        let permit_count = u32::from(self.count.get());
+        let permit = Arc::clone(&self.readers)
+            .try_acquire_many_owned(permit_count)
+            .map_err(|error| match error {
+                tokio::sync::TryAcquireError::NoPermits => SnapshotReadError::ReaderLimitReached,
+                tokio::sync::TryAcquireError::Closed => SnapshotReadError::Closed,
+            })?;
         let mut snapshots = Vec::new();
         snapshots
             .try_reserve_exact(self.cells.len())
