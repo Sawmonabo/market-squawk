@@ -57,6 +57,20 @@ fn new_journals_are_identified_as_msj1() -> Result<()> {
 }
 
 #[test]
+fn writer_refuses_to_create_a_journal_without_the_current_extension() -> Result<()> {
+    let directory = tempdir()?;
+    let path = directory.path().join("new.journal");
+
+    let Err(error) = JournalWriter::open(&path) else {
+        bail!("writer must enforce the current journal filename extension");
+    };
+
+    assert!(error.to_string().contains("must use the .msj extension"));
+    assert!(!path.exists());
+    Ok(())
+}
+
+#[test]
 fn writer_refuses_to_append_to_legacy_mej1() -> Result<()> {
     let directory = tempdir()?;
     let path = directory.path().join("legacy.mej");

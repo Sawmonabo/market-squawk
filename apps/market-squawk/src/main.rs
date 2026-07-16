@@ -1,9 +1,9 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, anyhow};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use market_squawk::{
-    AppPaths, Engine, EngineConfig,
+    AppPaths, Engine, EngineConfig, JournalFileFormat,
     journal::{JournalSink, JournalWriter},
     mcp::McpServer,
     replay::replay_coinbase_journal,
@@ -65,6 +65,9 @@ enum Command {
         /// Do not open a network connection; expose only current empty/local state and journal tools.
         #[arg(long)]
         offline: bool,
+        /// Select a journal when both the current and legacy formats exist.
+        #[arg(long, value_enum, requires = "offline")]
+        journal_format: Option<JournalFormatArgument>,
         #[arg(long)]
         paper_bot: bool,
     },
@@ -73,7 +76,25 @@ enum Command {
     Replay {
         #[arg(long, default_value = "coinbase-exchange")]
         source: String,
+        /// Select a journal when both the current and legacy formats exist.
+        #[arg(long, value_enum)]
+        journal_format: Option<JournalFormatArgument>,
     },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum JournalFormatArgument {
+    Current,
+    Legacy,
+}
+
+impl From<JournalFormatArgument> for JournalFileFormat {
+    fn from(value: JournalFormatArgument) -> Self {
+        match value {
+            JournalFormatArgument::Current => Self::Current,
+            JournalFormatArgument::Legacy => Self::Legacy,
+        }
+    }
 }
 
 #[tokio::main]
@@ -85,7 +106,9 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Init => {
             paths.initialize()?;
-            JournalWriter::open(paths.journal_file("coinbase-exchange"))?.flush()?;
+            if let Some(path) = paths.journal_initialization_file("coinbase-exchange")? {
+                JournalWriter::open(path)?.flush()?;
+            }
             println!("initialized {}", paths.root().display());
         }
         Command::Mock {
@@ -122,6 +145,7 @@ async fn main() -> Result<()> {
         Command::Mcp {
             products,
             offline,
+            journal_format,
             paper_bot,
         } => {
             let config = EngineConfig {
@@ -131,19 +155,23 @@ async fn main() -> Result<()> {
                 ..EngineConfig::default()
             };
             if offline {
-                run_offline_mcp(config).await?;
+                run_offline_mcp(config, journal_format.map(Into::into)).await?;
             } else {
                 let source: Box<dyn MarketSource> = Box::new(CoinbaseSource::new(products));
                 let _ = run_source(config, source, RunMode::Mcp).await?;
             }
         }
-        Command::Replay { source } => {
-            paths.initialize()?;
+        Command::Replay {
+            source,
+            journal_format,
+        } => {
             if source != "coinbase-exchange" {
                 anyhow::bail!("decoded replay currently supports source=coinbase-exchange");
             }
+            let journal_path =
+                paths.select_journal_for_read(&source, journal_format.map(Into::into))?;
             let replay = replay_coinbase_journal(
-                paths.journal_file(&source),
+                journal_path,
                 EngineConfig::default().stale_after_ms,
                 false,
             )?;
@@ -188,7 +216,7 @@ async fn run_source(
 ) -> Result<market_squawk::EngineSnapshot> {
     let paths = AppPaths::new(&config.data_dir);
     paths.initialize()?;
-    let journal_path = paths.journal_file(match mode {
+    let journal_path = paths.journal_write_file(match mode {
         RunMode::UntilSourceStops => "mock",
         RunMode::UntilInterrupted | RunMode::ForDuration(_) | RunMode::Mcp => "coinbase-exchange",
     });
@@ -314,11 +342,12 @@ fn flatten_source_result(
     }
 }
 
-async fn run_offline_mcp(config: EngineConfig) -> Result<()> {
+async fn run_offline_mcp(
+    config: EngineConfig,
+    journal_format: Option<JournalFileFormat>,
+) -> Result<()> {
     let paths = AppPaths::new(&config.data_dir);
-    paths.initialize()?;
-    let journal_path = paths.journal_file("coinbase-exchange");
-    JournalWriter::open(&journal_path)?.flush()?;
+    let journal_path = paths.select_journal_for_read("coinbase-exchange", journal_format)?;
     let engine = Arc::new(RwLock::new(Engine::new(
         config.stale_after_ms,
         config.paper_bot_enabled,

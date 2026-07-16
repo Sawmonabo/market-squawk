@@ -1,6 +1,6 @@
 # Contributing
 
-1. Use Rust 1.85 or newer.
+1. Use the pinned Rust 1.97.0 toolchain, including the repository's `rustfmt` and Clippy components.
 2. Add or update a failing test before implementation changes.
 3. Keep source-specific schemas inside adapters.
 4. Keep MCP, SQL, notebooks, and model training outside the live event-to-decision path.

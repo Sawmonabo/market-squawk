@@ -49,15 +49,38 @@ class BrandCheckTests(unittest.TestCase):
     def test_allowed_compatibility_occurrence_is_narrow(self) -> None:
         path, line, token_index = next(iter(check_brand.ALLOWED_OCCURRENCES))
         token = check_brand.TOKENS[token_index]
-        self.assertTrue(check_brand.is_allowed(path, line, token_index))
-        self.assertFalse(check_brand.is_allowed(path, line + 1, token_index))
-        allowed_text = "\n" * (line - 1) + token + "\n"
-        shifted_text = "\n" * line + token + "\n"
-        self.assertEqual(check_brand.scan_text(path, allowed_text), [])
-        self.assertEqual(
-            check_brand.scan_text(path, shifted_text),
-            [f"{path}:{line + 1}:{token}"],
+        allowance = check_brand.ALLOWED_OCCURRENCES[(path, line, token_index)]
+        self.assertTrue(
+            check_brand.is_allowed(path, line, token_index, allowance.container)
         )
+        self.assertFalse(
+            check_brand.is_allowed(path, line + 1, token_index, allowance.container)
+        )
+
+    def test_changed_allowed_line_is_rejected(self) -> None:
+        path, line, token_index = next(
+            key for key in check_brand.ALLOWED_OCCURRENCES if key[1] > 0
+        )
+        allowance = check_brand.ALLOWED_OCCURRENCES[(path, line, token_index)]
+        content = "\n" * (line - 1) + allowance.container + " changed\n"
+        violations, used = check_brand.scan_text_with_usage(path, content)
+        self.assertTrue(violations)
+        self.assertNotIn((path, line, token_index), used)
+
+    def test_duplicate_token_on_allowed_line_is_rejected(self) -> None:
+        path, line, token_index = next(
+            key for key in check_brand.ALLOWED_OCCURRENCES if key[1] > 0
+        )
+        allowance = check_brand.ALLOWED_OCCURRENCES[(path, line, token_index)]
+        token = check_brand.TOKENS[token_index]
+        content = "\n" * (line - 1) + allowance.container + token + "\n"
+        violations, used = check_brand.scan_text_with_usage(path, content)
+        self.assertTrue(violations)
+        self.assertNotIn((path, line, token_index), used)
+
+    def test_unused_allowance_fails_closed(self) -> None:
+        violations = check_brand.unused_allowance_violations(set())
+        self.assertEqual(len(violations), len(check_brand.ALLOWED_OCCURRENCES))
 
 
 if __name__ == "__main__":

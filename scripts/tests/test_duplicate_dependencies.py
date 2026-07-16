@@ -14,6 +14,19 @@ SPEC.loader.exec_module(check_duplicates)
 
 
 class DuplicateDependencyTests(unittest.TestCase):
+    def test_production_metadata_command_is_locked_and_resolves_all_features(self) -> None:
+        self.assertEqual(
+            check_duplicates.cargo_metadata_command(),
+            [
+                "cargo",
+                "metadata",
+                "--format-version",
+                "1",
+                "--all-features",
+                "--locked",
+            ],
+        )
+
     def test_duplicate_inventory_is_exact_and_order_independent(self) -> None:
         packages = [
             {"name": "alpha", "version": "2.0.0"},

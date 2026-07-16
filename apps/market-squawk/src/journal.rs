@@ -40,6 +40,7 @@ impl TryFrom<[u8; 4]> for JournalFormat {
 #[derive(Debug)]
 pub enum JournalError {
     UnsupportedMagic([u8; 4]),
+    InvalidWriterExtension,
     LegacyFormatReadOnly,
     RecordLimitExceeded {
         limit: usize,
@@ -71,6 +72,9 @@ impl fmt::Display for JournalError {
             Self::UnsupportedMagic(magic) => {
                 write!(formatter, "unsupported journal magic: {magic:?}")
             }
+            Self::InvalidWriterExtension => {
+                formatter.write_str("new and writable journals must use the .msj extension")
+            }
             Self::LegacyFormatReadOnly => formatter.write_str(
                 "legacy journal is read-only; migrate to an MSJ1 journal before appending",
             ),
@@ -97,6 +101,7 @@ impl Error for JournalError {
             Self::Json(source) => Some(source),
             Self::LengthOverflow(source) => Some(source),
             Self::UnsupportedMagic(_)
+            | Self::InvalidWriterExtension
             | Self::LegacyFormatReadOnly
             | Self::RecordLimitExceeded { .. }
             | Self::AggregateLimitExceeded { .. }
@@ -126,6 +131,13 @@ pub struct JournalWriter {
 impl JournalWriter {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
+        if path.extension().and_then(std::ffi::OsStr::to_str) != Some("msj") {
+            if path.try_exists()? && validate_existing_journal(&path)? == JournalFormat::LegacyMej1
+            {
+                return Err(anyhow!(JournalError::LegacyFormatReadOnly));
+            }
+            return Err(anyhow!(JournalError::InvalidWriterExtension));
+        }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;

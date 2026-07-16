@@ -2,6 +2,23 @@
 
 All notable changes to this project are documented here.
 
+## Unreleased
+
+- Established the Rust 1.97.0 Edition 2024 virtual workspace and shared invariant-preserving
+  domain crate.
+- Separated fair-value hierarchy, market depth, data quality, integrity, and provenance contracts.
+- Added exact tick, lot, money, and notional conversions with checked arithmetic and property tests.
+- Added verified instrument identifiers, network-qualified digital-asset addresses, futures identity,
+  venue-scoped symbol changes, and explicit asset-versus-currency denomination.
+- Added generation-bound timing, sequence, checksum, coverage, and live qualification evidence;
+  persisted quality assertions require current runtime requalification before executable use.
+- Kept live and research provenance independent, including point-in-time publication, revision, and
+  unknown-availability semantics for research records.
+- Made current journal writes use only `MSJ1/.msj`, retained bounded read-only compatibility for the
+  legacy journal format, and made dual-format selection fail closed until explicitly resolved.
+- Hardened local and CI verification with exact dependency inventory, exact compatibility-brand
+  allowances, immutable GitHub Action commits, strict workspace gates, and bounded offline smokes.
+
 ## 0.1.0 - 2026-07-15
 
 - Added public Coinbase Exchange Level 2, heartbeat, and match capture.

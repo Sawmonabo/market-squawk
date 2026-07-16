@@ -28,6 +28,17 @@ ALLOWED_DUPLICATES: dict[str, tuple[str, ...]] = {
 }
 
 
+def cargo_metadata_command() -> list[str]:
+    return [
+        "cargo",
+        "metadata",
+        "--format-version",
+        "1",
+        "--all-features",
+        "--locked",
+    ]
+
+
 def duplicate_inventory(packages: list[dict[str, Any]]) -> dict[str, tuple[str, ...]]:
     versions: dict[str, set[str]] = defaultdict(set)
     for package in packages:
@@ -61,7 +72,7 @@ def inventory_violations(
 def main() -> int:
     root = Path(__file__).resolve().parents[1]
     result = subprocess.run(
-        ["cargo", "metadata", "--format-version", "1", "--locked"],
+        cargo_metadata_command(),
         cwd=root,
         check=False,
         stdout=subprocess.PIPE,

@@ -15,6 +15,6 @@ pub mod replay;
 pub mod risk;
 pub mod source;
 
-pub use config::{AppPaths, EngineConfig};
+pub use config::{AppPaths, EngineConfig, JournalFileFormat, JournalSelectionError};
 pub use domain::{MarketEvent, RawEnvelope};
 pub use engine::{Engine, EngineSnapshot, SharedEngine};

@@ -2,7 +2,9 @@
 
 **Turn market noise into market state.**
 
-A local-first Rust engine for live market-data capture, loss-aware order-book processing, deterministic replay, incremental financial features, paper-only bot evaluation, and Model Context Protocol access.
+A local-first market platform with independent live-execution and research-data planes. They share
+invariant-preserving financial, identity, time, quality, and provenance contracts without requiring
+historical datasets to originate from or reproduce the live feed.
 
 ## Status
 
@@ -15,7 +17,7 @@ Implemented now:
 - Heartbeat sequence tracking separated from order-book freshness
 - Match/trade capture
 - Append-only length-prefixed raw journal with CRC32 integrity checks and a single-writer OS lock
-- Exact journal validation plus Coinbase state reconstruction through replay
+- Exact journal validation plus optional Coinbase diagnostic reconstruction
 - Fixed-point decimal prices and quantities
 - In-memory order books
 - Midprice, spread, spread basis points, microprice, and book imbalance
@@ -28,8 +30,10 @@ Implemented now:
 - Distinct fair-value, market-depth, data-quality, stream-integrity, and capture-integrity types
 - Typed internal/external instrument identities, scaled financial values, provenance, and separate
   canonical live/research observation families
+- Independent live and research boundaries; research storage and extraction adapters remain later
+  implementation stages and do not depend on captured live journals
 
-Deliberately not implemented in v0.1:
+Not yet implemented in the current foundation:
 
 - Live order submission
 - Credentialed exchange or brokerage access
@@ -64,7 +68,7 @@ cargo build --workspace --all-features --release --locked
   --products BTC-USD,ETH-USD \
   --seconds 30
 
-# Validate the journal and rebuild the ending market state
+# Optionally validate a capture journal and reconstruct ending state for diagnostics
 ./target/release/market-squawk replay --source coinbase-exchange
 ```
 
@@ -117,7 +121,35 @@ The server writes protocol responses only to stdout. Operational logs go to stde
 
 The MCP server does not accept arbitrary paths, SQL, shell commands, remote code, or unchecked order requests.
 
-## Live data path
+## Independent data planes
+
+```text
+                         shared domain contracts
+            instruments · time · money · quality · provenance
+                              │
+              ┌───────────────┴────────────────┐
+              │                                │
+       live execution plane             research data plane
+       direct source adapters           extraction adapters
+              │                                │
+       bounded live state               Arrow/Parquet datasets
+              │                                │
+       strategy and risk                point-in-time analytics
+              └───────────────┬────────────────┘
+                              │
+                    local CLI, catalog, MCP
+```
+
+The planes may reuse pure mathematical kernels, but neither pipeline is a transport or persistence
+requirement for the other. Historical sources may differ from live sources. Journal replay is
+optional diagnostic tooling for integrity investigation and decoder reprocessing, not the research
+architecture or a completion dependency.
+
+The research plane is currently represented by shared contracts. Arrow, Parquet, DataFusion,
+point-in-time datasets, and working extraction adapters are subsequent implementation stages and are
+not claimed as current capabilities.
+
+## Current live data path
 
 ```text
 Coinbase WebSocket
@@ -168,6 +200,11 @@ u32 little-endian payload length
 u32 little-endian payload CRC
 UTF-8 JSON RawEnvelope payload
 ```
+
+Readers retain bounded compatibility with legacy `MEJ1/.mej` journals, but writers never create or
+append that format. If a source has both formats, replay and offline MCP fail closed until the user
+selects `--journal-format current` or `--journal-format legacy`; initialization never creates an
+empty current journal that would shadow a sole legacy file.
 
 The raw envelope preserves:
 
@@ -224,7 +261,9 @@ docs/                               architecture, plans, research, and verificat
 
 The project has no mandatory paid software, API, cloud, telemetry, or hosted database. Existing hardware, storage, electricity, and internet access are outside the software-cost claim. External market providers retain their own coverage, availability, licensing, and rate constraints.
 
-The architecture removes avoidable vendor dependence through adapters, immutable local capture, exact replay, and fail-closed degradation. It does not attempt to evade legitimate provider restrictions.
+The architecture removes avoidable vendor dependence through adapters, local persistence, caching,
+explicit coverage, source health, and fail-closed degradation. It does not attempt to evade
+legitimate provider restrictions.
 
 ## Roadmap
 
@@ -234,7 +273,7 @@ The architecture removes avoidable vendor dependence through adapters, immutable
 4. Apache DataFusion point-in-time query layer
 5. Corporate actions and total-return series
 6. SEC EDGAR, FRED/ALFRED, Treasury, BLS, and portfolio import adapters
-7. Generalized historical replay through the same event pipeline
+7. Optional cross-adapter capture replay for diagnostics and decoder validation
 8. Strategy plugin ABI and versioned model bundles
 9. ONNX inference outside the source-reader threads
 10. Latency histograms and queue diagnostics without OTEL deployment
