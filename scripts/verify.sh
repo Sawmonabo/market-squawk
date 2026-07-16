@@ -21,8 +21,12 @@ import pathlib
 import sys
 
 help_text = pathlib.Path(sys.argv[1]).read_text()
-if not help_text.startswith("Local-first live market-data"):
-    raise SystemExit("CLI help identity is missing")
+expected_identity = "Local-first market capture, diagnostic replay/simulation, and MCP"
+first_line = help_text.splitlines()[0] if help_text else ""
+if first_line != expected_identity:
+    raise SystemExit(
+        f"CLI help identity mismatch: expected {expected_identity!r}, found {first_line!r}"
+    )
 PY
 ./target/debug/market-squawk \
   --data-dir "$tmp_dir" mock --events 100 >"$tmp_dir/snapshot.json"
