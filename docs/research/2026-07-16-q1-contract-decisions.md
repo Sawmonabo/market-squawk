@@ -1,6 +1,7 @@
 # Quarter 1 Contract Decisions
 
-Date: 2026-07-16  
+Date: 2026-07-16
+
 Scope: Stage 1 Tasks 1-4 and their grouped review corrections
 
 ## Purpose
@@ -77,4 +78,3 @@ Compile-time negative assertions prevent both `FairValueHierarchy` and `MarketDe
 `Into` or `TryInto` conversions to `DataQuality` or `ExecutionEligibility`. Runtime qualification
 tests separately prove that valuation hierarchy does not change the quality of the underlying
 market observation.
-
