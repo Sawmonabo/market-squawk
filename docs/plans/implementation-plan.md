@@ -10,8 +10,9 @@ release described by the product specification without losing runnable behavior 
 **Architecture:** A contract-first virtual Rust workspace separates a deterministic, sharded live
 execution plane from an Arrow/Parquet/DataFusion research plane while sharing invariant-preserving
 domain types. CLI and local stdio MCP operate through bounded application services outside the
-event-to-action path, and only evidence-qualified `DirectVerified` state can authorize automated
-paper or live actions by default.
+event-to-action path. Automated paper/live action requires the stateful live plane's opaque,
+single-use current capability for a `DirectVerified` state; serialized domain assessments and
+archives never authorize action.
 
 **Tech Stack:** Rust 1.97.0, Edition 2024, Cargo resolver 3, Tokio, Serde, Reqwest,
 Tokio-Tungstenite, Arrow, Parquet, DataFusion, SQLite, Clap, Tracing, Thiserror, Anyhow at app
@@ -35,7 +36,8 @@ ONNX-compatible local inference.
 - Accounting and analytical values use Decimal or Arrow Decimal128 with explicit currency/scale.
 - Fair-value hierarchy, market depth, data quality, stream integrity, and execution eligibility are
   separate types with no implicit conversion.
-- Only `DirectVerified` is eligible for automated action by default.
+- Only the stateful live authority issuer can mint the short-lived capability for current
+  `DirectVerified` state that risk requires and consumes by default.
 - SQLite, DataFusion, Parquet, Python, MCP, LLMs, and arbitrary filesystem work remain outside the
   event-to-action path.
 - All queues are bounded; saturation has an explicit quarantine/degradation policy.
@@ -166,15 +168,19 @@ unforgeable risk approval; migrated Coinbase, paper, CLI, and MCP v0.1 behavior;
 - [ ] Private validated identity, financial, time, quality, coverage, and provenance types.
 - [ ] Complete `MarketEvent`/`ResearchObservation` contracts needed by later stages.
 - [ ] Separate `FairValueHierarchy`, `MarketDepth`, `DataQuality`, `StreamIntegrityState`,
-  `CaptureIntegrityState`, `QualificationEvidence`, and `ExecutionEligibility`.
+  `CaptureIntegrityState`, audit-only `QualificationAssessment`, and `ExecutionEligibility`.
+- [ ] Archive/domain assessments are always execution-ineligible and cannot construct, deserialize,
+  clone, or substitute for live current authority.
 - [ ] `SourceMetadataProvider`, `LiveMarketSource`, and `ExtractionSource` contracts.
 - [ ] Explicit endpoint/network policy and provider budget contracts.
 - [ ] Raw capture no longer waits for writer acknowledgement.
 - [ ] Capture/shard overflow tests prove fail-closed quarantine behavior.
 - [ ] Versioned stable shard routing and single-writer ownership.
 - [ ] Immutable bounded snapshots for application services.
-- [ ] `OrderIntent`, publicly nameable but privately constructible `ApprovedOrder`, risk service,
-  and `ExecutionAdapter` contract.
+- [ ] Stateful live authority issuer and opaque non-Serde/non-`Clone`, single-use, policy-expiring
+  `LiveExecutionCapability` bound to authoritative metadata/session/instrument state.
+- [ ] `OrderIntent`, capability-consuming risk service, publicly nameable but privately
+  constructible `ApprovedOrder`, one-time dispatcher, and `ExecutionAdapter` contract.
 - [ ] Current features and paper behavior migrated behind new contracts without being mislabeled
   complete paper execution.
 - [ ] Existing CLI/MCP behavior preserved through application services.
@@ -195,8 +201,8 @@ cargo deny check
 ```
 
 Expected: every command exits zero; tests prove legacy journal reads, type separation, exact
-financial conversion, stable sharding, overflow quarantine, snapshot isolation, and risk
-non-bypassability.
+financial conversion, stable sharding, overflow quarantine, snapshot isolation, opaque-capability
+binding/expiry/one-time use, and risk/dispatch non-bypassability.
 
 ## Stage 2: Live adapters, qualification, books, sharding, and source health
 
@@ -225,6 +231,8 @@ comparison; measured live kernels.
   decimal-string checksum view, canonical order, and top-ten CRC32.
 - [ ] Kraken mismatch quarantine, reconnect, fresh snapshot, and requalification.
 - [ ] Typed source coverage and health snapshots for both venues.
+- [ ] Kraken current-authority issuance/revocation integrates the authoritative metadata revision,
+  session generation, health, and instrument state; Coinbase Level 2 never receives a capability.
 - [ ] Stable multi-shard supervisor with bounded queues and controlled shutdown.
 - [ ] Top-of-book and configurable price-level depth; order-level contract where supplied later.
 - [ ] Spread, midpoint, microprice, book/depth imbalance, order-flow imbalance, depth-weighted price,
@@ -363,11 +371,15 @@ order-state lifecycle, balances/positions/fills, cancel/reconcile, and durable e
 ### Mandatory deliverables
 
 - [ ] Canonical `Strategy` implementations consume validated live state and emit complete intents.
-- [ ] Risk checks source quality/freshness, eligibility, account/instrument, position, notional,
-  exposure, leverage, capital, price, slippage, rate, duplicate, loss/drawdown, and expiration.
+- [ ] Risk requires and consumes the live plane's opaque capability, revalidates action time/current
+  generation/source health, and checks account/instrument, position, notional, exposure, leverage,
+  capital, price, slippage, rate, duplicate, loss/drawdown, and expiration.
 - [ ] Every decision has structured reasons, evaluated limits, source/model/strategy identity, and
   durable audit outside the live path.
-- [ ] Only risk constructs `ApprovedOrder`; compile-fail and integration tests prove no bypass.
+- [ ] Only risk constructs `ApprovedOrder`; its expiry cannot outlive live evidence, and compile-fail
+  tests prove domain assessments/archives cannot satisfy the capability parameter.
+- [ ] Adapter dispatch consumes each approval ID exactly once and rechecks expiry/authority
+  revocation before constructing an adapter-only dispatch value.
 - [ ] Paper order state machine supports acceptance, rejection, partial/full fill, cancel,
   expiration, and reconciliation.
 - [ ] Deterministic seeded latency, spread, depth, queue/slippage, impact, fee, and rejection models.
@@ -380,8 +392,10 @@ order-state lifecycle, balances/positions/fills, cancel/reconcile, and durable e
 
 ### Stage 5 exit gate
 
-- [ ] No automated paper action occurs without `DirectVerified` by default.
-- [ ] No strategy/model/CLI/MCP/adapter can construct an approved order.
+- [ ] No automated paper action occurs without a current, consumed live capability for
+  `DirectVerified` state by default.
+- [ ] No strategy/model/CLI/MCP/archive/replay/adapter can construct a capability, approved order,
+  or adapter dispatch value.
 - [ ] Quantity, cash, position, fee, and fill reconciliation invariants pass under partial fills and
   cancellations.
 - [ ] Required workspace/security commands pass.

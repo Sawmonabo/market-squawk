@@ -329,9 +329,11 @@ git commit -m "build: establish Rust 1.97 virtual workspace"
 - [ ] **Step 1: Write boundary and exactness tests**
 
 Cover empty/oversized venue IDs, UUID round trips, ticker/venue-symbol validation, CUSIP/ISIN/SEDOL
-check digits, FIGI syntax, OCC option identity, futures expiry/contract identity, crypto pair/chain
-address normalization, zero tick/lot sizes, negative quantities where forbidden, exact decimal
-normalization, inexact scale rejection, and checked overflow:
+check digits, FIGI syntax, OCC option identity, every FIX `MonthYear` form (`YYYYMM`, `YYYYMMDD`,
+and `YYYYMMwN`), independent tag 541 maturity dates, leg-local tag 610 maturity designators,
+optional futures lifecycle dates, crypto pair/chain-address normalization, zero tick/lot sizes,
+negative quantities where forbidden, exact decimal normalization, inexact scale rejection, and
+checked overflow:
 
 ```rust
 #[test]
@@ -368,10 +370,25 @@ must cite their authoritative specification in rustdoc/tests; a syntactically va
 still not proof that an instrument exists. Provide borrowed views, `Display`, Serde, and only
 semantically valid conversions. Do not implement `Deref<Target = String>` or public tuple fields.
 
+Model FIX Latest EP307 maturity claims without collapsing them. Tag 200 is a structured
+`MaturityMonthYear` designator that preserves `YYYYMM`, `YYYYMMDD`, or `YYYYMMwN`; tag 541 is a
+separate optional `LocalMktDate`; tag 610 is the same structured designator scoped to one leg.
+First/last trade, notice, delivery, settlement, and other lifecycle dates remain optional,
+source-evidenced fields. Never synthesize one claim from another or reduce a day/week designator to
+a month.
+
 Add `InstrumentDefinition` with private instrument ID, asset class, primary currency, tick/lot rules,
 venue mappings, identifiers, and trading status. Symbol history, corporate-action transitions,
 mergers/delistings, and contract-roll persistence are Stage 3/4 behaviors, but their effective-time
 record contracts are defined here so storage cannot later invent incompatible identity semantics.
+
+Provider-native identity assertions use a versioned `ProviderIdentityRecord`, not an unqualified
+string or a field on `VenueMapping`. Bind every record to the provider `SourceId`, stable
+`InstrumentId`, immutable `PayloadReference`, provider source timestamp when supplied, local
+`observed_at`, authoritative metadata revision/evidence, and effective interval. Exact duplicate
+evidence is idempotent; the same provider namespace/revision/key with a different immutable payload
+is a conflict and is quarantined; a newer evidenced provider revision appends a new assertion and
+supersedes the prior assertion without deleting or overwriting history.
 
 - [ ] **Step 3: Implement exact scaled values**
 
@@ -401,7 +418,7 @@ git commit -m "feat(domain): add validated identities and scaled values"
 
 ---
 
-## Task 4: Separate classifications, integrity, eligibility, time, and provenance
+## Task 4: Separate classifications, integrity, audit assessment, time, and provenance
 
 **Files:**
 
@@ -413,50 +430,78 @@ git commit -m "feat(domain): add validated identities and scaled values"
 - Modify: `crates/market-squawk-domain/src/lib.rs`
 - Create: `crates/market-squawk-domain/tests/classification.rs`
 - Create: `crates/market-squawk-domain/tests/provenance.rs`
+- Create: `crates/market-squawk-domain/tests/qualification_assessment.rs`
 
-- [ ] **Step 1: Write separation and qualification tests**
+- [ ] **Step 1: Write separation and audit-assessment tests**
 
-Tests must prove that hierarchy/depth/quality are independent, heartbeat does not update market
-freshness, and Level 2/3 evidence cannot authorize execution:
+Use compile-time negative assertions to prove hierarchy, depth, quality, integrity, and eligibility
+have no `Into`/`TryInto` shortcuts. Separately prove that heartbeat time cannot become market-price
+freshness, an audit assessment cannot authorize execution, and deserialized/archival provenance is
+always ineligible even when it faithfully records a historical `DirectVerified` classification.
+Fair-value hierarchy is not an input to live quality assessment:
 
 ```rust
 #[test]
-fn modeled_level_two_evidence_is_not_execution_eligible()
+fn archival_assessment_is_never_current_execution_authority()
     -> Result<(), Box<dyn std::error::Error>>
 {
-    let evidence = QualificationEvidence::try_from(evidence_inputs(
-        DataQuality::Modeled,
-        FairValueHierarchy::Level2,
+    let assessment = QualificationAssessment::try_from(complete_bound_audit_inputs(
+        DataQuality::DirectVerified,
     ))?;
-    assert_eq!(evidence.execution_eligibility(), ExecutionEligibility::Ineligible);
+    assert_eq!(
+        assessment.policy_status(),
+        AssessmentPolicyStatus::Satisfied
+    );
+    assert_eq!(
+        assessment.execution_eligibility(),
+        ExecutionEligibility::Ineligible(EligibilityReason::RequiresCurrentRequalification)
+    );
     Ok(())
 }
 ```
 
-Run: `cargo test -p market-squawk-domain --test classification`
+Run:
 
-Expected: FAIL because the classification and evidence types are absent.
+```bash
+cargo test -p market-squawk-domain --test classification
+cargo test -p market-squawk-domain --test qualification_assessment
+```
+
+Expected: FAIL because the classification and assessment types are absent.
 
 - [ ] **Step 2: Implement independent enums without conversion shortcuts**
 
 Add the exact `FairValueHierarchy`, `MarketDepth`, and `DataQuality` variants from the product spec,
-plus `StreamIntegrityState`, `CaptureIntegrityState`, and `ExecutionEligibility`. Do not implement
-`From<FairValueHierarchy> for DataQuality`, `From<MarketDepth> for DataQuality`, or any ordinal
-comparison that implies evidentiary equivalence.
+plus `StreamIntegrityState`, `CaptureIntegrityState`, `ExecutionEligibility`, and typed ineligibility
+reasons. Do not implement conversions among taxonomy/operational types or any ordinal comparison
+that implies evidentiary equivalence. Runtime tests must test actual behavior; do not add a
+tautological runtime assertion that merely compares one enum variant to another.
 
-- [ ] **Step 3: Implement evidence-based qualification**
+- [ ] **Step 3: Implement a bound, audit-only qualification assessment**
 
-`QualificationEvidence` must carry typed evidence for source, venue, instrument, connection
-generation, sequence, snapshot consistency, checksum capability/result, exchange/receive time,
-market freshness, trading status, precision, and source coverage. Its constructor computes an
-eligibility result; callers cannot set `ExecutionEligibility::Eligible` directly.
+`QualificationAssessment` is a durable audit explanation, never a current authorization token. It
+contains immutable, mutually consistent evidence bound to one source ID, authoritative source
+metadata revision, authorization record, scoped coverage record and effective interval, venue,
+instrument, connection generation, provider channel/subscription, event class/depth, payload
+reference, canonical-state revision, snapshot state, sequence rule/result, checksum rule/result,
+source and receive timestamps, assessed-at time and checked policy window, market freshness,
+trading/venue/instrument status, precision result, stream integrity, and capture integrity. Every
+component repeats or references the same binding key; construction fails on any transplant,
+missing required evidence, impossible time ordering, or inconsistent capability/result pair.
+
+The assessment computes a typed `AssessmentPolicyStatus` with all satisfied/failed policy reason
+codes and the recorded `DataQuality`. That status is useful for audit and replay comparison only.
+The public domain API exposes no promotion method, `QualifiedCurrent` value, opaque authority, or
+execution-eligible constructor. `QualificationAssessment::execution_eligibility()` is always
+`Ineligible(RequiresCurrentRequalification)`, including after Serde round trips. Only Task 7's
+stateful live issuer may create current execution authority.
 
 - [ ] **Step 4: Implement canonical time and provenance**
 
 Use UTC nanosecond timestamps with validated ordering. Add:
 
 ```rust
-pub struct Provenance {
+pub struct LiveProvenance {
     schema_version: SchemaVersion,
     source_id: SourceId,
     instrument_id: Option<InstrumentId>,
@@ -471,8 +516,12 @@ pub struct Provenance {
 }
 ```
 
-Research metadata adds `effective_at`, `published_at`, `revision`, and `superseded_at`; constructors
-reject impossible time ordering without inventing unavailable timestamps.
+Live provenance may retain an archival `QualificationAssessment` and a recorded
+`DirectVerified` classification, but its archive-facing execution eligibility is always
+`Ineligible(RequiresCurrentRequalification)`. Deserialization must preserve the record for
+audit/research and must never manufacture Task 7's capability. `ResearchProvenance` adds
+`effective_at`, `published_at`, evidenced/unknown availability, `revision`, and `superseded_at`;
+constructors reject impossible time ordering without inventing unavailable timestamps.
 
 - [ ] **Step 5: Add canonical event families**
 
@@ -525,12 +574,14 @@ git commit -m "feat(domain): separate quality integrity and provenance"
 - Create: `crates/market-squawk-sources/Cargo.toml`
 - Create: `crates/market-squawk-sources/src/lib.rs`
 - Create: `crates/market-squawk-sources/src/metadata.rs`
+- Create: `crates/market-squawk-sources/src/registry.rs`
 - Create: `crates/market-squawk-sources/src/live.rs`
 - Create: `crates/market-squawk-sources/src/decoder.rs`
 - Create: `crates/market-squawk-sources/src/extraction.rs`
 - Create: `crates/market-squawk-sources/src/policy.rs`
 - Create: `crates/market-squawk-sources/src/health.rs`
 - Create: `crates/market-squawk-sources/tests/contracts.rs`
+- Create: `crates/market-squawk-sources/tests/registry_authority.rs`
 - Create: `crates/market-squawk-sources/tests/network_policy.rs`
 
 - [ ] **Step 1: Write metadata and allowlist tests**
@@ -556,10 +607,18 @@ Expected: FAIL because the source crate does not exist.
 
 - [ ] **Step 2: Implement metadata and health snapshots**
 
-`SourceMetadata` contains source ID, source class, authorization basis, coverage, supported
-instruments/events, delay semantics, declared quality ceiling, endpoint allowlist, freshness policy,
-and provider budget policy. `SourceHealthSnapshot` separately reports connection, market freshness,
-integrity, budget/cooldown, last error class, and coverage limitations.
+`SourceMetadata` is immutable/versioned and contains source ID, metadata revision and content hash,
+source class, typed authorization basis/evidence/effective interval, typed scoped coverage evidence/
+effective interval, supported instruments/events, delay semantics, declared quality ceiling,
+endpoint allowlist, freshness policy, and provider budget policy. `SourceHealthSnapshot` separately
+reports connection, session generation, market freshness, integrity, budget/cooldown, last error
+class, coverage limitations, and the metadata revision to which health applies.
+
+`AuthoritativeSourceRegistry` validates configured metadata/authorization/coverage and issues a
+registered-source handle; source supervision binds a current session-generation handle to it. Task
+7 obtains its authority gate from those handles, not from a public constructor taking loose
+`SourceMetadata`/result enums. Tests prove metadata revisions and effective intervals cannot be
+transplanted across sources or active sessions.
 
 - [ ] **Step 3: Implement object-safe distinct live/extraction traits**
 
@@ -707,7 +766,7 @@ git commit -m "refactor(platform): decouple capture from the live path"
 
 ---
 
-## Task 7: Implement scaled price-level books and evidence-driven qualification
+## Task 7: Implement scaled books and the stateful current-authority issuer
 
 **Files:**
 
@@ -716,9 +775,15 @@ git commit -m "refactor(platform): decouple capture from the live path"
 - Create: `crates/market-squawk-live/src/book.rs`
 - Create: `crates/market-squawk-live/src/integrity.rs`
 - Create: `crates/market-squawk-live/src/qualification.rs`
+- Create: `crates/market-squawk-live/src/authority.rs`
 - Create: `crates/market-squawk-live/tests/book.rs`
 - Create: `crates/market-squawk-live/tests/book_properties.rs`
 - Create: `crates/market-squawk-live/tests/qualification.rs`
+- Create: `crates/market-squawk-live/tests/authority.rs`
+- Create: `crates/market-squawk-live/tests/authority_privacy.rs`
+- Create: `crates/market-squawk-live/tests/ui/current_capability_is_opaque.rs`
+- Create: `crates/market-squawk-live/tests/ui/current_capability_is_not_serde.rs`
+- Create: `crates/market-squawk-live/tests/ui/domain_assessment_is_not_capability.rs`
 - Remove after migration: `apps/market-squawk/src/order_book.rs`
 - Remove after migration: `apps/market-squawk/src/quality.rs`
 
@@ -737,7 +802,10 @@ fn crossed_book_quarantines_the_generation() -> Result<(), Box<dyn std::error::E
         Err(BookError::Crossed { .. })
     ));
     assert_eq!(state.integrity(), StreamIntegrityState::Quarantined);
-    assert_eq!(state.eligibility(), ExecutionEligibility::Ineligible);
+    assert!(matches!(
+        authority_issuer().issue(&state, current_source_metadata(), decision_time()),
+        Err(AuthorityError::QuarantinedGeneration { .. })
+    ));
     Ok(())
 }
 ```
@@ -766,20 +834,62 @@ A heartbeat updates connection liveness only. Market freshness derives from the 
 event. Requalification requires a new or explicitly reset generation, a valid snapshot, all
 supported integrity evidence, valid status/precision, and freshness.
 
-- [ ] **Step 4: Bind qualification to provider capability evidence**
+- [ ] **Step 4: Implement the sole stateful current-authority issuer**
 
-The book cannot claim checksum or sequence validation when the source metadata says those
-capabilities are absent. `QualificationEvaluator` combines the live state and source ceiling; its
-output is `DirectVerified` only when every required evidence field is affirmative and the source
-ceiling allows it. Add a regression test proving Stage 1 Coinbase stays `DirectUnverified`.
+`market-squawk-live` owns the only production issuer of `LiveExecutionCapability`. Issuance consumes
+the authoritative current `SourceMetadata` revision (including authorization mode/evidence and
+scoped coverage/effective interval), current source-health state and session generation, and the
+instrument-owned state. It rechecks the complete Task 4 binding rather than trusting caller-authored
+result enums: source, metadata revision, authorization, coverage, venue, instrument, channel,
+event class/depth, generation, payload/canonical-state revision, snapshot, sequence, checksum,
+timestamps/freshness, trading status, precision, stream integrity, and capture integrity must all
+refer to the same current state.
 
-- [ ] **Step 5: Add property tests**
+The production issuer/current-authority gate is obtained only by binding Task 5's registered-source
+and active-session handles to the shard's instrument-owned state; there is no public constructor from
+loose metadata, audit assessment, health result enums, or timestamps. Test-only issuers are behind
+`cfg(test)`/non-default test support and their outputs are not accepted by production risk wiring.
+
+The issuer derives `DataQuality` and a policy-bound `valid_until`; callers supply neither. Expiry is
+the earliest applicable deadline from the source event's freshness budget, receive/source time
+sanity policy, metadata/authorization/coverage interval, session/state validity, and configured
+maximum capability lifetime. A capability is opaque, has private fields and constructors,
+implements neither `Serialize`, `Deserialize`, nor `Clone`, carries a single-use nonce, and is
+accepted only through the consumption path required by Task 10. Domain
+`QualificationAssessment`, archived provenance, snapshots, replayed records, and caller-authored
+`DirectVerified` values cannot mint or substitute for it.
+
+The book cannot claim checksum or sequence validation when authoritative metadata says those
+capabilities are absent. The live evaluator may record an audit assessment as `DirectVerified` only
+when every required field is affirmative and the source ceiling allows it; capability issuance has
+the additional current-state checks above. Add a regression test proving Stage 1 Coinbase remains
+`DirectUnverified` and cannot receive a capability.
+
+- [ ] **Step 5: Write adversarial capability tests before the issuer passes**
+
+Use Trybuild fixtures to prove a dependent crate cannot construct, deserialize, or clone
+`LiveExecutionCapability` and cannot pass `QualificationAssessment` where the capability is
+required. Table-drive a transplant test that replaces each binding component in turn: source,
+metadata revision, authorization, coverage/effective interval, venue, instrument, channel,
+event/depth, session generation, payload reference, canonical-state revision, snapshot/sequence/
+checksum evidence, timestamps/window, status, precision, stream integrity, and capture integrity.
+Every transplant must fail closed.
+
+Add exact boundary tests for generation rollover; metadata, authorization, coverage, or health
+revocation; acceptance at `valid_until` and rejection at `valid_until + 1ns`; validity at enqueue
+followed by expiry during queue delay; a capability revoked before consumption; and duplicate
+consumption of the same nonce. Ordinary reuse must also be prevented by by-value, non-`Clone`
+semantics. These tests must fail before the stateful issuer/nonce registry exists.
+
+- [ ] **Step 6: Add book and authority properties**
 
 Generate valid snapshots/deltas and assert: bids remain strictly descending, asks ascending,
 zero-quantity levels are absent, configured depth is bounded, best prices match extrema, and any
-crossed result is ineligible. Do not use `unwrap`/`expect` in the production implementation.
+crossed result cannot produce current authority. Generate valid authority bindings and mutate one
+component at a time; no mutation may be accepted. Do not use `unwrap`/`expect` in the production
+implementation.
 
-- [ ] **Step 6: Verify and commit**
+- [ ] **Step 7: Verify and commit**
 
 ```bash
 cargo test -p market-squawk-live --all-features
@@ -787,7 +897,7 @@ cargo clippy -p market-squawk-live --all-targets --all-features -- -D warnings
 cargo test -p market-squawk --test order_book --test quality
 git diff --check
 git add Cargo.toml Cargo.lock crates/market-squawk-live apps/market-squawk
-git commit -m "feat(live): add scaled books and qualification state"
+git commit -m "feat(live): add scaled books and current authority"
 ```
 
 ---
@@ -926,6 +1036,10 @@ git commit -m "refactor(analytics): extract pure online feature kernels"
 - Create: `crates/market-squawk-execution/tests/risk.rs`
 - Create: `crates/market-squawk-execution/tests/approval_privacy.rs`
 - Create: `crates/market-squawk-execution/tests/ui/approved_order_is_private.rs`
+- Create: `crates/market-squawk-execution/tests/ui/domain_assessment_cannot_authorize.rs`
+- Create: `crates/market-squawk-execution/tests/ui/capability_cannot_be_reused.rs`
+- Create: `crates/market-squawk-execution/tests/authority_adversarial.rs`
+- Create: `crates/market-squawk-execution/tests/dispatch_once.rs`
 - Remove after migration: `apps/market-squawk/src/risk.rs`
 
 - [ ] **Step 1: Write risk matrix and compile-fail tests**
@@ -947,6 +1061,14 @@ Run: `cargo test -p market-squawk-execution --test approval_privacy`
 Expected: FAIL because the execution crate/API is absent, then pass only when the UI fixture fails
 with the expected privacy error.
 
+Additional compile-fail fixtures must prove a domain `QualificationAssessment`, deserialized live
+provenance, immutable snapshot, replay record, or caller-authored `DirectVerified` classification
+cannot satisfy the `LiveExecutionCapability` parameter; the capability cannot be cloned/reused; and
+neither `ApprovedOrder` nor the adapter-only dispatch value can be externally constructed or
+deserialized. Runtime adversarial tests cover every binding transplant, capability expiry, stale
+queue delay, generation rollover, health revocation, duplicate capability nonce, duplicate approval
+ID, and adapter retry.
+
 - [ ] **Step 2: Implement the complete intent contract**
 
 `OrderIntent` contains strategy/model identity, instrument, account, side, order type, quantity,
@@ -955,10 +1077,21 @@ required data quality. Its constructor rejects internally inconsistent order-typ
 
 - [ ] **Step 3: Implement deterministic risk evaluation**
 
-`RiskService::evaluate(intent, market, account, limits)` returns either `RiskRejection` with all
-applicable reason codes or a privately constructible `ApprovedOrder`. Approval records input hashes,
-risk ruleset version, decision time, expiry, bounded price reference, and evidence ID. It is neither
-Serde-deserializable nor publicly constructible.
+`RiskService::evaluate` requires the Task 7 `LiveExecutionCapability` by value in addition to intent,
+market/account views, limits, explicit action time, and a mutable reference to Task 7's
+non-constructible current-authority gate. Risk invokes the gate's consuming validation and checks
+that the capability remains bound to the authoritative metadata revision, authorization, coverage,
+current session generation, instrument state, current healthy source state, and action time. It does
+not accept domain assessments or archive/snapshot DTOs. All other deterministic risk checks still
+run and produce typed reason codes; a consumed capability is never reusable for a retry.
+
+Evaluation returns either `RiskRejection` with all applicable reason codes or a privately
+constructible `ApprovedOrder`. Approval records input hashes, risk ruleset version, decision/action
+time, bounded price reference, authority/capability evidence ID, current-generation binding, and
+expiry. Its expiry is the minimum of intent expiration, the consumed capability's `valid_until`,
+source authorization/coverage validity, and the risk policy's own approval lifetime, so approval can
+never extend the underlying evidence. It is neither Serde-deserializable, clonable, nor publicly
+constructible.
 
 - [ ] **Step 4: Define the adapter gate**
 
@@ -966,7 +1099,7 @@ Serde-deserializable nor publicly constructible.
 use futures::future::BoxFuture;
 
 pub trait ExecutionAdapter {
-    fn submit(&self, order: ApprovedOrder)
+    fn submit(&self, order: DispatchOrder)
         -> BoxFuture<'_, Result<ExecutionReceipt, ExecutionError>>;
     fn cancel(&self, order_id: &OrderId)
         -> BoxFuture<'_, Result<CancelReceipt, ExecutionError>>;
@@ -974,18 +1107,27 @@ pub trait ExecutionAdapter {
 }
 ```
 
-The type is public because it appears in a public adapter trait, but all fields and constructors are
-private to the execution crate; it implements neither `Deserialize` nor `Clone`. Use a boxed future
-per order operation for object-safe configured adapters; risk evaluation and event-to-decision
-kernels remain allocation-free. Keep approval validation and one-time approval-ID consumption
-immediately before adapter dispatch so expired/duplicate approvals cannot queue or execute. CLI and
-MCP services accept intents or cancellation requests, never `ApprovedOrder`.
+`ExecutionDispatcher::submit(ApprovedOrder, current_authority, action_at)` is the sole public path
+to the configured adapter. Immediately before dispatch it atomically consumes the approval ID,
+rechecks expiry and the live authority binding/revocation state, and privately constructs the
+adapter-only `DispatchOrder`. Duplicate/retried IDs fail before the backend is invoked; an uncertain
+backend outcome requires reconciliation and a new risk decision rather than replaying the value.
+`DispatchOrder` is public only because it appears in the adapter trait; all fields and constructors
+are private to the execution crate and it implements neither Serde nor `Clone`.
+
+Use a boxed future per adapter operation for object-safe configured adapters; risk evaluation and
+event-to-decision kernels remain allocation-free. CLI and MCP services accept intents or
+cancellation requests, never capabilities, `ApprovedOrder`, or `DispatchOrder`.
 
 - [ ] **Step 5: Rewire the current bot through the risk service**
 
 Move strategy-to-intent mapping behind the new contracts. Preserve current conservative behavior,
 but delete all direct execution-adapter calls from strategy/app/MCP code. Add an integration test
-that enumerates every app submission entry point and asserts the same risk audit is produced.
+that enumerates every app submission entry point and proves the path is Task 7 issuer -> consuming
+`RiskService::evaluate` -> one-time `ExecutionDispatcher` -> adapter, with the same risk/dispatch
+audit records. Test `valid_until + 1ns`, expiration while queued, health or generation change after
+risk but before dispatch, duplicate/revoked capability consumption, duplicate approval dispatch,
+and failure/retry behavior.
 
 - [ ] **Step 6: Verify and commit**
 
@@ -1112,18 +1254,21 @@ Run: `cargo test -p market-squawk-adapter-paper --test compatibility`
 
 Expected: FAIL because the adapter does not exist.
 
-- [ ] **Step 2: Implement the adapter behind `ApprovedOrder`**
+- [ ] **Step 2: Implement the adapter behind the one-time dispatcher**
 
-Only `ExecutionAdapter::submit(ApprovedOrder)` enters the order state machine. Keep order IDs
-monotonic and state transitions explicit. Use checked decimal/integer accounting; reject insufficient
-cash/position without mutation. Produce an audit record for submit, reject, cancel, fill, and
-reconcile.
+Only `ExecutionDispatcher::submit(ApprovedOrder, current_authority, action_at)` may construct the
+`DispatchOrder` accepted by `ExecutionAdapter::submit`. Keep order IDs monotonic and state
+transitions explicit. Use checked decimal/integer accounting; reject insufficient cash/position
+without mutation. Produce an audit record for submit, reject, cancel, fill, and reconcile.
 
 - [ ] **Step 3: Prove the risk gate at the adapter boundary**
 
-An integration test attempts all public constructors/Serde paths from outside the execution crate
-and proves none can produce an approval. The successful path must call `RiskService::evaluate`, then
-submit before approval expiry. Ensure app/MCP code cannot import a test-only approval constructor.
+An integration test attempts all public constructors/Serde paths from outside the live/execution
+crates and proves none can produce a capability, approval, or dispatch value. The successful path
+must obtain current authority from Task 7, pass the opaque capability by value to
+`RiskService::evaluate`, then pass the resulting approval once through `ExecutionDispatcher` before
+the evidence-derived expiry. Prove duplicate dispatch and backend retry cannot reuse the approval.
+Ensure app/MCP code cannot import a test-only authority or approval constructor.
 
 - [ ] **Step 4: Preserve limitations for the Stage 5 implementation**
 
@@ -1195,9 +1340,13 @@ obtains shard handles, adapter internals, secrets, filesystem handles, or risk a
 
 Move journal replay into the app's `diagnostic_replay` composition module; it joins the platform
 journal reader, selected adapter decoder, and live sink without introducing a reverse dependency.
-It is not a dependency of historical research, model training, or live startup. Mark replayed
-records non-executable unless an explicit test-only policy is installed. Preserve current replay
-tests.
+It is not a dependency of historical research, model training, or live startup. Replayed records
+remain archival/diagnostic and are unconditionally execution-ineligible: replay must not obtain the
+authoritative current source registry/session handle, instantiate the production authority issuer,
+or mint `LiveExecutionCapability`. Simulation and test harnesses use separately typed sinks whose
+outputs are not accepted by production `RiskService`; there is no policy flag that promotes replay
+into current authority. Preserve current replay tests and add a boundary test proving replay cannot
+satisfy the risk capability parameter.
 
 - [ ] **Step 4: Implement deterministic lifecycle and shutdown**
 
@@ -1446,12 +1595,15 @@ cargo test -p market-squawk-domain --test financial_properties
 cargo test -p market-squawk-live --test book_properties
 cargo test -p market-squawk-live --test overflow
 cargo test -p market-squawk-live --test sharding
+cargo test -p market-squawk-live --test authority --test authority_privacy
 cargo test -p market-squawk-execution --test approval_privacy
+cargo test -p market-squawk-execution --test authority_adversarial --test dispatch_once
 cargo test -p market-squawk-mcp --test limits
 ```
 
-Expected: exact conversion, book invariants, saturation quarantine, stable routing, approval privacy,
-and MCP bounds are directly evidenced rather than inferred from the aggregate suite.
+Expected: exact conversion, book invariants, saturation quarantine, stable routing, capability
+binding/privacy/expiry, risk authority rejection, one-time dispatch, approval privacy, and MCP bounds
+are directly evidenced rather than inferred from the aggregate suite.
 
 - [ ] **Step 3: Record reproducible evidence without performance claims**
 
@@ -1503,10 +1655,15 @@ git commit -m "docs: record verified Stage 1 foundation"
   invariant-preserving fields.
 - [ ] Fair-value hierarchy, market depth, data quality, integrity, and execution eligibility cannot
   be confused through public conversions.
+- [ ] Domain assessments and all archival/replay provenance remain execution-ineligible and cannot
+  mint or deserialize live current authority.
 - [ ] Capture and shard queues are bounded; overflow is observable and execution-ineligible.
 - [ ] Live state has deterministic single-writer ownership and immutable bounded snapshots.
 - [ ] Coinbase cannot exceed `DirectUnverified` in Stage 1.
-- [ ] Every submission route uses the same risk service and unforgeable approval.
+- [ ] The live issuer alone mints opaque, one-use, expiring current capabilities from authoritative
+  registry/session/instrument state; transplant, rollover, delay, revocation, and reuse tests pass.
+- [ ] Every submission route consumes current authority through the same risk service; approvals
+  cannot outlive evidence and dispatch consumes each approval ID once.
 - [ ] CLI and MCP use the same bounded services; MCP has no unrestricted dangerous tools.
 - [ ] Workspace, dependency, advisory, license, credential, artifact, lint, test, and release gates
   pass with a committed lockfile.

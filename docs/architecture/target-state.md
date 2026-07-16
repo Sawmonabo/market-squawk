@@ -162,6 +162,14 @@ kept distinct from registry resolution. Effective-time identity records preserve
 mergers, delistings, contract rolls, and corporate actions without changing internal
 `InstrumentId` identity.
 
+Futures identities preserve FIX Latest EP307 tag 200 `MonthYear` forms (`YYYYMM`, `YYYYMMDD`, or
+`YYYYMMwN`) without reducing day/week designators to a month. Tag 541 maturity date, leg-scoped tag
+610 designators, and optional lifecycle dates remain independent sourced claims. Provider identity
+records bind the provider namespace/native ID and stable instrument to an immutable payload
+reference, source/first-observed timestamps, authoritative metadata revision/evidence, and effective
+interval. Exact evidence duplicates are idempotent, conflicting same-revision payloads are
+quarantined, and a newer evidenced revision appends/supersedes without overwriting history.
+
 ### Separate classification types
 
 ```rust
@@ -221,11 +229,17 @@ pub enum ExecutionEligibility {
 
 No implicit or infallible conversion exists among these types.
 
+`ExecutionEligibility` in serialized domain data is an archive/control-plane explanation, not a
+bearer capability. Archive-facing provenance and audit assessments are always
+`Ineligible(RequiresCurrentRequalification)`, even when they retain a historical
+`DirectVerified` classification.
+
 ### Provenance and time
 
 Every canonical live record includes schema version, source, internal instrument, venue where
 applicable, source identifier, connection generation, source timestamp, receive time, ingestion
-time, data quality, source coverage, and payload hash/reference.
+time, data quality, source coverage, payload hash/reference, and optional audit assessment. Serde
+round trips retain recorded classification/evidence but can never mint current execution authority.
 
 Every research observation additionally includes effective/reference time, publication time when
 known, availability time when evidenced, local first-observed time, revision identity, and
@@ -274,9 +288,13 @@ use object-safe boxed futures allocated once per source session or extraction re
 per market event. `MarketDecoder` is synchronous, bounded, source-specific, and separately testable;
 capture occurs before it is invoked. Provider validation loops remain concrete, bounded code.
 
-`SourceMetadata` declares authorization mode, provider, endpoint allowlist, asset/venue coverage,
-depth, delay, consolidation status, sequence/checksum capabilities, historical/revision coverage,
-rate policy, schema version, and data-quality ceiling.
+`SourceMetadata` is immutable/versioned and declares its revision/content hash, authorization mode
+and evidence/effective interval, provider, endpoint allowlist, evidenced asset/venue/event/depth
+coverage and effective interval, delay, consolidation status, sequence/checksum capabilities,
+historical/revision coverage, rate policy, schema version, and data-quality ceiling.
+`AuthoritativeSourceRegistry` validates that metadata and emits registered-source/current-session
+handles consumed by the live authority issuer; loose metadata/result enums cannot construct the
+gate.
 
 ### Provider access policy
 
@@ -327,9 +345,20 @@ instruments. No other task obtains a mutable reference.
 Shard-count changes are restart-time configuration changes with an explicit state-rebuild policy;
 they do not remap live state dynamically.
 
-### Qualification evidence
+### Audit assessment and current execution authority
 
-`DirectVerified` is emitted only when `QualificationEvidence` proves:
+The domain `QualificationAssessment` is a durable audit explanation. It binds one source, source
+metadata revision, authorization and scoped coverage record, venue, instrument, channel/event/depth,
+session generation, payload and canonical-state revision, snapshot/sequence/checksum evidence,
+source/receive/assessment timing window, freshness, status, precision, and stream/capture integrity.
+It records typed policy results and `DataQuality`, but is always execution-ineligible and exposes no
+promotion method or current capability. `FairValueHierarchy` is not an assessment input.
+
+The stateful `market-squawk-live` authority issuer is the only component that can mint the opaque,
+non-Serde, non-`Clone`, single-use, short-lived `LiveExecutionCapability` accepted by risk. Before
+issuance it rebinds the complete assessment to the authoritative current source registry/session and
+instrument-owned state. A current `DirectVerified` classification is possible only when those inputs
+prove:
 
 - Known authorized source
 - Known venue and internal instrument
@@ -344,8 +373,11 @@ they do not remap live state dynamically.
 - Exact tick and lot precision
 - Consistent non-crossed book
 
-Loss of any required evidence changes quality to `Quarantined` or `Stale`, revokes execution
-eligibility, clears executable features/signals, and requires source-specific requalification.
+Capability expiry is policy-derived as the earliest freshness, metadata/authorization/coverage, or
+maximum-lifetime deadline. Loss of any required evidence changes quality to `Quarantined` or
+`Stale`, revokes outstanding capability nonces, clears executable features/signals, and requires
+source-specific requalification in a current generation. A domain assessment, archive, immutable
+snapshot, replay record, or caller-authored quality variant can never substitute for the capability.
 
 Coinbase Level 2 is `DirectUnverified` unless a selected channel and implementation establish the
 complete evidence contract. Kraken WebSocket v2 price-level books can become `DirectVerified` only
@@ -363,13 +395,18 @@ Strategies implement the canonical `Strategy` trait and emit `OrderIntent`. An i
 strategy/model identity, instrument, side, order type, quantity, price, time in force, signal and
 expiration times, reason codes, maximum slippage, and required data quality.
 
-Only the risk service can construct `ApprovedOrder`. Its constructor is crate-private and its
-fields are private. Every risk decision records evaluated limits and reason codes. Risk validates
-quality/freshness, eligibility, exposure, leverage, capital, price/slippage, order rate, duplicates,
-loss/drawdown, and expiration. Inference errors produce no action.
+Only the risk service can construct `ApprovedOrder`. It consumes `LiveExecutionCapability` by value
+and revalidates action time, current generation, current source health, the authoritative metadata/
+authorization/coverage revision, and all normal exposure, leverage, capital, price/slippage, order
+rate, duplicate, loss/drawdown, and expiration checks. An approval's expiry cannot exceed the
+consumed evidence. Its constructor is crate-private, its fields are private, and it is neither Serde
+nor `Clone`. Every risk decision records evaluated limits and reason codes. Inference errors produce
+no action.
 
-Execution adapters accept only `ApprovedOrder`. CLI, MCP, models, and strategies cannot construct
-or submit one directly.
+`ExecutionDispatcher` atomically consumes an approval ID once, rechecks expiry and authority
+revocation immediately before the backend call, and creates the privately constructible
+adapter-only `DispatchOrder`. CLI, MCP, models, strategies, archives, and replay cannot construct or
+submit capabilities, approvals, or dispatch values directly.
 
 ## Paper execution
 
