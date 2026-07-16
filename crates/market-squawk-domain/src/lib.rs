@@ -1,5 +1,6 @@
 //! Shared invariant-preserving Market Squawk domain contracts.
 
+mod capture;
 mod classification;
 mod denomination;
 mod digest;
@@ -14,6 +15,10 @@ mod research;
 mod time;
 mod version;
 
+pub use capture::{
+    CaptureAdmission, CaptureAuthorityBundle, CaptureAuthorityError, CaptureDegradation,
+    CaptureInitializer, RawCaptureFrameView,
+};
 pub use classification::{
     AssessmentStatus, AssessmentValidity, AuthorizationBasis, BindingError, BookIntegrity,
     BookStateBinding, BoundAssessment, CanonicalStateDigest, CanonicalizationRule,
