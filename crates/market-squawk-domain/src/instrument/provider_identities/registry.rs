@@ -14,7 +14,10 @@ use crate::{InstrumentError, ProviderInstrumentId, SourceId, Timestamp};
 pub enum ProviderIdentityIngestOutcome {
     /// The assertion introduced the first revision for its natural provider key.
     Inserted,
-    /// Content-equivalent evidence added locator metadata and/or local observation times.
+    /// A content-equivalent assertion was coalesced, including an already-retained exact duplicate.
+    ///
+    /// New locator metadata and local observation times are retained when supplied. Reingesting an
+    /// exact duplicate reports this outcome without changing canonical registry state.
     ObservationCoalesced,
     /// A checked, evidenced successor revision was appended to an existing key.
     SupersedingRevisionAppended,
@@ -33,13 +36,36 @@ pub struct ProviderIdentityRegistry {
     conflicts: Vec<ProviderIdentityConflict>,
 }
 
+const fn checked_max_wire_records() -> Option<usize> {
+    match ProviderIdentityRegistry::MAX_CONFLICTS
+        .checked_mul(ProviderIdentityConflict::MAX_COMPETING_ASSERTIONS)
+    {
+        Some(conflict_records) => {
+            ProviderIdentityRegistry::MAX_ACCEPTED_RECORDS.checked_add(conflict_records)
+        }
+        None => None,
+    }
+}
+
+const fn wire_record_bound_is_valid() -> bool {
+    match checked_max_wire_records() {
+        Some(total) => total <= ProviderIdentityRegistry::MAX_RECONSTRUCTION_RECORDS,
+        None => false,
+    }
+}
+
 impl ProviderIdentityRegistry {
     /// Maximum accepted revisions retained by one registry.
     pub const MAX_ACCEPTED_RECORDS: usize = 65_536;
-    /// Maximum conflict groups retained by one registry.
-    pub const MAX_CONFLICTS: usize = 16_384;
     /// Maximum raw assertions accepted by one batch reconstruction.
     pub const MAX_RECONSTRUCTION_RECORDS: usize = 262_144;
+    /// Maximum conflict groups retained without exceeding the worst-case reconstruction budget.
+    pub const MAX_CONFLICTS: usize = 768;
+    /// Maximum provider records the nested registry wire can retain before reconstruction.
+    pub const MAX_WIRE_RECORDS: usize = match checked_max_wire_records() {
+        Some(total) => total,
+        None => usize::MAX,
+    };
 
     /// Constructs an empty checked registry.
     pub const fn new() -> Self {
@@ -192,6 +218,8 @@ impl ProviderIdentityRegistry {
         Ok(records)
     }
 }
+
+const _: () = assert!(wire_record_bound_is_valid());
 
 impl Default for ProviderIdentityRegistry {
     fn default() -> Self {

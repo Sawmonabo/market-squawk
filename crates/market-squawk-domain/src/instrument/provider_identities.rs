@@ -197,7 +197,7 @@ pub struct ProviderIdentityRecordInput {
     pub source_timestamp: Option<Timestamp>,
     /// Local time this exact assertion was observed.
     pub observed_at: Timestamp,
-    /// Immutable source metadata revision.
+    /// Bounded caller/source revision identity; surrounding evidence establishes its authority.
     pub metadata_revision: MetadataRevision,
     /// Half-open interval claimed by this revision.
     pub validity: EffectiveInterval,
@@ -265,7 +265,7 @@ impl ProviderIdentityRecord {
         &self.observation_timestamps
     }
 
-    /// Returns the immutable source metadata revision.
+    /// Returns the caller/source revision identity bound by the surrounding assertion evidence.
     pub const fn metadata_revision(&self) -> &MetadataRevision {
         &self.metadata_revision
     }

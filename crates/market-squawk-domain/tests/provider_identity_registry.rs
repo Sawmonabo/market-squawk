@@ -1,10 +1,11 @@
 use market_squawk_domain::{
     AssetClass, Currency, Denomination, EffectiveInterval, EvidenceDigest, InstrumentDefinition,
     InstrumentDefinitionInput, InstrumentError, InstrumentId, LotSize, MetadataRevision,
-    PayloadHashAlgorithm, ProviderIdentityConflictReason, ProviderIdentityEvidence,
-    ProviderIdentityIngestOutcome, ProviderIdentityLocator, ProviderIdentityRecord,
-    ProviderIdentityRecordInput, ProviderIdentityRegistry, ProviderIdentitySupersession,
-    ProviderInstrumentId, SourceId, SourceIdentifier, TickSize, Timestamp, TradingStatus,
+    PayloadHashAlgorithm, ProviderIdentityConflict, ProviderIdentityConflictReason,
+    ProviderIdentityEvidence, ProviderIdentityIngestOutcome, ProviderIdentityLocator,
+    ProviderIdentityRecord, ProviderIdentityRecordInput, ProviderIdentityRegistry,
+    ProviderIdentitySupersession, ProviderInstrumentId, SourceId, SourceIdentifier, TickSize,
+    Timestamp, TradingStatus,
 };
 use rust_decimal::Decimal;
 use uuid::Uuid;
@@ -87,6 +88,37 @@ fn supersedes(
     ))
 }
 
+fn conflicted_registry(
+    owner: InstrumentId,
+) -> Result<ProviderIdentityRegistry, Box<dyn std::error::Error>> {
+    let validity = EffectiveInterval::new(Timestamp::from_unix_nanos(10), None)?;
+    Ok(ProviderIdentityRegistry::try_from_records(vec![
+        record(owner, "revision-1", 100, 1, validity, None)?,
+        record(owner, "revision-1", 200, 2, validity, None)?,
+    ])?)
+}
+
+#[test]
+fn registry_wire_capacity_matches_aggregate_reconstruction_budget() {
+    assert_eq!(
+        ProviderIdentityRegistry::MAX_WIRE_RECORDS,
+        ProviderIdentityRegistry::MAX_RECONSTRUCTION_RECORDS
+    );
+
+    let one_more_conflict_bound = ProviderIdentityRegistry::MAX_CONFLICTS
+        .checked_add(1)
+        .and_then(|conflicts| {
+            conflicts.checked_mul(ProviderIdentityConflict::MAX_COMPETING_ASSERTIONS)
+        })
+        .and_then(|conflict_records| {
+            ProviderIdentityRegistry::MAX_ACCEPTED_RECORDS.checked_add(conflict_records)
+        });
+    assert!(matches!(
+        one_more_conflict_bound,
+        Some(total) if total > ProviderIdentityRegistry::MAX_RECONSTRUCTION_RECORDS
+    ));
+}
+
 fn definition(
     definition_instrument: InstrumentId,
     provider_identities: Vec<ProviderIdentityRecord>,
@@ -167,6 +199,29 @@ fn registry_ingest_reports_exhaustive_state_transitions_and_never_selects_a_winn
             )
             .is_none()
     );
+    Ok(())
+}
+
+#[test]
+fn exact_duplicate_reports_coalescing_without_changing_state()
+-> Result<(), Box<dyn std::error::Error>> {
+    let owner = instrument(1)?;
+    let assertion = record(
+        owner,
+        "revision-1",
+        100,
+        1,
+        EffectiveInterval::new(Timestamp::from_unix_nanos(10), None)?,
+        None,
+    )?;
+    let mut registry = ProviderIdentityRegistry::try_from_records(vec![assertion.clone()])?;
+    let before = registry.clone();
+
+    assert_eq!(
+        registry.ingest(assertion)?,
+        ProviderIdentityIngestOutcome::ObservationCoalesced
+    );
+    assert_eq!(registry, before);
     Ok(())
 }
 
@@ -424,6 +479,34 @@ fn registry_wire_reconstructs_invariants_and_rejects_tampering()
     let mut empty_observations = wire;
     empty_observations["accepted"][0]["observation_timestamps"] = serde_json::json!([]);
     assert!(serde_json::from_value::<ProviderIdentityRegistry>(empty_observations).is_err());
+    Ok(())
+}
+
+#[test]
+fn registry_wire_round_trip_preserves_quarantined_competitors()
+-> Result<(), Box<dyn std::error::Error>> {
+    let registry = conflicted_registry(instrument(1)?)?;
+
+    assert_eq!(
+        serde_json::from_value::<ProviderIdentityRegistry>(serde_json::to_value(&registry)?)?,
+        registry
+    );
+    Ok(())
+}
+
+#[test]
+fn registry_wire_field_order_preserves_checked_reconstruction()
+-> Result<(), Box<dyn std::error::Error>> {
+    let registry = conflicted_registry(instrument(1)?)?;
+    let wire = serde_json::to_value(&registry)?;
+    let conflicts = serde_json::to_string(&wire["conflicts"])?;
+    let accepted = serde_json::to_string(&wire["accepted"])?;
+    let conflicts_first = format!(r#"{{"conflicts":{conflicts},"accepted":{accepted}}}"#);
+
+    assert_eq!(
+        serde_json::from_str::<ProviderIdentityRegistry>(&conflicts_first)?,
+        registry
+    );
     Ok(())
 }
 
