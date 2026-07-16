@@ -4,7 +4,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{SchemaVersion, SchemaVersionError, SourceIdentifier};
+use crate::{DigestAlgorithm, SchemaVersion, SchemaVersionError, SourceIdentifier};
 
 #[path = "provenance/live.rs"]
 mod live;
@@ -19,32 +19,22 @@ pub use research::{
     ResearchTime, RevisionNumber,
 };
 
-/// Hash algorithm identifying how a retained payload digest was produced.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PayloadHashAlgorithm {
-    /// SHA-256 digest.
-    Sha256,
-    /// BLAKE3 digest.
-    Blake3,
-}
-
 /// An algorithm-qualified 256-bit content digest.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PayloadHash {
-    algorithm: PayloadHashAlgorithm,
+    algorithm: DigestAlgorithm,
     digest: [u8; 32],
 }
 
 impl PayloadHash {
     /// Constructs an algorithm-qualified digest.
-    pub const fn new(algorithm: PayloadHashAlgorithm, digest: [u8; 32]) -> Self {
+    pub const fn new(algorithm: DigestAlgorithm, digest: [u8; 32]) -> Self {
         Self { algorithm, digest }
     }
 
     /// Returns the digest algorithm.
-    pub const fn algorithm(self) -> PayloadHashAlgorithm {
+    pub const fn algorithm(self) -> DigestAlgorithm {
         self.algorithm
     }
 
@@ -74,6 +64,8 @@ pub enum PayloadReference {
 pub enum ProvenanceError {
     /// Local receive time is later than local ingestion time.
     ReceivedAfterIngested,
+    /// Local availability precedes local receipt.
+    AvailabilityBeforeReceived,
     /// Payload content hash does not match the complete live binding.
     PayloadDigestMismatch,
     /// Availability evidence is later than local ingestion.
@@ -99,6 +91,9 @@ impl fmt::Display for ProvenanceError {
         match self {
             Self::ReceivedAfterIngested => {
                 formatter.write_str("receive time must not be later than ingestion time")
+            }
+            Self::AvailabilityBeforeReceived => {
+                formatter.write_str("availability time must not precede receive time")
             }
             Self::PayloadDigestMismatch => {
                 formatter.write_str("payload reference digest does not match live binding")

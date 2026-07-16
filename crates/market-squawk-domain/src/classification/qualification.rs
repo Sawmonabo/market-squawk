@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use super::{
     BookIntegrity, BoundAssessment, CaptureIntegrityState, ChecksumCapability, ChecksumIntegrity,
@@ -195,6 +195,7 @@ impl std::error::Error for QualificationError {}
 /// short-lived token, but no dependent crate can derive such a token from this type alone. This
 /// type intentionally has no execution-eligibility or authority API.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct QualificationAssessment {
     assessment_id: QualificationAssessmentId,
     binding: LiveEvidenceBinding,
@@ -205,6 +206,51 @@ pub struct QualificationAssessment {
     failures: EligibilityFailures,
     evaluated_at: Timestamp,
     valid_until: Timestamp,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QualificationAssessmentWire {
+    assessment_id: QualificationAssessmentId,
+    binding: LiveEvidenceBinding,
+    source_policy: BoundAssessment<SourcePolicyAssessment>,
+    integrity: IntegrityAssessmentSet,
+    market: MarketAssessmentSet,
+    recorded_quality: DataQuality,
+    failures: EligibilityFailures,
+    evaluated_at: Timestamp,
+    valid_until: Timestamp,
+}
+
+impl<'de> Deserialize<'de> for QualificationAssessment {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = QualificationAssessmentWire::deserialize(deserializer)?;
+        let recorded_quality = wire.recorded_quality;
+        let failures = wire.failures;
+        let evaluated_at = wire.evaluated_at;
+        let valid_until = wire.valid_until;
+        let rebuilt = Self::try_from(QualificationAssessmentInput::new(
+            wire.assessment_id,
+            wire.binding,
+            wire.source_policy,
+            wire.integrity,
+            wire.market,
+        ))
+        .map_err(serde::de::Error::custom)?;
+        if rebuilt.recorded_quality != recorded_quality
+            || rebuilt.failures != failures
+            || rebuilt.evaluated_at != evaluated_at
+            || rebuilt.valid_until != valid_until
+        {
+            return Err(serde::de::Error::custom(
+                "serialized qualification result contradicts reconstructed assessment",
+            ));
+        }
+        Ok(rebuilt)
+    }
 }
 
 impl QualificationAssessment {

@@ -379,7 +379,18 @@ fn snapshot_initialization_is_explicit_even_without_provider_sequence() -> Resul
     let initialized = market_squawk_domain::InitializedSnapshot::new(
         generation,
         market_squawk_domain::SourceIdentifier::try_from("snapshot-7")?,
-        market_squawk_domain::EvidenceDigest::new([7; 32]),
+        market_squawk_domain::CanonicalStateDigest::new(
+            market_squawk_domain::EvidenceDigest::new(
+                market_squawk_domain::PayloadHashAlgorithm::Sha256,
+                [7; 32],
+            ),
+            market_squawk_domain::CanonicalizationRule::new(
+                market_squawk_domain::SourceIdentifier::try_from(
+                    "market-squawk.book.price-level-v1",
+                )?,
+                market_squawk_domain::RuleVersion::new(1)?,
+            ),
+        ),
         Timestamp::from_unix_nanos(900),
         None,
     );

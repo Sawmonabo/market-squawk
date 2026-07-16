@@ -24,6 +24,7 @@ fn market_event() -> Result<MarketEvent, Box<dyn Error>> {
         binding,
         Some(Timestamp::from_unix_nanos(995)),
         Timestamp::from_unix_nanos(1_000),
+        Timestamp::from_unix_nanos(1_000),
         Timestamp::from_unix_nanos(1_001),
         DataQuality::DirectUnverified,
         CoverageStatus::Sufficient,

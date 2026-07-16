@@ -307,7 +307,11 @@ impl SourceCoverageRecord {
     }
 }
 
-impl AssessmentValidity for SourceCoverageRecord {}
+impl AssessmentValidity for SourceCoverageRecord {
+    fn maximum_valid_until(&self) -> Option<Timestamp> {
+        self.scope.effective_until()
+    }
+}
 
 /// Coverage dimension implicated in a transplant attempt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -7,13 +7,14 @@ use std::error::Error;
 use std::str::FromStr;
 
 use market_squawk_domain::{
-    AuthorizationBasis, BookIntegrity, BookStateBinding, BoundAssessment, CaptureIntegrityState,
-    ChecksumCapability, ChecksumEvidence, ChecksumScope, ChecksumValue, ConnectionGeneration,
-    CoverageConsolidation, CoverageDelay, CoverageScope, CoverageStatus, DataQuality,
-    DeliveryEvidence, EvidenceDigest, InitializedSnapshot, InstrumentId, IntegrityAssessmentSet,
-    IntegrityCapabilities, IntegrityRule, LiveEventClass, LiveEvidenceBinding,
-    LiveTimingAssessment, LiveTimingPolicy, MarketAssessmentSet, MarketDepth, MarketEventTiming,
-    MetadataRevision, PayloadChecksumScope, PrecisionIntegrity, ProviderChannel, ProviderProduct,
+    AuthorizationBasis, BookIntegrity, BookStateBinding, BoundAssessment, CanonicalStateDigest,
+    CanonicalizationRule, CaptureIntegrityState, ChecksumCapability, ChecksumEvidence,
+    ChecksumScope, ChecksumValue, ConnectionGeneration, CoverageConsolidation, CoverageDelay,
+    CoverageScope, CoverageStatus, DataQuality, DeliveryEvidence, EvidenceDigest,
+    InitializedSnapshot, InstrumentId, IntegrityAssessmentSet, IntegrityCapabilities,
+    IntegrityRule, LiveEventClass, LiveEvidenceBinding, LiveTimingAssessment, LiveTimingPolicy,
+    MarketAssessmentSet, MarketDepth, MarketEventTiming, MetadataRevision, PayloadChecksumScope,
+    PayloadHashAlgorithm, PrecisionIntegrity, ProviderChannel, ProviderProduct,
     QualificationAssessmentId, QualificationAssessmentInput, RuleVersion, SequenceCapability,
     SequenceEvidence, SequenceNumber, SequenceValidationRule, SnapshotApplicability,
     SnapshotEvidence, SourceAuthorization, SourceCoverageRecord, SourceId, SourceIdentifier,
@@ -62,11 +63,18 @@ impl Default for BindingSpec {
 }
 
 pub(crate) fn binding(spec: &BindingSpec) -> Result<LiveEvidenceBinding, Box<dyn Error>> {
+    let state_digest = CanonicalStateDigest::new(
+        EvidenceDigest::new(PayloadHashAlgorithm::Sha256, [spec.state_digest; 32]),
+        CanonicalizationRule::new(
+            SourceIdentifier::try_from("market-squawk.book.price-level-v1")?,
+            RuleVersion::new(1)?,
+        ),
+    );
     let book_state = if spec.event_class.requires_book_state() {
         Some(BookStateBinding::new(
             spec.depth,
             SourceIdentifier::try_from(spec.book_state_id)?,
-            EvidenceDigest::new([spec.state_digest; 32]),
+            state_digest.clone(),
         ))
     } else {
         None
@@ -83,8 +91,8 @@ pub(crate) fn binding(spec: &BindingSpec) -> Result<LiveEvidenceBinding, Box<dyn
         ProviderChannel::new(SourceIdentifier::try_from(spec.channel)?),
         spec.event_class,
         SourceIdentifier::try_from(spec.source_identifier)?,
-        EvidenceDigest::new([spec.payload_digest; 32]),
-        EvidenceDigest::new([spec.state_digest; 32]),
+        EvidenceDigest::new(PayloadHashAlgorithm::Sha256, [spec.payload_digest; 32]),
+        state_digest,
         book_state,
     )?)
 }
@@ -291,13 +299,13 @@ pub(crate) fn assessment_input_with_relations(
             || {
                 Ok::<_, Box<dyn Error>>((
                     SourceIdentifier::try_from("non-book-snapshot")?,
-                    snapshot_binding.canonical_state_digest(),
+                    snapshot_binding.canonical_state_digest().clone(),
                 ))
             },
             |snapshot_book| {
                 Ok((
                     snapshot_book.state_id().clone(),
-                    snapshot_book.state_digest(),
+                    snapshot_book.state_digest().clone(),
                 ))
             },
         )?;

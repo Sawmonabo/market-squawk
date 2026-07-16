@@ -23,6 +23,7 @@ pub struct DecodedLiveProvenanceInput {
     binding: LiveEvidenceBinding,
     source_timestamp: Option<Timestamp>,
     received_at: Timestamp,
+    available_at: Timestamp,
     ingested_at: Timestamp,
     recorded_quality: DataQuality,
     recorded_coverage: CoverageStatus,
@@ -31,10 +32,15 @@ pub struct DecodedLiveProvenanceInput {
 
 impl DecodedLiveProvenanceInput {
     /// Collects decoder output. Validation occurs in [`LiveProvenance::decoded`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "decoder provenance timestamps and evidence must be captured atomically"
+    )]
     pub const fn new(
         binding: LiveEvidenceBinding,
         source_timestamp: Option<Timestamp>,
         received_at: Timestamp,
+        available_at: Timestamp,
         ingested_at: Timestamp,
         recorded_quality: DataQuality,
         recorded_coverage: CoverageStatus,
@@ -44,6 +50,7 @@ impl DecodedLiveProvenanceInput {
             binding,
             source_timestamp,
             received_at,
+            available_at,
             ingested_at,
             recorded_quality,
             recorded_coverage,
@@ -58,6 +65,7 @@ pub struct RecordedLiveProvenanceInput {
     binding: LiveEvidenceBinding,
     source_timestamp: Option<Timestamp>,
     received_at: Timestamp,
+    available_at: Timestamp,
     ingested_at: Timestamp,
     recorded_quality: DataQuality,
     recorded_coverage: CoverageStatus,
@@ -75,6 +83,7 @@ impl RecordedLiveProvenanceInput {
         binding: LiveEvidenceBinding,
         source_timestamp: Option<Timestamp>,
         received_at: Timestamp,
+        available_at: Timestamp,
         ingested_at: Timestamp,
         recorded_quality: DataQuality,
         recorded_coverage: CoverageStatus,
@@ -85,6 +94,7 @@ impl RecordedLiveProvenanceInput {
             binding,
             source_timestamp,
             received_at,
+            available_at,
             ingested_at,
             recorded_quality,
             recorded_coverage,
@@ -114,6 +124,7 @@ pub struct LiveProvenance {
     binding: LiveEvidenceBinding,
     source_timestamp: Option<Timestamp>,
     received_at: Timestamp,
+    available_at: Timestamp,
     ingested_at: Timestamp,
     recorded_quality: DataQuality,
     recorded_coverage: CoverageStatus,
@@ -128,7 +139,8 @@ impl LiveProvenance {
     ///
     /// # Errors
     ///
-    /// Rejects `DirectVerified`, local receive time after ingestion, and a content-hash mismatch.
+    /// Rejects `DirectVerified`, a local-time order other than
+    /// `received_at <= available_at <= ingested_at`, and a content-hash mismatch.
     pub fn decoded(input: DecodedLiveProvenanceInput) -> Result<Self, ProvenanceError> {
         if input.recorded_quality == DataQuality::DirectVerified {
             return Err(ProvenanceError::UnqualifiedDirectVerified);
@@ -136,6 +148,7 @@ impl LiveProvenance {
         validate_common(
             &input.binding,
             input.received_at,
+            input.available_at,
             input.ingested_at,
             &input.payload_reference,
         )?;
@@ -144,6 +157,7 @@ impl LiveProvenance {
             binding: input.binding,
             source_timestamp: input.source_timestamp,
             received_at: input.received_at,
+            available_at: input.available_at,
             ingested_at: input.ingested_at,
             recorded_quality: input.recorded_quality,
             recorded_coverage: input.recorded_coverage,
@@ -159,11 +173,13 @@ impl LiveProvenance {
     ///
     /// # Errors
     ///
-    /// Rejects local receive time after ingestion and a content-hash mismatch.
+    /// Rejects a local-time order other than `received_at <= available_at <= ingested_at` and a
+    /// content-hash mismatch.
     pub fn recorded(input: RecordedLiveProvenanceInput) -> Result<Self, ProvenanceError> {
         validate_common(
             &input.binding,
             input.received_at,
+            input.available_at,
             input.ingested_at,
             &input.payload_reference,
         )?;
@@ -172,6 +188,7 @@ impl LiveProvenance {
             binding: input.binding,
             source_timestamp: input.source_timestamp,
             received_at: input.received_at,
+            available_at: input.available_at,
             ingested_at: input.ingested_at,
             recorded_quality: input.recorded_quality,
             recorded_coverage: input.recorded_coverage,
@@ -212,6 +229,10 @@ impl LiveProvenance {
     /// Returns when the source payload reached this process.
     pub const fn received_at(&self) -> Timestamp {
         self.received_at
+    }
+    /// Returns when the received live observation became available to local consumers.
+    pub const fn available_at(&self) -> Timestamp {
+        self.available_at
     }
     /// Returns when the canonical event was ingested locally.
     pub const fn ingested_at(&self) -> Timestamp {
@@ -267,6 +288,7 @@ struct LiveProvenanceWire {
     binding: LiveEvidenceBinding,
     source_timestamp: Option<Timestamp>,
     received_at: Timestamp,
+    available_at: Timestamp,
     ingested_at: Timestamp,
     recorded_quality: DataQuality,
     recorded_coverage: CoverageStatus,
@@ -291,6 +313,7 @@ impl<'de> Deserialize<'de> for LiveProvenance {
         validate_common(
             &wire.binding,
             wire.received_at,
+            wire.available_at,
             wire.ingested_at,
             &wire.payload_reference,
         )
@@ -305,6 +328,7 @@ impl<'de> Deserialize<'de> for LiveProvenance {
             binding: wire.binding,
             source_timestamp: wire.source_timestamp,
             received_at: wire.received_at,
+            available_at: wire.available_at,
             ingested_at: wire.ingested_at,
             recorded_quality: wire.recorded_quality,
             recorded_coverage: wire.recorded_coverage,
@@ -318,14 +342,19 @@ impl<'de> Deserialize<'de> for LiveProvenance {
 fn validate_common(
     binding: &LiveEvidenceBinding,
     received_at: Timestamp,
+    available_at: Timestamp,
     ingested_at: Timestamp,
     payload_reference: &PayloadReference,
 ) -> Result<(), ProvenanceError> {
-    if received_at > ingested_at {
-        return Err(ProvenanceError::ReceivedAfterIngested);
+    if available_at < received_at {
+        return Err(ProvenanceError::AvailabilityBeforeReceived);
+    }
+    if available_at > ingested_at {
+        return Err(ProvenanceError::AvailabilityAfterIngested);
     }
     if let PayloadReference::ContentHash(hash) = payload_reference
-        && hash.digest() != binding.payload_digest().bytes()
+        && (hash.algorithm() != binding.payload_digest().algorithm()
+            || hash.digest() != binding.payload_digest().bytes())
     {
         return Err(ProvenanceError::PayloadDigestMismatch);
     }

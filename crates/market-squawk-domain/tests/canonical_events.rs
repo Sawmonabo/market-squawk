@@ -23,6 +23,7 @@ fn live_provenance(event_class: LiveEventClass) -> Result<LiveProvenance, Box<dy
         binding,
         Some(Timestamp::from_unix_nanos(100)),
         Timestamp::from_unix_nanos(110),
+        Timestamp::from_unix_nanos(115),
         Timestamp::from_unix_nanos(120),
         DataQuality::DirectUnverified,
         CoverageStatus::Sufficient,

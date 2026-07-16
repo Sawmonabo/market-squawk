@@ -4,12 +4,13 @@ use std::error::Error;
 use std::str::FromStr;
 
 use market_squawk_domain::{
-    BindingError, BookStateBinding, BoundAssessment, ChecksumCapability, ChecksumEvidence,
-    ChecksumIntegrity, ChecksumScope, ChecksumValue, CoverageConsolidation, CoverageDelay,
-    CoverageDimension, CoverageError, CoverageScope, CoverageStatus, DataQuality, EvidenceDigest,
-    IntegrityEvidenceError, LiveEventClass, LiveEvidenceBinding, MarketDepth,
-    QualificationAssessment, SequenceCapability, SequenceEvidence, SequenceIntegrity,
-    SequenceNumber, SequenceValidationRule, SourceCoverageRecord, SourceIdentifier, Timestamp,
+    BindingError, BookStateBinding, BoundAssessment, CanonicalStateDigest, CanonicalizationRule,
+    ChecksumCapability, ChecksumEvidence, ChecksumIntegrity, ChecksumScope, ChecksumValue,
+    CoverageConsolidation, CoverageDelay, CoverageDimension, CoverageError, CoverageScope,
+    CoverageStatus, DataQuality, EvidenceDigest, IntegrityEvidenceError, LiveEventClass,
+    LiveEvidenceBinding, MarketDepth, PayloadHashAlgorithm, QualificationAssessment, RuleVersion,
+    SequenceCapability, SequenceEvidence, SequenceIntegrity, SequenceNumber,
+    SequenceValidationRule, SourceCoverageRecord, SourceIdentifier, Timestamp,
 };
 use support::live::{BindingSpec, binding, rule, valid_assessment_input};
 
@@ -132,8 +133,14 @@ fn book_binding_requires_exact_state_identity() -> Result<(), Box<dyn Error>> {
             market_squawk_domain::ProviderChannel::new(SourceIdentifier::try_from(spec.channel)?),
             LiveEventClass::BookDelta,
             SourceIdentifier::try_from(spec.source_identifier)?,
-            EvidenceDigest::new([1; 32]),
-            EvidenceDigest::new([2; 32]),
+            EvidenceDigest::new(PayloadHashAlgorithm::Sha256, [1; 32]),
+            CanonicalStateDigest::new(
+                EvidenceDigest::new(PayloadHashAlgorithm::Sha256, [2; 32]),
+                CanonicalizationRule::new(
+                    SourceIdentifier::try_from("market-squawk.book.price-level-v1")?,
+                    RuleVersion::new(1)?,
+                ),
+            ),
             None,
         ),
         Err(BindingError::MissingBookState)

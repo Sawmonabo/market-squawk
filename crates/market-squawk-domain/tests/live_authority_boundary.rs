@@ -2,12 +2,12 @@ use std::error::Error;
 use std::str::FromStr;
 
 use market_squawk_domain::{
-    AuthorizationBasis, BookStateBinding, ConnectionGeneration, CoverageConsolidation,
-    CoverageDelay, CoverageScope, CoverageStatus, DataQuality, EvidenceDigest,
-    ExecutionEligibility, InstrumentId, LiveEventClass, LiveEvidenceBinding, LiveProvenance,
-    MarketDepth, MetadataRevision, PayloadReference, ProviderChannel, ProviderProduct,
-    RecordedLiveProvenanceInput, SourceCoverageRecord, SourceId, SourceIdentifier, Timestamp,
-    VenueId,
+    AuthorizationBasis, BookStateBinding, CanonicalStateDigest, CanonicalizationRule,
+    ConnectionGeneration, CoverageConsolidation, CoverageDelay, CoverageScope, CoverageStatus,
+    DataQuality, EvidenceDigest, ExecutionEligibility, InstrumentId, LiveEventClass,
+    LiveEvidenceBinding, LiveProvenance, MarketDepth, MetadataRevision, PayloadHashAlgorithm,
+    PayloadReference, ProviderChannel, ProviderProduct, RecordedLiveProvenanceInput, RuleVersion,
+    SourceCoverageRecord, SourceId, SourceIdentifier, Timestamp, VenueId,
 };
 
 fn instrument() -> Result<InstrumentId, Box<dyn Error>> {
@@ -15,6 +15,13 @@ fn instrument() -> Result<InstrumentId, Box<dyn Error>> {
 }
 
 fn binding() -> Result<LiveEvidenceBinding, Box<dyn Error>> {
+    let state_digest = CanonicalStateDigest::new(
+        EvidenceDigest::new(PayloadHashAlgorithm::Sha256, [3; 32]),
+        CanonicalizationRule::new(
+            SourceIdentifier::try_from("market-squawk.book.price-level-v1")?,
+            RuleVersion::new(1)?,
+        ),
+    );
     Ok(LiveEvidenceBinding::new(
         SourceId::try_from("coinbase-direct")?,
         SourceIdentifier::try_from("session-7")?,
@@ -27,12 +34,12 @@ fn binding() -> Result<LiveEvidenceBinding, Box<dyn Error>> {
         ProviderChannel::new(SourceIdentifier::try_from("level2")?),
         LiveEventClass::BookDelta,
         SourceIdentifier::try_from("update-42")?,
-        EvidenceDigest::new([1; 32]),
-        EvidenceDigest::new([3; 32]),
+        EvidenceDigest::new(PayloadHashAlgorithm::Sha256, [1; 32]),
+        state_digest.clone(),
         Some(BookStateBinding::new(
             MarketDepth::PriceLevel,
             SourceIdentifier::try_from("book-state-42")?,
-            EvidenceDigest::new([3; 32]),
+            state_digest,
         )),
     )?)
 }
@@ -70,6 +77,7 @@ fn recorded_direct_verified_is_archival_and_always_ineligible() -> Result<(), Bo
         binding,
         Some(Timestamp::from_unix_nanos(995)),
         Timestamp::from_unix_nanos(1_000),
+        Timestamp::from_unix_nanos(1_005),
         Timestamp::from_unix_nanos(1_010),
         DataQuality::DirectVerified,
         CoverageStatus::Sufficient,

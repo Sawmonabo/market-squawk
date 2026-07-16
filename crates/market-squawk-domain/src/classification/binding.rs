@@ -5,7 +5,10 @@ use std::fmt;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::MarketDepth;
-use crate::{ConnectionGeneration, InstrumentId, SourceId, SourceIdentifier, Timestamp, VenueId};
+use crate::{
+    ConnectionGeneration, DigestAlgorithm, InstrumentId, RuleVersion, SourceId, SourceIdentifier,
+    Timestamp, VenueId,
+};
 
 macro_rules! source_identifier_newtype {
     ($name:ident, $description:literal) => {
@@ -74,20 +77,81 @@ impl LiveEventClass {
     }
 }
 
-/// Fixed-width digest of a payload or canonical live-state image.
+/// Algorithm-qualified fixed-width digest of an exact byte sequence.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
-#[serde(transparent)]
-pub struct EvidenceDigest([u8; 32]);
+#[serde(deny_unknown_fields)]
+pub struct EvidenceDigest {
+    algorithm: DigestAlgorithm,
+    bytes: [u8; 32],
+}
 
 impl EvidenceDigest {
-    /// Constructs a digest already computed by an explicitly selected algorithm.
-    pub const fn new(bytes: [u8; 32]) -> Self {
-        Self(bytes)
+    /// Constructs a digest computed by the explicitly selected algorithm.
+    pub const fn new(algorithm: DigestAlgorithm, bytes: [u8; 32]) -> Self {
+        Self { algorithm, bytes }
+    }
+
+    /// Returns the digest algorithm.
+    pub const fn algorithm(self) -> DigestAlgorithm {
+        self.algorithm
     }
 
     /// Returns the digest bytes.
     pub const fn bytes(self) -> [u8; 32] {
-        self.0
+        self.bytes
+    }
+}
+
+/// Stable identity and one-based revision of canonical byte-encoding rules.
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalizationRule {
+    rule: SourceIdentifier,
+    version: RuleVersion,
+}
+
+impl CanonicalizationRule {
+    /// Constructs an explicit canonicalization rule revision.
+    pub const fn new(rule: SourceIdentifier, version: RuleVersion) -> Self {
+        Self { rule, version }
+    }
+
+    /// Returns the canonicalization rule identity.
+    pub const fn rule(&self) -> &SourceIdentifier {
+        &self.rule
+    }
+
+    /// Returns the one-based canonicalization rule revision.
+    pub const fn version(&self) -> RuleVersion {
+        self.version
+    }
+}
+
+/// Algorithm- and rule-qualified digest of a canonical live-state image.
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalStateDigest {
+    digest: EvidenceDigest,
+    canonicalization_rule: CanonicalizationRule,
+}
+
+impl CanonicalStateDigest {
+    /// Constructs a canonical-state digest with an explicit encoding-rule revision.
+    pub const fn new(digest: EvidenceDigest, canonicalization_rule: CanonicalizationRule) -> Self {
+        Self {
+            digest,
+            canonicalization_rule,
+        }
+    }
+
+    /// Returns the algorithm-qualified byte digest.
+    pub const fn digest(&self) -> EvidenceDigest {
+        self.digest
+    }
+
+    /// Returns the canonical byte-encoding rule revision.
+    pub const fn canonicalization_rule(&self) -> &CanonicalizationRule {
+        &self.canonicalization_rule
     }
 }
 
@@ -97,7 +161,7 @@ impl EvidenceDigest {
 pub struct BookStateBinding {
     depth: MarketDepth,
     state_id: SourceIdentifier,
-    state_digest: EvidenceDigest,
+    state_digest: CanonicalStateDigest,
 }
 
 impl BookStateBinding {
@@ -105,7 +169,7 @@ impl BookStateBinding {
     pub const fn new(
         depth: MarketDepth,
         state_id: SourceIdentifier,
-        state_digest: EvidenceDigest,
+        state_digest: CanonicalStateDigest,
     ) -> Self {
         Self {
             depth,
@@ -125,8 +189,8 @@ impl BookStateBinding {
     }
 
     /// Returns the canonical-state digest.
-    pub const fn state_digest(&self) -> EvidenceDigest {
-        self.state_digest
+    pub const fn state_digest(&self) -> &CanonicalStateDigest {
+        &self.state_digest
     }
 }
 
@@ -146,7 +210,7 @@ pub struct LiveEvidenceBinding {
     event_class: LiveEventClass,
     source_identifier: SourceIdentifier,
     payload_digest: EvidenceDigest,
-    canonical_state_digest: EvidenceDigest,
+    canonical_state_digest: CanonicalStateDigest,
     book_state: Option<BookStateBinding>,
 }
 
@@ -174,7 +238,7 @@ impl LiveEvidenceBinding {
         event_class: LiveEventClass,
         source_identifier: SourceIdentifier,
         payload_digest: EvidenceDigest,
-        canonical_state_digest: EvidenceDigest,
+        canonical_state_digest: CanonicalStateDigest,
         book_state: Option<BookStateBinding>,
     ) -> Result<Self, BindingError> {
         if event_class.requires_book_state() {
@@ -252,8 +316,8 @@ impl LiveEvidenceBinding {
         self.payload_digest
     }
     /// Returns the exact canonical-state digest.
-    pub const fn canonical_state_digest(&self) -> EvidenceDigest {
-        self.canonical_state_digest
+    pub const fn canonical_state_digest(&self) -> &CanonicalStateDigest {
+        &self.canonical_state_digest
     }
     /// Returns the book-state binding when applicable.
     pub const fn book_state(&self) -> Option<&BookStateBinding> {
@@ -276,7 +340,7 @@ struct LiveEvidenceBindingWire {
     event_class: LiveEventClass,
     source_identifier: SourceIdentifier,
     payload_digest: EvidenceDigest,
-    canonical_state_digest: EvidenceDigest,
+    canonical_state_digest: CanonicalStateDigest,
     book_state: Option<BookStateBinding>,
 }
 
@@ -319,9 +383,9 @@ pub struct BoundAssessment<T> {
 /// Evidence-specific upper bound for a caller-supplied assessment validity window.
 ///
 /// Most assessment results have no intrinsic clock deadline beyond the window supplied by their
-/// evaluator. Timing evidence is different: its retained market/source timestamps and checked
-/// policy determine an objective latest valid instant. Implementations are owned by the domain so
-/// downstream callers cannot weaken that limit for domain evidence types.
+/// evaluator. Timing evidence derives a deadline from checked market/source timestamps and policy;
+/// coverage evidence inherits the authoritative metadata scope's effective end. Implementations
+/// are owned by the domain so downstream callers cannot weaken those limits.
 pub trait AssessmentValidity {
     /// Returns the inclusive intrinsic expiry, when the evidence itself determines one.
     fn maximum_valid_until(&self) -> Option<Timestamp> {
@@ -365,7 +429,8 @@ where
     ///
     /// # Errors
     ///
-    /// Returns [`BindingError::ValidityBeforeEvaluation`] if the expiry precedes evaluation.
+    /// Returns [`BindingError::ValidityBeforeEvaluation`] if expiry precedes evaluation, or
+    /// [`BindingError::ValidityExceedsEvidence`] if it exceeds an intrinsic evidence deadline.
     pub fn new(
         binding: LiveEvidenceBinding,
         evaluated_at: Timestamp,

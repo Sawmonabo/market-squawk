@@ -2,14 +2,14 @@
 
 use std::num::NonZeroU32;
 
-use serde::Serialize;
+use serde::{Deserialize, Deserializer, Serialize};
 
 use super::super::{AssessmentValidity, ChecksumIntegrity, MarketDepth};
 use super::{ChecksumCapability, IntegrityEvidenceError, IntegrityEvidenceKind, IntegrityRule};
 use crate::{ConnectionGeneration, SourceIdentifier};
 
 /// Provider-defined checksum value widened for protocol-specific integer sizes.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(transparent)]
 pub struct ChecksumValue(u64);
 
@@ -33,11 +33,31 @@ pub struct ChecksumScope {
     provider_scope: SourceIdentifier,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChecksumScopeWire {
+    depth: MarketDepth,
+    level_count: u32,
+    provider_scope: SourceIdentifier,
+}
+
+impl<'de> Deserialize<'de> for ChecksumScope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ChecksumScopeWire::deserialize(deserializer)?;
+        Self::new(wire.depth, wire.level_count, wire.provider_scope)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 /// Provider-defined checksum scope for a non-book canonical event payload.
 ///
 /// This deliberately carries no market depth or level count. A payload checksum cannot be
 /// confused with evidence over an order-book image.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PayloadChecksumScope {
     provider_scope: SourceIdentifier,
 }
@@ -55,7 +75,7 @@ impl PayloadChecksumScope {
 }
 
 /// Event-shaped target covered by one supported checksum result.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "scope")]
 pub enum ChecksumTarget {
     /// Checksum covers an exact order-book depth and level count.
@@ -110,6 +130,86 @@ pub struct ChecksumEvidence {
     expected: Option<ChecksumValue>,
     computed: Option<ChecksumValue>,
     integrity: ChecksumIntegrity,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChecksumEvidenceWire {
+    capability: ChecksumCapability,
+    rule: Option<IntegrityRule>,
+    connection_generation: ConnectionGeneration,
+    target: Option<ChecksumTarget>,
+    expected: Option<ChecksumValue>,
+    computed: Option<ChecksumValue>,
+    integrity: ChecksumIntegrity,
+}
+
+impl<'de> Deserialize<'de> for ChecksumEvidence {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ChecksumEvidenceWire::deserialize(deserializer)?;
+        let declared_rule = wire.rule.clone();
+        let declared_target = wire.target.clone();
+        let rebuilt = match wire.capability {
+            ChecksumCapability::Unsupported => Self::unsupported(wire.connection_generation),
+            ChecksumCapability::Provided => {
+                let rule = wire
+                    .rule
+                    .ok_or_else(|| serde::de::Error::custom("provided checksum requires rule"))?;
+                let target = wire
+                    .target
+                    .ok_or_else(|| serde::de::Error::custom("provided checksum requires target"))?;
+                match (target, wire.expected, wire.computed) {
+                    (ChecksumTarget::Book(scope), Some(expected), Some(computed)) => {
+                        Self::validate_book(
+                            wire.capability,
+                            Some(rule),
+                            wire.connection_generation,
+                            Some(scope),
+                            Some(expected),
+                            Some(computed),
+                        )
+                        .map_err(serde::de::Error::custom)?
+                    }
+                    (ChecksumTarget::Payload(scope), Some(expected), Some(computed)) => {
+                        Self::validate_payload(
+                            wire.capability,
+                            Some(rule),
+                            wire.connection_generation,
+                            Some(scope),
+                            Some(expected),
+                            Some(computed),
+                        )
+                        .map_err(serde::de::Error::custom)?
+                    }
+                    (ChecksumTarget::Book(scope), None, None) => {
+                        Self::unchecked_book(rule, wire.connection_generation, scope)
+                    }
+                    (ChecksumTarget::Payload(scope), None, None) => {
+                        Self::unchecked_payload(rule, wire.connection_generation, scope)
+                    }
+                    _ => {
+                        return Err(serde::de::Error::custom(
+                            "checksum operands must be both present or both absent",
+                        ));
+                    }
+                }
+            }
+        };
+        if rebuilt.rule != declared_rule
+            || rebuilt.target != declared_target
+            || rebuilt.expected != wire.expected
+            || rebuilt.computed != wire.computed
+            || rebuilt.integrity != wire.integrity
+        {
+            return Err(serde::de::Error::custom(
+                "serialized checksum evidence contradicts reconstructed evidence",
+            ));
+        }
+        Ok(rebuilt)
+    }
 }
 
 impl ChecksumEvidence {

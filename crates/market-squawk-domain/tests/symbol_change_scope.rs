@@ -19,6 +19,7 @@ fn live_provenance(venue: &'static str) -> Result<LiveProvenance, Box<dyn Error>
         binding,
         Some(Timestamp::from_unix_nanos(100)),
         Timestamp::from_unix_nanos(110),
+        Timestamp::from_unix_nanos(115),
         Timestamp::from_unix_nanos(120),
         DataQuality::DirectUnverified,
         CoverageStatus::Sufficient,

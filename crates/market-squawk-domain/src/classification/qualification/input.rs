@@ -1,6 +1,6 @@
 //! Immutable inputs to relational live-policy qualification.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use super::super::{
     AssessmentValidity, BookIntegrity, BoundAssessment, CaptureIntegrityState, ChecksumEvidence,
@@ -36,6 +36,32 @@ pub struct SourcePolicyAssessment {
     source_authorization: SourceAuthorization,
     delivery_evidence: DeliveryEvidence,
     snapshot_applicability: SnapshotApplicability,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourcePolicyAssessmentWire {
+    quality_ceiling: DataQuality,
+    integrity_capabilities: IntegrityCapabilities,
+    source_authorization: SourceAuthorization,
+    delivery_evidence: DeliveryEvidence,
+    snapshot_applicability: SnapshotApplicability,
+}
+
+impl<'de> Deserialize<'de> for SourcePolicyAssessment {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = SourcePolicyAssessmentWire::deserialize(deserializer)?;
+        Ok(Self::new(
+            wire.quality_ceiling,
+            wire.integrity_capabilities,
+            wire.source_authorization,
+            wire.delivery_evidence,
+            wire.snapshot_applicability,
+        ))
+    }
 }
 
 impl SourcePolicyAssessment {
@@ -100,6 +126,30 @@ pub struct IntegrityAssessmentSet {
     pub(super) timing: BoundAssessment<LiveTimingAssessment>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IntegrityAssessmentSetWire {
+    sequence: BoundAssessment<SequenceEvidence>,
+    snapshot: BoundAssessment<SnapshotEvidence>,
+    checksum: BoundAssessment<ChecksumEvidence>,
+    timing: BoundAssessment<LiveTimingAssessment>,
+}
+
+impl<'de> Deserialize<'de> for IntegrityAssessmentSet {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = IntegrityAssessmentSetWire::deserialize(deserializer)?;
+        Ok(Self::new(
+            wire.sequence,
+            wire.snapshot,
+            wire.checksum,
+            wire.timing,
+        ))
+    }
+}
+
 impl IntegrityAssessmentSet {
     /// Groups independently evaluated integrity evidence.
     pub const fn new(
@@ -147,6 +197,34 @@ pub struct MarketAssessmentSet {
     pub(super) book: BoundAssessment<BookIntegrity>,
     pub(super) stream: BoundAssessment<StreamIntegrityState>,
     pub(super) capture: BoundAssessment<CaptureIntegrityState>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MarketAssessmentSetWire {
+    trading_status: BoundAssessment<TradingStatus>,
+    precision: BoundAssessment<PrecisionIntegrity>,
+    coverage: BoundAssessment<SourceCoverageRecord>,
+    book: BoundAssessment<BookIntegrity>,
+    stream: BoundAssessment<StreamIntegrityState>,
+    capture: BoundAssessment<CaptureIntegrityState>,
+}
+
+impl<'de> Deserialize<'de> for MarketAssessmentSet {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = MarketAssessmentSetWire::deserialize(deserializer)?;
+        Ok(Self::new(
+            wire.trading_status,
+            wire.precision,
+            wire.coverage,
+            wire.book,
+            wire.stream,
+            wire.capture,
+        ))
+    }
 }
 
 impl MarketAssessmentSet {
@@ -209,6 +287,32 @@ pub struct QualificationAssessmentInput {
     pub(super) source_policy: BoundAssessment<SourcePolicyAssessment>,
     pub(super) integrity: IntegrityAssessmentSet,
     pub(super) market: MarketAssessmentSet,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QualificationAssessmentInputWire {
+    assessment_id: QualificationAssessmentId,
+    binding: LiveEvidenceBinding,
+    source_policy: BoundAssessment<SourcePolicyAssessment>,
+    integrity: IntegrityAssessmentSet,
+    market: MarketAssessmentSet,
+}
+
+impl<'de> Deserialize<'de> for QualificationAssessmentInput {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = QualificationAssessmentInputWire::deserialize(deserializer)?;
+        Ok(Self::new(
+            wire.assessment_id,
+            wire.binding,
+            wire.source_policy,
+            wire.integrity,
+            wire.market,
+        ))
+    }
 }
 
 impl QualificationAssessmentInput {

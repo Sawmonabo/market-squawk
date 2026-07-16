@@ -2,6 +2,7 @@
 
 mod classification;
 mod denomination;
+mod digest;
 mod financial;
 mod identifiers;
 mod identity;
@@ -14,22 +15,25 @@ mod version;
 
 pub use classification::{
     AssessmentStatus, AssessmentValidity, AuthorizationBasis, BindingError, BookIntegrity,
-    BookStateBinding, BoundAssessment, CaptureIntegrityState, ChecksumCapability, ChecksumEvidence,
-    ChecksumIntegrity, ChecksumScope, ChecksumTarget, ChecksumValue, ClassificationError,
-    CoverageConsolidation, CoverageDelay, CoverageDimension, CoverageError, CoverageScope,
-    CoverageStatus, DataQuality, DeliveryEvidence, EligibilityFailure, EligibilityFailures,
-    EvidenceDigest, ExecutionEligibility, FairValueHierarchy, FreshnessState, InitializedSnapshot,
-    IntegrityAssessmentSet, IntegrityCapabilities, IntegrityEvidenceError, IntegrityRule,
-    LiveEventClass, LiveEvidenceBinding, LiveTimingAssessment, LiveTimingPolicy,
-    MarketAssessmentSet, MarketDepth, MarketEventTiming, MetadataRevision, PayloadChecksumScope,
-    PrecisionIntegrity, ProviderChannel, ProviderProduct, QualificationAssessment,
-    QualificationAssessmentId, QualificationAssessmentInput, QualificationComponent,
-    QualificationError, RuleVersion, SequenceCapability, SequenceEvidence, SequenceIntegrity,
-    SequenceValidationRule, SnapshotApplicability, SnapshotConsistency, SnapshotEvidence,
-    SnapshotState, SourceAuthorization, SourceCoverageRecord, SourcePolicyAssessment,
-    StreamIntegrityState, TimestampIntegrity,
+    BookStateBinding, BoundAssessment, CanonicalStateDigest, CanonicalizationRule,
+    CaptureIntegrityState, ChecksumCapability, ChecksumEvidence, ChecksumIntegrity, ChecksumScope,
+    ChecksumTarget, ChecksumValue, ClassificationError, CoverageConsolidation, CoverageDelay,
+    CoverageDimension, CoverageError, CoverageScope, CoverageStatus, DataQuality, DeliveryEvidence,
+    EligibilityFailure, EligibilityFailures, EvidenceDigest, ExecutionEligibility,
+    FairValueHierarchy, FreshnessState, InitializedSnapshot, IntegrityAssessmentSet,
+    IntegrityCapabilities, IntegrityEvidenceError, IntegrityRule, LiveEventClass,
+    LiveEvidenceBinding, LiveTimingAssessment, LiveTimingPolicy, MarketAssessmentSet, MarketDepth,
+    MarketEventTiming, MetadataRevision, PayloadChecksumScope, PrecisionIntegrity, ProviderChannel,
+    ProviderProduct, QualificationAssessment, QualificationAssessmentId,
+    QualificationAssessmentInput, QualificationComponent, QualificationError, RuleVersion,
+    SequenceCapability, SequenceEvidence, SequenceIntegrity, SequenceValidationRule,
+    SnapshotApplicability, SnapshotConsistency, SnapshotEvidence, SnapshotState,
+    SourceAuthorization, SourceCoverageRecord, SourcePolicyAssessment, StreamIntegrityState,
+    TimestampIntegrity,
 };
 pub use denomination::Denomination;
+pub use digest::DigestAlgorithm;
+pub use digest::DigestAlgorithm as PayloadHashAlgorithm;
 pub use financial::{
     BasisPoints, Currency, FinancialError, LotSize, Money, PriceError, PriceTicks, QuantityError,
     QuantityLots, RoundingPolicy, TickSize,
@@ -61,8 +65,8 @@ pub use market::{
 };
 pub use provenance::{
     AvailabilityEvidence, DecodedLiveProvenanceInput, LiveProvenance, LiveRecordState, PayloadHash,
-    PayloadHashAlgorithm, PayloadReference, ProvenanceError, RecordedLiveProvenanceInput,
-    ResearchContext, ResearchProvenance, ResearchProvenanceInput, ResearchTime, RevisionNumber,
+    PayloadReference, ProvenanceError, RecordedLiveProvenanceInput, ResearchContext,
+    ResearchProvenance, ResearchProvenanceInput, ResearchTime, RevisionNumber,
 };
 pub use research::{
     AlternativeDataObservation, CorporateActionObservation, FilingObservation,

@@ -236,8 +236,8 @@ pub enum FreshnessState {
 }
 pub use binding::{
     AssessmentValidity, AuthorizationBasis, BindingError, BookStateBinding, BoundAssessment,
-    EvidenceDigest, LiveEventClass, LiveEvidenceBinding, MetadataRevision, ProviderChannel,
-    ProviderProduct,
+    CanonicalStateDigest, CanonicalizationRule, EvidenceDigest, LiveEventClass,
+    LiveEvidenceBinding, MetadataRevision, ProviderChannel, ProviderProduct,
 };
 pub use coverage::{
     CoverageConsolidation, CoverageDelay, CoverageDimension, CoverageError, CoverageScope,

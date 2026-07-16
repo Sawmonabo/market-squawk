@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use serde::Serialize;
+use serde::{Deserialize, Deserializer, Serialize};
 
 use super::{AssessmentValidity, FreshnessState, TimestampIntegrity};
 use crate::{ConnectionGeneration, Timestamp};
@@ -38,11 +38,37 @@ impl std::error::Error for ClassificationError {}
 
 /// Bounds used for one atomic live timing assessment.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct LiveTimingPolicy {
     maximum_future_skew_nanos: i64,
     maximum_transport_age_nanos: i64,
     maximum_source_age_nanos: i64,
     maximum_market_age_nanos: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LiveTimingPolicyWire {
+    maximum_future_skew_nanos: u64,
+    maximum_transport_age_nanos: u64,
+    maximum_source_age_nanos: u64,
+    maximum_market_age_nanos: u64,
+}
+
+impl<'de> Deserialize<'de> for LiveTimingPolicy {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = LiveTimingPolicyWire::deserialize(deserializer)?;
+        Self::new(
+            wire.maximum_future_skew_nanos,
+            wire.maximum_transport_age_nanos,
+            wire.maximum_source_age_nanos,
+            wire.maximum_market_age_nanos,
+        )
+        .map_err(serde::de::Error::custom)
+    }
 }
 
 impl LiveTimingPolicy {
@@ -91,7 +117,8 @@ fn checked_limit(value: u64) -> Result<i64, ClassificationError> {
 }
 
 /// Source and local receive timestamps for one latest market event.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct MarketEventTiming {
     source_timestamp: Option<Timestamp>,
     received_at: Timestamp,
@@ -119,6 +146,7 @@ impl MarketEventTiming {
 
 /// One immutable assessment tying generation, market time, receive time, and evaluation time.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct LiveTimingAssessment {
     connection_generation: ConnectionGeneration,
     latest_market_event: Option<MarketEventTiming>,
@@ -127,6 +155,43 @@ pub struct LiveTimingAssessment {
     policy: LiveTimingPolicy,
     timestamp_integrity: TimestampIntegrity,
     freshness: FreshnessState,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LiveTimingAssessmentWire {
+    connection_generation: ConnectionGeneration,
+    latest_market_event: Option<MarketEventTiming>,
+    last_heartbeat_at: Option<Timestamp>,
+    evaluated_at: Timestamp,
+    policy: LiveTimingPolicy,
+    timestamp_integrity: TimestampIntegrity,
+    freshness: FreshnessState,
+}
+
+impl<'de> Deserialize<'de> for LiveTimingAssessment {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = LiveTimingAssessmentWire::deserialize(deserializer)?;
+        let rebuilt = Self::assess(
+            wire.connection_generation,
+            wire.latest_market_event,
+            wire.last_heartbeat_at,
+            wire.evaluated_at,
+            wire.policy,
+        )
+        .map_err(serde::de::Error::custom)?;
+        if rebuilt.timestamp_integrity != wire.timestamp_integrity
+            || rebuilt.freshness != wire.freshness
+        {
+            return Err(serde::de::Error::custom(
+                "serialized timing result contradicts reconstructed evidence",
+            ));
+        }
+        Ok(rebuilt)
+    }
 }
 
 impl LiveTimingAssessment {

@@ -3,7 +3,7 @@
 use std::fmt;
 use std::num::NonZeroU32;
 
-use serde::Serialize;
+use serde::{Deserialize, Deserializer, Serialize};
 
 use super::{AssessmentValidity, SequenceIntegrity, SnapshotConsistency};
 use crate::{ConnectionGeneration, SequenceNumber, SourceIdentifier};
@@ -16,7 +16,7 @@ pub use checksum::{
 };
 
 /// Provider metadata declaration for sequence support.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SequenceCapability {
     /// The selected protocol/channel supplies sequence information.
@@ -26,7 +26,7 @@ pub enum SequenceCapability {
 }
 
 /// Provider metadata declaration for checksum support.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChecksumCapability {
     /// The selected protocol/channel supplies a verifiable checksum.
@@ -36,7 +36,8 @@ pub enum ChecksumCapability {
 }
 
 /// Sequence and checksum capabilities declared by source metadata.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct IntegrityCapabilities {
     sequence: SequenceCapability,
     checksum: ChecksumCapability,
@@ -64,6 +65,16 @@ impl IntegrityCapabilities {
 #[serde(transparent)]
 pub struct RuleVersion(NonZeroU32);
 
+impl<'de> Deserialize<'de> for RuleVersion {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = u32::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
 impl RuleVersion {
     /// Constructs a one-based rule version.
     ///
@@ -83,7 +94,8 @@ impl RuleVersion {
 }
 
 /// Provider-owned rule identity and version retained with validation evidence.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct IntegrityRule {
     provider_rule: SourceIdentifier,
     version: RuleVersion,
@@ -110,7 +122,7 @@ impl IntegrityRule {
 }
 
 /// Sequence progression semantics implemented by the selected provider validator.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SequenceValidationRule {
     /// Each update must be exactly one greater than the prior update.
@@ -130,6 +142,75 @@ pub struct SequenceEvidence {
     previous_sequence: Option<SequenceNumber>,
     observed_sequence: Option<SequenceNumber>,
     integrity: SequenceIntegrity,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SequenceEvidenceWire {
+    capability: SequenceCapability,
+    rule: Option<IntegrityRule>,
+    validation_rule: Option<SequenceValidationRule>,
+    connection_generation: ConnectionGeneration,
+    snapshot_sequence: Option<SequenceNumber>,
+    previous_sequence: Option<SequenceNumber>,
+    observed_sequence: Option<SequenceNumber>,
+    integrity: SequenceIntegrity,
+}
+
+impl<'de> Deserialize<'de> for SequenceEvidence {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = SequenceEvidenceWire::deserialize(deserializer)?;
+        let declared_rule = wire.rule.clone();
+        let rebuilt = match wire.capability {
+            SequenceCapability::Provided => match wire.observed_sequence {
+                Some(observed) => Self::validate(
+                    wire.capability,
+                    wire.rule,
+                    wire.validation_rule.ok_or_else(|| {
+                        serde::de::Error::custom("provided sequence requires validation_rule")
+                    })?,
+                    wire.connection_generation,
+                    wire.snapshot_sequence,
+                    wire.previous_sequence,
+                    Some(observed),
+                ),
+                None => {
+                    if wire.previous_sequence.is_some() {
+                        return Err(serde::de::Error::custom(
+                            "uninitialized sequence cannot retain a previous sequence",
+                        ));
+                    }
+                    Ok(Self::uninitialized(
+                        wire.rule.ok_or_else(|| {
+                            serde::de::Error::custom("provided sequence requires rule")
+                        })?,
+                        wire.validation_rule.ok_or_else(|| {
+                            serde::de::Error::custom("provided sequence requires validation_rule")
+                        })?,
+                        wire.connection_generation,
+                        wire.snapshot_sequence,
+                    ))
+                }
+            },
+            SequenceCapability::Unsupported => Ok(Self::unsupported(wire.connection_generation)),
+        }
+        .map_err(serde::de::Error::custom)?;
+        if rebuilt.integrity != wire.integrity
+            || rebuilt.rule != declared_rule
+            || rebuilt.validation_rule != wire.validation_rule
+            || rebuilt.snapshot_sequence != wire.snapshot_sequence
+            || rebuilt.previous_sequence != wire.previous_sequence
+            || rebuilt.observed_sequence != wire.observed_sequence
+        {
+            return Err(serde::de::Error::custom(
+                "serialized sequence evidence contradicts reconstructed evidence",
+            ));
+        }
+        Ok(rebuilt)
+    }
 }
 
 impl SequenceEvidence {
@@ -268,11 +349,12 @@ impl SequenceEvidence {
 impl AssessmentValidity for SequenceEvidence {}
 
 /// Exact initialized snapshot state, independent of provider sequence capability.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct InitializedSnapshot {
     connection_generation: ConnectionGeneration,
     snapshot_identity: SourceIdentifier,
-    state_digest: super::EvidenceDigest,
+    state_digest: super::CanonicalStateDigest,
     initialized_at: crate::Timestamp,
     sequence: Option<SequenceNumber>,
 }
@@ -282,7 +364,7 @@ impl InitializedSnapshot {
     pub const fn new(
         connection_generation: ConnectionGeneration,
         snapshot_identity: SourceIdentifier,
-        state_digest: super::EvidenceDigest,
+        state_digest: super::CanonicalStateDigest,
         initialized_at: crate::Timestamp,
         sequence: Option<SequenceNumber>,
     ) -> Self {
@@ -304,8 +386,8 @@ impl InitializedSnapshot {
         &self.snapshot_identity
     }
     /// Returns the canonical snapshot digest.
-    pub const fn state_digest(&self) -> super::EvidenceDigest {
-        self.state_digest
+    pub const fn state_digest(&self) -> &super::CanonicalStateDigest {
+        &self.state_digest
     }
     /// Returns when initialization completed.
     pub const fn initialized_at(&self) -> crate::Timestamp {
@@ -318,7 +400,7 @@ impl InitializedSnapshot {
 }
 
 /// Explicit snapshot presence for one connection generation.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "state")]
 pub enum SnapshotState {
     /// A complete snapshot identity, digest, time, and optional sequence are retained.
@@ -331,7 +413,7 @@ pub enum SnapshotState {
 }
 
 /// Provider metadata declaration for snapshot applicability to an event class.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum SnapshotApplicability {
     /// Event processing requires an initialized snapshot.
@@ -350,6 +432,50 @@ pub struct SnapshotEvidence {
     observed_generation: ConnectionGeneration,
     observed_sequence: Option<SequenceNumber>,
     consistency: SnapshotConsistency,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotEvidenceWire {
+    state: SnapshotState,
+    observed_generation: ConnectionGeneration,
+    observed_sequence: Option<SequenceNumber>,
+    consistency: SnapshotConsistency,
+}
+
+impl<'de> Deserialize<'de> for SnapshotEvidence {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = SnapshotEvidenceWire::deserialize(deserializer)?;
+        let rebuilt = match wire.state {
+            SnapshotState::Initialized(initialized) => Self::assess_initialized(
+                initialized,
+                wire.observed_generation,
+                wire.observed_sequence,
+            )
+            .map_err(serde::de::Error::custom)?,
+            SnapshotState::Uninitialized {
+                connection_generation,
+            } => {
+                if connection_generation != wire.observed_generation
+                    || wire.observed_sequence.is_some()
+                {
+                    return Err(serde::de::Error::custom(
+                        "uninitialized snapshot contradicts observed generation or sequence",
+                    ));
+                }
+                Self::uninitialized(connection_generation)
+            }
+        };
+        if rebuilt.consistency != wire.consistency {
+            return Err(serde::de::Error::custom(
+                "serialized snapshot consistency contradicts reconstructed evidence",
+            ));
+        }
+        Ok(rebuilt)
+    }
 }
 
 impl SnapshotEvidence {
