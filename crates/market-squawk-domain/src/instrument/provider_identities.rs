@@ -2,83 +2,112 @@
 
 use std::cmp::Ordering;
 use std::fmt;
+use std::marker::PhantomData;
 
+use serde::de::{IgnoredAny, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::{EffectiveInterval, InstrumentError};
 use crate::{
-    DigestAlgorithm, EvidenceDigest, InstrumentId, MetadataRevision, ProviderInstrumentId,
-    SourceId, SourceIdentifier, Timestamp,
+    DigestAlgorithm, InstrumentId, MetadataRevision, ProviderInstrumentId, SourceId, Timestamp,
 };
 
-/// A provider object locator with an explicit immutable provider version identity.
-///
-/// The locator is retained only to retrieve or explain the source object. The separately required
-/// content digest in [`ProviderIdentityEvidence`] remains the authoritative evidence identity.
-#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProviderIdentityLocator {
-    reference: SourceIdentifier,
-    version: SourceIdentifier,
+#[path = "provider_identities/evidence.rs"]
+mod evidence;
+#[path = "provider_identities/registry.rs"]
+mod registry;
+
+use evidence::compare_locator_slices;
+pub use evidence::{ProviderIdentityEvidence, ProviderIdentityLocator};
+pub use registry::{ProviderIdentityIngestOutcome, ProviderIdentityRegistry};
+
+/// Bounded provider-identity collection whose capacity was exceeded.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ProviderIdentityCollection {
+    /// Retrieval locators attached to one digest.
+    Locators,
+    /// Local observation timestamps retained for one assertion.
+    ObservationTimestamps,
+    /// Accepted records owned by one registry.
+    AcceptedRecords,
+    /// Conflict groups owned by one registry.
+    Conflicts,
+    /// Substantive variants retained in one conflict group.
+    CompetingAssertions,
+    /// Raw assertions supplied to deterministic batch reconstruction.
+    ReconstructionRecords,
 }
 
-impl ProviderIdentityLocator {
-    /// Constructs a bounded provider locator with an explicit version identity.
-    pub const fn new(reference: SourceIdentifier, version: SourceIdentifier) -> Self {
-        Self { reference, version }
-    }
-
-    /// Returns the provider object or record locator.
-    pub const fn reference(&self) -> &SourceIdentifier {
-        &self.reference
-    }
-
-    /// Returns the provider-supplied immutable object or record version.
-    pub const fn version(&self) -> &SourceIdentifier {
-        &self.version
+impl fmt::Display for ProviderIdentityCollection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::Locators => "locators",
+            Self::ObservationTimestamps => "observation timestamps",
+            Self::AcceptedRecords => "accepted records",
+            Self::Conflicts => "conflicts",
+            Self::CompetingAssertions => "competing assertions",
+            Self::ReconstructionRecords => "reconstruction records",
+        };
+        formatter.write_str(name)
     }
 }
 
-/// Immutable, algorithm-qualified content evidence for a provider identity assertion.
-///
-/// A content digest is mandatory. A version-pinned locator is optional metadata and can never
-/// replace the digest, so a bare URL or mutable object name is not representable as evidence.
-#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProviderIdentityEvidence {
-    content_digest: EvidenceDigest,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    version_pinned_locator: Option<ProviderIdentityLocator>,
+struct BoundedVec<T, const MAX: usize>(Vec<T>);
+
+impl<T, const MAX: usize> BoundedVec<T, MAX> {
+    fn into_inner(self) -> Vec<T> {
+        self.0
+    }
 }
 
-impl ProviderIdentityEvidence {
-    /// Constructs provider evidence from an algorithm-qualified content digest.
-    pub const fn from_content_digest(content_digest: EvidenceDigest) -> Self {
-        Self {
-            content_digest,
-            version_pinned_locator: None,
+impl<T, const MAX: usize> Default for BoundedVec<T, MAX> {
+    fn default() -> Self {
+        Self(Vec::new())
+    }
+}
+
+impl<'de, T, const MAX: usize> Deserialize<'de> for BoundedVec<T, MAX>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct BoundedVecVisitor<T, const MAX: usize>(PhantomData<T>);
+
+        impl<'de, T, const MAX: usize> Visitor<'de> for BoundedVecVisitor<T, MAX>
+        where
+            T: Deserialize<'de>,
+        {
+            type Value = BoundedVec<T, MAX>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(formatter, "a sequence containing at most {MAX} elements")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let capacity = sequence.size_hint().unwrap_or(0).min(MAX);
+                let mut values = Vec::with_capacity(capacity);
+                while values.len() < MAX {
+                    let Some(value) = sequence.next_element()? else {
+                        return Ok(BoundedVec(values));
+                    };
+                    values.push(value);
+                }
+                if sequence.next_element::<IgnoredAny>()?.is_some() {
+                    return Err(serde::de::Error::custom(format_args!(
+                        "sequence exceeds maximum of {MAX} elements"
+                    )));
+                }
+                Ok(BoundedVec(values))
+            }
         }
-    }
 
-    /// Constructs provider evidence with an independently versioned source locator.
-    pub const fn with_version_pinned_locator(
-        content_digest: EvidenceDigest,
-        version_pinned_locator: ProviderIdentityLocator,
-    ) -> Self {
-        Self {
-            content_digest,
-            version_pinned_locator: Some(version_pinned_locator),
-        }
-    }
-
-    /// Returns the mandatory algorithm-qualified content digest.
-    pub const fn content_digest(&self) -> EvidenceDigest {
-        self.content_digest
-    }
-
-    /// Returns the optional provider locator and its explicit version identity.
-    pub const fn version_pinned_locator(&self) -> Option<&ProviderIdentityLocator> {
-        self.version_pinned_locator.as_ref()
+        deserializer.deserialize_seq(BoundedVecVisitor(PhantomData))
     }
 }
 
@@ -178,6 +207,9 @@ pub struct ProviderIdentityRecordInput {
 }
 
 impl ProviderIdentityRecord {
+    /// Maximum unique local observations retained for one normalized assertion.
+    pub const MAX_OBSERVATIONS: usize = 1_024;
+
     /// Constructs one assertion carrying a single local observation.
     pub fn new(input: ProviderIdentityRecordInput) -> Self {
         Self {
@@ -252,18 +284,37 @@ impl ProviderIdentityRecord {
         self.instrument_id == other.instrument_id
             && self.source_id == other.source_id
             && self.provider_instrument_id == other.provider_instrument_id
-            && self.evidence == other.evidence
+            && self.evidence.content_equivalent(&other.evidence)
             && self.source_timestamp == other.source_timestamp
             && self.metadata_revision == other.metadata_revision
             && self.validity == other.validity
-            && self.supersedes == other.supersedes
+            && supersessions_are_content_equivalent(
+                self.supersedes.as_ref(),
+                other.supersedes.as_ref(),
+            )
     }
 
-    fn merge_observations(&mut self, other: &Self) {
-        self.observation_timestamps
-            .extend_from_slice(&other.observation_timestamps);
+    fn merge_assertion_metadata(&mut self, other: &Self) -> Result<(), InstrumentError> {
+        self.evidence.merge_locator_metadata(&other.evidence)?;
+        if let (Some(existing), Some(incoming)) = (&mut self.supersedes, &other.supersedes) {
+            existing
+                .evidence
+                .merge_locator_metadata(incoming.evidence())?;
+        }
+        for observation in &other.observation_timestamps {
+            if self.observation_timestamps.contains(observation) {
+                continue;
+            }
+            if self.observation_timestamps.len() == Self::MAX_OBSERVATIONS {
+                return Err(InstrumentError::ProviderIdentityCapacityExceeded {
+                    collection: ProviderIdentityCollection::ObservationTimestamps,
+                    max: Self::MAX_OBSERVATIONS,
+                });
+            }
+            self.observation_timestamps.push(*observation);
+        }
         self.observation_timestamps.sort_unstable();
-        self.observation_timestamps.dedup();
+        Ok(())
     }
 
     fn is_effective_at(&self, at: Timestamp) -> bool {
@@ -289,7 +340,7 @@ struct ProviderIdentityRecordWire {
     provider_instrument_id: ProviderInstrumentId,
     evidence: ProviderIdentityEvidence,
     source_timestamp: Option<Timestamp>,
-    observation_timestamps: Vec<Timestamp>,
+    observation_timestamps: BoundedVec<Timestamp, { ProviderIdentityRecord::MAX_OBSERVATIONS }>,
     metadata_revision: MetadataRevision,
     validity: EffectiveInterval,
     supersedes: Option<ProviderIdentitySupersession>,
@@ -301,12 +352,12 @@ impl<'de> Deserialize<'de> for ProviderIdentityRecord {
         D: Deserializer<'de>,
     {
         let wire = ProviderIdentityRecordWire::deserialize(deserializer)?;
-        if wire.observation_timestamps.is_empty() {
+        let mut observations = wire.observation_timestamps.into_inner();
+        if observations.is_empty() {
             return Err(serde::de::Error::custom(
                 "provider identity requires at least one observation timestamp",
             ));
         }
-        let mut observations = wire.observation_timestamps;
         observations.sort_unstable();
         observations.dedup();
         Ok(Self {
@@ -347,7 +398,8 @@ struct ProviderIdentityConflictWire {
     key: ProviderIdentityKey,
     metadata_revision: MetadataRevision,
     reason: ProviderIdentityConflictReason,
-    competing_assertions: Vec<ProviderIdentityRecord>,
+    competing_assertions:
+        BoundedVec<ProviderIdentityRecord, { ProviderIdentityConflict::MAX_COMPETING_ASSERTIONS }>,
 }
 
 impl<'de> Deserialize<'de> for ProviderIdentityConflict {
@@ -356,8 +408,9 @@ impl<'de> Deserialize<'de> for ProviderIdentityConflict {
         D: Deserializer<'de>,
     {
         let wire = ProviderIdentityConflictWire::deserialize(deserializer)?;
-        let (accepted, mut conflicts) = normalize_provider_identities(wire.competing_assertions)
-            .map_err(serde::de::Error::custom)?;
+        let (accepted, mut conflicts) =
+            normalize_provider_identities(wire.competing_assertions.into_inner())
+                .map_err(serde::de::Error::custom)?;
         if !accepted.is_empty() || conflicts.len() != 1 {
             return Err(serde::de::Error::custom(
                 "provider identity conflict must contain divergent same-revision assertions",
@@ -377,6 +430,9 @@ impl<'de> Deserialize<'de> for ProviderIdentityConflict {
 }
 
 impl ProviderIdentityConflict {
+    /// Maximum substantive variants retained for one conflicting revision.
+    pub const MAX_COMPETING_ASSERTIONS: usize = 256;
+
     /// Returns the source-qualified natural key.
     pub const fn key(&self) -> &ProviderIdentityKey {
         &self.key
@@ -416,8 +472,14 @@ pub(super) fn normalize_provider_identities(
                 .iter_mut()
                 .find(|existing| existing.same_assertion(candidate))
             {
-                existing.merge_observations(candidate);
+                existing.merge_assertion_metadata(candidate)?;
             } else {
+                if variants.len() == ProviderIdentityConflict::MAX_COMPETING_ASSERTIONS {
+                    return Err(InstrumentError::ProviderIdentityCapacityExceeded {
+                        collection: ProviderIdentityCollection::CompetingAssertions,
+                        max: ProviderIdentityConflict::MAX_COMPETING_ASSERTIONS,
+                    });
+                }
                 variants.push(candidate.clone());
             }
         }
@@ -435,7 +497,7 @@ pub(super) fn normalize_provider_identities(
         cursor = end;
     }
     accepted.sort_by(compare_records);
-    validate_revision_graphs(&accepted)?;
+    validate_revision_graphs(&accepted, &conflicts)?;
     Ok((accepted, conflicts))
 }
 
@@ -459,14 +521,24 @@ pub(super) fn provider_identity_at<'a>(
     })
 }
 
-fn validate_revision_graphs(records: &[ProviderIdentityRecord]) -> Result<(), InstrumentError> {
+fn validate_revision_graphs(
+    records: &[ProviderIdentityRecord],
+    conflicts: &[ProviderIdentityConflict],
+) -> Result<(), InstrumentError> {
     let mut cursor = 0;
     while cursor < records.len() {
         let end = records[cursor..]
             .iter()
             .position(|candidate| !same_natural_key(&records[cursor], candidate))
             .map_or(records.len(), |offset| cursor + offset);
-        validate_revision_graph(&records[cursor..end])?;
+        let key_is_quarantined = conflicts.iter().any(|conflict| {
+            conflict.key().source_id() == records[cursor].source_id()
+                && conflict.key().provider_instrument_id()
+                    == records[cursor].provider_instrument_id()
+        });
+        if !key_is_quarantined {
+            validate_revision_graph(&records[cursor..end])?;
+        }
         cursor = end;
     }
     Ok(())
@@ -602,6 +674,20 @@ fn compare_supersession(
     }
 }
 
+fn supersessions_are_content_equivalent(
+    left: Option<&ProviderIdentitySupersession>,
+    right: Option<&ProviderIdentitySupersession>,
+) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => {
+            left.predecessor() == right.predecessor()
+                && left.evidence().content_equivalent(right.evidence())
+        }
+        (None, Some(_)) | (Some(_), None) => false,
+    }
+}
+
 fn compare_evidence(left: &ProviderIdentityEvidence, right: &ProviderIdentityEvidence) -> Ordering {
     digest_algorithm_rank(left.content_digest().algorithm())
         .cmp(&digest_algorithm_rank(right.content_digest().algorithm()))
@@ -610,27 +696,7 @@ fn compare_evidence(left: &ProviderIdentityEvidence, right: &ProviderIdentityEvi
                 .bytes()
                 .cmp(&right.content_digest().bytes())
         })
-        .then_with(|| {
-            compare_locator(
-                left.version_pinned_locator(),
-                right.version_pinned_locator(),
-            )
-        })
-}
-
-fn compare_locator(
-    left: Option<&ProviderIdentityLocator>,
-    right: Option<&ProviderIdentityLocator>,
-) -> Ordering {
-    match (left, right) {
-        (None, None) => Ordering::Equal,
-        (None, Some(_)) => Ordering::Less,
-        (Some(_), None) => Ordering::Greater,
-        (Some(left), Some(right)) => left
-            .reference()
-            .cmp(right.reference())
-            .then_with(|| left.version().cmp(right.version())),
-    }
+        .then_with(|| compare_locator_slices(left.locators(), right.locators()))
 }
 
 const fn digest_algorithm_rank(algorithm: DigestAlgorithm) -> u8 {

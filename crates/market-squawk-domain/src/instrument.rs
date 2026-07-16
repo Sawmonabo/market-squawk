@@ -2,25 +2,26 @@ use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::{
-    Denomination, InstrumentId, LotSize, MetadataRevision, ProviderInstrumentId, SourceId,
-    TickSize, Timestamp, VenueId, VenueSymbol,
-};
+use crate::{InstrumentId, MetadataRevision, Timestamp, VenueId, VenueSymbol};
 
+#[path = "instrument/definition.rs"]
+mod definition;
 #[path = "instrument/identifier_records.rs"]
 mod identifier_records;
 #[path = "instrument/provider_identities.rs"]
 mod provider_identities;
 
+pub use definition::{InstrumentDefinition, InstrumentDefinitionInput};
 pub use identifier_records::{
     AssignmentVerification, ExternalIdentifier, ExternalIdentifierRecord,
     ExternalIdentifierRecordInput, IdentifierEntitlement, IdentifierRightsPolicyReference,
     IdentifierSyntaxVerification,
 };
 pub use provider_identities::{
-    ProviderIdentityConflict, ProviderIdentityConflictReason, ProviderIdentityEvidence,
-    ProviderIdentityKey, ProviderIdentityLocator, ProviderIdentityRecord,
-    ProviderIdentityRecordInput, ProviderIdentitySupersession,
+    ProviderIdentityCollection, ProviderIdentityConflict, ProviderIdentityConflictReason,
+    ProviderIdentityEvidence, ProviderIdentityIngestOutcome, ProviderIdentityKey,
+    ProviderIdentityLocator, ProviderIdentityRecord, ProviderIdentityRecordInput,
+    ProviderIdentityRegistry, ProviderIdentitySupersession,
 };
 
 /// A broad instrument asset family, separate from Task 4 evidence classifications.
@@ -149,6 +150,18 @@ pub enum InstrumentError {
         /// Revision claiming to replace it.
         successor: MetadataRevision,
     },
+    /// A bounded provider-identity collection exceeded its documented capacity.
+    ProviderIdentityCapacityExceeded {
+        /// Collection whose bound was exceeded.
+        collection: ProviderIdentityCollection,
+        /// Maximum number of retained elements.
+        max: usize,
+    },
+    /// A new revision was submitted while its natural provider key remained quarantined.
+    ProviderIdentityKeyQuarantined {
+        /// Natural key requiring explicit conflict resolution before revision advancement.
+        key: ProviderIdentityKey,
+    },
 }
 
 impl fmt::Display for InstrumentError {
@@ -202,6 +215,18 @@ impl fmt::Display for InstrumentError {
                 "provider identity transition {} -> {} overlaps or leaves the predecessor current",
                 predecessor.as_source_identifier(),
                 successor.as_source_identifier()
+            ),
+            Self::ProviderIdentityCapacityExceeded { collection, max } => {
+                write!(
+                    formatter,
+                    "provider identity {collection} exceeds maximum capacity {max}"
+                )
+            }
+            Self::ProviderIdentityKeyQuarantined { key } => write!(
+                formatter,
+                "provider identity {}:{} is quarantined and cannot advance revisions",
+                key.source_id(),
+                key.provider_instrument_id()
             ),
         }
     }
@@ -485,230 +510,6 @@ impl<'de> Deserialize<'de> for ContractRollMapping {
             wire.to_instrument_id,
             wire.effective_at,
         )
-        .map_err(serde::de::Error::custom)
-    }
-}
-
-/// Current instrument reference definition with invariant-preserving private fields.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct InstrumentDefinition {
-    instrument_id: InstrumentId,
-    asset_class: AssetClass,
-    primary_denomination: Denomination,
-    tick_size: TickSize,
-    lot_size: LotSize,
-    venue_mappings: Vec<VenueMapping>,
-    provider_identities: Vec<ProviderIdentityRecord>,
-    provider_identity_conflicts: Vec<ProviderIdentityConflict>,
-    identifiers: Vec<ExternalIdentifierRecord>,
-    trading_status: TradingStatus,
-}
-
-/// Complete current reference-master input for constructing [`InstrumentDefinition`].
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct InstrumentDefinitionInput {
-    /// Stable internal instrument identity.
-    pub instrument_id: InstrumentId,
-    /// Broad asset family.
-    pub asset_class: AssetClass,
-    /// Explicit settlement denomination.
-    pub primary_denomination: Denomination,
-    /// Exact price increment.
-    pub tick_size: TickSize,
-    /// Exact quantity increment.
-    pub lot_size: LotSize,
-    /// Current venue-symbol mappings.
-    pub venue_mappings: Vec<VenueMapping>,
-    /// Source-qualified provider identity records.
-    pub provider_identities: Vec<ProviderIdentityRecord>,
-    /// Evidence-bearing external identifier records.
-    pub identifiers: Vec<ExternalIdentifierRecord>,
-    /// Current reference-master trading status.
-    pub trading_status: TradingStatus,
-}
-
-impl InstrumentDefinition {
-    /// Constructs a current instrument definition.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`InstrumentError::DuplicateVenueMapping`] for multiple current mappings in one
-    /// venue; historical mappings belong in [`SymbolIdentityRecord`] intervals. Returns
-    /// [`InstrumentError::ProviderIdentityInstrumentMismatch`] when an accepted provider assertion
-    /// names a different stable instrument and [`InstrumentError::DuplicateExternalIdentifier`]
-    /// when the same typed external identifier is attached more than once.
-    ///
-    /// Provider revision graphs additionally return
-    /// [`InstrumentError::MissingProviderIdentitySupersession`],
-    /// [`InstrumentError::MissingProviderIdentityPredecessor`],
-    /// [`InstrumentError::ProviderIdentitySupersessionCycle`],
-    /// [`InstrumentError::AmbiguousProviderIdentitySuccessor`], or
-    /// [`InstrumentError::InvalidProviderIdentityTransition`] when their evidence is incomplete,
-    /// cyclic, branching, or temporally overlapping.
-    pub fn try_new(input: InstrumentDefinitionInput) -> Result<Self, InstrumentError> {
-        let InstrumentDefinitionInput {
-            instrument_id,
-            asset_class,
-            primary_denomination,
-            tick_size,
-            lot_size,
-            venue_mappings,
-            provider_identities,
-            identifiers,
-            trading_status,
-        } = input;
-        for (index, mapping) in venue_mappings.iter().enumerate() {
-            if venue_mappings
-                .iter()
-                .skip(index + 1)
-                .any(|candidate| candidate.venue_id == mapping.venue_id)
-            {
-                return Err(InstrumentError::DuplicateVenueMapping {
-                    venue: mapping.venue_id.clone(),
-                });
-            }
-        }
-        let (provider_identities, provider_identity_conflicts) =
-            provider_identities::normalize_provider_identities(provider_identities)?;
-        for record in &provider_identities {
-            if record.instrument_id() != instrument_id {
-                return Err(InstrumentError::ProviderIdentityInstrumentMismatch {
-                    definition: instrument_id,
-                    record: record.instrument_id(),
-                });
-            }
-        }
-        for (index, record) in identifiers.iter().enumerate() {
-            if identifiers
-                .iter()
-                .skip(index + 1)
-                .any(|candidate| candidate.identifier() == record.identifier())
-            {
-                return Err(InstrumentError::DuplicateExternalIdentifier);
-            }
-        }
-        Ok(Self {
-            instrument_id,
-            asset_class,
-            primary_denomination,
-            tick_size,
-            lot_size,
-            venue_mappings,
-            provider_identities,
-            provider_identity_conflicts,
-            identifiers,
-            trading_status,
-        })
-    }
-
-    /// Returns the stable internal identity.
-    pub const fn instrument_id(&self) -> InstrumentId {
-        self.instrument_id
-    }
-
-    /// Returns the broad asset family.
-    pub const fn asset_class(&self) -> AssetClass {
-        self.asset_class
-    }
-
-    /// Returns the explicitly typed primary settlement denomination.
-    pub const fn primary_denomination(&self) -> Denomination {
-        self.primary_denomination
-    }
-
-    /// Returns the exact price increment.
-    pub const fn tick_size(&self) -> TickSize {
-        self.tick_size
-    }
-
-    /// Returns the exact quantity increment.
-    pub const fn lot_size(&self) -> LotSize {
-        self.lot_size
-    }
-
-    /// Returns current venue mappings.
-    pub fn venue_mappings(&self) -> &[VenueMapping] {
-        &self.venue_mappings
-    }
-
-    /// Returns source-qualified provider identities without collapsing source namespaces.
-    pub fn provider_identities(&self) -> &[ProviderIdentityRecord] {
-        &self.provider_identities
-    }
-
-    /// Returns quarantined competing provider assertions in deterministic order.
-    pub fn provider_identity_conflicts(&self) -> &[ProviderIdentityConflict] {
-        &self.provider_identity_conflicts
-    }
-
-    /// Resolves an accepted provider mapping at an effective instant.
-    ///
-    /// Quarantined evidence is never considered. Revision graph validation guarantees this cannot
-    /// return an arbitrary winner from overlapping accepted assertions.
-    pub fn provider_identity_at(
-        &self,
-        source_id: &SourceId,
-        provider_instrument_id: &ProviderInstrumentId,
-        at: Timestamp,
-    ) -> Option<&ProviderIdentityRecord> {
-        provider_identities::provider_identity_at(
-            &self.provider_identities,
-            &self.provider_identity_conflicts,
-            source_id,
-            provider_instrument_id,
-            at,
-        )
-    }
-
-    /// Returns syntactically validated external identifiers.
-    pub fn identifiers(&self) -> &[ExternalIdentifierRecord] {
-        &self.identifiers
-    }
-
-    /// Returns current reference-master trading status.
-    pub const fn trading_status(&self) -> TradingStatus {
-        self.trading_status
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct InstrumentDefinitionWire {
-    instrument_id: InstrumentId,
-    asset_class: AssetClass,
-    primary_denomination: Denomination,
-    tick_size: TickSize,
-    lot_size: LotSize,
-    venue_mappings: Vec<VenueMapping>,
-    #[serde(default)]
-    provider_identities: Vec<ProviderIdentityRecord>,
-    #[serde(default)]
-    provider_identity_conflicts: Vec<ProviderIdentityConflict>,
-    identifiers: Vec<ExternalIdentifierRecord>,
-    trading_status: TradingStatus,
-}
-
-impl<'de> Deserialize<'de> for InstrumentDefinition {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let wire = InstrumentDefinitionWire::deserialize(deserializer)?;
-        let mut provider_identities = wire.provider_identities;
-        for conflict in wire.provider_identity_conflicts {
-            provider_identities.extend_from_slice(conflict.competing_assertions());
-        }
-        Self::try_new(InstrumentDefinitionInput {
-            instrument_id: wire.instrument_id,
-            asset_class: wire.asset_class,
-            primary_denomination: wire.primary_denomination,
-            tick_size: wire.tick_size,
-            lot_size: wire.lot_size,
-            venue_mappings: wire.venue_mappings,
-            provider_identities,
-            identifiers: wire.identifiers,
-            trading_status: wire.trading_status,
-        })
         .map_err(serde::de::Error::custom)
     }
 }

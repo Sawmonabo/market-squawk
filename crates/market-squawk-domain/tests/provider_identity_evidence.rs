@@ -1,8 +1,8 @@
 use market_squawk_domain::{
     AssetClass, Currency, Denomination, EffectiveInterval, EvidenceDigest, InstrumentDefinition,
     InstrumentDefinitionInput, InstrumentError, InstrumentId, LotSize, MetadataRevision,
-    PayloadHashAlgorithm, ProviderIdentityConflictReason, ProviderIdentityEvidence,
-    ProviderIdentityLocator, ProviderIdentityRecord, ProviderIdentityRecordInput,
+    PayloadHashAlgorithm, ProviderIdentityEvidence, ProviderIdentityLocator,
+    ProviderIdentityRecord, ProviderIdentityRecordInput, ProviderIdentityRegistry,
     ProviderIdentitySupersession, ProviderInstrumentId, SourceId, SourceIdentifier, TickSize,
     Timestamp, TradingStatus,
 };
@@ -25,6 +25,48 @@ fn reference(digest: u8) -> ProviderIdentityEvidence {
     ))
 }
 
+fn locator(
+    reference: &str,
+    version: &str,
+) -> Result<ProviderIdentityLocator, Box<dyn std::error::Error>> {
+    Ok(ProviderIdentityLocator::new(
+        SourceIdentifier::try_from(reference)?,
+        SourceIdentifier::try_from(version)?,
+    ))
+}
+
+fn evidence_with_locator(
+    digest: u8,
+    reference: &str,
+    version: &str,
+) -> Result<ProviderIdentityEvidence, Box<dyn std::error::Error>> {
+    Ok(ProviderIdentityEvidence::with_version_pinned_locator(
+        EvidenceDigest::new(PayloadHashAlgorithm::Sha256, [digest; 32]),
+        locator(reference, version)?,
+    ))
+}
+
+fn record_with_evidence(
+    mapped_instrument: InstrumentId,
+    revision_name: &str,
+    observed_at: i64,
+    evidence: ProviderIdentityEvidence,
+    validity: EffectiveInterval,
+    supersedes: Option<ProviderIdentitySupersession>,
+) -> Result<ProviderIdentityRecord, Box<dyn std::error::Error>> {
+    Ok(ProviderIdentityRecord::new(ProviderIdentityRecordInput {
+        instrument_id: mapped_instrument,
+        source_id: SourceId::try_from("vendor-alpha")?,
+        provider_instrument_id: ProviderInstrumentId::try_from("12345")?,
+        evidence,
+        source_timestamp: Some(Timestamp::from_unix_nanos(99)),
+        observed_at: Timestamp::from_unix_nanos(observed_at),
+        metadata_revision: revision(revision_name)?,
+        validity,
+        supersedes,
+    }))
+}
+
 fn record(
     mapped_instrument: InstrumentId,
     revision_name: &str,
@@ -33,17 +75,14 @@ fn record(
     validity: EffectiveInterval,
     supersedes: Option<ProviderIdentitySupersession>,
 ) -> Result<ProviderIdentityRecord, Box<dyn std::error::Error>> {
-    Ok(ProviderIdentityRecord::new(ProviderIdentityRecordInput {
-        instrument_id: mapped_instrument,
-        source_id: SourceId::try_from("vendor-alpha")?,
-        provider_instrument_id: ProviderInstrumentId::try_from("12345")?,
-        evidence: reference(digest),
-        source_timestamp: Some(Timestamp::from_unix_nanos(99)),
-        observed_at: Timestamp::from_unix_nanos(observed_at),
-        metadata_revision: revision(revision_name)?,
+    record_with_evidence(
+        mapped_instrument,
+        revision_name,
+        observed_at,
+        reference(digest),
         validity,
         supersedes,
-    }))
+    )
 }
 
 fn supersedes(
@@ -110,49 +149,144 @@ fn identical_assertions_coalesce_and_retain_unique_sorted_observations()
 }
 
 #[test]
-fn same_natural_key_and_revision_conflicts_are_quarantined_without_order_winner()
+fn locator_metadata_coalesces_without_changing_assertion_identity()
 -> Result<(), Box<dyn std::error::Error>> {
     let owner = instrument(1)?;
-    let other = instrument(2)?;
     let validity = EffectiveInterval::new(Timestamp::from_unix_nanos(10), None)?;
-    let candidates = vec![
-        record(owner, "revision-7", 100, 7, validity, None)?,
-        record(other, "revision-7", 200, 7, validity, None)?,
-        record(owner, "revision-7", 300, 8, validity, None)?,
-        record(
-            owner,
-            "revision-7",
-            400,
-            7,
-            EffectiveInterval::new(Timestamp::from_unix_nanos(11), None)?,
-            None,
-        )?,
-    ];
-    let forward = definition(owner, candidates.clone())?;
-    let reverse = definition(owner, candidates.into_iter().rev().collect())?;
+    let without_locator = record(owner, "revision-7", 300, 7, validity, None)?;
+    let later_locator = record_with_evidence(
+        owner,
+        "revision-7",
+        500,
+        evidence_with_locator(7, "provider-object:z", "version:2")?,
+        validity,
+        None,
+    )?;
+    let earlier_locator = record_with_evidence(
+        owner,
+        "revision-7",
+        400,
+        evidence_with_locator(7, "provider-object:a", "version:1")?,
+        validity,
+        None,
+    )?;
 
-    assert_eq!(forward, reverse);
-    assert!(forward.provider_identities().is_empty());
-    assert_eq!(forward.provider_identity_conflicts().len(), 1);
-    let conflict = &forward.provider_identity_conflicts()[0];
+    let registry = ProviderIdentityRegistry::try_from_records(vec![
+        later_locator,
+        without_locator,
+        earlier_locator,
+    ])?;
+    assert_eq!(registry.accepted().len(), 1);
+    assert!(registry.conflicts().is_empty());
     assert_eq!(
-        conflict.reason(),
-        ProviderIdentityConflictReason::SameRevisionDivergence
+        registry.accepted()[0].observation_timestamps(),
+        &[
+            Timestamp::from_unix_nanos(300),
+            Timestamp::from_unix_nanos(400),
+            Timestamp::from_unix_nanos(500),
+        ]
     );
-    assert_eq!(conflict.competing_assertions().len(), 4);
+    let locators = registry.accepted()[0].evidence().locators();
+    assert_eq!(locators.len(), 2);
+    assert_eq!(locators[0].reference().as_str(), "provider-object:a");
+    assert_eq!(locators[1].reference().as_str(), "provider-object:z");
+    Ok(())
+}
+
+#[test]
+fn supersession_locator_metadata_coalesces_on_content_equivalent_edges()
+-> Result<(), Box<dyn std::error::Error>> {
+    let owner = instrument(1)?;
+    let first_interval = EffectiveInterval::new(
+        Timestamp::from_unix_nanos(10),
+        Some(Timestamp::from_unix_nanos(20)),
+    )?;
+    let second_interval = EffectiveInterval::new(Timestamp::from_unix_nanos(20), None)?;
+    let root = record(owner, "revision-1", 100, 1, first_interval, None)?;
+    let second_without_locators = record(
+        owner,
+        "revision-2",
+        200,
+        2,
+        second_interval,
+        Some(supersedes("revision-1", 42)?),
+    )?;
+    let second_with_locators = record_with_evidence(
+        owner,
+        "revision-2",
+        201,
+        evidence_with_locator(2, "assertion:b", "version:2")?,
+        second_interval,
+        Some(ProviderIdentitySupersession::new(
+            revision("revision-1")?,
+            evidence_with_locator(42, "transition:a", "version:1")?,
+        )),
+    )?;
+
+    let registry = ProviderIdentityRegistry::try_from_records(vec![
+        second_with_locators,
+        root,
+        second_without_locators,
+    ])?;
+    assert!(registry.conflicts().is_empty());
+    assert_eq!(registry.accepted().len(), 2);
+    let successor = &registry.accepted()[1];
+    assert_eq!(successor.evidence().locators().len(), 1);
+    assert_eq!(successor.observation_timestamps().len(), 2);
     assert_eq!(
-        serde_json::from_value::<InstrumentDefinition>(serde_json::to_value(&forward)?)?,
-        forward
+        successor
+            .supersedes()
+            .map(ProviderIdentitySupersession::evidence)
+            .map(ProviderIdentityEvidence::locators)
+            .map(<[_]>::len),
+        Some(1)
     );
-    assert!(
-        forward
-            .provider_identity_at(
-                &SourceId::try_from("vendor-alpha")?,
-                &ProviderInstrumentId::try_from("12345")?,
-                Timestamp::from_unix_nanos(20),
-            )
-            .is_none()
-    );
+    Ok(())
+}
+
+#[test]
+fn digest_algorithm_and_transition_content_remain_substantive_conflicts()
+-> Result<(), Box<dyn std::error::Error>> {
+    let owner = instrument(1)?;
+    let first_interval = EffectiveInterval::new(
+        Timestamp::from_unix_nanos(10),
+        Some(Timestamp::from_unix_nanos(20)),
+    )?;
+    let second_interval = EffectiveInterval::new(Timestamp::from_unix_nanos(20), None)?;
+    let root = record(owner, "revision-1", 100, 1, first_interval, None)?;
+    let sha = record(
+        owner,
+        "revision-2",
+        200,
+        2,
+        second_interval,
+        Some(supersedes("revision-1", 42)?),
+    )?;
+    let blake = record_with_evidence(
+        owner,
+        "revision-2",
+        201,
+        ProviderIdentityEvidence::from_content_digest(EvidenceDigest::new(
+            PayloadHashAlgorithm::Blake3,
+            [2; 32],
+        )),
+        second_interval,
+        Some(supersedes("revision-1", 42)?),
+    )?;
+    let transition_changed = record(
+        owner,
+        "revision-2",
+        202,
+        2,
+        second_interval,
+        Some(supersedes("revision-1", 43)?),
+    )?;
+
+    let registry =
+        ProviderIdentityRegistry::try_from_records(vec![root, sha, blake, transition_changed])?;
+    assert_eq!(registry.accepted().len(), 1);
+    assert_eq!(registry.conflicts().len(), 1);
+    assert_eq!(registry.conflicts()[0].competing_assertions().len(), 3);
     Ok(())
 }
 
@@ -261,54 +395,6 @@ fn revisions_require_evidenced_linear_supersession_and_nonoverlapping_transition
     Ok(())
 }
 
-#[test]
-fn a_conflict_on_any_revision_suppresses_active_resolution_for_the_natural_key()
--> Result<(), Box<dyn std::error::Error>> {
-    let owner = instrument(1)?;
-    let other = instrument(2)?;
-    let first = record(
-        owner,
-        "revision-1",
-        100,
-        1,
-        EffectiveInterval::new(Timestamp::from_unix_nanos(10), None)?,
-        None,
-    )?;
-    let conflicting_revision = vec![
-        record(
-            owner,
-            "revision-2",
-            200,
-            2,
-            EffectiveInterval::new(Timestamp::from_unix_nanos(20), None)?,
-            Some(supersedes("revision-1", 9)?),
-        )?,
-        record(
-            other,
-            "revision-2",
-            201,
-            2,
-            EffectiveInterval::new(Timestamp::from_unix_nanos(20), None)?,
-            Some(supersedes("revision-1", 9)?),
-        )?,
-    ];
-    let mut records = vec![first];
-    records.extend(conflicting_revision);
-    let definition = definition(owner, records)?;
-    assert_eq!(definition.provider_identities().len(), 1);
-    assert_eq!(definition.provider_identity_conflicts().len(), 1);
-    assert!(
-        definition
-            .provider_identity_at(
-                &SourceId::try_from("vendor-alpha")?,
-                &ProviderInstrumentId::try_from("12345")?,
-                Timestamp::from_unix_nanos(15),
-            )
-            .is_none()
-    );
-    Ok(())
-}
-
 proptest! {
     #[test]
     fn canonical_provider_ingestion_is_permutation_invariant(sort_keys in prop::array::uniform6(any::<u64>())) {
@@ -321,12 +407,30 @@ proptest! {
             .map_err(|error| TestCaseError::fail(error.to_string()))?;
         let edge = supersedes("revision-1", 9)
             .map_err(|error| TestCaseError::fail(error.to_string()))?;
+        let first_locator = evidence_with_locator(1, "provider-object:z", "version:2")
+            .map_err(|error| TestCaseError::fail(error.to_string()))?;
+        let second_locator = evidence_with_locator(2, "provider-object:a", "version:1")
+            .map_err(|error| TestCaseError::fail(error.to_string()))?;
         let records = vec![
             record(owner, "revision-1", 100, 1, first_interval, None),
-            record(owner, "revision-1", 101, 1, first_interval, None),
+            record_with_evidence(
+                owner,
+                "revision-1",
+                101,
+                first_locator,
+                first_interval,
+                None,
+            ),
             record(owner, "revision-1", 100, 1, first_interval, None),
             record(owner, "revision-2", 200, 2, second_interval, Some(edge.clone())),
-            record(owner, "revision-2", 201, 2, second_interval, Some(edge.clone())),
+            record_with_evidence(
+                owner,
+                "revision-2",
+                201,
+                second_locator,
+                second_interval,
+                Some(edge.clone()),
+            ),
             record(owner, "revision-2", 201, 2, second_interval, Some(edge)),
         ]
         .into_iter()
@@ -368,20 +472,18 @@ fn provider_identity_wire_is_strict_and_canonical() -> Result<(), Box<dyn std::e
 }
 
 #[test]
-fn provider_evidence_requires_a_digest_and_retains_an_explicit_version_pin()
+fn provider_evidence_requires_a_digest_and_retains_sorted_unique_locator_metadata()
 -> Result<(), Box<dyn std::error::Error>> {
     let bytes = [19; 32];
-    let locator = ProviderIdentityLocator::new(
-        SourceIdentifier::try_from("provider-object:instrument/12345")?,
-        SourceIdentifier::try_from("metadata-version:42")?,
-    );
-    let sha = ProviderIdentityEvidence::with_version_pinned_locator(
+    let later = locator("provider-object:z", "metadata-version:42")?;
+    let earlier = locator("provider-object:a", "metadata-version:41")?;
+    let sha = ProviderIdentityEvidence::try_with_locators(
         EvidenceDigest::new(PayloadHashAlgorithm::Sha256, bytes),
-        locator.clone(),
-    );
+        [later.clone(), earlier.clone(), later],
+    )?;
     let blake = ProviderIdentityEvidence::with_version_pinned_locator(
         EvidenceDigest::new(PayloadHashAlgorithm::Blake3, bytes),
-        locator,
+        earlier,
     );
 
     assert_ne!(sha, blake);
@@ -390,12 +492,9 @@ fn provider_evidence_requires_a_digest_and_retains_an_explicit_version_pin()
         PayloadHashAlgorithm::Sha256
     );
     assert_eq!(sha.content_digest().bytes(), bytes);
-    assert_eq!(
-        sha.version_pinned_locator()
-            .map(ProviderIdentityLocator::version)
-            .map(SourceIdentifier::as_str),
-        Some("metadata-version:42")
-    );
+    assert_eq!(sha.locators().len(), 2);
+    assert_eq!(sha.locators()[0].reference().as_str(), "provider-object:a");
+    assert_eq!(sha.locators()[1].reference().as_str(), "provider-object:z");
     assert_eq!(
         serde_json::from_value::<ProviderIdentityEvidence>(serde_json::to_value(&sha)?)?,
         sha
@@ -407,10 +506,10 @@ fn provider_evidence_requires_a_digest_and_retains_an_explicit_version_pin()
 fn provider_evidence_wire_rejects_bare_locators_and_tampering()
 -> Result<(), Box<dyn std::error::Error>> {
     let bare_locator = serde_json::json!({
-        "version_pinned_locator": {
+        "locators": [{
             "reference": "https://provider.example/current/instrument/12345",
             "version": "metadata-version:42"
-        }
+        }]
     });
     assert!(serde_json::from_value::<ProviderIdentityEvidence>(bare_locator).is_err());
 
@@ -419,9 +518,9 @@ fn provider_evidence_wire_rejects_bare_locators_and_tampering()
             "algorithm": "sha256",
             "bytes": vec![7; 32]
         },
-        "version_pinned_locator": {
+        "locators": [{
             "reference": "provider-object:instrument/12345"
-        }
+        }]
     });
     assert!(serde_json::from_value::<ProviderIdentityEvidence>(locator_without_version).is_err());
 
@@ -436,5 +535,19 @@ fn provider_evidence_wire_rejects_bare_locators_and_tampering()
     ))?;
     unknown["trusted_without_digest"] = serde_json::json!(true);
     assert!(serde_json::from_value::<ProviderIdentityEvidence>(unknown).is_err());
+
+    let too_many_locators = serde_json::json!({
+        "content_digest": {
+            "algorithm": "sha256",
+            "bytes": vec![7; 32]
+        },
+        "locators": (0..=ProviderIdentityEvidence::MAX_LOCATORS)
+            .map(|index| serde_json::json!({
+                "reference": format!("provider-object:{index}"),
+                "version": format!("metadata-version:{index}")
+            }))
+            .collect::<Vec<_>>()
+    });
+    assert!(serde_json::from_value::<ProviderIdentityEvidence>(too_many_locators).is_err());
     Ok(())
 }

@@ -59,9 +59,10 @@ pub use instrument::{
     ExternalIdentifierRecord, ExternalIdentifierRecordInput, IdentifierEntitlement,
     IdentifierRightsPolicyReference, IdentifierSyntaxVerification, InstrumentDefinition,
     InstrumentDefinitionInput, InstrumentError, LifecycleTransition, LifecycleTransitionKind,
-    ProviderIdentityConflict, ProviderIdentityConflictReason, ProviderIdentityEvidence,
-    ProviderIdentityKey, ProviderIdentityLocator, ProviderIdentityRecord,
-    ProviderIdentityRecordInput, ProviderIdentitySupersession, SymbolIdentityRecord, TradingStatus,
+    ProviderIdentityCollection, ProviderIdentityConflict, ProviderIdentityConflictReason,
+    ProviderIdentityEvidence, ProviderIdentityIngestOutcome, ProviderIdentityKey,
+    ProviderIdentityLocator, ProviderIdentityRecord, ProviderIdentityRecordInput,
+    ProviderIdentityRegistry, ProviderIdentitySupersession, SymbolIdentityRecord, TradingStatus,
     VenueMapping,
 };
 pub use market::{
