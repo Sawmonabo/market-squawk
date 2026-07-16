@@ -131,7 +131,6 @@ impl SequenceEvidence {
     /// # Errors
     ///
     /// Rejects capability contradictions, missing rules/observations, and sequence overflow.
-    #[allow(clippy::too_many_arguments)]
     pub fn validate(
         capability: SequenceCapability,
         rule: Option<IntegrityRule>,
@@ -259,42 +258,117 @@ impl SequenceEvidence {
     }
 }
 
-/// A generation-bound snapshot/update consistency assessment.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-pub struct SnapshotEvidence {
+/// Exact initialized snapshot state, independent of provider sequence capability.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct InitializedSnapshot {
     connection_generation: ConnectionGeneration,
-    snapshot_sequence: Option<SequenceNumber>,
+    snapshot_identity: SourceIdentifier,
+    state_digest: super::EvidenceDigest,
+    initialized_at: crate::Timestamp,
+    sequence: Option<SequenceNumber>,
+}
+
+impl InitializedSnapshot {
+    /// Constructs an explicit initialized snapshot state.
+    pub const fn new(
+        connection_generation: ConnectionGeneration,
+        snapshot_identity: SourceIdentifier,
+        state_digest: super::EvidenceDigest,
+        initialized_at: crate::Timestamp,
+        sequence: Option<SequenceNumber>,
+    ) -> Self {
+        Self {
+            connection_generation,
+            snapshot_identity,
+            state_digest,
+            initialized_at,
+            sequence,
+        }
+    }
+
+    /// Returns the connection generation in which initialization occurred.
+    pub const fn connection_generation(&self) -> ConnectionGeneration {
+        self.connection_generation
+    }
+    /// Returns the snapshot identity.
+    pub const fn snapshot_identity(&self) -> &SourceIdentifier {
+        &self.snapshot_identity
+    }
+    /// Returns the canonical snapshot digest.
+    pub const fn state_digest(&self) -> super::EvidenceDigest {
+        self.state_digest
+    }
+    /// Returns when initialization completed.
+    pub const fn initialized_at(&self) -> crate::Timestamp {
+        self.initialized_at
+    }
+    /// Returns the optional provider sequence without conflating absence with initialization.
+    pub const fn sequence(&self) -> Option<SequenceNumber> {
+        self.sequence
+    }
+}
+
+/// Explicit snapshot presence for one connection generation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "state")]
+pub enum SnapshotState {
+    /// A complete snapshot identity, digest, time, and optional sequence are retained.
+    Initialized(InitializedSnapshot),
+    /// No qualifying snapshot has initialized this generation.
+    Uninitialized {
+        /// Generation that remains uninitialized.
+        connection_generation: ConnectionGeneration,
+    },
+}
+
+/// Provider metadata declaration for snapshot applicability to an event class.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum SnapshotApplicability {
+    /// Event processing requires an initialized snapshot.
+    Required,
+    /// Provider metadata explicitly declares snapshots inapplicable for this event class.
+    NotApplicable {
+        /// Metadata rule supporting non-applicability.
+        metadata_rule: IntegrityRule,
+    },
+}
+
+/// A generation-bound snapshot/update consistency assessment.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SnapshotEvidence {
+    state: SnapshotState,
+    observed_generation: ConnectionGeneration,
     observed_sequence: Option<SequenceNumber>,
     consistency: SnapshotConsistency,
 }
 
 impl SnapshotEvidence {
-    /// Assesses generation and sequence ordering against an initialized snapshot.
+    /// Assesses an explicit initialized snapshot against an observation.
     ///
     /// # Errors
     ///
     /// Returns a typed error if the snapshot and observation generations differ.
-    pub fn assess(
-        snapshot_generation: ConnectionGeneration,
+    pub fn assess_initialized(
+        initialized: InitializedSnapshot,
         observed_generation: ConnectionGeneration,
-        snapshot_sequence: Option<SequenceNumber>,
         observed_sequence: Option<SequenceNumber>,
     ) -> Result<Self, IntegrityEvidenceError> {
-        if snapshot_generation != observed_generation {
+        if initialized.connection_generation != observed_generation {
             return Err(IntegrityEvidenceError::GenerationMismatch {
-                expected: snapshot_generation,
+                expected: initialized.connection_generation,
                 found: observed_generation,
             });
         }
-        let consistency = match (snapshot_sequence, observed_sequence) {
+        let consistency = match (initialized.sequence, observed_sequence) {
             (Some(snapshot), Some(observed)) if observed < snapshot => {
                 SnapshotConsistency::Inconsistent
             }
             _ => SnapshotConsistency::Consistent,
         };
         Ok(Self {
-            connection_generation: snapshot_generation,
-            snapshot_sequence,
+            state: SnapshotState::Initialized(initialized),
+            observed_generation,
             observed_sequence,
             consistency,
         })
@@ -303,31 +377,46 @@ impl SnapshotEvidence {
     /// Represents a generation for which no qualifying snapshot exists.
     pub const fn uninitialized(connection_generation: ConnectionGeneration) -> Self {
         Self {
-            connection_generation,
-            snapshot_sequence: None,
+            state: SnapshotState::Uninitialized {
+                connection_generation,
+            },
+            observed_generation: connection_generation,
             observed_sequence: None,
             consistency: SnapshotConsistency::Uninitialized,
         }
     }
 
     /// Returns the assessed generation.
-    pub const fn connection_generation(self) -> ConnectionGeneration {
-        self.connection_generation
+    pub const fn connection_generation(&self) -> ConnectionGeneration {
+        self.observed_generation
     }
 
     /// Returns the retained snapshot sequence.
-    pub const fn snapshot_sequence(self) -> Option<SequenceNumber> {
-        self.snapshot_sequence
+    pub const fn snapshot_sequence(&self) -> Option<SequenceNumber> {
+        match &self.state {
+            SnapshotState::Initialized(initialized) => initialized.sequence,
+            SnapshotState::Uninitialized { .. } => None,
+        }
     }
 
     /// Returns the retained observed sequence.
-    pub const fn observed_sequence(self) -> Option<SequenceNumber> {
+    pub const fn observed_sequence(&self) -> Option<SequenceNumber> {
         self.observed_sequence
     }
 
     /// Returns the derived snapshot consistency.
-    pub const fn consistency(self) -> SnapshotConsistency {
+    pub const fn consistency(&self) -> SnapshotConsistency {
         self.consistency
+    }
+
+    /// Returns the explicit snapshot state.
+    pub const fn state(&self) -> &SnapshotState {
+        &self.state
+    }
+
+    /// Returns true only for a complete initialized snapshot state.
+    pub const fn is_initialized(&self) -> bool {
+        matches!(&self.state, SnapshotState::Initialized(_))
     }
 }
 

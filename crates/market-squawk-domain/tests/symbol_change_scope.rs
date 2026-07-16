@@ -2,29 +2,28 @@ use std::error::Error;
 use std::str::FromStr;
 
 use market_squawk_domain::{
-    AvailabilityEvidence, ConnectionGeneration, CorporateActionEvent, CorporateActionKind,
-    CorporateActionObservation, DataQuality, InstrumentId, LiveProvenance, MarketEventError,
-    PayloadReference, ResearchContext, ResearchError, ResearchProvenance, ResearchTime,
-    RevisionNumber, SourceCoverageEvidence, SourceId, SourceIdentifier, Timestamp, VenueId,
-    VenueSymbol,
+    AvailabilityEvidence, CorporateActionEvent, CorporateActionKind, CorporateActionObservation,
+    CoverageStatus, DataQuality, DecodedLiveProvenanceInput, InstrumentId, LiveEventClass,
+    LiveProvenance, MarketEventError, PayloadReference, ResearchContext, ResearchError,
+    ResearchProvenance, ResearchTime, RevisionNumber, SourceId, SourceIdentifier, Timestamp,
+    VenueId, VenueSymbol,
 };
 
-fn live_provenance(venue: Option<&str>) -> Result<LiveProvenance, Box<dyn Error>> {
-    LiveProvenance::decoded(
-        SourceId::try_from("reference-feed")?,
-        Some(InstrumentId::from_str(
-            "0187f5f1-6fc2-7fa2-bf05-2ce5354c55cb",
-        )?),
-        venue.map(VenueId::try_from).transpose()?,
-        SourceIdentifier::try_from("symbol-change-1")?,
+fn live_provenance(venue: &'static str) -> Result<LiveProvenance, Box<dyn Error>> {
+    let binding = support::live::binding(&support::live::BindingSpec {
+        venue,
+        event_class: LiveEventClass::CorporateAction,
+        ..support::live::BindingSpec::default()
+    })?;
+    LiveProvenance::decoded(DecodedLiveProvenanceInput::new(
+        binding,
         Some(Timestamp::from_unix_nanos(100)),
         Timestamp::from_unix_nanos(110),
         Timestamp::from_unix_nanos(120),
         DataQuality::DirectUnverified,
-        ConnectionGeneration::new(1)?,
-        SourceCoverageEvidence::Explicit,
+        CoverageStatus::Sufficient,
         PayloadReference::SourceReference(SourceIdentifier::try_from("record:1")?),
-    )
+    ))
     .map_err(Into::into)
 }
 
@@ -74,7 +73,7 @@ fn action(venue: &str) -> Result<CorporateActionKind, Box<dyn Error>> {
 fn symbol_change_requires_matching_venue_in_live_and_research() -> Result<(), Box<dyn Error>> {
     assert!(
         CorporateActionEvent::new(
-            live_provenance(Some("XNYS"))?,
+            live_provenance("XNYS")?,
             Timestamp::from_unix_nanos(500),
             action("XNYS")?,
         )
@@ -86,7 +85,7 @@ fn symbol_change_requires_matching_venue_in_live_and_research() -> Result<(), Bo
 
     assert!(matches!(
         CorporateActionEvent::new(
-            live_provenance(Some("XNYS"))?,
+            live_provenance("XNYS")?,
             Timestamp::from_unix_nanos(500),
             action("XNAS")?,
         ),
@@ -98,16 +97,9 @@ fn symbol_change_requires_matching_venue_in_live_and_research() -> Result<(), Bo
     ));
 
     assert!(matches!(
-        CorporateActionEvent::new(
-            live_provenance(None)?,
-            Timestamp::from_unix_nanos(500),
-            action("XNYS")?,
-        ),
-        Err(MarketEventError::MissingVenue)
-    ));
-    assert!(matches!(
         CorporateActionObservation::new(research_context(None)?, action("XNYS")?),
         Err(ResearchError::MissingVenue)
     ));
     Ok(())
 }
+mod support;

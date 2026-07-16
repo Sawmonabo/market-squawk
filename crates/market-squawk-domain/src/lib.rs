@@ -13,15 +13,21 @@ mod time;
 mod version;
 
 pub use classification::{
-    BookIntegrity, CaptureIntegrityState, ChecksumCapability, ChecksumEvidence, ChecksumIntegrity,
-    ChecksumScope, ChecksumValue, ClassificationError, DataQuality, DeliveryEvidence,
-    EligibilityFailure, EligibilityFailures, ExecutionEligibility, FairValueHierarchy,
-    FreshnessState, IntegrityCapabilities, IntegrityEvidenceError, IntegrityRule,
-    LiveTimingAssessment, LiveTimingPolicy, MarketDepth, MarketEventTiming, PrecisionIntegrity,
-    QualificationComponent, QualificationError, QualificationEvidence, QualificationEvidenceId,
-    QualificationEvidenceInput, RuleVersion, SequenceCapability, SequenceEvidence,
-    SequenceIntegrity, SequenceValidationRule, SnapshotConsistency, SnapshotEvidence,
-    SourceAuthorization, SourceCoverageEvidence, StreamIntegrityState, TimestampIntegrity,
+    AssessmentStatus, AuthorizationBasis, BindingError, BookIntegrity, BookStateBinding,
+    BoundAssessment, CaptureIntegrityState, ChecksumCapability, ChecksumEvidence,
+    ChecksumIntegrity, ChecksumScope, ChecksumValue, ClassificationError, CoverageConsolidation,
+    CoverageDelay, CoverageDimension, CoverageError, CoverageScope, CoverageStatus, DataQuality,
+    DeliveryEvidence, EligibilityFailure, EligibilityFailures, EvidenceDigest,
+    ExecutionEligibility, FairValueHierarchy, FreshnessState, InitializedSnapshot,
+    IntegrityAssessmentSet, IntegrityCapabilities, IntegrityEvidenceError, IntegrityRule,
+    LiveEventClass, LiveEvidenceBinding, LiveTimingAssessment, LiveTimingPolicy,
+    MarketAssessmentSet, MarketDepth, MarketEventTiming, MetadataRevision, PrecisionIntegrity,
+    ProviderChannel, ProviderProduct, QualificationAssessment, QualificationAssessmentId,
+    QualificationAssessmentInput, QualificationComponent, QualificationError, RuleVersion,
+    SequenceCapability, SequenceEvidence, SequenceIntegrity, SequenceValidationRule,
+    SnapshotApplicability, SnapshotConsistency, SnapshotEvidence, SnapshotState,
+    SourceAuthorization, SourceCoverageRecord, SourcePolicyAssessment, StreamIntegrityState,
+    TimestampIntegrity,
 };
 pub use denomination::Denomination;
 pub use financial::{
@@ -53,9 +59,9 @@ pub use market::{
     TradingHaltEvent,
 };
 pub use provenance::{
-    AvailabilityEvidence, LiveProvenance, LiveVerificationState, PayloadHash, PayloadHashAlgorithm,
-    PayloadReference, ProvenanceError, ResearchContext, ResearchProvenance, ResearchTime,
-    RevisionNumber,
+    AvailabilityEvidence, DecodedLiveProvenanceInput, LiveProvenance, LiveRecordState, PayloadHash,
+    PayloadHashAlgorithm, PayloadReference, ProvenanceError, RecordedLiveProvenanceInput,
+    ResearchContext, ResearchProvenance, ResearchTime, RevisionNumber,
 };
 pub use research::{
     AlternativeDataObservation, CorporateActionObservation, FilingObservation,

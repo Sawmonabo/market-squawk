@@ -3,37 +3,31 @@ use std::str::FromStr;
 
 use market_squawk_domain::{
     AggressorSide, AlternativeDataObservation, AuctionEvent, AuctionPhase, AvailabilityEvidence,
-    BookDeltaEvent, BookLevel, BookSnapshotEvent, ConnectionGeneration, CorporateActionEvent,
-    CorporateActionKind, CorporateActionObservation, DataQuality, FilingObservation,
-    FundamentalObservation, HaltTransition, InstrumentId, InstrumentStatusEvent, LiveProvenance,
-    MacroObservation, MarketDepth, MarketEvent, MarketEventError, MarketSide, PayloadReference,
-    PositionObservation, PositionSide, PriceTicks, QuantityLots, QuoteEvent, ResearchContext,
-    ResearchError, ResearchObservation, ResearchProvenance, ResearchTime, RevisionNumber,
-    SourceCoverageEvidence, SourceId, SourceIdentifier, Timestamp, TradeEvent, TradingHaltEvent,
-    TradingStatus, TransactionObservation, VenueId,
+    BookDeltaEvent, BookLevel, BookSnapshotEvent, CorporateActionEvent, CorporateActionKind,
+    CorporateActionObservation, CoverageStatus, DataQuality, DecodedLiveProvenanceInput,
+    FilingObservation, FundamentalObservation, HaltTransition, InstrumentId, InstrumentStatusEvent,
+    LiveEventClass, LiveProvenance, MacroObservation, MarketDepth, MarketEvent, MarketEventError,
+    MarketSide, PayloadReference, PositionObservation, PositionSide, PriceTicks, QuantityLots,
+    QuoteEvent, ResearchContext, ResearchError, ResearchObservation, ResearchProvenance,
+    ResearchTime, RevisionNumber, SourceId, SourceIdentifier, Timestamp, TradeEvent,
+    TradingHaltEvent, TradingStatus, TransactionObservation,
 };
 use rust_decimal::Decimal;
 
-fn live_provenance(instrument: bool) -> Result<LiveProvenance, Box<dyn Error>> {
-    LiveProvenance::decoded(
-        SourceId::try_from("direct-feed")?,
-        if instrument {
-            Some(InstrumentId::from_str(
-                "0187f5f1-6fc2-7fa2-bf05-2ce5354c55cb",
-            )?)
-        } else {
-            None
-        },
-        Some(VenueId::try_from("XNYS")?),
-        SourceIdentifier::try_from("trade-7")?,
+fn live_provenance(event_class: LiveEventClass) -> Result<LiveProvenance, Box<dyn Error>> {
+    let binding = support::live::binding(&support::live::BindingSpec {
+        event_class,
+        ..support::live::BindingSpec::default()
+    })?;
+    LiveProvenance::decoded(DecodedLiveProvenanceInput::new(
+        binding,
         Some(Timestamp::from_unix_nanos(100)),
         Timestamp::from_unix_nanos(110),
         Timestamp::from_unix_nanos(120),
         DataQuality::DirectUnverified,
-        ConnectionGeneration::new(7)?,
-        SourceCoverageEvidence::Explicit,
+        CoverageStatus::Sufficient,
         PayloadReference::SourceReference(SourceIdentifier::try_from("capture:7")?),
-    )
+    ))
     .map_err(Into::into)
 }
 
@@ -71,10 +65,11 @@ fn research_context(instrument: bool) -> Result<ResearchContext, Box<dyn Error>>
 }
 
 #[test]
-fn trade_event_requires_positive_quantity_and_live_identity() -> Result<(), Box<dyn Error>> {
+fn trade_event_requires_positive_quantity_and_matching_live_identity() -> Result<(), Box<dyn Error>>
+{
     assert!(matches!(
         TradeEvent::new(
-            live_provenance(true)?,
+            live_provenance(LiveEventClass::Trade)?,
             PriceTicks::new(10_000),
             QuantityLots::new(0)?,
             AggressorSide::Buy,
@@ -83,12 +78,12 @@ fn trade_event_requires_positive_quantity_and_live_identity() -> Result<(), Box<
     ));
     assert!(matches!(
         TradeEvent::new(
-            live_provenance(false)?,
+            live_provenance(LiveEventClass::Quote)?,
             PriceTicks::new(10_000),
             QuantityLots::new(1)?,
             AggressorSide::Buy,
         ),
-        Err(MarketEventError::MissingInstrument)
+        Err(MarketEventError::ProvenanceEventClassMismatch)
     ));
     Ok(())
 }
@@ -99,7 +94,11 @@ fn quote_rejects_a_crossed_market() -> Result<(), Box<dyn Error>> {
     let ask = BookLevel::new(PriceTicks::new(100), QuantityLots::new(5)?)?;
 
     assert!(matches!(
-        QuoteEvent::new(live_provenance(true)?, Some(bid), Some(ask)),
+        QuoteEvent::new(
+            live_provenance(LiveEventClass::Quote)?,
+            Some(bid),
+            Some(ask)
+        ),
         Err(MarketEventError::CrossedMarket)
     ));
     Ok(())
@@ -112,7 +111,7 @@ fn snapshot_requires_canonical_side_ordering() -> Result<(), Box<dyn Error>> {
         BookLevel::new(PriceTicks::new(100), QuantityLots::new(1)?)?,
     ];
     let result = BookSnapshotEvent::new(
-        live_provenance(true)?,
+        live_provenance(LiveEventClass::BookSnapshot)?,
         MarketDepth::PriceLevel,
         bids,
         Vec::new(),
@@ -132,7 +131,7 @@ fn snapshot_requires_canonical_side_ordering() -> Result<(), Box<dyn Error>> {
 fn delta_cannot_be_an_empty_marker_payload() -> Result<(), Box<dyn Error>> {
     assert!(matches!(
         BookDeltaEvent::new(
-            live_provenance(true)?,
+            live_provenance(LiveEventClass::BookDelta)?,
             MarketDepth::PriceLevel,
             Vec::new(),
             None,
@@ -145,7 +144,7 @@ fn delta_cannot_be_an_empty_marker_payload() -> Result<(), Box<dyn Error>> {
 #[test]
 fn canonical_market_family_is_serializable() -> Result<(), Box<dyn Error>> {
     let event = MarketEvent::Trade(TradeEvent::new(
-        live_provenance(true)?,
+        live_provenance(LiveEventClass::Trade)?,
         PriceTicks::new(10_000),
         QuantityLots::new(3)?,
         AggressorSide::Sell,
@@ -159,27 +158,26 @@ fn canonical_market_family_is_serializable() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn market_payload_fields_are_available_through_typed_views() -> Result<(), Box<dyn Error>> {
-    let provenance = live_provenance(true)?;
     let trade = TradeEvent::new(
-        provenance.clone(),
+        live_provenance(LiveEventClass::Trade)?,
         PriceTicks::new(100),
         QuantityLots::new(2)?,
         AggressorSide::Buy,
     )?;
     let quote = QuoteEvent::new(
-        provenance.clone(),
+        live_provenance(LiveEventClass::Quote)?,
         Some(BookLevel::new(PriceTicks::new(99), QuantityLots::new(1)?)?),
         None,
     )?;
     let snapshot = BookSnapshotEvent::new(
-        provenance.clone(),
+        live_provenance(LiveEventClass::BookSnapshot)?,
         MarketDepth::PriceLevel,
         Vec::new(),
         Vec::new(),
         None,
     )?;
     let delta = BookDeltaEvent::new(
-        provenance.clone(),
+        live_provenance(LiveEventClass::BookDelta)?,
         MarketDepth::PriceLevel,
         vec![market_squawk_domain::BookChange::new(
             MarketSide::Bid,
@@ -189,19 +187,22 @@ fn market_payload_fields_are_available_through_typed_views() -> Result<(), Box<d
         None,
     )?;
     let auction = AuctionEvent::new(
-        provenance.clone(),
+        live_provenance(LiveEventClass::Auction)?,
         AuctionPhase::Opening,
         Some(PriceTicks::new(100)),
         QuantityLots::new(4)?,
     )?;
     let halt = TradingHaltEvent::new(
-        provenance.clone(),
+        live_provenance(LiveEventClass::TradingHalt)?,
         HaltTransition::Halted,
         SourceIdentifier::try_from("LUDP")?,
     )?;
-    let status = InstrumentStatusEvent::new(provenance.clone(), TradingStatus::Halted)?;
+    let status = InstrumentStatusEvent::new(
+        live_provenance(LiveEventClass::InstrumentStatus)?,
+        TradingStatus::Halted,
+    )?;
     let action = CorporateActionEvent::new(
-        provenance,
+        live_provenance(LiveEventClass::CorporateAction)?,
         Timestamp::from_unix_nanos(500),
         CorporateActionKind::Delisting,
     )?;
@@ -366,3 +367,4 @@ fn research_payload_fields_are_available_through_typed_views() -> Result<(), Box
     );
     Ok(())
 }
+mod support;

@@ -1,28 +1,234 @@
+mod support;
+
 use std::error::Error;
-use std::str::FromStr;
 
 use market_squawk_domain::{
-    BookIntegrity, CaptureIntegrityState, ChecksumCapability, ChecksumEvidence, ChecksumIntegrity,
-    ChecksumScope, ChecksumValue, ConnectionGeneration, DataQuality, DeliveryEvidence,
-    EligibilityFailure, ExecutionEligibility, FreshnessState, InstrumentId, IntegrityCapabilities,
-    IntegrityEvidenceError, IntegrityRule, LiveTimingAssessment, LiveTimingPolicy, MarketDepth,
-    MarketEventTiming, PrecisionIntegrity, QualificationComponent, QualificationError,
-    QualificationEvidence, QualificationEvidenceId, QualificationEvidenceInput, RuleVersion,
-    SequenceCapability, SequenceEvidence, SequenceIntegrity, SequenceNumber,
-    SequenceValidationRule, SnapshotEvidence, SourceAuthorization, SourceCoverageEvidence,
-    SourceId, SourceIdentifier, StreamIntegrityState, Timestamp, TimestampIntegrity, TradingStatus,
-    VenueId,
+    AssessmentStatus, ClassificationError, FreshnessState, LiveEventClass, LiveTimingAssessment,
+    LiveTimingPolicy, MarketEventTiming, QualificationAssessment, QualificationComponent,
+    QualificationError, SnapshotEvidence, Timestamp, TimestampIntegrity,
 };
+use support::live::{BindingSpec, Component, assessment_input, binding, valid_assessment_input};
 
-fn generation(value: u64) -> Result<ConnectionGeneration, Box<dyn Error>> {
-    ConnectionGeneration::new(value).map_err(Into::into)
+#[test]
+fn archive_assessment_never_returns_execution_authority() -> Result<(), Box<dyn Error>> {
+    let assessment = QualificationAssessment::try_from(valid_assessment_input()?)?;
+
+    assert_eq!(
+        assessment.recorded_quality(),
+        market_squawk_domain::DataQuality::DirectVerified
+    );
+    assert_eq!(
+        assessment.assessment_status_at(Timestamp::from_unix_nanos(1_020)),
+        AssessmentStatus::Satisfied
+    );
+    Ok(())
 }
 
-fn rule(name: &str) -> Result<IntegrityRule, Box<dyn Error>> {
-    Ok(IntegrityRule::new(
-        SourceIdentifier::try_from(name)?,
-        RuleVersion::new(1)?,
-    ))
+#[test]
+fn strictest_expiry_is_inclusive_then_queue_delay_rejects_at_plus_one_nanosecond()
+-> Result<(), Box<dyn Error>> {
+    let assessment = QualificationAssessment::try_from(valid_assessment_input()?)?;
+
+    assert_eq!(assessment.valid_until(), Timestamp::from_unix_nanos(1_020));
+    assert_eq!(
+        assessment.assessment_status_at(Timestamp::from_unix_nanos(1_020)),
+        AssessmentStatus::Satisfied
+    );
+    assert_eq!(
+        assessment.assessment_status_at(Timestamp::from_unix_nanos(1_021)),
+        AssessmentStatus::Rejected
+    );
+    Ok(())
+}
+
+#[test]
+fn every_assessment_component_rejects_a_transplanted_binding() -> Result<(), Box<dyn Error>> {
+    let base = binding(&BindingSpec::default())?;
+    let replacement = binding(&BindingSpec {
+        channel: "ticker",
+        ..BindingSpec::default()
+    })?;
+    let cases = [
+        (
+            Component::SourcePolicy,
+            QualificationComponent::SourcePolicy,
+        ),
+        (Component::Sequence, QualificationComponent::Sequence),
+        (Component::Snapshot, QualificationComponent::Snapshot),
+        (Component::Checksum, QualificationComponent::Checksum),
+        (Component::Timing, QualificationComponent::Timing),
+        (
+            Component::TradingStatus,
+            QualificationComponent::TradingStatus,
+        ),
+        (Component::Precision, QualificationComponent::Precision),
+        (Component::Coverage, QualificationComponent::Coverage),
+        (Component::Book, QualificationComponent::Book),
+        (Component::Stream, QualificationComponent::Stream),
+        (Component::Capture, QualificationComponent::Capture),
+    ];
+
+    for (component, expected) in cases {
+        let input = assessment_input(
+            base.clone(),
+            Some(component),
+            replacement.clone(),
+            Timestamp::from_unix_nanos(1_020),
+        )?;
+        assert_eq!(
+            QualificationAssessment::try_from(input),
+            Err(QualificationError::BindingMismatch {
+                component: expected
+            })
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn complete_key_rejects_transplant_across_every_identity_dimension() -> Result<(), Box<dyn Error>> {
+    let base_spec = BindingSpec::default();
+    let base = binding(&base_spec)?;
+    let mutations = [
+        BindingSpec {
+            source: "kraken-direct",
+            ..base_spec.clone()
+        },
+        BindingSpec {
+            session: "session-8",
+            ..base_spec.clone()
+        },
+        BindingSpec {
+            metadata_revision: "coinbase-advanced-trade-v4",
+            ..base_spec.clone()
+        },
+        BindingSpec {
+            authorization_basis: "different-authorized-account",
+            ..base_spec.clone()
+        },
+        BindingSpec {
+            venue: "KRAKEN",
+            ..base_spec.clone()
+        },
+        BindingSpec {
+            instrument: "0187f5f1-6fc2-7fa2-bf05-2ce5354c55cc",
+            ..base_spec.clone()
+        },
+        BindingSpec {
+            generation: 8,
+            ..base_spec.clone()
+        },
+        BindingSpec {
+            product: "ETH-USD",
+            ..base_spec.clone()
+        },
+        BindingSpec {
+            channel: "ticker",
+            ..base_spec.clone()
+        },
+        BindingSpec {
+            event_class: LiveEventClass::BookSnapshot,
+            ..base_spec.clone()
+        },
+        BindingSpec {
+            source_identifier: "update-43",
+            ..base_spec.clone()
+        },
+        BindingSpec {
+            payload_digest: 9,
+            ..base_spec.clone()
+        },
+        BindingSpec {
+            state_digest: 9,
+            ..base_spec.clone()
+        },
+        BindingSpec {
+            book_state_id: "book-state-43",
+            ..base_spec.clone()
+        },
+        BindingSpec {
+            depth: market_squawk_domain::MarketDepth::OrderLevel,
+            ..base_spec
+        },
+    ];
+
+    for mutation in mutations {
+        let replacement = binding(&mutation)?;
+        let input = assessment_input(
+            base.clone(),
+            Some(Component::Sequence),
+            replacement,
+            Timestamp::from_unix_nanos(1_020),
+        )?;
+        assert_eq!(
+            QualificationAssessment::try_from(input),
+            Err(QualificationError::BindingMismatch {
+                component: QualificationComponent::Sequence,
+            })
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn generation_rollover_invalidates_prior_assessment_without_aliasing() -> Result<(), Box<dyn Error>>
+{
+    let base = binding(&BindingSpec::default())?;
+    let next_generation = binding(&BindingSpec {
+        generation: 8,
+        ..BindingSpec::default()
+    })?;
+    let input = assessment_input(
+        base,
+        Some(Component::Timing),
+        next_generation,
+        Timestamp::from_unix_nanos(1_020),
+    )?;
+
+    assert_eq!(
+        QualificationAssessment::try_from(input),
+        Err(QualificationError::BindingMismatch {
+            component: QualificationComponent::Timing
+        })
+    );
+    Ok(())
+}
+
+#[test]
+fn snapshot_initialization_is_explicit_even_without_provider_sequence() -> Result<(), Box<dyn Error>>
+{
+    let generation = market_squawk_domain::ConnectionGeneration::new(7)?;
+    let initialized = market_squawk_domain::InitializedSnapshot::new(
+        generation,
+        market_squawk_domain::SourceIdentifier::try_from("snapshot-7")?,
+        market_squawk_domain::EvidenceDigest::new([7; 32]),
+        Timestamp::from_unix_nanos(900),
+        None,
+    );
+    let evidence = SnapshotEvidence::assess_initialized(initialized, generation, None)?;
+
+    assert!(evidence.is_initialized());
+    assert_eq!(evidence.snapshot_sequence(), None);
+    assert!(!SnapshotEvidence::uninitialized(generation).is_initialized());
+    Ok(())
+}
+
+#[test]
+fn non_book_events_require_explicit_metadata_backed_snapshot_non_applicability()
+-> Result<(), Box<dyn Error>> {
+    let spec = BindingSpec {
+        event_class: LiveEventClass::Trade,
+        ..BindingSpec::default()
+    };
+    let base = binding(&spec)?;
+    let input = assessment_input(base.clone(), None, base, Timestamp::from_unix_nanos(1_020))?;
+    let assessment = QualificationAssessment::try_from(input)?;
+
+    assert_eq!(
+        assessment.assessment_status_at(Timestamp::from_unix_nanos(1_020)),
+        AssessmentStatus::Satisfied
+    );
+    Ok(())
 }
 
 fn timing(
@@ -31,342 +237,79 @@ fn timing(
     evaluated_at: i64,
     policy: LiveTimingPolicy,
 ) -> Result<LiveTimingAssessment, Box<dyn Error>> {
-    let market_event = MarketEventTiming::new(
-        source_at.map(Timestamp::from_unix_nanos),
-        Timestamp::from_unix_nanos(received_at),
-    );
     Ok(LiveTimingAssessment::assess(
-        generation(7)?,
-        Some(market_event),
+        market_squawk_domain::ConnectionGeneration::new(7)?,
+        Some(MarketEventTiming::new(
+            source_at.map(Timestamp::from_unix_nanos),
+            Timestamp::from_unix_nanos(received_at),
+        )),
         Some(Timestamp::from_unix_nanos(evaluated_at)),
         Timestamp::from_unix_nanos(evaluated_at),
         policy,
     )?)
 }
 
-fn policy() -> Result<LiveTimingPolicy, Box<dyn Error>> {
-    LiveTimingPolicy::new(5, 25, 50, 20).map_err(Into::into)
-}
-
-fn valid_sequence() -> Result<SequenceEvidence, Box<dyn Error>> {
-    Ok(SequenceEvidence::validate(
-        SequenceCapability::Provided,
-        Some(rule("provider.sequence.consecutive")?),
-        SequenceValidationRule::Consecutive,
-        generation(7)?,
-        Some(SequenceNumber::new(40)),
-        Some(SequenceNumber::new(41)),
-        Some(SequenceNumber::new(42)),
-    )?)
-}
-
-fn valid_snapshot() -> Result<SnapshotEvidence, Box<dyn Error>> {
-    Ok(SnapshotEvidence::assess(
-        generation(7)?,
-        generation(7)?,
-        Some(SequenceNumber::new(40)),
-        Some(SequenceNumber::new(42)),
-    )?)
-}
-
-fn checksum(capability: ChecksumCapability) -> Result<ChecksumEvidence, Box<dyn Error>> {
-    match capability {
-        ChecksumCapability::Provided => Ok(ChecksumEvidence::validate(
-            capability,
-            Some(rule("provider.checksum.crc32")?),
-            generation(7)?,
-            Some(ChecksumScope::new(
-                MarketDepth::PriceLevel,
-                10,
-                SourceIdentifier::try_from("top-ten-bid-ask")?,
-            )?),
-            Some(ChecksumValue::new(0xAABBCCDD)),
-            Some(ChecksumValue::new(0xAABBCCDD)),
-        )?),
-        ChecksumCapability::Unsupported => Ok(ChecksumEvidence::unsupported(generation(7)?)),
-    }
-}
-
-fn qualification_input() -> Result<QualificationEvidenceInput, Box<dyn Error>> {
-    Ok(QualificationEvidenceInput::new(
-        QualificationEvidenceId::new(SourceIdentifier::try_from(
-            "qualification:direct-feed:7:42",
-        )?),
-        DataQuality::DirectVerified,
-        IntegrityCapabilities::new(SequenceCapability::Provided, ChecksumCapability::Provided),
-        SourceAuthorization::Authorized,
-        DeliveryEvidence::DirectVenue,
-        SourceId::try_from("direct-feed")?,
-        VenueId::try_from("XNYS")?,
-        InstrumentId::from_str("0187f5f1-6fc2-7fa2-bf05-2ce5354c55cb")?,
-        generation(7)?,
-        valid_sequence()?,
-        valid_snapshot()?,
-        checksum(ChecksumCapability::Provided)?,
-        timing(Some(995), 1_000, 1_010, policy()?)?,
-        TradingStatus::Active,
-        PrecisionIntegrity::Valid,
-        SourceCoverageEvidence::Explicit,
-        BookIntegrity::Consistent,
-        StreamIntegrityState::Healthy,
-        CaptureIntegrityState::Healthy,
-    ))
-}
-
 #[test]
-fn ancient_source_event_received_now_is_not_fresh_direct_evidence() -> Result<(), Box<dyn Error>> {
-    let assessment = timing(Some(900), 1_000, 1_010, policy()?)?;
-
+fn atomic_timing_rejects_stale_source_and_heartbeat_cannot_refresh_market()
+-> Result<(), Box<dyn Error>> {
+    let policy = LiveTimingPolicy::new(5, 25, 50, 20)?;
+    let stale_source = timing(Some(900), 1_000, 1_010, policy)?;
     assert_eq!(
-        assessment.timestamp_integrity(),
+        stale_source.timestamp_integrity(),
         TimestampIntegrity::Invalid
     );
-    assert_eq!(assessment.freshness(), FreshnessState::Fresh);
-    Ok(())
-}
+    assert_eq!(stale_source.freshness(), FreshnessState::Fresh);
 
-#[test]
-fn missing_source_timestamp_is_invalid_for_direct_verification() -> Result<(), Box<dyn Error>> {
-    let assessment = timing(None, 1_000, 1_010, policy()?)?;
-
-    assert_eq!(
-        assessment.timestamp_integrity(),
-        TimestampIntegrity::Invalid
-    );
-    Ok(())
-}
-
-#[test]
-fn heartbeat_cannot_refresh_market_freshness() -> Result<(), Box<dyn Error>> {
-    let market_event = MarketEventTiming::new(
-        Some(Timestamp::from_unix_nanos(1_000)),
-        Timestamp::from_unix_nanos(1_000),
-    );
-    let assessment = LiveTimingAssessment::assess(
-        generation(7)?,
-        Some(market_event),
+    let heartbeat_only = LiveTimingAssessment::assess(
+        market_squawk_domain::ConnectionGeneration::new(7)?,
+        Some(MarketEventTiming::new(
+            Some(Timestamp::from_unix_nanos(1_000)),
+            Timestamp::from_unix_nanos(1_000),
+        )),
         Some(Timestamp::from_unix_nanos(2_000)),
         Timestamp::from_unix_nanos(2_000),
         LiveTimingPolicy::new(0, 2_000, 2_000, 10)?,
     )?;
-
-    assert_eq!(assessment.freshness(), FreshnessState::Stale);
+    assert_eq!(heartbeat_only.freshness(), FreshnessState::Stale);
     Ok(())
 }
 
 #[test]
-fn time_boundaries_are_inclusive_and_one_nanosecond_beyond_fails() -> Result<(), Box<dyn Error>> {
-    let boundary_policy = LiveTimingPolicy::new(5, 25, 50, 20)?;
-    let at_boundary = timing(Some(975), 1_000, 1_020, boundary_policy)?;
-    let beyond_transport = timing(Some(974), 1_000, 1_020, boundary_policy)?;
-    let beyond_freshness = timing(Some(995), 1_000, 1_021, boundary_policy)?;
-    let future_boundary = timing(Some(1_005), 1_000, 1_000, boundary_policy)?;
-    let future_beyond = timing(Some(1_006), 1_000, 1_000, boundary_policy)?;
-
-    assert_eq!(at_boundary.timestamp_integrity(), TimestampIntegrity::Valid);
-    assert_eq!(at_boundary.freshness(), FreshnessState::Fresh);
+fn timing_boundaries_and_i64_extremes_use_checked_wide_arithmetic() -> Result<(), Box<dyn Error>> {
+    let policy = LiveTimingPolicy::new(5, 25, 50, 20)?;
     assert_eq!(
-        beyond_transport.timestamp_integrity(),
-        TimestampIntegrity::Invalid
-    );
-    assert_eq!(beyond_freshness.freshness(), FreshnessState::Stale);
-    assert_eq!(
-        future_boundary.timestamp_integrity(),
+        timing(Some(975), 1_000, 1_020, policy)?.timestamp_integrity(),
         TimestampIntegrity::Valid
     );
     assert_eq!(
-        future_beyond.timestamp_integrity(),
+        timing(Some(974), 1_000, 1_020, policy)?.timestamp_integrity(),
         TimestampIntegrity::Invalid
     );
-    Ok(())
-}
-
-#[test]
-fn timing_rejects_evaluation_before_receive_and_handles_i64_edges() -> Result<(), Box<dyn Error>> {
-    let event = MarketEventTiming::new(
-        Some(Timestamp::from_unix_nanos(i64::MIN)),
-        Timestamp::from_unix_nanos(i64::MIN),
+    assert_eq!(
+        timing(Some(995), 1_000, 1_021, policy)?.freshness(),
+        FreshnessState::Stale
     );
-    let assessment = LiveTimingAssessment::assess(
-        generation(7)?,
-        Some(event),
-        None,
-        Timestamp::from_unix_nanos(i64::MAX),
+
+    let edge = timing(
+        Some(i64::MIN),
+        i64::MIN,
+        i64::MAX,
         LiveTimingPolicy::new(0, i64::MAX as u64, i64::MAX as u64, i64::MAX as u64)?,
     )?;
+    assert_eq!(edge.timestamp_integrity(), TimestampIntegrity::Invalid);
+    assert_eq!(edge.freshness(), FreshnessState::Stale);
     assert_eq!(
-        assessment.timestamp_integrity(),
-        TimestampIntegrity::Invalid
-    );
-    assert_eq!(assessment.freshness(), FreshnessState::Stale);
-
-    let future_event = MarketEventTiming::new(
-        Some(Timestamp::from_unix_nanos(2)),
-        Timestamp::from_unix_nanos(2),
-    );
-    assert!(
         LiveTimingAssessment::assess(
-            generation(7)?,
-            Some(future_event),
+            market_squawk_domain::ConnectionGeneration::new(7)?,
+            Some(MarketEventTiming::new(
+                Some(Timestamp::from_unix_nanos(2)),
+                Timestamp::from_unix_nanos(2),
+            )),
             None,
             Timestamp::from_unix_nanos(1),
-            policy()?,
-        )
-        .is_err()
-    );
-    assert!(LiveTimingPolicy::new(u64::MAX, 1, 1, 1).is_err());
-    Ok(())
-}
-
-#[test]
-fn sequence_and_checksum_results_are_derived_and_auditable() -> Result<(), Box<dyn Error>> {
-    let sequence = valid_sequence()?;
-    assert_eq!(sequence.integrity(), SequenceIntegrity::Valid);
-    assert_eq!(sequence.previous_sequence(), Some(SequenceNumber::new(41)));
-    assert_eq!(sequence.observed_sequence(), Some(SequenceNumber::new(42)));
-    assert_eq!(sequence.snapshot_sequence(), Some(SequenceNumber::new(40)));
-    assert_eq!(
-        sequence.rule().map(IntegrityRule::version),
-        Some(RuleVersion::new(1)?)
-    );
-
-    let checksum = checksum(ChecksumCapability::Provided)?;
-    assert_eq!(checksum.integrity(), ChecksumIntegrity::Valid);
-    assert_eq!(checksum.expected(), Some(ChecksumValue::new(0xAABBCCDD)));
-    assert_eq!(checksum.computed(), Some(ChecksumValue::new(0xAABBCCDD)));
-    assert_eq!(
-        checksum.scope().map(ChecksumScope::depth),
-        Some(MarketDepth::PriceLevel)
-    );
-    Ok(())
-}
-
-#[test]
-fn capability_contradictions_are_typed_errors() -> Result<(), Box<dyn Error>> {
-    assert!(matches!(
-        SequenceEvidence::validate(
-            SequenceCapability::Unsupported,
-            Some(rule("provider.sequence")?),
-            SequenceValidationRule::Consecutive,
-            generation(7)?,
-            None,
-            Some(SequenceNumber::new(1)),
-            Some(SequenceNumber::new(2)),
+            policy,
         ),
-        Err(IntegrityEvidenceError::CapabilityContradiction { .. })
-    ));
-    assert!(matches!(
-        ChecksumEvidence::validate(
-            ChecksumCapability::Unsupported,
-            Some(rule("provider.checksum")?),
-            generation(7)?,
-            None,
-            None,
-            None,
-        ),
-        Err(IntegrityEvidenceError::CapabilityContradiction { .. })
-    ));
-    Ok(())
-}
-
-#[test]
-fn qualification_rejects_generation_and_capability_disagreement() -> Result<(), Box<dyn Error>> {
-    let mismatched_sequence = SequenceEvidence::validate(
-        SequenceCapability::Provided,
-        Some(rule("provider.sequence")?),
-        SequenceValidationRule::Consecutive,
-        generation(8)?,
-        Some(SequenceNumber::new(40)),
-        Some(SequenceNumber::new(41)),
-        Some(SequenceNumber::new(42)),
-    )?;
-    let result = QualificationEvidence::try_from(
-        qualification_input()?.with_sequence_evidence(mismatched_sequence),
+        Err(ClassificationError::EvaluationBeforeReceive)
     );
-    assert!(matches!(
-        result,
-        Err(QualificationError::GenerationMismatch {
-            component: QualificationComponent::Sequence,
-            ..
-        })
-    ));
-
-    let result = QualificationEvidence::try_from(
-        qualification_input()?.with_integrity_capabilities(IntegrityCapabilities::new(
-            SequenceCapability::Provided,
-            ChecksumCapability::Unsupported,
-        )),
-    );
-    assert!(matches!(
-        result,
-        Err(QualificationError::CapabilityMismatch {
-            component: QualificationComponent::Checksum,
-            ..
-        })
-    ));
-    Ok(())
-}
-
-#[test]
-fn quality_is_evaluator_output_subject_to_source_ceiling() -> Result<(), Box<dyn Error>> {
-    let direct = QualificationEvidence::try_from(qualification_input()?)?;
-    assert_eq!(direct.quality(), DataQuality::DirectVerified);
-    assert_eq!(
-        direct.execution_eligibility(),
-        ExecutionEligibility::Eligible
-    );
-
-    let modeled = QualificationEvidence::try_from(
-        qualification_input()?.with_quality_ceiling(DataQuality::Modeled),
-    )?;
-    assert_eq!(modeled.quality(), DataQuality::Modeled);
-    assert_eq!(
-        modeled.execution_eligibility(),
-        ExecutionEligibility::Ineligible
-    );
-    assert!(modeled.has_failure(EligibilityFailure::QualityCeiling));
-    Ok(())
-}
-
-#[test]
-fn unsupported_checksum_is_eligible_only_when_metadata_declares_it() -> Result<(), Box<dyn Error>> {
-    let input = qualification_input()?
-        .with_integrity_capabilities(IntegrityCapabilities::new(
-            SequenceCapability::Provided,
-            ChecksumCapability::Unsupported,
-        ))
-        .with_checksum_evidence(checksum(ChecksumCapability::Unsupported)?);
-    let evidence = QualificationEvidence::try_from(input)?;
-
-    assert_eq!(
-        evidence.checksum_evidence().integrity(),
-        ChecksumIntegrity::NotSupported
-    );
-    assert_eq!(
-        evidence.execution_eligibility(),
-        ExecutionEligibility::Eligible
-    );
-    Ok(())
-}
-
-#[test]
-fn disabled_capture_is_explicitly_eligible_but_incomplete_capture_is_not()
--> Result<(), Box<dyn Error>> {
-    let disabled = QualificationEvidence::try_from(
-        qualification_input()?.with_capture_integrity(CaptureIntegrityState::Disabled),
-    )?;
-    assert_eq!(
-        disabled.execution_eligibility(),
-        ExecutionEligibility::Eligible
-    );
-
-    let incomplete = QualificationEvidence::try_from(
-        qualification_input()?.with_capture_integrity(CaptureIntegrityState::Incomplete),
-    )?;
-    assert_eq!(
-        incomplete.execution_eligibility(),
-        ExecutionEligibility::Ineligible
-    );
-    assert!(incomplete.has_failure(EligibilityFailure::CaptureIntegrity));
     Ok(())
 }

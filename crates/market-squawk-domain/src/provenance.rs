@@ -11,7 +11,9 @@ mod live;
 #[path = "provenance/research.rs"]
 mod research;
 
-pub use live::{LiveProvenance, LiveVerificationState};
+pub use live::{
+    DecodedLiveProvenanceInput, LiveProvenance, LiveRecordState, RecordedLiveProvenanceInput,
+};
 pub use research::{
     AvailabilityEvidence, ResearchContext, ResearchProvenance, ResearchTime, RevisionNumber,
 };
@@ -71,6 +73,8 @@ pub enum PayloadReference {
 pub enum ProvenanceError {
     /// Local receive time is later than local ingestion time.
     ReceivedAfterIngested,
+    /// Payload content hash does not match the complete live binding.
+    PayloadDigestMismatch,
     /// Availability evidence is later than local ingestion.
     AvailabilityAfterIngested,
     /// A source claims availability before its known publication time.
@@ -83,16 +87,8 @@ pub enum ProvenanceError {
     ZeroRevision,
     /// Decoding cannot author `DirectVerified`; it requires a successful qualification.
     UnqualifiedDirectVerified,
-    /// Qualification evidence was not eligible and direct verified.
-    QualificationNotEligible,
-    /// Qualification evidence describes a different source, venue, instrument, or generation.
-    QualificationIdentityMismatch,
-    /// Qualification timing does not describe the decoded market event.
-    QualificationTimingMismatch,
-    /// Qualification coverage does not match decoded provenance.
-    QualificationCoverageMismatch,
-    /// A recorded direct-verified label lacks its required evidence identity.
-    MissingQualificationEvidenceId,
+    /// A recorded direct-verified label lacks its required assessment reference.
+    MissingAssessmentReference,
     /// Serialized input uses an unsupported schema version.
     SchemaVersion(SchemaVersionError),
 }
@@ -102,6 +98,9 @@ impl fmt::Display for ProvenanceError {
         match self {
             Self::ReceivedAfterIngested => {
                 formatter.write_str("receive time must not be later than ingestion time")
+            }
+            Self::PayloadDigestMismatch => {
+                formatter.write_str("payload reference digest does not match live binding")
             }
             Self::AvailabilityAfterIngested => {
                 formatter.write_str("availability evidence must not be later than ingestion time")
@@ -119,20 +118,8 @@ impl fmt::Display for ProvenanceError {
             Self::UnqualifiedDirectVerified => {
                 formatter.write_str("decoded provenance cannot claim direct-verified quality")
             }
-            Self::QualificationNotEligible => formatter
-                .write_str("direct-verified provenance requires successful qualification evidence"),
-            Self::QualificationIdentityMismatch => formatter.write_str(
-                "qualification source, venue, instrument, or generation does not match provenance",
-            ),
-            Self::QualificationTimingMismatch => {
-                formatter.write_str("qualification timing does not match provenance")
-            }
-            Self::QualificationCoverageMismatch => {
-                formatter.write_str("qualification coverage does not match provenance")
-            }
-            Self::MissingQualificationEvidenceId => formatter.write_str(
-                "recorded direct-verified provenance requires a qualification evidence identity",
-            ),
+            Self::MissingAssessmentReference => formatter
+                .write_str("recorded direct-verified provenance requires an assessment reference"),
             Self::SchemaVersion(error) => error.fmt(formatter),
         }
     }

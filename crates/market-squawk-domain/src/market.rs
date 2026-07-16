@@ -216,6 +216,10 @@ pub enum MarketEventError {
     MissingInstrument,
     /// A venue-scoped live event lacks venue identity.
     MissingVenue,
+    /// Provenance is bound to a different live-event class.
+    ProvenanceEventClassMismatch,
+    /// A book payload depth differs from its bound book-state depth.
+    ProvenanceDepthMismatch,
     /// A displayed or executed quantity is zero.
     ZeroQuantity,
     /// A quote or book is crossed.
@@ -242,6 +246,12 @@ impl fmt::Display for MarketEventError {
         match self {
             Self::MissingInstrument => formatter.write_str("market event requires an instrument"),
             Self::MissingVenue => formatter.write_str("market event requires a venue"),
+            Self::ProvenanceEventClassMismatch => {
+                formatter.write_str("market payload class does not match provenance binding")
+            }
+            Self::ProvenanceDepthMismatch => {
+                formatter.write_str("market payload depth does not match provenance binding")
+            }
             Self::ZeroQuantity => formatter.write_str("market quantity must be positive"),
             Self::CrossedMarket => formatter.write_str("best bid must be below best ask"),
             Self::EmptyQuote => formatter.write_str("quote requires a bid or ask"),
@@ -268,6 +278,7 @@ impl std::error::Error for MarketEventError {}
 pub(super) fn validate_market_provenance(
     provenance: &LiveProvenance,
     venue_required: bool,
+    expected_class: crate::LiveEventClass,
 ) -> Result<InstrumentId, MarketEventError> {
     let instrument_id = provenance
         .instrument_id()
@@ -275,7 +286,25 @@ pub(super) fn validate_market_provenance(
     if venue_required && provenance.venue_id().is_none() {
         return Err(MarketEventError::MissingVenue);
     }
+    if provenance.binding().event_class() != expected_class {
+        return Err(MarketEventError::ProvenanceEventClassMismatch);
+    }
     Ok(instrument_id)
+}
+
+pub(super) fn validate_book_depth(
+    provenance: &LiveProvenance,
+    depth: MarketDepth,
+) -> Result<(), MarketEventError> {
+    if provenance
+        .binding()
+        .book_state()
+        .map(crate::BookStateBinding::depth)
+        != Some(depth)
+    {
+        return Err(MarketEventError::ProvenanceDepthMismatch);
+    }
+    Ok(())
 }
 
 pub(super) fn validate_book(

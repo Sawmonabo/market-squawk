@@ -2,6 +2,10 @@
 
 use serde::{Deserialize, Serialize};
 
+#[path = "classification/binding.rs"]
+mod binding;
+#[path = "classification/coverage.rs"]
+mod coverage;
 #[path = "classification/integrity.rs"]
 mod integrity;
 #[path = "classification/qualification.rs"]
@@ -10,13 +14,16 @@ mod qualification;
 mod timing;
 
 pub use integrity::{
-    ChecksumCapability, ChecksumEvidence, ChecksumScope, ChecksumValue, IntegrityCapabilities,
-    IntegrityEvidenceError, IntegrityRule, RuleVersion, SequenceCapability, SequenceEvidence,
-    SequenceValidationRule, SnapshotEvidence,
+    ChecksumCapability, ChecksumEvidence, ChecksumScope, ChecksumValue, InitializedSnapshot,
+    IntegrityCapabilities, IntegrityEvidenceError, IntegrityRule, RuleVersion, SequenceCapability,
+    SequenceEvidence, SequenceValidationRule, SnapshotApplicability, SnapshotEvidence,
+    SnapshotState,
 };
 pub use qualification::{
-    EligibilityFailure, EligibilityFailures, QualificationComponent, QualificationError,
-    QualificationEvidence, QualificationEvidenceId, QualificationEvidenceInput,
+    AssessmentStatus, EligibilityFailure, EligibilityFailures, IntegrityAssessmentSet,
+    MarketAssessmentSet, QualificationAssessment, QualificationAssessmentId,
+    QualificationAssessmentInput, QualificationComponent, QualificationError,
+    SourcePolicyAssessment,
 };
 pub use timing::{ClassificationError, LiveTimingAssessment, LiveTimingPolicy, MarketEventTiming};
 
@@ -190,18 +197,6 @@ pub enum PrecisionIntegrity {
     Invalid,
 }
 
-/// Whether the source explicitly covers the instrument, venue, and event class.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SourceCoverageEvidence {
-    /// Coverage is explicit and sufficient for the candidate action.
-    Explicit,
-    /// Coverage is known to be partial or otherwise insufficient.
-    Insufficient,
-    /// Coverage has not been established.
-    Unknown,
-}
-
 /// Structural state of the candidate market book.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -235,3 +230,11 @@ pub enum FreshnessState {
     /// No market event has established freshness.
     Unknown,
 }
+pub use binding::{
+    AuthorizationBasis, BindingError, BookStateBinding, BoundAssessment, EvidenceDigest,
+    LiveEventClass, LiveEvidenceBinding, MetadataRevision, ProviderChannel, ProviderProduct,
+};
+pub use coverage::{
+    CoverageConsolidation, CoverageDelay, CoverageDimension, CoverageError, CoverageScope,
+    CoverageStatus, SourceCoverageRecord,
+};

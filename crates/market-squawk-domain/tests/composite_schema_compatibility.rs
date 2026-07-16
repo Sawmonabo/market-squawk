@@ -1,17 +1,12 @@
 use std::error::Error;
-use std::str::FromStr;
 
 use market_squawk_domain::{
-    AggressorSide, AvailabilityEvidence, DataQuality, InstrumentId, LiveProvenance,
-    MacroObservation, MarketEvent, PayloadReference, PriceTicks, QuantityLots, ResearchContext,
-    ResearchObservation, ResearchProvenance, ResearchTime, RevisionNumber, SourceCoverageEvidence,
-    SourceId, SourceIdentifier, Timestamp, TradeEvent, VenueId,
+    AggressorSide, AvailabilityEvidence, CoverageStatus, DataQuality, DecodedLiveProvenanceInput,
+    LiveEventClass, LiveProvenance, MacroObservation, MarketEvent, PayloadReference, PriceTicks,
+    QuantityLots, ResearchContext, ResearchObservation, ResearchProvenance, ResearchTime,
+    RevisionNumber, SourceId, SourceIdentifier, Timestamp, TradeEvent,
 };
 use rust_decimal::Decimal;
-
-fn instrument() -> Result<InstrumentId, Box<dyn Error>> {
-    InstrumentId::from_str("0187f5f1-6fc2-7fa2-bf05-2ce5354c55cb").map_err(Into::into)
-}
 
 fn payload_reference(name: &str) -> Result<PayloadReference, Box<dyn Error>> {
     Ok(PayloadReference::SourceReference(
@@ -20,19 +15,19 @@ fn payload_reference(name: &str) -> Result<PayloadReference, Box<dyn Error>> {
 }
 
 fn market_event() -> Result<MarketEvent, Box<dyn Error>> {
-    let provenance = LiveProvenance::decoded(
-        SourceId::try_from("direct-feed")?,
-        Some(instrument()?),
-        Some(VenueId::try_from("XNYS")?),
-        SourceIdentifier::try_from("trade-42")?,
+    let binding = support::live::binding(&support::live::BindingSpec {
+        event_class: LiveEventClass::Trade,
+        ..support::live::BindingSpec::default()
+    })?;
+    let provenance = LiveProvenance::decoded(DecodedLiveProvenanceInput::new(
+        binding,
         Some(Timestamp::from_unix_nanos(995)),
         Timestamp::from_unix_nanos(1_000),
         Timestamp::from_unix_nanos(1_001),
         DataQuality::DirectUnverified,
-        market_squawk_domain::ConnectionGeneration::new(7)?,
-        SourceCoverageEvidence::Explicit,
+        CoverageStatus::Sufficient,
         payload_reference("capture:7:42")?,
-    )?;
+    ))?;
     Ok(MarketEvent::Trade(TradeEvent::new(
         provenance,
         PriceTicks::new(100),
@@ -116,3 +111,4 @@ fn unknown_v1_market_and_research_payload_fields_are_rejected() -> Result<(), Bo
     assert!(serde_json::from_value::<ResearchObservation>(research).is_err());
     Ok(())
 }
+mod support;

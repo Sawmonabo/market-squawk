@@ -5,7 +5,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use super::{
     AggressorSide, AuctionPhase, BookChange, BookLevel, CorporateActionKind, HaltTransition,
     LiveProvenance, MarketDepth, MarketEventError, SequenceNumber, SourceIdentifier, Timestamp,
-    TradingStatus, validate_book, validate_market_provenance,
+    TradingStatus, validate_book, validate_book_depth, validate_market_provenance,
 };
 use crate::{PriceTicks, QuantityLots};
 
@@ -26,7 +26,7 @@ impl TradeEvent {
         quantity: QuantityLots,
         aggressor_side: AggressorSide,
     ) -> Result<Self, MarketEventError> {
-        validate_market_provenance(&provenance, true)?;
+        validate_market_provenance(&provenance, true, crate::LiveEventClass::Trade)?;
         if quantity.get() == 0 {
             return Err(MarketEventError::ZeroQuantity);
         }
@@ -99,7 +99,7 @@ impl QuoteEvent {
         bid: Option<BookLevel>,
         ask: Option<BookLevel>,
     ) -> Result<Self, MarketEventError> {
-        validate_market_provenance(&provenance, true)?;
+        validate_market_provenance(&provenance, true, crate::LiveEventClass::Quote)?;
         if bid.is_none() && ask.is_none() {
             return Err(MarketEventError::EmptyQuote);
         }
@@ -168,7 +168,8 @@ impl BookSnapshotEvent {
         asks: Vec<BookLevel>,
         sequence: Option<SequenceNumber>,
     ) -> Result<Self, MarketEventError> {
-        validate_market_provenance(&provenance, true)?;
+        validate_market_provenance(&provenance, true, crate::LiveEventClass::BookSnapshot)?;
+        validate_book_depth(&provenance, depth)?;
         validate_book(&bids, &asks)?;
         Ok(Self {
             provenance,
@@ -249,7 +250,8 @@ impl BookDeltaEvent {
         changes: Vec<BookChange>,
         sequence: Option<SequenceNumber>,
     ) -> Result<Self, MarketEventError> {
-        validate_market_provenance(&provenance, true)?;
+        validate_market_provenance(&provenance, true, crate::LiveEventClass::BookDelta)?;
+        validate_book_depth(&provenance, depth)?;
         if changes.is_empty() {
             return Err(MarketEventError::EmptyBookDelta);
         }
@@ -319,7 +321,7 @@ impl AuctionEvent {
         indicative_price: Option<PriceTicks>,
         paired_quantity: QuantityLots,
     ) -> Result<Self, MarketEventError> {
-        validate_market_provenance(&provenance, true)?;
+        validate_market_provenance(&provenance, true, crate::LiveEventClass::Auction)?;
         Ok(Self {
             provenance,
             phase,
@@ -389,7 +391,7 @@ impl TradingHaltEvent {
         transition: HaltTransition,
         reason: SourceIdentifier,
     ) -> Result<Self, MarketEventError> {
-        validate_market_provenance(&provenance, true)?;
+        validate_market_provenance(&provenance, true, crate::LiveEventClass::TradingHalt)?;
         Ok(Self {
             provenance,
             transition,
@@ -444,7 +446,7 @@ impl InstrumentStatusEvent {
         provenance: LiveProvenance,
         status: TradingStatus,
     ) -> Result<Self, MarketEventError> {
-        validate_market_provenance(&provenance, true)?;
+        validate_market_provenance(&provenance, true, crate::LiveEventClass::InstrumentStatus)?;
         Ok(Self { provenance, status })
     }
 
@@ -491,7 +493,8 @@ impl CorporateActionEvent {
         effective_at: Timestamp,
         action: CorporateActionKind,
     ) -> Result<Self, MarketEventError> {
-        let instrument_id = validate_market_provenance(&provenance, false)?;
+        let instrument_id =
+            validate_market_provenance(&provenance, false, crate::LiveEventClass::CorporateAction)?;
         match &action {
             CorporateActionKind::Merger { successor } if *successor == instrument_id => {
                 return Err(MarketEventError::SelfMerger);
