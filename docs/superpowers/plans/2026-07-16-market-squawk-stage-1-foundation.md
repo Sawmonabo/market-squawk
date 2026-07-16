@@ -688,15 +688,24 @@ Expected: FAIL because the source crate does not exist.
 `SourceMetadata` is immutable/versioned and contains source ID, metadata revision and content hash,
 source class, typed authorization basis/evidence/effective interval, typed scoped coverage evidence/
 effective interval, supported instruments/events, delay semantics, declared quality ceiling,
-endpoint allowlist, freshness policy, and provider budget policy. `SourceHealthSnapshot` separately
-reports connection, session generation, market freshness, integrity, budget/cooldown, last error
-class, coverage limitations, and the metadata revision to which health applies.
+endpoint allowlist, provider budget policy, provider decoder revision, exact sequence rule/version,
+checksum algorithm/canonicalization/scope/depth/level count, and separate connection-idle,
+future-skew, transport-age, source-age, and market-age policy. Capability enums declare provider
+support but never substitute for a metadata-bound validator profile. `SourceHealthSnapshot`
+separately reports connection, session generation, market freshness, integrity, budget/cooldown,
+last error class, coverage limitations, and the metadata revision to which health applies; it is a
+Serde audit DTO and never current execution authority.
 
 `AuthoritativeSourceRegistry` validates configured metadata/authorization/coverage and issues a
 registered-source handle; source supervision binds a current session-generation handle to it. Task
 7 obtains its authority gate from those handles, not from a public constructor taking loose
-`SourceMetadata`/result enums. Tests prove metadata revisions and effective intervals cannot be
-transplanted across sources or active sessions.
+`SourceMetadata`/result enums. The supervisor/registry also owns an opaque current-health lease and
+a `ValidatedLiveScope` (or equivalent) binding registry/health epoch, source, revision, session,
+generation, authorization, exact venue/instrument membership, product/channel, event/depth rule,
+runtime subscription, validation profiles, and effective deadlines. `AllDeclared` instrument
+coverage needs registry-owned universe attestation; partial or unproven membership is not execution
+quality. Tests prove metadata revisions, effective intervals, scope fields, health, and active
+sessions cannot be transplanted or caller-forged.
 
 - [ ] **Step 3: Implement object-safe distinct live/extraction traits**
 
@@ -722,7 +731,7 @@ pub trait MarketDecoder: SourceMetadataProvider {
     fn decode(
         &mut self,
         frame: &RawMarketFrame,
-    ) -> Result<DecodedMarketBatch, DecodeError>;
+    ) -> Result<DecodedProviderBatch, DecodeError>;
 }
 
 pub trait ExtractionSource: SourceMetadataProvider {
@@ -733,11 +742,17 @@ pub trait ExtractionSource: SourceMetadataProvider {
 }
 ```
 
-`DecodedMarketBatch` is bounded at construction and contains canonical `MarketEvent` values plus
-connection-generation/decoder evidence; it is not an extraction `RecordBatch`. Keep raw live frames,
-decoded live batches, and normalized extraction batches separate. The app composes a configured
-`LiveMarketSource` and source-specific `MarketDecoder`, allowing capture before decode without
-making the adapter depend on platform/live runtime implementations.
+`DecodedProviderBatch` is bounded at construction and contains provider-normalized pre-state
+observations plus connection-generation/decoder evidence; it is not an extraction `RecordBatch`
+and does not contain caller-asserted canonical `MarketEvent` values. It retains exact provider
+numeric lexemes/checked decimals, source timestamps, sequence/snapshot fields, expected checksums,
+and status fields until the owning Task 7 shard validates precision, time, sequence, checksum, and
+message-atomic state transitions. The authoritative registry validates a batch and returns an
+opaque, non-Serde proof that retains the exact current-session lease/allocation identity. Keep raw
+live frames, decoded provider batches, canonical live events, and normalized extraction batches
+separate. The app composes a configured `LiveMarketSource` and source-specific `MarketDecoder`,
+allowing capture before decode without making the adapter depend on platform/live runtime
+implementations.
 
 - [ ] **Step 4: Implement bounded, policy-compliant provider budgets**
 

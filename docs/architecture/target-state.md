@@ -310,7 +310,7 @@ pub trait MarketDecoder: SourceMetadataProvider {
     fn decode(
         &mut self,
         frame: &RawMarketFrame,
-    ) -> Result<DecodedMarketBatch, DecodeError>;
+    ) -> Result<DecodedProviderBatch, DecodeError>;
 }
 
 pub trait ExtractionSource: SourceMetadataProvider {
@@ -329,7 +329,11 @@ pub trait ExtractionSource: SourceMetadataProvider {
 These signatures express the asynchronous semantic contract. The heterogeneous runtime registries
 use object-safe boxed futures allocated once per source session or extraction request, never once
 per market event. `MarketDecoder` is synchronous, bounded, source-specific, and separately testable;
-capture occurs before it is invoked. Provider validation loops remain concrete, bounded code.
+capture occurs before it is invoked. It returns provider-normalized pre-state observations, not
+caller-asserted canonical `MarketEvent` values. Numeric lexemes/checked decimals, provider sequence,
+snapshot markers, expected checksums, source timestamps, and trading/status fields remain available
+until the instrument-owning live shard validates and applies them atomically. Provider validation
+loops remain concrete, bounded code.
 
 `SourceMetadata` is immutable/versioned and declares its revision/content hash, authorization mode
 and evidence/effective interval, provider, endpoint allowlist, evidenced asset/venue/event/depth
@@ -337,7 +341,17 @@ coverage and effective interval, delay, consolidation status, sequence/checksum 
 historical/revision coverage, rate policy, schema version, and data-quality ceiling.
 `AuthoritativeSourceRegistry` validates that metadata and emits registered-source/current-session
 handles consumed by the live authority issuer; loose metadata/result enums cannot construct the
-gate.
+gate. Metadata also binds the provider decoder revision, exact sequence semantics/rule version,
+checksum algorithm/canonicalization/scope/depth/level count, and separate future-skew, transport-age,
+source-age, market-age, and connection-idle policies. Capability enums alone never prove that those
+validators ran.
+
+`SourceHealthSnapshot` is a serializable audit/control-plane DTO only. Current execution authority
+uses an opaque registry/supervisor-owned health lease keyed by registry epoch, source, metadata
+revision, session, connection generation, and health epoch. A validated live-scope handle selects
+one exact authorization, venue/instrument membership, provider product/channel, event/depth rule,
+runtime subscription, effective deadline, delivery mode, and validation profile. Callers cannot
+assemble this scope from loose metadata or a self-reported healthy snapshot.
 
 ### Provider access policy
 
@@ -358,11 +372,15 @@ socket/protocol reader
         │
         └── source decoder
                  │
-       sequence/checksum/time/precision/status validation
+        bounded provider-normalized observation
                  │
           try_send(stable shard)
                  │
-       instrument-owned book and rolling state
+       exact precision/time/sequence validation
+                 │
+       atomic snapshot/delta/checksum/book transition
+                 │
+       canonical event and instrument-owned rolling state
                  │
         online features and optional inference
                  │
@@ -376,7 +394,9 @@ socket/protocol reader
 The source reader never waits for disk completion. A raw-capture enqueue failure emits an integrity
 control event and prevents that frame from producing an executable action. A shard enqueue failure
 quarantines the affected source/instrument/generation and requires resynchronization. No critical
-message is silently discarded.
+message is silently discarded. The decoder never owns a second order book and cannot pre-assert
+precision, checksum, sequence, or canonical-state success. The shard computes the post-apply
+canonical state digest while retaining the exact initializing snapshot identity/digest.
 
 ### Stable sharding
 
@@ -417,6 +437,13 @@ prove:
 - Valid trading/instrument/venue status
 - Exact tick and lot precision
 - Consistent non-crossed book
+
+Issuance consumes an opaque validated decoded-batch proof, current session lease, current-health
+lease, validated live-scope handle, and a private applied-observation view from the owning shard.
+The issuer owns its clock and derives every assessment time and deadline. Exact provider numeric
+evidence is converted against the current instrument tick/lot definition before a canonical event
+exists. `AllDeclared` coverage requires a registry-owned universe attestation; partial or otherwise
+unproven membership cannot qualify for immediate automated action.
 
 Capability expiry is policy-derived as the earliest freshness, metadata/authorization/coverage, or
 maximum-lifetime deadline. Loss of any required evidence changes quality to `Quarantined` or
