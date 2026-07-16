@@ -274,6 +274,14 @@ Construction and deserialization enforce `received_at <= available_at <= ingeste
 default a missing wire `available_at`. Serde round trips retain recorded classification/evidence but
 can never mint current execution authority.
 
+Concretely, `LiveProvenance` owns a complete `LiveEvidenceBinding` instead of separately writable
+source, venue, instrument, generation, channel, event, payload, and canonical-state identity fields.
+Its archive `record_state` is derived from the checked construction path or optional wire assessment
+reference and is not serialized. `RecordedLiveProvenanceInput` accepts a caller-supplied archival
+classification and opaque assessment reference. The recorded path requires the reference, and the
+wire rejects `DirectVerified` without one, but provenance does not dereference or prove the external
+assessment relationship. It remains an audit assertion that the stateful live plane must revalidate.
+
 Every research observation additionally includes effective/reference time, publication time when
 known, availability time when evidenced, local first-observed time, revision identity, and
 superseded time. Unknown historical availability remains unknown; ingestion code does not invent it

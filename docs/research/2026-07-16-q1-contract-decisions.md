@@ -135,6 +135,13 @@ The corrected boundary is deliberately fail-closed:
 - `LiveProvenance` carries explicit `available_at`, enforces
   `received_at <= available_at <= ingested_at`, and retains only a durable assessment reference,
   never a full assessment or capability.
+- `LiveProvenance` owns the complete `LiveEvidenceBinding`; source, venue, instrument, generation,
+  channel, event, payload, and canonical-state identity are binding views rather than independently
+  writable flattened fields. Its non-wire `record_state` is derived from checked construction.
+- `RecordedLiveProvenanceInput` accepts a caller-supplied archival classification plus an opaque
+  assessment reference. The recorded path requires a reference and the wire rejects
+  `DirectVerified` without one, but provenance does not dereference or prove the assessment
+  relationship. That assertion is audit evidence only and must be revalidated by the live plane.
 - The domain exports no `QualifiedCurrent`, promotion method, or deserializable current authority.
 
 The opaque, non-Serde, non-clonable, time-bounded execution capability belongs to the stateful

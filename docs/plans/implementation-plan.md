@@ -174,6 +174,10 @@ unforgeable risk approval; migrated Coinbase, paper, CLI, and MCP v0.1 behavior;
   deserialize, clone, or substitute for live current authority.
 - [ ] Live provenance carries explicit validated `available_at`, a durable assessment reference
   rather than a full assessment, and no serialized execution authority.
+- [ ] Live provenance owns one complete `LiveEvidenceBinding`; its archive record state is derived,
+  while a caller-supplied archival classification and opaque assessment reference are retained
+  as audit assertions. Provenance does not dereference or prove
+  the external assessment relationship.
 - [ ] `SourceMetadataProvider`, `LiveMarketSource`, and `ExtractionSource` contracts.
 - [ ] Explicit endpoint/network policy and provider budget contracts.
 - [ ] Raw capture no longer waits for writer acknowledgement.

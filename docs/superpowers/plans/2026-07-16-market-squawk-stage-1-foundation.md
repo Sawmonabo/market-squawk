@@ -545,10 +545,7 @@ Use UTC nanosecond timestamps with validated ordering. Add:
 ```rust
 pub struct LiveProvenance {
     schema_version: SchemaVersion,
-    source_id: SourceId,
-    instrument_id: Option<InstrumentId>,
-    venue_id: Option<VenueId>,
-    source_identifier: SourceIdentifier,
+    binding: LiveEvidenceBinding,
     source_timestamp: Option<Timestamp>,
     received_at: Timestamp,
     available_at: Timestamp,
@@ -557,8 +554,17 @@ pub struct LiveProvenance {
     recorded_coverage: CoverageStatus,
     payload_reference: PayloadReference,
     assessment_reference: Option<SourceIdentifier>,
+    // Not serialized; derived from the checked constructor or wire reference.
+    record_state: LiveRecordState,
 }
 ```
+
+The concrete record owns one complete `LiveEvidenceBinding`; it does not duplicate flattened source,
+session, metadata, authorization, venue, instrument, generation, channel, event, payload, or
+canonical-state identity fields. Public views such as `source_id()`, `instrument_id()`,
+`venue_id()`, `source_identifier()`, and `connection_generation()` delegate to that binding.
+`record_state()` reports either decoder output or a retained archival-assessment assertion, and the
+state is reconstructed rather than accepted as a wire field.
 
 `DecodedLiveProvenanceInput::new` takes `(binding, source_timestamp, received_at, available_at,
 ingested_at, recorded_quality, recorded_coverage, payload_reference)` in that order.
@@ -573,8 +579,12 @@ that reference, but its archive-facing execution eligibility is always the unit 
 `received_at <= available_at <= ingested_at` in constructors and deserialization, require
 `available_at` on the wire with no default, preserve the record for audit/research, and never
 manufacture Task 7's capability. Decoder construction rejects a caller-authored
-`DirectVerified`; recorded assessment construction carries the quality derived by the referenced
-assessment. `ResearchProvenance` adds
+`DirectVerified`. `RecordedLiveProvenanceInput` instead accepts a caller-supplied archival
+classification and an opaque assessment reference. The recorded constructor structurally requires
+that reference, and deserialization rejects a recorded `DirectVerified` classification when the
+reference is absent, but `LiveProvenance` does not dereference or prove the assessment relationship.
+The classification remains an audit assertion, never current authority; Task 7 must revalidate the
+complete binding and current state independently. `ResearchProvenance` adds
 `effective_at`, `published_at`, evidenced/unknown availability, `revision`, and `superseded_at`;
 constructors reject impossible time ordering without inventing unavailable timestamps.
 
