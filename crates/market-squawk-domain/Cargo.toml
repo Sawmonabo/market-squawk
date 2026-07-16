@@ -9,9 +9,14 @@ repository = "https://github.com/Sawmonabo/market-squawk"
 publish = false
 
 [dependencies]
+bs58 = { workspace = true }
+rust_decimal = { workspace = true }
 serde = { workspace = true }
+sha3 = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
+proptest = { workspace = true }
 serde_json = { workspace = true }
 
 [lints]
