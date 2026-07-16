@@ -235,7 +235,7 @@ impl<C: TrustedClock> InstrumentLiveProcessor<C> {
         {
             Ok(value) => value,
             Err(error) => {
-                self.quarantine(&key);
+                self.quarantine_rejected(&key, &current, now.wall());
                 return Err(error);
             }
         };
@@ -282,7 +282,7 @@ impl<C: TrustedClock> InstrumentLiveProcessor<C> {
         let (qualified, capability_deadline, committed) = match outcome {
             Ok(value) => value,
             Err(error) => {
-                state.quarantine();
+                state.quarantine_rejected(&current, now.wall());
                 self.streams.insert(key, state);
                 return Err(error);
             }
@@ -467,9 +467,14 @@ impl<C: TrustedClock> InstrumentLiveProcessor<C> {
         Ok(())
     }
 
-    fn quarantine(&mut self, key: &CurrentStreamKey) {
+    fn quarantine_rejected(
+        &mut self,
+        key: &CurrentStreamKey,
+        current: &CurrentProviderObservation,
+        evaluated_at: Timestamp,
+    ) {
         if let Some(state) = self.streams.get_mut(key) {
-            state.quarantine();
+            state.quarantine_rejected(current, evaluated_at);
         }
     }
 }

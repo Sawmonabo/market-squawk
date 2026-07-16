@@ -111,6 +111,30 @@ impl StreamState {
         self.phase.quarantine();
     }
 
+    /// Quarantines a rejected observation while retaining complete, truthful diagnostics.
+    ///
+    /// A newly allocated stream has no committed market state. Its first rejected observation is
+    /// therefore the only truthful provenance available for the quarantined diagnostic record.
+    /// An established stream keeps the provenance of its last committed state so a rejected
+    /// candidate can never relabel an older book with newer, uncommitted evidence.
+    pub(super) fn quarantine_rejected(
+        &mut self,
+        current: &CurrentProviderObservation,
+        evaluated_at: Timestamp,
+    ) {
+        if self.received_at.is_none() {
+            self.health_epoch = current.current_lease().health_epoch();
+            self.source_valid_until = Some(current.current_lease().valid_until());
+            self.source_timestamp = match current.observation().timestamp() {
+                ProviderTimestampEvidence::Provided { value, .. } => Some(*value),
+                ProviderTimestampEvidence::AuthoritativelyAbsent(_) => None,
+            };
+            self.received_at = Some(current.frame_evidence().received_at());
+            self.evaluated_at = Some(evaluated_at);
+        }
+        self.quarantine();
+    }
+
     #[cfg(test)]
     pub(super) fn set_revision_for_test(&mut self, revision: u64) {
         self.revision.invalidate();

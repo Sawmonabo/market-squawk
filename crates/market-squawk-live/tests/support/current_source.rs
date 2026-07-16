@@ -376,6 +376,15 @@ impl SourceHarness {
         source_identifier: &str,
         sequence: u64,
     ) -> TestResult<(CurrentSourceAuthorityLease, CurrentDecodedProviderBatch)> {
+        self.batch_with_price(source_identifier, sequence, "100.00")
+    }
+
+    pub(super) fn batch_with_price(
+        &mut self,
+        source_identifier: &str,
+        sequence: u64,
+        price: &str,
+    ) -> TestResult<(CurrentSourceAuthorityLease, CurrentDecodedProviderBatch)> {
         let frame_at = next_after(self.last_frame_at)?;
         self.last_frame_at = frame_at;
         let frame = self.frames.try_frame(
@@ -406,7 +415,7 @@ impl SourceHarness {
             },
             ProviderObservationPayload::Trade {
                 trade_id: id(source_identifier)?,
-                price: ProviderPrice::new(ProviderDecimalLexeme::try_new("100.00")?),
+                price: ProviderPrice::new(ProviderDecimalLexeme::try_new(price)?),
                 quantity: ProviderQuantity::new(ProviderDecimalLexeme::try_new("1.00")?),
                 aggressor: ProviderAggressorEvidence::new(
                     AggressorSide::Buy,
