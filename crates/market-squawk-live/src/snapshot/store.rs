@@ -236,3 +236,7 @@ pub(crate) fn create_snapshot_plane(
         notifications: receivers.into_boxed_slice(),
     })
 }
+
+#[cfg(test)]
+#[path = "store/tests.rs"]
+mod tests;

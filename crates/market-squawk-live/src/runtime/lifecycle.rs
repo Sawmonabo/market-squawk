@@ -581,3 +581,7 @@ impl From<crate::snapshot::SnapshotBuildError> for LiveRuntimeStartError {
         Self::SnapshotConstruction
     }
 }
+
+#[cfg(test)]
+#[path = "lifecycle/tests.rs"]
+mod tests;
