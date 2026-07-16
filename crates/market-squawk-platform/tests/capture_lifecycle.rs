@@ -7,10 +7,10 @@ use market_squawk_domain::{
     RawCaptureFrameView, SourceId, SourceIdentifier, Timestamp,
 };
 use market_squawk_platform::{
-    CaptureGenerationError, CaptureSink, CaptureSinkError, CaptureStorageErrorClass,
-    CaptureWriterPolicy, CapturedRawRecord, DiagnosticCaptureBundle, DiagnosticCaptureFrame,
-    DiagnosticCaptureReceipt, MemoryCaptureSink, RawCaptureControl, RawCapturePublisher,
-    raw_capture_channel, spawn_capture_writer,
+    CaptureDestination, CaptureGenerationError, CaptureSink, CaptureSinkError,
+    CaptureStorageErrorClass, CaptureWriterPolicy, CaptureWriterSpawnError, CapturedRawRecord,
+    DiagnosticCaptureBundle, DiagnosticCaptureFrame, DiagnosticCaptureReceipt, MemoryCaptureSink,
+    RawCaptureControl, RawCapturePublisher, raw_capture_channel, spawn_capture_writer,
 };
 use static_assertions::{assert_impl_all, assert_not_impl_any};
 
@@ -87,11 +87,16 @@ async fn natural_writer_completion_degrades_every_previously_issued_receipt()
 
 #[derive(Debug)]
 struct GatedFailingSink {
+    destination: CaptureDestination,
     entered: std::sync::mpsc::SyncSender<()>,
     release: std::sync::mpsc::Receiver<()>,
 }
 
 impl CaptureSink for GatedFailingSink {
+    fn destination(&self) -> CaptureDestination {
+        self.destination.clone()
+    }
+
     fn append(&mut self, _record: &CapturedRawRecord) -> Result<(), CaptureSinkError> {
         self.entered
             .send(())
@@ -122,6 +127,7 @@ async fn old_queued_frame_failure_degrades_the_current_writer_allocation()
     let handle = spawn_capture_writer(
         writer,
         GatedFailingSink {
+            destination: CaptureDestination::try_named("gated-failing-sink")?,
             entered: entered_sender,
             release: release_receiver,
         },
@@ -143,11 +149,16 @@ async fn old_queued_frame_failure_degrades_the_current_writer_allocation()
 
 #[derive(Debug)]
 struct GatedSink {
+    destination: CaptureDestination,
     entered: Option<std::sync::mpsc::SyncSender<()>>,
     release: std::sync::mpsc::Receiver<()>,
 }
 
 impl CaptureSink for GatedSink {
+    fn destination(&self) -> CaptureDestination {
+        self.destination.clone()
+    }
+
     fn append(&mut self, _record: &CapturedRawRecord) -> Result<(), CaptureSinkError> {
         if let Some(entered) = self.entered.take() {
             entered
@@ -178,6 +189,7 @@ async fn blocking_sink_does_not_stall_tokio_and_handle_drop_releases_exact_queue
     let handle = spawn_capture_writer(
         writer,
         GatedSink {
+            destination: CaptureDestination::try_named("gated-sink")?,
             entered: Some(entered_sender),
             release: release_receiver,
         },
@@ -204,5 +216,100 @@ async fn blocking_sink_does_not_stall_tokio_and_handle_drop_releases_exact_queue
     assert_eq!(publisher.queued_bytes(), 0);
     release_sender.send(())?;
     drop(control);
+    Ok(())
+}
+
+#[derive(Debug)]
+struct DestinationGatedSink {
+    destination: CaptureDestination,
+    entered: Option<std::sync::mpsc::SyncSender<()>>,
+    release: Option<std::sync::mpsc::Receiver<()>>,
+}
+
+impl CaptureSink for DestinationGatedSink {
+    fn destination(&self) -> CaptureDestination {
+        self.destination.clone()
+    }
+
+    fn append(&mut self, _record: &CapturedRawRecord) -> Result<(), CaptureSinkError> {
+        if let Some(entered) = self.entered.take() {
+            entered
+                .send(())
+                .map_err(|_error| CaptureSinkError::storage(CaptureStorageErrorClass::Other))?;
+        }
+        if let Some(release) = self.release.take() {
+            release
+                .recv()
+                .map_err(|_error| CaptureSinkError::storage(CaptureStorageErrorClass::Other))?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<(), CaptureSinkError> {
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn destination_fence_rejects_concurrent_independent_writer()
+-> Result<(), Box<dyn std::error::Error>> {
+    let destination = CaptureDestination::try_named("capture-lifecycle-shared-destination")?;
+    let first_identity = identity(1)?;
+    let (first_publisher, mut first_control, first_writer) = raw_capture_channel(
+        NonZeroUsize::MIN,
+        DiagnosticCaptureBundle::new(first_identity.clone()),
+    );
+    let (entered_sender, entered_receiver) = std::sync::mpsc::sync_channel(1);
+    let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(1);
+    let first_handle = spawn_capture_writer(
+        first_writer,
+        DestinationGatedSink {
+            destination: destination.clone(),
+            entered: Some(entered_sender),
+            release: Some(release_receiver),
+        },
+        CaptureWriterPolicy::default(),
+    )?;
+    first_control.activate_initial()?;
+    let first_frame = frame(first_identity, 1)?;
+    let _first_receipt = first_publisher.try_publish(&first_frame)?;
+    entered_receiver.recv_timeout(Duration::from_secs(1))?;
+
+    let (_second_publisher, _second_control, second_writer) = raw_capture_channel(
+        NonZeroUsize::MIN,
+        DiagnosticCaptureBundle::new(identity(1)?),
+    );
+    assert!(matches!(
+        spawn_capture_writer(
+            second_writer,
+            DestinationGatedSink {
+                destination: destination.clone(),
+                entered: None,
+                release: None,
+            },
+            CaptureWriterPolicy::default(),
+        ),
+        Err(CaptureWriterSpawnError::DestinationBusy { .. })
+    ));
+
+    release_sender.send(())?;
+    drop(first_publisher);
+    assert!(!first_handle.wait().await.is_incomplete());
+
+    let (_third_publisher, _third_control, third_writer) = raw_capture_channel(
+        NonZeroUsize::MIN,
+        DiagnosticCaptureBundle::new(identity(1)?),
+    );
+    let third_handle = spawn_capture_writer(
+        third_writer,
+        DestinationGatedSink {
+            destination,
+            entered: None,
+            release: None,
+        },
+        CaptureWriterPolicy::default(),
+    )?;
+    let third_outcome = third_handle.shutdown(Duration::from_secs(1)).await;
+    assert!(!third_outcome.is_incomplete());
     Ok(())
 }

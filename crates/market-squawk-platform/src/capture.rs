@@ -602,8 +602,9 @@ pub use diagnostic::{
 };
 pub use policy::{CaptureWriterPolicy, CaptureWriterPolicyError};
 pub use writer::{
-    CaptureShutdown, CaptureSink, CaptureSinkError, CaptureStorageErrorClass, CaptureWriterHandle,
-    CaptureWriterOutcome, CaptureWriterSpawnError, MemoryCaptureSink, spawn_capture_writer,
+    CaptureDestination, CaptureDestinationError, CaptureShutdown, CaptureSink, CaptureSinkError,
+    CaptureStorageErrorClass, CaptureWriterHandle, CaptureWriterOutcome, CaptureWriterSpawnError,
+    MemoryCaptureSink, spawn_capture_writer,
 };
 
 #[cfg(test)]

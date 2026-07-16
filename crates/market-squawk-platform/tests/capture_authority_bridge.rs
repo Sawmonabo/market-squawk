@@ -9,9 +9,9 @@ use market_squawk_domain::{
     MetadataRevision, RawCaptureFrameView, SourceId, SourceIdentifier, Timestamp,
 };
 use market_squawk_platform::{
-    CapturePublishError, CaptureSink, CaptureSinkError, CaptureStorageErrorClass,
-    CaptureWriterPolicy, CapturedRawRecord, MemoryCaptureSink, raw_capture_channel,
-    spawn_capture_writer,
+    CaptureDestination, CapturePublishError, CaptureSink, CaptureSinkError,
+    CaptureStorageErrorClass, CaptureWriterPolicy, CapturedRawRecord, MemoryCaptureSink,
+    raw_capture_channel, spawn_capture_writer,
 };
 use static_assertions::{assert_impl_all, assert_not_impl_any};
 
@@ -345,11 +345,16 @@ async fn concrete_associated_receipt_is_issued_only_after_bounded_enqueue()
 
 #[derive(Debug)]
 struct GatedSink {
+    destination: CaptureDestination,
     entered: Option<std::sync::mpsc::SyncSender<()>>,
     release: std::sync::mpsc::Receiver<()>,
 }
 
 impl CaptureSink for GatedSink {
+    fn destination(&self) -> CaptureDestination {
+        self.destination.clone()
+    }
+
     fn append(&mut self, _record: &CapturedRawRecord) -> Result<(), CaptureSinkError> {
         if let Some(entered) = self.entered.take() {
             entered
@@ -378,6 +383,7 @@ async fn queue_saturation_degrades_exact_generation_without_issuing_a_third_rece
     let handle = spawn_capture_writer(
         writer,
         GatedSink {
+            destination: CaptureDestination::try_named("authority-bridge-gated")?,
             entered: Some(entered_sender),
             release: release_receiver,
         },
@@ -434,9 +440,13 @@ async fn whole_bundle_rotation_invalidates_old_receipt_and_accepts_only_new_bind
 }
 
 #[derive(Debug)]
-struct FailingSink;
+struct FailingSink(CaptureDestination);
 
 impl CaptureSink for FailingSink {
+    fn destination(&self) -> CaptureDestination {
+        self.0.clone()
+    }
+
     fn append(&mut self, _record: &CapturedRawRecord) -> Result<(), CaptureSinkError> {
         Err(CaptureSinkError::storage(
             CaptureStorageErrorClass::Unavailable,
@@ -454,7 +464,11 @@ async fn writer_failure_invalidates_an_already_issued_concrete_receipt()
     let (bundle, _issued) = TestBundle::try_new(1)?;
     let identity = bundle.identity();
     let (publisher, mut control, writer) = raw_capture_channel(NonZeroUsize::MIN, bundle);
-    let handle = spawn_capture_writer(writer, FailingSink, CaptureWriterPolicy::default())?;
+    let handle = spawn_capture_writer(
+        writer,
+        FailingSink(CaptureDestination::try_named("authority-bridge-failing")?),
+        CaptureWriterPolicy::default(),
+    )?;
     control.activate_initial()?;
     let receipt = publisher.try_publish(&frame(identity, 1)?)?;
 
@@ -466,11 +480,18 @@ async fn writer_failure_invalidates_an_already_issued_concrete_receipt()
 }
 
 #[derive(Debug)]
-struct RecordingSink(std::sync::mpsc::SyncSender<CapturedRawRecord>);
+struct RecordingSink {
+    destination: CaptureDestination,
+    sender: std::sync::mpsc::SyncSender<CapturedRawRecord>,
+}
 
 impl CaptureSink for RecordingSink {
+    fn destination(&self) -> CaptureDestination {
+        self.destination.clone()
+    }
+
     fn append(&mut self, record: &CapturedRawRecord) -> Result<(), CaptureSinkError> {
-        self.0
+        self.sender
             .send(record.clone())
             .map_err(|_error| CaptureSinkError::storage(CaptureStorageErrorClass::Other))
     }
@@ -489,7 +510,10 @@ async fn writer_converts_exact_frame_to_bounded_diagnostic_record_without_author
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     let handle = spawn_capture_writer(
         writer,
-        RecordingSink(sender),
+        RecordingSink {
+            destination: CaptureDestination::try_named("authority-bridge-recording")?,
+            sender,
+        },
         CaptureWriterPolicy::default(),
     )?;
     control.activate_initial()?;
@@ -601,9 +625,13 @@ async fn rotation_rejects_wrong_session_and_nonincreasing_whole_bundles()
 }
 
 #[derive(Debug)]
-struct SlowFlushSink;
+struct SlowFlushSink(CaptureDestination);
 
 impl CaptureSink for SlowFlushSink {
+    fn destination(&self) -> CaptureDestination {
+        self.0.clone()
+    }
+
     fn append(&mut self, _record: &CapturedRawRecord) -> Result<(), CaptureSinkError> {
         Ok(())
     }
@@ -620,7 +648,13 @@ async fn shutdown_deadline_invalidates_authority_and_releases_queued_bytes()
     let (bundle, _issued) = TestBundle::try_new(1)?;
     let identity = bundle.identity();
     let (publisher, mut control, writer) = raw_capture_channel(NonZeroUsize::MIN, bundle);
-    let handle = spawn_capture_writer(writer, SlowFlushSink, CaptureWriterPolicy::default())?;
+    let handle = spawn_capture_writer(
+        writer,
+        SlowFlushSink(CaptureDestination::try_named(
+            "authority-bridge-slow-flush",
+        )?),
+        CaptureWriterPolicy::default(),
+    )?;
     control.activate_initial()?;
     let receipt = publisher.try_publish(&frame(identity, 1)?)?;
 

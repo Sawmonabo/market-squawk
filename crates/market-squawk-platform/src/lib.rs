@@ -7,12 +7,13 @@ mod paths;
 mod raw_record;
 
 pub use capture::{
-    CaptureGenerationError, CaptureHealthEvent, CaptureHealthReason, CaptureHealthSnapshot,
-    CapturePublishError, CaptureShutdown, CaptureSink, CaptureSinkError, CaptureStorageErrorClass,
-    CaptureWriterHandle, CaptureWriterOutcome, CaptureWriterPolicy, CaptureWriterPolicyError,
-    CaptureWriterSpawnError, CapturedRawRecord, DiagnosticCaptureBundle, DiagnosticCaptureError,
-    DiagnosticCaptureFrame, DiagnosticCaptureReceipt, MemoryCaptureSink, RawCaptureControl,
-    RawCapturePublisher, RawCaptureWriter, raw_capture_channel, spawn_capture_writer,
+    CaptureDestination, CaptureDestinationError, CaptureGenerationError, CaptureHealthEvent,
+    CaptureHealthReason, CaptureHealthSnapshot, CapturePublishError, CaptureShutdown, CaptureSink,
+    CaptureSinkError, CaptureStorageErrorClass, CaptureWriterHandle, CaptureWriterOutcome,
+    CaptureWriterPolicy, CaptureWriterPolicyError, CaptureWriterSpawnError, CapturedRawRecord,
+    DiagnosticCaptureBundle, DiagnosticCaptureError, DiagnosticCaptureFrame,
+    DiagnosticCaptureReceipt, MemoryCaptureSink, RawCaptureControl, RawCapturePublisher,
+    RawCaptureWriter, raw_capture_channel, spawn_capture_writer,
 };
 pub use config::{
     AppConfig, ConfigError, ConfigOverrides, ConfigSources, SecretError, SecretProvider,

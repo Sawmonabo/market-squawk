@@ -1,12 +1,14 @@
 //! Supervised capture-sink storage outside the live event-to-action path.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, OnceLock, Weak, mpsc};
 use std::time::Duration;
 
 use bytes::Bytes;
 use market_squawk_domain::{CaptureAuthorityBundle, RawCaptureFrameView};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -16,6 +18,105 @@ use super::{
     CaptureHealthReason, CaptureMessage, CaptureState, CaptureWriterPolicy, CapturedRawRecord,
     GenerationCaptureState, RawCaptureWriter, WRITER_NOT_STARTED, WRITER_RUNNING,
 };
+
+const MAX_CAPTURE_DESTINATION_LABEL_BYTES: usize = 1_024;
+const CAPTURE_DESTINATION_DOMAIN: &[u8] = b"MSQKCAPTUREDESTINATION\x01";
+
+/// Redacted exact identity for one capture storage destination.
+#[derive(Clone, Eq, Hash, PartialEq)]
+pub struct CaptureDestination([u8; 32]);
+
+impl CaptureDestination {
+    /// Constructs a destination from one bounded non-secret alternative-sink label.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an empty label or one larger than 1,024 bytes.
+    pub fn try_named(label: &str) -> Result<Self, CaptureDestinationError> {
+        if label.is_empty() {
+            return Err(CaptureDestinationError::Empty);
+        }
+        if label.len() > MAX_CAPTURE_DESTINATION_LABEL_BYTES {
+            return Err(CaptureDestinationError::TooLong {
+                max: MAX_CAPTURE_DESTINATION_LABEL_BYTES,
+            });
+        }
+        Ok(Self::from_bytes(b"named", label.as_bytes()))
+    }
+
+    pub(crate) fn for_journal(path: &std::path::Path) -> Self {
+        Self::from_bytes(b"journal", path.as_os_str().as_encoded_bytes())
+    }
+
+    fn unique_memory() -> Self {
+        Self::from_bytes(b"memory", Uuid::new_v4().as_bytes())
+    }
+
+    fn from_bytes(kind: &[u8], value: &[u8]) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(CAPTURE_DESTINATION_DOMAIN);
+        hasher.update(
+            u64::try_from(kind.len())
+                .map_or(u64::MAX, |length| length)
+                .to_be_bytes(),
+        );
+        hasher.update(kind);
+        hasher.update(
+            u64::try_from(value.len())
+                .map_or(u64::MAX, |length| length)
+                .to_be_bytes(),
+        );
+        hasher.update(value);
+        Self(hasher.finalize().into())
+    }
+}
+
+impl fmt::Debug for CaptureDestination {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("CaptureDestination")
+            .field(&self.0)
+            .finish()
+    }
+}
+
+/// Capture destination construction failure.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum CaptureDestinationError {
+    /// An empty destination cannot establish a stable fence.
+    #[error("capture destination label cannot be empty")]
+    Empty,
+    /// The destination label exceeded its retained input bound.
+    #[error("capture destination label exceeds maximum {max} bytes")]
+    TooLong {
+        /// Maximum accepted label bytes.
+        max: usize,
+    },
+}
+
+#[derive(Debug)]
+struct CaptureDestinationLease;
+
+static CAPTURE_DESTINATION_FENCES: OnceLock<
+    std::sync::Mutex<HashMap<CaptureDestination, Weak<CaptureDestinationLease>>>,
+> = OnceLock::new();
+
+fn acquire_destination_fence(
+    destination: &CaptureDestination,
+) -> Option<(Arc<CaptureDestinationLease>, Arc<CaptureDestinationLease>)> {
+    let registry = CAPTURE_DESTINATION_FENCES.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut registry = match registry.lock() {
+        Ok(registry) => registry,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    registry.retain(|_destination, lease| lease.strong_count() > 0);
+    if registry.get(destination).and_then(Weak::upgrade).is_some() {
+        return None;
+    }
+    let lease = Arc::new(CaptureDestinationLease);
+    registry.insert(destination.clone(), Arc::downgrade(&lease));
+    Some((Arc::clone(&lease), lease))
+}
 
 /// Typed storage failure returned to the supervised capture writer.
 #[derive(Debug, Error)]
@@ -53,6 +154,8 @@ pub enum CaptureStorageErrorClass {
 
 /// Synchronous diagnostic storage contract consumed only by the background writer.
 pub trait CaptureSink: fmt::Debug + Send + 'static {
+    /// Returns the exact process-local destination fence identity.
+    fn destination(&self) -> CaptureDestination;
     /// Appends one bounded diagnostic record.
     fn append(&mut self, record: &CapturedRawRecord) -> Result<(), CaptureSinkError>;
     /// Flushes buffered records durably according to the sink contract.
@@ -60,6 +163,10 @@ pub trait CaptureSink: fmt::Debug + Send + 'static {
 }
 
 impl CaptureSink for JournalWriter {
+    fn destination(&self) -> CaptureDestination {
+        CaptureDestination::for_journal(self.path())
+    }
+
     fn append(&mut self, captured: &CapturedRawRecord) -> Result<(), CaptureSinkError> {
         self.append(captured.record()).map_err(Into::into)
     }
@@ -70,9 +177,19 @@ impl CaptureSink for JournalWriter {
 }
 
 /// In-memory sink for deterministic supervision tests and diagnostics.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct MemoryCaptureSink {
+    destination: CaptureDestination,
     records: Vec<CapturedRawRecord>,
+}
+
+impl Default for MemoryCaptureSink {
+    fn default() -> Self {
+        Self {
+            destination: CaptureDestination::unique_memory(),
+            records: Vec::new(),
+        }
+    }
 }
 
 impl MemoryCaptureSink {
@@ -83,6 +200,10 @@ impl MemoryCaptureSink {
 }
 
 impl CaptureSink for MemoryCaptureSink {
+    fn destination(&self) -> CaptureDestination {
+        self.destination.clone()
+    }
+
     fn append(&mut self, record: &CapturedRawRecord) -> Result<(), CaptureSinkError> {
         self.records.push(record.clone());
         Ok(())
@@ -122,11 +243,20 @@ pub type CaptureShutdown = CaptureWriterOutcome;
 
 /// Failure to start the dedicated capture writer thread.
 #[derive(Debug, Error)]
-#[error("failed to start dedicated capture writer thread: {source}")]
-pub struct CaptureWriterSpawnError {
-    /// Underlying operating-system thread creation failure.
-    #[source]
-    source: std::io::Error,
+pub enum CaptureWriterSpawnError {
+    /// Another worker or unreaped lifecycle owner fences the exact destination.
+    #[error("capture destination already has an active or unreaped writer: {destination:?}")]
+    DestinationBusy {
+        /// Redacted exact destination identity.
+        destination: CaptureDestination,
+    },
+    /// The operating system rejected dedicated thread creation.
+    #[error("failed to start dedicated capture writer thread: {source}")]
+    Thread {
+        /// Underlying operating-system thread creation failure.
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// Supervised dedicated writer-thread handle.
@@ -139,6 +269,7 @@ pub struct CaptureWriterHandle<B: CaptureAuthorityBundle> {
     shutdown_deadline: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
     receiver: Arc<std::sync::Mutex<mpsc::Receiver<CaptureMessage<B>>>>,
     state: Arc<CaptureState<B>>,
+    destination_fence: Option<Arc<CaptureDestinationLease>>,
     completed: bool,
 }
 
@@ -450,6 +581,13 @@ pub fn spawn_capture_writer<B: CaptureAuthorityBundle, S: CaptureSink>(
     sink: S,
     policy: CaptureWriterPolicy,
 ) -> Result<CaptureWriterHandle<B>, CaptureWriterSpawnError> {
+    let destination = sink.destination();
+    let (worker_destination_fence, owner_destination_fence) =
+        acquire_destination_fence(&destination).ok_or_else(|| {
+            CaptureWriterSpawnError::DestinationBusy {
+                destination: destination.clone(),
+            }
+        })?;
     let state = Arc::clone(&writer.state);
     let receiver = Arc::clone(&writer.receiver);
     writer
@@ -461,7 +599,7 @@ pub fn spawn_capture_writer<B: CaptureAuthorityBundle, S: CaptureSink>(
             Ordering::AcqRel,
             Ordering::Acquire,
         )
-        .map_err(|_previous| CaptureWriterSpawnError {
+        .map_err(|_previous| CaptureWriterSpawnError::Thread {
             source: std::io::Error::other("capture writer lifecycle is not startable"),
         })?;
     let shutdown_requested = Arc::new(AtomicBool::new(false));
@@ -471,20 +609,21 @@ pub fn spawn_capture_writer<B: CaptureAuthorityBundle, S: CaptureSink>(
     let wake_sender = writer
         .sender
         .take()
-        .ok_or_else(|| CaptureWriterSpawnError {
+        .ok_or_else(|| CaptureWriterSpawnError::Thread {
             source: std::io::Error::other("capture writer control sender is unavailable"),
         })?;
     let (completion_sender, completion) = tokio::sync::oneshot::channel();
     let thread = std::thread::Builder::new()
         .name("market-squawk-capture".to_owned())
         .spawn(move || {
+            let _worker_destination_fence = worker_destination_fence;
             let outcome =
                 run_capture_writer(writer, sink, policy, &thread_shutdown, &thread_deadline);
             let _completion_result = completion_sender.send(outcome);
         })
         .map_err(|source| {
             state.mark_writer_failed();
-            CaptureWriterSpawnError { source }
+            CaptureWriterSpawnError::Thread { source }
         })?;
     Ok(CaptureWriterHandle {
         thread: Some(thread),
@@ -494,6 +633,7 @@ pub fn spawn_capture_writer<B: CaptureAuthorityBundle, S: CaptureSink>(
         shutdown_deadline,
         receiver,
         state,
+        destination_fence: Some(owner_destination_fence),
         completed: false,
     })
 }
@@ -507,9 +647,12 @@ impl<B: CaptureAuthorityBundle> CaptureWriterHandle<B> {
     }
 
     fn join_finished_thread(&mut self) -> bool {
-        self.thread
+        let joined = self
+            .thread
             .take()
-            .is_none_or(|thread| thread.join().is_ok())
+            .is_none_or(|thread| thread.join().is_ok());
+        self.destination_fence.take();
+        joined
     }
 
     /// Waits for natural writer completion and joins the dedicated thread.
