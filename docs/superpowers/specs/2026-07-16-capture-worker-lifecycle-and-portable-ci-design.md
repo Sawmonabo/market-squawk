@@ -34,9 +34,11 @@ that owns the thread join handle, completion channel, and deadline snapshot. The
 queried, nonblockingly polled, or asynchronously reaped. Its `Drop` joins synchronously as fail-closed
 misuse behavior; it never spawns a hidden background reaper and never silently detaches the worker.
 
-The worker holds an exact destination lease until it has terminated. The pending owner holds the
-join responsibility until reap completes. A successor targeting the same destination cannot start
-while either condition remains outstanding.
+The worker and lifecycle owner each hold one strong side of an exact, process-wide, weak-registry
+destination lease. The worker side remains held until thread exit. The owner side remains held until
+`JoinHandle::join` has completed and the final termination report has been persisted. A successor
+targeting the same destination cannot start while either side remains outstanding, including the
+observable interval where `JoinHandle::is_finished()` is true but no owner has reaped it.
 
 ### Rejected: subprocess writer isolation
 
@@ -59,12 +61,20 @@ The public state model separates three facts that were previously conflated:
 3. **Storage result:** the worker's eventual final outcome includes all records whose append returned
    successfully, including records completed after authority revocation.
 
-`CaptureWriterHandle::shutdown(self, deadline)` consumes the only ordinary handle and returns one of:
+`CaptureWriterHandle::shutdown(self, deadline)` is synchronous: it consumes the only ordinary
+handle, revokes authority, requests bounded cooperative shutdown, and returns a
+`PendingCaptureWriter<B>` lifecycle owner. That owner exposes an async, borrowing
+`wait_until_deadline(&mut self)` operation which reports one of:
 
-- `CaptureShutdown::Terminated(CaptureWorkerTermination)`, which proves the thread was joined and
-  contains the final `CaptureWriterOutcome`; or
-- `CaptureShutdown::Pending(PendingCaptureWriter<B>)`, which proves authority was revoked but does
-  not claim worker termination.
+- `CaptureShutdownStatus::WorkerTerminated`, which means `is_finished()` is true but deliberately
+  does not yet claim join; or
+- `CaptureShutdownStatus::DeadlineElapsed`, which proves authority was revoked but does not claim
+  worker termination.
+
+After `WorkerTerminated`, `try_reap(&mut self)` performs `JoinHandle::join`, persists and returns
+`CaptureWorkerTermination`, and releases the owner half of the destination fence. `try_reap` refuses
+to join while `is_finished()` is false. This makes every join executed from the async application
+path nonblocking by construction.
 
 `CaptureWorkerTermination` records:
 
@@ -73,9 +83,9 @@ The public state model separates three facts that were previously conflated:
 - the final record count after join; and
 - the checked difference as late completed writes.
 
-Normal completion and `wait` also return joined termination evidence. Thread panic, a closed
-completion channel, or a failed join produces a fail-closed incomplete outcome and never a clean
-termination claim.
+Natural worker completion is observed through the same lifecycle owner and `try_reap` path. Thread
+panic, missing final outcome, or a failed join produces a fail-closed incomplete outcome and never a
+clean termination claim.
 
 ## Pending ownership and reap
 
@@ -83,9 +93,17 @@ termination claim.
 
 - the deadline-time authority-revocation snapshot;
 - `is_worker_terminated`, using `JoinHandle::is_finished` only as a query;
-- `try_reap`, which joins only after the worker is known to be finished; and
-- `reap(self)`, which waits for completion outside the Tokio executor's blocking worker path and
-  returns the persisted final termination report.
+- `wait_until_deadline(&mut self)`, which only awaits notifications/timers and never joins;
+- `wait_until_terminated(&mut self)`, which only awaits a worker-finished notification and never
+  joins; and
+- `try_reap(&mut self)`, which joins only after the worker is known to be finished and persists the
+  final termination report.
+
+The async wait methods borrow rather than consume the lifecycle owner. Cancelling or dropping one of
+their futures therefore leaves the queryable, joinable owner in the calling composition. No
+`spawn_blocking`, detached join wrapper, background reaper task, or spawn-and-forget future is used.
+The synchronous `try_reap` first observes `is_finished()` and returns `WorkerStillRunning` rather
+than calling `join` when termination has not been proven.
 
 Dropping a pending owner synchronously joins. This can block indefinitely if a custom or OS sink
 never returns, and that is intentional fail-closed misuse behavior: ownership may not disappear.
@@ -103,10 +121,13 @@ Every `CaptureSink` publishes a stable `CaptureDestination` identity before its 
 test and alternative sinks use an explicit bounded destination label. The digest prevents path or
 label content from appearing in public debug output.
 
-A process-local registry atomically acquires one lease per destination during
-`spawn_capture_writer`. The lease moves into the writer thread and is released only when that thread
-exits. A spawn attempt for an already leased destination returns a typed `DestinationBusy` error.
-The existing per-allocation lifecycle atomic independently prevents a second writer for the same
+A process-local registry atomically acquires one weak/reclaimable entry per destination during
+`spawn_capture_writer`. Two strong guards are created: one moves into the writer thread and one into
+the `CaptureWriterHandle`, then into `PendingCaptureWriter` at shutdown. The worker guard is released
+only on thread exit. The owner guard is released only after the thread was joined and its final
+outcome persisted. The registry removes dead weak entries opportunistically. A spawn attempt for an
+already upgraded destination entry returns a typed `DestinationBusy` error. The existing
+per-allocation lifecycle atomic independently prevents a second writer for the same
 `RawCaptureWriter` allocation. Journal file locking remains an additional OS-level fence and is
 tested through late completion and reap.
 
@@ -130,7 +151,8 @@ execution authority is restored by that accounting.
 
 - Shutdown first stops publication and degrades the exact current generation.
 - Queue draining releases every queued byte reservation even if the worker owns one in-flight frame.
-- A deadline returns `Pending`, not an ordinary incomplete outcome, while the thread remains alive.
+- A deadline wait returns `DeadlineElapsed`, not an ordinary incomplete outcome, while the thread
+  remains alive.
 - A blocked append or flush that later fails remains incomplete and is persisted in the reap report.
 - A blocked append that later succeeds is counted as a late completed write before the final
   deadline outcome is reported.
@@ -138,33 +160,38 @@ execution authority is restored by that accounting.
   synchronously joins. It does not detach.
 - `PendingCaptureWriter::Drop` synchronously joins. Production composition avoids this blocking path
   by retaining and explicitly reaping the owner.
-- The destination lease and journal lock remain held until worker exit, including after a deadline.
+- The worker-side destination lease and journal lock remain held until worker exit. The owner-side
+  destination lease remains held through successful join and final-report persistence.
 
 ## Regression strategy
 
 The TDD sequence begins with failing integration tests for:
 
-1. a blocked append returning `Pending` by the deadline while authority is revoked and Tokio remains
-   responsive;
-2. a blocked flush returning `Pending` under the same conditions;
+1. a blocked append yielding `DeadlineElapsed` by the deadline while its pending owner remains
+   retained, authority is revoked, and Tokio remains responsive;
+2. a blocked flush yielding `DeadlineElapsed` under the same conditions;
 3. a same-destination successor being rejected before release/reap;
 4. gated append completion being included in late-write accounting after reap;
 5. gated flush completion producing a joined final outcome without inventing a late append;
-6. queue-byte reservations being released at deadline;
-7. a journal destination/file lock remaining unavailable until the old worker is reaped, then being
+6. a successor remaining rejected after `is_finished()` becomes true but before `try_reap` joins the
+   worker and releases the owner fence;
+7. queue-byte reservations being released at deadline;
+8. a journal destination/file lock remaining unavailable until the old worker is reaped, then being
    reusable; and
-8. drop behavior joining rather than silently detaching.
+9. drop behavior joining rather than silently detaching.
 
 Existing capture authority, writer failure, rotation, source-supervisor, and journal compatibility
 tests remain green. No test uses `unwrap`, `expect`, or intentional panic paths.
 
 ## Portable CI
 
-The Linux job keeps `./scripts/verify.sh` and is pinned to the repository's chosen Ubuntu image.
-Separate macOS and Windows jobs perform locked all-feature workspace builds and explicit locked
-platform tests for path confinement, journal compatibility, capture lifecycle, and the capture
-authority bridge. Runner labels are selected only after checking current official GitHub-hosted
-runner documentation.
+The Linux job keeps `./scripts/verify.sh` on the GA `ubuntu-24.04` image. Separate
+`macos-15-intel` and `windows-2025` jobs perform locked all-feature workspace builds and explicit
+locked platform tests for path confinement, journal compatibility, capture lifecycle, and the
+capture authority bridge. These explicit labels were checked on 2026-07-16 against GitHub's
+[hosted-runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)
+and the official [runner-images repository](https://github.com/actions/runner-images). The preview
+`ubuntu-26.04` image and mutable `*-latest` aliases are deliberately excluded.
 
 Every third-party action reference is a full 40-hex commit SHA. Every checkout step declares
 `persist-credentials: false`. A standard-library Python policy test parses the workflow text and
