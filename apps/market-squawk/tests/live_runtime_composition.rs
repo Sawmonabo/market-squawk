@@ -61,7 +61,7 @@ fn runtime_config() -> TestResult<LiveRuntimeConfig> {
         registration_control_capacity: 8,
         registration_deadline: Duration::from_secs(1),
         health_event_capacity: 16,
-        snapshot_event_budget: 32,
+        snapshot_event_trigger: 32,
         snapshot_interval: Duration::from_secs(1),
         snapshot_limits: SnapshotLimits::try_new(4, 4, 4, 32, 256 * 1024)?,
         maximum_retained_snapshot_readers: 4,

@@ -75,7 +75,7 @@ fn runtime_input() -> TestResult<LiveRuntimeConfigInput> {
         registration_control_capacity: 8,
         registration_deadline: Duration::from_secs(1),
         health_event_capacity: 64,
-        snapshot_event_budget: 128,
+        snapshot_event_trigger: 128,
         snapshot_interval: Duration::from_millis(100),
         snapshot_limits: SnapshotLimits::try_new(8, 8, 8, 100, 1_048_576)?,
         maximum_retained_snapshot_readers: 4,
@@ -97,7 +97,7 @@ fn memory_input(maximum_runtime_bytes: u64) -> TestResult<LiveRuntimeConfigInput
         registration_control_capacity: 2,
         registration_deadline: Duration::from_secs(1),
         health_event_capacity: 4,
-        snapshot_event_budget: 8,
+        snapshot_event_trigger: 8,
         snapshot_interval: Duration::from_millis(10),
         snapshot_limits: SnapshotLimits::try_new(1, 2, 2, 4, 4_096)?,
         maximum_retained_snapshot_readers: 2,
@@ -291,7 +291,7 @@ fn runtime_config_rejects_every_zero_capacity_and_duration() -> TestResult {
     zero_capacity!(maximum_streams_per_route);
     zero_capacity!(registration_control_capacity);
     zero_capacity!(health_event_capacity);
-    zero_capacity!(snapshot_event_budget);
+    zero_capacity!(snapshot_event_trigger);
     zero_capacity!(maximum_retained_snapshot_readers);
     zero_capacity!(maximum_runtime_bytes);
 
@@ -339,7 +339,7 @@ fn runtime_config_enforces_exact_public_hard_limits() -> TestResult {
     hard_limit!(maximum_streams_per_route, 64);
     hard_limit!(registration_control_capacity, 65_536);
     hard_limit!(health_event_capacity, 65_536);
-    hard_limit!(snapshot_event_budget, 1_000_000);
+    hard_limit!(snapshot_event_trigger, 1_000_000);
 
     let mut exact_shards = runtime_input()?;
     exact_shards.shard_count = 64;

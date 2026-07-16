@@ -45,7 +45,7 @@ pub(super) fn config(
         registration_control_capacity: 2,
         registration_deadline: Duration::from_secs(1),
         health_event_capacity: 16,
-        snapshot_event_budget: 4,
+        snapshot_event_trigger: 4,
         snapshot_interval: Duration::from_secs(60),
         snapshot_limits: SnapshotLimits::try_new(4, 4, 4, 4, 16 * 1024)?,
         maximum_retained_snapshot_readers: maximum_readers,

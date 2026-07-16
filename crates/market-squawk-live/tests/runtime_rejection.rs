@@ -19,7 +19,10 @@ use current_source::{
     INSTRUMENT_ONE, INSTRUMENT_TWO, SourceHarness, TestResult, route, route_config, runtime_config,
 };
 
-fn rejection_runtime_config(maximum_streams_per_route: usize) -> TestResult<LiveRuntimeConfig> {
+fn rejection_runtime_config(
+    maximum_streams_per_route: usize,
+    snapshot_event_trigger: usize,
+) -> TestResult<LiveRuntimeConfig> {
     let base = runtime_config(8, 8 * 1024 * 1024, 4 * 1024 * 1024)?;
     Ok(LiveRuntimeConfig::try_new(LiveRuntimeConfigInput {
         routing_version: base.routing_version(),
@@ -33,7 +36,7 @@ fn rejection_runtime_config(maximum_streams_per_route: usize) -> TestResult<Live
         registration_control_capacity: base.registration_control_capacity().get(),
         registration_deadline: base.registration_deadline(),
         health_event_capacity: base.health_event_capacity().get(),
-        snapshot_event_budget: 1,
+        snapshot_event_trigger,
         snapshot_interval: Duration::from_secs(60),
         snapshot_limits: base.snapshot_limits(),
         maximum_retained_snapshot_readers: base.maximum_retained_snapshot_readers().get(),
@@ -61,7 +64,7 @@ async fn bind(
 async fn rejected_first_observation_is_quarantined_without_killing_other_routes_or_shutdown()
 -> TestResult {
     let mut runtime = LiveRuntime::start(
-        rejection_runtime_config(4)?,
+        rejection_runtime_config(4, 1)?,
         vec![route_config(INSTRUMENT_ONE)?, route_config(INSTRUMENT_TWO)?],
     )
     .await?;
@@ -124,5 +127,44 @@ async fn rejected_first_observation_is_quarantined_without_killing_other_routes_
             .iter()
             .all(|outcome| outcome.status() == ShardShutdownStatus::Complete)
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn snapshot_event_trigger_skips_intermediate_prefix_of_successful_batch() -> TestResult {
+    let runtime = LiveRuntime::start(
+        rejection_runtime_config(4, 2)?,
+        vec![route_config(INSTRUMENT_ONE)?],
+    )
+    .await?;
+    let mut source = SourceHarness::try_new("batched-source", 1, INSTRUMENT_ONE)?;
+    let ingress = bind(&runtime, &source, INSTRUMENT_ONE).await?;
+    let (_, batch) = source.batch_many(&[
+        ("trade-1", 1, "100.00"),
+        ("trade-2", 2, "100.01"),
+        ("trade-3", 3, "100.02"),
+    ])?;
+    ingress.try_publish(batch)?;
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let snapshots = runtime.snapshots().try_load_all()?;
+            let published = snapshots
+                .snapshots()
+                .flat_map(|snapshot| snapshot.routes())
+                .flat_map(|route| route.streams())
+                .find(|stream| stream.source().as_str() == "batched-source");
+            if let Some(stream) = published
+                && stream.last_sequence() == Some(market_squawk_domain::SequenceNumber::new(3))
+            {
+                return Ok::<_, Box<dyn std::error::Error>>(());
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await??;
+
+    let shutdown = runtime.shutdown().await;
+    assert!(shutdown.is_complete(), "shutdown outcomes: {shutdown:?}");
     Ok(())
 }

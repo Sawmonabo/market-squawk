@@ -44,7 +44,7 @@ pub(crate) struct ShardActorInput {
     pub(crate) registrations: mpsc::Receiver<RegistrationCommand>,
     pub(crate) snapshot_limits: SnapshotLimits,
     pub(crate) snapshot_interval: std::time::Duration,
-    pub(crate) snapshot_event_budget: usize,
+    pub(crate) snapshot_event_trigger: usize,
     pub(crate) publisher: SnapshotPublisher,
     pub(crate) cancellation: CancellationToken,
     pub(crate) health: mpsc::Sender<LiveRuntimeHealthEvent>,
@@ -143,7 +143,7 @@ struct ShardActor {
     registrations: mpsc::Receiver<RegistrationCommand>,
     snapshot_limits: SnapshotLimits,
     snapshot_interval: std::time::Duration,
-    snapshot_event_budget: usize,
+    snapshot_event_trigger: usize,
     publisher: SnapshotPublisher,
     cancellation: CancellationToken,
     health: mpsc::Sender<LiveRuntimeHealthEvent>,
@@ -151,6 +151,8 @@ struct ShardActor {
     health_revision: u64,
     events_since_snapshot: usize,
     dirty: bool,
+    fair_turn: FairTurn,
+    snapshot_pending: bool,
     terminal_health_emitted: bool,
     observed_notification_drops: u64,
     startup_release: oneshot::Receiver<()>,
@@ -168,12 +170,114 @@ impl Drop for ShardActor {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FairTurn {
+    Registration,
+    Market,
+    Snapshot,
+}
+
+impl FairTurn {
+    const fn next(self) -> Self {
+        match self {
+            Self::Registration => Self::Market,
+            Self::Market => Self::Snapshot,
+            Self::Snapshot => Self::Registration,
+        }
+    }
+}
+
 #[derive(Debug)]
-enum ActorLoopEvent {
+enum FairEvent<R, M> {
     Cancelled,
-    Registration(Option<RegistrationCommand>),
-    Market(Option<ShardCommand>),
-    SnapshotTick,
+    Registration(Option<R>),
+    Market(Option<M>),
+    SnapshotDue,
+    SnapshotPublish,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SnapshotSchedule {
+    Due,
+    Publish,
+}
+
+struct FairSources<'a, R, M> {
+    cancellation: &'a CancellationToken,
+    registrations: &'a mut mpsc::Receiver<R>,
+    mailbox: &'a mut mpsc::Receiver<M>,
+    registrations_open: bool,
+    mailbox_open: bool,
+    interval: &'a mut tokio::time::Interval,
+}
+
+async fn select_fair_event<R, M>(
+    turn: FairTurn,
+    snapshot_pending: bool,
+    sources: FairSources<'_, R, M>,
+) -> FairEvent<R, M> {
+    async fn snapshot_event(
+        snapshot_pending: bool,
+        interval: &mut tokio::time::Interval,
+    ) -> SnapshotSchedule {
+        if snapshot_pending {
+            SnapshotSchedule::Publish
+        } else {
+            interval.tick().await;
+            SnapshotSchedule::Due
+        }
+    }
+
+    match turn {
+        FairTurn::Registration => {
+            tokio::select! {
+                biased;
+                () = sources.cancellation.cancelled() => FairEvent::Cancelled,
+                command = sources.registrations.recv(), if sources.registrations_open => {
+                    FairEvent::Registration(command)
+                }
+                command = sources.mailbox.recv(), if sources.mailbox_open => {
+                    FairEvent::Market(command)
+                },
+                event = snapshot_event(snapshot_pending, sources.interval) => match event {
+                    SnapshotSchedule::Due => FairEvent::SnapshotDue,
+                    SnapshotSchedule::Publish => FairEvent::SnapshotPublish,
+                },
+            }
+        }
+        FairTurn::Market => {
+            tokio::select! {
+                biased;
+                () = sources.cancellation.cancelled() => FairEvent::Cancelled,
+                command = sources.mailbox.recv(), if sources.mailbox_open => {
+                    FairEvent::Market(command)
+                },
+                event = snapshot_event(snapshot_pending, sources.interval) => match event {
+                    SnapshotSchedule::Due => FairEvent::SnapshotDue,
+                    SnapshotSchedule::Publish => FairEvent::SnapshotPublish,
+                },
+                command = sources.registrations.recv(), if sources.registrations_open => {
+                    FairEvent::Registration(command)
+                }
+            }
+        }
+        FairTurn::Snapshot => {
+            tokio::select! {
+                biased;
+                () = sources.cancellation.cancelled() => FairEvent::Cancelled,
+                event = snapshot_event(snapshot_pending, sources.interval) => match event {
+                    SnapshotSchedule::Due => FairEvent::SnapshotDue,
+                    SnapshotSchedule::Publish => FairEvent::SnapshotPublish,
+                },
+                command = sources.registrations.recv(), if sources.registrations_open => {
+                    FairEvent::Registration(command)
+                }
+                command = sources.mailbox.recv(), if sources.mailbox_open => {
+                    FairEvent::Market(command)
+                },
+            }
+        }
+    }
 }
 
 impl ShardActor {
@@ -224,7 +328,7 @@ impl ShardActor {
             registrations: input.registrations,
             snapshot_limits: input.snapshot_limits,
             snapshot_interval: input.snapshot_interval,
-            snapshot_event_budget: input.snapshot_event_budget,
+            snapshot_event_trigger: input.snapshot_event_trigger,
             publisher: input.publisher,
             cancellation: input.cancellation,
             health: input.health,
@@ -232,6 +336,8 @@ impl ShardActor {
             health_revision: 0,
             events_since_snapshot: 0,
             dirty: true,
+            fair_turn: FairTurn::Registration,
+            snapshot_pending: false,
             terminal_health_emitted: false,
             observed_notification_drops: 0,
             startup_release: input.startup_release,
@@ -250,36 +356,43 @@ impl ShardActor {
         interval.tick().await;
         let mut mailbox_open = true;
         let mut registrations_open = true;
-        let mut prefer_registration = true;
         loop {
             if !mailbox_open && !registrations_open {
                 break;
             }
-            match self
-                .next_event(
-                    prefer_registration,
+            let event = select_fair_event(
+                self.fair_turn,
+                self.snapshot_pending,
+                FairSources {
+                    cancellation: &self.cancellation,
+                    registrations: &mut self.registrations,
+                    mailbox: &mut self.mailbox,
                     registrations_open,
                     mailbox_open,
-                    &mut interval,
-                )
-                .await
-            {
-                ActorLoopEvent::Cancelled => break,
-                ActorLoopEvent::Registration(command) => match command {
+                    interval: &mut interval,
+                },
+            )
+            .await;
+            if !matches!(event, FairEvent::Cancelled) {
+                self.fair_turn = self.fair_turn.next();
+            }
+            match event {
+                FairEvent::Cancelled => break,
+                FairEvent::Registration(command) => match command {
                     Some(command) => {
                         self.register(command);
-                        prefer_registration = false;
                     }
                     None => registrations_open = false,
                 },
-                ActorLoopEvent::Market(command) => match command {
+                FairEvent::Market(command) => match command {
                     Some(command) => {
                         self.process(command)?;
-                        prefer_registration = true;
                     }
                     None => mailbox_open = false,
                 },
-                ActorLoopEvent::SnapshotTick => {
+                FairEvent::SnapshotDue => self.snapshot_pending = true,
+                FairEvent::SnapshotPublish => {
+                    self.snapshot_pending = false;
                     if self.dirty {
                         self.publish_snapshot(ShardLifecycleSnapshot::Ready)?;
                     }
@@ -299,36 +412,6 @@ impl ShardActor {
         self.publish_snapshot(ShardLifecycleSnapshot::Stopped)?;
         self.emit_terminal_health();
         Ok(())
-    }
-
-    async fn next_event(
-        &mut self,
-        prefer_registration: bool,
-        registrations_open: bool,
-        mailbox_open: bool,
-        interval: &mut tokio::time::Interval,
-    ) -> ActorLoopEvent {
-        if prefer_registration {
-            tokio::select! {
-                biased;
-                () = self.cancellation.cancelled() => ActorLoopEvent::Cancelled,
-                _ = interval.tick() => ActorLoopEvent::SnapshotTick,
-                command = self.registrations.recv(), if registrations_open => {
-                    ActorLoopEvent::Registration(command)
-                }
-                command = self.mailbox.recv(), if mailbox_open => ActorLoopEvent::Market(command),
-            }
-        } else {
-            tokio::select! {
-                biased;
-                () = self.cancellation.cancelled() => ActorLoopEvent::Cancelled,
-                _ = interval.tick() => ActorLoopEvent::SnapshotTick,
-                command = self.mailbox.recv(), if mailbox_open => ActorLoopEvent::Market(command),
-                command = self.registrations.recv(), if registrations_open => {
-                    ActorLoopEvent::Registration(command)
-                }
-            }
-        }
     }
 
     fn prepare_ready(&mut self) -> Result<(), ActorError> {
@@ -428,7 +511,7 @@ impl ShardActor {
                 }
                 self.events_since_snapshot = self.events_since_snapshot.saturating_add(1);
                 self.dirty = true;
-                publish_after_batch |= self.events_since_snapshot >= self.snapshot_event_budget;
+                publish_after_batch |= self.events_since_snapshot >= self.snapshot_event_trigger;
             }
         }
         if publish_after_batch {
@@ -602,5 +685,85 @@ impl ActorError {
             ),
             Self::GenerationNotCurrent => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod fairness_tests {
+    use super::{FairEvent, FairSources, FairTurn, select_fair_event};
+    use tokio::sync::mpsc;
+    use tokio::time::{Duration, advance};
+    use tokio_util::sync::CancellationToken;
+
+    #[tokio::test(start_paused = true)]
+    async fn perpetually_ready_snapshot_work_services_both_queues_within_one_rotation() {
+        let (registrations, mut registration_rx) = mpsc::channel(1);
+        let (market, mut market_rx) = mpsc::channel(1);
+        assert!(registrations.send(11_u8).await.is_ok());
+        assert!(market.send(22_u8).await.is_ok());
+        let cancellation = CancellationToken::new();
+        let mut interval = tokio::time::interval(Duration::from_millis(1));
+        interval.tick().await;
+        advance(Duration::from_secs(1)).await;
+
+        let mut turn = FairTurn::Snapshot;
+        let mut saw_registration = false;
+        let mut saw_market = false;
+        let mut unexpected = None;
+        for _ in 0..3 {
+            let event = select_fair_event(
+                turn,
+                true,
+                FairSources {
+                    cancellation: &cancellation,
+                    registrations: &mut registration_rx,
+                    mailbox: &mut market_rx,
+                    registrations_open: true,
+                    mailbox_open: true,
+                    interval: &mut interval,
+                },
+            )
+            .await;
+            turn = turn.next();
+            match event {
+                FairEvent::SnapshotPublish => {}
+                FairEvent::Registration(Some(11)) => saw_registration = true,
+                FairEvent::Market(Some(22)) => saw_market = true,
+                other => unexpected = Some(format!("{other:?}")),
+            }
+        }
+        assert!(unexpected.is_none(), "unexpected event: {unexpected:?}");
+        assert!(saw_registration);
+        assert!(saw_market);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_wins_when_snapshot_and_both_queues_are_ready() {
+        let (registrations, mut registration_rx) = mpsc::channel(1);
+        let (market, mut market_rx) = mpsc::channel(1);
+        assert!(registrations.send(1_u8).await.is_ok());
+        assert!(market.send(2_u8).await.is_ok());
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let mut interval = tokio::time::interval(Duration::from_millis(1));
+        interval.tick().await;
+        advance(Duration::from_secs(1)).await;
+
+        assert!(matches!(
+            select_fair_event(
+                FairTurn::Snapshot,
+                true,
+                FairSources {
+                    cancellation: &cancellation,
+                    registrations: &mut registration_rx,
+                    mailbox: &mut market_rx,
+                    registrations_open: true,
+                    mailbox_open: true,
+                    interval: &mut interval,
+                },
+            )
+            .await,
+            FairEvent::Cancelled
+        ));
     }
 }

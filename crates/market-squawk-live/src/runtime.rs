@@ -21,7 +21,7 @@ pub use admission::{
 };
 pub use config::{
     LiveRouteConfig, LiveRouteConfigInput, LiveRuntimeConfig, LiveRuntimeConfigError,
-    LiveRuntimeConfigInput,
+    LiveRuntimeConfigInput, MAX_SNAPSHOT_EVENT_TRIGGER_OVERSHOOT,
 };
 pub use lifecycle::{
     LiveRuntime, LiveRuntimeReplaceError, LiveRuntimeShutdown, LiveRuntimeStartError,

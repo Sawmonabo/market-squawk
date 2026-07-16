@@ -5,6 +5,7 @@ use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::time::Duration;
 
 use market_squawk_domain::InstrumentDefinition;
+use market_squawk_sources::MAX_DECODED_EVENTS;
 use thiserror::Error;
 
 use crate::processor::MAX_STREAMS_PER_INSTRUMENT;
@@ -19,8 +20,16 @@ const MAX_ROUTES_PER_SHARD: usize = 64;
 const MAX_SOURCES_PER_ROUTE: usize = 64;
 const MAX_CONTROL_COMMANDS_PER_SHARD: usize = 65_536;
 const MAX_HEALTH_EVENTS: usize = 65_536;
-const MAX_SNAPSHOT_EVENT_BUDGET: usize = 1_000_000;
+const MAX_SNAPSHOT_EVENT_TRIGGER: usize = 1_000_000;
 const MAX_NONCE_CAPACITY: usize = 1_000_000;
+
+/// Maximum observations by which successful-batch-end publication can pass its trigger.
+///
+/// A decoded provider batch contains at most [`MAX_DECODED_EVENTS`] observations. Because the
+/// scheduler does not publish an intermediate prefix of a successfully applied batch, a trigger
+/// reached by the first observation in a maximum-size batch can be exceeded by every remaining
+/// observation.
+pub const MAX_SNAPSHOT_EVENT_TRIGGER_OVERSHOOT: usize = MAX_DECODED_EVENTS - 1;
 
 /// Primitive configuration input checked into [`LiveRuntimeConfig`].
 #[derive(Clone, Debug)]
@@ -37,7 +46,13 @@ pub struct LiveRuntimeConfigInput {
     pub registration_control_capacity: usize,
     pub registration_deadline: Duration,
     pub health_event_capacity: usize,
-    pub snapshot_event_budget: usize,
+    /// Accepted-observation count that triggers publication at successful current-batch end.
+    ///
+    /// This is a batch-end trigger, not an exact per-observation cadence. Publication occurs once
+    /// the cumulative count reaches or exceeds this value and the current provider batch finishes
+    /// successfully. The scheduler does not expose an intermediate prefix of that successful
+    /// batch. The maximum overshoot is [`MAX_SNAPSHOT_EVENT_TRIGGER_OVERSHOOT`].
+    pub snapshot_event_trigger: usize,
     pub snapshot_interval: Duration,
     pub snapshot_limits: SnapshotLimits,
     pub maximum_retained_snapshot_readers: u32,
@@ -60,7 +75,7 @@ pub struct LiveRuntimeConfig {
     registration_control_capacity: NonZeroUsize,
     registration_deadline: Duration,
     health_event_capacity: NonZeroUsize,
-    snapshot_event_budget: NonZeroUsize,
+    snapshot_event_trigger: NonZeroUsize,
     snapshot_interval: Duration,
     snapshot_limits: SnapshotLimits,
     maximum_retained_snapshot_readers: NonZeroU32,
@@ -145,10 +160,10 @@ impl LiveRuntimeConfig {
                 input.health_event_capacity,
                 MAX_HEALTH_EVENTS,
             )?,
-            snapshot_event_budget: checked_usize(
-                "snapshot_event_budget",
-                input.snapshot_event_budget,
-                MAX_SNAPSHOT_EVENT_BUDGET,
+            snapshot_event_trigger: checked_usize(
+                "snapshot_event_trigger",
+                input.snapshot_event_trigger,
+                MAX_SNAPSHOT_EVENT_TRIGGER,
             )?,
             snapshot_interval: checked_duration("snapshot_interval", input.snapshot_interval)?,
             snapshot_limits: input.snapshot_limits,
@@ -241,8 +256,14 @@ impl LiveRuntimeConfig {
     pub const fn health_event_capacity(&self) -> NonZeroUsize {
         self.health_event_capacity
     }
-    pub const fn snapshot_event_budget(&self) -> NonZeroUsize {
-        self.snapshot_event_budget
+    /// Returns the accepted-observation trigger for batch-end snapshot publication.
+    ///
+    /// The scheduler does not publish an intermediate prefix of a successfully applied provider
+    /// batch. Publication therefore occurs at successful batch end after that batch reaches or
+    /// crosses this trigger, with at most [`MAX_SNAPSHOT_EVENT_TRIGGER_OVERSHOOT`] additional
+    /// observations.
+    pub const fn snapshot_event_trigger(&self) -> NonZeroUsize {
+        self.snapshot_event_trigger
     }
     pub const fn snapshot_interval(&self) -> Duration {
         self.snapshot_interval
@@ -457,7 +478,7 @@ mod tests {
             registration_control_capacity: 8,
             registration_deadline: Duration::from_secs(1),
             health_event_capacity: 64,
-            snapshot_event_budget: 128,
+            snapshot_event_trigger: 128,
             snapshot_interval: Duration::from_millis(100),
             snapshot_limits: SnapshotLimits::try_new(8, 8, 8, 100, 1_048_576)?,
             maximum_retained_snapshot_readers: 4,
@@ -473,6 +494,11 @@ mod tests {
         assert_eq!(config.mailbox_bytes_per_shard().get(), 1_048_576);
         assert_eq!(config.maximum_message_bytes().get(), 262_144);
         assert_eq!(config.maximum_streams_per_route().get(), 8);
+        assert_eq!(config.snapshot_event_trigger().get(), 128);
+        assert_eq!(
+            super::MAX_SNAPSHOT_EVENT_TRIGGER_OVERSHOOT,
+            market_squawk_sources::MAX_DECODED_EVENTS - 1
+        );
         assert_eq!(config.maximum_runtime_bytes().get(), 256 * 1024 * 1024);
         Ok(())
     }

@@ -178,7 +178,7 @@ impl LiveRuntime {
                 registrations,
                 snapshot_limits: config.snapshot_limits(),
                 snapshot_interval: config.snapshot_interval(),
-                snapshot_event_budget: config.snapshot_event_budget().get(),
+                snapshot_event_trigger: config.snapshot_event_trigger().get(),
                 publisher,
                 cancellation: cancellation.child_token(),
                 health: health_sender.clone(),

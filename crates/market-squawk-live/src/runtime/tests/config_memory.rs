@@ -71,7 +71,7 @@ fn input() -> TestResult<LiveRuntimeConfigInput> {
         registration_control_capacity: 2,
         registration_deadline: Duration::from_secs(1),
         health_event_capacity: 4,
-        snapshot_event_budget: 8,
+        snapshot_event_trigger: 8,
         snapshot_interval: Duration::from_millis(10),
         snapshot_limits: SnapshotLimits::try_new(8, 2, 2, 4, 4_096)?,
         maximum_retained_snapshot_readers: 2,

@@ -122,7 +122,7 @@ pub(super) fn runtime_config(
         registration_control_capacity: 4,
         registration_deadline: Duration::from_secs(2),
         health_event_capacity: 16,
-        snapshot_event_budget: 16,
+        snapshot_event_trigger: 16,
         snapshot_interval: Duration::from_millis(10),
         snapshot_limits: SnapshotLimits::try_new(4, 4, 4, 8, 1_048_576)?,
         maximum_retained_snapshot_readers: 4,
@@ -386,46 +386,58 @@ impl SourceHarness {
         sequence: u64,
         price: &str,
     ) -> TestResult<(CurrentSourceAuthorityLease, CurrentDecodedProviderBatch)> {
+        self.batch_many(&[(source_identifier, sequence, price)])
+    }
+
+    pub(super) fn batch_many(
+        &mut self,
+        observations: &[(&str, u64, &str)],
+    ) -> TestResult<(CurrentSourceAuthorityLease, CurrentDecodedProviderBatch)> {
+        let (frame_identifier, ..) = observations.first().ok_or("empty fixture batch")?;
         let frame_at = next_after(self.last_frame_at)?;
         self.last_frame_at = frame_at;
         let frame = self.frames.try_frame(
             frame_at,
             TransportFrameKind::Binary,
-            source_identifier.as_bytes().to_vec().into(),
+            frame_identifier.as_bytes().to_vec().into(),
         )?;
         self.capture_admission.preflight(&frame)?;
         let receipt = self.capture_admission.issue_after_enqueue(&frame)?;
         self.capture_admission.validate_active(&frame)?;
         let validated = self.session.validate_live_frame(&frame)?;
         let decoder = DecoderEvidence::from_validated_frame(&validated, rule("coinbase-decoder")?);
-        let observation = ProviderNormalizedObservation::try_new(
-            id(source_identifier)?,
-            VenueId::try_from(VENUE)?,
-            instrument(&self.instrument_id)?,
-            ProviderTimestampEvidence::Provided {
-                value: frame_at,
-                rule: rule("coinbase-timestamp")?,
-            },
-            ProviderSequenceEvidence::Provided {
-                value: SequenceNumber::new(sequence),
-                rule: rule("coinbase-sequence")?,
-            },
-            ProviderSnapshotEvidence::NotApplicable(rule("non-book-no-snapshot-v1")?),
-            ProviderChecksumEvidence::Unsupported {
-                rule: rule("coinbase-no-checksum")?,
-            },
-            ProviderObservationPayload::Trade {
-                trade_id: id(source_identifier)?,
-                price: ProviderPrice::new(ProviderDecimalLexeme::try_new(price)?),
-                quantity: ProviderQuantity::new(ProviderDecimalLexeme::try_new("1.00")?),
-                aggressor: ProviderAggressorEvidence::new(
-                    AggressorSide::Buy,
-                    Some(id("BUY")?),
-                    rule("coinbase-aggressor")?,
-                ),
-            },
-        )?;
-        let decoded = DecodedProviderBatch::try_new(decoder, vec![observation])?;
+        let mut decoded_observations = Vec::new();
+        decoded_observations.try_reserve_exact(observations.len())?;
+        for (source_identifier, sequence, price) in observations {
+            decoded_observations.push(ProviderNormalizedObservation::try_new(
+                id(source_identifier)?,
+                VenueId::try_from(VENUE)?,
+                instrument(&self.instrument_id)?,
+                ProviderTimestampEvidence::Provided {
+                    value: frame_at,
+                    rule: rule("coinbase-timestamp")?,
+                },
+                ProviderSequenceEvidence::Provided {
+                    value: SequenceNumber::new(*sequence),
+                    rule: rule("coinbase-sequence")?,
+                },
+                ProviderSnapshotEvidence::NotApplicable(rule("non-book-no-snapshot-v1")?),
+                ProviderChecksumEvidence::Unsupported {
+                    rule: rule("coinbase-no-checksum")?,
+                },
+                ProviderObservationPayload::Trade {
+                    trade_id: id(source_identifier)?,
+                    price: ProviderPrice::new(ProviderDecimalLexeme::try_new(price)?),
+                    quantity: ProviderQuantity::new(ProviderDecimalLexeme::try_new("1.00")?),
+                    aggressor: ProviderAggressorEvidence::new(
+                        AggressorSide::Buy,
+                        Some(id("BUY")?),
+                        rule("coinbase-aggressor")?,
+                    ),
+                },
+            )?);
+        }
+        let decoded = DecodedProviderBatch::try_new(decoder, decoded_observations)?;
         let evaluated_at = now()?;
         let current = self
             .registry

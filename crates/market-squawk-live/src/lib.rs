@@ -25,8 +25,9 @@ pub use runtime::{
     BoundShardIngress, LiveIngressBindError, LiveIngressError, LiveRouteConfig,
     LiveRouteConfigInput, LiveRuntime, LiveRuntimeConfig, LiveRuntimeConfigError,
     LiveRuntimeConfigInput, LiveRuntimeHealthEvent, LiveRuntimeHealthKind, LiveRuntimeIngress,
-    LiveRuntimeReplaceError, LiveRuntimeShutdown, LiveRuntimeStartError, RegistrationFailure,
-    ShardShutdownOutcome, ShardShutdownStatus,
+    LiveRuntimeReplaceError, LiveRuntimeShutdown, LiveRuntimeStartError,
+    MAX_SNAPSHOT_EVENT_TRIGGER_OVERSHOOT, RegistrationFailure, ShardShutdownOutcome,
+    ShardShutdownStatus,
 };
 pub use sharding::{
     ShardCount, ShardId, ShardKey, ShardRouter, ShardRoutingError, ShardRoutingVersion,

@@ -302,7 +302,7 @@ async fn actor_exit_invalidates_shared_runtime_before_completion_is_observed() -
         registrations: mpsc::channel(1).1,
         snapshot_limits: config.snapshot_limits(),
         snapshot_interval: config.snapshot_interval(),
-        snapshot_event_budget: config.snapshot_event_budget().get(),
+        snapshot_event_trigger: config.snapshot_event_trigger().get(),
         publisher,
         cancellation: CancellationToken::new(),
         health,

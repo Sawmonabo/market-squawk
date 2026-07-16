@@ -26,6 +26,7 @@ proptest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 static_assertions.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 trybuild.workspace = true
 
 [lints]
