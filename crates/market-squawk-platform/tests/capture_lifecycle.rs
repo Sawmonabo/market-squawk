@@ -78,6 +78,33 @@ async fn activation_before_writer_start_is_retryable_after_writer_start()
 }
 
 #[tokio::test]
+async fn worker_terminated_before_deadline_is_not_retroactively_timed_out_at_late_reap()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_publisher, _control, writer) = raw_capture_channel(
+        NonZeroUsize::MIN,
+        DiagnosticCaptureBundle::new(identity(1)?),
+    );
+    let handle = spawn_capture_writer(
+        writer,
+        MemoryCaptureSink::default(),
+        CaptureWriterPolicy::default(),
+    )?;
+    let mut pending = handle.shutdown(Duration::from_millis(100));
+    assert_eq!(
+        pending.wait_until_deadline().await,
+        CaptureShutdownStatus::WorkerTerminated
+    );
+    tokio::time::sleep(Duration::from_millis(110)).await;
+    let termination = pending
+        .try_reap()?
+        .ok_or("finished worker did not retain termination after delayed reap")?;
+
+    assert!(!termination.shutdown_deadline_elapsed());
+    assert!(!termination.outcome().is_incomplete());
+    Ok(())
+}
+
+#[tokio::test]
 async fn natural_writer_completion_degrades_every_previously_issued_receipt()
 -> Result<(), Box<dyn std::error::Error>> {
     let identity = identity(1)?;
@@ -405,9 +432,10 @@ async fn finished_unreaped_journal_destination_remains_fenced()
         Err(CaptureWriterSpawnError::DestinationBusy { .. })
     ));
 
-    pending
+    let first_termination = pending
         .try_reap()?
         .ok_or("finished journal worker did not retain termination")?;
+    assert!(!first_termination.outcome().is_incomplete());
     let successor_sink = paths.open_journal_writer("capture-lifecycle")?;
     let (_successor_publisher, _successor_control, successor_writer) = raw_capture_channel(
         NonZeroUsize::MIN,
@@ -418,7 +446,8 @@ async fn finished_unreaped_journal_destination_remains_fenced()
         successor_sink,
         CaptureWriterPolicy::default(),
     )?;
-    let _termination = shutdown_and_reap(successor, Duration::from_secs(1)).await?;
+    let successor_termination = shutdown_and_reap(successor, Duration::from_secs(1)).await?;
+    assert!(!successor_termination.outcome().is_incomplete());
     Ok(())
 }
 
@@ -427,6 +456,7 @@ struct DeadlineGatedAppendSink {
     destination: CaptureDestination,
     entered: Option<std::sync::mpsc::SyncSender<()>>,
     release: Option<std::sync::mpsc::Receiver<()>>,
+    fail_after_release: bool,
 }
 
 impl CaptureSink for DeadlineGatedAppendSink {
@@ -449,7 +479,13 @@ impl CaptureSink for DeadlineGatedAppendSink {
                 .recv()
                 .map_err(|_error| CaptureSinkError::storage(CaptureStorageErrorClass::Other))?;
         }
-        Ok(())
+        if self.fail_after_release {
+            Err(CaptureSinkError::storage(
+                CaptureStorageErrorClass::Unavailable,
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     fn flush(&mut self, _context: &CaptureIoContext) -> Result<(), CaptureSinkError> {
@@ -474,6 +510,7 @@ async fn blocked_append_returns_owned_pending_worker_and_persists_late_write()
             destination: destination.clone(),
             entered: Some(entered_sender),
             release: Some(release_receiver),
+            fail_after_release: false,
         },
         CaptureWriterPolicy::default(),
     )?;
@@ -518,6 +555,7 @@ async fn blocked_append_returns_owned_pending_worker_and_persists_late_write()
                 destination: destination.clone(),
                 entered: None,
                 release: None,
+                fail_after_release: false,
             },
             CaptureWriterPolicy::default(),
         ),
@@ -534,6 +572,7 @@ async fn blocked_append_returns_owned_pending_worker_and_persists_late_write()
             reason: CaptureHealthReason::ShutdownDeadline,
         }
     );
+    assert!(termination.shutdown_deadline_elapsed());
     assert_eq!(termination.records_written_at_revocation(), 0);
     assert_eq!(termination.final_records_written(), 1);
     assert_eq!(termination.late_records_written(), 1);
@@ -548,6 +587,7 @@ async fn blocked_append_returns_owned_pending_worker_and_persists_late_write()
             destination,
             entered: None,
             release: None,
+            fail_after_release: false,
         },
         CaptureWriterPolicy::default(),
     )?;
@@ -556,9 +596,60 @@ async fn blocked_append_returns_owned_pending_worker_and_persists_late_write()
         successor_pending.wait_until_deadline().await,
         CaptureShutdownStatus::WorkerTerminated
     );
-    successor_pending
+    let successor_termination = successor_pending
         .try_reap()?
         .ok_or("successor worker did not retain termination")?;
+    assert!(!successor_termination.outcome().is_incomplete());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blocked_append_error_preserves_deadline_and_storage_failure()
+-> Result<(), Box<dyn std::error::Error>> {
+    let exact_identity = identity(1)?;
+    let (publisher, mut control, writer) = raw_capture_channel(
+        NonZeroUsize::MIN,
+        DiagnosticCaptureBundle::new(exact_identity.clone()),
+    );
+    let (entered_sender, entered_receiver) = std::sync::mpsc::sync_channel(1);
+    let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(1);
+    let handle = spawn_capture_writer(
+        writer,
+        DeadlineGatedAppendSink {
+            destination: CaptureDestination::try_named("deadline-gated-append-error")?,
+            entered: Some(entered_sender),
+            release: Some(release_receiver),
+            fail_after_release: true,
+        },
+        CaptureWriterPolicy::default(),
+    )?;
+    control.activate_initial()?;
+    let receipt = publisher.try_publish(&frame(exact_identity, 1)?)?;
+    entered_receiver.recv_timeout(Duration::from_secs(1))?;
+
+    let mut pending = handle.shutdown(Duration::from_millis(10));
+    assert_eq!(
+        pending.wait_until_deadline().await,
+        CaptureShutdownStatus::DeadlineElapsed
+    );
+    release_sender.send(())?;
+    pending.wait_until_terminated().await;
+    let termination = pending
+        .try_reap()?
+        .ok_or("finished append-error worker did not retain termination")?;
+
+    assert_eq!(
+        termination.outcome(),
+        &CaptureWriterOutcome::Incomplete {
+            records_written: 0,
+            reason: CaptureHealthReason::WriterFailed,
+        }
+    );
+    assert!(termination.shutdown_deadline_elapsed());
+    assert_eq!(termination.records_written_at_revocation(), 0);
+    assert_eq!(termination.final_records_written(), 0);
+    assert_eq!(termination.late_records_written(), 0);
+    assert!(!receipt.generation_is_complete());
     Ok(())
 }
 
@@ -567,6 +658,7 @@ struct DeadlineGatedFlushSink {
     destination: CaptureDestination,
     entered: Option<std::sync::mpsc::SyncSender<()>>,
     release: Option<std::sync::mpsc::Receiver<()>>,
+    fail_after_release: bool,
 }
 
 impl CaptureSink for DeadlineGatedFlushSink {
@@ -593,7 +685,13 @@ impl CaptureSink for DeadlineGatedFlushSink {
                 .recv()
                 .map_err(|_error| CaptureSinkError::storage(CaptureStorageErrorClass::Other))?;
         }
-        Ok(())
+        if self.fail_after_release {
+            Err(CaptureSinkError::storage(
+                CaptureStorageErrorClass::Unavailable,
+            ))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -614,6 +712,7 @@ async fn blocked_flush_returns_owned_pending_worker_without_false_termination()
             destination: CaptureDestination::try_named("deadline-gated-flush")?,
             entered: Some(entered_sender),
             release: Some(release_receiver),
+            fail_after_release: false,
         },
         policy,
     )?;
@@ -646,8 +745,60 @@ async fn blocked_flush_returns_owned_pending_worker_without_false_termination()
             reason: CaptureHealthReason::ShutdownDeadline,
         }
     );
+    assert!(termination.shutdown_deadline_elapsed());
     assert_eq!(termination.records_written_at_revocation(), 1);
     assert_eq!(termination.final_records_written(), 1);
     assert_eq!(termination.late_records_written(), 0);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blocked_flush_error_preserves_deadline_and_storage_failure()
+-> Result<(), Box<dyn std::error::Error>> {
+    let exact_identity = identity(1)?;
+    let (publisher, mut control, writer) = raw_capture_channel(
+        NonZeroUsize::MIN,
+        DiagnosticCaptureBundle::new(exact_identity.clone()),
+    );
+    let (entered_sender, entered_receiver) = std::sync::mpsc::sync_channel(1);
+    let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(1);
+    let policy = CaptureWriterPolicy::try_new(NonZeroUsize::MIN, Duration::from_secs(1))?;
+    let handle = spawn_capture_writer(
+        writer,
+        DeadlineGatedFlushSink {
+            destination: CaptureDestination::try_named("deadline-gated-flush-error")?,
+            entered: Some(entered_sender),
+            release: Some(release_receiver),
+            fail_after_release: true,
+        },
+        policy,
+    )?;
+    control.activate_initial()?;
+    let receipt = publisher.try_publish(&frame(exact_identity, 1)?)?;
+    entered_receiver.recv_timeout(Duration::from_secs(1))?;
+
+    let mut pending = handle.shutdown(Duration::from_millis(10));
+    assert_eq!(
+        pending.wait_until_deadline().await,
+        CaptureShutdownStatus::DeadlineElapsed
+    );
+    release_sender.send(())?;
+    pending.wait_until_terminated().await;
+    let termination = pending
+        .try_reap()?
+        .ok_or("finished flush-error worker did not retain termination")?;
+
+    assert_eq!(
+        termination.outcome(),
+        &CaptureWriterOutcome::Incomplete {
+            records_written: 1,
+            reason: CaptureHealthReason::WriterFailed,
+        }
+    );
+    assert!(termination.shutdown_deadline_elapsed());
+    assert_eq!(termination.records_written_at_revocation(), 1);
+    assert_eq!(termination.final_records_written(), 1);
+    assert_eq!(termination.late_records_written(), 0);
+    assert!(!receipt.generation_is_complete());
     Ok(())
 }

@@ -418,7 +418,7 @@ pub enum CaptureWriterSpawnError {
 pub struct CaptureWriterHandle<B: CaptureAuthorityBundle> {
     thread: Option<std::thread::JoinHandle<()>>,
     completion: Arc<tokio::sync::Notify>,
-    final_outcome: Arc<std::sync::Mutex<Option<CaptureWriterOutcome>>>,
+    final_report: Arc<std::sync::Mutex<Option<CaptureWorkerFinalReport>>>,
     wake_sender: Option<mpsc::SyncSender<CaptureMessage<B>>>,
     io_context: CaptureIoContext,
     receiver: Arc<std::sync::Mutex<mpsc::Receiver<CaptureMessage<B>>>>,
@@ -440,6 +440,7 @@ pub enum CaptureShutdownStatus {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CaptureWorkerTermination {
     outcome: CaptureWriterOutcome,
+    shutdown_deadline_elapsed: bool,
     records_written_at_revocation: u64,
     final_records_written: u64,
     late_records_written: u64,
@@ -449,6 +450,14 @@ impl CaptureWorkerTermination {
     /// Returns the fail-closed storage outcome persisted after join.
     pub const fn outcome(&self) -> &CaptureWriterOutcome {
         &self.outcome
+    }
+
+    /// Returns whether the lifecycle owner observed the configured shutdown deadline elapse.
+    ///
+    /// This fact is independent of the storage outcome: a sink may return a storage error after
+    /// the deadline, in which case the outcome remains `WriterFailed` and this flag is also true.
+    pub const fn shutdown_deadline_elapsed(&self) -> bool {
+        self.shutdown_deadline_elapsed
     }
 
     /// Returns records known complete when shutdown revoked positive authority.
@@ -476,12 +485,16 @@ pub enum CaptureWorkerReapError {
 }
 
 /// Explicit lifecycle owner for a shutdown-requested capture worker.
+///
+/// Dropping an unreaped owner joins synchronously as a fail-closed fallback and can therefore block
+/// the caller, including an async executor thread. Async compositions must retain the owner, use a
+/// borrowing wait, and call [`Self::try_reap`] after termination is observable.
 #[derive(Debug)]
 #[must_use = "pending capture workers must remain owned and be explicitly reaped"]
 pub struct PendingCaptureWriter<B: CaptureAuthorityBundle> {
     thread: Option<std::thread::JoinHandle<()>>,
     completion: Arc<tokio::sync::Notify>,
-    final_outcome: Arc<std::sync::Mutex<Option<CaptureWriterOutcome>>>,
+    final_report: Arc<std::sync::Mutex<Option<CaptureWorkerFinalReport>>>,
     wake_sender: Option<mpsc::SyncSender<CaptureMessage<B>>>,
     io_context: CaptureIoContext,
     receiver: Arc<std::sync::Mutex<mpsc::Receiver<CaptureMessage<B>>>>,
@@ -491,6 +504,12 @@ pub struct PendingCaptureWriter<B: CaptureAuthorityBundle> {
     records_written_at_revocation: u64,
     termination: Option<CaptureWorkerTermination>,
     deadline_recorded: bool,
+}
+
+#[derive(Debug)]
+struct CaptureWorkerFinalReport {
+    outcome: CaptureWriterOutcome,
+    shutdown_deadline_elapsed_at_exit: bool,
 }
 
 fn writer_failed<B: CaptureAuthorityBundle>(
@@ -876,16 +895,20 @@ pub fn spawn_capture_writer<B: CaptureAuthorityBundle, S: CaptureSink>(
         })?;
     let completion = Arc::new(tokio::sync::Notify::new());
     let thread_completion = Arc::clone(&completion);
-    let final_outcome = Arc::new(std::sync::Mutex::new(None));
-    let thread_outcome = Arc::clone(&final_outcome);
+    let final_report = Arc::new(std::sync::Mutex::new(None));
+    let thread_report = Arc::clone(&final_report);
     let thread = std::thread::Builder::new()
         .name("market-squawk-capture".to_owned())
         .spawn(move || {
             let _worker_destination_fence = worker_destination_fence;
             let outcome = run_capture_writer(writer, sink, policy, &thread_context);
-            match thread_outcome.lock() {
-                Ok(mut retained) => *retained = Some(outcome),
-                Err(poisoned) => *poisoned.into_inner() = Some(outcome),
+            let report = CaptureWorkerFinalReport {
+                outcome,
+                shutdown_deadline_elapsed_at_exit: thread_context.deadline_reached(),
+            };
+            match thread_report.lock() {
+                Ok(mut retained) => *retained = Some(report),
+                Err(poisoned) => *poisoned.into_inner() = Some(report),
             }
             thread_completion.notify_one();
         })
@@ -896,7 +919,7 @@ pub fn spawn_capture_writer<B: CaptureAuthorityBundle, S: CaptureSink>(
     Ok(CaptureWriterHandle {
         thread: Some(thread),
         completion,
-        final_outcome,
+        final_report,
         wake_sender: Some(wake_sender),
         io_context,
         receiver,
@@ -935,7 +958,7 @@ impl<B: CaptureAuthorityBundle> CaptureWriterHandle<B> {
         PendingCaptureWriter {
             thread: self.thread.take(),
             completion: Arc::clone(&self.completion),
-            final_outcome: Arc::clone(&self.final_outcome),
+            final_report: Arc::clone(&self.final_report),
             wake_sender: self.wake_sender.take(),
             io_context: self.io_context.clone(),
             receiver: Arc::clone(&self.receiver),
@@ -962,12 +985,17 @@ impl<B: CaptureAuthorityBundle> Drop for CaptureWriterHandle<B> {
                 .thread
                 .take()
                 .is_none_or(|thread| thread.join().is_ok());
-            let _termination = termination_after_join(
+            let termination = termination_after_join(
                 &self.state,
-                &self.final_outcome,
+                &self.final_report,
                 revocation.records_written_at_revocation,
+                false,
                 joined,
             );
+            if termination.outcome().is_incomplete() {
+                self.state
+                    .mark_current_incomplete(CaptureHealthReason::WriterFailed);
+            }
             self.destination_fence.take();
         }
     }
@@ -1054,8 +1082,9 @@ impl<B: CaptureAuthorityBundle> PendingCaptureWriter<B> {
     fn persist_termination(&mut self, joined: bool) {
         let termination = termination_after_join(
             &self.state,
-            &self.final_outcome,
+            &self.final_report,
             self.records_written_at_revocation,
+            self.deadline_recorded,
             joined,
         );
         self.termination = Some(termination);
@@ -1075,6 +1104,8 @@ impl<B: CaptureAuthorityBundle> PendingCaptureWriter<B> {
 }
 
 impl<B: CaptureAuthorityBundle> Drop for PendingCaptureWriter<B> {
+    // This join is deliberately synchronous and can block the caller, including an async executor
+    // thread. Production callers must retain, wait, and explicitly reap rather than rely on Drop.
     fn drop(&mut self) {
         if self.termination.is_some() {
             return;
@@ -1092,11 +1123,12 @@ impl<B: CaptureAuthorityBundle> Drop for PendingCaptureWriter<B> {
 
 fn termination_after_join<B: CaptureAuthorityBundle>(
     state: &CaptureState<B>,
-    final_outcome: &std::sync::Mutex<Option<CaptureWriterOutcome>>,
+    final_report: &std::sync::Mutex<Option<CaptureWorkerFinalReport>>,
     records_written_at_revocation: u64,
+    shutdown_deadline_elapsed: bool,
     joined: bool,
 ) -> CaptureWorkerTermination {
-    let retained = match final_outcome.lock() {
+    let retained = match final_report.lock() {
         Ok(mut retained) => retained.take(),
         Err(poisoned) => poisoned.into_inner().take(),
     };
@@ -1109,10 +1141,14 @@ fn termination_after_join<B: CaptureAuthorityBundle>(
         && expected_late == Some(accounting.late_records_written);
     let outcome_matches = retained
         .as_ref()
-        .is_some_and(|outcome| outcome.records_written() == accounting.records_written);
+        .is_some_and(|report| report.outcome.records_written() == accounting.records_written);
+    let shutdown_deadline_elapsed = shutdown_deadline_elapsed
+        || retained
+            .as_ref()
+            .is_some_and(|report| report.shutdown_deadline_elapsed_at_exit);
     let outcome = if joined && accounting_valid && outcome_matches {
         match retained {
-            Some(outcome) => outcome,
+            Some(report) => report.outcome,
             None => writer_failed(state, accounting.records_written),
         }
     } else {
@@ -1121,6 +1157,7 @@ fn termination_after_join<B: CaptureAuthorityBundle>(
     };
     CaptureWorkerTermination {
         outcome,
+        shutdown_deadline_elapsed,
         records_written_at_revocation,
         final_records_written: accounting.records_written,
         late_records_written: expected_late.map_or(0, |late| late),

@@ -421,7 +421,12 @@ async fn queue_saturation_degrades_exact_generation_without_issuing_a_third_rece
     assert!(!second.is_healthy());
 
     release_sender.send(())?;
-    let _termination = shutdown_and_reap(handle, Duration::from_secs(1)).await?;
+    assert!(
+        !shutdown_and_reap(handle, Duration::from_secs(1))
+            .await?
+            .outcome()
+            .is_incomplete()
+    );
     assert_eq!(publisher.queued_bytes(), 0);
     Ok(())
 }
@@ -454,7 +459,12 @@ async fn whole_bundle_rotation_invalidates_old_receipt_and_accepts_only_new_bind
     let current = publisher.try_publish(&frame(second_identity, 1)?)?;
     assert!(current.is_healthy());
 
-    let _termination = shutdown_and_reap(handle, Duration::from_secs(1)).await?;
+    assert!(
+        !shutdown_and_reap(handle, Duration::from_secs(1))
+            .await?
+            .outcome()
+            .is_incomplete()
+    );
     Ok(())
 }
 
@@ -560,7 +570,12 @@ async fn writer_converts_exact_frame_to_bounded_diagnostic_record_without_author
     assert!(!captured.record().event_id().is_nil());
     assert!(!captured.record().connection_id().is_nil());
 
-    let _termination = shutdown_and_reap(handle, Duration::from_secs(1)).await?;
+    assert!(
+        !shutdown_and_reap(handle, Duration::from_secs(1))
+            .await?
+            .outcome()
+            .is_incomplete()
+    );
     Ok(())
 }
 
@@ -586,7 +601,12 @@ async fn retained_size_overflow_is_synchronous_and_terminal_before_enqueue()
     assert_eq!(issued.load(Ordering::Acquire), 0);
     assert_eq!(publisher.integrity(), CaptureIntegrityState::Incomplete);
     assert_eq!(publisher.queued_bytes(), 0);
-    let _termination = shutdown_and_reap(handle, Duration::from_secs(1)).await?;
+    assert!(
+        !shutdown_and_reap(handle, Duration::from_secs(1))
+            .await?
+            .outcome()
+            .is_incomplete()
+    );
     Ok(())
 }
 
@@ -614,7 +634,12 @@ async fn transplanted_frame_is_rejected_without_poisoning_the_current_exact_allo
     assert_eq!(publisher.integrity(), CaptureIntegrityState::Healthy);
     assert!(publisher.try_publish(&frame(current, 1)?).is_ok());
 
-    let _termination = shutdown_and_reap(handle, Duration::from_secs(1)).await?;
+    assert!(
+        !shutdown_and_reap(handle, Duration::from_secs(1))
+            .await?
+            .outcome()
+            .is_incomplete()
+    );
     Ok(())
 }
 
@@ -652,7 +677,12 @@ async fn rotation_rejects_wrong_session_and_nonincreasing_whole_bundles()
         Err(market_squawk_platform::CaptureGenerationError::NotNewer)
     );
     assert_eq!(publisher.integrity(), CaptureIntegrityState::Healthy);
-    let _termination = shutdown_and_reap(handle, Duration::from_secs(1)).await?;
+    assert!(
+        !shutdown_and_reap(handle, Duration::from_secs(1))
+            .await?
+            .outcome()
+            .is_incomplete()
+    );
     Ok(())
 }
 

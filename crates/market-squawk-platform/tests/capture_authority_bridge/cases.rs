@@ -42,7 +42,12 @@ async fn in_flight_old_publication_cannot_return_healthy_after_rotation_lineariz
         ))
     ));
     assert_eq!(publisher.integrity(), CaptureIntegrityState::Healthy);
-    let _termination = shutdown_and_reap(handle, Duration::from_secs(1)).await?;
+    assert!(
+        !shutdown_and_reap(handle, Duration::from_secs(1))
+            .await?
+            .outcome()
+            .is_incomplete()
+    );
     Ok(())
 }
 
@@ -66,7 +71,12 @@ async fn failed_rotation_degrades_the_uninstalled_next_bundle_only()
     ));
     assert_eq!(wrong_health.integrity(), CaptureIntegrityState::Incomplete);
     assert_eq!(publisher.integrity(), CaptureIntegrityState::Healthy);
-    let _termination = shutdown_and_reap(handle, Duration::from_secs(1)).await?;
+    assert!(
+        !shutdown_and_reap(handle, Duration::from_secs(1))
+            .await?
+            .outcome()
+            .is_incomplete()
+    );
     Ok(())
 }
 
@@ -102,7 +112,12 @@ async fn preflight_lock_is_released_before_frame_clone_and_bounded_enqueue()
         .map_err(|_panic| "publisher thread panicked")?;
     assert!(first_result.is_ok());
 
-    let _termination = shutdown_and_reap(handle, Duration::from_secs(1)).await?;
+    assert!(
+        !shutdown_and_reap(handle, Duration::from_secs(1))
+            .await?
+            .outcome()
+            .is_incomplete()
+    );
     Ok(())
 }
 
@@ -141,7 +156,12 @@ async fn successor_initializes_before_old_revocation_and_failed_init_preserves_o
     assert!(current_receipt.is_healthy());
     assert_eq!(publisher.identity().connection_generation().get(), 2);
 
-    let _termination = shutdown_and_reap(handle, Duration::from_secs(1)).await?;
+    assert!(
+        !shutdown_and_reap(handle, Duration::from_secs(1))
+            .await?
+            .outcome()
+            .is_incomplete()
+    );
     Ok(())
 }
 

@@ -81,6 +81,7 @@ return quickly; this is not presented as a hard real-time nonblocking guarantee.
 `CaptureWorkerTermination` records:
 
 - the final `CaptureWriterOutcome`;
+- whether the configured shutdown deadline elapsed;
 - the record count observed when authority was revoked;
 - the final record count after join; and
 - the checked difference as late completed writes.
@@ -88,6 +89,12 @@ return quickly; this is not presented as a hard real-time nonblocking guarantee.
 Natural worker completion is observed through the same lifecycle owner and `try_reap` path. Thread
 panic, missing final outcome, or a failed join produces a fail-closed incomplete outcome and never a
 clean termination claim.
+
+Deadline and storage failures are independent facts. When a blocked operation returns a storage
+error after the deadline, the causal outcome remains `WriterFailed` and
+`shutdown_deadline_elapsed` is also true. When a blocked append succeeds after the deadline, its
+commit is counted and the writer's post-I/O checkpoint produces `ShutdownDeadline`. This preserves
+multiple causes without silently replacing either one.
 
 ## Pending ownership and reap
 
@@ -110,7 +117,8 @@ than calling `join` when termination has not been proven.
 Dropping a pending owner synchronously joins. This can block indefinitely if a custom or OS sink
 never returns, and that is intentional fail-closed misuse behavior: ownership may not disappear.
 Application code must therefore propagate or retain `PendingCaptureWriter` as typed lifecycle state,
-not erase it into an ordinary error.
+not erase it into an ordinary error. In particular, relying on `Drop` can block an async executor
+thread; async composition must use the borrowing wait and explicit reap path.
 
 The app's source-run result becomes a typed shutdown result that can carry a pending writer back to
 its composition owner. A clean application result is impossible while a pending capture worker
