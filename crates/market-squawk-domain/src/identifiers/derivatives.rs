@@ -9,64 +9,13 @@ use crate::{
     VenueId,
 };
 
+#[path = "derivatives/maturity_month_year.rs"]
+mod maturity_month_year;
 #[path = "derivatives/options.rs"]
 mod options;
 
+pub use maturity_month_year::MaturityMonthYear;
 pub use options::{OccOptionIdentity, OptionKind};
-
-/// A validated futures contract month kept separate from venue-native symbols.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
-pub struct ContractMonth {
-    year: u16,
-    month: u8,
-}
-
-impl fmt::Display for ContractMonth {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{:04}-{:02}", self.year, self.month)
-    }
-}
-
-#[derive(Deserialize)]
-struct ContractMonthWire {
-    year: u16,
-    month: u8,
-}
-
-impl<'de> Deserialize<'de> for ContractMonth {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let wire = ContractMonthWire::deserialize(deserializer)?;
-        Self::new(wire.year, wire.month).map_err(serde::de::Error::custom)
-    }
-}
-
-impl ContractMonth {
-    /// Validates a year and month without parsing venue month codes.
-    ///
-    /// # Errors
-    ///
-    /// Rejects year zero and months outside 1 through 12.
-    pub const fn new(year: u16, month: u8) -> Result<Self, IdentifierError> {
-        if year == 0 || month == 0 || month > 12 {
-            Err(IdentifierError::InvalidDate)
-        } else {
-            Ok(Self { year, month })
-        }
-    }
-
-    /// Returns the full contract year.
-    pub const fn year(self) -> u16 {
-        self.year
-    }
-
-    /// Returns the contract month from 1 through 12.
-    pub const fn month(self) -> u8 {
-        self.month
-    }
-}
 
 /// Venue reference-data security type for a futures identity.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -80,15 +29,12 @@ pub enum FuturesSecurityType {
     Daily,
 }
 
-/// Source-evidenced contract lifecycle dates, independent of the contract month.
+/// Optional contract lifecycle dates, independent of FIX `MaturityMonthYear(200)`.
 ///
-/// Exchange reference data can supply only some dates. This contract never manufactures missing
-/// values, but it requires at least one observed lifecycle date and enforces relational ranges.
-#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+/// An empty value means the source record supplied no lifecycle dates. Source payload and revision
+/// evidence lives on [`FuturesContractIdentity`] so a tag-200-only record remains evidenced.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize)]
 pub struct FuturesLifecycleDates {
-    source_id: SourceId,
-    source_reference: PayloadReference,
-    observed_at: Timestamp,
     maturity_date: Option<CalendarDate>,
     expiration_date: Option<CalendarDate>,
     last_trade_date: Option<CalendarDate>,
@@ -103,6 +49,7 @@ pub struct FuturesLifecycleDates {
 /// Absence is retained exactly. In particular, a full maturity date does not imply that a source
 /// supplied FIX `MaturityMonthYear (200)`.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct FuturesLifecycleDateFields {
     /// Source maturity date, when present.
     pub maturity_date: Option<CalendarDate>,
@@ -120,43 +67,15 @@ pub struct FuturesLifecycleDateFields {
     pub last_delivery_date: Option<CalendarDate>,
 }
 
-/// Complete evidence input for constructing [`FuturesLifecycleDates`].
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct FuturesLifecycleDatesInput {
-    /// Reference-data source namespace.
-    pub source_id: SourceId,
-    /// Immutable source payload evidence.
-    pub source_reference: PayloadReference,
-    /// Time Market Squawk first observed the record.
-    pub observed_at: Timestamp,
-    /// Lifecycle fields exactly as supplied by the source.
-    pub dates: FuturesLifecycleDateFields,
-}
-
 impl FuturesLifecycleDates {
-    /// Constructs source-evidenced lifecycle dates without inventing absent fields.
+    /// Constructs lifecycle dates without inventing absent fields.
     ///
     /// # Errors
     ///
-    /// Rejects an empty date set, last trade after expiration, a reversed notice range, or a
-    /// reversed delivery range.
-    pub fn try_new(input: FuturesLifecycleDatesInput) -> Result<Self, IdentifierError> {
-        let FuturesLifecycleDatesInput {
-            source_id,
-            source_reference,
-            observed_at,
-            dates:
-                FuturesLifecycleDateFields {
-                    maturity_date,
-                    expiration_date,
-                    last_trade_date,
-                    first_notice_date,
-                    last_notice_date,
-                    first_delivery_date,
-                    last_delivery_date,
-                },
-        } = input;
-        if [
+    /// Rejects last trade after expiration, a reversed notice range, or a reversed delivery range.
+    /// An empty set is valid and faithfully represents a source record with no lifecycle fields.
+    pub fn try_new(fields: FuturesLifecycleDateFields) -> Result<Self, IdentifierError> {
+        let FuturesLifecycleDateFields {
             maturity_date,
             expiration_date,
             last_trade_date,
@@ -164,12 +83,7 @@ impl FuturesLifecycleDates {
             last_notice_date,
             first_delivery_date,
             last_delivery_date,
-        ]
-        .iter()
-        .all(Option::is_none)
-        {
-            return Err(IdentifierError::MissingLifecycleDate);
-        }
+        } = fields;
         if last_trade_date
             .zip(expiration_date)
             .is_some_and(|(last, expiration)| last > expiration)
@@ -183,9 +97,6 @@ impl FuturesLifecycleDates {
             return Err(IdentifierError::InvalidLifecycleOrdering);
         }
         Ok(Self {
-            source_id,
-            source_reference,
-            observed_at,
             maturity_date,
             expiration_date,
             last_trade_date,
@@ -196,19 +107,15 @@ impl FuturesLifecycleDates {
         })
     }
 
-    /// Returns the reference-data source.
-    pub const fn source_id(&self) -> &SourceId {
-        &self.source_id
-    }
-
-    /// Returns immutable source payload evidence.
-    pub const fn source_reference(&self) -> &PayloadReference {
-        &self.source_reference
-    }
-
-    /// Returns when Market Squawk first observed this lifecycle record.
-    pub const fn observed_at(&self) -> Timestamp {
-        self.observed_at
+    /// Returns whether the source supplied no lifecycle date fields.
+    pub const fn is_empty(&self) -> bool {
+        self.maturity_date.is_none()
+            && self.expiration_date.is_none()
+            && self.last_trade_date.is_none()
+            && self.first_notice_date.is_none()
+            && self.last_notice_date.is_none()
+            && self.first_delivery_date.is_none()
+            && self.last_delivery_date.is_none()
     }
 
     /// Returns the source maturity date.
@@ -247,41 +154,13 @@ impl FuturesLifecycleDates {
     }
 }
 
-#[derive(Deserialize)]
-struct FuturesLifecycleDatesWire {
-    source_id: SourceId,
-    source_reference: PayloadReference,
-    observed_at: Timestamp,
-    maturity_date: Option<CalendarDate>,
-    expiration_date: Option<CalendarDate>,
-    last_trade_date: Option<CalendarDate>,
-    first_notice_date: Option<CalendarDate>,
-    last_notice_date: Option<CalendarDate>,
-    first_delivery_date: Option<CalendarDate>,
-    last_delivery_date: Option<CalendarDate>,
-}
-
 impl<'de> Deserialize<'de> for FuturesLifecycleDates {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        let wire = FuturesLifecycleDatesWire::deserialize(deserializer)?;
-        Self::try_new(FuturesLifecycleDatesInput {
-            source_id: wire.source_id,
-            source_reference: wire.source_reference,
-            observed_at: wire.observed_at,
-            dates: FuturesLifecycleDateFields {
-                maturity_date: wire.maturity_date,
-                expiration_date: wire.expiration_date,
-                last_trade_date: wire.last_trade_date,
-                first_notice_date: wire.first_notice_date,
-                last_notice_date: wire.last_notice_date,
-                first_delivery_date: wire.first_delivery_date,
-                last_delivery_date: wire.last_delivery_date,
-            },
-        })
-        .map_err(serde::de::Error::custom)
+        let fields = FuturesLifecycleDateFields::deserialize(deserializer)?;
+        Self::try_new(fields).map_err(serde::de::Error::custom)
     }
 }
 
@@ -301,9 +180,34 @@ pub struct FuturesLeg {
     position: NonZeroU16,
     security_id: ProviderInstrumentId,
     security_id_source: SourceIdentifier,
-    contract_month: Option<ContractMonth>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    maturity_month_year: Option<MaturityMonthYear>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    maturity_date: Option<CalendarDate>,
     side: FuturesLegSide,
     ratio: NonZeroU32,
+}
+
+/// Complete FIX/source fields for one [`FuturesLeg`].
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct FuturesLegInput {
+    /// One-based source order in the multileg definition.
+    pub position: u16,
+    /// Source-native security identifier for the leg.
+    pub security_id: ProviderInstrumentId,
+    /// Scheme qualifying the source-native security identifier.
+    pub security_id_source: SourceIdentifier,
+    /// FIX `LegMaturityMonthYear(610)`, when supplied.
+    #[serde(default)]
+    pub maturity_month_year: Option<MaturityMonthYear>,
+    /// FIX `LegMaturityDate(611)`, retained separately from tag 610.
+    #[serde(default)]
+    pub maturity_date: Option<CalendarDate>,
+    /// Economic side of this component.
+    pub side: FuturesLegSide,
+    /// Nonzero integer leg ratio.
+    pub ratio: u32,
 }
 
 impl FuturesLeg {
@@ -312,19 +216,22 @@ impl FuturesLeg {
     /// # Errors
     ///
     /// Rejects position zero or ratio zero.
-    pub fn try_new(
-        position: u16,
-        security_id: ProviderInstrumentId,
-        security_id_source: SourceIdentifier,
-        contract_month: Option<ContractMonth>,
-        side: FuturesLegSide,
-        ratio: u32,
-    ) -> Result<Self, IdentifierError> {
+    pub fn try_new(input: FuturesLegInput) -> Result<Self, IdentifierError> {
+        let FuturesLegInput {
+            position,
+            security_id,
+            security_id_source,
+            maturity_month_year,
+            maturity_date,
+            side,
+            ratio,
+        } = input;
         Ok(Self {
             position: NonZeroU16::new(position).ok_or(IdentifierError::ZeroLegPosition)?,
             security_id,
             security_id_source,
-            contract_month,
+            maturity_month_year,
+            maturity_date,
             side,
             ratio: NonZeroU32::new(ratio).ok_or(IdentifierError::ZeroLegRatio)?,
         })
@@ -345,9 +252,14 @@ impl FuturesLeg {
         &self.security_id_source
     }
 
-    /// Returns the separately supplied leg contract month when applicable.
-    pub const fn contract_month(&self) -> Option<ContractMonth> {
-        self.contract_month
+    /// Returns FIX `LegMaturityMonthYear(610)` without collapsing its month/day/week form.
+    pub const fn maturity_month_year(&self) -> Option<MaturityMonthYear> {
+        self.maturity_month_year
+    }
+
+    /// Returns FIX `LegMaturityDate(611)`, separately from tag 610.
+    pub const fn maturity_date(&self) -> Option<CalendarDate> {
+        self.maturity_date
     }
 
     /// Returns the economic leg side.
@@ -361,31 +273,13 @@ impl FuturesLeg {
     }
 }
 
-#[derive(Deserialize)]
-struct FuturesLegWire {
-    position: u16,
-    security_id: ProviderInstrumentId,
-    security_id_source: SourceIdentifier,
-    contract_month: Option<ContractMonth>,
-    side: FuturesLegSide,
-    ratio: u32,
-}
-
 impl<'de> Deserialize<'de> for FuturesLeg {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        let wire = FuturesLegWire::deserialize(deserializer)?;
-        Self::try_new(
-            wire.position,
-            wire.security_id,
-            wire.security_id_source,
-            wire.contract_month,
-            wire.side,
-            wire.ratio,
-        )
-        .map_err(serde::de::Error::custom)
+        let input = FuturesLegInput::deserialize(deserializer)?;
+        Self::try_new(input).map_err(serde::de::Error::custom)
     }
 }
 
@@ -396,6 +290,11 @@ impl<'de> Deserialize<'de> for FuturesLeg {
 /// contract economics require licensed venue reference data.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct FuturesContractIdentity {
+    source_id: SourceId,
+    source_reference: PayloadReference,
+    source_timestamp: Option<Timestamp>,
+    observed_at: Timestamp,
+    metadata_revision: SourceIdentifier,
     venue_id: VenueId,
     security_id: ProviderInstrumentId,
     security_id_source: SourceIdentifier,
@@ -403,23 +302,36 @@ pub struct FuturesContractIdentity {
     native_symbol: VenueSymbol,
     security_type: FuturesSecurityType,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    contract_month: Option<ContractMonth>,
+    maturity_month_year: Option<MaturityMonthYear>,
+    #[serde(default, skip_serializing_if = "FuturesLifecycleDates::is_empty")]
     lifecycle: FuturesLifecycleDates,
     legs: Vec<FuturesLeg>,
 }
 
 /// Complete source-field input for constructing [`FuturesContractIdentity`].
 ///
-/// `contract_month` is optional because full maturity dates and leg-level maturity fields are
-/// independent source fields. See FIX [`MaturityMonthYear (200)`], [`MaturityDate (541)`], and
-/// [`LegMaturityMonthYear (610)`].
+/// `maturity_month_year` is optional because full maturity dates and leg-level maturity fields are
+/// independent source fields. See FIX [`MaturityMonthYear (200)`], [`MaturityDate (541)`],
+/// [`LegMaturityMonthYear (610)`], and [`LegMaturityDate (611)`].
 ///
 /// [`MaturityMonthYear (200)`]: https://fiximate.fixtrading.org/en/FIX.Latest/tag200.html
 /// [`MaturityDate (541)`]: https://fiximate.fixtrading.org/en/FIX.Latest/tag541.html
 /// [`LegMaturityMonthYear (610)`]: https://fiximate.fixtrading.org/en/FIX.Latest/tag610.html
+/// [`LegMaturityDate (611)`]: https://fiximate.fixtrading.org/en/FIX.Latest/tag611.html
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct FuturesContractIdentityInput {
+    /// Reference-data source namespace.
+    pub source_id: SourceId,
+    /// Immutable reference to the exact security-definition payload.
+    pub source_reference: PayloadReference,
+    /// Source-authored timestamp when the definition carries one.
+    #[serde(default)]
+    pub source_timestamp: Option<Timestamp>,
+    /// Local first-observation timestamp for this payload.
+    pub observed_at: Timestamp,
+    /// Immutable provider publication, version, or mapping revision identifier.
+    pub metadata_revision: SourceIdentifier,
     /// Venue namespace in which the security identity is valid.
     pub venue_id: VenueId,
     /// Source-native security identifier.
@@ -432,12 +344,14 @@ pub struct FuturesContractIdentityInput {
     pub native_symbol: VenueSymbol,
     /// Source security type.
     pub security_type: FuturesSecurityType,
-    /// Source-supplied contract month, if explicit; never derived from a full date or a leg.
+    /// FIX `MaturityMonthYear(200)`, preserving month/day/week form exactly.
     #[serde(default)]
-    pub contract_month: Option<ContractMonth>,
-    /// Source-evidenced lifecycle dates.
+    pub maturity_month_year: Option<MaturityMonthYear>,
+    /// Optional lifecycle dates, including FIX `MaturityDate(541)` separately from tag 200.
+    #[serde(default)]
     pub lifecycle: FuturesLifecycleDates,
     /// Ordered legs for a multileg security.
+    #[serde(default)]
     pub legs: Vec<FuturesLeg>,
 }
 
@@ -450,13 +364,18 @@ impl FuturesContractIdentity {
     /// outright and daily securities reject legs.
     pub fn try_new(input: FuturesContractIdentityInput) -> Result<Self, IdentifierError> {
         let FuturesContractIdentityInput {
+            source_id,
+            source_reference,
+            source_timestamp,
+            observed_at,
+            metadata_revision,
             venue_id,
             security_id,
             security_id_source,
             product_code,
             native_symbol,
             security_type,
-            contract_month,
+            maturity_month_year,
             lifecycle,
             legs,
         } = input;
@@ -480,21 +399,53 @@ impl FuturesContractIdentity {
             if legs.iter().skip(index + 1).any(|candidate| {
                 candidate.security_id == leg.security_id
                     && candidate.security_id_source == leg.security_id_source
+                    && candidate.maturity_month_year == leg.maturity_month_year
+                    && candidate.maturity_date == leg.maturity_date
             }) {
                 return Err(IdentifierError::DuplicateLeg);
             }
         }
         Ok(Self {
+            source_id,
+            source_reference,
+            source_timestamp,
+            observed_at,
+            metadata_revision,
             venue_id,
             security_id,
             security_id_source,
             product_code,
             native_symbol,
             security_type,
-            contract_month,
+            maturity_month_year,
             lifecycle,
             legs,
         })
+    }
+
+    /// Returns the reference-data source namespace.
+    pub const fn source_id(&self) -> &SourceId {
+        &self.source_id
+    }
+
+    /// Returns the immutable source payload evidence.
+    pub const fn source_reference(&self) -> &PayloadReference {
+        &self.source_reference
+    }
+
+    /// Returns the source-authored timestamp when supplied.
+    pub const fn source_timestamp(&self) -> Option<Timestamp> {
+        self.source_timestamp
+    }
+
+    /// Returns when Market Squawk first observed this security definition.
+    pub const fn observed_at(&self) -> Timestamp {
+        self.observed_at
+    }
+
+    /// Returns the immutable source metadata revision.
+    pub const fn metadata_revision(&self) -> &SourceIdentifier {
+        &self.metadata_revision
     }
 
     /// Returns the venue namespace.
@@ -522,9 +473,9 @@ impl FuturesContractIdentity {
         &self.native_symbol
     }
 
-    /// Returns the separately supplied contract month.
-    pub const fn contract_month(&self) -> Option<ContractMonth> {
-        self.contract_month
+    /// Returns FIX `MaturityMonthYear(200)` without collapsing its month/day/week form.
+    pub const fn maturity_month_year(&self) -> Option<MaturityMonthYear> {
+        self.maturity_month_year
     }
 
     /// Returns the venue reference-data security type.
@@ -532,7 +483,7 @@ impl FuturesContractIdentity {
         self.security_type
     }
 
-    /// Returns source-evidenced lifecycle dates.
+    /// Returns lifecycle dates exactly as supplied, including an empty set.
     pub const fn lifecycle(&self) -> &FuturesLifecycleDates {
         &self.lifecycle
     }

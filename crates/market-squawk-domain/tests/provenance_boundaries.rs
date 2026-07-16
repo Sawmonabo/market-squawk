@@ -5,8 +5,8 @@ use std::error::Error;
 use market_squawk_domain::{
     AvailabilityEvidence, CoverageStatus, DataQuality, DecodedLiveProvenanceInput,
     ExecutionEligibility, LiveProvenance, PayloadHash, PayloadHashAlgorithm, PayloadReference,
-    ProvenanceError, ResearchContext, ResearchProvenance, ResearchTime, RevisionNumber, SourceId,
-    SourceIdentifier, Timestamp,
+    ProvenanceError, ResearchContext, ResearchProvenance, ResearchProvenanceInput, ResearchTime,
+    RevisionNumber, SourceId, SourceIdentifier, Timestamp,
 };
 use support::live::{BindingSpec, binding};
 
@@ -59,18 +59,20 @@ fn content_hash_must_match_complete_binding() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn research_unknown_availability_remains_unknown_and_conservative() -> Result<(), Box<dyn Error>> {
-    let provenance = ResearchProvenance::new(
-        SourceId::try_from("historical-file")?,
-        None,
-        None,
-        SourceIdentifier::try_from("row-42")?,
-        None,
-        Timestamp::from_unix_nanos(500),
-        Timestamp::from_unix_nanos(600),
-        DataQuality::Aggregated,
-        PayloadReference::SourceReference(SourceIdentifier::try_from("fixture:42")?),
-        AvailabilityEvidence::unknown(),
-    )?;
+    let provenance = ResearchProvenance::try_new(ResearchProvenanceInput {
+        source_id: SourceId::try_from("historical-file")?,
+        instrument_id: None,
+        venue_id: None,
+        source_identifier: SourceIdentifier::try_from("row-42")?,
+        source_timestamp: None,
+        received_at: Timestamp::from_unix_nanos(500),
+        ingested_at: Timestamp::from_unix_nanos(600),
+        quality: DataQuality::Aggregated,
+        payload_reference: PayloadReference::SourceReference(SourceIdentifier::try_from(
+            "fixture:42",
+        )?),
+        availability: AvailabilityEvidence::unknown(),
+    })?;
     let context = ResearchContext::new(
         provenance,
         ResearchTime::new(

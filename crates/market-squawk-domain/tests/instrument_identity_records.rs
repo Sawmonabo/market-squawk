@@ -4,8 +4,9 @@ use market_squawk_domain::{
     IdentifierEntitlement, IdentifierRightsPolicyReference, IdentifierSyntaxVerification,
     InstrumentDefinition, InstrumentDefinitionInput, InstrumentError, InstrumentId, Isin,
     LifecycleTransition, LifecycleTransitionKind, LotSize, PayloadHash, PayloadHashAlgorithm,
-    PayloadReference, ProviderIdentityRecord, ProviderInstrumentId, SourceId, SourceIdentifier,
-    SymbolIdentityRecord, TickSize, Timestamp, TradingStatus, VenueId, VenueMapping, VenueSymbol,
+    PayloadReference, ProviderIdentityRecord, ProviderIdentityRecordInput, ProviderInstrumentId,
+    SourceId, SourceIdentifier, SymbolIdentityRecord, TickSize, Timestamp, TradingStatus, VenueId,
+    VenueMapping, VenueSymbol,
 };
 use rust_decimal::Decimal;
 use uuid::Uuid;
@@ -38,6 +39,28 @@ fn identifier_record() -> Result<ExternalIdentifierRecord, Box<dyn std::error::E
             rights_policy: rights()?,
         },
     ))
+}
+
+fn provider_identity(
+    instrument_id: InstrumentId,
+    source_id: &str,
+    provider_instrument_id: &str,
+    validity: EffectiveInterval,
+    evidence_byte: u8,
+) -> Result<ProviderIdentityRecord, Box<dyn std::error::Error>> {
+    Ok(ProviderIdentityRecord::new(ProviderIdentityRecordInput {
+        instrument_id,
+        source_id: SourceId::try_from(source_id)?,
+        provider_instrument_id: ProviderInstrumentId::try_from(provider_instrument_id)?,
+        source_reference: PayloadReference::ContentHash(PayloadHash::new(
+            PayloadHashAlgorithm::Sha256,
+            [evidence_byte; 32],
+        )),
+        source_timestamp: Some(Timestamp::from_unix_nanos(90)),
+        observed_at: Timestamp::from_unix_nanos(100),
+        metadata_revision: SourceIdentifier::try_from(format!("revision-{evidence_byte}"))?,
+        validity,
+    }))
 }
 
 #[test]
@@ -174,12 +197,7 @@ fn identity_records_and_mappings_expose_complete_borrowed_state()
     assert_eq!(symbol.venue_symbol().as_str(), "AAPL");
     assert_eq!(symbol.validity(), validity);
 
-    let provider = ProviderIdentityRecord::new(
-        id,
-        SourceId::try_from("nasdaq-reference")?,
-        ProviderInstrumentId::try_from("AAPL.O")?,
-        validity,
-    );
+    let provider = provider_identity(id, "nasdaq-reference", "AAPL.O", validity, 4)?;
     assert_eq!(provider.instrument_id(), id);
     assert_eq!(provider.source_id().as_str(), "nasdaq-reference");
     assert_eq!(provider.provider_instrument_id().as_str(), "AAPL.O");
@@ -213,18 +231,8 @@ fn provider_identity_text_is_qualified_by_source_in_instrument_definition()
 -> Result<(), Box<dyn std::error::Error>> {
     let id = instrument("936da01f-9abd-4d9d-80c7-02af85c822a8")?;
     let validity = EffectiveInterval::new(Timestamp::from_unix_nanos(1), None)?;
-    let first = ProviderIdentityRecord::new(
-        id,
-        SourceId::try_from("vendor-alpha")?,
-        ProviderInstrumentId::try_from("12345")?,
-        validity,
-    );
-    let second = ProviderIdentityRecord::new(
-        id,
-        SourceId::try_from("vendor-beta")?,
-        ProviderInstrumentId::try_from("12345")?,
-        validity,
-    );
+    let first = provider_identity(id, "vendor-alpha", "12345", validity, 5)?;
+    let second = provider_identity(id, "vendor-beta", "12345", validity, 6)?;
     let definition = InstrumentDefinition::try_new(InstrumentDefinitionInput {
         instrument_id: id,
         asset_class: AssetClass::Equity,
@@ -275,17 +283,18 @@ fn provider_identity_text_is_qualified_by_source_in_instrument_definition()
     duplicate.provider_identities = vec![first.clone(), first];
     assert_eq!(
         InstrumentDefinition::try_new(duplicate),
-        Err(InstrumentError::DuplicateProviderIdentity)
+        Err(InstrumentError::DuplicateProviderIdentityEvidence)
     );
 
     let other_id = instrument("7d9e9f3e-b62d-4fce-a85f-fad3ca549c97")?;
     let mut mismatched = definition_input()?;
-    mismatched.provider_identities = vec![ProviderIdentityRecord::new(
+    mismatched.provider_identities = vec![provider_identity(
         other_id,
-        SourceId::try_from("vendor-alpha")?,
-        ProviderInstrumentId::try_from("12345")?,
+        "vendor-alpha",
+        "12345",
         validity,
-    )];
+        7,
+    )?];
     assert_eq!(
         InstrumentDefinition::try_new(mismatched),
         Err(InstrumentError::ProviderIdentityInstrumentMismatch {

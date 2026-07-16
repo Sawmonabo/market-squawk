@@ -3,8 +3,9 @@ use std::error::Error;
 use market_squawk_domain::{
     AggressorSide, AvailabilityEvidence, CoverageStatus, DataQuality, DecodedLiveProvenanceInput,
     LiveEventClass, LiveProvenance, MacroObservation, MarketEvent, PayloadReference, PriceTicks,
-    QuantityLots, ResearchContext, ResearchObservation, ResearchProvenance, ResearchTime,
-    RevisionNumber, SourceId, SourceIdentifier, Timestamp, TradeEvent,
+    QuantityLots, ResearchContext, ResearchObservation, ResearchProvenance,
+    ResearchProvenanceInput, ResearchTime, RevisionNumber, SourceId, SourceIdentifier, Timestamp,
+    TradeEvent,
 };
 use rust_decimal::Decimal;
 
@@ -37,21 +38,21 @@ fn market_event() -> Result<MarketEvent, Box<dyn Error>> {
 }
 
 fn research_observation() -> Result<ResearchObservation, Box<dyn Error>> {
-    let provenance = ResearchProvenance::new(
-        SourceId::try_from("fred")?,
-        None,
-        None,
-        SourceIdentifier::try_from("GDP:2026-Q1")?,
-        None,
-        Timestamp::from_unix_nanos(200),
-        Timestamp::from_unix_nanos(300),
-        DataQuality::OfficialDelayed,
-        payload_reference("fred:GDP:2026-Q1")?,
-        AvailabilityEvidence::evidenced(
+    let provenance = ResearchProvenance::try_new(ResearchProvenanceInput {
+        source_id: SourceId::try_from("fred")?,
+        instrument_id: None,
+        venue_id: None,
+        source_identifier: SourceIdentifier::try_from("GDP:2026-Q1")?,
+        source_timestamp: None,
+        received_at: Timestamp::from_unix_nanos(200),
+        ingested_at: Timestamp::from_unix_nanos(300),
+        quality: DataQuality::OfficialDelayed,
+        payload_reference: payload_reference("fred:GDP:2026-Q1")?,
+        availability: AvailabilityEvidence::evidenced(
             Timestamp::from_unix_nanos(100),
             SourceIdentifier::try_from("fred-release-calendar")?,
         ),
-    )?;
+    })?;
     let context = ResearchContext::new(
         provenance,
         ResearchTime::new(

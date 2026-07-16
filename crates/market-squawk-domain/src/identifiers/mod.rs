@@ -32,8 +32,6 @@ pub enum IdentifierError {
     InvalidAddressChecksum,
     /// A valid Bitcoin address was not valid for the explicitly requested network.
     InvalidAddressNetwork,
-    /// Futures lifecycle evidence did not contain any lifecycle date.
-    MissingLifecycleDate,
     /// Futures lifecycle dates were not in a valid relational order.
     InvalidLifecycleOrdering,
     /// A futures leg position or ratio was zero.
@@ -70,9 +68,6 @@ impl fmt::Display for IdentifierError {
             Self::InvalidAddressChecksum => formatter.write_str("EVM address checksum is invalid"),
             Self::InvalidAddressNetwork => {
                 formatter.write_str("Bitcoin address is not valid for the requested network")
-            }
-            Self::MissingLifecycleDate => {
-                formatter.write_str("futures lifecycle evidence requires at least one date")
             }
             Self::InvalidLifecycleOrdering => {
                 formatter.write_str("futures lifecycle dates are not relationally ordered")
@@ -246,9 +241,9 @@ mod digital_assets;
 mod securities;
 
 pub use derivatives::{
-    ContractMonth, FuturesContractIdentity, FuturesContractIdentityInput, FuturesLeg,
-    FuturesLegSide, FuturesLifecycleDateFields, FuturesLifecycleDates, FuturesLifecycleDatesInput,
-    FuturesSecurityType, OccOptionIdentity, OptionKind,
+    FuturesContractIdentity, FuturesContractIdentityInput, FuturesLeg, FuturesLegInput,
+    FuturesLegSide, FuturesLifecycleDateFields, FuturesLifecycleDates, FuturesSecurityType,
+    MaturityMonthYear, OccOptionIdentity, OptionKind,
 };
 pub use digital_assets::{
     BitcoinAddressType, BitcoinNetwork, ChainAddress, ChainAddressRole, ChainAddressRule, ChainId,

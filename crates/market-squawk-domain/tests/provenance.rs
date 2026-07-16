@@ -3,29 +3,29 @@ use std::str::FromStr;
 
 use market_squawk_domain::{
     AvailabilityEvidence, DataQuality, InstrumentId, PayloadReference, ProvenanceError,
-    ResearchContext, ResearchProvenance, ResearchTime, RevisionNumber, SchemaVersion, SourceId,
-    SourceIdentifier, Timestamp, VenueId,
+    ResearchContext, ResearchProvenance, ResearchProvenanceInput, ResearchTime, RevisionNumber,
+    SchemaVersion, SourceId, SourceIdentifier, Timestamp, VenueId,
 };
 
 fn valid_provenance(
     availability: AvailabilityEvidence,
 ) -> Result<ResearchProvenance, Box<dyn Error>> {
-    ResearchProvenance::new(
-        SourceId::try_from("sec-edgar")?,
-        Some(InstrumentId::from_str(
+    ResearchProvenance::try_new(ResearchProvenanceInput {
+        source_id: SourceId::try_from("sec-edgar")?,
+        instrument_id: Some(InstrumentId::from_str(
             "0187f5f1-6fc2-7fa2-bf05-2ce5354c55cb",
         )?),
-        Some(VenueId::try_from("XNYS")?),
-        SourceIdentifier::try_from("0000320193-26-000001")?,
-        None,
-        Timestamp::from_unix_nanos(200),
-        Timestamp::from_unix_nanos(300),
-        DataQuality::OfficialDelayed,
-        PayloadReference::SourceReference(SourceIdentifier::try_from(
+        venue_id: Some(VenueId::try_from("XNYS")?),
+        source_identifier: SourceIdentifier::try_from("0000320193-26-000001")?,
+        source_timestamp: None,
+        received_at: Timestamp::from_unix_nanos(200),
+        ingested_at: Timestamp::from_unix_nanos(300),
+        quality: DataQuality::OfficialDelayed,
+        payload_reference: PayloadReference::SourceReference(SourceIdentifier::try_from(
             "edgar/data/320193/filing.json",
         )?),
         availability,
-    )
+    })
     .map_err(Into::into)
 }
 
@@ -44,18 +44,20 @@ fn research_provenance_retains_unknown_source_and_availability_times() -> Result
 
 #[test]
 fn research_provenance_rejects_receive_after_ingestion() -> Result<(), Box<dyn Error>> {
-    let result = ResearchProvenance::new(
-        SourceId::try_from("fred")?,
-        None,
-        None,
-        SourceIdentifier::try_from("GDP")?,
-        None,
-        Timestamp::from_unix_nanos(400),
-        Timestamp::from_unix_nanos(300),
-        DataQuality::OfficialDelayed,
-        PayloadReference::SourceReference(SourceIdentifier::try_from("GDP:2026-Q1")?),
-        AvailabilityEvidence::unknown(),
-    );
+    let result = ResearchProvenance::try_new(ResearchProvenanceInput {
+        source_id: SourceId::try_from("fred")?,
+        instrument_id: None,
+        venue_id: None,
+        source_identifier: SourceIdentifier::try_from("GDP")?,
+        source_timestamp: None,
+        received_at: Timestamp::from_unix_nanos(400),
+        ingested_at: Timestamp::from_unix_nanos(300),
+        quality: DataQuality::OfficialDelayed,
+        payload_reference: PayloadReference::SourceReference(SourceIdentifier::try_from(
+            "GDP:2026-Q1",
+        )?),
+        availability: AvailabilityEvidence::unknown(),
+    });
 
     assert!(matches!(
         result,
@@ -67,20 +69,22 @@ fn research_provenance_rejects_receive_after_ingestion() -> Result<(), Box<dyn E
 #[test]
 fn research_provenance_rejects_reported_availability_after_ingestion() -> Result<(), Box<dyn Error>>
 {
-    let result = ResearchProvenance::new(
-        SourceId::try_from("sec-edgar")?,
-        Some(InstrumentId::from_str(
+    let result = ResearchProvenance::try_new(ResearchProvenanceInput {
+        source_id: SourceId::try_from("sec-edgar")?,
+        instrument_id: Some(InstrumentId::from_str(
             "0187f5f1-6fc2-7fa2-bf05-2ce5354c55cb",
         )?),
-        Some(VenueId::try_from("XNYS")?),
-        SourceIdentifier::try_from("0000320193-26-000001")?,
-        None,
-        Timestamp::from_unix_nanos(200),
-        Timestamp::from_unix_nanos(300),
-        DataQuality::OfficialDelayed,
-        PayloadReference::SourceReference(SourceIdentifier::try_from("filing.json")?),
-        AvailabilityEvidence::local_first_observed(Timestamp::from_unix_nanos(400)),
-    );
+        venue_id: Some(VenueId::try_from("XNYS")?),
+        source_identifier: SourceIdentifier::try_from("0000320193-26-000001")?,
+        source_timestamp: None,
+        received_at: Timestamp::from_unix_nanos(200),
+        ingested_at: Timestamp::from_unix_nanos(300),
+        quality: DataQuality::OfficialDelayed,
+        payload_reference: PayloadReference::SourceReference(SourceIdentifier::try_from(
+            "filing.json",
+        )?),
+        availability: AvailabilityEvidence::local_first_observed(Timestamp::from_unix_nanos(400)),
+    });
 
     assert!(matches!(
         result,

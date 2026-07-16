@@ -15,7 +15,8 @@ pub use live::{
     DecodedLiveProvenanceInput, LiveProvenance, LiveRecordState, RecordedLiveProvenanceInput,
 };
 pub use research::{
-    AvailabilityEvidence, ResearchContext, ResearchProvenance, ResearchTime, RevisionNumber,
+    AvailabilityEvidence, ResearchContext, ResearchProvenance, ResearchProvenanceInput,
+    ResearchTime, RevisionNumber,
 };
 
 /// Hash algorithm identifying how a retained payload digest was produced.

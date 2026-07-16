@@ -5,8 +5,8 @@ use market_squawk_domain::{
     AvailabilityEvidence, CorporateActionEvent, CorporateActionKind, CorporateActionObservation,
     CoverageStatus, DataQuality, DecodedLiveProvenanceInput, InstrumentId, LiveEventClass,
     LiveProvenance, MarketEventError, PayloadReference, ResearchContext, ResearchError,
-    ResearchProvenance, ResearchTime, RevisionNumber, SourceId, SourceIdentifier, Timestamp,
-    VenueId, VenueSymbol,
+    ResearchProvenance, ResearchProvenanceInput, ResearchTime, RevisionNumber, SourceId,
+    SourceIdentifier, Timestamp, VenueId, VenueSymbol,
 };
 
 fn live_provenance(venue: &'static str) -> Result<LiveProvenance, Box<dyn Error>> {
@@ -28,23 +28,25 @@ fn live_provenance(venue: &'static str) -> Result<LiveProvenance, Box<dyn Error>
 }
 
 fn research_provenance(venue: Option<&str>) -> Result<ResearchProvenance, Box<dyn Error>> {
-    ResearchProvenance::new(
-        SourceId::try_from("reference-feed")?,
-        Some(InstrumentId::from_str(
+    ResearchProvenance::try_new(ResearchProvenanceInput {
+        source_id: SourceId::try_from("reference-feed")?,
+        instrument_id: Some(InstrumentId::from_str(
             "0187f5f1-6fc2-7fa2-bf05-2ce5354c55cb",
         )?),
-        venue.map(VenueId::try_from).transpose()?,
-        SourceIdentifier::try_from("symbol-change-1")?,
-        Some(Timestamp::from_unix_nanos(100)),
-        Timestamp::from_unix_nanos(110),
-        Timestamp::from_unix_nanos(120),
-        DataQuality::OfficialDelayed,
-        PayloadReference::SourceReference(SourceIdentifier::try_from("record:1")?),
-        AvailabilityEvidence::evidenced(
+        venue_id: venue.map(VenueId::try_from).transpose()?,
+        source_identifier: SourceIdentifier::try_from("symbol-change-1")?,
+        source_timestamp: Some(Timestamp::from_unix_nanos(100)),
+        received_at: Timestamp::from_unix_nanos(110),
+        ingested_at: Timestamp::from_unix_nanos(120),
+        quality: DataQuality::OfficialDelayed,
+        payload_reference: PayloadReference::SourceReference(SourceIdentifier::try_from(
+            "record:1",
+        )?),
+        availability: AvailabilityEvidence::evidenced(
             Timestamp::from_unix_nanos(110),
             SourceIdentifier::try_from("source-publication-record")?,
         ),
-    )
+    })
     .map_err(Into::into)
 }
 

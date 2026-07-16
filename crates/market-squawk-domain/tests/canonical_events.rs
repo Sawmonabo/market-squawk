@@ -9,8 +9,8 @@ use market_squawk_domain::{
     LiveEventClass, LiveProvenance, MacroObservation, MarketDepth, MarketEvent, MarketEventError,
     MarketSide, PayloadReference, PositionObservation, PositionSide, PriceTicks, QuantityLots,
     QuoteEvent, ResearchContext, ResearchError, ResearchObservation, ResearchProvenance,
-    ResearchTime, RevisionNumber, SourceId, SourceIdentifier, Timestamp, TradeEvent,
-    TradingHaltEvent, TradingStatus, TransactionObservation,
+    ResearchProvenanceInput, ResearchTime, RevisionNumber, SourceId, SourceIdentifier, Timestamp,
+    TradeEvent, TradingHaltEvent, TradingStatus, TransactionObservation,
 };
 use rust_decimal::Decimal;
 
@@ -33,27 +33,29 @@ fn live_provenance(event_class: LiveEventClass) -> Result<LiveProvenance, Box<dy
 
 fn research_context(instrument: bool) -> Result<ResearchContext, Box<dyn Error>> {
     ResearchContext::new(
-        ResearchProvenance::new(
-            SourceId::try_from("historical-file")?,
-            if instrument {
+        ResearchProvenance::try_new(ResearchProvenanceInput {
+            source_id: SourceId::try_from("historical-file")?,
+            instrument_id: if instrument {
                 Some(InstrumentId::from_str(
                     "0187f5f1-6fc2-7fa2-bf05-2ce5354c55cb",
                 )?)
             } else {
                 None
             },
-            None,
-            SourceIdentifier::try_from("record-7")?,
-            None,
-            Timestamp::from_unix_nanos(110),
-            Timestamp::from_unix_nanos(120),
-            DataQuality::OfficialDelayed,
-            PayloadReference::SourceReference(SourceIdentifier::try_from("fixture:7")?),
-            AvailabilityEvidence::evidenced(
+            venue_id: None,
+            source_identifier: SourceIdentifier::try_from("record-7")?,
+            source_timestamp: None,
+            received_at: Timestamp::from_unix_nanos(110),
+            ingested_at: Timestamp::from_unix_nanos(120),
+            quality: DataQuality::OfficialDelayed,
+            payload_reference: PayloadReference::SourceReference(SourceIdentifier::try_from(
+                "fixture:7",
+            )?),
+            availability: AvailabilityEvidence::evidenced(
                 Timestamp::from_unix_nanos(100),
                 SourceIdentifier::try_from("release-calendar")?,
             ),
-        )?,
+        })?,
         ResearchTime::new(
             Timestamp::from_unix_nanos(90),
             Some(Timestamp::from_unix_nanos(100)),

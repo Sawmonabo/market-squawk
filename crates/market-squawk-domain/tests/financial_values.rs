@@ -2,15 +2,15 @@ use std::str::FromStr;
 
 use market_squawk_domain::{
     AssetClass, AssignmentVerification, BasisPoints, CalendarDate, ChainAddress, ChainAddressRole,
-    ChainId, ConnectionGeneration, ContractMonth, ContractRollMapping, CryptoPair,
-    CryptoProductType, Currency, Cusip, Denomination, EffectiveInterval, ExternalIdentifier,
-    ExternalIdentifierRecord, ExternalIdentifierRecordInput, Figi, FinancialError,
-    FuturesContractIdentity, FuturesContractIdentityInput, FuturesLifecycleDateFields,
-    FuturesLifecycleDates, FuturesLifecycleDatesInput, FuturesSecurityType, IdentifierEntitlement,
-    IdentifierError, IdentifierRightsPolicyReference, IdentityError, InstrumentDefinition,
-    InstrumentDefinitionInput, InstrumentError, InstrumentId, Isin, LifecycleTransition,
-    LifecycleTransitionKind, LotSize, Money, OccOptionIdentity, OptionKind, PayloadReference,
-    PriceError, PriceTicks, ProviderIdentityRecord, ProviderInstrumentId, QuantityError,
+    ChainId, ConnectionGeneration, ContractRollMapping, CryptoPair, CryptoProductType, Currency,
+    Cusip, Denomination, EffectiveInterval, ExternalIdentifier, ExternalIdentifierRecord,
+    ExternalIdentifierRecordInput, Figi, FinancialError, FuturesContractIdentity,
+    FuturesContractIdentityInput, FuturesLifecycleDateFields, FuturesLifecycleDates,
+    FuturesSecurityType, IdentifierEntitlement, IdentifierError, IdentifierRightsPolicyReference,
+    IdentityError, InstrumentDefinition, InstrumentDefinitionInput, InstrumentError, InstrumentId,
+    Isin, LifecycleTransition, LifecycleTransitionKind, LotSize, MaturityMonthYear, Money,
+    OccOptionIdentity, OptionKind, PayloadReference, PriceError, PriceTicks,
+    ProviderIdentityRecord, ProviderIdentityRecordInput, ProviderInstrumentId, QuantityError,
     QuantityLots, RoundingPolicy, Sedol, SequenceNumber, SourceId, SourceIdentifier,
     SymbolIdentityRecord, TickSize, Ticker, TimeError, Timestamp, TradingStatus, VenueId,
     VenueMapping, VenueSymbol,
@@ -387,34 +387,34 @@ fn futures_identity_uses_venue_fields_instead_of_parsing_a_universal_symbol()
     // CFTC/CME reference contracts keep exchange security IDs, sources, native symbols, and
     // expiry fields separate; month-letter parsing is venue metadata behavior.
     assert_eq!(
-        ContractMonth::new(2026, 0),
+        MaturityMonthYear::month(2026, 0),
         Err(IdentifierError::InvalidDate)
     );
-    let expiry = ContractMonth::new(2026, 3)?;
-    let lifecycle = FuturesLifecycleDates::try_new(FuturesLifecycleDatesInput {
-        source_id: SourceId::try_from("cme-reference")?,
-        source_reference: PayloadReference::SourceReference(SourceIdentifier::try_from(
-            "security-definition:1",
-        )?),
-        observed_at: Timestamp::from_unix_nanos(1),
-        dates: FuturesLifecycleDateFields {
-            maturity_date: Some(CalendarDate::new(2026, 3, 20)?),
-            ..FuturesLifecycleDateFields::default()
-        },
+    let expiry = MaturityMonthYear::month(2026, 3)?;
+    let lifecycle = FuturesLifecycleDates::try_new(FuturesLifecycleDateFields {
+        maturity_date: Some(CalendarDate::new(2026, 3, 20)?),
+        ..FuturesLifecycleDateFields::default()
     })?;
+    let source_reference =
+        PayloadReference::SourceReference(SourceIdentifier::try_from("security-definition:1")?);
     let contract = FuturesContractIdentity::try_new(FuturesContractIdentityInput {
+        source_id: SourceId::try_from("cme-reference")?,
+        source_reference,
+        source_timestamp: None,
+        observed_at: Timestamp::from_unix_nanos(1),
+        metadata_revision: SourceIdentifier::try_from("security-definition-revision:1")?,
         venue_id: VenueId::try_from("XCME")?,
         security_id: ProviderInstrumentId::try_from("123456")?,
         security_id_source: SourceIdentifier::try_from("8")?,
         product_code: ProviderInstrumentId::try_from("ES")?,
         native_symbol: VenueSymbol::try_from("ESH6")?,
         security_type: FuturesSecurityType::Future,
-        contract_month: Some(expiry),
+        maturity_month_year: Some(expiry),
         lifecycle,
         legs: Vec::new(),
     })?;
     assert_eq!(contract.native_symbol().as_str(), "ESH6");
-    assert_eq!(contract.contract_month(), Some(expiry));
+    assert_eq!(contract.maturity_month_year(), Some(expiry));
     Ok(())
 }
 
@@ -521,12 +521,18 @@ fn identity_lifecycle_records_keep_effective_time_and_stable_instrument_ids()
         VenueSymbol::try_from("ACME")?,
         interval,
     );
-    let provider = ProviderIdentityRecord::new(
-        current,
-        SourceId::try_from("nasdaq-reference")?,
-        ProviderInstrumentId::try_from("ACME.O")?,
-        interval,
-    );
+    let provider = ProviderIdentityRecord::new(ProviderIdentityRecordInput {
+        instrument_id: current,
+        source_id: SourceId::try_from("nasdaq-reference")?,
+        provider_instrument_id: ProviderInstrumentId::try_from("ACME.O")?,
+        source_reference: PayloadReference::SourceReference(SourceIdentifier::try_from(
+            "nasdaq-reference:ACME.O:1",
+        )?),
+        source_timestamp: None,
+        observed_at: effective_at,
+        metadata_revision: SourceIdentifier::try_from("nasdaq-reference-revision:1")?,
+        validity: interval,
+    });
     assert_eq!(symbol.validity().ends_at(), None);
     assert_eq!(provider.instrument_id(), current);
 
@@ -561,12 +567,18 @@ fn instrument_definition_owns_precision_mappings_identifiers_and_status()
     let id = InstrumentId::try_from(Uuid::parse_str("936da01f-9abd-4d9d-80c7-02af85c822a8")?)?;
     let venue = VenueId::try_from("XNAS")?;
     let mapping = VenueMapping::new(venue.clone(), VenueSymbol::try_from("AAPL")?);
-    let provider_identity = ProviderIdentityRecord::new(
-        id,
-        SourceId::try_from("user-reference")?,
-        ProviderInstrumentId::try_from("AAPL.O")?,
-        EffectiveInterval::new(Timestamp::from_unix_nanos(1), None)?,
-    );
+    let provider_identity = ProviderIdentityRecord::new(ProviderIdentityRecordInput {
+        instrument_id: id,
+        source_id: SourceId::try_from("user-reference")?,
+        provider_instrument_id: ProviderInstrumentId::try_from("AAPL.O")?,
+        source_reference: PayloadReference::SourceReference(SourceIdentifier::try_from(
+            "instrument-row:1",
+        )?),
+        source_timestamp: None,
+        observed_at: Timestamp::from_unix_nanos(1),
+        metadata_revision: SourceIdentifier::try_from("user-reference-revision:1")?,
+        validity: EffectiveInterval::new(Timestamp::from_unix_nanos(1), None)?,
+    });
     let identifier = ExternalIdentifier::Isin(Isin::try_from("US0378331005")?);
     let identifier_record = ExternalIdentifierRecord::new(ExternalIdentifierRecordInput {
         identifier,
@@ -633,8 +645,8 @@ fn validated_display_and_deserialization_do_not_bypass_invariants()
 -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(SequenceNumber::new(42).to_string(), "42");
     assert_eq!(ConnectionGeneration::new(7)?.to_string(), "7");
-    assert_eq!(ContractMonth::new(2026, 3)?.to_string(), "2026-03");
-    assert!(serde_json::from_str::<ContractMonth>(r#"{"year":2026,"month":0}"#).is_err());
+    assert_eq!(MaturityMonthYear::month(2026, 3)?.to_string(), "202603");
+    assert!(serde_json::from_str::<MaturityMonthYear>(r#"{"year":2026,"month":3}"#).is_err());
 
     let address = ChainAddress::try_solana(
         ChainId::try_from("solana:mainnet")?,

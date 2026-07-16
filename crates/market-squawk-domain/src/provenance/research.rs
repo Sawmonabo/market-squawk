@@ -107,27 +107,66 @@ pub struct ResearchProvenance {
     availability: AvailabilityEvidence,
 }
 
+/// Complete current-schema input for constructing [`ResearchProvenance`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResearchProvenanceInput {
+    /// Source namespace.
+    pub source_id: SourceId,
+    /// Stable internal instrument identity when applicable.
+    pub instrument_id: Option<InstrumentId>,
+    /// Venue identity when applicable.
+    pub venue_id: Option<VenueId>,
+    /// Source-native record identifier.
+    pub source_identifier: SourceIdentifier,
+    /// Source-authored timestamp when known.
+    pub source_timestamp: Option<Timestamp>,
+    /// Time the source payload reached this process.
+    pub received_at: Timestamp,
+    /// Time the canonical record was ingested locally.
+    pub ingested_at: Timestamp,
+    /// Evidentiary data-quality class.
+    pub quality: DataQuality,
+    /// Immutable payload evidence.
+    pub payload_reference: PayloadReference,
+    /// Explicit point-in-time availability evidence.
+    pub availability: AvailabilityEvidence,
+}
+
 impl ResearchProvenance {
     /// Constructs research-only provenance using the current schema.
     ///
     /// # Errors
     ///
     /// Rejects receive or reported availability times after local ingestion.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        source_id: SourceId,
-        instrument_id: Option<InstrumentId>,
-        venue_id: Option<VenueId>,
-        source_identifier: SourceIdentifier,
-        source_timestamp: Option<Timestamp>,
-        received_at: Timestamp,
-        ingested_at: Timestamp,
-        quality: DataQuality,
-        payload_reference: PayloadReference,
-        availability: AvailabilityEvidence,
-    ) -> Result<Self, ProvenanceError> {
-        Self::from_wire(
-            SchemaVersion::CURRENT,
+    pub fn try_new(input: ResearchProvenanceInput) -> Result<Self, ProvenanceError> {
+        if input.received_at > input.ingested_at {
+            return Err(ProvenanceError::ReceivedAfterIngested);
+        }
+        if input
+            .availability
+            .reported_at()
+            .is_some_and(|available| available > input.ingested_at)
+        {
+            return Err(ProvenanceError::AvailabilityAfterIngested);
+        }
+        Ok(Self {
+            schema_version: SchemaVersion::CURRENT,
+            source_id: input.source_id,
+            instrument_id: input.instrument_id,
+            venue_id: input.venue_id,
+            source_identifier: input.source_identifier,
+            source_timestamp: input.source_timestamp,
+            received_at: input.received_at,
+            ingested_at: input.ingested_at,
+            quality: input.quality,
+            payload_reference: input.payload_reference,
+            availability: input.availability,
+        })
+    }
+
+    fn try_from_wire(wire: ResearchProvenanceWire) -> Result<Self, ProvenanceError> {
+        let ResearchProvenanceWire {
+            schema_version,
             source_id,
             instrument_id,
             venue_id,
@@ -138,35 +177,9 @@ impl ResearchProvenance {
             quality,
             payload_reference,
             availability,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn from_wire(
-        schema_version: SchemaVersion,
-        source_id: SourceId,
-        instrument_id: Option<InstrumentId>,
-        venue_id: Option<VenueId>,
-        source_identifier: SourceIdentifier,
-        source_timestamp: Option<Timestamp>,
-        received_at: Timestamp,
-        ingested_at: Timestamp,
-        quality: DataQuality,
-        payload_reference: PayloadReference,
-        availability: AvailabilityEvidence,
-    ) -> Result<Self, ProvenanceError> {
+        } = wire;
         ensure_current_schema(schema_version)?;
-        if received_at > ingested_at {
-            return Err(ProvenanceError::ReceivedAfterIngested);
-        }
-        if availability
-            .reported_at()
-            .is_some_and(|available| available > ingested_at)
-        {
-            return Err(ProvenanceError::AvailabilityAfterIngested);
-        }
-        Ok(Self {
-            schema_version,
+        Self::try_new(ResearchProvenanceInput {
             source_id,
             instrument_id,
             venue_id,
@@ -258,20 +271,7 @@ impl<'de> Deserialize<'de> for ResearchProvenance {
         D: Deserializer<'de>,
     {
         let wire = ResearchProvenanceWire::deserialize(deserializer)?;
-        Self::from_wire(
-            wire.schema_version,
-            wire.source_id,
-            wire.instrument_id,
-            wire.venue_id,
-            wire.source_identifier,
-            wire.source_timestamp,
-            wire.received_at,
-            wire.ingested_at,
-            wire.quality,
-            wire.payload_reference,
-            wire.availability,
-        )
-        .map_err(serde::de::Error::custom)
+        Self::try_from_wire(wire).map_err(serde::de::Error::custom)
     }
 }
 
