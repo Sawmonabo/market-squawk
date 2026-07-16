@@ -59,6 +59,18 @@ background/control-plane path.
   [Tokio task blocking guidance](https://docs.rs/tokio/1.52.3/tokio/task/index.html),
   [Tokio `spawn_blocking`](https://docs.rs/tokio/1.52.3/tokio/task/fn.spawn_blocking.html)
 
+- Capture generation state is read on every live publication but replaced only on explicit
+  synchronization. `arc-swap` 1.9.2 provides an atomically replaceable `Arc` for this read-mostly
+  shape and documents lock-free reads. Its consistency guidance also requires loading once and
+  retaining that one snapshot when related fields must not come from different generations. The
+  platform may therefore use `ArcSwap<GenerationCaptureState>` instead of a contended
+  `RwLock<Arc<_>>`; a publication carries the exact loaded `Arc` through the bounded queue. The
+  guard is not retained across async yield points, and actual latency still has to be benchmarked
+  on target hardware before making a Market Squawk performance claim.
+  [`arc-swap` 1.9.2](https://docs.rs/arc-swap/1.9.2/arc_swap/),
+  [`ArcSwap` consistency contract](https://docs.rs/arc-swap/1.9.2/arc_swap/type.ArcSwap.html),
+  [`arc-swap` performance documentation](https://docs.rs/arc-swap/1.9.2/arc_swap/docs/performance/)
+
 ## Required implementation consequences
 
 - `JournalWriter` receives or owns a directory capability plus a validated relative journal name;
@@ -77,6 +89,11 @@ background/control-plane path.
 - The persistent writer performs synchronous filesystem operations on a supervised dedicated
   thread, not a Tokio core worker. The async control-plane handle may await a completion signal, but
   aborting that handle is not treated as proof that an in-progress blocking sync was cancelled.
+- Publication loads one atomically swappable generation-state snapshot, checks the exact binding,
+  reserves both record-count and aggregate-byte capacity, and enqueues an item retaining that same
+  state. It does not acquire a contended reader/writer lock or synchronously write a watch channel.
+- The authoritative health read returns key and integrity from one generation-state snapshot; it
+  never combines independent key and integrity reads across a rollover.
 - Literal legacy `MEJ1` fixtures remain read-only. New writes use only `MSJ1`; existing legacy data
   is never silently rewritten or shadowed.
 
