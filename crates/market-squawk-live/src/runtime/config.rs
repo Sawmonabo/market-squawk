@@ -172,6 +172,19 @@ impl LiveRuntimeConfig {
         Ok(())
     }
 
+    /// Computes the checked conservative peak retained-memory model for these routes.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid route partitioning, checked arithmetic overflow, or an estimate above the
+    /// explicitly configured runtime ceiling.
+    pub fn estimated_peak_bytes(
+        &self,
+        routes: &[LiveRouteConfig],
+    ) -> Result<NonZeroU64, LiveRuntimeConfigError> {
+        super::memory::estimate_peak_bytes(self, routes)
+    }
+
     pub const fn routing_version(&self) -> ShardRoutingVersion {
         self.routing_version
     }
@@ -391,6 +404,8 @@ pub enum LiveRuntimeConfigError {
     CapacityOverflow,
     #[error("runtime could not reserve bounded route validation state")]
     Allocation,
+    #[error("conservative peak runtime bytes {estimated} exceed configured ceiling {ceiling}")]
+    PeakMemoryExceedsCeiling { estimated: u64, ceiling: u64 },
 }
 
 #[cfg(test)]

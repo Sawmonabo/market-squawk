@@ -1,8 +1,30 @@
-//! Authority-free immutable live snapshot contracts and bounded reader configuration.
+//! Authority-free, bounded immutable live-state snapshot contracts.
 
-use std::num::{NonZeroU32, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+use std::sync::Arc;
 
+use market_squawk_domain::{
+    ConnectionGeneration, InstrumentId, PriceTicks, ProviderChannel, ProviderProduct, QuantityLots,
+    SourceId, Timestamp, TradingStatus, VenueId,
+};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::sync::OwnedSemaphorePermit;
+
+use crate::{ShardCount, ShardId, ShardKey, ShardRoutingVersion};
+
+#[path = "snapshot/store.rs"]
+#[allow(
+    dead_code,
+    reason = "Task 8 actor/lifecycle production wiring consumes the private store in the next slice"
+)]
+mod store;
+
+#[allow(
+    unused_imports,
+    reason = "Task 8 actor/lifecycle production wiring consumes these private handles next"
+)]
+pub(crate) use store::{SnapshotPublisher, create_snapshot_plane};
 
 /// Hard bound aligned with one shard's preallocated route table.
 pub(crate) const MAX_SNAPSHOT_ROUTES: usize = 64;
@@ -15,7 +37,344 @@ pub(crate) const MAX_SNAPSHOT_LEVELS_PER_SIDE: u32 = 10_000;
 /// Hard upper bound for one immutable shard snapshot.
 pub(crate) const MAX_SNAPSHOT_RETAINED_BYTES: u32 = 64 * 1024 * 1024;
 
-/// Caller-selected snapshot output bounds validated before actor construction.
+/// Whether one independently bounded snapshot dimension is complete.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotCompleteness {
+    /// Every available item is represented.
+    Complete,
+    /// The configured output limit omitted one or more available items.
+    Truncated,
+    /// No truthful value was available for this dimension.
+    Unavailable,
+}
+
+/// Counts and configured output policy for one independently bounded dimension.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SnapshotDimension {
+    completeness: SnapshotCompleteness,
+    available: u32,
+    returned: u32,
+    configured_limit: u32,
+}
+
+impl SnapshotDimension {
+    #[allow(
+        dead_code,
+        reason = "the Task 8 actor snapshot builder consumes this checked constructor"
+    )]
+    pub(crate) fn from_counts(
+        available: usize,
+        returned: usize,
+        configured_limit: usize,
+    ) -> Result<Self, SnapshotBuildError> {
+        let available = u32::try_from(available).map_err(|_| SnapshotBuildError::CountOverflow)?;
+        let returned = u32::try_from(returned).map_err(|_| SnapshotBuildError::CountOverflow)?;
+        let configured_limit =
+            u32::try_from(configured_limit).map_err(|_| SnapshotBuildError::CountOverflow)?;
+        if returned > available || returned > configured_limit {
+            return Err(SnapshotBuildError::DimensionInvariant);
+        }
+        let completeness = if available == 0 && returned == 0 {
+            SnapshotCompleteness::Complete
+        } else if returned == 0 {
+            SnapshotCompleteness::Unavailable
+        } else if returned == available {
+            SnapshotCompleteness::Complete
+        } else {
+            SnapshotCompleteness::Truncated
+        };
+        Ok(Self {
+            completeness,
+            available,
+            returned,
+            configured_limit,
+        })
+    }
+
+    /// Returns whether this dimension is complete, truncated, or unavailable.
+    pub const fn completeness(&self) -> SnapshotCompleteness {
+        self.completeness
+    }
+
+    /// Returns the number of available values before output bounding.
+    pub const fn available(&self) -> u32 {
+        self.available
+    }
+
+    /// Returns the number of values retained in this DTO.
+    pub const fn returned(&self) -> u32 {
+        self.returned
+    }
+
+    /// Returns the configured maximum for this dimension.
+    pub const fn configured_limit(&self) -> u32 {
+        self.configured_limit
+    }
+}
+
+/// Actor lifecycle at one exact shard publication revision.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShardLifecycleSnapshot {
+    Starting,
+    Ready,
+    Degraded,
+    Stopping,
+    Stopped,
+}
+
+/// Synchronization phase of one source/product/channel stream.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamPhaseSnapshot {
+    Disconnected,
+    AwaitingSnapshot,
+    Synchronizing,
+    Healthy,
+    Quarantined,
+}
+
+/// One scaled integer price level in an immutable diagnostic snapshot.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BookLevelSnapshot {
+    price: PriceTicks,
+    quantity: QuantityLots,
+}
+
+impl BookLevelSnapshot {
+    #[allow(
+        dead_code,
+        reason = "the Task 8 actor snapshot builder consumes this authority-free conversion"
+    )]
+    pub(crate) const fn new(price: PriceTicks, quantity: QuantityLots) -> Self {
+        Self { price, quantity }
+    }
+
+    pub const fn price(self) -> PriceTicks {
+        self.price
+    }
+
+    pub const fn quantity(self) -> QuantityLots {
+        self.quantity
+    }
+}
+
+/// Cross-channel trading status retained separately from stream state.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StatusSnapshot {
+    pub(crate) source: SourceId,
+    pub(crate) venue: VenueId,
+    pub(crate) instrument: InstrumentId,
+    pub(crate) connection_generation: ConnectionGeneration,
+    pub(crate) trading_status: TradingStatus,
+    pub(crate) status_revision: u64,
+}
+
+impl StatusSnapshot {
+    pub const fn source(&self) -> &SourceId {
+        &self.source
+    }
+    pub const fn venue(&self) -> &VenueId {
+        &self.venue
+    }
+    pub const fn instrument(&self) -> InstrumentId {
+        self.instrument
+    }
+    pub const fn connection_generation(&self) -> ConnectionGeneration {
+        self.connection_generation
+    }
+    pub const fn trading_status(&self) -> TradingStatus {
+        self.trading_status
+    }
+    pub const fn status_revision(&self) -> u64 {
+        self.status_revision
+    }
+}
+
+/// Complete bounded view of one independently synchronized provider stream.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StreamSnapshot {
+    pub(crate) source: SourceId,
+    pub(crate) venue: VenueId,
+    pub(crate) instrument: InstrumentId,
+    pub(crate) provider_product: ProviderProduct,
+    pub(crate) provider_channel: ProviderChannel,
+    pub(crate) connection_generation: ConnectionGeneration,
+    pub(crate) phase: StreamPhaseSnapshot,
+    pub(crate) state_revision: u64,
+    pub(crate) snapshot_origin_revision: Option<u64>,
+    pub(crate) health_epoch: u64,
+    pub(crate) source_valid_until: Option<Timestamp>,
+    pub(crate) source_timestamp: Option<Timestamp>,
+    pub(crate) received_at: Option<Timestamp>,
+    pub(crate) evaluated_at: Option<Timestamp>,
+    pub(crate) configured_depth: u32,
+    pub(crate) state_bid_depth: usize,
+    pub(crate) state_ask_depth: usize,
+    pub(crate) bids: Box<[BookLevelSnapshot]>,
+    pub(crate) asks: Box<[BookLevelSnapshot]>,
+    pub(crate) bid_dimension: SnapshotDimension,
+    pub(crate) ask_dimension: SnapshotDimension,
+}
+
+impl StreamSnapshot {
+    pub const fn source(&self) -> &SourceId {
+        &self.source
+    }
+    pub const fn venue(&self) -> &VenueId {
+        &self.venue
+    }
+    pub const fn instrument(&self) -> InstrumentId {
+        self.instrument
+    }
+    pub const fn provider_product(&self) -> &ProviderProduct {
+        &self.provider_product
+    }
+    pub const fn provider_channel(&self) -> &ProviderChannel {
+        &self.provider_channel
+    }
+    pub const fn connection_generation(&self) -> ConnectionGeneration {
+        self.connection_generation
+    }
+    pub const fn phase(&self) -> StreamPhaseSnapshot {
+        self.phase
+    }
+    pub const fn state_revision(&self) -> u64 {
+        self.state_revision
+    }
+    pub const fn snapshot_origin_revision(&self) -> Option<u64> {
+        self.snapshot_origin_revision
+    }
+    pub const fn health_epoch(&self) -> u64 {
+        self.health_epoch
+    }
+    pub const fn source_valid_until(&self) -> Option<Timestamp> {
+        self.source_valid_until
+    }
+    pub const fn source_timestamp(&self) -> Option<Timestamp> {
+        self.source_timestamp
+    }
+    pub const fn received_at(&self) -> Option<Timestamp> {
+        self.received_at
+    }
+    pub const fn evaluated_at(&self) -> Option<Timestamp> {
+        self.evaluated_at
+    }
+    pub const fn configured_depth(&self) -> u32 {
+        self.configured_depth
+    }
+    pub const fn state_bid_depth(&self) -> usize {
+        self.state_bid_depth
+    }
+    pub const fn state_ask_depth(&self) -> usize {
+        self.state_ask_depth
+    }
+    pub fn bids(&self) -> &[BookLevelSnapshot] {
+        &self.bids
+    }
+    pub fn asks(&self) -> &[BookLevelSnapshot] {
+        &self.asks
+    }
+    pub const fn bid_dimension(&self) -> &SnapshotDimension {
+        &self.bid_dimension
+    }
+    pub const fn ask_dimension(&self) -> &SnapshotDimension {
+        &self.ask_dimension
+    }
+}
+
+/// Bounded state for one venue/instrument owner.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteSnapshot {
+    pub(crate) route: ShardKey,
+    pub(crate) streams: Box<[StreamSnapshot]>,
+    pub(crate) statuses: Box<[StatusSnapshot]>,
+    pub(crate) stream_dimension: SnapshotDimension,
+    pub(crate) status_dimension: SnapshotDimension,
+}
+
+impl RouteSnapshot {
+    pub const fn route(&self) -> &ShardKey {
+        &self.route
+    }
+    pub fn streams(&self) -> &[StreamSnapshot] {
+        &self.streams
+    }
+    pub fn statuses(&self) -> &[StatusSnapshot] {
+        &self.statuses
+    }
+    pub const fn stream_dimension(&self) -> &SnapshotDimension {
+        &self.stream_dimension
+    }
+    pub const fn status_dimension(&self) -> &SnapshotDimension {
+        &self.status_dimension
+    }
+}
+
+/// Complete immutable publication from one single-writer shard actor.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShardSnapshot {
+    pub(crate) routing_version: ShardRoutingVersion,
+    pub(crate) shard_count: ShardCount,
+    pub(crate) runtime_incarnation: NonZeroU64,
+    pub(crate) shard_id: ShardId,
+    pub(crate) snapshot_revision: NonZeroU64,
+    pub(crate) health_revision: u64,
+    pub(crate) lifecycle: ShardLifecycleSnapshot,
+    pub(crate) evaluated_at: Timestamp,
+    pub(crate) published_at: Timestamp,
+    pub(crate) routes: Box<[RouteSnapshot]>,
+    pub(crate) route_dimension: SnapshotDimension,
+    pub(crate) retained_bytes: u64,
+}
+
+impl ShardSnapshot {
+    pub const fn routing_version(&self) -> ShardRoutingVersion {
+        self.routing_version
+    }
+    pub const fn shard_count(&self) -> ShardCount {
+        self.shard_count
+    }
+    pub const fn runtime_incarnation(&self) -> NonZeroU64 {
+        self.runtime_incarnation
+    }
+    pub const fn shard_id(&self) -> ShardId {
+        self.shard_id
+    }
+    pub const fn snapshot_revision(&self) -> NonZeroU64 {
+        self.snapshot_revision
+    }
+    pub const fn health_revision(&self) -> u64 {
+        self.health_revision
+    }
+    pub const fn lifecycle(&self) -> ShardLifecycleSnapshot {
+        self.lifecycle
+    }
+    pub const fn evaluated_at(&self) -> Timestamp {
+        self.evaluated_at
+    }
+    pub const fn published_at(&self) -> Timestamp {
+        self.published_at
+    }
+    pub fn routes(&self) -> &[RouteSnapshot] {
+        &self.routes
+    }
+    pub const fn route_dimension(&self) -> &SnapshotDimension {
+        &self.route_dimension
+    }
+    pub const fn retained_bytes(&self) -> u64 {
+        self.retained_bytes
+    }
+}
+
+/// Caller-selected snapshot bounds validated before actor construction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SnapshotLimits {
     maximum_routes: NonZeroUsize,
@@ -27,10 +386,6 @@ pub struct SnapshotLimits {
 
 impl SnapshotLimits {
     /// Constructs locally bounded snapshot dimensions.
-    ///
-    /// # Errors
-    ///
-    /// Rejects zero and values above the corresponding live-plane hard limit.
     pub fn try_new(
         maximum_routes: usize,
         maximum_streams_per_route: usize,
@@ -80,6 +435,99 @@ impl SnapshotLimits {
     }
 }
 
+/// Non-cloneable retained-reader lease for one immutable shard publication.
+#[derive(Debug)]
+pub struct LiveSnapshotLease {
+    snapshot: Arc<ShardSnapshot>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl LiveSnapshotLease {
+    pub(crate) fn new(snapshot: Arc<ShardSnapshot>, permit: OwnedSemaphorePermit) -> Self {
+        Self {
+            snapshot,
+            _permit: permit,
+        }
+    }
+
+    /// Returns the immutable DTO guarded by this retained-reader permit.
+    pub fn snapshot(&self) -> &ShardSnapshot {
+        &self.snapshot
+    }
+}
+
+/// Revision metadata for one shard in a non-atomic cross-shard read.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShardSnapshotRevision {
+    shard_id: ShardId,
+    snapshot_revision: NonZeroU64,
+    evaluated_at: Timestamp,
+    published_at: Timestamp,
+}
+
+impl ShardSnapshotRevision {
+    pub const fn shard_id(&self) -> ShardId {
+        self.shard_id
+    }
+    pub const fn snapshot_revision(&self) -> NonZeroU64 {
+        self.snapshot_revision
+    }
+    pub const fn evaluated_at(&self) -> Timestamp {
+        self.evaluated_at
+    }
+    pub const fn published_at(&self) -> Timestamp {
+        self.published_at
+    }
+}
+
+/// Non-cloneable retained-reader lease for a sorted cross-shard revision vector.
+#[derive(Debug)]
+pub struct LiveRuntimeSnapshotLease {
+    snapshots: Box<[Arc<ShardSnapshot>]>,
+    revisions: Box<[ShardSnapshotRevision]>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl LiveRuntimeSnapshotLease {
+    pub(crate) fn new(
+        snapshots: Box<[Arc<ShardSnapshot>]>,
+        revisions: Box<[ShardSnapshotRevision]>,
+        permit: OwnedSemaphorePermit,
+    ) -> Self {
+        Self {
+            snapshots,
+            revisions,
+            _permit: permit,
+        }
+    }
+
+    pub fn snapshots(&self) -> &[Arc<ShardSnapshot>] {
+        &self.snapshots
+    }
+    pub fn revisions(&self) -> &[ShardSnapshotRevision] {
+        &self.revisions
+    }
+}
+
+/// Cloneable read-only access to current immutable shard publications.
+#[derive(Clone, Debug)]
+pub struct LiveSnapshotReader {
+    pub(crate) plane: Arc<store::SnapshotPlane>,
+}
+
+impl LiveSnapshotReader {
+    /// Loads one current shard snapshot without blocking publication.
+    pub fn try_load(&self, shard: ShardId) -> Result<LiveSnapshotLease, SnapshotReadError> {
+        self.plane.try_load(shard)
+    }
+
+    /// Loads a sorted cross-shard revision vector without claiming global atomicity.
+    pub fn try_load_all(&self) -> Result<LiveRuntimeSnapshotLease, SnapshotReadError> {
+        self.plane.try_load_all()
+    }
+}
+
 fn checked_usize(
     field: &'static str,
     value: usize,
@@ -125,17 +573,32 @@ pub enum SnapshotLimitsError {
     },
 }
 
-#[cfg(test)]
-mod tests {
-    use super::SnapshotLimits;
+/// Snapshot construction invariant or checked-retained-size failure.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[allow(
+    dead_code,
+    reason = "the Task 8 actor snapshot builder maps these fail-closed construction errors"
+)]
+pub(crate) enum SnapshotBuildError {
+    #[error("snapshot count cannot be represented")]
+    CountOverflow,
+    #[error("snapshot dimension counts violate configured bounds")]
+    DimensionInvariant,
+    #[error("snapshot retained-byte accounting overflowed")]
+    RetainedSizeOverflow,
+    #[error("snapshot revision exhausted")]
+    RevisionExhausted,
+    #[error("system clock is outside the supported timestamp range")]
+    ClockRange,
+}
 
-    #[test]
-    fn limits_are_nonzero_and_locally_bounded() {
-        assert!(SnapshotLimits::try_new(1, 1, 1, 1, 1).is_ok());
-        assert!(SnapshotLimits::try_new(0, 1, 1, 1, 1).is_err());
-        assert!(SnapshotLimits::try_new(1, 0, 1, 1, 1).is_err());
-        assert!(SnapshotLimits::try_new(1, 1, 0, 1, 1).is_err());
-        assert!(SnapshotLimits::try_new(1, 1, 1, 0, 1).is_err());
-        assert!(SnapshotLimits::try_new(1, 1, 1, 1, 0).is_err());
-    }
+/// Bounded retained-reader or shard lookup failure.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum SnapshotReadError {
+    #[error("all configured retained snapshot reader permits are in use")]
+    ReaderLimitReached,
+    #[error("snapshot shard identity is not part of this runtime incarnation")]
+    UnknownShard,
+    #[error("snapshot reader plane is closed")]
+    Closed,
 }
