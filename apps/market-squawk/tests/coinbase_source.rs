@@ -1,11 +1,16 @@
-use std::time::Duration;
+use std::{num::NonZeroUsize, time::Duration};
 
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use market_squawk::{
     domain::MarketEvent,
-    journal::{JournalReader, JournalSink},
-    source::{MarketSource, coinbase::CoinbaseSource},
+    journal::JournalReader,
+    source::{CaptureContext, MarketSource, coinbase::CoinbaseSource},
+};
+use market_squawk_domain::{ConnectionGeneration, MetadataRevision, SourceId, SourceIdentifier};
+use market_squawk_platform::{
+    CaptureGenerationKey, CaptureWriterPolicy, LocalPaths, raw_capture_channel,
+    spawn_capture_writer,
 };
 use serde_json::Value;
 use tempfile::tempdir;
@@ -56,15 +61,40 @@ async fn coinbase_source_journals_and_publishes_local_websocket_messages() -> Re
     });
 
     let directory = tempdir()?;
-    let journal_path = directory.path().join("coinbase.msj");
-    let (journal, journal_task) = JournalSink::spawn(&journal_path, 32)?;
+    let paths = LocalPaths::prepare(directory.path().join("data"))?;
+    let journal_path = paths.journal_write_file("coinbase-exchange")?;
+    let key = CaptureGenerationKey::new(
+        SourceId::try_from("coinbase-exchange")?,
+        MetadataRevision::new(SourceIdentifier::try_from("test-v1")?),
+        SourceIdentifier::try_from("test-session")?,
+        ConnectionGeneration::new(1)?,
+        uuid::Uuid::new_v4(),
+    );
+    let (publisher, mut control, writer) = raw_capture_channel(
+        NonZeroUsize::new(32).ok_or_else(|| anyhow::anyhow!("invalid test capacity"))?,
+        key.clone(),
+    );
+    let capture_handle = spawn_capture_writer(
+        writer,
+        paths.open_journal_writer("coinbase-exchange")?,
+        CaptureWriterPolicy::default(),
+    )?;
+    control.activate_initial(&key)?;
     let (event_sender, mut event_receiver) = mpsc::channel(32);
     let (cancel_sender, cancel_receiver) = watch::channel(false);
-    let source: Box<dyn MarketSource> = Box::new(
+    let mut source: Box<dyn MarketSource> = Box::new(
         CoinbaseSource::new(vec!["BTC-USD".to_owned()]).with_url(format!("ws://{address}")),
     );
 
-    let source_task = tokio::spawn(source.run(journal.clone(), event_sender, cancel_receiver));
+    let source_task = tokio::spawn(async move {
+        source
+            .run_session(
+                CaptureContext::new(publisher, key),
+                event_sender,
+                cancel_receiver,
+            )
+            .await
+    });
     let mut saw_snapshot = false;
     let mut saw_heartbeat = false;
 
@@ -92,13 +122,13 @@ async fn coinbase_source_journals_and_publishes_local_websocket_messages() -> Re
 
     cancel_sender.send(true)?;
     source_task.await??;
-    journal.shutdown().await?;
-    journal_task.await??;
+    let capture_outcome = capture_handle.shutdown(Duration::from_secs(2)).await;
+    assert!(!capture_outcome.is_incomplete());
     server.await??;
 
     let records = JournalReader::open(&journal_path)?.read_all()?;
     assert_eq!(records.len(), 2);
-    assert!(records[0].payload.starts_with(b"{\"type\":\"snapshot\""));
-    assert!(records[1].payload.starts_with(b"{\"type\":\"heartbeat\""));
+    assert!(records[0].payload().starts_with(b"{\"type\":\"snapshot\""));
+    assert!(records[1].payload().starts_with(b"{\"type\":\"heartbeat\""));
     Ok(())
 }

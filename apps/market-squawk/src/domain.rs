@@ -1,39 +1,7 @@
 use chrono::{DateTime, Utc};
+pub use market_squawk_platform::RawCaptureRecord as RawEnvelope;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct RawEnvelope {
-    pub event_id: Uuid,
-    pub source: String,
-    pub connection_id: Uuid,
-    pub source_sequence: Option<u64>,
-    pub exchange_at: Option<DateTime<Utc>>,
-    pub received_at: DateTime<Utc>,
-    pub payload: Vec<u8>,
-}
-
-impl RawEnvelope {
-    #[must_use]
-    pub fn new(
-        source: impl Into<String>,
-        connection_id: Uuid,
-        source_sequence: Option<u64>,
-        exchange_at: Option<DateTime<Utc>>,
-        payload: Vec<u8>,
-    ) -> Self {
-        Self {
-            event_id: Uuid::new_v4(),
-            source: source.into(),
-            connection_id,
-            source_sequence,
-            exchange_at,
-            received_at: Utc::now(),
-            payload,
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

@@ -111,7 +111,7 @@ reconstructable. Fail closed on any required gate.
 requirement identifiers because identifiers can change. It provides testable application-security
 requirements and machine-readable release artifacts. [ASVS project and versioning guidance](https://github.com/OWASP/ASVS/tree/v5.0.0_release)
 **Inference:** Pin `v5.0.0-<requirement>` IDs in a repository checklist. Target Level 2 for the local
-control plane and selected Level 3 controls for credential storage, execution/risk authorization,
+control plane and selected Level 3 controls for credential storage, execution/risk authorization, <!-- gitleaks:allow: security-control prose, not a credential -->
 artifact paths, and MCP boundaries. Record `applicable`, `not_applicable`, evidence, test, reviewer,
 and rationale. Verify schema/bounds validation, least privilege, authorization at every service
 boundary, secret redaction, safe cryptography, secure defaults, log integrity, path containment, and

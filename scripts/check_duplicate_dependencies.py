@@ -18,13 +18,26 @@ ALLOWED_DUPLICATES: dict[str, tuple[str, ...]] = {
     "hashbrown": ("0.12.3", "0.17.1"),
     # rust-bitcoin 0.32 uses the current crate; secp256k1 retains the 0.2 wire helper.
     "hex-conservative": ("0.2.2", "1.2.0"),
+    # cap-std 4 uses io-lifetimes 3 directly while its fs-set-times dependency retains version 2.
+    "io-lifetimes": ("2.0.4", "3.0.1"),
     "r-efi": ("5.3.0", "6.0.0"),
     "rand": ("0.8.7", "0.9.5"),
     "rand_chacha": ("0.3.1", "0.9.0"),
     "rand_core": ("0.6.4", "0.9.5"),
     "syn": ("1.0.109", "2.0.119"),
     "webpki-roots": ("0.26.11", "1.0.8"),
-    "windows-sys": ("0.52.0", "0.61.2"),
+    # The cross-platform capability and existing protocol/test stacks retain separate reviewed
+    # Windows support generations. Keep every target-helper family exact as part of lock review.
+    "windows-sys": ("0.52.0", "0.59.0", "0.60.2", "0.61.2"),
+    "windows-targets": ("0.52.6", "0.53.5"),
+    "windows_aarch64_gnullvm": ("0.52.6", "0.53.1"),
+    "windows_aarch64_msvc": ("0.52.6", "0.53.1"),
+    "windows_i686_gnu": ("0.52.6", "0.53.1"),
+    "windows_i686_gnullvm": ("0.52.6", "0.53.1"),
+    "windows_i686_msvc": ("0.52.6", "0.53.1"),
+    "windows_x86_64_gnu": ("0.52.6", "0.53.1"),
+    "windows_x86_64_gnullvm": ("0.52.6", "0.53.1"),
+    "windows_x86_64_msvc": ("0.52.6", "0.53.1"),
 }
 
 

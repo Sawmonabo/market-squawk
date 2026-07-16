@@ -2,20 +2,37 @@ use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 
 use anyhow::{Context, Result, bail};
 use market_squawk::{
+    AppPaths,
     domain::RawEnvelope,
-    journal::{JournalError, JournalReader, JournalWriter},
+    journal::{JournalError, JournalReader},
 };
 use tempfile::tempdir;
 use uuid::Uuid;
 
+fn envelope(
+    source: &str,
+    connection_id: Uuid,
+    source_sequence: Option<u64>,
+    payload: Vec<u8>,
+) -> Result<RawEnvelope> {
+    Ok(RawEnvelope::try_from_compatibility_parts(
+        Uuid::new_v4(),
+        source.to_owned(),
+        connection_id,
+        source_sequence,
+        None,
+        chrono::Utc::now(),
+        payload,
+    )?)
+}
+
 fn fixture_with_magic(magic: [u8; 4]) -> Result<Vec<u8>> {
-    let envelope = RawEnvelope::new(
+    let envelope = envelope(
         "fixture-source",
         Uuid::nil(),
         Some(1),
-        None,
         br#"{"price":"100.00"}"#.to_vec(),
-    );
+    )?;
     let payload = serde_json::to_vec(&envelope)?;
     let length = u32::try_from(payload.len())?;
 
@@ -45,8 +62,9 @@ fn reads_current_msj1_header() -> Result<()> {
 #[test]
 fn new_journals_are_identified_as_msj1() -> Result<()> {
     let directory = tempdir()?;
-    let path = directory.path().join("new.msj");
-    let mut writer = JournalWriter::open(&path)?;
+    let paths = AppPaths::prepare(directory.path().join("data"))?;
+    let path = paths.journal_write_file("new")?;
+    let mut writer = paths.open_journal_writer("new")?;
     writer.flush()?;
     drop(writer);
 
@@ -57,27 +75,27 @@ fn new_journals_are_identified_as_msj1() -> Result<()> {
 }
 
 #[test]
-fn writer_refuses_to_create_a_journal_without_the_current_extension() -> Result<()> {
+fn writer_refuses_an_unconfined_or_invalid_source_filename() -> Result<()> {
     let directory = tempdir()?;
-    let path = directory.path().join("new.journal");
+    let paths = AppPaths::prepare(directory.path().join("data"))?;
 
-    let Err(error) = JournalWriter::open(&path) else {
-        bail!("writer must enforce the current journal filename extension");
+    let Err(error) = paths.open_journal_writer("../new") else {
+        bail!("writer must enforce a confined source filename");
     };
 
-    assert!(error.to_string().contains("must use the .msj extension"));
-    assert!(!path.exists());
+    assert!(error.to_string().contains("source filename is invalid"));
     Ok(())
 }
 
 #[test]
 fn writer_refuses_to_append_to_legacy_mej1() -> Result<()> {
     let directory = tempdir()?;
-    let path = directory.path().join("legacy.mej");
+    let paths = AppPaths::prepare(directory.path().join("data"))?;
+    let path = paths.journal_write_file("legacy")?;
     let original = fixture_with_magic(*b"MEJ1")?;
     std::fs::write(&path, &original)?;
 
-    let Err(error) = JournalWriter::open(&path) else {
+    let Err(error) = paths.open_journal_writer("legacy") else {
         bail!("legacy journal must remain read-only");
     };
     assert!(error.to_string().contains("legacy journal is read-only"));
@@ -108,16 +126,16 @@ fn bounded_collection_rejects_record_count_overflow() -> Result<()> {
 #[test]
 fn journal_round_trip_preserves_raw_envelope() -> Result<()> {
     let directory = tempdir()?;
-    let path = directory.path().join("test.msj");
-    let expected = RawEnvelope::new(
+    let paths = AppPaths::prepare(directory.path().join("data"))?;
+    let path = paths.journal_write_file("test")?;
+    let expected = envelope(
         "test-source",
         Uuid::new_v4(),
         Some(42),
-        None,
         br#"{"price":"100.00"}"#.to_vec(),
-    );
+    )?;
 
-    let mut writer = JournalWriter::open(&path)?;
+    let mut writer = paths.open_journal_writer("test")?;
     writer.append(&expected)?;
     writer.flush()?;
 
@@ -129,16 +147,11 @@ fn journal_round_trip_preserves_raw_envelope() -> Result<()> {
 #[test]
 fn journal_detects_payload_corruption() -> Result<()> {
     let directory = tempdir()?;
-    let path = directory.path().join("test.msj");
-    let record = RawEnvelope::new(
-        "test-source",
-        Uuid::new_v4(),
-        Some(1),
-        None,
-        b"original".to_vec(),
-    );
+    let paths = AppPaths::prepare(directory.path().join("data"))?;
+    let path = paths.journal_write_file("test")?;
+    let record = envelope("test-source", Uuid::new_v4(), Some(1), b"original".to_vec())?;
 
-    let mut writer = JournalWriter::open(&path)?;
+    let mut writer = paths.open_journal_writer("test")?;
     writer.append(&record)?;
     writer.flush()?;
     drop(writer);
@@ -165,8 +178,9 @@ fn journal_detects_payload_corruption() -> Result<()> {
 #[test]
 fn journal_rejects_a_truncated_record_length() -> Result<()> {
     let directory = tempdir()?;
-    let path = directory.path().join("test.msj");
-    let mut writer = JournalWriter::open(&path)?;
+    let paths = AppPaths::prepare(directory.path().join("data"))?;
+    let path = paths.journal_write_file("test")?;
+    let mut writer = paths.open_journal_writer("test")?;
     writer.flush()?;
     drop(writer);
 
@@ -184,16 +198,11 @@ fn journal_rejects_a_truncated_record_length() -> Result<()> {
 #[test]
 fn journal_writer_refuses_to_append_to_a_truncated_existing_journal() -> Result<()> {
     let directory = tempdir()?;
-    let path = directory.path().join("test.msj");
-    let record = RawEnvelope::new(
-        "test-source",
-        Uuid::new_v4(),
-        Some(7),
-        None,
-        b"original".to_vec(),
-    );
+    let paths = AppPaths::prepare(directory.path().join("data"))?;
+    let path = paths.journal_write_file("test")?;
+    let record = envelope("test-source", Uuid::new_v4(), Some(7), b"original".to_vec())?;
 
-    let mut writer = JournalWriter::open(&path)?;
+    let mut writer = paths.open_journal_writer("test")?;
     writer.append(&record)?;
     writer.flush()?;
     drop(writer);
@@ -204,7 +213,7 @@ fn journal_writer_refuses_to_append_to_a_truncated_existing_journal() -> Result<
         .open(&path)?
         .set_len(length - 1)?;
 
-    let Err(error) = JournalWriter::open(&path) else {
+    let Err(error) = paths.open_journal_writer("test") else {
         bail!("writer must reject a truncated existing journal");
     };
     assert!(error.to_string().contains("truncated record payload"));
@@ -214,10 +223,10 @@ fn journal_writer_refuses_to_append_to_a_truncated_existing_journal() -> Result<
 #[test]
 fn journal_allows_only_one_writer_per_file() -> Result<()> {
     let directory = tempdir()?;
-    let path = directory.path().join("test.msj");
-    let _first = JournalWriter::open(&path)?;
+    let paths = AppPaths::prepare(directory.path().join("data"))?;
+    let _first = paths.open_journal_writer("test")?;
 
-    let Err(error) = JournalWriter::open(&path) else {
+    let Err(error) = paths.open_journal_writer("test") else {
         bail!("second writer must be rejected");
     };
     assert!(error.to_string().contains("already has an active writer"));

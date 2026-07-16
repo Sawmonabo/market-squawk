@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use market_squawk::{domain::RawEnvelope, journal::JournalWriter};
+use market_squawk::{AppPaths, domain::RawEnvelope};
 use serde_json::Value;
 use tempfile::tempdir;
 use uuid::Uuid;
@@ -29,18 +29,19 @@ fn command(data_dir: &Path) -> Command {
 }
 
 fn legacy_fixture(data_dir: &Path) -> Result<PathBuf> {
-    let journal_dir = data_dir.join("journal");
-    fs::create_dir_all(&journal_dir)?;
-    let current = journal_dir.join("fixture.msj");
-    let legacy = journal_dir.join(format!("{SOURCE}.mej"));
-    let mut writer = JournalWriter::open(&current)?;
-    writer.append(&RawEnvelope::new(
-        "fixture-source",
+    let paths = AppPaths::prepare(data_dir)?;
+    let current = paths.journal_write_file("fixture")?;
+    let legacy = paths.journal_dir().join(format!("{SOURCE}.mej"));
+    let mut writer = paths.open_journal_writer("fixture")?;
+    writer.append(&RawEnvelope::try_from_compatibility_parts(
+        Uuid::new_v4(),
+        "fixture-source".to_owned(),
         Uuid::nil(),
         Some(1),
         None,
+        chrono::Utc::now(),
         br#"{"fixture":true}"#.to_vec(),
-    ))?;
+    )?)?;
     writer.flush()?;
     drop(writer);
 
@@ -55,8 +56,9 @@ fn legacy_fixture(data_dir: &Path) -> Result<PathBuf> {
 }
 
 fn current_fixture(data_dir: &Path) -> Result<PathBuf> {
-    let path = data_dir.join("journal").join(format!("{SOURCE}.msj"));
-    JournalWriter::open(&path)?.flush()?;
+    let paths = AppPaths::prepare(data_dir)?;
+    let path = paths.journal_write_file(SOURCE)?;
+    paths.open_journal_writer(SOURCE)?.flush()?;
     Ok(path)
 }
 

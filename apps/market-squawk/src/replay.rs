@@ -25,12 +25,12 @@ impl ReplaySummary {
         self.records = self.records.saturating_add(1);
         self.bytes = self
             .bytes
-            .saturating_add(u64::try_from(record.payload.len())?);
-        self.first_received_at.get_or_insert(record.received_at);
-        self.last_received_at = Some(record.received_at);
+            .saturating_add(u64::try_from(record.payload().len())?);
+        self.first_received_at.get_or_insert(record.received_at());
+        self.last_received_at = Some(record.received_at());
         *self
             .records_by_source
-            .entry(record.source.clone())
+            .entry(record.source().to_owned())
             .or_default() += 1;
         Ok(())
     }
@@ -64,13 +64,13 @@ pub fn replay_coinbase_journal(
 
     while let Some(record) = reader.next_record()? {
         summary.observe(&record)?;
-        if record.source != "coinbase-exchange" {
+        if record.source() != "coinbase-exchange" {
             continue;
         }
 
-        let value = serde_json::from_slice(&record.payload)
+        let value = serde_json::from_slice(record.payload())
             .context("journal contains invalid Coinbase JSON")?;
-        if let Some(event) = decode_message(&value, record.received_at)? {
+        if let Some(event) = decode_message(&value, record.received_at())? {
             engine.handle(event);
         }
     }

@@ -1,13 +1,14 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
-use market_squawk::{domain::RawEnvelope, journal::JournalWriter, replay::replay_coinbase_journal};
+use market_squawk::{AppPaths, domain::RawEnvelope, replay::replay_coinbase_journal};
 use tempfile::tempdir;
 use uuid::Uuid;
 
 #[test]
 fn coinbase_journal_replay_rebuilds_the_order_book() -> Result<()> {
     let directory = tempdir()?;
-    let path = directory.path().join("coinbase.msj");
+    let paths = AppPaths::prepare(directory.path().join("data"))?;
+    let path = paths.journal_write_file("coinbase-exchange")?;
     let connection_id = Uuid::new_v4();
     let received_at = Utc::now();
     let payload = br#"{
@@ -18,16 +19,16 @@ fn coinbase_journal_replay_rebuilds_the_order_book() -> Result<()> {
     }"#
     .to_vec();
 
-    let mut writer = JournalWriter::open(&path)?;
-    writer.append(&RawEnvelope {
-        event_id: Uuid::new_v4(),
-        source: "coinbase-exchange".to_owned(),
+    let mut writer = paths.open_journal_writer("coinbase-exchange")?;
+    writer.append(&RawEnvelope::try_from_compatibility_parts(
+        Uuid::new_v4(),
+        "coinbase-exchange".to_owned(),
         connection_id,
-        source_sequence: None,
-        exchange_at: None,
+        None,
+        None,
         received_at,
         payload,
-    })?;
+    )?)?;
     writer.flush()?;
 
     let replay = replay_coinbase_journal(&path, 5_000, false)?;

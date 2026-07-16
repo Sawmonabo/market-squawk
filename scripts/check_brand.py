@@ -28,23 +28,47 @@ class AllowedOccurrence(NamedTuple):
 # line and the exact occurrence count, so changed, duplicated, missing, and stale references fail.
 ALLOWED_OCCURRENCES = {
     (".gitattributes", 2, 2): AllowedOccurrence(f"*{TOKENS[2]} binary"),
-    ("apps/market-squawk/src/journal.rs", 33, 3): AllowedOccurrence(
-        f'            b"{TOKENS[3]}" => Ok(Self::LegacyMej1),'
-    ),
-    ("apps/market-squawk/tests/journal.rs", 31, 3): AllowedOccurrence(
+    ("apps/market-squawk/tests/journal.rs", 48, 3): AllowedOccurrence(
         f'    let bytes = fixture_with_magic(*b"{TOKENS[3]}")?;'
     ),
-    ("apps/market-squawk/tests/journal.rs", 76, 2): AllowedOccurrence(
-        f'    let path = directory.path().join("legacy{TOKENS[2]}");'
-    ),
-    ("apps/market-squawk/tests/journal.rs", 77, 3): AllowedOccurrence(
+    ("apps/market-squawk/tests/journal.rs", 95, 3): AllowedOccurrence(
         f'    let original = fixture_with_magic(*b"{TOKENS[3]}")?;'
     ),
-    ("apps/market-squawk/tests/journal_path_integration.rs", 35, 2): AllowedOccurrence(
-        f'    let legacy = journal_dir.join(format!("{{SOURCE}}{TOKENS[2]}"));'
+    ("apps/market-squawk/tests/journal_path_integration.rs", 34, 2): AllowedOccurrence(
+        f'    let legacy = paths.journal_dir().join(format!("{{SOURCE}}{TOKENS[2]}"));'
     ),
-    ("apps/market-squawk/tests/journal_path_integration.rs", 51, 3): AllowedOccurrence(
+    ("apps/market-squawk/tests/journal_path_integration.rs", 52, 3): AllowedOccurrence(
         f'        .copy_from_slice(b"{TOKENS[3]}");'
+    ),
+    ("crates/market-squawk-platform/src/journal.rs", 3, 3): AllowedOccurrence(
+        f"//! `{TOKENS[3]}` and `MSJ1` preserve source-faithful diagnostic bytes, raw connection identity, and"
+    ),
+    ("crates/market-squawk-platform/src/journal.rs", 32, 3): AllowedOccurrence(
+        f"/// Explicit authority limitation of every committed `{TOKENS[3]}`/`MSJ1` replay."
+    ),
+    ("crates/market-squawk-platform/src/journal.rs", 44, 3): AllowedOccurrence(
+        f'            b"{TOKENS[3]}" => Ok(Self::LegacyMej1),'
+    ),
+    ("crates/market-squawk-platform/src/journal.rs", 222, 3): AllowedOccurrence(
+        f"/// Streaming reader for committed `MSJ1` and legacy `{TOKENS[3]}` records."
+    ),
+    ("crates/market-squawk-platform/src/paths.rs", 232, 2): AllowedOccurrence(
+        f"    /// Legacy `{TOKENS[3]}/{TOKENS[2]}` format."
+    ),
+    ("crates/market-squawk-platform/src/paths.rs", 232, 3): AllowedOccurrence(
+        f"    /// Legacy `{TOKENS[3]}/{TOKENS[2]}` format."
+    ),
+    ("crates/market-squawk-platform/src/raw_record.rs", 160, 3): AllowedOccurrence(
+        f"/// `{TOKENS[3]}` and `MSJ1` historically accepted nil UUIDs and otherwise unconstrained field values as"
+    ),
+    ("crates/market-squawk-platform/tests/journal_compatibility.rs", 50, 3): AllowedOccurrence(
+        f'    for magic in [*b"MSJ1", *b"{TOKENS[3]}"] {{'
+    ),
+    ("crates/market-squawk-platform/tests/journal_compatibility.rs", 64, 3): AllowedOccurrence(
+        f'    for magic in [*b"{TOKENS[3]}", *b"MSJ1"] {{'
+    ),
+    ("crates/market-squawk-platform/tests/journal_compatibility.rs", 147, 3): AllowedOccurrence(
+        f'    std::fs::write(&current, fixture_with_magic(*b"{TOKENS[3]}")?)?;'
     ),
     ("README.md", 204, 2): AllowedOccurrence(
         f"Readers retain bounded compatibility with legacy `{TOKENS[3]}/{TOKENS[2]}` journals, but writers never create or"

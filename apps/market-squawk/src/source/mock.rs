@@ -1,5 +1,8 @@
+use std::sync::Arc;
+
 use anyhow::Result;
 use async_trait::async_trait;
+use bytes::Bytes;
 use chrono::Utc;
 use rust_decimal::Decimal;
 use serde_json::json;
@@ -7,9 +10,8 @@ use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
 
 use crate::{
-    domain::{BookChange, MarketEvent, PriceLevel, RawEnvelope, Side},
-    journal::JournalSink,
-    source::MarketSource,
+    domain::{BookChange, MarketEvent, PriceLevel, Side},
+    source::{CaptureContext, MarketSource, SourceRunOutcome},
 };
 
 #[derive(Debug, Clone)]
@@ -30,14 +32,17 @@ impl MockSource {
 
 #[async_trait]
 impl MarketSource for MockSource {
-    async fn run(
-        self: Box<Self>,
-        journal: JournalSink,
+    async fn run_session(
+        &mut self,
+        capture: CaptureContext,
         output: mpsc::Sender<MarketEvent>,
         cancel: watch::Receiver<bool>,
-    ) -> Result<()> {
+    ) -> Result<SourceRunOutcome> {
+        if *cancel.borrow() {
+            return Ok(SourceRunOutcome::Cancelled);
+        }
         let source = "mock".to_owned();
-        let connection_id = Uuid::new_v4();
+        let source_label: Arc<str> = Arc::from(source.as_str());
         let received_at = Utc::now();
         let bids = vec![PriceLevel {
             price: Decimal::from(100_u32),
@@ -53,15 +58,14 @@ impl MarketSource for MockSource {
             "bids": [["100", "2"]],
             "asks": [["101", "2"]]
         }))?;
-        journal
-            .append(RawEnvelope::new(
-                &source,
-                connection_id,
-                Some(1),
-                Some(received_at),
-                snapshot_payload,
-            ))
-            .await?;
+        let _capture_receipt = capture.publish(
+            Uuid::new_v4(),
+            Arc::clone(&source_label),
+            Some(1),
+            Some(received_at),
+            received_at,
+            Bytes::from(snapshot_payload),
+        )?;
         output
             .send(MarketEvent::BookSnapshot {
                 source: source.clone(),
@@ -74,7 +78,7 @@ impl MarketSource for MockSource {
 
         for index in 0..self.events {
             if *cancel.borrow() {
-                break;
+                return Ok(SourceRunOutcome::Cancelled);
             }
             let sequence = u64::try_from(index)?.saturating_add(2);
             let price = Decimal::from(100_u32) + Decimal::new(i64::try_from(index % 25)?, 2);
@@ -93,15 +97,14 @@ impl MarketSource for MockSource {
                 "price": price.to_string(),
                 "size": size.to_string()
             }))?;
-            journal
-                .append(RawEnvelope::new(
-                    &source,
-                    connection_id,
-                    Some(sequence),
-                    Some(received_at),
-                    raw,
-                ))
-                .await?;
+            let _capture_receipt = capture.publish(
+                Uuid::new_v4(),
+                Arc::clone(&source_label),
+                Some(sequence),
+                Some(received_at),
+                received_at,
+                Bytes::from(raw),
+            )?;
             output
                 .send(MarketEvent::BookDelta {
                     source: source.clone(),
@@ -113,7 +116,6 @@ impl MarketSource for MockSource {
                 .await?;
         }
 
-        journal.flush().await?;
-        Ok(())
+        Ok(SourceRunOutcome::Completed)
     }
 }

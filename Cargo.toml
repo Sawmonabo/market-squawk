@@ -12,15 +12,18 @@ license = "Apache-2.0 OR MIT"
 
 [workspace.dependencies]
 anyhow = "1.0"
+arc-swap = "=1.9.2"
 async-trait = "0.1"
 bs58 = "0.5"
-bitcoin = { version = "=0.32.102", default-features = false, features = ["std"] }
 bytes = "1.10"
+cap-std = "4.0.2"
+bitcoin = { version = "=0.32.102", default-features = false, features = ["std"] }
 chrono = { version = "0.4", features = ["clock", "serde"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 crc32fast = "1.4"
 fs2 = "0.4"
 futures-util = "0.3"
+libc = "0.2"
 num-bigint = "0.4"
 parking_lot = "0.12"
 proptest = "1.7"
@@ -44,10 +47,12 @@ tokio = { version = "1.43", features = [
 ] }
 tokio-util = "0.7"
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+toml = "1.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 uuid = { version = "1.12", features = ["serde", "v4", "v5"] }
 url = "2.5"
+zeroize = "1.8"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

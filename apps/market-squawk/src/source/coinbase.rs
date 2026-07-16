@@ -1,7 +1,8 @@
-use std::str::FromStr;
+use std::{str::FromStr, sync::Arc};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
 use rust_decimal::Decimal;
@@ -11,9 +12,8 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use uuid::Uuid;
 
 use crate::{
-    domain::{BookChange, MarketEvent, PriceLevel, RawEnvelope, Side},
-    journal::JournalSink,
-    source::MarketSource,
+    domain::{BookChange, MarketEvent, PriceLevel, Side},
+    source::{CaptureContext, MarketSource, SourceRunOutcome},
 };
 
 const SOURCE_NAME: &str = "coinbase-exchange";
@@ -45,56 +45,41 @@ impl CoinbaseSource {
 
 #[async_trait]
 impl MarketSource for CoinbaseSource {
-    async fn run(
-        self: Box<Self>,
-        journal: JournalSink,
+    async fn run_session(
+        &mut self,
+        capture: CaptureContext,
         events: mpsc::Sender<MarketEvent>,
         mut cancel: watch::Receiver<bool>,
-    ) -> Result<()> {
-        let mut backoff_seconds = 1_u64;
-
-        loop {
-            if *cancel.borrow() {
-                return Ok(());
-            }
-
-            let result = self.run_session(&journal, &events, &mut cancel).await;
-            if *cancel.borrow() {
-                return Ok(());
-            }
-
-            let detail = result.err().map(|error| format!("{error:#}"));
-            events
-                .send(MarketEvent::SourceStatus {
-                    source: SOURCE_NAME.to_owned(),
-                    status: "disconnected".to_owned(),
-                    detail,
-                    received_at: Utc::now(),
-                })
-                .await?;
-
-            tokio::select! {
-                changed = cancel.changed() => {
-                    if changed.is_err() || *cancel.borrow() {
-                        return Ok(());
-                    }
-                }
-                () = tokio::time::sleep(std::time::Duration::from_secs(backoff_seconds)) => {}
-            }
-            backoff_seconds = (backoff_seconds.saturating_mul(2)).min(30);
+    ) -> Result<SourceRunOutcome> {
+        if *cancel.borrow() {
+            return Ok(SourceRunOutcome::Cancelled);
         }
+        let result = self.run_connection(&capture, &events, &mut cancel).await;
+        if *cancel.borrow() {
+            return Ok(SourceRunOutcome::Cancelled);
+        }
+        let detail = result.err().map(|error| format!("{error:#}"));
+        events
+            .send(MarketEvent::SourceStatus {
+                source: SOURCE_NAME.to_owned(),
+                status: "disconnected".to_owned(),
+                detail,
+                received_at: Utc::now(),
+            })
+            .await?;
+        Ok(SourceRunOutcome::ReconnectRequired)
     }
 }
 
 impl CoinbaseSource {
-    async fn run_session(
+    async fn run_connection(
         &self,
-        journal: &JournalSink,
+        capture: &CaptureContext,
         events: &mpsc::Sender<MarketEvent>,
         cancel: &mut watch::Receiver<bool>,
     ) -> Result<()> {
         validate_products(&self.products)?;
-        let connection_id = Uuid::new_v4();
+        let source_label: Arc<str> = Arc::from(SOURCE_NAME);
         events
             .send(MarketEvent::SourceStatus {
                 source: SOURCE_NAME.to_owned(),
@@ -143,29 +128,16 @@ impl CoinbaseSource {
                     match message? {
                         Message::Text(text) => {
                             let received_at = Utc::now();
-                            let payload = text.as_bytes().to_vec();
+                            let payload: Bytes = text.into();
+                            let _capture_receipt = capture.publish(
+                                Uuid::new_v4(),
+                                Arc::clone(&source_label),
+                                None,
+                                None,
+                                received_at,
+                                payload.clone(),
+                            )?;
                             let parsed = serde_json::from_slice::<Value>(&payload);
-                            let source_sequence = parsed
-                                .as_ref()
-                                .ok()
-                                .and_then(|value| value.get("sequence"))
-                                .and_then(Value::as_u64);
-                            let exchange_at = parsed
-                                .as_ref()
-                                .ok()
-                                .and_then(|value| parse_optional_time_lossy(value.get("time")));
-                            journal
-                                .append(RawEnvelope {
-                                    event_id: Uuid::new_v4(),
-                                    source: SOURCE_NAME.to_owned(),
-                                    connection_id,
-                                    source_sequence,
-                                    exchange_at,
-                                    received_at,
-                                    payload,
-                                })
-                                .await?;
-
                             let parsed = parsed.context("Coinbase sent invalid JSON")?;
                             if let Some(event) = decode_message(&parsed, received_at)? {
                                 let is_error = matches!(
@@ -360,8 +332,4 @@ fn parse_optional_time(value: Option<&Value>) -> Result<Option<DateTime<Utc>>> {
     let parsed = DateTime::parse_from_rfc3339(raw)
         .with_context(|| format!("invalid RFC 3339 timestamp: {raw}"))?;
     Ok(Some(parsed.with_timezone(&Utc)))
-}
-
-fn parse_optional_time_lossy(value: Option<&Value>) -> Option<DateTime<Utc>> {
-    parse_optional_time(value).ok().flatten()
 }
