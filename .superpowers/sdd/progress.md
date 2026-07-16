@@ -34,8 +34,11 @@ Stage 0: complete (commit 66d30fe, planning/research controls committed; baselin
   behavior and the exact combined gate are recorded in
   `docs/reports/q2-task8-implementation.md`. Final documentation commit and root integration may
   advance the checkpoint head without changing the tested production behavior.
-- Quarter 2 review: pending at the exact integrated Tasks 5-8 head. No approval is implied by lane
-  completion or focused green gates.
+- Quarter 2 review: exact integrated commit `581d4fd` was rejected by both independent review
+  lanes. The combined findings and remediation ownership are persisted in
+  `docs/reports/q2-checkpoint-review.md`. Three isolated TDD lanes are correcting source authority
+  and accounting, live memory/snapshot/scheduling, and capture-worker/Windows-CI defects. No
+  approval is implied until a replacement exact commit passes every gate and two fresh re-reviews.
 
 ## Quarter 3: Tasks 9-12
 
@@ -75,7 +78,9 @@ Stage 0: complete (commit 66d30fe, planning/research controls committed; baselin
   builds for both packages; and diff-check all exited zero against the regenerated integrated lock.
   The live library has 74 passing unit tests plus integration/property/compile-fail suites, and the
   application has 5 focused diagnostic/runtime-composition tests. No performance claim is made.
-- Quarter 2 grouped review must inspect exact-generation invalidation ordering, actor terminal
-  invalidation order, reader permits charged per retained shard generation, clean replacement,
-  application diagnostic quarantine/deletion trigger, and the absence of prohibited evasion
-  surfaces. Review remains pending.
+- Quarter 2 grouped review at `581d4fd` found no Critical bypass but rejected acceptance with the
+  Q2-R01–Q2-R15 ledger: false queued/persistent/transient memory bounds, future health authority,
+  budget revocation/coordinator/account binding, incomplete rejected-stream provenance, timer
+  starvation, unchecked snapshot deserialization, detached blocking capture writer, failure
+  atomicity, aggregate-reader configuration, Windows CI, and cadence wording. Re-review remains
+  pending after code and tests close every item.
