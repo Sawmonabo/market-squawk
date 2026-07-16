@@ -202,9 +202,12 @@ class DocumentationContractTests(unittest.TestCase):
 
         self.assertIn("Bounded caller/source-supplied revision identity", source)
         self.assertIn(
-            "authority and immutability are established by surrounding evidence and registration",
+            "establishes neither authority nor immutability by itself",
             source,
         )
+        self.assertIn("applicable registered source", source)
+        self.assertIn("source-specific adapter verification", source)
+        self.assertNotIn("surrounding evidence and registration", source)
         self.assertNotIn(
             "Immutable revision of the authoritative source metadata used by an assessment.",
             source,
@@ -217,6 +220,11 @@ class DocumentationContractTests(unittest.TestCase):
         self.assertIn("establishes neither authority nor immutability by itself", source)
         self.assertIn("bounded optional version-pinned locators", source)
         self.assertIn("non-substantive retrieval metadata", source)
+        self.assertIn(
+            "complete provider mapping assertion carrying exact content evidence", source
+        )
+        self.assertIn("source-specific adapter verification", source)
+        self.assertNotIn("Complete immutable evidence", source)
         self.assertNotIn("evidence authorizing a provider metadata revision", source)
         self.assertNotIn("surrounding evidence establishes its authority", source)
         self.assertNotIn("optional version-pinned locator for the exact source assertion", source)

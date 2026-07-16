@@ -1,10 +1,12 @@
 //! Transactional provider-identity aggregate and typed ingest outcomes.
 
+use std::cmp::Ordering;
+
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::{
     BoundedVec, ProviderIdentityCollection, ProviderIdentityConflict, ProviderIdentityRecord,
-    compare_records, normalize_provider_identities, provider_identity_at, same_natural_key,
+    compare_records, normalize_provider_identities, provider_identity_at,
 };
 use crate::{InstrumentError, ProviderInstrumentId, SourceId, Timestamp};
 
@@ -133,23 +135,16 @@ impl ProviderIdentityRegistry {
             return Ok(ProviderIdentityIngestOutcome::ObservationCoalesced);
         }
 
-        let key_has_conflict = self.conflicts.iter().any(|conflict| {
-            conflict.key().source_id() == record.source_id()
-                && conflict.key().provider_instrument_id() == record.provider_instrument_id()
-        });
+        let key_has_conflict = self.has_conflict_for_natural_key(&record);
         let outcome = self.classify_growth(&record);
         if key_has_conflict && outcome == ProviderIdentityIngestOutcome::SupersedingRevisionAppended
         {
             return Err(InstrumentError::ProviderIdentityKeyQuarantined { key: record.key() });
         }
 
-        let mut records = self.reconstruction_records()?;
-        if records.len() >= reconstruction_limit {
-            return Err(InstrumentError::ProviderIdentityCapacityExceeded {
-                collection: ProviderIdentityCollection::ReconstructionRecords,
-                max: reconstruction_limit,
-            });
-        }
+        let current_count = self.canonical_record_count()?;
+        let required_capacity = Self::checked_growth_capacity(current_count, reconstruction_limit)?;
+        let mut records = self.reconstruction_records(required_capacity)?;
         records.push(record);
         let replacement = Self::try_from_records(records)?;
         *self = replacement;
@@ -160,11 +155,14 @@ impl ProviderIdentityRegistry {
         &mut self,
         incoming: &ProviderIdentityRecord,
     ) -> Result<bool, InstrumentError> {
-        if let Some(existing) = self
+        if let Ok(index) = self
             .accepted
-            .iter_mut()
-            .find(|existing| existing.same_assertion(incoming))
+            .binary_search_by(|existing| compare_record_revision_prefix(existing, incoming))
         {
+            let existing = &mut self.accepted[index];
+            if !existing.same_assertion(incoming) {
+                return Ok(false);
+            }
             if existing == incoming {
                 return Ok(true);
             }
@@ -172,12 +170,15 @@ impl ProviderIdentityRegistry {
             replacement.merge_assertion_metadata(incoming)?;
             if replacement != *existing {
                 *existing = replacement;
-                self.accepted.sort_by(compare_records);
             }
             return Ok(true);
         }
 
-        for conflict in &mut self.conflicts {
+        if let Ok(index) = self
+            .conflicts
+            .binary_search_by(|conflict| compare_conflict_revision_prefix(conflict, incoming))
+        {
+            let conflict = &mut self.conflicts[index];
             if let Some(existing) = conflict
                 .competing_assertions
                 .iter_mut()
@@ -227,17 +228,22 @@ impl ProviderIdentityRegistry {
     }
 
     fn classify_growth(&self, incoming: &ProviderIdentityRecord) -> ProviderIdentityIngestOutcome {
-        let mut same_key = false;
-        let mut same_revision = false;
-        for existing in self.assertions() {
-            if !same_natural_key(existing, incoming) {
-                continue;
-            }
-            same_key = true;
-            if existing.metadata_revision() == incoming.metadata_revision() {
-                same_revision = true;
-            }
-        }
+        let same_revision = self
+            .accepted
+            .binary_search_by(|existing| compare_record_revision_prefix(existing, incoming))
+            .is_ok()
+            || self
+                .conflicts
+                .binary_search_by(|conflict| compare_conflict_revision_prefix(conflict, incoming))
+                .is_ok();
+        let same_key = self
+            .accepted
+            .binary_search_by(|existing| compare_record_natural_key(existing, incoming))
+            .is_ok()
+            || self
+                .conflicts
+                .binary_search_by(|conflict| compare_conflict_natural_key(conflict, incoming))
+                .is_ok();
         if same_revision {
             ProviderIdentityIngestOutcome::ConflictQuarantined
         } else if same_key {
@@ -255,20 +261,174 @@ impl ProviderIdentityRegistry {
         )
     }
 
-    fn reconstruction_records(&self) -> Result<Vec<ProviderIdentityRecord>, InstrumentError> {
-        let mut records =
-            Vec::with_capacity(self.accepted.len().min(Self::MAX_RECONSTRUCTION_RECORDS));
+    fn has_conflict_for_natural_key(&self, incoming: &ProviderIdentityRecord) -> bool {
+        self.conflicts
+            .binary_search_by(|conflict| compare_conflict_natural_key(conflict, incoming))
+            .is_ok()
+    }
+
+    fn canonical_record_count(&self) -> Result<usize, InstrumentError> {
+        checked_record_count(
+            self.accepted.len(),
+            self.conflicts
+                .iter()
+                .map(|conflict| conflict.competing_assertions().len()),
+        )
+    }
+
+    fn checked_growth_capacity(
+        current_count: usize,
+        requested_limit: usize,
+    ) -> Result<usize, InstrumentError> {
+        let limit = requested_limit.min(Self::MAX_RECONSTRUCTION_RECORDS);
+        if current_count >= limit {
+            return Err(reconstruction_capacity_error(limit));
+        }
+        current_count
+            .checked_add(1)
+            .ok_or_else(|| reconstruction_capacity_error(limit))
+    }
+
+    fn reconstruction_records(
+        &self,
+        required_capacity: usize,
+    ) -> Result<Vec<ProviderIdentityRecord>, InstrumentError> {
+        record_reconstruction_build();
+        let mut records = Vec::with_capacity(required_capacity);
         for record in self.assertions() {
             if records.len() == Self::MAX_RECONSTRUCTION_RECORDS {
-                return Err(InstrumentError::ProviderIdentityCapacityExceeded {
-                    collection: ProviderIdentityCollection::ReconstructionRecords,
-                    max: Self::MAX_RECONSTRUCTION_RECORDS,
-                });
+                return Err(reconstruction_capacity_error(
+                    Self::MAX_RECONSTRUCTION_RECORDS,
+                ));
             }
             records.push(record.clone());
         }
         Ok(records)
     }
+}
+
+fn checked_record_count(
+    accepted_count: usize,
+    conflict_counts: impl IntoIterator<Item = usize>,
+) -> Result<usize, InstrumentError> {
+    if accepted_count > ProviderIdentityRegistry::MAX_RECONSTRUCTION_RECORDS {
+        return Err(reconstruction_capacity_error(
+            ProviderIdentityRegistry::MAX_RECONSTRUCTION_RECORDS,
+        ));
+    }
+    let mut count = accepted_count;
+    for conflict_count in conflict_counts {
+        count = count.checked_add(conflict_count).ok_or_else(|| {
+            reconstruction_capacity_error(ProviderIdentityRegistry::MAX_RECONSTRUCTION_RECORDS)
+        })?;
+        if count > ProviderIdentityRegistry::MAX_RECONSTRUCTION_RECORDS {
+            return Err(reconstruction_capacity_error(
+                ProviderIdentityRegistry::MAX_RECONSTRUCTION_RECORDS,
+            ));
+        }
+    }
+    Ok(count)
+}
+
+fn reconstruction_capacity_error(max: usize) -> InstrumentError {
+    InstrumentError::ProviderIdentityCapacityExceeded {
+        collection: ProviderIdentityCollection::ReconstructionRecords,
+        max,
+    }
+}
+
+fn compare_record_revision_prefix(
+    existing: &ProviderIdentityRecord,
+    incoming: &ProviderIdentityRecord,
+) -> Ordering {
+    record_revision_lookup_comparison();
+    compare_record_natural_key(existing, incoming).then_with(|| {
+        existing
+            .metadata_revision()
+            .as_source_identifier()
+            .cmp(incoming.metadata_revision().as_source_identifier())
+    })
+}
+
+fn compare_conflict_revision_prefix(
+    existing: &ProviderIdentityConflict,
+    incoming: &ProviderIdentityRecord,
+) -> Ordering {
+    record_revision_lookup_comparison();
+    compare_conflict_natural_key(existing, incoming).then_with(|| {
+        existing
+            .metadata_revision()
+            .as_source_identifier()
+            .cmp(incoming.metadata_revision().as_source_identifier())
+    })
+}
+
+fn compare_record_natural_key(
+    existing: &ProviderIdentityRecord,
+    incoming: &ProviderIdentityRecord,
+) -> Ordering {
+    existing
+        .source_id()
+        .cmp(incoming.source_id())
+        .then_with(|| {
+            existing
+                .provider_instrument_id()
+                .cmp(incoming.provider_instrument_id())
+        })
+}
+
+fn compare_conflict_natural_key(
+    existing: &ProviderIdentityConflict,
+    incoming: &ProviderIdentityRecord,
+) -> Ordering {
+    existing
+        .key()
+        .source_id()
+        .cmp(incoming.source_id())
+        .then_with(|| {
+            existing
+                .key()
+                .provider_instrument_id()
+                .cmp(incoming.provider_instrument_id())
+        })
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static REVISION_LOOKUP_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static RECONSTRUCTION_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn record_revision_lookup_comparison() {
+    REVISION_LOOKUP_COMPARISONS.with(|count| count.set(count.get().saturating_add(1)));
+}
+
+#[cfg(not(test))]
+const fn record_revision_lookup_comparison() {}
+
+#[cfg(test)]
+fn record_reconstruction_build() {
+    RECONSTRUCTION_BUILDS.with(|count| count.set(count.get().saturating_add(1)));
+}
+
+#[cfg(not(test))]
+const fn record_reconstruction_build() {}
+
+#[cfg(test)]
+fn reset_registry_test_probes() {
+    REVISION_LOOKUP_COMPARISONS.with(|count| count.set(0));
+    RECONSTRUCTION_BUILDS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn revision_lookup_comparison_count() -> usize {
+    REVISION_LOOKUP_COMPARISONS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn reconstruction_build_count() -> usize {
+    RECONSTRUCTION_BUILDS.with(std::cell::Cell::get)
 }
 
 const _: () = assert!(wire_record_bound_is_valid());
@@ -313,285 +473,5 @@ impl<'de> Deserialize<'de> for ProviderIdentityRegistry {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{
-        DigestAlgorithm, EffectiveInterval, EvidenceDigest, InstrumentId, MetadataRevision,
-        ProviderIdentityEvidence, ProviderIdentityLocator, ProviderIdentityRecordInput,
-        SourceIdentifier,
-    };
-    use uuid::Uuid;
-
-    fn instrument(value: u128) -> Result<InstrumentId, Box<dyn std::error::Error>> {
-        Ok(InstrumentId::try_from(Uuid::from_u128(value))?)
-    }
-
-    fn evidence(byte: u8) -> ProviderIdentityEvidence {
-        ProviderIdentityEvidence::from_content_digest(EvidenceDigest::new(
-            DigestAlgorithm::Sha256,
-            [byte; 32],
-        ))
-    }
-
-    fn evidence_with_locator(
-        byte: u8,
-        reference: &str,
-        version: &str,
-    ) -> Result<ProviderIdentityEvidence, Box<dyn std::error::Error>> {
-        Ok(ProviderIdentityEvidence::with_version_pinned_locator(
-            EvidenceDigest::new(DigestAlgorithm::Sha256, [byte; 32]),
-            ProviderIdentityLocator::new(
-                SourceIdentifier::try_from(reference)?,
-                SourceIdentifier::try_from(version)?,
-            ),
-        ))
-    }
-
-    fn record(
-        owner: InstrumentId,
-        provider_instrument_id: &str,
-        observed_at: i64,
-        evidence: ProviderIdentityEvidence,
-    ) -> Result<ProviderIdentityRecord, Box<dyn std::error::Error>> {
-        record_with_source_timestamp(owner, provider_instrument_id, observed_at, 99, evidence)
-    }
-
-    fn record_with_source_timestamp(
-        owner: InstrumentId,
-        provider_instrument_id: &str,
-        observed_at: i64,
-        source_timestamp: i64,
-        evidence: ProviderIdentityEvidence,
-    ) -> Result<ProviderIdentityRecord, Box<dyn std::error::Error>> {
-        Ok(ProviderIdentityRecord::new(ProviderIdentityRecordInput {
-            instrument_id: owner,
-            source_id: SourceId::try_from("vendor-alpha")?,
-            provider_instrument_id: ProviderInstrumentId::try_from(provider_instrument_id)?,
-            evidence,
-            source_timestamp: Some(Timestamp::from_unix_nanos(source_timestamp)),
-            observed_at: Timestamp::from_unix_nanos(observed_at),
-            metadata_revision: MetadataRevision::new(SourceIdentifier::try_from("revision-1")?),
-            validity: EffectiveInterval::new(Timestamp::from_unix_nanos(10), None)?,
-            supersedes: None,
-        }))
-    }
-
-    #[test]
-    fn accepted_exact_duplicate_coalesces_at_test_policy_ceiling()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let assertion = record(instrument(1)?, "12345", 100, evidence(1))?;
-        let mut registry = ProviderIdentityRegistry::try_from_records(vec![assertion.clone()])?;
-        let before = registry.clone();
-        let accepted_allocation = registry.accepted().as_ptr();
-
-        assert_eq!(
-            registry.ingest_with_reconstruction_limit(assertion, 1)?,
-            ProviderIdentityIngestOutcome::ObservationCoalesced
-        );
-        assert_eq!(registry, before);
-        assert_eq!(registry.accepted().as_ptr(), accepted_allocation);
-        Ok(())
-    }
-
-    #[test]
-    fn accepted_metadata_only_duplicate_merges_at_test_policy_ceiling()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let owner = instrument(1)?;
-        let mut registry = ProviderIdentityRegistry::try_from_records(vec![record(
-            owner,
-            "12345",
-            200,
-            evidence(1),
-        )?])?;
-        let accepted_allocation = registry.accepted().as_ptr();
-
-        assert_eq!(
-            registry.ingest_with_reconstruction_limit(
-                record(
-                    owner,
-                    "12345",
-                    100,
-                    evidence_with_locator(1, "provider-object:z", "version:2")?,
-                )?,
-                1,
-            )?,
-            ProviderIdentityIngestOutcome::ObservationCoalesced
-        );
-        assert_eq!(
-            registry.accepted()[0].observation_timestamps(),
-            &[
-                Timestamp::from_unix_nanos(100),
-                Timestamp::from_unix_nanos(200)
-            ]
-        );
-        assert_eq!(registry.accepted()[0].evidence().locators().len(), 1);
-        assert_eq!(registry.accepted().as_ptr(), accepted_allocation);
-        assert_eq!(
-            serde_json::from_value::<ProviderIdentityRegistry>(serde_json::to_value(&registry)?)?,
-            registry
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn quarantined_exact_duplicate_coalesces_at_test_policy_ceiling()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let owner = instrument(1)?;
-        let assertion = record(owner, "12345", 200, evidence(2))?;
-        let mut registry = ProviderIdentityRegistry::try_from_records(vec![
-            record(owner, "12345", 100, evidence(1))?,
-            assertion.clone(),
-        ])?;
-        let before = registry.clone();
-        let competitor_allocation = registry.conflicts()[0].competing_assertions().as_ptr();
-
-        assert_eq!(
-            registry.ingest_with_reconstruction_limit(assertion, 2)?,
-            ProviderIdentityIngestOutcome::ObservationCoalesced
-        );
-        assert_eq!(registry, before);
-        assert_eq!(
-            registry.conflicts()[0].competing_assertions().as_ptr(),
-            competitor_allocation
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn quarantined_metadata_only_duplicate_merges_and_orders_at_test_policy_ceiling()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let owner = instrument(1)?;
-        let mut registry = ProviderIdentityRegistry::try_from_records(vec![
-            record_with_source_timestamp(owner, "12345", 200, 99, evidence(2))?,
-            record_with_source_timestamp(owner, "12345", 100, 100, evidence(2))?,
-        ])?;
-        let competitor_allocation = registry.conflicts()[0].competing_assertions().as_ptr();
-
-        assert_eq!(
-            registry.ingest_with_reconstruction_limit(
-                record_with_source_timestamp(
-                    owner,
-                    "12345",
-                    50,
-                    99,
-                    evidence_with_locator(2, "provider-object:z", "version:2")?,
-                )?,
-                2,
-            )?,
-            ProviderIdentityIngestOutcome::ObservationCoalesced
-        );
-        let competitors = registry.conflicts()[0].competing_assertions();
-        assert_eq!(
-            competitors[0].source_timestamp(),
-            Some(Timestamp::from_unix_nanos(100))
-        );
-        assert_eq!(
-            competitors[1].source_timestamp(),
-            Some(Timestamp::from_unix_nanos(99))
-        );
-        assert_eq!(
-            competitors[1].observation_timestamps(),
-            &[
-                Timestamp::from_unix_nanos(50),
-                Timestamp::from_unix_nanos(200)
-            ]
-        );
-        assert_eq!(competitors[1].evidence().locators().len(), 1);
-        assert_eq!(competitors.as_ptr(), competitor_allocation);
-        assert_eq!(
-            serde_json::from_value::<ProviderIdentityRegistry>(serde_json::to_value(&registry)?)?,
-            registry
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn growth_is_rejected_transactionally_at_test_policy_ceiling()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let owner = instrument(1)?;
-        let mut registry = ProviderIdentityRegistry::try_from_records(vec![record(
-            owner,
-            "12345",
-            100,
-            evidence(1),
-        )?])?;
-        let before = registry.clone();
-
-        assert!(matches!(
-            registry
-                .ingest_with_reconstruction_limit(record(owner, "67890", 200, evidence(2))?, 1,),
-            Err(InstrumentError::ProviderIdentityCapacityExceeded {
-                collection: ProviderIdentityCollection::ReconstructionRecords,
-                max: 1,
-            })
-        ));
-        assert_eq!(registry, before);
-        Ok(())
-    }
-
-    #[test]
-    fn locator_exhaustion_during_coalescing_is_transactional()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let owner = instrument(1)?;
-        let locators = (0..ProviderIdentityEvidence::MAX_LOCATORS)
-            .map(|index| {
-                Ok(ProviderIdentityLocator::new(
-                    SourceIdentifier::try_from(format!("provider-object:{index:02}"))?,
-                    SourceIdentifier::try_from(format!("version:{index:02}"))?,
-                ))
-            })
-            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
-        let full_evidence = ProviderIdentityEvidence::try_with_locators(
-            EvidenceDigest::new(DigestAlgorithm::Sha256, [1; 32]),
-            locators,
-        )?;
-        let mut registry = ProviderIdentityRegistry::try_from_records(vec![record(
-            owner,
-            "12345",
-            100,
-            full_evidence,
-        )?])?;
-        let before = registry.clone();
-
-        assert!(matches!(
-            registry.ingest_with_reconstruction_limit(
-                record(
-                    owner,
-                    "12345",
-                    100,
-                    evidence_with_locator(1, "provider-object:overflow", "version:overflow")?,
-                )?,
-                1,
-            ),
-            Err(InstrumentError::ProviderIdentityCapacityExceeded {
-                collection: ProviderIdentityCollection::Locators,
-                max: ProviderIdentityEvidence::MAX_LOCATORS,
-            })
-        ));
-        assert_eq!(registry, before);
-        Ok(())
-    }
-
-    #[test]
-    fn observation_exhaustion_in_quarantine_is_transactional()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let owner = instrument(1)?;
-        let mut records = (0..ProviderIdentityRecord::MAX_OBSERVATIONS)
-            .map(|offset| record(owner, "12345", 100 + offset as i64, evidence(1)))
-            .collect::<Result<Vec<_>, _>>()?;
-        records.push(record(owner, "12345", 200, evidence(2))?);
-        let mut registry = ProviderIdentityRegistry::try_from_records(records)?;
-        let before = registry.clone();
-
-        assert!(matches!(
-            registry
-                .ingest_with_reconstruction_limit(record(owner, "12345", 10_000, evidence(1))?, 2,),
-            Err(InstrumentError::ProviderIdentityCapacityExceeded {
-                collection: ProviderIdentityCollection::ObservationTimestamps,
-                max: ProviderIdentityRecord::MAX_OBSERVATIONS,
-            })
-        ));
-        assert_eq!(registry, before);
-        Ok(())
-    }
-}
+#[path = "registry/tests.rs"]
+mod tests;

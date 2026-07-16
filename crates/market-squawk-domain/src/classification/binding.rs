@@ -33,7 +33,7 @@ macro_rules! source_identifier_newtype {
 
 source_identifier_newtype!(
     MetadataRevision,
-    "Bounded caller/source-supplied revision identity; authority and immutability are established by surrounding evidence and registration, not by this identifier alone."
+    "Bounded caller/source-supplied revision identity. It establishes neither authority nor immutability by itself; those properties require independent verification by the applicable registered source and source-specific adapter verification."
 );
 source_identifier_newtype!(
     AuthorizationBasis,

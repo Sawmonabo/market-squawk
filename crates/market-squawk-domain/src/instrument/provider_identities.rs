@@ -181,7 +181,7 @@ pub struct ProviderIdentityRecord {
     supersedes: Option<ProviderIdentitySupersession>,
 }
 
-/// Complete immutable evidence and one local observation of a provider mapping assertion.
+/// A complete provider mapping assertion carrying exact content evidence and one local observation.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderIdentityRecordInput {
@@ -269,8 +269,9 @@ impl ProviderIdentityRecord {
 
     /// Returns the bounded caller/source-supplied revision identity.
     ///
-    /// The identity establishes neither authority nor immutability by itself; those properties
-    /// depend on the surrounding exact evidence and applicable source registration.
+    /// The identity establishes neither authority nor immutability by itself. Those properties
+    /// require independent verification by the applicable registered source and source-specific
+    /// adapter verification.
     pub const fn metadata_revision(&self) -> &MetadataRevision {
         &self.metadata_revision
     }
