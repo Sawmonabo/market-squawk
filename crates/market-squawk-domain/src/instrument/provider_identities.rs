@@ -139,7 +139,7 @@ impl ProviderIdentityKey {
     }
 }
 
-/// Immutable evidence authorizing a provider metadata revision to replace its predecessor.
+/// A provider-supplied predecessor claim bound to exact evidence.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderIdentitySupersession {
@@ -148,7 +148,7 @@ pub struct ProviderIdentitySupersession {
 }
 
 impl ProviderIdentitySupersession {
-    /// Constructs an evidence-backed predecessor edge.
+    /// Constructs a provider-supplied predecessor claim with exact content evidence.
     pub const fn new(predecessor: MetadataRevision, evidence: ProviderIdentityEvidence) -> Self {
         Self {
             predecessor,
@@ -156,12 +156,12 @@ impl ProviderIdentitySupersession {
         }
     }
 
-    /// Returns the exact predecessor revision.
+    /// Returns the bounded provider-supplied predecessor revision identity.
     pub const fn predecessor(&self) -> &MetadataRevision {
         &self.predecessor
     }
 
-    /// Returns immutable evidence for the revision transition.
+    /// Returns the exact content evidence bound to the predecessor claim.
     pub const fn evidence(&self) -> &ProviderIdentityEvidence {
         &self.evidence
     }
@@ -191,17 +191,19 @@ pub struct ProviderIdentityRecordInput {
     pub source_id: SourceId,
     /// Source-native instrument identity.
     pub provider_instrument_id: ProviderInstrumentId,
-    /// Mandatory content digest and optional version-pinned locator for the exact source assertion.
+    /// Mandatory content digest and bounded optional version-pinned locators; locators are
+    /// non-substantive retrieval metadata.
     pub evidence: ProviderIdentityEvidence,
     /// Source-authored timestamp when supplied.
     pub source_timestamp: Option<Timestamp>,
     /// Local time this exact assertion was observed.
     pub observed_at: Timestamp,
-    /// Bounded caller/source revision identity; surrounding evidence establishes its authority.
+    /// Bounded caller/source-supplied revision identity; it establishes neither authority nor
+    /// immutability by itself.
     pub metadata_revision: MetadataRevision,
     /// Half-open interval claimed by this revision.
     pub validity: EffectiveInterval,
-    /// Explicit predecessor evidence; absent only for the first revision of a natural key.
+    /// Provider-supplied predecessor claim; absent only for the first revision of a natural key.
     #[serde(default)]
     pub supersedes: Option<ProviderIdentitySupersession>,
 }
@@ -265,7 +267,10 @@ impl ProviderIdentityRecord {
         &self.observation_timestamps
     }
 
-    /// Returns the caller/source revision identity bound by the surrounding assertion evidence.
+    /// Returns the bounded caller/source-supplied revision identity.
+    ///
+    /// The identity establishes neither authority nor immutability by itself; those properties
+    /// depend on the surrounding exact evidence and applicable source registration.
     pub const fn metadata_revision(&self) -> &MetadataRevision {
         &self.metadata_revision
     }
@@ -275,7 +280,7 @@ impl ProviderIdentityRecord {
         self.validity
     }
 
-    /// Returns the evidenced predecessor edge, if this is a revised assertion.
+    /// Returns the provider-supplied predecessor claim bound to exact evidence, if present.
     pub const fn supersedes(&self) -> Option<&ProviderIdentitySupersession> {
         self.supersedes.as_ref()
     }
@@ -634,7 +639,10 @@ fn same_revision_group(left: &ProviderIdentityRecord, right: &ProviderIdentityRe
     same_natural_key(left, right) && left.metadata_revision == right.metadata_revision
 }
 
-fn compare_records(left: &ProviderIdentityRecord, right: &ProviderIdentityRecord) -> Ordering {
+pub(super) fn compare_records(
+    left: &ProviderIdentityRecord,
+    right: &ProviderIdentityRecord,
+) -> Ordering {
     left.source_id
         .cmp(&right.source_id)
         .then_with(|| {

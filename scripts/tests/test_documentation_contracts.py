@@ -24,6 +24,9 @@ Q1_CONTRACT_DECISIONS = (
 METADATA_BINDING_SOURCE = (
     ROOT / "crates" / "market-squawk-domain" / "src" / "classification" / "binding.rs"
 )
+PROVIDER_IDENTITIES_SOURCE = (
+    ROOT / "crates" / "market-squawk-domain" / "src" / "instrument" / "provider_identities.rs"
+)
 STALE_DOMAIN_REPORT = ROOT / ".superpowers" / "sdd" / "q1-final-domain-contracts-report.md"
 EXACT_IDENTITY_REPORT = (
     ROOT / ".superpowers" / "sdd" / "q1-fix-exact-identity-evidence-report.md"
@@ -141,6 +144,17 @@ class DocumentationContractTests(unittest.TestCase):
             "Immutable revision of the authoritative source metadata used by an assessment.",
             source,
         )
+
+    def test_provider_identity_rustdoc_does_not_turn_evidence_into_authority(self) -> None:
+        source = normalized_source(PROVIDER_IDENTITIES_SOURCE)
+
+        self.assertIn("provider-supplied predecessor claim bound to exact evidence", source)
+        self.assertIn("establishes neither authority nor immutability by itself", source)
+        self.assertIn("bounded optional version-pinned locators", source)
+        self.assertIn("non-substantive retrieval metadata", source)
+        self.assertNotIn("evidence authorizing a provider metadata revision", source)
+        self.assertNotIn("surrounding evidence establishes its authority", source)
+        self.assertNotIn("optional version-pinned locator for the exact source assertion", source)
 
     def test_correction_reports_and_changelog_state_the_current_wire_contract(self) -> None:
         stale_report_prefix = STALE_DOMAIN_REPORT.read_text()[:500]
