@@ -58,6 +58,47 @@ count define an immutable runtime incarnation and are persisted in diagnostics a
    authority before every exit/shutdown, releases all permits, and joins or aborts-and-awaits every
    task to a deadline. No actor is detached.
 
+## Frozen Task 5/6 integration decision
+
+The authoritative capture integration preserves the documented dependency edge
+`platform -> domain`; `market-squawk-platform` must not depend on `market-squawk-sources`. Generic
+capture authority contracts live in `market-squawk-domain`. Task 5 implements them for one private,
+registry-only-constructible `CaptureGenerationCapabilities` bundle whose associated frame and
+receipt are exactly `RawMarketFrame` and Task 5's `CaptureAdmissionReceipt`. Task 6 accepts and
+consumes the whole bundle, never loose initializer/admission/degradation values and never a
+caller-authored generation key.
+
+The bundle contract statically associates a bounded raw-frame view, non-`Clone` initializer,
+non-`Clone` admission issuer, cloneable degradation capability, and concrete receipt. Platform
+publication linearizes in this order:
+
+```text
+concrete admission preflight
+-> checked retained-byte reservation
+-> bounded try_send
+-> concrete issue_after_enqueue
+-> final active-allocation recheck
+-> return the associated concrete receipt
+```
+
+Full/closed queues, byte-accounting failure, writer append/flush/shutdown failure, control drop,
+rotation failure, and task abortion degrade the exact Task 5 allocation before returning or
+reporting the failure. Writer state retains its own clone of the degradation-only capability. A
+fake or diagnostic bundle produces only its own receipt type; Task 5's registry accepts only the
+private concrete receipt whose allocation, frame ordinal, receive time, digest, and one-way lease
+match the decoded frame. Object erasure is prohibited at this boundary because the associated
+frame/receipt relationship is a safety property, not a runtime extension point.
+
+Task 6's pre-integration local `CaptureGenerationKey` and `CaptureAdmissionReceipt` are diagnostic
+compatibility values only. During integration they are removed from execution-adjacent APIs or
+renamed to make that limitation explicit; there is no conversion into Task 5's receipt. MSJ1 is a
+diagnostic audit format and cannot reconstruct `RawMarketFrame`, a current capture receipt, or live
+authority.
+
+The root integration order is Task 5, Task 6, then the domain-generic bridge and cross-crate tests.
+The lane commits intentionally exclude their divergent `Cargo.lock`; root generates and reviews one
+lockfile after merging the manifest dependency union, and every subsequent command is locked.
+
 ## Snapshot and memory semantics
 
 Snapshots are built completely from one committed owner state after the action decision and at a

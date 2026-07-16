@@ -181,6 +181,9 @@ unforgeable risk approval; migrated Coinbase, paper, CLI, and MCP v0.1 behavior;
 - [ ] `SourceMetadataProvider`, `LiveMarketSource`, and `ExtractionSource` contracts.
 - [ ] Explicit endpoint/network policy and provider budget contracts.
 - [ ] Raw capture no longer waits for writer acknowledgement.
+- [ ] Platform capture consumes one registry-issued generic authority bundle through domain traits;
+  `platform -> sources`, loose capability composition, receipt erasure, and diagnostic-receipt
+  promotion are forbidden.
 - [ ] Capture/shard overflow tests prove fail-closed quarantine behavior.
 - [ ] Versioned stable shard routing and single-writer ownership.
 - [ ] Immutable bounded snapshots for application services.

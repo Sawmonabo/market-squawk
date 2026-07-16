@@ -722,6 +722,7 @@ pub trait SourceMetadataProvider {
 pub trait LiveMarketSource: SourceMetadataProvider {
     fn run<'a>(
         &'a mut self,
+        frames: &'a mut RawFrameFactory,
         sink: &'a mut dyn RawMarketSink,
         cancellation: CancellationToken,
     ) -> BoxFuture<'a, Result<(), SourceError>>;
@@ -761,13 +762,22 @@ session, current-health, runtime-subscription, capture-generation, and raw-frame
 allocations needed for O(1) actor-time revalidation; a bare or deserialized batch cannot cross the
 production shard-ingress boundary.
 
-The registry owns one process-local capture allocation per source connection generation. It splits
-that allocation into an opaque current-capture health view, a non-`Clone` admission issuer moved
-into platform capture composition, and a cloneable degradation-only capability. Capture state is
-one-way within an allocation: `Initializing -> Healthy -> Incomplete`; `Incomplete` is terminal and
-recovery allocates a new generation. A successful admission receipt is owned, non-Serde, and bound
-to the exact session/generation allocation, raw payload digest, receive time, and frame identity.
-Replay, audit health DTOs, and reconstructed values cannot manufacture it.
+The registry owns one process-local capture allocation per source connection generation. It issues
+exactly one registry-only-constructible, non-`Clone`, non-Serde
+`CaptureGenerationCapabilities` bundle that retains the exact binding/allocation and consumes into
+the initialization, admission, and degradation capabilities for that allocation. Platform
+composition must accept this whole bundle, never loose parts. Capture state is one-way within an
+allocation: `Initializing -> Healthy -> Incomplete`; `Incomplete` is terminal and recovery
+allocates a new generation. A successful admission receipt is owned, non-Serde, and bound to the
+exact session/generation allocation, raw payload digest, receive time, and checked nonzero frame
+ordinal. Replay, audit health DTOs, diagnostic platform receipts, and reconstructed values cannot
+manufacture it.
+
+The registry also issues one restricted, non-`Clone`, non-Serde `RawFrameFactory` to the active
+adapter session. It binds the exact source/revision/session/generation lease and owns the checked
+frame-ordinal counter. The adapter receives the factory in `LiveMarketSource::run`, but never the
+registry's current-session, health, capture, or execution authority. Session invalidation and
+ordinal exhaustion terminally disable further frame creation.
 
 - [ ] **Step 4: Implement bounded, policy-compliant provider budgets**
 
@@ -849,20 +859,32 @@ than blocking the event-to-action path.
 
 - [ ] **Step 4: Implement a non-blocking capture publisher**
 
-`RawCapturePublisher::try_publish` uses bounded `mpsc::Sender::try_send`; it returns an owned,
-non-Serde admission receipt on success, never a disk acknowledgement. The writer task produces
-separate metrics/health and never sends per-frame acknowledgements. On full/closed channel, writer
-failure, or shutdown deadline, atomically degrade the registry-issued exact-generation capture
-allocation before returning and emit a best-effort bounded control-plane health event. The
-associated market stream becomes execution-ineligible until a new connection generation and
-capture allocation are established.
+The generic capture authority traits live in `market-squawk-domain`, preserving the documented
+`platform -> domain` dependency and forbidding `platform -> sources`. The trait associates one
+bounded raw-frame view with one concrete receipt, initializer, admission issuer, and cloneable
+degrader. Task 5 implements it for `CaptureGenerationCapabilities`; platform statically dispatches
+over the whole bundle. Do not erase the frame/receipt relationship behind `dyn`, accept loose
+capabilities, or expose a platform diagnostic receipt as source execution authority.
 
-The cloneable publisher can admit and degrade only. A separate non-`Clone` control handle owns
-initial activation and generation rotation; no publisher clone, public value key, audit snapshot,
-or application callback can promote capture health. Capture readiness means the supervised capture
-path is ready and is independent of market/book snapshot synchronization. Same-generation
-degradation is terminal. Control transitions use RCU/one-way state or a bounded wait and cannot
-spin indefinitely on an in-flight publisher.
+`RawCapturePublisher::try_publish` uses bounded `mpsc::Sender::try_send`; it performs the concrete
+admission preflight, checked byte reservation, bounded enqueue, concrete `issue_after_enqueue`, and
+final active-allocation recheck in that order. It returns Task 5's associated owned, non-Serde
+admission receipt on success, never a disk acknowledgement. The writer task produces separate
+metrics/health and never sends per-frame acknowledgements. On full/closed channel, writer failure,
+flush failure, control drop, rotation failure, accounting failure, or shutdown deadline, atomically
+degrade the registry-issued exact-generation capture allocation before returning and emit a
+best-effort bounded control-plane health event. The associated market stream becomes
+execution-ineligible until a new connection generation and capture allocation are established.
+
+The channel constructor and rotation operation consume a whole authority bundle. The cloneable
+publisher can admit and degrade only. A separate non-`Clone` control handle owns the bundle's
+initializer and generation rotation; no publisher clone, public value key, audit snapshot,
+diagnostic journal record, or application callback can promote capture health. Capture readiness
+means the supervised capture path is ready and is independent of market/book snapshot
+synchronization. Same-generation degradation is terminal. Control transitions use RCU/one-way
+state or a bounded wait and cannot spin indefinitely on an in-flight publisher. Tests cover wrong-
+bundle transplant, exact receipt/frame binding, rotation races, sliced `Bytes`, permit release, and
+every degradation path.
 
 - [ ] **Step 5: Rewire and verify compatibility**
 

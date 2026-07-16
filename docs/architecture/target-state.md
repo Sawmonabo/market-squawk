@@ -301,6 +301,7 @@ pub trait SourceMetadataProvider {
 pub trait LiveMarketSource: SourceMetadataProvider {
     async fn run(
         &mut self,
+        frames: &mut RawFrameFactory,
         sink: &mut dyn RawMarketSink,
         cancellation: CancellationToken,
     ) -> Result<(), SourceError>;
@@ -354,12 +355,75 @@ runtime subscription, effective deadline, delivery mode, and validation profile.
 assemble this scope from loose metadata or a self-reported healthy snapshot.
 
 The registry also issues one process-local, one-way capture allocation for each connection
-generation. Platform capture owns a non-`Clone` admission issuer and a degradation-only handle; a
-cloneable publisher cannot promote or rotate capture health. Successful enqueue returns an owned,
-non-Serde admission receipt bound to the exact generation allocation and raw-frame digest/timing.
-The registry consumes that receipt with the decoded provider batch to produce the owned,
-`Send + 'static` current-batch envelope admitted to a shard. Same-generation degradation is
-terminal, and audit/replay values cannot reconstruct either receipt or current authority.
+generation. The registry returns exactly one non-`Clone`, non-Serde, non-constructible
+`CaptureGenerationCapabilities` bundle. The bundle retains the exact binding/allocation and can be
+consumed only into initialization, admission, and degradation capabilities for that same
+allocation. Platform capture accepts the whole bundle, never loose capabilities, and owns the
+resulting non-`Clone` initializer and admission issuer plus the cloneable degradation-only handle.
+A cloneable publisher cannot initialize, promote, or rotate capture health. Successful enqueue
+returns Task 5's concrete owned, non-Serde admission receipt bound to the exact generation
+allocation, frame ordinal, raw-frame digest, and receive time. The registry consumes that exact
+receipt with the decoded provider batch to produce the owned, `Send + 'static` current-batch
+envelope admitted to a shard. Same-generation degradation is terminal, and audit/replay values
+cannot reconstruct either receipt or current authority.
+
+The cross-crate composition contract lives in `market-squawk-domain`; the dependency remains
+`platform -> domain` and never becomes `platform -> sources`. It preserves the concrete
+frame/receipt relationship with associated types and static dispatch:
+
+```rust
+pub trait RawCaptureFrameView: Clone + Send + Sync + 'static {
+    fn source_id(&self) -> &SourceId;
+    fn metadata_revision(&self) -> &MetadataRevision;
+    fn session_identifier(&self) -> &SourceIdentifier;
+    fn connection_generation(&self) -> ConnectionGeneration;
+    fn frame_ordinal(&self) -> NonZeroU64;
+    fn received_at(&self) -> Timestamp;
+    fn payload(&self) -> &[u8];
+    fn retained_bytes(&self) -> usize;
+}
+pub trait CaptureInitializer: Debug + Send + 'static {
+    fn mark_healthy(&mut self) -> Result<(), CaptureAuthorityError>;
+}
+pub trait CaptureAdmission<Frame>: Debug + Send + 'static {
+    type Receipt: Debug + Send + 'static;
+    fn preflight(&self, frame: &Frame) -> Result<(), CaptureAuthorityError>;
+    fn issue_after_enqueue(
+        &mut self,
+        frame: &Frame,
+    ) -> Result<Self::Receipt, CaptureAuthorityError>;
+    fn validate_active(&self, frame: &Frame) -> Result<(), CaptureAuthorityError>;
+}
+pub trait CaptureDegradation: Clone + Debug + Send + Sync + 'static {
+    fn mark_incomplete(&self);
+}
+pub trait CaptureAuthorityBundle: Debug + Send + Sized + 'static {
+    type Frame: RawCaptureFrameView;
+    type Receipt: Debug + Send + 'static;
+    type Initializer: CaptureInitializer;
+    type Admission: CaptureAdmission<Self::Frame, Receipt = Self::Receipt>;
+    type Degradation: CaptureDegradation;
+
+    fn into_parts(
+        self,
+    ) -> (Self::Initializer, Self::Admission, Self::Degradation);
+}
+```
+
+The platform channel is generic over the whole bundle. Publication linearizes as concrete
+admission preflight, checked byte reservation, bounded `try_send`, concrete receipt issuance, and
+a final active-allocation check. Every full, closed, writer, flush, shutdown, rotation, accounting,
+or control-drop failure degrades that exact allocation before it returns. A diagnostic or test
+bundle can mint only its own associated receipt type; Task 5's registry accepts only its private,
+concrete receipt and consumes its exact allocation/frame binding. Object erasure is intentionally
+not used at this compile-time composition boundary.
+
+The registry separately issues one non-`Clone`, non-Serde `RawFrameFactory` to the active adapter
+session. It binds the current source/revision/session/generation lease and owns the checked,
+nonzero, never-reused frame-ordinal counter. `LiveMarketSource::run` receives this restricted
+factory explicitly: adapters can create raw frames but cannot access registry, health, capture, or
+execution authority. Session invalidation or ordinal exhaustion makes further frame creation fail
+closed.
 
 ### Provider access policy
 
