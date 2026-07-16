@@ -26,8 +26,19 @@ ALLOWED_DUPLICATES: dict[str, tuple[str, ...]] = {
     "rand_core": ("0.6.4", "0.9.5"),
     "syn": ("1.0.109", "2.0.119"),
     "webpki-roots": ("0.26.11", "1.0.8"),
-    # cap-std 4 and its fs-set-times dependency retain two reviewed windows-sys generations.
-    "windows-sys": ("0.52.0", "0.61.2"),
+    # ring retains 0.52; cap-std 4's fs-set-times/winx and io-extras paths retain 0.59/0.60;
+    # Tokio, Clap, Rustix, and current platform dependencies use 0.61.
+    "windows-sys": ("0.52.0", "0.59.0", "0.60.2", "0.61.2"),
+    # windows-sys 0.52/0.59 share the 0.52 target family; windows-sys 0.60 uses 0.53.
+    "windows-targets": ("0.52.6", "0.53.5"),
+    "windows_aarch64_gnullvm": ("0.52.6", "0.53.1"),
+    "windows_aarch64_msvc": ("0.52.6", "0.53.1"),
+    "windows_i686_gnu": ("0.52.6", "0.53.1"),
+    "windows_i686_gnullvm": ("0.52.6", "0.53.1"),
+    "windows_i686_msvc": ("0.52.6", "0.53.1"),
+    "windows_x86_64_gnu": ("0.52.6", "0.53.1"),
+    "windows_x86_64_gnullvm": ("0.52.6", "0.53.1"),
+    "windows_x86_64_msvc": ("0.52.6", "0.53.1"),
 }
 
 
