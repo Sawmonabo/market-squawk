@@ -1,0 +1,11 @@
+/target/
+/.market-engine/
+/data/
+*.log
+*.tmp
+.DS_Store
+.idea/
+.vscode/
+.env
+__pycache__/
+*.py[cod]
