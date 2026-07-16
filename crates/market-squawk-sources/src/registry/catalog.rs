@@ -47,11 +47,9 @@ impl AuthoritativeSourceRegistry {
             .map_err(|_| RegistryError::RegistryIdentityExhausted)?;
         let mut budgets =
             ProviderBudgetPool::new().map_err(|_| RegistryError::BudgetCoordinator)?;
-        for policy in state.budget_policies.as_slice() {
-            budgets
-                .register(policy.clone())
-                .map_err(|_| RegistryError::BudgetCoordinator)?;
-        }
+        budgets
+            .register_all(state.budget_policies.as_slice())
+            .map_err(|_| RegistryError::BudgetCoordinator)?;
         let history = state
             .sources
             .as_slice()
@@ -119,12 +117,6 @@ impl AuthoritativeSourceRegistry {
         {
             return Err(RegistryError::RevisionHistoryExhausted);
         }
-        let budget = metadata
-            .budget_policy()
-            .cloned()
-            .map(|policy| self.budgets.register(policy))
-            .transpose()
-            .map_err(|_| RegistryError::BudgetCoordinator)?;
         let source_id = metadata.source_id().clone();
         let revision = metadata.revision().clone();
         let epoch = previous.map_or(Ok(1), |history| {
@@ -137,6 +129,12 @@ impl AuthoritativeSourceRegistry {
         let mut used_revisions =
             previous.map_or_else(Vec::new, |history| history.used_revisions.clone());
         used_revisions.push(revision.clone());
+        let budget = metadata
+            .budget_policy()
+            .cloned()
+            .map(|policy| self.budgets.register(policy))
+            .transpose()
+            .map_err(|_| RegistryError::BudgetCoordinator)?;
         self.history.insert(
             source_id.clone(),
             SourceAuthorityHistory {
@@ -391,6 +389,7 @@ impl AuthoritativeSourceRegistry {
             binding: session.binding.clone(),
             lease: Arc::clone(&session.lease),
             freshness: entry.metadata.freshness_policy(),
+            budget: session.budget.clone(),
             not_sync: PhantomData,
         })
     }
@@ -597,6 +596,7 @@ impl AuthoritativeSourceRegistry {
             )
             && exact_runtime_coverage
             && health.budget() == crate::BudgetHealth::Available
+            && update.budget.health() == crate::BudgetHealth::Available
             && health.last_error().is_none();
         let valid_until = health.live_valid_until().map(|health_until| {
             let authorization_until = entry
@@ -630,6 +630,7 @@ impl AuthoritativeSourceRegistry {
                 valid_until: valid_until.ok_or(RegistryError::HealthNotQualified)?,
                 authorization: health.authorization().clone(),
                 coverage: health.coverage().clone(),
+                budget: update.budget,
             })
         } else {
             None
@@ -655,6 +656,9 @@ impl AuthoritativeSourceRegistry {
             .as_ref()
             .ok_or(RegistryError::HealthNotQualified)?;
         if !session.lease.validate_health_epoch(health.epoch, at) {
+            return Err(RegistryError::HealthNotQualified);
+        }
+        if !health.budget.is_available() {
             return Err(RegistryError::HealthNotQualified);
         }
         if !session.capture.is_healthy() {

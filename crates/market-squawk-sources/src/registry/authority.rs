@@ -4,6 +4,7 @@ pub struct CurrentHealthReporter {
     binding: FrameSessionBinding,
     lease: Arc<SessionLeaseState>,
     freshness: crate::FreshnessPolicy,
+    budget: Option<SharedProviderBudget>,
     not_sync: PhantomData<Cell<()>>,
 }
 
@@ -31,6 +32,7 @@ impl CurrentHealthReporter {
             snapshot,
             binding: self.binding.clone(),
             lease: Arc::clone(&self.lease),
+            budget: CurrentBudgetAuthority::observe(self.budget.as_ref()),
         })
     }
 }
@@ -41,6 +43,7 @@ pub struct CurrentHealthUpdate {
     snapshot: crate::SourceHealthSnapshot,
     binding: FrameSessionBinding,
     lease: Arc<SessionLeaseState>,
+    budget: CurrentBudgetAuthority,
 }
 
 /// Opaque, non-serializable proof that one metadata revision was registered by one registry.
@@ -231,6 +234,7 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
             .session
             .lease
             .validate_health_epoch(self.health.epoch, at)
+            || !self.health.budget.is_available()
             || !self.validated.session.capture.is_healthy()
         {
             return Err(RegistryError::HealthNotQualified);
@@ -242,6 +246,7 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
             valid_until: self.health.valid_until,
             lease: Arc::clone(&self.validated.session.lease),
             capture: self.validated.session.capture.clone(),
+            budget: self.health.budget.clone(),
         };
         lease.validate_at(at)?;
         Ok(lease)
@@ -266,6 +271,7 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
             .session
             .lease
             .validate_health_epoch(self.health.epoch, self.health.observed_at)
+            || !self.health.budget.is_available()
         {
             return Err(RegistryError::HealthNotQualified);
         }
@@ -334,6 +340,7 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
             health_epoch: self.health.epoch,
             lease: Arc::clone(&self.validated.session.lease),
             capture: self.validated.session.capture.clone(),
+            budget: self.health.budget.clone(),
             universe_evidence: self.attestation.map(|value| value.evidence.clone()),
         })
     }
@@ -488,6 +495,7 @@ pub struct ValidatedLiveScope {
     health_epoch: u64,
     lease: Arc<SessionLeaseState>,
     capture: crate::CaptureGenerationLease,
+    budget: CurrentBudgetAuthority,
     universe_evidence: Option<ExactPayloadEvidence>,
 }
 
@@ -501,6 +509,7 @@ impl ValidatedLiveScope {
         if at <= self.valid_until
             && self.lease.validate_health_epoch(self.health_epoch, at)
             && self.capture.is_healthy()
+            && self.budget.is_available()
         {
             Ok(())
         } else {
@@ -605,6 +614,7 @@ impl ValidatedLiveScope {
             valid_until: self.valid_until,
             lease: self.lease,
             capture: self.capture,
+            budget: self.budget,
         };
         let key = CurrentBatchKey {
             venue: self.venue.clone(),

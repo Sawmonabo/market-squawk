@@ -78,6 +78,7 @@ pub struct CurrentSourceAuthorityLease {
     valid_until: Timestamp,
     lease: Arc<SessionLeaseState>,
     capture: crate::CaptureGenerationLease,
+    budget: CurrentBudgetAuthority,
 }
 
 impl CurrentSourceAuthorityLease {
@@ -90,6 +91,7 @@ impl CurrentSourceAuthorityLease {
         if at <= self.valid_until
             && self.lease.validate_health_epoch(self.health_epoch, at)
             && self.capture.is_healthy()
+            && self.budget.is_available()
         {
             Ok(())
         } else {
@@ -118,17 +120,29 @@ impl CurrentSourceAuthorityLease {
     }
 
     fn shared_allocation_charge(&self) -> Result<usize, RegistryError> {
-        std::mem::size_of::<SessionLeaseState>()
+        let budget = self.budget.shared_allocation_charge()?;
+        let session = std::mem::size_of::<SessionLeaseState>()
             .checked_add(crate::conservative_arc_control_block_charge::<
                 SessionLeaseState,
             >())
-            .and_then(|bytes| {
-                self.capture
-                    .shared_allocation_charge()
-                    .and_then(|capture| bytes.checked_add(capture))
-            })
-            .ok_or(RegistryError::RetainedSizeOverflow)
+            .ok_or(RegistryError::RetainedSizeOverflow)?;
+        let capture = self
+            .capture
+            .shared_allocation_charge()
+            .ok_or(RegistryError::RetainedSizeOverflow)?;
+        current_authority_shared_allocation_charge(session, capture, budget)
     }
+}
+
+fn current_authority_shared_allocation_charge(
+    session: usize,
+    capture: usize,
+    budget: usize,
+) -> Result<usize, RegistryError> {
+    session
+        .checked_add(capture)
+        .and_then(|bytes| bytes.checked_add(budget))
+        .ok_or(RegistryError::RetainedSizeOverflow)
 }
 
 /// Full mutable stream-state identity inside one instrument-owned shard.
@@ -515,8 +529,10 @@ mod stream_key_tests {
         InstrumentId, ProviderChannel, ProviderProduct, SourceId, SourceIdentifier, VenueId,
     };
 
-    use super::{CurrentBatchKey, CurrentProviderObservation, CurrentStreamKey,
-        current_routed_batch_retained_bytes};
+    use super::{
+        CurrentBatchKey, CurrentProviderObservation, CurrentStreamKey, RegistryError,
+        current_authority_shared_allocation_charge, current_routed_batch_retained_bytes,
+    };
 
     fn key(
         source: &str,
@@ -589,6 +605,19 @@ mod stream_key_tests {
             with_key.checked_sub(without_key),
             Some(key.dynamic_retained_bytes())
         );
+        Ok(())
+    }
+
+    #[test]
+    fn authority_charge_adds_budget_allocation_exactly_once() -> Result<(), RegistryError> {
+        const SESSION: usize = 101;
+        const CAPTURE: usize = 103;
+        const BUDGET: usize = 107;
+        let without_budget = current_authority_shared_allocation_charge(SESSION, CAPTURE, 0)?;
+        let with_budget =
+            current_authority_shared_allocation_charge(SESSION, CAPTURE, BUDGET)?;
+
+        assert_eq!(with_budget.checked_sub(without_budget), Some(BUDGET));
         Ok(())
     }
 }

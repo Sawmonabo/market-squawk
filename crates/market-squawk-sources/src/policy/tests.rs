@@ -36,6 +36,114 @@ mod tests {
                 .map(|observation| *observation)
                 .map_err(|_| BudgetUnavailableReason::StatePoisoned)
         }
+
+
+        fn shared_allocation_charge(&self) -> usize {
+            std::mem::size_of::<Self>() + crate::conservative_arc_control_block_charge::<Self>()
+        }
+    }
+
+    #[derive(Debug)]
+    struct SwitchableClock {
+        observation: Mutex<ClockObservation>,
+        available: AtomicBool,
+    }
+
+    impl SwitchableClock {
+        fn new(wall: i64, monotonic: u64) -> Self {
+            Self {
+                observation: Mutex::new(ClockObservation::new(
+                    Timestamp::from_unix_nanos(wall),
+                    MonotonicInstant::from_nanos(monotonic),
+                )),
+                available: AtomicBool::new(true),
+            }
+        }
+
+        fn set(&self, wall: i64, monotonic: u64) -> bool {
+            let Ok(mut observation) = self.observation.lock() else {
+                return false;
+            };
+            *observation = ClockObservation::new(
+                Timestamp::from_unix_nanos(wall),
+                MonotonicInstant::from_nanos(monotonic),
+            );
+            true
+        }
+
+        fn fail(&self) {
+            self.available.store(false, Ordering::Release);
+        }
+    }
+
+    impl BudgetClock for SwitchableClock {
+        fn observation(&self) -> Result<ClockObservation, BudgetUnavailableReason> {
+            if !self.available.load(Ordering::Acquire) {
+                return Err(BudgetUnavailableReason::ClockUnavailable);
+            }
+            self.observation
+                .lock()
+                .map(|observation| *observation)
+                .map_err(|_| BudgetUnavailableReason::ClockUnavailable)
+        }
+
+
+        fn shared_allocation_charge(&self) -> usize {
+            std::mem::size_of::<Self>() + crate::conservative_arc_control_block_charge::<Self>()
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum AvailabilityFailureCase {
+        ClockUnavailable,
+        StatePoisoned,
+        Disabled,
+        ClockRegression,
+        CoolingDown,
+        DeadlineOverflow,
+        RequestWindowExhausted,
+        ConcurrencyExhausted,
+    }
+
+    impl AvailabilityFailureCase {
+        const ALL: [Self; 8] = [
+            Self::ClockUnavailable,
+            Self::StatePoisoned,
+            Self::Disabled,
+            Self::ClockRegression,
+            Self::CoolingDown,
+            Self::DeadlineOverflow,
+            Self::RequestWindowExhausted,
+            Self::ConcurrencyExhausted,
+        ];
+
+        const fn expected(self) -> BudgetUnavailableReason {
+            match self {
+                Self::ClockUnavailable => BudgetUnavailableReason::ClockUnavailable,
+                Self::StatePoisoned => BudgetUnavailableReason::StatePoisoned,
+                Self::Disabled => BudgetUnavailableReason::Disabled,
+                Self::ClockRegression => BudgetUnavailableReason::ClockRegression,
+                Self::CoolingDown => BudgetUnavailableReason::CoolingDown,
+                Self::DeadlineOverflow => BudgetUnavailableReason::DeadlineOverflow,
+                Self::RequestWindowExhausted => {
+                    BudgetUnavailableReason::RequestWindowExhausted
+                }
+                Self::ConcurrencyExhausted => BudgetUnavailableReason::ConcurrencyExhausted,
+            }
+        }
+    }
+
+    #[allow(clippy::panic)]
+    fn poison_budget_state(budget: &SharedProviderBudget) {
+        // This panic is intentionally caught and exists solely to exercise fail-closed poison
+        // handling. Production paths remain panic-free.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let Ok(_state) = budget.allocation.state.lock() else {
+                return;
+            };
+            panic!("test-only budget state poison");
+        }));
+        assert!(result.is_err());
     }
 
     fn policy() -> Result<ProviderBudgetPolicy, NetworkPolicyError> {
@@ -176,6 +284,187 @@ mod tests {
             BudgetDecision::Unavailable(BudgetUnavailableReason::Disabled)
         ));
         assert!(clock.set(1_000_000, 2_000));
+        Ok(())
+    }
+
+    #[test]
+    fn every_availability_failure_revokes_prior_lease_before_returning()
+    -> Result<(), NetworkPolicyError> {
+        for case in AvailabilityFailureCase::ALL {
+            let clock = Arc::new(SwitchableClock::new(0, 0));
+            let budget = SharedProviderBudget::new(
+                policy()?,
+                MonotonicInstant::from_nanos(0),
+                clock.clone(),
+            );
+            let prior = match budget.availability_lease() {
+                Ok(lease) => lease,
+                Err(_) => return Err(NetworkPolicyError::InvalidBudgetPolicy),
+            };
+            match case {
+                AvailabilityFailureCase::ClockUnavailable => clock.fail(),
+                AvailabilityFailureCase::StatePoisoned => poison_budget_state(&budget),
+                AvailabilityFailureCase::Disabled => {
+                    let Ok(mut state) = budget.allocation.state.lock() else {
+                        return Err(NetworkPolicyError::InvalidBudgetPolicy);
+                    };
+                    state.disabled = true;
+                }
+                AvailabilityFailureCase::ClockRegression => {
+                    let Ok(mut state) = budget.allocation.state.lock() else {
+                        return Err(NetworkPolicyError::InvalidBudgetPolicy);
+                    };
+                    state.window_started_at = MonotonicInstant::from_nanos(1);
+                }
+                AvailabilityFailureCase::CoolingDown => {
+                    let Ok(mut state) = budget.allocation.state.lock() else {
+                        return Err(NetworkPolicyError::InvalidBudgetPolicy);
+                    };
+                    state.unavailable_until = Some(MonotonicInstant::from_nanos(1));
+                }
+                AvailabilityFailureCase::DeadlineOverflow => {
+                    assert!(clock.set(i64::MAX, u64::MAX));
+                    let Ok(mut state) = budget.allocation.state.lock() else {
+                        return Err(NetworkPolicyError::InvalidBudgetPolicy);
+                    };
+                    state.window_started_at = MonotonicInstant::from_nanos(u64::MAX);
+                }
+                AvailabilityFailureCase::RequestWindowExhausted => {
+                    let Ok(mut state) = budget.allocation.state.lock() else {
+                        return Err(NetworkPolicyError::InvalidBudgetPolicy);
+                    };
+                    state.requests_used = budget.policy().requests_per_window.get();
+                }
+                AvailabilityFailureCase::ConcurrencyExhausted => {
+                    let Ok(mut state) = budget.allocation.state.lock() else {
+                        return Err(NetworkPolicyError::InvalidBudgetPolicy);
+                    };
+                    state.in_flight = budget.policy().max_concurrent.get();
+                }
+            }
+            let result = budget.availability_lease();
+            assert!(
+                matches!(result, Err(reason) if reason == case.expected()),
+                "unexpected availability result for {case:?}: {result:?}"
+            );
+            assert!(
+                !prior.is_available(),
+                "prior lease survived availability failure {case:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn consuming_final_available_slot_revokes_prior_availability_lease()
+    -> Result<(), NetworkPolicyError> {
+        let clock = Arc::new(ManualClock::new(0, 0));
+        let budget =
+            SharedProviderBudget::new(policy()?, MonotonicInstant::from_nanos(0), clock);
+        let prior = budget
+            .availability_lease()
+            .map_err(|_| NetworkPolicyError::InvalidBudgetPolicy)?;
+
+        let permit = match budget.try_acquire() {
+            BudgetDecision::Ready(permit) => permit,
+            _ => return Err(NetworkPolicyError::InvalidBudgetPolicy),
+        };
+        assert!(!prior.is_available());
+        permit.release();
+        assert!(budget.availability_lease().is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn availability_generation_overflow_terminalizes_all_future_operations()
+    -> Result<(), NetworkPolicyError> {
+        let clock = Arc::new(ManualClock::new(0, 0));
+        let budget =
+            SharedProviderBudget::new(policy()?, MonotonicInstant::from_nanos(0), clock);
+        budget
+            .allocation
+            .availability_generation
+            .store(u64::MAX, Ordering::Release);
+        let final_generation_lease = budget
+            .availability_lease()
+            .map_err(|_| NetworkPolicyError::InvalidBudgetPolicy)?;
+        {
+            let Ok(mut state) = budget.allocation.state.lock() else {
+                return Err(NetworkPolicyError::InvalidBudgetPolicy);
+            };
+            state.disabled = true;
+        }
+
+        assert!(matches!(
+            budget.availability_lease(),
+            Err(BudgetUnavailableReason::AvailabilityGenerationExhausted)
+        ));
+        assert!(!final_generation_lease.is_available());
+        assert!(budget.allocation.terminal.load(Ordering::Acquire));
+
+        if let Ok(mut state) = budget.allocation.state.lock() {
+            state.disabled = false;
+        }
+        assert!(matches!(
+            budget.availability_lease(),
+            Err(BudgetUnavailableReason::AvailabilityGenerationExhausted)
+        ));
+        assert!(matches!(
+            budget.try_acquire(),
+            BudgetDecision::Unavailable(
+                BudgetUnavailableReason::AvailabilityGenerationExhausted
+            )
+        ));
+        assert_eq!(
+            budget.record_success(),
+            Err(BudgetUnavailableReason::AvailabilityGenerationExhausted)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unavailable_state_is_not_observable_before_generation_revocation()
+    -> Result<(), NetworkPolicyError> {
+        use std::sync::{Barrier, mpsc};
+
+        let clock = Arc::new(ManualClock::new(0, 0));
+        let budget = Arc::new(SharedProviderBudget::new(
+            policy()?,
+            MonotonicInstant::from_nanos(0),
+            clock,
+        ));
+        let prior = budget
+            .availability_lease()
+            .map_err(|_| NetworkPolicyError::InvalidBudgetPolicy)?;
+        let release = Arc::new(Barrier::new(2));
+        let worker_budget = Arc::clone(&budget);
+        let worker_release = Arc::clone(&release);
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let decision = worker_budget.try_acquire();
+            let sent = ready_tx.send(()).is_ok();
+            worker_release.wait();
+            (decision, sent)
+        });
+
+        ready_rx
+            .recv()
+            .map_err(|_| NetworkPolicyError::InvalidBudgetPolicy)?;
+        {
+            let state = budget
+                .allocation
+                .state
+                .lock()
+                .map_err(|_| NetworkPolicyError::InvalidBudgetPolicy)?;
+            assert_eq!(state.in_flight, budget.policy().max_concurrent.get());
+            assert!(!prior.is_available());
+        }
+        release.wait();
+        let (decision, sent) = worker
+            .join()
+            .map_err(|_| NetworkPolicyError::InvalidBudgetPolicy)?;
+        assert!(sent);
+        assert!(matches!(decision, BudgetDecision::Ready(_)));
         Ok(())
     }
 }

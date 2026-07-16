@@ -17,7 +17,7 @@ use thiserror::Error;
 
 use crate::ProviderBudgetPolicy;
 use crate::bounded::BoundedVec;
-use crate::policy::ProviderBudgetPool;
+use crate::policy::{BudgetAvailabilityLease, ProviderBudgetPool};
 use crate::{FrameSessionBinding, SessionId, SharedProviderBudget, SourceMetadata};
 
 static NEXT_REGISTRY_ID: AtomicU64 = AtomicU64::new(1);
@@ -129,6 +129,51 @@ struct CurrentHealthAuthority {
     valid_until: Timestamp,
     authorization: crate::AuthorizationHealth,
     coverage: crate::CoverageHealth,
+    budget: CurrentBudgetAuthority,
+}
+
+#[derive(Clone, Debug)]
+enum CurrentBudgetAuthority {
+    NotRequired,
+    Available(BudgetAvailabilityLease),
+    Unavailable,
+}
+
+impl CurrentBudgetAuthority {
+    fn observe(budget: Option<&SharedProviderBudget>) -> Self {
+        let Some(budget) = budget else {
+            return Self::NotRequired;
+        };
+        match budget.availability_lease() {
+            Ok(lease) => Self::Available(lease),
+            Err(_) => Self::Unavailable,
+        }
+    }
+
+    fn is_available(&self) -> bool {
+        match self {
+            Self::NotRequired => true,
+            Self::Available(lease) => lease.is_available(),
+            Self::Unavailable => false,
+        }
+    }
+
+    fn health(&self) -> crate::BudgetHealth {
+        if self.is_available() {
+            crate::BudgetHealth::Available
+        } else {
+            crate::BudgetHealth::Unavailable
+        }
+    }
+
+    fn shared_allocation_charge(&self) -> Result<usize, RegistryError> {
+        match self {
+            Self::Available(lease) => lease
+                .shared_allocation_charge()
+                .ok_or(RegistryError::RetainedSizeOverflow),
+            Self::NotRequired | Self::Unavailable => Ok(0),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
