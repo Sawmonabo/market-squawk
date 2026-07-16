@@ -3,20 +3,66 @@ from __future__ import annotations
 
 import json
 import pathlib
+import queue
 import subprocess
 import sys
 import tempfile
+import threading
+from typing import TextIO
+
+
+REQUEST_TIMEOUT_SECONDS = 5.0
+SHUTDOWN_TIMEOUT_SECONDS = 5.0
+
+
+def require(condition: bool, message: str) -> None:
+    if not condition:
+        raise RuntimeError(message)
+
+
+def readline_with_timeout(stream: TextIO, timeout_seconds: float) -> str:
+    outcomes: queue.Queue[tuple[str | None, BaseException | None]] = queue.Queue(maxsize=1)
+
+    def read_line() -> None:
+        try:
+            outcomes.put((stream.readline(), None))
+        except BaseException as error:  # Propagate reader failures to the controlling thread.
+            outcomes.put((None, error))
+
+    threading.Thread(target=read_line, daemon=True).start()
+    try:
+        line, error = outcomes.get(timeout=timeout_seconds)
+    except queue.Empty as error:
+        raise TimeoutError(f"MCP response timed out after {timeout_seconds:.3f}s") from error
+    if error is not None:
+        raise RuntimeError("failed to read MCP response") from error
+    return line or ""
 
 
 def request(process: subprocess.Popen[str], payload: dict) -> dict:
-    assert process.stdin is not None
-    assert process.stdout is not None
+    require(process.stdin is not None, "MCP process stdin is unavailable")
+    require(process.stdout is not None, "MCP process stdout is unavailable")
+    if process.poll() is not None:
+        raise RuntimeError(f"MCP server exited before request with status {process.returncode}")
     process.stdin.write(json.dumps(payload) + "\n")
     process.stdin.flush()
-    line = process.stdout.readline()
+    line = readline_with_timeout(process.stdout, REQUEST_TIMEOUT_SECONDS)
     if not line:
         raise RuntimeError("MCP server closed stdout")
-    return json.loads(line)
+    response = json.loads(line)
+    require(isinstance(response, dict), "MCP response must be a JSON object")
+    return response
+
+
+def stop_process(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=SHUTDOWN_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=SHUTDOWN_TIMEOUT_SECONDS)
 
 
 def main() -> int:
@@ -27,14 +73,20 @@ def main() -> int:
     binary = pathlib.Path(
         sys.argv[1] if len(sys.argv) == 2 else "target/debug/market-squawk"
     ).resolve()
-    with tempfile.TemporaryDirectory() as data_dir:
+    require(binary.is_file(), f"Market Squawk binary does not exist: {binary}")
+    with (
+        tempfile.TemporaryDirectory() as data_dir,
+        tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as stderr_log,
+    ):
         process = subprocess.Popen(
             [str(binary), "--data-dir", data_dir, "mcp", "--offline"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=stderr_log,
             text=True,
+            bufsize=1,
         )
+        failure: BaseException | None = None
         try:
             initialized = request(
                 process,
@@ -49,19 +101,36 @@ def main() -> int:
                     },
                 },
             )
-            assert initialized["result"]["serverInfo"]["name"] == "market-squawk"
+            require(
+                initialized.get("result", {}).get("serverInfo", {}).get("name")
+                == "market-squawk",
+                "MCP initialize response has the wrong server identity",
+            )
 
             tools = request(
                 process,
                 {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
             )
-            names = {tool["name"] for tool in tools["result"]["tools"]}
-            assert "Market.GetSnapshot" in names
-            assert "Risk.TriggerKillSwitch" in names
+            tool_entries = tools.get("result", {}).get("tools")
+            require(isinstance(tool_entries, list), "MCP tools/list response has no tool list")
+            names = {
+                tool.get("name")
+                for tool in tool_entries
+                if isinstance(tool, dict) and isinstance(tool.get("name"), str)
+            }
+            require("Market.GetSnapshot" in names, "Market.GetSnapshot tool is missing")
+            require("Risk.TriggerKillSwitch" in names, "Risk.TriggerKillSwitch tool is missing")
             print("MCP smoke test passed")
+        except BaseException as error:
+            failure = error
         finally:
-            process.terminate()
-            process.wait(timeout=5)
+            stop_process(process)
+        if failure is not None:
+            stderr_log.seek(0)
+            diagnostics = stderr_log.read().strip()
+            if diagnostics:
+                print(f"MCP stderr:\n{diagnostics}", file=sys.stderr)
+            raise failure
     return 0
 
 

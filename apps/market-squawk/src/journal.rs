@@ -16,6 +16,8 @@ use crate::domain::RawEnvelope;
 
 const CURRENT_MAGIC: &[u8; 4] = b"MSJ1";
 const MAX_RECORD_BYTES: usize = 64 * 1024 * 1024;
+const DEFAULT_MAX_RECORDS: usize = 1_000_000;
+const DEFAULT_MAX_AGGREGATE_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum JournalFormat {
@@ -38,6 +40,13 @@ impl TryFrom<[u8; 4]> for JournalFormat {
 #[derive(Debug)]
 pub enum JournalError {
     UnsupportedMagic([u8; 4]),
+    LegacyFormatReadOnly,
+    RecordLimitExceeded {
+        limit: usize,
+    },
+    AggregateLimitExceeded {
+        limit: u64,
+    },
     Io {
         context: String,
         source: std::io::Error,
@@ -62,6 +71,15 @@ impl fmt::Display for JournalError {
             Self::UnsupportedMagic(magic) => {
                 write!(formatter, "unsupported journal magic: {magic:?}")
             }
+            Self::LegacyFormatReadOnly => formatter.write_str(
+                "legacy journal is read-only; migrate to an MSJ1 journal before appending",
+            ),
+            Self::RecordLimitExceeded { limit } => {
+                write!(formatter, "journal collection exceeds record limit {limit}")
+            }
+            Self::AggregateLimitExceeded { limit } => {
+                write!(formatter, "journal collection exceeds byte limit {limit}")
+            }
             Self::Io { context, source } => write!(formatter, "{context}: {source}"),
             Self::InvalidRecord(message) => formatter.write_str(message),
             Self::Json(source) => write!(formatter, "invalid journal payload: {source}"),
@@ -78,7 +96,11 @@ impl Error for JournalError {
             Self::Io { source, .. } => Some(source),
             Self::Json(source) => Some(source),
             Self::LengthOverflow(source) => Some(source),
-            Self::UnsupportedMagic(_) | Self::InvalidRecord(_) => None,
+            Self::UnsupportedMagic(_)
+            | Self::LegacyFormatReadOnly
+            | Self::RecordLimitExceeded { .. }
+            | Self::AggregateLimitExceeded { .. }
+            | Self::InvalidRecord(_) => None,
         }
     }
 }
@@ -120,7 +142,10 @@ impl JournalWriter {
 
         let is_new = file.metadata()?.len() == 0;
         if !is_new {
-            validate_existing_journal(&path)?;
+            let format = validate_existing_journal(&path)?;
+            if format == JournalFormat::LegacyMej1 {
+                return Err(anyhow!(JournalError::LegacyFormatReadOnly));
+            }
         }
 
         let mut writer = BufWriter::new(file);
@@ -341,17 +366,39 @@ impl<R: Read> JournalReader<R> {
         Ok(Some(serde_json::from_slice(&payload)?))
     }
 
-    pub fn read_all(mut self) -> std::result::Result<Vec<RawEnvelope>, JournalError> {
+    pub fn read_all(self) -> std::result::Result<Vec<RawEnvelope>, JournalError> {
+        self.read_all_bounded(DEFAULT_MAX_RECORDS, DEFAULT_MAX_AGGREGATE_BYTES)
+    }
+
+    /// Collects journal records under explicit count and aggregate framed-byte limits.
+    ///
+    /// Streaming consumers should prefer [`Self::next_record`]. This bounded convenience method
+    /// prevents a structurally valid journal from causing unbounded memory growth.
+    pub fn read_all_bounded(
+        mut self,
+        max_records: usize,
+        max_aggregate_bytes: u64,
+    ) -> std::result::Result<Vec<RawEnvelope>, JournalError> {
         let mut records = Vec::new();
         while let Some(record) = self.next_record()? {
+            if records.len() >= max_records {
+                return Err(JournalError::RecordLimitExceeded { limit: max_records });
+            }
+            let aggregate_bytes = self.offset.saturating_sub(4);
+            if aggregate_bytes > max_aggregate_bytes {
+                return Err(JournalError::AggregateLimitExceeded {
+                    limit: max_aggregate_bytes,
+                });
+            }
             records.push(record);
         }
         Ok(records)
     }
 }
 
-fn validate_existing_journal(path: &Path) -> Result<()> {
+fn validate_existing_journal(path: &Path) -> Result<JournalFormat> {
     let mut reader = JournalReader::open(path)?;
+    let format = reader.ensure_format()?;
     while reader.next_record()?.is_some() {}
-    Ok(())
+    Ok(format)
 }

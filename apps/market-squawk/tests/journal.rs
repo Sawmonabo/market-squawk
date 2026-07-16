@@ -43,11 +43,50 @@ fn reads_current_msj1_header() -> Result<()> {
 }
 
 #[test]
+fn new_journals_are_identified_as_msj1() -> Result<()> {
+    let directory = tempdir()?;
+    let path = directory.path().join("new.msj");
+    let mut writer = JournalWriter::open(&path)?;
+    writer.flush()?;
+    drop(writer);
+
+    let mut header = [0_u8; 4];
+    std::fs::File::open(path)?.read_exact(&mut header)?;
+    assert_eq!(&header, b"MSJ1");
+    Ok(())
+}
+
+#[test]
+fn writer_refuses_to_append_to_legacy_mej1() -> Result<()> {
+    let directory = tempdir()?;
+    let path = directory.path().join("legacy.mej");
+    let original = fixture_with_magic(*b"MEJ1")?;
+    std::fs::write(&path, &original)?;
+
+    let Err(error) = JournalWriter::open(&path) else {
+        bail!("legacy journal must remain read-only");
+    };
+    assert!(error.to_string().contains("legacy journal is read-only"));
+    assert_eq!(std::fs::read(path)?, original);
+    Ok(())
+}
+
+#[test]
 fn rejects_unknown_journal_magic() -> Result<()> {
     let bytes = fixture_with_magic(*b"XXXX")?;
     assert!(matches!(
         JournalReader::new(Cursor::new(bytes)).read_all(),
         Err(JournalError::UnsupportedMagic(_))
+    ));
+    Ok(())
+}
+
+#[test]
+fn bounded_collection_rejects_record_count_overflow() -> Result<()> {
+    let bytes = fixture_with_magic(*b"MSJ1")?;
+    assert!(matches!(
+        JournalReader::new(Cursor::new(bytes)).read_all_bounded(0, u64::MAX),
+        Err(JournalError::RecordLimitExceeded { limit: 0 })
     ));
     Ok(())
 }

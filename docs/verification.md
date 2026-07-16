@@ -1,8 +1,9 @@
-# Verification Record
+# Verification Records
 
-## Verified with Rust 1.85.0
+## Historical pre-workspace record: Rust 1.85.0
 
-The following completed successfully in the artifact environment on July 15, 2026:
+The following completed successfully in the original single-package artifact environment on July
+15, 2026. It is retained as historical evidence and does not describe the current workspace gate:
 
 ```bash
 cargo fmt --all -- --check
@@ -39,3 +40,18 @@ market-squawk replay --source coinbase-exchange
 ## Reproducibility
 
 `Cargo.lock` is committed. Local and CI verification use `--locked` so dependency resolution cannot silently drift during a build.
+
+## Current Rust 1.97 workspace gate
+
+The repository now pins Rust 1.97.0 and runs one fail-fast local/CI entry point:
+
+```bash
+./scripts/verify.sh
+```
+
+That entry point checks the brand allowlist, Python policy-helper tests, workspace inheritance,
+reviewed duplicate-dependency inventory, workspace formatting, strict all-target/all-feature
+Clippy, the complete workspace test suite, a release build, rustdoc with warnings denied, CLI help,
+the deterministic 101-event offline mock, and a timeout-bounded local stdio MCP interaction. The
+current measured result is recorded after the Quarter 1 correction review rather than copying the
+historical 24-test claim forward.

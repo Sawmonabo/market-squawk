@@ -26,7 +26,7 @@ EXPECTED_DEFAULT_MEMBERS = {"apps/market-squawk/Cargo.toml"}
 
 def cargo_metadata(root: Path) -> dict[str, Any]:
     result = subprocess.run(
-        ["cargo", "metadata", "--format-version", "1", "--no-deps"],
+        ["cargo", "metadata", "--format-version", "1", "--no-deps", "--locked"],
         cwd=root,
         check=False,
         stdout=subprocess.PIPE,

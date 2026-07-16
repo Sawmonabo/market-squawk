@@ -17,11 +17,15 @@ TOKENS = (
     "ME" + "J1",
 )
 
-# Keys are (repository-relative path, one-based line, TOKENS index). Exact locations keep
-# compatibility references visible and prevent a path-wide exception from hiding new branding.
+# Keys are (repository-relative path, one-based line, TOKENS index). Line zero is reserved for an
+# explicitly approved compatibility filename. Exact locations keep compatibility references
+# visible and prevent a path-wide exception from hiding new branding.
 ALLOWED_OCCURRENCES = {
-    ("apps/market-squawk/src/journal.rs", 31, 3),
+    (".gitattributes", 2, 2),
+    ("apps/market-squawk/src/journal.rs", 33, 3),
     ("apps/market-squawk/tests/journal.rs", 31, 3),
+    ("apps/market-squawk/tests/journal.rs", 62, 2),
+    ("apps/market-squawk/tests/journal.rs", 63, 3),
     ("docs/architecture/current-state.md", 9, 0),
     ("docs/architecture/current-state.md", 208, 2),
     ("docs/architecture/current-state.md", 208, 3),
@@ -41,7 +45,6 @@ ALLOWED_OCCURRENCES = {
     ("docs/superpowers/plans/2026-07-16-market-squawk-stage-1-foundation.md", 1501, 2),
     ("docs/superpowers/plans/2026-07-16-market-squawk-stage-1-foundation.md", 1501, 3),
 }
-HISTORICAL_RESEARCH_PREFIX = "docs/research/"
 
 
 def repository_root() -> Path:
@@ -91,11 +94,24 @@ def read_bounded_text(path: Path) -> tuple[str | None, str | None]:
 
 
 def is_allowed(path: str, line_number: int, token_index: int) -> bool:
-    return path.startswith(HISTORICAL_RESEARCH_PREFIX) or (
-        path,
-        line_number,
-        token_index,
-    ) in ALLOWED_OCCURRENCES
+    return (path, line_number, token_index) in ALLOWED_OCCURRENCES
+
+
+def scan_path(path: str) -> list[str]:
+    violations: list[str] = []
+    for token_index, token in enumerate(TOKENS):
+        if token in path and not is_allowed(path, 0, token_index):
+            violations.append(f"{path}:0:{token}")
+    return violations
+
+
+def scan_text(path: str, content: str) -> list[str]:
+    violations: list[str] = []
+    for line_number, line in enumerate(content.splitlines(), start=1):
+        for token_index, token in enumerate(TOKENS):
+            if token in line and not is_allowed(path, line_number, token_index):
+                violations.append(f"{path}:{line_number}:{token}")
+    return violations
 
 
 def main() -> int:
@@ -103,6 +119,7 @@ def main() -> int:
     violations: list[str] = []
 
     for relative_path in repository_files(root):
+        violations.extend(scan_path(relative_path))
         text, read_error = read_bounded_text(root / relative_path)
         if read_error is not None:
             violations.append(f"{relative_path}:0:{read_error}")
@@ -110,10 +127,7 @@ def main() -> int:
         if text is None:
             continue
 
-        for line_number, line in enumerate(text.splitlines(), start=1):
-            for token_index, token in enumerate(TOKENS):
-                if token in line and not is_allowed(relative_path, line_number, token_index):
-                    violations.append(f"{relative_path}:{line_number}:{token}")
+        violations.extend(scan_text(relative_path, text))
 
     for violation in violations:
         print(violation)

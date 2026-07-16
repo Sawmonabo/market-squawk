@@ -24,6 +24,10 @@ Implemented now:
 - Optional paper-only momentum bot
 - Local stdio MCP server with strict schemas and per-process tool-call limiting
 - Deterministic mock source for offline verification
+- Rust 1.97 virtual workspace with invariant-preserving shared domain contracts
+- Distinct fair-value, market-depth, data-quality, stream-integrity, and capture-integrity types
+- Typed internal/external instrument identities, scaled financial values, provenance, and separate
+  canonical live/research observation families
 
 Deliberately not implemented in v0.1:
 
@@ -43,11 +47,11 @@ The live path needs predictable memory use, native execution, safe concurrency, 
 
 Prerequisites:
 
-- Rust 1.85 or newer
+- Rust 1.97.0 (pinned by `rust-toolchain.toml`)
 - Internet access only for dependency installation and live Coinbase capture
 
 ```bash
-cargo build --release --locked
+cargo build --workspace --all-features --release --locked
 
 # Create local state
 ./target/release/market-squawk init
@@ -193,7 +197,10 @@ It is intentionally simple and not an investment recommendation. It generates fi
 ./scripts/verify.sh
 ```
 
-This runs locked dependency verification, formatting checks, Clippy with warnings denied, 24 tests, and an offline mock smoke run.
+This runs the brand, Python-helper, workspace-boundary, and exact duplicate-dependency gates;
+workspace-wide formatting, strict Clippy, tests, release build, and rustdoc; then CLI, offline mock,
+and timeout-bounded local MCP smoke tests. All Cargo operations that consume dependencies use the
+committed lockfile.
 
 To exercise MCP after building:
 
@@ -204,21 +211,13 @@ python3 scripts/smoke_mcp.py ./target/debug/market-squawk
 ## Repository boundaries
 
 ```text
-src/
-├── bot.rs             paper intent and fill state
-├── config.rs          local paths and runtime configuration
-├── domain.rs          canonical raw and market events
-├── engine.rs          deterministic event coordinator
-├── features.rs        incremental order-book features
-├── journal.rs         CRC-framed immutable raw capture
-├── mcp.rs             bounded local stdio MCP interface
-├── order_book.rs      single-writer local book state
-├── quality.rs         fail-closed data-quality state
-├── replay.rs          journal validation and summaries
-├── risk.rs            deterministic order-intent checks
-└── source/
-    ├── coinbase.rs    public Coinbase Exchange adapter
-    └── mock.rs        deterministic offline source
+apps/
+└── market-squawk/                 CLI, current live application, MCP, journal, and compatibility tests
+crates/
+└── market-squawk-domain/          shared financial, identity, quality, provenance, and event contracts
+adapters/                           added atomically with the first working production adapter crate
+scripts/                            deterministic local/CI policy and smoke gates
+docs/                               architecture, plans, research, and verification evidence
 ```
 
 ## Zero-cost boundary

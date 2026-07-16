@@ -50,7 +50,8 @@ missing_debug_implementations = "warn"
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
 cargo = { level = "warn", priority = -1 }
-# Transitive platform and protocol stacks intentionally resolve independent major versions.
+# Transitive platform and protocol stacks intentionally resolve independent major versions. The
+# exact reviewed family/version inventory is enforced by scripts/check_duplicate_dependencies.py.
 multiple_crate_versions = "allow"
 unwrap_used = "deny"
 expect_used = "deny"
