@@ -1,0 +1,74 @@
+# Market Squawk dependency policy. Keep this fail-closed and review every exception in source.
+
+[graph]
+targets = [
+    "aarch64-apple-darwin",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+    "x86_64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+]
+all-features = true
+
+[advisories]
+unmaintained = "all"
+unsound = "all"
+yanked = "deny"
+maximum-db-staleness = "P7D"
+unused-ignored-advisory = "deny"
+ignore = []
+
+[licenses]
+confidence-threshold = 0.93
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+]
+exceptions = [
+    { allow = ["MITNFA"], crate = "hex_lit@0.1.1" },
+    { allow = ["CDLA-Permissive-2.0"], crate = "webpki-roots@0.26.11" },
+    { allow = ["CDLA-Permissive-2.0"], crate = "webpki-roots@1.0.8" },
+]
+
+[licenses.private]
+ignore = false
+registries = []
+
+[bans]
+# Exact reviewed duplicates are enforced separately by check_duplicate_dependencies.py, including
+# failure when an allowance becomes stale. Cargo-deny remains authoritative for crate/feature bans.
+multiple-versions = "allow"
+wildcards = "deny"
+highlight = "all"
+allow = []
+allow-workspace = true
+deny = [
+    { crate = "native-tls", reason = "Market Squawk standardizes on rustls-backed TLS" },
+    { crate = "native-tls-sys", reason = "Native TLS bindings are outside the reviewed TLS stack" },
+    { crate = "openssl", reason = "Market Squawk standardizes on rustls-backed TLS" },
+    { crate = "openssl-sys", reason = "Native OpenSSL bindings are outside the reviewed TLS stack" },
+    { crate = "opentelemetry", reason = "Version 1 forbids mandatory OpenTelemetry infrastructure" },
+    { crate = "opentelemetry-otlp", reason = "Version 1 forbids mandatory OpenTelemetry infrastructure" },
+    { crate = "opentelemetry_sdk", reason = "Version 1 forbids mandatory OpenTelemetry infrastructure" },
+    { crate = "tracing-opentelemetry", reason = "Version 1 forbids mandatory OpenTelemetry infrastructure" },
+]
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+[sources.allow-org]
+github = []
+gitlab = []
+bitbucket = []

@@ -12,8 +12,8 @@ publish = false
 arc-swap.workspace = true
 crc32fast.workspace = true
 futures-util.workspace = true
-market-squawk-domain = { path = "../market-squawk-domain" }
-market-squawk-sources = { path = "../market-squawk-sources" }
+market-squawk-domain = { workspace = true }
+market-squawk-sources = { workspace = true }
 rust_decimal.workspace = true
 serde.workspace = true
 sha2.workspace = true

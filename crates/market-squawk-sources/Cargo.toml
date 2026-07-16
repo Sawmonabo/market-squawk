@@ -11,7 +11,7 @@ publish = false
 [dependencies]
 bytes = { workspace = true }
 futures-util = { workspace = true }
-market-squawk-domain = { path = "../market-squawk-domain" }
+market-squawk-domain = { workspace = true }
 rust_decimal = { workspace = true }
 serde = { workspace = true }
 sha2 = { workspace = true }
@@ -20,7 +20,7 @@ tokio-util = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
-market-squawk-platform = { path = "../market-squawk-platform" }
+market-squawk-platform = { workspace = true }
 proptest = { workspace = true }
 serde_json = { workspace = true }
 static_assertions = { workspace = true }

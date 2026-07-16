@@ -16,7 +16,7 @@ chrono = { workspace = true }
 crc32fast = { workspace = true }
 fs2 = { workspace = true }
 libc = { workspace = true }
-market-squawk-domain = { path = "../market-squawk-domain" }
+market-squawk-domain = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
