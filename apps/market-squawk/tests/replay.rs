@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
-use market_squawk::{AppPaths, domain::RawEnvelope, replay::replay_coinbase_journal};
+use market_squawk::{AppPaths, DiagnosticRawEnvelope, replay::replay_coinbase_journal};
 use tempfile::tempdir;
 use uuid::Uuid;
 
@@ -20,7 +20,7 @@ fn coinbase_journal_replay_rebuilds_the_order_book() -> Result<()> {
     .to_vec();
 
     let mut writer = paths.open_journal_writer("coinbase-exchange")?;
-    writer.append(&RawEnvelope::try_from_compatibility_parts(
+    writer.append(&DiagnosticRawEnvelope::try_from_compatibility_parts(
         Uuid::new_v4(),
         "coinbase-exchange".to_owned(),
         connection_id,

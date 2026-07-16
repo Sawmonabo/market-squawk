@@ -3,7 +3,7 @@ use std::{ffi::OsString, path::PathBuf, sync::Arc, time::Duration};
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand, ValueEnum};
 use market_squawk::{
-    AppPaths, Engine, EngineConfig, JournalFileFormat,
+    AppConfig, AppPaths, DiagnosticEngine, DiagnosticEngineSnapshot, JournalFileFormat,
     mcp::McpServer,
     replay::replay_coinbase_journal,
     source::{MarketSource, coinbase::CoinbaseSource, mock::MockSource},
@@ -23,7 +23,7 @@ use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
 #[command(name = "market-squawk")]
-#[command(about = "Local-first live market-data capture, replay, paper bots, and MCP")]
+#[command(about = "Local-first market capture, diagnostic replay/simulation, and MCP")]
 #[command(version)]
 struct Cli {
     #[arg(long)]
@@ -203,10 +203,10 @@ fn load_config(
     data_dir: Option<PathBuf>,
     products: Option<Vec<String>>,
     paper_bot_enabled: Option<bool>,
-) -> Result<EngineConfig> {
+) -> Result<AppConfig> {
     let mut environment = ConfigSources::process_environment();
     environment.remove(&OsString::from("MARKET_SQUAWK_LOG"));
-    Ok(EngineConfig::load(ConfigSources::new(
+    Ok(AppConfig::load(ConfigSources::new(
         config_file,
         &environment,
         ConfigOverrides {
@@ -263,10 +263,10 @@ enum RunMode {
 }
 
 async fn run_source(
-    config: EngineConfig,
+    config: AppConfig,
     source: Box<dyn MarketSource>,
     mode: RunMode,
-) -> Result<market_squawk::EngineSnapshot> {
+) -> Result<DiagnosticEngineSnapshot> {
     let paths = AppPaths::prepare(config.data_dir())?;
     let source_name = match mode {
         RunMode::UntilSourceStops => "mock",
@@ -284,14 +284,14 @@ async fn run_source(
     let writer_policy = CaptureWriterPolicy::try_new(flush_batch, config.capture_flush_interval())?;
     let capture_handle = spawn_capture_writer(capture_writer, journal, writer_policy)?;
     capture_control.activate_initial()?;
-    let engine = Arc::new(RwLock::new(Engine::new(
+    let diagnostic_engine = Arc::new(RwLock::new(DiagnosticEngine::new(
         duration_millis_i64(config.stale_after())?,
         config.paper_bot_enabled(),
     )));
     let (event_sender, mut event_receiver) = mpsc::channel(16_384);
     let (cancel_sender, cancel_receiver) = watch::channel(false);
 
-    let engine_for_events = Arc::clone(&engine);
+    let diagnostic_engine_for_events = Arc::clone(&diagnostic_engine);
     let stale_after_ms = duration_millis_i64(config.stale_after())?;
     let event_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(
@@ -301,12 +301,14 @@ async fn run_source(
             tokio::select! {
                 event = event_receiver.recv() => {
                     match event {
-                        Some(event) => engine_for_events.write().handle(event),
+                        Some(event) => diagnostic_engine_for_events.write().handle(event),
                         None => break,
                     }
                 }
                 _ = interval.tick() => {
-                    engine_for_events.write().refresh_staleness(chrono::Utc::now());
+                    diagnostic_engine_for_events
+                        .write()
+                        .refresh_staleness(chrono::Utc::now());
                 }
             }
         }
@@ -355,7 +357,7 @@ async fn run_source(
             }
         }
         RunMode::Mcp => {
-            let mcp = McpServer::new(Arc::clone(&engine), journal_path.clone());
+            let mcp = McpServer::new(Arc::clone(&diagnostic_engine), journal_path.clone());
             tokio::select! {
                 result = &mut source_task => {
                     source_completed = true;
@@ -387,7 +389,7 @@ async fn run_source(
         return Err(error);
     }
 
-    let snapshot = engine.read().snapshot();
+    let snapshot = diagnostic_engine.read().snapshot();
     info!(
         processed_events = snapshot.processed_events,
         "run completed"
@@ -406,14 +408,16 @@ fn flatten_source_result(
 }
 
 async fn run_offline_mcp(
-    config: EngineConfig,
+    config: AppConfig,
     journal_format: Option<JournalFileFormat>,
 ) -> Result<()> {
     let paths = AppPaths::for_read(config.data_dir().to_path_buf());
     let journal_path = paths.select_journal_for_read("coinbase-exchange", journal_format)?;
-    let engine = Arc::new(RwLock::new(Engine::new(
+    let diagnostic_engine = Arc::new(RwLock::new(DiagnosticEngine::new(
         duration_millis_i64(config.stale_after())?,
         config.paper_bot_enabled(),
     )));
-    McpServer::new(engine, journal_path).serve_stdio().await
+    McpServer::new(diagnostic_engine, journal_path)
+        .serve_stdio()
+        .await
 }

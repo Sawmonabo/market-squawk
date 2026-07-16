@@ -1,11 +1,13 @@
-//! Local-first live market data engine.
+//! Local-first Market Squawk application composition.
 //!
-//! The latency-sensitive path is intentionally isolated from MCP and analytical consumers.
+//! Production live batches enter only [`live_runtime::LiveRuntimeComposition`]. The legacy local
+//! event model is explicitly diagnostic and remains isolated from current execution authority.
 
 pub mod bot;
-pub mod domain;
-pub mod engine;
+pub mod diagnostic_engine;
+mod domain;
 pub mod features;
+pub mod live_runtime;
 pub mod mcp;
 pub mod order_book;
 pub mod quality;
@@ -19,8 +21,15 @@ pub mod journal {
     pub use market_squawk_platform::{JournalError, JournalReader, JournalWriter};
 }
 
-pub use domain::{MarketEvent, RawEnvelope};
-pub use engine::{Engine, EngineSnapshot, SharedEngine};
+pub use diagnostic_engine::{
+    DiagnosticEngine, DiagnosticEngineSnapshot, DiagnosticProductSnapshot, SharedDiagnosticEngine,
+};
+pub use domain::{
+    BookChange as DiagnosticBookChange, MarketEvent as DiagnosticMarketEvent,
+    PriceLevel as DiagnosticPriceLevel, RawEnvelope as DiagnosticRawEnvelope,
+    Side as DiagnosticSide,
+};
+pub use live_runtime::{LiveRuntimeComposition, LiveRuntimeCompositionError};
 pub use market_squawk_platform::{
-    AppConfig as EngineConfig, JournalFileFormat, JournalSelectionError, LocalPaths as AppPaths,
+    AppConfig, JournalFileFormat, JournalSelectionError, LocalPaths as AppPaths,
 };

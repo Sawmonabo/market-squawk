@@ -1,8 +1,7 @@
 use anyhow::{Context, Result};
 use market_squawk::{
-    domain::{BookChange, PriceLevel, Side},
-    features::OnlineFeatures,
-    order_book::OrderBook,
+    DiagnosticBookChange as BookChange, DiagnosticPriceLevel as PriceLevel, DiagnosticSide as Side,
+    features::OnlineFeatures, order_book::OrderBook,
 };
 use rust_decimal::Decimal;
 

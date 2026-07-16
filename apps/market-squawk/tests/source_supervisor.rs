@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::Utc;
 use market_squawk::{
-    MarketEvent,
+    DiagnosticMarketEvent as MarketEvent,
     source::{CaptureContext, MarketSource, SourceRunOutcome},
     source_supervisor::SourceSupervisor,
 };

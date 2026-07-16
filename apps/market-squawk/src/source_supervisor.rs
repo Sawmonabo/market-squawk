@@ -7,7 +7,7 @@ use market_squawk_platform::{DiagnosticCaptureBundle, RawCaptureControl, RawCapt
 use tokio::sync::{mpsc, watch};
 
 use crate::{
-    MarketEvent,
+    domain::MarketEvent,
     source::{CaptureContext, MarketSource, SourceRunOutcome},
 };
 

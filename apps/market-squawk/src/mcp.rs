@@ -10,7 +10,7 @@ use parking_lot::Mutex;
 use serde_json::{Map, Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use crate::{engine::SharedEngine, replay::summarize_journal};
+use crate::{diagnostic_engine::SharedDiagnosticEngine, replay::summarize_journal};
 
 const PROTOCOL_VERSION: &str = "2025-11-25";
 const MAX_TOOL_CALLS_PER_SECOND: usize = 100;
@@ -51,16 +51,16 @@ impl ToolRateLimiter {
 
 #[derive(Clone, Debug)]
 pub struct McpServer {
-    engine: SharedEngine,
+    diagnostic_engine: SharedDiagnosticEngine,
     journal_path: PathBuf,
     tool_rate_limiter: Arc<Mutex<ToolRateLimiter>>,
 }
 
 impl McpServer {
     #[must_use]
-    pub fn new(engine: SharedEngine, journal_path: PathBuf) -> Self {
+    pub fn new(diagnostic_engine: SharedDiagnosticEngine, journal_path: PathBuf) -> Self {
         Self {
-            engine,
+            diagnostic_engine,
             journal_path,
             tool_rate_limiter: Arc::new(Mutex::new(ToolRateLimiter::new(
                 MAX_TOOL_CALLS_PER_SECOND,
@@ -189,7 +189,7 @@ impl McpServer {
             "Market.GetSnapshot" => {
                 reject_unknown_keys(&arguments, &["product"])?;
                 let product = optional_bounded_string(&arguments, "product", 128)?;
-                let snapshot = self.engine.read().snapshot();
+                let snapshot = self.diagnostic_engine.read().snapshot();
                 if let Some(product) = product {
                     let product_snapshot = snapshot.products.get(product).ok_or_else(|| {
                         (
@@ -205,7 +205,7 @@ impl McpServer {
             }
             "Market.GetQuality" => {
                 reject_unknown_keys(&arguments, &[])?;
-                let snapshot = self.engine.read().snapshot();
+                let snapshot = self.diagnostic_engine.read().snapshot();
                 let quality: Map<String, Value> = snapshot
                     .products
                     .into_iter()
@@ -220,7 +220,7 @@ impl McpServer {
             }
             "Bot.GetStatus" => {
                 reject_unknown_keys(&arguments, &[])?;
-                let snapshot = self.engine.read().snapshot();
+                let snapshot = self.diagnostic_engine.read().snapshot();
                 json!({
                     "mode": "paper_only",
                     "account": snapshot.paper_account,
@@ -245,7 +245,7 @@ impl McpServer {
                 if !confirmed {
                     return Err((-32602, "confirm=true is required".to_owned()));
                 }
-                self.engine.write().trigger_kill_switch();
+                self.diagnostic_engine.write().trigger_kill_switch();
                 json!({ "triggered": true, "reason": reason })
             }
             _ => return Err((-32602, format!("unknown tool: {name}"))),
@@ -353,7 +353,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "Bot.GetStatus",
-            "title": "Paper Bot Status",
+            "title": "Diagnostic Paper Simulation Status",
             "description": "Get paper-bot positions, fills, cash flow, and current risk state. This server never submits live orders.",
             "inputSchema": { "type": "object", "additionalProperties": false },
             "annotations": { "readOnlyHint": true, "destructiveHint": false },
@@ -369,8 +369,8 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "Risk.TriggerKillSwitch",
-            "title": "Trigger Paper Risk Kill Switch",
-            "description": "Irreversibly activate the in-process risk kill switch for the current run. Requires explicit confirmation and a reason.",
+            "title": "Trigger Diagnostic Simulation Kill Switch",
+            "description": "Irreversibly stop the compatibility paper simulation for the current run. This does not control production Task 8 execution. Requires explicit confirmation and a reason.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -389,13 +389,13 @@ fn tool_definitions() -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::Engine;
+    use crate::diagnostic_engine::DiagnosticEngine;
     use parking_lot::RwLock;
 
     #[test]
     fn initialize_advertises_tools_without_live_execution() -> Result<(), &'static str> {
         let server = McpServer::new(
-            Arc::new(RwLock::new(Engine::new(5_000, false))),
+            Arc::new(RwLock::new(DiagnosticEngine::new(5_000, false))),
             PathBuf::from("unused.msj"),
         );
         let response = server
@@ -414,7 +414,7 @@ mod tests {
     #[test]
     fn tool_arguments_reject_unknown_fields() -> Result<(), &'static str> {
         let server = McpServer::new(
-            Arc::new(RwLock::new(Engine::new(5_000, false))),
+            Arc::new(RwLock::new(DiagnosticEngine::new(5_000, false))),
             PathBuf::from("unused.msj"),
         );
         let response = server

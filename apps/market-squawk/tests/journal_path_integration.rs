@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use market_squawk::{AppPaths, domain::RawEnvelope};
+use market_squawk::{AppPaths, DiagnosticRawEnvelope};
 use serde_json::Value;
 use tempfile::tempdir;
 use uuid::Uuid;
@@ -33,7 +33,7 @@ fn legacy_fixture(data_dir: &Path) -> Result<PathBuf> {
     let current = paths.journal_write_file("fixture")?;
     let legacy = paths.journal_dir().join(format!("{SOURCE}.mej"));
     let mut writer = paths.open_journal_writer("fixture")?;
-    writer.append(&RawEnvelope::try_from_compatibility_parts(
+    writer.append(&DiagnosticRawEnvelope::try_from_compatibility_parts(
         Uuid::new_v4(),
         "fixture-source".to_owned(),
         Uuid::nil(),

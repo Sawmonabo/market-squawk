@@ -2,8 +2,7 @@ use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 
 use anyhow::{Context, Result, bail};
 use market_squawk::{
-    AppPaths,
-    domain::RawEnvelope,
+    AppPaths, DiagnosticRawEnvelope,
     journal::{JournalError, JournalReader},
 };
 use tempfile::tempdir;
@@ -14,8 +13,8 @@ fn envelope(
     connection_id: Uuid,
     source_sequence: Option<u64>,
     payload: Vec<u8>,
-) -> Result<RawEnvelope> {
-    Ok(RawEnvelope::try_from_compatibility_parts(
+) -> Result<DiagnosticRawEnvelope> {
+    Ok(DiagnosticRawEnvelope::try_from_compatibility_parts(
         Uuid::new_v4(),
         source.to_owned(),
         connection_id,

@@ -3,7 +3,7 @@ use std::{num::NonZeroUsize, time::Duration};
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use market_squawk::{
-    domain::MarketEvent,
+    DiagnosticMarketEvent as MarketEvent,
     journal::JournalReader,
     source::{CaptureContext, MarketSource, coinbase::CoinbaseSource},
 };

@@ -1,3 +1,9 @@
+//! Legacy diagnostic state used by mock capture, replay, and compatibility MCP display.
+//!
+//! This module cannot accept `CurrentDecodedProviderBatch`, mint live authority, or enter the
+//! production Task 8 runtime. Its historical paper calculation is intentionally ineligible for
+//! live execution.
+
 use std::{
     collections::{BTreeMap, HashMap},
     sync::Arc,
@@ -17,10 +23,11 @@ use crate::{
     risk::{RiskDecision, RiskKernel, RiskLimits, RiskState},
 };
 
-pub type SharedEngine = Arc<RwLock<Engine>>;
+/// Shared compatibility state for diagnostic capture, replay, and MCP display only.
+pub type SharedDiagnosticEngine = Arc<RwLock<DiagnosticEngine>>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProductSnapshot {
+pub struct DiagnosticProductSnapshot {
     pub product: String,
     pub source: Option<String>,
     pub top: Option<TopOfBook>,
@@ -32,9 +39,10 @@ pub struct ProductSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EngineSnapshot {
+/// Authority-free compatibility snapshot; it is never an execution input.
+pub struct DiagnosticEngineSnapshot {
     pub source_status: BTreeMap<String, String>,
-    pub products: BTreeMap<String, ProductSnapshot>,
+    pub products: BTreeMap<String, DiagnosticProductSnapshot>,
     pub paper_account: PaperAccount,
     pub risk: RiskState,
     pub processed_events: u64,
@@ -51,7 +59,8 @@ struct ProductState {
 }
 
 #[derive(Debug)]
-pub struct Engine {
+/// Diagnostic/replay compatibility engine structurally isolated from production live ingress.
+pub struct DiagnosticEngine {
     products: HashMap<String, ProductState>,
     source_status: BTreeMap<String, String>,
     paper_account: PaperAccount,
@@ -61,7 +70,7 @@ pub struct Engine {
     stale_after_ms: i64,
 }
 
-impl Engine {
+impl DiagnosticEngine {
     #[must_use]
     pub fn new(stale_after_ms: i64, paper_bot_enabled: bool) -> Self {
         Self {
@@ -89,7 +98,7 @@ impl Engine {
                 asks,
                 received_at,
             } => {
-                let tradable = {
+                let simulation_eligible = {
                     let state = self.products.entry(product.clone()).or_default();
                     state.source = Some(source);
                     state.book.apply_snapshot(&bids, &asks);
@@ -108,8 +117,8 @@ impl Engine {
                         state.features.is_some()
                     }
                 };
-                if tradable {
-                    self.maybe_run_paper_bot(&product, received_at);
+                if simulation_eligible {
+                    self.maybe_run_diagnostic_paper_simulation(&product, received_at);
                 }
             }
             MarketEvent::BookDelta {
@@ -119,7 +128,7 @@ impl Engine {
                 received_at,
                 ..
             } => {
-                let tradable = {
+                let simulation_eligible = {
                     let state = self.products.entry(product.clone()).or_default();
                     state.source = Some(source);
                     state.last_update_at = Some(received_at);
@@ -147,8 +156,8 @@ impl Engine {
                         }
                     }
                 };
-                if tradable {
-                    self.maybe_run_paper_bot(&product, received_at);
+                if simulation_eligible {
+                    self.maybe_run_diagnostic_paper_simulation(&product, received_at);
                 }
             }
             MarketEvent::Heartbeat {
@@ -202,7 +211,7 @@ impl Engine {
         }
     }
 
-    fn maybe_run_paper_bot(&mut self, product: &str, at: DateTime<Utc>) {
+    fn maybe_run_diagnostic_paper_simulation(&mut self, product: &str, at: DateTime<Utc>) {
         let state = match self.products.get(product) {
             Some(state) => state,
             None => return,
@@ -245,14 +254,14 @@ impl Engine {
     }
 
     #[must_use]
-    pub fn snapshot(&self) -> EngineSnapshot {
+    pub fn snapshot(&self) -> DiagnosticEngineSnapshot {
         let products = self
             .products
             .iter()
             .map(|(product, state)| {
                 (
                     product.clone(),
-                    ProductSnapshot {
+                    DiagnosticProductSnapshot {
                         product: product.clone(),
                         source: state.source.clone(),
                         top: state.book.top(),
@@ -266,7 +275,7 @@ impl Engine {
             })
             .collect();
 
-        EngineSnapshot {
+        DiagnosticEngineSnapshot {
             source_status: self.source_status.clone(),
             products,
             paper_account: self.paper_account.clone(),

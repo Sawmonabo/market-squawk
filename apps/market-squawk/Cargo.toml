@@ -27,11 +27,15 @@ fs2 = { workspace = true }
 futures-util = { workspace = true }
 parking_lot = { workspace = true }
 market-squawk-domain = { path = "../../crates/market-squawk-domain" }
+market-squawk-live = { path = "../../crates/market-squawk-live" }
 market-squawk-platform = { path = "../../crates/market-squawk-platform" }
+market-squawk-sources = { path = "../../crates/market-squawk-sources" }
 rust_decimal = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 tokio-tungstenite = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

@@ -1,7 +1,7 @@
 use chrono::{Duration, Utc};
 use market_squawk::{
+    DiagnosticSide as Side,
     bot::OrderIntent,
-    domain::Side,
     quality::FeedQuality,
     risk::{RiskDecision, RiskKernel, RiskLimits},
 };

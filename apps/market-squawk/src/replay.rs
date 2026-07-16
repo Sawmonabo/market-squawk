@@ -5,8 +5,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    domain::RawEnvelope,
-    engine::{Engine, EngineSnapshot},
+    DiagnosticRawEnvelope,
+    diagnostic_engine::{DiagnosticEngine, DiagnosticEngineSnapshot},
     journal::JournalReader,
     source::coinbase::decode_message,
 };
@@ -21,7 +21,7 @@ pub struct ReplaySummary {
 }
 
 impl ReplaySummary {
-    fn observe(&mut self, record: &RawEnvelope) -> Result<()> {
+    fn observe(&mut self, record: &DiagnosticRawEnvelope) -> Result<()> {
         self.records = self.records.saturating_add(1);
         self.bytes = self
             .bytes
@@ -39,7 +39,7 @@ impl ReplaySummary {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplayResult {
     pub summary: ReplaySummary,
-    pub snapshot: EngineSnapshot,
+    pub snapshot: DiagnosticEngineSnapshot,
 }
 
 pub fn summarize_journal(path: impl AsRef<Path>) -> Result<ReplaySummary> {
@@ -60,7 +60,7 @@ pub fn replay_coinbase_journal(
 ) -> Result<ReplayResult> {
     let mut reader = JournalReader::open(path)?;
     let mut summary = ReplaySummary::default();
-    let mut engine = Engine::new(stale_after_ms, paper_bot_enabled);
+    let mut diagnostic_engine = DiagnosticEngine::new(stale_after_ms, paper_bot_enabled);
 
     while let Some(record) = reader.next_record()? {
         summary.observe(&record)?;
@@ -71,12 +71,12 @@ pub fn replay_coinbase_journal(
         let value = serde_json::from_slice(record.payload())
             .context("journal contains invalid Coinbase JSON")?;
         if let Some(event) = decode_message(&value, record.received_at())? {
-            engine.handle(event);
+            diagnostic_engine.handle(event);
         }
     }
 
     Ok(ReplayResult {
         summary,
-        snapshot: engine.snapshot(),
+        snapshot: diagnostic_engine.snapshot(),
     })
 }
