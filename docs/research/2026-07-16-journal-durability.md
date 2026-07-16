@@ -50,6 +50,15 @@ background/control-plane path.
   therefore operate relative to held directory capabilities and must not cross filesystems.
   [POSIX `rename`/`renameat`](https://man7.org/linux/man-pages/man3/rename.3p.html)
 
+- Tokio tasks are cooperatively scheduled, so synchronous append, flush, and synchronization calls
+  must not run inside an ordinary `tokio::spawn` future. Tokio's current guidance distinguishes
+  short-lived blocking operations (`spawn_blocking`) from long-lived persistent blocking workers,
+  for which it recommends a dedicated thread. Raw capture is a persistent ordered writer, so it
+  uses one supervised dedicated OS thread and a bounded bridge; shutdown is cooperative and
+  deadline-aware rather than relying on aborting an uninterruptible blocking operation.
+  [Tokio task blocking guidance](https://docs.rs/tokio/1.52.3/tokio/task/index.html),
+  [Tokio `spawn_blocking`](https://docs.rs/tokio/1.52.3/tokio/task/fn.spawn_blocking.html)
+
 ## Required implementation consequences
 
 - `JournalWriter` receives or owns a directory capability plus a validated relative journal name;
@@ -65,6 +74,9 @@ background/control-plane path.
 - Shutdown drains only to its configured deadline, then performs the required flush/synchronization.
   Timeout or synchronization failure leaves the exact source/revision/session/generation capture
   binding incomplete.
+- The persistent writer performs synchronous filesystem operations on a supervised dedicated
+  thread, not a Tokio core worker. The async control-plane handle may await a completion signal, but
+  aborting that handle is not treated as proof that an in-progress blocking sync was cancelled.
 - Literal legacy `MEJ1` fixtures remain read-only. New writes use only `MSJ1`; existing legacy data
   is never silently rewritten or shadowed.
 
