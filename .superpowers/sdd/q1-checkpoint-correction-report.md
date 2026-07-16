@@ -101,5 +101,9 @@ Results:
 - Warning-denied domain rustdoc passed.
 - The integrated diff check passed.
 
-The full root `./scripts/verify.sh` result and final grouped signoff are recorded after this report is
-committed and the exact post-report head is verified.
+The full root `./scripts/verify.sh` gate passed after the three implementation commits and this
+report were integrated. It included all 21 policy tests, formatting, warning-denied locked
+workspace Clippy, locked workspace tests and doctests, locked release build, warning-denied
+rustdoc, the deterministic 101-event offline smoke, and the local stdio MCP smoke. Final grouped
+signoff is recorded in the Stage 1 progress ledger after independent reviewers approve the exact
+post-report head.
