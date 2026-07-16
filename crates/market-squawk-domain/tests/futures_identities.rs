@@ -13,9 +13,11 @@ fn reference() -> PayloadReference {
 fn lifecycle() -> Result<FuturesLifecycleDates, Box<dyn std::error::Error>> {
     Ok(FuturesLifecycleDates::try_new(
         FuturesLifecycleDateFields {
+            first_trade_date: Some(CalendarDate::new(2025, 12, 1)?),
             maturity_date: Some(CalendarDate::new(2026, 3, 20)?),
             expiration_date: Some(CalendarDate::new(2026, 3, 20)?),
             last_trade_date: Some(CalendarDate::new(2026, 3, 20)?),
+            settlement_date: Some(CalendarDate::new(2026, 3, 21)?),
             first_notice_date: Some(CalendarDate::new(2026, 2, 24)?),
             last_notice_date: Some(CalendarDate::new(2026, 2, 27)?),
             first_delivery_date: Some(CalendarDate::new(2026, 3, 18)?),
@@ -72,6 +74,14 @@ fn lifecycle_dates_allow_absence_and_enforce_ordering() -> Result<(), Box<dyn st
     assert!(!dates.is_empty());
     assert_eq!(dates.maturity_date(), Some(CalendarDate::new(2026, 3, 20)?));
     assert_eq!(
+        dates.first_trade_date(),
+        Some(CalendarDate::new(2025, 12, 1)?)
+    );
+    assert_eq!(
+        dates.settlement_date(),
+        Some(CalendarDate::new(2026, 3, 21)?)
+    );
+    assert_eq!(
         dates.last_notice_date(),
         Some(CalendarDate::new(2026, 2, 27)?)
     );
@@ -82,7 +92,47 @@ fn lifecycle_dates_allow_absence_and_enforce_ordering() -> Result<(), Box<dyn st
             last_notice_date: Some(CalendarDate::new(2026, 3, 1)?),
             ..FuturesLifecycleDateFields::default()
         }),
-        Err(IdentifierError::InvalidLifecycleOrdering)
+        Err(IdentifierError::FirstNoticeAfterLastNotice)
+    );
+    assert_eq!(
+        FuturesLifecycleDates::try_new(FuturesLifecycleDateFields {
+            first_trade_date: Some(CalendarDate::new(2026, 3, 21)?),
+            last_trade_date: Some(CalendarDate::new(2026, 3, 20)?),
+            ..FuturesLifecycleDateFields::default()
+        }),
+        Err(IdentifierError::FirstTradeAfterLastTrade)
+    );
+    assert_eq!(
+        FuturesLifecycleDates::try_new(FuturesLifecycleDateFields {
+            expiration_date: Some(CalendarDate::new(2026, 3, 22)?),
+            settlement_date: Some(CalendarDate::new(2026, 3, 21)?),
+            ..FuturesLifecycleDateFields::default()
+        }),
+        Err(IdentifierError::ExpirationAfterSettlement)
+    );
+    assert_eq!(
+        FuturesLifecycleDates::try_new(FuturesLifecycleDateFields {
+            first_trade_date: Some(CalendarDate::new(2026, 3, 22)?),
+            expiration_date: Some(CalendarDate::new(2026, 3, 21)?),
+            ..FuturesLifecycleDateFields::default()
+        }),
+        Err(IdentifierError::FirstTradeAfterExpiration)
+    );
+    assert_eq!(
+        FuturesLifecycleDates::try_new(FuturesLifecycleDateFields {
+            last_trade_date: Some(CalendarDate::new(2026, 3, 22)?),
+            settlement_date: Some(CalendarDate::new(2026, 3, 21)?),
+            ..FuturesLifecycleDateFields::default()
+        }),
+        Err(IdentifierError::LastTradeAfterSettlement)
+    );
+    assert_eq!(
+        FuturesLifecycleDates::try_new(FuturesLifecycleDateFields {
+            maturity_date: Some(CalendarDate::new(2026, 3, 22)?),
+            settlement_date: Some(CalendarDate::new(2026, 3, 21)?),
+            ..FuturesLifecycleDateFields::default()
+        }),
+        Err(IdentifierError::MaturityAfterSettlement)
     );
     Ok(())
 }
@@ -161,5 +211,69 @@ fn maturity_date_does_not_invent_tag_200_and_wire_preserves_absence()
         serde_json::from_value::<FuturesContractIdentity>(encoded)?,
         contract
     );
+    Ok(())
+}
+
+#[test]
+fn all_lifecycle_and_fix_maturity_fields_round_trip_without_collapsing_independent_claims()
+-> Result<(), Box<dyn std::error::Error>> {
+    let tag_200 = MaturityMonthYear::month(2026, 6)?;
+    let tag_610 = MaturityMonthYear::day(2026, 3, 20)?;
+    let tag_611 = CalendarDate::new(2026, 3, 20)?;
+    let legs = vec![
+        FuturesLeg::try_new(FuturesLegInput {
+            position: 1,
+            security_id: ProviderInstrumentId::try_from("ESH6")?,
+            security_id_source: SourceIdentifier::try_from("8")?,
+            maturity_month_year: Some(tag_610),
+            maturity_date: Some(tag_611),
+            side: FuturesLegSide::Buy,
+            ratio: 1,
+        })?,
+        FuturesLeg::try_new(FuturesLegInput {
+            position: 2,
+            security_id: ProviderInstrumentId::try_from("ESM6")?,
+            security_id_source: SourceIdentifier::try_from("8")?,
+            maturity_month_year: None,
+            maturity_date: None,
+            side: FuturesLegSide::Sell,
+            ratio: 1,
+        })?,
+    ];
+    let identity = FuturesContractIdentity::try_new(identity_input(
+        FuturesSecurityType::SpreadOrMultileg,
+        Some(tag_200),
+        lifecycle()?,
+        legs,
+    )?)?;
+    let wire = serde_json::to_value(&identity)?;
+    let decoded = serde_json::from_value::<FuturesContractIdentity>(wire)?;
+    assert_eq!(decoded, identity);
+    assert_eq!(decoded.maturity_month_year(), Some(tag_200));
+    assert_eq!(
+        decoded.lifecycle().maturity_date(),
+        Some(CalendarDate::new(2026, 3, 20)?)
+    );
+    assert_eq!(decoded.legs()[0].maturity_month_year(), Some(tag_610));
+    assert_eq!(decoded.legs()[0].maturity_date(), Some(tag_611));
+
+    let only_first_trade = FuturesLifecycleDates::try_new(FuturesLifecycleDateFields {
+        first_trade_date: Some(CalendarDate::new(2025, 1, 2)?),
+        ..FuturesLifecycleDateFields::default()
+    })?;
+    let only_settlement = FuturesLifecycleDates::try_new(FuturesLifecycleDateFields {
+        settlement_date: Some(CalendarDate::new(2026, 4, 1)?),
+        ..FuturesLifecycleDateFields::default()
+    })?;
+    assert_eq!(
+        serde_json::from_value::<FuturesLifecycleDates>(serde_json::to_value(only_first_trade)?)?,
+        only_first_trade
+    );
+    assert_eq!(only_first_trade.settlement_date(), None);
+    assert_eq!(
+        serde_json::from_value::<FuturesLifecycleDates>(serde_json::to_value(only_settlement)?)?,
+        only_settlement
+    );
+    assert_eq!(only_settlement.first_trade_date(), None);
     Ok(())
 }

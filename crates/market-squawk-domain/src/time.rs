@@ -80,6 +80,7 @@ impl fmt::Display for CalendarDate {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CalendarDateWire {
     year: u16,
     month: u8,

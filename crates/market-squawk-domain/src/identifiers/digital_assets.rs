@@ -1,4 +1,5 @@
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::str::FromStr;
 
 use bitcoin::address::{Address, NetworkUnchecked};
@@ -10,7 +11,7 @@ use super::IdentifierError;
 use crate::{ProviderInstrumentId, VenueId};
 
 /// Venue product family for a directional crypto pair.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CryptoProductType {
     /// Spot pair.
@@ -94,6 +95,7 @@ impl fmt::Display for CryptoPair {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CryptoPairWire {
     venue_id: VenueId,
     raw_product_id: ProviderInstrumentId,
@@ -206,6 +208,187 @@ impl<'de> Deserialize<'de> for ChainId {
     }
 }
 
+/// Protocol-qualified EIP-155 chain identity with a canonical decimal reference.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct EvmChainId(ChainId);
+
+impl EvmChainId {
+    /// Returns the validated generic CAIP-2 representation.
+    pub const fn chain_id(&self) -> &ChainId {
+        &self.0
+    }
+
+    /// Returns the canonical decimal EIP-155 chain-number text.
+    pub fn numeric_reference(&self) -> &str {
+        self.0.reference()
+    }
+}
+
+impl TryFrom<ChainId> for EvmChainId {
+    type Error = IdentifierError;
+
+    fn try_from(value: ChainId) -> Result<Self, Self::Error> {
+        let reference = value.reference();
+        let canonical_numeric = !reference.is_empty()
+            && reference.bytes().all(|byte| byte.is_ascii_digit())
+            && (reference == "0" || !reference.starts_with('0'));
+        if value.namespace() != "eip155" || !canonical_numeric {
+            return Err(IdentifierError::InvalidChainId);
+        }
+        Ok(Self(value))
+    }
+}
+
+impl TryFrom<&str> for EvmChainId {
+    type Error = IdentifierError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        ChainId::try_from(value).and_then(Self::try_from)
+    }
+}
+
+impl TryFrom<String> for EvmChainId {
+    type Error = IdentifierError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for EvmChainId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        ChainId::deserialize(deserializer)?
+            .try_into()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+impl fmt::Display for EvmChainId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+/// Source-registry network associated with a recognized Solana genesis-hash reference.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SolanaNetwork {
+    /// Solana mainnet-beta.
+    Mainnet,
+    /// Solana testnet.
+    Testnet,
+    /// Solana devnet.
+    Devnet,
+}
+
+impl SolanaNetwork {
+    const fn reference(self) -> &'static str {
+        match self {
+            Self::Mainnet => "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+            Self::Testnet => "4uhcVJyU9pJkvQyS88uRDiswHXSCkY3z",
+            Self::Devnet => "EtWTRABZaYq6iMfeYKouRu166VU2xqa1",
+        }
+    }
+}
+
+/// Protocol-qualified Solana chain identity recognized from a registry genesis-hash reference.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct SolanaChainId {
+    chain_id: ChainId,
+    #[serde(skip)]
+    network: SolanaNetwork,
+}
+
+impl SolanaChainId {
+    /// Returns the official mainnet-beta chain identity.
+    pub fn mainnet() -> Self {
+        Self::from_network(SolanaNetwork::Mainnet)
+    }
+
+    /// Constructs a chain identity from a recognized source-registry network.
+    pub fn from_network(network: SolanaNetwork) -> Self {
+        let reference = network.reference();
+        Self {
+            chain_id: ChainId {
+                canonical: format!("solana:{reference}"),
+                namespace: "solana".to_owned(),
+                reference: reference.to_owned(),
+            },
+            network,
+        }
+    }
+
+    /// Returns the validated generic CAIP-2 representation.
+    pub const fn chain_id(&self) -> &ChainId {
+        &self.chain_id
+    }
+
+    /// Returns the source-registry network matched by the genesis reference.
+    pub const fn network(&self) -> SolanaNetwork {
+        self.network
+    }
+}
+
+impl TryFrom<ChainId> for SolanaChainId {
+    type Error = IdentifierError;
+
+    fn try_from(value: ChainId) -> Result<Self, Self::Error> {
+        if value.namespace() != "solana" {
+            return Err(IdentifierError::InvalidChainId);
+        }
+        let network = [
+            SolanaNetwork::Mainnet,
+            SolanaNetwork::Testnet,
+            SolanaNetwork::Devnet,
+        ]
+        .into_iter()
+        .find(|network| value.reference() == network.reference())
+        .ok_or(IdentifierError::InvalidChainId)?;
+        Ok(Self {
+            chain_id: value,
+            network,
+        })
+    }
+}
+
+impl TryFrom<&str> for SolanaChainId {
+    type Error = IdentifierError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        ChainId::try_from(value).and_then(Self::try_from)
+    }
+}
+
+impl TryFrom<String> for SolanaChainId {
+    type Error = IdentifierError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for SolanaChainId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        ChainId::deserialize(deserializer)?
+            .try_into()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+impl fmt::Display for SolanaChainId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.chain_id.fmt(formatter)
+    }
+}
+
 /// Semantic role of a chain-qualified address.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -304,7 +487,7 @@ enum ChainAddressPayload {
 /// the 32-byte public-key contract documented by [Solana accounts](https://solana.com/docs/core/accounts).
 /// The type exposes no universal address parser, does not infer chains, and does not prove on-chain
 /// account/contract existence or token semantics.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct ChainAddress {
     chain_id: ChainId,
     submitted: String,
@@ -323,10 +506,13 @@ impl ChainAddress {
     ///
     /// Rejects wrong length/hex or an invalid mixed-case checksum.
     pub fn try_evm(
-        chain_id: ChainId,
+        chain_id: EvmChainId,
         submitted: &str,
         role: ChainAddressRole,
     ) -> Result<Self, IdentifierError> {
+        if matches!(role, ChainAddressRole::Mint) {
+            return Err(IdentifierError::InvalidAddressRole);
+        }
         if submitted.len() != 42 || !submitted.starts_with("0x") && !submitted.starts_with("0X") {
             return Err(IdentifierError::InvalidAddress);
         }
@@ -351,7 +537,7 @@ impl ChainAddress {
             decoded[index] = high * 16 + low;
         }
         Ok(Self {
-            chain_id,
+            chain_id: chain_id.0,
             submitted: submitted.to_owned(),
             canonical: format!("0x{}", body.to_ascii_lowercase()),
             payload: ChainAddressPayload::Evm(decoded),
@@ -368,10 +554,13 @@ impl ChainAddress {
     ///
     /// Rejects invalid base58 or decoded lengths other than 32 bytes.
     pub fn try_solana(
-        chain_id: ChainId,
+        chain_id: SolanaChainId,
         submitted: &str,
         role: ChainAddressRole,
     ) -> Result<Self, IdentifierError> {
+        if matches!(role, ChainAddressRole::TokenContract) {
+            return Err(IdentifierError::InvalidAddressRole);
+        }
         if submitted.is_empty() || submitted.len() > 44 {
             return Err(IdentifierError::InvalidAddress);
         }
@@ -383,7 +572,7 @@ impl ChainAddress {
             return Err(IdentifierError::InvalidAddress);
         }
         Ok(Self {
-            chain_id,
+            chain_id: chain_id.chain_id,
             submitted: submitted.to_owned(),
             canonical: bs58::encode(decoded).into_string(),
             payload: ChainAddressPayload::Solana(decoded),
@@ -410,6 +599,12 @@ impl ChainAddress {
         role: ChainAddressRole,
         network: BitcoinNetwork,
     ) -> Result<Self, IdentifierError> {
+        if matches!(
+            role,
+            ChainAddressRole::TokenContract | ChainAddressRole::Mint
+        ) {
+            return Err(IdentifierError::InvalidAddressRole);
+        }
         if submitted.is_empty() || submitted.len() > 90 || !submitted.is_ascii() {
             return Err(IdentifierError::InvalidAddress);
         }
@@ -505,6 +700,30 @@ impl ChainAddress {
     }
 }
 
+impl PartialEq for ChainAddress {
+    fn eq(&self, other: &Self) -> bool {
+        self.chain_id == other.chain_id
+            && self.payload == other.payload
+            && self.role == other.role
+            && self.rule == other.rule
+            && self.bitcoin_network == other.bitcoin_network
+            && self.bitcoin_address_type == other.bitcoin_address_type
+    }
+}
+
+impl Eq for ChainAddress {}
+
+impl Hash for ChainAddress {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.chain_id.hash(state);
+        self.payload.hash(state);
+        self.role.hash(state);
+        self.rule.hash(state);
+        self.bitcoin_network.hash(state);
+        self.bitcoin_address_type.hash(state);
+    }
+}
+
 impl fmt::Display for ChainAddress {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.canonical.fmt(formatter)
@@ -557,7 +776,7 @@ impl Serialize for ChainAddress {
     {
         ChainAddressWireRef {
             chain_id: &self.chain_id,
-            submitted: &self.submitted,
+            submitted: &self.canonical,
             role: self.role,
             rule: self.rule,
             bitcoin_network: self.bitcoin_network,
@@ -583,11 +802,11 @@ impl<'de> Deserialize<'de> for ChainAddress {
     {
         let wire = ChainAddressWire::deserialize(deserializer)?;
         match (wire.rule, wire.bitcoin_network) {
-            (ChainAddressRule::EvmHex20Eip55, None) => {
-                Self::try_evm(wire.chain_id, &wire.submitted, wire.role)
-            }
+            (ChainAddressRule::EvmHex20Eip55, None) => EvmChainId::try_from(wire.chain_id)
+                .and_then(|chain| Self::try_evm(chain, &wire.submitted, wire.role)),
             (ChainAddressRule::SolanaBase58PublicKey, None) => {
-                Self::try_solana(wire.chain_id, &wire.submitted, wire.role)
+                SolanaChainId::try_from(wire.chain_id)
+                    .and_then(|chain| Self::try_solana(chain, &wire.submitted, wire.role))
             }
             (ChainAddressRule::BitcoinAddress, Some(network)) => {
                 Self::try_bitcoin(wire.chain_id, &wire.submitted, wire.role, network)

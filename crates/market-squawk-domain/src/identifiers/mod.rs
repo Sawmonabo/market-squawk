@@ -28,12 +28,30 @@ pub enum IdentifierError {
     InvalidChainId,
     /// An address did not satisfy its explicitly selected protocol grammar.
     InvalidAddress,
+    /// An address role is not meaningful for the selected protocol.
+    InvalidAddressRole,
     /// A mixed-case EVM address did not satisfy EIP-55.
     InvalidAddressChecksum,
     /// A valid Bitcoin address was not valid for the explicitly requested network.
     InvalidAddressNetwork,
-    /// Futures lifecycle dates were not in a valid relational order.
-    InvalidLifecycleOrdering,
+    /// First trade was later than last trade.
+    FirstTradeAfterLastTrade,
+    /// First trade was later than expiration.
+    FirstTradeAfterExpiration,
+    /// First trade was later than settlement.
+    FirstTradeAfterSettlement,
+    /// Last trade was later than expiration.
+    LastTradeAfterExpiration,
+    /// Last trade was later than settlement.
+    LastTradeAfterSettlement,
+    /// Expiration was later than settlement.
+    ExpirationAfterSettlement,
+    /// Maturity was later than settlement.
+    MaturityAfterSettlement,
+    /// First notice was later than last notice.
+    FirstNoticeAfterLastNotice,
+    /// First delivery was later than last delivery.
+    FirstDeliveryAfterLastDelivery,
     /// A futures leg position or ratio was zero.
     ZeroLegRatio,
     /// A futures leg position was zero.
@@ -65,12 +83,39 @@ impl fmt::Display for IdentifierError {
                 formatter.write_str("chain identifier is not valid CAIP-2 syntax")
             }
             Self::InvalidAddress => formatter.write_str("address does not match its protocol rule"),
+            Self::InvalidAddressRole => {
+                formatter.write_str("address role is incompatible with its protocol")
+            }
             Self::InvalidAddressChecksum => formatter.write_str("EVM address checksum is invalid"),
             Self::InvalidAddressNetwork => {
                 formatter.write_str("Bitcoin address is not valid for the requested network")
             }
-            Self::InvalidLifecycleOrdering => {
-                formatter.write_str("futures lifecycle dates are not relationally ordered")
+            Self::FirstTradeAfterLastTrade => {
+                formatter.write_str("futures first trade date is after last trade date")
+            }
+            Self::FirstTradeAfterExpiration => {
+                formatter.write_str("futures first trade date is after expiration date")
+            }
+            Self::FirstTradeAfterSettlement => {
+                formatter.write_str("futures first trade date is after settlement date")
+            }
+            Self::LastTradeAfterExpiration => {
+                formatter.write_str("futures last trade date is after expiration date")
+            }
+            Self::LastTradeAfterSettlement => {
+                formatter.write_str("futures last trade date is after settlement date")
+            }
+            Self::ExpirationAfterSettlement => {
+                formatter.write_str("futures expiration date is after settlement date")
+            }
+            Self::MaturityAfterSettlement => {
+                formatter.write_str("futures maturity date is after settlement date")
+            }
+            Self::FirstNoticeAfterLastNotice => {
+                formatter.write_str("futures first notice date is after last notice date")
+            }
+            Self::FirstDeliveryAfterLastDelivery => {
+                formatter.write_str("futures first delivery date is after last delivery date")
             }
             Self::ZeroLegRatio => formatter.write_str("futures leg ratio must be nonzero"),
             Self::ZeroLegPosition => formatter.write_str("futures leg position must be nonzero"),
@@ -247,6 +292,6 @@ pub use derivatives::{
 };
 pub use digital_assets::{
     BitcoinAddressType, BitcoinNetwork, ChainAddress, ChainAddressRole, ChainAddressRule, ChainId,
-    CryptoPair, CryptoProductType,
+    CryptoPair, CryptoProductType, EvmChainId, SolanaChainId, SolanaNetwork,
 };
 pub use securities::{Cusip, Figi, Isin, Sedol};

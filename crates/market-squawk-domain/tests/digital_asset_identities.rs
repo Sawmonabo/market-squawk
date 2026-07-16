@@ -1,6 +1,6 @@
 use market_squawk_domain::{
     BitcoinAddressType, BitcoinNetwork, ChainAddress, ChainAddressRole, ChainAddressRule, ChainId,
-    CryptoPair, CryptoProductType, IdentifierError, ProviderInstrumentId, VenueId,
+    CryptoPair, CryptoProductType, IdentifierError, ProviderInstrumentId, SolanaChainId, VenueId,
 };
 
 #[test]
@@ -55,14 +55,14 @@ fn crypto_pair_exposes_every_source_qualified_component() -> Result<(), Box<dyn 
 #[test]
 fn solana_decode_is_bounded_fixed_width_and_wire_authoritative()
 -> Result<(), Box<dyn std::error::Error>> {
-    let chain_id = ChainId::try_from("solana:mainnet")?;
+    let chain_id = SolanaChainId::mainnet();
     let address = ChainAddress::try_solana(
         chain_id.clone(),
         "11111111111111111111111111111111",
         ChainAddressRole::Mint,
     )?;
 
-    assert_eq!(address.chain_id(), &chain_id);
+    assert_eq!(address.chain_id(), chain_id.chain_id());
     assert_eq!(address.submitted(), "11111111111111111111111111111111");
     assert_eq!(address.canonical(), address.submitted());
     assert_eq!(address.solana_public_key(), Some(&[0_u8; 32]));
@@ -81,7 +81,7 @@ fn solana_decode_is_bounded_fixed_width_and_wire_authoritative()
     );
 
     let tampered = serde_json::json!({
-        "chain_id": "solana:mainnet",
+        "chain_id": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
         "submitted": "11111111111111111111111111111111",
         "role": "mint",
         "rule": "solana_base58_public_key",

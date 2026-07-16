@@ -35,9 +35,11 @@ pub enum FuturesSecurityType {
 /// evidence lives on [`FuturesContractIdentity`] so a tag-200-only record remains evidenced.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize)]
 pub struct FuturesLifecycleDates {
+    first_trade_date: Option<CalendarDate>,
     maturity_date: Option<CalendarDate>,
     expiration_date: Option<CalendarDate>,
     last_trade_date: Option<CalendarDate>,
+    settlement_date: Option<CalendarDate>,
     first_notice_date: Option<CalendarDate>,
     last_notice_date: Option<CalendarDate>,
     first_delivery_date: Option<CalendarDate>,
@@ -51,12 +53,16 @@ pub struct FuturesLifecycleDates {
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FuturesLifecycleDateFields {
+    /// First date on which the contract may trade, when supplied.
+    pub first_trade_date: Option<CalendarDate>,
     /// Source maturity date, when present.
     pub maturity_date: Option<CalendarDate>,
     /// Source expiration date, when present.
     pub expiration_date: Option<CalendarDate>,
     /// Last date on which the contract may trade, when present.
     pub last_trade_date: Option<CalendarDate>,
+    /// Final settlement date, when separately supplied by the source.
+    pub settlement_date: Option<CalendarDate>,
     /// First notice date, when present.
     pub first_notice_date: Option<CalendarDate>,
     /// Last notice date, when present.
@@ -76,30 +82,76 @@ impl FuturesLifecycleDates {
     /// An empty set is valid and faithfully represents a source record with no lifecycle fields.
     pub fn try_new(fields: FuturesLifecycleDateFields) -> Result<Self, IdentifierError> {
         let FuturesLifecycleDateFields {
+            first_trade_date,
             maturity_date,
             expiration_date,
             last_trade_date,
+            settlement_date,
             first_notice_date,
             last_notice_date,
             first_delivery_date,
             last_delivery_date,
         } = fields;
+        if first_trade_date
+            .zip(last_trade_date)
+            .is_some_and(|(first, last)| first > last)
+        {
+            return Err(IdentifierError::FirstTradeAfterLastTrade);
+        }
+        if first_trade_date
+            .zip(expiration_date)
+            .is_some_and(|(first, expiration)| first > expiration)
+        {
+            return Err(IdentifierError::FirstTradeAfterExpiration);
+        }
+        if first_trade_date
+            .zip(settlement_date)
+            .is_some_and(|(first, settlement)| first > settlement)
+        {
+            return Err(IdentifierError::FirstTradeAfterSettlement);
+        }
         if last_trade_date
             .zip(expiration_date)
             .is_some_and(|(last, expiration)| last > expiration)
-            || first_notice_date
-                .zip(last_notice_date)
-                .is_some_and(|(first, last)| first > last)
-            || first_delivery_date
-                .zip(last_delivery_date)
-                .is_some_and(|(first, last)| first > last)
         {
-            return Err(IdentifierError::InvalidLifecycleOrdering);
+            return Err(IdentifierError::LastTradeAfterExpiration);
+        }
+        if last_trade_date
+            .zip(settlement_date)
+            .is_some_and(|(last, settlement)| last > settlement)
+        {
+            return Err(IdentifierError::LastTradeAfterSettlement);
+        }
+        if expiration_date
+            .zip(settlement_date)
+            .is_some_and(|(expiration, settlement)| expiration > settlement)
+        {
+            return Err(IdentifierError::ExpirationAfterSettlement);
+        }
+        if maturity_date
+            .zip(settlement_date)
+            .is_some_and(|(maturity, settlement)| maturity > settlement)
+        {
+            return Err(IdentifierError::MaturityAfterSettlement);
+        }
+        if first_notice_date
+            .zip(last_notice_date)
+            .is_some_and(|(first, last)| first > last)
+        {
+            return Err(IdentifierError::FirstNoticeAfterLastNotice);
+        }
+        if first_delivery_date
+            .zip(last_delivery_date)
+            .is_some_and(|(first, last)| first > last)
+        {
+            return Err(IdentifierError::FirstDeliveryAfterLastDelivery);
         }
         Ok(Self {
+            first_trade_date,
             maturity_date,
             expiration_date,
             last_trade_date,
+            settlement_date,
             first_notice_date,
             last_notice_date,
             first_delivery_date,
@@ -109,13 +161,20 @@ impl FuturesLifecycleDates {
 
     /// Returns whether the source supplied no lifecycle date fields.
     pub const fn is_empty(&self) -> bool {
-        self.maturity_date.is_none()
+        self.first_trade_date.is_none()
+            && self.maturity_date.is_none()
             && self.expiration_date.is_none()
             && self.last_trade_date.is_none()
+            && self.settlement_date.is_none()
             && self.first_notice_date.is_none()
             && self.last_notice_date.is_none()
             && self.first_delivery_date.is_none()
             && self.last_delivery_date.is_none()
+    }
+
+    /// Returns the source-supplied first trading date.
+    pub const fn first_trade_date(&self) -> Option<CalendarDate> {
+        self.first_trade_date
     }
 
     /// Returns the source maturity date.
@@ -131,6 +190,11 @@ impl FuturesLifecycleDates {
     /// Returns the last trading date.
     pub const fn last_trade_date(&self) -> Option<CalendarDate> {
         self.last_trade_date
+    }
+
+    /// Returns the source-supplied final settlement date.
+    pub const fn settlement_date(&self) -> Option<CalendarDate> {
+        self.settlement_date
     }
 
     /// Returns the first notice date.

@@ -3,17 +3,23 @@ use std::fmt;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{
-    Denomination, InstrumentId, LotSize, PayloadReference, ProviderInstrumentId, SourceId,
-    SourceIdentifier, TickSize, Timestamp, VenueId, VenueSymbol,
+    Denomination, InstrumentId, LotSize, MetadataRevision, ProviderInstrumentId, SourceId,
+    TickSize, Timestamp, VenueId, VenueSymbol,
 };
 
 #[path = "instrument/identifier_records.rs"]
 mod identifier_records;
+#[path = "instrument/provider_identities.rs"]
+mod provider_identities;
 
 pub use identifier_records::{
     AssignmentVerification, ExternalIdentifier, ExternalIdentifierRecord,
     ExternalIdentifierRecordInput, IdentifierEntitlement, IdentifierRightsPolicyReference,
     IdentifierSyntaxVerification,
+};
+pub use provider_identities::{
+    ProviderIdentityConflict, ProviderIdentityConflictReason, ProviderIdentityKey,
+    ProviderIdentityRecord, ProviderIdentityRecordInput, ProviderIdentitySupersession,
 };
 
 /// A broad instrument asset family, separate from Task 4 evidence classifications.
@@ -106,16 +112,41 @@ pub enum InstrumentError {
     },
     /// An instrument definition attached the same typed identifier more than once.
     DuplicateExternalIdentifier,
-    /// An instrument definition attached the exact same provider mapping evidence twice.
-    DuplicateProviderIdentityEvidence,
-    /// One immutable provider metadata revision made conflicting interval claims for one mapping.
-    ConflictingProviderIdentityInterval,
     /// A provider identity referenced a different stable instrument.
     ProviderIdentityInstrumentMismatch {
         /// Stable instrument owned by the definition.
         definition: InstrumentId,
         /// Stable instrument carried by the provider record.
         record: InstrumentId,
+    },
+    /// A non-initial metadata revision omitted its required predecessor edge.
+    MissingProviderIdentitySupersession {
+        /// Revision missing its predecessor edge.
+        revision: MetadataRevision,
+    },
+    /// A predecessor edge referenced a revision absent from the same natural key.
+    MissingProviderIdentityPredecessor {
+        /// Revision carrying the invalid edge.
+        revision: MetadataRevision,
+        /// Referenced predecessor that was not retained.
+        predecessor: MetadataRevision,
+    },
+    /// Provider identity predecessor edges form a cycle.
+    ProviderIdentitySupersessionCycle {
+        /// Revision participating in the detected cycle.
+        revision: MetadataRevision,
+    },
+    /// More than one revision claims to replace the same predecessor.
+    AmbiguousProviderIdentitySuccessor {
+        /// Predecessor with multiple successors.
+        revision: MetadataRevision,
+    },
+    /// A successor overlaps or follows an open-ended predecessor.
+    InvalidProviderIdentityTransition {
+        /// Revision being replaced.
+        predecessor: MetadataRevision,
+        /// Revision claiming to replace it.
+        successor: MetadataRevision,
     },
 }
 
@@ -134,15 +165,42 @@ impl fmt::Display for InstrumentError {
             Self::DuplicateExternalIdentifier => {
                 formatter.write_str("duplicate external identifier attachment")
             }
-            Self::DuplicateProviderIdentityEvidence => {
-                formatter.write_str("duplicate provider identity evidence attachment")
-            }
-            Self::ConflictingProviderIdentityInterval => {
-                formatter.write_str("one provider metadata revision claims conflicting intervals")
-            }
             Self::ProviderIdentityInstrumentMismatch { definition, record } => write!(
                 formatter,
                 "provider identity instrument {record} does not match definition {definition}"
+            ),
+            Self::MissingProviderIdentitySupersession { revision } => write!(
+                formatter,
+                "provider identity revision {} requires explicit supersession evidence",
+                revision.as_source_identifier()
+            ),
+            Self::MissingProviderIdentityPredecessor {
+                revision,
+                predecessor,
+            } => write!(
+                formatter,
+                "provider identity revision {} references missing predecessor {}",
+                revision.as_source_identifier(),
+                predecessor.as_source_identifier()
+            ),
+            Self::ProviderIdentitySupersessionCycle { revision } => write!(
+                formatter,
+                "provider identity supersession cycle includes {}",
+                revision.as_source_identifier()
+            ),
+            Self::AmbiguousProviderIdentitySuccessor { revision } => write!(
+                formatter,
+                "provider identity revision {} has multiple successors",
+                revision.as_source_identifier()
+            ),
+            Self::InvalidProviderIdentityTransition {
+                predecessor,
+                successor,
+            } => write!(
+                formatter,
+                "provider identity transition {} -> {} overlaps or leaves the predecessor current",
+                predecessor.as_source_identifier(),
+                successor.as_source_identifier()
             ),
         }
     }
@@ -184,6 +242,7 @@ impl EffectiveInterval {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct EffectiveIntervalWire {
     starts_at: Timestamp,
     ends_at: Option<Timestamp>,
@@ -201,6 +260,7 @@ impl<'de> Deserialize<'de> for EffectiveInterval {
 
 /// A venue-symbol validity record retaining stable internal identity.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SymbolIdentityRecord {
     instrument_id: InstrumentId,
     venue_id: VenueId,
@@ -251,146 +311,9 @@ impl fmt::Display for SymbolIdentityRecord {
     }
 }
 
-/// A provider-instrument-ID validity record retaining stable internal identity.
-#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
-pub struct ProviderIdentityRecord {
-    instrument_id: InstrumentId,
-    source_id: SourceId,
-    provider_instrument_id: ProviderInstrumentId,
-    source_reference: PayloadReference,
-    source_timestamp: Option<Timestamp>,
-    observed_at: Timestamp,
-    metadata_revision: SourceIdentifier,
-    validity: EffectiveInterval,
-}
-
-/// Complete immutable evidence for one provider-to-internal-instrument mapping observation.
-#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct ProviderIdentityRecordInput {
-    /// Stable internal instrument identity.
-    pub instrument_id: InstrumentId,
-    /// Provider/source namespace in which the ID is meaningful.
-    pub source_id: SourceId,
-    /// Source-native instrument identity.
-    pub provider_instrument_id: ProviderInstrumentId,
-    /// Immutable reference to the exact source object containing the mapping.
-    pub source_reference: PayloadReference,
-    /// Source-authored timestamp when supplied.
-    pub source_timestamp: Option<Timestamp>,
-    /// Local time this exact mapping evidence was observed.
-    pub observed_at: Timestamp,
-    /// Immutable source publication, file version, or mapping revision identifier.
-    pub metadata_revision: SourceIdentifier,
-    /// Half-open interval claimed by this revision.
-    pub validity: EffectiveInterval,
-}
-
-impl ProviderIdentityRecord {
-    /// Constructs an evidence-bearing provider-ID history record.
-    ///
-    /// Equality means exact duplicate evidence, including observation, payload, revision, and
-    /// interval. The same logical mapping may therefore retain repeated observations or a new
-    /// metadata revision without being collapsed.
-    pub fn new(input: ProviderIdentityRecordInput) -> Self {
-        let ProviderIdentityRecordInput {
-            instrument_id,
-            source_id,
-            provider_instrument_id,
-            source_reference,
-            source_timestamp,
-            observed_at,
-            metadata_revision,
-            validity,
-        } = input;
-        Self {
-            instrument_id,
-            source_id,
-            provider_instrument_id,
-            source_reference,
-            source_timestamp,
-            observed_at,
-            metadata_revision,
-            validity,
-        }
-    }
-
-    /// Returns the stable internal instrument identity.
-    pub const fn instrument_id(&self) -> InstrumentId {
-        self.instrument_id
-    }
-
-    /// Returns the provider/source namespace.
-    pub const fn source_id(&self) -> &SourceId {
-        &self.source_id
-    }
-
-    /// Returns the source-native instrument identity.
-    pub const fn provider_instrument_id(&self) -> &ProviderInstrumentId {
-        &self.provider_instrument_id
-    }
-
-    /// Returns the immutable source-object evidence.
-    pub const fn source_reference(&self) -> &PayloadReference {
-        &self.source_reference
-    }
-
-    /// Returns the source-authored timestamp when supplied.
-    pub const fn source_timestamp(&self) -> Option<Timestamp> {
-        self.source_timestamp
-    }
-
-    /// Returns when this exact mapping evidence was observed locally.
-    pub const fn observed_at(&self) -> Timestamp {
-        self.observed_at
-    }
-
-    /// Returns the immutable source metadata revision.
-    pub const fn metadata_revision(&self) -> &SourceIdentifier {
-        &self.metadata_revision
-    }
-
-    /// Returns the half-open effective interval.
-    pub const fn validity(&self) -> EffectiveInterval {
-        self.validity
-    }
-
-    fn is_same_logical_mapping(&self, other: &Self) -> bool {
-        self.instrument_id == other.instrument_id
-            && self.source_id == other.source_id
-            && self.provider_instrument_id == other.provider_instrument_id
-    }
-
-    fn conflicts_with(&self, other: &Self) -> bool {
-        self.is_same_logical_mapping(other)
-            && self.metadata_revision == other.metadata_revision
-            && self.validity != other.validity
-    }
-}
-
-impl<'de> Deserialize<'de> for ProviderIdentityRecord {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let input = ProviderIdentityRecordInput::deserialize(deserializer)?;
-        Ok(Self::new(input))
-    }
-}
-
-impl fmt::Display for ProviderIdentityRecord {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "{}:{}",
-            self.source_id, self.provider_instrument_id
-        )
-    }
-}
-
 /// The identity-level lifecycle transition persisted before canonical Task 4 event payloads exist.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
 pub enum LifecycleTransitionKind {
     /// Instrument merged into a distinct stable internal identity.
     Merger {
@@ -466,6 +389,7 @@ impl fmt::Display for LifecycleTransition {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct LifecycleTransitionWire {
     instrument_id: InstrumentId,
     effective_at: Timestamp,
@@ -542,6 +466,7 @@ impl fmt::Display for ContractRollMapping {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ContractRollMappingWire {
     from_instrument_id: InstrumentId,
     to_instrument_id: InstrumentId,
@@ -573,6 +498,7 @@ pub struct InstrumentDefinition {
     lot_size: LotSize,
     venue_mappings: Vec<VenueMapping>,
     provider_identities: Vec<ProviderIdentityRecord>,
+    provider_identity_conflicts: Vec<ProviderIdentityConflict>,
     identifiers: Vec<ExternalIdentifierRecord>,
     trading_status: TradingStatus,
 }
@@ -630,20 +556,14 @@ impl InstrumentDefinition {
                 });
             }
         }
-        for (index, record) in provider_identities.iter().enumerate() {
+        let (provider_identities, provider_identity_conflicts) =
+            provider_identities::normalize_provider_identities(provider_identities)?;
+        for record in &provider_identities {
             if record.instrument_id() != instrument_id {
                 return Err(InstrumentError::ProviderIdentityInstrumentMismatch {
                     definition: instrument_id,
                     record: record.instrument_id(),
                 });
-            }
-            for candidate in provider_identities.iter().skip(index + 1) {
-                if candidate == record {
-                    return Err(InstrumentError::DuplicateProviderIdentityEvidence);
-                }
-                if record.conflicts_with(candidate) {
-                    return Err(InstrumentError::ConflictingProviderIdentityInterval);
-                }
             }
         }
         for (index, record) in identifiers.iter().enumerate() {
@@ -663,6 +583,7 @@ impl InstrumentDefinition {
             lot_size,
             venue_mappings,
             provider_identities,
+            provider_identity_conflicts,
             identifiers,
             trading_status,
         })
@@ -703,6 +624,30 @@ impl InstrumentDefinition {
         &self.provider_identities
     }
 
+    /// Returns quarantined competing provider assertions in deterministic order.
+    pub fn provider_identity_conflicts(&self) -> &[ProviderIdentityConflict] {
+        &self.provider_identity_conflicts
+    }
+
+    /// Resolves an accepted provider mapping at an effective instant.
+    ///
+    /// Quarantined evidence is never considered. Revision graph validation guarantees this cannot
+    /// return an arbitrary winner from overlapping accepted assertions.
+    pub fn provider_identity_at(
+        &self,
+        source_id: &SourceId,
+        provider_instrument_id: &ProviderInstrumentId,
+        at: Timestamp,
+    ) -> Option<&ProviderIdentityRecord> {
+        provider_identities::provider_identity_at(
+            &self.provider_identities,
+            &self.provider_identity_conflicts,
+            source_id,
+            provider_instrument_id,
+            at,
+        )
+    }
+
     /// Returns syntactically validated external identifiers.
     pub fn identifiers(&self) -> &[ExternalIdentifierRecord] {
         &self.identifiers
@@ -725,6 +670,8 @@ struct InstrumentDefinitionWire {
     venue_mappings: Vec<VenueMapping>,
     #[serde(default)]
     provider_identities: Vec<ProviderIdentityRecord>,
+    #[serde(default)]
+    provider_identity_conflicts: Vec<ProviderIdentityConflict>,
     identifiers: Vec<ExternalIdentifierRecord>,
     trading_status: TradingStatus,
 }
@@ -735,6 +682,10 @@ impl<'de> Deserialize<'de> for InstrumentDefinition {
         D: Deserializer<'de>,
     {
         let wire = InstrumentDefinitionWire::deserialize(deserializer)?;
+        let mut provider_identities = wire.provider_identities;
+        for conflict in wire.provider_identity_conflicts {
+            provider_identities.extend_from_slice(conflict.competing_assertions());
+        }
         Self::try_new(InstrumentDefinitionInput {
             instrument_id: wire.instrument_id,
             asset_class: wire.asset_class,
@@ -742,7 +693,7 @@ impl<'de> Deserialize<'de> for InstrumentDefinition {
             tick_size: wire.tick_size,
             lot_size: wire.lot_size,
             venue_mappings: wire.venue_mappings,
-            provider_identities: wire.provider_identities,
+            provider_identities,
             identifiers: wire.identifiers,
             trading_status: wire.trading_status,
         })

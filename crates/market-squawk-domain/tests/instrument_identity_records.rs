@@ -3,10 +3,10 @@ use market_squawk_domain::{
     EffectiveInterval, ExternalIdentifier, ExternalIdentifierRecord, ExternalIdentifierRecordInput,
     IdentifierEntitlement, IdentifierRightsPolicyReference, IdentifierSyntaxVerification,
     InstrumentDefinition, InstrumentDefinitionInput, InstrumentError, InstrumentId, Isin,
-    LifecycleTransition, LifecycleTransitionKind, LotSize, PayloadHash, PayloadHashAlgorithm,
-    PayloadReference, ProviderIdentityRecord, ProviderIdentityRecordInput, ProviderInstrumentId,
-    SourceId, SourceIdentifier, SymbolIdentityRecord, TickSize, Timestamp, TradingStatus, VenueId,
-    VenueMapping, VenueSymbol,
+    LifecycleTransition, LifecycleTransitionKind, LotSize, MetadataRevision, PayloadHash,
+    PayloadHashAlgorithm, PayloadReference, ProviderIdentityRecord, ProviderIdentityRecordInput,
+    ProviderInstrumentId, SourceId, SourceIdentifier, SymbolIdentityRecord, TickSize, Timestamp,
+    TradingStatus, VenueId, VenueMapping, VenueSymbol,
 };
 use rust_decimal::Decimal;
 use uuid::Uuid;
@@ -58,8 +58,11 @@ fn provider_identity(
         )),
         source_timestamp: Some(Timestamp::from_unix_nanos(90)),
         observed_at: Timestamp::from_unix_nanos(100),
-        metadata_revision: SourceIdentifier::try_from(format!("revision-{evidence_byte}"))?,
+        metadata_revision: MetadataRevision::new(SourceIdentifier::try_from(format!(
+            "revision-{evidence_byte}",
+        ))?),
         validity,
+        supersedes: None,
     }))
 }
 
@@ -281,9 +284,13 @@ fn provider_identity_text_is_qualified_by_source_in_instrument_definition()
     };
     let mut duplicate = definition_input()?;
     duplicate.provider_identities = vec![first.clone(), first];
+    let coalesced = InstrumentDefinition::try_new(duplicate)?;
+    assert_eq!(coalesced.provider_identities().len(), 1);
     assert_eq!(
-        InstrumentDefinition::try_new(duplicate),
-        Err(InstrumentError::DuplicateProviderIdentityEvidence)
+        coalesced.provider_identities()[0]
+            .observation_timestamps()
+            .len(),
+        1
     );
 
     let other_id = instrument("7d9e9f3e-b62d-4fce-a85f-fad3ca549c97")?;

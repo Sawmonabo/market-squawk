@@ -15,7 +15,12 @@ use crate::{
 /// Every variant remains syntax/checksum-only. Assignment, existence, lifecycle, source, and
 /// licensed-data rights are retained by [`ExternalIdentifierRecord`].
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
-#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+#[serde(
+    deny_unknown_fields,
+    tag = "kind",
+    content = "value",
+    rename_all = "snake_case"
+)]
 pub enum ExternalIdentifier {
     /// Ticker alias.
     Ticker(Ticker),
@@ -108,6 +113,7 @@ pub enum IdentifierEntitlement {
 
 /// Typed reference to the policy used for identifier data-rights decisions.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct IdentifierRightsPolicyReference {
     policy_id: SourceIdentifier,
     entitlement: IdentifierEntitlement,

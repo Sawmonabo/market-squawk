@@ -3,15 +3,16 @@ use std::str::FromStr;
 use market_squawk_domain::{
     AssetClass, AssignmentVerification, BasisPoints, CalendarDate, ChainAddress, ChainAddressRole,
     ChainId, ConnectionGeneration, ContractRollMapping, CryptoPair, CryptoProductType, Currency,
-    Cusip, Denomination, EffectiveInterval, ExternalIdentifier, ExternalIdentifierRecord,
-    ExternalIdentifierRecordInput, Figi, FinancialError, FuturesContractIdentity,
-    FuturesContractIdentityInput, FuturesLifecycleDateFields, FuturesLifecycleDates,
-    FuturesSecurityType, IdentifierEntitlement, IdentifierError, IdentifierRightsPolicyReference,
-    IdentityError, InstrumentDefinition, InstrumentDefinitionInput, InstrumentError, InstrumentId,
-    Isin, LifecycleTransition, LifecycleTransitionKind, LotSize, MaturityMonthYear, Money,
+    Cusip, Denomination, EffectiveInterval, EvmChainId, ExternalIdentifier,
+    ExternalIdentifierRecord, ExternalIdentifierRecordInput, Figi, FinancialError,
+    FuturesContractIdentity, FuturesContractIdentityInput, FuturesLifecycleDateFields,
+    FuturesLifecycleDates, FuturesSecurityType, IdentifierEntitlement, IdentifierError,
+    IdentifierRightsPolicyReference, IdentityError, InstrumentDefinition,
+    InstrumentDefinitionInput, InstrumentError, InstrumentId, Isin, LifecycleTransition,
+    LifecycleTransitionKind, LotSize, MaturityMonthYear, MetadataRevision, Money,
     OccOptionIdentity, OptionKind, PayloadReference, PriceError, PriceTicks,
     ProviderIdentityRecord, ProviderIdentityRecordInput, ProviderInstrumentId, QuantityError,
-    QuantityLots, RoundingPolicy, Sedol, SequenceNumber, SourceId, SourceIdentifier,
+    QuantityLots, RoundingPolicy, Sedol, SequenceNumber, SolanaChainId, SourceId, SourceIdentifier,
     SymbolIdentityRecord, TickSize, Ticker, TimeError, Timestamp, TradingStatus, VenueId,
     VenueMapping, VenueSymbol,
 };
@@ -447,13 +448,13 @@ fn chain_addresses_are_chain_qualified_and_protocol_specific()
 -> Result<(), Box<dyn std::error::Error>> {
     // CAIP-2 chain IDs are case-sensitive. EIP-55 defines EVM checksum case; Solana RPC renders
     // 32-byte public keys as case-sensitive base58. Syntax does not establish on-chain existence.
-    let ethereum = ChainId::try_from("eip155:1")?;
+    let ethereum = EvmChainId::try_from("eip155:1")?;
     let evm = ChainAddress::try_evm(
         ethereum.clone(),
         "0X52908400098527886E0F7030069857D2E4169EE7",
         ChainAddressRole::TokenContract,
     )?;
-    assert_eq!(evm.chain_id(), &ethereum);
+    assert_eq!(evm.chain_id(), ethereum.chain_id());
     assert_eq!(
         evm.canonical(),
         "0x52908400098527886e0f7030069857d2e4169ee7"
@@ -473,7 +474,7 @@ fn chain_addresses_are_chain_qualified_and_protocol_specific()
     );
 
     let solana = ChainAddress::try_solana(
-        ChainId::try_from("solana:mainnet")?,
+        SolanaChainId::mainnet(),
         "11111111111111111111111111111111",
         ChainAddressRole::Mint,
     )?;
@@ -530,8 +531,11 @@ fn identity_lifecycle_records_keep_effective_time_and_stable_instrument_ids()
         )?),
         source_timestamp: None,
         observed_at: effective_at,
-        metadata_revision: SourceIdentifier::try_from("nasdaq-reference-revision:1")?,
+        metadata_revision: MetadataRevision::new(SourceIdentifier::try_from(
+            "nasdaq-reference-revision:1",
+        )?),
         validity: interval,
+        supersedes: None,
     });
     assert_eq!(symbol.validity().ends_at(), None);
     assert_eq!(provider.instrument_id(), current);
@@ -576,8 +580,11 @@ fn instrument_definition_owns_precision_mappings_identifiers_and_status()
         )?),
         source_timestamp: None,
         observed_at: Timestamp::from_unix_nanos(1),
-        metadata_revision: SourceIdentifier::try_from("user-reference-revision:1")?,
+        metadata_revision: MetadataRevision::new(SourceIdentifier::try_from(
+            "user-reference-revision:1",
+        )?),
         validity: EffectiveInterval::new(Timestamp::from_unix_nanos(1), None)?,
+        supersedes: None,
     });
     let identifier = ExternalIdentifier::Isin(Isin::try_from("US0378331005")?);
     let identifier_record = ExternalIdentifierRecord::new(ExternalIdentifierRecordInput {
@@ -649,7 +656,7 @@ fn validated_display_and_deserialization_do_not_bypass_invariants()
     assert!(serde_json::from_str::<MaturityMonthYear>(r#"{"year":2026,"month":3}"#).is_err());
 
     let address = ChainAddress::try_solana(
-        ChainId::try_from("solana:mainnet")?,
+        SolanaChainId::mainnet(),
         "11111111111111111111111111111111",
         ChainAddressRole::Account,
     )?;
