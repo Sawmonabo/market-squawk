@@ -1,0 +1,210 @@
+{
+  "sources": [
+    {
+      "id": "papers-001",
+      "category": "papers",
+      "title": "Disruptor: High performance alternative to bounded queues for exchanging data between concurrent threads",
+      "url": "https://lmax-exchange.github.io/disruptor/files/Disruptor-1.0.pdf",
+      "source_type": "recognized_engineering_lab_technical_paper",
+      "credibility_signals": {
+        "provenance": "First-party LMAX exchange-engineering paper",
+        "evidence": "Discloses design, benchmark topologies, JVM, operating systems, processors, message counts, and measurement choices",
+        "review_status": "Industry technical paper; not peer reviewed"
+      },
+      "freshness_signals": {
+        "publication_date": "2011-05",
+        "assessment": "Old benchmark environment; single-writer, preallocation, sequence, and cache-contention mechanics remain relevant"
+      },
+      "selection_rationale": "Directly informs bounded rings, stable single-writer ownership, cache-aware state, sequencing, dependency graphs, and explicit latency benchmarking.",
+      "priority": "high",
+      "status": "selected",
+      "notes": "Authors: Martin Thompson, Dave Farley, Michael Barker, Patricia Gee, Andrew Stewart. Problem: contention and latency in asynchronous pipelines. Method/result: preallocated bounded ring and sequence barriers; authors report higher throughput/lower latency than Java queues. Caveats: vendor-authored, Java-specific, 2011 hardware, best-of-three metrics are not portable Market Squawk evidence. Accessed 2026-07-15."
+    },
+    {
+      "id": "papers-002",
+      "category": "papers",
+      "title": "The Price Impact of Order Book Events",
+      "url": "https://arxiv.org/abs/1011.6402",
+      "source_type": "peer_reviewed_journal_article_open_preprint",
+      "credibility_signals": {
+        "venue": "Journal of Financial Econometrics 12(1), 47-88",
+        "method": "Empirical NYSE TAQ study of 50 randomly selected S&P 500 stocks",
+        "open_version": "Full paper and journal metadata on arXiv"
+      },
+      "freshness_signals": {
+        "publication_date": "2014",
+        "data_period": "April 2010",
+        "assessment": "Foundational online-feature evidence; venue and asset calibration must be refreshed"
+      },
+      "selection_rationale": "Provides a simple incremental order-flow-imbalance feature, empirical depth-conditioned impact result, and explicit limitations useful for online features and slippage controls.",
+      "priority": "high",
+      "status": "selected",
+      "notes": "Authors: Rama Cont, Arseniy Kukanov, Sasha Stoikov. Method: regress short-interval price changes on top-of-book OFI. Result: linear OFI-price relation with impact inversely related to depth. Caveats: one month, 50 U.S. stocks, Level I data, potential explanatory-variable tautology, deeper-book effects omitted. Accessed 2026-07-15."
+    },
+    {
+      "id": "papers-003",
+      "category": "papers",
+      "title": "ABIDES: Towards High-Fidelity Multi-Agent Market Simulation",
+      "url": "https://par.nsf.gov/servlets/purl/10185795",
+      "source_type": "peer_reviewed_conference_paper",
+      "credibility_signals": {
+        "venue": "ACM SIGSIM-PADS 2020",
+        "doi": "10.1145/3384441.3395986",
+        "authors_institutions": "Georgia Tech, University of Georgia, and J.P. Morgan AI Research",
+        "artifact_lineage": "Open-source simulator lineage"
+      },
+      "freshness_signals": {
+        "publication_date": "2020",
+        "assessment": "Mature discrete-event architecture; empirical market fidelity remains illustrative"
+      },
+      "selection_rationale": "Supports deterministic discrete-event order, protocol-shaped messages, configurable network latency, interacting agents, and counterfactual response beyond static replay.",
+      "priority": "high",
+      "status": "selected",
+      "notes": "Authors: David Byrd, Maria Hybinette, Tucker Hybinette Balch. Method: message-driven multi-agent discrete-event simulator modeled on ITCH/OUCH. Result: demonstrates tens of thousands of agents and example market-impact experiments. Caveats: preliminary/illustrative validation, simplified background agents, examples trade one symbol on one exchange. Accessed 2026-07-15."
+    },
+    {
+      "id": "papers-004",
+      "category": "papers",
+      "title": "Bridging the Reality Gap in Limit Order Book Simulation",
+      "url": "https://arxiv.org/abs/2603.24137",
+      "source_type": "arxiv_preprint",
+      "credibility_signals": {
+        "provenance": "Primary arXiv q-fin.TR manuscript",
+        "author_signal": "Includes recognized market-microstructure researcher Mathieu Rosenbaum",
+        "evidence": "Method and multiple stock/strategy case studies exposed"
+      },
+      "freshness_signals": {
+        "submitted": "2026-03-25",
+        "version": "v1",
+        "assessment": "Very current, not peer reviewed at cutoff"
+      },
+      "selection_rationale": "Current practical recipe for calibrated event timing, imbalance state, impact decay, strategy-sensitive execution cost, and P&L simulation.",
+      "priority": "high",
+      "status": "selected",
+      "notes": "Authors: Patrick Noble, Mathieu Rosenbaum, Saad Souilmi. Method: projected spread/volume-imbalance state, calibrated timing, signed-flow power-law feedback. Result: reports realistic concave impact, reversion, and execution-parameter sensitivity. Caveats: v1 preprint, large-tick assets/several stocks, projected state omits full-book detail, cross-asset replication open. Accessed 2026-07-15."
+    },
+    {
+      "id": "papers-005",
+      "category": "papers",
+      "title": "Look-Ahead-Freedom as Temporal Non-Interference: A Verifiable Correctness Property for Backtesting and Agentic Trading Pipelines",
+      "url": "https://arxiv.org/abs/2607.04958",
+      "source_type": "arxiv_preprint_submitted_to_journal",
+      "credibility_signals": {
+        "provenance": "Primary arXiv cs.CR/cs.LO/cs.PL/cs.SE/q-fin.PM manuscript",
+        "method": "Formal calculus, soundness argument, explicit decidability boundary, and artifact claim",
+        "review_status": "Listed as submitted to ACM TOSEM; not peer reviewed at cutoff"
+      },
+      "freshness_signals": {
+        "submitted": "2026-07-06",
+        "version": "v1",
+        "age_at_cutoff_days": 9
+      },
+      "selection_rationale": "Directly formalizes reference-time versus availability-time semantics for windows, resampling, joins, point-in-time reads, and vintage reads.",
+      "priority": "high_provisional",
+      "status": "selected",
+      "notes": "Author: Xavier Fonseca. Result claimed: sound linear-time check over a value-independent fragment; full data-dependent availability case is undecidable. Caveats: single-author nine-day-old v1, no peer review, artifact not independently reproduced, decidable fragment excludes data-dependent availability. Use as provisional test/property inspiration. Accessed 2026-07-15."
+    },
+    {
+      "id": "papers-006",
+      "category": "papers",
+      "title": "Survivorship Bias in Performance Studies",
+      "url": "https://terpconnect.umd.edu/~wermers/ftpsite/FAME/Brown_Goetzmann_Ibbotson_Ross.pdf",
+      "source_type": "peer_reviewed_journal_article_university_copy",
+      "credibility_signals": {
+        "venue": "The Review of Financial Studies 5(4), 553-580",
+        "provenance": "University-hosted full paper",
+        "status": "Foundational finance methodology result"
+      },
+      "freshness_signals": {
+        "publication_date": "1992",
+        "assessment": "Old empirical context; survivor-selection mechanism remains durable"
+      },
+      "selection_rationale": "Supports historical constituents, delisted instruments, membership-as-of data, and explicit universe selection instead of present-day survivor sets.",
+      "priority": "medium",
+      "status": "selected",
+      "notes": "Authors: Stephen J. Brown, William Goetzmann, Roger G. Ibbotson, Stephen A. Ross. Method: analytical/numerical study of samples truncated by survival. Result: truncation can create apparent predictability. Caveat: mutual-fund setting and older period; does not prescribe instrument/corporate-action schemas. Accessed 2026-07-15."
+    },
+    {
+      "id": "papers-007",
+      "category": "papers",
+      "title": "The probability of backtest overfitting",
+      "url": "https://www.risk.net/journal-of-computational-finance/2471206/the-probability-of-backtest-overfitting",
+      "source_type": "peer_reviewed_journal_article",
+      "credibility_signals": {
+        "venue": "Journal of Computational Finance 20(4), 39-69",
+        "doi": "10.21314/JCF.2016.322",
+        "provenance": "Official publisher page with method and result summary"
+      },
+      "freshness_signals": {
+        "first_published": "2016-09-19",
+        "issue_date": "2017-04",
+        "assessment": "Established statistical method"
+      },
+      "selection_rationale": "Adds strategy/model-selection risk controls that point-in-time data, chronological splits, and realistic execution do not solve alone.",
+      "priority": "high",
+      "status": "selected",
+      "notes": "Authors: David H. Bailey, Jonathan M. Borwein, Marcos Lopez de Prado, Qiji Jim Zhu. Method: combinatorially symmetric cross-validation to estimate probability of backtest overfitting. Result: reasonable PBO estimates in examples. Caveats: does not fix leakage, survivors, fill realism, fees, or regime mismatch; trial set must be preserved. Accessed 2026-07-15."
+    },
+    {
+      "id": "papers-008",
+      "category": "papers",
+      "title": "On the coherence of Expected Shortfall",
+      "url": "https://arxiv.org/abs/cond-mat/0104295",
+      "source_type": "peer_reviewed_journal_article_open_preprint",
+      "credibility_signals": {
+        "venue": "Journal of Banking & Finance 26, 1487-1503",
+        "provenance": "Full arXiv manuscript with journal reference",
+        "method": "Formal comparison of risk-measure definitions and coherence"
+      },
+      "freshness_signals": {
+        "last_revision": "2002-05-02",
+        "assessment": "Foundational mathematical result; implementation edge cases remain current"
+      },
+      "selection_rationale": "Defines coherent ES under discontinuous/discrete loss distributions and exposes ambiguity in naive tail-mean implementations.",
+      "priority": "high",
+      "status": "selected",
+      "notes": "Authors: Carlo Acerbi, Dirk Tasche. Result: identifies an ES definition coherent for general distributions and estimable where usual VaR estimators can fail. Caveat: theory does not choose horizon, scenarios, dependence, confidence level, or finite-sample method. Accessed 2026-07-15."
+    },
+    {
+      "id": "papers-009",
+      "category": "papers",
+      "title": "Optimal execution of portfolio transactions",
+      "url": "https://doi.org/10.21314/JOR.2001.041",
+      "source_type": "peer_reviewed_journal_article",
+      "credibility_signals": {
+        "venue": "The Journal of Risk 3(2), 5-39",
+        "doi": "10.21314/JOR.2001.041",
+        "status": "Canonical execution-cost framework"
+      },
+      "freshness_signals": {
+        "publication_date": "2001-01-01",
+        "assessment": "Foundational baseline with simplified price/impact dynamics"
+      },
+      "selection_rationale": "Makes volatility risk, temporary/permanent impact, schedule, implementation cost, and liquidation tradeoffs explicit for a testable paper-execution baseline.",
+      "priority": "high",
+      "status": "selected",
+      "notes": "Authors: Robert Almgren, Neil Chriss. Method/result: mean-variance execution framework and explicit efficient frontier under linear impact. Caveats: no queue priority, venue fragmentation, partial fills, rejects, cancels, fees, latency, or state-dependent liquidity. Baseline only, not a realistic paper broker. Accessed 2026-07-15."
+    },
+    {
+      "id": "papers-010",
+      "category": "papers",
+      "title": "Convergence in Motion: A Review of Fair Value Levels' Relevance",
+      "url": "https://doi.org/10.1080/17449480.2021.1912370",
+      "source_type": "peer_reviewed_meta_analysis_and_interview_study",
+      "credibility_signals": {
+        "venue": "Accounting in Europe 18(3), 275-294",
+        "doi": "10.1080/17449480.2021.1912370",
+        "method": "Meta-analysis plus practitioner interviews",
+        "disclosure": "IASB-linked funding/research context and limitations disclosed"
+      },
+      "freshness_signals": {
+        "published_online": "2021-04-27",
+        "assessment": "Post-IFRS 13 synthesis; not itself a current standards text"
+      },
+      "selection_rationale": "Direct evidence for treating hierarchy level, input observability, model risk, measurement-process complexity, value relevance, and data quality as distinct explained dimensions.",
+      "priority": "high",
+      "status": "selected",
+      "notes": "Authors: Andrei Filip, Ahmad Hammami, Zhongwei Huang, Anne Jeny, Michel Magnan, Rucsandra Moldovan. Result: Level 3 is less value relevant overall than Levels 1/2, with change over time; model/process complexity may contribute. Caveats: value relevance is not classification correctness; small Canadian interview component; IASB funding disclosed; not a rules engine. Accessed 2026-07-15."
+    }
+  ]
+}

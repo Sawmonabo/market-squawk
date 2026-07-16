@@ -1,0 +1,256 @@
+{
+  "sources": [
+    {
+      "id": "github-001",
+      "category": "github",
+      "title": "nautechsystems/nautilus_trader",
+      "url": "https://github.com/nautechsystems/nautilus_trader",
+      "source_type": "repository",
+      "credibility_signals": {
+        "owner": "Nautech Systems",
+        "stars": 24717,
+        "forks": 3170,
+        "license": "LGPL-3.0",
+        "primary_language": "Rust",
+        "maintenance": "Extensive documentation, tests, adapters, benchmarks, fuzzing, Cargo.lock, security policy, supply-chain controls, and nearly 20,000 commits"
+      },
+      "freshness_signals": {
+        "latest_release": "v1.230.0",
+        "latest_release_date": "2026-06-29",
+        "last_push_utc": "2026-07-16T01:35:37Z",
+        "accessed": "2026-07-15"
+      },
+      "selection_rationale": "Strongest broad Rust-native reference for financial domain types, deterministic event processing, modular Coinbase/Kraken and multi-venue adapters, order management, risk, simulation, live execution, performance work, and release hardening.",
+      "priority": "P0",
+      "status": "selected",
+      "notes": "Architecture/reference candidate, not a wholesale platform dependency. Its shared research/live semantics differ from Market Squawk's independent planes. Python participates in its control plane, its v2 API is still stabilizing, and LGPL-3.0 Rust reuse/linking needs legal review before any code is incorporated into an Apache-2.0 OR MIT workspace. Upstream data normalization must not be equated with Market Squawk DirectVerified qualification."
+    },
+    {
+      "id": "github-002",
+      "category": "github",
+      "title": "barter-rs/barter-rs",
+      "url": "https://github.com/barter-rs/barter-rs",
+      "source_type": "repository",
+      "credibility_signals": {
+        "owner": "barter-rs",
+        "stars": 2202,
+        "forks": 355,
+        "license": "MIT",
+        "primary_language": "Rust",
+        "maintenance": "Cohesive modular crates, documentation, examples, tests, Tokio integration, OMS, strategy, risk, live, paper, and backtest components"
+      },
+      "freshness_signals": {
+        "latest_release": "barter-v0.12.5",
+        "latest_release_date": "2026-05-09",
+        "last_push_utc": "2026-06-06T10:36:50Z",
+        "accessed": "2026-07-15"
+      },
+      "selection_rationale": "Close Rust reference for Market Squawk's proposed instruments/data/integration/execution crate boundaries and trait-driven REST, WebSocket, strategy, risk, OMS, paper, and backtest contracts.",
+      "priority": "P0",
+      "status": "selected",
+      "notes": "MIT makes isolated reuse plausible after normal dependency review, but the repository expressly disclaims production/live-trading fitness. Treat its contracts and tests as inputs, not production assurance. Market Squawk must add venue-specific sequence/checksum/freshness/precision/coverage validation, bounded-overflow quarantine, source health, and non-bypassable risk semantics."
+    },
+    {
+      "id": "github-003",
+      "category": "github",
+      "title": "apache/arrow-rs",
+      "url": "https://github.com/apache/arrow-rs",
+      "source_type": "official-ecosystem-repository",
+      "credibility_signals": {
+        "owner": "Apache Software Foundation",
+        "stars": 3527,
+        "forks": 1213,
+        "license": "Apache-2.0",
+        "primary_language": "Rust",
+        "maintenance": "Official Rust implementation of Apache Arrow and Apache Parquet with tests, benchmarks, examples, and regular releases"
+      },
+      "freshness_signals": {
+        "latest_release": "59.1.0",
+        "latest_release_date": "2026-07-07",
+        "last_push_utc": "2026-07-15T23:51:15Z",
+        "accessed": "2026-07-15"
+      },
+      "selection_rationale": "Mandated production dependency family for Arrow record batches, Decimal128 analytical values, Parquet read/write, IPC, schemas, and columnar research-plane interchange.",
+      "priority": "P0",
+      "status": "selected",
+      "notes": "Use as a pinned direct dependency rather than copying code. Align its version with DataFusion, commit Cargo.lock, test decimal/timestamp/schema evolution semantics, and keep all Arrow/Parquet allocation and I/O outside the event-to-action hot path."
+    },
+    {
+      "id": "github-004",
+      "category": "github",
+      "title": "apache/datafusion",
+      "url": "https://github.com/apache/datafusion",
+      "source_type": "official-ecosystem-repository",
+      "credibility_signals": {
+        "owner": "Apache Software Foundation",
+        "stars": 8982,
+        "forks": 2229,
+        "license": "Apache-2.0",
+        "primary_language": "Rust",
+        "maintenance": "More than 14,000 commits, active roadmap, large contributor/PR activity, examples, benchmarks, API docs, and committed Cargo.lock"
+      },
+      "freshness_signals": {
+        "latest_github_release": null,
+        "last_push_utc": "2026-07-16T01:47:04Z",
+        "roadmap": "Active 2026 Q3-Q4 roadmap discussion",
+        "accessed": "2026-07-15"
+      },
+      "selection_rationale": "Mandated embedded analytical SQL and DataFrame engine for local Arrow, Parquet, CSV, and JSON research datasets, with extension points for Market Squawk tables, functions, and catalog adapters.",
+      "priority": "P0",
+      "status": "selected",
+      "notes": "Pin a crates.io version compatible with arrow-rs rather than the moving default branch. Budget compile/feature footprint and test query cancellation, memory limits, partition pruning, point-in-time predicates, and Decimal128 behavior. DataFusion must never run per live event or inside strategy/risk/execution hot paths."
+    },
+    {
+      "id": "github-005",
+      "category": "github",
+      "title": "microsoft/qlib",
+      "url": "https://github.com/microsoft/qlib",
+      "source_type": "repository",
+      "credibility_signals": {
+        "owner": "Microsoft",
+        "stars": 46268,
+        "forks": 7372,
+        "license": "MIT",
+        "primary_language": "Python",
+        "maintenance": "Tests, documentation, research papers, point-in-time database, ML pipeline, portfolio optimization, execution simulation, and broad community adoption"
+      },
+      "freshness_signals": {
+        "latest_release": "v0.9.7",
+        "latest_release_date": "2025-08-15",
+        "last_push_utc": "2026-04-22T07:08:01Z",
+        "accessed": "2026-07-15"
+      },
+      "selection_rationale": "Focused reference for point-in-time datasets, factor and feature research, model training/evaluation, portfolio construction, execution simulation, and leakage-aware backtesting workflows.",
+      "priority": "P1",
+      "status": "selected",
+      "notes": "Research/reference only; Python cannot enter the live hot path. The project says its official dataset is temporarily disabled and warns that Yahoo-derived public sample data may be imperfect. Market Squawk must own persisted provenance, availability timestamps, revisions, delistings, historical constituents, corporate-action rules, reproducibility, and data-quality classification."
+    },
+    {
+      "id": "github-006",
+      "category": "github",
+      "title": "OpenBB-finance/OpenBB",
+      "url": "https://github.com/OpenBB-finance/OpenBB",
+      "source_type": "repository",
+      "credibility_signals": {
+        "owner": "OpenBB",
+        "stars": 70630,
+        "forks": 7175,
+        "license": "AGPL-3.0",
+        "primary_language": "Python",
+        "maintenance": "Large actively maintained provider ecosystem with SEC, FRED, BLS, and US government packages, typed models, schemas, unit tests, and recorded HTTP fixtures"
+      },
+      "freshness_signals": {
+        "latest_release": "Open-Data-Platform-v1.0.2",
+        "latest_release_date": "2026-04-25",
+        "last_push_utc": "2026-07-16T00:13:14Z",
+        "accessed": "2026-07-15"
+      },
+      "selection_rationale": "Concentrated reference for four required research adapters: SEC filings/company facts/XBRL, FRED, BLS, and US Treasury, including source-specific normalization, provider registration, assets, and deterministic HTTP-fixture tests.",
+      "priority": "P1",
+      "status": "selected",
+      "notes": "Reference behavior and architecture only unless Market Squawk intentionally accepts AGPL-3.0 obligations; do not copy code into the planned dual-licensed workspace by default. Its providers mix public, key-required, and commercial sources. Independently verify official API terms, zero-cost availability, rate limits, vintages, coverage, provenance, and point-in-time semantics."
+    },
+    {
+      "id": "github-007",
+      "category": "github",
+      "title": "modelcontextprotocol/rust-sdk",
+      "url": "https://github.com/modelcontextprotocol/rust-sdk",
+      "source_type": "official-ecosystem-repository",
+      "credibility_signals": {
+        "owner": "Model Context Protocol",
+        "stars": 3636,
+        "forks": 562,
+        "license": "Apache-2.0/MIT transition",
+        "primary_language": "Rust",
+        "maintenance": "Official SDK with typed client/server APIs, macros, schema integration, transports, examples, tests, and current releases"
+      },
+      "freshness_signals": {
+        "latest_release": "rmcp-v2.2.0",
+        "latest_release_date": "2026-07-08",
+        "last_push_utc": "2026-07-15T22:26:29Z",
+        "accessed": "2026-07-15"
+      },
+      "selection_rationale": "Official implementation base for Market Squawk's typed local stdio MCP server and protocol transport, serialization, request dispatch, and schema plumbing.",
+      "priority": "P0",
+      "status": "selected",
+      "notes": "The repository is young and the license file records a transition from MIT to Apache-2.0. Pin and audit a specific release. The SDK is transport/protocol infrastructure, not Market Squawk's security boundary: implement explicit domain authorization, typed bounded results, cancellation, audit, controlled artifacts, credential isolation, and risk-gated bot/execution commands above it. Never invoke MCP in the live path."
+    },
+    {
+      "id": "github-008",
+      "category": "github",
+      "title": "pykeio/ort",
+      "url": "https://github.com/pykeio/ort",
+      "source_type": "repository",
+      "credibility_signals": {
+        "owner": "pykeio",
+        "stars": 2400,
+        "forks": 255,
+        "license": "Apache-2.0 OR MIT",
+        "primary_language": "Rust",
+        "maintenance": "Nearly 1,000 commits, examples, tests, security policy, documentation, active issues and releases"
+      },
+      "freshness_signals": {
+        "latest_release": "v2.0.0-rc.12",
+        "latest_release_date": "2026-03-05",
+        "last_push_utc": "2026-07-13T16:44:01Z",
+        "accessed": "2026-07-15"
+      },
+      "selection_rationale": "Practical Rust ONNX-compatible inference layer that supports local model bundles trained in Python without Python calls in the default live runtime.",
+      "priority": "P1",
+      "status": "selected",
+      "notes": "Current 2.0 is a release candidate. Pin both wrapper and native runtime, document offline/reproducible runtime provisioning, audit native-binary supply chain, validate opset/tensor/feature schemas and hashes before activation, warm and benchmark on target hardware, and guarantee that load/inference failures emit no order intent."
+    },
+    {
+      "id": "github-009",
+      "category": "github",
+      "title": "OpenGamma/Strata",
+      "url": "https://github.com/OpenGamma/Strata",
+      "source_type": "repository",
+      "credibility_signals": {
+        "owner": "OpenGamma",
+        "stars": 950,
+        "forks": 313,
+        "license": "Apache-2.0",
+        "primary_language": "Java",
+        "maintenance": "Long-lived production-used analytics library with product, market-data, pricer, scenario, calculation, measure, loader, report, tests, documentation, and frequent maintenance releases"
+      },
+      "freshness_signals": {
+        "latest_release": "v2.12.73",
+        "latest_release_date": "2026-07-02",
+        "last_push_utc": "2026-07-02T13:54:53Z",
+        "accessed": "2026-07-15"
+      },
+      "selection_rationale": "Mature design reference for valuation product models, market inputs, pricers, scenario calculations, measures, curve/rate analytics, market risk, loading, and reports.",
+      "priority": "P2",
+      "status": "selected",
+      "notes": "Java reference, not a Rust dependency and not an ASC 820/IFRS 13 classification engine. Reuse concepts and verify any ported pure math independently. Market Squawk must separately capture hierarchy evidence, market activity/accessibility, source/venue validity, measurement-date relevance, ruleset version, override, and approval. Modeled values never become DirectVerified or Level 1 evidence by implication."
+    },
+    {
+      "id": "github-010",
+      "category": "github",
+      "title": "krakenfx/kraken-cli",
+      "url": "https://github.com/krakenfx/kraken-cli",
+      "source_type": "official-provider-repository",
+      "credibility_signals": {
+        "owner": "Kraken",
+        "stars": 669,
+        "forks": 89,
+        "license": "MIT",
+        "primary_language": "Rust",
+        "maintenance": "Official repository with tests, signed-release guidance, REST/WebSocket commands, typed JSON/NDJSON, categorized errors, paper engines, credential controls, and local MCP"
+      },
+      "freshness_signals": {
+        "created": "2026-03-06",
+        "latest_release": "v0.3.2",
+        "latest_release_date": "2026-04-20",
+        "last_push_utc": "2026-04-20T08:19:01Z",
+        "repository_updated_utc": "2026-07-14T20:20:38Z",
+        "accessed": "2026-07-15"
+      },
+      "selection_rationale": "Current official Rust reference for Kraken Spot/Futures REST and WebSocket books/trades/account/order streams, paper execution, endpoint and credential controls, machine-readable errors/output, and stdio MCP.",
+      "priority": "P1",
+      "status": "selected",
+      "notes": "Very young CLI application, not an established embeddable production library. Code search found checksum fields in WebSocket examples but did not establish full venue checksum reconstruction and validation. Build Market Squawk's adapter from official protocol rules and independently implement sequence/snapshot/checksum/generation/freshness/precision/resync/quarantine tests. Validate its paper-fill assumptions before using any behavior as a contract."
+    }
+  ]
+}

@@ -1,0 +1,955 @@
+{
+  "as_of": "2026-07-15",
+  "batches": [
+    {
+      "category": "docs",
+      "id": "docs-batch-001",
+      "prompt_path": "docs/research/2026-07-15-market-squawk/prompts/batches/docs/batch-001.md",
+      "report_path": "docs/research/2026-07-15-market-squawk/reports/docs/batch-001.md",
+      "source_ids": [
+        "docs-036",
+        "docs-037",
+        "docs-038"
+      ]
+    },
+    {
+      "category": "docs",
+      "id": "docs-batch-002",
+      "prompt_path": "docs/research/2026-07-15-market-squawk/prompts/batches/docs/batch-002.md",
+      "report_path": "docs/research/2026-07-15-market-squawk/reports/docs/batch-002.md",
+      "source_ids": [
+        "docs-039",
+        "docs-040",
+        "docs-041"
+      ]
+    },
+    {
+      "category": "docs",
+      "id": "docs-batch-003",
+      "prompt_path": "docs/research/2026-07-15-market-squawk/prompts/batches/docs/batch-003.md",
+      "report_path": "docs/research/2026-07-15-market-squawk/reports/docs/batch-003.md",
+      "source_ids": [
+        "docs-042",
+        "docs-043",
+        "docs-044"
+      ]
+    },
+    {
+      "category": "docs",
+      "id": "docs-batch-004",
+      "prompt_path": "docs/research/2026-07-15-market-squawk/prompts/batches/docs/batch-004.md",
+      "report_path": "docs/research/2026-07-15-market-squawk/reports/docs/batch-004.md",
+      "source_ids": [
+        "docs-045",
+        "docs-046",
+        "docs-047"
+      ]
+    },
+    {
+      "category": "docs",
+      "id": "docs-batch-005",
+      "prompt_path": "docs/research/2026-07-15-market-squawk/prompts/batches/docs/batch-005.md",
+      "report_path": "docs/research/2026-07-15-market-squawk/reports/docs/batch-005.md",
+      "source_ids": [
+        "docs-048",
+        "docs-049"
+      ]
+    },
+    {
+      "category": "github",
+      "id": "github-batch-001",
+      "prompt_path": "docs/research/2026-07-15-market-squawk/prompts/batches/github/batch-001.md",
+      "report_path": "docs/research/2026-07-15-market-squawk/reports/github/batch-001.md",
+      "source_ids": [
+        "github-001",
+        "github-002",
+        "github-003",
+        "github-004"
+      ]
+    },
+    {
+      "category": "github",
+      "id": "github-batch-002",
+      "prompt_path": "docs/research/2026-07-15-market-squawk/prompts/batches/github/batch-002.md",
+      "report_path": "docs/research/2026-07-15-market-squawk/reports/github/batch-002.md",
+      "source_ids": [
+        "github-005",
+        "github-006",
+        "github-007",
+        "github-008"
+      ]
+    },
+    {
+      "category": "github",
+      "id": "github-batch-003",
+      "prompt_path": "docs/research/2026-07-15-market-squawk/prompts/batches/github/batch-003.md",
+      "report_path": "docs/research/2026-07-15-market-squawk/reports/github/batch-003.md",
+      "source_ids": [
+        "github-009",
+        "github-010"
+      ]
+    },
+    {
+      "category": "papers",
+      "id": "papers-batch-001",
+      "prompt_path": "docs/research/2026-07-15-market-squawk/prompts/batches/papers/batch-001.md",
+      "report_path": "docs/research/2026-07-15-market-squawk/reports/papers/batch-001.md",
+      "source_ids": [
+        "papers-001",
+        "papers-002",
+        "papers-003"
+      ]
+    },
+    {
+      "category": "papers",
+      "id": "papers-batch-002",
+      "prompt_path": "docs/research/2026-07-15-market-squawk/prompts/batches/papers/batch-002.md",
+      "report_path": "docs/research/2026-07-15-market-squawk/reports/papers/batch-002.md",
+      "source_ids": [
+        "papers-004",
+        "papers-005",
+        "papers-006"
+      ]
+    },
+    {
+      "category": "papers",
+      "id": "papers-batch-003",
+      "prompt_path": "docs/research/2026-07-15-market-squawk/prompts/batches/papers/batch-003.md",
+      "report_path": "docs/research/2026-07-15-market-squawk/reports/papers/batch-003.md",
+      "source_ids": [
+        "papers-007",
+        "papers-008",
+        "papers-009"
+      ]
+    },
+    {
+      "category": "papers",
+      "id": "papers-batch-004",
+      "prompt_path": "docs/research/2026-07-15-market-squawk/prompts/batches/papers/batch-004.md",
+      "report_path": "docs/research/2026-07-15-market-squawk/reports/papers/batch-004.md",
+      "source_ids": [
+        "papers-010"
+      ]
+    },
+    {
+      "category": "reputable-sources",
+      "id": "reputable-sources-batch-001",
+      "prompt_path": "docs/research/2026-07-15-market-squawk/prompts/batches/reputable-sources/batch-001.md",
+      "report_path": "docs/research/2026-07-15-market-squawk/reports/reputable-sources/batch-001.md",
+      "source_ids": [
+        "reputable-sources-076",
+        "reputable-sources-071",
+        "reputable-sources-072",
+        "reputable-sources-073",
+        "reputable-sources-074",
+        "reputable-sources-075"
+      ]
+    },
+    {
+      "category": "reputable-sources",
+      "id": "reputable-sources-batch-002",
+      "prompt_path": "docs/research/2026-07-15-market-squawk/prompts/batches/reputable-sources/batch-002.md",
+      "report_path": "docs/research/2026-07-15-market-squawk/reports/reputable-sources/batch-002.md",
+      "source_ids": [
+        "reputable-sources-077",
+        "reputable-sources-078"
+      ]
+    }
+  ],
+  "categories": [
+    "github",
+    "papers",
+    "docs",
+    "reputable-sources"
+  ],
+  "decision_context": "Validate the architecture and staged migration from the existing single-crate v0.1 to the specified complete local release, including current upstream compatibility, source obligations, temporal-data correctness, live-path integrity, risk, valuation, and bounded local MCP exposure.",
+  "sources": [
+    {
+      "assigned_batch": "docs-batch-001",
+      "category": "docs",
+      "credibility_signals": "Published by the Rust Project on doc.rust-lang.org; release notes and Edition Guide are primary toolchain sources.",
+      "freshness_signals": "Rust 1.97.0 is dated 2026-07-09; stable documentation accessed 2026-07-15.",
+      "id": "docs-036",
+      "notes": "Related official page: https://doc.rust-lang.org/stable/edition-guide/rust-2024/cargo-resolver.html . Resolver 3's Rust-version fallback is not a substitute for a locked all-feature build on Rust 1.97; preserve Cargo.lock and verify every package MSRV. Accessed 2026-07-15.",
+      "priority": "P0",
+      "selection_rationale": "Confirms the exact compiler baseline, Edition 2024 stabilization, resolver 3 behavior, and the requirement to set resolver=3 explicitly in a virtual workspace.",
+      "source_type": "official language and toolchain documentation",
+      "status": "assigned",
+      "title": "Rust 1.97.0 release notes and Edition 2024/Cargo resolver 3 documentation family",
+      "url": "https://doc.rust-lang.org/stable/releases.html"
+    },
+    {
+      "assigned_batch": "docs-batch-001",
+      "category": "docs",
+      "credibility_signals": "Tokio project-owned tutorial and generated API documentation linked to maintained source.",
+      "freshness_signals": "Current Rustdoc showed Tokio 1.52.3; pages accessed 2026-07-15.",
+      "id": "docs-037",
+      "notes": "Related API page: https://docs.rs/tokio/latest/tokio/sync/mpsc/ . The docs distinguish bounded channels from infinite-capacity unbounded channels. Overflow quarantine/resynchronization is an application policy, and unbounded queues must not carry execution-critical events. Accessed 2026-07-15.",
+      "priority": "P0",
+      "selection_rationale": "Defines supervision, CancellationToken, TaskTracker, bounded queue backpressure, clean shutdown, and the failure boundaries needed for bounded local services.",
+      "source_type": "official project documentation and Rustdoc",
+      "status": "assigned",
+      "title": "Tokio runtime, bounded mpsc, cancellation, and graceful-shutdown documentation family",
+      "url": "https://tokio.rs/tokio/topics/shutdown"
+    },
+    {
+      "assigned_batch": "docs-batch-001",
+      "category": "docs",
+      "credibility_signals": "Crate Rustdoc links to the canonical source repositories; Serde also has a project-owned documentation site.",
+      "freshness_signals": "Reqwest 0.13.4 and Tokio-Tungstenite 0.30.0 were current; the latter is dated 2026-07-11.",
+      "id": "docs-038",
+      "notes": "Related pages: https://serde.rs/ and https://docs.rs/tokio-tungstenite/latest/tokio_tungstenite/ . Reqwest documents system proxies enabled by default, so production configuration must explicitly decide proxy behavior, endpoint allowlists, TLS backend, redirects, and timeouts. These libraries do not provide venue sequence/checksum validation. Accessed 2026-07-15.",
+      "priority": "P0",
+      "selection_rationale": "Covers typed serialization, reusable asynchronous HTTP, TLS and redirect policy, streamed bodies, and Tokio-integrated WebSocket Stream/Sink APIs.",
+      "source_type": "maintainer-published project Rustdoc family",
+      "status": "assigned",
+      "title": "Serde, Reqwest, and Tokio-Tungstenite transport boundary documentation family",
+      "url": "https://docs.rs/reqwest/latest/reqwest/"
+    },
+    {
+      "assigned_batch": "docs-batch-002",
+      "category": "docs",
+      "credibility_signals": "Apache Arrow-owned API documentation; Parquet page identifies itself as the official native Rust implementation.",
+      "freshness_signals": "Current Arrow family documentation and Parquet 59.1.0 accessed 2026-07-15.",
+      "id": "docs-039",
+      "notes": "Related official page: https://arrow.apache.org/rust/parquet/index.html . Parquet partitioning, compaction, manifests, deduplication, and point-in-time semantics are application responsibilities. Bound schema inference and treat experimental content-defined chunking as non-baseline. Accessed 2026-07-15.",
+      "priority": "P0",
+      "selection_rationale": "Directly documents RecordBatch, explicit schemas, CSV/JSON/IPC readers and writers, Serde conversion, and Arrow-to-Parquet persistence APIs.",
+      "source_type": "official Apache Software Foundation project documentation",
+      "status": "assigned",
+      "title": "Apache Arrow Rust, native Parquet, CSV, and JSON ingestion documentation family",
+      "url": "https://arrow.apache.org/rust/arrow/index.html"
+    },
+    {
+      "assigned_batch": "docs-batch-002",
+      "category": "docs",
+      "credibility_signals": "Apache DataFusion primary documentation under ASF governance, with API docs, architecture, configuration, and examples.",
+      "freshness_signals": "Current documentation site accessed 2026-07-15.",
+      "id": "docs-040",
+      "notes": "Production integration must configure memory/runtime limits, cancellation, and controlled local table providers; unrestricted SQL, arbitrary URLs, and broad extension loading must not be exposed via MCP. DataFusion remains outside the live path and its fast release cadence requires a locked tested version. Accessed 2026-07-15.",
+      "priority": "P0",
+      "selection_rationale": "Establishes the embeddable Rust SQL/DataFrame engine over Arrow with native CSV, JSON, and Parquet sources.",
+      "source_type": "official Apache Software Foundation project documentation",
+      "status": "assigned",
+      "title": "Apache DataFusion embedded analytical query engine documentation",
+      "url": "https://datafusion.apache.org/"
+    },
+    {
+      "assigned_batch": "docs-batch-002",
+      "category": "docs",
+      "credibility_signals": "Primary SQLite project documentation for SQL, C API, WAL, isolation, threading, integrity, and file format.",
+      "freshness_signals": "Current pages include 2025-2026 updates and were accessed 2026-07-15.",
+      "id": "docs-041",
+      "notes": "Related pages: https://www.sqlite.org/foreignkeys.html and https://www.sqlite.org/stricttables.html . Foreign-key enforcement is off by default per connection; STRICT needs SQLite 3.37+. WAL improves concurrency but SQLite still has a single-writer model and must not be queried per live event. Configure busy handling, migrations, backups, and integrity checks explicitly. Accessed 2026-07-15.",
+      "priority": "P0",
+      "selection_rationale": "Supports local transactional configuration, cursors, manifests, registries, and run state while documenting concurrency and integrity constraints.",
+      "source_type": "official database documentation",
+      "status": "assigned",
+      "title": "SQLite control-plane database documentation family",
+      "url": "https://www.sqlite.org/docs.html"
+    },
+    {
+      "assigned_batch": "docs-batch-003",
+      "category": "docs",
+      "credibility_signals": "Authoritative Model Context Protocol specification on the protocol's official domain.",
+      "freshness_signals": "The site marked protocol version 2025-11-25 as latest on 2026-07-15.",
+      "id": "docs-042",
+      "notes": "Related pages: https://modelcontextprotocol.io/specification/2025-11-25/server/tools and https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/cancellation . Ordinary cancellation is advisory and race-prone; task-augmented requests use tasks/cancel. Schemas do not replace authorization, bounded results, audit, or risk enforcement. Accessed 2026-07-15.",
+      "priority": "P0",
+      "selection_rationale": "Defines local subprocess stdio framing, protocol-clean stdout, JSON-RPC lifecycle/version negotiation, typed tool schemas and structured results, progress, and cancellation.",
+      "source_type": "versioned protocol specification",
+      "status": "assigned",
+      "title": "Model Context Protocol 2025-11-25 stdio, tools, schema, progress, and cancellation specification family",
+      "url": "https://modelcontextprotocol.io/specification/2025-11-25/basic/transports"
+    },
+    {
+      "assigned_batch": "docs-batch-003",
+      "category": "docs",
+      "credibility_signals": "Coinbase Developer Platform documentation for the Exchange API and live channel schemas.",
+      "freshness_signals": "Active Exchange changelog and current docs accessed 2026-07-15.",
+      "id": "docs-043",
+      "notes": "Related best-practices page: https://docs.cdp.coinbase.com/exchange/websocket-feed/best-practices . Matches-only messages can be dropped and recovered via heartbeat/trade IDs; zero level2 size deletes a level. Channel authentication and integrity fields vary, and no level2 checksum is documented. Keep Coinbase DirectUnverified until the exact selected channel proves sequence, freshness, status, precision, and resync requirements end to end. Accessed 2026-07-15.",
+      "priority": "P0",
+      "selection_rationale": "Documents heartbeats and sequence/trade identifiers, status and precision, full order events, REST snapshot plus queued update replay, level2 snapshots and absolute-size updates, and trades.",
+      "source_type": "official exchange API documentation",
+      "status": "assigned",
+      "title": "Coinbase Exchange WebSocket channels and book/trade integrity documentation",
+      "url": "https://docs.cdp.coinbase.com/exchange/websocket-feed/channels"
+    },
+    {
+      "assigned_batch": "docs-batch-003",
+      "category": "docs",
+      "credibility_signals": "Canonical Kraken Developers guide with an exact algorithm and deterministic fixture.",
+      "freshness_signals": "Current canonical v2 URL reached from Kraken's redirect and accessed 2026-07-15.",
+      "id": "docs-044",
+      "notes": "Checksum verification is optional upstream but should be mandatory for executable qualification. It covers only the top ten levels; deeper-book correctness and reconnect/status/timestamp semantics need companion reference review and tests. Quarantine and resubscribe on any mismatch. Accessed 2026-07-15.",
+      "priority": "P0",
+      "selection_rationale": "Specifies CRC32 over the top ten levels, decimal-preserving parsing, update ordering, delete-on-zero, depth truncation, normalization, and an expected checksum fixture.",
+      "source_type": "official exchange API guide",
+      "status": "assigned",
+      "title": "Kraken WebSocket v2 order-book checksum and maintenance guide",
+      "url": "https://docs.kraken.com/exchange/guides/websockets/book-checksum-v2"
+    },
+    {
+      "assigned_batch": "docs-batch-004",
+      "category": "docs",
+      "credibility_signals": "SEC .gov primary documentation for data.sec.gov and EDGAR public data.",
+      "freshness_signals": "Last reviewed 2025-04-08; current update schedules and endpoints accessed 2026-07-15.",
+      "id": "docs-045",
+      "notes": "Related policy page: https://www.sec.gov/about/webmaster-frequently-asked-questions . SEC requires a declared User-Agent and documents a 10 requests/second maximum for equitable access. Prefer nightly bulk ZIPs for large backfills, cache locally, preserve filing/accession evidence, and do not treat frames' calendar alignment as issuer fiscal-period truth. Accessed 2026-07-15.",
+      "priority": "P0",
+      "selection_rationale": "Covers unauthenticated submissions and XBRL JSON APIs, freshness, nightly bulk files, CORS limitations, and the scope limitations of standardized company facts.",
+      "source_type": "official U.S. government API documentation",
+      "status": "assigned",
+      "title": "SEC EDGAR submissions, company facts, XBRL frames, and bulk archives documentation family",
+      "url": "https://www.sec.gov/search-filings/edgar-application-programming-interfaces"
+    },
+    {
+      "assigned_batch": "docs-batch-004",
+      "category": "docs",
+      "credibility_signals": "Federal Reserve Bank of St. Louis primary API documentation for FRED and ALFRED.",
+      "freshness_signals": "Current endpoint and real-time-period pages accessed 2026-07-15.",
+      "id": "docs-046",
+      "notes": "Related pages: https://fred.stlouisfed.org/docs/api/fred/realtime_period.html and https://fred.stlouisfed.org/docs/api/fred/series_vintagedates.html . A free registered API key is required. HTTP 429 is documented, but a stable numeric quota was not found; use explicit vintages, conservative backoff, caching, and no identity rotation. Accessed 2026-07-15.",
+      "priority": "P0",
+      "selection_rationale": "Documents JSON/XML macro-series retrieval and the real-time/vintage semantics required for point-in-time datasets and revision preservation.",
+      "source_type": "official Federal Reserve Bank API documentation",
+      "status": "assigned",
+      "title": "FRED and ALFRED REST API, real-time periods, and vintage dates documentation family",
+      "url": "https://fred.stlouisfed.org/docs/api/fred/overview.html"
+    },
+    {
+      "assigned_batch": "docs-batch-004",
+      "category": "docs",
+      "credibility_signals": "BLS .gov primary developer documentation and service FAQ.",
+      "freshness_signals": "FAQ last modified 2023-08-30; service documentation accessed 2026-07-15.",
+      "id": "docs-047",
+      "notes": "Related limits page: https://www.bls.gov/developers/api_faqs.htm . v1/v2 daily limits are 25/500; series limits 25/50; year limits 10/20; both allow 50 requests per 10 seconds. v2 registration includes a CAPTCHA and annual renewal, which must remain manual user steps. Batch and cache within limits; never bypass registration or rotate accounts. Accessed 2026-07-15.",
+      "priority": "P0",
+      "selection_rationale": "Proves a free unregistered v1 baseline and documents optional registered v2 capabilities, request shapes, metadata differences, and exact quotas.",
+      "source_type": "official U.S. government API documentation",
+      "status": "assigned",
+      "title": "BLS Public Data API versions, signatures, and usage-limit documentation family",
+      "url": "https://www.bls.gov/developers/home.htm"
+    },
+    {
+      "assigned_batch": "docs-batch-005",
+      "category": "docs",
+      "credibility_signals": "Treasury .gov primary API registry, dataset documentation, feed guide, and developer change notice.",
+      "freshness_signals": "Current API registry and 2026 daily-rate pages accessed 2026-07-15.",
+      "id": "docs-048",
+      "notes": "Related pages: https://home.treasury.gov/treasury-daily-interest-rate-xml-feed and https://home.treasury.gov/developer-notice-xml-changes . The all-period XML feed uses zero-based pagination and a 300-row default. Fiscal Data values and null representations require explicit schema-driven parsing; HTTP 429 and historical URL/field changes require backoff, source health, and schema-change tests. Accessed 2026-07-15.",
+      "priority": "P0",
+      "selection_rationale": "Covers GET-only JSON datasets with field/filter/sort/pagination metadata and official XML/CSV yield, bill, long-term, and real-rate files.",
+      "source_type": "official U.S. Treasury API and file documentation",
+      "status": "assigned",
+      "title": "U.S. Treasury Fiscal Data REST API and daily interest-rate XML/CSV documentation family",
+      "url": "https://fiscaldata.treasury.gov/api-documentation/"
+    },
+    {
+      "assigned_batch": "docs-batch-005",
+      "category": "docs",
+      "credibility_signals": "Current tract project Rustdoc; Microsoft's ONNX Runtime docs explicitly classify Rust APIs as external community projects.",
+      "freshness_signals": "tract-onnx 0.23.4 was current as of 2026-07-15.",
+      "id": "docs-049",
+      "notes": "Official Microsoft context: https://onnxruntime.ai/docs/get-started/community-projects.html . tract Rustdoc coverage was about 49%, and no universal operator/opset compatibility is promised. Validate model hash, opset, tensor schema, numerical equivalence, performance, and failure behavior per bundle; inference error must yield no action. Accessed 2026-07-15.",
+      "priority": "P1",
+      "selection_rationale": "Provides a no-cloud, no-Python, pure-Rust ONNX-compatible inference candidate while keeping first-party support and operator-coverage claims bounded.",
+      "source_type": "maintainer-published project Rustdoc with upstream standard context",
+      "status": "assigned",
+      "title": "tract-onnx pure-Rust inference documentation with ONNX Runtime support-status context",
+      "url": "https://docs.rs/tract-onnx/latest/tract_onnx/"
+    },
+    {
+      "assigned_batch": "reputable-sources-batch-001",
+      "category": "reputable-sources",
+      "credibility_signals": "Primary FASB and IFRS Foundation material; the sources explicitly distinguish authoritative standards from amendment or supporting material.",
+      "freshness_signals": "IFRS landing page marked Standard 2026 Issued; FASB current ASU index and related pages accessed 2026-07-15.",
+      "id": "reputable-sources-076",
+      "notes": "FASB ASU 2011-04 says the Accounting Standards Codification, not the ASU, is authoritative. Related primary pages: https://fasb.org/standards/accounting-standard-updates , https://www.ifrs.org/issued-standards/list-of-standards/ifrs-13-fair-value-measurement/ , and https://www.ifrs.org/supporting-implementation/supporting-materials-by-ifrs-standards/ifrs-13/ . The IFRS supporting material is non-authoritative. Software classification requires ruleset versioning, evidence, judgment, and professional review and must never promote Level 2/3 inputs into execution-quality data. Accessed 2026-07-15.",
+      "priority": "P0",
+      "selection_rationale": "Supports fair-value hierarchy and Level 1 evidence rules while preserving authority, measurement-date, accessibility, adjustment, and judgment constraints.",
+      "source_type": "accounting standard-setter material",
+      "status": "assigned",
+      "title": "FASB ASC 820 and IFRS 13 fair-value authority family",
+      "url": "https://storage.fasb.org/ASU2011-04.pdf"
+    },
+    {
+      "assigned_batch": "github-batch-001",
+      "category": "github",
+      "credibility_signals": {
+        "forks": 3170,
+        "license": "LGPL-3.0",
+        "maintenance": "Extensive documentation, tests, adapters, benchmarks, fuzzing, Cargo.lock, security policy, supply-chain controls, and nearly 20,000 commits",
+        "owner": "Nautech Systems",
+        "primary_language": "Rust",
+        "stars": 24717
+      },
+      "freshness_signals": {
+        "accessed": "2026-07-15",
+        "last_push_utc": "2026-07-16T01:35:37Z",
+        "latest_release": "v1.230.0",
+        "latest_release_date": "2026-06-29"
+      },
+      "id": "github-001",
+      "notes": "Architecture/reference candidate, not a wholesale platform dependency. Its shared research/live semantics differ from Market Squawk's independent planes. Python participates in its control plane, its v2 API is still stabilizing, and LGPL-3.0 Rust reuse/linking needs legal review before any code is incorporated into an Apache-2.0 OR MIT workspace. Upstream data normalization must not be equated with Market Squawk DirectVerified qualification.",
+      "priority": "P0",
+      "selection_rationale": "Strongest broad Rust-native reference for financial domain types, deterministic event processing, modular Coinbase/Kraken and multi-venue adapters, order management, risk, simulation, live execution, performance work, and release hardening.",
+      "source_type": "repository",
+      "status": "assigned",
+      "title": "nautechsystems/nautilus_trader",
+      "url": "https://github.com/nautechsystems/nautilus_trader"
+    },
+    {
+      "assigned_batch": "github-batch-001",
+      "category": "github",
+      "credibility_signals": {
+        "forks": 355,
+        "license": "MIT",
+        "maintenance": "Cohesive modular crates, documentation, examples, tests, Tokio integration, OMS, strategy, risk, live, paper, and backtest components",
+        "owner": "barter-rs",
+        "primary_language": "Rust",
+        "stars": 2202
+      },
+      "freshness_signals": {
+        "accessed": "2026-07-15",
+        "last_push_utc": "2026-06-06T10:36:50Z",
+        "latest_release": "barter-v0.12.5",
+        "latest_release_date": "2026-05-09"
+      },
+      "id": "github-002",
+      "notes": "MIT makes isolated reuse plausible after normal dependency review, but the repository expressly disclaims production/live-trading fitness. Treat its contracts and tests as inputs, not production assurance. Market Squawk must add venue-specific sequence/checksum/freshness/precision/coverage validation, bounded-overflow quarantine, source health, and non-bypassable risk semantics.",
+      "priority": "P0",
+      "selection_rationale": "Close Rust reference for Market Squawk's proposed instruments/data/integration/execution crate boundaries and trait-driven REST, WebSocket, strategy, risk, OMS, paper, and backtest contracts.",
+      "source_type": "repository",
+      "status": "assigned",
+      "title": "barter-rs/barter-rs",
+      "url": "https://github.com/barter-rs/barter-rs"
+    },
+    {
+      "assigned_batch": "github-batch-001",
+      "category": "github",
+      "credibility_signals": {
+        "forks": 1213,
+        "license": "Apache-2.0",
+        "maintenance": "Official Rust implementation of Apache Arrow and Apache Parquet with tests, benchmarks, examples, and regular releases",
+        "owner": "Apache Software Foundation",
+        "primary_language": "Rust",
+        "stars": 3527
+      },
+      "freshness_signals": {
+        "accessed": "2026-07-15",
+        "last_push_utc": "2026-07-15T23:51:15Z",
+        "latest_release": "59.1.0",
+        "latest_release_date": "2026-07-07"
+      },
+      "id": "github-003",
+      "notes": "Use as a pinned direct dependency rather than copying code. Align its version with DataFusion, commit Cargo.lock, test decimal/timestamp/schema evolution semantics, and keep all Arrow/Parquet allocation and I/O outside the event-to-action hot path.",
+      "priority": "P0",
+      "selection_rationale": "Mandated production dependency family for Arrow record batches, Decimal128 analytical values, Parquet read/write, IPC, schemas, and columnar research-plane interchange.",
+      "source_type": "official-ecosystem-repository",
+      "status": "assigned",
+      "title": "apache/arrow-rs",
+      "url": "https://github.com/apache/arrow-rs"
+    },
+    {
+      "assigned_batch": "github-batch-001",
+      "category": "github",
+      "credibility_signals": {
+        "forks": 2229,
+        "license": "Apache-2.0",
+        "maintenance": "More than 14,000 commits, active roadmap, large contributor/PR activity, examples, benchmarks, API docs, and committed Cargo.lock",
+        "owner": "Apache Software Foundation",
+        "primary_language": "Rust",
+        "stars": 8982
+      },
+      "freshness_signals": {
+        "accessed": "2026-07-15",
+        "last_push_utc": "2026-07-16T01:47:04Z",
+        "latest_github_release": null,
+        "roadmap": "Active 2026 Q3-Q4 roadmap discussion"
+      },
+      "id": "github-004",
+      "notes": "Pin a crates.io version compatible with arrow-rs rather than the moving default branch. Budget compile/feature footprint and test query cancellation, memory limits, partition pruning, point-in-time predicates, and Decimal128 behavior. DataFusion must never run per live event or inside strategy/risk/execution hot paths.",
+      "priority": "P0",
+      "selection_rationale": "Mandated embedded analytical SQL and DataFrame engine for local Arrow, Parquet, CSV, and JSON research datasets, with extension points for Market Squawk tables, functions, and catalog adapters.",
+      "source_type": "official-ecosystem-repository",
+      "status": "assigned",
+      "title": "apache/datafusion",
+      "url": "https://github.com/apache/datafusion"
+    },
+    {
+      "assigned_batch": "github-batch-002",
+      "category": "github",
+      "credibility_signals": {
+        "forks": 7372,
+        "license": "MIT",
+        "maintenance": "Tests, documentation, research papers, point-in-time database, ML pipeline, portfolio optimization, execution simulation, and broad community adoption",
+        "owner": "Microsoft",
+        "primary_language": "Python",
+        "stars": 46268
+      },
+      "freshness_signals": {
+        "accessed": "2026-07-15",
+        "last_push_utc": "2026-04-22T07:08:01Z",
+        "latest_release": "v0.9.7",
+        "latest_release_date": "2025-08-15"
+      },
+      "id": "github-005",
+      "notes": "Research/reference only; Python cannot enter the live hot path. The project says its official dataset is temporarily disabled and warns that Yahoo-derived public sample data may be imperfect. Market Squawk must own persisted provenance, availability timestamps, revisions, delistings, historical constituents, corporate-action rules, reproducibility, and data-quality classification.",
+      "priority": "P1",
+      "selection_rationale": "Focused reference for point-in-time datasets, factor and feature research, model training/evaluation, portfolio construction, execution simulation, and leakage-aware backtesting workflows.",
+      "source_type": "repository",
+      "status": "assigned",
+      "title": "microsoft/qlib",
+      "url": "https://github.com/microsoft/qlib"
+    },
+    {
+      "assigned_batch": "github-batch-002",
+      "category": "github",
+      "credibility_signals": {
+        "forks": 7175,
+        "license": "AGPL-3.0",
+        "maintenance": "Large actively maintained provider ecosystem with SEC, FRED, BLS, and US government packages, typed models, schemas, unit tests, and recorded HTTP fixtures",
+        "owner": "OpenBB",
+        "primary_language": "Python",
+        "stars": 70630
+      },
+      "freshness_signals": {
+        "accessed": "2026-07-15",
+        "last_push_utc": "2026-07-16T00:13:14Z",
+        "latest_release": "Open-Data-Platform-v1.0.2",
+        "latest_release_date": "2026-04-25"
+      },
+      "id": "github-006",
+      "notes": "Reference behavior and architecture only unless Market Squawk intentionally accepts AGPL-3.0 obligations; do not copy code into the planned dual-licensed workspace by default. Its providers mix public, key-required, and commercial sources. Independently verify official API terms, zero-cost availability, rate limits, vintages, coverage, provenance, and point-in-time semantics.",
+      "priority": "P1",
+      "selection_rationale": "Concentrated reference for four required research adapters: SEC filings/company facts/XBRL, FRED, BLS, and US Treasury, including source-specific normalization, provider registration, assets, and deterministic HTTP-fixture tests.",
+      "source_type": "repository",
+      "status": "assigned",
+      "title": "OpenBB-finance/OpenBB",
+      "url": "https://github.com/OpenBB-finance/OpenBB"
+    },
+    {
+      "assigned_batch": "github-batch-002",
+      "category": "github",
+      "credibility_signals": {
+        "forks": 562,
+        "license": "Apache-2.0/MIT transition",
+        "maintenance": "Official SDK with typed client/server APIs, macros, schema integration, transports, examples, tests, and current releases",
+        "owner": "Model Context Protocol",
+        "primary_language": "Rust",
+        "stars": 3636
+      },
+      "freshness_signals": {
+        "accessed": "2026-07-15",
+        "last_push_utc": "2026-07-15T22:26:29Z",
+        "latest_release": "rmcp-v2.2.0",
+        "latest_release_date": "2026-07-08"
+      },
+      "id": "github-007",
+      "notes": "The repository is young and the license file records a transition from MIT to Apache-2.0. Pin and audit a specific release. The SDK is transport/protocol infrastructure, not Market Squawk's security boundary: implement explicit domain authorization, typed bounded results, cancellation, audit, controlled artifacts, credential isolation, and risk-gated bot/execution commands above it. Never invoke MCP in the live path.",
+      "priority": "P0",
+      "selection_rationale": "Official implementation base for Market Squawk's typed local stdio MCP server and protocol transport, serialization, request dispatch, and schema plumbing.",
+      "source_type": "official-ecosystem-repository",
+      "status": "assigned",
+      "title": "modelcontextprotocol/rust-sdk",
+      "url": "https://github.com/modelcontextprotocol/rust-sdk"
+    },
+    {
+      "assigned_batch": "github-batch-002",
+      "category": "github",
+      "credibility_signals": {
+        "forks": 255,
+        "license": "Apache-2.0 OR MIT",
+        "maintenance": "Nearly 1,000 commits, examples, tests, security policy, documentation, active issues and releases",
+        "owner": "pykeio",
+        "primary_language": "Rust",
+        "stars": 2400
+      },
+      "freshness_signals": {
+        "accessed": "2026-07-15",
+        "last_push_utc": "2026-07-13T16:44:01Z",
+        "latest_release": "v2.0.0-rc.12",
+        "latest_release_date": "2026-03-05"
+      },
+      "id": "github-008",
+      "notes": "Current 2.0 is a release candidate. Pin both wrapper and native runtime, document offline/reproducible runtime provisioning, audit native-binary supply chain, validate opset/tensor/feature schemas and hashes before activation, warm and benchmark on target hardware, and guarantee that load/inference failures emit no order intent.",
+      "priority": "P1",
+      "selection_rationale": "Practical Rust ONNX-compatible inference layer that supports local model bundles trained in Python without Python calls in the default live runtime.",
+      "source_type": "repository",
+      "status": "assigned",
+      "title": "pykeio/ort",
+      "url": "https://github.com/pykeio/ort"
+    },
+    {
+      "assigned_batch": "github-batch-003",
+      "category": "github",
+      "credibility_signals": {
+        "forks": 313,
+        "license": "Apache-2.0",
+        "maintenance": "Long-lived production-used analytics library with product, market-data, pricer, scenario, calculation, measure, loader, report, tests, documentation, and frequent maintenance releases",
+        "owner": "OpenGamma",
+        "primary_language": "Java",
+        "stars": 950
+      },
+      "freshness_signals": {
+        "accessed": "2026-07-15",
+        "last_push_utc": "2026-07-02T13:54:53Z",
+        "latest_release": "v2.12.73",
+        "latest_release_date": "2026-07-02"
+      },
+      "id": "github-009",
+      "notes": "Java reference, not a Rust dependency and not an ASC 820/IFRS 13 classification engine. Reuse concepts and verify any ported pure math independently. Market Squawk must separately capture hierarchy evidence, market activity/accessibility, source/venue validity, measurement-date relevance, ruleset version, override, and approval. Modeled values never become DirectVerified or Level 1 evidence by implication.",
+      "priority": "P2",
+      "selection_rationale": "Mature design reference for valuation product models, market inputs, pricers, scenario calculations, measures, curve/rate analytics, market risk, loading, and reports.",
+      "source_type": "repository",
+      "status": "assigned",
+      "title": "OpenGamma/Strata",
+      "url": "https://github.com/OpenGamma/Strata"
+    },
+    {
+      "assigned_batch": "github-batch-003",
+      "category": "github",
+      "credibility_signals": {
+        "forks": 89,
+        "license": "MIT",
+        "maintenance": "Official repository with tests, signed-release guidance, REST/WebSocket commands, typed JSON/NDJSON, categorized errors, paper engines, credential controls, and local MCP",
+        "owner": "Kraken",
+        "primary_language": "Rust",
+        "stars": 669
+      },
+      "freshness_signals": {
+        "accessed": "2026-07-15",
+        "created": "2026-03-06",
+        "last_push_utc": "2026-04-20T08:19:01Z",
+        "latest_release": "v0.3.2",
+        "latest_release_date": "2026-04-20",
+        "repository_updated_utc": "2026-07-14T20:20:38Z"
+      },
+      "id": "github-010",
+      "notes": "Very young CLI application, not an established embeddable production library. Code search found checksum fields in WebSocket examples but did not establish full venue checksum reconstruction and validation. Build Market Squawk's adapter from official protocol rules and independently implement sequence/snapshot/checksum/generation/freshness/precision/resync/quarantine tests. Validate its paper-fill assumptions before using any behavior as a contract.",
+      "priority": "P1",
+      "selection_rationale": "Current official Rust reference for Kraken Spot/Futures REST and WebSocket books/trades/account/order streams, paper execution, endpoint and credential controls, machine-readable errors/output, and stdio MCP.",
+      "source_type": "official-provider-repository",
+      "status": "assigned",
+      "title": "krakenfx/kraken-cli",
+      "url": "https://github.com/krakenfx/kraken-cli"
+    },
+    {
+      "assigned_batch": "papers-batch-001",
+      "category": "papers",
+      "credibility_signals": {
+        "evidence": "Discloses design, benchmark topologies, JVM, operating systems, processors, message counts, and measurement choices",
+        "provenance": "First-party LMAX exchange-engineering paper",
+        "review_status": "Industry technical paper; not peer reviewed"
+      },
+      "freshness_signals": {
+        "assessment": "Old benchmark environment; single-writer, preallocation, sequence, and cache-contention mechanics remain relevant",
+        "publication_date": "2011-05"
+      },
+      "id": "papers-001",
+      "notes": "Authors: Martin Thompson, Dave Farley, Michael Barker, Patricia Gee, Andrew Stewart. Problem: contention and latency in asynchronous pipelines. Method/result: preallocated bounded ring and sequence barriers; authors report higher throughput/lower latency than Java queues. Caveats: vendor-authored, Java-specific, 2011 hardware, best-of-three metrics are not portable Market Squawk evidence. Accessed 2026-07-15.",
+      "priority": "high",
+      "selection_rationale": "Directly informs bounded rings, stable single-writer ownership, cache-aware state, sequencing, dependency graphs, and explicit latency benchmarking.",
+      "source_type": "recognized_engineering_lab_technical_paper",
+      "status": "assigned",
+      "title": "Disruptor: High performance alternative to bounded queues for exchanging data between concurrent threads",
+      "url": "https://lmax-exchange.github.io/disruptor/files/Disruptor-1.0.pdf"
+    },
+    {
+      "assigned_batch": "papers-batch-001",
+      "category": "papers",
+      "credibility_signals": {
+        "method": "Empirical NYSE TAQ study of 50 randomly selected S&P 500 stocks",
+        "open_version": "Full paper and journal metadata on arXiv",
+        "venue": "Journal of Financial Econometrics 12(1), 47-88"
+      },
+      "freshness_signals": {
+        "assessment": "Foundational online-feature evidence; venue and asset calibration must be refreshed",
+        "data_period": "April 2010",
+        "publication_date": "2014"
+      },
+      "id": "papers-002",
+      "notes": "Authors: Rama Cont, Arseniy Kukanov, Sasha Stoikov. Method: regress short-interval price changes on top-of-book OFI. Result: linear OFI-price relation with impact inversely related to depth. Caveats: one month, 50 U.S. stocks, Level I data, potential explanatory-variable tautology, deeper-book effects omitted. Accessed 2026-07-15.",
+      "priority": "high",
+      "selection_rationale": "Provides a simple incremental order-flow-imbalance feature, empirical depth-conditioned impact result, and explicit limitations useful for online features and slippage controls.",
+      "source_type": "peer_reviewed_journal_article_open_preprint",
+      "status": "assigned",
+      "title": "The Price Impact of Order Book Events",
+      "url": "https://arxiv.org/abs/1011.6402"
+    },
+    {
+      "assigned_batch": "papers-batch-001",
+      "category": "papers",
+      "credibility_signals": {
+        "artifact_lineage": "Open-source simulator lineage",
+        "authors_institutions": "Georgia Tech, University of Georgia, and J.P. Morgan AI Research",
+        "doi": "10.1145/3384441.3395986",
+        "venue": "ACM SIGSIM-PADS 2020"
+      },
+      "freshness_signals": {
+        "assessment": "Mature discrete-event architecture; empirical market fidelity remains illustrative",
+        "publication_date": "2020"
+      },
+      "id": "papers-003",
+      "notes": "Authors: David Byrd, Maria Hybinette, Tucker Hybinette Balch. Method: message-driven multi-agent discrete-event simulator modeled on ITCH/OUCH. Result: demonstrates tens of thousands of agents and example market-impact experiments. Caveats: preliminary/illustrative validation, simplified background agents, examples trade one symbol on one exchange. Accessed 2026-07-15.",
+      "priority": "high",
+      "selection_rationale": "Supports deterministic discrete-event order, protocol-shaped messages, configurable network latency, interacting agents, and counterfactual response beyond static replay.",
+      "source_type": "peer_reviewed_conference_paper",
+      "status": "assigned",
+      "title": "ABIDES: Towards High-Fidelity Multi-Agent Market Simulation",
+      "url": "https://par.nsf.gov/servlets/purl/10185795"
+    },
+    {
+      "assigned_batch": "papers-batch-002",
+      "category": "papers",
+      "credibility_signals": {
+        "author_signal": "Includes recognized market-microstructure researcher Mathieu Rosenbaum",
+        "evidence": "Method and multiple stock/strategy case studies exposed",
+        "provenance": "Primary arXiv q-fin.TR manuscript"
+      },
+      "freshness_signals": {
+        "assessment": "Very current, not peer reviewed at cutoff",
+        "submitted": "2026-03-25",
+        "version": "v1"
+      },
+      "id": "papers-004",
+      "notes": "Authors: Patrick Noble, Mathieu Rosenbaum, Saad Souilmi. Method: projected spread/volume-imbalance state, calibrated timing, signed-flow power-law feedback. Result: reports realistic concave impact, reversion, and execution-parameter sensitivity. Caveats: v1 preprint, large-tick assets/several stocks, projected state omits full-book detail, cross-asset replication open. Accessed 2026-07-15.",
+      "priority": "high",
+      "selection_rationale": "Current practical recipe for calibrated event timing, imbalance state, impact decay, strategy-sensitive execution cost, and P&L simulation.",
+      "source_type": "arxiv_preprint",
+      "status": "assigned",
+      "title": "Bridging the Reality Gap in Limit Order Book Simulation",
+      "url": "https://arxiv.org/abs/2603.24137"
+    },
+    {
+      "assigned_batch": "papers-batch-002",
+      "category": "papers",
+      "credibility_signals": {
+        "method": "Formal calculus, soundness argument, explicit decidability boundary, and artifact claim",
+        "provenance": "Primary arXiv cs.CR/cs.LO/cs.PL/cs.SE/q-fin.PM manuscript",
+        "review_status": "Listed as submitted to ACM TOSEM; not peer reviewed at cutoff"
+      },
+      "freshness_signals": {
+        "age_at_cutoff_days": 9,
+        "submitted": "2026-07-06",
+        "version": "v1"
+      },
+      "id": "papers-005",
+      "notes": "Author: Xavier Fonseca. Result claimed: sound linear-time check over a value-independent fragment; full data-dependent availability case is undecidable. Caveats: single-author nine-day-old v1, no peer review, artifact not independently reproduced, decidable fragment excludes data-dependent availability. Use as provisional test/property inspiration. Accessed 2026-07-15.",
+      "priority": "high_provisional",
+      "selection_rationale": "Directly formalizes reference-time versus availability-time semantics for windows, resampling, joins, point-in-time reads, and vintage reads.",
+      "source_type": "arxiv_preprint_submitted_to_journal",
+      "status": "assigned",
+      "title": "Look-Ahead-Freedom as Temporal Non-Interference: A Verifiable Correctness Property for Backtesting and Agentic Trading Pipelines",
+      "url": "https://arxiv.org/abs/2607.04958"
+    },
+    {
+      "assigned_batch": "papers-batch-002",
+      "category": "papers",
+      "credibility_signals": {
+        "provenance": "University-hosted full paper",
+        "status": "Foundational finance methodology result",
+        "venue": "The Review of Financial Studies 5(4), 553-580"
+      },
+      "freshness_signals": {
+        "assessment": "Old empirical context; survivor-selection mechanism remains durable",
+        "publication_date": "1992"
+      },
+      "id": "papers-006",
+      "notes": "Authors: Stephen J. Brown, William Goetzmann, Roger G. Ibbotson, Stephen A. Ross. Method: analytical/numerical study of samples truncated by survival. Result: truncation can create apparent predictability. Caveat: mutual-fund setting and older period; does not prescribe instrument/corporate-action schemas. Accessed 2026-07-15.",
+      "priority": "medium",
+      "selection_rationale": "Supports historical constituents, delisted instruments, membership-as-of data, and explicit universe selection instead of present-day survivor sets.",
+      "source_type": "peer_reviewed_journal_article_university_copy",
+      "status": "assigned",
+      "title": "Survivorship Bias in Performance Studies",
+      "url": "https://terpconnect.umd.edu/~wermers/ftpsite/FAME/Brown_Goetzmann_Ibbotson_Ross.pdf"
+    },
+    {
+      "assigned_batch": "papers-batch-003",
+      "category": "papers",
+      "credibility_signals": {
+        "doi": "10.21314/JCF.2016.322",
+        "provenance": "Official publisher page with method and result summary",
+        "venue": "Journal of Computational Finance 20(4), 39-69"
+      },
+      "freshness_signals": {
+        "assessment": "Established statistical method",
+        "first_published": "2016-09-19",
+        "issue_date": "2017-04"
+      },
+      "id": "papers-007",
+      "notes": "Authors: David H. Bailey, Jonathan M. Borwein, Marcos Lopez de Prado, Qiji Jim Zhu. Method: combinatorially symmetric cross-validation to estimate probability of backtest overfitting. Result: reasonable PBO estimates in examples. Caveats: does not fix leakage, survivors, fill realism, fees, or regime mismatch; trial set must be preserved. Accessed 2026-07-15.",
+      "priority": "high",
+      "selection_rationale": "Adds strategy/model-selection risk controls that point-in-time data, chronological splits, and realistic execution do not solve alone.",
+      "source_type": "peer_reviewed_journal_article",
+      "status": "assigned",
+      "title": "The probability of backtest overfitting",
+      "url": "https://www.risk.net/journal-of-computational-finance/2471206/the-probability-of-backtest-overfitting"
+    },
+    {
+      "assigned_batch": "papers-batch-003",
+      "category": "papers",
+      "credibility_signals": {
+        "method": "Formal comparison of risk-measure definitions and coherence",
+        "provenance": "Full arXiv manuscript with journal reference",
+        "venue": "Journal of Banking & Finance 26, 1487-1503"
+      },
+      "freshness_signals": {
+        "assessment": "Foundational mathematical result; implementation edge cases remain current",
+        "last_revision": "2002-05-02"
+      },
+      "id": "papers-008",
+      "notes": "Authors: Carlo Acerbi, Dirk Tasche. Result: identifies an ES definition coherent for general distributions and estimable where usual VaR estimators can fail. Caveat: theory does not choose horizon, scenarios, dependence, confidence level, or finite-sample method. Accessed 2026-07-15.",
+      "priority": "high",
+      "selection_rationale": "Defines coherent ES under discontinuous/discrete loss distributions and exposes ambiguity in naive tail-mean implementations.",
+      "source_type": "peer_reviewed_journal_article_open_preprint",
+      "status": "assigned",
+      "title": "On the coherence of Expected Shortfall",
+      "url": "https://arxiv.org/abs/cond-mat/0104295"
+    },
+    {
+      "assigned_batch": "papers-batch-003",
+      "category": "papers",
+      "credibility_signals": {
+        "doi": "10.21314/JOR.2001.041",
+        "status": "Canonical execution-cost framework",
+        "venue": "The Journal of Risk 3(2), 5-39"
+      },
+      "freshness_signals": {
+        "assessment": "Foundational baseline with simplified price/impact dynamics",
+        "publication_date": "2001-01-01"
+      },
+      "id": "papers-009",
+      "notes": "Authors: Robert Almgren, Neil Chriss. Method/result: mean-variance execution framework and explicit efficient frontier under linear impact. Caveats: no queue priority, venue fragmentation, partial fills, rejects, cancels, fees, latency, or state-dependent liquidity. Baseline only, not a realistic paper broker. Accessed 2026-07-15.",
+      "priority": "high",
+      "selection_rationale": "Makes volatility risk, temporary/permanent impact, schedule, implementation cost, and liquidation tradeoffs explicit for a testable paper-execution baseline.",
+      "source_type": "peer_reviewed_journal_article",
+      "status": "assigned",
+      "title": "Optimal execution of portfolio transactions",
+      "url": "https://doi.org/10.21314/JOR.2001.041"
+    },
+    {
+      "assigned_batch": "papers-batch-004",
+      "category": "papers",
+      "credibility_signals": {
+        "disclosure": "IASB-linked funding/research context and limitations disclosed",
+        "doi": "10.1080/17449480.2021.1912370",
+        "method": "Meta-analysis plus practitioner interviews",
+        "venue": "Accounting in Europe 18(3), 275-294"
+      },
+      "freshness_signals": {
+        "assessment": "Post-IFRS 13 synthesis; not itself a current standards text",
+        "published_online": "2021-04-27"
+      },
+      "id": "papers-010",
+      "notes": "Authors: Andrei Filip, Ahmad Hammami, Zhongwei Huang, Anne Jeny, Michel Magnan, Rucsandra Moldovan. Result: Level 3 is less value relevant overall than Levels 1/2, with change over time; model/process complexity may contribute. Caveats: value relevance is not classification correctness; small Canadian interview component; IASB funding disclosed; not a rules engine. Accessed 2026-07-15.",
+      "priority": "high",
+      "selection_rationale": "Direct evidence for treating hierarchy level, input observability, model risk, measurement-process complexity, value relevance, and data quality as distinct explained dimensions.",
+      "source_type": "peer_reviewed_meta_analysis_and_interview_study",
+      "status": "assigned",
+      "title": "Convergence in Motion: A Review of Fair Value Levels' Relevance",
+      "url": "https://doi.org/10.1080/17449480.2021.1912370"
+    },
+    {
+      "assigned_batch": "reputable-sources-batch-001",
+      "category": "reputable-sources",
+      "credibility_signals": "Primary SEC .gov statement governing automated access to SEC web systems and EDGAR data.",
+      "freshness_signals": "Current policy page reviewed and accessed 2026-07-15.",
+      "id": "reputable-sources-071",
+      "notes": "Use a shared SEC-wide limiter at no more than ten requests per second, identify the application and contact, cache immutable filings, prefer bulk archives, and honor throttling or blocking. The ceiling is not a per-machine entitlement: identity/account rotation, IP or proxy rotation, misleading identity, and distributed requests intended to evade the aggregate limit are excluded. Related API page: https://www.sec.gov/search-filings/edgar-application-programming-interfaces . Accessed 2026-07-15.",
+      "priority": "P0",
+      "selection_rationale": "Provides a concrete aggregate request ceiling, declared-user-agent requirement, bulk-data preference, and provider enforcement context for a required adapter.",
+      "source_type": "public-provider fair-access policy",
+      "status": "assigned",
+      "title": "SEC webmaster fair-access and automated-request policy",
+      "url": "https://www.sec.gov/about/webmaster-frequently-asked-questions"
+    },
+    {
+      "assigned_batch": "reputable-sources-batch-001",
+      "category": "reputable-sources",
+      "credibility_signals": "Primary BLS .gov FAQ for API versions, registration, request composition, and limits.",
+      "freshness_signals": "Live v1/v2 limits were reviewed and page accessed 2026-07-15.",
+      "id": "reputable-sources-072",
+      "notes": "BLS documents 25 versus 500 daily queries, 25 versus 50 series per query, 10 versus 20 years per query, and 50 queries per ten seconds for both versions. Registration requires a human CAPTCHA and annual renewal; the adapter must not automate that workflow. CAPTCHA bypass, synthetic identity, key/account rotation, or distributed quota multiplication are excluded. Related page: https://www.bls.gov/developers/home.htm . Accessed 2026-07-15.",
+      "priority": "P0",
+      "selection_rationale": "Supplies exact zero-registration and registered ceilings and defines the human registration boundary for a required macroeconomic adapter.",
+      "source_type": "public-provider rate and registration policy",
+      "status": "assigned",
+      "title": "BLS Public Data API fair-use, registration, and quota policy",
+      "url": "https://www.bls.gov/developers/api_faqs.htm"
+    },
+    {
+      "assigned_batch": "reputable-sources-batch-001",
+      "category": "reputable-sources",
+      "credibility_signals": "Final NIST publication with named authors, DOI, document history, supplemental mappings, and a maintained CSRC project page.",
+      "freshness_signals": "Final issued 2022-02-03; current NIST page accessed 2026-07-15.",
+      "id": "reputable-sources-073",
+      "notes": "Map repository policies and release evidence to SSDF practices, including third-party component verification and vulnerability response. SSDF does not prescribe Rust tools and running cargo audit, fuzzing, license checks, signing, or tests does not by itself prove conformance. Related project page: https://csrc.nist.gov/projects/ssdf . Accessed 2026-07-15.",
+      "priority": "P0",
+      "selection_rationale": "Provides an outcome-oriented baseline for preparing the organization, protecting software, producing well-secured releases, and responding to vulnerabilities.",
+      "source_type": "public-sector secure-development framework",
+      "status": "assigned",
+      "title": "NIST SP 800-218 Secure Software Development Framework version 1.1",
+      "url": "https://csrc.nist.gov/pubs/sp/800/218/final"
+    },
+    {
+      "assigned_batch": "reputable-sources-batch-001",
+      "category": "reputable-sources",
+      "credibility_signals": "OWASP flagship project with stable, versioned, machine-readable technical-control requirements.",
+      "freshness_signals": "ASVS 5.0.0 released 2025-05-30 and was latest stable on access date 2026-07-15.",
+      "id": "reputable-sources-074",
+      "notes": "Reference requirements with their v5.0.0 identifier and document applicability. ASVS targets web applications and does not cover exchange integrity, financial precision, pre-trade risk, or the entire local Rust threat model; do not claim blanket ASVS compliance. Accessed 2026-07-15.",
+      "priority": "P0",
+      "selection_rationale": "Offers version-addressable verification requirements for applicable MCP, CLI, artifact, authentication, authorization, input-validation, error, and secret-handling controls.",
+      "source_type": "vendor-neutral application-security verification standard",
+      "status": "assigned",
+      "title": "OWASP Application Security Verification Standard 5.0.0",
+      "url": "https://owasp.org/www-project-application-security-verification-standard/"
+    },
+    {
+      "assigned_batch": "reputable-sources-batch-001",
+      "category": "reputable-sources",
+      "credibility_signals": "Approved industry-consensus specification under the OpenSSF/Linux Foundation, with source/build tracks, threat models, provenance, and verification formats.",
+      "freshness_signals": "Approved v1.2 was the current stable specification on 2026-07-15.",
+      "id": "reputable-sources-075",
+      "notes": "Generate and verify provenance, preserve source and lockfile evidence, and report the exact achieved track/level. SLSA does not replace vulnerability, license, credential, runtime, or financial-domain testing, and higher levels may depend on build infrastructure choices. Related project page: https://openssf.org/projects/slsa/ . Accessed 2026-07-15.",
+      "priority": "P0",
+      "selection_rationale": "Provides staged integrity guarantees for source, builds, provenance, artifact verification, and release hardening without requiring a paid service.",
+      "source_type": "vendor-neutral software-supply-chain specification",
+      "status": "assigned",
+      "title": "OpenSSF Supply-chain Levels for Software Artifacts specification version 1.2",
+      "url": "https://slsa.dev/spec/v1.2/"
+    },
+    {
+      "assigned_batch": "reputable-sources-batch-002",
+      "category": "reputable-sources",
+      "credibility_signals": "Federal Reserve primary publication with a joint Federal Reserve/OCC/FDIC attachment and explicit supersession history.",
+      "freshness_signals": "Issued and last updated 2026-04-17; accessed 2026-07-15.",
+      "id": "reputable-sources-077",
+      "notes": "SR 26-2 supersedes SR 11-7 and SR 21-8. Its attachment is https://www.federalreserve.gov/supervisionreg/srletters/SR2602a1.pdf . It is most relevant to Federal Reserve-regulated banking organizations over $30 billion, is non-prescriptive, and excludes generative/agentic AI from its defined scope. Applying its principles to Market Squawk is a conservative implementation inference, not an applicability or compliance assertion. Accessed 2026-07-15.",
+      "priority": "P0",
+      "selection_rationale": "Current guidance addresses model materiality, aggregate risk, effective challenge, development, validation, outcomes analysis, ongoing monitoring, inventory, documentation, governance, and vendor products.",
+      "source_type": "joint U.S. banking supervisory guidance",
+      "status": "assigned",
+      "title": "Federal Reserve, OCC, and FDIC SR 26-2 revised model-risk management guidance",
+      "url": "https://www.federalreserve.gov/supervisionreg/srletters/SR2602.htm"
+    },
+    {
+      "assigned_batch": "reputable-sources-batch-002",
+      "category": "reputable-sources",
+      "credibility_signals": "Basel Committee publication hosted by the Bank for International Settlements and marked Current.",
+      "freshness_signals": "Issued 2018-10-17, status Current, and accessed 2026-07-15.",
+      "id": "reputable-sources-078",
+      "notes": "The selected principles supersede the 2009 version. They are high-level banking and supervisory guidance, not a prescribed VaR/expected-shortfall algorithm or a compliance standard for a local personal platform. Use them as an inferred design baseline for versioned scenarios, assumptions, governance, independent review, and decision use. Accessed 2026-07-15.",
+      "priority": "P1",
+      "selection_rationale": "Provides a governance framework for multi-risk portfolio stress tests covering objectives, policies, process, methodology, resources, documentation, use, and oversight.",
+      "source_type": "international banking supervisory guidelines",
+      "status": "assigned",
+      "title": "Basel Committee current stress-testing principles",
+      "url": "https://www.bis.org/bcbs/publ/d450.htm"
+    }
+  ],
+  "topic": "Market Squawk complete local platform architecture, source adapters, analytics, risk, valuation, and MCP implementation evidence"
+}

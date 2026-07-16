@@ -1,0 +1,100 @@
+{
+  "sources": [
+    {
+      "category": "reputable-sources",
+      "title": "SEC webmaster fair-access and automated-request policy",
+      "url": "https://www.sec.gov/about/webmaster-frequently-asked-questions",
+      "source_type": "public-provider fair-access policy",
+      "credibility_signals": "Primary SEC .gov statement governing automated access to SEC web systems and EDGAR data.",
+      "freshness_signals": "Current policy page reviewed and accessed 2026-07-15.",
+      "selection_rationale": "Provides a concrete aggregate request ceiling, declared-user-agent requirement, bulk-data preference, and provider enforcement context for a required adapter.",
+      "priority": "P0",
+      "status": "selected",
+      "notes": "Use a shared SEC-wide limiter at no more than ten requests per second, identify the application and contact, cache immutable filings, prefer bulk archives, and honor throttling or blocking. The ceiling is not a per-machine entitlement: identity/account rotation, IP or proxy rotation, misleading identity, and distributed requests intended to evade the aggregate limit are excluded. Related API page: https://www.sec.gov/search-filings/edgar-application-programming-interfaces . Accessed 2026-07-15."
+    },
+    {
+      "category": "reputable-sources",
+      "title": "BLS Public Data API fair-use, registration, and quota policy",
+      "url": "https://www.bls.gov/developers/api_faqs.htm",
+      "source_type": "public-provider rate and registration policy",
+      "credibility_signals": "Primary BLS .gov FAQ for API versions, registration, request composition, and limits.",
+      "freshness_signals": "Live v1/v2 limits were reviewed and page accessed 2026-07-15.",
+      "selection_rationale": "Supplies exact zero-registration and registered ceilings and defines the human registration boundary for a required macroeconomic adapter.",
+      "priority": "P0",
+      "status": "selected",
+      "notes": "BLS documents 25 versus 500 daily queries, 25 versus 50 series per query, 10 versus 20 years per query, and 50 queries per ten seconds for both versions. Registration requires a human CAPTCHA and annual renewal; the adapter must not automate that workflow. CAPTCHA bypass, synthetic identity, key/account rotation, or distributed quota multiplication are excluded. Related page: https://www.bls.gov/developers/home.htm . Accessed 2026-07-15."
+    },
+    {
+      "category": "reputable-sources",
+      "title": "NIST SP 800-218 Secure Software Development Framework version 1.1",
+      "url": "https://csrc.nist.gov/pubs/sp/800/218/final",
+      "source_type": "public-sector secure-development framework",
+      "credibility_signals": "Final NIST publication with named authors, DOI, document history, supplemental mappings, and a maintained CSRC project page.",
+      "freshness_signals": "Final issued 2022-02-03; current NIST page accessed 2026-07-15.",
+      "selection_rationale": "Provides an outcome-oriented baseline for preparing the organization, protecting software, producing well-secured releases, and responding to vulnerabilities.",
+      "priority": "P0",
+      "status": "selected",
+      "notes": "Map repository policies and release evidence to SSDF practices, including third-party component verification and vulnerability response. SSDF does not prescribe Rust tools and running cargo audit, fuzzing, license checks, signing, or tests does not by itself prove conformance. Related project page: https://csrc.nist.gov/projects/ssdf . Accessed 2026-07-15."
+    },
+    {
+      "category": "reputable-sources",
+      "title": "OWASP Application Security Verification Standard 5.0.0",
+      "url": "https://owasp.org/www-project-application-security-verification-standard/",
+      "source_type": "vendor-neutral application-security verification standard",
+      "credibility_signals": "OWASP flagship project with stable, versioned, machine-readable technical-control requirements.",
+      "freshness_signals": "ASVS 5.0.0 released 2025-05-30 and was latest stable on access date 2026-07-15.",
+      "selection_rationale": "Offers version-addressable verification requirements for applicable MCP, CLI, artifact, authentication, authorization, input-validation, error, and secret-handling controls.",
+      "priority": "P0",
+      "status": "selected",
+      "notes": "Reference requirements with their v5.0.0 identifier and document applicability. ASVS targets web applications and does not cover exchange integrity, financial precision, pre-trade risk, or the entire local Rust threat model; do not claim blanket ASVS compliance. Accessed 2026-07-15."
+    },
+    {
+      "category": "reputable-sources",
+      "title": "OpenSSF Supply-chain Levels for Software Artifacts specification version 1.2",
+      "url": "https://slsa.dev/spec/v1.2/",
+      "source_type": "vendor-neutral software-supply-chain specification",
+      "credibility_signals": "Approved industry-consensus specification under the OpenSSF/Linux Foundation, with source/build tracks, threat models, provenance, and verification formats.",
+      "freshness_signals": "Approved v1.2 was the current stable specification on 2026-07-15.",
+      "selection_rationale": "Provides staged integrity guarantees for source, builds, provenance, artifact verification, and release hardening without requiring a paid service.",
+      "priority": "P0",
+      "status": "selected",
+      "notes": "Generate and verify provenance, preserve source and lockfile evidence, and report the exact achieved track/level. SLSA does not replace vulnerability, license, credential, runtime, or financial-domain testing, and higher levels may depend on build infrastructure choices. Related project page: https://openssf.org/projects/slsa/ . Accessed 2026-07-15."
+    },
+    {
+      "category": "reputable-sources",
+      "title": "FASB ASC 820 and IFRS 13 fair-value authority family",
+      "url": "https://storage.fasb.org/ASU2011-04.pdf",
+      "source_type": "accounting standard-setter material",
+      "credibility_signals": "Primary FASB and IFRS Foundation material; the sources explicitly distinguish authoritative standards from amendment or supporting material.",
+      "freshness_signals": "IFRS landing page marked Standard 2026 Issued; FASB current ASU index and related pages accessed 2026-07-15.",
+      "selection_rationale": "Supports fair-value hierarchy and Level 1 evidence rules while preserving authority, measurement-date, accessibility, adjustment, and judgment constraints.",
+      "priority": "P0",
+      "status": "selected",
+      "notes": "FASB ASU 2011-04 says the Accounting Standards Codification, not the ASU, is authoritative. Related primary pages: https://fasb.org/standards/accounting-standard-updates , https://www.ifrs.org/issued-standards/list-of-standards/ifrs-13-fair-value-measurement/ , and https://www.ifrs.org/supporting-implementation/supporting-materials-by-ifrs-standards/ifrs-13/ . The IFRS supporting material is non-authoritative. Software classification requires ruleset versioning, evidence, judgment, and professional review and must never promote Level 2/3 inputs into execution-quality data. Accessed 2026-07-15."
+    },
+    {
+      "category": "reputable-sources",
+      "title": "Federal Reserve, OCC, and FDIC SR 26-2 revised model-risk management guidance",
+      "url": "https://www.federalreserve.gov/supervisionreg/srletters/SR2602.htm",
+      "source_type": "joint U.S. banking supervisory guidance",
+      "credibility_signals": "Federal Reserve primary publication with a joint Federal Reserve/OCC/FDIC attachment and explicit supersession history.",
+      "freshness_signals": "Issued and last updated 2026-04-17; accessed 2026-07-15.",
+      "selection_rationale": "Current guidance addresses model materiality, aggregate risk, effective challenge, development, validation, outcomes analysis, ongoing monitoring, inventory, documentation, governance, and vendor products.",
+      "priority": "P0",
+      "status": "selected",
+      "notes": "SR 26-2 supersedes SR 11-7 and SR 21-8. Its attachment is https://www.federalreserve.gov/supervisionreg/srletters/SR2602a1.pdf . It is most relevant to Federal Reserve-regulated banking organizations over $30 billion, is non-prescriptive, and excludes generative/agentic AI from its defined scope. Applying its principles to Market Squawk is a conservative implementation inference, not an applicability or compliance assertion. Accessed 2026-07-15."
+    },
+    {
+      "category": "reputable-sources",
+      "title": "Basel Committee current stress-testing principles",
+      "url": "https://www.bis.org/bcbs/publ/d450.htm",
+      "source_type": "international banking supervisory guidelines",
+      "credibility_signals": "Basel Committee publication hosted by the Bank for International Settlements and marked Current.",
+      "freshness_signals": "Issued 2018-10-17, status Current, and accessed 2026-07-15.",
+      "selection_rationale": "Provides a governance framework for multi-risk portfolio stress tests covering objectives, policies, process, methodology, resources, documentation, use, and oversight.",
+      "priority": "P1",
+      "status": "selected",
+      "notes": "The selected principles supersede the 2009 version. They are high-level banking and supervisory guidance, not a prescribed VaR/expected-shortfall algorithm or a compliance standard for a local personal platform. Use them as an inferred design baseline for versioned scenarios, assumptions, governance, independent review, and decision use. Accessed 2026-07-15."
+    }
+  ]
+}
