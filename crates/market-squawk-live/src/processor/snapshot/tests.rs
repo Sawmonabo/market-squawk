@@ -2,9 +2,8 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::str::FromStr;
 
-use market_squawk_domain::{
-    BookLevel, InstrumentId, QuantityLots, SequenceNumber, Timestamp, TradingStatus,
-};
+use crate::{BookLevelSnapshot, SnapshotCompleteness, StreamPhaseSnapshot};
+use market_squawk_domain::{InstrumentId, QuantityLots, SequenceNumber, Timestamp, TradingStatus};
 
 use super::{
     MAX_SNAPSHOT_LEVELS_PER_SIDE, MAX_SNAPSHOT_RETAINED_BYTES, MAX_SNAPSHOT_STREAMS,
@@ -89,16 +88,22 @@ fn deterministic_sort_and_count_caps_report_requested_available_and_returned_sta
     assert_eq!(stream_sources(&seed), ["source-a", "source-m"]);
     assert_eq!(status_sources(&seed), ["source-a"]);
     for stream in &seed.streams {
-        assert_eq!(stream.configured_depth, CONFIGURED_DEPTH);
-        assert_eq!(stream.requested_depth, 2);
-        assert_eq!(stream.total_bid_levels, 3);
-        assert_eq!(stream.total_ask_levels, 2);
-        assert_eq!(stream.output_bid_levels, 2);
-        assert_eq!(stream.output_ask_levels, 2);
-        assert!(!stream.bids_complete);
-        assert!(stream.asks_complete);
-        assert_eq!(stream.bids.len(), stream.output_bid_levels);
-        assert_eq!(stream.asks.len(), stream.output_ask_levels);
+        assert_eq!(stream.configured_depth, u32::try_from(CONFIGURED_DEPTH)?);
+        assert_eq!(stream.bid_dimension.configured_limit(), 2);
+        assert_eq!(stream.state_bid_depth, 3);
+        assert_eq!(stream.state_ask_depth, 2);
+        assert_eq!(stream.bid_dimension.returned(), 2);
+        assert_eq!(stream.ask_dimension.returned(), 2);
+        assert_eq!(
+            stream.bid_dimension.completeness(),
+            SnapshotCompleteness::Truncated
+        );
+        assert_eq!(
+            stream.ask_dimension.completeness(),
+            SnapshotCompleteness::Complete
+        );
+        assert_eq!(stream.bids.len(), 2);
+        assert_eq!(stream.asks.len(), 2);
     }
     Ok(())
 }
@@ -120,20 +125,29 @@ fn complete_seed_retains_depth_book_status_and_all_provenance_dimensions() -> Te
     let stream = seed
         .streams
         .iter()
-        .find(|candidate| candidate.key.source_id().as_str() == "source-a")
+        .find(|candidate| candidate.source.as_str() == "source-a")
         .ok_or("sorted seed lost source-a")?;
-    assert_eq!(stream.generation.get(), 1);
-    assert_eq!(stream.phase, crate::GenerationPhase::Healthy);
-    assert_eq!(stream.revision, 1);
+    assert_eq!(stream.connection_generation.get(), 1);
+    assert_eq!(stream.phase, StreamPhaseSnapshot::Healthy);
+    assert_eq!(stream.state_revision, 1);
     assert_eq!(stream.last_sequence, Some(SequenceNumber::new(10)));
-    assert_eq!(stream.configured_depth, CONFIGURED_DEPTH);
-    assert_eq!(stream.requested_depth, CONFIGURED_DEPTH);
-    assert_eq!(stream.total_bid_levels, 3);
-    assert_eq!(stream.total_ask_levels, 2);
-    assert_eq!(stream.output_bid_levels, 3);
-    assert_eq!(stream.output_ask_levels, 2);
-    assert!(stream.bids_complete);
-    assert!(stream.asks_complete);
+    assert_eq!(stream.configured_depth, u32::try_from(CONFIGURED_DEPTH)?);
+    assert_eq!(
+        stream.bid_dimension.configured_limit(),
+        u32::try_from(CONFIGURED_DEPTH)?
+    );
+    assert_eq!(stream.state_bid_depth, 3);
+    assert_eq!(stream.state_ask_depth, 2);
+    assert_eq!(stream.bid_dimension.returned(), 3);
+    assert_eq!(stream.ask_dimension.returned(), 2);
+    assert_eq!(
+        stream.bid_dimension.completeness(),
+        SnapshotCompleteness::Complete
+    );
+    assert_eq!(
+        stream.ask_dimension.completeness(),
+        SnapshotCompleteness::Complete
+    );
     assert_eq!(prices(&stream.bids), [10_000, 9_900, 9_800]);
     assert_eq!(prices(&stream.asks), [10_100, 10_200]);
     let one_lot = QuantityLots::new(1)?;
@@ -150,34 +164,31 @@ fn complete_seed_retains_depth_book_status_and_all_provenance_dimensions() -> Te
     assert_eq!(stream.health_epoch, 1);
     assert_eq!(
         stream.source_valid_until,
-        Some(Timestamp::from_unix_nanos(SOURCE_VALID_UNTIL))
+        Timestamp::from_unix_nanos(SOURCE_VALID_UNTIL)
     );
     assert_eq!(
         stream.source_timestamp,
         Some(Timestamp::from_unix_nanos(SOURCE_TIMESTAMP))
     );
-    assert_eq!(
-        stream.received_at,
-        Some(Timestamp::from_unix_nanos(RECEIVED_AT))
-    );
+    assert_eq!(stream.received_at, Timestamp::from_unix_nanos(RECEIVED_AT));
     assert_eq!(
         stream.evaluated_at,
-        Some(Timestamp::from_unix_nanos(EVALUATED_AT))
+        Timestamp::from_unix_nanos(EVALUATED_AT)
     );
-    assert_ne!(stream.source_timestamp, stream.received_at);
+    assert_ne!(stream.source_timestamp, Some(stream.received_at));
     assert_ne!(stream.received_at, stream.evaluated_at);
     assert_eq!(stream.trading_status, Some(TradingStatus::Halted));
     assert_eq!(stream.trading_status_revision, Some(1));
     let status = seed
         .statuses
         .iter()
-        .find(|candidate| candidate.source_id.as_str() == "source-a")
+        .find(|candidate| candidate.source.as_str() == "source-a")
         .ok_or("sorted status seed lost source-a")?;
     assert_eq!(status.venue.as_str(), "coinbase");
     assert_eq!(status.instrument, state.instrument);
-    assert_eq!(status.generation.get(), 1);
-    assert_eq!(status.status, TradingStatus::Halted);
-    assert_eq!(status.revision, 1);
+    assert_eq!(status.connection_generation.get(), 1);
+    assert_eq!(status.trading_status, TradingStatus::Halted);
+    assert_eq!(status.status_revision, 1);
 
     let expected = exact_retained_bytes(&state)?;
     assert_eq!(seed.retained_bytes, expected);
@@ -195,7 +206,7 @@ fn byte_bound_truncates_deterministically_without_exceeding_exact_limit() -> Tes
         .ok_or("fixture lost source-a stream")?;
     let byte_limit = std::mem::size_of::<ProcessorSnapshotSeed>()
         .checked_add(stream_base_charge(first_key)?)
-        .and_then(|value| value.checked_add(std::mem::size_of::<BookLevel>()))
+        .and_then(|value| value.checked_add(std::mem::size_of::<BookLevelSnapshot>()))
         .ok_or("test byte limit overflow")?;
     let limits = ProcessorSnapshotLimits::try_new(1, 3, CONFIGURED_DEPTH, byte_limit)?;
 
@@ -210,16 +221,58 @@ fn byte_bound_truncates_deterministically_without_exceeding_exact_limit() -> Tes
     assert!(!seed.streams_complete);
     assert!(!seed.statuses_complete);
     let stream = seed.streams.first().ok_or("byte-bound seed lost stream")?;
-    assert_eq!(stream.key.source_id().as_str(), "source-a");
-    assert_eq!(stream.requested_depth, CONFIGURED_DEPTH);
-    assert_eq!(stream.total_bid_levels, 3);
-    assert_eq!(stream.total_ask_levels, 2);
-    assert_eq!(stream.output_bid_levels, 1);
-    assert_eq!(stream.output_ask_levels, 0);
-    assert!(!stream.bids_complete);
-    assert!(!stream.asks_complete);
+    assert_eq!(stream.source.as_str(), "source-a");
+    assert_eq!(
+        stream.bid_dimension.configured_limit(),
+        u32::try_from(CONFIGURED_DEPTH)?
+    );
+    assert_eq!(stream.state_bid_depth, 3);
+    assert_eq!(stream.state_ask_depth, 2);
+    assert_eq!(stream.bid_dimension.returned(), 1);
+    assert_eq!(stream.ask_dimension.returned(), 0);
+    assert_eq!(
+        stream.bid_dimension.completeness(),
+        SnapshotCompleteness::Truncated
+    );
+    assert_eq!(
+        stream.ask_dimension.completeness(),
+        SnapshotCompleteness::Unavailable
+    );
     assert_eq!(prices(&stream.bids), [10_000]);
     assert!(stream.asks.is_empty());
+    Ok(())
+}
+
+#[test]
+fn route_finalization_reuses_stream_status_and_book_allocations() -> TestResult {
+    let state = populated_state()?;
+    let limits =
+        ProcessorSnapshotLimits::try_new(3, 3, CONFIGURED_DEPTH, MAX_SNAPSHOT_RETAINED_BYTES)?;
+    let seed = snapshot(&state, limits)?;
+    let streams = seed.streams.as_ptr();
+    let statuses = seed.statuses.as_ptr();
+    let bids = seed
+        .streams
+        .first()
+        .ok_or("missing direct-final stream")?
+        .bids
+        .as_ptr();
+    let route = seed.into_route(crate::ShardKey::new(
+        market_squawk_domain::VenueId::try_from("coinbase")?,
+        state.instrument,
+    ));
+
+    assert_eq!(route.streams.as_ptr(), streams);
+    assert_eq!(route.statuses.as_ptr(), statuses);
+    assert_eq!(
+        route
+            .streams
+            .first()
+            .ok_or("missing finalized stream")?
+            .bids
+            .as_ptr(),
+        bids
+    );
     Ok(())
 }
 
@@ -239,18 +292,18 @@ fn snapshot(
 fn stream_sources(seed: &ProcessorSnapshotSeed) -> Vec<&str> {
     seed.streams
         .iter()
-        .map(|stream| stream.key.source_id().as_str())
+        .map(|stream| stream.source.as_str())
         .collect()
 }
 
 fn status_sources(seed: &ProcessorSnapshotSeed) -> Vec<&str> {
     seed.statuses
         .iter()
-        .map(|status| status.source_id.as_str())
+        .map(|status| status.source.as_str())
         .collect()
 }
 
-fn prices(levels: &[BookLevel]) -> Vec<i64> {
+fn prices(levels: &[BookLevelSnapshot]) -> Vec<i64> {
     levels.iter().map(|level| level.price().get()).collect()
 }
 
@@ -275,7 +328,7 @@ fn exact_retained_bytes(state: &PopulatedState) -> TestResult<usize> {
                             .book()
                             .ask_level_count(),
                     )
-                    .and_then(|count| count.checked_mul(std::mem::size_of::<BookLevel>()))
+                    .and_then(|count| count.checked_mul(std::mem::size_of::<BookLevelSnapshot>()))
                     .ok_or("level accounting overflow")?;
                 total
                     .checked_add(stream_base_charge(key)?)

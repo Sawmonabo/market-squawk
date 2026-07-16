@@ -5,9 +5,9 @@ use std::sync::Arc;
 
 use market_squawk_domain::{
     ConnectionGeneration, InstrumentId, PriceTicks, ProviderChannel, ProviderProduct, QuantityLots,
-    SourceId, Timestamp, TradingStatus, VenueId,
+    SequenceNumber, SourceId, Timestamp, TradingStatus, VenueId,
 };
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use thiserror::Error;
 use tokio::sync::OwnedSemaphorePermit;
 
@@ -32,7 +32,7 @@ pub(crate) const MAX_SNAPSHOT_LEVELS_PER_SIDE: u32 = 10_000;
 pub(crate) const MAX_SNAPSHOT_RETAINED_BYTES: u32 = 64 * 1024 * 1024;
 
 /// Whether one independently bounded snapshot dimension is complete.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SnapshotCompleteness {
     /// Every available item is represented.
@@ -44,7 +44,7 @@ pub enum SnapshotCompleteness {
 }
 
 /// Counts and configured output policy for one independently bounded dimension.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SnapshotDimension {
     completeness: SnapshotCompleteness,
@@ -105,7 +105,7 @@ impl SnapshotDimension {
 }
 
 /// Actor lifecycle at one exact shard publication revision.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ShardLifecycleSnapshot {
     Starting,
@@ -116,7 +116,7 @@ pub enum ShardLifecycleSnapshot {
 }
 
 /// Synchronization phase of one source/product/channel stream.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StreamPhaseSnapshot {
     Disconnected,
@@ -127,7 +127,7 @@ pub enum StreamPhaseSnapshot {
 }
 
 /// One scaled integer price level in an immutable diagnostic snapshot.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BookLevelSnapshot {
     price: PriceTicks,
@@ -149,7 +149,7 @@ impl BookLevelSnapshot {
 }
 
 /// Cross-channel trading status retained separately from stream state.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StatusSnapshot {
     pub(crate) source: SourceId,
@@ -182,7 +182,7 @@ impl StatusSnapshot {
 }
 
 /// Complete bounded view of one independently synchronized provider stream.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StreamSnapshot {
     pub(crate) source: SourceId,
@@ -193,12 +193,17 @@ pub struct StreamSnapshot {
     pub(crate) connection_generation: ConnectionGeneration,
     pub(crate) phase: StreamPhaseSnapshot,
     pub(crate) state_revision: u64,
+    pub(crate) last_sequence: Option<SequenceNumber>,
     pub(crate) snapshot_origin_revision: Option<u64>,
+    pub(crate) snapshot_initialized: bool,
+    pub(crate) generation_current: bool,
     pub(crate) health_epoch: u64,
     pub(crate) source_valid_until: Timestamp,
     pub(crate) source_timestamp: Option<Timestamp>,
     pub(crate) received_at: Timestamp,
     pub(crate) evaluated_at: Timestamp,
+    pub(crate) trading_status: Option<TradingStatus>,
+    pub(crate) trading_status_revision: Option<u64>,
     pub(crate) configured_depth: u32,
     pub(crate) state_bid_depth: usize,
     pub(crate) state_ask_depth: usize,
@@ -233,8 +238,17 @@ impl StreamSnapshot {
     pub const fn state_revision(&self) -> u64 {
         self.state_revision
     }
+    pub const fn last_sequence(&self) -> Option<SequenceNumber> {
+        self.last_sequence
+    }
     pub const fn snapshot_origin_revision(&self) -> Option<u64> {
         self.snapshot_origin_revision
+    }
+    pub const fn snapshot_initialized(&self) -> bool {
+        self.snapshot_initialized
+    }
+    pub const fn generation_current(&self) -> bool {
+        self.generation_current
     }
     pub const fn health_epoch(&self) -> u64 {
         self.health_epoch
@@ -250,6 +264,12 @@ impl StreamSnapshot {
     }
     pub const fn evaluated_at(&self) -> Timestamp {
         self.evaluated_at
+    }
+    pub const fn trading_status(&self) -> Option<TradingStatus> {
+        self.trading_status
+    }
+    pub const fn trading_status_revision(&self) -> Option<u64> {
+        self.trading_status_revision
     }
     pub const fn configured_depth(&self) -> u32 {
         self.configured_depth
@@ -275,7 +295,7 @@ impl StreamSnapshot {
 }
 
 /// Bounded state for one venue/instrument owner.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouteSnapshot {
     pub(crate) route: ShardKey,
@@ -304,7 +324,7 @@ impl RouteSnapshot {
 }
 
 /// Complete immutable publication from one single-writer shard actor.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ShardSnapshot {
     pub(crate) routing_version: ShardRoutingVersion,
@@ -451,7 +471,7 @@ impl LiveSnapshotLease {
 }
 
 /// Revision metadata for one shard in a non-atomic cross-shard read.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ShardSnapshotRevision {
     shard_id: ShardId,

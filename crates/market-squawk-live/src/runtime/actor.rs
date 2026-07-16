@@ -7,9 +7,6 @@ use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-#[path = "actor/snapshot.rs"]
-mod snapshot;
-
 use super::admission::{
     LiveRuntimeHealthEvent, LiveRuntimeHealthKind, RegistrationCommand, RegistrationFailure,
     ShardCommand,
@@ -25,8 +22,6 @@ use crate::{
     RouteSnapshot, ShardId, ShardLifecycleSnapshot, ShardRoutingVersion, ShardSnapshot,
     SnapshotDimension, SnapshotLimits,
 };
-
-use snapshot::route_from_seed;
 
 #[derive(Debug)]
 struct RouteOwner {
@@ -493,7 +488,7 @@ impl ShardActor {
                 break;
             }
             retained_bytes = candidate_retained_bytes;
-            routes.push(route_from_seed(key, seed)?);
+            routes.push(seed.into_route(key));
         }
         let route_dimension =
             SnapshotDimension::from_counts(available_routes, routes.len(), route_limit)?;

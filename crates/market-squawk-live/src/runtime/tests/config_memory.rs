@@ -10,8 +10,9 @@ use rust_decimal::Decimal;
 use super::{
     ACTOR_FIXED_BYTES, CHANNEL_COMMAND_SLOT_BYTES, CONTROL_SLOT_BYTES, EXACT_BOOK_LEVEL_BYTES,
     HEALTH_EVENT_BYTES, NONCE_SLOT_BYTES, ROUTE_FIXED_BYTES, SCALED_BOOK_LEVEL_BYTES,
-    SNAPSHOT_NOTIFICATION_BYTES, SOURCE_ADMISSION_BYTES, add, estimate_peak_bytes, multiply,
-    persistent_stream_bytes,
+    SNAPSHOT_NOTIFICATION_BYTES, SNAPSHOT_ROUTE_SORT_SCRATCH_BYTES,
+    SNAPSHOT_STATUS_SORT_SCRATCH_BYTES, SNAPSHOT_STREAM_SORT_SCRATCH_BYTES, SOURCE_ADMISSION_BYTES,
+    add, estimate_peak_bytes, multiply, persistent_stream_bytes,
 };
 use crate::runtime::{
     LiveRouteConfig, LiveRouteConfigInput, LiveRuntimeConfig, LiveRuntimeConfigError,
@@ -110,7 +111,8 @@ fn route_state_nonce_source_stream_and_dual_book_terms_have_exact_deltas() -> Te
     let expected_route = ROUTE_FIXED_BYTES
         + 8 * NONCE_SLOT_BYTES
         + 2 * SOURCE_ADMISSION_BYTES
-        + 2 * persistent_stream_bytes(4)?;
+        + 2 * persistent_stream_bytes(4)?
+        + SNAPSHOT_ROUTE_SORT_SCRATCH_BYTES;
     assert_eq!(with_second - base, expected_route);
 
     let larger_nonce = estimate(input()?, &[route(INSTRUMENT_ONE, 4, 9)?])?;
@@ -126,7 +128,12 @@ fn route_state_nonce_source_stream_and_dual_book_terms_have_exact_deltas() -> Te
     more_streams.maximum_streams_per_route = 3;
     let more_streams_input = more_streams.clone();
     let more_streams = estimate(more_streams, std::slice::from_ref(&base_route))?;
-    assert_eq!(more_streams - base, persistent_stream_bytes(4)?);
+    let per_stream_sort_scratch =
+        SNAPSHOT_STREAM_SORT_SCRATCH_BYTES + SNAPSHOT_STATUS_SORT_SCRATCH_BYTES;
+    assert_eq!(
+        more_streams - base,
+        persistent_stream_bytes(4)? + 2 * per_stream_sort_scratch
+    );
 
     let mut more_sources = more_streams_input;
     more_sources.maximum_sources_per_route = 3;
@@ -147,7 +154,12 @@ fn one_route_charges_every_persistent_book_for_one_or_sixty_four_streams() -> Te
     sixty_four.maximum_sources_per_route = 1;
     sixty_four.maximum_streams_per_route = 64;
     let sixty_four = estimate(sixty_four, &routes)?;
-    assert_eq!(sixty_four - one, 63 * persistent_stream_bytes(10)?);
+    let per_stream_sort_scratch =
+        SNAPSHOT_STREAM_SORT_SCRATCH_BYTES + SNAPSHOT_STATUS_SORT_SCRATCH_BYTES;
+    assert_eq!(
+        sixty_four - one,
+        63 * (persistent_stream_bytes(10)? + 2 * per_stream_sort_scratch)
+    );
     Ok(())
 }
 
@@ -164,7 +176,10 @@ fn expanded_stream_accounting_rejects_the_former_single_book_ceiling() -> TestRe
     expanded.maximum_streams_per_route = 64;
     expanded.maximum_runtime_bytes = former_ceiling;
     let expanded = LiveRuntimeConfig::try_new(expanded)?;
-    let expected = former_ceiling + 63 * persistent_stream_bytes(10)?;
+    let per_stream_sort_scratch =
+        SNAPSHOT_STREAM_SORT_SCRATCH_BYTES + SNAPSHOT_STATUS_SORT_SCRATCH_BYTES;
+    let expected =
+        former_ceiling + 63 * (persistent_stream_bytes(10)? + 2 * per_stream_sort_scratch);
     assert!(matches!(
         estimate_peak_bytes(&expanded, &routes),
         Err(LiveRuntimeConfigError::PeakMemoryExceedsCeiling {
@@ -190,6 +205,7 @@ fn one_more_shard_charges_mailbox_candidate_control_snapshot_and_actor() -> Test
         + 2 * 512
         + 2 * CONTROL_SLOT_BYTES
         + 2 * 4_096
+        + 2 * (SNAPSHOT_STREAM_SORT_SCRATCH_BYTES + SNAPSHOT_STATUS_SORT_SCRATCH_BYTES)
         + ACTOR_FIXED_BYTES
         + SNAPSHOT_NOTIFICATION_BYTES;
     assert_eq!(three_shards - base, expected_delta);

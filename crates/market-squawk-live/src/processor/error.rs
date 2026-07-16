@@ -5,6 +5,7 @@ use thiserror::Error;
 use crate::authority::AuthorityError;
 use crate::provider_book::ProviderBookError;
 use crate::qualification::QualificationBuildError;
+use crate::snapshot::SnapshotBuildError;
 use crate::{GenerationStateError, NormalizationError, SequenceValidationError};
 
 #[derive(Debug, Error)]
@@ -19,6 +20,8 @@ pub(crate) enum LiveApplyError {
     InvalidSnapshotLimits,
     #[error("processor snapshot retained-byte accounting overflowed")]
     SnapshotRetainedSizeOverflow,
+    #[error(transparent)]
+    SnapshotBuild(#[from] SnapshotBuildError),
     #[error("bounded live allocation failed")]
     Allocation,
     #[error("batch instrument does not match the instrument owner")]
@@ -101,6 +104,7 @@ impl LiveApplyError {
             | Self::InvalidCapabilityLifetime
             | Self::InvalidSnapshotLimits
             | Self::SnapshotRetainedSizeOverflow
+            | Self::SnapshotBuild(_)
             | Self::Allocation
             | Self::GenerationCapacityExhausted
             | Self::StatusCapacityExhausted

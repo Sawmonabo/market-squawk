@@ -21,7 +21,7 @@ use crate::authority::{
     AppliedObservationAuthority, AuthorityError, ClockReading, RuntimeLeaseOwner,
     ScriptedTrustedClock, ShardLeaseOwner,
 };
-use crate::{DepthLimit, GenerationPhase};
+use crate::{DepthLimit, StreamPhaseSnapshot};
 
 fn fixed_clock() -> TestResult<ScriptedTrustedClock> {
     let reading = ClockReading::new(Timestamp::from_unix_nanos(EVALUATED_AT), Instant::now());
@@ -310,22 +310,19 @@ fn committed_seed_is_sorted_truncated_and_exactly_base_charged() -> TestResult {
     assert_eq!(seed.output_status_count, 1);
     assert!(!seed.streams_complete);
     assert!(!seed.statuses_complete);
-    assert_eq!(stream.key.source_id().as_str(), "source-a");
-    assert_eq!(status.source_id.as_str(), "source-a");
-    assert_eq!(stream.phase, GenerationPhase::Healthy);
-    assert_eq!(stream.revision, 1);
+    assert_eq!(stream.source.as_str(), "source-a");
+    assert_eq!(status.source.as_str(), "source-a");
+    assert_eq!(stream.phase, StreamPhaseSnapshot::Healthy);
+    assert_eq!(stream.state_revision, 1);
     assert_eq!(stream.health_epoch, 1);
     assert_eq!(
         stream.source_valid_until,
-        Some(Timestamp::from_unix_nanos(VALID_UNTIL))
+        Timestamp::from_unix_nanos(VALID_UNTIL)
     );
-    assert_eq!(
-        stream.received_at,
-        Some(Timestamp::from_unix_nanos(FRAME_AT))
-    );
+    assert_eq!(stream.received_at, Timestamp::from_unix_nanos(FRAME_AT));
     assert_eq!(
         stream.evaluated_at,
-        Some(Timestamp::from_unix_nanos(EVALUATED_AT))
+        Timestamp::from_unix_nanos(EVALUATED_AT)
     );
     let expected_retained = std::mem::size_of::<ProcessorSnapshotSeed>()
         + std::mem::size_of::<StreamSnapshotSeed>()
@@ -375,7 +372,7 @@ fn late_delta_expiry_rolls_back_book_sequence_revision_and_status() -> TestResul
     let before_stream = before.streams.first().ok_or("missing prior stream")?;
     let before_bids = before_stream.bids.to_vec();
     let before_asks = before_stream.asks.to_vec();
-    let before_revision = before_stream.revision;
+    let before_revision = before_stream.state_revision;
     let before_sequence = before_stream.last_sequence;
     let before_status_revision = before_stream.trading_status_revision;
 
@@ -395,9 +392,9 @@ fn late_delta_expiry_rolls_back_book_sequence_revision_and_status() -> TestResul
 
     let after = processor.snapshot_seed(limits)?;
     let after_stream = after.streams.first().ok_or("missing rolled-back stream")?;
-    assert_eq!(after_stream.phase, GenerationPhase::Quarantined);
+    assert_eq!(after_stream.phase, StreamPhaseSnapshot::Quarantined);
     assert!(!after_stream.generation_current);
-    assert_eq!(after_stream.revision, before_revision);
+    assert_eq!(after_stream.state_revision, before_revision);
     assert_eq!(after_stream.last_sequence, before_sequence);
     assert_eq!(after_stream.bids.as_ref(), before_bids.as_slice());
     assert_eq!(after_stream.asks.as_ref(), before_asks.as_slice());
@@ -420,7 +417,7 @@ fn status_and_stream_revision_transitions_revoke_prior_authority() -> TestResult
             .statuses
             .first()
             .ok_or("missing initial status")?
-            .revision,
+            .status_revision,
         1
     );
     let (_, second_trade) = ready
@@ -452,13 +449,13 @@ fn status_and_stream_revision_transitions_revoke_prior_authority() -> TestResult
     let stream = halted_seed.streams.first().ok_or("missing status stream")?;
     assert_eq!(stream.trading_status, Some(TradingStatus::Halted));
     assert_eq!(stream.trading_status_revision, Some(2));
-    assert_eq!(stream.revision, 3);
+    assert_eq!(stream.state_revision, 3);
     assert_eq!(
         halted_seed
             .statuses
             .first()
             .ok_or("missing halted status")?
-            .revision,
+            .status_revision,
         2
     );
 
@@ -482,7 +479,7 @@ fn status_and_stream_revision_transitions_revoke_prior_authority() -> TestResult
             .statuses
             .first()
             .ok_or("missing resumed status")?
-            .revision,
+            .status_revision,
         3
     );
     Ok(())
@@ -494,8 +491,14 @@ fn status_allocation_overflow_preserves_last_good_status_and_stream_revision() -
     let limits = ProcessorSnapshotLimits::try_new(8, 8, 8, 64 * 1024)?;
     let before = ready.processor.snapshot_seed(limits)?;
     let stream = before.streams.first().ok_or("missing current stream")?;
-    let key = stream.key.clone();
-    let before_revision = stream.revision;
+    let key = ready
+        .processor
+        .streams
+        .keys()
+        .next()
+        .ok_or("missing current stream key")?
+        .clone();
+    let before_revision = stream.state_revision;
     ready
         .processor
         .statuses
@@ -515,12 +518,12 @@ fn status_allocation_overflow_preserves_last_good_status_and_stream_revision() -
     let after = ready.processor.snapshot_seed(limits)?;
     let after_stream = after.streams.first().ok_or("missing overflow stream")?;
     let after_status = after.statuses.first().ok_or("missing overflow status")?;
-    assert_eq!(after_stream.phase, GenerationPhase::Quarantined);
-    assert_eq!(after_stream.revision, before_revision);
+    assert_eq!(after_stream.phase, StreamPhaseSnapshot::Quarantined);
+    assert_eq!(after_stream.state_revision, before_revision);
     assert_eq!(after_stream.trading_status, Some(TradingStatus::Active));
     assert_eq!(after_stream.trading_status_revision, Some(u64::MAX));
-    assert_eq!(after_status.status, TradingStatus::Active);
-    assert_eq!(after_status.revision, u64::MAX);
+    assert_eq!(after_status.trading_status, TradingStatus::Active);
+    assert_eq!(after_status.status_revision, u64::MAX);
     Ok(())
 }
 

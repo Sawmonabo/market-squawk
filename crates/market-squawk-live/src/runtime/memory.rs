@@ -32,6 +32,13 @@ const CHANNEL_COMMAND_SLOT_BYTES: u64 = 128;
 const CONTROL_SLOT_BYTES: u64 = 256;
 const HEALTH_EVENT_BYTES: u64 = 512;
 const SNAPSHOT_NOTIFICATION_BYTES: u64 = 256;
+/// Cloned route identity plus Vec/allocator slack retained while one actor sorts route ownership.
+const SNAPSHOT_ROUTE_SORT_SCRATCH_BYTES: u64 =
+    size_of::<crate::ShardKey>() as u64 + VenueId::MAX_LENGTH as u64 + 64;
+/// Two references plus Vec/allocator slack retained while one route sorts stream entries.
+const SNAPSHOT_STREAM_SORT_SCRATCH_BYTES: u64 = 64;
+/// Status key reference/value tuple plus Vec/allocator slack retained during status sorting.
+const SNAPSHOT_STATUS_SORT_SCRATCH_BYTES: u64 = 64;
 
 /// Conservative checked peak retained bytes for every configured runtime component.
 pub(super) fn estimate_peak_bytes(
@@ -86,13 +93,26 @@ pub(super) fn estimate_peak_bytes(
     let snapshot_bytes = u64::from(config.snapshot_limits().maximum_retained_bytes().get());
     // One under construction and one currently published per actor.
     total = add(total, multiply(multiply(shards, snapshot_bytes)?, 2)?)?;
-    // The official retained-reader budget is runtime-wide, not multiplied by shard count.
+    // The official retained-reader budget is runtime-wide and weighted: a single-shard lease
+    // consumes one permit, while `try_load_all` consumes one permit for every retained shard.
+    // Therefore each permit can retain at most one per-shard publication and is not multiplied by
+    // shard count a second time here.
     total = add(
         total,
         multiply(
             u64::from(config.maximum_retained_snapshot_readers().get()),
             snapshot_bytes,
         )?,
+    )?;
+    // Every shard may construct concurrently. Route-key scratch scales with configured routes;
+    // one maximum-sized stream/status ordering workspace may coexist in each actor.
+    total = add(
+        total,
+        multiply(routes.len() as u64, SNAPSHOT_ROUTE_SORT_SCRATCH_BYTES)?,
+    )?;
+    total = add(
+        total,
+        multiply(shards, per_actor_snapshot_sort_scratch(config)?)?,
     )?;
 
     total = add(
@@ -114,6 +134,18 @@ pub(super) fn estimate_peak_bytes(
         });
     }
     NonZeroU64::new(total).ok_or(LiveRuntimeConfigError::CapacityOverflow)
+}
+
+fn per_actor_snapshot_sort_scratch(
+    config: &LiveRuntimeConfig,
+) -> Result<u64, LiveRuntimeConfigError> {
+    multiply(
+        config.maximum_streams_per_route().get() as u64,
+        add(
+            SNAPSHOT_STREAM_SORT_SCRATCH_BYTES,
+            SNAPSHOT_STATUS_SORT_SCRATCH_BYTES,
+        )?,
+    )
 }
 
 fn persistent_stream_bytes(depth: usize) -> Result<u64, LiveRuntimeConfigError> {
