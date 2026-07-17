@@ -2,13 +2,14 @@
 
 **Date:** 2026-07-16
 **Base commit:** `834674aa40198656b4486c4c64dec1fa788eae29`
-**Status:** Approved design captured from the evidence-backed Q3 preflight
+**Status:** Proposed for Q3 execution after Q2 approval
 **Supersedes:** Tasks 9–12 of
 `docs/superpowers/plans/2026-07-16-market-squawk-stage-1-foundation.md`
 
 ## Purpose
 
-This design closes the production-boundary gaps between the existing Q2 live/source/platform
+This proposed design closes the production-boundary gaps between the existing Q2
+live/source/platform
 foundation and a complete Q3 live decision and paper-execution pipeline. It replaces the former
 Tasks 9–12 where those tasks would underbuild the product specification, contradict existing
 authority boundaries, or overstate diagnostic compatibility as production capability.
@@ -254,7 +255,9 @@ Risk uses no caller-authored current position, balance, account view, or action 
 execution-owned `AccountRiskCoordinator` maintains authoritative account revision, balances,
 positions, capital, exposure, leverage, losses, drawdown, rates, and duplicate state. It issues a
 private, expiring `AccountRiskReservation` so concurrent shards cannot jointly exceed an account
-limit.
+limit. Accounts are deterministically partitioned into startup-sized single-writer critical sections;
+the live hook uses nonblocking acquisition. Contention fails closed with a typed rejection and zero
+mutation rather than blocking an instrument actor on an unbounded lock or response queue.
 
 `RiskService::evaluate` receives an intent, bounded market reference, a
 `LiveExecutionCapability` by value, and the actor-scoped `CurrentAuthorityGate`. It consumes the
@@ -311,24 +314,31 @@ Expected provider faults become typed recovery or quarantine outcomes. `DecodeIn
 reserved for allocation, retained-size, or implementation invariant failures. Stateful sequence,
 snapshot, checksum, tick/lot, book, freshness, and trading-status qualification remains in live.
 
-`ValidatedCurrentSourceAuthority::validate_decode_outcome_owned` consumes any outcome and its exact
+Capture binding and current coverage are intentionally separate authority upgrades. First,
+`ValidatedSourceSession::validate_decode_outcome_owned` consumes any outcome and its exact
 `CaptureAdmissionReceipt`, validates allocation identity and every frame/digest/rule dimension, and
-returns:
+returns a non-cloneable, non-Serde session-bound value:
 
 ```rust
-pub enum CurrentDecodeOutcome {
-    Data(CurrentDecodedProviderBatches),
-    Control(CurrentControlDisposition),
-    Ignored(CurrentIgnoredDisposition),
-    Resynchronize(CurrentRecoveryDisposition),
-    Quarantine(CurrentQuarantineDisposition),
+pub enum ValidatedSessionDecodeOutcome {
+    Data(CapturedDecodedProviderBatch),
+    Control(SessionControlDisposition),
+    Ignored(SessionIgnoredDisposition),
+    Resynchronize(SessionRecoveryDisposition),
+    Quarantine(SessionQuarantineDisposition),
 }
 ```
 
-Only `Data` reaches shard ingress. Control frames may update connection/transport health but never
-market freshness. Ignored frames produce bounded audit/counters without live mutation. Recovery and
-quarantine dispositions stop market eligibility and are acted on only by the app supervisor.
-Deserialized or replayed dispositions have no current authority.
+The app-owned per-generation subscription state machine consumes session-bound control outcomes.
+Only an exact acknowledgement for the configured product/channel set may establish current coverage
+health. Data before that acknowledgement fails closed and cannot reach current authority or shard
+ingress. After acknowledgement,
+`ValidatedCurrentSourceAuthority::validate_data_outcome_owned(CapturedDecodedProviderBatch)` performs
+the second upgrade and returns `CurrentDecodedProviderBatches`. Control frames may update
+connection/transport health but never market freshness. Ignored frames produce bounded
+audit/counters without live mutation. Recovery and quarantine dispositions stop market eligibility
+and are acted on only by the app supervisor. Deserialized or replayed outcomes have no current
+authority.
 
 All outcomes report checked retained bytes. Non-data audit uses bounded count and byte queues. Audit
 saturation invalidates the generation instead of silently losing an integrity decision.
@@ -372,10 +382,15 @@ normalization remains in the live processor against the current `InstrumentDefin
 does not duplicate it.
 
 The app production composition owns the authoritative registry, source metadata/session/health,
-shared budget, frame factory, capture publisher, decoder, current-outcome validator, route-bound
-ingress, and supervisor. Configuration includes explicit provider-product to internal-instrument
-mapping, venue, tick/lot definition, subscription bounds, frame bounds, endpoint allowlist, and
-freshness policy. Production IDs are not hardcoded in the adapter.
+shared budget, frame factory, capture publisher, decoder, two-stage session/current validators,
+bounded per-generation subscription/control state, route-bound ingress, and supervisor.
+Configuration includes explicit provider-product to internal-instrument mapping, venue, tick/lot
+definition, subscription bounds, frame bounds, endpoint allowlist, and freshness policy. Production
+IDs are not hardcoded in the adapter. The state machine does not declare current coverage before the
+exact subscription acknowledgement; data-before-ack, acknowledgement mismatch, control/audit queue
+saturation, or control-state overflow invalidates the generation. Ping/pong and heartbeat prove only
+transport/feed liveness. Every control queue, retained identifier, transition counter, and audit
+record participates in startup memory accounting.
 
 Coinbase remains `DirectUnverified`; no test or documentation promotes it to execution eligibility.
 
@@ -409,10 +424,24 @@ It owns:
 - Cancellation/fill race ordering by deterministic event time and sequence.
 - Reconciliation snapshots and reconciliation-required uncertain states.
 
-`DispatchOrder` carries a bounded immutable market reference with top/depth, observed time,
-tick/lot identity, quality, and authority evidence. Resting orders consume subsequent private
-`ExecutionMarketUpdate` values admitted by the execution layer; the adapter cannot construct them
-from arbitrary app DTOs.
+`DispatchOrder` carries a bounded immutable market reference with top/depth, observed time, quality,
+and authority evidence. It also freezes the validated instrument-definition revision and exact
+execution terms: price tick, lot size, quote and settlement currency, and positive exact contract
+multiplier where applicable. Paper accounting converts ticks times lots times exact execution terms
+to `Money` with checked decimal arithmetic; it never assumes raw ticks equal currency minor units.
+Terms from another instrument/revision, an inexact scale, an unsupported settlement denomination,
+or a currency mismatch fail before reservation or mutation. Resting orders consume subsequent
+private `ExecutionMarketUpdate` values admitted by the execution layer; the adapter cannot construct
+them from arbitrary app DTOs.
+
+The simulator implements market, limit, stop, and stop-limit orders and Day, GTC, IOC, and FOK time
+in force. Latency expires before eligibility. Crossing limits may take liquidity; non-crossing
+limits rest with stable price/time priority. Stops trigger from the configured canonical reference;
+stop-limits activate as limits. Day expiry uses a configured venue-session calendar/time zone rather
+than process-local midnight. Each bounded market-liquidity update is allocated once across all
+eligible competing orders, preventing two orders from consuming the same displayed quantity.
+Maker/taker classification, partial-fill continuation, slippage, fees, and cancellation races are
+deterministic and auditable.
 
 Compatibility metadata may truthfully describe immediate/full-fill behavior as `Modeled`, but such
 behavior remains `Partial` and is not the Q3 acceptance target.
@@ -443,6 +472,25 @@ stop source producers
 No worker or blocking task is detached after a deadline. Owned pending work remains inspectable and
 reapable under the existing platform lifecycle pattern.
 
+A post-commit feature arithmetic/capacity failure does not roll back or actor-fatally discard an
+already committed market observation. The route transactionally publishes an unavailable/overflow
+feature disposition, suppresses action for that observation, emits bounded health, and continues
+processing. The paper worker and its audit-reader consumer are owned by Wave 3 application services;
+shutdown closes production, drains/reconciles by deadline, flushes the controlled local audit, and
+joins both tasks. No paper task is detached and no audit receiver is left unconsumed.
+
+Platform provides a domain-agnostic controlled, bounded, checksum-framed audit journal and has no
+dependency on execution or paper DTOs. The app validates and serializes canonical execution/risk/
+paper records into that journal. A journal-writer failure revokes future action production and
+forces reconciliation while the live event path remains nonblocking and never waits on disk.
+
+Before action startup, the app validates journal/checkpoint version, monotonic sequence, framing,
+and checksum/hash-chain continuity; applies an explicit torn-final-tail policy; and reconstructs
+orders, fills, cash, positions, reservations, idempotency, and reconciliation state. Duplicate,
+reordered, missing, corrupted-complete, unsupported-version, or inconsistent records fail closed.
+Incomplete recovery publishes `ReconciliationRequired` and prevents every new submission; the
+system never silently starts paper accounting from an empty state.
+
 ## Privacy, lawful access, and anti-evasion exclusions
 
 Q3 preserves local-first operation, no mandatory cloud/database/container/telemetry dependency,
@@ -462,6 +510,12 @@ backoff, `Retry-After`, cache/local persistence, coverage metadata, and source f
 there is no rotation/evasion surface.
 
 ## Verification and review design
+
+Execution must start from the formally approved integrated Q2 commit, not automatically from the
+base commit recorded above. Before Q3 work begins, the integration owner rebases the plan branch or
+creates fresh implementation worktrees at that approved commit, refreshes every source line anchor
+and base-commit reference, reruns the complete local baseline, and records the reviewed Q2 evidence.
+Local command success is local evidence only; it does not prove that hosted CI ran or passed.
 
 Every task uses red-green TDD, focused tests, strict Clippy, and a small commit. External network
 tests remain ignored and opt-in; deterministic local WebSocket tests remain in the default suite.
@@ -489,9 +543,12 @@ The grouped Q3 review after the superseding Tasks 9–12 uses independent specia
 Q3 is not accepted if Coinbase is described as `DirectVerified`, any submission path bypasses risk,
 caller-authored time/account data can authorize action, a control frame becomes a market event, a
 reconnect reuses a generation, a required feature is absent, paper lacks realistic behavior, or any
-new retained state is missing from the peak-memory proof.
+new retained state is missing from the peak-memory proof. It is also not accepted with incomplete
+startup recovery, a detached/unconsumed paper or audit worker, a platform-to-execution dependency,
+or any unresolved substantiated quarter-review finding. Hosted CI, when present, is recorded
+separately and is not required for local approval.
 
-## Resolved decisions
+## Proposed execution decisions
 
 - The design uses a live-owned hook implemented by execution; no dependency cycle is allowed.
 - Live remains the sole capability issuer/consumer; execution owns approval and dispatch one-time

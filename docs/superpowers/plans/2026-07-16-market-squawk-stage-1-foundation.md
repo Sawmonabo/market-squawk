@@ -1162,7 +1162,7 @@ git add crates/market-squawk-live apps/market-squawk
 git commit -m "feat(live): add deterministic single-writer shards"
 ```
 
----
+> **Tasks 9–12 are historical and superseded:** do not execute them; use the [Q3 production plan](2026-07-16-market-squawk-q3-production-plan.md) governed by the [Q3 production design](../specs/2026-07-16-market-squawk-q3-production-design.md).
 
 ## Task 9: Extract pure online feature kernels with explicit warm-up and arithmetic policy
 
