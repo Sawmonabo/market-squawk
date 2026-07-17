@@ -172,6 +172,51 @@
     }
 
     #[test]
+    fn retained_authorities_enforce_acceptance_wall_bound_after_partial_rollback() -> TestResult {
+        use std::str::FromStr;
+
+        let mut harness = HealthHarness::new("trusted-time-acceptance-wall")?;
+        harness.accept_health(10, 20, 30, 1_000)?;
+        harness.set_time(30, 30)?;
+        let current = harness
+            .registry
+            .validate_current_authority(&harness.session)?;
+        let lease = current.try_current_lease()?;
+        let scope = current.validate_live_scope(
+            &VenueId::try_from("coinbase")?,
+            InstrumentId::from_str("4c74ab95-53b9-42ad-9b66-0ed403b88fed")?,
+            LiveEventClass::Trade,
+            None,
+        )?;
+        let queued = scope.queued_authority_for_test();
+        let event_at = harness.timestamp(10)?;
+
+        lease.validate_at(event_at)?;
+        scope.validate_at(event_at)?;
+        queued.validate_at(event_at)?;
+
+        harness.set_time(25, 40)?;
+        assert_eq!(
+            lease.validate_at(event_at),
+            Err(RegistryError::HealthNotQualified)
+        );
+        assert_eq!(
+            scope.validate_at(event_at),
+            Err(RegistryError::HealthNotQualified)
+        );
+        assert_eq!(
+            queued.validate_at(event_at),
+            Err(RegistryError::HealthNotQualified)
+        );
+
+        harness.set_time(40, 50)?;
+        lease.validate_at(event_at)?;
+        scope.validate_at(event_at)?;
+        queued.validate_at(event_at)?;
+        Ok(())
+    }
+
+    #[test]
     fn unavailable_trusted_clock_is_failure_atomic_at_report_record_and_mint() -> TestResult {
         let mut harness = HealthHarness::new("trusted-time-unavailable")?;
         let before_report = harness.epoch_and_cursor();
@@ -252,6 +297,57 @@
         ));
         assert_eq!(restored.export_authority_state()?, before);
         assert!(restored.entries.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn distinct_source_capacity_is_enforced_before_any_registration_mutation() -> TestResult {
+        let at = Timestamp::from_unix_nanos(1);
+        let mut registry = AuthoritativeSourceRegistry::try_new()?;
+        let registered = registry.register(direct_metadata("capacity-source", "revision-1")?, at)?;
+        for index in 1..MAX_AUTHORITY_SOURCES {
+            let source_id = SourceId::try_from(format!("capacity-history-{index}"))?;
+            registry.history.insert(
+                source_id,
+                SourceAuthorityHistory {
+                    used_revisions: vec![MetadataRevision::new(SourceIdentifier::try_from(
+                        format!("revision-{index}"),
+                    )?)],
+                    last_epoch: 1,
+                    generation_high_water: None,
+                },
+            );
+        }
+        assert_eq!(registry.history.len(), MAX_AUTHORITY_SOURCES);
+
+        let replacement = registry.replace_metadata(
+            &registered,
+            direct_metadata("capacity-source", "revision-2")?,
+            at,
+        )?;
+        assert_eq!(replacement.revision.as_source_identifier().as_str(), "revision-2");
+        registry.revoke(&replacement, at)?;
+        let restored_state = registry.export_authority_state()?;
+        let mut registry =
+            AuthoritativeSourceRegistry::try_new_with_authority_state(restored_state)?;
+        registry.register(direct_metadata("capacity-source", "revision-3")?, at)?;
+        let before = registry.export_authority_state()?;
+        let budget_policies_before = registry.budgets.policies();
+        let entries_before = registry.entries.len();
+
+        assert!(matches!(
+            registry.register(
+                direct_metadata("capacity-overflow-source", "revision-1")?,
+                at,
+            ),
+            Err(RegistryError::AuthorityStateCapacity)
+        ));
+        assert_eq!(registry.export_authority_state()?, before);
+        assert_eq!(registry.budgets.policies(), budget_policies_before);
+        assert_eq!(registry.entries.len(), entries_before);
+        assert!(!registry
+            .entries
+            .contains_key(&SourceId::try_from("capacity-overflow-source")?));
         Ok(())
     }
 
@@ -419,4 +515,3 @@
         }
         Ok(())
     }
-

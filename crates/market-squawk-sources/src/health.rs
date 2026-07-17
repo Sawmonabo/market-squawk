@@ -112,6 +112,8 @@ pub enum CoverageHealth {
     Limited,
 }
 
+include!("health/allocation.rs");
+
 /// Stable, non-secret source error classification for health reporting.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]

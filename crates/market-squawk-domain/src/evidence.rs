@@ -31,6 +31,17 @@ impl VersionPinnedSourceLocator {
     pub const fn version(&self) -> &SourceIdentifier {
         &self.version
     }
+
+    /// Returns checked heap bytes retained by this locator's bounded identities.
+    ///
+    /// The exhaustive field binding intentionally makes every future retained field an explicit
+    /// allocation-accounting decision.
+    pub fn dynamic_retained_bytes(&self) -> Option<usize> {
+        let Self { reference, version } = self;
+        reference
+            .retained_bytes()
+            .checked_add(version.retained_bytes())
+    }
 }
 
 /// Mandatory algorithm-qualified content evidence for one exact source payload.
@@ -74,6 +85,20 @@ impl ExactPayloadEvidence {
     /// Returns optional version-pinned retrieval metadata.
     pub const fn version_pinned_locator(&self) -> Option<&VersionPinnedSourceLocator> {
         self.version_pinned_locator.as_ref()
+    }
+
+    /// Returns checked heap bytes retained by optional retrieval metadata.
+    ///
+    /// The digest is fixed-width inline storage. The exhaustive field binding intentionally makes
+    /// every future retained field an explicit allocation-accounting decision.
+    pub fn dynamic_retained_bytes(&self) -> Option<usize> {
+        let Self {
+            content_digest: _,
+            version_pinned_locator,
+        } = self;
+        version_pinned_locator
+            .as_ref()
+            .map_or(Some(0), VersionPinnedSourceLocator::dynamic_retained_bytes)
     }
 }
 

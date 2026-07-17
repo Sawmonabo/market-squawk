@@ -9,14 +9,15 @@ mod tests {
 
     use bytes::Bytes;
     use market_squawk_domain::{
-        AggressorSide, ConnectionGeneration, InstrumentId, IntegrityRule, MetadataRevision,
-        RuleVersion, SequenceNumber, SequenceValidationRule, SourceId, SourceIdentifier, Timestamp,
-        VenueId,
+        AggressorSide, ConnectionGeneration, InstrumentId, IntegrityRule, LiveEventClass,
+        MetadataRevision, RuleVersion, SequenceNumber, SequenceValidationRule, SourceId,
+        SourceIdentifier, Timestamp, VenueId,
     };
 
     use super::{
         AuthoritativeSourceRegistry, RawFrameFactory, RegistryClock, RegistryError,
-        SessionLeaseState, TrustedRegistryTime, validate_observation_profile,
+        MAX_AUTHORITY_SOURCES, SessionLeaseState, SourceAuthorityHistory, TrustedRegistryTime,
+        validate_observation_profile,
     };
     use crate::{
         ChecksumValidationProfile, FrameSessionBinding, LiveProtocolProfile,

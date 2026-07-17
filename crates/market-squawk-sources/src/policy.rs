@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use market_squawk_domain::{SourceIdentifier, Timestamp};

@@ -122,6 +122,9 @@ impl AuthoritativeSourceRegistry {
             return Err(RegistryError::SourceAlreadyRegistered);
         }
         let previous = self.history.get(metadata.source_id());
+        if previous.is_none() && self.history.len() >= MAX_AUTHORITY_SOURCES {
+            return Err(RegistryError::AuthorityStateCapacity);
+        }
         if previous.is_some_and(|history| history.used_revisions.contains(metadata.revision())) {
             return Err(RegistryError::RevisionAlreadyUsed);
         }

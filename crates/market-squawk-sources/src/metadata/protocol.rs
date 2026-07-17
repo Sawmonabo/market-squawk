@@ -157,6 +157,20 @@ impl SemanticInterpretationProfile {
     pub const fn corporate_action_rule(&self) -> &IntegrityRule {
         &self.corporate_action_rule
     }
+
+    fn dynamic_retained_bytes(&self) -> Option<usize> {
+        let Self {
+            aggressor_rule,
+            auction_rule,
+            trading_status_rule,
+            corporate_action_rule,
+        } = self;
+        aggressor_rule
+            .dynamic_retained_bytes()?
+            .checked_add(auction_rule.dynamic_retained_bytes()?)?
+            .checked_add(trading_status_rule.dynamic_retained_bytes()?)?
+            .checked_add(corporate_action_rule.dynamic_retained_bytes()?)
+    }
 }
 
 /// Live decoder, sequence, checksum, timestamp, and numeric validation contract.
@@ -227,6 +241,50 @@ impl LiveProtocolProfile {
     /// Returns the exact provider-number conversion policy.
     pub const fn numeric_policy(&self) -> ProviderNumericPolicy {
         self.numeric_policy
+    }
+
+    pub(crate) fn dynamic_retained_bytes(&self) -> Option<usize> {
+        let Self {
+            decoder_rule,
+            semantic_interpretation,
+            timestamp_rule,
+            sequence,
+            checksum,
+            source_timestamps: _,
+            numeric_policy: _,
+        } = self;
+        decoder_rule
+            .dynamic_retained_bytes()?
+            .checked_add(semantic_interpretation.dynamic_retained_bytes()?)?
+            .checked_add(timestamp_rule.dynamic_retained_bytes()?)?
+            .checked_add(sequence_dynamic_retained_bytes(sequence)?)?
+            .checked_add(checksum_dynamic_retained_bytes(checksum)?)
+    }
+}
+
+fn sequence_dynamic_retained_bytes(profile: &SequenceValidationProfile) -> Option<usize> {
+    match profile {
+        SequenceValidationProfile::Unsupported { rule }
+        | SequenceValidationProfile::Provided {
+            rule,
+            progression: _,
+        } => rule.dynamic_retained_bytes(),
+    }
+}
+
+fn checksum_dynamic_retained_bytes(profile: &ChecksumValidationProfile) -> Option<usize> {
+    match profile {
+        ChecksumValidationProfile::Unsupported { rule } => rule.dynamic_retained_bytes(),
+        ChecksumValidationProfile::Provided {
+            rule,
+            algorithm: _,
+            canonicalization,
+            scope,
+            book_scope: _,
+        } => rule
+            .dynamic_retained_bytes()?
+            .checked_add(canonicalization.retained_bytes())?
+            .checked_add(scope.retained_bytes()),
     }
 }
 

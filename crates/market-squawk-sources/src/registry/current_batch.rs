@@ -77,7 +77,8 @@ pub struct CurrentSourceAuthorityLease {
     health_epoch: u64,
     valid_from: Timestamp,
     valid_until: Timestamp,
-    valid_from_monotonic: Instant,
+    trusted_valid_from: Timestamp,
+    trusted_valid_from_monotonic: Instant,
     valid_until_monotonic: Instant,
     lease: Arc<SessionLeaseState>,
     capture: crate::CaptureGenerationLease,
@@ -97,10 +98,10 @@ impl CurrentSourceAuthorityLease {
     /// Fails after rollover/revision/health/capture changes or deadline expiry.
     pub fn validate_at(&self, at: Timestamp) -> Result<(), RegistryError> {
         let trusted = self.clock.observe()?;
-        if trusted.monotonic() < self.valid_from_monotonic {
+        if trusted.monotonic() < self.trusted_valid_from_monotonic {
             return Err(RegistryError::TrustedClockRegression);
         }
-        if trusted.wall() >= self.valid_from
+        if trusted.wall() >= self.trusted_valid_from
             && trusted.wall() <= self.valid_until
             && trusted.monotonic() <= self.valid_until_monotonic
             && at >= self.valid_from
@@ -200,6 +201,21 @@ impl CurrentStreamKey {
     pub const fn provider_channel(&self) -> &market_squawk_domain::ProviderChannel {
         &self.provider_channel
     }
+
+    fn dynamic_retained_bytes(&self) -> Option<usize> {
+        let Self {
+            source_id,
+            venue,
+            instrument: _,
+            provider_product,
+            provider_channel,
+        } = self;
+        source_id
+            .retained_bytes()
+            .checked_add(venue.retained_bytes())?
+            .checked_add(provider_product.as_source_identifier().retained_bytes())?
+            .checked_add(provider_channel.as_source_identifier().retained_bytes())
+    }
 }
 
 /// Compact exact coverage projection retained with one current provider observation.
@@ -289,26 +305,31 @@ impl CurrentCoveragePolicy {
     pub const fn metadata_revision(&self) -> &MetadataRevision {
         &self.metadata_revision
     }
-}
 
-const CURRENT_POLICY_MAX_SOURCE_IDENTIFIERS: usize = 32;
-const CURRENT_POLICY_MAX_SOURCE_IDS: usize = 2;
-const CURRENT_POLICY_MAX_VENUE_IDS: usize = 2;
-
-fn current_policy_conservative_allocation_charge() -> Result<usize, RegistryError> {
-    let source_identifiers = market_squawk_domain::SourceIdentifier::MAX_LENGTH
-        .checked_mul(CURRENT_POLICY_MAX_SOURCE_IDENTIFIERS)
-        .ok_or(RegistryError::RetainedSizeOverflow)?;
-    let source_ids = SourceId::MAX_LENGTH
-        .checked_mul(CURRENT_POLICY_MAX_SOURCE_IDS)
-        .ok_or(RegistryError::RetainedSizeOverflow)?;
-    let venues = VenueId::MAX_LENGTH
-        .checked_mul(CURRENT_POLICY_MAX_VENUE_IDS)
-        .ok_or(RegistryError::RetainedSizeOverflow)?;
-    source_identifiers
-        .checked_add(source_ids)
-        .and_then(|bytes| bytes.checked_add(venues))
-        .ok_or(RegistryError::RetainedSizeOverflow)
+    fn dynamic_retained_bytes(&self) -> Option<usize> {
+        let Self {
+            source_id,
+            venue,
+            provider_product,
+            provider_channel,
+            event_class: _,
+            depth: _,
+            delay: _,
+            consolidation: _,
+            delivery: _,
+            evidence,
+            effective_from: _,
+            effective_until: _,
+            metadata_revision,
+        } = self;
+        source_id
+            .retained_bytes()
+            .checked_add(venue.retained_bytes())?
+            .checked_add(provider_product.as_source_identifier().retained_bytes())?
+            .checked_add(provider_channel.as_source_identifier().retained_bytes())?
+            .checked_add(evidence.dynamic_retained_bytes()?)?
+            .checked_add(metadata_revision.as_source_identifier().retained_bytes())
+    }
 }
 
 fn current_routed_batch_retained_bytes(
@@ -388,10 +409,39 @@ impl CurrentLivePolicy {
     }
 
     fn deep_allocation_charge(&self) -> Result<usize, RegistryError> {
-        // This closed policy shape is charged at its documented identifier maxima. It is
-        // intentionally conservative because several nested domain wrappers do not expose their
-        // internal allocation capacities; the bound is per retained policy clone.
-        current_policy_conservative_allocation_charge()
+        let Self {
+            stream_key,
+            quality_ceiling: _,
+            static_authorization,
+            runtime_authorization,
+            coverage,
+            runtime_coverage,
+            rule,
+            protocol,
+            freshness: _,
+            valid_until: _,
+            universe_evidence,
+        } = self;
+        stream_key
+            .dynamic_retained_bytes()
+            .and_then(|bytes| {
+                bytes.checked_add(static_authorization.dynamic_retained_bytes()?)
+            })
+            .and_then(|bytes| {
+                bytes.checked_add(runtime_authorization.dynamic_retained_bytes()?)
+            })
+            .and_then(|bytes| bytes.checked_add(coverage.dynamic_retained_bytes()?))
+            .and_then(|bytes| bytes.checked_add(runtime_coverage.dynamic_retained_bytes()?))
+            .and_then(|bytes| bytes.checked_add(rule.dynamic_retained_bytes()?))
+            .and_then(|bytes| bytes.checked_add(protocol.dynamic_retained_bytes()?))
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    universe_evidence
+                        .as_ref()
+                        .map_or(Some(0), ExactPayloadEvidence::dynamic_retained_bytes)?,
+                )
+            })
+            .ok_or(RegistryError::RetainedSizeOverflow)
     }
 }
 

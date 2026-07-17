@@ -70,6 +70,15 @@ impl LiveCoverageRule {
     pub const fn snapshot_applicability(&self) -> &SnapshotApplicability {
         &self.snapshot_applicability
     }
+
+    pub(crate) fn dynamic_retained_bytes(&self) -> Option<usize> {
+        let Self {
+            event_class: _,
+            depth: _,
+            snapshot_applicability,
+        } = self;
+        snapshot_applicability.dynamic_retained_bytes()
+    }
 }
 
 #[derive(Deserialize)]

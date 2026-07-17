@@ -17,7 +17,8 @@ pub struct ValidatedLiveScope {
     coverage: CurrentCoveragePolicy,
     valid_until: Timestamp,
     valid_from: Timestamp,
-    valid_from_monotonic: Instant,
+    trusted_valid_from: Timestamp,
+    trusted_valid_from_monotonic: Instant,
     valid_until_monotonic: Instant,
     health_epoch: u64,
     lease: Arc<SessionLeaseState>,
@@ -28,6 +29,24 @@ pub struct ValidatedLiveScope {
 }
 
 impl ValidatedLiveScope {
+    #[cfg(test)]
+    pub(in crate::registry) fn queued_authority_for_test(&self) -> CurrentSourceAuthorityLease {
+        CurrentSourceAuthorityLease {
+            registry_id: self.registry_id,
+            binding: self.binding.clone(),
+            health_epoch: self.health_epoch,
+            valid_from: self.valid_from,
+            valid_until: self.valid_until,
+            trusted_valid_from: self.trusted_valid_from,
+            trusted_valid_from_monotonic: self.trusted_valid_from_monotonic,
+            valid_until_monotonic: self.valid_until_monotonic,
+            lease: Arc::clone(&self.lease),
+            capture: self.capture.clone(),
+            budget: self.budget.clone(),
+            clock: Arc::clone(&self.clock),
+        }
+    }
+
     /// Revalidates the allocation/health epoch and inclusive deadline in O(1).
     ///
     /// `at` is the processor-owned wall-clock projection for the scoped event. A fresh sealed
@@ -39,10 +58,10 @@ impl ValidatedLiveScope {
     /// Fails after health/subscription change, session/revision rollover, or deadline expiry.
     pub fn validate_at(&self, at: Timestamp) -> Result<(), RegistryError> {
         let trusted = self.clock.observe()?;
-        if trusted.monotonic() < self.valid_from_monotonic {
+        if trusted.monotonic() < self.trusted_valid_from_monotonic {
             return Err(RegistryError::TrustedClockRegression);
         }
-        if trusted.wall() >= self.valid_from
+        if trusted.wall() >= self.trusted_valid_from
             && trusted.wall() <= self.valid_until
             && trusted.monotonic() <= self.valid_until_monotonic
             && at >= self.valid_from
@@ -152,7 +171,8 @@ impl ValidatedLiveScope {
             binding: self.binding,
             health_epoch: self.health_epoch,
             valid_from: self.valid_from,
-            valid_from_monotonic: self.valid_from_monotonic,
+            trusted_valid_from: self.trusted_valid_from,
+            trusted_valid_from_monotonic: self.trusted_valid_from_monotonic,
             valid_until: self.valid_until,
             valid_until_monotonic: self.valid_until_monotonic,
             lease: self.lease,

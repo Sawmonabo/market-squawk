@@ -388,6 +388,9 @@ fn process_coordinator_rejects_conflicting_restored_policy() -> TestResult {
     policy.insert("requests_per_window".to_owned(), serde_json::json!(11));
     let conflicting: RegistryAuthorityState = serde_json::from_value(wire)?;
 
+    drop(_registered);
+    drop(owner);
+
     assert!(matches!(
         AuthoritativeSourceRegistry::try_new_with_authority_state(conflicting),
         Err(RegistryError::BudgetCoordinator)

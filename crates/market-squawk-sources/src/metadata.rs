@@ -139,6 +139,19 @@ impl AuthorizationGrant {
             .ends_at()
             .and_then(|end| end.checked_sub_nanos(1).ok())
     }
+
+    pub(crate) fn dynamic_retained_bytes(&self) -> Option<usize> {
+        let Self {
+            mode: _,
+            basis,
+            evidence,
+            effective: _,
+        } = self;
+        basis
+            .as_source_identifier()
+            .retained_bytes()
+            .checked_add(evidence.dynamic_retained_bytes()?)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]

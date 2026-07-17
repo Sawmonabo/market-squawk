@@ -119,6 +119,18 @@ impl IntegrityRule {
     pub const fn version(&self) -> RuleVersion {
         self.version
     }
+
+    /// Returns checked heap bytes retained by this rule identity.
+    ///
+    /// The exhaustive field binding intentionally makes every future retained field an explicit
+    /// allocation-accounting decision.
+    pub fn dynamic_retained_bytes(&self) -> Option<usize> {
+        let Self {
+            provider_rule,
+            version: _,
+        } = self;
+        Some(provider_rule.retained_bytes())
+    }
 }
 
 /// Sequence progression semantics implemented by the selected provider validator.
@@ -423,6 +435,19 @@ pub enum SnapshotApplicability {
         /// Metadata rule supporting non-applicability.
         metadata_rule: IntegrityRule,
     },
+}
+
+impl SnapshotApplicability {
+    /// Returns checked heap bytes retained by the applicable metadata rule.
+    ///
+    /// This exhaustive match intentionally makes each future variant an explicit
+    /// allocation-accounting decision.
+    pub fn dynamic_retained_bytes(&self) -> Option<usize> {
+        match self {
+            Self::Required => Some(0),
+            Self::NotApplicable { metadata_rule } => metadata_rule.dynamic_retained_bytes(),
+        }
+    }
 }
 
 /// A generation-bound snapshot/update consistency assessment.
