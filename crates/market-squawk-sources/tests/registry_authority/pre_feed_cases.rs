@@ -186,4 +186,3 @@ fn pre_feed_current_leases_are_deadline_capture_health_and_registry_bound() -> T
     assert!(refreshed.validate_at(refreshed_at).is_err());
     Ok(())
 }
-
