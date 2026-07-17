@@ -146,7 +146,7 @@ fn current_snapshot(
     SnapshotTimeline,
 )> {
     let instrument = InstrumentId::from_str(INSTRUMENT)?;
-    let mut registry = AuthoritativeSourceRegistry::try_new()?;
+    let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
     let registered = registry.register(
         metadata(source, product, channel, instrument)?,
         Timestamp::from_unix_nanos(1),

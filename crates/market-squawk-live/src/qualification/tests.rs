@@ -211,7 +211,7 @@ fn metadata(policy: FixturePolicy) -> TestResult<SourceMetadata> {
 }
 
 fn current_fixture(policy: FixturePolicy, frame_count: usize) -> TestResult<CurrentFixture> {
-    let mut registry = AuthoritativeSourceRegistry::try_new()?;
+    let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
     let registered = registry.register(metadata(policy)?, Timestamp::from_unix_nanos(1))?;
     let session = registry.begin_session(
         &registered,

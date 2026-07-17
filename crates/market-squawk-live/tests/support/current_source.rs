@@ -265,7 +265,7 @@ pub(super) struct SourceHarness {
 
 impl SourceHarness {
     pub(super) fn try_new(source: &str, generation: u64, instrument_id: &str) -> TestResult<Self> {
-        let mut registry = AuthoritativeSourceRegistry::try_new()?;
+        let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
         let instance = SOURCE_INSTANCE.fetch_add(1, Ordering::Relaxed);
         let revision = format!("{source}-revision-{instance}");
         let at = now()?;

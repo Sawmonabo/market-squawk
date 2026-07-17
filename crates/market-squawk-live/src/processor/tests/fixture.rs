@@ -195,7 +195,7 @@ pub(super) struct SourceHarness {
 
 impl SourceHarness {
     pub(super) fn try_new(source: &str, generation: u64) -> TestResult<Self> {
-        let mut registry = AuthoritativeSourceRegistry::try_new()?;
+        let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
         let revision = format!("{source}-revision");
         let registered =
             registry.register(metadata(source, &revision)?, Timestamp::from_unix_nanos(1))?;
