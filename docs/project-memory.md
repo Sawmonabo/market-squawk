@@ -142,6 +142,25 @@ reviewed head and requires the applicable gate and re-review again.
 Hosted CI is separate optional evidence. Do not infer hosted success from local checks. Market
 Squawk must remain operable and approvable without a mandatory cloud service.
 
+## GitHub publication discipline
+
+The canonical collaboration remote is the private GitHub repository
+[`Sawmonabo/market-squawk`](https://github.com/Sawmonabo/market-squawk). The local repository keeps
+the imported bundle as `bundle-backup`; `origin` is the GitHub SSH remote.
+
+After a scoped integration change is locally verified and intentionally committed:
+
+1. push the exact integration branch commit to `origin`;
+2. add a concise status comment to the active integration pull request with the commit, outcome,
+   local verification evidence, and any hosted checks still pending;
+3. inspect failed GitHub Actions checks to root cause before changing code;
+4. update the comment or add a follow-up when hosted evidence finishes; and
+5. never push a dirty/rejected lane merely to obtain CI feedback.
+
+GitHub is a collaboration and optional verification surface, not a runtime dependency. A clean
+local exact-head gate remains mandatory. Active dirty worktrees stay local until their scoped
+review and integration barrier is satisfied.
+
 ## Progress reporting contract
 
 Status updates must lead with the outcome and include:

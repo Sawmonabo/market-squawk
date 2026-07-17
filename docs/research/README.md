@@ -30,6 +30,12 @@ decisions can be audited without relying on conversation history.
 - [Authority lifecycle model checking](2026-07-17-authority-lifecycle-model-checking.md) — packed
   lifecycle transition properties, property testing, bounded Loom modeling, commands, limitations,
   and primary sources.
+- [Cross-platform filesystem durability](2026-07-17-cross-platform-filesystem-durability.md) —
+  Linux `O_PATH` directory synchronization, Windows stable metadata limits, capability-relative
+  directory handles, and platform verification.
+- [Source-authority memory reservation](2026-07-17-source-authority-memory-reservation.md) —
+  composition-global graph and mutation ceilings, passive-lease decoupling, stable store bounds,
+  live exact-once accounting, failure semantics, and blocking RED/GREEN evidence.
 
 ## Evidence policy
 
