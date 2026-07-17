@@ -417,6 +417,7 @@ impl<'de> Deserialize<'de> for RegistryAuthorityState {
 }
 
 include!("registry/catalog.rs");
+include!("registry/health_authority.rs");
 include!("registry/authority.rs");
 include!("registry/current_batch.rs");
 #[cfg(test)]
