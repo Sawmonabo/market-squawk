@@ -2,7 +2,8 @@
 //!
 //! This module cannot accept `CurrentDecodedProviderBatch`, mint live authority, or enter the
 //! production Task 8 runtime. Its historical paper calculation is intentionally ineligible for
-//! live execution.
+//! live execution. Its app-local [`QualityState`] is diagnostic state: even `QualityState::Valid`
+//! can never establish canonical `DataQuality::DirectVerified`.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -27,11 +28,13 @@ use crate::{
 pub type SharedDiagnosticEngine = Arc<RwLock<DiagnosticEngine>>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// One authority-free compatibility view of an observed product.
 pub struct DiagnosticProductSnapshot {
     pub product: String,
     pub source: Option<String>,
     pub top: Option<TopOfBook>,
     pub features: Option<OnlineFeatures>,
+    /// App-local diagnostic state, never canonical execution-quality evidence.
     pub quality: FeedQuality,
     pub bid_levels: usize,
     pub ask_levels: usize,

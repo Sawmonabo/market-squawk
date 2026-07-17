@@ -319,7 +319,7 @@ impl McpServer {
                     "name": "market-squawk",
                     "version": env!("CARGO_PKG_VERSION")
                 },
-                "instructions": "Local, read-rich market data server. Bot actions are paper-only; risk controls fail closed."
+                "instructions": "Local compatibility data is diagnostic and authority-free. Bot behavior is paper simulation only, with no production order authority; risk controls fail closed."
             })),
             "ping" => Ok(json!({})),
             "tools/list" => Ok(json!({ "tools": tool_definitions() })),
@@ -499,8 +499,8 @@ fn tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "Market.GetSnapshot",
-            "title": "Latest Market Snapshot",
-            "description": "Get the latest validated local market snapshot. Omit product to return all observed products.",
+            "title": "Diagnostic Market Snapshot",
+            "description": "Get the latest diagnostic and authority-free compatibility snapshot from Coinbase Exchange single-venue, partial coverage. Omit product to return all observed products. Diagnostic values cannot mint production live authority.",
             "inputSchema": {
                 "type": "object",
                 "properties": { "product": { "type": "string", "minLength": 1, "maxLength": 128 } },
@@ -511,8 +511,8 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "Market.GetQuality",
-            "title": "Market Data Quality",
-            "description": "Get feed-quality states, book and heartbeat timestamps, sequence information, and gap counters for every product.",
+            "title": "Diagnostic Feed State",
+            "description": "Get the app-local diagnostic `QualityState`, book and heartbeat timestamps, sequence information, and gap counters; diagnostic `VALID` is not canonical `DataQuality` and can never establish `DataQuality::DirectVerified`. This state cannot mint production live authority.",
             "inputSchema": { "type": "object", "additionalProperties": false },
             "annotations": { "readOnlyHint": true, "destructiveHint": false },
             "execution": { "taskSupport": "forbidden" }
@@ -520,7 +520,7 @@ fn tool_definitions() -> Vec<Value> {
         json!({
             "name": "Bot.GetStatus",
             "title": "Diagnostic Paper Simulation Status",
-            "description": "Get paper-bot positions, fills, cash flow, and current risk state. This server never submits live orders.",
+            "description": "Get diagnostic positions, fills, cash flow, and current risk state. This is paper simulation only, with no production order authority; this server never submits live orders.",
             "inputSchema": { "type": "object", "additionalProperties": false },
             "annotations": { "readOnlyHint": true, "destructiveHint": false },
             "execution": { "taskSupport": "forbidden" }
@@ -536,7 +536,7 @@ fn tool_definitions() -> Vec<Value> {
         json!({
             "name": "Risk.TriggerKillSwitch",
             "title": "Trigger Diagnostic Simulation Kill Switch",
-            "description": "Irreversibly stop the compatibility paper simulation for the current run. This does not control production Task 8 execution. Requires explicit confirmation and a reason.",
+            "description": "Irreversibly stop the compatibility paper simulation only for the current run. It has no production order authority and cannot control production execution. Requires explicit confirmation and a reason.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -578,6 +578,53 @@ mod tests {
             .ok_or("request should produce a response")?;
         assert_eq!(response["result"]["serverInfo"]["name"], "market-squawk");
         assert_eq!(response["result"]["protocolVersion"], PROTOCOL_VERSION);
+        let instructions = response["result"]["instructions"]
+            .as_str()
+            .ok_or("initialize instructions must be text")?;
+        assert!(instructions.contains("diagnostic and authority-free"));
+        assert!(instructions.contains("paper simulation only"));
+        assert!(instructions.contains("no production order authority"));
+        Ok(())
+    }
+
+    #[test]
+    fn tool_contracts_distinguish_diagnostic_state_coverage_and_authority()
+    -> Result<(), &'static str> {
+        let definitions = tool_definitions();
+        let definition = |name: &str| {
+            definitions
+                .iter()
+                .find(|definition| definition["name"] == name)
+                .ok_or("required tool definition is missing")
+        };
+        let description = |name: &str| {
+            definition(name)?["description"]
+                .as_str()
+                .ok_or("tool description must be text")
+        };
+
+        let snapshot = description("Market.GetSnapshot")?;
+        assert!(snapshot.contains("diagnostic and authority-free"));
+        assert!(snapshot.contains("Coinbase Exchange single-venue, partial coverage"));
+        assert!(snapshot.contains("cannot mint production live authority"));
+
+        let quality = description("Market.GetQuality")?;
+        assert!(quality.contains("app-local diagnostic `QualityState`"));
+        assert!(quality.contains("diagnostic `VALID` is not canonical `DataQuality`"));
+        assert!(quality.contains("can never establish `DataQuality::DirectVerified`"));
+        assert!(quality.contains("cannot mint production live authority"));
+
+        for name in ["Bot.GetStatus", "Risk.TriggerKillSwitch"] {
+            let paper = description(name)?;
+            assert!(paper.contains("paper simulation only"));
+            assert!(paper.contains("no production order authority"));
+        }
+
+        let rendered = serde_json::to_string(&definitions)
+            .map_err(|_error| "tool definitions must serialize")?;
+        assert!(!rendered.contains("validated local market snapshot"));
+        assert!(!rendered.contains("Market Data Quality"));
+        assert!(!rendered.contains("feed-quality states"));
         Ok(())
     }
 

@@ -25,7 +25,10 @@ use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
 #[command(name = "market-squawk")]
-#[command(about = "Local-first market capture, diagnostic replay/simulation, and MCP")]
+#[command(
+    about = "Local-first market tools that are diagnostic and authority-free",
+    long_about = "Local-first market tools that are diagnostic and authority-free. Any bot behavior is paper simulation only, with no production order authority."
+)]
 #[command(version)]
 struct Cli {
     #[arg(long)]
@@ -53,28 +56,36 @@ enum Command {
     /// Create the local data directory and an empty Coinbase journal.
     Init,
 
-    /// Run a deterministic mock feed to verify journaling and in-memory analytics locally.
+    /// Run a deterministic, authority-free mock feed for local diagnostics.
     Mock {
         #[arg(long, default_value = "TEST-USD")]
         product: String,
         #[arg(long, default_value_t = 100)]
         events: usize,
+        /// Enable paper simulation only; it has no production order authority.
         #[arg(long)]
         paper_bot: bool,
     },
 
-    /// Capture public Coinbase Exchange Level 2, heartbeat, and match messages.
+    /// Capture Coinbase Exchange single-venue, partial coverage for local diagnostics.
+    #[command(
+        long_about = "Capture public Coinbase Exchange single-venue, partial coverage messages for diagnostic and authority-free processing. The app-local diagnostic QualityState can never establish DataQuality::DirectVerified; diagnostic VALID is not canonical DataQuality::DirectVerified. Captured values cannot mint production live authority. The optional bot is paper simulation only, with no production order authority."
+    )]
     Capture {
         #[arg(long, value_delimiter = ',', default_value = "BTC-USD")]
         products: Vec<String>,
         /// Stop after this many seconds. Omit to run until Ctrl-C.
         #[arg(long)]
         seconds: Option<u64>,
+        /// Enable paper simulation only; it has no production order authority.
         #[arg(long)]
         paper_bot: bool,
     },
 
-    /// Run the local MCP stdio server, optionally with a live Coinbase feed.
+    /// Run the local diagnostic, authority-free MCP stdio compatibility server.
+    #[command(
+        long_about = "Run the local MCP stdio compatibility server for diagnostic and authority-free access. Online mode observes Coinbase Exchange single-venue, partial coverage; no diagnostic value can mint production live authority. The optional bot is paper simulation only, with no production order authority."
+    )]
     Mcp {
         #[arg(long, value_delimiter = ',', default_value = "BTC-USD")]
         products: Vec<String>,
@@ -84,6 +95,7 @@ enum Command {
         /// Select a journal when both the current and legacy formats exist.
         #[arg(long, value_enum, requires = "offline")]
         journal_format: Option<JournalFormatArgument>,
+        /// Enable paper simulation only; it has no production order authority.
         #[arg(long)]
         paper_bot: bool,
     },
@@ -569,7 +581,7 @@ mod tests {
     use std::{collections::BTreeMap, num::NonZeroUsize, sync::Arc};
 
     use async_trait::async_trait;
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
     use market_squawk::source::{CaptureContext, MarketSource, SourceRunOutcome};
     use market_squawk::source_supervisor::{
         SourceShutdownOutcome, SourceSupervisor, SupervisedSourceTask,
@@ -609,6 +621,48 @@ mod tests {
         let cli = Cli::try_parse_from(["market-squawk", "--source-shutdown-ms", "2500", "mock"])?;
 
         assert_eq!(cli.source_shutdown_ms, Some(2_500));
+        Ok(())
+    }
+
+    #[test]
+    fn cli_help_distinguishes_diagnostic_coverage_quality_and_authority()
+    -> Result<(), Box<dyn std::error::Error>> {
+        fn normalized_help(command: &mut clap::Command) -> String {
+            command
+                .render_long_help()
+                .to_string()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+
+        let mut command = Cli::command();
+        let root_help = normalized_help(&mut command);
+        assert!(root_help.contains("diagnostic and authority-free"));
+        assert!(root_help.contains("paper simulation only"));
+        assert!(root_help.contains("no production order authority"));
+
+        let capture = command
+            .find_subcommand_mut("capture")
+            .ok_or("capture command must exist")?;
+        let capture_help = normalized_help(capture);
+        assert!(capture_help.contains("Coinbase Exchange single-venue, partial coverage"));
+        assert!(capture_help.contains("diagnostic and authority-free"));
+        assert!(capture_help.contains("app-local diagnostic QualityState"));
+        assert!(capture_help.contains("diagnostic VALID is not canonical DataQuality"));
+        assert!(capture_help.contains("can never establish DataQuality::DirectVerified"));
+        assert!(capture_help.contains("cannot mint production live authority"));
+        assert!(capture_help.contains("paper simulation only"));
+        assert!(capture_help.contains("no production order authority"));
+        assert!(!capture_help.contains("validated market"));
+        assert!(!capture_help.contains("market quality"));
+
+        let mcp = command
+            .find_subcommand_mut("mcp")
+            .ok_or("MCP command must exist")?;
+        let mcp_help = normalized_help(mcp);
+        assert!(mcp_help.contains("diagnostic and authority-free"));
+        assert!(mcp_help.contains("no production order authority"));
         Ok(())
     }
 
