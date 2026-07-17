@@ -26,4 +26,9 @@ Version 0.1 does not require credentials. Future credentialed adapters must use 
 
 ## Non-goals
 
-This project does not support quota evasion, identity rotation, anti-bot bypassing, stealth scraping, or circumvention of provider access controls.
+This project categorically does not implement identity or account rotation to evade limits,
+browser or TLS fingerprint spoofing for concealment, CAPTCHA or anti-bot bypass, proxy rotation
+intended to defeat blocking, distributed requests intended to evade aggregate quotas, stealth
+scraping, or any other circumvention of provider access controls. A provider refusal, exhausted
+budget, cooldown, or block revokes current availability and degrades source health; recovery uses
+the same evidenced authorization identity and the provider's permitted retry path.

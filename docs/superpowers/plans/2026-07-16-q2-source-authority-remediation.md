@@ -165,14 +165,14 @@ Proptest for invariants, and deterministic thread/barrier tests for concurrency.
 - Persist: a concise Q2 checkpoint note in the existing planning/review location if the repository
   has one
 
-- [ ] Replace ambiguous retry/identity language with categorical provider-authorized behavior:
+- [x] Replace ambiguous retry/identity language with categorical provider-authorized behavior:
   honor quotas and blocking; never rotate account, identity, fingerprint, proxy, or distributed
   caller for evasion.
-- [ ] Use `rg` to enumerate constructors, health reports, budget transitions, restore paths, and
+- [x] Use `rg` to enumerate constructors, health reports, budget transitions, restore paths, and
   current-authority consumers; fix compile-time and semantic ripple effects rather than adding
   compatibility shims that weaken invariants.
-- [ ] Confirm no SQLite/DataFusion/Parquet/Python/MCP/filesystem work entered the live hot path.
-- [ ] Run deterministic workspace verification:
+- [x] Confirm no SQLite/DataFusion/Parquet/Python/MCP/filesystem work entered the live hot path.
+- [x] Run deterministic workspace verification:
 
   ```bash
   cargo fmt --all --check
@@ -182,9 +182,9 @@ Proptest for invariants, and deterministic thread/barrier tests for concurrency.
   git diff --check
   ```
 
-- [ ] Run repository-provided dependency, vulnerability, license, credential, generated-artifact,
+- [x] Run repository-provided dependency, vulnerability, license, credential, generated-artifact,
   boundary, property, and concurrency checks relevant to Q2. Keep external-network tests separate.
-- [ ] Inspect the final diff against base `20ad084b47cfc0624a17f42233ff1e2748a62b05` for unrelated
+- [x] Inspect the final diff against base `20ad084b47cfc0624a17f42233ff1e2748a62b05` for unrelated
   changes and record exact verification output before claiming completion.
 
 ---

@@ -33,11 +33,14 @@ Implemented now:
 - Independent live and research boundaries; research storage and extraction adapters remain later
   implementation stages and do not depend on captured live journals
 
+Permanently excluded: Market Squawk will not implement identity/account rotation to evade limits,
+browser/TLS fingerprint concealment, CAPTCHA or anti-bot bypass, blocking-evasion proxy rotation,
+distributed quota evasion, stealth scraping, or any other access-control circumvention.
+
 Not yet implemented in the current foundation:
 
 - Live order submission
 - Credentialed exchange or brokerage access
-- Quota bypassing, stealth scraping, identity rotation, or access-control evasion
 - Full consolidated equities, options, futures, or fixed-income feeds
 - Distributed deployment
 - OpenTelemetry infrastructure

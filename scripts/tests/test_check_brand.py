@@ -4,6 +4,7 @@ import importlib.util
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "check_brand.py"
@@ -15,6 +16,14 @@ SPEC.loader.exec_module(check_brand)
 
 
 class BrandCheckTests(unittest.TestCase):
+    @staticmethod
+    def first_text_allowance():
+        return next(
+            (key, allowance)
+            for key, allowance in check_brand.ALLOWED_OCCURRENCES.items()
+            if key[0] != key[2]
+        )
+
     def test_each_forbidden_content_token_is_reported(self) -> None:
         for index, token in enumerate(check_brand.TOKENS):
             with self.subTest(token=token):
@@ -47,39 +56,83 @@ class BrandCheckTests(unittest.TestCase):
         self.assertIn("exceeds", error or "")
 
     def test_allowed_compatibility_occurrence_is_narrow(self) -> None:
-        path, line, token_index = next(iter(check_brand.ALLOWED_OCCURRENCES))
-        token = check_brand.TOKENS[token_index]
-        allowance = check_brand.ALLOWED_OCCURRENCES[(path, line, token_index)]
+        (path, token_index, container), allowance = self.first_text_allowance()
         self.assertTrue(
-            check_brand.is_allowed(path, line, token_index, allowance.container)
+            check_brand.is_allowed(path, token_index, container)
         )
         self.assertFalse(
-            check_brand.is_allowed(path, line + 1, token_index, allowance.container)
+            check_brand.is_allowed(f"other/{path}", token_index, container)
         )
+
+    def test_unrelated_preceding_lines_do_not_invalidate_exact_allowance(self) -> None:
+        (path, token_index, container), _allowance = self.first_text_allowance()
+        content = "unrelated heading\nunrelated paragraph\n" + container + "\n"
+        violations, usage = check_brand.scan_text_with_usage(path, content)
+        self.assertEqual(violations, [])
+        self.assertEqual(usage[(path, token_index, container)], 1)
 
     def test_changed_allowed_line_is_rejected(self) -> None:
-        path, line, token_index = next(
-            key for key in check_brand.ALLOWED_OCCURRENCES if key[1] > 0
-        )
-        allowance = check_brand.ALLOWED_OCCURRENCES[(path, line, token_index)]
-        content = "\n" * (line - 1) + allowance.container + " changed\n"
+        (path, token_index, container), _allowance = self.first_text_allowance()
+        content = container + " changed\n"
         violations, used = check_brand.scan_text_with_usage(path, content)
         self.assertTrue(violations)
-        self.assertNotIn((path, line, token_index), used)
+        self.assertNotIn((path, token_index, container), used)
 
     def test_duplicate_token_on_allowed_line_is_rejected(self) -> None:
-        path, line, token_index = next(
-            key for key in check_brand.ALLOWED_OCCURRENCES if key[1] > 0
-        )
-        allowance = check_brand.ALLOWED_OCCURRENCES[(path, line, token_index)]
+        (path, token_index, container), _allowance = self.first_text_allowance()
         token = check_brand.TOKENS[token_index]
-        content = "\n" * (line - 1) + allowance.container + token + "\n"
+        content = container + token + "\n"
         violations, used = check_brand.scan_text_with_usage(path, content)
         self.assertTrue(violations)
-        self.assertNotIn((path, line, token_index), used)
+        self.assertNotIn((path, token_index, container), used)
+
+    def test_duplicate_exact_allowed_lines_are_rejected(self) -> None:
+        (path, token_index, container), allowance = self.first_text_allowance()
+        content = f"{container}\n{container}\n"
+        violations, usage = check_brand.scan_text_with_usage(path, content)
+        self.assertTrue(violations)
+        self.assertEqual(
+            usage[(path, token_index, container)], allowance.expected_occurrences + 1
+        )
+
+    def test_declared_token_and_container_occurrence_counts_are_exact(self) -> None:
+        path = "compatibility.txt"
+        token_index = 3
+        token = check_brand.TOKENS[token_index]
+        container = f"legacy {token} and {token}"
+        key = (path, token_index, container)
+        allowance = check_brand.AllowedOccurrence(
+            token_count=2, expected_occurrences=2
+        )
+        with mock.patch.object(check_brand, "ALLOWED_OCCURRENCES", {key: allowance}):
+            violations, usage = check_brand.scan_text_with_usage(
+                path, f"{container}\n{container}\n"
+            )
+            self.assertEqual(violations, [])
+            self.assertEqual(check_brand.allowance_count_violations(usage), [])
+
+            extra_violations, extra_usage = check_brand.scan_text_with_usage(
+                path, f"{container}\n{container}\n{container}\n"
+            )
+            self.assertTrue(extra_violations)
+            self.assertTrue(check_brand.allowance_count_violations(extra_usage))
+
+            wrong_token_count = {
+                key: check_brand.AllowedOccurrence(
+                    token_count=1, expected_occurrences=2
+                )
+            }
+            with mock.patch.object(
+                check_brand, "ALLOWED_OCCURRENCES", wrong_token_count
+            ):
+                count_violations, count_usage = check_brand.scan_text_with_usage(
+                    path, f"{container}\n{container}\n"
+                )
+                self.assertTrue(count_violations)
+                self.assertEqual(count_usage, {})
 
     def test_unused_allowance_fails_closed(self) -> None:
-        violations = check_brand.unused_allowance_violations(set())
+        violations = check_brand.allowance_count_violations({})
         self.assertEqual(len(violations), len(check_brand.ALLOWED_OCCURRENCES))
 
 
