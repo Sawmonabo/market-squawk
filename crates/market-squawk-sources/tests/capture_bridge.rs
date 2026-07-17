@@ -22,7 +22,7 @@ use market_squawk_sources::{
     SessionId, SourceHealthSnapshot, TransportFrameKind,
 };
 
-use common::{TestResult, direct_metadata, exact_evidence, source_identifier};
+use common::{TestResult, direct_metadata, exact_evidence, now_timestamp, source_identifier};
 
 fn rule(name: &str) -> TestResult<IntegrityRule> {
     Ok(IntegrityRule::new(
@@ -55,16 +55,19 @@ async fn platform_returns_exact_registry_receipt_and_later_degradation_revokes_c
         CaptureWriterPolicy::default(),
     )?;
     control.activate_initial()?;
+    let observed_at = now_timestamp()?;
+    let valid_until = observed_at.checked_add_nanos(10_000_000_000)?;
+    let frame_at = observed_at.checked_add_nanos(1)?;
 
     let health = SourceHealthSnapshot::try_new(
         &session,
-        Timestamp::from_unix_nanos(2),
+        observed_at,
         ConnectionLiveness::Live {
-            last_activity_at: Timestamp::from_unix_nanos(2),
+            last_activity_at: observed_at,
         },
-        Some(Timestamp::from_unix_nanos(2)),
-        Some(Timestamp::from_unix_nanos(2)),
-        Some(Timestamp::from_unix_nanos(2)),
+        Some(observed_at),
+        Some(observed_at),
+        Some(observed_at),
         FreshnessPolicy::try_new(
             5_000_000_000,
             1_000_000_000,
@@ -76,13 +79,13 @@ async fn platform_returns_exact_registry_receipt_and_later_degradation_revokes_c
         CaptureIntegrityState::Healthy,
         AuthorizationHealth::Valid {
             evidence: exact_evidence(11),
-            valid_until: Timestamp::from_unix_nanos(12),
+            valid_until,
         },
         CoverageHealth::Sufficient {
             evidence: exact_evidence(12),
             provider_product: ProviderProduct::new(source_identifier("direct-product")?),
             provider_channel: ProviderChannel::new(source_identifier("trades")?),
-            valid_until: Timestamp::from_unix_nanos(12),
+            valid_until,
         },
         BudgetHealth::Available,
         None,
@@ -90,10 +93,10 @@ async fn platform_returns_exact_registry_receipt_and_later_degradation_revokes_c
     )?;
     let update = health_reporter.report(health)?;
     registry.record_health(&session, update)?;
-    let current = registry.validate_current_authority(&session, Timestamp::from_unix_nanos(2))?;
+    let current = registry.validate_current_authority(&session)?;
 
     let frame = frames.try_frame(
-        Timestamp::from_unix_nanos(3),
+        frame_at,
         TransportFrameKind::Binary,
         Bytes::from_static(b"exact-frame"),
     )?;
@@ -105,7 +108,7 @@ async fn platform_returns_exact_registry_receipt_and_later_degradation_revokes_c
         VenueId::try_from("coinbase")?,
         instrument,
         ProviderTimestampEvidence::Provided {
-            value: Timestamp::from_unix_nanos(3),
+            value: frame_at,
             rule: rule("coinbase-timestamp")?,
         },
         ProviderSequenceEvidence::Provided {
@@ -135,11 +138,11 @@ async fn platform_returns_exact_registry_receipt_and_later_degradation_revokes_c
         .into_iter()
         .next()
         .ok_or("validated frame produced no routed batch")?;
-    current_batch.validate_at(Timestamp::from_unix_nanos(3))?;
+    current_batch.validate_at(frame_at)?;
 
     drop(control);
     assert!(matches!(
-        current_batch.validate_at(Timestamp::from_unix_nanos(3)),
+        current_batch.validate_at(frame_at),
         Err(RegistryError::HealthNotQualified)
     ));
     assert_eq!(publisher.integrity(), CaptureIntegrityState::Incomplete);

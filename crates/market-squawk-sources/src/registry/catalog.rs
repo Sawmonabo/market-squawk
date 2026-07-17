@@ -5,6 +5,7 @@ pub struct AuthoritativeSourceRegistry {
     entries: BTreeMap<SourceId, RegistryEntry>,
     budgets: ProviderBudgetPool,
     history: BTreeMap<SourceId, SourceAuthorityHistory>,
+    clock: Arc<dyn RegistryClock>,
 }
 
 impl Drop for AuthoritativeSourceRegistry {
@@ -40,6 +41,16 @@ impl AuthoritativeSourceRegistry {
     pub fn try_new_with_authority_state(
         state: RegistryAuthorityState,
     ) -> Result<Self, RegistryError> {
+        Self::try_new_with_authority_state_and_clock(
+            state,
+            Arc::new(SystemRegistryClock::try_new()?),
+        )
+    }
+
+    fn try_new_with_authority_state_and_clock(
+        state: RegistryAuthorityState,
+        clock: Arc<dyn RegistryClock>,
+    ) -> Result<Self, RegistryError> {
         let instance_id = NEXT_REGISTRY_ID
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_add(1)
@@ -70,6 +81,7 @@ impl AuthoritativeSourceRegistry {
             entries: BTreeMap::new(),
             budgets,
             history,
+            clock,
         })
     }
 
@@ -256,13 +268,22 @@ impl AuthoritativeSourceRegistry {
         {
             return Err(RegistryError::UniverseAttestationMismatch);
         }
+        let next_health_epoch = entry
+            .active
+            .as_ref()
+            .map(|active| {
+                active
+                    .lease
+                    .next_health_epoch()
+                    .ok_or(RegistryError::HealthEpochExhausted)
+            })
+            .transpose()?;
         entry.universe_attestation = Some(attestation);
         entry.health_authority = None;
-        if let Some(active) = &entry.active {
+        if let (Some(active), Some(epoch)) = (&entry.active, next_health_epoch) {
             active
                 .lease
-                .record_live_qualification(false, None)
-                .ok_or(RegistryError::HealthEpochExhausted)?;
+                .commit_live_qualification(epoch, false, None, None);
         }
         Ok(())
     }
@@ -282,6 +303,7 @@ impl AuthoritativeSourceRegistry {
         at: Timestamp,
     ) -> Result<CurrentSourceSession, RegistryError> {
         self.validate_registered(registered, at)?;
+        let started_at = self.clock.observe()?;
         let entry = self
             .entries
             .get_mut(&registered.source_id)
@@ -300,6 +322,7 @@ impl AuthoritativeSourceRegistry {
             current: AtomicBool::new(true),
             live_qualified: AtomicBool::new(false),
             health_epoch: AtomicU64::new(0),
+            valid_from_nanos: AtomicI64::new(i64::MAX),
             valid_until_nanos: AtomicI64::new(i64::MIN),
             last_health_observed_nanos: AtomicI64::new(i64::MIN),
             frame_ordinal: AtomicU64::new(0),
@@ -313,6 +336,7 @@ impl AuthoritativeSourceRegistry {
             health_reporter_taken: false,
             raw_frame_factory_taken: false,
             capture: capture.clone(),
+            started_at,
         });
         entry.health_authority = None;
         entry.generation_high_water = Some(generation);
@@ -332,6 +356,7 @@ impl AuthoritativeSourceRegistry {
             budget: registered.budget.clone(),
             lease,
             capture,
+            started_at: started_at.wall(),
         })
     }
 
@@ -385,11 +410,14 @@ impl AuthoritativeSourceRegistry {
             return Err(RegistryError::HealthReporterAlreadyTaken);
         }
         active.health_reporter_taken = true;
+        let session_started_at = active.started_at;
         Ok(CurrentHealthReporter {
             binding: session.binding.clone(),
             lease: Arc::clone(&session.lease),
             freshness: entry.metadata.freshness_policy(),
             budget: session.budget.clone(),
+            clock: Arc::clone(&self.clock),
+            session_started_at,
             not_sync: PhantomData,
         })
     }
@@ -453,7 +481,9 @@ impl AuthoritativeSourceRegistry {
     ///
     /// # Errors
     ///
-    /// Rejects a stale/transplanted registration handle or epoch overflow.
+    /// Rejects a stale or transplanted registration handle. Revocation remains available when the
+    /// epoch is exhausted: the terminal revoked bit and synchronous lease invalidation do not
+    /// require a successor authority epoch.
     pub fn revoke(
         &mut self,
         registered: &RegisteredSource,
@@ -465,10 +495,13 @@ impl AuthoritativeSourceRegistry {
             .entries
             .get_mut(&registered.source_id)
             .ok_or(RegistryError::UnknownSource)?;
-        entry.epoch = entry
-            .epoch
-            .checked_add(1)
-            .ok_or(RegistryError::EpochExhausted)?;
+        let history = self
+            .history
+            .get_mut(&registered.source_id)
+            .ok_or(RegistryError::InvalidAuthorityState)?;
+        let revoked_epoch = entry.epoch.checked_add(1).unwrap_or(entry.epoch);
+        history.last_epoch = revoked_epoch;
+        entry.epoch = revoked_epoch;
         entry.revoked = true;
         if let Some(active) = entry.active.take() {
             active.lease.invalidate();
@@ -533,7 +566,12 @@ impl AuthoritativeSourceRegistry {
         update: CurrentHealthUpdate,
     ) -> Result<(), RegistryError> {
         let health = &update.snapshot;
-        self.validate_session_structure(session)?;
+        let session_started_at = self
+            .validate_session_structure(session)?
+            .active
+            .as_ref()
+            .ok_or(RegistryError::SessionNotCurrent)?
+            .started_at;
         if !Arc::ptr_eq(&update.lease, &session.lease)
             || !update.binding.shares_allocation_with(&session.binding)
         {
@@ -545,6 +583,18 @@ impl AuthoritativeSourceRegistry {
             || health.connection_generation() != session.generation()
         {
             return Err(RegistryError::HealthBindingMismatch);
+        }
+        let validation_at = self.clock.observe()?;
+        if update.trusted_reported_at.monotonic() < session_started_at.monotonic()
+            || validation_at.monotonic() < update.trusted_reported_at.monotonic()
+        {
+            return Err(RegistryError::TrustedClockRegression);
+        }
+        if health.observed_at() < session_started_at.wall()
+            || health.observed_at() > update.trusted_reported_at.wall()
+            || update.trusted_reported_at.wall() > validation_at.wall()
+        {
+            return Err(RegistryError::InvalidHealthTemporalOrder);
         }
         let entry = self
             .entries
@@ -611,23 +661,27 @@ impl AuthoritativeSourceRegistry {
                 .unwrap_or(Timestamp::from_unix_nanos(i64::MAX));
             health_until.min(authorization_until).min(coverage_until)
         });
-        let qualified = qualified && valid_until.is_some_and(|until| health.observed_at() <= until);
-        session
+        let valid_until_monotonic = valid_until
+            .map(|until| validation_at.checked_deadline(until))
+            .transpose()?
+            .flatten();
+        let qualified = qualified
+            && validation_at.wall() >= health.observed_at()
+            && valid_until_monotonic.is_some();
+        let epoch = session
             .lease
-            .last_health_observed_nanos
-            .store(health.observed_at().unix_nanos(), Ordering::Release);
-        let Some(epoch) = session
-            .lease
-            .record_live_qualification(qualified, valid_until)
-        else {
-            entry.health_authority = None;
-            return Err(RegistryError::HealthEpochExhausted);
-        };
-        entry.health_authority = if qualified {
+            .next_health_epoch()
+            .ok_or(RegistryError::HealthEpochExhausted)?;
+        let next_authority = if qualified {
             Some(CurrentHealthAuthority {
                 epoch,
                 observed_at: health.observed_at(),
+                trusted_reported_at: update.trusted_reported_at,
+                accepted_at: validation_at,
+                valid_from: health.observed_at(),
                 valid_until: valid_until.ok_or(RegistryError::HealthNotQualified)?,
+                valid_until_monotonic: valid_until_monotonic
+                    .ok_or(RegistryError::HealthNotQualified)?,
                 authorization: health.authorization().clone(),
                 coverage: health.coverage().clone(),
                 budget: update.budget,
@@ -635,6 +689,17 @@ impl AuthoritativeSourceRegistry {
         } else {
             None
         };
+        session.lease.commit_live_qualification(
+            epoch,
+            qualified,
+            qualified.then_some(health.observed_at()),
+            valid_until,
+        );
+        session
+            .lease
+            .last_health_observed_nanos
+            .store(health.observed_at().unix_nanos(), Ordering::Release);
+        entry.health_authority = next_authority;
         Ok(())
     }
 
@@ -647,15 +712,27 @@ impl AuthoritativeSourceRegistry {
     pub fn validate_current_authority<'a>(
         &'a self,
         session: &'a CurrentSourceSession,
-        at: Timestamp,
     ) -> Result<ValidatedCurrentSourceAuthority<'a>, RegistryError> {
-        let validated = self.validate_session(session, at)?;
+        let validation_at = self.clock.observe()?;
+        let validated = self.validate_session(session, validation_at.wall())?;
         let entry = self.validate_session_structure(session)?;
         let health = entry
             .health_authority
             .as_ref()
             .ok_or(RegistryError::HealthNotQualified)?;
-        if !session.lease.validate_health_epoch(health.epoch, at) {
+        if validation_at.monotonic() < health.accepted_at.monotonic() {
+            return Err(RegistryError::TrustedClockRegression);
+        }
+        if health.observed_at > health.trusted_reported_at.wall()
+            || health.trusted_reported_at.wall() > validation_at.wall()
+            || health.accepted_at.wall() > validation_at.wall()
+            || validation_at.wall() < health.observed_at
+            || validation_at.wall() > health.valid_until
+            || validation_at.monotonic() > health.valid_until_monotonic
+            || !session
+                .lease
+                .validate_health_epoch(health.epoch, validation_at.wall())
+        {
             return Err(RegistryError::HealthNotQualified);
         }
         if !health.budget.is_available() {
@@ -667,12 +744,13 @@ impl AuthoritativeSourceRegistry {
         let attestation = entry
             .universe_attestation
             .as_ref()
-            .filter(|attestation| attestation.is_effective_at(at));
+            .filter(|attestation| attestation.is_effective_at(validation_at.wall()));
         Ok(ValidatedCurrentSourceAuthority {
             validated,
             health,
             attestation,
-            validated_at: at,
+            validated_at: validation_at,
+            clock: &self.clock,
         })
     }
 
@@ -723,7 +801,10 @@ impl AuthoritativeSourceRegistry {
             .active
             .as_ref()
             .ok_or(RegistryError::SessionNotCurrent)?;
-        if active.session_id != *session.session_id() || active.generation != session.generation() {
+        if active.session_id != *session.session_id()
+            || active.generation != session.generation()
+            || active.started_at.wall() != session.started_at
+        {
             return Err(RegistryError::SessionNotCurrent);
         }
         Ok(entry)

@@ -36,19 +36,31 @@ use crate::processor::stream::{StreamState, preview_stream};
 pub(super) type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 pub(super) const CONFIGURED_DEPTH: usize = 4;
-pub(super) const SOURCE_TIMESTAMP: i64 = 201;
-pub(super) const RECEIVED_AT: i64 = 202;
-pub(super) const EVALUATED_AT: i64 = 203;
-pub(super) const SOURCE_VALID_UNTIL: i64 = 510;
+const SOURCE_TIMESTAMP: i64 = 10_000_000;
+const RECEIVED_AT: i64 = 20_000_000;
+const EVALUATED_AT: i64 = 30_000_000;
+const SOURCE_VALID_UNTIL: i64 = 60_000_000_000;
 
 const INSTRUMENT: &str = "4c74ab95-53b9-42ad-9b66-0ed403b88fed";
-const HEALTH_AT: i64 = 200;
-const COVERAGE_VALID_UNTIL: i64 = 520;
+const HEALTH_AT: i64 = 0;
+const COVERAGE_VALID_UNTIL: i64 = 70_000_000_000;
+
+#[derive(Clone, Copy, Debug)]
+struct SnapshotTimeline {
+    source_timestamp: Timestamp,
+    received_at: Timestamp,
+    evaluated_at: Timestamp,
+    source_valid_until: Timestamp,
+}
 
 pub(super) struct PopulatedState {
     pub(super) instrument: InstrumentId,
     pub(super) streams: HashMap<market_squawk_sources::CurrentStreamKey, StreamState>,
     pub(super) statuses: StatusBook,
+    pub(super) source_timestamp: Timestamp,
+    pub(super) received_at: Timestamp,
+    pub(super) evaluated_at: Timestamp,
+    pub(super) source_valid_until: Timestamp,
     _generation_owners: Vec<GenerationLeaseOwner>,
 }
 
@@ -58,6 +70,7 @@ pub(super) fn populated_state() -> TestResult<PopulatedState> {
     let mut streams = HashMap::new();
     let mut statuses = StatusBook::try_new(3)?;
     let mut generation_owners = Vec::new();
+    let mut expected_timeline = None;
     for (allocation, source, product, channel, status) in [
         (
             30,
@@ -81,7 +94,10 @@ pub(super) fn populated_state() -> TestResult<PopulatedState> {
             TradingStatus::Inactive,
         ),
     ] {
-        let current = current_snapshot(source, product, channel)?;
+        let (current, timeline) = current_snapshot(source, product, channel)?;
+        if source == "source-a" {
+            expected_timeline = Some(timeline);
+        }
         let owner = GenerationLeaseOwner::new(allocation);
         let mut state = StreamState::new(
             ConnectionGeneration::new(1)?,
@@ -96,7 +112,7 @@ pub(super) fn populated_state() -> TestResult<PopulatedState> {
             &current,
             &definition,
             status,
-            Timestamp::from_unix_nanos(EVALUATED_AT),
+            timeline.evaluated_at,
         )?;
         let committed = candidate.commit()?;
         assert_eq!(committed.expected_revision, 1);
@@ -105,10 +121,15 @@ pub(super) fn populated_state() -> TestResult<PopulatedState> {
         streams.insert(current.stream_key().clone(), state);
         generation_owners.push(owner);
     }
+    let expected_timeline = expected_timeline.ok_or("source-a timeline was not constructed")?;
     Ok(PopulatedState {
         instrument,
         streams,
         statuses,
+        source_timestamp: expected_timeline.source_timestamp,
+        received_at: expected_timeline.received_at,
+        evaluated_at: expected_timeline.evaluated_at,
+        source_valid_until: expected_timeline.source_valid_until,
         _generation_owners: generation_owners,
     })
 }
@@ -117,7 +138,10 @@ fn current_snapshot(
     source: &str,
     product: &str,
     channel: &str,
-) -> TestResult<market_squawk_sources::CurrentProviderObservation> {
+) -> TestResult<(
+    market_squawk_sources::CurrentProviderObservation,
+    SnapshotTimeline,
+)> {
     let instrument = InstrumentId::from_str(INSTRUMENT)?;
     let mut registry = AuthoritativeSourceRegistry::try_new()?;
     let registered = registry.register(
@@ -135,27 +159,35 @@ fn current_snapshot(
     initialization.mark_healthy()?;
     let mut frames = registry.take_raw_frame_factory(&session)?;
     let mut reporter = registry.take_current_health_reporter(&session)?;
+    let origin = session.started_at();
+    let timeline = SnapshotTimeline {
+        source_timestamp: origin.checked_add_nanos(SOURCE_TIMESTAMP)?,
+        received_at: origin.checked_add_nanos(RECEIVED_AT)?,
+        evaluated_at: origin.checked_add_nanos(EVALUATED_AT)?,
+        source_valid_until: origin.checked_add_nanos(SOURCE_VALID_UNTIL)?,
+    };
+    let health_at = origin.checked_add_nanos(HEALTH_AT)?;
     let health = SourceHealthSnapshot::try_new(
         &session,
-        Timestamp::from_unix_nanos(HEALTH_AT),
+        health_at,
         ConnectionLiveness::Live {
-            last_activity_at: Timestamp::from_unix_nanos(HEALTH_AT),
+            last_activity_at: health_at,
         },
-        Some(Timestamp::from_unix_nanos(HEALTH_AT)),
-        Some(Timestamp::from_unix_nanos(HEALTH_AT)),
-        Some(Timestamp::from_unix_nanos(HEALTH_AT)),
+        Some(health_at),
+        Some(health_at),
+        Some(health_at),
         freshness()?,
         StreamIntegrityState::Healthy,
         CaptureIntegrityState::Healthy,
         AuthorizationHealth::Valid {
             evidence: exact_evidence(11),
-            valid_until: Timestamp::from_unix_nanos(SOURCE_VALID_UNTIL),
+            valid_until: timeline.source_valid_until,
         },
         CoverageHealth::Sufficient {
             evidence: exact_evidence(12),
             provider_product: ProviderProduct::new(id(product)?),
             provider_channel: ProviderChannel::new(id(channel)?),
-            valid_until: Timestamp::from_unix_nanos(COVERAGE_VALID_UNTIL),
+            valid_until: origin.checked_add_nanos(COVERAGE_VALID_UNTIL)?,
         },
         BudgetHealth::Available,
         None,
@@ -164,7 +196,7 @@ fn current_snapshot(
     registry.record_health(&session, reporter.report(health)?)?;
     let payload = format!("snapshot-{source}").into_bytes();
     let frame = frames.try_frame(
-        Timestamp::from_unix_nanos(RECEIVED_AT),
+        timeline.received_at,
         TransportFrameKind::Binary,
         payload.into(),
     )?;
@@ -177,7 +209,7 @@ fn current_snapshot(
         VenueId::try_from("coinbase")?,
         instrument,
         ProviderTimestampEvidence::Provided {
-            value: Timestamp::from_unix_nanos(SOURCE_TIMESTAMP),
+            value: timeline.source_timestamp,
             rule: rule("snapshot-timestamp")?,
         },
         ProviderSequenceEvidence::Provided {
@@ -197,8 +229,7 @@ fn current_snapshot(
         )?,
     )?;
     let batch = DecodedProviderBatch::try_new(decoder, vec![observation])?;
-    let current =
-        registry.validate_current_authority(&session, Timestamp::from_unix_nanos(HEALTH_AT))?;
+    let current = registry.validate_current_authority(&session)?;
     let mut batches = current
         .validate_decoded_batch_owned(batch, receipt)?
         .into_iter();
@@ -206,9 +237,12 @@ fn current_snapshot(
         .next()
         .ok_or("snapshot fixture lost routed batch")?
         .into_observations();
-    Ok(observations
-        .next()
-        .ok_or("snapshot fixture lost current observation")?)
+    Ok((
+        observations
+            .next()
+            .ok_or("snapshot fixture lost current observation")?,
+        timeline,
+    ))
 }
 
 fn metadata(
@@ -217,10 +251,7 @@ fn metadata(
     channel: &str,
     instrument: InstrumentId,
 ) -> TestResult<SourceMetadata> {
-    let effective = EffectiveInterval::new(
-        Timestamp::from_unix_nanos(0),
-        Some(Timestamp::from_unix_nanos(1_000)),
-    )?;
+    let effective = EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?;
     let revision = MetadataRevision::new(id("revision-1")?);
     let authorization = AuthorizationGrant::new(
         AuthorizationMode::PublicInterface,
@@ -331,7 +362,13 @@ fn level(price: &str) -> TestResult<ProviderBookLevel> {
 }
 
 fn freshness() -> TestResult<FreshnessPolicy> {
-    Ok(FreshnessPolicy::try_new(1_000, 1_000, 1_000, 1_000, 10)?)
+    Ok(FreshnessPolicy::try_new(
+        120_000_000_000,
+        120_000_000_000,
+        120_000_000_000,
+        120_000_000_000,
+        100_000_000,
+    )?)
 }
 
 fn id(value: &str) -> TestResult<SourceIdentifier> {

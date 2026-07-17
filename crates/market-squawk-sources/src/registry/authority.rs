@@ -5,6 +5,8 @@ pub struct CurrentHealthReporter {
     lease: Arc<SessionLeaseState>,
     freshness: crate::FreshnessPolicy,
     budget: Option<SharedProviderBudget>,
+    clock: Arc<dyn RegistryClock>,
+    session_started_at: TrustedRegistryTime,
     not_sync: PhantomData<Cell<()>>,
 }
 
@@ -28,11 +30,21 @@ impl CurrentHealthReporter {
         {
             return Err(RegistryError::HealthBindingMismatch);
         }
+        let trusted_reported_at = self.clock.observe()?;
+        if trusted_reported_at.monotonic() < self.session_started_at.monotonic() {
+            return Err(RegistryError::TrustedClockRegression);
+        }
+        if snapshot.observed_at() < self.session_started_at.wall()
+            || snapshot.observed_at() > trusted_reported_at.wall()
+        {
+            return Err(RegistryError::InvalidHealthTemporalOrder);
+        }
         Ok(CurrentHealthUpdate {
             snapshot,
             binding: self.binding.clone(),
             lease: Arc::clone(&self.lease),
             budget: CurrentBudgetAuthority::observe(self.budget.as_ref()),
+            trusted_reported_at,
         })
     }
 }
@@ -44,6 +56,7 @@ pub struct CurrentHealthUpdate {
     binding: FrameSessionBinding,
     lease: Arc<SessionLeaseState>,
     budget: CurrentBudgetAuthority,
+    trusted_reported_at: TrustedRegistryTime,
 }
 
 /// Opaque, non-serializable proof that one metadata revision was registered by one registry.
@@ -82,6 +95,7 @@ pub struct CurrentSourceSession {
     budget: Option<SharedProviderBudget>,
     lease: Arc<SessionLeaseState>,
     capture: crate::CaptureGenerationLease,
+    started_at: Timestamp,
 }
 
 impl CurrentSourceSession {
@@ -103,6 +117,11 @@ impl CurrentSourceSession {
     /// Returns the nonzero connection generation.
     pub fn generation(&self) -> ConnectionGeneration {
         self.binding.connection_generation()
+    }
+
+    /// Returns the registry-sealed session start timestamp.
+    pub const fn started_at(&self) -> Timestamp {
+        self.started_at
     }
 
     pub(crate) const fn frame_binding(&self) -> &FrameSessionBinding {
@@ -204,7 +223,8 @@ pub struct ValidatedCurrentSourceAuthority<'a> {
     validated: ValidatedSourceSession<'a>,
     health: &'a CurrentHealthAuthority,
     attestation: Option<&'a InstrumentUniverseAttestation>,
-    validated_at: Timestamp,
+    validated_at: TrustedRegistryTime,
+    clock: &'a Arc<dyn RegistryClock>,
 }
 
 impl<'a> ValidatedCurrentSourceAuthority<'a> {
@@ -223,17 +243,21 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
     ///
     /// Rejects a stale session, changed health epoch, unhealthy capture generation, or expired
     /// current-health deadline.
-    pub fn try_current_lease(
-        &self,
-        at: Timestamp,
-    ) -> Result<CurrentSourceAuthorityLease, RegistryError> {
+    pub fn try_current_lease(&self) -> Result<CurrentSourceAuthorityLease, RegistryError> {
+        let mint_at = self.clock.observe()?;
         self.validated.session.validate_current_lease()?;
-        if at < self.validated_at
+        if mint_at.monotonic() < self.validated_at.monotonic() {
+            return Err(RegistryError::TrustedClockRegression);
+        }
+        if mint_at.wall() < self.health.accepted_at.wall()
+            || mint_at.wall() < self.health.valid_from
+            || mint_at.wall() > self.health.valid_until
+            || mint_at.monotonic() > self.health.valid_until_monotonic
             || !self
-            .validated
-            .session
-            .lease
-            .validate_health_epoch(self.health.epoch, at)
+                .validated
+                .session
+                .lease
+                .validate_health_epoch(self.health.epoch, mint_at.wall())
             || !self.health.budget.is_available()
             || !self.validated.session.capture.is_healthy()
         {
@@ -243,12 +267,16 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
             registry_id: self.validated.session.registry_id,
             binding: self.validated.session.binding.clone(),
             health_epoch: self.health.epoch,
+            valid_from: self.health.valid_from,
             valid_until: self.health.valid_until,
+            valid_from_monotonic: self.health.accepted_at.monotonic(),
+            valid_until_monotonic: self.health.valid_until_monotonic,
             lease: Arc::clone(&self.validated.session.lease),
             capture: self.validated.session.capture.clone(),
             budget: self.health.budget.clone(),
+            clock: Arc::clone(self.clock),
         };
-        lease.validate_at(at)?;
+        lease.validate_at(mint_at.wall())?;
         Ok(lease)
     }
 
@@ -265,12 +293,16 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
         event_class: LiveEventClass,
         depth: Option<MarketDepth>,
     ) -> Result<ValidatedLiveScope, RegistryError> {
+        let scope_validated_at = self.clock.observe()?;
         self.validated.session.validate_current_lease()?;
+        if scope_validated_at.monotonic() < self.validated_at.monotonic() {
+            return Err(RegistryError::TrustedClockRegression);
+        }
         if !self
             .validated
             .session
             .lease
-            .validate_health_epoch(self.health.epoch, self.health.observed_at)
+            .validate_health_epoch(self.health.epoch, scope_validated_at.wall())
             || !self.health.budget.is_available()
         {
             return Err(RegistryError::HealthNotQualified);
@@ -297,6 +329,16 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
             .map_or(self.health.valid_until, |until| {
                 until.min(self.health.valid_until)
             });
+        let scope_deadline = scope_validated_at
+            .checked_deadline(valid_until)?
+            .map(|deadline| deadline.min(self.health.valid_until_monotonic));
+        if scope_validated_at.wall() < self.health.accepted_at.wall()
+            || scope_validated_at.wall() < self.health.valid_from
+            || scope_validated_at.wall() > valid_until
+            || scope_deadline.is_none()
+        {
+            return Err(RegistryError::HealthNotQualified);
+        }
         let topology = self.validated.metadata.coverage().topology();
         let consolidation = if topology.is_single_venue() {
             CoverageConsolidation::SingleVenue
@@ -337,10 +379,14 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
             static_authorization: self.validated.metadata.authorization().clone(),
             coverage,
             valid_until,
+            valid_from: self.health.valid_from,
+            valid_from_monotonic: self.health.accepted_at.monotonic(),
+            valid_until_monotonic: scope_deadline.ok_or(RegistryError::HealthNotQualified)?,
             health_epoch: self.health.epoch,
             lease: Arc::clone(&self.validated.session.lease),
             capture: self.validated.session.capture.clone(),
             budget: self.health.budget.clone(),
+            clock: Arc::clone(self.clock),
             universe_evidence: self.attestation.map(|value| value.evidence.clone()),
         })
     }
@@ -492,21 +538,37 @@ pub struct ValidatedLiveScope {
     static_authorization: crate::AuthorizationGrant,
     coverage: CurrentCoveragePolicy,
     valid_until: Timestamp,
+    valid_from: Timestamp,
+    valid_from_monotonic: Instant,
+    valid_until_monotonic: Instant,
     health_epoch: u64,
     lease: Arc<SessionLeaseState>,
     capture: crate::CaptureGenerationLease,
     budget: CurrentBudgetAuthority,
+    clock: Arc<dyn RegistryClock>,
     universe_evidence: Option<ExactPayloadEvidence>,
 }
 
 impl ValidatedLiveScope {
     /// Revalidates the allocation/health epoch and inclusive deadline in O(1).
     ///
+    /// `at` is the processor-owned wall-clock projection for the scoped event. A fresh sealed
+    /// wall/monotonic observation is checked independently, preventing an old projection from
+    /// extending authority across expiry or a wall-clock discontinuity.
+    ///
     /// # Errors
     ///
     /// Fails after health/subscription change, session/revision rollover, or deadline expiry.
     pub fn validate_at(&self, at: Timestamp) -> Result<(), RegistryError> {
-        if at <= self.valid_until
+        let trusted = self.clock.observe()?;
+        if trusted.monotonic() < self.valid_from_monotonic {
+            return Err(RegistryError::TrustedClockRegression);
+        }
+        if trusted.wall() >= self.valid_from
+            && trusted.wall() <= self.valid_until
+            && trusted.monotonic() <= self.valid_until_monotonic
+            && at >= self.valid_from
+            && at <= self.valid_until
             && self.lease.validate_health_epoch(self.health_epoch, at)
             && self.capture.is_healthy()
             && self.budget.is_available()
@@ -611,10 +673,14 @@ impl ValidatedLiveScope {
             registry_id: self.registry_id,
             binding: self.binding,
             health_epoch: self.health_epoch,
+            valid_from: self.valid_from,
+            valid_from_monotonic: self.valid_from_monotonic,
             valid_until: self.valid_until,
+            valid_until_monotonic: self.valid_until_monotonic,
             lease: self.lease,
             capture: self.capture,
             budget: self.budget,
+            clock: self.clock,
         };
         let key = CurrentBatchKey {
             venue: self.venue.clone(),

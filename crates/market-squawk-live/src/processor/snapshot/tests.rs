@@ -3,7 +3,7 @@ use std::error::Error;
 use std::str::FromStr;
 
 use crate::{BookLevelSnapshot, SnapshotCompleteness, StreamPhaseSnapshot};
-use market_squawk_domain::{InstrumentId, QuantityLots, SequenceNumber, Timestamp, TradingStatus};
+use market_squawk_domain::{InstrumentId, QuantityLots, SequenceNumber, TradingStatus};
 
 use super::{
     MAX_SNAPSHOT_LEVELS_PER_SIDE, MAX_SNAPSHOT_RETAINED_BYTES, MAX_SNAPSHOT_STREAMS,
@@ -14,10 +14,7 @@ use super::{
 #[path = "tests/fixture.rs"]
 mod fixture;
 
-use fixture::{
-    CONFIGURED_DEPTH, EVALUATED_AT, PopulatedState, RECEIVED_AT, SOURCE_TIMESTAMP,
-    SOURCE_VALID_UNTIL, TestResult, populated_state,
-};
+use fixture::{CONFIGURED_DEPTH, PopulatedState, TestResult, populated_state};
 
 const INSTRUMENT: &str = "4c74ab95-53b9-42ad-9b66-0ed403b88fed";
 
@@ -162,19 +159,10 @@ fn complete_seed_retains_depth_book_status_and_all_provenance_dimensions() -> Te
     assert_eq!(stream.snapshot_origin_revision, Some(1));
     assert!(stream.generation_current);
     assert_eq!(stream.health_epoch, 1);
-    assert_eq!(
-        stream.source_valid_until,
-        Timestamp::from_unix_nanos(SOURCE_VALID_UNTIL)
-    );
-    assert_eq!(
-        stream.source_timestamp,
-        Some(Timestamp::from_unix_nanos(SOURCE_TIMESTAMP))
-    );
-    assert_eq!(stream.received_at, Timestamp::from_unix_nanos(RECEIVED_AT));
-    assert_eq!(
-        stream.evaluated_at,
-        Timestamp::from_unix_nanos(EVALUATED_AT)
-    );
+    assert_eq!(stream.source_valid_until, state.source_valid_until);
+    assert_eq!(stream.source_timestamp, Some(state.source_timestamp));
+    assert_eq!(stream.received_at, state.received_at);
+    assert_eq!(stream.evaluated_at, state.evaluated_at);
     assert_ne!(stream.source_timestamp, Some(stream.received_at));
     assert_ne!(stream.received_at, stream.evaluated_at);
     assert_eq!(stream.trading_status, Some(TradingStatus::Halted));

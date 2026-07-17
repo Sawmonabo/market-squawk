@@ -6,6 +6,7 @@
 use std::error::Error;
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 use std::str::FromStr;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use market_squawk_domain::{
     AssetClass, AuthorizationBasis, ChecksumCapability, CoverageDelay, DataQuality,
@@ -24,6 +25,22 @@ use market_squawk_sources::{
 };
 
 pub(crate) type TestResult<T = ()> = Result<T, Box<dyn Error>>;
+
+pub(crate) fn now_timestamp() -> TestResult<Timestamp> {
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    Ok(Timestamp::from_unix_nanos(i64::try_from(nanos)?))
+}
+
+pub(crate) fn next_timestamp_after(previous: Timestamp) -> TestResult<Timestamp> {
+    for _ in 0..10_000 {
+        let candidate = now_timestamp()?;
+        if candidate > previous {
+            return Ok(candidate);
+        }
+        std::hint::spin_loop();
+    }
+    Err("system clock did not advance for test fixture".into())
+}
 
 pub(crate) fn source_identifier(value: &str) -> TestResult<SourceIdentifier> {
     Ok(SourceIdentifier::try_from(value)?)

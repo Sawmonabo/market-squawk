@@ -303,8 +303,10 @@ impl SourceHarness {
         capture_control.mark_healthy()?;
         let frames = registry.take_raw_frame_factory(&session)?;
         let reporter = registry.take_current_health_reporter(&session)?;
+        let timeline_origin = session.started_at();
         let valid_until = Timestamp::from_unix_nanos(
-            at.unix_nanos()
+            timeline_origin
+                .unix_nanos()
                 .checked_add(i64::try_from(FRESHNESS_NANOS)?)
                 .ok_or("valid-until overflow")?,
         );
@@ -318,11 +320,11 @@ impl SourceHarness {
             capture_degradation,
             frames,
             reporter,
-            last_health_at: at,
-            last_frame_at: at,
+            last_health_at: timeline_origin,
+            last_frame_at: timeline_origin,
             valid_until,
         };
-        harness.refresh_health_at(at)?;
+        harness.refresh_health_at(timeline_origin)?;
         Ok(harness)
     }
 
@@ -365,11 +367,10 @@ impl SourceHarness {
     }
 
     pub(super) fn current_lease(&self) -> TestResult<CurrentSourceAuthorityLease> {
-        let at = now()?;
         Ok(self
             .registry
-            .validate_current_authority(&self.session, at)?
-            .try_current_lease(at)?)
+            .validate_current_authority(&self.session)?
+            .try_current_lease()?)
     }
 
     pub(super) fn batch(
@@ -438,11 +439,8 @@ impl SourceHarness {
             )?);
         }
         let decoded = DecodedProviderBatch::try_new(decoder, decoded_observations)?;
-        let evaluated_at = now()?;
-        let current = self
-            .registry
-            .validate_current_authority(&self.session, evaluated_at)?;
-        let lease = current.try_current_lease(evaluated_at)?;
+        let current = self.registry.validate_current_authority(&self.session)?;
+        let lease = current.try_current_lease()?;
         let batches = current.validate_decoded_batch_owned(decoded, receipt)?;
         let mut batches = batches.into_iter();
         let batch = batches.next().ok_or("missing routed current batch")?;
@@ -507,11 +505,8 @@ impl SourceHarness {
             )?,
         )?;
         let decoded = DecodedProviderBatch::try_new(decoder, vec![observation])?;
-        let evaluated_at = now()?;
-        let current = self
-            .registry
-            .validate_current_authority(&self.session, evaluated_at)?;
-        let lease = current.try_current_lease(evaluated_at)?;
+        let current = self.registry.validate_current_authority(&self.session)?;
+        let lease = current.try_current_lease()?;
         let batches = current.validate_decoded_batch_owned(decoded, receipt)?;
         let mut batches = batches.into_iter();
         let batch = batches.next().ok_or("missing routed current batch")?;

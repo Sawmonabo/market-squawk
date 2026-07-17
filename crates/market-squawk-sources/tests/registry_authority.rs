@@ -17,7 +17,7 @@ use static_assertions::{assert_impl_all, assert_not_impl_any};
 
 use common::{
     TestResult, direct_metadata, direct_metadata_with_instruments, exact_evidence,
-    source_identifier,
+    next_timestamp_after, now_timestamp, source_identifier,
 };
 
 assert_not_impl_any!(market_squawk_sources::RegisteredSource: Clone, serde::Serialize, serde::de::DeserializeOwned);
@@ -63,15 +63,17 @@ fn healthy_snapshot(
     session: &market_squawk_sources::CurrentSourceSession,
     observed_at: i64,
 ) -> TestResult<SourceHealthSnapshot> {
+    let observed_at = Timestamp::from_unix_nanos(observed_at);
+    let valid_until = observed_at.checked_add_nanos(10_000_000_000)?;
     Ok(SourceHealthSnapshot::try_new(
         session,
-        Timestamp::from_unix_nanos(observed_at),
+        observed_at,
         ConnectionLiveness::Live {
-            last_activity_at: Timestamp::from_unix_nanos(observed_at),
+            last_activity_at: observed_at,
         },
-        Some(Timestamp::from_unix_nanos(observed_at)),
-        Some(Timestamp::from_unix_nanos(observed_at)),
-        Some(Timestamp::from_unix_nanos(observed_at)),
+        Some(observed_at),
+        Some(observed_at),
+        Some(observed_at),
         FreshnessPolicy::try_new(
             5_000_000_000,
             1_000_000_000,
@@ -83,13 +85,13 @@ fn healthy_snapshot(
         CaptureIntegrityState::Healthy,
         AuthorizationHealth::Valid {
             evidence: exact_evidence(31),
-            valid_until: Timestamp::from_unix_nanos(100),
+            valid_until,
         },
         CoverageHealth::Sufficient {
             evidence: exact_evidence(32),
             provider_product: ProviderProduct::new(source_identifier("direct-product")?),
             provider_channel: ProviderChannel::new(source_identifier("trades")?),
-            valid_until: Timestamp::from_unix_nanos(100),
+            valid_until,
         },
         BudgetHealth::Available,
         None,
@@ -415,23 +417,36 @@ fn coordinated_budget_proof_controls_health_and_queued_authority() -> TestResult
     capture_control.mark_healthy()?;
     let mut reporter = registry.take_current_health_reporter(&session)?;
     let budget = session.budget().ok_or("remote session budget missing")?;
+    let first_health_at = now_timestamp()?;
+    let qualified_health_at = next_timestamp_after(first_health_at)?;
+    let cooling_health_at = next_timestamp_after(qualified_health_at)?;
+    let disabled_health_at = next_timestamp_after(cooling_health_at)?;
 
     let permit = match budget.try_acquire() {
         BudgetDecision::Ready(permit) => permit,
         other => return Err(format!("unexpected budget decision: {other:?}").into()),
     };
-    registry.record_health(&session, reporter.report(healthy_snapshot(&session, 2)?)?)?;
+    registry.record_health(
+        &session,
+        reporter.report(healthy_snapshot(&session, first_health_at.unix_nanos())?)?,
+    )?;
     assert!(matches!(
-        registry.validate_current_authority(&session, Timestamp::from_unix_nanos(2)),
+        registry.validate_current_authority(&session),
         Err(RegistryError::HealthNotQualified)
     ));
     permit.release();
 
-    registry.record_health(&session, reporter.report(healthy_snapshot(&session, 3)?)?)?;
+    registry.record_health(
+        &session,
+        reporter.report(healthy_snapshot(
+            &session,
+            qualified_health_at.unix_nanos(),
+        )?)?,
+    )?;
     let queued = registry
-        .validate_current_authority(&session, Timestamp::from_unix_nanos(3))?
-        .try_current_lease(Timestamp::from_unix_nanos(3))?;
-    assert!(queued.validate_at(Timestamp::from_unix_nanos(3)).is_ok());
+        .validate_current_authority(&session)?
+        .try_current_lease()?;
+    assert!(queued.validate_at(qualified_health_at).is_ok());
 
     assert!(matches!(
         budget.apply_retry_after(RetryAfter::Delay(
@@ -440,19 +455,25 @@ fn coordinated_budget_proof_controls_health_and_queued_authority() -> TestResult
         BudgetDecision::WaitUntil(_)
     ));
     assert_eq!(
-        queued.validate_at(Timestamp::from_unix_nanos(3)),
+        queued.validate_at(qualified_health_at),
         Err(RegistryError::HealthNotQualified)
     );
-    registry.record_health(&session, reporter.report(healthy_snapshot(&session, 4)?)?)?;
+    registry.record_health(
+        &session,
+        reporter.report(healthy_snapshot(&session, cooling_health_at.unix_nanos())?)?,
+    )?;
     assert!(matches!(
-        registry.validate_current_authority(&session, Timestamp::from_unix_nanos(4)),
+        registry.validate_current_authority(&session),
         Err(RegistryError::HealthNotQualified)
     ));
 
     assert!(matches!(budget.disable(), BudgetDecision::Unavailable(_)));
-    registry.record_health(&session, reporter.report(healthy_snapshot(&session, 5)?)?)?;
+    registry.record_health(
+        &session,
+        reporter.report(healthy_snapshot(&session, disabled_health_at.unix_nanos())?)?,
+    )?;
     assert!(matches!(
-        registry.validate_current_authority(&session, Timestamp::from_unix_nanos(5)),
+        registry.validate_current_authority(&session),
         Err(RegistryError::HealthNotQualified)
     ));
     Ok(())
@@ -541,15 +562,17 @@ fn pre_feed_current_leases_are_deadline_capture_health_and_registry_bound() -> T
         reporter: &mut market_squawk_sources::CurrentHealthReporter,
         observed_at: i64,
     ) -> TestResult {
+        let observed = Timestamp::from_unix_nanos(observed_at);
+        let valid_until = observed.checked_add_nanos(10_000_000_000)?;
         let health = SourceHealthSnapshot::try_new(
             session,
-            Timestamp::from_unix_nanos(observed_at),
+            observed,
             ConnectionLiveness::Live {
-                last_activity_at: Timestamp::from_unix_nanos(observed_at),
+                last_activity_at: observed,
             },
-            Some(Timestamp::from_unix_nanos(observed_at)),
-            Some(Timestamp::from_unix_nanos(observed_at)),
-            Some(Timestamp::from_unix_nanos(observed_at)),
+            Some(observed),
+            Some(observed),
+            Some(observed),
             FreshnessPolicy::try_new(
                 5_000_000_000,
                 1_000_000_000,
@@ -561,13 +584,13 @@ fn pre_feed_current_leases_are_deadline_capture_health_and_registry_bound() -> T
             CaptureIntegrityState::Healthy,
             AuthorizationHealth::Valid {
                 evidence: exact_evidence(21),
-                valid_until: Timestamp::from_unix_nanos(12),
+                valid_until,
             },
             CoverageHealth::Sufficient {
                 evidence: exact_evidence(22),
                 provider_product: ProviderProduct::new(source_identifier("direct-product")?),
                 provider_channel: ProviderChannel::new(source_identifier("trades")?),
-                valid_until: Timestamp::from_unix_nanos(12),
+                valid_until,
             },
             BudgetHealth::Available,
             None,
@@ -613,26 +636,33 @@ fn pre_feed_current_leases_are_deadline_capture_health_and_registry_bound() -> T
         _first_admission,
         _first_frames,
     ) = setup()?;
-    record_qualified_health(&mut first, &first_session, &mut first_reporter, 2)?;
+    let first_at = now_timestamp()?;
+    record_qualified_health(
+        &mut first,
+        &first_session,
+        &mut first_reporter,
+        first_at.unix_nanos(),
+    )?;
     let lease = {
-        let current =
-            first.validate_current_authority(&first_session, Timestamp::from_unix_nanos(2))?;
-        let lease = current.try_current_lease(Timestamp::from_unix_nanos(12))?;
-        assert_eq!(lease.valid_until(), Timestamp::from_unix_nanos(12));
-        assert!(
-            current
-                .try_current_lease(Timestamp::from_unix_nanos(13))
-                .is_err()
-        );
+        let current = first.validate_current_authority(&first_session)?;
+        let lease = current.try_current_lease()?;
+        assert_eq!(lease.valid_from(), first_at);
+        assert!(lease.validate_at(first_at.checked_sub_nanos(1)?).is_err());
         lease
     };
-    assert!(lease.validate_at(Timestamp::from_unix_nanos(12)).is_ok());
-    assert!(lease.validate_at(Timestamp::from_unix_nanos(13)).is_err());
-    record_qualified_health(&mut first, &first_session, &mut first_reporter, 3)?;
-    assert!(lease.validate_at(Timestamp::from_unix_nanos(3)).is_err());
+    assert!(lease.validate_at(first_at).is_ok());
+    assert!(lease.validate_at(first_at.checked_sub_nanos(1)?).is_err());
+    let refreshed_at = next_timestamp_after(first_at)?;
+    record_qualified_health(
+        &mut first,
+        &first_session,
+        &mut first_reporter,
+        refreshed_at.unix_nanos(),
+    )?;
+    assert!(lease.validate_at(refreshed_at).is_err());
     let refreshed = first
-        .validate_current_authority(&first_session, Timestamp::from_unix_nanos(3))?
-        .try_current_lease(Timestamp::from_unix_nanos(3))?;
+        .validate_current_authority(&first_session)?
+        .try_current_lease()?;
     assert!(refreshed.health_epoch() > lease.health_epoch());
 
     let (
@@ -643,10 +673,16 @@ fn pre_feed_current_leases_are_deadline_capture_health_and_registry_bound() -> T
         _second_admission,
         _second_frames,
     ) = setup()?;
-    record_qualified_health(&mut second, &second_session, &mut second_reporter, 2)?;
+    let second_at = now_timestamp()?;
+    record_qualified_health(
+        &mut second,
+        &second_session,
+        &mut second_reporter,
+        second_at.unix_nanos(),
+    )?;
     let second_lease = second
-        .validate_current_authority(&second_session, Timestamp::from_unix_nanos(2))?
-        .try_current_lease(Timestamp::from_unix_nanos(2))?;
+        .validate_current_authority(&second_session)?
+        .try_current_lease()?;
     assert!(!refreshed.shares_registry_lineage_with(&second_lease));
     assert!(
         !refreshed
@@ -662,17 +698,19 @@ fn pre_feed_current_leases_are_deadline_capture_health_and_registry_bound() -> T
         exiting_admission,
         mut exiting_frames,
     ) = setup()?;
-    record_qualified_health(&mut exiting, &exiting_session, &mut exiting_reporter, 2)?;
+    let exiting_at = now_timestamp()?;
+    record_qualified_health(
+        &mut exiting,
+        &exiting_session,
+        &mut exiting_reporter,
+        exiting_at.unix_nanos(),
+    )?;
     let exiting_lease = exiting
-        .validate_current_authority(&exiting_session, Timestamp::from_unix_nanos(2))?
-        .try_current_lease(Timestamp::from_unix_nanos(2))?;
-    assert!(
-        exiting_lease
-            .validate_at(Timestamp::from_unix_nanos(2))
-            .is_ok()
-    );
+        .validate_current_authority(&exiting_session)?
+        .try_current_lease()?;
+    assert!(exiting_lease.validate_at(exiting_at).is_ok());
     let exiting_frame = exiting_frames.try_frame(
-        Timestamp::from_unix_nanos(2),
+        exiting_at,
         TransportFrameKind::Binary,
         Bytes::from_static(b"before-registry-exit"),
     )?;
@@ -680,7 +718,7 @@ fn pre_feed_current_leases_are_deadline_capture_health_and_registry_bound() -> T
     exiting_admission.validate_active(&exiting_frame)?;
     drop(exiting);
     assert_eq!(
-        exiting_lease.validate_at(Timestamp::from_unix_nanos(2)),
+        exiting_lease.validate_at(exiting_at),
         Err(RegistryError::HealthNotQualified)
     );
     assert!(matches!(
@@ -701,11 +739,7 @@ fn pre_feed_current_leases_are_deadline_capture_health_and_registry_bound() -> T
     ));
 
     first_degrade.mark_incomplete();
-    assert!(
-        refreshed
-            .validate_at(Timestamp::from_unix_nanos(3))
-            .is_err()
-    );
+    assert!(refreshed.validate_at(refreshed_at).is_err());
     Ok(())
 }
 
@@ -748,19 +782,23 @@ fn current_authority_is_scoped_by_venue_instrument_event_and_depth() -> TestResu
     capture_control.mark_healthy()?;
     let mut frames = registry.take_raw_frame_factory(&session)?;
     let mut health_reporter = registry.take_current_health_reporter(&session)?;
+    let health_at = now_timestamp()?;
+    let valid_until = health_at.checked_add_nanos(10_000_000_000)?;
+    let first_frame_at = health_at.checked_add_nanos(1)?;
+    let current_frame_at = health_at.checked_add_nanos(2)?;
     assert!(matches!(
-        registry.validate_current_authority(&session, Timestamp::from_unix_nanos(2)),
+        registry.validate_current_authority(&session),
         Err(RegistryError::HealthNotQualified)
     ));
     let health = SourceHealthSnapshot::try_new(
         &session,
-        Timestamp::from_unix_nanos(2),
+        health_at,
         ConnectionLiveness::Live {
-            last_activity_at: Timestamp::from_unix_nanos(2),
+            last_activity_at: health_at,
         },
-        Some(Timestamp::from_unix_nanos(2)),
-        Some(Timestamp::from_unix_nanos(2)),
-        Some(Timestamp::from_unix_nanos(2)),
+        Some(health_at),
+        Some(health_at),
+        Some(health_at),
         FreshnessPolicy::try_new(
             5_000_000_000,
             1_000_000_000,
@@ -772,13 +810,13 @@ fn current_authority_is_scoped_by_venue_instrument_event_and_depth() -> TestResu
         CaptureIntegrityState::Healthy,
         AuthorizationHealth::Valid {
             evidence: exact_evidence(11),
-            valid_until: Timestamp::from_unix_nanos(12),
+            valid_until,
         },
         CoverageHealth::Sufficient {
             evidence: exact_evidence(12),
             provider_product: ProviderProduct::new(source_identifier("direct-product")?),
             provider_channel: ProviderChannel::new(source_identifier("trades")?),
-            valid_until: Timestamp::from_unix_nanos(12),
+            valid_until,
         },
         BudgetHealth::Available,
         None,
@@ -786,7 +824,7 @@ fn current_authority_is_scoped_by_venue_instrument_event_and_depth() -> TestResu
     )?;
     let update = health_reporter.report(health)?;
     registry.record_health(&session, update)?;
-    let current = registry.validate_current_authority(&session, Timestamp::from_unix_nanos(2))?;
+    let current = registry.validate_current_authority(&session)?;
     current.validate_live_scope(
         &VenueId::try_from("coinbase")?,
         instrument,
@@ -794,12 +832,12 @@ fn current_authority_is_scoped_by_venue_instrument_event_and_depth() -> TestResu
         None,
     )?;
     let first_frame = frames.try_frame(
-        Timestamp::from_unix_nanos(3),
+        first_frame_at,
         TransportFrameKind::Binary,
         Bytes::from_static(b"same-payload"),
     )?;
     let second_frame = frames.try_frame(
-        Timestamp::from_unix_nanos(3),
+        first_frame_at,
         TransportFrameKind::Binary,
         Bytes::from_static(b"same-payload"),
     )?;
@@ -821,7 +859,7 @@ fn current_authority_is_scoped_by_venue_instrument_event_and_depth() -> TestResu
         VenueId::try_from("coinbase")?,
         instrument,
         ProviderTimestampEvidence::Provided {
-            value: Timestamp::from_unix_nanos(3),
+            value: first_frame_at,
             rule: rule("coinbase-timestamp")?,
         },
         ProviderSequenceEvidence::Provided {
@@ -860,7 +898,7 @@ fn current_authority_is_scoped_by_venue_instrument_event_and_depth() -> TestResu
     );
 
     let current_frame = frames.try_frame(
-        Timestamp::from_unix_nanos(4),
+        current_frame_at,
         TransportFrameKind::Binary,
         Bytes::from_static(b"current-payload"),
     )?;
@@ -880,7 +918,7 @@ fn current_authority_is_scoped_by_venue_instrument_event_and_depth() -> TestResu
                 VenueId::try_from("coinbase")?,
                 instrument,
                 ProviderTimestampEvidence::Provided {
-                    value: Timestamp::from_unix_nanos(4),
+                    value: current_frame_at,
                     rule: rule("coinbase-timestamp")?,
                 },
                 ProviderSequenceEvidence::Provided {

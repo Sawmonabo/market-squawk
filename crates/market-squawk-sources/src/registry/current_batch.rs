@@ -75,20 +75,36 @@ pub struct CurrentSourceAuthorityLease {
     registry_id: u64,
     binding: FrameSessionBinding,
     health_epoch: u64,
+    valid_from: Timestamp,
     valid_until: Timestamp,
+    valid_from_monotonic: Instant,
+    valid_until_monotonic: Instant,
     lease: Arc<SessionLeaseState>,
     capture: crate::CaptureGenerationLease,
     budget: CurrentBudgetAuthority,
+    clock: Arc<dyn RegistryClock>,
 }
 
 impl CurrentSourceAuthorityLease {
     /// Revalidates current generation, health epoch, capture, and inclusive deadline in O(1).
     ///
+    /// `at` is the processor-owned wall-clock projection for the event being admitted. The
+    /// registry also samples its sealed wall/monotonic clock here, so retaining an old in-range
+    /// projection cannot extend authority across expiry or a wall-clock discontinuity.
+    ///
     /// # Errors
     ///
     /// Fails after rollover/revision/health/capture changes or deadline expiry.
     pub fn validate_at(&self, at: Timestamp) -> Result<(), RegistryError> {
-        if at <= self.valid_until
+        let trusted = self.clock.observe()?;
+        if trusted.monotonic() < self.valid_from_monotonic {
+            return Err(RegistryError::TrustedClockRegression);
+        }
+        if trusted.wall() >= self.valid_from
+            && trusted.wall() <= self.valid_until
+            && trusted.monotonic() <= self.valid_until_monotonic
+            && at >= self.valid_from
+            && at <= self.valid_until
             && self.lease.validate_health_epoch(self.health_epoch, at)
             && self.capture.is_healthy()
             && self.budget.is_available()
@@ -109,6 +125,11 @@ impl CurrentSourceAuthorityLease {
         self.health_epoch
     }
 
+    /// Returns the inclusive accepted-health observation lower bound.
+    pub const fn valid_from(&self) -> Timestamp {
+        self.valid_from
+    }
+
     /// Returns the inclusive static/runtime health deadline bound into this lease.
     pub const fn valid_until(&self) -> Timestamp {
         self.valid_until
@@ -121,6 +142,7 @@ impl CurrentSourceAuthorityLease {
 
     fn shared_allocation_charge(&self) -> Result<usize, RegistryError> {
         let budget = self.budget.shared_allocation_charge()?;
+        let clock = self.clock.shared_allocation_charge();
         let session = std::mem::size_of::<SessionLeaseState>()
             .checked_add(crate::conservative_arc_control_block_charge::<
                 SessionLeaseState,
@@ -130,7 +152,7 @@ impl CurrentSourceAuthorityLease {
             .capture
             .shared_allocation_charge()
             .ok_or(RegistryError::RetainedSizeOverflow)?;
-        current_authority_shared_allocation_charge(session, capture, budget)
+        current_authority_shared_allocation_charge(session, capture, budget, clock)
     }
 }
 
@@ -138,10 +160,12 @@ fn current_authority_shared_allocation_charge(
     session: usize,
     capture: usize,
     budget: usize,
+    clock: usize,
 ) -> Result<usize, RegistryError> {
     session
         .checked_add(capture)
         .and_then(|bytes| bytes.checked_add(budget))
+        .and_then(|bytes| bytes.checked_add(clock))
         .ok_or(RegistryError::RetainedSizeOverflow)
 }
 
@@ -613,11 +637,24 @@ mod stream_key_tests {
         const SESSION: usize = 101;
         const CAPTURE: usize = 103;
         const BUDGET: usize = 107;
-        let without_budget = current_authority_shared_allocation_charge(SESSION, CAPTURE, 0)?;
+        let without_budget = current_authority_shared_allocation_charge(SESSION, CAPTURE, 0, 0)?;
         let with_budget =
-            current_authority_shared_allocation_charge(SESSION, CAPTURE, BUDGET)?;
+            current_authority_shared_allocation_charge(SESSION, CAPTURE, BUDGET, 0)?;
 
         assert_eq!(with_budget.checked_sub(without_budget), Some(BUDGET));
+        Ok(())
+    }
+
+    #[test]
+    fn authority_charge_adds_clock_allocation_exactly_once() -> Result<(), RegistryError> {
+        const SESSION: usize = 101;
+        const CAPTURE: usize = 103;
+        const CLOCK: usize = 109;
+        let without_clock = current_authority_shared_allocation_charge(SESSION, CAPTURE, 0, 0)?;
+        let with_clock =
+            current_authority_shared_allocation_charge(SESSION, CAPTURE, 0, CLOCK)?;
+
+        assert_eq!(with_clock.checked_sub(without_clock), Some(CLOCK));
         Ok(())
     }
 }
@@ -750,6 +787,18 @@ pub enum RegistryError {
     /// Health observation did not strictly advance the current generation's health clock.
     #[error("source health observation is stale or replayed")]
     StaleHealthObservation,
+    /// Health evidence fell outside the registry-sealed session/report/validation time chain.
+    #[error("source health evidence violates trusted temporal ordering")]
+    InvalidHealthTemporalOrder,
+    /// The sealed registry clock could not produce a representable observation.
+    #[error("trusted registry clock is unavailable")]
+    TrustedClockUnavailable,
+    /// The sealed registry clock moved backward relative to a prior observation.
+    #[error("trusted registry clock regressed")]
+    TrustedClockRegression,
+    /// A wall deadline could not be converted into the sealed monotonic clock domain.
+    #[error("source health monotonic deadline overflowed")]
+    HealthDeadlineOverflow,
     /// Decoder rule or provider evidence conflicts with current metadata-bound profiles.
     #[error("decoded provider batch conflicts with current protocol profile")]
     DecoderProfileMismatch,

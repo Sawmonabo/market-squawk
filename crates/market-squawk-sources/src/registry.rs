@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use market_squawk_domain::SchemaVersion;
 use market_squawk_domain::{
@@ -34,6 +35,7 @@ struct ActiveSessionKey {
     health_reporter_taken: bool,
     raw_frame_factory_taken: bool,
     capture: crate::CaptureGenerationLease,
+    started_at: TrustedRegistryTime,
 }
 
 #[derive(Debug)]
@@ -41,6 +43,7 @@ struct SessionLeaseState {
     current: AtomicBool,
     live_qualified: AtomicBool,
     health_epoch: AtomicU64,
+    valid_from_nanos: AtomicI64,
     valid_until_nanos: AtomicI64,
     last_health_observed_nanos: AtomicI64,
     frame_ordinal: AtomicU64,
@@ -59,23 +62,28 @@ impl SessionLeaseState {
         self.current.load(Ordering::Acquire)
     }
 
-    fn record_live_qualification(
+    fn next_health_epoch(&self) -> Option<u64> {
+        self.health_epoch.load(Ordering::Acquire).checked_add(1)
+    }
+
+    fn commit_live_qualification(
         &self,
+        epoch: u64,
         qualified: bool,
+        valid_from: Option<Timestamp>,
         valid_until: Option<Timestamp>,
-    ) -> Option<u64> {
-        let Some(epoch) = self.advance_health_epoch() else {
-            self.current.store(false, Ordering::Release);
-            self.live_qualified.store(false, Ordering::Release);
-            self.valid_until_nanos.store(i64::MIN, Ordering::Release);
-            return None;
-        };
+    ) {
+        self.live_qualified.store(false, Ordering::Release);
+        self.valid_from_nanos.store(
+            valid_from.map_or(i64::MAX, Timestamp::unix_nanos),
+            Ordering::Release,
+        );
         self.valid_until_nanos.store(
             valid_until.map_or(i64::MIN, Timestamp::unix_nanos),
             Ordering::Release,
         );
+        self.health_epoch.store(epoch, Ordering::Release);
         self.live_qualified.store(qualified, Ordering::Release);
-        Some(epoch)
     }
 
     fn is_live_qualified(&self) -> bool {
@@ -86,6 +94,7 @@ impl SessionLeaseState {
         self.is_current()
             && self.is_live_qualified()
             && self.health_epoch.load(Ordering::Acquire) == epoch
+            && at.unix_nanos() >= self.valid_from_nanos.load(Ordering::Acquire)
             && at.unix_nanos() <= self.valid_until_nanos.load(Ordering::Acquire)
     }
 
@@ -126,10 +135,88 @@ impl SessionLeaseState {
 struct CurrentHealthAuthority {
     epoch: u64,
     observed_at: Timestamp,
+    trusted_reported_at: TrustedRegistryTime,
+    accepted_at: TrustedRegistryTime,
+    valid_from: Timestamp,
     valid_until: Timestamp,
+    valid_until_monotonic: Instant,
     authorization: crate::AuthorizationHealth,
     coverage: crate::CoverageHealth,
     budget: CurrentBudgetAuthority,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TrustedRegistryTime {
+    wall: Timestamp,
+    monotonic: Instant,
+}
+
+impl TrustedRegistryTime {
+    const fn new(wall: Timestamp, monotonic: Instant) -> Self {
+        Self { wall, monotonic }
+    }
+
+    const fn wall(self) -> Timestamp {
+        self.wall
+    }
+
+    const fn monotonic(self) -> Instant {
+        self.monotonic
+    }
+
+    fn checked_deadline(self, until: Timestamp) -> Result<Option<Instant>, RegistryError> {
+        if until < self.wall {
+            return Ok(None);
+        }
+        let delta = until
+            .unix_nanos()
+            .checked_sub(self.wall.unix_nanos())
+            .ok_or(RegistryError::HealthDeadlineOverflow)?;
+        let nanos = u64::try_from(delta).map_err(|_| RegistryError::HealthDeadlineOverflow)?;
+        self.monotonic
+            .checked_add(Duration::from_nanos(nanos))
+            .map(Some)
+            .ok_or(RegistryError::HealthDeadlineOverflow)
+    }
+}
+
+trait RegistryClock: Send + Sync + std::fmt::Debug {
+    fn observe(&self) -> Result<TrustedRegistryTime, RegistryError>;
+
+    fn shared_allocation_charge(&self) -> usize;
+}
+
+#[derive(Debug)]
+struct SystemRegistryClock;
+
+impl SystemRegistryClock {
+    fn try_new() -> Result<Self, RegistryError> {
+        let duration = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| RegistryError::TrustedClockUnavailable)?;
+        let nanos = i64::try_from(duration.as_nanos())
+            .map_err(|_| RegistryError::TrustedClockUnavailable)?;
+        let _representable_wall_origin = Timestamp::from_unix_nanos(nanos);
+        Ok(Self)
+    }
+}
+
+impl RegistryClock for SystemRegistryClock {
+    fn observe(&self) -> Result<TrustedRegistryTime, RegistryError> {
+        let wall_duration = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| RegistryError::TrustedClockUnavailable)?;
+        let wall_nanos = i64::try_from(wall_duration.as_nanos())
+            .map_err(|_| RegistryError::TrustedClockUnavailable)?;
+        Ok(TrustedRegistryTime::new(
+            Timestamp::from_unix_nanos(wall_nanos),
+            Instant::now(),
+        ))
+    }
+
+    fn shared_allocation_charge(&self) -> usize {
+        std::mem::size_of::<Self>() + crate::conservative_arc_control_block_charge::<Self>()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -332,4 +419,7 @@ impl<'de> Deserialize<'de> for RegistryAuthorityState {
 include!("registry/catalog.rs");
 include!("registry/authority.rs");
 include!("registry/current_batch.rs");
+#[cfg(test)]
+#[path = "registry/test_support.rs"]
+mod test_support;
 include!("registry/tests.rs");

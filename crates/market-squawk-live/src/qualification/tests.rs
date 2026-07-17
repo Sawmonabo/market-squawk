@@ -40,11 +40,11 @@ mod assessment_contract;
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 const INSTRUMENT: &str = "4c74ab95-53b9-42ad-9b66-0ed403b88fed";
-const HEALTH_AT: i64 = 100;
-const FRAME_AT: i64 = 101;
-const EVALUATED_AT: i64 = 102;
-const AUTHORIZATION_UNTIL: i64 = 110;
-const COVERAGE_UNTIL: i64 = 120;
+const HEALTH_AT: i64 = 0;
+const FRAME_AT: i64 = 10_000_000;
+const EVALUATED_AT: i64 = 20_000_000;
+const AUTHORIZATION_UNTIL: i64 = 60_000_000_000;
+const COVERAGE_UNTIL: i64 = 70_000_000_000;
 
 #[derive(Clone, Copy, Debug)]
 struct FixturePolicy {
@@ -80,6 +80,8 @@ impl Default for FixturePolicy {
 struct CurrentFixture {
     observations: Vec<market_squawk_sources::CurrentProviderObservation>,
     capture_degradation: CaptureDegradationCapability,
+    evaluated_at: Timestamp,
+    authorization_until: Timestamp,
     _registry: AuthoritativeSourceRegistry,
 }
 
@@ -99,16 +101,19 @@ fn exact_evidence(byte: u8) -> ExactPayloadEvidence {
 }
 
 fn freshness() -> TestResult<FreshnessPolicy> {
-    Ok(FreshnessPolicy::try_new(1_000, 1_000, 1_000, 1_000, 10)?)
+    Ok(FreshnessPolicy::try_new(
+        120_000_000_000,
+        120_000_000_000,
+        120_000_000_000,
+        120_000_000_000,
+        100_000_000,
+    )?)
 }
 
 fn metadata(policy: FixturePolicy) -> TestResult<SourceMetadata> {
     let source_id = SourceId::try_from("coinbase-test")?;
     let revision = market_squawk_domain::MetadataRevision::new(id("revision-1")?);
-    let effective = EffectiveInterval::new(
-        Timestamp::from_unix_nanos(0),
-        Some(Timestamp::from_unix_nanos(1_000)),
-    )?;
+    let effective = EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?;
     let authorization = AuthorizationGrant::new(
         AuthorizationMode::PublicInterface,
         AuthorizationBasis::new(id("public-interface-terms-v1")?),
@@ -220,10 +225,16 @@ fn current_fixture(policy: FixturePolicy, frame_count: usize) -> TestResult<Curr
     capture_control.mark_healthy()?;
     let mut frames = registry.take_raw_frame_factory(&session)?;
     let mut health_reporter = registry.take_current_health_reporter(&session)?;
+    let origin = session.started_at();
+    let health_at = origin.checked_add_nanos(HEALTH_AT)?;
+    let frame_at = origin.checked_add_nanos(FRAME_AT)?;
+    let evaluated_at = origin.checked_add_nanos(EVALUATED_AT)?;
+    let authorization_until = origin.checked_add_nanos(AUTHORIZATION_UNTIL)?;
+    let coverage_until = origin.checked_add_nanos(COVERAGE_UNTIL)?;
     let authorization = if policy.runtime_authorized {
         AuthorizationHealth::Valid {
             evidence: exact_evidence(11),
-            valid_until: Timestamp::from_unix_nanos(AUTHORIZATION_UNTIL),
+            valid_until: authorization_until,
         }
     } else {
         AuthorizationHealth::Invalid
@@ -233,25 +244,25 @@ fn current_fixture(policy: FixturePolicy, frame_count: usize) -> TestResult<Curr
             evidence: exact_evidence(12),
             provider_product: ProviderProduct::new(id("advanced-trade")?),
             provider_channel: ProviderChannel::new(id("market-trades")?),
-            valid_until: Timestamp::from_unix_nanos(COVERAGE_UNTIL),
+            valid_until: coverage_until,
         },
         RuntimeCoverage::MismatchedProduct => CoverageHealth::Sufficient {
             evidence: exact_evidence(12),
             provider_product: ProviderProduct::new(id("wrong-product")?),
             provider_channel: ProviderChannel::new(id("market-trades")?),
-            valid_until: Timestamp::from_unix_nanos(COVERAGE_UNTIL),
+            valid_until: coverage_until,
         },
         RuntimeCoverage::Insufficient => CoverageHealth::Limited,
     };
     let health = SourceHealthSnapshot::try_new(
         &session,
-        Timestamp::from_unix_nanos(HEALTH_AT),
+        health_at,
         ConnectionLiveness::Live {
-            last_activity_at: Timestamp::from_unix_nanos(HEALTH_AT),
+            last_activity_at: health_at,
         },
-        Some(Timestamp::from_unix_nanos(HEALTH_AT)),
-        Some(Timestamp::from_unix_nanos(HEALTH_AT)),
-        Some(Timestamp::from_unix_nanos(HEALTH_AT)),
+        Some(health_at),
+        Some(health_at),
+        Some(health_at),
         freshness()?,
         StreamIntegrityState::Healthy,
         CaptureIntegrityState::Healthy,
@@ -266,7 +277,7 @@ fn current_fixture(policy: FixturePolicy, frame_count: usize) -> TestResult<Curr
     let mut observations = Vec::with_capacity(frame_count);
     for _ in 0..frame_count {
         let frame = frames.try_frame(
-            Timestamp::from_unix_nanos(FRAME_AT),
+            frame_at,
             TransportFrameKind::Binary,
             b"identical-wire-payload".as_slice().into(),
         )?;
@@ -288,7 +299,7 @@ fn current_fixture(policy: FixturePolicy, frame_count: usize) -> TestResult<Curr
             VenueId::try_from("coinbase")?,
             market_squawk_domain::InstrumentId::from_str(INSTRUMENT)?,
             ProviderTimestampEvidence::Provided {
-                value: Timestamp::from_unix_nanos(FRAME_AT),
+                value: frame_at,
                 rule: rule("coinbase-timestamp")?,
             },
             ProviderSequenceEvidence::Provided {
@@ -309,8 +320,7 @@ fn current_fixture(policy: FixturePolicy, frame_count: usize) -> TestResult<Curr
             },
         )?;
         let batch = DecodedProviderBatch::try_new(decoder, vec![observation])?;
-        let current =
-            registry.validate_current_authority(&session, Timestamp::from_unix_nanos(HEALTH_AT))?;
+        let current = registry.validate_current_authority(&session)?;
         let routed = current.validate_decoded_batch_owned(batch, receipt)?;
         let mut routed = routed.into_iter();
         let batch = routed.next().ok_or("missing routed batch")?;
@@ -324,6 +334,8 @@ fn current_fixture(policy: FixturePolicy, frame_count: usize) -> TestResult<Curr
     Ok(CurrentFixture {
         observations,
         capture_degradation,
+        evaluated_at,
+        authorization_until,
         _registry: registry,
     })
 }
@@ -381,7 +393,11 @@ fn qualify(
     build_qualified_event(
         current,
         evidence,
-        Timestamp::from_unix_nanos(EVALUATED_AT),
+        current
+            .frame_evidence()
+            .received_at()
+            .checked_add_nanos(EVALUATED_AT - FRAME_AT)
+            .map_err(|_| QualificationBuildError::ExpiredWindow)?,
         |provenance| {
             Ok(MarketEvent::Trade(TradeEvent::new(
                 provenance,
@@ -442,6 +458,8 @@ fn assessment_and_execution_digest_bind_exact_frame_ordinal_and_committed_revisi
 #[test]
 fn complete_evidence_mapping_derives_direct_verified_and_exact_deadline() -> TestResult {
     let fixture = current_fixture(FixturePolicy::default(), 1)?;
+    let evaluated_at = fixture.evaluated_at;
+    let authorization_until = fixture.authorization_until;
     let qualified = qualify(
         &fixture.observations[0],
         unsupported_evidence(1, TradingStatus::Active)?,
@@ -507,7 +525,7 @@ fn complete_evidence_mapping_derives_direct_verified_and_exact_deadline() -> Tes
             .market()
             .coverage()
             .result()
-            .status_at(Timestamp::from_unix_nanos(EVALUATED_AT)),
+            .status_at(evaluated_at),
         CoverageStatus::Sufficient
     );
     assert_eq!(
@@ -522,7 +540,7 @@ fn complete_evidence_mapping_derives_direct_verified_and_exact_deadline() -> Tes
         *assessment.market().capture().result(),
         CaptureIntegrityState::Healthy
     );
-    let deadline = Timestamp::from_unix_nanos(AUTHORIZATION_UNTIL);
+    let deadline = authorization_until;
     assert_eq!(qualified.valid_until, deadline);
     assert_eq!(assessment.valid_until(), deadline);
     assert_eq!(
@@ -530,7 +548,7 @@ fn complete_evidence_mapping_derives_direct_verified_and_exact_deadline() -> Tes
         AssessmentStatus::Satisfied
     );
     assert_eq!(
-        assessment.assessment_status_at(Timestamp::from_unix_nanos(AUTHORIZATION_UNTIL + 1)),
+        assessment.assessment_status_at(deadline.checked_add_nanos(1)?),
         AssessmentStatus::Rejected
     );
     Ok(())
@@ -614,6 +632,7 @@ fn declared_and_runtime_coverage_delivery_authorization_and_capture_fail_closed(
         },
         1,
     )?;
+    let evaluated_at = delayed.evaluated_at;
     let delayed = qualify(
         &delayed.observations[0],
         unsupported_evidence(1, TradingStatus::Active)?,
@@ -625,7 +644,7 @@ fn declared_and_runtime_coverage_delivery_authorization_and_capture_fail_closed(
             .market()
             .coverage()
             .result()
-            .status_at(Timestamp::from_unix_nanos(EVALUATED_AT)),
+            .status_at(evaluated_at),
         CoverageStatus::Insufficient
     );
 

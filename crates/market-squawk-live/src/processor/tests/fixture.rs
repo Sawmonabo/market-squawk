@@ -34,10 +34,10 @@ pub(super) type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 const INSTRUMENT: &str = "4c74ab95-53b9-42ad-9b66-0ed403b88fed";
 const VENUE: &str = "coinbase";
-pub(super) const HEALTH_AT: i64 = 1_000_000;
-pub(super) const FRAME_AT: i64 = HEALTH_AT + 10;
-pub(super) const EVALUATED_AT: i64 = FRAME_AT + 10;
-pub(super) const VALID_UNTIL: i64 = EVALUATED_AT + 1_000;
+pub(super) const HEALTH_AT: i64 = 0;
+pub(super) const FRAME_AT: i64 = 10_000_000;
+pub(super) const EVALUATED_AT: i64 = 20_000_000;
+pub(super) const VALID_UNTIL: i64 = 60_000_000_000;
 
 pub(super) fn id(value: &str) -> TestResult<SourceIdentifier> {
     Ok(SourceIdentifier::try_from(value)?)
@@ -55,7 +55,13 @@ fn evidence(byte: u8) -> ExactPayloadEvidence {
 }
 
 fn freshness() -> Result<FreshnessPolicy, market_squawk_sources::SourceMetadataError> {
-    FreshnessPolicy::try_new(100_000, 100_000, 100_000, 100_000, 100)
+    FreshnessPolicy::try_new(
+        120_000_000_000,
+        120_000_000_000,
+        120_000_000_000,
+        120_000_000_000,
+        100_000_000,
+    )
 }
 
 fn instrument_id() -> TestResult<InstrumentId> {
@@ -184,6 +190,7 @@ pub(super) struct SourceHarness {
     pub(super) capture_degradation: CaptureDegradationCapability,
     frames: RawFrameFactory,
     reporter: CurrentHealthReporter,
+    timeline_origin: Timestamp,
 }
 
 impl SourceHarness {
@@ -192,20 +199,19 @@ impl SourceHarness {
         let revision = format!("{source}-revision");
         let registered =
             registry.register(metadata(source, &revision)?, Timestamp::from_unix_nanos(1))?;
-        Self::activate(registry, registered, generation, HEALTH_AT)
+        Self::activate(registry, registered, generation)
     }
 
     fn activate(
         mut registry: AuthoritativeSourceRegistry,
         registered: RegisteredSource,
         generation: u64,
-        health_at: i64,
     ) -> TestResult<Self> {
         let session = registry.begin_session(
             &registered,
             SessionId::new(id(&format!("session-{generation}"))?),
             ConnectionGeneration::new(generation)?,
-            Timestamp::from_unix_nanos(health_at - 1),
+            Timestamp::from_unix_nanos(1),
         )?;
         let capabilities = registry.take_capture_generation_capabilities(&session)?;
         let (mut capture_control, capture_admission, capture_degradation) =
@@ -213,6 +219,7 @@ impl SourceHarness {
         capture_control.mark_healthy()?;
         let frames = registry.take_raw_frame_factory(&session)?;
         let reporter = registry.take_current_health_reporter(&session)?;
+        let timeline_origin = session.started_at();
         let mut harness = Self {
             registry,
             registered,
@@ -221,13 +228,19 @@ impl SourceHarness {
             capture_degradation,
             frames,
             reporter,
+            timeline_origin,
         };
-        harness.refresh_health(health_at)?;
+        harness.refresh_health(HEALTH_AT)?;
         Ok(harness)
     }
 
+    pub(super) fn timestamp(&self, offset_nanos: i64) -> TestResult<Timestamp> {
+        Ok(self.timeline_origin.checked_add_nanos(offset_nanos)?)
+    }
+
     pub(super) fn refresh_health(&mut self, observed_at: i64) -> TestResult {
-        let observed = Timestamp::from_unix_nanos(observed_at);
+        let observed = self.timestamp(observed_at)?;
+        let valid_until = self.timestamp(VALID_UNTIL)?;
         let health = SourceHealthSnapshot::try_new(
             &self.session,
             observed,
@@ -242,13 +255,13 @@ impl SourceHarness {
             CaptureIntegrityState::Healthy,
             AuthorizationHealth::Valid {
                 evidence: evidence(11),
-                valid_until: Timestamp::from_unix_nanos(VALID_UNTIL),
+                valid_until,
             },
             CoverageHealth::Sufficient {
                 evidence: evidence(12),
                 provider_product: ProviderProduct::new(id("advanced-trade")?),
                 provider_channel: ProviderChannel::new(id("market-data")?),
-                valid_until: Timestamp::from_unix_nanos(VALID_UNTIL),
+                valid_until,
             },
             BudgetHealth::Available,
             None,
@@ -259,11 +272,11 @@ impl SourceHarness {
         Ok(())
     }
 
-    pub(super) fn current_lease(&self, at: i64) -> TestResult<CurrentSourceAuthorityLease> {
+    pub(super) fn current_lease(&self, _at: i64) -> TestResult<CurrentSourceAuthorityLease> {
         Ok(self
             .registry
-            .validate_current_authority(&self.session, Timestamp::from_unix_nanos(at))?
-            .try_current_lease(Timestamp::from_unix_nanos(at))?)
+            .validate_current_authority(&self.session)?
+            .try_current_lease()?)
     }
 
     pub(super) fn batch(
@@ -274,7 +287,7 @@ impl SourceHarness {
         snapshot: ProviderSnapshotEvidence,
     ) -> TestResult<(CurrentSourceAuthorityLease, CurrentDecodedProviderBatch)> {
         let frame = self.frames.try_frame(
-            Timestamp::from_unix_nanos(FRAME_AT),
+            self.timestamp(FRAME_AT)?,
             TransportFrameKind::Binary,
             source_identifier.as_bytes().to_vec().into(),
         )?;
@@ -288,7 +301,7 @@ impl SourceHarness {
             VenueId::try_from(VENUE)?,
             instrument_id()?,
             ProviderTimestampEvidence::Provided {
-                value: Timestamp::from_unix_nanos(FRAME_AT),
+                value: self.timestamp(FRAME_AT)?,
                 rule: rule("coinbase-timestamp")?,
             },
             ProviderSequenceEvidence::Provided {
@@ -302,10 +315,8 @@ impl SourceHarness {
             payload,
         )?;
         let decoded = DecodedProviderBatch::try_new(decoder, vec![observation])?;
-        let current = self
-            .registry
-            .validate_current_authority(&self.session, Timestamp::from_unix_nanos(EVALUATED_AT))?;
-        let lease = current.try_current_lease(Timestamp::from_unix_nanos(EVALUATED_AT))?;
+        let current = self.registry.validate_current_authority(&self.session)?;
+        let lease = current.try_current_lease()?;
         let batches = current.validate_decoded_batch_owned(decoded, receipt)?;
         let mut batches = batches.into_iter();
         let batch = batches.next().ok_or("missing routed current batch")?;
@@ -324,9 +335,10 @@ impl SourceHarness {
             capture_degradation: _,
             frames: _,
             reporter: _,
+            timeline_origin,
         } = self;
-        registry.end_session(&session, Timestamp::from_unix_nanos(at))?;
-        Self::activate(registry, registered, generation, at + 1)
+        registry.end_session(&session, timeline_origin.checked_add_nanos(at)?)?;
+        Self::activate(registry, registered, generation)
     }
 }
 

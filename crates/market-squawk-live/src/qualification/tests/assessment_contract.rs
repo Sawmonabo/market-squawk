@@ -1,11 +1,10 @@
 use market_squawk_domain::{
     AssessmentStatus, CoverageStatus, DataQuality, EligibilityFailure, PayloadHash,
-    PayloadReference, Timestamp, TradingStatus,
+    PayloadReference, TradingStatus,
 };
 
 use super::{
-    EVALUATED_AT, FixturePolicy, TestResult, current_fixture, provenance, qualify,
-    unsupported_evidence,
+    FixturePolicy, TestResult, current_fixture, provenance, qualify, unsupported_evidence,
 };
 
 #[test]
@@ -77,14 +76,8 @@ fn assessment_provenance_retains_binding_payload_and_assessment_reference() -> T
         ))
     );
     assert_eq!(provenance.received_at(), frame.received_at());
-    assert_eq!(
-        provenance.available_at(),
-        Timestamp::from_unix_nanos(EVALUATED_AT)
-    );
-    assert_eq!(
-        provenance.ingested_at(),
-        Timestamp::from_unix_nanos(EVALUATED_AT)
-    );
+    assert_eq!(provenance.available_at(), fixture.evaluated_at);
+    assert_eq!(provenance.ingested_at(), fixture.evaluated_at);
     assert_eq!(
         provenance.recorded_quality(),
         qualified.assessment.recorded_quality()
