@@ -433,28 +433,59 @@ impl RegistryAuthorityState {
     }
 
     pub(crate) fn canonicalize(&mut self) -> Result<(), crate::policy::AuthorityPersistenceError> {
-        let mut sources = self.sources.as_slice().to_vec();
+        let mut sources = Vec::new();
+        sources
+            .try_reserve(self.sources.len())
+            .map_err(|_| crate::policy::AuthorityPersistenceError::StateTooLarge)?;
+        for source in self.sources.as_slice() {
+            let mut revisions = Vec::new();
+            revisions
+                .try_reserve(source.used_revisions.len())
+                .map_err(|_| crate::policy::AuthorityPersistenceError::StateTooLarge)?;
+            revisions.extend(source.used_revisions.as_slice().iter().cloned());
+            revisions.sort_by(|left, right| {
+                left.as_source_identifier()
+                    .cmp(right.as_source_identifier())
+            });
+            if revisions.windows(2).any(|pair| pair[0] == pair[1]) {
+                return Err(crate::policy::AuthorityPersistenceError::InvalidState);
+            }
+            let mut canonical_source = source.clone();
+            canonical_source.used_revisions = BoundedVec::try_new(revisions)
+                .map_err(|_| crate::policy::AuthorityPersistenceError::StateTooLarge)?;
+            sources.push(canonical_source);
+        }
         sources.sort_by(|left, right| left.source_id.cmp(&right.source_id));
-        let mut policies = self
-            .budget_policies
-            .as_slice()
-            .iter()
-            .map(|policy| {
-                serde_json::to_vec(&policy)
-                    .map(|key| (key, policy))
-                    .map_err(|_| crate::policy::AuthorityPersistenceError::InvalidState)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        if sources
+            .windows(2)
+            .any(|pair| pair[0].source_id == pair[1].source_id)
+        {
+            return Err(crate::policy::AuthorityPersistenceError::InvalidState);
+        }
+        let mut policies = Vec::new();
+        policies
+            .try_reserve(self.budget_policies.len())
+            .map_err(|_| crate::policy::AuthorityPersistenceError::StateTooLarge)?;
+        for policy in self.budget_policies.as_slice() {
+            let key = serde_json::to_vec(policy)
+                .map_err(|_| crate::policy::AuthorityPersistenceError::InvalidState)?;
+            policies.push((key, policy.clone()));
+        }
         policies.sort_by(|left, right| left.0.cmp(&right.0));
+        if policies.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return Err(crate::policy::AuthorityPersistenceError::InvalidState);
+        }
+        let mut canonical_policies = Vec::new();
+        canonical_policies
+            .try_reserve(policies.len())
+            .map_err(|_| crate::policy::AuthorityPersistenceError::StateTooLarge)?;
+        for (_key, policy) in policies {
+            canonical_policies.push(policy);
+        }
         self.sources = BoundedVec::try_new(sources)
             .map_err(|_| crate::policy::AuthorityPersistenceError::StateTooLarge)?;
-        self.budget_policies = BoundedVec::try_new(
-            policies
-                .into_iter()
-                .map(|(_key, policy)| policy.clone())
-                .collect(),
-        )
-        .map_err(|_| crate::policy::AuthorityPersistenceError::StateTooLarge)?;
+        self.budget_policies = BoundedVec::try_new(canonical_policies)
+            .map_err(|_| crate::policy::AuthorityPersistenceError::StateTooLarge)?;
         Ok(())
     }
 
@@ -496,6 +527,9 @@ mod catalog_persistence;
 include!("registry/health_authority.rs");
 include!("registry/authority.rs");
 include!("registry/current_batch.rs");
+#[cfg(test)]
+#[path = "registry/canonicalization_tests.rs"]
+mod canonicalization_tests;
 #[cfg(test)]
 #[path = "registry/test_support.rs"]
 mod test_support;
