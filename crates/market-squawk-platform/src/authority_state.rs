@@ -137,7 +137,7 @@ impl LocalAuthorityStateStore {
         }
         let lock = lock.into_std();
         lock.try_lock_exclusive().map_err(|source| {
-            if source.kind() == io::ErrorKind::WouldBlock {
+            if is_lock_contended(&source) {
                 LocalAuthorityStateStoreError::AlreadyLocked
             } else {
                 io_error("acquire lock", source)
@@ -281,15 +281,14 @@ impl LocalAuthorityStateStore {
         }
         drop(temporary);
 
-        let canonical_exists = match reject_unsafe_entry_if_present(&self.directory, CANONICAL_FILE)
-        {
-            Ok(exists) => exists,
+        match reject_unsafe_entry_if_present(&self.directory, CANONICAL_FILE) {
+            Ok(_) => {}
             Err(error) => {
                 self.remove_regular_temp_best_effort();
                 return Err(error);
             }
-        };
-        if let Err(error) = self.install_temporary(canonical_exists) {
+        }
+        if let Err(error) = self.install_temporary() {
             self.remove_regular_temp_best_effort();
             return Err(error);
         }
@@ -325,34 +324,15 @@ impl LocalAuthorityStateStore {
         }
     }
 
-    #[cfg(unix)]
-    fn install_temporary(
-        &self,
-        _canonical_exists: bool,
-    ) -> Result<(), LocalAuthorityStateStoreError> {
-        self.directory
-            .rename(TEMP_FILE, &self.directory, CANONICAL_FILE)
-            .map_err(|source| io_error("atomically install canonical state", source))
-    }
-
-    #[cfg(windows)]
-    fn install_temporary(
-        &self,
-        canonical_exists: bool,
-    ) -> Result<(), LocalAuthorityStateStoreError> {
-        if canonical_exists {
-            return Err(LocalAuthorityStateStoreError::AtomicReplaceUnsupported);
-        }
+    #[cfg(any(unix, windows))]
+    fn install_temporary(&self) -> Result<(), LocalAuthorityStateStoreError> {
         self.directory
             .rename(TEMP_FILE, &self.directory, CANONICAL_FILE)
             .map_err(|source| io_error("atomically install canonical state", source))
     }
 
     #[cfg(not(any(unix, windows)))]
-    fn install_temporary(
-        &self,
-        _canonical_exists: bool,
-    ) -> Result<(), LocalAuthorityStateStoreError> {
+    fn install_temporary(&self) -> Result<(), LocalAuthorityStateStoreError> {
         Err(LocalAuthorityStateStoreError::AtomicReplaceUnsupported)
     }
 
@@ -603,6 +583,14 @@ fn set_private_root_permissions(_directory: &Dir) -> Result<(), LocalAuthoritySt
 
 fn io_error(operation: &'static str, source: io::Error) -> LocalAuthorityStateStoreError {
     LocalAuthorityStateStoreError::Io { operation, source }
+}
+
+fn is_lock_contended(source: &io::Error) -> bool {
+    let expected = fs2::lock_contended_error();
+    match (source.raw_os_error(), expected.raw_os_error()) {
+        (Some(actual), Some(expected)) => actual == expected,
+        _ => source.kind() == expected.kind(),
+    }
 }
 
 fn is_unambiguous_regular(metadata: &cap_std::fs::Metadata) -> bool {

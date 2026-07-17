@@ -3,6 +3,7 @@
 ## Document control
 
 - Researched: 2026-07-16
+- Updated: 2026-07-17 after hosted Windows failure diagnosis
 - Applies to: Q2-I03 provider-budget restart persistence
 - Implementation base: Q2 remediation plan commit `de101ee`
 - Platform-store implementation: `61c4292`
@@ -31,11 +32,12 @@ Rust documents that dropping a `File` ignores close errors and directs callers t
 errors handled to `File::sync_all`. Its implementation maps `sync_all` to the platform file-sync
 operation. Therefore a plain write followed by drop is insufficient for an authority checkpoint.
 
-Rust's `rename` replaces an existing destination, requires source and destination to remain on the
-same mount, maps to `rename` on Unix and Windows rename primitives on Windows, and documents
-platform differences when the destination exists. The implementation must keep the temporary file
-in the same confined directory and must test replacement on every supported target rather than
-assuming Unix behavior on Windows.
+Rust's `rename` replaces an existing destination and requires source and destination to remain on
+the same mount. Rust 1.97 documents that its Windows implementation selects `MoveFileExW` or
+`SetFileInformationByHandle`, with the same behavior on Windows 10 version 1607 and later when
+`FileRenameInfoEx` is supported. The implementation keeps the temporary file in the same confined
+directory and tests replacement on every supported target rather than assuming Unix behavior on
+Windows.
 
 Sources:
 
@@ -122,12 +124,19 @@ serializes writers inside a process, and retains an exclusive filesystem lock ac
 lifetime. On Unix, installation is same-directory replacement followed by directory sync and a
 canonical reopen/digest/payload verification.
 
-The workspace forbids unsafe Rust. The pinned safe capability APIs do not expose Windows'
-`ReplaceFileW`; ordinary Windows rename does not provide a portable replace-existing contract.
-Consequently the store supports first installation on Windows but returns a typed, fail-closed
-`AtomicReplaceUnsupported` error when a canonical file already exists. It never deletes the old
-file to simulate replacement. Full Windows replacement support requires a separately reviewed safe
-platform boundary; no Windows durability result is claimed by this macOS implementation run.
+The workspace forbids unsafe Rust. The pinned `cap-std` 4.0.2 Windows implementation resolves both
+parents from retained directory capabilities and delegates the final rename to `std::fs::rename`.
+The store therefore uses that same capability-relative, replace-existing operation on Unix and
+Windows. It never deletes the old file to simulate replacement. Windows replacement errors remain
+typed filesystem failures, and success still requires reopening and validating the canonical
+envelope.
+
+The Windows contract synchronizes the complete temporary file before replacement and verifies the
+canonical file after replacement. It does not claim Unix-style directory-entry durability because
+the safe Windows capability boundary in this implementation does not expose a supported directory
+flush. Hosted `windows-2025` verification is required to prove clean replacement and lifetime-lock
+behavior for every candidate; arbitrary power-loss behavior remains explicitly outside that
+claim.
 
 ## Required regression matrix
 

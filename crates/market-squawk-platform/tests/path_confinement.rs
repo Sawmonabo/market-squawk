@@ -1,6 +1,8 @@
 use std::path::Path;
 
-use market_squawk_platform::{ArtifactPathError, JournalError, LocalPaths};
+#[cfg(unix)]
+use market_squawk_platform::JournalError;
+use market_squawk_platform::{ArtifactPathError, LocalPaths};
 use tempfile::tempdir;
 
 #[test]
