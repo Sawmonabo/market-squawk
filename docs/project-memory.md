@@ -75,6 +75,19 @@ A serialized hotspot does not justify idling unrelated work. Documentation, prov
 fixtures, isolated adapters, pure analytical kernels, tests in disjoint packages, and later-wave
 design can proceed when their inputs are stable or explicitly provisional.
 
+### Worktree lifecycle
+
+An isolated lane worktree is temporary execution infrastructure, not a permanent archive. Remove it
+promptly after all of its commits and follow-up artifacts are integrated or otherwise handed off,
+its reported evidence is recorded, its agent is no longer using it, and `git status --short` is
+clean. Prune the corresponding worktree metadata after removal. The branch and commits may remain
+until the normal branch-completion decision; deleting a worktree does not imply deleting its branch.
+
+Never use forced worktree removal merely to make the directory list tidy. A modified or untracked
+worktree is unresolved state: inspect it, determine ownership, and either integrate, preserve, or
+explicitly escalate it. Do not discard user or prior-agent files, and do not remove a worktree while
+an agent or verification command still depends on it.
+
 If one lane remains the critical path across two consecutive status updates or one complete
 verification/review cycle, the integration owner must perform a scheduling audit:
 
@@ -141,6 +154,7 @@ completed focused or full gates
 remaining blocker and why it is serialized
 the precise event that releases the next barrier
 whether root is clean and unchanged
+completed worktrees removed and any dirty worktrees deliberately preserved
 ```
 
 Report reviews as `pending`, `rejected`, or `approved` with the reviewed commit. Report
@@ -171,4 +185,3 @@ The correction is permanent:
 
 This correction does not weaken production gates. It removes avoidable coordination latency while
 preserving the authority, memory, persistence, lifecycle, and review invariants those gates protect.
-

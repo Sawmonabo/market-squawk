@@ -21,5 +21,6 @@ In particular:
   are not quarter approval.
 - Report progress by outcome, frozen commit, active lane, remaining blocker, and next barrier. A
   historical task number alone is not an adequate status report.
+- Remove clean lane worktrees promptly after integration and handoff. Never force-remove a dirty or
+  still-active worktree; reconcile or preserve its uncommitted state first.
 - Keep all provider-access evasion mechanisms permanently excluded.
-
