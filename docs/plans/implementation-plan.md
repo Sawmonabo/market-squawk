@@ -65,6 +65,16 @@ The first code-level plan is:
 
 - [`2026-07-16-market-squawk-stage-1-foundation.md`](../superpowers/plans/2026-07-16-market-squawk-stage-1-foundation.md)
 
+The independently completed Q3 live-production plan is also persisted now rather than held behind
+Q2 remediation:
+
+- [Q3 production design](../superpowers/specs/2026-07-16-market-squawk-q3-production-design.md)
+- [Q3 production implementation plan](../superpowers/plans/2026-07-16-market-squawk-q3-production-plan.md)
+
+Those Q3 artifacts use `834674a` only as an audit anchor. They are not executable until Q2 is
+formally approved; Q3 Task 0 must replace the anchor with the approved Q2 exact commit and refresh
+every file, line, interface, dependency edge, and baseline result.
+
 Subsequent plan artifacts have fixed names and are written after the preceding stage fixes the
 actual public APIs they consume:
 

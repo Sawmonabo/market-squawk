@@ -4,6 +4,11 @@ Read and follow [`docs/project-memory.md`](docs/project-memory.md) before planni
 It defines the repository's binding parallel-ownership, review-checkpoint, exact-head verification,
 and progress-reporting rules.
 
+Current controlling artifacts are the
+[Q2 integrated remediation plan](docs/superpowers/plans/2026-07-16-q2-integrated-checkpoint-remediation.md)
+and the provisional, approved-base-gated
+[Q3 production plan](docs/superpowers/plans/2026-07-16-market-squawk-q3-production-plan.md).
+
 1. Use the pinned Rust 1.97.0 toolchain, including the repository's `rustfmt` and Clippy components.
 2. Add or update a failing test before implementation changes.
 3. Keep source-specific schemas inside adapters.
