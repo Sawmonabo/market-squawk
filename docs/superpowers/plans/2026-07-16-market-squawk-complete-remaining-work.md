@@ -64,7 +64,7 @@ ONNX-compatible inference.
 - Q2 live-memory and application-boundary lanes are integrated. Source authority A1-A3 are not
   integrated, A3 is rejected, A4 is not started, checkpoint truth is not refreshed, and Q2 is not
   approved.
-- The detailed Q3 production design and 18-task implementation plan exist, but execution is blocked
+- The detailed Q3 production design and 19-task implementation plan exist, but execution is blocked
   until formal Q2 approval and a Task 0 refresh against that exact approved commit.
 
 ## Completion dependency graph
@@ -238,7 +238,7 @@ Detailed controlling design and plan:
 - [`../specs/2026-07-16-market-squawk-q3-production-design.md`](../specs/2026-07-16-market-squawk-q3-production-design.md)
 - [`2026-07-16-market-squawk-q3-production-plan.md`](2026-07-16-market-squawk-q3-production-plan.md)
 
-All 18 Q3 tasks remain pending until Q2 approval:
+All 19 Q3 tasks remain pending until Q2 approval:
 
 - [ ] Q3.0 refresh every plan/design path, interface, and baseline against the approved Q2 tag.
 - [ ] Q3.1 enforce the closed Q3 dependency DAG and prohibit production `test-support` features.
