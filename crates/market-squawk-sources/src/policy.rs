@@ -1,6 +1,5 @@
 //! Network endpoint and shared provider-budget policy.
 
-use std::collections::HashMap;
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -15,6 +14,10 @@ use crate::bounded::BoundedVec;
 
 const MAX_ENDPOINTS: usize = 32;
 const MAX_API_RULES: usize = 32;
+const MAX_CANONICAL_AUTHORITIES: usize = MAX_ENDPOINTS + MAX_API_RULES;
+const MAX_PROCESS_BUDGET_SCOPES: usize = 4_096;
+const MAX_MERGED_CANONICAL_AUTHORITIES: usize =
+    MAX_PROCESS_BUDGET_SCOPES * MAX_CANONICAL_AUTHORITIES;
 const MAX_QUERY_RULES: usize = 32;
 const MAX_ENDPOINT_URL_BYTES: usize = 2_048;
 const MAX_REDIRECTS: u8 = 8;
@@ -254,6 +257,12 @@ enum EndpointScheme {
     Wss,
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct CanonicalNetworkAuthority {
+    host: SourceIdentifier,
+    port: u16,
+}
+
 impl NormalizedEndpoint {
     fn parse(value: &str) -> Result<Self, NetworkPolicyError> {
         Self::parse_with_query(value, false)
@@ -301,6 +310,8 @@ impl NormalizedEndpoint {
             .ok_or(NetworkPolicyError::EndpointDenied {
                 reason: EndpointDenialReason::MissingHost,
             })?
+            .trim_start_matches('[')
+            .trim_end_matches(']')
             .to_ascii_lowercase();
         let port = url
             .port_or_known_default()
@@ -343,6 +354,13 @@ impl NormalizedEndpoint {
 
     fn same_origin(&self, other: &Self) -> bool {
         self.scheme == other.scheme && self.host == other.host && self.port == other.port
+    }
+
+    fn canonical_network_authority(&self) -> CanonicalNetworkAuthority {
+        CanonicalNetworkAuthority {
+            host: self.host.clone(),
+            port: self.port,
+        }
     }
 }
 

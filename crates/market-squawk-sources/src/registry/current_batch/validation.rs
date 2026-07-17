@@ -99,6 +99,12 @@ pub enum RegistryError {
     /// Shared provider-budget coordinator rejected or could not initialize policy.
     #[error("source provider-budget coordination failed")]
     BudgetCoordinator,
+    /// Trusted credential/entitlement subject resolution failed.
+    #[error("source authorization subject could not be resolved")]
+    AuthorizationSubjectResolution,
+    /// Persisted subject evidence disagreed with fresh trusted resolution.
+    #[error("persisted authorization subject does not match trusted resolution")]
+    AuthorizationSubjectMismatch,
     /// The sole generation-bound raw frame factory was already issued.
     #[error("raw frame factory was already taken for this session")]
     RawFrameFactoryAlreadyTaken,

@@ -11,14 +11,16 @@ use market_squawk_domain::SchemaVersion;
 use market_squawk_domain::{
     ConnectionGeneration, CoverageConsolidation, CoverageDelay, DeliveryEvidence,
     EffectiveInterval, ExactPayloadEvidence, InstrumentId, LiveEventClass, MarketDepth,
-    MetadataRevision, ProviderProduct, SourceId, Timestamp, VenueId,
+    MetadataRevision, ProviderProduct, SourceId, SourceIdentifier, Timestamp, VenueId,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
-use crate::ProviderBudgetPolicy;
 use crate::bounded::BoundedVec;
-use crate::policy::{BudgetAvailabilityLease, ProviderBudgetPool};
+use crate::policy::{
+    BudgetAvailabilityLease, BudgetPolicyResolutionError, PersistedProviderBudgetPolicy,
+    ProviderBudgetPool, ResolvedProviderBudgetPolicy,
+};
 use crate::{FrameSessionBinding, SessionId, SharedProviderBudget, SourceMetadata};
 
 static NEXT_REGISTRY_ID: AtomicU64 = AtomicU64::new(1);
@@ -203,6 +205,19 @@ trait RegistryClock: Send + Sync + std::fmt::Debug {
 }
 
 #[derive(Debug)]
+struct UnconfiguredAuthorizationSubjectResolver;
+
+impl crate::AuthorizationSubjectResolver for UnconfiguredAuthorizationSubjectResolver {
+    fn resolve_subject_record(
+        &self,
+        _mode: crate::AuthorizationMode,
+        _evidence: market_squawk_domain::EvidenceDigest,
+    ) -> Result<SourceIdentifier, crate::AuthorizationSubjectResolutionError> {
+        Err(crate::AuthorizationSubjectResolutionError::EvidenceUnresolved)
+    }
+}
+
+#[derive(Debug)]
 struct SystemRegistryClock;
 
 impl SystemRegistryClock {
@@ -376,7 +391,7 @@ struct PersistedSourceAuthority {
 pub struct RegistryAuthorityState {
     schema_version: SchemaVersion,
     sources: BoundedVec<PersistedSourceAuthority, MAX_AUTHORITY_SOURCES>,
-    budget_policies: BoundedVec<ProviderBudgetPolicy, MAX_BUDGET_SCOPES>,
+    budget_policies: BoundedVec<PersistedProviderBudgetPolicy, MAX_BUDGET_SCOPES>,
 }
 
 impl RegistryAuthorityState {
@@ -390,7 +405,7 @@ impl RegistryAuthorityState {
 
     fn try_new(
         sources: Vec<PersistedSourceAuthority>,
-        budget_policies: Vec<ProviderBudgetPolicy>,
+        budget_policies: Vec<PersistedProviderBudgetPolicy>,
     ) -> Result<Self, RegistryError> {
         if sources.iter().any(|source| {
             source.last_epoch == 0
@@ -403,7 +418,7 @@ impl RegistryAuthorityState {
         }) || budget_policies.iter().enumerate().any(|(index, policy)| {
             budget_policies[index.saturating_add(1)..]
                 .iter()
-                .any(|other| policy.scope() == other.scope())
+                .any(|other| policy == other)
         }) {
             return Err(RegistryError::InvalidAuthorityState);
         }
@@ -422,7 +437,7 @@ impl RegistryAuthorityState {
 struct RegistryAuthorityStateWire {
     schema_version: SchemaVersion,
     sources: BoundedVec<PersistedSourceAuthority, MAX_AUTHORITY_SOURCES>,
-    budget_policies: BoundedVec<ProviderBudgetPolicy, MAX_BUDGET_SCOPES>,
+    budget_policies: BoundedVec<PersistedProviderBudgetPolicy, MAX_BUDGET_SCOPES>,
 }
 
 impl<'de> Deserialize<'de> for RegistryAuthorityState {

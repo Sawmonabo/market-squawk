@@ -316,7 +316,7 @@ impl SourceMetadata {
         self.schema_version
     }
 
-    /// Returns the bounded provider identity used for budget sharing and diagnostics.
+    /// Returns the bounded provider label retained for metadata and diagnostics.
     pub const fn provider(&self) -> &SourceIdentifier {
         &self.provider
     }

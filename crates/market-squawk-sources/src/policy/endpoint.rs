@@ -154,6 +154,31 @@ impl EndpointPolicy {
         self.client_profile
     }
 
+    pub(crate) fn canonical_network_authorities(
+        &self,
+    ) -> Result<BoundedVec<CanonicalNetworkAuthority, MAX_CANONICAL_AUTHORITIES>, NetworkPolicyError>
+    {
+        let mut authorities = self
+            .endpoints
+            .as_slice()
+            .iter()
+            .map(NormalizedEndpoint::canonical_network_authority)
+            .chain(
+                self.api_rules
+                    .as_slice()
+                    .iter()
+                    .map(|rule| rule.base.canonical_network_authority()),
+            )
+            .collect::<Vec<_>>();
+        authorities.sort_unstable();
+        authorities.dedup();
+        if authorities.is_empty() {
+            return Err(NetworkPolicyError::EmptyEndpointSet);
+        }
+        BoundedVec::try_new(authorities)
+            .map_err(|error| NetworkPolicyError::TooManyEndpoints { max: error.max })
+    }
+
     /// Reauthorizes a redirect and decides whether sensitive headers may be forwarded.
     ///
     /// # Errors

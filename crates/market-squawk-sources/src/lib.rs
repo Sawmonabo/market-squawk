@@ -61,13 +61,13 @@ pub use live::{
     ValidatedRawMarketFrame,
 };
 pub use metadata::{
-    AuthorizationGrant, AuthorizationMode, ChecksumAlgorithm, ChecksumBookScope,
-    ChecksumValidationProfile, CoverageDomain, CoverageTopology, FreshnessPolicy,
-    HistoricalCapability, InstrumentCoverage, InstrumentCoverageMembership,
-    LiveCoverageDeclaration, LiveCoverageRule, LiveProtocolProfile, NetworkAccessPolicy,
-    ProviderNumericPolicy, SemanticInterpretationProfile, SequenceValidationProfile,
-    SourceCapabilities, SourceClass, SourceCoverage, SourceMetadata, SourceMetadataError,
-    SourceMetadataInput, SourceProtocolProfile,
+    AuthorizationGrant, AuthorizationMode, AuthorizationSubjectResolutionError,
+    AuthorizationSubjectResolver, ChecksumAlgorithm, ChecksumBookScope, ChecksumValidationProfile,
+    CoverageDomain, CoverageTopology, FreshnessPolicy, HistoricalCapability, InstrumentCoverage,
+    InstrumentCoverageMembership, LiveCoverageDeclaration, LiveCoverageRule, LiveProtocolProfile,
+    NetworkAccessPolicy, ProviderNumericPolicy, SemanticInterpretationProfile,
+    SequenceValidationProfile, SourceCapabilities, SourceClass, SourceCoverage, SourceMetadata,
+    SourceMetadataError, SourceMetadataInput, SourceProtocolProfile,
 };
 pub use policy::{
     ApiEndpointRule, AuthorizedRequest, BackoffPolicy, BudgetDecision, BudgetPermit,

@@ -55,6 +55,38 @@ pub enum AuthorizationMode {
     UserOwnedLocal,
 }
 
+/// Trusted composition boundary that resolves exact authorization evidence to a stable local
+/// credential or entitlement record.
+///
+/// Provider names, account labels, authorization-basis text, source IDs, and locators are
+/// intentionally absent from this contract. Implementations belong to the local keyring,
+/// credential-store, or entitlement composition boundary and must return the same stable record
+/// for every alias of one credential.
+pub trait AuthorizationSubjectResolver: std::fmt::Debug + Send + Sync {
+    /// Resolves account-qualified authorization evidence to its stable local record identity.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the mode is unsupported or the exact evidence is not bound to a trusted local
+    /// credential/entitlement record.
+    fn resolve_subject_record(
+        &self,
+        mode: AuthorizationMode,
+        evidence: market_squawk_domain::EvidenceDigest,
+    ) -> Result<SourceIdentifier, AuthorizationSubjectResolutionError>;
+}
+
+/// Trusted authorization-subject resolution failure.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum AuthorizationSubjectResolutionError {
+    /// Public and local-owned modes do not have account-qualified subject records.
+    #[error("authorization mode has no resolvable remote subject")]
+    UnsupportedMode,
+    /// Exact authorization evidence was not bound to a trusted local record.
+    #[error("authorization evidence is not bound to a trusted subject record")]
+    EvidenceUnresolved,
+}
+
 /// Whether this source may perform any network I/O.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]

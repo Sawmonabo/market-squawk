@@ -6,6 +6,7 @@ pub struct AuthoritativeSourceRegistry {
     budgets: ProviderBudgetPool,
     history: BTreeMap<SourceId, SourceAuthorityHistory>,
     clock: Arc<dyn RegistryClock>,
+    authorization_subject_resolver: Arc<dyn crate::AuthorizationSubjectResolver>,
 }
 
 impl Drop for AuthoritativeSourceRegistry {
@@ -33,6 +34,24 @@ impl AuthoritativeSourceRegistry {
         Self::try_new_with_authority_state(RegistryAuthorityState::empty())
     }
 
+    /// Creates an empty registry with a trusted credential/entitlement subject resolver.
+    ///
+    /// The resolver is consulted only for account-qualified user-authorized or licensed budgets;
+    /// public-interface budgets are derived solely from normalized endpoint origins.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError::RegistryIdentityExhausted`] when registry identity is exhausted.
+    pub fn try_new_with_authorization_subject_resolver(
+        resolver: Arc<dyn crate::AuthorizationSubjectResolver>,
+    ) -> Result<Self, RegistryError> {
+        Self::try_new_with_authority_state_and_clock_and_resolver(
+            RegistryAuthorityState::empty(),
+            Arc::new(SystemRegistryClock::try_new()?),
+            resolver,
+        )
+    }
+
     /// Restores bounded authority tombstones before any source can be registered.
     ///
     /// # Errors
@@ -47,9 +66,38 @@ impl AuthoritativeSourceRegistry {
         )
     }
 
+    /// Restores authority state and retains a trusted account-subject resolver for later metadata
+    /// registration.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid persisted authority or coordinator conflicts.
+    pub fn try_new_with_authority_state_and_authorization_subject_resolver(
+        state: RegistryAuthorityState,
+        resolver: Arc<dyn crate::AuthorizationSubjectResolver>,
+    ) -> Result<Self, RegistryError> {
+        Self::try_new_with_authority_state_and_clock_and_resolver(
+            state,
+            Arc::new(SystemRegistryClock::try_new()?),
+            resolver,
+        )
+    }
+
     fn try_new_with_authority_state_and_clock(
         state: RegistryAuthorityState,
         clock: Arc<dyn RegistryClock>,
+    ) -> Result<Self, RegistryError> {
+        Self::try_new_with_authority_state_and_clock_and_resolver(
+            state,
+            clock,
+            Arc::new(UnconfiguredAuthorizationSubjectResolver),
+        )
+    }
+
+    fn try_new_with_authority_state_and_clock_and_resolver(
+        state: RegistryAuthorityState,
+        clock: Arc<dyn RegistryClock>,
+        authorization_subject_resolver: Arc<dyn crate::AuthorizationSubjectResolver>,
     ) -> Result<Self, RegistryError> {
         let instance_id = NEXT_REGISTRY_ID
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
@@ -58,8 +106,18 @@ impl AuthoritativeSourceRegistry {
             .map_err(|_| RegistryError::RegistryIdentityExhausted)?;
         let mut budgets =
             ProviderBudgetPool::new().map_err(|_| RegistryError::BudgetCoordinator)?;
+        let resolved_policies = state
+            .budget_policies
+            .as_slice()
+            .iter()
+            .map(|persisted| {
+                persisted
+                    .resolve(authorization_subject_resolver.as_ref())
+                    .map_err(map_budget_resolution_error)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         budgets
-            .register_all(state.budget_policies.as_slice())
+            .register_all(&resolved_policies)
             .map_err(|_| RegistryError::BudgetCoordinator)?;
         let history = state
             .sources
@@ -82,6 +140,7 @@ impl AuthoritativeSourceRegistry {
             budgets,
             history,
             clock,
+            authorization_subject_resolver,
         })
     }
 
@@ -144,9 +203,10 @@ impl AuthoritativeSourceRegistry {
         let mut used_revisions =
             previous.map_or_else(Vec::new, |history| history.used_revisions.clone());
         used_revisions.push(revision.clone());
-        let budget = metadata
-            .budget_policy()
-            .cloned()
+        let budget = resolve_provider_budget_policy(
+            &metadata,
+            self.authorization_subject_resolver.as_ref(),
+        )?
             .map(|policy| self.budgets.register(policy))
             .transpose()
             .map_err(|_| RegistryError::BudgetCoordinator)?;
@@ -214,9 +274,10 @@ impl AuthoritativeSourceRegistry {
             .checked_add(1)
             .ok_or(RegistryError::EpochExhausted)?;
         let revision = metadata.revision().clone();
-        let budget = metadata
-            .budget_policy()
-            .cloned()
+        let budget = resolve_provider_budget_policy(
+            &metadata,
+            self.authorization_subject_resolver.as_ref(),
+        )?
             .map(|policy| self.budgets.register(policy))
             .transpose()
             .map_err(|_| RegistryError::BudgetCoordinator)?;
@@ -563,4 +624,36 @@ impl AuthoritativeSourceRegistry {
         })
     }
 
+}
+
+fn resolve_provider_budget_policy(
+    metadata: &SourceMetadata,
+    resolver: &dyn crate::AuthorizationSubjectResolver,
+) -> Result<Option<ResolvedProviderBudgetPolicy>, RegistryError> {
+    let Some(policy) = metadata.budget_policy() else {
+        return Ok(None);
+    };
+    let crate::NetworkAccessPolicy::Allowlisted(endpoint_policy) = metadata.network_policy() else {
+        return Err(RegistryError::InvalidAuthorityState);
+    };
+    ResolvedProviderBudgetPolicy::try_new(
+        policy.clone(),
+        endpoint_policy.clone(),
+        metadata.authorization().clone(),
+        resolver,
+    )
+    .map(Some)
+    .map_err(map_budget_resolution_error)
+}
+
+fn map_budget_resolution_error(error: BudgetPolicyResolutionError) -> RegistryError {
+    match error {
+        BudgetPolicyResolutionError::InvalidPolicy => RegistryError::InvalidAuthorityState,
+        BudgetPolicyResolutionError::SubjectResolution(_) => {
+            RegistryError::AuthorizationSubjectResolution
+        }
+        BudgetPolicyResolutionError::SubjectMismatch => {
+            RegistryError::AuthorizationSubjectMismatch
+        }
+    }
 }

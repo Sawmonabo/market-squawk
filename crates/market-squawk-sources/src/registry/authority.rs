@@ -128,7 +128,7 @@ impl CurrentSourceSession {
         &self.binding
     }
 
-    /// Returns the same registry-coordinated budget shared by this provider/account scope.
+    /// Returns the registry-coordinated budget for this canonical collision group.
     pub const fn budget(&self) -> Option<&SharedProviderBudget> {
         self.budget.as_ref()
     }

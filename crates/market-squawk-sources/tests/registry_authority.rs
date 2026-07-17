@@ -1,17 +1,22 @@
 mod common;
 
+use std::collections::HashMap;
 use std::num::NonZeroU64;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use market_squawk_domain::{
     CaptureAuthorityBundle, CaptureDegradation, CaptureIntegrityState, ConnectionGeneration,
-    CoverageConsolidation, CoverageDelay, DeliveryEvidence, ProviderChannel, ProviderProduct,
-    RawCaptureFrameView, StreamIntegrityState, Timestamp,
+    CoverageConsolidation, CoverageDelay, DeliveryEvidence, DigestAlgorithm, EvidenceDigest,
+    ProviderChannel, ProviderProduct, RawCaptureFrameView, SourceIdentifier, StreamIntegrityState,
+    Timestamp,
 };
 use market_squawk_sources::{
-    AuthoritativeSourceRegistry, AuthorizationHealth, BudgetDecision, BudgetHealth,
-    ConnectionLiveness, CoverageHealth, FreshnessPolicy, RawMarketFrame, RegistryAuthorityState,
-    RegistryError, RetryAfter, SessionId, SourceHealthSnapshot, TransportFrameKind,
+    AuthoritativeSourceRegistry, AuthorizationHealth, AuthorizationMode,
+    AuthorizationSubjectResolutionError, AuthorizationSubjectResolver, BudgetDecision,
+    BudgetHealth, ConnectionLiveness, CoverageHealth, FreshnessPolicy, RawMarketFrame,
+    RegistryAuthorityState, RegistryError, RetryAfter, SessionId, SourceHealthSnapshot,
+    TransportFrameKind,
 };
 use static_assertions::{assert_impl_all, assert_not_impl_any};
 
@@ -41,6 +46,7 @@ fn direct_metadata_for_provider(
     source: &str,
     revision: &str,
     provider: &str,
+    endpoint: &str,
 ) -> TestResult<market_squawk_sources::SourceMetadata> {
     let mut wire = serde_json::to_value(direct_metadata(source, revision, 0, None)?)?;
     let metadata = wire
@@ -56,7 +62,131 @@ fn direct_metadata_for_provider(
         .and_then(serde_json::Value::as_object_mut)
         .ok_or("source metadata budget scope was absent")?;
     scope.insert("provider".to_owned(), serde_json::json!(provider));
+    let network = metadata
+        .get_mut("network")
+        .and_then(serde_json::Value::as_object_mut)
+        .and_then(|network| network.get_mut("allowlisted"))
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or("source metadata allowlist was absent")?;
+    network.insert("endpoints".to_owned(), serde_json::json!([endpoint]));
     Ok(serde_json::from_value(wire)?)
+}
+
+type RemoteAuthorizationAlias<'a> = (&'a str, u8, Option<(&'a str, &'a str)>);
+
+fn remote_metadata_alias(
+    source: &str,
+    revision: &str,
+    provider: &str,
+    endpoints: &[&str],
+    authorization: Option<RemoteAuthorizationAlias<'_>>,
+    requests_per_window: u32,
+) -> TestResult<market_squawk_sources::SourceMetadata> {
+    let mut wire = serde_json::to_value(direct_metadata(source, revision, 0, None)?)?;
+    let metadata = wire
+        .as_object_mut()
+        .ok_or("source metadata did not serialize as an object")?;
+    metadata.insert("provider".to_owned(), serde_json::json!(provider));
+    let network = metadata
+        .get_mut("network")
+        .and_then(serde_json::Value::as_object_mut)
+        .and_then(|network| network.get_mut("allowlisted"))
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or("source metadata allowlist was absent")?;
+    network.insert("endpoints".to_owned(), serde_json::json!(endpoints));
+    let budget = metadata
+        .get_mut("budget")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or("source metadata budget was absent")?;
+    budget.insert(
+        "requests_per_window".to_owned(),
+        serde_json::json!(requests_per_window),
+    );
+    let scope = budget
+        .get_mut("scope")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or("source metadata budget scope was absent")?;
+    scope.insert("provider".to_owned(), serde_json::json!(provider));
+    if let Some((account_alias, _, _)) = authorization {
+        scope.insert(
+            "authorization_account".to_owned(),
+            serde_json::json!(account_alias),
+        );
+    }
+
+    if let Some((account_alias, evidence_byte, locator)) = authorization {
+        metadata.insert("source_class".to_owned(), serde_json::json!("broker"));
+        let authorization = metadata
+            .get_mut("authorization")
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or("source authorization was absent")?;
+        authorization.insert("mode".to_owned(), serde_json::json!("user_authorized"));
+        authorization.insert("basis".to_owned(), serde_json::json!(account_alias));
+        let evidence = authorization
+            .get_mut("evidence")
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or("authorization evidence was absent")?;
+        let content_digest = evidence
+            .get_mut("content_digest")
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or("authorization evidence digest was absent")?;
+        content_digest.insert(
+            "bytes".to_owned(),
+            serde_json::json!(vec![evidence_byte; 32]),
+        );
+        if let Some((reference, version)) = locator {
+            evidence.insert(
+                "version_pinned_locator".to_owned(),
+                serde_json::json!({"reference": reference, "version": version}),
+            );
+        }
+        let coverage = metadata
+            .get_mut("coverage")
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or("source coverage was absent")?;
+        coverage.insert(
+            "delivery".to_owned(),
+            serde_json::json!("authorized_broker"),
+        );
+    }
+    Ok(serde_json::from_value(wire)?)
+}
+
+#[derive(Debug)]
+struct EvidenceBoundSubjectResolver {
+    records: HashMap<EvidenceDigest, SourceIdentifier>,
+}
+
+impl AuthorizationSubjectResolver for EvidenceBoundSubjectResolver {
+    fn resolve_subject_record(
+        &self,
+        mode: AuthorizationMode,
+        evidence: EvidenceDigest,
+    ) -> Result<SourceIdentifier, AuthorizationSubjectResolutionError> {
+        if !matches!(
+            mode,
+            AuthorizationMode::UserAuthorized | AuthorizationMode::Licensed
+        ) {
+            return Err(AuthorizationSubjectResolutionError::UnsupportedMode);
+        }
+        self.records
+            .get(&evidence)
+            .cloned()
+            .ok_or(AuthorizationSubjectResolutionError::EvidenceUnresolved)
+    }
+}
+
+fn subject_resolver(records: &[(u8, &str)]) -> TestResult<Arc<dyn AuthorizationSubjectResolver>> {
+    let records = records
+        .iter()
+        .map(|(byte, record)| {
+            Ok((
+                EvidenceDigest::new(DigestAlgorithm::Sha256, [*byte; 32]),
+                source_identifier(record)?,
+            ))
+        })
+        .collect::<TestResult<HashMap<_, _>>>()?;
+    Ok(Arc::new(EvidenceBoundSubjectResolver { records }))
 }
 
 fn healthy_snapshot(
@@ -300,17 +430,26 @@ fn two_sources_with_one_scope_share_concurrency_and_cooldown() -> TestResult {
 
 #[test]
 fn process_coordinator_interns_registry_and_restored_budget_allocations() -> TestResult {
-    let provider = "process-budget-interner-provider";
     let mut first_registry = AuthoritativeSourceRegistry::try_new()?;
     let first = first_registry.register(
-        direct_metadata_for_provider("interner-a", "interner-rev-a", provider)?,
+        direct_metadata_for_provider(
+            "interner-a",
+            "interner-rev-a",
+            "display-provider-alias-a",
+            "wss://process-interner.example.test/feed-a",
+        )?,
         Timestamp::from_unix_nanos(1),
     )?;
     let first_budget = first.budget().ok_or("first coordinated budget missing")?;
 
     let mut second_registry = AuthoritativeSourceRegistry::try_new()?;
     let second = second_registry.register(
-        direct_metadata_for_provider("interner-b", "interner-rev-b", provider)?,
+        direct_metadata_for_provider(
+            "interner-b",
+            "interner-rev-b",
+            "display-provider-alias-b",
+            "https://process-interner.example.test/feed-b",
+        )?,
         Timestamp::from_unix_nanos(1),
     )?;
     let second_budget = second.budget().ok_or("second coordinated budget missing")?;
@@ -319,7 +458,12 @@ fn process_coordinator_interns_registry_and_restored_budget_allocations() -> Tes
     let state = first_registry.export_authority_state()?;
     let mut restored = AuthoritativeSourceRegistry::try_new_with_authority_state(state)?;
     let restored_source = restored.register(
-        direct_metadata_for_provider("interner-c", "interner-rev-c", provider)?,
+        direct_metadata_for_provider(
+            "interner-c",
+            "interner-rev-c",
+            "display-provider-alias-c",
+            "wss://process-interner.example.test/feed-c",
+        )?,
         Timestamp::from_unix_nanos(1),
     )?;
     assert!(
@@ -367,11 +511,411 @@ fn process_coordinator_interns_registry_and_restored_budget_allocations() -> Tes
 }
 
 #[test]
+fn account_aliases_and_locator_metadata_cannot_multiply_one_credential_budget() -> TestResult {
+    let resolver = subject_resolver(&[(41, "credential-record-a"), (44, "credential-record-a")])?;
+    let mut first = AuthoritativeSourceRegistry::try_new_with_authorization_subject_resolver(
+        Arc::clone(&resolver),
+    )?;
+    let mut second = AuthoritativeSourceRegistry::try_new_with_authorization_subject_resolver(
+        Arc::clone(&resolver),
+    )?;
+    let first_source = first.register(
+        remote_metadata_alias(
+            "account-alias-a",
+            "account-alias-rev-a",
+            "provider-display-a",
+            &["wss://identity-budget.example.test/feed-a"],
+            Some(("account-display-a", 41, Some(("record-a", "version-a")))),
+            2,
+        )?,
+        Timestamp::from_unix_nanos(1),
+    )?;
+    let second_source = second.register(
+        remote_metadata_alias(
+            "account-alias-b",
+            "account-alias-rev-b",
+            "provider-display-b",
+            &["wss://identity-budget.example.test/feed-b"],
+            Some(("account-display-b", 44, Some(("record-b", "version-b")))),
+            2,
+        )?,
+        Timestamp::from_unix_nanos(1),
+    )?;
+    let first_budget = first_source
+        .budget()
+        .ok_or("first account budget missing")?;
+    let second_budget = second_source
+        .budget()
+        .ok_or("second account budget missing")?;
+    assert!(first_budget.shares_allocation_with(second_budget));
+
+    let permit = match first_budget.try_acquire() {
+        BudgetDecision::Ready(permit) => permit,
+        other => return Err(format!("unexpected account acquire: {other:?}").into()),
+    };
+    assert!(matches!(
+        second_budget.try_acquire(),
+        BudgetDecision::Unavailable(
+            market_squawk_sources::BudgetUnavailableReason::ConcurrencyExhausted
+        )
+    ));
+    permit.release();
+    Ok(())
+}
+
+#[test]
+fn public_endpoint_subset_and_superset_share_on_any_authority_overlap() -> TestResult {
+    let mut first = AuthoritativeSourceRegistry::try_new()?;
+    let mut second = AuthoritativeSourceRegistry::try_new()?;
+    let first_source = first.register(
+        remote_metadata_alias(
+            "overlap-subset-a",
+            "overlap-subset-rev-a",
+            "overlap-display-a",
+            &[
+                "wss://overlap-subset.example.test/feed-a",
+                "https://independent-a.example.test/data",
+            ],
+            None,
+            2,
+        )?,
+        Timestamp::from_unix_nanos(1),
+    )?;
+    let second_source = second.register(
+        remote_metadata_alias(
+            "overlap-subset-b",
+            "overlap-subset-rev-b",
+            "overlap-display-b",
+            &["https://overlap-subset.example.test/feed-b"],
+            None,
+            2,
+        )?,
+        Timestamp::from_unix_nanos(1),
+    )?;
+    assert!(
+        first_source
+            .budget()
+            .ok_or("first overlap budget missing")?
+            .shares_allocation_with(
+                second_source
+                    .budget()
+                    .ok_or("second overlap budget missing")?
+            )
+    );
+    Ok(())
+}
+
+#[test]
+fn public_bridge_declaration_fails_without_merging_existing_allocations() -> TestResult {
+    let mut registry = AuthoritativeSourceRegistry::try_new()?;
+    let first = registry.register(
+        remote_metadata_alias(
+            "bridge-a",
+            "bridge-rev-a",
+            "bridge-display-a",
+            &["wss://bridge-a.example.test/feed"],
+            None,
+            2,
+        )?,
+        Timestamp::from_unix_nanos(1),
+    )?;
+    let second = registry.register(
+        remote_metadata_alias(
+            "bridge-b",
+            "bridge-rev-b",
+            "bridge-display-b",
+            &["wss://bridge-b.example.test/feed"],
+            None,
+            2,
+        )?,
+        Timestamp::from_unix_nanos(1),
+    )?;
+    let first_budget = first.budget().ok_or("first bridge budget missing")?;
+    let second_budget = second.budget().ok_or("second bridge budget missing")?;
+    assert!(!first_budget.shares_allocation_with(second_budget));
+
+    assert!(matches!(
+        registry.register(
+            remote_metadata_alias(
+                "bridge-c",
+                "bridge-rev-c",
+                "bridge-display-c",
+                &[
+                    "https://bridge-a.example.test/other",
+                    "https://bridge-b.example.test/other",
+                ],
+                None,
+                2,
+            )?,
+            Timestamp::from_unix_nanos(1),
+        ),
+        Err(RegistryError::BudgetCoordinator)
+    ));
+    assert!(!first_budget.shares_allocation_with(second_budget));
+    let first_permit = match first_budget.try_acquire() {
+        BudgetDecision::Ready(permit) => permit,
+        other => return Err(format!("first bridge allocation changed: {other:?}").into()),
+    };
+    let second_permit = match second_budget.try_acquire() {
+        BudgetDecision::Ready(permit) => permit,
+        other => return Err(format!("second bridge allocation changed: {other:?}").into()),
+    };
+    first_permit.release();
+    second_permit.release();
+    Ok(())
+}
+
+#[test]
+fn account_budget_requires_trusted_subject_resolution() -> TestResult {
+    let mut registry = AuthoritativeSourceRegistry::try_new()?;
+    assert!(matches!(
+        registry.register(
+            remote_metadata_alias(
+                "unresolved-account",
+                "unresolved-account-rev",
+                "unresolved-provider",
+                &["wss://unresolved-account.example.test/feed"],
+                Some(("caller-account-alias", 49, None)),
+                2,
+            )?,
+            Timestamp::from_unix_nanos(1),
+        ),
+        Err(RegistryError::AuthorizationSubjectResolution)
+    ));
+    Ok(())
+}
+
+#[test]
+fn restored_account_subject_is_freshly_resolved_and_tampering_fails_closed() -> TestResult {
+    let resolver = subject_resolver(&[(51, "credential-record-restore")])?;
+    let mut owner = AuthoritativeSourceRegistry::try_new_with_authorization_subject_resolver(
+        Arc::clone(&resolver),
+    )?;
+    let registered = owner.register(
+        remote_metadata_alias(
+            "restore-account",
+            "restore-account-rev",
+            "restore-provider",
+            &["wss://restore-account.example.test/feed"],
+            Some(("restore-display-account", 51, None)),
+            2,
+        )?,
+        Timestamp::from_unix_nanos(1),
+    )?;
+    let state = owner.export_authority_state()?;
+    let serialized = serde_json::to_string(&state)?;
+    assert!(!serialized.contains("canonical_identity"));
+    assert!(matches!(
+        AuthoritativeSourceRegistry::try_new_with_authority_state(state.clone()),
+        Err(RegistryError::AuthorizationSubjectResolution)
+    ));
+    let restored =
+        AuthoritativeSourceRegistry::try_new_with_authority_state_and_authorization_subject_resolver(
+            state.clone(),
+            Arc::clone(&resolver),
+        )?;
+    let owner_budget = registered.budget().ok_or("owner account budget missing")?;
+    let restored_state = restored.export_authority_state()?;
+    let mut second_restore =
+        AuthoritativeSourceRegistry::try_new_with_authority_state_and_authorization_subject_resolver(
+            restored_state,
+            Arc::clone(&resolver),
+        )?;
+    let restored_alias = second_restore.register(
+        remote_metadata_alias(
+            "restore-account-alias",
+            "restore-account-alias-rev",
+            "restore-provider-alias",
+            &["https://different-account-endpoint.example.test/data"],
+            Some(("different-display-account", 51, None)),
+            2,
+        )?,
+        Timestamp::from_unix_nanos(1),
+    )?;
+    assert!(
+        owner_budget.shares_allocation_with(
+            restored_alias
+                .budget()
+                .ok_or("restored account budget missing")?
+        )
+    );
+
+    let mut tampered = serde_json::to_value(state)?;
+    let subject = tampered
+        .as_object_mut()
+        .and_then(|object| object.get_mut("budget_policies"))
+        .and_then(serde_json::Value::as_array_mut)
+        .and_then(|policies| policies.first_mut())
+        .and_then(serde_json::Value::as_object_mut)
+        .and_then(|policy| policy.get_mut("resolved_subject_record"))
+        .ok_or("persisted resolved subject record missing")?;
+    *subject = serde_json::json!("tampered-credential-record");
+    let tampered: RegistryAuthorityState = serde_json::from_value(tampered)?;
+    assert!(matches!(
+        AuthoritativeSourceRegistry::try_new_with_authority_state_and_authorization_subject_resolver(
+            tampered,
+            resolver,
+        ),
+        Err(RegistryError::AuthorizationSubjectMismatch)
+    ));
+    Ok(())
+}
+
+#[test]
+fn distinct_resolved_credentials_receive_distinct_account_allocations() -> TestResult {
+    let resolver = subject_resolver(&[(42, "credential-record-a"), (43, "credential-record-b")])?;
+    let mut registry =
+        AuthoritativeSourceRegistry::try_new_with_authorization_subject_resolver(resolver)?;
+    let first = registry.register(
+        remote_metadata_alias(
+            "distinct-account-a",
+            "distinct-account-rev-a",
+            "provider-a",
+            &["wss://distinct-budget.example.test/feed"],
+            Some(("display-account", 42, None)),
+            2,
+        )?,
+        Timestamp::from_unix_nanos(1),
+    )?;
+    let second = registry.register(
+        remote_metadata_alias(
+            "distinct-account-b",
+            "distinct-account-rev-b",
+            "provider-b",
+            &["wss://distinct-budget.example.test/feed"],
+            Some(("display-account", 43, None)),
+            2,
+        )?,
+        Timestamp::from_unix_nanos(1),
+    )?;
+    assert!(
+        !first
+            .budget()
+            .ok_or("first distinct budget missing")?
+            .shares_allocation_with(second.budget().ok_or("second distinct budget missing")?)
+    );
+    Ok(())
+}
+
+#[test]
+fn canonical_endpoint_origins_normalize_idna_ports_paths_and_allowlist_order() -> TestResult {
+    let mut first = AuthoritativeSourceRegistry::try_new()?;
+    let mut second = AuthoritativeSourceRegistry::try_new()?;
+    let first_source = first.register(
+        remote_metadata_alias(
+            "canonical-origin-a",
+            "canonical-origin-rev-a",
+            "origin-display-a",
+            &[
+                "WSS://BÜCHER.example.test:443/feed-a",
+                "https://[2001:db8::1]:443/path-a",
+            ],
+            None,
+            2,
+        )?,
+        Timestamp::from_unix_nanos(1),
+    )?;
+    let second_source = second.register(
+        remote_metadata_alias(
+            "canonical-origin-b",
+            "canonical-origin-rev-b",
+            "origin-display-b",
+            &[
+                "https://[2001:0db8:0:0:0:0:0:1]/path-b",
+                "wss://xn--bcher-kva.example.test/feed-b",
+            ],
+            None,
+            2,
+        )?,
+        Timestamp::from_unix_nanos(1),
+    )?;
+    assert!(
+        first_source
+            .budget()
+            .ok_or("first canonical budget missing")?
+            .shares_allocation_with(
+                second_source
+                    .budget()
+                    .ok_or("second canonical budget missing")?
+            )
+    );
+
+    let mut scheme_alias = AuthoritativeSourceRegistry::try_new()?;
+    let third_source = scheme_alias.register(
+        remote_metadata_alias(
+            "canonical-origin-c",
+            "canonical-origin-rev-c",
+            "origin-display-c",
+            &[
+                "https://xn--bcher-kva.example.test/feed-b",
+                "https://[2001:db8::1]/path-b",
+            ],
+            None,
+            2,
+        )?,
+        Timestamp::from_unix_nanos(1),
+    )?;
+    assert!(
+        first_source
+            .budget()
+            .ok_or("first canonical budget missing")?
+            .shares_allocation_with(
+                third_source
+                    .budget()
+                    .ok_or("third canonical budget missing")?
+            )
+    );
+    Ok(())
+}
+
+#[test]
+fn one_canonical_identity_rejects_conflicting_alias_policy_without_publication() -> TestResult {
+    let mut registry = AuthoritativeSourceRegistry::try_new()?;
+    let first = registry.register(
+        remote_metadata_alias(
+            "conflicting-alias-a",
+            "conflicting-alias-rev-a",
+            "conflicting-display-a",
+            &["wss://conflicting-alias.example.test/feed-a"],
+            None,
+            2,
+        )?,
+        Timestamp::from_unix_nanos(1),
+    )?;
+    assert!(matches!(
+        registry.register(
+            remote_metadata_alias(
+                "conflicting-alias-b",
+                "conflicting-alias-rev-b",
+                "conflicting-display-b",
+                &["wss://conflicting-alias.example.test/feed-b"],
+                None,
+                3,
+            )?,
+            Timestamp::from_unix_nanos(1),
+        ),
+        Err(RegistryError::BudgetCoordinator)
+    ));
+    assert!(first.budget().is_some());
+    assert!(
+        registry
+            .validate_registered(&first, Timestamp::from_unix_nanos(1))
+            .is_ok()
+    );
+    Ok(())
+}
+
+#[test]
 fn process_coordinator_rejects_conflicting_restored_policy() -> TestResult {
     let provider = "process-budget-conflict-provider";
     let mut owner = AuthoritativeSourceRegistry::try_new()?;
     let _registered = owner.register(
-        direct_metadata_for_provider("conflict-a", "conflict-rev-a", provider)?,
+        direct_metadata_for_provider(
+            "conflict-a",
+            "conflict-rev-a",
+            provider,
+            "wss://process-conflict.example.test/feed",
+        )?,
         Timestamp::from_unix_nanos(1),
     )?;
     let state = owner.export_authority_state()?;
@@ -385,7 +929,11 @@ fn process_coordinator_rejects_conflicting_restored_policy() -> TestResult {
         .first_mut()
         .and_then(serde_json::Value::as_object_mut)
         .ok_or("authority state policy missing")?;
-    policy.insert("requests_per_window".to_owned(), serde_json::json!(11));
+    let declared_policy = policy
+        .get_mut("policy")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or("authority state declared policy missing")?;
+    declared_policy.insert("requests_per_window".to_owned(), serde_json::json!(11));
     let conflicting: RegistryAuthorityState = serde_json::from_value(wire)?;
 
     drop(_registered);
@@ -406,6 +954,7 @@ fn coordinated_budget_proof_controls_health_and_queued_authority() -> TestResult
             "budget-source",
             "budget-revision",
             "budget-authority-test-provider",
+            "wss://budget-authority.example.test/feed",
         )?,
         Timestamp::from_unix_nanos(1),
     )?;

@@ -44,6 +44,7 @@ pub(super) fn direct_metadata_with_provider_and_limit(
     provider: &str,
     requests_per_window: u32,
 ) -> TestResult<SourceMetadata> {
+    let endpoint = format!("wss://{provider}.source.test/feed");
     let source_id = SourceId::try_from(source)?;
     let revision = MetadataRevision::new(source_identifier(revision)?);
     let effective = EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?;
@@ -97,9 +98,7 @@ pub(super) fn direct_metadata_with_provider_and_limit(
         authorization,
         coverage,
         DataQuality::DirectVerified,
-        NetworkAccessPolicy::Allowlisted(EndpointPolicy::try_new([
-            "wss://advanced-trade-ws.coinbase.com",
-        ])?),
+        NetworkAccessPolicy::Allowlisted(EndpointPolicy::try_new([endpoint])?),
         freshness_policy()?,
         Some(budget),
         SourceCapabilities::new(

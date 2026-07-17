@@ -1,4 +1,72 @@
-/// One shared provider/account budget identity without credentials or alternate identities.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum BudgetCollisionKey {
+    Public(Vec<CanonicalNetworkAuthority>),
+    Account(SourceIdentifier),
+}
+
+impl BudgetCollisionKey {
+    fn collides_with(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Public(left), Self::Public(right)) => left
+                .as_slice()
+                .iter()
+                .any(|authority| right.as_slice().binary_search(authority).is_ok()),
+            (Self::Account(left), Self::Account(right)) => left == right,
+            (Self::Public(_), Self::Account(_)) | (Self::Account(_), Self::Public(_)) => false,
+        }
+    }
+
+    fn merge_public_authorities(
+        &mut self,
+        other: &Self,
+    ) -> Result<(), BudgetCollisionMergeError> {
+        self.merge_public_authorities_with_limit(other, MAX_MERGED_CANONICAL_AUTHORITIES)
+    }
+
+    fn merge_public_authorities_with_limit(
+        &mut self,
+        other: &Self,
+        maximum: usize,
+    ) -> Result<(), BudgetCollisionMergeError> {
+        let (Self::Public(current), Self::Public(additional)) = (self, other) else {
+            return Ok(());
+        };
+        let additional_count = additional
+            .iter()
+            .filter(|authority| current.binary_search(authority).is_err())
+            .count();
+        let merged_len = current
+            .len()
+            .checked_add(additional_count)
+            .filter(|length| *length <= maximum)
+            .ok_or(BudgetCollisionMergeError::Capacity)?;
+        current
+            .try_reserve(merged_len.saturating_sub(current.len()))
+            .map_err(|_| BudgetCollisionMergeError::Allocation)?;
+        let original_len = current.len();
+        for authority in additional {
+            if current[..original_len].binary_search(authority).is_err() {
+                current.push(authority.clone());
+            }
+        }
+        current.sort_unstable();
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+enum BudgetCollisionMergeError {
+    #[error("canonical network authority capacity exhausted")]
+    Capacity,
+    #[error("canonical network authority allocation failed")]
+    Allocation,
+}
+
+/// Human-readable provider/account declaration retained for audit metadata only.
+///
+/// Registry and process budget coordination never key allocations by these caller-authored
+/// labels. They conservatively collide normalized public network authorities or trusted stable
+/// authorization subjects.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BudgetScope {
@@ -7,7 +75,7 @@ pub struct BudgetScope {
 }
 
 impl BudgetScope {
-    /// Constructs a bounded configured provider/account budget key.
+    /// Constructs a bounded public provider declaration for metadata and diagnostics.
     pub const fn new(value: SourceIdentifier) -> Self {
         Self {
             provider: value,
@@ -49,7 +117,7 @@ impl BudgetScope {
         }
     }
 
-    /// Returns the configured scope key.
+    /// Returns the caller-declared provider label retained for metadata and diagnostics.
     pub const fn as_source_identifier(&self) -> &SourceIdentifier {
         &self.provider
     }
@@ -191,9 +259,16 @@ impl ProviderBudgetPolicy {
         })
     }
 
-    /// Returns the single shared provider/account scope.
+    /// Returns the human-readable provider/account declaration.
     pub const fn scope(&self) -> &BudgetScope {
         &self.scope
+    }
+
+    pub(crate) fn has_same_limits_as(&self, other: &Self) -> bool {
+        self.requests_per_window == other.requests_per_window
+            && self.window_nanos == other.window_nanos
+            && self.max_concurrent == other.max_concurrent
+            && self.backoff == other.backoff
     }
 
     fn dynamic_retained_bytes(&self) -> Option<usize> {
@@ -235,6 +310,193 @@ impl<'de> Deserialize<'de> for ProviderBudgetPolicy {
         )
         .map_err(serde::de::Error::custom)
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PersistedProviderBudgetPolicy {
+    policy: ProviderBudgetPolicy,
+    endpoint_policy: EndpointPolicy,
+    authorization: crate::AuthorizationGrant,
+    resolved_subject_record: Option<SourceIdentifier>,
+}
+
+impl PersistedProviderBudgetPolicy {
+    pub(crate) fn try_new(
+        policy: ProviderBudgetPolicy,
+        endpoint_policy: EndpointPolicy,
+        authorization: crate::AuthorizationGrant,
+        resolved_subject_record: Option<SourceIdentifier>,
+    ) -> Result<Self, NetworkPolicyError> {
+        let persisted = Self {
+            policy,
+            endpoint_policy,
+            authorization,
+            resolved_subject_record,
+        };
+        persisted.validate_structure()?;
+        Ok(persisted)
+    }
+
+    pub(crate) const fn policy(&self) -> &ProviderBudgetPolicy {
+        &self.policy
+    }
+
+    pub(crate) fn resolve(
+        &self,
+        resolver: &dyn crate::AuthorizationSubjectResolver,
+    ) -> Result<ResolvedProviderBudgetPolicy, BudgetPolicyResolutionError> {
+        self.validate_structure()
+            .map_err(|_| BudgetPolicyResolutionError::InvalidPolicy)?;
+        let collision_key = match self.authorization.mode() {
+            crate::AuthorizationMode::PublicInterface => {
+                BudgetCollisionKey::Public(
+                    self.endpoint_policy
+                        .canonical_network_authorities()
+                        .map_err(|_| BudgetPolicyResolutionError::InvalidPolicy)?
+                        .into_vec(),
+                )
+            }
+            crate::AuthorizationMode::UserAuthorized | crate::AuthorizationMode::Licensed => {
+                let resolved = resolver
+                    .resolve_subject_record(
+                        self.authorization.mode(),
+                        self.authorization.evidence().content_digest(),
+                    )
+                    .map_err(BudgetPolicyResolutionError::SubjectResolution)?;
+                if self.resolved_subject_record.as_ref() != Some(&resolved) {
+                    return Err(BudgetPolicyResolutionError::SubjectMismatch);
+                }
+                BudgetCollisionKey::Account(resolved)
+            }
+            crate::AuthorizationMode::UserOwnedLocal => {
+                return Err(BudgetPolicyResolutionError::InvalidPolicy);
+            }
+        };
+        Ok(ResolvedProviderBudgetPolicy {
+            persisted: self.clone(),
+            collision_key,
+        })
+    }
+
+    fn validate_structure(&self) -> Result<(), NetworkPolicyError> {
+        let expected = BudgetScope::for_authorization(
+            self.policy.scope().as_source_identifier().clone(),
+            &self.authorization,
+        )?;
+        if self.policy.scope() != &expected {
+            return Err(NetworkPolicyError::InvalidBudgetScope);
+        }
+        let subject_shape_is_valid = match self.authorization.mode() {
+            crate::AuthorizationMode::PublicInterface => self.resolved_subject_record.is_none(),
+            crate::AuthorizationMode::UserAuthorized | crate::AuthorizationMode::Licensed => {
+                self.resolved_subject_record.is_some()
+            }
+            crate::AuthorizationMode::UserOwnedLocal => false,
+        };
+        if !subject_shape_is_valid {
+            return Err(NetworkPolicyError::InvalidBudgetScope);
+        }
+        let _authorities = self.endpoint_policy.canonical_network_authorities()?;
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedProviderBudgetPolicyWire {
+    policy: ProviderBudgetPolicy,
+    endpoint_policy: EndpointPolicy,
+    authorization: crate::AuthorizationGrant,
+    resolved_subject_record: Option<SourceIdentifier>,
+}
+
+impl<'de> Deserialize<'de> for PersistedProviderBudgetPolicy {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = PersistedProviderBudgetPolicyWire::deserialize(deserializer)?;
+        Self::try_new(
+            wire.policy,
+            wire.endpoint_policy,
+            wire.authorization,
+            wire.resolved_subject_record,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedProviderBudgetPolicy {
+    persisted: PersistedProviderBudgetPolicy,
+    collision_key: BudgetCollisionKey,
+}
+
+impl ResolvedProviderBudgetPolicy {
+    pub(crate) fn try_new(
+        policy: ProviderBudgetPolicy,
+        endpoint_policy: EndpointPolicy,
+        authorization: crate::AuthorizationGrant,
+        resolver: &dyn crate::AuthorizationSubjectResolver,
+    ) -> Result<Self, BudgetPolicyResolutionError> {
+        let (resolved_subject_record, collision_key) = match authorization.mode() {
+            crate::AuthorizationMode::PublicInterface => (
+                None,
+                BudgetCollisionKey::Public(
+                    endpoint_policy
+                        .canonical_network_authorities()
+                        .map_err(|_| BudgetPolicyResolutionError::InvalidPolicy)?
+                        .into_vec(),
+                ),
+            ),
+            crate::AuthorizationMode::UserAuthorized | crate::AuthorizationMode::Licensed => {
+                let subject = resolver
+                    .resolve_subject_record(
+                        authorization.mode(),
+                        authorization.evidence().content_digest(),
+                    )
+                    .map_err(BudgetPolicyResolutionError::SubjectResolution)?;
+                (Some(subject.clone()), BudgetCollisionKey::Account(subject))
+            }
+            crate::AuthorizationMode::UserOwnedLocal => {
+                return Err(BudgetPolicyResolutionError::InvalidPolicy);
+            }
+        };
+        let persisted = PersistedProviderBudgetPolicy::try_new(
+            policy,
+            endpoint_policy,
+            authorization,
+            resolved_subject_record,
+        )
+        .map_err(|_| BudgetPolicyResolutionError::InvalidPolicy)?;
+        Ok(Self {
+            persisted,
+            collision_key,
+        })
+    }
+
+    pub(crate) const fn persisted(&self) -> &PersistedProviderBudgetPolicy {
+        &self.persisted
+    }
+
+    pub(crate) const fn policy(&self) -> &ProviderBudgetPolicy {
+        self.persisted.policy()
+    }
+
+    pub(crate) const fn collision_key(&self) -> &BudgetCollisionKey {
+        &self.collision_key
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum BudgetPolicyResolutionError {
+    #[error("provider budget evidence is structurally invalid")]
+    InvalidPolicy,
+    #[error("authorization subject resolution failed: {0}")]
+    SubjectResolution(crate::AuthorizationSubjectResolutionError),
+    #[error("persisted authorization subject differs from trusted resolution")]
+    SubjectMismatch,
 }
 
 /// A checked provider `Retry-After` instruction.
@@ -337,7 +599,7 @@ struct BudgetAllocation {
     terminal: AtomicBool,
 }
 
-/// Thread-safe budget shared by every worker in one configured provider/account scope.
+/// Thread-safe budget shared by every worker in one canonical collision group.
 #[derive(Clone)]
 pub struct SharedProviderBudget {
     allocation: Arc<BudgetAllocation>,
