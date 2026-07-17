@@ -1,11 +1,13 @@
 //! Local configuration, confined paths, compatible journals, and asynchronous raw capture.
 
+mod authority_state;
 mod capture;
 mod config;
 mod journal;
 mod paths;
 mod raw_record;
 
+pub use authority_state::{LocalAuthorityStateStore, LocalAuthorityStateStoreError};
 pub use capture::{
     CaptureDestination, CaptureDestinationError, CaptureGenerationError, CaptureHealthEvent,
     CaptureHealthReason, CaptureHealthSnapshot, CaptureIoContext, CapturePublishError,
