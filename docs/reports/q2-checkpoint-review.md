@@ -95,3 +95,45 @@ one authoritative identity and budget scope, never rotation or circumvention.
 Final approval requires a clean replacement commit, the complete locked workspace/release/doc
 gate, dependency/license/advisory/credential/generated-artifact audits, remediation tests for every
 ledger item, and two fresh independent reviews with no unresolved severity.
+
+## Integrated replacement review at `651a01e` (2026-07-16)
+
+The original Q2-R01–R15 findings were substantively closed and integrated through exact commit
+`651a01e120dfe27a598b9475296733d238d870b7`. That commit passed the complete local verification
+wrapper, Cargo-deny, Cargo-audit, working-tree and history Gitleaks scans, brand and generated-
+artifact checks, and clean/unchanged exact-head assertions. Hosted macOS and Windows results were
+not observed and are not claimed.
+
+Three fresh independent read-only reviewers examined that same frozen commit across source
+authority/persistence, concurrency/memory/lifecycle, and architecture/security/documentation. The
+replacement checkpoint was **rejected** with zero Critical, eleven Important, and three Minor
+reports, deduplicated into thirteen remediation contracts:
+
+| ID | Severity | Finding |
+| --- | --- | --- |
+| Q2-I01 | Important | Health-epoch exhaustion preserves the prior executable session authority. |
+| Q2-I02 | Important | Provider/account budget identity remains caller-aliasable instead of registry-canonical. |
+| Q2-I03 | Important | A fresh process can reset provider-budget enforcement state. |
+| Q2-I04 | Important | Raw transport receive time is adapter-authored but treated as trusted freshness evidence. |
+| Q2-I05 | Important | The registry clock does not retain and enforce a wall high-water. |
+| Q2-I06 | Important | Live runtime memory omits simultaneously reachable order-book processing allocations. |
+| Q2-I07 | Important | Snapshot reader/publication/generation metadata scales outside the runtime estimate. |
+| Q2-I08 | Important | Capture admission omits complete session identity and uniquely retained generation/bundle allocations. |
+| Q2-I09 | Important | Application shutdown can wait forever for a non-cooperative or backpressured source task. |
+| Q2-I10 | Important | MCP checks its 1 MiB line limit only after the complete line has been allocated. |
+| Q2-I11 | Important | Authoritative architecture/gap/plan/checkpoint/progress documents describe conflicting candidates and status. |
+| Q2-M01 | Minor | Persisted provider-budget policies are emitted in randomized map order. |
+| Q2-M02 | Minor | Public diagnostic market wording can be mistaken for canonical execution-quality coverage. |
+
+Q2-I08 incorporates the separate Minor raw-capture capacity undercount because both require one
+closed capture object-graph accounting contract. No reviewer found an execution-authority bypass,
+provider-access evasion implementation, hot-path analytical I/O, or reopening of an original
+R01–R15 defect as framed.
+
+The controlling design and TDD/DAG plan are:
+
+- `docs/superpowers/specs/2026-07-16-q2-integrated-checkpoint-remediation-design.md`
+- `docs/superpowers/plans/2026-07-16-q2-integrated-checkpoint-remediation.md`
+
+The current disposition remains **rejected; integrated remediation and exact-head re-review are
+required**. No Q2 approval is implied by focused lane tests or the earlier green gate.

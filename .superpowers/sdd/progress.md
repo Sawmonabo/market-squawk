@@ -35,10 +35,13 @@ Stage 0: complete (commit 66d30fe, planning/research controls committed; baselin
   `docs/reports/q2-task8-implementation.md`. Final documentation commit and root integration may
   advance the checkpoint head without changing the tested production behavior.
 - Quarter 2 review: exact integrated commit `581d4fd` was rejected by both independent review
-  lanes. The combined findings and remediation ownership are persisted in
-  `docs/reports/q2-checkpoint-review.md`. Three isolated TDD lanes are correcting source authority
-  and accounting, live memory/snapshot/scheduling, and capture-worker/Windows-CI defects. No
-  approval is implied until a replacement exact commit passes every gate and two fresh re-reviews.
+  lanes. Q2-R01–R15 were subsequently remediated and integrated through `651a01e`. That clean exact
+  commit passed the complete local gate and audits, then three fresh read-only reviewers rejected it
+  with zero Critical and thirteen deduplicated adjacent Important/Minor remediation contracts.
+  Current work follows
+  `docs/superpowers/plans/2026-07-16-q2-integrated-checkpoint-remediation.md` in three isolated TDD
+  implementation lanes plus a root documentation-coherence lane. No approval is implied until a
+  replacement exact commit passes every gate and three fresh specialist re-reviews.
 
 ## Quarter 3: Tasks 9-12
 
@@ -84,3 +87,10 @@ Stage 0: complete (commit 66d30fe, planning/research controls committed; baselin
   starvation, unchecked snapshot deserialization, detached blocking capture writer, failure
   atomicity, aggregate-reader configuration, Windows CI, and cadence wording. Re-review remains
   pending after code and tests close every item.
+- The replacement implementation at `651a01e` closed those original findings as framed. Its formal
+  review found the adjacent Q2-I01–I11/Q2-M01–M02 set: terminal health-epoch behavior, canonical
+  provider/account identity, restart-durable budgets, registry-sealed frame receipt and wall
+  high-water, complete live/capture memory ceilings, bounded source shutdown and MCP framing,
+  coherent checkpoint documents, deterministic budget serialization, and unambiguous diagnostic
+  wording. These are active checkpoint blockers; Q2 remains rejected pending integrated TDD
+  remediation, clean exact-head verification, and three-scope re-review.
