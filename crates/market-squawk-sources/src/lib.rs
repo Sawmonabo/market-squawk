@@ -70,11 +70,11 @@ pub use metadata::{
     SourceMetadataError, SourceMetadataInput, SourceProtocolProfile,
 };
 pub use policy::{
-    ApiEndpointRule, AuthorizedRequest, BackoffPolicy, BudgetDecision, BudgetPermit,
-    BudgetPoolError, BudgetScope, BudgetUnavailableReason, EndpointDenialReason, EndpointPolicy,
-    HttpClientProfile, HttpRequestBounds, MonotonicInstant, NetworkPolicyError, PathScope,
-    ProviderBudgetPolicy, QueryParameterRule, QuerySensitivity, RedirectAuthorization, RetryAfter,
-    SharedProviderBudget,
+    ApiEndpointRule, AuthorityPersistenceError, AuthorityStateStore, AuthorityStateStoreError,
+    AuthorizedRequest, BackoffPolicy, BudgetDecision, BudgetPermit, BudgetPoolError, BudgetScope,
+    BudgetUnavailableReason, EndpointDenialReason, EndpointPolicy, HttpClientProfile,
+    HttpRequestBounds, MonotonicInstant, NetworkPolicyError, PathScope, ProviderBudgetPolicy,
+    QueryParameterRule, QuerySensitivity, RedirectAuthorization, RetryAfter, SharedProviderBudget,
 };
 pub use registry::{
     AuthoritativeSourceRegistry, CurrentBatchIter, CurrentBatchKey, CurrentCoveragePolicy,

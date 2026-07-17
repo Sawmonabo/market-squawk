@@ -99,6 +99,24 @@ pub enum RegistryError {
     /// Shared provider-budget coordinator rejected or could not initialize policy.
     #[error("source provider-budget coordination failed")]
     BudgetCoordinator,
+    /// Required authority state could not be loaded or durably replaced.
+    #[error("source authority persistence failed")]
+    AuthorityPersistence,
+    /// Trusted wall time is below the durable authority high-water.
+    #[error("trusted wall time rolled back below durable authority state")]
+    DurableWallRollback,
+    /// Durable authority state claims a checkpoint in the future.
+    #[error("durable source authority state is from the future")]
+    DurableFutureState,
+    /// Durable run generation cannot advance safely.
+    #[error("durable source authority run generation exhausted")]
+    DurableRunGenerationExhausted,
+    /// Clean shutdown was attempted while a source session remained authoritative.
+    #[error("source registry still has active session authority")]
+    ActiveAuthorityAtShutdown,
+    /// A previous run did not publish a clean marker, so new live authority is terminally barred.
+    #[error("source authority predecessor did not shut down cleanly")]
+    UncleanAuthorityPredecessor,
     /// Trusted credential/entitlement subject resolution failed.
     #[error("source authorization subject could not be resolved")]
     AuthorizationSubjectResolution,

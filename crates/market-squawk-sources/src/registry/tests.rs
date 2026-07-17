@@ -111,7 +111,7 @@ mod tests {
                 monotonic_origin,
             )));
             let mut registry =
-                AuthoritativeSourceRegistry::try_new_with_authority_state_and_clock(
+                AuthoritativeSourceRegistry::try_new_ephemeral_with_authority_state_and_clock_for_diagnostics(
                     super::RegistryAuthorityState::empty(),
                     clock.clone(),
                 )?;

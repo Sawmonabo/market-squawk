@@ -53,7 +53,7 @@ fn pre_feed_current_leases_are_deadline_capture_health_and_registry_bound() -> T
         market_squawk_sources::CaptureAdmissionIssuer,
         market_squawk_sources::RawFrameFactory,
     )> {
-        let mut registry = AuthoritativeSourceRegistry::try_new()?;
+        let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
         let registered = registry.register(
             direct_metadata("source-a", "revision-a", 0, None)?,
             Timestamp::from_unix_nanos(1),

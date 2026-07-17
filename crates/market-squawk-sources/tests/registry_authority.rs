@@ -231,7 +231,7 @@ fn healthy_snapshot(
 
 #[test]
 fn domain_capture_bundle_retains_exact_registry_identity_and_one_way_health() -> TestResult {
-    let mut registry = AuthoritativeSourceRegistry::try_new()?;
+    let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
     let registered = registry.register(
         direct_metadata("source-a", "revision-a", 0, None)?,
         Timestamp::from_unix_nanos(1),
@@ -263,7 +263,7 @@ fn domain_capture_bundle_retains_exact_registry_identity_and_one_way_health() ->
 
 #[test]
 fn raw_frame_view_reports_exact_generation_local_identity_and_deep_bound() -> TestResult {
-    let mut registry = AuthoritativeSourceRegistry::try_new()?;
+    let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
     let registered = registry.register(
         direct_metadata("source-a", "revision-a", 0, None)?,
         Timestamp::from_unix_nanos(1),
@@ -294,8 +294,8 @@ fn raw_frame_view_reports_exact_generation_local_identity_and_deep_bound() -> Te
 
 #[test]
 fn handles_reject_registry_transplant_and_session_resurrection() -> TestResult {
-    let mut first = AuthoritativeSourceRegistry::try_new()?;
-    let second = AuthoritativeSourceRegistry::try_new()?;
+    let mut first = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
+    let second = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
     let registered = first.register(
         direct_metadata("source-a", "rev-a", 0, Some(100))?,
         Timestamp::from_unix_nanos(1),
@@ -336,7 +336,7 @@ fn handles_reject_registry_transplant_and_session_resurrection() -> TestResult {
 
 #[test]
 fn raw_frame_factory_is_once_issued_and_fails_after_session_end() -> TestResult {
-    let mut registry = AuthoritativeSourceRegistry::try_new()?;
+    let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
     let registered = registry.register(
         direct_metadata("source-a", "rev-a", 0, Some(100))?,
         Timestamp::from_unix_nanos(1),
@@ -372,7 +372,7 @@ fn raw_frame_factory_is_once_issued_and_fails_after_session_end() -> TestResult 
 
 #[test]
 fn adjacent_revision_cutover_and_expired_cleanup_are_administratively_valid() -> TestResult {
-    let mut registry = AuthoritativeSourceRegistry::try_new()?;
+    let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
     let first = registry.register(
         direct_metadata("source-a", "rev-a", 0, Some(100))?,
         Timestamp::from_unix_nanos(50),
@@ -401,7 +401,7 @@ fn adjacent_revision_cutover_and_expired_cleanup_are_administratively_valid() ->
 
 #[test]
 fn two_sources_with_one_scope_share_concurrency_and_cooldown() -> TestResult {
-    let mut registry = AuthoritativeSourceRegistry::try_new()?;
+    let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
     let first = registry.register(
         direct_metadata("source-a", "rev-a", 0, None)?,
         Timestamp::from_unix_nanos(1),
@@ -430,7 +430,7 @@ fn two_sources_with_one_scope_share_concurrency_and_cooldown() -> TestResult {
 
 #[test]
 fn process_coordinator_interns_registry_and_restored_budget_allocations() -> TestResult {
-    let mut first_registry = AuthoritativeSourceRegistry::try_new()?;
+    let mut first_registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
     let first = first_registry.register(
         direct_metadata_for_provider(
             "interner-a",
@@ -442,7 +442,7 @@ fn process_coordinator_interns_registry_and_restored_budget_allocations() -> Tes
     )?;
     let first_budget = first.budget().ok_or("first coordinated budget missing")?;
 
-    let mut second_registry = AuthoritativeSourceRegistry::try_new()?;
+    let mut second_registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
     let second = second_registry.register(
         direct_metadata_for_provider(
             "interner-b",
@@ -456,7 +456,8 @@ fn process_coordinator_interns_registry_and_restored_budget_allocations() -> Tes
     assert!(first_budget.shares_allocation_with(second_budget));
 
     let state = first_registry.export_authority_state()?;
-    let mut restored = AuthoritativeSourceRegistry::try_new_with_authority_state(state)?;
+    let mut restored =
+        AuthoritativeSourceRegistry::try_new_ephemeral_with_authority_state_for_diagnostics(state)?;
     let restored_source = restored.register(
         direct_metadata_for_provider(
             "interner-c",
@@ -513,10 +514,10 @@ fn process_coordinator_interns_registry_and_restored_budget_allocations() -> Tes
 #[test]
 fn account_aliases_and_locator_metadata_cannot_multiply_one_credential_budget() -> TestResult {
     let resolver = subject_resolver(&[(41, "credential-record-a"), (44, "credential-record-a")])?;
-    let mut first = AuthoritativeSourceRegistry::try_new_with_authorization_subject_resolver(
+    let mut first = AuthoritativeSourceRegistry::try_new_ephemeral_with_authorization_subject_resolver_for_diagnostics(
         Arc::clone(&resolver),
     )?;
-    let mut second = AuthoritativeSourceRegistry::try_new_with_authorization_subject_resolver(
+    let mut second = AuthoritativeSourceRegistry::try_new_ephemeral_with_authorization_subject_resolver_for_diagnostics(
         Arc::clone(&resolver),
     )?;
     let first_source = first.register(
@@ -565,8 +566,8 @@ fn account_aliases_and_locator_metadata_cannot_multiply_one_credential_budget() 
 
 #[test]
 fn public_endpoint_subset_and_superset_share_on_any_authority_overlap() -> TestResult {
-    let mut first = AuthoritativeSourceRegistry::try_new()?;
-    let mut second = AuthoritativeSourceRegistry::try_new()?;
+    let mut first = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
+    let mut second = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
     let first_source = first.register(
         remote_metadata_alias(
             "overlap-subset-a",
@@ -607,7 +608,7 @@ fn public_endpoint_subset_and_superset_share_on_any_authority_overlap() -> TestR
 
 #[test]
 fn public_bridge_declaration_fails_without_merging_existing_allocations() -> TestResult {
-    let mut registry = AuthoritativeSourceRegistry::try_new()?;
+    let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
     let first = registry.register(
         remote_metadata_alias(
             "bridge-a",
@@ -667,7 +668,7 @@ fn public_bridge_declaration_fails_without_merging_existing_allocations() -> Tes
 
 #[test]
 fn account_budget_requires_trusted_subject_resolution() -> TestResult {
-    let mut registry = AuthoritativeSourceRegistry::try_new()?;
+    let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
     assert!(matches!(
         registry.register(
             remote_metadata_alias(
@@ -688,7 +689,7 @@ fn account_budget_requires_trusted_subject_resolution() -> TestResult {
 #[test]
 fn restored_account_subject_is_freshly_resolved_and_tampering_fails_closed() -> TestResult {
     let resolver = subject_resolver(&[(51, "credential-record-restore")])?;
-    let mut owner = AuthoritativeSourceRegistry::try_new_with_authorization_subject_resolver(
+    let mut owner = AuthoritativeSourceRegistry::try_new_ephemeral_with_authorization_subject_resolver_for_diagnostics(
         Arc::clone(&resolver),
     )?;
     let registered = owner.register(
@@ -706,18 +707,20 @@ fn restored_account_subject_is_freshly_resolved_and_tampering_fails_closed() -> 
     let serialized = serde_json::to_string(&state)?;
     assert!(!serialized.contains("canonical_identity"));
     assert!(matches!(
-        AuthoritativeSourceRegistry::try_new_with_authority_state(state.clone()),
+        AuthoritativeSourceRegistry::try_new_ephemeral_with_authority_state_for_diagnostics(
+            state.clone()
+        ),
         Err(RegistryError::AuthorizationSubjectResolution)
     ));
     let restored =
-        AuthoritativeSourceRegistry::try_new_with_authority_state_and_authorization_subject_resolver(
+        AuthoritativeSourceRegistry::try_new_ephemeral_with_authority_state_and_authorization_subject_resolver_for_diagnostics(
             state.clone(),
             Arc::clone(&resolver),
         )?;
     let owner_budget = registered.budget().ok_or("owner account budget missing")?;
     let restored_state = restored.export_authority_state()?;
     let mut second_restore =
-        AuthoritativeSourceRegistry::try_new_with_authority_state_and_authorization_subject_resolver(
+        AuthoritativeSourceRegistry::try_new_ephemeral_with_authority_state_and_authorization_subject_resolver_for_diagnostics(
             restored_state,
             Arc::clone(&resolver),
         )?;
@@ -752,7 +755,7 @@ fn restored_account_subject_is_freshly_resolved_and_tampering_fails_closed() -> 
     *subject = serde_json::json!("tampered-credential-record");
     let tampered: RegistryAuthorityState = serde_json::from_value(tampered)?;
     assert!(matches!(
-        AuthoritativeSourceRegistry::try_new_with_authority_state_and_authorization_subject_resolver(
+        AuthoritativeSourceRegistry::try_new_ephemeral_with_authority_state_and_authorization_subject_resolver_for_diagnostics(
             tampered,
             resolver,
         ),
@@ -765,7 +768,7 @@ fn restored_account_subject_is_freshly_resolved_and_tampering_fails_closed() -> 
 fn distinct_resolved_credentials_receive_distinct_account_allocations() -> TestResult {
     let resolver = subject_resolver(&[(42, "credential-record-a"), (43, "credential-record-b")])?;
     let mut registry =
-        AuthoritativeSourceRegistry::try_new_with_authorization_subject_resolver(resolver)?;
+        AuthoritativeSourceRegistry::try_new_ephemeral_with_authorization_subject_resolver_for_diagnostics(resolver)?;
     let first = registry.register(
         remote_metadata_alias(
             "distinct-account-a",
@@ -799,8 +802,8 @@ fn distinct_resolved_credentials_receive_distinct_account_allocations() -> TestR
 
 #[test]
 fn canonical_endpoint_origins_normalize_idna_ports_paths_and_allowlist_order() -> TestResult {
-    let mut first = AuthoritativeSourceRegistry::try_new()?;
-    let mut second = AuthoritativeSourceRegistry::try_new()?;
+    let mut first = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
+    let mut second = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
     let first_source = first.register(
         remote_metadata_alias(
             "canonical-origin-a",
@@ -840,7 +843,7 @@ fn canonical_endpoint_origins_normalize_idna_ports_paths_and_allowlist_order() -
             )
     );
 
-    let mut scheme_alias = AuthoritativeSourceRegistry::try_new()?;
+    let mut scheme_alias = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
     let third_source = scheme_alias.register(
         remote_metadata_alias(
             "canonical-origin-c",
@@ -870,7 +873,7 @@ fn canonical_endpoint_origins_normalize_idna_ports_paths_and_allowlist_order() -
 
 #[test]
 fn one_canonical_identity_rejects_conflicting_alias_policy_without_publication() -> TestResult {
-    let mut registry = AuthoritativeSourceRegistry::try_new()?;
+    let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
     let first = registry.register(
         remote_metadata_alias(
             "conflicting-alias-a",
@@ -908,7 +911,7 @@ fn one_canonical_identity_rejects_conflicting_alias_policy_without_publication()
 #[test]
 fn process_coordinator_rejects_conflicting_restored_policy() -> TestResult {
     let provider = "process-budget-conflict-provider";
-    let mut owner = AuthoritativeSourceRegistry::try_new()?;
+    let mut owner = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
     let _registered = owner.register(
         direct_metadata_for_provider(
             "conflict-a",
@@ -940,7 +943,9 @@ fn process_coordinator_rejects_conflicting_restored_policy() -> TestResult {
     drop(owner);
 
     assert!(matches!(
-        AuthoritativeSourceRegistry::try_new_with_authority_state(conflicting),
+        AuthoritativeSourceRegistry::try_new_ephemeral_with_authority_state_for_diagnostics(
+            conflicting
+        ),
         Err(RegistryError::BudgetCoordinator)
     ));
     Ok(())
@@ -948,7 +953,7 @@ fn process_coordinator_rejects_conflicting_restored_policy() -> TestResult {
 
 #[test]
 fn coordinated_budget_proof_controls_health_and_queued_authority() -> TestResult {
-    let mut registry = AuthoritativeSourceRegistry::try_new()?;
+    let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
     let registered = registry.register(
         direct_metadata_for_provider(
             "budget-source",
@@ -1033,7 +1038,7 @@ fn coordinated_budget_proof_controls_health_and_queued_authority() -> TestResult
 
 #[test]
 fn replayed_frames_lose_transient_authority_and_ended_lease_stays_invalid() -> TestResult {
-    let mut registry = AuthoritativeSourceRegistry::try_new()?;
+    let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
     let registered = registry.register(
         direct_metadata("source-a", "rev-a", 0, None)?,
         Timestamp::from_unix_nanos(1),
@@ -1066,7 +1071,7 @@ fn replayed_frames_lose_transient_authority_and_ended_lease_stays_invalid() -> T
 
 #[test]
 fn authority_state_round_trip_blocks_revision_and_generation_reuse_after_restart() -> TestResult {
-    let mut first = AuthoritativeSourceRegistry::try_new()?;
+    let mut first = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
     let registered = first.register(
         direct_metadata("source-a", "rev-a", 0, None)?,
         Timestamp::from_unix_nanos(1),
@@ -1080,7 +1085,10 @@ fn authority_state_round_trip_blocks_revision_and_generation_reuse_after_restart
     let state = first.export_authority_state()?;
     let wire = serde_json::to_string(&state)?;
     let restored: RegistryAuthorityState = serde_json::from_str(&wire)?;
-    let mut restarted = AuthoritativeSourceRegistry::try_new_with_authority_state(restored)?;
+    let mut restarted =
+        AuthoritativeSourceRegistry::try_new_ephemeral_with_authority_state_for_diagnostics(
+            restored,
+        )?;
     assert!(matches!(
         restarted.register(
             direct_metadata("source-a", "rev-a", 0, None)?,

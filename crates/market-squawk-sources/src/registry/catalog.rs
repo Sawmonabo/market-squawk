@@ -7,6 +7,13 @@ pub struct AuthoritativeSourceRegistry {
     history: BTreeMap<SourceId, SourceAuthorityHistory>,
     clock: Arc<dyn RegistryClock>,
     authorization_subject_resolver: Arc<dyn crate::AuthorizationSubjectResolver>,
+    composition: AuthorityComposition,
+}
+
+#[derive(Debug)]
+enum AuthorityComposition {
+    Durable(Arc<AuthorityDurabilitySession>),
+    EphemeralDiagnostic,
 }
 
 impl Drop for AuthoritativeSourceRegistry {
@@ -20,149 +27,13 @@ impl Drop for AuthoritativeSourceRegistry {
             }
             entry.health_authority = None;
         }
+        if let AuthorityComposition::Durable(durability) = &self.composition {
+            durability.invalidate();
+        }
     }
 }
 
 impl AuthoritativeSourceRegistry {
-    /// Creates an empty registry with a process-unique instance identity.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RegistryError::RegistryIdentityExhausted`] if the process-wide identifier space is
-    /// exhausted.
-    pub fn try_new() -> Result<Self, RegistryError> {
-        Self::try_new_with_authority_state(RegistryAuthorityState::empty())
-    }
-
-    /// Creates an empty registry with a trusted credential/entitlement subject resolver.
-    ///
-    /// The resolver is consulted only for account-qualified user-authorized or licensed budgets;
-    /// public-interface budgets are derived solely from normalized endpoint origins.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RegistryError::RegistryIdentityExhausted`] when registry identity is exhausted.
-    pub fn try_new_with_authorization_subject_resolver(
-        resolver: Arc<dyn crate::AuthorizationSubjectResolver>,
-    ) -> Result<Self, RegistryError> {
-        Self::try_new_with_authority_state_and_clock_and_resolver(
-            RegistryAuthorityState::empty(),
-            Arc::new(SystemRegistryClock::try_new()?),
-            resolver,
-        )
-    }
-
-    /// Restores bounded authority tombstones before any source can be registered.
-    ///
-    /// # Errors
-    ///
-    /// Rejects unsupported/tampered state, duplicate sources/budget scopes, or coordinator failure.
-    pub fn try_new_with_authority_state(
-        state: RegistryAuthorityState,
-    ) -> Result<Self, RegistryError> {
-        Self::try_new_with_authority_state_and_clock(
-            state,
-            Arc::new(SystemRegistryClock::try_new()?),
-        )
-    }
-
-    /// Restores authority state and retains a trusted account-subject resolver for later metadata
-    /// registration.
-    ///
-    /// # Errors
-    ///
-    /// Rejects invalid persisted authority or coordinator conflicts.
-    pub fn try_new_with_authority_state_and_authorization_subject_resolver(
-        state: RegistryAuthorityState,
-        resolver: Arc<dyn crate::AuthorizationSubjectResolver>,
-    ) -> Result<Self, RegistryError> {
-        Self::try_new_with_authority_state_and_clock_and_resolver(
-            state,
-            Arc::new(SystemRegistryClock::try_new()?),
-            resolver,
-        )
-    }
-
-    fn try_new_with_authority_state_and_clock(
-        state: RegistryAuthorityState,
-        clock: Arc<dyn RegistryClock>,
-    ) -> Result<Self, RegistryError> {
-        Self::try_new_with_authority_state_and_clock_and_resolver(
-            state,
-            clock,
-            Arc::new(UnconfiguredAuthorizationSubjectResolver),
-        )
-    }
-
-    fn try_new_with_authority_state_and_clock_and_resolver(
-        state: RegistryAuthorityState,
-        clock: Arc<dyn RegistryClock>,
-        authorization_subject_resolver: Arc<dyn crate::AuthorizationSubjectResolver>,
-    ) -> Result<Self, RegistryError> {
-        let instance_id = NEXT_REGISTRY_ID
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                current.checked_add(1)
-            })
-            .map_err(|_| RegistryError::RegistryIdentityExhausted)?;
-        let mut budgets =
-            ProviderBudgetPool::new().map_err(|_| RegistryError::BudgetCoordinator)?;
-        let resolved_policies = state
-            .budget_policies
-            .as_slice()
-            .iter()
-            .map(|persisted| {
-                persisted
-                    .resolve(authorization_subject_resolver.as_ref())
-                    .map_err(map_budget_resolution_error)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        budgets
-            .register_all(&resolved_policies)
-            .map_err(|_| RegistryError::BudgetCoordinator)?;
-        let history = state
-            .sources
-            .as_slice()
-            .iter()
-            .map(|source| {
-                (
-                    source.source_id.clone(),
-                    SourceAuthorityHistory {
-                        used_revisions: source.used_revisions.as_slice().to_vec(),
-                        last_epoch: source.last_epoch,
-                        generation_high_water: source.generation_high_water,
-                    },
-                )
-            })
-            .collect();
-        Ok(Self {
-            instance_id,
-            entries: BTreeMap::new(),
-            budgets,
-            history,
-            clock,
-            authorization_subject_resolver,
-        })
-    }
-
-    /// Exports bounded serializable tombstones; live handles and leases are deliberately absent.
-    ///
-    /// # Errors
-    ///
-    /// Fails if configured source or budget counts exceed persisted bounds.
-    pub fn export_authority_state(&self) -> Result<RegistryAuthorityState, RegistryError> {
-        let mut sources = Vec::with_capacity(self.history.len());
-        for (source_id, history) in &self.history {
-            sources.push(PersistedSourceAuthority {
-                source_id: source_id.clone(),
-                used_revisions: BoundedVec::try_new(history.used_revisions.clone())
-                    .map_err(|_| RegistryError::RevisionHistoryExhausted)?,
-                last_epoch: history.last_epoch,
-                generation_high_water: history.generation_high_water,
-            });
-        }
-        RegistryAuthorityState::try_new(sources, self.budgets.policies())
-    }
-
     /// Registers effective, checked source metadata and returns an opaque handle.
     ///
     /// # Errors
@@ -174,6 +45,12 @@ impl AuthoritativeSourceRegistry {
         metadata: SourceMetadata,
         at: Timestamp,
     ) -> Result<RegisteredSource, RegistryError> {
+        if matches!(
+            &self.composition,
+            AuthorityComposition::Durable(durability) if durability.recovered_unclean()
+        ) {
+            return Err(RegistryError::UncleanAuthorityPredecessor);
+        }
         if !metadata.is_effective_at(at) {
             return Err(RegistryError::MetadataNotEffective);
         }
@@ -203,14 +80,12 @@ impl AuthoritativeSourceRegistry {
         let mut used_revisions =
             previous.map_or_else(Vec::new, |history| history.used_revisions.clone());
         used_revisions.push(revision.clone());
-        let budget = resolve_provider_budget_policy(
+        let resolved_budget = resolve_provider_budget_policy(
             &metadata,
             self.authorization_subject_resolver.as_ref(),
-        )?
-            .map(|policy| self.budgets.register(policy))
-            .transpose()
-            .map_err(|_| RegistryError::BudgetCoordinator)?;
-        self.history.insert(
+        )?;
+        let mut candidate_history = self.history.clone();
+        candidate_history.insert(
             source_id.clone(),
             SourceAuthorityHistory {
                 used_revisions: used_revisions.clone(),
@@ -218,6 +93,28 @@ impl AuthoritativeSourceRegistry {
                 generation_high_water,
             },
         );
+        let policies = resolved_budget.as_ref().map_or_else(
+            || self.budgets.policies(),
+            |policy| self.budgets.policies_with(policy.persisted()),
+        );
+        let candidate_state = authority_state_from_history(&candidate_history, policies)?;
+        let budget = match resolved_budget {
+            Some(policy) => Some(match &self.composition {
+                AuthorityComposition::Durable(_) => self
+                    .budgets
+                    .register_durable(policy, &candidate_state)
+                    .map_err(map_budget_pool_error)?,
+                AuthorityComposition::EphemeralDiagnostic => self
+                    .budgets
+                    .register(policy)
+                    .map_err(map_budget_pool_error)?,
+            }),
+            None => {
+                self.persist_registry_candidate(candidate_state)?;
+                None
+            }
+        };
+        self.history = candidate_history;
         self.entries.insert(
             source_id.clone(),
             RegistryEntry {
@@ -261,7 +158,7 @@ impl AuthoritativeSourceRegistry {
         }
         let entry = self
             .entries
-            .get_mut(&registered.source_id)
+            .get(&registered.source_id)
             .ok_or(RegistryError::UnknownSource)?;
         if entry.used_revisions.contains(metadata.revision()) {
             return Err(RegistryError::RevisionAlreadyUsed);
@@ -274,13 +171,41 @@ impl AuthoritativeSourceRegistry {
             .checked_add(1)
             .ok_or(RegistryError::EpochExhausted)?;
         let revision = metadata.revision().clone();
-        let budget = resolve_provider_budget_policy(
+        let resolved_budget = resolve_provider_budget_policy(
             &metadata,
             self.authorization_subject_resolver.as_ref(),
-        )?
-            .map(|policy| self.budgets.register(policy))
-            .transpose()
-            .map_err(|_| RegistryError::BudgetCoordinator)?;
+        )?;
+        let mut candidate_history = self.history.clone();
+        let history = candidate_history
+            .get_mut(&registered.source_id)
+            .ok_or(RegistryError::InvalidAuthorityState)?;
+        history.used_revisions.push(revision.clone());
+        history.last_epoch = epoch;
+        let policies = resolved_budget.as_ref().map_or_else(
+            || self.budgets.policies(),
+            |policy| self.budgets.policies_with(policy.persisted()),
+        );
+        let candidate_state = authority_state_from_history(&candidate_history, policies)?;
+        let budget = match resolved_budget {
+            Some(policy) => Some(match &self.composition {
+                AuthorityComposition::Durable(_) => self
+                    .budgets
+                    .register_durable(policy, &candidate_state)
+                    .map_err(map_budget_pool_error)?,
+                AuthorityComposition::EphemeralDiagnostic => self
+                    .budgets
+                    .register(policy)
+                    .map_err(map_budget_pool_error)?,
+            }),
+            None => {
+                self.persist_registry_candidate(candidate_state)?;
+                None
+            }
+        };
+        let entry = self
+            .entries
+            .get_mut(&registered.source_id)
+            .ok_or(RegistryError::UnknownSource)?;
         entry.metadata = metadata;
         entry.health_authority = None;
         entry.universe_attestation = None;
@@ -290,10 +215,7 @@ impl AuthoritativeSourceRegistry {
             active.lease.invalidate();
             active.capture.mark_incomplete();
         }
-        if let Some(history) = self.history.get_mut(&registered.source_id) {
-            history.used_revisions.push(revision.clone());
-            history.last_epoch = epoch;
-        }
+        self.history = candidate_history;
         Ok(RegisteredSource {
             registry_id: self.instance_id,
             source_id: registered.source_id.clone(),
@@ -367,10 +289,16 @@ impl AuthoritativeSourceRegistry {
         at: Timestamp,
     ) -> Result<CurrentSourceSession, RegistryError> {
         self.validate_registered(registered, at)?;
+        if matches!(
+            &self.composition,
+            AuthorityComposition::Durable(durability) if durability.recovered_unclean()
+        ) {
+            return Err(RegistryError::UncleanAuthorityPredecessor);
+        }
         let started_at = self.clock.observe()?;
         let entry = self
             .entries
-            .get_mut(&registered.source_id)
+            .get(&registered.source_id)
             .ok_or(RegistryError::UnknownSource)?;
         if entry
             .active
@@ -385,6 +313,18 @@ impl AuthoritativeSourceRegistry {
         {
             return Err(RegistryError::GenerationNotAdvanced);
         }
+        let mut candidate_history = self.history.clone();
+        candidate_history
+            .get_mut(&registered.source_id)
+            .ok_or(RegistryError::InvalidAuthorityState)?
+            .generation_high_water = Some(generation);
+        let candidate_state =
+            authority_state_from_history(&candidate_history, self.budgets.policies())?;
+        self.persist_registry_candidate_at(candidate_state, started_at.wall())?;
+        let entry = self
+            .entries
+            .get_mut(&registered.source_id)
+            .ok_or(RegistryError::UnknownSource)?;
         if let Some(active) = entry.active.take() {
             active.lease.invalidate();
             active.capture.mark_incomplete();
@@ -412,9 +352,7 @@ impl AuthoritativeSourceRegistry {
         });
         entry.health_authority = None;
         entry.generation_high_water = Some(generation);
-        if let Some(history) = self.history.get_mut(&registered.source_id) {
-            history.generation_high_water = Some(generation);
-        }
+        self.history = candidate_history;
         let binding = FrameSessionBinding::new(
             registered.source_id.clone(),
             registered.revision.clone(),
@@ -559,20 +497,30 @@ impl AuthoritativeSourceRegistry {
     pub fn revoke(
         &mut self,
         registered: &RegisteredSource,
-        at: Timestamp,
+        _at: Timestamp,
     ) -> Result<(), RegistryError> {
-        let _ = at;
         self.validate_registered_structure(registered)?;
+        let entry = self
+            .entries
+            .get(&registered.source_id)
+            .ok_or(RegistryError::UnknownSource)?;
+        self.history
+            .get(&registered.source_id)
+            .ok_or(RegistryError::InvalidAuthorityState)?;
+        let revoked_epoch = entry.epoch.checked_add(1).unwrap_or(entry.epoch);
+        let mut candidate_history = self.history.clone();
+        candidate_history
+            .get_mut(&registered.source_id)
+            .ok_or(RegistryError::InvalidAuthorityState)?
+            .last_epoch = revoked_epoch;
+        let candidate_state =
+            authority_state_from_history(&candidate_history, self.budgets.policies())?;
+        let persistence = self.persist_registry_candidate(candidate_state);
         let entry = self
             .entries
             .get_mut(&registered.source_id)
             .ok_or(RegistryError::UnknownSource)?;
-        let history = self
-            .history
-            .get_mut(&registered.source_id)
-            .ok_or(RegistryError::InvalidAuthorityState)?;
-        let revoked_epoch = entry.epoch.checked_add(1).unwrap_or(entry.epoch);
-        history.last_epoch = revoked_epoch;
+        self.history = candidate_history;
         entry.epoch = revoked_epoch;
         entry.revoked = true;
         if let Some(active) = entry.active.take() {
@@ -580,7 +528,7 @@ impl AuthoritativeSourceRegistry {
             active.capture.mark_incomplete();
         }
         entry.health_authority = None;
-        Ok(())
+        persistence
     }
 
     /// Revalidates a registration handle against registry-owned current state.
@@ -626,6 +574,26 @@ impl AuthoritativeSourceRegistry {
 
 }
 
+fn authority_state_from_history(
+    history: &BTreeMap<SourceId, SourceAuthorityHistory>,
+    policies: Vec<PersistedProviderBudgetPolicy>,
+) -> Result<RegistryAuthorityState, RegistryError> {
+    let mut sources = Vec::new();
+    sources
+        .try_reserve(history.len())
+        .map_err(|_| RegistryError::AuthorityStateCapacity)?;
+    for (source_id, source_history) in history {
+        sources.push(PersistedSourceAuthority {
+            source_id: source_id.clone(),
+            used_revisions: BoundedVec::try_new(source_history.used_revisions.clone())
+                .map_err(|_| RegistryError::RevisionHistoryExhausted)?,
+            last_epoch: source_history.last_epoch,
+            generation_high_water: source_history.generation_high_water,
+        });
+    }
+    RegistryAuthorityState::try_new(sources, policies)
+}
+
 fn resolve_provider_budget_policy(
     metadata: &SourceMetadata,
     resolver: &dyn crate::AuthorizationSubjectResolver,
@@ -655,5 +623,69 @@ fn map_budget_resolution_error(error: BudgetPolicyResolutionError) -> RegistryEr
         BudgetPolicyResolutionError::SubjectMismatch => {
             RegistryError::AuthorizationSubjectMismatch
         }
+    }
+}
+
+fn map_budget_pool_error(error: crate::BudgetPoolError) -> RegistryError {
+    match error {
+        crate::BudgetPoolError::Persistence => RegistryError::AuthorityPersistence,
+        crate::BudgetPoolError::ConflictingPolicy
+        | crate::BudgetPoolError::BridgingIdentity
+        | crate::BudgetPoolError::ClockUnavailable
+        | crate::BudgetPoolError::CoordinatorPoisoned
+        | crate::BudgetPoolError::CoordinatorCapacity
+        | crate::BudgetPoolError::CoordinatorAllocation
+        | crate::BudgetPoolError::CanonicalAuthorityCapacity
+        | crate::BudgetPoolError::CanonicalAuthorityAllocation
+        | crate::BudgetPoolError::CoordinatorCorrupt
+        | crate::BudgetPoolError::ConflictingDurability => RegistryError::BudgetCoordinator,
+    }
+}
+
+fn history_from_state(
+    state: &RegistryAuthorityState,
+) -> BTreeMap<SourceId, SourceAuthorityHistory> {
+    state
+        .sources
+        .as_slice()
+        .iter()
+        .map(|source| {
+            (
+                source.source_id.clone(),
+                SourceAuthorityHistory {
+                    used_revisions: source.used_revisions.as_slice().to_vec(),
+                    last_epoch: source.last_epoch,
+                    generation_high_water: source.generation_high_water,
+                },
+            )
+        })
+        .collect()
+}
+
+fn same_persisted_policy_set(
+    expected: &[PersistedProviderBudgetPolicy],
+    observed: &[PersistedProviderBudgetPolicy],
+) -> bool {
+    expected.len() == observed.len()
+        && observed
+            .iter()
+            .enumerate()
+            .all(|(index, policy)| {
+                !observed[index.saturating_add(1)..].contains(policy)
+                    && expected.contains(policy)
+            })
+}
+
+fn map_authority_persistence_error(error: AuthorityPersistenceError) -> RegistryError {
+    match error {
+        AuthorityPersistenceError::WallRollback => RegistryError::DurableWallRollback,
+        AuthorityPersistenceError::FutureState => RegistryError::DurableFutureState,
+        AuthorityPersistenceError::GenerationExhausted => {
+            RegistryError::DurableRunGenerationExhausted
+        }
+        AuthorityPersistenceError::Store
+        | AuthorityPersistenceError::InvalidState
+        | AuthorityPersistenceError::StateTooLarge
+        | AuthorityPersistenceError::SessionUnavailable => RegistryError::AuthorityPersistence,
     }
 }

@@ -104,7 +104,7 @@ fn metadata_deserialization_rejects_budget_scope_ambiguous_for_authorization() -
 
 #[test]
 fn raw_frames_share_session_identity_and_bound_exact_bytes() -> TestResult {
-    let mut registry = AuthoritativeSourceRegistry::try_new()?;
+    let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
     let registered = registry.register(
         direct_metadata("source-a", "revision-a", 0, None)?,
         Timestamp::from_unix_nanos(1),
@@ -151,7 +151,7 @@ fn raw_frames_share_session_identity_and_bound_exact_bytes() -> TestResult {
 
 #[test]
 fn connection_liveness_and_market_freshness_use_separate_clocks() -> TestResult {
-    let mut registry = AuthoritativeSourceRegistry::try_new()?;
+    let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
     let registered = registry.register(
         direct_metadata("source-a", "revision-a", 0, None)?,
         Timestamp::from_unix_nanos(1),

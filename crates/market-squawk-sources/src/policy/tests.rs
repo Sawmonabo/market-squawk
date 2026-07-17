@@ -333,13 +333,13 @@ mod tests {
                     let Ok(mut state) = budget.allocation.state.lock() else {
                         return Err(NetworkPolicyError::InvalidBudgetPolicy);
                     };
-                    state.requests_used = budget.policy().requests_per_window.get();
+                    state.requests_used = budget.policy().requests_per_window();
                 }
                 AvailabilityFailureCase::ConcurrencyExhausted => {
                     let Ok(mut state) = budget.allocation.state.lock() else {
                         return Err(NetworkPolicyError::InvalidBudgetPolicy);
                     };
-                    state.in_flight = budget.policy().max_concurrent.get();
+                    state.in_flight = budget.policy().max_concurrent();
                 }
             }
             let result = budget.availability_lease();
@@ -456,7 +456,7 @@ mod tests {
                 .state
                 .lock()
                 .map_err(|_| NetworkPolicyError::InvalidBudgetPolicy)?;
-            assert_eq!(state.in_flight, budget.policy().max_concurrent.get());
+            assert_eq!(state.in_flight, budget.policy().max_concurrent());
             assert!(!prior.is_available());
         }
         release.wait();
@@ -465,6 +465,82 @@ mod tests {
             .map_err(|_| NetworkPolicyError::InvalidBudgetPolicy)?;
         assert!(sent);
         assert!(matches!(decision, BudgetDecision::Ready(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn durable_checkpoint_rejects_corrupt_counters_generations_and_deadlines()
+    -> Result<(), NetworkPolicyError> {
+        let policy = policy()?;
+        let observation = ClockObservation::new(
+            Timestamp::from_unix_nanos(1_000),
+            MonotonicInstant::from_nanos(1_000),
+        );
+        let state = BudgetState {
+            window_started_at: observation.monotonic,
+            restored_window_ends_at: None,
+            requests_used: 1,
+            in_flight: 0,
+            unavailable_until: None,
+            disabled: false,
+            consecutive_refusals: 0,
+        };
+        let valid = checkpoint_from_runtime(&policy, &state, observation, 1, false)
+            .map_err(|_| NetworkPolicyError::InvalidBudgetPolicy)?;
+        assert!(validate_checkpoint(&policy, &valid, observation).is_ok());
+
+        let mut excessive_requests = valid.clone();
+        excessive_requests.requests_used = policy.requests_per_window() + 1;
+        assert_eq!(
+            validate_checkpoint(&policy, &excessive_requests, observation),
+            Err(AuthorityPersistenceError::InvalidState)
+        );
+
+        let mut excessive_in_flight = valid.clone();
+        excessive_in_flight.in_flight = policy.max_concurrent() + 1;
+        assert_eq!(
+            validate_checkpoint(&policy, &excessive_in_flight, observation),
+            Err(AuthorityPersistenceError::InvalidState)
+        );
+
+        let mut zero_generation = valid.clone();
+        zero_generation.availability_generation = 0;
+        assert_eq!(
+            validate_checkpoint(&policy, &zero_generation, observation),
+            Err(AuthorityPersistenceError::InvalidState)
+        );
+
+        let mut poisoned_without_terminal = valid.clone();
+        poisoned_without_terminal.poisoned = true;
+        assert_eq!(
+            validate_checkpoint(&policy, &poisoned_without_terminal, observation),
+            Err(AuthorityPersistenceError::InvalidState)
+        );
+
+        let mut wrong_window = valid.clone();
+        wrong_window.window_ends_wall = wrong_window
+            .window_ends_wall
+            .checked_add_nanos(1)
+            .map_err(|_| NetworkPolicyError::InvalidBudgetPolicy)?;
+        assert_eq!(
+            validate_checkpoint(&policy, &wrong_window, observation),
+            Err(AuthorityPersistenceError::InvalidState)
+        );
+
+        let mut future_window = valid.clone();
+        future_window.window_started_wall = Timestamp::from_unix_nanos(1_001);
+        future_window.window_ends_wall = Timestamp::from_unix_nanos(1_101);
+        assert_eq!(
+            validate_checkpoint(&policy, &future_window, observation),
+            Err(AuthorityPersistenceError::FutureState)
+        );
+
+        let mut excessive_cooldown = valid;
+        excessive_cooldown.unavailable_until_wall = Some(Timestamp::from_unix_nanos(1_101));
+        assert_eq!(
+            validate_checkpoint(&policy, &excessive_cooldown, observation),
+            Err(AuthorityPersistenceError::InvalidState)
+        );
         Ok(())
     }
 }

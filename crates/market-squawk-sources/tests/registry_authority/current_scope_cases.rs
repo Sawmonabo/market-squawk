@@ -21,7 +21,7 @@ fn current_authority_is_scoped_by_venue_instrument_event_and_depth() -> TestResu
         .first()
         .ok_or("maximum-universe fixture must not be empty")?;
     covered_instruments.push(instrument);
-    let mut registry = AuthoritativeSourceRegistry::try_new()?;
+    let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
     let registered = registry.register(
         direct_metadata_with_instruments("source-a", "revision-a", 0, None, covered_instruments)?,
         Timestamp::from_unix_nanos(1),

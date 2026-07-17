@@ -446,7 +446,7 @@
     #[test]
     fn restored_registration_epoch_overflow_preserves_authority_state() -> TestResult {
         let at = Timestamp::from_unix_nanos(1);
-        let mut original = AuthoritativeSourceRegistry::try_new()?;
+        let mut original = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
         original.register(direct_metadata("restored-epoch-source", "revision-1")?, at)?;
         let mut wire = serde_json::to_value(original.export_authority_state()?)?;
         let sources = wire
@@ -459,7 +459,7 @@
             .ok_or_else(|| std::io::Error::other("persisted source authority missing"))?;
         persisted.insert("last_epoch".to_owned(), serde_json::json!(u64::MAX));
         let state = serde_json::from_value(wire)?;
-        let mut restored = AuthoritativeSourceRegistry::try_new_with_authority_state(state)?;
+        let mut restored = AuthoritativeSourceRegistry::try_new_ephemeral_with_authority_state_for_diagnostics(state)?;
         let before = restored.export_authority_state()?;
 
         assert!(matches!(
@@ -477,7 +477,7 @@
     #[test]
     fn distinct_source_capacity_is_enforced_before_any_registration_mutation() -> TestResult {
         let at = Timestamp::from_unix_nanos(1);
-        let mut registry = AuthoritativeSourceRegistry::try_new()?;
+        let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
         let registered = registry.register(direct_metadata("capacity-source", "revision-1")?, at)?;
         for index in 1..MAX_AUTHORITY_SOURCES {
             let source_id = SourceId::try_from(format!("capacity-history-{index}"))?;
@@ -503,7 +503,7 @@
         registry.revoke(&replacement, at)?;
         let restored_state = registry.export_authority_state()?;
         let mut registry =
-            AuthoritativeSourceRegistry::try_new_with_authority_state(restored_state)?;
+            AuthoritativeSourceRegistry::try_new_ephemeral_with_authority_state_for_diagnostics(restored_state)?;
         registry.register(direct_metadata("capacity-source", "revision-3")?, at)?;
         let before = registry.export_authority_state()?;
         let budget_policies_before = registry.budgets.policies();
@@ -528,7 +528,7 @@
     #[test]
     fn normal_revocation_persists_epoch_before_restart_reregistration() -> TestResult {
         let at = Timestamp::from_unix_nanos(1);
-        let mut registry = AuthoritativeSourceRegistry::try_new()?;
+        let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
         let registered =
             registry.register(direct_metadata("revoked-epoch-source", "revision-1")?, at)?;
         assert_eq!(registered.epoch, 1);
@@ -540,7 +540,7 @@
         let revoked_state = registry.export_authority_state()?;
 
         let mut restarted =
-            AuthoritativeSourceRegistry::try_new_with_authority_state(revoked_state)?;
+            AuthoritativeSourceRegistry::try_new_ephemeral_with_authority_state_for_diagnostics(revoked_state)?;
         let successor = restarted.register(
             direct_metadata("revoked-epoch-source", "revision-2")?,
             at,
@@ -613,7 +613,7 @@
         );
 
         let mut restarted =
-            AuthoritativeSourceRegistry::try_new_with_authority_state(before.clone())?;
+            AuthoritativeSourceRegistry::try_new_ephemeral_with_authority_state_for_diagnostics(before.clone())?;
         assert!(matches!(
             restarted.register(
                 direct_metadata("active-epoch-source", "revision-2")?,
@@ -628,8 +628,8 @@
     #[test]
     fn concurrent_conflicting_budget_registration_has_one_authoritative_winner() -> TestResult {
         let at = Timestamp::from_unix_nanos(1);
-        let first_registry = AuthoritativeSourceRegistry::try_new()?;
-        let second_registry = AuthoritativeSourceRegistry::try_new()?;
+        let first_registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
+        let second_registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
         let first_metadata = direct_metadata_with_provider_and_limit(
             "concurrent-policy-source-a",
             "revision-1",

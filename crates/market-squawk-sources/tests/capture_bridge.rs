@@ -34,7 +34,7 @@ fn rule(name: &str) -> TestResult<IntegrityRule> {
 #[tokio::test]
 async fn platform_returns_exact_registry_receipt_and_later_degradation_revokes_current_batch()
 -> TestResult {
-    let mut registry = AuthoritativeSourceRegistry::try_new()?;
+    let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
     let registered = registry.register(
         direct_metadata("source-a", "revision-a", 0, None)?,
         Timestamp::from_unix_nanos(1),
