@@ -1,5 +1,6 @@
 use std::{
     collections::VecDeque,
+    num::NonZeroUsize,
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
@@ -8,13 +9,150 @@ use std::{
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
 use serde_json::{Map, Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use thiserror::Error;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio_util::sync::CancellationToken;
 
 use crate::{diagnostic_engine::SharedDiagnosticEngine, replay::summarize_journal};
 
 const PROTOCOL_VERSION: &str = "2025-11-25";
 const MAX_TOOL_CALLS_PER_SECOND: usize = 100;
 const MAX_MCP_LINE_BYTES: usize = 1024 * 1024;
+const MCP_READER_SCRATCH_BYTES: usize = 8 * 1024;
+
+#[derive(Debug, Eq, PartialEq)]
+enum McpFrame<'a> {
+    Frame(&'a [u8]),
+    EndOfInput,
+}
+
+#[derive(Debug, Error)]
+enum McpFramingError {
+    #[error("MCP input read failed")]
+    Io(#[source] std::io::Error),
+    #[error("MCP request exceeds {maximum_bytes} bytes")]
+    Oversized { maximum_bytes: usize },
+    #[error("MCP input read was cancelled")]
+    Cancelled,
+    #[error("MCP framing limit cannot reserve a detection byte")]
+    InvalidLimit,
+}
+
+impl From<std::io::Error> for McpFramingError {
+    fn from(source: std::io::Error) -> Self {
+        Self::Io(source)
+    }
+}
+
+/// Incremental newline framing with one fixed request buffer and fixed reader scratch.
+#[derive(Debug)]
+struct BoundedMcpReader<R> {
+    reader: BufReader<R>,
+    frame: Box<[u8]>,
+    frame_len: usize,
+    maximum_bytes: usize,
+}
+
+impl<R> BoundedMcpReader<R>
+where
+    R: AsyncRead + Unpin,
+{
+    fn new(
+        reader: R,
+        maximum_bytes: NonZeroUsize,
+        scratch_bytes: NonZeroUsize,
+    ) -> std::result::Result<Self, McpFramingError> {
+        let frame_bytes = maximum_bytes
+            .get()
+            .checked_add(1)
+            .ok_or(McpFramingError::InvalidLimit)?;
+        Ok(Self {
+            reader: BufReader::with_capacity(scratch_bytes.get(), reader),
+            frame: vec![0; frame_bytes].into_boxed_slice(),
+            frame_len: 0,
+            maximum_bytes: maximum_bytes.get(),
+        })
+    }
+
+    async fn next_frame<'a>(
+        &'a mut self,
+        cancellation: &CancellationToken,
+    ) -> std::result::Result<McpFrame<'a>, McpFramingError> {
+        loop {
+            if cancellation.is_cancelled() {
+                return Err(McpFramingError::Cancelled);
+            }
+
+            let available = tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return Err(McpFramingError::Cancelled),
+                available = self.reader.fill_buf() => available?,
+            };
+            if available.is_empty() {
+                if self.frame_len == 0 {
+                    return Ok(McpFrame::EndOfInput);
+                }
+                if self.frame_len > self.maximum_bytes {
+                    return Err(McpFramingError::Oversized {
+                        maximum_bytes: self.maximum_bytes,
+                    });
+                }
+                let length = self.frame_len;
+                self.frame_len = 0;
+                return Ok(McpFrame::Frame(&self.frame[..length]));
+            }
+
+            let newline = available.iter().position(|byte| *byte == b'\n');
+            let bytes_before_newline = newline.unwrap_or(available.len());
+            let remaining = self.frame.len().saturating_sub(self.frame_len);
+            let copy_bytes = bytes_before_newline.min(remaining);
+            let end = self.frame_len.saturating_add(copy_bytes);
+            self.frame[self.frame_len..end].copy_from_slice(&available[..copy_bytes]);
+            self.frame_len = end;
+            let overflowed = bytes_before_newline > copy_bytes;
+            let consumed =
+                newline.map_or(bytes_before_newline, |position| position.saturating_add(1));
+            self.reader.consume(consumed);
+
+            if overflowed {
+                return Err(McpFramingError::Oversized {
+                    maximum_bytes: self.maximum_bytes,
+                });
+            }
+            if newline.is_some() {
+                if self.frame_len > self.maximum_bytes {
+                    if self.frame_len == self.maximum_bytes.saturating_add(1)
+                        && self.frame.get(self.frame_len.saturating_sub(1)) == Some(&b'\r')
+                    {
+                        self.frame_len = self.frame_len.saturating_sub(1);
+                    } else {
+                        return Err(McpFramingError::Oversized {
+                            maximum_bytes: self.maximum_bytes,
+                        });
+                    }
+                } else if self.frame.get(self.frame_len.saturating_sub(1)) == Some(&b'\r') {
+                    self.frame_len = self.frame_len.saturating_sub(1);
+                }
+                let length = self.frame_len;
+                self.frame_len = 0;
+                return Ok(McpFrame::Frame(&self.frame[..length]));
+            }
+
+            if self.frame_len > self.maximum_bytes
+                && self.frame.get(self.frame_len.saturating_sub(1)) != Some(&b'\r')
+            {
+                return Err(McpFramingError::Oversized {
+                    maximum_bytes: self.maximum_bytes,
+                });
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn frame_storage_bytes(&self) -> usize {
+        self.frame.len()
+    }
+}
 
 #[derive(Debug)]
 struct ToolRateLimiter {
@@ -71,32 +209,60 @@ impl McpServer {
 
     pub async fn serve_stdio(self) -> Result<()> {
         let stdin = tokio::io::stdin();
-        let mut lines = BufReader::new(stdin).lines();
         let stdout = tokio::io::stdout();
-        let mut stdout = tokio::io::BufWriter::new(stdout);
+        self.serve_io(
+            stdin,
+            tokio::io::BufWriter::new(stdout),
+            NonZeroUsize::new(MAX_MCP_LINE_BYTES)
+                .ok_or_else(|| anyhow::anyhow!("MCP request limit must be nonzero"))?,
+            NonZeroUsize::new(MCP_READER_SCRATCH_BYTES)
+                .ok_or_else(|| anyhow::anyhow!("MCP reader scratch must be nonzero"))?,
+            CancellationToken::new(),
+        )
+        .await
+    }
 
-        while let Some(line) = lines.next_line().await? {
-            if line.trim().is_empty() {
+    async fn serve_io<R, W>(
+        self,
+        reader: R,
+        mut writer: W,
+        maximum_bytes: NonZeroUsize,
+        scratch_bytes: NonZeroUsize,
+        cancellation: CancellationToken,
+    ) -> Result<()>
+    where
+        R: AsyncRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
+        let mut frames = BoundedMcpReader::new(reader, maximum_bytes, scratch_bytes)?;
+
+        loop {
+            let line = match frames.next_frame(&cancellation).await {
+                Ok(McpFrame::Frame(line)) => line,
+                Ok(McpFrame::EndOfInput) | Err(McpFramingError::Cancelled) => break,
+                Err(McpFramingError::Oversized { maximum_bytes }) => {
+                    write_message(
+                        &mut writer,
+                        &json_rpc_error(
+                            Value::Null,
+                            -32600,
+                            format!("request exceeds {maximum_bytes} bytes"),
+                        ),
+                    )
+                    .await?;
+                    break;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            if line.iter().all(u8::is_ascii_whitespace) {
                 continue;
             }
-            if line.len() > MAX_MCP_LINE_BYTES {
-                write_message(
-                    &mut stdout,
-                    &json_rpc_error(
-                        Value::Null,
-                        -32600,
-                        format!("request exceeds {MAX_MCP_LINE_BYTES} bytes"),
-                    ),
-                )
-                .await?;
-                continue;
-            }
 
-            let request: Value = match serde_json::from_str(&line) {
+            let request: Value = match serde_json::from_slice(line) {
                 Ok(request) => request,
                 Err(error) => {
                     write_message(
-                        &mut stdout,
+                        &mut writer,
                         &json_rpc_error(Value::Null, -32700, format!("parse error: {error}")),
                     )
                     .await?;
@@ -105,7 +271,7 @@ impl McpServer {
             };
 
             if let Some(response) = self.handle_request(&request) {
-                write_message(&mut stdout, &response).await?;
+                write_message(&mut writer, &response).await?;
             }
         }
         Ok(())
@@ -385,6 +551,10 @@ fn tool_definitions() -> Vec<Value> {
         }),
     ]
 }
+
+#[cfg(test)]
+#[path = "mcp/framing_tests.rs"]
+mod framing_tests;
 
 #[cfg(test)]
 mod tests {
