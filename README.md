@@ -24,7 +24,7 @@ Implemented production foundation contracts:
 Runnable diagnostic compatibility capabilities:
 
 - Public Coinbase Exchange WebSocket reader with single-venue, partial coverage
-- Level 2 snapshots and updates
+- Level 2/3 snapshots and updates
 - Heartbeat sequence tracking separated from order-book freshness
 - Match/trade capture
 - Append-only length-prefixed raw journal with CRC32 integrity checks and a single-writer OS lock
@@ -42,10 +42,6 @@ These compatibility capabilities are authority-free. Their app-local `QualitySta
 canonical `DataQuality::DirectVerified`, cannot enter the production live runtime, and can never
 authorize a production order. All bot/fill behavior described below is paper simulation only.
 
-Permanently excluded: Market Squawk will not implement identity/account rotation to evade limits,
-browser/TLS fingerprint concealment, CAPTCHA or anti-bot bypass, blocking-evasion proxy rotation,
-distributed quota evasion, stealth scraping, or any other access-control circumvention.
-
 Not yet implemented in the current foundation:
 
 - Live order submission
@@ -57,7 +53,8 @@ Not yet implemented in the current foundation:
 
 ## Why Rust
 
-The live path needs predictable memory use, native execution, safe concurrency, fixed-point financial values, and a single local binary. Python remains the intended research and model-training consumer through journal exports, Parquet in later versions, or a future Arrow/PyO3 interface. Python is not placed between a live event and a paper-bot decision.
+The live path needs predictable memory use, native execution, safe concurrency, fixed-point financial values, and a single local binary. Python remains the intended research and model-training consumer through journal exports, Parquet,
+Arrow/PyO3 interface. Python is not placed between a live event and a paper-bot decision.
 
 ## Quick start
 
