@@ -8,13 +8,13 @@
 and registry mutation fail closed and process authoritative.
 
 **Architecture:** Recursive checked retained-size accounting feeds bounded live admission. A sealed
-registry clock and temporal health epochs bind source evidence to trustworthy time. A process-wide
-weak interner supplies one generation-revocable allocation per canonical provider/account scope,
-while registries retain strong local catalogs. Registration and health changes stage all fallible
-work before state publication.
+registry clock and temporal health epochs bind source evidence to trustworthy time. A bounded
+process-lifetime coordinator supplies one non-resettable, generation-revocable allocation per
+canonical provider/account scope, while registries retain strong local catalogs. Registration and
+health changes stage all fallible work before state publication.
 
 **Tech stack:** Rust 1.97, Edition 2024, Tokio synchronization where already required, standard
-`OnceLock`/`Mutex`/`Weak`/atomics for process coordination, Serde for persisted control-plane state,
+`OnceLock`/`Mutex`/`Arc`/atomics for process coordination, Serde for persisted control-plane state,
 Proptest for invariants, and deterministic thread/barrier tests for concurrency.
 
 **Controlling design:**
@@ -99,8 +99,8 @@ Proptest for invariants, and deterministic thread/barrier tests for concurrency.
   conflicting policy registration is not linearized, and restore creates an independent budget.
 - [ ] Add failing lease tests for retry-after, refusal, disable, poison/clock/overflow failures,
   cooldown expiry, and concurrent transition versus lease validation.
-- [ ] Implement the process-wide weak interner and registry-retained budget catalogs. Provide an
-  atomic batch registration path for restore and bounded dead-entry reclamation.
+- [ ] Implement the bounded process-lifetime coordinator and registry-retained budget catalogs.
+  Provide an atomic batch registration path for restore; dropping handles must not reset authority.
 - [ ] Move availability generation into the shared allocation. Increment it before every
   unavailable return, derive `BudgetHealth` under the allocation state, and issue generation-bound
   availability leases only for currently available state.

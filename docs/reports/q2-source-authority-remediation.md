@@ -12,19 +12,27 @@ and planned in
 - Deep retained-size accounting closes nested decoded book storage, frame evidence, source
   authority, process budget, and sealed-clock allocations. Shared allocations are charged once per
   routed batch; admission rejects an overweight batch before it enters a bounded live queue.
+  Current-policy accounting now exhaustively binds every allocation-bearing field or enum variant,
+  charges actual retained capacities—including both identities in optional version-pinned evidence
+  locators—and uses checked arithmetic. Future retained fields therefore require explicit
+  allocation treatment at compile time; no handwritten policy-wide occurrence counts remain.
 - Remote provider budgets are process-authoritative by authorization-derived provider/account
   scope. Independent registries and restored state share request, concurrency, cooldown, disabled,
   and availability-generation state. Every unavailable transition synchronously revokes retained
-  availability leases.
+  availability leases. The coordinator retains at most 4,096 allocations for the process lifetime,
+  intentionally bounding memory while preventing handle churn from resetting provider state.
 - Health authority uses a registry-sealed wall/monotonic pair. The accepted chain is
   `session start <= observation <= report <= acceptance <= current validation`, with inclusive wall
   and monotonic deadlines. Reporter, recorder, mint, scoped authority, and queued authority all
-  fail closed on unavailable clocks, rollback, expiry, or arithmetic overflow.
+  retain the separate acceptance wall/monotonic lower bounds and fail closed on unavailable clocks,
+  partial or complete rollback, expiry, or arithmetic overflow.
 - Registration, replacement, health, attestation, and revocation transitions stage fallible work
   before publishing authority. Normal revocation records its successor epoch in exportable
   authority history before invalidating leases; exported and restored state preserves the
   tombstone. Terminal revocation remains available at `u64::MAX`, where no successor epoch exists,
-  and restored tombstones cannot resurrect the source.
+  and restored tombstones cannot resurrect the source. A 4,097th distinct source is rejected before
+  budget, history, or entry mutation; replacement and known-source re-registration remain possible
+  at the persisted-source bound.
 - Live processor, qualification, snapshot, and runtime-admission fixtures now derive absolute
   timelines from the registry-sealed session start. No test-only public clock or production bypass
   was introduced.
@@ -39,11 +47,14 @@ recovers only through an authorized provider path under the same evidenced ident
 
 ## Verification scope
 
-Deterministic coverage includes nested retained-size bounds, concurrent process-budget conflicts,
-cross-registry shared concurrency/cooldown, every availability-revocation branch, temporal-order
-rejection without mutation, trusted-clock failure and discontinuity, deadline/epoch overflow,
-normal and terminal revocation persistence, current-authority expiry, downstream live admission,
-and public capability privacy. External network tests remain separate from the deterministic suite.
+Deterministic coverage includes nested retained-size bounds, a maximum policy with every optional
+version-pinned evidence locator, concurrent process-budget conflicts,
+cross-registry shared concurrency/cooldown, complete-handle-drop state retention, coordinator and
+source capacity atomicity, every availability-revocation branch, temporal-order rejection without
+mutation, acceptance-bound rollback, trusted-clock failure and discontinuity, deadline/epoch
+overflow, normal and terminal revocation persistence, current-authority expiry, downstream live
+admission, and public capability privacy. External network tests remain separate from the
+deterministic suite.
 
 ## Verification results
 

@@ -35,9 +35,18 @@ normalization. Recursive payload accounting includes the backing array for snaps
 elements plus all nested strings. Arithmetic overflow rejects the batch; it never saturates into an
 undercharge.
 
+Current-policy accounting is exact rather than occurrence-count based. `CurrentLivePolicy` and
+every nested allocation-bearing structure use exhaustive field bindings or exhaustive enum
+matches, then sum the actual retained capacities with checked arithmetic. This is an intentional
+compiler boundary: adding a retained field or enum variant fails compilation until its allocation
+treatment is declared. Evidence accounting includes both identities in every optional
+version-pinned locator; there is no handwritten policy-wide identifier count to drift from the
+type shape.
+
 Tests cover each payload variant and boundary-size snapshots/deltas at 1, 10,000, and 20,000
-elements. A live admission regression chooses a byte limit between the former shallow estimate and
-the correct retained size and proves rejection.
+elements. A maximum-policy test exercises all nested locator allocations. A live admission
+regression chooses a byte limit between the former shallow estimate and the correct retained size
+and proves rejection.
 
 ## Trusted health time and temporal chain
 
@@ -52,22 +61,32 @@ non-serializable trusted observation in the update. Callers may describe when so
 observed, but cannot forge the registry's trusted report time. Production uses system time; unit
 tests inject a deterministic monotonic test clock through a non-public constructor.
 
-Each health epoch records both a lower and upper validity bound. Every validated authority and live
-lease checks the lower bound, deadline, current source epoch, current health epoch, and budget
-availability generation. Backward time, future source observations, deadline overflow, or a clock
-failure rejects without mutating current health.
+Each health epoch records the source-observation lower bound, the separate trusted acceptance wall
+and monotonic lower bounds, and the upper deadline. Every validated authority and retained live or
+queued lease checks those bounds, the current source epoch, current health epoch, and budget
+availability generation. Backward time—including rollback into the interval between observation
+and acceptance—future source observations, deadline overflow, or a clock failure rejects without
+mutating current health.
 
 ## Budget authority and synchronous revocation
 
-A process-wide coordinator interns budget allocations by canonical `BudgetScope`. The coordinator
-stores weak references, while each registry catalog retains strong references for its registered
-policies. This yields these invariants:
+A process-wide coordinator interns budget allocations by canonical `BudgetScope`. It retains each
+published allocation for the process lifetime, up to a hard 4,096-scope bound. Registry catalogs
+also retain the allocations they use. This deliberate bounded retention prevents a caller from
+resetting request, cooldown, disabled, terminal, or availability-generation state by dropping every
+external handle. It yields these invariants:
 
-- identical active scopes and policies share one allocation across all registries and restored
+- identical scopes and policies share one allocation across all registries and restored
   registries;
-- a conflicting policy for an active scope is rejected under the same coordinator lock;
-- a dead allocation can be reclaimed and replaced, with bounded cleanup on control-plane paths;
+- a conflicting policy for a published scope is rejected under the same coordinator lock, even
+  after all registry and caller handles are dropped;
+- allocation state is non-resettable for the process lifetime and coordinator capacity failure
+  leaves every previously published allocation unchanged;
 - batch restore preflights every scope and commits all coordinator entries atomically.
+
+At maximum cardinality, the coordinator intentionally retains 4,096 allocation objects, their
+bounded policies, synchronization state, and sealed budget clocks. This is control-plane memory,
+not live queue memory, and the fixed cap makes its worst-case growth explicit.
 
 Each allocation owns an atomic availability generation in addition to its rate state. Acquiring
 availability produces an unforgeable lease bound to that generation. Before an unavailable
@@ -114,4 +133,3 @@ authoritative.
 
 No database, analytical query, Python, MCP, filesystem operation, or unrelated network request is
 introduced into the live event-to-action path.
-
