@@ -15,8 +15,9 @@ use market_squawk_domain::{
     CaptureAuthorityIdentity, ConnectionGeneration, MetadataRevision, SourceId, SourceIdentifier,
 };
 use market_squawk_platform::{
-    CaptureShutdownStatus, CaptureWriterPolicy, ConfigOverrides, ConfigSources,
-    DiagnosticCaptureBundle, PendingCaptureWriter, raw_capture_channel, spawn_capture_writer,
+    CaptureShutdownStatus, CaptureWorkerReapError, CaptureWorkerTermination, CaptureWriterPolicy,
+    ConfigOverrides, ConfigSources, DiagnosticCaptureBundle, PendingCaptureWriter,
+    raw_capture_channel, spawn_capture_writer,
 };
 use parking_lot::RwLock;
 use tokio::sync::mpsc;
@@ -330,18 +331,26 @@ async fn finish_run_source(disposition: RunSourceDisposition) -> Result<Diagnost
             mut shutdown,
         } => {
             pending.wait_until_terminated().await;
-            let termination = pending
-                .try_reap()?
-                .cloned()
-                .ok_or_else(|| anyhow!("terminated capture worker had no final report"))?;
-            let capture_error = anyhow!(
-                "raw capture shutdown deadline elapsed; final worker report: {termination:?}"
-            );
+            let capture_error = compose_deferred_capture_error(pending.try_reap());
             match compose_pipeline_error(&mut shutdown, Some(capture_error)) {
                 Some(error) => Err(error),
                 None => Err(anyhow!("raw capture shutdown deadline elapsed")),
             }
         }
+    }
+}
+
+fn compose_deferred_capture_error(
+    reaped: std::result::Result<Option<&CaptureWorkerTermination>, CaptureWorkerReapError>,
+) -> anyhow::Error {
+    match reaped {
+        Ok(Some(termination)) => {
+            anyhow!("raw capture shutdown deadline elapsed; final worker report: {termination:?}")
+        }
+        Ok(None) => anyhow!(
+            "raw capture shutdown deadline elapsed; terminated worker retained no final report"
+        ),
+        Err(error) => anyhow!(error).context("failed to reap deferred capture worker"),
     }
 }
 
@@ -587,15 +596,16 @@ mod tests {
         SourceShutdownOutcome, SourceSupervisor, SupervisedSourceTask,
     };
     use market_squawk_platform::{
-        AppConfig, CaptureShutdownStatus, CaptureWriterPolicy, ConfigOverrides, ConfigSources,
-        DiagnosticCaptureBundle, MemoryCaptureSink, PendingCaptureWriter, raw_capture_channel,
-        spawn_capture_writer,
+        AppConfig, CaptureShutdownStatus, CaptureWorkerReapError, CaptureWriterPolicy,
+        ConfigOverrides, ConfigSources, DiagnosticCaptureBundle, MemoryCaptureSink,
+        PendingCaptureWriter, raw_capture_channel, spawn_capture_writer,
     };
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        Cli, RunMode, RunSourceDisposition, capture_identity, compose_pipeline_error, run_source,
+        Cli, PipelineShutdownReport, RunMode, RunSourceDisposition, SourceEventShutdownReport,
+        capture_identity, compose_deferred_capture_error, compose_pipeline_error, run_source,
         shutdown_source_then_event,
     };
 
@@ -613,6 +623,30 @@ mod tests {
         let _type_check: fn(
             RunSourceDisposition,
         ) -> Option<PendingCaptureWriter<DiagnosticCaptureBundle>> = retain_pending_owner;
+    }
+
+    #[test]
+    fn deferred_capture_reap_error_preserves_the_primary_pipeline_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const PRIMARY_FAILURE: &str = "injected primary pipeline failure";
+        let mut shutdown = PipelineShutdownReport {
+            primary: Some(anyhow::anyhow!(PRIMARY_FAILURE)),
+            source_event: SourceEventShutdownReport {
+                source: Ok(SourceShutdownOutcome::Graceful),
+                event_join_failed: false,
+            },
+        };
+
+        let capture_error =
+            compose_deferred_capture_error(Err(CaptureWorkerReapError::WorkerStillRunning));
+        let composed = compose_pipeline_error(&mut shutdown, Some(capture_error))
+            .ok_or("the injected primary failure must be retained")?;
+        let rendered = format!("{composed:#}");
+
+        assert!(rendered.contains(PRIMARY_FAILURE));
+        assert!(rendered.contains("failed to reap deferred capture worker"));
+        assert!(rendered.contains("capture worker is still running"));
+        Ok(())
     }
 
     #[test]
