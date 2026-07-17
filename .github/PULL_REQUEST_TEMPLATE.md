@@ -11,8 +11,9 @@ deliberate non-goals. Link the issue, plan, decision record, or review finding w
       negative tests.
 - [ ] Provider terms, source coverage, provenance, data quality, and execution eligibility remain
       explicit where applicable.
-- [ ] Security-sensitive details are reported privately through [SECURITY.md](../SECURITY.md), not
-      disclosed in this pull request.
+- [ ] Security-sensitive details are reported privately through
+      [SECURITY.md](https://github.com/Sawmonabo/market-squawk/blob/main/SECURITY.md), not disclosed
+      in this pull request.
 
 Do not paste credentials, private portfolio data, exchange secrets, proprietary datasets, or
 unredacted logs into a pull request.

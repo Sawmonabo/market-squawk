@@ -127,7 +127,11 @@ class RepositoryGovernancePolicyTests(unittest.TestCase):
         ):
             self.assertIn(heading, pull_request)
         self.assertIn("Do not paste credentials", pull_request)
-        self.assertIn("SECURITY.md", pull_request)
+        self.assertIn(
+            "https://github.com/Sawmonabo/market-squawk/blob/main/SECURITY.md",
+            pull_request,
+        )
+        self.assertNotIn("](../SECURITY.md)", pull_request)
         self.assertNotIn("${{", pull_request)
 
         config = (GITHUB / "ISSUE_TEMPLATE" / "config.yml").read_text()
