@@ -423,6 +423,10 @@ impl AuthorityDurabilitySession {
         self.lifecycle.fail_active()
     }
 
+    pub(crate) fn latch_terminal_for_time_discontinuity(&self) {
+        self.lifecycle.latch_terminal();
+    }
+
     fn latch_terminal_from_admitted_operation(
         &self,
         admission: &AuthorityOperationAdmission,
@@ -522,17 +526,29 @@ mod tests {
     }
 
     #[cfg(loom)]
-    #[test]
-    fn loom_models_admission_terminalization_and_clean_close_races() {
+    mod loom_model {
+        use std::time::Duration;
+
         use loom::sync::Arc as LoomArc;
         use loom::sync::atomic::{AtomicU64 as LoomAtomicU64, AtomicUsize};
         use loom::thread;
 
-        let mut model = loom::model::Builder::new();
-        model.max_threads = 4;
-        model.max_branches = 1_000;
-        model.preemption_bound = Some(2);
-        model.check(|| {
+        use super::*;
+
+        #[test]
+        fn admission_terminalization_and_clean_close_races() {
+            let mut model = loom::model::Builder::new();
+            model.max_threads = 4;
+            model.max_branches = 1_000;
+            model.max_permutations = Some(50_000);
+            model.max_duration = Some(Duration::from_secs(30));
+            model.preemption_bound = Some(2);
+            model.checkpoint_file = None;
+            model.checkpoint_interval = 20_000;
+            model.expect_explicit_explore = false;
+            model.location = false;
+            model.log = false;
+            model.check(|| {
             let lifecycle = LoomArc::new(LifecycleWord {
                 atomic: LoomAtomicU64::new(lifecycle_word(
                     AuthorityLifecyclePhase::Active,
@@ -588,6 +604,7 @@ mod tests {
                 writers,
                 usize::from(phase == AuthorityLifecyclePhase::TerminalPersisted)
             );
-        });
+            });
+        }
     }
 }

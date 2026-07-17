@@ -35,6 +35,16 @@ class VerifyScriptTests(unittest.TestCase):
             ),
         )
 
+    def test_bounded_capture_queue_models_are_a_required_gate(self) -> None:
+        script = VERIFY_SCRIPT.read_text()
+        self.assertRegex(
+            script,
+            re.compile(
+                r"^\./scripts/check_capture_queue_loom\.sh$",
+                flags=re.MULTILINE,
+            ),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

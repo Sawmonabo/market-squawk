@@ -15,13 +15,60 @@ use market_squawk_domain::{
     SourceId, SourceIdentifier,
 };
 use market_squawk_platform::{
-    CaptureShutdownStatus, CaptureWorkerTermination, CaptureWriterHandle, CaptureWriterPolicy,
-    DiagnosticCaptureBundle, DiagnosticCaptureReceipt, MemoryCaptureSink, RawCaptureControl,
-    RawCapturePublisher, raw_capture_channel, spawn_capture_writer,
+    CaptureChannelLimits, CaptureProcessInfrastructureLimits, CaptureShutdownStatus,
+    CaptureWorkerTermination, CaptureWriterHandle, CaptureWriterPolicy, DiagnosticCaptureBundle,
+    DiagnosticCaptureReceipt, MemoryCaptureSink, RawCaptureControl, RawCapturePublisher,
+    RawCaptureWriter, initialize_capture_process_infrastructure, raw_capture_channel,
+    spawn_capture_writer,
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+
+const TEST_CAPTURE_MEMORY_CEILING_BYTES: usize = 64 * 1024 * 1024;
+const TEST_DESTINATION_REGISTRY_CEILING_BYTES: usize = 1024 * 1024;
+const TEST_MEMORY_SINK_MAX_RECORDS: usize = 4_096;
+const TEST_MEMORY_SINK_RETAINED_CEILING_BYTES: usize = 64 * 1024 * 1024;
+
+fn test_memory_capture_sink() -> Result<MemoryCaptureSink, Box<dyn std::error::Error>> {
+    Ok(MemoryCaptureSink::try_new(
+        NonZeroUsize::new(TEST_MEMORY_SINK_MAX_RECORDS).ok_or("invalid test sink record limit")?,
+        NonZeroUsize::new(TEST_MEMORY_SINK_RETAINED_CEILING_BYTES)
+            .ok_or("invalid test sink retained-byte ceiling")?,
+    )?)
+}
+
+type TestCaptureChannel = (
+    RawCapturePublisher<DiagnosticCaptureBundle>,
+    RawCaptureControl<DiagnosticCaptureBundle>,
+    RawCaptureWriter<DiagnosticCaptureBundle>,
+);
+
+fn test_capture_channel(
+    capacity: NonZeroUsize,
+    bundle: DiagnosticCaptureBundle,
+) -> Result<TestCaptureChannel, Box<dyn std::error::Error>> {
+    let process =
+        initialize_capture_process_infrastructure(CaptureProcessInfrastructureLimits::new(
+            NonZeroUsize::new(TEST_DESTINATION_REGISTRY_CEILING_BYTES).unwrap_or(NonZeroUsize::MIN),
+        ))?;
+    Ok(raw_capture_channel(
+        &process,
+        CaptureChannelLimits::new(
+            capacity,
+            NonZeroUsize::new(TEST_CAPTURE_MEMORY_CEILING_BYTES).unwrap_or(NonZeroUsize::MIN),
+        ),
+        bundle,
+    )?)
+}
+
+fn accounting_invariant_failures(
+    publisher: &RawCapturePublisher<DiagnosticCaptureBundle>,
+) -> Result<u64, market_squawk_platform::CaptureAccountingSnapshotError> {
+    publisher
+        .try_accounting_snapshot(NonZeroUsize::new(64).unwrap_or(NonZeroUsize::MIN))
+        .map(market_squawk_platform::CaptureAccountingSnapshot::accounting_invariant_failures)
+}
 
 #[derive(Debug)]
 struct ReconnectOnceSource {
@@ -83,10 +130,10 @@ fn activated_capture() -> Result<ActivatedCapture, Box<dyn std::error::Error>> {
     let (identity, connection_id) = initial_identity()?;
     let capacity = NonZeroUsize::new(8).ok_or("invalid fixed test capacity")?;
     let (publisher, mut control, writer) =
-        raw_capture_channel(capacity, DiagnosticCaptureBundle::new(identity.clone()));
+        test_capture_channel(capacity, DiagnosticCaptureBundle::new(identity.clone()))?;
     let writer_handle = spawn_capture_writer(
         writer,
-        MemoryCaptureSink::default(),
+        test_memory_capture_sink()?,
         CaptureWriterPolicy::default(),
     )?;
     control.activate_initial()?;
@@ -182,10 +229,10 @@ async fn only_the_supervisor_rotates_after_a_typed_reconnect_outcome()
     let (identity, connection_id) = initial_identity()?;
     let capacity = NonZeroUsize::new(8).ok_or("invalid fixed test capacity")?;
     let (publisher, mut control, writer) =
-        raw_capture_channel(capacity, DiagnosticCaptureBundle::new(identity.clone()));
+        test_capture_channel(capacity, DiagnosticCaptureBundle::new(identity.clone()))?;
     let capture_handle = spawn_capture_writer(
         writer,
-        MemoryCaptureSink::default(),
+        test_memory_capture_sink()?,
         CaptureWriterPolicy::default(),
     )?;
     control.activate_initial()?;
@@ -194,8 +241,12 @@ async fn only_the_supervisor_rotates_after_a_typed_reconnect_outcome()
         sessions: 0,
         receipts: Arc::clone(&receipts),
     });
-    let supervisor =
-        SourceSupervisor::new(publisher.clone(), control, identity.clone(), connection_id);
+    let supervisor = SourceSupervisor::new(
+        publisher.try_clone()?,
+        control,
+        identity.clone(),
+        connection_id,
+    );
     let (events, _event_receiver) = mpsc::channel(8);
     let cancel = CancellationToken::new();
 
@@ -233,7 +284,8 @@ async fn normal_and_cancelled_source_completion_invalidate_the_active_allocation
             identity,
             connection_id,
         } = activated_capture()?;
-        let supervisor = SourceSupervisor::new(publisher.clone(), control, identity, connection_id);
+        let supervisor =
+            SourceSupervisor::new(publisher.try_clone()?, control, identity, connection_id);
         let (events, _event_receiver) = mpsc::channel(1);
         let cancel = CancellationToken::new();
 
@@ -242,7 +294,7 @@ async fn normal_and_cancelled_source_completion_invalidate_the_active_allocation
             .await?;
 
         assert_eq!(publisher.integrity(), CaptureIntegrityState::Incomplete);
-        assert_eq!(publisher.accounting_invariant_failures(), 0);
+        assert_eq!(accounting_invariant_failures(&publisher)?, 0);
         assert!(
             !shutdown_and_reap(writer_handle)
                 .await?
@@ -263,7 +315,8 @@ async fn source_error_invalidates_the_active_allocation() -> Result<(), Box<dyn 
         identity,
         connection_id,
     } = activated_capture()?;
-    let supervisor = SourceSupervisor::new(publisher.clone(), control, identity, connection_id);
+    let supervisor =
+        SourceSupervisor::new(publisher.try_clone()?, control, identity, connection_id);
     let (events, _event_receiver) = mpsc::channel(1);
     let cancel = CancellationToken::new();
 
@@ -271,7 +324,7 @@ async fn source_error_invalidates_the_active_allocation() -> Result<(), Box<dyn 
 
     assert!(error.is_err());
     assert_eq!(publisher.integrity(), CaptureIntegrityState::Incomplete);
-    assert_eq!(publisher.accounting_invariant_failures(), 0);
+    assert_eq!(accounting_invariant_failures(&publisher)?, 0);
     assert!(
         !shutdown_and_reap(writer_handle)
             .await?
@@ -291,7 +344,8 @@ async fn aborting_the_supervisor_invalidates_the_active_allocation()
         identity,
         connection_id,
     } = activated_capture()?;
-    let supervisor = SourceSupervisor::new(publisher.clone(), control, identity, connection_id);
+    let supervisor =
+        SourceSupervisor::new(publisher.try_clone()?, control, identity, connection_id);
     let (events, _event_receiver) = mpsc::channel(1);
     let cancel = CancellationToken::new();
     let task = tokio::spawn(supervisor.run(Box::new(HangingSource), events, cancel));
@@ -306,7 +360,7 @@ async fn aborting_the_supervisor_invalidates_the_active_allocation()
 
     assert!(join_error.is_cancelled());
     assert_eq!(publisher.integrity(), CaptureIntegrityState::Incomplete);
-    assert_eq!(publisher.accounting_invariant_failures(), 0);
+    assert_eq!(accounting_invariant_failures(&publisher)?, 0);
     assert!(
         !shutdown_and_reap(writer_handle)
             .await?
@@ -326,7 +380,8 @@ async fn supervisor_cancellation_preempts_and_reaps_a_token_ignoring_source_sess
         identity,
         connection_id,
     } = activated_capture()?;
-    let supervisor = SourceSupervisor::new(publisher.clone(), control, identity, connection_id);
+    let supervisor =
+        SourceSupervisor::new(publisher.try_clone()?, control, identity, connection_id);
     let (events, _event_receiver) = mpsc::channel(1);
     let mut task = SupervisedSourceTask::spawn(supervisor, Box::new(HangingSource), events);
     tokio::task::yield_now().await;
@@ -402,7 +457,8 @@ async fn cancellation_preempts_reconnect_backoff_before_generation_rotation()
         identity,
         connection_id,
     } = activated_capture()?;
-    let supervisor = SourceSupervisor::new(publisher.clone(), control, identity, connection_id);
+    let supervisor =
+        SourceSupervisor::new(publisher.try_clone()?, control, identity, connection_id);
     let (events, _event_receiver) = mpsc::channel(1);
     let sessions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut task = SupervisedSourceTask::spawn(

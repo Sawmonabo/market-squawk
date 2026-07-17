@@ -15,9 +15,10 @@ use market_squawk_domain::{
     CaptureAuthorityIdentity, ConnectionGeneration, MetadataRevision, SourceId, SourceIdentifier,
 };
 use market_squawk_platform::{
-    CaptureShutdownStatus, CaptureWorkerReapError, CaptureWorkerTermination, CaptureWriterPolicy,
-    ConfigOverrides, ConfigSources, DiagnosticCaptureBundle, PendingCaptureWriter,
-    raw_capture_channel, spawn_capture_writer,
+    CaptureChannelLimits, CaptureProcessInfrastructureLimits, CaptureShutdownStatus,
+    CaptureWorkerReapError, CaptureWorkerTermination, CaptureWriterPolicy, ConfigOverrides,
+    ConfigSources, DiagnosticCaptureBundle, PendingCaptureWriter,
+    initialize_capture_process_infrastructure, raw_capture_channel, spawn_capture_writer,
 };
 use parking_lot::RwLock;
 use tokio::sync::mpsc;
@@ -47,6 +48,18 @@ struct Cli {
     /// Source-task cancellation deadline in milliseconds (1..=60000).
     #[arg(long)]
     source_shutdown_ms: Option<u64>,
+
+    /// Fixed raw-capture queue depth.
+    #[arg(long)]
+    capture_queue_capacity: Option<usize>,
+
+    /// Unified per-channel capture memory ceiling in bytes.
+    #[arg(long)]
+    capture_memory_ceiling_bytes: Option<usize>,
+
+    /// Process-wide capture destination-registry memory ceiling in bytes.
+    #[arg(long)]
+    capture_destination_registry_memory_ceiling_bytes: Option<usize>,
 
     #[command(subcommand)]
     command: Command,
@@ -131,18 +144,19 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     initialize_logging(&cli.log, cli.json_logs)?;
     let config_file = cli.config.clone();
-    let cli_data_dir = cli.data_dir.clone();
-    let cli_source_shutdown_ms = cli.source_shutdown_ms;
+    let cli_overrides = ConfigOverrides {
+        data_dir: cli.data_dir,
+        capture_queue_capacity: cli.capture_queue_capacity,
+        capture_memory_ceiling_bytes: cli.capture_memory_ceiling_bytes,
+        capture_destination_registry_memory_ceiling_bytes: cli
+            .capture_destination_registry_memory_ceiling_bytes,
+        source_shutdown_ms: cli.source_shutdown_ms,
+        ..ConfigOverrides::default()
+    };
 
     match cli.command {
         Command::Init => {
-            let config = load_config(
-                config_file.as_deref(),
-                cli_data_dir,
-                None,
-                None,
-                cli_source_shutdown_ms,
-            )?;
+            let config = load_config(config_file.as_deref(), cli_overrides)?;
             let paths = AppPaths::prepare(config.data_dir())?;
             if let Some(path) = paths.journal_initialization_file("coinbase-exchange")?
                 && !path.exists()
@@ -158,10 +172,11 @@ async fn main() -> Result<()> {
         } => {
             let config = load_config(
                 config_file.as_deref(),
-                cli_data_dir,
-                Some(vec![product.clone()]),
-                Some(paper_bot),
-                cli_source_shutdown_ms,
+                ConfigOverrides {
+                    products: Some(vec![product.clone()]),
+                    paper_bot_enabled: Some(paper_bot),
+                    ..cli_overrides
+                },
             )?;
             let source: Box<dyn MarketSource> = Box::new(MockSource::new(product, events));
             let disposition = run_source(config, source, RunMode::UntilSourceStops).await?;
@@ -175,10 +190,11 @@ async fn main() -> Result<()> {
         } => {
             let config = load_config(
                 config_file.as_deref(),
-                cli_data_dir,
-                Some(products.clone()),
-                Some(paper_bot),
-                cli_source_shutdown_ms,
+                ConfigOverrides {
+                    products: Some(products.clone()),
+                    paper_bot_enabled: Some(paper_bot),
+                    ..cli_overrides
+                },
             )?;
             let source: Box<dyn MarketSource> = Box::new(CoinbaseSource::new(products));
             let mode = seconds.map_or(RunMode::UntilInterrupted, RunMode::ForDuration);
@@ -194,10 +210,11 @@ async fn main() -> Result<()> {
         } => {
             let config = load_config(
                 config_file.as_deref(),
-                cli_data_dir,
-                Some(products.clone()),
-                Some(paper_bot),
-                cli_source_shutdown_ms,
+                ConfigOverrides {
+                    products: Some(products.clone()),
+                    paper_bot_enabled: Some(paper_bot),
+                    ..cli_overrides
+                },
             )?;
             if offline {
                 run_offline_mcp(config, journal_format.map(Into::into)).await?;
@@ -214,13 +231,7 @@ async fn main() -> Result<()> {
             if source != "coinbase-exchange" {
                 anyhow::bail!("decoded replay currently supports source=coinbase-exchange");
             }
-            let config = load_config(
-                config_file.as_deref(),
-                cli_data_dir,
-                None,
-                None,
-                cli_source_shutdown_ms,
-            )?;
+            let config = load_config(config_file.as_deref(), cli_overrides)?;
             let paths = AppPaths::for_read(config.data_dir().to_path_buf());
             let journal_path =
                 paths.select_journal_for_read(&source, journal_format.map(Into::into))?;
@@ -238,23 +249,14 @@ async fn main() -> Result<()> {
 
 fn load_config(
     config_file: Option<&std::path::Path>,
-    data_dir: Option<PathBuf>,
-    products: Option<Vec<String>>,
-    paper_bot_enabled: Option<bool>,
-    source_shutdown_ms: Option<u64>,
+    cli_overrides: ConfigOverrides,
 ) -> Result<AppConfig> {
     let mut environment = ConfigSources::process_environment();
     environment.remove(&OsString::from("MARKET_SQUAWK_LOG"));
     Ok(AppConfig::load(ConfigSources::new(
         config_file,
         &environment,
-        ConfigOverrides {
-            data_dir,
-            products,
-            paper_bot_enabled,
-            source_shutdown_ms,
-            ..ConfigOverrides::default()
-        },
+        cli_overrides,
     ))?)
 }
 
@@ -366,10 +368,18 @@ async fn run_source(
     };
     let journal_path = paths.journal_write_file(source_name)?;
     let (capture_identity, connection_id) = capture_identity(source_name)?;
+    let process =
+        initialize_capture_process_infrastructure(CaptureProcessInfrastructureLimits::new(
+            config.capture_destination_registry_memory_ceiling_bytes(),
+        ))?;
     let (publisher, mut capture_control, capture_writer) = raw_capture_channel(
-        config.journal_queue_capacity(),
+        &process,
+        CaptureChannelLimits::new(
+            config.capture_queue_capacity(),
+            config.capture_memory_ceiling_bytes(),
+        ),
         DiagnosticCaptureBundle::new(capture_identity.clone()),
-    );
+    )?;
     let journal = paths.open_journal_writer(source_name)?;
     let flush_batch = std::num::NonZeroUsize::new(256)
         .ok_or_else(|| anyhow!("capture flush batch invariant failed"))?;
@@ -596,9 +606,10 @@ mod tests {
         SourceShutdownOutcome, SourceSupervisor, SupervisedSourceTask,
     };
     use market_squawk_platform::{
-        AppConfig, CaptureShutdownStatus, CaptureWorkerReapError, CaptureWriterPolicy,
-        ConfigOverrides, ConfigSources, DiagnosticCaptureBundle, MemoryCaptureSink,
-        PendingCaptureWriter, raw_capture_channel, spawn_capture_writer,
+        AppConfig, CaptureChannelLimits, CaptureProcessInfrastructureLimits, CaptureShutdownStatus,
+        CaptureWorkerReapError, CaptureWriterPolicy, ConfigOverrides, ConfigSources,
+        DiagnosticCaptureBundle, MemoryCaptureSink, PendingCaptureWriter,
+        initialize_capture_process_infrastructure, raw_capture_channel, spawn_capture_writer,
     };
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
@@ -608,6 +619,18 @@ mod tests {
         capture_identity, compose_deferred_capture_error, compose_pipeline_error, run_source,
         shutdown_source_then_event,
     };
+
+    const TEST_MEMORY_SINK_MAX_RECORDS: usize = 4_096;
+    const TEST_MEMORY_SINK_RETAINED_CEILING_BYTES: usize = 64 * 1024 * 1024;
+
+    fn test_memory_capture_sink() -> Result<MemoryCaptureSink, Box<dyn std::error::Error>> {
+        Ok(MemoryCaptureSink::try_new(
+            NonZeroUsize::new(TEST_MEMORY_SINK_MAX_RECORDS)
+                .ok_or("invalid test sink record limit")?,
+            NonZeroUsize::new(TEST_MEMORY_SINK_RETAINED_CEILING_BYTES)
+                .ok_or("invalid test sink retained-byte ceiling")?,
+        )?)
+    }
 
     fn retain_pending_owner(
         disposition: RunSourceDisposition,
@@ -655,6 +678,32 @@ mod tests {
         let cli = Cli::try_parse_from(["market-squawk", "--source-shutdown-ms", "2500", "mock"])?;
 
         assert_eq!(cli.source_shutdown_ms, Some(2_500));
+        Ok(())
+    }
+
+    #[test]
+    fn capture_memory_cli_overrides_use_only_the_v01_names()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let cli = Cli::try_parse_from([
+            "market-squawk",
+            "--capture-queue-capacity",
+            "32",
+            "--capture-memory-ceiling-bytes",
+            "67108864",
+            "--capture-destination-registry-memory-ceiling-bytes",
+            "1048576",
+            "mock",
+        ])?;
+        assert_eq!(cli.capture_queue_capacity, Some(32));
+        assert_eq!(cli.capture_memory_ceiling_bytes, Some(67_108_864));
+        assert_eq!(
+            cli.capture_destination_registry_memory_ceiling_bytes,
+            Some(1_048_576)
+        );
+        assert!(
+            Cli::try_parse_from(["market-squawk", "--journal-queue-capacity", "32", "mock",])
+                .is_err()
+        );
         Ok(())
     }
 
@@ -758,13 +807,21 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         const PRIMARY_FAILURE: &str = "injected MCP branch failure";
         let (identity, connection_id) = capture_identity("mock")?;
+        let process =
+            initialize_capture_process_infrastructure(CaptureProcessInfrastructureLimits::new(
+                NonZeroUsize::new(1024 * 1024).ok_or("invalid registry memory ceiling")?,
+            ))?;
         let (publisher, mut control, writer) = raw_capture_channel(
-            NonZeroUsize::new(8).ok_or("invalid fixed queue capacity")?,
+            &process,
+            CaptureChannelLimits::new(
+                NonZeroUsize::new(8).ok_or("invalid fixed queue capacity")?,
+                NonZeroUsize::new(64 * 1024 * 1024).ok_or("invalid capture memory ceiling")?,
+            ),
             DiagnosticCaptureBundle::new(identity.clone()),
-        );
+        )?;
         let capture_handle = spawn_capture_writer(
             writer,
-            MemoryCaptureSink::default(),
+            test_memory_capture_sink()?,
             CaptureWriterPolicy::default(),
         )?;
         control.activate_initial()?;
@@ -779,7 +836,8 @@ mod tests {
         let source: Box<dyn MarketSource> = Box::new(NonCooperativeSource {
             dropped: Arc::clone(&dropped),
         });
-        let supervisor = SourceSupervisor::new(publisher.clone(), control, identity, connection_id);
+        let supervisor =
+            SourceSupervisor::new(publisher.try_clone()?, control, identity, connection_id);
         let mut source_task = SupervisedSourceTask::spawn(supervisor, source, event_sender);
 
         let mut shutdown = shutdown_source_then_event(

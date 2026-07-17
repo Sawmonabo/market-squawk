@@ -50,7 +50,7 @@ impl SourceSupervisor {
         let mut backoff = Duration::from_secs(1);
         loop {
             let context = CaptureContext::new(
-                self.publisher.clone(),
+                self.publisher.try_clone()?,
                 self.identity.clone(),
                 self.connection_id,
             );

@@ -76,8 +76,14 @@ fn assessment_provenance_retains_binding_payload_and_assessment_reference() -> T
         ))
     );
     assert_eq!(provenance.received_at(), frame.received_at());
-    assert_eq!(provenance.available_at(), fixture.evaluated_at);
-    assert_eq!(provenance.ingested_at(), fixture.evaluated_at);
+    assert_eq!(
+        provenance.available_at(),
+        qualified.assessment.evaluated_at()
+    );
+    assert_eq!(
+        provenance.ingested_at(),
+        qualified.assessment.evaluated_at()
+    );
     assert_eq!(
         provenance.recorded_quality(),
         qualified.assessment.recorded_quality()

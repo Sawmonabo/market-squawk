@@ -6,9 +6,10 @@ use bytes::Bytes;
 use market_squawk_domain::{
     AuthorizationBasis, CaptureIntegrityState, ChecksumCapability, CoverageDelay, DataQuality,
     DeliveryEvidence, DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence,
-    MetadataRevision, ProviderChannel, ProviderProduct, RevisionBoundPayloadEvidence,
-    SchemaVersion, SequenceCapability, SourceId, StreamIntegrityState, Timestamp,
-    VersionPinnedSourceLocator,
+    MetadataRevision, ProviderChannel, ProviderProduct, RawCaptureFrameView,
+    RevisionBoundPayloadEvidence, SchemaVersion, SequenceCapability, SourceId,
+    StreamIntegrityState, Timestamp, VersionPinnedSourceLocator,
+    checked_arc_bytes_allocation_bytes,
 };
 use market_squawk_sources::{
     AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationHealth, AuthorizationMode,
@@ -116,35 +117,73 @@ fn raw_frames_share_session_identity_and_bound_exact_bytes() -> TestResult {
         Timestamp::from_unix_nanos(1),
     )?;
     let mut factory = registry.take_raw_frame_factory(&session)?;
-    let first = factory.try_frame(
-        Timestamp::from_unix_nanos(2),
-        TransportFrameKind::Binary,
-        Bytes::from_static(b"one"),
-    )?;
-    let second = factory.try_frame(
-        Timestamp::from_unix_nanos(3),
-        TransportFrameKind::Binary,
-        Bytes::from_static(b"two"),
-    )?;
+    let first = factory.try_frame(TransportFrameKind::Binary, Bytes::from_static(b"one"))?;
+    let second = factory.try_frame(TransportFrameKind::Binary, Bytes::from_static(b"two"))?;
     assert!(first.binding().shares_allocation_with(second.binding()));
+    assert!(
+        first
+            .capture_payload()
+            .shares_allocation_with(first.capture_payload())
+    );
+    assert!(
+        !first
+            .capture_payload()
+            .shares_allocation_with(second.capture_payload())
+    );
+    let first_footprint = first.checked_retained_footprint()?;
+    let first_source_pointer = first.source_id().as_str().as_ptr();
+    let first_payload_pointer = first.payload().as_ptr();
+    for _iteration in 0..3 {
+        assert_eq!(first.source_id().as_str().as_ptr(), first_source_pointer);
+        assert_eq!(first.payload().as_ptr(), first_payload_pointer);
+        assert_eq!(
+            first.capture_payload().as_bytes().as_ptr(),
+            first_payload_pointer
+        );
+        assert_eq!(first.checked_retained_footprint()?, first_footprint);
+    }
+    let first_clone = first.clone();
+    assert!(
+        first_clone
+            .binding()
+            .shares_allocation_with(first.binding())
+    );
+    assert!(
+        first_clone
+            .capture_payload()
+            .shares_allocation_with(first.capture_payload())
+    );
+    assert_eq!(first_clone.checked_retained_footprint()?, first_footprint);
+    assert_eq!(
+        first_footprint.inline_slot_funded_bytes(),
+        std::mem::size_of_val(&first)
+    );
+    assert!(first_footprint.resident_shared_bytes() > 0);
+    assert_eq!(
+        first_footprint.unique_frame_dynamic_bytes(),
+        checked_arc_bytes_allocation_bytes(first.payload().len())?
+    );
     let oversized_backing = Bytes::from(vec![7_u8; MAX_RAW_FRAME_BYTES + 1]);
     let tiny_slice = oversized_backing.slice(0..1);
     let original_pointer = tiny_slice.as_ptr();
-    let normalized = factory.try_frame(
-        Timestamp::from_unix_nanos(4),
-        TransportFrameKind::Binary,
-        tiny_slice,
-    )?;
+    let normalized = factory.try_frame(TransportFrameKind::Binary, tiny_slice)?;
     assert_eq!(normalized.retained_payload_bytes(), 1);
     assert_ne!(normalized.payload().as_ptr(), original_pointer);
     assert!(
         factory
             .try_frame(
-                Timestamp::from_unix_nanos(4),
                 TransportFrameKind::Binary,
                 Bytes::from(vec![0; MAX_RAW_FRAME_BYTES + 1]),
             )
             .is_err()
+    );
+    let exact = factory.try_frame(
+        TransportFrameKind::Binary,
+        Bytes::from(vec![0; MAX_RAW_FRAME_BYTES]),
+    )?;
+    assert_eq!(
+        exact.capture_payload().as_bytes().len(),
+        MAX_RAW_FRAME_BYTES
     );
     Ok(())
 }

@@ -11,8 +11,10 @@ use market_squawk_domain::{
     CaptureAuthorityIdentity, ConnectionGeneration, MetadataRevision, SourceId, SourceIdentifier,
 };
 use market_squawk_platform::{
-    CaptureShutdownStatus, CaptureWriterPolicy, DiagnosticCaptureBundle, LocalPaths,
-    MemoryCaptureSink, raw_capture_channel, spawn_capture_writer,
+    CaptureChannelLimits, CaptureProcessInfrastructureLimits, CaptureShutdownStatus,
+    CaptureWriterPolicy, DiagnosticCaptureBundle, LocalPaths, MemoryCaptureSink, RawCaptureControl,
+    RawCapturePublisher, RawCaptureWriter, initialize_capture_process_infrastructure,
+    raw_capture_channel, spawn_capture_writer,
 };
 use serde_json::Value;
 use tempfile::tempdir;
@@ -22,6 +24,42 @@ use tokio::{
 };
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 use tokio_util::sync::CancellationToken;
+
+const TEST_CAPTURE_MEMORY_CEILING_BYTES: usize = 64 * 1024 * 1024;
+const TEST_DESTINATION_REGISTRY_CEILING_BYTES: usize = 1024 * 1024;
+const TEST_MEMORY_SINK_MAX_RECORDS: usize = 4_096;
+const TEST_MEMORY_SINK_RETAINED_CEILING_BYTES: usize = 64 * 1024 * 1024;
+
+fn test_memory_capture_sink() -> Result<MemoryCaptureSink> {
+    Ok(MemoryCaptureSink::try_new(
+        NonZeroUsize::new(TEST_MEMORY_SINK_MAX_RECORDS)
+            .context("invalid test sink record limit")?,
+        NonZeroUsize::new(TEST_MEMORY_SINK_RETAINED_CEILING_BYTES)
+            .context("invalid test sink retained-byte ceiling")?,
+    )?)
+}
+
+fn test_capture_channel(
+    capacity: NonZeroUsize,
+    bundle: DiagnosticCaptureBundle,
+) -> Result<(
+    RawCapturePublisher<DiagnosticCaptureBundle>,
+    RawCaptureControl<DiagnosticCaptureBundle>,
+    RawCaptureWriter<DiagnosticCaptureBundle>,
+)> {
+    let process =
+        initialize_capture_process_infrastructure(CaptureProcessInfrastructureLimits::new(
+            NonZeroUsize::new(TEST_DESTINATION_REGISTRY_CEILING_BYTES).unwrap_or(NonZeroUsize::MIN),
+        ))?;
+    Ok(raw_capture_channel(
+        &process,
+        CaptureChannelLimits::new(
+            capacity,
+            NonZeroUsize::new(TEST_CAPTURE_MEMORY_CEILING_BYTES).unwrap_or(NonZeroUsize::MIN),
+        ),
+        bundle,
+    )?)
+}
 
 #[tokio::test]
 async fn coinbase_source_journals_and_publishes_local_websocket_messages() -> Result<()> {
@@ -76,10 +114,10 @@ async fn coinbase_source_journals_and_publishes_local_websocket_messages() -> Re
         ConnectionGeneration::new(1)?,
     );
     let connection_id = uuid::Uuid::new_v4();
-    let (publisher, mut control, writer) = raw_capture_channel(
+    let (publisher, mut control, writer) = test_capture_channel(
         NonZeroUsize::new(32).ok_or_else(|| anyhow::anyhow!("invalid test capacity"))?,
         DiagnosticCaptureBundle::new(identity.clone()),
-    );
+    )?;
     let capture_handle = spawn_capture_writer(
         writer,
         paths.open_journal_writer("coinbase-exchange")?,
@@ -162,13 +200,13 @@ fn test_capture() -> Result<(
         ConnectionGeneration::new(1)?,
     );
     let connection_id = uuid::Uuid::new_v4();
-    let (publisher, mut control, writer) = raw_capture_channel(
+    let (publisher, mut control, writer) = test_capture_channel(
         NonZeroUsize::new(8).ok_or_else(|| anyhow!("invalid test capacity"))?,
         DiagnosticCaptureBundle::new(identity.clone()),
-    );
+    )?;
     let handle = spawn_capture_writer(
         writer,
-        MemoryCaptureSink::default(),
+        test_memory_capture_sink()?,
         CaptureWriterPolicy::default(),
     )?;
     control.activate_initial()?;

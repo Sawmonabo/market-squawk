@@ -87,17 +87,16 @@ fn current_authority_is_scoped_by_venue_instrument_event_and_depth() -> TestResu
         None,
     )?;
     let first_frame = frames.try_frame(
-        first_frame_at,
         TransportFrameKind::Binary,
         Bytes::from_static(b"same-payload"),
     )?;
     let second_frame = frames.try_frame(
-        first_frame_at,
         TransportFrameKind::Binary,
         Bytes::from_static(b"same-payload"),
     )?;
     capture_admission.preflight(&first_frame)?;
-    let receipt = capture_admission.issue_after_enqueue(&first_frame)?;
+    let (resident, error_path_resident_drops) = observed_resident_generation_lease();
+    let receipt = capture_admission.issue_after_enqueue(&first_frame, resident)?;
     capture_admission.validate_active(&first_frame)?;
     let validated = session.validate_live_frame(&second_frame)?;
     let decoder_rule =
@@ -141,6 +140,7 @@ fn current_authority_is_scoped_by_venue_instrument_event_and_depth() -> TestResu
         current.validate_decoded_batch_owned(batch, receipt),
         Err(RegistryError::CaptureReceiptMismatch)
     ));
+    assert_eq!(error_path_resident_drops.load(Ordering::SeqCst), 1);
     assert!(
         current
             .validate_live_scope(
@@ -153,12 +153,12 @@ fn current_authority_is_scoped_by_venue_instrument_event_and_depth() -> TestResu
     );
 
     let current_frame = frames.try_frame(
-        current_frame_at,
         TransportFrameKind::Binary,
         Bytes::from_static(b"current-payload"),
     )?;
     capture_admission.preflight(&current_frame)?;
-    let current_receipt = capture_admission.issue_after_enqueue(&current_frame)?;
+    let (resident, success_path_resident_drops) = observed_resident_generation_lease();
+    let current_receipt = capture_admission.issue_after_enqueue(&current_frame, resident)?;
     capture_admission.validate_active(&current_frame)?;
     let current_validated = session.validate_live_frame(&current_frame)?;
     let current_evidence = DecoderEvidence::from_validated_frame(
@@ -210,6 +210,7 @@ fn current_authority_is_scoped_by_venue_instrument_event_and_depth() -> TestResu
         )?,
         current_receipt,
     )?;
+    assert_eq!(success_path_resident_drops.load(Ordering::SeqCst), 1);
     let mut routed_batches = current_batches.into_iter();
     assert_eq!(routed_batches.len(), 2);
     let current_batch = routed_batches

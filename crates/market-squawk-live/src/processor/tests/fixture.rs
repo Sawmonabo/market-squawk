@@ -32,6 +32,17 @@ use rust_decimal::Decimal;
 
 pub(super) type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
+#[derive(Debug)]
+struct FixtureResidentToken;
+
+impl market_squawk_domain::CaptureResidentToken for FixtureResidentToken {}
+
+fn fixture_resident_lease() -> market_squawk_domain::CaptureResidentGenerationLease {
+    market_squawk_domain::CaptureResidentGenerationLease::new(std::sync::Arc::new(
+        FixtureResidentToken,
+    ))
+}
+
 const INSTRUMENT: &str = "4c74ab95-53b9-42ad-9b66-0ed403b88fed";
 const VENUE: &str = "coinbase";
 pub(super) const HEALTH_AT: i64 = 0;
@@ -191,6 +202,7 @@ pub(super) struct SourceHarness {
     frames: RawFrameFactory,
     reporter: CurrentHealthReporter,
     timeline_origin: Timestamp,
+    last_frame_received_at: Option<Timestamp>,
 }
 
 impl SourceHarness {
@@ -229,6 +241,7 @@ impl SourceHarness {
             frames,
             reporter,
             timeline_origin,
+            last_frame_received_at: None,
         };
         harness.refresh_health(HEALTH_AT)?;
         Ok(harness)
@@ -279,6 +292,11 @@ impl SourceHarness {
             .try_current_lease()?)
     }
 
+    pub(super) fn last_frame_received_at(&self) -> TestResult<Timestamp> {
+        self.last_frame_received_at
+            .ok_or_else(|| "source harness has not built a frame".into())
+    }
+
     pub(super) fn batch(
         &mut self,
         source_identifier: &str,
@@ -287,12 +305,14 @@ impl SourceHarness {
         snapshot: ProviderSnapshotEvidence,
     ) -> TestResult<(CurrentSourceAuthorityLease, CurrentDecodedProviderBatch)> {
         let frame = self.frames.try_frame(
-            self.timestamp(FRAME_AT)?,
             TransportFrameKind::Binary,
             source_identifier.as_bytes().to_vec().into(),
         )?;
+        self.last_frame_received_at = Some(frame.received_at());
         self.capture_admission.preflight(&frame)?;
-        let receipt = self.capture_admission.issue_after_enqueue(&frame)?;
+        let receipt = self
+            .capture_admission
+            .issue_after_enqueue(&frame, fixture_resident_lease())?;
         self.capture_admission.validate_active(&frame)?;
         let validated = self.session.validate_live_frame(&frame)?;
         let decoder = DecoderEvidence::from_validated_frame(&validated, rule("coinbase-decoder")?);
@@ -336,6 +356,7 @@ impl SourceHarness {
             frames: _,
             reporter: _,
             timeline_origin,
+            last_frame_received_at: _,
         } = self;
         registry.end_session(&session, timeline_origin.checked_add_nanos(at)?)?;
         Self::activate(registry, registered, generation)

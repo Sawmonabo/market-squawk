@@ -5,7 +5,6 @@ use std::collections::{BTreeMap, HashMap};
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use market_squawk_domain::SchemaVersion;
 use market_squawk_domain::{
@@ -16,6 +15,10 @@ use market_squawk_domain::{
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
+use crate::authority_time::{
+    AuthorityTimeContinuity, RawRegistryClockSource, RegistryMonotonicInstant, SealedRegistryClock,
+    SystemRawRegistryClock, TrustedReceiptObservation, TrustedRegistryTime,
+};
 use crate::bounded::BoundedVec;
 use crate::policy::{
     AuthorityDurabilitySession, AuthorityPersistenceError, BudgetAvailabilityLease,
@@ -51,6 +54,8 @@ struct SessionLeaseState {
     valid_until_nanos: AtomicI64,
     last_health_observed_nanos: AtomicI64,
     frame_ordinal: AtomicU64,
+    continuity: AuthorityTimeContinuity,
+    started_at: TrustedRegistryTime,
 }
 
 impl SessionLeaseState {
@@ -63,7 +68,9 @@ impl SessionLeaseState {
     }
 
     fn is_current(&self) -> bool {
-        self.current.load(Ordering::Acquire) && !self.is_terminal()
+        self.current.load(Ordering::Acquire)
+            && !self.is_terminal()
+            && self.continuity.is_continuous()
     }
 
     fn is_terminal(&self) -> bool {
@@ -148,6 +155,10 @@ impl SessionLeaseState {
             })?;
         Ok(crate::FrameId::new(value))
     }
+
+    fn validate_receipt(&self, receipt: &TrustedReceiptObservation) -> Result<(), RegistryError> {
+        self.continuity.validate_receipt(receipt, self.started_at)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -158,51 +169,10 @@ struct CurrentHealthAuthority {
     accepted_at: TrustedRegistryTime,
     valid_from: Timestamp,
     valid_until: Timestamp,
-    valid_until_monotonic: Instant,
+    valid_until_monotonic: RegistryMonotonicInstant,
     authorization: crate::AuthorizationHealth,
     coverage: crate::CoverageHealth,
     budget: CurrentBudgetAuthority,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct TrustedRegistryTime {
-    wall: Timestamp,
-    monotonic: Instant,
-}
-
-impl TrustedRegistryTime {
-    const fn new(wall: Timestamp, monotonic: Instant) -> Self {
-        Self { wall, monotonic }
-    }
-
-    const fn wall(self) -> Timestamp {
-        self.wall
-    }
-
-    const fn monotonic(self) -> Instant {
-        self.monotonic
-    }
-
-    fn checked_deadline(self, until: Timestamp) -> Result<Option<Instant>, RegistryError> {
-        if until < self.wall {
-            return Ok(None);
-        }
-        let delta = until
-            .unix_nanos()
-            .checked_sub(self.wall.unix_nanos())
-            .ok_or(RegistryError::HealthDeadlineOverflow)?;
-        let nanos = u64::try_from(delta).map_err(|_| RegistryError::HealthDeadlineOverflow)?;
-        self.monotonic
-            .checked_add(Duration::from_nanos(nanos))
-            .map(Some)
-            .ok_or(RegistryError::HealthDeadlineOverflow)
-    }
-}
-
-trait RegistryClock: Send + Sync + std::fmt::Debug {
-    fn observe(&self) -> Result<TrustedRegistryTime, RegistryError>;
-
-    fn shared_allocation_charge(&self) -> usize;
 }
 
 #[derive(Debug)]
@@ -215,39 +185,6 @@ impl crate::AuthorizationSubjectResolver for UnconfiguredAuthorizationSubjectRes
         _evidence: market_squawk_domain::EvidenceDigest,
     ) -> Result<SourceIdentifier, crate::AuthorizationSubjectResolutionError> {
         Err(crate::AuthorizationSubjectResolutionError::EvidenceUnresolved)
-    }
-}
-
-#[derive(Debug)]
-struct SystemRegistryClock;
-
-impl SystemRegistryClock {
-    fn try_new() -> Result<Self, RegistryError> {
-        let duration = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| RegistryError::TrustedClockUnavailable)?;
-        let nanos = i64::try_from(duration.as_nanos())
-            .map_err(|_| RegistryError::TrustedClockUnavailable)?;
-        let _representable_wall_origin = Timestamp::from_unix_nanos(nanos);
-        Ok(Self)
-    }
-}
-
-impl RegistryClock for SystemRegistryClock {
-    fn observe(&self) -> Result<TrustedRegistryTime, RegistryError> {
-        let wall_duration = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| RegistryError::TrustedClockUnavailable)?;
-        let wall_nanos = i64::try_from(wall_duration.as_nanos())
-            .map_err(|_| RegistryError::TrustedClockUnavailable)?;
-        Ok(TrustedRegistryTime::new(
-            Timestamp::from_unix_nanos(wall_nanos),
-            Instant::now(),
-        ))
-    }
-
-    fn shared_allocation_charge(&self) -> usize {
-        std::mem::size_of::<Self>() + crate::conservative_arc_control_block_charge::<Self>()
     }
 }
 

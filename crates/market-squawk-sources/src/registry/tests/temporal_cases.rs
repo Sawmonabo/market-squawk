@@ -39,10 +39,14 @@
         wall.set_time(19, 30)?;
         assert_eq!(
             wall.registry.record_health(&wall.session, wall_update),
-            Err(RegistryError::InvalidHealthTemporalOrder)
+            Err(RegistryError::TrustedClockRegression)
         );
         assert_eq!(wall.epoch_and_cursor(), before_wall);
-        wall.accept_health(11, 31, 40, 1_000)?;
+        wall.set_time(31, 31)?;
+        assert!(wall
+            .reporter
+            .report(wall.snapshot(11, 1_000)?)
+            .is_err());
 
         let mut monotonic = HealthHarness::new("trusted-time-monotonic-inversion")?;
         monotonic.set_time(20, 20)?;
@@ -58,7 +62,11 @@
             Err(RegistryError::TrustedClockRegression)
         );
         assert_eq!(monotonic.epoch_and_cursor(), before_monotonic);
-        monotonic.accept_health(11, 31, 40, 1_000)?;
+        monotonic.set_time(31, 31)?;
+        assert!(monotonic
+            .reporter
+            .report(monotonic.snapshot(11, 1_000)?)
+            .is_err());
         Ok(())
     }
 
@@ -98,7 +106,6 @@
         let prior_queued = prior_scope.queued_authority_for_test();
         let mut raw_frames = harness.registry.take_raw_frame_factory(&harness.session)?;
         raw_frames.try_frame(
-            harness.timestamp(40)?,
             crate::TransportFrameKind::Binary,
             bytes::Bytes::from_static(b"before-exhaustion"),
         )?;
@@ -140,7 +147,6 @@
         );
         assert!(matches!(
             raw_frames.try_frame(
-                harness.timestamp(60)?,
                 crate::TransportFrameKind::Binary,
                 bytes::Bytes::from_static(b"after-exhaustion"),
             ),
@@ -330,17 +336,17 @@
         harness.set_time(5, 50)?;
         assert_eq!(
             lease.validate_at(harness.timestamp(50)?),
-            Err(RegistryError::HealthNotQualified)
+            Err(RegistryError::AuthorityTimeDiscontinuous)
         );
         harness.set_time(1_001, 60)?;
         assert_eq!(
             lease.validate_at(harness.timestamp(60)?),
-            Err(RegistryError::HealthNotQualified)
+            Err(RegistryError::AuthorityTimeDiscontinuous)
         );
         harness.set_time(50, 1_001)?;
         assert_eq!(
             lease.validate_at(harness.timestamp(50)?),
-            Err(RegistryError::HealthNotQualified)
+            Err(RegistryError::AuthorityTimeDiscontinuous)
         );
         Ok(())
     }
@@ -372,27 +378,36 @@
         harness.set_time(25, 40)?;
         assert_eq!(
             lease.validate_at(event_at),
-            Err(RegistryError::HealthNotQualified)
+            Err(RegistryError::TrustedClockRegression)
         );
         assert_eq!(
             scope.validate_at(event_at),
-            Err(RegistryError::HealthNotQualified)
+            Err(RegistryError::AuthorityTimeDiscontinuous)
         );
         assert_eq!(
             queued.validate_at(event_at),
-            Err(RegistryError::HealthNotQualified)
+            Err(RegistryError::AuthorityTimeDiscontinuous)
         );
 
         harness.set_time(40, 50)?;
-        lease.validate_at(event_at)?;
-        scope.validate_at(event_at)?;
-        queued.validate_at(event_at)?;
+        assert_eq!(
+            lease.validate_at(event_at),
+            Err(RegistryError::AuthorityTimeDiscontinuous)
+        );
+        assert_eq!(
+            scope.validate_at(event_at),
+            Err(RegistryError::AuthorityTimeDiscontinuous)
+        );
+        assert_eq!(
+            queued.validate_at(event_at),
+            Err(RegistryError::AuthorityTimeDiscontinuous)
+        );
         Ok(())
     }
 
     #[test]
     fn unavailable_trusted_clock_is_failure_atomic_at_report_record_and_mint() -> TestResult {
-        let mut harness = HealthHarness::new("trusted-time-unavailable")?;
+        let mut harness = HealthHarness::new("trusted-time-unavailable-report")?;
         let before_report = harness.epoch_and_cursor();
         let report_snapshot = harness.snapshot(10, 1_000)?;
         harness.clock.fail()?;
@@ -401,7 +416,13 @@
             Err(RegistryError::TrustedClockUnavailable)
         ));
         assert_eq!(harness.epoch_and_cursor(), before_report);
+        harness.set_time(20, 20)?;
+        assert!(harness
+            .reporter
+            .report(harness.snapshot(10, 1_000)?)
+            .is_err());
 
+        let mut harness = HealthHarness::new("trusted-time-unavailable-record")?;
         harness.set_time(20, 20)?;
         let record_update = harness.reporter.report(harness.snapshot(10, 1_000)?)?;
         let before_record = harness.epoch_and_cursor();
@@ -413,7 +434,13 @@
             Err(RegistryError::TrustedClockUnavailable)
         );
         assert_eq!(harness.epoch_and_cursor(), before_record);
+        harness.set_time(30, 30)?;
+        assert!(harness
+            .reporter
+            .report(harness.snapshot(11, 1_000)?)
+            .is_err());
 
+        let mut harness = HealthHarness::new("trusted-time-unavailable-mint")?;
         harness.accept_health(11, 31, 40, 1_000)?;
         harness.set_time(50, 50)?;
         let current = harness
@@ -427,7 +454,7 @@
         ));
         assert_eq!(harness.epoch_and_cursor(), before_mint);
         harness.set_time(51, 51)?;
-        current.try_current_lease()?.validate_at(harness.timestamp(51)?)?;
+        assert!(current.try_current_lease().is_err());
         Ok(())
     }
 
@@ -435,7 +462,7 @@
     fn trusted_deadline_conversion_rejects_wall_delta_overflow() {
         let reading = TrustedRegistryTime::new(
             Timestamp::from_unix_nanos(i64::MIN),
-            Instant::now(),
+            RegistryMonotonicInstant::from_nanos(0),
         );
         assert_eq!(
             reading.checked_deadline(Timestamp::from_unix_nanos(i64::MAX)),

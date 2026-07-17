@@ -17,12 +17,16 @@ use zeroize::Zeroize;
 const ENV_PREFIX: &str = "MARKET_SQUAWK_";
 const DEFAULT_STALE_AFTER_MS: u64 = 5_000;
 const DEFAULT_QUEUE_CAPACITY: usize = 16_384;
+const DEFAULT_CAPTURE_MEMORY_CEILING_BYTES: usize = 64 * 1024 * 1024;
+const DEFAULT_CAPTURE_DESTINATION_REGISTRY_MEMORY_CEILING_BYTES: usize = 1024 * 1024;
 const DEFAULT_FLUSH_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_SHUTDOWN_MS: u64 = 5_000;
 const DEFAULT_SOURCE_SHUTDOWN_MS: u64 = 5_000;
 const MAX_PRODUCTS: usize = 128;
 const MAX_PRODUCT_BYTES: usize = 128;
 const MAX_QUEUE_CAPACITY: usize = 1_048_576;
+const MAX_CAPTURE_MEMORY_CEILING_BYTES: usize = 4_294_967_295;
+const MAX_CAPTURE_DESTINATION_REGISTRY_MEMORY_CEILING_BYTES: usize = 64 * 1024 * 1024;
 const MIN_STALE_AFTER_MS: u64 = 250;
 const MAX_STALE_AFTER_MS: u64 = 600_000;
 const MAX_SHUTDOWN_MS: u64 = 60_000;
@@ -135,7 +139,11 @@ pub struct ConfigOverrides {
     /// Market-price freshness threshold in milliseconds.
     pub stale_after_ms: Option<u64>,
     /// Bounded raw-capture queue capacity.
-    pub journal_queue_capacity: Option<usize>,
+    pub capture_queue_capacity: Option<usize>,
+    /// Total fixed, resident-generation, and queued-record capture memory ceiling.
+    pub capture_memory_ceiling_bytes: Option<usize>,
+    /// Process-wide destination-registry memory ceiling.
+    pub capture_destination_registry_memory_ceiling_bytes: Option<usize>,
     /// Enables paper bot behavior only; live execution is not implied.
     pub paper_bot_enabled: Option<bool>,
     /// Background capture flush interval in milliseconds.
@@ -194,7 +202,9 @@ struct FileConfig {
     data_dir: Option<PathBuf>,
     products: Option<Vec<String>>,
     stale_after_ms: Option<u64>,
-    journal_queue_capacity: Option<usize>,
+    capture_queue_capacity: Option<usize>,
+    capture_memory_ceiling_bytes: Option<usize>,
+    capture_destination_registry_memory_ceiling_bytes: Option<usize>,
     paper_bot_enabled: Option<bool>,
     capture_flush_interval_ms: Option<u64>,
     capture_shutdown_ms: Option<u64>,
@@ -208,7 +218,9 @@ pub struct AppConfig {
     data_dir: PathBuf,
     products: Vec<String>,
     stale_after: Duration,
-    journal_queue_capacity: NonZeroUsize,
+    capture_queue_capacity: NonZeroUsize,
+    capture_memory_ceiling_bytes: NonZeroUsize,
+    capture_destination_registry_memory_ceiling_bytes: NonZeroUsize,
     paper_bot_enabled: bool,
     capture_flush_interval: Duration,
     capture_shutdown: Duration,
@@ -223,7 +235,15 @@ impl fmt::Debug for AppConfig {
             .field("data_dir", &self.data_dir)
             .field("products", &self.products)
             .field("stale_after", &self.stale_after)
-            .field("journal_queue_capacity", &self.journal_queue_capacity)
+            .field("capture_queue_capacity", &self.capture_queue_capacity)
+            .field(
+                "capture_memory_ceiling_bytes",
+                &self.capture_memory_ceiling_bytes,
+            )
+            .field(
+                "capture_destination_registry_memory_ceiling_bytes",
+                &self.capture_destination_registry_memory_ceiling_bytes,
+            )
             .field("paper_bot_enabled", &self.paper_bot_enabled)
             .field("capture_flush_interval", &self.capture_flush_interval)
             .field("capture_shutdown", &self.capture_shutdown)
@@ -242,7 +262,19 @@ impl Default for AppConfig {
             data_dir: PathBuf::from(".market-squawk"),
             products: vec!["BTC-USD".to_owned()],
             stale_after: Duration::from_millis(DEFAULT_STALE_AFTER_MS),
-            journal_queue_capacity: match NonZeroUsize::new(DEFAULT_QUEUE_CAPACITY) {
+            capture_queue_capacity: match NonZeroUsize::new(DEFAULT_QUEUE_CAPACITY) {
+                Some(value) => value,
+                None => NonZeroUsize::MIN,
+            },
+            capture_memory_ceiling_bytes: match NonZeroUsize::new(
+                DEFAULT_CAPTURE_MEMORY_CEILING_BYTES,
+            ) {
+                Some(value) => value,
+                None => NonZeroUsize::MIN,
+            },
+            capture_destination_registry_memory_ceiling_bytes: match NonZeroUsize::new(
+                DEFAULT_CAPTURE_DESTINATION_REGISTRY_MEMORY_CEILING_BYTES,
+            ) {
                 Some(value) => value,
                 None => NonZeroUsize::MIN,
             },
@@ -295,8 +327,18 @@ impl AppConfig {
     }
 
     /// Returns the bounded raw-capture queue capacity.
-    pub const fn journal_queue_capacity(&self) -> NonZeroUsize {
-        self.journal_queue_capacity
+    pub const fn capture_queue_capacity(&self) -> NonZeroUsize {
+        self.capture_queue_capacity
+    }
+
+    /// Returns the unified per-channel capture memory ceiling.
+    pub const fn capture_memory_ceiling_bytes(&self) -> NonZeroUsize {
+        self.capture_memory_ceiling_bytes
+    }
+
+    /// Returns the process-wide capture destination-registry memory ceiling.
+    pub const fn capture_destination_registry_memory_ceiling_bytes(&self) -> NonZeroUsize {
+        self.capture_destination_registry_memory_ceiling_bytes
     }
 
     /// Returns whether paper-only bot behavior is enabled.
@@ -331,7 +373,13 @@ impl From<AppConfig> for ConfigOverrides {
             data_dir: Some(config.data_dir),
             products: Some(config.products),
             stale_after_ms: Some(duration_millis(config.stale_after)),
-            journal_queue_capacity: Some(config.journal_queue_capacity.get()),
+            capture_queue_capacity: Some(config.capture_queue_capacity.get()),
+            capture_memory_ceiling_bytes: Some(config.capture_memory_ceiling_bytes.get()),
+            capture_destination_registry_memory_ceiling_bytes: Some(
+                config
+                    .capture_destination_registry_memory_ceiling_bytes
+                    .get(),
+            ),
             paper_bot_enabled: Some(config.paper_bot_enabled),
             capture_flush_interval_ms: Some(duration_millis(config.capture_flush_interval)),
             capture_shutdown_ms: Some(duration_millis(config.capture_shutdown)),
@@ -360,8 +408,18 @@ impl ConfigOverrides {
         if higher.stale_after_ms.is_some() {
             self.stale_after_ms = higher.stale_after_ms;
         }
-        if higher.journal_queue_capacity.is_some() {
-            self.journal_queue_capacity = higher.journal_queue_capacity;
+        if higher.capture_queue_capacity.is_some() {
+            self.capture_queue_capacity = higher.capture_queue_capacity;
+        }
+        if higher.capture_memory_ceiling_bytes.is_some() {
+            self.capture_memory_ceiling_bytes = higher.capture_memory_ceiling_bytes;
+        }
+        if higher
+            .capture_destination_registry_memory_ceiling_bytes
+            .is_some()
+        {
+            self.capture_destination_registry_memory_ceiling_bytes =
+                higher.capture_destination_registry_memory_ceiling_bytes;
         }
         if higher.paper_bot_enabled.is_some() {
             self.paper_bot_enabled = higher.paper_bot_enabled;
@@ -385,7 +443,10 @@ impl ConfigOverrides {
             data_dir: file.data_dir,
             products: file.products,
             stale_after_ms: file.stale_after_ms,
-            journal_queue_capacity: file.journal_queue_capacity,
+            capture_queue_capacity: file.capture_queue_capacity,
+            capture_memory_ceiling_bytes: file.capture_memory_ceiling_bytes,
+            capture_destination_registry_memory_ceiling_bytes: file
+                .capture_destination_registry_memory_ceiling_bytes,
             paper_bot_enabled: file.paper_bot_enabled,
             capture_flush_interval_ms: file.capture_flush_interval_ms,
             capture_shutdown_ms: file.capture_shutdown_ms,
@@ -423,8 +484,15 @@ impl ConfigOverrides {
                 "MARKET_SQUAWK_STALE_AFTER_MS" => {
                     layer.stale_after_ms = Some(parse_environment(value)?);
                 }
-                "MARKET_SQUAWK_JOURNAL_QUEUE_CAPACITY" => {
-                    layer.journal_queue_capacity = Some(parse_environment(value)?);
+                "MARKET_SQUAWK_CAPTURE_QUEUE_CAPACITY" => {
+                    layer.capture_queue_capacity = Some(parse_environment(value)?);
+                }
+                "MARKET_SQUAWK_CAPTURE_MEMORY_CEILING_BYTES" => {
+                    layer.capture_memory_ceiling_bytes = Some(parse_environment(value)?);
+                }
+                "MARKET_SQUAWK_CAPTURE_DESTINATION_REGISTRY_MEMORY_CEILING_BYTES" => {
+                    layer.capture_destination_registry_memory_ceiling_bytes =
+                        Some(parse_environment(value)?);
                 }
                 "MARKET_SQUAWK_PAPER_BOT_ENABLED" => {
                     layer.paper_bot_enabled = Some(parse_environment(value)?);
@@ -485,12 +553,22 @@ impl TryFrom<ConfigOverrides> for AppConfig {
             return Err(ConfigError::InvalidStaleAfter);
         }
         let queue = values
-            .journal_queue_capacity
+            .capture_queue_capacity
             .and_then(NonZeroUsize::new)
             .ok_or(ConfigError::InvalidQueueCapacity)?;
         if queue.get() > MAX_QUEUE_CAPACITY {
             return Err(ConfigError::InvalidQueueCapacity);
         }
+        let capture_memory_ceiling_bytes = values
+            .capture_memory_ceiling_bytes
+            .and_then(NonZeroUsize::new)
+            .filter(|value| value.get() <= MAX_CAPTURE_MEMORY_CEILING_BYTES)
+            .ok_or(ConfigError::InvalidCaptureMemoryCeiling)?;
+        let capture_destination_registry_memory_ceiling_bytes = values
+            .capture_destination_registry_memory_ceiling_bytes
+            .and_then(NonZeroUsize::new)
+            .filter(|value| value.get() <= MAX_CAPTURE_DESTINATION_REGISTRY_MEMORY_CEILING_BYTES)
+            .ok_or(ConfigError::InvalidCaptureDestinationRegistryMemoryCeiling)?;
         let flush_ms = values
             .capture_flush_interval_ms
             .and_then(NonZeroU64::new)
@@ -513,7 +591,9 @@ impl TryFrom<ConfigOverrides> for AppConfig {
             data_dir,
             products,
             stale_after: Duration::from_millis(stale_after_ms.get()),
-            journal_queue_capacity: queue,
+            capture_queue_capacity: queue,
+            capture_memory_ceiling_bytes,
+            capture_destination_registry_memory_ceiling_bytes,
             paper_bot_enabled: values
                 .paper_bot_enabled
                 .ok_or(ConfigError::InternalComposition)?,
@@ -579,8 +659,14 @@ pub enum ConfigError {
     #[error("stale-after duration is invalid")]
     InvalidStaleAfter,
     /// Capture queue capacity was zero or outside supported limits.
-    #[error("journal queue capacity is invalid")]
+    #[error("capture queue capacity is invalid")]
     InvalidQueueCapacity,
+    /// The unified capture memory ceiling was zero or exceeded the supported bound.
+    #[error("capture memory ceiling is invalid")]
+    InvalidCaptureMemoryCeiling,
+    /// The process destination-registry memory ceiling was zero or exceeded its bound.
+    #[error("capture destination registry memory ceiling is invalid")]
+    InvalidCaptureDestinationRegistryMemoryCeiling,
     /// Flush/shutdown values were zero, out of order, or outside supported limits.
     #[error("capture flush and shutdown timing is invalid")]
     InvalidCaptureTiming,

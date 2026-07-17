@@ -36,6 +36,17 @@ use rust_decimal::Decimal;
 
 pub(super) type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
+#[derive(Debug)]
+struct FixtureResidentToken;
+
+impl market_squawk_domain::CaptureResidentToken for FixtureResidentToken {}
+
+fn fixture_resident_lease() -> market_squawk_domain::CaptureResidentGenerationLease {
+    market_squawk_domain::CaptureResidentGenerationLease::new(std::sync::Arc::new(
+        FixtureResidentToken,
+    ))
+}
+
 pub(super) const INSTRUMENT_ONE: &str = "018f0000-0000-7000-8000-000000000001";
 pub(super) const INSTRUMENT_TWO: &str = "018f0000-0000-7000-8000-000000000002";
 pub(super) const VENUE: &str = "coinbase";
@@ -398,12 +409,13 @@ impl SourceHarness {
         let frame_at = next_after(self.last_frame_at)?;
         self.last_frame_at = frame_at;
         let frame = self.frames.try_frame(
-            frame_at,
             TransportFrameKind::Binary,
             frame_identifier.as_bytes().to_vec().into(),
         )?;
         self.capture_admission.preflight(&frame)?;
-        let receipt = self.capture_admission.issue_after_enqueue(&frame)?;
+        let receipt = self
+            .capture_admission
+            .issue_after_enqueue(&frame, fixture_resident_lease())?;
         self.capture_admission.validate_active(&frame)?;
         let validated = self.session.validate_live_frame(&frame)?;
         let decoder = DecoderEvidence::from_validated_frame(&validated, rule("coinbase-decoder")?);
@@ -463,12 +475,13 @@ impl SourceHarness {
         let frame_at = next_after(self.last_frame_at)?;
         self.last_frame_at = frame_at;
         let frame = self.frames.try_frame(
-            frame_at,
             TransportFrameKind::Binary,
             source_identifier.as_bytes().to_vec().into(),
         )?;
         self.capture_admission.preflight(&frame)?;
-        let receipt = self.capture_admission.issue_after_enqueue(&frame)?;
+        let receipt = self
+            .capture_admission
+            .issue_after_enqueue(&frame, fixture_resident_lease())?;
         self.capture_admission.validate_active(&frame)?;
         let validated = self.session.validate_live_frame(&frame)?;
         let decoder = DecoderEvidence::from_validated_frame(&validated, rule("coinbase-decoder")?);

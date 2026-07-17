@@ -39,6 +39,17 @@ mod assessment_contract;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
+#[derive(Debug)]
+struct FixtureResidentToken;
+
+impl market_squawk_domain::CaptureResidentToken for FixtureResidentToken {}
+
+fn fixture_resident_lease() -> market_squawk_domain::CaptureResidentGenerationLease {
+    market_squawk_domain::CaptureResidentGenerationLease::new(std::sync::Arc::new(
+        FixtureResidentToken,
+    ))
+}
+
 const INSTRUMENT: &str = "4c74ab95-53b9-42ad-9b66-0ed403b88fed";
 const HEALTH_AT: i64 = 0;
 const FRAME_AT: i64 = 10_000_000;
@@ -277,12 +288,11 @@ fn current_fixture(policy: FixturePolicy, frame_count: usize) -> TestResult<Curr
     let mut observations = Vec::with_capacity(frame_count);
     for _ in 0..frame_count {
         let frame = frames.try_frame(
-            frame_at,
             TransportFrameKind::Binary,
             b"identical-wire-payload".as_slice().into(),
         )?;
         capture_admission.preflight(&frame)?;
-        let receipt = capture_admission.issue_after_enqueue(&frame)?;
+        let receipt = capture_admission.issue_after_enqueue(&frame, fixture_resident_lease())?;
         let validated = session.validate_live_frame(&frame)?;
         let decoder = DecoderEvidence::from_validated_frame(&validated, rule("coinbase-decoder")?);
         let checksum = match policy.checksum {

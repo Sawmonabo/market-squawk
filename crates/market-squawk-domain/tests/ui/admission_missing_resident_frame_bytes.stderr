@@ -1,0 +1,7 @@
+error[E0046]: not all trait items implemented, missing: `checked_resident_shared_frame_bytes`
+  --> tests/ui/admission_missing_resident_frame_bytes.rs:24:1
+   |
+24 | impl CaptureAdmission<()> for MissingResidentFrameBytes {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ missing `checked_resident_shared_frame_bytes` in implementation
+   |
+   = help: implement the missing item: `fn checked_resident_shared_frame_bytes(&self, _: &()) -> Result<usize, CaptureRetainedSizeError> { todo!() }`

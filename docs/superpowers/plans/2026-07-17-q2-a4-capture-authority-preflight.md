@@ -16,9 +16,39 @@ The seed owns dependencies, the ownership-preserving payload seam, the safe fixe
 construction, all shared call migration, and a measured legacy-channel baseline. TIME integrates
 first, MEM rebases onto TIME, and one unchanged candidate receives the grouped Q2 checkpoint.
 
-**Tech Stack:** Rust 1.97.0, Edition 2024, checked `Layout`/`usize` arithmetic, invariant-preserving
+**Tech Stack:** Rust 1.97.1, Edition 2024, checked `Layout`/`usize` arithmetic, invariant-preserving
 `CapturePayload` ownership over `Arc<[u8]>`, RAII reservations, `Mutex`/`Condvar`, Loom, Serde
 streaming, Criterion 0.8.2, Cargo, and optional GitHub Actions portability evidence.
+
+Rust 1.97.0 is forbidden for implementation, benchmark, checkpoint, or release evidence because
+of its upstream critical LLVM miscompilation. Every command result and private-layout assumption
+recorded under 1.97.0 is historical only and must be regenerated or explicitly revalidated under
+the exact 1.97.1 production toolchain before A4 approval.
+
+### Binding measurement-scope correction (2026-07-17)
+
+The pre-change standard-channel run and current preparer/host artifacts are diagnostic, not an
+independent approval baseline. Do not freeze, publish, or cite them as production performance
+evidence. A4 implementation proceeds directly through the fixed-ring/accounting/TIME/MEM work.
+After integration, one unchanged clean Q2 candidate runs paired standard-versus-ring measurements
+under direct Rust 1.97.1, locked dependencies, exact source/fixture/executable hashes, bounded host
+process supervision, an independent RSS observer, and documented host state. Identical final source,
+fixtures, host, and collection rules are mandatory for both backends. The clean exact-head full gate
+and grouped independent quarter review—not a self-declared lock or signature literal—authorize the
+performance claim.
+
+The measurement trust model excludes a malicious same-UID compiler/build-script adversary and does
+not claim byte-reproducible build or supply-chain attestation. Existing bounded I/O, process, schema,
+and no-clobber tests remain useful diagnostic hardening; they must not be described as proving that
+broader threat model. Unfinished hermetic snapshot/provenance work is excluded from the candidate.
+
+Authoritative tool references used by the seed are Cargo's profile inheritance rules—where the
+built-in `bench` profile inherits `release`—at
+<https://doc.rust-lang.org/cargo/reference/profiles.html>, and Clippy's feature-name guidance at
+<https://rust-lang.github.io/rust-clippy/master/#redundant_feature_names>. The production support
+feature is therefore named `capture-benchmark`, and evidence labels the active profile as Cargo
+bench inheriting the exact bound release profile rather than pretending `cargo bench` selected a
+different profile.
 
 ## Global constraints
 
@@ -180,12 +210,46 @@ pub trait CaptureAuthorityBundle: fmt::Debug + Send + Sized + 'static {
 
 pub trait CaptureAdmission<Frame>: fmt::Debug + Send + 'static {
     // Existing receipt, preflight, issuance, and validation methods remain required.
+    type Receipt: CaptureRetainedReceipt;
+
     fn checked_resident_shared_frame_bytes(
         &self,
         frame: &Frame,
     ) -> Result<usize, CaptureRetainedSizeError>;
+
+    fn issue_after_enqueue(
+        &mut self,
+        frame: &Frame,
+        resident: CaptureResidentGenerationLease,
+    ) -> Result<Self::Receipt, CaptureAuthorityError>;
 }
 ```
+
+`CaptureResidentGenerationLease` is a dependency-neutral opaque wrapper over one
+`Arc<dyn CaptureResidentToken>`. It is non-`Clone`; its public generic constructor and borrowed
+`shares_allocation_with` proof perform only allocation-free Arc unsizing and expose no inner
+accessor, detaching conversion, manual release, or authority operation. Every concrete associated
+receipt implements the required `CaptureRetainedReceipt` contract, stores the lease privately, and
+reports its additional dynamic retained bytes through a no-default checked method. The platform
+constructs a lease from the exact active `Arc<AccountedGenerationIdentity>`, moves it into
+`issue_after_enqueue`, then requires the issued receipt to prove both pointer identity with that
+active token and zero additional dynamic bytes before return. Pointer substitution or any nonzero
+unreserved receipt allocation terminally degrades the affected generation with typed
+`InvalidAuthorityGraph(CaptureLease)` and returns no receipt. The receipt/lease remain non-`Clone`
+and non-Serde, with no consuming extraction API. This closes the case where an old source receipt
+outlives all platform state while retaining bundle-counted binding/lease allocations after the
+resident charge was released. Receipt-only-after-rotation drop-order tests require the predecessor
+charge to remain until the concrete receipt drops and then reconcile exactly. Future nonzero
+receipt-owned dynamic storage requires an explicit reservation design; it cannot be admitted by
+changing the receipt implementation alone.
+
+The queue-independent standard-channel baseline precedes resident accounting. In Steps 1 through
+3, the platform therefore creates this lease over the exact active
+`Arc<GenerationCaptureState<B>>`, validates receipt pointer identity against that same Arc, and uses
+it solely as a lifetime proof for the already reachable source binding/lease graph. The baseline
+must not describe that transitional anchor as a memory-accounting token. Step 5 atomically replaces
+the anchor with the exact `Arc<AccountedGenerationIdentity>` when resident accounting is installed;
+the same pointer and zero-additional-dynamic validations then become accounting-authoritative.
 
 Add the inherent method with a complete body in implementation:
 
@@ -438,6 +502,18 @@ pub struct CaptureProcessInfrastructureLimits {
     destination_registry_memory_ceiling_bytes: NonZeroUsize,
 }
 
+impl CaptureProcessInfrastructureLimits {
+    pub const fn new(destination_registry_memory_ceiling_bytes: NonZeroUsize) -> Self {
+        Self {
+            destination_registry_memory_ceiling_bytes,
+        }
+    }
+
+    pub const fn destination_registry_memory_ceiling_bytes(self) -> NonZeroUsize {
+        self.destination_registry_memory_ceiling_bytes
+    }
+}
+
 pub struct CaptureProcessInfrastructure {
     // Allocation-free private reference to the ready arm of the process-global state.
 }
@@ -645,11 +721,13 @@ not allocator/RSS exactness.
 
 The same `Arc<AccountedGenerationIdentity>` is shared through `GenerationCaptureState`, publisher
 and control identity snapshots, health snapshots/events, queued messages, and
-`CapturedRawRecord`. Public wrappers expose `&CaptureAuthorityIdentity` but retain that exact Arc.
-The RAII token releases the resident charge only when the final state/message/event/snapshot/record
-reference drops. Rotation creates the successor token while the predecessor remains charged; a
-rejected successor drops its token and degrades only itself; successful publication needs no charge
-transfer or predecessor release call.
+`CapturedRawRecord`, and the opaque non-clone resident lease embedded in every issued receipt. Public
+wrappers expose `&CaptureAuthorityIdentity` but retain that exact Arc. No receipt API can extract a
+bare concrete receipt while dropping the resident lease early.
+The RAII token releases the resident charge only when the final
+state/message/event/snapshot/record/receipt reference drops. Rotation creates the successor
+token while the predecessor remains charged; a rejected successor drops its token and degrades only
+itself; successful publication needs no charge transfer or predecessor release call.
 
 Health slots are fixed queue storage. Health events share the generation token instead of cloning a
 new identity allocation or owning a second health-byte reservation. Diagnostic-event refusal may
@@ -816,6 +894,15 @@ owner and preserves record reservations until each item is actually dropped or c
 Deterministic barriers and platform Loom models cover send-vs-close, send-vs-receiver-drop,
 last-sender-vs-wait, consumer-predicate-check-vs-shutdown-before-sleep, full-queue shutdown,
 deadline/reap, full-vs-close, rotation-vs-send, poison cleanup, and exactly-once reservation release.
+
+Freeze and rustdoc one lock rank for every path that can touch more than one authority object:
+lifecycle transition, record queue, health queue, accounting transition, then destination registry.
+Prefer releasing one rank before acquiring the next. No user/generic destructor, sink operation,
+health-event publication, tracing formatter, or allocation is invoked while any queue/accounting/
+registry mutex is held; cleanup moves owned values into a local bounded batch, unlocks, then drops
+or publishes. Tests use reentrant `Drop`/sink/health fixtures that call back into diagnostics and
+shutdown to prove the implementation neither deadlocks nor observes a partially published state.
+
 `RawCapturePublisher` deliberately does not implement `Clone`. Its typed
 `try_clone(&self) -> Result<Self, CapturePublisherCloneError>` acquires the queue mutex, rejects
 poison/terminal close and checked `usize` overflow, then increments `sender_count`. Sender `Drop`
@@ -1331,6 +1418,10 @@ rebases with `--onto` onto that exact integration commit before its final gate.
 - Create: `crates/market-squawk-domain/tests/ui/raw_frame_missing_capture_payload.stderr`
 - Create: `crates/market-squawk-domain/tests/ui/admission_missing_resident_frame_bytes.rs`
 - Create: `crates/market-squawk-domain/tests/ui/admission_missing_resident_frame_bytes.stderr`
+- Create: `crates/market-squawk-domain/tests/ui/capture_receipt_missing_retention.rs`
+- Create: `crates/market-squawk-domain/tests/ui/capture_receipt_missing_retention.stderr`
+- Create: `crates/market-squawk-domain/tests/ui/capture_receipt_missing_dynamic_size.rs`
+- Create: `crates/market-squawk-domain/tests/ui/capture_receipt_missing_dynamic_size.stderr`
 - Modify: `crates/market-squawk-sources/src/lib.rs`
 - Modify: `crates/market-squawk-sources/src/bounded.rs`
 - Modify: `crates/market-squawk-sources/src/live.rs`
@@ -1376,6 +1467,9 @@ rebases with `--onto` onto that exact integration commit before its final gate.
 - Create: `scripts/tests/expected-red/invalid-environment-matrix.tsv`
 - Create: `scripts/tests/expected-red/invalid-mixed.log`
 - Create: `scripts/tests/expected-red/invalid-success.log`
+- Create: `scripts/tests/expected-red/invalid-sentinel-assertion.log`
+- Create: `scripts/tests/expected-red/invalid-sentinel-rust.log`
+- Create: `scripts/tests/expected-red/invalid-uncorrelated-compiler.log`
 - Create: `scripts/tests/test_capture_benchmark_host_gate.py`
 - Create: `scripts/tests/test_classify_hosted_run.py`
 - Modify: `scripts/verify.sh`
@@ -1468,18 +1562,26 @@ measurement is captured at its own clean exact commit.
 - [ ] **Step 1: RED the complete domain payload and ownership-preserving trait surface**
 
   Add checked method calls and complete `CapturePayload` constructor/limit/identity tests before the
-  types and traits expose them, then capture the compile failure. Add
-  trybuild runners/fixtures proving a frame cannot omit `capture_payload` or retained-size, an
-  admission cannot omit resident-shared frame accounting, and a bundle cannot omit retained-size.
-  Add typed overflow, underreport, invalid-graph, zero-dynamic, maximum-capacity identity, Arc value
-  layout, Arc byte-slice layout, and over-aligned pointee tests.
+  types and traits expose them, then capture the compile failure. This purpose-built compiler RED
+  deliberately runs before the trybuild runner exists: an unaccepted trybuild stderr produces
+  `wip/*.stderr` diagnostics that the mandatory classifier correctly rejects as malformed evidence.
+  Do not weaken that rejection. After the exact missing-contract RED is independently classified,
+  implement the domain surface, add the trybuild runner/fixtures proving a frame cannot omit
+  `capture_payload` or retained-size, an admission cannot omit resident-shared frame accounting,
+  a concrete receipt cannot omit either resident-generation retention or its checked additional
+  dynamic-size declaration, and a bundle cannot omit retained-size. Generate each stderr in
+  isolation, inspect it for the exact missing method, accept it, and require the complete trybuild
+  suite to pass. Add typed
+  overflow, underreport, invalid-graph, zero-dynamic, maximum-capacity identity, Arc value layout,
+  Arc byte-slice layout, and over-aligned pointee tests.
 
   ```bash
   set -euo pipefail
   RED_DIR=target/q2-a4-red/domain-payload
   rm -rf "$RED_DIR"
   mkdir -p "$RED_DIR"
-  if cargo test -p market-squawk-domain --all-targets --all-features --locked \
+  if cargo test -p market-squawk-domain --test capture_authority_contract \
+    --all-features --locked \
     >"$RED_DIR/test.log" 2>&1; then
     printf '%s\n' 'expected domain payload RED but target passed' >&2
     exit 1
@@ -1491,8 +1593,15 @@ measurement is captured at its own clean exact commit.
     'CapturePayload|capture_payload|checked_retained_bytes|checked_retained_footprint'
   ```
 
-  Expected RED: checked/ownership methods are not trait members and omission fixtures have no
-  accepted stderr. Record the exact failing test names before implementation.
+  Expected RED: checked/ownership types and methods are absent. Record the exact diagnostics before
+  implementation. After the domain surface exists, create each omission fixture, run
+  `TRYBUILD=overwrite cargo test -p market-squawk-domain --test capture_contract_compile_fail
+  --all-features --locked`, inspect every generated stderr for `error[E0046]` and its exact required
+  method name and no unrelated diagnostic, then rerun without `TRYBUILD=overwrite`. Overwrite mode
+  writes each reviewed stderr directly beside its `tests/ui/*.rs` fixture; there is no `wip/` move
+  in this flow.
+  Run `python3 scripts/check_brand.py`, documentation-contract tests, `git diff --check`, and
+  `git diff --cached --check` after this execution correction and at the completed domain barrier.
 
 - [ ] **Step 2: GREEN the complete domain payload seam without an intermediate commit**
 
@@ -1572,10 +1681,14 @@ measurement is captured at its own clean exact commit.
 - [ ] **Step 3C: GREEN every queue-independent contract and freeze the final harness**
 
   Complete the behavior-preserving `capture.rs`/`capture/admission.rs` split without changing the
-  standard channel. Create and register the final Criterion harness with all five comparable
-  endpoint families fully connected and executable at the standard-channel code head. Partition it
-  into immutable `collector`, `endpoints`, `fixture`, `producer_inventory`, `schema`, and `workload`
-  modules plus one separately hashed `backend` adapter. The benchmark abstraction
+  standard channel. Register two deliberately separate targets. `capture_admission_evidence` is the
+  authoritative fixed-quota executable and is the only target allowed to emit baseline/candidate
+  evidence. `capture_admission_criterion` is a genuine adaptive Criterion engineering target over
+  the same five closed production-operation seams, but is permanently labeled
+  `exploratory_zero_authority` and can never establish or compare an evidence baseline. Partition
+  the authoritative target into immutable `benchmark_identity`, `collector`, `endpoints`,
+  `evidence_io`, `fixture`, `producer_inventory`, `schema`, and `workload` modules plus one
+  separately hashed closed `backend` adapter. The benchmark abstraction
   freezes one producer-duplication factory: standard-channel duplication returns `Ok(clone)`;
   candidate duplication later calls production `try_clone`. It freezes identical workload,
   outcome accounting, endpoints, and collector code for both backends.
@@ -1592,40 +1705,68 @@ measurement is captured at its own clean exact commit.
 
   Freeze all five endpoint families in rustdoc and code: queue push, queue pop, capture admission,
   writer append, and flush-inclusive writer latency. The fixed-operation matrix uses payloads
-  `{0, 1_024, 4_194_304}`, depths `{1, 64, 16_384}`, producer cases `{1, 2, 4, 8}` plus the labeled
-  representative case, and `max(1_000_000, producers * 100_000)` requested operations. Compute a
-  deterministic sampling stride before execution from the checked operation quota; preallocate
-  disjoint producer-local slices totaling exactly 1,000,000 sample slots; sample across the entire
-  measured population only at declared stride ordinals; join every producer before aggregation;
-  and reject any out-of-stride write, collector overflow, lost outcome, malformed result, zero
-  duration, zero successes, zero samples, or count mismatch. The matrix terminates at its fixed
-  operation quota. It does not run the sustained time epochs.
+  `{0, 1_024, 4_194_304}`, depths `{1, 64, 16_384}` for queue/admission endpoints, depth `{64}` only
+  for writer endpoints, producer cases `{1, 2, 4, 8}` plus the labeled representative case, and
+  a checked payload-aware quota: `max(1_000_000, producers * 100_000)` successful operations for
+  the 0-byte and 1,024-byte cells, and exactly 10,000 successful operations for every 4 MiB stress
+  cell in each repetition. The five repetitions therefore retain at least 50,000 maximum-payload
+  observations per cell without pretending a consumer system can hash roughly 400 GB/s. Queue
+  permits and barriers remain outside
+  the named latency interval; the overall case timer includes producer/thread/barrier/permit wait.
+  Queue-pop has exactly one production receiver owner with producer fan-in. Preallocate disjoint
+  producer-local slices totaling the cell's exact declared operation/sample quota, join every producer before
+  aggregation, and reject collector overflow, lost outcome, malformed result, zero duration, or any
+  requested/completed/sample count mismatch. Record configured depth separately from the exact
+  production effective-capacity quote. The matrix does not run sustained time epochs.
 
   Separately freeze the representative sustained RSS fixture: 1,024-byte payload, depth 16,384,
   representative fan-in, two five-second warm epochs, ten ten-second measured burst/drain epochs,
-  and 100 ms RSS sampling. A deterministic comparable full fixture is separate from the matrix and
-  runs for both backends; it gates the consumer until a depth-one queue refuses and requires
-  `QueueFull > 0`. The candidate backend adapter additionally exposes a test/benchmark-only
+  and exactly 100 typed RSS samples in every measured epoch at the 100 ms cadence. Every sample
+  records epoch ownership, target offset, observed monotonic offset, and bytes; a missed deadline
+  outside the fixed 25 ms tolerance fails rather than backfilling observations. Sustained offered load
+  uses the real unthrottled bounded production queue and requires both accepted operations and
+  refusals; it does not use capture admission because admission poison on deliberate saturation is
+  a different contract. A deterministic comparable-full fixture is separate from the matrix and
+  runs for both backends; it gates the consumer until a depth-one queue refuses and requires exactly
+  one recorded `QueueFull`. The candidate backend adapter additionally exposes a test/benchmark-only
   forced-lock fixture requiring `QueueContended > 0`; it is labeled noncomparative and never enters
   comparative endpoint results. Neither is conflated with unsaturated acceptance, which requires
   zero refusals. One externally selected standard repetition is exactly matrix + comparable full +
   sustained RSS. One externally selected candidate repetition is that identical set plus the
   separately named noncomparative forced-lock fixture.
 
-  Every manifest records the exact `immutable_module_sha256` object with separate `collector`,
-  `endpoints`, `fixture`, `producer_inventory`, `schema`, and `workload` members; a separate
+  Every manifest records the exact `immutable_module_sha256` object with separate
+  `benchmark_identity`, `collector`, `endpoints`, `evidence_io`, `fixture`, `producer_inventory`,
+  `schema`, and `workload` members; a separate
   `entrypoint_sha256`; a separate `backend_sha256`; selected `backend`; exact expected fixture set;
   result schema; relative evidence-local executable path and digest; measured code head; hashes of
   production libraries linked into the executable; host fingerprint; toolchain fingerprint; and
-  release-profile fingerprint. Candidate startup requires `CAPTURE_BENCH_BASELINE_MANIFEST`,
+  release-profile fingerprint. It also binds the ordered five repetition digests, every controlled
+  artifact digest, the exact build command, sanitized build-environment policy and digest, Cargo
+  executable digest, the exact real pinned-toolchain Cargo/rustc binaries, the explicitly selected
+  target linker and its required SDK/linker inputs, bound Git executable/config environment, build
+  script and bounded build-helper modules, every host-gate helper, and every separately split
+  build-evidence preparer module. The preparer owns the exact Cargo invocation under a minimal
+  constructed tool PATH, rejects loader injection, discovered Cargo config, and unowned compiler/
+  profile/target override surfaces, captures bounded Cargo JSON itself, and no-clobber publishes the exact
+  artifact. `build.rs` independently requires the closed-build policy, exact feature/profile facts,
+  clean Git head, and command/environment digests. Candidate startup requires
+  `CAPTURE_BENCH_BASELINE_MANIFEST`,
   recomputes every immutable module hash, and fails before measurement unless each equals the
   persisted standard manifest. Host, toolchain, and release-profile fingerprints must also equal
   the baseline. The backend hash must differ; no whole-harness equality claim includes it.
 
-  Create `scripts/capture_benchmark_host_gate.sh` and deterministic fake-command tests. `preflight`
+  Create `scripts/capture_benchmark_host_gate.sh` plus its capability-confined Python helper and a
+  deterministic closed adversarial matrix. `measure` owns preflight, all five exact repetitions,
+  continuous bounded monitoring, and postflight while the lock remains held. It creates a private
+  mode-0500 evidence-local execution copy from the descriptor-verified runner, then binds the
+  original runner, execution copy, and build evidence by device, inode, size, and SHA-256 before,
+  throughout, and after every repetition. The no-other-agent attestation is an explicit residual
+  same-UID threat boundary; periodic pathname checks are not described as mathematically race-free.
+  `preflight`
   acquires and attests the already-created exclusive evidence lock, rejects any other active
-  repository agent, captures a complete `ps` process inventory with PID/PPID/state/comm/full argv,
-  rejects competing Cargo/rustc/full-command benchmark processes, and atomically records host ID,
+  repository agent, examines a complete `ps` process inventory with PID/PPID/state/comm/full argv
+  transiently, rejects competing Cargo/rustc/full-command benchmark processes, and atomically records host ID,
   boot/session ID, uptime/load, power mode, thermal/throttling state when available, CPU affinity,
   scheduler/nice policy, toolchain, target, release profile, Git head, and a lock-owner nonce.
   `postflight` repeats that inventory while the lock is still held and exits nonzero on host/boot,
@@ -1636,15 +1777,29 @@ measurement is captured at its own clean exact commit.
   because the measured workload itself remains in the one-minute load average. Wall elapsed versus
   monotonic elapsed may differ by at most two seconds, which detects sleep/wake without requiring an
   impossible identical raw load sample. Full argv matching—not the truncated Linux `comm` name—identifies
-  `capture_admission`. The integration owner supplies a persisted `no-other-active-agents`
+  `capture_admission`, but raw argv is never persisted because it may contain credentials. Persisted
+  process evidence contains only PID, PPID, state, bounded `comm`, a redacted command class, and a
+  digest of the transient canonical inventory in a mode-0600 file under the canonical controlled
+  evidence root. All file access requires descriptor-relative no-follow primitives, exact bounded
+  read/write loops, private ownership/mode, stable descriptor/path identity, single links, strict
+  duplicate-free JSON schemas, and no-clobber fsync publication. Release requires both the exact
+  preflight ticket and caller-supplied lock/owner/nonce identity, verifies the lock contains only its
+  owner before unlink, and preserves the lock on mismatch. Tests include secret-bearing argv
+  fixtures and prove neither stdout, stderr, nor persisted JSON contains the secret. The integration
+  owner supplies a persisted `no-other-active-agents`
   attestation only after pausing every subagent. Fake Darwin/Linux fixtures cover all success and
   invalidation branches, including a valid high postflight load caused by the benchmark plus real
-  competitor, thermal, power, sleep/wake, and lock-loss failures. Preflight creates only
-  `owner.json` inside the already-exclusive lock;
-  postflight proves the same inode/nonce, and the shell trap removes that exact file before `rmdir`.
+  competitor, thermal, power, sleep/wake, root/output/attestation/owner replacement, partial I/O,
+  replace/restore, and lock-loss failures. Preflight creates only `owner.json` inside the
+  already-exclusive lock; postflight proves the same identities and nonce, and explicit release—not
+  a force-cleanup trap—removes only the caller-bound exact owner before `rmdir`.
   After postflight, the benchmark executable's finalize-only mode consumes
   those immutable JSON files, verifies their digests and valid comparison, and only then writes the
-  top-level manifest. The manifest binds preflight, postflight, and comparison SHA-256 values;
+  top-level manifest. The finalizer requires exact root and host-directory allowlists, exact
+  configured/effective capacity, throughput, refusal and sustained/RSS invariants, lowercase SHA
+  values, a full lowercase Git object ID, and `CAPTURE_BENCH_FINALIZE_ONLY=1`; it then self-reads the
+  no-clobber manifest and requires typed equality. The manifest binds preflight, monitor,
+  postflight, and comparison SHA-256 values;
   missing or stale host evidence makes the run diagnostic-only.
 
   ```bash
@@ -1653,8 +1808,13 @@ measurement is captured at its own clean exact commit.
   cargo test --workspace --all-targets --all-features --locked
   cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
   cargo build --workspace --all-features --locked
-  cargo bench -p market-squawk-platform --bench capture_admission --locked --no-run
-  python3 -m unittest scripts.tests.test_capture_benchmark_host_gate
+  cargo bench -p market-squawk-platform \
+    --bench capture_admission_evidence \
+    --bench capture_admission_criterion \
+    --all-features --locked --no-run
+  python3 -m unittest \
+    scripts.tests.test_capture_benchmark_host_gate \
+    scripts.tests.test_capture_benchmark_prepare_build_evidence
   git diff --check
   git diff --cached --check
   ```
@@ -1674,7 +1834,10 @@ measurement is captured at its own clean exact commit.
   rg -n 'std::sync::mpsc::sync_channel|mpsc::sync_channel' \
     crates/market-squawk-platform/src/capture.rs
   ./scripts/verify.sh
-  cargo bench -p market-squawk-platform --bench capture_admission --locked --no-run
+  cargo bench -p market-squawk-platform \
+    --bench capture_admission_evidence \
+    --bench capture_admission_criterion \
+    --all-features --locked --no-run
   test "$(git rev-parse HEAD)" = "$A4_BASELINE_CODE_HEAD"
   EMPTY_OUTPUT="$(git status --short)"
   test -z "$EMPTY_OUTPUT"
@@ -1698,67 +1861,53 @@ measurement is captured at its own clean exact commit.
   COMMON_GIT_DIR="$(git rev-parse --path-format=absolute --git-common-dir)"
   REPO_ROOT="$(dirname "$COMMON_GIT_DIR")"
   EVIDENCE_ROOT="$REPO_ROOT/target/q2-a4-capture-benchmark"
-  RUN_DIR="$EVIDENCE_ROOT/standard"
+  RUN_DIR="$EVIDENCE_ROOT/standard-$A4_BASELINE_CODE_HEAD"
   HOST_EVIDENCE_DIR="$RUN_DIR/host-gate"
+  umask 077
   mkdir -p "$EVIDENCE_ROOT"
-  mkdir "$EVIDENCE_ROOT/.exclusive-lock"
-  trap 'rm -f "$EVIDENCE_ROOT/.exclusive-lock/owner.json"; rmdir "$EVIDENCE_ROOT/.exclusive-lock"' EXIT
-  rm -rf "$RUN_DIR"
-  mkdir -p "$RUN_DIR"
+  chmod 700 "$EVIDENCE_ROOT"
+  mkdir "$RUN_DIR"
+  chmod 700 "$RUN_DIR"
+  scripts/capture_benchmark_prepare_build_evidence.py --run-dir "$RUN_DIR"
+  test -s "$RUN_DIR/capture-bench-build.json"
+  test -x "$RUN_DIR/capture_admission_evidence-exe"
+  test -s "$RUN_DIR/build-evidence.json"
+
+  # Pause every other agent and competing build/benchmark process before this attestation.
   printf '%s\n' no-other-active-agents > "$RUN_DIR/active-agent-attestation.txt"
-  scripts/capture_benchmark_host_gate.sh preflight \
+  chmod 600 "$RUN_DIR/active-agent-attestation.txt"
+  mkdir "$EVIDENCE_ROOT/.exclusive-lock"
+  chmod 700 "$EVIDENCE_ROOT/.exclusive-lock"
+  scripts/capture_benchmark_host_gate.sh measure \
     --lock-dir "$EVIDENCE_ROOT/.exclusive-lock" \
     --active-agent-attestation "$RUN_DIR/active-agent-attestation.txt" \
-    --output-dir "$HOST_EVIDENCE_DIR"
-  cargo bench -p market-squawk-platform --bench capture_admission --locked --no-run \
-    --message-format=json > target/q2-a4-capture-bench-build.json
-  BENCH_EXE="$(sed -n 's/.*"executable":"\([^"]*capture_admission[^"]*\)".*/\1/p' \
-    target/q2-a4-capture-bench-build.json | tail -n 1)"
-  test -n "$BENCH_EXE"
-  test -x "$BENCH_EXE"
-  cp "$BENCH_EXE" "$RUN_DIR/capture_admission-exe"
-  BENCH_EXE="$RUN_DIR/capture_admission-exe"
-  test -x "$BENCH_EXE"
-  set -o pipefail
-  for REPETITION in 1 2 3 4 5; do
-    case "$(uname -s)" in
-      Darwin)
-        { /usr/bin/time -l env CAPTURE_BENCH_BACKEND=standard \
-            CAPTURE_BENCH_REPETITION="$REPETITION" \
-            CAPTURE_BENCH_EXPECTED_FIXTURES=matrix,comparable_full,sustained_rss \
-            CAPTURE_BENCH_OUTPUT="$RUN_DIR" \
-            "$BENCH_EXE" --bench; } 2>&1 | tee \
-          "$RUN_DIR/repetition-${REPETITION}.log"
-        ;;
-      Linux)
-        { /usr/bin/time -v env CAPTURE_BENCH_BACKEND=standard \
-            CAPTURE_BENCH_REPETITION="$REPETITION" \
-            CAPTURE_BENCH_EXPECTED_FIXTURES=matrix,comparable_full,sustained_rss \
-            CAPTURE_BENCH_OUTPUT="$RUN_DIR" \
-            "$BENCH_EXE" --bench; } 2>&1 | tee \
-          "$RUN_DIR/repetition-${REPETITION}.log"
-        ;;
-      *)
-        exit 1
-        ;;
-    esac
-  done
-  scripts/capture_benchmark_host_gate.sh postflight \
-    --lock-dir "$EVIDENCE_ROOT/.exclusive-lock" \
-    --active-agent-attestation "$RUN_DIR/active-agent-attestation.txt" \
-    --output-dir "$HOST_EVIDENCE_DIR"
+    --output-dir "$HOST_EVIDENCE_DIR" \
+    --runner "$RUN_DIR/capture_admission_evidence-exe" \
+    --build-evidence "$RUN_DIR/build-evidence.json"
   env CAPTURE_BENCH_BACKEND=standard \
     CAPTURE_BENCH_FINALIZE_ONLY=1 \
+    CAPTURE_BENCH_BUILD_EVIDENCE="$RUN_DIR/build-evidence.json" \
     CAPTURE_BENCH_HOST_EVIDENCE="$HOST_EVIDENCE_DIR/comparison.json" \
     CAPTURE_BENCH_OUTPUT="$RUN_DIR" \
-    "$BENCH_EXE" --bench
+    "$RUN_DIR/capture_admission_evidence-exe" --bench
   test -s "$RUN_DIR/manifest.json"
   jq -e '.backend == "standard" and
+    .evidence_mode == "diagnostic_fixed_quota" and
+    .criterion_evidence_mode == "exploratory_zero_authority" and
+    .benchmark_support_feature == "capture-benchmark" and
     .fixtures == ["matrix", "comparable_full", "sustained_rss"] and
     .repetitions == [1, 2, 3, 4, 5] and
-    .executable_path == "./capture_admission-exe" and
+    .executable_path == "./capture_admission_evidence-exe" and
     (.immutable_module_sha256 | keys | sort) ==
-      ["collector", "endpoints", "fixture", "producer_inventory", "schema", "workload"] and
+      ["benchmark_identity", "collector", "endpoints", "evidence_io", "fixture",
+       "producer_inventory", "schema", "workload"] and
+    (.repetition_sha256 | keys | sort) ==
+      ["repetition-1.json", "repetition-2.json", "repetition-3.json",
+       "repetition-4.json", "repetition-5.json"] and
+    .build_environment_policy == "sanitized-cargo-bench-v1" and
+    (.build_command_sha256 | length == 64) and
+    (.build_environment_sha256 | length == 64) and
+    (.cargo_executable_sha256 | length == 64) and
     (.entrypoint_sha256 | type == "string" and length == 64) and
     (.backend_sha256 | type == "string" and length == 64) and
     (.host_fingerprint_sha256 | type == "string" and length == 64) and
@@ -1766,14 +1915,20 @@ measurement is captured at its own clean exact commit.
     (.release_profile_sha256 | type == "string" and length == 64) and
     .host_gate.valid == true and
     (.host_gate.preflight_sha256 | length == 64) and
+    (.host_gate.monitor_sha256 | length == 64) and
     (.host_gate.postflight_sha256 | length == 64) and
     (.host_gate.comparison_sha256 | length == 64)' \
     "$RUN_DIR/manifest.json"
-  (cd "$RUN_DIR" && \
-    find . -type f ! -name SHA256SUMS -print | LC_ALL=C sort | \
-      while IFS= read -r FILE; do shasum -a 256 "$FILE"; done > SHA256SUMS)
-  test -s "$RUN_DIR/SHA256SUMS"
-  (cd "$RUN_DIR" && shasum -a 256 -c SHA256SUMS)
+  PREFLIGHT="$HOST_EVIDENCE_DIR/preflight.json"
+  scripts/capture_benchmark_host_gate.sh release \
+    --lock-dir "$EVIDENCE_ROOT/.exclusive-lock" \
+    --release-ticket "$PREFLIGHT" \
+    --expected-lock-device "$(jq -r '.lock_identity.device' "$PREFLIGHT")" \
+    --expected-lock-inode "$(jq -r '.lock_identity.inode' "$PREFLIGHT")" \
+    --expected-owner-device "$(jq -r '.owner_identity.device' "$PREFLIGHT")" \
+    --expected-owner-inode "$(jq -r '.owner_identity.inode' "$PREFLIGHT")" \
+    --expected-nonce-sha256 "$(jq -r '.lock_nonce_sha256' "$PREFLIGHT")"
+  test ! -e "$EVIDENCE_ROOT/.exclusive-lock"
   test "$(git rev-parse HEAD)" = "$A4_BASELINE_CODE_HEAD"
   EMPTY_OUTPUT="$(git status --short)"
   test -z "$EMPTY_OUTPUT"
@@ -1782,10 +1937,11 @@ measurement is captured at its own clean exact commit.
   Create `docs/reports/performance/2026-07-17-q2-a4-standard-channel-baseline.md` with the exact measured code
   SHA, clean proof, harness/fixture digests, producer-task derivation, hardware/OS/toolchain/timer,
   release profile, commands, requested/completed outcomes, every endpoint's p50/p95/p99/max,
-  deterministic stride, throughput, structural counters, all ten post-drain epoch RSS values, raw
-  artifact references under the persistent root evidence directory, every immutable-module SHA,
-  separate standard backend SHA, exact fixture/repetition manifest, and absence of any candidate
-  threshold claim.
+  exact payload-aware sample quotas and their statistical rationale, throughput,
+  configured/effective capacities, structural counters,
+  all 1,000 measured RSS samples, raw artifact references under the persistent root evidence
+  directory, every immutable-module/tool/artifact/repetition SHA, separate standard backend SHA,
+  exact fixture/repetition manifest, and absence of any candidate threshold claim.
 
 - [ ] **Step 3E: Commit report-only evidence and establish the ring barrier**
 
@@ -1795,16 +1951,17 @@ measurement is captured at its own clean exact commit.
   git diff --check
   git diff --cached --check
   test "$(git status --short)" = \
-    "?? docs/reports/performance/2026-07-17-q2-a4-standard-channel-baseline.md"
-  git add docs/reports/performance/2026-07-17-q2-a4-standard-channel-baseline.md
+    $'?? docs/reports/performance/2026-07-17-q2-a4-standard-channel-baseline.lock.json\n?? docs/reports/performance/2026-07-17-q2-a4-standard-channel-baseline.md'
+  git add \
+    docs/reports/performance/2026-07-17-q2-a4-standard-channel-baseline.lock.json \
+    docs/reports/performance/2026-07-17-q2-a4-standard-channel-baseline.md
   git diff --cached --check
   git commit -m "docs: record q2 a4 standard channel baseline"
   A4_BASELINE_EVIDENCE_HEAD="$(git rev-parse HEAD)"
   EMPTY_OUTPUT="$(git status --short)"
   test -z "$EMPTY_OUTPUT"
-  EMPTY_OUTPUT="$(git diff --name-only "$A4_BASELINE_CODE_HEAD..$A4_BASELINE_EVIDENCE_HEAD" | \
-    awk '$0 != "docs/reports/performance/2026-07-17-q2-a4-standard-channel-baseline.md" { print }')"
-  test -z "$EMPTY_OUTPUT"
+  test "$(git diff --name-only "$A4_BASELINE_CODE_HEAD..$A4_BASELINE_EVIDENCE_HEAD")" = \
+    $'docs/reports/performance/2026-07-17-q2-a4-standard-channel-baseline.lock.json\ndocs/reports/performance/2026-07-17-q2-a4-standard-channel-baseline.md'
   ```
 
   The report-inclusive evidence head is not relabeled as measured code. Only now may seed replace
@@ -1889,7 +2046,21 @@ measurement is captured at its own clean exact commit.
   payload term; MEM can set the former to zero only after its pointer proof passes. This temporary
   safe compatibility term is tested and is never used in the final candidate formula.
 
-  Create `scripts/check_capture_queue_loom.sh` with a pinned target/configuration and models for
+  Create one shared `scripts/run_exact_loom_gate.sh` used by both authority and queue wrappers. It
+  rejects ambient `LOOM_*`, `RUSTFLAGS`, encoded/build/target Rust flags, target/profile overrides,
+  `RUSTC`, and compiler wrappers by environment name before Cargo runs; derives exactly one pinned
+  host target; then owns exactly `RUSTFLAGS=--cfg loom` and `CARGO_INCREMENTAL=0`. Listing, Clippy,
+  and execution use the same package, library target, all features, release profile, lockfile, and
+  target. The runner lists the complete reserved `::loom_model` namespace, byte-compares its sorted
+  nonempty unique inventory with the wrapper's closed full-path list, and invokes each full path
+  separately with `--exact --test-threads=1`. Missing, renamed, duplicate, extra, or zero models
+  fail. Every model explicitly sets every `loom::model::Builder` environment/default-sensitive
+  field (`max_threads`, `max_branches`, `max_permutations`, `max_duration`, `preemption_bound`,
+  `checkpoint_file`, `checkpoint_interval`, `expect_explicit_explore`, `location`, and `log`). A
+  network-free fake-Cargo policy test covers exact success and every inventory/list/execution/
+  forbidden-environment failure and is wired into `scripts/verify.sh`.
+
+  Create `scripts/check_capture_queue_loom.sh` with that exact runner and separately named models for
   clone/drop/overflow/poison/last-close, explicit live-transition-guard abandonment and checked
   Drop fallback, coherent-snapshot ABA, shutdown-before-wait, and every send/close/drain race in the
   frozen contract. Add that script to `scripts/verify.sh`; failure must propagate nonzero. Run:
@@ -2022,7 +2193,12 @@ measurement is captured at its own clean exact commit.
   `--output-dir` arguments. It atomically writes the observed class plus raw run/jobs JSON to the
   controlled ignored output directory and prints exactly that class to stdout after publication.
   It validates a full lowercase 40-hex SHA, positive attempts, nonnegative interval, and an output
-  directory under the common repository root's controlled `target/q2-a4-hosted/` subtree. A job
+  directory under the common repository root's controlled `target/q2-a4-hosted/` subtree. It
+  rejects symlinks at every existing path component and canonical escape/traversal, caps total poll
+  wait, API attempts, pages per endpoint, runs/jobs/steps per page and in aggregate, response JSON
+  bytes, diagnostic text, and the exact number and size of output files. Boundary tests cover every
+  exact cap and one-over case plus traversal, an intermediate symlink, a final symlink, and an
+  output root outside the controlled subtree. A job
   counts as assigned/started only when `runner_id != 0`,
   `runner_name` is nonempty, or at least one step has a non-null `started_at`, status
   `in_progress`/`completed`, or non-null conclusion; a mere step skeleton is not execution.
@@ -2032,6 +2208,17 @@ measurement is captured at its own clean exact commit.
 
   ```bash
   set -euo pipefail
+  LEGACY_CONFIG_NAMES="$(mktemp)"
+  trap 'rm -f "$LEGACY_CONFIG_NAMES"' EXIT
+  set +e
+  rg -n 'journal_queue_capacity|MARKET_SQUAWK_JOURNAL_QUEUE_CAPACITY|--journal-queue-capacity' \
+    apps crates --glob '*.rs' >"$LEGACY_CONFIG_NAMES"
+  LEGACY_CONFIG_STATUS=$?
+  set -e
+  test "$LEGACY_CONFIG_STATUS" -eq 1
+  test ! -s "$LEGACY_CONFIG_NAMES"
+  rg -n 'capture_queue_capacity|MARKET_SQUAWK_CAPTURE_QUEUE_CAPACITY|--capture-queue-capacity' \
+    apps crates --glob '*.rs'
   test "$(rg -n 'raw_capture_channel\(' apps crates --glob '*.rs' | wc -l | tr -d ' ')" -eq 39
   test "$(rg -n 'MemoryCaptureSink::default\(\)' apps crates --glob '*.rs' | wc -l | tr -d ' ')" -eq 0
   test "$(rg -n '\b[a-zA-Z_]*publisher\.clone\(\)|\.publisher\.clone\(\)' \
@@ -2058,6 +2245,16 @@ measurement is captured at its own clean exact commit.
   public signature or unmigrated caller.
 
 - [ ] **Step 8: Run the complete seed candidate gate**
+
+  Before approval, a scoped production-source gate excludes the intentionally preserved benchmark
+  standard backend and proves that `crates/market-squawk-platform/src/capture.rs` plus
+  `src/capture/**/*.rs` contain no standard `sync_channel`/`SyncSender`/`mpsc::Receiver` and no
+  `CaptureMessage::Wake`. Pair those negative checks with positive `QueueCore`, mutex-owned
+  `QueueState`, non-atomic `sender_count: usize`, one-way `closed_hint: AtomicBool`, and fixed
+  `Vec<Option<_>>` evidence in `capture/queue.rs`. The gate distinguishes ripgrep no-match status 1
+  from search failure and never masks failures with `|| true` or command substitution. Separately,
+  the standard benchmark backend source digest must still equal the persisted baseline manifest
+  and retain its explicit standard-channel implementation.
 
   ```bash
   set -euo pipefail
@@ -2643,8 +2840,9 @@ measurement is captured at its own clean exact commit.
   queue depths:            1, 64, 16_384
   numeric producers:       1, 2, 4, 8
   representative fan-in:   checked production task inventory, currently exactly 1
-  requested operations:    max(1_000_000, producers * 100_000) per case
-  latency sample capacity: exactly 1_000_000 aggregate preallocated slots per case
+  requested operations:    max(1_000_000, producers * 100_000) for 0/1,024-byte cells;
+                           exactly 10,000 for every 4 MiB stress cell
+  latency sample capacity: exactly the checked per-cell operation quota
   endpoint families:       queue push; queue pop; capture admission; writer append;
                            flush-inclusive writer
   ```
@@ -2658,7 +2856,7 @@ measurement is captured at its own clean exact commit.
 
   Compute each producer's deterministic nonzero sampling stride from its quota before the start
   barrier. Fallibly preallocate disjoint producer-local slices whose checked total is exactly
-  1,000,000 slots, sample only declared stride ordinals across the full population, join all
+  the cell's exact checked quota, sample only declared stride ordinals across the full population, join all
   producers, and then aggregate. Out-of-stride writes, collector overflow, an unjoined producer,
   lost/double outcomes, count mismatch, zero duration, zero successes, zero samples, or malformed
   results exit nonzero. The five frozen endpoints preserve their distinct start/end boundaries and
@@ -2685,7 +2883,8 @@ measurement is captured at its own clean exact commit.
   on macOS or `/usr/bin/time -v` on Linux records supplemental whole-process peak RSS. An unavailable
   platform RSS source is a typed failure of the host-memory claim.
 
-  The candidate representative case in every evidence repetition requires at least 100,000
+  Exactly one candidate acceptance cell per repetition—capture admission, 1,024-byte payload,
+  depth 16,384, and the labeled representative fan-in—requires at least 100,000
   successful capture admissions/second, warmed capture-admission p99 strictly below 1 ms, nonzero
   successes/samples, zero refusals, zero accounting invariant failures, and record reservation zero
   in the accepted post-drain snapshot. Criterion may schedule the frozen fixed-operation cases, but

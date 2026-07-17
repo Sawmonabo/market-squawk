@@ -11,17 +11,17 @@ async fn in_flight_old_publication_cannot_return_healthy_after_rotation_lineariz
         entered: entered_sender,
         release: Arc::new(std::sync::Mutex::new(release_receiver)),
     });
-    let (publisher, mut control, writer) = raw_capture_channel(
+    let (publisher, mut control, writer) = test_capture_channel(
         NonZeroUsize::new(4).ok_or("invalid test capacity")?,
         first_bundle,
-    );
+    )?;
     let handle = spawn_capture_writer(
         writer,
-        MemoryCaptureSink::default(),
+        test_memory_capture_sink()?,
         CaptureWriterPolicy::default(),
     )?;
     control.activate_initial()?;
-    let thread_publisher = publisher.clone();
+    let thread_publisher = publisher.try_clone()?;
     let publish = std::thread::spawn(move || {
         let publishing_frame = frame(first_identity, 1).map_err(|_error| {
             CapturePublishError::Authority(CaptureAuthorityError::FrameRejected)
@@ -55,10 +55,10 @@ async fn in_flight_old_publication_cannot_return_healthy_after_rotation_lineariz
 async fn failed_rotation_degrades_the_uninstalled_next_bundle_only()
 -> Result<(), Box<dyn std::error::Error>> {
     let (bundle, _issued) = TestBundle::try_new(1)?;
-    let (publisher, mut control, writer) = raw_capture_channel(NonZeroUsize::MIN, bundle);
+    let (publisher, mut control, writer) = test_capture_channel(NonZeroUsize::MIN, bundle)?;
     let handle = spawn_capture_writer(
         writer,
-        MemoryCaptureSink::default(),
+        test_memory_capture_sink()?,
         CaptureWriterPolicy::default(),
     )?;
     control.activate_initial()?;
@@ -86,10 +86,10 @@ async fn preflight_lock_is_released_before_frame_clone_and_bounded_enqueue()
     let (bundle, _issued) = TestBundle::try_new(1)?;
     let identity = bundle.identity();
     let (publisher, mut control, writer) =
-        raw_capture_channel(NonZeroUsize::new(4).ok_or("invalid test capacity")?, bundle);
+        test_capture_channel(NonZeroUsize::new(4).ok_or("invalid test capacity")?, bundle)?;
     let handle = spawn_capture_writer(
         writer,
-        MemoryCaptureSink::default(),
+        test_memory_capture_sink()?,
         CaptureWriterPolicy::default(),
     )?;
     control.activate_initial()?;
@@ -100,7 +100,7 @@ async fn preflight_lock_is_released_before_frame_clone_and_bounded_enqueue()
         entered: entered_sender,
         release: Arc::new(std::sync::Mutex::new(release_receiver)),
     });
-    let thread_publisher = publisher.clone();
+    let thread_publisher = publisher.try_clone()?;
     let first_publish = std::thread::spawn(move || thread_publisher.try_publish(&first));
     entered_receiver.recv_timeout(Duration::from_secs(1))?;
 
@@ -126,13 +126,13 @@ async fn successor_initializes_before_old_revocation_and_failed_init_preserves_o
 -> Result<(), Box<dyn std::error::Error>> {
     let (first_bundle, _issued) = TestBundle::try_new(1)?;
     let first_identity = first_bundle.identity();
-    let (publisher, mut control, writer) = raw_capture_channel(
+    let (publisher, mut control, writer) = test_capture_channel(
         NonZeroUsize::new(4).ok_or("invalid test capacity")?,
         first_bundle,
-    );
+    )?;
     let handle = spawn_capture_writer(
         writer,
-        MemoryCaptureSink::default(),
+        test_memory_capture_sink()?,
         CaptureWriterPolicy::default(),
     )?;
     control.activate_initial()?;
@@ -176,10 +176,10 @@ async fn writer_stop_serializes_with_rotation_and_cannot_leave_successor_healthy
         release: Arc::new(std::sync::Mutex::new(release_receiver)),
         used: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
-    let (publisher, mut control, writer) = raw_capture_channel(NonZeroUsize::MIN, first_bundle);
+    let (publisher, mut control, writer) = test_capture_channel(NonZeroUsize::MIN, first_bundle)?;
     let handle = spawn_capture_writer(
         writer,
-        MemoryCaptureSink::default(),
+        test_memory_capture_sink()?,
         CaptureWriterPolicy::default(),
     )?;
     control.activate_initial()?;

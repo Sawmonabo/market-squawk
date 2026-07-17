@@ -78,12 +78,12 @@ pub struct CurrentSourceAuthorityLease {
     valid_from: Timestamp,
     valid_until: Timestamp,
     trusted_valid_from: Timestamp,
-    trusted_valid_from_monotonic: Instant,
-    valid_until_monotonic: Instant,
+    trusted_valid_from_monotonic: RegistryMonotonicInstant,
+    valid_until_monotonic: RegistryMonotonicInstant,
     lease: Arc<SessionLeaseState>,
     capture: crate::CaptureGenerationLease,
     budget: CurrentBudgetAuthority,
-    clock: Arc<dyn RegistryClock>,
+    clock: Arc<SealedRegistryClock>,
 }
 
 impl CurrentSourceAuthorityLease {
@@ -143,7 +143,10 @@ impl CurrentSourceAuthorityLease {
 
     fn shared_allocation_charge(&self) -> Result<usize, RegistryError> {
         let budget = self.budget.shared_allocation_charge()?;
-        let clock = self.clock.shared_allocation_charge();
+        let clock = self
+            .clock
+            .shared_allocation_charge()
+            .ok_or(RegistryError::RetainedSizeOverflow)?;
         let session = std::mem::size_of::<SessionLeaseState>()
             .checked_add(crate::conservative_arc_control_block_charge::<
                 SessionLeaseState,

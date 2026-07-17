@@ -1,5 +1,9 @@
 # Q2 A4 Wave 0 implementation inventory refresh
 
+> **Historical evidence only:** this refresh was produced with Rust 1.97.0 and is not valid for
+> benchmark, checkpoint, release, or approval evidence. A4 must regenerate every affected result
+> and revalidate every private-layout assumption under the binding Rust 1.97.1 baseline.
+
 Date: 2026-07-17
 Input Wave 0 head: `8d39cfcda20eb6bfef5d71230fd39794b1b5d956`
 Locally approved A3 production ancestor: `ab3f7c19000884357c38702edf6b4acc6a80c483`

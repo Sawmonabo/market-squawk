@@ -10,8 +10,9 @@ use market_squawk_domain::{
     StreamIntegrityState, Timestamp, VenueId,
 };
 use market_squawk_platform::{
-    CaptureShutdownStatus, CaptureWriterPolicy, MemoryCaptureSink, raw_capture_channel,
-    spawn_capture_writer,
+    CaptureChannelLimits, CaptureProcessInfrastructureLimits, CaptureShutdownStatus,
+    CaptureWriterPolicy, MemoryCaptureSink, initialize_capture_process_infrastructure,
+    raw_capture_channel, spawn_capture_writer,
 };
 use market_squawk_sources::{
     AuthoritativeSourceRegistry, AuthorizationHealth, BudgetHealth, ConnectionLiveness,
@@ -23,6 +24,18 @@ use market_squawk_sources::{
 };
 
 use common::{TestResult, direct_metadata, exact_evidence, now_timestamp, source_identifier};
+
+const TEST_MEMORY_SINK_MAX_RECORDS: usize = 4_096;
+const TEST_MEMORY_SINK_RETAINED_CEILING_BYTES: usize = 64 * 1024 * 1024;
+
+fn test_memory_capture_sink() -> TestResult<MemoryCaptureSink> {
+    Ok(MemoryCaptureSink::try_new(
+        std::num::NonZeroUsize::new(TEST_MEMORY_SINK_MAX_RECORDS)
+            .ok_or("invalid test sink record limit")?,
+        std::num::NonZeroUsize::new(TEST_MEMORY_SINK_RETAINED_CEILING_BYTES)
+            .ok_or("invalid test sink retained-byte ceiling")?,
+    )?)
+}
 
 fn rule(name: &str) -> TestResult<IntegrityRule> {
     Ok(IntegrityRule::new(
@@ -48,10 +61,21 @@ async fn platform_returns_exact_registry_receipt_and_later_degradation_revokes_c
     let bundle = registry.take_capture_generation_capabilities(&session)?;
     let mut frames = registry.take_raw_frame_factory(&session)?;
     let mut health_reporter = registry.take_current_health_reporter(&session)?;
-    let (publisher, mut control, writer) = raw_capture_channel(std::num::NonZeroUsize::MIN, bundle);
+    let process =
+        initialize_capture_process_infrastructure(CaptureProcessInfrastructureLimits::new(
+            std::num::NonZeroUsize::new(1024 * 1024).unwrap_or(std::num::NonZeroUsize::MIN),
+        ))?;
+    let (publisher, mut control, writer) = raw_capture_channel(
+        &process,
+        CaptureChannelLimits::new(
+            std::num::NonZeroUsize::MIN,
+            std::num::NonZeroUsize::new(64 * 1024 * 1024).unwrap_or(std::num::NonZeroUsize::MIN),
+        ),
+        bundle,
+    )?;
     let writer_handle = spawn_capture_writer(
         writer,
-        MemoryCaptureSink::default(),
+        test_memory_capture_sink()?,
         CaptureWriterPolicy::default(),
     )?;
     control.activate_initial()?;
@@ -96,7 +120,6 @@ async fn platform_returns_exact_registry_receipt_and_later_degradation_revokes_c
     let current = registry.validate_current_authority(&session)?;
 
     let frame = frames.try_frame(
-        frame_at,
         TransportFrameKind::Binary,
         Bytes::from_static(b"exact-frame"),
     )?;
@@ -131,14 +154,23 @@ async fn platform_returns_exact_registry_receipt_and_later_degradation_revokes_c
         },
     )?;
     let batch = DecodedProviderBatch::try_new(evidence, vec![observation])?;
+    #[cfg(debug_assertions)]
+    let receipt = writer_handle.with_receiver_paused_for_test(Duration::from_secs(1), || {
+        publisher.try_publish(&frame)
+    })??;
+    #[cfg(not(debug_assertions))]
     let receipt = publisher.try_publish(&frame)?;
-    let current_batches = current.validate_decoded_batch_owned(batch, receipt)?;
+    let current_batches = current
+        .validate_decoded_batch_owned(batch, receipt)
+        .map_err(|error| format!("validated batch lost current authority: {error}"))?;
     assert_eq!(current_batches.len(), 1);
     let current_batch = current_batches
         .into_iter()
         .next()
         .ok_or("validated frame produced no routed batch")?;
-    current_batch.validate_at(frame_at)?;
+    current_batch
+        .validate_at(frame_at)
+        .map_err(|error| format!("fresh routed batch was not qualified: {error}"))?;
 
     drop(control);
     assert!(matches!(

@@ -5,7 +5,7 @@ pub struct AuthoritativeSourceRegistry {
     entries: BTreeMap<SourceId, RegistryEntry>,
     budgets: ProviderBudgetPool,
     history: BTreeMap<SourceId, SourceAuthorityHistory>,
-    clock: Arc<dyn RegistryClock>,
+    clock: Arc<SealedRegistryClock>,
     authorization_subject_resolver: Arc<dyn crate::AuthorizationSubjectResolver>,
     composition: AuthorityComposition,
 }
@@ -51,6 +51,7 @@ impl AuthoritativeSourceRegistry {
         ) {
             return Err(RegistryError::UncleanAuthorityPredecessor);
         }
+        let _trusted_operation_time = self.clock.observe()?;
         if !metadata.is_effective_at(at) {
             return Err(RegistryError::MetadataNotEffective);
         }
@@ -150,6 +151,7 @@ impl AuthoritativeSourceRegistry {
         at: Timestamp,
     ) -> Result<RegisteredSource, RegistryError> {
         self.validate_registered_structure(registered)?;
+        let _trusted_operation_time = self.clock.observe()?;
         if metadata.source_id() != &registered.source_id {
             return Err(RegistryError::HandleTransplanted);
         }
@@ -338,8 +340,13 @@ impl AuthoritativeSourceRegistry {
             valid_until_nanos: AtomicI64::new(i64::MIN),
             last_health_observed_nanos: AtomicI64::new(i64::MIN),
             frame_ordinal: AtomicU64::new(0),
+            continuity: self.clock.continuity().clone(),
+            started_at,
         });
-        let capture = crate::CaptureGenerationLease::new_generation();
+        let capture = crate::CaptureGenerationLease::new_generation(
+            self.clock.continuity().clone(),
+            started_at,
+        );
         entry.active = Some(ActiveSessionKey {
             session_id: session_id.clone(),
             generation,
@@ -366,7 +373,7 @@ impl AuthoritativeSourceRegistry {
             budget: registered.budget.clone(),
             lease,
             capture,
-            started_at: started_at.wall(),
+            started_at,
         })
     }
 
@@ -460,6 +467,7 @@ impl AuthoritativeSourceRegistry {
         Ok(RawFrameFactory {
             binding: session.binding.clone(),
             lease: Arc::clone(&session.lease),
+            clock: Arc::clone(&self.clock),
             not_sync: PhantomData,
         })
     }

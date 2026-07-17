@@ -21,6 +21,7 @@ cap-std = "4.0.2"
 bitcoin = { version = "=0.32.102", default-features = false, features = ["std"] }
 chrono = { version = "0.4", features = ["clock", "serde"] }
 clap = { version = "4.5", features = ["derive", "env"] }
+criterion = "=0.8.2"
 crc32fast = "1.4"
 fs2 = "0.4"
 futures-util = "0.3"
@@ -29,11 +30,13 @@ market-squawk-domain = { path = "crates/market-squawk-domain", version = "=0.1.0
 market-squawk-live = { path = "crates/market-squawk-live", version = "=0.1.0" }
 market-squawk-platform = { path = "crates/market-squawk-platform", version = "=0.1.0" }
 market-squawk-sources = { path = "crates/market-squawk-sources", version = "=0.1.0" }
+memory-stats = "=1.2.0"
 num-bigint = "0.4"
 parking_lot = "0.12"
 proptest = "1.7"
 loom = "=0.7.2"
 rust_decimal = { version = "1.36", features = ["serde-with-str"] }
+rustix = { version = "=1.1.4", features = ["fs", "process"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"

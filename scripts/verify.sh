@@ -2,15 +2,18 @@
 set -euo pipefail
 
 python3 scripts/check_brand.py
+./scripts/tests/test_assert_expected_red.sh
 python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 python3 scripts/check_workspace_boundaries.py
 python3 scripts/check_duplicate_dependencies.py
 python3 scripts/check_generated_artifacts.py
+python3 scripts/check_capture_frame_contracts.py
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-targets --all-features --locked
 cargo test --doc --workspace --all-features --locked
 ./scripts/check_authority_lifecycle_loom.sh
+./scripts/check_capture_queue_loom.sh
 cargo build --workspace --all-features --release --locked
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
 cargo build -p market-squawk --all-features --locked

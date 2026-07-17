@@ -8,7 +8,10 @@ use market_squawk_domain::{
 };
 use thiserror::Error;
 
-use super::{CaptureHealthReason, CaptureState, GenerationCaptureState, WRITER_RUNNING};
+use super::{
+    CaptureHealthReason, CaptureHealthSnapshot, CaptureIdentitySnapshot, CaptureState,
+    GenerationPreparationError, WRITER_RUNNING, try_prepare_generation,
+};
 
 /// Whole-bundle generation transition failure.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -17,9 +20,9 @@ pub enum CaptureGenerationError {
     #[error("capture generation rotation changed the registered source/session binding")]
     BindingMismatch {
         /// Active exact audit identity.
-        current: Arc<CaptureAuthorityIdentity>,
+        current: CaptureHealthSnapshot,
         /// Received exact audit identity.
-        received: Arc<CaptureAuthorityIdentity>,
+        received: CaptureHealthSnapshot,
     },
     /// Recovery requires a strictly newer registry-issued generation.
     #[error("capture generation must strictly advance")]
@@ -30,6 +33,20 @@ pub enum CaptureGenerationError {
     /// Concrete registry initialization failed closed.
     #[error("capture generation initialization failed: {0}")]
     Authority(#[from] CaptureAuthorityError),
+    /// Successor retained-size preparation failed before predecessor revocation.
+    #[error("capture generation preparation failed: {0}")]
+    Preparation(market_squawk_domain::CaptureRetainedSizeError),
+    /// The unified per-channel capture-memory ceiling rejected the complete successor.
+    #[error("capture memory requires {required} bytes but ceiling is {ceiling} bytes")]
+    CaptureMemoryBudgetExceeded {
+        /// Total bytes required with the successor resident.
+        required: usize,
+        /// Configured channel ceiling.
+        ceiling: usize,
+    },
+    /// Unified accounting entered a terminal fail-closed state.
+    #[error("capture accounting invariant failed")]
+    AccountingInvariant,
 }
 
 /// Non-clone owner of positive capture-allocation lifecycle transitions.
@@ -81,49 +98,64 @@ impl<B: CaptureAuthorityBundle> RawCaptureControl<B> {
     /// Release-invalidated and RCU-replaced. A rejected successor is degraded without disturbing
     /// a still-current healthy predecessor.
     pub fn rotate_generation(&mut self, bundle: B) -> Result<(), CaptureGenerationError> {
-        let identity = bundle.identity();
-        let (mut initializer, admission, degradation) = bundle.into_parts();
+        let (mut initializer, prepared) = try_prepare_generation(bundle, &self.state.accounting)
+            .map_err(|error| match error {
+                GenerationPreparationError::Retained(error) => {
+                    CaptureGenerationError::Preparation(error)
+                }
+                GenerationPreparationError::Accounting(
+                    super::accounting::CaptureAccountingError::BudgetExceeded { required, ceiling },
+                ) => CaptureGenerationError::CaptureMemoryBudgetExceeded { required, ceiling },
+                GenerationPreparationError::Accounting(
+                    super::accounting::CaptureAccountingError::ArithmeticOverflow
+                    | super::accounting::CaptureAccountingError::TransitionOverflow
+                    | super::accounting::CaptureAccountingError::EpochOverflow
+                    | super::accounting::CaptureAccountingError::InvariantViolated,
+                ) => CaptureGenerationError::AccountingInvariant,
+            })?;
         let _transition = match self.state.lifecycle_transition.lock() {
             Ok(transition) => transition,
             Err(poisoned) => poisoned.into_inner(),
         };
         let active = self.state.active.load_full();
-        if !same_session(active.identity.as_ref(), &identity) {
-            degradation.mark_incomplete();
+        if !same_session(&active.identity.identity, &prepared.identity.identity) {
+            prepared.degradation.mark_incomplete();
             return Err(CaptureGenerationError::BindingMismatch {
-                current: Arc::clone(&active.identity),
-                received: Arc::new(identity),
+                current: CaptureHealthSnapshot {
+                    identity: CaptureIdentitySnapshot(Arc::clone(&active.identity)),
+                    integrity: active.integrity(),
+                },
+                received: CaptureHealthSnapshot {
+                    identity: CaptureIdentitySnapshot(Arc::clone(&prepared.identity)),
+                    integrity: prepared.integrity(),
+                },
             });
         }
-        if identity.connection_generation() <= active.identity.connection_generation() {
-            degradation.mark_incomplete();
+        if prepared.identity.identity.connection_generation()
+            <= active.identity.identity.connection_generation()
+        {
+            prepared.degradation.mark_incomplete();
             return Err(CaptureGenerationError::NotNewer);
         }
         if self.state.writer_lifecycle.load(Ordering::Acquire) != WRITER_RUNNING {
-            degradation.mark_incomplete();
+            prepared.degradation.mark_incomplete();
             self.state
                 .mark_incomplete_for_generation(&active, CaptureHealthReason::WriterUnavailable);
             return Err(CaptureGenerationError::WriterUnavailable);
         }
         if let Err(error) = initializer.mark_healthy() {
-            degradation.mark_incomplete();
+            prepared.degradation.mark_incomplete();
             return Err(error.into());
         }
         if self.state.writer_lifecycle.load(Ordering::Acquire) != WRITER_RUNNING {
-            degradation.mark_incomplete();
+            prepared.degradation.mark_incomplete();
             self.state
                 .mark_incomplete_for_generation(&active, CaptureHealthReason::WriterUnavailable);
             return Err(CaptureGenerationError::WriterUnavailable);
         }
         self.state
             .mark_incomplete_for_generation(&active, CaptureHealthReason::SupervisorStopped);
-        self.state
-            .active
-            .store(Arc::new(GenerationCaptureState::new(
-                identity,
-                admission,
-                degradation,
-            )));
+        self.state.active.store(prepared);
         if self.state.writer_lifecycle.load(Ordering::Acquire) != WRITER_RUNNING {
             let installed = self.state.active.load_full();
             self.state
@@ -135,8 +167,12 @@ impl<B: CaptureAuthorityBundle> RawCaptureControl<B> {
     }
 
     /// Returns active audit identity.
-    pub fn identity(&self) -> Arc<CaptureAuthorityIdentity> {
-        Arc::clone(&self.state.active.load_full().identity)
+    pub fn identity(&self) -> CaptureHealthSnapshot {
+        let active = self.state.active.load_full();
+        CaptureHealthSnapshot {
+            identity: CaptureIdentitySnapshot(Arc::clone(&active.identity)),
+            integrity: active.integrity(),
+        }
     }
 }
 

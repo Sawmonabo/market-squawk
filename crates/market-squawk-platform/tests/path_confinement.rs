@@ -125,7 +125,11 @@ fn journal_writer_rejects_a_final_symlink_even_when_the_target_exists()
 
     assert!(matches!(
         paths.open_journal_writer("source-a"),
-        Err(JournalError::SymlinkNotAllowed)
+        Err(
+            market_squawk_platform::JournalSinkConstructionError::Journal(
+                JournalError::SymlinkNotAllowed
+            )
+        )
     ));
     assert_eq!(std::fs::read(outside)?, b"outside");
     Ok(())

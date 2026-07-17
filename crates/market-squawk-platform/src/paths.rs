@@ -13,7 +13,7 @@ use cap_std::{
 use thiserror::Error;
 
 use crate::journal::ParentDirectorySync;
-use crate::{JournalError, JournalWriter};
+use crate::{JournalError, JournalSinkConstructionError, JournalSinkLimits, JournalWriter};
 
 const MAX_ARTIFACT_COMPONENT_BYTES: usize = 255;
 const MAX_ARTIFACT_DEPTH: usize = 32;
@@ -392,7 +392,23 @@ impl LocalPaths {
 
     /// Opens a current journal through the prepared directory capability, then locks and
     /// validates that exact file handle before append.
-    pub fn open_journal_writer(&self, source: &str) -> Result<JournalWriter, JournalError> {
+    pub fn open_journal_writer(
+        &self,
+        source: &str,
+    ) -> Result<JournalWriter, JournalSinkConstructionError> {
+        self.open_journal_writer_with_limits(source, JournalSinkLimits::standard())
+    }
+
+    /// Opens a current journal under explicit, separate fixed sink limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed fixed-storage refusal or the existing confined journal-path/lock error.
+    pub fn open_journal_writer_with_limits(
+        &self,
+        source: &str,
+        limits: JournalSinkLimits,
+    ) -> Result<JournalWriter, JournalSinkConstructionError> {
         validate_source_filename(source).map_err(|_error| JournalError::InvalidSourceFilename)?;
         let capability = self
             .journal_capability
@@ -401,7 +417,7 @@ impl LocalPaths {
         let filename = format!("{source}.msj");
         match capability.symlink_metadata(&filename) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(JournalError::SymlinkNotAllowed);
+                return Err(JournalError::SymlinkNotAllowed.into());
             }
             Ok(_metadata) => {}
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
@@ -409,7 +425,8 @@ impl LocalPaths {
                 return Err(JournalError::io(
                     "failed to inspect confined journal endpoint",
                     source,
-                ));
+                )
+                .into());
             }
         }
         let mut options = OpenOptions::new();
@@ -433,20 +450,21 @@ impl LocalPaths {
             options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
         }
         let path = self.journal_dir.join(&filename);
+        JournalWriter::validate_limits_for_path(&path, limits)?;
         let file = match capability.open_with(&filename, &options) {
             Ok(file) => file.into_std(),
             #[cfg(windows)]
             Err(source) if is_windows_writer_contention(&source) => {
-                return Err(JournalError::AlreadyLocked { path });
+                return Err(JournalError::AlreadyLocked { path }.into());
             }
             Err(source) => {
-                return Err(JournalError::io("failed to open confined journal", source));
+                return Err(JournalError::io("failed to open confined journal", source).into());
             }
         };
         #[cfg(windows)]
         validate_windows_journal_handle(&file)?;
         let parent_directory = open_parent_directory_sync(capability)?;
-        JournalWriter::from_open_file(path, file, parent_directory)
+        JournalWriter::from_open_file(path, file, parent_directory, limits)
     }
 
     /// Returns an initialization path unless doing so would shadow a sole legacy journal.

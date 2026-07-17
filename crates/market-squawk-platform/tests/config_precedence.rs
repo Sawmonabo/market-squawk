@@ -21,7 +21,9 @@ fn precedence_is_defaults_then_file_then_supplied_environment_then_cli()
 data_dir = "from-file"
 products = ["FILE-USD"]
 stale_after_ms = 4000
-journal_queue_capacity = 8
+capture_queue_capacity = 8
+capture_memory_ceiling_bytes = 67108864
+capture_destination_registry_memory_ceiling_bytes = 2097152
 paper_bot_enabled = false
 capture_flush_interval_ms = 500
 capture_shutdown_ms = 2000
@@ -32,13 +34,20 @@ source_secret = "keyring:coinbase"
     let environment = environment(&[
         ("MARKET_SQUAWK_DATA_DIR", "from-env"),
         ("MARKET_SQUAWK_PRODUCTS", "ENV-USD,ENV-EUR"),
-        ("MARKET_SQUAWK_JOURNAL_QUEUE_CAPACITY", "16"),
+        ("MARKET_SQUAWK_CAPTURE_QUEUE_CAPACITY", "16"),
+        ("MARKET_SQUAWK_CAPTURE_MEMORY_CEILING_BYTES", "68157440"),
+        (
+            "MARKET_SQUAWK_CAPTURE_DESTINATION_REGISTRY_MEMORY_CEILING_BYTES",
+            "3145728",
+        ),
         ("MARKET_SQUAWK_SOURCE_SHUTDOWN_MS", "4000"),
     ]);
     let cli = ConfigOverrides {
         data_dir: Some(PathBuf::from("from-cli")),
         products: Some(vec!["CLI-USD".to_owned()]),
-        journal_queue_capacity: Some(32),
+        capture_queue_capacity: Some(32),
+        capture_memory_ceiling_bytes: Some(69_206_016),
+        capture_destination_registry_memory_ceiling_bytes: Some(4_194_304),
         source_shutdown_ms: Some(6_000),
         ..ConfigOverrides::default()
     };
@@ -47,7 +56,14 @@ source_secret = "keyring:coinbase"
 
     assert_eq!(config.data_dir(), PathBuf::from("from-cli"));
     assert_eq!(config.products(), ["CLI-USD"]);
-    assert_eq!(config.journal_queue_capacity().get(), 32);
+    assert_eq!(config.capture_queue_capacity().get(), 32);
+    assert_eq!(config.capture_memory_ceiling_bytes().get(), 69_206_016);
+    assert_eq!(
+        config
+            .capture_destination_registry_memory_ceiling_bytes()
+            .get(),
+        4_194_304
+    );
     assert_eq!(config.stale_after().as_millis(), 4_000);
     assert_eq!(config.source_shutdown().as_millis(), 6_000);
     assert_eq!(
@@ -66,6 +82,17 @@ fn source_shutdown_has_an_independent_safe_default() -> Result<(), Box<dyn std::
     ))?;
 
     assert_eq!(config.source_shutdown().as_millis(), 5_000);
+    assert_eq!(config.capture_queue_capacity().get(), 16_384);
+    assert_eq!(
+        config.capture_memory_ceiling_bytes().get(),
+        64 * 1024 * 1024
+    );
+    assert_eq!(
+        config
+            .capture_destination_registry_memory_ceiling_bytes()
+            .get(),
+        1024 * 1024
+    );
     Ok(())
 }
 
@@ -119,7 +146,7 @@ fn debug_output_redacts_secret_references() -> Result<(), Box<dyn std::error::Er
 
 #[test]
 fn supplied_environment_is_validated_without_reading_process_environment() {
-    let environment = environment(&[("MARKET_SQUAWK_JOURNAL_QUEUE_CAPACITY", "0")]);
+    let environment = environment(&[("MARKET_SQUAWK_CAPTURE_QUEUE_CAPACITY", "0")]);
     assert!(
         AppConfig::load(ConfigSources::new(
             None,
@@ -128,6 +155,51 @@ fn supplied_environment_is_validated_without_reading_process_environment() {
         ))
         .is_err()
     );
+}
+
+#[test]
+fn legacy_journal_queue_file_and_environment_names_are_rejected()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let path = directory.path().join("legacy.toml");
+    std::fs::write(&path, "journal_queue_capacity = 8\n")?;
+    assert!(
+        AppConfig::load(ConfigSources::new(
+            Some(&path),
+            &BTreeMap::new(),
+            ConfigOverrides::default(),
+        ))
+        .is_err()
+    );
+
+    let legacy_environment = environment(&[("MARKET_SQUAWK_JOURNAL_QUEUE_CAPACITY", "8")]);
+    assert!(
+        AppConfig::load(ConfigSources::new(
+            None,
+            &legacy_environment,
+            ConfigOverrides::default(),
+        ))
+        .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn capture_memory_ceilings_reject_zero() {
+    for key in [
+        "MARKET_SQUAWK_CAPTURE_MEMORY_CEILING_BYTES",
+        "MARKET_SQUAWK_CAPTURE_DESTINATION_REGISTRY_MEMORY_CEILING_BYTES",
+    ] {
+        let environment = environment(&[(key, "0")]);
+        assert!(
+            AppConfig::load(ConfigSources::new(
+                None,
+                &environment,
+                ConfigOverrides::default(),
+            ))
+            .is_err()
+        );
+    }
 }
 
 #[test]

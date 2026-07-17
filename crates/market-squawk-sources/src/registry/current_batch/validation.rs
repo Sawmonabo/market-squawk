@@ -159,6 +159,21 @@ pub enum RegistryError {
     /// The sealed registry clock moved backward relative to a prior observation.
     #[error("trusted registry clock regressed")]
     TrustedClockRegression,
+    /// The registry-wide paired-time continuity latch is permanently terminal.
+    #[error("registry authority-time continuity is permanently invalid")]
+    AuthorityTimeDiscontinuous,
+    /// A frame or downstream proof did not retain this registry's exact continuity allocation.
+    #[error("trusted receipt continuity does not match current registry authority")]
+    TrustedReceiptContinuityMismatch,
+    /// A trusted receipt was before session start or beyond the sealed paired high-water.
+    #[error("trusted receipt lies outside the sealed registry time window")]
+    TrustedReceiptOutOfRange,
+    /// A bounded coherent high-water snapshot could not be obtained.
+    #[error("trusted receipt high-water snapshot is temporarily unavailable")]
+    TrustedReceiptHighWaterUnavailable,
+    /// A sealed registry clock was incorrectly attached to more than one durability session.
+    #[error("registry authority-time durability is already bound")]
+    AuthorityTimeDurabilityAlreadyBound,
     /// A wall deadline could not be converted into the sealed monotonic clock domain.
     #[error("source health monotonic deadline overflowed")]
     HealthDeadlineOverflow,

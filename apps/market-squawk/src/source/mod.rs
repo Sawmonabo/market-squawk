@@ -16,7 +16,7 @@ use uuid::Uuid;
 use crate::domain::MarketEvent;
 
 /// Exact source binding and nonblocking raw-capture publisher supplied by application composition.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct CaptureContext {
     publisher: RawCapturePublisher<DiagnosticCaptureBundle>,
     identity: CaptureAuthorityIdentity,

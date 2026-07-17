@@ -27,6 +27,16 @@ No release, benchmark, checkpoint, or approval evidence may be produced with 1.9
 toolchain change requires current primary-source research, a recorded decision, exact CI/toolchain
 pins, inherited workspace MSRV enforcement, and a fresh locked all-feature verification run.
 
+Q2 performance approval uses a bounded measurement trust model, not a hostile same-UID or
+byte-reproducible build-supply-chain claim. Pre-change standard-channel results and the current
+preparer/host bundle are diagnostic until regenerated at one clean exact Q2 candidate. Final
+standard-versus-ring measurements must use direct Rust 1.97.1, locked dependencies, exact
+source/fixture/executable hashes, bounded whole-process supervision, a separate RSS observer,
+documented hardware/OS/host state, identical paired conditions, and no false hosted-CI claim. The
+unchanged clean-head full gate and grouped independent quarter review confer approval authority;
+self-signed baseline literals do not. Same-UID compiler/build-script hostility and independent
+reproducible-build attestation are outside this measurement trust model and must not be implied.
+
 Identity/account rotation to evade limits, browser or TLS fingerprint spoofing, CAPTCHA or
 anti-bot bypass, proxy rotation intended to defeat blocking, distributed quota evasion, stealth
 scraping, and access-control circumvention are permanently prohibited. Provider constraints are

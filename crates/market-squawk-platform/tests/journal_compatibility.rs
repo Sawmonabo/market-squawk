@@ -1,10 +1,12 @@
 use std::io::{Cursor, Read};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use market_squawk_platform::{
-    JournalError, JournalReader, JournalReplayAuthority, LocalPaths, RawCaptureRecord,
+    JournalError, JournalReader, JournalReplayAuthority, JournalSinkConstructionError,
+    JournalSinkLimits, JournalWriter, LocalPaths, RawCaptureRecord,
 };
 use tempfile::tempdir;
 use uuid::Uuid;
@@ -148,13 +150,17 @@ fn writer_is_current_only_validates_existing_content_and_locks_exclusively()
 
     assert!(matches!(
         paths.open_journal_writer("capture"),
-        Err(JournalError::LegacyFormatReadOnly)
+        Err(JournalSinkConstructionError::Journal(
+            JournalError::LegacyFormatReadOnly
+        ))
     ));
     std::fs::remove_file(&current)?;
     let _first = paths.open_journal_writer("capture")?;
     assert!(matches!(
         paths.open_journal_writer("capture"),
-        Err(JournalError::AlreadyLocked { .. })
+        Err(JournalSinkConstructionError::Journal(
+            JournalError::AlreadyLocked { .. }
+        ))
     ));
     Ok(())
 }
@@ -173,5 +179,114 @@ fn active_writer_does_not_block_readers_of_committed_records()
 
     let records = JournalReader::open(current)?.read_all()?;
     assert_eq!(records, vec![expected]);
+    Ok(())
+}
+
+#[test]
+fn journal_sink_fixed_ledger_accepts_exact_and_refuses_one_under_before_creation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let paths = LocalPaths::prepare(directory.path().join("data"))?;
+    let path = paths.journal_write_file("bounded")?;
+    let buffer_capacity = NonZeroUsize::new(4_096).ok_or("invalid journal test buffer")?;
+    let generous_limits = JournalSinkLimits::new(
+        buffer_capacity,
+        NonZeroUsize::new(1024 * 1024).ok_or("invalid generous journal test ceiling")?,
+    );
+    let probe = paths.open_journal_writer_with_limits("bounded", generous_limits)?;
+    let exact_fixed = probe.fixed_retained_bytes();
+    assert_eq!(probe.buffer_capacity(), buffer_capacity.get());
+    assert_eq!(
+        exact_fixed,
+        std::mem::size_of::<JournalWriter>() + path.capacity() + probe.buffer_capacity()
+    );
+    drop(probe);
+    std::fs::remove_file(&path)?;
+
+    let exact_limits = JournalSinkLimits::new(
+        buffer_capacity,
+        NonZeroUsize::new(exact_fixed).ok_or("observed journal fixed storage must be nonzero")?,
+    );
+    let exact = paths.open_journal_writer_with_limits("bounded", exact_limits)?;
+    assert_eq!(exact.fixed_retained_bytes(), exact_fixed);
+    assert_eq!(exact.retained_byte_ceiling(), exact_fixed);
+    drop(exact);
+    std::fs::remove_file(&path)?;
+
+    let one_under = exact_fixed
+        .checked_sub(1)
+        .and_then(NonZeroUsize::new)
+        .ok_or("observed journal fixed storage must exceed one byte")?;
+    assert!(matches!(
+        paths.open_journal_writer_with_limits(
+            "bounded",
+            JournalSinkLimits::new(buffer_capacity, one_under)
+        ),
+        Err(JournalSinkConstructionError::FixedStorageBudgetExceeded {
+            required,
+            limit
+        }) if required == exact_fixed && limit == exact_fixed - 1
+    ));
+    assert!(!path.exists());
+    Ok(())
+}
+
+#[test]
+fn journal_sink_limit_arithmetic_fails_before_creating_the_endpoint()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let paths = LocalPaths::prepare(directory.path().join("data"))?;
+    let path = paths.journal_write_file("overflow")?;
+    assert!(matches!(
+        paths.open_journal_writer_with_limits(
+            "overflow",
+            JournalSinkLimits::new(NonZeroUsize::MAX, NonZeroUsize::MAX)
+        ),
+        Err(JournalSinkConstructionError::ArithmeticOverflow)
+    ));
+    assert!(!path.exists());
+    Ok(())
+}
+
+#[test]
+fn journal_append_streams_exact_length_and_crc_without_growing_the_sink_graph()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let paths = LocalPaths::prepare(directory.path().join("data"))?;
+    let path = paths.journal_write_file("streaming")?;
+    let mut writer = paths.open_journal_writer_with_limits(
+        "streaming",
+        JournalSinkLimits::new(
+            NonZeroUsize::new(257).ok_or("invalid journal test buffer")?,
+            NonZeroUsize::new(1024 * 1024).ok_or("invalid journal test ceiling")?,
+        ),
+    )?;
+    let fixed_before = writer.fixed_retained_bytes();
+    let record = RawCaptureRecord::try_new_live(
+        Uuid::from_u128(101),
+        Arc::from("streaming-fixture"),
+        Uuid::from_u128(102),
+        Some(103),
+        None,
+        "2026-07-15T20:00:01Z".parse::<DateTime<Utc>>()?,
+        Bytes::from(vec![255_u8; 32 * 1024]),
+    )?;
+    let expected_payload = serde_json::to_vec(&record)?;
+
+    writer.append(&record)?;
+    assert_eq!(writer.fixed_retained_bytes(), fixed_before);
+    assert_eq!(writer.buffer_capacity(), 257);
+    writer.flush()?;
+    drop(record);
+    assert_eq!(writer.fixed_retained_bytes(), fixed_before);
+    drop(writer);
+
+    let bytes = std::fs::read(path)?;
+    assert_eq!(&bytes[..4], b"MSJ1");
+    let length = u32::from_le_bytes(bytes[4..8].try_into()?) as usize;
+    let crc = u32::from_le_bytes(bytes[8..12].try_into()?);
+    assert_eq!(length, expected_payload.len());
+    assert_eq!(crc, crc32fast::hash(&expected_payload));
+    assert_eq!(&bytes[12..], expected_payload);
     Ok(())
 }

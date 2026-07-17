@@ -253,7 +253,7 @@ impl AuthoritativeSourceRegistry {
             .ok_or(RegistryError::SessionNotCurrent)?;
         if active.session_id != *session.session_id()
             || active.generation != session.generation()
-            || active.started_at.wall() != session.started_at
+            || active.started_at.wall() != session.started_at.wall()
             || !Arc::ptr_eq(&active.lease, &session.lease)
             || !active.lease.is_current()
         {

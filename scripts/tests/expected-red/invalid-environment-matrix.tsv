@@ -1,0 +1,11 @@
+dependency	error: failed to select a version for `serde`
+network	warning: spurious network error: connection timed out
+lockfile	error: the lock file Cargo.lock needs to be updated but --locked was passed
+manifest	error: failed to parse manifest at Cargo.toml
+toolchain	error: toolchain '1.97.0' is not installed
+target-or-component	error[E0463]: can't find crate for `std`; target may not be installed
+linker	error: linking with `cc` failed: exit status: 1
+permission	error: Permission denied (os error 13)
+storage	error: No space left on device (os error 28)
+malformed-trybuild	successfully created new stderr files for 1 test cases
+syntax	error: mismatched closing delimiter: `}`

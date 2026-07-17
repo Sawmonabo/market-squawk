@@ -1,0 +1,7 @@
+error[E0046]: not all trait items implemented, missing: `checked_retained_bytes`
+   --> tests/ui/capture_bundle_missing_retained_bytes.rs:122:1
+    |
+122 | impl CaptureAuthorityBundle for MissingRetainedBytes {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ missing `checked_retained_bytes` in implementation
+    |
+    = help: implement the missing item: `fn checked_retained_bytes(&self) -> Result<usize, CaptureRetainedSizeError> { todo!() }`

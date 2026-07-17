@@ -265,11 +265,7 @@ fn nonclean_registry_drop_revokes_retained_request_capture_and_live_capabilities
     ));
     assert_eq!(capture_lease.health(), CaptureGenerationHealth::Incomplete);
     assert!(matches!(
-        raw_frames.try_frame(
-            now_timestamp()?,
-            TransportFrameKind::Text,
-            Bytes::from_static(b"{}")
-        ),
+        raw_frames.try_frame(TransportFrameKind::Text, Bytes::from_static(b"{}")),
         Err(SourceError::SessionNotCurrent)
     ));
     Ok(())

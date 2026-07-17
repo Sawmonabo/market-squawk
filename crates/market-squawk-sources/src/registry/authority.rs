@@ -5,7 +5,7 @@ pub struct CurrentHealthReporter {
     lease: Arc<SessionLeaseState>,
     freshness: crate::FreshnessPolicy,
     budget: Option<SharedProviderBudget>,
-    clock: Arc<dyn RegistryClock>,
+    clock: Arc<SealedRegistryClock>,
     session_started_at: TrustedRegistryTime,
     not_sync: PhantomData<Cell<()>>,
 }
@@ -95,7 +95,7 @@ pub struct CurrentSourceSession {
     budget: Option<SharedProviderBudget>,
     lease: Arc<SessionLeaseState>,
     capture: crate::CaptureGenerationLease,
-    started_at: Timestamp,
+    started_at: TrustedRegistryTime,
 }
 
 impl CurrentSourceSession {
@@ -121,7 +121,7 @@ impl CurrentSourceSession {
 
     /// Returns the registry-sealed session start timestamp.
     pub const fn started_at(&self) -> Timestamp {
-        self.started_at
+        self.started_at.wall()
     }
 
     pub(crate) const fn frame_binding(&self) -> &FrameSessionBinding {
@@ -159,11 +159,14 @@ impl CurrentSourceSession {
         frame: &'a crate::RawMarketFrame,
     ) -> Result<crate::ValidatedRawMarketFrame<'a>, RegistryError> {
         self.validate_current_lease()?;
-        if self.binding.shares_allocation_with(frame.binding()) {
-            Ok(crate::ValidatedRawMarketFrame::new(frame))
-        } else {
-            Err(RegistryError::HandleTransplanted)
+        if !self.binding.shares_allocation_with(frame.binding()) {
+            return Err(RegistryError::HandleTransplanted);
         }
+        let receipt = frame
+            .trusted_receipt()
+            .ok_or(RegistryError::TrustedReceiptContinuityMismatch)?;
+        self.lease.validate_receipt(receipt)?;
+        Ok(crate::ValidatedRawMarketFrame::new(frame, receipt))
     }
 }
 
@@ -172,6 +175,7 @@ impl CurrentSourceSession {
 pub struct RawFrameFactory {
     binding: FrameSessionBinding,
     lease: Arc<SessionLeaseState>,
+    clock: Arc<SealedRegistryClock>,
     not_sync: PhantomData<Cell<()>>,
 }
 
@@ -184,14 +188,20 @@ impl RawFrameFactory {
     /// larger than [`crate::MAX_RAW_FRAME_BYTES`].
     pub fn try_frame(
         &mut self,
-        received_at: Timestamp,
         transport: crate::TransportFrameKind,
         payload: bytes::Bytes,
     ) -> Result<crate::RawMarketFrame, crate::SourceError> {
+        let receipt = self.clock.observe_receipt().map_err(|error| match error {
+            RegistryError::TrustedClockUnavailable => crate::SourceError::TrustedTimeUnavailable,
+            _ => crate::SourceError::TrustedTimeDiscontinuity,
+        })?;
+        self.lease
+            .validate_receipt(&receipt)
+            .map_err(|_error| crate::SourceError::TrustedTimeDiscontinuity)?;
         crate::RawMarketFrame::try_from_parts(
             self.binding.clone(),
             self.lease.next_frame_id()?,
-            received_at,
+            receipt,
             transport,
             payload,
         )
@@ -224,7 +234,7 @@ pub struct ValidatedCurrentSourceAuthority<'a> {
     health: &'a CurrentHealthAuthority,
     attestation: Option<&'a InstrumentUniverseAttestation>,
     validated_at: TrustedRegistryTime,
-    clock: &'a Arc<dyn RegistryClock>,
+    clock: &'a Arc<SealedRegistryClock>,
 }
 
 impl<'a> ValidatedCurrentSourceAuthority<'a> {
@@ -416,6 +426,7 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
             .binding()
             .shares_allocation_with(batch.evidence().binding())
             || receipt.received_at() != batch.evidence().received_at()
+            || receipt.trusted_receipt() != batch.evidence().trusted_receipt()
             || receipt.frame_id() != batch.evidence().frame_id()
             || receipt.payload_digest() != batch.evidence().payload_digest()
             || !receipt.lease().is_healthy()
@@ -425,6 +436,10 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
         {
             return Err(RegistryError::CaptureReceiptMismatch);
         }
+        self.validated
+            .session
+            .lease
+            .validate_receipt(receipt.trusted_receipt())?;
         let crate::SourceProtocolProfile::Live(protocol) =
             self.validated.metadata.protocol_profile()
         else {
