@@ -133,6 +133,9 @@ actually inspected and never inferred from local results.
 Detailed controlling plan:
 [`2026-07-16-q2-integrated-checkpoint-remediation.md`](2026-07-16-q2-integrated-checkpoint-remediation.md).
 
+Detailed A4 contract and parallel-lane preflight:
+[`2026-07-17-q2-a4-capture-authority-preflight.md`](2026-07-17-q2-a4-capture-authority-preflight.md).
+
 ### Task Q2.1: Remediate the rejected A3 exact candidate
 
 **Lane:** Existing `q2-authority-persistence` worktree; no additional worktree.
