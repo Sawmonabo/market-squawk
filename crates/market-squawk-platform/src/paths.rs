@@ -54,7 +54,7 @@ pub enum ArtifactPathError {
         /// Rejected path.
         path: PathBuf,
     },
-    /// Empty, non-normal, non-portable, reserved, or oversized components are rejected.
+    /// Empty, noncanonical, non-portable, reserved, or oversized components are rejected.
     #[error("artifact path contains an unsafe component: {component}")]
     UnsafeComponent {
         /// Rejected lossy component for diagnostics.
@@ -108,8 +108,11 @@ impl ArtifactRoot {
         &self.display_root
     }
 
-    /// Validates a portable relative reference and binds it to this open directory capability.
-    /// Portable references use `/` separators; `\` is rejected before platform path parsing.
+    /// Validates a canonical portable reference and binds it to this open directory capability.
+    ///
+    /// References use `/` separators and lowercase ASCII filename components. Platform path
+    /// normalization, alternate separators, device names, and filesystem-dependent characters are
+    /// rejected rather than normalized into aliases.
     pub fn resolve(
         &self,
         relative: impl AsRef<Path>,
@@ -179,57 +182,71 @@ fn validate_artifact_reference(path: &Path) -> Result<(), ArtifactPathError> {
         });
     }
     let portable_path = path.to_str().ok_or(ArtifactPathError::NonUtf8Component)?;
-    if portable_path.contains('\\') {
+    if portable_path.is_empty() {
         return Err(ArtifactPathError::UnsafeComponent {
-            component: "[NON-PORTABLE SEPARATOR]".to_owned(),
+            component: "[EMPTY]".to_owned(),
         });
     }
     let mut depth = 0_usize;
-    for component in path.components() {
+    let mut platform_components = path.components();
+    for portable_component in portable_path.split('/') {
         depth = depth.saturating_add(1);
         if depth > MAX_ARTIFACT_DEPTH {
             return Err(ArtifactPathError::UnsafeComponent {
                 component: "[PATH TOO DEEP]".to_owned(),
             });
         }
-        let Component::Normal(component) = component else {
-            return Err(ArtifactPathError::UnsafeComponent {
-                component: "[NON-NORMAL COMPONENT]".to_owned(),
-            });
-        };
-        let component = component
-            .to_str()
-            .ok_or(ArtifactPathError::NonUtf8Component)?;
-        if component.is_empty()
-            || component.len() > MAX_ARTIFACT_COMPONENT_BYTES
-            || component.chars().any(char::is_control)
-            || component.contains(['\\', ':'])
-            || component.ends_with(['.', ' '])
-            || is_windows_reserved_name(component)
-        {
+        if !is_portable_artifact_component(portable_component) {
             return Err(ArtifactPathError::UnsafeComponent {
                 component: "[UNSAFE COMPONENT]".to_owned(),
             });
         }
+        if !matches!(
+            platform_components.next(),
+            Some(Component::Normal(component)) if component.to_str() == Some(portable_component)
+        ) {
+            return Err(ArtifactPathError::UnsafeComponent {
+                component: "[PLATFORM PATH NORMALIZATION]".to_owned(),
+            });
+        }
     }
-    if depth == 0 {
+    if platform_components.next().is_some() {
         return Err(ArtifactPathError::UnsafeComponent {
-            component: "[EMPTY]".to_owned(),
+            component: "[PLATFORM PATH NORMALIZATION]".to_owned(),
         });
     }
     Ok(())
+}
+
+fn is_portable_artifact_component(component: &str) -> bool {
+    let mut characters = component.chars();
+    let Some(first) = characters.next() else {
+        return false;
+    };
+    component.len() <= MAX_ARTIFACT_COMPONENT_BYTES
+        && (first.is_ascii_lowercase() || first.is_ascii_digit())
+        && characters.all(|character| {
+            character.is_ascii_lowercase()
+                || character.is_ascii_digit()
+                || matches!(character, '-' | '_' | '.')
+        })
+        && !component.ends_with('.')
+        && !is_windows_reserved_name(component)
 }
 
 fn is_windows_reserved_name(component: &str) -> bool {
     let base = component.split('.').next().unwrap_or_default();
     let upper = base.to_ascii_uppercase();
     matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || (upper.len() == 4
-            && (upper.starts_with("COM") || upper.starts_with("LPT"))
-            && upper
-                .as_bytes()
-                .get(3)
-                .is_some_and(|digit| (b'1'..=b'9').contains(digit)))
+        || upper
+            .strip_prefix("COM")
+            .or_else(|| upper.strip_prefix("LPT"))
+            .is_some_and(|suffix| {
+                matches!(
+                    suffix,
+                    "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+                )
+            })
 }
 
 /// Current and legacy journal filename formats.

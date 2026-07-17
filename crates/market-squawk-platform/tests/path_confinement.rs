@@ -181,24 +181,90 @@ fn journal_source_names_are_single_bounded_portable_components()
 }
 
 #[test]
-fn artifact_names_reject_cross_platform_ambiguous_components()
+fn artifact_references_enforce_one_canonical_portable_grammar()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempdir()?;
     let paths = LocalPaths::prepare(directory.path().join("data"))?;
 
     for invalid in [
+        "",
+        ".",
+        "..",
+        "./report.json",
+        "reports/./result.json",
+        "reports/../result.json",
+        "reports//result.json",
+        "reports/result.json/",
         "CON",
+        "con",
+        "prn.txt",
+        "aux",
         "nul.txt",
+        "com1",
+        "com9.txt",
+        "lpt1",
+        "lpt9.log",
+        "COM¹",
+        "COM¹.txt",
+        "LPT²",
+        "LPT³.log",
         "report.",
         "report ",
+        "report final.json",
+        ".hidden",
+        "-report.json",
+        "_report.json",
+        "Report.json",
+        "résumé.json",
         "stream:name",
+        "report<1>.json",
+        "report>1.json",
+        "report\"1.json",
+        "report|1.json",
+        "report?1.json",
+        "report*1.json",
         "back\\slash",
+        "line\nbreak.json",
     ] {
         assert!(
-            paths.artifacts()?.resolve(Path::new(invalid)).is_err(),
-            "accepted non-portable artifact reference {invalid:?}"
+            matches!(
+                paths.artifacts()?.resolve(Path::new(invalid)),
+                Err(ArtifactPathError::UnsafeComponent { .. })
+            ),
+            "accepted or misclassified non-portable artifact reference {invalid:?}"
         );
     }
+
+    let valid = Path::new("reports/daily/result-2026_07_17.json");
+    assert_eq!(paths.artifacts()?.resolve(valid)?.relative(), valid);
+    Ok(())
+}
+
+#[test]
+fn artifact_reference_component_and_depth_bounds_are_exact()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let paths = LocalPaths::prepare(directory.path().join("data"))?;
+    let exact_component = "a".repeat(255);
+    let overlong_component = "a".repeat(256);
+    assert!(
+        paths
+            .artifacts()?
+            .resolve(Path::new(&exact_component))
+            .is_ok()
+    );
+    assert!(matches!(
+        paths.artifacts()?.resolve(Path::new(&overlong_component)),
+        Err(ArtifactPathError::UnsafeComponent { .. })
+    ));
+
+    let exact_depth = vec!["a"; 32].join("/");
+    let excessive_depth = vec!["a"; 33].join("/");
+    assert!(paths.artifacts()?.resolve(Path::new(&exact_depth)).is_ok());
+    assert!(matches!(
+        paths.artifacts()?.resolve(Path::new(&excessive_depth)),
+        Err(ArtifactPathError::UnsafeComponent { .. })
+    ));
     Ok(())
 }
 
