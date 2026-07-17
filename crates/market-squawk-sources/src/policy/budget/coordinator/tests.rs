@@ -175,25 +175,34 @@ mod coordinator_tests {
         drop(budget);
 
         let restored = register_fresh(policy)?;
-        assert!(matches!(restored.try_acquire(), BudgetDecision::WaitUntil(_)));
+        assert!(matches!(
+            restored.try_acquire(),
+            BudgetDecision::WaitUntil(_)
+        ));
         Ok(())
     }
 
     #[test]
-    fn dropping_every_external_handle_preserves_refusal_disabled_and_terminal_state()
-    -> TestResult {
+    fn dropping_every_external_handle_preserves_refusal_disabled_and_terminal_state() -> TestResult
+    {
         let refusal_policy = resolved_policy("drop-reset-refusal-state", 2)?;
         let refusal = register_fresh(refusal_policy.clone())?;
         let deadline = match refusal.apply_refusal(0) {
             BudgetDecision::WaitUntil(deadline) => deadline,
             other => return Err(format!("unexpected refusal decision: {other:?}").into()),
         };
+        let refusal_allocation = Arc::downgrade(&refusal.allocation);
         drop(refusal);
         let refusal_restored = register_fresh(refusal_policy)?;
-        assert!(matches!(
-            refusal_restored.try_acquire(),
-            BudgetDecision::WaitUntil(observed) if observed == deadline
-        ));
+        assert!(refusal_allocation.ptr_eq(&Arc::downgrade(&refusal_restored.allocation)));
+        let refusal_state = refusal_restored
+            .allocation
+            .state
+            .lock()
+            .map_err(|_| "refusal budget state poisoned")?;
+        assert_eq!(refusal_state.unavailable_until, Some(deadline));
+        assert_eq!(refusal_state.consecutive_refusals, 1);
+        drop(refusal_state);
 
         let disabled_policy = resolved_policy("drop-reset-disabled-state", 2)?;
         let disabled = register_fresh(disabled_policy.clone())?;
@@ -216,31 +225,24 @@ mod coordinator_tests {
             .store(u64::MAX, Ordering::Release);
         assert!(matches!(
             terminal.disable(),
-            BudgetDecision::Unavailable(
-                BudgetUnavailableReason::AvailabilityGenerationExhausted
-            )
+            BudgetDecision::Unavailable(BudgetUnavailableReason::AvailabilityGenerationExhausted)
         ));
         drop(terminal);
         let terminal_restored = register_fresh(terminal_policy)?;
         assert!(matches!(
             terminal_restored.try_acquire(),
-            BudgetDecision::Unavailable(
-                BudgetUnavailableReason::AvailabilityGenerationExhausted
-            )
+            BudgetDecision::Unavailable(BudgetUnavailableReason::AvailabilityGenerationExhausted)
         ));
         Ok(())
     }
 
     #[test]
-    fn coordinator_capacity_and_conflict_fail_without_mutating_authoritative_state()
-    -> TestResult {
+    fn coordinator_capacity_and_conflict_fail_without_mutating_authoritative_state() -> TestResult {
         let first_policy = resolved_policy("bounded-coordinator-first", 1)?;
         let second_policy = resolved_policy("bounded-coordinator-second", 1)?;
         let mut coordinator = ProcessBudgetCoordinator::new(1);
         let first = coordinator.coordinate(std::slice::from_ref(&first_policy), None)?;
-        let first_budget = first
-            .first()
-            .ok_or("first coordinated budget missing")?;
+        let first_budget = first.first().ok_or("first coordinated budget missing")?;
         let permit = match first_budget.try_acquire() {
             BudgetDecision::Ready(permit) => permit,
             other => return Err(format!("unexpected bounded acquire: {other:?}").into()),
@@ -287,8 +289,8 @@ mod coordinator_tests {
     }
 
     #[test]
-    fn canonical_authority_union_accepts_exact_bound_and_rejects_one_over_atomically()
-    -> TestResult {
+    fn canonical_authority_union_accepts_exact_bound_and_rejects_one_over_atomically() -> TestResult
+    {
         fn authority(host: &str) -> TestResult<CanonicalNetworkAuthority> {
             Ok(CanonicalNetworkAuthority {
                 host: SourceIdentifier::try_from(host)?,
@@ -331,7 +333,15 @@ mod coordinator_tests {
             .iter()
             .map(|authority| authority.host.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(hosts, ["a.example.test", "b.example.test", "c.example.test", "d.example.test"]);
+        assert_eq!(
+            hosts,
+            [
+                "a.example.test",
+                "b.example.test",
+                "c.example.test",
+                "d.example.test"
+            ]
+        );
         Ok(())
     }
 
@@ -364,20 +374,10 @@ mod coordinator_tests {
             disabled: false,
             consecutive_refusals: 0,
         };
-        let first_checkpoint = checkpoint_from_runtime(
-            first.policy(),
-            &state,
-            observation,
-            1,
-            false,
-        )?;
-        let mut invalid_checkpoint = checkpoint_from_runtime(
-            second.policy(),
-            &state,
-            observation,
-            1,
-            false,
-        )?;
+        let first_checkpoint =
+            checkpoint_from_runtime(first.policy(), &state, observation, 1, false)?;
+        let mut invalid_checkpoint =
+            checkpoint_from_runtime(second.policy(), &state, observation, 1, false)?;
         invalid_checkpoint.requests_used = second.policy().requests_per_window() + 1;
         let store: Arc<dyn AuthorityStateStore> = Arc::new(NoopAuthorityStore);
         let session = AuthorityDurabilitySession::open(store, observation.wall_clock)?;
@@ -385,10 +385,7 @@ mod coordinator_tests {
 
         assert!(matches!(
             coordinator.coordinate_restored(
-                &[
-                    (first, first_checkpoint),
-                    (second, invalid_checkpoint)
-                ],
+                &[(first, first_checkpoint), (second, invalid_checkpoint)],
                 &session
             ),
             Err(BudgetPoolError::Persistence)

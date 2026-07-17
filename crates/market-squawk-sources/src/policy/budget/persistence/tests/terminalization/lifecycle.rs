@@ -70,9 +70,9 @@ impl BlockingFailClock {
                 "timed out waiting for clock entry"
             } else {
                 "clock-entry wait woke without entry"
-                };
-                return Err(message.into());
-            }
+            };
+            return Err(message.into());
+        }
         Ok(release)
     }
 
@@ -120,20 +120,24 @@ fn observer_timeout_releases_a_clock_call_that_enters_late() -> TestResult {
     );
     let clock = Arc::new(BlockingFailClock::new(observation));
     clock.arm();
-    assert!(clock
-        .wait_until_entered_with_timeout(std::time::Duration::ZERO)
-        .is_err());
+    assert!(
+        clock
+            .wait_until_entered_with_timeout(std::time::Duration::ZERO)
+            .is_err()
+    );
 
     let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
     let late_clock = clock.clone();
-    let observer = std::thread::spawn(move || {
-        result_tx.send(late_clock.observation()).is_ok()
-    });
+    let observer = std::thread::spawn(move || result_tx.send(late_clock.observation()).is_ok());
     assert_eq!(
         result_rx.recv_timeout(TEST_WATCHDOG_TIMEOUT)?,
         Err(BudgetUnavailableReason::ClockUnavailable)
     );
-    assert!(observer.join().map_err(|_| "late clock observer panicked")?);
+    assert!(
+        observer
+            .join()
+            .map_err(|_| "late clock observer panicked")?
+    );
     Ok(())
 }
 
@@ -146,8 +150,7 @@ struct BlockingBudgetFixture {
 
 fn blocking_budget() -> TestResult<BlockingBudgetFixture> {
     let store = Arc::new(BlockingStore::default());
-    let session =
-        AuthorityDurabilitySession::open(store.clone(), Timestamp::from_unix_nanos(100))?;
+    let session = AuthorityDurabilitySession::open(store.clone(), Timestamp::from_unix_nanos(100))?;
     let declaration = declaration(1)?;
     let clock = Arc::new(SwitchableClock::new(100, 0));
     let observation = clock
@@ -205,8 +208,7 @@ fn wait_until_session_unavailable(session: &AuthorityDurabilitySession) -> TestR
 #[test]
 fn admitted_fatal_operation_prevents_clean_write_even_when_terminal_store_fails() -> TestResult {
     let store = Arc::new(MemoryStore::default());
-    let session =
-        AuthorityDurabilitySession::open(store.clone(), Timestamp::from_unix_nanos(100))?;
+    let session = AuthorityDurabilitySession::open(store.clone(), Timestamp::from_unix_nanos(100))?;
     let declaration = declaration(1)?;
     let observation = ClockObservation::new(
         Timestamp::from_unix_nanos(100),
@@ -276,8 +278,7 @@ fn admitted_fatal_operation_prevents_clean_write_even_when_terminal_store_fails(
     );
 
     store.reject_stores.store(false, Ordering::Release);
-    let restarted =
-        AuthorityDurabilitySession::open(store, Timestamp::from_unix_nanos(100))?;
+    let restarted = AuthorityDurabilitySession::open(store, Timestamp::from_unix_nanos(100))?;
     assert!(restarted.recovered_unclean());
     assert!(!restarted.is_available());
     Ok(())
@@ -310,11 +311,9 @@ fn ordinary_transaction_admission_prevents_clean_close_for_both_write_paths() ->
         store.block_next_store();
         let transaction_session = session.clone();
         let write = std::thread::spawn(move || match transaction {
-            OrdinaryTransaction::UpdateBudget => transaction_session.update_budget(
-                slot,
-                checkpoint,
-                Timestamp::from_unix_nanos(200),
-            ),
+            OrdinaryTransaction::UpdateBudget => {
+                transaction_session.update_budget(slot, checkpoint, Timestamp::from_unix_nanos(200))
+            }
             OrdinaryTransaction::PersistRegistry => transaction_session.persist_registry(
                 crate::RegistryAuthorityState::empty(),
                 Timestamp::from_unix_nanos(200),
@@ -330,7 +329,10 @@ fn ordinary_transaction_admission_prevents_clean_close_for_both_write_paths() ->
             Err(AuthorityPersistenceError::SessionUnavailable),
             "close crossed an admitted {transaction:?}"
         );
-        assert_eq!(store.store_calls.load(Ordering::Acquire), calls_while_blocked);
+        assert_eq!(
+            store.store_calls.load(Ordering::Acquire),
+            calls_while_blocked
+        );
         blocked_store.release()?;
         assert_eq!(
             write.join().map_err(|_| "ordinary write thread panicked")?,
@@ -388,8 +390,7 @@ fn terminal_writer_owns_failed_overwrite_after_blocked_normal_store() -> TestRes
         "normal write plus exactly one terminal overwrite were expected"
     );
 
-    let restarted =
-        AuthorityDurabilitySession::open(store, Timestamp::from_unix_nanos(200))?;
+    let restarted = AuthorityDurabilitySession::open(store, Timestamp::from_unix_nanos(200))?;
     assert!(restarted.recovered_unclean());
     assert!(!restarted.is_available());
     Ok(())
@@ -417,7 +418,10 @@ fn permit_retains_admission_until_explicit_release_or_drop_finishes() -> TestRes
             ),
             Err(AuthorityPersistenceError::SessionUnavailable)
         );
-        assert_eq!(store.store_calls.load(Ordering::Acquire), calls_before_close);
+        assert_eq!(
+            store.store_calls.load(Ordering::Acquire),
+            calls_before_close
+        );
         if explicit_release {
             permit.release();
         } else {
@@ -482,8 +486,7 @@ fn packed_admission_overflow_terminalizes_once_and_preserves_in_use_restart() ->
     ));
     assert_eq!(store.store_calls.load(Ordering::Acquire), calls_before + 1);
 
-    let restarted =
-        AuthorityDurabilitySession::open(store, Timestamp::from_unix_nanos(100))?;
+    let restarted = AuthorityDurabilitySession::open(store, Timestamp::from_unix_nanos(100))?;
     assert!(restarted.recovered_unclean());
     assert!(!restarted.is_available());
     Ok(())
@@ -631,8 +634,7 @@ fn poisoned_session_locks_detach_store_without_publishing_clean() -> TestResult 
         };
         assert!(detached, "poisoned {lock:?} retained the store capability");
 
-        let restarted =
-            AuthorityDurabilitySession::open(store, Timestamp::from_unix_nanos(100))?;
+        let restarted = AuthorityDurabilitySession::open(store, Timestamp::from_unix_nanos(100))?;
         assert!(restarted.recovered_unclean());
         assert!(!restarted.is_available());
     }
