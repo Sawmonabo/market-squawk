@@ -1,5 +1,9 @@
 # Contributing
 
+Read and follow [`docs/project-memory.md`](docs/project-memory.md) before planning or implementation.
+It defines the repository's binding parallel-ownership, review-checkpoint, exact-head verification,
+and progress-reporting rules.
+
 1. Use the pinned Rust 1.97.0 toolchain, including the repository's `rustfmt` and Clippy components.
 2. Add or update a failing test before implementation changes.
 3. Keep source-specific schemas inside adapters.
