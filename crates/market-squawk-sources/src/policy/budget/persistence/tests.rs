@@ -13,6 +13,7 @@ mod tests {
     static_assertions::assert_not_impl_any!(UnpublishedAuthoritySession: Clone);
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+    const TEST_WATCHDOG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
     #[path = "canonical_envelope.rs"]
     mod canonical_envelope;
@@ -89,6 +90,28 @@ mod tests {
         released: (Mutex<bool>, Condvar),
     }
 
+    #[derive(Debug)]
+    struct BlockedStoreRelease<'a> {
+        store: &'a BlockingStore,
+        released: bool,
+    }
+
+    impl BlockedStoreRelease<'_> {
+        fn release(mut self) -> TestResult {
+            self.store.signal_release()?;
+            self.released = true;
+            Ok(())
+        }
+    }
+
+    impl Drop for BlockedStoreRelease<'_> {
+        fn drop(&mut self) {
+            if !self.released {
+                let _release_result = self.store.signal_release();
+            }
+        }
+    }
+
     impl BlockingStore {
         fn block_next_store(&self) {
             self.block_next.store(true, Ordering::Release);
@@ -98,11 +121,11 @@ mod tests {
             self.rejected_call.store(call, Ordering::Release);
         }
 
-        fn wait_until_blocked(&self) -> TestResult {
+        fn wait_until_blocked(&self) -> TestResult<BlockedStoreRelease<'_>> {
             let (entered, signal) = &self.entered;
             let entered = entered.lock().map_err(|_| "entered lock poisoned")?;
             let (entered, wait) = signal
-                .wait_timeout(entered, std::time::Duration::from_secs(1))
+                .wait_timeout_while(entered, TEST_WATCHDOG_TIMEOUT, |entered| !*entered)
                 .map_err(|_| "entered wait poisoned")?;
             if !*entered {
                 let message = if wait.timed_out() {
@@ -112,10 +135,13 @@ mod tests {
                 };
                 return Err(message.into());
             }
-            Ok(())
+            Ok(BlockedStoreRelease {
+                store: self,
+                released: false,
+            })
         }
 
-        fn release_store(&self) -> TestResult {
+        fn signal_release(&self) -> TestResult {
             let (released, signal) = &self.released;
             *released.lock().map_err(|_| "release lock poisoned")? = true;
             signal.notify_all();
@@ -141,15 +167,13 @@ mod tests {
                 entered_signal.notify_all();
 
                 let (released, release_signal) = &self.released;
-                let released = released
+                let mut released = released
                     .lock()
                     .map_err(|_| AuthorityStateStoreError::Unavailable)?;
-                let (released, wait) = release_signal
-                    .wait_timeout(released, std::time::Duration::from_secs(1))
-                    .map_err(|_| AuthorityStateStoreError::Unavailable)?;
-                if !*released {
-                    let _timed_out = wait.timed_out();
-                    return Err(AuthorityStateStoreError::Unavailable);
+                while !*released {
+                    released = release_signal
+                        .wait(released)
+                        .map_err(|_| AuthorityStateStoreError::Unavailable)?;
                 }
             }
             if self.rejected_call.load(Ordering::Acquire) == call {
@@ -456,7 +480,7 @@ mod tests {
                 Timestamp::from_unix_nanos(100),
             )
         });
-        store.wait_until_blocked()?;
+        let blocked_store = store.wait_until_blocked()?;
 
         let updating = session.clone();
         let update = std::thread::spawn(move || {
@@ -466,7 +490,7 @@ mod tests {
                 Timestamp::from_unix_nanos(100),
             )
         });
-        store.release_store()?;
+        blocked_store.release()?;
 
         assert_eq!(close.join().map_err(|_| "close thread panicked")?, Ok(()));
         assert_eq!(

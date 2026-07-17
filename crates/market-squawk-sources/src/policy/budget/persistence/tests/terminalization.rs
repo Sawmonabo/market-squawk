@@ -524,16 +524,16 @@ fn clean_close_winner_rejects_stale_runtime_entry_without_terminal_io() -> TestR
             Timestamp::from_unix_nanos(100),
         )
     });
-    store.wait_until_blocked()?;
+    let blocked_store = store.wait_until_blocked()?;
     let (decision_tx, decision_rx) = std::sync::mpsc::sync_channel(1);
     let stale = std::thread::spawn(move || {
         decision_tx.send(budget.try_acquire()).is_ok()
     });
     assert!(matches!(
-        decision_rx.recv_timeout(std::time::Duration::from_secs(1))?,
+        decision_rx.recv_timeout(TEST_WATCHDOG_TIMEOUT)?,
         BudgetDecision::Unavailable(BudgetUnavailableReason::PersistenceUnavailable)
     ));
-    store.release_store()?;
+    blocked_store.release()?;
 
     assert_eq!(close.join().map_err(|_| "close thread panicked")?, Ok(()));
     assert!(stale.join().map_err(|_| "stale thread panicked")?);
@@ -614,7 +614,7 @@ fn terminal_fault_publishes_the_global_latch_before_the_terminal_store_finishes(
             &terminal_operation,
         )
     });
-    store.wait_until_blocked()?;
+    let blocked_store = store.wait_until_blocked()?;
     assert!(!session.is_available());
     assert!(!peer_lease.is_available());
 
@@ -622,10 +622,10 @@ fn terminal_fault_publishes_the_global_latch_before_the_terminal_store_finishes(
     let peer_request =
         std::thread::spawn(move || decision_tx.send(peer.try_acquire()).is_ok());
     assert!(matches!(
-        decision_rx.recv_timeout(std::time::Duration::from_secs(1))?,
+        decision_rx.recv_timeout(TEST_WATCHDOG_TIMEOUT)?,
         BudgetDecision::Unavailable(BudgetUnavailableReason::PersistenceUnavailable)
     ));
-    store.release_store()?;
+    blocked_store.release()?;
 
     assert_eq!(
         terminal.join().map_err(|_| "terminal thread panicked")?,

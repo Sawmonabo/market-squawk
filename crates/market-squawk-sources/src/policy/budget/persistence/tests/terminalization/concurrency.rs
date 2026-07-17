@@ -1,7 +1,6 @@
 //! Deterministic single-flight, transaction, permit, and phase-race coverage.
 
 use std::sync::mpsc;
-use std::time::Duration;
 
 use super::*;
 
@@ -92,7 +91,7 @@ fn already_admitted_faults_have_one_terminal_writer_for_success_and_failure() ->
                 &owner_operation,
             )
         });
-        store.wait_until_blocked()?;
+        let blocked_store = store.wait_until_blocked()?;
         assert!(!session.is_available());
 
         let (result_tx, result_rx) = mpsc::sync_channel(operations.len());
@@ -114,13 +113,13 @@ fn already_admitted_faults_have_one_terminal_writer_for_success_and_failure() ->
         drop(result_tx);
         for _ in &peers {
             assert_eq!(
-                result_rx.recv_timeout(Duration::from_secs(1))?,
+                result_rx.recv_timeout(TEST_WATCHDOG_TIMEOUT)?,
                 BudgetUnavailableReason::PersistenceUnavailable,
                 "a terminal peer waited or retried persistence"
             );
         }
         assert_eq!(store.store_calls.load(Ordering::Acquire), calls_before + 1);
-        store.release_store()?;
+        blocked_store.release()?;
         let expected_owner = if terminal_store_fails {
             BudgetUnavailableReason::PersistenceUnavailable
         } else {
@@ -166,7 +165,7 @@ fn close_winner_rejects_update_and_registry_writes_without_extra_io() -> TestRes
             Timestamp::from_unix_nanos(200),
         )
     });
-    store.wait_until_blocked()?;
+    let blocked_store = store.wait_until_blocked()?;
     let calls_with_close_blocked = store.store_calls.load(Ordering::Acquire);
     let (result_tx, result_rx) = mpsc::sync_channel(2);
     let updating = session.clone();
@@ -191,7 +190,7 @@ fn close_winner_rejects_update_and_registry_writes_without_extra_io() -> TestRes
     });
     for _ in 0..2 {
         assert_eq!(
-            result_rx.recv_timeout(Duration::from_secs(1))?,
+            result_rx.recv_timeout(TEST_WATCHDOG_TIMEOUT)?,
             Err(AuthorityPersistenceError::SessionUnavailable)
         );
     }
@@ -199,7 +198,7 @@ fn close_winner_rejects_update_and_registry_writes_without_extra_io() -> TestRes
         store.store_calls.load(Ordering::Acquire),
         calls_with_close_blocked
     );
-    store.release_store()?;
+    blocked_store.release()?;
     assert_eq!(close.join().map_err(|_| "close thread panicked")?, Ok(()));
     assert!(update.join().map_err(|_| "update thread panicked")?);
     assert!(persist.join().map_err(|_| "persist thread panicked")?);
@@ -271,7 +270,7 @@ fn explicit_and_drop_release_retain_admission_during_blocked_terminal_write() ->
             }
             release_tx.send(()).is_ok()
         });
-        store.wait_until_blocked()?;
+        let blocked_store = store.wait_until_blocked()?;
         assert!(!session.is_available());
         assert_eq!(
             session.close_clean_for_test(
@@ -282,8 +281,8 @@ fn explicit_and_drop_release_retain_admission_during_blocked_terminal_write() ->
         );
         assert!(matches!(release_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
         assert_eq!(store.store_calls.load(Ordering::Acquire), calls_before + 1);
-        store.release_store()?;
-        release_rx.recv_timeout(Duration::from_secs(1))?;
+        blocked_store.release()?;
+        release_rx.recv_timeout(TEST_WATCHDOG_TIMEOUT)?;
         assert!(releasing.join().map_err(|_| "release thread panicked")?);
         assert_eq!(store.store_calls.load(Ordering::Acquire), calls_before + 1);
     }

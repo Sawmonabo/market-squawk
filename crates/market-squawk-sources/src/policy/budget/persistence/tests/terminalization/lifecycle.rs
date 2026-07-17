@@ -12,6 +12,28 @@ struct BlockingFailClock {
     released: (Mutex<bool>, Condvar),
 }
 
+#[derive(Debug)]
+struct BlockedClockRelease<'a> {
+    clock: &'a BlockingFailClock,
+    released: bool,
+}
+
+impl BlockedClockRelease<'_> {
+    fn release(mut self) -> TestResult {
+        self.clock.signal_release()?;
+        self.released = true;
+        Ok(())
+    }
+}
+
+impl Drop for BlockedClockRelease<'_> {
+    fn drop(&mut self) {
+        if !self.released {
+            let _release_result = self.clock.signal_release();
+        }
+    }
+}
+
 impl BlockingFailClock {
     fn new(observation: ClockObservation) -> Self {
         Self {
@@ -26,11 +48,11 @@ impl BlockingFailClock {
         self.armed.store(true, Ordering::Release);
     }
 
-    fn wait_until_entered(&self) -> TestResult {
+    fn wait_until_entered(&self) -> TestResult<BlockedClockRelease<'_>> {
         let (entered, signal) = &self.entered;
         let entered = entered.lock().map_err(|_| "clock entered lock poisoned")?;
         let (entered, wait) = signal
-            .wait_timeout(entered, std::time::Duration::from_secs(1))
+            .wait_timeout_while(entered, TEST_WATCHDOG_TIMEOUT, |entered| !*entered)
             .map_err(|_| "clock entered wait poisoned")?;
         if !*entered {
             let message = if wait.timed_out() {
@@ -40,10 +62,13 @@ impl BlockingFailClock {
             };
             return Err(message.into());
         }
-        Ok(())
+        Ok(BlockedClockRelease {
+            clock: self,
+            released: false,
+        })
     }
 
-    fn release(&self) -> TestResult {
+    fn signal_release(&self) -> TestResult {
         let (released, signal) = &self.released;
         *released.lock().map_err(|_| "clock release lock poisoned")? = true;
         signal.notify_all();
@@ -63,15 +88,13 @@ impl BudgetClock for BlockingFailClock {
         entered_signal.notify_all();
 
         let (released, release_signal) = &self.released;
-        let released = released
+        let mut released = released
             .lock()
             .map_err(|_| BudgetUnavailableReason::ClockUnavailable)?;
-        let (released, wait) = release_signal
-            .wait_timeout(released, std::time::Duration::from_secs(1))
-            .map_err(|_| BudgetUnavailableReason::ClockUnavailable)?;
-        if !*released {
-            let _timed_out = wait.timed_out();
-            return Err(BudgetUnavailableReason::ClockUnavailable);
+        while !*released {
+            released = release_signal
+                .wait(released)
+                .map_err(|_| BudgetUnavailableReason::ClockUnavailable)?;
         }
         Err(BudgetUnavailableReason::ClockUnavailable)
     }
@@ -179,7 +202,7 @@ fn admitted_fatal_operation_prevents_clean_write_even_when_terminal_store_fails(
 
     clock.arm();
     let request = std::thread::spawn(move || budget.try_acquire());
-    clock.wait_until_entered()?;
+    let blocked_clock = clock.wait_until_entered()?;
     let calls_before_close = store.store_calls.load(Ordering::Acquire);
     assert_eq!(
         session.close_clean_for_test(
@@ -196,7 +219,7 @@ fn admitted_fatal_operation_prevents_clean_write_even_when_terminal_store_fails(
     );
 
     store.reject_stores.store(true, Ordering::Release);
-    clock.release()?;
+    blocked_clock.release()?;
     assert!(matches!(
         request.join().map_err(|_| "request thread panicked")?,
         BudgetDecision::Unavailable(BudgetUnavailableReason::PersistenceUnavailable)
@@ -253,7 +276,7 @@ fn ordinary_transaction_admission_prevents_clean_close_for_both_write_paths() ->
                 Timestamp::from_unix_nanos(200),
             ),
         });
-        store.wait_until_blocked()?;
+        let blocked_store = store.wait_until_blocked()?;
         let calls_while_blocked = store.store_calls.load(Ordering::Acquire);
         assert_eq!(
             session.close_clean_for_test(
@@ -264,7 +287,7 @@ fn ordinary_transaction_admission_prevents_clean_close_for_both_write_paths() ->
             "close crossed an admitted {transaction:?}"
         );
         assert_eq!(store.store_calls.load(Ordering::Acquire), calls_while_blocked);
-        store.release_store()?;
+        blocked_store.release()?;
         assert_eq!(
             write.join().map_err(|_| "ordinary write thread panicked")?,
             Ok(())
@@ -297,7 +320,7 @@ fn terminal_writer_owns_failed_overwrite_after_blocked_normal_store() -> TestRes
             Timestamp::from_unix_nanos(200),
         )
     });
-    store.wait_until_blocked()?;
+    let blocked_store = store.wait_until_blocked()?;
     store.reject_store_call(calls_before + 2);
     let terminal_operation = budget
         .admit_runtime_operation()
@@ -312,7 +335,7 @@ fn terminal_writer_owns_failed_overwrite_after_blocked_normal_store() -> TestRes
         std::thread::yield_now();
     }
     assert!(!session.is_available(), "terminal latch was not published");
-    store.release_store()?;
+    blocked_store.release()?;
     assert_eq!(
         normal.join().map_err(|_| "normal write thread panicked")?,
         Err(AuthorityPersistenceError::SessionUnavailable)
