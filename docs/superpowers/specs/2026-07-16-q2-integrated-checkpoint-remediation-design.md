@@ -206,7 +206,10 @@ writer retains one frame from each of many rotated generations.
 
 Source shutdown has a validated nonzero configuration deadline independent of capture-writer
 shutdown. The supervisor races cancellation against the entire session future, including connect,
-subscription, status sends, event sends, control writes, close, and reconnect backoff.
+subscription, status sends, event sends, control writes, reads, provider-initiated Pong/Close reply
+writes, and reconnect backoff. Client-initiated cancellation drops the WebSocket transport
+immediately; it does not await a graceful Close write that a backpressured peer could use to consume
+the shutdown budget. A provider-initiated Close may receive a cancellation-raced Close reply.
 
 At application shutdown:
 
@@ -219,7 +222,8 @@ At application shutdown:
 
 Adapter operations remain individually cancellation-aware so abort is a last-resort ownership
 backstop. Tests cover a non-cooperative source, a full event channel, stalled setup/control writes,
-and clean cooperative shutdown under paused deterministic time.
+stalled provider-initiated Pong/Close replies, immediate transport drop on client cancellation, and
+clean cooperative shutdown under paused deterministic time.
 
 ## Bounded MCP framing
 

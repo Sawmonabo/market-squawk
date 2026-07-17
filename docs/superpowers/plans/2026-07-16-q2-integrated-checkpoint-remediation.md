@@ -287,8 +287,9 @@ wording.
 
 - [ ] Add validated nonzero source-shutdown deadline configuration and precedence tests.
 - [ ] Add failing paused-time tests for a non-cooperative source, full event channel, stalled setup,
-  stalled status/control send, stalled Pong/close write, reconnect backoff, cooperative completion,
-  and source task failure.
+  stalled status/control send, stalled Pong/provider-initiated Close reply, immediate WebSocket
+  transport drop on client cancellation, reconnect backoff, cooperative completion, and source
+  task failure.
 - [ ] Race cancellation around the complete session future and each adapter blocking point.
 - [ ] Add a single application shutdown helper that signals cancellation, waits to deadline, aborts,
   awaits the join, and returns a typed outcome. Never drop/detach the handle.
