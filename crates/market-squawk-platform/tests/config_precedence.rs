@@ -25,6 +25,7 @@ journal_queue_capacity = 8
 paper_bot_enabled = false
 capture_flush_interval_ms = 500
 capture_shutdown_ms = 2000
+source_shutdown_ms = 3000
 source_secret = "keyring:coinbase"
 "#,
     )?;
@@ -32,11 +33,13 @@ source_secret = "keyring:coinbase"
         ("MARKET_SQUAWK_DATA_DIR", "from-env"),
         ("MARKET_SQUAWK_PRODUCTS", "ENV-USD,ENV-EUR"),
         ("MARKET_SQUAWK_JOURNAL_QUEUE_CAPACITY", "16"),
+        ("MARKET_SQUAWK_SOURCE_SHUTDOWN_MS", "4000"),
     ]);
     let cli = ConfigOverrides {
         data_dir: Some(PathBuf::from("from-cli")),
         products: Some(vec!["CLI-USD".to_owned()]),
         journal_queue_capacity: Some(32),
+        source_shutdown_ms: Some(6_000),
         ..ConfigOverrides::default()
     };
 
@@ -46,11 +49,54 @@ source_secret = "keyring:coinbase"
     assert_eq!(config.products(), ["CLI-USD"]);
     assert_eq!(config.journal_queue_capacity().get(), 32);
     assert_eq!(config.stale_after().as_millis(), 4_000);
+    assert_eq!(config.source_shutdown().as_millis(), 6_000);
     assert_eq!(
         config.source_secret(),
         Some(&SecretReference::try_from("keyring:coinbase")?)
     );
     Ok(())
+}
+
+#[test]
+fn source_shutdown_has_an_independent_safe_default() -> Result<(), Box<dyn std::error::Error>> {
+    let config = AppConfig::load(ConfigSources::new(
+        None,
+        &BTreeMap::new(),
+        ConfigOverrides::default(),
+    ))?;
+
+    assert_eq!(config.source_shutdown().as_millis(), 5_000);
+    Ok(())
+}
+
+#[test]
+fn source_shutdown_accepts_exact_boundaries_and_rejects_zero_or_excess() {
+    for accepted in [1, 60_000] {
+        let config = AppConfig::load(ConfigSources::new(
+            None,
+            &BTreeMap::new(),
+            ConfigOverrides {
+                source_shutdown_ms: Some(accepted),
+                ..ConfigOverrides::default()
+            },
+        ));
+        assert!(config.is_ok(), "source shutdown {accepted}ms was rejected");
+    }
+
+    for rejected in [0, 60_001] {
+        let error = AppConfig::load(ConfigSources::new(
+            None,
+            &BTreeMap::new(),
+            ConfigOverrides {
+                source_shutdown_ms: Some(rejected),
+                ..ConfigOverrides::default()
+            },
+        ));
+        assert!(matches!(
+            error,
+            Err(market_squawk_platform::ConfigError::InvalidSourceShutdownTiming)
+        ));
+    }
 }
 
 #[test]

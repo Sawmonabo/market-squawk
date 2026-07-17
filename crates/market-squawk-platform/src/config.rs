@@ -19,12 +19,14 @@ const DEFAULT_STALE_AFTER_MS: u64 = 5_000;
 const DEFAULT_QUEUE_CAPACITY: usize = 16_384;
 const DEFAULT_FLUSH_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_SHUTDOWN_MS: u64 = 5_000;
+const DEFAULT_SOURCE_SHUTDOWN_MS: u64 = 5_000;
 const MAX_PRODUCTS: usize = 128;
 const MAX_PRODUCT_BYTES: usize = 128;
 const MAX_QUEUE_CAPACITY: usize = 1_048_576;
 const MIN_STALE_AFTER_MS: u64 = 250;
 const MAX_STALE_AFTER_MS: u64 = 600_000;
 const MAX_SHUTDOWN_MS: u64 = 60_000;
+const MAX_SOURCE_SHUTDOWN_MS: u64 = 60_000;
 const MAX_SECRET_REFERENCE_BYTES: usize = 512;
 const MAX_SECRET_VALUE_BYTES: usize = 64 * 1024;
 const MAX_CONFIG_FILE_BYTES: u64 = 1024 * 1024;
@@ -140,6 +142,8 @@ pub struct ConfigOverrides {
     pub capture_flush_interval_ms: Option<u64>,
     /// Capture drain deadline in milliseconds.
     pub capture_shutdown_ms: Option<u64>,
+    /// Source-supervisor shutdown deadline in milliseconds.
+    pub source_shutdown_ms: Option<u64>,
     /// Redacted secret locator.
     pub source_secret: Option<SecretReference>,
 }
@@ -194,6 +198,7 @@ struct FileConfig {
     paper_bot_enabled: Option<bool>,
     capture_flush_interval_ms: Option<u64>,
     capture_shutdown_ms: Option<u64>,
+    source_shutdown_ms: Option<u64>,
     source_secret: Option<String>,
 }
 
@@ -207,6 +212,7 @@ pub struct AppConfig {
     paper_bot_enabled: bool,
     capture_flush_interval: Duration,
     capture_shutdown: Duration,
+    source_shutdown: Duration,
     source_secret: Option<SecretReference>,
 }
 
@@ -221,6 +227,7 @@ impl fmt::Debug for AppConfig {
             .field("paper_bot_enabled", &self.paper_bot_enabled)
             .field("capture_flush_interval", &self.capture_flush_interval)
             .field("capture_shutdown", &self.capture_shutdown)
+            .field("source_shutdown", &self.source_shutdown)
             .field(
                 "source_secret",
                 &self.source_secret.as_ref().map(|_| "[REDACTED]"),
@@ -242,6 +249,7 @@ impl Default for AppConfig {
             paper_bot_enabled: false,
             capture_flush_interval: Duration::from_millis(DEFAULT_FLUSH_INTERVAL_MS),
             capture_shutdown: Duration::from_millis(DEFAULT_SHUTDOWN_MS),
+            source_shutdown: Duration::from_millis(DEFAULT_SOURCE_SHUTDOWN_MS),
             source_secret: None,
         }
     }
@@ -306,6 +314,11 @@ impl AppConfig {
         self.capture_shutdown
     }
 
+    /// Returns the independent bounded source-supervisor shutdown deadline.
+    pub const fn source_shutdown(&self) -> Duration {
+        self.source_shutdown
+    }
+
     /// Returns the optional redacted source-secret reference.
     pub const fn source_secret(&self) -> Option<&SecretReference> {
         self.source_secret.as_ref()
@@ -322,6 +335,7 @@ impl From<AppConfig> for ConfigOverrides {
             paper_bot_enabled: Some(config.paper_bot_enabled),
             capture_flush_interval_ms: Some(duration_millis(config.capture_flush_interval)),
             capture_shutdown_ms: Some(duration_millis(config.capture_shutdown)),
+            source_shutdown_ms: Some(duration_millis(config.source_shutdown)),
             source_secret: config.source_secret,
         }
     }
@@ -358,6 +372,9 @@ impl ConfigOverrides {
         if higher.capture_shutdown_ms.is_some() {
             self.capture_shutdown_ms = higher.capture_shutdown_ms;
         }
+        if higher.source_shutdown_ms.is_some() {
+            self.source_shutdown_ms = higher.source_shutdown_ms;
+        }
         if higher.source_secret.is_some() {
             self.source_secret = higher.source_secret;
         }
@@ -372,6 +389,7 @@ impl ConfigOverrides {
             paper_bot_enabled: file.paper_bot_enabled,
             capture_flush_interval_ms: file.capture_flush_interval_ms,
             capture_shutdown_ms: file.capture_shutdown_ms,
+            source_shutdown_ms: file.source_shutdown_ms,
             source_secret: file
                 .source_secret
                 .as_deref()
@@ -416,6 +434,9 @@ impl ConfigOverrides {
                 }
                 "MARKET_SQUAWK_CAPTURE_SHUTDOWN_MS" => {
                     layer.capture_shutdown_ms = Some(parse_environment(value)?);
+                }
+                "MARKET_SQUAWK_SOURCE_SHUTDOWN_MS" => {
+                    layer.source_shutdown_ms = Some(parse_environment(value)?);
                 }
                 "MARKET_SQUAWK_SOURCE_SECRET" => {
                     layer.source_secret = Some(SecretReference::try_from(value)?);
@@ -481,6 +502,13 @@ impl TryFrom<ConfigOverrides> for AppConfig {
         if flush_ms > shutdown_ms || shutdown_ms.get() > MAX_SHUTDOWN_MS {
             return Err(ConfigError::InvalidCaptureTiming);
         }
+        let source_shutdown_ms = values
+            .source_shutdown_ms
+            .and_then(NonZeroU64::new)
+            .ok_or(ConfigError::InvalidSourceShutdownTiming)?;
+        if source_shutdown_ms.get() > MAX_SOURCE_SHUTDOWN_MS {
+            return Err(ConfigError::InvalidSourceShutdownTiming);
+        }
         Ok(Self {
             data_dir,
             products,
@@ -491,6 +519,7 @@ impl TryFrom<ConfigOverrides> for AppConfig {
                 .ok_or(ConfigError::InternalComposition)?,
             capture_flush_interval: Duration::from_millis(flush_ms.get()),
             capture_shutdown: Duration::from_millis(shutdown_ms.get()),
+            source_shutdown: Duration::from_millis(source_shutdown_ms.get()),
             source_secret: values.source_secret,
         })
     }
@@ -555,6 +584,9 @@ pub enum ConfigError {
     /// Flush/shutdown values were zero, out of order, or outside supported limits.
     #[error("capture flush and shutdown timing is invalid")]
     InvalidCaptureTiming,
+    /// Source-supervisor shutdown was zero or outside supported limits.
+    #[error("source shutdown timing is invalid")]
+    InvalidSourceShutdownTiming,
     /// A redacted secret reference was invalid.
     #[error(transparent)]
     Secret(#[from] SecretError),
