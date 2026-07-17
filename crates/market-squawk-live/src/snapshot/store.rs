@@ -128,6 +128,8 @@ impl SnapshotPlane {
                 tokio::sync::TryAcquireError::NoPermits => SnapshotReadError::ReaderLimitReached,
                 tokio::sync::TryAcquireError::Closed => SnapshotReadError::Closed,
             })?;
+        super::snapshot_reader_metadata_peak_bytes(permit_count, self.count.get())
+            .ok_or(SnapshotReadError::CapacityOverflow)?;
         let mut snapshots = Vec::new();
         snapshots
             .try_reserve_exact(self.cells.len())
@@ -183,6 +185,8 @@ pub(crate) fn create_snapshot_plane(
     if readers == 0 || readers > Semaphore::MAX_PERMITS {
         return Err(SnapshotReadError::ReaderLimitReached);
     }
+    super::snapshot_reader_metadata_peak_bytes(maximum_readers, count.get())
+        .ok_or(SnapshotReadError::CapacityOverflow)?;
     let mut cells = Vec::new();
     let mut publishers = Vec::new();
     let mut receivers = Vec::new();

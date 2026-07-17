@@ -87,20 +87,12 @@ pub(super) fn estimate_peak_bytes(
     )?;
     total = add(total, multiply(shards, control_per_shard)?)?;
 
-    let snapshot_bytes = u64::from(config.snapshot_limits().maximum_retained_bytes().get());
-    // One under construction and one currently published per actor.
-    total = add(total, multiply(multiply(shards, snapshot_bytes)?, 2)?)?;
-    // The official retained-reader budget is runtime-wide and weighted: a single-shard lease
-    // consumes one permit, while `try_load_all` consumes one permit for every retained shard.
-    // Therefore each permit can retain at most one per-shard publication and is not multiplied by
-    // shard count a second time here.
-    total = add(
-        total,
-        multiply(
-            u64::from(config.maximum_retained_snapshot_readers().get()),
-            snapshot_bytes,
-        )?,
+    let snapshot_peak = snapshot_publication_reader_peak(
+        config.snapshot_limits().maximum_retained_bytes().get(),
+        config.shard_count().get(),
+        config.maximum_retained_snapshot_readers().get(),
     )?;
+    total = add(total, snapshot_peak.additional_bytes)?;
     // Every shard may construct concurrently. Route-key scratch scales with configured routes;
     // one maximum-sized stream/status ordering workspace may coexist in each actor.
     total = add(
@@ -223,6 +215,42 @@ pub(crate) fn book_processing_peak(
         snapshot_additional_bytes,
         delta_additional_bytes,
         additional_bytes: snapshot_additional_bytes.max(delta_additional_bytes),
+    })
+}
+
+/// Closed snapshot publication/reader generation inventory for one runtime incarnation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SnapshotPublicationReaderPeak {
+    pub(super) publication_count: u64,
+    pub(super) publication_bytes: u64,
+    pub(super) reader_metadata_bytes: u64,
+    pub(super) additional_bytes: u64,
+}
+
+pub(super) fn snapshot_publication_reader_peak(
+    maximum_snapshot_bytes: u32,
+    shard_count: u16,
+    maximum_readers: u32,
+) -> Result<SnapshotPublicationReaderPeak, LiveRuntimeConfigError> {
+    let shards = u64::from(shard_count);
+    let readers = u64::from(maximum_readers);
+    // Every shard may have its predecessor guarded while its successor is current, and every
+    // official permit may retain one additional distinct old shard publication.
+    let publication_count = add(multiply(shards, 2)?, readers)?;
+    let publication_bytes = crate::snapshot::snapshot_publication_bytes(maximum_snapshot_bytes)
+        .ok_or(LiveRuntimeConfigError::CapacityOverflow)?;
+    let reader_metadata_bytes =
+        crate::snapshot::snapshot_reader_metadata_peak_bytes(maximum_readers, shard_count)
+            .ok_or(LiveRuntimeConfigError::CapacityOverflow)?;
+    let additional_bytes = add(
+        multiply(publication_count, publication_bytes)?,
+        reader_metadata_bytes,
+    )?;
+    Ok(SnapshotPublicationReaderPeak {
+        publication_count,
+        publication_bytes,
+        reader_metadata_bytes,
+        additional_bytes,
     })
 }
 

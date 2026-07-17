@@ -13,7 +13,7 @@ use super::{
     SNAPSHOT_ROUTE_SORT_SCRATCH_BYTES, SNAPSHOT_STATUS_SORT_SCRATCH_BYTES,
     SNAPSHOT_STREAM_SORT_SCRATCH_BYTES, SOURCE_ADMISSION_BYTES, add,
     all_shard_book_processing_bytes, book_processing_peak, estimate_peak_bytes, multiply,
-    persistent_stream_bytes,
+    persistent_stream_bytes, snapshot_publication_reader_peak,
 };
 use crate::runtime::{
     LiveRouteConfig, LiveRouteConfigInput, LiveRuntimeConfig, LiveRuntimeConfigError,
@@ -212,11 +212,13 @@ fn one_more_shard_charges_mailbox_candidate_control_snapshot_and_actor() -> Test
     let three_shards = estimate(three_shards, &[route])?;
 
     let processing = book_processing_peak(512, 4)?;
+    let base_snapshot = snapshot_publication_reader_peak(4_096, 2, 3)?;
+    let expanded_snapshot = snapshot_publication_reader_peak(4_096, 3, 3)?;
     let expected_delta = 1_024
         + 4 * CHANNEL_COMMAND_SLOT_BYTES
         + processing.shard_scratch_bytes
         + 2 * CONTROL_SLOT_BYTES
-        + 2 * 4_096
+        + (expanded_snapshot.additional_bytes - base_snapshot.additional_bytes)
         + 2 * (SNAPSHOT_STREAM_SORT_SCRATCH_BYTES + SNAPSHOT_STATUS_SORT_SCRATCH_BYTES)
         + ACTOR_FIXED_BYTES
         + SNAPSHOT_NOTIFICATION_BYTES;
@@ -330,7 +332,12 @@ fn snapshot_reader_and_health_terms_are_bounded_at_the_documented_scope() -> Tes
 
     let mut one_more_reader = input()?;
     one_more_reader.maximum_retained_snapshot_readers += 1;
-    assert_eq!(estimate(one_more_reader, &routes)? - base, 4_096);
+    let base_snapshot = snapshot_publication_reader_peak(4_096, 2, 2)?;
+    let expanded_snapshot = snapshot_publication_reader_peak(4_096, 2, 3)?;
+    assert_eq!(
+        estimate(one_more_reader, &routes)? - base,
+        expanded_snapshot.additional_bytes - base_snapshot.additional_bytes
+    );
 
     let mut one_more_snapshot_byte = input()?;
     one_more_snapshot_byte.snapshot_limits = SnapshotLimits::try_new(8, 2, 2, 4, 4_097)?;
@@ -343,6 +350,74 @@ fn snapshot_reader_and_health_terms_are_bounded_at_the_documented_scope() -> Tes
         estimate(one_more_health_event, &routes)? - base,
         HEALTH_EVENT_BYTES
     );
+    Ok(())
+}
+
+#[test]
+fn snapshot_publication_generations_and_aggregate_metadata_have_exact_boundaries() -> TestResult {
+    let peak = snapshot_publication_reader_peak(4_096, 2, 4)?;
+    assert_eq!(peak.publication_count, 8);
+    assert!(peak.publication_bytes > 4_096);
+    assert!(peak.reader_metadata_bytes > 0);
+    assert_eq!(
+        peak.additional_bytes,
+        peak.publication_count * peak.publication_bytes + peak.reader_metadata_bytes
+    );
+
+    let routes = [route(INSTRUMENT_ONE, 4, 8)?];
+    let estimated = estimate(input()?, &routes)?;
+    let mut exact = input()?;
+    exact.maximum_runtime_bytes = estimated;
+    assert_eq!(estimate(exact, &routes)?, estimated);
+
+    let mut below = input()?;
+    below.maximum_runtime_bytes = estimated - 1;
+    let below = LiveRuntimeConfig::try_new(below)?;
+    assert!(matches!(
+        estimate_peak_bytes(&below, &routes),
+        Err(LiveRuntimeConfigError::PeakMemoryExceedsCeiling {
+            estimated: rejected,
+            ceiling,
+        }) if rejected == estimated && ceiling == estimated - 1
+    ));
+    Ok(())
+}
+
+#[test]
+fn single_shard_multiple_generation_ceiling_is_inclusive_and_one_under_rejects() -> TestResult {
+    let routes = [route(INSTRUMENT_ONE, 4, 8)?];
+    let mut single = input()?;
+    single.shard_count = 1;
+    single.maximum_retained_snapshot_readers = 3;
+    let estimated = estimate(single.clone(), &routes)?;
+
+    single.maximum_runtime_bytes = estimated;
+    assert_eq!(estimate(single.clone(), &routes)?, estimated);
+    single.maximum_runtime_bytes = estimated - 1;
+    let below = LiveRuntimeConfig::try_new(single)?;
+    assert!(matches!(
+        estimate_peak_bytes(&below, &routes),
+        Err(LiveRuntimeConfigError::PeakMemoryExceedsCeiling {
+            estimated: rejected,
+            ceiling,
+        }) if rejected == estimated && ceiling == estimated - 1
+    ));
+    Ok(())
+}
+
+#[test]
+fn all_shard_processing_and_worst_reader_generations_coexist_below_the_runtime_ceiling()
+-> TestResult {
+    let routes = [route(INSTRUMENT_ONE, 4, 8)?, route(INSTRUMENT_TWO, 4, 8)?];
+    let mut configured = input()?;
+    configured.maximum_retained_snapshot_readers = 4;
+    let config = LiveRuntimeConfig::try_new(configured)?;
+    let processing = all_shard_book_processing_bytes(&config, &routes)?;
+    let per_shard = book_processing_peak(512, 4)?;
+    assert_eq!(processing, 2 * per_shard.additional_bytes);
+    let snapshots = snapshot_publication_reader_peak(4_096, 2, 4)?;
+    let total = estimate_peak_bytes(&config, &routes)?.get();
+    assert!(total >= processing + snapshots.additional_bytes);
     Ok(())
 }
 

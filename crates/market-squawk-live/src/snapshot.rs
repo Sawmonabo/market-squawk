@@ -468,6 +468,11 @@ impl LiveSnapshotLease {
     pub fn snapshot(&self) -> &ShardSnapshot {
         &self.snapshot
     }
+
+    #[cfg(test)]
+    pub(crate) fn observed_metadata_bytes(&self) -> u64 {
+        std::mem::size_of::<Self>() as u64
+    }
 }
 
 /// Revision metadata for one shard in a non-atomic cross-shard read.
@@ -526,6 +531,73 @@ impl LiveRuntimeSnapshotLease {
     pub fn revisions(&self) -> &[ShardSnapshotRevision] {
         &self.revisions
     }
+
+    #[cfg(test)]
+    pub(crate) fn observed_metadata_bytes(&self) -> Option<u64> {
+        (std::mem::size_of::<Self>() as u64)
+            .checked_add(
+                (self.snapshots.len() as u64)
+                    .checked_mul(std::mem::size_of::<Arc<ShardSnapshot>>() as u64)?,
+            )?
+            .checked_add(
+                (self.revisions.len() as u64)
+                    .checked_mul(std::mem::size_of::<ShardSnapshotRevision>() as u64)?,
+            )
+    }
+}
+
+/// Returns the retained bytes of one maximum-sized immutable publication, including the `Arc`
+/// strong/weak counters and worst-case padding before the pointee. `ShardSnapshot::retained_bytes`
+/// already includes the pointee and every nested boxed slice/string allocation.
+pub(crate) fn snapshot_publication_bytes(maximum_retained_bytes: u32) -> Option<u64> {
+    u64::from(maximum_retained_bytes).checked_add(arc_control_overhead::<ShardSnapshot>())
+}
+
+/// Returns the maximum metadata retained by all official reader permits.
+///
+/// Aggregate reads consume one permit per shard and own exact boxed `Arc`/revision arrays. The
+/// larger of aggregate or individual leases is selected per complete shard group. Aggregate array
+/// construction also charges one unsafe-free Vec-to-box normalization overlap for the larger
+/// array; this makes allocator spare capacity an accounting concern rather than a read failure.
+pub(crate) fn snapshot_reader_metadata_peak_bytes(
+    maximum_readers: u32,
+    shard_count: u16,
+) -> Option<u64> {
+    let readers = u64::from(maximum_readers);
+    let shards = u64::from(shard_count);
+    if readers == 0 || shards == 0 {
+        return None;
+    }
+    let single = std::mem::size_of::<LiveSnapshotLease>() as u64;
+    if readers < shards {
+        return single.checked_mul(readers);
+    }
+    let aggregate = aggregate_lease_peak_bytes(shards)?;
+    let single_group = single.checked_mul(shards)?;
+    if aggregate <= single_group {
+        return single.checked_mul(readers);
+    }
+    let groups = readers.checked_div(shards)?;
+    let remainder = readers.checked_rem(shards)?;
+    groups
+        .checked_mul(aggregate)?
+        .checked_add(remainder.checked_mul(single)?)
+}
+
+fn aggregate_lease_peak_bytes(shards: u64) -> Option<u64> {
+    let snapshot_array = shards.checked_mul(std::mem::size_of::<Arc<ShardSnapshot>>() as u64)?;
+    let revision_array = shards.checked_mul(std::mem::size_of::<ShardSnapshotRevision>() as u64)?;
+    let retained_arrays = snapshot_array.checked_add(revision_array)?;
+    let conversion_overlap = snapshot_array.max(revision_array);
+    (std::mem::size_of::<LiveRuntimeSnapshotLease>() as u64)
+        .checked_add(retained_arrays)?
+        .checked_add(conversion_overlap)
+}
+
+const fn arc_control_overhead<T>() -> u64 {
+    let counters = 2 * std::mem::size_of::<usize>();
+    let padding = std::mem::align_of::<T>() - 1;
+    (counters + padding) as u64
 }
 
 /// Cloneable read-only access to current immutable shard publications.
@@ -619,6 +691,8 @@ pub enum SnapshotReadError {
     ReaderLimitReached,
     #[error("snapshot shard identity is not part of this runtime incarnation")]
     UnknownShard,
+    #[error("snapshot reader metadata capacity overflowed")]
+    CapacityOverflow,
     #[error("snapshot reader plane is closed")]
     Closed,
 }

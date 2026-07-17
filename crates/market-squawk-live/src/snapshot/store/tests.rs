@@ -103,6 +103,15 @@ fn one_permit_is_charged_per_retained_shard_generation_and_drop_restores_it() ->
     let bundle = create_snapshot_plane(initial(2, 5)?, 2)?;
     let first = bundle.reader.try_load(ShardId::new(0, 2)?)?;
     let second = bundle.reader.try_load(ShardId::new(1, 2)?)?;
+    let modeled_single = crate::snapshot::snapshot_reader_metadata_peak_bytes(2, 2)
+        .ok_or("modeled single-reader metadata overflow")?;
+    assert!(
+        first
+            .observed_metadata_bytes()
+            .checked_add(second.observed_metadata_bytes())
+            .ok_or("observed single-reader metadata overflow")?
+            <= modeled_single
+    );
     assert_eq!(
         bundle.reader.try_load(ShardId::new(0, 2)?).err(),
         Some(SnapshotReadError::ReaderLimitReached)
@@ -157,6 +166,57 @@ fn retained_old_generations_exhaust_readers_but_never_block_publication() -> Tes
     drop(revision_one);
     let latest = bundle.reader.try_load(shard)?;
     assert_eq!(latest.snapshot().snapshot_revision().get(), 3);
+    Ok(())
+}
+
+#[test]
+fn maximum_aggregate_readers_retain_distinct_all_shard_generations_while_all_shards_republish()
+-> TestResult {
+    let bundle = create_snapshot_plane(initial(2, 19)?, 4)?;
+    let generation_one = bundle.reader.try_load_all()?;
+    for (index, publisher) in bundle.publishers.iter().enumerate() {
+        publisher.publish(snapshot(u16::try_from(index)?, 2, 19, 2)?)?;
+    }
+    let generation_two = bundle.reader.try_load_all()?;
+    for (index, publisher) in bundle.publishers.iter().enumerate() {
+        publisher.publish(snapshot(u16::try_from(index)?, 2, 19, 3)?)?;
+    }
+
+    assert_eq!(
+        bundle.reader.try_load_all().err(),
+        Some(SnapshotReadError::ReaderLimitReached)
+    );
+    assert!(
+        generation_one
+            .revisions()
+            .iter()
+            .all(|revision| revision.snapshot_revision().get() == 1)
+    );
+    assert!(
+        generation_two
+            .revisions()
+            .iter()
+            .all(|revision| revision.snapshot_revision().get() == 2)
+    );
+    let observed_metadata = generation_one
+        .observed_metadata_bytes()
+        .and_then(|first| {
+            generation_two
+                .observed_metadata_bytes()
+                .and_then(|second| first.checked_add(second))
+        })
+        .ok_or("observed aggregate metadata overflow")?;
+    let modeled_metadata = crate::snapshot::snapshot_reader_metadata_peak_bytes(4, 2)
+        .ok_or("modeled aggregate metadata overflow")?;
+    assert!(observed_metadata <= modeled_metadata);
+    drop(generation_one);
+    let latest = bundle.reader.try_load_all()?;
+    assert!(
+        latest
+            .revisions()
+            .iter()
+            .all(|revision| revision.snapshot_revision().get() == 3)
+    );
     Ok(())
 }
 
