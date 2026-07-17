@@ -5,8 +5,9 @@
 - Researched: 2026-07-16
 - Applies to: Q2-I03 provider-budget restart persistence
 - Implementation base: Q2 remediation plan commit `de101ee`
+- Platform-store implementation: `61c4292`
 - Source policy: primary standards, Rust 1.97 documentation, Microsoft platform documentation,
-  and the exact pinned `cap-std` 4.0.2 API documentation
+  and the exact pinned `cap-std`/`cap-fs-ext` 4.0.2 API documentation
 
 ## Decision
 
@@ -98,6 +99,35 @@ reconstructing one from an arbitrary handle.
 Source:
 
 - [`cap-std` 4.0.2 `Dir` API](https://docs.rs/cap-std/4.0.2/cap_std/fs/struct.Dir.html)
+
+`cap-std` deliberately keeps final-component symbolic-link policy below its public convenience
+surface. The companion `cap-fs-ext` crate exposes that existing capability through
+`OpenOptionsFollowExt::follow`. The store pins the matching 4.0.2 versions and sets
+`FollowSymlinks::No` for lock, temporary, and canonical opens. It additionally rejects
+non-regular and multiply linked reserved entries, compares the opened root handle's filesystem
+identity with the no-follow pre-open identity, and changes root permissions through the opened
+handle rather than through a second ambient path lookup.
+
+Sources:
+
+- [`cap-fs-ext` 4.0.2 crate documentation](https://docs.rs/cap-fs-ext/4.0.2/cap_fs_ext/)
+- [`OpenOptionsFollowExt` 4.0.2](https://docs.rs/cap-fs-ext/4.0.2/cap_fs_ext/trait.OpenOptionsFollowExt.html)
+
+### Implemented platform boundary
+
+The implemented store bounds payloads at 8 MiB and uses an 8-byte magic, 16-bit format version,
+64-bit payload length, SHA-256 digest, and payload envelope. It validates the filesystem-reported
+length before allocation, probes for concurrent trailing growth, zeroes transient payload copies,
+serializes writers inside a process, and retains an exclusive filesystem lock across the store
+lifetime. On Unix, installation is same-directory replacement followed by directory sync and a
+canonical reopen/digest/payload verification.
+
+The workspace forbids unsafe Rust. The pinned safe capability APIs do not expose Windows'
+`ReplaceFileW`; ordinary Windows rename does not provide a portable replace-existing contract.
+Consequently the store supports first installation on Windows but returns a typed, fail-closed
+`AtomicReplaceUnsupported` error when a canonical file already exists. It never deletes the old
+file to simulate replacement. Full Windows replacement support requires a separately reviewed safe
+platform boundary; no Windows durability result is claimed by this macOS implementation run.
 
 ## Required regression matrix
 
