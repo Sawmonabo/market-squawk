@@ -9,7 +9,7 @@ mod budget_checkpoint;
 #[path = "budget/coordinator.rs"]
 mod budget_coordinator;
 #[path = "budget/persistence.rs"]
-mod persistence;
+pub(crate) mod persistence;
 
 pub use budget_identity::{BackoffPolicy, BudgetScope, ProviderBudgetPolicy};
 pub(crate) use budget_identity::{
@@ -30,9 +30,7 @@ pub(in crate::policy) use budget_checkpoint::{
 use budget_coordinator::BudgetClock;
 pub use budget_coordinator::{BudgetPermit, BudgetPoolError};
 pub(crate) use budget_coordinator::{BudgetAvailabilityLease, ProviderBudgetPool};
-pub use persistence::{
-    AuthorityPersistenceError, AuthorityStateStore, AuthorityStateStoreError,
-};
+pub(crate) use persistence::{AuthorityPersistenceError, AuthorityStateStore};
 pub(crate) use persistence::{
     AuthorityDurabilitySession, BudgetCheckpointState, DurableBudgetGroup,
 };

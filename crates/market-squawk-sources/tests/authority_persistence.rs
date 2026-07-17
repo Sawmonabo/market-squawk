@@ -4,17 +4,15 @@ use std::fs;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use market_squawk_domain::ConnectionGeneration;
 use market_squawk_platform::LocalAuthorityStateStore;
 use market_squawk_sources::{
-    AuthoritativeSourceRegistry, AuthorityStateStore, AuthorityStateStoreError, BudgetDecision,
-    BudgetUnavailableReason, CaptureGenerationHealth, RegistryError, RetryAfter, SessionId,
-    SourceError, TransportFrameKind,
+    AuthoritativeSourceRegistry, BudgetDecision, BudgetUnavailableReason, CaptureGenerationHealth,
+    RegistryError, RetryAfter, SessionId, SourceError, TransportFrameKind,
 };
 
 use common::{TestResult, direct_metadata, now_timestamp, source_identifier};
@@ -22,38 +20,6 @@ use common::{TestResult, direct_metadata, now_timestamp, source_identifier};
 const CHILD_PHASE: &str = "MARKET_SQUAWK_AUTHORITY_CHILD_PHASE";
 const CHILD_ROOT: &str = "MARKET_SQUAWK_AUTHORITY_CHILD_ROOT";
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
-
-#[derive(Debug, Default)]
-struct FailingMemoryStore {
-    payload: Mutex<Option<Vec<u8>>>,
-    reject_stores: AtomicBool,
-}
-
-impl FailingMemoryStore {
-    fn reject_stores(&self) {
-        self.reject_stores.store(true, Ordering::Release);
-    }
-}
-
-impl AuthorityStateStore for FailingMemoryStore {
-    fn load(&self) -> Result<Option<Vec<u8>>, AuthorityStateStoreError> {
-        self.payload
-            .lock()
-            .map(|payload| payload.clone())
-            .map_err(|_| AuthorityStateStoreError::Unavailable)
-    }
-
-    fn store(&self, payload: &[u8]) -> Result<(), AuthorityStateStoreError> {
-        if self.reject_stores.load(Ordering::Acquire) {
-            return Err(AuthorityStateStoreError::Unavailable);
-        }
-        self.payload
-            .lock()
-            .map_err(|_| AuthorityStateStoreError::Unavailable)?
-            .replace(payload.to_vec());
-        Ok(())
-    }
-}
 
 #[derive(Debug)]
 struct TemporaryAuthorityRoot(PathBuf);
@@ -102,7 +68,7 @@ fn run_child(root: &Path, phase: &str) -> TestResult {
 }
 
 fn open_registry(root: &Path) -> TestResult<AuthoritativeSourceRegistry> {
-    let store: Arc<dyn AuthorityStateStore> = Arc::new(LocalAuthorityStateStore::try_open(root)?);
+    let store = LocalAuthorityStateStore::try_open(root)?;
     Ok(AuthoritativeSourceRegistry::try_new_durable(store)?)
 }
 
@@ -149,13 +115,6 @@ fn metadata_for_provider(
     Ok(serde_json::from_value(wire)?)
 }
 
-fn open_memory_registry(
-    store: Arc<FailingMemoryStore>,
-) -> Result<AuthoritativeSourceRegistry, RegistryError> {
-    let store: Arc<dyn AuthorityStateStore> = store;
-    AuthoritativeSourceRegistry::try_new_durable(store)
-}
-
 #[test]
 fn clean_child_restarts_preserve_capacity_cooldown_and_disable() -> TestResult {
     let request_root = TemporaryAuthorityRoot::try_new("requests")?;
@@ -181,60 +140,9 @@ fn unclean_child_restart_terminally_bars_live_authority() -> TestResult {
 }
 
 #[test]
-fn write_failures_publish_no_new_authority_and_terminalize_restrictive_transitions() -> TestResult {
-    let registration_store = Arc::new(FailingMemoryStore::default());
-    let mut registration_registry = open_memory_registry(registration_store.clone())?;
-    registration_store.reject_stores();
-    assert!(matches!(
-        registration_registry.register(
-            metadata_for_provider(
-                "failed-registration",
-                "revision-1",
-                "failed-registration-provider"
-            )?,
-            now_timestamp()?
-        ),
-        Err(RegistryError::AuthorityPersistence)
-    ));
-
-    let restrictive_store = Arc::new(FailingMemoryStore::default());
-    let mut restrictive_registry = open_memory_registry(restrictive_store.clone())?;
-    let registered = restrictive_registry.register(
-        metadata_for_provider(
-            "failed-restriction",
-            "revision-1",
-            "failed-restriction-provider",
-        )?,
-        now_timestamp()?,
-    )?;
-    let budget = registered
-        .budget()
-        .ok_or("restrictive budget missing")?
-        .clone();
-    restrictive_store.reject_stores();
-    assert!(matches!(
-        budget.disable(),
-        BudgetDecision::Unavailable(BudgetUnavailableReason::PersistenceUnavailable)
-    ));
-    assert!(matches!(
-        budget.try_acquire(),
-        BudgetDecision::Unavailable(BudgetUnavailableReason::PersistenceUnavailable)
-    ));
-    assert!(matches!(
-        restrictive_registry.revoke(&registered, now_timestamp()?),
-        Err(RegistryError::AuthorityPersistence)
-    ));
-    assert!(matches!(
-        restrictive_registry.validate_registered(&registered, now_timestamp()?),
-        Err(RegistryError::SourceRevoked)
-    ));
-    Ok(())
-}
-
-#[test]
 fn clean_shutdown_requires_reconciled_sessions_and_provider_permits() -> TestResult {
-    let active_store = Arc::new(FailingMemoryStore::default());
-    let mut active_registry = open_memory_registry(active_store)?;
+    let active_root = TemporaryAuthorityRoot::try_new("active-shutdown")?;
+    let mut active_registry = open_registry(active_root.path())?;
     let active = active_registry.register(
         metadata_for_provider("active-shutdown", "revision-1", "active-shutdown-provider")?,
         now_timestamp()?,
@@ -250,8 +158,8 @@ fn clean_shutdown_requires_reconciled_sessions_and_provider_permits() -> TestRes
         Err(RegistryError::ActiveAuthorityAtShutdown)
     ));
 
-    let permit_store = Arc::new(FailingMemoryStore::default());
-    let mut permit_registry = open_memory_registry(permit_store)?;
+    let permit_root = TemporaryAuthorityRoot::try_new("permit-shutdown")?;
+    let mut permit_registry = open_registry(permit_root.path())?;
     let registered = permit_registry.register(
         metadata_for_provider("permit-shutdown", "revision-1", "permit-shutdown-provider")?,
         now_timestamp()?,
@@ -275,8 +183,10 @@ fn clean_shutdown_requires_reconciled_sessions_and_provider_permits() -> TestRes
 
 #[test]
 fn one_canonical_allocation_rejects_conflicting_durability_stores() -> TestResult {
-    let mut first = open_memory_registry(Arc::new(FailingMemoryStore::default()))?;
-    let mut second = open_memory_registry(Arc::new(FailingMemoryStore::default()))?;
+    let first_root = TemporaryAuthorityRoot::try_new("store-owner")?;
+    let second_root = TemporaryAuthorityRoot::try_new("store-contender")?;
+    let mut first = open_registry(first_root.path())?;
+    let mut second = open_registry(second_root.path())?;
     let _registered = first.register(
         metadata_for_provider("store-owner", "revision-1", "shared-store-provider")?,
         now_timestamp()?,
@@ -298,14 +208,15 @@ fn failed_restore_rolls_back_the_unpublished_run_to_clean() -> TestResult {
     let root = TemporaryAuthorityRoot::try_new("restore-rollback")?;
     run_child(root.path(), "constructor-conflict-write")?;
 
-    let mut existing = open_memory_registry(Arc::new(FailingMemoryStore::default()))?;
+    let existing_root = TemporaryAuthorityRoot::try_new("restore-conflict")?;
+    let mut existing = open_registry(existing_root.path())?;
     let _registered = existing.register(
         direct_metadata("constructor-conflict-existing", "revision-1", 0, None)?,
         now_timestamp()?,
     )?;
-    let result = AuthoritativeSourceRegistry::try_new_durable(Arc::new(
-        LocalAuthorityStateStore::try_open(root.path())?,
-    ));
+    let result = AuthoritativeSourceRegistry::try_new_durable(LocalAuthorityStateStore::try_open(
+        root.path(),
+    )?);
     assert!(matches!(result, Err(RegistryError::BudgetCoordinator)));
 
     let store = LocalAuthorityStateStore::try_open(root.path())?;
@@ -318,7 +229,8 @@ fn failed_restore_rolls_back_the_unpublished_run_to_clean() -> TestResult {
 
 #[test]
 fn nonclean_registry_drop_revokes_retained_request_capture_and_live_capabilities() -> TestResult {
-    let mut registry = open_memory_registry(Arc::new(FailingMemoryStore::default()))?;
+    let root = TemporaryAuthorityRoot::try_new("retained-unclean")?;
+    let mut registry = open_registry(root.path())?;
     let registered = registry.register(
         metadata_for_provider(
             "retained-unclean",
@@ -462,8 +374,7 @@ fn durable_authority_child() -> TestResult {
             registry.shutdown()?;
         }
         "unclean-read" => {
-            let store: Arc<dyn AuthorityStateStore> =
-                Arc::new(LocalAuthorityStateStore::try_open(&root)?);
+            let store = LocalAuthorityStateStore::try_open(&root)?;
             assert!(matches!(
                 AuthoritativeSourceRegistry::try_new_durable(store),
                 Err(RegistryError::UncleanAuthorityPredecessor)

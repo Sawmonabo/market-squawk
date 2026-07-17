@@ -12,12 +12,23 @@ impl AuthoritativeSourceRegistry {
     /// let _registry = AuthoritativeSourceRegistry::try_new();
     /// ```
     ///
+    /// Arbitrary store implementations cannot be presented as production durability:
+    ///
+    /// ```compile_fail
+    /// use market_squawk_sources::AuthoritativeSourceRegistry;
+    ///
+    /// #[derive(Debug)]
+    /// struct VolatileStore;
+    ///
+    /// let _registry = AuthoritativeSourceRegistry::try_new_durable(VolatileStore);
+    /// ```
+    ///
     /// # Errors
     ///
     /// Fails closed when canonical state is unavailable, invalid, temporally ambiguous, or cannot
     /// be durably marked in-use.
     pub fn try_new_durable(
-        store: Arc<dyn crate::AuthorityStateStore>,
+        store: market_squawk_platform::LocalAuthorityStateStore,
     ) -> Result<Self, RegistryError> {
         Self::try_new_durable_with_authorization_subject_resolver(
             store,
@@ -31,7 +42,15 @@ impl AuthoritativeSourceRegistry {
     ///
     /// Fails closed on persistence, restore, subject-resolution, or coordinator failure.
     pub fn try_new_durable_with_authorization_subject_resolver(
-        store: Arc<dyn crate::AuthorityStateStore>,
+        store: market_squawk_platform::LocalAuthorityStateStore,
+        resolver: Arc<dyn crate::AuthorizationSubjectResolver>,
+    ) -> Result<Self, RegistryError> {
+        let store: Arc<dyn crate::policy::AuthorityStateStore> = Arc::new(store);
+        Self::try_new_durable_with_store_and_authorization_subject_resolver(store, resolver)
+    }
+
+    pub(crate) fn try_new_durable_with_store_and_authorization_subject_resolver(
+        store: Arc<dyn crate::policy::AuthorityStateStore>,
         resolver: Arc<dyn crate::AuthorizationSubjectResolver>,
     ) -> Result<Self, RegistryError> {
         let clock: Arc<dyn RegistryClock> = Arc::new(SystemRegistryClock::try_new()?);

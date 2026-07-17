@@ -10,6 +10,7 @@ mod coordinator_tests {
     };
 
     use super::*;
+    use crate::policy::persistence::AuthorityStateStoreError;
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 

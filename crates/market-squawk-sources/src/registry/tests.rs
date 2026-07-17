@@ -4,7 +4,7 @@ mod tests {
     use std::marker::PhantomData;
     use std::str::FromStr;
     use std::sync::{Arc, Barrier, Mutex};
-    use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64};
+    use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
     use bytes::Bytes;
@@ -17,15 +17,18 @@ mod tests {
     use super::{
         AuthoritativeSourceRegistry, RawFrameFactory, RegistryClock, RegistryError,
         MAX_AUTHORITY_SOURCES, SessionLeaseState, SourceAuthorityHistory, TrustedRegistryTime,
-        validate_observation_profile,
+        UnconfiguredAuthorizationSubjectResolver, validate_observation_profile,
     };
+    use crate::policy::AuthorityStateStore;
+    use crate::policy::persistence::AuthorityStateStoreError;
     use crate::{
-        ChecksumValidationProfile, FrameSessionBinding, LiveProtocolProfile,
-        ProviderAggressorEvidence, ProviderChecksumEvidence, ProviderDecimalLexeme,
-        ProviderNormalizedObservation, ProviderNumericPolicy, ProviderObservationPayload,
-        ProviderPrice, ProviderQuantity, ProviderSequenceEvidence, ProviderSnapshotEvidence,
-        ProviderTimestampEvidence, SemanticInterpretationProfile, SequenceValidationProfile,
-        CurrentHealthReporter, CurrentSourceSession, SessionId, SourceError, TransportFrameKind,
+        BudgetDecision, BudgetUnavailableReason, ChecksumValidationProfile, CurrentHealthReporter,
+        CurrentSourceSession, FrameSessionBinding, LiveProtocolProfile, ProviderAggressorEvidence,
+        ProviderChecksumEvidence, ProviderDecimalLexeme, ProviderNormalizedObservation,
+        ProviderNumericPolicy, ProviderObservationPayload, ProviderPrice, ProviderQuantity,
+        ProviderSequenceEvidence, ProviderSnapshotEvidence, ProviderTimestampEvidence,
+        SemanticInterpretationProfile, SequenceValidationProfile, SessionId, SourceError,
+        TransportFrameKind,
     };
     use crate::registry::test_support::{
         TestResult, direct_metadata, direct_metadata_with_provider_and_limit, healthy_snapshot,
@@ -40,6 +43,47 @@ mod tests {
     #[derive(Debug)]
     struct ManualRegistryClock {
         state: Mutex<ManualClockState>,
+    }
+
+    #[derive(Debug, Default)]
+    struct FailingAuthorityStore {
+        payload: Mutex<Option<Vec<u8>>>,
+        reject_stores: AtomicBool,
+    }
+
+    impl FailingAuthorityStore {
+        fn reject_stores(&self) {
+            self.reject_stores.store(true, Ordering::Release);
+        }
+    }
+
+    impl AuthorityStateStore for FailingAuthorityStore {
+        fn load(&self) -> Result<Option<Vec<u8>>, AuthorityStateStoreError> {
+            self.payload
+                .lock()
+                .map(|payload| payload.clone())
+                .map_err(|_| AuthorityStateStoreError::Unavailable)
+        }
+
+        fn store(&self, payload: &[u8]) -> Result<(), AuthorityStateStoreError> {
+            if self.reject_stores.load(Ordering::Acquire) {
+                return Err(AuthorityStateStoreError::Unavailable);
+            }
+            self.payload
+                .lock()
+                .map_err(|_| AuthorityStateStoreError::Unavailable)?
+                .replace(payload.to_vec());
+            Ok(())
+        }
+    }
+
+    fn durable_registry_with_test_store(
+        store: Arc<dyn AuthorityStateStore>,
+    ) -> Result<AuthoritativeSourceRegistry, RegistryError> {
+        AuthoritativeSourceRegistry::try_new_durable_with_store_and_authorization_subject_resolver(
+            store,
+            Arc::new(UnconfiguredAuthorizationSubjectResolver),
+        )
     }
 
     impl ManualRegistryClock {
@@ -303,6 +347,61 @@ mod tests {
             aggressor: ProviderAggressorEvidence::new(AggressorSide::Buy, None, corporate_action),
         })?;
         assert!(validate_observation_profile(&protocol, &transplanted).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn private_store_failures_publish_no_authority_and_terminalize_restrictions() -> TestResult {
+        let at = Timestamp::from_unix_nanos(1_000_000_000);
+        let registration_store = Arc::new(FailingAuthorityStore::default());
+        let mut registration_registry =
+            durable_registry_with_test_store(registration_store.clone())?;
+        registration_store.reject_stores();
+        assert!(matches!(
+            registration_registry.register(
+                direct_metadata_with_provider_and_limit(
+                    "failed-registration",
+                    "revision-1",
+                    "failed-registration-provider",
+                    10,
+                )?,
+                at,
+            ),
+            Err(RegistryError::AuthorityPersistence)
+        ));
+
+        let restrictive_store = Arc::new(FailingAuthorityStore::default());
+        let mut restrictive_registry = durable_registry_with_test_store(restrictive_store.clone())?;
+        let registered = restrictive_registry.register(
+            direct_metadata_with_provider_and_limit(
+                "failed-restriction",
+                "revision-1",
+                "failed-restriction-provider",
+                10,
+            )?,
+            at,
+        )?;
+        let budget = registered
+            .budget()
+            .ok_or("restrictive budget missing")?
+            .clone();
+        restrictive_store.reject_stores();
+        assert!(matches!(
+            budget.disable(),
+            BudgetDecision::Unavailable(BudgetUnavailableReason::PersistenceUnavailable)
+        ));
+        assert!(matches!(
+            budget.try_acquire(),
+            BudgetDecision::Unavailable(BudgetUnavailableReason::PersistenceUnavailable)
+        ));
+        assert!(matches!(
+            restrictive_registry.revoke(&registered, at),
+            Err(RegistryError::AuthorityPersistence)
+        ));
+        assert!(matches!(
+            restrictive_registry.validate_registered(&registered, at),
+            Err(RegistryError::SourceRevoked)
+        ));
         Ok(())
     }
 

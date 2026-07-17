@@ -18,13 +18,11 @@ use thiserror::Error;
 
 use crate::bounded::BoundedVec;
 use crate::policy::{
-    AuthorityDurabilitySession, BudgetAvailabilityLease, BudgetPolicyResolutionError,
-    DurableBudgetGroup, PersistedProviderBudgetPolicy, ProviderBudgetPool,
-    ResolvedProviderBudgetPolicy,
+    AuthorityDurabilitySession, AuthorityPersistenceError, BudgetAvailabilityLease,
+    BudgetPolicyResolutionError, DurableBudgetGroup, PersistedProviderBudgetPolicy,
+    ProviderBudgetPool, ResolvedProviderBudgetPolicy,
 };
-use crate::{
-    AuthorityPersistenceError, FrameSessionBinding, SessionId, SharedProviderBudget, SourceMetadata,
-};
+use crate::{FrameSessionBinding, SessionId, SharedProviderBudget, SourceMetadata};
 
 static NEXT_REGISTRY_ID: AtomicU64 = AtomicU64::new(1);
 const MAX_REVISIONS_PER_SOURCE: usize = 4_096;
@@ -434,7 +432,7 @@ impl RegistryAuthorityState {
         })
     }
 
-    pub(crate) fn canonicalize(&mut self) -> Result<(), crate::AuthorityPersistenceError> {
+    pub(crate) fn canonicalize(&mut self) -> Result<(), crate::policy::AuthorityPersistenceError> {
         let mut sources = self.sources.as_slice().to_vec();
         sources.sort_by(|left, right| left.source_id.cmp(&right.source_id));
         let mut policies = self
@@ -444,19 +442,19 @@ impl RegistryAuthorityState {
             .map(|policy| {
                 serde_json::to_vec(&policy)
                     .map(|key| (key, policy))
-                    .map_err(|_| crate::AuthorityPersistenceError::InvalidState)
+                    .map_err(|_| crate::policy::AuthorityPersistenceError::InvalidState)
             })
             .collect::<Result<Vec<_>, _>>()?;
         policies.sort_by(|left, right| left.0.cmp(&right.0));
         self.sources = BoundedVec::try_new(sources)
-            .map_err(|_| crate::AuthorityPersistenceError::StateTooLarge)?;
+            .map_err(|_| crate::policy::AuthorityPersistenceError::StateTooLarge)?;
         self.budget_policies = BoundedVec::try_new(
             policies
                 .into_iter()
                 .map(|(_key, policy)| policy.clone())
                 .collect(),
         )
-        .map_err(|_| crate::AuthorityPersistenceError::StateTooLarge)?;
+        .map_err(|_| crate::policy::AuthorityPersistenceError::StateTooLarge)?;
         Ok(())
     }
 

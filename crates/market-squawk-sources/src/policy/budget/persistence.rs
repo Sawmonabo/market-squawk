@@ -12,7 +12,7 @@ const DURABLE_AUTHORITY_FORMAT_VERSION: u16 = 1;
 /// Implementations must make a successful [`Self::store`] durable before returning. The platform
 /// crate provides the path-confined local implementation; adapters may map its typed failures to
 /// [`AuthorityStateStoreError`] without exposing filesystem access to the source state machine.
-pub trait AuthorityStateStore: std::fmt::Debug + Send + Sync {
+pub(crate) trait AuthorityStateStore: std::fmt::Debug + Send + Sync {
     /// Loads the sole canonical payload without following alternate or recovery files.
     ///
     /// # Errors
@@ -31,7 +31,7 @@ pub trait AuthorityStateStore: std::fmt::Debug + Send + Sync {
 
 /// Redacted failure returned by an opaque authority-state store adapter.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
-pub enum AuthorityStateStoreError {
+pub(crate) enum AuthorityStateStoreError {
     /// State could not be read or durably replaced.
     #[error("authority state store is unavailable")]
     Unavailable,
@@ -74,7 +74,7 @@ fn map_local_store_error(
 
 /// Durable authority-state validation or publication failure.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
-pub enum AuthorityPersistenceError {
+pub(crate) enum AuthorityPersistenceError {
     /// The opaque store rejected a load or durable replacement.
     #[error("authority state persistence failed")]
     Store,
