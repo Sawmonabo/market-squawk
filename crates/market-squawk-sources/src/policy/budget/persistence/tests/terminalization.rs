@@ -2,14 +2,14 @@
 
 use super::*;
 
-#[path = "terminalization/branch_matrix.rs"]
-mod branch_matrix;
 #[path = "terminalization/availability_changed.rs"]
 mod availability_changed;
-#[path = "terminalization/lifecycle.rs"]
-mod lifecycle;
+#[path = "terminalization/branch_matrix.rs"]
+mod branch_matrix;
 #[path = "terminalization/concurrency.rs"]
 mod concurrency;
+#[path = "terminalization/lifecycle.rs"]
+mod lifecycle;
 
 #[derive(Debug)]
 struct SwitchableClock {
@@ -450,10 +450,7 @@ fn repeated_terminal_persistence_succeeds_only_after_a_proven_terminal_write() -
         .admit_runtime_operation()
         .map_err(|reason| format!("operation admission failed: {reason:?}"))?;
     assert_eq!(
-        budget.terminal_fault(
-            BudgetUnavailableReason::StateCorrupt,
-            &operation,
-        ),
+        budget.terminal_fault(BudgetUnavailableReason::StateCorrupt, &operation,),
         BudgetUnavailableReason::StateCorrupt
     );
     assert_eq!(
@@ -476,10 +473,7 @@ fn repeated_terminal_persistence_succeeds_only_after_a_proven_terminal_write() -
 #[test]
 fn clean_close_winner_rejects_stale_runtime_entry_without_terminal_io() -> TestResult {
     let store = Arc::new(BlockingStore::default());
-    let session = AuthorityDurabilitySession::open(
-        store.clone(),
-        Timestamp::from_unix_nanos(100),
-    )?;
+    let session = AuthorityDurabilitySession::open(store.clone(), Timestamp::from_unix_nanos(100))?;
     let declaration = declaration(1)?;
     let clock = Arc::new(SwitchableClock::new(100, 0));
     let observation = clock
@@ -526,9 +520,7 @@ fn clean_close_winner_rejects_stale_runtime_entry_without_terminal_io() -> TestR
     });
     let blocked_store = store.wait_until_blocked()?;
     let (decision_tx, decision_rx) = std::sync::mpsc::sync_channel(1);
-    let stale = std::thread::spawn(move || {
-        decision_tx.send(budget.try_acquire()).is_ok()
-    });
+    let stale = std::thread::spawn(move || decision_tx.send(budget.try_acquire()).is_ok());
     assert!(matches!(
         decision_rx.recv_timeout(TEST_WATCHDOG_TIMEOUT)?,
         BudgetDecision::Unavailable(BudgetUnavailableReason::PersistenceUnavailable)
@@ -543,10 +535,7 @@ fn clean_close_winner_rejects_stale_runtime_entry_without_terminal_io() -> TestR
         .ok_or("blocking store payload missing")?;
     let envelope = deserialize_canonical_envelope(&payload)?;
     assert_eq!(envelope.run_state, DurableRunState::Clean);
-    let restarted = AuthorityDurabilitySession::open(
-        store,
-        Timestamp::from_unix_nanos(100),
-    )?;
+    let restarted = AuthorityDurabilitySession::open(store, Timestamp::from_unix_nanos(100))?;
     assert!(!restarted.recovered_unclean());
     assert!(restarted.is_available());
     Ok(())
@@ -557,10 +546,7 @@ fn terminal_fault_publishes_the_global_latch_before_the_terminal_store_finishes(
     use std::sync::mpsc;
 
     let store = Arc::new(BlockingStore::default());
-    let session = AuthorityDurabilitySession::open(
-        store.clone(),
-        Timestamp::from_unix_nanos(100),
-    )?;
+    let session = AuthorityDurabilitySession::open(store.clone(), Timestamp::from_unix_nanos(100))?;
     let clock = Arc::new(SwitchableClock::new(100, 0));
     let observation = clock
         .observation()
@@ -609,18 +595,14 @@ fn terminal_fault_publishes_the_global_latch_before_the_terminal_store_finishes(
         .admit_runtime_operation()
         .map_err(|reason| format!("terminal operation admission failed: {reason:?}"))?;
     let terminal = std::thread::spawn(move || {
-        failing.terminal_fault(
-            BudgetUnavailableReason::StateCorrupt,
-            &terminal_operation,
-        )
+        failing.terminal_fault(BudgetUnavailableReason::StateCorrupt, &terminal_operation)
     });
     let blocked_store = store.wait_until_blocked()?;
     assert!(!session.is_available());
     assert!(!peer_lease.is_available());
 
     let (decision_tx, decision_rx) = mpsc::sync_channel(1);
-    let peer_request =
-        std::thread::spawn(move || decision_tx.send(peer.try_acquire()).is_ok());
+    let peer_request = std::thread::spawn(move || decision_tx.send(peer.try_acquire()).is_ok());
     assert!(matches!(
         decision_rx.recv_timeout(TEST_WATCHDOG_TIMEOUT)?,
         BudgetDecision::Unavailable(BudgetUnavailableReason::PersistenceUnavailable)

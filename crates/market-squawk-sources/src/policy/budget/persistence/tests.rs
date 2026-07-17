@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicUsize;
     use std::sync::Condvar;
+    use std::sync::atomic::AtomicUsize;
 
     use market_squawk_domain::{
         AuthorizationBasis, DigestAlgorithm, EffectiveInterval, EvidenceDigest,
@@ -199,9 +199,11 @@ mod tests {
     fn observer_timeout_releases_a_store_call_that_enters_late() -> TestResult {
         let store = Arc::new(BlockingStore::default());
         store.block_next_store();
-        assert!(store
-            .wait_until_blocked_with_timeout(std::time::Duration::ZERO)
-            .is_err());
+        assert!(
+            store
+                .wait_until_blocked_with_timeout(std::time::Duration::ZERO)
+                .is_err()
+        );
 
         let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
         let late_store = store.clone();
@@ -248,9 +250,7 @@ mod tests {
     fn checkpoint(index: u8) -> BudgetCheckpointState {
         BudgetCheckpointState {
             window_started_wall: Timestamp::from_unix_nanos(i64::from(index)),
-            window_ends_wall: Timestamp::from_unix_nanos(
-                60_000_000_000 + i64::from(index),
-            ),
+            window_ends_wall: Timestamp::from_unix_nanos(60_000_000_000 + i64::from(index)),
             requests_used: u32::from(index),
             in_flight: 0,
             unavailable_until_wall: None,
@@ -376,10 +376,7 @@ mod tests {
         envelope.run_state = DurableRunState::InUse;
         let store = Arc::new(MemoryStore::default());
         store.replace(serialize_canonical_envelope(&envelope)?)?;
-        let session = AuthorityDurabilitySession::open(
-            store,
-            Timestamp::from_unix_nanos(100),
-        )?;
+        let session = AuthorityDurabilitySession::open(store, Timestamp::from_unix_nanos(100))?;
         assert!(session.recovered_unclean());
         assert!(matches!(
             session.close_clean_for_test(
@@ -400,10 +397,7 @@ mod tests {
         )?;
         drop(unpublished);
 
-        let restarted = AuthorityDurabilitySession::open(
-            store,
-            Timestamp::from_unix_nanos(100),
-        )?;
+        let restarted = AuthorityDurabilitySession::open(store, Timestamp::from_unix_nanos(100))?;
         assert!(restarted.recovered_unclean());
         assert!(!restarted.is_available());
         Ok(())
@@ -425,30 +419,23 @@ mod tests {
         rolled_back.rollback()?;
         drop(abandoned);
 
-        let clean_restart = AuthorityDurabilitySession::open(
-            rolled_back_store,
-            Timestamp::from_unix_nanos(100),
-        )?;
+        let clean_restart =
+            AuthorityDurabilitySession::open(rolled_back_store, Timestamp::from_unix_nanos(100))?;
         assert!(!clean_restart.recovered_unclean());
         assert!(clean_restart.is_available());
 
-        let unclean_restart = AuthorityDurabilitySession::open(
-            abandoned_store,
-            Timestamp::from_unix_nanos(100),
-        )?;
+        let unclean_restart =
+            AuthorityDurabilitySession::open(abandoned_store, Timestamp::from_unix_nanos(100))?;
         assert!(unclean_restart.recovered_unclean());
         assert!(!unclean_restart.is_available());
         Ok(())
     }
 
     #[test]
-    fn stale_concurrent_observation_preserves_deadline_distance_from_wall_high_water()
-    -> TestResult {
+    fn stale_concurrent_observation_preserves_deadline_distance_from_wall_high_water() -> TestResult
+    {
         let store = Arc::new(MemoryStore::default());
-        let session = AuthorityDurabilitySession::open(
-            store,
-            Timestamp::from_unix_nanos(100),
-        )?;
+        let session = AuthorityDurabilitySession::open(store, Timestamp::from_unix_nanos(100))?;
         let slot = session.register_budget_group(
             crate::RegistryAuthorityState::empty(),
             declaration(1)?,
@@ -473,7 +460,10 @@ mod tests {
             .get(slot)
             .ok_or("anchored budget group missing")?
             .checkpoint();
-        assert_eq!(anchored.window_started_wall, Timestamp::from_unix_nanos(100));
+        assert_eq!(
+            anchored.window_started_wall,
+            Timestamp::from_unix_nanos(100)
+        );
         assert_eq!(
             anchored.window_ends_wall,
             Timestamp::from_unix_nanos(60_000_000_100)
@@ -489,10 +479,8 @@ mod tests {
     #[test]
     fn clean_close_serializes_against_and_rejects_a_waiting_budget_update() -> TestResult {
         let store = Arc::new(BlockingStore::default());
-        let session = AuthorityDurabilitySession::open(
-            store.clone(),
-            Timestamp::from_unix_nanos(100),
-        )?;
+        let session =
+            AuthorityDurabilitySession::open(store.clone(), Timestamp::from_unix_nanos(100))?;
         let slot = session.register_budget_group(
             crate::RegistryAuthorityState::empty(),
             declaration(1)?,
@@ -512,11 +500,7 @@ mod tests {
 
         let updating = session.clone();
         let update = std::thread::spawn(move || {
-            updating.update_budget(
-                slot,
-                checkpoint(2),
-                Timestamp::from_unix_nanos(100),
-            )
+            updating.update_budget(slot, checkpoint(2), Timestamp::from_unix_nanos(100))
         });
         blocked_store.release()?;
 
@@ -526,21 +510,21 @@ mod tests {
             Err(AuthorityPersistenceError::SessionUnavailable)
         );
         assert!(!session.is_available());
-        assert!(session
-            .store
-            .lock()
-            .map_err(|_| "session store lock poisoned")?
-            .is_none());
+        assert!(
+            session
+                .store
+                .lock()
+                .map_err(|_| "session store lock poisoned")?
+                .is_none()
+        );
         Ok(())
     }
 
     #[test]
     fn memory_store_test_fixture_exposes_last_payload() -> TestResult {
         let store = Arc::new(MemoryStore::default());
-        let _session = AuthorityDurabilitySession::open(
-            store.clone(),
-            Timestamp::from_unix_nanos(100),
-        )?;
+        let _session =
+            AuthorityDurabilitySession::open(store.clone(), Timestamp::from_unix_nanos(100))?;
         assert!(!store.payload()?.is_empty());
         Ok(())
     }

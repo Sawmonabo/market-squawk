@@ -59,7 +59,7 @@ public APIs are unchanged.
 The frozen remediation candidate must pass:
 
 - the exact coordinator test repeatedly under the same 16-thread stress conditions;
-- the complete 110-test sources library suite repeatedly at 16 threads;
+- the complete 111-test sources library suite repeatedly at 16 threads;
 - all source targets and strict source Clippy;
 - standalone `rustfmt --check` for changed nested `#[path]` modules;
 - the complete local verifier and independent exact-hash review; and

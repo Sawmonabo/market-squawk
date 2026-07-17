@@ -125,14 +125,10 @@ fn assert_global_terminal(
     assert_eq!(envelope.run_state, DurableRunState::InUse);
     if terminal_checkpoint_was_stored {
         assert!(
-            envelope
-                .budgets
-                .as_slice()
-                .iter()
-                .all(|group| {
-                    let checkpoint = group.checkpoint();
-                    checkpoint.terminal && checkpoint.poisoned && checkpoint.disabled
-                }),
+            envelope.budgets.as_slice().iter().all(|group| {
+                let checkpoint = group.checkpoint();
+                checkpoint.terminal && checkpoint.poisoned && checkpoint.disabled
+            }),
             "global terminal persistence left a pre-existing group recoverable"
         );
     } else {
@@ -581,11 +577,9 @@ fn generation_exhaustion_is_not_masked_by_a_later_persistence_attempt() -> TestR
             .store(u64::MAX, Ordering::Release);
         let observed = match entry_point {
             GenerationExhaustionEntryPoint::TryAcquire => fixture.budget.try_acquire(),
-            GenerationExhaustionEntryPoint::RetryAfter => {
-                fixture.budget.apply_retry_after(RetryAfter::Delay(
-                    NonZeroU64::new(1).ok_or("retry delay must be nonzero")?,
-                ))
-            }
+            GenerationExhaustionEntryPoint::RetryAfter => fixture.budget.apply_retry_after(
+                RetryAfter::Delay(NonZeroU64::new(1).ok_or("retry delay must be nonzero")?),
+            ),
             GenerationExhaustionEntryPoint::Refusal => fixture.budget.apply_refusal(0),
             GenerationExhaustionEntryPoint::Disable => fixture.budget.disable(),
         };

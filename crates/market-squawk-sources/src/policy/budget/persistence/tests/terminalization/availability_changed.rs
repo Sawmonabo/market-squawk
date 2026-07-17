@@ -57,10 +57,7 @@ impl AuthorityStateStore for GenerationAdvancingStore {
 #[test]
 fn legitimate_post_mint_generation_change_returns_precise_nonterminal_reason() -> TestResult {
     let store = Arc::new(GenerationAdvancingStore::default());
-    let session = AuthorityDurabilitySession::open(
-        store.clone(),
-        Timestamp::from_unix_nanos(100),
-    )?;
+    let session = AuthorityDurabilitySession::open(store.clone(), Timestamp::from_unix_nanos(100))?;
     let declaration = declaration(1)?;
     let clock = Arc::new(SwitchableClock::new(100, 0));
     let observation = clock

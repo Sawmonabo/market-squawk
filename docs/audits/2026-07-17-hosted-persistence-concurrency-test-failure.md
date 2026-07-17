@@ -69,7 +69,7 @@ was changed.
 Before committing the remediation candidate:
 
 - both formerly failing tests passed individually;
-- all 110 sources library tests passed with 16 test threads;
+- all 111 sources library tests passed with 16 test threads;
 - all sources tests and integration tests passed with all targets and features;
 - strict all-target/all-feature sources Clippy passed; and
 - formatting and diff checks passed.

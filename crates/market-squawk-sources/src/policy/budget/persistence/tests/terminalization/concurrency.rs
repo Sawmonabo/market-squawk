@@ -14,8 +14,7 @@ struct BlockingBudgetFixture {
 
 fn blocking_budget() -> TestResult<BlockingBudgetFixture> {
     let store = Arc::new(BlockingStore::default());
-    let session =
-        AuthorityDurabilitySession::open(store.clone(), Timestamp::from_unix_nanos(100))?;
+    let session = AuthorityDurabilitySession::open(store.clone(), Timestamp::from_unix_nanos(100))?;
     let declaration = declaration(1)?;
     let clock = Arc::new(SwitchableClock::new(100, 0));
     let observation = clock
@@ -86,10 +85,7 @@ fn already_admitted_faults_have_one_terminal_writer_for_success_and_failure() ->
         store.block_next_store();
         let owner_budget = budget.clone();
         let owner = std::thread::spawn(move || {
-            owner_budget.terminal_fault(
-                BudgetUnavailableReason::StateCorrupt,
-                &owner_operation,
-            )
+            owner_budget.terminal_fault(BudgetUnavailableReason::StateCorrupt, &owner_operation)
         });
         let blocked_store = store.wait_until_blocked()?;
         assert!(!session.is_available());
@@ -102,10 +98,10 @@ fn already_admitted_faults_have_one_terminal_writer_for_success_and_failure() ->
                 let result_tx = result_tx.clone();
                 std::thread::spawn(move || {
                     result_tx
-                        .send(peer_budget.terminal_fault(
-                            BudgetUnavailableReason::StateCorrupt,
-                            &operation,
-                        ))
+                        .send(
+                            peer_budget
+                                .terminal_fault(BudgetUnavailableReason::StateCorrupt, &operation),
+                        )
                         .is_ok()
                 })
             })
@@ -172,11 +168,7 @@ fn close_winner_rejects_update_and_registry_writes_without_extra_io() -> TestRes
     let update_tx = result_tx.clone();
     let update = std::thread::spawn(move || {
         update_tx
-            .send(updating.update_budget(
-                slot,
-                checkpoint,
-                Timestamp::from_unix_nanos(200),
-            ))
+            .send(updating.update_budget(slot, checkpoint, Timestamp::from_unix_nanos(200)))
             .is_ok()
     });
     let persisting = session.clone();
@@ -238,8 +230,7 @@ fn normal_store_failure_retains_store_for_one_terminal_attempt() -> TestResult {
     ));
     assert_eq!(store.store_calls.load(Ordering::Acquire), calls_before + 2);
     store.reject_stores.store(false, Ordering::Release);
-    let restarted =
-        AuthorityDurabilitySession::open(store, Timestamp::from_unix_nanos(200))?;
+    let restarted = AuthorityDurabilitySession::open(store, Timestamp::from_unix_nanos(200))?;
     assert!(restarted.recovered_unclean());
     Ok(())
 }
@@ -279,7 +270,10 @@ fn explicit_and_drop_release_retain_admission_during_blocked_terminal_write() ->
             ),
             Err(AuthorityPersistenceError::SessionUnavailable)
         );
-        assert!(matches!(release_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        assert!(matches!(
+            release_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
         assert_eq!(store.store_calls.load(Ordering::Acquire), calls_before + 1);
         blocked_store.release()?;
         release_rx.recv_timeout(TEST_WATCHDOG_TIMEOUT)?;
@@ -305,9 +299,7 @@ fn generation_exhaustion_has_one_terminal_write_and_no_later_normal_write() -> T
     let calls_before = store.store_calls.load(Ordering::Acquire);
     assert!(matches!(
         budget.try_acquire(),
-        BudgetDecision::Unavailable(
-            BudgetUnavailableReason::AvailabilityGenerationExhausted
-        )
+        BudgetDecision::Unavailable(BudgetUnavailableReason::AvailabilityGenerationExhausted)
     ));
     assert_eq!(store.store_calls.load(Ordering::Acquire), calls_before + 1);
     assert_eq!(

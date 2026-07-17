@@ -37,7 +37,6 @@ mod tests {
                 .map_err(|_| BudgetUnavailableReason::StatePoisoned)
         }
 
-
         fn shared_allocation_charge(&self) -> usize {
             std::mem::size_of::<Self>() + crate::conservative_arc_control_block_charge::<Self>()
         }
@@ -87,7 +86,6 @@ mod tests {
                 .map_err(|_| BudgetUnavailableReason::ClockUnavailable)
         }
 
-
         fn shared_allocation_charge(&self) -> usize {
             std::mem::size_of::<Self>() + crate::conservative_arc_control_block_charge::<Self>()
         }
@@ -125,9 +123,7 @@ mod tests {
                 Self::ClockRegression => BudgetUnavailableReason::ClockRegression,
                 Self::CoolingDown => BudgetUnavailableReason::CoolingDown,
                 Self::DeadlineOverflow => BudgetUnavailableReason::DeadlineOverflow,
-                Self::RequestWindowExhausted => {
-                    BudgetUnavailableReason::RequestWindowExhausted
-                }
+                Self::RequestWindowExhausted => BudgetUnavailableReason::RequestWindowExhausted,
                 Self::ConcurrencyExhausted => BudgetUnavailableReason::ConcurrencyExhausted,
             }
         }
@@ -388,8 +384,7 @@ mod tests {
     fn consuming_final_available_slot_revokes_prior_availability_lease()
     -> Result<(), NetworkPolicyError> {
         let clock = Arc::new(ManualClock::new(0, 0));
-        let budget =
-            SharedProviderBudget::new(policy()?, MonotonicInstant::from_nanos(0), clock);
+        let budget = SharedProviderBudget::new(policy()?, MonotonicInstant::from_nanos(0), clock);
         let prior = budget
             .availability_lease()
             .map_err(|_| NetworkPolicyError::InvalidBudgetPolicy)?;
@@ -408,8 +403,7 @@ mod tests {
     fn availability_generation_overflow_terminalizes_all_future_operations()
     -> Result<(), NetworkPolicyError> {
         let clock = Arc::new(ManualClock::new(0, 0));
-        let budget =
-            SharedProviderBudget::new(policy()?, MonotonicInstant::from_nanos(0), clock);
+        let budget = SharedProviderBudget::new(policy()?, MonotonicInstant::from_nanos(0), clock);
         budget
             .allocation
             .availability_generation
@@ -440,9 +434,7 @@ mod tests {
         ));
         assert!(matches!(
             budget.try_acquire(),
-            BudgetDecision::Unavailable(
-                BudgetUnavailableReason::AvailabilityGenerationExhausted
-            )
+            BudgetDecision::Unavailable(BudgetUnavailableReason::AvailabilityGenerationExhausted)
         ));
         assert_eq!(
             budget.record_success(),
