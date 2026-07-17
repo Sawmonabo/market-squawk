@@ -110,9 +110,18 @@ impl ArtifactRoot {
 
     /// Validates a canonical portable reference and binds it to this open directory capability.
     ///
-    /// References use `/` separators and lowercase ASCII filename components. Platform path
-    /// normalization, alternate separators, device names, and filesystem-dependent characters are
-    /// rejected rather than normalized into aliases.
+    /// References contain at most 32 `/`-separated UTF-8 components. Each component contains at
+    /// most 255 bytes, starts with an ASCII lowercase letter or digit, continues with only ASCII
+    /// lowercase letters, digits, `-`, `_`, or `.`, and does not end in `.`. Empty, `.`, `..`,
+    /// repeated-separator, trailing-separator, alternate-separator, Windows device-name, and
+    /// platform-reinterpreted inputs are rejected rather than normalized into aliases.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArtifactPathError::AbsolutePath`] for an absolute host path,
+    /// [`ArtifactPathError::NonUtf8Component`] when the complete reference is not UTF-8, and
+    /// [`ArtifactPathError::UnsafeComponent`] when the reference violates the canonical grammar,
+    /// its component or depth bounds, or the host platform would parse it differently.
     pub fn resolve(
         &self,
         relative: impl AsRef<Path>,
