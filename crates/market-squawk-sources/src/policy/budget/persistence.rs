@@ -70,6 +70,7 @@ fn map_local_store_error(
         | LocalAuthorityStateStoreError::Allocation
         | LocalAuthorityStateStoreError::WriterUnavailable
         | LocalAuthorityStateStoreError::AtomicReplaceUnsupported
+        | LocalAuthorityStateStoreError::SecureRootUnsupported
         | LocalAuthorityStateStoreError::VerificationFailed
         | LocalAuthorityStateStoreError::Io { .. } => AuthorityStateStoreError::Unavailable,
     }

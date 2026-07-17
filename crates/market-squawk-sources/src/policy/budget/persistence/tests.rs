@@ -19,6 +19,21 @@ mod tests {
     #[path = "terminalization.rs"]
     mod terminalization;
 
+    #[test]
+    fn unsupported_platform_capabilities_map_to_store_unavailability() {
+        use market_squawk_platform::LocalAuthorityStateStoreError;
+
+        for error in [
+            LocalAuthorityStateStoreError::AtomicReplaceUnsupported,
+            LocalAuthorityStateStoreError::SecureRootUnsupported,
+        ] {
+            assert_eq!(
+                map_local_store_error(error),
+                AuthorityStateStoreError::Unavailable
+            );
+        }
+    }
+
     #[derive(Debug, Default)]
     struct MemoryStore {
         payload: Mutex<Option<Vec<u8>>>,
