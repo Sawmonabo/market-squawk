@@ -6,12 +6,13 @@ use bytes::Bytes;
 use chrono::Utc;
 use rust_decimal::Decimal;
 use serde_json::json;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
     domain::{BookChange, MarketEvent, PriceLevel, Side},
-    source::{CaptureContext, MarketSource, SourceRunOutcome},
+    source::{CaptureContext, MarketSource, SourceRunOutcome, send_event_until_cancelled},
 };
 
 #[derive(Debug, Clone)]
@@ -36,9 +37,9 @@ impl MarketSource for MockSource {
         &mut self,
         capture: CaptureContext,
         output: mpsc::Sender<MarketEvent>,
-        cancel: watch::Receiver<bool>,
+        cancellation: CancellationToken,
     ) -> Result<SourceRunOutcome> {
-        if *cancel.borrow() {
+        if cancellation.is_cancelled() {
             return Ok(SourceRunOutcome::Cancelled);
         }
         let source = "mock".to_owned();
@@ -66,18 +67,24 @@ impl MarketSource for MockSource {
             received_at,
             Bytes::from(snapshot_payload),
         )?;
-        output
-            .send(MarketEvent::BookSnapshot {
+        if !send_event_until_cancelled(
+            &output,
+            MarketEvent::BookSnapshot {
                 source: source.clone(),
                 product: self.product.clone(),
                 bids,
                 asks,
                 received_at,
-            })
-            .await?;
+            },
+            &cancellation,
+        )
+        .await?
+        {
+            return Ok(SourceRunOutcome::Cancelled);
+        }
 
         for index in 0..self.events {
-            if *cancel.borrow() {
+            if cancellation.is_cancelled() {
                 return Ok(SourceRunOutcome::Cancelled);
             }
             let sequence = u64::try_from(index)?.saturating_add(2);
@@ -105,15 +112,21 @@ impl MarketSource for MockSource {
                 received_at,
                 Bytes::from(raw),
             )?;
-            output
-                .send(MarketEvent::BookDelta {
+            if !send_event_until_cancelled(
+                &output,
+                MarketEvent::BookDelta {
                     source: source.clone(),
                     product: self.product.clone(),
                     changes: vec![BookChange { side, price, size }],
                     exchange_at: Some(received_at),
                     received_at,
-                })
-                .await?;
+                },
+                &cancellation,
+            )
+            .await?
+            {
+                return Ok(SourceRunOutcome::Cancelled);
+            }
         }
 
         Ok(SourceRunOutcome::Completed)

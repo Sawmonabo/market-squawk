@@ -9,7 +9,8 @@ use market_squawk_platform::{
     DiagnosticCaptureBundle, DiagnosticCaptureFrame, DiagnosticCaptureReceipt, RawCapturePublisher,
     RawCaptureRecord,
 };
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::domain::MarketEvent;
@@ -110,6 +111,21 @@ pub trait MarketSource: Send {
         &mut self,
         capture: CaptureContext,
         events: mpsc::Sender<MarketEvent>,
-        cancel: watch::Receiver<bool>,
+        cancellation: CancellationToken,
     ) -> anyhow::Result<SourceRunOutcome>;
+}
+
+pub(crate) async fn send_event_until_cancelled(
+    events: &mpsc::Sender<MarketEvent>,
+    event: MarketEvent,
+    cancellation: &CancellationToken,
+) -> anyhow::Result<bool> {
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => Ok(false),
+        result = events.send(event) => {
+            result?;
+            Ok(true)
+        }
+    }
 }

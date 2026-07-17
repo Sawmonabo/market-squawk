@@ -6,7 +6,9 @@ use chrono::Utc;
 use market_squawk::{
     DiagnosticMarketEvent as MarketEvent,
     source::{CaptureContext, MarketSource, SourceRunOutcome},
-    source_supervisor::SourceSupervisor,
+    source_supervisor::{
+        SourceShutdownOutcome, SourceSupervisor, SourceTaskFailureKind, SupervisedSourceTask,
+    },
 };
 use market_squawk_domain::{
     CaptureAuthorityIdentity, CaptureIntegrityState, ConnectionGeneration, MetadataRevision,
@@ -17,7 +19,8 @@ use market_squawk_platform::{
     DiagnosticCaptureBundle, DiagnosticCaptureReceipt, MemoryCaptureSink, RawCaptureControl,
     RawCapturePublisher, raw_capture_channel, spawn_capture_writer,
 };
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 #[derive(Debug)]
@@ -32,7 +35,7 @@ impl MarketSource for ReconnectOnceSource {
         &mut self,
         capture: CaptureContext,
         _events: mpsc::Sender<MarketEvent>,
-        _cancel: watch::Receiver<bool>,
+        _cancel: CancellationToken,
     ) -> anyhow::Result<SourceRunOutcome> {
         self.sessions = self.sessions.saturating_add(1);
         let receipt = capture.publish(
@@ -118,7 +121,7 @@ impl MarketSource for ImmediateOutcomeSource {
         &mut self,
         _capture: CaptureContext,
         _events: mpsc::Sender<MarketEvent>,
-        _cancel: watch::Receiver<bool>,
+        _cancel: CancellationToken,
     ) -> anyhow::Result<SourceRunOutcome> {
         Ok(self.0)
     }
@@ -133,7 +136,7 @@ impl MarketSource for ErrorSource {
         &mut self,
         _capture: CaptureContext,
         _events: mpsc::Sender<MarketEvent>,
-        _cancel: watch::Receiver<bool>,
+        _cancel: CancellationToken,
     ) -> anyhow::Result<SourceRunOutcome> {
         Err(anyhow::anyhow!("deterministic source failure"))
     }
@@ -148,9 +151,28 @@ impl MarketSource for HangingSource {
         &mut self,
         _capture: CaptureContext,
         _events: mpsc::Sender<MarketEvent>,
-        _cancel: watch::Receiver<bool>,
+        _cancel: CancellationToken,
     ) -> anyhow::Result<SourceRunOutcome> {
         std::future::pending().await
+    }
+}
+
+#[derive(Debug)]
+struct ReconnectForeverSource {
+    sessions: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait]
+impl MarketSource for ReconnectForeverSource {
+    async fn run_session(
+        &mut self,
+        _capture: CaptureContext,
+        _events: mpsc::Sender<MarketEvent>,
+        _cancel: CancellationToken,
+    ) -> anyhow::Result<SourceRunOutcome> {
+        self.sessions
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Ok(SourceRunOutcome::ReconnectRequired)
     }
 }
 
@@ -175,7 +197,7 @@ async fn only_the_supervisor_rotates_after_a_typed_reconnect_outcome()
     let supervisor =
         SourceSupervisor::new(publisher.clone(), control, identity.clone(), connection_id);
     let (events, _event_receiver) = mpsc::channel(8);
-    let (_cancel_sender, cancel) = watch::channel(false);
+    let cancel = CancellationToken::new();
 
     tokio::time::timeout(
         Duration::from_secs(3),
@@ -213,7 +235,7 @@ async fn normal_and_cancelled_source_completion_invalidate_the_active_allocation
         } = activated_capture()?;
         let supervisor = SourceSupervisor::new(publisher.clone(), control, identity, connection_id);
         let (events, _event_receiver) = mpsc::channel(1);
-        let (_cancel_sender, cancel) = watch::channel(false);
+        let cancel = CancellationToken::new();
 
         supervisor
             .run(Box::new(ImmediateOutcomeSource(outcome)), events, cancel)
@@ -243,7 +265,7 @@ async fn source_error_invalidates_the_active_allocation() -> Result<(), Box<dyn 
     } = activated_capture()?;
     let supervisor = SourceSupervisor::new(publisher.clone(), control, identity, connection_id);
     let (events, _event_receiver) = mpsc::channel(1);
-    let (_cancel_sender, cancel) = watch::channel(false);
+    let cancel = CancellationToken::new();
 
     let error = supervisor.run(Box::new(ErrorSource), events, cancel).await;
 
@@ -271,7 +293,7 @@ async fn aborting_the_supervisor_invalidates_the_active_allocation()
     } = activated_capture()?;
     let supervisor = SourceSupervisor::new(publisher.clone(), control, identity, connection_id);
     let (events, _event_receiver) = mpsc::channel(1);
-    let (_cancel_sender, cancel) = watch::channel(false);
+    let cancel = CancellationToken::new();
     let task = tokio::spawn(supervisor.run(Box::new(HangingSource), events, cancel));
     tokio::task::yield_now().await;
     assert_eq!(publisher.integrity(), CaptureIntegrityState::Healthy);
@@ -285,6 +307,124 @@ async fn aborting_the_supervisor_invalidates_the_active_allocation()
     assert!(join_error.is_cancelled());
     assert_eq!(publisher.integrity(), CaptureIntegrityState::Incomplete);
     assert_eq!(publisher.accounting_invariant_failures(), 0);
+    assert!(
+        !shutdown_and_reap(writer_handle)
+            .await?
+            .outcome()
+            .is_incomplete()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn supervisor_cancellation_preempts_and_reaps_a_token_ignoring_source_session()
+-> Result<(), Box<dyn std::error::Error>> {
+    let ActivatedCapture {
+        publisher,
+        control,
+        writer_handle,
+        identity,
+        connection_id,
+    } = activated_capture()?;
+    let supervisor = SourceSupervisor::new(publisher.clone(), control, identity, connection_id);
+    let (events, _event_receiver) = mpsc::channel(1);
+    let mut task = SupervisedSourceTask::spawn(supervisor, Box::new(HangingSource), events);
+    tokio::task::yield_now().await;
+
+    let shutdown = tokio::spawn(async move {
+        let outcome = task.shutdown(Duration::from_millis(20)).await;
+        (outcome, task.is_reaped())
+    });
+    let (outcome, reaped) = tokio::time::timeout(Duration::from_secs(1), shutdown).await??;
+
+    assert_eq!(outcome?, SourceShutdownOutcome::Graceful);
+    assert!(reaped);
+    assert_eq!(publisher.integrity(), CaptureIntegrityState::Incomplete);
+    assert!(
+        !shutdown_and_reap(writer_handle)
+            .await?
+            .outcome()
+            .is_incomplete()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn source_task_reports_cooperative_completion_and_typed_failure()
+-> Result<(), Box<dyn std::error::Error>> {
+    for (source, expect_failure) in [
+        (
+            Box::new(ImmediateOutcomeSource(SourceRunOutcome::Completed)) as Box<dyn MarketSource>,
+            false,
+        ),
+        (Box::new(ErrorSource) as Box<dyn MarketSource>, true),
+    ] {
+        let ActivatedCapture {
+            publisher,
+            control,
+            writer_handle,
+            identity,
+            connection_id,
+        } = activated_capture()?;
+        let supervisor = SourceSupervisor::new(publisher, control, identity, connection_id);
+        let (events, _event_receiver) = mpsc::channel(1);
+        let mut task = SupervisedSourceTask::spawn(supervisor, source, events);
+
+        let outcome = task.wait().await;
+        if expect_failure {
+            let failure = match outcome {
+                SourceShutdownOutcome::TaskFailed(failure) => failure,
+                other => return Err(format!("unexpected source outcome: {other:?}").into()),
+            };
+            assert_eq!(failure.kind(), SourceTaskFailureKind::Source);
+            assert_eq!(failure.detail(), "supervised source returned an error");
+        } else {
+            assert_eq!(outcome, SourceShutdownOutcome::Graceful);
+        }
+        assert!(task.is_reaped());
+        assert!(
+            !shutdown_and_reap(writer_handle)
+                .await?
+                .outcome()
+                .is_incomplete()
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancellation_preempts_reconnect_backoff_before_generation_rotation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let ActivatedCapture {
+        publisher,
+        control,
+        writer_handle,
+        identity,
+        connection_id,
+    } = activated_capture()?;
+    let supervisor = SourceSupervisor::new(publisher.clone(), control, identity, connection_id);
+    let (events, _event_receiver) = mpsc::channel(1);
+    let sessions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut task = SupervisedSourceTask::spawn(
+        supervisor,
+        Box::new(ReconnectForeverSource {
+            sessions: Arc::clone(&sessions),
+        }),
+        events,
+    );
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while sessions.load(std::sync::atomic::Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+
+    let outcome = task.shutdown(Duration::from_secs(1)).await?;
+
+    assert_eq!(outcome, SourceShutdownOutcome::Graceful);
+    assert!(task.is_reaped());
+    assert_eq!(sessions.load(std::sync::atomic::Ordering::Acquire), 1);
+    assert_eq!(publisher.identity().connection_generation().get(), 1);
     assert!(
         !shutdown_and_reap(writer_handle)
             .await?

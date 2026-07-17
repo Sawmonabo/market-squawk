@@ -12,15 +12,16 @@ use market_squawk_domain::{
 };
 use market_squawk_platform::{
     CaptureShutdownStatus, CaptureWriterPolicy, DiagnosticCaptureBundle, LocalPaths,
-    raw_capture_channel, spawn_capture_writer,
+    MemoryCaptureSink, raw_capture_channel, spawn_capture_writer,
 };
 use serde_json::Value;
 use tempfile::tempdir;
 use tokio::{
     net::TcpListener,
-    sync::{mpsc, watch},
+    sync::{mpsc, oneshot},
 };
 use tokio_tungstenite::{accept_async, tungstenite::Message};
+use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
 async fn coinbase_source_journals_and_publishes_local_websocket_messages() -> Result<()> {
@@ -52,14 +53,17 @@ async fn coinbase_source_journals_and_publishes_local_websocket_messages() -> Re
             ))
             .await?;
 
-        while let Some(message) = socket.next().await {
-            match message? {
-                Message::Close(_) => break,
-                Message::Ping(payload) => socket.send(Message::Pong(payload)).await?,
-                _ => {}
+        let saw_client_close = loop {
+            match socket.next().await {
+                Some(Ok(Message::Close(_))) => break true,
+                Some(Ok(Message::Ping(payload))) => {
+                    socket.send(Message::Pong(payload)).await?;
+                }
+                Some(Ok(_)) => {}
+                Some(Err(_)) | None => break false,
             }
-        }
-        Ok::<(), anyhow::Error>(())
+        };
+        Ok::<bool, anyhow::Error>(saw_client_close)
     });
 
     let directory = tempdir()?;
@@ -83,7 +87,8 @@ async fn coinbase_source_journals_and_publishes_local_websocket_messages() -> Re
     )?;
     control.activate_initial()?;
     let (event_sender, mut event_receiver) = mpsc::channel(32);
-    let (cancel_sender, cancel_receiver) = watch::channel(false);
+    let cancellation = CancellationToken::new();
+    let source_cancellation = cancellation.clone();
     let mut source: Box<dyn MarketSource> = Box::new(
         CoinbaseSource::new(vec!["BTC-USD".to_owned()]).with_url(format!("ws://{address}")),
     );
@@ -93,7 +98,7 @@ async fn coinbase_source_journals_and_publishes_local_websocket_messages() -> Re
             .run_session(
                 CaptureContext::new(publisher, identity, connection_id),
                 event_sender,
-                cancel_receiver,
+                source_cancellation,
             )
             .await
     });
@@ -122,7 +127,7 @@ async fn coinbase_source_journals_and_publishes_local_websocket_messages() -> Re
     .await
     .context("source messages arrived before timeout")??;
 
-    cancel_sender.send(true)?;
+    cancellation.cancel();
     source_task.await??;
     let mut pending_capture = capture_handle.shutdown(Duration::from_secs(2));
     assert_eq!(
@@ -133,11 +138,123 @@ async fn coinbase_source_journals_and_publishes_local_websocket_messages() -> Re
         .try_reap()?
         .ok_or_else(|| anyhow!("terminated capture worker did not retain a final report"))?;
     assert!(!capture_termination.outcome().is_incomplete());
-    server.await??;
+    let saw_client_close = server.await??;
+    assert!(
+        !saw_client_close,
+        "client cancellation must immediately drop the transport without awaiting a close write"
+    );
 
     let records = JournalReader::open(&journal_path)?.read_all()?;
     assert_eq!(records.len(), 2);
     assert!(records[0].payload().starts_with(b"{\"type\":\"snapshot\""));
     assert!(records[1].payload().starts_with(b"{\"type\":\"heartbeat\""));
+    Ok(())
+}
+
+fn test_capture() -> Result<(
+    CaptureContext,
+    market_squawk_platform::CaptureWriterHandle<DiagnosticCaptureBundle>,
+)> {
+    let identity = CaptureAuthorityIdentity::new(
+        SourceId::try_from("coinbase-exchange")?,
+        MetadataRevision::new(SourceIdentifier::try_from("test-v1")?),
+        SourceIdentifier::try_from("test-session")?,
+        ConnectionGeneration::new(1)?,
+    );
+    let connection_id = uuid::Uuid::new_v4();
+    let (publisher, mut control, writer) = raw_capture_channel(
+        NonZeroUsize::new(8).ok_or_else(|| anyhow!("invalid test capacity"))?,
+        DiagnosticCaptureBundle::new(identity.clone()),
+    );
+    let handle = spawn_capture_writer(
+        writer,
+        MemoryCaptureSink::default(),
+        CaptureWriterPolicy::default(),
+    )?;
+    control.activate_initial()?;
+    Ok((
+        CaptureContext::new(publisher, identity, connection_id),
+        handle,
+    ))
+}
+
+async fn shutdown_memory_capture(
+    handle: market_squawk_platform::CaptureWriterHandle<DiagnosticCaptureBundle>,
+) -> Result<()> {
+    let mut pending = handle.shutdown(Duration::from_secs(1));
+    assert_eq!(
+        pending.wait_until_deadline().await,
+        CaptureShutdownStatus::WorkerTerminated
+    );
+    let report = pending
+        .try_reap()?
+        .ok_or_else(|| anyhow!("capture worker did not retain its termination report"))?;
+    assert!(!report.outcome().is_incomplete());
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancellation_preempts_a_full_source_status_channel() -> Result<()> {
+    let (capture, handle) = test_capture()?;
+    let (events, _receiver) = mpsc::channel(1);
+    events
+        .send(MarketEvent::SourceStatus {
+            source: "occupied".to_owned(),
+            status: "occupied".to_owned(),
+            detail: None,
+            received_at: chrono::Utc::now(),
+        })
+        .await?;
+    let cancellation = CancellationToken::new();
+    let mut source = CoinbaseSource::new(vec!["BTC-USD".to_owned()]);
+    let task_cancellation = cancellation.clone();
+    let source_task =
+        tokio::spawn(async move { source.run_session(capture, events, task_cancellation).await });
+    tokio::task::yield_now().await;
+
+    cancellation.cancel();
+    let outcome = tokio::time::timeout(Duration::from_secs(1), source_task).await???;
+
+    assert_eq!(outcome, market_squawk::source::SourceRunOutcome::Cancelled);
+    shutdown_memory_capture(handle).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancellation_preempts_a_stalled_websocket_handshake() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let (accepted_sender, accepted_receiver) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (_stream, _) = listener.accept().await?;
+        let _ = accepted_sender.send(());
+        std::future::pending::<Result<()>>().await
+    });
+    let (capture, handle) = test_capture()?;
+    let (events, mut receiver) = mpsc::channel(4);
+    let cancellation = CancellationToken::new();
+    let mut source =
+        CoinbaseSource::new(vec!["BTC-USD".to_owned()]).with_url(format!("ws://{address}"));
+    let task_cancellation = cancellation.clone();
+    let source_task =
+        tokio::spawn(async move { source.run_session(capture, events, task_cancellation).await });
+    let status = receiver.recv().await.context("connecting status")?;
+    assert!(matches!(
+        status,
+        MarketEvent::SourceStatus { ref status, .. } if status == "connecting"
+    ));
+    accepted_receiver.await?;
+
+    cancellation.cancel();
+    let outcome = tokio::time::timeout(Duration::from_secs(1), source_task).await???;
+
+    assert_eq!(outcome, market_squawk::source::SourceRunOutcome::Cancelled);
+    server.abort();
+    let join_error = server
+        .await
+        .err()
+        .context("server unexpectedly completed")?;
+    assert!(join_error.is_cancelled());
+    shutdown_memory_capture(handle).await?;
     Ok(())
 }

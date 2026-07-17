@@ -1,23 +1,86 @@
-use std::{str::FromStr, sync::Arc};
+use std::{future::Future, str::FromStr, sync::Arc};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{Sink, SinkExt, StreamExt};
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
     domain::{BookChange, MarketEvent, PriceLevel, Side},
-    source::{CaptureContext, MarketSource, SourceRunOutcome},
+    source::{CaptureContext, MarketSource, SourceRunOutcome, send_event_until_cancelled},
 };
 
 const SOURCE_NAME: &str = "coinbase-exchange";
 const DEFAULT_URL: &str = "wss://ws-feed.exchange.coinbase.com";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CancellableOperation<T> {
+    Completed(T),
+    Cancelled,
+}
+
+#[derive(Debug)]
+enum ControlMessageDisposition {
+    Data(Message),
+    Continue,
+    ProviderClosed,
+    Cancelled,
+}
+
+async fn await_or_cancel<T>(
+    cancellation: &CancellationToken,
+    operation: impl Future<Output = T>,
+) -> CancellableOperation<T> {
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => CancellableOperation::Cancelled,
+        output = operation => CancellableOperation::Completed(output),
+    }
+}
+
+async fn handle_control_message<S, E>(
+    message: Message,
+    write: &mut S,
+    cancellation: &CancellationToken,
+) -> Result<ControlMessageDisposition>
+where
+    S: Sink<Message, Error = E> + Unpin,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    match message {
+        Message::Ping(payload) => {
+            match await_or_cancel(cancellation, write.send(Message::Pong(payload))).await {
+                CancellableOperation::Completed(result) => result.map_err(anyhow::Error::new)?,
+                CancellableOperation::Cancelled => {
+                    return Ok(ControlMessageDisposition::Cancelled);
+                }
+            }
+            Ok(ControlMessageDisposition::Continue)
+        }
+        Message::Close(frame) => {
+            match await_or_cancel(cancellation, write.send(Message::Close(frame))).await {
+                CancellableOperation::Completed(result) => result.map_err(anyhow::Error::new)?,
+                CancellableOperation::Cancelled => {
+                    return Ok(ControlMessageDisposition::Cancelled);
+                }
+            }
+            Ok(ControlMessageDisposition::ProviderClosed)
+        }
+        message => Ok(ControlMessageDisposition::Data(message)),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConnectionExit {
+    Cancelled,
+}
 
 #[derive(Debug, Clone)]
 pub struct CoinbaseSource {
@@ -49,24 +112,31 @@ impl MarketSource for CoinbaseSource {
         &mut self,
         capture: CaptureContext,
         events: mpsc::Sender<MarketEvent>,
-        mut cancel: watch::Receiver<bool>,
+        cancellation: CancellationToken,
     ) -> Result<SourceRunOutcome> {
-        if *cancel.borrow() {
+        if cancellation.is_cancelled() {
             return Ok(SourceRunOutcome::Cancelled);
         }
-        let result = self.run_connection(&capture, &events, &mut cancel).await;
-        if *cancel.borrow() {
-            return Ok(SourceRunOutcome::Cancelled);
+        let result = self.run_connection(&capture, &events, &cancellation).await;
+        match result {
+            Ok(ConnectionExit::Cancelled) => return Ok(SourceRunOutcome::Cancelled),
+            Err(_error) if cancellation.is_cancelled() => return Ok(SourceRunOutcome::Cancelled),
+            Err(_error) => {}
         }
-        let detail = result.err().map(|error| format!("{error:#}"));
-        events
-            .send(MarketEvent::SourceStatus {
+        if !send_event_until_cancelled(
+            &events,
+            MarketEvent::SourceStatus {
                 source: SOURCE_NAME.to_owned(),
                 status: "disconnected".to_owned(),
-                detail,
+                detail: Some("Coinbase Exchange session ended; reconnect required".to_owned()),
                 received_at: Utc::now(),
-            })
-            .await?;
+            },
+            &cancellation,
+        )
+        .await?
+        {
+            return Ok(SourceRunOutcome::Cancelled);
+        }
         Ok(SourceRunOutcome::ReconnectRequired)
     }
 }
@@ -76,22 +146,32 @@ impl CoinbaseSource {
         &self,
         capture: &CaptureContext,
         events: &mpsc::Sender<MarketEvent>,
-        cancel: &mut watch::Receiver<bool>,
-    ) -> Result<()> {
+        cancellation: &CancellationToken,
+    ) -> Result<ConnectionExit> {
         validate_products(&self.products)?;
         let source_label: Arc<str> = Arc::from(SOURCE_NAME);
-        events
-            .send(MarketEvent::SourceStatus {
+        if !send_event_until_cancelled(
+            events,
+            MarketEvent::SourceStatus {
                 source: SOURCE_NAME.to_owned(),
                 status: "connecting".to_owned(),
-                detail: Some(self.url.clone()),
+                detail: Some("Coinbase Exchange WebSocket connection".to_owned()),
                 received_at: Utc::now(),
-            })
-            .await?;
+            },
+            cancellation,
+        )
+        .await?
+        {
+            return Ok(ConnectionExit::Cancelled);
+        }
 
-        let (socket, _) = connect_async(self.url.as_str())
-            .await
-            .with_context(|| format!("failed to connect to {}", self.url))?;
+        let (socket, _) =
+            match await_or_cancel(cancellation, connect_async(self.url.as_str())).await {
+                CancellableOperation::Completed(result) => {
+                    result.with_context(|| format!("failed to connect to {}", self.url))?
+                }
+                CancellableOperation::Cancelled => return Ok(ConnectionExit::Cancelled),
+            };
         let (mut write, mut read) = socket.split();
 
         let subscription = json!({
@@ -99,64 +179,81 @@ impl CoinbaseSource {
             "product_ids": &self.products,
             "channels": ["level2", "heartbeat", "matches"]
         });
-        write
-            .send(Message::Text(subscription.to_string().into()))
-            .await?;
+        match await_or_cancel(
+            cancellation,
+            write.send(Message::Text(subscription.to_string().into())),
+        )
+        .await
+        {
+            CancellableOperation::Completed(result) => result?,
+            CancellableOperation::Cancelled => return Ok(ConnectionExit::Cancelled),
+        }
 
-        events
-            .send(MarketEvent::SourceStatus {
+        if !send_event_until_cancelled(
+            events,
+            MarketEvent::SourceStatus {
                 source: SOURCE_NAME.to_owned(),
                 status: "connected".to_owned(),
                 detail: None,
                 received_at: Utc::now(),
-            })
-            .await?;
+            },
+            cancellation,
+        )
+        .await?
+        {
+            return Ok(ConnectionExit::Cancelled);
+        }
 
         loop {
-            tokio::select! {
-                changed = cancel.changed() => {
-                    if changed.is_err() || *cancel.borrow() {
-                        let _ = write.send(Message::Close(None)).await;
-                        return Ok(());
+            let message = match await_or_cancel(cancellation, read.next()).await {
+                CancellableOperation::Completed(Some(message)) => message?,
+                CancellableOperation::Completed(None) => {
+                    bail!("Coinbase WebSocket stream ended");
+                }
+                CancellableOperation::Cancelled => return Ok(ConnectionExit::Cancelled),
+            };
+            let message = match handle_control_message(message, &mut write, cancellation).await? {
+                ControlMessageDisposition::Data(message) => message,
+                ControlMessageDisposition::Continue => continue,
+                ControlMessageDisposition::ProviderClosed => {
+                    bail!("Coinbase closed the connection");
+                }
+                ControlMessageDisposition::Cancelled => {
+                    return Ok(ConnectionExit::Cancelled);
+                }
+            };
+            match message {
+                Message::Text(text) => {
+                    let received_at = Utc::now();
+                    let payload: Bytes = text.into();
+                    let _capture_receipt = capture.publish(
+                        Uuid::new_v4(),
+                        Arc::clone(&source_label),
+                        None,
+                        None,
+                        received_at,
+                        payload.clone(),
+                    )?;
+                    let parsed = serde_json::from_slice::<Value>(&payload);
+                    let parsed = parsed.context("Coinbase sent invalid JSON")?;
+                    if let Some(event) = decode_message(&parsed, received_at)? {
+                        let is_error = matches!(
+                            event,
+                            MarketEvent::SourceStatus { ref status, .. } if status == "error"
+                        );
+                        if !send_event_until_cancelled(events, event, cancellation).await? {
+                            return Ok(ConnectionExit::Cancelled);
+                        }
+                        if is_error {
+                            bail!("Coinbase returned an error message");
+                        }
                     }
                 }
-                message = read.next() => {
-                    let message = match message {
-                        Some(message) => message,
-                        None => bail!("Coinbase WebSocket stream ended"),
-                    };
-                    match message? {
-                        Message::Text(text) => {
-                            let received_at = Utc::now();
-                            let payload: Bytes = text.into();
-                            let _capture_receipt = capture.publish(
-                                Uuid::new_v4(),
-                                Arc::clone(&source_label),
-                                None,
-                                None,
-                                received_at,
-                                payload.clone(),
-                            )?;
-                            let parsed = serde_json::from_slice::<Value>(&payload);
-                            let parsed = parsed.context("Coinbase sent invalid JSON")?;
-                            if let Some(event) = decode_message(&parsed, received_at)? {
-                                let is_error = matches!(
-                                    event,
-                                    MarketEvent::SourceStatus { ref status, .. } if status == "error"
-                                );
-                                events.send(event).await?;
-                                if is_error {
-                                    bail!("Coinbase returned an error message");
-                                }
-                            }
-                        }
-                        Message::Ping(payload) => write.send(Message::Pong(payload)).await?,
-                        Message::Close(frame) => {
-                            bail!("Coinbase closed the connection: {frame:?}");
-                        }
-                        Message::Binary(_) | Message::Pong(_) | Message::Frame(_) => {}
-                    }
-                }
+                Message::Binary(_)
+                | Message::Ping(_)
+                | Message::Pong(_)
+                | Message::Close(_)
+                | Message::Frame(_) => {}
             }
         }
     }
@@ -332,4 +429,118 @@ fn parse_optional_time(value: Option<&Value>) -> Result<Option<DateTime<Utc>>> {
     let parsed = DateTime::parse_from_rfc3339(raw)
         .with_context(|| format!("invalid RFC 3339 timestamp: {raw}"))?;
     Ok(Some(parsed.with_timezone(&Utc)))
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use std::{
+        io,
+        pin::Pin,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        task::{Context, Poll},
+        time::Duration,
+    };
+
+    use futures_util::Sink;
+    use tokio_tungstenite::tungstenite::{Message, protocol::CloseFrame};
+    use tokio_util::sync::CancellationToken;
+
+    use super::{
+        CancellableOperation, ControlMessageDisposition, await_or_cancel, handle_control_message,
+    };
+
+    #[derive(Debug)]
+    struct StalledMessageSink {
+        ready_polls: Arc<AtomicUsize>,
+    }
+
+    impl Sink<Message> for StalledMessageSink {
+        type Error = io::Error;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            self.ready_polls.fetch_add(1, Ordering::AcqRel);
+            Poll::Pending
+        }
+
+        fn start_send(self: Pin<&mut Self>, _item: Message) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Pending
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Pending
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_preempts_a_stalled_transport_or_channel_operation() {
+        let cancellation = CancellationToken::new();
+        let operation = await_or_cancel(&cancellation, std::future::pending::<()>());
+        tokio::pin!(operation);
+        cancellation.cancel();
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), operation).await,
+            Ok(CancellableOperation::Cancelled)
+        );
+    }
+
+    async fn assert_stalled_control_write_is_cancelled(
+        incoming: Message,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cancellation = CancellationToken::new();
+        let task_cancellation = cancellation.clone();
+        let ready_polls = Arc::new(AtomicUsize::new(0));
+        let task_ready_polls = Arc::clone(&ready_polls);
+        let task = tokio::spawn(async move {
+            let mut sink = StalledMessageSink {
+                ready_polls: task_ready_polls,
+            };
+            handle_control_message(incoming, &mut sink, &task_cancellation).await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while ready_polls.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+
+        cancellation.cancel();
+        let disposition = tokio::time::timeout(Duration::from_secs(1), task).await???;
+
+        assert!(matches!(disposition, ControlMessageDisposition::Cancelled));
+        assert!(ready_polls.load(Ordering::Acquire) > 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stalled_pong_write_is_cancelled_at_the_transport_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_stalled_control_write_is_cancelled(Message::Ping(vec![1, 2, 3].into())).await
+    }
+
+    #[tokio::test]
+    async fn stalled_provider_close_reply_is_cancelled_at_the_transport_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_stalled_control_write_is_cancelled(Message::Close(Some(CloseFrame {
+            code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Normal,
+            reason: "provider shutdown".into(),
+        })))
+        .await
+    }
 }
