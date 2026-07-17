@@ -10,9 +10,20 @@ historical datasets to originate from or reproduce the live feed.
 
 `v0.1.0` is a runnable local foundation, not a production brokerage system.
 
-Implemented now:
+Implemented production foundation contracts:
 
-- Public Coinbase Exchange WebSocket adapter
+- Rust 1.97 virtual workspace with invariant-preserving shared domain contracts
+- Distinct fair-value, market-depth, data-quality, stream-integrity, and capture-integrity types
+- Typed internal/external instrument identities, scaled financial values, provenance, and separate
+  canonical live/research observation families
+- Opaque current-source/live authority, deterministic single-writer sharding, transactional books,
+  and bounded immutable snapshots
+- Independent live and research boundaries; research storage and extraction adapters remain later
+  implementation stages and do not depend on captured live journals
+
+Runnable diagnostic compatibility capabilities:
+
+- Public Coinbase Exchange WebSocket reader with single-venue, partial coverage
 - Level 2 snapshots and updates
 - Heartbeat sequence tracking separated from order-book freshness
 - Match/trade capture
@@ -22,16 +33,14 @@ Implemented now:
 - In-memory order books
 - Midprice, spread, spread basis points, microprice, and book imbalance
 - Latched feed-quality state machine requiring a fresh snapshot after hard failures
-- Deterministic pre-trade risk checks
-- Optional paper-only momentum bot
-- Local stdio MCP server with strict schemas and per-process tool-call limiting
+- Diagnostic pre-trade calculation
+- Optional diagnostic paper-only momentum simulation
+- Local diagnostic stdio MCP server with strict schemas and per-process tool-call limiting
 - Deterministic mock source for offline verification
-- Rust 1.97 virtual workspace with invariant-preserving shared domain contracts
-- Distinct fair-value, market-depth, data-quality, stream-integrity, and capture-integrity types
-- Typed internal/external instrument identities, scaled financial values, provenance, and separate
-  canonical live/research observation families
-- Independent live and research boundaries; research storage and extraction adapters remain later
-  implementation stages and do not depend on captured live journals
+
+These compatibility capabilities are authority-free. Their app-local `QualityState::Valid` is not
+canonical `DataQuality::DirectVerified`, cannot enter the production live runtime, and can never
+authorize a production order. All bot/fill behavior described below is paper simulation only.
 
 Permanently excluded: Market Squawk will not implement identity/account rotation to evade limits,
 browser/TLS fingerprint concealment, CAPTCHA or anti-bot bypass, blocking-evasion proxy rotation,
@@ -66,7 +75,7 @@ cargo build --workspace --all-features --release --locked
 # Fully offline deterministic smoke run
 ./target/release/market-squawk mock --events 100
 
-# Capture public BTC-USD and ETH-USD data for 30 seconds
+# Diagnostic capture of Coinbase Exchange single-venue, partial-coverage data for 30 seconds
 ./target/release/market-squawk capture \
   --products BTC-USD,ETH-USD \
   --seconds 30
@@ -85,7 +94,8 @@ Offline mode is useful for verifying protocol integration without opening a mark
 market-squawk mcp --offline
 ```
 
-Live mode starts the Coinbase source and MCP server in the same process:
+Diagnostic live-display mode starts the Coinbase Exchange compatibility reader and MCP server in
+the same process. It does not create `DirectVerified` authority:
 
 ```bash
 market-squawk mcp --products BTC-USD,ETH-USD
@@ -116,9 +126,9 @@ The server writes protocol responses only to stdout. Operational logs go to stde
 
 | Tool | Access | Purpose |
 |---|---|---|
-| `Market.GetSnapshot` | Read | Latest local books and incremental features |
-| `Market.GetQuality` | Read | Quality states, timestamps, sequences, and gaps |
-| `Bot.GetStatus` | Read | Paper account, fills, positions, and risk state |
+| `Market.GetSnapshot` | Read | Authority-free diagnostic snapshot from Coinbase Exchange single-venue partial coverage |
+| `Market.GetQuality` | Read | App-local diagnostic `QualityState`, not canonical `DataQuality` |
+| `Bot.GetStatus` | Read | Diagnostic paper-only account, fills, positions, and calculation state |
 | `Journal.GetSummary` | Read | Validate and summarize the configured journal |
 | `Risk.TriggerKillSwitch` | Restricted mutation | Irreversibly stop paper order approval for the current process |
 
@@ -152,10 +162,13 @@ The research plane is currently represented by shared contracts. Arrow, Parquet,
 point-in-time datasets, and working extraction adapters are subsequent implementation stages and are
 not claimed as current capabilities.
 
-## Current live data path
+## Diagnostic compatibility data path
+
+This runnable path exists for local capture, display, and paper simulation. It is not the
+production current-authority plane and never produces `DirectVerified` data.
 
 ```text
-Coinbase WebSocket
+Coinbase Exchange WebSocket (single venue, partial coverage)
         │
         ▼
 raw JSON frame ──► acknowledged bounded journal queue ─► CRC-framed journal
@@ -170,7 +183,7 @@ canonical market event
 order book ─► incremental features ─► optional paper bot
         │                                  │
         └────────► quality state           ▼
-                                       risk kernel
+                                       diagnostic calculation
                                            │
                                            ▼
                                       paper fill only
@@ -178,11 +191,11 @@ order book ─► incremental features ─► optional paper bot
 
 No database, LLM, MCP request, notebook, or filesystem query is in the event-to-decision path. Journal writes use a bounded asynchronous queue. The source waits for an in-process writer acknowledgement before publishing the decoded event. If the writer disappears or the queue cannot accept data, capture fails rather than silently discarding raw market data. Durability flushes occur at explicit checkpoints and shutdown so the hot path does not fsync every message.
 
-## Data integrity model
+## Diagnostic data-integrity model
 
 The engine distinguishes source capture from market truth. It guarantees that locally accepted journal records can be checksummed, replayed, and traced to the raw source frame. It does not claim that any external venue or free provider is globally complete or infallible.
 
-Quality states include:
+The compatibility engine's app-local `QualityState` values include:
 
 - `INITIALIZING`
 - `VALID`
@@ -192,7 +205,10 @@ Quality states include:
 - `DIVERGENT`
 - `QUARANTINED`
 
-Paper orders are rejected unless the relevant book is `VALID`, recently updated by a snapshot or delta, within notional and position limits, and the kill switch is inactive. Heartbeats are tracked separately and never make a stale book fresh.
+Diagnostic paper intents are rejected unless the compatibility book is app-locally `VALID`,
+recently updated by a snapshot or delta, within calculation limits, and the diagnostic kill switch
+is inactive. `VALID` never means canonical `DirectVerified` and grants no production order
+authority. Heartbeats are tracked separately and never make a stale book fresh.
 
 ## Journal format
 
@@ -221,15 +237,18 @@ The raw envelope preserves:
 
 A future format version may add segmented files, stronger cryptographic segment manifests, compression, and Arrow/Parquet compaction. Existing versions remain independently readable.
 
-## Paper bot
+## Diagnostic paper bot
 
-The optional bot exists to exercise the complete live path without risking capital:
+The optional bot exists to exercise the authority-free compatibility path without risking capital:
 
 ```bash
 market-squawk capture --products BTC-USD --paper-bot
 ```
 
-It is intentionally simple and not an investment recommendation. It generates fixed-size momentum intents after a warm-up window. Every intent passes through the deterministic risk kernel before a paper fill is recorded.
+It is intentionally simple and not an investment recommendation. It generates fixed-size momentum
+intents after a warm-up window. Every intent passes through a diagnostic calculation before a
+paper-only simulated fill is recorded. It has no broker connection or production execution
+authority.
 
 ## Local verification
 

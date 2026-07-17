@@ -1,5 +1,14 @@
 # Market Squawk Gap Analysis
 
+<!-- q2-checkpoint-state
+candidate-id: q2-integrated-remediation-2026-07-16
+audit-anchor: 651a01e120dfe27a598b9475296733d238d870b7
+review-target: repository-head
+lifecycle: remediation-in-progress
+prior-r01-r15: closed-as-framed
+active-findings: Q2-I01,Q2-I02,Q2-I03,Q2-I04,Q2-I05,Q2-I06,Q2-I07,Q2-I08,Q2-I09,Q2-I10,Q2-I11,Q2-M01,Q2-M02
+-->
+
 ## Document control
 
 - Analysis date: 2026-07-16
@@ -25,13 +34,35 @@
 Interfaces, empty crates, mocks, synthetic feeds, roadmap text, and schemas without a working
 producer and consumer do not count as implemented.
 
+## Current Q2 checkpoint delta
+
+Q2-R01–R15 are closed as framed at `651a01e`. The replacement exact commit passed the complete
+local gate and audits but was rejected by three fresh reviewers for these adjacent gaps. Statuses
+below describe the audit anchor; in-flight remediation is not counted as implemented.
+
+| Finding | Status | Required closure |
+| --- | --- | --- |
+| Q2-I01 | Unsafe | Terminally revoke current/live/queued authority when health epoch cannot advance. |
+| Q2-I02 | Unsafe | Derive one provider/account quota identity from registry-owned endpoint and authorization-subject evidence. |
+| Q2-I03 | Unsafe | Persist budget windows, cooldowns, refusal, disablement, terminality, and generations across restart. |
+| Q2-I04 | Unsafe | Seal paired raw-frame receipt time inside registry/reader authority. |
+| Q2-I05 | Unsafe | Retain wall high-water and latch rollback across authority validators. |
+| Q2-I06 | Incorrect | Charge every simultaneously reachable snapshot/delta processing allocation. |
+| Q2-I07 | Incorrect | Charge snapshot publication, retained generations, aggregate leases, and reader metadata. |
+| Q2-I08 | Incorrect | Charge complete capture frame/session/generation/bundle object graphs. |
+| Q2-I09 | Unsafe | Bound source shutdown with cancellation, deadline, abort, and awaited ownership. |
+| Q2-I10 | Unsafe | Reject oversized MCP frames before materializing them. |
+| Q2-I11 | Incorrect | Keep architecture, gap, plan, checkpoint, and progress status coherent. |
+| Q2-M01 | Partial | Emit canonical byte-deterministic budget state. |
+| Q2-M02 | Incorrect | Qualify compatibility surfaces as diagnostic, authority-free, partial-coverage, and paper-only. |
+
 ## 1. Product and cost boundary
 
 | ID | Requirement | Status | Evidence and closure | Stage |
 | --- | --- | --- | --- | --- |
 | P-01 | Local-first platform | Partial | Current capture, journal, CLI, and MCP are local; most product domains are missing. | 1-7 |
 | P-02 | Direct live market ingestion | Partial | Coinbase public WebSocket works; required Kraken and broader contracts are missing. | 2 |
-| P-03 | Low-latency signals and automated actions | Partial | Qualification, current authority, deterministic sharding, and state processing exist, but Q2-R01–Q2-R10 invalidate production-readiness claims until remediation. Task 8 intentionally returns `NoStrategy`; features, risk, and execution remain. | 1-2, 5 |
+| P-03 | Low-latency signals and automated actions | Partial | Qualification, current authority, deterministic sharding, and state processing exist. Q2-I01, Q2-I04–Q2-I07, and Q2-I09 still block checkpoint readiness; Task 8 intentionally returns `NoStrategy`, and features/risk/execution remain. | 1-2, 5 |
 | P-04 | Historical and point-in-time research | Missing | No research storage, observations, revisions, or PIT builder. | 3-4 |
 | P-05 | Modeling, prediction, and backtesting | Missing | No registry, bundles, inference, datasets, or backtester. | 4 |
 | P-06 | Fundamentals, filings, macro, portfolio, alternative data | Missing | No required extraction adapters or datasets. | 3-4 |
@@ -40,8 +71,8 @@ producer and consumer do not count as implemented.
 | P-09 | Local MCP access | Partial | Five local stdio tools work; lifecycle, service domains, cancellation, audit, and bounds are incomplete. | 6 |
 | P-10 | No paid software/API/cloud/external DB/container/telemetry requirement | Implemented | Current v0.1 has none; all later dependencies must preserve this gate. | All |
 | P-11 | Optional paid/licensed adapters do not become mandatory | Implemented | Source authorization, coverage, endpoint, and secret contracts do not impose a paid dependency; concrete optional adapters can remain replaceable. | All |
-| P-12 | Provider restrictions handled by adapters, persistence, cache, health, failover, coverage | Unsafe | Typed budgets and health exist, but Q2-R03–Q2-R05 show cooldown revocation, process-wide coordination, and audited account binding are incomplete and can multiply effective quotas. | 1-3 |
-| P-13 | No access-control or quota evasion | Unsafe | Deliberate evasion features are absent and prohibited, but Q2-R04–Q2-R05 prevent certifying structural quota aggregation until one process-wide audited provider/account budget is enforced. | 1, 7 |
+| P-12 | Provider restrictions handled by adapters, persistence, cache, health, failover, coverage | Unsafe | Typed process-shared budgets and health exist, but Q2-I02–Q2-I03 require registry-owned authorization identity and restart-durable enforcement; cache/failover remain later work. | 1-3 |
+| P-13 | No access-control or quota evasion | Partial | Deliberate evasion features are absent and permanently prohibited. Q2-I02–Q2-I03 must close before one authorized quota is structurally non-aliasable and non-resettable across restart. | 1, 7 |
 | P-14 | Optional paid/licensed feed adapters | Intentionally deferred | They are not required for the complete local release; typed source/authorization/coverage contracts remain available without introducing a paid dependency. | Post-release |
 
 ## 2. Data classification and execution eligibility
@@ -58,7 +89,7 @@ producer and consumer do not count as implemented.
 | Q-08 | Snapshot/update consistency | Implemented | Generation state, snapshot applicability/origin, transactional rollback, and current-generation revalidation are implemented. | All |
 | Q-09 | Checksum where supported | Partial | Closed provider checksum profiles and Kraken V2 golden CRC32 validation are implemented; the production Kraken stream adapter remains Task 11. | 2 |
 | Q-10 | Valid exchange and receive timestamps | Implemented | Exact timestamps and independent source/market/transport/future-skew/idle policies participate in qualification. | All |
-| Q-11 | Freshness within limits | Unsafe | Upper deadlines are derived, but Q2-R02 shows future health can qualify before its claimed observation and poison later health reporting. Trusted-time lower bounds are under remediation. | All |
+| Q-11 | Freshness within limits | Unsafe | Earlier future-health defects are closed, but Q2-I04–Q2-I05 show receipt time is adapter-authored and later wall rollback is not latched. | All |
 | Q-12 | Valid trading status | Implemented | Typed generation-bound status is revisioned, snapshotted, and required by qualification. | All |
 | Q-13 | Valid price/quantity precision | Implemented | Exact provider lexemes normalize through current tick/lot definitions without rounding. | All |
 | Q-14 | Explicit source coverage | Implemented | Typed bounded coverage records include domain, topology, delay, consolidation, membership, and current policy binding. | All |
@@ -145,7 +176,7 @@ producer and consumer do not count as implemented.
 | L-02 | Raw capture async; decisions do not wait for persistence | Implemented | Task 6 capture admission is bounded and asynchronous; Task 8 consumes receipt-validated current batches and performs no persistence work. | All |
 | L-03 | Stable deterministic shard ownership | Implemented | Routing V1 freezes byte encoding and FNV-1a golden vectors; one actor is the sole writer for every route assigned to its shard. | All |
 | L-04 | Shard owns books/windows/features/strategy/risk | Partial | Actors own route processors, books, generation state, revisions, snapshots, and the reserved feature/strategy state boundary. Task 9-10 state is not yet attached. | 1-2 |
-| L-05 | Explicit bounded overflow invalidation/degradation | Unsafe | Count and invalidation ordering are bounded, but Q2-R01 shows retained-byte admission undercounts nested book allocations, so the configured memory bound is false. | All |
+| L-05 | Explicit bounded overflow invalidation/degradation | Unsafe | Original nested batch admission is closed. Q2-I06–Q2-I08 show downstream processing, reader/publication, and capture-generation allocations still exceed declared complete memory ceilings. | All |
 | L-06 | Sequence continuity, duplicates, out-of-order | Implemented | The transactional sequence validator handles progression, duplicates, out-of-order/gap outcomes, generation rollover, and rollback on rejected candidates. | All |
 | L-07 | Snapshot/delta ordering | Implemented | Generation-owned state requires initialization snapshots, rejects invalid delta ordering, preserves snapshot-origin identity, and revalidates current generation. | All |
 | L-08 | Checksums | Implemented | The closed checksum engine validates provider-declared canonicalization profiles and rejects profile/evidence mismatches; production Kraken adapter integration remains L-19. | All |
@@ -155,7 +186,7 @@ producer and consumer do not count as implemented.
 | L-12 | Book consistency | Implemented | Price-level updates are message-atomic with bounded rollback, strict ordering, delete-zero, depth, crossed-book, checksum, and last-good-state invariants. | All |
 | L-13 | Trading/venue status | Implemented | Typed generation-bound shared trading status participates in qualification, revisions, snapshot diagnostics, and capability invalidation. | All |
 | L-14 | Market freshness distinct from heartbeat | Implemented | Connection/heartbeat health cannot refresh market-price freshness; qualification retains separate limits and exact deadlines. | All |
-| L-15 | Quarantine until resynchronized/revalidated | Incorrect | Invalid generations cannot issue action, but Q2-R06 shows a first recoverable rejection can retain incomplete provenance and later terminate the actor during snapshot publication. | All |
+| L-15 | Quarantine until resynchronized/revalidated | Partial | The original rejected-provenance actor failure is closed, and invalid generations cannot issue action. Q2-I01/Q2-I05 still require terminal epoch/clock-discontinuity quarantine across every retained authority path. | All |
 | L-16 | Top/price/order depth support | Partial | Top-of-book and configurable bounded price-level depth are implemented. Order-level ownership remains required when a production source supplies it. | 2 |
 | L-17 | Snapshot, incremental, delete-zero, configurable depth | Implemented | Transactional snapshots/deltas, delete-zero behavior, checked configured depth, and exact output-depth metadata are tested. | All |
 | L-18 | Best bid/ask, crossed, staleness | Implemented | The production book maintains extrema, rejects crossed candidates, and qualification/snapshots preserve typed freshness state. | All |

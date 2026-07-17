@@ -1,5 +1,14 @@
 # Market Squawk Complete Local Release Implementation Plan
 
+<!-- q2-checkpoint-state
+candidate-id: q2-integrated-remediation-2026-07-16
+audit-anchor: 651a01e120dfe27a598b9475296733d238d870b7
+review-target: repository-head
+lifecycle: remediation-in-progress
+prior-r01-r15: closed-as-framed
+active-findings: Q2-I01,Q2-I02,Q2-I03,Q2-I04,Q2-I05,Q2-I06,Q2-I07,Q2-I08,Q2-I09,Q2-I10,Q2-I11,Q2-M01,Q2-M02
+-->
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use
 > `superpowers:subagent-driven-development` (recommended) or `superpowers:executing-plans` to
 > implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
@@ -114,12 +123,36 @@ evidence. No stage is marked complete from a partial test run.
 
 ## Q2 Tasks 1-8 implementation progress
 
-The live foundation through Task 8 is implemented in the isolated integration lane and documented
-in the [Q2 Task 8 implementation report](../reports/q2-task8-implementation.md). The exact Task 8
-crate gate passes formatting, strict all-target/all-feature Clippy, all-feature tests, and diff
-checks. Q2 is **not** marked complete here: the root owner must integrate the one authoritative
-`Cargo.lock`, run the full workspace/release gate, and complete the grouped Tasks 5-8 review at the
-exact integrated head.
+The live foundation through Task 8 is integrated. Q2-R01–R15 are closed as framed at `651a01e`,
+and that exact clean commit passed the full local verification wrapper and audits. Three fresh
+specialist reviewers rejected the same commit for the adjacent Q2-I01–Q2-I11 and Q2-M01–Q2-M02
+contracts. The checkpoint lifecycle is `remediation-in-progress`; the green gate is evidence, not
+approval.
+
+The controlling design and subagent-driven TDD plan are:
+
+- [integrated Q2 remediation design](../superpowers/specs/2026-07-16-q2-integrated-checkpoint-remediation-design.md)
+- [integrated Q2 remediation plan](../superpowers/plans/2026-07-16-q2-integrated-checkpoint-remediation.md)
+
+Three isolated workers own source authority/persistence/capture memory, live processing/snapshot
+memory, and app framing/shutdown/terminology. Root owns checkpoint coherence, integration, exact-
+head verification, and three-scope re-review. Their in-flight changes are not counted below.
+
+| Active finding | Planned production contract |
+| --- | --- |
+| Q2-I01 | Terminal health-epoch revocation and replacement-only recovery |
+| Q2-I02 | Registry-owned canonical endpoint/authorization budget identity |
+| Q2-I03 | Restart-durable conservative provider-budget enforcement |
+| Q2-I04 | Registry-sealed paired raw-frame receipt time |
+| Q2-I05 | Trusted wall high-water and discontinuity latch |
+| Q2-I06 | Closed structural snapshot/delta processing peak |
+| Q2-I07 | Complete snapshot reader/publication/generation accounting |
+| Q2-I08 | Complete capture frame/session/generation/bundle accounting |
+| Q2-I09 | Configured cancellation/deadline/abort-and-await source shutdown |
+| Q2-I10 | Allocation-bounded incremental MCP framing |
+| Q2-I11 | Machine-checked checkpoint document coherence |
+| Q2-M01 | Canonically ordered persistent budget state |
+| Q2-M02 | Unambiguous diagnostic/authority-free/partial-coverage wording |
 
 Working Task 8 deliverables are:
 

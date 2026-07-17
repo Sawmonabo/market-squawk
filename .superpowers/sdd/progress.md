@@ -1,5 +1,14 @@
 # Market Squawk Stage 1 SDD Progress
 
+<!-- q2-checkpoint-state
+candidate-id: q2-integrated-remediation-2026-07-16
+audit-anchor: 651a01e120dfe27a598b9475296733d238d870b7
+review-target: repository-head
+lifecycle: remediation-in-progress
+prior-r01-r15: closed-as-framed
+active-findings: Q2-I01,Q2-I02,Q2-I03,Q2-I04,Q2-I05,Q2-I06,Q2-I07,Q2-I08,Q2-I09,Q2-I10,Q2-I11,Q2-M01,Q2-M02
+-->
+
 Branch: `feat/stage-1-foundation`
 Plan: `docs/superpowers/plans/2026-07-16-market-squawk-stage-1-foundation.md`
 Review cadence: quarter checkpoints after Tasks 4, 8, 12, and 16.
@@ -94,3 +103,5 @@ Stage 0: complete (commit 66d30fe, planning/research controls committed; baselin
   coherent checkpoint documents, deterministic budget serialization, and unambiguous diagnostic
   wording. These are active checkpoint blockers; Q2 remains rejected pending integrated TDD
   remediation, clean exact-head verification, and three-scope re-review.
+- Q2-R01–R15 are closed as framed at `651a01e`; their historical rejection remains in the append-
+  only checkpoint ledger, while Q2-I01–Q2-I11 and Q2-M01–Q2-M02 are the active blockers.

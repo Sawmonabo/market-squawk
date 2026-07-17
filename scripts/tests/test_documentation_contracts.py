@@ -43,13 +43,98 @@ LIVE_PROVENANCE_SOURCE = (
 RESEARCH_PROVENANCE_SOURCE = (
     ROOT / "crates" / "market-squawk-domain" / "src" / "provenance" / "research.rs"
 )
+Q2_CURRENT_STATE = ROOT / "docs" / "architecture" / "current-state.md"
+Q2_GAP_ANALYSIS = ROOT / "docs" / "plans" / "gap-analysis.md"
+Q2_IMPLEMENTATION_PLAN = ROOT / "docs" / "plans" / "implementation-plan.md"
+Q2_CHECKPOINT_REVIEW = ROOT / "docs" / "reports" / "q2-checkpoint-review.md"
+Q2_PROGRESS = ROOT / ".superpowers" / "sdd" / "progress.md"
+Q2_STATE_DOCS = (
+    Q2_CURRENT_STATE,
+    Q2_GAP_ANALYSIS,
+    Q2_IMPLEMENTATION_PLAN,
+    Q2_CHECKPOINT_REVIEW,
+    Q2_PROGRESS,
+)
+Q2_STATE_START = "<!-- q2-checkpoint-state"
+Q2_STATE_END = "-->"
+Q2_AUDIT_ANCHOR = "651a01e120dfe27a598b9475296733d238d870b7"
+Q2_CANDIDATE_ID = "q2-integrated-remediation-2026-07-16"
+Q2_ACTIVE_FINDINGS = ",".join(
+    [*(f"Q2-I{number:02d}" for number in range(1, 12)), "Q2-M01", "Q2-M02"]
+)
 
 
 def normalized_source(path: Path) -> str:
     return " ".join(path.read_text().replace("///", "").split())
 
 
+def q2_checkpoint_state(path: Path) -> dict[str, str]:
+    document = path.read_text()
+    start = document.index(Q2_STATE_START) + len(Q2_STATE_START)
+    end = document.index(Q2_STATE_END, start)
+    state: dict[str, str] = {}
+    for line in document[start:end].splitlines():
+        key, separator, value = line.strip().partition(":")
+        if separator:
+            state[key.strip()] = value.strip()
+    return state
+
+
 class DocumentationContractTests(unittest.TestCase):
+    def test_q2_checkpoint_documents_share_one_machine_readable_state(self) -> None:
+        states = []
+        for path in Q2_STATE_DOCS:
+            with self.subTest(path=path.relative_to(ROOT)):
+                state = q2_checkpoint_state(path)
+                self.assertEqual(state["candidate-id"], Q2_CANDIDATE_ID)
+                self.assertEqual(state["audit-anchor"], Q2_AUDIT_ANCHOR)
+                self.assertEqual(state["review-target"], "repository-head")
+                self.assertEqual(state["prior-r01-r15"], "closed-as-framed")
+                self.assertEqual(state["active-findings"], Q2_ACTIVE_FINDINGS)
+                self.assertIn(
+                    state["lifecycle"],
+                    {
+                        "remediation-in-progress",
+                        "pending-exact-head-rereview",
+                    },
+                )
+                states.append(state)
+        self.assertTrue(states)
+        self.assertTrue(all(state == states[0] for state in states[1:]))
+
+    def test_q2_current_documents_do_not_reopen_superseded_r01_r15_findings(
+        self,
+    ) -> None:
+        required_closure = "Q2-R01–R15 are closed as framed at `651a01e`"
+        for path in Q2_STATE_DOCS:
+            with self.subTest(path=path.relative_to(ROOT)):
+                self.assertIn(required_closure, path.read_text())
+
+        current_state = Q2_CURRENT_STATE.read_text()
+        gap = Q2_GAP_ANALYSIS.read_text()
+        implementation = Q2_IMPLEMENTATION_PLAN.read_text()
+
+        self.assertNotIn(
+            "Reviewed implementation baseline: integrated Q2 Tasks 1–8 commit `581d4fd`",
+            current_state,
+        )
+        self.assertNotIn(
+            "Q2-R01–Q2-R10 invalidate production-readiness claims until remediation",
+            gap,
+        )
+        self.assertNotIn(
+            "Q2 is **not** marked complete here: the root owner must integrate",
+            implementation,
+        )
+        for identifier in (
+            *(f"Q2-I{number:02d}" for number in range(1, 12)),
+            "Q2-M01",
+            "Q2-M02",
+        ):
+            self.assertIn(identifier, current_state)
+            self.assertIn(identifier, gap)
+            self.assertIn(identifier, implementation)
+
     def test_task_four_uses_the_binding_based_live_provenance_shape(self) -> None:
         plan = STAGE_ONE_PLAN.read_text()
         start = plan.index("- [ ] **Step 4: Implement canonical time and provenance**")

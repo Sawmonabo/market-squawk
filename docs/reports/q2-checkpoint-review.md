@@ -1,5 +1,14 @@
 # Quarter 2 Tasks 5–8 checkpoint review and remediation ledger
 
+<!-- q2-checkpoint-state
+candidate-id: q2-integrated-remediation-2026-07-16
+audit-anchor: 651a01e120dfe27a598b9475296733d238d870b7
+review-target: repository-head
+lifecycle: remediation-in-progress
+prior-r01-r15: closed-as-framed
+active-findings: Q2-I01,Q2-I02,Q2-I03,Q2-I04,Q2-I05,Q2-I06,Q2-I07,Q2-I08,Q2-I09,Q2-I10,Q2-I11,Q2-M01,Q2-M02
+-->
+
 ## Document control
 
 - Review date: 2026-07-16
@@ -103,6 +112,9 @@ The original Q2-R01–R15 findings were substantively closed and integrated thro
 wrapper, Cargo-deny, Cargo-audit, working-tree and history Gitleaks scans, brand and generated-
 artifact checks, and clean/unchanged exact-head assertions. Hosted macOS and Windows results were
 not observed and are not claimed.
+
+Q2-R01–R15 are closed as framed at `651a01e`; the table above is retained as append-only historical
+evidence and does not describe the active defect set.
 
 Three fresh independent read-only reviewers examined that same frozen commit across source
 authority/persistence, concurrency/memory/lifecycle, and architecture/security/documentation. The

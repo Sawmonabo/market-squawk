@@ -1,15 +1,26 @@
 # Market Squawk current state
 
+<!-- q2-checkpoint-state
+candidate-id: q2-integrated-remediation-2026-07-16
+audit-anchor: 651a01e120dfe27a598b9475296733d238d870b7
+review-target: repository-head
+lifecycle: remediation-in-progress
+prior-r01-r15: closed-as-framed
+active-findings: Q2-I01,Q2-I02,Q2-I03,Q2-I04,Q2-I05,Q2-I06,Q2-I07,Q2-I08,Q2-I09,Q2-I10,Q2-I11,Q2-M01,Q2-M02
+-->
+
 ## Document control
 
 - Audit date: 2026-07-16
 - Repository: `market-squawk`
-- Reviewed implementation baseline: integrated Q2 Tasks 1–8 commit `581d4fd` (rejected pending the
-  Q2-R01–Q2-R15 remediation ledger)
+- Current implementation audit anchor: `651a01e120dfe27a598b9475296733d238d870b7`
+- Checkpoint disposition: rejected; integrated remediation and exact-head re-review required
 - Evidence: repository inspection, locked local verification,
   [Q2 live-readiness audit](../plans/q2-live-readiness-audit.md),
   [Q2 Task 8 implementation report](../reports/q2-task8-implementation.md),
-  [Q2 checkpoint rejection ledger](../reports/q2-checkpoint-review.md), and
+  [Q2 checkpoint rejection ledger](../reports/q2-checkpoint-review.md),
+  [integrated Q2 remediation plan](../superpowers/plans/2026-07-16-q2-integrated-checkpoint-remediation.md),
+  and
   [deep-research report](../research/2026-07-15-market-squawk/final-report.md)
 
 This document describes working software at the stated baseline. Interfaces, synthetic fixtures,
@@ -37,29 +48,30 @@ performance claim has been made.
 
 ## Quarter 2 production-readiness correction
 
-The exact integrated Tasks 5–8 checkpoint `581d4fd` was rejected by both independent reviewers.
-The components below exist and their focused tests remain useful evidence, but the following
-cross-component properties are not accepted as production-ready until the linked Q2-R findings are
-closed and re-reviewed:
+The exact `581d4fd` checkpoint was rejected. Q2-R01–R15 are closed as framed at `651a01e`, and the
+complete local gate and audits passed at that clean replacement commit. Three fresh independent
+reviewers then rejected `651a01e` for the adjacent defects below; passing the earlier gate does not
+override missing production contracts:
 
-- decoded/current-batch byte accounting omits nested book/change allocations (Q2-R01);
-- caller-authored future health and budget state can outlive or contradict authoritative current
-  conditions (Q2-R02–Q2-R05);
-- recoverable first-event rejection can later terminate a shard through incomplete snapshot
-  provenance (Q2-R06);
-- persistent and transient snapshot memory are undercounted (Q2-R07–Q2-R08);
-- snapshot timers can starve control/data queues and public snapshot deserialization bypasses
-  invariants (Q2-R09–Q2-R10);
-- a blocked capture sink can outlive a timeout after supervision ownership is discarded (Q2-R11);
-  and
-- failure atomicity, aggregate-reader configuration, Windows CI, and cadence semantics require the
-  recorded hardening corrections (Q2-R12–Q2-R15).
+- Q2-I01 terminal health-epoch exhaustion;
+- Q2-I02 registry-owned canonical provider/account budget identity;
+- Q2-I03 restart-durable conservative budget enforcement;
+- Q2-I04 registry-sealed raw-frame receipt time;
+- Q2-I05 trusted wall high-water and rollback discontinuity;
+- Q2-I06 complete snapshot/delta processing peak memory;
+- Q2-I07 snapshot reader/publication/generation metadata memory;
+- Q2-I08 complete capture frame/session/generation retained memory;
+- Q2-I09 bounded application source shutdown;
+- Q2-I10 allocation-bounded MCP framing;
+- Q2-I11 coherent authoritative checkpoint documents;
+- Q2-M01 canonical budget-state serialization; and
+- Q2-M02 unambiguous diagnostic CLI/MCP/README terminology.
 
-Consequently, statements later in this document describing exact byte or peak-memory bounds,
-complete current health, route-local rejection, clean capture-worker shutdown, and bounded
-snapshot input are descriptions of the pre-review implementation intent, not accepted guarantees.
-The [checkpoint ledger](../reports/q2-checkpoint-review.md) is authoritative until a replacement
-commit closes each item with code and regression evidence.
+The current candidate lifecycle is `remediation-in-progress`. The three implementation lanes and
+root documentation lane start from plan commit `de101ee`; none of their in-flight behavior is
+counted as implemented here. Q2 remains rejected until those commits are integrated, the worktree
+is frozen and clean, every local gate/audit passes at exact `HEAD`, and three fresh specialist
+re-reviews report no unresolved severity.
 
 ## Workspace and toolchain
 
@@ -142,6 +154,12 @@ The authoritative registry binds metadata, session generation, health epoch, cap
 frame ordinal, live scope, and current deadlines. It produces nonempty homogeneous route batches
 of `CurrentProviderObservation` values while preserving wire order.
 
+At the current audit anchor, adapter-authored raw receive time, absence of a registry wall
+high-water, non-terminal health-epoch exhaustion, aliasable provider/account quota identity, and
+process-restart budget reset remain Q2-I01–Q2-I05 blockers. The types and focused tests are useful,
+but the source authority subsystem is not checkpoint-approved until those adjacent contracts are
+integrated and re-reviewed.
+
 `CurrentDecodedProviderBatch` is owned, non-Serde, and process-local. Its exact
 `CurrentSourceAuthorityLease` can be obtained before a feed starts, allowing Task 8 to perform the
 pre-feed route binding handshake without trusting the first data batch.
@@ -156,7 +174,10 @@ Task 11 work.
 
 `market-squawk-platform` implements local configuration, confined paths, controlled artifact
 roots, MSJ1 journal compatibility, and generic asynchronous capture. The capture queue is bounded
-by count and retained bytes; admission success is independent of disk completion. Capture
+by count and its current declared retained-byte estimate; admission success is independent of disk
+completion. Q2-I08 records that capacity-heavy session identities and uniquely retained capture
+generations are not yet fully charged, so the byte figure is not accepted as a complete heap bound.
+Capture
 authority is supplied as one registry-owned bundle, and a concrete admission receipt binds the
 exact frame ordinal, digest, receive time, source allocation, and one-way health lease.
 
@@ -215,7 +236,9 @@ admission, command, and shared allocation. Count-full, byte-full, overweight, ch
 wrong-route, source-transplant, closed, and stale-authority failures invalidate the exact bound
 generation before returning.
 
-Startup validates all capacities/routes and a conservative peak-memory model before allocating.
+Startup validates all capacities/routes and the currently implemented peak-memory model before
+allocating. Q2-I06 and Q2-I07 show that processing overlap and snapshot reader/publication metadata
+are missing from that estimate, so it is not yet an accepted complete runtime ceiling.
 Every actor publishes an initial immutable `Ready` snapshot before the runtime escapes. Partial
 startup is aborted and awaited. Shutdown invalidates authority before draining; a deadline causes
 abort-and-await, never detach. Replacement starts a fresh incarnation only after complete former
@@ -245,16 +268,24 @@ cells, authority issuers, unbound publication, or event conversion.
 The previous public `Engine` is now `DiagnosticEngine`. Its domain module is private and exported
 only through explicit `Diagnostic*` aliases. The compatibility Coinbase/mock path, replay, five
 existing MCP tools, and historical paper calculation remain runnable but cannot accept a current
-batch or mint production authority. CLI/MCP wording identifies this as diagnostic simulation.
+batch or mint production authority. Internal types identify the boundary, but Q2-M02 remains open
+because public CLI/MCP wording does not yet identify it consistently.
 
 The deletion trigger is precise: production Task 11 adapters must emit receipt-validated current
 batches after pre-feed binding, and Task 13 services must consume Task 8 immutable snapshots. The
 diagnostic engine is then removed rather than promoted.
 
 The CLI still implements only `init`, diagnostic `mock`, diagnostic `capture`, diagnostic/offline
-`mcp`, and `replay`. The MCP server remains local stdio with bounded lines, typed input schemas,
-unknown-field rejection, and a local rate limiter, but it does not implement the complete required
-tool domains, durable audit, controlled large artifacts, or cancellation/deadline service layer.
+`mcp`, and `replay`. The compatibility plane is authority-free, paper-only, and based on Coinbase
+Exchange single-venue partial coverage. Its app-local `QualityState::Valid` is not canonical
+`DataQuality::DirectVerified` and can never authorize production action. Q2-M02 is active because
+some public descriptions do not yet state that boundary consistently.
+
+The MCP server remains local stdio with typed input schemas, unknown-field rejection, and a local
+rate limiter. Q2-I10 records that its current 1 MiB check occurs after `read_line` allocation, so
+request framing is not memory-bounded until the incremental reader is integrated. Complete tool
+domains, durable audit, controlled large artifacts, and service cancellation/deadlines remain
+later-stage work. Q2-I09 separately blocks the claim that application source shutdown is bounded.
 
 ## Research, analytics, modeling, portfolio, execution, and valuation
 
@@ -276,27 +307,23 @@ contracts; their existence alone is not counted as the production capability.
 
 ## Verification state
 
-The exact combined Task 8 live/application gate passed at the deterministic test head:
+Exact commit `651a01e120dfe27a598b9475296733d238d870b7` passed the complete local verification
+wrapper and additional audits from a clean, unchanged worktree:
 
 ```text
 cargo fmt --all --check                                                        PASS
-cargo clippy -p market-squawk-live -p market-squawk \
-  --all-targets --all-features --locked -- -D warnings                        PASS
-cargo test -p market-squawk-live -p market-squawk --all-features --locked      PASS
-cargo build -p market-squawk-live -p market-squawk \
-  --all-features --release --locked                                             PASS
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings PASS
+cargo test --workspace --all-features --locked                                PASS
+cargo build --workspace --all-features --release --locked                     PASS
+cargo deny check                                                              PASS
+cargo audit --deny warnings                                                   PASS
+gitleaks dir and git-history scans                                             PASS
 git diff --check                                                               PASS
 ```
 
-The live suite includes 74 unit tests plus compile-fail authority privacy, price-level book,
-property, Kraken checksum, conversion, real-registry overflow, sequence, 15 public sharding/config,
-and state-machine integration tests. The focused application suite also covers diagnostic
-quarantine and real runtime startup, metrics, bounded reads/notifications/health, shutdown,
-replacement, and typed configuration failure.
-
-The root integration owner generates and reviews the one authoritative merged `Cargo.lock` and
-runs the full required workspace fmt, strict Clippy, test, and release-build gate at the Q2
-checkpoint. This Task 8 worktree does not mark Q2 complete before that integration and review.
+That evidence establishes tested behavior at `651a01e`, not Q2 approval. The three-reviewer
+checkpoint still rejected the exact commit for Q2-I01–Q2-I11 and Q2-M01–Q2-M02. Focused lane gates
+and the future integrated gate are recorded separately; no in-flight result is exact-head evidence.
 
 There are no final fuzz targets, Criterion benchmarks, sustained-burst harness, dependency/license
 audit gate, SBOM, or complete release-hardening report yet. No 100,000 events/s or sub-millisecond
@@ -316,8 +343,8 @@ future research plane, explicit coverage, and fail-closed source health.
 
 ## Current conclusion
 
-The cross-cutting live contracts that later features depend on are now real and tested: typed
-identity and exact finance, current-source/capture authority, transactional qualification,
-deterministic ownership, bounded admission, immutable snapshots, and supervised lifecycle. The
-next work should attach features, strategy/risk, and real adapters to these seams without reopening
-the authority boundary or routing diagnostic/replay values into production.
+The cross-cutting live foundation is substantial and tested, and Q2-R01–R15 remain closed as
+framed. Q2 is nevertheless rejected while the adjacent terminality, identity, persistence, trusted
+time, complete memory, process-boundary, and documentation contracts are under remediation. Q3
+features, strategy/risk, and real adapters begin only after the new exact head passes re-review;
+diagnostic/replay values remain permanently outside production authority.
