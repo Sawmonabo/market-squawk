@@ -222,6 +222,24 @@ fn canonical_temp_lock_and_root_symlinks_are_rejected_without_following() -> Tes
     Ok(())
 }
 
+#[cfg(windows)]
+#[test]
+fn reparse_root_is_rejected_from_the_opened_windows_handle() -> TestResult {
+    use std::os::windows::fs::symlink_dir;
+
+    let parent = tempfile::tempdir()?;
+    let real = parent.path().join("real-root");
+    let alias = parent.path().join("root-alias");
+    fs::create_dir(&real)?;
+    symlink_dir(&real, &alias)?;
+
+    assert!(matches!(
+        LocalAuthorityStateStore::try_open(alias),
+        Err(LocalAuthorityStateStoreError::UnsafeRoot)
+    ));
+    Ok(())
+}
+
 #[test]
 fn non_regular_canonical_file_is_rejected_as_ambiguous_authority() -> TestResult {
     let directory = tempfile::tempdir()?;

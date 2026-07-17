@@ -12,6 +12,7 @@ use cap_std::{
 };
 use thiserror::Error;
 
+use crate::journal::ParentDirectorySync;
 use crate::{JournalError, JournalWriter};
 
 const MAX_ARTIFACT_COMPONENT_BYTES: usize = 255;
@@ -389,15 +390,8 @@ impl LocalPaths {
             .open_with(&filename, &options)
             .map_err(|source| JournalError::io("failed to open confined journal", source))?
             .into_std();
-        let parent_directory = capability
-            .try_clone()
-            .map_err(|source| JournalError::io("failed to clone journal directory handle", source))?
-            .into_std_file();
-        JournalWriter::from_open_file(
-            self.journal_dir.join(filename),
-            file,
-            Some(parent_directory),
-        )
+        let parent_directory = open_parent_directory_sync(capability)?;
+        JournalWriter::from_open_file(self.journal_dir.join(filename), file, parent_directory)
     }
 
     /// Returns an initialization path unless doing so would shadow a sole legacy journal.
@@ -450,6 +444,32 @@ impl LocalPaths {
             .journal_dir
             .join(format!("{source}.{}", format.extension())))
     }
+}
+
+#[cfg(unix)]
+fn open_parent_directory_sync(directory: &Dir) -> Result<ParentDirectorySync, JournalError> {
+    use cap_std::fs::OpenOptionsExt as _;
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let handle = directory
+        .open_with(".", &options)
+        .map_err(|source| {
+            JournalError::io("failed to open syncable journal directory handle", source)
+        })?
+        .into_std();
+    Ok(ParentDirectorySync::required(handle))
+}
+
+#[cfg(windows)]
+fn open_parent_directory_sync(_directory: &Dir) -> Result<ParentDirectorySync, JournalError> {
+    Ok(ParentDirectorySync::file_sync_is_authoritative())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_parent_directory_sync(_directory: &Dir) -> Result<ParentDirectorySync, JournalError> {
+    Err(JournalError::DirectoryDurabilityUnsupported)
 }
 
 fn validate_source_filename(source: &str) -> Result<(), JournalSelectionError> {

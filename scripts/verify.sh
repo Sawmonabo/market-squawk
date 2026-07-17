@@ -22,7 +22,7 @@ import pathlib
 import sys
 
 help_text = pathlib.Path(sys.argv[1]).read_text()
-expected_identity = "Local-first market capture, diagnostic replay/simulation, and MCP"
+expected_identity = "Local-first market tools that are diagnostic and authority-free. Any bot behavior is paper simulation only, with no production order authority."
 first_line = help_text.splitlines()[0] if help_text else ""
 if first_line != expected_identity:
     raise SystemExit(

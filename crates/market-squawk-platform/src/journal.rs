@@ -66,6 +66,9 @@ pub enum JournalError {
     /// Writable journal endpoints may not be symbolic links.
     #[error("journal endpoint must not be a symbolic link")]
     SymlinkNotAllowed,
+    /// The platform has no implemented journal directory-durability contract.
+    #[error("journal directory durability is unsupported on this platform")]
+    DirectoryDurabilityUnsupported,
     /// A second writer already owns the exclusive file lock.
     #[error("journal {path} already has an active writer")]
     AlreadyLocked {
@@ -131,11 +134,48 @@ pub struct JournalWriter {
     writer: BufWriter<File>,
 }
 
+/// Platform-specific directory-entry durability retained across journal creation.
+#[derive(Debug)]
+pub(crate) struct ParentDirectorySync {
+    #[cfg(unix)]
+    directory: File,
+}
+
+impl ParentDirectorySync {
+    #[cfg(unix)]
+    pub(crate) const fn required(directory: File) -> Self {
+        Self { directory }
+    }
+
+    #[cfg(windows)]
+    pub(crate) const fn file_sync_is_authoritative() -> Self {
+        Self {}
+    }
+
+    fn synchronize(&self) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            self.directory.sync_all()
+        }
+        #[cfg(windows)]
+        {
+            Ok(())
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "journal directory durability is unsupported",
+            ))
+        }
+    }
+}
+
 impl JournalWriter {
     pub(crate) fn from_open_file(
         path: PathBuf,
         file: File,
-        parent_directory: Option<File>,
+        parent_directory: ParentDirectorySync,
     ) -> Result<Self, JournalError> {
         if path.extension().and_then(std::ffi::OsStr::to_str) != Some("msj") {
             return Err(JournalError::InvalidWriterExtension);
@@ -166,14 +206,9 @@ impl JournalWriter {
             writer.get_ref().sync_all().map_err(|source| {
                 JournalError::io("failed to synchronize journal header", source)
             })?;
-            parent_directory
-                .ok_or_else(|| {
-                    JournalError::InvalidRecord("journal path has no parent directory".to_owned())
-                })?
-                .sync_all()
-                .map_err(|source| {
-                    JournalError::io("failed to synchronize journal directory handle", source)
-                })?;
+            parent_directory.synchronize().map_err(|source| {
+                JournalError::io("failed to synchronize journal directory handle", source)
+            })?;
         }
         Ok(Self { path, writer })
     }

@@ -7,8 +7,6 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use cap_fs_ext::{FollowSymlinks, MetadataExt as _, OpenOptionsFollowExt};
-#[cfg(not(any(unix, windows)))]
-use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
 use fs2::FileExt as _;
 use sha2::{Digest, Sha256};
@@ -88,6 +86,9 @@ pub enum LocalAuthorityStateStoreError {
     /// The platform cannot safely replace an existing file atomically.
     #[error("atomic authority-state replacement is unsupported on this platform")]
     AtomicReplaceUnsupported,
+    /// The platform has no implemented no-follow root-identity contract.
+    #[error("secure authority-state root handling is unsupported on this platform")]
+    SecureRootUnsupported,
     /// A post-installation read did not reproduce the submitted payload.
     #[error("installed authority state failed canonical verification")]
     VerificationFailed,
@@ -371,6 +372,7 @@ impl LocalAuthorityStateStore {
     }
 }
 
+#[cfg(any(unix, windows))]
 fn open_root(root: &Path) -> Result<Dir, LocalAuthorityStateStoreError> {
     match fs::symlink_metadata(root) {
         Ok(metadata) => ensure_safe_root_metadata(&metadata)?,
@@ -382,19 +384,43 @@ fn open_root(root: &Path) -> Result<Dir, LocalAuthorityStateStoreError> {
     let metadata = fs::symlink_metadata(root)
         .map_err(|source| io_error("reinspect authority root", source))?;
     ensure_safe_root_metadata(&metadata)?;
+    #[cfg(unix)]
     let expected_identity = (metadata.dev(), metadata.ino());
 
     let directory = open_root_without_following(root)?;
     let opened_metadata = directory
         .dir_metadata()
         .map_err(|source| io_error("inspect opened authority root", source))?;
-    if !opened_metadata.is_dir()
-        || (opened_metadata.dev(), opened_metadata.ino()) != expected_identity
-    {
+    #[cfg(unix)]
+    let opened_expected_root = (opened_metadata.dev(), opened_metadata.ino()) == expected_identity;
+    #[cfg(windows)]
+    let opened_expected_root = {
+        // The retained handle omits FILE_SHARE_DELETE, so the root cannot be replaced while this
+        // second no-follow, reparse-validated handle is opened and compared.
+        let verification_directory = open_root_without_following(root)?;
+        let verification_metadata = verification_directory
+            .dir_metadata()
+            .map_err(|source| io_error("reinspect opened authority root", source))?;
+        same_opened_root_identity(&opened_metadata, &verification_metadata)
+    };
+    if !opened_metadata.is_dir() || !opened_expected_root {
         return Err(LocalAuthorityStateStoreError::UnsafeRoot);
     }
     set_private_root_permissions(&directory)?;
     Ok(directory)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_root(_root: &Path) -> Result<Dir, LocalAuthorityStateStoreError> {
+    Err(LocalAuthorityStateStoreError::SecureRootUnsupported)
+}
+
+#[cfg(windows)]
+fn same_opened_root_identity(
+    first: &cap_std::fs::Metadata,
+    second: &cap_std::fs::Metadata,
+) -> bool {
+    (first.dev(), first.ino()) == (second.dev(), second.ino())
 }
 
 fn ensure_safe_root_metadata(metadata: &fs::Metadata) -> Result<(), LocalAuthorityStateStoreError> {
@@ -436,12 +462,6 @@ fn open_root_without_following(root: &Path) -> Result<Dir, LocalAuthorityStateSt
         .map_err(|source| io_error("inspect authority root handle", source))?;
     ensure_safe_root_metadata(&metadata)?;
     Ok(Dir::from_std_file(file))
-}
-
-#[cfg(not(any(unix, windows)))]
-fn open_root_without_following(root: &Path) -> Result<Dir, LocalAuthorityStateStoreError> {
-    Dir::open_ambient_dir(root, ambient_authority())
-        .map_err(|source| io_error("open authority root", source))
 }
 
 #[cfg(windows)]
@@ -587,4 +607,56 @@ fn io_error(operation: &'static str, source: io::Error) -> LocalAuthorityStateSt
 
 fn is_unambiguous_regular(metadata: &cap_std::fs::Metadata) -> bool {
     metadata.is_file() && metadata.nlink() == 1
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::{
+        LocalAuthorityStateStoreError, open_root_without_following, same_opened_root_identity,
+    };
+
+    #[test]
+    fn opened_handle_rejects_a_windows_directory_reparse_point()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::windows::fs::symlink_dir;
+
+        let parent = tempfile::tempdir()?;
+        let real = parent.path().join("real-root");
+        let alias = parent.path().join("root-alias");
+        std::fs::create_dir(&real)?;
+        symlink_dir(&real, &alias)?;
+
+        assert!(matches!(
+            open_root_without_following(&alias),
+            Err(LocalAuthorityStateStoreError::UnsafeRoot)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn opened_root_identity_accepts_the_same_directory_and_rejects_a_different_one()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let parent = tempfile::tempdir()?;
+        let first_path = parent.path().join("first");
+        let second_path = parent.path().join("second");
+        std::fs::create_dir(&first_path)?;
+        std::fs::create_dir(&second_path)?;
+
+        let first = open_root_without_following(&first_path)?;
+        let first_reopened = open_root_without_following(&first_path)?;
+        let second = open_root_without_following(&second_path)?;
+        let first_metadata = first.dir_metadata()?;
+        let first_reopened_metadata = first_reopened.dir_metadata()?;
+        let second_metadata = second.dir_metadata()?;
+
+        assert!(same_opened_root_identity(
+            &first_metadata,
+            &first_reopened_metadata
+        ));
+        assert!(!same_opened_root_identity(
+            &first_metadata,
+            &second_metadata
+        ));
+        Ok(())
+    }
 }
