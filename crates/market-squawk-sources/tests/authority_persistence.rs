@@ -171,7 +171,7 @@ fn clean_shutdown_requires_reconciled_sessions_and_provider_permits() -> TestRes
     };
     assert!(matches!(
         permit_registry.shutdown(),
-        Err(RegistryError::AuthorityPersistence)
+        Err(RegistryError::ActiveAuthorityAtShutdown)
     ));
     permit.release();
     assert!(matches!(

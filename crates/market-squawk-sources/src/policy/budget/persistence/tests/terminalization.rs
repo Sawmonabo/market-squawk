@@ -4,6 +4,12 @@ use super::*;
 
 #[path = "terminalization/branch_matrix.rs"]
 mod branch_matrix;
+#[path = "terminalization/availability_changed.rs"]
+mod availability_changed;
+#[path = "terminalization/lifecycle.rs"]
+mod lifecycle;
+#[path = "terminalization/concurrency.rs"]
+mod concurrency;
 
 #[derive(Debug)]
 struct SwitchableClock {
@@ -367,7 +373,7 @@ fn one_fatal_scope_revokes_alias_peer_future_registration_shutdown_and_restart()
         Err(AuthorityPersistenceError::SessionUnavailable)
     ));
     assert!(matches!(
-        session.close_clean(
+        session.close_clean_for_test(
             crate::RegistryAuthorityState::empty(),
             Timestamp::from_unix_nanos(100),
         ),
@@ -397,9 +403,24 @@ fn failed_terminal_store_leaves_in_use_state_for_unclean_restart_rejection() -> 
         slot: _,
     } = durable_budget(1)?;
     store.reject_stores.store(true, Ordering::Release);
+    let calls_before_terminal = store.store_calls.load(Ordering::Acquire);
     clock.fail();
     let _decision = budget.try_acquire();
     assert!(!session.is_available());
+    assert_eq!(
+        store.store_calls.load(Ordering::Acquire),
+        calls_before_terminal + 1,
+        "the sole terminal writer must attempt exactly one durable publication"
+    );
+    assert!(matches!(
+        budget.try_acquire(),
+        BudgetDecision::Unavailable(BudgetUnavailableReason::PersistenceUnavailable)
+    ));
+    assert_eq!(
+        store.store_calls.load(Ordering::Acquire),
+        calls_before_terminal + 1,
+        "a failed terminal outcome must never be retried by a later caller"
+    );
     store.reject_stores.store(false, Ordering::Release);
 
     let restarted = AuthorityDurabilitySession::open(store, Timestamp::from_unix_nanos(100))?;
@@ -411,5 +432,205 @@ fn failed_terminal_store_leaves_in_use_state_for_unclean_restart_rejection() -> 
             .iter()
             .all(|group| group.checkpoint().terminal && group.checkpoint().poisoned)
     );
+    Ok(())
+}
+
+#[test]
+fn repeated_terminal_persistence_succeeds_only_after_a_proven_terminal_write() -> TestResult {
+    let DurableBudgetFixture {
+        store,
+        session,
+        clock: _,
+        budget,
+        slot: _,
+    } = durable_budget(1)?;
+
+    let calls_before_terminal = store.store_calls.load(Ordering::Acquire);
+    let operation = budget
+        .admit_runtime_operation()
+        .map_err(|reason| format!("operation admission failed: {reason:?}"))?;
+    assert_eq!(
+        budget.terminal_fault(
+            BudgetUnavailableReason::StateCorrupt,
+            &operation,
+        ),
+        BudgetUnavailableReason::StateCorrupt
+    );
+    assert_eq!(
+        store.store_calls.load(Ordering::Acquire),
+        calls_before_terminal + 1
+    );
+    assert!(matches!(
+        budget.try_acquire(),
+        BudgetDecision::Unavailable(BudgetUnavailableReason::PersistenceUnavailable)
+    ));
+    assert_eq!(
+        store.store_calls.load(Ordering::Acquire),
+        calls_before_terminal + 1,
+        "a proven terminal outcome must never be republished by a later caller"
+    );
+    assert!(!session.is_available());
+    Ok(())
+}
+
+#[test]
+fn clean_close_winner_rejects_stale_runtime_entry_without_terminal_io() -> TestResult {
+    let store = Arc::new(BlockingStore::default());
+    let session = AuthorityDurabilitySession::open(
+        store.clone(),
+        Timestamp::from_unix_nanos(100),
+    )?;
+    let declaration = declaration(1)?;
+    let clock = Arc::new(SwitchableClock::new(100, 0));
+    let observation = clock
+        .observation()
+        .map_err(|reason| format!("clock setup failed: {reason:?}"))?;
+    let checkpoint = checkpoint_from_runtime(
+        declaration.policy(),
+        &BudgetState {
+            window_started_at: observation.monotonic,
+            restored_window_ends_at: None,
+            requests_used: 0,
+            in_flight: 0,
+            unavailable_until: None,
+            disabled: false,
+            consecutive_refusals: 0,
+        },
+        observation,
+        1,
+        false,
+    )?;
+    let slot = session.register_budget_group(
+        crate::RegistryAuthorityState::empty(),
+        declaration.clone(),
+        checkpoint,
+        observation.wall_clock,
+    )?;
+    let budget = SharedProviderBudget::new_durable(
+        declaration.policy().clone(),
+        observation.monotonic,
+        clock,
+        BudgetDurabilityBinding {
+            session: session.clone(),
+            slot,
+        },
+    );
+    store.block_next_store();
+
+    let closing_session = session.clone();
+    let close = std::thread::spawn(move || {
+        closing_session.close_clean_for_test(
+            crate::RegistryAuthorityState::empty(),
+            Timestamp::from_unix_nanos(100),
+        )
+    });
+    store.wait_until_blocked()?;
+    let (decision_tx, decision_rx) = std::sync::mpsc::sync_channel(1);
+    let stale = std::thread::spawn(move || {
+        decision_tx.send(budget.try_acquire()).is_ok()
+    });
+    assert!(matches!(
+        decision_rx.recv_timeout(std::time::Duration::from_secs(1))?,
+        BudgetDecision::Unavailable(BudgetUnavailableReason::PersistenceUnavailable)
+    ));
+    store.release_store()?;
+
+    assert_eq!(close.join().map_err(|_| "close thread panicked")?, Ok(()));
+    assert!(stale.join().map_err(|_| "stale thread panicked")?);
+    let payload = store
+        .load()
+        .map_err(|_| "blocking store load failed")?
+        .ok_or("blocking store payload missing")?;
+    let envelope = deserialize_canonical_envelope(&payload)?;
+    assert_eq!(envelope.run_state, DurableRunState::Clean);
+    let restarted = AuthorityDurabilitySession::open(
+        store,
+        Timestamp::from_unix_nanos(100),
+    )?;
+    assert!(!restarted.recovered_unclean());
+    assert!(restarted.is_available());
+    Ok(())
+}
+
+#[test]
+fn terminal_fault_publishes_the_global_latch_before_the_terminal_store_finishes() -> TestResult {
+    use std::sync::mpsc;
+
+    let store = Arc::new(BlockingStore::default());
+    let session = AuthorityDurabilitySession::open(
+        store.clone(),
+        Timestamp::from_unix_nanos(100),
+    )?;
+    let clock = Arc::new(SwitchableClock::new(100, 0));
+    let observation = clock
+        .observation()
+        .map_err(|reason| format!("clock setup failed: {reason:?}"))?;
+    let make_budget = |index: u8| -> TestResult<SharedProviderBudget> {
+        let declaration = declaration(index)?;
+        let checkpoint = checkpoint_from_runtime(
+            declaration.policy(),
+            &BudgetState {
+                window_started_at: observation.monotonic,
+                restored_window_ends_at: None,
+                requests_used: 0,
+                in_flight: 0,
+                unavailable_until: None,
+                disabled: false,
+                consecutive_refusals: 0,
+            },
+            observation,
+            1,
+            false,
+        )?;
+        let slot = session.register_budget_group(
+            crate::RegistryAuthorityState::empty(),
+            declaration.clone(),
+            checkpoint,
+            observation.wall_clock,
+        )?;
+        Ok(SharedProviderBudget::new_durable(
+            declaration.policy().clone(),
+            observation.monotonic,
+            clock.clone(),
+            BudgetDurabilityBinding {
+                session: session.clone(),
+                slot,
+            },
+        ))
+    };
+    let failing = make_budget(1)?;
+    let peer = make_budget(2)?;
+    let peer_lease = peer
+        .availability_lease()
+        .map_err(|reason| format!("peer availability setup failed: {reason:?}"))?;
+    store.block_next_store();
+
+    let terminal_operation = failing
+        .admit_runtime_operation()
+        .map_err(|reason| format!("terminal operation admission failed: {reason:?}"))?;
+    let terminal = std::thread::spawn(move || {
+        failing.terminal_fault(
+            BudgetUnavailableReason::StateCorrupt,
+            &terminal_operation,
+        )
+    });
+    store.wait_until_blocked()?;
+    assert!(!session.is_available());
+    assert!(!peer_lease.is_available());
+
+    let (decision_tx, decision_rx) = mpsc::sync_channel(1);
+    let peer_request =
+        std::thread::spawn(move || decision_tx.send(peer.try_acquire()).is_ok());
+    assert!(matches!(
+        decision_rx.recv_timeout(std::time::Duration::from_secs(1))?,
+        BudgetDecision::Unavailable(BudgetUnavailableReason::PersistenceUnavailable)
+    ));
+    store.release_store()?;
+
+    assert_eq!(
+        terminal.join().map_err(|_| "terminal thread panicked")?,
+        BudgetUnavailableReason::StateCorrupt
+    );
+    assert!(peer_request.join().map_err(|_| "peer thread panicked")?);
     Ok(())
 }

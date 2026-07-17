@@ -4,7 +4,7 @@ mod tests {
     use std::marker::PhantomData;
     use std::str::FromStr;
     use std::sync::{Arc, Barrier, Mutex};
-    use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
     use bytes::Bytes;
@@ -49,6 +49,7 @@ mod tests {
     struct FailingAuthorityStore {
         payload: Mutex<Option<Vec<u8>>>,
         reject_stores: AtomicBool,
+        store_calls: AtomicUsize,
     }
 
     impl FailingAuthorityStore {
@@ -66,6 +67,7 @@ mod tests {
         }
 
         fn store(&self, payload: &[u8]) -> Result<(), AuthorityStateStoreError> {
+            self.store_calls.fetch_add(1, Ordering::AcqRel);
             if self.reject_stores.load(Ordering::Acquire) {
                 return Err(AuthorityStateStoreError::Unavailable);
             }
@@ -401,6 +403,41 @@ mod tests {
         assert!(matches!(
             restrictive_registry.validate_registered(&registered, at),
             Err(RegistryError::SourceRevoked)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn admitted_state_unwind_prevents_clean_shutdown_and_unclean_restart() -> TestResult {
+        let at = Timestamp::from_unix_nanos(1_000_000_000);
+        let store = Arc::new(FailingAuthorityStore::default());
+        let mut registry = durable_registry_with_test_store(store.clone())?;
+        let registered = registry.register(
+            direct_metadata_with_provider_and_limit(
+                "poisoned-shutdown",
+                "revision-1",
+                "poisoned-shutdown-provider",
+                10,
+            )?,
+            at,
+        )?;
+        let budget = registered
+            .budget()
+            .ok_or("poisoned-shutdown budget missing")?;
+        assert!(budget.poison_state_during_admitted_unwind_for_test());
+        let calls_before_shutdown = store.store_calls.load(Ordering::Acquire);
+        assert_eq!(
+            registry.shutdown(),
+            Err(RegistryError::ActiveAuthorityAtShutdown)
+        );
+        assert_eq!(
+            store.store_calls.load(Ordering::Acquire),
+            calls_before_shutdown,
+            "shutdown published state after an admitted unwind"
+        );
+        assert!(matches!(
+            durable_registry_with_test_store(store),
+            Err(RegistryError::UncleanAuthorityPredecessor)
         ));
         Ok(())
     }

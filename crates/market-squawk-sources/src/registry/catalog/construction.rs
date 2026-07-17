@@ -42,6 +42,12 @@ impl AuthoritativeSourceRegistry {
     /// use market_squawk_sources::AuthorityStateStore;
     /// ```
     ///
+    /// The linear unpublished-run capability cannot be named, cloned, or used by callers:
+    ///
+    /// ```compile_fail
+    /// use market_squawk_sources::UnpublishedAuthoritySession;
+    /// ```
+    ///
     /// # Errors
     ///
     /// Fails closed when canonical state is unavailable, invalid, temporally ambiguous, or cannot
@@ -74,8 +80,9 @@ impl AuthoritativeSourceRegistry {
     ) -> Result<Self, RegistryError> {
         let clock: Arc<dyn RegistryClock> = Arc::new(SystemRegistryClock::try_new()?);
         let now = clock.observe()?.wall();
-        let durability = AuthorityDurabilitySession::open(store, now)
+        let unpublished = AuthorityDurabilitySession::open_unpublished(store, now)
             .map_err(map_authority_persistence_error)?;
+        let durability = Arc::clone(unpublished.session());
         if durability.recovered_unclean() {
             durability.invalidate();
             return Err(RegistryError::UncleanAuthorityPredecessor);
@@ -96,11 +103,14 @@ impl AuthoritativeSourceRegistry {
             )
         })();
         match construction {
-            Ok(registry) => Ok(registry),
+            Ok(registry) => {
+                unpublished
+                    .publish()
+                    .map_err(map_authority_persistence_error)?;
+                Ok(registry)
+            }
             Err(error) => {
-                if !durability.recovered_unclean()
-                    && durability.rollback_unpublished_open().is_err()
-                {
+                if !durability.recovered_unclean() && unpublished.rollback().is_err() {
                     return Err(RegistryError::AuthorityPersistence);
                 }
                 Err(error)
@@ -311,9 +321,13 @@ impl AuthoritativeSourceRegistry {
                 if durability.recovered_unclean() {
                     return Err(RegistryError::UncleanAuthorityPredecessor);
                 }
+                let proof = self
+                    .budgets
+                    .validate_clean_shutdown(durability)
+                    .map_err(|_error| RegistryError::ActiveAuthorityAtShutdown)?;
                 let observed = self.clock.observe()?;
                 durability
-                    .close_clean(self.export_authority_state()?, observed.wall())
+                    .close_clean(proof, self.export_authority_state()?, observed.wall())
                     .map_err(map_authority_persistence_error)?;
             }
             AuthorityComposition::EphemeralDiagnostic => {}

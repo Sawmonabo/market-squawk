@@ -11,6 +11,41 @@ struct RegisteredBudget {
     budget: SharedProviderBudget,
 }
 
+/// Non-cloneable proof that every unique runtime allocation reconciled with one session.
+pub(crate) struct CleanShutdownProof {
+    session: Arc<AuthorityDurabilitySession>,
+}
+
+impl std::fmt::Debug for CleanShutdownProof {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CleanShutdownProof")
+            .finish_non_exhaustive()
+    }
+}
+
+impl CleanShutdownProof {
+    pub(crate) fn belongs_to(&self, session: &AuthorityDurabilitySession) -> bool {
+        std::ptr::eq(Arc::as_ptr(&self.session), session)
+    }
+
+    pub(crate) fn invalidate_bound_session(&self) {
+        self.session.invalidate();
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CleanShutdownValidationError {
+    StateUnavailable,
+    TerminalAllocation,
+    DurabilityMismatch,
+    CheckpointMismatch,
+    ActiveRequest,
+    SlotCollision,
+    DeclarationMismatch,
+    OrphanedGroup,
+}
+
 /// Sole composition-owned mint for conservatively colliding network/authorization authority.
 pub(crate) struct ProviderBudgetPool {
     budgets: Vec<RegisteredBudget>,
@@ -234,6 +269,100 @@ impl ProviderBudgetPool {
             policies.push(declaration.clone());
         }
         policies
+    }
+
+    pub(crate) fn validate_clean_shutdown(
+        &self,
+        session: &Arc<AuthorityDurabilitySession>,
+    ) -> Result<CleanShutdownProof, CleanShutdownValidationError> {
+        let Ok(groups) = session.budget_groups() else {
+            return Err(CleanShutdownValidationError::StateUnavailable);
+        };
+        let mut bound_slots = [false; MAX_PROCESS_BUDGET_SCOPES];
+        let mut unique_allocations = 0_usize;
+        for (index, registered) in self.budgets.iter().enumerate() {
+            if self.budgets[..index].iter().any(|earlier| {
+                Arc::ptr_eq(&earlier.budget.allocation, &registered.budget.allocation)
+            }) {
+                continue;
+            }
+            unique_allocations = unique_allocations
+                .checked_add(1)
+                .ok_or(CleanShutdownValidationError::StateUnavailable)?;
+            let allocation = &registered.budget.allocation;
+            if allocation.terminal.load(Ordering::Acquire) {
+                session.invalidate();
+                return Err(CleanShutdownValidationError::TerminalAllocation);
+            }
+            if allocation.state.is_poisoned() {
+                session.invalidate();
+                return Err(CleanShutdownValidationError::StateUnavailable);
+            }
+            let Some(binding) = &allocation.durability else {
+                session.invalidate();
+                return Err(CleanShutdownValidationError::DurabilityMismatch);
+            };
+            if !Arc::ptr_eq(&binding.session, session) {
+                session.invalidate();
+                return Err(CleanShutdownValidationError::DurabilityMismatch);
+            }
+            let Some(group) = groups.get(binding.slot) else {
+                session.invalidate();
+                return Err(CleanShutdownValidationError::CheckpointMismatch);
+            };
+            let Some(slot_seen) = bound_slots.get_mut(binding.slot) else {
+                session.invalidate();
+                return Err(CleanShutdownValidationError::CheckpointMismatch);
+            };
+            if *slot_seen {
+                session.invalidate();
+                return Err(CleanShutdownValidationError::SlotCollision);
+            }
+            *slot_seen = true;
+            let policy_count = self
+                .budgets
+                .iter()
+                .filter(|candidate| {
+                    Arc::ptr_eq(
+                        &candidate.budget.allocation,
+                        &registered.budget.allocation,
+                    )
+                })
+                .count();
+            let declarations_match = self
+                .budgets
+                .iter()
+                .filter(|candidate| {
+                    Arc::ptr_eq(
+                        &candidate.budget.allocation,
+                        &registered.budget.allocation,
+                    )
+                })
+                .all(|candidate| group.declarations().contains(&candidate.persisted));
+            if policy_count != group.declarations().len() || !declarations_match {
+                session.invalidate();
+                return Err(CleanShutdownValidationError::DeclarationMismatch);
+            }
+            let Ok(state) = allocation.state.lock() else {
+                session.invalidate();
+                return Err(CleanShutdownValidationError::StateUnavailable);
+            };
+            if state.in_flight != 0 {
+                session.invalidate();
+                return Err(CleanShutdownValidationError::ActiveRequest);
+            }
+            if group.checkpoint().in_flight() != state.in_flight {
+                session.invalidate();
+                return Err(CleanShutdownValidationError::CheckpointMismatch);
+            }
+        }
+        if unique_allocations != groups.len() {
+            session.invalidate();
+            return Err(CleanShutdownValidationError::OrphanedGroup);
+        }
+        Ok(CleanShutdownProof {
+            session: Arc::clone(session),
+        })
     }
 }
 
@@ -539,6 +668,7 @@ pub enum BudgetPoolError {
 /// RAII reservation for one in-flight provider request.
 pub struct BudgetPermit {
     pub(in crate::policy) allocation: Arc<BudgetAllocation>,
+    pub(in crate::policy) runtime_admission: RuntimeOperationAdmission,
     pub(in crate::policy) released: bool,
 }
 
@@ -564,24 +694,43 @@ impl BudgetPermit {
         let budget = SharedProviderBudget {
             allocation: Arc::clone(&self.allocation),
         };
+        let admission = &self.runtime_admission;
         if !budget.durability_is_available() {
-            let _reason = budget.latch_persistence_failure();
+            let _reason = budget.terminal_fault(
+                BudgetUnavailableReason::PersistenceUnavailable,
+                admission,
+            );
             self.released = true;
             return;
         }
-        let observation = self.allocation.clock.observation();
-        if let (Ok(observation), Ok(mut state)) = (observation, self.allocation.state.lock()) {
-            if let Some(in_flight) = state.in_flight.checked_sub(1) {
-                state.in_flight = in_flight;
-                if budget.persist_locked(&state, observation).is_err() {
-                    let _reason = budget.latch_persistence_failure();
-                }
-            } else {
-                let _reason = budget.latch_persistence_failure();
-            }
-        } else {
-            let _reason = budget.latch_persistence_failure();
-        }
+        let Ok(observation) = self.allocation.clock.observation() else {
+            let _reason = budget.terminal_fault(
+                BudgetUnavailableReason::ClockUnavailable,
+                admission,
+            );
+            self.released = true;
+            return;
+        };
+        let Ok(mut state) = self.allocation.state.lock() else {
+            let _reason = budget.terminal_fault(
+                BudgetUnavailableReason::StatePoisoned,
+                admission,
+            );
+            self.released = true;
+            return;
+        };
+        let Some(in_flight) = state.in_flight.checked_sub(1) else {
+            let _reason = budget.terminal_fault(
+                BudgetUnavailableReason::StateCorrupt,
+                admission,
+            );
+            drop(state);
+            self.released = true;
+            return;
+        };
+        state.in_flight = in_flight;
+        let _persisted = budget.persist_locked(&state, observation, admission);
+        drop(state);
         self.released = true;
     }
 }

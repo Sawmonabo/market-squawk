@@ -243,7 +243,7 @@ fn canonical_envelope_roundtrip_preserves_identical_authenticated_bytes() -> Tes
 #[test]
 fn canonical_envelope_is_identical_across_all_nested_permutations() -> TestResult {
     let fixture = rich_fixture()?;
-    assert!(PERMUTATION_COUNT >= 100);
+    const { assert!(PERMUTATION_COUNT >= 100) };
     assert!(fixture.sources.len() >= 2);
     assert!(
         fixture

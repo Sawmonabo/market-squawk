@@ -19,12 +19,14 @@ impl std::fmt::Debug for BudgetAvailabilityLease {
 impl BudgetAvailabilityLease {
     pub(crate) fn is_available(&self) -> bool {
         !self.allocation.terminal.load(Ordering::Acquire)
+            && !self.allocation.state.is_poisoned()
             && self
                 .allocation
                 .durability
                 .as_ref()
                 .is_none_or(|binding| binding.session.is_available())
             && self.allocation.availability_generation.load(Ordering::Acquire) == self.generation
+            && !self.allocation.state.is_poisoned()
             && !self.allocation.terminal.load(Ordering::Acquire)
     }
 
@@ -49,34 +51,40 @@ impl SharedProviderBudget {
     pub(crate) fn availability_lease(
         &self,
     ) -> Result<BudgetAvailabilityLease, BudgetUnavailableReason> {
-        if !self.durability_is_available() {
-            return Err(self.latch_persistence_failure());
-        }
+        let operation = self.admit_runtime_operation()?;
         if self.allocation.terminal.load(Ordering::Acquire) {
             return Err(BudgetUnavailableReason::AvailabilityGenerationExhausted);
         }
         let observation = match self.allocation.clock.observation() {
             Ok(observation) => observation,
             Err(_reason) => {
-                return self.revoke_and_fail(BudgetUnavailableReason::ClockUnavailable);
+                return self.terminal_fail(
+                    BudgetUnavailableReason::ClockUnavailable,
+                    &operation,
+                );
             }
         };
         let mut state = match self.allocation.state.lock() {
             Ok(state) => state,
-            Err(_) => return self.revoke_and_fail(BudgetUnavailableReason::StatePoisoned),
+            Err(_) => {
+                return self.terminal_fail(
+                    BudgetUnavailableReason::StatePoisoned,
+                    &operation,
+                );
+            }
         };
         if state.disabled {
             return self.revoke_persist_and_fail(
                 &state,
                 observation,
                 BudgetUnavailableReason::Disabled,
+                &operation,
             );
         }
         if observation.monotonic < state.window_started_at {
-            return self.revoke_persist_and_fail(
-                &state,
-                observation,
+            return self.terminal_fail(
                 BudgetUnavailableReason::ClockRegression,
+                &operation,
             );
         }
         if state
@@ -87,6 +95,7 @@ impl SharedProviderBudget {
                 &state,
                 observation,
                 BudgetUnavailableReason::CoolingDown,
+                &operation,
             );
         }
         state.unavailable_until = None;
@@ -96,35 +105,47 @@ impl SharedProviderBudget {
                 .checked_add(self.policy().window_nanos())
         })
         else {
-            return self.revoke_persist_and_fail(
-                &state,
-                observation,
+            return self.terminal_fail(
                 BudgetUnavailableReason::DeadlineOverflow,
+                &operation,
             );
         };
         if observation.monotonic >= window_end {
             state.window_started_at = observation.monotonic;
             state.restored_window_ends_at = None;
             state.requests_used = 0;
-        } else if state.requests_used >= self.policy().requests_per_window() {
+        } else if state.requests_used > self.policy().requests_per_window() {
+            return self.terminal_fail(
+                BudgetUnavailableReason::StateCorrupt,
+                &operation,
+            );
+        } else if state.requests_used == self.policy().requests_per_window() {
             return self.revoke_persist_and_fail(
                 &state,
                 observation,
                 BudgetUnavailableReason::RequestWindowExhausted,
+                &operation,
             );
         }
-        if state.in_flight >= self.policy().max_concurrent() {
+        if state.in_flight > self.policy().max_concurrent() {
+            return self.terminal_fail(
+                BudgetUnavailableReason::StateCorrupt,
+                &operation,
+            );
+        }
+        if state.in_flight == self.policy().max_concurrent() {
             return self.revoke_persist_and_fail(
                 &state,
                 observation,
                 BudgetUnavailableReason::ConcurrencyExhausted,
+                &operation,
             );
         }
         let generation = self
             .allocation
             .availability_generation
             .load(Ordering::Acquire);
-        self.persist_locked(&state, observation)?;
+        self.persist_locked(&state, observation, &operation)?;
         drop(state);
         let lease = BudgetAvailabilityLease {
             allocation: Arc::clone(&self.allocation),
@@ -132,8 +153,15 @@ impl SharedProviderBudget {
         };
         if lease.is_available() {
             Ok(lease)
+        } else if !self.durability_is_available() {
+            self.terminal_fail(
+                BudgetUnavailableReason::PersistenceUnavailable,
+                &operation,
+            )
+        } else if self.allocation.terminal.load(Ordering::Acquire) {
+            Err(BudgetUnavailableReason::AvailabilityGenerationExhausted)
         } else {
-            self.revoke_and_fail(BudgetUnavailableReason::StateCorrupt)
+            Err(BudgetUnavailableReason::AvailabilityChanged)
         }
     }
 }
@@ -141,6 +169,7 @@ impl SharedProviderBudget {
 #[path = "coordinator/durability.rs"]
 mod durability;
 pub use durability::{BudgetPermit, BudgetPoolError};
+pub(in crate::policy) use durability::CleanShutdownProof;
 pub(crate) use durability::ProviderBudgetPool;
 
 pub(super) trait BudgetClock: Send + Sync {

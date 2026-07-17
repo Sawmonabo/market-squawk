@@ -70,6 +70,8 @@ pub enum BudgetUnavailableReason {
     StatePoisoned,
     /// Internal checked counters could not advance consistently.
     StateCorrupt,
+    /// Availability changed legitimately after a candidate lease was minted.
+    AvailabilityChanged,
     /// Process clock could not produce a representable paired observation.
     ClockUnavailable,
     /// Availability generation exhausted and the allocation became irreversibly terminal.

@@ -32,6 +32,7 @@ market-squawk-sources = { path = "crates/market-squawk-sources", version = "=0.1
 num-bigint = "0.4"
 parking_lot = "0.12"
 proptest = "1.7"
+loom = "=0.7.2"
 rust_decimal = { version = "1.36", features = ["serde-with-str"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -65,6 +66,7 @@ unsafe_code = "forbid"
 unreachable_pub = "warn"
 unused_must_use = "deny"
 missing_debug_implementations = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }

@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
     use std::sync::Condvar;
 
     use market_squawk_domain::{
@@ -8,6 +9,8 @@ mod tests {
     };
 
     use super::*;
+
+    static_assertions::assert_not_impl_any!(UnpublishedAuthoritySession: Clone);
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -20,6 +23,7 @@ mod tests {
     struct MemoryStore {
         payload: Mutex<Option<Vec<u8>>>,
         reject_stores: AtomicBool,
+        store_calls: AtomicUsize,
     }
 
     impl MemoryStore {
@@ -48,6 +52,7 @@ mod tests {
         }
 
         fn store(&self, payload: &[u8]) -> Result<(), AuthorityStateStoreError> {
+            self.store_calls.fetch_add(1, Ordering::AcqRel);
             if self.reject_stores.load(Ordering::Acquire) {
                 return Err(AuthorityStateStoreError::Unavailable);
             }
@@ -63,6 +68,8 @@ mod tests {
     struct BlockingStore {
         payload: Mutex<Option<Vec<u8>>>,
         block_next: AtomicBool,
+        store_calls: AtomicUsize,
+        rejected_call: AtomicUsize,
         entered: (Mutex<bool>, Condvar),
         released: (Mutex<bool>, Condvar),
     }
@@ -72,13 +79,23 @@ mod tests {
             self.block_next.store(true, Ordering::Release);
         }
 
+        fn reject_store_call(&self, call: usize) {
+            self.rejected_call.store(call, Ordering::Release);
+        }
+
         fn wait_until_blocked(&self) -> TestResult {
             let (entered, signal) = &self.entered;
-            let mut entered = entered.lock().map_err(|_| "entered lock poisoned")?;
-            while !*entered {
-                entered = signal
-                    .wait(entered)
-                    .map_err(|_| "entered wait poisoned")?;
+            let entered = entered.lock().map_err(|_| "entered lock poisoned")?;
+            let (entered, wait) = signal
+                .wait_timeout(entered, std::time::Duration::from_secs(1))
+                .map_err(|_| "entered wait poisoned")?;
+            if !*entered {
+                let message = if wait.timed_out() {
+                    "timed out waiting for blocked store"
+                } else {
+                    "blocked-store wait woke without entry"
+                };
+                return Err(message.into());
             }
             Ok(())
         }
@@ -100,6 +117,7 @@ mod tests {
         }
 
         fn store(&self, payload: &[u8]) -> Result<(), AuthorityStateStoreError> {
+            let call = self.store_calls.fetch_add(1, Ordering::AcqRel) + 1;
             if self.block_next.swap(false, Ordering::AcqRel) {
                 let (entered, entered_signal) = &self.entered;
                 *entered
@@ -108,14 +126,19 @@ mod tests {
                 entered_signal.notify_all();
 
                 let (released, release_signal) = &self.released;
-                let mut released = released
+                let released = released
                     .lock()
                     .map_err(|_| AuthorityStateStoreError::Unavailable)?;
-                while !*released {
-                    released = release_signal
-                        .wait(released)
-                        .map_err(|_| AuthorityStateStoreError::Unavailable)?;
+                let (released, wait) = release_signal
+                    .wait_timeout(released, std::time::Duration::from_secs(1))
+                    .map_err(|_| AuthorityStateStoreError::Unavailable)?;
+                if !*released {
+                    let _timed_out = wait.timed_out();
+                    return Err(AuthorityStateStoreError::Unavailable);
                 }
+            }
+            if self.rejected_call.load(Ordering::Acquire) == call {
+                return Err(AuthorityStateStoreError::Unavailable);
             }
             self.payload
                 .lock()
@@ -292,12 +315,62 @@ mod tests {
         )?;
         assert!(session.recovered_unclean());
         assert!(matches!(
-            session.close_clean(
+            session.close_clean_for_test(
                 crate::RegistryAuthorityState::empty(),
                 Timestamp::from_unix_nanos(100)
             ),
             Err(AuthorityPersistenceError::SessionUnavailable)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn dropped_unpublished_open_cannot_publish_a_clean_run() -> TestResult {
+        let store = Arc::new(MemoryStore::default());
+        let unpublished = AuthorityDurabilitySession::open_unpublished(
+            store.clone(),
+            Timestamp::from_unix_nanos(100),
+        )?;
+        drop(unpublished);
+
+        let restarted = AuthorityDurabilitySession::open(
+            store,
+            Timestamp::from_unix_nanos(100),
+        )?;
+        assert!(restarted.recovered_unclean());
+        assert!(!restarted.is_available());
+        Ok(())
+    }
+
+    #[test]
+    fn unpublished_rollback_capability_is_bound_to_its_opened_session() -> TestResult {
+        let rolled_back_store = Arc::new(MemoryStore::default());
+        let abandoned_store = Arc::new(MemoryStore::default());
+        let rolled_back = AuthorityDurabilitySession::open_unpublished(
+            rolled_back_store.clone(),
+            Timestamp::from_unix_nanos(100),
+        )?;
+        let abandoned = AuthorityDurabilitySession::open_unpublished(
+            abandoned_store.clone(),
+            Timestamp::from_unix_nanos(100),
+        )?;
+
+        rolled_back.rollback()?;
+        drop(abandoned);
+
+        let clean_restart = AuthorityDurabilitySession::open(
+            rolled_back_store,
+            Timestamp::from_unix_nanos(100),
+        )?;
+        assert!(!clean_restart.recovered_unclean());
+        assert!(clean_restart.is_available());
+
+        let unclean_restart = AuthorityDurabilitySession::open(
+            abandoned_store,
+            Timestamp::from_unix_nanos(100),
+        )?;
+        assert!(unclean_restart.recovered_unclean());
+        assert!(!unclean_restart.is_available());
         Ok(())
     }
 
@@ -363,7 +436,7 @@ mod tests {
 
         let closing = session.clone();
         let close = std::thread::spawn(move || {
-            closing.close_clean(
+            closing.close_clean_for_test(
                 crate::RegistryAuthorityState::empty(),
                 Timestamp::from_unix_nanos(100),
             )

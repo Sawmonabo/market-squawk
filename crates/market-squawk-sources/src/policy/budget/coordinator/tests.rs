@@ -93,6 +93,30 @@ mod coordinator_tests {
         Ok(pool.register(policy)?)
     }
 
+    fn durable_pool(
+        prefix: &str,
+        count: u8,
+    ) -> TestResult<(
+        Arc<AuthorityDurabilitySession>,
+        ProviderBudgetPool,
+        ClockObservation,
+    )> {
+        let clock = SystemBudgetClock::new();
+        let observation = clock
+            .observation()
+            .map_err(|reason| format!("test clock unavailable: {reason:?}"))?;
+        let store: Arc<dyn AuthorityStateStore> = Arc::new(NoopAuthorityStore);
+        let session = AuthorityDurabilitySession::open(store, observation.wall_clock)?;
+        let mut pool = ProviderBudgetPool::new_durable(session.clone());
+        for index in 0..count {
+            pool.register_durable(
+                resolved_policy(&format!("{prefix}-clean-proof-{index}"), 2)?,
+                &crate::RegistryAuthorityState::empty(),
+            )?;
+        }
+        Ok((session, pool, observation))
+    }
+
     #[test]
     fn account_qualified_policy_has_an_exact_shared_allocation_charge() -> TestResult {
         fn capacity_identifier(character: char) -> TestResult<SourceIdentifier> {
@@ -370,6 +394,79 @@ mod coordinator_tests {
             Err(BudgetPoolError::Persistence)
         ));
         assert!(coordinator.allocations.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn clean_shutdown_proof_requires_allocation_slot_group_bijection() -> TestResult {
+        let (orphan_session, orphan_pool, observation) = durable_pool("orphan", 1)?;
+        let orphan_policy = resolved_policy("orphan-clean-group", 2)?;
+        let orphan_checkpoint = checkpoint_from_runtime(
+            orphan_policy.policy(),
+            &BudgetState {
+                window_started_at: observation.monotonic,
+                restored_window_ends_at: None,
+                requests_used: 0,
+                in_flight: 0,
+                unavailable_until: None,
+                disabled: false,
+                consecutive_refusals: 0,
+            },
+            observation,
+            1,
+            false,
+        )?;
+        orphan_session.register_budget_group(
+            crate::RegistryAuthorityState::empty(),
+            orphan_policy.persisted().clone(),
+            orphan_checkpoint,
+            observation.wall_clock,
+        )?;
+        assert!(matches!(
+            orphan_pool.validate_clean_shutdown(&orphan_session),
+            Err(CleanShutdownValidationError::OrphanedGroup)
+        ));
+
+        let (collision_session, mut collision_pool, collision_observation) =
+            durable_pool("collision", 2)?;
+        let second_policy = collision_pool
+            .budgets
+            .get(1)
+            .ok_or("second registered budget missing")?
+            .budget
+            .policy()
+            .clone();
+        collision_pool
+            .budgets
+            .get_mut(1)
+            .ok_or("second registered budget missing")?
+            .budget = SharedProviderBudget::new_durable(
+            second_policy,
+            collision_observation.monotonic,
+            Arc::new(SystemBudgetClock::new()),
+            BudgetDurabilityBinding {
+                session: collision_session.clone(),
+                slot: 0,
+            },
+        );
+        assert!(matches!(
+            collision_pool.validate_clean_shutdown(&collision_session),
+            Err(CleanShutdownValidationError::SlotCollision)
+        ));
+
+        let (declaration_session, mut declaration_pool, _observation) =
+            durable_pool("declaration", 1)?;
+        declaration_pool
+            .budgets
+            .get_mut(0)
+            .ok_or("registered budget missing")?
+            .persisted = resolved_policy("mismatched-clean-declaration", 2)?
+            .persisted()
+            .clone();
+        assert!(matches!(
+            declaration_pool.validate_clean_shutdown(&declaration_session),
+            Err(CleanShutdownValidationError::DeclarationMismatch)
+        ));
         Ok(())
     }
 }

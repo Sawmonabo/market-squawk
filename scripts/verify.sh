@@ -10,6 +10,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-targets --all-features --locked
 cargo test --doc --workspace --all-features --locked
+./scripts/check_authority_lifecycle_loom.sh
 cargo build --workspace --all-features --release --locked
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
 cargo build -p market-squawk --all-features --locked

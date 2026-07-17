@@ -18,6 +18,7 @@ pub(crate) use budget_identity::{
 };
 pub(in crate::policy) use budget_identity::BudgetCollisionMergeError;
 pub use budget_runtime::SharedProviderBudget;
+pub(in crate::policy) use budget_runtime::RuntimeOperationAdmission;
 pub use budget_runtime_types::{
     BudgetDecision, BudgetUnavailableReason, MonotonicInstant, RetryAfter,
 };
@@ -30,7 +31,9 @@ pub(in crate::policy) use budget_checkpoint::{
 use budget_coordinator::BudgetClock;
 pub use budget_coordinator::{BudgetPermit, BudgetPoolError};
 pub(crate) use budget_coordinator::{BudgetAvailabilityLease, ProviderBudgetPool};
+pub(in crate::policy) use budget_coordinator::CleanShutdownProof;
 pub(crate) use persistence::{AuthorityPersistenceError, AuthorityStateStore};
 pub(crate) use persistence::{
     AuthorityDurabilitySession, BudgetCheckpointState, DurableBudgetGroup,
 };
+pub(in crate::policy) use persistence::lifecycle::AuthorityOperationAdmission;

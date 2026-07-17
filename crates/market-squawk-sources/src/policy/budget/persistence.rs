@@ -1,17 +1,20 @@
 //! Restart-durable provider-budget checkpoints and the narrow opaque store contract.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-
 use super::*;
+
+#[path = "persistence/terminal.rs"]
+mod terminal;
+#[path = "persistence/lifecycle.rs"]
+pub(in crate::policy) mod lifecycle;
 
 pub(crate) const MAX_DURABLE_AUTHORITY_STATE_BYTES: usize = 8 * 1024 * 1024;
 const DURABLE_AUTHORITY_FORMAT_VERSION: u16 = 1;
 
 /// Opaque, synchronous durability boundary used only by the source control plane.
 ///
-/// Implementations must make a successful [`Self::store`] durable before returning. The platform
-/// crate provides the path-confined local implementation; adapters may map its typed failures to
-/// [`AuthorityStateStoreError`] without exposing filesystem access to the source state machine.
+/// Implementations must make a successful [`Self::store`] durable before returning. Production
+/// composition accepts only the path-confined platform store; alternate implementations are
+/// crate-private deterministic fault injectors used by this module's tests.
 pub(crate) trait AuthorityStateStore: std::fmt::Debug + Send + Sync {
     /// Loads the sole canonical payload without following alternate or recovery files.
     ///
@@ -320,12 +323,66 @@ pub(crate) struct AuthorityDurabilitySession {
     store: Mutex<Option<Arc<dyn AuthorityStateStore>>>,
     envelope: Mutex<DurableAuthorityEnvelope>,
     recovered_unclean: bool,
-    failed: AtomicBool,
-    closed: AtomicBool,
+    lifecycle: lifecycle::AuthorityLifecycleWord,
+}
+
+/// Linear capability for a newly opened run that has not entered registry ownership yet.
+#[derive(Debug)]
+pub(crate) struct UnpublishedAuthoritySession {
+    session: Arc<AuthorityDurabilitySession>,
+    finalized: bool,
+}
+
+impl UnpublishedAuthoritySession {
+    pub(crate) fn session(&self) -> &Arc<AuthorityDurabilitySession> {
+        &self.session
+    }
+
+    pub(crate) fn publish(mut self) -> Result<(), AuthorityPersistenceError> {
+        if !self.session.is_available() {
+            return Err(AuthorityPersistenceError::SessionUnavailable);
+        }
+        self.finalized = true;
+        Ok(())
+    }
+
+    pub(crate) fn rollback(mut self) -> Result<(), AuthorityPersistenceError> {
+        let result = self.session.rollback_unpublished_open();
+        if result.is_ok() {
+            self.finalized = true;
+        }
+        result
+    }
+}
+
+impl Drop for UnpublishedAuthoritySession {
+    fn drop(&mut self) {
+        if !self.finalized {
+            self.session.invalidate();
+        }
+    }
 }
 
 impl AuthorityDurabilitySession {
+    pub(crate) fn open_unpublished(
+        store: Arc<dyn AuthorityStateStore>,
+        now: Timestamp,
+    ) -> Result<UnpublishedAuthoritySession, AuthorityPersistenceError> {
+        Self::open_session(store, now).map(|session| UnpublishedAuthoritySession {
+            session,
+            finalized: false,
+        })
+    }
+
+    #[cfg(test)]
     pub(crate) fn open(
+        store: Arc<dyn AuthorityStateStore>,
+        now: Timestamp,
+    ) -> Result<Arc<Self>, AuthorityPersistenceError> {
+        Self::open_session(store, now)
+    }
+
+    fn open_session(
         store: Arc<dyn AuthorityStateStore>,
         now: Timestamp,
     ) -> Result<Arc<Self>, AuthorityPersistenceError> {
@@ -361,25 +418,30 @@ impl AuthorityDurabilitySession {
             store: Mutex::new(Some(store)),
             envelope: Mutex::new(envelope),
             recovered_unclean,
-            failed: AtomicBool::new(false),
-            closed: AtomicBool::new(false),
+            lifecycle: lifecycle::AuthorityLifecycleWord::new(Self::initial_lifecycle_word()),
         }))
     }
 
     pub(crate) fn is_available(&self) -> bool {
         !self.recovered_unclean
-            && !self.failed.load(Ordering::Acquire)
-            && !self.closed.load(Ordering::Acquire)
+            && !self.envelope.is_poisoned()
+            && !self.store.is_poisoned()
+            && self.lifecycle_is_active()
     }
 
     pub(crate) fn invalidate(&self) {
-        self.failed.store(true, Ordering::Release);
-        let Ok(_envelope) = self.envelope.lock() else {
+        if !self.fail_active_session_without_terminal_write() {
             return;
-        };
-        if let Ok(mut store) = self.store.lock() {
-            *store = None;
         }
+        let _envelope = match self.envelope.lock() {
+            Ok(envelope) => envelope,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let mut store = match self.store.lock() {
+            Ok(store) => store,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *store = None;
     }
 
     pub(crate) const fn recovered_unclean(&self) -> bool {
@@ -405,7 +467,7 @@ impl AuthorityDurabilitySession {
     }
 
     pub(crate) fn register_budget_group(
-        &self,
+        self: &Arc<Self>,
         registry: crate::RegistryAuthorityState,
         declaration: PersistedProviderBudgetPolicy,
         checkpoint: BudgetCheckpointState,
@@ -430,7 +492,7 @@ impl AuthorityDurabilitySession {
     }
 
     pub(crate) fn add_budget_declaration(
-        &self,
+        self: &Arc<Self>,
         slot: usize,
         registry: crate::RegistryAuthorityState,
         declaration: PersistedProviderBudgetPolicy,
@@ -449,8 +511,9 @@ impl AuthorityDurabilitySession {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn update_budget(
-        &self,
+        self: &Arc<Self>,
         slot: usize,
         checkpoint: BudgetCheckpointState,
         wall: Timestamp,
@@ -469,8 +532,29 @@ impl AuthorityDurabilitySession {
         })
     }
 
-    pub(crate) fn persist_registry(
+    pub(in crate::policy) fn update_budget_admitted(
         &self,
+        admission: &lifecycle::AuthorityOperationAdmission,
+        slot: usize,
+        checkpoint: BudgetCheckpointState,
+        wall: Timestamp,
+    ) -> Result<(), AuthorityPersistenceError> {
+        self.transact_with_admission(admission, wall, |envelope, wall_adjustment| {
+            let mut budgets = envelope.budgets.as_slice().to_vec();
+            let mut anchored = checkpoint;
+            anchored.shift_wall_anchor(wall_adjustment)?;
+            budgets
+                .get_mut(slot)
+                .ok_or(AuthorityPersistenceError::InvalidState)?
+                .checkpoint = anchored;
+            envelope.budgets = BoundedVec::try_new(budgets)
+                .map_err(|_| AuthorityPersistenceError::StateTooLarge)?;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn persist_registry(
+        self: &Arc<Self>,
         registry: crate::RegistryAuthorityState,
         wall: Timestamp,
     ) -> Result<(), AuthorityPersistenceError> {
@@ -481,30 +565,46 @@ impl AuthorityDurabilitySession {
     }
 
     pub(crate) fn close_clean(
-        &self,
+        self: &Arc<Self>,
+        proof: CleanShutdownProof,
         registry: crate::RegistryAuthorityState,
         wall: Timestamp,
     ) -> Result<(), AuthorityPersistenceError> {
-        self.transact_and_maybe_close(
-            wall,
-            true,
-            |envelope, _wall_adjustment| {
-                if envelope
-                    .budgets
-                    .as_slice()
-                    .iter()
-                    .any(|group| group.checkpoint.in_flight != 0)
-                {
-                    return Err(AuthorityPersistenceError::InvalidState);
-                }
-                envelope.registry = registry;
-                envelope.run_state = DurableRunState::Clean;
-                Ok(())
-            },
-        )
+        if !proof.belongs_to(self) {
+            proof.invalidate_bound_session();
+            self.invalidate();
+            return Err(AuthorityPersistenceError::SessionUnavailable);
+        }
+        self.close_clean_after_validation(registry, wall)
     }
 
-    pub(crate) fn rollback_unpublished_open(&self) -> Result<(), AuthorityPersistenceError> {
+    #[cfg(test)]
+    pub(crate) fn close_clean_for_test(
+        self: &Arc<Self>,
+        registry: crate::RegistryAuthorityState,
+        wall: Timestamp,
+    ) -> Result<(), AuthorityPersistenceError> {
+        self.close_clean_after_validation(registry, wall)
+    }
+
+    fn close_clean_after_validation(
+        self: &Arc<Self>,
+        registry: crate::RegistryAuthorityState,
+        wall: Timestamp,
+    ) -> Result<(), AuthorityPersistenceError> {
+        if self.recovered_unclean {
+            return Err(AuthorityPersistenceError::SessionUnavailable);
+        }
+        self.begin_clean_close()?;
+        let result = self.store_clean_envelope(registry, wall);
+        self.finish_clean_close(result.is_ok());
+        self.detach_store();
+        result
+    }
+
+    fn rollback_unpublished_open(
+        self: &Arc<Self>,
+    ) -> Result<(), AuthorityPersistenceError> {
         if self.recovered_unclean {
             return Err(AuthorityPersistenceError::SessionUnavailable);
         }
@@ -513,77 +613,131 @@ impl AuthorityDurabilitySession {
             .lock()
             .map(|envelope| (envelope.registry.clone(), envelope.wall_high_water))
             .map_err(|_| self.fail(AuthorityPersistenceError::SessionUnavailable))?;
-        self.close_clean(registry, wall)
+        self.close_clean_after_validation(registry, wall)
     }
 
     fn transact(
-        &self,
+        self: &Arc<Self>,
         wall: Timestamp,
         mutation: impl FnOnce(
             &mut DurableAuthorityEnvelope,
             i64,
         ) -> Result<(), AuthorityPersistenceError>,
     ) -> Result<(), AuthorityPersistenceError> {
-        self.transact_and_maybe_close(wall, false, mutation)
+        let admission = self.admit_operation()?;
+        self.transact_with_admission(&admission, wall, mutation)
     }
 
-    fn transact_and_maybe_close(
+    fn transact_with_admission(
         &self,
+        admission: &lifecycle::AuthorityOperationAdmission,
         wall: Timestamp,
-        close_after_store: bool,
         mutation: impl FnOnce(
             &mut DurableAuthorityEnvelope,
             i64,
         ) -> Result<(), AuthorityPersistenceError>,
     ) -> Result<(), AuthorityPersistenceError> {
-        if !self.is_available() {
+        if !admission.belongs_to(self) {
+            self.invalidate();
+            return Err(AuthorityPersistenceError::SessionUnavailable);
+        }
+        let result = self.transact_admitted(admission, wall, mutation);
+        if result.is_err() {
+            admission.latch_terminal();
+            let _terminal = self.persist_terminal_and_detach();
+        }
+        result
+    }
+
+    fn transact_admitted(
+        &self,
+        admission: &lifecycle::AuthorityOperationAdmission,
+        wall: Timestamp,
+        mutation: impl FnOnce(
+            &mut DurableAuthorityEnvelope,
+            i64,
+        ) -> Result<(), AuthorityPersistenceError>,
+    ) -> Result<(), AuthorityPersistenceError> {
+        if !admission.is_active_for(self) {
             return Err(AuthorityPersistenceError::SessionUnavailable);
         }
         let mut current = self
             .envelope
             .lock()
-            .map_err(|_| self.fail(AuthorityPersistenceError::SessionUnavailable))?;
-        if !self.is_available() {
+            .map_err(|_| AuthorityPersistenceError::SessionUnavailable)?;
+        if !admission.is_active_for(self) {
             return Err(AuthorityPersistenceError::SessionUnavailable);
         }
         let effective_wall = wall.max(current.wall_high_water);
         let wall_adjustment = effective_wall
             .unix_nanos()
             .checked_sub(wall.unix_nanos())
-            .ok_or_else(|| self.fail(AuthorityPersistenceError::InvalidState))?;
+            .ok_or(AuthorityPersistenceError::InvalidState)?;
         let mut candidate = current.clone();
-        mutation(&mut candidate, wall_adjustment).map_err(|error| self.fail(error))?;
+        mutation(&mut candidate, wall_adjustment)?;
         candidate.saved_at_wall = effective_wall;
         candidate.wall_high_water = effective_wall;
-        let payload = serialize_canonical_envelope(&candidate).map_err(|error| self.fail(error))?;
-        let mut store = self
+        let payload = serialize_canonical_envelope(&candidate)?;
+        let store = self
             .store
             .lock()
-            .map_err(|_| self.fail(AuthorityPersistenceError::SessionUnavailable))?;
-        if !self.is_available() {
+            .map_err(|_| AuthorityPersistenceError::SessionUnavailable)?;
+        if !admission.is_active_for(self) {
             return Err(AuthorityPersistenceError::SessionUnavailable);
         }
         let Some(active_store) = store.as_ref() else {
-            return Err(self.fail(AuthorityPersistenceError::SessionUnavailable));
+            return Err(AuthorityPersistenceError::SessionUnavailable);
         };
         if active_store.store(&payload).is_err() {
-            self.failed.store(true, Ordering::Release);
-            *store = None;
             return Err(AuthorityPersistenceError::Store);
         }
         *current = candidate;
-        if self.failed.load(Ordering::Acquire) {
+        if !admission.is_active_for(self) {
             return Err(AuthorityPersistenceError::SessionUnavailable);
-        }
-        if close_after_store {
-            self.closed.store(true, Ordering::Release);
-            *store = None;
         }
         Ok(())
     }
 
+    fn store_clean_envelope(
+        &self,
+        registry: crate::RegistryAuthorityState,
+        wall: Timestamp,
+    ) -> Result<(), AuthorityPersistenceError> {
+        let mut current = self
+            .envelope
+            .lock()
+            .map_err(|_| AuthorityPersistenceError::SessionUnavailable)?;
+        if current
+            .budgets
+            .as_slice()
+            .iter()
+            .any(|group| group.checkpoint.in_flight != 0)
+        {
+            return Err(AuthorityPersistenceError::InvalidState);
+        }
+        let effective_wall = wall.max(current.wall_high_water);
+        let mut candidate = current.clone();
+        candidate.registry = registry;
+        candidate.run_state = DurableRunState::Clean;
+        candidate.saved_at_wall = effective_wall;
+        candidate.wall_high_water = effective_wall;
+        let payload = serialize_canonical_envelope(&candidate)?;
+        let store = self
+            .store
+            .lock()
+            .map_err(|_| AuthorityPersistenceError::SessionUnavailable)?;
+        let active_store = store
+            .as_ref()
+            .ok_or(AuthorityPersistenceError::SessionUnavailable)?;
+        active_store
+            .store(&payload)
+            .map_err(|_| AuthorityPersistenceError::Store)?;
+        *current = candidate;
+        Ok(())
+    }
+
     fn fail(&self, error: AuthorityPersistenceError) -> AuthorityPersistenceError {
-        self.failed.store(true, Ordering::Release);
+        self.invalidate();
         error
     }
 }

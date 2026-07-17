@@ -90,7 +90,6 @@ fn assert_global_terminal(
     assert!(matches!(
         fixture.alias.try_acquire(),
         BudgetDecision::Unavailable(BudgetUnavailableReason::PersistenceUnavailable)
-            | BudgetDecision::Unavailable(BudgetUnavailableReason::AvailabilityGenerationExhausted)
     ));
     assert_eq!(
         fixture
@@ -115,7 +114,7 @@ fn assert_global_terminal(
         Err(AuthorityPersistenceError::SessionUnavailable)
     ));
     assert!(matches!(
-        fixture.session.close_clean(
+        fixture.session.close_clean_for_test(
             crate::RegistryAuthorityState::empty(),
             Timestamp::from_unix_nanos(100),
         ),
@@ -231,7 +230,11 @@ fn availability_fatal_branch_matrix_invalidates_global_durability() -> TestResul
                 BudgetUnavailableReason::AvailabilityGenerationExhausted
             }
         };
-        assert!(matches!(fixture.budget.availability_lease(), Err(reason) if reason == expected));
+        let observed = fixture.budget.availability_lease();
+        assert!(
+            matches!(observed, Err(reason) if reason == expected),
+            "unexpected availability result for {case:?}: {observed:?}"
+        );
         assert_global_terminal(
             fixture,
             !matches!(case, AvailabilityFatalCase::PersistenceFailure),
@@ -526,6 +529,76 @@ fn administrative_fatal_branch_matrix_invalidates_global_durability() -> TestRes
                     | AdministrativeFatalCase::DisablePersistenceFailure
             ),
         )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn prelatched_session_failure_still_uses_an_available_store_for_global_terminalization()
+-> TestResult {
+    let fixture = global_fault_fixture()?;
+    let operation = fixture
+        .budget
+        .admit_runtime_operation()
+        .map_err(|reason| format!("operation admission failed: {reason:?}"))?;
+    let durable_operation = fixture
+        .budget
+        .validated_durable_admission(&operation)
+        .map_err(|reason| format!("durable admission validation failed: {reason:?}"))?
+        .ok_or("durable operation admission missing")?;
+    durable_operation.latch_terminal();
+
+    assert_eq!(
+        fixture
+            .budget
+            .terminal_fault(BudgetUnavailableReason::StateCorrupt, &operation),
+        BudgetUnavailableReason::StateCorrupt
+    );
+    assert_global_terminal(fixture, true)
+}
+
+#[derive(Clone, Copy, Debug)]
+enum GenerationExhaustionEntryPoint {
+    TryAcquire,
+    RetryAfter,
+    Refusal,
+    Disable,
+}
+
+#[test]
+fn generation_exhaustion_is_not_masked_by_a_later_persistence_attempt() -> TestResult {
+    for entry_point in [
+        GenerationExhaustionEntryPoint::TryAcquire,
+        GenerationExhaustionEntryPoint::RetryAfter,
+        GenerationExhaustionEntryPoint::Refusal,
+        GenerationExhaustionEntryPoint::Disable,
+    ] {
+        let fixture = global_fault_fixture()?;
+        fixture
+            .budget
+            .allocation
+            .availability_generation
+            .store(u64::MAX, Ordering::Release);
+        let observed = match entry_point {
+            GenerationExhaustionEntryPoint::TryAcquire => fixture.budget.try_acquire(),
+            GenerationExhaustionEntryPoint::RetryAfter => {
+                fixture.budget.apply_retry_after(RetryAfter::Delay(
+                    NonZeroU64::new(1).ok_or("retry delay must be nonzero")?,
+                ))
+            }
+            GenerationExhaustionEntryPoint::Refusal => fixture.budget.apply_refusal(0),
+            GenerationExhaustionEntryPoint::Disable => fixture.budget.disable(),
+        };
+        assert!(
+            matches!(
+                observed,
+                BudgetDecision::Unavailable(
+                    BudgetUnavailableReason::AvailabilityGenerationExhausted
+                )
+            ),
+            "generation exhaustion was masked for {entry_point:?}: {observed:?}"
+        );
+        assert_global_terminal(fixture, true)?;
     }
     Ok(())
 }

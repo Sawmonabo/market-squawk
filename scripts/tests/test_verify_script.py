@@ -25,6 +25,16 @@ class VerifyScriptTests(unittest.TestCase):
             ),
         )
 
+    def test_bounded_authority_lifecycle_model_is_a_required_gate(self) -> None:
+        script = VERIFY_SCRIPT.read_text()
+        self.assertRegex(
+            script,
+            re.compile(
+                r"^\./scripts/check_authority_lifecycle_loom\.sh$",
+                flags=re.MULTILINE,
+            ),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
