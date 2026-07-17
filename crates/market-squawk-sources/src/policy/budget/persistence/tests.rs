@@ -11,6 +11,8 @@ mod tests {
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
+    #[path = "canonical_envelope.rs"]
+    mod canonical_envelope;
     #[path = "terminalization.rs"]
     mod terminalization;
 
