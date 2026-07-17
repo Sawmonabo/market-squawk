@@ -11,6 +11,9 @@ mod tests {
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
+    #[path = "terminalization.rs"]
+    mod terminalization;
+
     #[derive(Debug, Default)]
     struct MemoryStore {
         payload: Mutex<Option<Vec<u8>>>,
