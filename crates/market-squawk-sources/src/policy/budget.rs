@@ -60,8 +60,12 @@ impl BudgetScope {
     }
 
     fn dynamic_retained_bytes(&self) -> Option<usize> {
-        self.provider.retained_bytes().checked_add(
-            self.authorization_account
+        let Self {
+            provider,
+            authorization_account,
+        } = self;
+        provider.retained_bytes().checked_add(
+            authorization_account
                 .as_ref()
                 .map_or(0, SourceIdentifier::retained_bytes),
         )
@@ -118,6 +122,15 @@ impl BackoffPolicy {
         base.checked_add(jitter)
             .unwrap_or(self.maximum_nanos.get())
             .min(self.maximum_nanos.get())
+    }
+
+    fn dynamic_retained_bytes(&self) -> Option<usize> {
+        let Self {
+            initial_nanos: _,
+            maximum_nanos: _,
+            jitter_basis_points: _,
+        } = self;
+        Some(0)
     }
 }
 
@@ -184,7 +197,16 @@ impl ProviderBudgetPolicy {
     }
 
     fn dynamic_retained_bytes(&self) -> Option<usize> {
-        self.scope.dynamic_retained_bytes()
+        let Self {
+            scope,
+            requests_per_window: _,
+            window_nanos: _,
+            max_concurrent: _,
+            backoff,
+        } = self;
+        scope
+            .dynamic_retained_bytes()?
+            .checked_add(backoff.dynamic_retained_bytes()?)
     }
 }
 

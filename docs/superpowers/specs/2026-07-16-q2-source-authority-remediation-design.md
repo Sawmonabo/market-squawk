@@ -41,12 +41,14 @@ matches, then sum the actual retained capacities with checked arithmetic. This i
 compiler boundary: adding a retained field or enum variant fails compilation until its allocation
 treatment is declared. Evidence accounting includes both identities in every optional
 version-pinned locator; there is no handwritten policy-wide identifier count to drift from the
-type shape.
+type shape. The separately shared process-budget branch applies the same rule: `BudgetScope`,
+`ProviderBudgetPolicy`, and nested `BackoffPolicy` exhaustively bind every field before the budget
+allocation is charged into retained current authority.
 
 Tests cover each payload variant and boundary-size snapshots/deltas at 1, 10,000, and 20,000
-elements. A maximum-policy test exercises all nested locator allocations. A live admission
-regression chooses a byte limit between the former shallow estimate and the correct retained size
-and proves rejection.
+elements. Maximum-policy tests exercise all nested locator allocations and a maximum-capacity,
+account-qualified process-budget allocation. A live admission regression chooses a byte limit
+between the former shallow estimate and the correct retained size and proves rejection.
 
 ## Trusted health time and temporal chain
 

@@ -296,6 +296,52 @@ mod coordinator_tests {
     }
 
     #[test]
+    fn account_qualified_policy_has_an_exact_shared_allocation_charge() -> TestResult {
+        fn capacity_identifier(character: char) -> TestResult<SourceIdentifier> {
+            let mut value = String::with_capacity(SourceIdentifier::MAX_LENGTH);
+            value.push(character);
+            Ok(SourceIdentifier::try_from(value)?)
+        }
+
+        let provider = capacity_identifier('p')?;
+        let account = capacity_identifier('a')?;
+        let expected_dynamic = provider
+            .retained_bytes()
+            .checked_add(account.retained_bytes())
+            .ok_or("budget policy dynamic charge overflow")?;
+        let policy = ProviderBudgetPolicy::try_new(
+            BudgetScope::with_authorization_account(provider, account),
+            NonZeroU32::new(1).ok_or("request limit must be nonzero")?,
+            NonZeroU64::new(60_000_000_000).ok_or("window must be nonzero")?,
+            NonZeroU16::new(1).ok_or("concurrency must be nonzero")?,
+            BackoffPolicy::try_new(
+                NonZeroU64::new(1_000_000).ok_or("backoff must be nonzero")?,
+                NonZeroU64::new(60_000_000_000).ok_or("backoff cap must be nonzero")?,
+                0,
+            )?,
+        )?;
+        let clock = Arc::new(SystemBudgetClock::new());
+        let starts_at = clock
+            .observation()
+            .map_err(|reason| std::io::Error::other(format!("clock unavailable: {reason:?}")))?
+            .monotonic;
+        let budget = SharedProviderBudget::new(policy, starts_at, clock.clone());
+        let lease = budget.availability_lease().map_err(|reason| {
+            std::io::Error::other(format!("budget lease unavailable: {reason:?}"))
+        })?;
+        let expected = std::mem::size_of::<BudgetAllocation>()
+            .checked_add(crate::conservative_arc_control_block_charge::<
+                BudgetAllocation,
+            >())
+            .and_then(|bytes| bytes.checked_add(expected_dynamic))
+            .and_then(|bytes| bytes.checked_add(clock.shared_allocation_charge()))
+            .ok_or("shared budget allocation charge overflow")?;
+
+        assert_eq!(lease.shared_allocation_charge(), Some(expected));
+        Ok(())
+    }
+
+    #[test]
     fn dropping_every_external_handle_cannot_reset_request_state() -> TestResult {
         let policy = test_policy("drop-reset-request-state", 1)?;
         let budget = register_fresh(policy.clone())?;

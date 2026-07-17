@@ -15,7 +15,9 @@ and planned in
   Current-policy accounting now exhaustively binds every allocation-bearing field or enum variant,
   charges actual retained capacities—including both identities in optional version-pinned evidence
   locators—and uses checked arithmetic. Future retained fields therefore require explicit
-  allocation treatment at compile time; no handwritten policy-wide occurrence counts remain.
+  allocation treatment at compile time; no handwritten policy-wide occurrence counts remain. The
+  shared process-budget contribution applies the same exhaustive treatment to provider/account
+  scope, provider policy, and nested backoff policy before entering the queued-authority charge.
 - Remote provider budgets are process-authoritative by authorization-derived provider/account
   scope. Independent registries and restored state share request, concurrency, cooldown, disabled,
   and availability-generation state. Every unavailable transition synchronously revokes retained
@@ -48,7 +50,8 @@ recovers only through an authorized provider path under the same evidenced ident
 ## Verification scope
 
 Deterministic coverage includes nested retained-size bounds, a maximum policy with every optional
-version-pinned evidence locator, concurrent process-budget conflicts,
+version-pinned evidence locator, an exact maximum-capacity account-qualified budget allocation,
+concurrent process-budget conflicts,
 cross-registry shared concurrency/cooldown, complete-handle-drop state retention, coordinator and
 source capacity atomicity, every availability-revocation branch, temporal-order rejection without
 mutation, acceptance-bound rollback, trusted-clock failure and discontinuity, deadline/epoch
