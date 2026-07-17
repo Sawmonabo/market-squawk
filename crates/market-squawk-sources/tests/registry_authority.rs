@@ -39,6 +39,7 @@ assert_not_impl_any!(market_squawk_sources::CurrentHealthReporter: Clone, Sync, 
 assert_not_impl_any!(market_squawk_sources::CurrentHealthUpdate: Clone, serde::Serialize, serde::de::DeserializeOwned);
 assert_not_impl_any!(market_squawk_sources::RawFrameFactory: Clone, Sync, serde::Serialize, serde::de::DeserializeOwned);
 assert_not_impl_any!(market_squawk_sources::CurrentCoveragePolicy: serde::Serialize, serde::de::DeserializeOwned);
+assert_not_impl_any!(market_squawk_platform::LocalAuthorityStateStore: Clone);
 assert_impl_all!(market_squawk_sources::RawMarketFrame: RawCaptureFrameView);
 assert_impl_all!(market_squawk_sources::CaptureGenerationCapabilities: CaptureAuthorityBundle);
 

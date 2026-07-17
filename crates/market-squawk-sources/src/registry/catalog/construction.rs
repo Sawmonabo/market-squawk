@@ -23,6 +23,25 @@ impl AuthoritativeSourceRegistry {
     /// let _registry = AuthoritativeSourceRegistry::try_new_durable(VolatileStore);
     /// ```
     ///
+    /// The concrete store is transferred by value; retaining a raw `Arc` store capability is not
+    /// accepted:
+    ///
+    /// ```compile_fail
+    /// use std::sync::Arc;
+    /// use market_squawk_platform::LocalAuthorityStateStore;
+    /// use market_squawk_sources::AuthoritativeSourceRegistry;
+    ///
+    /// fn rejected(store: Arc<LocalAuthorityStateStore>) {
+    ///     let _registry = AuthoritativeSourceRegistry::try_new_durable(store);
+    /// }
+    /// ```
+    ///
+    /// The generic persistence backend is not a public production extension point:
+    ///
+    /// ```compile_fail
+    /// use market_squawk_sources::AuthorityStateStore;
+    /// ```
+    ///
     /// # Errors
     ///
     /// Fails closed when canonical state is unavailable, invalid, temporally ambiguous, or cannot
