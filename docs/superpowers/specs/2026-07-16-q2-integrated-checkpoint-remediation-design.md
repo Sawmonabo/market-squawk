@@ -165,13 +165,18 @@ variants a compile-time accounting decision.
 The per-shard peak includes, separately for maximum-shape snapshot and delta paths:
 
 - the admitted command and decoded nested allocations;
-- normalized changes and exact lexeme clones;
-- scaled level updates;
-- scaled and exact rollback entries at their maximum capacities;
-- candidate scaled/exact maps and conservative tree-node allocations;
-- canonical `BookChange` construction;
-- prior committed books retained until publication; and
-- bounded sorting or snapshot scratch that overlaps the transaction.
+- one shard-owned fixed-capacity normalization/deduplication scratch buffer;
+- active and inactive fixed-capacity bid/ask buffers, with only the active image published;
+- inline exact provider decimal lexemes and immutable `Arc` pointees shared by unchanged levels;
+- new candidate exact-level `Arc` allocations overlapping the prior committed pointees;
+- canonical snapshot or delta vectors and their unsafe-free boxed-slice conversion overlap; and
+- the admitted command's complete retained allocation, charged separately by the bounded mailbox.
+
+Mutation is a transaction over the inactive buffers. Success swaps active and inactive images and
+clears the old image; failure leaves the active image unchanged. The production implementation has
+no rollback vector, ordered-tree node, or allocator-selected spare-capacity assumption to estimate.
+The exact provider byte lexemes used by venue checksum rules remain available without reconstructing
+text or falling back through UTF-8 conversion.
 
 The configuration uses the larger derived peak. Exact-boundary tests accept at the computed ceiling
 and reject one byte below. Allocator-observed high-water tests validate the structural model under

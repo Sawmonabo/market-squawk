@@ -21,6 +21,23 @@ paused-time/concurrency tests.
 **Controlling design:**
 [`2026-07-16-q2-integrated-checkpoint-remediation-design.md`](../specs/2026-07-16-q2-integrated-checkpoint-remediation-design.md)
 
+## Execution status — 2026-07-16
+
+This is an implementation progress record, not checkpoint approval. Root integration is clean at
+`0f9b8cc` while Lane A remains active:
+
+| Work | State | Evidence |
+| --- | --- | --- |
+| Platform authority-state store | Integrated | `61c4292`; 8 MiB bounded envelope, exclusive lock, no-follow confinement, atomic Unix replacement, directory sync, canonical verification |
+| Lane A A1 | Frozen in lane | `f171961`; terminal health-epoch exhaustion |
+| Lane A A2 | Frozen in lane | `d211e67`; canonical provider-budget identity |
+| Lane A A3 | In progress | durable source-owned budget protocol using the integrated platform store |
+| Lane A A4 | Pending A3 | sealed receive time, wall discontinuity latch, capture retained-size contract |
+| Lane B B1–B2 | Integrated | `280fb0f`, `0f9b8cc`; live processing and snapshot/publication/reader structural memory ceilings |
+| Lane C C1–C3 | Integrated | `a36e624`, `9911d2e`, `89b220b`, `a7be854`; bounded MCP framing, owned shutdown, diagnostic terminology |
+| Root D1 | Integrated before this plan | semantic documentation-contract markers and deterministic policy test |
+| Root D2 and exact-head gate | Pending all lanes | lifecycle remains `remediation-in-progress`; no approval claim |
+
 ## Audit base and mandatory barriers
 
 The audit anchor is rejected, not approved. Every implementation worktree starts from the commit
@@ -213,20 +230,22 @@ wording.
 - Modify: `crates/market-squawk-live/src/runtime/tests/config_memory.rs`
 - Modify/Create: maximum-shape memory fixtures and allocator high-water tests in the live crate
 
-- [ ] Inventory every allocation simultaneously reachable on maximum snapshot and delta paths and
+- [x] Inventory every allocation simultaneously reachable on maximum snapshot and delta paths and
   encode that inventory as exhaustive checked structural helpers beside the owning types.
-- [ ] Add failing exact-boundary tests demonstrating that the old `2 * maximum_message_bytes` model
+- [x] Add failing exact-boundary tests demonstrating that the old `2 * maximum_message_bytes` model
   accepts a non-conservative configuration.
-- [ ] Cover command allocations, normalized/exact lexemes, level updates, both rollback vectors,
-  candidate/prior maps, conservative map-node charges, canonical changes, and overlapping scratch.
-- [ ] Use the larger derived snapshot/delta peak per shard. Reject arithmetic overflow and a runtime
+- [x] Cover command allocations, fixed active/inactive level buffers, inline exact lexemes,
+  prior/candidate exact-level `Arc` pointees, canonical vectors and their boxed-slice conversion
+  overlap, and the reusable shard scratch. The resulting production state has no rollback vectors
+  or tree-node allocation assumption.
+- [x] Use the larger derived snapshot/delta peak per shard. Reject arithmetic overflow and a runtime
   ceiling one byte below the derived maximum.
-- [ ] Add an allocator-observed high-water harness for all shards processing maximum-shape fixtures
+- [x] Add an allocator-observed high-water harness for all shards processing maximum-shape fixtures
   concurrently. Assert observed allocation is at or below the structural ceiling; do not replace the
   structural proof with an unexplained multiplier.
-- [ ] Run live configuration, processing, snapshot/delta, property, and all-shard tests; format and
+- [x] Run live configuration, processing, snapshot/delta, property, and all-shard tests; format and
   diff check.
-- [ ] Commit only Task B1.
+- [x] Commit only Task B1 as lane commit `de2123a` (integrated as `280fb0f`).
 
 ### Task B2: Charge snapshot readers, publications, generations, and aggregate lease metadata
 
@@ -239,17 +258,18 @@ wording.
 - Modify: `crates/market-squawk-live/src/snapshot/store/tests.rs`
 - Modify: `crates/market-squawk-live/src/runtime/tests/config_memory.rs`
 
-- [ ] Add failing tests with maximum reader permits retaining distinct old generations while every
+- [x] Add failing tests with maximum reader permits retaining distinct old generations while every
   shard republishes a near-limit snapshot.
-- [ ] Derive charges for publication pointees/control blocks, reader-retained old generations,
+- [x] Derive charges for publication pointees/control blocks, reader-retained old generations,
   aggregate `Arc`/revision boxed slices, capacities, and owned permits.
-- [ ] Add single-shard and aggregate exact-ceiling/one-byte-under tests across multiple generations.
-- [ ] Make reader-count and shard-count multiplication checked and bounded before allocation.
-- [ ] Rerun the B1 allocator harness with worst-case readers and prove the combined ceiling remains
+- [x] Add single-shard and aggregate exact-ceiling/one-byte-under tests across multiple generations.
+- [x] Make reader-count and shard-count multiplication checked and bounded before allocation.
+- [x] Rerun the B1 allocator harness with worst-case readers and prove the combined ceiling remains
   conservative.
-- [ ] Run `cargo test -p market-squawk-live --all-targets --all-features --locked`, strict package
+- [x] Run `cargo test -p market-squawk-live --all-targets --all-features --locked`, strict package
   Clippy, release build, format, and diff check.
-- [ ] Self-review the complete B1–B2 diff for double charge versus undercharge and commit Task B2.
+- [x] Self-review the complete B1–B2 diff for double charge versus undercharge and commit Task B2 as
+  lane commit `366690b` (integrated as `0f9b8cc`).
 
 ## Lane C — application framing, shutdown, and public diagnostic contracts
 
@@ -262,16 +282,16 @@ wording.
   `apps/market-squawk/tests/`
 - Modify: `scripts/tests/test_smoke_mcp.py` only if its protocol fixture must change
 
-- [ ] Extract the framing reader behind an async-read-generic test seam without exposing arbitrary
+- [x] Extract the framing reader behind an async-read-generic test seam without exposing arbitrary
   input capabilities through MCP tools.
-- [ ] Add failing tests for exact maximum, maximum plus one followed by newline, maximum plus one at
+- [x] Add failing tests for exact maximum, maximum plus one followed by newline, maximum plus one at
   EOF, fragmented input, multiple valid frames, CRLF policy, empty lines, and cancellation.
-- [ ] Instrument reads/buffer capacity and prove the implementation never materializes a complete
+- [x] Instrument reads/buffer capacity and prove the implementation never materializes a complete
   oversized line or retains more than maximum plus fixed scratch.
-- [ ] Implement fixed-capacity incremental framing. On oversize, emit one bounded protocol error and
+- [x] Implement fixed-capacity incremental framing. On oversize, emit one bounded protocol error and
   terminate the stdio session; do not unboundedly drain or resume.
-- [ ] Run MCP unit/integration/smoke tests, app package Clippy, format, and diff check.
-- [ ] Commit only Task C1.
+- [x] Run MCP unit/integration/smoke tests, app package Clippy, format, and diff check.
+- [x] Commit only Task C1 as lane commit `55eeaa1` (integrated as `a36e624`).
 
 ### Task C2: Bound source shutdown and make adapter operations cancellation-aware
 
@@ -285,18 +305,19 @@ wording.
 - Modify: `apps/market-squawk/tests/source_supervisor.rs`
 - Modify: `apps/market-squawk/tests/live_runtime_composition.rs`
 
-- [ ] Add validated nonzero source-shutdown deadline configuration and precedence tests.
-- [ ] Add failing paused-time tests for a non-cooperative source, full event channel, stalled setup,
+- [x] Add validated nonzero source-shutdown deadline configuration and precedence tests.
+- [x] Add failing paused-time tests for a non-cooperative source, full event channel, stalled setup,
   stalled status/control send, stalled Pong/provider-initiated Close reply, immediate WebSocket
   transport drop on client cancellation, reconnect backoff, cooperative completion, and source
   task failure.
-- [ ] Race cancellation around the complete session future and each adapter blocking point.
-- [ ] Add a single application shutdown helper that signals cancellation, waits to deadline, aborts,
+- [x] Race cancellation around the complete session future and each adapter blocking point.
+- [x] Add a single application shutdown helper that signals cancellation, waits to deadline, aborts,
   awaits the join, and returns a typed outcome. Never drop/detach the handle.
-- [ ] Prove reverse-order shutdown continues after deadline abort and capture/event tasks are reaped.
-- [ ] Run source-supervisor, Coinbase deterministic, composition, config, and app all-target tests,
+- [x] Prove reverse-order shutdown continues after deadline abort and capture/event tasks are reaped.
+- [x] Run source-supervisor, Coinbase deterministic, composition, config, and app all-target tests,
   format, and diff check.
-- [ ] Commit only Task C2.
+- [x] Commit Task C2 and its self-review follow-up as lane commits `a7f2d47` and `2d842f1`
+  (integrated as `9911d2e` and `a7be854`).
 
 ### Task C3: Make app/CLI/MCP diagnostic terminology unambiguous
 
@@ -307,14 +328,15 @@ wording.
 - Modify: `apps/market-squawk/src/diagnostic_engine.rs` rustdoc only if needed
 - Modify/Create: MCP `tools/list` and CLI-help contract tests under `apps/market-squawk/tests/`
 
-- [ ] Add failing assertions requiring diagnostic/authority-free/paper-only/single-venue partial
+- [x] Add failing assertions requiring diagnostic/authority-free/paper-only/single-venue partial
   coverage wording and forbidding unqualified `validated`, `VALID`, or market `quality` claims.
-- [ ] Update capture command, Market snapshot/quality, Bot, and Risk descriptions consistently.
-- [ ] Explicitly distinguish app-local `QualityState` from canonical `DataQuality` and say the former
+- [x] Update capture command, Market snapshot/quality, Bot, and Risk descriptions consistently.
+- [x] Explicitly distinguish app-local `QualityState` from canonical `DataQuality` and say the former
   can never establish `DirectVerified`.
-- [ ] Run app all-target/all-feature tests, CLI help, MCP tools/list smoke, strict package Clippy,
+- [x] Run app all-target/all-feature tests, CLI help, MCP tools/list smoke, strict package Clippy,
   format, and diff check.
-- [ ] Self-review C1–C3 for protocol compatibility and public-claim accuracy; commit Task C3.
+- [x] Self-review C1–C3 for protocol compatibility and public-claim accuracy; commit Task C3 as lane
+  commit `83edeb6` (integrated as `89b220b`).
 
 ## Root lane — checkpoint truth and deterministic coherence
 
@@ -371,8 +393,8 @@ wording.
   final status, and `git diff --check`.
 - [ ] Cherry-pick Lane A A1–A4 in order. Resolve source/platform conflicts only in root and rerun its
   package gates immediately.
-- [ ] Cherry-pick Lane B B1–B2, rerun live tests and memory boundary fixtures.
-- [ ] Cherry-pick Lane C C1–C3, rerun app tests, CLI help, and MCP smoke.
+- [x] Cherry-pick Lane B B1–B2, rerun live tests and memory boundary fixtures.
+- [x] Cherry-pick Lane C C1–C3, rerun app tests, CLI help, and MCP smoke.
 - [ ] Inspect the combined dependency graph and `Cargo.lock`. Reject unexplained dependency or
   feature changes.
 - [ ] Complete root D1–D2 against the integrated code and commit.
