@@ -43,7 +43,9 @@ market-squawk replay --source coinbase-exchange
 
 ## Current Rust 1.97 workspace gate
 
-The repository now pins Rust 1.97.0 and runs one fail-fast local/CI entry point:
+The repository now pins Rust 1.97.1 and runs one fail-fast local/CI entry point. Rust 1.97.0 is
+explicitly ineligible for release or performance evidence because of its critical LLVM
+miscompilation:
 
 ```bash
 ./scripts/verify.sh

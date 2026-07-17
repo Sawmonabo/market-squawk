@@ -11,7 +11,7 @@ import sys
 from typing import Any
 
 
-# These are transitive families in the locked Rust 1.97 graph. Any family or version change is a
+# These are transitive families in the locked Rust 1.97.1 graph. Any family or version change is a
 # review event. Cargo-deny can replace this focused gate once Task 15 installs the full audit policy.
 ALLOWED_DUPLICATES: dict[str, tuple[str, ...]] = {
     "getrandom": ("0.2.17", "0.3.4", "0.4.3"),

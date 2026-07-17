@@ -99,7 +99,7 @@ Task 11 adds the directory with the first working adapter rather than creating e
 
 Implemented baseline controls include:
 
-- Rust 1.97.0 stable, Edition 2024, resolver 3;
+- Rust 1.97.1 stable, Edition 2024, resolver 3;
 - inherited workspace version, license, Rust version, and lint policy;
 - `unsafe_code = "forbid"`, denied unused results, and strict Clippy policies for unwrap, expect,
   panic, todo, and unimplemented paths;

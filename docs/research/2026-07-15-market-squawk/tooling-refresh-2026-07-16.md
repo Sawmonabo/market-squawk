@@ -25,7 +25,7 @@ provision the tool.
 - Download Gitleaks only from its official release and verify the release checksum before execution.
 - Local verification must not silently install or execute downloaded software; it should report the
   missing tool and the exact installation command.
-- Re-check tool MSRV and the full locked workspace on Rust 1.97.0 during implementation. A release
+- Re-check tool MSRV and the full locked workspace on Rust 1.97.1 during implementation. A release
   tag alone does not prove compatibility with the project's target toolchain.
 - Keep advisory, license, dependency-use, credential, generated-artifact, and application tests as
   separate gates. No single tool proves all of them.

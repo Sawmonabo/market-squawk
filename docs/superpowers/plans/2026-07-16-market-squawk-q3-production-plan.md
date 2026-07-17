@@ -15,7 +15,7 @@ decoder outcomes, the app composes Coinbase through the authoritative registry/c
 and a bounded single-writer paper adapter consumes dispatcher-only values with deterministic
 realistic market simulation.
 
-**Tech Stack:** Rust 1.97.0 stable, Edition 2024, Cargo resolver 3, Tokio, Tokio-util, Serde,
+**Tech Stack:** Rust 1.97.1 stable, Edition 2024, Cargo resolver 3, Tokio, Tokio-util, Serde,
 Rust Decimal, UUID, Chrono, Thiserror, Tracing, Tokio-Tungstenite, Proptest, Trybuild, Criterion,
 Cargo-fuzz targets, Python 3 boundary checks, and local Git worktrees.
 
@@ -30,7 +30,7 @@ integrated Q2 commit and refreshes every path/line anchor before implementation.
   commit, update the recorded base commit, and refresh every file/line anchor with `rg -n`/`nl -ba`.
 - Local build/test results are local evidence only. Never state that hosted CI ran or passed without
   inspecting the hosted check result.
-- Rust toolchain is exactly `1.97.0`, stable, Edition 2024, resolver 3; every package inherits
+- Rust toolchain is exactly `1.97.1`, stable, Edition 2024, resolver 3; every package inherits
   workspace package metadata and lints.
 - `unsafe_code = "forbid"`; production paths do not use `unwrap`, `expect`, `panic!`, `todo!`, or
   `unimplemented!`.
@@ -2697,7 +2697,7 @@ The cargo-fuzz README states that libFuzzer requires sanitizer support and a nig
 documents an independent fuzzing workspace. Therefore `fuzz/Cargo.toml` is its own nested
 `[workspace]`, not a root workspace member; root `Cargo.toml` explicitly excludes `fuzz` if Cargo
 workspace discovery requires it. `fuzz/rust-toolchain.toml` pins one reviewed dated nightly solely
-for fuzzing. Root `rust-toolchain.toml` remains stable `1.97.0`; normal build, clippy, tests, release,
+for fuzzing. Root `rust-toolchain.toml` remains stable `1.97.1`; normal build, clippy, tests, release,
 and audits never select fuzz nightly or consume `fuzz/Cargo.lock`.
 
 ```bash

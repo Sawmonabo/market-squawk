@@ -113,7 +113,7 @@ below describe the audit anchor; in-flight remediation is not counted as impleme
 
 | ID | Requirement | Status | Evidence and closure | Stage |
 | --- | --- | --- | --- | --- |
-| R-01 | Rust 1.97.0 toolchain | Implemented | `rust-toolchain.toml` pins stable 1.97.0 and workspace MSRV is 1.97. | All |
+| R-01 | Rust 1.97.1 toolchain | Implemented | `rust-toolchain.toml` pins stable 1.97.1 and the workspace MSRV rejects the critically miscompiling 1.97.0 point release. | All |
 | R-02 | Edition 2024 and resolver 3 | Implemented | The virtual workspace uses Edition 2024 and resolver 3. | All |
 | R-03 | Workspace members `apps/*`, `crates/*`, `adapters/*` | Partial | Working app/domain/platform/sources/live packages use `apps/*` and `crates/*`; `adapters/*` is added atomically with Task 11's first working adapter rather than empty crates. | 1-6 |
 | R-04 | Inherited workspace metadata and lints | Implemented | Every current package inherits workspace version, edition, Rust version, license, and lint tables. | All |

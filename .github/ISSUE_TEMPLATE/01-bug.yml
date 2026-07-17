@@ -40,7 +40,7 @@ body:
     attributes:
       label: Operating system and architecture
       description: Include the OS version, architecture, and Rust version when relevant.
-      placeholder: macOS 26 arm64; rustc 1.97.0
+      placeholder: macOS 26 arm64; rustc 1.97.1
     validations:
       required: true
   - type: textarea

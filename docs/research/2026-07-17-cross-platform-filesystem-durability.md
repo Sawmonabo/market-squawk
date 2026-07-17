@@ -193,7 +193,10 @@ The regression is covered at three levels:
 - platform and application tests keep a writer active while reading its flushed committed records
   and separately require a typed rejection of a second writer;
 - the application deadline test opens the exact journal path that failed in hosted Linux CI;
-- GitHub Actions builds and tests Linux, macOS, and Windows with Rust 1.97.0.
+- GitHub Actions builds and tests Linux, macOS, and Windows with the corrected Rust 1.97.1
+  production baseline. The 1.97.0 toolchain recorded at the top of this research remains the
+  historical environment in which the filesystem investigation was conducted, not valid current
+  release evidence.
 
 Required focused commands:
 

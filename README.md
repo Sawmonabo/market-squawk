@@ -66,7 +66,7 @@ not placed between a live event and a paper-bot decision.
 
 Prerequisites:
 
-- Rust 1.97.0 (pinned by `rust-toolchain.toml`)
+- Rust 1.97.1 (pinned by `rust-toolchain.toml`)
 - Internet access only for dependency installation and live Coinbase capture
 
 ```bash

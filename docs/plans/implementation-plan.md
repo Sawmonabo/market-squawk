@@ -23,7 +23,7 @@ event-to-action path. Automated paper/live action requires the stateful live pla
 single-use current capability for a `DirectVerified` state; serialized domain assessments and
 archives never authorize action.
 
-**Tech Stack:** Rust 1.97.0, Edition 2024, Cargo resolver 3, Tokio, Serde, Reqwest,
+**Tech Stack:** Rust 1.97.1, Edition 2024, Cargo resolver 3, Tokio, Serde, Reqwest,
 Tokio-Tungstenite, Arrow, Parquet, DataFusion, SQLite, Clap, Tracing, Thiserror, Anyhow at app
 boundaries, Proptest, Criterion, Cargo-fuzz, Python outside the live path, and conditional
 ONNX-compatible local inference.
@@ -35,7 +35,8 @@ ONNX-compatible local inference.
 - No OpenTelemetry infrastructure in version 1.
 - No identity/account rotation to evade limits, browser/TLS fingerprint spoofing, CAPTCHA bypass,
   proxy rotation intended to defeat blocking, or distributed quota evasion.
-- Rust 1.97.0 stable, Edition 2024, resolver 3, committed `Cargo.lock`.
+- Rust 1.97.1 stable, Edition 2024, resolver 3, committed `Cargo.lock`. Rust 1.97.0 is forbidden for
+  release and performance evidence because of the upstream critical LLVM miscompilation.
 - Every workspace package inherits workspace package metadata and lint policy.
 - No empty crates, unconsumed interfaces, or synthetic sources represented as production.
 - No unsafe Rust.

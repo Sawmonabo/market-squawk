@@ -14,10 +14,13 @@ slice, local analytical data plane, analytics/modeling/portfolio systems, fair-v
 control surfaces, and final measured release evidence. Each quarter remains runnable and receives
 one grouped exact-head review after all of its parallel lanes are integrated.
 
-**Tech Stack:** Rust 1.97.0 stable, Edition 2024, Cargo resolver 3, Tokio, Serde, Reqwest,
+**Tech Stack:** Rust 1.97.1 stable, Edition 2024, Cargo resolver 3, Tokio, Serde, Reqwest,
 Tokio-Tungstenite, Arrow, Parquet, DataFusion, SQLite, Clap, Tracing, Thiserror, Rust Decimal,
 Proptest, Criterion, Cargo-fuzz, optional Python outside the live path, and conditional local
 ONNX-compatible inference.
+
+Rust 1.97.0 is ineligible for implementation, benchmark, checkpoint, or release evidence because
+the Rust project subsequently classified and corrected its LLVM miscompilation in 1.97.1.
 
 ## Global Constraints
 

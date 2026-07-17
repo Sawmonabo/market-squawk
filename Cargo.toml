@@ -6,7 +6,7 @@ default-members = ["apps/market-squawk"]
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.97"
+rust-version = "1.97.1"
 version = "0.1.0"
 license = "Apache-2.0 OR MIT"
 

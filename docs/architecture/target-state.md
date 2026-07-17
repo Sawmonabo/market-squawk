@@ -4,7 +4,7 @@
 
 - Target release: first complete local release
 - Architecture date: 2026-07-16
-- Rust baseline: 1.97.0, Edition 2024, resolver 3
+- Rust baseline: 1.97.1, Edition 2024, resolver 3
 - Cost boundary: no mandatory paid software, API, cloud, database service, container runtime, or
   telemetry infrastructure
 - Research basis: [Market Squawk deep research](../research/2026-07-15-market-squawk/final-report.md)

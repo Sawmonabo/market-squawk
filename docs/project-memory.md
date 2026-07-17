@@ -20,6 +20,13 @@ current architectural boundary is the correct place to implement the complete co
 silently broaden scope either: significant new authority or product decisions still require an
 explicit design decision.
 
+The production Rust baseline is 1.97.1, not 1.97.0. On 2026-07-16 the Rust project published
+1.97.1 to correct an LLVM miscompilation in 1.97.0; the upstream compiler issue is classified
+critical and demonstrates correct optimized Rust lowering to a release-mode crash on x86-64.
+No release, benchmark, checkpoint, or approval evidence may be produced with 1.97.0. A later
+toolchain change requires current primary-source research, a recorded decision, exact CI/toolchain
+pins, inherited workspace MSRV enforcement, and a fresh locked all-feature verification run.
+
 Identity/account rotation to evade limits, browser or TLS fingerprint spoofing, CAPTCHA or
 anti-bot bypass, proxy rotation intended to defeat blocking, distributed quota evasion, stealth
 scraping, and access-control circumvention are permanently prohibited. Provider constraints are

@@ -4,8 +4,11 @@ All notable changes to this project are documented here.
 
 ## Unreleased
 
-- Established the Rust 1.97.0 Edition 2024 virtual workspace and shared invariant-preserving
+- Established the Rust 1.97.1 Edition 2024 virtual workspace and shared invariant-preserving
   domain crate.
+- Rejected Rust 1.97.0 for release evidence after the Rust project classified an x86-64 LLVM
+  miscompilation as critical; CI, the pinned toolchain, and the workspace MSRV now require the
+  corrective 1.97.1 point release.
 - Separated fair-value hierarchy, market depth, data quality, integrity, and provenance contracts.
 - Added exact tick, lot, money, and notional conversions with checked arithmetic and property tests.
 - Added verified instrument identifiers, network-qualified digital-asset addresses, futures identity,
