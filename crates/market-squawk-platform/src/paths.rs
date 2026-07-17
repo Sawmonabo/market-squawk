@@ -54,7 +54,7 @@ pub enum ArtifactPathError {
         /// Rejected path.
         path: PathBuf,
     },
-    /// Empty, dot, parent, prefix, or oversized components are rejected.
+    /// Empty, non-normal, non-portable, reserved, or oversized components are rejected.
     #[error("artifact path contains an unsafe component: {component}")]
     UnsafeComponent {
         /// Rejected lossy component for diagnostics.
@@ -109,6 +109,7 @@ impl ArtifactRoot {
     }
 
     /// Validates a portable relative reference and binds it to this open directory capability.
+    /// Portable references use `/` separators; `\` is rejected before platform path parsing.
     pub fn resolve(
         &self,
         relative: impl AsRef<Path>,
@@ -175,6 +176,12 @@ fn validate_artifact_reference(path: &Path) -> Result<(), ArtifactPathError> {
     if path.is_absolute() {
         return Err(ArtifactPathError::AbsolutePath {
             path: PathBuf::from("[ABSOLUTE PATH REDACTED]"),
+        });
+    }
+    let portable_path = path.to_str().ok_or(ArtifactPathError::NonUtf8Component)?;
+    if portable_path.contains('\\') {
+        return Err(ArtifactPathError::UnsafeComponent {
+            component: "[NON-PORTABLE SEPARATOR]".to_owned(),
         });
     }
     let mut depth = 0_usize;

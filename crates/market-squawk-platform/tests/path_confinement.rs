@@ -194,7 +194,10 @@ fn artifact_names_reject_cross_platform_ambiguous_components()
         "stream:name",
         "back\\slash",
     ] {
-        assert!(paths.artifacts()?.resolve(Path::new(invalid)).is_err());
+        assert!(
+            paths.artifacts()?.resolve(Path::new(invalid)).is_err(),
+            "accepted non-portable artifact reference {invalid:?}"
+        );
     }
     Ok(())
 }
