@@ -32,6 +32,7 @@ use crate::DepthLimit;
 use crate::authority::GenerationLeaseOwner;
 use crate::processor::status::StatusBook;
 use crate::processor::stream::{StreamState, preview_stream};
+use crate::provider_book::BookProcessingScratch;
 
 pub(super) type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -107,12 +108,14 @@ pub(super) fn populated_state() -> TestResult<PopulatedState> {
         )?;
         let staged_status = statuses.stage(&current, status)?;
         statuses.validate_staged(&staged_status)?;
+        let mut scratch = BookProcessingScratch::try_new(16)?;
         let candidate = preview_stream(
             &mut state,
             &current,
             &definition,
             status,
             timeline.evaluated_at,
+            &mut scratch,
         )?;
         let committed = candidate.commit()?;
         assert_eq!(committed.expected_revision, 1);

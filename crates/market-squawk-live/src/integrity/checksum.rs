@@ -10,6 +10,33 @@ use market_squawk_sources::{
 use rust_decimal::Decimal;
 use thiserror::Error;
 
+/// Allocation-free exact decimal view used by both decoder DTOs and the live book's fixed-size
+/// immutable lexeme representation.
+pub(crate) trait ExactChecksumLevel {
+    fn price_bytes(&self) -> &[u8];
+    fn quantity_bytes(&self) -> &[u8];
+    fn price_decimal(&self) -> Decimal;
+    fn quantity_decimal(&self) -> Decimal;
+}
+
+impl ExactChecksumLevel for ProviderBookLevel {
+    fn price_bytes(&self) -> &[u8] {
+        self.price().value().as_str().as_bytes()
+    }
+
+    fn quantity_bytes(&self) -> &[u8] {
+        self.quantity().value().as_str().as_bytes()
+    }
+
+    fn price_decimal(&self) -> Decimal {
+        self.price().value().decimal()
+    }
+
+    fn quantity_decimal(&self) -> Decimal {
+        self.quantity().value().decimal()
+    }
+}
+
 /// Closed identity for Kraken WebSocket v2 book canonicalization revision 1.
 pub const KRAKEN_V2_CANONICALIZATION_ID: &str = "kraken-ws-v2-book-checksum-v1";
 /// Closed identity for Kraken's asks-then-bids, top-ten checksum scope.
@@ -118,6 +145,35 @@ impl ResolvedChecksumValidator {
             Err(ChecksumValidationError::Mismatch { expected, computed })
         }
     }
+
+    pub(crate) fn validate_exact_ordered<'a, L, A, B>(
+        &self,
+        asks: A,
+        bids: B,
+        evidence: &ProviderChecksumEvidence,
+    ) -> Result<u32, ChecksumValidationError>
+    where
+        L: ExactChecksumLevel + 'a,
+        A: IntoIterator<Item = &'a L>,
+        B: IntoIterator<Item = &'a L>,
+    {
+        let ProviderChecksumEvidence::Provided { value, rule } = evidence else {
+            return Err(ChecksumValidationError::EvidenceProfileMismatch);
+        };
+        if rule != &self.rule {
+            return Err(ChecksumValidationError::EvidenceProfileMismatch);
+        }
+        let expected = value
+            .as_str()
+            .parse::<u32>()
+            .map_err(|_| ChecksumValidationError::InvalidChecksumValue)?;
+        let computed = kraken_v2_crc32_ordered(asks, bids, self.level_count)?;
+        if expected == computed {
+            Ok(computed)
+        } else {
+            Err(ChecksumValidationError::Mismatch { expected, computed })
+        }
+    }
 }
 
 /// Computes the official Kraken WebSocket v2 book CRC32 from exact provider lexemes.
@@ -140,14 +196,15 @@ pub fn kraken_v2_crc32(
     kraken_v2_crc32_ordered(retained_asks.iter(), retained_bids.iter(), level_count)
 }
 
-fn kraken_v2_crc32_ordered<'a, A, B>(
+fn kraken_v2_crc32_ordered<'a, L, A, B>(
     asks: A,
     bids: B,
     level_count: NonZeroU16,
 ) -> Result<u32, ChecksumValidationError>
 where
-    A: IntoIterator<Item = &'a ProviderBookLevel>,
-    B: IntoIterator<Item = &'a ProviderBookLevel>,
+    L: ExactChecksumLevel + 'a,
+    A: IntoIterator<Item = &'a L>,
+    B: IntoIterator<Item = &'a L>,
 {
     let retained = usize::from(level_count.get());
     let mut hasher = Hasher::new();
@@ -156,26 +213,28 @@ where
     Ok(hasher.finalize())
 }
 
-fn append_component(hasher: &mut Hasher, value: &str) {
+fn append_component(hasher: &mut Hasher, value: &[u8]) {
     let first_significant = value
-        .as_bytes()
         .iter()
         .position(|byte| *byte != b'0' && *byte != b'.')
         .unwrap_or(value.len());
-    for component in value.as_bytes()[first_significant..].split(|byte| *byte == b'.') {
+    for component in value[first_significant..].split(|byte| *byte == b'.') {
         hasher.update(component);
     }
 }
 
-fn hash_side<'a>(
+fn hash_side<'a, L>(
     hasher: &mut Hasher,
-    levels: impl Iterator<Item = &'a ProviderBookLevel>,
+    levels: impl Iterator<Item = &'a L>,
     ascending: bool,
-) -> Result<(), ChecksumValidationError> {
+) -> Result<(), ChecksumValidationError>
+where
+    L: ExactChecksumLevel + 'a,
+{
     let mut previous = None;
     for level in levels {
-        let price = level.price().value().decimal();
-        let quantity = level.quantity().value().decimal();
+        let price = level.price_decimal();
+        let quantity = level.quantity_decimal();
         if price <= Decimal::ZERO || quantity <= Decimal::ZERO {
             return Err(ChecksumValidationError::NonPositiveLevel);
         }
@@ -188,8 +247,8 @@ fn hash_side<'a>(
         }) {
             return Err(ChecksumValidationError::InvalidOrdering);
         }
-        append_component(hasher, level.price().value().as_str());
-        append_component(hasher, level.quantity().value().as_str());
+        append_component(hasher, level.price_bytes());
+        append_component(hasher, level.quantity_bytes());
         previous = Some(price);
     }
     Ok(())

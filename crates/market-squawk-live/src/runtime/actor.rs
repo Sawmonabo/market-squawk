@@ -17,6 +17,7 @@ use crate::processor::{
     GenerationAuthorityRegistry, GenerationRegistryExitHandle, InstrumentLiveProcessor,
     LiveApplyError, ProcessorLivenessBinding, ProcessorSnapshotLimits, ProcessorSnapshotSeed,
 };
+use crate::provider_book::BookProcessingScratch;
 use crate::snapshot::{SnapshotBuildError, SnapshotPublisher};
 use crate::{
     RouteSnapshot, ShardId, ShardLifecycleSnapshot, ShardRoutingVersion, ShardSnapshot,
@@ -40,6 +41,7 @@ pub(crate) struct ShardActorInput {
     pub(crate) routes: Vec<LiveRouteConfig>,
     pub(crate) maximum_sources_per_route: usize,
     pub(crate) maximum_streams_per_route: usize,
+    pub(crate) maximum_book_items_per_message: usize,
     pub(crate) mailbox: mpsc::Receiver<ShardCommand>,
     pub(crate) registrations: mpsc::Receiver<RegistrationCommand>,
     pub(crate) snapshot_limits: SnapshotLimits,
@@ -139,6 +141,7 @@ struct ShardActor {
     routing_version: ShardRoutingVersion,
     runtime_incarnation: NonZeroU64,
     routes: HashMap<crate::ShardKey, RouteOwner>,
+    book_scratch: BookProcessingScratch,
     mailbox: mpsc::Receiver<ShardCommand>,
     registrations: mpsc::Receiver<RegistrationCommand>,
     snapshot_limits: SnapshotLimits,
@@ -319,11 +322,14 @@ impl ShardActor {
                 return Err(ActorError::DuplicateRoute);
             }
         }
+        let book_scratch = BookProcessingScratch::try_new(input.maximum_book_items_per_message)
+            .map_err(|_| ActorError::Allocation)?;
         Ok(Self {
             shard: input.shard,
             routing_version: input.routing_version,
             runtime_incarnation: input.runtime_incarnation,
             routes,
+            book_scratch,
             mailbox: input.mailbox,
             registrations: input.registrations,
             snapshot_limits: input.snapshot_limits,
@@ -495,7 +501,10 @@ impl ShardActor {
                 }
             };
             loop {
-                let applied = match owner.processor.apply_next(&mut cursor) {
+                let applied = match owner
+                    .processor
+                    .apply_next(&mut cursor, &mut self.book_scratch)
+                {
                     Ok(Some(applied)) => applied,
                     Ok(None) => break,
                     Err(error) => {

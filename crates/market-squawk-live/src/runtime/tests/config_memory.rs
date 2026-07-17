@@ -8,11 +8,12 @@ use market_squawk_domain::{
 use rust_decimal::Decimal;
 
 use super::{
-    ACTOR_FIXED_BYTES, CHANNEL_COMMAND_SLOT_BYTES, CONTROL_SLOT_BYTES, EXACT_BOOK_LEVEL_BYTES,
-    HEALTH_EVENT_BYTES, NONCE_SLOT_BYTES, ROUTE_FIXED_BYTES, SCALED_BOOK_LEVEL_BYTES,
-    SNAPSHOT_NOTIFICATION_BYTES, SNAPSHOT_ROUTE_SORT_SCRATCH_BYTES,
-    SNAPSHOT_STATUS_SORT_SCRATCH_BYTES, SNAPSHOT_STREAM_SORT_SCRATCH_BYTES, SOURCE_ADMISSION_BYTES,
-    add, estimate_peak_bytes, multiply, persistent_stream_bytes,
+    ACTOR_FIXED_BYTES, CHANNEL_COMMAND_SLOT_BYTES, CONTROL_SLOT_BYTES, HEALTH_EVENT_BYTES,
+    NONCE_SLOT_BYTES, ROUTE_FIXED_BYTES, SNAPSHOT_NOTIFICATION_BYTES,
+    SNAPSHOT_ROUTE_SORT_SCRATCH_BYTES, SNAPSHOT_STATUS_SORT_SCRATCH_BYTES,
+    SNAPSHOT_STREAM_SORT_SCRATCH_BYTES, SOURCE_ADMISSION_BYTES, add,
+    all_shard_book_processing_bytes, book_processing_peak, estimate_peak_bytes, multiply,
+    persistent_stream_bytes,
 };
 use crate::runtime::{
     LiveRouteConfig, LiveRouteConfigInput, LiveRuntimeConfig, LiveRuntimeConfigError,
@@ -107,21 +108,31 @@ fn route_state_nonce_source_stream_and_dual_book_terms_have_exact_deltas() -> Te
     let base = estimate(input()?, std::slice::from_ref(&base_route))?;
 
     let second_route = route(INSTRUMENT_TWO, 4, 8)?;
-    let with_second = estimate(input()?, &[base_route.clone(), second_route])?;
+    let both_routes = [base_route.clone(), second_route];
+    let with_second = estimate(input()?, &both_routes)?;
+    let config = LiveRuntimeConfig::try_new(input()?)?;
+    let processing_delta = all_shard_book_processing_bytes(&config, &both_routes)?
+        - all_shard_book_processing_bytes(&config, std::slice::from_ref(&base_route))?;
     let expected_route = ROUTE_FIXED_BYTES
         + 8 * NONCE_SLOT_BYTES
         + 2 * SOURCE_ADMISSION_BYTES
         + 2 * persistent_stream_bytes(4)?
-        + SNAPSHOT_ROUTE_SORT_SCRATCH_BYTES;
+        + SNAPSHOT_ROUTE_SORT_SCRATCH_BYTES
+        + processing_delta;
     assert_eq!(with_second - base, expected_route);
 
     let larger_nonce = estimate(input()?, &[route(INSTRUMENT_ONE, 4, 9)?])?;
     assert_eq!(larger_nonce - base, NONCE_SLOT_BYTES);
 
     let deeper_book = estimate(input()?, &[route(INSTRUMENT_ONE, 5, 8)?])?;
+    let shallow_processing = book_processing_peak(512, 4)?;
+    let deeper_processing = book_processing_peak(512, 5)?;
+    let processing_delta = (deeper_processing.additional_bytes
+        - deeper_processing.shard_scratch_bytes)
+        - (shallow_processing.additional_bytes - shallow_processing.shard_scratch_bytes);
     assert_eq!(
         deeper_book - base,
-        2 * 2 * (SCALED_BOOK_LEVEL_BYTES + EXACT_BOOK_LEVEL_BYTES)
+        2 * (persistent_stream_bytes(5)? - persistent_stream_bytes(4)?) + processing_delta
     );
 
     let mut more_streams = input()?;
@@ -200,9 +211,10 @@ fn one_more_shard_charges_mailbox_candidate_control_snapshot_and_actor() -> Test
     three_shards.shard_count = 3;
     let three_shards = estimate(three_shards, &[route])?;
 
+    let processing = book_processing_peak(512, 4)?;
     let expected_delta = 1_024
         + 4 * CHANNEL_COMMAND_SLOT_BYTES
-        + 2 * 512
+        + processing.shard_scratch_bytes
         + 2 * CONTROL_SLOT_BYTES
         + 2 * 4_096
         + 2 * (SNAPSHOT_STREAM_SORT_SCRATCH_BYTES + SNAPSHOT_STATUS_SORT_SCRATCH_BYTES)
@@ -228,9 +240,31 @@ fn mailbox_and_processing_dimensions_charge_independent_exact_deltas() -> TestRe
     one_more_byte.mailbox_bytes_per_shard += 1;
     assert_eq!(estimate(one_more_byte, &routes)? - base, 2);
 
-    let mut one_more_candidate_byte = input()?;
-    one_more_candidate_byte.maximum_message_bytes += 1;
-    assert_eq!(estimate(one_more_candidate_byte, &routes)? - base, 4);
+    let processing = book_processing_peak(512, 4)?;
+    assert_eq!(processing.maximum_message_bytes, 512);
+    assert!(processing.maximum_book_items > 0);
+    assert!(processing.snapshot_additional_bytes > 0);
+    assert!(processing.delta_additional_bytes > 2 * 512);
+    assert_eq!(
+        processing.additional_bytes,
+        processing
+            .snapshot_additional_bytes
+            .max(processing.delta_additional_bytes)
+    );
+
+    let mut one_more_message_byte = input()?;
+    one_more_message_byte.maximum_message_bytes += 1;
+    let expanded_input = one_more_message_byte.clone();
+    let expanded = estimate(one_more_message_byte, &routes)?;
+    let expanded_processing = book_processing_peak(513, 4)?;
+    let current_config = LiveRuntimeConfig::try_new(input()?)?;
+    let expanded_config = LiveRuntimeConfig::try_new(expanded_input)?;
+    assert_eq!(
+        expanded - base,
+        all_shard_book_processing_bytes(&expanded_config, &routes)?
+            - all_shard_book_processing_bytes(&current_config, &routes)?
+    );
+    assert!(expanded_processing.maximum_book_items >= processing.maximum_book_items);
 
     let mut one_more_control = input()?;
     one_more_control.registration_control_capacity += 1;
@@ -238,6 +272,54 @@ fn mailbox_and_processing_dimensions_charge_independent_exact_deltas() -> TestRe
         estimate(one_more_control, &routes)? - base,
         2 * CONTROL_SLOT_BYTES
     );
+    Ok(())
+}
+
+#[test]
+fn former_wire_multiplier_ceiling_rejects_the_structural_delta_peak() -> TestResult {
+    let routes = [route(INSTRUMENT_ONE, 4, 8)?];
+    let complete = estimate(input()?, &routes)?;
+    let config = LiveRuntimeConfig::try_new(input()?)?;
+    let structural = all_shard_book_processing_bytes(&config, &routes)?;
+    let former_processing = 2 * u64::from(config.shard_count().get()) * 512;
+    assert!(structural > former_processing);
+
+    let former_estimate = complete
+        .checked_sub(structural)
+        .and_then(|value| value.checked_add(former_processing))
+        .ok_or("former estimate overflow")?;
+    let mut undercharged = input()?;
+    undercharged.maximum_runtime_bytes = former_estimate;
+    let undercharged = LiveRuntimeConfig::try_new(undercharged)?;
+    assert!(matches!(
+        estimate_peak_bytes(&undercharged, &routes),
+        Err(LiveRuntimeConfigError::PeakMemoryExceedsCeiling {
+            estimated,
+            ceiling,
+        }) if estimated == complete && ceiling == former_estimate
+    ));
+    Ok(())
+}
+
+#[test]
+fn structural_processing_peak_accepts_exact_ceiling_and_rejects_one_byte_under() -> TestResult {
+    let routes = [route(INSTRUMENT_ONE, 10_000, 8)?];
+    let estimated = estimate(input()?, &routes)?;
+
+    let mut exact = input()?;
+    exact.maximum_runtime_bytes = estimated;
+    assert_eq!(estimate(exact, &routes)?, estimated);
+
+    let mut below = input()?;
+    below.maximum_runtime_bytes = estimated - 1;
+    let below = LiveRuntimeConfig::try_new(below)?;
+    assert!(matches!(
+        estimate_peak_bytes(&below, &routes),
+        Err(LiveRuntimeConfigError::PeakMemoryExceedsCeiling {
+            estimated: rejected,
+            ceiling,
+        }) if rejected == estimated && ceiling == estimated - 1
+    ));
     Ok(())
 }
 

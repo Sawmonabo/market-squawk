@@ -174,6 +174,10 @@ impl LiveRuntime {
                 routes: shard_routes,
                 maximum_sources_per_route: config.maximum_sources_per_route().get(),
                 maximum_streams_per_route: config.maximum_streams_per_route().get(),
+                maximum_book_items_per_message:
+                    crate::provider_book::maximum_book_items_for_message(
+                        config.maximum_message_bytes().get(),
+                    ),
                 mailbox,
                 registrations,
                 snapshot_limits: config.snapshot_limits(),

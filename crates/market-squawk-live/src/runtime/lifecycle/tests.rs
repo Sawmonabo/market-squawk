@@ -298,6 +298,9 @@ async fn actor_exit_invalidates_shared_runtime_before_completion_is_observed() -
         routes: Vec::new(),
         maximum_sources_per_route: 1,
         maximum_streams_per_route: 1,
+        maximum_book_items_per_message: crate::provider_book::maximum_book_items_for_message(
+            config.maximum_message_bytes().get(),
+        ),
         mailbox: mpsc::channel(1).1,
         registrations: mpsc::channel(1).1,
         snapshot_limits: config.snapshot_limits(),

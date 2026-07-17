@@ -1,6 +1,5 @@
 //! Pure scaled-integer price-level book invariants.
 
-use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 
 use market_squawk_domain::{PriceTicks, QuantityLots};
@@ -97,8 +96,11 @@ impl LevelUpdate {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScaledBook {
     depth: DepthLimit,
-    bids: BTreeMap<PriceTicks, QuantityLots>,
-    asks: BTreeMap<PriceTicks, QuantityLots>,
+    /// Ascending price order. This reusable mathematical container is not the production provider
+    /// book; the latter owns preallocated active/inactive buffers in `provider_book`.
+    bids: Vec<(PriceTicks, QuantityLots)>,
+    /// Ascending price order.
+    asks: Vec<(PriceTicks, QuantityLots)>,
 }
 
 impl ScaledBook {
@@ -106,8 +108,8 @@ impl ScaledBook {
     pub const fn new(depth: DepthLimit) -> Self {
         Self {
             depth,
-            bids: BTreeMap::new(),
-            asks: BTreeMap::new(),
+            bids: Vec::new(),
+            asks: Vec::new(),
         }
     }
 
@@ -136,38 +138,32 @@ impl ScaledBook {
         validate_snapshot_side(bids, BookSide::Bid)?;
         validate_snapshot_side(asks, BookSide::Ask)?;
 
-        let mut candidate_bids = BTreeMap::new();
-        let mut candidate_asks = BTreeMap::new();
-
-        for update in bids.iter().take(self.depth.get()) {
-            if candidate_bids
-                .insert(update.price, update.quantity)
-                .is_some()
-            {
-                return Err(BookError::DuplicatePrice {
-                    side: BookSide::Bid,
-                    price: update.price,
-                });
-            }
-        }
-        for update in asks.iter().take(self.depth.get()) {
-            if candidate_asks
-                .insert(update.price, update.quantity)
-                .is_some()
-            {
-                return Err(BookError::DuplicatePrice {
-                    side: BookSide::Ask,
-                    price: update.price,
-                });
-            }
-        }
+        let mut candidate_bids = Vec::new();
+        candidate_bids
+            .try_reserve_exact(self.depth.get().min(bids.len()))
+            .map_err(|_| BookError::Allocation)?;
+        candidate_bids.extend(
+            bids.iter()
+                .take(self.depth.get())
+                .rev()
+                .map(|update| (update.price, update.quantity)),
+        );
+        let mut candidate_asks = Vec::new();
+        candidate_asks
+            .try_reserve_exact(self.depth.get().min(asks.len()))
+            .map_err(|_| BookError::Allocation)?;
+        candidate_asks.extend(
+            asks.iter()
+                .take(self.depth.get())
+                .map(|update| (update.price, update.quantity)),
+        );
         validate_uncrossed(&candidate_bids, &candidate_asks)?;
         self.bids = candidate_bids;
         self.asks = candidate_asks;
         Ok(())
     }
 
-    /// Applies one complete provider delta using a bounded rollback journal.
+    /// Applies one complete scaled delta using an unpublished candidate image.
     ///
     /// All supplied changes and depth evictions either commit together or are restored in reverse
     /// order. Zero deletes a level; positive quantity inserts or replaces it.
@@ -176,62 +172,33 @@ impl ScaledBook {
     ///
     /// Returns a typed invariant or allocation error without exposing a partial candidate.
     pub fn apply_delta(&mut self, changes: &[LevelUpdate]) -> Result<(), BookError> {
-        let _committed = self.begin_delta_checked(changes, |_| Ok(()))?;
-        Ok(())
-    }
-
-    /// Applies a delta and runs a caller's candidate-state validation before commit.
-    ///
-    /// This crate-private hook lets the provider book validate exact-lexeme checksums while the
-    /// scaled rollback journal is still live. Any validator failure restores the prior book.
-    pub(crate) fn begin_delta_checked<E, F>(
-        &mut self,
-        changes: &[LevelUpdate],
-        validate: F,
-    ) -> Result<ScaledBookRollback, E>
-    where
-        E: From<BookError>,
-        F: FnOnce(&Self) -> Result<(), E>,
-    {
-        ensure_message_bound(changes.len()).map_err(E::from)?;
+        ensure_message_bound(changes.len())?;
         if changes.is_empty() {
-            return Err(E::from(BookError::EmptyDelta));
+            return Err(BookError::EmptyDelta);
         }
-        let rollback_capacity = delta_rollback_capacity(changes.len()).map_err(E::from)?;
-        let mut rollback = Vec::new();
-        rollback
-            .try_reserve(rollback_capacity)
-            .map_err(|_| E::from(BookError::Allocation))?;
+        let mut candidate_bids = self.bids.clone();
+        let mut candidate_asks = self.asks.clone();
+        candidate_bids
+            .try_reserve_exact(changes.len())
+            .map_err(|_| BookError::Allocation)?;
+        candidate_asks
+            .try_reserve_exact(changes.len())
+            .map_err(|_| BookError::Allocation)?;
 
         for update in changes {
-            let map = match update.side {
-                BookSide::Bid => &mut self.bids,
-                BookSide::Ask => &mut self.asks,
+            let side = match update.side {
+                BookSide::Bid => &mut candidate_bids,
+                BookSide::Ask => &mut candidate_asks,
             };
-            let previous = map.get(&update.price).copied();
-            rollback.push(RollbackEntry {
-                side: update.side,
-                price: update.price,
-                previous,
-            });
-            if update.quantity.get() == 0 {
-                map.remove(&update.price);
-            } else {
-                map.insert(update.price, update.quantity);
-            }
+            apply_sorted_update(side, update.price, update.quantity);
         }
-        truncate_with_rollback(&mut self.bids, BookSide::Bid, self.depth, &mut rollback);
-        truncate_with_rollback(&mut self.asks, BookSide::Ask, self.depth, &mut rollback);
+        truncate_sorted(&mut candidate_bids, BookSide::Bid, self.depth);
+        truncate_sorted(&mut candidate_asks, BookSide::Ask, self.depth);
 
-        if let Err(error) = validate_uncrossed(&self.bids, &self.asks) {
-            self.rollback(rollback);
-            return Err(E::from(error));
-        }
-        if let Err(error) = validate(self) {
-            self.rollback(rollback);
-            return Err(error);
-        }
-        Ok(ScaledBookRollback { entries: rollback })
+        validate_uncrossed(&candidate_bids, &candidate_asks)?;
+        self.bids = candidate_bids;
+        self.asks = candidate_asks;
+        Ok(())
     }
 
     /// Returns the configured per-side depth.
@@ -241,84 +208,23 @@ impl ScaledBook {
 
     /// Returns the current best bid.
     pub fn best_bid(&self) -> Option<(PriceTicks, QuantityLots)> {
-        self.bids
-            .iter()
-            .next_back()
-            .map(|(price, quantity)| (*price, *quantity))
+        self.bids.last().copied()
     }
 
     /// Returns the current best ask.
     pub fn best_ask(&self) -> Option<(PriceTicks, QuantityLots)> {
-        self.asks
-            .iter()
-            .next()
-            .map(|(price, quantity)| (*price, *quantity))
+        self.asks.first().copied()
     }
 
     /// Returns a bounded best-to-worst bid snapshot.
     pub fn bid_levels(&self) -> Vec<(PriceTicks, QuantityLots)> {
-        self.bids
-            .iter()
-            .rev()
-            .map(|(price, quantity)| (*price, *quantity))
-            .collect()
+        self.bids.iter().rev().copied().collect()
     }
 
     /// Returns a bounded best-to-worst ask snapshot.
     pub fn ask_levels(&self) -> Vec<(PriceTicks, QuantityLots)> {
-        self.asks
-            .iter()
-            .map(|(price, quantity)| (*price, *quantity))
-            .collect()
+        self.asks.clone()
     }
-
-    pub(crate) fn bid_iter(
-        &self,
-    ) -> impl ExactSizeIterator<Item = (PriceTicks, QuantityLots)> + '_ {
-        self.bids
-            .iter()
-            .rev()
-            .map(|(price, quantity)| (*price, *quantity))
-    }
-
-    pub(crate) fn ask_iter(
-        &self,
-    ) -> impl ExactSizeIterator<Item = (PriceTicks, QuantityLots)> + '_ {
-        self.asks
-            .iter()
-            .map(|(price, quantity)| (*price, *quantity))
-    }
-
-    fn rollback(&mut self, rollback: Vec<RollbackEntry>) {
-        for entry in rollback.into_iter().rev() {
-            let map = match entry.side {
-                BookSide::Bid => &mut self.bids,
-                BookSide::Ask => &mut self.asks,
-            };
-            match entry.previous {
-                Some(quantity) => {
-                    map.insert(entry.price, quantity);
-                }
-                None => {
-                    map.remove(&entry.price);
-                }
-            }
-        }
-    }
-
-    pub(crate) fn rollback_delta(&mut self, rollback: ScaledBookRollback) {
-        self.rollback(rollback.entries);
-    }
-}
-
-/// Internal scaled journal owned by the fail-safe provider-book transaction.
-#[derive(Debug)]
-pub(crate) struct ScaledBookRollback {
-    entries: Vec<RollbackEntry>,
-}
-
-fn delta_rollback_capacity(message_items: usize) -> Result<usize, BookError> {
-    message_items.checked_mul(2).ok_or(BookError::Allocation)
 }
 
 fn ensure_message_bound(observed: usize) -> Result<(), BookError> {
@@ -330,13 +236,6 @@ fn ensure_message_bound(observed: usize) -> Result<(), BookError> {
     } else {
         Ok(())
     }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct RollbackEntry {
-    side: BookSide,
-    price: PriceTicks,
-    previous: Option<QuantityLots>,
 }
 
 fn validate_snapshot_side(updates: &[LevelUpdate], side: BookSide) -> Result<(), BookError> {
@@ -371,38 +270,45 @@ fn validate_snapshot_side(updates: &[LevelUpdate], side: BookSide) -> Result<(),
     Ok(())
 }
 
-fn truncate_with_rollback(
-    map: &mut BTreeMap<PriceTicks, QuantityLots>,
+fn apply_sorted_update(
+    levels: &mut Vec<(PriceTicks, QuantityLots)>,
+    price: PriceTicks,
+    quantity: QuantityLots,
+) {
+    match levels.binary_search_by_key(&price, |(candidate, _)| *candidate) {
+        Ok(index) if quantity.get() == 0 => {
+            levels.remove(index);
+        }
+        Ok(index) => levels[index].1 = quantity,
+        Err(_) if quantity.get() == 0 => {}
+        Err(index) => levels.insert(index, (price, quantity)),
+    }
+}
+
+fn truncate_sorted(
+    levels: &mut Vec<(PriceTicks, QuantityLots)>,
     side: BookSide,
     depth: DepthLimit,
-    rollback: &mut Vec<RollbackEntry>,
 ) {
-    while map.len() > depth.get() {
-        let evicted = match side {
-            BookSide::Bid => map.first_key_value(),
-            BookSide::Ask => map.last_key_value(),
+    if levels.len() <= depth.get() {
+        return;
+    }
+    match side {
+        BookSide::Bid => {
+            let remove = levels.len() - depth.get();
+            levels.drain(..remove);
         }
-        .map(|(price, quantity)| (*price, *quantity));
-        if let Some((price, quantity)) = evicted {
-            rollback.push(RollbackEntry {
-                side,
-                price,
-                previous: Some(quantity),
-            });
-            map.remove(&price);
-        } else {
-            break;
-        }
+        BookSide::Ask => levels.truncate(depth.get()),
     }
 }
 
 fn validate_uncrossed(
-    bids: &BTreeMap<PriceTicks, QuantityLots>,
-    asks: &BTreeMap<PriceTicks, QuantityLots>,
+    bids: &[(PriceTicks, QuantityLots)],
+    asks: &[(PriceTicks, QuantityLots)],
 ) -> Result<(), BookError> {
     if bids
-        .last_key_value()
-        .zip(asks.first_key_value())
+        .last()
+        .zip(asks.first())
         .is_some_and(|((bid, _), (ask, _))| bid >= ask)
     {
         Err(BookError::Crossed)
@@ -438,18 +344,7 @@ pub enum BookError {
     /// Candidate best bid is at or above candidate best ask.
     #[error("candidate order book is crossed")]
     Crossed,
-    /// A bounded candidate or rollback allocation failed.
+    /// A bounded unpublished candidate allocation failed.
     #[error("bounded book allocation failed")]
     Allocation,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::delta_rollback_capacity;
-
-    #[test]
-    fn rollback_capacity_scales_with_message_not_configured_depth() {
-        assert_eq!(delta_rollback_capacity(1), Ok(2));
-        assert_eq!(delta_rollback_capacity(10), Ok(20));
-    }
 }

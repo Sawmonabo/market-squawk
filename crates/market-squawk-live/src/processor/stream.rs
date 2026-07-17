@@ -11,9 +11,9 @@ use market_squawk_sources::{
 };
 
 use super::LiveApplyError;
-use super::event::{PreparedEvent, digest_book, normalized_changes, prepare_non_book};
+use super::event::{PreparedEvent, digest_candidate_book, prepare_non_book};
 use crate::authority::{AuthorityError, GenerationLease, StreamRevisionLease, StreamRevisionOwner};
-use crate::provider_book::{ProviderBook, ProviderBookDeltaTransaction};
+use crate::provider_book::{BookProcessingScratch, ProviderBook, ProviderBookTransaction};
 use crate::qualification::{CommittedQualificationEvidence, SnapshotOrigin, canonical_digest};
 use crate::{
     DepthLimit, GenerationPhase, GenerationStateMachine, ResolvedChecksumValidator, SequenceTracker,
@@ -57,7 +57,7 @@ impl StreamState {
             phase,
             sequence: SequenceTracker::new(generation, protocol.sequence()),
             checksum,
-            book: ProviderBook::new(depth),
+            book: ProviderBook::try_new(depth)?,
             snapshot_origin: None,
             revision: StreamRevisionOwner::new(),
             health_epoch: 0,
@@ -145,11 +145,7 @@ impl StreamState {
 #[derive(Debug)]
 enum BookMutation<'a> {
     Unchanged,
-    Snapshot {
-        target: &'a mut ProviderBook,
-        candidate: ProviderBook,
-    },
-    Delta(ProviderBookDeltaTransaction<'a>),
+    Transaction(ProviderBookTransaction<'a>),
 }
 
 /// Fully validated next state. A dropped delta candidate automatically restores last-good book.
@@ -208,8 +204,7 @@ impl StreamCandidate<'_> {
         }
         match self.book_mutation {
             BookMutation::Unchanged => {}
-            BookMutation::Snapshot { target, candidate } => *target = candidate,
-            BookMutation::Delta(transaction) => transaction.commit(),
+            BookMutation::Transaction(transaction) => transaction.commit(),
         }
         *self.phase_target = self.phase;
         *self.sequence_target = self.sequence;
@@ -243,6 +238,7 @@ pub(super) fn preview_stream<'a>(
     definition: &InstrumentDefinition,
     trading_status: TradingStatus,
     evaluated_at: Timestamp,
+    scratch: &'a mut BookProcessingScratch,
 ) -> Result<StreamCandidate<'a>, LiveApplyError> {
     if state.phase.phase() == GenerationPhase::Quarantined {
         return Err(LiveApplyError::Quarantined);
@@ -266,8 +262,7 @@ pub(super) fn preview_stream<'a>(
             ProviderObservationPayload::BookSnapshot(snapshot) => {
                 phase.begin_snapshot()?;
                 let sequence_evidence = sequence.validate_snapshot(observation.sequence())?;
-                let mut candidate = ProviderBook::new(state.book.scaled_depth());
-                let computed = candidate.replace_snapshot(
+                let transaction = state.book.begin_snapshot(
                     snapshot.bids(),
                     snapshot.asks(),
                     definition.tick_size(),
@@ -276,8 +271,11 @@ pub(super) fn preview_stream<'a>(
                         .checksum
                         .as_ref()
                         .map(|validator| (validator, observation.checksum())),
+                    scratch,
                 )?;
-                let digest = digest_book(&candidate)?;
+                let computed = transaction.computed_checksum();
+                let candidate = transaction.candidate();
+                let digest = digest_candidate_book(&candidate)?;
                 let identity = state_identity(state.connection_generation, next_revision)?;
                 snapshot_origin = Some(SnapshotOrigin {
                     identity: identity.clone(),
@@ -301,10 +299,7 @@ pub(super) fn preview_stream<'a>(
                     Some(book_state),
                     sequence_evidence,
                     checksum,
-                    BookMutation::Snapshot {
-                        target: &mut state.book,
-                        candidate,
-                    },
+                    BookMutation::Transaction(transaction),
                 )
             }
             ProviderObservationPayload::BookDelta(delta) => {
@@ -318,11 +313,12 @@ pub(super) fn preview_stream<'a>(
                         .checksum
                         .as_ref()
                         .map(|validator| (validator, observation.checksum())),
+                    scratch,
                 )?;
                 let computed = transaction.computed_checksum();
                 let candidate_book = transaction.candidate();
                 let late_result = (|| {
-                    let digest = digest_book(candidate_book)?;
+                    let digest = digest_candidate_book(&candidate_book)?;
                     let identity = state_identity(state.connection_generation, next_revision)?;
                     let origin = snapshot_origin
                         .as_ref()
@@ -335,7 +331,7 @@ pub(super) fn preview_stream<'a>(
                         origin.digest.clone(),
                     );
                     let checksum = checksum_evidence(current, computed)?;
-                    let changes = normalized_changes(delta.changes(), definition)?;
+                    let changes = transaction.normalized_changes()?;
                     Ok::<_, LiveApplyError>((
                         PreparedEvent::BookDelta {
                             depth: delta.depth(),
@@ -354,7 +350,7 @@ pub(super) fn preview_stream<'a>(
                     book_state,
                     sequence_evidence,
                     checksum,
-                    BookMutation::Delta(transaction),
+                    BookMutation::Transaction(transaction),
                 )
             }
             payload => {

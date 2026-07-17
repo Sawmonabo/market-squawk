@@ -30,6 +30,7 @@ mod status;
 mod stream;
 
 pub(crate) use error::LiveApplyError;
+pub(crate) use event::{delta_canonical_vector_peak_bytes, snapshot_canonical_vector_peak_bytes};
 #[allow(
     unused_imports,
     reason = "Task 8 control-plane binding consumes the registry and exit handle"
@@ -46,6 +47,7 @@ use crate::authority::{
     AppliedObservationAuthority, AuthorityGate, ClockReading, RuntimeLease, ShardLease,
     SystemTrustedClock, TrustedClock,
 };
+use crate::provider_book::BookProcessingScratch;
 use crate::qualification::build_qualified_event;
 use crate::{AuthorityError, ConsumedLiveAuthority, DepthLimit, LiveExecutionCapability};
 
@@ -245,6 +247,7 @@ impl<C: TrustedClock> InstrumentLiveProcessor<C> {
     pub(crate) fn apply_next(
         &mut self,
         cursor: &mut CurrentBatchCursor,
+        scratch: &mut BookProcessingScratch,
     ) -> Result<Option<AppliedLiveObservation>, LiveApplyError> {
         let Some(current) = cursor.observations.next() else {
             return Ok(None);
@@ -274,6 +277,7 @@ impl<C: TrustedClock> InstrumentLiveProcessor<C> {
                 &self.definition,
                 staged_status.status(),
                 now.wall(),
+                scratch,
             )?;
             let prepared = candidate.take_prepared()?;
             let qualified = build_qualified_event(

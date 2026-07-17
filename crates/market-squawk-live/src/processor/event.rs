@@ -3,16 +3,37 @@
 use market_squawk_domain::{
     AuctionEvent, BookChange, BookDeltaEvent, BookSnapshotEvent, CorporateActionEvent,
     CorporateActionKind, InstrumentDefinition, InstrumentStatusEvent, LiveProvenance, MarketEvent,
-    MarketSide, PriceTicks, QuantityLots, QuoteEvent, SourceIdentifier, Timestamp, TradeEvent,
+    PriceTicks, QuantityLots, QuoteEvent, SourceIdentifier, Timestamp, TradeEvent,
     TradingHaltEvent, TradingStatus,
 };
-use market_squawk_sources::{ProviderBookSide, ProviderObservationPayload};
+use market_squawk_sources::ProviderObservationPayload;
 use sha2::{Digest, Sha256};
 
 use super::LiveApplyError;
-use crate::provider_book::ProviderBook;
+use crate::provider_book::{ProviderBook, ProviderBookCandidate};
 use crate::qualification::canonical_digest_from_sha256;
 use crate::{normalize_positive_quantity, normalize_price};
+
+/// Maximum canonical snapshot-vector bytes while allocator spare capacity is normalized through
+/// an owned boxed slice. Both final side vectors and one in-flight conversion allocation coexist.
+pub(crate) fn snapshot_canonical_vector_peak_bytes(
+    depth: usize,
+    maximum_items: usize,
+) -> Option<u64> {
+    let retained_levels = (depth as u64).checked_mul(2)?.min(maximum_items as u64);
+    let conversion_overlap = (depth as u64).min(maximum_items as u64);
+    retained_levels
+        .checked_add(conversion_overlap)?
+        .checked_mul(std::mem::size_of::<market_squawk_domain::BookLevel>() as u64)
+}
+
+/// Maximum canonical delta-vector bytes while allocator spare capacity is normalized through an
+/// owned boxed slice. The pre-normalization and final allocations may briefly coexist.
+pub(crate) fn delta_canonical_vector_peak_bytes(maximum_items: usize) -> Option<u64> {
+    (maximum_items as u64)
+        .checked_mul(2)?
+        .checked_mul(std::mem::size_of::<BookChange>() as u64)
+}
 
 #[derive(Clone, Debug)]
 pub(super) enum PreparedEvent {
@@ -232,27 +253,18 @@ pub(super) fn prepare_non_book(
     }
 }
 
-pub(super) fn normalized_changes(
-    changes: &[market_squawk_sources::ProviderBookChange],
-    definition: &InstrumentDefinition,
-) -> Result<Vec<BookChange>, LiveApplyError> {
-    changes
-        .iter()
-        .map(|change| {
-            Ok(BookChange::new(
-                match change.side() {
-                    ProviderBookSide::Bid => MarketSide::Bid,
-                    ProviderBookSide::Ask => MarketSide::Ask,
-                },
-                normalize_price(change.level().price(), definition.tick_size())?,
-                crate::normalize_delta_quantity(change.level().quantity(), definition.lot_size())?,
-            ))
-        })
-        .collect()
-}
-
 pub(super) fn digest_book(
     book: &ProviderBook,
+) -> Result<market_squawk_domain::CanonicalStateDigest, LiveApplyError> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"MSQKBOOK\x01");
+    hash_side(&mut hasher, 1, book.scaled_bid_iter())?;
+    hash_side(&mut hasher, 2, book.scaled_ask_iter())?;
+    Ok(canonical_digest_from_sha256(hasher.finalize().into())?)
+}
+
+pub(super) fn digest_candidate_book(
+    book: &ProviderBookCandidate<'_>,
 ) -> Result<market_squawk_domain::CanonicalStateDigest, LiveApplyError> {
     let mut hasher = Sha256::new();
     hasher.update(b"MSQKBOOK\x01");
@@ -378,7 +390,10 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::{PreparedEvent, digest_book};
-    use crate::{DepthLimit, provider_book::ProviderBook};
+    use crate::{
+        DepthLimit,
+        provider_book::{BookProcessingScratch, ProviderBook},
+    };
 
     fn level(price: &str, quantity: &str) -> Result<ProviderBookLevel, Box<dyn std::error::Error>> {
         Ok(ProviderBookLevel::new(
@@ -390,13 +405,15 @@ mod tests {
     #[test]
     fn streaming_book_digest_matches_v1_canonical_bytes() -> Result<(), Box<dyn std::error::Error>>
     {
-        let mut book = ProviderBook::new(DepthLimit::new(2)?);
+        let mut book = ProviderBook::try_new(DepthLimit::new(2)?)?;
+        let mut scratch = BookProcessingScratch::try_new(4)?;
         book.replace_snapshot(
             &[level("100", "2")?, level("99", "3")?],
             &[level("101", "4")?, level("102", "5")?],
             TickSize::try_from_decimal(Decimal::ONE)?,
             LotSize::try_from_decimal(Decimal::ONE)?,
             None,
+            &mut scratch,
         )?;
         let mut legacy = Vec::from(&b"MSQKBOOK\x01"[..]);
         legacy.push(1);

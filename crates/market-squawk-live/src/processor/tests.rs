@@ -21,7 +21,14 @@ use crate::authority::{
     AppliedObservationAuthority, AuthorityError, ClockReading, RuntimeLeaseOwner,
     ScriptedTrustedClock, ShardLeaseOwner,
 };
+use crate::provider_book::BookProcessingScratch;
 use crate::{DepthLimit, StreamPhaseSnapshot};
+
+const TEST_BOOK_MESSAGE_ITEMS: usize = 64;
+
+fn test_book_scratch() -> Result<BookProcessingScratch, LiveApplyError> {
+    Ok(BookProcessingScratch::try_new(TEST_BOOK_MESSAGE_ITEMS)?)
+}
 
 fn fixed_clock(at: Timestamp) -> TestResult<ScriptedTrustedClock> {
     let reading = ClockReading::new(at, Instant::now());
@@ -101,8 +108,9 @@ fn rejected_new_stream_does_not_consume_source_generation_capacity() -> TestResu
 
     let _ = apply_one(&mut processor, &first_admission, first_batch)?;
     let mut rejected = processor.accept_batch(second_batch, &second_admission)?;
+    let mut scratch = test_book_scratch()?;
     assert!(matches!(
-        processor.apply_next(&mut rejected),
+        processor.apply_next(&mut rejected, &mut scratch),
         Err(LiveApplyError::StreamCapacityExhausted)
     ));
     assert_eq!(processor.streams.len(), 1);
@@ -160,7 +168,12 @@ fn failed_generation_replacement_preserves_the_former_processor_state() -> TestR
     );
     processor.clock = ScriptedTrustedClock::try_new(vec![current, expired])?;
 
-    assert!(processor.apply_next(&mut replacement).is_err());
+    let mut scratch = test_book_scratch()?;
+    assert!(
+        processor
+            .apply_next(&mut replacement, &mut scratch)
+            .is_err()
+    );
     assert_eq!(processor.streams.len(), 1);
     let retained = processor
         .streams
@@ -184,10 +197,11 @@ fn apply_one(
     batch: CurrentDecodedProviderBatch,
 ) -> Result<AppliedLiveObservation, LiveApplyError> {
     let mut cursor = processor.accept_batch(batch, admission)?;
+    let mut scratch = test_book_scratch()?;
     let applied = processor
-        .apply_next(&mut cursor)?
+        .apply_next(&mut cursor, &mut scratch)?
         .ok_or(LiveApplyError::BindingMismatch)?;
-    if processor.apply_next(&mut cursor)?.is_some() {
+    if processor.apply_next(&mut cursor, &mut scratch)?.is_some() {
         return Err(LiveApplyError::BindingMismatch);
     }
     Ok(applied)
@@ -393,8 +407,9 @@ fn late_delta_expiry_rolls_back_book_sequence_revision_and_status() -> TestResul
         },
     )?;
     let mut cursor = processor.accept_batch(delta_batch, &admission)?;
+    let mut scratch = test_book_scratch()?;
     assert!(matches!(
-        processor.apply_next(&mut cursor),
+        processor.apply_next(&mut cursor, &mut scratch),
         Err(LiveApplyError::Source(RegistryError::HealthNotQualified))
     ));
 
@@ -519,8 +534,9 @@ fn status_allocation_overflow_preserves_last_good_status_and_stream_revision() -
         non_book_snapshot()?,
     )?;
     let mut cursor = ready.processor.accept_batch(halted, &ready.admission)?;
+    let mut scratch = test_book_scratch()?;
     assert!(matches!(
-        ready.processor.apply_next(&mut cursor),
+        ready.processor.apply_next(&mut cursor, &mut scratch),
         Err(LiveApplyError::StatusRevisionExhausted)
     ));
     let after = ready.processor.snapshot_seed(limits)?;

@@ -15,6 +15,9 @@ mod lifecycle;
 #[path = "runtime/memory.rs"]
 mod memory;
 
+#[cfg(test)]
+pub(crate) use memory::book_processing_peak;
+
 pub use admission::{
     BoundShardIngress, LiveIngressBindError, LiveIngressError, LiveRuntimeHealthEvent,
     LiveRuntimeHealthKind, LiveRuntimeIngress, RegistrationFailure,
