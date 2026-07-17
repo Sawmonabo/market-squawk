@@ -25,6 +25,12 @@ decisions can be audited without relying on conversation history.
 - [Journal durability](2026-07-16-journal-durability.md) — exact-handle validation, file/directory
   synchronization, capability-bound journal I/O, and blocking-writer isolation.
 
+## Stage 2 decisions
+
+- [Authority lifecycle model checking](2026-07-17-authority-lifecycle-model-checking.md) — packed
+  lifecycle transition properties, property testing, bounded Loom modeling, commands, limitations,
+  and primary sources.
+
 ## Evidence policy
 
 - Prefer official specifications, official project documentation, primary research papers, and
