@@ -6,7 +6,11 @@ The `main` branch and the latest tagged `0.x` release receive security fixes. Th
 
 ## Reporting
 
-Report suspected vulnerabilities privately through GitHub Security Advisories for the repository. Do not include live credentials, private portfolio data, exchange secrets, or proprietary datasets in an issue.
+Use the private vulnerability-reporting option on the repository's Security page when GitHub shows
+it. If no private reporting option is visible, contact `@Sawmonabo` through an already established
+private channel and request a reporting route without disclosing vulnerability details. Never open
+a public issue or pull request containing a suspected vulnerability, live credential, private
+portfolio data, exchange secret, proprietary dataset, or unredacted sensitive log.
 
 ## Security boundaries
 

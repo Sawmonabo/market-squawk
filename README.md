@@ -287,6 +287,13 @@ The architecture removes avoidable vendor dependence through adapters, local per
 explicit coverage, source health, and fail-closed degradation. It does not attempt to evade
 legitimate provider restrictions.
 
+## License
+
+Market Squawk is available under your choice of the
+[Apache License 2.0](LICENSE-APACHE) or the [MIT License](LICENSE-MIT)
+(`Apache-2.0 OR MIT`). Contributions are accepted under those same terms unless explicitly stated
+otherwise.
+
 ## Roadmap
 
 1. Segmented journals with SHA-256 manifests and crash recovery indexes
