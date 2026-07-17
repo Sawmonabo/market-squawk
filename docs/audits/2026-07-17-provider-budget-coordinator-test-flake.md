@@ -46,6 +46,11 @@ the exact refusal deadline and refusal count. The assertion therefore proves per
 canonical allocation and request state without allowing scheduler delay or wall-clock passage to
 change the expected result.
 
+A separate runtime unit test uses the existing manual monotonic clock to prove the complementary
+boundary contract: acquisition returns the same refusal deadline one nanosecond before expiry and
+becomes ready exactly at expiry. Coordinator ownership and deadline enforcement are therefore
+covered independently without a process-global clock override.
+
 Production clock selection, cooldown expiry, acquisition behavior, coordinator ownership, and
 public APIs are unchanged.
 

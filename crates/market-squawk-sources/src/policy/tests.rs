@@ -288,6 +288,35 @@ mod tests {
     }
 
     #[test]
+    fn refusal_cooldown_blocks_before_and_expires_at_the_exact_monotonic_deadline()
+    -> Result<(), NetworkPolicyError> {
+        let clock = Arc::new(ManualClock::new(100, 1_000));
+        let budget = SharedProviderBudget::new(
+            policy()?,
+            MonotonicInstant::from_nanos(1_000),
+            clock.clone(),
+        );
+        let deadline = match budget.apply_refusal(0) {
+            BudgetDecision::WaitUntil(deadline) => deadline,
+            _ => return Err(NetworkPolicyError::InvalidBudgetPolicy),
+        };
+        assert_eq!(deadline.as_nanos(), 1_010);
+
+        assert!(clock.set(109, 1_009));
+        assert!(matches!(
+            budget.try_acquire(),
+            BudgetDecision::WaitUntil(observed) if observed == deadline
+        ));
+
+        assert!(clock.set(110, 1_010));
+        let BudgetDecision::Ready(permit) = budget.try_acquire() else {
+            return Err(NetworkPolicyError::InvalidBudgetPolicy);
+        };
+        permit.release();
+        Ok(())
+    }
+
+    #[test]
     fn every_availability_failure_revokes_prior_lease_before_returning()
     -> Result<(), NetworkPolicyError> {
         for case in AvailabilityFailureCase::ALL {
