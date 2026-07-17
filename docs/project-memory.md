@@ -229,10 +229,88 @@ following:
    materially integrated and runnable rather than represented by contracts or scaffolding.
 4. The refreshed requirement ledger demonstrates at least 50% of mandatory production-capability
    weight as implemented, with its weighting method and evidence recorded.
-5. No unresolved Critical or Important review finding remains at the frozen halfway candidate.
+5. No unresolved Critical, Important, or Minor review finding remains at the frozen halfway
+   candidate.
 6. The repository is clean, pushed to `origin`, commented on the active pull request, and the
    applicable local and hosted verification evidence is recorded truthfully.
 
 At that point, stop implementation and hand off the exact commit, ledger, verification, review,
 remaining-work map, active/removed worktrees, and explicit next dependency. Do not silently resume
 beyond halfway without a new user instruction.
+
+## 2026-07-17 A3 integration and hosted account evidence gap
+
+Q2 A3 authority persistence and its scheduler-independent concurrency remediation are integrated on
+`feat/stage-1-foundation` at exact commit
+`ab3f7c19000884357c38702edf6b4acc6a80c483`. That unchanged commit passed the complete local
+verifier, 25 consecutive complete 111-test source-library runs with 16 test threads, standalone
+formatting checks for all eight changed included/path test modules, and independent exact-hash
+review with zero Critical, Important, or Minor findings. Production code and public APIs were
+unchanged by the hosted-test remediation.
+
+GitHub Actions run
+[`29564138664`](https://github.com/Sawmonabo/market-squawk/actions/runs/29564138664) did not assign a
+runner or execute a checkout/project step on Ubuntu, macOS, or Windows. Every job had runner ID zero,
+an empty step list, and the GitHub annotation that recent account payments failed or the Actions
+spending limit must be increased. This is an external account-level hosted-evidence gap, not a
+failed Market Squawk test result.
+
+The current execution rule is:
+
+1. Wave 0 capture research, plan correction, and evidence persistence may proceed because they do
+   not publish or exercise new production authority.
+2. GitHub Actions is optional evidence under the no-mandatory-cloud product constraint and the
+   candidate-evidence policy above. The external account condition must not become a paid-cloud
+   prerequisite for A4 implementation or local exact-head approval. After the Wave 0 artifacts are
+   reviewed and integrated, the serialized A4.0 seed starts from that clean documentation
+   descendant while proving that its production tree still equals the locally approved exact A3
+   production tree at `ab3f7c1`.
+3. Do not waive, misclassify, or repeatedly rerun the account-blocked workflow. The event that
+   releases the optional hosted evidence gap is a Billing & plans correction followed by one
+   exact-hash rerun. Until then, record hosted portability as unverified and make no Ubuntu,
+   macOS-hosted, or Windows-hosted success claim.
+4. Completed governance, authority, preflight, and hosted-remediation worktrees were verified clean
+   and removed without force. The only active grouped worktree is `q2-a4-wave0` until its research
+   and plan artifacts are integrated.
+5. The production-weighted ledger remains below halfway. A3 local approval is earned evidence, but
+   projected A4/Q3/Q4 weight is not counted as implemented.
+
+## 2026-07-17 downstream halfway launch correction
+
+After Q2 approval, Q3 production work starts only after Task 0 refreshes the detailed Q3 plan from
+the approved Q2 exact commit. Preserve its three grouped implementation lanes and serialized root
+ownership of manifests, `Cargo.lock`, application composition, and live/execution authority
+handoffs. The pre-Q2 audit anchors, paths, module sizes, capture APIs, Cargo Machete prerequisite,
+fuzz tool versions, and provider assumptions are refresh inputs rather than execution truth.
+
+Immediately after Q2 approval and before any Q3 production dispatch, Q3 Task 0 must also freeze and
+independently review the production-capability weighting method used to determine halfway. The
+method must define the mandatory-capability universe, weights, partial-credit rules, minimum
+implementation evidence, rounding, and treatment of cross-cutting capabilities before Q3 or Q4
+outcomes are known. Commit its exact version with the refreshed Q3 execution base. Q3 and Q4 consume
+that immutable method, but implementation weight is credited only after the corresponding production
+capability and required evidence are integrated. The approved-Q3 Q4 refresh must not redefine,
+rebalance, or retroactively reinterpret the weights.
+
+The existing complete-release document does not yet contain an ownership-complete Q4 plan or the
+binding halfway stop. An ownership-complete Q4 controlling plan may be written and reviewed
+provisionally now from an explicit audited base with an approved-head refresh gate. After Q3 is
+approved and before Q4 code dispatch, refresh that plan against the exact approved Q3 commit. The
+refresh updates paths, interfaces, dependency edges, ownership, provider assumptions, and baseline
+evidence, but consumes the already-frozen production-capability weighting method unchanged. The
+controlling plan must:
+
+1. use the approved Q3 exact commit as its execution base after the mandatory refresh;
+2. run Kraken/live closure in parallel with the local data/storage/provider branch using disjoint
+   crates and serialized shared schemas, manifests, configuration, application composition, and
+   lockfile ownership;
+3. require deterministic runnable Kraken and research-plane vertical demonstrations rather than
+   package existence, interfaces, empty schemas, or mocks;
+4. credit only real datasets with Q2/Q3/Q4 producers, not later model/valuation placeholders; and
+5. freeze, verify, review, push, comment, clean worktrees, and stop immediately when every
+   halfway predicate above is satisfied.
+
+Late Q2 verification may overlap only with read-only/provisional Q3/Q4 inventories, lawful-provider
+research, fixture/license metadata, tooling research, benchmark design, and plan writing. No Q3/Q4
+production code, implementation worktree, manifest/lockfile mutation, or capability credit begins
+before its approved-base barrier.
