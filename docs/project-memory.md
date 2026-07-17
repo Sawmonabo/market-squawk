@@ -204,3 +204,28 @@ The correction is permanent:
 
 This correction does not weaken production gates. It removes avoidable coordination latency while
 preserving the authority, memory, persistence, lifecycle, and review invariants those gates protect.
+
+## Halfway terminal condition
+
+As directed on 2026-07-17, the active delivery run stops at a defensible production-weighted
+halfway checkpoint rather than continuing automatically through the complete release.
+
+Raw checklist counts cannot establish this checkpoint because the remaining storage, provider,
+analytics, modeling, portfolio, execution, valuation, MCP, performance, and release capabilities
+have materially different implementation weight. The halfway checkpoint requires all of the
+following:
+
+1. Q2 authority/capture remediation is integrated and approved at one clean exact commit.
+2. Q3 production live decisions, enforced risk, Coinbase, and realistic paper execution are
+   integrated and approved.
+3. Both Q4 branches—Kraken/live-source closure and the local research/storage/provider plane—are
+   materially integrated and runnable rather than represented by contracts or scaffolding.
+4. The refreshed requirement ledger demonstrates at least 50% of mandatory production-capability
+   weight as implemented, with its weighting method and evidence recorded.
+5. No unresolved Critical or Important review finding remains at the frozen halfway candidate.
+6. The repository is clean, pushed to `origin`, commented on the active pull request, and the
+   applicable local and hosted verification evidence is recorded truthfully.
+
+At that point, stop implementation and hand off the exact commit, ledger, verification, review,
+remaining-work map, active/removed worktrees, and explicit next dependency. Do not silently resume
+beyond halfway without a new user instruction.
