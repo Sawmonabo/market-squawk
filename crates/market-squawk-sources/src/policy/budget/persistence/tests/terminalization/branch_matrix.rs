@@ -124,14 +124,24 @@ fn assert_global_terminal(
 
     let envelope = deserialize_canonical_envelope(&fixture.store.payload()?)?;
     assert_eq!(envelope.run_state, DurableRunState::InUse);
-    let affected = envelope
-        .budgets
-        .as_slice()
-        .get(fixture.slot)
-        .ok_or("affected durable budget group missing")?
-        .checkpoint();
     if terminal_checkpoint_was_stored {
-        assert!(affected.terminal && affected.poisoned && affected.disabled);
+        assert!(
+            envelope
+                .budgets
+                .as_slice()
+                .iter()
+                .all(|group| {
+                    let checkpoint = group.checkpoint();
+                    checkpoint.terminal && checkpoint.poisoned && checkpoint.disabled
+                }),
+            "global terminal persistence left a pre-existing group recoverable"
+        );
+    } else {
+        let _affected = envelope
+            .budgets
+            .as_slice()
+            .get(fixture.slot)
+            .ok_or("affected durable budget group missing")?;
     }
 
     fixture.store.reject_stores.store(false, Ordering::Release);
@@ -150,6 +160,7 @@ fn assert_global_terminal(
 
 #[derive(Clone, Copy, Debug)]
 enum AvailabilityFatalCase {
+    ClockUnavailable,
     StatePoisoned,
     ClockRegression,
     DeadlineOverflow,
@@ -160,6 +171,7 @@ enum AvailabilityFatalCase {
 #[test]
 fn availability_fatal_branch_matrix_invalidates_global_durability() -> TestResult {
     for case in [
+        AvailabilityFatalCase::ClockUnavailable,
         AvailabilityFatalCase::StatePoisoned,
         AvailabilityFatalCase::ClockRegression,
         AvailabilityFatalCase::DeadlineOverflow,
@@ -168,6 +180,7 @@ fn availability_fatal_branch_matrix_invalidates_global_durability() -> TestResul
     ] {
         let fixture = global_fault_fixture()?;
         match case {
+            AvailabilityFatalCase::ClockUnavailable => fixture.clock.fail(),
             AvailabilityFatalCase::StatePoisoned => poison_budget_state(&fixture.budget),
             AvailabilityFatalCase::ClockRegression => {
                 fixture
@@ -207,6 +220,7 @@ fn availability_fatal_branch_matrix_invalidates_global_durability() -> TestResul
             }
         }
         let expected = match case {
+            AvailabilityFatalCase::ClockUnavailable => BudgetUnavailableReason::ClockUnavailable,
             AvailabilityFatalCase::StatePoisoned => BudgetUnavailableReason::StatePoisoned,
             AvailabilityFatalCase::ClockRegression => BudgetUnavailableReason::ClockRegression,
             AvailabilityFatalCase::DeadlineOverflow => BudgetUnavailableReason::DeadlineOverflow,
@@ -228,6 +242,7 @@ fn availability_fatal_branch_matrix_invalidates_global_durability() -> TestResul
 
 #[derive(Clone, Copy, Debug)]
 enum AcquireFatalCase {
+    ClockUnavailable,
     StatePoisoned,
     ClockRegression,
     WindowDeadlineOverflow,
@@ -239,6 +254,7 @@ enum AcquireFatalCase {
 #[test]
 fn try_acquire_fatal_branch_matrix_invalidates_global_durability() -> TestResult {
     for case in [
+        AcquireFatalCase::ClockUnavailable,
         AcquireFatalCase::StatePoisoned,
         AcquireFatalCase::ClockRegression,
         AcquireFatalCase::WindowDeadlineOverflow,
@@ -248,6 +264,7 @@ fn try_acquire_fatal_branch_matrix_invalidates_global_durability() -> TestResult
     ] {
         let fixture = global_fault_fixture()?;
         match case {
+            AcquireFatalCase::ClockUnavailable => fixture.clock.fail(),
             AcquireFatalCase::StatePoisoned => poison_budget_state(&fixture.budget),
             AcquireFatalCase::ClockRegression => {
                 fixture
@@ -291,6 +308,7 @@ fn try_acquire_fatal_branch_matrix_invalidates_global_durability() -> TestResult
             }
         }
         let expected = match case {
+            AcquireFatalCase::ClockUnavailable => BudgetUnavailableReason::ClockUnavailable,
             AcquireFatalCase::StatePoisoned => BudgetUnavailableReason::StatePoisoned,
             AcquireFatalCase::ClockRegression => BudgetUnavailableReason::ClockRegression,
             AcquireFatalCase::WindowDeadlineOverflow => BudgetUnavailableReason::DeadlineOverflow,
@@ -313,6 +331,7 @@ fn try_acquire_fatal_branch_matrix_invalidates_global_durability() -> TestResult
 
 #[derive(Clone, Copy, Debug)]
 enum RetryAfterFatalCase {
+    ClockUnavailable,
     StatePoisoned,
     RelativeMonotonicOverflow,
     AbsoluteWallSubtractionOverflow,
@@ -323,6 +342,7 @@ enum RetryAfterFatalCase {
 #[test]
 fn retry_after_fatal_branch_matrix_invalidates_global_durability() -> TestResult {
     for case in [
+        RetryAfterFatalCase::ClockUnavailable,
         RetryAfterFatalCase::StatePoisoned,
         RetryAfterFatalCase::RelativeMonotonicOverflow,
         RetryAfterFatalCase::AbsoluteWallSubtractionOverflow,
@@ -331,6 +351,10 @@ fn retry_after_fatal_branch_matrix_invalidates_global_durability() -> TestResult
     ] {
         let fixture = global_fault_fixture()?;
         let retry_after = match case {
+            RetryAfterFatalCase::ClockUnavailable => {
+                fixture.clock.fail();
+                RetryAfter::Delay(NonZeroU64::new(1).ok_or("retry delay must be nonzero")?)
+            }
             RetryAfterFatalCase::StatePoisoned => {
                 poison_budget_state(&fixture.budget);
                 RetryAfter::Delay(NonZeroU64::new(1).ok_or("retry delay must be nonzero")?)
@@ -353,6 +377,7 @@ fn retry_after_fatal_branch_matrix_invalidates_global_durability() -> TestResult
             }
         };
         let expected = match case {
+            RetryAfterFatalCase::ClockUnavailable => BudgetUnavailableReason::ClockUnavailable,
             RetryAfterFatalCase::StatePoisoned => BudgetUnavailableReason::StatePoisoned,
             RetryAfterFatalCase::PersistenceFailure => {
                 BudgetUnavailableReason::PersistenceUnavailable
@@ -377,6 +402,7 @@ fn retry_after_fatal_branch_matrix_invalidates_global_durability() -> TestResult
 
 #[derive(Clone, Copy, Debug)]
 enum RefusalFatalCase {
+    ClockUnavailable,
     StatePoisoned,
     CounterOverflow,
     DeadlineOverflow,
@@ -386,6 +412,7 @@ enum RefusalFatalCase {
 #[test]
 fn refusal_fatal_branch_matrix_invalidates_global_durability() -> TestResult {
     for case in [
+        RefusalFatalCase::ClockUnavailable,
         RefusalFatalCase::StatePoisoned,
         RefusalFatalCase::CounterOverflow,
         RefusalFatalCase::DeadlineOverflow,
@@ -393,6 +420,7 @@ fn refusal_fatal_branch_matrix_invalidates_global_durability() -> TestResult {
     ] {
         let fixture = global_fault_fixture()?;
         match case {
+            RefusalFatalCase::ClockUnavailable => fixture.clock.fail(),
             RefusalFatalCase::StatePoisoned => poison_budget_state(&fixture.budget),
             RefusalFatalCase::CounterOverflow => {
                 fixture
@@ -411,6 +439,7 @@ fn refusal_fatal_branch_matrix_invalidates_global_durability() -> TestResult {
             }
         }
         let expected = match case {
+            RefusalFatalCase::ClockUnavailable => BudgetUnavailableReason::ClockUnavailable,
             RefusalFatalCase::StatePoisoned => BudgetUnavailableReason::StatePoisoned,
             RefusalFatalCase::CounterOverflow => BudgetUnavailableReason::StateCorrupt,
             RefusalFatalCase::DeadlineOverflow => BudgetUnavailableReason::DeadlineOverflow,
@@ -430,8 +459,10 @@ fn refusal_fatal_branch_matrix_invalidates_global_durability() -> TestResult {
 
 #[derive(Clone, Copy, Debug)]
 enum AdministrativeFatalCase {
+    RecordSuccessClockUnavailable,
     RecordSuccessPoisoned,
     RecordSuccessPersistenceFailure,
+    DisableClockUnavailable,
     DisablePoisoned,
     DisablePersistenceFailure,
 }
@@ -439,13 +470,17 @@ enum AdministrativeFatalCase {
 #[test]
 fn administrative_fatal_branch_matrix_invalidates_global_durability() -> TestResult {
     for case in [
+        AdministrativeFatalCase::RecordSuccessClockUnavailable,
         AdministrativeFatalCase::RecordSuccessPoisoned,
         AdministrativeFatalCase::RecordSuccessPersistenceFailure,
+        AdministrativeFatalCase::DisableClockUnavailable,
         AdministrativeFatalCase::DisablePoisoned,
         AdministrativeFatalCase::DisablePersistenceFailure,
     ] {
         let fixture = global_fault_fixture()?;
         match case {
+            AdministrativeFatalCase::RecordSuccessClockUnavailable
+            | AdministrativeFatalCase::DisableClockUnavailable => fixture.clock.fail(),
             AdministrativeFatalCase::RecordSuccessPoisoned
             | AdministrativeFatalCase::DisablePoisoned => {
                 poison_budget_state(&fixture.budget);
@@ -456,11 +491,13 @@ fn administrative_fatal_branch_matrix_invalidates_global_durability() -> TestRes
             }
         }
         let observed = match case {
-            AdministrativeFatalCase::RecordSuccessPoisoned
+            AdministrativeFatalCase::RecordSuccessClockUnavailable
+            | AdministrativeFatalCase::RecordSuccessPoisoned
             | AdministrativeFatalCase::RecordSuccessPersistenceFailure => {
                 fixture.budget.record_success()
             }
-            AdministrativeFatalCase::DisablePoisoned
+            AdministrativeFatalCase::DisableClockUnavailable
+            | AdministrativeFatalCase::DisablePoisoned
             | AdministrativeFatalCase::DisablePersistenceFailure => {
                 match fixture.budget.disable() {
                     BudgetDecision::Unavailable(reason) => Err(reason),
@@ -469,6 +506,10 @@ fn administrative_fatal_branch_matrix_invalidates_global_durability() -> TestRes
             }
         };
         let expected = match case {
+            AdministrativeFatalCase::RecordSuccessClockUnavailable
+            | AdministrativeFatalCase::DisableClockUnavailable => {
+                BudgetUnavailableReason::ClockUnavailable
+            }
             AdministrativeFatalCase::RecordSuccessPoisoned
             | AdministrativeFatalCase::DisablePoisoned => BudgetUnavailableReason::StatePoisoned,
             AdministrativeFatalCase::RecordSuccessPersistenceFailure

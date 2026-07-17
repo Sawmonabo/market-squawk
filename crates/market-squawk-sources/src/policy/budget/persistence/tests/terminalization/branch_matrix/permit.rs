@@ -4,6 +4,7 @@ use super::*;
 
 #[derive(Clone, Copy, Debug)]
 enum PermitFatalCase {
+    ClockUnavailable,
     SessionUnavailable,
     StatePoisoned,
     InFlightUnderflow,
@@ -13,6 +14,7 @@ enum PermitFatalCase {
 #[test]
 fn permit_release_fatal_branch_matrix_invalidates_global_durability() -> TestResult {
     for case in [
+        PermitFatalCase::ClockUnavailable,
         PermitFatalCase::SessionUnavailable,
         PermitFatalCase::StatePoisoned,
         PermitFatalCase::InFlightUnderflow,
@@ -24,6 +26,7 @@ fn permit_release_fatal_branch_matrix_invalidates_global_durability() -> TestRes
             other => return Err(format!("permit setup failed: {other:?}").into()),
         };
         match case {
+            PermitFatalCase::ClockUnavailable => fixture.clock.fail(),
             PermitFatalCase::SessionUnavailable => {
                 fixture.clock.fail();
                 let _decision = fixture.peer.try_acquire();
@@ -48,7 +51,9 @@ fn permit_release_fatal_branch_matrix_invalidates_global_durability() -> TestRes
             fixture,
             matches!(
                 case,
-                PermitFatalCase::StatePoisoned | PermitFatalCase::InFlightUnderflow
+                PermitFatalCase::ClockUnavailable
+                    | PermitFatalCase::StatePoisoned
+                    | PermitFatalCase::InFlightUnderflow
             ),
         )?;
     }
