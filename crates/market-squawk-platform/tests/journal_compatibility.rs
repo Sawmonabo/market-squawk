@@ -158,3 +158,20 @@ fn writer_is_current_only_validates_existing_content_and_locks_exclusively()
     ));
     Ok(())
 }
+
+#[test]
+fn active_writer_does_not_block_readers_of_committed_records()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let paths = LocalPaths::prepare(directory.path().join("data"))?;
+    let current = paths.journal_write_file("capture")?;
+    let expected = record()?;
+
+    let mut writer = paths.open_journal_writer("capture")?;
+    writer.append(&expected)?;
+    writer.flush()?;
+
+    let records = JournalReader::open(current)?.read_all()?;
+    assert_eq!(records, vec![expected]);
+    Ok(())
+}

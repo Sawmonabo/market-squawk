@@ -6,8 +6,9 @@ Toolchain: Rust 1.97.0 (`rustc 2d8144b78 2026-07-07`)
 
 Dependency anchor: `cap-std`, `cap-primitives`, and `cap-fs-ext` 4.0.2
 
-Incident anchor: GitHub Actions run
-[`29557828946`](https://github.com/Sawmonabo/market-squawk/actions/runs/29557828946)
+Incident anchors: GitHub Actions runs
+[`29557828946`](https://github.com/Sawmonabo/market-squawk/actions/runs/29557828946) and
+[`29559148251`](https://github.com/Sawmonabo/market-squawk/actions/runs/29559148251)
 
 ## Decision
 
@@ -31,6 +32,13 @@ second equally validated handle and compares the two cap-fs-ext identities befor
 first. The code does not enable nightly merely to inspect the pre-open standard metadata.
 
 These are target-specific contracts, not silently weakened cross-platform approximations.
+
+Writer exclusion is also target-specific while preserving one public contract: exactly one writer
+owns a journal, and diagnostic readers may consume already committed bytes while that writer is
+active. Unix retains its advisory exclusive lock on the journal file. Windows opens the writer
+handle with `FILE_SHARE_READ` only, which atomically denies a competing write-capable open without
+locking the journal's readable byte range. Windows also requests `FILE_FLAG_OPEN_REPARSE_POINT`
+and rejects a non-regular or reparse handle after opening it.
 
 ## Failure evidence
 
@@ -85,6 +93,37 @@ or junction gap: the Windows opener requests `FILE_FLAG_OPEN_REPARSE_POINT`, val
 two opened identities while the retained handle prevents deletion or replacement. Microsoft
 documents `FILE_FLAG_BACKUP_SEMANTICS` as the required flag for obtaining a directory handle:
 [Directory Handles](https://learn.microsoft.com/en-us/windows/win32/fileio/obtaining-a-handle-to-a-directory).
+
+### Windows: an exclusive byte-range lock also denied diagnostic reads
+
+The second hosted run compiled successfully on Windows but failed two journal tests. A competing
+writer did not map to the stable `AlreadyLocked` result, and a reader could not inspect a flushed
+journal while its writer remained active:
+
+```text
+The process cannot access the file because another process has locked a portion of the file.
+(os error 33)
+```
+
+This was a production contract defect rather than a test-only difference. Microsoft's
+[`LockFileEx`](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-lockfileex)
+documentation states that an exclusive region lock denies other processes both read and write
+access to that region. The pinned `fs2` implementation requests an exclusive lock covering the
+complete range, so it cannot provide single-writer/multiple-reader behavior on Windows.
+
+Windows writer exclusion therefore moves to the handle-open share contract. The writer requests
+read and append access but shares only reads. A second writer's requested write access is rejected
+atomically with `ERROR_SHARING_VIOLATION`, while an ordinary read handle remains compatible. Rust's
+stable
+[`OpenOptionsExt::share_mode`](https://doc.rust-lang.org/1.97.0/std/os/windows/fs/trait.OpenOptionsExt.html#tymethod.share_mode)
+exposes this `CreateFile` share-mode contract without unsafe code. The code also recognizes
+`ERROR_LOCK_VIOLATION` as contention for compatibility with an older process that still holds the
+former byte-range lock.
+
+A persistent sidecar lock was rejected because removing and recreating its pathname while a handle
+remained open could split writer ownership across two filesystem objects. The journal's retained
+Windows handle instead makes ownership inseparable from the exact data file and omits delete
+sharing for its lifetime.
 
 ## Why a separate Unix synchronization handle is required
 
@@ -151,6 +190,8 @@ correct authority boundary.
 The regression is covered at three levels:
 
 - platform tests create new journals, which exercises parent-directory synchronization on Unix;
+- platform and application tests keep a writer active while reading its flushed committed records
+  and separately require a typed rejection of a second writer;
 - the application deadline test opens the exact journal path that failed in hosted Linux CI;
 - GitHub Actions builds and tests Linux, macOS, and Windows with Rust 1.97.0.
 
@@ -174,5 +215,6 @@ Re-audit this decision when any of the following changes:
 - `cap-std`, `cap-primitives`, or `cap-fs-ext` version;
 - Rust stabilizes the Windows by-handle metadata APIs;
 - journal creation or rename durability protocol;
+- journal writer exclusion, Windows share modes, or concurrent diagnostic reads;
 - supported operating-system targets;
 - capability-root construction or final-component no-follow policy.

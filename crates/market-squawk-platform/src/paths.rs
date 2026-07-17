@@ -386,12 +386,34 @@ impl LocalPaths {
             use cap_std::fs::OpenOptionsExt as _;
             options.custom_flags(libc::O_NOFOLLOW);
         }
-        let file = capability
-            .open_with(&filename, &options)
-            .map_err(|source| JournalError::io("failed to open confined journal", source))?
-            .into_std();
+        #[cfg(windows)]
+        {
+            use cap_std::fs::OpenOptionsExt as _;
+
+            // Windows byte-range exclusive locks deny readers as well as writers. Deny only
+            // competing write opens at handle creation so diagnostic readers can consume already
+            // committed journal bytes while the single writer remains active. Opening the reparse
+            // point itself lets the handle-derived validation below reject it without following.
+            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+            const FILE_SHARE_READ: u32 = 0x0000_0001;
+            options.share_mode(FILE_SHARE_READ);
+            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+        let path = self.journal_dir.join(&filename);
+        let file = match capability.open_with(&filename, &options) {
+            Ok(file) => file.into_std(),
+            #[cfg(windows)]
+            Err(source) if is_windows_writer_contention(&source) => {
+                return Err(JournalError::AlreadyLocked { path });
+            }
+            Err(source) => {
+                return Err(JournalError::io("failed to open confined journal", source));
+            }
+        };
+        #[cfg(windows)]
+        validate_windows_journal_handle(&file)?;
         let parent_directory = open_parent_directory_sync(capability)?;
-        JournalWriter::from_open_file(self.journal_dir.join(filename), file, parent_directory)
+        JournalWriter::from_open_file(path, file, parent_directory)
     }
 
     /// Returns an initialization path unless doing so would shadow a sole legacy journal.
@@ -444,6 +466,27 @@ impl LocalPaths {
             .journal_dir
             .join(format!("{source}.{}", format.extension())))
     }
+}
+
+#[cfg(windows)]
+fn is_windows_writer_contention(source: &std::io::Error) -> bool {
+    // ERROR_SHARING_VIOLATION is produced by the atomic deny-write share contract. Retain
+    // ERROR_LOCK_VIOLATION compatibility for a file held by an older byte-range-locking process.
+    matches!(source.raw_os_error(), Some(32 | 33))
+}
+
+#[cfg(windows)]
+fn validate_windows_journal_handle(file: &std::fs::File) -> Result<(), JournalError> {
+    use std::os::windows::fs::MetadataExt as _;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    let metadata = file
+        .metadata()
+        .map_err(|source| JournalError::io("failed to inspect opened journal handle", source))?;
+    if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(JournalError::SymlinkNotAllowed);
+    }
+    Ok(())
 }
 
 #[cfg(unix)]

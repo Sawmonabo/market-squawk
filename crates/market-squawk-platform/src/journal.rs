@@ -13,7 +13,8 @@ use std::{
 };
 
 use crc32fast::Hasher;
-use fs2::FileExt;
+#[cfg(not(windows))]
+use fs2::FileExt as _;
 use thiserror::Error;
 
 use crate::{RawCaptureRecord, RawCaptureRecordError, raw_record::MAX_SERIALIZED_RECORD_BYTES};
@@ -180,8 +181,9 @@ impl JournalWriter {
         if path.extension().and_then(std::ffi::OsStr::to_str) != Some("msj") {
             return Err(JournalError::InvalidWriterExtension);
         }
-        if let Err(source) = FileExt::try_lock_exclusive(&file) {
-            if source.kind() == std::io::ErrorKind::WouldBlock {
+        #[cfg(not(windows))]
+        if let Err(source) = file.try_lock_exclusive() {
+            if is_lock_contended(&source) {
                 return Err(JournalError::AlreadyLocked { path });
             }
             return Err(JournalError::io("failed to lock journal", source));
@@ -251,6 +253,15 @@ impl JournalWriter {
     /// Returns the owned journal path.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+}
+
+#[cfg(not(windows))]
+fn is_lock_contended(source: &std::io::Error) -> bool {
+    let expected = fs2::lock_contended_error();
+    match (source.raw_os_error(), expected.raw_os_error()) {
+        (Some(actual), Some(expected)) => actual == expected,
+        _ => source.kind() == expected.kind(),
     }
 }
 
