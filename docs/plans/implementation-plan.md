@@ -65,6 +65,11 @@ The first code-level plan is:
 
 - [`2026-07-16-market-squawk-stage-1-foundation.md`](../superpowers/plans/2026-07-16-market-squawk-stage-1-foundation.md)
 
+The complete remaining-work inventory groups every mandatory capability and exact-head review into
+quarter checkpoints while preserving the subsystem plans as the code-level execution authority:
+
+- [Complete remaining work plan](../superpowers/plans/2026-07-16-market-squawk-complete-remaining-work.md)
+
 The independently completed Q3 live-production plan is also persisted now rather than held behind
 Q2 remediation:
 
