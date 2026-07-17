@@ -122,10 +122,21 @@ mod tests {
         }
 
         fn wait_until_blocked(&self) -> TestResult<BlockedStoreRelease<'_>> {
+            self.wait_until_blocked_with_timeout(TEST_WATCHDOG_TIMEOUT)
+        }
+
+        fn wait_until_blocked_with_timeout(
+            &self,
+            timeout: std::time::Duration,
+        ) -> TestResult<BlockedStoreRelease<'_>> {
+            let release = BlockedStoreRelease {
+                store: self,
+                released: false,
+            };
             let (entered, signal) = &self.entered;
             let entered = entered.lock().map_err(|_| "entered lock poisoned")?;
             let (entered, wait) = signal
-                .wait_timeout_while(entered, TEST_WATCHDOG_TIMEOUT, |entered| !*entered)
+                .wait_timeout_while(entered, timeout, |entered| !*entered)
                 .map_err(|_| "entered wait poisoned")?;
             if !*entered {
                 let message = if wait.timed_out() {
@@ -135,10 +146,7 @@ mod tests {
                 };
                 return Err(message.into());
             }
-            Ok(BlockedStoreRelease {
-                store: self,
-                released: false,
-            })
+            Ok(release)
         }
 
         fn signal_release(&self) -> TestResult {
@@ -185,6 +193,26 @@ mod tests {
                 .replace(payload.to_vec());
             Ok(())
         }
+    }
+
+    #[test]
+    fn observer_timeout_releases_a_store_call_that_enters_late() -> TestResult {
+        let store = Arc::new(BlockingStore::default());
+        store.block_next_store();
+        assert!(store
+            .wait_until_blocked_with_timeout(std::time::Duration::ZERO)
+            .is_err());
+
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let late_store = store.clone();
+        let writer = std::thread::spawn(move || {
+            result_tx
+                .send(AuthorityStateStore::store(late_store.as_ref(), b"late"))
+                .is_ok()
+        });
+        assert_eq!(result_rx.recv_timeout(TEST_WATCHDOG_TIMEOUT)?, Ok(()));
+        assert!(writer.join().map_err(|_| "late writer panicked")?);
+        Ok(())
     }
 
     fn declaration(index: u8) -> TestResult<PersistedProviderBudgetPolicy> {

@@ -49,23 +49,31 @@ impl BlockingFailClock {
     }
 
     fn wait_until_entered(&self) -> TestResult<BlockedClockRelease<'_>> {
+        self.wait_until_entered_with_timeout(TEST_WATCHDOG_TIMEOUT)
+    }
+
+    fn wait_until_entered_with_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> TestResult<BlockedClockRelease<'_>> {
+        let release = BlockedClockRelease {
+            clock: self,
+            released: false,
+        };
         let (entered, signal) = &self.entered;
         let entered = entered.lock().map_err(|_| "clock entered lock poisoned")?;
         let (entered, wait) = signal
-            .wait_timeout_while(entered, TEST_WATCHDOG_TIMEOUT, |entered| !*entered)
+            .wait_timeout_while(entered, timeout, |entered| !*entered)
             .map_err(|_| "clock entered wait poisoned")?;
         if !*entered {
             let message = if wait.timed_out() {
                 "timed out waiting for clock entry"
             } else {
                 "clock-entry wait woke without entry"
-            };
-            return Err(message.into());
-        }
-        Ok(BlockedClockRelease {
-            clock: self,
-            released: false,
-        })
+                };
+                return Err(message.into());
+            }
+        Ok(release)
     }
 
     fn signal_release(&self) -> TestResult {
@@ -102,6 +110,31 @@ impl BudgetClock for BlockingFailClock {
     fn shared_allocation_charge(&self) -> usize {
         std::mem::size_of::<Self>() + crate::conservative_arc_control_block_charge::<Self>()
     }
+}
+
+#[test]
+fn observer_timeout_releases_a_clock_call_that_enters_late() -> TestResult {
+    let observation = ClockObservation::new(
+        Timestamp::from_unix_nanos(100),
+        MonotonicInstant::from_nanos(0),
+    );
+    let clock = Arc::new(BlockingFailClock::new(observation));
+    clock.arm();
+    assert!(clock
+        .wait_until_entered_with_timeout(std::time::Duration::ZERO)
+        .is_err());
+
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+    let late_clock = clock.clone();
+    let observer = std::thread::spawn(move || {
+        result_tx.send(late_clock.observation()).is_ok()
+    });
+    assert_eq!(
+        result_rx.recv_timeout(TEST_WATCHDOG_TIMEOUT)?,
+        Err(BudgetUnavailableReason::ClockUnavailable)
+    );
+    assert!(observer.join().map_err(|_| "late clock observer panicked")?);
+    Ok(())
 }
 
 struct BlockingBudgetFixture {
@@ -156,6 +189,17 @@ fn blocking_budget() -> TestResult<BlockingBudgetFixture> {
         budget,
         slot,
     })
+}
+
+fn wait_until_session_unavailable(session: &AuthorityDurabilitySession) -> TestResult {
+    let started = std::time::Instant::now();
+    while session.is_available() {
+        if started.elapsed() >= TEST_WATCHDOG_TIMEOUT {
+            return Err("timed out waiting for terminal lifecycle latch".into());
+        }
+        std::thread::yield_now();
+    }
+    Ok(())
 }
 
 #[test]
@@ -328,13 +372,7 @@ fn terminal_writer_owns_failed_overwrite_after_blocked_normal_store() -> TestRes
     let terminal = std::thread::spawn(move || {
         budget.terminal_fault(BudgetUnavailableReason::StateCorrupt, &terminal_operation)
     });
-    for _ in 0..10_000 {
-        if !session.is_available() {
-            break;
-        }
-        std::thread::yield_now();
-    }
-    assert!(!session.is_available(), "terminal latch was not published");
+    wait_until_session_unavailable(&session)?;
     blocked_store.release()?;
     assert_eq!(
         normal.join().map_err(|_| "normal write thread panicked")?,

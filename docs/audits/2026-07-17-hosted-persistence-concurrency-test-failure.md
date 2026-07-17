@@ -1,7 +1,7 @@
 # Hosted persistence concurrency-test failure
 
-Date: 2026-07-17  
-Candidate: `2b708a5fc4c5d4d26b9381d8fffe93dd86a3d3c1`  
+Date: 2026-07-17
+Candidate: `2b708a5fc4c5d4d26b9381d8fffe93dd86a3d3c1`
 Hosted run: [GitHub Actions 29562087233](https://github.com/Sawmonabo/market-squawk/actions/runs/29562087233)
 
 ## Result
@@ -40,9 +40,10 @@ than patching only the two observed tests.
 
 ## Remediation contract
 
-The blocking store and clock now wait for an explicit controller release. The controller receives
-an owned release guard only after the blocked operation has entered. Explicit `release` consumes the
-guard, while `Drop` releases on assertion failure or early return. This provides two properties:
+The blocking store and clock now wait for an explicit controller release. The controller constructs
+an owned release guard before it begins observing entry and receives that guard only after the
+blocked operation has entered. Explicit `release` consumes the guard, while `Drop` releases on an
+observation timeout, assertion failure, or early return. This provides two properties:
 
 1. scheduler delay cannot be misrepresented as a production persistence or clock failure; and
 2. a failed assertion cannot strand a worker indefinitely behind the test double.
@@ -50,7 +51,10 @@ guard, while `Drop` releases on assertion failure or early return. This provides
 A 30-second watchdog remains only at observation points that must detect a worker that never
 entered or a peer that incorrectly waited. It is not used to determine the result of a store or
 clock operation. `Condvar::wait_timeout_while` also handles spurious notifications without
-misclassifying them as entry.
+misclassifying them as entry. Dedicated regressions prove that a worker entering after the observer
+has timed out still observes the guard-owned release and terminates. Terminal-latch publication is
+observed with the same elapsed-time watchdog instead of a scheduler-dependent fixed count of
+`yield_now` calls.
 
 Every blocking persistence and blocking clock call site was migrated to retain the guard through
 the asserted linearization window. The short peer-response watchdogs were changed to the shared
@@ -65,7 +69,7 @@ was changed.
 Before committing the remediation candidate:
 
 - both formerly failing tests passed individually;
-- all 108 sources library tests passed with 16 test threads;
+- all 110 sources library tests passed with 16 test threads;
 - all sources tests and integration tests passed with all targets and features;
 - strict all-target/all-feature sources Clippy passed; and
 - formatting and diff checks passed.
