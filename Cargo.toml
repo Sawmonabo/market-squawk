@@ -16,6 +16,7 @@ arc-swap = "=1.9.2"
 async-trait = "0.1"
 bs58 = "0.5"
 bytes = "1.10"
+cap-fs-ext = "4.0.2"
 cap-std = "4.0.2"
 bitcoin = { version = "=0.32.102", default-features = false, features = ["std"] }
 chrono = { version = "0.4", features = ["clock", "serde"] }
