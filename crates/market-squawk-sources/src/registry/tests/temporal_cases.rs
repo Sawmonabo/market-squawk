@@ -63,7 +63,9 @@
     }
 
     #[test]
-    fn health_epoch_overflow_is_failure_atomic_and_preserves_prior_authority() -> TestResult {
+    fn health_epoch_exhaustion_terminally_revokes_every_generation_authority() -> TestResult {
+        use std::str::FromStr;
+
         let mut harness = HealthHarness::new("trusted-time-health-epoch")?;
         harness.accept_health(10, 20, 30, 1_000)?;
         harness.set_time(40, 40)?;
@@ -84,25 +86,197 @@
             .registry
             .validate_current_authority(&harness.session)?
             .try_current_lease()?;
+        let prior_scope = harness
+            .registry
+            .validate_current_authority(&harness.session)?
+            .validate_live_scope(
+                &VenueId::try_from("coinbase")?,
+                InstrumentId::from_str("4c74ab95-53b9-42ad-9b66-0ed403b88fed")?,
+                LiveEventClass::Trade,
+                None,
+            )?;
+        let prior_queued = prior_scope.queued_authority_for_test();
+        let mut raw_frames = harness.registry.take_raw_frame_factory(&harness.session)?;
+        raw_frames.try_frame(
+            harness.timestamp(40)?,
+            crate::TransportFrameKind::Binary,
+            bytes::Bytes::from_static(b"before-exhaustion"),
+        )?;
 
         harness.set_time(50, 50)?;
         let successor = harness.reporter.report(harness.snapshot(41, 1_000)?)?;
         harness.set_time(60, 60)?;
-        let before = harness.epoch_and_cursor();
         assert_eq!(
             harness.registry.record_health(&harness.session, successor),
             Err(RegistryError::HealthEpochExhausted)
         );
-        assert_eq!(harness.epoch_and_cursor(), before);
-        let authority = harness
+        assert!(harness
             .registry
             .entries
             .get(&source_id)
             .and_then(|entry| entry.health_authority.as_ref())
-            .ok_or_else(|| std::io::Error::other("prior health authority was removed"))?;
-        assert_eq!(authority.epoch, u64::MAX);
-        assert_eq!(authority.observed_at, harness.timestamp(10)?);
-        prior_lease.validate_at(harness.timestamp(60)?)?;
+            .is_none());
+        assert!(harness.session.lease.is_terminal());
+        assert!(!harness.session.capture.is_healthy());
+        assert_eq!(
+            harness.session.validate_current_lease(),
+            Err(RegistryError::SessionNotCurrent)
+        );
+        assert!(matches!(
+            harness.registry.validate_current_authority(&harness.session),
+            Err(RegistryError::SessionNotCurrent)
+        ));
+        assert_eq!(
+            prior_lease.validate_at(harness.timestamp(60)?),
+            Err(RegistryError::HealthNotQualified)
+        );
+        assert_eq!(
+            prior_scope.validate_at(harness.timestamp(60)?),
+            Err(RegistryError::HealthNotQualified)
+        );
+        assert_eq!(
+            prior_queued.validate_at(harness.timestamp(60)?),
+            Err(RegistryError::HealthNotQualified)
+        );
+        assert!(matches!(
+            raw_frames.try_frame(
+                harness.timestamp(60)?,
+                crate::TransportFrameKind::Binary,
+                bytes::Bytes::from_static(b"after-exhaustion"),
+            ),
+            Err(crate::SourceError::SessionNotCurrent)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_health_epoch_requires_new_source_epoch_and_generation_to_recover() -> TestResult {
+        let mut harness = HealthHarness::new("terminal-health-recovery")?;
+        harness.accept_health(10, 20, 30, 1_000)?;
+        harness
+            .session
+            .lease
+            .health_epoch
+            .store(u64::MAX, std::sync::atomic::Ordering::Release);
+        let source_id = harness.session.source_id().clone();
+        harness
+            .registry
+            .entries
+            .get_mut(&source_id)
+            .and_then(|entry| entry.health_authority.as_mut())
+            .ok_or_else(|| std::io::Error::other("qualified health authority missing"))?
+            .epoch = u64::MAX;
+        harness.set_time(40, 40)?;
+        let update = harness.reporter.report(harness.snapshot(31, 1_000)?)?;
+        harness.set_time(50, 50)?;
+        assert_eq!(
+            harness.registry.record_health(&harness.session, update),
+            Err(RegistryError::HealthEpochExhausted)
+        );
+        assert!(matches!(
+            harness.reporter.report(harness.snapshot(32, 1_000)?),
+            Err(RegistryError::HealthBindingMismatch)
+        ));
+        assert!(matches!(
+            harness.registry.begin_session(
+                &harness.registered,
+                SessionId::new(SourceIdentifier::try_from("session-retry")?),
+                ConnectionGeneration::new(2)?,
+                harness.timestamp(50)?,
+            ),
+            Err(RegistryError::HealthEpochExhausted)
+        ));
+
+        let replacement = harness.registry.replace_metadata(
+            &harness.registered,
+            direct_metadata("terminal-health-recovery", "revision-2")?,
+            harness.timestamp(50)?,
+        )?;
+        assert!(replacement.epoch > harness.registered.epoch);
+        let successor = harness.registry.begin_session(
+            &replacement,
+            SessionId::new(SourceIdentifier::try_from("session-2")?),
+            ConnectionGeneration::new(2)?,
+            harness.timestamp(50)?,
+        )?;
+        let capabilities = harness
+            .registry
+            .take_capture_generation_capabilities(&successor)?;
+        let (mut capture_control, _capture_admission, _capture_degradation) =
+            capabilities.into_parts();
+        capture_control.mark_healthy()?;
+        let mut reporter = harness.registry.take_current_health_reporter(&successor)?;
+        harness.set_time(60, 60)?;
+        let update = reporter.report(healthy_snapshot(
+            &successor,
+            harness.timestamp(51)?,
+            harness.timestamp(1_000)?,
+        )?)?;
+        harness.set_time(70, 70)?;
+        harness.registry.record_health(&successor, update)?;
+        harness
+            .registry
+            .validate_current_authority(&successor)?
+            .try_current_lease()?
+            .validate_at(harness.timestamp(70)?)?;
+        Ok(())
+    }
+
+    #[test]
+    fn source_epoch_exhaustion_cannot_revive_a_terminal_health_generation() -> TestResult {
+        let mut harness = HealthHarness::new("terminal-source-epoch")?;
+        harness.accept_health(10, 20, 30, 1_000)?;
+        harness.registered.epoch = u64::MAX;
+        harness.session.epoch = u64::MAX;
+        harness
+            .session
+            .lease
+            .health_epoch
+            .store(u64::MAX, std::sync::atomic::Ordering::Release);
+        let source_id = harness.session.source_id().clone();
+        let entry = harness
+            .registry
+            .entries
+            .get_mut(&source_id)
+            .ok_or_else(|| std::io::Error::other("registered source entry missing"))?;
+        entry.epoch = u64::MAX;
+        entry
+            .health_authority
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("qualified health authority missing"))?
+            .epoch = u64::MAX;
+        harness
+            .registry
+            .history
+            .get_mut(&source_id)
+            .ok_or_else(|| std::io::Error::other("registered source history missing"))?
+            .last_epoch = u64::MAX;
+
+        harness.set_time(40, 40)?;
+        let update = harness.reporter.report(harness.snapshot(31, 1_000)?)?;
+        harness.set_time(50, 50)?;
+        assert_eq!(
+            harness.registry.record_health(&harness.session, update),
+            Err(RegistryError::HealthEpochExhausted)
+        );
+        assert!(matches!(
+            harness.registry.replace_metadata(
+                &harness.registered,
+                direct_metadata("terminal-source-epoch", "revision-2")?,
+                harness.timestamp(50)?,
+            ),
+            Err(RegistryError::EpochExhausted)
+        ));
+        assert!(matches!(
+            harness.registry.begin_session(
+                &harness.registered,
+                SessionId::new(SourceIdentifier::try_from("session-2")?),
+                ConnectionGeneration::new(2)?,
+                harness.timestamp(50)?,
+            ),
+            Err(RegistryError::HealthEpochExhausted)
+        ));
+        assert!(harness.session.lease.is_terminal());
         Ok(())
     }
 

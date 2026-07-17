@@ -115,10 +115,13 @@ impl AuthoritativeSourceRegistry {
         let qualified = qualified
             && validation_at.wall() >= health.observed_at()
             && valid_until_monotonic.is_some();
-        let epoch = session
-            .lease
-            .next_health_epoch()
-            .ok_or(RegistryError::HealthEpochExhausted)?;
+        let epoch = match session.lease.next_health_epoch() {
+            Some(epoch) => epoch,
+            None => {
+                entry.terminally_invalidate_health_authority();
+                return Err(RegistryError::HealthEpochExhausted);
+            }
+        };
         let next_authority = if qualified {
             Some(CurrentHealthAuthority {
                 epoch,
@@ -251,6 +254,8 @@ impl AuthoritativeSourceRegistry {
         if active.session_id != *session.session_id()
             || active.generation != session.generation()
             || active.started_at.wall() != session.started_at
+            || !Arc::ptr_eq(&active.lease, &session.lease)
+            || !active.lease.is_current()
         {
             return Err(RegistryError::SessionNotCurrent);
         }

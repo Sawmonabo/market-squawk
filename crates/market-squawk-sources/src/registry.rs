@@ -41,6 +41,7 @@ struct ActiveSessionKey {
 #[derive(Debug)]
 struct SessionLeaseState {
     current: AtomicBool,
+    terminal: AtomicBool,
     live_qualified: AtomicBool,
     health_epoch: AtomicU64,
     valid_from_nanos: AtomicI64,
@@ -59,10 +60,25 @@ impl SessionLeaseState {
     }
 
     fn is_current(&self) -> bool {
-        self.current.load(Ordering::Acquire)
+        self.current.load(Ordering::Acquire) && !self.is_terminal()
+    }
+
+    fn is_terminal(&self) -> bool {
+        self.terminal.load(Ordering::Acquire)
+    }
+
+    fn terminally_invalidate_health_authority(&self) {
+        self.live_qualified.store(false, Ordering::Release);
+        self.valid_from_nanos.store(i64::MAX, Ordering::Release);
+        self.valid_until_nanos.store(i64::MIN, Ordering::Release);
+        self.current.store(false, Ordering::Release);
+        self.terminal.store(true, Ordering::Release);
     }
 
     fn next_health_epoch(&self) -> Option<u64> {
+        if self.is_terminal() {
+            return None;
+        }
         self.health_epoch.load(Ordering::Acquire).checked_add(1)
     }
 
@@ -273,6 +289,16 @@ struct RegistryEntry {
     universe_attestation: Option<InstrumentUniverseAttestation>,
     generation_high_water: Option<ConnectionGeneration>,
     used_revisions: Vec<MetadataRevision>,
+}
+
+impl RegistryEntry {
+    fn terminally_invalidate_health_authority(&mut self) {
+        if let Some(active) = &self.active {
+            active.lease.terminally_invalidate_health_authority();
+            active.capture.mark_incomplete();
+        }
+        self.health_authority = None;
+    }
 }
 
 /// Exact registry-recorded provider-universe membership attestation.

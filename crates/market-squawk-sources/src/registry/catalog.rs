@@ -271,16 +271,16 @@ impl AuthoritativeSourceRegistry {
         {
             return Err(RegistryError::UniverseAttestationMismatch);
         }
-        let next_health_epoch = entry
-            .active
-            .as_ref()
-            .map(|active| {
-                active
-                    .lease
-                    .next_health_epoch()
-                    .ok_or(RegistryError::HealthEpochExhausted)
-            })
-            .transpose()?;
+        let next_health_epoch = match entry.active.as_ref() {
+            Some(active) => match active.lease.next_health_epoch() {
+                Some(epoch) => Some(epoch),
+                None => {
+                    entry.terminally_invalidate_health_authority();
+                    return Err(RegistryError::HealthEpochExhausted);
+                }
+            },
+            None => None,
+        };
         entry.universe_attestation = Some(attestation);
         entry.health_authority = None;
         if let (Some(active), Some(epoch)) = (&entry.active, next_health_epoch) {
@@ -312,6 +312,13 @@ impl AuthoritativeSourceRegistry {
             .get_mut(&registered.source_id)
             .ok_or(RegistryError::UnknownSource)?;
         if entry
+            .active
+            .as_ref()
+            .is_some_and(|active| active.lease.is_terminal())
+        {
+            return Err(RegistryError::HealthEpochExhausted);
+        }
+        if entry
             .generation_high_water
             .is_some_and(|previous| generation <= previous)
         {
@@ -323,6 +330,7 @@ impl AuthoritativeSourceRegistry {
         }
         let lease = Arc::new(SessionLeaseState {
             current: AtomicBool::new(true),
+            terminal: AtomicBool::new(false),
             live_qualified: AtomicBool::new(false),
             health_epoch: AtomicU64::new(0),
             valid_from_nanos: AtomicI64::new(i64::MAX),
