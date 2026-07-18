@@ -14,12 +14,17 @@ pub(crate) struct BoundSourceFile {
 }
 
 pub(crate) fn hash_regular_file(path: &Path, maximum: u64) -> Result<String, Box<dyn Error>> {
-    hash_regular_file_with_after_read(path, maximum, || {})
+    hash_file_with_after_read(path, maximum, true, || {})
 }
 
-fn hash_regular_file_with_after_read<F>(
+pub(crate) fn hash_bound_executable(path: &Path, maximum: u64) -> Result<String, Box<dyn Error>> {
+    hash_file_with_after_read(path, maximum, false, || {})
+}
+
+fn hash_file_with_after_read<F>(
     path: &Path,
     maximum: u64,
+    require_single_link: bool,
     after_read: F,
 ) -> Result<String, Box<dyn Error>>
 where
@@ -32,15 +37,15 @@ where
     }
     let mut file = File::open(path)?;
     let before = file.metadata()?;
-    if !same_identity(&before_path, &before) {
+    if !same_identity(&before_path, &before, require_single_link) {
         return Err("build input path and descriptor identities differ".into());
     }
     let (digest, observed, after) = hash_open_descriptor(&mut file, &before, maximum)?;
     after_read();
     let current = fs::symlink_metadata(path)?;
     if observed != before.len()
-        || !same_identity(&before, &after)
-        || !same_identity(&before, &current)
+        || !same_identity(&before, &after, require_single_link)
+        || !same_identity(&before, &current, require_single_link)
     {
         return Err("build input changed during descriptor hashing".into());
     }
@@ -87,7 +92,7 @@ pub(crate) fn hash_regular_file_with_test_mutation<F>(
 where
     F: FnOnce(),
 {
-    hash_regular_file_with_after_read(path, maximum, mutate_after_read)
+    hash_file_with_after_read(path, maximum, true, mutate_after_read)
 }
 
 pub(crate) fn collect_rust_files(
@@ -201,8 +206,8 @@ where
                     hash_open_descriptor(&mut file, &before, maximum_file_bytes)?;
                 let current = entry.open_with(&options)?.into_std().metadata()?;
                 if observed != before.len()
-                    || !same_identity(&before, &after)
-                    || !same_identity(&before, &current)
+                    || !same_identity(&before, &after, true)
+                    || !same_identity(&before, &current, true)
                 {
                     return Err("Rust source changed during capability hashing".into());
                 }
@@ -263,14 +268,14 @@ where
 }
 
 #[cfg(unix)]
-fn same_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+fn same_identity(left: &fs::Metadata, right: &fs::Metadata, require_single_link: bool) -> bool {
     use std::os::unix::fs::MetadataExt as _;
 
     left.dev() == right.dev()
         && left.ino() == right.ino()
         && left.len() == right.len()
-        && left.nlink() == 1
-        && right.nlink() == 1
+        && left.nlink() == right.nlink()
+        && (!require_single_link || left.nlink() == 1)
         && left.mode() == right.mode()
         && left.uid() == right.uid()
         && left.gid() == right.gid()
@@ -300,7 +305,7 @@ fn same_directory_identity(left: &cap_std::fs::Metadata, right: &cap_std::fs::Me
 }
 
 #[cfg(not(unix))]
-fn same_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+fn same_identity(left: &fs::Metadata, right: &fs::Metadata, _require_single_link: bool) -> bool {
     left.len() == right.len()
         && left.modified().ok() == right.modified().ok()
         && left.permissions().readonly() == right.permissions().readonly()

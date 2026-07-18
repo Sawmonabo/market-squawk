@@ -112,6 +112,14 @@ fn descriptor_hash_rejects_oversized_and_symlink_inputs() -> Result<(), Box<dyn 
     {
         std::os::unix::fs::symlink(&regular, directory.path().join("linked.rs"))?;
         assert!(build_support::hash_regular_file(&directory.path().join("linked.rs"), 7).is_err());
+
+        let hard_link = directory.path().join("hard-linked-tool");
+        fs::hard_link(&regular, &hard_link)?;
+        assert!(build_support::hash_regular_file(&regular, 7).is_err());
+        assert_eq!(
+            build_support::hash_bound_executable(&regular, 7)?,
+            build_support::hash_bound_executable(&hard_link, 7)?
+        );
     }
     Ok(())
 }

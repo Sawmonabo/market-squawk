@@ -12,7 +12,9 @@ mod filesystem;
 #[path = "build_support/reader.rs"]
 mod reader;
 
-pub(crate) use filesystem::{BoundSourceFile, collect_rust_files, hash_regular_file};
+pub(crate) use filesystem::{
+    BoundSourceFile, collect_rust_files, hash_bound_executable, hash_regular_file,
+};
 #[cfg(test)]
 pub(crate) use filesystem::{
     collect_rust_files_with_test_replacement, collect_rust_files_with_test_root_replacement,

@@ -653,7 +653,10 @@ fn absolute_bound_tool(
 ) -> Result<(PathBuf, String), Box<dyn Error>> {
     let path = PathBuf::from(std::env::var(path_key)?);
     let digest = std::env::var(digest_key)?;
-    if !path.is_absolute() || !is_lower_digest(&digest) || hash_file(&path)? != digest {
+    if !path.is_absolute()
+        || !is_lower_digest(&digest)
+        || build_support::hash_bound_executable(&path, MAX_BUILD_INPUT_BYTES)? != digest
+    {
         return Err("authoritative benchmark executable binding is invalid".into());
     }
     Ok((path, digest))
