@@ -15,7 +15,6 @@ use generation::{
     CaptureIdentitySnapshot, GenerationCaptureState, GenerationPreparationError,
     mark_bundle_incomplete, try_prepare_generation,
 };
-
 const WRITER_NOT_STARTED: u8 = 0;
 const WRITER_RUNNING: u8 = 1;
 const WRITER_STOPPED: u8 = 2;
@@ -148,7 +147,7 @@ struct CaptureState<B: CaptureAuthorityBundle> {
     dropped_health_events: AtomicU64,
     accounting: Arc<accounting::CaptureMemoryAccounting>,
     _fixed_infrastructure: accounting::CaptureMemoryReservation,
-    fixed_storage: queue::FixedStorageReceipt,
+    queue_storage: transport::QueueStorageReceipt,
     health_fixed_storage: queue::FixedStorageReceipt,
     writer_lifecycle_core: Arc<writer::WriterLifecycleCore>,
 }
@@ -257,12 +256,17 @@ impl<B: CaptureAuthorityBundle> CaptureState<B> {
     }
 }
 
+#[derive(Debug)]
+struct CaptureWriterCore<B: CaptureAuthorityBundle, T: transport::CaptureQueueTransport> {
+    receiver: Option<T::Receiver<CaptureMessage<B>>>,
+    queue_control: T::Control<CaptureMessage<B>>,
+    state: Arc<CaptureState<B>>,
+}
+
 /// Receiver owned by the supervised raw-capture writer.
 #[derive(Debug)]
 pub struct RawCaptureWriter<B: CaptureAuthorityBundle> {
-    receiver: Option<queue::FixedReceiver<CaptureMessage<B>>>,
-    queue_control: queue::FixedQueueControl<CaptureMessage<B>>,
-    state: Arc<CaptureState<B>>,
+    core: CaptureWriterCore<B, transport::FixedRingTransport>,
 }
 
 /// The publisher, control authority, and sole writer receiver created for one capture channel.
@@ -272,9 +276,17 @@ pub type RawCaptureChannel<B> = (
     RawCaptureWriter<B>,
 );
 
-impl<B: CaptureAuthorityBundle> Drop for RawCaptureWriter<B> {
+type CaptureChannelCoreParts<B, T> = (
+    admission::CapturePublisherCore<B, T>,
+    RawCaptureControl<B>,
+    CaptureWriterCore<B, T>,
+);
+
+impl<B: CaptureAuthorityBundle, T: transport::CaptureQueueTransport> Drop
+    for CaptureWriterCore<B, T>
+{
     fn drop(&mut self) {
-        if self.queue_control.close_and_drain().is_err() {
+        if T::close_and_drain(&self.queue_control, self.receiver.as_ref()).is_err() {
             self.state
                 .mark_current_incomplete(CaptureHealthReason::QueuePoisoned);
         }
@@ -317,29 +329,42 @@ pub fn raw_capture_channel<B: CaptureAuthorityBundle>(
     limits: CaptureChannelLimits,
     bundle: B,
 ) -> Result<RawCaptureChannel<B>, CaptureChannelError> {
+    let (publisher, control, writer) =
+        capture_channel_core::<B, transport::FixedRingTransport>(process, limits, bundle)?;
+    Ok((
+        RawCapturePublisher::from_core(publisher),
+        control,
+        RawCaptureWriter { core: writer },
+    ))
+}
+
+fn capture_channel_core<B: CaptureAuthorityBundle, T: transport::CaptureQueueTransport>(
+    process: &CaptureProcessInfrastructure,
+    limits: CaptureChannelLimits,
+    bundle: B,
+) -> Result<CaptureChannelCoreParts<B, T>, CaptureChannelError> {
     let capacity = limits.capture_queue_capacity();
     let ceiling = limits.capture_memory_ceiling_bytes();
-    let (sender, receiver, queue_control, fixed_storage) =
-        match queue::FixedQueue::try_new(capacity) {
-            Ok(queue) => queue,
-            Err(error) => {
-                mark_bundle_incomplete(bundle);
-                return Err(match error {
-                    queue::QueueConstructionError::AllocationFailed => {
-                        CaptureChannelError::QueueAllocationFailed {
-                            queue: CaptureQueueKind::Record,
-                            requested_slots: capacity,
-                        }
+    let (sender, receiver, queue_control, fixed_storage) = match T::try_new(capacity) {
+        Ok(queue) => queue,
+        Err(error) => {
+            mark_bundle_incomplete(bundle);
+            return Err(match error {
+                queue::QueueConstructionError::AllocationFailed => {
+                    CaptureChannelError::QueueAllocationFailed {
+                        queue: CaptureQueueKind::Record,
+                        requested_slots: capacity,
                     }
-                    queue::QueueConstructionError::ArithmeticOverflow => {
-                        CaptureChannelError::FixedStorageBudgetExceeded {
-                            required: usize::MAX,
-                            ceiling: ceiling.get(),
-                        }
+                }
+                queue::QueueConstructionError::ArithmeticOverflow => {
+                    CaptureChannelError::FixedStorageBudgetExceeded {
+                        required: usize::MAX,
+                        ceiling: ceiling.get(),
                     }
-                });
-            }
-        };
+                }
+            });
+        }
+    };
     let health_capacity = NonZeroUsize::new(HEALTH_EVENT_CAPACITY).unwrap_or(NonZeroUsize::MIN);
     let (health_sender, health_receiver, _health_control, health_fixed_storage) =
         match queue::FixedQueue::try_new(health_capacity) {
@@ -394,8 +419,12 @@ pub fn raw_capture_channel<B: CaptureAuthorityBundle>(
                 });
             }
         };
-    let channel_state_fixed_bytes = match fixed_storage
-        .retained_queue_bytes()
+    // Production FixedQueue infrastructure contributes exact allocator-observed bytes. The
+    // benchmark-only standard reference deliberately contributes no byte value because stable
+    // `sync_channel` does not expose one; its evidence schema records `not_measured` and forbids
+    // treating this accounting snapshot as a whole-graph memory comparison.
+    let known_record_queue_fixed_bytes = fixed_storage.retained_queue_bytes().unwrap_or(0);
+    let channel_state_fixed_bytes = match known_record_queue_fixed_bytes
         .checked_add(health_fixed_storage.retained_queue_bytes())
         .and_then(|bytes| bytes.checked_add(capture_state_bytes))
         .and_then(|bytes| bytes.checked_add(writer_lifecycle_core_bytes))
@@ -445,22 +474,64 @@ pub fn raw_capture_channel<B: CaptureAuthorityBundle>(
         dropped_health_events: AtomicU64::new(0),
         accounting,
         _fixed_infrastructure: fixed_infrastructure,
-        fixed_storage,
+        queue_storage: fixed_storage,
         health_fixed_storage,
         writer_lifecycle_core: Arc::new(writer::WriterLifecycleCore::new()),
     });
     Ok((
-        RawCapturePublisher::new(sender, Arc::clone(&state)),
+        admission::CapturePublisherCore::new(sender, Arc::clone(&state)),
         RawCaptureControl {
             state: Arc::clone(&state),
             initializer: Some(initializer),
         },
-        RawCaptureWriter {
+        CaptureWriterCore {
             receiver: Some(receiver),
             queue_control,
             state,
         },
     ))
+}
+
+#[cfg(all(
+    feature = "capture-benchmark",
+    not(test),
+    capture_bench_backend = "standard"
+))]
+type SelectedBenchmarkTransport = transport::StandardReferenceTransport;
+#[cfg(all(
+    feature = "capture-benchmark",
+    any(test, capture_bench_backend = "candidate")
+))]
+type SelectedBenchmarkTransport = transport::FixedRingTransport;
+
+#[cfg(feature = "capture-benchmark")]
+type BenchmarkCapturePublisher<B> = admission::CapturePublisherCore<B, SelectedBenchmarkTransport>;
+#[cfg(feature = "capture-benchmark")]
+type BenchmarkCaptureWriter<B> = CaptureWriterCore<B, SelectedBenchmarkTransport>;
+#[cfg(feature = "capture-benchmark")]
+type BenchmarkCaptureChannelParts<B> = (
+    BenchmarkCapturePublisher<B>,
+    RawCaptureControl<B>,
+    BenchmarkCaptureWriter<B>,
+);
+
+#[cfg(feature = "capture-benchmark")]
+fn benchmark_capture_channel<B: CaptureAuthorityBundle>(
+    process: &CaptureProcessInfrastructure,
+    limits: CaptureChannelLimits,
+    bundle: B,
+) -> Result<BenchmarkCaptureChannelParts<B>, CaptureChannelError> {
+    capture_channel_core::<B, SelectedBenchmarkTransport>(process, limits, bundle)
+}
+
+#[cfg(feature = "capture-benchmark")]
+const fn benchmark_transport_identity() -> &'static str {
+    <SelectedBenchmarkTransport as transport::CaptureQueueTransport>::IDENTITY
+}
+
+#[cfg(feature = "capture-benchmark")]
+const fn benchmark_private_storage_accounting() -> &'static str {
+    <SelectedBenchmarkTransport as transport::CaptureQueueTransport>::PRIVATE_STORAGE_ACCOUNTING
 }
 
 mod accounting;
@@ -473,6 +544,7 @@ mod diagnostic;
 mod generation;
 mod policy;
 mod queue;
+mod transport;
 mod writer;
 
 pub use accounting::{CaptureAccountingSnapshot, CaptureAccountingSnapshotError};

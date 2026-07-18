@@ -36,6 +36,7 @@ else:
 
 MAX_BUILD_EVIDENCE_BYTES = 1024 * 1024
 MAX_EXECUTABLE_BYTES = 256 * 1024 * 1024
+RUNNER_SCHEMA_VERSION = 3
 SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 AUTHORITY_MODULE_FILES = {
     "host_gate_shell_sha256": SCRIPT_DIRECTORY / "capture_benchmark_host_gate.sh",
@@ -67,6 +68,8 @@ BUILD_EVIDENCE_FIELDS = {
     "runner",
     "evidence_mode",
     "evidence_backend",
+    "queue_transport",
+    "queue_private_storage_accounting",
     "cargo_target",
     "benchmark_feature",
     "build_profile",
@@ -105,6 +108,9 @@ BUILD_EVIDENCE_FIELDS = {
     "platform_source_sha256",
     "domain_source_sha256",
     "entrypoint_sha256",
+    "backend_dispatcher_sha256",
+    "selected_backend_source_path",
+    "selected_backend_source_sha256",
     "backend_sha256",
     "criterion_sha256",
     "observer_sha256",
@@ -120,6 +126,8 @@ RUNNER_BINDING_FIELDS = {
     "runner",
     "evidence_mode",
     "evidence_backend",
+    "queue_transport",
+    "queue_private_storage_accounting",
     "build_profile",
     "measured_code_head",
     "clean_build_enforced",
@@ -147,6 +155,9 @@ RUNNER_BINDING_FIELDS = {
     "platform_source_sha256",
     "domain_source_sha256",
     "entrypoint_sha256",
+    "backend_dispatcher_sha256",
+    "selected_backend_source_path",
+    "selected_backend_source_sha256",
     "backend_sha256",
     "criterion_sha256",
     "observer_sha256",
@@ -183,6 +194,8 @@ DIGEST_FIELDS = {
     "platform_source_sha256",
     "domain_source_sha256",
     "entrypoint_sha256",
+    "backend_dispatcher_sha256",
+    "selected_backend_source_sha256",
     "backend_sha256",
     "criterion_sha256",
     "observer_sha256",
@@ -302,11 +315,19 @@ def build_evidence_contract(
     )
     if (
         type(value["schema_version"]) is not int
-        or value["schema_version"] != 1
+        or value["schema_version"] != RUNNER_SCHEMA_VERSION
         or value["runner"] != "capture_admission_evidence"
         or value["evidence_mode"] != "diagnostic_fixed_quota"
         or not isinstance(backend, str)
         or backend not in {"standard", "candidate"}
+        or (
+            value["queue_transport"],
+            value["queue_private_storage_accounting"],
+        )
+        != {
+            "standard": ("standard_sync_channel", "not_measured"),
+            "candidate": ("candidate_fixed_ring", "exact"),
+        }[backend]
         or value["cargo_target"] != "capture_admission_evidence"
         or value["benchmark_feature"] != "capture-benchmark"
         or value["build_profile"] != PROFILE
@@ -319,6 +340,11 @@ def build_evidence_contract(
         or value["build_environment_policy"] != "sanitized-cargo-bench-v1"
         or value["executable_path"] != "./capture_admission_evidence-exe"
         or value["cargo_json_path"] != "./capture-bench-build.json"
+        or value["selected_backend_source_path"]
+        != (
+            "crates/market-squawk-platform/benches/capture_admission/backend/"
+            f"{backend}.rs"
+        )
         or value["build_command"] != BUILD_COMMAND
         or any(not is_lower_digest(value[field]) for field in DIGEST_FIELDS)
         or not isinstance(value["immutable_module_sha256"], dict)

@@ -28,11 +28,15 @@ const IMMUTABLE_MODULES: [(&str, &str); 8] = [
 ];
 
 fn main() -> Result<(), Box<dyn Error>> {
+    println!(
+        "cargo:rustc-check-cfg=cfg(capture_bench_backend, values(\"standard\", \"candidate\"))"
+    );
     println!("cargo:rerun-if-env-changed=CAPTURE_BENCH_REQUIRE_CLEAN_BUILD");
     println!("cargo:rerun-if-env-changed=CAPTURE_BENCH_BUILD_POLICY");
     println!("cargo:rerun-if-env-changed=CAPTURE_BENCH_BUILD_COMMAND_SHA256");
     println!("cargo:rerun-if-env-changed=CAPTURE_BENCH_BUILD_ENV_SHA256");
     println!("cargo:rerun-if-env-changed=CAPTURE_BENCH_EVIDENCE_BACKEND");
+    println!("cargo:rerun-if-env-changed=CAPTURE_BENCH_DEVELOPMENT_BACKEND");
     println!("cargo:rerun-if-env-changed=CAPTURE_BENCH_CARGO_EXECUTABLE");
     println!("cargo:rerun-if-env-changed=CAPTURE_BENCH_CARGO_EXECUTABLE_SHA256");
     println!("cargo:rerun-if-env-changed=CAPTURE_BENCH_GIT_EXECUTABLE");
@@ -42,12 +46,38 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-env-changed=CAPTURE_BENCH_BASELINE_LOCK_SHA256");
     println!("cargo:rerun-if-env-changed=CAPTURE_BENCH_BASELINE_MANIFEST_SHA256");
     println!("cargo:rerun-if-env-changed=CAPTURE_BENCH_BASELINE_MEASURED_CODE_HEAD");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_CAPTURE_BENCHMARK");
+    match std::env::var("CARGO_FEATURE_CAPTURE_BENCHMARK") {
+        Ok(value) if value == "1" => {}
+        Ok(_invalid) => return Err("capture benchmark feature marker is invalid".into()),
+        Err(std::env::VarError::NotPresent) => return Ok(()),
+        Err(error) => return Err(error.into()),
+    }
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
     let repository = manifest
         .parent()
         .and_then(Path::parent)
         .ok_or("platform manifest is not under the repository root")?;
     let clean_build_requested = std::env::var_os("CAPTURE_BENCH_REQUIRE_CLEAN_BUILD").is_some();
+    let configured_backend = match std::env::var("CAPTURE_BENCH_EVIDENCE_BACKEND") {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => return Err(error.into()),
+    };
+    let development_backend = match std::env::var("CAPTURE_BENCH_DEVELOPMENT_BACKEND") {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => return Err(error.into()),
+    };
+    let selected_backend = build_support::select_benchmark_backend(
+        clean_build_requested,
+        configured_backend.as_deref(),
+        development_backend.as_deref(),
+    )?;
+    println!(
+        "cargo:rustc-cfg=capture_bench_backend={:?}",
+        selected_backend.as_str()
+    );
     if clean_build_requested {
         let configured = std::env::var("CAPTURE_BENCH_PROCESS_GROUP_POLICY").ok();
         let expected_group = std::env::var("CAPTURE_BENCH_EXPECTED_PROCESS_GROUP_ID").ok();
@@ -71,6 +101,18 @@ fn main() -> Result<(), Box<dyn Error>> {
         (PathBuf::from("git"), "0".repeat(64), "0".repeat(64))
     };
     let bench_root = manifest.join("benches/capture_admission");
+    let backend_binding = build_support::bind_benchmark_backend_sources(
+        &manifest,
+        selected_backend,
+        MAX_SOURCE_FILE_BYTES,
+    )?;
+    if backend_binding.backend() != selected_backend {
+        return Err("backend source binding selected a different identity".into());
+    }
+    let selected_backend_source_path = format!(
+        "crates/market-squawk-platform/{}",
+        backend_binding.selected_source_relative_path()
+    );
     let mut module_hashes = Vec::new();
     for (name, file) in IMMUTABLE_MODULES {
         let path = bench_root.join(file);
@@ -79,9 +121,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     let entrypoint = manifest.join("benches/capture_admission.rs");
     let backend = bench_root.join("backend.rs");
+    let standard_backend = bench_root.join("backend/standard.rs");
+    let candidate_backend = bench_root.join("backend/candidate.rs");
     let criterion = manifest.join("benches/capture_admission_criterion.rs");
     let observer = manifest.join("src/capture/benchmark_support/observer.rs");
-    for path in [&entrypoint, &backend, &criterion, &observer] {
+    for path in [
+        &entrypoint,
+        &backend,
+        &standard_backend,
+        &candidate_backend,
+        &criterion,
+        &observer,
+    ] {
         rerun(path);
     }
     let platform_sources = collect_rust_files(&manifest.join("src"))?;
@@ -152,12 +203,15 @@ fn main() -> Result<(), Box<dyn Error>> {
             policy: "development-unverified".to_owned(),
             command_sha256: "0".repeat(64),
             environment_sha256: "0".repeat(64),
-            evidence_backend: "standard".to_owned(),
+            evidence_backend: selected_backend.as_str().to_owned(),
             baseline_lock_sha256: None,
             baseline_manifest_sha256: None,
             baseline_measured_code_head: None,
         }
     };
+    if build_environment.evidence_backend != selected_backend.as_str() {
+        return Err("compiled backend differs from its build-environment identity".into());
+    }
     if let Ok(path) = command(
         &git_executable,
         repository,
@@ -198,7 +252,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         baseline_measured_code_head: build_environment.baseline_measured_code_head.as_deref(),
         module_hashes: &module_hashes,
         entrypoint_sha256: &hash_file(&entrypoint)?,
-        backend_sha256: &hash_file(&backend)?,
+        backend_dispatcher_sha256: backend_binding.dispatcher_sha256(),
+        selected_backend_source_path: &selected_backend_source_path,
+        selected_backend_source_sha256: backend_binding.selected_source_sha256(),
+        backend_sha256: backend_binding.backend_sha256(),
         criterion_sha256: &hash_file(&criterion)?,
         observer_sha256: &hash_file(&observer)?,
         platform_source_sha256: &tree_hash(repository, &platform_sources)?,
@@ -342,6 +399,9 @@ struct GeneratedBindings<'a> {
     baseline_measured_code_head: Option<&'a str>,
     module_hashes: &'a [(&'a str, String)],
     entrypoint_sha256: &'a str,
+    backend_dispatcher_sha256: &'a str,
+    selected_backend_source_path: &'a str,
+    selected_backend_source_sha256: &'a str,
     backend_sha256: &'a str,
     criterion_sha256: &'a str,
     observer_sha256: &'a str,
@@ -442,6 +502,18 @@ fn render(bindings: GeneratedBindings<'_>) -> Result<String, std::fmt::Error> {
     writeln!(output, "];")?;
     for (name, value) in [
         ("ENTRYPOINT_SHA256", bindings.entrypoint_sha256),
+        (
+            "BACKEND_DISPATCHER_SHA256",
+            bindings.backend_dispatcher_sha256,
+        ),
+        (
+            "SELECTED_BACKEND_SOURCE_PATH",
+            bindings.selected_backend_source_path,
+        ),
+        (
+            "SELECTED_BACKEND_SOURCE_SHA256",
+            bindings.selected_backend_source_sha256,
+        ),
         ("BACKEND_SHA256", bindings.backend_sha256),
         ("CRITERION_SHA256", bindings.criterion_sha256),
         ("OBSERVER_SHA256", bindings.observer_sha256),

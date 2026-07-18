@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! Fixed-operation diagnostic capture measurement executable.
 //!
 //! The project collector is authoritative: one external invocation executes each matrix cell
@@ -116,6 +118,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         build_evidence_sha256: output.hash_file(Path::new("build-evidence.json"), 1024 * 1024)?,
         measured_code_head: build_bindings::BUILD_GIT_HEAD.to_owned(),
         backend: backend::EVIDENCE_BACKEND.to_owned(),
+        queue_transport: backend::QUEUE_TRANSPORT.to_owned(),
+        queue_private_storage_accounting: backend::QUEUE_PRIVATE_STORAGE_ACCOUNTING.to_owned(),
         repetition,
         fixtures: backend::FIXTURES
             .iter()
@@ -142,6 +146,7 @@ fn self_check() -> Result<(), Box<dyn Error>> {
     validate_backend_contract()?;
     workload::self_check_rss_adapter()?;
     schema::self_check_rss_sample_contract()?;
+    schema::self_check_post_drain_memory_contract()?;
     let producers = producer_cases()?;
     if benchmark_identity::verify_distinct_authority_labels().is_err()
         || Endpoint::ALL.len() != 5
@@ -183,7 +188,74 @@ fn self_check() -> Result<(), Box<dyn Error>> {
     if full.queue_full == 0 {
         return Err("comparable-full self-check did not refuse".into());
     }
+    match (backend::REQUIRES_BASELINE, backend::run_forced_lock()?) {
+        (false, None) => {}
+        (true, Some(proof))
+            if proof.schema_version == RESULT_SCHEMA_VERSION
+                && proof.backend == backend::EVIDENCE_BACKEND
+                && proof.slot_lock_unavailable == 1
+                && proof.accepted == 0
+                && proof.consumed == 0
+                && proof.queued_bytes == 0
+                && proof.record_reservations.is_none()
+                && proof.queue_private_storage_bytes > 0
+                && proof.accounting_invariant_failures == 0 => {}
+        _ => return Err("backend forced-lock self-check contract failed".into()),
+    }
+    self_check_selected_transport_endpoints()?;
     Ok(())
+}
+
+fn self_check_selected_transport_endpoints() -> Result<(), Box<dyn Error>> {
+    let queue_depth = NonZeroUsize::new(64).ok_or("self-check queue depth is zero")?;
+    for endpoint in Endpoint::ALL {
+        let case = backend::PreparedCase::try_new(endpoint, 8, queue_depth, 2)?;
+        for _ordinal in 0..2 {
+            let operation = case.try_producer()?.try_prepare_operation()?;
+            let _attempt = operation.execute()?;
+        }
+        let reconciliation = case.finish()?;
+        if reconciliation.accepted() != 2
+            || reconciliation.consumed() != 2
+            || reconciliation.queued_bytes() != 0
+            || reconciliation.accounting_invariant_failures() != 0
+            || !selected_transport_memory_is_valid(&reconciliation)
+        {
+            return Err(format!("selected transport failed {endpoint:?} reconciliation").into());
+        }
+        let samples = reconciliation.into_samples();
+        let expected_samples = if endpoint.has_deferred_samples() {
+            2
+        } else {
+            0
+        };
+        if samples.len() != expected_samples {
+            return Err(format!("selected transport failed {endpoint:?} sample parity").into());
+        }
+    }
+    Ok(())
+}
+
+fn selected_transport_memory_is_valid(
+    reconciliation: &market_squawk_platform::capture_benchmark_support::BenchmarkCaseReconciliation,
+) -> bool {
+    match backend::QUEUE_PRIVATE_STORAGE_ACCOUNTING {
+        "not_measured" => {
+            reconciliation.queue_private_storage_bytes().is_none()
+                && reconciliation.fixed_capture_bytes().is_none()
+                && reconciliation.total_accounted_bytes().is_none()
+        }
+        "exact" => matches!(
+            (
+                reconciliation.queue_private_storage_bytes(),
+                reconciliation.fixed_capture_bytes(),
+                reconciliation.total_accounted_bytes(),
+            ),
+            (Some(queue), Some(fixed), Some(total))
+                if queue > 0 && fixed >= queue && total >= fixed
+        ),
+        _ => false,
+    }
 }
 
 fn finalize(
@@ -312,6 +384,8 @@ fn finalize(
         baseline_manifest_sha256,
         baseline_lock_sha256,
         backend: backend::EVIDENCE_BACKEND.to_owned(),
+        queue_transport: backend::QUEUE_TRANSPORT.to_owned(),
+        queue_private_storage_accounting: backend::QUEUE_PRIVATE_STORAGE_ACCOUNTING.to_owned(),
         benchmark_support_feature: "capture-benchmark".to_owned(),
         fixtures: backend::FIXTURES
             .iter()
@@ -437,14 +511,19 @@ fn validate_build_evidence(output: &EvidenceDirectory) -> Result<BuildEvidence, 
 }
 
 fn validate_backend_contract() -> Result<(), Box<dyn Error>> {
+    backend::validate_compiled_transport()?;
     let valid = match backend::EVIDENCE_BACKEND {
         "standard" => {
             !backend::REQUIRES_BASELINE
+                && backend::QUEUE_TRANSPORT == "standard_sync_channel"
+                && backend::QUEUE_PRIVATE_STORAGE_ACCOUNTING == "not_measured"
                 && backend::FIXTURES == ["matrix", "comparable_full", "sustained_rss"]
                 && backend::EXPECTED_FIXTURES == "matrix,comparable_full,sustained_rss"
         }
         "candidate" => {
             backend::REQUIRES_BASELINE
+                && backend::QUEUE_TRANSPORT == "candidate_fixed_ring"
+                && backend::QUEUE_PRIVATE_STORAGE_ACCOUNTING == "exact"
                 && backend::FIXTURES
                     == ["matrix", "comparable_full", "forced_lock", "sustained_rss"]
                 && backend::EXPECTED_FIXTURES == "matrix,comparable_full,forced_lock,sustained_rss"
@@ -586,6 +665,8 @@ fn print_build_bindings() -> Result<(), Box<dyn Error>> {
         "runner": benchmark_identity::EVIDENCE_TARGET,
         "evidence_mode": benchmark_identity::FIXED_QUOTA_EVIDENCE_MODE,
         "evidence_backend": build_bindings::BUILD_EVIDENCE_BACKEND,
+        "queue_transport": backend::QUEUE_TRANSPORT,
+        "queue_private_storage_accounting": backend::QUEUE_PRIVATE_STORAGE_ACCOUNTING,
         "build_profile": "cargo-bench-inherits-release:opt-level=3:lto=thin:codegen-units=1:panic=abort:strip=symbols",
         "measured_code_head": build_bindings::BUILD_GIT_HEAD,
         "clean_build_enforced": build_bindings::CLEAN_BUILD_ENFORCED,
@@ -613,6 +694,9 @@ fn print_build_bindings() -> Result<(), Box<dyn Error>> {
         "platform_source_sha256": build_bindings::PLATFORM_SOURCE_SHA256,
         "domain_source_sha256": build_bindings::DOMAIN_SOURCE_SHA256,
         "entrypoint_sha256": build_bindings::ENTRYPOINT_SHA256,
+        "backend_dispatcher_sha256": build_bindings::BACKEND_DISPATCHER_SHA256,
+        "selected_backend_source_path": build_bindings::SELECTED_BACKEND_SOURCE_PATH,
+        "selected_backend_source_sha256": build_bindings::SELECTED_BACKEND_SOURCE_SHA256,
         "backend_sha256": build_bindings::BACKEND_SHA256,
         "criterion_sha256": build_bindings::CRITERION_SHA256,
         "observer_sha256": build_bindings::OBSERVER_SHA256,

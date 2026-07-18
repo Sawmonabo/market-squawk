@@ -58,7 +58,7 @@ pub enum CaptureShutdownStatus {
 ///
 /// This contract is compiled for crate unit tests, or for debug-assertion builds with the internal
 /// `capture-test` feature. Production composition must observe and handle
-/// [`crate::CapturePublishError::QueueContended`] directly.
+/// [`crate::CapturePublishError::QueueInvariant`] directly.
 #[cfg(any(test, all(feature = "capture-test", debug_assertions)))]
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum CaptureReceiverTestCoordinationError {
@@ -184,7 +184,7 @@ impl<B: CaptureAuthorityBundle> CaptureWriterHandle<B> {
             .lifecycle
             .shutdown_requested
             .store(true, Ordering::Release);
-        if self.queue_control.close().is_err() {
+        if self.queue_control.request_close().is_err() {
             self.state
                 .mark_current_incomplete(CaptureHealthReason::QueuePoisoned);
         }
@@ -333,7 +333,7 @@ impl<B: CaptureAuthorityBundle> PendingCaptureWriter<B> {
         if self.deadline_recorded {
             return;
         }
-        if self.queue_control.close_and_drain().is_err() {
+        if self.queue_control.request_close().is_err() {
             self.state
                 .mark_current_incomplete(CaptureHealthReason::QueuePoisoned);
         }
@@ -362,7 +362,7 @@ impl<B: CaptureAuthorityBundle> PendingCaptureWriter<B> {
             .lifecycle
             .shutdown_requested
             .store(true, Ordering::Release);
-        if self.queue_control.close().is_err() {
+        if self.queue_control.request_close().is_err() {
             self.state
                 .mark_current_incomplete(CaptureHealthReason::QueuePoisoned);
         }
@@ -389,7 +389,7 @@ impl<B: CaptureAuthorityBundle> Drop for PendingCaptureWriter<B> {
     }
 }
 
-fn termination_after_join<B: CaptureAuthorityBundle>(
+pub(super) fn termination_after_join<B: CaptureAuthorityBundle>(
     state: &CaptureState<B>,
     final_report: &std::sync::Mutex<Option<CaptureWorkerFinalReport>>,
     records_written_at_revocation: u64,

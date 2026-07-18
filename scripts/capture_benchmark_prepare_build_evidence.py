@@ -26,6 +26,7 @@ from capture_benchmark_host_gate import (  # noqa: E402
     publish_json,
     require_platform_primitives,
 )
+from capture_benchmark_host_measured import RUNNER_SCHEMA_VERSION  # noqa: E402
 
 MAX_BINDINGS_BYTES = 1024 * 1024
 MAX_CARGO_JSON_BYTES = 64 * 1024 * 1024
@@ -33,6 +34,8 @@ MAX_CARGO_STDERR_BYTES = 16 * 1024 * 1024
 MAX_EXECUTABLE_BYTES = 256 * 1024 * 1024
 TARGET = "capture_admission_evidence"
 FEATURE = "capture-benchmark"
+EXPECTED_CARGO_FEATURES = (FEATURE, "capture-test", "default")
+RESULT_SCHEMA_VERSION = RUNNER_SCHEMA_VERSION
 EVIDENCE_MODE = "diagnostic_fixed_quota"
 PROFILE = (
     "cargo-bench-inherits-release:opt-level=3:lto=thin:codegen-units=1:"
@@ -77,6 +80,12 @@ BASELINE_LOCK_RELATIVE = Path(
     "docs/reports/performance/2026-07-17-q2-a4-standard-channel-baseline.lock.json"
 )
 MAX_BASELINE_BYTES = 4 * 1024 * 1024
+BACKEND_DIGEST_DOMAIN = b"market-squawk:capture-benchmark-backend:v1\0"
+BACKEND_DISPATCHER_RELATIVE = Path("benches/capture_admission/backend.rs")
+BACKEND_SOURCE_RELATIVE = {
+    "standard": Path("benches/capture_admission/backend/standard.rs"),
+    "candidate": Path("benches/capture_admission/backend/candidate.rs"),
+}
 
 
 def strict_json(value: bytes) -> dict[str, Any]:
@@ -269,6 +278,9 @@ def validate_current_bindings(bindings: dict[str, Any], current: dict[str, Any])
         "platform_source_sha256",
         "domain_source_sha256",
         "entrypoint_sha256",
+        "backend_dispatcher_sha256",
+        "selected_backend_source_path",
+        "selected_backend_source_sha256",
         "backend_sha256",
         "criterion_sha256",
         "observer_sha256",
@@ -377,6 +389,41 @@ def current_file_hash(path: Path, repository: Path) -> str:
         os.close(descriptor)
 
 
+def benchmark_backend_binding(repository: Path, backend: str) -> dict[str, str]:
+    """Return the closed, descriptor-checked binding for one selected backend source."""
+    if backend not in BACKEND_SOURCE_RELATIVE:
+        raise GateError("capture benchmark backend is not a closed identity")
+    package = repository / "crates/market-squawk-platform"
+    dispatcher = package / BACKEND_DISPATCHER_RELATIVE
+    sources = {
+        identity: current_file_hash(package / relative, repository)
+        for identity, relative in BACKEND_SOURCE_RELATIVE.items()
+    }
+    if sources["standard"] == sources["candidate"]:
+        raise GateError("capture benchmark backend sources are byte-identical")
+    dispatcher_sha256 = current_file_hash(dispatcher, repository)
+    selected_relative = BACKEND_SOURCE_RELATIVE[backend]
+    selected_sha256 = sources[backend]
+    digest = hashlib.sha256(BACKEND_DIGEST_DOMAIN)
+    for label, value in (
+        (str(BACKEND_DISPATCHER_RELATIVE).encode(), dispatcher_sha256.encode()),
+        (str(selected_relative).encode(), selected_sha256.encode()),
+        (b"identity", backend.encode()),
+    ):
+        digest.update(len(label).to_bytes(8, "little"))
+        digest.update(label)
+        digest.update(len(value).to_bytes(8, "little"))
+        digest.update(value)
+    return {
+        "backend_dispatcher_sha256": dispatcher_sha256,
+        "selected_backend_source_path": str(
+            (package / selected_relative).relative_to(repository)
+        ),
+        "selected_backend_source_sha256": selected_sha256,
+        "backend_sha256": digest.hexdigest(),
+    }
+
+
 def rust_files(root: Path) -> list[Path]:
     files = []
     for directory, names, filenames in os.walk(root, followlinks=False):
@@ -404,7 +451,10 @@ def tree_hash(repository: Path, files: list[Path]) -> str:
 
 
 def recompute_current_bindings(
-    repository: Path, cargo_sha256: str, git_sha256: str
+    repository: Path,
+    cargo_sha256: str,
+    git_sha256: str,
+    evidence_backend: str = "standard",
 ) -> dict[str, Any]:
     platform = rust_files(repository / "crates/market-squawk-platform/src")
     domain = rust_files(repository / "crates/market-squawk-domain/src")
@@ -417,6 +467,7 @@ def recompute_current_bindings(
         name: current_file_hash(bench / filename, repository)
         for name, filename in IMMUTABLE_MODULES.items()
     }
+    backend_binding = benchmark_backend_binding(repository, evidence_backend)
     return {
         "source_inventory_sha256": inventory.hexdigest(),
         "cargo_lock_sha256": current_file_hash(repository / "Cargo.lock", repository),
@@ -468,7 +519,7 @@ def recompute_current_bindings(
             repository / "crates/market-squawk-platform/benches/capture_admission.rs",
             repository,
         ),
-        "backend_sha256": current_file_hash(bench / "backend.rs", repository),
+        **backend_binding,
         "criterion_sha256": current_file_hash(
             repository / "crates/market-squawk-platform/benches/capture_admission_criterion.rs",
             repository,
@@ -551,7 +602,7 @@ def parse_cargo_artifact(cargo_json: bytes, repository: Path) -> tuple[Path, dic
         or str(profile.get("opt_level")) != "3"
         or profile.get("debug_assertions") is not False
         or not isinstance(features, list)
-        or features != [FEATURE]
+        or features != list(EXPECTED_CARGO_FEATURES)
     ):
         raise GateError("Cargo artifact profile, kind, or feature set is invalid")
     path = Path(artifact["executable"])
@@ -576,6 +627,8 @@ def runner_bindings(executable: Path) -> dict[str, Any]:
         "runner",
         "evidence_mode",
         "evidence_backend",
+        "queue_transport",
+        "queue_private_storage_accounting",
         "build_profile",
         "measured_code_head",
         "clean_build_enforced",
@@ -603,6 +656,9 @@ def runner_bindings(executable: Path) -> dict[str, Any]:
         "platform_source_sha256",
         "domain_source_sha256",
         "entrypoint_sha256",
+        "backend_dispatcher_sha256",
+        "selected_backend_source_path",
+        "selected_backend_source_sha256",
         "backend_sha256",
         "criterion_sha256",
         "observer_sha256",
@@ -616,9 +672,18 @@ def runner_bindings(executable: Path) -> dict[str, Any]:
     if (
         not isinstance(value, dict)
         or set(value) != expected
+        or value["schema_version"] != RESULT_SCHEMA_VERSION
         or value["runner"] != TARGET
         or value["evidence_mode"] != EVIDENCE_MODE
         or value["evidence_backend"] not in {"standard", "candidate"}
+        or (
+            value["queue_transport"],
+            value["queue_private_storage_accounting"],
+        )
+        != {
+            "standard": ("standard_sync_channel", "not_measured"),
+            "candidate": ("candidate_fixed_ring", "exact"),
+        }[value["evidence_backend"]]
         or value["build_profile"] != PROFILE
         or not is_git_head(value["measured_code_head"])
         or value["clean_build_enforced"] is not True
@@ -632,12 +697,15 @@ def runner_bindings(executable: Path) -> dict[str, Any]:
         "runner",
         "evidence_mode",
         "evidence_backend",
+        "queue_transport",
+        "queue_private_storage_accounting",
         "build_profile",
         "measured_code_head",
         "clean_build_enforced",
         "build_environment_policy",
         "build_command_sha256",
         "build_environment_sha256",
+        "selected_backend_source_path",
         "immutable_module_sha256",
         "baseline_lock_path",
         "baseline_lock_sha256",
@@ -648,6 +716,12 @@ def runner_bindings(executable: Path) -> dict[str, Any]:
     for field in digest_fields:
         if not is_lower_digest(value[field]):
             raise GateError("runner build binding contains a noncanonical digest")
+    selected_source = (
+        "crates/market-squawk-platform/benches/capture_admission/backend/"
+        f"{value['evidence_backend']}.rs"
+    )
+    if value["selected_backend_source_path"] != selected_source:
+        raise GateError("runner selected backend source path is inconsistent")
     if not isinstance(value["immutable_module_sha256"], dict) or any(
         not is_lower_digest(digest) for digest in value["immutable_module_sha256"].values()
     ):
@@ -742,6 +816,8 @@ def validate_baseline_inputs(
         "approval_state",
         "approval_identity",
         "backend",
+        "queue_transport",
+        "queue_private_storage_accounting",
         "backend_sha256",
         "build_evidence_sha256",
         "immutable_module_sha256",
@@ -775,6 +851,8 @@ def validate_baseline_inputs(
         "criterion_sha256",
         "observer_sha256",
         "backend",
+        "queue_transport",
+        "queue_private_storage_accounting",
         "benchmark_support_feature",
         "fixtures",
         "repetitions",
@@ -801,13 +879,15 @@ def validate_baseline_inputs(
     if (
         set(lock) != lock_fields
         or set(manifest) != manifest_fields
-        or lock.get("schema_version") != 1
+        or lock.get("schema_version") != RESULT_SCHEMA_VERSION
         or lock.get("state") != "frozen_standard_baseline"
-        or manifest.get("schema_version") != 1
+        or manifest.get("schema_version") != RESULT_SCHEMA_VERSION
         or manifest.get("runner") != TARGET
         or manifest.get("evidence_mode") != EVIDENCE_MODE
         or manifest.get("criterion_evidence_mode") != "exploratory_zero_authority"
         or manifest.get("backend") != "standard"
+        or manifest.get("queue_transport") != "standard_sync_channel"
+        or manifest.get("queue_private_storage_accounting") != "not_measured"
         or manifest.get("benchmark_support_feature") != FEATURE
         or manifest.get("fixtures") != ["matrix", "comparable_full", "sustained_rss"]
         or manifest.get("repetitions") != [1, 2, 3, 4, 5]
@@ -824,6 +904,9 @@ def validate_baseline_inputs(
         or lock.get("approval_state") != "independent_seed_review_approved"
         or lock.get("approval_identity") != "q2-a4-seed-checkpoint-review"
         or lock.get("backend") != "standard"
+        or lock.get("queue_transport") != manifest.get("queue_transport")
+        or lock.get("queue_private_storage_accounting")
+        != manifest.get("queue_private_storage_accounting")
     ):
         raise GateError("tracked baseline lock does not authorize the supplied manifest")
     for field in (
@@ -1141,7 +1224,10 @@ def main() -> int:
                 if parsed.fixture_failure_injection == "after-runner-validation":
                     raise GateError("fixture-injected failure after runner validation")
                 current_bindings = recompute_current_bindings(
-                    repository, cargo_sha256, git_sha256
+                    repository,
+                    cargo_sha256,
+                    git_sha256,
+                    parsed.benchmark_backend,
                 )
                 validate_current_bindings(bindings, current_bindings)
                 if baseline is not None:

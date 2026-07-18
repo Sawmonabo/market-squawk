@@ -145,14 +145,8 @@ async fn receipt_method_reentry_runs_after_the_admission_guard_is_released()
     assert!(receipt.is_healthy());
     assert_eq!(probe.calls.load(Ordering::Acquire), 1);
     let observed = probe.observed_error();
-    assert!(matches!(
-        observed,
-        None | Some(CapturePublishError::QueueContended)
-    ));
-    assert_eq!(
-        issued.load(Ordering::Acquire),
-        if observed.is_none() { 2 } else { 1 }
-    );
+    assert_eq!(observed, None);
+    assert_eq!(issued.load(Ordering::Acquire), 2);
 
     let _termination = shutdown_and_reap(handle, Duration::from_secs(1)).await?;
     Ok(())

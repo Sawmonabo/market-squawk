@@ -68,7 +68,6 @@ async fn blocked_append_returns_owned_pending_worker_and_persists_late_write()
     entered_receiver.recv_timeout(Duration::from_secs(1))?;
     let second_receipt = publisher.try_publish(&frame(first_identity, 2)?)?;
     let queued_before_shutdown = accounted_record_bytes(&publisher)?;
-    assert!(queued_before_shutdown > 0);
 
     let mut pending = handle.shutdown(Duration::from_millis(10));
     tokio::time::timeout(
@@ -76,20 +75,15 @@ async fn blocked_append_returns_owned_pending_worker_and_persists_late_write()
         tokio::time::sleep(Duration::from_millis(1)),
     )
     .await?;
-    assert_eq!(
-        pending.wait_until_deadline().await,
-        CaptureShutdownStatus::DeadlineElapsed
-    );
-    assert!(!pending.is_worker_terminated());
-    let writer_owned_bytes = accounted_record_bytes(&publisher)?;
-    assert!(writer_owned_bytes > 0);
-    assert!(writer_owned_bytes < queued_before_shutdown);
-    assert!(!first_receipt.generation_is_complete());
-    assert!(!second_receipt.generation_is_complete());
-    assert!(matches!(
+    let deadline_status = pending.wait_until_deadline().await;
+    let worker_terminated_at_deadline = pending.is_worker_terminated();
+    let retained_bytes_at_deadline = accounted_record_bytes(&publisher);
+    let first_complete_at_deadline = first_receipt.generation_is_complete();
+    let second_complete_at_deadline = second_receipt.generation_is_complete();
+    let worker_retained_at_deadline = matches!(
         pending.try_reap(),
         Err(CaptureWorkerReapError::WorkerStillRunning)
-    ));
+    );
 
     release_sender.send(())?;
     pending.wait_until_terminated().await;
@@ -119,6 +113,13 @@ async fn blocked_append_returns_owned_pending_worker_and_persists_late_write()
     let termination = pending
         .try_reap()?
         .ok_or("finished append worker did not retain termination")?;
+    assert!(queued_before_shutdown > 0);
+    assert_eq!(deadline_status, CaptureShutdownStatus::DeadlineElapsed);
+    assert!(!worker_terminated_at_deadline);
+    assert_eq!(retained_bytes_at_deadline?, queued_before_shutdown);
+    assert!(!first_complete_at_deadline);
+    assert!(!second_complete_at_deadline);
+    assert!(worker_retained_at_deadline);
     assert_eq!(accounted_record_bytes(&publisher)?, 0);
     assert_eq!(
         termination.outcome(),

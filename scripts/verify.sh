@@ -9,6 +9,11 @@ python3 scripts/check_duplicate_dependencies.py
 python3 scripts/check_generated_artifacts.py
 python3 scripts/check_capture_frame_contracts.py
 cargo fmt --all -- --check
+RUSTFLAGS="" CARGO_ENCODED_RUSTFLAGS="-Dwarnings" \
+  CAPTURE_BENCH_DEVELOPMENT_BACKEND=candidate \
+  cargo check -p market-squawk-platform --all-targets --all-features --locked
+cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
+cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-targets --all-features --locked
 cargo test --doc --workspace --all-features --locked

@@ -132,6 +132,9 @@ pub(crate) fn run_matrix_case(
         consumed: reconciliation.consumed(),
         queued_bytes: reconciliation.queued_bytes(),
         record_reservations: 0,
+        queue_private_storage_bytes: reconciliation.queue_private_storage_bytes(),
+        fixed_capture_bytes: reconciliation.fixed_capture_bytes(),
+        total_accounted_bytes: reconciliation.total_accounted_bytes(),
         accounting_invariant_failures: reconciliation.accounting_invariant_failures(),
     };
     let deferred_samples = reconciliation.into_samples();
@@ -173,7 +176,7 @@ pub(crate) fn run_matrix_case(
         outcomes: OutcomeCounts {
             accepted: completed,
             queue_full: 0,
-            queue_contended: 0,
+            queue_invariant: 0,
         },
         post_drain,
         elapsed_nanos,
@@ -350,7 +353,7 @@ pub(crate) fn run_sustained(
             outcomes: OutcomeCounts {
                 accepted: scoped.0,
                 queue_full: scoped.1,
-                queue_contended: 0,
+                queue_invariant: 0,
             },
             active_rss_samples: rss_samples[rss_before_epoch..].to_vec(),
             post_drain_rss_bytes,
@@ -359,6 +362,9 @@ pub(crate) fn run_sustained(
                 consumed: reconciled.consumed(),
                 queued_bytes: reconciled.queued_bytes(),
                 record_reservations: 0,
+                queue_private_storage_bytes: reconciled.queue_private_storage_bytes(),
+                fixed_capture_bytes: reconciled.fixed_capture_bytes(),
+                total_accounted_bytes: reconciled.total_accounted_bytes(),
                 accounting_invariant_failures: reconciled.accounting_invariant_failures(),
             },
         });
@@ -379,7 +385,7 @@ pub(crate) fn run_sustained(
         rss_interval_nanos: u64::try_from(rss_interval.as_nanos())?,
         accepted,
         queue_full,
-        queue_contended: 0,
+        queue_invariant: 0,
         elapsed_nanos: u64::try_from(total_started.elapsed().as_nanos())?,
         rss_samples,
         epochs,

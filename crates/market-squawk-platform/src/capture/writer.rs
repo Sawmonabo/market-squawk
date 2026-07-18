@@ -1,5 +1,7 @@
 //! Supervised capture-sink storage outside the live event-to-action path.
 
+#[cfg(feature = "capture-benchmark")]
+mod benchmark;
 mod destination;
 #[cfg(not(test))]
 mod lifecycle;
@@ -18,10 +20,15 @@ use thiserror::Error;
 
 use super::accounting::CaptureAccountingError;
 use super::queue::{RecvTimeoutError, TryRecvError};
+use super::transport::{CaptureQueueReceiver, CaptureQueueTransport};
 use super::{
-    CaptureHealthReason, CaptureIdentitySnapshot, CaptureMessage, CaptureState,
+    CaptureHealthReason, CaptureIdentitySnapshot, CaptureMessage, CaptureState, CaptureWriterCore,
     CaptureWriterPolicy, CapturedRawRecord, GenerationCaptureState, RawCaptureWriter,
     WRITER_NOT_STARTED, WRITER_RUNNING,
+};
+#[cfg(feature = "capture-benchmark")]
+pub(super) use benchmark::{
+    BenchmarkCaptureWriterHandle, BenchmarkCaptureWriterShutdown, spawn_benchmark_capture_writer,
 };
 use destination::{
     CaptureDestinationLease, acquire_destination_fence, destination_lease_allocation_bytes,
@@ -277,8 +284,8 @@ fn append_frame<B: CaptureAuthorityBundle, S: CaptureSink>(
     Ok(())
 }
 
-fn try_receive<B: CaptureAuthorityBundle>(
-    writer: &RawCaptureWriter<B>,
+fn try_receive<B: CaptureAuthorityBundle, T: CaptureQueueTransport>(
+    writer: &CaptureWriterCore<B, T>,
 ) -> Result<CaptureMessage<B>, TryRecvError> {
     writer
         .receiver
@@ -287,8 +294,8 @@ fn try_receive<B: CaptureAuthorityBundle>(
         .try_recv()
 }
 
-fn receive_timeout<B: CaptureAuthorityBundle>(
-    writer: &RawCaptureWriter<B>,
+fn receive_timeout<B: CaptureAuthorityBundle, T: CaptureQueueTransport>(
+    writer: &CaptureWriterCore<B, T>,
     timeout: Duration,
 ) -> Result<CaptureMessage<B>, RecvTimeoutError> {
     writer
@@ -346,8 +353,8 @@ fn shutdown_deadline_outcome<B: CaptureAuthorityBundle>(
     }
 }
 
-fn drain_and_flush<B: CaptureAuthorityBundle, S: CaptureSink>(
-    writer: &RawCaptureWriter<B>,
+fn drain_and_flush<B: CaptureAuthorityBundle, S: CaptureSink, T: CaptureQueueTransport>(
+    writer: &CaptureWriterCore<B, T>,
     sink: &mut S,
     state: &CaptureState<B>,
     progress: &mut CaptureWriterProgress,
@@ -366,7 +373,8 @@ fn drain_and_flush<B: CaptureAuthorityBundle, S: CaptureSink>(
                     return outcome;
                 }
             }
-            Err(TryRecvError::Empty | TryRecvError::Closed) => break,
+            Err(TryRecvError::Empty) => std::thread::yield_now(),
+            Err(TryRecvError::Closed) => break,
             Err(TryRecvError::Poisoned) => {
                 return writer_failed(state, progress.records_written);
             }
@@ -391,8 +399,8 @@ fn drain_and_flush<B: CaptureAuthorityBundle, S: CaptureSink>(
     }
 }
 
-fn run_capture_writer<B: CaptureAuthorityBundle, S: CaptureSink>(
-    writer: RawCaptureWriter<B>,
+fn run_capture_writer<B: CaptureAuthorityBundle, S: CaptureSink, T: CaptureQueueTransport>(
+    writer: CaptureWriterCore<B, T>,
     mut sink: S,
     policy: CaptureWriterPolicy,
     io_context: &CaptureIoContext,
@@ -478,8 +486,8 @@ fn run_capture_writer<B: CaptureAuthorityBundle, S: CaptureSink>(
 }
 
 #[derive(Debug)]
-struct WriterSpawnPacket<B: CaptureAuthorityBundle, S: CaptureSink> {
-    writer: RawCaptureWriter<B>,
+struct WriterSpawnPacket<B: CaptureAuthorityBundle, S: CaptureSink, T: CaptureQueueTransport> {
+    writer: CaptureWriterCore<B, T>,
     sink: S,
     policy: CaptureWriterPolicy,
     io_context: CaptureIoContext,
@@ -488,7 +496,9 @@ struct WriterSpawnPacket<B: CaptureAuthorityBundle, S: CaptureSink> {
     scratch: WriterScratch,
 }
 
-impl<B: CaptureAuthorityBundle, S: CaptureSink> WriterSpawnPacket<B, S> {
+impl<B: CaptureAuthorityBundle, S: CaptureSink, T: CaptureQueueTransport>
+    WriterSpawnPacket<B, S, T>
+{
     fn run(self) {
         let lifecycle = Arc::clone(&self.io_context.lifecycle);
         let outcome = run_capture_writer(
@@ -556,6 +566,37 @@ pub fn spawn_capture_writer<B: CaptureAuthorityBundle, S: CaptureSink>(
     sink: S,
     policy: CaptureWriterPolicy,
 ) -> Result<CaptureWriterHandle<B>, CaptureWriterSpawnError> {
+    let spawned = spawn_capture_writer_core(writer.core, sink, policy)?;
+    Ok(CaptureWriterHandle {
+        thread: spawned.thread,
+        queue_control: spawned.queue_control,
+        io_context: spawned.io_context,
+        state: spawned.state,
+        destination_fence: spawned.destination_fence,
+        fixed_storage: spawned.fixed_storage,
+        completed: false,
+    })
+}
+
+#[derive(Debug)]
+struct SpawnedCaptureWriter<B: CaptureAuthorityBundle, T: CaptureQueueTransport> {
+    thread: Option<std::thread::JoinHandle<()>>,
+    queue_control: T::Control<CaptureMessage<B>>,
+    io_context: CaptureIoContext,
+    state: Arc<CaptureState<B>>,
+    destination_fence: Option<Arc<CaptureDestinationLease>>,
+    fixed_storage: Option<Arc<WriterFixedStorageOwner>>,
+}
+
+fn spawn_capture_writer_core<
+    B: CaptureAuthorityBundle,
+    S: CaptureSink,
+    T: CaptureQueueTransport,
+>(
+    writer: CaptureWriterCore<B, T>,
+    sink: S,
+    policy: CaptureWriterPolicy,
+) -> Result<SpawnedCaptureWriter<B, T>, CaptureWriterSpawnError> {
     let destination = sink.destination();
     let (worker_destination_fence, owner_destination_fence) =
         match acquire_destination_fence(writer.state.process, &destination) {
@@ -595,7 +636,7 @@ pub fn spawn_capture_writer<B: CaptureAuthorityBundle, S: CaptureSink>(
     } = prepare_writer_runtime(
         &state.accounting,
         destination_lease_bytes,
-        std::mem::size_of::<WriterSpawnPacket<B, S>>(),
+        std::mem::size_of::<WriterSpawnPacket<B, S, T>>(),
     )
     .map_err(|error| writer_runtime_error(error, ceiling))?;
     writer
@@ -627,13 +668,12 @@ pub fn spawn_capture_writer<B: CaptureAuthorityBundle, S: CaptureSink>(
             state.mark_writer_failed();
             CaptureWriterSpawnError::ThreadSpawnFailed { source }
         })?;
-    Ok(CaptureWriterHandle {
+    Ok(SpawnedCaptureWriter {
         thread: Some(thread),
         queue_control,
         io_context,
         state,
         destination_fence: Some(owner_destination_fence),
         fixed_storage: Some(fixed_storage),
-        completed: false,
     })
 }

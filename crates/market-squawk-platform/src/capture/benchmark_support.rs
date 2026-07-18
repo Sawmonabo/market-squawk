@@ -15,9 +15,70 @@ use std::num::NonZeroUsize;
 
 pub use types::{
     BenchmarkAttempt, BenchmarkAttemptOutcome, BenchmarkCaseReconciliation,
-    BenchmarkOfferedLoadOutcome, BenchmarkOfferedLoadReconciliation, BenchmarkOperation,
-    BenchmarkSupportError,
+    BenchmarkForcedLockReconciliation, BenchmarkOfferedLoadOutcome,
+    BenchmarkOfferedLoadReconciliation, BenchmarkOperation, BenchmarkSupportError,
 };
+
+/// Returns the closed identity of the queue transport monomorphized into this benchmark artifact.
+pub const fn benchmark_transport_identity() -> &'static str {
+    super::benchmark_transport_identity()
+}
+
+/// Returns how this artifact classifies its queue implementation's private storage bytes.
+///
+/// Candidate `FixedQueue` bytes are exact. Standard `sync_channel` bytes are `not_measured`
+/// because stable Rust exposes no allocator-retained byte receipt for that implementation.
+pub const fn benchmark_private_storage_accounting() -> &'static str {
+    super::benchmark_private_storage_accounting()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BenchmarkMemoryReceipt {
+    queue_private_storage_bytes: Option<usize>,
+    fixed_capture_bytes: Option<usize>,
+    total_accounted_bytes: Option<usize>,
+}
+
+fn benchmark_memory_receipt(
+    queue_private_storage_bytes: Option<usize>,
+    accounting: super::CaptureAccountingSnapshot,
+) -> Result<BenchmarkMemoryReceipt, BenchmarkSupportError> {
+    let Some(queue_private_storage_bytes) = queue_private_storage_bytes else {
+        return Ok(BenchmarkMemoryReceipt {
+            queue_private_storage_bytes: None,
+            fixed_capture_bytes: None,
+            total_accounted_bytes: None,
+        });
+    };
+    let fixed_capture_bytes = accounting.fixed_capture_bytes();
+    let total_accounted_bytes = accounting.total_accounted_bytes();
+    if queue_private_storage_bytes == 0
+        || fixed_capture_bytes < queue_private_storage_bytes
+        || total_accounted_bytes < fixed_capture_bytes
+    {
+        return Err(BenchmarkSupportError::ObservationInvariant);
+    }
+    Ok(BenchmarkMemoryReceipt {
+        queue_private_storage_bytes: Some(queue_private_storage_bytes),
+        fixed_capture_bytes: Some(fixed_capture_bytes),
+        total_accounted_bytes: Some(total_accounted_bytes),
+    })
+}
+
+/// Runs the candidate-only fixed-ring lock-contention evidence fixture.
+///
+/// This symbol is absent from the standard-reference compilation.
+#[cfg(capture_bench_backend = "candidate")]
+pub fn benchmark_candidate_forced_lock()
+-> Result<BenchmarkForcedLockReconciliation, BenchmarkSupportError> {
+    queue::run_candidate_forced_lock()
+}
+
+#[cfg(test)]
+fn run_candidate_forced_lock_for_test()
+-> Result<BenchmarkForcedLockReconciliation, BenchmarkSupportError> {
+    queue::run_candidate_forced_lock()
+}
 
 #[derive(Debug)]
 enum ProducerFactory {
@@ -35,13 +96,6 @@ enum ProducerWorker {
 enum PreparedWorker {
     Queue(queue::PreparedQueueOperation),
     Capture(capture_case::PreparedCaptureOperation),
-}
-
-#[cfg(test)]
-#[derive(Debug, Eq, PartialEq)]
-enum BenchmarkConcurrentAttemptOutcome {
-    Accepted(BenchmarkAttempt),
-    Contended,
 }
 
 #[derive(Debug)]
@@ -170,7 +224,7 @@ impl BenchmarkCase {
         self.effective_capacity
     }
 
-    /// Duplicates one producer using the selected standard backend's explicit fallible seam.
+    /// Duplicates one producer through the selected transport's explicit fallible seam.
     pub fn try_producer(&self) -> Result<BenchmarkProducer, BenchmarkSupportError> {
         let worker = match &self.producer_factory {
             ProducerFactory::Queue(factory) => ProducerWorker::Queue(factory.try_producer()?),
@@ -222,16 +276,6 @@ impl BenchmarkPreparedOperation {
             PreparedWorker::Capture(capture) => capture.execute(),
         }
     }
-
-    #[cfg(test)]
-    fn execute_concurrent_for_test(
-        self,
-    ) -> Result<BenchmarkConcurrentAttemptOutcome, BenchmarkSupportError> {
-        match self.worker {
-            PreparedWorker::Queue(queue) => queue.execute_concurrent_for_test(),
-            PreparedWorker::Capture(_capture) => Err(BenchmarkSupportError::InvalidFixture),
-        }
-    }
 }
 
 impl BenchmarkOfferedLoadCase {
@@ -250,7 +294,7 @@ impl BenchmarkOfferedLoadCase {
             .with_receiver_paused_for_test(action)
     }
 
-    /// Prepares a real standard capture queue without successful-operation capacity permits.
+    /// Prepares the selected real bounded queue without successful-operation capacity permits.
     pub fn try_new(
         payload_bytes: usize,
         queue_depth: NonZeroUsize,
@@ -292,7 +336,7 @@ impl BenchmarkOfferedLoadProducer {
     }
 }
 
-/// Executes the real depth-one standard queue's deterministic full refusal fixture.
+/// Executes the selected real depth-one queue's deterministic full-refusal fixture.
 pub fn verify_comparable_full() -> Result<(), BenchmarkSupportError> {
     queue::verify_comparable_full()
 }

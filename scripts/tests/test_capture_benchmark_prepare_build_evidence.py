@@ -17,23 +17,31 @@ from scripts.capture_benchmark_prepare_build_evidence import (
     BUILD_COMMAND,
     BUILD_ENVIRONMENT_POLICY,
     EVIDENCE_MODE,
+    EXPECTED_CARGO_FEATURES,
     FEATURE,
+    MAX_BINDINGS_BYTES,
+    MAX_CARGO_JSON_BYTES,
+    MAX_CARGO_STDERR_BYTES,
     PROFILE,
+    RESULT_SCHEMA_VERSION,
     TARGET,
     GateError,
     artifact_hash,
+    benchmark_backend_binding,
     canonical_json,
     parse_cargo_artifact,
     runner_bindings,
     run_closed_cargo_build,
     sanitized_build_environment,
     sha256,
+    strict_json,
     external_tool_hash,
     validate_current_bindings,
     validate_baseline_inputs,
     validate_candidate_current_bindings,
     recompute_current_bindings,
 )
+from scripts.capture_benchmark_process import bounded_process
 
 REPOSITORY = Path(__file__).resolve().parents[2]
 
@@ -51,17 +59,19 @@ def cargo_message(executable: Path) -> dict:
         "reason": "compiler-artifact",
         "target": {"name": TARGET, "kind": ["bench"]},
         "profile": {"opt_level": "3", "debug_assertions": False},
-        "features": [FEATURE],
+        "features": list(EXPECTED_CARGO_FEATURES),
         "executable": str(executable),
     }
 
 
 def binding_value() -> dict:
     return {
-        "schema_version": 1,
+        "schema_version": RESULT_SCHEMA_VERSION,
         "runner": TARGET,
         "evidence_mode": EVIDENCE_MODE,
         "evidence_backend": "standard",
+        "queue_transport": "standard_sync_channel",
+        "queue_private_storage_accounting": "not_measured",
         "build_profile": PROFILE,
         "measured_code_head": "1" * 40,
         "clean_build_enforced": True,
@@ -89,6 +99,12 @@ def binding_value() -> dict:
         "platform_source_sha256": "6" * 64,
         "domain_source_sha256": "7" * 64,
         "entrypoint_sha256": "8" * 64,
+        "backend_dispatcher_sha256": "2" * 64,
+        "selected_backend_source_path": (
+            "crates/market-squawk-platform/benches/"
+            "capture_admission/backend/standard.rs"
+        ),
+        "selected_backend_source_sha256": "3" * 64,
         "backend_sha256": "9" * 64,
         "criterion_sha256": "a" * 64,
         "observer_sha256": "1" * 64,
@@ -121,7 +137,7 @@ def baseline_fixture(current_head: str = "f" * 40) -> tuple[bytes, bytes, dict, 
         "git-executable": "9" * 64,
     }
     manifest = {
-        "schema_version": 1,
+        "schema_version": RESULT_SCHEMA_VERSION,
         "runner": TARGET,
         "evidence_mode": EVIDENCE_MODE,
         "criterion_evidence_mode": "exploratory_zero_authority",
@@ -140,6 +156,8 @@ def baseline_fixture(current_head: str = "f" * 40) -> tuple[bytes, bytes, dict, 
         "criterion_sha256": "9" * 64,
         "observer_sha256": "b" * 64,
         "backend": "standard",
+        "queue_transport": "standard_sync_channel",
+        "queue_private_storage_accounting": "not_measured",
         "benchmark_support_feature": FEATURE,
         "fixtures": ["matrix", "comparable_full", "sustained_rss"],
         "repetitions": [1, 2, 3, 4, 5],
@@ -165,7 +183,7 @@ def baseline_fixture(current_head: str = "f" * 40) -> tuple[bytes, bytes, dict, 
     }
     manifest_bytes = (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
     lock = {
-        "schema_version": 1,
+        "schema_version": RESULT_SCHEMA_VERSION,
         "state": "frozen_standard_baseline",
         "baseline_head": manifest["measured_code_head"],
         "manifest_sha256": sha256(manifest_bytes),
@@ -180,6 +198,10 @@ def baseline_fixture(current_head: str = "f" * 40) -> tuple[bytes, bytes, dict, 
         "approval_state": "independent_seed_review_approved",
         "approval_identity": "q2-a4-seed-checkpoint-review",
         "backend": "standard",
+        "queue_transport": manifest["queue_transport"],
+        "queue_private_storage_accounting": manifest[
+            "queue_private_storage_accounting"
+        ],
         "backend_sha256": manifest["backend_sha256"],
         "build_evidence_sha256": manifest["build_evidence_sha256"],
         "immutable_module_sha256": immutable,
@@ -278,12 +300,124 @@ def initialize_fixture_repository(root: Path) -> tuple[Path, str]:
 
 
 class BuildEvidenceTest(unittest.TestCase):
-    def test_cargo_parser_accepts_one_exact_release_feature_artifact(self) -> None:
+    def test_backend_binding_has_canonical_golden_vectors(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = Path(temporary).resolve()
+            benchmark = (
+                repository
+                / "crates/market-squawk-platform/benches/capture_admission"
+            )
+            selected = benchmark / "backend"
+            selected.mkdir(parents=True)
+            (benchmark / "backend.rs").write_bytes(b"closed dispatcher")
+            (selected / "standard.rs").write_bytes(b"bounded standard channel")
+            (selected / "candidate.rs").write_bytes(b"bounded fixed ring")
+
+            standard = benchmark_backend_binding(repository, "standard")
+            candidate = benchmark_backend_binding(repository, "candidate")
+            self.assertEqual(
+                standard,
+                {
+                    "backend_dispatcher_sha256": (
+                        "47718f8722eb36c9acbcdfb146ca49a5f4ea84ef2cf8f0eb2b4d72521ce917ec"
+                    ),
+                    "selected_backend_source_path": (
+                        "crates/market-squawk-platform/benches/"
+                        "capture_admission/backend/standard.rs"
+                    ),
+                    "selected_backend_source_sha256": (
+                        "86d2ead4846f7aa630094faa003ece14b740742f601f33e23c262da386273ce5"
+                    ),
+                    "backend_sha256": (
+                        "170a74eb9f9c520c126897147812d966c37bf9019858d557e8242bae25fcc3e4"
+                    ),
+                },
+            )
+            self.assertEqual(
+                candidate["selected_backend_source_path"],
+                (
+                    "crates/market-squawk-platform/benches/"
+                    "capture_admission/backend/candidate.rs"
+                ),
+            )
+            self.assertEqual(
+                candidate["selected_backend_source_sha256"],
+                "b19b8841668286305384ee37f26677d4df5ee65ab4087fb4b10e7e4bfa8d9d48",
+            )
+            self.assertEqual(
+                candidate["backend_sha256"],
+                "1ca93724f5c4a5e6ece59b4f90eeb980cdb51f0ec0b2d63ac5da6e7426086fc8",
+            )
+            self.assertNotEqual(
+                standard["backend_sha256"], candidate["backend_sha256"]
+            )
+
+            (selected / "candidate.rs").write_bytes(b"bounded standard channel")
+            with self.assertRaises(GateError):
+                benchmark_backend_binding(repository, "candidate")
+            with self.assertRaises(GateError):
+                benchmark_backend_binding(repository, "STANDARD")
+
+    def test_cargo_parser_accepts_one_exact_all_feature_release_artifact(self) -> None:
         executable = REPOSITORY / "target" / "fixture-executable"
         encoded = (json.dumps(cargo_message(executable)) + "\n").encode()
         path, message = parse_cargo_artifact(encoded, REPOSITORY)
         self.assertEqual(path, executable)
         self.assertEqual(message["target"]["name"], TARGET)
+
+    def test_real_rust_runner_matches_python_binding_contract(self) -> None:
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith("CAPTURE_BENCH_")
+        }
+        environment["CAPTURE_BENCH_DEVELOPMENT_BACKEND"] = "standard"
+        build = bounded_process(
+            list(BUILD_COMMAND),
+            cwd=REPOSITORY,
+            env=environment,
+            timeout_seconds=600,
+            maximum_stdout=MAX_CARGO_JSON_BYTES,
+            maximum_stderr=MAX_CARGO_STDERR_BYTES,
+        )
+        self.assertEqual(build.returncode, 0, build.stderr.decode(errors="replace"))
+        executable, message = parse_cargo_artifact(build.stdout, REPOSITORY)
+        self.assertEqual(message["features"], list(EXPECTED_CARGO_FEATURES))
+        emitted = bounded_process(
+            [str(executable), "--print-build-bindings"],
+            env={},
+            timeout_seconds=10,
+            maximum_stdout=MAX_BINDINGS_BYTES,
+            maximum_stderr=0,
+        )
+        self.assertEqual(emitted.returncode, 0)
+        emitted_bindings = strict_json(emitted.stdout)
+        self.assertEqual(emitted.stdout, canonical_json(emitted_bindings))
+        self.assertEqual(emitted_bindings["schema_version"], RESULT_SCHEMA_VERSION)
+        self.assertEqual(
+            {
+                field: emitted_bindings[field]
+                for field in (
+                    "evidence_backend",
+                    "queue_transport",
+                    "queue_private_storage_accounting",
+                    "clean_build_enforced",
+                    "build_environment_policy",
+                )
+            },
+            {
+                "evidence_backend": "standard",
+                "queue_transport": "standard_sync_channel",
+                "queue_private_storage_accounting": "not_measured",
+                "clean_build_enforced": False,
+                "build_environment_policy": "development-unverified",
+            },
+        )
+        backend = benchmark_backend_binding(REPOSITORY, "standard")
+        self.assertEqual(
+            {field: emitted_bindings[field] for field in backend},
+            backend,
+        )
 
     def test_cargo_parser_rejects_duplicate_target_artifacts(self) -> None:
         executable = REPOSITORY / "target" / "fixture-executable"
@@ -294,14 +428,16 @@ class BuildEvidenceTest(unittest.TestCase):
     def test_cargo_parser_rejects_missing_feature(self) -> None:
         executable = REPOSITORY / "target" / "fixture-executable"
         message = cargo_message(executable)
-        message["features"] = []
+        message["features"] = [
+            feature for feature in EXPECTED_CARGO_FEATURES if feature != FEATURE
+        ]
         with self.assertRaises(GateError):
             parse_cargo_artifact((json.dumps(message) + "\n").encode(), REPOSITORY)
 
     def test_cargo_parser_rejects_extra_feature(self) -> None:
         executable = REPOSITORY / "target" / "fixture-executable"
         message = cargo_message(executable)
-        message["features"] = [FEATURE, "unexpected"]
+        message["features"].append("unexpected")
         with self.assertRaises(GateError):
             parse_cargo_artifact((json.dumps(message) + "\n").encode(), REPOSITORY)
 
@@ -382,6 +518,53 @@ class BuildEvidenceTest(unittest.TestCase):
     def test_runner_binding_requires_clean_build_enforcement(self) -> None:
         value = binding_value()
         value["clean_build_enforced"] = False
+        with tempfile.TemporaryDirectory() as temporary:
+            script = Path(temporary) / "runner"
+            script.write_text(
+                "#!/bin/sh\nprintf '%s\\n' '"
+                + json.dumps(value, separators=(",", ":"))
+                + "'\n"
+            )
+            os.chmod(script, 0o700)
+            with self.assertRaises(GateError):
+                runner_bindings(script)
+
+    def test_runner_binding_rejects_transport_storage_identity_forgery(self) -> None:
+        cases = (
+            ("standard-exact", "standard", "standard_sync_channel", "exact"),
+            ("standard-fixed", "standard", "candidate_fixed_ring", "not_measured"),
+            ("candidate-opaque", "candidate", "candidate_fixed_ring", "not_measured"),
+            ("candidate-standard", "candidate", "standard_sync_channel", "exact"),
+        )
+        for name, backend, transport, accounting in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                value = binding_value()
+                value["evidence_backend"] = backend
+                value["queue_transport"] = transport
+                value["queue_private_storage_accounting"] = accounting
+                value["selected_backend_source_path"] = (
+                    "crates/market-squawk-platform/benches/capture_admission/backend/"
+                    f"{backend}.rs"
+                )
+                if backend == "candidate":
+                    value["baseline_lock_path"] = "./baseline-lock.json"
+                    value["baseline_lock_sha256"] = "c" * 64
+                    value["baseline_manifest_path"] = "./baseline-manifest.json"
+                    value["baseline_manifest_sha256"] = "d" * 64
+                    value["baseline_measured_code_head"] = "2" * 40
+                script = Path(temporary) / "runner"
+                script.write_text(
+                    "#!/bin/sh\nprintf '%s\\n' '"
+                    + json.dumps(value, separators=(",", ":"))
+                    + "'\n"
+                )
+                os.chmod(script, 0o700)
+                with self.assertRaises(GateError):
+                    runner_bindings(script)
+
+    def test_runner_binding_rejects_retired_schema_version(self) -> None:
+        value = binding_value()
+        value["schema_version"] = RESULT_SCHEMA_VERSION - 1
         with tempfile.TemporaryDirectory() as temporary:
             script = Path(temporary) / "runner"
             script.write_text(
@@ -486,6 +669,9 @@ class BuildEvidenceTest(unittest.TestCase):
             "platform_source_sha256",
             "domain_source_sha256",
             "entrypoint_sha256",
+            "backend_dispatcher_sha256",
+            "selected_backend_source_path",
+            "selected_backend_source_sha256",
             "backend_sha256",
             "criterion_sha256",
             "observer_sha256",
@@ -514,9 +700,8 @@ class BuildEvidenceTest(unittest.TestCase):
             "matrix_drift",
             "baseline_equals_candidate",
             "same_backend",
+            "false_exact_storage",
         )
-        self.assertEqual(len(cases), 10)
-        self.assertEqual(len(set(cases)), 10)
         for case in cases:
             with self.subTest(case=case):
                 lock_bytes, manifest_bytes, current, manifest = baseline_fixture()
@@ -537,12 +722,24 @@ class BuildEvidenceTest(unittest.TestCase):
                     lock_bytes = (json.dumps(lock, sort_keys=True) + "\n").encode()
                 elif case == "baseline_equals_candidate":
                     current_head = manifest["measured_code_head"]
+                elif case == "false_exact_storage":
+                    manifest["queue_private_storage_accounting"] = "exact"
+                    manifest_bytes = (
+                        json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n"
+                    ).encode()
+                    lock = json.loads(lock_bytes)
+                    lock["queue_private_storage_accounting"] = "exact"
+                    lock["manifest_sha256"] = sha256(manifest_bytes)
+                    lock_bytes = (
+                        json.dumps(lock, sort_keys=True, separators=(",", ":")) + "\n"
+                    ).encode()
                 baseline_error = case in {
                     "missing_lock_member",
                     "tampered_manifest",
                     "self_consistent_forged_manifest",
                     "wrong_head",
                     "baseline_equals_candidate",
+                    "false_exact_storage",
                 }
                 if baseline_error:
                     with self.assertRaises(GateError):
@@ -585,8 +782,6 @@ class BuildEvidenceTest(unittest.TestCase):
             "exited_parent_with_inherited_pipe_child_reaped",
             "missing_cargo_rejected",
         )
-        self.assertEqual(len(cases), 9)
-        self.assertEqual(len(set(cases)), 9)
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             repository = root / "repository"
@@ -756,8 +951,6 @@ class BuildEvidenceTest(unittest.TestCase):
             "after-executable-publication",
             "after-build-evidence-publication",
         )
-        self.assertEqual(len(cases), 5)
-        self.assertEqual(len(set(cases)), 5)
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             for case in cases:

@@ -5,6 +5,8 @@ use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
+use sha2::{Digest, Sha256};
+
 #[path = "build_support/filesystem.rs"]
 mod filesystem;
 #[path = "build_support/reader.rs"]
@@ -35,6 +37,156 @@ const MAXIMUM_CLEANUP_GRACE_MILLIS: u64 = PROCESS_GROUP_TERM_GRACE_MILLIS
     + LEADER_REAP_GRACE_MILLIS
     + PIPE_READER_GRACE_MILLIS;
 const MAXIMUM_CLEANUP_GRACE: Duration = Duration::from_millis(MAXIMUM_CLEANUP_GRACE_MILLIS);
+const BACKEND_DISPATCHER_RELATIVE_PATH: &str = "benches/capture_admission/backend.rs";
+const STANDARD_BACKEND_RELATIVE_PATH: &str = "benches/capture_admission/backend/standard.rs";
+const CANDIDATE_BACKEND_RELATIVE_PATH: &str = "benches/capture_admission/backend/candidate.rs";
+const BACKEND_DIGEST_DOMAIN: &[u8] = b"market-squawk:capture-benchmark-backend:v1\0";
+
+/// Closed compile-time identity for the capture benchmark implementation under measurement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BenchmarkBackend {
+    Standard,
+    Candidate,
+}
+
+impl BenchmarkBackend {
+    pub(crate) fn parse(value: &str) -> Result<Self, &'static str> {
+        match value {
+            "standard" => Ok(Self::Standard),
+            "candidate" => Ok(Self::Candidate),
+            _ => Err("capture benchmark backend is not a closed identity"),
+        }
+    }
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Candidate => "candidate",
+        }
+    }
+
+    const fn selected_source_relative_path(self) -> &'static str {
+        match self {
+            Self::Standard => STANDARD_BACKEND_RELATIVE_PATH,
+            Self::Candidate => CANDIDATE_BACKEND_RELATIVE_PATH,
+        }
+    }
+}
+
+/// Selects exactly one backend for the current compilation.
+///
+/// Development builds are pinned to the standard reference and reject ambient selection. An
+/// authoritative build must explicitly provide one closed identity through its sanitized build
+/// environment.
+pub(crate) fn select_benchmark_backend(
+    authoritative: bool,
+    evidence_backend: Option<&str>,
+    development_backend: Option<&str>,
+) -> Result<BenchmarkBackend, &'static str> {
+    match (authoritative, evidence_backend, development_backend) {
+        (false, None, None) => Ok(BenchmarkBackend::Standard),
+        (false, None, Some(value)) => BenchmarkBackend::parse(value),
+        (false, Some(_), _) => Err("development build forbids the evidence backend variable"),
+        (true, Some(value), None) => BenchmarkBackend::parse(value),
+        (true, None, None) => Err("authoritative build requires an explicit benchmark backend"),
+        (true, _, Some(_)) => Err("authoritative build forbids the development backend variable"),
+    }
+}
+
+/// Immutable digest binding for the dispatcher and the one compile-time-selected backend source.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BenchmarkBackendSourceBinding {
+    backend: BenchmarkBackend,
+    dispatcher_sha256: String,
+    selected_source_relative_path: &'static str,
+    selected_source_sha256: String,
+    backend_sha256: String,
+}
+
+impl BenchmarkBackendSourceBinding {
+    pub(crate) const fn backend(&self) -> BenchmarkBackend {
+        self.backend
+    }
+
+    pub(crate) fn dispatcher_sha256(&self) -> &str {
+        &self.dispatcher_sha256
+    }
+
+    pub(crate) const fn selected_source_relative_path(&self) -> &'static str {
+        self.selected_source_relative_path
+    }
+
+    pub(crate) fn selected_source_sha256(&self) -> &str {
+        &self.selected_source_sha256
+    }
+
+    pub(crate) fn backend_sha256(&self) -> &str {
+        &self.backend_sha256
+    }
+}
+
+/// Binds the immutable dispatcher and selected implementation using bounded descriptor hashes.
+///
+/// Both implementation sources are read even though only one is selected. This rejects an aliased
+/// or byte-identical candidate/reference pair before either can become benchmark evidence.
+pub(crate) fn bind_benchmark_backend_sources(
+    package_root: &Path,
+    backend: BenchmarkBackend,
+    maximum_source_bytes: u64,
+) -> Result<BenchmarkBackendSourceBinding, Box<dyn Error>> {
+    let dispatcher_sha256 = hash_regular_file(
+        &package_root.join(BACKEND_DISPATCHER_RELATIVE_PATH),
+        maximum_source_bytes,
+    )?;
+    let standard_sha256 = hash_regular_file(
+        &package_root.join(STANDARD_BACKEND_RELATIVE_PATH),
+        maximum_source_bytes,
+    )?;
+    let candidate_sha256 = hash_regular_file(
+        &package_root.join(CANDIDATE_BACKEND_RELATIVE_PATH),
+        maximum_source_bytes,
+    )?;
+    if standard_sha256 == candidate_sha256 {
+        return Err("capture benchmark backend sources are byte-identical".into());
+    }
+    let selected_source_sha256 = match backend {
+        BenchmarkBackend::Standard => standard_sha256,
+        BenchmarkBackend::Candidate => candidate_sha256,
+    };
+    let selected_source_relative_path = backend.selected_source_relative_path();
+    let mut digest = Sha256::new();
+    digest.update(BACKEND_DIGEST_DOMAIN);
+    update_backend_digest_component(
+        &mut digest,
+        BACKEND_DISPATCHER_RELATIVE_PATH.as_bytes(),
+        dispatcher_sha256.as_bytes(),
+    )?;
+    update_backend_digest_component(
+        &mut digest,
+        selected_source_relative_path.as_bytes(),
+        selected_source_sha256.as_bytes(),
+    )?;
+    update_backend_digest_component(&mut digest, b"identity", backend.as_str().as_bytes())?;
+    Ok(BenchmarkBackendSourceBinding {
+        backend,
+        dispatcher_sha256,
+        selected_source_relative_path,
+        selected_source_sha256,
+        backend_sha256: format!("{:x}", digest.finalize()),
+    })
+}
+
+fn update_backend_digest_component(
+    digest: &mut Sha256,
+    label: &[u8],
+    value: &[u8],
+) -> Result<(), Box<dyn Error>> {
+    digest.update(u64::try_from(label.len())?.to_le_bytes());
+    digest.update(label);
+    digest.update(u64::try_from(value.len())?.to_le_bytes());
+    digest.update(value);
+    Ok(())
+}
 
 #[derive(Debug)]
 pub(crate) struct BoundedOutput {
@@ -457,7 +609,13 @@ fn wait_for_test_readiness(
     #[cfg(test)]
     {
         let path = readiness.ok_or("injected command failure is missing its readiness path")?;
-        while !path.is_file() {
+        // Creation and population are separate filesystem operations. Seeing the pathname alone
+        // can race the writer between `open(O_CREAT)` and its first write, which would inject the
+        // fault before the fixture has published the descendant identity needed to prove cleanup.
+        while !path
+            .metadata()
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
+        {
             if Instant::now() >= deadline {
                 return Err(
                     "test command did not become ready before its execution deadline".into(),

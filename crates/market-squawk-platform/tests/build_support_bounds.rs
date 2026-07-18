@@ -14,6 +14,86 @@ use tempfile::tempdir;
 static BOUNDED_COMMAND_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
+fn benchmark_backend_selection_is_closed_and_binds_distinct_sources()
+-> Result<(), Box<dyn std::error::Error>> {
+    use build_support::{BenchmarkBackend, bind_benchmark_backend_sources};
+
+    assert_eq!(
+        BenchmarkBackend::parse("standard")?,
+        BenchmarkBackend::Standard
+    );
+    assert_eq!(
+        BenchmarkBackend::parse("candidate")?,
+        BenchmarkBackend::Candidate
+    );
+    assert!(BenchmarkBackend::parse("STANDARD").is_err());
+    assert!(BenchmarkBackend::parse("standard,candidate").is_err());
+    assert!(BenchmarkBackend::parse("").is_err());
+
+    let package = tempdir()?;
+    let benchmark = package.path().join("benches/capture_admission");
+    let selected = benchmark.join("backend");
+    fs::create_dir_all(&selected)?;
+    fs::write(benchmark.join("backend.rs"), b"closed dispatcher")?;
+    fs::write(selected.join("standard.rs"), b"bounded standard channel")?;
+    fs::write(selected.join("candidate.rs"), b"bounded fixed ring")?;
+
+    let standard =
+        bind_benchmark_backend_sources(package.path(), BenchmarkBackend::Standard, 4_096)?;
+    let candidate =
+        bind_benchmark_backend_sources(package.path(), BenchmarkBackend::Candidate, 4_096)?;
+    assert_eq!(standard.backend(), BenchmarkBackend::Standard);
+    assert_eq!(candidate.backend(), BenchmarkBackend::Candidate);
+    assert_eq!(
+        standard.selected_source_relative_path(),
+        "benches/capture_admission/backend/standard.rs"
+    );
+    assert_eq!(
+        candidate.selected_source_relative_path(),
+        "benches/capture_admission/backend/candidate.rs"
+    );
+    assert_ne!(
+        standard.selected_source_sha256(),
+        candidate.selected_source_sha256()
+    );
+    assert_ne!(standard.backend_sha256(), candidate.backend_sha256());
+    assert_eq!(standard.dispatcher_sha256(), candidate.dispatcher_sha256());
+
+    fs::write(selected.join("candidate.rs"), b"bounded standard channel")?;
+    assert!(
+        bind_benchmark_backend_sources(package.path(), BenchmarkBackend::Candidate, 4_096).is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn benchmark_backend_environment_selection_is_closed() {
+    use build_support::{BenchmarkBackend, select_benchmark_backend};
+
+    assert_eq!(
+        select_benchmark_backend(false, None, None),
+        Ok(BenchmarkBackend::Standard)
+    );
+    assert_eq!(
+        select_benchmark_backend(false, None, Some("candidate")),
+        Ok(BenchmarkBackend::Candidate)
+    );
+    assert!(select_benchmark_backend(false, Some("candidate"), None).is_err());
+    assert!(select_benchmark_backend(false, None, Some("standard,candidate")).is_err());
+    assert_eq!(
+        select_benchmark_backend(true, Some("standard"), None),
+        Ok(BenchmarkBackend::Standard)
+    );
+    assert_eq!(
+        select_benchmark_backend(true, Some("candidate"), None),
+        Ok(BenchmarkBackend::Candidate)
+    );
+    assert!(select_benchmark_backend(true, None, None).is_err());
+    assert!(select_benchmark_backend(true, Some("standard,candidate"), None).is_err());
+    assert!(select_benchmark_backend(true, Some("standard"), Some("candidate")).is_err());
+}
+
+#[test]
 fn descriptor_hash_rejects_oversized_and_symlink_inputs() -> Result<(), Box<dyn std::error::Error>>
 {
     let directory = tempdir()?;

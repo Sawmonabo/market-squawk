@@ -7,7 +7,7 @@ use thiserror::Error;
 pub enum BenchmarkOperation {
     /// Standard capture queue nonblocking send.
     QueuePush,
-    /// Single-writer standard capture queue nonblocking receive.
+    /// Single-writer selected capture queue nonblocking receive.
     QueuePop,
     /// Complete validated publisher admission.
     CaptureAdmission,
@@ -24,7 +24,7 @@ pub enum BenchmarkAttemptOutcome {
     Accepted,
 }
 
-/// Result of one unthrottled offer to the real bounded standard capture queue.
+/// Result of one unthrottled offer to the selected real bounded capture queue.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BenchmarkOfferedLoadOutcome {
     /// The queue accepted the complete capture message.
@@ -39,7 +39,59 @@ pub struct BenchmarkOfferedLoadReconciliation {
     pub(super) accepted: usize,
     pub(super) consumed: usize,
     pub(super) queued_bytes: usize,
+    pub(super) queue_private_storage_bytes: Option<usize>,
+    pub(super) fixed_capture_bytes: Option<usize>,
+    pub(super) total_accounted_bytes: Option<usize>,
     pub(super) accounting_invariant_failures: u64,
+}
+
+/// Exact candidate-only proof that one real fixed-ring send observed a held queue lock.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BenchmarkForcedLockReconciliation {
+    pub(super) slot_lock_unavailable: usize,
+    pub(super) accepted: usize,
+    pub(super) consumed: usize,
+    pub(super) queued_bytes: usize,
+    pub(super) record_reservations: Option<usize>,
+    pub(super) queue_private_storage_bytes: usize,
+    pub(super) accounting_invariant_failures: u64,
+}
+
+impl BenchmarkForcedLockReconciliation {
+    /// Returns the exact number of adversarial attempts that observed the held next-slot lock.
+    pub const fn slot_lock_unavailable(self) -> usize {
+        self.slot_lock_unavailable
+    }
+
+    /// Returns the number of accepted queue operations.
+    pub const fn accepted(self) -> usize {
+        self.accepted
+    }
+
+    /// Returns the number of drained queue operations.
+    pub const fn consumed(self) -> usize {
+        self.consumed
+    }
+
+    /// Returns the post-proof queued byte count.
+    pub const fn queued_bytes(self) -> usize {
+        self.queued_bytes
+    }
+
+    /// Returns the post-proof reservation count when the accounting core exposes one.
+    pub const fn record_reservations(self) -> Option<usize> {
+        self.record_reservations
+    }
+
+    /// Returns the allocator-observed retained bytes for the proven fixed-ring allocation.
+    pub const fn queue_private_storage_bytes(self) -> usize {
+        self.queue_private_storage_bytes
+    }
+
+    /// Returns fixed-ring accounting invariant failures.
+    pub const fn accounting_invariant_failures(self) -> u64 {
+        self.accounting_invariant_failures
+    }
 }
 
 /// Exact terminal accounting and immutable-observer samples for one named-operation case.
@@ -49,6 +101,9 @@ pub struct BenchmarkCaseReconciliation {
     pub(super) consumed: usize,
     pub(super) deferred_samples: Vec<u64>,
     pub(super) queued_bytes: usize,
+    pub(super) queue_private_storage_bytes: Option<usize>,
+    pub(super) fixed_capture_bytes: Option<usize>,
+    pub(super) total_accounted_bytes: Option<usize>,
     pub(super) accounting_invariant_failures: u64,
 }
 
@@ -66,6 +121,21 @@ impl BenchmarkCaseReconciliation {
     /// Returns the post-drain queued-byte reservation.
     pub const fn queued_bytes(&self) -> usize {
         self.queued_bytes
+    }
+
+    /// Returns exact private queue bytes, or `None` for the opaque standard reference.
+    pub const fn queue_private_storage_bytes(&self) -> Option<usize> {
+        self.queue_private_storage_bytes
+    }
+
+    /// Returns exact fixed capture-graph bytes, or `None` when any component is opaque.
+    pub const fn fixed_capture_bytes(&self) -> Option<usize> {
+        self.fixed_capture_bytes
+    }
+
+    /// Returns exact total accounted bytes, or `None` when any component is opaque.
+    pub const fn total_accounted_bytes(&self) -> Option<usize> {
+        self.total_accounted_bytes
     }
 
     /// Returns the post-drain accounting invariant failure count.
@@ -93,6 +163,21 @@ impl BenchmarkOfferedLoadReconciliation {
     /// Returns the post-drain queued-byte reservation.
     pub const fn queued_bytes(self) -> usize {
         self.queued_bytes
+    }
+
+    /// Returns exact private queue bytes, or `None` for the opaque standard reference.
+    pub const fn queue_private_storage_bytes(self) -> Option<usize> {
+        self.queue_private_storage_bytes
+    }
+
+    /// Returns exact fixed capture-graph bytes, or `None` when any component is opaque.
+    pub const fn fixed_capture_bytes(self) -> Option<usize> {
+        self.fixed_capture_bytes
+    }
+
+    /// Returns exact total accounted bytes, or `None` when any component is opaque.
+    pub const fn total_accounted_bytes(self) -> Option<usize> {
+        self.total_accounted_bytes
     }
 
     /// Returns the post-drain accounting invariant failure count.

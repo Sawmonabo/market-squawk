@@ -129,10 +129,12 @@ def build_evidence_value(backend: str) -> dict:
     digest = "a" * 64
     candidate = backend == "candidate"
     value = {
-        "schema_version": 1,
+        "schema_version": measured.RUNNER_SCHEMA_VERSION,
         "runner": "capture_admission_evidence",
         "evidence_mode": "diagnostic_fixed_quota",
         "evidence_backend": backend,
+        "queue_transport": "candidate_fixed_ring" if candidate else "standard_sync_channel",
+        "queue_private_storage_accounting": "exact" if candidate else "not_measured",
         "cargo_target": "capture_admission_evidence",
         "benchmark_feature": "capture-benchmark",
         "build_profile": schema.PROFILE,
@@ -189,6 +191,12 @@ def build_evidence_value(backend: str) -> dict:
         "platform_source_sha256": digest,
         "domain_source_sha256": digest,
         "entrypoint_sha256": digest,
+        "backend_dispatcher_sha256": digest,
+        "selected_backend_source_path": (
+            "crates/market-squawk-platform/benches/capture_admission/backend/"
+            f"{backend}.rs"
+        ),
+        "selected_backend_source_sha256": digest,
         "backend_sha256": digest,
         "criterion_sha256": digest,
         "observer_sha256": digest,
@@ -644,6 +652,22 @@ class MeasurementContractTest(unittest.TestCase):
         os.chmod(path, 0o600)
         with self.assertRaises(GateError):
             measured.build_evidence_contract(self.root, path)
+
+    def test_queue_storage_accounting_forgery_is_rejected_before_launch(self) -> None:
+        for backend, accounting in (
+            ("standard", "exact"),
+            ("candidate", "not_measured"),
+        ):
+            with self.subTest(backend=backend):
+                invalid = build_evidence_value(backend)
+                invalid["queue_private_storage_accounting"] = accounting
+                path = self.root_path / f"{backend}-storage-forgery.json"
+                path.write_bytes(
+                    (json.dumps(invalid, sort_keys=True, separators=(",", ":")) + "\n").encode()
+                )
+                os.chmod(path, 0o600)
+                with self.assertRaises(GateError):
+                    measured.build_evidence_contract(self.root, path)
 
     def test_runner_disagreement_is_rejected_before_benchmark_launch(self) -> None:
         build_evidence = build_evidence_value("candidate")

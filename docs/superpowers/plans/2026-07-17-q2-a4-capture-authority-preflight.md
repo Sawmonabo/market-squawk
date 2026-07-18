@@ -5,16 +5,19 @@
 > uses `superpowers:test-driven-development`; every handoff uses
 > `superpowers:verification-before-completion`.
 
-**Goal:** Close Q2 capture authority with source-owned trusted receipt time and a complete,
-checked, bounded capture-memory graph that remains outside the event-to-action path.
+**Goal:** Close the historical Q2/A4 capture-authority audit identity as Quarter 1 of 4 with
+source-owned trusted receipt time and a complete, checked, bounded capture-memory graph that remains
+outside the event-to-action path.
 
 **Architecture:** A documentation-only Wave 0 head descends from the locally approved A3 commit and
 changes no production tree. A mandatory clean-head refresh then freezes the actual inventory,
 formulas, tools, and lockfile graph before implementation. Exactly three grouped implementation
 worktrees are used: one serialized A4.0 seed, then disjoint TIME and MEM lanes from the frozen seed.
 The seed owns dependencies, the ownership-preserving payload seam, the safe fixed rings, fallible
-construction, all shared call migration, and a measured legacy-channel baseline. TIME integrates
-first, MEM rebases onto TIME, and one unchanged candidate receives the grouped Q2 checkpoint.
+construction, all shared call migration, and both closed benchmark backend implementations. TIME
+integrates first, MEM rebases onto TIME, and the first clean fully integrated descendant passes the
+reviewed standard-reference freeze barrier before one unchanged candidate receives the grouped
+Quarter 1 of 4 checkpoint.
 
 **Tech Stack:** Rust 1.97.1, Edition 2024, checked `Layout`/`usize` arithmetic, invariant-preserving
 `CapturePayload` ownership over `Arc<[u8]>`, RAII reservations, `Mutex`/`Condvar`, Loom, Serde
@@ -27,15 +30,127 @@ the exact 1.97.1 production toolchain before A4 approval.
 
 ### Binding measurement-scope correction (2026-07-17)
 
+#### Reviewed standard-reference rebaseline (binding remediation)
+
+This subsection is the authoritative A4 benchmark provenance and sequencing contract. Its reviewed
+design base is exact commit `6d0f71ce0c836feb3522fffa360b8adcf85fc55d`. That commit is an audit
+and design base only; it is **not** a standard-reference head, measured-code head, performance
+baseline, or approved candidate. Do not substitute a fabricated or abbreviated future SHA.
+
+All earlier A4 artifacts that labeled the production `FixedQueue` transport as `standard`, described
+it as a historical standard-channel run, or derived a comparison from that mislabeled identity are
+invalid. They cannot supply a threshold, manifest, lock, hash, host fingerprint, sample, approval
+claim, or carry-forward input. Delete or quarantine such generated artifacts before the authoritative
+run. In the corrected contract, `standard` means only the benchmark-only reference implementation
+backed by `std::sync::mpsc::sync_channel`. It is not a claim about historical production behavior and
+is not a production capture transport. It is compiled only with the `capture-benchmark` feature and
+the closed standard backend selector.
+
+The standard reference wraps `sync_channel` with one combined atomic lifecycle word whose closed
+bit and checked active send/clone count share a single modification order. Send and clone first
+register through a CAS that rejects the closed bit; close and receiver drop set that bit atomically,
+reject new registration, and wait for the encoded count to reach zero. An admitted operation may
+finish before close returns, while an operation that loses the registration race returns closed; no
+send or clone succeeds after a completed close/receiver drop. Deterministic pre-CAS and
+post-registration interleavings plus model checks cover send/clone/receiver-drop linearizability.
+Split lifecycle-state and active-operation atomics are not an acceptable reference implementation.
+
+No authoritative measurement may run during the dirty seed remediation or from the design base. The
+future `A4_STANDARD_REFERENCE_HEAD` is the first clean descendant of the design base that:
+
+1. contains the reviewed queue, writer, benchmark, TIME, and MEM integration and every accepted
+   remediation;
+2. contains both closed benchmark backend sources and gates the standard transport behind
+   `capture-benchmark`;
+3. passes the exact-head Rust 1.97.1 full verification and independent reference-freeze review; and
+4. has its complete 40-hex commit and clean tree rederived immediately before the standard run.
+
+That descendant becomes a reference only after those gates pass and the integration owner assigns
+its rederived full commit to `A4_STANDARD_REFERENCE_HEAD`. The review records that exact value in the
+standard manifest and standard lock; this plan intentionally does not predict it. A dirty tree,
+unreviewed descendant, abbreviated revision, placeholder, or artifact generated before the freeze
+barrier has zero evidence authority.
+
+At `A4_STANDARD_REFERENCE_HEAD`, the following files are the closed immutable comparison harness and
+must be hashed independently under the stated manifest identities:
+
+```text
+benchmark_identity  crates/market-squawk-platform/benches/capture_admission/benchmark_identity.rs
+collector           crates/market-squawk-platform/benches/capture_admission/collector.rs
+endpoints           crates/market-squawk-platform/benches/capture_admission/endpoints.rs
+evidence_io         crates/market-squawk-platform/benches/capture_admission/evidence_io.rs
+fixture             crates/market-squawk-platform/benches/capture_admission/fixture.rs
+producer_inventory  crates/market-squawk-platform/benches/capture_admission/producer_inventory.rs
+schema              crates/market-squawk-platform/benches/capture_admission/schema.rs
+workload            crates/market-squawk-platform/benches/capture_admission/workload.rs
+```
+
+The freeze also records separate hashes for
+`crates/market-squawk-platform/benches/capture_admission.rs`,
+`crates/market-squawk-platform/benches/capture_admission_criterion.rs`,
+`crates/market-squawk-platform/src/capture/benchmark_support/observer.rs`, the backend dispatcher,
+the selected standard backend source, all evidence/build/host-gate tools, linked production-library
+sources, lockfile, toolchain, release profile, fixture, executable, host, and controlled artifacts.
+`crates/market-squawk-platform/benches/capture_admission/backend/standard.rs` must remain the explicit
+`sync_channel` reference. The separately hashed candidate backend is selected from
+`crates/market-squawk-platform/benches/capture_admission/backend/candidate.rs`; its selected-backend
+digest must differ without changing the dispatcher or immutable harness.
+
+The candidate-delta rule is closed. After the standard run, the first candidate evidence head is a
+clean descendant of `A4_STANDARD_REFERENCE_HEAD` whose source-tree delta is exactly the standard
+reference report and its machine-readable lock:
+
+```text
+docs/reports/performance/2026-07-17-q2-a4-standard-channel-baseline.md
+docs/reports/performance/2026-07-17-q2-a4-standard-channel-baseline.lock.json
+```
+
+The report must call the run a benchmark-only standard reference, not a historical production
+baseline. The candidate executable is rebuilt from that report-only descendant with the closed
+candidate selector. All immutable, entrypoint, Criterion, observer, tool, production-source,
+fixture, toolchain, release-profile, and host fingerprints must equal the frozen reference values;
+only the selected backend identity/source digest and the evidence fields that necessarily bind the
+distinct clean candidate head may differ. Any other code, build, fixture, schema, workload, tool, or
+environment delta invalidates the reference and requires a new clean reference head, a fresh
+independent freeze review, and fresh standard and candidate runs. The later exact seven-file
+documentation/evidence-only Q2 truth commit may reuse the already verified candidate artifacts only
+under Wave 3's unchanged-code checks.
+
+This correction explicitly supersedes the pre-ring sequencing and provenance language in seed Step
+3C, seed Steps 3D/3E, seed Step 5, and MEM Step 5. Those sections remain useful only for their
+behavioral test, workload, and evidence-field requirements. They do not authorize a pre-ring or
+reconstructed historical baseline, do not make an already-installed `FixedQueue` a standard
+transport, and do not permit a standard run before the future clean integrated reference barrier.
+
+#### Reviewed fixed-ring design and formula rebaseline (binding remediation)
+
+The same review replaces the former single-`QueueState`-mutex/`Vec<Option<T>>` ring contract. A live
+producer must never wait for queue capacity or another valid producer/consumer critical section, and
+ordinary unsaturated overlap must never become a real `QueueContended` refusal. The production ring
+is therefore a safe bounded MPSC sequence ring: modular atomic enqueue/dequeue positions, one
+preallocated `QueueSlot<T>` per logical slot, atomic sender count, one combined atomic lifecycle word
+for receiver closure and the checked active-operation count, and a per-slot readiness atomic plus
+`Mutex<Option<T>>` used only after the slot sequence grants exclusive ownership. No unsafe code is
+permitted. Correct sequence/readiness publication makes the owned slot mutex uncontended in every
+valid execution; a would-block or poisoned slot lock is a terminal internal invariant failure, not
+normal queue contention.
+
+This rebaseline supersedes every later statement requiring one mutex-authoritative `QueueState`, a
+non-atomic sender count, a `Condvar`, or `Vec<Option<T>>` slot accounting. The exact replacement
+formula and linearization contract appear below. The future standard-reference freeze must hash this
+rebaselined implementation and its updated accounting/schema/tests. No artifact produced with the
+superseded formula can contribute evidence.
+
 The pre-change standard-channel run and current preparer/host artifacts are diagnostic, not an
 independent approval baseline. Do not freeze, publish, or cite them as production performance
 evidence. A4 implementation proceeds directly through the fixed-ring/accounting/TIME/MEM work.
-After integration, one unchanged clean Q2 candidate runs paired standard-versus-ring measurements
+After integration, the reviewed reference head and its report-only candidate descendant run paired
+standard-reference-versus-ring measurements
 under direct Rust 1.97.1, locked dependencies, exact source/fixture/executable hashes, bounded host
 process supervision, an independent RSS observer, and documented host state. Identical final source,
 fixtures, host, and collection rules are mandatory for both backends. The clean exact-head full gate
-and grouped independent quarter review—not a self-declared lock or signature literal—authorize the
-performance claim.
+and grouped independent Quarter 1 of 4 review—not a self-declared lock or signature
+literal—authorize the performance claim.
 
 The measurement trust model excludes a malicious same-UID compiler/build-script adversary and does
 not claim byte-reproducible build or supply-chain attestation. Existing bounded I/O, process, schema,
@@ -90,7 +205,8 @@ different profile.
 - Every dirty-tree gate checks tracked unstaged changes, staged changes, and untracked files. Every
   exact-head gate checks `HEAD`, clean status, and staged/untracked emptiness again after the gate.
 - There are no accounting waivers. A known undercount, manual early release, unbounded sink,
-  unresolved race, failed performance criterion, or unmeasured claim blocks A4/Q2 approval.
+  unresolved race, failed performance criterion, or unmeasured claim blocks historical A4/Q2
+  approval at the Quarter 1 of 4 checkpoint.
 - Provider-access evasion mechanisms remain permanently excluded.
 
 ### Canonical GitHub publication target
@@ -103,15 +219,15 @@ repository:          Sawmonabo/market-squawk
 canonical PR:        1
 canonical PR branch: feat/stage-1-foundation
 base branch:         main
-expected state:      OPEN and draft through Q2
-Q2 predecessor:      ab3f7c19000884357c38702edf6b4acc6a80c483
+expected state:      OPEN and draft through Quarter 1 of 4
+historical Q2/A4 predecessor: ab3f7c19000884357c38702edf6b4acc6a80c483
 ```
 
 Every publication step uses `gh pr view 1 --repo Sawmonabo/market-squawk ...` and
 `gh pr comment 1 --repo Sawmonabo/market-squawk ...`; it never infers a PR from the checked-out
 branch. In the same shell immediately before every comment, rederive every reported value and
 verify PR number, head branch, head OID, base branch, open state, and draft state. The only allowed
-head-OID change is the final fast-forward promotion of the already reviewed Q2 candidate.
+head-OID change is the final fast-forward promotion of the already reviewed Quarter 1 candidate.
 
 ---
 
@@ -243,13 +359,14 @@ charge to remain until the concrete receipt drops and then reconcile exactly. Fu
 receipt-owned dynamic storage requires an explicit reservation design; it cannot be admitted by
 changing the receipt implementation alone.
 
-The queue-independent standard-channel baseline precedes resident accounting. In Steps 1 through
-3, the platform therefore creates this lease over the exact active
+The superseded pre-ring baseline sequence must not be executed. In Steps 1 through 3, the platform
+creates this transitional lease over the exact active
 `Arc<GenerationCaptureState<B>>`, validates receipt pointer identity against that same Arc, and uses
-it solely as a lifetime proof for the already reachable source binding/lease graph. The baseline
-must not describe that transitional anchor as a memory-accounting token. Step 5 atomically replaces
+it solely as a lifetime proof for the already reachable source binding/lease graph. No evidence run
+may describe that transitional anchor as a memory-accounting token. Step 5 atomically replaces
 the anchor with the exact `Arc<AccountedGenerationIdentity>` when resident accounting is installed;
-the same pointer and zero-additional-dynamic validations then become accounting-authoritative.
+the same pointer and zero-additional-dynamic validations then become accounting-authoritative. The
+standard reference is frozen and measured only after this replacement and full integration.
 
 Add the inherent method with a complete body in implementation:
 
@@ -737,25 +854,29 @@ keeps its generation resident in the channel accounting core until the record's 
 ### Fixed storage and per-record reservation
 
 The seed freezes these exact owned types and rejects construction unless every term can be computed
-and reserved. `QueueCore<T>` contains the queue mutex, condition variable, one-way closed hint, and
-one never-growing `Vec<Option<T>>`. `CaptureState<B>` owns the two queue Arcs, accounting Arc, and a
-coalesced `WriterLifecycleCore` Arc containing shutdown deadlines, completion, final-report,
-destination-fence, and lifecycle-control state. Its shutdown request always performs the
-mutex-authoritative record-queue close described below; no separate flag is a wait predicate. At MEM writer start,
-`CaptureWriterRuntime<B>` owns the fallibly preallocated formatting scratch and a writer-start fixed
-reservation behind the seed's frozen fixed-component API. Caller-owned inline publisher, control,
-and writer handle values are not heap allocations and are not charged. There are no hidden
-receiver/control Arcs outside the exhaustively named types; any retained separate pointee must be
+and reserved. `QueueCore<T>` contains one never-growing `Vec<QueueSlot<T>>`, atomic enqueue/dequeue
+positions, the capacity-aligned position modulus, sender count, and one combined atomic lifecycle
+word whose high bit is the one-way receiver-closed state and whose remaining bits are the checked
+active send/clone count, plus the consumer/terminal-drain serialization gate, bounded
+receiver-wakeup registration, and test-only coordination compiled for the exact target.
+`QueueSlot<T>` contains its sequence number, readiness atomic, and `Mutex<Option<T>>` inline.
+`CaptureState<B>` owns the two queue Arcs, accounting Arc, and a coalesced `WriterLifecycleCore` Arc
+containing shutdown deadlines, completion, final-report, destination-fence, and lifecycle-control
+state. At MEM writer start, `CaptureWriterRuntime<B>` owns the fallibly preallocated formatting
+scratch and a writer-start fixed reservation behind the seed's frozen fixed-component API.
+Caller-owned inline publisher, control, and writer handle values are not heap allocations and are
+not charged. There are no hidden receiver/control Arcs outside the exhaustively named types; any
+retained separate pointee must be
 named and charged before construction can publish handles.
 
 At channel construction, use observed capacities after `try_reserve_exact` and compute:
 
 ```text
 record_slot_bytes =
-    record_slots.capacity() * size_of::<Option<CaptureMessage<B>>>()
+    record_slots.capacity() * size_of::<QueueSlot<CaptureMessage<B>>>()
 
 health_slot_bytes =
-    health_slots.capacity() * size_of::<Option<CaptureHealthEvent>>()
+    health_slots.capacity() * size_of::<QueueSlot<CaptureHealthEvent>>()
 
 record_queue_allocation =
     checked_arc_value_allocation_bytes::<QueueCore<CaptureMessage<B>>>(record_slot_bytes)
@@ -797,9 +918,10 @@ record/health capacity, lifecycle-core term, and checked sum. `WriterFixedStorag
 exact observed scratch capacities, destination/thread/runtime terms, compiled-target proof
 identifier, and RAII fixed-component reservation. Tests independently reconstruct every term from
 actual objects and reject omitted, duplicated, overflowed, or hidden terms. Both rings use
-`Vec::try_reserve_exact`, resize their length to exactly the requested logical slot count with empty
-slots, derive ring modulus/fullness only from that requested length, charge the independently
-observed backing capacity, never address allocator spare capacity, never grow, and return
+`Vec::try_reserve_exact`, initialize exactly the requested logical count with sequence-owned empty
+`QueueSlot` values, derive ring modulus/fullness only from that requested length, charge the
+independently observed backing capacity at `size_of::<QueueSlot<T>>()`, never address allocator spare
+capacity, never grow, and return
 `CaptureChannelError::QueueAllocationFailed { queue, requested_slots }` on recoverable allocation
 refusal. The record ring's requested logical length is the configured nonzero
 `capture_queue_capacity`; the health ring's separately named requested logical length is the fixed
@@ -860,40 +982,78 @@ admit iff
   <= configured_capture_memory_ceiling_bytes
 ```
 
-The fixed record slot already owns the inline message/frame/identity-Arc/reservation handles, so
-those inline values are in `record_slot_bytes`; only their reachable dynamic allocations are in the
-record reservation. Zero dynamic bytes are valid. `QueueByteReservation` stays lexically alive
-through deadline and authority revalidation, conversion, sink append, and policy-triggered flush.
-It is installed before the queue lock attempt and remains inside the owned message on every send
-failure. RAII releases exactly once on success, conversion/append/flush error,
-full/contention/closed/poisoned send, cancellation, shutdown, drain, writer drop, and pending-owner
-drop.
+The fixed record slot's inline `Mutex<Option<CaptureMessage<B>>>` already owns the inline
+message/frame/identity-Arc/reservation handles, so those inline values are in `record_slot_bytes`;
+only their reachable dynamic allocations are in the record reservation. Zero dynamic bytes are
+valid. `QueueByteReservation` stays lexically alive through deadline and authority revalidation,
+conversion, sink append, and policy-triggered flush. It is installed before the enqueue claim and
+remains inside the owned message on every send failure. RAII releases exactly once on success,
+conversion/append/flush error, full/closed/invariant send, cancellation, shutdown, drain, writer
+drop, and pending-owner drop.
 
 ### Queue linearization and Loom contract
 
-Use one safe fixed ring per record/health queue. Producers call `Mutex::try_lock`; the unique
-consumer may wait on `Condvar`. The authoritative `closed`, `receiver_alive`,
-`sender_count: usize`, `head`, `length`, and poison/cleanup state live under the same `QueueState`
-mutex. No atomic sender count exists. The only permitted atomic is a one-way `closed_hint` that can
-reject early but cannot authorize a send.
+Use one safe bounded sequence ring per record/health queue. Each slot starts with its logical ordinal
+as the sequence and an explicit `ready = false` publication state. A producer first enters the
+checked active-operation set through a CAS on the combined lifecycle word, claims one enqueue
+position by CAS, and may touch only the slot whose sequence proves that exact position is empty. It
+then `try_lock`s that uniquely owned slot, verifies `ready = false`, installs the message, releases
+the guard, and publishes `ready = true` with `Release`. The single consumer claims the next dequeue
+position only when
+`Acquire` observes the exact sequence and `ready = true`, removes the message under that uniquely
+owned slot lock, clears readiness, and publishes the next empty-cycle sequence with `Release`.
+The next producer's sequence `Acquire` therefore observes the cleared readiness and removed value
+before reusing the slot. The separate readiness state is required even at logical capacity one,
+where the published and next-free sequence values would otherwise alias. Full and empty observations
+derive only from position/sequence/readiness state and the exact logical capacity. The readiness
+atomic is part of `size_of::<QueueSlot<CaptureMessage<B>>>()` and therefore part of exact fixed-slot
+and queue-private-storage accounting; it is not an uncharged side allocation. Construction sets
+`position_modulus = usize::MAX - (usize::MAX % logical_capacity)`, requires it to exceed the logical
+capacity, and advances positions modulo that capacity-aligned bound so the position-to-slot mapping
+is preserved across rollover without relying on ambiguous native integer overflow. Test-only
+near-modulus seeding proves rollover without indexing allocator spare capacity.
 
-Send linearizes while holding that mutex when it rechecks closed/receiver state and installs the
-message. Close/receiver drop/last-sender drop acquire the same mutex, set terminal state, drain when
-owned by cleanup, release the guard, and notify. An `AtomicBool` may provide a one-way closed hint
-for an early negative result, but it is not authority and can never permit a send. No in-band `Wake`
-variant remains.
+Valid producer execution never waits on a queue mutex, condition variable, capacity permit, or
+another producer/consumer critical section. The per-slot mutex is a safe storage cell rather than a
+contention policy: sequence ownership guarantees its immediate acquisition. A would-block slot,
+poisoned slot, impossible empty/filled value, counter overflow, or ownership mismatch is a distinct
+terminal queue-invariant result, closes the stream, and releases the rejected message reservation;
+it is never reported as `QueueContended`. Production acceptance and performance evidence require
+zero such invariant failures and no ordinary contention outcome.
 
-Writer cancellation is not a separate `Condvar` predicate. `request_shutdown` acquires the same
-record `QueueState` mutex, publishes the explicit closed/shutdown generation there, releases the
-guard, and only then calls `notify_all`; the consumer checks that mutex-authoritative state in its
-wait loop. `WriterLifecycleCore` may retain deadlines and lifecycle reporting, but an external
-cancellation flag can neither authorize sleep nor replace the queue close transition. This closes
-the check-before-wait lost-wakeup window. Full-queue shutdown drains under the declared cleanup
-owner and preserves record reservations until each item is actually dropped or consumed.
+Send linearizes when the owned slot's `ready = true` state is published. Close/receiver drop sets the
+closed bit through an atomic read-modify-write on the same lifecycle word that admits operations,
+rejects subsequent send/clone registration, and waits until that word's active-operation count is
+zero before notifying or draining under the declared cleanup owner. An operation guard's checked
+decrement can never clear the closed bit. A send admitted before close either publishes a drainable
+message or returns the intact value while close waits; one that observes the closed bit is rejected.
+Receiver drop uses this same close transition before draining, without a second competing
+receiver-alive authority flag. `try_clone` holds the same active-operation guard around its checked
+sender-count CAS, so close cannot return before an admitted clone completes; last-sender drop closes
+and notifies. No post-close send or clone can succeed, no in-band `Wake` variant exists, and no user
+destructor runs while a slot lock is held.
 
-Deterministic barriers and platform Loom models cover send-vs-close, send-vs-receiver-drop,
-last-sender-vs-wait, consumer-predicate-check-vs-shutdown-before-sleep, full-queue shutdown,
-deadline/reap, full-vs-close, rotation-vs-send, poison cleanup, and exactly-once reservation release.
+Benchmark timeout and Drop paths may issue a nonblocking close-registration request so reporting
+cannot wait behind an admitted producer. Once shutdown is requested, however, the writer must not
+treat a transient `Empty` observation as terminal while the combined lifecycle count is nonzero. It
+retries/yields, consumes any message published by an operation admitted before close, and exits the
+drain only on terminal `Closed` or the configured shutdown deadline. A deterministic paused-send
+fixture proves the writer cannot terminate between operation registration and publication and that
+the late accepted message or intact refusal reconciles its reservation exactly.
+
+The unique consumer uses a stored `Thread` wake token outside the publisher's latency authority. Its
+registration protocol publishes the waiter, rechecks queue and terminal sequence state, and only
+then parks. A producer/closer that cannot immediately acquire the registration cell is racing that
+pre-park publication and may skip the wake only because the receiver's mandatory recheck will see
+the transition; a wake after the recheck leaves an `unpark` token. This exact handshake, rather than
+an unrelated lifecycle flag, closes the check-before-sleep lost-wakeup window.
+
+Deterministic barriers, sustained multi-producer stress, and platform Loom models cover slot
+ownership, capacity-one readiness/sequence alias regression, arbitrary-capacity full/empty/FIFO
+behavior, counter wraparound, send-vs-close,
+send-vs-receiver-drop, clone-vs-close, receiver-drop-vs-send, last-sender-vs-wait,
+consumer-registration-vs-notify, full-queue shutdown, deadline/reap, poison/invariant cleanup, and
+exactly-once reservation release.
 
 Freeze and rustdoc one lock rank for every path that can touch more than one authority object:
 lifecycle transition, record queue, health queue, accounting transition, then destination registry.
@@ -904,16 +1064,16 @@ or publishes. Tests use reentrant `Drop`/sink/health fixtures that call back int
 shutdown to prove the implementation neither deadlocks nor observes a partially published state.
 
 `RawCapturePublisher` deliberately does not implement `Clone`. Its typed
-`try_clone(&self) -> Result<Self, CapturePublisherCloneError>` acquires the queue mutex, rejects
-poison/terminal close and checked `usize` overflow, then increments `sender_count`. Sender `Drop`
-decrements under the same mutex and the last drop closes/notifies. The seed migrates all ten audited
+`try_clone(&self) -> Result<Self, CapturePublisherCloneError>` uses a checked sender-count CAS,
+rejects terminal close and `usize` overflow, then rechecks terminal state and rolls back if close won
+the race. Sender `Drop` atomically decrements and the last drop closes/notifies. The seed migrates all ten audited
 publisher `.clone()` calls, removes the `CaptureContext` derived `Clone`, replaces two positive
 publisher `Clone` assertions with negative compile-time assertions plus `Send + Sync`, and removes
 the hidden inner-sender clone during channel construction. Tests and Loom models assert clone/drop
 races, overflow at `usize::MAX`, last-sender wakeup,
-receiver-drop drain, queue-full close, poisoned clone/drop cleanup, and no send after the
-mutex-authoritative last-close transition. Poison recovery may take owned messages only for terminal
-cleanup; it never resumes normal queue service.
+receiver-drop drain, queue-full close, invariant cleanup, and no send after the linearized last-close
+transition. Poison recovery may take owned messages only for terminal cleanup; it never resumes
+normal queue service.
 
 ### Conversion, journal, and bounded sink
 
@@ -1027,12 +1187,12 @@ CaptureGenerationError:
   | RetainedSize | RetainedSizeUnderreported | CaptureMemoryBudgetExceeded | AccountingInvariant
 
 CapturePublisherCloneError:
-  QueueClosed | QueuePoisoned | SenderCountOverflow
+  QueueClosed | SenderCountOverflow
 
 CapturePublishError:
   Authority | AuthorityBusy | WriterUnavailable | RetainedSize | RetainedSizeUnderreported
   | InvalidPayloadView | CaptureMemoryBudgetExceeded | QueueFull
-  | QueueContended | QueueClosed | QueuePoisoned | AccountingInvariant
+  | QueueClosed | QueuePoisoned | QueueInvariant | AccountingInvariant
 
 CaptureWriterError:
   Deadline | Authority | InvalidPayloadSharing
@@ -1086,11 +1246,11 @@ Every runtime rejection has one exhaustive, compile-checked `CaptureHealthReason
 | normal supervised writer stop | `WriterStopped`; capture authority ends with writer lifetime |
 | sole positive capture supervisor exit/drop | `SupervisorStopped`; terminal capture incompleteness |
 | generation activation / binding / order / lifecycle / preparation | `GenerationActivation` / `BindingMismatch` / `GenerationOrder` / `WriterLifecycle` / `GenerationPreparation` |
-| producer clone closed / poison / count overflow | `QueueClosed` / `QueuePoisoned` / `SenderCountOverflow` |
+| producer clone closed / count overflow | `QueueClosed` / `SenderCountOverflow` |
 | retained overflow / invalid graph / underreport | `RetainedSizeOverflow` / `InvalidAuthorityGraph` / `RetainedSizeUnderreported` |
 | payload view / allocation mismatch | `InvalidPayloadView` / `InvalidPayloadSharing` |
 | unified memory refusal | `CaptureMemoryBudgetExceeded` |
-| queue full / contention / closed / poison | `QueueFull` / `QueueContended` / `QueueClosed` / `QueuePoisoned` |
+| queue full / closed / poison / impossible slot ownership | `QueueFull` / `QueueClosed` / `QueuePoisoned` / `QueueInvariant` |
 | accounting reconciliation failure | `AccountingInvariant` |
 | diagnostic/source conversion failure | `DiagnosticConversion` |
 | sink record / byte / serialization limits | `SinkRecordLimit` / `SinkRetainedByteLimit` / `SerializationLimit` |
@@ -1112,7 +1272,7 @@ until operator semantics are chosen.
 | 1 | Grouped A4.0 seed | Frozen `REFRESH_HEAD` | Domain/shared contracts, payload types, configuration/app composition, manifests/lockfile, all channel/sink calls, legacy baseline, safe rings/fallible construction, queue Loom | Clean unchanged seed exact head | Serialized |
 | 2 | TIME | Frozen seed | Sources/live authority-time production and tests | Clean unchanged TIME exact head | Integrate first |
 | 2 | MEM | Same frozen seed | Platform writer-start/conversion/journal/sink hardening behind seed-owned record tokens, platform/app tests, acceptance benchmark | Clean unchanged MEM exact head | Rebase onto TIME, then integrate |
-| 3 | Q2 checkpoint | TIME then rebased MEM integrated | Truth/evidence owner, exact candidate, grouped reviewers | Clean exact-head gate and zero findings | Last |
+| 3 | Quarter 1 of 4 checkpoint (historical Q2/A4 audit identity) | TIME then rebased MEM integrated | Truth/evidence owner, exact candidate, grouped reviewers | Clean exact-head gate and zero findings | Last |
 
 Create exactly these three grouped implementation worktrees; never create a worktree per checklist
 task:
@@ -1480,13 +1640,14 @@ rebases with `--onto` onto that exact integration commit before its final gate.
 - Consumes: exact clean published `REFRESH_HEAD`
 - Produces: one clean seed with typed retained errors, one Arc helper, one shared `CapturePayload`
   contract used by all three owners, exact formulas, renamed configuration, fallible channel,
-  prevalidated rotation, safe fixed rings, mutex-authoritative fallible publisher cloning, 39
+  prevalidated rotation, safe sequence-owned fixed rings, fallible publisher cloning, 39
   channel migrations, 18 bounded-sink migrations, ten direct publisher-clone migrations plus all
   three type-level Clone expectations, the authoritative total/resident identity/frame reservation
-  lifecycle, trybuild/Loom enforcement, and a measured pre-ring standard-channel baseline
+  lifecycle, trybuild/Loom enforcement, and closed standard-reference/candidate benchmark backends
 
-The following barriers are serialized. Do not implement the ring before the legacy standard-channel
-measurement is captured at its own clean exact commit.
+The following implementation barriers are serialized. The reviewed rebaseline correction above
+supersedes the former pre-ring measurement barrier: implement and integrate the ring first, and do
+not measure either backend before the future clean `A4_STANDARD_REFERENCE_HEAD` freeze.
 
 - [ ] **Step 0A: RED bootstrap inventory and add pinned development dependencies**
 
@@ -1678,7 +1839,10 @@ measurement is captured at its own clean exact commit.
   tests. Leave writer conversion on the explicitly over-reserved compatibility-copy quote until MEM
   installs and proves the generic zero-copy conversion; do not undercharge the temporary copy.
 
-- [ ] **Step 3C: GREEN every queue-independent contract and freeze the final harness**
+- [ ] **Step 3C: GREEN every queue-independent contract and define the final harness**
+
+  This step defines and tests the closed harness, but does not freeze an evidence head or authorize a
+  run. The exact file hashes freeze later at the reviewed `A4_STANDARD_REFERENCE_HEAD` barrier.
 
   Complete the behavior-preserving `capture.rs`/`capture/admission.rs` split without changing the
   standard channel. Register two deliberately separate targets. `capture_admission_evidence` is the
@@ -1729,8 +1893,11 @@ measurement is captured at its own clean exact commit.
   a different contract. A deterministic comparable-full fixture is separate from the matrix and
   runs for both backends; it gates the consumer until a depth-one queue refuses and requires exactly
   one recorded `QueueFull`. The candidate backend adapter additionally exposes a test/benchmark-only
-  forced-lock fixture requiring `QueueContended > 0`; it is labeled noncomparative and never enters
-  comparative endpoint results. Neither is conflated with unsaturated acceptance, which requires
+  adversarial forced-lock fixture. It uses a real `CaptureMessage` and reports measured accounting
+  reconciliation, or emits an explicit typed-unavailable result when the production sequence
+  protocol makes the probe inapplicable. It is non-authoritative, noncomparative, never enters
+  endpoint or acceptance results, and never requires a production `QueueContended` outcome. Neither
+  case is conflated with unsaturated acceptance, which requires
   zero refusals. One externally selected standard repetition is exactly matrix + comparable full +
   sustained RSS. One externally selected candidate repetition is that identical set plus the
   separately named noncomparative forced-lock fixture.
@@ -1843,7 +2010,11 @@ measurement is captured at its own clean exact commit.
   test -z "$EMPTY_OUTPUT"
   ```
 
-- [ ] **Step 3D: Run the unchanged standard-channel baseline**
+- [ ] **Step 3D: SUPERSEDED here; retain the standard-reference run template**
+
+  Do not execute this step at its historical pre-ring location. Apply its workload and host-gate
+  requirements only after the binding reviewed rebaseline barrier, substituting the exact future
+  `A4_STANDARD_REFERENCE_HEAD` and the benchmark-only `sync_channel` standard reference.
 
   Execute five independent fixed-operation matrix repetitions plus five independent representative
   sustained/RSS repetitions at the exact clean `A4_BASELINE_CODE_HEAD`. The fixed matrix ends at
@@ -1943,7 +2114,12 @@ measurement is captured at its own clean exact commit.
   directory, every immutable-module/tool/artifact/repetition SHA, separate standard backend SHA,
   exact fixture/repetition manifest, and absence of any candidate threshold claim.
 
-- [ ] **Step 3E: Commit report-only evidence and establish the ring barrier**
+- [ ] **Step 3E: SUPERSEDED ring barrier; retain the report-only candidate barrier**
+
+  The ring is already integrated before this step under the reviewed rebaseline. After the future
+  standard-reference run, commit only the two exact report/lock paths named in the candidate-delta
+  rule. That clean report-only descendant is the candidate evidence head; no implementation delta is
+  allowed between the paired runs.
 
   ```bash
   set -euo pipefail
@@ -1964,10 +2140,10 @@ measurement is captured at its own clean exact commit.
     $'docs/reports/performance/2026-07-17-q2-a4-standard-channel-baseline.lock.json\ndocs/reports/performance/2026-07-17-q2-a4-standard-channel-baseline.md'
   ```
 
-  The report-inclusive evidence head is not relabeled as measured code. Only now may seed replace
-  the standard channel; the candidate may change only the frozen producer/queue backend and the
-  production accounting/ring implementation, not payload ownership, endpoints, collectors,
-  producer inventory, operation quotas, or benchmark fixture semantics.
+  The report-inclusive evidence head is not relabeled as standard-reference measured code. The ring
+  has already been installed. The candidate build changes only the closed compile-time backend
+  selection; payload ownership, production sources, endpoints, collectors, producer inventory,
+  operation quotas, benchmark fixture semantics, and every other frozen input remain byte-identical.
 
 - [ ] **Step 4: RED final ring construction, publisher cloning, and rotation**
 
@@ -1979,10 +2155,11 @@ measurement is captured at its own clean exact commit.
   Add deterministic tests for fixed channel storage's four exact allocation terms, the frozen
   fallible fixed-component quote/reservation API used later by writer start, observed record/health
   backing capacity versus exact requested logical length, injected allocator spare capacity, queue
-  allocation refusal, record/health exact-full, try-lock contention, close,
-  receiver drop; poison cleanup; sender-count `try_clone`, overflow, poison, and last-close; and
+  allocation refusal, record/health exact-full, near-wrap position/sequence cycles, valid-operation
+  slot-lock non-contention, impossible slot ownership, close, receiver drop, poison cleanup,
+  sender-count `try_clone`, overflow, close races, and last-close; and
   exactly-once reservation release. Add the complete process-lifetime destination-registry tests,
-  mutex-authoritative shutdown/check-before-sleep barrier, and bounded accounting-snapshot tests
+  receiver-registration shutdown/check-before-sleep barrier, and bounded accounting-snapshot tests
   including fixed/resident/record transitions, multiple writers, ABA, epoch overflow, poison, and
   snapshot contention. Deliberately abandon an entered transition guard in deterministic and Loom
   fixtures and assert checked leave, durable first `InvariantViolated` poison, later-admission
@@ -2027,10 +2204,13 @@ measurement is captured at its own clean exact commit.
 
 - [ ] **Step 5: GREEN the final safe fixed ring without a public-cutover commit**
 
+  This implementation step precedes the standard-reference freeze. It must not consume, generate, or
+  claim a historical standard baseline; the binding reviewed rebaseline governs later evidence.
+
   Complete the already-started message/generation/publisher split in `capture/admission.rs` and put
   the fixed ring in `capture/queue.rs`. Replace the process-global destination `HashMap` in
   `capture/writer/destination.rs` with the frozen fallibly preallocated fixed registry. Implement the exact fixed formula,
-  mutex-authoritative state, fallible slots, `CaptureMemoryAccounting`, resident generation token,
+  sequence-owned per-slot state, fallible slots, `CaptureMemoryAccounting`, resident generation token,
   `AccountedGenerationIdentity`, identity-bearing errors/snapshots/events/queued records, complete
   generation/publish health mappings, frame-footprint reservation ownership, typed
   `RawCapturePublisher::try_clone`, initial/generation errors, exact pre-consumption validation,
@@ -2249,12 +2429,14 @@ measurement is captured at its own clean exact commit.
   Before approval, a scoped production-source gate excludes the intentionally preserved benchmark
   standard backend and proves that `crates/market-squawk-platform/src/capture.rs` plus
   `src/capture/**/*.rs` contain no standard `sync_channel`/`SyncSender`/`mpsc::Receiver` and no
-  `CaptureMessage::Wake`. Pair those negative checks with positive `QueueCore`, mutex-owned
-  `QueueState`, non-atomic `sender_count: usize`, one-way `closed_hint: AtomicBool`, and fixed
-  `Vec<Option<_>>` evidence in `capture/queue.rs`. The gate distinguishes ripgrep no-match status 1
+  `CaptureMessage::Wake`. Pair those negative checks with positive `QueueCore`, `QueueSlot<T>`,
+  `Vec<QueueSlot<T>>`, atomic enqueue/dequeue positions, sender count, one combined atomic lifecycle
+  word with receiver-closed-bit and active-operation-count masks, and per-slot
+  `ready: AtomicBool` plus `Mutex<Option<T>>` evidence in
+  `capture/queue.rs`. The gate distinguishes ripgrep no-match status 1
   from search failure and never masks failures with `|| true` or command substitution. Separately,
-  the standard benchmark backend source digest must still equal the persisted baseline manifest
-  and retain its explicit standard-channel implementation.
+  the standard benchmark backend must retain its explicit benchmark-only `sync_channel`
+  implementation. Its digest is persisted only at the future reviewed standard-reference freeze.
 
   ```bash
   set -euo pipefail
@@ -2559,7 +2741,7 @@ measurement is captured at its own clean exact commit.
   test "$(git rev-parse HEAD)" = "$TIME_HEAD"
   ```
 
-  Comment on canonical PR 1 explicitly. This is a lane handoff, not the quarter review:
+  Comment on canonical PR 1 explicitly. This is a lane handoff, not the Quarter 1 of 4 review:
 
   ```bash
   set -euo pipefail
@@ -2817,21 +2999,19 @@ measurement is captured at its own clean exact commit.
   Review/commit writer/journal/sink work as
   `feat(capture): bound journal and retained sinks`. Record `MEM_SINK_HEAD`; prove clean.
 
-- [ ] **Step 5: Switch the frozen harness backend and validate one dirty-tree repetition**
+- [ ] **Step 5: Validate both closed backends before the future reference freeze**
 
-  Do not redesign, expand, relabel, or reconstruct the committed standard-channel harness. Switch
-  only its producer-backend factory from the standard `Ok(clone)` implementation to production
-  `RawCapturePublisher::try_clone`; the five already connected endpoint modules are immutable and
-  production code changes are observed only through those frozen boundaries. Put candidate-only
-  forced-lock instrumentation inside the separately hashed backend adapter. Keep the baseline result
-  group and candidate result group separately named;
-  never synthesize a baseline after queue replacement. Payload ownership, fixtures, operation
-  quotas, endpoint boundaries, collector, producer inventory, and result schema must retain their
-  separate baseline immutable-module hashes. The expected backend hash is different and is never
-  included in an alleged whole-harness equality. The entrypoint
-  `benches/capture_admission.rs` is immutable after the baseline commit; MEM owns only
-  `benches/capture_admission/backend.rs`. Candidate startup and every later comparison require exact
-  baseline equality of `entrypoint_sha256` as well as every immutable-module hash.
+  Do not redesign, expand, or relabel the closed harness during MEM. The dispatcher already selects
+  either the benchmark-only standard `sync_channel` source or production
+  `RawCapturePublisher::try_clone`; validate both feature-gated builds, but perform no authoritative
+  measurement from the dirty lane. The five connected endpoint modules become immutable at the
+  future `A4_STANDARD_REFERENCE_HEAD`, and production code is observed only through those closed
+  boundaries. Keep candidate-only forced-lock instrumentation inside the separately hashed candidate
+  adapter, using real `CaptureMessage` accounting or an explicit typed-unavailable result. The
+  standard and candidate result groups remain separately named; no artifact may be presented as a
+  historical pre-replacement baseline. Payload ownership, fixtures, operation quotas, endpoint
+  boundaries, collector, producer inventory, result schema, entrypoint, Criterion target, observer,
+  and evidence tools must satisfy the exact hash equality required by the reviewed rebaseline.
 
   The exact fixed-operation matrix remains:
 
@@ -2867,9 +3047,11 @@ measurement is captured at its own clean exact commit.
   sustained RSS fixture. The standard repetition is the identical set without forced-lock.
   Unsaturated representative acceptance inside the matrix requires zero typed
   publication refusals and an accepted coherent post-drain `CaptureAccountingSnapshot` with record
-  reservation zero. The full fixture is invalid unless `QueueFull > 0`; the forced-lock fixture is
-  invalid unless `QueueContended > 0`. All fixture outcome counts must equal attempts exactly, every
-  consumer count must equal successes, and all post-drain ledgers must reconcile.
+  reservation zero. The full fixture is invalid unless `QueueFull > 0`. The forced-lock diagnostic
+  is accepted only when its typed status and every applicable real-message accounting field
+  reconcile; an unavailable field is never encoded as numeric zero. It has no performance threshold
+  and is excluded from performance acceptance. All fixture outcome counts must equal attempts
+  exactly, every consumer count must equal successes, and all post-drain ledgers must reconcile.
 
   Only the representative sustained fixture uses two five-second warm epochs followed by ten
   ten-second measured burst/drain epochs. Every epoch completes and joins its current checked batch,
@@ -3073,7 +3255,7 @@ measurement is captured at its own clean exact commit.
   test "$(git rev-parse HEAD)" = "$MEM_HEAD"
   ```
 
-  Comment on canonical PR 1 explicitly. This is a lane handoff, not the quarter review:
+  Comment on canonical PR 1 explicitly. This is a lane handoff, not the Quarter 1 of 4 review:
 
   ```bash
   set -euo pipefail
@@ -3396,7 +3578,7 @@ measurement is captured at its own clean exact commit.
 
   Never force-remove dirty/active state. Retain branches through checkpoint publication.
 
-## Wave 3: one exact Q2 checkpoint
+## Wave 3: one exact Quarter 1 of 4 checkpoint
 
 ### Task 5: Commit truth, freeze, verify, review, and publish
 
@@ -3429,12 +3611,12 @@ measurement is captured at its own clean exact commit.
   report renders the same values for humans; the JSON
   is the machine authority used again at final publication.
   The memory update records integrated candidate facts, hosted class, evidence paths, clean
-  worktree disposition, that Q2 remains below the project halfway boundary, and the immediate Q3
-  weighting-freeze barrier. It does not change the existing weighting method or award projected
-  credit. Because a file cannot contain its own commit hash, it identifies its authority as the
-  exact commit containing the entry; the canonical PR comment later binds that literal SHA. The
-  first Q3 Task 0 governance commit resolves the literal approved Q2 SHA. There is no tracked
-  post-review memory edit at Q2.
+  worktree disposition, and the immediate canonical Stage 2 planning/Wave barrier. It records that
+  implementation continues through the complete release plan under four quarter-checkpoint reviews.
+  It does not award projected credit. Because a file cannot contain its own commit hash, it
+  identifies its authority as the exact commit containing the entry; the canonical PR comment later
+  binds that literal SHA. The first canonical Stage 2 planning/freeze commit resolves the literal
+  approved historical Q2/A4 SHA. There is no tracked post-review memory edit at Quarter 1 of 4.
 
 - [ ] **Step 2: Run the unchanged clean exact-head local gate**
 
@@ -3549,14 +3731,14 @@ measurement is captured at its own clean exact commit.
     --jq '[.number,.headRefName,.headRefOid,.baseRefName,.state,.isDraft] | @tsv')" = \
     "$(printf '1\tfeat/stage-1-foundation\tab3f7c19000884357c38702edf6b4acc6a80c483\tmain\tOPEN\ttrue')"
   COMMENT_URL="$(gh pr comment 1 --repo Sawmonabo/market-squawk --body \
-    "Q2 A4 candidate ${CANDIDATE_HEAD} published for quarter review; approval is pending. Local exact-head gates and rebased benchmark evidence are recorded in docs/reports/2026-07-17-q2-a4-verification.md. Pre-promotion hosted class: ${PRE_PROMOTION_HOSTED_CLASS}; raw evidence: root target/q2-a4-hosted/q2-pre-promotion.")"
+    "Historical Q2/A4 candidate ${CANDIDATE_HEAD} published for Quarter 1 of 4 review; approval is pending. Local exact-head gates and rebased benchmark evidence are recorded in docs/reports/2026-07-17-q2-a4-verification.md. Pre-promotion hosted class: ${PRE_PROMOTION_HOSTED_CLASS}; raw evidence: root target/q2-a4-hosted/q2-pre-promotion.")"
   test -n "$COMMENT_URL"
   ```
 
   Optional hosted state does not alter the local approval criteria or permit a false portability
   claim.
 
-- [ ] **Step 4: Dispatch grouped quarter reviewers on one SHA**
+- [ ] **Step 4: Dispatch grouped Quarter 1 of 4 reviewers on one SHA**
 
   Give the same `CANDIDATE_HEAD` to independent non-mutating reviewers for TIME/authority,
   memory/queue/sink/journal, and integration/tests/performance. Do not change the candidate between
@@ -3650,7 +3832,7 @@ measurement is captured at its own clean exact commit.
 
   After post-promotion classification and confirmation no process uses the seed worktree, verify the
   seed and newly promoted main worktree are clean, remove the seed normally, prune, and only then
-  publish the final Q2 approval comment. Never force-remove.
+  publish the final Quarter 1 of 4 approval comment. Never force-remove.
   Retain the published branches until the normal PR/branch completion decision.
 
   ```bash
@@ -3719,7 +3901,7 @@ measurement is captured at its own clean exact commit.
     "$(printf '1\tfeat/stage-1-foundation\t%s\tmain\tOPEN\ttrue' \
       "$REVIEWED_CANDIDATE_HEAD")"
   COMMENT_URL="$(gh pr comment 1 --repo Sawmonabo/market-squawk --body \
-    "Q2 A4 approved at exact candidate ${REVIEWED_CANDIDATE_HEAD}; measured code ${MEASURED_CODE_HEAD}; local verifier, queue Loom, audits, and capture-admission benchmark passed; standard manifest SHA-256 ${STANDARD_MANIFEST_DIGEST}; candidate manifest SHA-256 ${ARTIFACT_DIGEST}. Post-promotion hosted class: ${POST_PROMOTION_HOSTED_CLASS}; raw evidence: root target/q2-a4-hosted/q2-post-promotion. Wave0, TIME, MEM, and seed worktrees were removed normally; canonical root retained clean. Q2 remains below the project halfway boundary; next barrier is the reviewed immutable Q3 capability-weighting freeze.")"
+    "Historical Q2/A4 approved as Quarter 1 of 4 at exact candidate ${REVIEWED_CANDIDATE_HEAD}; measured code ${MEASURED_CODE_HEAD}; local verifier, queue Loom, audits, and capture-admission benchmark passed; standard manifest SHA-256 ${STANDARD_MANIFEST_DIGEST}; candidate manifest SHA-256 ${ARTIFACT_DIGEST}. Post-promotion hosted class: ${POST_PROMOTION_HOSTED_CLASS}; raw evidence: root target/q2-a4-hosted/q2-post-promotion. Wave0, TIME, MEM, and seed worktrees were removed normally; canonical root retained clean. Next barrier is canonical Stage 2 planning and its reviewed Wave sequence; implementation continues through Stages 2-7.")"
   test -n "$COMMENT_URL"
   printf '%s\n' "$COMMENT_URL" | rg '^https://github\.com/Sawmonabo/market-squawk/'
   test "$(git rev-parse HEAD)" = "$REVIEWED_CANDIDATE_HEAD"
@@ -3727,17 +3909,16 @@ measurement is captured at its own clean exact commit.
   test -z "$EMPTY_OUTPUT"
   ```
 
-- [ ] **Step 6: Close Q2 and continue toward the project halfway boundary**
+- [ ] **Step 6: Close Quarter 1 of 4 and continue through the canonical Stage/Wave plan**
 
-  Report the Q2 outcome, exact frozen commit, evidence paths, hosted class, worktree disposition,
-  remaining Q3/Q4 blockers, and the next barrier. Q2 approval is necessary but is not the project
-  halfway terminal condition. Immediately return to the global implementation plan: first freeze
-  and independently review the immutable production-capability weighting method, then execute the
-  Q3 production live-decision/risk/Coinbase/paper checkpoint and materially runnable Q4
-  Kraken/live-source and research/storage/provider branches. Stop only when every condition in
-  `docs/project-memory.md` section “Halfway terminal condition” is satisfied at one clean, pushed,
-  reviewed exact commit with at least 50% earned production-capability weight. Do not award
-  projected, contract-only, scaffold, or unverified credit.
+  Report the Quarter 1 outcome, exact frozen commit, evidence paths, hosted class, worktree
+  disposition, remaining Stage 2-7 blockers, and the next barrier. Immediately return to the
+  canonical Stage 2 plan and its reviewed Wave sequence, then continue through Stage 3 research
+  storage, Stage 4 Python/modeling/analytics/portfolio, Stage 5 strategy/risk/execution, Stage 6
+  valuation and complete typed MCP, and Stage 7 release hardening. The four quarter checkpoints are
+  the grouped review barriers; no intermediate percentage milestone pauses implementation.
+  Continue until the complete release definition of done is satisfied. Do not award projected,
+  contract-only, scaffold, or unverified credit in progress reporting.
 
-No lane result, dirty gate, benchmark subset, hosted result, or documentation claim constitutes Q2
-approval by itself.
+No lane result, dirty gate, benchmark subset, hosted result, or documentation claim constitutes
+Quarter 1 of 4 approval by itself.

@@ -3,6 +3,8 @@
 use std::hint::black_box;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+#[cfg(all(test, not(loom)))]
+use std::sync::Barrier;
 use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(test)]
 use std::sync::{Condvar, Mutex};
@@ -10,12 +12,19 @@ use std::time::{Duration, Instant};
 
 use market_squawk_domain::CaptureIntegrityState;
 
-use super::super::{
-    CaptureAccountingSnapshotError, CaptureIoContext, CapturePublishError, CaptureSink,
-    CaptureSinkError, CaptureStorageErrorClass, CaptureWriterHandle, CaptureWriterOutcome,
-    CaptureWriterPolicy, DiagnosticCaptureBundle, DiagnosticCaptureFrame, RawCaptureControl,
-    RawCapturePublisher, raw_capture_channel, spawn_capture_writer,
+#[cfg(test)]
+use super::super::CaptureWorkerReapError;
+use super::super::writer::{
+    BenchmarkCaptureWriterHandle, BenchmarkCaptureWriterShutdown, spawn_benchmark_capture_writer,
 };
+use super::super::{
+    BenchmarkCapturePublisher, CaptureAccountingSnapshotError, CaptureIoContext,
+    CapturePublishError, CaptureSink, CaptureSinkError, CaptureStorageErrorClass,
+    CaptureWriterOutcome, CaptureWriterPolicy, DiagnosticCaptureBundle, DiagnosticCaptureFrame,
+    RawCaptureControl, benchmark_capture_channel,
+};
+#[cfg(all(test, not(loom)))]
+use super::fixture::MessageFactory;
 use super::fixture::{
     channel_limits, fixture_identity, next_destination, prepare_fixture, process_infrastructure,
 };
@@ -30,7 +39,7 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 pub(super) struct CaptureProducerFactory {
-    publisher: RawCapturePublisher<DiagnosticCaptureBundle>,
+    publisher: BenchmarkCapturePublisher<DiagnosticCaptureBundle>,
     frame: DiagnosticCaptureFrame,
     permits: Arc<PermitCoordinator>,
     accepted: Arc<AtomicUsize>,
@@ -39,7 +48,7 @@ pub(super) struct CaptureProducerFactory {
 #[derive(Debug)]
 pub(super) struct CaptureProducer {
     operation: BenchmarkOperation,
-    publisher: RawCapturePublisher<DiagnosticCaptureBundle>,
+    publisher: BenchmarkCapturePublisher<DiagnosticCaptureBundle>,
     frame: DiagnosticCaptureFrame,
     permits: Arc<PermitCoordinator>,
     accepted: Arc<AtomicUsize>,
@@ -48,7 +57,7 @@ pub(super) struct CaptureProducer {
 #[derive(Debug)]
 pub(super) struct PreparedCaptureOperation {
     operation: BenchmarkOperation,
-    publisher: RawCapturePublisher<DiagnosticCaptureBundle>,
+    publisher: BenchmarkCapturePublisher<DiagnosticCaptureBundle>,
     frame: DiagnosticCaptureFrame,
     permit: AcquiredPermit,
     accepted: Arc<AtomicUsize>,
@@ -56,14 +65,14 @@ pub(super) struct PreparedCaptureOperation {
 
 #[derive(Debug)]
 pub(super) struct CaptureLifecycle {
-    publisher: RawCapturePublisher<DiagnosticCaptureBundle>,
+    publisher: BenchmarkCapturePublisher<DiagnosticCaptureBundle>,
     observer: Arc<std::sync::Mutex<ObserverState>>,
     latency_observer: Arc<LatencyObserver>,
     permits: Arc<PermitCoordinator>,
     accepted: Arc<AtomicUsize>,
     expected_samples: usize,
     _control: RawCaptureControl<DiagnosticCaptureBundle>,
-    writer: Option<CaptureWriterHandle<DiagnosticCaptureBundle>>,
+    writer: Option<BenchmarkCaptureWriterHandle<DiagnosticCaptureBundle>>,
 }
 
 #[derive(Debug)]
@@ -132,7 +141,7 @@ fn prepare_inner(
     let bundle = DiagnosticCaptureBundle::new(fixture_identity()?);
     let process = process_infrastructure()?;
     let (publisher, mut control, writer) =
-        raw_capture_channel(&process, channel_limits(queue_depth), bundle)
+        benchmark_capture_channel(&process, channel_limits(queue_depth), bundle)
             .map_err(|_error| BenchmarkSupportError::CaptureComposition)?;
     let sink = ObserverSink {
         destination: next_destination()?,
@@ -151,7 +160,7 @@ fn prepare_inner(
     };
     let policy = CaptureWriterPolicy::try_new(flush_every, Duration::from_secs(60))
         .map_err(|_error| BenchmarkSupportError::CaptureComposition)?;
-    let writer = spawn_capture_writer(writer, sink, policy)
+    let writer = spawn_benchmark_capture_writer(writer, sink, policy)
         .map_err(|_error| BenchmarkSupportError::CaptureComposition)?;
     control
         .activate_initial()
@@ -312,20 +321,21 @@ impl CaptureLifecycle {
             .writer
             .take()
             .ok_or(BenchmarkSupportError::Reconciliation)?;
-        let mut pending = writer.shutdown(SHUTDOWN_TIMEOUT);
-        let shutdown_deadline = Instant::now()
-            .checked_add(SHUTDOWN_TIMEOUT)
-            .ok_or(BenchmarkSupportError::Reconciliation)?;
-        while !pending.is_worker_terminated() {
-            if Instant::now() >= shutdown_deadline {
+        let shutdown = writer
+            .shutdown_and_join(SHUTDOWN_TIMEOUT)
+            .map_err(|_error| BenchmarkSupportError::Reconciliation)?;
+        let termination = match shutdown {
+            BenchmarkCaptureWriterShutdown::Terminated(termination) => termination,
+            BenchmarkCaptureWriterShutdown::DeadlineElapsed(mut pending)
+            | BenchmarkCaptureWriterShutdown::ControlFailed(mut pending) => {
+                if pending.is_worker_terminated() {
+                    let _termination = pending
+                        .try_reap()
+                        .map_err(|_error| BenchmarkSupportError::Reconciliation)?;
+                }
                 return Err(BenchmarkSupportError::Reconciliation);
             }
-            std::thread::yield_now();
-        }
-        let termination = pending
-            .try_reap()
-            .map_err(|_error| BenchmarkSupportError::Reconciliation)?
-            .ok_or(BenchmarkSupportError::Reconciliation)?;
+        };
         let records_written =
             u64::try_from(accepted).map_err(|_error| BenchmarkSupportError::Reconciliation)?;
         if termination.outcome() != &(CaptureWriterOutcome::Complete { records_written }) {
@@ -348,11 +358,18 @@ impl CaptureLifecycle {
             .publisher
             .try_accounting_snapshot(NonZeroUsize::new(64).unwrap_or(NonZeroUsize::MIN))
             .map_err(|_error| BenchmarkSupportError::Reconciliation)?;
+        let memory = super::benchmark_memory_receipt(
+            self.publisher.benchmark_queue_private_storage_bytes(),
+            accounting,
+        )?;
         Ok(BenchmarkCaseReconciliation {
             accepted,
             consumed: accepted,
             deferred_samples: self.latency_observer.take_exact(expected_samples)?,
             queued_bytes: accounting.record_reservation_bytes(),
+            queue_private_storage_bytes: memory.queue_private_storage_bytes,
+            fixed_capture_bytes: memory.fixed_capture_bytes,
+            total_accounted_bytes: memory.total_accounted_bytes,
             accounting_invariant_failures: accounting.accounting_invariant_failures(),
         })
     }
@@ -509,94 +526,4 @@ impl TestFlushGate {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn finalization_waits_for_flush_after_append_observation()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let gate = Arc::new(TestFlushGate::default());
-        let (factory, lifecycle, _capacity) = prepare_inner(
-            BenchmarkOperation::FlushInclusiveWriter,
-            8,
-            NonZeroUsize::MIN,
-            1,
-            Some(Arc::clone(&gate)),
-        )?;
-        let producer = factory.try_producer(BenchmarkOperation::FlushInclusiveWriter)?;
-        lifecycle.execute_capture_uncontended_for_test(producer.try_prepare_operation()?)?;
-        if !gate.wait_until_entered(Duration::from_secs(1))? {
-            return Err("writer did not reach the controlled flush boundary".into());
-        }
-
-        let (result_sender, result_receiver) = std::sync::mpsc::sync_channel(1);
-        let finalizer = std::thread::spawn(move || {
-            let _send_result = result_sender.send(lifecycle.finish());
-        });
-        let early = result_receiver.recv_timeout(Duration::from_millis(50));
-        gate.release()?;
-        let (finished_before_release, result) = match early {
-            Ok(result) => (true, result),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => (
-                false,
-                result_receiver
-                    .recv_timeout(Duration::from_secs(1))
-                    .map_err(|_error| "finalizer did not complete after flush release")?,
-            ),
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return Err("finalizer result channel disconnected".into());
-            }
-        };
-        if finalizer.join().is_err() {
-            return Err("finalizer thread panicked".into());
-        }
-
-        assert!(!finished_before_release);
-        assert_eq!(result?.into_samples().len(), 1);
-        Ok(())
-    }
-
-    #[test]
-    fn finalization_waits_for_record_reservation_release_after_append_observation()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let gate = Arc::new(TestFlushGate::default());
-        let (factory, lifecycle, _capacity) = prepare_inner(
-            BenchmarkOperation::WriterAppend,
-            8,
-            NonZeroUsize::MIN,
-            1,
-            Some(Arc::clone(&gate)),
-        )?;
-        let producer = factory.try_producer(BenchmarkOperation::WriterAppend)?;
-        lifecycle.execute_capture_uncontended_for_test(producer.try_prepare_operation()?)?;
-        if !gate.wait_until_entered(Duration::from_secs(1))? {
-            return Err("writer did not reach the controlled post-append boundary".into());
-        }
-
-        let (result_sender, result_receiver) = std::sync::mpsc::sync_channel(1);
-        let finalizer = std::thread::spawn(move || {
-            let _send_result = result_sender.send(lifecycle.finish());
-        });
-        let early = result_receiver.recv_timeout(Duration::from_millis(50));
-        gate.release()?;
-        let (finished_before_release, result) = match early {
-            Ok(result) => (true, result),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => (
-                false,
-                result_receiver
-                    .recv_timeout(Duration::from_secs(1))
-                    .map_err(|_error| "finalizer did not complete after append release")?,
-            ),
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return Err("finalizer result channel disconnected".into());
-            }
-        };
-        if finalizer.join().is_err() {
-            return Err("finalizer thread panicked".into());
-        }
-
-        assert!(!finished_before_release);
-        assert_eq!(result?.into_samples().len(), 1);
-        Ok(())
-    }
-}
+mod tests;

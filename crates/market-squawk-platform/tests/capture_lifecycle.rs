@@ -1,4 +1,5 @@
 use std::num::{NonZeroU64, NonZeroUsize};
+use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -95,6 +96,112 @@ async fn shutdown_and_reap(
         .try_reap()?
         .cloned()
         .ok_or_else(|| "terminated capture worker did not retain a final report".into())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_deadline_is_reported_while_an_admitted_publisher_clone_is_paused()
+-> Result<(), Box<dyn std::error::Error>> {
+    let deadline_runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()?;
+    let (publisher, mut control, writer) = test_capture_channel(
+        NonZeroUsize::MIN,
+        DiagnosticCaptureBundle::new(identity(1)?),
+    )?;
+    let handle = spawn_capture_writer(
+        writer,
+        test_memory_capture_sink()?,
+        CaptureWriterPolicy::default(),
+    )?;
+    control.activate_initial()?;
+
+    let publisher = Arc::new(publisher);
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let clone_worker = {
+        let publisher = Arc::clone(&publisher);
+        let entered = Arc::clone(&entered);
+        let release = Arc::clone(&release);
+        std::thread::spawn(move || {
+            publisher.try_clone_after_registration_paused_for_test(&entered, &release)
+        })
+    };
+    entered.wait();
+
+    let (shutdown_sender, shutdown_receiver) = std::sync::mpsc::sync_channel(1);
+    let shutdown_worker = std::thread::spawn(move || {
+        let pending = handle.shutdown(Duration::from_millis(25));
+        let _sent = shutdown_sender.send(pending);
+    });
+    let pending = match shutdown_receiver.recv_timeout(Duration::from_secs(1)) {
+        Ok(pending) => pending,
+        Err(error) => {
+            release.wait();
+            let clone_result = clone_worker.join();
+            let shutdown_result = shutdown_worker.join();
+            drop(shutdown_receiver);
+            let clone = clone_result.map_err(|_panic| "publisher clone worker panicked")??;
+            drop(clone);
+            shutdown_result.map_err(|_panic| "shutdown worker panicked")?;
+            return Err(format!("shutdown did not return before clone release: {error}").into());
+        }
+    };
+
+    let (deadline_sender, deadline_receiver) = std::sync::mpsc::sync_channel(1);
+    let deadline_worker = std::thread::spawn(move || {
+        let mut pending = pending;
+        let status = deadline_runtime.block_on(pending.wait_until_deadline());
+        let _sent = deadline_sender.send((status, pending));
+    });
+    let mut observed = deadline_receiver.recv_timeout(Duration::from_secs(1));
+    let reported_before_release = observed.is_ok();
+    let (storage_retained, worker_retained) = match &mut observed {
+        Ok((_status, pending)) => (
+            pending.fixed_storage_receipt().is_some(),
+            matches!(
+                pending.try_reap(),
+                Err(CaptureWorkerReapError::WorkerStillRunning)
+            ),
+        ),
+        Err(_error) => (false, false),
+    };
+    release.wait();
+    let deadline_result = match observed {
+        Ok(result) => Ok(result),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => deadline_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .map_err(|_error| "deadline wait did not return after clone release"),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err("deadline result channel disconnected")
+        }
+    };
+    let clone_result = clone_worker.join();
+    let shutdown_result = shutdown_worker.join();
+    let deadline_join_result = deadline_worker.join();
+    let clone = clone_result.map_err(|_panic| "publisher clone worker panicked")??;
+    drop(clone);
+    shutdown_result.map_err(|_panic| "shutdown worker panicked")?;
+    deadline_join_result.map_err(|_panic| "deadline worker panicked")?;
+    let (status, mut pending) = deadline_result?;
+    pending.wait_until_terminated().await;
+    let _termination = pending
+        .try_reap()?
+        .ok_or("terminated writer omitted its final report")?;
+
+    assert!(
+        reported_before_release,
+        "deadline reporting waited for an already-admitted publisher clone"
+    );
+    assert_eq!(status, CaptureShutdownStatus::DeadlineElapsed);
+    assert!(
+        storage_retained,
+        "deadline reporting released pending writer fixed storage"
+    );
+    assert!(
+        worker_retained,
+        "deadline reporting lost ownership of the running capture worker"
+    );
+    Ok(())
 }
 
 #[tokio::test]

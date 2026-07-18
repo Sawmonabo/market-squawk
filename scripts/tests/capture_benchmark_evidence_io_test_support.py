@@ -17,6 +17,7 @@ PROFILE = (
     "cargo-bench-inherits-release:opt-level=3:lto=thin:codegen-units=1:"
     "panic=abort:strip=symbols"
 )
+RUNNER_SCHEMA_VERSION = 3
 BUILD_COMMAND = [
     "cargo",
     "bench",
@@ -34,6 +35,8 @@ RUNNER_BINDING_FIELDS = {
     "runner",
     "evidence_mode",
     "evidence_backend",
+    "queue_transport",
+    "queue_private_storage_accounting",
     "build_profile",
     "measured_code_head",
     "clean_build_enforced",
@@ -61,6 +64,9 @@ RUNNER_BINDING_FIELDS = {
     "platform_source_sha256",
     "domain_source_sha256",
     "entrypoint_sha256",
+    "backend_dispatcher_sha256",
+    "selected_backend_source_path",
+    "selected_backend_source_sha256",
     "backend_sha256",
     "criterion_sha256",
     "observer_sha256",
@@ -143,10 +149,12 @@ def benchmark_artifacts(
         raise ValueError("candidate fixture baseline digests are incomplete")
     digest = "a" * 64
     evidence = {
-        "schema_version": 1,
+        "schema_version": RUNNER_SCHEMA_VERSION,
         "runner": "capture_admission_evidence",
         "evidence_mode": "diagnostic_fixed_quota",
         "evidence_backend": backend,
+        "queue_transport": "candidate_fixed_ring" if candidate else "standard_sync_channel",
+        "queue_private_storage_accounting": "exact" if candidate else "not_measured",
         "cargo_target": "capture_admission_evidence",
         "benchmark_feature": "capture-benchmark",
         "build_profile": PROFILE,
@@ -203,6 +211,12 @@ def benchmark_artifacts(
         "platform_source_sha256": digest,
         "domain_source_sha256": digest,
         "entrypoint_sha256": digest,
+        "backend_dispatcher_sha256": digest,
+        "selected_backend_source_path": (
+            "crates/market-squawk-platform/benches/capture_admission/backend/"
+            f"{backend}.rs"
+        ),
+        "selected_backend_source_sha256": digest,
         "backend_sha256": digest,
         "criterion_sha256": digest,
         "observer_sha256": digest,

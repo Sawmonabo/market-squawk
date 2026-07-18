@@ -68,8 +68,8 @@ pub enum CaptureHealthReason {
     CaptureMemoryBudgetExceeded,
     /// The fixed capture queue reached its exact logical record capacity.
     QueueFull,
-    /// The nonblocking capture producer could not acquire the queue state immediately.
-    QueueContended,
+    /// The fixed queue's slot ownership or lifecycle invariant failed.
+    QueueInvariant,
     /// The fixed queue's synchronization state was poisoned.
     QueuePoisoned,
     /// The fixed queue sender count could not be incremented exactly.
@@ -198,9 +198,9 @@ pub enum CapturePublishError {
     /// The fixed queue was full at the count boundary.
     #[error("raw capture queue is full")]
     QueueFull,
-    /// The nonblocking publisher could not acquire the queue state immediately.
-    #[error("raw capture queue is contended")]
-    QueueContended,
+    /// The fixed queue's slot ownership or lifecycle invariant failed.
+    #[error("raw capture queue invariant failed")]
+    QueueInvariant,
     /// The fixed queue's synchronization state was poisoned.
     #[error("raw capture queue state is poisoned")]
     QueuePoisoned,
@@ -284,9 +284,6 @@ pub enum CapturePublisherCloneError {
     /// The queue has closed to new producers.
     #[error("raw capture queue is closed")]
     QueueClosed,
-    /// The queue synchronization state is poisoned.
-    #[error("raw capture queue state is poisoned")]
-    QueuePoisoned,
     /// The exact live sender count cannot be incremented.
     #[error("raw capture publisher count overflowed")]
     SenderCountOverflow,

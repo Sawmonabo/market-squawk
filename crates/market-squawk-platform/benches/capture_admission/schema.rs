@@ -11,7 +11,7 @@ use super::fixture::{
 };
 use std::collections::BTreeMap;
 
-pub(crate) const RESULT_SCHEMA_VERSION: u32 = 1;
+pub(crate) const RESULT_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -25,7 +25,7 @@ pub(crate) enum SustainedEpochPhase {
 pub(crate) struct OutcomeCounts {
     pub(crate) accepted: usize,
     pub(crate) queue_full: usize,
-    pub(crate) queue_contended: usize,
+    pub(crate) queue_invariant: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -35,6 +35,9 @@ pub(crate) struct PostDrainAccounting {
     pub(crate) consumed: usize,
     pub(crate) queued_bytes: usize,
     pub(crate) record_reservations: usize,
+    pub(crate) queue_private_storage_bytes: Option<usize>,
+    pub(crate) fixed_capture_bytes: Option<usize>,
+    pub(crate) total_accounted_bytes: Option<usize>,
     pub(crate) accounting_invariant_failures: u64,
 }
 
@@ -71,7 +74,13 @@ pub(crate) struct ComparableFullResult {
 pub(crate) struct ForcedLockResult {
     pub(crate) schema_version: u32,
     pub(crate) backend: String,
-    pub(crate) queue_contended: usize,
+    pub(crate) slot_lock_unavailable: usize,
+    pub(crate) accepted: usize,
+    pub(crate) consumed: usize,
+    pub(crate) queued_bytes: usize,
+    pub(crate) record_reservations: Option<usize>,
+    pub(crate) queue_private_storage_bytes: usize,
+    pub(crate) accounting_invariant_failures: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -89,7 +98,7 @@ pub(crate) struct SustainedResult {
     pub(crate) rss_interval_nanos: u64,
     pub(crate) accepted: usize,
     pub(crate) queue_full: usize,
-    pub(crate) queue_contended: usize,
+    pub(crate) queue_invariant: usize,
     pub(crate) elapsed_nanos: u64,
     pub(crate) rss_samples: Vec<RssSample>,
     pub(crate) epochs: Vec<SustainedEpochEvidence>,
@@ -128,6 +137,9 @@ pub(crate) fn validate_repetition(
         || !is_digest(&evidence.build_evidence_sha256)
         || evidence.measured_code_head != super::build_bindings::BUILD_GIT_HEAD
         || evidence.backend != super::backend::EVIDENCE_BACKEND
+        || evidence.queue_transport != super::backend::QUEUE_TRANSPORT
+        || evidence.queue_private_storage_accounting
+            != super::backend::QUEUE_PRIVATE_STORAGE_ACCOUNTING
         || evidence.repetition != expected_repetition
         || evidence.fixtures != super::backend::FIXTURES
     {
@@ -183,11 +195,12 @@ pub(crate) fn validate_repetition(
                         || cell.completed_operations != quota
                         || cell.outcomes.accepted != quota
                         || cell.outcomes.queue_full != 0
-                        || cell.outcomes.queue_contended != 0
+                        || cell.outcomes.queue_invariant != 0
                         || cell.post_drain.accepted != quota
                         || cell.post_drain.consumed != quota
                         || cell.post_drain.queued_bytes != 0
                         || cell.post_drain.record_reservations != 0
+                        || !post_drain_memory_is_valid(&cell.post_drain)
                         || cell.post_drain.accounting_invariant_failures != 0
                         || cell.elapsed_nanos == 0
                         || cell.throughput_per_second.to_bits() != exact_throughput.to_bits()
@@ -239,7 +252,13 @@ pub(crate) fn validate_repetition(
         || evidence.forced_lock.as_ref().is_some_and(|forced| {
             forced.schema_version != RESULT_SCHEMA_VERSION
                 || forced.backend != super::backend::EVIDENCE_BACKEND
-                || forced.queue_contended == 0
+                || forced.slot_lock_unavailable != 1
+                || forced.accepted != 0
+                || forced.consumed != 0
+                || forced.queued_bytes != 0
+                || forced.record_reservations.is_some()
+                || forced.queue_private_storage_bytes == 0
+                || forced.accounting_invariant_failures != 0
         })
         || sustained.schema_version != RESULT_SCHEMA_VERSION
         || sustained.backend != super::backend::EVIDENCE_BACKEND
@@ -253,7 +272,7 @@ pub(crate) fn validate_repetition(
         || sustained.rss_interval_nanos != duration_nanos(SUSTAINED_FIXTURE.rss_interval)?
         || sustained.accepted == 0
         || sustained.queue_full == 0
-        || sustained.queue_contended != 0
+        || sustained.queue_invariant != 0
         || u128::from(sustained.elapsed_nanos) < expected_sustained_nanos
         || u128::from(sustained.elapsed_nanos) > sustained_upper_nanos
         || sustained.rss_samples.len() != expected_rss_samples
@@ -315,7 +334,7 @@ fn validate_sustained_epochs(sustained: &SustainedResult) -> Result<(), String> 
             || epoch.elapsed_nanos < epoch.target_duration_nanos
             || epoch.outcomes.accepted == 0
             || epoch.outcomes.queue_full == 0
-            || epoch.outcomes.queue_contended != 0
+            || epoch.outcomes.queue_invariant != 0
             || epoch.active_rss_samples.len() != expected_samples
             || !validate_epoch_rss_samples(epoch, expected_samples)?
             || epoch.post_drain_rss_bytes == 0
@@ -323,6 +342,7 @@ fn validate_sustained_epochs(sustained: &SustainedResult) -> Result<(), String> 
             || epoch.post_drain.consumed != epoch.outcomes.accepted
             || epoch.post_drain.queued_bytes != 0
             || epoch.post_drain.record_reservations != 0
+            || !post_drain_memory_is_valid(&epoch.post_drain)
             || epoch.post_drain.accounting_invariant_failures != 0
         {
             return Err(format!("sustained epoch {index} is malformed"));
@@ -342,6 +362,69 @@ fn validate_sustained_epochs(sustained: &SustainedResult) -> Result<(), String> 
         || measured_samples != sustained.rss_samples
     {
         return Err("sustained epoch arithmetic does not reconcile".to_owned());
+    }
+    Ok(())
+}
+
+fn post_drain_memory_is_valid(accounting: &PostDrainAccounting) -> bool {
+    match super::backend::QUEUE_PRIVATE_STORAGE_ACCOUNTING {
+        "not_measured" => {
+            accounting.queue_private_storage_bytes.is_none()
+                && accounting.fixed_capture_bytes.is_none()
+                && accounting.total_accounted_bytes.is_none()
+        }
+        "exact" => matches!(
+            (
+                accounting.queue_private_storage_bytes,
+                accounting.fixed_capture_bytes,
+                accounting.total_accounted_bytes,
+            ),
+            (Some(queue), Some(fixed), Some(total))
+                if queue > 0 && fixed >= queue && total >= fixed
+        ),
+        _ => false,
+    }
+}
+
+pub(crate) fn self_check_post_drain_memory_contract() -> Result<(), String> {
+    let mut accounting = PostDrainAccounting {
+        accepted: 1,
+        consumed: 1,
+        queued_bytes: 0,
+        record_reservations: 0,
+        queue_private_storage_bytes: None,
+        fixed_capture_bytes: None,
+        total_accounted_bytes: None,
+        accounting_invariant_failures: 0,
+    };
+    match super::backend::QUEUE_PRIVATE_STORAGE_ACCOUNTING {
+        "not_measured" => {
+            if !post_drain_memory_is_valid(&accounting) {
+                return Err("standard opaque memory receipt was rejected".to_owned());
+            }
+            accounting.queue_private_storage_bytes = Some(1);
+            accounting.fixed_capture_bytes = Some(2);
+            accounting.total_accounted_bytes = Some(3);
+            if post_drain_memory_is_valid(&accounting) {
+                return Err("standard exact-memory forgery was accepted".to_owned());
+            }
+        }
+        "exact" => {
+            if post_drain_memory_is_valid(&accounting) {
+                return Err("candidate missing memory receipt was accepted".to_owned());
+            }
+            accounting.queue_private_storage_bytes = Some(1);
+            accounting.fixed_capture_bytes = Some(2);
+            accounting.total_accounted_bytes = Some(3);
+            if !post_drain_memory_is_valid(&accounting) {
+                return Err("candidate exact memory receipt was rejected".to_owned());
+            }
+            accounting.total_accounted_bytes = Some(1);
+            if post_drain_memory_is_valid(&accounting) {
+                return Err("candidate non-reconciling memory receipt was accepted".to_owned());
+            }
+        }
+        _ => return Err("unknown private-storage accounting identity".to_owned()),
     }
     Ok(())
 }
@@ -388,7 +471,7 @@ pub(crate) fn self_check_rss_sample_contract() -> Result<(), String> {
         outcomes: OutcomeCounts {
             accepted: 1,
             queue_full: 1,
-            queue_contended: 0,
+            queue_invariant: 0,
         },
         active_rss_samples: (0_u64..3)
             .map(|index| RssSample {
@@ -404,6 +487,21 @@ pub(crate) fn self_check_rss_sample_contract() -> Result<(), String> {
             consumed: 1,
             queued_bytes: 0,
             record_reservations: 0,
+            queue_private_storage_bytes: if super::backend::REQUIRES_BASELINE {
+                Some(1)
+            } else {
+                None
+            },
+            fixed_capture_bytes: if super::backend::REQUIRES_BASELINE {
+                Some(2)
+            } else {
+                None
+            },
+            total_accounted_bytes: if super::backend::REQUIRES_BASELINE {
+                Some(3)
+            } else {
+                None
+            },
             accounting_invariant_failures: 0,
         },
     };
@@ -502,6 +600,8 @@ pub(crate) struct RepetitionEvidence {
     pub(crate) build_evidence_sha256: String,
     pub(crate) measured_code_head: String,
     pub(crate) backend: String,
+    pub(crate) queue_transport: String,
+    pub(crate) queue_private_storage_accounting: String,
     pub(crate) repetition: u8,
     pub(crate) fixtures: Vec<String>,
     pub(crate) matrix: Vec<MatrixResult>,
@@ -517,6 +617,8 @@ pub(crate) struct BuildEvidence {
     pub(crate) runner: String,
     pub(crate) evidence_mode: String,
     pub(crate) evidence_backend: String,
+    pub(crate) queue_transport: String,
+    pub(crate) queue_private_storage_accounting: String,
     pub(crate) cargo_target: String,
     pub(crate) benchmark_feature: String,
     pub(crate) build_profile: String,
@@ -555,6 +657,9 @@ pub(crate) struct BuildEvidence {
     pub(crate) platform_source_sha256: String,
     pub(crate) domain_source_sha256: String,
     pub(crate) entrypoint_sha256: String,
+    pub(crate) backend_dispatcher_sha256: String,
+    pub(crate) selected_backend_source_path: String,
+    pub(crate) selected_backend_source_sha256: String,
     pub(crate) backend_sha256: String,
     pub(crate) criterion_sha256: String,
     pub(crate) observer_sha256: String,
@@ -577,6 +682,9 @@ impl BuildEvidence {
             || self.evidence_mode != super::benchmark_identity::FIXED_QUOTA_EVIDENCE_MODE
             || self.evidence_backend != super::backend::EVIDENCE_BACKEND
             || self.evidence_backend != super::build_bindings::BUILD_EVIDENCE_BACKEND
+            || self.queue_transport != super::backend::QUEUE_TRANSPORT
+            || self.queue_private_storage_accounting
+                != super::backend::QUEUE_PRIVATE_STORAGE_ACCOUNTING
             || self.cargo_target != super::benchmark_identity::EVIDENCE_TARGET
             || self.benchmark_feature != "capture-benchmark"
             || self.build_profile
@@ -632,6 +740,11 @@ impl BuildEvidence {
             || self.platform_source_sha256 != super::build_bindings::PLATFORM_SOURCE_SHA256
             || self.domain_source_sha256 != super::build_bindings::DOMAIN_SOURCE_SHA256
             || self.entrypoint_sha256 != super::build_bindings::ENTRYPOINT_SHA256
+            || self.backend_dispatcher_sha256 != super::build_bindings::BACKEND_DISPATCHER_SHA256
+            || self.selected_backend_source_path
+                != super::build_bindings::SELECTED_BACKEND_SOURCE_PATH
+            || self.selected_backend_source_sha256
+                != super::build_bindings::SELECTED_BACKEND_SOURCE_SHA256
             || self.backend_sha256 != super::build_bindings::BACKEND_SHA256
             || self.criterion_sha256 != super::build_bindings::CRITERION_SHA256
             || self.observer_sha256 != super::build_bindings::OBSERVER_SHA256
@@ -674,6 +787,8 @@ impl BuildEvidence {
             &self.platform_source_sha256,
             &self.domain_source_sha256,
             &self.entrypoint_sha256,
+            &self.backend_dispatcher_sha256,
+            &self.selected_backend_source_sha256,
             &self.backend_sha256,
             &self.criterion_sha256,
             &self.observer_sha256,
@@ -803,6 +918,8 @@ pub(crate) struct BaselineManifest {
     pub(crate) criterion_sha256: String,
     pub(crate) observer_sha256: String,
     pub(crate) backend: String,
+    pub(crate) queue_transport: String,
+    pub(crate) queue_private_storage_accounting: String,
     pub(crate) benchmark_support_feature: String,
     pub(crate) fixtures: Vec<String>,
     pub(crate) repetitions: Vec<u8>,
@@ -847,6 +964,8 @@ pub(crate) struct BaselineCompatibility {
     pub(crate) measured_code_head: String,
     pub(crate) build_evidence_sha256: String,
     pub(crate) backend: String,
+    pub(crate) queue_transport: String,
+    pub(crate) queue_private_storage_accounting: String,
     pub(crate) benchmark_support_feature: String,
     pub(crate) fixtures: Vec<String>,
     pub(crate) repetitions: Vec<u8>,
@@ -873,6 +992,8 @@ impl From<&BaselineManifest> for BaselineCompatibility {
             measured_code_head: manifest.measured_code_head.clone(),
             build_evidence_sha256: manifest.build_evidence_sha256.clone(),
             backend: manifest.backend.clone(),
+            queue_transport: manifest.queue_transport.clone(),
+            queue_private_storage_accounting: manifest.queue_private_storage_accounting.clone(),
             benchmark_support_feature: manifest.benchmark_support_feature.clone(),
             fixtures: manifest.fixtures.clone(),
             repetitions: manifest.repetitions.clone(),
@@ -907,6 +1028,8 @@ pub(crate) fn validate_candidate_baseline_compatibility(
         || baseline.evidence_mode != super::benchmark_identity::FIXED_QUOTA_EVIDENCE_MODE
         || baseline.criterion_evidence_mode != super::benchmark_identity::CRITERION_EVIDENCE_MODE
         || baseline.backend != "standard"
+        || baseline.queue_transport != "standard_sync_channel"
+        || baseline.queue_private_storage_accounting != "not_measured"
         || baseline.benchmark_support_feature != "capture-benchmark"
         || baseline.fixtures != ["matrix", "comparable_full", "sustained_rss"]
         || baseline.repetitions != [1, 2, 3, 4, 5]
@@ -933,6 +1056,9 @@ pub(crate) fn validate_candidate_baseline_compatibility(
         || expected.lock.approval_state != "independent_seed_review_approved"
         || expected.lock.approval_identity != "q2-a4-seed-checkpoint-review"
         || expected.lock.backend != "standard"
+        || expected.lock.queue_transport != baseline.queue_transport
+        || expected.lock.queue_private_storage_accounting
+            != baseline.queue_private_storage_accounting
         || expected.lock.backend_sha256 != baseline.backend_sha256
         || expected.lock.build_evidence_sha256 != baseline.build_evidence_sha256
         || expected.lock.artifact_sha256 != baseline.artifact_sha256
@@ -981,6 +1107,8 @@ pub(crate) struct BaselineLock {
     pub(crate) approval_state: String,
     pub(crate) approval_identity: String,
     pub(crate) backend: String,
+    pub(crate) queue_transport: String,
+    pub(crate) queue_private_storage_accounting: String,
     pub(crate) backend_sha256: String,
     pub(crate) build_evidence_sha256: String,
     pub(crate) immutable_module_sha256: BTreeMap<String, String>,
@@ -1010,6 +1138,8 @@ pub(crate) fn self_check_candidate_baseline_contracts() -> Result<(), String> {
         measured_code_head: baseline_head.clone(),
         build_evidence_sha256: "c".repeat(64),
         backend: "standard".to_owned(),
+        queue_transport: "standard_sync_channel".to_owned(),
+        queue_private_storage_accounting: "not_measured".to_owned(),
         benchmark_support_feature: "capture-benchmark".to_owned(),
         fixtures: vec![
             "matrix".to_owned(),
@@ -1043,6 +1173,8 @@ pub(crate) fn self_check_candidate_baseline_contracts() -> Result<(), String> {
         approval_state: "independent_seed_review_approved".to_owned(),
         approval_identity: "q2-a4-seed-checkpoint-review".to_owned(),
         backend: "standard".to_owned(),
+        queue_transport: baseline.queue_transport.clone(),
+        queue_private_storage_accounting: baseline.queue_private_storage_accounting.clone(),
         backend_sha256: baseline.backend_sha256.clone(),
         build_evidence_sha256: baseline.build_evidence_sha256.clone(),
         immutable_module_sha256: immutable.clone(),

@@ -9,25 +9,22 @@ use market_squawk_domain::{
     CaptureRetainedSizeError, MAX_LIVE_CAPTURE_PAYLOAD_BYTES, RawCaptureFrameView,
 };
 
-use super::queue::{FixedSender, TryCloneError, TrySendError};
+use super::queue::{TryCloneError, TrySendError};
+use super::transport::{CaptureQueueSender, CaptureQueueTransport, FixedRingTransport};
 use super::{
     CaptureHealthEvent, CaptureHealthReason, CaptureHealthSnapshot, CaptureIdentitySnapshot,
     CaptureMessage, CapturePublishError, CapturePublisherCloneError, CaptureState,
     RecordReservationQuote, WRITER_RUNNING,
 };
 
-/// Publisher that can only admit frames through its concrete bundle authority.
 #[derive(Debug)]
-pub struct RawCapturePublisher<B: CaptureAuthorityBundle> {
-    sender: FixedSender<CaptureMessage<B>>,
+pub(super) struct CapturePublisherCore<B: CaptureAuthorityBundle, T: CaptureQueueTransport> {
+    sender: T::Sender<CaptureMessage<B>>,
     state: Arc<CaptureState<B>>,
 }
 
-impl<B: CaptureAuthorityBundle> RawCapturePublisher<B> {
-    pub(super) const fn new(
-        sender: FixedSender<CaptureMessage<B>>,
-        state: Arc<CaptureState<B>>,
-    ) -> Self {
+impl<B: CaptureAuthorityBundle, T: CaptureQueueTransport> CapturePublisherCore<B, T> {
+    pub(super) fn new(sender: T::Sender<CaptureMessage<B>>, state: Arc<CaptureState<B>>) -> Self {
         Self { sender, state }
     }
 
@@ -35,19 +32,24 @@ impl<B: CaptureAuthorityBundle> RawCapturePublisher<B> {
     ///
     /// # Errors
     ///
-    /// Returns a typed failure when queue state is contended, closed, poisoned, or its exact
-    /// sender count cannot be incremented.
-    pub fn try_clone(&self) -> Result<Self, CapturePublisherCloneError> {
+    /// Returns a typed failure when the queue is closed or its exact sender count cannot be
+    /// incremented.
+    pub(super) fn try_clone(&self) -> Result<Self, CapturePublisherCloneError> {
+        self.try_clone_with(|sender| sender.try_clone())
+    }
+
+    fn try_clone_with(
+        &self,
+        clone_sender: impl FnOnce(
+            &T::Sender<CaptureMessage<B>>,
+        ) -> Result<T::Sender<CaptureMessage<B>>, TryCloneError>,
+    ) -> Result<Self, CapturePublisherCloneError> {
         let active = self.state.active.load_full();
-        let sender = self.sender.try_clone().map_err(|error| {
+        let sender = clone_sender(&self.sender).map_err(|error| {
             let (public, health) = match error {
                 TryCloneError::Closed => (
                     CapturePublisherCloneError::QueueClosed,
                     CaptureHealthReason::Closed,
-                ),
-                TryCloneError::Poisoned => (
-                    CapturePublisherCloneError::QueuePoisoned,
-                    CaptureHealthReason::QueuePoisoned,
                 ),
                 TryCloneError::CountOverflow => (
                     CapturePublisherCloneError::SenderCountOverflow,
@@ -64,12 +66,17 @@ impl<B: CaptureAuthorityBundle> RawCapturePublisher<B> {
     }
 
     #[cfg(feature = "capture-benchmark")]
-    pub(super) fn into_benchmark_sender(self) -> FixedSender<CaptureMessage<B>> {
+    pub(super) fn into_benchmark_sender(self) -> T::Sender<CaptureMessage<B>> {
         self.sender
     }
 
+    #[cfg(all(test, not(loom), feature = "capture-benchmark"))]
+    pub(super) fn benchmark_state_for_test(&self) -> Arc<CaptureState<B>> {
+        Arc::clone(&self.state)
+    }
+
     /// Admits one exact frame without waiting for queue or filesystem capacity.
-    pub fn try_publish(&self, frame: &B::Frame) -> Result<B::Receipt, CapturePublishError> {
+    pub(super) fn try_publish(&self, frame: &B::Frame) -> Result<B::Receipt, CapturePublishError> {
         let active = self.state.active.load_full();
         if self.state.writer_lifecycle.load(Ordering::Acquire) != WRITER_RUNNING
             || !active.accepting.load(Ordering::Acquire)
@@ -248,11 +255,6 @@ impl<B: CaptureAuthorityBundle> RawCapturePublisher<B> {
                     .mark_incomplete_for_generation(&active, CaptureHealthReason::QueueFull);
                 return Err(CapturePublishError::QueueFull);
             }
-            Err(TrySendError::Contended(_message)) => {
-                self.state
-                    .mark_incomplete_for_generation(&active, CaptureHealthReason::QueueContended);
-                return Err(CapturePublishError::QueueContended);
-            }
             Err(TrySendError::Closed(_message)) => {
                 self.state
                     .stop_writer_from_publisher(&active, CaptureHealthReason::Closed);
@@ -262,6 +264,11 @@ impl<B: CaptureAuthorityBundle> RawCapturePublisher<B> {
                 self.state
                     .stop_writer_from_publisher(&active, CaptureHealthReason::QueuePoisoned);
                 return Err(CapturePublishError::QueuePoisoned);
+            }
+            Err(TrySendError::Invariant(_message)) => {
+                self.state
+                    .stop_writer_from_publisher(&active, CaptureHealthReason::QueueInvariant);
+                return Err(CapturePublishError::QueueInvariant);
             }
         }
         let mut admission = match active.admission.try_lock() {
@@ -344,12 +351,12 @@ impl<B: CaptureAuthorityBundle> RawCapturePublisher<B> {
     }
 
     /// Returns the active audit identity.
-    pub fn identity(&self) -> CaptureHealthSnapshot {
+    pub(super) fn identity(&self) -> CaptureHealthSnapshot {
         self.health_snapshot()
     }
 
     /// Returns one exact identity-and-integrity snapshot.
-    pub fn health_snapshot(&self) -> CaptureHealthSnapshot {
+    pub(super) fn health_snapshot(&self) -> CaptureHealthSnapshot {
         let active = self.state.active.load_full();
         CaptureHealthSnapshot {
             identity: CaptureIdentitySnapshot(Arc::clone(&active.identity)),
@@ -358,43 +365,165 @@ impl<B: CaptureAuthorityBundle> RawCapturePublisher<B> {
     }
 
     /// Returns current capture integrity.
-    pub fn integrity(&self) -> CaptureIntegrityState {
+    pub(super) fn integrity(&self) -> CaptureIntegrityState {
         self.health_snapshot().integrity()
     }
 
     /// Polls one bounded health event without blocking.
-    pub fn try_next_health(&self) -> Option<CaptureHealthEvent> {
+    pub(super) fn try_next_health(&self) -> Option<CaptureHealthEvent> {
         self.state.health_receiver.try_recv().ok()
     }
 
     /// Returns bounded health events dropped due to control-plane saturation.
-    pub fn dropped_health_events(&self) -> u64 {
+    pub(super) fn dropped_health_events(&self) -> u64 {
         self.state.dropped_health_events.load(Ordering::Acquire)
     }
 
     /// Returns the exact configured logical fixed-ring depth.
+    pub(super) fn fixed_queue_capacity(&self) -> usize {
+        self.state.queue_storage.logical_capacity()
+    }
+
+    /// Returns the allocator-observed retained slot count backing the fixed ring.
+    pub(super) fn fixed_queue_observed_slot_capacity(&self) -> usize {
+        // This method is only exposed through `RawCapturePublisher<FixedRingTransport>`.
+        self.state
+            .queue_storage
+            .observed_slot_capacity()
+            .unwrap_or(0)
+    }
+
+    /// Returns the retained bytes of the allocator-observed fixed slot backing allocation.
+    pub(super) fn fixed_queue_slot_bytes(&self) -> usize {
+        // This method is only exposed through `RawCapturePublisher<FixedRingTransport>`.
+        self.state.queue_storage.retained_slot_bytes().unwrap_or(0)
+    }
+
+    /// Returns the allocator-observed retained bytes for the complete record queue allocation.
+    pub(super) fn fixed_queue_retained_bytes(&self) -> usize {
+        // This method is only exposed through `RawCapturePublisher<FixedRingTransport>`.
+        self.state.queue_storage.retained_queue_bytes().unwrap_or(0)
+    }
+
+    #[cfg(feature = "capture-benchmark")]
+    pub(super) fn benchmark_queue_private_storage_bytes(&self) -> Option<usize> {
+        self.state.queue_storage.retained_queue_bytes()
+    }
+
+    /// Returns the exact configured logical health-ring depth.
+    pub(super) fn fixed_health_queue_capacity(&self) -> usize {
+        self.state.health_fixed_storage.logical_capacity()
+    }
+
+    /// Attempts one coherent bounded unified-accounting snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns contention only after exhausting `max_attempts`, or a durable typed terminal
+    /// accounting state. No independent component read is exposed.
+    pub(super) fn try_accounting_snapshot(
+        &self,
+        max_attempts: std::num::NonZeroUsize,
+    ) -> Result<
+        super::accounting::CaptureAccountingSnapshot,
+        super::accounting::CaptureAccountingSnapshotError,
+    > {
+        self.state.accounting.try_snapshot(max_attempts)
+    }
+}
+
+/// Publisher that can only admit frames through its concrete bundle authority.
+#[derive(Debug)]
+pub struct RawCapturePublisher<B: CaptureAuthorityBundle> {
+    core: CapturePublisherCore<B, FixedRingTransport>,
+}
+
+impl<B: CaptureAuthorityBundle> RawCapturePublisher<B> {
+    pub(super) const fn from_core(core: CapturePublisherCore<B, FixedRingTransport>) -> Self {
+        Self { core }
+    }
+
+    /// Creates another publisher without blocking on queue synchronization.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed failure when the queue is closed or its exact sender count cannot be
+    /// incremented.
+    pub fn try_clone(&self) -> Result<Self, CapturePublisherCloneError> {
+        self.core.try_clone().map(Self::from_core)
+    }
+
+    /// Creates another publisher after pausing an admitted clone at a deterministic test barrier.
+    ///
+    /// This boundary exists only in debug builds with the internal `capture-test` feature. It
+    /// exposes no queue state and does not change production clone behavior.
+    #[cfg(all(feature = "capture-test", debug_assertions, not(loom)))]
+    #[doc(hidden)]
+    pub fn try_clone_after_registration_paused_for_test(
+        &self,
+        entered: &std::sync::Barrier,
+        release: &std::sync::Barrier,
+    ) -> Result<Self, CapturePublisherCloneError> {
+        self.core
+            .try_clone_with(|sender| {
+                sender.try_clone_after_registration_paused_for_test(entered, release)
+            })
+            .map(Self::from_core)
+    }
+
+    /// Admits one exact frame without waiting for queue or filesystem capacity.
+    pub fn try_publish(&self, frame: &B::Frame) -> Result<B::Receipt, CapturePublishError> {
+        self.core.try_publish(frame)
+    }
+
+    /// Returns the active audit identity.
+    pub fn identity(&self) -> CaptureHealthSnapshot {
+        self.core.identity()
+    }
+
+    /// Returns one exact identity-and-integrity snapshot.
+    pub fn health_snapshot(&self) -> CaptureHealthSnapshot {
+        self.core.health_snapshot()
+    }
+
+    /// Returns current capture integrity.
+    pub fn integrity(&self) -> CaptureIntegrityState {
+        self.core.integrity()
+    }
+
+    /// Polls one bounded health event without blocking.
+    pub fn try_next_health(&self) -> Option<CaptureHealthEvent> {
+        self.core.try_next_health()
+    }
+
+    /// Returns bounded health events dropped due to control-plane saturation.
+    pub fn dropped_health_events(&self) -> u64 {
+        self.core.dropped_health_events()
+    }
+
+    /// Returns the exact configured logical fixed-ring depth.
     pub fn fixed_queue_capacity(&self) -> usize {
-        self.state.fixed_storage.logical_capacity()
+        self.core.fixed_queue_capacity()
     }
 
     /// Returns the allocator-observed retained slot count backing the fixed ring.
     pub fn fixed_queue_observed_slot_capacity(&self) -> usize {
-        self.state.fixed_storage.observed_slot_capacity()
+        self.core.fixed_queue_observed_slot_capacity()
     }
 
     /// Returns the retained bytes of the allocator-observed fixed slot backing allocation.
     pub fn fixed_queue_slot_bytes(&self) -> usize {
-        self.state.fixed_storage.retained_slot_bytes()
+        self.core.fixed_queue_slot_bytes()
     }
 
     /// Returns the allocator-observed retained bytes for the complete record queue allocation.
     pub fn fixed_queue_retained_bytes(&self) -> usize {
-        self.state.fixed_storage.retained_queue_bytes()
+        self.core.fixed_queue_retained_bytes()
     }
 
     /// Returns the exact configured logical health-ring depth.
     pub fn fixed_health_queue_capacity(&self) -> usize {
-        self.state.health_fixed_storage.logical_capacity()
+        self.core.fixed_health_queue_capacity()
     }
 
     /// Attempts one coherent bounded unified-accounting snapshot.
@@ -410,6 +539,6 @@ impl<B: CaptureAuthorityBundle> RawCapturePublisher<B> {
         super::accounting::CaptureAccountingSnapshot,
         super::accounting::CaptureAccountingSnapshotError,
     > {
-        self.state.accounting.try_snapshot(max_attempts)
+        self.core.try_accounting_snapshot(max_attempts)
     }
 }

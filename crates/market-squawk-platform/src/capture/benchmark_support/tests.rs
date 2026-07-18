@@ -5,9 +5,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use super::{
-    BenchmarkAttemptOutcome, BenchmarkCase, BenchmarkConcurrentAttemptOutcome,
-    BenchmarkOfferedLoadCase, BenchmarkOfferedLoadOutcome, BenchmarkOperation,
-    BenchmarkSupportError, benchmark_effective_capacity,
+    BenchmarkAttemptOutcome, BenchmarkCase, BenchmarkOfferedLoadCase, BenchmarkOfferedLoadOutcome,
+    BenchmarkOperation, BenchmarkSupportError, benchmark_effective_capacity,
     fixture::{BENCHMARK_RECORD_RESERVATION_BUDGET_BYTES, reservation_bytes_for_test},
     verify_comparable_full,
 };
@@ -137,12 +136,12 @@ fn queue_push_concurrent_start_reports_truthful_outcomes_and_reconciles()
             let first_start = Arc::clone(&start);
             let first = scope.spawn(move || {
                 first_start.arrive_and_wait(Duration::from_secs(1))?;
-                first.execute_concurrent_for_test()
+                first.execute()
             });
             let second_start = Arc::clone(&start);
             let second = scope.spawn(move || {
                 second_start.arrive_and_wait(Duration::from_secs(1))?;
-                second.execute_concurrent_for_test()
+                second.execute()
             });
             start.release_when_ready(Duration::from_secs(1))?;
             [
@@ -158,18 +157,11 @@ fn queue_push_concurrent_start_reports_truthful_outcomes_and_reconciles()
         })
     })??;
     let mut accepted = 0_usize;
-    let mut contended = 0_usize;
     for outcome in outcomes {
-        match outcome {
-            BenchmarkConcurrentAttemptOutcome::Accepted(attempt) => {
-                assert_eq!(attempt.outcome(), BenchmarkAttemptOutcome::Accepted);
-                accepted += 1;
-            }
-            BenchmarkConcurrentAttemptOutcome::Contended => contended += 1,
-        }
+        assert_eq!(outcome.outcome(), BenchmarkAttemptOutcome::Accepted);
+        accepted += 1;
     }
-    assert!(accepted >= 1);
-    assert_eq!(accepted + contended, 2);
+    assert_eq!(accepted, 2);
     let reconciliation = case.finish()?;
     assert_eq!(reconciliation.accepted(), accepted);
     assert_eq!(reconciliation.consumed(), accepted);
@@ -232,7 +224,7 @@ fn effective_capacity_reports_exact_byte_budget_cap_and_one_over()
 }
 
 #[test]
-fn comparable_full_uses_the_real_standard_capture_queue() -> Result<(), Box<dyn std::error::Error>>
+fn comparable_full_uses_the_real_selected_capture_queue() -> Result<(), Box<dyn std::error::Error>>
 {
     verify_comparable_full()?;
     Ok(())
@@ -284,5 +276,19 @@ fn offered_load_queue_reports_real_refusals_and_reconciles()
     let reconciliation = case.finish()?;
     assert_eq!(reconciliation.accepted(), 1);
     assert_eq!(reconciliation.consumed(), 1);
+    Ok(())
+}
+
+#[test]
+fn candidate_forced_lock_uses_one_real_fixed_ring_attempt_and_reconciles()
+-> Result<(), Box<dyn std::error::Error>> {
+    let result = super::run_candidate_forced_lock_for_test()?;
+    assert_eq!(result.slot_lock_unavailable(), 1);
+    assert_eq!(result.accepted(), 0);
+    assert_eq!(result.consumed(), 0);
+    assert_eq!(result.queued_bytes(), 0);
+    assert_eq!(result.record_reservations(), None);
+    assert!(result.queue_private_storage_bytes() > 0);
+    assert_eq!(result.accounting_invariant_failures(), 0);
     Ok(())
 }

@@ -1,25 +1,31 @@
-//! Production standard-channel queue endpoints with single receiver ownership.
+//! Compile-time-selected queue endpoints with single receiver ownership.
 
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
+#[cfg(any(test, capture_bench_backend = "candidate"))]
+use super::super::capture_channel_core;
 use super::super::queue::{
-    FixedReceiver, FixedSender, RecvTimeoutError as FixedRecvTimeoutError,
-    TrySendError as FixedTrySendError,
+    RecvTimeoutError as FixedRecvTimeoutError, TrySendError as FixedTrySendError,
 };
+use super::super::transport::CaptureQueueTransport;
+#[cfg(any(test, capture_bench_backend = "candidate"))]
+use super::super::transport::FixedRingTransport;
+#[cfg(all(not(test), capture_bench_backend = "standard"))]
+use super::super::transport::{CaptureQueueReceiver, CaptureQueueSender};
 use super::super::{
-    CaptureMessage, DiagnosticCaptureBundle, RawCaptureControl, RawCaptureWriter,
-    raw_capture_channel,
+    BenchmarkCaptureWriter, CaptureMessage, DiagnosticCaptureBundle, RawCaptureControl,
+    SelectedBenchmarkTransport, benchmark_capture_channel,
 };
-#[cfg(test)]
-use super::BenchmarkConcurrentAttemptOutcome;
 use super::fixture::{
     MessageFactory, channel_limits, fixture_identity, prepare_fixture, process_infrastructure,
 };
 use super::observer::{LatencyObserver, measure_operation};
 use super::permit::{AcquiredPermit, PermitCoordinator};
+#[cfg(any(test, capture_bench_backend = "candidate"))]
+use super::types::BenchmarkForcedLockReconciliation;
 use super::types::{
     BenchmarkAttempt, BenchmarkCaseReconciliation, BenchmarkOfferedLoadOutcome,
     BenchmarkOfferedLoadReconciliation, BenchmarkOperation, BenchmarkSupportError, increment,
@@ -27,16 +33,88 @@ use super::types::{
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
+type BenchmarkSender = <SelectedBenchmarkTransport as CaptureQueueTransport>::Sender<
+    CaptureMessage<DiagnosticCaptureBundle>,
+>;
+type BenchmarkReceiver = <SelectedBenchmarkTransport as CaptureQueueTransport>::Receiver<
+    CaptureMessage<DiagnosticCaptureBundle>,
+>;
+
+#[cfg(any(test, capture_bench_backend = "candidate"))]
+pub(super) fn run_candidate_forced_lock()
+-> Result<BenchmarkForcedLockReconciliation, BenchmarkSupportError> {
+    let fixture = prepare_fixture(0, NonZeroUsize::MIN)?;
+    let bundle = DiagnosticCaptureBundle::new(fixture_identity()?);
+    let process = process_infrastructure()?;
+    let (publisher, _control, mut writer) = capture_channel_core::<_, FixedRingTransport>(
+        &process,
+        channel_limits(NonZeroUsize::MIN),
+        bundle,
+    )
+    .map_err(|_error| BenchmarkSupportError::CaptureComposition)?;
+    let messages = MessageFactory::try_new(Arc::clone(&writer.state), fixture.frame)?;
+    let holder = publisher.into_benchmark_sender();
+    let contender = holder
+        .try_clone()
+        .map_err(|_error| BenchmarkSupportError::CaptureComposition)?;
+    let message = messages.prepare()?;
+    let attempt = holder
+        .with_state_locked_for_benchmark(|| contender.try_send(message))
+        .map_err(|_error| BenchmarkSupportError::SynchronizationPoisoned)?;
+    match attempt {
+        Err(FixedTrySendError::Invariant(returned)) => drop(returned),
+        Ok(())
+        | Err(
+            FixedTrySendError::Full(_)
+            | FixedTrySendError::Closed(_)
+            | FixedTrySendError::Poisoned(_),
+        ) => return Err(BenchmarkSupportError::ObservationInvariant),
+    }
+    writer
+        .queue_control
+        .close_and_drain()
+        .map_err(|_error| BenchmarkSupportError::Reconciliation)?;
+    let receiver = writer
+        .receiver
+        .take()
+        .ok_or(BenchmarkSupportError::Reconciliation)?;
+    if !matches!(
+        receiver.try_recv(),
+        Err(super::super::queue::TryRecvError::Closed)
+    ) {
+        return Err(BenchmarkSupportError::ObservationInvariant);
+    }
+    let accounting = writer
+        .state
+        .accounting
+        .try_snapshot(NonZeroUsize::new(64).unwrap_or(NonZeroUsize::MIN))
+        .map_err(|_error| BenchmarkSupportError::Reconciliation)?;
+    let queue_private_storage_bytes = writer
+        .state
+        .queue_storage
+        .retained_queue_bytes()
+        .ok_or(BenchmarkSupportError::ObservationInvariant)?;
+    Ok(BenchmarkForcedLockReconciliation {
+        slot_lock_unavailable: 1,
+        accepted: 0,
+        consumed: 0,
+        queued_bytes: accounting.record_reservation_bytes(),
+        record_reservations: None,
+        queue_private_storage_bytes,
+        accounting_invariant_failures: accounting.accounting_invariant_failures(),
+    })
+}
+
 #[derive(Debug)]
 pub(super) enum QueueProducerFactory {
     Push {
-        sender: FixedSender<CaptureMessage<DiagnosticCaptureBundle>>,
+        sender: BenchmarkSender,
         messages: Arc<MessageFactory>,
         permits: Arc<PermitCoordinator>,
         accepted: Arc<AtomicUsize>,
     },
     Pop {
-        sender: FixedSender<CaptureMessage<DiagnosticCaptureBundle>>,
+        sender: BenchmarkSender,
         messages: Arc<MessageFactory>,
         permits: Arc<PermitCoordinator>,
         requests: mpsc::SyncSender<PopRequest>,
@@ -47,13 +125,13 @@ pub(super) enum QueueProducerFactory {
 #[derive(Debug)]
 pub(super) enum QueueProducer {
     Push {
-        sender: FixedSender<CaptureMessage<DiagnosticCaptureBundle>>,
+        sender: BenchmarkSender,
         messages: Arc<MessageFactory>,
         permits: Arc<PermitCoordinator>,
         accepted: Arc<AtomicUsize>,
     },
     Pop {
-        sender: FixedSender<CaptureMessage<DiagnosticCaptureBundle>>,
+        sender: BenchmarkSender,
         messages: Arc<MessageFactory>,
         permits: Arc<PermitCoordinator>,
         requests: mpsc::SyncSender<PopRequest>,
@@ -64,13 +142,13 @@ pub(super) enum QueueProducer {
 #[derive(Debug)]
 pub(super) enum PreparedQueueOperation {
     Push {
-        sender: FixedSender<CaptureMessage<DiagnosticCaptureBundle>>,
+        sender: BenchmarkSender,
         message: CaptureMessage<DiagnosticCaptureBundle>,
         permit: AcquiredPermit,
         accepted: Arc<AtomicUsize>,
     },
     Pop {
-        sender: FixedSender<CaptureMessage<DiagnosticCaptureBundle>>,
+        sender: BenchmarkSender,
         message: CaptureMessage<DiagnosticCaptureBundle>,
         requests: mpsc::SyncSender<PopRequest>,
         request: PopRequest,
@@ -91,7 +169,7 @@ pub(super) struct QueueLifecycle {
     operation: BenchmarkOperation,
     latency_observer: Arc<LatencyObserver>,
     _control: RawCaptureControl<DiagnosticCaptureBundle>,
-    writer: RawCaptureWriter<DiagnosticCaptureBundle>,
+    writer: BenchmarkCaptureWriter<DiagnosticCaptureBundle>,
 }
 
 #[derive(Debug)]
@@ -101,14 +179,14 @@ pub(super) struct PopRequest {
 
 #[derive(Debug)]
 pub(super) struct OfferedLoadProducerFactory {
-    sender: FixedSender<CaptureMessage<DiagnosticCaptureBundle>>,
+    sender: BenchmarkSender,
     messages: Arc<MessageFactory>,
     accepted: Arc<AtomicUsize>,
 }
 
 #[derive(Debug)]
 pub(super) struct OfferedLoadProducer {
-    sender: FixedSender<CaptureMessage<DiagnosticCaptureBundle>>,
+    sender: BenchmarkSender,
     messages: Arc<MessageFactory>,
     accepted: Arc<AtomicUsize>,
 }
@@ -121,7 +199,7 @@ pub(super) struct OfferedLoadLifecycle {
     accepted: Arc<AtomicUsize>,
     consumed: Arc<AtomicUsize>,
     _control: RawCaptureControl<DiagnosticCaptureBundle>,
-    writer: RawCaptureWriter<DiagnosticCaptureBundle>,
+    writer: BenchmarkCaptureWriter<DiagnosticCaptureBundle>,
 }
 
 pub(super) fn prepare_offered_load(
@@ -132,7 +210,7 @@ pub(super) fn prepare_offered_load(
     let bundle = DiagnosticCaptureBundle::new(fixture_identity()?);
     let process = process_infrastructure()?;
     let (publisher, control, mut writer) =
-        raw_capture_channel(&process, channel_limits(queue_depth), bundle)
+        benchmark_capture_channel(&process, channel_limits(queue_depth), bundle)
             .map_err(|_error| BenchmarkSupportError::CaptureComposition)?;
     let sender = publisher.into_benchmark_sender();
     let receiver = writer
@@ -181,7 +259,7 @@ pub(super) fn prepare(
     let bundle = DiagnosticCaptureBundle::new(fixture_identity()?);
     let process = process_infrastructure()?;
     let (publisher, control, mut writer) =
-        raw_capture_channel(&process, channel_limits(queue_depth), bundle)
+        benchmark_capture_channel(&process, channel_limits(queue_depth), bundle)
             .map_err(|_error| BenchmarkSupportError::CaptureComposition)?;
     let sender = publisher.into_benchmark_sender();
     let receiver = writer
@@ -323,9 +401,9 @@ impl OfferedLoadProducer {
             }
             Err(FixedTrySendError::Full(_message)) => Ok(BenchmarkOfferedLoadOutcome::QueueFull),
             Err(
-                FixedTrySendError::Contended(_message)
-                | FixedTrySendError::Closed(_message)
-                | FixedTrySendError::Poisoned(_message),
+                FixedTrySendError::Closed(_message)
+                | FixedTrySendError::Poisoned(_message)
+                | FixedTrySendError::Invariant(_message),
             ) => Err(BenchmarkSupportError::Reconciliation),
         }
     }
@@ -381,13 +459,6 @@ impl QueueProducer {
 
 impl PreparedQueueOperation {
     pub(super) fn execute(self) -> Result<BenchmarkAttempt, BenchmarkSupportError> {
-        match self.execute_classified()? {
-            PreparedQueueExecution::Accepted(attempt) => Ok(attempt),
-            PreparedQueueExecution::Contended => Err(BenchmarkSupportError::UnexpectedRefusal),
-        }
-    }
-
-    fn execute_classified(self) -> Result<PreparedQueueExecution, BenchmarkSupportError> {
         match self {
             Self::Push {
                 sender,
@@ -398,20 +469,16 @@ impl PreparedQueueOperation {
                 let (result, latency_nanos) = measure_operation(|| sender.try_send(message))?;
                 match result {
                     Ok(()) => {}
-                    Err(FixedTrySendError::Contended(_message)) => {
-                        return Ok(PreparedQueueExecution::Contended);
-                    }
                     Err(
                         FixedTrySendError::Full(_message)
                         | FixedTrySendError::Closed(_message)
-                        | FixedTrySendError::Poisoned(_message),
+                        | FixedTrySendError::Poisoned(_message)
+                        | FixedTrySendError::Invariant(_message),
                     ) => return Err(BenchmarkSupportError::UnexpectedRefusal),
                 }
                 increment(&accepted)?;
                 permit.commit();
-                Ok(PreparedQueueExecution::Accepted(BenchmarkAttempt {
-                    latency_nanos,
-                }))
+                Ok(BenchmarkAttempt { latency_nanos })
             }
             Self::Pop {
                 sender,
@@ -424,13 +491,11 @@ impl PreparedQueueOperation {
             } => {
                 match sender.try_send(message) {
                     Ok(()) => {}
-                    Err(FixedTrySendError::Contended(_message)) => {
-                        return Ok(PreparedQueueExecution::Contended);
-                    }
                     Err(
                         FixedTrySendError::Full(_message)
                         | FixedTrySendError::Closed(_message)
-                        | FixedTrySendError::Poisoned(_message),
+                        | FixedTrySendError::Poisoned(_message)
+                        | FixedTrySendError::Invariant(_message),
                     ) => return Err(BenchmarkSupportError::UnexpectedRefusal),
                 }
                 requests
@@ -441,30 +506,10 @@ impl PreparedQueueOperation {
                     .map_err(|_error| BenchmarkSupportError::Reconciliation)??;
                 increment(&accepted)?;
                 permit.commit();
-                Ok(PreparedQueueExecution::Accepted(BenchmarkAttempt {
-                    latency_nanos: 0,
-                }))
+                Ok(BenchmarkAttempt { latency_nanos: 0 })
             }
         }
     }
-
-    #[cfg(test)]
-    pub(super) fn execute_concurrent_for_test(
-        self,
-    ) -> Result<BenchmarkConcurrentAttemptOutcome, BenchmarkSupportError> {
-        Ok(match self.execute_classified()? {
-            PreparedQueueExecution::Accepted(attempt) => {
-                BenchmarkConcurrentAttemptOutcome::Accepted(attempt)
-            }
-            PreparedQueueExecution::Contended => BenchmarkConcurrentAttemptOutcome::Contended,
-        })
-    }
-}
-
-#[derive(Debug)]
-enum PreparedQueueExecution {
-    Accepted(BenchmarkAttempt),
-    Contended,
 }
 
 impl QueueLifecycle {
@@ -524,6 +569,10 @@ impl QueueLifecycle {
             .map_err(|_error| BenchmarkSupportError::Reconciliation)?;
         let queued_bytes = accounting.record_reservation_bytes();
         let accounting_invariant_failures = accounting.accounting_invariant_failures();
+        let memory = super::benchmark_memory_receipt(
+            self.writer.state.queue_storage.retained_queue_bytes(),
+            accounting,
+        )?;
         let accepted = self.accepted.load(Ordering::Acquire);
         let consumed = self.consumed.load(Ordering::Acquire);
         if queued_bytes != 0 || accounting_invariant_failures != 0 || accepted != consumed {
@@ -539,6 +588,9 @@ impl QueueLifecycle {
             consumed,
             deferred_samples: self.latency_observer.take_exact(expected_samples)?,
             queued_bytes,
+            queue_private_storage_bytes: memory.queue_private_storage_bytes,
+            fixed_capture_bytes: memory.fixed_capture_bytes,
+            total_accounted_bytes: memory.total_accounted_bytes,
             accounting_invariant_failures,
         })
     }
@@ -583,6 +635,10 @@ impl OfferedLoadLifecycle {
             .map_err(|_error| BenchmarkSupportError::Reconciliation)?;
         let queued_bytes = accounting.record_reservation_bytes();
         let accounting_invariant_failures = accounting.accounting_invariant_failures();
+        let memory = super::benchmark_memory_receipt(
+            self.writer.state.queue_storage.retained_queue_bytes(),
+            accounting,
+        )?;
         if !joined
             || self.failed.load(Ordering::Acquire)
             || accepted != consumed
@@ -595,6 +651,9 @@ impl OfferedLoadLifecycle {
             accepted,
             consumed,
             queued_bytes,
+            queue_private_storage_bytes: memory.queue_private_storage_bytes,
+            fixed_capture_bytes: memory.fixed_capture_bytes,
+            total_accounted_bytes: memory.total_accounted_bytes,
             accounting_invariant_failures,
         })
     }
@@ -619,7 +678,7 @@ pub(super) fn verify_comparable_full() -> Result<(), BenchmarkSupportError> {
     let bundle = DiagnosticCaptureBundle::new(fixture_identity()?);
     let process = process_infrastructure()?;
     let (publisher, _control, writer) =
-        raw_capture_channel(&process, channel_limits(NonZeroUsize::MIN), bundle)
+        benchmark_capture_channel(&process, channel_limits(NonZeroUsize::MIN), bundle)
             .map_err(|_error| BenchmarkSupportError::CaptureComposition)?;
     let factory = MessageFactory::try_new(Arc::clone(&writer.state), fixture.frame)?;
     let sender = publisher.into_benchmark_sender();
@@ -630,15 +689,15 @@ pub(super) fn verify_comparable_full() -> Result<(), BenchmarkSupportError> {
         Err(FixedTrySendError::Full(_message)) => Ok(()),
         Ok(())
         | Err(
-            FixedTrySendError::Contended(_)
-            | FixedTrySendError::Closed(_)
-            | FixedTrySendError::Poisoned(_),
+            FixedTrySendError::Closed(_)
+            | FixedTrySendError::Poisoned(_)
+            | FixedTrySendError::Invariant(_),
         ) => Err(BenchmarkSupportError::UnexpectedRefusal),
     }
 }
 
 fn spawn_push_consumer(
-    receiver: FixedReceiver<CaptureMessage<DiagnosticCaptureBundle>>,
+    receiver: BenchmarkReceiver,
     permits: Arc<PermitCoordinator>,
     consumed: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
@@ -668,7 +727,7 @@ fn spawn_push_consumer(
 }
 
 fn spawn_single_pop_consumer(
-    receiver: FixedReceiver<CaptureMessage<DiagnosticCaptureBundle>>,
+    receiver: BenchmarkReceiver,
     requests: mpsc::Receiver<PopRequest>,
     permits: Arc<PermitCoordinator>,
     consumed: Arc<AtomicUsize>,
@@ -710,7 +769,7 @@ fn spawn_single_pop_consumer(
 }
 
 fn spawn_offered_load_consumer(
-    receiver: FixedReceiver<CaptureMessage<DiagnosticCaptureBundle>>,
+    receiver: BenchmarkReceiver,
     consumed: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
     failed: Arc<AtomicBool>,
