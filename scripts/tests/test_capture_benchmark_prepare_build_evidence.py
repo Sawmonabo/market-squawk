@@ -302,6 +302,9 @@ def initialize_fixture_repository(root: Path) -> tuple[Path, str]:
 class BuildEvidenceTest(unittest.TestCase):
     def test_cargo_resolution_returns_the_direct_cargo_executable(self) -> None:
         cargo, digest = resolve_external_tool("cargo", dict(os.environ))
+        rustup_path = shutil.which("rustup")
+        self.assertIsNotNone(rustup_path)
+        rustup = Path(os.path.realpath(rustup_path or ""))
         completed = bounded_process(
             [str(cargo), "--version"],
             cwd=REPOSITORY,
@@ -312,7 +315,46 @@ class BuildEvidenceTest(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 0, completed.stderr.decode(errors="replace"))
         self.assertTrue(completed.stdout.startswith(b"cargo "), completed.stdout)
+        self.assertFalse(os.path.samefile(cargo, rustup))
         self.assertEqual(external_tool_hash(cargo), digest)
+
+    def test_cargo_resolution_detects_a_hard_linked_rustup_proxy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            rustup = root / "rustup"
+            rustup.write_bytes(b"rustup-proxy")
+            cargo_proxy = root / "cargo"
+            os.link(rustup, cargo_proxy)
+            direct = root / "toolchain" / "cargo"
+            direct.parent.mkdir()
+            direct.write_bytes(b"direct-cargo")
+            completed = subprocess.CompletedProcess(
+                args=[str(rustup), "which", "cargo"],
+                returncode=0,
+                stdout=f"{direct}\n".encode(),
+                stderr=b"",
+            )
+            with (
+                mock.patch(
+                    "scripts.capture_benchmark_prepare_build_evidence.shutil.which",
+                    side_effect=lambda name, path=None: str(
+                        {"cargo": cargo_proxy, "rustup": rustup}[name]
+                    ),
+                ),
+                mock.patch(
+                    "scripts.capture_benchmark_prepare_build_evidence.bounded_process",
+                    return_value=completed,
+                ) as run,
+            ):
+                resolved, digest = resolve_external_tool(
+                    "cargo", {"PATH": str(root), "HOME": str(root)}
+                )
+            self.assertEqual(resolved, Path(os.path.realpath(direct)))
+            self.assertEqual(digest, external_tool_hash(direct))
+            self.assertEqual(
+                run.call_args.args[0],
+                [str(Path(os.path.realpath(rustup))), "which", "cargo"],
+            )
 
     def test_backend_binding_has_canonical_golden_vectors(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

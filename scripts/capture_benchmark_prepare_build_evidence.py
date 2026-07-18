@@ -293,19 +293,30 @@ def resolve_external_tool(name: str, environment: dict[str, str]) -> tuple[Path,
     path = shutil.which(name, path=environment.get("PATH"))
     if path is None:
         raise GateError(f"closed build could not resolve required {name} executable")
-    canonical = Path(os.path.realpath(path))
+    discovered = Path(path)
+    canonical = Path(os.path.realpath(discovered))
     if not canonical.is_absolute():
         raise GateError("closed build tool did not resolve to an absolute path")
-    if canonical.name in {"rustup", "rustup.exe"}:
+    rustup_path = shutil.which("rustup", path=environment.get("PATH"))
+    rustup = Path(os.path.realpath(rustup_path)) if rustup_path is not None else None
+    rustup_proxy = canonical.name in {"rustup", "rustup.exe"}
+    if rustup is not None:
+        try:
+            rustup_proxy = rustup_proxy or os.path.samefile(discovered, rustup_path)
+        except OSError as error:
+            raise GateError("closed build could not bind the rustup proxy identity") from error
+    if rustup_proxy:
         if name not in {"cargo", "rustc"}:
             raise GateError("closed build found an unexpected rustup proxy")
+        rustup = rustup or canonical
+        external_tool_hash(rustup)
         resolver_environment = {
             key: environment[key]
             for key in ("PATH", "HOME", "RUSTUP_HOME")
             if key in environment and environment[key]
         }
         resolved = bounded_process(
-            [str(canonical), "which", name],
+            [str(rustup), "which", name],
             cwd=Path(__file__).resolve().parents[1],
             env=resolver_environment,
             timeout_seconds=10,
