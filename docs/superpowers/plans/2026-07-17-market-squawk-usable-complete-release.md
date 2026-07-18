@@ -20,9 +20,10 @@ serialized while disjoint grouped worktrees run concurrently.
 **Tech Stack:** Rust 1.97.1 stable, Edition 2024, Cargo resolver 3, Tokio, Serde, Reqwest,
 Tokio-Tungstenite/rustls, rust_decimal, SQLite through bundled rusqlite, Apache Arrow/Parquet 58.3.0,
 DataFusion 54.0.0, PyO3/maturin with PyArrow and Python `decimal.Decimal`, Clap, tracing, rmcp,
-Proptest, Criterion, cargo-fuzz/libFuzzer, cargo-deny, cargo-audit, Gitleaks, and deterministic Python
-policy/product tests. Task 1 verifies every non-frozen version against current primary sources, Rust
-1.97.1, licenses, and the locked dependency graph before a consumer is merged.
+tract-onnx as the required self-contained ONNX backend, optional operator-supplied ONNX Runtime
+through `ort`, Proptest, Criterion, cargo-fuzz/libFuzzer, cargo-deny, cargo-audit, Gitleaks, and
+deterministic Python policy/product tests. Task 1 verifies every non-frozen version against current
+primary sources, Rust 1.97.1, licenses, and the locked dependency graph before a consumer is merged.
 
 ## Global Constraints
 
@@ -320,7 +321,7 @@ Cargo Audit, and Gitleaks themselves instead of unit-testing fragments of their 
 not replace the deleted machinery with another README parser, capability-ledger checker, or command-
 string snapshot.
 
-- [ ] **Step 5: Verify and review**
+- [x] **Step 5: Verify and review**
 
 ```bash
 ./scripts/verify.sh
@@ -347,7 +348,7 @@ repeated for this ordinary task.
 - Produces: a closed task-to-path ownership map for parallel work, an acyclic crate dependency
   allowlist, and a deduplicated requirement/producer/consumer/evidence/source-link matrix.
 
-- [ ] **Step 1: Inspect the actual dependency graph**
+- [x] **Step 1: Inspect the actual dependency graph**
 
 Use `cargo metadata --locked --all-features` and the current public APIs. Confirm this allowed local
 crate graph and reject any proposed hot-path edge to data, MCP, Python, or provider adapters:
@@ -371,21 +372,21 @@ provider adapters -> declared domain/source/platform contracts, never data
 app -> composition dependencies
 ```
 
-- [ ] **Step 2: Refresh dependency and provider research**
+- [x] **Step 2: Refresh dependency and provider research**
 
 Use current official sources. Record exact compatible versions, enabled features, licenses, Rust and
 Python floors, native artifacts, transitive risks, provider rights, coverage, quotas, retrieval date,
 and stable fallback. Reject dependencies incompatible with Rust 1.97.1, local zero-mandatory-cost
 operation, or the no-evasion boundary.
 
-- [ ] **Step 3: Freeze parallel ownership**
+- [x] **Step 3: Freeze parallel ownership**
 
 Record every Task 0-20 path in `usable-release-path-ownership.json`. A complete conflict-isolated
 lane owns a cohesive group of files, not one worktree per checklist item. Shared manifests,
 `Cargo.lock`, application composition, authority-critical files, and release evidence remain
 serialized under the integration owner. Review the map directly for overlaps before starting a Wave.
 
-- [ ] **Step 4: Verify the real policies**
+- [x] **Step 4: Verify the real policies**
 
 ```bash
 cargo metadata --locked --all-features --format-version 1 > /dev/null
@@ -1467,7 +1468,7 @@ parity/training/bundle tests pass, and the full Rust workspace all-feature build
 Python extension is an analytical package dependency only; no live/execution crate links PyO3 or
 requires a Python runtime.
 
-### Task 15: Implement conditional ONNX-compatible inference
+### Task 15: Implement required local ONNX inference and an optional external-runtime backend
 
 **Files:**
 
@@ -1482,76 +1483,80 @@ requires a Python runtime.
 - Create: `docs/operations/onnx-runtime.md`
 - Create: `docs/licenses/onnx-runtime-notice.md`
 - Create: `scripts/verify_onnx_runtime.py`
-- Create: `scripts/tests/test_verify_onnx_runtime.py`
 - Create: `docs/verification/onnx-runtime-policy.json`
 
 **Interfaces:**
 
-- Consumes: Task 1 pinned `ort`/ONNX Runtime decision, Task 13 `ModelBundle` and
-  `InferenceBackend`, controlled runtime/model roots.
-- Produces: `OnnxBackend: InferenceBackend` and `OnnxRuntimePolicy` binding runtime/library digest,
-  ONNX opset, allowed operators, shapes, 64 MiB artifact ceiling, 1,024-node ceiling, 256-tensor
-  ceiling, 1,000,000-element per-request ceiling, sequential execution, one intra-op thread, one
-  inter-op thread, warm-up result and stable native/no-action fallback.
+- Consumes: Task 1 pinned `tract-onnx` decision and optional isolated `ort`/ONNX Runtime decision,
+  Task 13 `ModelBundle` and `InferenceBackend`, controlled runtime/model roots.
+- Produces: required `TractOnnxBackend: InferenceBackend`, optional
+  `ExternalOnnxRuntimeBackend: InferenceBackend`, and one `OnnxModelPolicy` binding model digest,
+  ONNX opset, allowed operators, static shapes, 64 MiB artifact ceiling, 1,024-node ceiling,
+  256-tensor ceiling, 1,000,000-element per-request ceiling, bounded execution, warm-up result and
+  stable native/no-action fallback. The required backend is fully local and self-contained; the
+  optional backend cannot be the only way to satisfy the release's ONNX capability.
 
-- [ ] **Step 1: Write RED runtime/operator/resource/offline tests**
+- [ ] **Step 1: Write thin RED model-policy, parity, and failure-boundary tests**
 
-Accept only the Task 1-pinned ONNX Runtime through the pinned `ort` crate with `load-dynamic` enabled
-and all download/copy-binaries features disabled. Test runtime digest/version/license mismatch,
-remote/external-data models, custom/
-control-flow/random operators, unsupported opset, unknown/dynamic/unbounded shapes, oversized graph/
-initializers/tensors/outputs, nonfinite input/output, thread/session policy mismatch, warm-up failure,
-corrupt models and native-versus-ONNX golden tolerance. Assert every failure yields the configured
-native fallback or audited no-action, never a default score.
+Use one table-driven hostile-model suite for external data, custom/control-flow/random operators,
+unsupported opsets, unknown/dynamic/unbounded shapes, resource ceilings, corrupt protobuf and
+nonfinite inputs/outputs. Use one golden model to prove native-versus-tract parity and the same model
+to prove optional external-runtime parity when that feature and verified runtime are present. Assert
+every preflight, load, warm-up, or inference failure yields the configured native fallback or audited
+no-action, never a default score. Do not duplicate parser cases across backend-specific suites.
 
 - [ ] **Step 2: Run RED**
 
 ```bash
 cargo test -p market-squawk-modeling --test onnx --test onnx_hostile \
-  --features onnx
+  --features onnx-tract
 ```
 
 Expected: FAIL because the ONNX backend/policy and fixtures do not exist.
 
-- [ ] **Step 3: Implement preflight and bounded runtime construction**
+- [ ] **Step 3: Implement common preflight and the required tract backend**
 
 Hash and parse the model before runtime load. Allow only `Add`, `Sub`, `Mul`, `Div`, `MatMul`, `Gemm`,
 `Relu`, `Sigmoid`, `Tanh`, `Softmax`, `Reshape`, `Transpose`, `Gather`, `Concat`, `ReduceMean`, `Sqrt`,
 `Clip`, `Cast`, and `Identity` under approved opsets and static bounded shapes. Reject external data,
-custom domains, control flow and randomness. Configure CPU-only sequential execution with one intra-
-and inter-op thread; preallocate bounded inputs/outputs; warm before publication.
+custom domains, control flow and randomness. Compile the accepted graph with the pinned
+`tract-onnx` crate, use bounded inputs/outputs and a serialized model-owned worker, then warm and
+validate the result before atomic publication. No Python process, native runtime download, shared
+library, network access, or build-time binary fetch is permitted for the required backend.
 
-- [ ] **Step 4: Enforce offline distribution and license provenance**
+- [ ] **Step 4: Isolate and verify the optional ONNX Runtime backend**
 
-Never download or remotely load native code at runtime/build. The runtime library must come from an
-operator-configured controlled path or a reproducibly built local package, match the configured SHA-
-256/version/platform tuple and carry the ONNX Runtime MIT notice/SBOM entry. Default all-feature
-workspace compilation enables the Rust `onnx` feature but performs no link-time/runtime download and
-does not require a shared library to compile. `verify_onnx_runtime.py` validates a separately installed
-local library against `onnx-runtime-policy.json`, no-follow path confinement, SHA-256, platform,
-version and license before targeted runtime tests set its explicit path. Task 20 must provide this
-verified local runtime and run inference fully offline; compile-only success never counts as ONNX
-capability.
+Keep `ort` behind a separate `onnx-runtime` feature with default features disabled and only
+`load-dynamic` enabled. Never download, fetch, copy, or remotely load native code at build or runtime.
+An operator-supplied library must be confined to a configured local root, match the configured SHA-
+256/version/platform tuple and carry the ONNX Runtime MIT notice/SBOM entry before it can construct a
+backend. `verify_onnx_runtime.py` performs that direct admission check; it does not gain a unit-test
+suite that merely re-tests its helpers. Failure to configure or admit the optional library leaves the
+required tract backend available and is not a release blocker.
 
 - [ ] **Step 5: Run GREEN and commit**
 
 ```bash
-python3 -m unittest scripts.tests.test_verify_onnx_runtime -v
-python3 scripts/verify_onnx_runtime.py \
-  --policy docs/verification/onnx-runtime-policy.json \
-  --library "$MARKET_SQUAWK_ONNX_RUNTIME"
 cargo build --workspace --all-features --locked
 cargo test -p market-squawk-modeling --test onnx --test onnx_hostile \
-  --features onnx --locked
-cargo clippy -p market-squawk-modeling --all-targets --features onnx \
+  --features onnx-tract --locked
+cargo clippy -p market-squawk-modeling --all-targets --features onnx-tract \
   --locked -- -D warnings
+if test -n "${MARKET_SQUAWK_ONNX_RUNTIME:-}"; then
+  python3 scripts/verify_onnx_runtime.py \
+    --policy docs/verification/onnx-runtime-policy.json \
+    --library "$MARKET_SQUAWK_ONNX_RUNTIME"
+  cargo test -p market-squawk-modeling --test onnx \
+    --features onnx-runtime --locked
+fi
 git diff --check
 git commit -m "feat(modeling): add constrained ONNX inference"
 ```
 
 Expected: full workspace all-features compiles without download or link-time runtime discovery; the
-explicit hash-pinned local runtime passes verification; approved fixtures pass parity; hostile/
-runtime/resource cases fail closed; offline/license checks pass.
+required tract backend runs approved fixtures fully offline; approved models pass parity;
+hostile/resource cases fail closed. When an explicit hash-pinned external runtime is supplied, the
+optional backend also passes verification and the shared golden parity case.
 
 ### Task 16: Implement complete portfolio accounting and analytics
 
