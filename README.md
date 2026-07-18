@@ -46,7 +46,7 @@ terminal consumer, focused verification, immutable evidence, and exact commit ex
 | State | Mandatory capability | Current blocker | Closing task |
 | --- | --- | --- | --- |
 | `Missing` | Coinbase direct-source qualification | No production authority-qualified Coinbase vertical | Task 2 |
-| `Missing` | Kraken direct-source qualification | No production Kraken adapter, checksum validation, or qualified vertical | Task 6 |
+| `Missing` | Kraken direct-source qualification | Generic checksum validation exists, but no production transport/decoder/session, metadata integration, qualification decision, or live-to-paper vertical exists | Task 6 |
 | `Missing` | CSV/TSV | No bounded production extraction adapter | Task 7 |
 | `Missing` | JSON/NDJSON | No bounded production extraction adapter | Task 7 |
 | `Missing` | XML | No entity-safe production extraction adapter | Task 7 |

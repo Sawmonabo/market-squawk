@@ -26,9 +26,13 @@ policy/product tests. Task 1 verifies every non-frozen version against current p
 
 ## Global Constraints
 
-- This plan is audited at `e99f4ba13a6e622b899f169065348c484098c09d`. That SHA is an audit
-  anchor, not approval. Task 0 refreshes paths, APIs, dependencies, line anchors, evidence, and the
-  DAG against the independently approved live/capture closure before implementation dispatch.
+- This plan was refreshed against clean pushed product-code audit anchor
+  `a829278aca4d4fc27d5a0c0aaa8e5a49f2cb5659`, tree
+  `6f5d9b7be896e9a5409f367c73aa4a5d95208a9c`, on 2026-07-18. That SHA is an audit anchor, not
+  approval: its A4 implementation and release-evidence runner are integrated and focused-review
+  clean, but the idle-host gate has not yet admitted the required measurement and the full exact-head
+  quarter gate has not run. Task 0 refreshes paths, APIs, dependencies, line anchors, evidence, and
+  the DAG; Stage 1 integration credit still requires the approved live/capture closure.
 - The read-only traceability input is `.agents/tmp/usable-release-traceability-audit.md`, SHA-256
   `57caaad73b638eeb785157a24ab54dba1e49251859c5f104d8f6ab6d259fb731`. Task 1 verifies that digest
   and persists its deduplicated capability/source-link matrix under `docs/research`; the ignored file
@@ -77,6 +81,12 @@ policy/product tests. Task 1 verifies every non-frozen version against current p
   and cleanup.
 - External network tests are opt-in and separate. Default tests use content-hashed, rights-recorded
   fixtures through production parsers and local protocol servers.
+- Tests are thin, concise, and critical: extend existing behavioral suites where practical, prove
+  the narrowest authority/accounting/recovery/resource/parser or producer-to-consumer invariant,
+  and consolidate overlapping cases. Test counts, prose/file-existence checks, wrapper snapshots,
+  duplicate fixtures, and implementation-detail matrices provide no release credit. This does not
+  relax adversarial tests for boundaries whose failure could corrupt money, authority, provenance,
+  resource limits, or durable state.
 - The integration owner alone edits `Cargo.toml`, `Cargo.lock`, shared public exports, application
   composition, live-authority/risk dispatch handoff, migrations registry, README capability state,
   checkpoint evidence, and review/publication state.
@@ -142,8 +152,8 @@ path set before dispatch and merges in the order shown.
 
 | Stage / wave | Ready tasks and grouped lanes | Start barrier | Exclusive ownership | Merge order | Required Wave close |
 | --- | --- | --- | --- | --- | --- |
-| Stage 0 / Wave 0 | 0 truth refresh; 1 DAG/dependency governance | approved live/capture exact head | docs/policy and integrator hotspots | 0 then 1 | reviewed dependency policy and locked full-workspace gate |
-| Stage 1 / Wave 1A | 2 live/risk/paper; 3 catalog/secrets; 5 MCP transport | Task 1 frozen interfaces | execution/adapters; platform/data; MCP | 3, 5, then 2 exact integration | one reviewed lock resolution; Tasks 2/3/5 focused `--locked` reruns; locked Wave gate |
+| Stage 0 / Wave 0 | 0 truth refresh; 1 DAG/dependency governance | clean audited product-code anchor; independent research/policy artifacts require an approved-head refresh before Stage 1 credit | docs/policy and integrator hotspots | 0 then 1 | reviewed dependency policy and locked full-workspace gate |
+| Stage 1 / Wave 1A | 2 live/risk/paper; 3 catalog/secrets; 5 MCP transport | Task 1 frozen interfaces; Tasks 3/5 may develop provisionally on the refreshed audit anchor, while Task 2 integration and all Wave credit wait for the approved live/capture head | execution/adapters; platform/data; MCP | 3, 5, then 2 exact integration | one reviewed lock resolution; Tasks 2/3/5 focused `--locked` reruns; locked Wave gate |
 | Stage 1 / Wave 1B | 4 data storage/query; 6 Kraken | Task 3 catalog and Task 2 live interfaces frozen | data only; Kraken only | 4 then 6 | one reviewed lock resolution; Tasks 4/6 focused `--locked` reruns; locked Wave gate |
 | Stage 2 / Wave 2 | 7 files; 8 SEC; 9 macro; 10 portfolio import | Task 4 ingest contract frozen | disjoint adapter crates | 7, 8, 9, 10 | one reviewed lock resolution; Tasks 7-10 focused `--locked` reruns; locked Wave gate |
 | Stage 2 / Wave 3 | 11 PIT/research composition; 12 analytics | provider lanes and data manifests merged | data/app research; analytics | 11 then 12 | one reviewed lock resolution; Tasks 11/12 focused `--locked` reruns; locked Wave gate |
@@ -240,7 +250,7 @@ evidence change only in that integration commit.
 
 ---
 
-### Task 0: Refresh the approved baseline and current release truth
+### Task 0: Refresh the audited baseline and current release truth
 
 **Files:**
 
@@ -264,18 +274,20 @@ evidence change only in that integration commit.
 - Delete: `scripts/tests/test_documentation_contracts.py`
 - Delete: `scripts/tests/test_duplicate_dependencies.py`
 - Delete: `scripts/tests/test_repository_governance_policy.py`
+- Delete: `scripts/tests/test_smoke_mcp.py`
 - Delete: `scripts/tests/test_verify_script.py`
 - Modify: `scripts/verify.sh`
 
 **Interfaces:**
 
-- Consumes: independently approved live/capture exact SHA and review evidence, current tracked
-  product code, and the approved usable-release scope.
+- Consumes: the clean audited live/capture anchor, its pending approval evidence, current tracked
+  product code, and the approved usable-release scope. Before Stage 1 integration or Wave credit,
+  paths, APIs and evidence must be refreshed against the approved live/capture prerequisite head.
 - Produces: an honest README capability inventory, a dated exact baseline, one canonical plan
   authority, a usable complete-release terminal condition, and a lean verification suite that
   protects product/build/security behavior rather than documentation wording.
 
-- [ ] **Step 1: Refresh current capability truth**
+- [x] **Step 1: Refresh current capability truth**
 
 Update the README to distinguish `Runnable now`, `Required but missing`, and
 `Release blocked until implemented`. Name every mandatory producer-to-consumer vertical and its
@@ -283,22 +295,22 @@ closing task. Correct the diagnostic capture receipt, current-authority, five-to
 Python-product, and Parquet-compaction descriptions. Preserve zero-cost, no-evasion, journal,
 coverage, security, and financial-use warnings.
 
-- [ ] **Step 2: Remove competing delivery authority**
+- [x] **Step 2: Remove competing delivery authority**
 
 Replace `docs/plans/implementation-plan.md` with the stable canonical entry point. Mark the dated
 Q5-Q7 remaining-work plan and old Q3 plan superseded with no current execution authority. Preserve
 historical IDs as audit locators. Replace the halfway stop in project memory with the usable
 complete-release terminal and use Stage, Wave, and Release Gate for current work.
 
-- [ ] **Step 3: Record the exact baseline**
+- [x] **Step 3: Record the exact baseline**
 
 Record product SHA/tree/branch, toolchain, workspace members and dependency edges, tracked
 adapter/Python-package state, runnable diagnostic capabilities, missing product planes, public
 interfaces consumed by subsequent tasks, verification evidence, and review disposition in
 `usable-release-baseline.md`. Mark stale current-state and gap documents as historical until the
-approved Q2 head is integrated and those detailed audits are refreshed.
+approved live/capture prerequisite head is integrated and those detailed audits are refreshed.
 
-- [ ] **Step 4: Remove prose-policy automation**
+- [x] **Step 4: Remove prose-policy automation**
 
 Delete branding, documentation-contract, plan-label, governance-template, verification-wrapper,
 and configuration-snapshot tests. Remove the exact CLI-help sentence assertion. Keep checks that
@@ -324,8 +336,8 @@ repeated for this ordinary task.
 **Files:**
 
 - Create: `docs/verification/usable-release-path-ownership.json`
-- Create: `docs/research/2026-07-17-usable-release-dependencies.md`
-- Create: `docs/research/2026-07-17-usable-release-traceability.md`
+- Create: `docs/research/2026-07-18-usable-release-dependencies.md`
+- Create: `docs/research/2026-07-18-usable-release-traceability.md`
 - Modify: `scripts/check_workspace_boundaries.py`
 
 **Interfaces:**

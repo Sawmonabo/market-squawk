@@ -160,6 +160,16 @@ evidence than unit tests that merely snapshot their configuration files. Custom 
 appropriate when it exercises a real protocol, invariant, resource bound, artifact, or end-to-end
 vertical; it is not appropriate merely to enforce prose, command ordering, or report choreography.
 
+The test suite must stay thin, concise, and critical. Add the smallest proof that can fail for a
+real product defect, prefer extending an existing behavioral suite over creating another test file,
+and remove redundant cases once one stronger invariant or end-to-end boundary covers them. Test
+counts are never a delivery metric. File-existence checks, duplicate fixtures, broad snapshot churn,
+wrapper tests, prose assertions, implementation-detail assertions, and near-identical example
+matrices are prohibited unless the file or serialization itself is the security or compatibility
+boundary under test. Security-, authority-, accounting-, recovery-, bounded-resource-, parser-, and
+producer-to-consumer failures remain critical and must not be weakened merely to make the suite
+smaller.
+
 Keep grouped quarter-checkpoint evidence concise. Do not create a tracked report per subtask or
 reviewer. One consolidated checkpoint review record per frozen candidate is sufficient; exact
 command outputs and bulky transient artifacts remain ignored and are summarized by commit and

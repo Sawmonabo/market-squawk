@@ -1,28 +1,36 @@
 # Market Squawk Usable-Release Baseline
 
-**Inventory date:** 2026-07-17 (America/New_York)
+**Inventory date:** 2026-07-18 (America/New_York)
 
-**Product-code audit base:** `e99f4ba13a6e622b899f169065348c484098c09d`
+**Product-code audit base:** `a829278aca4d4fc27d5a0c0aaa8e5a49f2cb5659`
 
-**Documentation-plan head before Task 0 remediation:**
-`6f495d88a060fefbf3f9dbff99a386880cccebad`
+**Product tree:** `6f5d9b7be896e9a5409f367c73aa4a5d95208a9c`
+
+**Branch and upstream:** `feat/stage-1-foundation` and
+`origin/feat/stage-1-foundation`, both at the product-code audit base when this inventory was
+refreshed.
 
 **Release disposition:** Blocked. This is an inventory, not release approval or performance
 evidence.
 
 ## Scope and evidence boundary
 
-The product-code audit base is the clean `feat/stage-1-foundation` commit shared with
-`origin/feat/stage-1-foundation` when this inventory was prepared. The separate Q2 A4 benchmark
-lane contains uncommitted work and is deliberately excluded until it is clean, independently
-reviewed, and promoted. Documentation changes after the product-code audit base do not turn that
-work into implemented product capability.
+The product-code audit base is the clean, pushed `feat/stage-1-foundation` commit shared with
+`origin/feat/stage-1-foundation` when this inventory was refreshed. The historical Q2/A4
+bounded-capture seed
+and hardened release-evidence runner are integrated through that commit. Their source and evidence
+boundary received focused independent review, and the clean release runner successfully prepared a
+schema-5 exact-head build-evidence bundle. The idle-host gate has not admitted the five-repetition
+measurement because normalized host load remained above its production threshold. Therefore no A4
+performance result, historical Q2/A4 performance approval, active quarter approval, or
+complete-release claim exists.
+Stage 0 documentation and research commits after this audit base do not change product capability.
 
 The previously named `docs/architecture/current-state.md` and `docs/plans/gap-analysis.md` remain
 historical audits frozen at rejected commit `651a01e120dfe27a598b9475296733d238d870b7`.
 They are not current approval evidence. This inventory, the README capability table, and the
 canonical complete-release plan replace them as current delivery truth until the detailed audit is
-refreshed after Q2 closure.
+refreshed after the approved live/capture prerequisite closure.
 
 ## Toolchain and workspace
 
@@ -66,7 +74,10 @@ or complete MCP.
 
 ## Interfaces consumed by the canonical plan
 
-The plan must refresh these exact APIs after Q2 approval before dependent implementation begins:
+The plan must refresh these exact APIs against the approved live/capture prerequisite head before
+dependent Stage 1 integration or Wave credit. Provisional disjoint Task 3/5 development may proceed
+from this explicit audit anchor, but receives no integration or capability credit before that
+refresh:
 
 - domain financial, instrument, quality, provenance, and canonical event modules under
   `crates/market-squawk-domain/src/`;
@@ -77,39 +88,33 @@ The plan must refresh these exact APIs after Q2 approval before dependent implem
   `crates/market-squawk-live/src/`; and
 - diagnostic CLI/MCP/source composition under `apps/market-squawk/src/`.
 
-No dirty-lane signature, provisional generated dependency, or unreviewed benchmark result is a
-frozen prerequisite.
+No dirty-lane signature, provisional generated dependency, prepared-but-unmeasured evidence bundle,
+or unreviewed benchmark result is a frozen prerequisite.
 
 ## Verification snapshot
 
-Before the Task 0 verification audit, the unchanged documentation candidate ran:
-
-- 69 Python tests, including 56 documentation, wording, configuration-snapshot, duplicate policy,
-  and verification-wrapper tests that did not exercise product behavior and have now been removed;
-- 651 Rust tests discovered by the locked all-feature workspace test inventory;
-- formatting, strict Clippy, workspace tests, release builds, rustdoc, and the reserved Loom model;
-- workspace-boundary, generated-artifact, offline mock, and MCP smoke gates.
-
-That full run exited successfully but preceded this Task 0 remediation and therefore does not approve
-the resulting candidate. The retained Python suite has 11 tests over repository-input hygiene,
-immutable CI configuration, and the MCP smoke harness. Fresh exact-head
-verification, direct Cargo Deny/Cargo Audit/Gitleaks execution, and independent review remain
-mandatory.
+The complete local gate passed on the intended A4 candidate before its final focused release-runner
+and cross-language source-inventory corrections. Those corrections then passed their focused Rust,
+Python, Clippy, clean release-build/preparer, and independent read-only review gates. This is strong
+lane evidence, but it is not a clean full-gate result for `a829278` and does not approve a quarter.
+Fresh exact-head verification, direct Cargo Deny/Cargo Audit/Gitleaks execution, measured performance
+when the production host gate admits the machine, and grouped quarter review remain mandatory.
 
 ## 2026-07-17 verification-overhead audit result
 
-The audit removed 59 of the 69 Python tests because they enforced documentation wording, migration
-allowances, configuration snapshots, exact dependency duplication, governance prose, or wrapper
-command strings. It also removed one Rust CLI-help phrase test, the exact help-sentence check in
-`verify.sh`, the bespoke brand and duplicate-dependency checkers, 25 per-task SDD reports, the stale
-transient progress report, and the rejected release-truth design. Git history retains every deleted
-artifact.
+The audit removed Python and Rust checks that enforced documentation wording, migration allowances,
+configuration snapshots, exact dependency duplication, governance prose, wrapper command strings,
+or one exact CLI-help sentence. It also removed the bespoke brand and duplicate-dependency checkers,
+per-task reports, the stale transient progress report, and the rejected release-truth design. Git
+history retains the removed artifacts. Test counts are deliberately not tracked as a delivery
+metric.
 
-The active suite now contains 11 Python tests and 650 Rust tests. The retained Python tests exercise
-repository-input hygiene, immutable CI/security configuration, and the bounded MCP process harness.
-The Rust suite continues to exercise financial, authority, qualification, lifecycle, concurrency,
-protocol, book, persistence, and security behavior. Diagnostic MCP authority/coverage/quality limits
-are now machine-readable `_meta` contracts instead of English phrase assertions.
+The retained Python tests exercise repository-input hygiene, immutable CI/security configuration,
+the bounded MCP process harness, and capture evidence/host-boundary behavior. The Rust suite
+exercises financial, authority, qualification, lifecycle, concurrency, protocol, book, persistence,
+and security behavior. Diagnostic MCP authority/coverage/quality limits are machine-readable `_meta`
+contracts instead of English phrase assertions. Project memory requires every new test to be a thin,
+critical behavioral or invariant proof.
 
 The post-audit dirty candidate passed `./scripts/verify.sh`, Cargo Deny, Cargo Audit with warnings
 denied, Gitleaks over the working tree, Gitleaks over 300 commits, formatting, and `git diff --check`.
@@ -126,7 +131,7 @@ Every remaining script and Python test was inspected after the deletion pass:
 | `check_workspace_boundaries.py` | Keep | Parses Cargo metadata/manifests and rejects invalid workspace membership, metadata inheritance, resolver, lint, and dependency-layer violations. |
 | `check_generated_artifacts.py` and its eight tests | Keep | Enumerates Git-authoritative active inputs and rejects secret-shaped files, generated directories, unsafe links, unreviewed binaries, and oversized artifacts. |
 | `test_ci_workflow_policy.py` | Keep, narrowed | Requires immutable 40-hex external-action references and credential-disabled checkout wherever checkout is used; it does not pin job count, runner labels, command text, or checkout-step count. |
-| `smoke_mcp.py` and its two harness tests | Keep | Exercises a real bounded stdio MCP process, framing deadlines, discovery, and the versioned typed authority/coverage/quality metadata contract. |
+| `smoke_mcp.py` | Keep | Exercises a real bounded stdio MCP process, framing deadlines, discovery, and the versioned typed authority/coverage/quality metadata contract. Its helper self-tests were removed; the product process smoke is the evidence. |
 | `check_authority_lifecycle_loom.sh` | Keep | Executes the Loom concurrency model for authority admission, terminalization, and clean close. |
 | `verify.sh` | Keep, simplified | Orchestrates the direct behavioral/build/security gates; no test snapshots its command order or help/report wording. |
 
@@ -137,12 +142,12 @@ documentation checker remains active.
 
 ## Review and release state
 
-The first documentation candidate at dirty-diff SHA-256
-`5d907af825966230fdf4599a025ea6d248be5af4f6a4ee97449158d9382d95af` was independently rejected at
-Critical 0 / Important 5 / Minor 1. Task 0 remediation addresses the authority overclaim, stale
-truth links, competing plan authority, incomplete policy invariants, ambient-directory coupling, and
-journal-compaction ambiguity. No finding is considered closed until the complete new candidate is
-unchanged and independently re-reviewed at Critical 0 / Important 0 / Minor 0.
+The original Task 0 documentation candidate was independently rejected at Critical 0 / Important 5 /
+Minor 1; its remediation was committed at `84ffe97` after the product/build/security gate passed.
+The subsequent A4 release-runner changes through `a829278` received focused read-only review at
+Critical 0 / Important 0 / Minor 0 and clean preparer evidence, but the full exact-head gate,
+five-repetition host measurement, and Quarter 1 grouped review remain pending. Focused approval does
+not approve Tasks 0-6 or the usable release.
 
 All mandatory release capabilities are listed in the README. Every current row is `Missing`, so the
 usable complete release remains blocked.
