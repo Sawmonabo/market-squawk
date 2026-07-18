@@ -167,6 +167,43 @@ contract requires an open file handle with write access. A read-only Windows dir
 not an interchangeable substitute. The code must not ignore an expected directory-flush failure
 or pretend it supplied Unix `fsync(directory)` semantics.
 
+## Windows catalog-backup publication
+
+Date revalidated: 2026-07-18
+
+The catalog-backup protocol has a different operation boundary from creation of an append-only
+journal. It first creates and flushes a complete SQLite backup in the destination directory and
+then publishes that prepared file under its final, caller-selected name. On Windows, publication
+must use `MoveFileExW` with `MOVEFILE_WRITE_THROUGH` and without
+`MOVEFILE_REPLACE_EXISTING`. Microsoft specifies that the write-through flag does not return until
+the file is actually moved on disk; omitting the replacement flag preserves the backup API's
+no-clobber contract. The prepared file and final name are children of the same retained destination
+directory, so the protocol does not opt into cross-volume copy behavior.
+
+This is a Market Squawk design inference from the operating-system contracts, not a claim that a
+read-only Windows directory handle can be synchronized. Microsoft documents that
+[`FlushFileBuffers`](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-flushfilebuffers)
+requires `GENERIC_WRITE`, while its supported
+[`Directory Handles`](https://learn.microsoft.com/en-us/windows/win32/fileio/obtaining-a-handle-to-a-directory)
+operations do not include that function. The publication primitive and its durability semantics
+are documented by
+[`MoveFileExW`](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-movefileexw).
+
+The selected safe Rust boundary is the exact-pinned MIT-licensed `atomicwrites` 0.4.4
+[`move_atomic`](https://docs.rs/crate/atomicwrites/0.4.4/source/src/lib.rs) function, admitted only
+for Windows builds of the data crate. Its audited Windows implementation accepts `Path` values and
+invokes `MoveFileExW` with `MOVEFILE_WRITE_THROUGH` alone. This preserves Windows path encoding,
+keeps Market Squawk's workspace-wide `unsafe_code = "forbid"` policy intact, and avoids exposing a
+general Win32 API surface. The wrapper owns its FFI safety boundary; Market Squawk still owns all
+catalog-specific authority, endpoint, close-before-publish, and identity checks.
+
+The Windows implementation must close every write-capable SQLite and prepared-file handle before
+publication, retain the destination writer exclusion for the whole operation, reject reparse or
+non-regular endpoints, and validate that the published file is the prepared file. It must not
+substitute a best-effort `rename`, hard-link sequence, ignored directory-flush error, or overwrite
+operation while advertising the same durability and no-clobber contract. Unix retains its
+same-directory publication followed by a real parent-directory synchronization.
+
 ## Authority-state root safety
 
 The root-open sequence remains fail-closed:
@@ -216,8 +253,10 @@ suite or make GitHub a mandatory runtime dependency.
 Re-audit this decision when any of the following changes:
 
 - `cap-std`, `cap-primitives`, or `cap-fs-ext` version;
+- `atomicwrites` version or Windows `move_atomic` implementation;
 - Rust stabilizes the Windows by-handle metadata APIs;
 - journal creation or rename durability protocol;
+- catalog-backup preparation, no-clobber publication, or Windows move flags;
 - journal writer exclusion, Windows share modes, or concurrent diagnostic reads;
 - supported operating-system targets;
 - capability-root construction or final-component no-follow policy.
