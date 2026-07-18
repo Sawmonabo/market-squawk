@@ -1,0 +1,2413 @@
+# Market Squawk Usable Complete Local Release Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use
+> `superpowers:subagent-driven-development` (recommended) or `superpowers:executing-plans` to
+> implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Deliver one hardened, zero-mandatory-cost, usable local Market Squawk release in which all
+required live, research, analytics, Python, modeling, portfolio, execution, valuation, CLI, and MCP
+verticals run together and pass an exact-head release gate.
+
+**Architecture:** Production live decisions remain a bounded single-writer Rust pipeline whose only
+action path consumes current `DirectVerified` authority through comprehensive risk and one-time
+dispatch. Independently, lawful live/research adapters publish canonical observations through a
+single-writer SQLite catalog, versioned Arrow schemas, immutable content-addressed Parquet manifests,
+bounded DataFusion/PIT services, Rust and Python analytics/modeling consumers, and shared bounded
+application services used by CLI and local stdio MCP. Integration follows an explicit dependency DAG;
+root manifests, application composition, authority handoff, evidence, and publication remain
+serialized while disjoint grouped worktrees run concurrently.
+
+**Tech Stack:** Rust 1.97.1 stable, Edition 2024, Cargo resolver 3, Tokio, Serde, Reqwest,
+Tokio-Tungstenite/rustls, rust_decimal, SQLite through bundled rusqlite, Apache Arrow/Parquet 58.3.0,
+DataFusion 54.0.0, PyO3/maturin with PyArrow and Python `decimal.Decimal`, Clap, tracing, rmcp,
+Proptest, Criterion, cargo-fuzz/libFuzzer, cargo-deny, cargo-audit, Gitleaks, and deterministic Python
+policy/product tests. Task 1 verifies every non-frozen version against current primary sources, Rust
+1.97.1, licenses, and the locked dependency graph before a consumer is merged.
+
+## Global Constraints
+
+- This plan is audited at `e99f4ba13a6e622b899f169065348c484098c09d`. That SHA is an audit
+  anchor, not approval. Task 0 refreshes paths, APIs, dependencies, line anchors, evidence, and the
+  DAG against the independently approved live/capture closure before implementation dispatch.
+- The read-only traceability input is `.agents/tmp/usable-release-traceability-audit.md`, SHA-256
+  `57caaad73b638eeb785157a24ab54dba1e49251859c5f104d8f6ab6d259fb731`. Task 1 verifies that digest
+  and persists its deduplicated capability/source-link matrix under `docs/research`; the ignored file
+  is not the durable source of truth.
+- The approved design is
+  `docs/superpowers/specs/2026-07-17-market-squawk-usable-release-truth-contract-design.md`; it
+  supersedes the halfway stop. Stop only at the usable-complete-local-release terminal gate in Task
+  20.
+- Active delivery language uses **Stage**, **Wave**, and **release gate**. Historical `Q1`, `Q2`,
+  `Q2-I*`, `Q2-R*`, and existing filenames remain immutable audit locators, not active “quarters.”
+- No paid software, paid API, cloud service, external database service, mandatory container runtime,
+  mandatory telemetry infrastructure, or OpenTelemetry dependency.
+- Rust is exactly 1.97.1 stable for release, benchmark, and approval evidence; 1.97.0 is forbidden.
+  Every workspace package inherits Edition 2024, resolver 3, package metadata, and workspace lints;
+  `Cargo.lock` is committed.
+- No unsafe Rust. Production paths contain no `unwrap`, `expect`, `panic!`, `todo!`, or
+  `unimplemented!`. Libraries return typed `thiserror` results; `anyhow` remains at application
+  boundaries.
+- Identity/account rotation to evade limits, browser/TLS fingerprint concealment, CAPTCHA or
+  anti-bot bypass, blocking-evasion proxy rotation, stealth scraping, distributed quota evasion,
+  access-control circumvention, and synthetic sources represented as production are prohibited.
+- Provider access uses one authorized identity, a shared authoritative budget, durable cursors and
+  caches where rights allow, conditional requests, `Retry-After`, bounded backoff, source health,
+  authorized failover, and explicit coverage. Rights are enforced per retrieve/display/persist/cache/
+  redistribute/train operation at extraction and storage boundaries.
+- Financial/order/accounting values use checked scaled integers, `Decimal`, Arrow `Decimal128`, or
+  Python `decimal.Decimal` with explicit currency, scale, tick/lot, unit, rounding, and overflow
+  policy. Floating point is admitted only inside explicitly bounded statistical/model kernels.
+- SQLite, Arrow/Parquet writes, DataFusion, Python, MCP, LLMs, arbitrary filesystem work, and
+  unrelated network requests remain outside the live event-to-action path.
+- Every queue, parser, frame, archive, page, retry, row group, query, result, artifact, audit stream,
+  model, Python batch, and MCP request is bounded by count, retained bytes, deadline, and cancellation.
+  Saturation fails closed before authoritative mutation.
+- Research and live pipelines remain independent. Historical data need not mirror the live source;
+  replay remains optional diagnostic tooling and is never the research/backtest architecture.
+- Add a crate, adapter, schema, dataset, migration, or Python package atomically with its first
+  working producer and consumer. Empty crates, schema-only future datasets, mocks, traits, plans, and
+  compatibility paths receive no production credit.
+- Strategies, models, adapters, CLI, MCP, replay, archives, and caller-authored DTOs cannot construct
+  current live authority, `ApprovedOrder`, or adapter dispatch. Every paper action passes the sole
+  risk and one-time dispatch boundary.
+- A focused lane gate proves only that lane. Approval requires one clean unchanged exact commit, all
+  locked local gates, deterministic default tests, grouped independent review with zero unresolved
+  Critical/Important/Minor findings, truthful external-smoke status, GitHub publication, and cleanup.
+- External network tests are opt-in and separate. Default tests use content-hashed, rights-recorded
+  fixtures through production parsers and local protocol servers.
+- The integration owner alone edits `Cargo.toml`, `Cargo.lock`, shared public exports, application
+  composition, live-authority/risk dispatch handoff, migrations registry, capability ledger,
+  checkpoint evidence, and review/publication state.
+- New crates under `crates/*` and `adapters/*` enter the workspace automatically. A lane may use a
+  generated lane-local lock only for provisional RED/GREEN diagnosis; it never stages, commits, or
+  hands off that lock. Before handoff it proves `Cargo.lock` matches its lane base. At each Wave
+  integration barrier, the integration owner reviews/merges exact manifests and workspace dependency
+  requests, performs one minimal offline-first lock resolution, audits the lock diff, commits it,
+  and reruns every affected focused gate plus the whole Wave gate with `--locked`. Until that locked
+  rerun passes, lane evidence is provisional and the capability remains `Missing`.
+- Grouped lane worktrees are removed normally after integration, evidence handoff, no active agent,
+  and clean status. Never force-remove dirty or active worktrees.
+
+---
+
+## Release capability truth
+
+| Vertical | Producer | Required terminal consumer | Closing task |
+| --- | --- | --- | --- |
+| Production live | Coinbase and Kraken adapters | current shard -> feature -> strategy -> risk -> paper | 2, 6 |
+| Local files | CSV/TSV/JSON/NDJSON/XML/Excel/SQLite/export/OFX/Parquet adapters | manifest-pinned query/PIT | 7, 11 |
+| Filings | SEC submissions/filings/XBRL/Company Facts | fundamentals/PIT/analysis | 8, 11, 12 |
+| Macro | FRED/ALFRED, BLS, Treasury | revisions/PIT/yield/surprise analysis | 9, 11, 12 |
+| Research storage | canonical observations | SQLite/Arrow/Parquet/DataFusion services | 3, 4 |
+| PIT datasets | manifest-bound observations/universes | feature/label datasets/model/backtest | 11 |
+| Analytics | market/fundamental/macro/portfolio observations | Rust/Python/portfolio/model services | 12, 14, 16 |
+| Python product | manifest-bound PIT data and Rust kernels | training/evaluation/model-bundle handoff | 14 |
+| Modeling | feature registry and training artifact | native/ONNX inference and no-action failure | 13, 15 |
+| Backtesting | PIT datasets and strategy/model | reconciled portfolio experiment output | 17 |
+| Portfolio | raw portfolio imports | accounting/performance/risk/MCP | 10, 16 |
+| Execution | complete intent/current authority | comprehensive risk/realistic paper/audit | 2 |
+| Fair value | market/research/portfolio evidence | classification/evidence/approval services | 18 |
+| Control plane | every bounded service | complete CLI and typed local stdio MCP | 5, 19 |
+| Release | all verticals | deterministic local demo and exact-head evidence | 20 |
+
+Dataset registration is atomic with a working writer and reader. The data crate supplies the
+versioned extension/publication mechanism in Task 4, but it must not pre-create empty schemas for
+later tasks. The integration owner enforces this first-producer/terminal-consumer map:
+
+| Dataset families | First working writer | Required reader/evidence |
+| --- | --- | --- |
+| instruments, instrument_identifiers, venues | 3 registry plus 7-10 resolution | 4 query and 11 PIT identity/history |
+| trades, quotes, order_books | 2/6 asynchronous live audit publication | 12 market analytics and 19 Market services |
+| corporate_actions | 7/8/11 normalized action ingestion | 11 PIT policy, 16 accounting, 17 backtest |
+| filings, xbrl_facts, financial_statements, fundamentals | 8 SEC ingestion/normalization | 11 PIT, 12 analytics, 19 Fundamental services |
+| macro_series, macro_observations | 9 macro providers | 11 PIT, 12 yield/surprise analytics, 19 Macro services |
+| accounts, positions, transactions, cash_flows | 10 import, then 16 authoritative revisions | 16 reconciliation/risk and 19 Portfolio services |
+| features, labels | 11 reproducible dataset builder | 13 model bundles, 14 Python, 17 backtest |
+| predictions, models | 13/14 validated model publication | 15 inference, 17 backtest, 19 Model services |
+| strategies | 2 strategy registry with version/hash | 2 risk/audit and 17 experiment lineage |
+| orders, fills, risk_decisions | 2 realistic paper/audit writer | 16 reconciliation and 19 Execution services |
+| valuations, fair_value_evidence | 18 measurement/rules workflow | 18 approval and 19 FairValue/Analysis services |
+| quality_results, lineage | each producer through 3/4 common commit | 11 PIT, 19 source/query domains, 20 evidence gate |
+
+Every row stores schema/source/quality/provenance, relevant time semantics and content identity. Task
+20 rejects a dataset family whose named producer or reader is absent, fixture-only, schema-only, or
+unbound to a committed manifest.
+
+## Dependency-safe wave and ownership table
+
+One worktree owns a cohesive lane, not one small task. The integration owner publishes the exact
+path set before dispatch and merges in the order shown.
+
+| Stage / wave | Ready tasks and grouped lanes | Start barrier | Exclusive ownership | Merge order | Required Wave close |
+| --- | --- | --- | --- | --- | --- |
+| Stage 0 / Wave 0 | 0 truth refresh; 1 DAG/dependency governance | approved live/capture exact head | docs/policy and integrator hotspots | 0 then 1 | reviewed dependency policy and locked full-workspace gate |
+| Stage 1 / Wave 1A | 2 live/risk/paper; 3 catalog/secrets; 5 MCP transport | Task 1 frozen interfaces | execution/adapters; platform/data; MCP | 3, 5, then 2 exact integration | one reviewed lock resolution; Tasks 2/3/5 focused `--locked` reruns; locked Wave gate |
+| Stage 1 / Wave 1B | 4 data storage/query; 6 Kraken | Task 3 catalog and Task 2 live interfaces frozen | data only; Kraken only | 4 then 6 | one reviewed lock resolution; Tasks 4/6 focused `--locked` reruns; locked Wave gate |
+| Stage 2 / Wave 2 | 7 files; 8 SEC; 9 macro; 10 portfolio import | Task 4 ingest contract frozen | disjoint adapter crates | 7, 8, 9, 10 | one reviewed lock resolution; Tasks 7-10 focused `--locked` reruns; locked Wave gate |
+| Stage 2 / Wave 3 | 11 PIT/research composition; 12 analytics | provider lanes and data manifests merged | data/app research; analytics | 11 then 12 | one reviewed lock resolution; Tasks 11/12 focused `--locked` reruns; locked Wave gate |
+| Stage 3 / Wave 4A | 13 bundle/native; 14 Python; 16 portfolio | PIT and analytics APIs frozen | modeling; python; portfolio | 13, 16, then 14 | one reviewed lock resolution; Tasks 13/14/16 focused `--locked` reruns; locked Wave gate |
+| Stage 3 / Wave 4B | 15 ONNX; 17 backtest; 18 fair value | bundle/portfolio/data interfaces frozen | modeling ONNX; backtesting crate; valuation | 15, 17, 18 | one reviewed lock resolution; Tasks 15/17/18 focused `--locked` reruns; locked Wave gate |
+| Stage 4 / Wave 5 | 19 services/CLI/MCP domains | all domain services merged | app/MCP/CLI serialized composition | last implementation merge | one reviewed lock resolution; Task 19 focused `--locked` rerun; locked full workspace gate |
+| Stage 5 / Wave 6 | 20 demo/hardening/review/publication | clean integrated candidate | benches/fuzz/docs/evidence, then frozen review | terminal | unchanged reviewed lock; all locked release gates at each freeze |
+
+If four agent slots are available, the integration owner occupies one slot and dispatches at most
+three disjoint writers. A lane blocked on a shared file sends an exact patch request to the integration
+owner and continues only on its owned files. No two live writers touch the same worktree.
+
+## Planned file ownership
+
+```text
+domain       crates/market-squawk-domain
+platform     crates/market-squawk-platform
+sources      crates/market-squawk-sources
+live         crates/market-squawk-live
+data         crates/market-squawk-data
+analytics    crates/market-squawk-analytics
+services     crates/market-squawk-services
+modeling     crates/market-squawk-modeling
+portfolio    crates/market-squawk-portfolio
+backtesting  crates/market-squawk-backtesting
+execution    crates/market-squawk-execution
+valuation    crates/market-squawk-valuation
+mcp          crates/market-squawk-mcp
+coinbase     adapters/market-squawk-adapter-coinbase
+kraken       adapters/market-squawk-adapter-kraken
+sec          adapters/market-squawk-adapter-sec
+fred         adapters/market-squawk-adapter-fred
+bls          adapters/market-squawk-adapter-bls
+treasury     adapters/market-squawk-adapter-treasury
+files        adapters/market-squawk-adapter-files
+port_import  adapters/market-squawk-adapter-portfolio
+paper        adapters/market-squawk-adapter-paper
+python       python/market_squawk, python/tests, python/pyproject.toml, python/requirements.lock
+python_bind  crates/market-squawk-python
+composition  apps/market-squawk
+```
+
+No package is created until the owning task includes its first production consumer and tests.
+
+At the end of every Wave, each lane writes its exact manifest requests and generated-lock disposition
+to the ignored handoff record named in `usable-release-path-ownership.json`. The integration owner
+rejects a handoff with a staged/dirty `Cargo.lock`, undeclared dependency, unreviewed feature/default,
+or network-fetched native artifact. After the single lock commit, workers may rerun in read-only
+worktrees, but only integration-owner `--locked` results and the exact Wave head count toward release
+evidence.
+
+Every lane that creates a crate or changes dependency requests uses this two-phase command contract.
+Its first dependency-resolving RED/GREEN commands deliberately omit `--locked` and are provisional.
+Before `stage_usable_release_task.py` and the lane commit, save the generated-lock diff only as
+ignored handoff evidence, then restore the owner-excluded lock and prove it equals the lane base.
+This required pre-staging sequence applies to every such task below even when the common commands are
+not repeated in that task's focused command block:
+
+```bash
+git diff -- Cargo.lock > .agents/tmp/generated-lock-disposition.patch
+git restore --source=HEAD --staged --worktree -- Cargo.lock
+git diff --exit-code -- Cargo.lock
+```
+
+This restore is authorized only for a lane-generated `Cargo.lock` after the diff is preserved; it
+must stop if the lock had pre-existing/user edits. The integrator then cherry-picks the clean lane
+commit, applies the reviewed manifest set, runs one minimal lock resolution, commits the lock diff,
+and reruns every lane's exact focused commands with `--locked`. A task's `Expected:` paragraph means
+the post-merge locked result, never the provisional lane run. The Stage truth ledger changes only in
+that integration commit.
+
+---
+
+### Task 0: Refresh the approved baseline and enforce release truth
+
+**Files:**
+
+- Modify: `AGENTS.md`
+- Modify: `README.md`
+- Modify: `docs/project-memory.md`
+- Modify: `docs/architecture/current-state.md`
+- Modify: `docs/plans/gap-analysis.md`
+- Modify: `docs/plans/implementation-plan.md`
+- Modify: `docs/superpowers/plans/2026-07-17-market-squawk-usable-complete-release.md`
+- Create: `scripts/check_release_truth.py`
+- Create: `scripts/tests/test_release_truth.py`
+- Modify: `scripts/verify.sh`
+- Create: `docs/verification/release-capability-state.json`
+- Create: `docs/verification/usable-release-baseline.md`
+
+**Interfaces:**
+
+- Consumes: independently approved live/capture exact SHA and review evidence; approved usable-release
+  truth design; current tracked file/tree digests.
+- Produces: a deterministic `ReleaseTruthReport`, the README headings `Runnable now`, `Required but
+  missing`, and `Release blocked until implemented`, corrected positive Python requirements, the
+  superseding terminal condition, and a refreshed exact plan base/API inventory.
+
+- [ ] **Step 1: Write failing README truth-policy tests**
+
+Add table-driven tests with these exact policy sets:
+
+```python
+REQUIRED_HEADINGS = (
+    "## Runnable now",
+    "## Required but missing",
+    "## Release blocked until implemented",
+)
+MANDATORY_CAPABILITIES = (
+    "Coinbase direct-source qualification",
+    "Kraken direct-source qualification",
+    "CSV/TSV", "JSON/NDJSON", "XML", "Excel", "SQLite/database export",
+    "OFX/QFX", "Parquet import", "SEC filings/XBRL/Company Facts",
+    "FRED/ALFRED", "BLS", "US Treasury", "portfolio import",
+    "SQLite catalog", "Arrow exchange", "Parquet datasets", "DataFusion queries",
+    "point-in-time datasets", "Rust financial analytics", "feature registry",
+    "Python data/financial/training product", "complete model bundle",
+    "native Rust inference", "constrained ONNX inference", "research backtesting",
+    "portfolio accounting/analytics", "strategies and comprehensive risk",
+    "realistic paper execution", "ASC 820/IFRS 13 fair value",
+    "complete local CLI", "complete typed local MCP", "release security/fuzz/performance gate",
+)
+FORBIDDEN_DEFERRAL = ("later stage", "subsequent stage", "roadmap")
+```
+
+Reject a diagnostic MCP described as complete, policy-helper Python described as the product package,
+missing adapter/Python status, active numbered-quarter delivery language above four, active “quarter
+review/checkpoint” terminology, or a usable-release claim while a mandatory item remains in `Missing`
+state. Exclude immutable historical finding IDs, filenames, and cited research quotations. Require
+each mandatory capability to appear exactly once in `release-capability-state.json` as `Runnable`,
+`Missing`, `Partial`, `Incorrect`, `Unsafe`, or `Blocked`; require the README section and evidence
+reference to match that state. Every non-`Runnable` item appears under `Required but missing` with its
+exact state, blocker and closing task. A `Runnable` item appears only under `Runnable now` and requires
+an immutable evidence path and exact commit SHA. Any non-`Runnable` item forces the release-blocked
+predicate. In the final all-`Runnable` state, `Required but missing` must contain exactly `None.`
+Add transition fixtures for baseline-all-missing, partial Stage integration, forbidden premature
+promotion, evidence invalidation after a commit change, and terminal all-runnable state.
+
+Add a capture-truth fixture requiring the README to distinguish: successful source admission means
+only a bounded in-process queue/admission receipt; writer append/flush/fsync and durability completion
+remain asynchronous and never gate event publication. Reject “source waits for writer/durability
+acknowledgement” and any claim that admission alone proves disk persistence.
+
+- [ ] **Step 2: Run RED**
+
+```bash
+python3 -m unittest scripts.tests.test_release_truth -v
+```
+
+Expected: FAIL because `scripts/check_release_truth.py` and the three README headings do not exist;
+current vague deferral and roadmap text is reported.
+
+- [ ] **Step 3: Implement the deterministic checker**
+
+Implement `check(path: pathlib.Path, state_path: pathlib.Path) -> ReleaseTruthReport` with 512 KiB
+no-follow stable reads, exact heading parsing, strict capability-state schema and uniqueness,
+case-normalized mandatory matching, evidence/commit checks, scoped forbidden-phrase checks, active
+delivery-term checks, and a bounded stable sorted violation list. The CLI accepts only `README.md`
+and `docs/verification/release-capability-state.json`, rejects symlinks, prints deterministic JSON on
+success, never rewrites files, and exits nonzero on a violation. Its closed CLI is exactly
+`check_release_truth.py README.md docs/verification/release-capability-state.json`; zero, one, three,
+reordered, duplicated, absolute, or alternate paths are rejected.
+
+- [ ] **Step 4: Rewrite current truth and terminal policy**
+
+Use this exact README order:
+
+```markdown
+## Runnable now
+The diagnostic foundation currently provides the verified Rust workspace, canonical domain types,
+local policy checks, and bounded compatibility-only control-plane diagnostics. These paths do not
+constitute a usable release, production provider coverage, or automated-execution authority.
+## Required but missing
+The release-capability ledger marks each required provider, storage, analytics, Python, modeling,
+backtest, portfolio, execution, fair-value, and complete-MCP capability `Missing` and links it to the
+closing task in this plan. The README renders that ledger as explicit capability rows.
+## Release blocked until implemented
+Market Squawk is not a usable complete local release until every required vertical is integrated,
+verified at one exact commit, independently reviewed, and demonstrated through local CLI and MCP.
+## Diagnostic foundation quick start
+List the existing build, test, doctor, and five-tool compatibility MCP commands, and label each one
+`Diagnostic only` with its authority and provider-coverage limits.
+## Release-blocking implementation map
+Render the Stage/Wave table from this plan and link every row to its exact closing tasks and start
+barrier.
+```
+
+Preserve zero-cost, no-evasion, journal, coverage, authority, security, and financial-use warnings.
+State that no tracked production adapter crate/directory and no Python product package exist at this
+baseline, while avoiding claims about ignored or untracked filesystem entries. State the bounded
+capture-admission versus asynchronous writer/durability contract exactly. The five-tool MCP remains
+compatibility-only. Replace the project-memory halfway-terminal section with the approved design's
+superseding usable-release decision; do not leave two competing active terminal conditions. Update
+`AGENTS.md` to require the new active Stage/Wave/release-gate vocabulary and usable terminal. In the gap
+analysis, split “Python absent from live path” from positive data/finance/training/export requirements,
+which remain `Missing` until Task 14.
+
+Initialize `release-capability-state.json` with every mandatory capability in `Missing` state, its
+closing task, and this plan path. After each integrated Stage, the integration owner alone updates the
+ledger and README in the Stage integration commit: a capability moves to `Runnable` only after its
+producer, terminal consumer, focused gate, and immutable evidence are present. This serialized truth
+update is mandatory before the next Stage starts; lane writers never edit the shared ledger/README.
+
+- [ ] **Step 5: Refresh exact baseline evidence and plan assumptions**
+
+Record approved SHA/tree/branch, toolchain, workspace members/edges, file existence, test counts,
+review state, all public interfaces consumed below, and current adapter/Python status in
+`usable-release-baseline.md`. Update every stale plan path/signature/line anchor and stop if the
+approved head lacks an assumed prerequisite.
+
+- [ ] **Step 6: Run GREEN and commit**
+
+```bash
+python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
+python3 scripts/check_release_truth.py README.md \
+  docs/verification/release-capability-state.json
+python3 scripts/check_brand.py
+python3 scripts/check_workspace_boundaries.py
+python3 scripts/check_duplicate_dependencies.py
+python3 scripts/check_generated_artifacts.py
+git diff --check
+git add AGENTS.md README.md docs/project-memory.md docs/architecture/current-state.md \
+  docs/plans/gap-analysis.md docs/plans/implementation-plan.md \
+  docs/superpowers/plans/2026-07-17-market-squawk-usable-complete-release.md \
+  docs/verification/release-capability-state.json \
+  docs/verification/usable-release-baseline.md scripts/check_release_truth.py \
+  scripts/tests/test_release_truth.py scripts/verify.sh
+git commit -m "docs(release): enforce usable release truth"
+```
+
+Expected: all commands pass, product Rust code is unchanged, and the committed plan names its exact
+approved audit base.
+
+### Task 1: Freeze the dependency DAG, current research, and path ownership
+
+**Files:**
+
+- Create: `docs/verification/usable-release-path-ownership.json`
+- Create: `docs/research/2026-07-17-usable-release-dependencies.md`
+- Create: `docs/research/2026-07-17-usable-release-traceability.md`
+- Create: `scripts/check_usable_release_plan.py`
+- Create: `scripts/stage_usable_release_task.py`
+- Create: `scripts/tests/test_check_usable_release_plan.py`
+- Create: `scripts/tests/test_stage_usable_release_task.py`
+- Modify: `scripts/check_workspace_boundaries.py`
+- Modify: `scripts/tests/test_dependency_policy.py`
+
+**Interfaces:**
+
+- Consumes: Task 0 exact inventory, official dependency/provider/MCP/runtime research, existing Q3
+  detailed plan, and the provisional Q4 plan.
+- Produces: closed `TaskId -> exact paths` ownership JSON, acyclic dependency allowlist, a tracked
+  deduplicated requirement/producer/consumer/evidence/source-link matrix, exact
+  compatible dependency/license/MSRV record, literal-path staging helper, and zero-credit
+  preimplementation state.
+
+- [ ] **Step 1: Write RED plan/ownership/dependency tests**
+
+Require Tasks 0-20 exactly once, the wave table, start barrier/focused gate per task, no glob or
+directory-only ownership, no overlap between parallel lanes, and serialized root manifest/lock/app/
+authority/evidence ownership. Enforce this graph:
+
+```text
+domain -> none
+analytics -> domain
+platform -> domain
+sources -> domain, platform
+live -> domain, sources, analytics
+data -> domain, platform, sources
+services -> domain, platform
+modeling -> domain, analytics, data
+portfolio -> domain, analytics, data
+backtesting -> domain, analytics, data, modeling, portfolio, execution
+execution -> domain, live, analytics, modeling, portfolio
+valuation -> domain, analytics, data, portfolio
+mcp -> domain, platform, services
+python bindings -> domain, analytics
+provider adapters -> declared domain/source/platform contracts, never data
+app -> composition dependencies
+```
+
+Reject `live -> data|mcp|python|adapter`, production `test-support`, an adapter without a real
+consumer test, and multiple owners for a shared hotspot.
+
+- [ ] **Step 2: Run RED**
+
+```bash
+python3 -m unittest scripts.tests.test_check_usable_release_plan \
+  scripts.tests.test_stage_usable_release_task scripts.tests.test_dependency_policy -v
+```
+
+Expected: FAIL because the ownership JSON and new validators do not exist.
+
+- [ ] **Step 3: Freeze exact dependency and rights research**
+
+Use current official sources and `cargo metadata --locked`. Retain the researched DataFusion 54.0.0
+and compatible Arrow/Parquet 58.3.0 family. Verify exact rusqlite/bundled SQLite, rmcp, PyO3,
+maturin, PyArrow, ONNX runtime, keyring, Argon2id, XChaCha20-Poly1305, parser, fuzz and benchmark
+versions. Record URL, retrieval date, license, Rust/Python floor, enabled features, native artifact
+policy, transitive risks and stable fallback. Reject anything incompatible with Rust 1.97.1,
+zero-mandatory-cost, local operation or the no-evasion boundary.
+
+Verify the ignored traceability report digest, reconcile it against the refreshed repository and
+approved design, and persist every mandatory capability with current classification, requirement IDs,
+producer, terminal consumer, acceptance evidence, closing task and direct official source/terms/docs
+links. Every web result records title, canonical URL, publisher, retrieval date, exact claim used and
+archived content digest where redistribution rights allow. Prefer official provider/API/protocol/
+runtime documentation and upstream release/security advisories; label any inference. Adapter fixture
+manifests in Tasks 6-10 link back to these records and add exact fixture URL/license/hash.
+
+- [ ] **Step 4: Implement the closed validators**
+
+`check_usable_release_plan.py` validates task headings, checkboxes, exact files, interface names,
+RED/GREEN commands, commit steps, waves/barriers/owners/gates, mandatory capability tokens and the
+terminal gate. `stage_usable_release_task.py TASK_ID` uses Git literal pathspecs, rejects traversal,
+symlinks, overlapping ownership, unexpected staged paths and task-owned dirty paths left unstaged,
+then verifies the index. Both use bounded stable reads and deterministic bounded output.
+
+- [ ] **Step 5: Extend workspace boundary enforcement**
+
+Read actual `cargo metadata`; compare every edge to the allowlist; reject Python imports from live/
+execution packages; reject any package whose only production behavior is a trait/schema; require an
+adapter's production parser plus an integration consumer before counting membership.
+
+- [ ] **Step 6: Run GREEN and commit**
+
+```bash
+python3 -m unittest scripts.tests.test_check_usable_release_plan \
+  scripts.tests.test_stage_usable_release_task scripts.tests.test_dependency_policy -v
+python3 scripts/check_usable_release_plan.py \
+  docs/superpowers/plans/2026-07-17-market-squawk-usable-complete-release.md \
+  docs/verification/usable-release-path-ownership.json
+python3 scripts/check_workspace_boundaries.py
+git diff --check
+git add docs/verification/usable-release-path-ownership.json \
+  docs/research/2026-07-17-usable-release-dependencies.md \
+  docs/research/2026-07-17-usable-release-traceability.md \
+  scripts/check_usable_release_plan.py scripts/stage_usable_release_task.py \
+  scripts/tests/test_check_usable_release_plan.py scripts/tests/test_stage_usable_release_task.py \
+  scripts/check_workspace_boundaries.py scripts/tests/test_dependency_policy.py
+git commit -m "build(release): freeze dependency and lane ownership"
+```
+
+Expected: all checks pass and no product package has been created.
+
+### Task 2: Complete production live features, Coinbase, risk, and realistic paper execution
+
+**Files:**
+
+- Refresh/execute: `docs/superpowers/plans/2026-07-16-market-squawk-q3-production-plan.md`
+- Create: `docs/verification/stage-live-execution-path-ownership.json`
+- Create: `scripts/check_stage_live_execution_plan.py`
+- Create: `scripts/tests/test_check_stage_live_execution_plan.py`
+- Create/modify: every exact product, test, and benchmark path enumerated by
+  `stage-live-execution-path-ownership.json`, including stable modules
+  `crates/market-squawk-domain/src/order.rs`,
+  `crates/market-squawk-analytics/src/registry.rs`,
+  `crates/market-squawk-live/src/action.rs`,
+  `crates/market-squawk-execution/src/risk.rs`,
+  `crates/market-squawk-execution/src/dispatcher.rs`,
+  `adapters/market-squawk-adapter-coinbase/src/decoder.rs`,
+  `adapters/market-squawk-adapter-coinbase/src/source.rs`,
+  `adapters/market-squawk-adapter-paper/src/adapter.rs`,
+  `adapters/market-squawk-adapter-paper/src/state.rs`,
+  `apps/market-squawk/src/services.rs`, and
+  `apps/market-squawk/tests/end_to_end_authority.rs`
+- Create: `docs/verification/stage-live-execution.md`
+
+**Interfaces:**
+
+- Consumes: approved live/capture closure, Task 1 ownership/DAG, registry/capture/book/shard/snapshot
+  contracts, and opaque `LiveExecutionCapability`.
+- Produces: refreshed Q3 plan's exact `FeatureDefinition`, `OrderIntent`,
+  `RiskCoordinator::evaluate`, privately constructible `ApprovedOrder`, single-use `DispatchOrder`,
+  `ExecutionAdapter`, `ApplicationServices`, production Coinbase `LiveMarketSource`, and realistic
+  paper order/account/reconciliation interfaces.
+
+- [ ] **Step 1: Refresh the detailed Q3 plan**
+
+Replace its audit base, active quarter wording, stale files/signatures, dependency pins, exact test
+counts and ownership table. Preserve all 19 tasks and every authority, memory, feature, risk, paper,
+fuzz, performance and review contract, but transfer creation/execution of fuzz targets to Task 20;
+Task 2 owns only parser property tests and committed seed fixtures. Materialize every exact Task-2
+path from the detailed plan into
+`stage-live-execution-path-ownership.json`; the refreshed Q3 plan plus that closed JSON are normative
+inputs to this master plan. `check_stage_live_execution_plan.py` rejects a detailed-plan file absent
+from the JSON, a JSON path absent from the plan, globs/directories, overlap with another live lane,
+and any shared hotspot not owned by the integration owner.
+
+- [ ] **Step 2: Execute all detailed Q3 RED/GREEN commits**
+
+First run `python3 -m unittest scripts.tests.test_check_stage_live_execution_plan -v` and observe RED
+until the exact closed path map and checker exist. Then use subagent-driven development on the
+refreshed DAG. Required RED evidence includes absent complete
+order identities/types, feature registry, risk reservations, production Coinbase current-batch
+adapter, route-owned feature state, private approval/dispatch boundary, complete paper state machine,
+shared app services and compile-fail bypass tests. Each lane runs its detailed focused test/clippy/
+diff gate before handoff.
+
+- [ ] **Step 3: Prove live-to-paper behavior**
+
+Run the production Coinbase parser against a deterministic local server through source metadata,
+shared budget, capture, exact decoding, current ingress, features, strategy, risk, one-use dispatch
+and paper execution. Evaluate Coinbase channel/profile evidence against every `DirectVerified`
+predicate; either prove and bind the exact approved qualification outcome or cap it below execution
+and keep verified-action release evidence open. Never promote it merely because it is a direct
+connection. Diagnostic values cannot enter production. Prove accepted/partial/filled/cancel-pending/canceled/rejected/expired,
+fees, seeded latency, depth/slippage/impact, reservations, balances/positions, recovery and audit.
+
+- [ ] **Step 4: Freeze focused interfaces and commit**
+
+```bash
+python3 -m unittest scripts.tests.test_check_stage_live_execution_plan -v
+python3 scripts/check_stage_live_execution_plan.py \
+  docs/superpowers/plans/2026-07-16-market-squawk-q3-production-plan.md \
+  docs/verification/stage-live-execution-path-ownership.json
+cargo fmt --all --check
+cargo clippy -p market-squawk-domain -p market-squawk-live \
+  -p market-squawk-analytics -p market-squawk-execution \
+  -p market-squawk-adapter-coinbase -p market-squawk-adapter-paper \
+  -p market-squawk --all-targets --all-features --locked -- -D warnings
+cargo test -p market-squawk-domain -p market-squawk-live \
+  -p market-squawk-analytics -p market-squawk-execution \
+  -p market-squawk-adapter-coinbase -p market-squawk-adapter-paper \
+  -p market-squawk --all-features --locked
+git diff --check
+python3 scripts/stage_usable_release_task.py 2
+git commit -m "feat(execution): complete production risk and paper vertical"
+```
+
+Expected: all focused gates pass and the clean commit exposes the frozen interfaces needed by Tasks
+6, 16, 17 and 19. Stage approval still waits for integrated exact-head review.
+
+### Task 3: Implement the SQLite catalog, durable registries, secrets, and rights admission
+
+**Files:**
+
+- Create: `crates/market-squawk-data/Cargo.toml`
+- Create: `crates/market-squawk-data/src/lib.rs`
+- Create: `crates/market-squawk-data/src/catalog.rs`
+- Create: `crates/market-squawk-data/src/migrations.rs`
+- Create: `crates/market-squawk-data/src/rights.rs`
+- Create: `crates/market-squawk-data/tests/catalog.rs`
+- Create: `crates/market-squawk-data/tests/rights.rs`
+- Create: `crates/market-squawk-data/migrations/0001_control.sql`
+- Create: `crates/market-squawk-data/migrations/0002_instruments.sql`
+- Modify: `crates/market-squawk-platform/Cargo.toml`
+- Modify: `crates/market-squawk-platform/src/lib.rs`
+- Create: `crates/market-squawk-platform/src/secrets.rs`
+- Create: `crates/market-squawk-platform/tests/secrets.rs`
+
+**Interfaces:**
+
+- Consumes: domain instrument/provenance/time values, source extraction/rights contracts, controlled
+  platform paths, Task 1 dependency pins.
+- Produces:
+
+```rust
+pub struct Catalog;
+pub struct IngestReservation;
+pub struct SourceRightsDecision;
+pub trait SecretStore {
+    fn store(&self, key: &SecretKey, value: SecretValue) -> Result<(), SecretError>;
+    fn load(&self, key: &SecretKey) -> Result<SecretValue, SecretError>;
+}
+impl Catalog {
+    pub fn open(config: CatalogConfig) -> Result<Self, CatalogError>;
+    pub fn reserve_ingest(
+        &self,
+        request: &IngestIdentity,
+        rights: &SourceRightsDecision,
+    ) -> Result<IngestReservation, CatalogError>;
+}
+```
+
+Rights bind source, payload digest, retrieval time, exact terms URL/digest, authorization evidence/
+expiry and permitted retrieve/display/persist/cache/redistribute/train operations.
+
+- [ ] **Step 1: Write failing catalog, restart, rights, and secret tests**
+
+Test `foreign_keys=ON`, `trusted_schema=OFF`, `synchronous=FULL`, bounded busy timeout, local-only WAL,
+digest-bound ordered migrations, integrity/foreign-key checks, one writer, crash restart, backup/
+restore, idempotency conflict, durable instruments/identifiers/symbol history/mergers/delistings/rolls/
+corporate actions, operation mismatch/expiry, keyring success, and Argon2id + XChaCha20-Poly1305
+fallback whose unlock secret is never stored beside ciphertext.
+
+- [ ] **Step 2: Run RED**
+
+```bash
+cargo test --manifest-path crates/market-squawk-data/Cargo.toml --test catalog --test rights
+cargo test -p market-squawk-platform --test secrets --locked
+```
+
+Expected: FAIL because the data package, migrations, catalog and secret provider do not exist.
+
+- [ ] **Step 3: Implement strict catalog and rights admission**
+
+Use prepared statements, checked transactions, a process-local non-clone writer permit, bounded
+queries/results, exact UTC nanoseconds, immutable audits and typed conflicts. Reserve an ingest only
+after the requested operation is authorized; extraction output cannot grant itself persistence.
+Persist instruments, identifiers, venues, symbol history, corporate actions, source configuration,
+cursors, runs, manifests, audit and artifact metadata needed by Tasks 4-19.
+
+- [ ] **Step 4: Implement secret providers and rotation**
+
+Prefer OS keyring. The fallback records Argon2id parameters/random salt, uses a unique nonce and
+XChaCha20-Poly1305 authenticated version/key-name metadata, atomically publishes below the confined
+secret root, zeroizes plaintext/derived keys, and rotates by decrypt-validate-reencrypt-replace.
+`Debug`, `Display`, tracing and MCP never reveal the value, path token or key identity.
+
+- [ ] **Step 5: Run GREEN and commit**
+
+```bash
+cargo test --manifest-path crates/market-squawk-data/Cargo.toml --all-features --locked
+cargo test -p market-squawk-platform --test secrets --locked
+cargo clippy --manifest-path crates/market-squawk-data/Cargo.toml \
+  --all-targets --all-features --locked -- -D warnings
+cargo clippy -p market-squawk-platform --all-targets --all-features --locked -- -D warnings
+git diff --check
+python3 scripts/stage_usable_release_task.py 3
+git commit -m "feat(data): add durable local catalog and rights admission"
+```
+
+Expected: a real catalog consumer opens, migrates, writes, restarts and reads; all gates pass; this
+lane does not edit the root manifest/lockfile.
+
+### Task 4: Implement Arrow schemas, immutable Parquet publication, and bounded DataFusion
+
+**Files:**
+
+- Modify: `crates/market-squawk-data/Cargo.toml`
+- Modify: `crates/market-squawk-data/src/lib.rs`
+- Create: `crates/market-squawk-data/src/schema.rs`
+- Create: `crates/market-squawk-data/src/arrow_convert.rs`
+- Create: `crates/market-squawk-data/src/manifest.rs`
+- Create: `crates/market-squawk-data/src/parquet_store.rs`
+- Create: `crates/market-squawk-data/src/ingest.rs`
+- Create: `crates/market-squawk-data/src/query.rs`
+- Create: `crates/market-squawk-data/tests/arrow_roundtrip.rs`
+- Create: `crates/market-squawk-data/tests/publication_recovery.rs`
+- Create: `crates/market-squawk-data/tests/query_limits.rs`
+- Create: `crates/market-squawk-data/tests/compaction.rs`
+
+**Interfaces:**
+
+- Consumes: Task 3 catalog/rights reservation, canonical `ResearchObservation`, controlled artifact
+  paths, exact schema/provenance values.
+- Produces:
+
+```rust
+pub trait ResearchIngestService {
+    async fn ingest(
+        &self,
+        reservation: IngestReservation,
+        batch: ExtractionBatch,
+        cancellation: CancellationToken,
+    ) -> Result<CommittedDataset, IngestError>;
+}
+pub struct DatasetManifestRef {
+    dataset_id: DatasetId,
+    manifest_version: u64,
+    content_hash: Sha256Digest,
+}
+pub struct QueryLimits {
+    max_rows: u64,
+    max_bytes: u64,
+    max_memory_bytes: u64,
+    deadline: std::time::Duration,
+}
+pub trait ResearchQueryService {
+    async fn query(
+        &self,
+        request: QueryRequest,
+        limits: QueryLimits,
+        cancellation: CancellationToken,
+    ) -> Result<QueryResult, QueryError>;
+}
+```
+
+- [ ] **Step 1: Write RED schema/publication/query tests**
+
+Cover Arrow Decimal128/currency/scale/time/provenance/revision/supersession metadata; invalid schema
+versions; no lossy decimal conversion; object-before-manifest crash points; idempotent same-key same-
+digest return; same-key different input conflict; orphan quarantine/grace collection; reader manifest
+pinning; compaction row/hash/lineage/revision invariance; DataFusion row/byte/memory/deadline/
+cancellation; forbidden writes/DDL/extension/network/filesystem UDFs; and small-file ceilings.
+
+- [ ] **Step 2: Run RED**
+
+```bash
+cargo test --manifest-path crates/market-squawk-data/Cargo.toml \
+  --test arrow_roundtrip --test publication_recovery --test query_limits --test compaction
+```
+
+Expected: FAIL because schema conversion, immutable publication and query services are absent.
+
+- [ ] **Step 3: Implement versioned Arrow and crash-safe Parquet publication**
+
+Convert only request-bound canonical observations. Write bounded Parquet objects to a confined
+staging directory, close/fsync/hash exact bytes, publish once at
+`objects/sha256/<prefix>/<digest>.parquet`, fsync created directories, then `BEGIN IMMEDIATE` and
+atomically commit a complete immutable manifest generation. Readers pin a committed generation and
+never infer completeness from directory listings. Compaction creates a new generation and never
+mutates an object.
+
+- [ ] **Step 4: Implement bounded DataFusion confinement**
+
+Register only manifest-pinned tables, allow `SELECT`/CTE/subquery/explain against allowlisted schemas,
+reject DDL/DML/copy/external table/UDF/extension statements, cap plans/partitions/rows/bytes/memory/
+wall time, propagate cancellation, and return inline data only below the service threshold; larger
+results use Task 3 artifact metadata and controlled content hashes.
+
+- [ ] **Step 5: Run GREEN and commit**
+
+```bash
+cargo test --manifest-path crates/market-squawk-data/Cargo.toml --all-features --locked
+cargo clippy --manifest-path crates/market-squawk-data/Cargo.toml \
+  --all-targets --all-features --locked -- -D warnings
+python3 scripts/check_workspace_boundaries.py
+git diff --check
+python3 scripts/stage_usable_release_task.py 4
+git commit -m "feat(data): publish immutable analytical datasets"
+```
+
+Expected: every crash point recovers to either the prior complete manifest or the new complete
+manifest; queries remain bounded; live packages have no analytical dependency.
+
+### Task 5: Implement the bounded MCP protocol crate over abstract services
+
+**Files:**
+
+- Create: `crates/market-squawk-services/Cargo.toml`
+- Create: `crates/market-squawk-services/src/lib.rs`
+- Create: `crates/market-squawk-services/src/request.rs`
+- Create: `crates/market-squawk-services/src/response.rs`
+- Create: `crates/market-squawk-services/src/traits.rs`
+- Create: `crates/market-squawk-services/tests/contracts.rs`
+- Create: `crates/market-squawk-mcp/Cargo.toml`
+- Create: `crates/market-squawk-mcp/src/lib.rs`
+- Create: `crates/market-squawk-mcp/src/framing.rs`
+- Create: `crates/market-squawk-mcp/src/protocol.rs`
+- Create: `crates/market-squawk-mcp/src/server.rs`
+- Create: `crates/market-squawk-mcp/src/limits.rs`
+- Create: `crates/market-squawk-mcp/src/audit.rs`
+- Create: `crates/market-squawk-mcp/src/artifact.rs`
+- Create: `crates/market-squawk-mcp/tests/lifecycle.rs`
+- Create: `crates/market-squawk-mcp/tests/hostile_input.rs`
+- Create: `crates/market-squawk-mcp/tests/cancellation.rs`
+- Create: `crates/market-squawk-mcp/tests/output_bounds.rs`
+
+**Interfaces:**
+
+- Consumes: Task 1 rmcp decision and frozen abstract audit/artifact metadata contracts; existing
+  bounded compatibility framing tests. It does not wait for Task 3's implementation.
+- Produces:
+
+```rust
+pub struct McpServer<S: ToolServices>;
+pub trait ToolServices: Send + Sync + 'static {
+    fn capabilities(&self) -> ServiceCapabilities;
+    async fn call(
+        &self,
+        request: TypedToolRequest,
+        context: RequestContext,
+    ) -> Result<TypedToolResult, ServiceError>;
+}
+pub struct RequestContext {
+    pub request_id: RequestId,
+    pub cancellation: CancellationToken,
+    pub deadline: Instant,
+    pub limits: ServiceLimits,
+}
+```
+
+`ToolServices`, `TypedToolRequest`, `TypedToolResult`, `RequestContext`, `ServiceLimits` and
+`ServiceError` live in transport-neutral `market-squawk-services`; MCP implements only the transport.
+The MCP crate knows protocol, bounds, audit envelopes and opaque artifacts; it contains no market
+book, provider, portfolio, valuation, model, risk or execution implementation.
+
+- [ ] **Step 1: Port compatibility tests and write hostile lifecycle RED tests**
+
+Test initialize version/capability negotiation, initialized-state enforcement, string/integer IDs,
+duplicate active IDs, notifications, ping, progress, cancellation, deadline, EOF, broken pipe,
+maximum frame/body/depth/string/array/map size, output queue/backpressure, bounded errors, secret
+redaction, and one audit admission/result class per request. Assert every domain tool is absent until
+Task 19 registers a service.
+
+- [ ] **Step 2: Run RED**
+
+```bash
+cargo test --manifest-path crates/market-squawk-mcp/Cargo.toml --all-features
+cargo test --manifest-path crates/market-squawk-services/Cargo.toml --all-features
+```
+
+Expected: FAIL because the dedicated MCP package and lifecycle implementation do not exist.
+
+- [ ] **Step 3: Implement rmcp lifecycle behind the existing bounded transport**
+
+Adopt the Task 1-pinned official SDK features only. Retain maximum-plus-one incremental newline
+framing; validate body/depth/string/container bounds before dispatch; enforce initialize state and
+negotiated protocol; track active typed request IDs; connect cancel/progress/deadline to a child token;
+bound the writer queue and write deadline; treat EOF/broken pipe as controlled shutdown; keep stdout
+protocol-clean.
+
+- [ ] **Step 4: Implement audit and artifact response contracts**
+
+Audit request ID, authenticated local process identity class, tool/version, admitted limits, start/
+finish/result class and content hashes without secrets/full financial payloads. Inline results only
+within bytes/items limits. Larger results are atomically written under the controlled artifact root,
+hashed, registered in Task 3 metadata and returned as opaque `ArtifactReference`; no request accepts
+a path.
+
+- [ ] **Step 5: Run GREEN and commit**
+
+```bash
+cargo test --manifest-path crates/market-squawk-mcp/Cargo.toml --all-features
+cargo test --manifest-path crates/market-squawk-services/Cargo.toml --all-features
+cargo clippy --manifest-path crates/market-squawk-mcp/Cargo.toml \
+  --all-targets --all-features --locked -- -D warnings
+cargo clippy --manifest-path crates/market-squawk-services/Cargo.toml \
+  --all-targets --all-features --locked -- -D warnings
+git diff --check
+python3 scripts/stage_usable_release_task.py 5
+git commit -m "feat(mcp): add bounded local protocol server"
+```
+
+Expected: all protocol/hostile/cancellation/output tests pass with a fake bounded service; no domain
+tool or app composition is claimed.
+
+### Task 6: Implement the production Kraken live-to-paper vertical
+
+**Files:**
+
+- Create: `adapters/market-squawk-adapter-kraken/Cargo.toml`
+- Create: `adapters/market-squawk-adapter-kraken/src/lib.rs`
+- Create: `adapters/market-squawk-adapter-kraken/src/config.rs`
+- Create: `adapters/market-squawk-adapter-kraken/src/messages.rs`
+- Create: `adapters/market-squawk-adapter-kraken/src/decoder.rs`
+- Create: `adapters/market-squawk-adapter-kraken/src/session.rs`
+- Create: `adapters/market-squawk-adapter-kraken/src/qualification.rs`
+- Create: `adapters/market-squawk-adapter-kraken/tests/fixtures.rs`
+- Create: `adapters/market-squawk-adapter-kraken/tests/local_websocket.rs`
+- Create: `adapters/market-squawk-adapter-kraken/tests/live_to_paper.rs`
+- Create: `adapters/market-squawk-adapter-kraken/fixtures/manifest.json`
+
+**Interfaces:**
+
+- Consumes: Task 2 live/risk/paper interfaces, source registry/budget/capture, instrument numeric
+  policy, existing Kraken checksum profile.
+- Produces: `KrakenSource: LiveMarketSource`, exact-lexeme bounded decoder outcomes, typed transport-
+  order evidence distinct from venue sequence, coverage/health, quarantine/recovery and optional
+  current qualification only under the approved `KrakenQualificationPolicy`.
+
+- [ ] **Step 1: Write official-fixture and local-WebSocket RED tests**
+
+Use content-hashed official snapshot/update/checksum fixtures. Test subscribe acknowledgement,
+unsupported depth, exact decimal lexemes including leading/trailing zeros, message-atomic update,
+top-ten bid-desc/ask-asc CRC32, delete-zero, depth truncation, malformed/oversized/duplicate fields,
+heartbeat versus market freshness, status/precision, ping/close/cancellation, checksum mismatch,
+generation reconnect, fresh snapshot and complete requalification. Assert no fabricated venue
+sequence exists in any type or wire output.
+
+- [ ] **Step 2: Run RED**
+
+```bash
+cargo test --manifest-path adapters/market-squawk-adapter-kraken/Cargo.toml --all-features
+```
+
+Expected: FAIL because the production Kraken package does not exist.
+
+- [ ] **Step 3: Implement transport, parser, integrity, and recovery**
+
+Bind the endpoint/redirect/TLS policy and shared authoritative budget before connect. Capture each raw
+frame before decoding. Preserve lexemes, apply each frame's updates atomically in wire order, invoke
+the existing closed checksum profile, and quarantine the generation on any parse, depth, checksum,
+status, precision, freshness, subscription, capture or send failure. Reconnect under bounded backoff
+with a new generation and require a fresh snapshot.
+
+- [ ] **Step 4: Enforce the independent qualification decision**
+
+`KrakenQualificationPolicy` is a versioned, reviewed source-policy input, not adapter discretion. If
+continuous bounded transport order plus checksum-after-every-update does not satisfy the product's
+sequence-progression predicate, cap Kraken below execution quality and assert risk rejection. If the
+independent evidence decision approves the composite rule, bind its exact version/digest into source
+metadata and prove current capability expiry/revocation through the full live-to-paper test.
+
+- [ ] **Step 5: Run GREEN, parser property tests, and commit**
+
+```bash
+cargo test --manifest-path adapters/market-squawk-adapter-kraken/Cargo.toml --all-features
+cargo clippy --manifest-path adapters/market-squawk-adapter-kraken/Cargo.toml \
+  --all-targets --all-features --locked -- -D warnings
+git diff --check
+python3 scripts/stage_usable_release_task.py 6
+git commit -m "feat(kraken): add integrity-qualified live adapter"
+```
+
+Expected: deterministic fixtures and parser property tests pass. A non-executable Kraken cap is
+truthful adapter behavior but does not close the production-live release row by itself: Task 20 must
+still demonstrate verified qualification and automated paper action through an authorized direct
+source, or the usable release remains blocked with the unmet qualification predicate reported.
+External Kraken smoke remains opt-in and truthful. Task 20 owns the exact fuzz target and campaign.
+
+### Task 7: Implement local file, database-export, OFX/QFX, and Parquet adapters
+
+**Files:**
+
+- Create: `adapters/market-squawk-adapter-files/Cargo.toml`
+- Create: `adapters/market-squawk-adapter-files/src/lib.rs`
+- Create: `adapters/market-squawk-adapter-files/src/csv.rs`
+- Create: `adapters/market-squawk-adapter-files/src/json.rs`
+- Create: `adapters/market-squawk-adapter-files/src/xml.rs`
+- Create: `adapters/market-squawk-adapter-files/src/excel.rs`
+- Create: `adapters/market-squawk-adapter-files/src/parquet.rs`
+- Create: `adapters/market-squawk-adapter-files/src/database.rs`
+- Create: `adapters/market-squawk-adapter-files/src/ofx.rs`
+- Create: `adapters/market-squawk-adapter-files/tests/hostile_files.rs`
+- Create: `adapters/market-squawk-adapter-files/tests/ingest_vertical.rs`
+- Create: `adapters/market-squawk-adapter-files/fixtures/manifest.json`
+
+**Interfaces:**
+
+- Consumes: `ExtractionSource`, controlled no-follow local file capabilities, Task 3 rights decision,
+  Task 4 `ResearchIngestService` and schema registry.
+- Produces: `FileExtractionSource` with bounded discovery/extract for CSV/TSV, JSON/NDJSON, XML,
+  Excel, Parquet, read-only SQLite/database exports, OFX/QFX/broker exports and user-authorized files;
+  every batch retains raw-source hash, schema, row/field policy, provenance and idempotency identity.
+
+- [ ] **Step 1: Write RED hostile parser and archive tests**
+
+Test CSV quoting/encoding/delimiter/row/column/field/decimal/timestamp errors; JSON duplicate keys,
+depth/container/string/record bounds and NDJSON line recovery policy; XML DTD/external/general/
+parameter entity and network prohibition plus depth/text bounds; Excel ZIP entry/count/uncompressed-
+bytes/compression-ratio/path traversal, macro/formula/external-link/cached-value/sheet/cell policies;
+Parquet footer/schema/metadata/row-group/column bounds; read-only SQLite allowlisted schema and
+consistent snapshot; OFX SGML/XML nesting, duplicate transaction IDs, account/currency and supplied
+totals; symlink races and no-follow path confinement.
+
+- [ ] **Step 2: Run RED**
+
+```bash
+cargo test --manifest-path adapters/market-squawk-adapter-files/Cargo.toml --all-features
+```
+
+Expected: FAIL because the file adapter package is absent.
+
+- [ ] **Step 3: Implement bounded production parsers**
+
+Parse streams incrementally under one `ExtractionLimits` object covering source bytes, decompressed
+bytes, records, fields, depth, text, sheets/cells, row groups, elapsed time and cancellation. Reject
+macros, formulas without an approved cached-value policy, external entities/links/network, archive
+traversal/bombs, mutable database reads and inferred accounting scale. Preserve the raw record/hash
+and explicit row-error disposition.
+
+- [ ] **Step 4: Prove provider-to-query consumption**
+
+For one fixture per format, reserve rights/idempotency, extract canonical observations, publish via
+Task 4, restart, resolve the manifest and query the exact rows. Re-run and assert no duplicate logical
+observation. A same key with changed source bytes/schema/config must fail as a typed conflict.
+
+- [ ] **Step 5: Run GREEN, parser property tests, and commit**
+
+```bash
+cargo test --manifest-path adapters/market-squawk-adapter-files/Cargo.toml --all-features
+cargo clippy --manifest-path adapters/market-squawk-adapter-files/Cargo.toml \
+  --all-targets --all-features --locked -- -D warnings
+git diff --check
+python3 scripts/stage_usable_release_task.py 7
+git commit -m "feat(files): add bounded local extraction adapters"
+```
+
+Expected: hostile fixtures fail safely, valid fixtures reach a manifest-pinned query, and no arbitrary
+path/network/SQL surface exists. Task 20 owns the exact parser fuzz targets and campaigns.
+
+### Task 8: Implement SEC EDGAR, submissions, filings, XBRL, and Company Facts
+
+**Files:**
+
+- Create: `adapters/market-squawk-adapter-sec/Cargo.toml`
+- Create: `adapters/market-squawk-adapter-sec/src/lib.rs`
+- Create: `adapters/market-squawk-adapter-sec/src/client.rs`
+- Create: `adapters/market-squawk-adapter-sec/src/submissions.rs`
+- Create: `adapters/market-squawk-adapter-sec/src/filings.rs`
+- Create: `adapters/market-squawk-adapter-sec/src/xbrl.rs`
+- Create: `adapters/market-squawk-adapter-sec/src/company_facts.rs`
+- Create: `adapters/market-squawk-adapter-sec/tests/official_fixtures.rs`
+- Create: `adapters/market-squawk-adapter-sec/tests/restart_reconcile.rs`
+- Create: `adapters/market-squawk-adapter-sec/fixtures/manifest.json`
+
+**Interfaces:**
+
+- Consumes: shared source budget/health/network policy, declared user-agent configuration, rights
+  admission, instrument registry and Task 4 ingest.
+- Produces: `SecExtractionSource` yielding filing/fundamental observations with accession, form,
+  amendment, taxonomy/context/unit/period, raw payload hash, source/published/available/ingested times,
+  revision and lineage.
+
+- [ ] **Step 1: Write RED official-fixture tests**
+
+Cover submissions pagination, recent/archive reconciliation, Company Facts units/contexts/segments,
+XBRL numeric scale/sign/decimals/period/entity, amendments and supersession, malformed/oversized
+documents, unavailable exact release time, CIK/instrument resolution, conditional requests, retry/
+429/403 health transitions and shared request ceiling. Require the configured declared user agent.
+
+- [ ] **Step 2: Run RED**
+
+```bash
+cargo test --manifest-path adapters/market-squawk-adapter-sec/Cargo.toml --all-features
+```
+
+Expected: FAIL because the SEC adapter does not exist.
+
+- [ ] **Step 3: Implement bulk and incremental ingestion**
+
+Use one authorized HTTP client and shared budget. Bound response/decompression/DOM/text, preserve
+exact payload bytes/hashes, parse production fixtures with the same code as network responses, and
+derive availability conservatively without inventing intraday timestamps. Bulk initialization and
+incremental runs converge by accession/fact identity; amendments remain separate revisions.
+
+- [ ] **Step 4: Run GREEN, prove restart/reconciliation, and commit**
+
+```bash
+cargo test --manifest-path adapters/market-squawk-adapter-sec/Cargo.toml --all-features
+cargo clippy --manifest-path adapters/market-squawk-adapter-sec/Cargo.toml \
+  --all-targets --all-features --locked -- -D warnings
+git diff --check
+python3 scripts/stage_usable_release_task.py 8
+git commit -m "feat(sec): ingest filings and company facts"
+```
+
+Expected: bulk plus incremental rerun is idempotent, revisions persist, provider-to-query tests pass,
+and external SEC smoke remains opt-in.
+
+### Task 9: Implement FRED/ALFRED, BLS, and US Treasury adapters
+
+**Files:**
+
+- Create: `adapters/market-squawk-adapter-fred/Cargo.toml`
+- Create: `adapters/market-squawk-adapter-fred/src/lib.rs`
+- Create: `adapters/market-squawk-adapter-fred/src/client.rs`
+- Create: `adapters/market-squawk-adapter-fred/src/series.rs`
+- Create: `adapters/market-squawk-adapter-fred/src/vintages.rs`
+- Create: `adapters/market-squawk-adapter-fred/src/rights.rs`
+- Create: `adapters/market-squawk-adapter-fred/tests/vintages.rs`
+- Create: `adapters/market-squawk-adapter-fred/tests/rights.rs`
+- Create: `adapters/market-squawk-adapter-bls/Cargo.toml`
+- Create: `adapters/market-squawk-adapter-bls/src/lib.rs`
+- Create: `adapters/market-squawk-adapter-bls/src/client.rs`
+- Create: `adapters/market-squawk-adapter-bls/src/chunks.rs`
+- Create: `adapters/market-squawk-adapter-bls/src/observations.rs`
+- Create: `adapters/market-squawk-adapter-bls/tests/chunking.rs`
+- Create: `adapters/market-squawk-adapter-treasury/Cargo.toml`
+- Create: `adapters/market-squawk-adapter-treasury/src/lib.rs`
+- Create: `adapters/market-squawk-adapter-treasury/src/client.rs`
+- Create: `adapters/market-squawk-adapter-treasury/src/fiscal_data.rs`
+- Create: `adapters/market-squawk-adapter-treasury/src/rates.rs`
+- Create: `adapters/market-squawk-adapter-treasury/tests/pagination.rs`
+- Create: `adapters/market-squawk-adapter-treasury/tests/rates.rs`
+- Create: `docs/verification/fred-rights-decision.json`
+
+**Interfaces:**
+
+- Consumes: Task 3 rights/secrets/catalog, shared budget/health/network policy and Task 4 ingest.
+- Produces: `FredExtractionSource`, `BlsExtractionSource`, `TreasuryExtractionSource`; exact macro
+  series/observation/vintage/revision/availability/coverage records; machine-checked
+  `FredRightsDecision { terms_digest, operations, expires_at, disposition }`.
+
+- [ ] **Step 1: Write three provider RED suites**
+
+FRED tests cover explicit realtime start/end, observation pagination, missing markers, vintage dates,
+revisions, secret redaction and 429. BLS tests cover deterministic v1/v2 series/year chunking,
+public/registered limits, partial/error messages, preliminary flags and explicit vintage limitation.
+Treasury tests cover Fiscal Data pagination, repeated/missing pages, schema drift, official rate files,
+yield methodology/version and source hashes. All test shared budgets, deadlines, cancellation and
+conservative unknown release times.
+
+- [ ] **Step 2: Run RED**
+
+```bash
+cargo test --manifest-path adapters/market-squawk-adapter-fred/Cargo.toml
+cargo test --manifest-path adapters/market-squawk-adapter-bls/Cargo.toml
+cargo test --manifest-path adapters/market-squawk-adapter-treasury/Cargo.toml
+```
+
+Expected: FAIL because none of the macro adapters exists.
+
+- [ ] **Step 3: Implement lawful provider clients and exact revisions**
+
+Use official endpoints, one declared/authorized identity where applicable, the shared durable budget,
+bounded pagination and `Retry-After`. Preserve raw payload hashes, series metadata, reference period,
+published/available evidence, vintage/revision and coverage limitations. Production parser code is
+identical for content-hashed fixtures and opt-in network responses.
+
+- [ ] **Step 4: Enforce FRED rights as a release predicate**
+
+Before persistence, independently verify the exact current terms bytes and operation authorization.
+If retrieve is permitted but persist/cache/archive/train is not affirmatively evidenced, run only the
+permitted ephemeral operation, reject `Catalog::reserve_ingest`, record the fail-closed disposition,
+and keep the usable release gate blocked. Do not treat user acknowledgement as rights, infer a bulk-
+download exception, evade controls, or count an ephemeral stub as the durable FRED/ALFRED capability.
+Release unblocks only when exact lawful source/use evidence supports the required local consumer or
+the user explicitly revises the product requirement.
+
+- [ ] **Step 5: Run GREEN and commit**
+
+```bash
+cargo test --manifest-path adapters/market-squawk-adapter-fred/Cargo.toml --all-features
+cargo test --manifest-path adapters/market-squawk-adapter-bls/Cargo.toml --all-features
+cargo test --manifest-path adapters/market-squawk-adapter-treasury/Cargo.toml --all-features
+cargo clippy --manifest-path adapters/market-squawk-adapter-fred/Cargo.toml \
+  --all-targets --all-features -- -D warnings
+cargo clippy --manifest-path adapters/market-squawk-adapter-bls/Cargo.toml \
+  --all-targets --all-features -- -D warnings
+cargo clippy --manifest-path adapters/market-squawk-adapter-treasury/Cargo.toml \
+  --all-targets --all-features -- -D warnings
+git diff --check
+python3 scripts/stage_usable_release_task.py 9
+git commit -m "feat(macro): ingest official revisioned series"
+```
+
+Expected: provider suites pass and `fred-rights-decision.json` truthfully records either lawful durable
+admission or a release-blocking rejection; it never fabricates completion.
+
+### Task 10: Implement portfolio import and raw-record reconciliation
+
+**Files:**
+
+- Create: `adapters/market-squawk-adapter-portfolio/Cargo.toml`
+- Create: `adapters/market-squawk-adapter-portfolio/src/lib.rs`
+- Create: `adapters/market-squawk-adapter-portfolio/src/holdings.rs`
+- Create: `adapters/market-squawk-adapter-portfolio/src/transactions.rs`
+- Create: `adapters/market-squawk-adapter-portfolio/src/reconcile.rs`
+- Create: `adapters/market-squawk-adapter-portfolio/tests/import.rs`
+- Create: `adapters/market-squawk-adapter-portfolio/tests/reconcile.rs`
+- Create: `adapters/market-squawk-adapter-portfolio/fixtures/manifest.json`
+
+**Interfaces:**
+
+- Consumes: Task 7 file/OFX records, Task 3 identities/secrets/rights, Task 4 ingest.
+- Produces: `PortfolioExtractionSource`, immutable `RawPortfolioRecord`, normalized account/holding/
+  transaction/cash-flow/cost-basis observations, `SuppliedTotals`, and bounded typed
+  `ReconciliationDiscrepancy` values.
+
+- [ ] **Step 1: Write RED preservation and reconciliation tests**
+
+Cover exact raw bytes/hash, duplicate broker transaction IDs, account/instrument/currency resolution,
+cash/income/fee/corporate-action transactions, signed quantities, explicit lot method, missing/
+ambiguous basis, broker-rounded supplied totals, multi-account imports, corrected statements,
+supersession and credential redaction. Never coerce an unreconciled source total into the calculated
+ledger.
+
+- [ ] **Step 2: Run RED**
+
+```bash
+cargo test --manifest-path adapters/market-squawk-adapter-portfolio/Cargo.toml --all-features
+```
+
+Expected: FAIL because the portfolio adapter is absent.
+
+- [ ] **Step 3: Implement normalized import with preserved evidence**
+
+Store the immutable source record before normalization; convert only through validated account,
+instrument, currency, Decimal and timestamp constructors; retain source-provided values beside
+calculated fields; emit discrepancies with field, supplied/calculated amount, currency, tolerance
+policy and source reference. Corrected imports supersede rather than delete prior records.
+
+- [ ] **Step 4: Run GREEN, prove data-plane consumption, and commit**
+
+```bash
+cargo test --manifest-path adapters/market-squawk-adapter-portfolio/Cargo.toml --all-features
+cargo clippy --manifest-path adapters/market-squawk-adapter-portfolio/Cargo.toml \
+  --all-targets --all-features -- -D warnings
+git diff --check
+python3 scripts/stage_usable_release_task.py 10
+git commit -m "feat(portfolio): import and reconcile source records"
+```
+
+Expected: valid fixtures persist raw and normalized records, reruns are idempotent, corrections retain
+history, and discrepancies are explicit inputs to Task 16.
+
+### Task 11: Compose research ingestion and point-in-time datasets
+
+**Files:**
+
+- Modify: `crates/market-squawk-data/src/lib.rs`
+- Create: `crates/market-squawk-data/src/pit.rs`
+- Create: `crates/market-squawk-data/src/universe.rs`
+- Create: `crates/market-squawk-data/src/corporate_actions.rs`
+- Create: `crates/market-squawk-data/src/dataset_builder.rs`
+- Create: `crates/market-squawk-data/tests/pit.rs`
+- Create: `crates/market-squawk-data/tests/corporate_actions.rs`
+- Create: `crates/market-squawk-data/tests/dataset_builder.rs`
+- Create: `apps/market-squawk/src/research_service.rs`
+- Create: `apps/market-squawk/tests/research_vertical.rs`
+
+**Interfaces:**
+
+- Consumes: Tasks 4 and 7-10 committed manifests, instrument/symbol/corporate-action history,
+  evidenced availability and revisions.
+- Produces:
+
+```rust
+pub struct PointInTimePolicy {
+    policy_version: PolicyVersion,
+    require_available_at: bool,
+    include_superseded_revisions: bool,
+    corporate_action_policy: CorporateActionPolicy,
+    missing_observation_policy: MissingObservationPolicy,
+}
+pub struct DatasetBuildRequest;
+pub struct FeatureLabelDataset;
+pub trait PointInTimeService {
+    async fn select(
+        &self,
+        request: PointInTimeRequest,
+        cancellation: CancellationToken,
+    ) -> Result<PointInTimeResult, PointInTimeError>;
+}
+pub trait DatasetBuilder {
+    async fn build(
+        &self,
+        request: DatasetBuildRequest,
+        cancellation: CancellationToken,
+    ) -> Result<FeatureLabelDataset, DatasetBuildError>;
+}
+```
+
+- [ ] **Step 1: Write RED temporal, universe, and action tests**
+
+Test `available_at <= as_of`, effective intervals, `published_at`, `superseded_at`, deterministic
+highest admitted revision, unknown/inferred availability excluded by default, provider civil date
+with conservative not-before time, historical constituents, symbol changes, mergers, delistings,
+option/futures expiry/rolls, splits/dividends/spinoffs/mergers, raw versus adjusted versus total-return
+policies, and no mutation of original observations. Add future-perturbation, delayed-publication,
+same-date unknown-time, survivorship and compaction-invariance tests.
+
+- [ ] **Step 2: Run RED**
+
+```bash
+cargo test -p market-squawk-data --test pit --test corporate_actions \
+  --test dataset_builder --all-features --locked
+cargo test -p market-squawk --test research_vertical --locked
+```
+
+Expected: FAIL because PIT selection, corporate-action policy, dataset builder and research service
+composition are absent.
+
+- [ ] **Step 3: Implement conservative PIT and corporate-action policy**
+
+Pin one manifest generation per input. Admit only records satisfying every versioned temporal,
+revision and universe predicate. Keep raw events immutable; publish adjusted/total-return derived
+datasets with policy version, parent hashes and adjustment lineage. Never invent publication time or
+silently drop delisted instruments.
+
+- [ ] **Step 4: Implement reproducible feature/label dataset construction**
+
+Bind universe, as-of range, feature versions, inputs, label cutoff, chronological train/validation/
+test splits, missing-value policy, corporate-action policy and implementation revision. Labels use
+only data after each feature cutoff. Publish content-addressed Parquet through Task 4 and return a
+complete manifest reference.
+
+- [ ] **Step 5: Run GREEN, prove every research producer has a consumer, and commit**
+
+```bash
+cargo test -p market-squawk-data --all-features --locked
+cargo test -p market-squawk --test research_vertical --locked
+cargo clippy -p market-squawk-data -p market-squawk \
+  --all-targets --all-features --locked -- -D warnings
+git diff --check
+python3 scripts/stage_usable_release_task.py 11
+git commit -m "feat(research): build point-in-time datasets"
+```
+
+Expected: file, SEC and authorized macro fixtures ingest, restart, select as-of, apply explicit
+corporate actions and produce a queryable dataset; no live journal is required.
+
+### Task 12: Implement complete Rust batch analytics and feature registry
+
+**Files:**
+
+- Modify: `crates/market-squawk-analytics/Cargo.toml`
+- Modify: `crates/market-squawk-analytics/src/lib.rs`
+- Create: `crates/market-squawk-analytics/src/batch.rs`
+- Create: `crates/market-squawk-analytics/src/returns.rs`
+- Create: `crates/market-squawk-analytics/src/risk.rs`
+- Create: `crates/market-squawk-analytics/src/factors.rs`
+- Create: `crates/market-squawk-analytics/src/fundamentals.rs`
+- Create: `crates/market-squawk-analytics/src/macro_features.rs`
+- Create: `crates/market-squawk-analytics/src/scenarios.rs`
+- Modify: `crates/market-squawk-analytics/src/registry.rs`
+- Create: `crates/market-squawk-analytics/tests/golden.rs`
+- Create: `crates/market-squawk-analytics/tests/properties.rs`
+- Create: `crates/market-squawk-analytics/tests/live_batch_parity.rs`
+
+**Interfaces:**
+
+- Consumes: domain Decimal/currency/unit/time values, Task 2 pure live kernels and Task 11 PIT batches.
+- Produces: `FeatureDefinition`, `FeatureRegistry`, `AnalyticsPolicy`, typed results for returns,
+  volatility/drawdown/correlation/beta/alpha, Sharpe/Sortino/tracking error/information ratio,
+  historical/parametric VaR, coherent discrete Expected Shortfall, factors, fundamentals/valuation/
+  FCF/surprises/yield curves, exposure/attribution and scenario/stress kernels.
+
+- [ ] **Step 1: Write RED golden/property tests**
+
+Define units, annualization, null/missing, weights, insufficient history and floating conversion for
+each function. Include zero variance, negative prices, irregular dates, weighted observations, NaN/
+infinity rejection, discrete ES ties/point masses/fractional quantile atom, currency/unit mismatch,
+empty/one-element windows, drawdown recovery, beta singularity, factor rank deficiency, yield-curve
+ordering, and scenario shock composition. Proptest algebraic invariants and explicit live/batch parity
+where semantics match.
+
+- [ ] **Step 2: Run RED**
+
+```bash
+cargo test -p market-squawk-analytics --test golden --test properties \
+  --test live_batch_parity --all-features --locked
+```
+
+Expected: FAIL because complete batch modules and registry APIs are absent.
+
+- [ ] **Step 3: Implement exact boundaries and deterministic kernels**
+
+Keep money/accounting/fees/cost basis in checked Decimal/scaled types. Convert to finite `f64` only
+through a typed `StatisticalInput` carrying source unit/scale, then return a typed result with units/
+policy/observations. Use stable summation and documented sample/population/quantile conventions.
+Avoid hidden annualization or implicit missing-value removal.
+
+- [ ] **Step 4: Implement the feature registry**
+
+Require name/version, input schema digest, parameters, time semantics, warm-up, null policy, output
+type/unit, live compatibility, PIT compatibility and implementation revision/hash. Reject duplicate
+identity with changed metadata, unknown implementation hash and incompatible requested version.
+
+- [ ] **Step 5: Run GREEN and commit**
+
+```bash
+cargo test -p market-squawk-analytics --all-features --locked
+cargo clippy -p market-squawk-analytics --all-targets --all-features \
+  --locked -- -D warnings
+git diff --check
+python3 scripts/stage_usable_release_task.py 12
+git commit -m "feat(analytics): add complete financial feature kernels"
+```
+
+Expected: all golden/property/parity tests pass; the crate has no data/platform/network/filesystem/
+Python dependency.
+
+### Task 13: Implement model registry, complete bundles, and native Rust inference
+
+**Files:**
+
+- Create: `crates/market-squawk-modeling/Cargo.toml`
+- Create: `crates/market-squawk-modeling/src/lib.rs`
+- Create: `crates/market-squawk-modeling/src/metadata.rs`
+- Create: `crates/market-squawk-modeling/src/bundle.rs`
+- Create: `crates/market-squawk-modeling/src/registry.rs`
+- Create: `crates/market-squawk-modeling/src/input.rs`
+- Create: `crates/market-squawk-modeling/src/native.rs`
+- Create: `crates/market-squawk-modeling/tests/bundle.rs`
+- Create: `crates/market-squawk-modeling/tests/native.rs`
+- Create: `crates/market-squawk-modeling/tests/no_action.rs`
+
+**Interfaces:**
+
+- Consumes: Task 11 dataset manifests, Task 12 feature registry, controlled artifact paths.
+- Produces:
+
+```rust
+pub trait InferenceBackend: Send + Sync {
+    fn metadata(&self) -> &ModelMetadata;
+    fn infer(&self, input: &ModelInput) -> Result<ModelOutput, InferenceError>;
+}
+pub struct ModelBundle;
+pub struct ModelRegistry;
+pub struct NativeLinearBackend;
+```
+
+`ModelBundle` binds artifact/hash, format/version, feature schema/versions, normalization, training
+period/universe, dataset versions, label, training code revision, validation metrics, thresholds,
+intended use/limitations and fallback.
+
+- [ ] **Step 1: Write RED bundle/native/no-action tests**
+
+Reject missing/unknown fields, wrong artifact hash, unsupported format/version, feature reorder/
+version/schema mismatch, invalid normalizer, dataset/universe/period/label mismatch, nonfinite weights,
+oversized input/output/artifact, threshold inconsistency, absent intended use/fallback and changed code
+revision. Test deterministic native linear/logistic inference and that every load/validation/inference
+error returns no `OrderIntent` through the Task 2 strategy integration.
+
+- [ ] **Step 2: Run RED**
+
+```bash
+cargo test --manifest-path crates/market-squawk-modeling/Cargo.toml --all-features
+```
+
+Expected: FAIL because the modeling package and bundle/backend types do not exist.
+
+- [ ] **Step 3: Implement closed bundle validation and registry**
+
+Read only from the controlled model root; no remote URL/code/plugin. Bound bytes, JSON depth/members/
+strings, feature count and tensors before allocation. Hash exact artifact and metadata bytes, validate
+all relationships against the Task 11/12 registries, atomically register immutable generations and
+retain prior versions for reproducibility.
+
+- [ ] **Step 4: Implement native inference and strategy failure boundary**
+
+Implement checked finite normalization, shape/version matching and deterministic native operations.
+Return typed output with model/bundle/feature/dataset identities and confidence/decision fields. The
+strategy adapter maps `Err` only to an audited no-action reason and cannot substitute a default score.
+
+- [ ] **Step 5: Run GREEN and commit**
+
+```bash
+cargo test --manifest-path crates/market-squawk-modeling/Cargo.toml --all-features
+cargo clippy --manifest-path crates/market-squawk-modeling/Cargo.toml \
+  --all-targets --all-features -- -D warnings
+git diff --check
+python3 scripts/stage_usable_release_task.py 13
+git commit -m "feat(modeling): validate bundles and native inference"
+```
+
+Expected: complete bundle and native inference work with real PIT/feature metadata; every mismatch is
+fail-closed and no action is produced.
+
+### Task 14: Implement the Python financial analytics and training product
+
+**Files:**
+
+- Create: `crates/market-squawk-python/Cargo.toml`
+- Create: `crates/market-squawk-python/src/lib.rs`
+- Create: `python/pyproject.toml`
+- Create: `python/requirements.lock`
+- Create: `python/wheelhouse-lock.json`
+- Create: `python/market_squawk/__init__.py`
+- Create: `python/market_squawk/data.py`
+- Create: `python/market_squawk/finance.py`
+- Create: `python/market_squawk/training.py`
+- Create: `python/market_squawk/bundle.py`
+- Create: `python/market_squawk/visualization.py`
+- Create: `python/tests/test_data.py`
+- Create: `python/tests/test_finance_parity.py`
+- Create: `python/tests/test_training_bundle.py`
+- Create: `python/tests/test_visualization_examples.py`
+- Create: `python/examples/pit_research.py`
+- Create: `python/examples/pit_research.ipynb`
+- Create: `scripts/build_python_release.py`
+- Create: `scripts/tests/test_build_python_release.py`
+
+**Interfaces:**
+
+- Consumes: Task 11 manifest/PIT dataset, Task 12 analytics, Task 13 bundle schema, Task 1 exact Python
+  dependency/runtime policy.
+- Produces Python APIs `open_dataset(root, manifest_sha256, as_of)`, `market_squawk.finance` PyO3
+bindings to Rust kernels, `TrainingRun.fit_evaluate_export`, and `BundleCandidate.write`, returning
+only verified local paths/content hashes and exact Decimal/time/provenance metadata. The research API
+also produces bounded self-contained chart specifications/static SVG from already loaded local
+results; the executable notebook uses the same APIs with no download or release authority.
+
+- [ ] **Step 1: Write RED packaging/data/parity/training tests**
+
+Test deterministic source/wheel lock parsing, clean offline hash-locked install, supported interpreter
+matrix, package import without network,
+manifest hash/schema mismatch, symlink/path escape, PIT/as-of enforcement, Arrow Decimal128 <->
+`decimal.Decimal` exact scale, timezone-aware nanoseconds, null policy, Rust/Python golden parity for
+all exported finance kernels, deterministic seeded training split/evaluation, nonfinite rejection,
+exported artifact hash and Task 13 bundle-candidate validation. Scan live/execution dependency graphs
+to prove no Python/PyO3 import. Execute the example script and notebook in the clean offline venv;
+assert fixed hashes for chart specifications, no external resource URLs, bounded point counts and no
+secret/path leakage.
+
+- [ ] **Step 2: Run RED**
+
+```bash
+python3 -m unittest scripts.tests.test_build_python_release -v
+python3 scripts/build_python_release.py \
+  --lock python/wheelhouse-lock.json \
+  --wheelhouse .agents/tmp/python-wheelhouse \
+  --venv .agents/tmp/python-release-venv
+```
+
+Expected: FAIL because the Python product, lock, native extension and release builder do not exist.
+
+- [ ] **Step 3: Implement manifest-bound data access and native finance bindings**
+
+Use PyArrow only after validating the catalog-exported manifest digest, schema version, object hashes
+and as-of policy; never scan directories for datasets. Convert accounting values to `Decimal`, not
+float. Build a `market_squawk._native` PyO3 extension from `market-squawk-python`, which depends only
+on domain/analytics and exposes typed arrays/policies/results. Release the GIL only around bounded
+pure Rust computation; translate typed errors without leaking paths/secrets.
+
+`scripts/build_python_release.py` verifies every source/wheel filename, SHA-256, Python/platform tag
+and license from `wheelhouse-lock.json`; populates the ignored wheelhouse from an explicitly supplied
+local cache or an authorized preparation network mode. Normal/release mode runs the Task 1-pinned
+maturin with `cargo --locked`. The explicit lane-only `--provisional-lane-lock` mode may resolve an
+uncommitted lane-local workspace lock, records its diff, and is rejected by Task 20; it does not alter
+the Python dependency/wheelhouse lock. The builder hashes/adds the `abi3` project wheel to the run manifest;
+creates a clean venv; installs dependencies and the project wheel with `pip --no-index --find-links`;
+and records interpreter, compiler, Cargo, wheel and lock digests. It never downloads during the
+offline verification mode used by Task 20.
+
+- [ ] **Step 4: Implement deterministic training, evaluation, and export**
+
+Require dataset/feature/label/universe/split hashes, seed, code/environment lock digest and explicit
+missing policy. Record metrics and trial identity; export a size-bounded model plus normalization and
+complete Task 13 metadata. Re-open and validate the candidate with the Rust bundle validator before
+success. Examples use local fixtures and perform no hidden download.
+
+- [ ] **Step 5: Run GREEN and commit**
+
+```bash
+python3 -m unittest scripts.tests.test_build_python_release -v
+MARKET_SQUAWK_PYTHON_WHEEL_PREPARE_NETWORK=1 \
+  python3 scripts/build_python_release.py --prepare-cache-only \
+  --lock python/wheelhouse-lock.json \
+  --wheelhouse .agents/cache/python-wheelhouse
+python3 scripts/build_python_release.py \
+  --offline \
+  --provisional-lane-lock \
+  --lock python/wheelhouse-lock.json \
+  --wheelhouse .agents/cache/python-wheelhouse \
+  --venv .agents/tmp/python-release-venv
+.agents/tmp/python-release-venv/bin/python -m pytest python/tests -q
+cargo test -p market-squawk-python --all-features
+cargo build --workspace --all-features
+python3 scripts/check_workspace_boundaries.py
+git diff -- Cargo.lock > .agents/tmp/generated-lock-disposition.patch
+git restore --source=HEAD --staged --worktree -- Cargo.lock
+git diff --exit-code -- Cargo.lock
+git diff --check
+python3 scripts/stage_usable_release_task.py 14
+git commit -m "feat(python): add financial research and training product"
+```
+
+Expected: the pinned maturin build creates and installs `_native`, clean offline install and all data/
+parity/training/bundle tests pass, and the full Rust workspace all-feature build remains green. The
+Python extension is an analytical package dependency only; no live/execution crate links PyO3 or
+requires a Python runtime.
+
+### Task 15: Implement conditional ONNX-compatible inference
+
+**Files:**
+
+- Modify: `crates/market-squawk-modeling/Cargo.toml`
+- Modify: `crates/market-squawk-modeling/src/lib.rs`
+- Create: `crates/market-squawk-modeling/src/onnx.rs`
+- Create: `crates/market-squawk-modeling/src/onnx/policy.rs`
+- Create: `crates/market-squawk-modeling/src/onnx/worker.rs`
+- Create: `crates/market-squawk-modeling/tests/onnx.rs`
+- Create: `crates/market-squawk-modeling/tests/onnx_hostile.rs`
+- Create: `crates/market-squawk-modeling/fixtures/onnx/manifest.json`
+- Create: `docs/operations/onnx-runtime.md`
+- Create: `docs/licenses/onnx-runtime-notice.md`
+- Create: `scripts/verify_onnx_runtime.py`
+- Create: `scripts/tests/test_verify_onnx_runtime.py`
+- Create: `docs/verification/onnx-runtime-policy.json`
+
+**Interfaces:**
+
+- Consumes: Task 1 pinned `ort`/ONNX Runtime decision, Task 13 `ModelBundle` and
+  `InferenceBackend`, controlled runtime/model roots.
+- Produces: `OnnxBackend: InferenceBackend` and `OnnxRuntimePolicy` binding runtime/library digest,
+  ONNX opset, allowed operators, shapes, 64 MiB artifact ceiling, 1,024-node ceiling, 256-tensor
+  ceiling, 1,000,000-element per-request ceiling, sequential execution, one intra-op thread, one
+  inter-op thread, warm-up result and stable native/no-action fallback.
+
+- [ ] **Step 1: Write RED runtime/operator/resource/offline tests**
+
+Accept only the Task 1-pinned ONNX Runtime through the pinned `ort` crate with `load-dynamic` enabled
+and all download/copy-binaries features disabled. Test runtime digest/version/license mismatch,
+remote/external-data models, custom/
+control-flow/random operators, unsupported opset, unknown/dynamic/unbounded shapes, oversized graph/
+initializers/tensors/outputs, nonfinite input/output, thread/session policy mismatch, warm-up failure,
+corrupt models and native-versus-ONNX golden tolerance. Assert every failure yields the configured
+native fallback or audited no-action, never a default score.
+
+- [ ] **Step 2: Run RED**
+
+```bash
+cargo test -p market-squawk-modeling --test onnx --test onnx_hostile \
+  --features onnx
+```
+
+Expected: FAIL because the ONNX backend/policy and fixtures do not exist.
+
+- [ ] **Step 3: Implement preflight and bounded runtime construction**
+
+Hash and parse the model before runtime load. Allow only `Add`, `Sub`, `Mul`, `Div`, `MatMul`, `Gemm`,
+`Relu`, `Sigmoid`, `Tanh`, `Softmax`, `Reshape`, `Transpose`, `Gather`, `Concat`, `ReduceMean`, `Sqrt`,
+`Clip`, `Cast`, and `Identity` under approved opsets and static bounded shapes. Reject external data,
+custom domains, control flow and randomness. Configure CPU-only sequential execution with one intra-
+and inter-op thread; preallocate bounded inputs/outputs; warm before publication.
+
+- [ ] **Step 4: Enforce offline distribution and license provenance**
+
+Never download or remotely load native code at runtime/build. The runtime library must come from an
+operator-configured controlled path or a reproducibly built local package, match the configured SHA-
+256/version/platform tuple and carry the ONNX Runtime MIT notice/SBOM entry. Default all-feature
+workspace compilation enables the Rust `onnx` feature but performs no link-time/runtime download and
+does not require a shared library to compile. `verify_onnx_runtime.py` validates a separately installed
+local library against `onnx-runtime-policy.json`, no-follow path confinement, SHA-256, platform,
+version and license before targeted runtime tests set its explicit path. Task 20 must provide this
+verified local runtime and run inference fully offline; compile-only success never counts as ONNX
+capability.
+
+- [ ] **Step 5: Run GREEN and commit**
+
+```bash
+python3 -m unittest scripts.tests.test_verify_onnx_runtime -v
+python3 scripts/verify_onnx_runtime.py \
+  --policy docs/verification/onnx-runtime-policy.json \
+  --library "$MARKET_SQUAWK_ONNX_RUNTIME"
+cargo build --workspace --all-features --locked
+cargo test -p market-squawk-modeling --test onnx --test onnx_hostile \
+  --features onnx --locked
+cargo clippy -p market-squawk-modeling --all-targets --features onnx \
+  --locked -- -D warnings
+git diff --check
+python3 scripts/stage_usable_release_task.py 15
+git commit -m "feat(modeling): add constrained ONNX inference"
+```
+
+Expected: full workspace all-features compiles without download or link-time runtime discovery; the
+explicit hash-pinned local runtime passes verification; approved fixtures pass parity; hostile/
+runtime/resource cases fail closed; offline/license checks pass.
+
+### Task 16: Implement complete portfolio accounting and analytics
+
+**Files:**
+
+- Create: `crates/market-squawk-portfolio/Cargo.toml`
+- Create: `crates/market-squawk-portfolio/src/lib.rs`
+- Create: `crates/market-squawk-portfolio/src/ledger.rs`
+- Create: `crates/market-squawk-portfolio/src/lots.rs`
+- Create: `crates/market-squawk-portfolio/src/reconcile.rs`
+- Create: `crates/market-squawk-portfolio/src/performance.rs`
+- Create: `crates/market-squawk-portfolio/src/exposure.rs`
+- Create: `crates/market-squawk-portfolio/src/attribution.rs`
+- Create: `crates/market-squawk-portfolio/src/rebalance.rs`
+- Create: `crates/market-squawk-portfolio/src/risk.rs`
+- Create: `crates/market-squawk-portfolio/tests/accounting.rs`
+- Create: `crates/market-squawk-portfolio/tests/analytics.rs`
+- Create: `crates/market-squawk-portfolio/tests/service.rs`
+- Modify: `crates/market-squawk-execution/Cargo.toml`
+- Modify: `crates/market-squawk-execution/src/risk.rs`
+- Create: `crates/market-squawk-execution/tests/portfolio_state_integration.rs`
+
+**Interfaces:**
+
+- Consumes: Task 10 raw/normalized imports, Task 11 prices/actions/PIT, and Task 12 pure analytics
+  kernels. Portfolio core has no dependency on execution or live authority.
+- Produces: `PortfolioLedger`, immutable `PortfolioRevision`, account/holding/transaction/cash-flow/
+  lot/gain/income results, `PerformanceReport`, `ExposureReport`, `AttributionReport`,
+  `RebalanceProposal`, `PortfolioRiskReport`, and `PortfolioService` bounded queries. After the
+  portfolio commit is merged, a serialized execution-owned integration consumes `PortfolioService`;
+  the dependency remains `execution -> portfolio` and never reverses.
+
+- [ ] **Step 1: Write RED accounting/property tests**
+
+Cover buy/sell/short/cover, fees, dividends/interest/withholding, FIFO/specific-ID selected lot policy,
+splits/mergers/spinoffs/return-of-capital, multi-currency cash with explicit FX provenance, realized/
+unrealized gains, income, negative cash, corrected/superseded transactions, duplicate IDs, checked
+overflow and raw/supplied-total reconciliation. Proptest inventory/cash/cost conservation under
+partial lot disposal and corporate actions.
+
+- [ ] **Step 2: Write RED analytics/risk tests and run RED**
+
+Test time- and money-weighted performance under explicit policy, allocation totals, sector/factor/
+currency/issuer/venue/instrument exposure, contribution-based attribution, constrained rebalancing,
+tracking error, VaR/ES discrete cases, scenarios/stress and revision binding. Within portfolio tests,
+assert that `PortfolioService` returns an opaque immutable current revision and rejects stale query
+preconditions; do not import execution.
+
+```bash
+cargo test --manifest-path crates/market-squawk-portfolio/Cargo.toml --all-features
+```
+
+Expected: FAIL because the portfolio package and services do not exist.
+
+- [ ] **Step 3: Implement immutable accounting and reconciliation**
+
+Apply normalized transactions in deterministic account/time/source order through checked Decimal/
+currency/lot operations, publish an immutable revision only after all invariants pass, retain source
+and previous revision lineage, and emit typed discrepancies without overwriting supplied values.
+
+- [ ] **Step 4: Implement analytics and the portfolio service boundary**
+
+Use Task 12 kernels with explicit valuation/FX/as-of policies. Bound instruments/factors/scenarios/
+history/result bytes. Rebalancing emits proposals, never approved orders. Publish current account
+revision through an opaque read-only service capability. Portfolio DTOs cannot mint risk authority,
+orders, or approvals, and the crate has no execution dependency.
+
+- [ ] **Step 5: Run the portfolio GREEN gate and commit the independent core**
+
+```bash
+cargo test --manifest-path crates/market-squawk-portfolio/Cargo.toml --all-features
+cargo clippy --manifest-path crates/market-squawk-portfolio/Cargo.toml \
+  --all-targets --all-features -- -D warnings
+git diff --check
+python3 scripts/stage_usable_release_task.py 16
+git commit -m "feat(portfolio): add accounting analytics and risk state"
+```
+
+Expected: accounting, reconciliation, analytics and bounded service tests pass with no portfolio-to-
+execution dependency.
+
+- [ ] **Step 6: Serialize the execution-owned portfolio integration after merge**
+
+Only the integration owner now changes `crates/market-squawk-execution/src/risk.rs` and adds
+`portfolio_state_integration.rs`. Make risk load the authoritative `PortfolioRevision` immediately
+before reserve/approve, bind the revision ID into `RiskDecision`/`ApprovedOrder`, and reject caller-
+supplied balances/positions, missing accounts and stale/revoked revisions. Recheck the revision at
+one-time dispatch. Do not add an execution import to portfolio.
+
+```bash
+cargo test -p market-squawk-execution --test portfolio_state_integration \
+  --all-features --locked
+cargo test -p market-squawk-execution --all-features --locked
+cargo clippy -p market-squawk-execution --all-targets --all-features \
+  --locked -- -D warnings
+python3 scripts/check_workspace_boundaries.py
+git diff --check
+python3 scripts/stage_usable_release_task.py 16
+git commit -m "feat(execution): bind risk to portfolio revisions"
+```
+
+Expected: execution depends one-way on portfolio, risk and dispatch bind the same current revision,
+and no alternate approval path exists.
+
+### Task 17: Implement PIT research backtesting and experiment governance
+
+**Files:**
+
+- Modify: `apps/market-squawk/Cargo.toml`
+- Create: `crates/market-squawk-backtesting/Cargo.toml`
+- Create: `crates/market-squawk-backtesting/src/lib.rs`
+- Create: `crates/market-squawk-backtesting/src/clock.rs`
+- Create: `crates/market-squawk-backtesting/src/engine.rs`
+- Create: `crates/market-squawk-backtesting/src/fills.rs`
+- Create: `crates/market-squawk-backtesting/src/experiments.rs`
+- Create: `crates/market-squawk-backtesting/src/service.rs`
+- Create: `crates/market-squawk-backtesting/tests/backtest.rs`
+- Create: `crates/market-squawk-backtesting/tests/backtest_leakage.rs`
+- Create: `crates/market-squawk-backtesting/tests/experiment_governance.rs`
+- Create: `apps/market-squawk/src/backtest_service.rs`
+- Create: `apps/market-squawk/tests/backtest_vertical.rs`
+
+**Interfaces:**
+
+- Consumes: Task 11 PIT datasets, Task 12 pure analytics kernels, Task 13/15 models, Task 16
+  accounting, and Task 2 strategy/order-intent types; never live replay. The orchestration crate is
+  a leaf above analytics/modeling/portfolio/execution, so no dependency cycle is introduced.
+- Produces: `BacktestRequest`, `BacktestResult`, `TrialRecord`, `ExperimentInventory`, reconciled
+  orders/fills/cash/positions/performance and content-hashed artifacts/lineage.
+
+- [ ] **Step 1: Write RED timing, leakage, accounting, and experiment tests**
+
+Test signal timestamp versus next eligible execution, evidenced availability, fees/spread/slippage/
+depth/partial fills, corporate actions, delistings, historical universe, portfolio constraints,
+missing prices, stale inputs, model error/no action, cash/lot/gain reconciliation, deterministic seed,
+rerun hash equality and no live-journal dependency. Future data perturbations cannot change earlier
+features/orders. Trial inventory records data/model/strategy/code/config/seed, search space, selection
+criterion and probability-of-backtest-overfitting/deflated-performance diagnostics.
+
+- [ ] **Step 2: Run RED**
+
+```bash
+cargo test --manifest-path crates/market-squawk-backtesting/Cargo.toml \
+  --test backtest --test backtest_leakage \
+  --test experiment_governance --all-features
+cargo test -p market-squawk --test backtest_vertical
+```
+
+Expected: FAIL because backtest/experiment modules and service are absent.
+
+- [ ] **Step 3: Implement event-time backtest orchestration**
+
+Implement orchestration in `market-squawk-backtesting`; keep only source-independent mathematical
+kernels in `market-squawk-analytics`. Stream manifest-pinned PIT batches in deterministic order,
+call the same typed strategy/model intent
+contracts, simulate only with versioned research execution assumptions, and apply results through
+Task 16 accounting. Separate research fill assumptions from Task 2 paper authority while sharing pure
+fee/slippage/accounting kernels where semantics and units are identical.
+
+- [ ] **Step 4: Implement experiment inventory and artifact publication**
+
+Reserve a trial before execution; bind every immutable input and parameter; record completion/failure,
+metrics and selection membership; publish bounded detailed outputs through controlled artifacts and a
+small inline summary. Never delete losing trials or overwrite a trial identity.
+
+- [ ] **Step 5: Run GREEN and commit**
+
+```bash
+cargo test --manifest-path crates/market-squawk-backtesting/Cargo.toml \
+  --all-features
+cargo test -p market-squawk --test backtest_vertical
+cargo clippy -p market-squawk-backtesting -p market-squawk \
+  --all-targets --all-features -- -D warnings
+python3 scripts/check_workspace_boundaries.py
+git diff -- Cargo.lock > .agents/tmp/generated-lock-disposition.patch
+git restore --source=HEAD --staged --worktree -- Cargo.lock
+git diff --exit-code -- Cargo.lock
+git diff --check
+python3 scripts/stage_usable_release_task.py 17
+git commit -m "feat(backtest): add point-in-time experiment engine"
+```
+
+Expected: PIT/leakage/reconciliation/experiment tests pass and a file/SEC/macro fixture produces a
+reproducible backtest without capture replay.
+
+### Task 18: Implement ASC 820/IFRS 13 fair-value analysis
+
+**Files:**
+
+- Create: `crates/market-squawk-valuation/Cargo.toml`
+- Create: `crates/market-squawk-valuation/src/lib.rs`
+- Create: `crates/market-squawk-valuation/src/measurement.rs`
+- Create: `crates/market-squawk-valuation/src/evidence.rs`
+- Create: `crates/market-squawk-valuation/src/rules.rs`
+- Create: `crates/market-squawk-valuation/src/approval.rs`
+- Create: `crates/market-squawk-valuation/src/service.rs`
+- Create: `crates/market-squawk-valuation/tests/level1.rs`
+- Create: `crates/market-squawk-valuation/tests/no_promotion.rs`
+- Create: `crates/market-squawk-valuation/tests/override_approval.rs`
+
+**Interfaces:**
+
+- Consumes: instrument identity, Task 11 market/research evidence, Task 12 analytics, Task 16 portfolio
+  positions, Task 3 immutable audit/catalog.
+- Produces: `ValuationMeasurement`, `ValuationInput`, `ValuationMethod`, `FairValueEvidence`,
+  versioned `ClassificationRuleset`, `ClassificationDecision`, `ValuationOverride`,
+  `ValuationApproval`, and bounded `FairValueService`.
+
+- [ ] **Step 1: Write RED Level 1 decision-table/property tests**
+
+Require identical instrument, quoted unadjusted price, active market, accessible market,
+measurement-date relevance, valid source/venue evidence and sufficient freshness. Missing evidence ->
+`Unclassified`. Delayed/stale/proxy/adjusted/modeled/estimated/similar instrument cannot silently
+qualify. Test market closure, thin/inactive market, inaccessible venue, post-measurement quote,
+currency/scale mismatch and disqualifying adjustment.
+
+- [ ] **Step 2: Write RED no-promotion and workflow tests; run RED**
+
+Compile-fail and Serde tests prevent substitution among `FairValueHierarchy`, `MarketDepth`,
+`DataQuality`, assessment and execution capability. Level 2/3 inputs remain analytical only. Test
+ruleset version/hash, reason codes, evidence immutability, override justification/identity/time,
+separation of preparer/approver, approval expiry/revocation and complete audit.
+
+```bash
+cargo test --manifest-path crates/market-squawk-valuation/Cargo.toml --all-features
+```
+
+Expected: FAIL because valuation package, rules and service are absent.
+
+- [ ] **Step 3: Implement deterministic classification and workflow**
+
+Construct measurements only from validated typed inputs; evaluate every ruleset predicate and retain
+the complete truth table/reasons/evidence hashes. An override creates a new immutable decision and
+never edits source evidence. Approval binds measurement/ruleset/override/reviewer/version and cannot
+alter market data quality or execution eligibility.
+
+- [ ] **Step 4: Run GREEN and commit**
+
+```bash
+cargo test --manifest-path crates/market-squawk-valuation/Cargo.toml --all-features
+cargo clippy --manifest-path crates/market-squawk-valuation/Cargo.toml \
+  --all-targets --all-features -- -D warnings
+git diff --check
+python3 scripts/stage_usable_release_task.py 18
+git commit -m "feat(valuation): classify fair value with evidence"
+```
+
+Expected: decision tables, workflow and no-promotion tests pass; valuation remains outside execution
+authority.
+
+### Task 19: Complete shared application services, CLI, and MCP domains
+
+**Files:**
+
+- Modify: `apps/market-squawk/Cargo.toml`
+- Modify: `crates/market-squawk-platform/src/config.rs`
+- Modify: `crates/market-squawk-platform/src/paths.rs`
+- Create: `crates/market-squawk-platform/src/observability.rs`
+- Create: `crates/market-squawk-platform/tests/operations_policy.rs`
+- Create: `apps/market-squawk/src/application.rs`
+- Create: `apps/market-squawk/src/cli.rs`
+- Modify: `apps/market-squawk/src/main.rs`
+- Modify: `apps/market-squawk/src/lib.rs`
+- Modify: `crates/market-squawk-services/src/lib.rs`
+- Create: `crates/market-squawk-services/src/source.rs`
+- Create: `crates/market-squawk-services/src/market.rs`
+- Create: `crates/market-squawk-services/src/research.rs`
+- Create: `crates/market-squawk-services/src/fundamental.rs`
+- Create: `crates/market-squawk-services/src/macro_data.rs`
+- Create: `crates/market-squawk-services/src/portfolio.rs`
+- Create: `crates/market-squawk-services/src/analysis.rs`
+- Create: `crates/market-squawk-services/src/model.rs`
+- Create: `crates/market-squawk-services/src/fair_value.rs`
+- Create: `crates/market-squawk-services/src/bot.rs`
+- Create: `crates/market-squawk-services/src/execution.rs`
+- Create: `crates/market-squawk-services/tests/domain_contracts.rs`
+- Modify: `crates/market-squawk-mcp/src/server.rs`
+- Create: `crates/market-squawk-mcp/src/domains/source.rs`
+- Create: `crates/market-squawk-mcp/src/domains/market.rs`
+- Create: `crates/market-squawk-mcp/src/domains/research.rs`
+- Create: `crates/market-squawk-mcp/src/domains/fundamental.rs`
+- Create: `crates/market-squawk-mcp/src/domains/macro_data.rs`
+- Create: `crates/market-squawk-mcp/src/domains/portfolio.rs`
+- Create: `crates/market-squawk-mcp/src/domains/analysis.rs`
+- Create: `crates/market-squawk-mcp/src/domains/model.rs`
+- Create: `crates/market-squawk-mcp/src/domains/fair_value.rs`
+- Create: `crates/market-squawk-mcp/src/domains/bot.rs`
+- Create: `crates/market-squawk-mcp/src/domains/execution.rs`
+- Create: `crates/market-squawk-mcp/tests/domains.rs`
+- Create: `crates/market-squawk-mcp/tests/prohibited_surfaces.rs`
+- Create: `apps/market-squawk/tests/cli_complete.rs`
+- Create: `apps/market-squawk/tests/service_parity.rs`
+- Create: `apps/market-squawk/tests/doctor_policy.rs`
+- Create: `apps/market-squawk/tests/no_hidden_outbound.rs`
+- Create: `scripts/check_no_telemetry.py`
+- Create: `scripts/tests/test_check_no_telemetry.py`
+- Modify: `scripts/smoke_mcp.py`
+
+**Interfaces:**
+
+- Consumes: Task 2 `ApplicationServices`, Task 5 protocol, Tasks 4/11 query/PIT, Task 13/15 model,
+  Task 16 portfolio, Task 17 backtest and Task 18 fair value services.
+- Produces: one lifecycle-owned `Application` implementing versioned transport-neutral services from
+  `market-squawk-services`, shared by the complete CLI and MCP. Every request has typed authorization,
+  cancellation/deadline, time/instrument/result limits, source coverage, audit admission and
+  controlled artifact policy. Neither transport owns business validation.
+
+The same composition also produces `EffectiveConfig`, `EndpointPolicy`, `ArtifactRootPolicy`,
+`RedactionPolicy`, `LocalTracingPolicy`, and a bounded `DoctorReport`. Configuration precedence is
+exactly safe defaults -> local file -> `MARKET_SQUAWK_*` environment -> CLI override. Source and
+execution endpoints are deny-by-default/allowlisted; the artifact root is capability-confined; local
+tracing supports human-readable and JSON output with the same recursive redaction. Telemetry,
+analytics beacons, OpenTelemetry, remote exporters and undocumented outbound clients are absent.
+
+- [ ] **Step 1: Write RED CLI hierarchy and service-parity tests**
+
+Require `init`, `config`, `source`, `capture`, `ingest`, `dataset`, `query`, `feature`, `model`,
+`portfolio`, `backtest`, `bot`, `execution`, `fair-value`, `mcp serve`, and `doctor`, with human/JSON
+output, precedence, bounded args, typed exit classes and diagnostic compatibility aliases. The same
+request DTO and service call must produce semantically equal CLI/MCP results. DataFusion SQL exists
+only under CLI `query` and cannot be reached by MCP.
+
+Add precedence matrices for absent/file/env/CLI combinations, unknown `MARKET_SQUAWK_*` keys,
+invalid/unset values and secret references. Run human/JSON tracing through nested typed errors,
+provider payloads, URLs, headers, account/order IDs and `Debug`/`Display`; assert configured secret
+values and capability paths never appear. `doctor --json` reports the precedence source for each
+non-secret setting, allowlist decisions, artifact confinement, local-only tracing, telemetry disabled,
+provider rights/health and release blockers, but no secret value or secret identifier. Socket/DNS
+instrumentation asserts startup/doctor/default tests make no outbound call; only an explicitly
+enabled allowlisted source/execution adapter can open its declared endpoint. Dependency/registration
+scans reject `opentelemetry`, exporter/beacon code and hidden HTTP/WebSocket clients.
+
+- [ ] **Step 2: Write RED complete MCP domain/schema/result tests**
+
+Require these domains and minimum operations:
+
+```text
+Source.*      register/status/coverage/health
+Market.*      snapshots/trades/quotes/books/quality/comparisons
+Research.*    datasets/manifest/history/alternative data
+Fundamental.* filings/facts/statements/ratios
+Macro.*       series/observations/vintages/revisions
+Portfolio.*   holdings/transactions/performance/exposure/risk
+Analysis.*    returns/factors/valuation/scenarios/feature datasets/backtests
+Model.*       metadata/bundles/evaluation/predictions
+FairValue.*   measurements/classification/explanation/evidence/approval status
+Bot.*         status/start/stop for controlled paper operation only
+Execution.*   paper orders/fills/cancel/reconcile
+```
+
+Every schema rejects unknown fields and requires explicit instrument/time/result limits. Every call
+propagates cancellation/deadline, records admitted/result audit, includes source coverage/quality,
+returns truncation/completeness metadata, and spills over the inline byte/item ceiling to a content-
+hashed opaque artifact. Mutations require local authorization/confirmation and the sole Task 2 risk/
+dispatch service. Results cannot expose capability, credential, raw secret or arbitrary path.
+
+- [ ] **Step 3: Run RED**
+
+```bash
+cargo test -p market-squawk-mcp --test domains --test prohibited_surfaces --locked
+cargo test -p market-squawk-services --test domain_contracts --locked
+cargo test -p market-squawk --test cli_complete --test service_parity \
+  --test doctor_policy --test no_hidden_outbound --locked
+python3 scripts/smoke_mcp.py ./target/debug/market-squawk
+python3 scripts/check_no_telemetry.py Cargo.toml Cargo.lock apps crates adapters python
+```
+
+Expected: FAIL because complete domain handlers, CLI hierarchy and shared composition are absent.
+
+- [ ] **Step 4: Implement one bounded application composition**
+
+Start catalog/artifact/audit, research/query/PIT, portfolio/model/valuation, source/live/risk/paper,
+then transports; publish the app only after every mandatory service is ready. Shutdown reverses the
+order with bounded deadlines and retained owned handles. CLI/MCP borrow service handles and never
+duplicate validation, read mutable live state, or call adapters/risk internals directly.
+
+Load and validate one immutable effective configuration before constructing any outbound-capable
+service. Install recursive redaction before the first trace event, bind both trace renderers to it,
+and derive confined paths/endpoint capabilities from that configuration. `doctor` is read-only and
+uses bounded health/status services; it never tests a remote endpoint unless the user invokes an
+explicit source smoke command.
+
+- [ ] **Step 5: Implement domain registration, mutation authority, and prohibited surfaces**
+
+Map typed service errors to stable MCP/CLI errors without provider payloads/secrets. No shell,
+arbitrary filesystem, unrestricted SQL, credential read, remote code/model loading, unchecked order,
+risk bypass, audit deletion or provider-evasion tool exists in registration or hidden dispatch. Bot/
+Execution accept intents/controlled commands only; risk constructs approvals and dispatcher consumes
+them once.
+
+- [ ] **Step 6: Run GREEN and commit**
+
+```bash
+cargo test -p market-squawk-mcp --all-features --locked
+cargo test -p market-squawk-services --all-features --locked
+cargo test -p market-squawk --all-features --locked
+cargo clippy -p market-squawk-services -p market-squawk-mcp -p market-squawk \
+  --all-targets --all-features --locked -- -D warnings
+python3 scripts/smoke_mcp.py ./target/debug/market-squawk
+python3 scripts/check_no_telemetry.py Cargo.toml Cargo.lock apps crates adapters python
+python3 scripts/check_workspace_boundaries.py
+git diff --check
+python3 scripts/stage_usable_release_task.py 19
+git commit -m "feat(app): complete local CLI and MCP services"
+```
+
+Expected: all domain, prohibited-surface, lifecycle, result-bound, cancellation/audit/artifact and
+CLI-parity tests pass; compatibility aliases remain explicitly diagnostic.
+
+### Task 20: Prove, review, publish, and stop at the usable complete local release
+
+**Files:**
+
+- Modify: `apps/market-squawk/Cargo.toml`
+- Create: `apps/market-squawk/tests/usable_release.rs`
+- Create: `apps/market-squawk/tests/external_coinbase_vertical.rs`
+- Create: `apps/market-squawk/tests/external_kraken_vertical.rs`
+- Create: `apps/market-squawk/tests/external_fred_alfred_vertical.rs`
+- Create: `apps/market-squawk/src/bin/market-squawk-benchmark.rs`
+- Create: `scripts/demo_usable_release.py`
+- Create: `scripts/run_release_fuzz.py`
+- Create: `scripts/run_sustained_benchmark.py`
+- Create: `scripts/check_release_performance.py`
+- Create: `scripts/check_external_release_evidence.py`
+- Create: `scripts/run_usable_release_gate.py`
+- Create: `scripts/build_release_review_report.py`
+- Create: `scripts/tests/test_run_release_fuzz.py`
+- Create: `scripts/tests/test_run_sustained_benchmark.py`
+- Create: `scripts/tests/test_check_release_performance.py`
+- Create: `scripts/tests/test_check_external_release_evidence.py`
+- Create: `scripts/tests/test_run_usable_release_gate.py`
+- Create: `scripts/tests/test_build_release_review_report.py`
+- Create: `fuzz/Cargo.toml`
+- Create: `fuzz/fuzz_targets/coinbase_decoder.rs`
+- Create: `fuzz/fuzz_targets/kraken_v2_decoder.rs`
+- Create: `fuzz/fuzz_targets/csv_decoder.rs`
+- Create: `fuzz/fuzz_targets/json_ndjson_decoder.rs`
+- Create: `fuzz/fuzz_targets/xml_excel_decoder.rs`
+- Create: `fuzz/fuzz_targets/xbrl_decoder.rs`
+- Create: `fuzz/fuzz_targets/capture_record.rs`
+- Create: `fuzz/fuzz_targets/mcp_request.rs`
+- Create: `fuzz/fuzz_targets/model_bundle.rs`
+- Modify: `apps/market-squawk/benches/event_to_decision_latency.rs`
+- Modify: `crates/market-squawk-data/Cargo.toml`
+- Create: `crates/market-squawk-data/benches/storage.rs`
+- Create: `docs/verification/usable-release-demonstration.md`
+- Create: `docs/verification/usable-release-performance.md`
+- Create: `docs/verification/usable-release-gate.md`
+- Create: `docs/reports/usable-release-review.md`
+- Modify: `README.md`
+- Modify: `docs/verification/release-capability-state.json`
+- Modify: `SECURITY.md`
+- Modify: `CHANGELOG.md`
+
+**Interfaces:**
+
+- Consumes: every Task 0-19 production vertical and exact immutable inputs/evidence.
+- Produces: one clean exact candidate SHA, deterministic demo artifact set, measured performance/
+  memory report, supply-chain/security evidence, zero-finding grouped review, GitHub publication and
+  the only `usable_complete_local_release = true` determination.
+
+- [ ] **Step 1: Write the failing all-vertical release demonstration**
+
+The network-free demo initializes local state; runs deterministic local protocol servers through the
+production Coinbase and Kraken parsers, sequence/checksum/books/features paths; verifies those local
+simulations remain `DirectUnverified` and risk rejects automated action; exercises approved paper
+orders from separately recorded direct-source evidence; ingests local files, SEC, authorized macro
+and portfolio fixtures; restarts; queries Arrow/Parquet with DataFusion; builds PIT features/labels;
+runs Rust/Python analytics and training; validates native/ONNX inference; backtests; produces
+portfolio reports; classifies fair value; calls every CLI/MCP domain; and verifies all hashes/audits/
+artifacts/reconciliation. It also executes `doctor` in human and JSON modes, verifies effective
+configuration precedence, endpoint/artifact confinement, recursive secret redaction, telemetry/
+OpenTelemetry disabled, and zero outbound socket/DNS calls in offline mode. A fixture or local server
+can validate parsing and state transitions but can
+never mint `DirectVerified`. The demo fails if a mock/diagnostic path substitutes for production or
+if exact-head authorized direct-source evidence is absent.
+
+- [ ] **Step 2: Run RED**
+
+```bash
+cargo test -p market-squawk --test usable_release --all-features --locked
+python3 scripts/demo_usable_release.py --offline-fixtures
+```
+
+Expected: FAIL until every required vertical, FRED rights predicate, and separate authorized
+direct-source evidence predicate is satisfied and composed.
+
+- [ ] **Step 3: Complete fuzz, property, performance, and sustained-memory evidence**
+
+Task 20 is the sole owner of fuzz targets and campaigns; Tasks 6/7 contribute production parsers,
+property tests and seed fixtures only. `run_release_fuzz.py` verifies the exact fuzz-only nightly from
+Task 1, builds no release artifact, runs every named target serially with a 120-second/2 GiB ceiling,
+rejects crashes/timeouts/OOMs, and emits a content-hashed JSON report. Stable Rust remains the only
+release/approval toolchain.
+
+The release benchmark binary measures decoder, sequence/checksum, bounded queue, book, online
+features, strategy, native/ONNX inference, risk, one-time dispatch and end-to-decision separately and
+together after an explicit warm-up. The storage bench measures Arrow/Parquet ingest/write/read,
+DataFusion query and Python handoff. `run_sustained_benchmark.py` samples process RSS during at least
+60 million events and fails if post-warm-up RSS grows beyond 32 MiB or 1% of the warm plateau,
+whichever is larger, or if any queue exceeds configured capacity. Every run records hardware, OS,
+toolchain, fixture/digest, event/row count, throughput, p50/p95/p99/max and peak RSS.
+
+Run these exact gates on documented target hardware:
+
+```bash
+python3 scripts/run_release_fuzz.py \
+  --toolchain nightly-2026-07-15 --seconds-per-target 120 \
+  --rss-limit-mib 2048 --report target/release-evidence/fuzz.json
+cargo bench -p market-squawk --bench event_to_decision_latency \
+  --all-features --locked -- --warm-up-events 1000000 --events 10000000 \
+  --output target/release-evidence/live-bench.json
+cargo bench -p market-squawk-data --bench storage \
+  --all-features --locked -- --rows 10000000 \
+  --output target/release-evidence/data-bench.json
+cargo build -p market-squawk --bin market-squawk-benchmark \
+  --release --all-features --locked
+python3 scripts/run_sustained_benchmark.py \
+  --binary target/release/market-squawk-benchmark --warm-up-events 1000000 \
+  --events 60000000 --max-tail-growth-mib 32 --max-tail-growth-percent 1 \
+  --report target/release-evidence/sustained-memory.json
+python3 scripts/check_release_performance.py \
+  --live target/release-evidence/live-bench.json \
+  --data target/release-evidence/data-bench.json \
+  --memory target/release-evidence/sustained-memory.json \
+  --min-events-per-second 100000 --max-warmed-p99-ns 999999 \
+  --report docs/verification/usable-release-performance.md
+```
+
+Expected: every command exits 0; measured end-to-decision throughput is at least 100,000 events/s,
+warmed p99 is strictly below 1,000,000 ns, queues remain bounded, post-warm-up RSS meets the stated
+growth bound, and analytical I/O probes record zero calls from the live path. The checker refuses to
+write a passing report when measurements, fixture hashes, hardware fields or component distributions
+are missing. No performance claim is permitted from estimates, local-server network timing, a failed
+run or a different commit.
+
+- [ ] **Step 4: Capture separate authorized provider evidence at the frozen candidate**
+
+Run production adapters against direct venue/public interfaces and FRED/ALFRED only after the user has
+affirmed the applicable terms, configured one authorized identity where required, and explicitly
+enabled external networking. The command records source/venue/instrument/coverage, transport peer,
+sequence/snapshot/checksum/timestamp/freshness/trading-status/precision predicates, denial/recovery
+tests, binary/tree/head digests and rights decision. It never records credentials. Coinbase and Kraken
+must each prove the exact quality ceiling their real channel supports. At least one authorized direct
+source must satisfy every `DirectVerified` predicate and drive strategy -> comprehensive risk ->
+paper action; otherwise the release remains blocked. FRED/ALFRED retrieval/persistence/training rights
+must be admitted or the required macro predicate remains blocked.
+
+```bash
+test "$MARKET_SQUAWK_EXTERNAL_NETWORK" = "1"
+test "$MARKET_SQUAWK_PROVIDER_TERMS_ACCEPTED" = "1"
+cargo test -p market-squawk --test external_coinbase_vertical \
+  --all-features --locked -- --ignored --nocapture
+cargo test -p market-squawk --test external_kraken_vertical \
+  --all-features --locked -- --ignored --nocapture
+cargo test -p market-squawk --test external_fred_alfred_vertical \
+  --all-features --locked -- --ignored --nocapture
+python3 scripts/check_external_release_evidence.py \
+  --head "$(git rev-parse HEAD)" --tree "$(git rev-parse HEAD^{tree})" \
+  --evidence-dir target/release-evidence/providers \
+  --require-direct-verified-action --require-fred-alfred-rights
+```
+
+Expected: tests and checker pass only on real authorized network delivery at the unchanged candidate;
+the checker rejects local servers, fixtures, synthetic transports, missing predicates, mismatched
+head/tree/binary hashes, credentials in output, unsupported quality promotion and incomplete rights.
+
+- [ ] **Step 5: Build the offline Python/ONNX environment and run the complete candidate gate**
+
+First verify the hash-pinned local ONNX runtime, build the maturin extension and Python wheel using
+only the committed wheelhouse lock, install into a clean release venv without index access, and use
+that interpreter for all Python tests/demo. The extension may call analytical Rust kernels only; the
+dependency checker proves neither Python nor the extension enters live/execution runtime edges.
+
+```bash
+python3 scripts/verify_onnx_runtime.py \
+  --policy docs/verification/onnx-runtime-policy.json \
+  --library "$MARKET_SQUAWK_ONNX_RUNTIME"
+python3 scripts/build_python_release.py \
+  --wheelhouse .agents/cache/python-wheelhouse \
+  --lock python/wheelhouse-lock.json \
+  --venv target/usable-release-venv --offline \
+  --report target/release-evidence/python-build.json
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-features --locked
+cargo test --doc --workspace --all-features --locked
+cargo build --workspace --all-features --release --locked
+python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
+target/usable-release-venv/bin/python -m pytest python/tests -q
+MARKET_SQUAWK_PYTHON=target/usable-release-venv/bin/python \
+  python3 scripts/demo_usable_release.py --offline-fixtures \
+  --provider-evidence target/release-evidence/providers
+python3 scripts/check_release_performance.py \
+  --live target/release-evidence/live-bench.json \
+  --data target/release-evidence/data-bench.json \
+  --memory target/release-evidence/sustained-memory.json \
+  --min-events-per-second 100000 --max-warmed-p99-ns 999999 \
+  --check-existing docs/verification/usable-release-performance.md
+python3 scripts/check_external_release_evidence.py \
+  --head "$(git rev-parse HEAD)" --tree "$(git rev-parse HEAD^{tree})" \
+  --evidence-dir target/release-evidence/providers \
+  --require-direct-verified-action --require-fred-alfred-rights
+cargo deny check
+cargo audit
+gitleaks dir --redact --no-banner .
+gitleaks git --redact --no-banner
+python3 scripts/check_generated_artifacts.py
+python3 scripts/check_workspace_boundaries.py
+python3 scripts/check_no_telemetry.py Cargo.toml Cargo.lock apps crates adapters python
+python3 scripts/check_release_truth.py README.md \
+  docs/verification/release-capability-state.json
+git diff --check
+python3 scripts/stage_usable_release_task.py 20
+git commit -m "release: prove usable complete local platform"
+```
+
+Expected: every command exits 0. Update the capability ledger/README so every required capability is
+`Runnable` with exact evidence; `Required but missing` contains exactly `None.` The checker rejects a
+complete claim before this transition. Record the exact commit/tree, outputs, tool versions and
+artifact digests. The first tracked commit is only **Freeze A candidate preparation**; it is not an
+approved release. After that commit, recapture provider evidence at the new exact head/tree and run
+the complete orchestrated gate, which contains the exact local commands above plus the Step 3 fuzz/
+performance commands:
+
+```bash
+test "$MARKET_SQUAWK_EXTERNAL_NETWORK" = "1"
+test "$MARKET_SQUAWK_PROVIDER_TERMS_ACCEPTED" = "1"
+cargo test -p market-squawk --test external_coinbase_vertical \
+  --all-features --locked -- --ignored --nocapture
+cargo test -p market-squawk --test external_kraken_vertical \
+  --all-features --locked -- --ignored --nocapture
+cargo test -p market-squawk --test external_fred_alfred_vertical \
+  --all-features --locked -- --ignored --nocapture
+python3 scripts/run_usable_release_gate.py \
+  --head "$(git rev-parse HEAD)" --tree "$(git rev-parse HEAD^{tree})" \
+  --python target/usable-release-venv/bin/python \
+  --onnx-runtime "$MARKET_SQUAWK_ONNX_RUNTIME" \
+  --evidence-dir target/release-evidence --regenerate-heavy-evidence
+git diff --exit-code
+git status --short --branch
+```
+
+`run_usable_release_gate.py` is table-driven and tested: it rejects omitted/reordered commands,
+nonzero exits, a dirty tracked tree, wrong head/tree/binary digest, stale evidence, network access in
+default tests, or missing fuzz/performance/audit/provider/Python/ONNX results. Freeze A exists only
+when the commands pass at a clean unchanged head.
+
+- [ ] **Step 6: Review Freeze A, persist the finding union, and create Freeze B**
+
+Dispatch non-mutating reviewers in maximum parallel batches for: live/source/qualification/risk/
+paper; catalog/storage/PIT/provider rights; analytics/Python/modeling/backtest/portfolio/fair value;
+MCP/CLI/security/operations/supply chain; and performance/evidence/release truth. Freeze the candidate
+between batches. Reviewers write signed/hashed ignored artifacts under
+`target/release-evidence/reviews/freeze-a/<domain>.json`; they never edit the candidate. Union and
+deduplicate every finding, remediate every substantiated Critical/Important/Minor in disjoint lanes,
+and generate the durable review/remediation report. Commit that report together with all remediation
+and any resulting ledger/README truth changes; that tracked commit is **Freeze B**, so no approval
+claim is inherited from Freeze A.
+
+```bash
+python3 scripts/build_release_review_report.py \
+  --candidate "$(git rev-parse HEAD)" \
+  --review-dir target/release-evidence/reviews/freeze-a \
+  --output docs/reports/usable-release-review.md --require-all-domains
+python3 scripts/stage_usable_release_task.py 20
+git commit -m "docs(release): persist review and remediation evidence"
+```
+
+At the new Freeze B head, recapture all authorized external evidence because HEAD/tree changed, then
+rerun the complete gate. Evidence from Freeze A is invalid for Freeze B even when the delta was docs-
+only; no source-set-digest exception is used.
+
+```bash
+cargo test -p market-squawk --test external_coinbase_vertical \
+  --all-features --locked -- --ignored --nocapture
+cargo test -p market-squawk --test external_kraken_vertical \
+  --all-features --locked -- --ignored --nocapture
+cargo test -p market-squawk --test external_fred_alfred_vertical \
+  --all-features --locked -- --ignored --nocapture
+python3 scripts/run_usable_release_gate.py \
+  --head "$(git rev-parse HEAD)" --tree "$(git rev-parse HEAD^{tree})" \
+  --python target/usable-release-venv/bin/python \
+  --onnx-runtime "$MARKET_SQUAWK_ONNX_RUNTIME" \
+  --evidence-dir target/release-evidence --regenerate-heavy-evidence
+git diff --exit-code
+```
+
+- [ ] **Step 7: Obtain final read-only approval of unchanged Freeze B**
+
+Dispatch the same grouped domains against Freeze B. They write only ignored signed artifacts under
+`target/release-evidence/reviews/freeze-b/<domain>.json`. Verify domain coverage, reviewer identities,
+candidate head/tree, input/output hashes and zero substantiated findings without rewriting the tracked
+report:
+
+```bash
+python3 scripts/build_release_review_report.py \
+  --candidate "$(git rev-parse HEAD)" \
+  --review-dir target/release-evidence/reviews/freeze-b \
+  --check-only --require-all-domains --require-zero-findings
+python3 scripts/run_usable_release_gate.py \
+  --head "$(git rev-parse HEAD)" --tree "$(git rev-parse HEAD^{tree})" \
+  --python target/usable-release-venv/bin/python \
+  --onnx-runtime "$MARKET_SQUAWK_ONNX_RUNTIME" \
+  --evidence-dir target/release-evidence --check-existing
+git diff --exit-code
+git status --short --branch
+```
+
+If any Freeze B finding exists, return to Step 6, persist the updated finding/remediation union in a
+new commit, recapture provider evidence, rerun the full gate, and obtain another read-only review of
+the replacement head. Never mutate `docs/reports/usable-release-review.md` after the SHA claimed as
+approved. Persist final ignored review hashes and the unchanged SHA in the PR comment/release
+attestation during publication.
+
+- [ ] **Step 8: Evaluate the terminal predicate**
+
+Set release complete only when all statements are true:
+
+```text
+all mandatory producers and terminal consumers execute locally
+Coinbase and Kraken quality/coverage are honest; verified automated paper action has authorized direct evidence
+FRED/ALFRED required use is lawfully admitted or the release remains blocked
+all required datasets have real producers and consumers
+Python data/finance/training and model-bundle handoff work offline
+native and constrained ONNX inference work; every error produces no action
+backtest and portfolio accounting reconcile
+fair-value Level 1/no-promotion rules pass
+complete bounded/audited/cancellable CLI and MCP domains work
+deterministic demo, full gates, audits, fuzz and measured reports pass at exact SHA
+grouped review has zero unresolved finding of every severity
+repository and all integrated worktrees are clean
+```
+
+Any false predicate means continue the owning task; weighting or stage completion cannot authorize a
+stop.
+
+- [ ] **Step 9: Publish exact evidence, clean lanes, and stop**
+
+Push only the unchanged reviewed SHA to `origin`, update the active pull request with local evidence,
+truthful hosted status and external-smoke status, create the approved release tag, and verify remote
+identity. Remove clean inactive worktrees and prune metadata; preserve/escalate any dirty state. Hand
+off the exact SHA, ledger, demo, performance, audits, review, provider rights, remaining optional work
+and cleanup inventory. Do not begin paid adapters, live-money execution, extended replay or future
+observability without a new user instruction.
