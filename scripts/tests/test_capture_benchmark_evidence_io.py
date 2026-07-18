@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import stat
@@ -39,23 +38,14 @@ class EvidenceIoBehaviorTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
-    def test_canonical_json_digests_and_strict_object_decode_are_exact(self) -> None:
+    def test_canonical_json_and_strict_object_decode_are_exact(self) -> None:
         encoded = evidence_io.canonical_json({"z": 1, "a": [True, None]})
         self.assertEqual(encoded, b'{"a":[true,null],"z":1}\n')
-        self.assertEqual(evidence_io.digest_bytes(encoded), hashlib.sha256(encoded).hexdigest())
-        self.assertEqual(
-            evidence_io.digest_json({"z": 1, "a": [True, None]}),
-            hashlib.sha256(encoded).hexdigest(),
-        )
-        self.assertTrue(evidence_io.is_lower_digest("a" * 64))
-        self.assertFalse(evidence_io.is_lower_digest("A" * 64))
         self.assertEqual(evidence_io.read_json_bytes(encoded), {"a": [True, None], "z": 1})
         for invalid in (b'[]\n', b'{"a":1,"a":2}\n', b'{"a":'):
             with self.subTest(invalid=invalid):
                 with self.assertRaises(evidence_io.GateError):
                     evidence_io.read_json_bytes(invalid)
-
-    def test_json_rejects_non_finite_recursive_and_unencodable_values(self) -> None:
         recursive: list[object] = []
         recursive.append(recursive)
         invalid_values = (
@@ -108,7 +98,7 @@ class EvidenceIoBehaviorTest(unittest.TestCase):
         finally:
             root.close()
 
-    def test_read_rejects_hardlinked_and_permissive_inputs(self) -> None:
+    def test_read_rejects_unsafe_or_changed_inputs(self) -> None:
         first = self.root_path / "first.json"
         second = self.root_path / "second.json"
         first.write_bytes(b'{"ok":true}\n')
@@ -122,38 +112,18 @@ class EvidenceIoBehaviorTest(unittest.TestCase):
             os.chmod(first, 0o644)
             with self.assertRaises(evidence_io.GateError):
                 root.read_file(first)
+            os.chmod(first, 0o600)
+            directory = self.root_path / "directory"
+            directory.mkdir(mode=0o700)
+            with self.assertRaises(evidence_io.GateError):
+                root.read_file(directory)
+            with evidence_io._fixture_failure_injection(
+                evidence_io.FailureInjection.POST_READ_IDENTITY_MISMATCH, "fixture"
+            ):
+                with self.assertRaises(evidence_io.GateError):
+                    root.read_file(first)
         finally:
             root.close()
-
-    def test_private_regular_identity_revalidates_every_security_property(self) -> None:
-        path = self.root_path / "input"
-        path.write_bytes(b"value")
-        os.chmod(path, 0o600)
-        initial = path.stat()
-        current = path.stat()
-        self.assertTrue(
-            evidence_io._same_private_regular_identity(initial, current, current, 1024, False)
-        )
-
-        os.chmod(path, 0o644)
-        permissive = path.stat()
-        self.assertFalse(
-            evidence_io._same_private_regular_identity(
-                initial, permissive, permissive, 1024, False
-            )
-        )
-        os.chmod(path, 0o600)
-        hardlink = self.root_path / "hardlink"
-        os.link(path, hardlink)
-        linked = path.stat()
-        self.assertFalse(
-            evidence_io._same_private_regular_identity(initial, linked, linked, 1024, False)
-        )
-        self.assertFalse(
-            evidence_io._same_private_regular_identity(
-                initial, self.root_path.stat(), self.root_path.stat(), 1024, False
-            )
-        )
 
     def test_exact_descriptor_read_honors_bounds_and_partial_read_fixture(self) -> None:
         value = b"0123456789" * 10

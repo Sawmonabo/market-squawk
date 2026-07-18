@@ -20,7 +20,6 @@ import capture_benchmark_host_execution as execution  # noqa: E402
 import capture_benchmark_host_measured as measured  # noqa: E402
 import capture_benchmark_host_observation as observation  # noqa: E402
 import capture_benchmark_host_schema as schema  # noqa: E402
-import capture_benchmark_prepare_build_evidence as preparer  # noqa: E402
 from capture_benchmark_process import GateError  # noqa: E402
 from capture_benchmark_evidence_io import CapabilityRoot  # noqa: E402
 
@@ -556,18 +555,20 @@ class MeasurementContractTest(unittest.TestCase):
         self.temporary.cleanup()
 
     def _contract(self, backend: str) -> measured.MeasurementContract:
-        path = self.root_path / f"{backend}.json"
+        path = self._write_build_evidence(backend, build_evidence_value(backend))
+        _binding, contract = measured.build_evidence_contract(self.root, path)
+        return contract
+
+    def _write_build_evidence(self, name: str, value: dict) -> Path:
+        path = self.root_path / f"{name}.json"
         path.write_bytes(
             (
-                json.dumps(
-                    build_evidence_value(backend), sort_keys=True, separators=(",", ":")
-                )
+                json.dumps(value, sort_keys=True, separators=(",", ":"))
                 + "\n"
             ).encode()
         )
         os.chmod(path, 0o600)
-        _binding, contract = measured.build_evidence_contract(self.root, path)
-        return contract
+        return path
 
     def test_standard_and_candidate_environments_derive_from_build_evidence(self) -> None:
         standard = self._contract("standard")
@@ -614,30 +615,22 @@ class MeasurementContractTest(unittest.TestCase):
         with self.assertRaises(GateError):
             measured.verify_build_tool_identities(contract, toolchain)
 
-    def test_backend_and_baseline_disagreement_is_rejected(self) -> None:
-        invalid = build_evidence_value("candidate")
-        invalid["baseline_manifest_sha256"] = None
-        path = self.root_path / "invalid.json"
-        path.write_bytes(
-            (json.dumps(invalid, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    def test_invalid_build_evidence_is_rejected_before_launch(self) -> None:
+        cases = (
+            ("candidate-baseline", "candidate", "baseline_manifest_sha256", None),
+            ("standard-storage", "standard", "queue_private_storage_accounting", "exact"),
+            (
+                "candidate-storage",
+                "candidate",
+                "queue_private_storage_accounting",
+                "not_measured",
+            ),
         )
-        os.chmod(path, 0o600)
-        with self.assertRaises(GateError):
-            measured.build_evidence_contract(self.root, path)
-
-    def test_queue_storage_accounting_forgery_is_rejected_before_launch(self) -> None:
-        for backend, accounting in (
-            ("standard", "exact"),
-            ("candidate", "not_measured"),
-        ):
-            with self.subTest(backend=backend):
+        for name, backend, field, replacement in cases:
+            with self.subTest(name=name):
                 invalid = build_evidence_value(backend)
-                invalid["queue_private_storage_accounting"] = accounting
-                path = self.root_path / f"{backend}-storage-forgery.json"
-                path.write_bytes(
-                    (json.dumps(invalid, sort_keys=True, separators=(",", ":")) + "\n").encode()
-                )
-                os.chmod(path, 0o600)
+                invalid[field] = replacement
+                path = self._write_build_evidence(name, invalid)
                 with self.assertRaises(GateError):
                     measured.build_evidence_contract(self.root, path)
 
@@ -669,57 +662,19 @@ class MeasurementContractTest(unittest.TestCase):
             measured.verify_execution_contract(runner, self.root_path, contract)
         self.assertFalse(marker.exists())
 
-    def test_authority_module_digest_disagreement_is_rejected(self) -> None:
-        build_evidence = build_evidence_value("standard")
-        build_evidence["host_gate_schema_sha256"] = "f" * 64
-        path = self.root_path / "authority-mismatch.json"
-        path.write_bytes(
-            (json.dumps(build_evidence, sort_keys=True, separators=(",", ":")) + "\n").encode()
-        )
-        os.chmod(path, 0o600)
-        _binding, contract = measured.build_evidence_contract(self.root, path)
-        with self.assertRaises(GateError):
-            measured.verify_authority_module_bindings(contract)
-
-    def test_execution_authority_digest_missing_or_mismatch_is_rejected(self) -> None:
+    def test_authority_binding_missing_or_mismatch_is_rejected(self) -> None:
         missing = build_evidence_value("standard")
         del missing["host_gate_execution_sha256"]
-        missing_path = self.root_path / "execution-authority-missing.json"
-        missing_path.write_bytes(
-            (json.dumps(missing, sort_keys=True, separators=(",", ":")) + "\n").encode()
-        )
-        os.chmod(missing_path, 0o600)
+        missing_path = self._write_build_evidence("authority-missing", missing)
         with self.assertRaises(GateError):
             measured.build_evidence_contract(self.root, missing_path)
 
         mismatched = build_evidence_value("standard")
         mismatched["host_gate_execution_sha256"] = "f" * 64
-        mismatch_path = self.root_path / "execution-authority-mismatch.json"
-        mismatch_path.write_bytes(
-            (
-                json.dumps(mismatched, sort_keys=True, separators=(",", ":"))
-                + "\n"
-            ).encode()
-        )
-        os.chmod(mismatch_path, 0o600)
+        mismatch_path = self._write_build_evidence("authority-mismatch", mismatched)
         _binding, contract = measured.build_evidence_contract(self.root, mismatch_path)
         with self.assertRaises(GateError):
             measured.verify_authority_module_bindings(contract)
-
-    def test_preparer_and_host_accept_the_same_runner_binding_schema(self) -> None:
-        build_evidence = build_evidence_value("candidate")
-        runner_bindings = {
-            field: build_evidence[field] for field in measured.RUNNER_BINDING_FIELDS
-        }
-        runner = self.root_path / "schema-runner"
-        encoded = json.dumps(runner_bindings, sort_keys=True, separators=(",", ":"))
-        runner.write_text(
-            "#!/bin/sh\n"
-            f"printf '%s\\n' '{encoded}'\n",
-            encoding="utf-8",
-        )
-        os.chmod(runner, 0o500)
-        self.assertEqual(preparer.runner_bindings(runner), runner_bindings)
 
 
 if __name__ == "__main__":

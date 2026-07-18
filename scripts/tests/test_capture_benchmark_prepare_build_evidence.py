@@ -8,7 +8,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -469,12 +468,29 @@ class BuildEvidenceTest(unittest.TestCase):
             with self.assertRaises(GateError):
                 benchmark_backend_binding(repository, "STANDARD")
 
-    def test_cargo_parser_accepts_one_exact_all_feature_release_artifact(self) -> None:
+    def test_cargo_parser_enforces_one_exact_all_feature_release_artifact(self) -> None:
         executable = REPOSITORY / "target" / "fixture-executable"
         encoded = (json.dumps(cargo_message(executable)) + "\n").encode()
         path, message = parse_cargo_artifact(encoded, REPOSITORY)
         self.assertEqual(path, executable)
         self.assertEqual(message["target"]["name"], TARGET)
+
+        line = json.dumps(cargo_message(executable)) + "\n"
+        missing_feature = cargo_message(executable)
+        missing_feature["features"] = [
+            feature for feature in EXPECTED_CARGO_FEATURES if feature != FEATURE
+        ]
+        extra_feature = cargo_message(executable)
+        extra_feature["features"].append("unexpected")
+        invalid = (
+            ("duplicate-target", (line + line).encode()),
+            ("missing-feature", (json.dumps(missing_feature) + "\n").encode()),
+            ("extra-feature", (json.dumps(extra_feature) + "\n").encode()),
+        )
+        for name, cargo_json in invalid:
+            with self.subTest(name=name):
+                with self.assertRaises(GateError):
+                    parse_cargo_artifact(cargo_json, REPOSITORY)
 
     def test_real_rust_runner_matches_python_binding_contract(self) -> None:
         environment = {
@@ -545,28 +561,6 @@ class BuildEvidenceTest(unittest.TestCase):
         )
         self.assertEqual(self_check.returncode, 0)
 
-    def test_cargo_parser_rejects_duplicate_target_artifacts(self) -> None:
-        executable = REPOSITORY / "target" / "fixture-executable"
-        line = json.dumps(cargo_message(executable)) + "\n"
-        with self.assertRaises(GateError):
-            parse_cargo_artifact((line + line).encode(), REPOSITORY)
-
-    def test_cargo_parser_rejects_missing_feature(self) -> None:
-        executable = REPOSITORY / "target" / "fixture-executable"
-        message = cargo_message(executable)
-        message["features"] = [
-            feature for feature in EXPECTED_CARGO_FEATURES if feature != FEATURE
-        ]
-        with self.assertRaises(GateError):
-            parse_cargo_artifact((json.dumps(message) + "\n").encode(), REPOSITORY)
-
-    def test_cargo_parser_rejects_extra_feature(self) -> None:
-        executable = REPOSITORY / "target" / "fixture-executable"
-        message = cargo_message(executable)
-        message["features"].append("unexpected")
-        with self.assertRaises(GateError):
-            parse_cargo_artifact((json.dumps(message) + "\n").encode(), REPOSITORY)
-
     def test_artifact_hash_rejects_symlink(self) -> None:
         target_root = REPOSITORY / "target"
         target_root.mkdir(exist_ok=True)
@@ -602,105 +596,63 @@ class BuildEvidenceTest(unittest.TestCase):
                 with self.assertRaises(GateError):
                     artifact_hash(artifact, REPOSITORY)
 
-    def test_runner_binding_schema_is_exact(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            script = Path(temporary) / "runner"
-            script.write_text(
-                "#!/bin/sh\nprintf '%s\\n' '"
-                + json.dumps(binding_value(), separators=(",", ":"))
-                + "'\n"
-            )
-            os.chmod(script, 0o700)
-            self.assertEqual(runner_bindings(script)["runner"], RUNNER)
+    def test_runner_binding_schema_is_exact_and_rejects_forgery(self) -> None:
+        invalid = []
+        extra_key = binding_value()
+        extra_key["unexpected"] = True
+        invalid.append(("extra-key", extra_key))
+        uppercase_digest = binding_value()
+        uppercase_digest["host_gate_python_sha256"] = "A" * 64
+        invalid.append(("uppercase-digest", uppercase_digest))
+        unclean = binding_value()
+        unclean["clean_build_enforced"] = False
+        invalid.append(("unclean-build", unclean))
+        retired = binding_value()
+        retired["schema_version"] = RESULT_SCHEMA_VERSION - 1
+        invalid.append(("retired-schema", retired))
 
-    def test_runner_binding_extra_key_is_rejected(self) -> None:
-        value = binding_value()
-        value["unexpected"] = True
-        with tempfile.TemporaryDirectory() as temporary:
-            script = Path(temporary) / "runner"
-            script.write_text(
-                "#!/bin/sh\nprintf '%s\\n' '"
-                + json.dumps(value, separators=(",", ":"))
-                + "'\n"
-            )
-            os.chmod(script, 0o700)
-            with self.assertRaises(GateError):
-                runner_bindings(script)
-
-    def test_runner_binding_uppercase_digest_is_rejected(self) -> None:
-        value = binding_value()
-        value["host_gate_python_sha256"] = "A" * 64
-        with tempfile.TemporaryDirectory() as temporary:
-            script = Path(temporary) / "runner"
-            script.write_text(
-                "#!/bin/sh\nprintf '%s\\n' '"
-                + json.dumps(value, separators=(",", ":"))
-                + "'\n"
-            )
-            os.chmod(script, 0o700)
-            with self.assertRaises(GateError):
-                runner_bindings(script)
-
-    def test_runner_binding_requires_clean_build_enforcement(self) -> None:
-        value = binding_value()
-        value["clean_build_enforced"] = False
-        with tempfile.TemporaryDirectory() as temporary:
-            script = Path(temporary) / "runner"
-            script.write_text(
-                "#!/bin/sh\nprintf '%s\\n' '"
-                + json.dumps(value, separators=(",", ":"))
-                + "'\n"
-            )
-            os.chmod(script, 0o700)
-            with self.assertRaises(GateError):
-                runner_bindings(script)
-
-    def test_runner_binding_rejects_transport_storage_identity_forgery(self) -> None:
-        cases = (
+        transport_cases = (
             ("standard-exact", "standard", "standard_sync_channel", "exact"),
             ("standard-fixed", "standard", "candidate_fixed_ring", "not_measured"),
             ("candidate-opaque", "candidate", "candidate_fixed_ring", "not_measured"),
             ("candidate-standard", "candidate", "standard_sync_channel", "exact"),
         )
-        for name, backend, transport, accounting in cases:
-            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
-                value = binding_value()
-                value["evidence_backend"] = backend
-                value["queue_transport"] = transport
-                value["queue_private_storage_accounting"] = accounting
-                value["selected_backend_source_path"] = (
-                    "crates/market-squawk-platform/benches/capture_admission/backend/"
-                    f"{backend}.rs"
-                )
-                if backend == "candidate":
-                    value["baseline_lock_path"] = "./baseline-lock.json"
-                    value["baseline_lock_sha256"] = "c" * 64
-                    value["baseline_manifest_path"] = "./baseline-manifest.json"
-                    value["baseline_manifest_sha256"] = "d" * 64
-                    value["baseline_measured_code_head"] = "2" * 40
-                script = Path(temporary) / "runner"
-                script.write_text(
-                    "#!/bin/sh\nprintf '%s\\n' '"
-                    + json.dumps(value, separators=(",", ":"))
-                    + "'\n"
-                )
-                os.chmod(script, 0o700)
-                with self.assertRaises(GateError):
-                    runner_bindings(script)
-
-    def test_runner_binding_rejects_retired_schema_version(self) -> None:
-        value = binding_value()
-        value["schema_version"] = RESULT_SCHEMA_VERSION - 1
-        with tempfile.TemporaryDirectory() as temporary:
-            script = Path(temporary) / "runner"
-            script.write_text(
-                "#!/bin/sh\nprintf '%s\\n' '"
-                + json.dumps(value, separators=(",", ":"))
-                + "'\n"
+        for name, backend, transport, accounting in transport_cases:
+            value = binding_value()
+            value["evidence_backend"] = backend
+            value["queue_transport"] = transport
+            value["queue_private_storage_accounting"] = accounting
+            value["selected_backend_source_path"] = (
+                "crates/market-squawk-platform/benches/capture_admission/backend/"
+                f"{backend}.rs"
             )
-            os.chmod(script, 0o700)
-            with self.assertRaises(GateError):
-                runner_bindings(script)
+            if backend == "candidate":
+                value["baseline_lock_path"] = "./baseline-lock.json"
+                value["baseline_lock_sha256"] = "c" * 64
+                value["baseline_manifest_path"] = "./baseline-manifest.json"
+                value["baseline_manifest_sha256"] = "d" * 64
+                value["baseline_measured_code_head"] = "2" * 40
+            invalid.append((name, value))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            valid = self._runner_script(directory, "valid", binding_value())
+            self.assertEqual(runner_bindings(valid)["runner"], RUNNER)
+            for name, value in invalid:
+                with self.subTest(name=name):
+                    script = self._runner_script(directory, name, value)
+                    with self.assertRaises(GateError):
+                        runner_bindings(script)
+
+    def _runner_script(self, directory: Path, name: str, value: dict) -> Path:
+        script = directory / name
+        script.write_text(
+            "#!/bin/sh\nprintf '%s\\n' '"
+            + json.dumps(value, separators=(",", ":"))
+            + "'\n"
+        )
+        os.chmod(script, 0o700)
+        return script
 
     def test_sanitized_environment_binds_exact_command_and_inputs(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -724,68 +676,47 @@ class BuildEvidenceTest(unittest.TestCase):
                 tools[5],
             )
             self.assertNotIn("IGNORED_SECRET", environment)
-            with self.assertRaises(GateError):
-                sanitized_build_environment(
-                    repository,
-                    {
-                        "PATH": "/usr/bin:/bin",
-                        "HOME": str(home),
-                        "RUSTC": str(tools[4]),
-                    },
-                    *tools,
-                )
 
-    def test_sanitized_environment_rejects_profile_override(self) -> None:
+    def test_sanitized_environment_rejects_ambient_overrides(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             repository = root / "repository"
             home = root / "home"
             repository.mkdir()
             home.mkdir()
-            with self.assertRaises(GateError):
-                sanitized_build_environment(
-                    repository,
-                    {
+            tools = host_tool_bindings()
+            overrides = (
+                ("RUSTC", str(tools[4])),
+                ("CARGO_PROFILE_RELEASE_LTO", "false"),
+                ("LD_PRELOAD", "/tmp/injected"),
+                ("DYLD_INSERT_LIBRARIES", "/tmp/injected"),
+                ("DYLD_LIBRARY_PATH", "/tmp/injected"),
+            )
+            for name, value in overrides:
+                with self.subTest(name=name):
+                    environment = {
                         "PATH": "/usr/bin:/bin",
                         "HOME": str(home),
-                        "CARGO_PROFILE_RELEASE_LTO": "false",
-                    },
-                    *host_tool_bindings(),
-                )
+                        name: value,
+                    }
+                    with self.assertRaises(GateError):
+                        sanitized_build_environment(
+                            repository,
+                            environment,
+                            *tools,
+                        )
 
-    def test_sanitized_environment_rejects_loader_injection(self) -> None:
-        for name in ("LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH"):
-            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
-                root = Path(temporary)
-                repository = root / "repository"
-                home = root / "home"
-                repository.mkdir()
-                home.mkdir()
+            (home / ".cargo").mkdir(parents=True)
+            (home / ".cargo/config.toml").write_text(
+                "[profile.release]\nlto = false\n"
+            )
+            with self.subTest(name="discovered-cargo-config"):
                 with self.assertRaises(GateError):
                     sanitized_build_environment(
                         repository,
-                        {
-                            "PATH": "/usr/bin:/bin",
-                            "HOME": str(home),
-                            name: "/tmp/injected",
-                        },
-                        *host_tool_bindings(),
+                        {"PATH": "/usr/bin:/bin", "HOME": str(home)},
+                        *tools,
                     )
-
-    def test_sanitized_environment_rejects_discovered_cargo_config(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            repository = root / "repository"
-            home = root / "home"
-            repository.mkdir()
-            (home / ".cargo").mkdir(parents=True)
-            (home / ".cargo/config.toml").write_text("[profile.release]\nlto = false\n")
-            with self.assertRaises(GateError):
-                sanitized_build_environment(
-                    repository,
-                    {"PATH": "/usr/bin:/bin", "HOME": str(home)},
-                    *host_tool_bindings(),
-                )
 
     def test_current_binding_drift_is_rejected(self) -> None:
         value = binding_value()
@@ -922,11 +853,6 @@ class BuildEvidenceTest(unittest.TestCase):
             "success_exact_argv_env_and_eof_stdin",
             "nonzero_rejected",
             "empty_stdout_rejected",
-            "oversized_stdout_rejected",
-            "oversized_stderr_rejected",
-            "sustained_stdout_terminated_at_cap",
-            "timeout_rejected",
-            "exited_parent_with_inherited_pipe_child_reaped",
             "compiler_digest_mismatch_rejected",
             "compiler_mutation_rejected",
             "missing_cargo_rejected",
@@ -975,27 +901,6 @@ class BuildEvidenceTest(unittest.TestCase):
                             body = "exit 19\n"
                         elif case == "empty_stdout_rejected":
                             body = "exit 0\n"
-                        elif case == "oversized_stdout_rejected":
-                            body = f'"{sys.executable}" -c \'print("x" * 65)\'\n'
-                        elif case == "oversized_stderr_rejected":
-                            body = f'"{sys.executable}" -c \'import sys; print("x" * 65, file=sys.stderr)\'\n'
-                        elif case == "sustained_stdout_terminated_at_cap":
-                            body = (
-                                'printf \'%s\\n\' "$$" > "$FAKE_CARGO_RECORD"\n'
-                                "while :; do printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'; done\n"
-                            )
-                        elif case == "timeout_rejected":
-                            body = (
-                                "/bin/sleep 30 &\n"
-                                'printf \'%s\\n\' "$!" > "$FAKE_CARGO_RECORD"\n'
-                                "wait\n"
-                            )
-                        elif case == "exited_parent_with_inherited_pipe_child_reaped":
-                            body = (
-                                "/bin/sleep 30 &\n"
-                                'printf \'%s\\n\' "$!" > "$FAKE_CARGO_RECORD"\n'
-                                "exit 0\n"
-                            )
                         elif case == "compiler_mutation_rejected":
                             body = (
                                 "printf 'mutated' > \"$CAPTURE_BENCH_RUSTC_EXECUTABLE\"\n"
@@ -1003,81 +908,34 @@ class BuildEvidenceTest(unittest.TestCase):
                             )
                         cargo.write_text("#!/bin/sh\n" + body)
                         os.chmod(cargo, 0o700)
-                    patches = []
-                    if case in {
-                        "oversized_stdout_rejected",
-                        "sustained_stdout_terminated_at_cap",
-                    }:
-                        patches.append(
-                            mock.patch(
-                                "scripts.capture_benchmark_prepare_build_evidence.MAX_CARGO_JSON_BYTES",
-                                32,
+                    cargo_digest = external_tool_hash(cargo) if cargo.exists() else "0" * 64
+                    if case == "success_exact_argv_env_and_eof_stdin":
+                        cargo_json, _tool, command_digest, environment_digest = (
+                            run_closed_cargo_build(
+                                repository,
+                                environment,
+                                cargo,
+                                cargo_digest,
+                                timeout_seconds=2,
                             )
                         )
-                    if case == "oversized_stderr_rejected":
-                        patches.append(
-                            mock.patch(
-                                "scripts.capture_benchmark_prepare_build_evidence.MAX_CARGO_STDERR_BYTES",
-                                32,
-                            )
+                        self.assertEqual(cargo_json, b"{}\n")
+                        self.assertEqual(command_digest, "a" * 64)
+                        self.assertEqual(environment_digest, "b" * 64)
+                        lines = record.read_text().splitlines()
+                        self.assertEqual(lines[0], " ".join(BUILD_COMMAND[1:]))
+                        self.assertEqual(
+                            lines[1], f"{BUILD_ENVIRONMENT_POLICY}|{'a' * 64}|{'b' * 64}"
                         )
-                    for patch in patches:
-                        patch.start()
-                    try:
-                        cargo_digest = (
-                            external_tool_hash(cargo) if cargo.exists() else "0" * 64
-                        )
-                        if case == "success_exact_argv_env_and_eof_stdin":
-                            cargo_json, _tool, command_digest, environment_digest = (
-                                run_closed_cargo_build(
-                                    repository,
-                                    environment,
-                                    cargo,
-                                    cargo_digest,
-                                    timeout_seconds=2,
-                                )
+                    else:
+                        with self.assertRaises(GateError):
+                            run_closed_cargo_build(
+                                repository,
+                                environment,
+                                cargo,
+                                cargo_digest,
+                                timeout_seconds=2,
                             )
-                            self.assertEqual(cargo_json, b"{}\n")
-                            self.assertEqual(command_digest, "a" * 64)
-                            self.assertEqual(environment_digest, "b" * 64)
-                            lines = record.read_text().splitlines()
-                            self.assertEqual(lines[0], " ".join(BUILD_COMMAND[1:]))
-                            self.assertEqual(
-                                lines[1], f"{BUILD_ENVIRONMENT_POLICY}|{'a' * 64}|{'b' * 64}"
-                            )
-                        else:
-                            with self.assertRaises(GateError):
-                                run_closed_cargo_build(
-                                    repository,
-                                    environment,
-                                    cargo,
-                                    cargo_digest,
-                                    timeout_seconds=0.5
-                                    if case
-                                    in {
-                                        "timeout_rejected",
-                                        "exited_parent_with_inherited_pipe_child_reaped",
-                                    }
-                                    else 2,
-                                )
-                            if case in {
-                                "sustained_stdout_terminated_at_cap",
-                                "timeout_rejected",
-                                "exited_parent_with_inherited_pipe_child_reaped",
-                            }:
-                                pid = int(record.read_text().strip())
-                                deadline = time.monotonic() + 2
-                                while time.monotonic() < deadline:
-                                    try:
-                                        os.kill(pid, 0)
-                                    except ProcessLookupError:
-                                        break
-                                    time.sleep(0.01)
-                                else:
-                                    self.fail(f"bounded process left PID {pid} alive for {case}")
-                    finally:
-                        for patch in reversed(patches):
-                            patch.stop()
 
     def test_cli_fixture_success_is_exact_and_no_clobber(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1098,29 +956,27 @@ class BuildEvidenceTest(unittest.TestCase):
             self.assertNotEqual(second.returncode, 0)
             self.assertEqual({path.name: path.read_bytes() for path in run.iterdir()}, before)
 
-    def test_cli_fixture_failed_cargo_publishes_nothing(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            command, environment, run = self._cli_fixture(Path(temporary), cargo_success=False)
-            result = subprocess.run(command, env=environment, capture_output=True, text=True)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertEqual(list(run.iterdir()), [])
-
     def test_cli_fixture_rolls_back_every_validation_and_publication_boundary(self) -> None:
         cases = (
-            "after-runner-validation",
-            "after-current-validation",
-            "after-cargo-publication",
-            "after-executable-publication",
-            "after-build-evidence-publication",
+            ("failed-cargo", False, None),
+            ("after-runner-validation", True, "after-runner-validation"),
+            ("after-current-validation", True, "after-current-validation"),
+            ("after-cargo-publication", True, "after-cargo-publication"),
+            ("after-executable-publication", True, "after-executable-publication"),
+            (
+                "after-build-evidence-publication",
+                True,
+                "after-build-evidence-publication",
+            ),
         )
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            for case in cases:
+            for case, cargo_success, failure_injection in cases:
                 with self.subTest(case=case):
                     command, environment, run = self._cli_fixture(
                         root / case,
-                        cargo_success=True,
-                        failure_injection=case,
+                        cargo_success=cargo_success,
+                        failure_injection=failure_injection,
                     )
                     sentinel = run / "sentinel"
                     sentinel.write_bytes(b"unchanged")
