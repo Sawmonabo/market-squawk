@@ -535,8 +535,9 @@
       "owner_id": "research-governance",
       "tasks": [1],
       "paths": [
-        "docs/research/2026-07-17-usable-release-dependencies.md",
-        "docs/research/2026-07-17-usable-release-traceability.md"
+        "docs/research/2026-07-18-usable-release-dependencies.md",
+        "docs/research/2026-07-18-usable-release-traceability.md",
+        "docs/research/README.md"
       ],
       "focused_gate": ["direct review of source links, dates, licenses, MSRV, rights, fallbacks, and requirement traceability"]
     },
