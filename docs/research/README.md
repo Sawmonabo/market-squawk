@@ -37,6 +37,15 @@ decisions can be audited without relying on conversation history.
   composition-global graph and mutation ceilings, passive-lease decoupling, stable store bounds,
   live exact-once accounting, failure semantics, and blocking RED/GREEN evidence.
 
+## Usable-release decisions
+
+- [Dependency and provider decisions](2026-07-18-usable-release-dependencies.md) — exact analytical,
+  MCP, Python, inference, parser, secret, and HTTP dependency admissions plus current provider
+  rights, limits, coverage, fallback, and live-qualification policy.
+- [Capability traceability](2026-07-18-usable-release-traceability.md) — honest current state and the
+  mandatory producer-to-terminal-consumer, dataset, evidence, closing-task, and exact-head refresh
+  map for the complete local release.
+
 ## Evidence policy
 
 - Prefer official specifications, official project documentation, primary research papers, and
