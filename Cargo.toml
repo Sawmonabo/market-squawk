@@ -18,6 +18,7 @@ argon2 = { version = "=0.5.3", default-features = false, features = [
     "zeroize",
 ] }
 async-trait = "0.1"
+atomicwrites = "=0.4.4"
 bs58 = "0.5"
 bytes = "1.10"
 cap-fs-ext = "4.0.2"
