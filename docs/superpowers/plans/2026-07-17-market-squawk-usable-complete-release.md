@@ -221,6 +221,10 @@ composition  apps/market-squawk
 ```
 
 No package is created until the owning task includes its first production consumer and tests.
+Every `Cargo.toml` path named in a task below is a serialized integration-owner action, even when it
+appears beside lane-owned source files. A writer may use the root-provided provisional manifest in
+its isolated worktree, but it never stages or commits that manifest. The integration owner likewise
+owns the data migration registry and its ordered digest set; a data writer owns only the SQL bodies.
 
 At the end of every Wave, each lane writes its exact manifest requests and generated-lock disposition
 to the ignored handoff record named in `usable-release-path-ownership.json`. The integration owner
@@ -485,16 +489,15 @@ Expected: all focused gates pass and the clean commit exposes the frozen interfa
 
 **Files:**
 
-- Create: `crates/market-squawk-data/Cargo.toml`
+- Integration owner create: `crates/market-squawk-data/Cargo.toml`
 - Create: `crates/market-squawk-data/src/lib.rs`
 - Create: `crates/market-squawk-data/src/catalog.rs`
-- Create: `crates/market-squawk-data/src/migrations.rs`
+- Integration owner create: `crates/market-squawk-data/src/migrations.rs`
 - Create: `crates/market-squawk-data/src/rights.rs`
 - Create: `crates/market-squawk-data/tests/catalog.rs`
-- Create: `crates/market-squawk-data/tests/rights.rs`
 - Create: `crates/market-squawk-data/migrations/0001_control.sql`
 - Create: `crates/market-squawk-data/migrations/0002_instruments.sql`
-- Modify: `crates/market-squawk-platform/Cargo.toml`
+- Integration owner modify: `crates/market-squawk-platform/Cargo.toml`
 - Modify: `crates/market-squawk-platform/src/lib.rs`
 - Create: `crates/market-squawk-platform/src/secrets.rs`
 - Create: `crates/market-squawk-platform/tests/secrets.rs`
@@ -526,7 +529,7 @@ impl Catalog {
 Rights bind source, payload digest, retrieval time, exact terms URL/digest, authorization evidence/
 expiry and permitted retrieve/display/persist/cache/redistribute/train operations.
 
-- [ ] **Step 1: Write failing catalog, restart, rights, and secret tests**
+- [ ] **Step 1: Write two thin failing catalog/rights and secret-store integrations**
 
 Test `foreign_keys=ON`, `trusted_schema=OFF`, `synchronous=FULL`, bounded busy timeout, local-only WAL,
 digest-bound ordered migrations, integrity/foreign-key checks, one writer, crash restart, backup/
@@ -555,7 +558,9 @@ cursors, runs, manifests, audit and artifact metadata needed by Tasks 4-19.
 
 Prefer OS keyring. The fallback records Argon2id parameters/random salt, uses a unique nonce and
 XChaCha20-Poly1305 authenticated version/key-name metadata, atomically publishes below the confined
-secret root, zeroizes plaintext/derived keys, and rotates by decrypt-validate-reencrypt-replace.
+secret root, supplies a caller-owned `Zeroizing<Vec<argon2::Block>>` KDF arena, zeroizes plaintext/
+derived keys, and rotates by decrypt-validate-reencrypt-replace. It never uses Argon2's convenience
+allocator because that does not wipe the complete memory arena.
 `Debug`, `Display`, tracing and MCP never reveal the value, path token or key identity.
 
 - [ ] **Step 5: Run GREEN and commit**
@@ -571,7 +576,7 @@ git commit -m "feat(data): add durable local catalog and rights admission"
 ```
 
 Expected: a real catalog consumer opens, migrates, writes, restarts and reads; all gates pass; this
-lane does not edit the root manifest/lockfile.
+lane does not edit any Cargo manifest, the migration registry, or the lockfile.
 
 ### Task 4: Implement Arrow schemas, immutable Parquet publication, and bounded DataFusion
 
@@ -677,13 +682,12 @@ manifest; queries remain bounded; live packages have no analytical dependency.
 
 **Files:**
 
-- Create: `crates/market-squawk-services/Cargo.toml`
+- Integration owner create: `crates/market-squawk-services/Cargo.toml`
 - Create: `crates/market-squawk-services/src/lib.rs`
 - Create: `crates/market-squawk-services/src/request.rs`
 - Create: `crates/market-squawk-services/src/response.rs`
 - Create: `crates/market-squawk-services/src/traits.rs`
-- Create: `crates/market-squawk-services/tests/contracts.rs`
-- Create: `crates/market-squawk-mcp/Cargo.toml`
+- Integration owner create: `crates/market-squawk-mcp/Cargo.toml`
 - Create: `crates/market-squawk-mcp/src/lib.rs`
 - Create: `crates/market-squawk-mcp/src/framing.rs`
 - Create: `crates/market-squawk-mcp/src/protocol.rs`
@@ -691,10 +695,8 @@ manifest; queries remain bounded; live packages have no analytical dependency.
 - Create: `crates/market-squawk-mcp/src/limits.rs`
 - Create: `crates/market-squawk-mcp/src/audit.rs`
 - Create: `crates/market-squawk-mcp/src/artifact.rs`
-- Create: `crates/market-squawk-mcp/tests/lifecycle.rs`
-- Create: `crates/market-squawk-mcp/tests/hostile_input.rs`
-- Create: `crates/market-squawk-mcp/tests/cancellation.rs`
-- Create: `crates/market-squawk-mcp/tests/output_bounds.rs`
+- Create: `crates/market-squawk-mcp/tests/lifecycle_protocol.rs`
+- Create: `crates/market-squawk-mcp/tests/hostile_boundaries.rs`
 
 **Interfaces:**
 
@@ -748,15 +750,19 @@ Adopt the Task 1-pinned official SDK features only. Retain maximum-plus-one incr
 framing; validate body/depth/string/container bounds before dispatch; enforce initialize state and
 negotiated protocol; track active typed request IDs; connect cancel/progress/deadline to a child token;
 bound the writer queue and write deadline; treat EOF/broken pipe as controlled shutdown; keep stdout
-protocol-clean.
+protocol-clean. `rmcp::JsonRpcMessageCodec::default()` is prohibited because its maximum length is
+`usize::MAX`; the owned bounded transport feeds the official SDK lifecycle and protocol types.
 
 - [ ] **Step 4: Implement audit and artifact response contracts**
 
-Audit request ID, authenticated local process identity class, tool/version, admitted limits, start/
-finish/result class and content hashes without secrets/full financial payloads. Inline results only
-within bytes/items limits. Larger results are atomically written under the controlled artifact root,
-hashed, registered in Task 3 metadata and returned as opaque `ArtifactReference`; no request accepts
-a path.
+Audit request ID, honest local process identity class and authentication status, tool/version,
+admitted limits, start/finish/result class and content hashes without secrets/full financial
+payloads. Task 5 reports inherited stdio as unverified and exposes no public constructor that can
+mint an authenticated identity; Task 19 may consume a sealed platform-issued capability. Inline
+results stay within bytes/items limits. Larger results cross a pathless `ArtifactRepository`
+contract and return an opaque `ArtifactReference`; the Task 3/19 production implementation must
+stage, fsync, atomically publish, hash and register the object. MCP receives neither ambient
+filesystem authority nor a caller-authored path.
 
 - [ ] **Step 5: Run GREEN and commit**
 
