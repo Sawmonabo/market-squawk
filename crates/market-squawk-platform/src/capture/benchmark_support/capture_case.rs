@@ -242,6 +242,20 @@ impl PreparedCaptureOperation {
 }
 
 impl CaptureLifecycle {
+    #[cfg(test)]
+    pub(super) fn execute_capture_uncontended_for_test(
+        &self,
+        operation: PreparedCaptureOperation,
+    ) -> Result<BenchmarkAttempt, BenchmarkSupportError> {
+        let writer = self
+            .writer
+            .as_ref()
+            .ok_or(BenchmarkSupportError::Reconciliation)?;
+        writer
+            .with_receiver_paused_for_test(SHUTDOWN_TIMEOUT, || operation.execute())
+            .map_err(map_receiver_pause_error_for_test)?
+    }
+
     pub(super) fn finish(mut self) -> Result<BenchmarkCaseReconciliation, BenchmarkSupportError> {
         let accepted = self.accepted.load(Ordering::Acquire);
         let deadline = Instant::now()
@@ -341,6 +355,20 @@ impl CaptureLifecycle {
             queued_bytes: accounting.record_reservation_bytes(),
             accounting_invariant_failures: accounting.accounting_invariant_failures(),
         })
+    }
+}
+
+#[cfg(test)]
+pub(super) const fn map_receiver_pause_error_for_test(
+    error: super::super::writer::lifecycle::CaptureReceiverTestCoordinationError,
+) -> BenchmarkSupportError {
+    match error {
+        super::super::writer::lifecycle::CaptureReceiverTestCoordinationError::Poisoned => {
+            BenchmarkSupportError::SynchronizationPoisoned
+        }
+        super::super::writer::lifecycle::CaptureReceiverTestCoordinationError::DeadlineElapsed => {
+            BenchmarkSupportError::SynchronizationDeadlineElapsed
+        }
     }
 }
 
@@ -496,7 +524,7 @@ mod tests {
             Some(Arc::clone(&gate)),
         )?;
         let producer = factory.try_producer(BenchmarkOperation::FlushInclusiveWriter)?;
-        producer.try_prepare_operation()?.execute()?;
+        lifecycle.execute_capture_uncontended_for_test(producer.try_prepare_operation()?)?;
         if !gate.wait_until_entered(Duration::from_secs(1))? {
             return Err("writer did not reach the controlled flush boundary".into());
         }
@@ -540,7 +568,7 @@ mod tests {
             Some(Arc::clone(&gate)),
         )?;
         let producer = factory.try_producer(BenchmarkOperation::WriterAppend)?;
-        producer.try_prepare_operation()?.execute()?;
+        lifecycle.execute_capture_uncontended_for_test(producer.try_prepare_operation()?)?;
         if !gate.wait_until_entered(Duration::from_secs(1))? {
             return Err("writer did not reach the controlled post-append boundary".into());
         }

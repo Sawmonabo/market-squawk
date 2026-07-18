@@ -37,6 +37,13 @@ enum PreparedWorker {
     Capture(capture_case::PreparedCaptureOperation),
 }
 
+#[cfg(test)]
+#[derive(Debug, Eq, PartialEq)]
+enum BenchmarkConcurrentAttemptOutcome {
+    Accepted(BenchmarkAttempt),
+    Contended,
+}
+
 #[derive(Debug)]
 enum Lifecycle {
     Queue(queue::QueueLifecycle),
@@ -80,6 +87,41 @@ pub struct BenchmarkOfferedLoadProducer {
 }
 
 impl BenchmarkCase {
+    #[cfg(test)]
+    fn execute_success_path_for_test(
+        &self,
+        operation: BenchmarkPreparedOperation,
+    ) -> Result<BenchmarkAttempt, BenchmarkSupportError> {
+        let lifecycle = self
+            .lifecycle
+            .lock()
+            .map_err(|_error| BenchmarkSupportError::SynchronizationPoisoned)?;
+        match (lifecycle.as_ref(), operation.worker) {
+            (Some(Lifecycle::Queue(queue)), PreparedWorker::Queue(operation)) => {
+                queue.execute_success_path_for_test(operation)
+            }
+            (Some(Lifecycle::Capture(capture)), PreparedWorker::Capture(operation)) => {
+                capture.execute_capture_uncontended_for_test(operation)
+            }
+            _ => Err(BenchmarkSupportError::InvalidFixture),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_receiver_paused_for_test<R>(
+        &self,
+        action: impl FnOnce() -> R,
+    ) -> Result<R, BenchmarkSupportError> {
+        let lifecycle = self
+            .lifecycle
+            .lock()
+            .map_err(|_error| BenchmarkSupportError::SynchronizationPoisoned)?;
+        match lifecycle.as_ref() {
+            Some(Lifecycle::Queue(queue)) => queue.with_receiver_paused_for_test(action),
+            _ => Err(BenchmarkSupportError::InvalidFixture),
+        }
+    }
+
     /// Prepares one real operation case. `maximum_samples` is the exact writer-observation bound.
     pub fn try_new(
         operation: BenchmarkOperation,
@@ -180,9 +222,34 @@ impl BenchmarkPreparedOperation {
             PreparedWorker::Capture(capture) => capture.execute(),
         }
     }
+
+    #[cfg(test)]
+    fn execute_concurrent_for_test(
+        self,
+    ) -> Result<BenchmarkConcurrentAttemptOutcome, BenchmarkSupportError> {
+        match self.worker {
+            PreparedWorker::Queue(queue) => queue.execute_concurrent_for_test(),
+            PreparedWorker::Capture(_capture) => Err(BenchmarkSupportError::InvalidFixture),
+        }
+    }
 }
 
 impl BenchmarkOfferedLoadCase {
+    #[cfg(test)]
+    fn with_receiver_paused_for_test<R>(
+        &self,
+        action: impl FnOnce() -> R,
+    ) -> Result<R, BenchmarkSupportError> {
+        let lifecycle = self
+            .lifecycle
+            .lock()
+            .map_err(|_error| BenchmarkSupportError::SynchronizationPoisoned)?;
+        lifecycle
+            .as_ref()
+            .ok_or(BenchmarkSupportError::Reconciliation)?
+            .with_receiver_paused_for_test(action)
+    }
+
     /// Prepares a real standard capture queue without successful-operation capacity permits.
     pub fn try_new(
         payload_bytes: usize,

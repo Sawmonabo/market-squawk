@@ -138,6 +138,9 @@ pub enum BenchmarkSupportError {
     /// A harness synchronization primitive was poisoned.
     #[error("benchmark synchronization was poisoned")]
     SynchronizationPoisoned,
+    /// A bounded harness synchronization barrier did not complete before its deadline.
+    #[error("benchmark synchronization deadline elapsed")]
+    SynchronizationDeadlineElapsed,
     /// Bounded observation or accounting state was inconsistent.
     #[error("benchmark observation invariant failed")]
     ObservationInvariant,

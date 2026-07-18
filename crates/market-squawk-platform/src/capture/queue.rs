@@ -99,7 +99,7 @@ pub(super) enum QueueControlError {
     Poisoned,
 }
 
-#[cfg(all(feature = "capture-test", debug_assertions))]
+#[cfg(any(test, all(feature = "capture-test", debug_assertions)))]
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub(super) enum ReceiverPauseError {
     #[error("capture receiver test coordination state is poisoned")]
@@ -108,14 +108,14 @@ pub(super) enum ReceiverPauseError {
     DeadlineElapsed,
 }
 
-#[cfg(all(feature = "capture-test", debug_assertions))]
+#[cfg(any(test, all(feature = "capture-test", debug_assertions)))]
 #[derive(Debug, Default)]
 struct ReceiverPauseState {
     requested: bool,
     parked: bool,
 }
 
-#[cfg(all(feature = "capture-test", debug_assertions))]
+#[cfg(any(test, all(feature = "capture-test", debug_assertions)))]
 #[derive(Debug)]
 struct ReceiverTestCoordination {
     requested_hint: AtomicBool,
@@ -123,7 +123,7 @@ struct ReceiverTestCoordination {
     changed: Condvar,
 }
 
-#[cfg(all(feature = "capture-test", debug_assertions))]
+#[cfg(any(test, all(feature = "capture-test", debug_assertions)))]
 impl ReceiverTestCoordination {
     fn new() -> Self {
         Self {
@@ -169,13 +169,13 @@ impl ReceiverTestCoordination {
     }
 }
 
-#[cfg(all(feature = "capture-test", debug_assertions))]
+#[cfg(any(test, all(feature = "capture-test", debug_assertions)))]
 #[derive(Debug)]
 struct ReceiverPauseGuard<'a> {
     coordination: &'a ReceiverTestCoordination,
 }
 
-#[cfg(all(feature = "capture-test", debug_assertions))]
+#[cfg(any(test, all(feature = "capture-test", debug_assertions)))]
 impl ReceiverPauseGuard<'_> {
     fn wait_until_parked(&self, timeout: Duration) -> Result<(), ReceiverPauseError> {
         let start = Instant::now();
@@ -204,7 +204,7 @@ impl ReceiverPauseGuard<'_> {
     }
 }
 
-#[cfg(all(feature = "capture-test", debug_assertions))]
+#[cfg(any(test, all(feature = "capture-test", debug_assertions)))]
 impl Drop for ReceiverPauseGuard<'_> {
     fn drop(&mut self) {
         match self.coordination.state.lock() {
@@ -257,7 +257,7 @@ struct QueueCore<T> {
     state: Mutex<QueueState<T>>,
     available: Condvar,
     closed_hint: AtomicBool,
-    #[cfg(all(feature = "capture-test", debug_assertions))]
+    #[cfg(any(test, all(feature = "capture-test", debug_assertions)))]
     receiver_test_coordination: ReceiverTestCoordination,
 }
 
@@ -342,7 +342,7 @@ impl<T> FixedQueue<T> {
             }),
             available: Condvar::new(),
             closed_hint: AtomicBool::new(false),
-            #[cfg(all(feature = "capture-test", debug_assertions))]
+            #[cfg(any(test, all(feature = "capture-test", debug_assertions)))]
             receiver_test_coordination: ReceiverTestCoordination::new(),
         });
         Ok((
@@ -478,7 +478,7 @@ impl<T> std::fmt::Debug for FixedReceiver<T> {
 
 impl<T> FixedReceiver<T> {
     pub(super) fn try_recv(&self) -> Result<T, TryRecvError> {
-        #[cfg(all(feature = "capture-test", debug_assertions))]
+        #[cfg(any(test, all(feature = "capture-test", debug_assertions)))]
         self.core
             .receiver_test_coordination
             .park_if_requested()
@@ -492,7 +492,7 @@ impl<T> FixedReceiver<T> {
     }
 
     pub(super) fn recv_timeout(&self, timeout: Duration) -> Result<T, RecvTimeoutError> {
-        #[cfg(all(feature = "capture-test", debug_assertions))]
+        #[cfg(any(test, all(feature = "capture-test", debug_assertions)))]
         self.core
             .receiver_test_coordination
             .park_if_requested()
@@ -512,7 +512,7 @@ impl<T> FixedReceiver<T> {
                 Err(TryRecvError::Poisoned) => return Err(RecvTimeoutError::Poisoned),
                 Err(TryRecvError::Empty) => {}
             }
-            #[cfg(all(feature = "capture-test", debug_assertions))]
+            #[cfg(any(test, all(feature = "capture-test", debug_assertions)))]
             if self
                 .core
                 .receiver_test_coordination
@@ -548,7 +548,7 @@ impl<T> FixedReceiver<T> {
                     Err(RecvTimeoutError::Timeout)
                 };
             }
-            #[cfg(all(feature = "capture-test", debug_assertions))]
+            #[cfg(any(test, all(feature = "capture-test", debug_assertions)))]
             if self
                 .core
                 .receiver_test_coordination
@@ -611,7 +611,7 @@ impl<T> FixedQueueControl<T> {
         self.core.close_and_drain(false)
     }
 
-    #[cfg(all(feature = "capture-test", debug_assertions))]
+    #[cfg(any(test, all(feature = "capture-test", debug_assertions)))]
     pub(super) fn with_receiver_paused_for_test<R>(
         &self,
         timeout: Duration,

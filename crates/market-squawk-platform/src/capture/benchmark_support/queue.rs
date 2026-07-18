@@ -13,6 +13,8 @@ use super::super::{
     CaptureMessage, DiagnosticCaptureBundle, RawCaptureControl, RawCaptureWriter,
     raw_capture_channel,
 };
+#[cfg(test)]
+use super::BenchmarkConcurrentAttemptOutcome;
 use super::fixture::{
     MessageFactory, channel_limits, fixture_identity, prepare_fixture, process_infrastructure,
 };
@@ -379,6 +381,13 @@ impl QueueProducer {
 
 impl PreparedQueueOperation {
     pub(super) fn execute(self) -> Result<BenchmarkAttempt, BenchmarkSupportError> {
+        match self.execute_classified()? {
+            PreparedQueueExecution::Accepted(attempt) => Ok(attempt),
+            PreparedQueueExecution::Contended => Err(BenchmarkSupportError::UnexpectedRefusal),
+        }
+    }
+
+    fn execute_classified(self) -> Result<PreparedQueueExecution, BenchmarkSupportError> {
         match self {
             Self::Push {
                 sender,
@@ -387,10 +396,22 @@ impl PreparedQueueOperation {
                 accepted,
             } => {
                 let (result, latency_nanos) = measure_operation(|| sender.try_send(message))?;
-                result.map_err(|_error| BenchmarkSupportError::UnexpectedRefusal)?;
+                match result {
+                    Ok(()) => {}
+                    Err(FixedTrySendError::Contended(_message)) => {
+                        return Ok(PreparedQueueExecution::Contended);
+                    }
+                    Err(
+                        FixedTrySendError::Full(_message)
+                        | FixedTrySendError::Closed(_message)
+                        | FixedTrySendError::Poisoned(_message),
+                    ) => return Err(BenchmarkSupportError::UnexpectedRefusal),
+                }
                 increment(&accepted)?;
                 permit.commit();
-                Ok(BenchmarkAttempt { latency_nanos })
+                Ok(PreparedQueueExecution::Accepted(BenchmarkAttempt {
+                    latency_nanos,
+                }))
             }
             Self::Pop {
                 sender,
@@ -401,9 +422,17 @@ impl PreparedQueueOperation {
                 permit,
                 accepted,
             } => {
-                sender
-                    .try_send(message)
-                    .map_err(|_error| BenchmarkSupportError::UnexpectedRefusal)?;
+                match sender.try_send(message) {
+                    Ok(()) => {}
+                    Err(FixedTrySendError::Contended(_message)) => {
+                        return Ok(PreparedQueueExecution::Contended);
+                    }
+                    Err(
+                        FixedTrySendError::Full(_message)
+                        | FixedTrySendError::Closed(_message)
+                        | FixedTrySendError::Poisoned(_message),
+                    ) => return Err(BenchmarkSupportError::UnexpectedRefusal),
+                }
                 requests
                     .send(request)
                     .map_err(|_error| BenchmarkSupportError::Reconciliation)?;
@@ -412,13 +441,62 @@ impl PreparedQueueOperation {
                     .map_err(|_error| BenchmarkSupportError::Reconciliation)??;
                 increment(&accepted)?;
                 permit.commit();
-                Ok(BenchmarkAttempt { latency_nanos: 0 })
+                Ok(PreparedQueueExecution::Accepted(BenchmarkAttempt {
+                    latency_nanos: 0,
+                }))
             }
         }
     }
+
+    #[cfg(test)]
+    pub(super) fn execute_concurrent_for_test(
+        self,
+    ) -> Result<BenchmarkConcurrentAttemptOutcome, BenchmarkSupportError> {
+        Ok(match self.execute_classified()? {
+            PreparedQueueExecution::Accepted(attempt) => {
+                BenchmarkConcurrentAttemptOutcome::Accepted(attempt)
+            }
+            PreparedQueueExecution::Contended => BenchmarkConcurrentAttemptOutcome::Contended,
+        })
+    }
+}
+
+#[derive(Debug)]
+enum PreparedQueueExecution {
+    Accepted(BenchmarkAttempt),
+    Contended,
 }
 
 impl QueueLifecycle {
+    #[cfg(test)]
+    pub(super) fn execute_success_path_for_test(
+        &self,
+        operation: PreparedQueueOperation,
+    ) -> Result<BenchmarkAttempt, BenchmarkSupportError> {
+        match (&operation, self.operation) {
+            (PreparedQueueOperation::Push { .. }, BenchmarkOperation::QueuePush) => self
+                .writer
+                .queue_control
+                .with_receiver_paused_for_test(SHUTDOWN_TIMEOUT, || operation.execute())
+                .map_err(map_receiver_pause_error_for_test)?,
+            (PreparedQueueOperation::Pop { .. }, BenchmarkOperation::QueuePop) => {
+                operation.execute()
+            }
+            _ => Err(BenchmarkSupportError::InvalidFixture),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_receiver_paused_for_test<R>(
+        &self,
+        action: impl FnOnce() -> R,
+    ) -> Result<R, BenchmarkSupportError> {
+        self.writer
+            .queue_control
+            .with_receiver_paused_for_test(SHUTDOWN_TIMEOUT, action)
+            .map_err(map_receiver_pause_error_for_test)
+    }
+
     pub(super) fn finish(mut self) -> Result<BenchmarkCaseReconciliation, BenchmarkSupportError> {
         let deadline = Instant::now()
             .checked_add(SHUTDOWN_TIMEOUT)
@@ -467,6 +545,17 @@ impl QueueLifecycle {
 }
 
 impl OfferedLoadLifecycle {
+    #[cfg(test)]
+    pub(super) fn with_receiver_paused_for_test<R>(
+        &self,
+        action: impl FnOnce() -> R,
+    ) -> Result<R, BenchmarkSupportError> {
+        self.writer
+            .queue_control
+            .with_receiver_paused_for_test(SHUTDOWN_TIMEOUT, action)
+            .map_err(map_receiver_pause_error_for_test)
+    }
+
     pub(super) fn finish(
         mut self,
     ) -> Result<BenchmarkOfferedLoadReconciliation, BenchmarkSupportError> {
@@ -508,6 +597,20 @@ impl OfferedLoadLifecycle {
             queued_bytes,
             accounting_invariant_failures,
         })
+    }
+}
+
+#[cfg(test)]
+pub(super) const fn map_receiver_pause_error_for_test(
+    error: super::super::queue::ReceiverPauseError,
+) -> BenchmarkSupportError {
+    match error {
+        super::super::queue::ReceiverPauseError::Poisoned => {
+            BenchmarkSupportError::SynchronizationPoisoned
+        }
+        super::super::queue::ReceiverPauseError::DeadlineElapsed => {
+            BenchmarkSupportError::SynchronizationDeadlineElapsed
+        }
     }
 }
 

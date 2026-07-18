@@ -1,16 +1,87 @@
 //! Bounded contract tests for the feature-gated production seam.
 
 use std::num::NonZeroUsize;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use super::{
-    BenchmarkAttemptOutcome, BenchmarkCase, BenchmarkOfferedLoadCase, BenchmarkOfferedLoadOutcome,
-    BenchmarkOperation, BenchmarkSupportError, benchmark_effective_capacity,
+    BenchmarkAttemptOutcome, BenchmarkCase, BenchmarkConcurrentAttemptOutcome,
+    BenchmarkOfferedLoadCase, BenchmarkOfferedLoadOutcome, BenchmarkOperation,
+    BenchmarkSupportError, benchmark_effective_capacity,
     fixture::{BENCHMARK_RECORD_RESERVATION_BUDGET_BYTES, reservation_bytes_for_test},
     verify_comparable_full,
 };
 
+#[derive(Debug, Default)]
+struct ConcurrentStartState {
+    ready: usize,
+    released: bool,
+}
+
+#[derive(Debug)]
+struct ConcurrentStartGate {
+    participants: usize,
+    state: Mutex<ConcurrentStartState>,
+    changed: Condvar,
+}
+
+impl ConcurrentStartGate {
+    fn new(participants: NonZeroUsize) -> Self {
+        Self {
+            participants: participants.get(),
+            state: Mutex::new(ConcurrentStartState::default()),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn arrive_and_wait(&self, timeout: Duration) -> Result<(), BenchmarkSupportError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_error| BenchmarkSupportError::SynchronizationPoisoned)?;
+        state.ready = state
+            .ready
+            .checked_add(1)
+            .ok_or(BenchmarkSupportError::ObservationInvariant)?;
+        self.changed.notify_all();
+        let (state, result) = self
+            .changed
+            .wait_timeout_while(state, timeout, |state| !state.released)
+            .map_err(|_error| BenchmarkSupportError::SynchronizationPoisoned)?;
+        if result.timed_out() && !state.released {
+            return Err(BenchmarkSupportError::SynchronizationDeadlineElapsed);
+        }
+        Ok(())
+    }
+
+    fn release_when_ready(&self, timeout: Duration) -> Result<(), BenchmarkSupportError> {
+        let started = Instant::now();
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_error| BenchmarkSupportError::SynchronizationPoisoned)?;
+        while state.ready != self.participants {
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Err(BenchmarkSupportError::SynchronizationDeadlineElapsed);
+            }
+            let (next, result) = self
+                .changed
+                .wait_timeout(state, remaining)
+                .map_err(|_error| BenchmarkSupportError::SynchronizationPoisoned)?;
+            state = next;
+            if result.timed_out() && state.ready != self.participants {
+                return Err(BenchmarkSupportError::SynchronizationDeadlineElapsed);
+            }
+        }
+        state.released = true;
+        self.changed.notify_all();
+        Ok(())
+    }
+}
+
 #[test]
-fn seam_runs_real_operations_with_two_concurrent_producers()
+fn seam_runs_real_operations_from_two_producer_handles_on_uncontended_path()
 -> Result<(), Box<dyn std::error::Error>> {
     for operation in [
         BenchmarkOperation::QueuePush,
@@ -22,25 +93,16 @@ fn seam_runs_real_operations_with_two_concurrent_producers()
         let case = BenchmarkCase::try_new(operation, 8, NonZeroUsize::MIN, 2)?;
         let first = case.try_producer()?;
         let second = case.try_producer()?;
-        std::thread::scope(|scope| -> Result<(), BenchmarkSupportError> {
-            let first = scope.spawn(move || first.try_prepare_operation()?.execute());
-            let second = scope.spawn(move || second.try_prepare_operation()?.execute());
-            assert_eq!(
-                first
-                    .join()
-                    .map_err(|_panic| BenchmarkSupportError::Reconciliation)??
-                    .outcome(),
-                BenchmarkAttemptOutcome::Accepted
-            );
-            assert_eq!(
-                second
-                    .join()
-                    .map_err(|_panic| BenchmarkSupportError::Reconciliation)??
-                    .outcome(),
-                BenchmarkAttemptOutcome::Accepted
-            );
-            Ok(())
-        })?;
+        assert_eq!(
+            case.execute_success_path_for_test(first.try_prepare_operation()?)?
+                .outcome(),
+            BenchmarkAttemptOutcome::Accepted
+        );
+        assert_eq!(
+            case.execute_success_path_for_test(second.try_prepare_operation()?)?
+                .outcome(),
+            BenchmarkAttemptOutcome::Accepted
+        );
         let reconciliation = case.finish()?;
         assert_eq!(reconciliation.accepted(), 2);
         assert_eq!(reconciliation.consumed(), 2);
@@ -59,6 +121,88 @@ fn seam_runs_real_operations_with_two_concurrent_producers()
         }
     }
     Ok(())
+}
+
+#[test]
+fn queue_push_concurrent_start_reports_truthful_outcomes_and_reconciles()
+-> Result<(), Box<dyn std::error::Error>> {
+    let queue_depth = NonZeroUsize::new(2).ok_or("queue depth is zero")?;
+    let case = BenchmarkCase::try_new(BenchmarkOperation::QueuePush, 8, queue_depth, 0)?;
+    let first = case.try_producer()?.try_prepare_operation()?;
+    let second = case.try_producer()?.try_prepare_operation()?;
+    let outcomes = case.with_receiver_paused_for_test(|| {
+        let participants = NonZeroUsize::new(2).ok_or(BenchmarkSupportError::InvalidFixture)?;
+        let start = Arc::new(ConcurrentStartGate::new(participants));
+        std::thread::scope(|scope| {
+            let first_start = Arc::clone(&start);
+            let first = scope.spawn(move || {
+                first_start.arrive_and_wait(Duration::from_secs(1))?;
+                first.execute_concurrent_for_test()
+            });
+            let second_start = Arc::clone(&start);
+            let second = scope.spawn(move || {
+                second_start.arrive_and_wait(Duration::from_secs(1))?;
+                second.execute_concurrent_for_test()
+            });
+            start.release_when_ready(Duration::from_secs(1))?;
+            [
+                first
+                    .join()
+                    .map_err(|_panic| BenchmarkSupportError::Reconciliation)?,
+                second
+                    .join()
+                    .map_err(|_panic| BenchmarkSupportError::Reconciliation)?,
+            ]
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+        })
+    })??;
+    let mut accepted = 0_usize;
+    let mut contended = 0_usize;
+    for outcome in outcomes {
+        match outcome {
+            BenchmarkConcurrentAttemptOutcome::Accepted(attempt) => {
+                assert_eq!(attempt.outcome(), BenchmarkAttemptOutcome::Accepted);
+                accepted += 1;
+            }
+            BenchmarkConcurrentAttemptOutcome::Contended => contended += 1,
+        }
+    }
+    assert!(accepted >= 1);
+    assert_eq!(accepted + contended, 2);
+    let reconciliation = case.finish()?;
+    assert_eq!(reconciliation.accepted(), accepted);
+    assert_eq!(reconciliation.consumed(), accepted);
+    assert_eq!(reconciliation.queued_bytes(), 0);
+    assert_eq!(reconciliation.accounting_invariant_failures(), 0);
+    Ok(())
+}
+
+#[test]
+fn receiver_pause_errors_preserve_poison_and_deadline_classes() {
+    use super::super::queue::ReceiverPauseError;
+    use super::super::writer::lifecycle::CaptureReceiverTestCoordinationError;
+
+    assert_eq!(
+        super::queue::map_receiver_pause_error_for_test(ReceiverPauseError::Poisoned),
+        BenchmarkSupportError::SynchronizationPoisoned
+    );
+    assert_eq!(
+        super::queue::map_receiver_pause_error_for_test(ReceiverPauseError::DeadlineElapsed),
+        BenchmarkSupportError::SynchronizationDeadlineElapsed
+    );
+    assert_eq!(
+        super::capture_case::map_receiver_pause_error_for_test(
+            CaptureReceiverTestCoordinationError::Poisoned,
+        ),
+        BenchmarkSupportError::SynchronizationPoisoned
+    );
+    assert_eq!(
+        super::capture_case::map_receiver_pause_error_for_test(
+            CaptureReceiverTestCoordinationError::DeadlineElapsed,
+        ),
+        BenchmarkSupportError::SynchronizationDeadlineElapsed
+    );
 }
 
 #[test]
@@ -112,10 +256,10 @@ fn permit_wait_and_pre_execution_delay_are_excluded_from_queue_push_latency()
     });
     ready_receiver.recv_timeout(std::time::Duration::from_secs(1))?;
     std::thread::sleep(setup_delay);
-    let first_attempt = first.execute()?;
+    let first_attempt = case.execute_success_path_for_test(first)?;
     let (second_prepared, wait_elapsed) =
         receiver.recv_timeout(std::time::Duration::from_secs(1))?;
-    let second_attempt = second_prepared?.execute()?;
+    let second_attempt = case.execute_success_path_for_test(second_prepared?)?;
     if waiter.join().is_err() {
         return Err("permit waiter panicked".into());
     }
@@ -133,21 +277,12 @@ fn offered_load_queue_reports_real_refusals_and_reconciles()
 -> Result<(), Box<dyn std::error::Error>> {
     let case = BenchmarkOfferedLoadCase::try_new(1_024, NonZeroUsize::MIN)?;
     let producer = case.try_producer()?;
-    let mut accepted = 0_usize;
-    let mut full = 0_usize;
-    for _ in 0..10_000 {
-        match producer.try_offer()? {
-            BenchmarkOfferedLoadOutcome::Accepted => accepted += 1,
-            BenchmarkOfferedLoadOutcome::QueueFull => full += 1,
-        }
-        if accepted > 0 && full > 0 {
-            break;
-        }
-    }
-    assert!(accepted > 0);
-    assert!(full > 0);
+    let (first, second) =
+        case.with_receiver_paused_for_test(|| (producer.try_offer(), producer.try_offer()))?;
+    assert_eq!(first?, BenchmarkOfferedLoadOutcome::Accepted);
+    assert_eq!(second?, BenchmarkOfferedLoadOutcome::QueueFull);
     let reconciliation = case.finish()?;
-    assert_eq!(reconciliation.accepted(), accepted);
-    assert_eq!(reconciliation.consumed(), accepted);
+    assert_eq!(reconciliation.accepted(), 1);
+    assert_eq!(reconciliation.consumed(), 1);
     Ok(())
 }

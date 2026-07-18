@@ -6,7 +6,7 @@ use market_squawk_domain::CaptureAuthorityBundle;
 use thiserror::Error;
 
 use super::super::queue::FixedQueueControl;
-#[cfg(all(feature = "capture-test", debug_assertions))]
+#[cfg(any(test, all(feature = "capture-test", debug_assertions)))]
 use super::super::queue::ReceiverPauseError;
 use super::super::{CaptureHealthReason, CaptureMessage, CaptureState};
 use super::destination::CaptureDestinationLease;
@@ -56,10 +56,10 @@ pub enum CaptureShutdownStatus {
 
 /// Deterministic receiver-barrier failure for integration tests of nonblocking publication.
 ///
-/// This contract exists only in debug-assertion builds with the internal `capture-test`
-/// feature. Production composition must observe and handle
+/// This contract is compiled for crate unit tests, or for debug-assertion builds with the internal
+/// `capture-test` feature. Production composition must observe and handle
 /// [`crate::CapturePublishError::QueueContended`] directly.
-#[cfg(all(feature = "capture-test", debug_assertions))]
+#[cfg(any(test, all(feature = "capture-test", debug_assertions)))]
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum CaptureReceiverTestCoordinationError {
     /// The private coordination state was poisoned by a test panic.
@@ -154,7 +154,7 @@ impl<B: CaptureAuthorityBundle> CaptureWriterHandle<B> {
     /// # Errors
     ///
     /// Returns a typed poison or deadline failure before invoking `action`.
-    #[cfg(all(feature = "capture-test", debug_assertions))]
+    #[cfg(any(test, all(feature = "capture-test", debug_assertions)))]
     #[doc(hidden)]
     pub fn with_receiver_paused_for_test<R>(
         &self,

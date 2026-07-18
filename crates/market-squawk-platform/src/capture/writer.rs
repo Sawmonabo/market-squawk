@@ -1,7 +1,10 @@
 //! Supervised capture-sink storage outside the live event-to-action path.
 
 mod destination;
+#[cfg(not(test))]
 mod lifecycle;
+#[cfg(test)]
+pub(super) mod lifecycle;
 mod runtime;
 mod sink;
 
