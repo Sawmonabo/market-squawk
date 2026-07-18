@@ -345,7 +345,9 @@ fn validate_authoritative_build_environment() -> Result<ValidatedBuildEnvironmen
         || std::env::var("PROFILE")?.as_str() != "release"
         || std::env::var("OPT_LEVEL")?.as_str() != "3"
         || std::env::var("DEBUG")?.as_str() != "false"
-        || std::env::var("CARGO_CFG_PANIC")?.as_str() != "abort"
+        // Cargo forces build scripts to unwind even when the selected target uses `panic=abort`.
+        // The evidence binary's target-side compile guard is authoritative for its panic strategy.
+        || std::env::var("CARGO_CFG_PANIC")?.as_str() != "unwind"
         || std::env::var("CARGO_FEATURE_CAPTURE_BENCHMARK")?.as_str() != "1"
         || !std::env::var("CARGO_ENCODED_RUSTFLAGS")?.is_empty()
     {

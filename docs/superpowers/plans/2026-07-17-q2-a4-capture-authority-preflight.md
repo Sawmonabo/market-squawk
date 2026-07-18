@@ -181,8 +181,10 @@ cargo build -p market-squawk-platform --bin capture-admission-evidence \
 Evidence schema 5 uses build-environment policy `sanitized-cargo-release-runner-v3` and binds the
 profile literal
 `cargo-release-binary:opt-level=3:lto=thin:codegen-units=1:panic=abort:strip=symbols`. The target's
-`cfg(panic = "abort")` assertion is the final compile-time authority. The separate
-`capture_admission_criterion` target remains adaptive engineering instrumentation labeled
+`cfg(panic = "abort")` assertion is the final compile-time authority. Cargo separately forces the
+package build script to unwind, so `build.rs` validates its own `CARGO_CFG_PANIC=unwind` strategy
+without treating that build-script value as evidence of the binary target's panic strategy. The
+separate `capture_admission_criterion` target remains adaptive engineering instrumentation labeled
 `exploratory_zero_authority`; it cannot create, schedule, or approve fixed-quota evidence. See
 [Cargo's panic profile rules](https://doc.rust-lang.org/cargo/reference/profiles.html#panic),
 [Rust `cfg(panic)`](https://doc.rust-lang.org/reference/conditional-compilation.html#panic),

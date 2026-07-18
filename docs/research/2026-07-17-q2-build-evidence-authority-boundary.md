@@ -40,7 +40,10 @@ benchmark harness with `harness = false`; the prior `[[bench]]` runner was there
 `panic="unwind"` and could not truthfully claim the bound release profile's `panic="abort"`.
 The release binary is bound to profile literal
 `cargo-release-binary:opt-level=3:lto=thin:codegen-units=1:panic=abort:strip=symbols`, and the
-target-side `cfg(panic = "abort")` assertion remains the final compile-time authority. The separate
+target-side `cfg(panic = "abort")` assertion remains the final compile-time authority. Cargo also
+forces the package build script itself to unwind, so `build.rs` validates its truthful
+`CARGO_CFG_PANIC=unwind` host strategy and never treats that value as evidence of the binary target's
+panic strategy. The separate
 `capture_admission_criterion` benchmark remains adaptive engineering instrumentation with
 `exploratory_zero_authority`; it cannot generate, schedule, or approve fixed-quota evidence.
 [Cargo panic profile rules](https://doc.rust-lang.org/cargo/reference/profiles.html#panic),
