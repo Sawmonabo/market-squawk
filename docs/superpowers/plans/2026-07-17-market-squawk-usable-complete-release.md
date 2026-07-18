@@ -103,6 +103,391 @@ primary sources, Rust 1.97.1, licenses, and the locked dependency graph before a
 
 ---
 
+## One-time live/capture prerequisite gate
+
+This is an admission gate before Stage 1 integration. It is not a fifth delivery quarter, does not
+replace the Quarter 1 of 4 checkpoint, and cannot award product credit. The integration owner and
+one independent read-only reviewer are the prerequisite-review authority. The immutable audit
+identity `q2-a4-seed-checkpoint-review` remains in the evidence schema only because the closed
+harness requires it; it does not name a current quarter.
+
+This section is the sole executable authority for the pending live/capture measurement. The dated
+`2026-07-17-q2-a4-capture-authority-preflight.md` file remains supporting audit history. Its
+unqualified `target/q2-a4-capture-benchmark/standard/` examples are invalid and must never be used.
+Every standard artifact reference is head-qualified as
+`target/q2-a4-capture-benchmark/standard-$STANDARD_HEAD/`.
+
+### Reference freeze
+
+The standard-reference head is the first clean pushed pre-Wave-1 commit containing the integrated
+capture implementation and unchanged closed benchmark harness. Before measurement:
+
+```bash
+set -euo pipefail
+STANDARD_HEAD="$(git rev-parse HEAD)"
+test "${#STANDARD_HEAD}" -eq 40
+test -z "$(git status --short)"
+test "$(git rev-parse '@{upstream}')" = "$STANDARD_HEAD"
+test "$(rustc --version)" = "rustc 1.97.1 (8bab26f4f 2026-07-14)"
+./scripts/verify.sh
+./scripts/check_capture_queue_loom.sh
+cargo deny check
+cargo audit --deny warnings
+gitleaks dir --no-banner --redact --config .gitleaks.toml .
+gitleaks git --no-banner --redact --config .gitleaks.toml .
+test "$(git rev-parse HEAD)" = "$STANDARD_HEAD"
+test -z "$(git status --short)"
+```
+
+The independent reviewer then verifies that exact SHA, the standard `sync_channel` reference, the
+candidate fixed-ring backend, immutable harness/tool/source inventory, Rust 1.97.1 binding, release
+profile, fixed workloads, five-repetition contract, memory accounting, and host-gate controls.
+Every substantiated finding is remediated and the complete freeze gate and review repeat on a new
+head. Approval freezes the unchanged `STANDARD_HEAD`; it is prerequisite approval, not a delivery-
+quarter review. The reviewer returns that full literal SHA as `REVIEWED_STANDARD_HEAD`; the
+measurement operator must supply it explicitly rather than deriving authority from the later
+checkout.
+
+### Standard measurement and baseline lock
+
+Measurement waits until every other agent and all Cargo, rustc, Criterion, and capture-evidence
+processes are stopped. At preflight admission, the one-minute load divided by logical CPU count must
+be at most `0.10` (`0.80` on eight logical CPUs). The continuous monitor enforces competitor-process
+absence and immutable input/tool bindings; it does not claim an interval load-average threshold.
+The integration owner must truthfully attest `no-other-active-agents`; active background writers
+invalidate the run.
+
+```bash
+set -euo pipefail
+: "${REVIEWED_STANDARD_HEAD:?set the exact independently reviewed 40-hex standard head}"
+STANDARD_HEAD="$REVIEWED_STANDARD_HEAD"
+test "${#STANDARD_HEAD}" -eq 40
+test "$(git rev-parse HEAD)" = "$STANDARD_HEAD"
+test "$(git rev-parse '@{upstream}')" = "$STANDARD_HEAD"
+test -z "$(git status --short)"
+COMMON_GIT_DIR="$(git rev-parse --path-format=absolute --git-common-dir)"
+REPO_ROOT="$(dirname "$COMMON_GIT_DIR")"
+EVIDENCE_ROOT="$REPO_ROOT/target/q2-a4-capture-benchmark"
+RUN_DIR="$EVIDENCE_ROOT/standard-$STANDARD_HEAD"
+HOST_EVIDENCE_DIR="$RUN_DIR/host-gate"
+LOCK_DIR="$EVIDENCE_ROOT/.exclusive-lock"
+PREFLIGHT="$HOST_EVIDENCE_DIR/preflight.json"
+release_host_lock() {
+  if ! test -d "$LOCK_DIR"; then return 0; fi
+  if test -f "$LOCK_DIR/owner.json"; then
+    if ! test -s "$PREFLIGHT"; then
+      printf '%s\n' 'owned evidence lock has no valid release ticket; preserve and escalate' >&2
+      return 1
+    fi
+    scripts/capture_benchmark_host_gate.sh release \
+      --lock-dir "$LOCK_DIR" --release-ticket "$PREFLIGHT" \
+      --expected-lock-device "$(jq -r '.lock_identity.device' "$PREFLIGHT")" \
+      --expected-lock-inode "$(jq -r '.lock_identity.inode' "$PREFLIGHT")" \
+      --expected-owner-device "$(jq -r '.owner_identity.device' "$PREFLIGHT")" \
+      --expected-owner-inode "$(jq -r '.owner_identity.inode' "$PREFLIGHT")" \
+      --expected-nonce-sha256 "$(jq -r '.lock_nonce_sha256' "$PREFLIGHT")"
+  else
+    test -z "$(find "$LOCK_DIR" -mindepth 1 -maxdepth 1 -print -quit)"
+    rmdir "$LOCK_DIR"
+  fi
+}
+on_exit() {
+  status=$?
+  trap - EXIT
+  release_host_lock || status=1
+  exit "$status"
+}
+trap on_exit EXIT
+test ! -e "$RUN_DIR"
+umask 077
+mkdir -p "$EVIDENCE_ROOT"
+chmod 700 "$EVIDENCE_ROOT"
+mkdir "$RUN_DIR"
+chmod 700 "$RUN_DIR"
+scripts/capture_benchmark_prepare_build_evidence.py \
+  --run-dir "$RUN_DIR" --benchmark-backend standard
+printf '%s\n' no-other-active-agents > "$RUN_DIR/active-agent-attestation.txt"
+chmod 600 "$RUN_DIR/active-agent-attestation.txt"
+mkdir "$LOCK_DIR"
+chmod 700 "$LOCK_DIR"
+scripts/capture_benchmark_host_gate.sh measure \
+  --lock-dir "$LOCK_DIR" \
+  --active-agent-attestation "$RUN_DIR/active-agent-attestation.txt" \
+  --output-dir "$HOST_EVIDENCE_DIR" \
+  --runner "$RUN_DIR/capture_admission_evidence-exe" \
+  --build-evidence "$RUN_DIR/build-evidence.json"
+env CAPTURE_BENCH_BACKEND=standard \
+  CAPTURE_BENCH_FINALIZE_ONLY=1 \
+  CAPTURE_BENCH_BUILD_EVIDENCE="$RUN_DIR/build-evidence.json" \
+  CAPTURE_BENCH_HOST_EVIDENCE="$HOST_EVIDENCE_DIR/comparison.json" \
+  CAPTURE_BENCH_OUTPUT="$RUN_DIR" \
+  "$RUN_DIR/capture_admission_evidence-exe" --bench
+jq -e --arg head "$STANDARD_HEAD" \
+  '.schema_version == 5 and .backend == "standard" and
+   .measured_code_head == $head and .host_gate.valid == true and
+   .repetitions == [1, 2, 3, 4, 5]' "$RUN_DIR/manifest.json"
+release_host_lock
+(cd "$RUN_DIR" && find . -type f ! -name SHA256SUMS -print | LC_ALL=C sort | \
+  while IFS= read -r file; do shasum -a 256 "$file"; done > SHA256SUMS)
+(cd "$RUN_DIR" && shasum -a 256 -c SHA256SUMS)
+test "$(git rev-parse HEAD)" = "$STANDARD_HEAD"
+test "$(git rev-parse '@{upstream}')" = "$STANDARD_HEAD"
+test -z "$(git status --short)"
+```
+
+The integration owner writes exactly:
+
+```text
+docs/reports/performance/2026-07-17-q2-a4-standard-channel-baseline.md
+docs/reports/performance/2026-07-17-q2-a4-standard-channel-baseline.lock.json
+```
+
+The report records the exact measured head, hardware/OS/toolchain/profile, commands, fixed fixtures,
+sample/repetition rationale, every latency/throughput/RSS result, host admission, raw artifact
+references, and digests without making a candidate claim. The canonical compact-JSON lock copies
+the complete closed field set enforced by `validate_baseline` in
+`capture_benchmark_prepare_build_evidence.py`; it binds the head-qualified manifest reference,
+manifest/report hashes, `independent_seed_review_approved` state,
+`q2-a4-seed-checkpoint-review` identity, and every backend/build/harness/tool/artifact/repetition/
+host/toolchain/profile digest. Commit only those two files. Their commit must be the only delta from
+`STANDARD_HEAD`; otherwise discard the run and re-freeze a new standard head.
+
+### Paired candidate and prerequisite approval
+
+On that report-only clean child, run the candidate against the exact head-qualified standard
+manifest and tracked baseline lock:
+
+```bash
+set -euo pipefail
+CANDIDATE_HEAD="$(git rev-parse HEAD)"
+test -z "$(git status --short)"
+BASELINE_LOCK=docs/reports/performance/2026-07-17-q2-a4-standard-channel-baseline.lock.json
+STANDARD_HEAD="$(jq -er '.baseline_head' "$BASELINE_LOCK")"
+git merge-base --is-ancestor "$STANDARD_HEAD" "$CANDIDATE_HEAD"
+test "$(git diff --name-only "$STANDARD_HEAD..$CANDIDATE_HEAD")" = \
+  $'docs/reports/performance/2026-07-17-q2-a4-standard-channel-baseline.lock.json\ndocs/reports/performance/2026-07-17-q2-a4-standard-channel-baseline.md'
+COMMON_GIT_DIR="$(git rev-parse --path-format=absolute --git-common-dir)"
+REPO_ROOT="$(dirname "$COMMON_GIT_DIR")"
+EVIDENCE_ROOT="$REPO_ROOT/target/q2-a4-capture-benchmark"
+STANDARD_DIR="$EVIDENCE_ROOT/standard-$STANDARD_HEAD"
+BASELINE_MANIFEST="$STANDARD_DIR/manifest.json"
+RUN_DIR="$EVIDENCE_ROOT/candidate-$CANDIDATE_HEAD"
+HOST_EVIDENCE_DIR="$RUN_DIR/host-gate"
+LOCK_DIR="$EVIDENCE_ROOT/.exclusive-lock"
+PREFLIGHT="$HOST_EVIDENCE_DIR/preflight.json"
+release_host_lock() {
+  if ! test -d "$LOCK_DIR"; then return 0; fi
+  if test -f "$LOCK_DIR/owner.json"; then
+    if ! test -s "$PREFLIGHT"; then
+      printf '%s\n' 'owned evidence lock has no valid release ticket; preserve and escalate' >&2
+      return 1
+    fi
+    scripts/capture_benchmark_host_gate.sh release \
+      --lock-dir "$LOCK_DIR" --release-ticket "$PREFLIGHT" \
+      --expected-lock-device "$(jq -r '.lock_identity.device' "$PREFLIGHT")" \
+      --expected-lock-inode "$(jq -r '.lock_identity.inode' "$PREFLIGHT")" \
+      --expected-owner-device "$(jq -r '.owner_identity.device' "$PREFLIGHT")" \
+      --expected-owner-inode "$(jq -r '.owner_identity.inode' "$PREFLIGHT")" \
+      --expected-nonce-sha256 "$(jq -r '.lock_nonce_sha256' "$PREFLIGHT")"
+  else
+    test -z "$(find "$LOCK_DIR" -mindepth 1 -maxdepth 1 -print -quit)"
+    rmdir "$LOCK_DIR"
+  fi
+}
+on_exit() {
+  status=$?
+  trap - EXIT
+  release_host_lock || status=1
+  exit "$status"
+}
+trap on_exit EXIT
+(cd "$STANDARD_DIR" && shasum -a 256 -c SHA256SUMS)
+test ! -e "$RUN_DIR"
+mkdir "$RUN_DIR"
+chmod 700 "$RUN_DIR"
+scripts/capture_benchmark_prepare_build_evidence.py \
+  --run-dir "$RUN_DIR" --benchmark-backend candidate \
+  --baseline-manifest "$BASELINE_MANIFEST"
+printf '%s\n' no-other-active-agents > "$RUN_DIR/active-agent-attestation.txt"
+chmod 600 "$RUN_DIR/active-agent-attestation.txt"
+mkdir "$LOCK_DIR"
+chmod 700 "$LOCK_DIR"
+scripts/capture_benchmark_host_gate.sh measure \
+  --lock-dir "$LOCK_DIR" \
+  --active-agent-attestation "$RUN_DIR/active-agent-attestation.txt" \
+  --output-dir "$HOST_EVIDENCE_DIR" \
+  --runner "$RUN_DIR/capture_admission_evidence-exe" \
+  --build-evidence "$RUN_DIR/build-evidence.json"
+env CAPTURE_BENCH_BACKEND=candidate \
+  CAPTURE_BENCH_BASELINE_MANIFEST="$RUN_DIR/baseline-manifest.json" \
+  CAPTURE_BENCH_BASELINE_LOCK="$RUN_DIR/baseline-lock.json" \
+  CAPTURE_BENCH_BUILD_EVIDENCE="$RUN_DIR/build-evidence.json" \
+  CAPTURE_BENCH_FINALIZE_ONLY=1 \
+  CAPTURE_BENCH_HOST_EVIDENCE="$HOST_EVIDENCE_DIR/comparison.json" \
+  CAPTURE_BENCH_OUTPUT="$RUN_DIR" \
+  "$RUN_DIR/capture_admission_evidence-exe" --bench
+jq -e -s '.[0].schema_version == 5 and .[0].backend == "candidate" and
+  .[0].host_gate.valid == true and .[0].repetitions == [1, 2, 3, 4, 5] and
+  .[0].immutable_module_sha256 == .[1].immutable_module_sha256 and
+  .[0].entrypoint_sha256 == .[1].entrypoint_sha256 and
+  .[0].criterion_sha256 == .[1].criterion_sha256 and
+  .[0].observer_sha256 == .[1].observer_sha256 and
+  .[0].tool_sha256 == .[1].tool_sha256 and
+  .[0].production_library_sha256 == .[1].production_library_sha256 and
+  .[0].host_fingerprint_sha256 == .[1].host_fingerprint_sha256 and
+  .[0].toolchain_fingerprint_sha256 == .[1].toolchain_fingerprint_sha256 and
+  .[0].release_profile_sha256 == .[1].release_profile_sha256 and
+  .[0].backend_sha256 != .[1].backend_sha256' \
+  "$RUN_DIR/manifest.json" "$BASELINE_MANIFEST"
+release_host_lock
+(cd "$RUN_DIR" && find . -type f ! -name SHA256SUMS -print | LC_ALL=C sort | \
+  while IFS= read -r file; do shasum -a 256 "$file"; done > SHA256SUMS)
+(cd "$RUN_DIR" && shasum -a 256 -c SHA256SUMS)
+test "$(git rev-parse HEAD)" = "$CANDIDATE_HEAD"
+test -z "$(git status --short)"
+```
+
+The integration owner then creates
+`docs/reports/2026-07-17-q2-a4-evidence-lock.json` and
+`docs/reports/2026-07-17-q2-a4-verification.md`, and updates current state, target state, gap analysis,
+the canonical entry point, project memory, and `docs/verification/usable-release-baseline.md` in the
+same reviewed evidence/truth commit. The closed final lock binds both manifest hashes, both checksum-
+inventory hashes, executable, immutable modules, entrypoint, distinct backends, and both host-gate
+objects. Raw binaries and run data remain ignored under `target/`. This commit completes the required
+Task 0 baseline SHA/tree/API/evidence refresh. The Task 1 path/DAG policy stays byte-identical; a
+required ownership or DAG change must occur before a new standard freeze and forces a fresh paired
+run.
+
+After that exact eight-path truth commit is pushed, run the evidence-reuse and exact-head gate:
+
+```bash
+set -euo pipefail
+FINAL_HEAD="$(git rev-parse HEAD)"
+test -z "$(git status --short)"
+BASELINE_LOCK=docs/reports/performance/2026-07-17-q2-a4-standard-channel-baseline.lock.json
+BASELINE_REPORT=docs/reports/performance/2026-07-17-q2-a4-standard-channel-baseline.md
+FINAL_LOCK=docs/reports/2026-07-17-q2-a4-evidence-lock.json
+STANDARD_HEAD="$(jq -er '.baseline_head' "$BASELINE_LOCK")"
+COMMON_GIT_DIR="$(git rev-parse --path-format=absolute --git-common-dir)"
+REPO_ROOT="$(dirname "$COMMON_GIT_DIR")"
+EVIDENCE_ROOT="$REPO_ROOT/target/q2-a4-capture-benchmark"
+STANDARD_DIR="$EVIDENCE_ROOT/standard-$STANDARD_HEAD"
+STANDARD_MANIFEST="$STANDARD_DIR/manifest.json"
+MEASURED_CANDIDATE_HEAD="$(jq -er '.measured_code_head' "$FINAL_LOCK")"
+CANDIDATE_DIR="$EVIDENCE_ROOT/candidate-$MEASURED_CANDIDATE_HEAD"
+CANDIDATE_MANIFEST="$CANDIDATE_DIR/manifest.json"
+git merge-base --is-ancestor "$STANDARD_HEAD" "$MEASURED_CANDIDATE_HEAD"
+git merge-base --is-ancestor "$MEASURED_CANDIDATE_HEAD" "$FINAL_HEAD"
+test "$(git diff --name-only "$MEASURED_CANDIDATE_HEAD..$FINAL_HEAD")" = \
+  $'docs/architecture/current-state.md\ndocs/architecture/target-state.md\ndocs/plans/gap-analysis.md\ndocs/plans/implementation-plan.md\ndocs/project-memory.md\ndocs/reports/2026-07-17-q2-a4-evidence-lock.json\ndocs/reports/2026-07-17-q2-a4-verification.md\ndocs/verification/usable-release-baseline.md'
+(cd "$STANDARD_DIR" && shasum -a 256 -c SHA256SUMS)
+(cd "$CANDIDATE_DIR" && shasum -a 256 -c SHA256SUMS)
+STANDARD_MANIFEST_SHA="$(shasum -a 256 "$STANDARD_MANIFEST" | awk '{print $1}')"
+CANDIDATE_MANIFEST_SHA="$(shasum -a 256 "$CANDIDATE_MANIFEST" | awk '{print $1}')"
+STANDARD_SUMS_SHA="$(shasum -a 256 "$STANDARD_DIR/SHA256SUMS" | awk '{print $1}')"
+CANDIDATE_SUMS_SHA="$(shasum -a 256 "$CANDIDATE_DIR/SHA256SUMS" | awk '{print $1}')"
+BASELINE_LOCK_SHA="$(shasum -a 256 "$BASELINE_LOCK" | awk '{print $1}')"
+BASELINE_REPORT_SHA="$(shasum -a 256 "$BASELINE_REPORT" | awk '{print $1}')"
+jq -e -s \
+  --arg standard_head "$STANDARD_HEAD" \
+  --arg standard_manifest "$STANDARD_MANIFEST_SHA" \
+  --arg candidate_manifest "$CANDIDATE_MANIFEST_SHA" \
+  --arg standard_sums "$STANDARD_SUMS_SHA" \
+  --arg candidate_sums "$CANDIDATE_SUMS_SHA" \
+  --arg baseline_lock "$BASELINE_LOCK_SHA" \
+  --arg baseline_report "$BASELINE_REPORT_SHA" \
+  '.[2].schema_version == 1 and
+   (.[2] | keys | sort) == ["candidate_backend_sha256", "candidate_checksums_sha256",
+     "candidate_host_gate", "candidate_manifest_sha256", "entrypoint_sha256",
+     "executable_sha256", "immutable_module_sha256", "measured_code_head", "schema_version",
+     "standard_backend_sha256", "standard_checksums_sha256", "standard_host_gate",
+     "standard_manifest_sha256"] and
+   .[2].measured_code_head == .[0].measured_code_head and
+   .[2].standard_manifest_sha256 == $standard_manifest and
+   .[2].candidate_manifest_sha256 == $candidate_manifest and
+   .[2].standard_checksums_sha256 == $standard_sums and
+   .[2].candidate_checksums_sha256 == $candidate_sums and
+   .[2].immutable_module_sha256 == .[0].immutable_module_sha256 and
+   .[2].immutable_module_sha256 == .[1].immutable_module_sha256 and
+   .[2].entrypoint_sha256 == .[0].entrypoint_sha256 and
+   .[2].entrypoint_sha256 == .[1].entrypoint_sha256 and
+   .[2].executable_sha256 == .[0].executable_sha256 and
+   .[2].standard_backend_sha256 == .[1].backend_sha256 and
+   .[2].candidate_backend_sha256 == .[0].backend_sha256 and
+   .[2].standard_backend_sha256 != .[2].candidate_backend_sha256 and
+   .[2].standard_host_gate == .[1].host_gate and
+   .[2].candidate_host_gate == .[0].host_gate and
+   .[1].measured_code_head == $standard_head and
+   .[1].backend == "standard" and
+   .[1].baseline_manifest_sha256 == null and .[1].baseline_lock_sha256 == null and
+   .[0].baseline_manifest_sha256 == $standard_manifest and
+   .[0].baseline_lock_sha256 == $baseline_lock and
+   .[0].criterion_sha256 == .[1].criterion_sha256 and
+   .[0].observer_sha256 == .[1].observer_sha256 and
+   .[0].tool_sha256 == .[1].tool_sha256 and
+   .[0].production_library_sha256 == .[1].production_library_sha256 and
+   .[0].host_fingerprint_sha256 == .[1].host_fingerprint_sha256 and
+   .[0].toolchain_fingerprint_sha256 == .[1].toolchain_fingerprint_sha256 and
+   .[0].release_profile_sha256 == .[1].release_profile_sha256 and
+   (.[3] | keys | sort) == ["approval_identity", "approval_state", "artifact_sha256",
+     "backend", "backend_sha256", "baseline_head", "build_evidence_sha256",
+     "criterion_sha256", "entrypoint_sha256", "host_fingerprint_sha256",
+     "immutable_module_sha256", "manifest_reference", "manifest_sha256", "observer_sha256",
+     "queue_private_storage_accounting", "queue_transport", "release_profile_sha256",
+     "repetition_sha256", "report_reference", "report_sha256", "schema_version", "state",
+     "tool_sha256", "toolchain_fingerprint_sha256"] and
+   .[3].schema_version == 5 and .[3].state == "frozen_standard_baseline" and
+   .[3].approval_state == "independent_seed_review_approved" and
+   .[3].approval_identity == "q2-a4-seed-checkpoint-review" and
+   .[3].baseline_head == $standard_head and
+   .[3].backend == .[1].backend and
+   .[3].queue_transport == .[1].queue_transport and
+   .[3].queue_private_storage_accounting == .[1].queue_private_storage_accounting and
+   .[3].manifest_sha256 == $standard_manifest and
+   .[3].manifest_reference ==
+     ("target/q2-a4-capture-benchmark/standard-" + $standard_head + "/manifest.json") and
+   .[3].report_reference ==
+     "docs/reports/performance/2026-07-17-q2-a4-standard-channel-baseline.md" and
+   .[3].report_sha256 == $baseline_report and
+   .[3].immutable_module_sha256 == .[1].immutable_module_sha256 and
+   .[3].entrypoint_sha256 == .[1].entrypoint_sha256 and
+   .[3].criterion_sha256 == .[1].criterion_sha256 and
+   .[3].observer_sha256 == .[1].observer_sha256 and
+   .[3].tool_sha256 == .[1].tool_sha256 and
+   .[3].artifact_sha256 == .[1].artifact_sha256 and
+   .[3].repetition_sha256 == .[1].repetition_sha256 and
+   .[3].backend_sha256 == .[1].backend_sha256 and
+   .[3].build_evidence_sha256 == .[1].build_evidence_sha256 and
+   .[3].host_fingerprint_sha256 == .[1].host_fingerprint_sha256 and
+   .[3].toolchain_fingerprint_sha256 == .[1].toolchain_fingerprint_sha256 and
+   .[3].release_profile_sha256 == .[1].release_profile_sha256' \
+  "$CANDIDATE_MANIFEST" "$STANDARD_MANIFEST" "$FINAL_LOCK" "$BASELINE_LOCK"
+RELATIVE_EXE="$(jq -er '.executable_path' "$CANDIDATE_MANIFEST")"
+case "$RELATIVE_EXE" in ./*) ;; *) exit 1 ;; esac
+CANDIDATE_EXE="$CANDIDATE_DIR/${RELATIVE_EXE#./}"
+test -x "$CANDIDATE_EXE"
+test "$(shasum -a 256 "$CANDIDATE_EXE" | awk '{print $1}')" = \
+  "$(jq -er '.executable_sha256' "$FINAL_LOCK")"
+./scripts/verify.sh
+./scripts/check_capture_queue_loom.sh
+cargo deny check
+cargo audit --deny warnings
+gitleaks dir --no-banner --redact --config .gitleaks.toml .
+gitleaks git --no-banner --redact --config .gitleaks.toml .
+test "$(git rev-parse HEAD)" = "$FINAL_HEAD"
+test "$(git rev-parse '@{upstream}')" = "$FINAL_HEAD"
+test -z "$(git status --short)"
+```
+
+The complete exact-head gate runs again. The independent prerequisite reviewer verifies the
+standard/candidate threshold result, all immutable equality/difference constraints, both checksum
+inventories, the final lock, truthful coverage, and the unchanged clean pushed head. Findings force
+remediation and a fresh paired run when code, harness, fixture, tool, profile, or governed environment
+changed. Only that independently approved exact head unlocks Task 2 dispatch and Wave 1 integration;
+the approval is not another quarter checkpoint.
+
+---
+
 ## Release capability truth
 
 | Vertical | Producer | Required terminal consumer | Closing task |

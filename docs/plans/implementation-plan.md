@@ -22,9 +22,9 @@ locators only.
   as a completed product vertical.
 - README capability state and release evidence are updated by the integration owner after the
   corresponding producer-to-consumer vertical and its verification are committed.
-- The current Q2 live/capture closure remains an isolated prerequisite. The canonical plan's Task 0
-  refreshes its exact approved SHA, tree, APIs, evidence, and truth documents before subsequent
-  implementation Waves begin.
+- The historical Q2/A4 live/capture closure is a one-time prerequisite gate, not an active delivery
+  quarter. The canonical plan defines its current executable procedure and requires an exact
+  approved SHA, tree, API, evidence, and truth refresh before Stage 1 integration.
 
 ## Historical plan disposition
 
