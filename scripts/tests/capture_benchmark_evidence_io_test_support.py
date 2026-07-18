@@ -14,20 +14,20 @@ REPOSITORY = Path(__file__).resolve().parents[2]
 GATE = REPOSITORY / "scripts" / "capture_benchmark_host_gate.sh"
 SECRET = "MSQ_HOST_GATE_SECRET_DO_NOT_PERSIST"
 PROFILE = (
-    "cargo-bench-inherits-release:opt-level=3:lto=thin:codegen-units=1:"
+    "cargo-release-binary:opt-level=3:lto=thin:codegen-units=1:"
     "panic=abort:strip=symbols"
 )
-RUNNER_SCHEMA_VERSION = 4
+RUNNER_SCHEMA_VERSION = 5
 BUILD_COMMAND = [
     "cargo",
-    "bench",
+    "build",
     "-p",
     "market-squawk-platform",
-    "--bench",
-    "capture_admission_evidence",
+    "--bin",
+    "capture-admission-evidence",
     "--all-features",
+    "--release",
     "--locked",
-    "--no-run",
     "--message-format=json-render-diagnostics",
 ]
 RUNNER_BINDING_FIELDS = {
@@ -156,13 +156,13 @@ def benchmark_artifacts(
         "evidence_backend": backend,
         "queue_transport": "candidate_fixed_ring" if candidate else "standard_sync_channel",
         "queue_private_storage_accounting": "exact" if candidate else "not_measured",
-        "cargo_target": "capture_admission_evidence",
+        "cargo_target": "capture-admission-evidence",
         "benchmark_feature": "capture-benchmark",
         "build_profile": PROFILE,
         "measured_code_head": ("2" if candidate else "1") * 40,
         "clean_build_enforced": True,
         "build_command": BUILD_COMMAND,
-        "build_environment_policy": "sanitized-cargo-bench-v2",
+        "build_environment_policy": "sanitized-cargo-release-runner-v3",
         "build_command_sha256": digest,
         "build_environment_sha256": digest,
         "cargo_executable_sha256": digest,

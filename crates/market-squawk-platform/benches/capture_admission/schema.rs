@@ -11,7 +11,7 @@ use super::fixture::{
 };
 use std::collections::BTreeMap;
 
-pub(crate) const RESULT_SCHEMA_VERSION: u32 = 4;
+pub(crate) const RESULT_SCHEMA_VERSION: u32 = 5;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -686,10 +686,10 @@ impl BuildEvidence {
             || self.queue_transport != super::backend::QUEUE_TRANSPORT
             || self.queue_private_storage_accounting
                 != super::backend::QUEUE_PRIVATE_STORAGE_ACCOUNTING
-            || self.cargo_target != super::benchmark_identity::EVIDENCE_TARGET
+            || self.cargo_target != super::benchmark_identity::EVIDENCE_CARGO_TARGET
             || self.benchmark_feature != "capture-benchmark"
             || self.build_profile
-                != "cargo-bench-inherits-release:opt-level=3:lto=thin:codegen-units=1:panic=abort:strip=symbols"
+                != "cargo-release-binary:opt-level=3:lto=thin:codegen-units=1:panic=abort:strip=symbols"
             || self.measured_code_head != super::build_bindings::BUILD_GIT_HEAD
             || !is_git_sha(&self.measured_code_head)
             || !self.clean_build_enforced
@@ -697,18 +697,18 @@ impl BuildEvidence {
             || self.build_command
                 != [
                     "cargo",
-                    "bench",
+                    "build",
                     "-p",
                     "market-squawk-platform",
-                    "--bench",
-                    "capture_admission_evidence",
+                    "--bin",
+                    "capture-admission-evidence",
                     "--all-features",
+                    "--release",
                     "--locked",
-                    "--no-run",
                     "--message-format=json-render-diagnostics",
                 ]
             || self.build_environment_policy != super::build_bindings::BUILD_ENVIRONMENT_POLICY
-            || self.build_environment_policy != "sanitized-cargo-bench-v2"
+            || self.build_environment_policy != "sanitized-cargo-release-runner-v3"
             || self.build_command_sha256 != super::build_bindings::BUILD_COMMAND_SHA256
             || self.build_environment_sha256 != super::build_bindings::BUILD_ENVIRONMENT_SHA256
             || self.cargo_executable_sha256 != super::build_bindings::CARGO_EXECUTABLE_SHA256
@@ -1141,7 +1141,6 @@ pub(crate) struct BaselineLock {
     pub(crate) release_profile_sha256: String,
 }
 
-#[cfg(test)]
 pub(crate) fn self_check_candidate_baseline_contracts() -> Result<(), String> {
     let digest = "1".repeat(64);
     let baseline_head = "2".repeat(40);

@@ -24,6 +24,7 @@ from scripts.capture_benchmark_prepare_build_evidence import (
     MAX_CARGO_STDERR_BYTES,
     PROFILE,
     RESULT_SCHEMA_VERSION,
+    RUNNER,
     TARGET,
     GateError,
     artifact_hash,
@@ -56,11 +57,33 @@ def host_tool_bindings() -> tuple[Path, str, Path, str, Path, str]:
     return cargo, cargo_sha256, git, git_sha256, rustc, rustc_sha256
 
 
-def cargo_message(executable: Path) -> dict:
+def cargo_message(executable: Path, repository: Path = REPOSITORY) -> dict:
     return {
         "reason": "compiler-artifact",
-        "target": {"name": TARGET, "kind": ["bench"]},
-        "profile": {"opt_level": "3", "debug_assertions": False},
+        "manifest_path": str(
+            repository / "crates/market-squawk-platform/Cargo.toml"
+        ),
+        "target": {
+            "kind": ["bin"],
+            "crate_types": ["bin"],
+            "name": TARGET,
+            "src_path": str(
+                repository
+                / "crates/market-squawk-platform/benches/capture_admission.rs"
+            ),
+            "edition": "2024",
+            "required-features": [FEATURE],
+            "doc": False,
+            "doctest": False,
+            "test": False,
+        },
+        "profile": {
+            "opt_level": "3",
+            "debuginfo": 0,
+            "debug_assertions": False,
+            "overflow_checks": False,
+            "test": False,
+        },
         "features": list(EXPECTED_CARGO_FEATURES),
         "executable": str(executable),
     }
@@ -69,7 +92,7 @@ def cargo_message(executable: Path) -> dict:
 def binding_value() -> dict:
     return {
         "schema_version": RESULT_SCHEMA_VERSION,
-        "runner": TARGET,
+        "runner": RUNNER,
         "evidence_mode": EVIDENCE_MODE,
         "evidence_backend": "standard",
         "queue_transport": "standard_sync_channel",
@@ -142,7 +165,7 @@ def baseline_fixture(current_head: str = "f" * 40) -> tuple[bytes, bytes, dict, 
     }
     manifest = {
         "schema_version": RESULT_SCHEMA_VERSION,
-        "runner": TARGET,
+        "runner": RUNNER,
         "evidence_mode": EVIDENCE_MODE,
         "criterion_evidence_mode": "exploratory_zero_authority",
         "measured_code_head": "a" * 40,
@@ -506,6 +529,14 @@ class BuildEvidenceTest(unittest.TestCase):
             {field: emitted_bindings[field] for field in backend},
             backend,
         )
+        self_check = bounded_process(
+            [str(executable)],
+            env={},
+            timeout_seconds=10,
+            maximum_stdout=0,
+            maximum_stderr=0,
+        )
+        self.assertEqual(self_check.returncode, 0)
 
     def test_cargo_parser_rejects_duplicate_target_artifacts(self) -> None:
         executable = REPOSITORY / "target" / "fixture-executable"
@@ -573,7 +604,7 @@ class BuildEvidenceTest(unittest.TestCase):
                 + "'\n"
             )
             os.chmod(script, 0o700)
-            self.assertEqual(runner_bindings(script)["runner"], TARGET)
+            self.assertEqual(runner_bindings(script)["runner"], RUNNER)
 
     def test_runner_binding_extra_key_is_rejected(self) -> None:
         value = binding_value()
@@ -1173,7 +1204,9 @@ class BuildEvidenceTest(unittest.TestCase):
             + "'\n"
         )
         os.chmod(artifact, 0o700)
-        message = json.dumps(cargo_message(artifact), separators=(",", ":"))
+        message = json.dumps(
+            cargo_message(artifact, repository), separators=(",", ":")
+        )
         (repository / "target/fixture-cargo-message").write_text(message + "\n")
         self.assertEqual(
             build_environment["CAPTURE_BENCH_BUILD_COMMAND_SHA256"], command_digest

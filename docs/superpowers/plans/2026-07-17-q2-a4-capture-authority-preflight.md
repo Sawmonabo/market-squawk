@@ -166,13 +166,31 @@ not claim byte-reproducible build or supply-chain attestation. Existing bounded 
 and no-clobber tests remain useful diagnostic hardening; they must not be described as proving that
 broader threat model. Unfinished hermetic snapshot/provenance work is excluded from the candidate.
 
-Authoritative tool references used by the seed are Cargo's profile inheritance rules—where the
-built-in `bench` profile inherits `release`—at
-<https://doc.rust-lang.org/cargo/reference/profiles.html>, and Clippy's feature-name guidance at
-<https://rust-lang.github.io/rust-clippy/master/#redundant_feature_names>. The production support
-feature is therefore named `capture-benchmark`, and evidence labels the active profile as Cargo
-bench inheriting the exact bound release profile rather than pretending `cargo bench` selected a
-different profile.
+The authoritative runner is an explicit `[[bin]]` Cargo target named
+`capture-admission-evidence`; the logical runner/evidence-copy name remains
+`capture_admission_evidence`. Stable Cargo ignores the profile `panic` setting for benchmark
+targets, including a `[[bench]]` with `harness = false`, so the former benchmark target compiled
+with `panic="unwind"` and could not truthfully bind the release profile's `panic="abort"`. Build the
+authoritative runner only with:
+
+```bash
+cargo build -p market-squawk-platform --bin capture-admission-evidence \
+  --all-features --release --locked
+```
+
+Evidence schema 5 uses build-environment policy `sanitized-cargo-release-runner-v3` and binds the
+profile literal
+`cargo-release-binary:opt-level=3:lto=thin:codegen-units=1:panic=abort:strip=symbols`. The target's
+`cfg(panic = "abort")` assertion is the final compile-time authority. The separate
+`capture_admission_criterion` target remains adaptive engineering instrumentation labeled
+`exploratory_zero_authority`; it cannot create, schedule, or approve fixed-quota evidence. See
+[Cargo's panic profile rules](https://doc.rust-lang.org/cargo/reference/profiles.html#panic),
+[Rust `cfg(panic)`](https://doc.rust-lang.org/reference/conditional-compilation.html#panic),
+[Rust's panic-strategy reference](https://doc.rust-lang.org/reference/panic.html#panic-strategy),
+[Cargo artifact messages](https://doc.rust-lang.org/cargo/reference/external-tools.html#artifact-messages),
+and [`cargo build`](https://doc.rust-lang.org/cargo/commands/cargo-build.html). The production
+support feature remains `capture-benchmark`, consistent with
+<https://rust-lang.github.io/rust-clippy/master/#redundant_feature_names>.
 
 ## Global constraints
 
@@ -1677,8 +1695,9 @@ not measure either backend before the future clean `A4_STANDARD_REFERENCE_HEAD` 
   Expected RED: Criterion and the harness are absent. Preserve the already reviewed workspace
   `trybuild = "1.0"` lock resolution and exact `loom = "=0.7.2"`; add
   `criterion = "=0.8.2"`, the domain `trybuild` dev-dependency, and platform Criterion plus
-  target-`cfg(loom)` dev-dependencies. Do not register the benchmark target or run `--benches` until
-  Step 3 creates its source. Do not run any `--locked` build until the lockfile is updated.
+  target-`cfg(loom)` dev-dependencies. Do not register the release-runner or Criterion target or run
+  `--benches` until Step 3 creates their source. Do not run any `--locked` build until the lockfile
+  is updated.
 
   Create `scripts/assert_expected_red.sh` and deterministic shell fixtures/tests in
   `scripts/tests/expected-red/`. Its closed CLI is `LOG EXACT_SENTINEL ALLOWED_RUST_ERROR_REGEX
@@ -1724,9 +1743,10 @@ not measure either backend before the future clean `A4_STANDARD_REFERENCE_HEAD` 
 
   Dependency/lock changes remain in the grouped seed worktree while Steps 1 through 3 install every
   queue-independent retained contract, payload representation, frame/bundle implementation,
-  mechanical module split, and the final shared benchmark collector/endpoints. Do not register a
-  bench target before its source exists. Do not create an intermediate dependency-only or
-  trait-only commit. The first seed commit is the complete, full-workspace-green
+  mechanical module split, and the final shared benchmark collector/endpoints. Do not register the
+  release-runner or Criterion target before their shared source exists. Do not create an
+  intermediate dependency-only or trait-only commit. The first seed commit is the complete,
+  full-workspace-green
   `A4_BASELINE_CODE_HEAD` defined after Step 3; it still uses the standard channel.
 
 - [ ] **Step 1: RED the complete domain payload and ownership-preserving trait surface**
@@ -1854,10 +1874,12 @@ not measure either backend before the future clean `A4_STANDARD_REFERENCE_HEAD` 
   run. The exact file hashes freeze later at the reviewed `A4_STANDARD_REFERENCE_HEAD` barrier.
 
   Complete the behavior-preserving `capture.rs`/`capture/admission.rs` split without changing the
-  standard channel. Register two deliberately separate targets. `capture_admission_evidence` is the
-  authoritative fixed-quota executable and is the only target allowed to emit baseline/candidate
-  evidence. `capture_admission_criterion` is a genuine adaptive Criterion engineering target over
-  the same five closed production-operation seams, but is permanently labeled
+  standard channel. Register two deliberately separate targets. The Cargo `[[bin]]` target
+  `capture-admission-evidence`, whose logical runner and evidence-copy name is
+  `capture_admission_evidence`, is the authoritative fixed-quota executable and the only target
+  allowed to emit baseline/candidate evidence. `capture_admission_criterion` is a genuine adaptive
+  Criterion engineering target over the same five closed production-operation seams, but is
+  permanently labeled
   `exploratory_zero_authority` and can never establish or compare an evidence baseline. Partition
   the authoritative target into immutable `benchmark_identity`, `collector`, `endpoints`,
   `evidence_io`, `fixture`, `producer_inventory`, `schema`, and `workload` modules plus one
@@ -1985,8 +2007,10 @@ not measure either backend before the future clean `A4_STANDARD_REFERENCE_HEAD` 
   cargo test --workspace --all-targets --all-features --locked
   cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
   cargo build --workspace --all-features --locked
+  cargo build -p market-squawk-platform \
+    --bin capture-admission-evidence \
+    --all-features --release --locked
   cargo bench -p market-squawk-platform \
-    --bench capture_admission_evidence \
     --bench capture_admission_criterion \
     --all-features --locked --no-run
   python3 -m unittest \
@@ -2011,8 +2035,10 @@ not measure either backend before the future clean `A4_STANDARD_REFERENCE_HEAD` 
   rg -n 'std::sync::mpsc::sync_channel|mpsc::sync_channel' \
     crates/market-squawk-platform/src/capture.rs
   ./scripts/verify.sh
+  cargo build -p market-squawk-platform \
+    --bin capture-admission-evidence \
+    --all-features --release --locked
   cargo bench -p market-squawk-platform \
-    --bench capture_admission_evidence \
     --bench capture_admission_criterion \
     --all-features --locked --no-run
   test "$(git rev-parse HEAD)" = "$A4_BASELINE_CODE_HEAD"
@@ -2053,6 +2079,13 @@ not measure either backend before the future clean `A4_STANDARD_REFERENCE_HEAD` 
   test -s "$RUN_DIR/capture-bench-build.json"
   test -x "$RUN_DIR/capture_admission_evidence-exe"
   test -s "$RUN_DIR/build-evidence.json"
+  jq -e '.schema_version == 5 and
+    .runner == "capture_admission_evidence" and
+    .cargo_target == "capture-admission-evidence" and
+    .build_profile ==
+      "cargo-release-binary:opt-level=3:lto=thin:codegen-units=1:panic=abort:strip=symbols" and
+    .build_environment_policy == "sanitized-cargo-release-runner-v3"' \
+    "$RUN_DIR/build-evidence.json"
 
   # Pause every other agent and competing build/benchmark process before this attestation.
   printf '%s\n' no-other-active-agents > "$RUN_DIR/active-agent-attestation.txt"
@@ -2085,8 +2118,8 @@ not measure either backend before the future clean `A4_STANDARD_REFERENCE_HEAD` 
     (.repetition_sha256 | keys | sort) ==
       ["repetition-1.json", "repetition-2.json", "repetition-3.json",
        "repetition-4.json", "repetition-5.json"] and
-    .schema_version == 4 and
-    .build_environment_policy == "sanitized-cargo-bench-v2" and
+    .schema_version == 5 and
+    .build_environment_policy == "sanitized-cargo-release-runner-v3" and
     (.build_command_sha256 | length == 64) and
     (.build_environment_sha256 | length == 64) and
     (.cargo_executable_sha256 | length == 64) and
@@ -2463,7 +2496,10 @@ not measure either backend before the future clean `A4_STANDARD_REFERENCE_HEAD` 
     --all-targets --all-features --locked -- -D warnings
   cargo build -p market-squawk-domain -p market-squawk-sources \
     -p market-squawk-platform -p market-squawk --all-features --release --locked
-  cargo bench -p market-squawk-platform --bench capture_admission --locked --no-run
+  cargo build -p market-squawk-platform --bin capture-admission-evidence \
+    --all-features --release --locked
+  cargo bench -p market-squawk-platform --bench capture_admission_criterion \
+    --all-features --locked --no-run
   ./scripts/check_capture_queue_loom.sh
   ./scripts/tests/test_assert_expected_red.sh
   rg -F './scripts/tests/test_assert_expected_red.sh' scripts/verify.sh
@@ -2492,7 +2528,10 @@ not measure either backend before the future clean `A4_STANDARD_REFERENCE_HEAD` 
     scripts/capture_benchmark_host_gate.sh scripts/classify_hosted_run.sh \
     scripts/check_capture_queue_loom.sh scripts/verify.sh
   ./scripts/check_capture_queue_loom.sh
-  cargo bench -p market-squawk-platform --bench capture_admission --locked --no-run
+  cargo build -p market-squawk-platform --bin capture-admission-evidence \
+    --all-features --release --locked
+  cargo bench -p market-squawk-platform --bench capture_admission_criterion \
+    --all-features --locked --no-run
   test "$(git rev-parse HEAD)" = "$A4_SEED_HEAD"
   EMPTY_OUTPUT="$(git status --short)"
   test -z "$EMPTY_OUTPUT"
@@ -3082,60 +3121,30 @@ not measure either backend before the future clean `A4_STANDARD_REFERENCE_HEAD` 
   depth 16,384, and the labeled representative fan-in—requires at least 100,000
   successful capture admissions/second, warmed capture-admission p99 strictly below 1 ms, nonzero
   successes/samples, zero refusals, zero accounting invariant failures, and record reservation zero
-  in the accepted post-drain snapshot. Criterion may schedule the frozen fixed-operation cases, but
-  project p50/p95/p99/maximum come from the bounded project collector.
+  in the accepted post-drain snapshot. Criterion may exercise the same production seams adaptively,
+  but it cannot schedule or establish an authoritative fixed-quota run. Project
+  p50/p95/p99/maximum come only from the bounded project collector in the release runner.
 
   One externally selected `CAPTURE_BENCH_REPETITION` executes exactly the backend's declared fixture
-  set once. When the selector is absent the harness may orchestrate exactly five repetitions once;
-  an outer loop and internal five-run mode must never be combined. Run one selector-driven dirty-tree
-  repetition here only as non-evidence design validation, writing it to a distinct ignored
-  `exploratory/` directory:
+  set once. The production host gate owns the complete five-repetition sequence. The fixed-quota
+  runner requires a clean commit and preparer-issued build evidence, so it must not be invoked from
+  this dirty worktree. Use only the separate Criterion target here for adaptive, zero-authority
+  design feedback. The first candidate fixed-quota run remains Step 7 at the clean committed MEM
+  head:
 
   ```bash
   set -euo pipefail
   cargo fmt --all --check
-  COMMON_GIT_DIR="$(git rev-parse --path-format=absolute --git-common-dir)"
-  REPO_ROOT="$(dirname "$COMMON_GIT_DIR")"
-  BASELINE_MANIFEST="$REPO_ROOT/target/q2-a4-capture-benchmark/standard/manifest.json"
-  test -s "$BASELINE_MANIFEST"
-  rm -rf target/q2-a4-capture-benchmark/exploratory
-  mkdir -p target/q2-a4-capture-benchmark/exploratory
-  cargo bench -p market-squawk-platform --bench capture_admission --locked --no-run \
-    --message-format=json > target/q2-a4-capture-bench-build.json
-  BENCH_EXE="$(sed -n 's/.*"executable":"\([^"]*capture_admission[^"]*\)".*/\1/p' \
-    target/q2-a4-capture-bench-build.json | tail -n 1)"
-  test -n "$BENCH_EXE"
-  test -x "$BENCH_EXE"
-  set -o pipefail
-  case "$(uname -s)" in
-    Darwin)
-      { /usr/bin/time -l env CAPTURE_BENCH_BACKEND=candidate \
-          CAPTURE_BENCH_REPETITION=1 \
-          CAPTURE_BENCH_BASELINE_MANIFEST="$BASELINE_MANIFEST" \
-          CAPTURE_BENCH_EXPECTED_FIXTURES=matrix,comparable_full,forced_lock,sustained_rss \
-          CAPTURE_BENCH_OUTPUT=target/q2-a4-capture-benchmark/exploratory \
-          "$BENCH_EXE" --bench; } 2>&1 | tee \
-        target/q2-a4-capture-benchmark/exploratory/repetition-1.log
-      ;;
-    Linux)
-      { /usr/bin/time -v env CAPTURE_BENCH_BACKEND=candidate \
-          CAPTURE_BENCH_REPETITION=1 \
-          CAPTURE_BENCH_BASELINE_MANIFEST="$BASELINE_MANIFEST" \
-          CAPTURE_BENCH_EXPECTED_FIXTURES=matrix,comparable_full,forced_lock,sustained_rss \
-          CAPTURE_BENCH_OUTPUT=target/q2-a4-capture-benchmark/exploratory \
-          "$BENCH_EXE" --bench; } 2>&1 | tee \
-        target/q2-a4-capture-benchmark/exploratory/repetition-1.log
-      ;;
-    *)
-      exit 1
-      ;;
-  esac
+  CAPTURE_BENCH_DEVELOPMENT_BACKEND=candidate \
+    cargo bench -p market-squawk-platform \
+      --bench capture_admission_criterion \
+      --all-features --locked
   ```
 
-  Preserve but do not commit raw exploratory output. If the safe fixed ring misses a validity or
-  acceptance criterion, reject MEM before integration and return to a documented bounded-queue
-  design review; do not waive the result, tune away failures, or silently swap in an unaccounted
-  implementation.
+  Criterion output is ignored engineering feedback and must not be committed or cited as acceptance
+  evidence. If the clean-head fixed-quota gate in Step 7 misses a validity or acceptance criterion,
+  reject MEM before integration and return to a documented bounded-queue design review; do not waive
+  the result, tune away failures, or silently swap in an unaccounted implementation.
 
 - [ ] **Step 6: Run dirty MEM gates, review, and commit**
 
@@ -3148,7 +3157,10 @@ not measure either backend before the future clean `A4_STANDARD_REFERENCE_HEAD` 
     --all-targets --all-features --locked -- -D warnings
   cargo build -p market-squawk-platform -p market-squawk --all-features --release --locked
   ./scripts/check_capture_queue_loom.sh
-  cargo bench -p market-squawk-platform --bench capture_admission --locked --no-run
+  cargo build -p market-squawk-platform --bin capture-admission-evidence \
+    --all-features --release --locked
+  cargo bench -p market-squawk-platform --bench capture_admission_criterion \
+    --all-features --locked --no-run
   git diff --check
   git diff --cached --check
   git status --short
@@ -3190,61 +3202,36 @@ not measure either backend before the future clean `A4_STANDARD_REFERENCE_HEAD` 
   trap 'rm -f "$EVIDENCE_ROOT/.exclusive-lock/owner.json"; rmdir "$EVIDENCE_ROOT/.exclusive-lock"' EXIT
   rm -rf "$RUN_DIR"
   mkdir -p "$RUN_DIR"
+  scripts/capture_benchmark_prepare_build_evidence.py \
+    --run-dir "$RUN_DIR" \
+    --benchmark-backend candidate \
+    --baseline-manifest "$BASELINE_MANIFEST"
+  test -s "$RUN_DIR/capture-bench-build.json"
+  test -x "$RUN_DIR/capture_admission_evidence-exe"
+  test -s "$RUN_DIR/build-evidence.json"
+  test -s "$RUN_DIR/baseline-manifest.json"
+  test -s "$RUN_DIR/baseline-lock.json"
   printf '%s\n' no-other-active-agents > "$RUN_DIR/active-agent-attestation.txt"
-  scripts/capture_benchmark_host_gate.sh preflight \
+  chmod 600 "$RUN_DIR/active-agent-attestation.txt"
+  scripts/capture_benchmark_host_gate.sh measure \
     --lock-dir "$EVIDENCE_ROOT/.exclusive-lock" \
     --active-agent-attestation "$RUN_DIR/active-agent-attestation.txt" \
-    --output-dir "$HOST_EVIDENCE_DIR"
-  cargo bench -p market-squawk-platform --bench capture_admission --locked --no-run \
-    --message-format=json > target/q2-a4-capture-bench-build.json
-  BENCH_EXE="$(sed -n 's/.*"executable":"\([^"]*capture_admission[^"]*\)".*/\1/p' \
-    target/q2-a4-capture-bench-build.json | tail -n 1)"
-  test -n "$BENCH_EXE"
-  test -x "$BENCH_EXE"
-  cp "$BENCH_EXE" "$RUN_DIR/capture_admission-exe"
-  BENCH_EXE="$RUN_DIR/capture_admission-exe"
-  test -x "$BENCH_EXE"
-  set -o pipefail
-  for REPETITION in 1 2 3 4 5; do
-    case "$(uname -s)" in
-      Darwin)
-        { /usr/bin/time -l env CAPTURE_BENCH_BACKEND=candidate \
-            CAPTURE_BENCH_REPETITION="$REPETITION" \
-            CAPTURE_BENCH_BASELINE_MANIFEST="$BASELINE_MANIFEST" \
-            CAPTURE_BENCH_EXPECTED_FIXTURES=matrix,comparable_full,forced_lock,sustained_rss \
-            CAPTURE_BENCH_OUTPUT="$RUN_DIR" \
-            "$BENCH_EXE" --bench; } 2>&1 | tee \
-          "$RUN_DIR/repetition-${REPETITION}.log"
-        ;;
-      Linux)
-        { /usr/bin/time -v env CAPTURE_BENCH_BACKEND=candidate \
-            CAPTURE_BENCH_REPETITION="$REPETITION" \
-            CAPTURE_BENCH_BASELINE_MANIFEST="$BASELINE_MANIFEST" \
-            CAPTURE_BENCH_EXPECTED_FIXTURES=matrix,comparable_full,forced_lock,sustained_rss \
-            CAPTURE_BENCH_OUTPUT="$RUN_DIR" \
-            "$BENCH_EXE" --bench; } 2>&1 | tee \
-          "$RUN_DIR/repetition-${REPETITION}.log"
-        ;;
-      *)
-        exit 1
-        ;;
-    esac
-  done
-  scripts/capture_benchmark_host_gate.sh postflight \
-    --lock-dir "$EVIDENCE_ROOT/.exclusive-lock" \
-    --active-agent-attestation "$RUN_DIR/active-agent-attestation.txt" \
-    --output-dir "$HOST_EVIDENCE_DIR"
+    --output-dir "$HOST_EVIDENCE_DIR" \
+    --runner "$RUN_DIR/capture_admission_evidence-exe" \
+    --build-evidence "$RUN_DIR/build-evidence.json"
   env CAPTURE_BENCH_BACKEND=candidate \
-    CAPTURE_BENCH_BASELINE_MANIFEST="$BASELINE_MANIFEST" \
+    CAPTURE_BENCH_BASELINE_MANIFEST="$RUN_DIR/baseline-manifest.json" \
+    CAPTURE_BENCH_BASELINE_LOCK="$RUN_DIR/baseline-lock.json" \
+    CAPTURE_BENCH_BUILD_EVIDENCE="$RUN_DIR/build-evidence.json" \
     CAPTURE_BENCH_FINALIZE_ONLY=1 \
     CAPTURE_BENCH_HOST_EVIDENCE="$HOST_EVIDENCE_DIR/comparison.json" \
     CAPTURE_BENCH_OUTPUT="$RUN_DIR" \
-    "$BENCH_EXE" --bench
+    "$RUN_DIR/capture_admission_evidence-exe" --bench
   test -s "$RUN_DIR/manifest.json"
   jq -e -s '.[0].backend == "candidate" and
     .[0].fixtures == ["matrix", "comparable_full", "forced_lock", "sustained_rss"] and
     .[0].repetitions == [1, 2, 3, 4, 5] and
-    .[0].executable_path == "./capture_admission-exe" and
+    .[0].executable_path == "./capture_admission_evidence-exe" and
     .[0].immutable_module_sha256 == .[1].immutable_module_sha256 and
     .[0].entrypoint_sha256 == .[1].entrypoint_sha256 and
     .[0].backend_sha256 != .[1].backend_sha256 and
@@ -3421,61 +3408,36 @@ not measure either backend before the future clean `A4_STANDARD_REFERENCE_HEAD` 
   trap 'rm -f "$EVIDENCE_ROOT/.exclusive-lock/owner.json"; rmdir "$EVIDENCE_ROOT/.exclusive-lock"' EXIT
   rm -rf "$RUN_DIR"
   mkdir -p "$RUN_DIR"
+  scripts/capture_benchmark_prepare_build_evidence.py \
+    --run-dir "$RUN_DIR" \
+    --benchmark-backend candidate \
+    --baseline-manifest "$BASELINE_MANIFEST"
+  test -s "$RUN_DIR/capture-bench-build.json"
+  test -x "$RUN_DIR/capture_admission_evidence-exe"
+  test -s "$RUN_DIR/build-evidence.json"
+  test -s "$RUN_DIR/baseline-manifest.json"
+  test -s "$RUN_DIR/baseline-lock.json"
   printf '%s\n' no-other-active-agents > "$RUN_DIR/active-agent-attestation.txt"
-  scripts/capture_benchmark_host_gate.sh preflight \
+  chmod 600 "$RUN_DIR/active-agent-attestation.txt"
+  scripts/capture_benchmark_host_gate.sh measure \
     --lock-dir "$EVIDENCE_ROOT/.exclusive-lock" \
     --active-agent-attestation "$RUN_DIR/active-agent-attestation.txt" \
-    --output-dir "$HOST_EVIDENCE_DIR"
-  cargo bench -p market-squawk-platform --bench capture_admission --locked --no-run \
-    --message-format=json > target/q2-a4-capture-bench-build.json
-  BENCH_EXE="$(sed -n 's/.*"executable":"\([^"]*capture_admission[^"]*\)".*/\1/p' \
-    target/q2-a4-capture-bench-build.json | tail -n 1)"
-  test -n "$BENCH_EXE"
-  test -x "$BENCH_EXE"
-  cp "$BENCH_EXE" "$RUN_DIR/capture_admission-exe"
-  BENCH_EXE="$RUN_DIR/capture_admission-exe"
-  test -x "$BENCH_EXE"
-  set -o pipefail
-  for REPETITION in 1 2 3 4 5; do
-    case "$(uname -s)" in
-      Darwin)
-        { /usr/bin/time -l env CAPTURE_BENCH_BACKEND=candidate \
-            CAPTURE_BENCH_REPETITION="$REPETITION" \
-            CAPTURE_BENCH_BASELINE_MANIFEST="$BASELINE_MANIFEST" \
-            CAPTURE_BENCH_EXPECTED_FIXTURES=matrix,comparable_full,forced_lock,sustained_rss \
-            CAPTURE_BENCH_OUTPUT="$RUN_DIR" \
-            "$BENCH_EXE" --bench; } 2>&1 | tee \
-          "$RUN_DIR/repetition-${REPETITION}.log"
-        ;;
-      Linux)
-        { /usr/bin/time -v env CAPTURE_BENCH_BACKEND=candidate \
-            CAPTURE_BENCH_REPETITION="$REPETITION" \
-            CAPTURE_BENCH_BASELINE_MANIFEST="$BASELINE_MANIFEST" \
-            CAPTURE_BENCH_EXPECTED_FIXTURES=matrix,comparable_full,forced_lock,sustained_rss \
-            CAPTURE_BENCH_OUTPUT="$RUN_DIR" \
-            "$BENCH_EXE" --bench; } 2>&1 | tee \
-          "$RUN_DIR/repetition-${REPETITION}.log"
-        ;;
-      *)
-        exit 1
-        ;;
-    esac
-  done
-  scripts/capture_benchmark_host_gate.sh postflight \
-    --lock-dir "$EVIDENCE_ROOT/.exclusive-lock" \
-    --active-agent-attestation "$RUN_DIR/active-agent-attestation.txt" \
-    --output-dir "$HOST_EVIDENCE_DIR"
+    --output-dir "$HOST_EVIDENCE_DIR" \
+    --runner "$RUN_DIR/capture_admission_evidence-exe" \
+    --build-evidence "$RUN_DIR/build-evidence.json"
   env CAPTURE_BENCH_BACKEND=candidate \
-    CAPTURE_BENCH_BASELINE_MANIFEST="$BASELINE_MANIFEST" \
+    CAPTURE_BENCH_BASELINE_MANIFEST="$RUN_DIR/baseline-manifest.json" \
+    CAPTURE_BENCH_BASELINE_LOCK="$RUN_DIR/baseline-lock.json" \
+    CAPTURE_BENCH_BUILD_EVIDENCE="$RUN_DIR/build-evidence.json" \
     CAPTURE_BENCH_FINALIZE_ONLY=1 \
     CAPTURE_BENCH_HOST_EVIDENCE="$HOST_EVIDENCE_DIR/comparison.json" \
     CAPTURE_BENCH_OUTPUT="$RUN_DIR" \
-    "$BENCH_EXE" --bench
+    "$RUN_DIR/capture_admission_evidence-exe" --bench
   test -s "$RUN_DIR/manifest.json"
   jq -e -s '.[0].backend == "candidate" and
     .[0].fixtures == ["matrix", "comparable_full", "forced_lock", "sustained_rss"] and
     .[0].repetitions == [1, 2, 3, 4, 5] and
-    .[0].executable_path == "./capture_admission-exe" and
+    .[0].executable_path == "./capture_admission_evidence-exe" and
     .[0].immutable_module_sha256 == .[1].immutable_module_sha256 and
     .[0].entrypoint_sha256 == .[1].entrypoint_sha256 and
     .[0].backend_sha256 != .[1].backend_sha256 and

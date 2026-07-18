@@ -14,15 +14,40 @@ an independent RSS observer, and paired standard-versus-ring runs under identica
 result produced under Rust 1.97.0 or the pre-change standard-channel run is eligible for approval.
 
 Cargo uses `RUSTC` to select the compiler and passes the resolved value to build scripts. Authority
-policy `sanitized-cargo-bench-v2` therefore rejects ambient `RUSTC`, resolves and descriptor-hashes
+policy `sanitized-cargo-release-runner-v3` therefore rejects ambient `RUSTC`, resolves and
+descriptor-hashes
 the direct rustup-owned compiler, requires Rust 1.97.1 commit
 `8bab26f4f68e0e26f0bb7960be334d5b520ea452`, and deliberately supplies that exact path to Cargo.
-The benchmark package's build script requires the same path and digest, result schema 4 carries the
+The benchmark package's build script requires the same path and digest, result schema 5 carries the
 compiler digest through the runner and manifest, and preflight requires the measured host's direct
 compiler digest to match. This binds the driver executable without expanding the non-hermetic threat
 claim to its sysroot, linker, SDK, or hostile same-UID mutation. [Cargo environment variables](https://doc.rust-lang.org/cargo/reference/environment-variables.html),
 [rustup proxies](https://rust-lang.github.io/rustup/concepts/proxies.html),
 [Rust 1.97.1](https://blog.rust-lang.org/2026/07/16/Rust-1.97.1/)
+
+The authoritative fixed-quota runner is an explicit Cargo `[[bin]]` target named
+`capture-admission-evidence`; the logical runner/evidence-copy name remains
+`capture_admission_evidence`. It is built only with:
+
+```bash
+cargo build -p market-squawk-platform --bin capture-admission-evidence \
+  --all-features --release --locked
+```
+
+This target change is an integrity correction, not a naming preference. Stable Cargo explicitly
+ignores the profile `panic` setting for benchmark targets, even when a target disables the standard
+benchmark harness with `harness = false`; the prior `[[bench]]` runner was therefore compiled with
+`panic="unwind"` and could not truthfully claim the bound release profile's `panic="abort"`.
+The release binary is bound to profile literal
+`cargo-release-binary:opt-level=3:lto=thin:codegen-units=1:panic=abort:strip=symbols`, and the
+target-side `cfg(panic = "abort")` assertion remains the final compile-time authority. The separate
+`capture_admission_criterion` benchmark remains adaptive engineering instrumentation with
+`exploratory_zero_authority`; it cannot generate, schedule, or approve fixed-quota evidence.
+[Cargo panic profile rules](https://doc.rust-lang.org/cargo/reference/profiles.html#panic),
+[Rust `cfg(panic)`](https://doc.rust-lang.org/reference/conditional-compilation.html#panic),
+[Rust panic strategy](https://doc.rust-lang.org/reference/panic.html#panic-strategy),
+[Cargo artifact messages](https://doc.rust-lang.org/cargo/reference/external-tools.html#artifact-messages),
+[`cargo build`](https://doc.rust-lang.org/cargo/commands/cargo-build.html)
 
 The current preparer and host machinery is diagnostic. Its bounded I/O, process cleanup, schema,
 and no-clobber checks are useful engineering controls, but they do not prove a hermetic compiler,

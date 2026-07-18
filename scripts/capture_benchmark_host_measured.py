@@ -36,7 +36,7 @@ else:
 
 MAX_BUILD_EVIDENCE_BYTES = 1024 * 1024
 MAX_EXECUTABLE_BYTES = 256 * 1024 * 1024
-RUNNER_SCHEMA_VERSION = 4
+RUNNER_SCHEMA_VERSION = 5
 SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 AUTHORITY_MODULE_FILES = {
     "host_gate_shell_sha256": SCRIPT_DIRECTORY / "capture_benchmark_host_gate.sh",
@@ -53,14 +53,14 @@ AUTHORITY_MODULE_FILES = {
 }
 BUILD_COMMAND = [
     "cargo",
-    "bench",
+    "build",
     "-p",
     "market-squawk-platform",
-    "--bench",
-    "capture_admission_evidence",
+    "--bin",
+    "capture-admission-evidence",
     "--all-features",
+    "--release",
     "--locked",
-    "--no-run",
     "--message-format=json-render-diagnostics",
 ]
 BUILD_EVIDENCE_FIELDS = {
@@ -334,7 +334,7 @@ def build_evidence_contract(
             "standard": ("standard_sync_channel", "not_measured"),
             "candidate": ("candidate_fixed_ring", "exact"),
         }[backend]
-        or value["cargo_target"] != "capture_admission_evidence"
+        or value["cargo_target"] != "capture-admission-evidence"
         or value["benchmark_feature"] != "capture-benchmark"
         or value["build_profile"] != PROFILE
         or not is_git_head(value["measured_code_head"])
@@ -343,7 +343,8 @@ def build_evidence_contract(
         or value["cargo_locked"] is not True
         or value["all_features"] is not True
         or value["release"] is not True
-        or value["build_environment_policy"] != "sanitized-cargo-bench-v2"
+        or value["build_environment_policy"]
+        != "sanitized-cargo-release-runner-v3"
         or value["executable_path"] != "./capture_admission_evidence-exe"
         or value["cargo_json_path"] != "./capture-bench-build.json"
         or value["selected_backend_source_path"]

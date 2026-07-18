@@ -32,26 +32,27 @@ MAX_BINDINGS_BYTES = 1024 * 1024
 MAX_CARGO_JSON_BYTES = 64 * 1024 * 1024
 MAX_CARGO_STDERR_BYTES = 16 * 1024 * 1024
 MAX_EXECUTABLE_BYTES = 256 * 1024 * 1024
-TARGET = "capture_admission_evidence"
+RUNNER = "capture_admission_evidence"
+TARGET = "capture-admission-evidence"
 FEATURE = "capture-benchmark"
 EXPECTED_CARGO_FEATURES = (FEATURE, "capture-test", "default")
 RESULT_SCHEMA_VERSION = RUNNER_SCHEMA_VERSION
 EVIDENCE_MODE = "diagnostic_fixed_quota"
 PROFILE = (
-    "cargo-bench-inherits-release:opt-level=3:lto=thin:codegen-units=1:"
+    "cargo-release-binary:opt-level=3:lto=thin:codegen-units=1:"
     "panic=abort:strip=symbols"
 )
-BUILD_ENVIRONMENT_POLICY = "sanitized-cargo-bench-v2"
+BUILD_ENVIRONMENT_POLICY = "sanitized-cargo-release-runner-v3"
 BUILD_COMMAND = (
     "cargo",
-    "bench",
+    "build",
     "-p",
     "market-squawk-platform",
-    "--bench",
+    "--bin",
     TARGET,
     "--all-features",
+    "--release",
     "--locked",
-    "--no-run",
     "--message-format=json-render-diagnostics",
 )
 PASSTHROUGH_ENVIRONMENT = (
@@ -699,15 +700,35 @@ def parse_cargo_artifact(cargo_json: bytes, repository: Path) -> tuple[Path, dic
     target = artifact["target"]
     profile = artifact.get("profile")
     features = artifact.get("features")
+    expected_manifest = repository / "crates/market-squawk-platform/Cargo.toml"
+    expected_source = repository / (
+        "crates/market-squawk-platform/benches/capture_admission.rs"
+    )
     if (
-        target.get("kind") != ["bench"]
-        or not isinstance(profile, dict)
-        or str(profile.get("opt_level")) != "3"
-        or profile.get("debug_assertions") is not False
-        or not isinstance(features, list)
+        artifact.get("manifest_path") != str(expected_manifest)
+        or target
+        != {
+            "kind": ["bin"],
+            "crate_types": ["bin"],
+            "name": TARGET,
+            "src_path": str(expected_source),
+            "edition": "2024",
+            "required-features": [FEATURE],
+            "doc": False,
+            "doctest": False,
+            "test": False,
+        }
+        or profile
+        != {
+            "opt_level": "3",
+            "debuginfo": 0,
+            "debug_assertions": False,
+            "overflow_checks": False,
+            "test": False,
+        }
         or features != list(EXPECTED_CARGO_FEATURES)
     ):
-        raise GateError("Cargo artifact profile, kind, or feature set is invalid")
+        raise GateError("Cargo artifact target, profile, or feature contract is invalid")
     path = Path(artifact["executable"])
     if not path.is_absolute():
         path = repository / path
@@ -777,7 +798,7 @@ def runner_bindings(executable: Path) -> dict[str, Any]:
         not isinstance(value, dict)
         or set(value) != expected
         or value["schema_version"] != RESULT_SCHEMA_VERSION
-        or value["runner"] != TARGET
+        or value["runner"] != RUNNER
         or value["evidence_mode"] != EVIDENCE_MODE
         or value["evidence_backend"] not in {"standard", "candidate"}
         or (
@@ -987,7 +1008,7 @@ def validate_baseline_inputs(
         or lock.get("schema_version") != RESULT_SCHEMA_VERSION
         or lock.get("state") != "frozen_standard_baseline"
         or manifest.get("schema_version") != RESULT_SCHEMA_VERSION
-        or manifest.get("runner") != TARGET
+        or manifest.get("runner") != RUNNER
         or manifest.get("evidence_mode") != EVIDENCE_MODE
         or manifest.get("criterion_evidence_mode") != "exploratory_zero_authority"
         or manifest.get("backend") != "standard"

@@ -6,6 +6,12 @@
 //! exactly once at its frozen operation quota. Adaptive Criterion output is produced only by the
 //! separate `capture_admission_criterion` engineering target and has zero evidence authority.
 
+#[cfg(all(capture_bench_authoritative, not(panic = "abort")))]
+compile_error!("authoritative capture evidence requires the release abort panic strategy");
+
+#[cfg(all(capture_bench_authoritative, debug_assertions))]
+compile_error!("authoritative capture evidence requires debug assertions to be disabled");
+
 #[path = "capture_admission/backend.rs"]
 mod backend;
 #[path = "capture_admission/benchmark_identity.rs"]
@@ -54,7 +60,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         return print_build_bindings();
     }
     if arguments.as_slice() != ["--bench"] {
-        return Err("capture benchmark accepts only Cargo's --bench marker".into());
+        return Err("capture benchmark accepts only the closed --bench measurement marker".into());
     }
     validate_backend_contract()?;
     require_exact_environment("CAPTURE_BENCH_BACKEND", backend::EVIDENCE_BACKEND)?;
@@ -141,7 +147,6 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 fn self_check() -> Result<(), Box<dyn Error>> {
-    #[cfg(test)]
     schema::self_check_candidate_baseline_contracts()?;
     validate_backend_contract()?;
     workload::self_check_rss_adapter()?;
@@ -673,7 +678,7 @@ fn print_build_bindings() -> Result<(), Box<dyn Error>> {
         "evidence_backend": build_bindings::BUILD_EVIDENCE_BACKEND,
         "queue_transport": backend::QUEUE_TRANSPORT,
         "queue_private_storage_accounting": backend::QUEUE_PRIVATE_STORAGE_ACCOUNTING,
-        "build_profile": "cargo-bench-inherits-release:opt-level=3:lto=thin:codegen-units=1:panic=abort:strip=symbols",
+        "build_profile": "cargo-release-binary:opt-level=3:lto=thin:codegen-units=1:panic=abort:strip=symbols",
         "measured_code_head": build_bindings::BUILD_GIT_HEAD,
         "clean_build_enforced": build_bindings::CLEAN_BUILD_ENFORCED,
         "build_environment_policy": build_bindings::BUILD_ENVIRONMENT_POLICY,

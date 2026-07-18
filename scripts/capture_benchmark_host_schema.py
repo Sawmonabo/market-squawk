@@ -16,7 +16,7 @@ SCHEMA_VERSION = 1
 PRODUCTION_MODE = "production"
 FIXTURE_MODE = "fixture"
 PROFILE = (
-    "cargo-bench-inherits-release:opt-level=3:lto=thin:codegen-units=1:"
+    "cargo-release-binary:opt-level=3:lto=thin:codegen-units=1:"
     "panic=abort:strip=symbols"
 )
 MAX_PROCESSES = 16_384

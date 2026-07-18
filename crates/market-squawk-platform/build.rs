@@ -31,6 +31,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!(
         "cargo:rustc-check-cfg=cfg(capture_bench_backend, values(\"standard\", \"candidate\"))"
     );
+    println!("cargo:rustc-check-cfg=cfg(capture_bench_authoritative)");
     println!("cargo:rerun-if-env-changed=CAPTURE_BENCH_REQUIRE_CLEAN_BUILD");
     println!("cargo:rerun-if-env-changed=CAPTURE_BENCH_BUILD_POLICY");
     println!("cargo:rerun-if-env-changed=CAPTURE_BENCH_BUILD_COMMAND_SHA256");
@@ -82,6 +83,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         selected_backend.as_str()
     );
     if clean_build_requested {
+        println!("cargo:rustc-cfg=capture_bench_authoritative");
         let configured = std::env::var("CAPTURE_BENCH_PROCESS_GROUP_POLICY").ok();
         let expected_group = std::env::var("CAPTURE_BENCH_EXPECTED_PROCESS_GROUP_ID").ok();
         let _policy = build_support::authoritative_command_policy(
@@ -314,7 +316,7 @@ struct ValidatedBuildEnvironment {
 }
 
 fn validate_authoritative_build_environment() -> Result<ValidatedBuildEnvironment, Box<dyn Error>> {
-    const POLICY: &str = "sanitized-cargo-bench-v2";
+    const POLICY: &str = "sanitized-cargo-release-runner-v3";
     for key in [
         "RUSTFLAGS",
         "RUSTDOCFLAGS",
