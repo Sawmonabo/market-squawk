@@ -13,18 +13,26 @@ license = "Apache-2.0 OR MIT"
 [workspace.dependencies]
 anyhow = "1.0"
 arc-swap = "=1.9.2"
+argon2 = { version = "=0.5.3", default-features = false, features = ["alloc"] }
 async-trait = "0.1"
 bs58 = "0.5"
 bytes = "1.10"
 cap-fs-ext = "4.0.2"
 cap-std = "4.0.2"
 bitcoin = { version = "=0.32.102", default-features = false, features = ["std"] }
+chacha20poly1305 = { version = "=0.11.0", default-features = false, features = [
+    "alloc",
+    "getrandom",
+    "zeroize",
+] }
 chrono = { version = "0.4", features = ["clock", "serde"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 criterion = "=0.8.2"
 crc32fast = "1.4"
 fs2 = "0.4"
 futures-util = "0.3"
+getrandom = "=0.3.4"
+keyring = { version = "=4.1.5", default-features = false, features = ["v1"] }
 libc = "0.2"
 market-squawk-domain = { path = "crates/market-squawk-domain", version = "=0.1.0" }
 market-squawk-live = { path = "crates/market-squawk-live", version = "=0.1.0" }
@@ -37,6 +45,18 @@ proptest = "1.7"
 loom = "=0.7.2"
 rust_decimal = { version = "1.36", features = ["serde-with-str"] }
 rustix = { version = "=1.1.4", features = ["fs", "process"] }
+rmcp = { version = "=2.2.0", default-features = false, features = [
+    "server",
+    "transport-io",
+] }
+rusqlite = { version = "=0.40.1", default-features = false, features = [
+    "backup",
+    "bundled",
+] }
+schemars = { version = "=1.2.1", default-features = false, features = [
+    "derive",
+    "std",
+] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
