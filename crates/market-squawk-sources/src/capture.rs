@@ -6,12 +6,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use market_squawk_domain::{
-    CaptureAuthorityError, CaptureAuthorityIdentity, CaptureIntegrityState, DigestAlgorithm,
-    EvidenceDigest, Timestamp,
+    CaptureAuthorityError, CaptureAuthorityIdentity, CaptureIntegrityState,
+    CaptureResidentGenerationLease, CaptureRetainedComponent, CaptureRetainedReceipt,
+    CaptureRetainedSizeError, DigestAlgorithm, EvidenceDigest, Timestamp,
+    checked_arc_value_allocation_bytes,
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::authority_time::{
+    AuthorityTimeContinuity, TrustedReceiptObservation, TrustedRegistryTime,
+};
 use crate::{FrameId, FrameSessionBinding, RawMarketFrame};
 
 const CAPTURE_INITIALIZING: u8 = 0;
@@ -46,6 +51,8 @@ pub enum CaptureGenerationHealth {
 #[derive(Clone, Debug)]
 pub struct CaptureGenerationLease {
     state: Arc<CaptureGenerationState>,
+    continuity: AuthorityTimeContinuity,
+    session_started_at: TrustedRegistryTime,
 }
 
 /// Once-issued ownership bundle for wiring one exact generation's capture pipeline.
@@ -55,6 +62,7 @@ pub struct CaptureGenerationLease {
 #[derive(Debug)]
 pub struct CaptureGenerationCapabilities {
     binding: FrameSessionBinding,
+    continuity: AuthorityTimeContinuity,
     lease: CaptureGenerationLease,
     initialization: CaptureInitializationControl,
     admission: CaptureAdmissionIssuer,
@@ -65,6 +73,7 @@ impl CaptureGenerationCapabilities {
     pub(crate) fn new(binding: FrameSessionBinding, lease: CaptureGenerationLease) -> Self {
         Self {
             binding: binding.clone(),
+            continuity: lease.continuity.clone(),
             lease: lease.clone(),
             initialization: CaptureInitializationControl::new(lease.clone()),
             admission: CaptureAdmissionIssuer::new(binding, lease.clone()),
@@ -101,6 +110,48 @@ impl market_squawk_domain::CaptureAuthorityBundle for CaptureGenerationCapabilit
     type Admission = CaptureAdmissionIssuer;
     type Degradation = CaptureDegradationCapability;
 
+    fn checked_retained_bytes(&self) -> Result<usize, CaptureRetainedSizeError> {
+        let Self {
+            binding,
+            continuity,
+            lease,
+            initialization,
+            admission,
+            degradation,
+        } = self;
+        if !binding.shares_allocation_with(&admission.binding) {
+            return Err(CaptureRetainedSizeError::InvalidAuthorityGraph {
+                component: CaptureRetainedComponent::SessionBinding,
+            });
+        }
+        if !lease.shares_allocation_with(&initialization.lease)
+            || !lease.shares_allocation_with(&admission.lease)
+            || !lease.shares_allocation_with(&degradation.lease)
+        {
+            return Err(CaptureRetainedSizeError::InvalidAuthorityGraph {
+                component: CaptureRetainedComponent::CaptureLease,
+            });
+        }
+        if !continuity.shares_allocation_with(&lease.continuity)
+            || !continuity.shares_allocation_with(&initialization.lease.continuity)
+            || !continuity.shares_allocation_with(&admission.lease.continuity)
+            || !continuity.shares_allocation_with(&degradation.lease.continuity)
+        {
+            return Err(CaptureRetainedSizeError::InvalidAuthorityGraph {
+                component: CaptureRetainedComponent::Continuity,
+            });
+        }
+        let lease_bytes = lease.checked_shared_allocation_bytes()?;
+        let continuity_bytes = continuity.checked_shared_allocation_bytes()?;
+        std::mem::size_of::<Self>()
+            .checked_add(binding.checked_shared_allocation_bytes()?)
+            .and_then(|bytes| bytes.checked_add(lease_bytes))
+            .and_then(|bytes| bytes.checked_add(continuity_bytes))
+            .ok_or(CaptureRetainedSizeError::Overflow {
+                component: CaptureRetainedComponent::Bundle,
+            })
+    }
+
     fn identity(&self) -> CaptureAuthorityIdentity {
         CaptureAuthorityIdentity::new(
             self.binding.source_id().clone(),
@@ -116,9 +167,14 @@ impl market_squawk_domain::CaptureAuthorityBundle for CaptureGenerationCapabilit
 }
 
 impl CaptureGenerationLease {
-    pub(crate) fn new_generation() -> Self {
+    pub(crate) fn new_generation(
+        continuity: AuthorityTimeContinuity,
+        session_started_at: TrustedRegistryTime,
+    ) -> Self {
         Self {
             state: Arc::new(CaptureGenerationState::new()),
+            continuity,
+            session_started_at,
         }
     }
 
@@ -132,18 +188,34 @@ impl CaptureGenerationLease {
     }
 
     pub(crate) fn is_healthy(&self) -> bool {
-        self.health() == CaptureGenerationHealth::Healthy
+        self.health() == CaptureGenerationHealth::Healthy && self.continuity.is_continuous()
     }
 
     pub(crate) fn shares_allocation_with(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.state, &other.state)
+            && self.continuity.shares_allocation_with(&other.continuity)
+            && self.session_started_at == other.session_started_at
+    }
+
+    pub(crate) fn validate_receipt(
+        &self,
+        receipt: &TrustedReceiptObservation,
+    ) -> Result<(), crate::RegistryError> {
+        self.continuity
+            .validate_receipt(receipt, self.session_started_at)
     }
 
     /// Returns the conservative charge for the shared capture state and its `Arc` control block.
     pub(crate) fn shared_allocation_charge(&self) -> Option<usize> {
-        std::mem::size_of::<CaptureGenerationState>().checked_add(
-            crate::conservative_arc_control_block_charge::<CaptureGenerationState>(),
-        )
+        self.checked_shared_allocation_bytes().ok()
+    }
+
+    fn checked_shared_allocation_bytes(&self) -> Result<usize, CaptureRetainedSizeError> {
+        checked_arc_value_allocation_bytes::<CaptureGenerationState>(0).map_err(|_| {
+            CaptureRetainedSizeError::Overflow {
+                component: CaptureRetainedComponent::CaptureLease,
+            }
+        })
     }
 
     pub(crate) fn mark_incomplete(&self) {
@@ -193,6 +265,7 @@ impl CaptureAdmissionIssuer {
     pub fn issue_after_enqueue(
         &mut self,
         frame: &RawMarketFrame,
+        resident: CaptureResidentGenerationLease,
     ) -> Result<CaptureAdmissionReceipt, CaptureAdmissionError> {
         self.validate_active(frame)?;
         let digest: [u8; 32] = Sha256::digest(frame.payload()).into();
@@ -200,9 +273,13 @@ impl CaptureAdmissionIssuer {
         Ok(CaptureAdmissionReceipt {
             binding: frame.binding().clone(),
             frame_id: frame.frame_id(),
-            received_at: frame.received_at(),
+            receipt: frame
+                .trusted_receipt()
+                .ok_or(CaptureAdmissionError::TrustedTimeInvalid)?
+                .clone(),
             payload_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, digest),
             lease: self.lease.clone(),
+            resident,
         })
     }
 
@@ -219,12 +296,50 @@ impl CaptureAdmissionIssuer {
         if !self.binding.shares_allocation_with(frame.binding()) {
             return Err(CaptureAdmissionError::BindingMismatch);
         }
+        let receipt = frame
+            .trusted_receipt()
+            .ok_or(CaptureAdmissionError::TrustedTimeInvalid)?;
+        self.lease
+            .validate_receipt(receipt)
+            .map_err(|_error| CaptureAdmissionError::TrustedTimeInvalid)?;
         Ok(())
     }
 }
 
 impl market_squawk_domain::CaptureAdmission<RawMarketFrame> for CaptureAdmissionIssuer {
     type Receipt = CaptureAdmissionReceipt;
+
+    fn checked_resident_shared_frame_bytes(
+        &self,
+        frame: &RawMarketFrame,
+    ) -> Result<usize, CaptureRetainedSizeError> {
+        if !self.binding.shares_allocation_with(frame.binding()) {
+            return Err(CaptureRetainedSizeError::InvalidAuthorityGraph {
+                component: CaptureRetainedComponent::SessionBinding,
+            });
+        }
+        let receipt =
+            frame
+                .trusted_receipt()
+                .ok_or(CaptureRetainedSizeError::InvalidAuthorityGraph {
+                    component: CaptureRetainedComponent::Continuity,
+                })?;
+        if !self
+            .lease
+            .continuity
+            .shares_allocation_with(receipt.continuity())
+        {
+            return Err(CaptureRetainedSizeError::InvalidAuthorityGraph {
+                component: CaptureRetainedComponent::Continuity,
+            });
+        }
+        self.binding
+            .checked_shared_allocation_bytes()?
+            .checked_add(self.lease.continuity.checked_shared_allocation_bytes()?)
+            .ok_or(CaptureRetainedSizeError::Overflow {
+                component: CaptureRetainedComponent::Continuity,
+            })
+    }
 
     fn preflight(&self, frame: &RawMarketFrame) -> Result<(), CaptureAuthorityError> {
         CaptureAdmissionIssuer::preflight(self, frame).map_err(|error| self.to_domain_error(error))
@@ -233,8 +348,9 @@ impl market_squawk_domain::CaptureAdmission<RawMarketFrame> for CaptureAdmission
     fn issue_after_enqueue(
         &mut self,
         frame: &RawMarketFrame,
+        resident: CaptureResidentGenerationLease,
     ) -> Result<Self::Receipt, CaptureAuthorityError> {
-        CaptureAdmissionIssuer::issue_after_enqueue(self, frame)
+        CaptureAdmissionIssuer::issue_after_enqueue(self, frame, resident)
             .map_err(|error| self.to_domain_error(error))
     }
 
@@ -249,6 +365,7 @@ impl CaptureAdmissionIssuer {
         match error {
             CaptureAdmissionError::BindingMismatch => CaptureAuthorityError::FrameBindingMismatch,
             CaptureAdmissionError::Incomplete => CaptureAuthorityError::GenerationIncomplete,
+            CaptureAdmissionError::TrustedTimeInvalid => CaptureAuthorityError::FrameRejected,
             CaptureAdmissionError::NotHealthy => match self.lease.health() {
                 CaptureGenerationHealth::Initializing => CaptureAuthorityError::GenerationNotReady,
                 CaptureGenerationHealth::Healthy => CaptureAuthorityError::FrameRejected,
@@ -297,7 +414,9 @@ impl CaptureInitializationControl {
 impl market_squawk_domain::CaptureInitializer for CaptureInitializationControl {
     fn mark_healthy(&mut self) -> Result<(), CaptureAuthorityError> {
         CaptureInitializationControl::mark_healthy(self).map_err(|error| match error {
-            CaptureAdmissionError::Incomplete | CaptureAdmissionError::NotHealthy => {
+            CaptureAdmissionError::Incomplete
+            | CaptureAdmissionError::NotHealthy
+            | CaptureAdmissionError::TrustedTimeInvalid => {
                 CaptureAuthorityError::GenerationIncomplete
             }
             CaptureAdmissionError::BindingMismatch => CaptureAuthorityError::FrameBindingMismatch,
@@ -341,9 +460,28 @@ impl market_squawk_domain::CaptureDegradation for CaptureDegradationCapability {
 pub struct CaptureAdmissionReceipt {
     binding: FrameSessionBinding,
     frame_id: FrameId,
-    received_at: Timestamp,
+    receipt: TrustedReceiptObservation,
     payload_digest: EvidenceDigest,
     lease: CaptureGenerationLease,
+    resident: CaptureResidentGenerationLease,
+}
+
+impl CaptureRetainedReceipt for CaptureAdmissionReceipt {
+    fn resident_generation_lease(&self) -> &CaptureResidentGenerationLease {
+        &self.resident
+    }
+
+    fn checked_additional_dynamic_retained_bytes(&self) -> Result<usize, CaptureRetainedSizeError> {
+        let Self {
+            binding: _,
+            frame_id: _,
+            receipt: _,
+            payload_digest: _,
+            lease: _,
+            resident: _,
+        } = self;
+        Ok(0)
+    }
 }
 
 impl CaptureAdmissionReceipt {
@@ -352,7 +490,11 @@ impl CaptureAdmissionReceipt {
     }
 
     pub(crate) const fn received_at(&self) -> Timestamp {
-        self.received_at
+        self.receipt.received_at()
+    }
+
+    pub(crate) const fn trusted_receipt(&self) -> &TrustedReceiptObservation {
+        &self.receipt
     }
 
     pub(crate) const fn frame_id(&self) -> FrameId {
@@ -380,4 +522,185 @@ pub enum CaptureAdmissionError {
     /// Frame belongs to another session/generation allocation.
     #[error("raw frame belongs to another capture generation")]
     BindingMismatch,
+    /// Frame has no source-owned receipt proof or belongs to another continuity lineage.
+    #[error("raw frame trusted-time continuity proof is invalid")]
+    TrustedTimeInvalid,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroU64;
+
+    use bytes::Bytes;
+    use market_squawk_domain::{
+        CaptureAdmission, CaptureAuthorityBundle, CaptureRetainedComponent,
+        CaptureRetainedSizeError, ConnectionGeneration, MetadataRevision, SourceId,
+        SourceIdentifier, Timestamp,
+    };
+
+    use super::{CaptureAdmissionIssuer, CaptureGenerationCapabilities, CaptureGenerationLease};
+    use crate::authority_time::{TrustedReceiptObservation, trusted_test_receipt};
+    use crate::{FrameId, FrameSessionBinding, RawMarketFrame, SessionId, TransportFrameKind};
+
+    fn binding(session: &str) -> Result<FrameSessionBinding, Box<dyn std::error::Error>> {
+        Ok(FrameSessionBinding::new(
+            SourceId::try_from("source-a")?,
+            MetadataRevision::new(SourceIdentifier::try_from("revision-a")?),
+            SessionId::new(SourceIdentifier::try_from(session)?),
+            ConnectionGeneration::new(1)?,
+        ))
+    }
+
+    fn receipt() -> Result<TrustedReceiptObservation, Box<dyn std::error::Error>> {
+        Ok(trusted_test_receipt(Timestamp::from_unix_nanos(1), 1)?)
+    }
+
+    fn generation()
+    -> Result<(CaptureGenerationLease, TrustedReceiptObservation), Box<dyn std::error::Error>> {
+        let receipt = receipt()?;
+        let lease =
+            CaptureGenerationLease::new_generation(receipt.continuity().clone(), receipt.time());
+        Ok((lease, receipt))
+    }
+
+    fn frame(
+        binding: FrameSessionBinding,
+        receipt: TrustedReceiptObservation,
+    ) -> Result<RawMarketFrame, Box<dyn std::error::Error>> {
+        Ok(RawMarketFrame::try_from_parts(
+            binding,
+            FrameId::new(NonZeroU64::MIN),
+            receipt,
+            TransportFrameKind::Binary,
+            Bytes::from_static(b"frame"),
+        )?)
+    }
+
+    fn assert_invalid_component(
+        bundle: &CaptureGenerationCapabilities,
+        component: CaptureRetainedComponent,
+    ) {
+        assert_eq!(
+            bundle.checked_retained_bytes(),
+            Err(CaptureRetainedSizeError::InvalidAuthorityGraph { component })
+        );
+    }
+
+    #[test]
+    fn admission_resident_charge_requires_the_exact_frame_binding_pointer()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let issuer_binding = binding("session-a")?;
+        let (lease, receipt) = generation()?;
+        let expected = issuer_binding
+            .checked_shared_allocation_bytes()?
+            .checked_add(receipt.continuity().checked_shared_allocation_bytes()?)
+            .ok_or("resident expected total overflowed")?;
+        let issuer = CaptureAdmissionIssuer::new(issuer_binding.clone(), lease);
+        let exact = frame(issuer_binding, receipt.clone())?;
+        let copied_identity = frame(binding("session-a")?, receipt)?;
+
+        assert_eq!(
+            issuer.checked_resident_shared_frame_bytes(&exact)?,
+            expected
+        );
+        assert_eq!(
+            issuer.checked_resident_shared_frame_bytes(&copied_identity),
+            Err(CaptureRetainedSizeError::InvalidAuthorityGraph {
+                component: CaptureRetainedComponent::SessionBinding,
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn production_bundle_formula_is_exact_and_rejects_every_pointer_edge()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let exact_binding = binding("session-a")?;
+        let (exact_lease, exact_receipt) = generation()?;
+        let exact = CaptureGenerationCapabilities::new(exact_binding.clone(), exact_lease.clone());
+        let expected = std::mem::size_of::<CaptureGenerationCapabilities>()
+            .checked_add(exact_binding.checked_shared_allocation_bytes()?)
+            .and_then(|bytes| {
+                bytes.checked_add(exact_lease.checked_shared_allocation_bytes().ok()?)
+            })
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    exact_receipt
+                        .continuity()
+                        .checked_shared_allocation_bytes()
+                        .ok()?,
+                )
+            })
+            .ok_or("bundle expected total overflowed")?;
+        assert_eq!(exact.checked_retained_bytes()?, expected);
+
+        let (lease, _receipt) = generation()?;
+        let mut wrong_binding = CaptureGenerationCapabilities::new(exact_binding.clone(), lease);
+        wrong_binding.admission.binding = binding("session-a")?;
+        assert_invalid_component(&wrong_binding, CaptureRetainedComponent::SessionBinding);
+
+        let (lease, _receipt) = generation()?;
+        let mut wrong_top_lease = CaptureGenerationCapabilities::new(exact_binding.clone(), lease);
+        wrong_top_lease.lease = generation()?.0;
+        assert_invalid_component(&wrong_top_lease, CaptureRetainedComponent::CaptureLease);
+
+        let (lease, _receipt) = generation()?;
+        let mut wrong_initializer =
+            CaptureGenerationCapabilities::new(exact_binding.clone(), lease);
+        wrong_initializer.initialization.lease = generation()?.0;
+        assert_invalid_component(&wrong_initializer, CaptureRetainedComponent::CaptureLease);
+
+        let (lease, _receipt) = generation()?;
+        let mut wrong_admission = CaptureGenerationCapabilities::new(exact_binding.clone(), lease);
+        wrong_admission.admission.lease = generation()?.0;
+        assert_invalid_component(&wrong_admission, CaptureRetainedComponent::CaptureLease);
+
+        let (lease, _receipt) = generation()?;
+        let mut wrong_degradation =
+            CaptureGenerationCapabilities::new(exact_binding.clone(), lease);
+        wrong_degradation.degradation.lease = generation()?.0;
+        assert_invalid_component(&wrong_degradation, CaptureRetainedComponent::CaptureLease);
+
+        let (lease, _receipt) = generation()?;
+        let mut wrong_continuity = CaptureGenerationCapabilities::new(exact_binding, lease);
+        wrong_continuity.continuity = receipt()?.continuity().clone();
+        assert_invalid_component(&wrong_continuity, CaptureRetainedComponent::Continuity);
+        Ok(())
+    }
+
+    #[test]
+    fn capture_rejects_wrong_and_missing_continuity_with_the_exact_binding_pointer()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let exact_binding = binding("session-a")?;
+        let (lease, exact_receipt) = generation()?;
+        let capabilities = CaptureGenerationCapabilities::new(exact_binding.clone(), lease);
+        let (mut initialization, admission, _degradation) = capabilities.into_parts();
+        initialization.mark_healthy()?;
+
+        let wrong = frame(exact_binding.clone(), receipt()?)?;
+        assert_eq!(
+            admission.preflight(&wrong),
+            Err(super::CaptureAdmissionError::TrustedTimeInvalid)
+        );
+        assert_eq!(
+            admission.checked_resident_shared_frame_bytes(&wrong),
+            Err(CaptureRetainedSizeError::InvalidAuthorityGraph {
+                component: CaptureRetainedComponent::Continuity,
+            })
+        );
+
+        let mut missing = frame(exact_binding, exact_receipt)?;
+        missing.strip_trusted_receipt_for_test();
+        assert_eq!(
+            admission.preflight(&missing),
+            Err(super::CaptureAdmissionError::TrustedTimeInvalid)
+        );
+        assert_eq!(
+            admission.checked_resident_shared_frame_bytes(&missing),
+            Err(CaptureRetainedSizeError::InvalidAuthorityGraph {
+                component: CaptureRetainedComponent::Continuity,
+            })
+        );
+        Ok(())
+    }
 }

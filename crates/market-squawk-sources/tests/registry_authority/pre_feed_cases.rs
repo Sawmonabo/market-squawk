@@ -154,7 +154,6 @@ fn pre_feed_current_leases_are_deadline_capture_health_and_registry_bound() -> T
         .try_current_lease()?;
     assert!(exiting_lease.validate_at(exiting_at).is_ok());
     let exiting_frame = exiting_frames.try_frame(
-        exiting_at,
         TransportFrameKind::Binary,
         Bytes::from_static(b"before-registry-exit"),
     )?;
@@ -175,7 +174,6 @@ fn pre_feed_current_leases_are_deadline_capture_health_and_registry_bound() -> T
     );
     assert!(matches!(
         exiting_frames.try_frame(
-            Timestamp::from_unix_nanos(2),
             TransportFrameKind::Binary,
             Bytes::from_static(b"after-registry-exit"),
         ),

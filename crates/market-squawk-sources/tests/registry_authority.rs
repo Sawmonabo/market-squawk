@@ -3,10 +3,12 @@ mod common;
 use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
 use market_squawk_domain::{
-    CaptureAuthorityBundle, CaptureDegradation, CaptureIntegrityState, ConnectionGeneration,
+    CaptureAuthorityBundle, CaptureDegradation, CaptureIntegrityState,
+    CaptureResidentGenerationLease, CaptureResidentToken, ConnectionGeneration,
     CoverageConsolidation, CoverageDelay, DeliveryEvidence, DigestAlgorithm, EvidenceDigest,
     ProviderChannel, ProviderProduct, RawCaptureFrameView, SourceIdentifier, StreamIntegrityState,
     Timestamp,
@@ -33,6 +35,7 @@ assert_impl_all!(market_squawk_sources::CurrentDecodedProviderBatches: Send);
 assert_not_impl_any!(market_squawk_sources::CurrentDecodedProviderBatches: Clone, serde::Serialize, serde::de::DeserializeOwned);
 assert_not_impl_any!(market_squawk_sources::CurrentFrameEvidence: serde::Serialize, serde::de::DeserializeOwned);
 assert_not_impl_any!(market_squawk_sources::CaptureAdmissionIssuer: Clone, Sync, serde::Serialize);
+assert_not_impl_any!(market_squawk_sources::CaptureAdmissionReceipt: Clone, serde::Serialize, serde::de::DeserializeOwned);
 assert_not_impl_any!(market_squawk_sources::CaptureInitializationControl: Clone, Sync, serde::Serialize);
 assert_not_impl_any!(market_squawk_sources::CaptureGenerationCapabilities: Clone, Sync, serde::Serialize, serde::de::DeserializeOwned);
 assert_not_impl_any!(market_squawk_sources::CurrentHealthReporter: Clone, Sync, serde::Serialize);
@@ -42,6 +45,25 @@ assert_not_impl_any!(market_squawk_sources::CurrentCoveragePolicy: serde::Serial
 assert_not_impl_any!(market_squawk_platform::LocalAuthorityStateStore: Clone);
 assert_impl_all!(market_squawk_sources::RawMarketFrame: RawCaptureFrameView);
 assert_impl_all!(market_squawk_sources::CaptureGenerationCapabilities: CaptureAuthorityBundle);
+
+#[derive(Debug)]
+struct TestResidentToken(Option<Arc<AtomicUsize>>);
+
+impl CaptureResidentToken for TestResidentToken {}
+
+impl Drop for TestResidentToken {
+    fn drop(&mut self) {
+        if let Some(drops) = &self.0 {
+            drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+fn observed_resident_generation_lease() -> (CaptureResidentGenerationLease, Arc<AtomicUsize>) {
+    let drops = Arc::new(AtomicUsize::new(0));
+    let token = Arc::new(TestResidentToken(Some(Arc::clone(&drops))));
+    (CaptureResidentGenerationLease::new(token), drops)
+}
 
 fn direct_metadata_for_provider(
     source: &str,
@@ -276,11 +298,7 @@ fn raw_frame_view_reports_exact_generation_local_identity_and_deep_bound() -> Te
         Timestamp::from_unix_nanos(1),
     )?;
     let mut factory = registry.take_raw_frame_factory(&session)?;
-    let frame = factory.try_frame(
-        Timestamp::from_unix_nanos(2),
-        TransportFrameKind::Binary,
-        Bytes::from_static(b"frame"),
-    )?;
+    let frame = factory.try_frame(TransportFrameKind::Binary, Bytes::from_static(b"frame"))?;
 
     assert_eq!(RawCaptureFrameView::source_id(&frame).as_str(), "source-a");
     assert_eq!(
@@ -289,7 +307,10 @@ fn raw_frame_view_reports_exact_generation_local_identity_and_deep_bound() -> Te
     );
     assert_eq!(RawCaptureFrameView::frame_ordinal(&frame).get(), 1);
     assert_eq!(RawCaptureFrameView::payload(&frame), b"frame");
-    assert!(RawCaptureFrameView::retained_bytes(&frame) >= frame.retained_payload_bytes());
+    assert!(
+        RawCaptureFrameView::checked_retained_footprint(&frame)?.checked_complete_bytes()?
+            >= frame.retained_payload_bytes()
+    );
     Ok(())
 }
 
@@ -353,19 +374,11 @@ fn raw_frame_factory_is_once_issued_and_fails_after_session_end() -> TestResult 
         registry.take_raw_frame_factory(&session),
         Err(RegistryError::RawFrameFactoryAlreadyTaken)
     ));
-    let frame = frames.try_frame(
-        Timestamp::from_unix_nanos(2),
-        TransportFrameKind::Binary,
-        Bytes::from_static(b"first"),
-    )?;
+    let frame = frames.try_frame(TransportFrameKind::Binary, Bytes::from_static(b"first"))?;
     session.validate_live_frame(&frame)?;
     registry.end_session(&session, Timestamp::from_unix_nanos(3))?;
     assert!(matches!(
-        frames.try_frame(
-            Timestamp::from_unix_nanos(4),
-            TransportFrameKind::Binary,
-            Bytes::from_static(b"late"),
-        ),
+        frames.try_frame(TransportFrameKind::Binary, Bytes::from_static(b"late"),),
         Err(market_squawk_sources::SourceError::SessionNotCurrent)
     ));
     Ok(())
@@ -1051,11 +1064,7 @@ fn replayed_frames_lose_transient_authority_and_ended_lease_stays_invalid() -> T
         Timestamp::from_unix_nanos(1),
     )?;
     let mut frames = registry.take_raw_frame_factory(&session)?;
-    let frame = frames.try_frame(
-        Timestamp::from_unix_nanos(2),
-        TransportFrameKind::Binary,
-        Bytes::from_static(b"payload"),
-    )?;
+    let frame = frames.try_frame(TransportFrameKind::Binary, Bytes::from_static(b"payload"))?;
     session.validate_live_frame(&frame)?;
     let replayed: RawMarketFrame = serde_json::from_str(&serde_json::to_string(&frame)?)?;
     assert!(matches!(

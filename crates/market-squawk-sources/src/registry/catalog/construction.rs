@@ -78,7 +78,17 @@ impl AuthoritativeSourceRegistry {
         store: Arc<dyn crate::policy::AuthorityStateStore>,
         resolver: Arc<dyn crate::AuthorizationSubjectResolver>,
     ) -> Result<Self, RegistryError> {
-        let clock: Arc<dyn RegistryClock> = Arc::new(SystemRegistryClock::try_new()?);
+        let raw_clock: Arc<dyn RawRegistryClockSource> =
+            Arc::new(SystemRawRegistryClock::try_new()?);
+        Self::try_new_durable_with_store_resolver_and_clock_source(store, resolver, raw_clock)
+    }
+
+    pub(super) fn try_new_durable_with_store_resolver_and_clock_source(
+        store: Arc<dyn crate::policy::AuthorityStateStore>,
+        resolver: Arc<dyn crate::AuthorizationSubjectResolver>,
+        raw_clock: Arc<dyn RawRegistryClockSource>,
+    ) -> Result<Self, RegistryError> {
+        let clock = Arc::new(SealedRegistryClock::new(raw_clock));
         let now = clock.observe()?.wall();
         let unpublished = AuthorityDurabilitySession::open_unpublished(store, now)
             .map_err(map_authority_persistence_error)?;
@@ -87,6 +97,7 @@ impl AuthoritativeSourceRegistry {
             durability.invalidate();
             return Err(RegistryError::UncleanAuthorityPredecessor);
         }
+        clock.bind_durability(&durability)?;
         let construction = (|| {
             let state = durability
                 .registry_state()
@@ -144,7 +155,7 @@ impl AuthoritativeSourceRegistry {
     ) -> Result<Self, RegistryError> {
         Self::try_new_ephemeral_with_authority_state_and_clock_and_resolver_for_diagnostics(
             RegistryAuthorityState::empty(),
-            Arc::new(SystemRegistryClock::try_new()?),
+            Arc::new(SystemRawRegistryClock::try_new()?),
             resolver,
         )
     }
@@ -162,7 +173,7 @@ impl AuthoritativeSourceRegistry {
     ) -> Result<Self, RegistryError> {
         Self::try_new_ephemeral_with_authority_state_and_clock_for_diagnostics(
             state,
-            Arc::new(SystemRegistryClock::try_new()?),
+            Arc::new(SystemRawRegistryClock::try_new()?),
         )
     }
 
@@ -177,27 +188,29 @@ impl AuthoritativeSourceRegistry {
     ) -> Result<Self, RegistryError> {
         Self::try_new_ephemeral_with_authority_state_and_clock_and_resolver_for_diagnostics(
             state,
-            Arc::new(SystemRegistryClock::try_new()?),
+            Arc::new(SystemRawRegistryClock::try_new()?),
             resolver,
         )
     }
 
     pub(super) fn try_new_ephemeral_with_authority_state_and_clock_for_diagnostics(
         state: RegistryAuthorityState,
-        clock: Arc<dyn RegistryClock>,
+        clock_source: Arc<dyn RawRegistryClockSource>,
     ) -> Result<Self, RegistryError> {
         Self::try_new_ephemeral_with_authority_state_and_clock_and_resolver_for_diagnostics(
             state,
-            clock,
+            clock_source,
             Arc::new(UnconfiguredAuthorizationSubjectResolver),
         )
     }
 
     fn try_new_ephemeral_with_authority_state_and_clock_and_resolver_for_diagnostics(
         state: RegistryAuthorityState,
-        clock: Arc<dyn RegistryClock>,
+        clock_source: Arc<dyn RawRegistryClockSource>,
         authorization_subject_resolver: Arc<dyn crate::AuthorizationSubjectResolver>,
     ) -> Result<Self, RegistryError> {
+        let clock = Arc::new(SealedRegistryClock::new(clock_source));
+        let _initial_time = clock.observe()?;
         let instance_id = NEXT_REGISTRY_ID
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_add(1)
@@ -247,7 +260,7 @@ impl AuthoritativeSourceRegistry {
     fn try_new_with_durable_state(
         state: RegistryAuthorityState,
         groups: Vec<DurableBudgetGroup>,
-        clock: Arc<dyn RegistryClock>,
+        clock: Arc<SealedRegistryClock>,
         authorization_subject_resolver: Arc<dyn crate::AuthorizationSubjectResolver>,
         durability: Arc<AuthorityDurabilitySession>,
     ) -> Result<Self, RegistryError> {

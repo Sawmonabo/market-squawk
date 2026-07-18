@@ -1,0 +1,7 @@
+error[E0046]: not all trait items implemented, missing: `capture_payload`
+  --> tests/ui/raw_frame_missing_capture_payload.rs:11:1
+   |
+11 | impl RawCaptureFrameView for MissingCapturePayload {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ missing `capture_payload` in implementation
+   |
+   = help: implement the missing item: `fn capture_payload(&self) -> &CapturePayload { todo!() }`

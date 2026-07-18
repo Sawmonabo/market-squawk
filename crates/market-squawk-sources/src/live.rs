@@ -6,17 +6,20 @@ use std::sync::Arc;
 use bytes::Bytes;
 use futures_util::future::BoxFuture;
 use market_squawk_domain::{
-    ConnectionGeneration, MetadataRevision, SourceId, SourceIdentifier, Timestamp,
+    CaptureFrameFootprint, CapturePayload, CaptureRetainedComponent, CaptureRetainedSizeError,
+    ConnectionGeneration, MAX_LIVE_CAPTURE_PAYLOAD_BYTES, MetadataRevision, SourceId,
+    SourceIdentifier, Timestamp, checked_arc_value_allocation_bytes,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
+use crate::authority_time::TrustedReceiptObservation;
 use crate::bounded::BoundedBytes;
 use crate::{RawFrameFactory, SourceMetadata};
 
 /// Maximum exact wire payload retained in one live frame.
-pub const MAX_RAW_FRAME_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_RAW_FRAME_BYTES: usize = MAX_LIVE_CAPTURE_PAYLOAD_BYTES;
 
 /// Bounded source-defined connection-session identity.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -125,23 +128,34 @@ impl FrameSessionBinding {
     ///
     /// Cloned bindings share the same allocation and must be deduplicated by their owning object
     /// graph before this charge is added.
-    pub(crate) fn shared_allocation_charge(&self) -> Option<usize> {
-        std::mem::size_of::<FrameSessionIdentity>()
-            .checked_add(crate::conservative_arc_control_block_charge::<
-                FrameSessionIdentity,
-            >())
-            .and_then(|bytes| bytes.checked_add(self.0.source_id.retained_bytes()))
-            .and_then(|bytes| {
-                bytes.checked_add(
-                    self.0
-                        .metadata_revision
-                        .as_source_identifier()
-                        .retained_bytes(),
-                )
-            })
+    pub(crate) fn checked_shared_allocation_bytes(
+        &self,
+    ) -> Result<usize, CaptureRetainedSizeError> {
+        let dynamic = self
+            .0
+            .source_id
+            .retained_bytes()
+            .checked_add(
+                self.0
+                    .metadata_revision
+                    .as_source_identifier()
+                    .retained_bytes(),
+            )
             .and_then(|bytes| {
                 bytes.checked_add(self.0.session_id.as_source_identifier().retained_bytes())
             })
+            .ok_or(CaptureRetainedSizeError::Overflow {
+                component: CaptureRetainedComponent::SessionBinding,
+            })?;
+        checked_arc_value_allocation_bytes::<FrameSessionIdentity>(dynamic).map_err(|_| {
+            CaptureRetainedSizeError::Overflow {
+                component: CaptureRetainedComponent::SessionBinding,
+            }
+        })
+    }
+
+    pub(crate) fn shared_allocation_charge(&self) -> Option<usize> {
+        self.checked_shared_allocation_bytes().ok()
     }
 }
 
@@ -153,25 +167,55 @@ impl FrameSessionBinding {
 pub struct RawMarketFrame {
     binding: FrameSessionBinding,
     frame_id: FrameId,
-    received_at: Timestamp,
+    receipt: RawFrameReceipt,
     transport: TransportFrameKind,
-    payload: BoundedBytes<MAX_RAW_FRAME_BYTES>,
+    payload: CapturePayload,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RawFrameReceipt {
+    Trusted(TrustedReceiptObservation),
+    Untrusted(Timestamp),
+}
+
+impl RawFrameReceipt {
+    const fn received_at(&self) -> Timestamp {
+        match self {
+            Self::Trusted(receipt) => receipt.received_at(),
+            Self::Untrusted(received_at) => *received_at,
+        }
+    }
+
+    const fn trusted(&self) -> Option<&TrustedReceiptObservation> {
+        match self {
+            Self::Trusted(receipt) => Some(receipt),
+            Self::Untrusted(_) => None,
+        }
+    }
 }
 
 /// Opaque process-local proof that a raw frame belongs to a current registry session lease.
 #[derive(Debug)]
 pub struct ValidatedRawMarketFrame<'a> {
     frame: &'a RawMarketFrame,
+    receipt: &'a TrustedReceiptObservation,
 }
 
 impl<'a> ValidatedRawMarketFrame<'a> {
-    pub(crate) const fn new(frame: &'a RawMarketFrame) -> Self {
-        Self { frame }
+    pub(crate) const fn new(
+        frame: &'a RawMarketFrame,
+        receipt: &'a TrustedReceiptObservation,
+    ) -> Self {
+        Self { frame, receipt }
     }
 
     /// Returns the exact bounded frame after current-session validation.
     pub const fn frame(&self) -> &'a RawMarketFrame {
         self.frame
+    }
+
+    pub(crate) const fn trusted_receipt(&self) -> &'a TrustedReceiptObservation {
+        self.receipt
     }
 }
 
@@ -179,16 +223,19 @@ impl RawMarketFrame {
     pub(crate) fn try_from_parts(
         binding: FrameSessionBinding,
         frame_id: FrameId,
-        received_at: Timestamp,
+        receipt: TrustedReceiptObservation,
         transport: TransportFrameKind,
         payload: Bytes,
     ) -> Result<Self, SourceError> {
-        let payload = BoundedBytes::try_from_bytes(payload)
-            .map_err(|error| SourceError::FrameTooLarge { max: error.max })?;
+        let payload = CapturePayload::try_from_live(&payload).map_err(|_error| {
+            SourceError::FrameTooLarge {
+                max: MAX_RAW_FRAME_BYTES,
+            }
+        })?;
         Ok(Self {
             binding,
             frame_id,
-            received_at,
+            receipt: RawFrameReceipt::Trusted(receipt),
             transport,
             payload,
         })
@@ -221,7 +268,7 @@ impl RawMarketFrame {
 
     /// Returns the local receive timestamp.
     pub const fn received_at(&self) -> Timestamp {
-        self.received_at
+        self.receipt.received_at()
     }
 
     /// Returns the transport frame kind.
@@ -230,19 +277,28 @@ impl RawMarketFrame {
     }
 
     /// Returns exact immutable payload bytes without a per-consumer copy.
-    pub fn payload(&self) -> &Bytes {
+    pub fn payload(&self) -> &[u8] {
         self.payload.as_bytes()
     }
 
     /// Returns normalized retained payload bytes; sliced oversized backing allocations are
     /// detached at construction.
     pub fn retained_payload_bytes(&self) -> usize {
-        self.payload.retained_bytes()
+        self.payload.as_bytes().len()
     }
 
     /// Returns the shared immutable session binding.
     pub const fn binding(&self) -> &FrameSessionBinding {
         &self.binding
+    }
+
+    pub(crate) const fn trusted_receipt(&self) -> Option<&TrustedReceiptObservation> {
+        self.receipt.trusted()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn strip_trusted_receipt_for_test(&mut self) {
+        self.receipt = RawFrameReceipt::Untrusted(self.received_at());
     }
 }
 
@@ -275,23 +331,31 @@ impl market_squawk_domain::RawCaptureFrameView for RawMarketFrame {
         self.payload()
     }
 
-    fn retained_bytes(&self) -> usize {
-        std::mem::size_of::<Self>()
-            .checked_add(std::mem::size_of::<FrameSessionIdentity>())
-            .and_then(|bytes| bytes.checked_add(self.source_id().as_str().len()))
-            .and_then(|bytes| {
-                bytes.checked_add(
-                    self.metadata_revision()
-                        .as_source_identifier()
-                        .as_str()
-                        .len(),
-                )
-            })
-            .and_then(|bytes| {
-                bytes.checked_add(self.session_id().as_source_identifier().as_str().len())
-            })
-            .and_then(|bytes| bytes.checked_add(self.retained_payload_bytes()))
-            .unwrap_or(usize::MAX)
+    fn capture_payload(&self) -> &CapturePayload {
+        &self.payload
+    }
+
+    fn checked_retained_footprint(
+        &self,
+    ) -> Result<CaptureFrameFootprint, CaptureRetainedSizeError> {
+        let continuity = self
+            .trusted_receipt()
+            .map(TrustedReceiptObservation::continuity)
+            .map_or(Ok(0), |continuity| {
+                continuity.checked_shared_allocation_bytes()
+            })?;
+        let resident = self
+            .binding
+            .checked_shared_allocation_bytes()?
+            .checked_add(continuity)
+            .ok_or(CaptureRetainedSizeError::Overflow {
+                component: CaptureRetainedComponent::Frame,
+            })?;
+        CaptureFrameFootprint::try_new(
+            std::mem::size_of::<Self>(),
+            resident,
+            self.payload.checked_retained_allocation_bytes()?,
+        )
     }
 }
 
@@ -306,7 +370,7 @@ impl Serialize for RawMarketFrame {
             session_id: self.session_id(),
             connection_generation: self.connection_generation(),
             frame_id: self.frame_id,
-            received_at: self.received_at,
+            received_at: self.received_at(),
             transport: self.transport,
             payload: &self.payload,
         }
@@ -324,7 +388,7 @@ struct RawMarketFrameSerializeWire<'a> {
     frame_id: FrameId,
     received_at: Timestamp,
     transport: TransportFrameKind,
-    payload: &'a BoundedBytes<MAX_RAW_FRAME_BYTES>,
+    payload: &'a CapturePayload,
 }
 
 #[derive(Deserialize)]
@@ -346,6 +410,8 @@ impl<'de> Deserialize<'de> for RawMarketFrame {
         D: Deserializer<'de>,
     {
         let wire = RawMarketFrameWire::deserialize(deserializer)?;
+        let payload = CapturePayload::try_from_live(wire.payload.as_bytes())
+            .map_err(serde::de::Error::custom)?;
         Ok(Self {
             binding: FrameSessionBinding::new(
                 wire.source_id,
@@ -354,9 +420,9 @@ impl<'de> Deserialize<'de> for RawMarketFrame {
                 wire.connection_generation,
             ),
             frame_id: wire.frame_id,
-            received_at: wire.received_at,
+            receipt: RawFrameReceipt::Untrusted(wire.received_at),
             transport: wire.transport,
-            payload: wire.payload,
+            payload,
         })
     }
 }
@@ -436,4 +502,55 @@ pub enum SourceError {
     /// The generation ended, rolled over, or was revoked before frame construction.
     #[error("source session is no longer current")]
     SessionNotCurrent,
+    /// The registry clock source could not provide one sealed paired observation.
+    #[error("source-owned trusted receipt time is unavailable")]
+    TrustedTimeUnavailable,
+    /// The registry-wide paired wall/monotonic continuity latch is permanently terminal.
+    #[error("source-owned trusted receipt time is discontinuous")]
+    TrustedTimeDiscontinuity,
+}
+
+#[cfg(test)]
+mod tests {
+    use market_squawk_domain::{
+        ConnectionGeneration, MetadataRevision, SourceId, SourceIdentifier,
+        checked_arc_value_allocation_bytes,
+    };
+
+    use super::{FrameSessionBinding, FrameSessionIdentity, SessionId};
+
+    fn retained_string(value: &str, capacity: usize) -> String {
+        let mut retained = String::with_capacity(capacity);
+        retained.push_str(value);
+        retained
+    }
+
+    #[test]
+    fn frame_session_binding_charge_uses_actual_identifier_capacities()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let binding = FrameSessionBinding::new(
+            SourceId::try_from(retained_string("s", 97))?,
+            MetadataRevision::new(SourceIdentifier::try_from(retained_string("r", 113))?),
+            SessionId::new(SourceIdentifier::try_from(retained_string("q", 131))?),
+            ConnectionGeneration::new(1)?,
+        );
+        let dynamic = binding
+            .source_id()
+            .retained_bytes()
+            .checked_add(
+                binding
+                    .metadata_revision()
+                    .as_source_identifier()
+                    .retained_bytes(),
+            )
+            .and_then(|bytes| {
+                bytes.checked_add(binding.session_id().as_source_identifier().retained_bytes())
+            })
+            .ok_or("binding dynamic test total overflowed")?;
+        let expected = checked_arc_value_allocation_bytes::<FrameSessionIdentity>(dynamic)?;
+
+        assert_eq!(binding.checked_shared_allocation_bytes()?, expected);
+        assert!(dynamic > 3);
+        Ok(())
+    }
 }

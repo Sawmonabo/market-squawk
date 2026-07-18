@@ -36,6 +36,17 @@ use crate::provider_book::BookProcessingScratch;
 
 pub(super) type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
+#[derive(Debug)]
+struct FixtureResidentToken;
+
+impl market_squawk_domain::CaptureResidentToken for FixtureResidentToken {}
+
+fn fixture_resident_lease() -> market_squawk_domain::CaptureResidentGenerationLease {
+    market_squawk_domain::CaptureResidentGenerationLease::new(std::sync::Arc::new(
+        FixtureResidentToken,
+    ))
+}
+
 pub(super) const CONFIGURED_DEPTH: usize = 4;
 const SOURCE_TIMESTAMP: i64 = 10_000_000;
 const RECEIVED_AT: i64 = 20_000_000;
@@ -163,7 +174,7 @@ fn current_snapshot(
     let mut frames = registry.take_raw_frame_factory(&session)?;
     let mut reporter = registry.take_current_health_reporter(&session)?;
     let origin = session.started_at();
-    let timeline = SnapshotTimeline {
+    let mut timeline = SnapshotTimeline {
         source_timestamp: origin.checked_add_nanos(SOURCE_TIMESTAMP)?,
         received_at: origin.checked_add_nanos(RECEIVED_AT)?,
         evaluated_at: origin.checked_add_nanos(EVALUATED_AT)?,
@@ -198,13 +209,10 @@ fn current_snapshot(
     )?;
     registry.record_health(&session, reporter.report(health)?)?;
     let payload = format!("snapshot-{source}").into_bytes();
-    let frame = frames.try_frame(
-        timeline.received_at,
-        TransportFrameKind::Binary,
-        payload.into(),
-    )?;
+    let frame = frames.try_frame(TransportFrameKind::Binary, payload.into())?;
+    timeline.received_at = frame.received_at();
     admission.preflight(&frame)?;
-    let receipt = admission.issue_after_enqueue(&frame)?;
+    let receipt = admission.issue_after_enqueue(&frame, fixture_resident_lease())?;
     let validated = session.validate_live_frame(&frame)?;
     let decoder = DecoderEvidence::from_validated_frame(&validated, rule("snapshot-decoder")?);
     let observation = ProviderNormalizedObservation::try_new(

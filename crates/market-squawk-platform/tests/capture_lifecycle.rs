@@ -1,4 +1,5 @@
 use std::num::{NonZeroU64, NonZeroUsize};
+use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -7,19 +8,60 @@ use market_squawk_domain::{
     RawCaptureFrameView, SourceId, SourceIdentifier, Timestamp,
 };
 use market_squawk_platform::{
-    CaptureDestination, CaptureGenerationError, CaptureHealthReason, CaptureIoContext,
-    CaptureShutdownStatus, CaptureSink, CaptureSinkError, CaptureStorageErrorClass,
-    CaptureWorkerReapError, CaptureWorkerTermination, CaptureWriterHandle, CaptureWriterOutcome,
-    CaptureWriterPolicy, CaptureWriterSpawnError, CapturedRawRecord, DiagnosticCaptureBundle,
-    DiagnosticCaptureFrame, DiagnosticCaptureReceipt, LocalPaths, MemoryCaptureSink,
-    RawCaptureControl, RawCapturePublisher, raw_capture_channel, spawn_capture_writer,
+    CaptureChannelLimits, CaptureDestination, CaptureGenerationError, CaptureHealthReason,
+    CaptureIoContext, CaptureProcessInfrastructureLimits, CaptureShutdownStatus, CaptureSink,
+    CaptureSinkError, CaptureStorageErrorClass, CaptureWorkerReapError, CaptureWorkerTermination,
+    CaptureWriterHandle, CaptureWriterOutcome, CaptureWriterPolicy, CaptureWriterSpawnError,
+    CapturedRawRecord, DiagnosticCaptureBundle, DiagnosticCaptureFrame, DiagnosticCaptureReceipt,
+    LocalPaths, MemoryCaptureSink, RawCaptureChannel, RawCaptureControl, RawCapturePublisher,
+    initialize_capture_process_infrastructure, raw_capture_channel, spawn_capture_writer,
 };
 use static_assertions::{assert_impl_all, assert_not_impl_any};
 
-assert_impl_all!(RawCapturePublisher<DiagnosticCaptureBundle>: Clone, Send, Sync);
+assert_impl_all!(RawCapturePublisher<DiagnosticCaptureBundle>: Send, Sync);
+assert_not_impl_any!(RawCapturePublisher<DiagnosticCaptureBundle>: Clone);
 assert_not_impl_any!(RawCaptureControl<DiagnosticCaptureBundle>: Clone);
 assert_not_impl_any!(DiagnosticCaptureBundle: Clone, serde::Serialize, serde::de::DeserializeOwned);
 assert_not_impl_any!(DiagnosticCaptureReceipt: Clone, serde::Serialize, serde::de::DeserializeOwned);
+
+const TEST_CAPTURE_MEMORY_CEILING_BYTES: usize = 64 * 1024 * 1024;
+const TEST_DESTINATION_REGISTRY_CEILING_BYTES: usize = 1024 * 1024;
+const TEST_MEMORY_SINK_MAX_RECORDS: usize = 4_096;
+const TEST_MEMORY_SINK_RETAINED_CEILING_BYTES: usize = 64 * 1024 * 1024;
+
+fn test_memory_capture_sink() -> Result<MemoryCaptureSink, Box<dyn std::error::Error>> {
+    Ok(MemoryCaptureSink::try_new(
+        NonZeroUsize::new(TEST_MEMORY_SINK_MAX_RECORDS).ok_or("invalid test sink record limit")?,
+        NonZeroUsize::new(TEST_MEMORY_SINK_RETAINED_CEILING_BYTES)
+            .ok_or("invalid test sink retained-byte ceiling")?,
+    )?)
+}
+
+fn test_capture_channel(
+    capacity: NonZeroUsize,
+    bundle: DiagnosticCaptureBundle,
+) -> Result<RawCaptureChannel<DiagnosticCaptureBundle>, Box<dyn std::error::Error>> {
+    let process =
+        initialize_capture_process_infrastructure(CaptureProcessInfrastructureLimits::new(
+            NonZeroUsize::new(TEST_DESTINATION_REGISTRY_CEILING_BYTES).unwrap_or(NonZeroUsize::MIN),
+        ))?;
+    Ok(raw_capture_channel(
+        &process,
+        CaptureChannelLimits::new(
+            capacity,
+            NonZeroUsize::new(TEST_CAPTURE_MEMORY_CEILING_BYTES).unwrap_or(NonZeroUsize::MIN),
+        ),
+        bundle,
+    )?)
+}
+
+fn accounted_record_bytes(
+    publisher: &RawCapturePublisher<DiagnosticCaptureBundle>,
+) -> Result<usize, market_squawk_platform::CaptureAccountingSnapshotError> {
+    publisher
+        .try_accounting_snapshot(NonZeroUsize::new(64).unwrap_or(NonZeroUsize::MIN))
+        .map(market_squawk_platform::CaptureAccountingSnapshot::record_reservation_bytes)
+}
 
 fn identity(generation: u64) -> Result<CaptureAuthorityIdentity, Box<dyn std::error::Error>> {
     Ok(CaptureAuthorityIdentity::new(
@@ -56,19 +98,125 @@ async fn shutdown_and_reap(
         .ok_or_else(|| "terminated capture worker did not retain a final report".into())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_deadline_is_reported_while_an_admitted_publisher_clone_is_paused()
+-> Result<(), Box<dyn std::error::Error>> {
+    let deadline_runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()?;
+    let (publisher, mut control, writer) = test_capture_channel(
+        NonZeroUsize::MIN,
+        DiagnosticCaptureBundle::new(identity(1)?),
+    )?;
+    let handle = spawn_capture_writer(
+        writer,
+        test_memory_capture_sink()?,
+        CaptureWriterPolicy::default(),
+    )?;
+    control.activate_initial()?;
+
+    let publisher = Arc::new(publisher);
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let clone_worker = {
+        let publisher = Arc::clone(&publisher);
+        let entered = Arc::clone(&entered);
+        let release = Arc::clone(&release);
+        std::thread::spawn(move || {
+            publisher.try_clone_after_registration_paused_for_test(&entered, &release)
+        })
+    };
+    entered.wait();
+
+    let (shutdown_sender, shutdown_receiver) = std::sync::mpsc::sync_channel(1);
+    let shutdown_worker = std::thread::spawn(move || {
+        let pending = handle.shutdown(Duration::from_millis(25));
+        let _sent = shutdown_sender.send(pending);
+    });
+    let pending = match shutdown_receiver.recv_timeout(Duration::from_secs(1)) {
+        Ok(pending) => pending,
+        Err(error) => {
+            release.wait();
+            let clone_result = clone_worker.join();
+            let shutdown_result = shutdown_worker.join();
+            drop(shutdown_receiver);
+            let clone = clone_result.map_err(|_panic| "publisher clone worker panicked")??;
+            drop(clone);
+            shutdown_result.map_err(|_panic| "shutdown worker panicked")?;
+            return Err(format!("shutdown did not return before clone release: {error}").into());
+        }
+    };
+
+    let (deadline_sender, deadline_receiver) = std::sync::mpsc::sync_channel(1);
+    let deadline_worker = std::thread::spawn(move || {
+        let mut pending = pending;
+        let status = deadline_runtime.block_on(pending.wait_until_deadline());
+        let _sent = deadline_sender.send((status, pending));
+    });
+    let mut observed = deadline_receiver.recv_timeout(Duration::from_secs(1));
+    let reported_before_release = observed.is_ok();
+    let (storage_retained, worker_retained) = match &mut observed {
+        Ok((_status, pending)) => (
+            pending.fixed_storage_receipt().is_some(),
+            matches!(
+                pending.try_reap(),
+                Err(CaptureWorkerReapError::WorkerStillRunning)
+            ),
+        ),
+        Err(_error) => (false, false),
+    };
+    release.wait();
+    let deadline_result = match observed {
+        Ok(result) => Ok(result),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => deadline_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .map_err(|_error| "deadline wait did not return after clone release"),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err("deadline result channel disconnected")
+        }
+    };
+    let clone_result = clone_worker.join();
+    let shutdown_result = shutdown_worker.join();
+    let deadline_join_result = deadline_worker.join();
+    let clone = clone_result.map_err(|_panic| "publisher clone worker panicked")??;
+    drop(clone);
+    shutdown_result.map_err(|_panic| "shutdown worker panicked")?;
+    deadline_join_result.map_err(|_panic| "deadline worker panicked")?;
+    let (status, mut pending) = deadline_result?;
+    pending.wait_until_terminated().await;
+    let _termination = pending
+        .try_reap()?
+        .ok_or("terminated writer omitted its final report")?;
+
+    assert!(
+        reported_before_release,
+        "deadline reporting waited for an already-admitted publisher clone"
+    );
+    assert_eq!(status, CaptureShutdownStatus::DeadlineElapsed);
+    assert!(
+        storage_retained,
+        "deadline reporting released pending writer fixed storage"
+    );
+    assert!(
+        worker_retained,
+        "deadline reporting lost ownership of the running capture worker"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn activation_before_writer_start_is_retryable_after_writer_start()
 -> Result<(), Box<dyn std::error::Error>> {
     let identity = identity(1)?;
     let (_publisher, mut control, writer) =
-        raw_capture_channel(NonZeroUsize::MIN, DiagnosticCaptureBundle::new(identity));
+        test_capture_channel(NonZeroUsize::MIN, DiagnosticCaptureBundle::new(identity))?;
     assert_eq!(
         control.activate_initial(),
         Err(CaptureGenerationError::WriterUnavailable)
     );
     let handle = spawn_capture_writer(
         writer,
-        MemoryCaptureSink::default(),
+        test_memory_capture_sink()?,
         CaptureWriterPolicy::default(),
     )?;
     control.activate_initial()?;
@@ -80,13 +228,13 @@ async fn activation_before_writer_start_is_retryable_after_writer_start()
 #[tokio::test]
 async fn worker_terminated_before_deadline_is_not_retroactively_timed_out_at_late_reap()
 -> Result<(), Box<dyn std::error::Error>> {
-    let (_publisher, _control, writer) = raw_capture_channel(
+    let (_publisher, _control, writer) = test_capture_channel(
         NonZeroUsize::MIN,
         DiagnosticCaptureBundle::new(identity(1)?),
-    );
+    )?;
     let handle = spawn_capture_writer(
         writer,
-        MemoryCaptureSink::default(),
+        test_memory_capture_sink()?,
         CaptureWriterPolicy::default(),
     )?;
     let mut pending = handle.shutdown(Duration::from_millis(100));
@@ -108,13 +256,13 @@ async fn worker_terminated_before_deadline_is_not_retroactively_timed_out_at_lat
 async fn natural_writer_completion_degrades_every_previously_issued_receipt()
 -> Result<(), Box<dyn std::error::Error>> {
     let identity = identity(1)?;
-    let (publisher, mut control, writer) = raw_capture_channel(
+    let (publisher, mut control, writer) = test_capture_channel(
         NonZeroUsize::MIN,
         DiagnosticCaptureBundle::new(identity.clone()),
-    );
+    )?;
     let handle = spawn_capture_writer(
         writer,
-        MemoryCaptureSink::default(),
+        test_memory_capture_sink()?,
         CaptureWriterPolicy::default(),
     )?;
     control.activate_initial()?;
@@ -170,10 +318,10 @@ impl CaptureSink for GatedFailingSink {
 async fn old_queued_frame_failure_degrades_the_current_writer_allocation()
 -> Result<(), Box<dyn std::error::Error>> {
     let first = identity(1)?;
-    let (publisher, mut control, writer) = raw_capture_channel(
+    let (publisher, mut control, writer) = test_capture_channel(
         NonZeroUsize::new(4).ok_or("invalid test capacity")?,
         DiagnosticCaptureBundle::new(first.clone()),
-    );
+    )?;
     let (entered_sender, entered_receiver) = std::sync::mpsc::sync_channel(1);
     let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(1);
     let handle = spawn_capture_writer(
@@ -238,13 +386,13 @@ impl CaptureSink for GatedSink {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn blocking_sink_does_not_stall_tokio_and_handle_drop_releases_exact_queued_bytes()
+async fn blocking_sink_does_not_stall_tokio_and_releases_writer_owned_reservation_after_append()
 -> Result<(), Box<dyn std::error::Error>> {
     let identity = identity(1)?;
-    let (publisher, mut control, writer) = raw_capture_channel(
+    let (publisher, mut control, writer) = test_capture_channel(
         NonZeroUsize::new(3).ok_or("invalid test capacity")?,
         DiagnosticCaptureBundle::new(identity.clone()),
-    );
+    )?;
     let (entered_sender, entered_receiver) = std::sync::mpsc::sync_channel(1);
     let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(1);
     let handle = spawn_capture_writer(
@@ -262,16 +410,23 @@ async fn blocking_sink_does_not_stall_tokio_and_handle_drop_releases_exact_queue
     let third = frame(identity, 3)?;
     let _first_receipt = publisher.try_publish(&first)?;
     entered_receiver.recv_timeout(Duration::from_secs(1))?;
+    let one_frame_charge = accounted_record_bytes(&publisher)?;
+    assert!(one_frame_charge > first.payload().len());
     tokio::time::timeout(
         Duration::from_millis(50),
         tokio::time::sleep(Duration::from_millis(1)),
     )
     .await?;
     let _second_receipt = publisher.try_publish(&second)?;
-    let one_frame_charge = publisher.queued_bytes();
+    assert_eq!(
+        accounted_record_bytes(&publisher)?,
+        one_frame_charge.saturating_mul(2)
+    );
     let _third_receipt = publisher.try_publish(&third)?;
-    assert_eq!(publisher.queued_bytes(), one_frame_charge.saturating_mul(2));
-    assert!(one_frame_charge > second.payload().len());
+    assert_eq!(
+        accounted_record_bytes(&publisher)?,
+        one_frame_charge.saturating_mul(3)
+    );
 
     let (drop_complete_sender, drop_complete_receiver) = std::sync::mpsc::sync_channel(1);
     let drop_thread = std::thread::spawn(move || {
@@ -279,10 +434,12 @@ async fn blocking_sink_does_not_stall_tokio_and_handle_drop_releases_exact_queue
         let _sent = drop_complete_sender.send(());
     });
     let queue_release_deadline = std::time::Instant::now() + Duration::from_secs(1);
-    while publisher.queued_bytes() != 0 && std::time::Instant::now() < queue_release_deadline {
+    while accounted_record_bytes(&publisher)? != one_frame_charge
+        && std::time::Instant::now() < queue_release_deadline
+    {
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
-    assert_eq!(publisher.queued_bytes(), 0);
+    assert_eq!(accounted_record_bytes(&publisher)?, one_frame_charge);
     assert!(matches!(
         drop_complete_receiver.try_recv(),
         Err(std::sync::mpsc::TryRecvError::Empty)
@@ -292,6 +449,7 @@ async fn blocking_sink_does_not_stall_tokio_and_handle_drop_releases_exact_queue
     drop_thread
         .join()
         .map_err(|_panic| "capture handle drop thread panicked")?;
+    assert_eq!(accounted_record_bytes(&publisher)?, 0);
     drop(control);
     Ok(())
 }
@@ -337,10 +495,10 @@ async fn destination_fence_rejects_concurrent_independent_writer()
     let destination_label = "capture-lifecycle-shared-destination";
     let destination = CaptureDestination::try_named(destination_label)?;
     let first_identity = identity(1)?;
-    let (first_publisher, mut first_control, first_writer) = raw_capture_channel(
+    let (first_publisher, mut first_control, first_writer) = test_capture_channel(
         NonZeroUsize::MIN,
         DiagnosticCaptureBundle::new(first_identity.clone()),
-    );
+    )?;
     let (entered_sender, entered_receiver) = std::sync::mpsc::sync_channel(1);
     let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(1);
     let first_handle = spawn_capture_writer(
@@ -357,10 +515,10 @@ async fn destination_fence_rejects_concurrent_independent_writer()
     let _first_receipt = first_publisher.try_publish(&first_frame)?;
     entered_receiver.recv_timeout(Duration::from_secs(1))?;
 
-    let (_second_publisher, _second_control, second_writer) = raw_capture_channel(
+    let (_second_publisher, _second_control, second_writer) = test_capture_channel(
         NonZeroUsize::MIN,
         DiagnosticCaptureBundle::new(identity(1)?),
-    );
+    )?;
     assert!(matches!(
         spawn_capture_writer(
             second_writer,
@@ -371,7 +529,10 @@ async fn destination_fence_rejects_concurrent_independent_writer()
             },
             CaptureWriterPolicy::default(),
         ),
-        Err(CaptureWriterSpawnError::DestinationBusy { .. })
+        Err(CaptureWriterSpawnError::DestinationFence {
+            source: market_squawk_platform::CaptureDestinationFenceError::Busy,
+            ..
+        })
     ));
 
     release_sender.send(())?;
@@ -383,10 +544,10 @@ async fn destination_fence_rejects_concurrent_independent_writer()
             .is_incomplete()
     );
 
-    let (_third_publisher, _third_control, third_writer) = raw_capture_channel(
+    let (_third_publisher, _third_control, third_writer) = test_capture_channel(
         NonZeroUsize::MIN,
         DiagnosticCaptureBundle::new(identity(1)?),
-    );
+    )?;
     let third_handle = spawn_capture_writer(
         third_writer,
         DestinationGatedSink {
@@ -407,10 +568,10 @@ async fn finished_unreaped_journal_destination_remains_fenced()
     let directory = tempfile::tempdir()?;
     let paths = LocalPaths::prepare(directory.path().join("data"))?;
     let first_sink = paths.open_journal_writer("capture-lifecycle")?;
-    let (_first_publisher, _first_control, first_writer) = raw_capture_channel(
+    let (_first_publisher, _first_control, first_writer) = test_capture_channel(
         NonZeroUsize::MIN,
         DiagnosticCaptureBundle::new(identity(1)?),
-    );
+    )?;
     let first_handle =
         spawn_capture_writer(first_writer, first_sink, CaptureWriterPolicy::default())?;
     let mut pending = first_handle.shutdown(Duration::from_secs(1));
@@ -423,13 +584,16 @@ async fn finished_unreaped_journal_destination_remains_fenced()
     // Worker exit releases the journal's OS file lock, but the unreaped owner must still fence a
     // second in-process worker for the same prepared canonical destination.
     let blocked_sink = paths.open_journal_writer("capture-lifecycle")?;
-    let (_blocked_publisher, _blocked_control, blocked_writer) = raw_capture_channel(
+    let (_blocked_publisher, _blocked_control, blocked_writer) = test_capture_channel(
         NonZeroUsize::MIN,
         DiagnosticCaptureBundle::new(identity(1)?),
-    );
+    )?;
     assert!(matches!(
         spawn_capture_writer(blocked_writer, blocked_sink, CaptureWriterPolicy::default(),),
-        Err(CaptureWriterSpawnError::DestinationBusy { .. })
+        Err(CaptureWriterSpawnError::DestinationFence {
+            source: market_squawk_platform::CaptureDestinationFenceError::Busy,
+            ..
+        })
     ));
 
     let first_termination = pending
@@ -437,10 +601,10 @@ async fn finished_unreaped_journal_destination_remains_fenced()
         .ok_or("finished journal worker did not retain termination")?;
     assert!(!first_termination.outcome().is_incomplete());
     let successor_sink = paths.open_journal_writer("capture-lifecycle")?;
-    let (_successor_publisher, _successor_control, successor_writer) = raw_capture_channel(
+    let (_successor_publisher, _successor_control, successor_writer) = test_capture_channel(
         NonZeroUsize::MIN,
         DiagnosticCaptureBundle::new(identity(1)?),
-    );
+    )?;
     let successor = spawn_capture_writer(
         successor_writer,
         successor_sink,

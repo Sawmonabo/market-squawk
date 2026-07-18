@@ -1,34 +1,62 @@
 //! Supervised capture-sink storage outside the live event-to-action path.
 
+#[cfg(feature = "capture-benchmark")]
+mod benchmark;
 mod destination;
+#[cfg(not(test))]
 mod lifecycle;
+#[cfg(test)]
+pub(super) mod lifecycle;
+mod runtime;
 mod sink;
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use bytes::Bytes;
+use crate::{RawCaptureRecord, RawCaptureRecordError};
 use market_squawk_domain::{CaptureAuthorityBundle, RawCaptureFrameView};
 use thiserror::Error;
-use uuid::Uuid;
 
-use crate::{RawCaptureRecord, RawCaptureRecordError};
-
+use super::accounting::CaptureAccountingError;
+use super::queue::{RecvTimeoutError, TryRecvError};
+use super::transport::{CaptureQueueReceiver, CaptureQueueTransport};
 use super::{
-    CaptureHealthReason, CaptureMessage, CaptureState, CaptureWriterPolicy, CapturedRawRecord,
-    GenerationCaptureState, RawCaptureWriter, WRITER_NOT_STARTED, WRITER_RUNNING,
+    CaptureHealthReason, CaptureIdentitySnapshot, CaptureMessage, CaptureState, CaptureWriterCore,
+    CaptureWriterPolicy, CapturedRawRecord, GenerationCaptureState, RawCaptureWriter,
+    WRITER_NOT_STARTED, WRITER_RUNNING,
 };
-use destination::{CaptureDestinationFenceError, acquire_destination_fence};
+#[cfg(feature = "capture-benchmark")]
+pub(super) use benchmark::{
+    BenchmarkCaptureWriterHandle, BenchmarkCaptureWriterShutdown, spawn_benchmark_capture_writer,
+};
+use destination::{
+    CaptureDestinationLease, acquire_destination_fence, destination_lease_allocation_bytes,
+};
 use lifecycle::CaptureWorkerFinalReport;
+pub(super) use lifecycle::WriterLifecycleCore;
+use runtime::{
+    PreparedWriterRuntime, WriterFixedStorageError, WriterFixedStorageOwner,
+    WriterRuntimePreparationError, WriterScratch, WriterScratchError, prepare_writer_runtime,
+};
 
-pub use destination::{CaptureDestination, CaptureDestinationError};
+pub use destination::{
+    CaptureDestination, CaptureDestinationError, CaptureDestinationFenceError,
+    CaptureProcessInfrastructure, CaptureProcessInfrastructureLimits,
+    DestinationFenceRegistryInitializationError,
+    DestinationFenceRegistryPermanentInitializationError,
+    initialize_capture_process_infrastructure,
+};
+#[cfg(all(feature = "capture-test", debug_assertions))]
+pub use lifecycle::CaptureReceiverTestCoordinationError;
 pub use lifecycle::{
     CaptureShutdownStatus, CaptureWorkerReapError, CaptureWorkerTermination, CaptureWriterHandle,
     PendingCaptureWriter,
 };
+pub use runtime::{WriterFixedStorageReceipt, WriterRuntimeProofError};
 pub use sink::{
     CaptureIoContext, CaptureSink, CaptureSinkError, CaptureStorageErrorClass, MemoryCaptureSink,
+    MemoryCaptureSinkConstructionError,
 };
 
 /// Final supervised writer outcome.
@@ -68,18 +96,43 @@ impl CaptureWriterOutcome {
 /// Failure to start the dedicated capture writer thread.
 #[derive(Debug, Error)]
 pub enum CaptureWriterSpawnError {
-    /// Another worker or unreaped lifecycle owner fences the exact destination.
-    #[error("capture destination already has an active or unreaped writer: {destination:?}")]
-    DestinationBusy {
+    /// The complete writer-start graph exceeded the channel memory ceiling.
+    #[error("capture writer fixed storage requires {required} bytes but ceiling is {limit} bytes")]
+    FixedStorageBudgetExceeded {
+        /// Total channel bytes required by the rejected reservation.
+        required: usize,
+        /// Configured channel ceiling.
+        limit: usize,
+    },
+    /// A fallible fixed writer scratch allocation was refused.
+    #[error("capture writer scratch allocation of {requested_bytes} bytes failed")]
+    ScratchAllocationFailed {
+        /// Exact requested allocation length.
+        requested_bytes: usize,
+    },
+    /// The fixed destination registry rejected this exact destination.
+    #[error("capture destination fence rejected {destination:?}: {source}")]
+    DestinationFence {
         /// Redacted exact destination identity.
         destination: CaptureDestination,
+        /// Exact fixed-registry refusal.
+        #[source]
+        source: CaptureDestinationFenceError,
     },
-    /// The bounded process-wide active-destination registry is full.
-    #[error("active capture destination capacity is exhausted")]
-    DestinationCapacity,
+    /// The pinned standard-library runtime proof did not match this binary.
+    #[error("capture writer runtime proof failed: {0}")]
+    RuntimeProof(#[from] WriterRuntimeProofError),
+    /// The configured writer thread name exceeded its fixed bound.
+    #[error("capture writer thread name is {actual} bytes; maximum is {limit}")]
+    ThreadNameLimitExceeded {
+        /// Actual UTF-8 thread-name length.
+        actual: usize,
+        /// Maximum admitted UTF-8 thread-name length.
+        limit: usize,
+    },
     /// The operating system rejected dedicated thread creation.
     #[error("failed to start dedicated capture writer thread: {source}")]
-    Thread {
+    ThreadSpawnFailed {
         /// Underlying operating-system thread creation failure.
         #[source]
         source: std::io::Error,
@@ -101,63 +154,70 @@ fn stop_accepting<B: CaptureAuthorityBundle>(state: &CaptureState<B>) {
     state.stop_writer(CaptureHealthReason::WriterStopped);
 }
 
-fn diagnostic_uuid_inputs<F: RawCaptureFrameView>(frame: &F) -> (Uuid, Uuid) {
-    let mut generation = Vec::with_capacity(256);
-    for field in [
-        frame.source_id().as_str().as_bytes(),
-        frame
-            .metadata_revision()
-            .as_source_identifier()
-            .as_str()
-            .as_bytes(),
-        frame.session_identifier().as_str().as_bytes(),
-    ] {
-        generation.extend_from_slice(
-            &u64::try_from(field.len())
-                .map_or(u64::MAX, |length| length)
-                .to_be_bytes(),
-        );
-        generation.extend_from_slice(field);
-    }
-    generation.extend_from_slice(&frame.connection_generation().get().to_be_bytes());
-    let connection_id = Uuid::new_v5(&Uuid::NAMESPACE_OID, &generation);
-    let mut event = Vec::with_capacity(24);
-    event.extend_from_slice(connection_id.as_bytes());
-    event.extend_from_slice(&frame.frame_ordinal().get().to_be_bytes());
-    (connection_id, Uuid::new_v5(&Uuid::NAMESPACE_OID, &event))
-}
-
 fn diagnostic_record<B: CaptureAuthorityBundle>(
     allocation: &Arc<GenerationCaptureState<B>>,
     frame: &B::Frame,
+    scratch: &mut WriterScratch,
 ) -> Result<CapturedRawRecord, RawCaptureRecordError> {
-    let (connection_id, event_id) = diagnostic_uuid_inputs(frame);
+    let (connection_id, event_id) = scratch.diagnostic_uuid_inputs(frame).map_err(|_error| {
+        RawCaptureRecordError::RetainedSize(
+            market_squawk_domain::CaptureRetainedSizeError::InvalidAuthorityGraph {
+                component: market_squawk_domain::CaptureRetainedComponent::Frame,
+            },
+        )
+    })?;
     let nanos = frame.received_at().unix_nanos();
     let seconds = nanos.div_euclid(1_000_000_000);
     let subsecond = u32::try_from(nanos.rem_euclid(1_000_000_000))
         .map_err(|_error| RawCaptureRecordError::InvalidReceivedAt)?;
     let received_at = chrono::DateTime::from_timestamp(seconds, subsecond)
         .ok_or(RawCaptureRecordError::InvalidReceivedAt)?;
-    let record = RawCaptureRecord::try_new_live(
+    let record = RawCaptureRecord::try_new_live_payload(
         event_id,
-        Arc::from(frame.source_id().as_str()),
+        scratch
+            .source_arc(frame.source_id().as_str())
+            .map_err(|_error| {
+                RawCaptureRecordError::RetainedSize(
+                    market_squawk_domain::CaptureRetainedSizeError::InvalidAuthorityGraph {
+                        component: market_squawk_domain::CaptureRetainedComponent::Frame,
+                    },
+                )
+            })?,
         connection_id,
         None,
         None,
         received_at,
-        Bytes::copy_from_slice(frame.payload()),
+        frame.capture_payload().clone(),
     )?;
+    if !frame
+        .capture_payload()
+        .shares_allocation_with(record.capture_payload())
+    {
+        return Err(RawCaptureRecordError::InvalidPayloadSharing);
+    }
+    let _complete_retained_bytes = record.checked_retained_bytes()?;
     Ok(CapturedRawRecord::new(
-        Arc::clone(&allocation.identity),
+        CaptureIdentitySnapshot(Arc::clone(&allocation.identity)),
         frame.frame_ordinal(),
         record,
     ))
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct CaptureWriterProgress {
     records_written: u64,
     since_flush: usize,
+    scratch: WriterScratch,
+}
+
+impl CaptureWriterProgress {
+    fn new(scratch: WriterScratch) -> Self {
+        Self {
+            records_written: 0,
+            since_flush: 0,
+            scratch,
+        }
+    }
 }
 
 fn append_frame<B: CaptureAuthorityBundle, S: CaptureSink>(
@@ -169,14 +229,18 @@ fn append_frame<B: CaptureAuthorityBundle, S: CaptureSink>(
     policy: CaptureWriterPolicy,
     io_context: &CaptureIoContext,
 ) -> Result<(), CaptureWriterOutcome> {
-    let captured = diagnostic_record(allocation, frame).map_err(|_error| {
-        state.mark_incomplete_for_generation(allocation, CaptureHealthReason::DiagnosticConversion);
-        state.mark_writer_failed();
-        CaptureWriterOutcome::Incomplete {
-            records_written: progress.records_written,
-            reason: CaptureHealthReason::DiagnosticConversion,
-        }
-    })?;
+    let captured =
+        diagnostic_record(allocation, frame, &mut progress.scratch).map_err(|_error| {
+            state.mark_incomplete_for_generation(
+                allocation,
+                CaptureHealthReason::DiagnosticConversion,
+            );
+            state.mark_writer_failed();
+            CaptureWriterOutcome::Incomplete {
+                records_written: progress.records_written,
+                reason: CaptureHealthReason::DiagnosticConversion,
+            }
+        })?;
     if io_context.deadline_reached() {
         return Err(shutdown_deadline_outcome(state, progress.records_written));
     }
@@ -220,36 +284,25 @@ fn append_frame<B: CaptureAuthorityBundle, S: CaptureSink>(
     Ok(())
 }
 
-fn try_receive<B: CaptureAuthorityBundle>(
-    writer: &RawCaptureWriter<B>,
-) -> Result<CaptureMessage<B>, mpsc::TryRecvError> {
-    let receiver = match writer.receiver.lock() {
-        Ok(receiver) => receiver,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    receiver.try_recv()
+fn try_receive<B: CaptureAuthorityBundle, T: CaptureQueueTransport>(
+    writer: &CaptureWriterCore<B, T>,
+) -> Result<CaptureMessage<B>, TryRecvError> {
+    writer
+        .receiver
+        .as_ref()
+        .ok_or(TryRecvError::Closed)?
+        .try_recv()
 }
 
-fn receive_timeout<B: CaptureAuthorityBundle>(
-    writer: &RawCaptureWriter<B>,
+fn receive_timeout<B: CaptureAuthorityBundle, T: CaptureQueueTransport>(
+    writer: &CaptureWriterCore<B, T>,
     timeout: Duration,
-) -> Result<CaptureMessage<B>, mpsc::RecvTimeoutError> {
-    let receiver = match writer.receiver.lock() {
-        Ok(receiver) => receiver,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    receiver.recv_timeout(timeout)
-}
-
-pub(super) fn try_drain_pending<B: CaptureAuthorityBundle>(
-    receiver: &std::sync::Mutex<mpsc::Receiver<CaptureMessage<B>>>,
-) {
-    let receiver = match receiver.try_lock() {
-        Ok(receiver) => receiver,
-        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-        Err(std::sync::TryLockError::WouldBlock) => return,
-    };
-    while receiver.try_recv().is_ok() {}
+) -> Result<CaptureMessage<B>, RecvTimeoutError> {
+    writer
+        .receiver
+        .as_ref()
+        .ok_or(RecvTimeoutError::Closed)?
+        .recv_timeout(timeout)
 }
 
 fn process_message<B: CaptureAuthorityBundle, S: CaptureSink>(
@@ -266,11 +319,10 @@ fn process_message<B: CaptureAuthorityBundle, S: CaptureSink>(
             frame,
             reservation,
         } => {
-            // The bounded-queue permit covers work awaiting the single writer. Once dequeued, the
-            // writer owns the frame outside the queue budget; release before potentially blocking
-            // sink I/O so handle-drop and deadline-detach can reclaim every queued permit.
-            drop(reservation);
-            append_frame(
+            // Unified record accounting follows the owned record through conversion, append, and
+            // any policy-triggered flush. The reservation releases exactly once only after this
+            // complete writer operation returns or unwinds through an error path.
+            let result = append_frame(
                 sink,
                 &allocation,
                 &frame,
@@ -278,9 +330,10 @@ fn process_message<B: CaptureAuthorityBundle, S: CaptureSink>(
                 progress,
                 policy,
                 io_context,
-            )
+            );
+            drop(reservation);
+            result
         }
-        CaptureMessage::Wake => Ok(()),
     }
 }
 
@@ -300,8 +353,8 @@ fn shutdown_deadline_outcome<B: CaptureAuthorityBundle>(
     }
 }
 
-fn drain_and_flush<B: CaptureAuthorityBundle, S: CaptureSink>(
-    writer: &RawCaptureWriter<B>,
+fn drain_and_flush<B: CaptureAuthorityBundle, S: CaptureSink, T: CaptureQueueTransport>(
+    writer: &CaptureWriterCore<B, T>,
     sink: &mut S,
     state: &CaptureState<B>,
     progress: &mut CaptureWriterProgress,
@@ -320,7 +373,11 @@ fn drain_and_flush<B: CaptureAuthorityBundle, S: CaptureSink>(
                     return outcome;
                 }
             }
-            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
+            Err(TryRecvError::Empty) => std::thread::yield_now(),
+            Err(TryRecvError::Closed) => break,
+            Err(TryRecvError::Poisoned) => {
+                return writer_failed(state, progress.records_written);
+            }
         }
     }
     if io_context.deadline_reached() {
@@ -342,14 +399,15 @@ fn drain_and_flush<B: CaptureAuthorityBundle, S: CaptureSink>(
     }
 }
 
-fn run_capture_writer<B: CaptureAuthorityBundle, S: CaptureSink>(
-    writer: RawCaptureWriter<B>,
+fn run_capture_writer<B: CaptureAuthorityBundle, S: CaptureSink, T: CaptureQueueTransport>(
+    writer: CaptureWriterCore<B, T>,
     mut sink: S,
     policy: CaptureWriterPolicy,
     io_context: &CaptureIoContext,
+    scratch: WriterScratch,
 ) -> CaptureWriterOutcome {
     let state = Arc::clone(&writer.state);
-    let mut progress = CaptureWriterProgress::default();
+    let mut progress = CaptureWriterProgress::new(scratch);
     let mut next_flush_at = deadline_after(policy.flush_interval);
     loop {
         if io_context.shutdown_requested() {
@@ -377,7 +435,7 @@ fn run_capture_writer<B: CaptureAuthorityBundle, S: CaptureSink>(
                     return outcome;
                 }
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
+            Err(RecvTimeoutError::Timeout) => {
                 if progress.since_flush > 0 {
                     match sink.flush(io_context) {
                         Ok(()) => {}
@@ -393,7 +451,7 @@ fn run_capture_writer<B: CaptureAuthorityBundle, S: CaptureSink>(
                 progress.since_flush = 0;
                 next_flush_at = deadline_after(policy.flush_interval);
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err(RecvTimeoutError::Closed) => {
                 stop_accepting(&state);
                 return drain_and_flush(
                     &writer,
@@ -403,6 +461,9 @@ fn run_capture_writer<B: CaptureAuthorityBundle, S: CaptureSink>(
                     policy,
                     io_context,
                 );
+            }
+            Err(RecvTimeoutError::Poisoned) => {
+                return writer_failed(&state, progress.records_written);
             }
         }
         if std::time::Instant::now() >= next_flush_at {
@@ -424,27 +485,160 @@ fn run_capture_writer<B: CaptureAuthorityBundle, S: CaptureSink>(
     }
 }
 
+#[derive(Debug)]
+struct WriterSpawnPacket<B: CaptureAuthorityBundle, S: CaptureSink, T: CaptureQueueTransport> {
+    writer: CaptureWriterCore<B, T>,
+    sink: S,
+    policy: CaptureWriterPolicy,
+    io_context: CaptureIoContext,
+    destination_fence: Arc<CaptureDestinationLease>,
+    fixed_storage: Arc<WriterFixedStorageOwner>,
+    scratch: WriterScratch,
+}
+
+impl<B: CaptureAuthorityBundle, S: CaptureSink, T: CaptureQueueTransport>
+    WriterSpawnPacket<B, S, T>
+{
+    fn run(self) {
+        let lifecycle = Arc::clone(&self.io_context.lifecycle);
+        let outcome = run_capture_writer(
+            self.writer,
+            self.sink,
+            self.policy,
+            &self.io_context,
+            self.scratch,
+        );
+        let report = CaptureWorkerFinalReport {
+            outcome,
+            shutdown_deadline_elapsed_at_exit: self.io_context.deadline_reached(),
+        };
+        match lifecycle.final_report.lock() {
+            Ok(mut retained) => *retained = Some(report),
+            Err(poisoned) => *poisoned.into_inner() = Some(report),
+        }
+        lifecycle.completion.notify_one();
+        drop(self.destination_fence);
+        drop(self.fixed_storage);
+    }
+}
+
+fn writer_runtime_error(
+    error: WriterRuntimePreparationError,
+    ceiling: usize,
+) -> CaptureWriterSpawnError {
+    match error {
+        WriterRuntimePreparationError::Scratch(WriterScratchError::AllocationFailed {
+            requested_bytes,
+        })
+        | WriterRuntimePreparationError::ThreadNameAllocationFailed { requested_bytes } => {
+            CaptureWriterSpawnError::ScratchAllocationFailed { requested_bytes }
+        }
+        WriterRuntimePreparationError::Proof(error) => CaptureWriterSpawnError::RuntimeProof(error),
+        WriterRuntimePreparationError::ThreadNameLimitExceeded { actual, limit } => {
+            CaptureWriterSpawnError::ThreadNameLimitExceeded { actual, limit }
+        }
+        WriterRuntimePreparationError::Accounting(CaptureAccountingError::BudgetExceeded {
+            required,
+            ceiling,
+        }) => CaptureWriterSpawnError::FixedStorageBudgetExceeded {
+            required,
+            limit: ceiling,
+        },
+        WriterRuntimePreparationError::FixedStorage(
+            WriterFixedStorageError::ArithmeticOverflow,
+        )
+        | WriterRuntimePreparationError::Layout
+        | WriterRuntimePreparationError::Accounting(
+            CaptureAccountingError::ArithmeticOverflow
+            | CaptureAccountingError::TransitionOverflow
+            | CaptureAccountingError::EpochOverflow
+            | CaptureAccountingError::InvariantViolated,
+        ) => CaptureWriterSpawnError::FixedStorageBudgetExceeded {
+            required: usize::MAX,
+            limit: ceiling,
+        },
+    }
+}
+
 /// Starts one supervised dedicated capture writer thread.
 pub fn spawn_capture_writer<B: CaptureAuthorityBundle, S: CaptureSink>(
-    mut writer: RawCaptureWriter<B>,
+    writer: RawCaptureWriter<B>,
     sink: S,
     policy: CaptureWriterPolicy,
 ) -> Result<CaptureWriterHandle<B>, CaptureWriterSpawnError> {
+    let spawned = spawn_capture_writer_core(writer.core, sink, policy)?;
+    Ok(CaptureWriterHandle {
+        thread: spawned.thread,
+        queue_control: spawned.queue_control,
+        io_context: spawned.io_context,
+        state: spawned.state,
+        destination_fence: spawned.destination_fence,
+        fixed_storage: spawned.fixed_storage,
+        completed: false,
+    })
+}
+
+#[derive(Debug)]
+struct SpawnedCaptureWriter<B: CaptureAuthorityBundle, T: CaptureQueueTransport> {
+    thread: Option<std::thread::JoinHandle<()>>,
+    queue_control: T::Control<CaptureMessage<B>>,
+    io_context: CaptureIoContext,
+    state: Arc<CaptureState<B>>,
+    destination_fence: Option<Arc<CaptureDestinationLease>>,
+    fixed_storage: Option<Arc<WriterFixedStorageOwner>>,
+}
+
+fn spawn_capture_writer_core<
+    B: CaptureAuthorityBundle,
+    S: CaptureSink,
+    T: CaptureQueueTransport,
+>(
+    writer: CaptureWriterCore<B, T>,
+    sink: S,
+    policy: CaptureWriterPolicy,
+) -> Result<SpawnedCaptureWriter<B, T>, CaptureWriterSpawnError> {
     let destination = sink.destination();
     let (worker_destination_fence, owner_destination_fence) =
-        match acquire_destination_fence(&destination) {
+        match acquire_destination_fence(writer.state.process, &destination) {
             Ok(fences) => fences,
             Err(CaptureDestinationFenceError::Busy) => {
-                return Err(CaptureWriterSpawnError::DestinationBusy {
+                return Err(CaptureWriterSpawnError::DestinationFence {
                     destination: destination.clone(),
+                    source: CaptureDestinationFenceError::Busy,
                 });
             }
             Err(CaptureDestinationFenceError::Capacity) => {
-                return Err(CaptureWriterSpawnError::DestinationCapacity);
+                return Err(CaptureWriterSpawnError::DestinationFence {
+                    destination: destination.clone(),
+                    source: CaptureDestinationFenceError::Capacity,
+                });
+            }
+            Err(CaptureDestinationFenceError::RegistryPoisoned) => {
+                return Err(CaptureWriterSpawnError::DestinationFence {
+                    destination: destination.clone(),
+                    source: CaptureDestinationFenceError::RegistryPoisoned,
+                });
             }
         };
     let state = Arc::clone(&writer.state);
-    let receiver = Arc::clone(&writer.receiver);
+    let queue_control = writer.queue_control.clone();
+    let ceiling = state.accounting.configured_ceiling().get();
+    let destination_lease_bytes = destination_lease_allocation_bytes().map_err(|_error| {
+        CaptureWriterSpawnError::FixedStorageBudgetExceeded {
+            required: usize::MAX,
+            limit: ceiling,
+        }
+    })?;
+    let PreparedWriterRuntime {
+        scratch,
+        thread_name,
+        fixed_storage,
+    } = prepare_writer_runtime(
+        &state.accounting,
+        destination_lease_bytes,
+        std::mem::size_of::<WriterSpawnPacket<B, S, T>>(),
+    )
+    .map_err(|error| writer_runtime_error(error, ceiling))?;
     writer
         .state
         .writer_lifecycle
@@ -454,51 +648,32 @@ pub fn spawn_capture_writer<B: CaptureAuthorityBundle, S: CaptureSink>(
             Ordering::AcqRel,
             Ordering::Acquire,
         )
-        .map_err(|_previous| CaptureWriterSpawnError::Thread {
+        .map_err(|_previous| CaptureWriterSpawnError::ThreadSpawnFailed {
             source: std::io::Error::other("capture writer lifecycle is not startable"),
         })?;
-    let shutdown_requested = Arc::new(AtomicBool::new(false));
-    let shutdown_deadline = Arc::new(std::sync::Mutex::new(None));
-    let io_context = CaptureIoContext::new(shutdown_requested, shutdown_deadline);
-    let thread_context = io_context.clone();
-    let wake_sender = writer
-        .sender
-        .take()
-        .ok_or_else(|| CaptureWriterSpawnError::Thread {
-            source: std::io::Error::other("capture writer control sender is unavailable"),
-        })?;
-    let completion = Arc::new(tokio::sync::Notify::new());
-    let thread_completion = Arc::clone(&completion);
-    let final_report = Arc::new(std::sync::Mutex::new(None));
-    let thread_report = Arc::clone(&final_report);
+    let io_context = CaptureIoContext::new(Arc::clone(&state.writer_lifecycle_core));
+    let packet = WriterSpawnPacket {
+        writer,
+        sink,
+        policy,
+        io_context: io_context.clone(),
+        destination_fence: worker_destination_fence,
+        fixed_storage: Arc::clone(&fixed_storage),
+        scratch,
+    };
     let thread = std::thread::Builder::new()
-        .name("market-squawk-capture".to_owned())
-        .spawn(move || {
-            let _worker_destination_fence = worker_destination_fence;
-            let outcome = run_capture_writer(writer, sink, policy, &thread_context);
-            let report = CaptureWorkerFinalReport {
-                outcome,
-                shutdown_deadline_elapsed_at_exit: thread_context.deadline_reached(),
-            };
-            match thread_report.lock() {
-                Ok(mut retained) => *retained = Some(report),
-                Err(poisoned) => *poisoned.into_inner() = Some(report),
-            }
-            thread_completion.notify_one();
-        })
+        .name(thread_name)
+        .spawn(move || packet.run())
         .map_err(|source| {
             state.mark_writer_failed();
-            CaptureWriterSpawnError::Thread { source }
+            CaptureWriterSpawnError::ThreadSpawnFailed { source }
         })?;
-    Ok(CaptureWriterHandle {
+    Ok(SpawnedCaptureWriter {
         thread: Some(thread),
-        completion,
-        final_report,
-        wake_sender: Some(wake_sender),
+        queue_control,
         io_context,
-        receiver,
         state,
         destination_fence: Some(owner_destination_fence),
-        completed: false,
+        fixed_storage: Some(fixed_storage),
     })
 }

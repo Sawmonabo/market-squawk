@@ -8,21 +8,34 @@ mod paths;
 mod raw_record;
 
 pub use authority_state::{LocalAuthorityStateStore, LocalAuthorityStateStoreError};
+#[cfg(all(feature = "capture-test", debug_assertions))]
+pub use capture::CaptureReceiverTestCoordinationError;
+#[cfg(feature = "capture-benchmark")]
+pub use capture::benchmark_support as capture_benchmark_support;
 pub use capture::{
-    CaptureDestination, CaptureDestinationError, CaptureGenerationError, CaptureHealthEvent,
-    CaptureHealthReason, CaptureHealthSnapshot, CaptureIoContext, CapturePublishError,
-    CaptureShutdownStatus, CaptureSink, CaptureSinkError, CaptureStorageErrorClass,
-    CaptureWorkerReapError, CaptureWorkerTermination, CaptureWriterHandle, CaptureWriterOutcome,
-    CaptureWriterPolicy, CaptureWriterPolicyError, CaptureWriterSpawnError, CapturedRawRecord,
-    DiagnosticCaptureBundle, DiagnosticCaptureError, DiagnosticCaptureFrame,
-    DiagnosticCaptureReceipt, MemoryCaptureSink, PendingCaptureWriter, RawCaptureControl,
-    RawCapturePublisher, RawCaptureWriter, raw_capture_channel, spawn_capture_writer,
+    CaptureAccountingSnapshot, CaptureAccountingSnapshotError, CaptureChannelError,
+    CaptureChannelLimits, CaptureDestination, CaptureDestinationError,
+    CaptureDestinationFenceError, CaptureGenerationError, CaptureHealthEvent, CaptureHealthReason,
+    CaptureHealthSnapshot, CaptureIoContext, CaptureProcessInfrastructure,
+    CaptureProcessInfrastructureLimits, CapturePublishError, CapturePublisherCloneError,
+    CaptureQueueKind, CaptureShutdownStatus, CaptureSink, CaptureSinkError,
+    CaptureStorageErrorClass, CaptureWorkerReapError, CaptureWorkerTermination,
+    CaptureWriterHandle, CaptureWriterOutcome, CaptureWriterPolicy, CaptureWriterPolicyError,
+    CaptureWriterSpawnError, CapturedRawRecord, DestinationFenceRegistryInitializationError,
+    DestinationFenceRegistryPermanentInitializationError, DiagnosticCaptureBundle,
+    DiagnosticCaptureError, DiagnosticCaptureFrame, DiagnosticCaptureReceipt, MemoryCaptureSink,
+    MemoryCaptureSinkConstructionError, PendingCaptureWriter, RawCaptureChannel, RawCaptureControl,
+    RawCapturePublisher, RawCaptureWriter, WriterFixedStorageReceipt, WriterRuntimeProofError,
+    initialize_capture_process_infrastructure, raw_capture_channel, spawn_capture_writer,
 };
 pub use config::{
     AppConfig, ConfigError, ConfigOverrides, ConfigSources, SecretError, SecretProvider,
     SecretReference, SecretValue,
 };
-pub use journal::{JournalError, JournalReader, JournalReplayAuthority, JournalWriter};
+pub use journal::{
+    JournalError, JournalReader, JournalReplayAuthority, JournalSinkConstructionError,
+    JournalSinkLimits, JournalWriter,
+};
 pub use paths::{
     ArtifactPathError, ArtifactRoot, JournalFileFormat, JournalSelectionError, LocalPaths,
     PathError, ResolvedArtifactPath,

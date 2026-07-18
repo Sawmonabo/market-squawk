@@ -7,8 +7,8 @@ use market_squawk_domain::{SourceId, SourceIdentifier, Timestamp, TradingStatus,
 use market_squawk_sources::{CurrentDecodedProviderBatch, ProviderSnapshotEvidence, RegistryError};
 
 use self::fixture::{
-    EVALUATED_AT, FRAME_AT, HEALTH_AT, SourceHarness, TestResult, VALID_UNTIL, definition,
-    non_book_snapshot, snapshot, status, trade, valid_multi_change_delta,
+    EVALUATED_AT, HEALTH_AT, SourceHarness, TestResult, VALID_UNTIL, definition, non_book_snapshot,
+    snapshot, status, trade, valid_multi_change_delta,
 };
 use super::error::LiveApplyError;
 use super::snapshot::{StatusSnapshotSeed, StreamSnapshotSeed};
@@ -320,6 +320,7 @@ fn committed_seed_is_sorted_truncated_and_exactly_base_charged() -> TestResult {
     let mut source_a = SourceHarness::try_new("source-a", 1)?;
     let (lease_b, batch_b) = source_b.batch("trade-b", 1, trade()?, non_book_snapshot()?)?;
     let (lease_a, batch_a) = source_a.batch("trade-a", 1, trade()?, non_book_snapshot()?)?;
+    let source_a_received_at = source_a.last_frame_received_at()?;
     let mut registry = GenerationAuthorityRegistry::try_new(2)?;
     let evaluated_at = source_a.timestamp(EVALUATED_AT)?;
     let admission_b = registry.bind_current(&lease_b, evaluated_at)?;
@@ -344,7 +345,7 @@ fn committed_seed_is_sorted_truncated_and_exactly_base_charged() -> TestResult {
     assert_eq!(stream.state_revision, 1);
     assert_eq!(stream.health_epoch, 1);
     assert_eq!(stream.source_valid_until, source_a.timestamp(VALID_UNTIL)?);
-    assert_eq!(stream.received_at, source_a.timestamp(FRAME_AT)?);
+    assert_eq!(stream.received_at, source_a_received_at);
     assert_eq!(stream.evaluated_at, evaluated_at);
     let expected_retained = std::mem::size_of::<ProcessorSnapshotSeed>()
         + std::mem::size_of::<StreamSnapshotSeed>()

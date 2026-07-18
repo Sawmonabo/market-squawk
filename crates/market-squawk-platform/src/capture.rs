@@ -1,23 +1,24 @@
 //! Non-blocking generic raw-capture publication and supervised storage.
 
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Weak, mpsc};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
 use market_squawk_domain::{
-    CaptureAdmission, CaptureAuthorityBundle, CaptureAuthorityError, CaptureAuthorityIdentity,
-    CaptureDegradation, CaptureIntegrityState, RawCaptureFrameView,
+    CaptureAuthorityBundle, CaptureDegradation, CaptureIntegrityState, CaptureRetainedComponent,
+    CaptureRetainedSizeError, RawCaptureFrameView, checked_arc_str_allocation_bytes,
+    checked_arc_value_allocation_bytes,
 };
-use thiserror::Error;
 
-use crate::RawCaptureRecord;
-
+use generation::{
+    CaptureIdentitySnapshot, GenerationCaptureState, GenerationPreparationError,
+    mark_bundle_incomplete, try_prepare_generation,
+};
 const WRITER_NOT_STARTED: u8 = 0;
 const WRITER_RUNNING: u8 = 1;
 const WRITER_STOPPED: u8 = 2;
 const HEALTH_EVENT_CAPACITY: usize = 64;
-const CAPTURE_QUEUE_BYTE_BUDGET: usize = 64 * 1024 * 1024;
 
 fn saturating_atomic_increment(counter: &AtomicU64) {
     let _previous = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
@@ -25,76 +26,66 @@ fn saturating_atomic_increment(counter: &AtomicU64) {
     });
 }
 
-/// Accepted diagnostic journal record derived from an exact authoritative raw frame.
-///
-/// This value carries audit identity only. Neither it nor its MSJ1 representation can recreate a
-/// source-registry receipt or current live authority.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CapturedRawRecord {
-    identity: Arc<CaptureAuthorityIdentity>,
-    frame_ordinal: std::num::NonZeroU64,
-    record: RawCaptureRecord,
-}
-
-impl CapturedRawRecord {
-    pub(super) fn new(
-        identity: Arc<CaptureAuthorityIdentity>,
-        frame_ordinal: std::num::NonZeroU64,
-        record: RawCaptureRecord,
-    ) -> Self {
-        Self {
-            identity,
-            frame_ordinal,
-            record,
-        }
-    }
-
-    /// Returns immutable source/session/generation audit identity.
-    pub fn identity(&self) -> &CaptureAuthorityIdentity {
-        &self.identity
-    }
-
-    /// Returns the exact nonzero generation-local frame ordinal.
-    pub const fn frame_ordinal(&self) -> std::num::NonZeroU64 {
-        self.frame_ordinal
-    }
-
-    /// Returns the diagnostic committed-wire record.
-    pub const fn record(&self) -> &RawCaptureRecord {
-        &self.record
-    }
-}
-
 #[derive(Debug)]
 enum CaptureMessage<B: CaptureAuthorityBundle> {
     Record {
         allocation: Arc<GenerationCaptureState<B>>,
-        frame: B::Frame,
-        reservation: QueueByteReservation<B>,
+        frame: Arc<B::Frame>,
+        reservation: QueueByteReservation,
     },
-    Wake,
 }
 
-#[derive(Debug)]
-struct QueueByteReservation<B: CaptureAuthorityBundle> {
-    state: Weak<CaptureState<B>>,
-    bytes: usize,
+/// Exact standard-channel reservation across enqueue, zero-copy conversion, append, and flush.
+///
+/// The complete queued frame already owns the payload allocation. Writer conversion clones that
+/// exact [`market_squawk_domain::CapturePayload`] and proves allocation identity, so only the new
+/// source `Arc<str>` and the queued-frame `Arc` header are additional dynamic storage.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RecordReservationQuote {
+    complete_frame: usize,
+    queued_frame_allocation_overhead: usize,
+    conversion_source_allocation: usize,
 }
 
-impl<B: CaptureAuthorityBundle> Drop for QueueByteReservation<B> {
-    fn drop(&mut self) {
-        if let Some(state) = self.state.upgrade() {
-            state.release_queue_bytes_exact(self.bytes);
-        }
+impl RecordReservationQuote {
+    fn try_for_frame<B: CaptureAuthorityBundle>(
+        frame: &B::Frame,
+        complete_frame: usize,
+    ) -> Result<Self, CaptureRetainedSizeError> {
+        let queued_frame_allocation_overhead = checked_arc_value_allocation_bytes::<B::Frame>(0)
+            .map_err(|_error| CaptureRetainedSizeError::Overflow {
+                component: CaptureRetainedComponent::Frame,
+            })?
+            .checked_sub(std::mem::size_of::<B::Frame>())
+            .ok_or(CaptureRetainedSizeError::InvalidAuthorityGraph {
+                component: CaptureRetainedComponent::Frame,
+            })?;
+        let conversion_source_allocation = checked_arc_str_allocation_bytes(
+            frame.source_id().as_str().len(),
+        )
+        .map_err(|_error| CaptureRetainedSizeError::Overflow {
+            component: CaptureRetainedComponent::Frame,
+        })?;
+        Ok(Self {
+            complete_frame,
+            queued_frame_allocation_overhead,
+            conversion_source_allocation,
+        })
+    }
+
+    fn checked_total(self) -> Result<usize, CaptureRetainedSizeError> {
+        self.complete_frame
+            .checked_add(self.queued_frame_allocation_overhead)
+            .and_then(|bytes| bytes.checked_add(self.conversion_source_allocation))
+            .ok_or(CaptureRetainedSizeError::Overflow {
+                component: CaptureRetainedComponent::Frame,
+            })
     }
 }
 
 #[derive(Debug)]
-struct GenerationCaptureState<B: CaptureAuthorityBundle> {
-    identity: Arc<CaptureAuthorityIdentity>,
-    admission: std::sync::Mutex<B::Admission>,
-    degradation: B::Degradation,
-    accepting: AtomicBool,
+struct QueueByteReservation {
+    _reservation: accounting::CaptureMemoryReservation,
 }
 
 #[derive(Debug, Default)]
@@ -144,36 +135,21 @@ impl CaptureCompletionAccounting {
     }
 }
 
-impl<B: CaptureAuthorityBundle> GenerationCaptureState<B> {
-    fn new(
-        identity: CaptureAuthorityIdentity,
-        admission: B::Admission,
-        degradation: B::Degradation,
-    ) -> Self {
-        Self {
-            identity: Arc::new(identity),
-            admission: std::sync::Mutex::new(admission),
-            degradation,
-            accepting: AtomicBool::new(true),
-        }
-    }
-
-    fn integrity(&self) -> CaptureIntegrityState {
-        self.degradation.integrity()
-    }
-}
-
 #[derive(Debug)]
 struct CaptureState<B: CaptureAuthorityBundle> {
+    process: writer::CaptureProcessInfrastructure,
     active: ArcSwap<GenerationCaptureState<B>>,
     lifecycle_transition: std::sync::Mutex<()>,
     writer_lifecycle: AtomicU8,
     completion_accounting: std::sync::Mutex<CaptureCompletionAccounting>,
-    health_sender: mpsc::SyncSender<CaptureHealthEvent>,
-    health_receiver: std::sync::Mutex<mpsc::Receiver<CaptureHealthEvent>>,
+    health_sender: queue::FixedSender<CaptureHealthEvent>,
+    health_receiver: queue::FixedReceiver<CaptureHealthEvent>,
     dropped_health_events: AtomicU64,
-    accounting_invariant_failures: AtomicU64,
-    queued_bytes: AtomicUsize,
+    accounting: Arc<accounting::CaptureMemoryAccounting>,
+    _fixed_infrastructure: accounting::CaptureMemoryReservation,
+    queue_storage: transport::QueueStorageReceipt,
+    health_fixed_storage: queue::FixedStorageReceipt,
+    writer_lifecycle_core: Arc<writer::WriterLifecycleCore>,
 }
 
 impl<B: CaptureAuthorityBundle> CaptureState<B> {
@@ -192,7 +168,7 @@ impl<B: CaptureAuthorityBundle> CaptureState<B> {
         if self
             .health_sender
             .try_send(CaptureHealthEvent {
-                identity: generation.identity.as_ref().clone(),
+                identity: CaptureIdentitySnapshot(Arc::clone(&generation.identity)),
                 integrity: CaptureIntegrityState::Incomplete,
                 reason,
             })
@@ -268,474 +244,334 @@ impl<B: CaptureAuthorityBundle> CaptureState<B> {
         accounting.snapshot()
     }
 
-    fn try_reserve_queue_bytes(self: &Arc<Self>, bytes: usize) -> Option<QueueByteReservation<B>> {
-        let mut current = self.queued_bytes.load(Ordering::Acquire);
-        loop {
-            let next = current.checked_add(bytes)?;
-            if next > CAPTURE_QUEUE_BYTE_BUDGET {
-                return None;
-            }
-            match self.queued_bytes.compare_exchange_weak(
-                current,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_previous) => {
-                    return Some(QueueByteReservation {
-                        state: Arc::downgrade(self),
-                        bytes,
-                    });
-                }
-                Err(observed) => current = observed,
-            }
-        }
-    }
-
-    fn release_queue_bytes_exact(&self, bytes: usize) {
-        let mut current = self.queued_bytes.load(Ordering::Acquire);
-        loop {
-            let Some(next) = current.checked_sub(bytes) else {
-                saturating_atomic_increment(&self.accounting_invariant_failures);
-                self.mark_current_incomplete(CaptureHealthReason::AccountingInvariant);
-                return;
-            };
-            match self.queued_bytes.compare_exchange_weak(
-                current,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_previous) => return,
-                Err(observed) => current = observed,
-            }
-        }
+    fn try_reserve_queue_bytes(
+        &self,
+        bytes: usize,
+    ) -> Result<QueueByteReservation, accounting::CaptureAccountingError> {
+        self.accounting
+            .try_reserve(accounting::AccountingComponent::Record, bytes)
+            .map(|reservation| QueueByteReservation {
+                _reservation: reservation,
+            })
     }
 }
 
-/// Why capture health changed outside the event-to-action path.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CaptureHealthReason {
-    /// The bounded raw-capture queue had no available count or byte capacity.
-    Saturated,
-    /// The capture receiver was closed.
-    Closed,
-    /// The supervised storage writer failed.
-    WriterFailed,
-    /// The writer stopped normally; capture authority still ends with the writer lifetime.
-    WriterStopped,
-    /// A publisher was used before supervision started or after it stopped.
-    WriterUnavailable,
-    /// Concrete source-registry admission failed.
-    AuthorityRejected,
-    /// The nonblocking admission issuer was already in use.
-    AuthorityBusy,
-    /// Retained-byte accounting overflowed.
-    RetainedSizeOverflow,
-    /// Writer-thread diagnostic conversion rejected an exact raw frame.
-    DiagnosticConversion,
-    /// Queue reservation accounting violated its exactly-once invariant.
-    AccountingInvariant,
-    /// The sole positive capture-allocation supervisor exited or was dropped.
-    SupervisorStopped,
-    /// Shutdown could not drain to the explicit deadline.
-    ShutdownDeadline,
-}
-
-/// Bounded control-plane capture-health event.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CaptureHealthEvent {
-    identity: CaptureAuthorityIdentity,
-    integrity: CaptureIntegrityState,
-    reason: CaptureHealthReason,
-}
-
-impl CaptureHealthEvent {
-    /// Returns the exact source/session/generation diagnostic identity.
-    pub const fn identity(&self) -> &CaptureAuthorityIdentity {
-        &self.identity
-    }
-
-    /// Returns the one-way integrity state.
-    pub const fn integrity(&self) -> CaptureIntegrityState {
-        self.integrity
-    }
-
-    /// Returns the failure reason.
-    pub const fn reason(&self) -> CaptureHealthReason {
-        self.reason
-    }
-}
-
-/// Atomic identity-and-integrity view from one immutable generation allocation.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CaptureHealthSnapshot {
-    identity: Arc<CaptureAuthorityIdentity>,
-    integrity: CaptureIntegrityState,
-}
-
-impl CaptureHealthSnapshot {
-    /// Returns exact audit identity.
-    pub fn identity(&self) -> &CaptureAuthorityIdentity {
-        &self.identity
-    }
-
-    /// Returns exact one-way integrity.
-    pub const fn integrity(&self) -> CaptureIntegrityState {
-        self.integrity
-    }
-}
-
-/// Immediate raw-capture publication failure.
-#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
-pub enum CapturePublishError {
-    /// Concrete registry authority rejected the frame or generation.
-    #[error("capture authority rejected publication: {0}")]
-    Authority(#[from] CaptureAuthorityError),
-    /// Another publisher currently owns the sole non-clone admission issuer.
-    #[error("capture admission authority is busy")]
-    AuthorityBusy,
-    /// Deep retained-size accounting overflowed.
-    #[error("raw capture retained-size accounting overflowed")]
-    RetainedSizeOverflow,
-    /// The bounded queue is full or its byte budget is exhausted.
-    #[error("raw capture queue is saturated")]
-    Saturated,
-    /// The writer receiver has closed.
-    #[error("raw capture writer is closed")]
-    Closed,
-    /// Publication requires a running supervised writer.
-    #[error("raw capture writer is not running")]
-    WriterUnavailable,
-}
-
-impl From<CapturePublishError> for std::io::Error {
-    fn from(error: CapturePublishError) -> Self {
-        Self::other(error)
-    }
-}
-
-/// Cloneable publisher that can only admit frames through its concrete bundle authority.
 #[derive(Debug)]
-pub struct RawCapturePublisher<B: CaptureAuthorityBundle> {
-    sender: mpsc::SyncSender<CaptureMessage<B>>,
+struct CaptureWriterCore<B: CaptureAuthorityBundle, T: transport::CaptureQueueTransport> {
+    receiver: Option<T::Receiver<CaptureMessage<B>>>,
+    queue_control: T::Control<CaptureMessage<B>>,
     state: Arc<CaptureState<B>>,
-}
-
-impl<B: CaptureAuthorityBundle> Clone for RawCapturePublisher<B> {
-    fn clone(&self) -> Self {
-        Self {
-            sender: self.sender.clone(),
-            state: Arc::clone(&self.state),
-        }
-    }
-}
-
-impl<B: CaptureAuthorityBundle> RawCapturePublisher<B> {
-    /// Admits one exact frame without waiting for queue or filesystem capacity.
-    pub fn try_publish(&self, frame: &B::Frame) -> Result<B::Receipt, CapturePublishError> {
-        let active = self.state.active.load_full();
-        if self.state.writer_lifecycle.load(Ordering::Acquire) != WRITER_RUNNING
-            || !active.accepting.load(Ordering::Acquire)
-        {
-            self.state
-                .mark_incomplete_for_generation(&active, CaptureHealthReason::WriterUnavailable);
-            return Err(CapturePublishError::WriterUnavailable);
-        }
-        {
-            let admission = match active.admission.try_lock() {
-                Ok(admission) => admission,
-                Err(std::sync::TryLockError::WouldBlock) => {
-                    self.state.mark_incomplete_for_generation(
-                        &active,
-                        CaptureHealthReason::AuthorityBusy,
-                    );
-                    return Err(CapturePublishError::AuthorityBusy);
-                }
-                Err(std::sync::TryLockError::Poisoned(_poisoned)) => {
-                    self.state.mark_incomplete_for_generation(
-                        &active,
-                        CaptureHealthReason::AuthorityRejected,
-                    );
-                    return Err(CapturePublishError::Authority(
-                        CaptureAuthorityError::GenerationIncomplete,
-                    ));
-                }
-            };
-            if let Err(error) = admission.preflight(frame) {
-                if error != CaptureAuthorityError::FrameBindingMismatch {
-                    self.state.mark_incomplete_for_generation(
-                        &active,
-                        CaptureHealthReason::AuthorityRejected,
-                    );
-                }
-                return Err(error.into());
-            }
-        }
-        let reserved_bytes = frame
-            .retained_bytes()
-            .checked_add(std::mem::size_of::<CaptureMessage<B>>())
-            .ok_or_else(|| {
-                self.state.mark_incomplete_for_generation(
-                    &active,
-                    CaptureHealthReason::RetainedSizeOverflow,
-                );
-                CapturePublishError::RetainedSizeOverflow
-            })?;
-        let reservation = self
-            .state
-            .try_reserve_queue_bytes(reserved_bytes)
-            .ok_or_else(|| {
-                self.state
-                    .mark_incomplete_for_generation(&active, CaptureHealthReason::Saturated);
-                CapturePublishError::Saturated
-            })?;
-        match self.sender.try_send(CaptureMessage::Record {
-            allocation: Arc::clone(&active),
-            frame: frame.clone(),
-            reservation,
-        }) {
-            Ok(()) => {}
-            Err(mpsc::TrySendError::Full(_message)) => {
-                self.state
-                    .mark_incomplete_for_generation(&active, CaptureHealthReason::Saturated);
-                return Err(CapturePublishError::Saturated);
-            }
-            Err(mpsc::TrySendError::Disconnected(_message)) => {
-                self.state
-                    .stop_writer_from_publisher(&active, CaptureHealthReason::Closed);
-                return Err(CapturePublishError::Closed);
-            }
-        }
-        let mut admission = match active.admission.try_lock() {
-            Ok(admission) => admission,
-            Err(std::sync::TryLockError::WouldBlock) => {
-                self.state
-                    .mark_incomplete_for_generation(&active, CaptureHealthReason::AuthorityBusy);
-                return Err(CapturePublishError::AuthorityBusy);
-            }
-            Err(std::sync::TryLockError::Poisoned(_poisoned)) => {
-                self.state.mark_incomplete_for_generation(
-                    &active,
-                    CaptureHealthReason::AuthorityRejected,
-                );
-                return Err(CapturePublishError::Authority(
-                    CaptureAuthorityError::GenerationIncomplete,
-                ));
-            }
-        };
-        let receipt = admission.issue_after_enqueue(frame).map_err(|error| {
-            self.state
-                .mark_incomplete_for_generation(&active, CaptureHealthReason::AuthorityRejected);
-            CapturePublishError::Authority(error)
-        })?;
-        admission.validate_active(frame).map_err(|error| {
-            self.state
-                .mark_incomplete_for_generation(&active, CaptureHealthReason::AuthorityRejected);
-            CapturePublishError::Authority(error)
-        })?;
-        let current = self.state.active.load_full();
-        if self.state.writer_lifecycle.load(Ordering::Acquire) != WRITER_RUNNING
-            || !active.accepting.load(Ordering::Acquire)
-            || !Arc::ptr_eq(&active, &current)
-        {
-            self.state
-                .mark_incomplete_for_generation(&active, CaptureHealthReason::WriterUnavailable);
-            return Err(CapturePublishError::WriterUnavailable);
-        }
-        Ok(receipt)
-    }
-
-    /// Returns the active audit identity.
-    pub fn identity(&self) -> Arc<CaptureAuthorityIdentity> {
-        Arc::clone(&self.state.active.load_full().identity)
-    }
-
-    /// Returns one exact identity-and-integrity snapshot.
-    pub fn health_snapshot(&self) -> CaptureHealthSnapshot {
-        let active = self.state.active.load_full();
-        CaptureHealthSnapshot {
-            identity: Arc::clone(&active.identity),
-            integrity: active.integrity(),
-        }
-    }
-
-    /// Returns current capture integrity.
-    pub fn integrity(&self) -> CaptureIntegrityState {
-        self.health_snapshot().integrity()
-    }
-
-    /// Polls one bounded health event without blocking.
-    pub fn try_next_health(&self) -> Option<CaptureHealthEvent> {
-        let receiver = match self.state.health_receiver.lock() {
-            Ok(receiver) => receiver,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        receiver.try_recv().ok()
-    }
-
-    /// Returns bounded health events dropped due to control-plane saturation.
-    pub fn dropped_health_events(&self) -> u64 {
-        self.state.dropped_health_events.load(Ordering::Acquire)
-    }
-
-    /// Returns aggregate retained bytes awaiting writer processing.
-    pub fn queued_bytes(&self) -> usize {
-        self.state.queued_bytes.load(Ordering::Acquire)
-    }
-
-    /// Returns exactly-once queue-reservation invariant failures.
-    pub fn accounting_invariant_failures(&self) -> u64 {
-        self.state
-            .accounting_invariant_failures
-            .load(Ordering::Acquire)
-    }
 }
 
 /// Receiver owned by the supervised raw-capture writer.
 #[derive(Debug)]
 pub struct RawCaptureWriter<B: CaptureAuthorityBundle> {
-    receiver: Arc<std::sync::Mutex<mpsc::Receiver<CaptureMessage<B>>>>,
-    sender: Option<mpsc::SyncSender<CaptureMessage<B>>>,
-    state: Arc<CaptureState<B>>,
+    core: CaptureWriterCore<B, transport::FixedRingTransport>,
 }
 
-impl<B: CaptureAuthorityBundle> Drop for RawCaptureWriter<B> {
+/// The publisher, control authority, and sole writer receiver created for one capture channel.
+pub type RawCaptureChannel<B> = (
+    RawCapturePublisher<B>,
+    RawCaptureControl<B>,
+    RawCaptureWriter<B>,
+);
+
+type CaptureChannelCoreParts<B, T> = (
+    admission::CapturePublisherCore<B, T>,
+    RawCaptureControl<B>,
+    CaptureWriterCore<B, T>,
+);
+
+impl<B: CaptureAuthorityBundle, T: transport::CaptureQueueTransport> Drop
+    for CaptureWriterCore<B, T>
+{
     fn drop(&mut self) {
-        let receiver = match self.receiver.try_lock() {
-            Ok(receiver) => Some(receiver),
-            Err(std::sync::TryLockError::WouldBlock) => None,
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
-        };
-        if let Some(receiver) = receiver {
-            while receiver.try_recv().is_ok() {}
+        if T::close_and_drain(&self.queue_control, self.receiver.as_ref()).is_err() {
+            self.state
+                .mark_current_incomplete(CaptureHealthReason::QueuePoisoned);
         }
+        self.receiver.take();
         if self.state.writer_lifecycle.load(Ordering::Acquire) != WRITER_STOPPED {
             self.state.stop_writer(CaptureHealthReason::Closed);
         }
     }
 }
 
+fn fixed_storage_error(
+    error: accounting::CaptureAccountingError,
+    ceiling: NonZeroUsize,
+) -> CaptureChannelError {
+    match error {
+        accounting::CaptureAccountingError::BudgetExceeded { required, ceiling } => {
+            CaptureChannelError::FixedStorageBudgetExceeded { required, ceiling }
+        }
+        accounting::CaptureAccountingError::ArithmeticOverflow
+        | accounting::CaptureAccountingError::TransitionOverflow
+        | accounting::CaptureAccountingError::EpochOverflow
+        | accounting::CaptureAccountingError::InvariantViolated => {
+            CaptureChannelError::FixedStorageBudgetExceeded {
+                required: usize::MAX,
+                ceiling: ceiling.get(),
+            }
+        }
+    }
+}
+
 /// Creates a bounded channel by consuming one registry-issued whole authority bundle.
+///
+/// # Errors
+///
+/// Returns a typed error before publishing any handle when generation preparation, dominant ring
+/// allocation, fixed-storage accounting, or the configured unified memory ceiling rejects the
+/// complete initial channel graph.
 pub fn raw_capture_channel<B: CaptureAuthorityBundle>(
-    capacity: NonZeroUsize,
+    process: &CaptureProcessInfrastructure,
+    limits: CaptureChannelLimits,
     bundle: B,
-) -> (
-    RawCapturePublisher<B>,
-    RawCaptureControl<B>,
-    RawCaptureWriter<B>,
-) {
-    let identity = bundle.identity();
-    let (initializer, admission, degradation) = bundle.into_parts();
-    let (sender, receiver) = mpsc::sync_channel(capacity.get());
-    let receiver = Arc::new(std::sync::Mutex::new(receiver));
-    let (health_sender, health_receiver) = mpsc::sync_channel(HEALTH_EVENT_CAPACITY);
+) -> Result<RawCaptureChannel<B>, CaptureChannelError> {
+    let (publisher, control, writer) =
+        capture_channel_core::<B, transport::FixedRingTransport>(process, limits, bundle)?;
+    Ok((
+        RawCapturePublisher::from_core(publisher),
+        control,
+        RawCaptureWriter { core: writer },
+    ))
+}
+
+fn capture_channel_core<B: CaptureAuthorityBundle, T: transport::CaptureQueueTransport>(
+    process: &CaptureProcessInfrastructure,
+    limits: CaptureChannelLimits,
+    bundle: B,
+) -> Result<CaptureChannelCoreParts<B, T>, CaptureChannelError> {
+    let capacity = limits.capture_queue_capacity();
+    let ceiling = limits.capture_memory_ceiling_bytes();
+    let (sender, receiver, queue_control, fixed_storage) = match T::try_new(capacity) {
+        Ok(queue) => queue,
+        Err(error) => {
+            mark_bundle_incomplete(bundle);
+            return Err(match error {
+                queue::QueueConstructionError::AllocationFailed => {
+                    CaptureChannelError::QueueAllocationFailed {
+                        queue: CaptureQueueKind::Record,
+                        requested_slots: capacity,
+                    }
+                }
+                queue::QueueConstructionError::ArithmeticOverflow => {
+                    CaptureChannelError::FixedStorageBudgetExceeded {
+                        required: usize::MAX,
+                        ceiling: ceiling.get(),
+                    }
+                }
+            });
+        }
+    };
+    let health_capacity = NonZeroUsize::new(HEALTH_EVENT_CAPACITY).unwrap_or(NonZeroUsize::MIN);
+    let (health_sender, health_receiver, _health_control, health_fixed_storage) =
+        match queue::FixedQueue::try_new(health_capacity) {
+            Ok(queue) => queue,
+            Err(error) => {
+                mark_bundle_incomplete(bundle);
+                return Err(match error {
+                    queue::QueueConstructionError::AllocationFailed => {
+                        CaptureChannelError::QueueAllocationFailed {
+                            queue: CaptureQueueKind::Health,
+                            requested_slots: health_capacity,
+                        }
+                    }
+                    queue::QueueConstructionError::ArithmeticOverflow => {
+                        CaptureChannelError::FixedStorageBudgetExceeded {
+                            required: usize::MAX,
+                            ceiling: ceiling.get(),
+                        }
+                    }
+                });
+            }
+        };
+    let accounting_core_base_bytes =
+        match checked_arc_value_allocation_bytes::<accounting::CaptureMemoryAccounting>(0) {
+            Ok(bytes) => bytes,
+            Err(_error) => {
+                mark_bundle_incomplete(bundle);
+                return Err(CaptureChannelError::FixedStorageBudgetExceeded {
+                    required: usize::MAX,
+                    ceiling: ceiling.get(),
+                });
+            }
+        };
+    let capture_state_bytes = match checked_arc_value_allocation_bytes::<CaptureState<B>>(0) {
+        Ok(bytes) => bytes,
+        Err(_error) => {
+            mark_bundle_incomplete(bundle);
+            return Err(CaptureChannelError::FixedStorageBudgetExceeded {
+                required: usize::MAX,
+                ceiling: ceiling.get(),
+            });
+        }
+    };
+    let writer_lifecycle_core_bytes =
+        match checked_arc_value_allocation_bytes::<writer::WriterLifecycleCore>(0) {
+            Ok(bytes) => bytes,
+            Err(_error) => {
+                mark_bundle_incomplete(bundle);
+                return Err(CaptureChannelError::FixedStorageBudgetExceeded {
+                    required: usize::MAX,
+                    ceiling: ceiling.get(),
+                });
+            }
+        };
+    // Production FixedQueue infrastructure contributes exact allocator-observed bytes. The
+    // benchmark-only standard reference deliberately contributes no byte value because stable
+    // `sync_channel` does not expose one; its evidence schema records `not_measured` and forbids
+    // treating this accounting snapshot as a whole-graph memory comparison.
+    let known_record_queue_fixed_bytes = fixed_storage.retained_queue_bytes().unwrap_or(0);
+    let channel_state_fixed_bytes = match known_record_queue_fixed_bytes
+        .checked_add(health_fixed_storage.retained_queue_bytes())
+        .and_then(|bytes| bytes.checked_add(capture_state_bytes))
+        .and_then(|bytes| bytes.checked_add(writer_lifecycle_core_bytes))
+    {
+        Some(bytes) => bytes,
+        None => {
+            mark_bundle_incomplete(bundle);
+            return Err(CaptureChannelError::FixedStorageBudgetExceeded {
+                required: usize::MAX,
+                ceiling: ceiling.get(),
+            });
+        }
+    };
+    let accounting =
+        match accounting::CaptureMemoryAccounting::try_new(accounting_core_base_bytes, ceiling) {
+            Ok(accounting) => Arc::new(accounting),
+            Err(error) => {
+                mark_bundle_incomplete(bundle);
+                return Err(fixed_storage_error(error, ceiling));
+            }
+        };
+    let fixed_infrastructure = match accounting.try_reserve(
+        accounting::AccountingComponent::Fixed,
+        channel_state_fixed_bytes,
+    ) {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            mark_bundle_incomplete(bundle);
+            return Err(fixed_storage_error(error, ceiling));
+        }
+    };
+    let (initializer, active) =
+        try_prepare_generation(bundle, &accounting).map_err(|error| match error {
+            GenerationPreparationError::Retained(error) => {
+                CaptureChannelError::GenerationPreparation(error)
+            }
+            GenerationPreparationError::Accounting(error) => fixed_storage_error(error, ceiling),
+        })?;
     let state = Arc::new(CaptureState {
-        active: ArcSwap::from_pointee(GenerationCaptureState::new(
-            identity,
-            admission,
-            degradation,
-        )),
+        process: *process,
+        active: ArcSwap::from(active),
         lifecycle_transition: std::sync::Mutex::new(()),
         writer_lifecycle: AtomicU8::new(WRITER_NOT_STARTED),
         completion_accounting: std::sync::Mutex::new(CaptureCompletionAccounting::default()),
         health_sender,
-        health_receiver: std::sync::Mutex::new(health_receiver),
+        health_receiver,
         dropped_health_events: AtomicU64::new(0),
-        accounting_invariant_failures: AtomicU64::new(0),
-        queued_bytes: AtomicUsize::new(0),
+        accounting,
+        _fixed_infrastructure: fixed_infrastructure,
+        queue_storage: fixed_storage,
+        health_fixed_storage,
+        writer_lifecycle_core: Arc::new(writer::WriterLifecycleCore::new()),
     });
-    (
-        RawCapturePublisher {
-            sender: sender.clone(),
-            state: Arc::clone(&state),
-        },
+    Ok((
+        admission::CapturePublisherCore::new(sender, Arc::clone(&state)),
         RawCaptureControl {
             state: Arc::clone(&state),
             initializer: Some(initializer),
         },
-        RawCaptureWriter {
-            receiver,
-            sender: Some(sender),
+        CaptureWriterCore {
+            receiver: Some(receiver),
+            queue_control,
             state,
         },
-    )
+    ))
 }
 
+#[cfg(all(
+    feature = "capture-benchmark",
+    not(test),
+    capture_bench_backend = "standard"
+))]
+type SelectedBenchmarkTransport = transport::StandardReferenceTransport;
+#[cfg(all(
+    feature = "capture-benchmark",
+    any(test, capture_bench_backend = "candidate")
+))]
+type SelectedBenchmarkTransport = transport::FixedRingTransport;
+
+#[cfg(feature = "capture-benchmark")]
+type BenchmarkCapturePublisher<B> = admission::CapturePublisherCore<B, SelectedBenchmarkTransport>;
+#[cfg(feature = "capture-benchmark")]
+type BenchmarkCaptureWriter<B> = CaptureWriterCore<B, SelectedBenchmarkTransport>;
+#[cfg(feature = "capture-benchmark")]
+type BenchmarkCaptureChannelParts<B> = (
+    BenchmarkCapturePublisher<B>,
+    RawCaptureControl<B>,
+    BenchmarkCaptureWriter<B>,
+);
+
+#[cfg(feature = "capture-benchmark")]
+fn benchmark_capture_channel<B: CaptureAuthorityBundle>(
+    process: &CaptureProcessInfrastructure,
+    limits: CaptureChannelLimits,
+    bundle: B,
+) -> Result<BenchmarkCaptureChannelParts<B>, CaptureChannelError> {
+    capture_channel_core::<B, SelectedBenchmarkTransport>(process, limits, bundle)
+}
+
+#[cfg(feature = "capture-benchmark")]
+const fn benchmark_transport_identity() -> &'static str {
+    <SelectedBenchmarkTransport as transport::CaptureQueueTransport>::IDENTITY
+}
+
+#[cfg(feature = "capture-benchmark")]
+const fn benchmark_private_storage_accounting() -> &'static str {
+    <SelectedBenchmarkTransport as transport::CaptureQueueTransport>::PRIVATE_STORAGE_ACCOUNTING
+}
+
+mod accounting;
+mod admission;
+#[cfg(feature = "capture-benchmark")]
+pub mod benchmark_support;
+mod contracts;
 mod control;
 mod diagnostic;
+mod generation;
 mod policy;
+mod queue;
+mod transport;
 mod writer;
 
+pub use accounting::{CaptureAccountingSnapshot, CaptureAccountingSnapshotError};
+pub use admission::RawCapturePublisher;
+pub use contracts::{
+    CaptureChannelError, CaptureChannelLimits, CaptureHealthEvent, CaptureHealthReason,
+    CaptureHealthSnapshot, CapturePublishError, CapturePublisherCloneError, CaptureQueueKind,
+    CapturedRawRecord,
+};
 pub use control::{CaptureGenerationError, RawCaptureControl};
 pub use diagnostic::{
     DiagnosticCaptureBundle, DiagnosticCaptureError, DiagnosticCaptureFrame,
     DiagnosticCaptureReceipt,
 };
 pub use policy::{CaptureWriterPolicy, CaptureWriterPolicyError};
+#[cfg(all(feature = "capture-test", debug_assertions))]
+pub use writer::CaptureReceiverTestCoordinationError;
 pub use writer::{
-    CaptureDestination, CaptureDestinationError, CaptureIoContext, CaptureShutdownStatus,
+    CaptureDestination, CaptureDestinationError, CaptureDestinationFenceError, CaptureIoContext,
+    CaptureProcessInfrastructure, CaptureProcessInfrastructureLimits, CaptureShutdownStatus,
     CaptureSink, CaptureSinkError, CaptureStorageErrorClass, CaptureWorkerReapError,
     CaptureWorkerTermination, CaptureWriterHandle, CaptureWriterOutcome, CaptureWriterSpawnError,
-    MemoryCaptureSink, PendingCaptureWriter, spawn_capture_writer,
+    DestinationFenceRegistryInitializationError,
+    DestinationFenceRegistryPermanentInitializationError, MemoryCaptureSink,
+    MemoryCaptureSinkConstructionError, PendingCaptureWriter, WriterFixedStorageReceipt,
+    WriterRuntimeProofError, initialize_capture_process_infrastructure, spawn_capture_writer,
 };
 
 #[cfg(test)]
-mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{Arc, Barrier};
-
-    use super::{CaptureCompletionAccounting, saturating_atomic_increment};
-
-    #[test]
-    fn diagnostic_counter_increment_saturates_at_the_numeric_limit() {
-        let counter = AtomicU64::new(u64::MAX);
-        saturating_atomic_increment(&counter);
-        assert_eq!(counter.load(Ordering::Acquire), u64::MAX);
-    }
-
-    #[test]
-    fn revocation_linearizes_before_accounting_commit_after_sink_success()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let accounting = Arc::new(std::sync::Mutex::new(CaptureCompletionAccounting::default()));
-        let sink_succeeded = Arc::new(Barrier::new(2));
-        let accounting_allowed = Arc::new(Barrier::new(2));
-        let worker_accounting = Arc::clone(&accounting);
-        let worker_sink_succeeded = Arc::clone(&sink_succeeded);
-        let worker_accounting_allowed = Arc::clone(&accounting_allowed);
-        let worker = std::thread::spawn(move || {
-            // The sink operation has returned success, but its completion is not authoritative
-            // until it acquires the accounting lock and commits below.
-            worker_sink_succeeded.wait();
-            worker_accounting_allowed.wait();
-            let mut accounting = match worker_accounting.lock() {
-                Ok(accounting) => accounting,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            accounting.record_completed_append()
-        });
-
-        sink_succeeded.wait();
-        let at_revocation = {
-            let mut accounting = match accounting.lock() {
-                Ok(accounting) => accounting,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            accounting.revoke()
-        };
-        accounting_allowed.wait();
-        let committed = worker
-            .join()
-            .map_err(|_panic| "completion-accounting worker panicked")?;
-        let final_snapshot = match accounting.lock() {
-            Ok(accounting) => accounting.snapshot(),
-            Err(poisoned) => poisoned.into_inner().snapshot(),
-        };
-
-        assert_eq!(committed, Some(1));
-        assert_eq!(at_revocation.records_written_at_revocation, 0);
-        assert_eq!(final_snapshot.records_written, 1);
-        assert_eq!(final_snapshot.late_records_written, 1);
-        Ok(())
-    }
-}
+mod tests;

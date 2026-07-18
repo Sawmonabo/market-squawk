@@ -13,6 +13,7 @@ use rust_decimal::Decimal;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::authority_time::TrustedReceiptObservation;
 use crate::bounded::BoundedVec;
 use crate::{FrameId, FrameSessionBinding, SourceMetadataProvider, ValidatedRawMarketFrame};
 
@@ -27,7 +28,7 @@ const MAX_DECIMAL_LEXEME_BYTES: usize = 128;
 pub struct DecoderEvidence {
     binding: FrameSessionBinding,
     frame_id: FrameId,
-    received_at: Timestamp,
+    receipt: TrustedReceiptObservation,
     payload_digest: EvidenceDigest,
     decoder_rule: IntegrityRule,
 }
@@ -43,7 +44,7 @@ impl DecoderEvidence {
         Self {
             binding: frame.binding().clone(),
             frame_id: frame.frame_id(),
-            received_at: frame.received_at(),
+            receipt: validated.trusted_receipt().clone(),
             payload_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, bytes),
             decoder_rule,
         }
@@ -56,7 +57,11 @@ impl DecoderEvidence {
 
     /// Returns exact frame receive time.
     pub const fn received_at(&self) -> Timestamp {
-        self.received_at
+        self.receipt.received_at()
+    }
+
+    pub(crate) const fn trusted_receipt(&self) -> &TrustedReceiptObservation {
+        &self.receipt
     }
 
     /// Returns the exact generation-local raw-frame identity.
@@ -80,6 +85,14 @@ impl DecoderEvidence {
     pub(crate) fn dynamic_retained_bytes(&self) -> Result<usize, DecodeError> {
         self.binding
             .shared_allocation_charge()
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    self.receipt
+                        .continuity()
+                        .checked_shared_allocation_bytes()
+                        .ok()?,
+                )
+            })
             .and_then(|bytes| bytes.checked_add(self.decoder_rule.provider_rule().retained_bytes()))
             .ok_or(DecodeError::RetainedSizeOverflow)
     }

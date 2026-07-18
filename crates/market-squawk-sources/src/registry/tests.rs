@@ -5,7 +5,7 @@ mod tests {
     use std::str::FromStr;
     use std::sync::{Arc, Barrier, Mutex};
     use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use bytes::Bytes;
     use market_squawk_domain::{
@@ -15,9 +15,13 @@ mod tests {
     };
 
     use super::{
-        AuthoritativeSourceRegistry, RawFrameFactory, RegistryClock, RegistryError,
-        MAX_AUTHORITY_SOURCES, SessionLeaseState, SourceAuthorityHistory, TrustedRegistryTime,
-        UnconfiguredAuthorizationSubjectResolver, validate_observation_profile,
+        AuthoritativeSourceRegistry, RawFrameFactory, RegistryError, MAX_AUTHORITY_SOURCES,
+        SessionLeaseState, SourceAuthorityHistory, UnconfiguredAuthorizationSubjectResolver,
+        validate_observation_profile,
+    };
+    use crate::authority_time::{
+        RawRegistryClockObservation, RawRegistryClockSource, RegistryMonotonicInstant,
+        SealedRegistryClock, TrustedRegistryTime,
     };
     use crate::policy::AuthorityStateStore;
     use crate::policy::persistence::AuthorityStateStoreError;
@@ -88,6 +92,17 @@ mod tests {
         )
     }
 
+    fn durable_registry_with_test_store_and_clock(
+        store: Arc<dyn AuthorityStateStore>,
+        clock: Arc<dyn RawRegistryClockSource>,
+    ) -> Result<AuthoritativeSourceRegistry, RegistryError> {
+        AuthoritativeSourceRegistry::try_new_durable_with_store_resolver_and_clock_source(
+            store,
+            Arc::new(UnconfiguredAuthorizationSubjectResolver),
+            clock,
+        )
+    }
+
     impl ManualRegistryClock {
         fn new(reading: TrustedRegistryTime) -> Self {
             Self {
@@ -118,14 +133,17 @@ mod tests {
         }
     }
 
-    impl RegistryClock for ManualRegistryClock {
-        fn observe(&self) -> Result<TrustedRegistryTime, RegistryError> {
+    impl RawRegistryClockSource for ManualRegistryClock {
+        fn observe_raw(&self) -> Result<RawRegistryClockObservation, RegistryError> {
             let state = self
                 .state
                 .lock()
                 .map_err(|_| RegistryError::TrustedClockUnavailable)?;
             if state.available {
-                Ok(state.reading)
+                Ok(RawRegistryClockObservation::new(
+                    state.reading.wall(),
+                    state.reading.monotonic(),
+                ))
             } else {
                 Err(RegistryError::TrustedClockUnavailable)
             }
@@ -145,13 +163,13 @@ mod tests {
         reporter: CurrentHealthReporter,
         clock: Arc<ManualRegistryClock>,
         wall_origin: Timestamp,
-        monotonic_origin: Instant,
+        monotonic_origin: RegistryMonotonicInstant,
     }
 
     impl HealthHarness {
         fn new(source: &str) -> TestResult<Self> {
             let wall_origin = Timestamp::from_unix_nanos(1_000_000_000);
-            let monotonic_origin = Instant::now();
+            let monotonic_origin = RegistryMonotonicInstant::from_nanos(0);
             let clock = Arc::new(ManualRegistryClock::new(TrustedRegistryTime::new(
                 wall_origin,
                 monotonic_origin,
@@ -189,8 +207,7 @@ mod tests {
         }
 
         fn reading(&self, wall_offset: i64, monotonic_offset: u64) -> TestResult<TrustedRegistryTime> {
-            let monotonic = self
-                .monotonic_origin
+            let monotonic = self.monotonic_origin
                 .checked_add(Duration::from_nanos(monotonic_offset))
                 .ok_or_else(|| std::io::Error::other("manual monotonic time overflowed"))?;
             Ok(TrustedRegistryTime::new(
@@ -248,6 +265,12 @@ mod tests {
             SessionId::new(SourceIdentifier::try_from("session-a")?),
             ConnectionGeneration::new(1)?,
         );
+        let raw_clock = Arc::new(ManualRegistryClock::new(TrustedRegistryTime::new(
+            Timestamp::from_unix_nanos(1),
+            RegistryMonotonicInstant::from_nanos(1),
+        )));
+        let clock = Arc::new(SealedRegistryClock::new(raw_clock));
+        let started_at = clock.observe()?;
         let lease = Arc::new(SessionLeaseState {
             current: AtomicBool::new(true),
             terminal: AtomicBool::new(false),
@@ -257,15 +280,17 @@ mod tests {
             valid_until_nanos: AtomicI64::new(i64::MIN),
             last_health_observed_nanos: AtomicI64::new(i64::MIN),
             frame_ordinal: AtomicU64::new(u64::MAX),
+            continuity: clock.continuity().clone(),
+            started_at,
         });
         let mut factory = RawFrameFactory {
             binding,
             lease: Arc::clone(&lease),
+            clock,
             not_sync: PhantomData::<Cell<()>>,
         };
         assert!(matches!(
             factory.try_frame(
-                Timestamp::from_unix_nanos(1),
                 TransportFrameKind::Binary,
                 Bytes::from_static(b"frame"),
             ),
@@ -443,6 +468,11 @@ mod tests {
     }
 
     include!("tests/temporal_cases.rs");
+    mod time_cases {
+        use super::*;
+
+        include!("tests/time_cases.rs");
+    }
 
     fn rule(value: &str) -> Result<IntegrityRule, Box<dyn std::error::Error>> {
         Ok(IntegrityRule::new(

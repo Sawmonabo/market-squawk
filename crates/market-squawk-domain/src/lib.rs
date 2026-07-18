@@ -12,12 +12,16 @@ mod instrument;
 mod market;
 mod provenance;
 mod research;
+mod retained;
 mod time;
 mod version;
 
 pub use capture::{
     CaptureAdmission, CaptureAuthorityBundle, CaptureAuthorityError, CaptureAuthorityIdentity,
-    CaptureDegradation, CaptureInitializer, RawCaptureFrameView,
+    CaptureDegradation, CaptureFrameFootprint, CaptureInitializer, CapturePayload,
+    CapturePayloadError, CaptureResidentGenerationLease, CaptureResidentToken,
+    CaptureRetainedComponent, CaptureRetainedReceipt, CaptureRetainedSizeError,
+    MAX_COMPATIBILITY_CAPTURE_PAYLOAD_BYTES, MAX_LIVE_CAPTURE_PAYLOAD_BYTES, RawCaptureFrameView,
 };
 pub use classification::{
     AssessmentStatus, AssessmentValidity, AuthorizationBasis, BindingError, BookIntegrity,
@@ -85,6 +89,10 @@ pub use research::{
     AlternativeDataObservation, CorporateActionObservation, FilingObservation,
     FundamentalObservation, MacroObservation, PositionObservation, PositionSide, ResearchError,
     ResearchObservation, TransactionObservation,
+};
+pub use retained::{
+    RetainedLayoutError, checked_arc_bytes_allocation_bytes, checked_arc_str_allocation_bytes,
+    checked_arc_value_allocation_bytes,
 };
 pub use time::{CalendarDate, TimeError, Timestamp};
 pub use version::{SchemaVersion, SchemaVersionError};

@@ -9,12 +9,17 @@ cargo audit --deny warnings
 gitleaks dir --redact --no-banner .
 gitleaks git --redact --no-banner
 cargo fmt --all -- --check
+RUSTFLAGS="" CARGO_ENCODED_RUSTFLAGS="-Dwarnings" \
+  CAPTURE_BENCH_DEVELOPMENT_BACKEND=candidate \
+  cargo clippy -p market-squawk-platform --all-targets --all-features --locked -- -D warnings
+cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-targets --all-features --locked
 cargo test --doc --workspace --all-features --locked
 ./scripts/check_authority_lifecycle_loom.sh
+./scripts/check_capture_queue_loom.sh
 cargo build --workspace --all-features --release --locked
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
+python3 scripts/check_capture_frame_contracts.py
 cargo build -p market-squawk --all-features --locked
 
 tmp_dir="$(mktemp -d)"

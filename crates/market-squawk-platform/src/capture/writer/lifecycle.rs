@@ -1,26 +1,47 @@
-use std::sync::atomic::Ordering;
-use std::sync::{Arc, mpsc};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use market_squawk_domain::CaptureAuthorityBundle;
 use thiserror::Error;
 
+use super::super::queue::FixedQueueControl;
+#[cfg(any(test, all(feature = "capture-test", debug_assertions)))]
+use super::super::queue::ReceiverPauseError;
 use super::super::{CaptureHealthReason, CaptureMessage, CaptureState};
 use super::destination::CaptureDestinationLease;
+use super::runtime::{WriterFixedStorageOwner, WriterFixedStorageReceipt};
 use super::sink::CaptureIoContext;
-use super::{CaptureWriterOutcome, deadline_after, try_drain_pending, writer_failed};
+use super::{CaptureWriterOutcome, deadline_after, writer_failed};
+
+#[derive(Debug)]
+pub(in crate::capture) struct WriterLifecycleCore {
+    pub(super) shutdown_requested: AtomicBool,
+    pub(super) shutdown_deadline: std::sync::Mutex<Option<std::time::Instant>>,
+    pub(super) completion: tokio::sync::Notify,
+    pub(super) final_report: std::sync::Mutex<Option<CaptureWorkerFinalReport>>,
+}
+
+impl WriterLifecycleCore {
+    pub(in crate::capture) fn new() -> Self {
+        Self {
+            shutdown_requested: AtomicBool::new(false),
+            shutdown_deadline: std::sync::Mutex::new(None),
+            completion: tokio::sync::Notify::new(),
+            final_report: std::sync::Mutex::new(None),
+        }
+    }
+}
 
 /// Supervised dedicated writer-thread handle.
 #[derive(Debug)]
 pub struct CaptureWriterHandle<B: CaptureAuthorityBundle> {
     pub(super) thread: Option<std::thread::JoinHandle<()>>,
-    pub(super) completion: Arc<tokio::sync::Notify>,
-    pub(super) final_report: Arc<std::sync::Mutex<Option<CaptureWorkerFinalReport>>>,
-    pub(super) wake_sender: Option<mpsc::SyncSender<CaptureMessage<B>>>,
+    pub(super) queue_control: FixedQueueControl<CaptureMessage<B>>,
     pub(super) io_context: CaptureIoContext,
-    pub(super) receiver: Arc<std::sync::Mutex<mpsc::Receiver<CaptureMessage<B>>>>,
     pub(super) state: Arc<CaptureState<B>>,
     pub(super) destination_fence: Option<Arc<CaptureDestinationLease>>,
+    pub(super) fixed_storage: Option<Arc<WriterFixedStorageOwner>>,
     pub(super) completed: bool,
 }
 
@@ -30,6 +51,22 @@ pub enum CaptureShutdownStatus {
     /// The worker thread exited but its lifecycle owner has not joined it yet.
     WorkerTerminated,
     /// Capture authority was revoked at the deadline while the worker was still running.
+    DeadlineElapsed,
+}
+
+/// Deterministic receiver-barrier failure for integration tests of nonblocking publication.
+///
+/// This contract is compiled for crate unit tests, or for debug-assertion builds with the internal
+/// `capture-test` feature. Production composition must observe and handle
+/// [`crate::CapturePublishError::QueueInvariant`] directly.
+#[cfg(any(test, all(feature = "capture-test", debug_assertions)))]
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum CaptureReceiverTestCoordinationError {
+    /// The private coordination state was poisoned by a test panic.
+    #[error("capture receiver test coordination state is poisoned")]
+    Poisoned,
+    /// The receiver did not reach the barrier before the caller's deadline.
+    #[error("capture receiver test coordination deadline elapsed")]
     DeadlineElapsed,
 }
 
@@ -90,13 +127,11 @@ pub enum CaptureWorkerReapError {
 #[must_use = "pending capture workers must remain owned and be explicitly reaped"]
 pub struct PendingCaptureWriter<B: CaptureAuthorityBundle> {
     thread: Option<std::thread::JoinHandle<()>>,
-    completion: Arc<tokio::sync::Notify>,
-    final_report: Arc<std::sync::Mutex<Option<CaptureWorkerFinalReport>>>,
-    wake_sender: Option<mpsc::SyncSender<CaptureMessage<B>>>,
+    queue_control: FixedQueueControl<CaptureMessage<B>>,
     io_context: CaptureIoContext,
-    receiver: Arc<std::sync::Mutex<mpsc::Receiver<CaptureMessage<B>>>>,
     state: Arc<CaptureState<B>>,
     destination_fence: Option<Arc<CaptureDestinationLease>>,
+    fixed_storage: Option<Arc<WriterFixedStorageOwner>>,
     deadline: std::time::Instant,
     records_written_at_revocation: u64,
     termination: Option<CaptureWorkerTermination>,
@@ -110,12 +145,48 @@ pub(super) struct CaptureWorkerFinalReport {
 }
 
 impl<B: CaptureAuthorityBundle> CaptureWriterHandle<B> {
+    /// Runs one integration-test action while the consumer is parked outside the queue lock.
+    ///
+    /// This is a deterministic harness boundary for success-path tests of the production
+    /// `Mutex::try_lock` publisher. It does not alter production contention semantics and is not a
+    /// production synchronization API.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed poison or deadline failure before invoking `action`.
+    #[cfg(any(test, all(feature = "capture-test", debug_assertions)))]
+    #[doc(hidden)]
+    pub fn with_receiver_paused_for_test<R>(
+        &self,
+        timeout: Duration,
+        action: impl FnOnce() -> R,
+    ) -> Result<R, CaptureReceiverTestCoordinationError> {
+        self.queue_control
+            .with_receiver_paused_for_test(timeout, action)
+            .map_err(|error| match error {
+                ReceiverPauseError::Poisoned => CaptureReceiverTestCoordinationError::Poisoned,
+                ReceiverPauseError::DeadlineElapsed => {
+                    CaptureReceiverTestCoordinationError::DeadlineElapsed
+                }
+            })
+    }
+
+    /// Returns the complete writer-start fixed-storage receipt while this owner retains it.
+    pub fn fixed_storage_receipt(&self) -> Option<WriterFixedStorageReceipt> {
+        self.fixed_storage
+            .as_deref()
+            .map(WriterFixedStorageOwner::receipt)
+            .copied()
+    }
+
     fn request_shutdown(&self) {
         self.io_context
+            .lifecycle
             .shutdown_requested
             .store(true, Ordering::Release);
-        if let Some(sender) = &self.wake_sender {
-            let _wake_result = sender.try_send(CaptureMessage::Wake);
+        if self.queue_control.request_close().is_err() {
+            self.state
+                .mark_current_incomplete(CaptureHealthReason::QueuePoisoned);
         }
     }
 
@@ -126,7 +197,7 @@ impl<B: CaptureAuthorityBundle> CaptureWriterHandle<B> {
     /// No thread termination is implied by this synchronous transition.
     pub fn shutdown(mut self, deadline: Duration) -> PendingCaptureWriter<B> {
         let absolute_deadline = deadline_after(deadline);
-        match self.io_context.shutdown_deadline.lock() {
+        match self.io_context.lifecycle.shutdown_deadline.lock() {
             Ok(mut configured) => *configured = Some(absolute_deadline),
             Err(poisoned) => *poisoned.into_inner() = Some(absolute_deadline),
         }
@@ -137,13 +208,11 @@ impl<B: CaptureAuthorityBundle> CaptureWriterHandle<B> {
         self.completed = true;
         PendingCaptureWriter {
             thread: self.thread.take(),
-            completion: Arc::clone(&self.completion),
-            final_report: Arc::clone(&self.final_report),
-            wake_sender: self.wake_sender.take(),
+            queue_control: self.queue_control.clone(),
             io_context: self.io_context.clone(),
-            receiver: Arc::clone(&self.receiver),
             state: Arc::clone(&self.state),
             destination_fence: self.destination_fence.take(),
+            fixed_storage: self.fixed_storage.take(),
             deadline: absolute_deadline,
             records_written_at_revocation: revocation.records_written_at_revocation,
             termination: None,
@@ -159,15 +228,17 @@ impl<B: CaptureAuthorityBundle> Drop for CaptureWriterHandle<B> {
                 .state
                 .revoke_writer_for_shutdown(CaptureHealthReason::WriterFailed);
             self.request_shutdown();
-            try_drain_pending(&self.receiver);
-            self.wake_sender.take();
+            if self.queue_control.close_and_drain().is_err() {
+                self.state
+                    .mark_current_incomplete(CaptureHealthReason::QueuePoisoned);
+            }
             let joined = self
                 .thread
                 .take()
                 .is_none_or(|thread| thread.join().is_ok());
             let termination = termination_after_join(
                 &self.state,
-                &self.final_report,
+                &self.io_context.lifecycle.final_report,
                 revocation.records_written_at_revocation,
                 false,
                 joined,
@@ -177,11 +248,20 @@ impl<B: CaptureAuthorityBundle> Drop for CaptureWriterHandle<B> {
                     .mark_current_incomplete(CaptureHealthReason::WriterFailed);
             }
             self.destination_fence.take();
+            self.fixed_storage.take();
         }
     }
 }
 
 impl<B: CaptureAuthorityBundle> PendingCaptureWriter<B> {
+    /// Returns the fixed-storage receipt until final reap releases writer storage.
+    pub fn fixed_storage_receipt(&self) -> Option<WriterFixedStorageReceipt> {
+        self.fixed_storage
+            .as_deref()
+            .map(WriterFixedStorageOwner::receipt)
+            .copied()
+    }
+
     /// Returns whether the OS thread has exited. The destination remains fenced until reap.
     pub fn is_worker_terminated(&self) -> bool {
         self.thread
@@ -204,7 +284,7 @@ impl<B: CaptureAuthorityBundle> PendingCaptureWriter<B> {
             }
             let remaining = self.deadline.saturating_duration_since(now);
             tokio::select! {
-                () = self.completion.notified() => {}
+                () = self.io_context.lifecycle.completion.notified() => {}
                 () = tokio::time::sleep(remaining) => {}
             }
         }
@@ -216,7 +296,7 @@ impl<B: CaptureAuthorityBundle> PendingCaptureWriter<B> {
     pub async fn wait_until_terminated(&mut self) {
         while !self.is_worker_terminated() {
             tokio::select! {
-                () = self.completion.notified() => {}
+                () = self.io_context.lifecycle.completion.notified() => {}
                 () = tokio::time::sleep(Duration::from_millis(1)) => {}
             }
         }
@@ -253,7 +333,10 @@ impl<B: CaptureAuthorityBundle> PendingCaptureWriter<B> {
         if self.deadline_recorded {
             return;
         }
-        try_drain_pending(&self.receiver);
+        if self.queue_control.request_close().is_err() {
+            self.state
+                .mark_current_incomplete(CaptureHealthReason::QueuePoisoned);
+        }
         self.state
             .mark_current_incomplete(CaptureHealthReason::ShutdownDeadline);
         self.deadline_recorded = true;
@@ -262,7 +345,7 @@ impl<B: CaptureAuthorityBundle> PendingCaptureWriter<B> {
     fn persist_termination(&mut self, joined: bool) {
         let termination = termination_after_join(
             &self.state,
-            &self.final_report,
+            &self.io_context.lifecycle.final_report,
             self.records_written_at_revocation,
             self.deadline_recorded,
             joined,
@@ -271,14 +354,17 @@ impl<B: CaptureAuthorityBundle> PendingCaptureWriter<B> {
         // The report is now retained in the lifecycle owner. Only this point may release the owner
         // side of the two-party destination fence.
         self.destination_fence.take();
+        self.fixed_storage.take();
     }
 
     fn request_shutdown(&self) {
         self.io_context
+            .lifecycle
             .shutdown_requested
             .store(true, Ordering::Release);
-        if let Some(sender) = &self.wake_sender {
-            let _wake_result = sender.try_send(CaptureMessage::Wake);
+        if self.queue_control.request_close().is_err() {
+            self.state
+                .mark_current_incomplete(CaptureHealthReason::QueuePoisoned);
         }
     }
 }
@@ -291,8 +377,10 @@ impl<B: CaptureAuthorityBundle> Drop for PendingCaptureWriter<B> {
             return;
         }
         self.request_shutdown();
-        try_drain_pending(&self.receiver);
-        self.wake_sender.take();
+        if self.queue_control.close_and_drain().is_err() {
+            self.state
+                .mark_current_incomplete(CaptureHealthReason::QueuePoisoned);
+        }
         let joined = self
             .thread
             .take()
@@ -301,7 +389,7 @@ impl<B: CaptureAuthorityBundle> Drop for PendingCaptureWriter<B> {
     }
 }
 
-fn termination_after_join<B: CaptureAuthorityBundle>(
+pub(super) fn termination_after_join<B: CaptureAuthorityBundle>(
     state: &CaptureState<B>,
     final_report: &std::sync::Mutex<Option<CaptureWorkerFinalReport>>,
     records_written_at_revocation: u64,

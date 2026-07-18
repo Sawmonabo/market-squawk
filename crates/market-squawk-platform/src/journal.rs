@@ -8,6 +8,7 @@
 use std::{
     fs::File,
     io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
+    num::NonZeroUsize,
     num::TryFromIntError,
     path::{Path, PathBuf},
 };
@@ -23,6 +24,66 @@ const CURRENT_MAGIC: &[u8; 4] = b"MSJ1";
 const MAX_RECORD_BYTES: usize = MAX_SERIALIZED_RECORD_BYTES;
 const DEFAULT_MAX_RECORDS: usize = 1_000_000;
 const DEFAULT_MAX_AGGREGATE_BYTES: u64 = 512 * 1024 * 1024;
+const DEFAULT_JOURNAL_BUFFER_CAPACITY_BYTES: usize = 64 * 1024;
+const DEFAULT_JOURNAL_RETAINED_BYTE_CEILING: usize = 1024 * 1024;
+
+/// Separate fixed-storage limits for one journal sink.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JournalSinkLimits {
+    buffer_capacity: NonZeroUsize,
+    retained_byte_ceiling: NonZeroUsize,
+}
+
+impl JournalSinkLimits {
+    /// Constructs explicit nonzero journal buffer and fixed retained-byte limits.
+    pub const fn new(buffer_capacity: NonZeroUsize, retained_byte_ceiling: NonZeroUsize) -> Self {
+        Self {
+            buffer_capacity,
+            retained_byte_ceiling,
+        }
+    }
+
+    /// Returns the requested bounded `BufWriter` capacity.
+    pub const fn buffer_capacity(self) -> usize {
+        self.buffer_capacity.get()
+    }
+
+    /// Returns the separate journal-sink fixed Rust-graph ceiling.
+    pub const fn retained_byte_ceiling(self) -> usize {
+        self.retained_byte_ceiling.get()
+    }
+
+    pub(crate) fn standard() -> Self {
+        let buffer_capacity = match NonZeroUsize::new(DEFAULT_JOURNAL_BUFFER_CAPACITY_BYTES) {
+            Some(value) => value,
+            None => NonZeroUsize::MIN,
+        };
+        let retained_byte_ceiling = match NonZeroUsize::new(DEFAULT_JOURNAL_RETAINED_BYTE_CEILING) {
+            Some(value) => value,
+            None => NonZeroUsize::MIN,
+        };
+        Self::new(buffer_capacity, retained_byte_ceiling)
+    }
+}
+
+/// Failure to construct a separately bounded journal sink.
+#[derive(Debug, Error)]
+pub enum JournalSinkConstructionError {
+    /// The requested or observed fixed Rust graph exceeds the configured ceiling.
+    #[error("journal sink fixed storage requires {required} bytes but limit is {limit} bytes")]
+    FixedStorageBudgetExceeded {
+        /// Exact lower-bound or observed bytes required.
+        required: usize,
+        /// Configured sink-owned fixed byte ceiling.
+        limit: usize,
+    },
+    /// Fixed-storage arithmetic overflowed.
+    #[error("journal sink fixed-storage arithmetic overflowed")]
+    ArithmeticOverflow,
+    /// Journal path, locking, validation, or header initialization failed.
+    #[error(transparent)]
+    Journal(#[from] JournalError),
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum JournalFormat {
@@ -133,6 +194,103 @@ impl JournalError {
 pub struct JournalWriter {
     path: PathBuf,
     writer: BufWriter<File>,
+    fixed_retained_bytes: usize,
+    retained_byte_ceiling: usize,
+}
+
+#[derive(Debug)]
+struct CountingCrcWriter {
+    bytes: usize,
+    attempted_bytes: usize,
+    maximum: usize,
+    hasher: Hasher,
+}
+
+impl CountingCrcWriter {
+    fn new(maximum: usize) -> Self {
+        Self {
+            bytes: 0,
+            attempted_bytes: 0,
+            maximum,
+            hasher: Hasher::new(),
+        }
+    }
+
+    fn finish(self) -> (usize, u32) {
+        (self.bytes, self.hasher.finalize())
+    }
+}
+
+impl Write for CountingCrcWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let next = self
+            .bytes
+            .checked_add(buffer.len())
+            .ok_or_else(|| std::io::Error::other("serialized journal record length overflowed"))?;
+        self.attempted_bytes = next;
+        if next > self.maximum {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "serialized journal record exceeds the committed bound",
+            ));
+        }
+        self.hasher.update(buffer);
+        self.bytes = next;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct BoundedCrcForwardWriter<'a, W> {
+    inner: &'a mut W,
+    bytes: usize,
+    expected_bytes: usize,
+    hasher: Hasher,
+}
+
+impl<'a, W> BoundedCrcForwardWriter<'a, W> {
+    fn new(inner: &'a mut W, expected_bytes: usize) -> Self {
+        Self {
+            inner,
+            bytes: 0,
+            expected_bytes,
+            hasher: Hasher::new(),
+        }
+    }
+
+    fn finish(self) -> (usize, u32) {
+        (self.bytes, self.hasher.finalize())
+    }
+}
+
+impl<W: Write> Write for BoundedCrcForwardWriter<'_, W> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let next = self
+            .bytes
+            .checked_add(buffer.len())
+            .ok_or_else(|| std::io::Error::other("journal second-pass length overflowed"))?;
+        if next > self.expected_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "journal second pass exceeded the counted length",
+            ));
+        }
+        let written = self.inner.write(buffer)?;
+        self.hasher.update(&buffer[..written]);
+        self.bytes = self
+            .bytes
+            .checked_add(written)
+            .ok_or_else(|| std::io::Error::other("journal second-pass length overflowed"))?;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 /// Platform-specific directory-entry durability retained across journal creation.
@@ -173,20 +331,38 @@ impl ParentDirectorySync {
 }
 
 impl JournalWriter {
+    pub(crate) fn validate_limits_for_path(
+        path: &PathBuf,
+        limits: JournalSinkLimits,
+    ) -> Result<(), JournalSinkConstructionError> {
+        let required = std::mem::size_of::<Self>()
+            .checked_add(path.capacity())
+            .and_then(|bytes| bytes.checked_add(limits.buffer_capacity()))
+            .ok_or(JournalSinkConstructionError::ArithmeticOverflow)?;
+        if required > limits.retained_byte_ceiling() {
+            return Err(JournalSinkConstructionError::FixedStorageBudgetExceeded {
+                required,
+                limit: limits.retained_byte_ceiling(),
+            });
+        }
+        Ok(())
+    }
+
     pub(crate) fn from_open_file(
         path: PathBuf,
         file: File,
         parent_directory: ParentDirectorySync,
-    ) -> Result<Self, JournalError> {
+        limits: JournalSinkLimits,
+    ) -> Result<Self, JournalSinkConstructionError> {
         if path.extension().and_then(std::ffi::OsStr::to_str) != Some("msj") {
-            return Err(JournalError::InvalidWriterExtension);
+            return Err(JournalError::InvalidWriterExtension.into());
         }
         #[cfg(not(windows))]
         if let Err(source) = file.try_lock_exclusive() {
             if is_lock_contended(&source) {
-                return Err(JournalError::AlreadyLocked { path });
+                return Err(JournalError::AlreadyLocked { path }.into());
             }
-            return Err(JournalError::io("failed to lock journal", source));
+            return Err(JournalError::io("failed to lock journal", source).into());
         }
         let is_new = file
             .metadata()
@@ -194,10 +370,10 @@ impl JournalWriter {
             .len()
             == 0;
         if !is_new && validate_existing_file(&file)? == JournalFormat::LegacyMej1 {
-            return Err(JournalError::LegacyFormatReadOnly);
+            return Err(JournalError::LegacyFormatReadOnly.into());
         }
 
-        let mut writer = BufWriter::new(file);
+        let mut writer = BufWriter::with_capacity(limits.buffer_capacity(), file);
         if is_new {
             writer
                 .write_all(CURRENT_MAGIC)
@@ -212,30 +388,67 @@ impl JournalWriter {
                 JournalError::io("failed to synchronize journal directory handle", source)
             })?;
         }
-        Ok(Self { path, writer })
+        let fixed_retained_bytes = std::mem::size_of::<Self>()
+            .checked_add(path.capacity())
+            .and_then(|bytes| bytes.checked_add(writer.capacity()))
+            .ok_or(JournalSinkConstructionError::ArithmeticOverflow)?;
+        if fixed_retained_bytes > limits.retained_byte_ceiling() {
+            return Err(JournalSinkConstructionError::FixedStorageBudgetExceeded {
+                required: fixed_retained_bytes,
+                limit: limits.retained_byte_ceiling(),
+            });
+        }
+        Ok(Self {
+            path,
+            writer,
+            fixed_retained_bytes,
+            retained_byte_ceiling: limits.retained_byte_ceiling(),
+        })
     }
 
     /// Appends one CRC-framed compatibility record to the buffer.
     pub fn append(&mut self, record: &RawCaptureRecord) -> Result<(), JournalError> {
-        record.validate_compatibility()?;
-        let payload = serde_json::to_vec(record)?;
-        if payload.len() > MAX_RECORD_BYTES {
+        let mut first_pass = CountingCrcWriter::new(MAX_RECORD_BYTES);
+        if let Err(error) = serde_json::to_writer(&mut first_pass, record) {
+            if first_pass.attempted_bytes > MAX_RECORD_BYTES {
+                return Err(JournalError::RecordTooLarge {
+                    bytes: first_pass.attempted_bytes,
+                    max: MAX_RECORD_BYTES,
+                });
+            }
+            return Err(JournalError::Json(error));
+        }
+        let (payload_bytes, crc) = first_pass.finish();
+        if payload_bytes > MAX_RECORD_BYTES {
             return Err(JournalError::RecordTooLarge {
-                bytes: payload.len(),
+                bytes: payload_bytes,
                 max: MAX_RECORD_BYTES,
             });
         }
-        let length = u32::try_from(payload.len())?;
-        let crc = crc32fast::hash(&payload);
+        let length = u32::try_from(payload_bytes)?;
         self.writer
             .write_all(&length.to_le_bytes())
             .map_err(|source| JournalError::io("failed to write journal length", source))?;
         self.writer
             .write_all(&crc.to_le_bytes())
             .map_err(|source| JournalError::io("failed to write journal checksum", source))?;
-        self.writer
-            .write_all(&payload)
-            .map_err(|source| JournalError::io("failed to write journal payload", source))?;
+        let mut second_pass = BoundedCrcForwardWriter::new(&mut self.writer, payload_bytes);
+        if let Err(error) = serde_json::to_writer(&mut second_pass, record) {
+            if error.is_io() {
+                let kind = error.io_error_kind().unwrap_or(std::io::ErrorKind::Other);
+                return Err(JournalError::io(
+                    "failed to write journal payload",
+                    std::io::Error::new(kind, error),
+                ));
+            }
+            return Err(JournalError::Json(error));
+        }
+        let (written_bytes, written_crc) = second_pass.finish();
+        if written_bytes != payload_bytes || written_crc != crc {
+            return Err(JournalError::InvalidRecord(
+                "journal serialization passes produced different bytes".to_owned(),
+            ));
+        }
         Ok(())
     }
 
@@ -253,6 +466,21 @@ impl JournalWriter {
     /// Returns the owned journal path.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Returns the exact observed fixed Rust graph owned by this sink.
+    pub const fn fixed_retained_bytes(&self) -> usize {
+        self.fixed_retained_bytes
+    }
+
+    /// Returns the journal sink's independent fixed retained-byte ceiling.
+    pub const fn retained_byte_ceiling(&self) -> usize {
+        self.retained_byte_ceiling
+    }
+
+    /// Returns the observed never-growing `BufWriter` byte capacity.
+    pub fn buffer_capacity(&self) -> usize {
+        self.writer.capacity()
     }
 }
 

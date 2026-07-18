@@ -18,13 +18,13 @@ pub struct ValidatedLiveScope {
     valid_until: Timestamp,
     valid_from: Timestamp,
     trusted_valid_from: Timestamp,
-    trusted_valid_from_monotonic: Instant,
-    valid_until_monotonic: Instant,
+    trusted_valid_from_monotonic: RegistryMonotonicInstant,
+    valid_until_monotonic: RegistryMonotonicInstant,
     health_epoch: u64,
     lease: Arc<SessionLeaseState>,
     capture: crate::CaptureGenerationLease,
     budget: CurrentBudgetAuthority,
-    clock: Arc<dyn RegistryClock>,
+    clock: Arc<SealedRegistryClock>,
     universe_evidence: Option<ExactPayloadEvidence>,
 }
 

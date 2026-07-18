@@ -4,6 +4,7 @@
 //! serializable metadata and health evidence. Live adapters and extraction adapters share source
 //! identity contracts, but they do not share one oversized adapter trait.
 
+mod authority_time;
 mod bounded;
 mod capture;
 mod decoder;

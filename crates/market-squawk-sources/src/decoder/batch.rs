@@ -357,6 +357,7 @@ mod tests {
         ProviderStatusEvidence, sequence_dynamic_retained_bytes,
     };
     use crate::SessionId;
+    use crate::authority_time::trusted_test_receipt;
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -475,7 +476,7 @@ mod tests {
                 frame_id: FrameId::new(
                     NonZeroU64::new(1).ok_or("frame fixture must be nonzero")?,
                 ),
-                received_at: Timestamp::from_unix_nanos(1),
+                receipt: trusted_test_receipt(Timestamp::from_unix_nanos(1), 1)?,
                 payload_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, [1; 32]),
                 decoder_rule: IntegrityRule::new(decoder, RuleVersion::new(1)?),
             })

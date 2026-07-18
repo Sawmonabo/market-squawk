@@ -1,0 +1,7 @@
+error[E0046]: not all trait items implemented, missing: `resident_generation_lease`
+ --> tests/ui/capture_receipt_missing_retention.rs:6:1
+  |
+6 | impl CaptureRetainedReceipt for MissingRetention {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ missing `resident_generation_lease` in implementation
+  |
+  = help: implement the missing item: `fn resident_generation_lease(&self) -> &CaptureResidentGenerationLease { todo!() }`
