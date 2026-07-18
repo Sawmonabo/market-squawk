@@ -540,7 +540,7 @@ fallback whose unlock secret is never stored beside ciphertext.
 - [ ] **Step 2: Run RED**
 
 ```bash
-cargo test --manifest-path crates/market-squawk-data/Cargo.toml --test catalog --test rights
+cargo test --manifest-path crates/market-squawk-data/Cargo.toml --test catalog
 cargo test -p market-squawk-platform --test secrets --locked
 ```
 
