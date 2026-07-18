@@ -33,12 +33,13 @@ policy/product tests. Task 1 verifies every non-frozen version against current p
   `57caaad73b638eeb785157a24ab54dba1e49251859c5f104d8f6ab6d259fb731`. Task 1 verifies that digest
   and persists its deduplicated capability/source-link matrix under `docs/research`; the ignored file
   is not the durable source of truth.
-- The approved design is
-  `docs/superpowers/specs/2026-07-17-market-squawk-usable-release-truth-contract-design.md`; it
-  supersedes the halfway stop. Stop only at the usable-complete-local-release terminal gate in Task
-  20.
-- Active delivery language uses **Stage**, **Wave**, and **release gate**. Historical `Q1`, `Q2`,
-  `Q2-I*`, `Q2-R*`, and existing filenames remain immutable audit locators, not active “quarters.”
+- This plan and `docs/project-memory.md` supersede the earlier halfway stop through the user's later
+  explicit resume/continue-to-completion instructions. Stop only at the usable-complete-local-release
+  terminal gate in Task 20.
+- Stages and Waves describe dependency and ownership. Fresh grouped reviews occur at exactly four
+  delivery checkpoints labeled **Quarter 1 of 4** through **Quarter 4 of 4**. Historical `Q1`, `Q2`,
+  `Q2-I*`, `Q2-R*`, and existing filenames remain immutable audit locators, not extra active
+  quarters.
 - No paid software, paid API, cloud service, external database service, mandatory container runtime,
   mandatory telemetry infrastructure, or OpenTelemetry dependency.
 - Rust is exactly 1.97.1 stable for release, benchmark, and approval evidence; 1.97.0 is forbidden.
@@ -71,12 +72,13 @@ policy/product tests. Task 1 verifies every non-frozen version against current p
   current live authority, `ApprovedOrder`, or adapter dispatch. Every paper action passes the sole
   risk and one-time dispatch boundary.
 - A focused lane gate proves only that lane. Approval requires one clean unchanged exact commit, all
-  locked local gates, deterministic default tests, grouped independent review with zero unresolved
-  Critical/Important/Minor findings, truthful external-smoke status, GitHub publication, and cleanup.
+  locked local gates, deterministic default tests, the applicable grouped quarter review with zero
+  unresolved Critical/Important/Minor findings, truthful external-smoke status, GitHub publication,
+  and cleanup.
 - External network tests are opt-in and separate. Default tests use content-hashed, rights-recorded
   fixtures through production parsers and local protocol servers.
 - The integration owner alone edits `Cargo.toml`, `Cargo.lock`, shared public exports, application
-  composition, live-authority/risk dispatch handoff, migrations registry, capability ledger,
+  composition, live-authority/risk dispatch handoff, migrations registry, README capability state,
   checkpoint evidence, and review/publication state.
 - New crates under `crates/*` and `adapters/*` enter the workspace automatically. A lane may use a
   generated lane-local lock only for provisional RED/GREEN diagnosis; it never stages, commits, or
@@ -150,6 +152,29 @@ path set before dispatch and merges in the order shown.
 | Stage 4 / Wave 5 | 19 services/CLI/MCP domains | all domain services merged | app/MCP/CLI serialized composition | last implementation merge | one reviewed lock resolution; Task 19 focused `--locked` rerun; locked full workspace gate |
 | Stage 5 / Wave 6 | 20 demo/hardening/review/publication | clean integrated candidate | benches/fuzz/docs/evidence, then frozen review | terminal | unchanged reviewed lock; all locked release gates at each freeze |
 
+## Four delivery-quarter checkpoints
+
+The word *quarter* refers only to these four production-weighted delivery groups. It does not imply
+equal elapsed time, a calendar quarter, or permission to create Q5 and later groups. Stage and Wave
+remain the fine-grained dependency/parallelization coordinates inside each quarter.
+
+| Quarter checkpoint | Included work | Integrated outcome frozen for grouped review |
+| --- | --- | --- |
+| Quarter 1 of 4 | Tasks 0-6; Stages 0-1; Waves 0-1B | truthful baseline, governed dependencies, production live/risk/paper path, catalog/data/MCP foundations, and Kraken vertical |
+| Quarter 2 of 4 | Tasks 7-12; Stage 2; Waves 2-3 | required file/SEC/macro/portfolio ingestion, research composition, PIT datasets, and Rust analytics |
+| Quarter 3 of 4 | Tasks 13-18; Stage 3; Waves 4A-4B | model bundles, native/ONNX inference, Python product, portfolio accounting, backtesting, and fair value |
+| Quarter 4 of 4 | Tasks 19-20; Stages 4-5; Waves 5-6 | complete shared services/CLI/MCP plus demo, fuzz, measurement, security, publication, and usable-release evidence |
+
+At every quarter checkpoint the integration owner freezes one clean exact commit, runs the complete
+applicable locked gate, and dispatches fresh non-mutating specialist reviewers in maximum parallel
+batches. Reviewers receive the same commit and return findings without editing it. The integrator
+unions and deduplicates the findings into one concise checkpoint record, remediates every
+substantiated Critical, Important, and Minor finding, reruns the complete gate, and obtains fresh
+read-only approval of the unchanged replacement head. Only an approved quarter head may start the
+next quarter. The approved commit is pushed and reported on the active pull request, and completed
+clean lane worktrees are removed. Focused lane and Wave gates remain mandatory but do not substitute
+for a quarter checkpoint or trigger per-task independent review.
+
 If four agent slots are available, the integration owner occupies one slot and dispatches at most
 three disjoint writers. A lane blocked on a shared file sends an exact patch request to the integration
 owner and continues only on its owned files. No two live writers touch the same worktree.
@@ -195,8 +220,8 @@ evidence.
 
 Every lane that creates a crate or changes dependency requests uses this two-phase command contract.
 Its first dependency-resolving RED/GREEN commands deliberately omit `--locked` and are provisional.
-Before `stage_usable_release_task.py` and the lane commit, save the generated-lock diff only as
-ignored handoff evidence, then restore the owner-excluded lock and prove it equals the lane base.
+Before the explicit literal-path lane commit, save the generated-lock diff only as ignored handoff
+evidence, then restore the owner-excluded lock and prove it equals the lane base.
 This required pre-staging sequence applies to every such task below even when the common commands are
 not repeated in that task's focused command block:
 
@@ -210,12 +235,12 @@ This restore is authorized only for a lane-generated `Cargo.lock` after the diff
 must stop if the lock had pre-existing/user edits. The integrator then cherry-picks the clean lane
 commit, applies the reviewed manifest set, runs one minimal lock resolution, commits the lock diff,
 and reruns every lane's exact focused commands with `--locked`. A task's `Expected:` paragraph means
-the post-merge locked result, never the provisional lane run. The Stage truth ledger changes only in
-that integration commit.
+the post-merge locked result, never the provisional lane run. README capability state and release
+evidence change only in that integration commit.
 
 ---
 
-### Task 0: Refresh the approved baseline and enforce release truth
+### Task 0: Refresh the approved baseline and current release truth
 
 **Files:**
 
@@ -225,155 +250,74 @@ that integration commit.
 - Modify: `docs/architecture/current-state.md`
 - Modify: `docs/plans/gap-analysis.md`
 - Modify: `docs/plans/implementation-plan.md`
+- Delete: `docs/superpowers/specs/2026-07-17-market-squawk-usable-release-truth-contract-design.md`
+- Modify: `docs/superpowers/plans/2026-07-16-market-squawk-complete-remaining-work.md`
+- Modify: `docs/superpowers/plans/2026-07-16-market-squawk-q3-production-plan.md`
 - Modify: `docs/superpowers/plans/2026-07-17-market-squawk-usable-complete-release.md`
-- Create: `scripts/check_release_truth.py`
-- Create: `scripts/tests/test_release_truth.py`
-- Modify: `scripts/verify.sh`
-- Create: `docs/verification/release-capability-state.json`
 - Create: `docs/verification/usable-release-baseline.md`
+- Delete: `scripts/check_brand.py`
+- Delete: `scripts/check_duplicate_dependencies.py`
+- Delete: `scripts/tests/test_check_brand.py`
+- Delete: `scripts/tests/test_ci_pins.py`
+- Delete: `scripts/tests/test_credential_policy.py`
+- Delete: `scripts/tests/test_dependency_policy.py`
+- Delete: `scripts/tests/test_documentation_contracts.py`
+- Delete: `scripts/tests/test_duplicate_dependencies.py`
+- Delete: `scripts/tests/test_repository_governance_policy.py`
+- Delete: `scripts/tests/test_verify_script.py`
+- Modify: `scripts/verify.sh`
 
 **Interfaces:**
 
-- Consumes: independently approved live/capture exact SHA and review evidence; approved usable-release
-  truth design; current tracked file/tree digests.
-- Produces: a deterministic `ReleaseTruthReport`, the README headings `Runnable now`, `Required but
-  missing`, and `Release blocked until implemented`, corrected positive Python requirements, the
-  superseding terminal condition, and a refreshed exact plan base/API inventory.
+- Consumes: independently approved live/capture exact SHA and review evidence, current tracked
+  product code, and the approved usable-release scope.
+- Produces: an honest README capability inventory, a dated exact baseline, one canonical plan
+  authority, a usable complete-release terminal condition, and a lean verification suite that
+  protects product/build/security behavior rather than documentation wording.
 
-- [ ] **Step 1: Write failing README truth-policy tests**
+- [ ] **Step 1: Refresh current capability truth**
 
-Add table-driven tests with these exact policy sets:
+Update the README to distinguish `Runnable now`, `Required but missing`, and
+`Release blocked until implemented`. Name every mandatory producer-to-consumer vertical and its
+closing task. Correct the diagnostic capture receipt, current-authority, five-tool MCP, adapter,
+Python-product, and Parquet-compaction descriptions. Preserve zero-cost, no-evasion, journal,
+coverage, security, and financial-use warnings.
 
-```python
-REQUIRED_HEADINGS = (
-    "## Runnable now",
-    "## Required but missing",
-    "## Release blocked until implemented",
-)
-MANDATORY_CAPABILITIES = (
-    "Coinbase direct-source qualification",
-    "Kraken direct-source qualification",
-    "CSV/TSV", "JSON/NDJSON", "XML", "Excel", "SQLite/database export",
-    "OFX/QFX", "Parquet import", "SEC filings/XBRL/Company Facts",
-    "FRED/ALFRED", "BLS", "US Treasury", "portfolio import",
-    "SQLite catalog", "Arrow exchange", "Parquet datasets", "DataFusion queries",
-    "point-in-time datasets", "Rust financial analytics", "feature registry",
-    "Python data/financial/training product", "complete model bundle",
-    "native Rust inference", "constrained ONNX inference", "research backtesting",
-    "portfolio accounting/analytics", "strategies and comprehensive risk",
-    "realistic paper execution", "ASC 820/IFRS 13 fair value",
-    "complete local CLI", "complete typed local MCP", "release security/fuzz/performance gate",
-)
-FORBIDDEN_DEFERRAL = ("later stage", "subsequent stage", "roadmap")
-```
+- [ ] **Step 2: Remove competing delivery authority**
 
-Reject a diagnostic MCP described as complete, policy-helper Python described as the product package,
-missing adapter/Python status, active numbered-quarter delivery language above four, active “quarter
-review/checkpoint” terminology, or a usable-release claim while a mandatory item remains in `Missing`
-state. Exclude immutable historical finding IDs, filenames, and cited research quotations. Require
-each mandatory capability to appear exactly once in `release-capability-state.json` as `Runnable`,
-`Missing`, `Partial`, `Incorrect`, `Unsafe`, or `Blocked`; require the README section and evidence
-reference to match that state. Every non-`Runnable` item appears under `Required but missing` with its
-exact state, blocker and closing task. A `Runnable` item appears only under `Runnable now` and requires
-an immutable evidence path and exact commit SHA. Any non-`Runnable` item forces the release-blocked
-predicate. In the final all-`Runnable` state, `Required but missing` must contain exactly `None.`
-Add transition fixtures for baseline-all-missing, partial Stage integration, forbidden premature
-promotion, evidence invalidation after a commit change, and terminal all-runnable state.
+Replace `docs/plans/implementation-plan.md` with the stable canonical entry point. Mark the dated
+Q5-Q7 remaining-work plan and old Q3 plan superseded with no current execution authority. Preserve
+historical IDs as audit locators. Replace the halfway stop in project memory with the usable
+complete-release terminal and use Stage, Wave, and Release Gate for current work.
 
-Add a capture-truth fixture requiring the README to distinguish: successful source admission means
-only a bounded in-process queue/admission receipt; writer append/flush/fsync and durability completion
-remain asynchronous and never gate event publication. Reject “source waits for writer/durability
-acknowledgement” and any claim that admission alone proves disk persistence.
+- [ ] **Step 3: Record the exact baseline**
 
-- [ ] **Step 2: Run RED**
+Record product SHA/tree/branch, toolchain, workspace members and dependency edges, tracked
+adapter/Python-package state, runnable diagnostic capabilities, missing product planes, public
+interfaces consumed by subsequent tasks, verification evidence, and review disposition in
+`usable-release-baseline.md`. Mark stale current-state and gap documents as historical until the
+approved Q2 head is integrated and those detailed audits are refreshed.
+
+- [ ] **Step 4: Remove prose-policy automation**
+
+Delete branding, documentation-contract, plan-label, governance-template, verification-wrapper,
+and configuration-snapshot tests. Remove the exact CLI-help sentence assertion. Keep checks that
+exercise actual workspace boundaries, dependency graphs, generated or secret artifacts, immutable
+CI actions, MCP protocol behavior, concurrency models, and locked Rust builds/tests. Run Cargo Deny,
+Cargo Audit, and Gitleaks themselves instead of unit-testing fragments of their configuration. Do
+not replace the deleted machinery with another README parser, capability-ledger checker, or command-
+string snapshot.
+
+- [ ] **Step 5: Verify and review**
 
 ```bash
-python3 -m unittest scripts.tests.test_release_truth -v
-```
-
-Expected: FAIL because `scripts/check_release_truth.py` and the three README headings do not exist;
-current vague deferral and roadmap text is reported.
-
-- [ ] **Step 3: Implement the deterministic checker**
-
-Implement `check(path: pathlib.Path, state_path: pathlib.Path) -> ReleaseTruthReport` with 512 KiB
-no-follow stable reads, exact heading parsing, strict capability-state schema and uniqueness,
-case-normalized mandatory matching, evidence/commit checks, scoped forbidden-phrase checks, active
-delivery-term checks, and a bounded stable sorted violation list. The CLI accepts only `README.md`
-and `docs/verification/release-capability-state.json`, rejects symlinks, prints deterministic JSON on
-success, never rewrites files, and exits nonzero on a violation. Its closed CLI is exactly
-`check_release_truth.py README.md docs/verification/release-capability-state.json`; zero, one, three,
-reordered, duplicated, absolute, or alternate paths are rejected.
-
-- [ ] **Step 4: Rewrite current truth and terminal policy**
-
-Use this exact README order:
-
-```markdown
-## Runnable now
-The diagnostic foundation currently provides the verified Rust workspace, canonical domain types,
-local policy checks, and bounded compatibility-only control-plane diagnostics. These paths do not
-constitute a usable release, production provider coverage, or automated-execution authority.
-## Required but missing
-The release-capability ledger marks each required provider, storage, analytics, Python, modeling,
-backtest, portfolio, execution, fair-value, and complete-MCP capability `Missing` and links it to the
-closing task in this plan. The README renders that ledger as explicit capability rows.
-## Release blocked until implemented
-Market Squawk is not a usable complete local release until every required vertical is integrated,
-verified at one exact commit, independently reviewed, and demonstrated through local CLI and MCP.
-## Diagnostic foundation quick start
-List the existing build, test, doctor, and five-tool compatibility MCP commands, and label each one
-`Diagnostic only` with its authority and provider-coverage limits.
-## Release-blocking implementation map
-Render the Stage/Wave table from this plan and link every row to its exact closing tasks and start
-barrier.
-```
-
-Preserve zero-cost, no-evasion, journal, coverage, authority, security, and financial-use warnings.
-State that no tracked production adapter crate/directory and no Python product package exist at this
-baseline, while avoiding claims about ignored or untracked filesystem entries. State the bounded
-capture-admission versus asynchronous writer/durability contract exactly. The five-tool MCP remains
-compatibility-only. Replace the project-memory halfway-terminal section with the approved design's
-superseding usable-release decision; do not leave two competing active terminal conditions. Update
-`AGENTS.md` to require the new active Stage/Wave/release-gate vocabulary and usable terminal. In the gap
-analysis, split “Python absent from live path” from positive data/finance/training/export requirements,
-which remain `Missing` until Task 14.
-
-Initialize `release-capability-state.json` with every mandatory capability in `Missing` state, its
-closing task, and this plan path. After each integrated Stage, the integration owner alone updates the
-ledger and README in the Stage integration commit: a capability moves to `Runnable` only after its
-producer, terminal consumer, focused gate, and immutable evidence are present. This serialized truth
-update is mandatory before the next Stage starts; lane writers never edit the shared ledger/README.
-
-- [ ] **Step 5: Refresh exact baseline evidence and plan assumptions**
-
-Record approved SHA/tree/branch, toolchain, workspace members/edges, file existence, test counts,
-review state, all public interfaces consumed below, and current adapter/Python status in
-`usable-release-baseline.md`. Update every stale plan path/signature/line anchor and stop if the
-approved head lacks an assumed prerequisite.
-
-- [ ] **Step 6: Run GREEN and commit**
-
-```bash
-python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
-python3 scripts/check_release_truth.py README.md \
-  docs/verification/release-capability-state.json
-python3 scripts/check_brand.py
-python3 scripts/check_workspace_boundaries.py
-python3 scripts/check_duplicate_dependencies.py
-python3 scripts/check_generated_artifacts.py
+./scripts/verify.sh
 git diff --check
-git add AGENTS.md README.md docs/project-memory.md docs/architecture/current-state.md \
-  docs/plans/gap-analysis.md docs/plans/implementation-plan.md \
-  docs/superpowers/plans/2026-07-17-market-squawk-usable-complete-release.md \
-  docs/verification/release-capability-state.json \
-  docs/verification/usable-release-baseline.md scripts/check_release_truth.py \
-  scripts/tests/test_release_truth.py scripts/verify.sh
-git commit -m "docs(release): enforce usable release truth"
 ```
 
-Expected: all commands pass, product Rust code is unchanged, and the committed plan names its exact
-approved audit base.
+Inspect relative links and the exact changed-file inventory directly. Integrate Task 0 into the
+Quarter 1 candidate; fresh independent review is grouped at the Quarter 1 checkpoint rather than
+repeated for this ordinary task.
 
 ### Task 1: Freeze the dependency DAG, current research, and path ownership
 
@@ -382,27 +326,19 @@ approved audit base.
 - Create: `docs/verification/usable-release-path-ownership.json`
 - Create: `docs/research/2026-07-17-usable-release-dependencies.md`
 - Create: `docs/research/2026-07-17-usable-release-traceability.md`
-- Create: `scripts/check_usable_release_plan.py`
-- Create: `scripts/stage_usable_release_task.py`
-- Create: `scripts/tests/test_check_usable_release_plan.py`
-- Create: `scripts/tests/test_stage_usable_release_task.py`
 - Modify: `scripts/check_workspace_boundaries.py`
-- Modify: `scripts/tests/test_dependency_policy.py`
 
 **Interfaces:**
 
 - Consumes: Task 0 exact inventory, official dependency/provider/MCP/runtime research, existing Q3
   detailed plan, and the provisional Q4 plan.
-- Produces: closed `TaskId -> exact paths` ownership JSON, acyclic dependency allowlist, a tracked
-  deduplicated requirement/producer/consumer/evidence/source-link matrix, exact
-  compatible dependency/license/MSRV record, literal-path staging helper, and zero-credit
-  preimplementation state.
+- Produces: a closed task-to-path ownership map for parallel work, an acyclic crate dependency
+  allowlist, and a deduplicated requirement/producer/consumer/evidence/source-link matrix.
 
-- [ ] **Step 1: Write RED plan/ownership/dependency tests**
+- [ ] **Step 1: Inspect the actual dependency graph**
 
-Require Tasks 0-20 exactly once, the wave table, start barrier/focused gate per task, no glob or
-directory-only ownership, no overlap between parallel lanes, and serialized root manifest/lock/app/
-authority/evidence ownership. Enforce this graph:
+Use `cargo metadata --locked --all-features` and the current public APIs. Confirm this allowed local
+crate graph and reject any proposed hot-path edge to data, MCP, Python, or provider adapters:
 
 ```text
 domain -> none
@@ -423,69 +359,36 @@ provider adapters -> declared domain/source/platform contracts, never data
 app -> composition dependencies
 ```
 
-Reject `live -> data|mcp|python|adapter`, production `test-support`, an adapter without a real
-consumer test, and multiple owners for a shared hotspot.
+- [ ] **Step 2: Refresh dependency and provider research**
 
-- [ ] **Step 2: Run RED**
+Use current official sources. Record exact compatible versions, enabled features, licenses, Rust and
+Python floors, native artifacts, transitive risks, provider rights, coverage, quotas, retrieval date,
+and stable fallback. Reject dependencies incompatible with Rust 1.97.1, local zero-mandatory-cost
+operation, or the no-evasion boundary.
 
-```bash
-python3 -m unittest scripts.tests.test_check_usable_release_plan \
-  scripts.tests.test_stage_usable_release_task scripts.tests.test_dependency_policy -v
-```
+- [ ] **Step 3: Freeze parallel ownership**
 
-Expected: FAIL because the ownership JSON and new validators do not exist.
+Record every Task 0-20 path in `usable-release-path-ownership.json`. A complete conflict-isolated
+lane owns a cohesive group of files, not one worktree per checklist item. Shared manifests,
+`Cargo.lock`, application composition, authority-critical files, and release evidence remain
+serialized under the integration owner. Review the map directly for overlaps before starting a Wave.
 
-- [ ] **Step 3: Freeze exact dependency and rights research**
-
-Use current official sources and `cargo metadata --locked`. Retain the researched DataFusion 54.0.0
-and compatible Arrow/Parquet 58.3.0 family. Verify exact rusqlite/bundled SQLite, rmcp, PyO3,
-maturin, PyArrow, ONNX runtime, keyring, Argon2id, XChaCha20-Poly1305, parser, fuzz and benchmark
-versions. Record URL, retrieval date, license, Rust/Python floor, enabled features, native artifact
-policy, transitive risks and stable fallback. Reject anything incompatible with Rust 1.97.1,
-zero-mandatory-cost, local operation or the no-evasion boundary.
-
-Verify the ignored traceability report digest, reconcile it against the refreshed repository and
-approved design, and persist every mandatory capability with current classification, requirement IDs,
-producer, terminal consumer, acceptance evidence, closing task and direct official source/terms/docs
-links. Every web result records title, canonical URL, publisher, retrieval date, exact claim used and
-archived content digest where redistribution rights allow. Prefer official provider/API/protocol/
-runtime documentation and upstream release/security advisories; label any inference. Adapter fixture
-manifests in Tasks 6-10 link back to these records and add exact fixture URL/license/hash.
-
-- [ ] **Step 4: Implement the closed validators**
-
-`check_usable_release_plan.py` validates task headings, checkboxes, exact files, interface names,
-RED/GREEN commands, commit steps, waves/barriers/owners/gates, mandatory capability tokens and the
-terminal gate. `stage_usable_release_task.py TASK_ID` uses Git literal pathspecs, rejects traversal,
-symlinks, overlapping ownership, unexpected staged paths and task-owned dirty paths left unstaged,
-then verifies the index. Both use bounded stable reads and deterministic bounded output.
-
-- [ ] **Step 5: Extend workspace boundary enforcement**
-
-Read actual `cargo metadata`; compare every edge to the allowlist; reject Python imports from live/
-execution packages; reject any package whose only production behavior is a trait/schema; require an
-adapter's production parser plus an integration consumer before counting membership.
-
-- [ ] **Step 6: Run GREEN and commit**
+- [ ] **Step 4: Verify the real policies**
 
 ```bash
-python3 -m unittest scripts.tests.test_check_usable_release_plan \
-  scripts.tests.test_stage_usable_release_task scripts.tests.test_dependency_policy -v
-python3 scripts/check_usable_release_plan.py \
-  docs/superpowers/plans/2026-07-17-market-squawk-usable-complete-release.md \
-  docs/verification/usable-release-path-ownership.json
+cargo metadata --locked --all-features --format-version 1 > /dev/null
 python3 scripts/check_workspace_boundaries.py
+cargo deny check
+cargo audit --deny warnings
+gitleaks dir --redact --no-banner .
+gitleaks git --redact --no-banner
 git diff --check
-git add docs/verification/usable-release-path-ownership.json \
-  docs/research/2026-07-17-usable-release-dependencies.md \
-  docs/research/2026-07-17-usable-release-traceability.md \
-  scripts/check_usable_release_plan.py scripts/stage_usable_release_task.py \
-  scripts/tests/test_check_usable_release_plan.py scripts/tests/test_stage_usable_release_task.py \
-  scripts/check_workspace_boundaries.py scripts/tests/test_dependency_policy.py
-git commit -m "build(release): freeze dependency and lane ownership"
 ```
 
-Expected: all checks pass and no product package has been created.
+Do not add a parser that tests plan headings, checkboxes, task labels, or wording. Do not add a
+custom staging wrapper. At execution time, enumerate every approved repository-relative path
+literally in the `git add --` command from the reviewed ownership map.
+
 
 ### Task 2: Complete production live features, Coinbase, risk, and realistic paper execution
 
@@ -493,8 +396,6 @@ Expected: all checks pass and no product package has been created.
 
 - Refresh/execute: `docs/superpowers/plans/2026-07-16-market-squawk-q3-production-plan.md`
 - Create: `docs/verification/stage-live-execution-path-ownership.json`
-- Create: `scripts/check_stage_live_execution_plan.py`
-- Create: `scripts/tests/test_check_stage_live_execution_plan.py`
 - Create/modify: every exact product, test, and benchmark path enumerated by
   `stage-live-execution-path-ownership.json`, including stable modules
   `crates/market-squawk-domain/src/order.rs`,
@@ -527,15 +428,12 @@ fuzz, performance and review contract, but transfer creation/execution of fuzz t
 Task 2 owns only parser property tests and committed seed fixtures. Materialize every exact Task-2
 path from the detailed plan into
 `stage-live-execution-path-ownership.json`; the refreshed Q3 plan plus that closed JSON are normative
-inputs to this master plan. `check_stage_live_execution_plan.py` rejects a detailed-plan file absent
-from the JSON, a JSON path absent from the plan, globs/directories, overlap with another live lane,
-and any shared hotspot not owned by the integration owner.
+inputs to this master plan. Review the two artifacts directly for missing paths, globs/directories,
+lane overlap, and shared hotspots before dispatching workers.
 
 - [ ] **Step 2: Execute all detailed Q3 RED/GREEN commits**
 
-First run `python3 -m unittest scripts.tests.test_check_stage_live_execution_plan -v` and observe RED
-until the exact closed path map and checker exist. Then use subagent-driven development on the
-refreshed DAG. Required RED evidence includes absent complete
+Use subagent-driven development on the refreshed DAG. Required RED evidence includes absent complete
 order identities/types, feature registry, risk reservations, production Coinbase current-batch
 adapter, route-owned feature state, private approval/dispatch boundary, complete paper state machine,
 shared app services and compile-fail bypass tests. Each lane runs its detailed focused test/clippy/
@@ -554,10 +452,6 @@ fees, seeded latency, depth/slippage/impact, reservations, balances/positions, r
 - [ ] **Step 4: Freeze focused interfaces and commit**
 
 ```bash
-python3 -m unittest scripts.tests.test_check_stage_live_execution_plan -v
-python3 scripts/check_stage_live_execution_plan.py \
-  docs/superpowers/plans/2026-07-16-market-squawk-q3-production-plan.md \
-  docs/verification/stage-live-execution-path-ownership.json
 cargo fmt --all --check
 cargo clippy -p market-squawk-domain -p market-squawk-live \
   -p market-squawk-analytics -p market-squawk-execution \
@@ -568,7 +462,6 @@ cargo test -p market-squawk-domain -p market-squawk-live \
   -p market-squawk-adapter-coinbase -p market-squawk-adapter-paper \
   -p market-squawk --all-features --locked
 git diff --check
-python3 scripts/stage_usable_release_task.py 2
 git commit -m "feat(execution): complete production risk and paper vertical"
 ```
 
@@ -661,7 +554,6 @@ cargo clippy --manifest-path crates/market-squawk-data/Cargo.toml \
   --all-targets --all-features --locked -- -D warnings
 cargo clippy -p market-squawk-platform --all-targets --all-features --locked -- -D warnings
 git diff --check
-python3 scripts/stage_usable_release_task.py 3
 git commit -m "feat(data): add durable local catalog and rights admission"
 ```
 
@@ -762,7 +654,6 @@ cargo clippy --manifest-path crates/market-squawk-data/Cargo.toml \
   --all-targets --all-features --locked -- -D warnings
 python3 scripts/check_workspace_boundaries.py
 git diff --check
-python3 scripts/stage_usable_release_task.py 4
 git commit -m "feat(data): publish immutable analytical datasets"
 ```
 
@@ -864,7 +755,6 @@ cargo clippy --manifest-path crates/market-squawk-mcp/Cargo.toml \
 cargo clippy --manifest-path crates/market-squawk-services/Cargo.toml \
   --all-targets --all-features --locked -- -D warnings
 git diff --check
-python3 scripts/stage_usable_release_task.py 5
 git commit -m "feat(mcp): add bounded local protocol server"
 ```
 
@@ -935,7 +825,6 @@ cargo test --manifest-path adapters/market-squawk-adapter-kraken/Cargo.toml --al
 cargo clippy --manifest-path adapters/market-squawk-adapter-kraken/Cargo.toml \
   --all-targets --all-features --locked -- -D warnings
 git diff --check
-python3 scripts/stage_usable_release_task.py 6
 git commit -m "feat(kraken): add integrity-qualified live adapter"
 ```
 
@@ -1009,7 +898,6 @@ cargo test --manifest-path adapters/market-squawk-adapter-files/Cargo.toml --all
 cargo clippy --manifest-path adapters/market-squawk-adapter-files/Cargo.toml \
   --all-targets --all-features --locked -- -D warnings
 git diff --check
-python3 scripts/stage_usable_release_task.py 7
 git commit -m "feat(files): add bounded local extraction adapters"
 ```
 
@@ -1068,7 +956,6 @@ cargo test --manifest-path adapters/market-squawk-adapter-sec/Cargo.toml --all-f
 cargo clippy --manifest-path adapters/market-squawk-adapter-sec/Cargo.toml \
   --all-targets --all-features --locked -- -D warnings
 git diff --check
-python3 scripts/stage_usable_release_task.py 8
 git commit -m "feat(sec): ingest filings and company facts"
 ```
 
@@ -1158,7 +1045,6 @@ cargo clippy --manifest-path adapters/market-squawk-adapter-bls/Cargo.toml \
 cargo clippy --manifest-path adapters/market-squawk-adapter-treasury/Cargo.toml \
   --all-targets --all-features -- -D warnings
 git diff --check
-python3 scripts/stage_usable_release_task.py 9
 git commit -m "feat(macro): ingest official revisioned series"
 ```
 
@@ -1215,7 +1101,6 @@ cargo test --manifest-path adapters/market-squawk-adapter-portfolio/Cargo.toml -
 cargo clippy --manifest-path adapters/market-squawk-adapter-portfolio/Cargo.toml \
   --all-targets --all-features -- -D warnings
 git diff --check
-python3 scripts/stage_usable_release_task.py 10
 git commit -m "feat(portfolio): import and reconcile source records"
 ```
 
@@ -1311,7 +1196,6 @@ cargo test -p market-squawk --test research_vertical --locked
 cargo clippy -p market-squawk-data -p market-squawk \
   --all-targets --all-features --locked -- -D warnings
 git diff --check
-python3 scripts/stage_usable_release_task.py 11
 git commit -m "feat(research): build point-in-time datasets"
 ```
 
@@ -1382,7 +1266,6 @@ cargo test -p market-squawk-analytics --all-features --locked
 cargo clippy -p market-squawk-analytics --all-targets --all-features \
   --locked -- -D warnings
 git diff --check
-python3 scripts/stage_usable_release_task.py 12
 git commit -m "feat(analytics): add complete financial feature kernels"
 ```
 
@@ -1459,7 +1342,6 @@ cargo test --manifest-path crates/market-squawk-modeling/Cargo.toml --all-featur
 cargo clippy --manifest-path crates/market-squawk-modeling/Cargo.toml \
   --all-targets --all-features -- -D warnings
 git diff --check
-python3 scripts/stage_usable_release_task.py 13
 git commit -m "feat(modeling): validate bundles and native inference"
 ```
 
@@ -1534,13 +1416,11 @@ pure Rust computation; translate typed errors without leaking paths/secrets.
 
 `scripts/build_python_release.py` verifies every source/wheel filename, SHA-256, Python/platform tag
 and license from `wheelhouse-lock.json`; populates the ignored wheelhouse from an explicitly supplied
-local cache or an authorized preparation network mode. Normal/release mode runs the Task 1-pinned
-maturin with `cargo --locked`. The explicit lane-only `--provisional-lane-lock` mode may resolve an
-uncommitted lane-local workspace lock, records its diff, and is rejected by Task 20; it does not alter
-the Python dependency/wheelhouse lock. The builder hashes/adds the `abi3` project wheel to the run manifest;
-creates a clean venv; installs dependencies and the project wheel with `pip --no-index --find-links`;
-and records interpreter, compiler, Cargo, wheel and lock digests. It never downloads during the
-offline verification mode used by Task 20.
+local cache or an authorized preparation network mode. Release mode runs the Task 1-pinned maturin
+with `cargo --locked` against the integration-owner-produced workspace lock. The builder hashes/adds
+the `abi3` project wheel to the run manifest, creates a clean venv, installs dependencies and the
+project wheel with `pip --no-index --find-links`, and records interpreter, compiler, Cargo, wheel and
+lock digests. It never downloads during the offline verification mode used by Task 20.
 
 - [ ] **Step 4: Implement deterministic training, evaluation, and export**
 
@@ -1559,7 +1439,6 @@ MARKET_SQUAWK_PYTHON_WHEEL_PREPARE_NETWORK=1 \
   --wheelhouse .agents/cache/python-wheelhouse
 python3 scripts/build_python_release.py \
   --offline \
-  --provisional-lane-lock \
   --lock python/wheelhouse-lock.json \
   --wheelhouse .agents/cache/python-wheelhouse \
   --venv .agents/tmp/python-release-venv
@@ -1567,11 +1446,7 @@ python3 scripts/build_python_release.py \
 cargo test -p market-squawk-python --all-features
 cargo build --workspace --all-features
 python3 scripts/check_workspace_boundaries.py
-git diff -- Cargo.lock > .agents/tmp/generated-lock-disposition.patch
-git restore --source=HEAD --staged --worktree -- Cargo.lock
-git diff --exit-code -- Cargo.lock
 git diff --check
-python3 scripts/stage_usable_release_task.py 14
 git commit -m "feat(python): add financial research and training product"
 ```
 
@@ -1659,7 +1534,6 @@ cargo test -p market-squawk-modeling --test onnx --test onnx_hostile \
 cargo clippy -p market-squawk-modeling --all-targets --features onnx \
   --locked -- -D warnings
 git diff --check
-python3 scripts/stage_usable_release_task.py 15
 git commit -m "feat(modeling): add constrained ONNX inference"
 ```
 
@@ -1740,7 +1614,6 @@ cargo test --manifest-path crates/market-squawk-portfolio/Cargo.toml --all-featu
 cargo clippy --manifest-path crates/market-squawk-portfolio/Cargo.toml \
   --all-targets --all-features -- -D warnings
 git diff --check
-python3 scripts/stage_usable_release_task.py 16
 git commit -m "feat(portfolio): add accounting analytics and risk state"
 ```
 
@@ -1763,7 +1636,6 @@ cargo clippy -p market-squawk-execution --all-targets --all-features \
   --locked -- -D warnings
 python3 scripts/check_workspace_boundaries.py
 git diff --check
-python3 scripts/stage_usable_release_task.py 16
 git commit -m "feat(execution): bind risk to portfolio revisions"
 ```
 
@@ -1844,7 +1716,6 @@ git diff -- Cargo.lock > .agents/tmp/generated-lock-disposition.patch
 git restore --source=HEAD --staged --worktree -- Cargo.lock
 git diff --exit-code -- Cargo.lock
 git diff --check
-python3 scripts/stage_usable_release_task.py 17
 git commit -m "feat(backtest): add point-in-time experiment engine"
 ```
 
@@ -1909,7 +1780,6 @@ cargo test --manifest-path crates/market-squawk-valuation/Cargo.toml --all-featu
 cargo clippy --manifest-path crates/market-squawk-valuation/Cargo.toml \
   --all-targets --all-features -- -D warnings
 git diff --check
-python3 scripts/stage_usable_release_task.py 18
 git commit -m "feat(valuation): classify fair value with evidence"
 ```
 
@@ -1960,8 +1830,6 @@ authority.
 - Create: `apps/market-squawk/tests/service_parity.rs`
 - Create: `apps/market-squawk/tests/doctor_policy.rs`
 - Create: `apps/market-squawk/tests/no_hidden_outbound.rs`
-- Create: `scripts/check_no_telemetry.py`
-- Create: `scripts/tests/test_check_no_telemetry.py`
 - Modify: `scripts/smoke_mcp.py`
 
 **Interfaces:**
@@ -2030,7 +1898,8 @@ cargo test -p market-squawk-services --test domain_contracts --locked
 cargo test -p market-squawk --test cli_complete --test service_parity \
   --test doctor_policy --test no_hidden_outbound --locked
 python3 scripts/smoke_mcp.py ./target/debug/market-squawk
-python3 scripts/check_no_telemetry.py Cargo.toml Cargo.lock apps crates adapters python
+cargo deny check
+python3 scripts/check_workspace_boundaries.py
 ```
 
 Expected: FAIL because complete domain handlers, CLI hierarchy and shared composition are absent.
@@ -2065,10 +1934,9 @@ cargo test -p market-squawk --all-features --locked
 cargo clippy -p market-squawk-services -p market-squawk-mcp -p market-squawk \
   --all-targets --all-features --locked -- -D warnings
 python3 scripts/smoke_mcp.py ./target/debug/market-squawk
-python3 scripts/check_no_telemetry.py Cargo.toml Cargo.lock apps crates adapters python
+cargo deny check
 python3 scripts/check_workspace_boundaries.py
 git diff --check
-python3 scripts/stage_usable_release_task.py 19
 git commit -m "feat(app): complete local CLI and MCP services"
 ```
 
@@ -2090,14 +1958,12 @@ CLI-parity tests pass; compatibility aliases remain explicitly diagnostic.
 - Create: `scripts/run_sustained_benchmark.py`
 - Create: `scripts/check_release_performance.py`
 - Create: `scripts/check_external_release_evidence.py`
-- Create: `scripts/run_usable_release_gate.py`
-- Create: `scripts/build_release_review_report.py`
+- Create: `scripts/check_release_evidence.py`
 - Create: `scripts/tests/test_run_release_fuzz.py`
 - Create: `scripts/tests/test_run_sustained_benchmark.py`
 - Create: `scripts/tests/test_check_release_performance.py`
 - Create: `scripts/tests/test_check_external_release_evidence.py`
-- Create: `scripts/tests/test_run_usable_release_gate.py`
-- Create: `scripts/tests/test_build_release_review_report.py`
+- Create: `scripts/tests/test_check_release_evidence.py`
 - Create: `fuzz/Cargo.toml`
 - Create: `fuzz/fuzz_targets/coinbase_decoder.rs`
 - Create: `fuzz/fuzz_targets/kraken_v2_decoder.rs`
@@ -2116,7 +1982,6 @@ CLI-parity tests pass; compatibility aliases remain explicitly diagnostic.
 - Create: `docs/verification/usable-release-gate.md`
 - Create: `docs/reports/usable-release-review.md`
 - Modify: `README.md`
-- Modify: `docs/verification/release-capability-state.json`
 - Modify: `SECURITY.md`
 - Modify: `CHANGELOG.md`
 
@@ -2139,9 +2004,9 @@ portfolio reports; classifies fair value; calls every CLI/MCP domain; and verifi
 artifacts/reconciliation. It also executes `doctor` in human and JSON modes, verifies effective
 configuration precedence, endpoint/artifact confinement, recursive secret redaction, telemetry/
 OpenTelemetry disabled, and zero outbound socket/DNS calls in offline mode. A fixture or local server
-can validate parsing and state transitions but can
-never mint `DirectVerified`. The demo fails if a mock/diagnostic path substitutes for production or
-if exact-head authorized direct-source evidence is absent.
+can validate parsing and state transitions but can never mint `DirectVerified`. The demo fails if a
+mock or diagnostic path substitutes for production, or if exact-head authorized direct-source
+evidence is absent.
 
 - [ ] **Step 2: Run RED**
 
@@ -2153,7 +2018,7 @@ python3 scripts/demo_usable_release.py --offline-fixtures
 Expected: FAIL until every required vertical, FRED rights predicate, and separate authorized
 direct-source evidence predicate is satisfied and composed.
 
-- [ ] **Step 3: Complete fuzz, property, performance, and sustained-memory evidence**
+- [ ] **Step 3: Implement fuzz, performance, and sustained-memory evidence producers**
 
 Task 20 is the sole owner of fuzz targets and campaigns; Tasks 6/7 contribute production parsers,
 property tests and seed fixtures only. `run_release_fuzz.py` verifies the exact fuzz-only nightly from
@@ -2169,30 +2034,33 @@ DataFusion query and Python handoff. `run_sustained_benchmark.py` samples proces
 whichever is larger, or if any queue exceeds configured capacity. Every run records hardware, OS,
 toolchain, fixture/digest, event/row count, throughput, p50/p95/p99/max and peak RSS.
 
-Run these exact gates on documented target hardware:
+Before the candidate freeze, exercise every producer against a provisional ignored directory. These
+runs validate the tooling but are never approval evidence:
 
 ```bash
+EVIDENCE_DIR=target/release-evidence/provisional
+mkdir -p "$EVIDENCE_DIR"
 python3 scripts/run_release_fuzz.py \
   --toolchain nightly-2026-07-15 --seconds-per-target 120 \
-  --rss-limit-mib 2048 --report target/release-evidence/fuzz.json
+  --rss-limit-mib 2048 --report "$EVIDENCE_DIR/fuzz.json"
 cargo bench -p market-squawk --bench event_to_decision_latency \
   --all-features --locked -- --warm-up-events 1000000 --events 10000000 \
-  --output target/release-evidence/live-bench.json
+  --output "$EVIDENCE_DIR/live-bench.json"
 cargo bench -p market-squawk-data --bench storage \
   --all-features --locked -- --rows 10000000 \
-  --output target/release-evidence/data-bench.json
+  --output "$EVIDENCE_DIR/data-bench.json"
 cargo build -p market-squawk --bin market-squawk-benchmark \
   --release --all-features --locked
 python3 scripts/run_sustained_benchmark.py \
   --binary target/release/market-squawk-benchmark --warm-up-events 1000000 \
   --events 60000000 --max-tail-growth-mib 32 --max-tail-growth-percent 1 \
-  --report target/release-evidence/sustained-memory.json
+  --report "$EVIDENCE_DIR/sustained-memory.json"
 python3 scripts/check_release_performance.py \
-  --live target/release-evidence/live-bench.json \
-  --data target/release-evidence/data-bench.json \
-  --memory target/release-evidence/sustained-memory.json \
+  --live "$EVIDENCE_DIR/live-bench.json" \
+  --data "$EVIDENCE_DIR/data-bench.json" \
+  --memory "$EVIDENCE_DIR/sustained-memory.json" \
   --min-events-per-second 100000 --max-warmed-p99-ns 999999 \
-  --report docs/verification/usable-release-performance.md
+  --report "$EVIDENCE_DIR/performance.json"
 ```
 
 Expected: every command exits 0; measured end-to-decision throughput is at least 100,000 events/s,
@@ -2200,9 +2068,11 @@ warmed p99 is strictly below 1,000,000 ns, queues remain bounded, post-warm-up R
 growth bound, and analytical I/O probes record zero calls from the live path. The checker refuses to
 write a passing report when measurements, fixture hashes, hardware fields or component distributions
 are missing. No performance claim is permitted from estimates, local-server network timing, a failed
-run or a different commit.
+run or a different commit. The tracked demonstration, performance, and gate documents are prepared
+before the candidate freeze as human-readable methodology and provisional-result summaries. They
+must state that they are not exact-head approval evidence and are never rewritten after a freeze.
 
-- [ ] **Step 4: Capture separate authorized provider evidence at the frozen candidate**
+- [ ] **Step 4: Implement the separate authorized provider-evidence producer**
 
 Run production adapters against direct venue/public interfaces and FRED/ALFRED only after the user has
 affirmed the applicable terms, configured one authorized identity where required, and explicitly
@@ -2214,9 +2084,14 @@ source must satisfy every `DirectVerified` predicate and drive strategy -> compr
 paper action; otherwise the release remains blocked. FRED/ALFRED retrieval/persistence/training rights
 must be admitted or the required macro predicate remains blocked.
 
+The provisional provider run uses the same production tests and checker but writes only below
+`target/release-evidence/provisional/providers`. It establishes parser/rights-checker behavior, not
+release approval:
+
 ```bash
 test "$MARKET_SQUAWK_EXTERNAL_NETWORK" = "1"
 test "$MARKET_SQUAWK_PROVIDER_TERMS_ACCEPTED" = "1"
+export MARKET_SQUAWK_RELEASE_EVIDENCE_DIR=target/release-evidence/provisional/providers
 cargo test -p market-squawk --test external_coinbase_vertical \
   --all-features --locked -- --ignored --nocapture
 cargo test -p market-squawk --test external_kraken_vertical \
@@ -2225,7 +2100,7 @@ cargo test -p market-squawk --test external_fred_alfred_vertical \
   --all-features --locked -- --ignored --nocapture
 python3 scripts/check_external_release_evidence.py \
   --head "$(git rev-parse HEAD)" --tree "$(git rev-parse HEAD^{tree})" \
-  --evidence-dir target/release-evidence/providers \
+  --evidence-dir target/release-evidence/provisional/providers \
   --require-direct-verified-action --require-fred-alfred-rights
 ```
 
@@ -2233,12 +2108,14 @@ Expected: tests and checker pass only on real authorized network delivery at the
 the checker rejects local servers, fixtures, synthetic transports, missing predicates, mismatched
 head/tree/binary hashes, credentials in output, unsupported quality promotion and incomplete rights.
 
-- [ ] **Step 5: Build the offline Python/ONNX environment and run the complete candidate gate**
+- [ ] **Step 5: Finish every tracked file and commit the candidate before collecting evidence**
 
 First verify the hash-pinned local ONNX runtime, build the maturin extension and Python wheel using
-only the committed wheelhouse lock, install into a clean release venv without index access, and use
-that interpreter for all Python tests/demo. The extension may call analytical Rust kernels only; the
-dependency checker proves neither Python nor the extension enters live/execution runtime edges.
+only the committed wheelhouse lock, and run the deterministic local gate. The extension may call
+analytical Rust kernels only; the dependency checker proves neither Python nor the extension enters
+live/execution runtime edges. Complete the README, changelog, security guidance, review procedure,
+and all tracked human-readable summaries now. A tracked file may summarize provisional evidence and
+methodology, but it must never claim to contain evidence for the commit that contains itself.
 
 ```bash
 python3 scripts/verify_onnx_runtime.py \
@@ -2248,138 +2125,139 @@ python3 scripts/build_python_release.py \
   --wheelhouse .agents/cache/python-wheelhouse \
   --lock python/wheelhouse-lock.json \
   --venv target/usable-release-venv --offline \
-  --report target/release-evidence/python-build.json
-cargo fmt --all --check
-cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-cargo test --workspace --all-features --locked
-cargo test --doc --workspace --all-features --locked
-cargo build --workspace --all-features --release --locked
-python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
+  --report target/release-evidence/provisional/python-build.json
 target/usable-release-venv/bin/python -m pytest python/tests -q
 MARKET_SQUAWK_PYTHON=target/usable-release-venv/bin/python \
   python3 scripts/demo_usable_release.py --offline-fixtures \
-  --provider-evidence target/release-evidence/providers
-python3 scripts/check_release_performance.py \
-  --live target/release-evidence/live-bench.json \
-  --data target/release-evidence/data-bench.json \
-  --memory target/release-evidence/sustained-memory.json \
-  --min-events-per-second 100000 --max-warmed-p99-ns 999999 \
-  --check-existing docs/verification/usable-release-performance.md
-python3 scripts/check_external_release_evidence.py \
-  --head "$(git rev-parse HEAD)" --tree "$(git rev-parse HEAD^{tree})" \
-  --evidence-dir target/release-evidence/providers \
-  --require-direct-verified-action --require-fred-alfred-rights
-cargo deny check
-cargo audit
-gitleaks dir --redact --no-banner .
-gitleaks git --redact --no-banner
-python3 scripts/check_generated_artifacts.py
-python3 scripts/check_workspace_boundaries.py
-python3 scripts/check_no_telemetry.py Cargo.toml Cargo.lock apps crates adapters python
-python3 scripts/check_release_truth.py README.md \
-  docs/verification/release-capability-state.json
+  --provider-evidence target/release-evidence/provisional/providers \
+  --report target/release-evidence/provisional/demo.json
+./scripts/verify.sh
 git diff --check
-python3 scripts/stage_usable_release_task.py 20
 git commit -m "release: prove usable complete local platform"
 ```
 
-Expected: every command exits 0. Update the capability ledger/README so every required capability is
-`Runnable` with exact evidence; `Required but missing` contains exactly `None.` The checker rejects a
-complete claim before this transition. Record the exact commit/tree, outputs, tool versions and
-artifact digests. The first tracked commit is only **Freeze A candidate preparation**; it is not an
-approved release. After that commit, recapture provider evidence at the new exact head/tree and run
-the complete orchestrated gate, which contains the exact local commands above plus the Step 3 fuzz/
-performance commands:
+Before the commit, stage only the literal paths in the reviewed ownership map and inspect the staged
+diff. Do not use globs, generated path lists, custom staging wrappers, or angle-bracket pseudo-paths.
+The exact literal staging command is recorded in the checkpoint handoff. The commit is only a clean
+candidate; provisional results do not approve it.
+
+- [ ] **Step 6: Collect the complete evidence set at the clean unchanged candidate**
+
+Set one HEAD-keyed ignored artifact directory after the commit. Every producer and checker accepts
+the exact HEAD/tree and records the relevant binary, model, fixture, toolchain, input, and output
+hashes. `check_release_evidence.py` validates the closed artifact schema, rejects missing/extra or
+cross-HEAD artifacts and credentials, verifies all internal hashes, and writes the final manifest in
+that same ignored directory. It validates artifacts, not command text or plan prose.
+
+Run this complete block on the documented target hardware. An abbreviated `verify.sh` invocation is
+not a substitute for any command in the block:
 
 ```bash
+set -euo pipefail
+test -z "$(git status --porcelain)"
+HEAD_SHA="$(git rev-parse HEAD)"
+TREE_SHA="$(git rev-parse HEAD^{tree})"
+EVIDENCE_DIR="target/release-evidence/$HEAD_SHA"
+mkdir -p "$EVIDENCE_DIR/providers"
+
+python3 scripts/run_release_fuzz.py \
+  --head "$HEAD_SHA" --tree "$TREE_SHA" \
+  --toolchain nightly-2026-07-15 --seconds-per-target 120 \
+  --rss-limit-mib 2048 --report "$EVIDENCE_DIR/fuzz.json"
+cargo bench -p market-squawk --bench event_to_decision_latency \
+  --all-features --locked -- --warm-up-events 1000000 --events 10000000 \
+  --head "$HEAD_SHA" --tree "$TREE_SHA" \
+  --output "$EVIDENCE_DIR/live-bench.json"
+cargo bench -p market-squawk-data --bench storage \
+  --all-features --locked -- --rows 10000000 \
+  --head "$HEAD_SHA" --tree "$TREE_SHA" \
+  --output "$EVIDENCE_DIR/data-bench.json"
+cargo build -p market-squawk --bin market-squawk-benchmark \
+  --release --all-features --locked
+python3 scripts/run_sustained_benchmark.py \
+  --head "$HEAD_SHA" --tree "$TREE_SHA" \
+  --binary target/release/market-squawk-benchmark --warm-up-events 1000000 \
+  --events 60000000 --max-tail-growth-mib 32 --max-tail-growth-percent 1 \
+  --report "$EVIDENCE_DIR/sustained-memory.json"
+python3 scripts/check_release_performance.py \
+  --head "$HEAD_SHA" --tree "$TREE_SHA" \
+  --live "$EVIDENCE_DIR/live-bench.json" \
+  --data "$EVIDENCE_DIR/data-bench.json" \
+  --memory "$EVIDENCE_DIR/sustained-memory.json" \
+  --min-events-per-second 100000 --max-warmed-p99-ns 999999 \
+  --report "$EVIDENCE_DIR/performance.json"
+
 test "$MARKET_SQUAWK_EXTERNAL_NETWORK" = "1"
 test "$MARKET_SQUAWK_PROVIDER_TERMS_ACCEPTED" = "1"
+export MARKET_SQUAWK_RELEASE_EVIDENCE_DIR="$EVIDENCE_DIR/providers"
 cargo test -p market-squawk --test external_coinbase_vertical \
   --all-features --locked -- --ignored --nocapture
 cargo test -p market-squawk --test external_kraken_vertical \
   --all-features --locked -- --ignored --nocapture
 cargo test -p market-squawk --test external_fred_alfred_vertical \
   --all-features --locked -- --ignored --nocapture
-python3 scripts/run_usable_release_gate.py \
-  --head "$(git rev-parse HEAD)" --tree "$(git rev-parse HEAD^{tree})" \
-  --python target/usable-release-venv/bin/python \
-  --onnx-runtime "$MARKET_SQUAWK_ONNX_RUNTIME" \
-  --evidence-dir target/release-evidence --regenerate-heavy-evidence
+python3 scripts/check_external_release_evidence.py \
+  --head "$HEAD_SHA" --tree "$TREE_SHA" \
+  --evidence-dir "$EVIDENCE_DIR/providers" \
+  --require-direct-verified-action --require-fred-alfred-rights \
+  --report "$EVIDENCE_DIR/provider-validation.json"
+
+python3 scripts/verify_onnx_runtime.py \
+  --head "$HEAD_SHA" --tree "$TREE_SHA" \
+  --policy docs/verification/onnx-runtime-policy.json \
+  --library "$MARKET_SQUAWK_ONNX_RUNTIME" \
+  --report "$EVIDENCE_DIR/onnx-runtime.json"
+python3 scripts/build_python_release.py \
+  --head "$HEAD_SHA" --tree "$TREE_SHA" \
+  --wheelhouse .agents/cache/python-wheelhouse \
+  --lock python/wheelhouse-lock.json \
+  --venv target/usable-release-venv --offline \
+  --report "$EVIDENCE_DIR/python-build.json"
+target/usable-release-venv/bin/python -m pytest python/tests -q \
+  --junitxml "$EVIDENCE_DIR/python-tests.xml"
+MARKET_SQUAWK_PYTHON=target/usable-release-venv/bin/python \
+  python3 scripts/demo_usable_release.py --offline-fixtures \
+  --head "$HEAD_SHA" --tree "$TREE_SHA" \
+  --provider-evidence "$EVIDENCE_DIR/providers" \
+  --report "$EVIDENCE_DIR/demo.json"
+./scripts/verify.sh 2>&1 | tee "$EVIDENCE_DIR/full-gate.log"
+python3 scripts/check_release_evidence.py \
+  --head "$HEAD_SHA" --tree "$TREE_SHA" \
+  --evidence-dir "$EVIDENCE_DIR" \
+  --binary target/release/market-squawk \
+  --benchmark-binary target/release/market-squawk-benchmark \
+  --report "$EVIDENCE_DIR/manifest.json"
 git diff --exit-code
+test -z "$(git status --porcelain)"
 git status --short --branch
 ```
 
-`run_usable_release_gate.py` is table-driven and tested: it rejects omitted/reordered commands,
-nonzero exits, a dirty tracked tree, wrong head/tree/binary digest, stale evidence, network access in
-default tests, or missing fuzz/performance/audit/provider/Python/ONNX results. Freeze A exists only
-when the commands pass at a clean unchanged head.
+Expected: every command exits 0; Git remains clean because every generated artifact is ignored; and
+the manifest binds the complete artifact set to the unchanged candidate. The retained validators
+check real artifacts and measurements. No wrapper tests command ordering or plan text.
 
-- [ ] **Step 6: Review Freeze A, persist the finding union, and create Freeze B**
+- [ ] **Step 7: Run grouped review and repeat the full evidence block after any remediation**
 
 Dispatch non-mutating reviewers in maximum parallel batches for: live/source/qualification/risk/
 paper; catalog/storage/PIT/provider rights; analytics/Python/modeling/backtest/portfolio/fair value;
 MCP/CLI/security/operations/supply chain; and performance/evidence/release truth. Freeze the candidate
-between batches. Reviewers write signed/hashed ignored artifacts under
-`target/release-evidence/reviews/freeze-a/<domain>.json`; they never edit the candidate. Union and
-deduplicate every finding, remediate every substantiated Critical/Important/Minor in disjoint lanes,
-and generate the durable review/remediation report. Commit that report together with all remediation
-and any resulting ledger/README truth changes; that tracked commit is **Freeze B**, so no approval
-claim is inherited from Freeze A.
+between batches. Reviewers return findings without editing the candidate. The integrator unions and
+deduplicates every finding into one concise `usable-release-review.md`, remediates every substantiated
+Critical/Important/Minor in disjoint lanes, and commits the report with the remediation and any
+truthful README changes. Do not create per-task report files or a report-generation script.
 
-```bash
-python3 scripts/build_release_review_report.py \
-  --candidate "$(git rev-parse HEAD)" \
-  --review-dir target/release-evidence/reviews/freeze-a \
-  --output docs/reports/usable-release-review.md --require-all-domains
-python3 scripts/stage_usable_release_task.py 20
-git commit -m "docs(release): persist review and remediation evidence"
-```
+Before each remediation commit, the integration owner copies the exact approved paths from
+`usable-release-path-ownership.json` and stages those literal paths only, then records that literal
+command in the checkpoint handoff. A placeholder, glob, generated path list, or custom staging
+wrapper is forbidden. Any remediation commit creates a new candidate and invalidates all prior
+artifacts, even when the changed file is documentation.
 
-At the new Freeze B head, recapture all authorized external evidence because HEAD/tree changed, then
-rerun the complete gate. Evidence from Freeze A is invalid for Freeze B even when the delta was docs-
-only; no source-set-digest exception is used.
-
-```bash
-cargo test -p market-squawk --test external_coinbase_vertical \
-  --all-features --locked -- --ignored --nocapture
-cargo test -p market-squawk --test external_kraken_vertical \
-  --all-features --locked -- --ignored --nocapture
-cargo test -p market-squawk --test external_fred_alfred_vertical \
-  --all-features --locked -- --ignored --nocapture
-python3 scripts/run_usable_release_gate.py \
-  --head "$(git rev-parse HEAD)" --tree "$(git rev-parse HEAD^{tree})" \
-  --python target/usable-release-venv/bin/python \
-  --onnx-runtime "$MARKET_SQUAWK_ONNX_RUNTIME" \
-  --evidence-dir target/release-evidence --regenerate-heavy-evidence
-git diff --exit-code
-```
-
-- [ ] **Step 7: Obtain final read-only approval of unchanged Freeze B**
-
-Dispatch the same grouped domains against Freeze B. They write only ignored signed artifacts under
-`target/release-evidence/reviews/freeze-b/<domain>.json`. Verify domain coverage, reviewer identities,
-candidate head/tree, input/output hashes and zero substantiated findings without rewriting the tracked
-report:
-
-```bash
-python3 scripts/build_release_review_report.py \
-  --candidate "$(git rev-parse HEAD)" \
-  --review-dir target/release-evidence/reviews/freeze-b \
-  --check-only --require-all-domains --require-zero-findings
-python3 scripts/run_usable_release_gate.py \
-  --head "$(git rev-parse HEAD)" --tree "$(git rev-parse HEAD^{tree})" \
-  --python target/usable-release-venv/bin/python \
-  --onnx-runtime "$MARKET_SQUAWK_ONNX_RUNTIME" \
-  --evidence-dir target/release-evidence --check-existing
-git diff --exit-code
-git status --short --branch
-```
-
-If any Freeze B finding exists, return to Step 6, persist the updated finding/remediation union in a
-new commit, recapture provider evidence, rerun the full gate, and obtain another read-only review of
-the replacement head. Never mutate `docs/reports/usable-release-review.md` after the SHA claimed as
-approved. Persist final ignored review hashes and the unchanged SHA in the PR comment/release
-attestation during publication.
+For every replacement candidate, rerun the entire Step 6 command block into its new HEAD-keyed
+directory, then dispatch the same grouped review domains against that unchanged head and manifest.
+Continue this remediation/evidence/re-review loop until the reviewers report zero substantiated
+findings of every severity. Final reviewer approvals and artifact digests are published in the PR and
+release attestation without changing the approved commit. A final approval is never appended to a
+tracked report after the freeze.
 
 - [ ] **Step 8: Evaluate the terminal predicate**
 
@@ -2408,6 +2286,7 @@ stop.
 Push only the unchanged reviewed SHA to `origin`, update the active pull request with local evidence,
 truthful hosted status and external-smoke status, create the approved release tag, and verify remote
 identity. Remove clean inactive worktrees and prune metadata; preserve/escalate any dirty state. Hand
-off the exact SHA, ledger, demo, performance, audits, review, provider rights, remaining optional work
-and cleanup inventory. Do not begin paid adapters, live-money execution, extended replay or future
-observability without a new user instruction.
+off the exact SHA, README capability state, immutable implementation evidence, demo, performance,
+audits, consolidated review, provider rights, remaining optional work, and cleanup inventory. Do not
+begin paid adapters, live-money execution, extended replay, or future observability without a new
+user instruction.

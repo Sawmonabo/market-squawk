@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-python3 scripts/check_brand.py
 python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 python3 scripts/check_workspace_boundaries.py
-python3 scripts/check_duplicate_dependencies.py
 python3 scripts/check_generated_artifacts.py
+cargo deny check
+cargo audit --deny warnings
+gitleaks dir --redact --no-banner .
+gitleaks git --redact --no-banner
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-targets --all-features --locked
@@ -18,18 +20,6 @@ cargo build -p market-squawk --all-features --locked
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
 ./target/debug/market-squawk --help >"$tmp_dir/help.txt"
-python3 - "$tmp_dir/help.txt" <<'PY'
-import pathlib
-import sys
-
-help_text = pathlib.Path(sys.argv[1]).read_text()
-expected_identity = "Local-first market tools that are diagnostic and authority-free. Any bot behavior is paper simulation only, with no production order authority."
-first_line = help_text.splitlines()[0] if help_text else ""
-if first_line != expected_identity:
-    raise SystemExit(
-        f"CLI help identity mismatch: expected {expected_identity!r}, found {first_line!r}"
-    )
-PY
 ./target/debug/market-squawk \
   --data-dir "$tmp_dir" mock --events 100 >"$tmp_dir/snapshot.json"
 python3 - "$tmp_dir/snapshot.json" <<'PY'

@@ -1,5 +1,11 @@
 # Market Squawk Complete Remaining Work Plan
 
+> **Status: Superseded. No current execution authority.** This dated plan is retained only as a
+> historical audit artifact. Its Q5–Q7 labels, quarter-checkpoint model, optional-Python wording,
+> paths, baselines, and terminal condition are not executable. All current work is controlled by the
+> [usable complete-release implementation plan](2026-07-17-market-squawk-usable-complete-release.md),
+> which uses Stage, Wave, and Release Gate terminology and requires the Python product.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use
 > `superpowers:subagent-driven-development` to implement this plan task-by-task. Steps use checkbox
 > (`- [ ]`) syntax for tracking. A worktree represents a complete conflict-isolated lane, never one

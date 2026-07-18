@@ -4,10 +4,9 @@ Read and follow [`docs/project-memory.md`](docs/project-memory.md) before planni
 It defines the repository's binding parallel-ownership, review-checkpoint, exact-head verification,
 and progress-reporting rules.
 
-Current controlling artifacts are the
-[Q2 integrated remediation plan](docs/superpowers/plans/2026-07-16-q2-integrated-checkpoint-remediation.md)
-and the provisional, approved-base-gated
-[Q3 production plan](docs/superpowers/plans/2026-07-16-market-squawk-q3-production-plan.md).
+The current controlling delivery artifact is the
+[usable complete-release implementation plan](docs/superpowers/plans/2026-07-17-market-squawk-usable-complete-release.md).
+Older Q-prefixed plans remain historical audit records and have no current execution authority.
 
 1. Use the pinned Rust 1.97.1 toolchain, including the repository's `rustfmt` and Clippy components.
 2. Add or update a failing test before implementation changes.

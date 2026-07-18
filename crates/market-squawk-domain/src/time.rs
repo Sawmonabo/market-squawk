@@ -103,7 +103,7 @@ impl std::error::Error for TimeError {}
 ///
 /// This stable scalar contract contains no wall-clock access or I/O. Its inclusive representation
 /// boundaries are `i64::MIN` through `i64::MAX` Unix nanoseconds; adapters must perform checked
-/// conversion before constructing it. Task 4 builds ordering-rich provenance on this same type.
+/// conversion before constructing it. Qualification builds ordering-rich provenance on this type.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct Timestamp(i64);

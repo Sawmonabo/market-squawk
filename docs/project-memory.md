@@ -107,13 +107,14 @@ verification/review cycle, the integration owner must perform a scheduling audit
 Do not describe hours of checkpoint remediation, audit, and plan work merely as being "on Task 7"
 or another historical task label.
 
-## Review policy
+## Four-quarter review policy
 
-Fresh independent specialist reviews are grouped at quarter checkpoints, not repeated after every
-ordinary task. Lane workers still perform TDD, self-review, focused verification, and blast-radius
-inspection before handoff.
+Fresh independent specialist reviews are grouped at four delivery-quarter checkpoints, not repeated
+after every ordinary task. Lane workers still perform TDD, self-review, focused verification, and
+blast-radius inspection before handoff. The canonical plan maps every Stage and Wave into exactly one
+of those four checkpoints; it must never invent Q5 or a higher-numbered quarter.
 
-At a quarter checkpoint:
+At each quarter checkpoint:
 
 1. integrate the candidate and make the worktree clean;
 2. freeze one exact commit;
@@ -128,9 +129,31 @@ At a quarter checkpoint:
 A re-review required to close findings from a rejected checkpoint is part of that checkpoint's
 remediation. It is not an avoidable per-task review round.
 
-Every substantiated Critical, Important, and Minor finding blocks checkpoint approval until it is
+Every substantiated Critical, Important, and Minor finding blocks quarter-checkpoint approval until it is
 fixed or retracted with specific contrary evidence. Severity determines order, not whether a known
 defect may remain.
+
+Historical Q-prefixed checkpoint and finding identifiers remain immutable audit locators. They do
+not authorize additional active quarters. Current delivery uses the explicit labels `Quarter 1 of
+4` through `Quarter 4 of 4` so historical and active identifiers cannot be confused.
+
+## Verification must exercise behavior
+
+Do not add tests or scripts that make README sentences, plan headings, task labels, report wording,
+template prose, or verification-wrapper command strings into executable product contracts. Do not
+maintain a parallel capability ledger whose only purpose is to mirror the README. User-facing safety
+language remains important, but stable authority, quality, coverage, bounds, and execution limits
+must be represented in typed or structured contracts and tested through behavior.
+
+Run security tools directly. Cargo Deny, RustSec advisory scanning, and Gitleaks results are stronger
+evidence than unit tests that merely snapshot their configuration files. Custom automation is
+appropriate when it exercises a real protocol, invariant, resource bound, artifact, or end-to-end
+vertical; it is not appropriate merely to enforce prose, command ordering, or report choreography.
+
+Keep grouped quarter-checkpoint evidence concise. Do not create a tracked report per subtask or
+reviewer. One consolidated checkpoint review record per frozen candidate is sufficient; exact
+command outputs and bulky transient artifacts remain ignored and are summarized by commit and
+digest.
 
 ## Candidate, commit, and evidence discipline
 
@@ -212,27 +235,36 @@ The correction is permanent:
 This correction does not weaken production gates. It removes avoidable coordination latency while
 preserving the authority, memory, persistence, lifecycle, and review invariants those gates protect.
 
-## Halfway terminal condition
+## Superseded halfway instruction
 
-As directed on 2026-07-17, the active delivery run stops at a defensible production-weighted
-halfway checkpoint rather than continuing automatically through the complete release.
+On 2026-07-17 an earlier instruction defined a production-weighted halfway stop. The user then issued
+explicit `resume`, `continue`, and `continue to completion` instructions and rejected a delivery
+contract that could stop before Python/modeling, complete MCP, and other mandatory planes existed.
+The old halfway criteria are retained in repository history only; they have no authority to pause or
+terminate active delivery. Progress weighting is status information, not a stopping gate.
 
-Raw checklist counts cannot establish this checkpoint because the remaining storage, provider,
-analytics, modeling, portfolio, execution, valuation, MCP, performance, and release capabilities
-have materially different implementation weight. The halfway checkpoint requires all of the
-following:
+## Usable complete-release terminal condition
 
-1. Q2 authority/capture remediation is integrated and approved at one clean exact commit.
-2. Q3 production live decisions, enforced risk, Coinbase, and realistic paper execution are
-   integrated and approved.
-3. Both Q4 branches—Kraken/live-source closure and the local research/storage/provider plane—are
-   materially integrated and runnable rather than represented by contracts or scaffolding.
-4. The refreshed requirement ledger demonstrates at least 50% of mandatory production-capability
-   weight as implemented, with its weighting method and evidence recorded.
-5. No unresolved Critical or Important review finding remains at the frozen halfway candidate.
-6. The repository is clean, pushed to `origin`, commented on the active pull request, and the
-   applicable local and hosted verification evidence is recorded truthfully.
+Active delivery continues through a usable complete local release. It does not stop at 50 percent,
+at the end of a numbered Stage, or when only contracts, schemas, mocks, synthetic sources,
+diagnostic paths, plans, or focused lane tests exist.
 
-At that point, stop implementation and hand off the exact commit, ledger, verification, review,
-remaining-work map, active/removed worktrees, and explicit next dependency. Do not silently resume
-beyond halfway without a new user instruction.
+The terminal condition requires all of the following at one clean, unchanged exact head:
+
+1. Every mandatory live, research, adapter, storage, point-in-time, analytics, Python/modeling,
+   backtesting, portfolio, execution/risk, valuation, CLI, and MCP capability is a working bounded
+   producer-to-consumer vertical slice.
+2. The integrated local demonstration exercises the required CLI and complete typed MCP surfaces
+   without a mandatory paid API, cloud service, external database, container runtime, telemetry
+   service, or provider-access evasion.
+3. Deterministic tests, separately gated authorized network smokes, parser/model/MCP fuzz targets,
+   measured performance, and security, dependency, vulnerability, license, credential, and
+   generated-artifact checks provide fresh exact-head evidence.
+4. The Quarter 4 of 4 grouped independent review approves the same frozen commit with no unresolved
+   substantiated Critical, Important, or Minor finding.
+5. The exact commit is clean, pushed to `origin`, reported on the active pull request with truthful
+   local and hosted evidence, and every completed lane worktree is safely removed after handoff.
+
+Only then may implementation stop for complete-release handoff. A user-approved scope change may
+alter the product contract, but progress percentage or elapsed time cannot waive a mandatory
+capability or release gate.

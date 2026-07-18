@@ -1,8 +1,8 @@
-//! Complete Task 4 assessment, provenance, and event construction.
+//! Complete live assessment, provenance, and event construction.
 
 #![allow(
     dead_code,
-    reason = "Task 8 actor wiring reaches this crate-private builder through InstrumentLiveProcessor"
+    reason = "actor wiring reaches this crate-private builder through InstrumentLiveProcessor"
 )]
 
 use market_squawk_domain::{

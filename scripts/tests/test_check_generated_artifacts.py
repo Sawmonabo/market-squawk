@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 
@@ -20,7 +21,7 @@ class GeneratedArtifactCheckTests(unittest.TestCase):
         self.assertTrue(check_artifacts.path_violations("src/__pycache__/module.pyc"))
         self.assertTrue(check_artifacts.path_violations("coverage/report.profraw"))
 
-    def test_secret_material_and_os_metadata_are_rejected(self) -> None:
+    def test_credential_shaped_files_and_os_metadata_are_rejected(self) -> None:
         self.assertTrue(check_artifacts.path_violations(".env"))
         self.assertTrue(check_artifacts.path_violations("config/.env.production"))
         self.assertTrue(check_artifacts.path_violations("credentials/client.pem"))
@@ -65,6 +66,23 @@ class GeneratedArtifactCheckTests(unittest.TestCase):
 
             self.assertEqual(check_artifacts.inspect_file(root, "source.rs"), [])
             self.assertTrue(check_artifacts.inspect_file(root, "link.rs"))
+
+    def test_repository_inputs_exclude_tracked_deletions(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            retained = root / "retained.txt"
+            deleted = root / "deleted.txt"
+            retained.write_text("retained\n")
+            deleted.write_text("deleted\n")
+            subprocess.run(
+                ["git", "add", "--", retained.name, deleted.name],
+                cwd=root,
+                check=True,
+            )
+            deleted.unlink()
+
+            self.assertEqual(check_artifacts.repository_inputs(root), [retained.name])
 
 
 if __name__ == "__main__":

@@ -51,16 +51,15 @@ miscompilation:
 ./scripts/verify.sh
 ```
 
-That entry point checks the brand allowlist, Python policy-helper tests, workspace inheritance,
-reviewed duplicate-dependency inventory, workspace formatting, strict all-target/all-feature
-Clippy, the locked all-target/all-feature workspace suite, an explicit locked all-feature workspace
-doctest pass, a release build, rustdoc with warnings denied, CLI help, the deterministic 101-event
-offline mock, and a timeout-bounded local stdio MCP interaction. A policy-helper regression test
-pins the exact `cargo test --doc --workspace --all-features --locked` command so document examples
-cannot silently fall out of the gate. `cargo doc` remains a separate warning-denied documentation
-build; it is not treated as a substitute for running doctests.
+That entry point runs focused behavioral support tests, workspace inheritance and repository-input
+hygiene checks, workspace formatting, strict all-target/all-feature Clippy, the locked all-target/
+all-feature workspace suite, locked all-feature doctests, a release build, rustdoc with warnings
+denied, CLI help, the deterministic 101-event offline mock, and a timeout-bounded local stdio MCP
+interaction. Cargo Deny, Cargo Audit, and Gitleaks run directly in the same local and CI entry point
+rather than through configuration-shape unit tests. `cargo doc` remains a separate warning-denied
+documentation build; it is not treated as a substitute for running doctests.
 
 The historical 24-test count above applies only to the pre-workspace artifact. Current harness and
 doctest counts are read from the fresh release-gate transcript and will be recorded in the
-commit-specific Stage 1 verification record after the Quarter 1 correction review. This living
+commit-specific verification record after the current correction review. This living
 overview intentionally does not copy a count across commits whose test corpus changed.

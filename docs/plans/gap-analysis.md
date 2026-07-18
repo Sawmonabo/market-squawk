@@ -1,5 +1,12 @@
 # Market Squawk Gap Analysis
 
+> **Status: Historical audit. No current execution authority.** The detailed classifications below
+> are frozen to the rejected `651a01e120dfe27a598b9475296733d238d870b7` anchor. They remain useful
+> audit evidence but are not an exact-head inventory, delivery plan, approval record, or stopping
+> condition. Current capability state lives in the [README](../../README.md) and
+> [release baseline](../verification/usable-release-baseline.md), and the active plan is the
+> [usable complete-release implementation plan](../superpowers/plans/2026-07-17-market-squawk-usable-complete-release.md).
+
 <!-- q2-checkpoint-state
 candidate-id: q2-integrated-remediation-2026-07-16
 audit-anchor: 651a01e120dfe27a598b9475296733d238d870b7

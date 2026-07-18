@@ -1,4 +1,4 @@
-//! Explicitly bounded direct-final diagnostic construction for Task 8 publication.
+//! Explicitly bounded direct-final diagnostic construction for snapshot publication.
 
 use market_squawk_domain::InstrumentId;
 use market_squawk_sources::CurrentStreamKey;

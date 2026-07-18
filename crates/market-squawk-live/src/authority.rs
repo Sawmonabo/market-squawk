@@ -2,7 +2,7 @@
 
 #![allow(
     dead_code,
-    reason = "Task 8 actor wiring is the sole production consumer of crate-private authority gates"
+    reason = "actor wiring is the sole production consumer of crate-private authority gates"
 )]
 
 use std::cell::Cell;
@@ -23,7 +23,7 @@ mod nonce;
 use lease::LeaseError;
 #[allow(
     unused_imports,
-    reason = "Task 8 constructs the typed shard/runtime owners in its actor supervisor"
+    reason = "the actor supervisor constructs the typed shard/runtime owners"
 )]
 pub(crate) use lease::{
     GenerationLease, GenerationLeaseOwner, RegistryLifecycleLease, RegistryLifecycleOwner,
@@ -496,7 +496,7 @@ pub enum AuthorityError {
     /// Stateful assessment quality was not directly verified.
     #[error("current observation is not direct verified")]
     QualityNotDirectVerified,
-    /// Task 5 source/current-health/capture authority is no longer current.
+    /// Source/current-health/capture authority is no longer current.
     #[error("source authority is revoked or expired")]
     SourceRevoked,
     /// A one-way generation, shard, runtime, or revision allocation was revoked.

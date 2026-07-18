@@ -38,7 +38,7 @@ struct GenerationEntry {
     owner: GenerationLeaseOwner,
 }
 
-/// Exact O(1) producer binding minted only from an opaque Task 5 current lease.
+/// Exact O(1) producer binding minted only from an opaque current-source lease.
 #[derive(Clone, Debug)]
 pub(crate) struct GenerationAdmission {
     source: CurrentSourceAuthorityLease,
@@ -112,7 +112,7 @@ impl GenerationAuthorityRegistry {
         })
     }
 
-    /// Binds the current Task 5 lease, reusing one generation allocation across health epochs.
+    /// Binds the current-source lease, reusing one generation allocation across health epochs.
     pub(crate) fn bind_current(
         &mut self,
         source: &CurrentSourceAuthorityLease,

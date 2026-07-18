@@ -141,7 +141,7 @@ pub struct LiveRuntimeIngress {
 }
 
 impl LiveRuntimeIngress {
-    /// Binds one exact current Task 5 source generation before its producer starts feeding data.
+    /// Binds one exact current source generation before its producer starts feeding data.
     pub async fn bind_generation(
         &self,
         route: ShardKey,

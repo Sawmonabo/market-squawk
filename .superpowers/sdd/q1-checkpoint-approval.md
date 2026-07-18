@@ -1,5 +1,9 @@
 # Quarter 1 Checkpoint Approval
 
+> **Historical evidence only.** This records the decision made at the exact commit below; it is not
+> a current release gate. Rust 1.97.0 is now ineligible, and the referenced prose-policy tests were
+> removed on 2026-07-17 in favor of behavioral and direct security-tool verification.
+
 Date: 2026-07-16
 
 Approved commit: `08d2ab24df91bc9fab8bee27763c164847bb1082`

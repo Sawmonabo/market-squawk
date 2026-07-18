@@ -1,5 +1,11 @@
 # Market Squawk Q3 Production Implementation Plan
 
+> **Status: Superseded. No current execution authority.** The historical Q3 identifier and findings
+> remain traceability locators, but this plan's audit base, paths, signatures, and quarter-checkpoint
+> language cannot be executed. Task 2 of the
+> [usable complete-release implementation plan](2026-07-17-market-squawk-usable-complete-release.md)
+> owns the refreshed Stage/Wave implementation after the active release gate closes.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development
 > (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use
 > checkbox (`- [ ]`) syntax for tracking.

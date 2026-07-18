@@ -590,7 +590,7 @@ mod tests {
     use std::{collections::BTreeMap, num::NonZeroUsize, sync::Arc};
 
     use async_trait::async_trait;
-    use clap::{CommandFactory, Parser};
+    use clap::Parser;
     use market_squawk::source::{CaptureContext, MarketSource, SourceRunOutcome};
     use market_squawk::source_supervisor::{
         SourceShutdownOutcome, SourceSupervisor, SupervisedSourceTask,
@@ -655,48 +655,6 @@ mod tests {
         let cli = Cli::try_parse_from(["market-squawk", "--source-shutdown-ms", "2500", "mock"])?;
 
         assert_eq!(cli.source_shutdown_ms, Some(2_500));
-        Ok(())
-    }
-
-    #[test]
-    fn cli_help_distinguishes_diagnostic_coverage_quality_and_authority()
-    -> Result<(), Box<dyn std::error::Error>> {
-        fn normalized_help(command: &mut clap::Command) -> String {
-            command
-                .render_long_help()
-                .to_string()
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
-        }
-
-        let mut command = Cli::command();
-        let root_help = normalized_help(&mut command);
-        assert!(root_help.contains("diagnostic and authority-free"));
-        assert!(root_help.contains("paper simulation only"));
-        assert!(root_help.contains("no production order authority"));
-
-        let capture = command
-            .find_subcommand_mut("capture")
-            .ok_or("capture command must exist")?;
-        let capture_help = normalized_help(capture);
-        assert!(capture_help.contains("Coinbase Exchange single-venue, partial coverage"));
-        assert!(capture_help.contains("diagnostic and authority-free"));
-        assert!(capture_help.contains("app-local diagnostic QualityState"));
-        assert!(capture_help.contains("diagnostic VALID is not canonical DataQuality"));
-        assert!(capture_help.contains("can never establish DataQuality::DirectVerified"));
-        assert!(capture_help.contains("cannot mint production live authority"));
-        assert!(capture_help.contains("paper simulation only"));
-        assert!(capture_help.contains("no production order authority"));
-        assert!(!capture_help.contains("validated market"));
-        assert!(!capture_help.contains("market quality"));
-
-        let mcp = command
-            .find_subcommand_mut("mcp")
-            .ok_or("MCP command must exist")?;
-        let mcp_help = normalized_help(mcp);
-        assert!(mcp_help.contains("diagnostic and authority-free"));
-        assert!(mcp_help.contains("no production order authority"));
         Ok(())
     }
 

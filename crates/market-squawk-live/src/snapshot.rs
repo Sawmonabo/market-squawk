@@ -22,9 +22,9 @@ pub(crate) use store::{
 
 /// Hard bound aligned with one shard's preallocated route table.
 pub(crate) const MAX_SNAPSHOT_ROUTES: usize = 64;
-/// Hard bound aligned with Task 7 stream/status capacity per route.
+/// Hard bound aligned with stream/status capacity per route.
 pub(crate) const MAX_SNAPSHOT_STREAMS_PER_ROUTE: usize = 64;
-/// Hard bound aligned with Task 7 stream/status capacity per route.
+/// Hard bound aligned with stream/status capacity per route.
 pub(crate) const MAX_SNAPSHOT_STATUSES_PER_ROUTE: usize = 64;
 /// Hard bound aligned with the live book and decoder depth contract.
 pub(crate) const MAX_SNAPSHOT_LEVELS_PER_SIDE: u32 = 10_000;

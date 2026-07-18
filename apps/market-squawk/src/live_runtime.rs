@@ -1,12 +1,12 @@
-//! Safe application ownership boundary for the production Task 8 live runtime.
+//! Safe application ownership boundary for the production live runtime.
 //!
 //! Source supervisors start this composition before opening a feed, obtain a route-bound ingress
 //! through the live crate's current-source lease handshake, and shut sources down before consuming
 //! this owner. No app-local diagnostic event can be converted into production ingress.
 //!
-//! The exact compatibility deletion trigger is: Task 11 adapters emit receipt-validated
-//! `CurrentDecodedProviderBatch` values after pre-feed binding, and Task 13 application services
-//! consume bounded Task 8 snapshots. Once both are integrated, `diagnostic_engine` and the
+//! The exact compatibility deletion trigger is: production adapters emit receipt-validated
+//! `CurrentDecodedProviderBatch` values after pre-feed binding, and application services consume
+//! bounded production snapshots. Once both are integrated, `diagnostic_engine` and the
 //! app-local event/book/quality path are deleted rather than promoted.
 
 use market_squawk_live::{

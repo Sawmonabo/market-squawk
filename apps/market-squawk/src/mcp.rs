@@ -7,7 +7,9 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use market_squawk_domain::DataQuality;
 use parking_lot::Mutex;
+use serde::Serialize;
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -19,6 +21,104 @@ const PROTOCOL_VERSION: &str = "2025-11-25";
 const MAX_TOOL_CALLS_PER_SECOND: usize = 100;
 const MAX_MCP_LINE_BYTES: usize = 1024 * 1024;
 const MCP_READER_SCRATCH_BYTES: usize = 8 * 1024;
+const DIAGNOSTIC_CONTRACT_SCHEMA_VERSION: u16 = 1;
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum McpSurface {
+    DiagnosticCompatibility,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ExecutionAuthority {
+    None,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DiagnosticCoverage {
+    CoinbaseExchangeSingleVenuePartial,
+    LocalDiagnosticState,
+    ConfiguredLocalJournal,
+    CurrentLocalRun,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SimulationAccess {
+    None,
+    ReadOnly,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ControlAuthority {
+    None,
+    PaperSimulationStopOnly,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ResourceScope {
+    CoinbaseDiagnosticMarketState,
+    CurrentPaperSimulationRun,
+    ConfiguredLocalJournal,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DiagnosticServerContract {
+    schema_version: u16,
+    surface: McpSurface,
+    execution_authority: ExecutionAuthority,
+    maximum_data_quality: DataQuality,
+}
+
+impl DiagnosticServerContract {
+    const fn new() -> Self {
+        Self {
+            schema_version: DIAGNOSTIC_CONTRACT_SCHEMA_VERSION,
+            surface: McpSurface::DiagnosticCompatibility,
+            execution_authority: ExecutionAuthority::None,
+            maximum_data_quality: DataQuality::DirectUnverified,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DiagnosticToolContract {
+    schema_version: u16,
+    surface: McpSurface,
+    coverage: DiagnosticCoverage,
+    maximum_data_quality: Option<DataQuality>,
+    execution_authority: ExecutionAuthority,
+    simulation_access: SimulationAccess,
+    control_authority: ControlAuthority,
+    resource_scope: ResourceScope,
+}
+
+impl DiagnosticToolContract {
+    const fn new(
+        coverage: DiagnosticCoverage,
+        maximum_data_quality: Option<DataQuality>,
+        simulation_access: SimulationAccess,
+        control_authority: ControlAuthority,
+        resource_scope: ResourceScope,
+    ) -> Self {
+        Self {
+            schema_version: DIAGNOSTIC_CONTRACT_SCHEMA_VERSION,
+            surface: McpSurface::DiagnosticCompatibility,
+            coverage,
+            maximum_data_quality,
+            execution_authority: ExecutionAuthority::None,
+            simulation_access,
+            control_authority,
+            resource_scope,
+        }
+    }
+}
 
 #[derive(Debug, Eq, PartialEq)]
 enum McpFrame<'a> {
@@ -319,6 +419,9 @@ impl McpServer {
                     "name": "market-squawk",
                     "version": env!("CARGO_PKG_VERSION")
                 },
+                "_meta": {
+                    "org.market-squawk/server-contract": DiagnosticServerContract::new()
+                },
                 "instructions": "Local compatibility data is diagnostic and authority-free. Bot behavior is paper simulation only, with no production order authority; risk controls fail closed."
             })),
             "ping" => Ok(json!({})),
@@ -507,7 +610,14 @@ fn tool_definitions() -> Vec<Value> {
                 "additionalProperties": false
             },
             "annotations": { "readOnlyHint": true, "destructiveHint": false },
-            "execution": { "taskSupport": "forbidden" }
+            "execution": { "taskSupport": "forbidden" },
+            "_meta": diagnostic_tool_contract(
+                DiagnosticCoverage::CoinbaseExchangeSingleVenuePartial,
+                Some(DataQuality::DirectUnverified),
+                SimulationAccess::None,
+                ControlAuthority::None,
+                ResourceScope::CoinbaseDiagnosticMarketState,
+            )
         }),
         json!({
             "name": "Market.GetQuality",
@@ -515,7 +625,14 @@ fn tool_definitions() -> Vec<Value> {
             "description": "Get the app-local diagnostic `QualityState`, book and heartbeat timestamps, sequence information, and gap counters; diagnostic `VALID` is not canonical `DataQuality` and can never establish `DataQuality::DirectVerified`. This state cannot mint production live authority.",
             "inputSchema": { "type": "object", "additionalProperties": false },
             "annotations": { "readOnlyHint": true, "destructiveHint": false },
-            "execution": { "taskSupport": "forbidden" }
+            "execution": { "taskSupport": "forbidden" },
+            "_meta": diagnostic_tool_contract(
+                DiagnosticCoverage::CoinbaseExchangeSingleVenuePartial,
+                Some(DataQuality::DirectUnverified),
+                SimulationAccess::None,
+                ControlAuthority::None,
+                ResourceScope::CoinbaseDiagnosticMarketState,
+            )
         }),
         json!({
             "name": "Bot.GetStatus",
@@ -523,7 +640,14 @@ fn tool_definitions() -> Vec<Value> {
             "description": "Get diagnostic positions, fills, cash flow, and current risk state. This is paper simulation only, with no production order authority; this server never submits live orders.",
             "inputSchema": { "type": "object", "additionalProperties": false },
             "annotations": { "readOnlyHint": true, "destructiveHint": false },
-            "execution": { "taskSupport": "forbidden" }
+            "execution": { "taskSupport": "forbidden" },
+            "_meta": diagnostic_tool_contract(
+                DiagnosticCoverage::LocalDiagnosticState,
+                None,
+                SimulationAccess::ReadOnly,
+                ControlAuthority::None,
+                ResourceScope::CurrentPaperSimulationRun,
+            )
         }),
         json!({
             "name": "Journal.GetSummary",
@@ -531,7 +655,14 @@ fn tool_definitions() -> Vec<Value> {
             "description": "Validate and summarize the configured immutable local raw-data journal without accepting arbitrary filesystem paths.",
             "inputSchema": { "type": "object", "additionalProperties": false },
             "annotations": { "readOnlyHint": true, "destructiveHint": false },
-            "execution": { "taskSupport": "forbidden" }
+            "execution": { "taskSupport": "forbidden" },
+            "_meta": diagnostic_tool_contract(
+                DiagnosticCoverage::ConfiguredLocalJournal,
+                None,
+                SimulationAccess::None,
+                ControlAuthority::None,
+                ResourceScope::ConfiguredLocalJournal,
+            )
         }),
         json!({
             "name": "Risk.TriggerKillSwitch",
@@ -547,9 +678,34 @@ fn tool_definitions() -> Vec<Value> {
                 "additionalProperties": false
             },
             "annotations": { "readOnlyHint": false, "destructiveHint": true },
-            "execution": { "taskSupport": "forbidden" }
+            "execution": { "taskSupport": "forbidden" },
+            "_meta": diagnostic_tool_contract(
+                DiagnosticCoverage::CurrentLocalRun,
+                None,
+                SimulationAccess::None,
+                ControlAuthority::PaperSimulationStopOnly,
+                ResourceScope::CurrentPaperSimulationRun,
+            )
         }),
     ]
+}
+
+fn diagnostic_tool_contract(
+    coverage: DiagnosticCoverage,
+    maximum_data_quality: Option<DataQuality>,
+    simulation_access: SimulationAccess,
+    control_authority: ControlAuthority,
+    resource_scope: ResourceScope,
+) -> Value {
+    json!({
+        "org.market-squawk/tool-contract": DiagnosticToolContract::new(
+            coverage,
+            maximum_data_quality,
+            simulation_access,
+            control_authority,
+            resource_scope,
+        )
+    })
 }
 
 #[cfg(test)]
@@ -563,7 +719,7 @@ mod tests {
     use parking_lot::RwLock;
 
     #[test]
-    fn initialize_advertises_tools_without_live_execution() -> Result<(), &'static str> {
+    fn initialize_exposes_a_structured_authority_ceiling() -> Result<(), &'static str> {
         let server = McpServer::new(
             Arc::new(RwLock::new(DiagnosticEngine::new(5_000, false))),
             PathBuf::from("unused.msj"),
@@ -578,18 +734,21 @@ mod tests {
             .ok_or("request should produce a response")?;
         assert_eq!(response["result"]["serverInfo"]["name"], "market-squawk");
         assert_eq!(response["result"]["protocolVersion"], PROTOCOL_VERSION);
-        let instructions = response["result"]["instructions"]
-            .as_str()
-            .ok_or("initialize instructions must be text")?;
-        assert!(instructions.contains("diagnostic and authority-free"));
-        assert!(instructions.contains("paper simulation only"));
-        assert!(instructions.contains("no production order authority"));
+        assert_eq!(
+            response["result"]["_meta"]["org.market-squawk/server-contract"],
+            json!({
+                "schemaVersion": 1,
+                "surface": "diagnostic_compatibility",
+                "executionAuthority": "none",
+                "maximumDataQuality": "direct_unverified"
+            })
+        );
         Ok(())
     }
 
     #[test]
-    fn tool_contracts_distinguish_diagnostic_state_coverage_and_authority()
-    -> Result<(), &'static str> {
+    fn tool_contracts_structurally_bound_coverage_quality_and_authority() -> Result<(), &'static str>
+    {
         let definitions = tool_definitions();
         let definition = |name: &str| {
             definitions
@@ -597,34 +756,74 @@ mod tests {
                 .find(|definition| definition["name"] == name)
                 .ok_or("required tool definition is missing")
         };
-        let description = |name: &str| {
-            definition(name)?["description"]
-                .as_str()
-                .ok_or("tool description must be text")
+        let contract = |name: &str| {
+            definition(name)?["_meta"]["org.market-squawk/tool-contract"]
+                .as_object()
+                .ok_or("tool contract metadata must be an object")
         };
 
-        let snapshot = description("Market.GetSnapshot")?;
-        assert!(snapshot.contains("diagnostic and authority-free"));
-        assert!(snapshot.contains("Coinbase Exchange single-venue, partial coverage"));
-        assert!(snapshot.contains("cannot mint production live authority"));
+        let expected = [
+            (
+                "Market.GetSnapshot",
+                "coinbase_exchange_single_venue_partial",
+                Value::String("direct_unverified".to_owned()),
+                "none",
+                "none",
+                "coinbase_diagnostic_market_state",
+            ),
+            (
+                "Market.GetQuality",
+                "coinbase_exchange_single_venue_partial",
+                Value::String("direct_unverified".to_owned()),
+                "none",
+                "none",
+                "coinbase_diagnostic_market_state",
+            ),
+            (
+                "Bot.GetStatus",
+                "local_diagnostic_state",
+                Value::Null,
+                "read_only",
+                "none",
+                "current_paper_simulation_run",
+            ),
+            (
+                "Journal.GetSummary",
+                "configured_local_journal",
+                Value::Null,
+                "none",
+                "none",
+                "configured_local_journal",
+            ),
+            (
+                "Risk.TriggerKillSwitch",
+                "current_local_run",
+                Value::Null,
+                "none",
+                "paper_simulation_stop_only",
+                "current_paper_simulation_run",
+            ),
+        ];
 
-        let quality = description("Market.GetQuality")?;
-        assert!(quality.contains("app-local diagnostic `QualityState`"));
-        assert!(quality.contains("diagnostic `VALID` is not canonical `DataQuality`"));
-        assert!(quality.contains("can never establish `DataQuality::DirectVerified`"));
-        assert!(quality.contains("cannot mint production live authority"));
-
-        for name in ["Bot.GetStatus", "Risk.TriggerKillSwitch"] {
-            let paper = description(name)?;
-            assert!(paper.contains("paper simulation only"));
-            assert!(paper.contains("no production order authority"));
+        for (
+            name,
+            coverage,
+            maximum_data_quality,
+            simulation_access,
+            control_authority,
+            resource_scope,
+        ) in expected
+        {
+            let tool_contract = contract(name)?;
+            assert_eq!(tool_contract["schemaVersion"], 1);
+            assert_eq!(tool_contract["surface"], "diagnostic_compatibility");
+            assert_eq!(tool_contract["coverage"], coverage);
+            assert_eq!(tool_contract["maximumDataQuality"], maximum_data_quality);
+            assert_eq!(tool_contract["executionAuthority"], "none");
+            assert_eq!(tool_contract["simulationAccess"], simulation_access);
+            assert_eq!(tool_contract["controlAuthority"], control_authority);
+            assert_eq!(tool_contract["resourceScope"], resource_scope);
         }
-
-        let rendered = serde_json::to_string(&definitions)
-            .map_err(|_error| "tool definitions must serialize")?;
-        assert!(!rendered.contains("validated local market snapshot"));
-        assert!(!rendered.contains("Market Data Quality"));
-        assert!(!rendered.contains("feed-quality states"));
         Ok(())
     }
 

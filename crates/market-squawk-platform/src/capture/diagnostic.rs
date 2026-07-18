@@ -1,6 +1,6 @@
 //! Explicitly non-authoritative compatibility capture composition.
 //!
-//! Stage 1's pre-adapter application path uses this bundle only to retain MSJ1 diagnostics. Its
+//! The pre-adapter application path uses this bundle only to retain MSJ1 diagnostics. Its
 //! receipt is not accepted by the source registry and cannot establish current live authority.
 
 use std::num::NonZeroU64;
@@ -181,7 +181,7 @@ impl CaptureDegradation for DiagnosticCaptureDegradation {
     }
 }
 
-/// Whole diagnostic bundle; its types are disjoint from Task 5 registry authority.
+/// Whole diagnostic bundle; its types are disjoint from registry current-source authority.
 #[derive(Debug)]
 pub struct DiagnosticCaptureBundle {
     identity: CaptureAuthorityIdentity,

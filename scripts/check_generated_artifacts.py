@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reject generated, secret-bearing, or opaque files from repository inputs."""
+"""Reject generated, credential-file-shaped, or opaque repository inputs."""
 
 from __future__ import annotations
 
@@ -69,20 +69,26 @@ def repository_root() -> Path:
     return Path(result.stdout.strip())
 
 
-def repository_inputs(root: Path) -> list[str]:
-    """Return tracked plus unignored untracked inputs using Git's path authority."""
-
+def git_paths(root: Path, arguments: list[str]) -> set[str]:
     result = subprocess.run(
-        ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+        ["git", "ls-files", "-z", *arguments],
         cwd=root,
         check=True,
         stdout=subprocess.PIPE,
     )
-    return sorted(
+    return {
         path.decode("utf-8", errors="surrogateescape")
         for path in result.stdout.split(b"\0")
         if path
-    )
+    }
+
+
+def repository_inputs(root: Path) -> list[str]:
+    """Return active tracked plus unignored untracked inputs using Git's path authority."""
+
+    listed = git_paths(root, ["--cached", "--others", "--exclude-standard"])
+    deleted = git_paths(root, ["--deleted"])
+    return sorted(listed - deleted)
 
 
 def path_violations(path: str) -> list[str]:

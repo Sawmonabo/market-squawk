@@ -42,8 +42,8 @@ ignore = false
 registries = []
 
 [bans]
-# Exact reviewed duplicates are enforced separately by check_duplicate_dependencies.py, including
-# failure when an allowance becomes stale. Cargo-deny remains authoritative for crate/feature bans.
+# Duplicate versions are not security defects by themselves. Security, license, source, TLS,
+# telemetry, and wildcard policy remain fail-closed below.
 multiple-versions = "allow"
 wildcards = "deny"
 highlight = "all"

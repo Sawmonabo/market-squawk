@@ -1,7 +1,7 @@
 //! Legacy diagnostic state used by mock capture, replay, and compatibility MCP display.
 //!
 //! This module cannot accept `CurrentDecodedProviderBatch`, mint live authority, or enter the
-//! production Task 8 runtime. Its historical paper calculation is intentionally ineligible for
+//! production live runtime. Its historical paper calculation is intentionally ineligible for
 //! live execution. Its app-local [`QualityState`] is diagnostic state: even `QualityState::Valid`
 //! can never establish canonical `DataQuality::DirectVerified`.
 

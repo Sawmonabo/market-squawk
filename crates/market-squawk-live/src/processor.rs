@@ -2,7 +2,7 @@
 
 #![allow(
     dead_code,
-    reason = "Task 8 actor runtime is the sole production caller of this crate-private processor"
+    reason = "the actor runtime is the sole production caller of this crate-private processor"
 )]
 
 use std::collections::HashMap;
@@ -33,7 +33,7 @@ pub(crate) use error::LiveApplyError;
 pub(crate) use event::{delta_canonical_vector_peak_bytes, snapshot_canonical_vector_peak_bytes};
 #[allow(
     unused_imports,
-    reason = "Task 8 control-plane binding consumes the registry and exit handle"
+    reason = "control-plane binding consumes the registry and exit handle"
 )]
 pub(crate) use generation::{
     GenerationAdmission, GenerationAuthorityRegistry, GenerationRegistryExitHandle,
@@ -63,7 +63,7 @@ pub(crate) const fn persistent_stream_inline_bytes() -> usize {
         + std::mem::size_of::<(StatusKey, SharedStatus)>()
 }
 
-/// Exact Task 8-owned shard and runtime liveness bindings used by every capability.
+/// Exact shard-owned runtime liveness bindings used by every capability.
 ///
 /// Positive invalidation ownership remains with the actor/supervisor. The processor receives only
 /// validation/degradation leases and never constructs a private per-instrument incarnation.
@@ -125,7 +125,7 @@ enum SourceGenerationTransition {
 }
 
 impl InstrumentLiveProcessor<SystemTrustedClock> {
-    /// Constructs the production processor using Task 8-owned liveness and the sealed clock.
+    /// Constructs the production processor using runtime-owned liveness and the sealed clock.
     #[allow(
         clippy::too_many_arguments,
         reason = "all startup bounds and external liveness bindings are explicit"
@@ -374,7 +374,7 @@ impl<C: TrustedClock> InstrumentLiveProcessor<C> {
         self.authority.consume(capability, self.clock.now()?)
     }
 
-    /// Returns bounded immutable state for Task 8 publication, including quarantined streams.
+    /// Returns bounded immutable state for snapshot publication, including quarantined streams.
     pub(crate) fn snapshot_seed(
         &self,
         limits: ProcessorSnapshotLimits,
@@ -388,7 +388,7 @@ impl<C: TrustedClock> InstrumentLiveProcessor<C> {
         )
     }
 
-    /// Release-invalidates processor-owned authority. Task 8 retains liveness ownership.
+    /// Release-invalidates processor-owned authority while the runtime retains liveness ownership.
     pub(crate) fn invalidate_for_exit(&mut self) {
         for state in self.streams.values_mut() {
             state.quarantine();

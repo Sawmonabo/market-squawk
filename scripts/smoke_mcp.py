@@ -120,6 +120,47 @@ def main() -> int:
             }
             require("Market.GetSnapshot" in names, "Market.GetSnapshot tool is missing")
             require("Risk.TriggerKillSwitch" in names, "Risk.TriggerKillSwitch tool is missing")
+            tools_by_name = {
+                tool["name"]: tool
+                for tool in tool_entries
+                if isinstance(tool, dict) and isinstance(tool.get("name"), str)
+            }
+            snapshot_contract = (
+                tools_by_name["Market.GetSnapshot"]
+                .get("_meta", {})
+                .get("org.market-squawk/tool-contract", {})
+            )
+            require(
+                snapshot_contract.get("maximumDataQuality") == "direct_unverified",
+                "Market.GetSnapshot must expose its structured quality ceiling",
+            )
+            require(
+                snapshot_contract.get("executionAuthority") == "none",
+                "Market.GetSnapshot must expose its lack of execution authority",
+            )
+            kill_switch_contract = (
+                tools_by_name["Risk.TriggerKillSwitch"]
+                .get("_meta", {})
+                .get("org.market-squawk/tool-contract", {})
+            )
+            require(
+                kill_switch_contract.get("executionAuthority") == "none",
+                "Risk.TriggerKillSwitch must expose its lack of execution authority",
+            )
+            require(
+                kill_switch_contract.get("simulationAccess") == "none",
+                "Risk.TriggerKillSwitch must not read paper-simulation state",
+            )
+            require(
+                kill_switch_contract.get("controlAuthority")
+                == "paper_simulation_stop_only",
+                "Risk.TriggerKillSwitch must remain confined to paper-simulation control",
+            )
+            require(
+                kill_switch_contract.get("resourceScope")
+                == "current_paper_simulation_run",
+                "Risk.TriggerKillSwitch must remain confined to the current local run",
+            )
             print("MCP smoke test passed")
         except BaseException as error:
             failure = error

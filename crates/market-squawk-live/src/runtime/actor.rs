@@ -514,9 +514,9 @@ impl ShardActor {
                 };
                 if let Some(authority) = applied.authority.as_ref() {
                     owner.processor.validate_applied_current(authority)?;
-                    // Task 9's bounded feature hook linearizes here.
+                    // The bounded feature hook linearizes here.
                     owner.processor.validate_applied_current(authority)?;
-                    // Task 10 returns NoStrategy in Task 8, so no capability is minted.
+                    // NoStrategy produces no order intent, so no capability is minted.
                 }
                 self.events_since_snapshot = self.events_since_snapshot.saturating_add(1);
                 self.dirty = true;

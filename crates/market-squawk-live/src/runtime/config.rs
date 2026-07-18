@@ -293,7 +293,7 @@ pub struct LiveRouteConfigInput {
     pub maximum_capability_lifetime: Duration,
 }
 
-/// One exact venue/instrument route and its preallocated Task 7 processor bounds.
+/// One exact venue/instrument route and its preallocated processor bounds.
 #[derive(Clone, Debug)]
 pub struct LiveRouteConfig {
     route: ShardKey,

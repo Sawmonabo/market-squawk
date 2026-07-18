@@ -8,66 +8,140 @@ historical datasets to originate from or reproduce the live feed.
 
 ## Status
 
-`v0.1.0` is a runnable local foundation, not a production brokerage system.
+`v0.1.0` is a runnable diagnostic foundation. It is not the usable complete Market Squawk release
+and it is not a production brokerage system. The linked
+[historical state audit](docs/architecture/current-state.md) records its own rejected audit anchor;
+it is not an exact-head inventory. The sections below and the tracked
+[release baseline](docs/verification/usable-release-baseline.md) are the current inventory and
+user-facing truth. All mandatory remaining work is bound by the single canonical
+[usable complete-release implementation plan](docs/superpowers/plans/2026-07-17-market-squawk-usable-complete-release.md).
 
-Implemented production foundation contracts:
+## Runnable now
 
-- Rust 1.97 virtual workspace with invariant-preserving shared domain contracts
-- Distinct fair-value, market-depth, data-quality, stream-integrity, and capture-integrity types
-- Typed internal/external instrument identities, scaled financial values, provenance, and separate
-  canonical live/research observation families
-- Opaque current-source/live authority, deterministic single-writer sharding, transactional books,
-  and bounded immutable snapshots
-- Independent live and research boundaries; research storage and extraction adapters remain later
-  implementation stages and do not depend on captured live journals
+- Rust 1.97.1 workspace with invariant-preserving domain, identity, time, financial, quality,
+  provenance, source-authority, sharding, transactional-book, and bounded-snapshot foundations.
+- Public Coinbase Exchange WebSocket diagnostic capture with explicit single-venue, partial
+  coverage. This is not a production `DirectVerified` adapter.
+- Level 2 price-level snapshots and updates, heartbeat tracking separated from market freshness,
+  match/trade capture, fixed-point prices and quantities, and in-memory order books.
+- MSJ1 append-only journal writing, CRC32 validation, a single-writer OS lock, bounded legacy read
+  compatibility, and optional Coinbase diagnostic reconstruction.
+- Authority-free midpoint, spread, spread-basis-point, microprice, imbalance, feed-quality,
+  pre-trade calculation, and paper-only momentum diagnostics.
+- A five-tool diagnostic stdio MCP compatibility server with strict schemas and per-process call
+  limiting; it is not the complete typed MCP product.
+- A deterministic mock source for offline diagnostic verification. It is never represented as a
+  production source.
 
-Runnable diagnostic compatibility capabilities:
+The current Coinbase reader and MCP server are compatibility paths. Their app-local
+`QualityState::Valid` is not canonical `DataQuality::DirectVerified`, cannot enter the production
+live runtime, and cannot authorize an order. All current bot and fill behavior is diagnostic paper
+simulation.
 
-- Public Coinbase Exchange WebSocket reader with single-venue, partial coverage
-- Level 2 price-level snapshots and incremental updates
-- Heartbeat sequence tracking separated from order-book freshness
-- Match/trade capture
-- Append-only length-prefixed raw journal with CRC32 integrity checks and a single-writer OS lock
-- Exact journal validation plus optional Coinbase diagnostic reconstruction
-- Fixed-point decimal prices and quantities
-- In-memory order books
-- Midprice, spread, spread basis points, microprice, and book imbalance
-- Latched feed-quality state machine requiring a fresh snapshot after hard failures
-- Diagnostic pre-trade calculation
-- Optional diagnostic paper-only momentum simulation
-- Local diagnostic stdio MCP server with strict schemas and per-process tool-call limiting
-- Deterministic mock source for offline verification
+## Required but missing
 
-These compatibility capabilities are authority-free. Their app-local `QualityState::Valid` is not
-canonical `DataQuality::DirectVerified`, cannot enter the production live runtime, and can never
-authorize a production order. All bot/fill behavior described below is paper simulation only.
+Every row below is currently `Missing`. A row becomes `Runnable` only when its real producer,
+terminal consumer, focused verification, immutable evidence, and exact commit exist together.
 
-Permanently excluded: Market Squawk will not implement identity/account rotation to evade limits,
-browser/TLS fingerprint concealment, CAPTCHA or anti-bot bypass, blocking-evasion proxy rotation,
-distributed quota evasion, stealth scraping, or any other access-control circumvention.
+| State | Mandatory capability | Current blocker | Closing task |
+| --- | --- | --- | --- |
+| `Missing` | Coinbase direct-source qualification | No production authority-qualified Coinbase vertical | Task 2 |
+| `Missing` | Kraken direct-source qualification | No production Kraken adapter, checksum validation, or qualified vertical | Task 6 |
+| `Missing` | CSV/TSV | No bounded production extraction adapter | Task 7 |
+| `Missing` | JSON/NDJSON | No bounded production extraction adapter | Task 7 |
+| `Missing` | XML | No entity-safe production extraction adapter | Task 7 |
+| `Missing` | Excel | No macro/formula-safe production extraction adapter | Task 7 |
+| `Missing` | SQLite/database export | No allowlisted read-only production extraction adapter | Task 7 |
+| `Missing` | OFX/QFX | No raw-preserving production extraction adapter | Task 7 |
+| `Missing` | Parquet import | No schema- and provenance-validating import adapter | Task 7 |
+| `Missing` | SEC filings/XBRL/Company Facts | No lawful, revision-preserving SEC vertical | Task 8 |
+| `Missing` | FRED/ALFRED | No vintage-aware production macro adapter | Task 9 |
+| `Missing` | BLS | No quota-honest production macro adapter | Task 9 |
+| `Missing` | US Treasury | No schema-tracked production Treasury adapter | Task 9 |
+| `Missing` | portfolio import | No raw-preserving holdings/transactions reconciliation vertical | Task 10 |
+| `Missing` | SQLite catalog | No durable local catalog, migrations, cursors, or manifests | Task 3 |
+| `Missing` | Arrow exchange | No versioned analytical interchange implementation | Task 4 |
+| `Missing` | Parquet datasets | No immutable publication, manifests, lineage, or compaction | Task 4 |
+| `Missing` | DataFusion queries | No bounded embedded analytical query service | Task 4 |
+| `Missing` | point-in-time datasets | No availability-aware joins or leakage-checked builder | Task 11 |
+| `Missing` | Rust financial analytics | No complete tested batch-analytics implementation | Task 12 |
+| `Missing` | feature registry | No versioned registry with time and compatibility semantics | Task 12 |
+| `Missing` | Python data/financial/training product | No tracked product package or Rust-parity training boundary | Task 14 |
+| `Missing` | complete model bundle | No fully hashed artifact/schema/metadata bundle | Task 13 |
+| `Missing` | native Rust inference | No production local inference backend | Task 13 |
+| `Missing` | constrained ONNX inference | No validated, bounded, fail-closed ONNX-compatible backend | Task 15 |
+| `Missing` | research backtesting | No point-in-time research-dataset backtester | Task 17 |
+| `Missing` | portfolio accounting/analytics | No lots, gains, performance, exposure, attribution, risk, or scenarios | Task 16 |
+| `Missing` | strategies and comprehensive risk | No canonical strategies or non-bypassable complete risk vertical | Task 2 |
+| `Missing` | realistic paper execution | No realistic lifecycle, fee, latency, slippage, fill, or reconciliation vertical | Task 2 |
+| `Missing` | ASC 820/IFRS 13 fair value | No ruleset, evidence, override, approval, or classification service | Task 18 |
+| `Missing` | complete local CLI | No complete command hierarchy over shared application services | Task 19 |
+| `Missing` | complete typed local MCP | No complete bounded tool domains over shared application services | Task 19 |
+| `Missing` | release security/fuzz/performance gate | No exact-head release evidence or final integrated demonstration | Task 20 |
 
-Not yet implemented in the current foundation:
+No production adapter crates are tracked under `adapters/` in this checkout. The checkout has no
+tracked `python/` product package. Python files under `scripts/` are repository-verification and
+protocol-smoke utilities, not financial-analytics or model-training product code.
 
-- Live order submission
-- Credentialed exchange or brokerage access
-- Full consolidated equities, options, futures, or fixed-income feeds
-- Distributed deployment
-- OpenTelemetry infrastructure
-- Arbitrary MCP SQL, shell, network, or filesystem access
+## Release blocked until implemented
+
+Market Squawk is not a usable complete release until every mandatory capability above is a working,
+bounded producer-to-consumer vertical slice; runs together locally through the CLI and complete typed
+MCP where applicable; and passes the clean, unchanged exact-head release gate. Traits, schemas,
+empty crates, mocks, synthetic sources, diagnostic compatibility paths, plans, and focused lane tests
+do not count as implemented production capabilities.
+
+Permanently excluded: identity or account rotation to evade limits, browser or TLS fingerprint
+concealment, CAPTCHA or anti-bot bypass, blocking-evasion proxy rotation, distributed quota evasion,
+stealth scraping, arbitrary MCP shell/filesystem/network/SQL authority, risk bypass, credential
+access, audit deletion, and other access-control circumvention.
+
+Only paid or licensed provider adapters, explicitly authorized live-money execution adapters, replay
+beyond diagnostic and decoder-validation needs, and a possible observability adapter beyond required
+local structured tracing are optional after the usable complete release. Distributed deployment,
+commercial consolidated-feed coverage, and OpenTelemetry infrastructure are not release blockers.
 
 ## Why Rust
 
 The live path needs predictable memory use, native execution, safe concurrency, fixed-point
-financial values, and a single local binary. Python remains the intended research and model-training
-consumer through journal exports and, in later stages, Parquet or an Arrow/PyO3 interface. Python is
-not placed between a live event and a paper-bot decision.
+financial values, and a single local binary. The required Python research, financial-analytics, and
+model-training product is currently missing and release-blocking. Its specified boundary consumes
+point-in-time Arrow/Parquet data and pure Rust analytical kernels outside the live path; Python is
+never placed between a live event and an automated decision.
 
-## Quick start
+## Diagnostic foundation quick start
+
+These commands demonstrate only the current authority-free diagnostic foundation. They do not
+provide production execution quality, research datasets, model training or inference, portfolio
+accounting, fair-value analysis, or complete MCP coverage.
 
 Prerequisites:
 
 - Rust 1.97.1 (pinned by `rust-toolchain.toml`)
+- Cargo Deny 0.20.2
+- Cargo Audit 0.22.2
+- Gitleaks 8.30.1
 - Internet access only for dependency installation and live Coinbase capture
+
+Install the pinned Rust security tools locally with:
+
+```bash
+cargo install cargo-deny --version 0.20.2 --locked
+cargo install cargo-audit --version 0.22.2 --locked
+```
+
+Install Gitleaks 8.30.1 from its
+[upstream release](https://github.com/gitleaks/gitleaks/releases/tag/v8.30.1), place the binary on
+`PATH`, and verify the downloaded archive against the release checksum file. The current archive
+SHA-256 values used by supported local/CI hosts are:
+
+| Archive | SHA-256 |
+| --- | --- |
+| `gitleaks_8.30.1_darwin_arm64.tar.gz` | `b40ab0ae55c505963e365f271a8d3846efbc170aa17f2607f13df610a9aeb6a5` |
+| `gitleaks_8.30.1_darwin_x64.tar.gz` | `dfe101a4db2255fc85120ac7f3d25e4342c3c20cf749f2c20a18081af1952709` |
+| `gitleaks_8.30.1_linux_x64.tar.gz` | `551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb` |
+
+**Diagnostic only — build and compatibility commands:**
 
 ```bash
 cargo build --workspace --all-features --release --locked
@@ -89,9 +163,15 @@ cargo build --workspace --all-features --release --locked
 
 All local data defaults to `.market-squawk/`. Override it with `--data-dir` or `MARKET_SQUAWK_DATA_DIR`.
 
-## Local MCP server
+## Diagnostic MCP compatibility server
+
+This is the five-tool diagnostic stdio MCP compatibility server, not the complete typed MCP product.
+Source, Research, Fundamental, Macro, Portfolio, Analysis, Model, FairValue, Bot, and Execution
+coverage remains release-blocking.
 
 Offline mode is useful for verifying protocol integration without opening a market-data connection:
+
+**Diagnostic only — offline five-tool MCP:**
 
 ```bash
 market-squawk mcp --offline
@@ -99,6 +179,8 @@ market-squawk mcp --offline
 
 Diagnostic live-display mode starts the Coinbase Exchange compatibility reader and MCP server in
 the same process. It does not create `DirectVerified` authority:
+
+**Diagnostic only — single-venue partial-coverage display plus five-tool MCP:**
 
 ```bash
 market-squawk mcp --products BTC-USD,ETH-USD
@@ -161,9 +243,10 @@ requirement for the other. Historical sources may differ from live sources. Jour
 optional diagnostic tooling for integrity investigation and decoder reprocessing, not the research
 architecture or a completion dependency.
 
-The research plane is currently represented by shared contracts. Arrow, Parquet, DataFusion,
-point-in-time datasets, and working extraction adapters are subsequent implementation stages and are
-not claimed as current capabilities.
+The research plane currently has shared contracts but no working storage or provider vertical.
+Arrow, Parquet, DataFusion, point-in-time datasets, and extraction adapters are mandatory missing
+capabilities bound to the complete-release plan; the release cannot pass without their real producers
+and consumers.
 
 ## Diagnostic compatibility data path
 
@@ -174,7 +257,7 @@ production current-authority plane and never produces `DirectVerified` data.
 Coinbase Exchange WebSocket (single venue, partial coverage)
         │
         ▼
-raw JSON frame ──► acknowledged bounded journal queue ─► CRC-framed journal
+raw JSON frame ──► bounded capture-admission queue ──► asynchronous CRC-framed journal writer
         │
         ▼
 decoder
@@ -192,11 +275,24 @@ order book ─► incremental features ─► optional paper bot
                                       paper fill only
 ```
 
-No database, LLM, MCP request, notebook, or filesystem query is in the event-to-decision path. Journal writes use a bounded asynchronous queue. The source waits for an in-process writer acknowledgement before publishing the decoded event. If the writer disappears or the queue cannot accept data, capture fails rather than silently discarding raw market data. Durability flushes occur at explicit checkpoints and shutdown so the hot path does not fsync every message.
+No database, LLM, MCP request, notebook, or filesystem query is in the event-to-decision path.
+Before decode, the source synchronously attempts nonblocking admission of the exact raw frame to a
+count- and byte-bounded in-process queue. A returned diagnostic capture receipt means the frame
+passed diagnostic capture identity, generation, and integrity admission checks and entered that
+queue; it is never current live or source-registry authority and is not a writer or durability
+acknowledgement.
+Saturation, a stopped or closed writer, authority failure, or a generation change fails publication
+closed. The dedicated writer appends and flushes asynchronously outside the event-to-decision path.
+Writer, storage, or shutdown-deadline failure marks capture incomplete and prevents execution-quality
+qualification; explicit flush checkpoints and shutdown avoid an fsync on every frame.
 
 ## Diagnostic data-integrity model
 
-The engine distinguishes source capture from market truth. It guarantees that locally accepted journal records can be checksummed, replayed, and traced to the raw source frame. It does not claim that any external venue or free provider is globally complete or infallible.
+The engine distinguishes source capture from market truth. Frames successfully appended to the local
+journal can be checksummed, replayed, and traced to their raw source bytes. Queue admission alone is
+not a durability claim. Capture health records an incomplete generation when asynchronous
+persistence cannot complete. No external venue or free provider is assumed globally complete or
+infallible.
 
 The compatibility engine's app-local `QualityState` values include:
 
@@ -238,7 +334,9 @@ The raw envelope preserves:
 - Local receive timestamp
 - Exact raw payload bytes
 
-A future format version may add segmented files, stronger cryptographic segment manifests, compression, and Arrow/Parquet compaction. Existing versions remain independently readable.
+Optional MSJ journal-format evolution may add segmentation, cryptographic segment manifests, or
+compression while retaining independent compatibility. That diagnostic-journal evolution is
+separate from mandatory research Parquet dataset compaction, which remains release-blocking.
 
 ## Diagnostic paper bot
 
@@ -259,10 +357,11 @@ authority.
 ./scripts/verify.sh
 ```
 
-This runs the brand, Python-helper, workspace-boundary, and exact duplicate-dependency gates;
-workspace-wide formatting, strict Clippy, tests, release build, and rustdoc; then CLI, offline mock,
-and timeout-bounded local MCP smoke tests. All Cargo operations that consume dependencies use the
-committed lockfile.
+This runs focused Python tests for repository-input hygiene, immutable CI action references, and the
+MCP smoke harness; workspace-boundary and generated-artifact gates; Cargo Deny, Cargo Audit, and
+Gitleaks tree/history scans; workspace-wide formatting, strict Clippy, tests, release build, and
+rustdoc; then CLI, offline mock, and timeout-bounded local MCP smoke tests. All Cargo operations that
+consume dependencies use the committed lockfile.
 
 To exercise MCP after building:
 
@@ -276,11 +375,16 @@ python3 scripts/smoke_mcp.py ./target/debug/market-squawk
 apps/
 └── market-squawk/                 CLI, current live application, MCP, journal, and compatibility tests
 crates/
-└── market-squawk-domain/          shared financial, identity, quality, provenance, and event contracts
-adapters/                           added atomically with the first working production adapter crate
+├── market-squawk-domain/          shared financial, identity, quality, provenance, and event contracts
+├── market-squawk-live/            production authority, sharding, books, and bounded snapshots
+├── market-squawk-platform/        local paths, lifecycle, capture, persistence, and operations
+└── market-squawk-sources/         source contracts, registry, budgets, health, and supervision
 scripts/                            deterministic local/CI policy and smoke gates
 docs/                               architecture, plans, research, and verification evidence
 ```
+
+The release baseline records current tracked adapter and Python-package state; required
+implementations are listed under **Required but missing**.
 
 ## Zero-cost boundary
 
@@ -297,19 +401,27 @@ Market Squawk is available under your choice of the
 (`Apache-2.0 OR MIT`). Contributions are accepted under those same terms unless explicitly stated
 otherwise.
 
-## Roadmap
+## Release-blocking implementation map
 
-1. Segmented journals with SHA-256 manifests and crash recovery indexes
-2. Kraken Level 2 adapter with checksum validation
-3. Arrow record batches and Parquet compaction
-4. Apache DataFusion point-in-time query layer
-5. Corporate actions and total-return series
-6. SEC EDGAR, FRED/ALFRED, Treasury, BLS, and portfolio import adapters
-7. Optional cross-adapter capture replay for diagnostics and decoder validation
-8. Strategy plugin ABI and versioned model bundles
-9. ONNX inference outside the source-reader threads
-10. Latency histograms and queue diagnostics without OTEL deployment
-11. Broker-specific paper adapters, followed only later by explicitly authorized live execution
+The [usable complete-release implementation plan](docs/superpowers/plans/2026-07-17-market-squawk-usable-complete-release.md)
+is the executable delivery contract. Stages and Waves describe dependency/parallel ownership inside
+exactly four production-weighted review quarters:
+
+1. **Quarter 1 of 4 — Stages 0–1 / Waves 0–1B:** close the live/capture prerequisite; refresh truth,
+   dependencies, rights, and ownership; then complete production Coinbase/risk/paper execution,
+   SQLite, Arrow/Parquet/DataFusion, bounded MCP protocol, and Kraken.
+2. **Quarter 2 of 4 — Stage 2 / Waves 2–3:** implement file, SEC, macro, and portfolio adapters;
+   compose research ingestion, point-in-time datasets, corporate actions, and batch analytics.
+3. **Quarter 3 of 4 — Stage 3 / Waves 4A–4B:** implement model bundles, native and ONNX inference,
+   the Python product, portfolio accounting, backtesting, and fair-value analysis.
+4. **Quarter 4 of 4 — Stages 4–5 / Waves 5–6:** complete shared services, CLI, and typed MCP domains;
+   then run integrated demonstrations, provider evidence, fuzzing, measured performance, security,
+   supply-chain gates, grouped review, publication, and cleanup.
+
+Every item is mandatory unless the product contract is explicitly changed. Each quarter ends at one
+clean exact commit with grouped independent review and remediation of every substantiated severity.
+No per-task review rounds or fifth delivery quarter are part of the plan. Stage, Wave, and percentage
+describe progress; none authorizes a partial-release stop.
 
 ## Primary references
 

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-# Task 11 adds `adapters/*` atomically with the first working adapter crate.
+# Add `adapters/*` atomically with the first working adapter crate.
 members = ["apps/*", "crates/*"]
 default-members = ["apps/market-squawk"]
 
@@ -71,8 +71,8 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
 cargo = { level = "warn", priority = -1 }
-# Transitive platform and protocol stacks intentionally resolve independent major versions. The
-# exact reviewed family/version inventory is enforced by scripts/check_duplicate_dependencies.py.
+# Transitive platform and protocol stacks can legitimately resolve independent major versions.
+# Cargo Deny remains authoritative for security, license, source, and crate bans.
 multiple_crate_versions = "allow"
 unwrap_used = "deny"
 expect_used = "deny"

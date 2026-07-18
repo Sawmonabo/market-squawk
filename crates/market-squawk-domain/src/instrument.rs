@@ -24,7 +24,7 @@ pub use provider_identities::{
     ProviderIdentityRegistry, ProviderIdentitySupersession,
 };
 
-/// A broad instrument asset family, separate from Task 4 evidence classifications.
+/// A broad instrument asset family, separate from live-evidence classifications.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AssetClass {
@@ -50,7 +50,7 @@ pub enum AssetClass {
     Cash,
 }
 
-/// Reference-master trading status. Live integrity and eligibility remain separate Task 4 types.
+/// Reference-master trading status. Live integrity and eligibility remain separate types.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TradingStatus {
@@ -337,7 +337,7 @@ impl fmt::Display for SymbolIdentityRecord {
     }
 }
 
-/// The identity-level lifecycle transition persisted before canonical Task 4 event payloads exist.
+/// The identity-level lifecycle transition persisted before canonical event payloads exist.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
 pub enum LifecycleTransitionKind {
