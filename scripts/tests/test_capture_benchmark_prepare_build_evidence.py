@@ -529,6 +529,13 @@ class BuildEvidenceTest(unittest.TestCase):
             {field: emitted_bindings[field] for field in backend},
             backend,
         )
+        current = recompute_current_bindings(
+            REPOSITORY, "0" * 64, "0" * 64, "0" * 64, "standard"
+        )
+        self.assertEqual(
+            emitted_bindings["source_inventory_sha256"],
+            current["source_inventory_sha256"],
+        )
         self_check = bounded_process(
             [str(executable)],
             env={},

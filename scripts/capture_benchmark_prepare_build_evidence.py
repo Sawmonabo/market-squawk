@@ -562,8 +562,11 @@ def recompute_current_bindings(
     platform = rust_files(repository / "crates/market-squawk-platform/src")
     domain = rust_files(repository / "crates/market-squawk-domain/src")
     inventory = hashlib.sha256()
-    for path in sorted(platform + domain):
-        inventory.update(str(path.relative_to(repository)).encode())
+    relative_paths = sorted(
+        os.fsencode(path.relative_to(repository)) for path in platform + domain
+    )
+    for path in relative_paths:
+        inventory.update(path)
         inventory.update(b"\0")
     bench = repository / "crates/market-squawk-platform/benches/capture_admission"
     immutable = {
