@@ -296,6 +296,34 @@ def resolve_external_tool(name: str, environment: dict[str, str]) -> tuple[Path,
     canonical = Path(os.path.realpath(path))
     if not canonical.is_absolute():
         raise GateError("closed build tool did not resolve to an absolute path")
+    if canonical.name in {"rustup", "rustup.exe"}:
+        if name not in {"cargo", "rustc"}:
+            raise GateError("closed build found an unexpected rustup proxy")
+        resolver_environment = {
+            key: environment[key]
+            for key in ("PATH", "HOME", "RUSTUP_HOME")
+            if key in environment and environment[key]
+        }
+        resolved = bounded_process(
+            [str(canonical), "which", name],
+            cwd=Path(__file__).resolve().parents[1],
+            env=resolver_environment,
+            timeout_seconds=10,
+            maximum_stdout=4096,
+            maximum_stderr=4096,
+        )
+        if resolved.returncode != 0:
+            raise GateError("rustup could not resolve the pinned direct build tool")
+        try:
+            resolved_path = resolved.stdout.decode("utf-8", "strict").strip()
+        except UnicodeDecodeError as error:
+            raise GateError("rustup returned a non-UTF-8 build tool path") from error
+        if not resolved_path or "\n" in resolved_path or "\r" in resolved_path:
+            raise GateError("rustup returned an ambiguous build tool path")
+        canonical = Path(os.path.realpath(resolved_path))
+        expected_names = {name, f"{name}.exe"}
+        if not canonical.is_absolute() or canonical.name not in expected_names:
+            raise GateError("rustup did not resolve the requested direct build tool")
     return canonical, external_tool_hash(canonical)
 
 

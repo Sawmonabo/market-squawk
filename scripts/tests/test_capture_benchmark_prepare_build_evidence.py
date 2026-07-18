@@ -30,6 +30,7 @@ from scripts.capture_benchmark_prepare_build_evidence import (
     benchmark_backend_binding,
     canonical_json,
     parse_cargo_artifact,
+    resolve_external_tool,
     runner_bindings,
     run_closed_cargo_build,
     sanitized_build_environment,
@@ -47,11 +48,10 @@ REPOSITORY = Path(__file__).resolve().parents[2]
 
 
 def host_tool_bindings() -> tuple[Path, str, Path, str]:
-    cargo = Path(os.path.realpath(shutil.which("cargo") or ""))
-    git = Path(os.path.realpath(shutil.which("git") or ""))
-    if not cargo.is_absolute() or not git.is_absolute():
-        raise RuntimeError("test host lacks Cargo or Git")
-    return cargo, external_tool_hash(cargo), git, external_tool_hash(git)
+    environment = dict(os.environ)
+    cargo, cargo_sha256 = resolve_external_tool("cargo", environment)
+    git, git_sha256 = resolve_external_tool("git", environment)
+    return cargo, cargo_sha256, git, git_sha256
 
 
 def cargo_message(executable: Path) -> dict:
@@ -300,6 +300,20 @@ def initialize_fixture_repository(root: Path) -> tuple[Path, str]:
 
 
 class BuildEvidenceTest(unittest.TestCase):
+    def test_cargo_resolution_returns_the_direct_cargo_executable(self) -> None:
+        cargo, digest = resolve_external_tool("cargo", dict(os.environ))
+        completed = bounded_process(
+            [str(cargo), "--version"],
+            cwd=REPOSITORY,
+            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+            timeout_seconds=10,
+            maximum_stdout=MAX_BINDINGS_BYTES,
+            maximum_stderr=MAX_BINDINGS_BYTES,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode(errors="replace"))
+        self.assertTrue(completed.stdout.startswith(b"cargo "), completed.stdout)
+        self.assertEqual(external_tool_hash(cargo), digest)
+
     def test_backend_binding_has_canonical_golden_vectors(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repository = Path(temporary).resolve()
