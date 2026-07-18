@@ -41,6 +41,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-env-changed=CAPTURE_BENCH_CARGO_EXECUTABLE_SHA256");
     println!("cargo:rerun-if-env-changed=CAPTURE_BENCH_GIT_EXECUTABLE");
     println!("cargo:rerun-if-env-changed=CAPTURE_BENCH_GIT_EXECUTABLE_SHA256");
+    println!("cargo:rerun-if-env-changed=CAPTURE_BENCH_RUSTC_EXECUTABLE");
+    println!("cargo:rerun-if-env-changed=CAPTURE_BENCH_RUSTC_EXECUTABLE_SHA256");
+    println!("cargo:rerun-if-env-changed=RUSTC");
     println!("cargo:rerun-if-env-changed=CAPTURE_BENCH_PROCESS_GROUP_POLICY");
     println!("cargo:rerun-if-env-changed=CAPTURE_BENCH_EXPECTED_PROCESS_GROUP_ID");
     println!("cargo:rerun-if-env-changed=CAPTURE_BENCH_BASELINE_LOCK_SHA256");
@@ -86,20 +89,34 @@ fn main() -> Result<(), Box<dyn Error>> {
             expected_group.as_deref(),
         )?;
     }
-    let (git_executable, git_executable_sha256, cargo_executable_sha256) = if clean_build_requested
-    {
-        let git = absolute_bound_tool(
-            "CAPTURE_BENCH_GIT_EXECUTABLE",
-            "CAPTURE_BENCH_GIT_EXECUTABLE_SHA256",
-        )?;
-        let cargo = absolute_bound_tool(
-            "CAPTURE_BENCH_CARGO_EXECUTABLE",
-            "CAPTURE_BENCH_CARGO_EXECUTABLE_SHA256",
-        )?;
-        (git.0, git.1, cargo.1)
-    } else {
-        (PathBuf::from("git"), "0".repeat(64), "0".repeat(64))
-    };
+    let (git_executable, git_executable_sha256, cargo_executable_sha256, rustc_executable_sha256) =
+        if clean_build_requested {
+            let git = absolute_bound_tool(
+                "CAPTURE_BENCH_GIT_EXECUTABLE",
+                "CAPTURE_BENCH_GIT_EXECUTABLE_SHA256",
+            )?;
+            let cargo = absolute_bound_tool(
+                "CAPTURE_BENCH_CARGO_EXECUTABLE",
+                "CAPTURE_BENCH_CARGO_EXECUTABLE_SHA256",
+            )?;
+            let rustc = absolute_bound_tool(
+                "CAPTURE_BENCH_RUSTC_EXECUTABLE",
+                "CAPTURE_BENCH_RUSTC_EXECUTABLE_SHA256",
+            )?;
+            let cargo_rustc = std::env::var_os("RUSTC")
+                .ok_or("Cargo did not provide the selected Rust compiler identity")?;
+            if Path::new(&cargo_rustc) != rustc.0.as_path() {
+                return Err("Cargo did not preserve the bound Rust compiler identity".into());
+            }
+            (git.0, git.1, cargo.1, rustc.1)
+        } else {
+            (
+                PathBuf::from("git"),
+                "0".repeat(64),
+                "0".repeat(64),
+                "0".repeat(64),
+            )
+        };
     let bench_root = manifest.join("benches/capture_admission");
     let backend_binding = build_support::bind_benchmark_backend_sources(
         &manifest,
@@ -268,6 +285,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         build_support_sha256: &hash_file(&build_support)?,
         cargo_executable_sha256: &cargo_executable_sha256,
         git_executable_sha256: &git_executable_sha256,
+        rustc_executable_sha256: &rustc_executable_sha256,
         host_gate_shell_sha256: &hash_file(&host_gate_shell)?,
         host_gate_python_sha256: &hash_file(&host_gate_python)?,
         host_gate_process_sha256: &hash_file(&host_gate_process)?,
@@ -296,13 +314,12 @@ struct ValidatedBuildEnvironment {
 }
 
 fn validate_authoritative_build_environment() -> Result<ValidatedBuildEnvironment, Box<dyn Error>> {
-    const POLICY: &str = "sanitized-cargo-bench-v1";
+    const POLICY: &str = "sanitized-cargo-bench-v2";
     for key in [
         "RUSTFLAGS",
         "RUSTDOCFLAGS",
         "CARGO_BUILD_RUSTFLAGS",
         "CARGO_BUILD_RUSTC_WRAPPER",
-        "RUSTC",
         "RUSTC_WRAPPER",
         "RUSTC_WORKSPACE_WRAPPER",
         "CC",
@@ -415,6 +432,7 @@ struct GeneratedBindings<'a> {
     build_support_sha256: &'a str,
     cargo_executable_sha256: &'a str,
     git_executable_sha256: &'a str,
+    rustc_executable_sha256: &'a str,
     host_gate_shell_sha256: &'a str,
     host_gate_python_sha256: &'a str,
     host_gate_process_sha256: &'a str,
@@ -530,6 +548,7 @@ fn render(bindings: GeneratedBindings<'_>) -> Result<String, std::fmt::Error> {
         ("BUILD_SUPPORT_SHA256", bindings.build_support_sha256),
         ("CARGO_EXECUTABLE_SHA256", bindings.cargo_executable_sha256),
         ("GIT_EXECUTABLE_SHA256", bindings.git_executable_sha256),
+        ("RUSTC_EXECUTABLE_SHA256", bindings.rustc_executable_sha256),
         ("HOST_GATE_SHELL_SHA256", bindings.host_gate_shell_sha256),
         ("HOST_GATE_PYTHON_SHA256", bindings.host_gate_python_sha256),
         (

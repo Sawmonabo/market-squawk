@@ -133,11 +133,12 @@ def build_evidence_value(backend: str) -> dict:
         "measured_code_head": ("2" if candidate else "1") * 40,
         "clean_build_enforced": True,
         "build_command": measured.BUILD_COMMAND,
-        "build_environment_policy": "sanitized-cargo-bench-v1",
+        "build_environment_policy": "sanitized-cargo-bench-v2",
         "build_command_sha256": digest,
         "build_environment_sha256": digest,
         "cargo_executable_sha256": digest,
         "git_executable_sha256": digest,
+        "rustc_executable_sha256": digest,
         "git_tree_clean": True,
         "cargo_locked": True,
         "all_features": True,
@@ -354,6 +355,60 @@ class ObservationContractTest(unittest.TestCase):
             "cargo",
         )
 
+    def test_toolchain_resolver_accepts_symlinked_and_hardlinked_rustup_proxies(
+        self,
+    ) -> None:
+        for layout in ("symlink", "hardlink"):
+            with self.subTest(layout=layout), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                bin_dir = root / "bin"
+                toolchain_dir = root / "toolchain"
+                bin_dir.mkdir(mode=0o700)
+                toolchain_dir.mkdir(mode=0o700)
+                direct = {}
+                for name in ("cargo", "rustc"):
+                    direct[name] = toolchain_dir / name
+                    direct[name].write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                    direct[name].chmod(0o500)
+                rustup = bin_dir / "rustup"
+                rustup.write_text(
+                    "#!/bin/sh\nprintf '%s\\n' "
+                    f'"{toolchain_dir}/$2"\n',
+                    encoding="utf-8",
+                )
+                rustup.chmod(0o500)
+                for name in ("cargo", "rustc"):
+                    proxy = bin_dir / name
+                    if layout == "symlink":
+                        proxy.symlink_to(rustup.name)
+                    else:
+                        os.link(rustup, proxy)
+                paths = {
+                    "cargo": bin_dir / "cargo",
+                    "rustc": bin_dir / "rustc",
+                    "rustup": rustup,
+                }
+                records: list[dict] = []
+                with mock.patch.object(
+                    observation,
+                    "_closed_tool_path",
+                    side_effect=lambda name: paths[name],
+                ):
+                    identities = observation._resolve_toolchain_identities(records)
+                self.assertEqual(
+                    Path(identities["cargo"]["path"]), direct["cargo"].resolve()
+                )
+                self.assertEqual(
+                    Path(identities["rustc"]["path"]), direct["rustc"].resolve()
+                )
+                self.assertEqual(
+                    identities["rustup"]["nlink"],
+                    1 if layout == "symlink" else 3,
+                )
+                self.assertEqual(
+                    [record["tool"] for record in records], ["rustup", "rustup"]
+                )
+
     def test_production_observation_binds_real_toolchain_executables(self) -> None:
         raw = observation.production_observation()
         identities = raw["toolchain"]["tool_identities"]
@@ -543,6 +598,21 @@ class MeasurementContractTest(unittest.TestCase):
             candidate_environment["CAPTURE_BENCH_BASELINE_LOCK"],
             str(self.root_path / "baseline-lock.json"),
         )
+
+    def test_measurement_requires_the_build_bound_toolchain(self) -> None:
+        contract = self._contract("standard")
+        identities = {
+            name: {
+                "state": "available",
+                "sha256": contract.runner_bindings[f"{name}_executable_sha256"],
+            }
+            for name in ("cargo", "git", "rustc")
+        }
+        toolchain = {"tool_identities": identities}
+        measured.verify_build_tool_identities(contract, toolchain)
+        identities["rustc"]["sha256"] = "0" * 64
+        with self.assertRaises(GateError):
+            measured.verify_build_tool_identities(contract, toolchain)
 
     def test_backend_and_baseline_disagreement_is_rejected(self) -> None:
         invalid = build_evidence_value("candidate")

@@ -36,7 +36,7 @@ else:
 
 MAX_BUILD_EVIDENCE_BYTES = 1024 * 1024
 MAX_EXECUTABLE_BYTES = 256 * 1024 * 1024
-RUNNER_SCHEMA_VERSION = 3
+RUNNER_SCHEMA_VERSION = 4
 SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 AUTHORITY_MODULE_FILES = {
     "host_gate_shell_sha256": SCRIPT_DIRECTORY / "capture_benchmark_host_gate.sh",
@@ -81,6 +81,7 @@ BUILD_EVIDENCE_FIELDS = {
     "build_environment_sha256",
     "cargo_executable_sha256",
     "git_executable_sha256",
+    "rustc_executable_sha256",
     "git_tree_clean",
     "cargo_locked",
     "all_features",
@@ -136,6 +137,7 @@ RUNNER_BINDING_FIELDS = {
     "build_environment_sha256",
     "cargo_executable_sha256",
     "git_executable_sha256",
+    "rustc_executable_sha256",
     "source_inventory_sha256",
     "cargo_lock_sha256",
     "workspace_manifest_sha256",
@@ -173,6 +175,7 @@ DIGEST_FIELDS = {
     "build_environment_sha256",
     "cargo_executable_sha256",
     "git_executable_sha256",
+    "rustc_executable_sha256",
     "executable_sha256",
     "cargo_json_sha256",
     "source_inventory_sha256",
@@ -210,6 +213,9 @@ class MeasurementContract:
     expected_fixtures: str
     measured_code_head: str
     executable_sha256: str
+    cargo_executable_sha256: str
+    git_executable_sha256: str
+    rustc_executable_sha256: str
     baseline_manifest_sha256: str | None
     baseline_lock_sha256: str | None
     baseline_measured_code_head: str | None
@@ -337,7 +343,7 @@ def build_evidence_contract(
         or value["cargo_locked"] is not True
         or value["all_features"] is not True
         or value["release"] is not True
-        or value["build_environment_policy"] != "sanitized-cargo-bench-v1"
+        or value["build_environment_policy"] != "sanitized-cargo-bench-v2"
         or value["executable_path"] != "./capture_admission_evidence-exe"
         or value["cargo_json_path"] != "./capture-bench-build.json"
         or value["selected_backend_source_path"]
@@ -370,6 +376,9 @@ def build_evidence_contract(
         expected_fixtures=fixtures,
         measured_code_head=value["measured_code_head"],
         executable_sha256=value["executable_sha256"],
+        cargo_executable_sha256=value["cargo_executable_sha256"],
+        git_executable_sha256=value["git_executable_sha256"],
+        rustc_executable_sha256=value["rustc_executable_sha256"],
         baseline_manifest_sha256=value["baseline_manifest_sha256"],
         baseline_lock_sha256=value["baseline_lock_sha256"],
         baseline_measured_code_head=value["baseline_measured_code_head"],
@@ -378,6 +387,23 @@ def build_evidence_contract(
             field: value[field] for field in AUTHORITY_MODULE_FILES
         },
     )
+
+
+def verify_build_tool_identities(
+    contract: MeasurementContract, stable_toolchain: dict[str, Any]
+) -> None:
+    identities = stable_toolchain.get("tool_identities")
+    if not isinstance(identities, dict):
+        raise GateError("host toolchain identities are absent")
+    for name in ("cargo", "git", "rustc"):
+        identity = identities.get(name)
+        expected = getattr(contract, f"{name}_executable_sha256")
+        if (
+            not isinstance(identity, dict)
+            or identity.get("state") != "available"
+            or identity.get("sha256") != expected
+        ):
+            raise GateError("host toolchain differs from the build-bound executables")
 
 
 def verify_authority_module_bindings(contract: MeasurementContract) -> None:

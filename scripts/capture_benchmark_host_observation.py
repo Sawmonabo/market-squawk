@@ -84,7 +84,10 @@ MAX_TOOL_BYTES = 256 * 1024 * 1024
 
 
 def executable_identity(
-    path: Path, *, execution_strategy: str | None = None
+    path: Path,
+    *,
+    execution_strategy: str | None = None,
+    allow_source_hardlinks: bool = False,
 ) -> dict[str, Any]:
     """Hash one canonical executable through a no-follow descriptor."""
 
@@ -94,7 +97,7 @@ def executable_identity(
     descriptor = os.open(resolved, os.O_RDONLY | NOFOLLOW)
     try:
         before = os.fstat(descriptor)
-        if not _safe_executable(before):
+        if not _safe_executable(before, allow_source_hardlinks):
             raise GateError("observation tool is not a bounded executable")
         _validate_executable_directory_chain(resolved, before.st_uid)
         digest = hashlib.sha256()
@@ -121,8 +124,8 @@ def executable_identity(
             before.st_ctime_ns,
         )
         if (
-            not _safe_executable(after)
-            or not _safe_executable(current)
+            not _safe_executable(after, allow_source_hardlinks)
+            or not _safe_executable(current, allow_source_hardlinks)
             or (
                 after.st_dev,
                 after.st_ino,
@@ -157,7 +160,11 @@ def executable_identity(
             or strategy == "trusted-direct"
             and before.st_uid != 0
             or strategy == "ephemeral-copy"
-            and (before.st_uid != os.getuid() or before.st_nlink != 1)
+            and (
+                before.st_uid != os.getuid()
+                or before.st_nlink != 1
+                and not allow_source_hardlinks
+            )
             or strategy == "current-process"
             and resolved != Path(sys.executable).resolve(strict=True)
         ):
@@ -179,13 +186,19 @@ def executable_identity(
         os.close(descriptor)
 
 
-def _safe_executable(metadata: os.stat_result) -> bool:
+def _safe_executable(
+    metadata: os.stat_result, allow_source_hardlinks: bool = False
+) -> bool:
     return (
         stat.S_ISREG(metadata.st_mode)
         and 0 < metadata.st_size <= MAX_TOOL_BYTES
         and metadata.st_uid in {0, os.getuid()}
         and metadata.st_nlink >= 1
-        and (metadata.st_uid == 0 or metadata.st_nlink == 1)
+        and (
+            metadata.st_uid == 0
+            or metadata.st_nlink == 1
+            or allow_source_hardlinks
+        )
         and stat.S_IMODE(metadata.st_mode) & 0o111 != 0
         and stat.S_IMODE(metadata.st_mode) & 0o022 == 0
     )
@@ -216,6 +229,7 @@ def resolve_tool_identity(
     required: bool = True,
     unavailable_reason: str = "not-required-on-platform",
     execution_strategy: str | None = None,
+    allow_source_hardlinks: bool = False,
 ) -> dict[str, Any]:
     if name not in TOOL_NAMES:
         raise GateError("observation tool name is outside the closed inventory")
@@ -226,7 +240,9 @@ def resolve_tool_identity(
     if explicit_path is None:
         raise GateError("required observation tool is unavailable")
     return executable_identity(
-        explicit_path, execution_strategy=execution_strategy
+        explicit_path,
+        execution_strategy=execution_strategy,
+        allow_source_hardlinks=allow_source_hardlinks,
     )
 
 
@@ -242,7 +258,15 @@ def run_bound_tool(
     tool_name: str | None = None,
     execution_records: list[dict[str, Any]] | None = None,
 ) -> str:
-    if not validate_tool_identity(identity) or identity["state"] != "available":
+    rustup_hardlinks = _allows_bound_rustup_hardlinks(
+        identity, invocation_name, tool_name
+    )
+    if (
+        not validate_tool_identity(
+            identity, allow_source_hardlinks=rustup_hardlinks
+        )
+        or identity["state"] != "available"
+    ):
         raise GateError("bound observation tool identity is invalid")
     if any(
         not isinstance(argument, str) or len(argument.encode()) > MAX_ARGV_BYTES
@@ -261,7 +285,9 @@ def run_bound_tool(
     path = Path(identity["path"])
     if (
         executable_identity(
-            path, execution_strategy=identity["execution_strategy"]
+            path,
+            execution_strategy=identity["execution_strategy"],
+            allow_source_hardlinks=rustup_hardlinks,
         )
         != identity
     ):
@@ -292,7 +318,9 @@ def run_bound_tool(
             path_removed = _remove_ephemeral_execution(binding)
     if (
         executable_identity(
-            path, execution_strategy=identity["execution_strategy"]
+            path,
+            execution_strategy=identity["execution_strategy"],
+            allow_source_hardlinks=rustup_hardlinks,
         )
         != identity
     ):
@@ -309,6 +337,24 @@ def run_bound_tool(
             }
         )
     return result
+
+
+def _allows_bound_rustup_hardlinks(
+    identity: dict[str, Any], invocation_name: str | None, tool_name: str | None
+) -> bool:
+    if (
+        tool_name != "rustup"
+        or invocation_name not in {None, "rustup"}
+        or identity.get("state") != "available"
+        or Path(identity.get("path", "")).name.casefold()
+        not in {"rustup", "rustup.exe"}
+    ):
+        return False
+    try:
+        rustup = _closed_tool_path("rustup").resolve(strict=True)
+    except (GateError, OSError):
+        return False
+    return Path(identity["path"]) == rustup
 
 
 def process_class(argv: str) -> str:
@@ -543,16 +589,38 @@ def _production_tool_identities(
 def _resolve_toolchain_identities(
     execution_records: list[dict[str, Any]],
 ) -> dict[str, dict[str, Any]]:
+    paths = {name: _closed_tool_path(name) for name in ("cargo", "rustc")}
+    try:
+        rustup_path = _closed_tool_path("rustup")
+    except GateError:
+        rustup_path = None
     launchers = {
-        name: resolve_tool_identity(name, explicit_path=_closed_tool_path(name))
-        for name in ("cargo", "rustc")
+        name: resolve_tool_identity(
+            name,
+            explicit_path=path,
+            allow_source_hardlinks=rustup_path is not None,
+        )
+        for name, path in paths.items()
     }
+    rustup = (
+        resolve_tool_identity(
+            "rustup",
+            explicit_path=rustup_path,
+            allow_source_hardlinks=True,
+        )
+        if rustup_path is not None
+        else None
+    )
     proxied = {
-        name: identity
+        name
         for name, identity in launchers.items()
-        if Path(identity["path"]).name == "rustup"
+        if Path(identity["path"]).name.casefold() in {"rustup", "rustup.exe"}
+        or rustup is not None
+        and _same_executable_identity(identity, rustup)
     }
     if not proxied:
+        if not all(validate_tool_identity(identity) for identity in launchers.values()):
+            raise GateError("non-proxy Rust toolchain executable has ambiguous links")
         return {
             **launchers,
             "rustup": resolve_tool_identity(
@@ -561,9 +629,15 @@ def _resolve_toolchain_identities(
                 unavailable_reason="not-used-for-direct-toolchain",
             ),
         }
-    if set(proxied) != {"cargo", "rustc"} or proxied["cargo"] != proxied["rustc"]:
+    if proxied != {"cargo", "rustc"}:
         raise GateError("Rust toolchain proxy resolution is inconsistent")
-    rustup = proxied["cargo"]
+    if rustup is None:
+        rustup = launchers["cargo"]
+    if not all(
+        _same_executable_identity(identity, rustup)
+        for identity in launchers.values()
+    ):
+        raise GateError("Rust toolchain proxy resolution is inconsistent")
     resolved = {}
     for name in ("cargo", "rustc"):
         path = run_bound_tool(
@@ -574,10 +648,29 @@ def _resolve_toolchain_identities(
             execution_records=execution_records,
         )
         identity = executable_identity(Path(path))
-        if Path(identity["path"]).name != name:
+        expected_names = {name.casefold(), f"{name}.exe".casefold()}
+        if Path(identity["path"]).name.casefold() not in expected_names:
             raise GateError("Rust toolchain executable resolution is malformed")
         resolved[name] = identity
     return {**resolved, "rustup": rustup}
+
+
+def _same_executable_identity(
+    left: dict[str, Any], right: dict[str, Any]
+) -> bool:
+    return all(
+        left.get(field) == right.get(field)
+        for field in (
+            "device",
+            "inode",
+            "size",
+            "uid",
+            "mode",
+            "nlink",
+            "flags",
+            "sha256",
+        )
+    )
 
 
 def _closed_tool_path(name: str) -> Path:

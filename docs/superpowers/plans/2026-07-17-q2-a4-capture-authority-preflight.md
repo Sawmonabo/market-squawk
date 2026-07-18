@@ -1919,12 +1919,13 @@ not measure either backend before the future clean `A4_STANDARD_REFERENCE_HEAD` 
   production libraries linked into the executable; host fingerprint; toolchain fingerprint; and
   release-profile fingerprint. It also binds the ordered five repetition digests, every controlled
   artifact digest, the exact build command, sanitized build-environment policy and digest, Cargo
-  executable digest, the exact real pinned-toolchain Cargo/rustc binaries, the explicitly selected
+  and rustc executable digests, the exact real pinned-toolchain Cargo/rustc binaries, the explicitly selected
   target linker and its required SDK/linker inputs, bound Git executable/config environment, build
   script and bounded build-helper modules, every host-gate helper, and every separately split
   build-evidence preparer module. The preparer owns the exact Cargo invocation under a minimal
-  constructed tool PATH, rejects loader injection, discovered Cargo config, and unowned compiler/
-  profile/target override surfaces, captures bounded Cargo JSON itself, and no-clobber publishes the exact
+  constructed tool PATH, rejects loader injection, discovered Cargo config, and ambient compiler/
+  profile/target override surfaces, then deliberately supplies the descriptor-bound Rust 1.97.1
+  compiler, captures bounded Cargo JSON itself, and no-clobber publishes the exact
   artifact. `build.rs` independently requires the closed-build policy, exact feature/profile facts,
   clean Git head, and command/environment digests. Candidate startup requires
   `CAPTURE_BENCH_BASELINE_MANIFEST`,
@@ -2084,10 +2085,13 @@ not measure either backend before the future clean `A4_STANDARD_REFERENCE_HEAD` 
     (.repetition_sha256 | keys | sort) ==
       ["repetition-1.json", "repetition-2.json", "repetition-3.json",
        "repetition-4.json", "repetition-5.json"] and
-    .build_environment_policy == "sanitized-cargo-bench-v1" and
+    .schema_version == 4 and
+    .build_environment_policy == "sanitized-cargo-bench-v2" and
     (.build_command_sha256 | length == 64) and
     (.build_environment_sha256 | length == 64) and
     (.cargo_executable_sha256 | length == 64) and
+    (.rustc_executable_sha256 | type == "string" and length == 64) and
+    .tool_sha256["rustc-executable"] == .rustc_executable_sha256 and
     (.entrypoint_sha256 | type == "string" and length == 64) and
     (.backend_sha256 | type == "string" and length == 64) and
     (.host_fingerprint_sha256 | type == "string" and length == 64) and

@@ -41,7 +41,7 @@ PROFILE = (
     "cargo-bench-inherits-release:opt-level=3:lto=thin:codegen-units=1:"
     "panic=abort:strip=symbols"
 )
-BUILD_ENVIRONMENT_POLICY = "sanitized-cargo-bench-v1"
+BUILD_ENVIRONMENT_POLICY = "sanitized-cargo-bench-v2"
 BUILD_COMMAND = (
     "cargo",
     "bench",
@@ -86,6 +86,8 @@ BACKEND_SOURCE_RELATIVE = {
     "standard": Path("benches/capture_admission/backend/standard.rs"),
     "candidate": Path("benches/capture_admission/backend/candidate.rs"),
 }
+PINNED_RUSTC_RELEASE = "1.97.1"
+PINNED_RUSTC_COMMIT = "8bab26f4f68e0e26f0bb7960be334d5b520ea452"
 
 
 def strict_json(value: bytes) -> dict[str, Any]:
@@ -150,6 +152,8 @@ def sanitized_build_environment(
     cargo_sha256: str,
     git_executable: Path,
     git_sha256: str,
+    rustc_executable: Path,
+    rustc_sha256: str,
     evidence_backend: str = "standard",
     baseline_lock_sha256: str | None = None,
     baseline_manifest_sha256: str | None = None,
@@ -197,12 +201,16 @@ def sanitized_build_environment(
     if (
         not cargo_executable.is_absolute()
         or not git_executable.is_absolute()
+        or not rustc_executable.is_absolute()
         or Path(os.path.realpath(cargo_executable)) != cargo_executable
         or Path(os.path.realpath(git_executable)) != git_executable
+        or Path(os.path.realpath(rustc_executable)) != rustc_executable
         or not is_lower_digest(cargo_sha256)
         or not is_lower_digest(git_sha256)
+        or not is_lower_digest(rustc_sha256)
         or external_tool_hash(cargo_executable) != cargo_sha256
         or external_tool_hash(git_executable) != git_sha256
+        or external_tool_hash(rustc_executable) != rustc_sha256
     ):
         raise GateError("closed Cargo build tool bindings are invalid")
     if evidence_backend == "standard":
@@ -238,6 +246,9 @@ def sanitized_build_environment(
             "CAPTURE_BENCH_CARGO_EXECUTABLE_SHA256": cargo_sha256,
             "CAPTURE_BENCH_GIT_EXECUTABLE": str(git_executable),
             "CAPTURE_BENCH_GIT_EXECUTABLE_SHA256": git_sha256,
+            "CAPTURE_BENCH_RUSTC_EXECUTABLE": str(rustc_executable),
+            "CAPTURE_BENCH_RUSTC_EXECUTABLE_SHA256": rustc_sha256,
+            "RUSTC": str(rustc_executable),
             "CAPTURE_BENCH_PROCESS_GROUP_POLICY": "inherit-outer-v1",
         },
     }
@@ -265,6 +276,7 @@ def validate_current_bindings(bindings: dict[str, Any], current: dict[str, Any])
         "build_support_sha256",
         "cargo_executable_sha256",
         "git_executable_sha256",
+        "rustc_executable_sha256",
         "host_gate_shell_sha256",
         "host_gate_python_sha256",
         "host_gate_process_sha256",
@@ -299,7 +311,7 @@ def resolve_external_tool(name: str, environment: dict[str, str]) -> tuple[Path,
         raise GateError("closed build tool did not resolve to an absolute path")
     rustup_path = shutil.which("rustup", path=environment.get("PATH"))
     rustup = Path(os.path.realpath(rustup_path)) if rustup_path is not None else None
-    rustup_proxy = canonical.name in {"rustup", "rustup.exe"}
+    rustup_proxy = canonical.name.casefold() in {"rustup", "rustup.exe"}
     if rustup is not None:
         try:
             rustup_proxy = rustup_proxy or os.path.samefile(discovered, rustup_path)
@@ -332,10 +344,50 @@ def resolve_external_tool(name: str, environment: dict[str, str]) -> tuple[Path,
         if not resolved_path or "\n" in resolved_path or "\r" in resolved_path:
             raise GateError("rustup returned an ambiguous build tool path")
         canonical = Path(os.path.realpath(resolved_path))
-        expected_names = {name, f"{name}.exe"}
-        if not canonical.is_absolute() or canonical.name not in expected_names:
+        expected_names = {name.casefold(), f"{name}.exe".casefold()}
+        if not canonical.is_absolute() or canonical.name.casefold() not in expected_names:
             raise GateError("rustup did not resolve the requested direct build tool")
     return canonical, external_tool_hash(canonical)
+
+
+def validate_pinned_rustc(rustc: Path, rustc_sha256: str) -> None:
+    if external_tool_hash(rustc) != rustc_sha256:
+        raise GateError("bound Rust compiler changed before identity validation")
+    completed = bounded_process(
+        [str(rustc), "-vV"],
+        executable=rustc,
+        cwd=Path(__file__).resolve().parents[1],
+        env={},
+        timeout_seconds=10,
+        maximum_stdout=4096,
+        maximum_stderr=4096,
+    )
+    if completed.returncode != 0 or completed.stderr:
+        raise GateError("bound Rust compiler identity command failed")
+    try:
+        lines = completed.stdout.decode("utf-8", "strict").splitlines()
+    except UnicodeDecodeError as error:
+        raise GateError("bound Rust compiler identity is not UTF-8") from error
+    fields: dict[str, str] = {}
+    for line in lines[1:]:
+        key, separator, value = line.partition(": ")
+        if not separator or key in fields:
+            raise GateError("bound Rust compiler identity is malformed")
+        fields[key] = value
+    if (
+        not lines
+        or not lines[0].startswith(
+            f"rustc {PINNED_RUSTC_RELEASE} ({PINNED_RUSTC_COMMIT[:9]} "
+        )
+        or not lines[0].endswith(")")
+        or fields.get("binary") != "rustc"
+        or fields.get("commit-hash") != PINNED_RUSTC_COMMIT
+        or fields.get("release") != PINNED_RUSTC_RELEASE
+        or not fields.get("host")
+    ):
+        raise GateError("bound Rust compiler is not the repository-pinned release")
+    if external_tool_hash(rustc) != rustc_sha256:
+        raise GateError("bound Rust compiler changed during identity validation")
 
 
 def run_closed_cargo_build(
@@ -347,8 +399,13 @@ def run_closed_cargo_build(
     wrapper_python: Path | None = None,
 ) -> tuple[bytes, str, str, str]:
     try:
-        if external_tool_hash(cargo_path) != cargo_sha256:
-            raise GateError("closed Cargo executable changed before invocation")
+        rustc_path = Path(environment["CAPTURE_BENCH_RUSTC_EXECUTABLE"])
+        rustc_sha256 = environment["CAPTURE_BENCH_RUSTC_EXECUTABLE_SHA256"]
+        if (
+            external_tool_hash(cargo_path) != cargo_sha256
+            or external_tool_hash(rustc_path) != rustc_sha256
+        ):
+            raise GateError("closed Rust build tool changed before invocation")
         completed = bounded_session_leader_exec(
             [str(cargo_path), *BUILD_COMMAND[1:]],
             executable=cargo_path,
@@ -359,7 +416,12 @@ def run_closed_cargo_build(
             maximum_stdout=MAX_CARGO_JSON_BYTES,
             maximum_stderr=MAX_CARGO_STDERR_BYTES,
         )
-    except (OSError, GateError) as error:
+        if (
+            external_tool_hash(cargo_path) != cargo_sha256
+            or external_tool_hash(rustc_path) != rustc_sha256
+        ):
+            raise GateError("closed Rust build tool changed during invocation")
+    except (KeyError, OSError, GateError) as error:
         raise GateError("closed Cargo build failed to execute within its bounds") from error
     if completed.returncode != 0 or not completed.stdout:
         raise GateError("closed Cargo build failed or emitted no Cargo JSON")
@@ -493,6 +555,7 @@ def recompute_current_bindings(
     repository: Path,
     cargo_sha256: str,
     git_sha256: str,
+    rustc_sha256: str,
     evidence_backend: str = "standard",
 ) -> dict[str, Any]:
     platform = rust_files(repository / "crates/market-squawk-platform/src")
@@ -522,6 +585,7 @@ def recompute_current_bindings(
         ),
         "cargo_executable_sha256": cargo_sha256,
         "git_executable_sha256": git_sha256,
+        "rustc_executable_sha256": rustc_sha256,
         "host_gate_shell_sha256": current_file_hash(
             repository / "scripts/capture_benchmark_host_gate.sh", repository
         ),
@@ -682,6 +746,7 @@ def runner_bindings(executable: Path) -> dict[str, Any]:
         "build_support_sha256",
         "cargo_executable_sha256",
         "git_executable_sha256",
+        "rustc_executable_sha256",
         "host_gate_shell_sha256",
         "host_gate_python_sha256",
         "host_gate_process_sha256",
@@ -884,6 +949,7 @@ def validate_baseline_inputs(
         "build_environment_sha256",
         "cargo_executable_sha256",
         "git_executable_sha256",
+        "rustc_executable_sha256",
         "cargo_json_sha256",
         "source_inventory_sha256",
         "cargo_lock_sha256",
@@ -946,6 +1012,12 @@ def validate_baseline_inputs(
         or lock.get("queue_transport") != manifest.get("queue_transport")
         or lock.get("queue_private_storage_accounting")
         != manifest.get("queue_private_storage_accounting")
+        or not isinstance(manifest.get("tool_sha256"), dict)
+        or any(
+            manifest.get(f"{name}_executable_sha256")
+            != manifest["tool_sha256"].get(f"{name}-executable")
+            for name in ("cargo", "git", "rustc")
+        )
     ):
         raise GateError("tracked baseline lock does not authorize the supplied manifest")
     for field in (
@@ -1001,7 +1073,10 @@ def validate_baseline_inputs(
 
 
 def validate_candidate_current_bindings(
-    baseline: dict[str, Any], current: dict[str, Any], cargo_sha256: str
+    baseline: dict[str, Any],
+    current: dict[str, Any],
+    cargo_sha256: str,
+    rustc_sha256: str,
 ) -> None:
     lock = baseline["lock"]
     current_tools = {
@@ -1025,6 +1100,7 @@ def validate_candidate_current_bindings(
         ],
         "cargo-executable": cargo_sha256,
         "git-executable": current["git_executable_sha256"],
+        "rustc-executable": rustc_sha256,
     }
     if (
         lock["immutable_module_sha256"] != current["immutable_module_sha256"]
@@ -1033,6 +1109,7 @@ def validate_candidate_current_bindings(
         or lock["observer_sha256"] != current["observer_sha256"]
         or lock["tool_sha256"] != current_tools
         or current["cargo_executable_sha256"] != cargo_sha256
+        or current["rustc_executable_sha256"] != rustc_sha256
         or baseline["manifest"]["backend_sha256"] == current["backend_sha256"]
     ):
         raise GateError("candidate harness, tools, or backend distinction failed baseline lock")
@@ -1170,6 +1247,8 @@ def main() -> int:
         ambient_environment = dict(os.environ)
         git_executable, git_sha256 = resolve_external_tool("git", ambient_environment)
         cargo_executable, cargo_sha256 = resolve_external_tool("cargo", ambient_environment)
+        rustc_executable, rustc_sha256 = resolve_external_tool("rustc", ambient_environment)
+        validate_pinned_rustc(rustc_executable, rustc_sha256)
         controlled_root_path = (
             parsed.fixture_controlled_root
             if parsed.evidence_mode == "fixture"
@@ -1225,6 +1304,8 @@ def main() -> int:
                         cargo_sha256,
                         git_executable,
                         git_sha256,
+                        rustc_executable,
+                        rustc_sha256,
                         parsed.benchmark_backend,
                         baseline["lock_sha256"] if baseline is not None else None,
                         baseline["manifest_sha256"] if baseline is not None else None,
@@ -1242,8 +1323,9 @@ def main() -> int:
                 if (
                     observed_command_sha256 != command_sha256
                     or observed_environment_sha256 != environment_sha256
+                    or external_tool_hash(git_executable) != git_sha256
                 ):
-                    raise GateError("closed Cargo build contract changed during invocation")
+                    raise GateError("closed build contract changed during invocation")
                 cargo_artifact, _message = parse_cargo_artifact(cargo_json, repository)
                 executable_bytes = artifact_bytes(cargo_artifact, repository)
                 bindings = runner_bindings(cargo_artifact)
@@ -1266,11 +1348,17 @@ def main() -> int:
                     repository,
                     cargo_sha256,
                     git_sha256,
+                    rustc_sha256,
                     parsed.benchmark_backend,
                 )
                 validate_current_bindings(bindings, current_bindings)
                 if baseline is not None:
-                    validate_candidate_current_bindings(baseline, current_bindings, cargo_sha256)
+                    validate_candidate_current_bindings(
+                        baseline,
+                        current_bindings,
+                        cargo_sha256,
+                        rustc_sha256,
+                    )
                 if parsed.fixture_failure_injection == "after-current-validation":
                     raise GateError("fixture-injected failure after current-tree validation")
                 executable_digest = sha256(executable_bytes)
@@ -1295,6 +1383,7 @@ def main() -> int:
                         "build_environment_sha256": environment_sha256,
                         "cargo_executable_sha256": cargo_sha256,
                         "git_executable_sha256": git_sha256,
+                        "rustc_executable_sha256": rustc_sha256,
                         "executable_path": "./capture_admission_evidence-exe",
                         "executable_sha256": executable_digest,
                         "cargo_json_path": "./capture-bench-build.json",

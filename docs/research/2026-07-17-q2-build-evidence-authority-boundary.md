@@ -13,6 +13,17 @@ direct Rust 1.97.1, locked dependencies, source/fixture/executable hashes, bound
 an independent RSS observer, and paired standard-versus-ring runs under identical conditions. No
 result produced under Rust 1.97.0 or the pre-change standard-channel run is eligible for approval.
 
+Cargo uses `RUSTC` to select the compiler and passes the resolved value to build scripts. Authority
+policy `sanitized-cargo-bench-v2` therefore rejects ambient `RUSTC`, resolves and descriptor-hashes
+the direct rustup-owned compiler, requires Rust 1.97.1 commit
+`8bab26f4f68e0e26f0bb7960be334d5b520ea452`, and deliberately supplies that exact path to Cargo.
+The benchmark package's build script requires the same path and digest, result schema 4 carries the
+compiler digest through the runner and manifest, and preflight requires the measured host's direct
+compiler digest to match. This binds the driver executable without expanding the non-hermetic threat
+claim to its sysroot, linker, SDK, or hostile same-UID mutation. [Cargo environment variables](https://doc.rust-lang.org/cargo/reference/environment-variables.html),
+[rustup proxies](https://rust-lang.github.io/rustup/concepts/proxies.html),
+[Rust 1.97.1](https://blog.rust-lang.org/2026/07/16/Rust-1.97.1/)
+
 The current preparer and host machinery is diagnostic. Its bounded I/O, process cleanup, schema,
 and no-clobber checks are useful engineering controls, but they do not prove a hermetic compiler,
 linker, SDK, dependency, dynamic-loader, or same-UID filesystem boundary. The clean unchanged

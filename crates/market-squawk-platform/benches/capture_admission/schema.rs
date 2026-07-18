@@ -11,7 +11,7 @@ use super::fixture::{
 };
 use std::collections::BTreeMap;
 
-pub(crate) const RESULT_SCHEMA_VERSION: u32 = 3;
+pub(crate) const RESULT_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -630,6 +630,7 @@ pub(crate) struct BuildEvidence {
     pub(crate) build_environment_sha256: String,
     pub(crate) cargo_executable_sha256: String,
     pub(crate) git_executable_sha256: String,
+    pub(crate) rustc_executable_sha256: String,
     pub(crate) git_tree_clean: bool,
     pub(crate) cargo_locked: bool,
     pub(crate) all_features: bool,
@@ -707,11 +708,12 @@ impl BuildEvidence {
                     "--message-format=json-render-diagnostics",
                 ]
             || self.build_environment_policy != super::build_bindings::BUILD_ENVIRONMENT_POLICY
-            || self.build_environment_policy != "sanitized-cargo-bench-v1"
+            || self.build_environment_policy != "sanitized-cargo-bench-v2"
             || self.build_command_sha256 != super::build_bindings::BUILD_COMMAND_SHA256
             || self.build_environment_sha256 != super::build_bindings::BUILD_ENVIRONMENT_SHA256
             || self.cargo_executable_sha256 != super::build_bindings::CARGO_EXECUTABLE_SHA256
             || self.git_executable_sha256 != super::build_bindings::GIT_EXECUTABLE_SHA256
+            || self.rustc_executable_sha256 != super::build_bindings::RUSTC_EXECUTABLE_SHA256
             || !self.git_tree_clean
             || !self.cargo_locked
             || !self.all_features
@@ -768,6 +770,7 @@ impl BuildEvidence {
             &self.build_environment_sha256,
             &self.cargo_executable_sha256,
             &self.git_executable_sha256,
+            &self.rustc_executable_sha256,
             &self.source_inventory_sha256,
             &self.cargo_lock_sha256,
             &self.workspace_manifest_sha256,
@@ -912,6 +915,7 @@ pub(crate) struct BaselineManifest {
     pub(crate) build_environment_sha256: String,
     pub(crate) cargo_executable_sha256: String,
     pub(crate) git_executable_sha256: String,
+    pub(crate) rustc_executable_sha256: String,
     pub(crate) cargo_json_sha256: String,
     pub(crate) source_inventory_sha256: String,
     pub(crate) cargo_lock_sha256: String,
@@ -952,6 +956,7 @@ pub(crate) struct CandidateBaselineExpectation {
     pub(crate) criterion_sha256: String,
     pub(crate) observer_sha256: String,
     pub(crate) tool_sha256: BTreeMap<String, String>,
+    pub(crate) rustc_executable_sha256: String,
     pub(crate) lock: BaselineLock,
 }
 
@@ -963,6 +968,9 @@ pub(crate) struct BaselineCompatibility {
     pub(crate) criterion_evidence_mode: String,
     pub(crate) measured_code_head: String,
     pub(crate) build_evidence_sha256: String,
+    pub(crate) cargo_executable_sha256: String,
+    pub(crate) git_executable_sha256: String,
+    pub(crate) rustc_executable_sha256: String,
     pub(crate) backend: String,
     pub(crate) queue_transport: String,
     pub(crate) queue_private_storage_accounting: String,
@@ -991,6 +999,9 @@ impl From<&BaselineManifest> for BaselineCompatibility {
             criterion_evidence_mode: manifest.criterion_evidence_mode.clone(),
             measured_code_head: manifest.measured_code_head.clone(),
             build_evidence_sha256: manifest.build_evidence_sha256.clone(),
+            cargo_executable_sha256: manifest.cargo_executable_sha256.clone(),
+            git_executable_sha256: manifest.git_executable_sha256.clone(),
+            rustc_executable_sha256: manifest.rustc_executable_sha256.clone(),
             backend: manifest.backend.clone(),
             queue_transport: manifest.queue_transport.clone(),
             queue_private_storage_accounting: manifest.queue_private_storage_accounting.clone(),
@@ -1033,6 +1044,13 @@ pub(crate) fn validate_candidate_baseline_compatibility(
         || baseline.benchmark_support_feature != "capture-benchmark"
         || baseline.fixtures != ["matrix", "comparable_full", "sustained_rss"]
         || baseline.repetitions != [1, 2, 3, 4, 5]
+        || !is_digest(&baseline.cargo_executable_sha256)
+        || !is_digest(&baseline.git_executable_sha256)
+        || baseline.tool_sha256.get("cargo-executable") != Some(&baseline.cargo_executable_sha256)
+        || baseline.tool_sha256.get("git-executable") != Some(&baseline.git_executable_sha256)
+        || !is_digest(&baseline.rustc_executable_sha256)
+        || baseline.rustc_executable_sha256 != expected.rustc_executable_sha256
+        || baseline.tool_sha256.get("rustc-executable") != Some(&baseline.rustc_executable_sha256)
     {
         return Err("candidate baseline authority identity is invalid".to_owned());
     }
@@ -1129,7 +1147,12 @@ pub(crate) fn self_check_candidate_baseline_contracts() -> Result<(), String> {
     let baseline_head = "2".repeat(40);
     let candidate_head = "3".repeat(40);
     let immutable = BTreeMap::from([("fixture".to_owned(), "4".repeat(64))]);
-    let tools = BTreeMap::from([("host-gate".to_owned(), "5".repeat(64))]);
+    let tools = BTreeMap::from([
+        ("host-gate".to_owned(), "5".repeat(64)),
+        ("cargo-executable".to_owned(), "8".repeat(64)),
+        ("git-executable".to_owned(), "9".repeat(64)),
+        ("rustc-executable".to_owned(), "b".repeat(64)),
+    ]);
     let baseline = BaselineCompatibility {
         schema_version: RESULT_SCHEMA_VERSION,
         runner: super::benchmark_identity::EVIDENCE_TARGET.to_owned(),
@@ -1137,6 +1160,9 @@ pub(crate) fn self_check_candidate_baseline_contracts() -> Result<(), String> {
         criterion_evidence_mode: super::benchmark_identity::CRITERION_EVIDENCE_MODE.to_owned(),
         measured_code_head: baseline_head.clone(),
         build_evidence_sha256: "c".repeat(64),
+        cargo_executable_sha256: "8".repeat(64),
+        git_executable_sha256: "9".repeat(64),
+        rustc_executable_sha256: "b".repeat(64),
         backend: "standard".to_owned(),
         queue_transport: "standard_sync_channel".to_owned(),
         queue_private_storage_accounting: "not_measured".to_owned(),
@@ -1201,6 +1227,7 @@ pub(crate) fn self_check_candidate_baseline_contracts() -> Result<(), String> {
         criterion_sha256: baseline.criterion_sha256.clone(),
         observer_sha256: baseline.observer_sha256.clone(),
         tool_sha256: tools,
+        rustc_executable_sha256: baseline.rustc_executable_sha256.clone(),
         lock,
     };
     validate_candidate_baseline_compatibility(&baseline, &expected)?;
@@ -1223,6 +1250,9 @@ pub(crate) fn self_check_candidate_baseline_contracts() -> Result<(), String> {
         .tool_sha256
         .insert("host-gate".to_owned(), "d".repeat(64));
     cases.push((wrong_tool, expected.clone()));
+    let mut wrong_rustc = baseline.clone();
+    wrong_rustc.rustc_executable_sha256 = "f".repeat(64);
+    cases.push((wrong_rustc, expected.clone()));
     let mut matrix_drift = baseline.clone();
     matrix_drift
         .immutable_module_sha256
@@ -1250,7 +1280,7 @@ pub(crate) fn self_check_candidate_baseline_contracts() -> Result<(), String> {
     );
     forged_expected.observed_lock_sha256 = "3".repeat(64);
     cases.push((forged_baseline, forged_expected));
-    if cases.len() != 9
+    if cases.len() != 10
         || cases.into_iter().any(|(baseline, expected)| {
             validate_candidate_baseline_compatibility(&baseline, &expected).is_ok()
         })

@@ -37,6 +37,7 @@ from scripts.capture_benchmark_prepare_build_evidence import (
     sha256,
     strict_json,
     external_tool_hash,
+    validate_pinned_rustc,
     validate_current_bindings,
     validate_baseline_inputs,
     validate_candidate_current_bindings,
@@ -47,11 +48,12 @@ from scripts.capture_benchmark_process import bounded_process
 REPOSITORY = Path(__file__).resolve().parents[2]
 
 
-def host_tool_bindings() -> tuple[Path, str, Path, str]:
+def host_tool_bindings() -> tuple[Path, str, Path, str, Path, str]:
     environment = dict(os.environ)
     cargo, cargo_sha256 = resolve_external_tool("cargo", environment)
     git, git_sha256 = resolve_external_tool("git", environment)
-    return cargo, cargo_sha256, git, git_sha256
+    rustc, rustc_sha256 = resolve_external_tool("rustc", environment)
+    return cargo, cargo_sha256, git, git_sha256, rustc, rustc_sha256
 
 
 def cargo_message(executable: Path) -> dict:
@@ -86,6 +88,7 @@ def binding_value() -> dict:
         "build_support_sha256": "2" * 64,
         "cargo_executable_sha256": "8" * 64,
         "git_executable_sha256": "9" * 64,
+        "rustc_executable_sha256": "7" * 64,
         "host_gate_shell_sha256": "c" * 64,
         "host_gate_python_sha256": "d" * 64,
         "host_gate_process_sha256": "0" * 64,
@@ -135,6 +138,7 @@ def baseline_fixture(current_head: str = "f" * 40) -> tuple[bytes, bytes, dict, 
         "capture_benchmark_prepare_build_evidence.py": "7" * 64,
         "cargo-executable": "8" * 64,
         "git-executable": "9" * 64,
+        "rustc-executable": "7" * 64,
     }
     manifest = {
         "schema_version": RESULT_SCHEMA_VERSION,
@@ -148,8 +152,9 @@ def baseline_fixture(current_head: str = "f" * 40) -> tuple[bytes, bytes, dict, 
         "build_environment_policy": BUILD_ENVIRONMENT_POLICY,
         "build_command_sha256": digest,
         "build_environment_sha256": digest,
-        "cargo_executable_sha256": digest,
+        "cargo_executable_sha256": tools["cargo-executable"],
         "git_executable_sha256": "9" * 64,
+        "rustc_executable_sha256": "7" * 64,
         "cargo_json_sha256": digest,
         "source_inventory_sha256": digest,
         "cargo_lock_sha256": digest,
@@ -226,6 +231,7 @@ def baseline_fixture(current_head: str = "f" * 40) -> tuple[bytes, bytes, dict, 
         "build_support_sha256": tools["build_support.rs"],
         "cargo_executable_sha256": tools["cargo-executable"],
         "git_executable_sha256": tools["git-executable"],
+        "rustc_executable_sha256": tools["rustc-executable"],
         "host_gate_shell_sha256": tools["capture_benchmark_host_gate.sh"],
         "host_gate_python_sha256": tools["capture_benchmark_host_gate.py"],
         "host_gate_process_sha256": tools["capture_benchmark_process.py"],
@@ -300,61 +306,87 @@ def initialize_fixture_repository(root: Path) -> tuple[Path, str]:
 
 
 class BuildEvidenceTest(unittest.TestCase):
-    def test_cargo_resolution_returns_the_direct_cargo_executable(self) -> None:
-        cargo, digest = resolve_external_tool("cargo", dict(os.environ))
+    def test_rustup_resolution_returns_direct_build_executables(self) -> None:
         rustup_path = shutil.which("rustup")
         self.assertIsNotNone(rustup_path)
         rustup = Path(os.path.realpath(rustup_path or ""))
-        completed = bounded_process(
-            [str(cargo), "--version"],
-            cwd=REPOSITORY,
-            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
-            timeout_seconds=10,
-            maximum_stdout=MAX_BINDINGS_BYTES,
-            maximum_stderr=MAX_BINDINGS_BYTES,
-        )
-        self.assertEqual(completed.returncode, 0, completed.stderr.decode(errors="replace"))
-        self.assertTrue(completed.stdout.startswith(b"cargo "), completed.stdout)
-        self.assertFalse(os.path.samefile(cargo, rustup))
-        self.assertEqual(external_tool_hash(cargo), digest)
+        for name in ("cargo", "rustc"):
+            with self.subTest(name=name):
+                executable, digest = resolve_external_tool(name, dict(os.environ))
+                completed = bounded_process(
+                    [str(executable), "--version"],
+                    cwd=REPOSITORY,
+                    env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+                    timeout_seconds=10,
+                    maximum_stdout=MAX_BINDINGS_BYTES,
+                    maximum_stderr=MAX_BINDINGS_BYTES,
+                )
+                self.assertEqual(
+                    completed.returncode, 0, completed.stderr.decode(errors="replace")
+                )
+                self.assertTrue(completed.stdout.startswith(f"{name} ".encode()))
+                self.assertFalse(os.path.samefile(executable, rustup))
+                self.assertEqual(external_tool_hash(executable), digest)
+                if name == "rustc":
+                    validate_pinned_rustc(executable, digest)
 
-    def test_cargo_resolution_detects_a_hard_linked_rustup_proxy(self) -> None:
+    def test_build_tool_resolution_detects_hard_linked_rustup_proxies(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             rustup = root / "rustup"
             rustup.write_bytes(b"rustup-proxy")
-            cargo_proxy = root / "cargo"
-            os.link(rustup, cargo_proxy)
-            direct = root / "toolchain" / "cargo"
-            direct.parent.mkdir()
-            direct.write_bytes(b"direct-cargo")
+            for name in ("cargo", "rustc"):
+                with self.subTest(name=name):
+                    proxy = root / name
+                    os.link(rustup, proxy)
+                    direct = root / "toolchain" / name
+                    direct.parent.mkdir(exist_ok=True)
+                    direct.write_bytes(f"direct-{name}".encode())
+                    completed = subprocess.CompletedProcess(
+                        args=[str(rustup), "which", name],
+                        returncode=0,
+                        stdout=f"{direct}\n".encode(),
+                        stderr=b"",
+                    )
+                    with (
+                        mock.patch(
+                            "scripts.capture_benchmark_prepare_build_evidence.shutil.which",
+                            side_effect=lambda requested, path=None: str(
+                                {name: proxy, "rustup": rustup}[requested]
+                            ),
+                        ),
+                        mock.patch(
+                            "scripts.capture_benchmark_prepare_build_evidence.bounded_process",
+                            return_value=completed,
+                        ) as run,
+                    ):
+                        resolved, digest = resolve_external_tool(
+                            name, {"PATH": str(root), "HOME": str(root)}
+                        )
+                    self.assertEqual(resolved, Path(os.path.realpath(direct)))
+                    self.assertEqual(digest, external_tool_hash(direct))
+                    self.assertEqual(
+                        run.call_args.args[0],
+                        [str(Path(os.path.realpath(rustup))), "which", name],
+                    )
+
+    def test_pinned_rustc_identity_rejects_a_different_release(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            rustc = Path(temporary) / "rustc"
+            rustc.write_bytes(b"bound-rustc")
+            digest = external_tool_hash(rustc)
             completed = subprocess.CompletedProcess(
-                args=[str(rustup), "which", "cargo"],
+                args=[str(rustc), "-vV"],
                 returncode=0,
-                stdout=f"{direct}\n".encode(),
+                stdout=b"rustc 1.96.0 (different 2026-01-01)\nrelease: 1.96.0\n",
                 stderr=b"",
             )
-            with (
-                mock.patch(
-                    "scripts.capture_benchmark_prepare_build_evidence.shutil.which",
-                    side_effect=lambda name, path=None: str(
-                        {"cargo": cargo_proxy, "rustup": rustup}[name]
-                    ),
-                ),
-                mock.patch(
-                    "scripts.capture_benchmark_prepare_build_evidence.bounded_process",
-                    return_value=completed,
-                ) as run,
+            with mock.patch(
+                "scripts.capture_benchmark_prepare_build_evidence.bounded_process",
+                return_value=completed,
             ):
-                resolved, digest = resolve_external_tool(
-                    "cargo", {"PATH": str(root), "HOME": str(root)}
-                )
-            self.assertEqual(resolved, Path(os.path.realpath(direct)))
-            self.assertEqual(digest, external_tool_hash(direct))
-            self.assertEqual(
-                run.call_args.args[0],
-                [str(Path(os.path.realpath(rustup))), "which", "cargo"],
-            )
+                with self.assertRaises(GateError):
+                    validate_pinned_rustc(rustc, digest)
 
     def test_backend_binding_has_canonical_golden_vectors(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -639,15 +671,31 @@ class BuildEvidenceTest(unittest.TestCase):
             home = root / "home"
             repository.mkdir()
             home.mkdir()
+            tools = host_tool_bindings()
             environment, command_digest, environment_digest = sanitized_build_environment(
                 repository,
                 {"PATH": "/usr/bin:/bin", "HOME": str(home), "IGNORED_SECRET": "secret"},
-                *host_tool_bindings(),
+                *tools,
             )
             self.assertEqual(command_digest, sha256(canonical_json(list(BUILD_COMMAND))))
             self.assertEqual(environment["CAPTURE_BENCH_BUILD_POLICY"], BUILD_ENVIRONMENT_POLICY)
             self.assertEqual(environment["CAPTURE_BENCH_BUILD_ENV_SHA256"], environment_digest)
+            self.assertEqual(environment["RUSTC"], str(tools[4]))
+            self.assertEqual(
+                environment["CAPTURE_BENCH_RUSTC_EXECUTABLE_SHA256"],
+                tools[5],
+            )
             self.assertNotIn("IGNORED_SECRET", environment)
+            with self.assertRaises(GateError):
+                sanitized_build_environment(
+                    repository,
+                    {
+                        "PATH": "/usr/bin:/bin",
+                        "HOME": str(home),
+                        "RUSTC": str(tools[4]),
+                    },
+                    *tools,
+                )
 
     def test_sanitized_environment_rejects_profile_override(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -712,6 +760,7 @@ class BuildEvidenceTest(unittest.TestCase):
             "build_support_sha256",
             "cargo_executable_sha256",
             "git_executable_sha256",
+            "rustc_executable_sha256",
             "host_gate_shell_sha256",
             "host_gate_python_sha256",
             "host_gate_process_sha256",
@@ -821,10 +870,14 @@ class BuildEvidenceTest(unittest.TestCase):
                 elif case == "same_backend":
                     current["backend_sha256"] = manifest["backend_sha256"]
                 if case == "success":
-                    validate_candidate_current_bindings(baseline, current, "8" * 64)
+                    validate_candidate_current_bindings(
+                        baseline, current, "8" * 64, "7" * 64
+                    )
                 else:
                     with self.assertRaises(GateError):
-                        validate_candidate_current_bindings(baseline, current, "8" * 64)
+                        validate_candidate_current_bindings(
+                            baseline, current, "8" * 64, "7" * 64
+                        )
 
     def test_closed_cargo_policy_matrix(self) -> None:
         cases = (
@@ -836,6 +889,8 @@ class BuildEvidenceTest(unittest.TestCase):
             "sustained_stdout_terminated_at_cap",
             "timeout_rejected",
             "exited_parent_with_inherited_pipe_child_reaped",
+            "compiler_digest_mismatch_rejected",
+            "compiler_mutation_rejected",
             "missing_cargo_rejected",
         )
         with tempfile.TemporaryDirectory() as temporary:
@@ -849,6 +904,8 @@ class BuildEvidenceTest(unittest.TestCase):
                     binary = root / case / "bin"
                     binary.mkdir(parents=True)
                     record = root / case / "record"
+                    rustc = binary / "rustc"
+                    rustc.write_bytes(b"bound-rustc")
                     environment = {
                         "PATH": str(binary),
                         "HOME": str(home),
@@ -856,8 +913,14 @@ class BuildEvidenceTest(unittest.TestCase):
                         "CAPTURE_BENCH_BUILD_ENV_SHA256": "b" * 64,
                         "CAPTURE_BENCH_BUILD_POLICY": BUILD_ENVIRONMENT_POLICY,
                         "CAPTURE_BENCH_PROCESS_GROUP_POLICY": "inherit-outer-v1",
+                        "CAPTURE_BENCH_RUSTC_EXECUTABLE": str(rustc),
+                        "CAPTURE_BENCH_RUSTC_EXECUTABLE_SHA256": external_tool_hash(
+                            rustc
+                        ),
                         "FAKE_CARGO_RECORD": str(record),
                     }
+                    if case == "compiler_digest_mismatch_rejected":
+                        environment["CAPTURE_BENCH_RUSTC_EXECUTABLE_SHA256"] = "0" * 64
                     cargo = binary / "cargo"
                     if case != "missing_cargo_rejected":
                         body = "printf '{}\\n'\n"
@@ -894,6 +957,11 @@ class BuildEvidenceTest(unittest.TestCase):
                                 "/bin/sleep 30 &\n"
                                 'printf \'%s\\n\' "$!" > "$FAKE_CARGO_RECORD"\n'
                                 "exit 0\n"
+                            )
+                        elif case == "compiler_mutation_rejected":
+                            body = (
+                                "printf 'mutated' > \"$CAPTURE_BENCH_RUSTC_EXECUTABLE\"\n"
+                                "printf '{}\\n'\n"
                             )
                         cargo.write_text("#!/bin/sh\n" + body)
                         os.chmod(cargo, 0o700)
@@ -1060,6 +1128,22 @@ class BuildEvidenceTest(unittest.TestCase):
         os.chmod(cargo, 0o700)
         cargo = Path(os.path.realpath(cargo))
         cargo_sha256 = external_tool_hash(cargo)
+        rustc = binary / "rustc"
+        rustc.write_text(
+            "#!/bin/sh\n"
+            "cat <<'EOF'\n"
+            "rustc 1.97.1 (8bab26f4f 2026-07-14)\n"
+            "binary: rustc\n"
+            "commit-hash: 8bab26f4f68e0e26f0bb7960be334d5b520ea452\n"
+            "commit-date: 2026-07-14\n"
+            "host: fixture-target\n"
+            "release: 1.97.1\n"
+            "LLVM version: fixture\n"
+            "EOF\n"
+        )
+        os.chmod(rustc, 0o700)
+        rustc = Path(os.path.realpath(rustc))
+        rustc_sha256 = external_tool_hash(rustc)
         git = Path(os.path.realpath(shutil.which("git", path=environment["PATH"]) or ""))
         git_sha256 = external_tool_hash(git)
         build_environment, command_digest, environment_digest = sanitized_build_environment(
@@ -1069,9 +1153,15 @@ class BuildEvidenceTest(unittest.TestCase):
             cargo_sha256,
             git,
             git_sha256,
+            rustc,
+            rustc_sha256,
         )
         value = binding_value()
-        value.update(recompute_current_bindings(repository, cargo_sha256, git_sha256))
+        value.update(
+            recompute_current_bindings(
+                repository, cargo_sha256, git_sha256, rustc_sha256
+            )
+        )
         value["measured_code_head"] = head
         value["build_command_sha256"] = command_digest
         value["build_environment_sha256"] = environment_digest

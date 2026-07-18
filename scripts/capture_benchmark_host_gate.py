@@ -42,6 +42,7 @@ if __package__:
         remove_execution_runner,
         require_measured_file_binding,
         verify_authority_module_bindings,
+        verify_build_tool_identities,
         verify_execution_contract,
     )
     from .capture_benchmark_host_observation import (
@@ -93,6 +94,7 @@ else:
         remove_execution_runner,
         require_measured_file_binding,
         verify_authority_module_bindings,
+        verify_build_tool_identities,
         verify_execution_contract,
     )
     from capture_benchmark_host_observation import (
@@ -247,6 +249,8 @@ def preflight(
             raise GateError("fixture-injected interruption after owner publication")
         output = root.open_directory(root.relative(output_path), create_final=True)
         observed = observe(root, fixture, "preflight", mode, contract)
+        if mode == PRODUCTION_MODE and contract is not None:
+            verify_build_tool_identities(contract, observed["stable_toolchain"])
         observed["phase"] = "preflight"
         observed["lock_nonce_sha256"] = digest_bytes(owner["nonce"].encode())
         observed["lock_identity"] = {

@@ -125,7 +125,9 @@ def is_git_head(value: object) -> bool:
     )
 
 
-def validate_tool_identity(value: object) -> bool:
+def validate_tool_identity(
+    value: object, *, allow_source_hardlinks: bool = False
+) -> bool:
     if not isinstance(value, dict) or value.get("state") not in {"available", "unavailable"}:
         return False
     if value["state"] == "unavailable":
@@ -155,7 +157,9 @@ def validate_tool_identity(value: object) -> bool:
     strategy_valid = (
         strategy == "trusted-direct" and uid == 0
     ) or (
-        strategy == "ephemeral-copy" and uid == os.getuid() and nlink == 1
+        strategy == "ephemeral-copy"
+        and uid == os.getuid()
+        and (nlink == 1 or allow_source_hardlinks)
     ) or (
         strategy == "current-process" and uid in {0, os.getuid()}
     )
@@ -221,7 +225,12 @@ def validate_stable_toolchain(value: object, evidence_mode: str) -> bool:
     if (
         not isinstance(identities, dict)
         or tuple(sorted(identities)) != TOOL_NAMES
-        or not all(validate_tool_identity(identity) for identity in identities.values())
+        or not all(
+            validate_tool_identity(
+                identity, allow_source_hardlinks=name == "rustup"
+            )
+            for name, identity in identities.items()
+        )
         or not all(
             isinstance(value[field], str) and bool(value[field])
             for field in ("rustc", "cargo", "target")
@@ -289,7 +298,12 @@ def validate_tool_executions(value: object, identities: object) -> bool:
         or not 0 < len(value) <= MAX_TOOL_EXECUTIONS
         or not isinstance(identities, dict)
         or tuple(sorted(identities)) != TOOL_NAMES
-        or not all(validate_tool_identity(identity) for identity in identities.values())
+        or not all(
+            validate_tool_identity(
+                identity, allow_source_hardlinks=name == "rustup"
+            )
+            for name, identity in identities.items()
+        )
     ):
         return False
     counts = {name: 0 for name in TOOL_NAMES}

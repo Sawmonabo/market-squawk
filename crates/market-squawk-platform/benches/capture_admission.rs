@@ -376,6 +376,7 @@ fn finalize(
         build_environment_sha256: build_evidence.build_environment_sha256.clone(),
         cargo_executable_sha256: build_evidence.cargo_executable_sha256.clone(),
         git_executable_sha256: build_evidence.git_executable_sha256.clone(),
+        rustc_executable_sha256: build_evidence.rustc_executable_sha256.clone(),
         cargo_json_sha256: build_evidence.cargo_json_sha256.clone(),
         source_inventory_sha256: build_bindings::SOURCE_INVENTORY_SHA256.to_owned(),
         cargo_lock_sha256: build_bindings::CARGO_LOCK_SHA256.to_owned(),
@@ -588,6 +589,7 @@ fn validate_baseline_manifest(
         criterion_sha256: build_evidence.criterion_sha256.clone(),
         observer_sha256: build_evidence.observer_sha256.clone(),
         tool_sha256: tool_sha256(build_evidence),
+        rustc_executable_sha256: build_evidence.rustc_executable_sha256.clone(),
         lock,
     };
     validate_candidate_baseline_compatibility(&BaselineCompatibility::from(&manifest), &expected)?;
@@ -649,6 +651,10 @@ fn tool_sha256(build_evidence: &BuildEvidence) -> BTreeMap<String, String> {
             "git-executable",
             build_evidence.git_executable_sha256.clone(),
         ),
+        (
+            "rustc-executable",
+            build_evidence.rustc_executable_sha256.clone(),
+        ),
     ]
     .into_iter()
     .map(|(name, digest)| (name.to_owned(), digest))
@@ -681,6 +687,7 @@ fn print_build_bindings() -> Result<(), Box<dyn Error>> {
         "build_support_sha256": build_bindings::BUILD_SUPPORT_SHA256,
         "cargo_executable_sha256": build_bindings::CARGO_EXECUTABLE_SHA256,
         "git_executable_sha256": build_bindings::GIT_EXECUTABLE_SHA256,
+        "rustc_executable_sha256": build_bindings::RUSTC_EXECUTABLE_SHA256,
         "host_gate_shell_sha256": build_bindings::HOST_GATE_SHELL_SHA256,
         "host_gate_python_sha256": build_bindings::HOST_GATE_PYTHON_SHA256,
         "host_gate_process_sha256": build_bindings::HOST_GATE_PROCESS_SHA256,

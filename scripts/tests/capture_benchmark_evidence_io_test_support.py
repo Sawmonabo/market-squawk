@@ -17,7 +17,7 @@ PROFILE = (
     "cargo-bench-inherits-release:opt-level=3:lto=thin:codegen-units=1:"
     "panic=abort:strip=symbols"
 )
-RUNNER_SCHEMA_VERSION = 3
+RUNNER_SCHEMA_VERSION = 4
 BUILD_COMMAND = [
     "cargo",
     "bench",
@@ -45,6 +45,7 @@ RUNNER_BINDING_FIELDS = {
     "build_environment_sha256",
     "cargo_executable_sha256",
     "git_executable_sha256",
+    "rustc_executable_sha256",
     "source_inventory_sha256",
     "cargo_lock_sha256",
     "workspace_manifest_sha256",
@@ -161,11 +162,12 @@ def benchmark_artifacts(
         "measured_code_head": ("2" if candidate else "1") * 40,
         "clean_build_enforced": True,
         "build_command": BUILD_COMMAND,
-        "build_environment_policy": "sanitized-cargo-bench-v1",
+        "build_environment_policy": "sanitized-cargo-bench-v2",
         "build_command_sha256": digest,
         "build_environment_sha256": digest,
         "cargo_executable_sha256": digest,
         "git_executable_sha256": digest,
+        "rustc_executable_sha256": digest,
         "git_tree_clean": True,
         "cargo_locked": True,
         "all_features": True,
