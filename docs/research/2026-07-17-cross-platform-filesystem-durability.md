@@ -197,6 +197,30 @@ keeps Market Squawk's workspace-wide `unsafe_code = "forbid"` policy intact, and
 general Win32 API surface. The wrapper owns its FFI safety boundary; Market Squawk still owns all
 catalog-specific authority, endpoint, close-before-publish, and identity checks.
 
+Neither Microsoft's `MoveFileExW` page nor the safe wrapper is treated as a formal guarantee of
+atomic visibility for every Windows filesystem and filter-driver combination. Market Squawk claims
+the narrower documented contract: same-volume no-clobber publication that returns only after the
+requested write-through move completes. A published backup is usable only after exact-file
+identity, the exact size and SHA-256 in its pathless `BackupReceipt`, and SQLite integrity
+validation. Backup verification requires that receipt and repeats the root/file identity, size,
+digest, application identity, migration identity, foreign-key, and SQLite integrity checks before
+the artifact can be used for restore. `ReplaceFileW` is not a substitute because this API
+deliberately publishes to a previously absent destination rather than overwriting an existing file.
+The wrapper's unresolved
+[`MoveFileEx` atomicity issue](https://github.com/untitaker/rust-atomicwrites/issues/27) is therefore
+tracked as a reason not to claim a stronger guarantee.
+
+The exact wrapper release has no declared MSRV, its last release and repository code activity were
+in 2024, and its upstream CI does not exercise Windows. It is admitted despite that maintenance
+gap because its small exact-pinned safe API is the only reviewed option that preserves arbitrary
+Windows `Path` values and the required flags without weakening the unsafe-code policy. The more
+active `winsafe` 0.0.28 wrapper accepts only UTF-8 `&str` paths. Exact Rust 1.97.1 Windows build
+evidence is therefore a release gate for this dependency. The ambient-path call also cannot close
+the hostile same-user parent-substitution race by itself; the retained root capability,
+cross-process writer exclusion, immediate root/endpoint revalidation, unpredictable prepared name,
+and fail-closed receipt verification bound that residual risk. This primitive remains prohibited
+for in-place replacement of the authoritative catalog.
+
 The Windows implementation must close every write-capable SQLite and prepared-file handle before
 publication, retain the destination writer exclusion for the whole operation, reject reparse or
 non-regular endpoints, and validate that the published file is the prepared file. It must not
