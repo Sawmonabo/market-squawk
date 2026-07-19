@@ -953,7 +953,7 @@ changes.
 
 ```bash
 cargo test --manifest-path crates/market-squawk-data/Cargo.toml --test catalog
-cargo test -p market-squawk-platform --test secrets --locked
+cargo test -p market-squawk-platform --all-features --locked
 ```
 
 Expected: FAIL because the data package, migrations, catalog and secret provider do not exist.
@@ -963,10 +963,11 @@ Expected: FAIL because the data package, migrations, catalog and secret provider
 Use prepared statements, checked transactions, a process-local non-clone writer permit, row and byte
 bounded queries/results, a lowered SQLite value-length limit, exact UTC nanoseconds, rollback-
 rejecting catalog authority time, immutable audits and typed conflicts. Application composition
-alone receives the non-clone rights registrar with the writer-open result; adapters provide
-untrusted evidence but cannot construct an admitted grant. Resolve the durable private grant inside
-the reservation transaction and evaluate expiry against catalog-observed admission time. Extraction
-output cannot grant itself persistence. Crash recovery must return a freshly sealed reservation
+alone receives the non-clone `CatalogAuthority`; its rights registrar remains private and sealed
+inside that writer-open owner. Adapters provide untrusted evidence but cannot construct an admitted
+grant. Resolve the durable private grant inside the reservation transaction and evaluate expiry
+against catalog-observed admission time. Extraction output cannot grant itself persistence. Crash
+recovery must return a freshly sealed reservation
 only after validating the retained run and rights row, recover existing publication metadata, and
 make semantic artifact/manifest replay idempotent across restart. Backup errors never promote
 visible content to durable success and carry a versioned path-free receipt for reconciliation.
@@ -998,7 +999,7 @@ Argon2's convenience allocator because that does not wipe the complete memory ar
 
 ```bash
 cargo test --manifest-path crates/market-squawk-data/Cargo.toml --all-features --locked
-cargo test -p market-squawk-platform --test secrets --locked
+cargo test -p market-squawk-platform --all-features --locked
 cargo clippy --manifest-path crates/market-squawk-data/Cargo.toml \
   --all-targets --all-features --locked -- -D warnings
 cargo clippy -p market-squawk-platform --all-targets --all-features --locked -- -D warnings
