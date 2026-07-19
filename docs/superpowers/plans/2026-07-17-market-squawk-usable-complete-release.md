@@ -907,26 +907,21 @@ Expected: all focused gates pass and the clean commit exposes the frozen interfa
 
 ```rust
 pub struct Catalog;
-pub struct OpenedCatalog;
+pub struct CatalogAuthority;
 pub struct IngestReservation;
 pub struct RegisteredRightsGrant;
-pub struct RightsRegistrar;
 pub trait SecretStore {
     fn store(&self, key: &SecretKey, value: SecretValue) -> Result<(), SecretError>;
     fn load(&self, key: &SecretKey) -> Result<SecretValue, SecretError>;
 }
-impl OpenedCatalog {
+impl CatalogAuthority {
     pub fn open(config: CatalogConfig) -> Result<Self, CatalogError>;
-    pub fn catalog(&self) -> &Catalog;
-    pub fn registrar(&self) -> &RightsRegistrar;
-    pub fn into_parts(self) -> (Catalog, RightsRegistrar);
-}
-impl Catalog {
     pub fn admit_source_rights(
         &self,
-        registrar: &RightsRegistrar,
         command: RightsRegistrationCommand,
     ) -> Result<RegisteredRightsGrant, CatalogError>;
+}
+impl Catalog {
     pub fn reserve_ingest(
         &self,
         request: &IngestIdentity,
