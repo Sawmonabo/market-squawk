@@ -890,6 +890,9 @@ Expected: all focused gates pass and the clean commit exposes the frozen interfa
 - Integration owner modify: `crates/market-squawk-platform/Cargo.toml`
 - Modify: `crates/market-squawk-platform/src/lib.rs`
 - Modify: `crates/market-squawk-platform/src/authority_state.rs`
+- Create: `crates/market-squawk-platform/src/authority_state/envelope.rs`
+- Create: `crates/market-squawk-platform/src/authority_state/filesystem.rs`
+- Create: `crates/market-squawk-platform/src/authority_state/recovery.rs`
 - Modify: `crates/market-squawk-platform/src/paths.rs`
 - Create: `crates/market-squawk-platform/src/paths/catalog.rs`
 - Create: `crates/market-squawk-platform/src/secrets.rs`

@@ -664,6 +664,9 @@
       "paths": [
         "crates/market-squawk-platform/src/lib.rs",
         "crates/market-squawk-platform/src/authority_state.rs",
+        "crates/market-squawk-platform/src/authority_state/envelope.rs",
+        "crates/market-squawk-platform/src/authority_state/filesystem.rs",
+        "crates/market-squawk-platform/src/authority_state/recovery.rs",
         "crates/market-squawk-platform/src/config.rs",
         "crates/market-squawk-platform/src/config/instruments.rs",
         "crates/market-squawk-platform/src/paths.rs",
