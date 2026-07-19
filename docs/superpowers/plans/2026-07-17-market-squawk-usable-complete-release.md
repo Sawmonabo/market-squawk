@@ -916,6 +916,7 @@ pub trait SecretStore {
 }
 impl CatalogAuthority {
     pub fn open(config: CatalogConfig) -> Result<Self, CatalogError>;
+    pub fn catalog(&self) -> &Catalog;
     pub fn admit_source_rights(
         &self,
         command: RightsRegistrationCommand,
