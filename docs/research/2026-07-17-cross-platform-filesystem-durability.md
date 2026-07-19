@@ -191,11 +191,12 @@ are documented by
 
 The selected safe Rust boundary is the exact-pinned MIT-licensed `atomicwrites` 0.4.4
 [`move_atomic`](https://docs.rs/crate/atomicwrites/0.4.4/source/src/lib.rs) function, admitted only
-for Windows builds of the data crate. Its audited Windows implementation accepts `Path` values and
-invokes `MoveFileExW` with `MOVEFILE_WRITE_THROUGH` alone. This preserves Windows path encoding,
-keeps Market Squawk's workspace-wide `unsafe_code = "forbid"` policy intact, and avoids exposing a
-general Win32 API surface. The wrapper owns its FFI safety boundary; Market Squawk still owns all
-catalog-specific authority, endpoint, close-before-publish, and identity checks.
+for Windows builds of the data and platform crates. Its audited Windows implementation accepts
+`Path` values and invokes `MoveFileExW` with `MOVEFILE_WRITE_THROUGH` alone. This preserves Windows
+path encoding, keeps Market Squawk's workspace-wide `unsafe_code = "forbid"` policy intact, and
+avoids exposing a general Win32 API surface. The wrapper owns its FFI safety boundary; Market
+Squawk still owns every domain-specific authority, endpoint, close-before-publish, identity, and
+recovery check.
 
 Neither Microsoft's `MoveFileExW` page nor the safe wrapper is treated as a formal guarantee of
 atomic visibility for every Windows filesystem and filter-driver combination. Market Squawk claims
@@ -219,7 +220,8 @@ evidence is therefore a release gate for this dependency. The ambient-path call 
 the hostile same-user parent-substitution race by itself; the retained root capability,
 cross-process writer exclusion, immediate root/endpoint revalidation, unpredictable prepared name,
 and fail-closed receipt verification bound that residual risk. This primitive remains prohibited
-for in-place replacement of the authoritative catalog.
+for in-place replacement of a sole authoritative catalog, secret vault, or control-plane state
+file.
 
 The Windows implementation must close every write-capable SQLite and prepared-file handle before
 publication, retain the destination writer exclusion for the whole operation, reject reparse or
@@ -227,6 +229,49 @@ non-regular endpoints, and validate that the published file is the prepared file
 substitute a best-effort `rename`, hard-link sequence, ignored directory-flush error, or overwrite
 operation while advertising the same durability and no-clobber contract. Unix retains its
 same-directory publication followed by a real parent-directory synchronization.
+
+### Windows authority-state generations
+
+The encrypted secret fallback and other authority-state consumers use a stricter retained-
+generation protocol. A single `replace_atomic` call is not accepted as proof for authoritative
+state: it adds `MOVEFILE_REPLACE_EXISTING` and `MOVEFILE_WRITE_THROUGH`, but neither Microsoft nor
+the wrapper establishes atomic visibility on every Windows filesystem/filter combination. Losing
+the sole old name before post-publication verification would make recovery depend on precisely the
+stronger guarantee Market Squawk does not claim.
+
+The authority store therefore retains two bounded immutable slots. Each authenticated envelope
+binds its generation, payload digest, and predecessor identity. For every acknowledged logical
+update, the store writes and synchronizes a same-directory temporary candidate, installs and
+reopens it in the inactive slot while the other known-good slot survives, then installs and verifies
+the same submitted logical payload as a new linked generation in the former active slot. Success is
+returned only when both slots hold that logical payload. First creation uses no-clobber
+`move_atomic`; replacement is permitted only for the inactive slot while the other verified slot is
+retained, so replacement atomicity is never the recovery proof. Opening the store scans only those
+fixed slots and selects the highest valid linked generation; a corrupt, torn, or missing slot does
+not erase the other valid generation. An interrupted second installation returns a typed recovery-
+required outcome and latches ordinary reads/writes until the verified newer slot repairs its peer.
+Startup rejects unrelated valid heads, non-successor generations, generation overflow, unsafe
+entries, and every ambiguous chain. Loads, stores, recovery, and cleanup share the store's lifetime
+lock and in-process serialization so an intermediate publication is never treated as a completed
+authority transition.
+
+The vault adds a keyed whole-context authenticator covering its version, phase, set roles, and full
+canonical entry membership, as well as the sealed authority generation and predecessor supplied
+before vault serialization. Prepared and committed states carry independently verifiable context
+tags under both permitted unlocks. Per-entry AEAD plus an unkeyed envelope digest cannot detect
+entry deletion, cross-phase substitution, or replayed membership under the same unlock. A hostile
+actor who can replace both slots with an older internally valid pair is outside the rollback
+guarantee of a local-files-only store; preventing that requires an independently protected monotonic
+anchor. Ordinary corruption or loss of either slot remains recoverable without such an external
+service.
+
+`RotationOutcome::Complete` is returned only after the final stable vault has been durably installed
+and authenticated in both slots, so no valid retained generation still contains prior-unlock
+recovery ciphertext. Failure after the first stable slot is admitted remains
+`RotationFinalizationPending`; recovery uses the highest valid generation and completes retirement
+before the prior unlock may be discarded. This protocol uses
+`atomicwrites::move_atomic` only as a lossless-path, no-clobber, write-through publication primitive,
+not as an unsupported atomic-visibility claim.
 
 ## Authority-state root safety
 

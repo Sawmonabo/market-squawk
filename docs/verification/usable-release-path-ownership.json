@@ -663,6 +663,7 @@
       "tasks": [2, 3, 19],
       "paths": [
         "crates/market-squawk-platform/src/lib.rs",
+        "crates/market-squawk-platform/src/authority_state.rs",
         "crates/market-squawk-platform/src/config.rs",
         "crates/market-squawk-platform/src/config/instruments.rs",
         "crates/market-squawk-platform/src/paths.rs",
@@ -673,6 +674,7 @@
         "crates/market-squawk-platform/src/secrets/keyring.rs",
         "crates/market-squawk-platform/src/audit_journal.rs",
         "crates/market-squawk-platform/src/observability.rs",
+        "crates/market-squawk-platform/tests/authority_state.rs",
         "crates/market-squawk-platform/tests/secrets.rs",
         "crates/market-squawk-platform/tests/config_precedence.rs",
         "crates/market-squawk-platform/tests/operations_policy.rs"

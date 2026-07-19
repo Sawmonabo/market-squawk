@@ -877,6 +877,11 @@ Expected: all focused gates pass and the clean commit exposes the frozen interfa
 - Integration owner create: `crates/market-squawk-data/Cargo.toml`
 - Create: `crates/market-squawk-data/src/lib.rs`
 - Create: `crates/market-squawk-data/src/catalog.rs`
+- Create: `crates/market-squawk-data/src/catalog/publication.rs`
+- Create: `crates/market-squawk-data/src/catalog/records.rs`
+- Create: `crates/market-squawk-data/src/catalog/runs.rs`
+- Create: `crates/market-squawk-data/src/catalog/storage.rs`
+- Create: `crates/market-squawk-data/src/catalog/types.rs`
 - Integration owner create: `crates/market-squawk-data/src/migrations.rs`
 - Create: `crates/market-squawk-data/src/rights.rs`
 - Create: `crates/market-squawk-data/tests/catalog.rs`
@@ -884,7 +889,14 @@ Expected: all focused gates pass and the clean commit exposes the frozen interfa
 - Create: `crates/market-squawk-data/migrations/0002_instruments.sql`
 - Integration owner modify: `crates/market-squawk-platform/Cargo.toml`
 - Modify: `crates/market-squawk-platform/src/lib.rs`
+- Modify: `crates/market-squawk-platform/src/authority_state.rs`
+- Modify: `crates/market-squawk-platform/src/paths.rs`
+- Create: `crates/market-squawk-platform/src/paths/catalog.rs`
 - Create: `crates/market-squawk-platform/src/secrets.rs`
+- Create: `crates/market-squawk-platform/src/secrets/crypto.rs`
+- Create: `crates/market-squawk-platform/src/secrets/encrypted.rs`
+- Create: `crates/market-squawk-platform/src/secrets/keyring.rs`
+- Modify: `crates/market-squawk-platform/tests/authority_state.rs`
 - Create: `crates/market-squawk-platform/tests/secrets.rs`
 
 **Interfaces:**
@@ -895,18 +907,30 @@ Expected: all focused gates pass and the clean commit exposes the frozen interfa
 
 ```rust
 pub struct Catalog;
+pub struct OpenedCatalog;
 pub struct IngestReservation;
-pub struct SourceRightsDecision;
+pub struct RegisteredRightsGrant;
+pub struct RightsRegistrar;
 pub trait SecretStore {
     fn store(&self, key: &SecretKey, value: SecretValue) -> Result<(), SecretError>;
     fn load(&self, key: &SecretKey) -> Result<SecretValue, SecretError>;
 }
-impl Catalog {
+impl OpenedCatalog {
     pub fn open(config: CatalogConfig) -> Result<Self, CatalogError>;
+    pub fn catalog(&self) -> &Catalog;
+    pub fn registrar(&self) -> &RightsRegistrar;
+    pub fn into_parts(self) -> (Catalog, RightsRegistrar);
+}
+impl Catalog {
+    pub fn admit_source_rights(
+        &self,
+        registrar: &RightsRegistrar,
+        command: RightsRegistrationCommand,
+    ) -> Result<RegisteredRightsGrant, CatalogError>;
     pub fn reserve_ingest(
         &self,
         request: &IngestIdentity,
-        rights: &SourceRightsDecision,
+        grant: &RegisteredRightsGrant,
     ) -> Result<IngestReservation, CatalogError>;
 }
 ```
@@ -914,13 +938,20 @@ impl Catalog {
 Rights bind source, payload digest, retrieval time, exact terms URL/digest, authorization evidence/
 expiry and permitted retrieve/display/persist/cache/redistribute/train operations.
 
-- [ ] **Step 1: Write two thin failing catalog/rights and secret-store integrations**
+- [ ] **Step 1: Extend only the thin catalog/rights, secret-store, and existing authority-state
+      integrations with critical behavioral proofs**
 
 Test `foreign_keys=ON`, `trusted_schema=OFF`, `synchronous=FULL`, bounded busy timeout, local-only WAL,
 digest-bound ordered migrations, integrity/foreign-key checks, one writer, crash restart, backup/
 restore, idempotency conflict, durable instruments/identifiers/symbol history/mergers/delistings/rolls/
 corporate actions, operation mismatch/expiry, keyring success, and Argon2id + XChaCha20-Poly1305
-fallback whose unlock secret is never stored beside ciphertext.
+fallback whose unlock secret is never stored beside ciphertext. Do not add another test file or
+near-duplicate test case. Extend the existing catalog sequence once for durable rights resolution,
+reserve -> publish -> restart -> resume -> semantic replay -> complete, and one oversized-result
+budget failure. Extend the existing secret sequence once for stable two-slot retirement and
+single-slot recovery, whole-state tamper rejection, and interrupted-peer repair before ordinary
+access. Update the existing authority-state assertions only where the generational on-disk contract
+changes.
 
 - [ ] **Step 2: Run RED**
 
@@ -933,19 +964,38 @@ Expected: FAIL because the data package, migrations, catalog and secret provider
 
 - [ ] **Step 3: Implement strict catalog and rights admission**
 
-Use prepared statements, checked transactions, a process-local non-clone writer permit, bounded
-queries/results, exact UTC nanoseconds, immutable audits and typed conflicts. Reserve an ingest only
-after the requested operation is authorized; extraction output cannot grant itself persistence.
+Use prepared statements, checked transactions, a process-local non-clone writer permit, row and byte
+bounded queries/results, a lowered SQLite value-length limit, exact UTC nanoseconds, rollback-
+rejecting catalog authority time, immutable audits and typed conflicts. Application composition
+alone receives the non-clone rights registrar with the writer-open result; adapters provide
+untrusted evidence but cannot construct an admitted grant. Resolve the durable private grant inside
+the reservation transaction and evaluate expiry against catalog-observed admission time. Extraction
+output cannot grant itself persistence. Crash recovery must return a freshly sealed reservation
+only after validating the retained run and rights row, recover existing publication metadata, and
+make semantic artifact/manifest replay idempotent across restart. Backup errors never promote
+visible content to durable success and carry a versioned path-free receipt for reconciliation.
+Cursor monotonicity is deletion-safe.
 Persist instruments, identifiers, venues, symbol history, corporate actions, source configuration,
 cursors, runs, manifests, audit and artifact metadata needed by Tasks 4-19.
 
 - [ ] **Step 4: Implement secret providers and rotation**
 
 Prefer OS keyring. The fallback records Argon2id parameters/random salt, uses a unique nonce and
-XChaCha20-Poly1305 authenticated version/key-name metadata, atomically publishes below the confined
-secret root, supplies a caller-owned `Zeroizing<Vec<argon2::Block>>` KDF arena, zeroizes plaintext/
-derived keys, and rotates by decrypt-validate-reencrypt-replace. It never uses Argon2's convenience
-allocator because that does not wipe the complete memory arena.
+XChaCha20-Poly1305 authenticated version/key-name metadata, and publishes below the confined secret
+root. Authority state uses two bounded authenticated generations and Windows no-clobber write-
+through publication; it never relies on in-place replacement or an unproven atomic-visibility claim.
+Opening selects the highest valid linked generation while retaining one known-good predecessor.
+Every acknowledged logical write is verified in both slots, and rotation is complete only after the
+final stable vault is verified in both slots and neither retains prior-unlock recovery ciphertext.
+A keyed whole-vault authenticator binds version, phase, set roles, and complete canonical entry
+membership plus the sealed next authority generation/predecessor supplied before serialization;
+prepared and committed phases are independently verifiable under both permitted unlocks. Per-entry
+AEAD is not treated as proof of the surrounding vault state. An interrupted peer-slot installation
+latches ordinary access behind typed recovery until the verified newer slot repairs its peer. The
+local-only threat contract detects whole-state tampering but does not claim resistance to hostile
+replay of an entire older valid two-slot pair without an independent monotonic anchor. The KDF uses
+a caller-owned `Zeroizing<Vec<argon2::Block>>` arena, zeroizes plaintext/derived keys, and never uses
+Argon2's convenience allocator because that does not wipe the complete memory arena.
 `Debug`, `Display`, tracing and MCP never reveal the value, path token or key identity.
 
 - [ ] **Step 5: Run GREEN and commit**
