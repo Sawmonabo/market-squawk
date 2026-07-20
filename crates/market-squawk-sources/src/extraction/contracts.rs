@@ -141,6 +141,8 @@ pub struct SourceObject {
     evidence: ExactPayloadEvidence,
     effective: EffectiveInterval,
     published_at: Option<Timestamp>,
+    #[serde(skip_serializing_if = "availability_is_unknown")]
+    availability: AvailabilityEvidence,
     expected_bytes: Option<u64>,
 }
 
@@ -162,6 +164,39 @@ impl SourceObject {
         published_at: Option<Timestamp>,
         expected_bytes: Option<u64>,
     ) -> Result<Self, ExtractionError> {
+        Self::try_new_with_availability(
+            source_id,
+            metadata_revision,
+            request,
+            object_id,
+            media_type,
+            evidence,
+            effective,
+            published_at,
+            AvailabilityEvidence::Unknown,
+            expected_bytes,
+        )
+    }
+
+    /// Constructs an exact object with explicit object-bound availability evidence.
+    ///
+    /// # Errors
+    ///
+    /// Rejects oversized objects, invalid identifiers/evidence, or availability before a known
+    /// source publication time.
+    #[allow(clippy::too_many_arguments, reason = "lineage fields remain explicit")]
+    pub fn try_new_with_availability(
+        source_id: SourceId,
+        metadata_revision: MetadataRevision,
+        request: &DiscoveryRequest,
+        object_id: SourceIdentifier,
+        media_type: SourceIdentifier,
+        evidence: ExactPayloadEvidence,
+        effective: EffectiveInterval,
+        published_at: Option<Timestamp>,
+        availability: AvailabilityEvidence,
+        expected_bytes: Option<u64>,
+    ) -> Result<Self, ExtractionError> {
         if expected_bytes.is_some_and(|size| size > MAX_EXTRACTION_BATCH_BYTES) {
             return Err(ExtractionError::LimitTooLarge {
                 field: "expected_bytes",
@@ -173,6 +208,8 @@ impl SourceObject {
         let object_id = normalize_identifier(&object_id)?;
         let media_type = normalize_identifier(&media_type)?;
         let evidence = normalize_evidence(&evidence)?;
+        let availability = normalize_availability(&availability)?;
+        validate_source_object_availability(published_at, &availability)?;
         Ok(Self {
             source_id,
             metadata_revision,
@@ -183,6 +220,7 @@ impl SourceObject {
             evidence,
             effective,
             published_at,
+            availability,
             expected_bytes,
         })
     }
@@ -232,6 +270,11 @@ impl SourceObject {
         self.published_at
     }
 
+    /// Returns availability evidence bound to this exact discovered object and digest.
+    pub const fn availability(&self) -> &AvailabilityEvidence {
+        &self.availability
+    }
+
     /// Returns declared source-object bytes.
     pub const fn expected_bytes(&self) -> Option<u64> {
         self.expected_bytes
@@ -249,6 +292,7 @@ impl SourceObject {
             self.object_id.as_str().len(),
             self.media_type.as_str().len(),
             evidence_dynamic_bytes(&self.evidence)?,
+            availability_dynamic_bytes(&self.availability)?,
         ])?)
     }
 }
@@ -265,6 +309,8 @@ struct SourceObjectWire {
     evidence: ExactPayloadEvidence,
     effective: EffectiveInterval,
     published_at: Option<Timestamp>,
+    #[serde(default)]
+    availability: AvailabilityEvidence,
     expected_bytes: Option<u64>,
 }
 
@@ -294,6 +340,12 @@ impl<'de> Deserialize<'de> for SourceObject {
             evidence: normalize_evidence(&wire.evidence).map_err(serde::de::Error::custom)?,
             effective: wire.effective,
             published_at: wire.published_at,
+            availability: normalize_availability(&wire.availability)
+                .and_then(|availability| {
+                    validate_source_object_availability(wire.published_at, &availability)?;
+                    Ok(availability)
+                })
+                .map_err(serde::de::Error::custom)?,
             expected_bytes: wire.expected_bytes,
         })
     }

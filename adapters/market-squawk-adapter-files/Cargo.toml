@@ -11,19 +11,32 @@ keywords = ["finance", "market-data", "parquet", "csv"]
 categories = ["finance", "parser-implementations"]
 
 [dependencies]
+arrow.workspace = true
 bytes.workspace = true
+chrono.workspace = true
+csv.workspace = true
+encoding_rs.workspace = true
+futures-util.workspace = true
 market-squawk-domain.workspace = true
 market-squawk-platform.workspace = true
 market-squawk-sources.workspace = true
+parquet.workspace = true
+quick-xml.workspace = true
+rusqlite.workspace = true
+rust_decimal.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 tokio-util.workspace = true
+zip.workspace = true
 
 [dev-dependencies]
 fs2.workspace = true
+market-squawk-data.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

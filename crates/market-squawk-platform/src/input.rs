@@ -1,5 +1,6 @@
 //! One-shot, no-follow capabilities for explicitly user-authorized local input roots.
 
+use std::convert::Infallible;
 use std::ffi::OsString;
 use std::fmt;
 use std::io::{Read as _, Seek as _, SeekFrom};
@@ -16,6 +17,7 @@ use thiserror::Error;
 
 const MAX_INPUT_DEPTH: usize = 64;
 const MAX_COMPONENT_BYTES: usize = 255;
+const INPUT_READ_CHUNK_BYTES: usize = 64 * 1024;
 
 /// A no-follow capability rooted at one directory explicitly selected by the local user.
 #[derive(Clone)]
@@ -68,6 +70,84 @@ pub struct BoundedInput {
     digest: EvidenceDigest,
 }
 
+/// One of the two exact passes over a controlled input handle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InputReadPass {
+    /// Exact bytes retained for publication and their incremental digest.
+    Primary,
+    /// Independent digest and length verification over the same handle.
+    Verification,
+}
+
+/// A bounded filesystem-read control point.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InputReadCheckpoint {
+    /// Before the stability lock, fixed allocation, or filesystem reads begin.
+    BeforeRead,
+    /// Immediately before one read of at most 64 KiB.
+    BeforeReadChunk {
+        /// Exact pass being read.
+        pass: InputReadPass,
+        /// Bytes already read in this pass.
+        offset_bytes: u64,
+    },
+    /// Immediately after one bounded read attempt.
+    AfterReadChunk {
+        /// Exact pass being read.
+        pass: InputReadPass,
+        /// Bytes read in this pass after the attempt.
+        offset_bytes: u64,
+    },
+    /// Immediately before the one-byte file-growth probe.
+    BeforeGrowthProbe,
+    /// Immediately after the one-byte file-growth probe.
+    AfterGrowthProbe,
+    /// Immediately before final path and handle identity revalidation.
+    BeforeIdentityRevalidation,
+    /// Immediately before verified bytes are released to the caller.
+    BeforeRelease,
+}
+
+/// A caller-owned cooperative controller for bounded input reads.
+pub trait InputReadControl {
+    /// Checks whether the operation may continue at the supplied bounded control point.
+    ///
+    /// # Errors
+    ///
+    /// Returns the exact caller control state that stopped the operation.
+    fn checkpoint(&self, checkpoint: InputReadCheckpoint) -> Result<(), InputReadControlError>;
+}
+
+/// Caller control failure independent of filesystem and capability errors.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum InputReadControlError {
+    /// The caller cancelled the read.
+    #[error("controlled input read was cancelled")]
+    Cancelled,
+    /// The caller's monotonic deadline expired.
+    #[error("controlled input read deadline was exceeded")]
+    DeadlineExceeded,
+    /// The caller could not establish trusted control state.
+    #[error("controlled input read control state is unavailable")]
+    Unavailable,
+}
+
+/// Failure from either the input capability or its caller-owned control contract.
+#[derive(Debug, Error)]
+pub enum ControlledInputFileError {
+    /// Filesystem, stability, identity, allocation, or byte-limit failure.
+    #[error(transparent)]
+    Input(#[from] InputFileError),
+    /// Exact caller cancellation, deadline, or trusted-control failure.
+    #[error(transparent)]
+    Control(#[from] InputReadControlError),
+}
+
+enum BoundedReadError<E> {
+    Input(InputFileError),
+    Control(E),
+}
+
 /// Failure to prepare, resolve, open, or consume a local input capability.
 #[derive(Debug, Error)]
 pub enum InputFileError {
@@ -98,6 +178,9 @@ pub enum InputFileError {
         /// Exact configured ceiling.
         max: u64,
     },
+    /// The exact admitted input buffer could not be reserved without exceeding its ceiling.
+    #[error("input buffer allocation failed within the admitted byte limit")]
+    AllocationFailed,
     /// Another process holds an incompatible cooperative file lock.
     #[error("input file is busy")]
     FileBusy,
@@ -291,76 +374,204 @@ impl VerifiedInputFile {
     /// # Errors
     ///
     /// Rejects short reads, concurrent mutation/replacement, limit overflow, and I/O failures.
-    pub fn read_bounded(mut self) -> Result<BoundedInput, InputFileError> {
-        fs2::FileExt::try_lock_shared(&self.file).map_err(|source| {
-            if source.kind() == std::io::ErrorKind::WouldBlock {
-                InputFileError::FileBusy
-            } else {
-                InputFileError::StabilityLockUnavailable { source }
-            }
-        })?;
+    pub fn read_bounded(self) -> Result<BoundedInput, InputFileError> {
+        match self.read_bounded_inner(|_| Ok::<(), Infallible>(())) {
+            Ok(input) => Ok(input),
+            Err(BoundedReadError::Input(error)) => Err(error),
+            Err(BoundedReadError::Control(never)) => match never {},
+        }
+    }
+
+    /// Performs the exact bounded read with caller-owned cooperative control.
+    ///
+    /// No individual filesystem read exceeds 64 KiB. Control is checked before and after each
+    /// read in both digest passes, around the growth probe, and before identity validation and
+    /// release. A control failure drops the retained handle and stability lock normally.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControlledInputFileError::Control`] without changing its cancellation, deadline,
+    /// or unavailable classification. All other failures retain their exact [`InputFileError`].
+    pub fn read_bounded_with_control(
+        self,
+        control: &dyn InputReadControl,
+    ) -> Result<BoundedInput, ControlledInputFileError> {
+        match self.read_bounded_inner(|checkpoint| control.checkpoint(checkpoint)) {
+            Ok(input) => Ok(input),
+            Err(BoundedReadError::Input(error)) => Err(ControlledInputFileError::Input(error)),
+            Err(BoundedReadError::Control(error)) => Err(ControlledInputFileError::Control(error)),
+        }
+    }
+
+    fn read_bounded_inner<E>(
+        mut self,
+        mut checkpoint: impl FnMut(InputReadCheckpoint) -> Result<(), E>,
+    ) -> Result<BoundedInput, BoundedReadError<E>> {
+        checkpoint(InputReadCheckpoint::BeforeRead).map_err(BoundedReadError::Control)?;
+        fs2::FileExt::try_lock_shared(&self.file)
+            .map_err(|source| {
+                if source.kind() == std::io::ErrorKind::WouldBlock {
+                    InputFileError::FileBusy
+                } else {
+                    InputFileError::StabilityLockUnavailable { source }
+                }
+            })
+            .map_err(BoundedReadError::Input)?;
         let read_ceiling = self
             .maximum_bytes
             .checked_add(1)
-            .ok_or(InputFileError::InvalidByteLimit)?;
-        let capacity = usize::try_from(self.identity.size_bytes)
-            .map_err(|_| InputFileError::InvalidByteLimit)?;
-        let mut bytes = Vec::with_capacity(capacity);
-        self.file
-            .by_ref()
-            .take(read_ceiling)
-            .read_to_end(&mut bytes)
-            .map_err(InputFileError::io)?;
-        if u64::try_from(bytes.len()).map_or(true, |length| length > self.maximum_bytes) {
-            return Err(InputFileError::ByteLimitExceeded {
-                max: self.maximum_bytes,
-            });
+            .ok_or(InputFileError::InvalidByteLimit)
+            .map_err(BoundedReadError::Input)?;
+        let exact_length = usize::try_from(self.identity.size_bytes)
+            .map_err(|_| BoundedReadError::Input(InputFileError::InvalidByteLimit))?;
+        let mut bytes = Vec::new();
+        reserve_fixed_input_buffer(&mut bytes, exact_length, self.maximum_bytes)
+            .map_err(BoundedReadError::Input)?;
+        let mut first_digest = Sha256::new();
+        let mut first_length = 0_u64;
+        for chunk in bytes.chunks_mut(INPUT_READ_CHUNK_BYTES) {
+            checkpoint(InputReadCheckpoint::BeforeReadChunk {
+                pass: InputReadPass::Primary,
+                offset_bytes: first_length,
+            })
+            .map_err(BoundedReadError::Control)?;
+            match self.file.read_exact(chunk) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    return Err(BoundedReadError::Input(InputFileError::IdentityChanged));
+                }
+                Err(error) => {
+                    return Err(BoundedReadError::Input(InputFileError::io(error)));
+                }
+            }
+            first_digest.update(&*chunk);
+            first_length = first_length
+                .checked_add(
+                    u64::try_from(chunk.len())
+                        .map_err(|_| BoundedReadError::Input(InputFileError::InvalidByteLimit))?,
+                )
+                .ok_or(InputFileError::InvalidByteLimit)
+                .map_err(BoundedReadError::Input)?;
+            checkpoint(InputReadCheckpoint::AfterReadChunk {
+                pass: InputReadPass::Primary,
+                offset_bytes: first_length,
+            })
+            .map_err(BoundedReadError::Control)?;
         }
-        if u64::try_from(bytes.len()).ok() != Some(self.identity.size_bytes) {
-            return Err(InputFileError::IdentityChanged);
+        checkpoint(InputReadCheckpoint::BeforeGrowthProbe).map_err(BoundedReadError::Control)?;
+        let mut growth_probe = [0_u8; 1];
+        let growth = loop {
+            match self.file.read(&mut growth_probe) {
+                Ok(read) => break read,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => {
+                    return Err(BoundedReadError::Input(InputFileError::io(error)));
+                }
+            }
+        };
+        checkpoint(InputReadCheckpoint::AfterGrowthProbe).map_err(BoundedReadError::Control)?;
+        if growth != 0 {
+            let current = self
+                .file
+                .metadata()
+                .map_err(InputFileError::io)
+                .map_err(BoundedReadError::Input)?;
+            if self.identity.size_bytes >= self.maximum_bytes || current.len() > self.maximum_bytes
+            {
+                return Err(BoundedReadError::Input(InputFileError::ByteLimitExceeded {
+                    max: self.maximum_bytes,
+                }));
+            }
+            return Err(BoundedReadError::Input(InputFileError::IdentityChanged));
         }
-        let first_digest = Sha256::digest(&bytes);
+        let first_digest = first_digest.finalize();
         self.file
             .seek(SeekFrom::Start(0))
-            .map_err(InputFileError::io)?;
+            .map_err(InputFileError::io)
+            .map_err(BoundedReadError::Input)?;
         let mut second_digest = Sha256::new();
         let mut second_length = 0_u64;
-        let mut buffer = [0_u8; 64 * 1024];
+        let mut buffer = [0_u8; INPUT_READ_CHUNK_BYTES];
         loop {
             let remaining = read_ceiling.saturating_sub(second_length);
             if remaining == 0 {
                 break;
             }
             let requested = usize::try_from(remaining.min(buffer.len() as u64))
-                .map_err(|_| InputFileError::InvalidByteLimit)?;
-            let read = self
-                .file
-                .read(&mut buffer[..requested])
-                .map_err(InputFileError::io)?;
+                .map_err(|_| BoundedReadError::Input(InputFileError::InvalidByteLimit))?;
+            checkpoint(InputReadCheckpoint::BeforeReadChunk {
+                pass: InputReadPass::Verification,
+                offset_bytes: second_length,
+            })
+            .map_err(BoundedReadError::Control)?;
+            let read = loop {
+                match self.file.read(&mut buffer[..requested]) {
+                    Ok(read) => break read,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(error) => {
+                        return Err(BoundedReadError::Input(InputFileError::io(error)));
+                    }
+                }
+            };
+            if read != 0 {
+                second_digest.update(&buffer[..read]);
+                second_length =
+                    second_length
+                        .checked_add(u64::try_from(read).map_err(|_| {
+                            BoundedReadError::Input(InputFileError::InvalidByteLimit)
+                        })?)
+                        .ok_or(InputFileError::InvalidByteLimit)
+                        .map_err(BoundedReadError::Input)?;
+            }
+            checkpoint(InputReadCheckpoint::AfterReadChunk {
+                pass: InputReadPass::Verification,
+                offset_bytes: second_length,
+            })
+            .map_err(BoundedReadError::Control)?;
             if read == 0 {
                 break;
             }
-            second_digest.update(&buffer[..read]);
-            second_length = second_length
-                .checked_add(u64::try_from(read).map_err(|_| InputFileError::InvalidByteLimit)?)
-                .ok_or(InputFileError::InvalidByteLimit)?;
         }
         let second_digest = second_digest.finalize();
         if second_length > self.maximum_bytes {
-            return Err(InputFileError::ByteLimitExceeded {
+            return Err(BoundedReadError::Input(InputFileError::ByteLimitExceeded {
                 max: self.maximum_bytes,
-            });
+            }));
         }
         if second_length != self.identity.size_bytes || first_digest != second_digest {
-            return Err(InputFileError::ContentChanged);
+            return Err(BoundedReadError::Input(InputFileError::ContentChanged));
         }
-        self.validate_unchanged()?;
+        checkpoint(InputReadCheckpoint::BeforeIdentityRevalidation)
+            .map_err(BoundedReadError::Control)?;
+        self.validate_unchanged().map_err(BoundedReadError::Input)?;
+        checkpoint(InputReadCheckpoint::BeforeRelease).map_err(BoundedReadError::Control)?;
         Ok(BoundedInput {
             bytes: bytes.into_boxed_slice(),
             identity: self.identity,
             digest: EvidenceDigest::new(DigestAlgorithm::Sha256, first_digest.into()),
         })
     }
+}
+
+fn reserve_fixed_input_buffer(
+    bytes: &mut Vec<u8>,
+    exact_length: usize,
+    maximum_bytes: u64,
+) -> Result<(), InputFileError> {
+    let exact_u64 = u64::try_from(exact_length).map_err(|_| InputFileError::InvalidByteLimit)?;
+    if exact_u64 > maximum_bytes {
+        return Err(InputFileError::ByteLimitExceeded { max: maximum_bytes });
+    }
+    let maximum_capacity =
+        usize::try_from(maximum_bytes).map_err(|_| InputFileError::InvalidByteLimit)?;
+    bytes
+        .try_reserve_exact(exact_length)
+        .map_err(|_| InputFileError::AllocationFailed)?;
+    if bytes.capacity() > maximum_capacity {
+        return Err(InputFileError::AllocationFailed);
+    }
+    bytes.resize(exact_length, 0);
+    Ok(())
 }
 
 impl InputFileIdentity {
@@ -417,6 +628,22 @@ impl BoundedInput {
 impl InputFileError {
     fn io(source: std::io::Error) -> Self {
         Self::Io { source }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixed_input_reservation_rejects_before_capacity_growth() {
+        let mut bytes = Vec::new();
+        let initial_capacity = bytes.capacity();
+        assert!(matches!(
+            reserve_fixed_input_buffer(&mut bytes, 2, 1),
+            Err(InputFileError::ByteLimitExceeded { max: 1 })
+        ));
+        assert_eq!(bytes.capacity(), initial_capacity);
     }
 }
 
