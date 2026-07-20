@@ -207,6 +207,12 @@ After a scoped integration change is locally verified and intentionally committe
 4. update the comment or add a follow-up when hosted evidence finishes; and
 5. never push a dirty/rejected lane merely to obtain CI feedback.
 
+Branch names describe the product delivery, never the execution machinery. Use release-oriented
+names such as `release/market-squawk-v0.1.0` for integration and feature-oriented names such as
+`feature/live-action-pipeline` or `fix/catalog-recovery` for bounded work. Do not name branches for
+stages, quarters, task numbers, agents, worktrees, or orchestration lanes. Historical branch names
+may remain only where renaming would destroy audit continuity; all new branches follow this rule.
+
 GitHub is a collaboration and optional verification surface, not a runtime dependency. A clean
 local exact-head gate remains mandatory. Active dirty worktrees stay local until their scoped
 review and integration barrier is satisfied.
