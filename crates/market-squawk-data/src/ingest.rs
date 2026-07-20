@@ -1,8 +1,10 @@
 //! Rights-bound analytical ingestion, immutable generation commit, and compaction.
 
 use std::collections::BTreeSet;
+use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use arrow::record_batch::RecordBatch;
 use market_squawk_domain::{
     DigestAlgorithm, EvidenceDigest, SchemaVersion, SourceIdentifier, Timestamp,
 };
@@ -11,14 +13,15 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
+use crate::catalog::QueryArtifactPublisher;
+use crate::parquet_store::ArtifactRootIdentity;
 use crate::{
     AnalyticalManifestCatalog, ArrowConversionError, ArtifactRecord, CatalogAuthority,
     CatalogError, ContractCompletion, DatasetId, DatasetManifestRecord, DatasetManifestRef,
     GenerationKind, IngestReservation, IngestRunState, ManifestCatalogError, ManifestObject,
     ManifestPlan, ManifestPlanError, ObjectStoreConfig, OrphanRecoveryReport, ParquetObjectStore,
-    ParquetStoreError, PinnedDataset, PublishedObject, QueryArtifactPublisher,
-    QueryArtifactReservation, QueryArtifactReservationInput, ResearchArrowBatch, Sha256Digest,
-    SourceOperation,
+    ParquetStoreError, PinnedDataset, PublishedObject, QueryArtifactReservation,
+    QueryArtifactReservationInput, ResearchArrowBatch, Sha256Digest, SourceOperation,
 };
 
 /// Exact immutable generation returned after successful reconciliation or commit.
@@ -104,25 +107,90 @@ pub trait ResearchIngestService {
 #[derive(Debug)]
 pub struct AnalyticalDataService {
     authority: Arc<Mutex<CatalogAuthority>>,
+    catalog_id: uuid::Uuid,
     manifests: AnalyticalManifestCatalog,
     objects: Arc<ParquetObjectStore>,
 }
 
-impl AnalyticalDataService {
-    /// Constructs the service from already-open capabilities for the same prepared local paths.
-    pub fn try_new(
-        authority: CatalogAuthority,
-        manifests: AnalyticalManifestCatalog,
-        objects: ParquetObjectStore,
-    ) -> Result<Self, IngestError> {
-        authority.integrity_check()?;
-        Ok(Self {
-            authority: Arc::new(Mutex::new(authority)),
-            manifests,
-            objects: Arc::new(objects),
-        })
+/// Non-separable query-result publication authority for one catalog and artifact root.
+pub struct QueryArtifactPublication {
+    objects: Arc<ParquetObjectStore>,
+    publisher: QueryArtifactPublisher,
+    catalog_id: uuid::Uuid,
+    root_identity: ArtifactRootIdentity,
+}
+
+impl fmt::Debug for QueryArtifactPublication {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("QueryArtifactPublication")
+            .field("objects", &"[SEALED ROOT CAPABILITY]")
+            .field("publisher", &self.publisher)
+            .field("catalog", &"[SEALED CATALOG SESSION]")
+            .finish()
+    }
+}
+
+impl QueryArtifactPublication {
+    pub(crate) fn root_identity(&self) -> &ArtifactRootIdentity {
+        &self.root_identity
     }
 
+    pub(crate) async fn publish_and_bind(
+        &self,
+        batch: &RecordBatch,
+        cancellation: &CancellationToken,
+        reservation: &QueryArtifactReservation,
+    ) -> Result<(PublishedObject, ArtifactRecord, crate::QueryArtifactResult), crate::QueryError>
+    {
+        if reservation.catalog_id() != self.catalog_id {
+            return Err(crate::QueryError::Catalog(
+                CatalogError::InvalidReservationCapability,
+            ));
+        }
+        let lease = self
+            .objects
+            .begin_publication(cancellation)
+            .await
+            .map_err(map_query_store_error)?;
+        let object = self
+            .objects
+            .publish_under_lease(batch, cancellation, &lease)
+            .await
+            .map_err(map_query_store_error)?;
+        if !self
+            .objects
+            .verify(&object)
+            .map_err(map_query_store_error)?
+        {
+            return Err(crate::QueryError::Artifact(
+                ParquetStoreError::ObjectMetadataMismatch,
+            ));
+        }
+        let artifact = ArtifactRecord::try_new(
+            object.relative_reference(),
+            object.content_hash().evidence(),
+            object.size_bytes(),
+            object.created_at(),
+        )
+        .map_err(crate::QueryError::Catalog)?;
+        let ownership = self
+            .publisher
+            .bind(reservation, &artifact)
+            .map_err(crate::QueryError::Catalog)?;
+        Ok((object, artifact, ownership))
+    }
+}
+
+fn map_query_store_error(error: ParquetStoreError) -> crate::QueryError {
+    if matches!(error, ParquetStoreError::Cancelled) {
+        crate::QueryError::Cancelled
+    } else {
+        crate::QueryError::Artifact(error)
+    }
+}
+
+impl AnalyticalDataService {
     /// Opens immutable storage from controlled capabilities and a validated generation catalog.
     pub fn open(
         authority: CatalogAuthority,
@@ -130,11 +198,23 @@ impl AnalyticalDataService {
         artifact_root: market_squawk_platform::ArtifactRoot,
         object_config: ObjectStoreConfig,
     ) -> Result<Self, IngestError> {
-        Self::try_new(
-            authority,
+        authority.integrity_check()?;
+        if authority.catalog_path() != manifests.catalog_path() {
+            return Err(IngestError::CatalogCompositionMismatch);
+        }
+        let objects = ParquetObjectStore::open(
+            artifact_root,
+            object_config,
+            authority.catalog_path(),
+            authority.artifact_root_binding(),
+        )?;
+        let catalog_id = authority.session_id();
+        Ok(Self {
+            authority: Arc::new(Mutex::new(authority)),
+            catalog_id,
             manifests,
-            ParquetObjectStore::open(artifact_root, object_config)?,
-        )
+            objects: Arc::new(objects),
+        })
     }
 
     /// Returns the controlled object capability for manifest-pinned query construction.
@@ -150,9 +230,14 @@ impl AnalyticalDataService {
         Ok(self.lock_authority()?.reserve_query_artifact(input)?)
     }
 
-    /// Issues a least-authority binder while ingestion retains the same catalog writer.
-    pub fn query_artifact_publisher(&self) -> Arc<QueryArtifactPublisher> {
-        Arc::new(QueryArtifactPublisher::new(Arc::clone(&self.authority)))
+    /// Issues one sealed publisher that cannot be paired with another root or catalog writer.
+    pub fn query_artifact_publication(&self) -> Arc<QueryArtifactPublication> {
+        Arc::new(QueryArtifactPublication {
+            objects: Arc::clone(&self.objects),
+            publisher: QueryArtifactPublisher::new(Arc::clone(&self.authority)),
+            catalog_id: self.catalog_id,
+            root_identity: self.objects.authority_identity().clone(),
+        })
     }
 
     /// Resolves one exact immutable generation.
@@ -246,6 +331,7 @@ impl AnalyticalDataService {
         now: Timestamp,
     ) -> Result<OrphanRecoveryReport, IngestError> {
         let mut recovery = self.objects.begin_recovery(now).await?;
+        let _authority = self.lock_authority()?;
         let referenced: BTreeSet<_> = self.manifests.referenced_hashes(now)?.into_iter().collect();
         for object in recovery.candidates().to_vec() {
             if referenced.contains(&object.content_hash()) {
@@ -442,6 +528,9 @@ pub enum IngestError {
     /// Task 3 rejected a reservation, publication, or transition.
     #[error("analytical catalog authority rejected the operation")]
     Catalog(#[from] CatalogError),
+    /// Catalog and manifest capabilities do not identify the same prepared catalog path.
+    #[error("analytical service capabilities name different catalogs")]
+    CatalogCompositionMismatch,
     /// Exact extraction-batch serialization failed.
     #[error("extraction batch identity serialization failed")]
     Serialization(#[from] serde_json::Error),

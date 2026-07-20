@@ -4,6 +4,7 @@
 //! event-to-action path.
 
 mod arrow_convert;
+mod blocking_supervisor;
 mod catalog;
 mod ingest;
 mod manifest;
@@ -19,12 +20,12 @@ pub use catalog::{
     ArtifactRecord, AuditEvent, BackupReceipt, Catalog, CatalogAuthority, CatalogConfig,
     CatalogError, CatalogHealth, CatalogLimit, CatalogResultLimits, ContractCompletion,
     DatasetManifestRecord, IngestReservation, IngestRunRecord, IngestRunState, PublishedIngest,
-    QueryArtifactPublisher, QueryArtifactReservation, QueryArtifactReservationInput,
-    QueryArtifactResult, ReferenceBundle, ResumedIngest, SourceCursor,
+    QueryArtifactReservation, QueryArtifactReservationInput, QueryArtifactResult, ReferenceBundle,
+    ResumedIngest, SourceCursor,
 };
 pub use ingest::{
-    AnalyticalDataService, CommittedDataset, CompactionRequest, IngestError, ResearchIngestService,
-    extraction_batch_digest,
+    AnalyticalDataService, CommittedDataset, CompactionRequest, IngestError,
+    QueryArtifactPublication, ResearchIngestService, extraction_batch_digest,
 };
 pub use manifest::{
     AnalyticalManifestCatalog, DatasetId, DatasetManifestRef, GenerationKind, ManifestCatalogError,
@@ -34,7 +35,6 @@ pub use manifest::{
 pub use parquet_store::{
     ObjectStoreConfig, OrphanRecoveryReport, ParquetObjectStore, ParquetStoreError, PublishedObject,
 };
-pub use publication_coordinator::PublicationLease;
 pub use query::{
     QueryError, QueryLimits, QueryRequest, QueryResult, ResearchQueryEngine, ResearchQueryService,
 };

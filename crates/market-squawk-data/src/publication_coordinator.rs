@@ -38,7 +38,7 @@ impl PublicationCoordinator {
 }
 
 /// Non-cloneable authority proving exclusive ownership of final-object publication/recovery.
-pub struct PublicationLease {
+pub(crate) struct PublicationLease {
     owner: Arc<Mutex<()>>,
     _lease: OwnedMutexGuard<()>,
 }

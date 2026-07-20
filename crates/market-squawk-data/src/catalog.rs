@@ -30,9 +30,9 @@ pub use self::types::{
 };
 use self::types::{MAX_SQLITE_RECORD_BYTES, WriterPermit};
 pub use publication::PublishedIngest;
+pub(crate) use query_artifacts::QueryArtifactPublisher;
 pub use query_artifacts::{
-    QueryArtifactPublisher, QueryArtifactReservation, QueryArtifactReservationInput,
-    QueryArtifactResult,
+    QueryArtifactReservation, QueryArtifactReservationInput, QueryArtifactResult,
 };
 pub use runs::{CatalogAuthority, ResumedIngest};
 
@@ -145,6 +145,12 @@ impl Catalog {
         }
         apply_migrations(&mut connection)?;
         verify_integrity(&connection)?;
+        let artifact_root_binding = exact_catalog_file_binding(
+            &catalog_file
+                .try_clone_file()
+                .map_err(map_catalog_location_error)?,
+            &path,
+        )?;
         Ok(Self {
             connection,
             _catalog_file: catalog_file,
@@ -154,6 +160,8 @@ impl Catalog {
             max_result_rows: config.max_result_rows,
             result_bytes: config.result_bytes,
             catalog_id: uuid::Uuid::new_v4(),
+            catalog_path: path,
+            artifact_root_binding,
         })
     }
 
@@ -243,6 +251,46 @@ impl Catalog {
             .validate_for_open()
             .map_err(|_| CatalogError::UnsafePath)
     }
+}
+
+#[cfg(unix)]
+fn exact_catalog_file_binding(file: &File, path: &Path) -> Result<[u8; 32], CatalogError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = file.metadata()?;
+    Ok(hash_catalog_file_identity(
+        path,
+        metadata.dev(),
+        metadata.ino(),
+    ))
+}
+
+#[cfg(windows)]
+fn exact_catalog_file_binding(file: &File, path: &Path) -> Result<[u8; 32], CatalogError> {
+    use std::os::windows::fs::MetadataExt as _;
+
+    let metadata = file.metadata()?;
+    let volume = metadata
+        .volume_serial_number()
+        .ok_or(CatalogError::UnsafePath)?;
+    let index = metadata.file_index().ok_or(CatalogError::UnsafePath)?;
+    Ok(hash_catalog_file_identity(path, u64::from(volume), index))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn exact_catalog_file_binding(_file: &File, _path: &Path) -> Result<[u8; 32], CatalogError> {
+    Err(CatalogError::UnsafePath)
+}
+
+fn hash_catalog_file_identity(path: &Path, device: u64, inode: u64) -> [u8; 32] {
+    let path = path.as_os_str().as_encoded_bytes();
+    let mut digest = Sha256::new();
+    digest.update(b"market-squawk/catalog-artifact-root-binding/v1");
+    digest.update(u64::try_from(path.len()).unwrap_or(u64::MAX).to_be_bytes());
+    digest.update(path);
+    digest.update(device.to_be_bytes());
+    digest.update(inode.to_be_bytes());
+    digest.finalize().into()
 }
 
 fn map_catalog_location_error(error: PathError) -> CatalogError {

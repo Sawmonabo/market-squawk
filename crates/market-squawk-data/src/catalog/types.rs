@@ -651,6 +651,8 @@ pub struct Catalog {
     pub(super) max_result_rows: CatalogLimit,
     pub(super) result_bytes: CatalogResultLimits,
     pub(super) catalog_id: Uuid,
+    pub(super) catalog_path: PathBuf,
+    pub(super) artifact_root_binding: [u8; 32],
 }
 
 impl fmt::Debug for Catalog {

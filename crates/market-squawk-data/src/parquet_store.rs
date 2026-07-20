@@ -1,14 +1,18 @@
 //! Capability-confined, immutable, content-addressed Parquet publication.
 
+use std::collections::BTreeSet;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
-use std::sync::Arc;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
+use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
+use fs2::FileExt as _;
 use market_squawk_domain::Timestamp;
 use market_squawk_platform::ArtifactRoot;
 use parquet::arrow::ArrowWriter;
@@ -31,6 +35,10 @@ const STAGING: &str = "staging/parquet";
 const QUARANTINE: &str = "quarantine/parquet";
 const MAX_SCAN_OBJECTS: usize = 100_000;
 const MAX_BLOCKING_TASKS: usize = 4;
+const ROOT_AUTHORITY_LOCK: &str = ".analytical-root-authority.lock";
+const CATALOG_ROOT_BINDING: &str = ".analytical-artifact-root.binding";
+
+static OPEN_ARTIFACT_ROOTS: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
 
 #[path = "parquet_store/pinned.rs"]
 mod pinned;
@@ -116,13 +124,63 @@ pub struct ParquetObjectStore {
     directory: Dir,
     config: ObjectStoreConfig,
     blocking_tasks: Arc<Semaphore>,
+    authority: Arc<RootAuthority>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ArtifactRootIdentity {
+    path: PathBuf,
+    catalog_binding: [u8; 32],
+}
+
+struct RootRegistryGuard {
+    path: PathBuf,
+}
+
+impl Drop for RootRegistryGuard {
+    fn drop(&mut self) {
+        if let Ok(mut roots) = OPEN_ARTIFACT_ROOTS
+            .get_or_init(|| Mutex::new(BTreeSet::new()))
+            .lock()
+        {
+            roots.remove(&self.path);
+        }
+    }
+}
+
+struct RootAuthority {
+    identity: ArtifactRootIdentity,
     publication: PublicationCoordinator,
+    _lock: File,
+    _registry: RootRegistryGuard,
+}
+
+impl std::fmt::Debug for RootAuthority {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RootAuthority")
+            .field("identity", &self.identity)
+            .field("publication", &self.publication)
+            .field("lock", &"[LOCKED ROOT CAPABILITY]")
+            .finish()
+    }
 }
 
 impl ParquetObjectStore {
     /// Opens the already controlled artifact root and prepares fixed internal namespaces.
-    pub fn open(root: ArtifactRoot, config: ObjectStoreConfig) -> Result<Self, ParquetStoreError> {
+    pub(crate) fn open(
+        root: ArtifactRoot,
+        config: ObjectStoreConfig,
+        catalog_path: &Path,
+        catalog_binding: [u8; 32],
+    ) -> Result<Self, ParquetStoreError> {
         let directory = Dir::open_ambient_dir(root.root(), ambient_authority())?;
+        let authority = Arc::new(acquire_root_authority(
+            &directory,
+            root.root(),
+            catalog_path,
+            catalog_binding,
+        )?);
         for path in [OBJECTS, STAGING, QUARANTINE] {
             directory.create_dir_all(path)?;
         }
@@ -142,12 +200,17 @@ impl ParquetObjectStore {
             directory,
             config,
             blocking_tasks: Arc::new(Semaphore::new(MAX_BLOCKING_TASKS)),
-            publication: PublicationCoordinator::default(),
+            authority,
         })
     }
 
+    pub(crate) fn authority_identity(&self) -> &ArtifactRootIdentity {
+        &self.authority.identity
+    }
+
     /// Writes, closes, fsyncs, hashes, and no-replace publishes one Parquet object.
-    pub async fn publish(
+    #[cfg(test)]
+    pub(crate) async fn publish(
         &self,
         batch: &RecordBatch,
         cancellation: &CancellationToken,
@@ -157,24 +220,25 @@ impl ParquetObjectStore {
     }
 
     /// Acquires exclusive final-object publication ownership with cancellation.
-    pub async fn begin_publication(
+    pub(crate) async fn begin_publication(
         &self,
         cancellation: &CancellationToken,
     ) -> Result<PublicationLease, ParquetStoreError> {
-        self.publication
+        self.authority
+            .publication
             .acquire(cancellation)
             .await
             .ok_or(ParquetStoreError::Cancelled)
     }
 
     /// Publishes while the caller retains exclusion through its durable reference commit.
-    pub async fn publish_under_lease(
+    pub(crate) async fn publish_under_lease(
         &self,
         batch: &RecordBatch,
         cancellation: &CancellationToken,
         lease: &PublicationLease,
     ) -> Result<PublishedObject, ParquetStoreError> {
-        if !self.publication.owns(lease) {
+        if !self.authority.publication.owns(lease) {
             return Err(ParquetStoreError::InvalidPublicationLease);
         }
         let store = Self {
@@ -182,7 +246,7 @@ impl ParquetObjectStore {
             directory: self.directory.try_clone()?,
             config: self.config,
             blocking_tasks: Arc::clone(&self.blocking_tasks),
-            publication: self.publication.clone(),
+            authority: Arc::clone(&self.authority),
         };
         let batch = batch.clone();
         let permit = self.acquire_blocking_permit(cancellation).await?;
@@ -395,7 +459,7 @@ impl ParquetObjectStore {
             directory: self.directory.try_clone()?,
             config: self.config,
             blocking_tasks: Arc::clone(&self.blocking_tasks),
-            publication: self.publication.clone(),
+            authority: Arc::clone(&self.authority),
         };
         let dataset = dataset.clone();
         let permit = self.acquire_blocking_permit(cancellation).await?;
@@ -496,6 +560,104 @@ struct StagingCleanup<'a> {
     reference: &'a str,
 }
 
+fn acquire_root_authority(
+    directory: &Dir,
+    root_path: &Path,
+    catalog_path: &Path,
+    catalog_binding: [u8; 32],
+) -> Result<RootAuthority, ParquetStoreError> {
+    let registry = {
+        let mut roots = OPEN_ARTIFACT_ROOTS
+            .get_or_init(|| Mutex::new(BTreeSet::new()))
+            .lock()
+            .map_err(|_| ParquetStoreError::RootAuthorityRegistryUnavailable)?;
+        if !roots.insert(root_path.to_path_buf()) {
+            return Err(ParquetStoreError::RootAuthorityAlreadyOwned);
+        }
+        RootRegistryGuard {
+            path: root_path.to_path_buf(),
+        }
+    };
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    options.follow(FollowSymlinks::No);
+    configure_private_root_lock(&mut options);
+    let mut lock = directory
+        .open_with(ROOT_AUTHORITY_LOCK, &options)?
+        .into_std();
+    match lock.try_lock_exclusive() {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            return Err(ParquetStoreError::RootAuthorityAlreadyOwned);
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let encoded_binding = encode_hex(catalog_binding);
+    let root_binding_missing = verify_binding(&mut lock, &encoded_binding)?;
+    let catalog_parent = catalog_path
+        .parent()
+        .ok_or(ParquetStoreError::RootCatalogMismatch)?;
+    let catalog_directory = Dir::open_ambient_dir(catalog_parent, ambient_authority())?;
+    let mut catalog_options = OpenOptions::new();
+    catalog_options.read(true).write(true).create(true);
+    catalog_options.follow(FollowSymlinks::No);
+    configure_private_root_lock(&mut catalog_options);
+    let mut catalog_binding_file = catalog_directory
+        .open_with(CATALOG_ROOT_BINDING, &catalog_options)?
+        .into_std();
+    let encoded_root = encode_hex(root_path_binding(root_path));
+    let catalog_binding_missing = verify_binding(&mut catalog_binding_file, &encoded_root)?;
+    if catalog_binding_missing {
+        initialize_binding(&catalog_directory, &mut catalog_binding_file, &encoded_root)?;
+    }
+    if root_binding_missing {
+        initialize_binding(directory, &mut lock, &encoded_binding)?;
+    }
+    Ok(RootAuthority {
+        identity: ArtifactRootIdentity {
+            path: root_path.to_path_buf(),
+            catalog_binding,
+        },
+        publication: PublicationCoordinator::default(),
+        _lock: lock,
+        _registry: registry,
+    })
+}
+
+fn root_path_binding(root_path: &Path) -> [u8; 32] {
+    let bytes = root_path.as_os_str().as_encoded_bytes();
+    let mut digest = Sha256::new();
+    digest.update(b"market-squawk/catalog-analytical-root/v1");
+    digest.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_be_bytes());
+    digest.update(bytes);
+    digest.finalize().into()
+}
+
+fn verify_binding(file: &mut File, expected: &str) -> Result<bool, ParquetStoreError> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut stored = Vec::new();
+    file.take(65).read_to_end(&mut stored)?;
+    if stored.is_empty() {
+        Ok(true)
+    } else if stored.as_slice() == expected.as_bytes() {
+        Ok(false)
+    } else {
+        Err(ParquetStoreError::RootCatalogMismatch)
+    }
+}
+
+fn initialize_binding(
+    directory: &Dir,
+    file: &mut File,
+    expected: &str,
+) -> Result<(), ParquetStoreError> {
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(expected.as_bytes())?;
+    file.sync_all()?;
+    sync_directory(directory, ".")?;
+    Ok(())
+}
+
 impl Drop for StagingCleanup<'_> {
     fn drop(&mut self) {
         let _ignored = self.directory.remove_file(self.reference);
@@ -508,6 +670,15 @@ pub enum ParquetStoreError {
     /// Writer limits are zero or excessive.
     #[error("Parquet object-store configuration is invalid")]
     InvalidConfiguration,
+    /// Another live service or process owns final-object publication and recovery for this root.
+    #[error("analytical artifact root already has an active authority")]
+    RootAuthorityAlreadyOwned,
+    /// The artifact root is durably bound to a different catalog path identity.
+    #[error("analytical artifact root belongs to a different catalog")]
+    RootCatalogMismatch,
+    /// The process-local artifact-root authority registry was poisoned.
+    #[error("analytical artifact-root authority registry is unavailable")]
+    RootAuthorityRegistryUnavailable,
     /// The operation was cancelled before publication.
     #[error("Parquet publication was cancelled")]
     Cancelled,
@@ -551,7 +722,9 @@ fn object_from_reference(
     reference: &str,
     rows: usize,
 ) -> Result<PublishedObject, ParquetStoreError> {
-    let mut file = directory.open(reference)?.into_std();
+    let mut options = OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    let mut file = directory.open_with(reference, &options)?.into_std();
     let metadata = file.metadata()?;
     let size_bytes = metadata.len();
     let content_hash = hash_file(&mut file, None)?;
@@ -598,6 +771,16 @@ fn configure_private_staging(options: &mut OpenOptions) {
 
     options.mode(0o600);
 }
+
+#[cfg(unix)]
+fn configure_private_root_lock(options: &mut OpenOptions) {
+    use cap_std::fs::OpenOptionsExt as _;
+
+    options.mode(0o600);
+}
+
+#[cfg(not(unix))]
+fn configure_private_root_lock(_options: &mut OpenOptions) {}
 
 #[cfg(not(unix))]
 fn configure_private_staging(_options: &mut OpenOptions) {}

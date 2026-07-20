@@ -9,7 +9,7 @@ use arrow::record_batch::RecordBatch;
 use market_squawk_data::{
     AnalyticalDataService, AnalyticalManifestCatalog, CatalogAuthority, CatalogConfig,
     CatalogError, CatalogLimit, CatalogResultLimits, CompactionRequest, DatasetId,
-    DatasetManifestRef, IngestError, IngestIdentity, ObjectStoreConfig, ParquetObjectStore,
+    DatasetManifestRef, IngestError, IngestIdentity, ObjectStoreConfig, ParquetStoreError,
     QueryArtifactReservationInput, QueryError, QueryLimits, QueryRequest, QueryResult,
     ResearchArrowBatch, ResearchIngestService, ResearchQueryEngine, RightsDecisionInput,
     Sha256Digest, SourceOperation, extraction_batch_digest,
@@ -34,105 +34,124 @@ use tokio_util::sync::CancellationToken;
 
 type TestResult = Result<(), Box<dyn Error>>;
 
-#[tokio::test]
-async fn publication_is_content_addressed_idempotent_and_recovers_orphans() -> TestResult {
-    let directory = tempfile::tempdir()?;
-    let paths = LocalPaths::prepare(directory.path().join("market-squawk"))?;
-    let store = ParquetObjectStore::open(
-        paths.artifacts()?.clone(),
-        ObjectStoreConfig::try_new(1024 * 1024, 2, Duration::from_secs(60))?,
+#[test]
+fn a_live_service_excludes_a_second_catalog_from_the_same_artifact_root() -> TestResult {
+    let first_directory = tempfile::tempdir()?;
+    let first_paths = LocalPaths::prepare(first_directory.path().join("market-squawk"))?;
+    let second_directory = tempfile::tempdir()?;
+    let second_paths = LocalPaths::prepare(second_directory.path().join("market-squawk"))?;
+    let first_location = first_paths.catalog()?.clone();
+    let second_location = second_paths.catalog()?.clone();
+    let store_config = ObjectStoreConfig::try_new(1024 * 1024, 32, Duration::from_secs(60))?;
+    let first = AnalyticalDataService::open(
+        CatalogAuthority::open(test_catalog_config(first_location.clone())?)?,
+        AnalyticalManifestCatalog::open(&first_location, 8)?,
+        first_paths.artifacts()?.clone(),
+        store_config,
     )?;
-    let schema = Schema::new(vec![Field::new("value", DataType::Int64, false)]);
-    let batch = RecordBatch::try_new(
-        schema.into(),
-        vec![std::sync::Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef],
-    )?;
-    let first = store.publish(&batch, &CancellationToken::new()).await?;
-    let repeated = store.publish(&batch, &CancellationToken::new()).await?;
-    assert_eq!(first, repeated);
-    assert!(store.verify(&first)?);
 
-    let report = store
-        .collect_orphans(&[], first.created_at().checked_add_nanos(59_000_000_000)?)
-        .await?;
-    assert_eq!(report.quarantined(), 0);
-    assert!(store.verify(&first)?);
-    drop(store);
+    let conflicting = AnalyticalDataService::open(
+        CatalogAuthority::open(test_catalog_config(second_location.clone())?)?,
+        AnalyticalManifestCatalog::open(&second_location, 8)?,
+        first_paths.artifacts()?.clone(),
+        store_config,
+    );
 
-    let store = ParquetObjectStore::open(
-        paths.artifacts()?.clone(),
-        ObjectStoreConfig::try_new(1024 * 1024, 2, Duration::from_secs(60))?,
+    assert!(matches!(
+        conflicting,
+        Err(IngestError::Parquet(
+            ParquetStoreError::RootAuthorityAlreadyOwned
+        ))
+    ));
+    drop(first);
+
+    let remapped = AnalyticalDataService::open(
+        CatalogAuthority::open(test_catalog_config(first_location.clone())?)?,
+        AnalyticalManifestCatalog::open(&first_location, 8)?,
+        second_paths.artifacts()?.clone(),
+        store_config,
+    );
+    assert!(matches!(
+        remapped,
+        Err(IngestError::Parquet(ParquetStoreError::RootCatalogMismatch))
+    ));
+    let restarted = AnalyticalDataService::open(
+        CatalogAuthority::open(test_catalog_config(first_location.clone())?)?,
+        AnalyticalManifestCatalog::open(&first_location, 8)?,
+        first_paths.artifacts()?.clone(),
+        store_config,
     )?;
-    let report = store
-        .collect_orphans(&[], first.created_at().checked_add_nanos(61_000_000_000)?)
-        .await?;
-    assert_eq!(report.quarantined(), 1);
-    assert_eq!(report.deleted(), 0);
-    let report = store
-        .collect_orphans(&[], first.created_at().checked_add_nanos(122_000_000_000)?)
-        .await?;
-    assert_eq!(report.deleted(), 1);
+    drop(restarted);
     Ok(())
 }
 
 #[tokio::test]
-async fn cancelled_publication_never_exposes_a_final_object() -> TestResult {
-    let directory = tempfile::tempdir()?;
-    let paths = LocalPaths::prepare(directory.path().join("market-squawk"))?;
-    let store = ParquetObjectStore::open(
-        paths.artifacts()?.clone(),
-        ObjectStoreConfig::try_new(1024 * 1024, 32, Duration::from_secs(60))?,
+async fn cross_root_artifact_authority_fails_before_publication_or_bind() -> TestResult {
+    let first_directory = tempfile::tempdir()?;
+    let first_paths = LocalPaths::prepare(first_directory.path().join("market-squawk"))?;
+    let second_directory = tempfile::tempdir()?;
+    let second_paths = LocalPaths::prepare(second_directory.path().join("market-squawk"))?;
+    let first_location = first_paths.catalog()?.clone();
+    let second_location = second_paths.catalog()?.clone();
+    let store_config = ObjectStoreConfig::try_new(8 * 1024 * 1024, 8192, Duration::from_secs(60))?;
+    let first = AnalyticalDataService::open(
+        CatalogAuthority::open(test_catalog_config(first_location.clone())?)?,
+        AnalyticalManifestCatalog::open(&first_location, 8)?,
+        first_paths.artifacts()?.clone(),
+        store_config,
+    )?;
+    let second = AnalyticalDataService::open(
+        CatalogAuthority::open(test_catalog_config(second_location.clone())?)?,
+        AnalyticalManifestCatalog::open(&second_location, 8)?,
+        second_paths.artifacts()?.clone(),
+        store_config,
+    )?;
+    let manifest = DatasetManifestRef::try_new(
+        DatasetId::try_from("cross-root-query-result")?,
+        1,
+        Sha256Digest::new([42; 32]),
     )?;
     let batch = RecordBatch::try_new(
         Schema::new(vec![Field::new("value", DataType::Int64, false)]).into(),
-        vec![std::sync::Arc::new(Int64Array::from(vec![1])) as ArrayRef],
+        vec![Arc::new(Int64Array::from_iter_values(0..100_000)) as ArrayRef],
     )?;
-    let cancellation = CancellationToken::new();
-    cancellation.cancel();
-    assert!(store.publish(&batch, &cancellation).await.is_err());
-    assert!(store.published_objects()?.is_empty());
-    Ok(())
-}
-
-#[tokio::test]
-async fn recovery_waits_for_the_in_flight_publication_lease() -> TestResult {
-    let directory = tempfile::tempdir()?;
-    let paths = LocalPaths::prepare(directory.path().join("market-squawk"))?;
-    let store = Arc::new(ParquetObjectStore::open(
-        paths.artifacts()?.clone(),
-        ObjectStoreConfig::try_new(1024 * 1024, 2, Duration::from_secs(60))?,
-    )?);
-    let batch = RecordBatch::try_new(
-        Schema::new(vec![Field::new("value", DataType::Int64, false)]).into(),
-        vec![Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef],
+    let limits = QueryLimits::try_new(
+        100_000,
+        4 * 1024 * 1024,
+        64 * 1024 * 1024,
+        1,
+        128,
+        128,
+        Duration::from_secs(5),
     )?;
-    let cancellation = CancellationToken::new();
-    let lease = store.begin_publication(&cancellation).await?;
-    let published = store
-        .publish_under_lease(&batch, &cancellation, &lease)
-        .await?;
+    let request = QueryRequest::try_new(manifest.clone(), "SELECT value FROM observations")?;
+    let wall_nanos = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos())?;
+    let reservation = first.reserve_query_artifact(QueryArtifactReservationInput::try_new(
+        SourceIdentifier::try_from("cross-root-owner")?,
+        request.artifact_identity(&limits),
+        limits.max_bytes(),
+        Timestamp::from_unix_nanos(wall_nanos).checked_add_nanos(120_000_000_000)?,
+    )?)?;
+    let before = count_published_objects(second_paths.artifacts()?.root())?;
+    let result = ResearchQueryEngine::from_pinned_batches(manifest, "observations", vec![batch])?
+        .with_artifact_publication(second.query_artifact_publication())?
+        .query(
+            request.with_artifact_reservation(reservation),
+            limits,
+            CancellationToken::new(),
+        )
+        .await;
 
-    let barrier = Arc::new(tokio::sync::Barrier::new(2));
-    let recovery_barrier = Arc::clone(&barrier);
-    let recovery_store = Arc::clone(&store);
-    let recovery_now = published.created_at().checked_add_nanos(61_000_000_000)?;
-    let referenced = [published.content_hash()];
-    let recovery = tokio::spawn(async move {
-        recovery_barrier.wait().await;
-        recovery_store
-            .collect_orphans(&referenced, recovery_now)
-            .await
-    });
-    barrier.wait().await;
-    tokio::task::yield_now().await;
-    assert!(!recovery.is_finished());
-    assert!(store.verify(&published)?);
-
-    drop(lease);
-
-    let report = recovery.await??;
-    assert_eq!(report.quarantined(), 0);
-    assert!(store.verify(&published)?);
+    assert!(matches!(
+        result,
+        Err(QueryError::Catalog(
+            CatalogError::InvalidReservationCapability
+        ))
+    ));
+    assert_eq!(
+        count_published_objects(second_paths.artifacts()?.root())?,
+        before
+    );
     Ok(())
 }
 
@@ -192,9 +211,9 @@ async fn authorized_query_artifact_survives_restart_until_expiry() -> TestResult
         limits.max_bytes(),
         expires_at,
     )?)?;
-    let publisher = service.query_artifact_publisher();
+    let publisher = service.query_artifact_publication();
     let engine = ResearchQueryEngine::from_pinned_batches(manifest, "observations", vec![batch])?
-        .with_artifact_publisher(Arc::clone(&store), publisher);
+        .with_artifact_publication(publisher)?;
     let result = engine
         .query(
             request.with_artifact_reservation(reservation),
@@ -350,6 +369,7 @@ async fn rights_bound_ingest_replays_one_complete_pinned_generation() -> TestRes
 
     let first_pinned = first.pinned().clone();
     let compaction = CompactionRequest::new(first.manifest().clone());
+    drop(query);
     drop(service);
     let authority = CatalogAuthority::open(catalog_config)?;
     let rights = authority.admit_source_rights(RightsDecisionInput {
@@ -485,37 +505,6 @@ async fn rights_bound_ingest_replays_one_complete_pinned_generation() -> TestRes
         std::fs::rename(&held_path, &exact_path)?;
     }
 
-    let newest = store
-        .published_objects()?
-        .into_iter()
-        .map(|object| object.created_at())
-        .max()
-        .ok_or("missing published object")?;
-    let report = store
-        .collect_orphans(&[], newest.checked_add_nanos(61_000_000_000)?)
-        .await?;
-    assert!(report.quarantined() > 0);
-    assert!(matches!(
-        deferred
-            .query(
-                QueryRequest::try_new(
-                    compacted.manifest().clone(),
-                    "SELECT source_id FROM observations",
-                )?,
-                QueryLimits::try_new(
-                    10,
-                    64 * 1024,
-                    8 * 1024 * 1024,
-                    1,
-                    128,
-                    128,
-                    Duration::from_secs(1),
-                )?,
-                CancellationToken::new(),
-            )
-            .await,
-        Err(QueryError::Artifact(_))
-    ));
     Ok(())
 }
 
@@ -638,4 +627,27 @@ fn local_source() -> Result<SourceMetadata, Box<dyn Error>> {
 
 fn digest(byte: u8) -> EvidenceDigest {
     EvidenceDigest::new(DigestAlgorithm::Sha256, [byte; 32])
+}
+
+fn test_catalog_config(
+    location: market_squawk_platform::CatalogLocation,
+) -> Result<CatalogConfig, CatalogError> {
+    CatalogConfig::try_new(
+        location,
+        Duration::from_millis(750),
+        CatalogLimit::new(32)?,
+        CatalogResultLimits::try_new(1024 * 1024, 8 * 1024 * 1024)?,
+    )
+}
+
+fn count_published_objects(root: &std::path::Path) -> Result<usize, std::io::Error> {
+    let objects = root.join("objects/sha256");
+    let mut count = 0_usize;
+    for prefix in std::fs::read_dir(objects)? {
+        let prefix = prefix?;
+        if prefix.file_type()?.is_dir() {
+            count = count.saturating_add(std::fs::read_dir(prefix.path())?.count());
+        }
+    }
+    Ok(count)
 }

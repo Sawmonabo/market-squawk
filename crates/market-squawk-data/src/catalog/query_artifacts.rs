@@ -96,6 +96,10 @@ impl QueryArtifactReservation {
     pub(crate) const fn max_bytes(&self) -> u64 {
         self.max_bytes
     }
+
+    pub(crate) const fn catalog_id(&self) -> Uuid {
+        self.catalog_id
+    }
 }
 
 impl fmt::Debug for QueryArtifactReservation {
@@ -145,7 +149,7 @@ impl QueryArtifactResult {
 }
 
 /// Least-authority binder shared by ingestion and query composition over one catalog writer.
-pub struct QueryArtifactPublisher {
+pub(crate) struct QueryArtifactPublisher {
     authority: Arc<Mutex<CatalogAuthority>>,
 }
 

@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{OBJECTS, ParquetObjectStore, ParquetStoreError, hash_file};
 use crate::PinnedDataset;
+use crate::blocking_supervisor::BlockingIoSupervisor;
 use crate::schema::encode_hex;
 
 #[derive(Debug)]
@@ -42,26 +43,47 @@ impl VerifiedPinnedObject {
     pub(crate) fn etag(&self) -> &str {
         &self.etag
     }
+
+    #[cfg(test)]
+    pub(crate) fn test_fixture(
+        relative_reference: String,
+        file: File,
+        size_bytes: u64,
+        etag: String,
+    ) -> Result<Self, std::io::Error> {
+        Ok(Self {
+            relative_reference,
+            file: Arc::new(Mutex::new(file)),
+            size_bytes,
+            modified_at: SystemTime::now(),
+            etag,
+        })
+    }
 }
 
 impl ParquetObjectStore {
     pub(crate) async fn capture_pinned_async(
         &self,
         dataset: &PinnedDataset,
-        cancellation: &CancellationToken,
+        supervisor: &BlockingIoSupervisor,
+        retained_metadata: Arc<dyn Send + Sync>,
     ) -> Result<Vec<VerifiedPinnedObject>, ParquetStoreError> {
+        let cancellation = supervisor.cancellation();
         let store = Self {
             root: self.root.clone(),
             directory: self.directory.try_clone()?,
             config: self.config,
             blocking_tasks: Arc::clone(&self.blocking_tasks),
-            publication: self.publication.clone(),
+            authority: Arc::clone(&self.authority),
         };
         let dataset = dataset.clone();
         let permit = self.acquire_blocking_permit(cancellation).await?;
+        let supervision = supervisor.start().ok_or(ParquetStoreError::Cancelled)?;
         let operation_cancellation = cancellation.child_token();
         let worker_cancellation = operation_cancellation.clone();
         let mut worker = tokio::task::spawn_blocking(move || {
+            let _supervision = supervision;
+            let _retained_metadata = retained_metadata;
             let _permit = permit;
             store.capture_pinned_files(&dataset, &worker_cancellation)
         });
@@ -71,6 +93,7 @@ impl ParquetObjectStore {
             }
             _ = cancellation.cancelled() => {
                 operation_cancellation.cancel();
+                worker.await.map_err(|_| ParquetStoreError::BlockingTaskFailed)??;
                 Err(ParquetStoreError::Cancelled)
             }
         }

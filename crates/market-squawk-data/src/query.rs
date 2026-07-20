@@ -33,10 +33,11 @@ use self::budget::{
 };
 use self::source::QuerySource;
 use self::validation::{validate_read_only_statement, validate_relations};
+use crate::blocking_supervisor::BlockingIoSupervisor;
 use crate::schema::research_schema;
 use crate::{
     ArrowConversionError, ArtifactRecord, CatalogError, DatasetManifestRef, ParquetObjectStore,
-    ParquetStoreError, PinnedDataset, PublishedObject, QueryArtifactPublisher,
+    ParquetStoreError, PinnedDataset, PublishedObject, QueryArtifactPublication,
     QueryArtifactReservation, QueryArtifactResult,
 };
 
@@ -247,8 +248,7 @@ pub struct ResearchQueryEngine {
     manifest: DatasetManifestRef,
     table_name: String,
     source: QuerySource,
-    artifact_store: Option<Arc<ParquetObjectStore>>,
-    artifact_publisher: Option<Arc<QueryArtifactPublisher>>,
+    artifact_publication: Option<Arc<QueryArtifactPublication>>,
 }
 
 impl ResearchQueryEngine {
@@ -287,8 +287,7 @@ impl ResearchQueryEngine {
                 store: Arc::clone(&store),
                 schema,
             },
-            artifact_store: Some(store),
-            artifact_publisher: None,
+            artifact_publication: None,
         })
     }
 
@@ -313,26 +312,24 @@ impl ResearchQueryEngine {
                 schema: batches[0].schema(),
                 batches,
             },
-            artifact_store: None,
-            artifact_publisher: None,
+            artifact_publication: None,
         })
     }
 
-    /// Enables controlled Parquet publication for non-inline results.
-    pub fn with_artifact_store(mut self, store: Arc<ParquetObjectStore>) -> Self {
-        self.artifact_store = Some(store);
-        self
-    }
-
-    /// Enables artifact publication only with a least-authority durable binder.
-    pub fn with_artifact_publisher(
+    /// Attaches one service-issued root/catalog publication capability.
+    pub fn with_artifact_publication(
         mut self,
-        store: Arc<ParquetObjectStore>,
-        publisher: Arc<QueryArtifactPublisher>,
-    ) -> Self {
-        self.artifact_store = Some(store);
-        self.artifact_publisher = Some(publisher);
-        self
+        publication: Arc<QueryArtifactPublication>,
+    ) -> Result<Self, QueryError> {
+        if self
+            .source
+            .root_identity()
+            .is_some_and(|identity| identity != publication.root_identity())
+        {
+            return Err(QueryError::ArtifactRootMismatch);
+        }
+        self.artifact_publication = Some(publication);
+        Ok(self)
     }
 
     /// Plans and executes one bounded, cancellation-aware query.
@@ -360,6 +357,8 @@ impl ResearchQueryEngine {
         validate_relations(&request.sql, &self.table_name, limits.max_ast_nodes)?;
         let operation_cancellation = cancellation.child_token();
         let execution_cancellation = operation_cancellation.clone();
+        let io_supervisor = BlockingIoSupervisor::new(operation_cancellation.clone());
+        let execution_io_supervisor = io_supervisor.clone();
         let execution = async {
             let memory =
                 usize::try_from(limits.max_memory_bytes).map_err(|_| QueryError::InvalidLimits)?;
@@ -392,7 +391,12 @@ impl ResearchQueryEngine {
                 .with_repartition_file_scans(false);
             let context = SessionContext::new_with_config_rt(config, runtime);
             self.source
-                .register(&context, &self.table_name, &execution_cancellation)
+                .register(
+                    &context,
+                    &self.table_name,
+                    &execution_io_supervisor,
+                    limits.max_memory_bytes,
+                )
                 .await?;
             let dataframe = context
                 .sql(&request.sql)
@@ -489,14 +493,10 @@ impl ResearchQueryEngine {
                     byte_count,
                 });
             }
-            let store = self
-                .artifact_store
+            let publication = self
+                .artifact_publication
                 .as_ref()
                 .ok_or(QueryError::ArtifactStoreRequired)?;
-            let publisher = self
-                .artifact_publisher
-                .as_ref()
-                .ok_or(QueryError::ArtifactAuthorityRequired)?;
             let reservation = request
                 .artifact_reservation
                 .as_ref()
@@ -519,24 +519,16 @@ impl ResearchQueryEngine {
                 .checked_mul(2)
                 .ok_or(QueryError::SizeOverflow)?;
             resize_memory(&artifact_memory, publication_work, limits.max_memory_bytes)?;
-            let lease = store.begin_publication(&execution_cancellation).await?;
-            let object = store
-                .publish_under_lease(&compact, &execution_cancellation, &lease)
+            let (object, artifact, ownership) = publication
+                .publish_and_bind(&compact, &execution_cancellation, reservation)
                 .await?;
-            let artifact = ArtifactRecord::try_new(
-                object.relative_reference(),
-                object.content_hash().evidence(),
-                object.size_bytes(),
-                object.created_at(),
-            )?;
-            let ownership = publisher.bind(reservation, &artifact)?;
             Ok(QueryResult::Artifact {
                 object,
                 artifact: Box::new(artifact),
                 ownership,
             })
         };
-        tokio::select! {
+        let result = tokio::select! {
             _ = cancellation.cancelled() => {
                 operation_cancellation.cancel();
                 Err(QueryError::Cancelled)
@@ -550,7 +542,16 @@ impl ResearchQueryEngine {
                     }
                 }
             }
+        };
+        if matches!(
+            result,
+            Err(QueryError::Cancelled | QueryError::DeadlineExceeded)
+        ) {
+            io_supervisor.cancel_and_drain().await;
+        } else {
+            io_supervisor.drain().await;
         }
+        result
     }
 }
 
@@ -620,6 +621,9 @@ pub enum QueryError {
     /// The attached reservation was issued for different request or limit bytes.
     #[error("query artifact reservation identity does not match this request")]
     ArtifactReservationMismatch,
+    /// A publication capability belongs to another pinned dataset root.
+    #[error("query artifact publication root does not match the pinned dataset root")]
+    ArtifactRootMismatch,
     /// DataFusion planning or execution failed.
     #[error("DataFusion query failed")]
     DataFusion(#[from] datafusion::error::DataFusionError),

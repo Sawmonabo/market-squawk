@@ -31,11 +31,11 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
 use futures_util::stream::{self, BoxStream, StreamExt};
 use thiserror::Error;
-use tokio_util::sync::CancellationToken;
 
-use super::budget::schema_retained_bytes;
-use crate::parquet_store::VerifiedPinnedObject;
-use crate::{ParquetObjectStore, PinnedDataset, QueryError};
+use super::budget::{reserve_memory, schema_retained_bytes};
+use crate::blocking_supervisor::BlockingIoSupervisor;
+use crate::parquet_store::{ArtifactRootIdentity, VerifiedPinnedObject};
+use crate::{ParquetObjectStore, ParquetStoreError, PinnedDataset, QueryError};
 
 const PINNED_STORE_URL: &str = "market-squawk://analytical";
 const STORE_NAME: &str = "PinnedReadOnlyObjectStore";
@@ -43,6 +43,10 @@ const STORE_NAME: &str = "PinnedReadOnlyObjectStore";
 #[derive(Debug, Error)]
 #[error("pinned Parquet range exceeded the query memory pool")]
 pub(super) struct PinnedRangeMemoryError;
+
+#[derive(Debug, Error)]
+#[error("pinned Parquet I/O was cancelled")]
+pub(super) struct PinnedIoCancelledError;
 
 #[derive(Debug)]
 pub(super) enum QuerySource {
@@ -58,6 +62,13 @@ pub(super) enum QuerySource {
 }
 
 impl QuerySource {
+    pub(super) fn root_identity(&self) -> Option<&ArtifactRootIdentity> {
+        match self {
+            Self::Pinned { store, .. } => Some(store.authority_identity()),
+            Self::Batches { .. } => None,
+        }
+    }
+
     pub(super) fn retained_bytes(&self) -> Result<usize, QueryError> {
         match self {
             Self::Pinned {
@@ -94,7 +105,8 @@ impl QuerySource {
         &self,
         context: &SessionContext,
         table_name: &str,
-        cancellation: &CancellationToken,
+        supervisor: &BlockingIoSupervisor,
+        max_memory_bytes: u64,
     ) -> Result<(), QueryError> {
         match self {
             Self::Pinned {
@@ -102,13 +114,31 @@ impl QuerySource {
                 store,
                 schema,
             } => {
-                let verified = store.capture_pinned_async(dataset, cancellation).await?;
+                let metadata_bytes = pinned_registration_retained_bytes_for_manifest(dataset)?;
+                let memory_pool = Arc::clone(&context.runtime_env().memory_pool);
+                let metadata_reservation =
+                    MemoryConsumer::new("market-squawk-pinned-parquet-metadata")
+                        .register(&memory_pool);
+                reserve_memory(&metadata_reservation, metadata_bytes, max_memory_bytes)?;
+                let retained_metadata = Arc::new(RetainedPinnedMetadata {
+                    _reservation: metadata_reservation,
+                });
+                let worker_metadata: Arc<dyn Send + Sync> = retained_metadata.clone();
+                let verified = store
+                    .capture_pinned_async(dataset, supervisor, worker_metadata)
+                    .await
+                    .map_err(map_capture_error)?;
                 ManifestParquetTable::register(
                     context,
                     table_name,
                     Arc::clone(schema),
                     dataset,
                     verified,
+                    PinnedRegistrationResources {
+                        supervisor: supervisor.clone(),
+                        retained_metadata,
+                        max_memory_bytes,
+                    },
                 )
             }
             Self::Batches { schema, batches } => {
@@ -118,6 +148,81 @@ impl QuerySource {
             }
         }
     }
+}
+
+fn map_capture_error(error: ParquetStoreError) -> QueryError {
+    if matches!(error, ParquetStoreError::Cancelled) {
+        QueryError::Cancelled
+    } else {
+        QueryError::Artifact(error)
+    }
+}
+
+#[derive(Debug)]
+struct RetainedPinnedMetadata {
+    _reservation: MemoryReservation,
+}
+
+struct PinnedRegistrationResources {
+    supervisor: BlockingIoSupervisor,
+    retained_metadata: Arc<RetainedPinnedMetadata>,
+    max_memory_bytes: u64,
+}
+
+fn pinned_registration_retained_bytes_for_manifest(
+    dataset: &PinnedDataset,
+) -> Result<usize, QueryError> {
+    pinned_registration_retained_bytes_for_shapes(
+        dataset
+            .objects()
+            .iter()
+            .map(|object| (object.relative_reference().len(), 64)),
+    )
+}
+
+#[cfg(test)]
+fn pinned_registration_retained_bytes(
+    verified: &[VerifiedPinnedObject],
+) -> Result<usize, QueryError> {
+    pinned_registration_retained_bytes_for_shapes(
+        verified
+            .iter()
+            .map(|object| (object.relative_reference().len(), object.etag().len())),
+    )
+}
+
+fn pinned_registration_retained_bytes_for_shapes(
+    mut shapes: impl Iterator<Item = (usize, usize)>,
+) -> Result<usize, QueryError> {
+    let fixed = size_of::<Vec<VerifiedPinnedObject>>()
+        .checked_add(size_of::<BTreeMap<ObjectPath, PinnedFile>>())
+        .and_then(|value| value.checked_add(size_of::<FileGroup>()))
+        .and_then(|value| value.checked_add(size_of::<RetainedPinnedMetadata>()))
+        .and_then(|value| value.checked_add(size_of::<usize>() * 2))
+        .ok_or(QueryError::SizeOverflow)?;
+    shapes.try_fold(fixed, |total, (reference, etag)| {
+        let verified = size_of::<VerifiedPinnedObject>()
+            .checked_add(reference)
+            .and_then(|value| value.checked_add(etag))
+            .and_then(|value| value.checked_add(size_of::<Mutex<std::fs::File>>()))
+            .and_then(|value| value.checked_add(size_of::<usize>() * 2))
+            .ok_or(QueryError::SizeOverflow)?;
+        let map_node = size_of::<ObjectPath>()
+            .checked_add(size_of::<PinnedFile>())
+            .and_then(|value| value.checked_add(size_of::<usize>() * 3))
+            .and_then(|value| value.checked_add(reference.checked_mul(2)?))
+            .and_then(|value| value.checked_add(etag))
+            .ok_or(QueryError::SizeOverflow)?;
+        let file_group = size_of::<PartitionedFile>()
+            .checked_add(reference)
+            .and_then(|value| value.checked_add(etag))
+            .ok_or(QueryError::SizeOverflow)?;
+        total
+            .checked_add(verified)
+            .and_then(|value| value.checked_add(map_node))
+            .and_then(|value| value.checked_add(file_group))
+            .ok_or(QueryError::SizeOverflow)
+    })
 }
 
 #[derive(Debug)]
@@ -131,12 +236,16 @@ struct PinnedFile {
 struct PinnedReadOnlyObjectStore {
     files: BTreeMap<ObjectPath, PinnedFile>,
     memory_pool: Arc<dyn MemoryPool>,
+    supervisor: BlockingIoSupervisor,
+    _retained_metadata: Arc<RetainedPinnedMetadata>,
 }
 
 impl PinnedReadOnlyObjectStore {
-    fn new(
+    fn new_reserved(
         files: Vec<VerifiedPinnedObject>,
         memory_pool: Arc<dyn MemoryPool>,
+        supervisor: BlockingIoSupervisor,
+        retained_metadata: Arc<RetainedPinnedMetadata>,
     ) -> Result<Self, QueryError> {
         let mut exact = BTreeMap::new();
         for file in files {
@@ -165,7 +274,30 @@ impl PinnedReadOnlyObjectStore {
         Ok(Self {
             files: exact,
             memory_pool,
+            supervisor,
+            _retained_metadata: retained_metadata,
         })
+    }
+
+    #[cfg(test)]
+    fn new(
+        files: Vec<VerifiedPinnedObject>,
+        memory_pool: Arc<dyn MemoryPool>,
+        supervisor: BlockingIoSupervisor,
+        memory_limit: u64,
+    ) -> Result<Self, QueryError> {
+        let retained_bytes = pinned_registration_retained_bytes(&files)?;
+        let reservation =
+            MemoryConsumer::new("market-squawk-pinned-parquet-metadata").register(&memory_pool);
+        reserve_memory(&reservation, retained_bytes, memory_limit)?;
+        Self::new_reserved(
+            files,
+            memory_pool,
+            supervisor,
+            Arc::new(RetainedPinnedMetadata {
+                _reservation: reservation,
+            }),
+        )
     }
 
     fn unsupported(operation: &str) -> ObjectStoreError {
@@ -237,6 +369,7 @@ impl ObjectStore for PinnedReadOnlyObjectStore {
                 Arc::clone(&pinned.file),
                 range.clone(),
                 Arc::clone(&self.memory_pool),
+                self.supervisor.clone(),
             )
             .await?
         };
@@ -283,8 +416,27 @@ async fn read_exact_range(
     file: Arc<Mutex<std::fs::File>>,
     range: Range<u64>,
     memory_pool: Arc<dyn MemoryPool>,
+    supervisor: BlockingIoSupervisor,
 ) -> ObjectStoreResult<Bytes> {
-    tokio::task::spawn_blocking(move || {
+    let supervision = supervisor.start().ok_or_else(cancelled_object_store)?;
+    let cancellation = supervisor.cancellation().clone();
+    #[cfg(test)]
+    let worker_supervisor = supervisor.clone();
+    let mut worker = tokio::task::spawn_blocking(move || {
+        let _supervision = supervision;
+        if cancellation.is_cancelled() {
+            return Err(cancelled_object_store());
+        }
+        #[cfg(test)]
+        worker_supervisor
+            .wait_at_test_range_barrier()
+            .map_err(|source| ObjectStoreError::Generic {
+                store: STORE_NAME,
+                source: source.into(),
+            })?;
+        if cancellation.is_cancelled() {
+            return Err(cancelled_object_store());
+        }
         let length = usize::try_from(range.end.saturating_sub(range.start)).map_err(|error| {
             ObjectStoreError::Generic {
                 store: STORE_NAME,
@@ -307,23 +459,44 @@ async fn read_exact_range(
                 source: Box::new(error),
             })?;
         bytes.resize(length, 0);
+        if cancellation.is_cancelled() {
+            return Err(cancelled_object_store());
+        }
         let mut file = file.lock().map_err(|_| ObjectStoreError::Generic {
             store: STORE_NAME,
             source: "verified file mutex was poisoned".into(),
         })?;
+        if cancellation.is_cancelled() {
+            return Err(cancelled_object_store());
+        }
         file.seek(SeekFrom::Start(range.start))
             .and_then(|_| file.read_exact(&mut bytes))
             .map_err(|source| ObjectStoreError::Generic {
                 store: STORE_NAME,
                 source: Box::new(source),
             })?;
+        if cancellation.is_cancelled() {
+            return Err(cancelled_object_store());
+        }
         Ok(Bytes::from_owner(ReservedBytes {
             bytes,
             _reservation: reservation,
         }))
-    })
-    .await
-    .map_err(ObjectStoreError::from)?
+    });
+    tokio::select! {
+        result = &mut worker => result.map_err(ObjectStoreError::from)?,
+        _ = supervisor.cancellation().cancelled() => {
+            let _ = worker.await.map_err(ObjectStoreError::from)?;
+            Err(cancelled_object_store())
+        }
+    }
+}
+
+fn cancelled_object_store() -> ObjectStoreError {
+    ObjectStoreError::Generic {
+        store: STORE_NAME,
+        source: Box::new(PinnedIoCancelledError),
+    }
 }
 
 struct ReservedBytes {
@@ -342,35 +515,50 @@ pub(super) struct ManifestParquetTable {
     schema: SchemaRef,
     object_store_url: ObjectStoreUrl,
     files: FileGroup,
+    _retained_metadata: Arc<RetainedPinnedMetadata>,
 }
 
 impl ManifestParquetTable {
-    pub(super) fn register(
+    fn register(
         context: &SessionContext,
         table_name: &str,
         schema: SchemaRef,
         dataset: &PinnedDataset,
         verified: Vec<VerifiedPinnedObject>,
+        resources: PinnedRegistrationResources,
     ) -> Result<(), QueryError> {
+        let PinnedRegistrationResources {
+            supervisor,
+            retained_metadata,
+            max_memory_bytes,
+        } = resources;
         let object_store_url = ObjectStoreUrl::parse(PINNED_STORE_URL)?;
         let memory_pool = Arc::clone(&context.runtime_env().memory_pool);
         context.register_object_store(
             object_store_url.as_ref(),
-            Arc::new(PinnedReadOnlyObjectStore::new(verified, memory_pool)?),
+            Arc::new(PinnedReadOnlyObjectStore::new_reserved(
+                verified,
+                memory_pool,
+                supervisor,
+                Arc::clone(&retained_metadata),
+            )?),
         );
-        let files = dataset
-            .objects()
-            .iter()
-            .map(|pinned| {
-                PartitionedFile::new(pinned.relative_reference(), pinned.object().size_bytes())
-            })
-            .collect();
+        let mut files = Vec::new();
+        files
+            .try_reserve_exact(dataset.objects().len())
+            .map_err(|_| QueryError::MemoryLimitExceeded {
+                limit: max_memory_bytes,
+            })?;
+        files.extend(dataset.objects().iter().map(|pinned| {
+            PartitionedFile::new(pinned.relative_reference(), pinned.object().size_bytes())
+        }));
         context.register_table(
             table_name,
             Arc::new(Self {
                 schema,
                 object_store_url,
                 files: FileGroup::new(files),
+                _retained_metadata: retained_metadata,
             }),
         )?;
         Ok(())
@@ -401,5 +589,71 @@ impl TableProvider for ManifestParquetTable {
             .with_limit(limit)
             .build();
         Ok(DataSourceExec::from_data_source(config))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error;
+
+    use datafusion::execution::memory_pool::GreedyMemoryPool;
+    use tokio_util::sync::CancellationToken;
+
+    use super::*;
+    use crate::ParquetStoreError;
+
+    type TestResult = Result<(), Box<dyn Error>>;
+
+    #[tokio::test]
+    async fn pinned_io_cancellation_is_joined_and_many_object_metadata_is_admitted() -> TestResult {
+        assert!(matches!(
+            map_capture_error(ParquetStoreError::Cancelled),
+            QueryError::Cancelled
+        ));
+
+        let mut range_file = tempfile::tempfile()?;
+        std::io::Write::write_all(&mut range_file, &[7_u8; 4096])?;
+        let cancellation = CancellationToken::new();
+        let supervisor = BlockingIoSupervisor::new(cancellation.clone());
+        let mut barrier = supervisor.install_test_range_barrier()?;
+        let range_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(8192));
+        let read_supervisor = supervisor.clone();
+        let read = tokio::spawn(read_exact_range(
+            Arc::new(Mutex::new(range_file)),
+            0..4096,
+            range_pool,
+            read_supervisor,
+        ));
+        barrier.wait_until_entered().await?;
+        cancellation.cancel();
+        barrier.release()?;
+        assert!(read.await?.is_err());
+        supervisor.cancel_and_drain().await;
+        assert_eq!(supervisor.active(), 0);
+
+        let seed = tempfile::tempfile()?;
+        let verified = (0..64)
+            .map(|index| {
+                VerifiedPinnedObject::test_fixture(
+                    format!("objects/sha256/aa/{index:064x}.parquet"),
+                    seed.try_clone()?,
+                    1,
+                    format!("{index:064x}"),
+                )
+            })
+            .collect::<Result<Vec<_>, std::io::Error>>()?;
+        let required = pinned_registration_retained_bytes(&verified)?;
+        let tight_limit = required.checked_sub(1).ok_or("nonzero retained charge")?;
+        let tight_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(tight_limit));
+        assert!(matches!(
+            PinnedReadOnlyObjectStore::new(
+                verified,
+                tight_pool,
+                BlockingIoSupervisor::new(CancellationToken::new()),
+                u64::try_from(tight_limit)?,
+            ),
+            Err(QueryError::MemoryLimitExceeded { limit }) if limit == u64::try_from(tight_limit)?
+        ));
+        Ok(())
     }
 }

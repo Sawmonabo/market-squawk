@@ -9,7 +9,7 @@ use datafusion::error::DataFusionError;
 use datafusion::execution::memory_pool::MemoryReservation;
 
 use super::QueryError;
-use super::source::PinnedRangeMemoryError;
+use super::source::{PinnedIoCancelledError, PinnedRangeMemoryError};
 
 #[derive(Debug, Default)]
 pub(super) struct CountingWriter {
@@ -72,7 +72,9 @@ pub(super) fn resize_memory(
 }
 
 pub(super) fn map_datafusion(error: DataFusionError, limit: u64) -> QueryError {
-    if datafusion_memory_error(&error) {
+    if error_chain_has_marker::<PinnedIoCancelledError>(&error) {
+        QueryError::Cancelled
+    } else if datafusion_memory_error(&error) {
         QueryError::MemoryLimitExceeded { limit }
     } else {
         QueryError::DataFusion(error)
@@ -80,7 +82,7 @@ pub(super) fn map_datafusion(error: DataFusionError, limit: u64) -> QueryError {
 }
 
 fn datafusion_memory_error(error: &DataFusionError) -> bool {
-    if error_chain_has_pinned_memory_marker(error) {
+    if error_chain_has_marker::<PinnedRangeMemoryError>(error) {
         return true;
     }
     match error {
@@ -90,10 +92,10 @@ fn datafusion_memory_error(error: &DataFusionError) -> bool {
     }
 }
 
-fn error_chain_has_pinned_memory_marker(error: &(dyn StdError + 'static)) -> bool {
+fn error_chain_has_marker<T: StdError + 'static>(error: &(dyn StdError + 'static)) -> bool {
     let mut current = Some(error);
     while let Some(source) = current {
-        if source.downcast_ref::<PinnedRangeMemoryError>().is_some() {
+        if source.downcast_ref::<T>().is_some() {
             return true;
         }
         current = source.source();

@@ -2961,6 +2961,7 @@ dependencies = [
  "cap-std",
  "chrono",
  "datafusion",
+ "fs2",
  "futures-util",
  "libc",
  "market-squawk-domain",

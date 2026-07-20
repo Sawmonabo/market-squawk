@@ -1,5 +1,6 @@
 //! Grace-bounded orphan enumeration, quarantine, and deletion.
 
+#[cfg(test)]
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::Duration;
@@ -79,12 +80,13 @@ impl OrphanRecoverySession<'_> {
 
 impl ParquetObjectStore {
     /// Returns a bounded snapshot of content-addressed final objects.
-    pub fn published_objects(&self) -> Result<Vec<PublishedObject>, ParquetStoreError> {
+    #[cfg(test)]
+    pub(crate) fn published_objects(&self) -> Result<Vec<PublishedObject>, ParquetStoreError> {
         scan_objects(&self.directory, OBJECTS)
     }
 
-    /// Quarantines grace-eligible objects absent from the supplied durable references.
-    pub async fn collect_orphans(
+    #[cfg(test)]
+    pub(crate) async fn collect_orphans_fault_fixture(
         &self,
         referenced: &[Sha256Digest],
         now: Timestamp,
@@ -103,7 +105,7 @@ impl ParquetObjectStore {
         &self,
         now: Timestamp,
     ) -> Result<OrphanRecoverySession<'_>, ParquetStoreError> {
-        let lease = self.publication.acquire_recovery().await;
+        let lease = self.authority.publication.acquire_recovery().await;
         let deleted = delete_expired_quarantine(&self.directory, now, self.config.orphan_grace)?;
         let quarantined = self.quarantine_expired_staging(now)?;
         let cutoff = recovery_cutoff(now, self.config.orphan_grace)?;
@@ -257,4 +259,72 @@ fn recovery_cutoff(now: Timestamp, grace: Duration) -> Result<i64, ParquetStoreE
     now.unix_nanos()
         .checked_sub(grace_nanos)
         .ok_or(ParquetStoreError::SizeOverflow)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error;
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, Int64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use market_squawk_platform::LocalPaths;
+    use tokio_util::sync::CancellationToken;
+
+    use super::*;
+
+    type TestResult = Result<(), Box<dyn Error>>;
+
+    #[tokio::test]
+    async fn direct_orphan_collection_is_a_private_lease_serialized_fault_fixture() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let paths = LocalPaths::prepare(directory.path().join("market-squawk"))?;
+        let store = Arc::new(ParquetObjectStore::open(
+            paths.artifacts()?.clone(),
+            ObjectStoreConfig::try_new(1024 * 1024, 2, Duration::from_secs(60))?,
+            paths.catalog()?.path(),
+            [7; 32],
+        )?);
+        let batch = RecordBatch::try_new(
+            Schema::new(vec![Field::new("value", DataType::Int64, false)]).into(),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef],
+        )?;
+        let cancellation = CancellationToken::new();
+        let first = store.publish(&batch, &cancellation).await?;
+        assert_eq!(store.publish(&batch, &cancellation).await?, first);
+        assert_eq!(store.published_objects()?.len(), 1);
+
+        let lease = store.begin_publication(&cancellation).await?;
+        let recovery_store = Arc::clone(&store);
+        let recovery_now = first.created_at().checked_add_nanos(61_000_000_000)?;
+        let referenced = [first.content_hash()];
+        let recovery = tokio::spawn(async move {
+            recovery_store
+                .collect_orphans_fault_fixture(&referenced, recovery_now)
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!recovery.is_finished());
+        drop(lease);
+        assert_eq!(recovery.await??.quarantined(), 0);
+        assert!(store.verify(&first)?);
+
+        let report = store
+            .collect_orphans_fault_fixture(&[], recovery_now)
+            .await?;
+        assert_eq!(report.quarantined(), 1);
+        assert_eq!(store.published_objects()?.len(), 0);
+        assert_eq!(
+            store
+                .collect_orphans_fault_fixture(
+                    &[],
+                    first.created_at().checked_add_nanos(122_000_000_000)?,
+                )
+                .await?
+                .deleted(),
+            1
+        );
+        Ok(())
+    }
 }

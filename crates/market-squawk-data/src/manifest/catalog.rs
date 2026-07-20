@@ -1,6 +1,7 @@
 //! SQLite-backed immutable analytical generation storage.
 
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceId, Timestamp};
@@ -68,6 +69,7 @@ impl PinnedDataset {
 pub struct AnalyticalManifestCatalog {
     connection: Mutex<Connection>,
     max_objects_per_generation: usize,
+    catalog_path: PathBuf,
 }
 
 impl fmt::Debug for AnalyticalManifestCatalog {
@@ -111,11 +113,16 @@ impl AnalyticalManifestCatalog {
         Ok(Self {
             connection: Mutex::new(connection),
             max_objects_per_generation,
+            catalog_path: location.path().to_path_buf(),
         })
     }
 
+    pub(crate) fn catalog_path(&self) -> &Path {
+        &self.catalog_path
+    }
+
     /// Builds the exact next ingest plan while the process-owned catalog writer is serialized.
-    pub fn preview_append(
+    pub(crate) fn preview_append(
         &self,
         dataset_id: DatasetId,
         object: ManifestObject,
@@ -132,7 +139,7 @@ impl AnalyticalManifestCatalog {
     }
 
     /// Builds a one-object compaction plan preserving the exact prior semantics.
-    pub fn preview_compaction(
+    pub(crate) fn preview_compaction(
         &self,
         previous: &DatasetManifestRef,
         compacted: ManifestObject,
@@ -143,7 +150,7 @@ impl AnalyticalManifestCatalog {
     }
 
     /// Commits one complete generation using `BEGIN IMMEDIATE` after the Task 3 anchor exists.
-    pub fn commit_generation(
+    pub(crate) fn commit_generation(
         &self,
         plan: &ManifestPlan,
         artifact: &ArtifactRecord,
@@ -336,7 +343,7 @@ impl AnalyticalManifestCatalog {
     }
 
     /// Returns generation objects and query results whose exclusive expiry is still in the future.
-    pub fn referenced_hashes(
+    pub(crate) fn referenced_hashes(
         &self,
         now: Timestamp,
     ) -> Result<Vec<Sha256Digest>, ManifestCatalogError> {

@@ -2,6 +2,7 @@
 
 use std::fmt;
 use std::ops::Deref;
+use std::path::Path;
 
 use market_squawk_domain::{SourceId, Timestamp};
 use rusqlite::{OptionalExtension as _, Row, Transaction, params};
@@ -42,6 +43,18 @@ impl CatalogAuthority {
     /// Returns the catalog service edge while retaining the private registrar authority.
     pub const fn catalog(&self) -> &Catalog {
         &self.catalog
+    }
+
+    pub(crate) fn catalog_path(&self) -> &Path {
+        &self.catalog.catalog_path
+    }
+
+    pub(crate) const fn session_id(&self) -> Uuid {
+        self.catalog.catalog_id
+    }
+
+    pub(crate) const fn artifact_root_binding(&self) -> [u8; 32] {
+        self.catalog.artifact_root_binding
     }
 
     /// Validates and durably admits rights evidence through the composition authority.
