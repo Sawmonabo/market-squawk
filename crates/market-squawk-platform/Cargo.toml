@@ -16,12 +16,16 @@ capture-test = []
 
 [dependencies]
 arc-swap = { workspace = true }
+argon2 = { workspace = true }
 bytes = { workspace = true }
 cap-fs-ext = { workspace = true }
 cap-std = { workspace = true }
+chacha20poly1305 = { workspace = true }
 chrono = { workspace = true }
 crc32fast = { workspace = true }
 fs2 = { workspace = true }
+getrandom = { workspace = true }
+keyring = { workspace = true }
 libc = { workspace = true }
 market-squawk-domain = { workspace = true }
 memory-stats = { workspace = true, optional = true }
@@ -49,6 +53,9 @@ sha2 = { workspace = true }
 
 [target.'cfg(loom)'.dependencies]
 loom = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+atomicwrites = { workspace = true }
 
 [[bin]]
 name = "capture-admission-evidence"

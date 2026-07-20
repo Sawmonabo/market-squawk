@@ -6,8 +6,12 @@ mod config;
 mod journal;
 mod paths;
 mod raw_record;
+mod secrets;
 
-pub use authority_state::{LocalAuthorityStateStore, LocalAuthorityStateStoreError};
+pub use authority_state::{
+    AuthorityCommitContext, AuthorityStateSnapshot, LocalAuthorityStateStore,
+    LocalAuthorityStateStoreError,
+};
 #[cfg(all(feature = "capture-test", debug_assertions))]
 pub use capture::CaptureReceiverTestCoordinationError;
 #[cfg(feature = "capture-benchmark")]
@@ -37,7 +41,11 @@ pub use journal::{
     JournalSinkLimits, JournalWriter,
 };
 pub use paths::{
-    ArtifactPathError, ArtifactRoot, JournalFileFormat, JournalSelectionError, LocalPaths,
-    PathError, ResolvedArtifactPath,
+    ArtifactPathError, ArtifactRoot, CatalogFileGuard, CatalogLocation, CatalogWriterGuard,
+    JournalFileFormat, JournalSelectionError, LocalPaths, PathError, ResolvedArtifactPath,
 };
 pub use raw_record::{RawCaptureRecord, RawCaptureRecordError};
+pub use secrets::{
+    EncryptedFileSecretStore, LocalSecretStoreError, OsKeyringSecretStore, RotationAuthority,
+    RotationOutcome, SecretKey, SecretStore,
+};

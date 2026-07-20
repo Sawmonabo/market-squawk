@@ -56,6 +56,7 @@ rmcp = { version = "=2.2.0", default-features = false, features = [
 rusqlite = { version = "=0.40.1", default-features = false, features = [
     "backup",
     "bundled",
+    "limits",
 ] }
 schemars = { version = "=1.2.1", default-features = false, features = [
     "derive",

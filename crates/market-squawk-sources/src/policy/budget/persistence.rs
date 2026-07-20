@@ -65,11 +65,18 @@ fn map_local_store_error(
         | LocalAuthorityStateStoreError::UnsafeFileType
         | LocalAuthorityStateStoreError::PayloadTooLarge { .. }
         | LocalAuthorityStateStoreError::EnvelopeTooLarge { .. }
-        | LocalAuthorityStateStoreError::CorruptEnvelope => AuthorityStateStoreError::InvalidState,
+        | LocalAuthorityStateStoreError::CorruptEnvelope
+        | LocalAuthorityStateStoreError::GenerationConflict
+        | LocalAuthorityStateStoreError::GenerationExhausted
+        | LocalAuthorityStateStoreError::StaleCommitContext => {
+            AuthorityStateStoreError::InvalidState
+        }
         LocalAuthorityStateStoreError::AlreadyLocked
         | LocalAuthorityStateStoreError::Allocation
         | LocalAuthorityStateStoreError::WriterUnavailable
         | LocalAuthorityStateStoreError::AtomicReplaceUnsupported
+        | LocalAuthorityStateStoreError::RecoveryRequired
+        | LocalAuthorityStateStoreError::FinalizationPending
         | LocalAuthorityStateStoreError::SecureRootUnsupported
         | LocalAuthorityStateStoreError::VerificationFailed
         | LocalAuthorityStateStoreError::Io { .. } => AuthorityStateStoreError::Unavailable,

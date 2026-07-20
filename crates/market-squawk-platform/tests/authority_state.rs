@@ -4,15 +4,20 @@ use std::sync::{Arc, Barrier};
 
 use market_squawk_platform::{LocalAuthorityStateStore, LocalAuthorityStateStoreError};
 
-const CANONICAL_FILE: &str = "authority-state.bin";
-const TEMP_FILE: &str = ".authority-state.tmp";
+const SLOT_A_FILE: &str = "authority-state-a.bin";
+const SLOT_B_FILE: &str = "authority-state-b.bin";
+const TEMP_A_FILE: &str = ".authority-state-a.tmp";
+const TEMP_B_FILE: &str = ".authority-state-b.tmp";
 const LOCK_FILE: &str = ".authority-state.lock";
 const MAX_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 const MAGIC_BYTES: usize = 8;
 const VERSION_BYTES: usize = 2;
+const GENERATION_BYTES: usize = 8;
 const LENGTH_BYTES: usize = 8;
 const DIGEST_BYTES: usize = 32;
-const HEADER_BYTES: usize = MAGIC_BYTES + VERSION_BYTES + LENGTH_BYTES + DIGEST_BYTES;
+const LENGTH_OFFSET: usize =
+    MAGIC_BYTES + VERSION_BYTES + GENERATION_BYTES + DIGEST_BYTES + GENERATION_BYTES + DIGEST_BYTES;
+const HEADER_BYTES: usize = LENGTH_OFFSET + LENGTH_BYTES + DIGEST_BYTES + DIGEST_BYTES;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 type CorruptionCase = (&'static str, fn(&mut Vec<u8>));
@@ -29,9 +34,16 @@ fn round_trip_replacement_and_reopen_preserve_only_the_latest_canonical_payload(
         assert_eq!(store.load()?, Some(b"second-authority-state".to_vec()));
     }
 
+    #[cfg(unix)]
+    fs::hard_link(
+        directory.path().join(SLOT_A_FILE),
+        directory.path().join(TEMP_A_FILE),
+    )?;
+
     let reopened = LocalAuthorityStateStore::try_open(directory.path())?;
     assert_eq!(reopened.load()?, Some(b"second-authority-state".to_vec()));
-    assert!(!directory.path().join(TEMP_FILE).exists());
+    assert!(!directory.path().join(TEMP_A_FILE).exists());
+    assert!(!directory.path().join(TEMP_B_FILE).exists());
     Ok(())
 }
 
@@ -89,7 +101,8 @@ fn concurrent_in_process_writers_are_serialized_without_losing_canonical_state()
 
     let final_state = store.load()?.ok_or("canonical state is missing")?;
     assert!(final_state == b"writer-one" || final_state == b"writer-two");
-    assert!(!directory.path().join(TEMP_FILE).exists());
+    assert!(!directory.path().join(TEMP_A_FILE).exists());
+    assert!(!directory.path().join(TEMP_B_FILE).exists());
     Ok(())
 }
 
@@ -106,27 +119,24 @@ fn debug_output_redacts_directory_handles_and_authority_payloads() -> TestResult
 }
 
 #[test]
-fn orphan_temp_is_never_authority_and_is_recovered_before_the_next_store() -> TestResult {
+fn unproven_orphan_temp_is_rejected_as_ambiguous_state() -> TestResult {
     let directory = tempfile::tempdir()?;
-    fs::write(directory.path().join(TEMP_FILE), b"interrupted-write")?;
-    let store = LocalAuthorityStateStore::try_open(directory.path())?;
-    assert_eq!(store.load()?, None);
-    store.store(b"canonical")?;
-    assert_eq!(store.load()?, Some(b"canonical".to_vec()));
-    assert!(!directory.path().join(TEMP_FILE).exists());
+    fs::write(directory.path().join(TEMP_A_FILE), b"interrupted-write")?;
+    assert!(matches!(
+        LocalAuthorityStateStore::try_open(directory.path()),
+        Err(LocalAuthorityStateStoreError::UnsafeFileType)
+    ));
     Ok(())
 }
 
 #[test]
-fn truncated_hash_version_and_declared_length_corruption_fail_closed() -> TestResult {
+fn one_content_invalid_peer_is_repaired_but_two_valid_unrelated_peers_fail_closed() -> TestResult {
     let cases: &[CorruptionCase] = &[
         ("truncated", |bytes| bytes.truncate(HEADER_BYTES - 1)),
-        ("hash", |bytes| {
-            bytes[MAGIC_BYTES + VERSION_BYTES + LENGTH_BYTES] ^= 0xff
-        }),
+        ("hash", |bytes| bytes[LENGTH_OFFSET + LENGTH_BYTES] ^= 0xff),
         ("version", |bytes| bytes[MAGIC_BYTES + 1] ^= 0x01),
         ("length", |bytes| {
-            bytes[MAGIC_BYTES + VERSION_BYTES + LENGTH_BYTES - 1] ^= 0x01
+            bytes[LENGTH_OFFSET + LENGTH_BYTES - 1] ^= 0x01
         }),
     ];
 
@@ -136,30 +146,43 @@ fn truncated_hash_version_and_declared_length_corruption_fail_closed() -> TestRe
             let store = LocalAuthorityStateStore::try_open(directory.path())?;
             store.store(format!("payload-{name}").as_bytes())?;
         }
-        let path = directory.path().join(CANONICAL_FILE);
+        let path = directory.path().join(SLOT_B_FILE);
         let mut bytes = fs::read(&path)?;
         corrupt(&mut bytes);
         fs::write(path, bytes)?;
 
-        let store = LocalAuthorityStateStore::try_open(directory.path())?;
-        assert!(matches!(
-            store.load(),
-            Err(LocalAuthorityStateStoreError::CorruptEnvelope)
-        ));
+        let reopened = LocalAuthorityStateStore::try_open(directory.path())?;
+        assert_eq!(
+            reopened.load()?,
+            Some(format!("payload-{name}").into_bytes())
+        );
     }
+
+    let directory = tempfile::tempdir()?;
+    {
+        let store = LocalAuthorityStateStore::try_open(directory.path())?;
+        store.store(b"canonical")?;
+    }
+    fs::copy(
+        directory.path().join(SLOT_A_FILE),
+        directory.path().join(SLOT_B_FILE),
+    )?;
+    assert!(matches!(
+        LocalAuthorityStateStore::try_open(directory.path()),
+        Err(LocalAuthorityStateStoreError::GenerationConflict)
+    ));
     Ok(())
 }
 
 #[test]
 fn oversized_envelope_is_rejected_before_payload_allocation() -> TestResult {
     let directory = tempfile::tempdir()?;
-    let canonical = directory.path().join(CANONICAL_FILE);
+    let canonical = directory.path().join(SLOT_B_FILE);
     let file = fs::File::create(&canonical)?;
     file.set_len(u64::try_from(HEADER_BYTES + MAX_PAYLOAD_BYTES + 1)?)?;
     drop(file);
-    let store = LocalAuthorityStateStore::try_open(directory.path())?;
     assert!(matches!(
-        store.load(),
+        LocalAuthorityStateStore::try_open(directory.path()),
         Err(LocalAuthorityStateStoreError::EnvelopeTooLarge { .. })
     ));
     Ok(())
@@ -170,13 +193,15 @@ fn failed_new_store_does_not_replace_the_last_canonical_state() -> TestResult {
     let directory = tempfile::tempdir()?;
     let store = LocalAuthorityStateStore::try_open(directory.path())?;
     store.store(b"last-good")?;
-    let before = fs::read(directory.path().join(CANONICAL_FILE))?;
+    let before_a = fs::read(directory.path().join(SLOT_A_FILE))?;
+    let before_b = fs::read(directory.path().join(SLOT_B_FILE))?;
 
     assert!(matches!(
         store.store(&vec![0; MAX_PAYLOAD_BYTES + 1]),
         Err(LocalAuthorityStateStoreError::PayloadTooLarge { .. })
     ));
-    assert_eq!(fs::read(directory.path().join(CANONICAL_FILE))?, before);
+    assert_eq!(fs::read(directory.path().join(SLOT_A_FILE))?, before_a);
+    assert_eq!(fs::read(directory.path().join(SLOT_B_FILE))?, before_b);
     assert_eq!(store.load()?, Some(b"last-good".to_vec()));
     Ok(())
 }
@@ -186,7 +211,13 @@ fn failed_new_store_does_not_replace_the_last_canonical_state() -> TestResult {
 fn canonical_temp_lock_and_root_symlinks_are_rejected_without_following() -> TestResult {
     use std::os::unix::fs::symlink;
 
-    for protected_name in [CANONICAL_FILE, TEMP_FILE, LOCK_FILE] {
+    for protected_name in [
+        SLOT_A_FILE,
+        SLOT_B_FILE,
+        TEMP_A_FILE,
+        TEMP_B_FILE,
+        LOCK_FILE,
+    ] {
         let parent = tempfile::tempdir()?;
         let root = parent.path().join("authority");
         let outside = parent.path().join("outside");
@@ -195,18 +226,10 @@ fn canonical_temp_lock_and_root_symlinks_are_rejected_without_following() -> Tes
         symlink(&outside, root.join(protected_name))?;
 
         let opened = LocalAuthorityStateStore::try_open(&root);
-        if protected_name == CANONICAL_FILE {
-            let store = opened?;
-            assert!(matches!(
-                store.load(),
-                Err(LocalAuthorityStateStoreError::UnsafeFileType)
-            ));
-        } else {
-            assert!(matches!(
-                opened,
-                Err(LocalAuthorityStateStoreError::UnsafeFileType)
-            ));
-        }
+        assert!(matches!(
+            opened,
+            Err(LocalAuthorityStateStoreError::UnsafeFileType)
+        ));
         assert_eq!(fs::read(&outside)?, b"outside");
     }
 
@@ -243,10 +266,9 @@ fn reparse_root_is_rejected_from_the_opened_windows_handle() -> TestResult {
 #[test]
 fn non_regular_canonical_file_is_rejected_as_ambiguous_authority() -> TestResult {
     let directory = tempfile::tempdir()?;
-    fs::create_dir(directory.path().join(CANONICAL_FILE))?;
-    let store = LocalAuthorityStateStore::try_open(directory.path())?;
+    fs::create_dir(directory.path().join(SLOT_B_FILE))?;
     assert!(matches!(
-        store.load(),
+        LocalAuthorityStateStore::try_open(directory.path()),
         Err(LocalAuthorityStateStoreError::UnsafeFileType)
     ));
     Ok(())
@@ -254,7 +276,13 @@ fn non_regular_canonical_file_is_rejected_as_ambiguous_authority() -> TestResult
 
 #[test]
 fn hard_linked_reserved_files_are_rejected_as_ambiguous_authority() -> TestResult {
-    for protected_name in [CANONICAL_FILE, TEMP_FILE, LOCK_FILE] {
+    for protected_name in [
+        SLOT_A_FILE,
+        SLOT_B_FILE,
+        TEMP_A_FILE,
+        TEMP_B_FILE,
+        LOCK_FILE,
+    ] {
         let parent = tempfile::tempdir()?;
         let root = parent.path().join("authority");
         fs::create_dir(&root)?;
@@ -263,18 +291,10 @@ fn hard_linked_reserved_files_are_rejected_as_ambiguous_authority() -> TestResul
         fs::hard_link(&outside, root.join(protected_name))?;
 
         let opened = LocalAuthorityStateStore::try_open(&root);
-        if protected_name == CANONICAL_FILE {
-            let store = opened?;
-            assert!(matches!(
-                store.load(),
-                Err(LocalAuthorityStateStoreError::UnsafeFileType)
-            ));
-        } else {
-            assert!(matches!(
-                opened,
-                Err(LocalAuthorityStateStoreError::UnsafeFileType)
-            ));
-        }
+        assert!(matches!(
+            opened,
+            Err(LocalAuthorityStateStoreError::UnsafeFileType)
+        ));
         assert_eq!(fs::read(&outside)?, b"outside");
     }
     Ok(())
@@ -294,10 +314,11 @@ fn existing_root_and_new_state_files_receive_private_permissions() -> TestResult
 
     assert_eq!(fs::metadata(&root)?.permissions().mode() & 0o777, 0o700);
     assert_eq!(
-        fs::metadata(root.join(CANONICAL_FILE))?
-            .permissions()
-            .mode()
-            & 0o777,
+        fs::metadata(root.join(SLOT_A_FILE))?.permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        fs::metadata(root.join(SLOT_B_FILE))?.permissions().mode() & 0o777,
         0o600
     );
     assert_eq!(
@@ -314,12 +335,13 @@ fn absent_nested_root_is_created_before_capability_confined_use() -> TestResult 
     let store = LocalAuthorityStateStore::try_open(&root)?;
     store.store(b"created-root")?;
     assert_eq!(store.load()?, Some(b"created-root".to_vec()));
-    assert!(root.join(CANONICAL_FILE).is_file());
+    assert!(root.join(SLOT_A_FILE).is_file());
+    assert!(root.join(SLOT_B_FILE).is_file());
     Ok(())
 }
 
 #[test]
-fn trailing_bytes_after_the_declared_payload_are_rejected() -> TestResult {
+fn trailing_bytes_on_one_peer_are_repaired_from_the_verified_peer() -> TestResult {
     let directory = tempfile::tempdir()?;
     {
         let store = LocalAuthorityStateStore::try_open(directory.path())?;
@@ -327,41 +349,35 @@ fn trailing_bytes_after_the_declared_payload_are_rejected() -> TestResult {
     }
     let mut file = fs::OpenOptions::new()
         .append(true)
-        .open(directory.path().join(CANONICAL_FILE))?;
+        .open(directory.path().join(SLOT_B_FILE))?;
     file.write_all(b"trailing")?;
     file.sync_all()?;
 
-    let store = LocalAuthorityStateStore::try_open(directory.path())?;
-    assert!(matches!(
-        store.load(),
-        Err(LocalAuthorityStateStoreError::CorruptEnvelope)
-    ));
+    let reopened = LocalAuthorityStateStore::try_open(directory.path())?;
+    assert_eq!(reopened.load()?, Some(b"canonical".to_vec()));
     Ok(())
 }
 
 #[test]
-fn a_length_field_larger_than_the_file_fails_without_growth_or_retry() -> TestResult {
+fn invalid_declared_length_on_one_peer_is_repaired_without_file_growth() -> TestResult {
     let directory = tempfile::tempdir()?;
     {
         let store = LocalAuthorityStateStore::try_open(directory.path())?;
         store.store(b"short")?;
     }
-    let canonical = directory.path().join(CANONICAL_FILE);
+    let canonical = directory.path().join(SLOT_B_FILE);
     let mut file = fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open(&canonical)?;
-    file.seek(SeekFrom::Start(u64::try_from(MAGIC_BYTES + VERSION_BYTES)?))?;
+    file.seek(SeekFrom::Start(u64::try_from(LENGTH_OFFSET)?))?;
     file.write_all(&(MAX_PAYLOAD_BYTES as u64).to_be_bytes())?;
     file.sync_all()?;
     drop(file);
 
     let before = fs::metadata(&canonical)?.len();
-    let store = LocalAuthorityStateStore::try_open(directory.path())?;
-    assert!(matches!(
-        store.load(),
-        Err(LocalAuthorityStateStoreError::CorruptEnvelope)
-    ));
+    let reopened = LocalAuthorityStateStore::try_open(directory.path())?;
+    assert_eq!(reopened.load()?, Some(b"short".to_vec()));
     assert_eq!(fs::metadata(canonical)?.len(), before);
     Ok(())
 }

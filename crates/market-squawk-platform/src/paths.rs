@@ -1,19 +1,21 @@
 //! Local directory layout and capability-confined artifact publication.
 
+mod catalog;
+
 use std::{
     fmt,
     path::{Component, Path, PathBuf},
     sync::Arc,
 };
 
-use cap_std::{
-    ambient_authority,
-    fs::{Dir, OpenOptions},
-};
+use cap_std::fs::{Dir, OpenOptions};
 use thiserror::Error;
 
 use crate::journal::ParentDirectorySync;
 use crate::{JournalError, JournalSinkConstructionError, JournalSinkLimits, JournalWriter};
+
+use self::catalog::open_prepared_root;
+pub use self::catalog::{CatalogFileGuard, CatalogLocation, CatalogWriterGuard};
 
 const MAX_ARTIFACT_COMPONENT_BYTES: usize = 255;
 const MAX_ARTIFACT_DEPTH: usize = 32;
@@ -37,6 +39,15 @@ pub enum PathError {
     /// Artifact publication was requested from a read-only/no-create path view.
     #[error("artifact root is unavailable in read-only path mode")]
     ArtifactRootUnavailable,
+    /// Catalog placement requires a prepared local path capability.
+    #[error("catalog location is unavailable in read-only path mode")]
+    CatalogLocationUnavailable,
+    /// The prepared local root path no longer names the retained directory capability.
+    #[error("prepared local root identity changed")]
+    PreparedRootChanged,
+    /// Another process owns the prepared catalog writer lock.
+    #[error("prepared catalog already has an active writer")]
+    CatalogAlreadyLocked,
 }
 
 impl PathError {
@@ -318,6 +329,7 @@ pub struct LocalPaths {
     root: PathBuf,
     journal_dir: PathBuf,
     artifacts: Option<ArtifactRoot>,
+    catalog: Option<CatalogLocation>,
     journal_capability: Option<Arc<Dir>>,
 }
 
@@ -329,8 +341,7 @@ impl LocalPaths {
         std::fs::create_dir_all(root)
             .map_err(|source| PathError::io("failed to create local data root", source))?;
         reject_explicitly_read_only(root)?;
-        let root_capability = Dir::open_ambient_dir(root, ambient_authority())
-            .map_err(|source| PathError::io("failed to open local data root capability", source))?;
+        let root_capability = Arc::new(open_prepared_root(root)?);
         root_capability
             .create_dir_all("journal")
             .map_err(|source| PathError::io("failed to create journal directory", source))?;
@@ -348,10 +359,12 @@ impl LocalPaths {
         let journal_dir = root.join("journal");
         let artifacts =
             ArtifactRoot::from_open_directory(root.join("artifacts"), artifact_capability);
+        let catalog = CatalogLocation::from_prepared(root.clone(), Arc::clone(&root_capability));
         Ok(Self {
             root,
             journal_dir,
             artifacts: Some(artifacts),
+            catalog: Some(catalog),
             journal_capability: Some(Arc::new(journal_capability)),
         })
     }
@@ -364,6 +377,7 @@ impl LocalPaths {
             root,
             journal_dir,
             artifacts: None,
+            catalog: None,
             journal_capability: None,
         }
     }
@@ -383,6 +397,13 @@ impl LocalPaths {
         self.artifacts
             .as_ref()
             .ok_or(PathError::ArtifactRootUnavailable)
+    }
+
+    /// Returns the catalog placement capability in prepared mode.
+    pub fn catalog(&self) -> Result<&CatalogLocation, PathError> {
+        self.catalog
+            .as_ref()
+            .ok_or(PathError::CatalogLocationUnavailable)
     }
 
     /// Returns the current-format journal path for a validated source filename.
