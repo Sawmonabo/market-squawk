@@ -7,10 +7,10 @@ fn current_authority_is_scoped_by_venue_instrument_event_and_depth() -> TestResu
         VenueId,
     };
     use market_squawk_sources::{
-        DecodedProviderBatch, DecoderEvidence, ProviderAggressorEvidence, ProviderChecksumEvidence,
-        ProviderDecimalLexeme, ProviderNormalizedObservation, ProviderObservationPayload,
-        ProviderPrice, ProviderQuantity, ProviderSequenceEvidence, ProviderSnapshotEvidence,
-        ProviderTimestampEvidence,
+        DecodeOutcome, DecodedProviderBatch, DecoderEvidence, ProviderAggressorEvidence,
+        ProviderChecksumEvidence, ProviderDecimalLexeme, ProviderNormalizedObservation,
+        ProviderObservationPayload, ProviderPrice, ProviderQuantity, ProviderSequenceEvidence,
+        ProviderSnapshotEvidence, ProviderTimestampEvidence, ValidatedSessionDecodeOutcome,
     };
 
     let instrument = InstrumentId::from_str("4c74ab95-53b9-42ad-9b66-0ed403b88fed")?;
@@ -136,8 +136,9 @@ fn current_authority_is_scoped_by_venue_instrument_event_and_depth() -> TestResu
         },
     )?;
     let batch = DecodedProviderBatch::try_new(evidence, vec![observation])?;
+    let validated_session = registry.validate_session(&session, second_frame.received_at())?;
     assert!(matches!(
-        current.validate_decoded_batch_owned(batch, receipt),
+        validated_session.validate_decode_outcome_owned(DecodeOutcome::Data(batch), receipt),
         Err(RegistryError::CaptureReceiptMismatch)
     ));
     assert_eq!(error_path_resident_drops.load(Ordering::SeqCst), 1);
@@ -199,17 +200,22 @@ fn current_authority_is_scoped_by_venue_instrument_event_and_depth() -> TestResu
     let first_current_observation = make_current_observation(instrument, "trade-2", 2)?;
     let other_observation = make_current_observation(other_instrument, "trade-3", 3)?;
     let second_current_observation = make_current_observation(instrument, "trade-4", 4)?;
-    let current_batches = current.validate_decoded_batch_owned(
-        DecodedProviderBatch::try_new(
+    let validated_session = registry.validate_session(&session, current_frame.received_at())?;
+    let validated_outcome = validated_session.validate_decode_outcome_owned(
+        DecodeOutcome::Data(DecodedProviderBatch::try_new(
             current_evidence,
             vec![
                 first_current_observation,
                 other_observation,
                 second_current_observation,
             ],
-        )?,
+        )?),
         current_receipt,
     )?;
+    let ValidatedSessionDecodeOutcome::Data(captured) = validated_outcome else {
+        return Err("data outcome changed disposition".into());
+    };
+    let current_batches = current.validate_data_outcome_owned(captured)?;
     assert_eq!(success_path_resident_drops.load(Ordering::SeqCst), 1);
     let mut routed_batches = current_batches.into_iter();
     assert_eq!(routed_batches.len(), 2);

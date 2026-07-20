@@ -463,6 +463,7 @@ mod catalog_construction;
 mod catalog_persistence;
 include!("registry/health_authority.rs");
 include!("registry/authority.rs");
+include!("registry/decode_outcome.rs");
 include!("registry/current_batch.rs");
 #[cfg(test)]
 #[path = "registry/canonicalization_tests.rs"]

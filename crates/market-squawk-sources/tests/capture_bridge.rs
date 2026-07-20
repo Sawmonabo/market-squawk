@@ -16,11 +16,11 @@ use market_squawk_platform::{
 };
 use market_squawk_sources::{
     AuthoritativeSourceRegistry, AuthorizationHealth, BudgetHealth, ConnectionLiveness,
-    CoverageHealth, DecodedProviderBatch, DecoderEvidence, FreshnessPolicy,
+    CoverageHealth, DecodeOutcome, DecodedProviderBatch, DecoderEvidence, FreshnessPolicy,
     ProviderAggressorEvidence, ProviderChecksumEvidence, ProviderDecimalLexeme,
     ProviderNormalizedObservation, ProviderObservationPayload, ProviderPrice, ProviderQuantity,
     ProviderSequenceEvidence, ProviderSnapshotEvidence, ProviderTimestampEvidence, RegistryError,
-    SessionId, SourceHealthSnapshot, TransportFrameKind,
+    SessionId, SourceHealthSnapshot, TransportFrameKind, ValidatedSessionDecodeOutcome,
 };
 
 use common::{TestResult, direct_metadata, exact_evidence, now_timestamp, source_identifier};
@@ -160,8 +160,14 @@ async fn platform_returns_exact_registry_receipt_and_later_degradation_revokes_c
     })??;
     #[cfg(not(debug_assertions))]
     let receipt = publisher.try_publish(&frame)?;
+    let validated_session = registry.validate_session(&session, frame.received_at())?;
+    let validated_outcome =
+        validated_session.validate_decode_outcome_owned(DecodeOutcome::Data(batch), receipt)?;
+    let ValidatedSessionDecodeOutcome::Data(captured) = validated_outcome else {
+        return Err("data outcome changed disposition".into());
+    };
     let current_batches = current
-        .validate_decoded_batch_owned(batch, receipt)
+        .validate_data_outcome_owned(captured)
         .map_err(|error| format!("validated batch lost current authority: {error}"))?;
     assert_eq!(current_batches.len(), 1);
     let current_batch = current_batches

@@ -37,12 +37,14 @@ pub use capture::{
     CaptureGenerationLease, CaptureInitializationControl,
 };
 pub use decoder::{
-    DecodeError, DecodedProviderBatch, DecoderEvidence, MAX_DECODED_BOOK_ITEMS, MAX_DECODED_EVENTS,
-    MarketDecoder, ProviderAggressorEvidence, ProviderBookChange, ProviderBookDeltaPayload,
-    ProviderBookLevel, ProviderBookSide, ProviderBookSnapshotPayload, ProviderChecksumEvidence,
-    ProviderDecimalLexeme, ProviderNormalizedObservation, ProviderObservationPayload,
-    ProviderPrice, ProviderQuantity, ProviderSequenceEvidence, ProviderSnapshotEvidence,
-    ProviderStatusEvidence, ProviderTimestampEvidence,
+    ControlFrameKind, DecodeError, DecodeInternalError, DecodeOutcome, DecodedControlFrame,
+    DecodedIgnoredFrame, DecodedProviderBatch, DecodedQuarantineAction, DecodedRecoveryAction,
+    DecoderEvidence, IgnoredFrameReason, MAX_DECODED_BOOK_ITEMS, MAX_DECODED_EVENTS, MarketDecoder,
+    ProviderAggressorEvidence, ProviderBookChange, ProviderBookDeltaPayload, ProviderBookLevel,
+    ProviderBookSide, ProviderBookSnapshotPayload, ProviderChecksumEvidence, ProviderDecimalLexeme,
+    ProviderNormalizedObservation, ProviderObservationPayload, ProviderPrice, ProviderQuantity,
+    ProviderSequenceEvidence, ProviderSnapshotEvidence, ProviderStatusEvidence,
+    ProviderTimestampEvidence, QuarantineReason, ResynchronizationReason,
 };
 pub use extraction::{
     AvailabilityEvidence, DiscoveryBatch, DiscoveryRequest, DiscoveryRequestId, ExtractionBatch,
@@ -78,12 +80,14 @@ pub use policy::{
     SharedProviderBudget,
 };
 pub use registry::{
-    AuthoritativeSourceRegistry, CurrentBatchIter, CurrentBatchKey, CurrentCoveragePolicy,
-    CurrentDecodedProviderBatch, CurrentDecodedProviderBatches, CurrentFrameEvidence,
-    CurrentHealthReporter, CurrentHealthUpdate, CurrentLivePolicy, CurrentObservationIter,
-    CurrentProviderObservation, CurrentSourceAuthorityLease, CurrentSourceSession,
-    CurrentStreamKey, InstrumentUniverseAttestation, RawFrameFactory, RegisteredSource,
-    RegistryAuthorityState, RegistryError, ValidatedCurrentSourceAuthority, ValidatedLiveScope,
+    AuthoritativeSourceRegistry, CapturedDecodedProviderBatch, CurrentBatchIter, CurrentBatchKey,
+    CurrentCoveragePolicy, CurrentDecodedProviderBatch, CurrentDecodedProviderBatches,
+    CurrentFrameEvidence, CurrentHealthReporter, CurrentHealthUpdate, CurrentLivePolicy,
+    CurrentObservationIter, CurrentProviderObservation, CurrentSourceAuthorityLease,
+    CurrentSourceSession, CurrentStreamKey, InstrumentUniverseAttestation, RawFrameFactory,
+    RegisteredSource, RegistryAuthorityState, RegistryError, SessionControlDisposition,
+    SessionIgnoredDisposition, SessionQuarantineDisposition, SessionRecoveryDisposition,
+    ValidatedCurrentSourceAuthority, ValidatedLiveScope, ValidatedSessionDecodeOutcome,
     ValidatedSourceSession,
 };
 

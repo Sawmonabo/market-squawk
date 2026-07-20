@@ -215,12 +215,15 @@ impl DecodedProviderBatch {
     ///
     /// Returns [`DecodeError::RetainedSizeOverflow`] on arithmetic overflow.
     pub fn retained_bytes(&self) -> Result<usize, DecodeError> {
-        let shallow = std::mem::size_of::<Self>()
-            .checked_add(
-                self.observations
-                    .checked_allocation_bytes()
-                    .ok_or(DecodeError::RetainedSizeOverflow)?,
-            )
+        std::mem::size_of::<Self>()
+            .checked_add(self.dynamic_retained_bytes()?)
+            .ok_or(DecodeError::RetainedSizeOverflow)
+    }
+
+    pub(super) fn dynamic_retained_bytes(&self) -> Result<usize, DecodeError> {
+        let observations = self
+            .observations
+            .checked_allocation_bytes()
             .ok_or(DecodeError::RetainedSizeOverflow)?;
         let evidence = self.evidence.dynamic_retained_bytes()?;
         let deep = checked_sum(
@@ -230,7 +233,7 @@ impl DecodedProviderBatch {
                 .map(ProviderNormalizedObservation::dynamic_retained_bytes)
                 .collect::<Result<Vec<_>, _>>()?,
         )?;
-        shallow
+        observations
             .checked_add(evidence)
             .and_then(|bytes| bytes.checked_add(deep))
             .ok_or(DecodeError::RetainedSizeOverflow)
@@ -247,7 +250,7 @@ pub trait MarketDecoder: SourceMetadataProvider {
     fn decode(
         &mut self,
         frame: &ValidatedRawMarketFrame<'_>,
-    ) -> Result<DecodedProviderBatch, DecodeError>;
+    ) -> Result<DecodeOutcome, DecodeInternalError>;
 }
 
 /// Provider decode or batch-bound failure.

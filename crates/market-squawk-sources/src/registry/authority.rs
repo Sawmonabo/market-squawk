@@ -243,6 +243,20 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
         self.validated.metadata
     }
 
+    /// Upgrades exact session/capture-validated data through current health and coverage authority.
+    ///
+    /// # Errors
+    ///
+    /// Rejects stale session, capture, health, authorization, coverage, protocol, or observation
+    /// evidence. Non-data decoder dispositions cannot be passed to this method.
+    pub fn validate_data_outcome_owned(
+        &self,
+        captured: CapturedDecodedProviderBatch,
+    ) -> Result<CurrentDecodedProviderBatches, RegistryError> {
+        let (batch, receipt) = captured.into_parts();
+        self.validate_decoded_batch_owned(batch, receipt)
+    }
+
     /// Issues an owned opaque source lease for pre-feed generation registration.
     ///
     /// The returned value retains the exact process-local session allocation, current health

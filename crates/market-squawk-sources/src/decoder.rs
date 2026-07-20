@@ -17,6 +17,15 @@ use crate::authority_time::TrustedReceiptObservation;
 use crate::bounded::BoundedVec;
 use crate::{FrameId, FrameSessionBinding, SourceMetadataProvider, ValidatedRawMarketFrame};
 
+#[path = "decoder/outcome.rs"]
+mod outcome;
+
+pub use outcome::{
+    ControlFrameKind, DecodeInternalError, DecodeOutcome, DecodedControlFrame, DecodedIgnoredFrame,
+    DecodedQuarantineAction, DecodedRecoveryAction, IgnoredFrameReason, QuarantineReason,
+    ResynchronizationReason,
+};
+
 /// Maximum provider observations emitted by one transport frame.
 pub const MAX_DECODED_EVENTS: usize = 1_024;
 /// Maximum numeric provider fields retained across one decoded frame.
