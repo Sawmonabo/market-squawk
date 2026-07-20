@@ -1,8 +1,9 @@
 //! Source health evidence with independent liveness and market-freshness clocks.
 
 use market_squawk_domain::{
-    CaptureIntegrityState, ConnectionGeneration, ExactPayloadEvidence, MetadataRevision,
-    ProviderChannel, ProviderProduct, SourceId, SourceIdentifier, StreamIntegrityState, Timestamp,
+    CaptureIntegrityState, ConnectionGeneration, DataQuality, ExactPayloadEvidence,
+    MetadataRevision, ProviderChannel, ProviderProduct, SourceId, SourceIdentifier,
+    StreamIntegrityState, Timestamp,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
@@ -359,6 +360,63 @@ impl SourceHealthSnapshot {
         ]
         .into_iter()
         .min()
+    }
+
+    /// Returns the current-data deadline permitted by the source's immutable quality ceiling.
+    ///
+    /// Missing provider timestamps may initialize non-executable current data. Stale provider
+    /// timestamps fail closed at every quality, and [`DataQuality::DirectVerified`] retains the
+    /// full live-execution deadline contract from [`Self::live_valid_until`].
+    pub(crate) fn current_data_valid_until(
+        &self,
+        quality_ceiling: DataQuality,
+    ) -> Option<Timestamp> {
+        if quality_ceiling == DataQuality::DirectVerified {
+            return self.live_valid_until();
+        }
+        let connection_at = match self.connection {
+            ConnectionLiveness::Live { last_activity_at } => last_activity_at,
+            _ => return None,
+        };
+        let market_at = match self.market_freshness {
+            MarketFreshness::Fresh { last_market_at } => last_market_at,
+            _ => return None,
+        };
+        let transport_at = match self.transport_freshness {
+            TransportFreshness::Fresh { last_transport_at } => last_transport_at,
+            _ => return None,
+        };
+        let source_at = match self.source_freshness {
+            SourceTimestampFreshness::Fresh { last_source_at } => Some(last_source_at),
+            SourceTimestampFreshness::Uninitialized => None,
+            SourceTimestampFreshness::Stale { .. } => return None,
+        };
+        let authorization_until = match &self.authorization {
+            AuthorizationHealth::Valid { valid_until, .. } => *valid_until,
+            _ => return None,
+        };
+        let coverage_until = match &self.coverage {
+            CoverageHealth::Sufficient { valid_until, .. } => *valid_until,
+            _ => return None,
+        };
+        let connection_until = checked_deadline(connection_at, self.max_connection_idle_nanos)?;
+        let transport_until = checked_deadline(transport_at, self.max_transport_age_nanos)?;
+        let market_until = checked_deadline(market_at, self.max_market_age_nanos)?;
+        let mut valid_until = [
+            connection_until,
+            transport_until,
+            market_until,
+            authorization_until,
+            coverage_until,
+        ]
+        .into_iter()
+        .min()?;
+        if let Some(source_at) = source_at {
+            let source_until =
+                checked_deadline(source_at.min(self.observed_at), self.max_source_age_nanos)?;
+            valid_until = valid_until.min(source_until);
+        }
+        Some(valid_until)
     }
 
     /// Returns bounded explicit coverage limitations.

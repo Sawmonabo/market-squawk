@@ -9,9 +9,9 @@ mod tests {
 
     use bytes::Bytes;
     use market_squawk_domain::{
-        AggressorSide, ConnectionGeneration, InstrumentId, IntegrityRule, LiveEventClass,
-        MetadataRevision, RuleVersion, SequenceNumber, SequenceValidationRule, SourceId,
-        SourceIdentifier, Timestamp, VenueId,
+        AggressorSide, ConnectionGeneration, DataQuality, InstrumentId, IntegrityRule,
+        LiveEventClass, MarketDepth, MetadataRevision, RuleVersion, SequenceNumber,
+        SequenceValidationRule, SourceId, SourceIdentifier, Timestamp, VenueId,
     };
 
     use super::{
@@ -28,14 +28,16 @@ mod tests {
     use crate::{
         BudgetDecision, BudgetUnavailableReason, ChecksumValidationProfile, CurrentHealthReporter,
         CurrentSourceSession, FrameSessionBinding, LiveProtocolProfile, ProviderAggressorEvidence,
-        ProviderChecksumEvidence, ProviderDecimalLexeme, ProviderNormalizedObservation,
-        ProviderNumericPolicy, ProviderObservationPayload, ProviderPrice, ProviderQuantity,
-        ProviderSequenceEvidence, ProviderSnapshotEvidence, ProviderTimestampEvidence,
-        SemanticInterpretationProfile, SequenceValidationProfile, SessionId, SourceError,
-        TransportFrameKind,
+        ProviderBookChange, ProviderBookLevel, ProviderBookSide, ProviderChecksumEvidence,
+        ProviderDecimalLexeme, ProviderNormalizedObservation, ProviderNumericPolicy,
+        ProviderObservationPayload, ProviderPrice, ProviderQuantity, ProviderSequenceEvidence,
+        ProviderSnapshotEvidence, ProviderTimestampEvidence, SemanticInterpretationProfile,
+        SequenceValidationProfile, SessionId, SourceError, TransportFrameKind,
     };
     use crate::registry::test_support::{
-        TestResult, direct_metadata, direct_metadata_with_provider_and_limit, healthy_snapshot,
+        TestResult, direct_metadata, direct_metadata_with_provider_and_limit,
+        direct_metadata_with_quality, exact_evidence, freshness_policy, healthy_snapshot,
+        source_identifier,
     };
 
     #[derive(Clone, Copy, Debug)]
@@ -168,6 +170,10 @@ mod tests {
 
     impl HealthHarness {
         fn new(source: &str) -> TestResult<Self> {
+            Self::new_with_quality(source, DataQuality::DirectVerified)
+        }
+
+        fn new_with_quality(source: &str, quality_ceiling: DataQuality) -> TestResult<Self> {
             let wall_origin = Timestamp::from_unix_nanos(1_000_000_000);
             let monotonic_origin = RegistryMonotonicInstant::from_nanos(0);
             let clock = Arc::new(ManualRegistryClock::new(TrustedRegistryTime::new(
@@ -179,7 +185,10 @@ mod tests {
                     super::RegistryAuthorityState::empty(),
                     clock.clone(),
                 )?;
-            let registered = registry.register(direct_metadata(source, "revision-1")?, wall_origin)?;
+            let registered = registry.register(
+                direct_metadata_with_quality(source, "revision-1", quality_ceiling)?,
+                wall_origin,
+            )?;
             let session = registry.begin_session(
                 &registered,
                 SessionId::new(SourceIdentifier::try_from("session-1")?),
@@ -229,6 +238,49 @@ mod tests {
             )
         }
 
+        fn snapshot_with_source_timestamp(
+            &self,
+            observed_offset: i64,
+            source_offset: Option<i64>,
+            deadline_offset: i64,
+        ) -> TestResult<crate::SourceHealthSnapshot> {
+            let observed_at = self.timestamp(observed_offset)?;
+            let source_at = source_offset
+                .map(|offset| self.timestamp(offset))
+                .transpose()?;
+            let valid_until = self.timestamp(deadline_offset)?;
+            Ok(crate::SourceHealthSnapshot::try_new(
+                &self.session,
+                observed_at,
+                crate::ConnectionLiveness::Live {
+                    last_activity_at: observed_at,
+                },
+                Some(observed_at),
+                Some(observed_at),
+                source_at,
+                freshness_policy()?,
+                market_squawk_domain::StreamIntegrityState::Healthy,
+                market_squawk_domain::CaptureIntegrityState::Healthy,
+                crate::AuthorizationHealth::Valid {
+                    evidence: exact_evidence(31),
+                    valid_until,
+                },
+                crate::CoverageHealth::Sufficient {
+                    evidence: exact_evidence(32),
+                    provider_product: market_squawk_domain::ProviderProduct::new(
+                        source_identifier("direct-product")?,
+                    ),
+                    provider_channel: market_squawk_domain::ProviderChannel::new(
+                        source_identifier("trades")?,
+                    ),
+                    valid_until,
+                },
+                crate::BudgetHealth::Available,
+                None,
+                Vec::new(),
+            )?)
+        }
+
         fn accept_health(
             &mut self,
             observed_offset: i64,
@@ -253,6 +305,48 @@ mod tests {
                     .load(std::sync::atomic::Ordering::Acquire),
             )
         }
+    }
+
+    #[test]
+    fn source_timestamp_freshness_is_quality_ceiling_aware() -> TestResult {
+        let mut research =
+            HealthHarness::new_with_quality("research-current-data", DataQuality::DirectUnverified)?;
+        research.set_time(20, 20)?;
+        let uninitialized = research.snapshot_with_source_timestamp(10, None, 1_000)?;
+        let update = research.reporter.report(uninitialized)?;
+        research.set_time(30, 30)?;
+        research.registry.record_health(&research.session, update)?;
+        research
+            .registry
+            .validate_current_authority(&research.session)?;
+
+        let mut executable = HealthHarness::new("executable-current-data")?;
+        executable.set_time(20, 20)?;
+        let uninitialized = executable.snapshot_with_source_timestamp(10, None, 1_000)?;
+        let update = executable.reporter.report(uninitialized)?;
+        executable.set_time(30, 30)?;
+        executable.registry.record_health(&executable.session, update)?;
+        assert_eq!(
+            executable
+                .registry
+                .validate_current_authority(&executable.session)
+                .map(|_| ()),
+            Err(RegistryError::HealthNotQualified)
+        );
+
+        research.set_time(40, 40)?;
+        let stale = research.snapshot_with_source_timestamp(31, Some(-2_000_000_000), 1_000)?;
+        let update = research.reporter.report(stale)?;
+        research.set_time(50, 50)?;
+        research.registry.record_health(&research.session, update)?;
+        assert_eq!(
+            research
+                .registry
+                .validate_current_authority(&research.session)
+                .map(|_| ()),
+            Err(RegistryError::HealthNotQualified)
+        );
+        Ok(())
     }
 
 
@@ -365,7 +459,9 @@ mod tests {
             quantity: quantity()?,
             aggressor: ProviderAggressorEvidence::new(AggressorSide::Buy, None, aggressor),
         })?;
-        assert!(validate_observation_profile(&protocol, &valid).is_ok());
+        assert!(
+            validate_observation_profile(&protocol, DataQuality::DirectVerified, &valid).is_ok()
+        );
 
         let transplanted = observation(ProviderObservationPayload::Trade {
             trade_id: SourceIdentifier::try_from("trade-2")?,
@@ -373,7 +469,117 @@ mod tests {
             quantity: quantity()?,
             aggressor: ProviderAggressorEvidence::new(AggressorSide::Buy, None, corporate_action),
         })?;
-        assert!(validate_observation_profile(&protocol, &transplanted).is_err());
+        assert!(
+            validate_observation_profile(&protocol, DataQuality::DirectVerified, &transplanted)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn absent_timestamp_only_initializes_non_executable_snapshot_state() -> TestResult {
+        let timestamp = rule("mixed-timestamp")?;
+        let no_sequence = rule("no-sequence")?;
+        let no_checksum = rule("no-checksum")?;
+        let no_snapshot = rule("no-snapshot")?;
+        let protocol = LiveProtocolProfile::new(
+            rule("decoder")?,
+            SemanticInterpretationProfile::new(
+                rule("aggressor")?,
+                rule("auction")?,
+                rule("trading-status")?,
+                rule("corporate-action")?,
+            ),
+            timestamp.clone(),
+            SequenceValidationProfile::Unsupported {
+                rule: no_sequence.clone(),
+            },
+            ChecksumValidationProfile::Unsupported {
+                rule: no_checksum.clone(),
+            },
+            true,
+            ProviderNumericPolicy::ExactDecimalLexeme,
+        );
+        let instrument =
+            InstrumentId::from_str("4c74ab95-53b9-42ad-9b66-0ed403b88fed")?;
+        let observation = |id, snapshot, payload| {
+            ProviderNormalizedObservation::try_new(
+                SourceIdentifier::try_from(id)?,
+                VenueId::try_from("coinbase")?,
+                instrument,
+                ProviderTimestampEvidence::AuthoritativelyAbsent(timestamp.clone()),
+                ProviderSequenceEvidence::Unsupported {
+                    rule: no_sequence.clone(),
+                },
+                snapshot,
+                ProviderChecksumEvidence::Unsupported {
+                    rule: no_checksum.clone(),
+                },
+                payload,
+            )
+            .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })
+        };
+        let initializing = observation(
+            "snapshot",
+            ProviderSnapshotEvidence::InitializingSnapshot {
+                provider_reference: None,
+            },
+            ProviderObservationPayload::book_snapshot(
+                MarketDepth::PriceLevel,
+                Vec::new(),
+                Vec::new(),
+            )?,
+        )?;
+        assert!(
+            validate_observation_profile(
+                &protocol,
+                DataQuality::DirectUnverified,
+                &initializing,
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            validate_observation_profile(&protocol, DataQuality::DirectVerified, &initializing),
+            Err(RegistryError::DecoderProfileMismatch)
+        );
+
+        let level = ProviderBookLevel::new(
+            ProviderPrice::new(ProviderDecimalLexeme::try_new("1")?),
+            ProviderQuantity::new(ProviderDecimalLexeme::try_new("1")?),
+        );
+        let delta = observation(
+            "delta",
+            ProviderSnapshotEvidence::Delta {
+                provider_snapshot_reference: None,
+            },
+            ProviderObservationPayload::book_delta(
+                MarketDepth::PriceLevel,
+                vec![ProviderBookChange::new(ProviderBookSide::Bid, level)],
+            )?,
+        )?;
+        assert_eq!(
+            validate_observation_profile(&protocol, DataQuality::DirectUnverified, &delta),
+            Err(RegistryError::DecoderProfileMismatch)
+        );
+
+        let trade = observation(
+            "trade",
+            ProviderSnapshotEvidence::NotApplicable(no_snapshot),
+            ProviderObservationPayload::Trade {
+                trade_id: SourceIdentifier::try_from("trade")?,
+                price: ProviderPrice::new(ProviderDecimalLexeme::try_new("1")?),
+                quantity: ProviderQuantity::new(ProviderDecimalLexeme::try_new("1")?),
+                aggressor: ProviderAggressorEvidence::new(
+                    AggressorSide::Buy,
+                    None,
+                    protocol.semantic_interpretation().aggressor_rule().clone(),
+                ),
+            },
+        )?;
+        assert_eq!(
+            validate_observation_profile(&protocol, DataQuality::DirectUnverified, &trade),
+            Err(RegistryError::DecoderProfileMismatch)
+        );
         Ok(())
     }
 

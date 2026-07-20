@@ -38,11 +38,35 @@ pub(super) fn direct_metadata(source: &str, revision: &str) -> TestResult<Source
     direct_metadata_with_provider_and_limit(source, revision, source, 10)
 }
 
+pub(super) fn direct_metadata_with_quality(
+    source: &str,
+    revision: &str,
+    quality_ceiling: DataQuality,
+) -> TestResult<SourceMetadata> {
+    direct_metadata_with_provider_limit_and_quality(source, revision, source, 10, quality_ceiling)
+}
+
 pub(super) fn direct_metadata_with_provider_and_limit(
     source: &str,
     revision: &str,
     provider: &str,
     requests_per_window: u32,
+) -> TestResult<SourceMetadata> {
+    direct_metadata_with_provider_limit_and_quality(
+        source,
+        revision,
+        provider,
+        requests_per_window,
+        DataQuality::DirectVerified,
+    )
+}
+
+fn direct_metadata_with_provider_limit_and_quality(
+    source: &str,
+    revision: &str,
+    provider: &str,
+    requests_per_window: u32,
+    quality_ceiling: DataQuality,
 ) -> TestResult<SourceMetadata> {
     let endpoint = format!("wss://{provider}.source.test/feed");
     let source_id = SourceId::try_from(source)?;
@@ -97,7 +121,7 @@ pub(super) fn direct_metadata_with_provider_and_limit(
         provider,
         authorization,
         coverage,
-        DataQuality::DirectVerified,
+        quality_ceiling,
         NetworkAccessPolicy::Allowlisted(EndpointPolicy::try_new([endpoint])?),
         freshness_policy()?,
         Some(budget),
@@ -165,7 +189,7 @@ pub(super) fn healthy_snapshot(
     )?)
 }
 
-fn freshness_policy() -> TestResult<FreshnessPolicy> {
+pub(super) fn freshness_policy() -> TestResult<FreshnessPolicy> {
     Ok(FreshnessPolicy::try_new(
         5_000_000_000,
         1_000_000_000,

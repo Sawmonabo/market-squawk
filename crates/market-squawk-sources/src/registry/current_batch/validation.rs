@@ -1,5 +1,6 @@
 fn validate_observation_profile(
     protocol: &crate::LiveProtocolProfile,
+    quality_ceiling: market_squawk_domain::DataQuality,
     observation: &crate::ProviderNormalizedObservation,
 ) -> Result<(), RegistryError> {
     let sequence_matches = match (protocol.sequence(), observation.sequence()) {
@@ -29,7 +30,16 @@ fn validate_observation_profile(
             protocol.source_timestamps() && rule == protocol.timestamp_rule()
         }
         crate::ProviderTimestampEvidence::AuthoritativelyAbsent(rule) => {
-            !protocol.source_timestamps() && rule == protocol.timestamp_rule()
+            let globally_absent = !protocol.source_timestamps();
+            let non_executable_initializing_snapshot = protocol.source_timestamps()
+                && quality_ceiling != market_squawk_domain::DataQuality::DirectVerified
+                && observation.event_class() == market_squawk_domain::LiveEventClass::BookSnapshot
+                && matches!(
+                    observation.snapshot(),
+                    crate::ProviderSnapshotEvidence::InitializingSnapshot { .. }
+                );
+            (globally_absent || non_executable_initializing_snapshot)
+                && rule == protocol.timestamp_rule()
         }
     };
     let semantics = protocol.semantic_interpretation();

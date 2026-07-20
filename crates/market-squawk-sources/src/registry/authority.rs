@@ -463,8 +463,9 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
             return Err(RegistryError::DecoderProfileMismatch);
         }
         let mut observation_authorities = Vec::with_capacity(batch.observations().len());
+        let quality_ceiling = self.validated.metadata.quality_ceiling();
         for observation in batch.observations() {
-            validate_observation_profile(protocol, observation)?;
+            validate_observation_profile(protocol, quality_ceiling, observation)?;
             let scope = self.validate_live_scope(
                 observation.venue(),
                 observation.instrument(),
