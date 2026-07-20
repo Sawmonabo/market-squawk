@@ -71,6 +71,10 @@ pub enum FeatureDataType {
     Timestamp,
     /// Canonical aggressor-side classification.
     AggressorSide,
+    /// Canonical order-side classification.
+    OrderSide,
+    /// Exact numerator and positive denominator.
+    ExactRatio,
     /// Internal instrument identity.
     InstrumentId,
     /// Internal venue identity.
@@ -584,12 +588,23 @@ const fn input_unit_is_compatible(data_type: FeatureDataType, unit: FeatureUnit)
         FeatureDataType::BasisPoints => matches!(unit, FeatureUnit::BasisPoints),
         FeatureDataType::Timestamp => matches!(unit, FeatureUnit::Nanoseconds),
         FeatureDataType::AggressorSide
+        | FeatureDataType::OrderSide
         | FeatureDataType::InstrumentId
         | FeatureDataType::VenueId
         | FeatureDataType::Boolean => matches!(unit, FeatureUnit::Unitless),
         FeatureDataType::SignedInteger | FeatureDataType::UnsignedInteger => {
             matches!(unit, FeatureUnit::Count | FeatureUnit::Nanoseconds)
         }
+        FeatureDataType::ExactRatio => matches!(
+            unit,
+            FeatureUnit::PriceTicks
+                | FeatureUnit::BasisPoints
+                | FeatureUnit::Ratio
+                | FeatureUnit::Return
+                | FeatureUnit::Volatility
+                | FeatureUnit::LotsPerSecond
+                | FeatureUnit::Unitless
+        ),
         FeatureDataType::StatisticalF64 => {
             !matches!(unit, FeatureUnit::PriceTicks | FeatureUnit::QuantityLots)
         }
