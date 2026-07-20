@@ -80,3 +80,32 @@ fn rolling_state_is_preallocated_and_regression_clears_every_ready_value() -> Te
     assert!(overflow.volume_velocity().ready_value().is_some());
     Ok(())
 }
+
+#[test]
+fn reset_reuses_the_ring_and_restarts_warm_up() -> TestResult {
+    let config = RollingWindowConfig::try_new(
+        NonZeroUsize::new(3).ok_or("capacity")?,
+        NonZeroUsize::new(2).ok_or("warm-up")?,
+        NonZeroU64::new(10).ok_or("duration")?,
+        NonZeroUsize::new(64 * 1024).ok_or("retained bound")?,
+    )?;
+    let mut state = RollingFeatureState::try_new(config)?;
+    let retained = state.retained_bytes();
+    let _ = state.update(trade(100, 1, 1)?)?;
+    assert!(
+        state
+            .update(trade(101, 1, 2)?)?
+            .vwap()
+            .ready_value()
+            .is_some()
+    );
+
+    state.reset();
+    assert!(state.is_empty());
+    assert_eq!(state.retained_bytes(), retained);
+    assert_eq!(
+        state.update(trade(102, 1, 3)?)?.vwap().validity(),
+        FeatureValidity::WarmingUp
+    );
+    Ok(())
+}

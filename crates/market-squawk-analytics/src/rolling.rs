@@ -150,7 +150,7 @@ impl RollingFeatureState {
             .last_observed_at
             .is_some_and(|last| trade.observed_at() < last)
         {
-            self.clear();
+            self.reset();
             return RollingFeatureValues::invalid(
                 FeatureValidity::TimestampRegression,
                 trade.observed_at(),
@@ -194,6 +194,19 @@ impl RollingFeatureState {
     #[must_use]
     pub const fn retained_bytes(&self) -> usize {
         self.retained_bytes
+    }
+
+    /// Clears every retained observation without releasing or reallocating the fixed ring.
+    ///
+    /// The configured capacity and exact retained footprint remain unchanged. The next update
+    /// therefore begins the original warm-up policy from an empty state.
+    pub fn reset(&mut self) {
+        for slot in &mut self.slots {
+            *slot = None;
+        }
+        self.head = 0;
+        self.len = 0;
+        self.last_observed_at = None;
     }
 
     fn calculate(
@@ -331,15 +344,6 @@ impl RollingFeatureState {
             return None;
         }
         self.slots[(self.head + logical_index) % self.slots.len()]
-    }
-
-    fn clear(&mut self) {
-        for slot in &mut self.slots {
-            *slot = None;
-        }
-        self.head = 0;
-        self.len = 0;
-        self.last_observed_at = None;
     }
 }
 
