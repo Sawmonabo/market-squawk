@@ -1,6 +1,7 @@
 //! Durable single-writer SQLite catalog lifecycle and recovery.
 
 mod publication;
+mod query_artifacts;
 mod records;
 mod runs;
 mod storage;
@@ -29,6 +30,10 @@ pub use self::types::{
 };
 use self::types::{MAX_SQLITE_RECORD_BYTES, WriterPermit};
 pub use publication::PublishedIngest;
+pub use query_artifacts::{
+    QueryArtifactPublisher, QueryArtifactReservation, QueryArtifactReservationInput,
+    QueryArtifactResult,
+};
 pub use runs::{CatalogAuthority, ResumedIngest};
 
 const BACKUP_HASH_BUFFER_BYTES: usize = 64 * 1024;

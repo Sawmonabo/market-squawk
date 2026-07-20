@@ -19,7 +19,8 @@ python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 python3 scripts/check_workspace_boundaries.py
 python3 scripts/check_generated_artifacts.py
 cargo deny check
-cargo audit --deny warnings
+# The exact exception and upstream refresh gate are documented in deny.toml.
+cargo audit --deny warnings --ignore RUSTSEC-2024-0436
 gitleaks dir --redact --no-banner .
 gitleaks git --redact --no-banner
 cargo fmt --all -- --check

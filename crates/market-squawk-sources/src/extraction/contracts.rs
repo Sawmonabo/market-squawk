@@ -5,8 +5,8 @@ use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 
 use bytes::Bytes;
 use market_squawk_domain::{
-    DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence, IntegrityRule,
-    MetadataRevision, SourceId, SourceIdentifier, Timestamp, VersionPinnedSourceLocator,
+    DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence, MetadataRevision,
+    SourceId, SourceIdentifier, Timestamp, VersionPinnedSourceLocator,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};

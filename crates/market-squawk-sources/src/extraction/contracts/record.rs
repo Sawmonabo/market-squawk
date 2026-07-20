@@ -1,21 +1,40 @@
-/// Mandatory availability time with explicit evidence basis.
+/// Explicit source availability basis without promoting inference to point-in-time evidence.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
 pub enum AvailabilityEvidence {
-    /// Availability was directly observed.
-    Observed { available_at: Timestamp },
-    /// Availability is estimated under an exact versioned rule.
-    Estimated {
+    /// Source/audit evidence directly establishes availability.
+    Observed {
         available_at: Timestamp,
-        rule: IntegrityRule,
+        evidence: SourceIdentifier,
     },
+    /// This process first observed the source object at the retained time.
+    LocalFirstObserved { observed_at: Timestamp },
+    /// A non-authoritative time is retained with its exact versioned inference method.
+    Inferred {
+        inferred_at: Timestamp,
+        method: SourceIdentifier,
+    },
+    /// Historical availability could not be established.
+    Unknown,
 }
 
 impl AvailabilityEvidence {
-    /// Returns mandatory point-in-time availability.
-    pub const fn available_at(&self) -> Timestamp {
+    /// Returns only conservative point-in-time availability.
+    pub const fn conservative_available_at(&self) -> Option<Timestamp> {
         match self {
-            Self::Observed { available_at } | Self::Estimated { available_at, .. } => *available_at,
+            Self::Observed { available_at, .. } => Some(*available_at),
+            Self::LocalFirstObserved { observed_at } => Some(*observed_at),
+            Self::Inferred { .. } | Self::Unknown => None,
+        }
+    }
+
+    /// Returns a source-reported or inferred time for analysis, never for default admission.
+    pub const fn reported_at(&self) -> Option<Timestamp> {
+        match self {
+            Self::Observed { available_at, .. } => Some(*available_at),
+            Self::LocalFirstObserved { observed_at } => Some(*observed_at),
+            Self::Inferred { inferred_at, .. } => Some(*inferred_at),
+            Self::Unknown => None,
         }
     }
 }
@@ -102,12 +121,12 @@ impl ExtractionRecord {
         superseded_at: Option<Timestamp>,
         payload: Bytes,
     ) -> Result<Self, ExtractionError> {
-        let available_at = availability.available_at();
-        if published_at.is_some_and(|published| available_at < published)
+        let reported_at = availability.reported_at();
+        if published_at.is_some_and(|published| reported_at.is_some_and(|value| value < published))
             || superseded_at.is_some_and(|superseded| {
                 superseded <= effective_at
                     || published_at.is_some_and(|published| superseded < published)
-                    || superseded < available_at
+                    || reported_at.is_some_and(|available| superseded < available)
             })
         {
             return Err(ExtractionError::InvalidPointInTimeOrdering);
@@ -197,9 +216,9 @@ impl ExtractionRecord {
         self.payload.as_bytes()
     }
 
-    /// Returns mandatory evidenced availability.
-    pub const fn available_at(&self) -> Timestamp {
-        self.availability.available_at()
+    /// Returns only conservative evidenced availability.
+    pub const fn available_at(&self) -> Option<Timestamp> {
+        self.availability.conservative_available_at()
     }
 
     /// Returns availability evidence basis.

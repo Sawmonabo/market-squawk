@@ -3,7 +3,7 @@
 use std::fmt;
 use std::sync::Mutex;
 
-use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceId};
+use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceId, Timestamp};
 use market_squawk_platform::CatalogLocation;
 use rusqlite::{Connection, OpenFlags, OptionalExtension as _, TransactionBehavior, params};
 use thiserror::Error;
@@ -84,7 +84,7 @@ impl fmt::Debug for AnalyticalManifestCatalog {
 }
 
 impl AnalyticalManifestCatalog {
-    /// Opens the Task 3 catalog after migration 0003 has been digest-verified and applied.
+    /// Opens the Task 3 catalog after analytical and query-artifact migrations are applied.
     pub fn open(
         location: &CatalogLocation,
         max_objects_per_generation: usize,
@@ -101,7 +101,7 @@ impl AnalyticalManifestCatalog {
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "trusted_schema", "OFF")?;
         let migrated: bool = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=3)",
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=4)",
             [],
             |row| row.get(0),
         )?;
@@ -335,18 +335,54 @@ impl AnalyticalManifestCatalog {
         generation_source(&connection, manifest)
     }
 
-    /// Returns all object identities retained by any readable immutable generation.
-    pub fn referenced_hashes(&self) -> Result<Vec<Sha256Digest>, ManifestCatalogError> {
+    /// Returns generation objects and query results whose exclusive expiry is still in the future.
+    pub fn referenced_hashes(
+        &self,
+        now: Timestamp,
+    ) -> Result<Vec<Sha256Digest>, ManifestCatalogError> {
         let connection = self.lock()?;
         let mut statement = connection.prepare(
-            "SELECT DISTINCT content_hash FROM analytical_generation_objects
-             ORDER BY content_hash",
+            "SELECT content_hash FROM analytical_generation_objects
+             UNION
+             SELECT results.content_digest
+             FROM query_artifact_results AS results
+             JOIN query_artifact_reservations AS reservations USING (reservation_id)
+             WHERE results.content_algorithm=1
+               AND reservations.state='published'
+               AND reservations.expires_at_ns>?1
+             ORDER BY 1",
         )?;
         let hashes = statement
-            .query_map([], |row| row.get::<_, Vec<u8>>(0))?
+            .query_map([now.unix_nanos()], |row| row.get::<_, Vec<u8>>(0))?
             .map(|row| parse_digest(&row?))
             .collect::<Result<Vec<_>, ManifestCatalogError>>()?;
         Ok(hashes)
+    }
+
+    /// Re-checks durable generation reachability immediately before orphan quarantine.
+    pub(crate) fn is_referenced(
+        &self,
+        content_hash: Sha256Digest,
+        now: Timestamp,
+    ) -> Result<bool, ManifestCatalogError> {
+        let connection = self.lock()?;
+        connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM analytical_generation_objects WHERE content_hash=?1
+                    UNION ALL
+                    SELECT 1
+                    FROM query_artifact_results AS results
+                    JOIN query_artifact_reservations AS reservations USING (reservation_id)
+                    WHERE results.content_algorithm=1
+                      AND results.content_digest=?1
+                      AND reservations.state='published'
+                      AND reservations.expires_at_ns>?2
+                 )",
+                params![content_hash.bytes().as_slice(), now.unix_nanos()],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>, ManifestCatalogError> {

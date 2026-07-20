@@ -2954,10 +2954,14 @@ name = "market-squawk-data"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "async-trait",
  "atomicwrites",
+ "bytes",
+ "cap-fs-ext",
  "cap-std",
  "chrono",
  "datafusion",
+ "futures-util",
  "libc",
  "market-squawk-domain",
  "market-squawk-platform",

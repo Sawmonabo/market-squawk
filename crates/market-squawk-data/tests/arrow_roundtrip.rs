@@ -1,6 +1,10 @@
 use std::error::Error;
 
-use arrow::array::{Decimal128Array, UInt8Array};
+use std::sync::Arc;
+
+use arrow::array::{
+    Array as _, ArrayRef, Decimal128Array, StringArray, TimestampNanosecondArray, UInt8Array,
+};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use market_squawk_data::{ArrowConversionError, ResearchArrowBatch};
@@ -76,7 +80,117 @@ fn arrow_reader_rejects_an_unsupported_schema_version() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn availability_projection_is_conservative_typed_and_tamper_evident() -> TestResult {
+    let observations = vec![
+        macro_observation_with_availability(
+            Decimal::new(1, 0),
+            AvailabilityEvidence::evidenced(
+                Timestamp::from_unix_nanos(100),
+                SourceIdentifier::try_from("fred-release")?,
+            ),
+        )?,
+        macro_observation_with_availability(
+            Decimal::new(2, 0),
+            AvailabilityEvidence::local_first_observed(Timestamp::from_unix_nanos(101)),
+        )?,
+        macro_observation_with_availability(
+            Decimal::new(3, 0),
+            AvailabilityEvidence::inferred(
+                Timestamp::from_unix_nanos(102),
+                SourceIdentifier::try_from("release-calendar-v2")?,
+            ),
+        )?,
+        macro_observation_with_availability(Decimal::new(4, 0), AvailabilityEvidence::unknown())?,
+    ];
+    let converted = ResearchArrowBatch::try_from_observations(
+        SourceIdentifier::try_from("fred-gdp")?,
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [11; 32]),
+        observations,
+    )?;
+    let batch = converted.record_batch();
+    let available = timestamp_column(batch, "available_at")?;
+    let reported = timestamp_column(batch, "availability_reported_or_inferred_at")?;
+    let kinds = string_column(batch, "availability_kind")?;
+    let evidence = string_column(batch, "availability_evidence")?;
+    let methods = string_column(batch, "availability_method")?;
+
+    assert_eq!(
+        available.iter().collect::<Vec<_>>(),
+        vec![Some(100), Some(101), None, None]
+    );
+    assert_eq!(
+        reported.iter().collect::<Vec<_>>(),
+        vec![Some(100), Some(101), Some(102), None]
+    );
+    assert_eq!(
+        kinds.iter().collect::<Vec<_>>(),
+        vec![
+            Some("evidenced"),
+            Some("local_first_observed"),
+            Some("inferred"),
+            Some("unknown"),
+        ]
+    );
+    assert_eq!(
+        evidence.iter().collect::<Vec<_>>(),
+        vec![Some("fred-release"), None, None, None]
+    );
+    assert_eq!(
+        methods.iter().collect::<Vec<_>>(),
+        vec![None, None, Some("release-calendar-v2"), None]
+    );
+
+    let kind_index = batch.schema().index_of("availability_kind")?;
+    let mut columns = batch.columns().to_vec();
+    columns[kind_index] = Arc::new(StringArray::from(vec![
+        Some("inferred"),
+        Some("local_first_observed"),
+        Some("inferred"),
+        Some("unknown"),
+    ])) as ArrayRef;
+    let hostile = RecordBatch::try_new(batch.schema(), columns)?;
+    assert!(matches!(
+        ResearchArrowBatch::try_from_record_batch(hostile),
+        Err(ArrowConversionError::ProjectionMismatch)
+    ));
+    Ok(())
+}
+
+fn timestamp_column<'a>(
+    batch: &'a RecordBatch,
+    name: &str,
+) -> Result<&'a TimestampNanosecondArray, Box<dyn Error>> {
+    batch
+        .column_by_name(name)
+        .and_then(|array| array.as_any().downcast_ref::<TimestampNanosecondArray>())
+        .ok_or_else(|| format!("missing timestamp column {name}").into())
+}
+
+fn string_column<'a>(
+    batch: &'a RecordBatch,
+    name: &str,
+) -> Result<&'a StringArray, Box<dyn Error>> {
+    batch
+        .column_by_name(name)
+        .and_then(|array| array.as_any().downcast_ref::<StringArray>())
+        .ok_or_else(|| format!("missing string column {name}").into())
+}
+
 fn macro_observation(value: Decimal) -> Result<ResearchObservation, Box<dyn Error>> {
+    macro_observation_with_availability(
+        value,
+        AvailabilityEvidence::evidenced(
+            Timestamp::from_unix_nanos(100),
+            SourceIdentifier::try_from("fred-release")?,
+        ),
+    )
+}
+
+fn macro_observation_with_availability(
+    value: Decimal,
+    availability: AvailabilityEvidence,
+) -> Result<ResearchObservation, Box<dyn Error>> {
     let context = ResearchContext::new(
         ResearchProvenance::try_new(ResearchProvenanceInput {
             source_id: SourceId::try_from("fred-local-fixture")?,
@@ -90,10 +204,7 @@ fn macro_observation(value: Decimal) -> Result<ResearchObservation, Box<dyn Erro
             payload_reference: PayloadReference::SourceReference(SourceIdentifier::try_from(
                 "fred:gdp:2026q1",
             )?),
-            availability: AvailabilityEvidence::evidenced(
-                Timestamp::from_unix_nanos(100),
-                SourceIdentifier::try_from("fred-release")?,
-            ),
+            availability,
         })?,
         ResearchTime::new(
             Timestamp::from_unix_nanos(90),

@@ -1,9 +1,7 @@
 //! Capability-confined, immutable, content-addressed Parquet publication.
 
-use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -25,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::manifest::{PinnedDataset, Sha256Digest};
+use crate::publication_coordinator::{PublicationCoordinator, PublicationLease};
 use crate::schema::{decode_hex, encode_hex};
 
 const OBJECTS: &str = "objects/sha256";
@@ -32,6 +31,14 @@ const STAGING: &str = "staging/parquet";
 const QUARANTINE: &str = "quarantine/parquet";
 const MAX_SCAN_OBJECTS: usize = 100_000;
 const MAX_BLOCKING_TASKS: usize = 4;
+
+#[path = "parquet_store/pinned.rs"]
+mod pinned;
+#[path = "parquet_store/recovery.rs"]
+mod recovery;
+
+pub(crate) use pinned::VerifiedPinnedObject;
+pub use recovery::OrphanRecoveryReport;
 
 /// Fixed resource policy for local Parquet publication.
 #[derive(Clone, Copy, Debug)]
@@ -102,25 +109,6 @@ impl PublishedObject {
     }
 }
 
-/// One bounded orphan reconciliation result.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct OrphanRecoveryReport {
-    quarantined: usize,
-    deleted: usize,
-}
-
-impl OrphanRecoveryReport {
-    /// Returns newly quarantined unreferenced objects.
-    pub const fn quarantined(self) -> usize {
-        self.quarantined
-    }
-
-    /// Returns quarantine entries deleted after the grace interval.
-    pub const fn deleted(self) -> usize {
-        self.deleted
-    }
-}
-
 /// Retained directory capability for immutable Parquet objects.
 #[derive(Debug)]
 pub struct ParquetObjectStore {
@@ -128,6 +116,7 @@ pub struct ParquetObjectStore {
     directory: Dir,
     config: ObjectStoreConfig,
     blocking_tasks: Arc<Semaphore>,
+    publication: PublicationCoordinator,
 }
 
 impl ParquetObjectStore {
@@ -153,6 +142,7 @@ impl ParquetObjectStore {
             directory,
             config,
             blocking_tasks: Arc::new(Semaphore::new(MAX_BLOCKING_TASKS)),
+            publication: PublicationCoordinator::default(),
         })
     }
 
@@ -162,11 +152,37 @@ impl ParquetObjectStore {
         batch: &RecordBatch,
         cancellation: &CancellationToken,
     ) -> Result<PublishedObject, ParquetStoreError> {
+        let lease = self.begin_publication(cancellation).await?;
+        self.publish_under_lease(batch, cancellation, &lease).await
+    }
+
+    /// Acquires exclusive final-object publication ownership with cancellation.
+    pub async fn begin_publication(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<PublicationLease, ParquetStoreError> {
+        self.publication
+            .acquire(cancellation)
+            .await
+            .ok_or(ParquetStoreError::Cancelled)
+    }
+
+    /// Publishes while the caller retains exclusion through its durable reference commit.
+    pub async fn publish_under_lease(
+        &self,
+        batch: &RecordBatch,
+        cancellation: &CancellationToken,
+        lease: &PublicationLease,
+    ) -> Result<PublishedObject, ParquetStoreError> {
+        if !self.publication.owns(lease) {
+            return Err(ParquetStoreError::InvalidPublicationLease);
+        }
         let store = Self {
             root: self.root.clone(),
             directory: self.directory.try_clone()?,
             config: self.config,
             blocking_tasks: Arc::clone(&self.blocking_tasks),
+            publication: self.publication.clone(),
         };
         let batch = batch.clone();
         let permit = self.acquire_blocking_permit(cancellation).await?;
@@ -182,6 +198,7 @@ impl ParquetObjectStore {
             }
             _ = cancellation.cancelled() => {
                 operation_cancellation.cancel();
+                worker.await.map_err(|_| ParquetStoreError::BlockingTaskFailed)??;
                 Err(ParquetStoreError::Cancelled)
             }
         }
@@ -378,6 +395,7 @@ impl ParquetObjectStore {
             directory: self.directory.try_clone()?,
             config: self.config,
             blocking_tasks: Arc::clone(&self.blocking_tasks),
+            publication: self.publication.clone(),
         };
         let dataset = dataset.clone();
         let permit = self.acquire_blocking_permit(cancellation).await?;
@@ -396,90 +414,6 @@ impl ParquetObjectStore {
                 Err(ParquetStoreError::Cancelled)
             }
         }
-    }
-
-    /// Returns a bounded snapshot of content-addressed final objects.
-    pub fn published_objects(&self) -> Result<Vec<PublishedObject>, ParquetStoreError> {
-        scan_objects(&self.directory, OBJECTS)
-    }
-
-    /// Quarantines unreferenced objects and deletes only pre-existing expired quarantine entries.
-    pub fn collect_orphans(
-        &self,
-        referenced: &[Sha256Digest],
-        now: Timestamp,
-    ) -> Result<OrphanRecoveryReport, ParquetStoreError> {
-        let referenced: BTreeSet<_> = referenced.iter().copied().collect();
-        let deleted = delete_expired_quarantine(&self.directory, now, self.config.orphan_grace)?;
-        let mut quarantined = self.quarantine_expired_staging(now)?;
-        for object in scan_objects(&self.directory, OBJECTS)? {
-            if referenced.contains(&object.content_hash) {
-                continue;
-            }
-            let name = format!("{}.parquet", encode_hex(object.content_hash.bytes()));
-            let destination = format!("{QUARANTINE}/{name}");
-            match self.publish_no_replace(&object.relative_reference, &destination) {
-                Ok(()) => {
-                    quarantined = quarantined
-                        .checked_add(1)
-                        .ok_or(ParquetStoreError::RecoveryScanLimit)?;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    self.directory.remove_file(&object.relative_reference)?;
-                }
-                Err(error) => return Err(error.into()),
-            }
-        }
-        sync_directory(&self.directory, QUARANTINE)?;
-        sync_directory(&self.directory, OBJECTS)?;
-        Ok(OrphanRecoveryReport {
-            quarantined,
-            deleted,
-        })
-    }
-
-    fn quarantine_expired_staging(&self, now: Timestamp) -> Result<usize, ParquetStoreError> {
-        let cutoff = recovery_cutoff(now, self.config.orphan_grace)?;
-        let mut quarantined = 0_usize;
-        let mut scanned = 0_usize;
-        for entry in self.directory.read_dir(STAGING)? {
-            scanned = scanned
-                .checked_add(1)
-                .ok_or(ParquetStoreError::RecoveryScanLimit)?;
-            if scanned > MAX_SCAN_OBJECTS {
-                return Err(ParquetStoreError::RecoveryScanLimit);
-            }
-            let entry = entry?;
-            if !entry.file_type()?.is_file() {
-                return Err(ParquetStoreError::ObjectMetadataMismatch);
-            }
-            let name = entry.file_name();
-            let name = name
-                .to_str()
-                .ok_or(ParquetStoreError::ObjectMetadataMismatch)?;
-            let identifier = name
-                .strip_suffix(".tmp")
-                .and_then(|value| Uuid::parse_str(value).ok())
-                .ok_or(ParquetStoreError::ObjectMetadataMismatch)?;
-            let modified = timestamp_from_system_time(entry.metadata()?.modified()?.into_std())?;
-            if modified.unix_nanos() > cutoff {
-                continue;
-            }
-            let source = format!("{STAGING}/{name}");
-            let destination = format!("{QUARANTINE}/staged-{identifier}.tmp");
-            match self.publish_no_replace(&source, &destination) {
-                Ok(()) => {
-                    quarantined = quarantined
-                        .checked_add(1)
-                        .ok_or(ParquetStoreError::RecoveryScanLimit)?;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    self.directory.remove_file(source)?;
-                }
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Ok(quarantined)
     }
 
     async fn acquire_blocking_permit(
@@ -577,6 +511,9 @@ pub enum ParquetStoreError {
     /// The operation was cancelled before publication.
     #[error("Parquet publication was cancelled")]
     Cancelled,
+    /// A lease belongs to a different publication/recovery coordinator.
+    #[error("Parquet publication lease does not own this object store")]
+    InvalidPublicationLease,
     /// A batch or object exceeds the configured bounded staging area.
     #[error("Parquet staging byte limit exceeded")]
     StagingLimitExceeded,
@@ -645,100 +582,6 @@ fn hash_file(
         hash.update(&buffer[..read]);
     }
     Ok(Sha256Digest::new(hash.finalize().into()))
-}
-
-fn scan_objects(directory: &Dir, root: &str) -> Result<Vec<PublishedObject>, ParquetStoreError> {
-    let mut objects = Vec::new();
-    let mut prefixes = 0_usize;
-    for prefix in directory.read_dir(root)? {
-        let prefix = prefix?;
-        prefixes = prefixes
-            .checked_add(1)
-            .ok_or(ParquetStoreError::RecoveryScanLimit)?;
-        if prefixes > 256 {
-            return Err(ParquetStoreError::RecoveryScanLimit);
-        }
-        if !prefix.file_type()?.is_dir() {
-            return Err(ParquetStoreError::ObjectMetadataMismatch);
-        }
-        let prefix_name = prefix.file_name();
-        let prefix_name = prefix_name
-            .to_str()
-            .filter(|value| {
-                value.len() == 2
-                    && value
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-            })
-            .ok_or(ParquetStoreError::ObjectMetadataMismatch)?;
-        let prefix_path = format!("{root}/{prefix_name}");
-        for entry in directory.read_dir(&prefix_path)? {
-            if objects.len() >= MAX_SCAN_OBJECTS {
-                return Err(ParquetStoreError::RecoveryScanLimit);
-            }
-            let entry = entry?;
-            if !entry.file_type()?.is_file() {
-                return Err(ParquetStoreError::ObjectMetadataMismatch);
-            }
-            let name = entry.file_name();
-            let name = name
-                .to_str()
-                .ok_or(ParquetStoreError::ObjectMetadataMismatch)?;
-            let encoded = name
-                .strip_suffix(".parquet")
-                .filter(|value| value.starts_with(prefix_name))
-                .ok_or(ParquetStoreError::ObjectMetadataMismatch)?;
-            let named_digest = decode_hex(encoded)
-                .map(Sha256Digest::new)
-                .ok_or(ParquetStoreError::ObjectMetadataMismatch)?;
-            let reference = format!("{prefix_path}/{name}");
-            let object = object_from_reference(directory, &reference, 0)?;
-            if object.content_hash != named_digest {
-                return Err(ParquetStoreError::ObjectMetadataMismatch);
-            }
-            objects.push(object);
-        }
-    }
-    Ok(objects)
-}
-
-fn delete_expired_quarantine(
-    directory: &Dir,
-    now: Timestamp,
-    grace: Duration,
-) -> Result<usize, ParquetStoreError> {
-    let cutoff = recovery_cutoff(now, grace)?;
-    let mut deleted = 0_usize;
-    let mut scanned = 0_usize;
-    for entry in directory.read_dir(QUARANTINE)? {
-        scanned = scanned
-            .checked_add(1)
-            .ok_or(ParquetStoreError::RecoveryScanLimit)?;
-        if scanned > MAX_SCAN_OBJECTS {
-            return Err(ParquetStoreError::RecoveryScanLimit);
-        }
-        let entry = entry?;
-        if !entry.file_type()?.is_file() {
-            return Err(ParquetStoreError::ObjectMetadataMismatch);
-        }
-        let modified = timestamp_from_system_time(entry.metadata()?.modified()?.into_std())?;
-        if modified.unix_nanos() <= cutoff {
-            let name = entry.file_name();
-            directory.remove_file(Path::new(QUARANTINE).join(name))?;
-            deleted = deleted
-                .checked_add(1)
-                .ok_or(ParquetStoreError::RecoveryScanLimit)?;
-        }
-    }
-    Ok(deleted)
-}
-
-fn recovery_cutoff(now: Timestamp, grace: Duration) -> Result<i64, ParquetStoreError> {
-    let grace_nanos =
-        i64::try_from(grace.as_nanos()).map_err(|_| ParquetStoreError::SizeOverflow)?;
-    now.unix_nanos()
-        .checked_sub(grace_nanos)
-        .ok_or(ParquetStoreError::SizeOverflow)
 }
 
 fn timestamp_from_system_time(value: SystemTime) -> Result<Timestamp, ParquetStoreError> {

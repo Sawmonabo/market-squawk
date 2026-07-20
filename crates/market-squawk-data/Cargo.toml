@@ -9,10 +9,14 @@ repository = "https://github.com/Sawmonabo/market-squawk"
 publish = false
 
 [dependencies]
+async-trait = { workspace = true }
 arrow = { workspace = true }
+bytes = { workspace = true }
 cap-std = { workspace = true }
+cap-fs-ext = { workspace = true }
 chrono = { workspace = true }
 datafusion = { workspace = true }
+futures-util = { workspace = true }
 libc = { workspace = true }
 market-squawk-domain = { workspace = true }
 market-squawk-platform = { workspace = true }

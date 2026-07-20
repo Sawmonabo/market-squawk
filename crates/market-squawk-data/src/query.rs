@@ -1,31 +1,43 @@
 //! Bounded read-only DataFusion execution over one immutable manifest pin.
 
-use std::collections::BTreeSet;
-use std::ops::ControlFlow;
+use std::mem::size_of;
 use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::compute::concat_batches;
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
-use datafusion::datasource::MemTable;
 use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
+use datafusion::execution::memory_pool::MemoryConsumer;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::physical_plan::ExecutionPlanProperties as _;
 use datafusion::prelude::{SessionConfig, SessionContext};
-use datafusion::sql::parser::{DFParserBuilder, Statement as DataFusionStatement};
-use datafusion::sql::sqlparser::ast::{
-    Expr, ObjectName, Query, Statement, TableFactor, Visit, Visitor,
-};
+use datafusion::sql::parser::DFParserBuilder;
 use datafusion::sql::sqlparser::dialect::GenericDialect;
-use datafusion::sql::sqlparser::tokenizer::Tokenizer;
+use futures_util::StreamExt as _;
+use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier};
+use sha2::Digest as _;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-use crate::schema::DATASET_KEY;
+#[path = "query/budget.rs"]
+mod budget;
+#[path = "query/source.rs"]
+mod source;
+#[path = "query/validation.rs"]
+mod validation;
+
+use self::budget::{
+    CountingWriter, map_datafusion, reserve_memory, resize_memory, schema_retained_bytes,
+    valid_table_name,
+};
+use self::source::QuerySource;
+use self::validation::{validate_read_only_statement, validate_relations};
+use crate::schema::research_schema;
 use crate::{
     ArrowConversionError, ArtifactRecord, CatalogError, DatasetManifestRef, ParquetObjectStore,
-    ParquetStoreError, PinnedDataset, PublishedObject, ResearchArrowBatch,
+    ParquetStoreError, PinnedDataset, PublishedObject, QueryArtifactPublisher,
+    QueryArtifactReservation, QueryArtifactResult,
 };
 
 const MAX_SQL_BYTES: usize = 64 * 1024;
@@ -92,14 +104,20 @@ impl QueryLimits {
             deadline,
         })
     }
+
+    /// Returns the result-byte ceiling also used by durable artifact authority.
+    pub const fn max_bytes(self) -> u64 {
+        self.max_bytes
+    }
 }
 
 /// Validated single-statement read-only query bound to one exact manifest generation.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct QueryRequest {
     manifest: DatasetManifestRef,
     sql: String,
     ast_nodes: usize,
+    artifact_reservation: Option<QueryArtifactReservation>,
 }
 
 impl QueryRequest {
@@ -132,7 +150,58 @@ impl QueryRequest {
             manifest,
             sql,
             ast_nodes,
+            artifact_reservation: None,
         })
+    }
+
+    /// Computes the exact SHA-256 identity of manifest, SQL, and every execution limit.
+    pub fn artifact_identity(&self, limits: &QueryLimits) -> EvidenceDigest {
+        let mut identity = sha2::Sha256::new();
+        identity.update(b"market-squawk/query-artifact-request/v1");
+        identity.update(
+            u64::try_from(self.manifest.dataset_id().as_str().len())
+                .unwrap_or(u64::MAX)
+                .to_be_bytes(),
+        );
+        identity.update(self.manifest.dataset_id().as_str().as_bytes());
+        identity.update(self.manifest.manifest_version().to_be_bytes());
+        identity.update(self.manifest.content_hash().bytes());
+        identity.update(
+            u64::try_from(self.sql.len())
+                .unwrap_or(u64::MAX)
+                .to_be_bytes(),
+        );
+        identity.update(self.sql.as_bytes());
+        identity.update(limits.max_rows.to_be_bytes());
+        identity.update(limits.max_bytes.to_be_bytes());
+        identity.update(limits.max_memory_bytes.to_be_bytes());
+        identity.update(
+            u64::try_from(limits.max_partitions)
+                .unwrap_or(u64::MAX)
+                .to_be_bytes(),
+        );
+        identity.update(
+            u64::try_from(limits.max_ast_nodes)
+                .unwrap_or(u64::MAX)
+                .to_be_bytes(),
+        );
+        identity.update(
+            u64::try_from(limits.max_plan_nodes)
+                .unwrap_or(u64::MAX)
+                .to_be_bytes(),
+        );
+        identity.update(
+            u64::try_from(limits.deadline.as_nanos())
+                .unwrap_or(u64::MAX)
+                .to_be_bytes(),
+        );
+        EvidenceDigest::new(DigestAlgorithm::Sha256, identity.finalize().into())
+    }
+
+    /// Attaches the non-cloneable durable authority receipt required for artifact mode.
+    pub fn with_artifact_reservation(mut self, reservation: QueryArtifactReservation) -> Self {
+        self.artifact_reservation = Some(reservation);
+        self
     }
 }
 
@@ -151,7 +220,9 @@ pub enum QueryResult {
         /// Immutable Parquet object receipt.
         object: PublishedObject,
         /// Task 3 controlled-artifact metadata for the exact object bytes.
-        artifact: ArtifactRecord,
+        artifact: Box<ArtifactRecord>,
+        /// Durable owner and expiry binding committed before this result crossed the boundary.
+        ownership: QueryArtifactResult,
     },
 }
 
@@ -175,45 +246,50 @@ pub trait ResearchQueryService {
 pub struct ResearchQueryEngine {
     manifest: DatasetManifestRef,
     table_name: String,
-    batches: Vec<RecordBatch>,
+    source: QuerySource,
     artifact_store: Option<Arc<ParquetObjectStore>>,
+    artifact_publisher: Option<Arc<QueryArtifactPublisher>>,
 }
 
 impl ResearchQueryEngine {
-    /// Verifies and loads only objects referenced by one exact immutable manifest generation.
+    /// Retains only the exact immutable pin and object-store capability; opening happens in query.
     pub async fn from_pinned_dataset(
         dataset: PinnedDataset,
         table_name: impl Into<String>,
         store: Arc<ParquetObjectStore>,
         cancellation: CancellationToken,
     ) -> Result<Self, QueryError> {
-        let batches = store.read_pinned_async(&dataset, &cancellation).await?;
         if cancellation.is_cancelled() {
             return Err(QueryError::Cancelled);
         }
-        let schema = Arc::new(Schema::new(batches[0].schema().fields().clone()));
-        let mut normalized = Vec::with_capacity(batches.len());
-        for batch in batches {
-            let validated = ResearchArrowBatch::try_from_record_batch(batch)?;
-            let retained_dataset = validated
-                .record_batch()
-                .schema()
-                .metadata()
-                .get(DATASET_KEY)
-                .cloned()
-                .ok_or(QueryError::InvalidSource)?;
-            if retained_dataset != dataset.manifest().dataset_id().as_str() {
-                return Err(QueryError::InvalidSource);
-            }
-            normalized.push(RecordBatch::try_new(
-                Arc::clone(&schema),
-                validated.record_batch().columns().to_vec(),
-            )?);
+        let table_name = table_name.into();
+        if !valid_table_name(&table_name) || dataset.objects().is_empty() {
+            return Err(QueryError::InvalidSource);
         }
-        Ok(
-            Self::from_pinned_batches(dataset.manifest().clone(), table_name, normalized)?
-                .with_artifact_store(store),
-        )
+        let dataset_name = SourceIdentifier::try_from(dataset.manifest().dataset_id().as_str())
+            .map_err(|_| QueryError::InvalidSource)?;
+        let schema = Arc::new(Schema::new(
+            research_schema(
+                &dataset_name,
+                EvidenceDigest::new(
+                    DigestAlgorithm::Sha256,
+                    dataset.manifest().content_hash().bytes(),
+                ),
+            )
+            .fields()
+            .clone(),
+        ));
+        Ok(Self {
+            manifest: dataset.manifest().clone(),
+            table_name,
+            source: QuerySource::Pinned {
+                dataset,
+                store: Arc::clone(&store),
+                schema,
+            },
+            artifact_store: Some(store),
+            artifact_publisher: None,
+        })
     }
 
     /// Registers only caller-supplied batches already bound to one immutable manifest.
@@ -233,14 +309,29 @@ impl ResearchQueryEngine {
         Ok(Self {
             manifest,
             table_name,
-            batches,
+            source: QuerySource::Batches {
+                schema: batches[0].schema(),
+                batches,
+            },
             artifact_store: None,
+            artifact_publisher: None,
         })
     }
 
     /// Enables controlled Parquet publication for non-inline results.
     pub fn with_artifact_store(mut self, store: Arc<ParquetObjectStore>) -> Self {
         self.artifact_store = Some(store);
+        self
+    }
+
+    /// Enables artifact publication only with a least-authority durable binder.
+    pub fn with_artifact_publisher(
+        mut self,
+        store: Arc<ParquetObjectStore>,
+        publisher: Arc<QueryArtifactPublisher>,
+    ) -> Self {
+        self.artifact_store = Some(store);
+        self.artifact_publisher = Some(publisher);
         self
     }
 
@@ -253,6 +344,12 @@ impl ResearchQueryEngine {
     ) -> Result<QueryResult, QueryError> {
         if request.manifest != self.manifest {
             return Err(QueryError::ManifestPinMismatch);
+        }
+        if let Some(reservation) = request.artifact_reservation.as_ref()
+            && (reservation.request_identity() != request.artifact_identity(&limits)
+                || reservation.max_bytes() != limits.max_bytes)
+        {
+            return Err(QueryError::ArtifactReservationMismatch);
         }
         if cancellation.is_cancelled() {
             return Err(QueryError::Cancelled);
@@ -271,7 +368,21 @@ impl ResearchQueryEngine {
                 .with_disk_manager_builder(
                     DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled),
                 )
-                .build_arc()?;
+                .build_arc()
+                .map_err(|error| map_datafusion(error, limits.max_memory_bytes))?;
+            let input_memory =
+                MemoryConsumer::new("market-squawk-query-input").register(&runtime.memory_pool);
+            reserve_memory(
+                &input_memory,
+                self.source.retained_bytes()?,
+                limits.max_memory_bytes,
+            )?;
+            let output_memory =
+                MemoryConsumer::new("market-squawk-query-output").register(&runtime.memory_pool);
+            let ipc_memory =
+                MemoryConsumer::new("market-squawk-query-ipc").register(&runtime.memory_pool);
+            let artifact_memory =
+                MemoryConsumer::new("market-squawk-query-artifact").register(&runtime.memory_pool);
             let config = SessionConfig::new()
                 .with_target_partitions(limits.max_partitions)
                 .with_batch_size(8_192)
@@ -280,9 +391,13 @@ impl ResearchQueryEngine {
                 .with_repartition_aggregations(false)
                 .with_repartition_file_scans(false);
             let context = SessionContext::new_with_config_rt(config, runtime);
-            let table = MemTable::try_new(self.batches[0].schema(), vec![self.batches.clone()])?;
-            context.register_table(self.table_name.clone(), Arc::new(table))?;
-            let dataframe = context.sql(&request.sql).await?;
+            self.source
+                .register(&context, &self.table_name, &execution_cancellation)
+                .await?;
+            let dataframe = context
+                .sql(&request.sql)
+                .await
+                .map_err(|error| map_datafusion(error, limits.max_memory_bytes))?;
             let logical_nodes = dataframe
                 .logical_plan()
                 .display_indent()
@@ -292,7 +407,10 @@ impl ResearchQueryEngine {
             if logical_nodes > limits.max_plan_nodes {
                 return Err(QueryError::PlanLimitExceeded);
             }
-            let physical = dataframe.create_physical_plan().await?;
+            let physical = dataframe
+                .create_physical_plan()
+                .await
+                .map_err(|error| map_datafusion(error, limits.max_memory_bytes))?;
             if physical.output_partitioning().partition_count() > limits.max_partitions {
                 return Err(QueryError::PartitionLimitExceeded);
             }
@@ -303,20 +421,63 @@ impl ResearchQueryEngine {
                     .ok_or(QueryError::InvalidLimits)?,
             )
             .map_err(|_| QueryError::InvalidLimits)?;
-            let batches = dataframe.limit(0, Some(requested_rows))?.collect().await?;
-            let rows = batches.iter().try_fold(0_u64, |total, batch| {
-                total
+            let limited = dataframe
+                .limit(0, Some(requested_rows))
+                .map_err(|error| map_datafusion(error, limits.max_memory_bytes))?;
+            let mut stream = limited
+                .execute_stream()
+                .await
+                .map_err(|error| map_datafusion(error, limits.max_memory_bytes))?;
+            let result_schema = stream.schema();
+            let schema_memory = schema_retained_bytes(&result_schema)?;
+            resize_memory(&ipc_memory, schema_memory, limits.max_memory_bytes)?;
+            let mut ipc = arrow::ipc::writer::StreamWriter::try_new(
+                CountingWriter::default(),
+                &result_schema,
+            )?;
+            resize_memory(&ipc_memory, 0, limits.max_memory_bytes)?;
+            let mut rows = 0_u64;
+            let mut batches = Vec::new();
+            while let Some(batch) = stream.next().await {
+                let batch =
+                    batch.map_err(|error| map_datafusion(error, limits.max_memory_bytes))?;
+                rows = rows
                     .checked_add(
-                        u64::try_from(batch.num_rows()).map_err(|_| QueryError::InvalidLimits)?,
+                        u64::try_from(batch.num_rows()).map_err(|_| QueryError::SizeOverflow)?,
                     )
-                    .ok_or(QueryError::InvalidLimits)
-            })?;
-            if rows > limits.max_rows {
-                return Err(QueryError::RowLimitExceeded {
-                    limit: limits.max_rows,
-                });
+                    .ok_or(QueryError::SizeOverflow)?;
+                if rows > limits.max_rows {
+                    return Err(QueryError::RowLimitExceeded {
+                        limit: limits.max_rows,
+                    });
+                }
+                let batch_memory = batch
+                    .get_array_memory_size()
+                    .checked_add(size_of::<RecordBatch>())
+                    .ok_or(QueryError::SizeOverflow)?;
+                reserve_memory(&output_memory, batch_memory, limits.max_memory_bytes)?;
+                batches
+                    .try_reserve_exact(1)
+                    .map_err(|_| QueryError::MemoryLimitExceeded {
+                        limit: limits.max_memory_bytes,
+                    })?;
+                let ipc_work = batch_memory
+                    .checked_add(schema_memory)
+                    .ok_or(QueryError::SizeOverflow)?;
+                resize_memory(&ipc_memory, ipc_work, limits.max_memory_bytes)?;
+                ipc.write(&batch)?;
+                resize_memory(&ipc_memory, 0, limits.max_memory_bytes)?;
+                if ipc.get_ref().byte_count > limits.max_bytes {
+                    return Err(QueryError::ByteLimitExceeded {
+                        limit: limits.max_bytes,
+                    });
+                }
+                batches.push(batch);
             }
-            let byte_count = ipc_size(&batches)?;
+            resize_memory(&ipc_memory, schema_memory, limits.max_memory_bytes)?;
+            ipc.finish()?;
+            resize_memory(&ipc_memory, 0, limits.max_memory_bytes)?;
+            let byte_count = ipc.get_ref().byte_count;
             if byte_count > limits.max_bytes {
                 return Err(QueryError::ByteLimitExceeded {
                     limit: limits.max_bytes,
@@ -332,19 +493,48 @@ impl ResearchQueryEngine {
                 .artifact_store
                 .as_ref()
                 .ok_or(QueryError::ArtifactStoreRequired)?;
-            let schema = batches
-                .first()
-                .map(RecordBatch::schema)
-                .unwrap_or_else(|| self.batches[0].schema());
-            let compact = concat_batches(&schema, &batches)?;
-            let object = store.publish(&compact, &execution_cancellation).await?;
+            let publisher = self
+                .artifact_publisher
+                .as_ref()
+                .ok_or(QueryError::ArtifactAuthorityRequired)?;
+            let reservation = request
+                .artifact_reservation
+                .as_ref()
+                .ok_or(QueryError::ArtifactAuthorityRequired)?;
+            let retained_output = batches.iter().try_fold(0_usize, |total, batch| {
+                total
+                    .checked_add(batch.get_array_memory_size())
+                    .and_then(|value| value.checked_add(size_of::<RecordBatch>()))
+                    .ok_or(QueryError::SizeOverflow)
+            })?;
+            resize_memory(&artifact_memory, retained_output, limits.max_memory_bytes)?;
+            let compact = concat_batches(&result_schema, &batches)?;
+            drop(batches);
+            output_memory.free();
+            let compact_memory = compact
+                .get_array_memory_size()
+                .checked_add(size_of::<RecordBatch>())
+                .ok_or(QueryError::SizeOverflow)?;
+            let publication_work = compact_memory
+                .checked_mul(2)
+                .ok_or(QueryError::SizeOverflow)?;
+            resize_memory(&artifact_memory, publication_work, limits.max_memory_bytes)?;
+            let lease = store.begin_publication(&execution_cancellation).await?;
+            let object = store
+                .publish_under_lease(&compact, &execution_cancellation, &lease)
+                .await?;
             let artifact = ArtifactRecord::try_new(
                 object.relative_reference(),
                 object.content_hash().evidence(),
                 object.size_bytes(),
                 object.created_at(),
             )?;
-            Ok(QueryResult::Artifact { object, artifact })
+            let ownership = publisher.bind(reservation, &artifact)?;
+            Ok(QueryResult::Artifact {
+                object,
+                artifact: Box::new(artifact),
+                ownership,
+            })
         };
         tokio::select! {
             _ = cancellation.cancelled() => {
@@ -409,6 +599,12 @@ pub enum QueryError {
     /// Result exceeded its serialized byte limit.
     #[error("query byte limit {limit} exceeded")]
     ByteLimitExceeded { limit: u64 },
+    /// Retained input, execution, output, or serialization work exceeded one memory budget.
+    #[error("query memory limit {limit} exceeded")]
+    MemoryLimitExceeded { limit: u64 },
+    /// A retained byte count could not be represented safely.
+    #[error("query retained byte count overflow")]
+    SizeOverflow,
     /// Cancellation was observed before a result crossed the service boundary.
     #[error("query was cancelled")]
     Cancelled,
@@ -418,6 +614,12 @@ pub enum QueryError {
     /// A non-inline result had no controlled artifact capability.
     #[error("query requires a controlled artifact store")]
     ArtifactStoreRequired,
+    /// A non-inline result lacked a durable least-authority publisher or reservation.
+    #[error("query requires authorized artifact publication authority")]
+    ArtifactAuthorityRequired,
+    /// The attached reservation was issued for different request or limit bytes.
+    #[error("query artifact reservation identity does not match this request")]
+    ArtifactReservationMismatch,
     /// DataFusion planning or execution failed.
     #[error("DataFusion query failed")]
     DataFusion(#[from] datafusion::error::DataFusionError),
@@ -436,6 +638,9 @@ pub enum QueryError {
     /// Arrow IPC serialization failed.
     #[error("query IPC serialization failed")]
     Io(#[from] std::io::Error),
+    /// Prefix-confined object-store construction failed.
+    #[error("query pinned object store failed")]
+    ObjectStore(#[from] datafusion::object_store::Error),
 }
 
 impl ResearchQueryService for ResearchQueryEngine {
@@ -447,166 +652,4 @@ impl ResearchQueryService for ResearchQueryEngine {
     ) -> Result<QueryResult, QueryError> {
         ResearchQueryEngine::query(self, request, limits, cancellation).await
     }
-}
-
-fn validate_read_only_statement(statement: &DataFusionStatement) -> Result<usize, QueryError> {
-    match statement {
-        DataFusionStatement::Statement(statement) => match statement.as_ref() {
-            Statement::Query(query) => validate_query(query),
-            _ => Err(QueryError::ForbiddenStatement),
-        },
-        DataFusionStatement::Explain(explain) => validate_read_only_statement(&explain.statement),
-        DataFusionStatement::CreateExternalTable(_)
-        | DataFusionStatement::CopyTo(_)
-        | DataFusionStatement::Reset(_) => Err(QueryError::ForbiddenStatement),
-    }
-}
-
-fn validate_query(query: &Query) -> Result<usize, QueryError> {
-    let mut visitor = ConfinementVisitor::default();
-    match query.visit(&mut visitor) {
-        ControlFlow::Continue(()) => Ok(visitor.nodes),
-        ControlFlow::Break(error) => Err(error),
-    }
-}
-
-fn validate_relations(sql: &str, table_name: &str, max_nodes: usize) -> Result<(), QueryError> {
-    let dialect = GenericDialect;
-    let token_count = Tokenizer::new(&dialect, sql)
-        .tokenize()
-        .map_err(|error| QueryError::Parse(error.to_string()))?
-        .len();
-    if token_count > max_nodes {
-        return Err(QueryError::AstLimitExceeded);
-    }
-    let mut parser = DFParserBuilder::new(sql)
-        .with_dialect(&dialect)
-        .with_recursion_limit(64)
-        .build()
-        .map_err(|error| QueryError::Parse(error.to_string()))?;
-    let statement = parser
-        .parse_statements()
-        .map_err(|error| QueryError::Parse(error.to_string()))?
-        .pop_front()
-        .ok_or(QueryError::ForbiddenStatement)?;
-    let mut visitor = RelationVisitor::new(table_name);
-    match statement {
-        DataFusionStatement::Statement(statement) => match statement.as_ref() {
-            Statement::Query(query) => match query.visit(&mut visitor) {
-                ControlFlow::Continue(()) => Ok(()),
-                ControlFlow::Break(error) => Err(error),
-            },
-            _ => Err(QueryError::ForbiddenStatement),
-        },
-        DataFusionStatement::Explain(explain) => {
-            validate_relations(&explain.statement.to_string(), table_name, max_nodes)
-        }
-        _ => Err(QueryError::ForbiddenStatement),
-    }
-}
-
-#[derive(Default)]
-struct ConfinementVisitor {
-    nodes: usize,
-}
-
-impl Visitor for ConfinementVisitor {
-    type Break = QueryError;
-
-    fn pre_visit_query(&mut self, _query: &Query) -> ControlFlow<Self::Break> {
-        self.nodes = self.nodes.saturating_add(1);
-        ControlFlow::Continue(())
-    }
-
-    fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<Self::Break> {
-        self.nodes = self.nodes.saturating_add(1);
-        match factor {
-            TableFactor::Table { args: None, .. } | TableFactor::Derived { .. } => {
-                ControlFlow::Continue(())
-            }
-            _ => ControlFlow::Break(QueryError::ForbiddenTableFunction),
-        }
-    }
-
-    fn pre_visit_expr(&mut self, expression: &Expr) -> ControlFlow<Self::Break> {
-        self.nodes = self.nodes.saturating_add(1);
-        if let Expr::Function(function) = expression {
-            let name = function.name.to_string().to_ascii_lowercase();
-            if !matches!(
-                name.as_str(),
-                "abs"
-                    | "avg"
-                    | "coalesce"
-                    | "count"
-                    | "date_trunc"
-                    | "lower"
-                    | "max"
-                    | "min"
-                    | "round"
-                    | "sum"
-                    | "upper"
-            ) {
-                return ControlFlow::Break(QueryError::ForbiddenFunction);
-            }
-        }
-        ControlFlow::Continue(())
-    }
-}
-
-struct RelationVisitor {
-    allowed: BTreeSet<String>,
-}
-
-impl RelationVisitor {
-    fn new(table_name: &str) -> Self {
-        Self {
-            allowed: BTreeSet::from([table_name.to_ascii_lowercase()]),
-        }
-    }
-}
-
-impl Visitor for RelationVisitor {
-    type Break = QueryError;
-
-    fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<Self::Break> {
-        if let Some(with) = &query.with {
-            for cte in &with.cte_tables {
-                self.allowed
-                    .insert(cte.alias.name.value.to_ascii_lowercase());
-            }
-        }
-        ControlFlow::Continue(())
-    }
-
-    fn pre_visit_relation(&mut self, relation: &ObjectName) -> ControlFlow<Self::Break> {
-        let relation = relation.to_string().to_ascii_lowercase();
-        if self.allowed.contains(&relation) {
-            ControlFlow::Continue(())
-        } else {
-            ControlFlow::Break(QueryError::ForbiddenRelation)
-        }
-    }
-}
-
-fn ipc_size(batches: &[RecordBatch]) -> Result<u64, QueryError> {
-    let Some(first) = batches.first() else {
-        return Ok(0);
-    };
-    let mut bytes = Vec::new();
-    {
-        let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut bytes, &first.schema())?;
-        for batch in batches {
-            writer.write(batch)?;
-        }
-        writer.finish()?;
-        writer.flush()?;
-    }
-    u64::try_from(bytes.len()).map_err(|_| QueryError::InvalidLimits)
-}
-
-fn valid_table_name(value: &str) -> bool {
-    let mut bytes = value.bytes();
-    bytes.next().is_some_and(|first| first.is_ascii_lowercase())
-        && value.len() <= 64
-        && bytes.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
 }

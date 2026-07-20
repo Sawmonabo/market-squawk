@@ -10,8 +10,8 @@ use arrow::compute::concat_batches;
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 use market_squawk_domain::{
-    DataQuality, DigestAlgorithm, EvidenceDigest, ExactPayloadEvidence, MetadataRevision,
-    ResearchContext, ResearchObservation, SourceId, SourceIdentifier, Timestamp,
+    AvailabilityEvidence, DataQuality, DigestAlgorithm, EvidenceDigest, ExactPayloadEvidence,
+    MetadataRevision, ResearchContext, ResearchObservation, SourceId, SourceIdentifier, Timestamp,
 };
 use market_squawk_sources::{
     AvailabilityEvidence as SourceAvailabilityEvidence, DiscoveryRequestId, ExtractionBatch,
@@ -213,6 +213,10 @@ impl ResearchArrowBatch {
         let mut source_timestamps = Vec::with_capacity(observations.len());
         let mut received_at = Vec::with_capacity(observations.len());
         let mut available_at = Vec::with_capacity(observations.len());
+        let mut availability_reported_or_inferred_at = Vec::with_capacity(observations.len());
+        let mut availability_kinds = Vec::with_capacity(observations.len());
+        let mut availability_evidence = Vec::with_capacity(observations.len());
+        let mut availability_methods = Vec::with_capacity(observations.len());
         let mut ingested_at = Vec::with_capacity(observations.len());
         let mut effective_at = Vec::with_capacity(observations.len());
         let mut published_at = Vec::with_capacity(observations.len());
@@ -242,12 +246,18 @@ impl ResearchArrowBatch {
                     .map(|value| value.unix_nanos()),
             );
             received_at.push(provenance.received_at().unix_nanos());
+            let availability = provenance.availability();
             available_at.push(
-                provenance
-                    .availability()
-                    .reported_at()
+                availability
+                    .conservative_available_at()
                     .map(|value| value.unix_nanos()),
             );
+            availability_reported_or_inferred_at
+                .push(availability.reported_at().map(|value| value.unix_nanos()));
+            let (kind, evidence, method) = availability_projection(availability);
+            availability_kinds.push(kind);
+            availability_evidence.push(evidence);
+            availability_methods.push(method);
             ingested_at.push(provenance.ingested_at().unix_nanos());
             effective_at.push(time.effective_at().unix_nanos());
             published_at.push(time.published_at().map(|value| value.unix_nanos()));
@@ -283,6 +293,10 @@ impl ResearchArrowBatch {
             Arc::new(utc(source_timestamps)),
             Arc::new(TimestampNanosecondArray::from(received_at).with_timezone_utc()),
             Arc::new(utc(available_at)),
+            Arc::new(utc(availability_reported_or_inferred_at)),
+            Arc::new(StringArray::from(availability_kinds)),
+            Arc::new(StringArray::from(availability_evidence)),
+            Arc::new(StringArray::from(availability_methods)),
             Arc::new(TimestampNanosecondArray::from(ingested_at).with_timezone_utc()),
             Arc::new(TimestampNanosecondArray::from(effective_at).with_timezone_utc()),
             Arc::new(utc(published_at)),
@@ -471,8 +485,7 @@ fn validate_row_lineage(
                 && lineage.record_schema.as_str() == RESEARCH_RECORD_SCHEMA
                 && lineage.effective_at == time.effective_at()
                 && lineage.published_at == time.published_at()
-                && Some(lineage.availability.available_at())
-                    == provenance.availability().reported_at()
+                && availability_basis_matches(&lineage.availability, provenance.availability())
                 && lineage.superseded_at == time.superseded_at()
                 && payload_matches_exact_evidence(payload, &lineage.record_evidence)
         }
@@ -493,6 +506,57 @@ fn validate_row_lineage(
         Ok(())
     } else {
         Err(ArrowConversionError::ExtractionBindingMismatch)
+    }
+}
+
+fn availability_projection(
+    availability: &AvailabilityEvidence,
+) -> (&'static str, Option<String>, Option<String>) {
+    match availability {
+        AvailabilityEvidence::Evidenced { evidence, .. } => {
+            ("evidenced", Some(evidence.as_str().to_owned()), None)
+        }
+        AvailabilityEvidence::LocalFirstObserved { .. } => ("local_first_observed", None, None),
+        AvailabilityEvidence::Inferred { method, .. } => {
+            ("inferred", None, Some(method.as_str().to_owned()))
+        }
+        AvailabilityEvidence::Unknown => ("unknown", None, None),
+    }
+}
+
+fn availability_basis_matches(
+    source: &SourceAvailabilityEvidence,
+    canonical: &AvailabilityEvidence,
+) -> bool {
+    match (source, canonical) {
+        (
+            SourceAvailabilityEvidence::Observed {
+                available_at: source_time,
+                evidence: source_evidence,
+            },
+            AvailabilityEvidence::Evidenced {
+                available_at,
+                evidence,
+            },
+        ) => source_time == available_at && source_evidence == evidence,
+        (
+            SourceAvailabilityEvidence::LocalFirstObserved {
+                observed_at: source_time,
+            },
+            AvailabilityEvidence::LocalFirstObserved { observed_at },
+        ) => source_time == observed_at,
+        (
+            SourceAvailabilityEvidence::Inferred {
+                inferred_at: source_time,
+                method: source_method,
+            },
+            AvailabilityEvidence::Inferred {
+                inferred_at,
+                method,
+            },
+        ) => source_time == inferred_at && source_method == method,
+        (SourceAvailabilityEvidence::Unknown, AvailabilityEvidence::Unknown) => true,
+        _ => false,
     }
 }
 

@@ -325,6 +325,7 @@ fn extraction_enforces_lineage_point_in_time_and_request_limits() -> TestResult 
         Some(Timestamp::from_unix_nanos(2)),
         AvailabilityEvidence::Observed {
             available_at: Timestamp::from_unix_nanos(3),
+            evidence: source_identifier("release-record")?,
         },
         source_identifier("revision-1")?,
         Some(Timestamp::from_unix_nanos(10)),
@@ -341,6 +342,7 @@ fn extraction_enforces_lineage_point_in_time_and_request_limits() -> TestResult 
         Some(Timestamp::from_unix_nanos(2)),
         AvailabilityEvidence::Observed {
             available_at: Timestamp::from_unix_nanos(3),
+            evidence: source_identifier("release-record")?,
         },
         source_identifier("revision-1")?,
         Some(Timestamp::from_unix_nanos(10)),
@@ -355,6 +357,7 @@ fn extraction_enforces_lineage_point_in_time_and_request_limits() -> TestResult 
             Some(Timestamp::from_unix_nanos(2)),
             AvailabilityEvidence::Observed {
                 available_at: Timestamp::from_unix_nanos(3),
+                evidence: source_identifier("release-record")?,
             },
             source_identifier("revision-1")?,
             Some(Timestamp::from_unix_nanos(10)),
@@ -466,6 +469,7 @@ fn extraction_deep_cap_counts_maximum_version_pinned_locators() -> TestResult {
         Some(Timestamp::from_unix_nanos(2)),
         AvailabilityEvidence::Observed {
             available_at: Timestamp::from_unix_nanos(3),
+            evidence: source_identifier("release-record")?,
         },
         source_identifier(&maximum)?,
         None,
@@ -477,6 +481,41 @@ fn extraction_deep_cap_counts_maximum_version_pinned_locators() -> TestResult {
             requested: MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES
         })
     ));
+    Ok(())
+}
+
+#[test]
+fn extraction_availability_retains_conservative_basis_and_inference_method() -> TestResult {
+    let observed = AvailabilityEvidence::Observed {
+        available_at: Timestamp::from_unix_nanos(3),
+        evidence: source_identifier("release-record")?,
+    };
+    let local = AvailabilityEvidence::LocalFirstObserved {
+        observed_at: Timestamp::from_unix_nanos(4),
+    };
+    let inferred = AvailabilityEvidence::Inferred {
+        inferred_at: Timestamp::from_unix_nanos(5),
+        method: source_identifier("calendar-v2")?,
+    };
+    let unknown = AvailabilityEvidence::Unknown;
+
+    assert_eq!(
+        observed.conservative_available_at(),
+        Some(Timestamp::from_unix_nanos(3))
+    );
+    assert_eq!(
+        local.conservative_available_at(),
+        Some(Timestamp::from_unix_nanos(4))
+    );
+    assert_eq!(inferred.conservative_available_at(), None);
+    assert_eq!(inferred.reported_at(), Some(Timestamp::from_unix_nanos(5)));
+    assert_eq!(unknown.reported_at(), None);
+    for basis in [observed, local, inferred, unknown] {
+        assert_eq!(
+            serde_json::from_slice::<AvailabilityEvidence>(&serde_json::to_vec(&basis)?)?,
+            basis
+        );
+    }
     Ok(())
 }
 

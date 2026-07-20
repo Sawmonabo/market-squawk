@@ -1,5 +1,6 @@
 //! Rights-bound analytical ingestion, immutable generation commit, and compaction.
 
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use market_squawk_domain::{
@@ -15,7 +16,8 @@ use crate::{
     CatalogError, ContractCompletion, DatasetId, DatasetManifestRecord, DatasetManifestRef,
     GenerationKind, IngestReservation, IngestRunState, ManifestCatalogError, ManifestObject,
     ManifestPlan, ManifestPlanError, ObjectStoreConfig, OrphanRecoveryReport, ParquetObjectStore,
-    ParquetStoreError, PinnedDataset, PublishedObject, ResearchArrowBatch, Sha256Digest,
+    ParquetStoreError, PinnedDataset, PublishedObject, QueryArtifactPublisher,
+    QueryArtifactReservation, QueryArtifactReservationInput, ResearchArrowBatch, Sha256Digest,
     SourceOperation,
 };
 
@@ -101,7 +103,7 @@ pub trait ResearchIngestService {
 /// Local composition of Task 3 authority, immutable generations, and controlled Parquet objects.
 #[derive(Debug)]
 pub struct AnalyticalDataService {
-    authority: Mutex<CatalogAuthority>,
+    authority: Arc<Mutex<CatalogAuthority>>,
     manifests: AnalyticalManifestCatalog,
     objects: Arc<ParquetObjectStore>,
 }
@@ -115,7 +117,7 @@ impl AnalyticalDataService {
     ) -> Result<Self, IngestError> {
         authority.integrity_check()?;
         Ok(Self {
-            authority: Mutex::new(authority),
+            authority: Arc::new(Mutex::new(authority)),
             manifests,
             objects: Arc::new(objects),
         })
@@ -138,6 +140,19 @@ impl AnalyticalDataService {
     /// Returns the controlled object capability for manifest-pinned query construction.
     pub fn object_store(&self) -> Arc<ParquetObjectStore> {
         Arc::clone(&self.objects)
+    }
+
+    /// Persists query-result ownership and expiry before artifact publication begins.
+    pub fn reserve_query_artifact(
+        &self,
+        input: QueryArtifactReservationInput,
+    ) -> Result<QueryArtifactReservation, IngestError> {
+        Ok(self.lock_authority()?.reserve_query_artifact(input)?)
+    }
+
+    /// Issues a least-authority binder while ingestion retains the same catalog writer.
+    pub fn query_artifact_publisher(&self) -> Arc<QueryArtifactPublisher> {
+        Arc::new(QueryArtifactPublisher::new(Arc::clone(&self.authority)))
     }
 
     /// Resolves one exact immutable generation.
@@ -180,9 +195,10 @@ impl AnalyticalDataService {
             request.payload_digest(),
             batches,
         )?;
+        let publication = self.objects.begin_publication(&cancellation).await?;
         let published = self
             .objects
-            .publish(compacted.record_batch(), &cancellation)
+            .publish_under_lease(compacted.record_batch(), &cancellation, &publication)
             .await?;
         if cancellation.is_cancelled() {
             return Err(IngestError::Cancelled);
@@ -225,9 +241,22 @@ impl AnalyticalDataService {
     }
 
     /// Quarantines only content-addressed objects absent from every retained generation.
-    pub fn recover_orphans(&self, now: Timestamp) -> Result<OrphanRecoveryReport, IngestError> {
-        let referenced = self.manifests.referenced_hashes()?;
-        Ok(self.objects.collect_orphans(&referenced, now)?)
+    pub async fn recover_orphans(
+        &self,
+        now: Timestamp,
+    ) -> Result<OrphanRecoveryReport, IngestError> {
+        let mut recovery = self.objects.begin_recovery(now).await?;
+        let referenced: BTreeSet<_> = self.manifests.referenced_hashes(now)?.into_iter().collect();
+        for object in recovery.candidates().to_vec() {
+            if referenced.contains(&object.content_hash()) {
+                continue;
+            }
+            if self.manifests.is_referenced(object.content_hash(), now)? {
+                continue;
+            }
+            recovery.quarantine(&object)?;
+        }
+        Ok(recovery.finish()?)
     }
 
     async fn ingest_batch(
@@ -250,9 +279,10 @@ impl AnalyticalDataService {
         }
         let converted = ResearchArrowBatch::try_from_extraction_batch(&batch)?;
         let lineage = converted.lineage_digest()?;
+        let publication = self.objects.begin_publication(&cancellation).await?;
         let published = self
             .objects
-            .publish(converted.record_batch(), &cancellation)
+            .publish_under_lease(converted.record_batch(), &cancellation, &publication)
             .await?;
         if cancellation.is_cancelled() {
             return Err(IngestError::Cancelled);

@@ -729,6 +729,15 @@ pub enum CatalogError {
     /// The supplied reservation was not sealed by this open catalog session.
     #[error("catalog ingest reservation is not valid for this session")]
     InvalidReservationCapability,
+    /// Shared composition authority could not be locked.
+    #[error("catalog composition authority lock is unavailable")]
+    AuthorityLockPoisoned,
+    /// A query-artifact reservation expired before durable result binding.
+    #[error("query artifact reservation is expired")]
+    QueryArtifactExpired,
+    /// A query-artifact receipt differs from its durable reservation.
+    #[error("query artifact reservation does not match durable authority")]
+    QueryArtifactReservationMismatch,
     /// The local wall clock moved behind the last committed authority decision.
     #[error("catalog authority clock rollback was detected")]
     AuthorityClockRollback,

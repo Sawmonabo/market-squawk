@@ -6,8 +6,14 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use market_squawk_data::{
     DatasetId, DatasetManifestRef, QueryError, QueryLimits, QueryRequest, QueryResult,
-    ResearchQueryEngine, Sha256Digest,
+    ResearchArrowBatch, ResearchQueryEngine, Sha256Digest,
 };
+use market_squawk_domain::{
+    AvailabilityEvidence, DataQuality, DigestAlgorithm, EvidenceDigest, MacroObservation,
+    PayloadReference, ResearchContext, ResearchObservation, ResearchProvenance,
+    ResearchProvenanceInput, ResearchTime, RevisionNumber, SourceId, SourceIdentifier, Timestamp,
+};
+use rust_decimal::Decimal;
 use tokio_util::sync::CancellationToken;
 
 type TestResult = Result<(), Box<dyn Error>>;
@@ -82,6 +88,117 @@ async fn query_service_honors_cancellation_and_manifest_pinning() -> TestResult 
     assert!(matches!(result, Err(QueryError::Cancelled)));
     assert!(!matches!(result, Ok(QueryResult::Inline { .. })));
     Ok(())
+}
+
+#[tokio::test]
+async fn available_at_cutoff_excludes_inferred_and_unknown_rows() -> TestResult {
+    let manifest = manifest()?;
+    let observations = [
+        AvailabilityEvidence::evidenced(
+            Timestamp::from_unix_nanos(100),
+            SourceIdentifier::try_from("release-record")?,
+        ),
+        AvailabilityEvidence::local_first_observed(Timestamp::from_unix_nanos(101)),
+        AvailabilityEvidence::inferred(
+            Timestamp::from_unix_nanos(102),
+            SourceIdentifier::try_from("calendar-v1")?,
+        ),
+        AvailabilityEvidence::unknown(),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, availability)| observation(index, availability))
+    .collect::<Result<Vec<_>, _>>()?;
+    let batch = ResearchArrowBatch::try_from_observations(
+        SourceIdentifier::try_from("fred-gdp")?,
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [12; 32]),
+        observations,
+    )?;
+    let engine = ResearchQueryEngine::from_pinned_batches(
+        manifest.clone(),
+        "observations",
+        vec![batch.record_batch().clone()],
+    )?;
+    let result = engine
+        .query(
+            QueryRequest::try_new(
+                manifest,
+                "SELECT available_at FROM observations WHERE available_at IS NOT NULL",
+            )?,
+            QueryLimits::try_new(
+                4,
+                64 * 1024,
+                8 * 1024 * 1024,
+                1,
+                128,
+                128,
+                Duration::from_secs(1),
+            )?,
+            CancellationToken::new(),
+        )
+        .await?;
+    let QueryResult::Inline { batches, .. } = result else {
+        return Err("expected inline result".into());
+    };
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn one_memory_budget_charges_retained_input_output_and_ipc_work() -> TestResult {
+    let manifest = manifest()?;
+    let batch = RecordBatch::try_new(
+        Schema::new(vec![Field::new("value", DataType::Int64, false)]).into(),
+        vec![std::sync::Arc::new(Int64Array::from_iter_values(0..64)) as ArrayRef],
+    )?;
+    let engine =
+        ResearchQueryEngine::from_pinned_batches(manifest.clone(), "observations", vec![batch])?;
+    let result = engine
+        .query(
+            QueryRequest::try_new(manifest, "SELECT value FROM observations")?,
+            QueryLimits::try_new(64, 1800, 1800, 1, 128, 128, Duration::from_secs(1))?,
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(QueryError::MemoryLimitExceeded { limit: 1800 })
+    ));
+    Ok(())
+}
+
+fn observation(
+    index: usize,
+    availability: AvailabilityEvidence,
+) -> Result<ResearchObservation, Box<dyn Error>> {
+    let context = ResearchContext::new(
+        ResearchProvenance::try_new(ResearchProvenanceInput {
+            source_id: SourceId::try_from("fred-local-fixture")?,
+            instrument_id: None,
+            venue_id: None,
+            source_identifier: SourceIdentifier::try_from(format!("GDP:2026Q1:{index}"))?,
+            source_timestamp: None,
+            received_at: Timestamp::from_unix_nanos(110),
+            ingested_at: Timestamp::from_unix_nanos(120),
+            quality: DataQuality::OfficialDelayed,
+            payload_reference: PayloadReference::SourceReference(SourceIdentifier::try_from(
+                format!("fred:gdp:2026q1:{index}"),
+            )?),
+            availability,
+        })?,
+        ResearchTime::new(
+            Timestamp::from_unix_nanos(90),
+            Some(Timestamp::from_unix_nanos(100)),
+            RevisionNumber::new(1)?,
+            None,
+        )?,
+    )?;
+    Ok(ResearchObservation::Macro(MacroObservation::new(
+        context,
+        SourceIdentifier::try_from("GDP")?,
+        Decimal::new(i64::try_from(index)? + 1, 0),
+        SourceIdentifier::try_from("USD")?,
+    )))
 }
 
 fn manifest() -> Result<DatasetManifestRef, Box<dyn Error>> {
