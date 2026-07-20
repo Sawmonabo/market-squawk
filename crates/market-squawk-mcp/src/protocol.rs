@@ -272,13 +272,6 @@ where
                 Ok(Frame::Message(bytes)) => bytes,
                 Ok(Frame::EndOfInput) => {
                     self.input_state.store(INPUT_ENDED, Ordering::SeqCst);
-                    if self
-                        .output
-                        .terminalize_pending(AuditResultClass::OutputUnavailable, b"input ended")
-                        .is_err()
-                    {
-                        self.input_state.store(INPUT_AUDIT_FAILED, Ordering::SeqCst);
-                    }
                     return None;
                 }
                 Err(FramingError::Cancelled) => {

@@ -1,11 +1,12 @@
 //! Opaque artifact publication contract without filesystem authority.
 
-use std::{fmt, sync::Arc};
+use std::{fmt, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 
 const MAXIMUM_ARTIFACT_ID_BYTES: usize = 160;
 const MAXIMUM_MEDIA_TYPE_BYTES: usize = 128;
@@ -66,6 +67,59 @@ impl fmt::Debug for ArtifactPublication {
             .field("sha256_hex", &self.sha256_hex)
             .field("media_type", &self.media_type)
             .field("byte_count", &self.content.len())
+            .finish()
+    }
+}
+
+/// Request lifecycle authority for one artifact publication.
+#[derive(Clone)]
+pub struct ArtifactPublicationContext {
+    cancellation: CancellationToken,
+    deadline: Instant,
+}
+
+impl ArtifactPublicationContext {
+    pub(crate) const fn new(cancellation: CancellationToken, deadline: Instant) -> Self {
+        Self {
+            cancellation,
+            deadline,
+        }
+    }
+
+    /// Request cancellation propagated from the transport-neutral service call.
+    #[must_use]
+    pub const fn cancellation(&self) -> &CancellationToken {
+        &self.cancellation
+    }
+
+    /// Absolute monotonic request deadline.
+    #[must_use]
+    pub const fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
+    /// Rejects work after request cancellation or deadline expiry.
+    ///
+    /// # Errors
+    ///
+    /// Returns the exact terminal lifecycle class when publication authority has ended.
+    pub fn ensure_live(&self) -> Result<(), ArtifactError> {
+        if self.cancellation.is_cancelled() {
+            return Err(ArtifactError::Cancelled);
+        }
+        if Instant::now() >= self.deadline {
+            return Err(ArtifactError::DeadlineExceeded);
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for ArtifactPublicationContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ArtifactPublicationContext")
+            .field("cancellation", &"[CANCELLATION TOKEN]")
+            .field("deadline", &self.deadline)
             .finish()
     }
 }
@@ -138,7 +192,12 @@ pub trait ArtifactRepository: Send + Sync + 'static {
     /// Atomically publishes and registers a complete content-addressed artifact.
     ///
     /// The implementation must stage, fsync, atomically rename, and durably register the digest
-    /// before returning. The returned identifier is opaque and must contain no path.
+    /// before returning. The returned identifier is opaque and must contain no path. Implementations
+    /// must observe the supplied cancellation and deadline before irreversible work and at safe
+    /// publication boundaries. Once the context cancellation token is cancelled, the returned
+    /// future must be immediately safe to drop; the bounded session-shutdown timeout is only
+    /// best-effort operational grace and is not a prerequisite for Drop safety. Externally visible
+    /// state must still be either absent or a complete atomically published object.
     ///
     /// # Errors
     ///
@@ -146,6 +205,7 @@ pub trait ArtifactRepository: Send + Sync + 'static {
     async fn publish(
         &self,
         publication: ArtifactPublication,
+        context: ArtifactPublicationContext,
     ) -> Result<ArtifactReference, ArtifactError>;
 }
 
@@ -161,4 +221,10 @@ pub enum ArtifactError {
     /// Durable capability-confined repository is unavailable.
     #[error("artifact repository is unavailable")]
     Unavailable,
+    /// Request cancellation ended publication authority.
+    #[error("artifact publication was cancelled")]
+    Cancelled,
+    /// Request deadline ended publication authority.
+    #[error("artifact publication deadline exceeded")]
+    DeadlineExceeded,
 }

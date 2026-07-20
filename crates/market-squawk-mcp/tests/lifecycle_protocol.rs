@@ -12,9 +12,10 @@ use std::{
 
 use async_trait::async_trait;
 use market_squawk_mcp::{
-    ArtifactError, ArtifactPublication, ArtifactReference, ArtifactRepository, AuditCompletion,
-    AuditCompletionReservation, AuditError, AuditEvent, AuditPhase, AuditSink,
-    LocalProcessIdentityClass, McpLimitSpec, McpLimits, McpServer, ServerError, ServerExit,
+    ArtifactError, ArtifactPublication, ArtifactPublicationContext, ArtifactReference,
+    ArtifactRepository, AuditCompletion, AuditCompletionReservation, AuditError, AuditEvent,
+    AuditPhase, AuditSink, LocalProcessIdentityClass, McpLimitSpec, McpLimits, McpServer,
+    ServerError, ServerExit,
 };
 use market_squawk_services::{
     ProgressError, RequestContext, ServiceCapabilities, ServiceError, ToolDescriptor, ToolEffects,
@@ -34,6 +35,7 @@ use tokio_util::sync::CancellationToken;
 #[derive(Debug, Default)]
 struct CollectingAudit {
     events: Arc<Mutex<Vec<AuditEvent>>>,
+    changed: Arc<Notify>,
 }
 
 impl CollectingAudit {
@@ -50,6 +52,28 @@ impl CollectingAudit {
             .map(|events| events.clone())
             .map_err(|_| AuditError::Unavailable)
     }
+
+    async fn wait_for_result_count(
+        &self,
+        result_class: market_squawk_mcp::AuditResultClass,
+        count: usize,
+    ) -> Result<(), AuditError> {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self
+                .events()?
+                .iter()
+                .filter(|event| event.result_class() == Some(result_class))
+                .count()
+                >= count
+            {
+                return Ok(());
+            }
+            changed.as_mut().await;
+        }
+    }
 }
 
 impl AuditSink for CollectingAudit {
@@ -58,6 +82,7 @@ impl AuditSink for CollectingAudit {
             .lock()
             .map_err(|_| AuditError::Unavailable)?
             .push(event);
+        self.changed.notify_waiters();
         Ok(())
     }
 
@@ -66,11 +91,13 @@ impl AuditSink for CollectingAudit {
         completion: AuditCompletion,
     ) -> Result<AuditCompletionReservation, AuditError> {
         let events = Arc::clone(&self.events);
+        let changed = Arc::clone(&self.changed);
         Ok(AuditCompletionReservation::new(completion, move |event| {
             events
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(event);
+            changed.notify_waiters();
         }))
     }
 }
@@ -83,6 +110,7 @@ impl ArtifactRepository for RejectingArtifacts {
     async fn publish(
         &self,
         _publication: ArtifactPublication,
+        _context: ArtifactPublicationContext,
     ) -> Result<ArtifactReference, ArtifactError> {
         Err(ArtifactError::Unavailable)
     }
@@ -546,7 +574,10 @@ async fn duplicate_active_ids_are_rejected_and_cancellation_reaches_the_service(
     let mut harness = Harness::start(
         Arc::clone(&service),
         Arc::clone(&audit),
-        McpLimits::try_from(McpLimitSpec::default())?,
+        McpLimits::try_from(McpLimitSpec {
+            maximum_active_requests: 1,
+            ..McpLimitSpec::default()
+        })?,
     )
     .await?;
     let initialized = harness.initialize(json!("init")).await?;
@@ -604,20 +635,43 @@ async fn duplicate_active_ids_are_rejected_and_cancellation_reaches_the_service(
             "params": { "requestId": "active-id", "reason": "test shutdown" }
         }))
         .await?;
-    harness.send(call).await?;
-
-    harness
-        .send(json!({"jsonrpc":"2.0","id":"after-cancel","method":"ping"}))
-        .await?;
 
     let duplicate = harness.receive().await?;
     assert_eq!(duplicate["error"]["code"], -32009);
-    let duplicate_after_cancel = harness.receive().await?;
-    assert_eq!(duplicate_after_cancel["error"]["code"], -32009);
-    let ping = harness.receive().await?;
-    assert_eq!(ping["id"], "after-cancel");
-    assert_eq!(ping["result"], json!({}));
     assert_eq!(service.calls.load(Ordering::SeqCst), 1);
+
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        audit.wait_for_result_count(market_squawk_mcp::AuditResultClass::Cancelled, 1),
+    )
+    .await??;
+    harness
+        .send(json!({"jsonrpc":"2.0","id":"after-release","method":"ping"}))
+        .await?;
+    assert_eq!(harness.receive().await?["result"], json!({}));
+    for cycle in 0..3 {
+        let started = service.started.notified();
+        let id = format!("cancel-cycle-{cycle}");
+        harness
+            .send(json!({
+                "jsonrpc":"2.0","id":id.clone(),"method":"tools/call",
+                "params":{"name":"test.wait","arguments":{}}
+            }))
+            .await?;
+        tokio::time::timeout(Duration::from_secs(1), started).await?;
+        harness
+            .send(json!({
+                "jsonrpc":"2.0","method":"notifications/cancelled",
+                "params":{"requestId":id,"reason":"capacity reuse"}
+            }))
+            .await?;
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            audit.wait_for_result_count(market_squawk_mcp::AuditResultClass::Cancelled, cycle + 2),
+        )
+        .await??;
+    }
+    assert_eq!(service.calls.load(Ordering::SeqCst), 4);
     assert_eq!(harness.close().await?, ServerExit::EndOfInput);
 
     let events = audit.events()?;

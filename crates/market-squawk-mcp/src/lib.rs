@@ -13,7 +13,10 @@ mod limits;
 mod protocol;
 mod server;
 
-pub use artifact::{ArtifactError, ArtifactPublication, ArtifactReference, ArtifactRepository};
+pub use artifact::{
+    ArtifactError, ArtifactPublication, ArtifactPublicationContext, ArtifactReference,
+    ArtifactRepository,
+};
 pub use audit::{
     AuditCompletion, AuditCompletionReservation, AuditError, AuditEvent, AuditOperation,
     AuditPhase, AuditResultClass, AuditSink, LocalProcessIdentityClass,

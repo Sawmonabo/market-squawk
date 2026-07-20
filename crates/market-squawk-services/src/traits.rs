@@ -494,6 +494,13 @@ pub trait ToolServices: Send + Sync + 'static {
 
     /// Executes one schema-admitted operation under the supplied cancellation, deadline, and
     /// result limits.
+    ///
+    /// Implementations must observe [`RequestContext::cancellation`] and
+    /// [`RequestContext::deadline`] before authoritative mutation and at safe interruption
+    /// boundaries. Once the request cancellation token is cancelled, the returned future must be
+    /// immediately safe to drop; the bounded session-shutdown timeout is only best-effort
+    /// operational grace and is not a prerequisite for Drop safety. Externally visible mutation
+    /// must remain committed or rolled back according to the operation's atomicity contract.
     async fn call(
         &self,
         request: TypedToolRequest,

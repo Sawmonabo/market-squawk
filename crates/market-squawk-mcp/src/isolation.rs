@@ -17,14 +17,14 @@ use rmcp::{
     transport::Transport,
 };
 use tokio::{
-    sync::{mpsc, oneshot},
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
     task::{JoinHandle, JoinSet},
 };
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    ArtifactError, ArtifactPublication, ArtifactReference, ArtifactRepository, AuditResultClass,
-    McpLimits,
+    ArtifactError, ArtifactPublication, ArtifactPublicationContext, ArtifactReference,
+    ArtifactRepository, AuditResultClass, McpLimits,
     framing::OutputChannel,
     protocol::{SdkInboundRequest, TransportError, WriterSupervisor},
     server::{ServerError, ServiceHandler},
@@ -153,12 +153,14 @@ pub(crate) struct ServiceCall {
     request: TypedToolRequest,
     context: RequestContext,
     response: oneshot::Sender<Result<TypedToolResult, ServiceError>>,
+    ownership: OwnedSemaphorePermit,
 }
 
 #[derive(Clone)]
 pub(crate) struct SdkToolServices {
     pub(crate) capabilities: ServiceCapabilities,
     pub(crate) calls: mpsc::Sender<ServiceCall>,
+    pub(crate) ownership: Arc<Semaphore>,
 }
 
 impl std::fmt::Debug for SdkToolServices {
@@ -167,6 +169,7 @@ impl std::fmt::Debug for SdkToolServices {
             .debug_struct("SdkToolServices")
             .field("capabilities", &self.capabilities)
             .field("calls", &"[BOUNDED SERVICE CHANNEL]")
+            .field("ownership", &"[BOUNDED HOST WORK OWNERSHIP]")
             .finish()
     }
 }
@@ -184,6 +187,16 @@ impl ToolServices for SdkToolServices {
     ) -> Result<TypedToolResult, ServiceError> {
         let cancellation = context.cancellation().clone();
         let deadline = tokio::time::Instant::from_std(context.deadline());
+        let ownership = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return Err(ServiceError::Cancelled),
+            () = tokio::time::sleep_until(deadline) => {
+                return Err(ServiceError::DeadlineExceeded);
+            }
+            permit = Arc::clone(&self.ownership).acquire_owned() => {
+                permit.map_err(|_| ServiceError::Unavailable)?
+            }
+        };
         let sender = self.calls.clone();
         let permit = tokio::select! {
             biased;
@@ -200,6 +213,7 @@ impl ToolServices for SdkToolServices {
             request,
             context,
             response,
+            ownership,
         });
         tokio::select! {
             biased;
@@ -229,25 +243,34 @@ pub(crate) async fn run_service_calls<S: ToolServices>(
                 };
                 let services = Arc::clone(&services);
                 active.spawn(async move {
-                    let result = services.call(call.request, call.context).await;
-                    let _ = call.response.send(result);
+                    let ServiceCall {
+                        request,
+                        context,
+                        response,
+                        ownership,
+                    } = call;
+                    let result = services.call(request, context).await;
+                    drop(ownership);
+                    let _ = response.send(result);
                 });
             }
         }
     }
-    active.abort_all();
+    drop(receiver);
     while active.join_next().await.is_some() {}
 }
 
 pub(crate) struct ArtifactCall {
     publication: ArtifactPublication,
+    context: ArtifactPublicationContext,
     response: oneshot::Sender<Result<ArtifactReference, ArtifactError>>,
+    ownership: OwnedSemaphorePermit,
 }
 
 #[derive(Clone)]
 pub(crate) struct SdkArtifactRepository {
     pub(crate) publications: mpsc::Sender<ArtifactCall>,
-    pub(crate) timeout: Duration,
+    pub(crate) ownership: Arc<Semaphore>,
 }
 
 impl std::fmt::Debug for SdkArtifactRepository {
@@ -255,7 +278,7 @@ impl std::fmt::Debug for SdkArtifactRepository {
         formatter
             .debug_struct("SdkArtifactRepository")
             .field("publications", &"[BOUNDED ARTIFACT CHANNEL]")
-            .field("timeout", &self.timeout)
+            .field("ownership", &"[BOUNDED HOST WORK OWNERSHIP]")
             .finish()
     }
 }
@@ -265,23 +288,45 @@ impl ArtifactRepository for SdkArtifactRepository {
     async fn publish(
         &self,
         publication: ArtifactPublication,
+        context: ArtifactPublicationContext,
     ) -> Result<ArtifactReference, ArtifactError> {
-        let deadline = tokio::time::Instant::now()
-            .checked_add(self.timeout)
-            .ok_or(ArtifactError::Unavailable)?;
-        let permit = tokio::time::timeout_at(deadline, self.publications.clone().reserve_owned())
-            .await
-            .map_err(|_| ArtifactError::Unavailable)?
-            .map_err(|_| ArtifactError::Unavailable)?;
+        context.ensure_live()?;
+        let deadline = tokio::time::Instant::from_std(context.deadline());
+        let cancellation = context.cancellation().clone();
+        let ownership = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return Err(ArtifactError::Cancelled),
+            () = tokio::time::sleep_until(deadline) => {
+                return Err(ArtifactError::DeadlineExceeded);
+            }
+            permit = Arc::clone(&self.ownership).acquire_owned() => {
+                permit.map_err(|_| ArtifactError::Unavailable)?
+            }
+        };
+        let sender = self.publications.clone();
+        let permit = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return Err(ArtifactError::Cancelled),
+            () = tokio::time::sleep_until(deadline) => {
+                return Err(ArtifactError::DeadlineExceeded);
+            }
+            permit = sender.reserve_owned() => {
+                permit.map_err(|_| ArtifactError::Unavailable)?
+            }
+        };
         let (response, result) = oneshot::channel();
         permit.send(ArtifactCall {
             publication,
+            context,
             response,
+            ownership,
         });
-        tokio::time::timeout_at(deadline, result)
-            .await
-            .map_err(|_| ArtifactError::Unavailable)?
-            .map_err(|_| ArtifactError::Unavailable)?
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => Err(ArtifactError::Cancelled),
+            () = tokio::time::sleep_until(deadline) => Err(ArtifactError::DeadlineExceeded),
+            outcome = result => outcome.map_err(|_| ArtifactError::Unavailable)?,
+        }
     }
 }
 
@@ -304,13 +349,20 @@ pub(crate) async fn run_artifact_calls(
                 };
                 let artifacts = Arc::clone(&artifacts);
                 active.spawn(async move {
-                    let result = artifacts.publish(call.publication).await;
-                    let _ = call.response.send(result);
+                    let ArtifactCall {
+                        publication,
+                        context,
+                        response,
+                        ownership,
+                    } = call;
+                    let result = artifacts.publish(publication, context).await;
+                    drop(ownership);
+                    let _ = response.send(result);
                 });
             }
         }
     }
-    active.abort_all();
+    drop(receiver);
     while active.join_next().await.is_some() {}
 }
 
@@ -575,6 +627,8 @@ impl SessionSupervisor {
 
 impl Drop for SessionSupervisor {
     fn drop(&mut self) {
+        // Cancellation is the public service/artifact Drop-safety boundary. Keep it before every
+        // abort so only contract-covered futures are reaped.
         self.cancellation.cancel();
         if let Some(task) = self.sdk_task.take() {
             task.abort();

@@ -12,9 +12,9 @@ use std::{
 
 use async_trait::async_trait;
 use market_squawk_mcp::{
-    ArtifactError, ArtifactPublication, ArtifactReference, ArtifactRepository, AuditCompletion,
-    AuditCompletionReservation, AuditError, AuditEvent, AuditResultClass, AuditSink, McpLimitError,
-    McpLimitSpec, McpLimits, McpServer, ServerExit,
+    ArtifactError, ArtifactPublication, ArtifactPublicationContext, ArtifactReference,
+    ArtifactRepository, AuditCompletion, AuditCompletionReservation, AuditError, AuditEvent,
+    AuditResultClass, AuditSink, McpLimitError, McpLimitSpec, McpLimits, McpServer, ServerExit,
 };
 use market_squawk_services::{
     JsonStructureLimits, RequestContext, ServiceCapabilities, ServiceError, ServiceLimits,
@@ -22,6 +22,7 @@ use market_squawk_services::{
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
+use tokio::sync::{Notify, Semaphore, oneshot};
 use tokio_util::sync::CancellationToken;
 
 const TRACE_SENTINEL: &str = "trace-sentinel-private-value";
@@ -128,6 +129,7 @@ impl ArtifactRepository for RecordingArtifacts {
     async fn publish(
         &self,
         publication: ArtifactPublication,
+        _context: ArtifactPublicationContext,
     ) -> Result<ArtifactReference, ArtifactError> {
         let reference = ArtifactReference::try_new(
             format!("artifact_{}", publication.sha256_hex()),
@@ -314,9 +316,9 @@ impl AsyncRead for SegmentedReader {
     }
 }
 
-async fn ready_server(
-    service: Arc<BoundaryService>,
-    artifacts: Arc<RecordingArtifacts>,
+async fn ready_server<S, A>(
+    service: Arc<S>,
+    artifacts: Arc<A>,
     limits: McpLimits,
 ) -> Result<
     (
@@ -325,7 +327,11 @@ async fn ready_server(
         tokio::task::JoinHandle<Result<ServerExit, market_squawk_mcp::ServerError>>,
     ),
     Box<dyn Error>,
-> {
+>
+where
+    S: ToolServices,
+    A: ArtifactRepository,
+{
     let server = McpServer::try_new(
         service,
         limits,
@@ -362,6 +368,145 @@ async fn ready_server(
     )
     .await?;
     Ok((client_reader, client_writer, task))
+}
+
+#[derive(Debug)]
+struct HeldWork {
+    entered: AtomicUsize,
+    completed: AtomicUsize,
+    release: Semaphore,
+    changed: Notify,
+}
+
+impl HeldWork {
+    fn new() -> Self {
+        Self {
+            entered: AtomicUsize::new(0),
+            completed: AtomicUsize::new(0),
+            release: Semaphore::new(0),
+            changed: Notify::new(),
+        }
+    }
+
+    async fn hold(&self) {
+        self.entered.fetch_add(1, Ordering::SeqCst);
+        self.changed.notify_waiters();
+        if let Ok(permit) = self.release.acquire().await {
+            permit.forget();
+            self.completed.fetch_add(1, Ordering::SeqCst);
+            self.changed.notify_waiters();
+        }
+    }
+
+    async fn wait_for(&self, counter: &AtomicUsize, expected: usize) {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if counter.load(Ordering::SeqCst) >= expected {
+                return;
+            }
+            changed.as_mut().await;
+        }
+    }
+}
+
+#[derive(Debug)]
+struct NonCooperativeService {
+    work: Arc<HeldWork>,
+    drop_observer: Mutex<Option<oneshot::Sender<bool>>>,
+}
+
+#[derive(Debug)]
+struct CancellationDropProbe {
+    cancellation: CancellationToken,
+    observer: Option<oneshot::Sender<bool>>,
+}
+
+impl Drop for CancellationDropProbe {
+    fn drop(&mut self) {
+        if let Some(observer) = self.observer.take() {
+            let _ = observer.send(self.cancellation.is_cancelled());
+        }
+    }
+}
+
+#[async_trait]
+impl ToolServices for NonCooperativeService {
+    fn capabilities(&self) -> ServiceCapabilities {
+        let descriptor = ToolDescriptor::try_new(
+            "test.owned-work",
+            "1",
+            "Exercise bounded host work ownership.",
+            json!({
+                "type":"object",
+                "properties":{"artifact":{"type":"boolean"}},
+                "required":["artifact"],
+                "additionalProperties":false
+            }),
+            ToolEffects::read_only_closed_world(),
+            |arguments: &serde_json::Map<String, Value>| {
+                arguments
+                    .get("artifact")
+                    .and_then(Value::as_bool)
+                    .map(|_| ())
+                    .ok_or(ToolInputError::Invalid)
+            },
+        );
+        ServiceCapabilities::try_new(descriptor.into_iter().collect())
+            .unwrap_or_else(|_| ServiceCapabilities::empty())
+    }
+
+    async fn call(
+        &self,
+        request: TypedToolRequest,
+        context: RequestContext,
+    ) -> Result<TypedToolResult, ServiceError> {
+        let artifact = request
+            .arguments()
+            .get("artifact")
+            .and_then(Value::as_bool)
+            .ok_or(ServiceError::InvalidRequest)?;
+        if artifact {
+            TypedToolResult::try_new(json!({"payload":"x".repeat(512)}), 1, context.limits())
+                .map_err(Into::into)
+        } else {
+            let observer = self
+                .drop_observer
+                .lock()
+                .map_err(|_| ServiceError::Unavailable)?
+                .take();
+            let _drop_probe = CancellationDropProbe {
+                cancellation: context.cancellation().clone(),
+                observer,
+            };
+            self.work.hold().await;
+            TypedToolResult::try_new(json!({"released":true}), 1, context.limits())
+                .map_err(Into::into)
+        }
+    }
+}
+
+#[derive(Debug)]
+struct NonCooperativeArtifacts {
+    work: Arc<HeldWork>,
+}
+
+#[async_trait]
+impl ArtifactRepository for NonCooperativeArtifacts {
+    async fn publish(
+        &self,
+        publication: ArtifactPublication,
+        _context: ArtifactPublicationContext,
+    ) -> Result<ArtifactReference, ArtifactError> {
+        self.work.hold().await;
+        ArtifactReference::try_new(
+            format!("artifact_{}", publication.sha256_hex()),
+            publication.sha256_hex(),
+            publication.byte_count(),
+            publication.media_type(),
+        )
+    }
 }
 
 #[tokio::test]
@@ -623,6 +768,129 @@ async fn deadline_and_large_output_fail_closed_or_return_an_opaque_artifact()
 
     writer.shutdown().await?;
     assert_eq!(task.await??, ServerExit::EndOfInput);
+    Ok(())
+}
+
+#[tokio::test]
+async fn timed_out_host_work_stays_within_session_ownership_and_drains_on_shutdown()
+-> Result<(), Box<dyn Error>> {
+    let service_work = Arc::new(HeldWork::new());
+    let artifact_work = Arc::new(HeldWork::new());
+    let service = Arc::new(NonCooperativeService {
+        work: Arc::clone(&service_work),
+        drop_observer: Mutex::new(None),
+    });
+    let artifacts = Arc::new(NonCooperativeArtifacts {
+        work: Arc::clone(&artifact_work),
+    });
+    let limits = McpLimits::try_from(McpLimitSpec {
+        maximum_active_requests: 2,
+        maximum_inline_bytes: 64,
+        maximum_result_bytes: 4 * 1024,
+        request_timeout: Duration::from_millis(100),
+        shutdown_timeout: Duration::from_millis(500),
+        ..McpLimitSpec::default()
+    })?;
+    let (mut reader, mut writer, mut task) = ready_server(service, artifacts, limits).await?;
+
+    for index in 0..3 {
+        send(
+            &mut writer,
+            json!({
+                "jsonrpc":"2.0","id":format!("service-{index}"),"method":"tools/call",
+                "params":{"name":"test.owned-work","arguments":{"artifact":false}}
+            }),
+        )
+        .await?;
+        if index < 2 {
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                service_work.wait_for(&service_work.entered, index + 1),
+            )
+            .await?;
+        }
+        assert_eq!(receive(&mut reader).await?["error"]["code"], -32008);
+    }
+    assert_eq!(service_work.entered.load(Ordering::SeqCst), 2);
+    service_work.release.add_permits(2);
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        service_work.wait_for(&service_work.completed, 2),
+    )
+    .await?;
+
+    for index in 0..3 {
+        send(
+            &mut writer,
+            json!({
+                "jsonrpc":"2.0","id":format!("artifact-{index}"),"method":"tools/call",
+                "params":{"name":"test.owned-work","arguments":{"artifact":true}}
+            }),
+        )
+        .await?;
+        if index < 2 {
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                artifact_work.wait_for(&artifact_work.entered, index + 1),
+            )
+            .await?;
+        }
+        assert_eq!(receive(&mut reader).await?["error"]["code"], -32008);
+    }
+    assert_eq!(artifact_work.entered.load(Ordering::SeqCst), 2);
+
+    writer.shutdown().await?;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut task)
+            .await
+            .is_err(),
+        "session abandoned lifecycle-owned artifact work"
+    );
+    artifact_work.release.add_permits(2);
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        artifact_work.wait_for(&artifact_work.completed, 2),
+    )
+    .await?;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), task).await???,
+        ServerExit::EndOfInput
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn supervisor_drop_cancels_before_dropping_held_service_work() -> Result<(), Box<dyn Error>> {
+    let service_work = Arc::new(HeldWork::new());
+    let (drop_observer, observed) = oneshot::channel();
+    let service = Arc::new(NonCooperativeService {
+        work: Arc::clone(&service_work),
+        drop_observer: Mutex::new(Some(drop_observer)),
+    });
+    let (_reader, mut writer, task) = ready_server(
+        service,
+        Arc::new(RecordingArtifacts::default()),
+        McpLimits::try_from(McpLimitSpec::default())?,
+    )
+    .await?;
+
+    send(
+        &mut writer,
+        json!({
+            "jsonrpc":"2.0","id":"drop-order","method":"tools/call",
+            "params":{"name":"test.owned-work","arguments":{"artifact":false}}
+        }),
+    )
+    .await?;
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        service_work.wait_for(&service_work.entered, 1),
+    )
+    .await?;
+
+    task.abort();
+    assert!(task.await.is_err());
+    assert!(tokio::time::timeout(Duration::from_secs(1), observed).await??);
     Ok(())
 }
 

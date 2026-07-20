@@ -315,6 +315,18 @@ impl OutputChannel {
         Ok(())
     }
 
+    pub(crate) fn complete_cancelled(&self, request_id: &RequestId) -> Result<(), TransportError> {
+        let Some(audit) =
+            self.claim_pending_when(request_id, |pending| pending.cancellation_requested)?
+        else {
+            return Ok(());
+        };
+        let completion =
+            self.reserve_completion(&audit, AuditResultClass::Cancelled, b"request cancelled")?;
+        completion.commit(AuditResultClass::Cancelled);
+        Ok(())
+    }
+
     pub(crate) async fn send_message(
         &self,
         message: TxJsonRpcMessage<RoleServer>,
@@ -327,10 +339,16 @@ impl OutputChannel {
         }
         encoded.push(b'\n');
 
-        let completion = if let Some((request_id, result_class)) = response {
-            self.reserve_pending_completion(&request_id, result_class, &encoded)?
-        } else {
-            None
+        let completion = match response {
+            Some((request_id, result_class)) => {
+                let Some(completion) =
+                    self.reserve_pending_completion(&request_id, result_class, &encoded)?
+                else {
+                    return Ok(());
+                };
+                Some(completion)
+            }
+            None => None,
         };
         self.enqueue(encoded, completion).await
     }
@@ -444,13 +462,28 @@ impl OutputChannel {
         intended_result_class: AuditResultClass,
         encoded: &[u8],
     ) -> Result<Option<ReservedCompletion>, TransportError> {
-        let mut pending = self.pending.lock().map_err(|_| TransportError::State)?;
-        let Some(audit) = pending.get(request_id) else {
+        let Some(audit) =
+            self.claim_pending_when(request_id, |pending| !pending.cancellation_requested)?
+        else {
             return Ok(None);
         };
-        let completion = self.reserve_completion(audit, intended_result_class, encoded)?;
-        pending.remove(request_id);
+        let completion = self.reserve_completion(&audit, intended_result_class, encoded)?;
         Ok(Some(completion))
+    }
+
+    fn claim_pending_when(
+        &self,
+        request_id: &RequestId,
+        can_claim: impl FnOnce(&PendingAudit) -> bool,
+    ) -> Result<Option<PendingAudit>, TransportError> {
+        let mut pending = self.pending.lock().map_err(|_| TransportError::State)?;
+        if pending
+            .get(request_id)
+            .is_none_or(|entry| !can_claim(entry))
+        {
+            return Ok(None);
+        }
+        Ok(pending.remove(request_id))
     }
 
     pub(crate) fn close_sender(&self) -> Result<(), TransportError> {
@@ -467,15 +500,15 @@ impl OutputChannel {
         terminal_marker: &[u8],
     ) -> Result<(), TransportError> {
         loop {
-            let mut pending = self.pending.lock().map_err(|_| TransportError::State)?;
-            let Some(request_id) = pending.keys().next().cloned() else {
-                return Ok(());
+            let audit = {
+                let mut pending = self.pending.lock().map_err(|_| TransportError::State)?;
+                let Some(request_id) = pending.keys().next().cloned() else {
+                    return Ok(());
+                };
+                pending.remove(&request_id).ok_or(TransportError::State)?
             };
-            let audit = pending.get(&request_id).ok_or(TransportError::State)?;
             let terminal_class = audit.shutdown_result_class(result_class);
-            let completion = self.reserve_completion(audit, terminal_class, terminal_marker)?;
-            pending.remove(&request_id);
-            drop(pending);
+            let completion = self.reserve_completion(&audit, terminal_class, terminal_marker)?;
             completion.commit(terminal_class);
         }
     }
@@ -704,6 +737,66 @@ mod tests {
                     .push(event);
             }))
         }
+    }
+
+    #[test]
+    fn marked_cancellation_pins_its_generation_until_the_callback_claims_it()
+    -> Result<(), Box<dyn Error>> {
+        let limits = McpLimits::try_from(McpLimitSpec::default())?;
+        let audit = Arc::new(TrackingAudit::default());
+        let (sender, _receiver) = mpsc::channel(1);
+        let output = OutputChannel::new(
+            sender,
+            Arc::new(AtomicU8::new(OUTPUT_RUNNING)),
+            limits,
+            audit.clone(),
+            LocalProcessIdentityClass::CallerSuppliedIoUnverified,
+        );
+        let request_id = RequestId::String(Arc::from("reused-id"));
+        let pending = || {
+            ServiceRequestId::try_string(Arc::from("reused-id"))
+                .map(|id| PendingAudit::new(id, AuditOperation::Ping))
+        };
+
+        assert!(matches!(
+            output.admit_active(request_id.clone(), pending()?, 1)?,
+            ActiveAdmission::Accepted
+        ));
+        output.mark_pending_cancelled(&request_id)?;
+        assert!(
+            output
+                .reserve_pending_completion(
+                    &request_id,
+                    AuditResultClass::Succeeded,
+                    b"late response",
+                )?
+                .is_none()
+        );
+        assert!(matches!(
+            output.admit_active(request_id.clone(), pending()?, 1)?,
+            ActiveAdmission::Duplicate(_)
+        ));
+
+        output.complete_cancelled(&request_id)?;
+        assert!(matches!(
+            output.admit_active(request_id.clone(), pending()?, 1)?,
+            ActiveAdmission::Accepted
+        ));
+        output.complete_cancelled(&request_id)?;
+        let replacement = output
+            .reserve_pending_completion(
+                &request_id,
+                AuditResultClass::Succeeded,
+                b"replacement response",
+            )?
+            .ok_or("delayed cancellation callback claimed the replacement generation")?;
+        replacement.commit(AuditResultClass::Succeeded);
+
+        let events = audit.events()?;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].result_class(), Some(AuditResultClass::Cancelled));
+        assert_eq!(events[1].result_class(), Some(AuditResultClass::Succeeded));
+        Ok(())
     }
 
     #[tokio::test]

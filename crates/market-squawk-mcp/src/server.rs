@@ -17,10 +17,11 @@ use market_squawk_services::{
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
     model::{
-        CallToolRequestParams, CallToolResult, ErrorCode, Implementation, InitializeRequestParams,
-        InitializeResult, ListToolsResult, NumberOrString, PaginatedRequestParams, ProgressToken,
-        ProtocolVersion, RequestId, ServerCapabilities, ServerInfo, ServerJsonRpcMessage,
-        ServerResult, TaskSupport, Tool, ToolAnnotations, ToolExecution,
+        CallToolRequestParams, CallToolResult, CancelledNotificationParam, ErrorCode,
+        Implementation, InitializeRequestParams, InitializeResult, ListToolsResult, NumberOrString,
+        PaginatedRequestParams, ProgressToken, ProtocolVersion, RequestId, ServerCapabilities,
+        ServerInfo, ServerJsonRpcMessage, ServerResult, TaskSupport, Tool, ToolAnnotations,
+        ToolExecution,
     },
     service::{NotificationContext, QuitReason, RequestContext as McpRequestContext},
 };
@@ -28,13 +29,14 @@ use serde_json::json;
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    sync::mpsc,
+    sync::{Semaphore, mpsc},
 };
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    ArtifactError, ArtifactPublication, ArtifactRepository, AuditResultClass, AuditSink,
-    LocalProcessIdentityClass, McpLimits,
+    ArtifactError, ArtifactPublication, ArtifactPublicationContext, ArtifactRepository,
+    AuditResultClass, AuditSink, LocalProcessIdentityClass, McpLimits,
+    framing::OutputChannel,
     isolation::{
         IsolatedSdkOutcome, McpProgressSink, ProgressDelivery, SdkArtifactRepository,
         SdkToolServices, SessionSupervisor, run_artifact_calls, run_isolated_sdk, run_sdk_output,
@@ -171,22 +173,7 @@ impl<S: ToolServices> McpServer<S> {
             mpsc::channel(self.limits.maximum_active_requests());
         let (progress_sender, progress_receiver) =
             mpsc::channel(self.limits.maximum_active_requests());
-        let handler = ServiceHandler {
-            services: Arc::new(SdkToolServices {
-                capabilities: self.capabilities.clone(),
-                calls: service_calls,
-            }),
-            capabilities: self.capabilities.clone(),
-            tools: Arc::clone(&self.tools),
-            limits: self.limits,
-            artifacts: Arc::new(SdkArtifactRepository {
-                publications: artifact_publications,
-                timeout: self.limits.request_timeout(),
-            }),
-            progress_sender,
-            initialization_state: Arc::clone(&initialization_state),
-            identity_class,
-        };
+        let host_work_ownership = Arc::new(Semaphore::new(self.limits.maximum_active_requests()));
         let (input, monitor, writer) = BoundedInputDriver::new(
             reader,
             writer,
@@ -195,11 +182,29 @@ impl<S: ToolServices> McpServer<S> {
                 cancellation: session_cancellation.clone(),
                 audit: self.audit,
                 identity_class,
-                capabilities: self.capabilities,
-                initialization_state,
+                capabilities: self.capabilities.clone(),
+                initialization_state: Arc::clone(&initialization_state),
             },
         )?;
         let output = input.output_channel();
+        let handler = ServiceHandler {
+            services: Arc::new(SdkToolServices {
+                capabilities: self.capabilities.clone(),
+                calls: service_calls,
+                ownership: Arc::clone(&host_work_ownership),
+            }),
+            capabilities: self.capabilities.clone(),
+            tools: Arc::clone(&self.tools),
+            limits: self.limits,
+            artifacts: Arc::new(SdkArtifactRepository {
+                publications: artifact_publications,
+                ownership: host_work_ownership,
+            }),
+            progress_sender,
+            initialization_state,
+            identity_class,
+            output: Arc::clone(&output),
+        };
         let (sdk_transport, sdk_input, sdk_output) = sdk_transport(self.limits);
         let host_tasks = vec![
             tokio::spawn(input.run(sdk_input)),
@@ -302,6 +307,7 @@ pub(crate) struct ServiceHandler<S: ToolServices> {
     progress_sender: mpsc::Sender<ProgressDelivery>,
     initialization_state: Arc<AtomicU8>,
     identity_class: LocalProcessIdentityClass,
+    output: Arc<OutputChannel>,
 }
 
 impl<S: ToolServices> std::fmt::Debug for ServiceHandler<S> {
@@ -315,6 +321,7 @@ impl<S: ToolServices> std::fmt::Debug for ServiceHandler<S> {
             .field("progress_sender", &"[BOUNDED PROGRESS CHANNEL]")
             .field("initialization_state", &self.initialization_state)
             .field("identity_class", &self.identity_class)
+            .field("output", &"[BOUNDED OUTPUT CHANNEL]")
             .finish_non_exhaustive()
     }
 }
@@ -403,7 +410,11 @@ impl<S: ToolServices> ServiceHandler<S> {
                 .call(service_request, service_context)
                 .await
                 .map_err(service_error)?;
-            self.render_result(result).await
+            self.render_result(
+                result,
+                ArtifactPublicationContext::new(request_cancellation.clone(), deadline),
+            )
+            .await
         };
         let outcome = tokio::select! {
             biased;
@@ -431,6 +442,7 @@ impl<S: ToolServices> ServiceHandler<S> {
     async fn render_result(
         &self,
         result: market_squawk_services::TypedToolResult,
+        artifact_context: ArtifactPublicationContext,
     ) -> Result<CallToolResult, McpError> {
         let limits = self.limits.service_limits();
         result
@@ -448,7 +460,7 @@ impl<S: ToolServices> ServiceHandler<S> {
         let publication = ArtifactPublication::try_json(encoded).map_err(artifact_error)?;
         let reference = self
             .artifacts
-            .publish(publication.clone())
+            .publish(publication.clone(), artifact_context)
             .await
             .map_err(artifact_error)?;
         if !reference.matches(&publication) {
@@ -519,6 +531,21 @@ impl<S: ToolServices> ServerHandler for ServiceHandler<S> {
         &self,
         _context: NotificationContext<RoleServer>,
     ) -> impl Future<Output = ()> + Send + '_ {
+        std::future::ready(())
+    }
+
+    fn on_cancelled(
+        &self,
+        notification: CancelledNotificationParam,
+        _context: NotificationContext<RoleServer>,
+    ) -> impl Future<Output = ()> + Send + '_ {
+        if notification
+            .request_id
+            .as_ref()
+            .is_some_and(|request_id| self.output.complete_cancelled(request_id).is_err())
+        {
+            self.output.fail(output_audit_failed());
+        }
         std::future::ready(())
     }
 
@@ -660,8 +687,16 @@ fn deadline_error() -> McpError {
     McpError::new(ErrorCode(-32_008), "request deadline exceeded", None)
 }
 
-fn artifact_error(_error: ArtifactError) -> McpError {
-    McpError::internal_error("artifact publication failed", None)
+fn artifact_error(error: ArtifactError) -> McpError {
+    match error {
+        ArtifactError::Cancelled => cancelled_error(),
+        ArtifactError::DeadlineExceeded => deadline_error(),
+        ArtifactError::InvalidPublication
+        | ArtifactError::InvalidReference
+        | ArtifactError::Unavailable => {
+            McpError::internal_error("artifact publication failed", None)
+        }
+    }
 }
 
 fn controlled_or_initialization_error(
