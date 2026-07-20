@@ -1,0 +1,16 @@
+[package]
+name = "market-squawk-analytics"
+description = "Bounded exact analytics values, metadata, and feature registry for Market Squawk"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+license.workspace = true
+repository = "https://github.com/Sawmonabo/market-squawk"
+publish = false
+
+[dependencies]
+market-squawk-domain = { workspace = true }
+thiserror.workspace = true
+
+[lints]
+workspace = true

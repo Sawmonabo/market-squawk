@@ -2950,6 +2950,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "market-squawk-analytics"
+version = "0.1.0"
+dependencies = [
+ "market-squawk-domain",
+ "thiserror",
+]
+
+[[package]]
 name = "market-squawk-data"
 version = "0.1.0"
 dependencies = [
@@ -3006,6 +3014,7 @@ dependencies = [
  "arc-swap",
  "crc32fast",
  "futures-util",
+ "market-squawk-analytics",
  "market-squawk-domain",
  "market-squawk-sources",
  "proptest",

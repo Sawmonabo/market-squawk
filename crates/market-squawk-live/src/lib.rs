@@ -1,5 +1,6 @@
 //! Deterministic instrument-owned live state and current execution authority.
 
+mod action;
 mod authority;
 mod book;
 mod integrity;
@@ -12,6 +13,10 @@ mod sharding;
 mod snapshot;
 mod state;
 
+pub use action::{
+    ActionHookDisposition, CommittedActionContext, CommittedMarketReference, CurrentAuthorityGate,
+    CurrentAuthorityGateError, LiveActionHook, LiveActionHookError,
+};
 pub use authority::{AuthorityError, ConsumedLiveAuthority, LiveExecutionCapability};
 pub use book::{BookError, BookSide, DepthLimit, LevelUpdate, MAX_BOOK_MESSAGE_ITEMS, ScaledBook};
 pub use integrity::{

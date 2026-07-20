@@ -21,6 +21,7 @@ fn live_execution_capability_has_no_dependent_crate_minting_surface() {
     cases.compile_fail("tests/ui/current_capability_is_opaque.rs");
     cases.compile_fail("tests/ui/current_capability_is_not_clone.rs");
     cases.compile_fail("tests/ui/current_capability_is_not_serde.rs");
+    cases.compile_fail("tests/ui/current_action_gate_is_private.rs");
     cases.compile_fail("tests/ui/domain_assessment_is_not_capability.rs");
     cases.compile_fail("tests/ui/snapshot_dtos_are_output_only.rs");
     cases.compile_fail("tests/ui/snapshot_dtos_are_not_clone.rs");
