@@ -11,6 +11,7 @@ publish = false
 [dependencies]
 blake3 = { workspace = true }
 bytes = { workspace = true }
+crc32fast = { workspace = true }
 futures-util = { workspace = true }
 market-squawk-domain = { workspace = true }
 market-squawk-platform = { workspace = true }

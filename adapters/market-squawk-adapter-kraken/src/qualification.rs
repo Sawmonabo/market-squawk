@@ -9,14 +9,14 @@ use market_squawk_domain::{
     RuleVersion, SchemaVersion, SequenceCapability, SnapshotApplicability, SourceId,
     SourceIdentifier, VenueId,
 };
-use market_squawk_live::{KRAKEN_V2_CANONICALIZATION_ID, KRAKEN_V2_SCOPE_ID};
 use market_squawk_sources::{
     AuthorizationGrant, ChecksumAlgorithm, ChecksumBookScope, ChecksumValidationProfile,
     CoverageTopology, FreshnessPolicy, HistoricalCapability, InstrumentCoverage,
-    LiveCoverageDeclaration, LiveCoverageRule, LiveProtocolProfile, NetworkAccessPolicy,
-    ProviderBudgetPolicy, ProviderNumericPolicy, SemanticInterpretationProfile,
-    SequenceValidationProfile, SourceCapabilities, SourceClass, SourceCoverage, SourceMetadata,
-    SourceMetadataError, SourceMetadataInput, SourceProtocolProfile,
+    KRAKEN_V2_CANONICALIZATION_ID, KRAKEN_V2_SCOPE_ID, LiveCoverageDeclaration, LiveCoverageRule,
+    LiveProtocolProfile, NetworkAccessPolicy, ProviderBudgetPolicy, ProviderNumericPolicy,
+    SemanticInterpretationProfile, SequenceValidationProfile, SourceCapabilities, SourceClass,
+    SourceCoverage, SourceMetadata, SourceMetadataError, SourceMetadataInput,
+    SourceProtocolProfile,
 };
 use thiserror::Error;
 

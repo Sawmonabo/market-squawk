@@ -10,7 +10,6 @@ publish = false
 
 [dependencies]
 arc-swap.workspace = true
-crc32fast.workspace = true
 futures-util.workspace = true
 market-squawk-analytics = { workspace = true }
 market-squawk-domain = { workspace = true }

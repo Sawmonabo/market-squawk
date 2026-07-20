@@ -6,7 +6,9 @@ use market_squawk_adapter_kraken::{
     KrakenSubscription,
 };
 use market_squawk_domain::{InstrumentId, LiveEventClass};
-use market_squawk_sources::{ProviderObservationPayload, ProviderSequenceEvidence};
+use market_squawk_sources::{
+    DecodeError, MAX_DECODED_EVENTS, ProviderObservationPayload, ProviderSequenceEvidence,
+};
 
 type TestResult = Result<(), Box<dyn Error>>;
 
@@ -44,9 +46,39 @@ fn subscription_ack_is_symbol_and_depth_exact() -> TestResult {
         decoder.decode_payload(valid)?,
         KrakenDecodeOutcome::Control(KrakenControl::Subscribed(KrakenSubscription::Book))
     ));
+    let warned = br#"{"method":"subscribe","result":{"channel":"book","depth":10,"snapshot":true,"symbol":"BTC/USD","warnings":["field will be deprecated"]},"success":true,"time_in":"2023-10-04T07:48:25Z","time_out":"2023-10-04T07:48:25Z"}"#;
+    assert!(matches!(
+        decoder.decode_payload(warned)?,
+        KrakenDecodeOutcome::Control(KrakenControl::Subscribed(KrakenSubscription::Book))
+    ));
     let wrong_depth = br#"{"method":"subscribe","result":{"channel":"book","depth":25,"snapshot":true,"symbol":"BTC/USD"},"success":true,"time_in":"2023-10-04T07:48:25Z","time_out":"2023-10-04T07:48:25Z"}"#;
     assert!(decoder.decode_payload(wrong_depth).is_err());
     assert_eq!(decoder.state(), KrakenDecoderState::Quarantined);
+
+    let mut strict_decoder = KrakenDecoder::try_new("BTC/USD", instrument, KrakenDepth::Ten)?;
+    let unknown = br#"{"method":"subscribe","result":{"channel":"book","depth":10,"snapshot":true,"symbol":"BTC/USD","unexpected":true},"success":true,"time_in":"2023-10-04T07:48:25Z","time_out":"2023-10-04T07:48:25Z"}"#;
+    assert!(strict_decoder.decode_payload(unknown).is_err());
+    Ok(())
+}
+
+#[test]
+fn trade_batch_rejects_max_plus_one_before_conversion() -> TestResult {
+    let instrument = InstrumentId::from_str("4c74ab95-53b9-42ad-9b66-0ed403b88fed")?;
+    let mut exact = KrakenDecoder::try_trades("BTC/USD", instrument)?;
+    let exact_payload = trade_payload(MAX_DECODED_EVENTS)?;
+    let KrakenDecodeOutcome::Market(observations) = exact.decode_payload(&exact_payload)? else {
+        return Err("exact-bound trade batch decoded as control traffic".into());
+    };
+    assert_eq!(observations.len(), MAX_DECODED_EVENTS);
+
+    let mut excessive = KrakenDecoder::try_trades("BTC/USD", instrument)?;
+    let excessive_payload = trade_payload(MAX_DECODED_EVENTS + 1)?;
+    assert!(matches!(
+        excessive.decode_payload(&excessive_payload),
+        Err(DecodeError::TooManyEvents {
+            max: MAX_DECODED_EVENTS,
+        })
+    ));
     Ok(())
 }
 
@@ -90,4 +122,25 @@ fn repeated_price_changes_apply_in_wire_order_before_one_checksum_commit() -> Te
         "0.10000000"
     );
     Ok(())
+}
+
+fn trade_payload(count: usize) -> Result<Vec<u8>, serde_json::Error> {
+    let data = (0..count)
+        .map(|trade_id| {
+            serde_json::json!({
+                "symbol": "BTC/USD",
+                "side": "buy",
+                "price": "45283.50000",
+                "qty": "0.01000000",
+                "ord_type": "market",
+                "trade_id": trade_id,
+                "timestamp": "2023-10-04T07:48:26Z",
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_vec(&serde_json::json!({
+        "channel": "trade",
+        "type": "update",
+        "data": data,
+    }))
 }

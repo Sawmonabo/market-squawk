@@ -7,21 +7,23 @@ use market_squawk_domain::{
     AggressorSide, InstrumentId, IntegrityRule, MarketDepth, RuleVersion, SourceIdentifier,
     Timestamp, VenueId,
 };
-use market_squawk_live::kraken_v2_crc32;
 use market_squawk_sources::{
-    DecodeError, DecodedProviderBatch, DecoderEvidence, MAX_RAW_FRAME_BYTES, MarketDecoder,
-    ProviderAggressorEvidence, ProviderBookChange, ProviderBookLevel, ProviderBookSide,
-    ProviderChecksumEvidence, ProviderDecimalLexeme, ProviderNormalizedObservation,
-    ProviderObservationPayload, ProviderPrice, ProviderQuantity, ProviderSequenceEvidence,
-    ProviderSnapshotEvidence, ProviderTimestampEvidence, SourceMetadata, SourceMetadataProvider,
-    SourceProtocolProfile, TransportFrameKind, ValidatedRawMarketFrame,
+    ControlFrameKind, DecodeError, DecodeInternalError, DecodeOutcome, DecodedControlFrame,
+    DecodedProviderBatch, DecodedQuarantineAction, DecodedRecoveryAction, DecoderEvidence,
+    MAX_DECODED_EVENTS, MAX_RAW_FRAME_BYTES, MarketDecoder, ProviderAggressorEvidence,
+    ProviderBookChange, ProviderBookLevel, ProviderBookSide, ProviderChecksumEvidence,
+    ProviderDecimalLexeme, ProviderNormalizedObservation, ProviderObservationPayload,
+    ProviderPrice, ProviderQuantity, ProviderSequenceEvidence, ProviderSnapshotEvidence,
+    ProviderTimestampEvidence, QuarantineReason, ResolvedChecksumValidator,
+    ResynchronizationReason, SourceMetadata, SourceMetadataProvider, SourceProtocolProfile,
+    TransportFrameKind, ValidatedRawMarketFrame, kraken_v2_crc32,
 };
 use rust_decimal::Decimal;
 
 use crate::config::{KrakenChannel, KrakenDepth};
 use crate::messages::{
-    BookData, BookEnvelope, EnvelopeKind, Heartbeat, Pong, StatusEnvelope, SubscribeAck,
-    TradeEnvelope, WireLevel, classify, exact_decimal,
+    BookData, BookEnvelope, EnvelopeKind, Heartbeat, Pong, StatusEnvelope, SubscribeAck, TradeData,
+    TradeEnvelope, WireLevel, bounded_trade_count, classify, exact_decimal, validate_warnings,
 };
 use crate::qualification::{KRAKEN_BOOK_SEQUENCE_RULE, KRAKEN_TRADE_SEQUENCE_RULE};
 
@@ -87,11 +89,8 @@ impl KrakenMarketDecoder {
         };
         match channel {
             KrakenChannel::Book(depth) => {
-                market_squawk_live::ResolvedChecksumValidator::resolve(
-                    profile.checksum(),
-                    depth.get(),
-                )
-                .map_err(|_| DecodeError::InvalidProviderEvidence)?;
+                ResolvedChecksumValidator::resolve(profile.checksum(), depth.get())
+                    .map_err(|_| DecodeError::InvalidProviderEvidence)?;
             }
             KrakenChannel::Trades => {
                 if !matches!(
@@ -124,21 +123,84 @@ impl MarketDecoder for KrakenMarketDecoder {
     fn decode(
         &mut self,
         frame: &ValidatedRawMarketFrame<'_>,
-    ) -> Result<DecodedProviderBatch, DecodeError> {
-        if frame.frame().transport() != TransportFrameKind::Text {
-            return Err(DecodeError::MalformedPayload);
-        }
+    ) -> Result<DecodeOutcome, DecodeInternalError> {
         let SourceProtocolProfile::Live(profile) = self.metadata.protocol_profile() else {
-            return Err(DecodeError::InvalidProviderEvidence);
+            return Err(DecodeInternalError::InvariantViolation);
         };
         let evidence = DecoderEvidence::from_validated_frame(frame, profile.decoder_rule().clone());
-        match self.decoder.decode_payload(frame.frame().payload())? {
-            KrakenDecodeOutcome::Market(observations) => {
-                DecodedProviderBatch::try_new(evidence, observations)
+        if frame.frame().transport() != TransportFrameKind::Text {
+            return Ok(DecodeOutcome::Quarantine(DecodedQuarantineAction::new(
+                evidence,
+                QuarantineReason::SchemaViolation,
+                None,
+            )));
+        }
+        match self.decoder.decode_payload(frame.frame().payload()) {
+            Ok(KrakenDecodeOutcome::Market(observations)) => {
+                match DecodedProviderBatch::try_new(evidence.clone(), observations) {
+                    Ok(batch) => Ok(DecodeOutcome::Data(batch)),
+                    Err(error) => decode_failure_outcome(error, evidence),
+                }
             }
-            KrakenDecodeOutcome::Control(_) => Err(DecodeError::EmptyBatch),
+            Ok(KrakenDecodeOutcome::Control(control)) => control_outcome(control, evidence),
+            Err(error) => decode_failure_outcome(error, evidence),
         }
     }
+}
+
+fn control_outcome(
+    control: KrakenControl,
+    evidence: DecoderEvidence,
+) -> Result<DecodeOutcome, DecodeInternalError> {
+    let (kind, provider_code) = match control {
+        KrakenControl::Heartbeat => (ControlFrameKind::Heartbeat, None),
+        KrakenControl::Pong => (ControlFrameKind::Pong, None),
+        KrakenControl::Online => (ControlFrameKind::ProviderFlowControl, Some("online")),
+        KrakenControl::Subscribed(KrakenSubscription::Book) => {
+            (ControlFrameKind::SubscriptionAcknowledgement, Some("book"))
+        }
+        KrakenControl::Subscribed(KrakenSubscription::Trade) => {
+            (ControlFrameKind::SubscriptionAcknowledgement, Some("trade"))
+        }
+    };
+    let provider_code = provider_code
+        .map(SourceIdentifier::try_from)
+        .transpose()
+        .map_err(|_| DecodeInternalError::InvariantViolation)?;
+    Ok(DecodeOutcome::Control(DecodedControlFrame::new(
+        evidence,
+        kind,
+        provider_code,
+    )))
+}
+
+fn decode_failure_outcome(
+    error: DecodeError,
+    evidence: DecoderEvidence,
+) -> Result<DecodeOutcome, DecodeInternalError> {
+    let reason = match error {
+        DecodeError::RetainedSizeOverflow => {
+            return Err(DecodeInternalError::RetainedSizeOverflow);
+        }
+        DecodeError::ResynchronizationRequired => {
+            return Ok(DecodeOutcome::Resynchronize(DecodedRecoveryAction::new(
+                evidence,
+                ResynchronizationReason::DecoderStateDiscontinuity,
+                None,
+            )));
+        }
+        DecodeError::MalformedPayload | DecodeError::EmptyBatch => {
+            QuarantineReason::MalformedPayload
+        }
+        DecodeError::InexactValue => QuarantineReason::InexactNumericValue,
+        DecodeError::TooManyEvents { .. } | DecodeError::TooManyNumericFields { .. } => {
+            QuarantineReason::SchemaViolation
+        }
+        DecodeError::InvalidProviderEvidence => QuarantineReason::ProtocolInvariantViolation,
+    };
+    Ok(DecodeOutcome::Quarantine(DecodedQuarantineAction::new(
+        evidence, reason, None,
+    )))
 }
 
 /// Fully validated classification of one Kraken application message.
@@ -453,11 +515,23 @@ impl KrakenDecoder {
         if envelope.channel != "trade" || !matches!(envelope.kind, "snapshot" | "update") {
             return Err(DecodeError::MalformedPayload);
         }
-        if envelope.data.is_empty() {
+        let trade_count =
+            bounded_trade_count(envelope.data).map_err(|_| DecodeError::MalformedPayload)?;
+        if trade_count == 0 {
             return Err(DecodeError::EmptyBatch);
         }
-        let mut observations = Vec::with_capacity(envelope.data.len());
-        for trade in envelope.data {
+        if trade_count > MAX_DECODED_EVENTS {
+            return Err(DecodeError::TooManyEvents {
+                max: MAX_DECODED_EVENTS,
+            });
+        }
+        let trades: Vec<TradeData<'_>> =
+            serde_json::from_str(envelope.data.get()).map_err(|_| DecodeError::MalformedPayload)?;
+        if trades.len() != trade_count {
+            return Err(DecodeError::MalformedPayload);
+        }
+        let mut observations = Vec::with_capacity(trade_count);
+        for trade in trades {
             if trade.symbol != self.symbol || trade.trade_id < 0 || trade.ord_type.is_empty() {
                 return Err(DecodeError::MalformedPayload);
             }
@@ -696,6 +770,7 @@ fn validate_ack(
     let ack: SubscribeAck<'_> =
         serde_json::from_slice(payload).map_err(|_| DecodeError::MalformedPayload)?;
     let result = ack.result.as_ref().ok_or(DecodeError::MalformedPayload)?;
+    validate_warnings(result.warnings).map_err(|_| DecodeError::MalformedPayload)?;
     if ack.method != "subscribe"
         || !ack.success
         || ack.error.is_some()

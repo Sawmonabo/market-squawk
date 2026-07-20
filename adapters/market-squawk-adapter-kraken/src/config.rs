@@ -5,10 +5,10 @@ use std::num::NonZeroUsize;
 use market_squawk_domain::{
     DataQuality, InstrumentId, LiveEventClass, MarketDepth, SequenceCapability,
 };
-use market_squawk_live::ResolvedChecksumValidator;
 use market_squawk_sources::{
     ChecksumValidationProfile, InstrumentCoverageMembership, MAX_RAW_FRAME_BYTES,
-    NetworkAccessPolicy, SharedProviderBudget, SourceClass, SourceMetadata, SourceMetadataProvider,
+    NetworkAccessPolicy, ResolvedChecksumValidator, SharedProviderBudget, SourceClass,
+    SourceMetadata, SourceMetadataProvider,
 };
 use thiserror::Error;
 use url::Url;

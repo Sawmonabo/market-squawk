@@ -2,13 +2,11 @@ use std::error::Error;
 use std::num::NonZeroU16;
 
 use market_squawk_domain::{IntegrityRule, MarketDepth, RuleVersion, SourceIdentifier};
-use market_squawk_live::{
-    ChecksumValidationError, KRAKEN_V2_CANONICALIZATION_ID, KRAKEN_V2_SCOPE_ID,
-    ResolvedChecksumValidator, kraken_v2_crc32,
-};
 use market_squawk_sources::{
-    ChecksumAlgorithm, ChecksumBookScope, ChecksumValidationProfile, ProviderBookLevel,
-    ProviderChecksumEvidence, ProviderDecimalLexeme, ProviderPrice, ProviderQuantity,
+    ChecksumAlgorithm, ChecksumBookScope, ChecksumValidationError, ChecksumValidationProfile,
+    KRAKEN_V2_CANONICALIZATION_ID, KRAKEN_V2_SCOPE_ID, ProviderBookLevel, ProviderChecksumEvidence,
+    ProviderDecimalLexeme, ProviderPrice, ProviderQuantity, ResolvedChecksumValidator,
+    kraken_v2_crc32,
 };
 
 fn level(price: &str, quantity: &str) -> Result<ProviderBookLevel, Box<dyn Error>> {

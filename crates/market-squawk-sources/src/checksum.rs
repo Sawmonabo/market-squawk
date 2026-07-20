@@ -4,18 +4,22 @@ use std::num::NonZeroU16;
 
 use crc32fast::Hasher;
 use market_squawk_domain::{IntegrityRule, MarketDepth};
-use market_squawk_sources::{
-    ChecksumAlgorithm, ChecksumValidationProfile, ProviderBookLevel, ProviderChecksumEvidence,
-};
 use rust_decimal::Decimal;
 use thiserror::Error;
 
+use crate::decoder::{ProviderBookLevel, ProviderChecksumEvidence};
+use crate::metadata::{ChecksumAlgorithm, ChecksumValidationProfile};
+
 /// Allocation-free exact decimal view used by both decoder DTOs and the live book's fixed-size
 /// immutable lexeme representation.
-pub(crate) trait ExactChecksumLevel {
+pub trait ExactChecksumLevel {
+    /// Returns the provider's exact price lexeme.
     fn price_bytes(&self) -> &[u8];
+    /// Returns the provider's exact quantity lexeme.
     fn quantity_bytes(&self) -> &[u8];
+    /// Returns the checked decimal price used to validate ordering.
     fn price_decimal(&self) -> Decimal;
+    /// Returns the checked decimal quantity used to validate positivity.
     fn quantity_decimal(&self) -> Decimal;
 }
 
@@ -146,7 +150,13 @@ impl ResolvedChecksumValidator {
         }
     }
 
-    pub(crate) fn validate_exact_ordered<'a, L, A, B>(
+    /// Validates ordered retained exact-level iterators without canonical string allocation.
+    ///
+    /// # Errors
+    ///
+    /// Rejects evidence/profile transplants, malformed checksum values, invalid ordering, and
+    /// checksum mismatches.
+    pub fn validate_exact_ordered<'a, L, A, B>(
         &self,
         asks: A,
         bids: B,

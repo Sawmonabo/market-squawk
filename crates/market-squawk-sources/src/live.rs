@@ -487,6 +487,9 @@ pub enum SourceError {
     /// Allowlisted network operation failed.
     #[error("source network operation failed")]
     Network,
+    /// No connection activity arrived before the metadata-bound idle deadline.
+    #[error("source connection exceeded its configured idle deadline")]
+    ConnectionIdle,
     /// Bounded sink rejected a frame.
     #[error("raw market sink rejected a frame: {0}")]
     Sink(#[from] SinkError),

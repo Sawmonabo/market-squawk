@@ -9,6 +9,8 @@ use market_squawk_sources::{
     BudgetDecision, LiveMarketSource, RawFrameFactory, RawMarketSink, SourceError, SourceMetadata,
     SourceMetadataProvider, TransportFrameKind,
 };
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::connect_async_tls_with_config;
 use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
 use tokio_util::sync::CancellationToken;
@@ -19,9 +21,30 @@ use crate::{
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_SOCKET_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 const READ_BUFFER_BYTES: usize = 64 * 1024;
 const WRITE_BUFFER_BYTES: usize = 8 * 1024;
 const MAX_WRITE_BUFFER_BYTES: usize = 128 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SessionDeadlines {
+    receive_idle: Duration,
+    write: Duration,
+    close: Duration,
+}
+
+impl SessionDeadlines {
+    fn from_metadata(metadata: &SourceMetadata) -> Self {
+        let receive_idle =
+            Duration::from_nanos(metadata.freshness_policy().max_connection_idle_nanos());
+        let operation = receive_idle.min(MAX_SOCKET_OPERATION_TIMEOUT);
+        Self {
+            receive_idle,
+            write: operation,
+            close: operation,
+        }
+    }
+}
 
 /// Non-authoritative operational counters for the current source instance.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -145,28 +168,57 @@ impl KrakenSource {
             self.health.state = KrakenDecoderState::Quarantined;
             return Err(SourceError::ProviderUnavailable);
         }
+        self.run_established(&mut socket, frames, sink, cancellation)
+            .await
+    }
+
+    async fn run_established<S>(
+        &mut self,
+        socket: &mut WebSocketStream<S>,
+        frames: &mut RawFrameFactory,
+        sink: &mut dyn RawMarketSink,
+        cancellation: CancellationToken,
+    ) -> Result<(), SourceError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let deadlines = SessionDeadlines::from_metadata(self.config.metadata());
+        let result = self
+            .run_established_inner(socket, frames, sink, &cancellation, deadlines)
+            .await;
+        if result.is_err() {
+            self.health.state = KrakenDecoderState::Quarantined;
+        }
+        if result == Err(SourceError::Cancelled) {
+            close_with_deadline(socket, deadlines.close).await;
+        }
+        result
+    }
+
+    async fn run_established_inner<S>(
+        &mut self,
+        socket: &mut WebSocketStream<S>,
+        frames: &mut RawFrameFactory,
+        sink: &mut dyn RawMarketSink,
+        cancellation: &CancellationToken,
+        deadlines: SessionDeadlines,
+    ) -> Result<(), SourceError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
         let (channel, depth) = match self.config.channel() {
             KrakenChannel::Book(depth) => ("book", Some(depth.get())),
             KrakenChannel::Trades => ("trade", None),
         };
-        let subscribe_payload = match subscription(self.config.symbol(), channel, depth) {
-            Ok(payload) => payload,
-            Err(error) => {
-                self.health.state = KrakenDecoderState::Quarantined;
-                return Err(error);
-            }
-        };
-        if let Err(error) = send_subscription(
-            &mut socket,
+        let subscribe_payload = subscription(self.config.symbol(), channel, depth)?;
+        send_subscription(
+            socket,
             self.config.budget(),
             subscribe_payload,
-            &cancellation,
+            cancellation,
+            deadlines.write,
         )
-        .await
-        {
-            self.health.state = KrakenDecoderState::Quarantined;
-            return Err(error);
-        }
+        .await?;
 
         let mut decoder = match self.config.channel() {
             KrakenChannel::Book(depth) => {
@@ -179,11 +231,16 @@ impl KrakenSource {
         .map_err(|_| SourceError::InvalidProtocolState)?;
         loop {
             let message = tokio::select! {
-                _ = cancellation.cancelled() => {
-                    let _close_result = socket.close(None).await;
-                    return Err(SourceError::Cancelled);
-                }
-                message = socket.next() => message,
+                _ = cancellation.cancelled() => return Err(SourceError::Cancelled),
+                result = tokio::time::timeout(deadlines.receive_idle, socket.next()) => {
+                    match result {
+                        Ok(message) => message,
+                        Err(_) => {
+                            self.health.state = KrakenDecoderState::Quarantined;
+                            return Err(SourceError::ConnectionIdle);
+                        }
+                    }
+                },
             };
             let Some(message) = message else {
                 self.health.state = KrakenDecoderState::Quarantined;
@@ -229,9 +286,16 @@ impl KrakenSource {
                     return Err(SourceError::InvalidProtocolState);
                 }
                 Message::Ping(payload) => {
-                    if let Err(error) = socket.send(Message::Pong(payload)).await {
+                    if let Err(error) = send_message_with_deadline(
+                        socket,
+                        Message::Pong(payload),
+                        cancellation,
+                        deadlines.write,
+                    )
+                    .await
+                    {
                         self.health.state = KrakenDecoderState::Quarantined;
-                        return Err(map_websocket_error(error));
+                        return Err(error);
                     }
                 }
                 Message::Pong(_) => {}
@@ -390,6 +454,7 @@ async fn send_subscription<S>(
     budget: &market_squawk_sources::SharedProviderBudget,
     payload: String,
     cancellation: &CancellationToken,
+    deadline: Duration,
 ) -> Result<(), SourceError>
 where
     S: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
@@ -400,16 +465,42 @@ where
             return Err(SourceError::ProviderUnavailable);
         }
     };
-    tokio::select! {
-        _ = cancellation.cancelled() => return Err(SourceError::Cancelled),
-        result = socket.send(Message::Text(payload.into())) => {
-            result.map_err(map_websocket_error)?;
-        }
-    }
+    send_message_with_deadline(
+        socket,
+        Message::Text(payload.into()),
+        cancellation,
+        deadline,
+    )
+    .await?;
     drop(permit);
     budget
         .record_success()
         .map_err(|_| SourceError::ProviderUnavailable)
+}
+
+async fn send_message_with_deadline<S>(
+    socket: &mut S,
+    message: Message,
+    cancellation: &CancellationToken,
+    deadline: Duration,
+) -> Result<(), SourceError>
+where
+    S: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    tokio::select! {
+        _ = cancellation.cancelled() => Err(SourceError::Cancelled),
+        result = tokio::time::timeout(deadline, socket.send(message)) => {
+            let result = result.map_err(|_| SourceError::Network)?;
+            result.map_err(map_websocket_error)
+        }
+    }
+}
+
+async fn close_with_deadline<S>(socket: &mut WebSocketStream<S>, deadline: Duration)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let _close_result = tokio::time::timeout(deadline, socket.close(None)).await;
 }
 
 fn map_websocket_error(error: tokio_tungstenite::tungstenite::Error) -> SourceError {
@@ -438,3 +529,7 @@ fn map_connect_error(
     }
     map_websocket_error(error)
 }
+
+#[cfg(test)]
+#[path = "session_tests.rs"]
+mod tests;

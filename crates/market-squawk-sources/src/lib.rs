@@ -7,6 +7,7 @@
 mod authority_time;
 mod bounded;
 mod capture;
+mod checksum;
 mod decoder;
 mod extraction;
 mod health;
@@ -35,6 +36,10 @@ pub use capture::{
     CaptureAdmissionError, CaptureAdmissionIssuer, CaptureAdmissionReceipt,
     CaptureDegradationCapability, CaptureGenerationCapabilities, CaptureGenerationHealth,
     CaptureGenerationLease, CaptureInitializationControl,
+};
+pub use checksum::{
+    ChecksumValidationError, ExactChecksumLevel, KRAKEN_V2_CANONICALIZATION_ID, KRAKEN_V2_SCOPE_ID,
+    ResolvedChecksumValidator, kraken_v2_crc32,
 };
 pub use decoder::{
     ControlFrameKind, DecodeError, DecodeInternalError, DecodeOutcome, DecodedControlFrame,

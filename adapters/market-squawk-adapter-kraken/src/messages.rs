@@ -1,8 +1,15 @@
 //! Strict bounded Kraken WebSocket v2 wire parsing.
 
-use serde::Deserialize;
+use std::fmt;
+
+use market_squawk_sources::MAX_DECODED_EVENTS;
+use serde::de::{Error as _, IgnoredAny, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 use serde_json::value::RawValue;
 use thiserror::Error;
+
+const MAX_SUBSCRIPTION_WARNINGS: usize = 16;
+const MAX_WARNING_JSON_BYTES: usize = 512;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -43,7 +50,7 @@ pub(crate) struct TradeEnvelope<'a> {
     #[serde(rename = "type")]
     pub(crate) kind: &'a str,
     #[serde(borrow)]
-    pub(crate) data: Vec<TradeData<'a>>,
+    pub(crate) data: &'a RawValue,
 }
 
 #[derive(Debug, Deserialize)]
@@ -104,6 +111,8 @@ pub(crate) struct SubscribeResult<'a> {
     pub(crate) depth: Option<usize>,
     pub(crate) snapshot: Option<bool>,
     pub(crate) symbol: &'a str,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_warnings")]
+    pub(crate) warnings: Option<&'a RawValue>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -153,6 +162,102 @@ pub(crate) fn exact_decimal(raw: &RawValue) -> Result<&str, MessageError> {
         Ok(&value[1..value.len() - 1])
     } else {
         Ok(value)
+    }
+}
+
+pub(crate) fn validate_warnings(raw: Option<&RawValue>) -> Result<(), MessageError> {
+    let Some(raw) = raw else {
+        return Ok(());
+    };
+    serde_json::from_str::<BoundedWarnings>(raw.get())
+        .map(|_warnings| ())
+        .map_err(|_| MessageError::Malformed)
+}
+
+pub(crate) fn bounded_trade_count(raw: &RawValue) -> Result<usize, MessageError> {
+    serde_json::from_str::<BoundedTradeCount>(raw.get())
+        .map(|count| count.0)
+        .map_err(|_| MessageError::Malformed)
+}
+
+struct BoundedTradeCount(usize);
+
+impl<'de> Deserialize<'de> for BoundedTradeCount {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(BoundedTradeCountVisitor)
+    }
+}
+
+struct BoundedTradeCountVisitor;
+
+impl<'de> Visitor<'de> for BoundedTradeCountVisitor {
+    type Value = BoundedTradeCount;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a bounded array of trade objects")
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut count = 0_usize;
+        while sequence.next_element::<IgnoredAny>()?.is_some() {
+            count = count.saturating_add(1).min(MAX_DECODED_EVENTS + 1);
+        }
+        Ok(BoundedTradeCount(count))
+    }
+}
+
+fn deserialize_present_warnings<'de, D>(deserializer: D) -> Result<Option<&'de RawValue>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    <&RawValue>::deserialize(deserializer).map(Some)
+}
+
+struct BoundedWarnings;
+
+impl<'de> Deserialize<'de> for BoundedWarnings {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(BoundedWarningsVisitor)
+    }
+}
+
+struct BoundedWarningsVisitor;
+
+impl<'de> Visitor<'de> for BoundedWarningsVisitor {
+    type Value = BoundedWarnings;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a bounded array of subscription warning strings")
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut count = 0_usize;
+        while let Some(raw_warning) = sequence.next_element::<&RawValue>()? {
+            count = count
+                .checked_add(1)
+                .ok_or_else(|| A::Error::custom("subscription warning count overflow"))?;
+            if count > MAX_SUBSCRIPTION_WARNINGS {
+                return Err(A::Error::custom("too many subscription warnings"));
+            }
+            if raw_warning.get().len() > MAX_WARNING_JSON_BYTES {
+                return Err(A::Error::custom("subscription warning is too large"));
+            }
+            let _warning =
+                serde_json::from_str::<String>(raw_warning.get()).map_err(A::Error::custom)?;
+        }
+        Ok(BoundedWarnings)
     }
 }
 

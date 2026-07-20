@@ -2957,7 +2957,6 @@ dependencies = [
  "chrono",
  "futures-util",
  "market-squawk-domain",
- "market-squawk-live",
  "market-squawk-sources",
  "rust_decimal",
  "serde",
@@ -3032,7 +3031,6 @@ name = "market-squawk-live"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
- "crc32fast",
  "futures-util",
  "market-squawk-analytics",
  "market-squawk-domain",
@@ -3119,6 +3117,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "bytes",
+ "crc32fast",
  "futures-util",
  "loom",
  "market-squawk-domain",
