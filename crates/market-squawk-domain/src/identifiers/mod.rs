@@ -283,6 +283,7 @@ macro_rules! checked_identifier_serde {
 
 mod derivatives;
 mod digital_assets;
+mod execution;
 mod securities;
 
 pub use derivatives::{
@@ -293,5 +294,8 @@ pub use derivatives::{
 pub use digital_assets::{
     BitcoinAddressType, BitcoinNetwork, ChainAddress, ChainAddressRole, ChainAddressRule, ChainId,
     CryptoPair, CryptoProductType, EvmChainId, SolanaChainId, SolanaNetwork,
+};
+pub use execution::{
+    AccountId, ApprovalId, ClientOrderId, ExecutionIdentityError, ModelId, OrderId, StrategyId,
 };
 pub use securities::{Cusip, Figi, Isin, Sedol};

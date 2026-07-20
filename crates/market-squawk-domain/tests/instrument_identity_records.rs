@@ -133,10 +133,13 @@ fn definition_uses_typed_denomination_and_rejects_duplicate_identifiers()
     let record = identifier_record()?;
     let definition = InstrumentDefinition::try_new(InstrumentDefinitionInput {
         instrument_id: id,
+        definition_revision: market_squawk_domain::InstrumentDefinitionRevision::try_from(1_u64)?,
         asset_class: AssetClass::Crypto,
         primary_denomination: Denomination::Asset(settlement_asset),
+        quote_currency: Currency::try_from("USD")?,
         tick_size: TickSize::try_from_decimal(Decimal::new(1, 2))?,
         lot_size: LotSize::try_from_decimal(Decimal::ONE)?,
+        contract_multiplier: Decimal::ONE,
         venue_mappings: Vec::new(),
         provider_identities: Vec::new(),
         identifiers: vec![record.clone()],
@@ -150,10 +153,15 @@ fn definition_uses_typed_denomination_and_rejects_duplicate_identifiers()
     assert_eq!(
         InstrumentDefinition::try_new(InstrumentDefinitionInput {
             instrument_id: id,
+            definition_revision: market_squawk_domain::InstrumentDefinitionRevision::try_from(
+                1_u64
+            )?,
             asset_class: AssetClass::Equity,
             primary_denomination: Denomination::Currency(Currency::try_from("USD")?),
+            quote_currency: Currency::try_from("USD")?,
             tick_size: TickSize::try_from_decimal(Decimal::new(1, 2))?,
             lot_size: LotSize::try_from_decimal(Decimal::ONE)?,
+            contract_multiplier: Decimal::ONE,
             venue_mappings: Vec::new(),
             provider_identities: Vec::new(),
             identifiers: vec![record.clone(), record],
@@ -236,10 +244,13 @@ fn provider_identity_text_is_qualified_by_source_in_instrument_definition()
     let second = provider_identity(id, "vendor-beta", "12345", validity, 6)?;
     let definition = InstrumentDefinition::try_new(InstrumentDefinitionInput {
         instrument_id: id,
+        definition_revision: market_squawk_domain::InstrumentDefinitionRevision::try_from(1_u64)?,
         asset_class: AssetClass::Equity,
         primary_denomination: Denomination::Currency(Currency::try_from("USD")?),
+        quote_currency: Currency::try_from("USD")?,
         tick_size: TickSize::try_from_decimal(Decimal::new(1, 2))?,
         lot_size: LotSize::try_from_decimal(Decimal::ONE)?,
+        contract_multiplier: Decimal::ONE,
         venue_mappings: vec![VenueMapping::new(
             VenueId::try_from("XNAS")?,
             VenueSymbol::try_from("ACME")?,
@@ -270,10 +281,15 @@ fn provider_identity_text_is_qualified_by_source_in_instrument_definition()
     let definition_input = || -> Result<InstrumentDefinitionInput, Box<dyn std::error::Error>> {
         Ok(InstrumentDefinitionInput {
             instrument_id: id,
+            definition_revision: market_squawk_domain::InstrumentDefinitionRevision::try_from(
+                1_u64,
+            )?,
             asset_class: AssetClass::Equity,
             primary_denomination: Denomination::Currency(Currency::try_from("USD")?),
+            quote_currency: Currency::try_from("USD")?,
             tick_size: TickSize::try_from_decimal(Decimal::new(1, 2))?,
             lot_size: LotSize::try_from_decimal(Decimal::ONE)?,
+            contract_multiplier: Decimal::ONE,
             venue_mappings: Vec::new(),
             provider_identities: Vec::new(),
             identifiers: Vec::new(),

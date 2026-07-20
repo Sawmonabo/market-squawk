@@ -26,10 +26,13 @@ fn route_config() -> TestResult<LiveRouteConfig> {
     let instrument = instrument_id()?;
     let definition = InstrumentDefinition::try_new(InstrumentDefinitionInput {
         instrument_id: instrument,
+        definition_revision: market_squawk_domain::InstrumentDefinitionRevision::try_from(1_u64)?,
         asset_class: AssetClass::Crypto,
         primary_denomination: Denomination::Currency(Currency::try_from("USD")?),
+        quote_currency: Currency::try_from("USD")?,
         tick_size: TickSize::try_from_decimal(Decimal::new(1, 2))?,
         lot_size: LotSize::try_from_decimal(Decimal::new(1, 4))?,
+        contract_multiplier: Decimal::ONE,
         venue_mappings: vec![VenueMapping::new(
             venue.clone(),
             VenueSymbol::try_from("BTC-USD")?,

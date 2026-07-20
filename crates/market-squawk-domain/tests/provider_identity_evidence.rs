@@ -101,14 +101,19 @@ fn definition(
 ) -> Result<InstrumentDefinition, InstrumentError> {
     InstrumentDefinition::try_new(InstrumentDefinitionInput {
         instrument_id: definition_instrument,
+        definition_revision: market_squawk_domain::InstrumentDefinitionRevision::try_from(1_u64)
+            .map_err(|_| InstrumentError::InvalidEffectiveInterval)?,
         asset_class: AssetClass::Equity,
         primary_denomination: Denomination::Currency(
             Currency::try_from("USD").map_err(|_| InstrumentError::InvalidEffectiveInterval)?,
         ),
+        quote_currency: Currency::try_from("USD")
+            .map_err(|_| InstrumentError::InvalidEffectiveInterval)?,
         tick_size: TickSize::try_from_decimal(Decimal::new(1, 2))
             .map_err(|_| InstrumentError::InvalidEffectiveInterval)?,
         lot_size: LotSize::try_from_decimal(Decimal::ONE)
             .map_err(|_| InstrumentError::InvalidEffectiveInterval)?,
+        contract_multiplier: Decimal::ONE,
         venue_mappings: Vec::new(),
         provider_identities,
         identifiers: Vec::new(),

@@ -629,10 +629,13 @@ fn instrument_definition_owns_precision_mappings_identifiers_and_status()
     });
     let definition = InstrumentDefinition::try_new(InstrumentDefinitionInput {
         instrument_id: id,
+        definition_revision: market_squawk_domain::InstrumentDefinitionRevision::try_from(1_u64)?,
         asset_class: AssetClass::Equity,
         primary_denomination: Denomination::Currency(Currency::try_from("USD")?),
+        quote_currency: Currency::try_from("USD")?,
         tick_size: TickSize::try_from_decimal(Decimal::new(1, 2))?,
         lot_size: LotSize::try_from_decimal(Decimal::ONE)?,
+        contract_multiplier: Decimal::ONE,
         venue_mappings: vec![mapping.clone()],
         provider_identities: vec![provider_identity.clone()],
         identifiers: vec![identifier_record.clone()],
@@ -657,10 +660,15 @@ fn instrument_definition_owns_precision_mappings_identifiers_and_status()
     assert_eq!(
         InstrumentDefinition::try_new(InstrumentDefinitionInput {
             instrument_id: id,
+            definition_revision: market_squawk_domain::InstrumentDefinitionRevision::try_from(
+                1_u64
+            )?,
             asset_class: AssetClass::Equity,
             primary_denomination: Denomination::Currency(Currency::try_from("USD")?),
+            quote_currency: Currency::try_from("USD")?,
             tick_size: TickSize::try_from_decimal(Decimal::new(1, 2))?,
             lot_size: LotSize::try_from_decimal(Decimal::ONE)?,
+            contract_multiplier: Decimal::ONE,
             venue_mappings: vec![mapping.clone(), mapping],
             provider_identities: Vec::new(),
             identifiers: Vec::new(),

@@ -34,10 +34,13 @@ fn instrument(value: &str) -> TestResult<InstrumentId> {
 fn definition(instrument_id: &str) -> TestResult<InstrumentDefinition> {
     Ok(InstrumentDefinition::try_new(InstrumentDefinitionInput {
         instrument_id: instrument(instrument_id)?,
+        definition_revision: market_squawk_domain::InstrumentDefinitionRevision::try_from(1_u64)?,
         asset_class: AssetClass::Crypto,
         primary_denomination: Denomination::Currency(Currency::try_from("USD")?),
+        quote_currency: Currency::try_from("USD")?,
         tick_size: TickSize::try_from_decimal(Decimal::new(1, 2))?,
         lot_size: LotSize::try_from_decimal(Decimal::new(1, 2))?,
+        contract_multiplier: Decimal::ONE,
         venue_mappings: vec![VenueMapping::new(
             VenueId::try_from(VENUE)?,
             VenueSymbol::try_from("BTC-USD")?,

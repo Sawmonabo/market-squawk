@@ -10,6 +10,7 @@ mod identifiers;
 mod identity;
 mod instrument;
 mod market;
+mod order;
 mod provenance;
 mod research;
 mod retained;
@@ -52,12 +53,12 @@ pub use financial::{
     QuantityLots, RoundingPolicy, TickSize,
 };
 pub use identifiers::{
-    BitcoinAddressType, BitcoinNetwork, ChainAddress, ChainAddressRole, ChainAddressRule, ChainId,
-    CryptoPair, CryptoProductType, Cusip, EvmChainId, Figi, FuturesContractIdentity,
-    FuturesContractIdentityInput, FuturesLeg, FuturesLegInput, FuturesLegSide,
-    FuturesLifecycleDateFields, FuturesLifecycleDates, FuturesSecurityType, IdentifierError, Isin,
-    MaturityMonthYear, OccOptionIdentity, OptionKind, Sedol, SolanaChainId, SolanaNetwork, Ticker,
-    VenueSymbol,
+    AccountId, ApprovalId, BitcoinAddressType, BitcoinNetwork, ChainAddress, ChainAddressRole,
+    ChainAddressRule, ChainId, ClientOrderId, CryptoPair, CryptoProductType, Cusip, EvmChainId,
+    ExecutionIdentityError, Figi, FuturesContractIdentity, FuturesContractIdentityInput,
+    FuturesLeg, FuturesLegInput, FuturesLegSide, FuturesLifecycleDateFields, FuturesLifecycleDates,
+    FuturesSecurityType, IdentifierError, Isin, MaturityMonthYear, ModelId, OccOptionIdentity,
+    OptionKind, OrderId, Sedol, SolanaChainId, SolanaNetwork, StrategyId, Ticker, VenueSymbol,
 };
 pub use identity::{
     ConnectionGeneration, IdentityError, InstrumentId, ProviderInstrumentId, SequenceNumber,
@@ -79,6 +80,10 @@ pub use market::{
     BookSnapshotEvent, CorporateActionEvent, CorporateActionKind, HaltTransition,
     InstrumentStatusEvent, MarketEvent, MarketEventError, MarketSide, QuoteEvent, TradeEvent,
     TradingHaltEvent,
+};
+pub use order::{
+    InstrumentDefinitionRevision, InstrumentExecutionTerms, OrderContractError, OrderReasonCode,
+    OrderSide, OrderType, TimeInForce,
 };
 pub use provenance::{
     AvailabilityEvidence, DecodedLiveProvenanceInput, LiveProvenance, LiveRecordState, PayloadHash,

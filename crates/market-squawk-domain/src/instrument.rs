@@ -2,7 +2,7 @@ use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::{InstrumentId, MetadataRevision, Timestamp, VenueId, VenueSymbol};
+use crate::{InstrumentId, MetadataRevision, OrderContractError, Timestamp, VenueId, VenueSymbol};
 
 #[path = "instrument/definition.rs"]
 mod definition;
@@ -103,6 +103,8 @@ impl fmt::Display for VenueMapping {
 /// Instrument-definition or effective-identity invariant failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum InstrumentError {
+    /// Execution terms were internally invalid.
+    InvalidExecutionTerms(OrderContractError),
     /// An effective interval ended at or before its start.
     InvalidEffectiveInterval,
     /// A lifecycle transition or roll mapped an instrument to itself.
@@ -167,6 +169,7 @@ pub enum InstrumentError {
 impl fmt::Display for InstrumentError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidExecutionTerms(error) => error.fmt(formatter),
             Self::InvalidEffectiveInterval => {
                 formatter.write_str("effective interval end must be later than its start")
             }
