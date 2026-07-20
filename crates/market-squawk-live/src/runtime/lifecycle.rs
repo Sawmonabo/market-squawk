@@ -17,6 +17,7 @@ use super::admission::{
 };
 use super::{LiveRouteConfig, LiveRuntimeConfig, LiveRuntimeConfigError, system_timestamp};
 use crate::authority::{RuntimeLeaseOwner, ShardLeaseOwner};
+use crate::cross_venue::create_cross_venue_plane;
 use crate::snapshot::{SnapshotPlaneBundle, create_snapshot_plane};
 use crate::{
     LiveSnapshotReader, ShardId, ShardLifecycleSnapshot, ShardRouter, ShardSnapshot,
@@ -39,6 +40,7 @@ pub struct LiveRuntime {
     health: mpsc::Receiver<LiveRuntimeHealthEvent>,
     cancellation: CancellationToken,
     actors: Option<JoinSet<ActorCompletion>>,
+    cross_venue_task: Option<tokio::task::JoinHandle<()>>,
     task_shards: HashMap<Id, ShardId>,
 }
 
@@ -54,6 +56,12 @@ impl LiveRuntime {
         let mut runtime_owner = RuntimeLeaseOwner::new(incarnation.get());
         let runtime = runtime_owner.lease();
         let cancellation = CancellationToken::new();
+        let (cross_venue, cross_venue_worker) = create_cross_venue_plane(
+            &routes,
+            config.feature_capacity(),
+            cancellation.child_token(),
+        )
+        .map_err(|_| LiveRuntimeStartError::CrossVenueInitialization)?;
         let router = ShardRouter::v1(config.shard_count().get())?;
         let shard_count = usize::from(config.shard_count().get());
         let mut partitions = (0..shard_count)
@@ -174,6 +182,8 @@ impl LiveRuntime {
                 routes: shard_routes,
                 maximum_sources_per_route: config.maximum_sources_per_route().get(),
                 maximum_streams_per_route: config.maximum_streams_per_route().get(),
+                feature_capacity: config.feature_capacity(),
+                cross_venue: cross_venue.clone(),
                 maximum_book_items_per_message:
                     crate::provider_book::maximum_book_items_for_message(
                         config.maximum_message_bytes().get(),
@@ -218,15 +228,29 @@ impl LiveRuntime {
                 .await;
             return Err(LiveRuntimeStartError::ActorExitedAfterReady);
         }
+        let mut cross_venue_task = cross_venue_worker.map(|worker| tokio::spawn(worker.run()));
         for (_shard, release) in startup_releases {
             if release.send(()).is_err() {
+                if let Some(task) = cross_venue_task.as_mut() {
+                    task.abort();
+                    let _ = task.await;
+                }
                 cleanup_failed_startup(&mut runtime_owner, &cancellation, &mut actors, &snapshots)
                     .await;
                 return Err(LiveRuntimeStartError::ActorExitedAfterReady);
             }
         }
         tokio::task::yield_now().await;
-        if runtime.validate().is_err() || actors.try_join_next().is_some() {
+        if runtime.validate().is_err()
+            || actors.try_join_next().is_some()
+            || cross_venue_task
+                .as_ref()
+                .is_some_and(tokio::task::JoinHandle::is_finished)
+        {
+            if let Some(task) = cross_venue_task.as_mut() {
+                task.abort();
+                let _ = task.await;
+            }
             cleanup_failed_startup(&mut runtime_owner, &cancellation, &mut actors, &snapshots)
                 .await;
             return Err(LiveRuntimeStartError::ActorExitedAfterReady);
@@ -246,6 +270,7 @@ impl LiveRuntime {
             health,
             cancellation,
             actors: Some(actors),
+            cross_venue_task,
             task_shards,
         })
     }
@@ -317,19 +342,37 @@ impl LiveRuntime {
         }
         self.cancellation.cancel();
         let mut actors = self.actors.take().unwrap_or_default();
+        let mut cross_venue_task = self.cross_venue_task.take();
         let deadline = self.config.shutdown_deadline();
         let mut outcomes = HashMap::new();
+        let mut cross_venue_join_error = false;
         let joined = tokio::time::timeout(deadline, async {
             while let Some(result) = actors.join_next_with_id().await {
                 record_join_result(result, &self.task_shards, &mut outcomes);
+            }
+            if let Some(task) = cross_venue_task.as_mut()
+                && (&mut *task).await.is_err()
+            {
+                cross_venue_join_error = true;
             }
         })
         .await;
         let deadline_elapsed = joined.is_err();
         if deadline_elapsed {
             actors.abort_all();
+            if let Some(task) = cross_venue_task.as_mut() {
+                task.abort();
+            }
             while let Some(result) = actors.join_next_with_id().await {
                 record_deadline_result(result, &self.task_shards, &mut outcomes);
+            }
+            if let Some(task) = cross_venue_task.as_mut() {
+                let _ = (&mut *task).await;
+            }
+        }
+        if cross_venue_join_error {
+            for shard in self.task_shards.values().copied() {
+                outcomes.insert(shard, ShardShutdownStatus::ActorError);
             }
         }
         for shard in self.task_shards.values().copied() {
@@ -362,6 +405,9 @@ impl Drop for LiveRuntime {
         self.snapshots.plane.close();
         if let Some(actors) = self.actors.as_mut() {
             actors.abort_all();
+        }
+        if let Some(task) = self.cross_venue_task.as_mut() {
+            task.abort();
         }
     }
 }
@@ -556,6 +602,8 @@ pub enum LiveRuntimeStartError {
     RoutePartitionInvariant,
     #[error("snapshot publication plane did not match configured shards")]
     SnapshotPlaneInvariant,
+    #[error("bounded cross-venue plane could not initialize")]
+    CrossVenueInitialization,
     #[error("actor task identity collision")]
     TaskIdentityCollision,
     #[error("shard {shard} exited before startup readiness")]

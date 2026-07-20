@@ -8,12 +8,13 @@ use market_squawk_domain::{
 use rust_decimal::Decimal;
 
 use super::{
-    ACTOR_FIXED_BYTES, CHANNEL_COMMAND_SLOT_BYTES, CONTROL_SLOT_BYTES, HEALTH_EVENT_BYTES,
-    NONCE_SLOT_BYTES, ROUTE_FIXED_BYTES, SNAPSHOT_NOTIFICATION_BYTES,
-    SNAPSHOT_ROUTE_SORT_SCRATCH_BYTES, SNAPSHOT_STATUS_SORT_SCRATCH_BYTES,
-    SNAPSHOT_STREAM_SORT_SCRATCH_BYTES, SOURCE_ADMISSION_BYTES, add,
-    all_shard_book_processing_bytes, book_processing_peak, estimate_peak_bytes, multiply,
-    persistent_stream_bytes, snapshot_publication_reader_peak,
+    ACTOR_FIXED_BYTES, CHANNEL_COMMAND_SLOT_BYTES, CONTROL_SLOT_BYTES,
+    CROSS_VENUE_COMMAND_SLOT_BYTES, CROSS_VENUE_INSTRUMENT_SLOT_BYTES,
+    CROSS_VENUE_VENUE_SLOT_BYTES, FEATURE_SET_SLOT_BYTES, HEALTH_EVENT_BYTES, NONCE_SLOT_BYTES,
+    ROUTE_FIXED_BYTES, SNAPSHOT_NOTIFICATION_BYTES, SNAPSHOT_ROUTE_SORT_SCRATCH_BYTES,
+    SNAPSHOT_STATUS_SORT_SCRATCH_BYTES, SNAPSHOT_STREAM_SORT_SCRATCH_BYTES, SOURCE_ADMISSION_BYTES,
+    add, all_shard_book_processing_bytes, book_processing_peak, estimate_peak_bytes, multiply,
+    persistent_stream_bytes, route_feature_owner_bytes, snapshot_publication_reader_peak,
 };
 use crate::runtime::{
     LiveRouteConfig, LiveRouteConfigInput, LiveRuntimeConfig, LiveRuntimeConfigError,
@@ -72,6 +73,15 @@ fn input() -> TestResult<LiveRuntimeConfigInput> {
         maximum_routes_per_shard: 8,
         maximum_sources_per_route: 2,
         maximum_streams_per_route: 2,
+        maximum_feature_window_observations_per_route: 8,
+        maximum_feature_window_bytes_per_route: 1_048_576,
+        maximum_feature_sets_per_route: 2,
+        cross_venue_command_count: 4,
+        cross_venue_command_bytes: 65_536,
+        maximum_cross_venue_instruments: 2,
+        maximum_venues_per_cross_venue_instrument: 2,
+        maximum_feature_snapshot_bytes: 4_096,
+        maximum_action_hook_bytes_per_route: 4_096,
         registration_control_capacity: 2,
         registration_deadline: Duration::from_secs(1),
         health_event_capacity: 4,
@@ -120,6 +130,9 @@ fn route_state_nonce_source_stream_and_dual_book_terms_have_exact_deltas() -> Te
         + 8 * NONCE_SLOT_BYTES
         + 2 * SOURCE_ADMISSION_BYTES
         + 2 * persistent_stream_bytes(4)?
+        + route_feature_owner_bytes(&config)?
+        + snapshot_publication_reader_peak(4_096, 2, 2)?.publication_count
+            * u64::from(config.maximum_feature_snapshot_bytes().get())
         + SNAPSHOT_ROUTE_SORT_SCRATCH_BYTES
         + processing_delta;
     assert_eq!(with_second - base, expected_route);
@@ -222,10 +235,71 @@ fn one_more_shard_charges_mailbox_candidate_control_snapshot_and_actor() -> Test
         + processing.shard_scratch_bytes
         + 2 * CONTROL_SLOT_BYTES
         + (expanded_snapshot.additional_bytes - base_snapshot.additional_bytes)
+        + (expanded_snapshot.publication_count - base_snapshot.publication_count)
+            * u64::from(configured_feature_snapshot_bytes()?)
         + 2 * (SNAPSHOT_STREAM_SORT_SCRATCH_BYTES + SNAPSHOT_STATUS_SORT_SCRATCH_BYTES)
         + ACTOR_FIXED_BYTES
         + SNAPSHOT_NOTIFICATION_BYTES;
     assert_eq!(three_shards - base, expected_delta);
+    Ok(())
+}
+
+fn configured_feature_snapshot_bytes() -> TestResult<u32> {
+    Ok(LiveRuntimeConfig::try_new(input()?)?
+        .maximum_feature_snapshot_bytes()
+        .get())
+}
+
+#[test]
+fn feature_owner_terms_have_exact_incremental_charges() -> TestResult {
+    let routes = [route(INSTRUMENT_ONE, 4, 8)?];
+    let base_input = input()?;
+    let base = estimate(base_input.clone(), &routes)?;
+
+    let mut window_byte = base_input.clone();
+    window_byte.maximum_feature_window_bytes_per_route += 1;
+    assert_eq!(estimate(window_byte, &routes)? - base, 1);
+
+    let mut feature_set = base_input.clone();
+    feature_set.maximum_feature_sets_per_route += 1;
+    assert_eq!(
+        estimate(feature_set, &routes)? - base,
+        FEATURE_SET_SLOT_BYTES
+    );
+
+    let mut hook_byte = base_input.clone();
+    hook_byte.maximum_action_hook_bytes_per_route += 1;
+    assert_eq!(estimate(hook_byte, &routes)? - base, 1);
+
+    let mut command_count = base_input.clone();
+    command_count.cross_venue_command_count += 1;
+    assert_eq!(
+        estimate(command_count, &routes)? - base,
+        CROSS_VENUE_COMMAND_SLOT_BYTES
+    );
+
+    let mut command_byte = base_input.clone();
+    command_byte.cross_venue_command_bytes += 1;
+    assert_eq!(estimate(command_byte, &routes)? - base, 1);
+
+    let mut instrument = base_input.clone();
+    instrument.maximum_cross_venue_instruments += 1;
+    assert_eq!(
+        estimate(instrument, &routes)? - base,
+        CROSS_VENUE_INSTRUMENT_SLOT_BYTES + 2 * CROSS_VENUE_VENUE_SLOT_BYTES
+    );
+
+    let mut venue = base_input.clone();
+    venue.maximum_venues_per_cross_venue_instrument += 1;
+    assert_eq!(
+        estimate(venue, &routes)? - base,
+        2 * CROSS_VENUE_VENUE_SLOT_BYTES
+    );
+
+    let publication_count = snapshot_publication_reader_peak(4_096, 2, 2)?.publication_count;
+    let mut snapshot_byte = base_input;
+    snapshot_byte.maximum_feature_snapshot_bytes += 1;
+    assert_eq!(estimate(snapshot_byte, &routes)? - base, publication_count);
     Ok(())
 }
 
@@ -309,13 +383,15 @@ fn former_wire_multiplier_ceiling_rejects_the_structural_delta_peak() -> TestRes
 #[test]
 fn structural_processing_peak_accepts_exact_ceiling_and_rejects_one_byte_under() -> TestResult {
     let routes = [route(INSTRUMENT_ONE, 10_000, 8)?];
-    let estimated = estimate(input()?, &routes)?;
+    let mut feature_complete = input()?;
+    feature_complete.maximum_feature_window_bytes_per_route = 2 * 1_048_576;
+    let estimated = estimate(feature_complete.clone(), &routes)?;
 
-    let mut exact = input()?;
+    let mut exact = feature_complete.clone();
     exact.maximum_runtime_bytes = estimated;
     assert_eq!(estimate(exact, &routes)?, estimated);
 
-    let mut below = input()?;
+    let mut below = feature_complete;
     below.maximum_runtime_bytes = estimated - 1;
     let below = LiveRuntimeConfig::try_new(below)?;
     assert!(matches!(
@@ -340,6 +416,7 @@ fn snapshot_reader_and_health_terms_are_bounded_at_the_documented_scope() -> Tes
     assert_eq!(
         estimate(one_more_reader, &routes)? - base,
         expanded_snapshot.additional_bytes - base_snapshot.additional_bytes
+            + u64::from(configured_feature_snapshot_bytes()?)
     );
 
     let mut one_more_snapshot_byte = input()?;

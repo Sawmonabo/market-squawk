@@ -289,6 +289,11 @@ async fn actor_exit_invalidates_shared_runtime_before_completion_is_observed() -
     let (health, _health_receiver) = mpsc::channel(4);
     let (ready, ready_receiver) = oneshot::channel();
     let (startup_release, startup_wait) = oneshot::channel();
+    let (cross_venue, _worker) = crate::cross_venue::create_cross_venue_plane(
+        &[],
+        config.feature_capacity(),
+        CancellationToken::new(),
+    )?;
     let input = ShardActorInput {
         shard: ShardId::new(0, 1)?,
         routing_version: ShardRoutingVersion::V1,
@@ -298,6 +303,8 @@ async fn actor_exit_invalidates_shared_runtime_before_completion_is_observed() -
         routes: Vec::new(),
         maximum_sources_per_route: 1,
         maximum_streams_per_route: 1,
+        feature_capacity: config.feature_capacity(),
+        cross_venue,
         maximum_book_items_per_message: crate::provider_book::maximum_book_items_for_message(
             config.maximum_message_bytes().get(),
         ),

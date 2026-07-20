@@ -5,6 +5,8 @@ use std::num::NonZeroU128;
 use market_squawk_domain::{BasisPoints, PriceTicks, QuantityLots, Timestamp};
 use thiserror::Error;
 
+use crate::{FeatureOutputType, HalfTickPrice};
+
 /// Availability state attached to one feature observation.
 ///
 /// Only [`Self::Ready`] may carry a value. Every other state deliberately removes any previously
@@ -125,6 +127,8 @@ impl StatisticalF64 {
 pub enum FeatureScalar {
     /// An exact number of instrument price ticks.
     PriceTicks(PriceTicks),
+    /// An exact price represented in half-tick units.
+    HalfTickPrice(HalfTickPrice),
     /// An exact number of instrument quantity lots.
     QuantityLots(QuantityLots),
     /// An exact signed number of basis points.
@@ -137,6 +141,23 @@ pub enum FeatureScalar {
     ExactRatio(ExactFeatureRatio),
     /// A finite statistical result that is not an executable price.
     Statistical(StatisticalF64),
+}
+
+impl FeatureScalar {
+    /// Returns the sole metadata output type compatible with this closed scalar variant.
+    #[must_use]
+    pub const fn output_type(self) -> FeatureOutputType {
+        match self {
+            Self::PriceTicks(_) => FeatureOutputType::PriceTicks,
+            Self::HalfTickPrice(_) => FeatureOutputType::HalfTickPrice,
+            Self::QuantityLots(_) => FeatureOutputType::QuantityLots,
+            Self::BasisPoints(_) => FeatureOutputType::BasisPoints,
+            Self::SignedInteger(_) => FeatureOutputType::SignedInteger,
+            Self::UnsignedInteger(_) => FeatureOutputType::UnsignedInteger,
+            Self::ExactRatio(_) => FeatureOutputType::ExactRatio,
+            Self::Statistical(_) => FeatureOutputType::StatisticalF64,
+        }
+    }
 }
 
 /// One timestamped feature result with stale-value exclusion.

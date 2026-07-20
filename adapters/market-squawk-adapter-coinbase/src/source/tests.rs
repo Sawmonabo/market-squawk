@@ -16,7 +16,10 @@ use market_squawk_sources::{
     RawMarketSink, SessionId, SinkError, SourceError,
 };
 use tokio::net::{TcpListener, TcpStream};
-use tokio_tungstenite::{accept_async, client_async, tungstenite::Message};
+use tokio_tungstenite::{
+    accept_async, client_async,
+    tungstenite::{Error as WebSocketError, Message},
+};
 use tokio_util::sync::CancellationToken;
 
 use super::CoinbaseExchangeSource;
@@ -26,6 +29,8 @@ use crate::{
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
+
+static SOURCE_BUDGET_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Debug, Default)]
 struct RecordingSink {
@@ -41,6 +46,7 @@ impl RawMarketSink for RecordingSink {
 
 #[tokio::test]
 async fn one_generation_subscribes_captures_controls_and_returns_typed_close() -> TestResult {
+    let _budget_guard = SOURCE_BUDGET_TEST_LOCK.lock().await;
     let config = config()?;
     let (mut registry, session) = session(&config, "source-local-1")?;
     let mut frames = registry.take_raw_frame_factory(&session)?;
@@ -115,11 +121,39 @@ async fn one_generation_subscribes_captures_controls_and_returns_typed_close() -
         decoder.decode(&session.validate_live_frame(&sink.frames[1])?)?,
         DecodeOutcome::Data(_)
     ));
+
+    let refusal = WebSocketError::Http(
+        tokio_tungstenite::tungstenite::http::Response::builder()
+            .status(429)
+            .header(
+                tokio_tungstenite::tungstenite::http::header::RETRY_AFTER,
+                "0",
+            )
+            .body(None)?,
+    );
+    let deadline = match super::map_connect_error(refusal, &source.budget) {
+        SourceError::BudgetWaitUntil { deadline } => deadline,
+        error => return Err(format!("429 mapped to {error:?} instead of a budget wait").into()),
+    };
+    let remaining = source
+        .budget
+        .remaining_wait(deadline)
+        .map_err(|reason| format!("Coinbase budget wait failed: {reason:?}"))?;
+    tokio::time::sleep(remaining).await;
+    let market_squawk_sources::BudgetDecision::Ready(permit) = source.budget.try_acquire() else {
+        return Err("Coinbase budget remained unavailable after its exact deadline".into());
+    };
+    permit.release();
+    source
+        .budget
+        .record_success()
+        .map_err(|reason| format!("Coinbase budget reset failed: {reason:?}"))?;
     Ok(())
 }
 
 #[tokio::test]
 async fn cancellation_preempts_read_and_source_refuses_same_generation_restart() -> TestResult {
+    let _budget_guard = SOURCE_BUDGET_TEST_LOCK.lock().await;
     let config = config()?;
     let (mut registry, session) = session(&config, "source-local-2")?;
     let mut frames = registry.take_raw_frame_factory(&session)?;

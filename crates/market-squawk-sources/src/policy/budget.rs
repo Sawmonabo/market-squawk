@@ -2,6 +2,8 @@
 mod budget_identity;
 #[path = "budget/runtime_types.rs"]
 mod budget_runtime_types;
+#[path = "budget/retry_after.rs"]
+mod budget_retry_after;
 #[path = "budget/runtime.rs"]
 mod budget_runtime;
 #[path = "budget/checkpoint.rs"]
@@ -18,6 +20,7 @@ pub(crate) use budget_identity::{
 };
 pub(in crate::policy) use budget_identity::BudgetCollisionMergeError;
 pub use budget_runtime::SharedProviderBudget;
+pub use budget_retry_after::apply_http_retry_after;
 pub(in crate::policy) use budget_runtime::RuntimeOperationAdmission;
 pub use budget_runtime_types::{
     BudgetDecision, BudgetUnavailableReason, MonotonicInstant, RetryAfter,

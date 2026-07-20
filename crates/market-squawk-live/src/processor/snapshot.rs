@@ -5,7 +5,7 @@ use market_squawk_sources::CurrentStreamKey;
 
 use super::status::StatusBook;
 use super::{LiveApplyError, StreamState};
-use crate::snapshot::SnapshotBuildError;
+use crate::snapshot::{LiveFeatureSnapshot, SnapshotBuildError};
 use crate::{
     BookLevelSnapshot, GenerationPhase, RouteSnapshot, SnapshotDimension, StatusSnapshot,
     StreamPhaseSnapshot, StreamSnapshot,
@@ -79,13 +79,18 @@ pub(crate) type StreamSnapshotSeed = StreamSnapshot;
 pub(crate) type StatusSnapshotSeed = StatusSnapshot;
 
 impl ProcessorSnapshotSeed {
-    pub(crate) fn into_route(self, route: crate::ShardKey) -> RouteSnapshot {
+    pub(crate) fn into_route(
+        self,
+        route: crate::ShardKey,
+        features: LiveFeatureSnapshot,
+    ) -> RouteSnapshot {
         RouteSnapshot {
             route,
             streams: self.streams,
             statuses: self.statuses,
             stream_dimension: self.stream_dimension,
             status_dimension: self.status_dimension,
+            features,
         }
     }
 }

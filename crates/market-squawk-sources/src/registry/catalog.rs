@@ -34,6 +34,129 @@ impl Drop for AuthoritativeSourceRegistry {
 }
 
 impl AuthoritativeSourceRegistry {
+    /// Registers new metadata or resumes the exact latest revision after a clean restart.
+    ///
+    /// Resume is deliberately narrower than ordinary registration: the source must not already be
+    /// registered in this process, the proposed revision must be the latest durable revision, and
+    /// its complete revision-bound payload evidence must equal the persisted evidence. A legacy
+    /// state without that evidence cannot resume. A genuinely unused revision follows the strict
+    /// registration transaction and consumes one revision-history slot.
+    ///
+    /// # Errors
+    ///
+    /// Rejects active duplicates, stale or changed revision evidence, explicit revocation, an
+    /// ineffective declaration, unclean durability, exhausted epochs/history, and any persistence
+    /// or shared-budget coordination failure without publishing a partial registry entry.
+    pub fn register_or_resume_exact(
+        &mut self,
+        metadata: SourceMetadata,
+        at: Timestamp,
+    ) -> Result<RegisteredSource, RegistryError> {
+        if self.entries.contains_key(metadata.source_id()) {
+            return Err(RegistryError::SourceAlreadyRegistered);
+        }
+        let Some(history) = self.history.get(metadata.source_id()) else {
+            return self.register(metadata, at);
+        };
+        if history.revoked {
+            return Err(RegistryError::SourceRevoked);
+        }
+        if !history.used_revisions.contains(metadata.revision()) {
+            return self.register(metadata, at);
+        }
+        self.resume_exact(metadata, at)
+    }
+
+    fn resume_exact(
+        &mut self,
+        metadata: SourceMetadata,
+        at: Timestamp,
+    ) -> Result<RegisteredSource, RegistryError> {
+        if matches!(
+            &self.composition,
+            AuthorityComposition::Durable(durability) if durability.recovered_unclean()
+        ) {
+            return Err(RegistryError::UncleanAuthorityPredecessor);
+        }
+        let _trusted_operation_time = self.clock.observe()?;
+        if !metadata.is_effective_at(at) {
+            return Err(RegistryError::MetadataNotEffective);
+        }
+        let history = self
+            .history
+            .get(metadata.source_id())
+            .ok_or(RegistryError::UnknownSource)?;
+        let latest = history
+            .latest_revision_evidence
+            .as_ref()
+            .ok_or(RegistryError::RevisionEvidenceUnavailable)?;
+        if latest.metadata_revision() != metadata.revision() {
+            return Err(RegistryError::RevisionNotLatest);
+        }
+        if latest != metadata.revision_evidence() {
+            return Err(RegistryError::RevisionEvidenceMismatch);
+        }
+        let epoch = history
+            .last_epoch
+            .checked_add(1)
+            .ok_or(RegistryError::EpochExhausted)?;
+        let generation_high_water = history.generation_high_water;
+        let used_revisions = history.used_revisions.clone();
+        let resolved_budget = resolve_provider_budget_policy(
+            &metadata,
+            self.authorization_subject_resolver.as_ref(),
+        )?;
+        let mut candidate_history = self.history.clone();
+        candidate_history
+            .get_mut(metadata.source_id())
+            .ok_or(RegistryError::InvalidAuthorityState)?
+            .last_epoch = epoch;
+        let policies = resolved_budget.as_ref().map_or_else(
+            || self.budgets.policies(),
+            |policy| self.budgets.policies_with(policy.persisted()),
+        );
+        let candidate_state = authority_state_from_history(&candidate_history, policies)?;
+        let budget = match resolved_budget {
+            Some(policy) => Some(match &self.composition {
+                AuthorityComposition::Durable(_) => self
+                    .budgets
+                    .register_durable(policy, &candidate_state)
+                    .map_err(map_budget_pool_error)?,
+                AuthorityComposition::EphemeralDiagnostic => self
+                    .budgets
+                    .register(policy)
+                    .map_err(map_budget_pool_error)?,
+            }),
+            None => {
+                self.persist_registry_candidate(candidate_state)?;
+                None
+            }
+        };
+        let source_id = metadata.source_id().clone();
+        let revision = metadata.revision().clone();
+        self.history = candidate_history;
+        self.entries.insert(
+            source_id.clone(),
+            RegistryEntry {
+                metadata,
+                epoch,
+                revoked: false,
+                active: None,
+                health_authority: None,
+                universe_attestation: None,
+                generation_high_water,
+                used_revisions,
+            },
+        );
+        Ok(RegisteredSource {
+            registry_id: self.instance_id,
+            source_id,
+            revision,
+            epoch,
+            budget,
+        })
+    }
+
     /// Registers effective, checked source metadata and returns an opaque handle.
     ///
     /// # Errors
@@ -45,6 +168,13 @@ impl AuthoritativeSourceRegistry {
         metadata: SourceMetadata,
         at: Timestamp,
     ) -> Result<RegisteredSource, RegistryError> {
+        if self
+            .history
+            .get(metadata.source_id())
+            .is_some_and(|history| history.revoked)
+        {
+            return Err(RegistryError::SourceRevoked);
+        }
         if matches!(
             &self.composition,
             AuthorityComposition::Durable(durability) if durability.recovered_unclean()
@@ -90,6 +220,8 @@ impl AuthoritativeSourceRegistry {
             source_id.clone(),
             SourceAuthorityHistory {
                 used_revisions: used_revisions.clone(),
+                latest_revision_evidence: Some(metadata.revision_evidence().clone()),
+                revoked: false,
                 last_epoch: epoch,
                 generation_high_water,
             },
@@ -182,6 +314,7 @@ impl AuthoritativeSourceRegistry {
             .get_mut(&registered.source_id)
             .ok_or(RegistryError::InvalidAuthorityState)?;
         history.used_revisions.push(revision.clone());
+        history.latest_revision_evidence = Some(metadata.revision_evidence().clone());
         history.last_epoch = epoch;
         let policies = resolved_budget.as_ref().map_or_else(
             || self.budgets.policies(),
@@ -377,6 +510,33 @@ impl AuthoritativeSourceRegistry {
         })
     }
 
+    /// Starts the next durable connection generation without exposing a caller-owned counter.
+    ///
+    /// The registry derives generation one for a never-started source or atomically advances the
+    /// persisted high-water, then delegates to the ordinary begin-session transaction. A failed
+    /// persistence step publishes neither the new high-water nor current session authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError::ConnectionGenerationExhausted`] at `u64::MAX`; otherwise returns
+    /// the same validation and persistence failures as [`Self::begin_session`].
+    pub fn begin_next_session(
+        &mut self,
+        registered: &RegisteredSource,
+        session_id: SessionId,
+        at: Timestamp,
+    ) -> Result<CurrentSourceSession, RegistryError> {
+        let entry = self.validate_registered_structure(registered)?;
+        let generation = match entry.generation_high_water {
+            Some(previous) => previous
+                .checked_next()
+                .map_err(|_error| RegistryError::ConnectionGenerationExhausted)?,
+            None => ConnectionGeneration::new(1)
+                .map_err(|_error| RegistryError::ConnectionGenerationExhausted)?,
+        };
+        self.begin_session(registered, session_id, generation, at)
+    }
+
     /// Moves the sole admission issuer and a cloneable degrade-only capability to capture wiring.
     ///
     /// # Errors
@@ -517,10 +677,12 @@ impl AuthoritativeSourceRegistry {
             .ok_or(RegistryError::InvalidAuthorityState)?;
         let revoked_epoch = entry.epoch.checked_add(1).unwrap_or(entry.epoch);
         let mut candidate_history = self.history.clone();
-        candidate_history
+        let history = candidate_history
             .get_mut(&registered.source_id)
-            .ok_or(RegistryError::InvalidAuthorityState)?
-            .last_epoch = revoked_epoch;
+            .ok_or(RegistryError::InvalidAuthorityState)?;
+        history.last_epoch = revoked_epoch;
+        history.latest_revision_evidence = None;
+        history.revoked = true;
         let candidate_state =
             authority_state_from_history(&candidate_history, self.budgets.policies())?;
         let persistence = self.persist_registry_candidate(candidate_state);
@@ -595,6 +757,8 @@ fn authority_state_from_history(
             source_id: source_id.clone(),
             used_revisions: BoundedVec::try_new(source_history.used_revisions.clone())
                 .map_err(|_| RegistryError::RevisionHistoryExhausted)?,
+            latest_revision_evidence: source_history.latest_revision_evidence.clone(),
+            revoked: source_history.revoked,
             last_epoch: source_history.last_epoch,
             generation_high_water: source_history.generation_high_water,
         });
@@ -662,6 +826,8 @@ fn history_from_state(
                 source.source_id.clone(),
                 SourceAuthorityHistory {
                     used_revisions: source.used_revisions.as_slice().to_vec(),
+                    latest_revision_evidence: source.latest_revision_evidence.clone(),
+                    revoked: source.revoked,
                     last_epoch: source.last_epoch,
                     generation_high_water: source.generation_high_water,
                 },

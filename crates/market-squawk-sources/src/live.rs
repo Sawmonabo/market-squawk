@@ -499,6 +499,18 @@ pub enum SourceError {
     /// Provider refused or throttled access; supervision must apply budget policy.
     #[error("provider access is temporarily unavailable")]
     ProviderUnavailable,
+    /// The shared provider budget supplied an exact inclusive retry deadline.
+    #[error("provider access is cooling down until the shared budget deadline")]
+    BudgetWaitUntil {
+        /// Process-local monotonic deadline understood only by the issuing shared budget.
+        deadline: crate::MonotonicInstant,
+    },
+    /// The shared provider budget rejected further access with an exact terminal reason.
+    #[error("provider budget is unavailable: {reason:?}")]
+    BudgetUnavailable {
+        /// Exact fail-closed reason returned by the shared provider budget.
+        reason: crate::BudgetUnavailableReason,
+    },
     /// Per-generation frame ordinal exhausted; the session fails closed.
     #[error("source frame identity space exhausted")]
     FrameIdentityExhausted,
@@ -511,6 +523,23 @@ pub enum SourceError {
     /// The registry-wide paired wall/monotonic continuity latch is permanently terminal.
     #[error("source-owned trusted receipt time is discontinuous")]
     TrustedTimeDiscontinuity,
+}
+
+impl SourceError {
+    /// Maps an already-applied shared-budget refusal to a live-source outcome.
+    ///
+    /// [`crate::BudgetDecision::Ready`] is impossible for a correctly applied refusal and maps to
+    /// [`Self::InvalidProtocolState`] rather than allowing the source to continue.
+    pub fn from_applied_budget_refusal(decision: crate::BudgetDecision) -> Self {
+        match decision {
+            crate::BudgetDecision::WaitUntil(deadline) => Self::BudgetWaitUntil { deadline },
+            crate::BudgetDecision::Unavailable(reason) => Self::BudgetUnavailable { reason },
+            crate::BudgetDecision::Ready(permit) => {
+                drop(permit);
+                Self::InvalidProtocolState
+            }
+        }
+    }
 }
 
 #[cfg(test)]

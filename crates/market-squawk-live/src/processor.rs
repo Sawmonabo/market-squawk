@@ -47,7 +47,7 @@ use crate::authority::{
     AppliedObservationAuthority, AuthorityGate, ClockReading, RuntimeLease, ShardLease,
     SystemTrustedClock, TrustedClock,
 };
-use crate::provider_book::BookProcessingScratch;
+use crate::provider_book::{BookProcessingScratch, ProviderBook};
 use crate::qualification::build_qualified_event;
 use crate::{AuthorityError, ConsumedLiveAuthority, DepthLimit, LiveExecutionCapability};
 
@@ -96,6 +96,8 @@ pub(crate) struct CurrentBatchCursor {
 /// Canonical event, audit assessment, and optional current-state authority seed.
 #[derive(Debug)]
 pub(crate) struct AppliedLiveObservation {
+    pub(crate) stream: CurrentStreamKey,
+    pub(crate) generation: ConnectionGeneration,
     pub(crate) event: MarketEvent,
     pub(crate) assessment: QualificationAssessment,
     pub(crate) authority: Option<AppliedObservationAuthority>,
@@ -315,7 +317,7 @@ impl<C: TrustedClock> InstrumentLiveProcessor<C> {
                 return Err(error);
             }
         };
-        self.streams.insert(key, state);
+        self.streams.insert(key.clone(), state);
         let status = self.statuses.commit(staged_status);
 
         let authority = if qualified.assessment.recorded_quality() == DataQuality::DirectVerified
@@ -343,10 +345,22 @@ impl<C: TrustedClock> InstrumentLiveProcessor<C> {
             None
         };
         Ok(Some(AppliedLiveObservation {
+            stream: key,
+            generation: cursor.admission.source().binding().connection_generation(),
             event: qualified.event,
             assessment: qualified.assessment,
             authority,
         }))
+    }
+
+    pub(crate) fn committed_book(
+        &self,
+        stream: &CurrentStreamKey,
+    ) -> Result<&ProviderBook, LiveApplyError> {
+        self.streams
+            .get(stream)
+            .map(StreamState::book)
+            .ok_or(LiveApplyError::StreamStateMissing)
     }
 
     /// Revalidates exact applied authority before feature and strategy evaluation.

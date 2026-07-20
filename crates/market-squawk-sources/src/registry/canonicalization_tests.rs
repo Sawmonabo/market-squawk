@@ -2,7 +2,8 @@ use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 
 use market_squawk_domain::{
     AuthorizationBasis, DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence,
-    MetadataRevision, SchemaVersion, SourceId, SourceIdentifier, Timestamp,
+    MetadataRevision, RevisionBoundPayloadEvidence, SchemaVersion, SourceId, SourceIdentifier,
+    Timestamp,
 };
 
 use super::{
@@ -19,6 +20,16 @@ fn revision(value: &str) -> TestResult<MetadataRevision> {
     Ok(MetadataRevision::new(SourceIdentifier::try_from(value)?))
 }
 
+fn revision_evidence(value: &str, byte: u8) -> TestResult<RevisionBoundPayloadEvidence> {
+    Ok(RevisionBoundPayloadEvidence::new(
+        revision(value)?,
+        ExactPayloadEvidence::from_content_digest(EvidenceDigest::new(
+            DigestAlgorithm::Sha256,
+            [byte; 32],
+        )),
+    ))
+}
+
 fn source(index: u8) -> TestResult<PersistedSourceAuthority> {
     let mut revisions = Vec::new();
     revisions.try_reserve(6)?;
@@ -30,6 +41,8 @@ fn source(index: u8) -> TestResult<PersistedSourceAuthority> {
     Ok(PersistedSourceAuthority {
         source_id: SourceId::try_from(format!("source-{index:02}"))?,
         used_revisions: BoundedVec::try_new(revisions)?,
+        latest_revision_evidence: None,
+        revoked: false,
         last_epoch: u64::from(index),
         generation_high_water: None,
     })
@@ -89,7 +102,8 @@ fn deterministic_shuffle<T>(values: &mut [T], seed: &mut u64) -> TestResult {
 }
 
 #[test]
-fn canonicalization_rebuilds_reversed_nested_revision_wire_order() -> TestResult {
+fn canonicalization_preserves_semantic_revision_order_and_rejects_a_false_latest_revision()
+-> TestResult {
     let state = RegistryAuthorityState::try_new(
         vec![PersistedSourceAuthority {
             source_id: SourceId::try_from("source-a")?,
@@ -97,6 +111,8 @@ fn canonicalization_rebuilds_reversed_nested_revision_wire_order() -> TestResult
                 revision("revision-z")?,
                 revision("revision-a")?,
             ])?,
+            latest_revision_evidence: Some(revision_evidence("revision-a", 7)?),
+            revoked: false,
             last_epoch: 2,
             generation_high_water: None,
         }],
@@ -108,7 +124,7 @@ fn canonicalization_rebuilds_reversed_nested_revision_wire_order() -> TestResult
     decoded.canonicalize()?;
 
     let canonical_wire = serde_json::to_vec(&decoded)?;
-    assert_ne!(canonical_wire, reversed_wire);
+    assert_eq!(canonical_wire, reversed_wire);
     let revisions = decoded
         .sources
         .as_slice()
@@ -119,7 +135,24 @@ fn canonicalization_rebuilds_reversed_nested_revision_wire_order() -> TestResult
         .iter()
         .map(|value| value.as_source_identifier().as_str())
         .collect::<Vec<_>>();
-    assert_eq!(revisions, ["revision-a", "revision-z"]);
+    assert_eq!(revisions, ["revision-z", "revision-a"]);
+    assert!(matches!(
+        RegistryAuthorityState::try_new(
+            vec![PersistedSourceAuthority {
+                source_id: SourceId::try_from("source-a")?,
+                used_revisions: BoundedVec::try_new(vec![
+                    revision("revision-z")?,
+                    revision("revision-a")?,
+                ])?,
+                latest_revision_evidence: Some(revision_evidence("revision-z", 8)?),
+                revoked: false,
+                last_epoch: 2,
+                generation_high_water: None,
+            }],
+            Vec::new(),
+        ),
+        Err(crate::RegistryError::InvalidAuthorityState)
+    ));
     Ok(())
 }
 
@@ -130,6 +163,8 @@ fn canonicalization_rejects_duplicate_nested_revisions() -> TestResult {
         vec![PersistedSourceAuthority {
             source_id: SourceId::try_from("source-a")?,
             used_revisions: BoundedVec::try_new(vec![duplicate.clone(), duplicate])?,
+            latest_revision_evidence: None,
+            revoked: false,
             last_epoch: 2,
             generation_high_water: None,
         }],
@@ -186,11 +221,6 @@ fn canonicalization_is_identical_across_one_hundred_twenty_registry_permutations
     for _ in 0..120 {
         let mut permuted_sources = sources.clone();
         deterministic_shuffle(&mut permuted_sources, &mut seed)?;
-        for source in &mut permuted_sources {
-            let mut revisions = source.used_revisions.as_slice().to_vec();
-            deterministic_shuffle(&mut revisions, &mut seed)?;
-            source.used_revisions = BoundedVec::try_new(revisions)?;
-        }
         let mut permuted_policies = policies.clone();
         deterministic_shuffle(&mut permuted_policies, &mut seed)?;
 

@@ -437,6 +437,13 @@ impl AuthorityDurabilitySession {
             && self.lifecycle_is_active()
     }
 
+    pub(crate) fn closed_clean(&self) -> bool {
+        !self.recovered_unclean
+            && !self.envelope.is_poisoned()
+            && !self.store.is_poisoned()
+            && self.lifecycle_is_closed()
+    }
+
     pub(crate) fn invalidate(&self) {
         if !self.fail_active_session_without_terminal_write() {
             return;

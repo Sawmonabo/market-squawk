@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use market_squawk_analytics::{FeatureValidity, RequiredLiveFeature};
 pub(crate) use market_squawk_live::{
     DepthLimit, LiveRouteConfig, LiveRouteConfigInput, ShardKey, ShardRoutingVersion,
     SnapshotLimits,
@@ -21,6 +22,7 @@ use current_source::{
 
 fn rejection_runtime_config(
     maximum_streams_per_route: usize,
+    maximum_feature_sets_per_route: usize,
     snapshot_event_trigger: usize,
 ) -> TestResult<LiveRuntimeConfig> {
     let base = runtime_config(8, 8 * 1024 * 1024, 4 * 1024 * 1024)?;
@@ -31,8 +33,24 @@ fn rejection_runtime_config(
         mailbox_bytes_per_shard: base.mailbox_bytes_per_shard().get(),
         maximum_message_bytes: base.maximum_message_bytes().get(),
         maximum_routes_per_shard: base.maximum_routes_per_shard().get(),
-        maximum_sources_per_route: base.maximum_sources_per_route().get(),
+        maximum_sources_per_route: base
+            .maximum_sources_per_route()
+            .get()
+            .min(maximum_streams_per_route),
         maximum_streams_per_route,
+        maximum_feature_window_observations_per_route: base
+            .maximum_feature_window_observations_per_route()
+            .get(),
+        maximum_feature_window_bytes_per_route: base.maximum_feature_window_bytes_per_route().get(),
+        maximum_feature_sets_per_route,
+        cross_venue_command_count: base.cross_venue_command_count().get(),
+        cross_venue_command_bytes: base.cross_venue_command_bytes().get(),
+        maximum_cross_venue_instruments: base.maximum_cross_venue_instruments().get(),
+        maximum_venues_per_cross_venue_instrument: base
+            .maximum_venues_per_cross_venue_instrument()
+            .get(),
+        maximum_feature_snapshot_bytes: base.maximum_feature_snapshot_bytes().get(),
+        maximum_action_hook_bytes_per_route: base.maximum_action_hook_bytes_per_route().get(),
         registration_control_capacity: base.registration_control_capacity().get(),
         registration_deadline: base.registration_deadline(),
         health_event_capacity: base.health_event_capacity().get(),
@@ -64,7 +82,7 @@ async fn bind(
 async fn rejected_first_observation_is_quarantined_without_killing_other_routes_or_shutdown()
 -> TestResult {
     let mut runtime = LiveRuntime::start(
-        rejection_runtime_config(4, 1)?,
+        rejection_runtime_config(4, 4, 1)?,
         vec![route_config(INSTRUMENT_ONE)?, route_config(INSTRUMENT_TWO)?],
     )
     .await?;
@@ -131,9 +149,86 @@ async fn rejected_first_observation_is_quarantined_without_killing_other_routes_
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn committed_feature_capacity_failure_is_visible_and_actor_recovers() -> TestResult {
+    let mut runtime = LiveRuntime::start(
+        rejection_runtime_config(2, 1, 1)?,
+        vec![route_config(INSTRUMENT_ONE)?],
+    )
+    .await?;
+    let mut source_a = SourceHarness::try_new("feature-a", 1, INSTRUMENT_ONE)?;
+    let mut source_b = SourceHarness::try_new("feature-b", 1, INSTRUMENT_ONE)?;
+    let ingress_a = bind(&runtime, &source_a, INSTRUMENT_ONE).await?;
+    let ingress_b = bind(&runtime, &source_b, INSTRUMENT_ONE).await?;
+
+    let (_, first) = source_a.batch("feature-a-1", 1)?;
+    ingress_a.try_publish(first)?;
+    wait_for_feature_validity(&runtime, "feature-a", FeatureValidity::WarmingUp, 1).await?;
+
+    let (_, committed_without_slot) = source_b.batch("feature-b-1", 1)?;
+    ingress_b.try_publish(committed_without_slot)?;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            while let Some(event) = runtime.try_next_health() {
+                if event.kind() == LiveRuntimeHealthKind::FeatureUnavailable {
+                    return;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    wait_for_feature_validity(&runtime, "feature-a", FeatureValidity::Overflow, 1).await?;
+
+    let (_, recovery) = source_a.batch("feature-a-2", 2)?;
+    ingress_a.try_publish(recovery)?;
+    wait_for_feature_validity(&runtime, "feature-a", FeatureValidity::WarmingUp, 2).await?;
+
+    assert!(runtime.shutdown().await.is_complete());
+    Ok(())
+}
+
+async fn wait_for_feature_validity(
+    runtime: &LiveRuntime,
+    source: &str,
+    validity: FeatureValidity,
+    sequence: u64,
+) -> TestResult {
+    let expected_route = route(INSTRUMENT_ONE)?;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let snapshots = runtime.snapshots().try_load_all()?;
+            let route = snapshots
+                .snapshots()
+                .flat_map(|snapshot| snapshot.routes())
+                .find(|route| route.route() == &expected_route);
+            if let Some(route) = route {
+                let stream_committed = route.streams().iter().any(|stream| {
+                    stream.source().as_str() == source
+                        && stream.last_sequence()
+                            == Some(market_squawk_domain::SequenceNumber::new(sequence))
+                });
+                let feature_matches = route.features().sets().iter().any(|set| {
+                    set.source().as_str() == source
+                        && set
+                            .feature(RequiredLiveFeature::RollingVwap)
+                            .is_some_and(|feature| feature.validity() == validity)
+                });
+                if stream_committed && feature_matches {
+                    return Ok::<_, Box<dyn std::error::Error>>(());
+                }
+            }
+            drop(snapshots);
+            tokio::task::yield_now().await;
+        }
+    })
+    .await??;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn snapshot_event_trigger_skips_intermediate_prefix_of_successful_batch() -> TestResult {
     let runtime = LiveRuntime::start(
-        rejection_runtime_config(4, 2)?,
+        rejection_runtime_config(4, 4, 2)?,
         vec![route_config(INSTRUMENT_ONE)?],
     )
     .await?;

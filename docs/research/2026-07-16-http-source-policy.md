@@ -51,6 +51,20 @@ therefore uses checked monotonic arithmetic and fails closed on an unrepresentab
 clock-order violation. Tests use an injected deterministic monotonic-clock interface rather than
 sleeping or accepting caller-authored timestamps as enforcement truth.
 
+## Implementation refresh: 2026-07-20
+
+Coinbase and Kraken WebSocket handshake refusals now use one sources-layer parser before mutating
+their shared provider budget. The parser accepts at most 128 ASCII bytes. Positive decimal seconds
+use checked conversion to nanoseconds; standard HTTP dates become an absolute wall-clock
+instruction that the budget converts once against its paired monotonic observation. Missing,
+invalid, zero, non-ASCII, or representation-overflowing fields use the same capped refusal policy.
+A syntactically valid instruction beyond the configured maximum remains fail-closed.
+
+The date parser is pinned exactly to `httpdate` 1.0.3. Its published API returns `SystemTime` and
+supports preferred IMF-fixdate plus the legacy HTTP date forms; its source forbids unsafe code and
+declares `MIT OR Apache-2.0`, matching this workspace's license policy. The helper exposes no HTTP
+client and cannot select alternate accounts, identities, endpoints, or proxies.
+
 ## Primary sources
 
 - [Reqwest 0.13.4 redirect module](https://docs.rs/reqwest/0.13.4/reqwest/redirect/)
@@ -61,6 +75,9 @@ sleeping or accepting caller-authored timestamps as enforcement truth.
 - [Rust 1.97 `std::time::Instant`](https://doc.rust-lang.org/1.97.0/std/time/struct.Instant.html)
 - [Tokio 1.52.3 paused-time testing](https://docs.rs/tokio/1.52.3/tokio/time/fn.pause.html)
 - [RFC 9110, HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110.html)
+- [`httpdate` 1.0.3 `parse_http_date`](https://docs.rs/httpdate/1.0.3/httpdate/fn.parse_http_date.html)
+- [`httpdate` 1.0.3 published source](https://docs.rs/crate/httpdate/1.0.3/source/)
+- [`httpdate` upstream repository](https://github.com/pyfisch/httpdate)
 
 ## Required tests for adapters
 

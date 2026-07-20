@@ -1,9 +1,12 @@
+use std::collections::HashMap;
 use std::mem::size_of;
 use std::sync::Arc;
+use std::time::Duration;
 
 use market_squawk_sources::CurrentSourceAuthorityLease;
 use market_squawk_sources::ProviderBookLevel;
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{Semaphore, mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 
 #[allow(
     dead_code,
@@ -14,8 +17,10 @@ mod current_source;
 
 use self::current_source::{INSTRUMENT_ONE, INSTRUMENT_TWO, SourceHarness, TestResult, now, route};
 use super::{
-    BoundShardIngress, COMMAND_SHARED_ALLOCATION_CHARGE, LiveIngressError, LiveRuntimeHealthEvent,
-    LiveRuntimeHealthKind, ShardCommand, checked_command_retained_bytes,
+    BoundShardIngress, COMMAND_SHARED_ALLOCATION_CHARGE, LiveIngressBindError, LiveIngressError,
+    LiveRuntimeHealthEvent, LiveRuntimeHealthKind, LiveRuntimeIngress, RegistrationCommand,
+    RegistrationFailure, RegistrationGrant, RouteIngressChannels, ShardCommand,
+    checked_command_retained_bytes,
 };
 use crate::authority::{RuntimeLeaseOwner, ShardLeaseOwner};
 use crate::processor::{GenerationAdmission, GenerationAuthorityRegistry};
@@ -31,6 +36,125 @@ struct AdmissionHarness {
     _registry: GenerationAuthorityRegistry,
     _runtime_owner: RuntimeLeaseOwner,
     _shard_owner: ShardLeaseOwner,
+}
+
+#[derive(Debug)]
+struct ReservationHarness {
+    ingress: LiveRuntimeIngress,
+    registrations: mpsc::Receiver<RegistrationCommand>,
+    _mailbox: mpsc::Receiver<ShardCommand>,
+    _health: mpsc::Receiver<LiveRuntimeHealthEvent>,
+    _runtime_owner: RuntimeLeaseOwner,
+    _shard_owner: ShardLeaseOwner,
+}
+
+fn reservation_harness(route: ShardKey) -> TestResult<ReservationHarness> {
+    let runtime_owner = RuntimeLeaseOwner::new(11);
+    let shard_owner = ShardLeaseOwner::new(12);
+    let runtime = runtime_owner.lease();
+    let shard_liveness = shard_owner.lease();
+    let (mailbox, mailbox_receiver) = mpsc::channel(1);
+    let (registration, registrations) = mpsc::channel(1);
+    let (health, health_receiver) = mpsc::channel(1);
+    let channels = RouteIngressChannels {
+        shard: ShardId::new(0, 1)?,
+        runtime: runtime.clone(),
+        shard_liveness,
+        mailbox,
+        byte_budget: Arc::new(Semaphore::new(65_536)),
+        registration: registration.clone(),
+        registration_deadline: Duration::from_secs(1),
+        maximum_message_bytes: 65_536,
+        health,
+    };
+    let mut routes = HashMap::new();
+    routes.insert(route, channels);
+    Ok(ReservationHarness {
+        ingress: LiveRuntimeIngress {
+            routes: Arc::new(routes),
+            runtime,
+        },
+        registrations,
+        _mailbox: mailbox_receiver,
+        _health: health_receiver,
+        _runtime_owner: runtime_owner,
+        _shard_owner: shard_owner,
+    })
+}
+
+#[test]
+fn reserve_route_owns_exactly_one_control_slot_before_source_authority_exists() -> TestResult {
+    let route = route(INSTRUMENT_ONE)?;
+    let harness = reservation_harness(route.clone())?;
+
+    let dormant = harness.ingress.reserve_route(route.clone())?;
+
+    assert_eq!(dormant.route(), &route);
+    assert_eq!(dormant.shard(), ShardId::new(0, 1)?);
+    assert_eq!(
+        harness.ingress.reserve_route(route.clone()).err(),
+        Some(LiveIngressBindError::ControlCapacityFull)
+    );
+    drop(dormant);
+    assert!(harness.ingress.reserve_route(route).is_ok());
+    Ok(())
+}
+
+#[tokio::test]
+async fn consuming_activation_binds_once_and_cancelled_activation_releases_reservation()
+-> TestResult {
+    let route = route(INSTRUMENT_ONE)?;
+    let mut harness = reservation_harness(route.clone())?;
+    let source = SourceHarness::try_new("dormant-source", 1, INSTRUMENT_ONE)?;
+    let dormant = harness.ingress.reserve_route(route.clone())?;
+    let activation = dormant.activate(source.current_lease()?, CancellationToken::new());
+    let registration = async {
+        let command = harness
+            .registrations
+            .recv()
+            .await
+            .ok_or("registration closed")?;
+        let (registry, admission) = admission(&command.source)?;
+        command
+            .response
+            .send(Ok(RegistrationGrant::new(admission)))
+            .map_err(|_| "activation receiver dropped")?;
+        TestResult::Ok(registry)
+    };
+    let (bound, registry) = tokio::join!(activation, registration);
+    let bound = bound?;
+    let _registry = registry?;
+    assert_eq!(bound.route(), &route);
+    assert_eq!(bound.shard(), ShardId::new(0, 1)?);
+
+    let cancelled = harness.ingress.reserve_route(route.clone())?;
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    assert_eq!(
+        cancelled
+            .activate(source.current_lease()?, cancellation)
+            .await
+            .err(),
+        Some(LiveIngressBindError::Cancelled)
+    );
+    assert!(harness.ingress.reserve_route(route).is_ok());
+    Ok(())
+}
+
+#[test]
+fn dropped_buffered_registration_response_invalidates_minted_admission() -> TestResult {
+    let source = SourceHarness::try_new("dropped-registration", 1, INSTRUMENT_ONE)?;
+    let (_registry, admission) = admission(&source.current_lease()?)?;
+    let probe = admission.clone();
+    let (response, receiver) = oneshot::channel::<Result<RegistrationGrant, RegistrationFailure>>();
+
+    response
+        .send(Ok(RegistrationGrant::new(admission)))
+        .map_err(|_| "registration receiver dropped before send")?;
+    drop(receiver);
+
+    assert!(probe.validate_at(now()?).is_err());
+    Ok(())
 }
 
 fn admission(

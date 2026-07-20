@@ -245,10 +245,13 @@ fn route_finalization_reuses_stream_status_and_book_allocations() -> TestResult 
         .ok_or("missing direct-final stream")?
         .bids
         .as_ptr();
-    let route = seed.into_route(crate::ShardKey::new(
-        market_squawk_domain::VenueId::try_from("coinbase")?,
-        state.instrument,
-    ));
+    let route = seed.into_route(
+        crate::ShardKey::new(
+            market_squawk_domain::VenueId::try_from("coinbase")?,
+            state.instrument,
+        ),
+        crate::snapshot::LiveFeatureSnapshot::empty(1)?,
+    );
 
     assert_eq!(route.streams.as_ptr(), streams);
     assert_eq!(route.statuses.as_ptr(), statuses);

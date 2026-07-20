@@ -42,6 +42,15 @@ pub(super) fn config(
         maximum_routes_per_shard: 4,
         maximum_sources_per_route: 2,
         maximum_streams_per_route: 4,
+        maximum_feature_window_observations_per_route: 8,
+        maximum_feature_window_bytes_per_route: 1_048_576,
+        maximum_feature_sets_per_route: 4,
+        cross_venue_command_count: 8,
+        cross_venue_command_bytes: 65_536,
+        maximum_cross_venue_instruments: 4,
+        maximum_venues_per_cross_venue_instrument: 2,
+        maximum_feature_snapshot_bytes: 65_536,
+        maximum_action_hook_bytes_per_route: 65_536,
         registration_control_capacity: 2,
         registration_deadline: Duration::from_secs(1),
         health_event_capacity: 16,
@@ -139,6 +148,7 @@ pub(super) fn runtime_shell(
         health,
         cancellation,
         actors: Some(actors),
+        cross_venue_task: None,
         task_shards,
     };
     Ok(RuntimeHarness {

@@ -1,7 +1,7 @@
 //! Deterministic local configuration composition and secret boundaries.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     ffi::OsString,
     fmt,
     io::Read,
@@ -14,6 +14,13 @@ use serde::Deserialize;
 use thiserror::Error;
 use zeroize::Zeroize;
 
+mod instruments;
+
+pub use instruments::{
+    COINBASE_EXCHANGE_ENDPOINT, CoinbaseAuthorizationAttestation, CoinbaseConfigurationError,
+    CoinbaseControlLimits, CoinbaseInstrumentMapping, CoinbaseSourceConfig,
+};
+
 const ENV_PREFIX: &str = "MARKET_SQUAWK_";
 const DEFAULT_STALE_AFTER_MS: u64 = 5_000;
 const DEFAULT_QUEUE_CAPACITY: usize = 16_384;
@@ -22,8 +29,6 @@ const DEFAULT_CAPTURE_DESTINATION_REGISTRY_MEMORY_CEILING_BYTES: usize = 1024 * 
 const DEFAULT_FLUSH_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_SHUTDOWN_MS: u64 = 5_000;
 const DEFAULT_SOURCE_SHUTDOWN_MS: u64 = 5_000;
-const MAX_PRODUCTS: usize = 128;
-const MAX_PRODUCT_BYTES: usize = 128;
 const MAX_QUEUE_CAPACITY: usize = 1_048_576;
 const MAX_CAPTURE_MEMORY_CEILING_BYTES: usize = 4_294_967_295;
 const MAX_CAPTURE_DESTINATION_REGISTRY_MEMORY_CEILING_BYTES: usize = 64 * 1024 * 1024;
@@ -154,6 +159,8 @@ pub struct ConfigOverrides {
     pub source_shutdown_ms: Option<u64>,
     /// Redacted secret locator.
     pub source_secret: Option<SecretReference>,
+    /// Complete validated production Coinbase source profile.
+    pub coinbase: Option<CoinbaseSourceConfig>,
 }
 
 /// Explicit input set for deterministic configuration loading.
@@ -210,6 +217,7 @@ struct FileConfig {
     capture_shutdown_ms: Option<u64>,
     source_shutdown_ms: Option<u64>,
     source_secret: Option<String>,
+    coinbase: Option<CoinbaseSourceConfig>,
 }
 
 /// Validated effective local configuration.
@@ -226,6 +234,7 @@ pub struct AppConfig {
     capture_shutdown: Duration,
     source_shutdown: Duration,
     source_secret: Option<SecretReference>,
+    coinbase: Option<CoinbaseSourceConfig>,
 }
 
 impl fmt::Debug for AppConfig {
@@ -252,6 +261,7 @@ impl fmt::Debug for AppConfig {
                 "source_secret",
                 &self.source_secret.as_ref().map(|_| "[REDACTED]"),
             )
+            .field("coinbase", &self.coinbase)
             .finish()
     }
 }
@@ -283,6 +293,7 @@ impl Default for AppConfig {
             capture_shutdown: Duration::from_millis(DEFAULT_SHUTDOWN_MS),
             source_shutdown: Duration::from_millis(DEFAULT_SOURCE_SHUTDOWN_MS),
             source_secret: None,
+            coinbase: None,
         }
     }
 }
@@ -365,6 +376,11 @@ impl AppConfig {
     pub const fn source_secret(&self) -> Option<&SecretReference> {
         self.source_secret.as_ref()
     }
+
+    /// Returns the optional strict production Coinbase source profile.
+    pub const fn coinbase(&self) -> Option<&CoinbaseSourceConfig> {
+        self.coinbase.as_ref()
+    }
 }
 
 impl From<AppConfig> for ConfigOverrides {
@@ -385,6 +401,7 @@ impl From<AppConfig> for ConfigOverrides {
             capture_shutdown_ms: Some(duration_millis(config.capture_shutdown)),
             source_shutdown_ms: Some(duration_millis(config.source_shutdown)),
             source_secret: config.source_secret,
+            coinbase: config.coinbase,
         }
     }
 }
@@ -436,6 +453,9 @@ impl ConfigOverrides {
         if higher.source_secret.is_some() {
             self.source_secret = higher.source_secret;
         }
+        if higher.coinbase.is_some() {
+            self.coinbase = higher.coinbase;
+        }
     }
 
     fn apply_file(&mut self, file: FileConfig) -> Result<(), ConfigError> {
@@ -456,6 +476,7 @@ impl ConfigOverrides {
                 .as_deref()
                 .map(SecretReference::try_from)
                 .transpose()?,
+            coinbase: file.coinbase,
         });
         Ok(())
     }
@@ -509,6 +530,9 @@ impl ConfigOverrides {
                 "MARKET_SQUAWK_SOURCE_SECRET" => {
                     layer.source_secret = Some(SecretReference::try_from(value)?);
                 }
+                "MARKET_SQUAWK_COINBASE_JSON" => {
+                    layer.coinbase = Some(instruments::parse_environment_profile(value)?);
+                }
                 _ => return Err(ConfigError::UnknownEnvironmentKey),
             }
         }
@@ -544,7 +568,7 @@ impl TryFrom<ConfigOverrides> for AppConfig {
             return Err(ConfigError::InvalidDataDirectory);
         }
         let products = values.products.ok_or(ConfigError::InternalComposition)?;
-        validate_products(&products)?;
+        instruments::validate_product_list(&products)?;
         let stale_after_ms = values
             .stale_after_ms
             .and_then(NonZeroU64::new)
@@ -601,27 +625,9 @@ impl TryFrom<ConfigOverrides> for AppConfig {
             capture_shutdown: Duration::from_millis(shutdown_ms.get()),
             source_shutdown: Duration::from_millis(source_shutdown_ms.get()),
             source_secret: values.source_secret,
+            coinbase: values.coinbase,
         })
     }
-}
-
-fn validate_products(products: &[String]) -> Result<(), ConfigError> {
-    if products.is_empty() || products.len() > MAX_PRODUCTS {
-        return Err(ConfigError::InvalidProducts);
-    }
-    let mut unique = BTreeSet::new();
-    for product in products {
-        if product.is_empty()
-            || product.len() > MAX_PRODUCT_BYTES
-            || !product
-                .chars()
-                .all(|character| character.is_ascii_alphanumeric() || "-._/".contains(character))
-            || !unique.insert(product)
-        {
-            return Err(ConfigError::InvalidProducts);
-        }
-    }
-    Ok(())
 }
 
 /// Configuration loading failure with sensitive values omitted from every representation.

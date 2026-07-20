@@ -1,8 +1,9 @@
 impl AuthoritativeSourceRegistry {
     /// Records registry-owned current health for the exact session generation.
     ///
-    /// Any non-executable dimension clears qualification immediately. A later fully healthy
-    /// observation may requalify only while the same lease remains current.
+    /// Any required current-data dimension clears qualification immediately. A later fully healthy
+    /// observation may requalify only while the same lease remains current. Direct-verified data
+    /// retains the stricter execution-quality timestamp contract.
     ///
     /// # Errors
     ///
@@ -58,6 +59,7 @@ impl AuthoritativeSourceRegistry {
             return Err(RegistryError::StaleHealthObservation);
         }
         let live_declaration = entry.metadata.coverage().live();
+        let quality_ceiling = entry.metadata.quality_ceiling();
         let exact_runtime_coverage = matches!(
             (health.coverage(), live_declaration),
             (
@@ -70,6 +72,13 @@ impl AuthoritativeSourceRegistry {
             ) if provider_product == live.provider_product()
                 && provider_channel == live.provider_channel()
         );
+        let source_timestamp_qualified = match health.source_freshness() {
+            crate::SourceTimestampFreshness::Fresh { .. } => true,
+            crate::SourceTimestampFreshness::Uninitialized => {
+                quality_ceiling != market_squawk_domain::DataQuality::DirectVerified
+            }
+            crate::SourceTimestampFreshness::Stale { .. } => false,
+        };
         let qualified = session.capture.is_healthy()
             && matches!(health.connection(), crate::ConnectionLiveness::Live { .. })
             && matches!(
@@ -80,10 +89,7 @@ impl AuthoritativeSourceRegistry {
                 health.market_freshness(),
                 crate::MarketFreshness::Fresh { .. }
             )
-            && matches!(
-                health.source_freshness(),
-                crate::SourceTimestampFreshness::Fresh { .. }
-            )
+            && source_timestamp_qualified
             && health.stream_integrity() == market_squawk_domain::StreamIntegrityState::Healthy
             && health.capture_integrity()
                 != market_squawk_domain::CaptureIntegrityState::Incomplete
@@ -95,19 +101,21 @@ impl AuthoritativeSourceRegistry {
             && health.budget() == crate::BudgetHealth::Available
             && update.budget.health() == crate::BudgetHealth::Available
             && health.last_error().is_none();
-        let valid_until = health.live_valid_until().map(|health_until| {
-            let authorization_until = entry
-                .metadata
-                .authorization()
-                .inclusive_authorization_deadline()
-                .unwrap_or(Timestamp::from_unix_nanos(i64::MAX));
-            let coverage_until = entry
-                .metadata
-                .coverage()
-                .inclusive_coverage_deadline()
-                .unwrap_or(Timestamp::from_unix_nanos(i64::MAX));
-            health_until.min(authorization_until).min(coverage_until)
-        });
+        let valid_until = health
+            .current_data_valid_until(quality_ceiling)
+            .map(|health_until| {
+                let authorization_until = entry
+                    .metadata
+                    .authorization()
+                    .inclusive_authorization_deadline()
+                    .unwrap_or(Timestamp::from_unix_nanos(i64::MAX));
+                let coverage_until = entry
+                    .metadata
+                    .coverage()
+                    .inclusive_coverage_deadline()
+                    .unwrap_or(Timestamp::from_unix_nanos(i64::MAX));
+                health_until.min(authorization_until).min(coverage_until)
+            });
         let valid_until_monotonic = valid_until
             .map(|until| validation_at.checked_deadline(until))
             .transpose()?

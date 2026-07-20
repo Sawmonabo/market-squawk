@@ -240,6 +240,8 @@ impl AuthoritativeSourceRegistry {
                     source.source_id.clone(),
                     SourceAuthorityHistory {
                         used_revisions: source.used_revisions.as_slice().to_vec(),
+                        latest_revision_evidence: source.latest_revision_evidence.clone(),
+                        revoked: source.revoked,
                         last_epoch: source.last_epoch,
                         generation_high_water: source.generation_high_water,
                     },

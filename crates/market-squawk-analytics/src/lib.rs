@@ -1,6 +1,8 @@
 //! Bounded exact feature values and immutable registry contracts.
 
 mod book;
+mod catalog;
+mod catalog_config;
 mod cross_venue;
 mod liquidity;
 mod metadata;
@@ -14,6 +16,8 @@ pub use book::{
     TopOfBookFeatures, TopOfBookView, depth_weighted_price, order_flow_imbalance,
     top_of_book_features,
 };
+pub use catalog::{LiveFeatureCatalog, REQUIRED_LIVE_FEATURE_COUNT, RequiredLiveFeature};
+pub use catalog_config::{LiveFeatureCatalogConfig, LiveFeatureCatalogConfigError};
 pub use cross_venue::{
     CrossVenueFeatureError, ExpectedVenueSet, MAX_CROSS_VENUE_OBSERVATIONS,
     VenueFeatureObservation, cross_venue_divergence,
@@ -29,8 +33,8 @@ pub use metadata::{
     MAX_FEATURE_PARAMETERS, MAX_IMPLEMENTATION_REVISION_BYTES,
 };
 pub use registry::{
-    FeatureRegistry, FeatureRegistryError, LiveFeatureView, MAX_FEATURE_REGISTRY_ENTRIES,
-    MAX_FEATURE_REGISTRY_RETAINED_BYTES, RegistrationOutcome,
+    BatchRegistrationOutcome, FeatureRegistry, FeatureRegistryError, LiveFeatureView,
+    MAX_FEATURE_REGISTRY_ENTRIES, MAX_FEATURE_REGISTRY_RETAINED_BYTES, RegistrationOutcome,
 };
 pub use rolling::{
     MAX_ROLLING_OBSERVATIONS, MAX_ROLLING_RETAINED_BYTES, RollingFeatureError, RollingFeatureState,

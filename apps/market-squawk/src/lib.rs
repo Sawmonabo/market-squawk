@@ -8,6 +8,7 @@ pub mod diagnostic_engine;
 mod domain;
 pub mod features;
 pub mod live_runtime;
+mod live_source;
 pub mod mcp;
 pub mod order_book;
 pub mod quality;
@@ -30,6 +31,11 @@ pub use domain::{
     Side as DiagnosticSide,
 };
 pub use live_runtime::{LiveRuntimeComposition, LiveRuntimeCompositionError};
+pub use live_source::{
+    ProductionCoinbaseProfileError, ProductionLiveSourceComposition,
+    ProductionLiveSourceCompositionError, ProductionLiveSourceRuntime,
+    ProductionLiveSourceRuntimeError, ProductionSupervisorError,
+};
 pub use market_squawk_platform::{
     AppConfig, JournalFileFormat, JournalSelectionError, LocalPaths as AppPaths,
 };

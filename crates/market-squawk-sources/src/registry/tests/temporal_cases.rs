@@ -514,6 +514,8 @@
                     used_revisions: vec![MetadataRevision::new(SourceIdentifier::try_from(
                         format!("revision-{index}"),
                     )?)],
+                    latest_revision_evidence: None,
+                    revoked: false,
                     last_epoch: 1,
                     generation_high_water: None,
                 },
@@ -527,11 +529,6 @@
             at,
         )?;
         assert_eq!(replacement.revision.as_source_identifier().as_str(), "revision-2");
-        registry.revoke(&replacement, at)?;
-        let restored_state = registry.export_authority_state()?;
-        let mut registry =
-            AuthoritativeSourceRegistry::try_new_ephemeral_with_authority_state_for_diagnostics(restored_state)?;
-        registry.register(direct_metadata("capacity-source", "revision-3")?, at)?;
         let before = registry.export_authority_state()?;
         let budget_policies_before = registry.budgets.policies();
         let entries_before = registry.entries.len();
@@ -568,11 +565,19 @@
 
         let mut restarted =
             AuthoritativeSourceRegistry::try_new_ephemeral_with_authority_state_for_diagnostics(revoked_state)?;
-        let successor = restarted.register(
-            direct_metadata("revoked-epoch-source", "revision-2")?,
-            at,
-        )?;
-        assert_eq!(successor.epoch, 3);
+        let before = restarted.export_authority_state()?;
+        assert!(matches!(
+            restarted.register(direct_metadata("revoked-epoch-source", "revision-2")?, at),
+            Err(RegistryError::SourceRevoked)
+        ));
+        assert!(matches!(
+            restarted.register_or_resume_exact(
+                direct_metadata("revoked-epoch-source", "revision-1")?,
+                at,
+            ),
+            Err(RegistryError::SourceRevoked)
+        ));
+        assert_eq!(restarted.export_authority_state()?, before);
         Ok(())
     }
 
@@ -621,7 +626,15 @@
         harness
             .registry
             .revoke(&harness.registered, harness.timestamp(41)?)?;
-        assert_eq!(harness.registry.export_authority_state()?, before);
+        let revoked = harness.registry.export_authority_state()?;
+        assert_ne!(revoked, before);
+        assert!(
+            revoked
+                .sources
+                .as_slice()
+                .first()
+                .is_some_and(|source| source.latest_revision_evidence.is_none())
+        );
         assert!(matches!(
             harness
                 .registry
@@ -640,15 +653,15 @@
         );
 
         let mut restarted =
-            AuthoritativeSourceRegistry::try_new_ephemeral_with_authority_state_for_diagnostics(before.clone())?;
+            AuthoritativeSourceRegistry::try_new_ephemeral_with_authority_state_for_diagnostics(revoked.clone())?;
         assert!(matches!(
             restarted.register(
                 direct_metadata("active-epoch-source", "revision-2")?,
                 harness.timestamp(41)?
             ),
-            Err(RegistryError::EpochExhausted)
+            Err(RegistryError::SourceRevoked)
         ));
-        assert_eq!(restarted.export_authority_state()?, before);
+        assert_eq!(restarted.export_authority_state()?, revoked);
         Ok(())
     }
 

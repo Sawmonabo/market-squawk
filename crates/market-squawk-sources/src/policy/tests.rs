@@ -1,6 +1,9 @@
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
+    use crate::SourceError;
 
     #[derive(Debug)]
     struct ManualClock {
@@ -159,6 +162,25 @@ mod tests {
         )
     }
 
+    fn retry_after_policy() -> Result<ProviderBudgetPolicy, NetworkPolicyError> {
+        ProviderBudgetPolicy::try_new(
+            BudgetScope::new(
+                SourceIdentifier::try_from("retry-after-provider")
+                    .map_err(|_| NetworkPolicyError::InvalidBudgetPolicy)?,
+            ),
+            NonZeroU32::new(2).ok_or(NetworkPolicyError::InvalidBudgetPolicy)?,
+            NonZeroU64::new(30_000_000_000)
+                .ok_or(NetworkPolicyError::InvalidBudgetPolicy)?,
+            NonZeroU16::new(1).ok_or(NetworkPolicyError::InvalidBudgetPolicy)?,
+            BackoffPolicy::try_new(
+                NonZeroU64::new(10).ok_or(NetworkPolicyError::InvalidBudgetPolicy)?,
+                NonZeroU64::new(10_000_000_000)
+                    .ok_or(NetworkPolicyError::InvalidBudgetPolicy)?,
+                1_000,
+            )?,
+        )
+    }
+
     fn authorization(
         mode: crate::AuthorizationMode,
         basis: &str,
@@ -284,6 +306,78 @@ mod tests {
     }
 
     #[test]
+    fn http_retry_after_preserves_valid_deadlines_and_bounds_fallbacks()
+    -> Result<(), NetworkPolicyError> {
+        let decision_for = |field: Option<&[u8]>| {
+            let budget = SharedProviderBudget::new(
+                retry_after_policy()?,
+                MonotonicInstant::from_nanos(100),
+                Arc::new(ManualClock::new(0, 100)),
+            );
+            Ok::<_, NetworkPolicyError>(apply_http_retry_after(&budget, field, 0))
+        };
+
+        assert!(matches!(
+            decision_for(Some(b"2"))?,
+            BudgetDecision::WaitUntil(deadline) if deadline.as_nanos() == 2_000_000_100
+        ));
+        assert!(matches!(
+            decision_for(Some(b"Thu, 01 Jan 1970 00:00:02 GMT"))?,
+            BudgetDecision::WaitUntil(deadline) if deadline.as_nanos() == 2_000_000_100
+        ));
+
+        let oversized = [b'9'; 129];
+        let non_ascii = [0xff];
+        for field in [
+            None,
+            Some(b"0".as_slice()),
+            Some(b"invalid".as_slice()),
+            Some(b"18446744073709551615".as_slice()),
+            Some(non_ascii.as_slice()),
+            Some(oversized.as_slice()),
+        ] {
+            assert!(matches!(
+                decision_for(field)?,
+                BudgetDecision::WaitUntil(deadline) if deadline.as_nanos() == 110
+            ));
+        }
+        let over_policy = SharedProviderBudget::new(
+            retry_after_policy()?,
+            MonotonicInstant::from_nanos(100),
+            Arc::new(ManualClock::new(0, 100)),
+        );
+        let over_policy_error = SourceError::from_applied_budget_refusal(apply_http_retry_after(
+            &over_policy,
+            Some(b"11"),
+            0,
+        ));
+        assert_eq!(
+            over_policy_error,
+            SourceError::BudgetUnavailable {
+                reason: BudgetUnavailableReason::RetryAfterExceedsPolicy,
+            }
+        );
+        assert!(matches!(
+            over_policy.try_acquire(),
+            BudgetDecision::Unavailable(BudgetUnavailableReason::Disabled)
+        ));
+        let mapped = SourceError::from_applied_budget_refusal(apply_http_retry_after(
+            &SharedProviderBudget::new(
+                retry_after_policy()?,
+                MonotonicInstant::from_nanos(100),
+                Arc::new(ManualClock::new(0, 100)),
+            ),
+            Some(b"2"),
+            0,
+        ));
+        assert!(matches!(
+            mapped,
+            SourceError::BudgetWaitUntil { deadline } if deadline.as_nanos() == 2_000_000_100
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn refusal_cooldown_blocks_before_and_expires_at_the_exact_monotonic_deadline()
     -> Result<(), NetworkPolicyError> {
         let clock = Arc::new(ManualClock::new(100, 1_000));
@@ -299,16 +393,70 @@ mod tests {
         assert_eq!(deadline.as_nanos(), 1_010);
 
         assert!(clock.set(109, 1_009));
+        assert_eq!(
+            budget.remaining_wait(deadline),
+            Ok(Duration::from_nanos(1))
+        );
         assert!(matches!(
             budget.try_acquire(),
             BudgetDecision::WaitUntil(observed) if observed == deadline
         ));
 
         assert!(clock.set(110, 1_010));
+        assert_eq!(budget.remaining_wait(deadline), Ok(Duration::ZERO));
         let BudgetDecision::Ready(permit) = budget.try_acquire() else {
             return Err(NetworkPolicyError::InvalidBudgetPolicy);
         };
         permit.release();
+        Ok(())
+    }
+
+    #[test]
+    fn remaining_wait_terminally_rejects_clock_failure_and_regression()
+    -> Result<(), NetworkPolicyError> {
+        let regression_clock = Arc::new(ManualClock::new(100, 1_000));
+        let regression_budget = SharedProviderBudget::new(
+            policy()?,
+            MonotonicInstant::from_nanos(1_000),
+            regression_clock.clone(),
+        );
+        let deadline = match regression_budget.apply_refusal(0) {
+            BudgetDecision::WaitUntil(deadline) => deadline,
+            _ => return Err(NetworkPolicyError::InvalidBudgetPolicy),
+        };
+        assert!(regression_clock.set(99, 999));
+        assert_eq!(
+            regression_budget.remaining_wait(deadline),
+            Err(BudgetUnavailableReason::ClockRegression)
+        );
+        assert!(matches!(
+            regression_budget.try_acquire(),
+            BudgetDecision::Unavailable(
+                BudgetUnavailableReason::AvailabilityGenerationExhausted
+            )
+        ));
+
+        let unavailable_clock = Arc::new(SwitchableClock::new(100, 1_000));
+        let unavailable_budget = SharedProviderBudget::new(
+            policy()?,
+            MonotonicInstant::from_nanos(1_000),
+            unavailable_clock.clone(),
+        );
+        let deadline = match unavailable_budget.apply_refusal(0) {
+            BudgetDecision::WaitUntil(deadline) => deadline,
+            _ => return Err(NetworkPolicyError::InvalidBudgetPolicy),
+        };
+        unavailable_clock.fail();
+        assert_eq!(
+            unavailable_budget.remaining_wait(deadline),
+            Err(BudgetUnavailableReason::ClockUnavailable)
+        );
+        assert!(matches!(
+            unavailable_budget.try_acquire(),
+            BudgetDecision::Unavailable(
+                BudgetUnavailableReason::AvailabilityGenerationExhausted
+            )
+        ));
         Ok(())
     }
 

@@ -82,7 +82,7 @@ pub use policy::{
     BudgetPoolError, BudgetScope, BudgetUnavailableReason, EndpointDenialReason, EndpointPolicy,
     HttpClientProfile, HttpRequestBounds, MonotonicInstant, NetworkPolicyError, PathScope,
     ProviderBudgetPolicy, QueryParameterRule, QuerySensitivity, RedirectAuthorization, RetryAfter,
-    SharedProviderBudget,
+    SharedProviderBudget, apply_http_retry_after,
 };
 pub use registry::{
     AuthoritativeSourceRegistry, CapturedDecodedProviderBatch, CurrentBatchIter, CurrentBatchKey,

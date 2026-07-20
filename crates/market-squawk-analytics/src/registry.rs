@@ -22,6 +22,27 @@ pub enum RegistrationOutcome {
     AlreadyRegistered,
 }
 
+/// Aggregate result of one atomically validated metadata batch registration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BatchRegistrationOutcome {
+    inserted: usize,
+    already_registered: usize,
+}
+
+impl BatchRegistrationOutcome {
+    /// Returns the number of newly inserted records.
+    #[must_use]
+    pub const fn inserted(self) -> usize {
+        self.inserted
+    }
+
+    /// Returns the number of identical records already present.
+    #[must_use]
+    pub const fn already_registered(self) -> usize {
+        self.already_registered
+    }
+}
+
 /// Fixed-capacity, byte-bounded metadata registry.
 ///
 /// Entries are retained in [`FeatureKey`] order inside a preallocated boxed slice. Registration
@@ -114,6 +135,80 @@ impl FeatureRegistry {
         }
     }
 
+    /// Atomically preflights and registers one bounded metadata batch.
+    ///
+    /// The batch must contain unique keys. Existing identical records are idempotent, while any
+    /// duplicate batch key, existing conflict, count overflow, or retained-byte failure leaves the
+    /// registry unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed duplicate, conflict, capacity, or retained-size error before mutation.
+    pub fn try_register_batch(
+        &mut self,
+        metadata: &[FeatureMetadata],
+    ) -> Result<BatchRegistrationOutcome, FeatureRegistryError> {
+        if metadata.len() > self.slots.len() {
+            return Err(FeatureRegistryError::RegistryFull);
+        }
+        for (index, candidate) in metadata.iter().enumerate() {
+            if metadata[index + 1..]
+                .iter()
+                .any(|other| other.key() == candidate.key())
+            {
+                return Err(FeatureRegistryError::DuplicateBatchKey);
+            }
+        }
+
+        let mut already_registered = 0_usize;
+        let mut dynamic_retained_bytes = 0_usize;
+        let mut pending = Vec::new();
+        for candidate in metadata {
+            match self.position(candidate.key()) {
+                Ok(index) if self.slots[index].as_ref() == Some(candidate) => {
+                    already_registered += 1;
+                }
+                Ok(_) => return Err(FeatureRegistryError::MetadataConflict),
+                Err(_) => {
+                    let owned = candidate.clone();
+                    dynamic_retained_bytes = dynamic_retained_bytes
+                        .checked_add(
+                            owned
+                                .checked_dynamic_retained_bytes()
+                                .ok_or(FeatureRegistryError::RetainedSizeOverflow)?,
+                        )
+                        .ok_or(FeatureRegistryError::RetainedSizeOverflow)?;
+                    pending.push(owned);
+                }
+            }
+        }
+
+        let final_len = self
+            .len
+            .checked_add(pending.len())
+            .ok_or(FeatureRegistryError::RetainedSizeOverflow)?;
+        if final_len > self.slots.len() {
+            return Err(FeatureRegistryError::RegistryFull);
+        }
+        let final_retained_bytes = self
+            .retained_bytes
+            .checked_add(dynamic_retained_bytes)
+            .ok_or(FeatureRegistryError::RetainedSizeOverflow)?;
+        if final_retained_bytes > self.retained_byte_limit.get() {
+            return Err(FeatureRegistryError::RetainedByteLimitExceeded);
+        }
+
+        let inserted = pending.len();
+        for candidate in pending {
+            self.insert_prevalidated(candidate);
+        }
+        self.retained_bytes = final_retained_bytes;
+        Ok(BatchRegistrationOutcome {
+            inserted,
+            already_registered,
+        })
+    }
+
     /// Returns metadata for an exact feature key without allocation.
     #[must_use]
     pub fn metadata(&self, key: &FeatureKey) -> Option<&FeatureMetadata> {
@@ -165,6 +260,24 @@ impl FeatureRegistry {
         }
         Err(self.len)
     }
+
+    fn insert_prevalidated(&mut self, metadata: FeatureMetadata) {
+        let mut index = self.len;
+        for (position, slot) in self.slots[..self.len].iter().enumerate() {
+            if slot
+                .as_ref()
+                .is_some_and(|existing| existing.key() > metadata.key())
+            {
+                index = position;
+                break;
+            }
+        }
+        for position in (index..self.len).rev() {
+            self.slots[position + 1] = self.slots[position].take();
+        }
+        self.slots[index] = Some(metadata);
+        self.len += 1;
+    }
 }
 
 /// Allocation-free, authority-free feature values exposed to a live action consumer.
@@ -201,6 +314,9 @@ pub enum FeatureRegistryError {
     /// The same feature key was registered with different metadata.
     #[error("conflicting metadata for an existing feature key")]
     MetadataConflict,
+    /// One submitted batch repeated a feature key.
+    #[error("feature metadata batch contains a duplicate key")]
+    DuplicateBatchKey,
     /// Checked retained-size arithmetic overflowed.
     #[error("feature registry retained-byte accounting overflowed")]
     RetainedSizeOverflow,

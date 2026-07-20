@@ -379,6 +379,58 @@ impl SharedProviderBudget {
         }
     }
 
+    /// Observes the remaining duration for a deadline returned by this budget.
+    ///
+    /// The duration is zero at and after the inclusive deadline. The supervisor owns
+    /// cancellation-aware sleeping; this method only converts the budget's private monotonic epoch
+    /// without exposing its clock or duplicating provider backoff policy.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed if the budget is terminal or disabled, its clock or state is unavailable, its
+    /// monotonic clock regressed below the current window origin, or its counters are corrupt.
+    pub fn remaining_wait(
+        &self,
+        deadline: MonotonicInstant,
+    ) -> Result<std::time::Duration, BudgetUnavailableReason> {
+        let operation = self.admit_runtime_operation()?;
+        if self.allocation.terminal.load(Ordering::Acquire) {
+            return Err(BudgetUnavailableReason::AvailabilityGenerationExhausted);
+        }
+        let observation = match self.allocation.clock.observation() {
+            Ok(observation) => observation,
+            Err(_) => {
+                return self.terminal_fail(
+                    BudgetUnavailableReason::ClockUnavailable,
+                    &operation,
+                );
+            }
+        };
+        let state = match self.allocation.state.lock() {
+            Ok(state) => state,
+            Err(_) => {
+                return self.terminal_fail(BudgetUnavailableReason::StatePoisoned, &operation);
+            }
+        };
+        if observation.monotonic < state.window_started_at {
+            drop(state);
+            return self.terminal_fail(BudgetUnavailableReason::ClockRegression, &operation);
+        }
+        if state.requests_used > self.policy().requests_per_window()
+            || state.in_flight > self.policy().max_concurrent()
+        {
+            drop(state);
+            return self.terminal_fail(BudgetUnavailableReason::StateCorrupt, &operation);
+        }
+        if state.disabled {
+            return Err(BudgetUnavailableReason::Disabled);
+        }
+        let remaining_nanos = deadline
+            .as_nanos()
+            .saturating_sub(observation.monotonic.as_nanos());
+        Ok(std::time::Duration::from_nanos(remaining_nanos))
+    }
+
     /// Atomically reserves one request from the shared window and concurrency limit.
     pub fn try_acquire(&self) -> BudgetDecision {
         let operation = match self.admit_runtime_operation() {
