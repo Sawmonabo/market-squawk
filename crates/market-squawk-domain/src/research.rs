@@ -8,11 +8,19 @@ use crate::{CorporateActionKind, InstrumentId, QuantityLots, ResearchContext, So
 
 #[path = "research/observations.rs"]
 mod observations;
+#[path = "research/xbrl.rs"]
+mod xbrl;
 
 pub use observations::{
     AlternativeDataObservation, CorporateActionObservation, FilingObservation,
     FundamentalObservation, MacroMissingValue, MacroObservation, MacroValue, PositionObservation,
     TransactionObservation,
+};
+pub use xbrl::{
+    MAX_XBRL_DIMENSIONS, XBRL_FACT_EVIDENCE_SCHEMA_VERSION, XbrlAccuracy, XbrlAccuracyValue,
+    XbrlDimensionEvidence, XbrlDimensionLocation, XbrlDimensionMember, XbrlDuplicateClass,
+    XbrlDuplicateEvidence, XbrlEntity, XbrlEvidenceError, XbrlFactEvidence, XbrlFactEvidenceInput,
+    XbrlPeriod, XbrlSign, XbrlTaxonomySet, XbrlText,
 };
 
 /// Direction of a nonzero portfolio position.
@@ -67,6 +75,8 @@ pub enum ResearchError {
     UnchangedSymbol,
     /// A symbol-change action's venue disagrees with research provenance.
     CorporateActionVenueMismatch,
+    /// XBRL evidence failed validation or did not bind the canonical value.
+    XbrlEvidence(XbrlEvidenceError),
 }
 
 impl fmt::Display for ResearchError {
@@ -88,11 +98,18 @@ impl fmt::Display for ResearchError {
             Self::CorporateActionVenueMismatch => {
                 formatter.write_str("symbol-change venue must match research provenance")
             }
+            Self::XbrlEvidence(error) => error.fmt(formatter),
         }
     }
 }
 
 impl std::error::Error for ResearchError {}
+
+impl From<XbrlEvidenceError> for ResearchError {
+    fn from(value: XbrlEvidenceError) -> Self {
+        Self::XbrlEvidence(value)
+    }
+}
 
 pub(super) fn require_instrument(context: &ResearchContext) -> Result<InstrumentId, ResearchError> {
     context

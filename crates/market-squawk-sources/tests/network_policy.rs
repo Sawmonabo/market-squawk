@@ -5,10 +5,19 @@ use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 use market_squawk_sources::{
     ApiEndpointRule, BackoffPolicy, BudgetDecision, BudgetScope, EndpointPolicy, HttpClientProfile,
     HttpRequestBounds, NetworkPolicyError, PathScope, ProviderBudgetPolicy, QueryParameterRule,
-    QuerySensitivity, RetryAfter,
+    QuerySensitivity, RetryAfter, install_ring_tls_provider,
 };
 
 use common::{TestResult, source_identifier};
+
+#[test]
+fn rustls_provider_installation_is_explicit_and_project_idempotent() -> TestResult {
+    let first = install_ring_tls_provider()?;
+    assert_eq!(first.provider_id(), "rustls-ring-0.23.42");
+    let second = install_ring_tls_provider()?;
+    assert_eq!(second.provider_id(), first.provider_id());
+    Ok(())
+}
 
 #[test]
 fn redirect_must_remain_allowlisted() -> TestResult {

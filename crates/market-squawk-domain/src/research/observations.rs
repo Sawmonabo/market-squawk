@@ -6,7 +6,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use super::{
     CorporateActionKind, PositionSide, QuantityLots, ResearchContext, ResearchError,
-    SourceIdentifier, require_instrument, validate_corporate_action,
+    SourceIdentifier, XbrlFactEvidence, require_instrument, validate_corporate_action,
 };
 
 /// Regulatory or issuer filing identity and point-in-time context.
@@ -73,6 +73,8 @@ pub struct FundamentalObservation {
     concept: SourceIdentifier,
     value: Decimal,
     unit: SourceIdentifier,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    xbrl_evidence: Option<Box<XbrlFactEvidence>>,
 }
 
 impl FundamentalObservation {
@@ -89,6 +91,31 @@ impl FundamentalObservation {
             concept,
             value: value.normalize(),
             unit,
+            xbrl_evidence: None,
+        })
+    }
+
+    /// Constructs a numeric fundamental and binds rich XBRL occurrence evidence to its exact value.
+    ///
+    /// # Errors
+    ///
+    /// Rejects missing instrument identity or evidence that does not produce `value` after its
+    /// retained Inline-XBRL scale and sign transforms.
+    pub fn new_with_xbrl_evidence(
+        context: ResearchContext,
+        concept: SourceIdentifier,
+        value: Decimal,
+        unit: SourceIdentifier,
+        xbrl_evidence: XbrlFactEvidence,
+    ) -> Result<Self, ResearchError> {
+        require_instrument(&context)?;
+        xbrl_evidence.validate_value(value)?;
+        Ok(Self {
+            context,
+            concept,
+            value: value.normalize(),
+            unit,
+            xbrl_evidence: Some(Box::new(xbrl_evidence)),
         })
     }
 
@@ -111,6 +138,11 @@ impl FundamentalObservation {
     pub const fn unit(&self) -> &SourceIdentifier {
         &self.unit
     }
+
+    /// Returns optional occurrence-level XBRL audit evidence.
+    pub fn xbrl_evidence(&self) -> Option<&XbrlFactEvidence> {
+        self.xbrl_evidence.as_deref()
+    }
 }
 
 #[derive(Deserialize)]
@@ -120,6 +152,8 @@ struct FundamentalObservationWire {
     concept: SourceIdentifier,
     value: Decimal,
     unit: SourceIdentifier,
+    #[serde(default)]
+    xbrl_evidence: Option<XbrlFactEvidence>,
 }
 
 impl<'de> Deserialize<'de> for FundamentalObservation {
@@ -128,8 +162,17 @@ impl<'de> Deserialize<'de> for FundamentalObservation {
         D: Deserializer<'de>,
     {
         let wire = FundamentalObservationWire::deserialize(deserializer)?;
-        Self::new(wire.context, wire.concept, wire.value, wire.unit)
-            .map_err(serde::de::Error::custom)
+        match wire.xbrl_evidence {
+            Some(evidence) => Self::new_with_xbrl_evidence(
+                wire.context,
+                wire.concept,
+                wire.value,
+                wire.unit,
+                evidence,
+            ),
+            None => Self::new(wire.context, wire.concept, wire.value, wire.unit),
+        }
+        .map_err(serde::de::Error::custom)
     }
 }
 

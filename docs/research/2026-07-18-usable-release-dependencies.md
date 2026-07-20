@@ -57,7 +57,7 @@ queried from the live event-to-action path.
 
 | Direct dependency | Exact manifest request | License / floor | Admission rationale and transitive risk |
 | --- | --- | --- | --- |
-| [`reqwest`](https://docs.rs/crate/reqwest/0.13.4) | `=0.13.4`, `default-features = false`, `features = ["gzip", "json", "rustls-no-provider", "stream"]` | MIT OR Apache-2.0; Rust 1.85 | Disables native TLS, cookies, system proxy discovery, HTTP/2/3, SOCKS, multipart, and alternate compression. Install one application-selected rustls crypto provider explicitly and keep the existing endpoint allowlist, DNS/IP checks, redirect revalidation, body limits, deadlines, and cancellation. A compressed response is still bounded on decoded bytes. |
+| [`reqwest`](https://docs.rs/crate/reqwest/0.13.4) | `=0.13.4`, `default-features = false`, `features = ["gzip", "json", "rustls-no-provider", "stream"]` | MIT OR Apache-2.0; Rust 1.85 | Disables native TLS, cookies, system proxy discovery, HTTP/2/3, SOCKS, multipart, and alternate compression. Install one application-selected rustls crypto provider explicitly and keep the existing endpoint allowlist, DNS/IP checks, redirect revalidation, body limits, deadlines, and cancellation. A compressed response is still bounded on decoded bytes. See reqwest's [0.13.4 TLS module](https://docs.rs/reqwest/0.13.4/reqwest/tls/index.html). |
 | [`csv`](https://docs.rs/crate/csv/1.4.0) | `=1.4.0` | Unlicense OR MIT; Rust 1.73 | Mature streaming parser, wrapped by owned row, field, decoded-byte, record-count, encoding, decimal, timestamp, and cancellation limits. Schema inference is opt-in and bounded. |
 | [`quick-xml`](https://docs.rs/crate/quick-xml/0.41.0) | `=0.41.0`, `default-features = false`, `features = ["encoding"]` | MIT; Rust 1.79 | Use the pull reader, not unbounded Serde materialization. Reject DTDs, external entities, unexpected namespaces, excessive depth/text/attributes, and trailing content. This parser covers Treasury XML, XBRL, and OFX 2 XML; OFX 1 SGML receives an owned bounded tokenizer. |
 | [`calamine`](https://docs.rs/crate/calamine/0.36.0) | `=0.36.0`, `default-features = false`, `features = ["dates"]` | MIT; Rust 1.88 | Required for Excel import. Its graph includes ZIP deflate, XML, code-page decoding, and fast numeric conversion. Admission requires archive entry/count/ratio/expanded-byte, worksheet/cell/string, date-system, formula-result, and type bounds before canonical conversion. |
@@ -73,7 +73,13 @@ queried from the live event-to-action path.
 entities, ZIP bombs, Excel formulas, OFX ambiguity, and Parquet metadata are rejected or normalized
 by Market Squawk-owned bounded adapters before domain construction. SQLite/database export support
 reads only operator-selected local files through controlled paths; it never accepts an arbitrary
-connection string or remote database.
+connection string or remote database endpoint. As of 2026-07-20, remote HTTP adapters pin
+`rustls = 0.23.42` with only `ring` and
+`std`, call the project-owned install boundary before constructing a reqwest client, and consume the
+minted capability at construction. The boundary is idempotent for project callers and fails closed
+if another process component installed a provider first; see rustls's
+[`CryptoProvider`](https://docs.rs/rustls/0.23.42/rustls/crypto/struct.CryptoProvider.html)
+contract. This proves the selected in-process implementation, not any external provider identity.
 
 ### MCP, Python, and inference
 

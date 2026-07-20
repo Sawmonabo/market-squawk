@@ -95,6 +95,11 @@ pub use research::{
     AlternativeDataObservation, CorporateActionObservation, FilingObservation,
     FundamentalObservation, MacroMissingValue, MacroObservation, MacroValue, PositionObservation,
     PositionSide, ResearchError, ResearchObservation, TransactionObservation,
+    MAX_XBRL_DIMENSIONS,
+    XBRL_FACT_EVIDENCE_SCHEMA_VERSION, XbrlAccuracy, XbrlAccuracyValue, XbrlDimensionEvidence,
+    XbrlDimensionLocation, XbrlDimensionMember, XbrlDuplicateClass, XbrlDuplicateEvidence,
+    XbrlEntity, XbrlEvidenceError, XbrlFactEvidence, XbrlFactEvidenceInput, XbrlPeriod, XbrlSign,
+    XbrlTaxonomySet, XbrlText,
 };
 pub use retained::{
     RetainedLayoutError, checked_arc_bytes_allocation_bytes, checked_arc_str_allocation_bytes,

@@ -15,6 +15,7 @@ mod live;
 mod metadata;
 mod policy;
 mod registry;
+mod tls;
 
 /// Conservative charge for the allocation metadata every `Arc<T>` retains independently of `T`.
 ///
@@ -98,6 +99,7 @@ pub use registry::{
     SessionQuarantineDisposition, SessionRecoveryDisposition, ValidatedCurrentSourceAuthority,
     ValidatedLiveScope, ValidatedSessionDecodeOutcome, ValidatedSourceSession,
 };
+pub use tls::{TlsProviderCapability, TlsProviderError, install_ring_tls_provider};
 
 #[cfg(test)]
 mod allocation_charge_tests {
