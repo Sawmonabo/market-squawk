@@ -2987,6 +2987,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "market-squawk-adapter-files"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "fs2",
+ "market-squawk-domain",
+ "market-squawk-platform",
+ "market-squawk-sources",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "tokio-util",
+]
+
+[[package]]
 name = "market-squawk-adapter-kraken"
 version = "0.1.0"
 dependencies = [
