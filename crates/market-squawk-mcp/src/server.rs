@@ -22,22 +22,28 @@ use rmcp::{
         ServerCapabilities, ServerInfo, ServerJsonRpcMessage, ServerResult, TaskSupport, Tool,
         ToolAnnotations, ToolExecution,
     },
-    service::{
-        NotificationContext, QuitReason, RequestContext as McpRequestContext, serve_server_with_ct,
-    },
+    service::{NotificationContext, QuitReason, RequestContext as McpRequestContext},
 };
 use serde_json::json;
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    sync::mpsc,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    ArtifactError, ArtifactPublication, ArtifactRepository, AuditSink, LocalProcessIdentityClass,
-    McpLimits,
+    ArtifactError, ArtifactPublication, ArtifactRepository, AuditResultClass, AuditSink,
+    LocalProcessIdentityClass, McpLimits,
+    isolation::{
+        IsolatedSdkOutcome, McpProgressSink, ProgressDelivery, SdkArtifactRepository,
+        SdkToolServices, SessionSupervisor, run_artifact_calls, run_isolated_sdk, run_sdk_output,
+        run_service_calls, sdk_transport,
+    },
     protocol::{
-        BoundedRmcpTransport, STATE_AWAIT_INITIALIZE, STATE_AWAIT_INITIALIZED, STATE_READY,
-        TransportConfig, TransportError, TransportMonitor, input_audit_failed, input_io_failed,
-        input_rejected, output_audit_failed, output_io_failed, output_peer_closed,
+        BoundedInputDriver, STATE_AWAIT_INITIALIZE, STATE_AWAIT_INITIALIZED, STATE_READY,
+        TransportConfig, TransportError, TransportMonitor, input_audit_failed, input_ended,
+        input_io_failed, input_rejected, output_audit_failed, output_io_failed, output_peer_closed,
         output_queue_timed_out, output_write_timed_out,
     },
 };
@@ -158,45 +164,142 @@ impl<S: ToolServices> McpServer<S> {
         W: AsyncWrite + Send + Unpin + 'static,
     {
         let initialization_state = Arc::new(AtomicU8::new(STATE_AWAIT_INITIALIZE));
+        let session_cancellation = cancellation.child_token();
+        let (service_calls, service_receiver) =
+            mpsc::channel(self.limits.maximum_active_requests());
+        let (artifact_publications, artifact_receiver) =
+            mpsc::channel(self.limits.maximum_active_requests());
+        let (progress_sender, progress_receiver) =
+            mpsc::channel(self.limits.maximum_active_requests());
         let handler = ServiceHandler {
-            services: self.services,
+            services: Arc::new(SdkToolServices {
+                capabilities: self.capabilities.clone(),
+                calls: service_calls,
+            }),
             capabilities: self.capabilities.clone(),
             tools: Arc::clone(&self.tools),
             limits: self.limits,
-            artifacts: self.artifacts,
+            artifacts: Arc::new(SdkArtifactRepository {
+                publications: artifact_publications,
+                timeout: self.limits.request_timeout(),
+            }),
+            progress_sender,
             initialization_state: Arc::clone(&initialization_state),
             identity_class,
         };
-        let (transport, monitor) = BoundedRmcpTransport::new(
+        let (input, monitor, writer) = BoundedInputDriver::new(
             reader,
             writer,
             TransportConfig {
                 limits: self.limits,
-                cancellation: cancellation.clone(),
+                cancellation: session_cancellation.clone(),
                 audit: self.audit,
                 identity_class,
                 capabilities: self.capabilities,
                 initialization_state,
             },
         )?;
-        let sdk_cancellation = cancellation.child_token();
-        let running = match serve_server_with_ct(handler, transport, sdk_cancellation).await {
-            Ok(running) => running,
+        let output = input.output_channel();
+        let (sdk_transport, sdk_input, sdk_output) = sdk_transport(self.limits);
+        let host_tasks = vec![
+            tokio::spawn(input.run(sdk_input)),
+            tokio::spawn(run_sdk_output(output, sdk_output)),
+            tokio::spawn(run_service_calls(
+                self.services,
+                service_receiver,
+                session_cancellation.clone(),
+            )),
+            tokio::spawn(run_artifact_calls(
+                self.artifacts,
+                artifact_receiver,
+                session_cancellation.clone(),
+            )),
+        ];
+        let sdk_cancellation = session_cancellation.child_token();
+        let shutdown_timeout = self.limits.shutdown_timeout();
+        let sdk_task = tokio::task::spawn_blocking(move || {
+            run_isolated_sdk(
+                handler,
+                sdk_transport,
+                progress_receiver,
+                sdk_cancellation,
+                shutdown_timeout,
+            )
+        });
+        let mut supervisor = SessionSupervisor::new(
+            session_cancellation,
+            sdk_task,
+            host_tasks,
+            writer,
+            shutdown_timeout,
+        );
+        let sdk_outcome = match supervisor.wait_sdk().await {
+            Ok(outcome) => outcome,
             Err(error) => {
-                return controlled_or_initialization_error(&monitor, cancellation, error);
+                let _ = supervisor
+                    .shutdown(
+                        AuditResultClass::OutputUnavailable,
+                        b"SDK isolation task failed",
+                    )
+                    .await;
+                return Err(error);
             }
         };
-        let reason = running.waiting().await.map_err(ServerError::RuntimeTask)?;
+        let runtime_result = match sdk_outcome {
+            IsolatedSdkOutcome::RuntimeBuild(error) => {
+                let _ = supervisor
+                    .shutdown(
+                        AuditResultClass::OutputUnavailable,
+                        b"SDK isolation runtime failed",
+                    )
+                    .await;
+                return Err(ServerError::SdkRuntime(error));
+            }
+            IsolatedSdkOutcome::InitializeFailed(error) => {
+                let (result_class, marker) = if cancellation.is_cancelled() {
+                    (
+                        AuditResultClass::Cancelled,
+                        b"initialization cancelled".as_slice(),
+                    )
+                } else {
+                    (
+                        AuditResultClass::ProtocolRejected,
+                        b"initialization rejected".as_slice(),
+                    )
+                };
+                let _ = supervisor.shutdown(result_class, marker).await;
+                return controlled_or_initialization_error(&monitor, cancellation, error);
+            }
+            IsolatedSdkOutcome::Finished(runtime_result) => runtime_result,
+        };
+        let (result_class, marker) = if cancellation.is_cancelled() {
+            (AuditResultClass::Cancelled, b"session cancelled".as_slice())
+        } else {
+            (
+                AuditResultClass::OutputUnavailable,
+                b"session ended".as_slice(),
+            )
+        };
+        let shutdown_result = supervisor.shutdown(result_class, marker).await;
+        if shutdown_result.is_err() {
+            let exit = exit_from(QuitReason::Closed, &monitor, cancellation.is_cancelled());
+            if !matches!(exit, ServerExit::EndOfInput) {
+                return Ok(exit);
+            }
+            return Err(ServerError::Transport);
+        }
+        let reason = runtime_result.map_err(ServerError::RuntimeTask)?;
         Ok(exit_from(reason, &monitor, cancellation.is_cancelled()))
     }
 }
 
-struct ServiceHandler<S: ToolServices> {
+pub(crate) struct ServiceHandler<S: ToolServices> {
     services: Arc<S>,
     capabilities: ServiceCapabilities,
     tools: Arc<[Tool]>,
     limits: McpLimits,
     artifacts: Arc<dyn ArtifactRepository>,
+    progress_sender: mpsc::Sender<ProgressDelivery>,
     initialization_state: Arc<AtomicU8>,
     identity_class: LocalProcessIdentityClass,
 }
@@ -209,6 +312,7 @@ impl<S: ToolServices> std::fmt::Debug for ServiceHandler<S> {
             .field("tool_count", &self.tools.len())
             .field("limits", &self.limits)
             .field("artifacts", &"[ARTIFACT REPOSITORY]")
+            .field("progress_sender", &"[BOUNDED PROGRESS CHANNEL]")
             .field("initialization_state", &self.initialization_state)
             .field("identity_class", &self.identity_class)
             .finish_non_exhaustive()
@@ -259,12 +363,28 @@ impl<S: ToolServices> ServiceHandler<S> {
             .checked_add(self.limits.request_timeout())
             .ok_or_else(|| McpError::internal_error("request deadline is invalid", None))?;
         let request_cancellation = context.ct.child_token();
-        let service_context = ServiceRequestContext::new(
-            request_id,
-            request_cancellation.clone(),
-            deadline,
-            self.limits.service_limits(),
-        );
+        let service_context = if let Some(token) = context.meta.get_progress_token() {
+            ServiceRequestContext::with_progress(
+                request_id,
+                request_cancellation.clone(),
+                deadline,
+                self.limits.service_limits(),
+                self.limits.progress_limits(),
+                Arc::new(McpProgressSink {
+                    sender: self.progress_sender.clone(),
+                    peer: context.peer.clone(),
+                    token,
+                    timeout: self.limits.write_timeout(),
+                }),
+            )
+        } else {
+            ServiceRequestContext::new(
+                request_id,
+                request_cancellation.clone(),
+                deadline,
+                self.limits.service_limits(),
+            )
+        };
 
         let execution = async {
             let result = self
@@ -296,8 +416,12 @@ impl<S: ToolServices> ServiceHandler<S> {
         &self,
         result: market_squawk_services::TypedToolResult,
     ) -> Result<CallToolResult, McpError> {
-        let inline = result.encoded_bytes() <= self.limits.service_limits().maximum_inline_bytes()
-            && result.item_count() <= self.limits.service_limits().maximum_inline_items();
+        let limits = self.limits.service_limits();
+        result
+            .validate_against(limits)
+            .map_err(|_| service_error(ServiceError::InvalidResult))?;
+        let inline = result.encoded_bytes() <= limits.maximum_inline_bytes()
+            && result.item_count() <= limits.maximum_inline_items();
         let (structured, _items, _encoded_bytes) = result.into_parts();
         if inline {
             return Ok(structured_result(structured));
@@ -520,20 +644,22 @@ fn artifact_error(_error: ArtifactError) -> McpError {
 fn controlled_or_initialization_error(
     monitor: &TransportMonitor,
     cancellation: CancellationToken,
-    error: rmcp::service::ServerInitializeError,
+    _error: Box<rmcp::service::ServerInitializeError>,
 ) -> Result<ServerExit, ServerError> {
     let exit = exit_from(QuitReason::Closed, monitor, cancellation.is_cancelled());
+    let input_ended_cleanly = monitor.input_state() == input_ended();
     if matches!(
         exit,
         ServerExit::Cancelled
-            | ServerExit::EndOfInput
             | ServerExit::PeerClosed
             | ServerExit::WriteTimedOut
             | ServerExit::InputRejected
-    ) {
+            | ServerExit::AuditFailed
+    ) || (matches!(exit, ServerExit::EndOfInput) && input_ended_cleanly)
+    {
         Ok(exit)
     } else {
-        Err(ServerError::Initialize(Box::new(error)))
+        Err(ServerError::Initialize)
     }
 }
 
@@ -586,11 +712,17 @@ pub enum ServerError {
     #[error("bounded MCP transport construction failed")]
     Transport,
     /// Official SDK initialization failed.
-    #[error("MCP initialization failed: {0}")]
-    Initialize(#[source] Box<rmcp::service::ServerInitializeError>),
+    ///
+    /// Dynamic SDK details are deliberately omitted because rejected pre-initialization messages
+    /// can contain untrusted or sensitive protocol payloads.
+    #[error("MCP initialization failed")]
+    Initialize,
     /// Official SDK runtime task failed.
     #[error("MCP runtime task failed: {0}")]
     RuntimeTask(#[source] tokio::task::JoinError),
+    /// Dedicated official-SDK isolation runtime could not be constructed.
+    #[error("MCP isolation runtime construction failed: {0}")]
+    SdkRuntime(#[source] std::io::Error),
 }
 
 impl From<TransportError> for ServerError {

@@ -11,19 +11,14 @@ use std::{
 use market_squawk_services::{
     RequestId as ServiceRequestId, ServiceCapabilities, validate_json_contract,
 };
-use rmcp::{
-    RoleServer,
-    model::{
-        ClientJsonRpcMessage, ClientNotification, ClientRequest, ErrorCode, ErrorData,
-        JsonRpcMessage, RequestId, ServerJsonRpcMessage,
-    },
-    service::{RxJsonRpcMessage, TxJsonRpcMessage},
-    transport::Transport,
+use rmcp::model::{
+    ClientJsonRpcMessage, ClientNotification, ClientRequest, ErrorCode, ErrorData, GetExtensions,
+    JsonRpcMessage, RequestId, ServerJsonRpcMessage,
 };
 use serde_json::Value;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    sync::mpsc,
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
@@ -86,21 +81,118 @@ impl TransportMonitor {
 }
 
 /// Official-SDK transport with bounded owned framing and output.
-pub(crate) struct BoundedRmcpTransport<R> {
+pub(crate) struct BoundedInputDriver<R> {
     reader: BoundedFrameReader<R>,
     limits: McpLimits,
     cancellation: CancellationToken,
     output: Arc<OutputChannel>,
     input_state: Arc<AtomicU8>,
-    writer_task: Option<JoinHandle<()>>,
     capabilities: ServiceCapabilities,
     initialization_state: Arc<AtomicU8>,
+    notification_admission: NotificationAdmissionController,
 }
 
-impl<R> std::fmt::Debug for BoundedRmcpTransport<R> {
+#[derive(Clone, Debug)]
+struct NotificationAdmission {
+    _permit: Arc<OwnedSemaphorePermit>,
+}
+
+#[derive(Clone, Debug)]
+struct NotificationAdmissionController {
+    permits: Arc<Semaphore>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NotificationAdmissionSaturated;
+
+impl NotificationAdmissionController {
+    fn new(maximum_active: usize) -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(maximum_active)),
+        }
+    }
+
+    fn admit(
+        &self,
+        notification: &mut ClientNotification,
+    ) -> Result<(), NotificationAdmissionSaturated> {
+        let permit = Arc::clone(&self.permits)
+            .try_acquire_owned()
+            .map_err(|_| NotificationAdmissionSaturated)?;
+        notification.extensions_mut().insert(NotificationAdmission {
+            _permit: Arc::new(permit),
+        });
+        Ok(())
+    }
+}
+
+pub(crate) struct WriterSupervisor {
+    output: Arc<OutputChannel>,
+    limits: McpLimits,
+    writer_task: Option<JoinHandle<()>>,
+}
+
+impl std::fmt::Debug for WriterSupervisor {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("BoundedRmcpTransport")
+            .debug_struct("WriterSupervisor")
+            .field("limits", &self.limits)
+            .field("writer_task_owned", &self.writer_task.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl WriterSupervisor {
+    pub(crate) async fn shutdown(
+        &mut self,
+        result_class: AuditResultClass,
+        terminal_marker: &'static [u8],
+    ) -> Result<(), TransportError> {
+        let terminalized = self
+            .output
+            .terminalize_pending(result_class, terminal_marker);
+        let sender_closed = self.output.close_sender();
+        let writer_result = if let Some(mut writer_task) = self.writer_task.take() {
+            match tokio::time::timeout(self.limits.shutdown_timeout(), &mut writer_task).await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(_)) => Err(TransportError::WriterTask),
+                Err(_) => {
+                    writer_task.abort();
+                    let _ = writer_task.await;
+                    self.output.fail(output_write_timed_out());
+                    Err(TransportError::WriteTimedOut)
+                }
+            }
+        } else {
+            Ok(())
+        };
+        terminalized.and(sender_closed).and(writer_result)
+    }
+}
+
+impl Drop for WriterSupervisor {
+    fn drop(&mut self) {
+        if self
+            .output
+            .terminalize_pending(
+                AuditResultClass::OutputUnavailable,
+                b"writer supervisor dropped",
+            )
+            .is_err()
+        {
+            self.output.fail(output_audit_failed());
+        }
+        let _ = self.output.close_sender();
+        if let Some(writer_task) = self.writer_task.take() {
+            writer_task.abort();
+        }
+    }
+}
+
+impl<R> std::fmt::Debug for BoundedInputDriver<R> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BoundedInputDriver")
             .field("limits", &self.limits)
             .field("input_state", &self.input_state)
             .field("capabilities", &self.capabilities)
@@ -108,7 +200,7 @@ impl<R> std::fmt::Debug for BoundedRmcpTransport<R> {
     }
 }
 
-impl<R> BoundedRmcpTransport<R>
+impl<R> BoundedInputDriver<R>
 where
     R: AsyncRead + Send + Unpin + 'static,
 {
@@ -116,7 +208,7 @@ where
         reader: R,
         writer: W,
         config: TransportConfig,
-    ) -> Result<(Self, TransportMonitor), TransportError>
+    ) -> Result<(Self, TransportMonitor, WriterSupervisor), TransportError>
     where
         W: AsyncWrite + Send + Unpin + 'static,
     {
@@ -138,19 +230,24 @@ where
             output_state,
             input_state: Arc::clone(&input_state),
         };
-        Ok((
-            Self {
-                reader,
-                limits: config.limits,
-                cancellation: config.cancellation,
-                output,
-                input_state,
-                writer_task: Some(writer_task),
-                capabilities: config.capabilities,
-                initialization_state: config.initialization_state,
-            },
-            monitor,
-        ))
+        let transport = Self {
+            reader,
+            limits: config.limits,
+            cancellation: config.cancellation,
+            output: Arc::clone(&output),
+            input_state,
+            capabilities: config.capabilities,
+            initialization_state: config.initialization_state,
+            notification_admission: NotificationAdmissionController::new(
+                config.limits.maximum_active_requests(),
+            ),
+        };
+        let supervisor = WriterSupervisor {
+            output,
+            limits: config.limits,
+            writer_task: Some(writer_task),
+        };
+        Ok((transport, monitor, supervisor))
     }
 
     async fn receive_next(&mut self) -> Option<ClientJsonRpcMessage> {
@@ -314,7 +411,7 @@ where
             }
 
             let request_id = request_id_from_value(&value);
-            let message: ClientJsonRpcMessage = match serde_json::from_value(value) {
+            let mut message: ClientJsonRpcMessage = match serde_json::from_value(value) {
                 Ok(message) => message,
                 Err(_) => {
                     let pending = if let Some(id) = request_id.as_ref() {
@@ -343,6 +440,27 @@ where
                     continue;
                 }
             };
+
+            if let JsonRpcMessage::Notification(notification) = &mut message
+                && self
+                    .notification_admission
+                    .admit(&mut notification.notification)
+                    .is_err()
+            {
+                self.input_state.store(INPUT_REJECTED, Ordering::SeqCst);
+                if self
+                    .output
+                    .terminalize_pending(
+                        AuditResultClass::OutputUnavailable,
+                        b"notification work limit exceeded",
+                    )
+                    .is_err()
+                {
+                    self.output.fail(output_audit_failed());
+                    self.input_state.store(INPUT_AUDIT_FAILED, Ordering::SeqCst);
+                }
+                return None;
+            }
 
             if let JsonRpcMessage::Notification(notification) = &message
                 && let ClientNotification::InitializedNotification(_) = &notification.notification
@@ -490,40 +608,39 @@ fn admit_direct(
     Ok(PendingAudit::new(request_id, operation))
 }
 
-impl<R> Transport<RoleServer> for BoundedRmcpTransport<R>
+impl<R> BoundedInputDriver<R>
 where
     R: AsyncRead + Send + Unpin + 'static,
 {
-    type Error = TransportError;
-
-    fn send(
-        &mut self,
-        item: TxJsonRpcMessage<RoleServer>,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
-        let output = Arc::clone(&self.output);
-        async move { output.send_message(item).await }
+    pub(crate) fn output_channel(&self) -> Arc<OutputChannel> {
+        Arc::clone(&self.output)
     }
 
-    async fn receive(&mut self) -> Option<RxJsonRpcMessage<RoleServer>> {
-        self.receive_next().await
-    }
-
-    async fn close(&mut self) -> Result<(), Self::Error> {
-        self.output.close_sender()?;
-        let Some(mut writer_task) = self.writer_task.take() else {
-            return Ok(());
-        };
-        match tokio::time::timeout(self.limits.shutdown_timeout(), &mut writer_task).await {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(_)) => Err(TransportError::WriterTask),
-            Err(_) => {
-                writer_task.abort();
-                let _ = writer_task.await;
-                self.output.fail(output_write_timed_out());
-                Err(TransportError::WriteTimedOut)
+    pub(crate) async fn run(mut self, mut requests: mpsc::Receiver<SdkInboundRequest>) {
+        while let Some(request) = requests.recv().await {
+            let message = self.receive_next().await;
+            let ended = message.is_none();
+            if request.response.send(message).is_err() {
+                let _ = self.output.terminalize_pending(
+                    AuditResultClass::OutputUnavailable,
+                    b"SDK input channel closed",
+                );
+                return;
+            }
+            if ended {
+                return;
             }
         }
+        let _ = self.output.terminalize_pending(
+            AuditResultClass::OutputUnavailable,
+            b"SDK input channel closed",
+        );
     }
+}
+
+#[derive(Debug)]
+pub(crate) struct SdkInboundRequest {
+    pub(crate) response: oneshot::Sender<Option<ClientJsonRpcMessage>>,
 }
 
 fn operation_for(request: &ClientRequest, capabilities: &ServiceCapabilities) -> AuditOperation {
@@ -562,10 +679,57 @@ pub(crate) const fn input_rejected() -> u8 {
     INPUT_REJECTED
 }
 
+pub(crate) const fn input_ended() -> u8 {
+    INPUT_ENDED
+}
+
 pub(crate) const fn input_io_failed() -> u8 {
     INPUT_IO_FAILED
 }
 
 pub(crate) const fn input_audit_failed() -> u8 {
     INPUT_AUDIT_FAILED
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error;
+
+    use rmcp::model::{ClientJsonRpcMessage, GetExtensions, JsonRpcMessage};
+    use serde_json::json;
+
+    use super::{NotificationAdmissionController, NotificationAdmissionSaturated};
+
+    #[test]
+    fn notification_extensions_own_the_exact_admission_permit() -> Result<(), Box<dyn Error>> {
+        let admission = NotificationAdmissionController::new(1);
+        let mut first: ClientJsonRpcMessage = serde_json::from_value(json!({
+            "jsonrpc":"2.0",
+            "method":"notifications/initialized"
+        }))?;
+        let mut second: ClientJsonRpcMessage = serde_json::from_value(json!({
+            "jsonrpc":"2.0",
+            "method":"notifications/initialized"
+        }))?;
+        let JsonRpcMessage::Notification(first) = &mut first else {
+            return Err(std::io::Error::other("expected first notification").into());
+        };
+        let JsonRpcMessage::Notification(second) = &mut second else {
+            return Err(std::io::Error::other("expected second notification").into());
+        };
+
+        admission
+            .admit(&mut first.notification)
+            .map_err(|_| std::io::Error::other("first notification was not admitted"))?;
+        assert_eq!(
+            admission.admit(&mut second.notification),
+            Err(NotificationAdmissionSaturated)
+        );
+        let owned_extensions = std::mem::take(first.notification.extensions_mut());
+        drop(owned_extensions);
+        admission
+            .admit(&mut second.notification)
+            .map_err(|_| std::io::Error::other("notification permit was not released"))?;
+        Ok(())
+    }
 }

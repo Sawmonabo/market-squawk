@@ -23,8 +23,8 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    AuditError, AuditEvent, AuditOperation, AuditResultClass, AuditSink, LocalProcessIdentityClass,
-    McpLimits,
+    AuditCompletion, AuditCompletionReservation, AuditError, AuditEvent, AuditOperation,
+    AuditResultClass, AuditSink, LocalProcessIdentityClass, McpLimits,
 };
 
 const OUTPUT_RUNNING: u8 = 0;
@@ -127,7 +127,10 @@ where
             if newline.is_some() {
                 return self.finish_at_newline();
             }
-            if self.frame_len > self.maximum_bytes {
+            let waiting_for_fragmented_line_feed = self.frame_len
+                == self.maximum_bytes.saturating_add(1)
+                && self.frame.get(self.maximum_bytes) == Some(&b'\r');
+            if self.frame_len > self.maximum_bytes && !waiting_for_fragmented_line_feed {
                 return Err(FramingError::Oversized {
                     maximum_bytes: self.maximum_bytes,
                 });
@@ -195,6 +198,18 @@ struct PendingCompletion {
     audit: PendingAudit,
     result_class: AuditResultClass,
     terminalized: Arc<AtomicBool>,
+}
+
+#[derive(Debug)]
+struct ReservedCompletion {
+    intended_result_class: AuditResultClass,
+    reservation: AuditCompletionReservation,
+}
+
+impl ReservedCompletion {
+    fn commit(self, result_class: AuditResultClass) {
+        self.reservation.commit(result_class);
+    }
 }
 
 impl PendingCompletion {
@@ -432,34 +447,39 @@ impl OutputChannel {
         }
     }
 
-    fn record_completion(
+    fn reserve_completion(
         &self,
         completion: Option<PendingCompletion>,
         encoded: &[u8],
-    ) -> Result<(), TransportError> {
+    ) -> Result<Option<ReservedCompletion>, TransportError> {
         let Some(completion) = completion else {
-            return Ok(());
+            return Ok(None);
         };
         if completion
             .terminalized
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
-            return Ok(());
+            return Ok(None);
         }
-        let event = AuditEvent::completed(
+        let audit_completion = AuditCompletion::new(
             &completion.audit.request_id,
             self.identity_class,
             completion.audit.operation,
             self.limits.service_limits(),
             encoded,
-            completion.result_class,
         )?;
-        if self.audit.record(event).is_err() {
-            self.fail(OUTPUT_AUDIT_FAILED);
-            return Err(TransportError::Audit);
-        }
-        Ok(())
+        let reservation = self
+            .audit
+            .reserve_completion(audit_completion)
+            .map_err(|_| {
+                self.fail(OUTPUT_AUDIT_FAILED);
+                TransportError::Audit
+            })?;
+        Ok(Some(ReservedCompletion {
+            intended_result_class: completion.result_class,
+            reservation,
+        }))
     }
 
     fn record_output_unavailable(
@@ -467,14 +487,10 @@ impl OutputChannel {
         completion: Option<PendingCompletion>,
         encoded: &[u8],
     ) -> Result<(), TransportError> {
-        self.record_completion(
-            completion.map(|completion| PendingCompletion {
-                audit: completion.audit,
-                result_class: AuditResultClass::OutputUnavailable,
-                terminalized: completion.terminalized,
-            }),
-            encoded,
-        )
+        if let Some(reservation) = self.reserve_completion(completion, encoded)? {
+            reservation.commit(AuditResultClass::OutputUnavailable);
+        }
+        Ok(())
     }
 
     pub(crate) fn close_sender(&self) -> Result<(), TransportError> {
@@ -499,10 +515,12 @@ impl OutputChannel {
             .collect::<Vec<_>>();
         for audit in pending {
             let result_class = audit.shutdown_result_class(result_class);
-            self.record_completion(
+            if let Some(reservation) = self.reserve_completion(
                 Some(PendingCompletion::new(audit, result_class)),
                 terminal_marker,
-            )?;
+            )? {
+                reservation.commit(result_class);
+            }
         }
         Ok(())
     }
@@ -533,28 +551,44 @@ pub(crate) async fn run_writer<W>(
     W: AsyncWrite + Unpin,
 {
     while let Some(outbound) = receiver.recv().await {
+        let completion = match output.reserve_completion(outbound.completion, &outbound.encoded) {
+            Ok(completion) => completion,
+            Err(_) => {
+                let _ = outbound.acknowledgement.send(Err(DeliveryFailure::Audit));
+                return;
+            }
+        };
         let result = tokio::time::timeout_at(outbound.deadline, async {
             writer.write_all(&outbound.encoded).await?;
             writer.flush().await
         })
         .await;
         let delivery = match result {
-            Ok(Ok(())) => match output.record_completion(outbound.completion, &outbound.encoded) {
-                Ok(()) => Ok(()),
-                Err(_) => Err(DeliveryFailure::Audit),
-            },
+            Ok(Ok(())) => {
+                if let Some(completion) = completion {
+                    let result_class = completion.intended_result_class;
+                    completion.commit(result_class);
+                }
+                Ok(())
+            }
             Ok(Err(error)) if error.kind() == std::io::ErrorKind::BrokenPipe => {
-                let _ = output.record_output_unavailable(outbound.completion, &outbound.encoded);
+                if let Some(completion) = completion {
+                    completion.commit(AuditResultClass::OutputUnavailable);
+                }
                 output.fail(OUTPUT_PEER_CLOSED);
                 Err(DeliveryFailure::PeerClosed)
             }
             Ok(Err(_)) => {
-                let _ = output.record_output_unavailable(outbound.completion, &outbound.encoded);
+                if let Some(completion) = completion {
+                    completion.commit(AuditResultClass::OutputUnavailable);
+                }
                 output.fail(OUTPUT_IO_FAILED);
                 Err(DeliveryFailure::Io)
             }
             Err(_) => {
-                let _ = output.record_output_unavailable(outbound.completion, &outbound.encoded);
+                if let Some(completion) = completion {
+                    completion.commit(AuditResultClass::OutputUnavailable);
+                }
                 output.fail(OUTPUT_WRITE_TIMED_OUT);
                 Err(DeliveryFailure::TimedOut)
             }

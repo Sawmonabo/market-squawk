@@ -1,30 +1,35 @@
 use std::{
     collections::HashMap,
     error::Error,
+    pin::Pin,
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
+    task::{Context, Poll},
+    time::Duration,
 };
 
 use async_trait::async_trait;
 use market_squawk_mcp::{
-    ArtifactError, ArtifactPublication, ArtifactReference, ArtifactRepository, AuditError,
-    AuditEvent, AuditPhase, AuditSink, LocalProcessIdentityClass, McpLimitSpec, McpLimits,
-    McpServer, ServerError, ServerExit,
+    ArtifactError, ArtifactPublication, ArtifactReference, ArtifactRepository, AuditCompletion,
+    AuditCompletionReservation, AuditError, AuditEvent, AuditPhase, AuditSink,
+    LocalProcessIdentityClass, McpLimitSpec, McpLimits, McpServer, ServerError, ServerExit,
 };
 use market_squawk_services::{
-    RequestContext, ServiceCapabilities, ServiceError, ToolDescriptor, ToolEffects, ToolInputError,
-    ToolServices, TypedToolRequest, TypedToolResult,
+    ProgressError, RequestContext, ServiceCapabilities, ServiceError, ToolDescriptor, ToolEffects,
+    ToolInputError, ToolServices, TypedToolRequest, TypedToolResult,
 };
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, ReadHalf, WriteHalf};
+use tokio::io::{
+    AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, DuplexStream, ReadHalf, WriteHalf,
+};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Default)]
 struct CollectingAudit {
-    events: Mutex<Vec<AuditEvent>>,
+    events: Arc<Mutex<Vec<AuditEvent>>>,
 }
 
 impl CollectingAudit {
@@ -50,6 +55,19 @@ impl AuditSink for CollectingAudit {
             .map_err(|_| AuditError::Unavailable)?
             .push(event);
         Ok(())
+    }
+
+    fn reserve_completion(
+        &self,
+        completion: AuditCompletion,
+    ) -> Result<AuditCompletionReservation, AuditError> {
+        let events = Arc::clone(&self.events);
+        Ok(AuditCompletionReservation::new(completion, move |event| {
+            events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(event);
+        }))
     }
 }
 
@@ -81,6 +99,36 @@ impl ToolServices for EmptyServices {
         _context: RequestContext,
     ) -> Result<TypedToolResult, ServiceError> {
         Err(ServiceError::NotFound)
+    }
+}
+
+#[derive(Debug)]
+struct DropTrackedWriter(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for DropTrackedWriter {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+impl AsyncWrite for DropTrackedWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Poll::Ready(Ok(buffer.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        _context: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -159,7 +207,7 @@ async fn lifecycle_negotiates_protocol_and_advertises_no_unregistered_domains()
     let audit = Arc::new(CollectingAudit::default());
     let mut harness = Harness::start(
         Arc::new(EmptyServices),
-        Arc::clone(&audit),
+        audit.clone(),
         McpLimits::try_from(McpLimitSpec::default())?,
     )
     .await?;
@@ -175,6 +223,13 @@ async fn lifecycle_negotiates_protocol_and_advertises_no_unregistered_domains()
     assert_eq!(harness.receive().await?["error"]["code"], -32002);
 
     harness.initialized().await?;
+    harness
+        .send(json!({"jsonrpc":"2.0","id":"","method":"ping"}))
+        .await?;
+    let empty_id = harness.receive().await?;
+    assert_eq!(empty_id["id"], "");
+    assert_eq!(empty_id["result"], json!({}));
+
     harness
         .send(json!({
             "jsonrpc":"2.0",
@@ -225,8 +280,70 @@ async fn lifecycle_negotiates_protocol_and_advertises_no_unregistered_domains()
             AuditPhase::Completed,
             AuditPhase::Admitted,
             AuditPhase::Completed,
+            AuditPhase::Admitted,
+            AuditPhase::Completed,
         ]
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn preinitialize_exits_own_the_writer_and_terminalize_admitted_audits()
+-> Result<(), Box<dyn Error>> {
+    let audit = Arc::new(CollectingAudit::default());
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let server = McpServer::try_new(
+        Arc::new(EmptyServices),
+        McpLimits::try_from(McpLimitSpec::default())?,
+        audit.clone(),
+        Arc::new(RejectingArtifacts),
+    )?;
+    let (mut input, reader) = tokio::io::duplex(4 * 1024);
+    input
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":\"wrong\",\"method\":\"tools/list\"}\n")
+        .await?;
+    input.shutdown().await?;
+    let wrong = tokio::time::timeout(
+        Duration::from_secs(1),
+        server.serve_unverified_io(
+            reader,
+            DropTrackedWriter(Arc::clone(&dropped)),
+            CancellationToken::new(),
+        ),
+    )
+    .await?;
+    assert!(
+        matches!(wrong, Err(ServerError::Initialize)),
+        "unexpected pre-initialize result: {wrong:?}"
+    );
+    assert!(dropped.load(Ordering::SeqCst));
+    assert_eq!(
+        audit.phases()?,
+        vec![AuditPhase::Admitted, AuditPhase::Completed]
+    );
+
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let server = McpServer::try_new(
+        Arc::new(EmptyServices),
+        McpLimits::try_from(McpLimitSpec::default())?,
+        Arc::new(CollectingAudit::default()),
+        Arc::new(RejectingArtifacts),
+    )?;
+    let (input_guard, reader) = tokio::io::duplex(64);
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    let cancelled = tokio::time::timeout(
+        Duration::from_secs(1),
+        server.serve_unverified_io(
+            reader,
+            DropTrackedWriter(Arc::clone(&dropped)),
+            cancellation,
+        ),
+    )
+    .await??;
+    drop(input_guard);
+    assert_eq!(cancelled, ServerExit::Cancelled);
+    assert!(dropped.load(Ordering::SeqCst));
     Ok(())
 }
 
@@ -234,6 +351,69 @@ async fn lifecycle_negotiates_protocol_and_advertises_no_unregistered_domains()
 struct WaitingService {
     started: Notify,
     calls: AtomicUsize,
+}
+
+#[derive(Debug, Default)]
+struct ProgressService {
+    rejected_bounds: AtomicUsize,
+}
+
+#[async_trait]
+impl ToolServices for ProgressService {
+    fn capabilities(&self) -> ServiceCapabilities {
+        let descriptor = ToolDescriptor::try_new(
+            "test.progress",
+            "1",
+            "Report bounded progress for a test-only operation.",
+            json!({"type":"object","properties":{},"additionalProperties":false}),
+            ToolEffects::read_only_closed_world(),
+            |arguments: &serde_json::Map<String, Value>| {
+                arguments
+                    .is_empty()
+                    .then_some(())
+                    .ok_or(ToolInputError::Invalid)
+            },
+        );
+        ServiceCapabilities::try_new(descriptor.into_iter().collect())
+            .unwrap_or_else(|_| ServiceCapabilities::empty())
+    }
+
+    async fn call(
+        &self,
+        _request: TypedToolRequest,
+        context: RequestContext,
+    ) -> Result<TypedToolResult, ServiceError> {
+        context
+            .progress()
+            .report(1, Some(2), Some("phase one"))
+            .await?;
+        if matches!(
+            context.progress().report(0, Some(2), None).await,
+            Err(ProgressError::NonMonotonic)
+        ) {
+            self.rejected_bounds.fetch_add(1, Ordering::SeqCst);
+        }
+        if matches!(
+            context
+                .progress()
+                .report(2, Some(2), Some("message exceeds limit"))
+                .await,
+            Err(ProgressError::MessageTooLong)
+        ) {
+            self.rejected_bounds.fetch_add(1, Ordering::SeqCst);
+        }
+        context
+            .progress()
+            .report(2, Some(2), Some("phase two"))
+            .await?;
+        if matches!(
+            context.progress().report(2, Some(2), None).await,
+            Err(ProgressError::TooManyUpdates)
+        ) {
+            self.rejected_bounds.fetch_add(1, Ordering::SeqCst);
+        }
+        TypedToolResult::try_new(json!({"done": true}), 1, context.limits()).map_err(Into::into)
+    }
 }
 
 #[async_trait]
@@ -392,5 +572,46 @@ async fn duplicate_active_ids_are_rejected_and_cancellation_reaches_the_service(
             .values()
             .all(|counts| counts.0 > 0 && counts.0 == counts.1)
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn progress_tokens_bridge_through_a_bounded_transport_neutral_reporter()
+-> Result<(), Box<dyn Error>> {
+    let service = Arc::new(ProgressService::default());
+    let mut harness = Harness::start(
+        Arc::clone(&service),
+        Arc::new(CollectingAudit::default()),
+        McpLimits::try_from(McpLimitSpec {
+            maximum_progress_updates: 2,
+            maximum_progress_message_bytes: 16,
+            ..McpLimitSpec::default()
+        })?,
+    )
+    .await?;
+    let _ = harness.initialize(json!("init-progress")).await?;
+    harness.initialized().await?;
+    harness
+        .send(json!({
+            "jsonrpc":"2.0","id":"progress","method":"tools/call",
+            "params":{
+                "name":"test.progress","arguments":{},
+                "_meta":{"progressToken":"progress-token"}
+            }
+        }))
+        .await?;
+    let first = harness.receive().await?;
+    let second = harness.receive().await?;
+    let result = harness.receive().await?;
+    assert_eq!(first["method"], "notifications/progress");
+    assert_eq!(first["params"]["progressToken"], "progress-token");
+    assert_eq!(first["params"]["progress"], 1.0);
+    assert_eq!(first["params"]["message"], "phase one");
+    assert_eq!(second["params"]["progress"], 2.0);
+    assert_eq!(second["params"]["message"], "phase two");
+    assert_eq!(result["id"], "progress");
+    assert_eq!(result["result"]["structuredContent"]["done"], true);
+    assert_eq!(service.rejected_bounds.load(Ordering::SeqCst), 3);
+    assert_eq!(harness.close().await?, ServerExit::EndOfInput);
     Ok(())
 }

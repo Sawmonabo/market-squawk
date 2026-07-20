@@ -97,27 +97,105 @@ impl AuditEvent {
             result_class: None,
         })
     }
+}
 
-    pub(crate) fn completed(
+/// Payload-free completion envelope accepted before response publication.
+///
+/// The sink reserves durable or bounded capacity for this envelope synchronously, while the
+/// terminal result class is committed only after the transport knows whether publication
+/// succeeded. This preserves fail-closed ordering without misclassifying output failures.
+#[derive(Clone)]
+pub struct AuditCompletion {
+    event: AuditEvent,
+}
+
+impl AuditCompletion {
+    pub(crate) fn new(
         request_id: &RequestId,
         identity_class: LocalProcessIdentityClass,
         operation: AuditOperation,
         limits: ServiceLimits,
         response_bytes: &[u8],
-        result_class: AuditResultClass,
     ) -> Result<Self, AuditError> {
         Ok(Self {
-            phase: AuditPhase::Completed,
-            request_id_sha256: hash_request_id(request_id)?,
-            identity_class,
-            operation,
-            limits,
-            occurred_at: SystemTime::now(),
-            content_sha256: hash_bytes(response_bytes),
-            result_class: Some(result_class),
+            event: AuditEvent {
+                phase: AuditPhase::Completed,
+                request_id_sha256: hash_request_id(request_id)?,
+                identity_class,
+                operation,
+                limits,
+                occurred_at: SystemTime::now(),
+                content_sha256: hash_bytes(response_bytes),
+                result_class: None,
+            },
         })
     }
 
+    fn into_event(mut self, result_class: AuditResultClass) -> AuditEvent {
+        self.event.result_class = Some(result_class);
+        self.event
+    }
+}
+
+impl fmt::Debug for AuditCompletion {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuditCompletion")
+            .field("event", &self.event)
+            .finish()
+    }
+}
+
+/// Infallible one-shot terminal commit backed by capacity accepted from an [`AuditSink`].
+pub struct AuditCompletionReservation {
+    completion: Option<AuditCompletion>,
+    commit: Option<Box<dyn FnOnce(AuditEvent) + Send + 'static>>,
+}
+
+impl AuditCompletionReservation {
+    /// Creates a reservation after the sink has durably or boundedly accepted its capacity.
+    ///
+    /// The callback must be infallible and must not perform unbounded or blocking work. Dropping an
+    /// uncommitted reservation records [`AuditResultClass::OutputUnavailable`].
+    #[must_use]
+    pub fn new<F>(completion: AuditCompletion, commit: F) -> Self
+    where
+        F: FnOnce(AuditEvent) + Send + 'static,
+    {
+        Self {
+            completion: Some(completion),
+            commit: Some(Box::new(commit)),
+        }
+    }
+
+    pub(crate) fn commit(mut self, result_class: AuditResultClass) {
+        self.finish(result_class);
+    }
+
+    fn finish(&mut self, result_class: AuditResultClass) {
+        if let (Some(completion), Some(commit)) = (self.completion.take(), self.commit.take()) {
+            commit(completion.into_event(result_class));
+        }
+    }
+}
+
+impl fmt::Debug for AuditCompletionReservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuditCompletionReservation")
+            .field("completion", &self.completion)
+            .field("commit", &"[AUDIT COMMIT]")
+            .finish()
+    }
+}
+
+impl Drop for AuditCompletionReservation {
+    fn drop(&mut self) {
+        self.finish(AuditResultClass::OutputUnavailable);
+    }
+}
+
+impl AuditEvent {
     /// Event lifecycle phase.
     #[must_use]
     pub const fn phase(&self) -> AuditPhase {
@@ -205,6 +283,17 @@ pub trait AuditSink: Send + Sync + 'static {
     ///
     /// Returns [`AuditError`] when the event cannot be durably or boundedly accepted.
     fn record(&self, event: AuditEvent) -> Result<(), AuditError>;
+
+    /// Reserves one completion envelope before any corresponding response bytes are written.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuditError`] unless the returned reservation can later commit exactly one
+    /// terminal event without failure or further capacity acquisition.
+    fn reserve_completion(
+        &self,
+        completion: AuditCompletion,
+    ) -> Result<AuditCompletionReservation, AuditError>;
 }
 
 /// Audit admission or encoding failure.

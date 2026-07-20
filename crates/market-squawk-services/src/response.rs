@@ -63,6 +63,27 @@ impl TypedToolResult {
         self.encoded_bytes
     }
 
+    /// Revalidates this result against the exact limits admitted by its current caller.
+    ///
+    /// A service result can cross transport or composition boundaries after being constructed
+    /// under a different valid limit set. Consumers must call this method before publishing it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceContractError`] when the logical item count or structured JSON exceeds
+    /// any hard limit supplied by the current caller.
+    pub fn validate_against(&self, limits: ServiceLimits) -> Result<(), ServiceContractError> {
+        if self.item_count > limits.maximum_result_items() {
+            return Err(ServiceContractError::TooManyItems);
+        }
+        let _ = validate_json_contract(
+            &self.structured_content,
+            limits.result_structure(),
+            limits.maximum_result_bytes(),
+        )?;
+        Ok(())
+    }
+
     /// Consumes the result into its structured content and logical item count.
     #[must_use]
     pub fn into_parts(self) -> (Value, usize, usize) {

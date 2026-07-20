@@ -7,7 +7,7 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 
 use crate::{
-    JsonStructureLimits, RequestContext, ServiceContractError, TypedToolResult,
+    JsonStructureLimits, ProgressError, RequestContext, ServiceContractError, TypedToolResult,
     validate_json_contract,
 };
 
@@ -468,6 +468,21 @@ impl ServiceError {
 impl From<ServiceContractError> for ServiceError {
     fn from(_source: ServiceContractError) -> Self {
         Self::InvalidResult
+    }
+}
+
+impl From<ProgressError> for ServiceError {
+    fn from(source: ProgressError) -> Self {
+        match source {
+            ProgressError::Cancelled => Self::Cancelled,
+            ProgressError::DeadlineExceeded => Self::DeadlineExceeded,
+            ProgressError::TooManyUpdates | ProgressError::MessageTooLong => {
+                Self::ResourceExhausted
+            }
+            ProgressError::NonMonotonic | ProgressError::InvalidValue => Self::InvalidRequest,
+            ProgressError::Unavailable | ProgressError::Delivery => Self::Unavailable,
+            ProgressError::State => Self::Internal,
+        }
     }
 }
 

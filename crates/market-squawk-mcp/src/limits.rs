@@ -3,7 +3,8 @@
 use std::time::Duration;
 
 use market_squawk_services::{
-    JsonContractError, JsonStructureLimits, ServiceLimits, ServiceLimitsError,
+    JsonContractError, JsonStructureLimits, ProgressLimits, ProgressLimitsError, ServiceLimits,
+    ServiceLimitsError,
 };
 use thiserror::Error;
 
@@ -20,6 +21,8 @@ const MAXIMUM_INLINE_BYTES: usize = 16 * 1024 * 1024;
 const MAXIMUM_INLINE_ITEMS: usize = 100_000;
 const MAXIMUM_RESULT_BYTES: usize = 256 * 1024 * 1024;
 const MAXIMUM_RESULT_ITEMS: usize = 10_000_000;
+const MAXIMUM_PROGRESS_UPDATES: usize = 100_000;
+const MAXIMUM_PROGRESS_MESSAGE_BYTES: usize = 64 * 1024;
 const MAXIMUM_RESPONSE_ENVELOPE_BYTES: usize = 16 * 1024;
 const MAXIMUM_ACTIVE_BODY_BYTES: usize = 512 * 1024 * 1024;
 const MAXIMUM_ACTIVE_RESULT_BYTES: usize = 512 * 1024 * 1024;
@@ -53,6 +56,10 @@ pub struct McpLimitSpec {
     pub maximum_result_bytes: usize,
     /// Hard ceiling for logical result items.
     pub maximum_result_items: usize,
+    /// Maximum progress notifications accepted from one request.
+    pub maximum_progress_updates: usize,
+    /// Maximum UTF-8 bytes in one progress message.
+    pub maximum_progress_message_bytes: usize,
     /// Default request execution deadline.
     pub request_timeout: Duration,
     /// Maximum queue admission or physical write duration.
@@ -77,6 +84,8 @@ impl Default for McpLimitSpec {
             maximum_inline_items: 1_000,
             maximum_result_bytes: 64 * 1024 * 1024,
             maximum_result_items: 1_000_000,
+            maximum_progress_updates: 1_024,
+            maximum_progress_message_bytes: 1_024,
             request_timeout: Duration::from_secs(30),
             write_timeout: Duration::from_secs(5),
             shutdown_timeout: Duration::from_secs(5),
@@ -90,6 +99,7 @@ pub struct McpLimits {
     spec: McpLimitSpec,
     service: ServiceLimits,
     input_structure: JsonStructureLimits,
+    progress: ProgressLimits,
 }
 
 impl TryFrom<McpLimitSpec> for McpLimits {
@@ -110,6 +120,8 @@ impl TryFrom<McpLimitSpec> for McpLimits {
             spec.maximum_inline_items,
             spec.maximum_result_bytes,
             spec.maximum_result_items,
+            spec.maximum_progress_updates,
+            spec.maximum_progress_message_bytes,
         ]
         .contains(&0)
             || spec.request_timeout.is_zero()
@@ -134,6 +146,8 @@ impl TryFrom<McpLimitSpec> for McpLimits {
             || spec.maximum_inline_items > MAXIMUM_INLINE_ITEMS
             || spec.maximum_result_bytes > MAXIMUM_RESULT_BYTES
             || spec.maximum_result_items > MAXIMUM_RESULT_ITEMS
+            || spec.maximum_progress_updates > MAXIMUM_PROGRESS_UPDATES
+            || spec.maximum_progress_message_bytes > MAXIMUM_PROGRESS_MESSAGE_BYTES
         {
             return Err(McpLimitError::LimitTooLarge);
         }
@@ -150,6 +164,13 @@ impl TryFrom<McpLimitSpec> for McpLimits {
             .is_none_or(|encoded| encoded > spec.maximum_frame_bytes)
         {
             return Err(McpLimitError::InlineExceedsFrame);
+        }
+        if spec
+            .maximum_progress_message_bytes
+            .checked_add(MAXIMUM_RESPONSE_ENVELOPE_BYTES)
+            .is_none_or(|encoded| encoded > spec.maximum_frame_bytes)
+        {
+            return Err(McpLimitError::ProgressExceedsFrame);
         }
         if spec
             .maximum_active_requests
@@ -188,10 +209,15 @@ impl TryFrom<McpLimitSpec> for McpLimits {
             spec.maximum_result_items,
             input_structure,
         )?;
+        let progress = ProgressLimits::try_new(
+            spec.maximum_progress_updates,
+            spec.maximum_progress_message_bytes,
+        )?;
         Ok(Self {
             spec,
             service,
             input_structure,
+            progress,
         })
     }
 }
@@ -236,6 +262,10 @@ impl McpLimits {
     pub(crate) const fn input_structure(self) -> JsonStructureLimits {
         self.input_structure
     }
+
+    pub(crate) const fn progress_limits(self) -> ProgressLimits {
+        self.progress
+    }
 }
 
 /// Invalid resource-ceiling configuration.
@@ -250,6 +280,9 @@ pub enum McpLimitError {
     /// Inline structured data plus worst-case JSON-RPC identity/envelope must fit one frame.
     #[error("MCP inline result and response envelope exceed the frame limit")]
     InlineExceedsFrame,
+    /// Progress notifications plus their JSON-RPC envelope must fit one output frame.
+    #[error("MCP progress message and envelope exceed the frame limit")]
+    ProgressExceedsFrame,
     /// Cross-field active-request and result memory exposure must remain bounded.
     #[error("MCP aggregate active byte exposure exceeds the supported maximum")]
     AggregateActiveBytes,
@@ -268,4 +301,7 @@ pub enum McpLimitError {
     /// JSON structural limits are invalid.
     #[error("invalid MCP JSON limits: {0}")]
     Json(#[from] JsonContractError),
+    /// Progress limits are invalid.
+    #[error("invalid MCP progress limits: {0}")]
+    Progress(#[from] ProgressLimitsError),
 }

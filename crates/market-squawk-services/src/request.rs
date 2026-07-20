@@ -7,6 +7,8 @@ use serde_json::Value;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
+use crate::{ProgressLimits, ProgressReporter, ProgressSink};
+
 const MAXIMUM_REQUEST_ID_BYTES: usize = 1024;
 const MAXIMUM_JSON_DEPTH: usize = 64;
 const MAXIMUM_JSON_STRING_BYTES: usize = 16 * 1024 * 1024;
@@ -43,12 +45,9 @@ impl RequestId {
     ///
     /// # Errors
     ///
-    /// Returns [`RequestIdError`] when the identifier is empty or exceeds 1,024 UTF-8 bytes.
+    /// Returns [`RequestIdError`] when the identifier exceeds 1,024 UTF-8 bytes.
     pub fn try_string(value: impl Into<Arc<str>>) -> Result<Self, RequestIdError> {
         let value = value.into();
-        if value.is_empty() {
-            return Err(RequestIdError::Empty);
-        }
         if value.len() > MAXIMUM_REQUEST_ID_BYTES {
             return Err(RequestIdError::TooLong {
                 maximum_bytes: MAXIMUM_REQUEST_ID_BYTES,
@@ -82,9 +81,6 @@ impl fmt::Debug for RequestId {
 /// Invalid request identifier.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum RequestIdError {
-    /// String identifiers cannot be empty.
-    #[error("request identifier cannot be empty")]
-    Empty,
     /// String identifier exceeded its byte ceiling.
     #[error("request identifier exceeds {maximum_bytes} bytes")]
     TooLong {
@@ -361,22 +357,51 @@ pub struct RequestContext {
     cancellation: CancellationToken,
     deadline: Instant,
     limits: ServiceLimits,
+    progress: ProgressReporter,
 }
 
 impl RequestContext {
     /// Creates a context from transport-admitted limits and lifecycle controls.
     #[must_use]
-    pub const fn new(
+    pub fn new(
         request_id: RequestId,
         cancellation: CancellationToken,
         deadline: Instant,
         limits: ServiceLimits,
     ) -> Self {
+        let progress =
+            ProgressReporter::disabled(cancellation.clone(), deadline, ProgressLimits::default());
         Self {
             request_id,
             cancellation,
             deadline,
             limits,
+            progress,
+        }
+    }
+
+    /// Creates a context with a bounded transport-neutral progress capability.
+    #[must_use]
+    pub fn with_progress(
+        request_id: RequestId,
+        cancellation: CancellationToken,
+        deadline: Instant,
+        limits: ServiceLimits,
+        progress_limits: ProgressLimits,
+        progress_sink: Arc<dyn ProgressSink>,
+    ) -> Self {
+        let progress = ProgressReporter::enabled(
+            progress_sink,
+            cancellation.clone(),
+            deadline,
+            progress_limits,
+        );
+        Self {
+            request_id,
+            cancellation,
+            deadline,
+            limits,
+            progress,
         }
     }
 
@@ -403,6 +428,12 @@ impl RequestContext {
     pub const fn limits(&self) -> ServiceLimits {
         self.limits
     }
+
+    /// Bounded progress reporter associated with this request.
+    #[must_use]
+    pub const fn progress(&self) -> &ProgressReporter {
+        &self.progress
+    }
 }
 
 impl fmt::Debug for RequestContext {
@@ -413,6 +444,7 @@ impl fmt::Debug for RequestContext {
             .field("cancellation", &"[CANCELLATION TOKEN]")
             .field("deadline", &self.deadline)
             .field("limits", &self.limits)
+            .field("progress", &self.progress)
             .finish()
     }
 }
