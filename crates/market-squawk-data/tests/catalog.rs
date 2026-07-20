@@ -463,10 +463,13 @@ fn test_instrument(id: &str, status: &str) -> TestResult<InstrumentDefinition> {
     let _: market_squawk_domain::InstrumentId = id.parse()?;
     Ok(serde_json::from_value(serde_json::json!({
         "instrument_id": id,
+        "definition_revision": 1,
         "asset_class": "equity",
         "primary_denomination": { "kind": "currency", "value": "USD" },
+        "quote_currency": "USD",
         "tick_size": "0.01",
         "lot_size": "1",
+        "contract_multiplier": "1",
         "venue_mappings": [],
         "identifiers": [],
         "trading_status": status
