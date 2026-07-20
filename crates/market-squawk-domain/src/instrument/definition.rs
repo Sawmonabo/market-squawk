@@ -13,7 +13,7 @@ use crate::{
 };
 
 /// Current instrument reference definition with invariant-preserving private fields.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InstrumentDefinition {
     instrument_id: InstrumentId,
     asset_class: AssetClass,
@@ -290,6 +290,45 @@ impl InstrumentDefinition {
     /// Returns current reference-master trading status.
     pub const fn trading_status(&self) -> TradingStatus {
         self.trading_status
+    }
+}
+
+#[derive(Serialize)]
+struct InstrumentDefinitionWireRef<'a> {
+    instrument_id: InstrumentId,
+    definition_revision: InstrumentDefinitionRevision,
+    asset_class: AssetClass,
+    primary_denomination: Denomination,
+    quote_currency: Currency,
+    tick_size: TickSize,
+    lot_size: LotSize,
+    contract_multiplier: Decimal,
+    venue_mappings: &'a [VenueMapping],
+    provider_identity_registry: &'a ProviderIdentityRegistry,
+    identifiers: &'a [ExternalIdentifierRecord],
+    trading_status: TradingStatus,
+}
+
+impl Serialize for InstrumentDefinition {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        InstrumentDefinitionWireRef {
+            instrument_id: self.instrument_id,
+            definition_revision: self.definition_revision(),
+            asset_class: self.asset_class,
+            primary_denomination: self.primary_denomination(),
+            quote_currency: self.quote_currency(),
+            tick_size: self.tick_size(),
+            lot_size: self.lot_size(),
+            contract_multiplier: self.contract_multiplier(),
+            venue_mappings: &self.venue_mappings,
+            provider_identity_registry: &self.provider_identity_registry,
+            identifiers: &self.identifiers,
+            trading_status: self.trading_status,
+        }
+        .serialize(serializer)
     }
 }
 
