@@ -363,6 +363,11 @@ impl<C: TrustedClock> InstrumentLiveProcessor<C> {
             .ok_or(LiveApplyError::StreamStateMissing)
     }
 
+    /// Returns immutable reference-master execution terms owned by this route processor.
+    pub(crate) const fn execution_terms(&self) -> market_squawk_domain::InstrumentExecutionTerms {
+        self.definition.execution_terms()
+    }
+
     /// Revalidates exact applied authority before feature and strategy evaluation.
     pub(crate) fn validate_applied_current(
         &self,

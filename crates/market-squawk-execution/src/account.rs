@@ -1,201 +1,37 @@
 //! Fixed-capacity account ownership and atomic risk reservations.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
-use std::fmt;
-use std::num::{NonZeroU64, NonZeroUsize};
-use std::sync::atomic::{AtomicU64, Ordering};
+mod contracts;
+mod replacement;
+mod reservation;
+
+pub use contracts::{
+    AccountBootstrap, AccountCoordinatorConfig, AccountCoordinatorError,
+    AccountIdempotencyBootstrap, AccountIdempotencyBootstrapError, AccountIdempotencySnapshotError,
+    AccountIdempotencyTombstone,
+};
+pub(crate) use replacement::{
+    AccountReplacementCandidate, AccountReplacementReservationBinding, AccountStateReplacementBatch,
+};
+#[cfg(test)]
+pub(crate) use reservation::accepted_reservation_for_test;
+pub(crate) use reservation::{AccountOutcomeFailSafe, AccountSubmissionFailSafe};
+pub use reservation::{
+    AccountReservationError, AccountReservationStateError, AccountRiskReservation,
+};
+
+use std::collections::{HashMap, VecDeque};
+use std::num::NonZeroU64;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, TryLockError};
 
 use market_squawk_domain::{
-    AccountId, ClientOrderId, Currency, InstrumentId, Money, OrderSide, PriceTicks,
+    AccountId, Currency, InstrumentId, Money, OrderSide, PriceTicks, Timestamp,
 };
 use rust_decimal::Decimal;
-use thiserror::Error;
 
 use crate::clock::{AccountReservationLease, ClockReading, monotonic_deadline, system_now};
 use crate::limits::{AccountRiskViolation, ReservationCalculation};
-use crate::{OrderIntent, OrderIntentDigest, RiskLimits};
-
-/// Startup-fixed memory and partition bounds for authoritative account coordination.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct AccountCoordinatorConfig {
-    /// Number of deterministic account partitions.
-    pub partition_count: NonZeroUsize,
-    /// Maximum accounts retained in one partition.
-    pub max_accounts_per_partition: NonZeroUsize,
-    /// Maximum outstanding and terminal reservation records retained before compaction.
-    pub max_reservations_per_account: NonZeroUsize,
-    /// Maximum positions retained for one account.
-    pub max_positions_per_account: NonZeroUsize,
-    /// Maximum consumed client-order identities retained for one account.
-    pub max_idempotency_keys_per_account: NonZeroUsize,
-    /// Maximum accepted timestamps retained for rate enforcement.
-    pub max_rate_events_per_account: NonZeroUsize,
-}
-
-impl Default for AccountCoordinatorConfig {
-    fn default() -> Self {
-        Self {
-            partition_count: nonzero_usize(16),
-            max_accounts_per_partition: nonzero_usize(1_024),
-            max_reservations_per_account: nonzero_usize(256),
-            max_positions_per_account: nonzero_usize(4_096),
-            max_idempotency_keys_per_account: nonzero_usize(4_096),
-            max_rate_events_per_account: nonzero_usize(1_024),
-        }
-    }
-}
-
-fn nonzero_usize(value: usize) -> NonZeroUsize {
-    NonZeroUsize::new(value).unwrap_or(NonZeroUsize::MIN)
-}
-
-/// One explicit startup account state transferred into coordinator ownership.
-///
-/// Evaluation never accepts this structure. Once admitted, the coordinator is the only current
-/// account authority.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AccountBootstrap {
-    /// Stable account identity.
-    pub account_id: AccountId,
-    /// Nonzero upstream account revision.
-    pub revision: NonZeroU64,
-    /// Whether the account is currently eligible for orders.
-    pub eligible: bool,
-    /// Current available cash before new reservations.
-    pub cash: Money,
-    /// Current risk capital.
-    pub capital: Money,
-    /// Highest capital used for drawdown measurement.
-    pub peak_capital: Money,
-    /// Current gross exposure before new reservations.
-    pub gross_exposure: Money,
-    /// Current nonnegative realized loss measure.
-    pub realized_loss: Money,
-    /// Current signed positions in instrument lots.
-    pub positions: Vec<(InstrumentId, i64)>,
-}
-
-/// Atomic account coordination construction failure.
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-pub enum AccountCoordinatorError {
-    /// More accounts hashed to a partition than its startup bound permits.
-    #[error("account partition capacity exceeded")]
-    AccountCapacity,
-    /// The same account appeared more than once.
-    #[error("duplicate account bootstrap")]
-    DuplicateAccount,
-    /// A bootstrap violated currency, sign, peak, position, or capacity invariants.
-    #[error("invalid account bootstrap")]
-    InvalidBootstrap,
-}
-
-/// Stable, nonempty account reservation rejection.
-#[derive(Debug, Eq, PartialEq)]
-pub struct AccountReservationError {
-    reasons: Box<[AccountRiskViolation]>,
-}
-
-impl AccountReservationError {
-    /// Returns every applicable reason in stable enum order.
-    pub const fn reasons(&self) -> &[AccountRiskViolation] {
-        &self.reasons
-    }
-
-    fn from_reason(reason: AccountRiskViolation) -> Self {
-        Self {
-            reasons: Box::new([reason]),
-        }
-    }
-
-    fn from_reasons(mut reasons: Vec<AccountRiskViolation>) -> Self {
-        reasons.sort_unstable();
-        reasons.dedup();
-        debug_assert!(!reasons.is_empty());
-        Self {
-            reasons: reasons.into_boxed_slice(),
-        }
-    }
-}
-
-impl fmt::Display for AccountReservationError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("account risk rejected order:")?;
-        for reason in &self.reasons {
-            write!(formatter, " {reason}")?;
-        }
-        Ok(())
-    }
-}
-
-impl std::error::Error for AccountReservationError {}
-
-/// Private-field, non-cloneable account reservation.
-///
-/// This value conveys no broker or adapter authority. Dropping an active reservation releases its
-/// exposure atomically without acquiring the account partition lock.
-#[derive(Debug)]
-pub struct AccountRiskReservation {
-    account_id: AccountId,
-    intent_digest: OrderIntentDigest,
-    lease: Arc<AccountReservationLease>,
-}
-
-impl AccountRiskReservation {
-    /// Returns the reserved account.
-    pub const fn account_id(&self) -> AccountId {
-        self.account_id
-    }
-
-    /// Returns the exact order-intent digest bound to this reservation.
-    pub const fn intent_digest(&self) -> OrderIntentDigest {
-        self.intent_digest
-    }
-
-    /// Revalidates state revision, reservation state, and both deadlines.
-    ///
-    /// # Errors
-    ///
-    /// Fails after release, commit, reconciliation transition, account replacement, clock failure,
-    /// or inclusive expiration.
-    pub fn validate_current(&self) -> Result<(), AccountReservationStateError> {
-        let now = system_now().map_err(|_| AccountReservationStateError::ClockFailure)?;
-        self.lease.validate(now)
-    }
-
-    /// Explicitly releases the active reservation. Drop has the same fail-safe effect.
-    pub fn release(self) {
-        self.lease.release();
-    }
-
-    /// Marks an uncertain backend outcome. Exposure remains reserved until reconciliation.
-    pub fn mark_reconciliation_required(self) {
-        self.lease.mark_reconciliation_required();
-    }
-}
-
-impl Drop for AccountRiskReservation {
-    fn drop(&mut self) {
-        self.lease.release();
-    }
-}
-
-/// Current reservation validation failure.
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-pub enum AccountReservationStateError {
-    /// Reservation is released, committed, or awaiting reconciliation.
-    #[error("account reservation is not active")]
-    NotActive,
-    /// Authoritative account state changed after reservation.
-    #[error("account state revision changed")]
-    AccountStateChanged,
-    /// Either wall or monotonic expiry was reached.
-    #[error("account reservation expired")]
-    Expired,
-    /// Trusted clock failure.
-    #[error("trusted account-reservation clock failed")]
-    ClockFailure,
-}
+use crate::{OrderIntent, RiskLimits};
 
 /// Fixed-partition authoritative account owner.
 #[derive(Debug)]
@@ -214,14 +50,18 @@ impl AccountRiskCoordinator {
         config: AccountCoordinatorConfig,
         accounts: impl IntoIterator<Item = AccountBootstrap>,
     ) -> Result<Self, AccountCoordinatorError> {
+        let now = system_now().map_err(|_| AccountCoordinatorError::ClockFailure)?;
+        if config.maximum_intent_lifetime_nanos.get() > i64::MAX as u64 {
+            return Err(AccountCoordinatorError::InvalidIdempotencyBootstrap);
+        }
         let mut partitions = Vec::with_capacity(config.partition_count.get());
         for _ in 0..config.partition_count.get() {
             partitions.push(AccountPartition {
                 accounts: HashMap::with_capacity(config.max_accounts_per_partition.get()),
             });
         }
-        for account in accounts {
-            validate_bootstrap(&account, config.max_positions_per_account.get())?;
+        for mut account in accounts {
+            validate_bootstrap(&mut account, config, now)?;
             let index = partition_index(account.account_id, config.partition_count.get());
             let partition = &mut partitions[index];
             if partition.accounts.contains_key(&account.account_id) {
@@ -231,9 +71,10 @@ impl AccountRiskCoordinator {
                 return Err(AccountCoordinatorError::AccountCapacity);
             }
             let account_id = account.account_id;
-            partition
-                .accounts
-                .insert(account_id, AccountState::from_bootstrap(account));
+            partition.accounts.insert(
+                account_id,
+                AccountState::try_from_bootstrap(account, config)?,
+            );
         }
         Ok(Self {
             config,
@@ -316,6 +157,37 @@ impl AccountRiskCoordinator {
         };
         account.try_reserve(intent, reservation_price, limits, now, self.config)
     }
+
+    /// Returns one bounded, restart-loadable replay-fence snapshot for durable persistence.
+    ///
+    /// The trusted-time boundary evicts only tombstones whose inclusive intent deadline has passed
+    /// and advances the replay revision before copying the snapshot. This method is control-plane
+    /// only and performs no filesystem or network I/O.
+    pub fn snapshot_idempotency(
+        &self,
+        account_id: AccountId,
+    ) -> Result<AccountIdempotencyBootstrap, AccountIdempotencySnapshotError> {
+        let now = system_now().map_err(|_| AccountIdempotencySnapshotError::ClockFailure)?;
+        let index = partition_index(account_id, self.config.partition_count.get());
+        let mut partition = match self.partitions[index].try_lock() {
+            Ok(partition) => partition,
+            Err(TryLockError::WouldBlock) => return Err(AccountIdempotencySnapshotError::Busy),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(AccountIdempotencySnapshotError::Poisoned);
+            }
+        };
+        let account = partition
+            .accounts
+            .get_mut(&account_id)
+            .ok_or(AccountIdempotencySnapshotError::AccountNotFound)?;
+        account
+            .compact_expired_idempotency(now.wall)
+            .map_err(|()| AccountIdempotencySnapshotError::RevisionExhausted)?;
+        Ok(AccountIdempotencyBootstrap {
+            revision: account.idempotency_revision,
+            tombstones: account.idempotency_tombstones.clone().into_boxed_slice(),
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -334,14 +206,38 @@ struct AccountState {
     realized_loss: Money,
     positions: HashMap<InstrumentId, i64>,
     account_revision: Arc<AtomicU64>,
+    reconciliation_required: Arc<AtomicBool>,
     reservations: Vec<ReservationRecord>,
-    seen_client_orders: BTreeSet<ClientOrderId>,
+    idempotency_revision: NonZeroU64,
+    idempotency_tombstones: Vec<AccountIdempotencyTombstone>,
     rate_events: VecDeque<i64>,
+    last_reconciliation: Option<replacement::AccountReplacementSource>,
 }
 
 impl AccountState {
-    fn from_bootstrap(bootstrap: AccountBootstrap) -> Self {
-        Self {
+    fn try_from_bootstrap(
+        bootstrap: AccountBootstrap,
+        config: AccountCoordinatorConfig,
+    ) -> Result<Self, AccountCoordinatorError> {
+        let mut positions = HashMap::new();
+        positions
+            .try_reserve(config.max_positions_per_account.get())
+            .map_err(|_| AccountCoordinatorError::Allocation)?;
+        positions.extend(bootstrap.positions);
+        let mut reservations = Vec::new();
+        reservations
+            .try_reserve_exact(config.max_reservations_per_account.get())
+            .map_err(|_| AccountCoordinatorError::Allocation)?;
+        let mut idempotency_tombstones = Vec::new();
+        idempotency_tombstones
+            .try_reserve_exact(config.max_idempotency_keys_per_account.get())
+            .map_err(|_| AccountCoordinatorError::Allocation)?;
+        idempotency_tombstones.extend(bootstrap.idempotency.tombstones.iter().cloned());
+        let mut rate_events = VecDeque::new();
+        rate_events
+            .try_reserve_exact(config.max_rate_events_per_account.get())
+            .map_err(|_| AccountCoordinatorError::Allocation)?;
+        Ok(Self {
             eligible: bootstrap.eligible,
             currency: bootstrap.cash.currency(),
             cash: bootstrap.cash,
@@ -349,12 +245,15 @@ impl AccountState {
             peak_capital: bootstrap.peak_capital,
             gross_exposure: bootstrap.gross_exposure,
             realized_loss: bootstrap.realized_loss,
-            positions: bootstrap.positions.into_iter().collect(),
+            positions,
             account_revision: Arc::new(AtomicU64::new(bootstrap.revision.get())),
-            reservations: Vec::new(),
-            seen_client_orders: BTreeSet::new(),
-            rate_events: VecDeque::new(),
-        }
+            reconciliation_required: Arc::new(AtomicBool::new(false)),
+            reservations,
+            idempotency_revision: bootstrap.idempotency.revision,
+            idempotency_tombstones,
+            rate_events,
+            last_reconciliation: None,
+        })
     }
 
     fn try_reserve(
@@ -371,15 +270,21 @@ impl AccountState {
             .checked_sub(limits.order_rate_window_nanos())
             .unwrap_or(i64::MIN);
         let calculation = self.assess(intent, reservation_price, limits, now, config)?;
-        self.reservations.retain(ReservationRecord::retained);
-        while self
-            .rate_events
-            .front()
-            .is_some_and(|timestamp| *timestamp <= oldest)
-        {
-            let _ = self.rate_events.pop_front();
-        }
-
+        let removes_expired = self
+            .idempotency_tombstones
+            .iter()
+            .any(|tombstone| now.wall > tombstone.intent_expires_at);
+        let revision_steps = 1_u64 + u64::from(removes_expired);
+        let next_idempotency_revision = self
+            .idempotency_revision
+            .get()
+            .checked_add(revision_steps)
+            .and_then(NonZeroU64::new)
+            .ok_or_else(|| {
+                AccountReservationError::from_reason(
+                    AccountRiskViolation::IdempotencyRevisionExhausted,
+                )
+            })?;
         let terms = intent.execution_terms();
         let wall_expiry = intent.expires_at().min(
             now.wall
@@ -394,27 +299,69 @@ impl AccountState {
             })?;
         let lease = Arc::new(AccountReservationLease::new(
             Arc::clone(&self.account_revision),
+            Arc::clone(&self.reconciliation_required),
             self.account_revision.load(Ordering::Acquire),
             wall_expiry,
             monotonic_expiry,
         ));
+
+        // Every fallible calculation is complete. The preallocated collections below now publish
+        // the reservation, tombstone, revision, and rate event as one infallible lock-owned step.
+        if removes_expired {
+            self.idempotency_tombstones
+                .retain(|tombstone| now.wall <= tombstone.intent_expires_at);
+        }
+        self.reservations.retain(ReservationRecord::retained);
+        while self
+            .rate_events
+            .front()
+            .is_some_and(|timestamp| *timestamp <= oldest)
+        {
+            let _ = self.rate_events.pop_front();
+        }
         self.reservations.push(ReservationRecord {
+            order_id: intent.order_id(),
+            intent_digest: intent.digest(),
             lease: Arc::clone(&lease),
             cash: calculation.cash,
             exposure: calculation.exposure,
             instrument_id: terms.instrument_id(),
             signed_quantity: calculation.signed_quantity,
         });
-        let inserted = self
-            .seen_client_orders
-            .insert(intent.client_order_id().clone());
-        debug_assert!(inserted);
+        self.idempotency_tombstones
+            .push(AccountIdempotencyTombstone::new(
+                intent.order_id(),
+                intent.client_order_id().clone(),
+                intent.digest(),
+                intent.expires_at(),
+            ));
+        self.idempotency_revision = next_idempotency_revision;
         self.rate_events.push_back(now.wall.unix_nanos());
         Ok(AccountRiskReservation {
             account_id: intent.account_id(),
             intent_digest: intent.digest(),
             lease,
         })
+    }
+
+    fn compact_expired_idempotency(&mut self, now: Timestamp) -> Result<(), ()> {
+        if !self
+            .idempotency_tombstones
+            .iter()
+            .any(|tombstone| now > tombstone.intent_expires_at)
+        {
+            return Ok(());
+        }
+        let next_revision = self
+            .idempotency_revision
+            .get()
+            .checked_add(1)
+            .and_then(NonZeroU64::new)
+            .ok_or(())?;
+        self.idempotency_tombstones
+            .retain(|tombstone| now <= tombstone.intent_expires_at);
+        self.idempotency_revision = next_revision;
+        Ok(())
     }
 
     fn assess(
@@ -428,6 +375,9 @@ impl AccountState {
         let mut reasons = Vec::new();
         if limits.kill_switch() {
             reasons.push(AccountRiskViolation::KillSwitch);
+        }
+        if self.reconciliation_required.load(Ordering::Acquire) {
+            reasons.push(AccountRiskViolation::ReconciliationRequired);
         }
         if !self.eligible {
             reasons.push(AccountRiskViolation::AccountIneligible);
@@ -447,13 +397,31 @@ impl AccountState {
         {
             reasons.push(AccountRiskViolation::CurrencyMismatch);
         }
-        if now.wall >= intent.expires_at() {
+        if now.wall > intent.expires_at() {
             reasons.push(AccountRiskViolation::IntentExpired);
         }
-        if self.seen_client_orders.contains(intent.client_order_id()) {
+        let intent_lifetime = i128::from(intent.expires_at().unix_nanos())
+            - i128::from(intent.signal_at().unix_nanos());
+        if intent_lifetime > i128::from(config.maximum_intent_lifetime_nanos.get()) {
+            reasons.push(AccountRiskViolation::IntentLifetimeExceeded);
+        }
+        let active_tombstones = self
+            .idempotency_tombstones
+            .iter()
+            .filter(|tombstone| now.wall <= tombstone.intent_expires_at);
+        if active_tombstones
+            .clone()
+            .any(|tombstone| tombstone.client_order_id == *intent.client_order_id())
+        {
             reasons.push(AccountRiskViolation::DuplicateClientOrder);
         }
-        if self.seen_client_orders.len() >= config.max_idempotency_keys_per_account.get() {
+        if active_tombstones
+            .clone()
+            .any(|tombstone| tombstone.order_id == intent.order_id())
+        {
+            reasons.push(AccountRiskViolation::DuplicateOrder);
+        }
+        if active_tombstones.count() >= config.max_idempotency_keys_per_account.get() {
             reasons.push(AccountRiskViolation::IdempotencyCapacity);
         }
         if self
@@ -606,6 +574,8 @@ struct ActiveTotals {
 
 #[derive(Debug)]
 struct ReservationRecord {
+    order_id: market_squawk_domain::OrderId,
+    intent_digest: crate::OrderIntentDigest,
     lease: Arc<AccountReservationLease>,
     cash: Money,
     exposure: Money,
@@ -624,8 +594,9 @@ impl ReservationRecord {
 }
 
 fn validate_bootstrap(
-    account: &AccountBootstrap,
-    maximum_positions: usize,
+    account: &mut AccountBootstrap,
+    config: AccountCoordinatorConfig,
+    now: ClockReading,
 ) -> Result<(), AccountCoordinatorError> {
     let currency = account.cash.currency();
     let money = [
@@ -640,13 +611,33 @@ fn validate_bootstrap(
         .any(|value| value.currency() != currency || value.amount().is_sign_negative())
         || account.capital.amount().is_zero()
         || account.peak_capital.amount() < account.capital.amount()
-        || account.positions.len() > maximum_positions
+        || account.positions.len() > config.max_positions_per_account.get()
     {
         return Err(AccountCoordinatorError::InvalidBootstrap);
     }
-    let unique: BTreeSet<_> = account.positions.iter().map(|(id, _)| *id).collect();
-    if unique.len() != account.positions.len() {
+    account
+        .positions
+        .sort_unstable_by_key(|(instrument_id, _)| *instrument_id);
+    if account
+        .positions
+        .windows(2)
+        .any(|pair| pair[0].0 == pair[1].0)
+    {
         return Err(AccountCoordinatorError::InvalidBootstrap);
+    }
+    let maximum_expiry = now
+        .wall
+        .checked_add_nanos(
+            i64::try_from(config.maximum_intent_lifetime_nanos.get())
+                .map_err(|_| AccountCoordinatorError::InvalidIdempotencyBootstrap)?,
+        )
+        .unwrap_or(Timestamp::from_unix_nanos(i64::MAX));
+    if account.idempotency.tombstones.len() > config.max_idempotency_keys_per_account.get()
+        || account.idempotency.tombstones.iter().any(|tombstone| {
+            now.wall > tombstone.intent_expires_at || tombstone.intent_expires_at > maximum_expiry
+        })
+    {
+        return Err(AccountCoordinatorError::InvalidIdempotencyBootstrap);
     }
     Ok(())
 }

@@ -155,7 +155,7 @@ pub(super) fn runtime_config_with_feature_snapshot_bytes(
         maximum_cross_venue_instruments: 4,
         maximum_venues_per_cross_venue_instrument: 2,
         maximum_feature_snapshot_bytes,
-        maximum_action_hook_bytes_per_route: 65_536,
+        maximum_action_hook_bytes_per_route: 4 * 1024 * 1024,
         registration_control_capacity: 4,
         registration_deadline: Duration::from_secs(2),
         health_event_capacity: 16,
@@ -506,6 +506,28 @@ impl SourceHarness {
         sequence: u64,
         level_count: usize,
     ) -> TestResult<(CurrentSourceAuthorityLease, CurrentDecodedProviderBatch)> {
+        self.book_snapshot_with_sides(source_identifier, sequence, level_count, 0)
+    }
+
+    #[allow(
+        dead_code,
+        reason = "the execution crate's vertical test includes this shared source fixture"
+    )]
+    pub(super) fn two_sided_book_snapshot_batch(
+        &mut self,
+        source_identifier: &str,
+        sequence: u64,
+    ) -> TestResult<(CurrentSourceAuthorityLease, CurrentDecodedProviderBatch)> {
+        self.book_snapshot_with_sides(source_identifier, sequence, 1, 1)
+    }
+
+    fn book_snapshot_with_sides(
+        &mut self,
+        source_identifier: &str,
+        sequence: u64,
+        bid_count: usize,
+        ask_count: usize,
+    ) -> TestResult<(CurrentSourceAuthorityLease, CurrentDecodedProviderBatch)> {
         let frame_at = next_after(self.last_frame_at)?;
         self.last_frame_at = frame_at;
         let frame = self.frames.try_frame(
@@ -519,10 +541,18 @@ impl SourceHarness {
         self.capture_admission.validate_active(&frame)?;
         let validated = self.session.validate_live_frame(&frame)?;
         let decoder = DecoderEvidence::from_validated_frame(&validated, rule("coinbase-decoder")?);
-        let levels = (0..level_count)
+        let bids = (0..bid_count)
             .map(|_| {
                 Ok(ProviderBookLevel::new(
                     ProviderPrice::new(ProviderDecimalLexeme::try_new("100.00")?),
+                    ProviderQuantity::new(ProviderDecimalLexeme::try_new("1.00")?),
+                ))
+            })
+            .collect::<TestResult<Vec<_>>>()?;
+        let asks = (0..ask_count)
+            .map(|_| {
+                Ok(ProviderBookLevel::new(
+                    ProviderPrice::new(ProviderDecimalLexeme::try_new("101.00")?),
                     ProviderQuantity::new(ProviderDecimalLexeme::try_new("1.00")?),
                 ))
             })
@@ -547,8 +577,8 @@ impl SourceHarness {
             },
             ProviderObservationPayload::book_snapshot(
                 market_squawk_domain::MarketDepth::PriceLevel,
-                levels,
-                Vec::new(),
+                bids,
+                asks,
             )?,
         )?;
         let decoded = DecodedProviderBatch::try_new(decoder, vec![observation])?;

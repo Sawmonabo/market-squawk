@@ -16,10 +16,14 @@ mod snapshot;
 mod state;
 
 pub use action::{
-    ActionHookDisposition, CommittedActionContext, CommittedMarketReference, CurrentAuthorityGate,
-    CurrentAuthorityGateError, LiveActionHook, LiveActionHookError,
+    ActionAuthorityIssueLimit, ActionHookDisposition, CommittedActionContext,
+    CommittedMarketReference, CurrentAuthorityGate, CurrentAuthorityGateError, LiveActionHook,
+    LiveActionHookError, MAX_ACTION_AUTHORITY_ISSUES_PER_OBSERVATION, RouteActionHook,
+    RouteActionHookError,
 };
-pub use authority::{AuthorityError, ConsumedLiveAuthority, LiveExecutionCapability};
+pub use authority::{
+    AuthorityError, ConsumedLiveAuthority, ConsumedLiveEvidence, LiveExecutionCapability,
+};
 pub use book::{BookError, BookSide, DepthLimit, LevelUpdate, MAX_BOOK_MESSAGE_ITEMS, ScaledBook};
 pub use cross_venue::{
     CrossVenueFeatureError, CrossVenueFeatureHub, CrossVenueFeatureSnapshot, CrossVenueUpdate,

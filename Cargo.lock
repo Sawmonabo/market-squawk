@@ -2938,7 +2938,9 @@ dependencies = [
  "fs2",
  "futures-util",
  "market-squawk-adapter-coinbase",
+ "market-squawk-adapter-paper",
  "market-squawk-domain",
+ "market-squawk-execution",
  "market-squawk-live",
  "market-squawk-platform",
  "market-squawk-sources",
@@ -2992,6 +2994,26 @@ dependencies = [
  "tokio-tungstenite",
  "tokio-util",
  "url",
+]
+
+[[package]]
+name = "market-squawk-adapter-paper"
+version = "0.1.0"
+dependencies = [
+ "chrono-tz",
+ "market-squawk-domain",
+ "market-squawk-execution",
+ "proptest",
+ "rand_chacha 0.9.0",
+ "rand_core 0.9.5",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "sha2",
+ "static_assertions",
+ "thiserror",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -3056,12 +3078,18 @@ dependencies = [
 name = "market-squawk-execution"
 version = "0.1.0"
 dependencies = [
+ "market-squawk-analytics",
  "market-squawk-domain",
+ "market-squawk-live",
  "proptest",
  "rust_decimal",
+ "serde",
  "sha2",
  "static_assertions",
  "thiserror",
+ "tokio",
+ "tokio-util",
+ "trybuild",
 ]
 
 [[package]]

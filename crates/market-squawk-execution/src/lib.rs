@@ -2,17 +2,41 @@
 
 mod account;
 mod adapter;
+mod approval;
+mod audit;
 mod clock;
+mod dispatcher;
 mod intent;
 mod limits;
+mod live_hook;
 mod risk;
+mod strategy;
 
 pub use account::{
-    AccountBootstrap, AccountCoordinatorConfig, AccountCoordinatorError, AccountReservationError,
+    AccountBootstrap, AccountCoordinatorConfig, AccountCoordinatorError,
+    AccountIdempotencyBootstrap, AccountIdempotencyBootstrapError, AccountIdempotencySnapshotError,
+    AccountIdempotencyTombstone, AccountReservationError, AccountReservationStateError,
     AccountRiskCoordinator, AccountRiskReservation,
 };
 pub use adapter::{
-    CancelReceipt, CancelStatus, ExecutionAdapterError, ExecutionReceipt, ExecutionState,
+    ACCOUNT_REPLACEMENT_SCHEMA_VERSION, CancelReceipt, CancelStatus, DispatchOrder,
+    ExecutionAdapter, ExecutionAdapterError, ExecutionAdapterFuture, ExecutionMarketSink,
+    ExecutionMarketSinkError, ExecutionMarketUpdate, ExecutionReceipt, ExecutionState,
+    ExecutionStateError, ExecutionStateSourceBinding, MAX_RECONCILED_ACCOUNTS,
+    MAX_RECONCILED_ORDERS, MAX_RECONCILED_POSITIONS_PER_ACCOUNT, ReconciledAccountState,
+    ReconciledAccountStateError, ReconciledOrder, ReconciledOrderStatus,
+};
+pub use approval::{
+    ApprovedOrder, ExecutionMarketReference, MAX_EXECUTION_MARKET_LEVELS_PER_SIDE,
+    RiskPolicyIdentity,
+};
+pub use audit::{
+    ExecutionAuditConfig, ExecutionAuditError, ExecutionAuditEvent, ExecutionAuditKind,
+    ExecutionAuditReader, ExecutionAuditReason, ExecutionAuditWriter, MAX_EXECUTION_AUDIT_REASONS,
+};
+pub use dispatcher::{
+    ExecutionDispatchError, ExecutionDispatcher, ExecutionDispatcherConfig,
+    ExecutionDispatcherError, ExecutionDispatcherHandle, ExecutionDispatcherShutdown,
 };
 pub use intent::{
     MAX_INTENT_SLIPPAGE_BASIS_POINTS, MAX_ORDER_REASON_CODES, OrderIntent, OrderIntentDigest,
@@ -21,7 +45,12 @@ pub use intent::{
 pub use limits::{
     AccountRiskViolation, MAX_RISK_INSTRUMENTS, RiskLimits, RiskLimitsError, RiskLimitsInput,
 };
+pub use live_hook::{ExecutionLiveActionHook, ExecutionLiveActionHookError};
 pub use risk::{
-    MarketRiskInput, MarketRiskInputError, PreAuthorityRiskOutcome, RiskRejection,
-    RiskRejectionCode, RiskService,
+    MarketRiskInput, MarketRiskInputError, PreAuthorityRiskOutcome, RiskOutcome, RiskRejection,
+    RiskRejectionCode, RiskService, RiskServiceConfig, RiskServiceError,
+};
+pub use strategy::{
+    BoundedOrderIntentIterator, BoundedOrderIntents, MAX_STRATEGY_ORDER_INTENTS, Strategy,
+    StrategyContext, StrategyError,
 };

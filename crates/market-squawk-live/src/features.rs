@@ -167,6 +167,22 @@ impl RouteFeatureState {
         self.slots.iter().filter(|slot| slot.identity.is_some())
     }
 
+    pub(crate) fn action_view(
+        &self,
+        stream: &CurrentStreamKey,
+        generation: ConnectionGeneration,
+    ) -> Result<&FeatureSetState, RouteFeatureError> {
+        let slot = self
+            .slots
+            .iter()
+            .find(|slot| slot.identity.as_ref() == Some(stream))
+            .ok_or(RouteFeatureError::InternalStateInvariant)?;
+        if slot.generation != Some(generation) {
+            return Err(RouteFeatureError::InternalStateInvariant);
+        }
+        Ok(slot)
+    }
+
     pub(crate) fn cross_venue_midpoint(
         &self,
         stream: &CurrentStreamKey,

@@ -7,7 +7,10 @@ use super::super::system_timestamp;
 use super::{ActorError, RouteOwner, ShardActor};
 use crate::features::{CommittedFeatureInput, FeatureInvalidationReason, FeatureUpdateDisposition};
 use crate::processor::{AppliedLiveObservation, LiveApplyError};
-use crate::{LiveRuntimeHealthKind, ShardLifecycleSnapshot};
+use crate::{
+    ActionHookDisposition, CommittedActionContext, CommittedMarketReference, LiveRuntimeHealthKind,
+    ShardLifecycleSnapshot,
+};
 
 impl ShardActor {
     pub(super) fn register(&mut self, command: RegistrationCommand) {
@@ -68,6 +71,7 @@ impl ShardActor {
         let _retained_bytes = command.retained_bytes;
         let mut publish_after_batch = false;
         let mut feature_unavailable = false;
+        let mut action_failed = false;
         {
             let Some(owner) = self.routes.get_mut(&key) else {
                 admission.invalidate_on_admission_failure();
@@ -95,7 +99,9 @@ impl ShardActor {
                         return Err(error.into());
                     }
                 };
-                feature_unavailable |= process_applied_observation(owner, applied)?;
+                let disposition = process_applied_observation(&key, owner, applied)?;
+                feature_unavailable |= disposition.feature_unavailable;
+                action_failed |= disposition.action_failed;
                 self.events_since_snapshot = self.events_since_snapshot.saturating_add(1);
                 self.dirty = true;
                 publish_after_batch |= self.events_since_snapshot >= self.snapshot_event_trigger;
@@ -103,7 +109,11 @@ impl ShardActor {
         }
         if feature_unavailable {
             self.health_revision = self.health_revision.saturating_add(1);
-            self.emit_health(LiveRuntimeHealthKind::FeatureUnavailable, Some(key));
+            self.emit_health(LiveRuntimeHealthKind::FeatureUnavailable, Some(key.clone()));
+        }
+        if action_failed {
+            self.health_revision = self.health_revision.saturating_add(1);
+            self.emit_health(LiveRuntimeHealthKind::ActionFailed, Some(key.clone()));
         }
         if publish_after_batch {
             self.publish_snapshot(ShardLifecycleSnapshot::Ready)?;
@@ -113,9 +123,10 @@ impl ShardActor {
 }
 
 fn process_applied_observation(
+    route: &crate::ShardKey,
     owner: &mut RouteOwner,
     applied: AppliedLiveObservation,
-) -> Result<bool, ActorError> {
+) -> Result<AppliedObservationDisposition, ActorError> {
     if let Some(authority) = applied.authority.as_ref() {
         owner.processor.validate_applied_current(authority)?;
     }
@@ -125,6 +136,7 @@ fn process_applied_observation(
         let RouteOwner {
             processor,
             features,
+            action_hook: _,
             generations: _,
             cross_venue_publisher: _,
             cross_venue_reader: _,
@@ -195,11 +207,57 @@ fn process_applied_observation(
             .features
             .apply_cross_venue(&applied.stream, applied.generation, value)?;
     }
-    if !unavailable && let Some(authority) = applied.authority.as_ref() {
-        owner.processor.validate_applied_current(authority)?;
-        // Task 11 installs the bounded action hook at this exact post-feature authority recheck.
+    let mut action_failed = false;
+    if !unavailable
+        && let Some(authority) = applied.authority.as_ref()
+        && let Some(action_hook) = owner.action_hook.as_mut()
+    {
+        let feature_view = owner
+            .features
+            .action_view(&applied.stream, applied.generation)?;
+        if feature_view.required_ready(action_hook.required_features()) {
+            owner.processor.validate_applied_current(authority)?;
+            let market = CommittedMarketReference::try_new(
+                owner.processor.execution_terms(),
+                feature_view.bids(),
+                feature_view.asks(),
+                observed_at,
+            );
+            let context = market.and_then(|market| {
+                CommittedActionContext::try_new(
+                    route,
+                    &applied.event,
+                    authority,
+                    market,
+                    feature_view,
+                )
+            });
+            match context {
+                Ok(context) => {
+                    let mut gate = crate::action::current_authority_gate(
+                        &mut owner.processor,
+                        authority,
+                        action_hook.issue_limit(),
+                    );
+                    action_failed = matches!(
+                        action_hook.hook_mut().on_committed(context, &mut gate),
+                        ActionHookDisposition::Failed
+                    );
+                }
+                Err(_) => action_failed = true,
+            }
+        }
     }
-    Ok(unavailable)
+    Ok(AppliedObservationDisposition {
+        feature_unavailable: unavailable,
+        action_failed,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AppliedObservationDisposition {
+    feature_unavailable: bool,
+    action_failed: bool,
 }
 
 fn event_received_at(event: &market_squawk_domain::MarketEvent) -> market_squawk_domain::Timestamp {

@@ -1,0 +1,30 @@
+[package]
+name = "market-squawk-adapter-paper"
+description = "Deterministic bounded realistic paper execution for Market Squawk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository = "https://github.com/Sawmonabo/market-squawk"
+publish = false
+
+[dependencies]
+chrono-tz.workspace = true
+market-squawk-domain.workspace = true
+market-squawk-execution.workspace = true
+rand_chacha.workspace = true
+rand_core.workspace = true
+rust_decimal.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+static_assertions.workspace = true
+
+[lints]
+workspace = true

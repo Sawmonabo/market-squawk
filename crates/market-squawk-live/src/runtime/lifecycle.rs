@@ -20,8 +20,8 @@ use crate::authority::{RuntimeLeaseOwner, ShardLeaseOwner};
 use crate::cross_venue::create_cross_venue_plane;
 use crate::snapshot::{SnapshotPlaneBundle, create_snapshot_plane};
 use crate::{
-    LiveSnapshotReader, ShardId, ShardLifecycleSnapshot, ShardRouter, ShardSnapshot,
-    SnapshotDimension, SnapshotReadError,
+    LiveSnapshotReader, RouteActionHook, RouteActionHookError, ShardId, ShardKey,
+    ShardLifecycleSnapshot, ShardRouter, ShardSnapshot, SnapshotDimension, SnapshotReadError,
 };
 
 static NEXT_RUNTIME_INCARNATION: AtomicU64 = AtomicU64::new(1);
@@ -45,12 +45,37 @@ pub struct LiveRuntime {
 }
 
 impl LiveRuntime {
-    /// Allocates, spawns, and completely readies every configured shard before returning ingress.
+    /// Starts an explicitly market-data-only runtime with no action hooks.
+    ///
+    /// This compatibility constructor cannot invoke strategies or issue execution capabilities.
     pub async fn start(
         config: LiveRuntimeConfig,
         routes: Vec<LiveRouteConfig>,
     ) -> Result<Self, LiveRuntimeStartError> {
+        Self::start_inner(config, routes, None).await
+    }
+
+    /// Starts a runtime only after every configured route transfers one exact action hook.
+    ///
+    /// # Errors
+    ///
+    /// Fails before actor release when a hook is missing, duplicated, unknown, transplanted, or
+    /// exceeds the already-reserved route footprint.
+    pub async fn start_with_action_hooks(
+        config: LiveRuntimeConfig,
+        routes: Vec<LiveRouteConfig>,
+        action_hooks: Vec<RouteActionHook>,
+    ) -> Result<Self, LiveRuntimeStartError> {
+        Self::start_inner(config, routes, Some(action_hooks)).await
+    }
+
+    async fn start_inner(
+        config: LiveRuntimeConfig,
+        routes: Vec<LiveRouteConfig>,
+        action_hooks: Option<Vec<RouteActionHook>>,
+    ) -> Result<Self, LiveRuntimeStartError> {
         config.validate_routes(&routes)?;
+        let mut action_hooks = validate_action_hooks(&config, &routes, action_hooks)?;
         let estimated_peak_bytes = config.estimated_peak_bytes(&routes)?;
         let incarnation = next_incarnation()?;
         let mut runtime_owner = RuntimeLeaseOwner::new(incarnation.get());
@@ -82,6 +107,27 @@ impl LiveRuntime {
                     .cmp(right.route().venue().as_str())
                     .then_with(|| left.route().instrument().cmp(&right.route().instrument()))
             });
+        }
+        let mut action_hook_partitions = (0..shard_count)
+            .map(|_| Vec::new())
+            .collect::<Vec<Vec<RouteActionHook>>>();
+        if let Some(validated_hooks) = action_hooks.as_mut() {
+            for (shard_routes, shard_hooks) in partitions.iter().zip(&mut action_hook_partitions) {
+                shard_hooks
+                    .try_reserve_exact(shard_routes.len())
+                    .map_err(|_| LiveRuntimeStartError::Allocation)?;
+                for route in shard_routes {
+                    let hook = validated_hooks.remove(route.route()).ok_or_else(|| {
+                        LiveRuntimeStartError::MissingActionHook {
+                            route: route.route().clone(),
+                        }
+                    })?;
+                    shard_hooks.push(hook);
+                }
+            }
+            if !validated_hooks.is_empty() {
+                return Err(LiveRuntimeStartError::ActionHookPartitionInvariant);
+            }
         }
 
         let initial = initial_snapshots(&config, incarnation, &partitions)?;
@@ -129,7 +175,11 @@ impl LiveRuntime {
             .try_reserve(route_total)
             .map_err(|_| LiveRuntimeStartError::Allocation)?;
 
-        for (shard, shard_routes) in shard_ids.into_iter().zip(partitions) {
+        for ((shard, shard_routes), shard_action_hooks) in shard_ids
+            .into_iter()
+            .zip(partitions)
+            .zip(action_hook_partitions)
+        {
             let shard_index = shard.index();
             let shard_owner = ShardLeaseOwner::new(u64::from(shard_index) + 1);
             let shard_liveness = shard_owner.lease();
@@ -180,6 +230,10 @@ impl LiveRuntime {
                 runtime: runtime.clone(),
                 shard_owner,
                 routes: shard_routes,
+                action_hooks: shard_action_hooks,
+                maximum_action_hook_bytes_per_route: config
+                    .maximum_action_hook_bytes_per_route()
+                    .get(),
                 maximum_sources_per_route: config.maximum_sources_per_route().get(),
                 maximum_streams_per_route: config.maximum_streams_per_route().get(),
                 feature_capacity: config.feature_capacity(),
@@ -332,6 +386,22 @@ impl LiveRuntime {
             .map_err(LiveRuntimeReplaceError::Start)
     }
 
+    /// Replaces this incarnation with a fully action-enabled runtime and exact route hooks.
+    pub async fn replace_with_action_hooks(
+        self,
+        config: LiveRuntimeConfig,
+        routes: Vec<LiveRouteConfig>,
+        action_hooks: Vec<RouteActionHook>,
+    ) -> Result<Self, LiveRuntimeReplaceError> {
+        let shutdown = self.shutdown().await;
+        if !shutdown.is_complete() {
+            return Err(LiveRuntimeReplaceError::Shutdown(shutdown));
+        }
+        Self::start_with_action_hooks(config, routes, action_hooks)
+            .await
+            .map_err(LiveRuntimeReplaceError::Start)
+    }
+
     /// Release-invalidates ingress, drains or aborts-and-awaits every actor, and returns outcomes.
     pub async fn shutdown(mut self) -> LiveRuntimeShutdown {
         if let Some(owner) = self.runtime_owner.as_mut() {
@@ -410,6 +480,49 @@ impl Drop for LiveRuntime {
             task.abort();
         }
     }
+}
+
+fn validate_action_hooks(
+    config: &LiveRuntimeConfig,
+    routes: &[LiveRouteConfig],
+    action_hooks: Option<Vec<RouteActionHook>>,
+) -> Result<Option<HashMap<ShardKey, RouteActionHook>>, LiveRuntimeStartError> {
+    let Some(action_hooks) = action_hooks else {
+        return Ok(None);
+    };
+    let mut known_routes = std::collections::HashSet::new();
+    known_routes
+        .try_reserve(routes.len())
+        .map_err(|_| LiveRuntimeStartError::Allocation)?;
+    for route in routes {
+        known_routes.insert(route.route().clone());
+    }
+    let mut validated = HashMap::new();
+    validated
+        .try_reserve(action_hooks.len())
+        .map_err(|_| LiveRuntimeStartError::Allocation)?;
+    for hook in action_hooks {
+        let route = hook.route().clone();
+        if !known_routes.contains(&route) {
+            return Err(LiveRuntimeStartError::UnknownActionHook { route });
+        }
+        hook.validate_retained_bytes(config.maximum_action_hook_bytes_per_route().get())
+            .map_err(|error| LiveRuntimeStartError::InvalidActionHook {
+                route: route.clone(),
+                error,
+            })?;
+        if validated.insert(route.clone(), hook).is_some() {
+            return Err(LiveRuntimeStartError::DuplicateActionHook { route });
+        }
+    }
+    for route in routes {
+        if !validated.contains_key(route.route()) {
+            return Err(LiveRuntimeStartError::MissingActionHook {
+                route: route.route().clone(),
+            });
+        }
+    }
+    Ok(Some(validated))
 }
 
 fn initial_snapshots(
@@ -600,6 +713,20 @@ pub enum LiveRuntimeStartError {
     ShardCount,
     #[error("deterministic route partition violated configured ownership")]
     RoutePartitionInvariant,
+    #[error("action-enabled runtime is missing a hook for route {route:?}")]
+    MissingActionHook { route: ShardKey },
+    #[error("action-enabled runtime received duplicate hooks for route {route:?}")]
+    DuplicateActionHook { route: ShardKey },
+    #[error("action-enabled runtime received a hook for unknown route {route:?}")]
+    UnknownActionHook { route: ShardKey },
+    #[error("route action hook {route:?} failed validation")]
+    InvalidActionHook {
+        route: ShardKey,
+        #[source]
+        error: RouteActionHookError,
+    },
+    #[error("validated action hooks did not preserve deterministic shard partitioning")]
+    ActionHookPartitionInvariant,
     #[error("snapshot publication plane did not match configured shards")]
     SnapshotPlaneInvariant,
     #[error("bounded cross-venue plane could not initialize")]

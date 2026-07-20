@@ -19,6 +19,8 @@ pub enum AccountRiskViolation {
     AccountNotFound,
     /// The account is not eligible to trade.
     AccountIneligible,
+    /// An uncertain submission blocks the account until explicit reconciliation.
+    ReconciliationRequired,
     /// The instrument is not in the policy allowlist.
     InstrumentIneligible,
     /// The account, limits, and instrument terms do not use one currency.
@@ -27,10 +29,16 @@ pub enum AccountRiskViolation {
     UnsupportedSettlement,
     /// The intent expired before reservation.
     IntentExpired,
+    /// Signal-to-expiration duration exceeds the configured replay-protection horizon.
+    IntentLifetimeExceeded,
     /// The client-order identity was previously consumed.
     DuplicateClientOrder,
+    /// The stable internal order identity was previously consumed.
+    DuplicateOrder,
     /// The fixed idempotency registry is full.
     IdempotencyCapacity,
+    /// The persisted idempotency revision cannot advance without wrapping.
+    IdempotencyRevisionExhausted,
     /// The fixed reservation registry is full.
     ReservationCapacity,
     /// The rolling order-rate limit is reached.
@@ -258,6 +266,15 @@ impl RiskLimits {
             (Some(left), Some(right)) => left > right,
             _ => true,
         }
+    }
+
+    pub(crate) fn retained_byte_ceiling(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(
+            self.input
+                .eligible_instruments
+                .len()
+                .saturating_mul(std::mem::size_of::<InstrumentId>() * 4),
+        )
     }
 }
 

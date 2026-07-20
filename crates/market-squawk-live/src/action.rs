@@ -1,9 +1,10 @@
 //! Actor-scoped live-action contracts with no caller-mintable authority surface.
 
 use std::marker::PhantomData;
+use std::num::NonZeroUsize;
 use std::rc::Rc;
 
-use market_squawk_analytics::LiveFeatureView;
+use market_squawk_analytics::{LiveFeatureView, RequiredLiveFeature};
 use market_squawk_domain::{
     BookLevel, DataQuality, InstrumentExecutionTerms, LiveProvenance, MarketEvent,
     QualificationAssessmentId, Timestamp,
@@ -13,6 +14,168 @@ use thiserror::Error;
 use crate::authority::{AppliedObservationAuthority, SystemTrustedClock};
 use crate::processor::InstrumentLiveProcessor;
 use crate::{AuthorityError, ConsumedLiveAuthority, LiveExecutionCapability, ShardKey};
+
+/// Hard maximum capabilities one route hook may request for one committed observation.
+pub const MAX_ACTION_AUTHORITY_ISSUES_PER_OBSERVATION: usize = 64;
+
+/// Validated closed authority-issue bound for one route hook invocation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ActionAuthorityIssueLimit(NonZeroUsize);
+
+impl ActionAuthorityIssueLimit {
+    /// Smallest valid per-observation issue bound.
+    pub const MIN: Self = Self(NonZeroUsize::MIN);
+
+    /// Validates a positive issue count against the process hard maximum.
+    ///
+    /// # Errors
+    ///
+    /// Rejects zero or a value above [`MAX_ACTION_AUTHORITY_ISSUES_PER_OBSERVATION`].
+    pub fn try_new(value: usize) -> Result<Self, RouteActionHookError> {
+        let value = NonZeroUsize::new(value).ok_or(RouteActionHookError::ZeroIssueLimit)?;
+        if value.get() > MAX_ACTION_AUTHORITY_ISSUES_PER_OBSERVATION {
+            return Err(RouteActionHookError::IssueLimitExceedsHardMaximum {
+                requested: value.get(),
+                maximum: MAX_ACTION_AUTHORITY_ISSUES_PER_OBSERVATION,
+            });
+        }
+        Ok(Self(value))
+    }
+
+    /// Returns the positive validated issue count.
+    pub const fn get(self) -> usize {
+        self.0.get()
+    }
+}
+
+/// Non-cloneable exact route ownership transferred into one action-enabled runtime.
+#[derive(Debug)]
+pub struct RouteActionHook {
+    route: ShardKey,
+    hook: Box<dyn LiveActionHook>,
+    required_features: Box<[RequiredLiveFeature]>,
+    issue_limit: ActionAuthorityIssueLimit,
+    declared_retained_bytes: usize,
+}
+
+impl RouteActionHook {
+    /// Binds one hook, requirement set, and issue bound to one exact route.
+    ///
+    /// # Errors
+    ///
+    /// Rejects duplicate requirements and retained-size accounting failure. An empty requirement
+    /// set explicitly selects a canonical-market-reference-only strategy.
+    pub fn try_new(
+        route: ShardKey,
+        hook: Box<dyn LiveActionHook>,
+        mut required_features: Vec<RequiredLiveFeature>,
+    ) -> Result<Self, RouteActionHookError> {
+        required_features.sort_unstable();
+        if required_features.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(RouteActionHookError::DuplicateRequiredFeature);
+        }
+        let declared_retained_bytes =
+            route_action_retained_bytes(&route, required_features.len(), hook.retained_bytes()?)?;
+        let issue_limit = hook.maximum_authority_issues();
+        Ok(Self {
+            route,
+            hook,
+            required_features: required_features.into_boxed_slice(),
+            issue_limit,
+            declared_retained_bytes,
+        })
+    }
+
+    /// Returns the exact venue/instrument owner for this non-shareable hook.
+    pub const fn route(&self) -> &ShardKey {
+        &self.route
+    }
+
+    /// Returns the closed feature set that must all be ready before invocation.
+    pub const fn required_features(&self) -> &[RequiredLiveFeature] {
+        &self.required_features
+    }
+
+    /// Returns the maximum capabilities this hook may request per observation.
+    pub const fn issue_limit(&self) -> ActionAuthorityIssueLimit {
+        self.issue_limit
+    }
+
+    /// Returns the startup-declared maximum retained footprint.
+    pub const fn declared_retained_bytes(&self) -> usize {
+        self.declared_retained_bytes
+    }
+
+    pub(crate) fn validate_retained_bytes(
+        &self,
+        maximum: usize,
+    ) -> Result<(), RouteActionHookError> {
+        let observed = route_action_retained_bytes(
+            &self.route,
+            self.required_features.len(),
+            self.hook.retained_bytes()?,
+        )?;
+        if observed != self.declared_retained_bytes {
+            return Err(RouteActionHookError::RetainedSizeChanged {
+                declared: self.declared_retained_bytes,
+                observed,
+            });
+        }
+        if observed > maximum {
+            return Err(RouteActionHookError::RetainedSizeExceedsRouteMaximum {
+                retained: observed,
+                maximum,
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn hook_mut(&mut self) -> &mut dyn LiveActionHook {
+        self.hook.as_mut()
+    }
+}
+
+/// Route hook construction or startup accounting failure.
+#[derive(Debug, Error)]
+pub enum RouteActionHookError {
+    /// At least one authority issue must be possible for an enabled hook.
+    #[error("route action authority issue limit must be positive")]
+    ZeroIssueLimit,
+    /// Per-observation capability issuance exceeded the closed hard maximum.
+    #[error("route action authority issue limit {requested} exceeds hard maximum {maximum}")]
+    IssueLimitExceedsHardMaximum { requested: usize, maximum: usize },
+    /// A readiness prerequisite appeared more than once.
+    #[error("route action hook contains a duplicate required feature")]
+    DuplicateRequiredFeature,
+    /// Retained accounting changed between construction and runtime admission.
+    #[error("route action retained bytes changed from {declared} to {observed}")]
+    RetainedSizeChanged { declared: usize, observed: usize },
+    /// The hook exceeds the already-reserved per-route ceiling.
+    #[error("route action retains {retained} bytes but route maximum is {maximum}")]
+    RetainedSizeExceedsRouteMaximum { retained: usize, maximum: usize },
+    /// Wrapper, route, requirement, or hook retained accounting overflowed.
+    #[error("route action retained-byte accounting overflowed")]
+    RetainedSizeOverflow,
+    /// Hook-owned retained-size accounting failed.
+    #[error(transparent)]
+    Hook(#[from] LiveActionHookError),
+}
+
+fn route_action_retained_bytes(
+    route: &ShardKey,
+    required_feature_count: usize,
+    hook_retained_bytes: usize,
+) -> Result<usize, RouteActionHookError> {
+    std::mem::size_of::<RouteActionHook>()
+        .checked_add(route.venue().as_str().len())
+        .and_then(|value| {
+            value.checked_add(
+                required_feature_count.checked_mul(std::mem::size_of::<RequiredLiveFeature>())?,
+            )
+        })
+        .and_then(|value| value.checked_add(hook_retained_bytes))
+        .ok_or(RouteActionHookError::RetainedSizeOverflow)
+}
 
 /// Authority-free reference to the exact committed market state exposed to one action hook call.
 ///
@@ -237,7 +400,7 @@ impl CurrentAuthorityGate<'_> {
 pub(crate) const fn current_authority_gate<'actor>(
     processor: &'actor mut InstrumentLiveProcessor<SystemTrustedClock>,
     applied: &'actor AppliedObservationAuthority,
-    maximum_issues: std::num::NonZeroUsize,
+    maximum_issues: ActionAuthorityIssueLimit,
 ) -> CurrentAuthorityGate<'actor> {
     CurrentAuthorityGate {
         processor,
@@ -280,6 +443,9 @@ pub trait LiveActionHook: Send + std::fmt::Debug {
     /// Returns [`LiveActionHookError::RetainedSizeOverflow`] when exact accounting is not
     /// representable.
     fn retained_bytes(&self) -> Result<usize, LiveActionHookError>;
+
+    /// Returns the validated per-observation capability bound enforced by the actor gate.
+    fn maximum_authority_issues(&self) -> ActionAuthorityIssueLimit;
 }
 
 /// Action-context or retained-accounting failure.

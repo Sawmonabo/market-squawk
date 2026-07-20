@@ -1,0 +1,5 @@
+error: cannot construct `DispatchOrder` with struct literal syntax due to private fields
+ --> tests/ui/dispatch_order_is_private.rs:4:13
+  |
+4 |     let _ = DispatchOrder {};
+  |             ^^^^^^^^^^^^^
