@@ -18,9 +18,9 @@ use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
     model::{
         CallToolRequestParams, CallToolResult, ErrorCode, Implementation, InitializeRequestParams,
-        InitializeResult, ListToolsResult, PaginatedRequestParams, ProtocolVersion, RequestId,
-        ServerCapabilities, ServerInfo, ServerJsonRpcMessage, ServerResult, TaskSupport, Tool,
-        ToolAnnotations, ToolExecution,
+        InitializeResult, ListToolsResult, NumberOrString, PaginatedRequestParams, ProgressToken,
+        ProtocolVersion, RequestId, ServerCapabilities, ServerInfo, ServerJsonRpcMessage,
+        ServerResult, TaskSupport, Tool, ToolAnnotations, ToolExecution,
     },
     service::{NotificationContext, QuitReason, RequestContext as McpRequestContext},
 };
@@ -356,6 +356,16 @@ impl<S: ToolServices> ServiceHandler<S> {
                 )
             })?;
 
+        let progress_token = context.meta.get_progress_token();
+        if progress_token.as_ref().is_some_and(|token| {
+            progress_token_exceeds(token, self.limits.maximum_progress_token_bytes())
+        }) {
+            return Err(McpError::new(
+                ErrorCode(-32_010),
+                "progress token resource limit exceeded",
+                None,
+            ));
+        }
         let arguments = request.arguments.unwrap_or_default();
         let service_request = descriptor.admit(arguments).map_err(service_error)?;
         let request_id = service_request_id(&context.id)?;
@@ -363,7 +373,7 @@ impl<S: ToolServices> ServiceHandler<S> {
             .checked_add(self.limits.request_timeout())
             .ok_or_else(|| McpError::internal_error("request deadline is invalid", None))?;
         let request_cancellation = context.ct.child_token();
-        let service_context = if let Some(token) = context.meta.get_progress_token() {
+        let service_context = if let Some(token) = progress_token {
             ServiceRequestContext::with_progress(
                 request_id,
                 request_cancellation.clone(),
@@ -374,7 +384,7 @@ impl<S: ToolServices> ServiceHandler<S> {
                     sender: self.progress_sender.clone(),
                     peer: context.peer.clone(),
                     token,
-                    timeout: self.limits.write_timeout(),
+                    limits: self.limits,
                 }),
             )
         } else {
@@ -385,6 +395,7 @@ impl<S: ToolServices> ServiceHandler<S> {
                 self.limits.service_limits(),
             )
         };
+        let progress = service_context.progress().clone();
 
         let execution = async {
             let result = self
@@ -394,7 +405,7 @@ impl<S: ToolServices> ServiceHandler<S> {
                 .map_err(service_error)?;
             self.render_result(result).await
         };
-        tokio::select! {
+        let outcome = tokio::select! {
             biased;
             () = context.ct.cancelled() => {
                 request_cancellation.cancel();
@@ -409,7 +420,12 @@ impl<S: ToolServices> ServiceHandler<S> {
                     }
                 }
             }
-        }
+        };
+        progress
+            .close()
+            .await
+            .map_err(|_| McpError::internal_error("progress lifecycle closure failed", None))?;
+        outcome
     }
 
     async fn render_result(
@@ -444,6 +460,13 @@ impl<S: ToolServices> ServiceHandler<S> {
         let value = serde_json::to_value(reference)
             .map_err(|_| McpError::internal_error("artifact reference encoding failed", None))?;
         Ok(structured_result(json!({ "artifact": value })))
+    }
+}
+
+fn progress_token_exceeds(token: &ProgressToken, maximum_string_bytes: usize) -> bool {
+    match &token.0 {
+        NumberOrString::Number(_) => false,
+        NumberOrString::String(value) => value.len() > maximum_string_bytes,
     }
 }
 

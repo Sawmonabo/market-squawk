@@ -5,7 +5,7 @@ use std::{
     num::NonZeroUsize,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        atomic::{AtomicU8, Ordering},
     },
 };
 
@@ -193,13 +193,6 @@ impl PendingAudit {
     }
 }
 
-#[derive(Clone, Debug)]
-struct PendingCompletion {
-    audit: PendingAudit,
-    result_class: AuditResultClass,
-    terminalized: Arc<AtomicBool>,
-}
-
 #[derive(Debug)]
 struct ReservedCompletion {
     intended_result_class: AuditResultClass,
@@ -212,20 +205,10 @@ impl ReservedCompletion {
     }
 }
 
-impl PendingCompletion {
-    fn new(audit: PendingAudit, result_class: AuditResultClass) -> Self {
-        Self {
-            audit,
-            result_class,
-            terminalized: Arc::new(AtomicBool::new(false)),
-        }
-    }
-}
-
 #[derive(Debug)]
 pub(crate) struct OutboundMessage {
     encoded: Vec<u8>,
-    completion: Option<PendingCompletion>,
+    completion: Option<ReservedCompletion>,
     deadline: tokio::time::Instant,
     acknowledgement: oneshot::Sender<Result<(), DeliveryFailure>>,
     _retained_bytes: OwnedSemaphorePermit,
@@ -236,7 +219,6 @@ enum DeliveryFailure {
     PeerClosed,
     TimedOut,
     Io,
-    Audit,
 }
 
 pub(crate) enum ActiveAdmission {
@@ -318,16 +300,6 @@ impl OutputChannel {
         Ok(ActiveAdmission::Accepted)
     }
 
-    pub(crate) fn remove_pending(
-        &self,
-        request_id: &RequestId,
-    ) -> Result<Option<PendingAudit>, TransportError> {
-        self.pending
-            .lock()
-            .map_err(|_| TransportError::State)
-            .map(|mut pending| pending.remove(request_id))
-    }
-
     pub(crate) fn mark_pending_cancelled(
         &self,
         request_id: &RequestId,
@@ -356,8 +328,7 @@ impl OutputChannel {
         encoded.push(b'\n');
 
         let completion = if let Some((request_id, result_class)) = response {
-            self.remove_pending(&request_id)?
-                .map(|audit| PendingCompletion::new(audit, result_class))
+            self.reserve_pending_completion(&request_id, result_class, &encoded)?
         } else {
             None
         };
@@ -376,14 +347,16 @@ impl OutputChannel {
             return Err(TransportError::OutputLimit);
         }
         encoded.push(b'\n');
-        let completion = pending.map(|audit| PendingCompletion::new(audit, result_class));
+        let completion = pending
+            .map(|audit| self.reserve_completion(&audit, result_class, &encoded))
+            .transpose()?;
         self.enqueue(encoded, completion).await
     }
 
     async fn enqueue(
         &self,
         encoded: Vec<u8>,
-        completion: Option<PendingCompletion>,
+        completion: Option<ReservedCompletion>,
     ) -> Result<(), TransportError> {
         let sender = self
             .sender
@@ -394,7 +367,6 @@ impl OutputChannel {
         let deadline = tokio::time::Instant::now()
             .checked_add(self.limits.write_timeout())
             .ok_or(TransportError::InvalidLimit)?;
-        let fallback = completion.clone();
         let retained_byte_count =
             u32::try_from(encoded.len()).map_err(|_| TransportError::InvalidLimit)?;
         let retained_bytes = match tokio::time::timeout_at(
@@ -405,12 +377,10 @@ impl OutputChannel {
         {
             Ok(Ok(permit)) => permit,
             Ok(Err(_)) => {
-                self.record_output_unavailable(fallback, b"writer byte budget unavailable")?;
                 self.fail(OUTPUT_IO_FAILED);
                 return Err(TransportError::WriterTask);
             }
             Err(_) => {
-                self.record_output_unavailable(fallback, b"writer byte budget timed out")?;
                 self.fail(OUTPUT_QUEUE_TIMED_OUT);
                 return Err(TransportError::WriteTimedOut);
             }
@@ -425,12 +395,8 @@ impl OutputChannel {
         };
         let queue_permit = match tokio::time::timeout_at(deadline, sender.reserve_owned()).await {
             Ok(Ok(permit)) => permit,
-            Ok(Err(_)) => {
-                self.record_output_unavailable(fallback, b"writer queue unavailable")?;
-                return Err(self.current_error());
-            }
+            Ok(Err(_)) => return Err(self.current_error()),
             Err(_) => {
-                self.record_output_unavailable(fallback, b"writer queue admission timed out")?;
                 self.fail(OUTPUT_QUEUE_TIMED_OUT);
                 return Err(TransportError::WriteTimedOut);
             }
@@ -440,7 +406,6 @@ impl OutputChannel {
             Ok(Ok(())) => Ok(()),
             Ok(Err(failure)) => Err(failure.into()),
             Err(_) => {
-                self.record_output_unavailable(fallback, b"writer ended before delivery")?;
                 self.fail(OUTPUT_IO_FAILED);
                 Err(TransportError::WriterTask)
             }
@@ -449,23 +414,14 @@ impl OutputChannel {
 
     fn reserve_completion(
         &self,
-        completion: Option<PendingCompletion>,
+        audit: &PendingAudit,
+        intended_result_class: AuditResultClass,
         encoded: &[u8],
-    ) -> Result<Option<ReservedCompletion>, TransportError> {
-        let Some(completion) = completion else {
-            return Ok(None);
-        };
-        if completion
-            .terminalized
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return Ok(None);
-        }
+    ) -> Result<ReservedCompletion, TransportError> {
         let audit_completion = AuditCompletion::new(
-            &completion.audit.request_id,
+            &audit.request_id,
             self.identity_class,
-            completion.audit.operation,
+            audit.operation.clone(),
             self.limits.service_limits(),
             encoded,
         )?;
@@ -476,21 +432,25 @@ impl OutputChannel {
                 self.fail(OUTPUT_AUDIT_FAILED);
                 TransportError::Audit
             })?;
-        Ok(Some(ReservedCompletion {
-            intended_result_class: completion.result_class,
+        Ok(ReservedCompletion {
+            intended_result_class,
             reservation,
-        }))
+        })
     }
 
-    fn record_output_unavailable(
+    fn reserve_pending_completion(
         &self,
-        completion: Option<PendingCompletion>,
+        request_id: &RequestId,
+        intended_result_class: AuditResultClass,
         encoded: &[u8],
-    ) -> Result<(), TransportError> {
-        if let Some(reservation) = self.reserve_completion(completion, encoded)? {
-            reservation.commit(AuditResultClass::OutputUnavailable);
-        }
-        Ok(())
+    ) -> Result<Option<ReservedCompletion>, TransportError> {
+        let mut pending = self.pending.lock().map_err(|_| TransportError::State)?;
+        let Some(audit) = pending.get(request_id) else {
+            return Ok(None);
+        };
+        let completion = self.reserve_completion(audit, intended_result_class, encoded)?;
+        pending.remove(request_id);
+        Ok(Some(completion))
     }
 
     pub(crate) fn close_sender(&self) -> Result<(), TransportError> {
@@ -506,23 +466,18 @@ impl OutputChannel {
         result_class: AuditResultClass,
         terminal_marker: &[u8],
     ) -> Result<(), TransportError> {
-        let pending = self
-            .pending
-            .lock()
-            .map_err(|_| TransportError::State)?
-            .drain()
-            .map(|(_, audit)| audit)
-            .collect::<Vec<_>>();
-        for audit in pending {
-            let result_class = audit.shutdown_result_class(result_class);
-            if let Some(reservation) = self.reserve_completion(
-                Some(PendingCompletion::new(audit, result_class)),
-                terminal_marker,
-            )? {
-                reservation.commit(result_class);
-            }
+        loop {
+            let mut pending = self.pending.lock().map_err(|_| TransportError::State)?;
+            let Some(request_id) = pending.keys().next().cloned() else {
+                return Ok(());
+            };
+            let audit = pending.get(&request_id).ok_or(TransportError::State)?;
+            let terminal_class = audit.shutdown_result_class(result_class);
+            let completion = self.reserve_completion(audit, terminal_class, terminal_marker)?;
+            pending.remove(&request_id);
+            drop(pending);
+            completion.commit(terminal_class);
         }
-        Ok(())
     }
 
     pub(crate) fn fail(&self, state: u8) {
@@ -551,13 +506,7 @@ pub(crate) async fn run_writer<W>(
     W: AsyncWrite + Unpin,
 {
     while let Some(outbound) = receiver.recv().await {
-        let completion = match output.reserve_completion(outbound.completion, &outbound.encoded) {
-            Ok(completion) => completion,
-            Err(_) => {
-                let _ = outbound.acknowledgement.send(Err(DeliveryFailure::Audit));
-                return;
-            }
-        };
+        let completion = outbound.completion;
         let result = tokio::time::timeout_at(outbound.deadline, async {
             writer.write_all(&outbound.encoded).await?;
             writer.flush().await
@@ -669,7 +618,6 @@ impl From<DeliveryFailure> for TransportError {
             DeliveryFailure::PeerClosed => Self::PeerClosed,
             DeliveryFailure::TimedOut => Self::WriteTimedOut,
             DeliveryFailure::Io => Self::Io,
-            DeliveryFailure::Audit => Self::Audit,
         }
     }
 }
@@ -692,4 +640,153 @@ pub(crate) const fn output_io_failed() -> u8 {
 
 pub(crate) const fn output_audit_failed() -> u8 {
     OUTPUT_AUDIT_FAILED
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{error::Error, sync::atomic::AtomicUsize, time::Duration};
+
+    use market_squawk_services::RequestId as ServiceRequestId;
+    use rmcp::model::{RequestId, ServerJsonRpcMessage, ServerResult};
+    use tokio::sync::Notify;
+
+    use super::*;
+    use crate::{McpLimitSpec, McpLimits};
+
+    #[derive(Debug, Default)]
+    struct TrackingAudit {
+        events: Arc<Mutex<Vec<AuditEvent>>>,
+        reservations: AtomicUsize,
+        changed: Notify,
+    }
+
+    impl TrackingAudit {
+        async fn wait_for_reservations(&self, count: usize) {
+            loop {
+                let changed = self.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if self.reservations.load(Ordering::SeqCst) >= count {
+                    return;
+                }
+                changed.as_mut().await;
+            }
+        }
+
+        fn events(&self) -> Result<Vec<AuditEvent>, AuditError> {
+            self.events
+                .lock()
+                .map(|events| events.clone())
+                .map_err(|_| AuditError::Unavailable)
+        }
+    }
+
+    impl AuditSink for TrackingAudit {
+        fn record(&self, event: AuditEvent) -> Result<(), AuditError> {
+            self.events
+                .lock()
+                .map_err(|_| AuditError::Unavailable)?
+                .push(event);
+            Ok(())
+        }
+
+        fn reserve_completion(
+            &self,
+            completion: AuditCompletion,
+        ) -> Result<AuditCompletionReservation, AuditError> {
+            let events = Arc::clone(&self.events);
+            self.reservations.fetch_add(1, Ordering::SeqCst);
+            self.changed.notify_waiters();
+            Ok(AuditCompletionReservation::new(completion, move |event| {
+                events
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(event);
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_enqueue_and_queue_drop_terminalize_reserved_audits()
+    -> Result<(), Box<dyn Error>> {
+        let limits = McpLimits::try_from(McpLimitSpec {
+            writer_queue_capacity: 1,
+            write_timeout: Duration::from_secs(1),
+            shutdown_timeout: Duration::from_millis(10),
+            ..McpLimitSpec::default()
+        })?;
+        let audit = Arc::new(TrackingAudit::default());
+        let (sender, receiver) = mpsc::channel(1);
+        let output = Arc::new(OutputChannel::new(
+            sender,
+            Arc::new(AtomicU8::new(OUTPUT_RUNNING)),
+            limits,
+            audit.clone(),
+            LocalProcessIdentityClass::CallerSuppliedIoUnverified,
+        ));
+        for id in ["first", "second"] {
+            let service_id = ServiceRequestId::try_string(Arc::from(id))?;
+            output.record_admitted(AuditEvent::admitted(
+                &service_id,
+                output.identity_class(),
+                AuditOperation::Ping,
+                limits.service_limits(),
+                id.as_bytes(),
+            )?)?;
+            assert!(matches!(
+                output.admit_active(
+                    RequestId::String(Arc::from(id)),
+                    PendingAudit::new(service_id, AuditOperation::Ping),
+                    2,
+                )?,
+                ActiveAdmission::Accepted
+            ));
+        }
+
+        let first_output = Arc::clone(&output);
+        let first = tokio::spawn(async move {
+            first_output
+                .send_message(ServerJsonRpcMessage::response(
+                    ServerResult::empty(()),
+                    RequestId::String(Arc::from("first")),
+                ))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), audit.wait_for_reservations(1)).await?;
+
+        let second_output = Arc::clone(&output);
+        let second = tokio::spawn(async move {
+            second_output
+                .send_message(ServerJsonRpcMessage::response(
+                    ServerResult::empty(()),
+                    RequestId::String(Arc::from("second")),
+                ))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), audit.wait_for_reservations(2)).await?;
+        second.abort();
+        assert!(second.await.is_err());
+        drop(receiver);
+        assert!(first.await?.is_err());
+
+        let events = audit.events()?;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.phase() == crate::AuditPhase::Admitted)
+                .count(),
+            2
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    event.result_class() == Some(AuditResultClass::OutputUnavailable)
+                })
+                .count(),
+            2
+        );
+        assert_eq!(events.len(), 4);
+        Ok(())
+    }
 }

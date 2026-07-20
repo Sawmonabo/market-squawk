@@ -20,11 +20,15 @@ use market_squawk_services::{
     ProgressError, RequestContext, ServiceCapabilities, ServiceError, ToolDescriptor, ToolEffects,
     ToolInputError, ToolServices, TypedToolRequest, TypedToolResult,
 };
+use rmcp::model::{
+    Notification, NumberOrString, ProgressNotificationParam, ProgressToken, ServerJsonRpcMessage,
+    ServerNotification,
+};
 use serde_json::{Value, json};
 use tokio::io::{
     AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, DuplexStream, ReadHalf, WriteHalf,
 };
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Default)]
@@ -355,6 +359,7 @@ struct WaitingService {
 
 #[derive(Debug, Default)]
 struct ProgressService {
+    calls: AtomicUsize,
     rejected_bounds: AtomicUsize,
 }
 
@@ -383,6 +388,7 @@ impl ToolServices for ProgressService {
         _request: TypedToolRequest,
         context: RequestContext,
     ) -> Result<TypedToolResult, ServiceError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
         context
             .progress()
             .report(1, Some(2), Some("phase one"))
@@ -411,6 +417,67 @@ impl ToolServices for ProgressService {
             Err(ProgressError::TooManyUpdates)
         ) {
             self.rejected_bounds.fetch_add(1, Ordering::SeqCst);
+        }
+        TypedToolResult::try_new(json!({"done": true}), 1, context.limits()).map_err(Into::into)
+    }
+}
+
+#[derive(Debug)]
+struct TerminalProgressService {
+    release: Arc<Semaphore>,
+    started: Notify,
+    outcomes: mpsc::UnboundedSender<Result<(), ProgressError>>,
+}
+
+#[async_trait]
+impl ToolServices for TerminalProgressService {
+    fn capabilities(&self) -> ServiceCapabilities {
+        let descriptor = ToolDescriptor::try_new(
+            "test.terminal-progress",
+            "1",
+            "Attempt delayed progress around a terminal result.",
+            json!({
+                "type":"object",
+                "properties":{"wait":{"type":"boolean"}},
+                "required":["wait"],
+                "additionalProperties":false
+            }),
+            ToolEffects::read_only_closed_world(),
+            |arguments: &serde_json::Map<String, Value>| {
+                arguments
+                    .get("wait")
+                    .and_then(Value::as_bool)
+                    .map(|_| ())
+                    .ok_or(ToolInputError::Invalid)
+            },
+        );
+        ServiceCapabilities::try_new(descriptor.into_iter().collect())
+            .unwrap_or_else(|_| ServiceCapabilities::empty())
+    }
+
+    async fn call(
+        &self,
+        request: TypedToolRequest,
+        context: RequestContext,
+    ) -> Result<TypedToolResult, ServiceError> {
+        let wait = request
+            .arguments()
+            .get("wait")
+            .and_then(Value::as_bool)
+            .ok_or(ServiceError::InvalidRequest)?;
+        let release = Arc::clone(&self.release);
+        let progress = context.progress().clone();
+        let outcomes = self.outcomes.clone();
+        tokio::spawn(async move {
+            if let Ok(permit) = release.acquire_owned().await {
+                permit.forget();
+                let _ = outcomes.send(progress.report(1, Some(1), Some("too late")).await);
+            }
+        });
+        self.started.notify_one();
+        if wait {
+            context.cancellation().cancel();
+            return Err(ServiceError::Cancelled);
         }
         TypedToolResult::try_new(json!({"done": true}), 1, context.limits()).map_err(Into::into)
     }
@@ -578,6 +645,38 @@ async fn duplicate_active_ids_are_rejected_and_cancellation_reaches_the_service(
 #[tokio::test]
 async fn progress_tokens_bridge_through_a_bounded_transport_neutral_reporter()
 -> Result<(), Box<dyn Error>> {
+    let maximum_message = 2_800;
+    let encoded_progress = |token| {
+        let params = ProgressNotificationParam::new(token, 9_007_199_254_740_991_f64)
+            .with_total(9_007_199_254_740_991_f64)
+            .with_message("\0".repeat(maximum_message));
+        serde_json::to_vec(&ServerJsonRpcMessage::notification(
+            ServerNotification::ProgressNotification(Notification::new(params)),
+        ))
+    };
+    let string_frame = encoded_progress(ProgressToken(NumberOrString::String(Arc::from("\0"))))?;
+    let numeric_frame = encoded_progress(ProgressToken(NumberOrString::Number(i64::MIN)))?;
+    assert!(numeric_frame.len() > string_frame.len());
+    let numeric_spec = McpLimitSpec {
+        maximum_frame_bytes: numeric_frame.len(),
+        maximum_body_bytes: numeric_frame.len(),
+        maximum_progress_message_bytes: maximum_message,
+        maximum_progress_token_bytes: 1,
+        maximum_inline_bytes: 1,
+        maximum_writer_queue_bytes: numeric_frame.len() + 1,
+        ..McpLimitSpec::default()
+    };
+    assert!(McpLimits::try_from(numeric_spec).is_ok());
+    assert!(matches!(
+        McpLimits::try_from(McpLimitSpec {
+            maximum_frame_bytes: numeric_frame.len() - 1,
+            maximum_body_bytes: numeric_frame.len() - 1,
+            maximum_writer_queue_bytes: numeric_frame.len(),
+            ..numeric_spec
+        }),
+        Err(market_squawk_mcp::McpLimitError::ProgressExceedsFrame)
+    ));
+
     let service = Arc::new(ProgressService::default());
     let mut harness = Harness::start(
         Arc::clone(&service),
@@ -585,6 +684,7 @@ async fn progress_tokens_bridge_through_a_bounded_transport_neutral_reporter()
         McpLimits::try_from(McpLimitSpec {
             maximum_progress_updates: 2,
             maximum_progress_message_bytes: 16,
+            maximum_progress_token_bytes: 8,
             ..McpLimitSpec::default()
         })?,
     )
@@ -596,7 +696,7 @@ async fn progress_tokens_bridge_through_a_bounded_transport_neutral_reporter()
             "jsonrpc":"2.0","id":"progress","method":"tools/call",
             "params":{
                 "name":"test.progress","arguments":{},
-                "_meta":{"progressToken":"progress-token"}
+                "_meta":{"progressToken":"12345678"}
             }
         }))
         .await?;
@@ -604,7 +704,7 @@ async fn progress_tokens_bridge_through_a_bounded_transport_neutral_reporter()
     let second = harness.receive().await?;
     let result = harness.receive().await?;
     assert_eq!(first["method"], "notifications/progress");
-    assert_eq!(first["params"]["progressToken"], "progress-token");
+    assert_eq!(first["params"]["progressToken"], "12345678");
     assert_eq!(first["params"]["progress"], 1.0);
     assert_eq!(first["params"]["message"], "phase one");
     assert_eq!(second["params"]["progress"], 2.0);
@@ -612,6 +712,62 @@ async fn progress_tokens_bridge_through_a_bounded_transport_neutral_reporter()
     assert_eq!(result["id"], "progress");
     assert_eq!(result["result"]["structuredContent"]["done"], true);
     assert_eq!(service.rejected_bounds.load(Ordering::SeqCst), 3);
+    harness
+        .send(json!({
+            "jsonrpc":"2.0","id":"too-long","method":"tools/call",
+            "params":{
+                "name":"test.progress","arguments":{},
+                "_meta":{"progressToken":"123456789"}
+            }
+        }))
+        .await?;
+    assert_eq!(harness.receive().await?["error"]["code"], -32010);
+    assert_eq!(service.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(harness.close().await?, ServerExit::EndOfInput);
+    Ok(())
+}
+
+#[tokio::test]
+async fn terminal_results_close_delayed_progress_for_normal_and_cancelled_calls()
+-> Result<(), Box<dyn Error>> {
+    let (outcomes, mut reported) = mpsc::unbounded_channel();
+    let service = Arc::new(TerminalProgressService {
+        release: Arc::new(Semaphore::new(0)),
+        started: Notify::new(),
+        outcomes,
+    });
+    let mut harness = Harness::start(
+        Arc::clone(&service),
+        Arc::new(CollectingAudit::default()),
+        McpLimits::try_from(McpLimitSpec::default())?,
+    )
+    .await?;
+    let _ = harness.initialize(json!("init-terminal-progress")).await?;
+    harness.initialized().await?;
+
+    for (id, wait) in [("normal", false), ("cancelled", true)] {
+        let started = service.started.notified();
+        harness
+            .send(json!({
+                "jsonrpc":"2.0","id":id,"method":"tools/call",
+                "params":{
+                    "name":"test.terminal-progress","arguments":{"wait":wait},
+                    "_meta":{"progressToken":id}
+                }
+            }))
+            .await?;
+        started.await;
+        let terminal = harness.receive().await?;
+        assert_eq!(terminal["id"], id);
+        service.release.add_permits(1);
+        let outcome = reported.recv().await;
+        assert_eq!(outcome, Some(Err(ProgressError::Cancelled)));
+        harness
+            .send(json!({"jsonrpc":"2.0","id":format!("after-{id}"),"method":"ping"}))
+            .await?;
+        assert_eq!(harness.receive().await?["id"], format!("after-{id}"));
+    }
+
     assert_eq!(harness.close().await?, ServerExit::EndOfInput);
     Ok(())
 }

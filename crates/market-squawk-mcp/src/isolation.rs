@@ -4,12 +4,15 @@ use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use market_squawk_services::{
-    ProgressError, ProgressSink, ProgressUpdate, RequestContext, ServiceCapabilities, ServiceError,
-    ToolServices, TypedToolRequest, TypedToolResult,
+    ProgressDelivery as ServiceProgressDelivery, ProgressError, ProgressSink, RequestContext,
+    ServiceCapabilities, ServiceError, ToolServices, TypedToolRequest, TypedToolResult,
 };
 use rmcp::{
     RoleServer,
-    model::{ClientJsonRpcMessage, ProgressNotificationParam, ProgressToken},
+    model::{
+        ClientJsonRpcMessage, Notification, ProgressNotificationParam, ProgressToken,
+        ServerJsonRpcMessage, ServerNotification,
+    },
     service::{QuitReason, RxJsonRpcMessage, TxJsonRpcMessage, serve_server_with_ct},
     transport::Transport,
 };
@@ -316,7 +319,7 @@ pub(crate) struct McpProgressSink {
     pub(crate) sender: mpsc::Sender<ProgressDelivery>,
     pub(crate) peer: rmcp::service::Peer<RoleServer>,
     pub(crate) token: ProgressToken,
-    pub(crate) timeout: Duration,
+    pub(crate) limits: McpLimits,
 }
 
 impl std::fmt::Debug for McpProgressSink {
@@ -326,17 +329,21 @@ impl std::fmt::Debug for McpProgressSink {
             .field("sender", &"[BOUNDED PROGRESS CHANNEL]")
             .field("peer", &"[MCP PEER]")
             .field("token", &"[PROGRESS TOKEN REDACTED]")
-            .field("timeout", &self.timeout)
+            .field("limits", &self.limits)
             .finish()
     }
 }
 
 #[async_trait]
 impl ProgressSink for McpProgressSink {
-    async fn report(&self, update: ProgressUpdate) -> Result<(), ProgressError> {
-        let deadline = tokio::time::Instant::now()
-            .checked_add(self.timeout)
+    async fn report(&self, report: ServiceProgressDelivery) -> Result<(), ProgressError> {
+        report.ensure_live()?;
+        let notification = progress_notification(self.token.clone(), report.update());
+        validate_progress_notification(&notification, self.limits)?;
+        let write_deadline = tokio::time::Instant::now()
+            .checked_add(self.limits.write_timeout())
             .ok_or(ProgressError::Delivery)?;
+        let deadline = write_deadline.min(tokio::time::Instant::from_std(report.deadline()));
         let permit = tokio::time::timeout_at(deadline, self.sender.clone().reserve_owned())
             .await
             .map_err(|_| ProgressError::Delivery)?
@@ -344,8 +351,8 @@ impl ProgressSink for McpProgressSink {
         let (acknowledgement, delivered) = oneshot::channel();
         permit.send(ProgressDelivery {
             peer: self.peer.clone(),
-            token: self.token.clone(),
-            update,
+            notification,
+            report,
             acknowledgement,
         });
         tokio::time::timeout_at(deadline, delivered)
@@ -357,8 +364,8 @@ impl ProgressSink for McpProgressSink {
 
 pub(crate) struct ProgressDelivery {
     peer: rmcp::service::Peer<RoleServer>,
-    token: ProgressToken,
-    update: ProgressUpdate,
+    notification: ProgressNotificationParam,
+    report: ServiceProgressDelivery,
     acknowledgement: oneshot::Sender<Result<(), ProgressError>>,
 }
 
@@ -367,8 +374,8 @@ impl std::fmt::Debug for ProgressDelivery {
         formatter
             .debug_struct("ProgressDelivery")
             .field("peer", &"[MCP PEER]")
-            .field("token", &"[PROGRESS TOKEN REDACTED]")
-            .field("update", &"[PROGRESS UPDATE REDACTED]")
+            .field("notification", &"[PROGRESS NOTIFICATION REDACTED]")
+            .field("report", &"[PROGRESS LIFECYCLE]")
             .field("acknowledgement", &"[DELIVERY ACKNOWLEDGEMENT]")
             .finish()
     }
@@ -387,21 +394,58 @@ async fn run_sdk_progress(
         let Some(delivery) = delivery else {
             break;
         };
-        let mut notification =
-            ProgressNotificationParam::new(delivery.token, delivery.update.completed() as f64);
-        if let Some(total) = delivery.update.total() {
-            notification = notification.with_total(total as f64);
-        }
-        if let Some(message) = delivery.update.message() {
-            notification = notification.with_message(message);
-        }
-        let result = delivery
-            .peer
-            .notify_progress(notification)
-            .await
-            .map_err(|_| ProgressError::Delivery);
-        let _ = delivery.acknowledgement.send(result);
+        let ProgressDelivery {
+            peer,
+            notification,
+            report,
+            acknowledgement,
+        } = delivery;
+        let result = match report.ensure_live() {
+            Ok(()) => tokio::select! {
+                biased;
+                error = report.ended() => Err(error),
+                result = peer.notify_progress(notification) => {
+                    result.map_err(|_| ProgressError::Delivery)
+                }
+            },
+            Err(error) => Err(error),
+        };
+        drop(report);
+        let _ = acknowledgement.send(result);
     }
+}
+
+fn progress_notification(
+    token: ProgressToken,
+    update: &market_squawk_services::ProgressUpdate,
+) -> ProgressNotificationParam {
+    let mut notification = ProgressNotificationParam::new(token, update.completed() as f64);
+    if let Some(total) = update.total() {
+        notification = notification.with_total(total as f64);
+    }
+    if let Some(message) = update.message() {
+        notification = notification.with_message(message);
+    }
+    notification
+}
+
+fn validate_progress_notification(
+    params: &ProgressNotificationParam,
+    limits: McpLimits,
+) -> Result<(), ProgressError> {
+    let notification = Notification::new(params.clone());
+    let message =
+        ServerJsonRpcMessage::notification(ServerNotification::ProgressNotification(notification));
+    let encoded = serde_json::to_vec(&message).map_err(|_| ProgressError::Delivery)?;
+    if encoded.len() > limits.maximum_frame_bytes()
+        || encoded
+            .len()
+            .checked_add(1)
+            .is_none_or(|framed| framed > limits.maximum_writer_queue_bytes())
+    {
+        return Err(ProgressError::Delivery);
+    }
+    Ok(())
 }
 
 #[derive(Debug)]

@@ -9,8 +9,8 @@ mod response;
 mod traits;
 
 pub use progress::{
-    ProgressError, ProgressLimits, ProgressLimitsError, ProgressReporter, ProgressSink,
-    ProgressUpdate,
+    ProgressDelivery, ProgressError, ProgressLimits, ProgressLimitsError, ProgressReporter,
+    ProgressSink, ProgressUpdate,
 };
 
 pub use request::{

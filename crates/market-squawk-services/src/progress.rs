@@ -8,6 +8,7 @@ use std::{
 
 use async_trait::async_trait;
 use thiserror::Error;
+use tokio::{sync::Notify, time::Instant as TokioInstant};
 use tokio_util::sync::CancellationToken;
 
 const MAXIMUM_PROGRESS_UPDATES: usize = 100_000;
@@ -86,6 +87,73 @@ pub struct ProgressUpdate {
     message: Option<Arc<str>>,
 }
 
+/// One lifecycle-bound progress delivery accepted from a request reporter.
+///
+/// Dropping this value acknowledges the accepted delivery, including cancellation and transport
+/// teardown paths. Transport sinks must retain it until they publish or suppress the update.
+pub struct ProgressDelivery {
+    update: ProgressUpdate,
+    request_cancellation: CancellationToken,
+    lifecycle: Arc<ProgressLifecycle>,
+    deadline: Instant,
+    _acknowledgement: ProgressAcknowledgement,
+}
+
+impl fmt::Debug for ProgressDelivery {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProgressDelivery")
+            .field("update", &"[PROGRESS UPDATE REDACTED]")
+            .field("request_cancellation", &"[CANCELLATION TOKEN]")
+            .field("lifecycle", &"[PROGRESS LIFECYCLE]")
+            .field("deadline", &self.deadline)
+            .field("acknowledgement", &"[PROGRESS ACKNOWLEDGEMENT]")
+            .finish()
+    }
+}
+
+impl ProgressDelivery {
+    /// Validated progress values carried by this delivery.
+    #[must_use]
+    pub const fn update(&self) -> &ProgressUpdate {
+        &self.update
+    }
+
+    /// Absolute monotonic deadline inherited from the request.
+    #[must_use]
+    pub const fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
+    /// Revalidates request authority immediately before publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns cancellation or deadline errors after the request or progress lifecycle ends.
+    pub fn ensure_live(&self) -> Result<(), ProgressError> {
+        if self.request_cancellation.is_cancelled() || self.lifecycle.is_closed() {
+            return Err(ProgressError::Cancelled);
+        }
+        if Instant::now() >= self.deadline {
+            return Err(ProgressError::DeadlineExceeded);
+        }
+        Ok(())
+    }
+
+    /// Waits until cancellation, progress closure, or the absolute deadline ends publication
+    /// authority.
+    pub async fn ended(&self) -> ProgressError {
+        tokio::select! {
+            biased;
+            () = self.request_cancellation.cancelled() => ProgressError::Cancelled,
+            () = self.lifecycle.closed.cancelled() => ProgressError::Cancelled,
+            () = tokio::time::sleep_until(TokioInstant::from_std(self.deadline)) => {
+                ProgressError::DeadlineExceeded
+            }
+        }
+    }
+}
+
 impl ProgressUpdate {
     /// Completed work units.
     #[must_use]
@@ -109,18 +177,103 @@ impl ProgressUpdate {
 /// Transport adapter for progress notifications.
 #[async_trait]
 pub trait ProgressSink: Send + Sync + 'static {
-    /// Delivers one already validated progress update.
+    /// Delivers one validated, lifecycle-bound progress update.
     ///
     /// # Errors
     ///
     /// Returns [`ProgressError::Delivery`] when the bounded transport cannot accept the update.
-    async fn report(&self, update: ProgressUpdate) -> Result<(), ProgressError>;
+    async fn report(&self, delivery: ProgressDelivery) -> Result<(), ProgressError>;
 }
 
 #[derive(Debug, Default)]
 struct ProgressState {
     accepted_updates: usize,
     last_completed: Option<u64>,
+}
+
+#[derive(Debug, Default)]
+struct ProgressLifecycleState {
+    closed: bool,
+    outstanding: usize,
+}
+
+#[derive(Debug, Default)]
+struct ProgressLifecycle {
+    state: Mutex<ProgressLifecycleState>,
+    closed: CancellationToken,
+    changed: Notify,
+}
+
+impl ProgressLifecycle {
+    fn is_closed(&self) -> bool {
+        self.closed.is_cancelled()
+    }
+
+    fn admit(self: &Arc<Self>) -> Result<ProgressAcknowledgement, ProgressError> {
+        let mut state = self.state.lock().map_err(|_| ProgressError::State)?;
+        if state.closed {
+            return Err(ProgressError::Cancelled);
+        }
+        state.outstanding = state
+            .outstanding
+            .checked_add(1)
+            .ok_or(ProgressError::State)?;
+        Ok(ProgressAcknowledgement {
+            lifecycle: Arc::clone(self),
+        })
+    }
+
+    async fn close_and_drain(&self) -> Result<(), ProgressError> {
+        {
+            let mut state = self.state.lock().map_err(|_| ProgressError::State)?;
+            state.closed = true;
+            self.closed.cancel();
+        }
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self
+                .state
+                .lock()
+                .map_err(|_| ProgressError::State)?
+                .outstanding
+                == 0
+            {
+                return Ok(());
+            }
+            changed.as_mut().await;
+        }
+    }
+
+    fn acknowledge(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.outstanding = state.outstanding.saturating_sub(1);
+        if state.outstanding == 0 {
+            self.changed.notify_waiters();
+        }
+    }
+}
+
+struct ProgressAcknowledgement {
+    lifecycle: Arc<ProgressLifecycle>,
+}
+
+impl fmt::Debug for ProgressAcknowledgement {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProgressAcknowledgement")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for ProgressAcknowledgement {
+    fn drop(&mut self) {
+        self.lifecycle.acknowledge();
+    }
 }
 
 /// Cloneable reporter enforcing per-request progress invariants before transport dispatch.
@@ -132,6 +285,7 @@ pub struct ProgressReporter {
     limits: ProgressLimits,
     state: Arc<Mutex<ProgressState>>,
     delivery: Arc<tokio::sync::Mutex<()>>,
+    lifecycle: Arc<ProgressLifecycle>,
 }
 
 impl ProgressReporter {
@@ -148,6 +302,7 @@ impl ProgressReporter {
             limits,
             state: Arc::new(Mutex::new(ProgressState::default())),
             delivery: Arc::new(tokio::sync::Mutex::new(())),
+            lifecycle: Arc::new(ProgressLifecycle::default()),
         }
     }
 
@@ -163,6 +318,7 @@ impl ProgressReporter {
             limits,
             state: Arc::new(Mutex::new(ProgressState::default())),
             delivery: Arc::new(tokio::sync::Mutex::new(())),
+            lifecycle: Arc::new(ProgressLifecycle::default()),
         }
     }
 
@@ -185,12 +341,7 @@ impl ProgressReporter {
         message: Option<&str>,
     ) -> Result<(), ProgressError> {
         let sink = self.sink.as_ref().ok_or(ProgressError::Unavailable)?;
-        if self.cancellation.is_cancelled() {
-            return Err(ProgressError::Cancelled);
-        }
-        if Instant::now() >= self.deadline {
-            return Err(ProgressError::DeadlineExceeded);
-        }
+        self.ensure_live()?;
         if completed > MAXIMUM_EXACT_PROGRESS_INTEGER
             || total
                 .is_some_and(|value| value > MAXIMUM_EXACT_PROGRESS_INTEGER || value < completed)
@@ -203,11 +354,12 @@ impl ProgressReporter {
         let _delivery = tokio::select! {
             biased;
             () = self.cancellation.cancelled() => return Err(ProgressError::Cancelled),
-            () = tokio::time::sleep_until(tokio::time::Instant::from_std(self.deadline)) => {
+            () = tokio::time::sleep_until(TokioInstant::from_std(self.deadline)) => {
                 return Err(ProgressError::DeadlineExceeded);
             }
             guard = self.delivery.lock() => guard,
         };
+        self.ensure_live()?;
         {
             let mut state = self.state.lock().map_err(|_| ProgressError::State)?;
             if state.accepted_updates >= self.limits.maximum_updates() {
@@ -227,14 +379,42 @@ impl ProgressReporter {
             total,
             message: message.map(Arc::from),
         };
+        let acknowledgement = self.lifecycle.admit()?;
+        let delivery = ProgressDelivery {
+            update,
+            request_cancellation: self.cancellation.clone(),
+            lifecycle: Arc::clone(&self.lifecycle),
+            deadline: self.deadline,
+            _acknowledgement: acknowledgement,
+        };
         tokio::select! {
             biased;
             () = self.cancellation.cancelled() => Err(ProgressError::Cancelled),
-            () = tokio::time::sleep_until(tokio::time::Instant::from_std(self.deadline)) => {
+            () = tokio::time::sleep_until(TokioInstant::from_std(self.deadline)) => {
                 Err(ProgressError::DeadlineExceeded)
             }
-            result = sink.report(update) => result,
+            result = sink.report(delivery) => result,
         }
+    }
+
+    /// Closes this request's progress capability and waits for every accepted delivery to be
+    /// published or suppressed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgressError::State`] when lifecycle state was poisoned.
+    pub async fn close(&self) -> Result<(), ProgressError> {
+        self.lifecycle.close_and_drain().await
+    }
+
+    fn ensure_live(&self) -> Result<(), ProgressError> {
+        if self.cancellation.is_cancelled() || self.lifecycle.is_closed() {
+            return Err(ProgressError::Cancelled);
+        }
+        if Instant::now() >= self.deadline {
+            return Err(ProgressError::DeadlineExceeded);
+        }
+        Ok(())
     }
 }
 
@@ -248,6 +428,7 @@ impl fmt::Debug for ProgressReporter {
             .field("limits", &self.limits)
             .field("state", &"[PROGRESS STATE]")
             .field("delivery", &"[ORDERED DELIVERY]")
+            .field("lifecycle", &"[PROGRESS LIFECYCLE]")
             .finish()
     }
 }

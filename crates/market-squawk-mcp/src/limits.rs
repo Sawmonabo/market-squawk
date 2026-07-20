@@ -1,10 +1,14 @@
 //! Validated transport and service resource ceilings.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use market_squawk_services::{
     JsonContractError, JsonStructureLimits, ProgressLimits, ProgressLimitsError, ServiceLimits,
     ServiceLimitsError,
+};
+use rmcp::model::{
+    Notification, NumberOrString, ProgressNotificationParam, ProgressToken, ServerJsonRpcMessage,
+    ServerNotification,
 };
 use thiserror::Error;
 
@@ -23,6 +27,7 @@ const MAXIMUM_RESULT_BYTES: usize = 256 * 1024 * 1024;
 const MAXIMUM_RESULT_ITEMS: usize = 10_000_000;
 const MAXIMUM_PROGRESS_UPDATES: usize = 100_000;
 const MAXIMUM_PROGRESS_MESSAGE_BYTES: usize = 64 * 1024;
+const MAXIMUM_PROGRESS_TOKEN_BYTES: usize = 64 * 1024;
 const MAXIMUM_RESPONSE_ENVELOPE_BYTES: usize = 16 * 1024;
 const MAXIMUM_ACTIVE_BODY_BYTES: usize = 512 * 1024 * 1024;
 const MAXIMUM_ACTIVE_RESULT_BYTES: usize = 512 * 1024 * 1024;
@@ -60,6 +65,8 @@ pub struct McpLimitSpec {
     pub maximum_progress_updates: usize,
     /// Maximum UTF-8 bytes in one progress message.
     pub maximum_progress_message_bytes: usize,
+    /// Maximum UTF-8 bytes in a string progress token; integer tokens remain exact.
+    pub maximum_progress_token_bytes: usize,
     /// Default request execution deadline.
     pub request_timeout: Duration,
     /// Maximum queue admission or physical write duration.
@@ -86,6 +93,7 @@ impl Default for McpLimitSpec {
             maximum_result_items: 1_000_000,
             maximum_progress_updates: 1_024,
             maximum_progress_message_bytes: 1_024,
+            maximum_progress_token_bytes: 1_024,
             request_timeout: Duration::from_secs(30),
             write_timeout: Duration::from_secs(5),
             shutdown_timeout: Duration::from_secs(5),
@@ -122,6 +130,7 @@ impl TryFrom<McpLimitSpec> for McpLimits {
             spec.maximum_result_items,
             spec.maximum_progress_updates,
             spec.maximum_progress_message_bytes,
+            spec.maximum_progress_token_bytes,
         ]
         .contains(&0)
             || spec.request_timeout.is_zero()
@@ -148,6 +157,7 @@ impl TryFrom<McpLimitSpec> for McpLimits {
             || spec.maximum_result_items > MAXIMUM_RESULT_ITEMS
             || spec.maximum_progress_updates > MAXIMUM_PROGRESS_UPDATES
             || spec.maximum_progress_message_bytes > MAXIMUM_PROGRESS_MESSAGE_BYTES
+            || spec.maximum_progress_token_bytes > MAXIMUM_PROGRESS_TOKEN_BYTES
         {
             return Err(McpLimitError::LimitTooLarge);
         }
@@ -165,13 +175,7 @@ impl TryFrom<McpLimitSpec> for McpLimits {
         {
             return Err(McpLimitError::InlineExceedsFrame);
         }
-        if spec
-            .maximum_progress_message_bytes
-            .checked_add(MAXIMUM_RESPONSE_ENVELOPE_BYTES)
-            .is_none_or(|encoded| encoded > spec.maximum_frame_bytes)
-        {
-            return Err(McpLimitError::ProgressExceedsFrame);
-        }
+        validate_progress_envelope(spec)?;
         if spec
             .maximum_active_requests
             .checked_mul(spec.maximum_body_bytes)
@@ -266,6 +270,41 @@ impl McpLimits {
     pub(crate) const fn progress_limits(self) -> ProgressLimits {
         self.progress
     }
+
+    pub(crate) const fn maximum_progress_token_bytes(self) -> usize {
+        self.spec.maximum_progress_token_bytes
+    }
+}
+
+fn validate_progress_envelope(spec: McpLimitSpec) -> Result<(), McpLimitError> {
+    let string_token = ProgressToken(NumberOrString::String(Arc::from(
+        "\0".repeat(spec.maximum_progress_token_bytes),
+    )));
+    let numeric_token = ProgressToken(NumberOrString::Number(i64::MIN));
+    validate_progress_envelope_for_token(spec, string_token)?;
+    validate_progress_envelope_for_token(spec, numeric_token)
+}
+
+fn validate_progress_envelope_for_token(
+    spec: McpLimitSpec,
+    token: ProgressToken,
+) -> Result<(), McpLimitError> {
+    let mut params = ProgressNotificationParam::new(token, 9_007_199_254_740_991_f64)
+        .with_total(9_007_199_254_740_991_f64)
+        .with_message("\0".repeat(spec.maximum_progress_message_bytes));
+    params.meta = None;
+    let notification = Notification::new(params);
+    let message =
+        ServerJsonRpcMessage::notification(ServerNotification::ProgressNotification(notification));
+    let encoded = serde_json::to_vec(&message).map_err(|_| McpLimitError::ProgressExceedsFrame)?;
+    let framed = encoded
+        .len()
+        .checked_add(1)
+        .ok_or(McpLimitError::ProgressExceedsFrame)?;
+    if encoded.len() > spec.maximum_frame_bytes || framed > spec.maximum_writer_queue_bytes {
+        return Err(McpLimitError::ProgressExceedsFrame);
+    }
+    Ok(())
 }
 
 /// Invalid resource-ceiling configuration.
