@@ -22,6 +22,11 @@ user-facing truth. All mandatory remaining work is bound by the single canonical
   provenance, source-authority, sharding, transactional-book, and bounded-snapshot foundations.
 - Public Coinbase Exchange WebSocket diagnostic capture with explicit single-venue, partial
   coverage. This is not a production `DirectVerified` adapter.
+- A bounded Kraken WebSocket v2 production-source crate for price-level books and trades, with
+  capture-before-decode, official CRC32 book validation, bounded control traffic, cancellation,
+  source metadata, and session lifecycle enforcement. Its current qualification ceiling is
+  intentionally `DirectUnverified` and execution-ineligible until the downstream qualification,
+  risk, and paper-execution vertical is complete.
 - Level 2 price-level snapshots and updates, heartbeat tracking separated from market freshness,
   match/trade capture, fixed-point prices and quantities, and in-memory order books.
 - MSJ1 append-only journal writing, CRC32 validation, a single-writer OS lock, bounded legacy read
@@ -52,7 +57,7 @@ terminal consumer, focused verification, immutable evidence, and exact commit ex
 | State | Mandatory capability | Current blocker | Closing task |
 | --- | --- | --- | --- |
 | `Missing` | Coinbase direct-source qualification | No production authority-qualified Coinbase vertical | Task 2 |
-| `Missing` | Kraken direct-source qualification | Generic checksum validation exists, but no production transport/decoder/session, metadata integration, qualification decision, or live-to-paper vertical exists | Task 6 |
+| `Missing` | Kraken direct-source qualification | Production transport, decoder, checksum, metadata, and session lifecycle exist; the authority-qualified live ingress, risk decision, and live-to-paper terminal path do not | Task 6 |
 | `Missing` | CSV/TSV | No bounded production extraction adapter | Task 7 |
 | `Missing` | JSON/NDJSON | No bounded production extraction adapter | Task 7 |
 | `Missing` | XML | No entity-safe production extraction adapter | Task 7 |
@@ -67,7 +72,7 @@ terminal consumer, focused verification, immutable evidence, and exact commit ex
 | `Missing` | portfolio import | No raw-preserving holdings/transactions reconciliation vertical | Task 10 |
 | `Missing` | point-in-time datasets | No availability-aware joins or leakage-checked builder | Task 11 |
 | `Missing` | Rust financial analytics | No complete tested batch-analytics implementation | Task 12 |
-| `Missing` | feature registry | No versioned registry with time and compatibility semantics | Task 12 |
+| `Missing` | feature registry | Versioned metadata, exact live kernels, and compatibility checks exist, but no production live-route or batch-dataset consumer closes the capability | Task 12 |
 | `Missing` | Python data/financial/training product | No tracked product package or Rust-parity training boundary | Task 14 |
 | `Missing` | complete model bundle | No fully hashed artifact/schema/metadata bundle | Task 13 |
 | `Missing` | native Rust inference | No production local inference backend | Task 13 |
@@ -81,9 +86,10 @@ terminal consumer, focused verification, immutable evidence, and exact commit ex
 | `Missing` | complete typed local MCP | No complete bounded tool domains over shared application services | Task 19 |
 | `Missing` | release security/fuzz/performance gate | No exact-head release evidence or final integrated demonstration | Task 20 |
 
-No production adapter crates are tracked under `adapters/` in this checkout. The checkout has no
-tracked `python/` product package. Python files under `scripts/` are repository-verification and
-protocol-smoke utilities, not financial-analytics or model-training product code.
+A production-hardened Kraken source crate is tracked under `adapters/`; its execution qualification
+vertical remains release-blocking above. The checkout has no tracked `python/` product package.
+Python files under `scripts/` are repository-verification and protocol-smoke utilities, not
+financial-analytics or model-training product code.
 
 ## Release blocked until implemented
 
@@ -377,10 +383,16 @@ python3 scripts/smoke_mcp.py ./target/debug/market-squawk
 apps/
 └── market-squawk/                 CLI, current live application, MCP, journal, and compatibility tests
 crates/
+├── market-squawk-analytics/       exact live feature kernels and versioned feature metadata
+├── market-squawk-data/            SQLite catalog, Arrow, Parquet, DataFusion, and lineage
 ├── market-squawk-domain/          shared financial, identity, quality, provenance, and event contracts
 ├── market-squawk-live/            production authority, sharding, books, and bounded snapshots
+├── market-squawk-mcp/             bounded local stdio MCP protocol and lifecycle foundation
 ├── market-squawk-platform/        local paths, lifecycle, capture, persistence, and operations
+├── market-squawk-services/        shared application-service contracts
 └── market-squawk-sources/         source contracts, registry, budgets, health, and supervision
+adapters/
+└── market-squawk-adapter-kraken/  bounded Kraken v2 transport, decoder, checksum, and session source
 scripts/                            deterministic local/CI policy and smoke gates
 docs/                               architecture, plans, research, and verification evidence
 ```
