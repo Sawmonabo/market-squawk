@@ -22,6 +22,7 @@ use market_squawk_sources::{
 };
 
 use common::{TestResult, direct_metadata, exact_evidence, source_identifier};
+use sha2::{Digest as _, Sha256};
 
 static_assertions::assert_not_impl_any!(
     DecodedProviderBatch: serde::Serialize,
@@ -315,13 +316,11 @@ fn extraction_enforces_lineage_point_in_time_and_request_limits() -> TestResult 
         NonZeroU64::try_from(10_000_u64)?,
         Timestamp::from_unix_nanos(100),
     )?;
+    let sha_payload = Bytes::from_static(b"record");
     let record = ExtractionRecord::try_new(
         &other_request,
         source_identifier("schema-v1")?,
-        ExactPayloadEvidence::from_content_digest(EvidenceDigest::new(
-            DigestAlgorithm::Sha256,
-            [5; 32],
-        )),
+        payload_evidence(DigestAlgorithm::Sha256, &sha_payload),
         Timestamp::from_unix_nanos(1),
         Some(Timestamp::from_unix_nanos(2)),
         AvailabilityEvidence::Observed {
@@ -329,8 +328,43 @@ fn extraction_enforces_lineage_point_in_time_and_request_limits() -> TestResult 
         },
         source_identifier("revision-1")?,
         Some(Timestamp::from_unix_nanos(10)),
-        Bytes::from_static(b"record"),
+        sha_payload,
     )?;
+    assert_eq!(record.source_id(), other_request.object().source_id());
+    assert_eq!(record.schema().as_str(), "schema-v1");
+    let blake_payload = Bytes::from_static(b"blake3-record");
+    ExtractionRecord::try_new(
+        &other_request,
+        source_identifier("schema-v1")?,
+        payload_evidence(DigestAlgorithm::Blake3, &blake_payload),
+        Timestamp::from_unix_nanos(1),
+        Some(Timestamp::from_unix_nanos(2)),
+        AvailabilityEvidence::Observed {
+            available_at: Timestamp::from_unix_nanos(3),
+        },
+        source_identifier("revision-1")?,
+        Some(Timestamp::from_unix_nanos(10)),
+        blake_payload,
+    )?;
+    assert!(matches!(
+        ExtractionRecord::try_new(
+            &other_request,
+            source_identifier("schema-v1")?,
+            exact_evidence(5),
+            Timestamp::from_unix_nanos(1),
+            Some(Timestamp::from_unix_nanos(2)),
+            AvailabilityEvidence::Observed {
+                available_at: Timestamp::from_unix_nanos(3),
+            },
+            source_identifier("revision-1")?,
+            Some(Timestamp::from_unix_nanos(10)),
+            Bytes::from_static(b"mismatch"),
+        ),
+        Err(ExtractionError::PayloadEvidenceMismatch)
+    ));
+    let mut hostile = serde_json::to_value(&record)?;
+    hostile["payload"] = serde_json::json!([116, 97, 109, 112, 101, 114, 101, 100]);
+    assert!(serde_json::from_value::<ExtractionRecord>(hostile).is_err());
     assert!(matches!(
         ExtractionBatch::try_new(&request, vec![record]),
         Err(ExtractionError::ObjectBindingMismatch)
@@ -420,11 +454,12 @@ fn extraction_deep_cap_counts_maximum_version_pinned_locators() -> TestResult {
         NonZeroU64::try_from(1024 * 1024 * 1024_u64)?,
         Timestamp::from_unix_nanos(100),
     )?;
+    let payload = Bytes::from(vec![7_u8; 1024 * 1024]);
     let record = ExtractionRecord::try_new(
         &request,
         source_identifier(&maximum)?,
         ExactPayloadEvidence::with_version_pinned_locator(
-            EvidenceDigest::new(DigestAlgorithm::Sha256, [5; 32]),
+            payload_evidence(DigestAlgorithm::Sha256, &payload).content_digest(),
             locator()?,
         ),
         Timestamp::from_unix_nanos(1),
@@ -434,7 +469,7 @@ fn extraction_deep_cap_counts_maximum_version_pinned_locators() -> TestResult {
         },
         source_identifier(&maximum)?,
         None,
-        Bytes::from(vec![7_u8; 1024 * 1024]),
+        payload,
     )?;
     assert!(matches!(
         ExtractionBatch::try_new(&request, vec![record; 65]),
@@ -443,6 +478,14 @@ fn extraction_deep_cap_counts_maximum_version_pinned_locators() -> TestResult {
         })
     ));
     Ok(())
+}
+
+fn payload_evidence(algorithm: DigestAlgorithm, payload: &Bytes) -> ExactPayloadEvidence {
+    let bytes = match algorithm {
+        DigestAlgorithm::Sha256 => Sha256::digest(payload).into(),
+        DigestAlgorithm::Blake3 => *blake3::hash(payload).as_bytes(),
+    };
+    ExactPayloadEvidence::from_content_digest(EvidenceDigest::new(algorithm, bytes))
 }
 
 #[test]

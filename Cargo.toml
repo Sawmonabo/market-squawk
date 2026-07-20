@@ -17,6 +17,10 @@ argon2 = { version = "=0.5.3", default-features = false, features = [
     "alloc",
     "zeroize",
 ] }
+arrow = { version = "=58.3.0", default-features = false, features = [
+    "canonical_extension_types",
+    "ipc",
+] }
 async-trait = "0.1"
 atomicwrites = "=0.4.4"
 bs58 = "0.5"
@@ -24,6 +28,7 @@ bytes = "1.10"
 cap-fs-ext = "4.0.2"
 cap-std = "4.0.2"
 bitcoin = { version = "=0.32.102", default-features = false, features = ["std"] }
+blake3 = "=1.8.5"
 chacha20poly1305 = { version = "=0.11.0", default-features = false, features = [
     "alloc",
     "getrandom",
@@ -33,6 +38,11 @@ chrono = { version = "0.4", features = ["clock", "serde"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 criterion = "=0.8.2"
 crc32fast = "1.4"
+datafusion = { version = "=54.0.0", default-features = false, features = [
+    "parquet",
+    "recursive_protection",
+    "sql",
+] }
 fs2 = "0.4"
 futures-util = "0.3"
 getrandom = "=0.3.4"
@@ -45,6 +55,12 @@ market-squawk-sources = { path = "crates/market-squawk-sources", version = "=0.1
 memory-stats = "=1.2.0"
 num-bigint = "0.4"
 parking_lot = "0.12"
+parquet = { version = "=58.3.0", default-features = false, features = [
+    "arrow",
+    "async",
+    "crc",
+    "zstd",
+] }
 proptest = "1.7"
 loom = "=0.7.2"
 rust_decimal = { version = "1.36", features = ["serde-with-str"] }

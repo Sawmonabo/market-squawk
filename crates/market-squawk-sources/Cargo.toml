@@ -9,6 +9,7 @@ repository = "https://github.com/Sawmonabo/market-squawk"
 publish = false
 
 [dependencies]
+blake3 = { workspace = true }
 bytes = { workspace = true }
 futures-util = { workspace = true }
 market-squawk-domain = { workspace = true }

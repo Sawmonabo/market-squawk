@@ -14,7 +14,7 @@ pub use contracts::{
     AvailabilityEvidence, DiscoveryBatch, DiscoveryRequest, DiscoveryRequestId, ExtractionError,
     ExtractionRecord, ExtractionRequest, ExtractionRequestId, MAX_DISCOVERY_OBJECTS,
     MAX_EXTRACTION_BATCH_BYTES, MAX_EXTRACTION_RECORD_BYTES, MAX_EXTRACTION_RECORDS,
-    MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES, SourceObject,
+    MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES, SourceObject, payload_matches_exact_evidence,
 };
 
 /// Object-safe research extraction contract with one boxed future per request.

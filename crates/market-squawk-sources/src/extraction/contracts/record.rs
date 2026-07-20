@@ -112,6 +112,12 @@ impl ExtractionRecord {
         {
             return Err(ExtractionError::InvalidPointInTimeOrdering);
         }
+        let evidence = normalize_evidence(&evidence)?;
+        let payload = BoundedBytes::try_from_bytes(payload)
+            .map_err(|error| ExtractionError::RecordTooLarge { max: error.max })?;
+        if !payload_matches_exact_evidence(payload.as_bytes(), &evidence) {
+            return Err(ExtractionError::PayloadEvidenceMismatch);
+        }
         Ok(Self {
             source_id: normalize_source_id(&source_id)?,
             metadata_revision: normalize_metadata_revision(&metadata_revision)?,
@@ -121,15 +127,69 @@ impl ExtractionRecord {
             object_id: normalize_identifier(&object_id)?,
             object_evidence: normalize_evidence(&object_evidence)?,
             schema: normalize_identifier(&schema)?,
-            evidence: normalize_evidence(&evidence)?,
+            evidence,
             effective_at,
             published_at,
             availability,
             revision: normalize_identifier(&revision)?,
             superseded_at,
-            payload: BoundedBytes::try_from_bytes(payload)
-                .map_err(|error| ExtractionError::RecordTooLarge { max: error.max })?,
+            payload,
         })
+    }
+
+    /// Returns the exact source namespace carried by the extraction request.
+    pub const fn source_id(&self) -> &SourceId {
+        &self.source_id
+    }
+
+    /// Returns the exact source-metadata revision carried by the extraction request.
+    pub const fn metadata_revision(&self) -> &MetadataRevision {
+        &self.metadata_revision
+    }
+
+    /// Returns the request-bound dataset identity.
+    pub const fn dataset(&self) -> &SourceIdentifier {
+        &self.dataset
+    }
+
+    /// Returns the exact discovery request identity.
+    pub const fn discovery_request_id(&self) -> DiscoveryRequestId {
+        self.discovery_request_id
+    }
+
+    /// Returns the exact extraction request identity.
+    pub const fn extraction_request_id(&self) -> ExtractionRequestId {
+        self.extraction_request_id
+    }
+
+    /// Returns the exact discovered source-object identity.
+    pub const fn object_id(&self) -> &SourceIdentifier {
+        &self.object_id
+    }
+
+    /// Returns the source object's exact payload evidence.
+    pub const fn object_evidence(&self) -> &ExactPayloadEvidence {
+        &self.object_evidence
+    }
+
+    /// Returns the normalized record schema identity.
+    pub const fn schema(&self) -> &SourceIdentifier {
+        &self.schema
+    }
+
+    /// Returns evidence verified against the exact normalized payload bytes.
+    pub const fn evidence(&self) -> &ExactPayloadEvidence {
+        &self.evidence
+    }
+
+    /// Returns the record's effective time.
+    pub const fn effective_at(&self) -> Timestamp {
+        self.effective_at
+    }
+
+    /// Returns the source publication time, when supplied.
+    pub const fn published_at(&self) -> Option<Timestamp> {
+        self.published_at
     }
 
     /// Returns exact normalized payload bytes.
@@ -258,6 +318,18 @@ pub enum ExtractionError {
     SourceBindingMismatch,
     #[error("extraction record object evidence does not match its exact request")]
     ObjectBindingMismatch,
+    #[error("extraction record payload does not match its exact content evidence")]
+    PayloadEvidenceMismatch,
+}
+
+/// Verifies algorithm-qualified evidence against exact payload bytes.
+pub fn payload_matches_exact_evidence(payload: &[u8], evidence: &ExactPayloadEvidence) -> bool {
+    let expected = evidence.content_digest();
+    let actual = match expected.algorithm() {
+        DigestAlgorithm::Sha256 => Sha256::digest(payload).into(),
+        DigestAlgorithm::Blake3 => *blake3::hash(payload).as_bytes(),
+    };
+    actual == expected.bytes()
 }
 
 fn discovery_request_id(
