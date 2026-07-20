@@ -105,6 +105,20 @@ worktree is unresolved state: inspect it, determine ownership, and either integr
 explicitly escalate it. Do not discard user or prior-agent files, and do not remove a worktree while
 an agent or verification command still depends on it.
 
+### Completion hygiene
+
+A lane is not operationally complete until its accepted commits are integrated and pushed, its
+closing evidence is recorded on the owning GitHub issue, the issue is closed when its stated outcome
+is actually delivered, and its clean worktree is removed. Delete completed local and remote lane
+branches after proving their commits are merged, patch-equivalent, or superseded by the accepted
+integration. Preserve active branches, open dependency-update branches, and any unique unintegrated
+commit until its disposition is explicit.
+
+Update the README only when runnable or release-blocking product truth changes. Update the local
+delivery ledger at every integration barrier with the exact pushed heads, active worktree, open
+blocker, next release event, issue state, and cleanup disposition. Repository prose is tracking and
+handoff evidence; it never substitutes for behavioral verification.
+
 If one lane remains the critical path across two consecutive status updates or one complete
 verification/review cycle, the integration owner must perform a scheduling audit:
 
