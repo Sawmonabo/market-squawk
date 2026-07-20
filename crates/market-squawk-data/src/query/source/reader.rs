@@ -23,9 +23,9 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::scan::ScanProjection;
-use super::{PinnedIoCancelledError, PinnedRangeMemoryError};
+use super::{PinnedIoAdmissionError, PinnedIoCancelledError, PinnedRangeMemoryError};
 use crate::QueryError;
-use crate::blocking_supervisor::BlockingIoSupervisor;
+use crate::blocking_supervisor::{BlockingIoAdmissionError, BlockingIoSupervisor, BlockingIoTask};
 use crate::parquet_store::VerifiedPinnedObject;
 
 const STREAM_FIXED_RECEIPT: usize = 64 * 1024;
@@ -90,7 +90,6 @@ pub(super) fn execute_pinned(
     let receipt = Arc::new(ActiveReaderReceipt {
         _reservation: reservation,
     });
-    let supervision = supervisor.start().ok_or_else(cancelled_datafusion)?;
     let cancellation = supervisor.cancellation().child_token();
     let worker_cancellation = cancellation.clone();
     let worker_supervisor = supervisor.clone();
@@ -99,20 +98,21 @@ pub(super) fn execute_pinned(
     let projection = Arc::clone(projection);
     let worker_receipt = Arc::clone(&receipt);
     let (sender, receiver) = mpsc::channel(1);
-    let worker = tokio::task::spawn_blocking(move || {
-        let _supervision = supervision;
-        let _receipt = worker_receipt;
-        let result = read_pinned_files(
-            &files,
-            &projection,
-            &worker_cancellation,
-            &worker_supervisor,
-            &sender,
-        );
-        if let Err(error) = result {
-            let _ignored = sender.blocking_send(Err(error));
-        }
-    });
+    let worker = supervisor
+        .spawn_blocking(move || {
+            let _receipt = worker_receipt;
+            let result = read_pinned_files(
+                &files,
+                &projection,
+                &worker_cancellation,
+                &worker_supervisor,
+                &sender,
+            );
+            if let Err(error) = result {
+                let _ignored = sender.blocking_send(Err(error));
+            }
+        })
+        .map_err(blocking_admission_datafusion)?;
     Ok(Box::pin(PinnedBatchStream {
         schema,
         receiver,
@@ -161,7 +161,7 @@ impl RecordBatchStream for SharedBatchStream {
 struct PinnedBatchStream {
     schema: SchemaRef,
     receiver: mpsc::Receiver<DataFusionResult<RecordBatch>>,
-    worker: Option<tokio::task::JoinHandle<()>>,
+    worker: Option<BlockingIoTask<()>>,
     cancellation: CancellationToken,
     _receipt: Arc<ActiveReaderReceipt>,
     done: bool,
@@ -451,6 +451,15 @@ fn cancelled_parquet() -> ParquetError {
 
 fn cancelled_datafusion() -> DataFusionError {
     DataFusionError::External(Box::new(PinnedIoCancelledError))
+}
+
+fn blocking_admission_datafusion(error: BlockingIoAdmissionError) -> DataFusionError {
+    match error {
+        BlockingIoAdmissionError::Cancelled => cancelled_datafusion(),
+        BlockingIoAdmissionError::Saturated => {
+            DataFusionError::External(Box::new(PinnedIoAdmissionError))
+        }
+    }
 }
 
 fn parquet_datafusion(error: ParquetError) -> DataFusionError {

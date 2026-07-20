@@ -3,14 +3,96 @@
 use std::error::Error as StdError;
 use std::io::Write;
 use std::mem::size_of;
+use std::sync::{Arc, LazyLock};
 
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion::error::DataFusionError;
 use datafusion::execution::memory_pool::MemoryReservation;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio_util::sync::CancellationToken;
 
 use super::QueryError;
-use super::source::{PinnedIoCancelledError, PinnedRangeMemoryError};
+use super::source::{PinnedIoAdmissionError, PinnedIoCancelledError, PinnedRangeMemoryError};
+
+const PLANNING_FIXED_RECEIPT: usize = 128 * 1024;
+const PLANNING_SQL_EXPANSION: usize = 32;
+const PLANNING_AST_NODE_RECEIPT: usize = 1024;
+const PLANNING_PLAN_NODE_RECEIPT: usize = 4 * 1024;
+const PLANNING_SCHEMA_EXPANSION: usize = 16;
+const GLOBAL_PLANNING_BYTES: usize = 1024 * 1024 * 1024;
+const _: () = assert!(GLOBAL_PLANNING_BYTES <= Semaphore::MAX_PERMITS);
+const _: () = assert!(GLOBAL_PLANNING_BYTES <= u32::MAX as usize);
+static PLANNING_BYTES: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(GLOBAL_PLANNING_BYTES)));
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct PlanningReceipt {
+    bytes: u32,
+}
+
+#[derive(Debug)]
+pub(super) struct PlanningAdmission {
+    _permit: OwnedSemaphorePermit,
+}
+
+impl PlanningReceipt {
+    pub(super) fn try_new(
+        sql_bytes: usize,
+        ast_nodes: usize,
+        schema_bytes: usize,
+        max_plan_nodes: usize,
+        limit: u64,
+    ) -> Result<Self, QueryError> {
+        let bytes = sql_bytes
+            .checked_mul(PLANNING_SQL_EXPANSION)
+            .and_then(|value| {
+                ast_nodes
+                    .checked_mul(PLANNING_AST_NODE_RECEIPT)
+                    .and_then(|ast| value.checked_add(ast))
+            })
+            .and_then(|value| {
+                schema_bytes
+                    .checked_mul(PLANNING_SCHEMA_EXPANSION)
+                    .and_then(|schema| value.checked_add(schema))
+            })
+            .and_then(|value| {
+                max_plan_nodes
+                    .checked_mul(PLANNING_PLAN_NODE_RECEIPT)
+                    .and_then(|plan| value.checked_add(plan))
+            })
+            .and_then(|value| value.checked_add(PLANNING_FIXED_RECEIPT))
+            .ok_or(QueryError::SizeOverflow)?;
+        if u64::try_from(bytes).map_err(|_| QueryError::SizeOverflow)? >= limit {
+            return Err(QueryError::MemoryLimitExceeded { limit });
+        }
+        Ok(Self {
+            bytes: u32::try_from(bytes).map_err(|_| QueryError::SizeOverflow)?,
+        })
+    }
+
+    pub(super) async fn acquire(
+        self,
+        cancellation: &CancellationToken,
+    ) -> Result<PlanningAdmission, QueryError> {
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err(QueryError::Cancelled),
+            permit = Arc::clone(&PLANNING_BYTES).acquire_many_owned(self.bytes) => {
+                Ok(PlanningAdmission {
+                    _permit: permit.map_err(|_| QueryError::DependencyAllocationContract)?,
+                })
+            }
+        }
+    }
+
+    pub(super) fn execution_bytes(self, limit: u64) -> Result<usize, QueryError> {
+        let available = limit
+            .checked_sub(u64::from(self.bytes))
+            .ok_or(QueryError::MemoryLimitExceeded { limit })?;
+        usize::try_from(available).map_err(|_| QueryError::InvalidLimits)
+    }
+}
 
 #[derive(Debug, Default)]
 pub(super) struct CountingWriter {
@@ -112,6 +194,8 @@ pub(super) fn resize_memory(
 pub(super) fn map_datafusion(error: DataFusionError, limit: u64) -> QueryError {
     if error_chain_has_marker::<PinnedIoCancelledError>(&error) {
         QueryError::Cancelled
+    } else if error_chain_has_marker::<PinnedIoAdmissionError>(&error) {
+        QueryError::BlockingTaskLimitExceeded
     } else if datafusion_memory_error(&error) {
         QueryError::MemoryLimitExceeded { limit }
     } else {

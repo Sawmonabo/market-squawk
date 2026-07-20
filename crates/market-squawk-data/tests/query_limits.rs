@@ -167,6 +167,37 @@ async fn one_memory_budget_charges_retained_input_output_and_ipc_work() -> TestR
     Ok(())
 }
 
+#[tokio::test]
+async fn planning_memory_is_reserved_from_the_configured_ceiling_before_context() -> TestResult {
+    let manifest = manifest()?;
+    let batch = RecordBatch::try_new(
+        Schema::new(vec![Field::new("value", DataType::Int64, false)]).into(),
+        vec![std::sync::Arc::new(Int64Array::from(vec![1])) as ArrayRef],
+    )?;
+    let engine =
+        ResearchQueryEngine::from_pinned_batches(manifest.clone(), "observations", vec![batch])?;
+    let result = engine
+        .query(
+            QueryRequest::try_new(manifest, "SELECT value FROM observations")?,
+            QueryLimits::try_new(
+                1,
+                64 * 1024,
+                256 * 1024,
+                1,
+                128,
+                10_000,
+                Duration::from_secs(1),
+            )?,
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(QueryError::MemoryLimitExceeded { limit }) if limit == 256 * 1024
+    ));
+    Ok(())
+}
+
 fn observation(
     index: usize,
     availability: AvailabilityEvidence,

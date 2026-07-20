@@ -762,6 +762,12 @@ pub enum CatalogError {
     /// A query-artifact receipt differs from its durable reservation.
     #[error("query artifact reservation does not match durable authority")]
     QueryArtifactReservationMismatch,
+    /// Cancellation was observed while query-artifact binding could still roll back safely.
+    #[error("query artifact binding was cancelled before durable commit")]
+    QueryArtifactCancelled,
+    /// The monotonic query deadline elapsed before artifact binding became durable.
+    #[error("query artifact binding deadline elapsed before durable commit")]
+    QueryArtifactDeadlineExceeded,
     /// The local wall clock moved behind the last committed authority decision.
     #[error("catalog authority clock rollback was detected")]
     AuthorityClockRollback,

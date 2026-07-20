@@ -31,6 +31,8 @@ pub use self::types::{
     IngestRunRecord, IngestRunState, ReferenceBundle, SourceCursor,
 };
 pub use publication::PublishedIngest;
+#[cfg(test)]
+pub(crate) use query_artifacts::QueryArtifactBindCheckpoint;
 pub(crate) use query_artifacts::QueryArtifactPublisher;
 pub use query_artifacts::{
     QueryArtifactReservation, QueryArtifactReservationInput, QueryArtifactResult,

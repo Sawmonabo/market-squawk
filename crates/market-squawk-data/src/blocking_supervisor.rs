@@ -1,10 +1,25 @@
-//! Query-scoped ownership and draining for admitted blocking file operations.
+//! Globally admitted ownership and non-blocking reaping for query file operations.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 
-use tokio::sync::Notify;
+#[cfg(test)]
+use tokio::sync::{Mutex as TokioMutex, OwnedMutexGuard};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::task::{JoinError, JoinHandle};
 use tokio_util::sync::CancellationToken;
+
+const MAX_QUERY_BLOCKING_WORKERS: usize = 64;
+const _: () = assert!(MAX_QUERY_BLOCKING_WORKERS <= Semaphore::MAX_PERMITS);
+static QUERY_BLOCKING_WORKERS: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(MAX_QUERY_BLOCKING_WORKERS)));
+#[cfg(test)]
+static QUERY_BLOCKING_WORKER_TEST_SERIAL: LazyLock<Arc<TokioMutex<()>>> =
+    LazyLock::new(|| Arc::new(TokioMutex::new(())));
 
 #[derive(Clone, Debug)]
 pub(crate) struct BlockingIoSupervisor {
@@ -23,6 +38,18 @@ struct SupervisorInner {
 #[derive(Debug)]
 pub(crate) struct BlockingIoLease {
     inner: Arc<SupervisorInner>,
+    _global_permit: OwnedSemaphorePermit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BlockingIoAdmissionError {
+    Cancelled,
+    Saturated,
+}
+
+#[derive(Debug)]
+pub(crate) struct BlockingIoTask<T: Send + 'static> {
+    worker: Option<JoinHandle<T>>,
 }
 
 impl BlockingIoSupervisor {
@@ -42,22 +69,59 @@ impl BlockingIoSupervisor {
         &self.inner.cancellation
     }
 
-    pub(crate) fn start(&self) -> Option<BlockingIoLease> {
+    pub(crate) fn spawn_blocking<F, T>(
+        &self,
+        operation: F,
+    ) -> Result<BlockingIoTask<T>, BlockingIoAdmissionError>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
         if self.inner.cancellation.is_cancelled() {
-            return None;
+            return Err(BlockingIoAdmissionError::Cancelled);
         }
+        let global_permit = Arc::clone(&QUERY_BLOCKING_WORKERS)
+            .try_acquire_owned()
+            .map_err(|_| BlockingIoAdmissionError::Saturated)?;
         self.inner.active.fetch_add(1, Ordering::AcqRel);
         let lease = BlockingIoLease {
             inner: Arc::clone(&self.inner),
+            _global_permit: global_permit,
         };
         if self.inner.cancellation.is_cancelled() {
             drop(lease);
-            None
-        } else {
-            Some(lease)
+            return Err(BlockingIoAdmissionError::Cancelled);
         }
+        Ok(BlockingIoTask {
+            worker: Some(tokio::task::spawn_blocking(move || {
+                let _lease = lease;
+                operation()
+            })),
+        })
     }
 
+    pub(crate) fn cancel(&self) {
+        self.inner.cancellation.cancel();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn globally_available() -> usize {
+        QUERY_BLOCKING_WORKERS.available_permits()
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn global_limit() -> usize {
+        MAX_QUERY_BLOCKING_WORKERS
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn acquire_test_serial_guard() -> OwnedMutexGuard<()> {
+        Arc::clone(&QUERY_BLOCKING_WORKER_TEST_SERIAL)
+            .lock_owned()
+            .await
+    }
+
+    #[cfg(test)]
     pub(crate) async fn drain(&self) {
         loop {
             let idle = self.inner.idle.notified();
@@ -66,11 +130,6 @@ impl BlockingIoSupervisor {
             }
             idle.await;
         }
-    }
-
-    pub(crate) async fn cancel_and_drain(&self) {
-        self.inner.cancellation.cancel();
-        self.drain().await;
     }
 
     #[cfg(test)]
@@ -113,8 +172,43 @@ impl BlockingIoSupervisor {
                 .release_receiver
                 .recv()
                 .map_err(|_| "test range release sender was dropped")?;
+        } else {
+            return Ok(());
         }
         Ok(())
+    }
+}
+
+impl<T: Send + 'static> Future for BlockingIoTask<T> {
+    type Output = Result<T, JoinError>;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let Some(worker) = self.worker.as_mut() else {
+            return Poll::Pending;
+        };
+        match Pin::new(worker).poll(context) {
+            Poll::Ready(result) => {
+                self.worker = None;
+                Poll::Ready(result)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<T: Send + 'static> Drop for BlockingIoTask<T> {
+    fn drop(&mut self) {
+        let Some(worker) = self.worker.take() else {
+            return;
+        };
+        if worker.is_finished() {
+            return;
+        }
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ignored = worker.await;
+            });
+        }
     }
 }
 

@@ -423,6 +423,65 @@ async fn authorized_query_artifact_survives_restart_until_expiry() -> TestResult
 }
 
 #[tokio::test]
+async fn query_artifact_writer_memory_is_pre_admitted_by_the_object_store() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let paths = LocalPaths::prepare(directory.path().join("market-squawk"))?;
+    let location = paths.catalog()?.clone();
+    let service = AnalyticalDataService::initialize(
+        CatalogAuthority::open(test_catalog_config(location.clone())?)?,
+        AnalyticalManifestCatalog::open(&location, 8)?,
+        paths.artifacts()?.clone(),
+        ObjectStoreConfig::try_new(1024 * 1024, 100_000, Duration::from_secs(60))?,
+    )?;
+    let manifest = DatasetManifestRef::try_new(
+        DatasetId::try_from("writer-memory-query-result")?,
+        1,
+        Sha256Digest::new([42; 32]),
+    )?;
+    let batch = RecordBatch::try_new(
+        Schema::new(vec![Field::new("value", DataType::Int64, false)]).into(),
+        vec![Arc::new(Int64Array::from_iter_values(0..100_000)) as ArrayRef],
+    )?;
+    let limits = QueryLimits::try_new(
+        100_000,
+        4 * 1024 * 1024,
+        64 * 1024 * 1024,
+        1,
+        128,
+        128,
+        Duration::from_secs(5),
+    )?;
+    let request = QueryRequest::try_new(manifest.clone(), "SELECT value FROM observations")?;
+    let wall_nanos = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos())?;
+    let reservation = service
+        .reserve_query_artifact(
+            QueryArtifactReservationInput::try_new(
+                SourceIdentifier::try_from("writer-memory-owner")?,
+                request.artifact_identity(&limits),
+                limits.max_bytes(),
+                Timestamp::from_unix_nanos(wall_nanos).checked_add_nanos(120_000_000_000)?,
+            )?,
+            &CancellationToken::new(),
+        )
+        .await?;
+    let result = ResearchQueryEngine::from_pinned_batches(manifest, "observations", vec![batch])?
+        .with_artifact_publication(service.query_artifact_publication())?
+        .query(
+            request.with_artifact_reservation(reservation),
+            limits,
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(QueryError::Artifact(
+            ParquetStoreError::StagingLimitExceeded
+        ))
+    ));
+    Ok(())
+}
+
+#[tokio::test]
 async fn rights_bound_ingest_replays_one_complete_pinned_generation() -> TestResult {
     let directory = tempfile::tempdir()?;
     let paths = LocalPaths::prepare(directory.path().join("market-squawk"))?;

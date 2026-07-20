@@ -14,7 +14,7 @@ use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use tokio_util::sync::CancellationToken;
 
 use super::{OBJECTS, ParquetObjectStore, ParquetStoreError, hash_file};
-use crate::blocking_supervisor::BlockingIoSupervisor;
+use crate::blocking_supervisor::{BlockingIoAdmissionError, BlockingIoSupervisor};
 use crate::{PinnedDataset, QueryError};
 
 #[derive(Debug)]
@@ -111,27 +111,29 @@ impl ParquetObjectStore {
             let directory = self.directory.try_clone()?;
             let config = self.config;
             let permit = self.acquire_blocking_permit(cancellation).await?;
-            let supervision = supervisor.start().ok_or(ParquetStoreError::Cancelled)?;
             let operation_cancellation = cancellation.child_token();
             let worker_cancellation = operation_cancellation.clone();
-            let mut worker = tokio::task::spawn_blocking(move || {
-                let _supervision = supervision;
-                let _permit = permit;
-                Self::capture_pinned_files(
-                    &directory,
-                    config,
-                    &plan,
-                    verified,
-                    &worker_cancellation,
-                )
-            });
+            let mut worker = supervisor
+                .spawn_blocking(move || {
+                    let _permit = permit;
+                    Self::capture_pinned_files(
+                        &directory,
+                        config,
+                        &plan,
+                        verified,
+                        &worker_cancellation,
+                    )
+                })
+                .map_err(|error| match error {
+                    BlockingIoAdmissionError::Cancelled => ParquetStoreError::Cancelled,
+                    BlockingIoAdmissionError::Saturated => ParquetStoreError::BlockingTaskFailed,
+                })?;
             tokio::select! {
                 result = &mut worker => {
                     result.map_err(|_| ParquetStoreError::BlockingTaskFailed)?
                 }
                 _ = cancellation.cancelled() => {
                     operation_cancellation.cancel();
-                    worker.await.map_err(|_| ParquetStoreError::BlockingTaskFailed)??;
                     Err(ParquetStoreError::Cancelled)
                 }
             }

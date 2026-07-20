@@ -2,6 +2,9 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::sync::atomic::AtomicBool;
+#[cfg(test)]
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use arrow::record_batch::RecordBatch;
@@ -15,8 +18,12 @@ use tokio_util::sync::CancellationToken;
 
 use crate::analytical_backup::AnalyticalOperationGate;
 use crate::authority_transition::{AuthorityTransitionError, AuthorityTransitionService};
+use crate::blocking_supervisor::BlockingIoSupervisor;
+#[cfg(test)]
+use crate::catalog::QueryArtifactBindCheckpoint;
 use crate::catalog::QueryArtifactPublisher;
-use crate::parquet_store::ArtifactRootIdentity;
+use crate::parquet_store::{ArtifactRootIdentity, QueryArtifactWriterAdmission};
+use crate::query::QueryArtifactMemoryLease;
 use crate::{
     AnalyticalManifestCatalog, ArrowConversionError, ArtifactRecord, CatalogAuthority,
     CatalogError, ContractCompletion, DatasetId, DatasetManifestRecord, DatasetManifestRef,
@@ -122,6 +129,41 @@ pub struct QueryArtifactPublication {
     catalog_id: uuid::Uuid,
     root_identity: ArtifactRootIdentity,
     operation_gate: AnalyticalOperationGate,
+    #[cfg(test)]
+    bind_barrier: Mutex<Option<QueryArtifactBindWorkerBarrier>>,
+    #[cfg(test)]
+    writer_barrier: Mutex<Option<QueryArtifactWriterWorkerBarrier>>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct QueryArtifactBindWorkerBarrier {
+    checkpoint: QueryArtifactBindCheckpoint,
+    entered_sender: std::sync::mpsc::SyncSender<()>,
+    release_receiver: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct QueryArtifactBindTestBarrier {
+    entered_receiver: Option<std::sync::mpsc::Receiver<()>>,
+    release_sender: std::sync::mpsc::SyncSender<()>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct QueryArtifactWriterWorkerBarrier {
+    entered_sender: std::sync::mpsc::SyncSender<()>,
+    release_receiver: std::sync::mpsc::Receiver<()>,
+    memory_retained: Arc<AtomicBool>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct QueryArtifactWriterTestBarrier {
+    entered_receiver: Option<std::sync::mpsc::Receiver<()>>,
+    release_sender: std::sync::mpsc::SyncSender<()>,
+    memory_retained: Arc<AtomicBool>,
 }
 
 impl fmt::Debug for QueryArtifactPublication {
@@ -140,11 +182,108 @@ impl QueryArtifactPublication {
         &self.root_identity
     }
 
-    pub(crate) async fn publish_and_bind(
+    pub(crate) fn writer_admission(
         &self,
         batch: &RecordBatch,
+    ) -> Result<QueryArtifactWriterAdmission, ParquetStoreError> {
+        self.objects.query_artifact_writer_admission(batch)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_test_bind_barrier(
+        &self,
+        checkpoint: QueryArtifactBindCheckpoint,
+    ) -> Result<QueryArtifactBindTestBarrier, &'static str> {
+        let (entered_sender, entered_receiver) = std::sync::mpsc::sync_channel(1);
+        let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(1);
+        *self
+            .bind_barrier
+            .lock()
+            .map_err(|_| "test query-bind barrier mutex was poisoned")? =
+            Some(QueryArtifactBindWorkerBarrier {
+                checkpoint,
+                entered_sender,
+                release_receiver,
+            });
+        Ok(QueryArtifactBindTestBarrier {
+            entered_receiver: Some(entered_receiver),
+            release_sender,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_test_writer_barrier(
+        &self,
+    ) -> Result<QueryArtifactWriterTestBarrier, &'static str> {
+        let (entered_sender, entered_receiver) = std::sync::mpsc::sync_channel(1);
+        let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(1);
+        let memory_retained = Arc::new(AtomicBool::new(false));
+        *self
+            .writer_barrier
+            .lock()
+            .map_err(|_| "test query-writer barrier mutex was poisoned")? =
+            Some(QueryArtifactWriterWorkerBarrier {
+                entered_sender,
+                release_receiver,
+                memory_retained: Arc::clone(&memory_retained),
+            });
+        Ok(QueryArtifactWriterTestBarrier {
+            entered_receiver: Some(entered_receiver),
+            release_sender,
+            memory_retained,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_writer_memory_witness(&self) -> Option<Arc<AtomicBool>> {
+        self.writer_barrier.lock().ok().and_then(|barrier| {
+            barrier
+                .as_ref()
+                .map(|barrier| Arc::clone(&barrier.memory_retained))
+        })
+    }
+
+    #[cfg(test)]
+    fn take_test_writer_barrier(&self) -> Option<QueryArtifactWriterWorkerBarrier> {
+        self.writer_barrier
+            .lock()
+            .ok()
+            .and_then(|mut barrier| barrier.take())
+    }
+
+    #[cfg(test)]
+    fn wait_at_test_bind_barrier(&self, checkpoint: QueryArtifactBindCheckpoint) {
+        let barrier = self.bind_barrier.lock().ok().and_then(|mut barrier| {
+            if barrier
+                .as_ref()
+                .is_some_and(|barrier| barrier.checkpoint == checkpoint)
+            {
+                barrier.take()
+            } else {
+                None
+            }
+        });
+        if let Some(barrier) = barrier {
+            let _ignored = barrier.entered_sender.send(());
+            let _ignored = barrier.release_receiver.recv();
+        }
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "publication ownership, admission, deadline, and durability capabilities stay explicit"
+    )]
+    pub(crate) async fn publish_and_bind(
+        &self,
+        batch: RecordBatch,
         cancellation: &CancellationToken,
         reservation: &QueryArtifactReservation,
+        writer_admission: QueryArtifactWriterAdmission,
+        memory_lease: QueryArtifactMemoryLease,
+        supervisor: &BlockingIoSupervisor,
+        deadline: tokio::time::Instant,
+        #[cfg(test)] bind_precommit_deadline: Option<tokio::time::Instant>,
+        durable_bound: &AtomicBool,
     ) -> Result<(PublishedObject, ArtifactRecord, crate::QueryArtifactResult), crate::QueryError>
     {
         let _operation = self
@@ -164,7 +303,16 @@ impl QueryArtifactPublication {
             .map_err(map_query_store_error)?;
         let object = self
             .objects
-            .publish_under_lease(batch, cancellation, &lease)
+            .publish_query_artifact_under_lease(
+                batch,
+                cancellation,
+                &lease,
+                writer_admission,
+                memory_lease,
+                supervisor,
+                #[cfg(test)]
+                self.take_test_writer_barrier(),
+            )
             .await
             .map_err(map_query_store_error)?;
         if !self
@@ -183,19 +331,90 @@ impl QueryArtifactPublication {
             object.created_at(),
         )
         .map_err(crate::QueryError::Catalog)?;
+        let mut checkpoint = |checkpoint| {
+            #[cfg(test)]
+            self.wait_at_test_bind_barrier(checkpoint);
+            #[cfg(not(test))]
+            let _ = checkpoint;
+        };
         let ownership = self
             .publisher
-            .bind(reservation, &artifact)
-            .map_err(crate::QueryError::Catalog)?;
+            .bind(
+                reservation,
+                &artifact,
+                cancellation,
+                deadline,
+                #[cfg(test)]
+                bind_precommit_deadline,
+                durable_bound,
+                &mut checkpoint,
+            )
+            .map_err(map_query_catalog_error)?;
         Ok((object, artifact, ownership))
     }
 }
 
 fn map_query_store_error(error: ParquetStoreError) -> crate::QueryError {
-    if matches!(error, ParquetStoreError::Cancelled) {
-        crate::QueryError::Cancelled
-    } else {
-        crate::QueryError::Artifact(error)
+    match error {
+        ParquetStoreError::Cancelled => crate::QueryError::Cancelled,
+        ParquetStoreError::BlockingTaskLimitExceeded => {
+            crate::QueryError::BlockingTaskLimitExceeded
+        }
+        error => crate::QueryError::Artifact(error),
+    }
+}
+
+fn map_query_catalog_error(error: CatalogError) -> crate::QueryError {
+    match error {
+        CatalogError::QueryArtifactCancelled => crate::QueryError::Cancelled,
+        CatalogError::QueryArtifactDeadlineExceeded => crate::QueryError::DeadlineExceeded,
+        error => crate::QueryError::Catalog(error),
+    }
+}
+
+#[cfg(test)]
+impl QueryArtifactBindTestBarrier {
+    pub(crate) async fn wait_until_entered(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let receiver = self
+            .entered_receiver
+            .take()
+            .ok_or("test query-bind barrier was already entered")?;
+        tokio::task::spawn_blocking(move || receiver.recv()).await??;
+        Ok(())
+    }
+
+    pub(crate) fn release(&self) -> Result<(), Box<dyn std::error::Error>> {
+        self.release_sender.send(())?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl QueryArtifactWriterWorkerBarrier {
+    pub(crate) fn wait(self) {
+        let _ignored = self.entered_sender.send(());
+        let _ignored = self.release_receiver.recv();
+    }
+}
+
+#[cfg(test)]
+impl QueryArtifactWriterTestBarrier {
+    pub(crate) async fn wait_until_entered(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let receiver = self
+            .entered_receiver
+            .take()
+            .ok_or("test query-writer barrier was already entered")?;
+        tokio::task::spawn_blocking(move || receiver.recv()).await??;
+        Ok(())
+    }
+
+    pub(crate) fn memory_retained(&self) -> bool {
+        self.memory_retained.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn release(&self) -> Result<(), Box<dyn std::error::Error>> {
+        self.release_sender.send(())?;
+        Ok(())
     }
 }
 
@@ -299,6 +518,10 @@ impl AnalyticalDataService {
             catalog_id: self.catalog_id,
             root_identity: self.objects.authority_identity().clone(),
             operation_gate: self.operation_gate.clone(),
+            #[cfg(test)]
+            bind_barrier: Mutex::new(None),
+            #[cfg(test)]
+            writer_barrier: Mutex::new(None),
         })
     }
 

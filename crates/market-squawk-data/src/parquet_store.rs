@@ -22,8 +22,10 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::blocking_supervisor::{BlockingIoAdmissionError, BlockingIoSupervisor};
 use crate::manifest::{PinnedDataset, Sha256Digest};
 use crate::publication_coordinator::PublicationLease;
+use crate::query::QueryArtifactMemoryLease;
 use crate::schema::{decode_hex, encode_hex};
 
 const OBJECTS: &str = "objects/sha256";
@@ -31,6 +33,12 @@ const STAGING: &str = "staging/parquet";
 const QUARANTINE: &str = "quarantine/parquet";
 const MAX_SCAN_OBJECTS: usize = 100_000;
 const MAX_BLOCKING_TASKS: usize = 4;
+const QUERY_WRITER_FIXED_RECEIPT: usize = 128 * 1024;
+const QUERY_WRITER_INPUT_EXPANSION: usize = 3;
+const QUERY_WRITER_SCHEMA_EXPANSION: usize = 16;
+const QUERY_WRITER_COLUMN_METADATA: usize = 8 * 1024;
+const QUERY_WRITER_ROW_GROUP_METADATA: usize = 4 * 1024;
+const QUERY_WRITER_PAGE_BYTES: usize = 64 * 1024;
 #[path = "parquet_store/authority.rs"]
 mod authority;
 #[path = "parquet_store/pinned.rs"]
@@ -91,6 +99,21 @@ pub struct PublishedObject {
     size_bytes: u64,
     row_count: u64,
     created_at: Timestamp,
+}
+
+/// Pre-construction receipt for the bounded uncompressed query-artifact writer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct QueryArtifactWriterAdmission {
+    active_writer_bytes: usize,
+    metadata_bytes: usize,
+    row_groups: usize,
+    total_bytes: usize,
+}
+
+impl QueryArtifactWriterAdmission {
+    pub(crate) const fn bytes(self) -> usize {
+        self.total_bytes
+    }
 }
 
 impl PublishedObject {
@@ -277,8 +300,140 @@ impl ParquetObjectStore {
             .ok_or(ParquetStoreError::Cancelled)
     }
 
+    /// Pre-admits every variable allocation of the query-only uncompressed writer path.
+    pub(crate) fn query_artifact_writer_admission(
+        &self,
+        batch: &RecordBatch,
+    ) -> Result<QueryArtifactWriterAdmission, ParquetStoreError> {
+        let batch_bytes = batch
+            .get_array_memory_size()
+            .checked_add(
+                batch
+                    .num_columns()
+                    .checked_mul(std::mem::size_of::<arrow::array::ArrayRef>())
+                    .ok_or(ParquetStoreError::SizeOverflow)?,
+            )
+            .and_then(|value| value.checked_add(std::mem::size_of::<RecordBatch>()))
+            .ok_or(ParquetStoreError::SizeOverflow)?;
+        let schema_bytes = batch
+            .schema()
+            .fields()
+            .iter()
+            .try_fold(0_usize, |total, field| {
+                total
+                    .checked_add(field.size())
+                    .ok_or(ParquetStoreError::SizeOverflow)
+            })?;
+        let row_groups = batch
+            .num_rows()
+            .checked_add(self.config.max_row_group_rows - 1)
+            .ok_or(ParquetStoreError::SizeOverflow)?
+            / self.config.max_row_group_rows;
+        let metadata_units = row_groups
+            .checked_mul(batch.num_columns())
+            .ok_or(ParquetStoreError::SizeOverflow)?;
+        let metadata_bytes = metadata_units
+            .checked_mul(QUERY_WRITER_COLUMN_METADATA)
+            .and_then(|value| {
+                row_groups
+                    .checked_mul(QUERY_WRITER_ROW_GROUP_METADATA)
+                    .and_then(|rows| value.checked_add(rows))
+            })
+            .and_then(|value| {
+                schema_bytes
+                    .checked_mul(QUERY_WRITER_SCHEMA_EXPANSION)
+                    .and_then(|schema| value.checked_add(schema))
+            })
+            .ok_or(ParquetStoreError::SizeOverflow)?;
+        let active_writer_bytes = batch_bytes
+            .checked_mul(QUERY_WRITER_INPUT_EXPANSION)
+            .and_then(|value| value.checked_add(QUERY_WRITER_FIXED_RECEIPT))
+            .and_then(|value| {
+                batch
+                    .num_columns()
+                    .checked_mul(QUERY_WRITER_PAGE_BYTES)
+                    .and_then(|pages| value.checked_add(pages))
+            })
+            .ok_or(ParquetStoreError::SizeOverflow)?;
+        let total_bytes = active_writer_bytes
+            .checked_add(metadata_bytes)
+            .ok_or(ParquetStoreError::SizeOverflow)?;
+        if u64::try_from(total_bytes).map_err(|_| ParquetStoreError::SizeOverflow)?
+            > self.config.max_staging_bytes
+        {
+            return Err(ParquetStoreError::StagingLimitExceeded);
+        }
+        Ok(QueryArtifactWriterAdmission {
+            active_writer_bytes,
+            metadata_bytes,
+            row_groups,
+            total_bytes,
+        })
+    }
+
     /// Publishes while the caller retains exclusion through its durable reference commit.
     pub(crate) async fn publish_under_lease(
+        &self,
+        batch: &RecordBatch,
+        cancellation: &CancellationToken,
+        lease: &PublicationLease,
+    ) -> Result<PublishedObject, ParquetStoreError> {
+        self.publish_under_lease_inner(batch, cancellation, lease)
+            .await
+    }
+
+    /// Publishes a query artifact only after a checked uncompressed-writer admission.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "query publication keeps every independently owned capability explicit"
+    )]
+    pub(crate) async fn publish_query_artifact_under_lease(
+        &self,
+        batch: RecordBatch,
+        cancellation: &CancellationToken,
+        lease: &PublicationLease,
+        admission: QueryArtifactWriterAdmission,
+        memory_lease: QueryArtifactMemoryLease,
+        supervisor: &BlockingIoSupervisor,
+        #[cfg(test)] writer_barrier: Option<crate::ingest::QueryArtifactWriterWorkerBarrier>,
+    ) -> Result<PublishedObject, ParquetStoreError> {
+        if !self.authority.publication.owns(lease)
+            || self.query_artifact_writer_admission(&batch)? != admission
+        {
+            return Err(ParquetStoreError::InvalidPublicationLease);
+        }
+        let store = Self {
+            root: self.root.clone(),
+            directory: self.directory.try_clone()?,
+            config: self.config,
+            blocking_tasks: Arc::clone(&self.blocking_tasks),
+            authority: Arc::clone(&self.authority),
+        };
+        let permit = self.acquire_blocking_permit(cancellation).await?;
+        let worker_cancellation = supervisor.cancellation().clone();
+        let mut worker = supervisor
+            .spawn_blocking(move || {
+                let _permit = permit;
+                let _memory_lease = memory_lease;
+                #[cfg(test)]
+                if let Some(barrier) = writer_barrier {
+                    barrier.wait();
+                }
+                store.publish_blocking(&batch, &worker_cancellation, Some(admission))
+            })
+            .map_err(|error| match error {
+                BlockingIoAdmissionError::Cancelled => ParquetStoreError::Cancelled,
+                BlockingIoAdmissionError::Saturated => ParquetStoreError::BlockingTaskLimitExceeded,
+            })?;
+        tokio::select! {
+            result = &mut worker => {
+                result.map_err(|_| ParquetStoreError::BlockingTaskFailed)?
+            }
+            _ = cancellation.cancelled() => Err(ParquetStoreError::Cancelled),
+        }
+    }
+
+    async fn publish_under_lease_inner(
         &self,
         batch: &RecordBatch,
         cancellation: &CancellationToken,
@@ -300,7 +455,7 @@ impl ParquetObjectStore {
         let worker_cancellation = operation_cancellation.clone();
         let mut worker = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            store.publish_blocking(&batch, &worker_cancellation)
+            store.publish_blocking(&batch, &worker_cancellation, None)
         });
         tokio::select! {
             result = &mut worker => {
@@ -318,6 +473,7 @@ impl ParquetObjectStore {
         &self,
         batch: &RecordBatch,
         cancellation: &CancellationToken,
+        query_admission: Option<QueryArtifactWriterAdmission>,
     ) -> Result<PublishedObject, ParquetStoreError> {
         if cancellation.is_cancelled() {
             return Err(ParquetStoreError::Cancelled);
@@ -337,11 +493,21 @@ impl ParquetObjectStore {
             reference: &stage,
         };
         let properties = WriterProperties::builder()
-            .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
             .set_max_row_group_row_count(Some(self.config.max_row_group_rows))
-            .set_statistics_enabled(EnabledStatistics::Chunk)
-            .set_write_page_header_statistics(false)
-            .build();
+            .set_write_page_header_statistics(false);
+        let properties = match query_admission {
+            Some(admission) => properties
+                .set_compression(Compression::UNCOMPRESSED)
+                .set_dictionary_enabled(false)
+                .set_statistics_enabled(EnabledStatistics::None)
+                .set_data_page_size_limit(QUERY_WRITER_PAGE_BYTES)
+                .set_write_batch_size(1024)
+                .set_max_row_group_bytes(Some(admission.active_writer_bytes)),
+            None => properties
+                .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
+                .set_statistics_enabled(EnabledStatistics::Chunk),
+        }
+        .build();
         let mut writer = ArrowWriter::try_new(staged, batch.schema(), Some(properties))?;
         let mut offset = 0_usize;
         while offset < batch.num_rows() {
@@ -357,6 +523,13 @@ impl ParquetObjectStore {
                 let _ignored = self.directory.remove_file(&stage);
                 return Err(error.into());
             }
+            if query_admission.is_some_and(|admission| {
+                writer.memory_size() > admission.active_writer_bytes
+                    || writer.flushed_row_groups().len() > admission.row_groups
+            }) {
+                let _ignored = self.directory.remove_file(&stage);
+                return Err(ParquetStoreError::StagingLimitExceeded);
+            }
             offset = offset
                 .checked_add(length)
                 .ok_or(ParquetStoreError::SizeOverflow)?;
@@ -364,6 +537,13 @@ impl ParquetObjectStore {
         if cancellation.is_cancelled() {
             let _ignored = self.directory.remove_file(&stage);
             return Err(ParquetStoreError::Cancelled);
+        }
+        if query_admission.is_some_and(|admission| {
+            writer.memory_size() > admission.active_writer_bytes
+                || writer.flushed_row_groups().len() > admission.row_groups
+        }) {
+            let _ignored = self.directory.remove_file(&stage);
+            return Err(ParquetStoreError::StagingLimitExceeded);
         }
         let mut staged = match writer.into_inner() {
             Ok(staged) => staged,
@@ -665,6 +845,9 @@ pub enum ParquetStoreError {
     /// A bounded blocking worker or its admission semaphore failed.
     #[error("Parquet blocking worker failed")]
     BlockingTaskFailed,
+    /// Process-global admission for query blocking workers is saturated.
+    #[error("query Parquet blocking-worker limit exceeded")]
+    BlockingTaskLimitExceeded,
     /// An existing content address contains different bytes.
     #[error("content-addressed Parquet object conflicts with existing bytes")]
     ContentAddressConflict,

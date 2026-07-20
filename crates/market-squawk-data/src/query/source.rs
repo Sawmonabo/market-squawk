@@ -25,7 +25,7 @@ use url::Url;
 
 #[cfg(test)]
 use crate::ParquetStoreError;
-use crate::blocking_supervisor::BlockingIoSupervisor;
+use crate::blocking_supervisor::{BlockingIoAdmissionError, BlockingIoSupervisor};
 use crate::parquet_store::{ArtifactRootIdentity, VerifiedPinnedObject};
 use crate::{ParquetObjectStore, PinnedDataset, QueryError};
 
@@ -64,6 +64,10 @@ pub(super) struct PinnedRangeMemoryError;
 #[derive(Debug, Error)]
 #[error("pinned Parquet I/O was cancelled")]
 pub(super) struct PinnedIoCancelledError;
+
+#[derive(Debug, Error)]
+#[error("global pinned Parquet blocking-worker admission is saturated")]
+pub(super) struct PinnedIoAdmissionError;
 
 /// Query-local fixed single-slot registry. Its fixed runtime allocation is outside the pinned
 /// source R/P model; the only variable ownership is the already-admitted store `Arc` in the slot.
@@ -171,6 +175,12 @@ pub(super) enum QuerySource {
 }
 
 impl QuerySource {
+    pub(super) fn schema(&self) -> &SchemaRef {
+        match self {
+            Self::Pinned { schema, .. } | Self::Batches { schema, .. } => schema,
+        }
+    }
+
     pub(super) fn root_identity(&self) -> Option<&ArtifactRootIdentity> {
         match self {
             Self::Pinned { store, .. } => Some(store.authority_identity()),
@@ -390,77 +400,85 @@ async fn read_exact_range(
     memory_pool: Arc<dyn MemoryPool>,
     supervisor: BlockingIoSupervisor,
 ) -> ObjectStoreResult<Bytes> {
-    let supervision = supervisor.start().ok_or_else(cancelled_object_store)?;
     let cancellation = supervisor.cancellation().clone();
     #[cfg(test)]
     let worker_supervisor = supervisor.clone();
-    let mut worker = tokio::task::spawn_blocking(move || {
-        let _supervision = supervision;
-        if cancellation.is_cancelled() {
-            return Err(cancelled_object_store());
-        }
-        #[cfg(test)]
-        worker_supervisor
-            .wait_at_test_range_barrier()
-            .map_err(|source| ObjectStoreError::Generic {
-                store: STORE_NAME,
-                source: source.into(),
-            })?;
-        if cancellation.is_cancelled() {
-            return Err(cancelled_object_store());
-        }
-        let length = usize::try_from(range.end.saturating_sub(range.start)).map_err(|error| {
-            ObjectStoreError::Generic {
-                store: STORE_NAME,
-                source: Box::new(error),
+    let mut worker = supervisor
+        .spawn_blocking(move || {
+            if cancellation.is_cancelled() {
+                return Err(cancelled_object_store());
             }
-        })?;
-        let reservation =
-            MemoryConsumer::new("market-squawk-pinned-parquet-range").register(&memory_pool);
-        reservation
-            .try_grow(length)
-            .map_err(|_| ObjectStoreError::Generic {
+            #[cfg(test)]
+            worker_supervisor
+                .wait_at_test_range_barrier()
+                .map_err(|source| ObjectStoreError::Generic {
+                    store: STORE_NAME,
+                    source: source.into(),
+                })?;
+            if cancellation.is_cancelled() {
+                return Err(cancelled_object_store());
+            }
+            let length =
+                usize::try_from(range.end.saturating_sub(range.start)).map_err(|error| {
+                    ObjectStoreError::Generic {
+                        store: STORE_NAME,
+                        source: Box::new(error),
+                    }
+                })?;
+            let reservation =
+                MemoryConsumer::new("market-squawk-pinned-parquet-range").register(&memory_pool);
+            reservation
+                .try_grow(length)
+                .map_err(|_| ObjectStoreError::Generic {
+                    store: STORE_NAME,
+                    source: Box::new(PinnedRangeMemoryError),
+                })?;
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(length)
+                .map_err(|error| ObjectStoreError::Generic {
+                    store: STORE_NAME,
+                    source: Box::new(error),
+                })?;
+            bytes.resize(length, 0);
+            if cancellation.is_cancelled() {
+                return Err(cancelled_object_store());
+            }
+            let mut file = file.lock().map_err(|_| ObjectStoreError::Generic {
                 store: STORE_NAME,
-                source: Box::new(PinnedRangeMemoryError),
+                source: "verified file mutex was poisoned".into(),
             })?;
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(length)
-            .map_err(|error| ObjectStoreError::Generic {
-                store: STORE_NAME,
-                source: Box::new(error),
-            })?;
-        bytes.resize(length, 0);
-        if cancellation.is_cancelled() {
-            return Err(cancelled_object_store());
-        }
-        let mut file = file.lock().map_err(|_| ObjectStoreError::Generic {
-            store: STORE_NAME,
-            source: "verified file mutex was poisoned".into(),
-        })?;
-        if cancellation.is_cancelled() {
-            return Err(cancelled_object_store());
-        }
-        file.seek(SeekFrom::Start(range.start))
-            .and_then(|_| file.read_exact(&mut bytes))
-            .map_err(|source| ObjectStoreError::Generic {
-                store: STORE_NAME,
-                source: Box::new(source),
-            })?;
-        if cancellation.is_cancelled() {
-            return Err(cancelled_object_store());
-        }
-        Ok(Bytes::from_owner(ReservedBytes {
-            bytes,
-            _reservation: reservation,
-        }))
-    });
+            if cancellation.is_cancelled() {
+                return Err(cancelled_object_store());
+            }
+            file.seek(SeekFrom::Start(range.start))
+                .and_then(|_| file.read_exact(&mut bytes))
+                .map_err(|source| ObjectStoreError::Generic {
+                    store: STORE_NAME,
+                    source: Box::new(source),
+                })?;
+            if cancellation.is_cancelled() {
+                return Err(cancelled_object_store());
+            }
+            Ok(Bytes::from_owner(ReservedBytes {
+                bytes,
+                _reservation: reservation,
+            }))
+        })
+        .map_err(blocking_admission_object_store)?;
     tokio::select! {
         result = &mut worker => result.map_err(ObjectStoreError::from)?,
-        _ = supervisor.cancellation().cancelled() => {
-            let _ = worker.await.map_err(ObjectStoreError::from)?;
-            Err(cancelled_object_store())
-        }
+        _ = supervisor.cancellation().cancelled() => Err(cancelled_object_store()),
+    }
+}
+
+fn blocking_admission_object_store(error: BlockingIoAdmissionError) -> ObjectStoreError {
+    ObjectStoreError::Generic {
+        store: STORE_NAME,
+        source: match error {
+            BlockingIoAdmissionError::Cancelled => Box::new(PinnedIoCancelledError),
+            BlockingIoAdmissionError::Saturated => Box::new(PinnedIoAdmissionError),
+        },
     }
 }
 

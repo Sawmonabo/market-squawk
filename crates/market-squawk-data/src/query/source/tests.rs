@@ -1,8 +1,12 @@
 use std::collections::HashSet;
 use std::error::Error;
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use arrow::array::{ArrayRef, Int64Array};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
 use datafusion::execution::memory_pool::GreedyMemoryPool;
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
@@ -29,14 +33,17 @@ use super::super::ResearchQueryEngine;
 use super::*;
 use crate::{
     AnalyticalDataService, AnalyticalManifestCatalog, CatalogAuthority, CatalogConfig,
-    CatalogLimit, CatalogResultLimits, IngestIdentity, ObjectStoreConfig, ParquetStoreError,
-    ResearchIngestService, RightsDecisionInput, SourceOperation, extraction_batch_digest,
+    CatalogLimit, CatalogResultLimits, DatasetId, DatasetManifestRef, IngestIdentity,
+    ObjectStoreConfig, ParquetStoreError, QueryArtifactReservationInput, QueryLimits, QueryRequest,
+    QueryResult, ResearchIngestService, RightsDecisionInput, Sha256Digest, SourceOperation,
+    extraction_batch_digest,
 };
 
 type TestResult = Result<(), Box<dyn Error>>;
 
 #[tokio::test]
 async fn pinned_io_is_joined_and_repeated_scans_share_admitted_metadata() -> TestResult {
+    let _blocking_worker_serial = BlockingIoSupervisor::acquire_test_serial_guard().await;
     assert!(matches!(
         map_capture_error(ParquetStoreError::Cancelled),
         QueryError::Cancelled
@@ -56,11 +63,27 @@ async fn pinned_io_is_joined_and_repeated_scans_share_admitted_metadata() -> Tes
         read_supervisor,
     ));
     barrier.wait_until_entered().await?;
+    assert_eq!(
+        BlockingIoSupervisor::globally_available(),
+        BlockingIoSupervisor::global_limit() - 1
+    );
     cancellation.cancel();
+    let boundary = tokio::time::timeout(Duration::from_millis(50), read).await;
+    assert_eq!(
+        BlockingIoSupervisor::globally_available(),
+        BlockingIoSupervisor::global_limit() - 1
+    );
     barrier.release()?;
-    assert!(read.await?.is_err());
-    supervisor.cancel_and_drain().await;
+    supervisor.drain().await;
+    assert!(
+        matches!(boundary, Ok(Ok(Err(_)))),
+        "cancelled range read did not return while its blocking worker remained held"
+    );
     assert_eq!(supervisor.active(), 0);
+    assert_eq!(
+        BlockingIoSupervisor::globally_available(),
+        BlockingIoSupervisor::global_limit()
+    );
 
     let (_directory, service, pinned) = published_dataset_fixture().await?;
     let engine = ResearchQueryEngine::from_pinned_dataset(
@@ -179,6 +202,222 @@ async fn pinned_io_is_joined_and_repeated_scans_share_admitted_metadata() -> Tes
     scan_supervisor.drain().await;
     assert_eq!(scan_supervisor.active(), 0);
     assert_eq!(tight_pool.reserved(), retained_before_cancelled_execute);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn durable_query_artifact_bind_has_deterministic_cancellation_precedence() -> TestResult {
+    let _blocking_worker_serial = BlockingIoSupervisor::acquire_test_serial_guard().await;
+    for (checkpoint, expect_receipt) in [
+        (
+            crate::catalog::QueryArtifactBindCheckpoint::BeforeCommit,
+            false,
+        ),
+        (
+            crate::catalog::QueryArtifactBindCheckpoint::AfterCommit,
+            true,
+        ),
+    ] {
+        let (_directory, service, _pinned) = published_dataset_fixture().await?;
+        let manifest = DatasetManifestRef::try_new(
+            DatasetId::try_from("bind-precedence-query-result")?,
+            1,
+            Sha256Digest::new([43; 32]),
+        )?;
+        let batch = RecordBatch::try_new(
+            Schema::new(vec![Field::new("value", DataType::Int64, false)]).into(),
+            vec![Arc::new(Int64Array::from_iter_values(0..100_000)) as ArrayRef],
+        )?;
+        let limits = QueryLimits::try_new(
+            100_000,
+            4 * 1024 * 1024,
+            64 * 1024 * 1024,
+            1,
+            128,
+            128,
+            Duration::from_secs(5),
+        )?;
+        let request = QueryRequest::try_new(manifest.clone(), "SELECT value FROM observations")?;
+        let wall_nanos = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos())?;
+        let reservation = service
+            .reserve_query_artifact(
+                QueryArtifactReservationInput::try_new(
+                    SourceIdentifier::try_from("bind-precedence-owner")?,
+                    request.artifact_identity(&limits),
+                    limits.max_bytes(),
+                    Timestamp::from_unix_nanos(wall_nanos).checked_add_nanos(120_000_000_000)?,
+                )?,
+                &CancellationToken::new(),
+            )
+            .await?;
+        let publication = service.query_artifact_publication();
+        let mut barrier = publication.install_test_bind_barrier(checkpoint)?;
+        let engine =
+            ResearchQueryEngine::from_pinned_batches(manifest, "observations", vec![batch])?
+                .with_artifact_publication(publication)?;
+        let cancellation = CancellationToken::new();
+        let query_cancellation = cancellation.clone();
+        let query = tokio::spawn(async move {
+            engine
+                .query(
+                    request.with_artifact_reservation(reservation),
+                    limits,
+                    query_cancellation,
+                )
+                .await
+        });
+        barrier.wait_until_entered().await?;
+        cancellation.cancel();
+        barrier.release()?;
+        let result = query.await?;
+        assert_eq!(
+            matches!(result, Ok(QueryResult::Artifact { .. })),
+            expect_receipt
+        );
+        assert_eq!(
+            matches!(result, Err(QueryError::Cancelled)),
+            !expect_receipt
+        );
+    }
+
+    let (_directory, service, _pinned) = published_dataset_fixture().await?;
+    let manifest = DatasetManifestRef::try_new(
+        DatasetId::try_from("deadline-precedence-query-result")?,
+        1,
+        Sha256Digest::new([44; 32]),
+    )?;
+    let batch = RecordBatch::try_new(
+        Schema::new(vec![Field::new("value", DataType::Int64, false)]).into(),
+        vec![Arc::new(Int64Array::from_iter_values(0..100_000)) as ArrayRef],
+    )?;
+    let limits = QueryLimits::try_new(
+        100_000,
+        4 * 1024 * 1024,
+        64 * 1024 * 1024,
+        1,
+        128,
+        128,
+        Duration::from_secs(5),
+    )?
+    .with_test_bind_precommit_deadline(tokio::time::Instant::now());
+    let request = QueryRequest::try_new(manifest.clone(), "SELECT value FROM observations")?;
+    let wall_nanos = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos())?;
+    let reservation = service
+        .reserve_query_artifact(
+            QueryArtifactReservationInput::try_new(
+                SourceIdentifier::try_from("deadline-precedence-owner")?,
+                request.artifact_identity(&limits),
+                limits.max_bytes(),
+                Timestamp::from_unix_nanos(wall_nanos).checked_add_nanos(120_000_000_000)?,
+            )?,
+            &CancellationToken::new(),
+        )
+        .await?;
+    let publication = service.query_artifact_publication();
+    let mut barrier = publication
+        .install_test_bind_barrier(crate::catalog::QueryArtifactBindCheckpoint::BeforeCommit)?;
+    let engine = ResearchQueryEngine::from_pinned_batches(manifest, "observations", vec![batch])?
+        .with_artifact_publication(publication)?;
+    let query = tokio::spawn(async move {
+        engine
+            .query(
+                request.with_artifact_reservation(reservation),
+                limits,
+                CancellationToken::new(),
+            )
+            .await
+    });
+    barrier.wait_until_entered().await?;
+    barrier.release()?;
+    let result = query.await?;
+    assert!(
+        matches!(result, Err(QueryError::DeadlineExceeded)),
+        "deadline elapsed at the precommit barrier but the bind outcome was {result:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_query_artifact_writer_retains_admission_until_reaped() -> TestResult {
+    let _blocking_worker_serial = BlockingIoSupervisor::acquire_test_serial_guard().await;
+    let available_before = BlockingIoSupervisor::globally_available();
+    assert_eq!(available_before, BlockingIoSupervisor::global_limit());
+    let (_directory, service, _pinned) = published_dataset_fixture().await?;
+    let manifest = DatasetManifestRef::try_new(
+        DatasetId::try_from("held-writer-query-result")?,
+        1,
+        Sha256Digest::new([45; 32]),
+    )?;
+    let batch = RecordBatch::try_new(
+        Schema::new(vec![Field::new("value", DataType::Int64, false)]).into(),
+        vec![Arc::new(Int64Array::from_iter_values(0..100_000)) as ArrayRef],
+    )?;
+    let limits = QueryLimits::try_new(
+        100_000,
+        4 * 1024 * 1024,
+        64 * 1024 * 1024,
+        1,
+        128,
+        128,
+        Duration::from_secs(5),
+    )?;
+    let request = QueryRequest::try_new(manifest.clone(), "SELECT value FROM observations")?;
+    let wall_nanos = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos())?;
+    let reservation = service
+        .reserve_query_artifact(
+            QueryArtifactReservationInput::try_new(
+                SourceIdentifier::try_from("held-writer-owner")?,
+                request.artifact_identity(&limits),
+                limits.max_bytes(),
+                Timestamp::from_unix_nanos(wall_nanos).checked_add_nanos(120_000_000_000)?,
+            )?,
+            &CancellationToken::new(),
+        )
+        .await?;
+    let publication = service.query_artifact_publication();
+    let mut barrier = publication.install_test_writer_barrier()?;
+    let engine = ResearchQueryEngine::from_pinned_batches(manifest, "observations", vec![batch])?
+        .with_artifact_publication(publication)?;
+    let cancellation = CancellationToken::new();
+    let query_cancellation = cancellation.clone();
+    let query = tokio::spawn(async move {
+        engine
+            .query(
+                request.with_artifact_reservation(reservation),
+                limits,
+                query_cancellation,
+            )
+            .await
+    });
+    barrier.wait_until_entered().await?;
+    let memory_retained_before_cancel = barrier.memory_retained();
+    let global_retained_before_cancel =
+        BlockingIoSupervisor::globally_available() == available_before.saturating_sub(1);
+    cancellation.cancel();
+    let boundary = tokio::time::timeout(Duration::from_millis(50), query).await;
+    let memory_retained_after_cancel = barrier.memory_retained();
+    let global_retained_after_cancel =
+        BlockingIoSupervisor::globally_available() == available_before.saturating_sub(1);
+    barrier.release()?;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while barrier.memory_retained()
+            || BlockingIoSupervisor::globally_available() != available_before
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    assert!(
+        matches!(boundary, Ok(Ok(Err(QueryError::Cancelled)))),
+        "cancelled artifact query did not return while its writer remained held: {boundary:?}"
+    );
+    assert!(
+        memory_retained_before_cancel
+            && memory_retained_after_cancel
+            && global_retained_before_cancel
+            && global_retained_after_cancel,
+        "held writer lost ownership: memory before={memory_retained_before_cancel}, memory after={memory_retained_after_cancel}, global before={global_retained_before_cancel}, global after={global_retained_after_cancel}"
+    );
     Ok(())
 }
 

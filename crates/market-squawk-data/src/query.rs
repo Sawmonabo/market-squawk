@@ -2,13 +2,15 @@
 
 use std::mem::size_of;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use arrow::compute::concat_batches;
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
-use datafusion::execution::memory_pool::MemoryConsumer;
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::physical_plan::ExecutionPlanProperties as _;
 use datafusion::prelude::{SessionConfig, SessionContext};
@@ -28,8 +30,8 @@ mod source;
 mod validation;
 
 use self::budget::{
-    CountingWriter, map_datafusion, record_batch_retained_bytes, reserve_memory, resize_memory,
-    schema_retained_bytes, valid_table_name,
+    CountingWriter, PlanningReceipt, map_datafusion, record_batch_retained_bytes, reserve_memory,
+    resize_memory, schema_retained_bytes, valid_table_name,
 };
 use self::source::{PinnedObjectStoreRegistry, QuerySource, RetainedSourceReceipt};
 use self::validation::{validate_read_only_statement, validate_relations};
@@ -51,6 +53,26 @@ const MAX_PLAN_NODES: usize = 10_000;
 const MAX_DEADLINE: Duration = Duration::from_secs(60);
 const INLINE_RESULT_BYTES: u64 = 256 * 1024;
 
+#[cfg(test)]
+struct QueryArtifactMemoryTestWitness {
+    retained: Arc<AtomicBool>,
+}
+
+#[cfg(test)]
+impl QueryArtifactMemoryTestWitness {
+    fn new(retained: Arc<AtomicBool>) -> Self {
+        retained.store(true, Ordering::Release);
+        Self { retained }
+    }
+}
+
+#[cfg(test)]
+impl Drop for QueryArtifactMemoryTestWitness {
+    fn drop(&mut self) {
+        self.retained.store(false, Ordering::Release);
+    }
+}
+
 /// Complete caller limits for one analytical query.
 #[derive(Clone, Copy, Debug)]
 pub struct QueryLimits {
@@ -61,6 +83,8 @@ pub struct QueryLimits {
     max_ast_nodes: usize,
     max_plan_nodes: usize,
     deadline: Duration,
+    #[cfg(test)]
+    bind_precommit_deadline: Option<tokio::time::Instant>,
 }
 
 impl QueryLimits {
@@ -103,12 +127,45 @@ impl QueryLimits {
             max_ast_nodes,
             max_plan_nodes,
             deadline,
+            #[cfg(test)]
+            bind_precommit_deadline: None,
         })
     }
 
     /// Returns the result-byte ceiling also used by durable artifact authority.
     pub const fn max_bytes(self) -> u64 {
         self.max_bytes
+    }
+
+    #[cfg(test)]
+    fn with_test_bind_precommit_deadline(mut self, deadline: tokio::time::Instant) -> Self {
+        self.bind_precommit_deadline = Some(deadline);
+        self
+    }
+}
+
+pub(crate) struct QueryArtifactMemoryLease {
+    _reservation: MemoryReservation,
+    #[cfg(test)]
+    _witness: Option<QueryArtifactMemoryTestWitness>,
+}
+
+impl QueryArtifactMemoryLease {
+    fn try_new(reservation: MemoryReservation, expected: usize) -> Result<Self, QueryError> {
+        if reservation.size() != expected {
+            return Err(QueryError::DependencyAllocationContract);
+        }
+        Ok(Self {
+            _reservation: reservation,
+            #[cfg(test)]
+            _witness: None,
+        })
+    }
+
+    #[cfg(test)]
+    fn with_test_witness(mut self, retained: Option<Arc<AtomicBool>>) -> Self {
+        self._witness = retained.map(QueryArtifactMemoryTestWitness::new);
+        self
     }
 }
 
@@ -384,14 +441,26 @@ impl ResearchQueryEngine {
         if request.ast_nodes > limits.max_ast_nodes {
             return Err(QueryError::AstLimitExceeded);
         }
+        let deadline_at = tokio::time::Instant::now()
+            .checked_add(limits.deadline)
+            .ok_or(QueryError::InvalidLimits)?;
         validate_relations(&request.sql, &self.table_name, limits.max_ast_nodes)?;
+        let planning_receipt = PlanningReceipt::try_new(
+            request.sql.len(),
+            request.ast_nodes,
+            schema_retained_bytes(self.source.schema())?,
+            limits.max_plan_nodes,
+            limits.max_memory_bytes,
+        )?;
         let operation_cancellation = cancellation.child_token();
         let execution_cancellation = operation_cancellation.clone();
+        let durable_bound = Arc::new(AtomicBool::new(false));
+        let execution_durable_bound = Arc::clone(&durable_bound);
         let io_supervisor = BlockingIoSupervisor::new(operation_cancellation.clone());
         let execution_io_supervisor = io_supervisor.clone();
         let execution = async {
-            let memory =
-                usize::try_from(limits.max_memory_bytes).map_err(|_| QueryError::InvalidLimits)?;
+            let _planning_admission = planning_receipt.acquire(&execution_cancellation).await?;
+            let memory = planning_receipt.execution_bytes(limits.max_memory_bytes)?;
             let object_store_registry = Arc::new(PinnedObjectStoreRegistry::default());
             let runtime = RuntimeEnvBuilder::new()
                 .with_memory_limit(memory, 1.0)
@@ -436,12 +505,18 @@ impl ResearchQueryEngine {
                 .sql(&request.sql)
                 .await
                 .map_err(|error| map_datafusion(error, limits.max_memory_bytes))?;
-            let logical_nodes = dataframe
+            let mut logical_nodes = 0_usize;
+            dataframe
                 .logical_plan()
-                .display_indent()
-                .to_string()
-                .lines()
-                .count();
+                .apply_with_subqueries(|_| {
+                    logical_nodes += 1;
+                    Ok(if logical_nodes > limits.max_plan_nodes {
+                        TreeNodeRecursion::Stop
+                    } else {
+                        TreeNodeRecursion::Continue
+                    })
+                })
+                .map_err(|error| map_datafusion(error, limits.max_memory_bytes))?;
             if logical_nodes > limits.max_plan_nodes {
                 return Err(QueryError::PlanLimitExceeded);
             }
@@ -519,6 +594,9 @@ impl ResearchQueryEngine {
                 });
             }
             if byte_count <= INLINE_RESULT_BYTES {
+                if execution_cancellation.is_cancelled() {
+                    return Err(QueryError::Cancelled);
+                }
                 return Ok(QueryResult::Inline {
                     batches,
                     byte_count,
@@ -542,12 +620,29 @@ impl ResearchQueryEngine {
             drop(batches);
             output_memory.free();
             let compact_memory = record_batch_retained_bytes(&compact)?;
+            let writer_admission = publication.writer_admission(&compact)?;
             let publication_work = compact_memory
-                .checked_mul(2)
+                .checked_add(writer_admission.bytes())
                 .ok_or(QueryError::SizeOverflow)?;
             resize_memory(&artifact_memory, publication_work, limits.max_memory_bytes)?;
+            let artifact_memory =
+                QueryArtifactMemoryLease::try_new(artifact_memory, publication_work)?;
+            #[cfg(test)]
+            let artifact_memory =
+                artifact_memory.with_test_witness(publication.test_writer_memory_witness());
             let (object, artifact, ownership) = publication
-                .publish_and_bind(&compact, &execution_cancellation, reservation)
+                .publish_and_bind(
+                    compact,
+                    &execution_cancellation,
+                    reservation,
+                    writer_admission,
+                    artifact_memory,
+                    &execution_io_supervisor,
+                    deadline_at,
+                    #[cfg(test)]
+                    limits.bind_precommit_deadline,
+                    &execution_durable_bound,
+                )
                 .await?;
             Ok(QueryResult::Artifact {
                 object,
@@ -555,29 +650,30 @@ impl ResearchQueryEngine {
                 ownership,
             })
         };
+        tokio::pin!(execution);
+        let deadline = tokio::time::sleep_until(deadline_at);
+        tokio::pin!(deadline);
         let result = tokio::select! {
+            biased;
+            result = execution.as_mut() => result,
             _ = cancellation.cancelled() => {
-                operation_cancellation.cancel();
-                Err(QueryError::Cancelled)
-            },
-            result = tokio::time::timeout(limits.deadline, execution) => {
-                match result {
-                    Ok(result) => result,
-                    Err(_) => {
-                        operation_cancellation.cancel();
-                        Err(QueryError::DeadlineExceeded)
-                    }
+                if durable_bound.load(Ordering::Acquire) {
+                    execution.as_mut().await
+                } else {
+                    operation_cancellation.cancel();
+                    Err(QueryError::Cancelled)
                 }
-            }
+            },
+            _ = deadline.as_mut() => {
+                if durable_bound.load(Ordering::Acquire) {
+                    execution.as_mut().await
+                } else {
+                    operation_cancellation.cancel();
+                    Err(QueryError::DeadlineExceeded)
+                }
+            },
         };
-        if matches!(
-            result,
-            Err(QueryError::Cancelled | QueryError::DeadlineExceeded)
-        ) {
-            io_supervisor.cancel_and_drain().await;
-        } else {
-            io_supervisor.drain().await;
-        }
+        io_supervisor.cancel();
         result
     }
 }
@@ -636,6 +732,9 @@ pub enum QueryError {
     /// A pinned Rust or DataFusion allocation assumption no longer matches the locked dependency.
     #[error("query dependency allocation contract changed")]
     DependencyAllocationContract,
+    /// Process-wide admission for query blocking workers is saturated.
+    #[error("query blocking-worker limit exceeded")]
+    BlockingTaskLimitExceeded,
     /// A source schema has nested, dictionary, or variable-width shapes without a proved bound.
     #[error("query source schema has no supported bounded reader representation")]
     UnsupportedSourceSchema,

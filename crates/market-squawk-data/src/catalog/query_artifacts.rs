@@ -1,10 +1,13 @@
 //! Durable least-authority reservations and reachability for analytical query artifacts.
 
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp};
 use rusqlite::{OptionalExtension as _, params};
+use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::runs::CatalogAuthority;
@@ -13,6 +16,12 @@ use super::types::{ArtifactRecord, Catalog, CatalogError};
 
 const MAX_QUERY_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_QUERY_ARTIFACT_TTL_NS: i64 = 24 * 60 * 60 * 1_000_000_000;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum QueryArtifactBindCheckpoint {
+    BeforeCommit,
+    AfterCommit,
+}
 
 struct StoredQueryArtifactReservation {
     owner: String,
@@ -158,15 +167,33 @@ impl QueryArtifactPublisher {
         Self { authority }
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "binding keeps authority, cancellation, deadline, and durability capabilities explicit"
+    )]
     pub(crate) fn bind(
         &self,
         reservation: &QueryArtifactReservation,
         artifact: &ArtifactRecord,
+        cancellation: &CancellationToken,
+        deadline: Instant,
+        #[cfg(test)] precommit_deadline: Option<Instant>,
+        durable_bound: &AtomicBool,
+        checkpoint: &mut impl FnMut(QueryArtifactBindCheckpoint),
     ) -> Result<QueryArtifactResult, CatalogError> {
         self.authority
             .lock()
             .map_err(|_| CatalogError::AuthorityLockPoisoned)?
-            .bind_query_artifact(reservation, artifact)
+            .bind_query_artifact(
+                reservation,
+                artifact,
+                cancellation,
+                deadline,
+                #[cfg(test)]
+                precommit_deadline,
+                durable_bound,
+                checkpoint,
+            )
     }
 }
 
@@ -241,11 +268,21 @@ impl Catalog {
         Ok(reservation)
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "binding keeps authority, cancellation, deadline, and durability capabilities explicit"
+    )]
     fn bind_query_artifact(
         &self,
         reservation: &QueryArtifactReservation,
         artifact: &ArtifactRecord,
+        cancellation: &CancellationToken,
+        deadline: Instant,
+        #[cfg(test)] precommit_deadline: Option<Instant>,
+        durable_bound: &AtomicBool,
+        checkpoint: &mut impl FnMut(QueryArtifactBindCheckpoint),
     ) -> Result<QueryArtifactResult, CatalogError> {
+        check_query_artifact_boundary(cancellation, deadline)?;
         if reservation.catalog_id != self.catalog_id {
             return Err(CatalogError::InvalidReservationCapability);
         }
@@ -328,12 +365,31 @@ impl Catalog {
             artifact.content_digest().bytes(),
             bound_at,
         )?;
+        checkpoint(QueryArtifactBindCheckpoint::BeforeCommit);
+        #[cfg(test)]
+        let deadline = precommit_deadline.unwrap_or(deadline);
+        check_query_artifact_boundary(cancellation, deadline)?;
         transaction.commit()?;
+        durable_bound.store(true, Ordering::Release);
+        checkpoint(QueryArtifactBindCheckpoint::AfterCommit);
         Ok(QueryArtifactResult {
             reservation_id: reservation.reservation_id,
             owner: reservation.owner.clone(),
             artifact_id: artifact.artifact_id(),
             expires_at: reservation.expires_at,
         })
+    }
+}
+
+fn check_query_artifact_boundary(
+    cancellation: &CancellationToken,
+    deadline: Instant,
+) -> Result<(), CatalogError> {
+    if cancellation.is_cancelled() {
+        Err(CatalogError::QueryArtifactCancelled)
+    } else if Instant::now() >= deadline {
+        Err(CatalogError::QueryArtifactDeadlineExceeded)
+    } else {
+        Ok(())
     }
 }
