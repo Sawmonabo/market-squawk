@@ -47,12 +47,14 @@ futures-util = "0.3"
 getrandom = "=0.3.4"
 keyring = { version = "=4.1.5", default-features = false, features = ["v1"] }
 libc = "0.2"
+market-squawk-adapter-coinbase = { path = "adapters/market-squawk-adapter-coinbase", version = "=0.1.0" }
+market-squawk-adapter-kraken = { path = "adapters/market-squawk-adapter-kraken", version = "=0.1.0" }
 market-squawk-analytics = { path = "crates/market-squawk-analytics", version = "=0.1.0" }
 market-squawk-domain = { path = "crates/market-squawk-domain", version = "=0.1.0" }
+market-squawk-execution = { path = "crates/market-squawk-execution", version = "=0.1.0" }
 market-squawk-live = { path = "crates/market-squawk-live", version = "=0.1.0" }
 market-squawk-platform = { path = "crates/market-squawk-platform", version = "=0.1.0" }
 market-squawk-sources = { path = "crates/market-squawk-sources", version = "=0.1.0" }
-market-squawk-adapter-kraken = { path = "adapters/market-squawk-adapter-kraken", version = "=0.1.0" }
 memory-stats = "=1.2.0"
 num-bigint = "0.4"
 parking_lot = "0.12"

@@ -22,6 +22,11 @@ user-facing truth. All mandatory remaining work is bound by the single canonical
   provenance, source-authority, sharding, transactional-book, and bounded-snapshot foundations.
 - Public Coinbase Exchange WebSocket diagnostic capture with explicit single-venue, partial
   coverage. This is not a production `DirectVerified` adapter.
+- A separate bounded Coinbase Exchange WebSocket v1 production-source crate with strict endpoint
+  policy, capture-before-decode, exact decimal lexemes, bounded subscriptions and frames,
+  cancellation, pinned protocol fixtures, source metadata, and explicit single-venue partial
+  coverage. Its current qualification ceiling is intentionally `DirectUnverified` and it is not
+  yet composed through the authoritative live-to-paper terminal path.
 - A bounded Kraken WebSocket v2 production-source crate for price-level books and trades, with
   capture-before-decode, official CRC32 book validation, bounded control traffic, cancellation,
   source metadata, and session lifecycle enforcement. Its current qualification ceiling is
@@ -39,15 +44,20 @@ user-facing truth. All mandatory remaining work is bound by the single canonical
   point-in-time dataset builder remain release-blocking below.
 - Authority-free midpoint, spread, spread-basis-point, microprice, imbalance, feed-quality,
   pre-trade calculation, and paper-only momentum diagnostics.
+- Immutable typed order intents plus fixed-capacity, nonblocking account risk coordination with
+  exact cash, position, exposure, leverage, capital, loss, drawdown, rate, idempotency, freshness,
+  eligibility, price, slippage, and expiry checks. This pre-authority risk core has no public order
+  submission or approval-minting surface.
 - A five-tool diagnostic stdio MCP compatibility server with strict schemas and per-process call
   limiting; it is not the complete typed MCP product.
 - A deterministic mock source for offline diagnostic verification. It is never represented as a
   production source.
 
-The current Coinbase reader and MCP server are compatibility paths. Their app-local
+The app-local Coinbase reader and MCP server remain compatibility paths. Their app-local
 `QualityState::Valid` is not canonical `DataQuality::DirectVerified`, cannot enter the production
-live runtime, and cannot authorize an order. All current bot and fill behavior is diagnostic paper
-simulation.
+live runtime, and cannot authorize an order. The separate Coinbase and Kraken source crates also
+remain execution-ineligible at their declared `DirectUnverified` ceilings. All current bot and fill
+behavior is diagnostic paper simulation.
 
 ## Required but missing
 
@@ -56,7 +66,7 @@ terminal consumer, focused verification, immutable evidence, and exact commit ex
 
 | State | Mandatory capability | Current blocker | Closing task |
 | --- | --- | --- | --- |
-| `Missing` | Coinbase direct-source qualification | No production authority-qualified Coinbase vertical | Task 2 |
+| `Missing` | Coinbase direct-source qualification | Production transport, decoder, metadata, and session lifecycle exist; authoritative app composition, one-time risk/dispatch, and live-to-paper completion do not | Task 2 |
 | `Missing` | Kraken direct-source qualification | Production transport, decoder, checksum, metadata, and session lifecycle exist; the authority-qualified live ingress, risk decision, and live-to-paper terminal path do not | Task 6 |
 | `Missing` | CSV/TSV | No bounded production extraction adapter | Task 7 |
 | `Missing` | JSON/NDJSON | No bounded production extraction adapter | Task 7 |
@@ -79,17 +89,17 @@ terminal consumer, focused verification, immutable evidence, and exact commit ex
 | `Missing` | constrained ONNX inference | No validated, bounded, fail-closed ONNX-compatible backend | Task 15 |
 | `Missing` | research backtesting | No point-in-time research-dataset backtester | Task 17 |
 | `Missing` | portfolio accounting/analytics | No lots, gains, performance, exposure, attribution, risk, or scenarios | Task 16 |
-| `Missing` | strategies and comprehensive risk | No canonical strategies or non-bypassable complete risk vertical | Task 2 |
+| `Missing` | strategies and comprehensive risk | Comprehensive pre-authority risk/account coordination exists; canonical strategies, actor-owned authority consumption, private approval, one-time dispatch, and terminal audit do not | Task 2 |
 | `Missing` | realistic paper execution | No realistic lifecycle, fee, latency, slippage, fill, or reconciliation vertical | Task 2 |
 | `Missing` | ASC 820/IFRS 13 fair value | No ruleset, evidence, override, approval, or classification service | Task 18 |
 | `Missing` | complete local CLI | No complete command hierarchy over shared application services | Task 19 |
 | `Missing` | complete typed local MCP | No complete bounded tool domains over shared application services | Task 19 |
 | `Missing` | release security/fuzz/performance gate | No exact-head release evidence or final integrated demonstration | Task 20 |
 
-A production-hardened Kraken source crate is tracked under `adapters/`; its execution qualification
-vertical remains release-blocking above. The checkout has no tracked `python/` product package.
-Python files under `scripts/` are repository-verification and protocol-smoke utilities, not
-financial-analytics or model-training product code.
+Production-hardened Coinbase and Kraken source crates are tracked under `adapters/`; their
+execution-qualification verticals remain release-blocking above. The checkout has no tracked
+`python/` product package. Python files under `scripts/` are repository-verification and
+protocol-smoke utilities, not financial-analytics or model-training product code.
 
 ## Release blocked until implemented
 
@@ -386,13 +396,15 @@ crates/
 ├── market-squawk-analytics/       exact live feature kernels and versioned feature metadata
 ├── market-squawk-data/            SQLite catalog, Arrow, Parquet, DataFusion, and lineage
 ├── market-squawk-domain/          shared financial, identity, quality, provenance, and event contracts
+├── market-squawk-execution/       typed intents and bounded pre-authority account/risk coordination
 ├── market-squawk-live/            production authority, sharding, books, and bounded snapshots
 ├── market-squawk-mcp/             bounded local stdio MCP protocol and lifecycle foundation
 ├── market-squawk-platform/        local paths, lifecycle, capture, persistence, and operations
 ├── market-squawk-services/        shared application-service contracts
 └── market-squawk-sources/         source contracts, registry, budgets, health, and supervision
 adapters/
-└── market-squawk-adapter-kraken/  bounded Kraken v2 transport, decoder, checksum, and session source
+├── market-squawk-adapter-coinbase/ bounded Coinbase Exchange v1 source and protocol fixtures
+└── market-squawk-adapter-kraken/   bounded Kraken v2 transport, decoder, checksum, and session source
 scripts/                            deterministic local/CI policy and smoke gates
 docs/                               architecture, plans, research, and verification evidence
 ```
