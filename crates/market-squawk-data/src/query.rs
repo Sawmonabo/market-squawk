@@ -655,7 +655,6 @@ impl ResearchQueryEngine {
         tokio::pin!(deadline);
         let result = tokio::select! {
             biased;
-            result = execution.as_mut() => result,
             _ = cancellation.cancelled() => {
                 if durable_bound.load(Ordering::Acquire) {
                     execution.as_mut().await
@@ -672,6 +671,7 @@ impl ResearchQueryEngine {
                     Err(QueryError::DeadlineExceeded)
                 }
             },
+            result = execution.as_mut() => result,
         };
         io_supervisor.cancel();
         result
