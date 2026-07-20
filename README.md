@@ -26,6 +26,12 @@ user-facing truth. All mandatory remaining work is bound by the single canonical
   match/trade capture, fixed-point prices and quantities, and in-memory order books.
 - MSJ1 append-only journal writing, CRC32 validation, a single-writer OS lock, bounded legacy read
   compatibility, and optional Coinbase diagnostic reconstruction.
+- A durable local SQLite control catalog with versioned migrations, rights-bound records, immutable
+  authority history, backup/restore recovery, and tamper-evident catalog state.
+- Versioned Arrow analytical interchange plus authority-bound immutable Parquet publication,
+  manifests, lineage, compaction, recovery, and bounded read-only DataFusion queries with
+  point-in-time availability filtering. Production extraction adapters and the complete
+  point-in-time dataset builder remain release-blocking below.
 - Authority-free midpoint, spread, spread-basis-point, microprice, imbalance, feed-quality,
   pre-trade calculation, and paper-only momentum diagnostics.
 - A five-tool diagnostic stdio MCP compatibility server with strict schemas and per-process call
@@ -59,10 +65,6 @@ terminal consumer, focused verification, immutable evidence, and exact commit ex
 | `Missing` | BLS | No quota-honest production macro adapter | Task 9 |
 | `Missing` | US Treasury | No schema-tracked production Treasury adapter | Task 9 |
 | `Missing` | portfolio import | No raw-preserving holdings/transactions reconciliation vertical | Task 10 |
-| `Missing` | SQLite catalog | No durable local catalog, migrations, cursors, or manifests | Task 3 |
-| `Missing` | Arrow exchange | No versioned analytical interchange implementation | Task 4 |
-| `Missing` | Parquet datasets | No immutable publication, manifests, lineage, or compaction | Task 4 |
-| `Missing` | DataFusion queries | No bounded embedded analytical query service | Task 4 |
 | `Missing` | point-in-time datasets | No availability-aware joins or leakage-checked builder | Task 11 |
 | `Missing` | Rust financial analytics | No complete tested batch-analytics implementation | Task 12 |
 | `Missing` | feature registry | No versioned registry with time and compatibility semantics | Task 12 |
