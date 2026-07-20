@@ -2950,6 +2950,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "market-squawk-adapter-coinbase"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "chrono",
+ "futures-util",
+ "market-squawk-domain",
+ "market-squawk-sources",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tokio",
+ "tokio-tungstenite",
+ "tokio-util",
+]
+
+[[package]]
 name = "market-squawk-adapter-kraken"
 version = "0.1.0"
 dependencies = [
@@ -3024,6 +3042,18 @@ dependencies = [
  "static_assertions",
  "trybuild",
  "uuid",
+]
+
+[[package]]
+name = "market-squawk-execution"
+version = "0.1.0"
+dependencies = [
+ "market-squawk-domain",
+ "proptest",
+ "rust_decimal",
+ "sha2",
+ "static_assertions",
+ "thiserror",
 ]
 
 [[package]]
