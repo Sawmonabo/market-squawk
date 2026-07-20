@@ -725,7 +725,7 @@ impl BuildEvidence {
             || self.workspace_manifest_sha256 != super::build_bindings::WORKSPACE_MANIFEST_SHA256
             || self.package_manifest_sha256 != super::build_bindings::PACKAGE_MANIFEST_SHA256
             || self.build_script_sha256 != super::build_bindings::BUILD_SCRIPT_SHA256
-            || self.build_support_sha256 != super::build_bindings::BUILD_SUPPORT_SHA256
+            || self.build_support_sha256 != super::build_bindings::BUILD_SUPPORT_TREE_SHA256
             || self.host_gate_shell_sha256 != super::build_bindings::HOST_GATE_SHELL_SHA256
             || self.host_gate_python_sha256 != super::build_bindings::HOST_GATE_PYTHON_SHA256
             || self.host_gate_process_sha256 != super::build_bindings::HOST_GATE_PROCESS_SHA256

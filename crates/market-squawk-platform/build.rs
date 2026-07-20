@@ -27,6 +27,13 @@ const IMMUTABLE_MODULES: [(&str, &str); 8] = [
     ("workload", "workload.rs"),
 ];
 
+const BUILD_SUPPORT_TREE: [&str; 3] = [
+    "build_support.rs",
+    "build_support/filesystem.rs",
+    "build_support/reader.rs",
+];
+const BUILD_SUPPORT_TREE_DOMAIN: &[u8] = b"market-squawk/capture-build-support-tree/v1\0";
+
 fn main() -> Result<(), Box<dyn Error>> {
     println!(
         "cargo:rustc-check-cfg=cfg(capture_bench_backend, values(\"standard\", \"candidate\"))"
@@ -163,7 +170,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let workspace_manifest = repository.join("Cargo.toml");
     let package_manifest = manifest.join("Cargo.toml");
     let build_script = manifest.join("build.rs");
-    let build_support = manifest.join("build_support.rs");
+    let build_support_paths = BUILD_SUPPORT_TREE.map(|relative| manifest.join(relative));
     let host_gate_shell = repository.join("scripts/capture_benchmark_host_gate.sh");
     let host_gate_python = repository.join("scripts/capture_benchmark_host_gate.py");
     let host_gate_process = repository.join("scripts/capture_benchmark_process.py");
@@ -180,7 +187,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         &workspace_manifest,
         &package_manifest,
         &build_script,
-        &build_support,
         &host_gate_shell,
         &host_gate_python,
         &host_gate_process,
@@ -192,6 +198,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         &host_gate_measured,
         &build_evidence_python,
     ] {
+        rerun(path);
+    }
+    for path in &build_support_paths {
         rerun(path);
     }
     let git_head = command(&git_executable, repository, &["rev-parse", "HEAD"])?;
@@ -284,7 +293,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         workspace_manifest_sha256: &hash_file(&workspace_manifest)?,
         package_manifest_sha256: &hash_file(&package_manifest)?,
         build_script_sha256: &hash_file(&build_script)?,
-        build_support_sha256: &hash_file(&build_support)?,
+        build_support_tree_sha256: &build_support_tree_hash(&manifest, &build_support_paths)?,
         cargo_executable_sha256: &cargo_executable_sha256,
         git_executable_sha256: &git_executable_sha256,
         rustc_executable_sha256: &rustc_executable_sha256,
@@ -433,7 +442,7 @@ struct GeneratedBindings<'a> {
     workspace_manifest_sha256: &'a str,
     package_manifest_sha256: &'a str,
     build_script_sha256: &'a str,
-    build_support_sha256: &'a str,
+    build_support_tree_sha256: &'a str,
     cargo_executable_sha256: &'a str,
     git_executable_sha256: &'a str,
     rustc_executable_sha256: &'a str,
@@ -549,7 +558,10 @@ fn render(bindings: GeneratedBindings<'_>) -> Result<String, std::fmt::Error> {
         ),
         ("PACKAGE_MANIFEST_SHA256", bindings.package_manifest_sha256),
         ("BUILD_SCRIPT_SHA256", bindings.build_script_sha256),
-        ("BUILD_SUPPORT_SHA256", bindings.build_support_sha256),
+        (
+            "BUILD_SUPPORT_TREE_SHA256",
+            bindings.build_support_tree_sha256,
+        ),
         ("CARGO_EXECUTABLE_SHA256", bindings.cargo_executable_sha256),
         ("GIT_EXECUTABLE_SHA256", bindings.git_executable_sha256),
         ("RUSTC_EXECUTABLE_SHA256", bindings.rustc_executable_sha256),
@@ -612,6 +624,25 @@ fn tree_hash(
         digest.update([0]);
         digest.update(source.sha256.as_bytes());
         digest.update([0]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn build_support_tree_hash(
+    manifest: &Path,
+    paths: &[PathBuf; BUILD_SUPPORT_TREE.len()],
+) -> Result<String, Box<dyn Error>> {
+    let mut digest = Sha256::new();
+    digest.update(BUILD_SUPPORT_TREE_DOMAIN);
+    for path in paths {
+        let relative = path.strip_prefix(manifest)?;
+        let relative = relative
+            .to_str()
+            .ok_or("build-support path is not valid UTF-8")?;
+        let length = u64::try_from(relative.len())?;
+        digest.update(length.to_be_bytes());
+        digest.update(relative.as_bytes());
+        digest.update(hash_file(path)?.as_bytes());
     }
     Ok(format!("{:x}", digest.finalize()))
 }

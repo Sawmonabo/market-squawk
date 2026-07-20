@@ -605,7 +605,7 @@ fn tool_sha256(build_evidence: &BuildEvidence) -> BTreeMap<String, String> {
     [
         ("build.rs", build_evidence.build_script_sha256.clone()),
         (
-            "build_support.rs",
+            "build_support-tree-v1",
             build_evidence.build_support_sha256.clone(),
         ),
         (
@@ -689,7 +689,7 @@ fn print_build_bindings() -> Result<(), Box<dyn Error>> {
         "workspace_manifest_sha256": build_bindings::WORKSPACE_MANIFEST_SHA256,
         "package_manifest_sha256": build_bindings::PACKAGE_MANIFEST_SHA256,
         "build_script_sha256": build_bindings::BUILD_SCRIPT_SHA256,
-        "build_support_sha256": build_bindings::BUILD_SUPPORT_SHA256,
+        "build_support_sha256": build_bindings::BUILD_SUPPORT_TREE_SHA256,
         "cargo_executable_sha256": build_bindings::CARGO_EXECUTABLE_SHA256,
         "git_executable_sha256": build_bindings::GIT_EXECUTABLE_SHA256,
         "rustc_executable_sha256": build_bindings::RUSTC_EXECUTABLE_SHA256,

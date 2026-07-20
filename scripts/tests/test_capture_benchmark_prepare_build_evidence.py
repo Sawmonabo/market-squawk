@@ -147,7 +147,7 @@ def baseline_fixture(current_head: str = "f" * 40) -> tuple[bytes, bytes, dict, 
     immutable = {"fixture": "2" * 64}
     tools = {
         "build.rs": "3" * 64,
-        "build_support.rs": "2" * 64,
+        "build_support-tree-v1": "2" * 64,
         "capture_benchmark_host_gate.sh": "4" * 64,
         "capture_benchmark_host_gate.py": "5" * 64,
         "capture_benchmark_process.py": "6" * 64,
@@ -250,7 +250,7 @@ def baseline_fixture(current_head: str = "f" * 40) -> tuple[bytes, bytes, dict, 
         "observer_sha256": manifest["observer_sha256"],
         "backend_sha256": "e" * 64,
         "build_script_sha256": tools["build.rs"],
-        "build_support_sha256": tools["build_support.rs"],
+        "build_support_sha256": tools["build_support-tree-v1"],
         "cargo_executable_sha256": tools["cargo-executable"],
         "git_executable_sha256": tools["git-executable"],
         "rustc_executable_sha256": tools["rustc-executable"],
@@ -286,6 +286,10 @@ def initialize_fixture_repository(root: Path) -> tuple[Path, str]:
     shutil.copy2(
         REPOSITORY / "crates/market-squawk-platform/build_support.rs",
         platform / "build_support.rs",
+    )
+    shutil.copytree(
+        REPOSITORY / "crates/market-squawk-platform/build_support",
+        platform / "build_support",
     )
     shutil.copytree(REPOSITORY / "crates/market-squawk-platform/src", platform / "src")
     shutil.copytree(REPOSITORY / "crates/market-squawk-platform/benches", platform / "benches")
@@ -328,6 +332,34 @@ def initialize_fixture_repository(root: Path) -> tuple[Path, str]:
 
 
 class BuildEvidenceTest(unittest.TestCase):
+    def test_build_support_helper_mutation_invalidates_current_tree_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, _head = initialize_fixture_repository(Path(temporary))
+            before = recompute_current_bindings(
+                repository, "8" * 64, "9" * 64, "7" * 64
+            )
+            self.assertIn("build_support_sha256", before)
+
+            helpers = (
+                "build_support/filesystem.rs",
+                "build_support/reader.rs",
+            )
+            for relative in helpers:
+                with self.subTest(relative=relative):
+                    path = repository / "crates/market-squawk-platform" / relative
+                    original = path.read_bytes()
+                    path.write_bytes(original + b"\n// adversarial mutation\n")
+                    mutated = recompute_current_bindings(
+                        repository, "8" * 64, "9" * 64, "7" * 64
+                    )
+                    self.assertNotEqual(
+                        before["build_support_sha256"],
+                        mutated["build_support_sha256"],
+                    )
+                    with self.assertRaises(GateError):
+                        validate_current_bindings(before, mutated)
+                    path.write_bytes(original)
+
     def test_rustup_resolution_returns_direct_build_executables(self) -> None:
         rustup_path = shutil.which("rustup")
         self.assertIsNotNone(rustup_path)
@@ -551,6 +583,10 @@ class BuildEvidenceTest(unittest.TestCase):
         self.assertEqual(
             emitted_bindings["source_inventory_sha256"],
             current["source_inventory_sha256"],
+        )
+        self.assertEqual(
+            emitted_bindings["build_support_sha256"],
+            current["build_support_sha256"],
         )
         self_check = bounded_process(
             [str(executable)],

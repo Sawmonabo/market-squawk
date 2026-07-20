@@ -77,6 +77,12 @@ IMMUTABLE_MODULES = {
     "schema": "schema.rs",
     "workload": "workload.rs",
 }
+BUILD_SUPPORT_TREE_RELATIVE = (
+    Path("build_support.rs"),
+    Path("build_support/filesystem.rs"),
+    Path("build_support/reader.rs"),
+)
+BUILD_SUPPORT_TREE_DOMAIN = b"market-squawk/capture-build-support-tree/v1\0"
 BASELINE_LOCK_RELATIVE = Path(
     "docs/reports/performance/2026-07-17-q2-a4-standard-channel-baseline.lock.json"
 )
@@ -552,6 +558,18 @@ def tree_hash(repository: Path, files: list[Path]) -> str:
     return digest.hexdigest()
 
 
+def build_support_tree_hash(repository: Path) -> str:
+    digest = hashlib.sha256()
+    digest.update(BUILD_SUPPORT_TREE_DOMAIN)
+    platform = repository / "crates/market-squawk-platform"
+    for relative in BUILD_SUPPORT_TREE_RELATIVE:
+        encoded = relative.as_posix().encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+        digest.update(current_file_hash(platform / relative, repository).encode("ascii"))
+    return digest.hexdigest()
+
+
 def recompute_current_bindings(
     repository: Path,
     cargo_sha256: str,
@@ -584,9 +602,7 @@ def recompute_current_bindings(
         "build_script_sha256": current_file_hash(
             repository / "crates/market-squawk-platform/build.rs", repository
         ),
-        "build_support_sha256": current_file_hash(
-            repository / "crates/market-squawk-platform/build_support.rs", repository
-        ),
+        "build_support_sha256": build_support_tree_hash(repository),
         "cargo_executable_sha256": cargo_sha256,
         "git_executable_sha256": git_sha256,
         "rustc_executable_sha256": rustc_sha256,
@@ -1105,7 +1121,7 @@ def validate_candidate_current_bindings(
     lock = baseline["lock"]
     current_tools = {
         "build.rs": current["build_script_sha256"],
-        "build_support.rs": current["build_support_sha256"],
+        "build_support-tree-v1": current["build_support_sha256"],
         "capture_benchmark_host_gate.sh": current["host_gate_shell_sha256"],
         "capture_benchmark_host_gate.py": current["host_gate_python_sha256"],
         "capture_benchmark_process.py": current["host_gate_process_sha256"],
