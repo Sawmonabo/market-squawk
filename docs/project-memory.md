@@ -92,6 +92,16 @@ A serialized hotspot does not justify idling unrelated work. Documentation, prov
 fixtures, isolated adapters, pure analytical kernels, tests in disjoint packages, and later-wave
 design can proceed when their inputs are stable or explicitly provisional.
 
+Workspace-wide Cargo verification is also a serialized integration resource. The integration
+owner runs the one authoritative full-workspace gate; active lanes run their focused package and
+dependency-ripple gates until asked to freeze. Do not run duplicate full-workspace tests or builds
+from multiple worktrees: they contend for CPU, hide timing defects, and multiply large Rust build
+artifacts without adding independent evidence. Before a release build or new worktree, inspect free
+space and active Cargo processes. Reclaim only reproducible `target/` output from completed or idle
+lanes when capacity is tight; never delete a dirty worktree, research evidence, source, or unique Git
+state to make room. Generated build caches are convenience state, not project memory or approval
+evidence.
+
 ### Worktree lifecycle
 
 An isolated lane worktree is temporary execution infrastructure, not a permanent archive. Remove it

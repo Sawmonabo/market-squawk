@@ -24,9 +24,11 @@ user-facing truth. All mandatory remaining work is bound by the single canonical
   coverage. This is not a production `DirectVerified` adapter.
 - A separate bounded Coinbase Exchange WebSocket v1 production-source crate with strict endpoint
   policy, capture-before-decode, exact decimal lexemes, bounded subscriptions and frames,
-  cancellation, pinned protocol fixtures, source metadata, and explicit single-venue partial
-  coverage. Its current qualification ceiling is intentionally `DirectUnverified` and it is not
-  yet composed through the authoritative live-to-paper terminal path.
+  cancellation, pinned protocol fixtures, source metadata, explicit single-venue partial coverage,
+  durable generation/revision authority, and authoritative application composition into the
+  instrument-owned live runtime. Its current qualification ceiling remains intentionally
+  `DirectUnverified`; the one-time risk/dispatch and realistic paper-execution terminal path is not
+  complete.
 - A bounded Kraken WebSocket v2 production-source crate for price-level books and trades, with
   capture-before-decode, official CRC32 book validation, bounded control traffic, cancellation,
   source metadata, and session lifecycle enforcement. Its current qualification ceiling is
@@ -54,10 +56,10 @@ user-facing truth. All mandatory remaining work is bound by the single canonical
   production source.
 
 The app-local Coinbase reader and MCP server remain compatibility paths. Their app-local
-`QualityState::Valid` is not canonical `DataQuality::DirectVerified`, cannot enter the production
-live runtime, and cannot authorize an order. The separate Coinbase and Kraken source crates also
-remain execution-ineligible at their declared `DirectUnverified` ceilings. All current bot and fill
-behavior is diagnostic paper simulation.
+`QualityState::Valid` is not canonical `DataQuality::DirectVerified` and cannot authorize an order.
+The separately composed production Coinbase source can enter the production live runtime only at
+its declared `DirectUnverified` ceiling; Coinbase and Kraken therefore remain execution-ineligible.
+All current bot and fill behavior is diagnostic paper simulation.
 
 ## Required but missing
 
@@ -66,7 +68,7 @@ terminal consumer, focused verification, immutable evidence, and exact commit ex
 
 | State | Mandatory capability | Current blocker | Closing task |
 | --- | --- | --- | --- |
-| `Missing` | Coinbase direct-source qualification | Production transport, decoder, metadata, and session lifecycle exist; authoritative app composition, one-time risk/dispatch, and live-to-paper completion do not | Task 2 |
+| `Missing` | Coinbase direct-source qualification | Authoritative production transport-to-live-runtime composition exists at a `DirectUnverified` ceiling; verified qualification, one-time risk/dispatch, and realistic live-to-paper completion do not | Task 2 |
 | `Missing` | Kraken direct-source qualification | Production transport, decoder, checksum, metadata, and session lifecycle exist; the authority-qualified live ingress, risk decision, and live-to-paper terminal path do not | Task 6 |
 | `Missing` | CSV/TSV | No bounded production extraction adapter | Task 7 |
 | `Missing` | JSON/NDJSON | No bounded production extraction adapter | Task 7 |
