@@ -1,5 +1,7 @@
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     #[derive(Debug)]
@@ -299,16 +301,70 @@ mod tests {
         assert_eq!(deadline.as_nanos(), 1_010);
 
         assert!(clock.set(109, 1_009));
+        assert_eq!(
+            budget.remaining_wait(deadline),
+            Ok(Duration::from_nanos(1))
+        );
         assert!(matches!(
             budget.try_acquire(),
             BudgetDecision::WaitUntil(observed) if observed == deadline
         ));
 
         assert!(clock.set(110, 1_010));
+        assert_eq!(budget.remaining_wait(deadline), Ok(Duration::ZERO));
         let BudgetDecision::Ready(permit) = budget.try_acquire() else {
             return Err(NetworkPolicyError::InvalidBudgetPolicy);
         };
         permit.release();
+        Ok(())
+    }
+
+    #[test]
+    fn remaining_wait_terminally_rejects_clock_failure_and_regression()
+    -> Result<(), NetworkPolicyError> {
+        let regression_clock = Arc::new(ManualClock::new(100, 1_000));
+        let regression_budget = SharedProviderBudget::new(
+            policy()?,
+            MonotonicInstant::from_nanos(1_000),
+            regression_clock.clone(),
+        );
+        let deadline = match regression_budget.apply_refusal(0) {
+            BudgetDecision::WaitUntil(deadline) => deadline,
+            _ => return Err(NetworkPolicyError::InvalidBudgetPolicy),
+        };
+        assert!(regression_clock.set(99, 999));
+        assert_eq!(
+            regression_budget.remaining_wait(deadline),
+            Err(BudgetUnavailableReason::ClockRegression)
+        );
+        assert!(matches!(
+            regression_budget.try_acquire(),
+            BudgetDecision::Unavailable(
+                BudgetUnavailableReason::AvailabilityGenerationExhausted
+            )
+        ));
+
+        let unavailable_clock = Arc::new(SwitchableClock::new(100, 1_000));
+        let unavailable_budget = SharedProviderBudget::new(
+            policy()?,
+            MonotonicInstant::from_nanos(1_000),
+            unavailable_clock.clone(),
+        );
+        let deadline = match unavailable_budget.apply_refusal(0) {
+            BudgetDecision::WaitUntil(deadline) => deadline,
+            _ => return Err(NetworkPolicyError::InvalidBudgetPolicy),
+        };
+        unavailable_clock.fail();
+        assert_eq!(
+            unavailable_budget.remaining_wait(deadline),
+            Err(BudgetUnavailableReason::ClockUnavailable)
+        );
+        assert!(matches!(
+            unavailable_budget.try_acquire(),
+            BudgetDecision::Unavailable(
+                BudgetUnavailableReason::AvailabilityGenerationExhausted
+            )
+        ));
         Ok(())
     }
 
