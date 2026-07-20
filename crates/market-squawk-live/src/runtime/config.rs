@@ -23,6 +23,11 @@ const MAX_HEALTH_EVENTS: usize = 65_536;
 const MAX_SNAPSHOT_EVENT_TRIGGER: usize = 1_000_000;
 const MAX_NONCE_CAPACITY: usize = 1_000_000;
 
+#[path = "config/features.rs"]
+mod features;
+
+pub(crate) use features::LiveFeatureCapacity;
+
 /// Maximum observations by which successful-batch-end publication can pass its trigger.
 ///
 /// A decoded provider batch contains at most [`MAX_DECODED_EVENTS`] observations. Because the
@@ -43,6 +48,15 @@ pub struct LiveRuntimeConfigInput {
     pub maximum_sources_per_route: usize,
     /// Maximum independently keyed source/product/channel streams retained by one route owner.
     pub maximum_streams_per_route: usize,
+    pub maximum_feature_window_observations_per_route: usize,
+    pub maximum_feature_window_bytes_per_route: usize,
+    pub maximum_feature_sets_per_route: usize,
+    pub cross_venue_command_count: usize,
+    pub cross_venue_command_bytes: u32,
+    pub maximum_cross_venue_instruments: usize,
+    pub maximum_venues_per_cross_venue_instrument: usize,
+    pub maximum_feature_snapshot_bytes: u32,
+    pub maximum_action_hook_bytes_per_route: usize,
     pub registration_control_capacity: usize,
     pub registration_deadline: Duration,
     pub health_event_capacity: usize,
@@ -72,6 +86,7 @@ pub struct LiveRuntimeConfig {
     maximum_routes_per_shard: NonZeroUsize,
     maximum_sources_per_route: NonZeroUsize,
     maximum_streams_per_route: NonZeroUsize,
+    feature_capacity: LiveFeatureCapacity,
     registration_control_capacity: NonZeroUsize,
     registration_deadline: Duration,
     health_event_capacity: NonZeroUsize,
@@ -133,6 +148,7 @@ impl LiveRuntimeConfig {
                 streams: maximum_streams_per_route.get(),
             });
         }
+        let feature_capacity = LiveFeatureCapacity::try_new(&input)?;
         let config = Self {
             routing_version: input.routing_version,
             shard_count,
@@ -146,6 +162,7 @@ impl LiveRuntimeConfig {
             )?,
             maximum_sources_per_route,
             maximum_streams_per_route,
+            feature_capacity,
             registration_control_capacity: checked_usize(
                 "registration_control_capacity",
                 input.registration_control_capacity,
@@ -189,6 +206,18 @@ impl LiveRuntimeConfig {
             .map_err(|_| LiveRuntimeConfigError::Allocation)?;
         let mut counts = vec![0_usize; usize::from(self.shard_count.get())];
         for route in routes {
+            let minimum_window_bytes = self
+                .feature_capacity
+                .minimum_window_bytes(route.depth().get())
+                .ok_or(LiveRuntimeConfigError::CapacityOverflow)?;
+            if self.maximum_feature_window_bytes_per_route().get() < minimum_window_bytes {
+                return Err(
+                    LiveRuntimeConfigError::FeatureWindowBytesBelowRetainedState {
+                        bytes: self.maximum_feature_window_bytes_per_route().get(),
+                        minimum: minimum_window_bytes,
+                    },
+                );
+            }
             if !seen.insert(route.route.clone()) {
                 return Err(LiveRuntimeConfigError::DuplicateRoute);
             }
@@ -247,6 +276,38 @@ impl LiveRuntimeConfig {
     pub const fn maximum_streams_per_route(&self) -> NonZeroUsize {
         self.maximum_streams_per_route
     }
+    pub(crate) const fn feature_capacity(&self) -> LiveFeatureCapacity {
+        self.feature_capacity
+    }
+    pub const fn maximum_feature_window_observations_per_route(&self) -> NonZeroUsize {
+        self.feature_capacity
+            .maximum_feature_window_observations_per_route
+    }
+    pub const fn maximum_feature_window_bytes_per_route(&self) -> NonZeroUsize {
+        self.feature_capacity.maximum_feature_window_bytes_per_route
+    }
+    pub const fn maximum_feature_sets_per_route(&self) -> NonZeroUsize {
+        self.feature_capacity.maximum_feature_sets_per_route
+    }
+    pub const fn cross_venue_command_count(&self) -> NonZeroUsize {
+        self.feature_capacity.cross_venue_command_count
+    }
+    pub const fn cross_venue_command_bytes(&self) -> NonZeroU32 {
+        self.feature_capacity.cross_venue_command_bytes
+    }
+    pub const fn maximum_cross_venue_instruments(&self) -> NonZeroUsize {
+        self.feature_capacity.maximum_cross_venue_instruments
+    }
+    pub const fn maximum_venues_per_cross_venue_instrument(&self) -> NonZeroUsize {
+        self.feature_capacity
+            .maximum_venues_per_cross_venue_instrument
+    }
+    pub const fn maximum_feature_snapshot_bytes(&self) -> NonZeroU32 {
+        self.feature_capacity.maximum_feature_snapshot_bytes
+    }
+    pub const fn maximum_action_hook_bytes_per_route(&self) -> NonZeroUsize {
+        self.feature_capacity.maximum_action_hook_bytes_per_route
+    }
     pub const fn registration_control_capacity(&self) -> NonZeroUsize {
         self.registration_control_capacity
     }
@@ -282,6 +343,7 @@ impl LiveRuntimeConfig {
     }
 }
 
+/// Fully validated live-feature ownership capacities forwarded to shard actors as one unit.
 /// Primitive route input checked into [`LiveRouteConfig`].
 #[derive(Clone, Debug)]
 pub struct LiveRouteConfigInput {
@@ -397,6 +459,22 @@ fn checked_permit_capacity(
     Ok(value)
 }
 
+fn checked_u32(
+    field: &'static str,
+    value: u32,
+    maximum: u32,
+) -> Result<NonZeroU32, LiveRuntimeConfigError> {
+    let value = NonZeroU32::new(value).ok_or(LiveRuntimeConfigError::ZeroCapacity { field })?;
+    if value.get() > maximum {
+        return Err(LiveRuntimeConfigError::CapacityExceedsHardLimit {
+            field,
+            value: u64::from(value.get()),
+            maximum: u64::from(maximum),
+        });
+    }
+    Ok(value)
+}
+
 fn checked_duration(
     field: &'static str,
     value: Duration,
@@ -435,6 +513,12 @@ pub enum LiveRuntimeConfigError {
     MessageExceedsMailbox { message: u32, mailbox: u32 },
     #[error("maximum sources per route {sources} exceeds maximum streams per route {streams}")]
     SourcesExceedStreams { sources: usize, streams: usize },
+    #[error("feature window bytes {bytes} cannot retain bounded state minimum {minimum}")]
+    FeatureWindowBytesBelowRetainedState { bytes: usize, minimum: usize },
+    #[error("cross-venue state requires capacity for at least two venues per instrument")]
+    CrossVenueRequiresTwoVenues,
+    #[error("cross-venue command bytes {bytes} cannot retain one command minimum {minimum}")]
+    CrossVenueCommandBytesBelowOne { bytes: u32, minimum: usize },
     #[error("maximum retained snapshot readers {readers} is below configured shard count {shards}")]
     SnapshotReadersBelowShardCount { readers: u32, shards: u16 },
     #[error("route instrument differs from its instrument definition")]
@@ -475,6 +559,15 @@ mod tests {
             maximum_routes_per_shard: 8,
             maximum_sources_per_route: 8,
             maximum_streams_per_route: 8,
+            maximum_feature_window_observations_per_route: 8,
+            maximum_feature_window_bytes_per_route: 1_048_576,
+            maximum_feature_sets_per_route: 8,
+            cross_venue_command_count: 8,
+            cross_venue_command_bytes: 65_536,
+            maximum_cross_venue_instruments: 8,
+            maximum_venues_per_cross_venue_instrument: 2,
+            maximum_feature_snapshot_bytes: 65_536,
+            maximum_action_hook_bytes_per_route: 65_536,
             registration_control_capacity: 8,
             registration_deadline: Duration::from_secs(1),
             health_event_capacity: 64,

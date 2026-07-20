@@ -75,6 +75,15 @@ fn runtime_input() -> TestResult<LiveRuntimeConfigInput> {
         maximum_routes_per_shard: 8,
         maximum_sources_per_route: 8,
         maximum_streams_per_route: 8,
+        maximum_feature_window_observations_per_route: 8,
+        maximum_feature_window_bytes_per_route: 1_048_576,
+        maximum_feature_sets_per_route: 8,
+        cross_venue_command_count: 8,
+        cross_venue_command_bytes: 65_536,
+        maximum_cross_venue_instruments: 8,
+        maximum_venues_per_cross_venue_instrument: 2,
+        maximum_feature_snapshot_bytes: 65_536,
+        maximum_action_hook_bytes_per_route: 65_536,
         registration_control_capacity: 8,
         registration_deadline: Duration::from_secs(1),
         health_event_capacity: 64,
@@ -97,6 +106,15 @@ fn memory_input(maximum_runtime_bytes: u64) -> TestResult<LiveRuntimeConfigInput
         maximum_routes_per_shard: 1,
         maximum_sources_per_route: 2,
         maximum_streams_per_route: 2,
+        maximum_feature_window_observations_per_route: 8,
+        maximum_feature_window_bytes_per_route: 1_048_576,
+        maximum_feature_sets_per_route: 2,
+        cross_venue_command_count: 4,
+        cross_venue_command_bytes: 65_536,
+        maximum_cross_venue_instruments: 2,
+        maximum_venues_per_cross_venue_instrument: 2,
+        maximum_feature_snapshot_bytes: 4_096,
+        maximum_action_hook_bytes_per_route: 4_096,
         registration_control_capacity: 2,
         registration_deadline: Duration::from_secs(1),
         health_event_capacity: 4,
@@ -534,7 +552,7 @@ fn route_validation_rejects_duplicates_and_per_shard_overflow() -> TestResult {
 
 #[test]
 fn estimated_peak_bytes_matches_golden_and_exact_ceiling_boundary() -> TestResult {
-    const EXPECTED_PEAK_BYTES: u64 = 264_612;
+    const EXPECTED_PEAK_BYTES: u64 = 1_418_916;
     let routes = [route_config("coinbase", INSTRUMENT_ONE, 4, 8, 1)?];
 
     let config = LiveRuntimeConfig::try_new(memory_input(EXPECTED_PEAK_BYTES)?)?;

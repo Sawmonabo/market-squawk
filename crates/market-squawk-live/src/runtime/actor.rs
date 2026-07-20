@@ -10,8 +10,12 @@ use tokio_util::sync::CancellationToken;
 use super::admission::{
     LiveRuntimeHealthEvent, LiveRuntimeHealthKind, RegistrationCommand, ShardCommand,
 };
-use super::{LiveRouteConfig, system_timestamp};
+use super::{LiveFeatureCapacity, LiveRouteConfig, system_timestamp};
 use crate::authority::{RuntimeLease, ShardLeaseOwner};
+use crate::cross_venue::{
+    CrossVenuePlaneHandle, CrossVenueRoutePublisher, CrossVenueRuntimeReader,
+};
+use crate::features::RouteFeatureState;
 use crate::processor::{
     GenerationAuthorityRegistry, GenerationRegistryExitHandle, InstrumentLiveProcessor,
     LiveApplyError, ProcessorLivenessBinding,
@@ -33,6 +37,9 @@ use scheduling::{FairEvent, FairSources, FairTurn, select_fair_event};
 struct RouteOwner {
     processor: InstrumentLiveProcessor<crate::authority::SystemTrustedClock>,
     generations: GenerationAuthorityRegistry,
+    features: RouteFeatureState,
+    cross_venue_publisher: Option<CrossVenueRoutePublisher>,
+    cross_venue_reader: Option<CrossVenueRuntimeReader>,
 }
 
 /// All already-allocated actor inputs; construction performs no late route discovery.
@@ -46,6 +53,8 @@ pub(crate) struct ShardActorInput {
     pub(crate) routes: Vec<LiveRouteConfig>,
     pub(crate) maximum_sources_per_route: usize,
     pub(crate) maximum_streams_per_route: usize,
+    pub(crate) feature_capacity: LiveFeatureCapacity,
+    pub(crate) cross_venue: CrossVenuePlaneHandle,
     pub(crate) maximum_book_items_per_message: usize,
     pub(crate) mailbox: mpsc::Receiver<ShardCommand>,
     pub(crate) registrations: mpsc::Receiver<RegistrationCommand>,
@@ -150,6 +159,7 @@ struct ShardActor {
     mailbox: mpsc::Receiver<ShardCommand>,
     registrations: mpsc::Receiver<RegistrationCommand>,
     snapshot_limits: SnapshotLimits,
+    maximum_feature_snapshot_bytes: usize,
     snapshot_interval: std::time::Duration,
     snapshot_event_trigger: usize,
     publisher: SnapshotPublisher,
@@ -191,6 +201,7 @@ impl ShardActor {
             .try_reserve_exact(input.routes.len())
             .map_err(|_| ActorError::Allocation)?;
         for route in input.routes {
+            let cross_venue = input.cross_venue.route(route.route());
             let generations =
                 GenerationAuthorityRegistry::try_new(input.maximum_sources_per_route)?;
             handles.push(generations.exit_handle());
@@ -204,12 +215,18 @@ impl ShardActor {
                 route.maximum_capability_lifetime(),
                 liveness.clone(),
             )?;
+            let features = RouteFeatureState::try_new(input.feature_capacity, route.depth())?;
             if routes
                 .insert(
                     route.route().clone(),
                     RouteOwner {
                         processor,
                         generations,
+                        features,
+                        cross_venue_publisher: cross_venue
+                            .as_ref()
+                            .map(|(publisher, _)| publisher.clone()),
+                        cross_venue_reader: cross_venue.map(|(_, reader)| reader),
                     },
                 )
                 .is_some()
@@ -219,6 +236,9 @@ impl ShardActor {
         }
         let book_scratch = BookProcessingScratch::try_new(input.maximum_book_items_per_message)
             .map_err(|_| ActorError::Allocation)?;
+        let maximum_feature_snapshot_bytes =
+            usize::try_from(input.feature_capacity.maximum_feature_snapshot_bytes.get())
+                .map_err(|_| ActorError::Allocation)?;
         Ok(Self {
             shard: input.shard,
             routing_version: input.routing_version,
@@ -228,6 +248,7 @@ impl ShardActor {
             mailbox: input.mailbox,
             registrations: input.registrations,
             snapshot_limits: input.snapshot_limits,
+            maximum_feature_snapshot_bytes,
             snapshot_interval: input.snapshot_interval,
             snapshot_event_trigger: input.snapshot_event_trigger,
             publisher: input.publisher,
@@ -309,6 +330,12 @@ impl ShardActor {
         for owner in self.routes.values_mut() {
             owner.generations.invalidate_all();
             owner.processor.invalidate_for_exit();
+            if let Ok(observed_at) = system_timestamp() {
+                owner.features.invalidate_all(
+                    crate::FeatureInvalidationReason::SourceReplacement,
+                    observed_at,
+                )?;
+            }
         }
         self.publish_snapshot(ShardLifecycleSnapshot::Stopped)?;
         self.emit_terminal_health();
@@ -377,6 +404,8 @@ pub(crate) enum ActorError {
     Snapshot(#[from] SnapshotBuildError),
     #[error(transparent)]
     Publish(#[from] crate::snapshot::SnapshotPublishError),
+    #[error(transparent)]
+    Feature(#[from] crate::RouteFeatureError),
 }
 
 impl ActorError {
@@ -388,6 +417,7 @@ impl ActorError {
             | Self::RuntimeClosed
             | Self::ShardClosed
             | Self::ClockRange
+            | Self::Feature(_)
             | Self::Snapshot(_)
             | Self::Publish(_)
             | Self::StartupReceiverDropped

@@ -6,7 +6,9 @@ use super::super::system_timestamp;
 use super::{ActorError, ShardActor};
 use crate::processor::{ProcessorSnapshotLimits, ProcessorSnapshotSeed};
 use crate::snapshot::SnapshotBuildError;
-use crate::{RouteSnapshot, ShardLifecycleSnapshot, ShardSnapshot, SnapshotDimension};
+use crate::{
+    LiveFeatureSnapshot, RouteSnapshot, ShardLifecycleSnapshot, ShardSnapshot, SnapshotDimension,
+};
 
 impl ShardActor {
     pub(super) fn publish_snapshot(
@@ -39,23 +41,43 @@ impl ShardActor {
                 .map_err(|_| SnapshotBuildError::RetainedSizeOverflow)?
                 .checked_sub(retained_bytes)
                 .ok_or(SnapshotBuildError::RetainedSizeOverflow)?;
-            let minimum = std::mem::size_of::<ProcessorSnapshotSeed>();
+            let route_charge = std::mem::size_of::<RouteSnapshot>()
+                .checked_add(key.venue().retained_bytes())
+                .ok_or(SnapshotBuildError::RetainedSizeOverflow)?;
+            let minimum = std::mem::size_of::<ProcessorSnapshotSeed>()
+                .checked_add(route_charge)
+                .and_then(|value| value.checked_add(std::mem::size_of::<LiveFeatureSnapshot>()))
+                .ok_or(SnapshotBuildError::RetainedSizeOverflow)?;
             if remaining < minimum {
                 break;
             }
             let owner = self.routes.get(&key).ok_or(ActorError::UnknownRoute)?;
+            let processor_budget = remaining
+                .checked_sub(route_charge)
+                .and_then(|value| value.checked_sub(std::mem::size_of::<LiveFeatureSnapshot>()))
+                .ok_or(SnapshotBuildError::RetainedSizeOverflow)?;
             let seed = owner
                 .processor
                 .snapshot_seed(ProcessorSnapshotLimits::try_new(
                     self.snapshot_limits.maximum_streams_per_route().get(),
                     self.snapshot_limits.maximum_statuses_per_route().get(),
                     self.snapshot_limits.maximum_levels_per_side().get() as usize,
-                    remaining,
+                    processor_budget,
                 )?)?;
+            let feature_budget = remaining
+                .checked_sub(route_charge)
+                .and_then(|value| value.checked_sub(seed.retained_bytes))
+                .ok_or(SnapshotBuildError::RetainedSizeOverflow)?
+                .min(self.maximum_feature_snapshot_bytes);
+            let features = owner.features.build_snapshot(feature_budget)?;
             let candidate_retained_bytes = retained_bytes
                 .checked_add(seed.retained_bytes)
-                .and_then(|value| value.checked_add(std::mem::size_of::<RouteSnapshot>()))
-                .and_then(|value| value.checked_add(key.venue().as_str().len()))
+                .and_then(|value| value.checked_add(route_charge))
+                .and_then(|value| {
+                    usize::try_from(features.retained_bytes())
+                        .ok()
+                        .and_then(|feature_bytes| value.checked_add(feature_bytes))
+                })
                 .ok_or(SnapshotBuildError::RetainedSizeOverflow)?;
             if candidate_retained_bytes
                 > self.snapshot_limits.maximum_retained_bytes().get() as usize
@@ -63,7 +85,7 @@ impl ShardActor {
                 break;
             }
             retained_bytes = candidate_retained_bytes;
-            routes.push(seed.into_route(key));
+            routes.push(seed.into_route(key, features));
         }
         let route_dimension =
             SnapshotDimension::from_counts(available_routes, routes.len(), route_limit)?;

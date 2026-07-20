@@ -67,6 +67,7 @@ pub enum LiveRuntimeHealthKind {
     IngressRejected,
     GenerationRejected,
     ProcessingRejected,
+    FeatureUnavailable,
     SnapshotNotificationDropped,
     ShardExited,
 }

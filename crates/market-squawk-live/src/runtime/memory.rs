@@ -35,6 +35,14 @@ const SNAPSHOT_ROUTE_SORT_SCRATCH_BYTES: u64 =
 const SNAPSHOT_STREAM_SORT_SCRATCH_BYTES: u64 = 64;
 /// Status key reference/value tuple plus Vec/allocator slack retained during status sorting.
 const SNAPSHOT_STATUS_SORT_SCRATCH_BYTES: u64 = 64;
+/// Fixed map/identity/output ownership for one preallocated route feature-set slot.
+pub(crate) const FEATURE_SET_SLOT_BYTES: u64 = 4 * 1024;
+/// One count-bounded coalescing hint and its semaphore/queue bookkeeping.
+pub(crate) const CROSS_VENUE_COMMAND_SLOT_BYTES: u64 = 192;
+/// Fixed single-writer instrument table slot excluding venue observations.
+pub(crate) const CROSS_VENUE_INSTRUMENT_SLOT_BYTES: u64 = 512;
+/// Fixed exact midpoint/generation/identity slot for one expected venue.
+pub(crate) const CROSS_VENUE_VENUE_SLOT_BYTES: u64 = 384;
 
 /// Conservative checked peak retained bytes for every configured runtime component.
 pub(super) fn estimate_peak_bytes(
@@ -65,7 +73,10 @@ pub(super) fn estimate_peak_bytes(
                 persistent_stream_bytes(route.depth().get())?,
             )?,
         )?;
+        total = add(total, route_feature_owner_bytes(config)?)?;
     }
+
+    total = add(total, cross_venue_owner_bytes(config)?)?;
 
     let mailbox_per_shard = add(
         u64::from(config.mailbox_bytes_per_shard().get()),
@@ -93,6 +104,14 @@ pub(super) fn estimate_peak_bytes(
         config.maximum_retained_snapshot_readers().get(),
     )?;
     total = add(total, snapshot_peak.additional_bytes)?;
+    let feature_publications = multiply(snapshot_peak.publication_count, routes.len() as u64)?;
+    total = add(
+        total,
+        multiply(
+            feature_publications,
+            u64::from(config.maximum_feature_snapshot_bytes().get()),
+        )?,
+    )?;
     // Every shard may construct concurrently. Route-key scratch scales with configured routes;
     // one maximum-sized stream/status ordering workspace may coexist in each actor.
     total = add(
@@ -123,6 +142,46 @@ pub(super) fn estimate_peak_bytes(
         });
     }
     NonZeroU64::new(total).ok_or(LiveRuntimeConfigError::CapacityOverflow)
+}
+
+pub(crate) fn route_feature_owner_bytes(
+    config: &LiveRuntimeConfig,
+) -> Result<u64, LiveRuntimeConfigError> {
+    let feature_sets = multiply(
+        config.maximum_feature_sets_per_route().get() as u64,
+        FEATURE_SET_SLOT_BYTES,
+    )?;
+    add(
+        add(
+            config.maximum_feature_window_bytes_per_route().get() as u64,
+            feature_sets,
+        )?,
+        config.maximum_action_hook_bytes_per_route().get() as u64,
+    )
+}
+
+pub(crate) fn cross_venue_owner_bytes(
+    config: &LiveRuntimeConfig,
+) -> Result<u64, LiveRuntimeConfigError> {
+    let commands = add(
+        u64::from(config.cross_venue_command_bytes().get()),
+        multiply(
+            config.cross_venue_command_count().get() as u64,
+            CROSS_VENUE_COMMAND_SLOT_BYTES,
+        )?,
+    )?;
+    let venues = multiply(
+        config.maximum_venues_per_cross_venue_instrument().get() as u64,
+        CROSS_VENUE_VENUE_SLOT_BYTES,
+    )?;
+    let instrument = add(CROSS_VENUE_INSTRUMENT_SLOT_BYTES, venues)?;
+    add(
+        commands,
+        multiply(
+            config.maximum_cross_venue_instruments().get() as u64,
+            instrument,
+        )?,
+    )
 }
 
 fn per_actor_snapshot_sort_scratch(

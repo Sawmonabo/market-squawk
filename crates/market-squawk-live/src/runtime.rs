@@ -15,6 +15,8 @@ mod lifecycle;
 #[path = "runtime/memory.rs"]
 mod memory;
 
+pub(crate) use config::LiveFeatureCapacity;
+
 #[cfg(test)]
 pub(crate) use memory::book_processing_peak;
 
