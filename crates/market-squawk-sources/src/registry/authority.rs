@@ -254,7 +254,7 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
         captured: CapturedDecodedProviderBatch,
     ) -> Result<CurrentDecodedProviderBatches, RegistryError> {
         let (batch, receipt) = captured.into_parts();
-        self.validate_decoded_batch_owned(batch, receipt)
+        self.validate_captured_batch_owned(batch, receipt)
     }
 
     /// Issues an owned opaque source lease for pre-feed generation registration.
@@ -422,7 +422,7 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
     /// # Errors
     ///
     /// Rejects binding/rule/profile/scope transplants and stale current health authority.
-    pub fn validate_decoded_batch_owned(
+    fn validate_captured_batch_owned(
         &self,
         batch: crate::DecodedProviderBatch,
         receipt: crate::CaptureAdmissionReceipt,

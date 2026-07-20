@@ -16,15 +16,15 @@ use market_squawk_domain::{
 use market_squawk_sources::{
     AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationHealth, AuthorizationMode,
     BackoffPolicy, BudgetHealth, BudgetScope, ChecksumValidationProfile, ConnectionLiveness,
-    CoverageHealth, CoverageTopology, DecodedProviderBatch, DecoderEvidence, EndpointPolicy,
-    FreshnessPolicy, HistoricalCapability, InstrumentCoverage, LiveCoverageDeclaration,
-    LiveCoverageRule, LiveProtocolProfile, NetworkAccessPolicy, ProviderBookLevel,
-    ProviderBudgetPolicy, ProviderChecksumEvidence, ProviderDecimalLexeme,
+    CoverageHealth, CoverageTopology, DecodeOutcome, DecodedProviderBatch, DecoderEvidence,
+    EndpointPolicy, FreshnessPolicy, HistoricalCapability, InstrumentCoverage,
+    LiveCoverageDeclaration, LiveCoverageRule, LiveProtocolProfile, NetworkAccessPolicy,
+    ProviderBookLevel, ProviderBudgetPolicy, ProviderChecksumEvidence, ProviderDecimalLexeme,
     ProviderNormalizedObservation, ProviderNumericPolicy, ProviderObservationPayload,
     ProviderPrice, ProviderQuantity, ProviderSequenceEvidence, ProviderSnapshotEvidence,
     ProviderTimestampEvidence, SemanticInterpretationProfile, SequenceValidationProfile, SessionId,
     SourceCapabilities, SourceClass, SourceCoverage, SourceHealthSnapshot, SourceMetadata,
-    SourceMetadataInput, SourceProtocolProfile, TransportFrameKind,
+    SourceMetadataInput, SourceProtocolProfile, TransportFrameKind, ValidatedSessionDecodeOutcome,
 };
 use rust_decimal::Decimal;
 
@@ -240,10 +240,14 @@ fn current_snapshot(
         )?,
     )?;
     let batch = DecodedProviderBatch::try_new(decoder, vec![observation])?;
+    let validated_session = registry.validate_session(&session, frame.received_at())?;
+    let validated_outcome =
+        validated_session.validate_decode_outcome_owned(DecodeOutcome::Data(batch), receipt)?;
+    let ValidatedSessionDecodeOutcome::Data(captured) = validated_outcome else {
+        return Err("data outcome changed disposition".into());
+    };
     let current = registry.validate_current_authority(&session)?;
-    let mut batches = current
-        .validate_decoded_batch_owned(batch, receipt)?
-        .into_iter();
+    let mut batches = current.validate_data_outcome_owned(captured)?.into_iter();
     let mut observations = batches
         .next()
         .ok_or("snapshot fixture lost routed batch")?

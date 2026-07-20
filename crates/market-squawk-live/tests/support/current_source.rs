@@ -21,16 +21,16 @@ use market_squawk_sources::{
     AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationHealth, AuthorizationMode,
     BackoffPolicy, BudgetHealth, BudgetScope, CaptureAdmissionIssuer, CaptureDegradationCapability,
     ConnectionLiveness, CoverageHealth, CoverageTopology, CurrentDecodedProviderBatch,
-    CurrentHealthReporter, CurrentSourceAuthorityLease, CurrentSourceSession, DecodedProviderBatch,
-    DecoderEvidence, EndpointPolicy, FreshnessPolicy, HistoricalCapability, InstrumentCoverage,
-    LiveCoverageDeclaration, LiveCoverageRule, LiveProtocolProfile, NetworkAccessPolicy,
-    ProviderAggressorEvidence, ProviderBookLevel, ProviderBudgetPolicy, ProviderChecksumEvidence,
-    ProviderDecimalLexeme, ProviderNormalizedObservation, ProviderNumericPolicy,
-    ProviderObservationPayload, ProviderPrice, ProviderQuantity, ProviderSequenceEvidence,
-    ProviderSnapshotEvidence, ProviderTimestampEvidence, RawFrameFactory, RegisteredSource,
-    SemanticInterpretationProfile, SequenceValidationProfile, SessionId, SourceCapabilities,
-    SourceClass, SourceCoverage, SourceHealthSnapshot, SourceMetadata, SourceMetadataInput,
-    SourceProtocolProfile, TransportFrameKind,
+    CurrentHealthReporter, CurrentSourceAuthorityLease, CurrentSourceSession, DecodeOutcome,
+    DecodedProviderBatch, DecoderEvidence, EndpointPolicy, FreshnessPolicy, HistoricalCapability,
+    InstrumentCoverage, LiveCoverageDeclaration, LiveCoverageRule, LiveProtocolProfile,
+    NetworkAccessPolicy, ProviderAggressorEvidence, ProviderBookLevel, ProviderBudgetPolicy,
+    ProviderChecksumEvidence, ProviderDecimalLexeme, ProviderNormalizedObservation,
+    ProviderNumericPolicy, ProviderObservationPayload, ProviderPrice, ProviderQuantity,
+    ProviderSequenceEvidence, ProviderSnapshotEvidence, ProviderTimestampEvidence, RawFrameFactory,
+    RegisteredSource, SemanticInterpretationProfile, SequenceValidationProfile, SessionId,
+    SourceCapabilities, SourceClass, SourceCoverage, SourceHealthSnapshot, SourceMetadata,
+    SourceMetadataInput, SourceProtocolProfile, TransportFrameKind, ValidatedSessionDecodeOutcome,
 };
 use rust_decimal::Decimal;
 
@@ -454,9 +454,17 @@ impl SourceHarness {
             )?);
         }
         let decoded = DecodedProviderBatch::try_new(decoder, decoded_observations)?;
+        let validated_session = self
+            .registry
+            .validate_session(&self.session, frame.received_at())?;
+        let validated_outcome = validated_session
+            .validate_decode_outcome_owned(DecodeOutcome::Data(decoded), receipt)?;
+        let ValidatedSessionDecodeOutcome::Data(captured) = validated_outcome else {
+            return Err("data outcome changed disposition".into());
+        };
         let current = self.registry.validate_current_authority(&self.session)?;
         let lease = current.try_current_lease()?;
-        let batches = current.validate_decoded_batch_owned(decoded, receipt)?;
+        let batches = current.validate_data_outcome_owned(captured)?;
         let mut batches = batches.into_iter();
         let batch = batches.next().ok_or("missing routed current batch")?;
         if batches.next().is_some() {
@@ -521,9 +529,17 @@ impl SourceHarness {
             )?,
         )?;
         let decoded = DecodedProviderBatch::try_new(decoder, vec![observation])?;
+        let validated_session = self
+            .registry
+            .validate_session(&self.session, frame.received_at())?;
+        let validated_outcome = validated_session
+            .validate_decode_outcome_owned(DecodeOutcome::Data(decoded), receipt)?;
+        let ValidatedSessionDecodeOutcome::Data(captured) = validated_outcome else {
+            return Err("data outcome changed disposition".into());
+        };
         let current = self.registry.validate_current_authority(&self.session)?;
         let lease = current.try_current_lease()?;
-        let batches = current.validate_decoded_batch_owned(decoded, receipt)?;
+        let batches = current.validate_data_outcome_owned(captured)?;
         let mut batches = batches.into_iter();
         let batch = batches.next().ok_or("missing routed current batch")?;
         if batches.next().is_some() {

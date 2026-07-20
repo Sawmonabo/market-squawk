@@ -17,7 +17,7 @@ use market_squawk_domain::{
 use market_squawk_sources::{
     AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationHealth, AuthorizationMode,
     BackoffPolicy, BudgetHealth, BudgetScope, CaptureDegradationCapability, ChecksumAlgorithm,
-    ChecksumValidationProfile, ConnectionLiveness, CoverageHealth, CoverageTopology,
+    ChecksumValidationProfile, ConnectionLiveness, CoverageHealth, CoverageTopology, DecodeOutcome,
     DecodedProviderBatch, DecoderEvidence, EndpointPolicy, FreshnessPolicy, HistoricalCapability,
     InstrumentCoverage, LiveCoverageDeclaration, LiveCoverageRule, LiveProtocolProfile,
     NetworkAccessPolicy, ProviderAggressorEvidence, ProviderBudgetPolicy, ProviderChecksumEvidence,
@@ -26,7 +26,7 @@ use market_squawk_sources::{
     ProviderSnapshotEvidence, ProviderTimestampEvidence, SemanticInterpretationProfile,
     SequenceValidationProfile, SessionId, SourceCapabilities, SourceClass, SourceCoverage,
     SourceHealthSnapshot, SourceMetadata, SourceMetadataInput, SourceProtocolProfile,
-    TransportFrameKind,
+    TransportFrameKind, ValidatedSessionDecodeOutcome,
 };
 
 use super::{
@@ -330,8 +330,14 @@ fn current_fixture(policy: FixturePolicy, frame_count: usize) -> TestResult<Curr
             },
         )?;
         let batch = DecodedProviderBatch::try_new(decoder, vec![observation])?;
+        let validated_session = registry.validate_session(&session, frame.received_at())?;
+        let validated_outcome =
+            validated_session.validate_decode_outcome_owned(DecodeOutcome::Data(batch), receipt)?;
+        let ValidatedSessionDecodeOutcome::Data(captured) = validated_outcome else {
+            return Err("data outcome changed disposition".into());
+        };
         let current = registry.validate_current_authority(&session)?;
-        let routed = current.validate_decoded_batch_owned(batch, receipt)?;
+        let routed = current.validate_data_outcome_owned(captured)?;
         let mut routed = routed.into_iter();
         let batch = routed.next().ok_or("missing routed batch")?;
         let mut current_observations = batch.into_observations();
