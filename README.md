@@ -263,10 +263,11 @@ requirement for the other. Historical sources may differ from live sources. Jour
 optional diagnostic tooling for integrity investigation and decoder reprocessing, not the research
 architecture or a completion dependency.
 
-The research plane currently has shared contracts but no working storage or provider vertical.
-Arrow, Parquet, DataFusion, point-in-time datasets, and extraction adapters are mandatory missing
-capabilities bound to the complete-release plan; the release cannot pass without their real producers
-and consumers.
+The research plane currently has a working local SQLite catalog, versioned Arrow interchange,
+authority-bound immutable Parquet publication and compaction, manifests, lineage, recovery, and
+bounded read-only DataFusion queries. Production extraction/provider verticals and the complete
+point-in-time dataset builder remain mandatory missing capabilities bound to the complete-release
+plan; the release cannot pass without their real producers and terminal consumers.
 
 ## Diagnostic compatibility data path
 
@@ -356,7 +357,8 @@ The raw envelope preserves:
 
 Optional MSJ journal-format evolution may add segmentation, cryptographic segment manifests, or
 compression while retaining independent compatibility. That diagnostic-journal evolution is
-separate from mandatory research Parquet dataset compaction, which remains release-blocking.
+separate from the already-runnable research Parquet compaction service and from the still-mandatory
+provider-ingestion and point-in-time dataset-construction verticals.
 
 ## Diagnostic paper bot
 
