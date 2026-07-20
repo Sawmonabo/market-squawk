@@ -419,6 +419,46 @@ fn request_identities_frame_fields_and_bind_the_full_source_object() -> TestResu
         Timestamp::from_unix_nanos(100),
     )?;
     assert_ne!(base.request_id(), mutated.request_id());
+    let observed_object = SourceObject::try_new_with_availability(
+        SourceId::try_from("source-a")?,
+        MetadataRevision::new(source_identifier("metadata-a")?),
+        &first_discovery,
+        source_identifier("c")?,
+        source_identifier("application-json")?,
+        exact_evidence(4),
+        EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?,
+        Some(Timestamp::from_unix_nanos(2)),
+        AvailabilityEvidence::LocalFirstObserved {
+            observed_at: Timestamp::from_unix_nanos(3),
+        },
+        Some(100),
+    )?;
+    let observed = ExtractionRequest::try_new(
+        observed_object,
+        NonZeroU32::try_from(5_u32)?,
+        NonZeroU64::try_from(10_000_u64)?,
+        Timestamp::from_unix_nanos(100),
+    )?;
+    assert_ne!(base.request_id(), observed.request_id());
+    assert_eq!(
+        observed.object().availability().conservative_available_at(),
+        Some(Timestamp::from_unix_nanos(3))
+    );
+    assert!(serde_json::to_value(observed.object())?["availability"].is_object());
+    let mut legacy_object = serde_json::to_value(base.object())?;
+    assert!(legacy_object.get("availability").is_none());
+    legacy_object
+        .as_object_mut()
+        .ok_or("source object wire is not an object")?
+        .remove("availability");
+    let legacy_object: SourceObject = serde_json::from_value(legacy_object)?;
+    let legacy = ExtractionRequest::try_new(
+        legacy_object,
+        NonZeroU32::try_from(5_u32)?,
+        NonZeroU64::try_from(10_000_u64)?,
+        Timestamp::from_unix_nanos(100),
+    )?;
+    assert_eq!(legacy.request_id(), base.request_id());
     Ok(())
 }
 
@@ -475,6 +515,16 @@ fn extraction_deep_cap_counts_maximum_version_pinned_locators() -> TestResult {
         None,
         payload,
     )?;
+    let mut records_with_spare_capacity = Vec::with_capacity(8);
+    records_with_spare_capacity.push(record.clone());
+    let batch = ExtractionBatch::try_new(&request, records_with_spare_capacity)?;
+    let encoded = serde_json::to_vec(&batch)?;
+    let encoded_text = std::str::from_utf8(&encoded)?;
+    assert!(encoded_text.contains("\"total_retained_bytes\""));
+    assert!(!encoded_text.contains("\"logical_retained_bytes\""));
+    let decoded: ExtractionBatch = serde_json::from_slice(&encoded)?;
+    assert_eq!(decoded.records().len(), 1);
+    assert_eq!(serde_json::to_vec(&decoded)?, encoded);
     assert!(matches!(
         ExtractionBatch::try_new(&request, vec![record; 65]),
         Err(ExtractionError::ByteLimitExceeded {

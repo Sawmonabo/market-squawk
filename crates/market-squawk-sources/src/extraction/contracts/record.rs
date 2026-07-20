@@ -1,5 +1,5 @@
 /// Explicit source availability basis without promoting inference to point-in-time evidence.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
 pub enum AvailabilityEvidence {
     /// Source/audit evidence directly establishes availability.
@@ -15,7 +15,12 @@ pub enum AvailabilityEvidence {
         method: SourceIdentifier,
     },
     /// Historical availability could not be established.
+    #[default]
     Unknown,
+}
+
+fn availability_is_unknown(availability: &AvailabilityEvidence) -> bool {
+    matches!(availability, AvailabilityEvidence::Unknown)
 }
 
 impl AvailabilityEvidence {
@@ -329,6 +334,8 @@ pub enum ExtractionError {
     ByteLimitExceeded { requested: u64 },
     #[error("extraction byte count overflow")]
     ByteCountOverflow,
+    #[error("extraction batch allocation failed")]
+    AllocationFailed,
     #[error("record availability/publication/supersession ordering is invalid")]
     InvalidPointInTimeOrdering,
     #[error("discovery or extraction request identity does not match")]
@@ -376,7 +383,11 @@ fn extraction_request_id(
     deadline: Timestamp,
 ) -> ExtractionRequestId {
     let mut hash = Sha256::new();
-    hash.update(b"market-squawk/extraction-request/v2");
+    if matches!(object.availability, AvailabilityEvidence::Unknown) {
+        hash.update(b"market-squawk/extraction-request/v2");
+    } else {
+        hash.update(b"market-squawk/extraction-request/v3");
+    }
     hash_field(
         &mut hash,
         b"source_id",
@@ -415,6 +426,9 @@ fn extraction_request_id(
     );
     hash_optional_timestamp(&mut hash, b"effective_ends_at", object.effective.ends_at());
     hash_optional_timestamp(&mut hash, b"published_at", object.published_at);
+    if !matches!(object.availability, AvailabilityEvidence::Unknown) {
+        hash_availability(&mut hash, &object.availability);
+    }
     hash_optional_u64(&mut hash, b"expected_bytes", object.expected_bytes);
     hash_field(&mut hash, b"max_records", &max_records.get().to_be_bytes());
     hash_field(&mut hash, b"max_bytes", &max_bytes.get().to_be_bytes());
@@ -448,6 +462,52 @@ fn hash_evidence(hash: &mut Sha256, tag: &[u8], evidence: &ExactPayloadEvidence)
         );
     } else {
         hash_field(hash, b"locator_presence", &[0]);
+    }
+}
+
+fn hash_availability(hash: &mut Sha256, availability: &AvailabilityEvidence) {
+    match availability {
+        AvailabilityEvidence::Observed {
+            available_at,
+            evidence,
+        } => {
+            hash_field(hash, b"object_availability_kind", b"observed");
+            hash_field(
+                hash,
+                b"object_available_at",
+                &available_at.unix_nanos().to_be_bytes(),
+            );
+            hash_field(
+                hash,
+                b"object_availability_evidence",
+                evidence.as_str().as_bytes(),
+            );
+        }
+        AvailabilityEvidence::LocalFirstObserved { observed_at } => {
+            hash_field(hash, b"object_availability_kind", b"local_first_observed");
+            hash_field(
+                hash,
+                b"object_observed_at",
+                &observed_at.unix_nanos().to_be_bytes(),
+            );
+        }
+        AvailabilityEvidence::Inferred {
+            inferred_at,
+            method,
+        } => {
+            hash_field(hash, b"object_availability_kind", b"inferred");
+            hash_field(
+                hash,
+                b"object_inferred_at",
+                &inferred_at.unix_nanos().to_be_bytes(),
+            );
+            hash_field(
+                hash,
+                b"object_availability_method",
+                method.as_str().as_bytes(),
+            );
+        }
+        AvailabilityEvidence::Unknown => {}
     }
 }
 
@@ -504,6 +564,58 @@ fn normalize_evidence(
         None => Ok(ExactPayloadEvidence::from_content_digest(
             evidence.content_digest(),
         )),
+    }
+}
+
+fn normalize_availability(
+    availability: &AvailabilityEvidence,
+) -> Result<AvailabilityEvidence, ExtractionError> {
+    match availability {
+        AvailabilityEvidence::Observed {
+            available_at,
+            evidence,
+        } => Ok(AvailabilityEvidence::Observed {
+            available_at: *available_at,
+            evidence: normalize_identifier(evidence)?,
+        }),
+        AvailabilityEvidence::LocalFirstObserved { observed_at } => {
+            Ok(AvailabilityEvidence::LocalFirstObserved {
+                observed_at: *observed_at,
+            })
+        }
+        AvailabilityEvidence::Inferred {
+            inferred_at,
+            method,
+        } => Ok(AvailabilityEvidence::Inferred {
+            inferred_at: *inferred_at,
+            method: normalize_identifier(method)?,
+        }),
+        AvailabilityEvidence::Unknown => Ok(AvailabilityEvidence::Unknown),
+    }
+}
+
+fn validate_source_object_availability(
+    published_at: Option<Timestamp>,
+    availability: &AvailabilityEvidence,
+) -> Result<(), ExtractionError> {
+    if published_at.is_some_and(|published| {
+        availability
+            .reported_at()
+            .is_some_and(|available| available < published)
+    }) {
+        Err(ExtractionError::InvalidPointInTimeOrdering)
+    } else {
+        Ok(())
+    }
+}
+
+fn availability_dynamic_bytes(
+    availability: &AvailabilityEvidence,
+) -> Result<usize, ExtractionError> {
+    match availability {
+        AvailabilityEvidence::Observed { evidence, .. } => Ok(evidence.as_str().len()),
+        AvailabilityEvidence::Inferred { method, .. } => Ok(method.as_str().len()),
+        AvailabilityEvidence::LocalFirstObserved { .. } | AvailabilityEvidence::Unknown => Ok(0),
     }
 }
 

@@ -38,8 +38,9 @@ pub use config::{
     SecretReference, SecretValue,
 };
 pub use input::{
-    BoundedInput, InputFileCapability, InputFileError, InputFileIdentity, UserAuthorizedInputRoot,
-    VerifiedInputFile,
+    BoundedInput, ControlledInputFileError, InputFileCapability, InputFileError, InputFileIdentity,
+    InputReadCheckpoint, InputReadControl, InputReadControlError, InputReadPass,
+    UserAuthorizedInputRoot, VerifiedInputFile,
 };
 pub use journal::{
     JournalError, JournalReader, JournalReplayAuthority, JournalSinkConstructionError,

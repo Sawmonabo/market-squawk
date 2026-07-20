@@ -1,0 +1,160 @@
+{
+  "schema_version": 1,
+  "objects": [
+    {
+      "dataset": "alternative-prices",
+      "object_id": "csv-fixture",
+      "path": "prices.csv",
+      "format": { "kind": "csv", "delimiter": 44 },
+      "effective_at": 100,
+      "published_at": 150,
+      "revision": "revision-1",
+      "revision_number": 1,
+      "superseded_at": null,
+      "row_policy": {
+        "identity_field": "id",
+        "fields": [{ "source": "value", "field": "price", "decimal_scale": 2, "unit": "USD" }]
+      }
+    },
+    {
+      "dataset": "alternative-prices",
+      "object_id": "tsv-fixture",
+      "path": "prices.tsv",
+      "format": { "kind": "tsv" },
+      "effective_at": 100,
+      "published_at": 150,
+      "revision": "revision-1",
+      "revision_number": 1,
+      "superseded_at": null,
+      "row_policy": {
+        "identity_field": "id",
+        "fields": [{ "source": "value", "field": "price", "decimal_scale": 2, "unit": "USD" }]
+      }
+    },
+    {
+      "dataset": "alternative-prices",
+      "object_id": "json-fixture",
+      "path": "prices.json",
+      "format": { "kind": "json" },
+      "effective_at": 100,
+      "published_at": 150,
+      "revision": "revision-1",
+      "revision_number": 1,
+      "superseded_at": null,
+      "row_policy": {
+        "identity_field": "id",
+        "fields": [{ "source": "value", "field": "price", "decimal_scale": 2, "unit": "USD" }]
+      }
+    },
+    {
+      "dataset": "alternative-prices",
+      "object_id": "ndjson-fixture",
+      "path": "prices.ndjson",
+      "format": { "kind": "ndjson" },
+      "effective_at": 100,
+      "published_at": 150,
+      "revision": "revision-1",
+      "revision_number": 1,
+      "superseded_at": null,
+      "row_policy": {
+        "identity_field": "id",
+        "fields": [{ "source": "value", "field": "price", "decimal_scale": 2, "unit": "USD" }]
+      }
+    },
+    {
+      "dataset": "alternative-prices",
+      "object_id": "xml-fixture",
+      "path": "prices.xml",
+      "format": { "kind": "xml", "record_element": "row" },
+      "effective_at": 100,
+      "published_at": 150,
+      "revision": "revision-1",
+      "revision_number": 1,
+      "superseded_at": null,
+      "row_policy": {
+        "identity_field": "id",
+        "fields": [{ "source": "value", "field": "price", "decimal_scale": 2, "unit": "USD" }]
+      }
+    },
+    {
+      "dataset": "alternative-prices",
+      "object_id": "excel-fixture",
+      "path": "prices.xlsx",
+      "format": { "kind": "excel", "formula_policy": "reject" },
+      "effective_at": 100,
+      "published_at": 150,
+      "revision": "revision-1",
+      "revision_number": 1,
+      "superseded_at": null,
+      "row_policy": {
+        "identity_field": "id",
+        "fields": [{ "source": "value", "field": "price", "decimal_scale": 2, "unit": "USD" }]
+      }
+    },
+    {
+      "dataset": "alternative-prices",
+      "object_id": "parquet-fixture",
+      "path": "prices.parquet",
+      "format": { "kind": "parquet" },
+      "effective_at": 100,
+      "published_at": 150,
+      "revision": "revision-1",
+      "revision_number": 1,
+      "superseded_at": null,
+      "row_policy": {
+        "identity_field": "id",
+        "fields": [{ "source": "value", "field": "price", "decimal_scale": 2, "unit": "USD" }]
+      }
+    },
+    {
+      "dataset": "alternative-prices",
+      "object_id": "sqlite-fixture",
+      "path": "prices.sqlite3",
+      "format": {
+        "kind": "sqlite",
+        "table": "prices",
+        "columns": ["id", "value"],
+        "order_by": ["id"]
+      },
+      "effective_at": 100,
+      "published_at": 150,
+      "revision": "revision-1",
+      "revision_number": 1,
+      "superseded_at": null,
+      "row_policy": {
+        "identity_field": "id",
+        "fields": [{ "source": "value", "field": "price", "decimal_scale": 2, "unit": "USD" }]
+      }
+    },
+    {
+      "dataset": "alternative-prices",
+      "object_id": "ofx-fixture",
+      "path": "prices.ofx",
+      "format": { "kind": "ofx", "account_id": "acct-1", "currency": "USD" },
+      "effective_at": 100,
+      "published_at": 150,
+      "revision": "revision-1",
+      "revision_number": 1,
+      "superseded_at": null,
+      "row_policy": {
+        "identity_field": "id",
+        "fields": [{ "source": "value", "field": "price", "decimal_scale": 2, "unit": "USD" }]
+      }
+    },
+    {
+      "dataset": "alternative-prices",
+      "object_id": "qfx-fixture",
+      "path": "prices.qfx",
+      "format": { "kind": "qfx", "account_id": "acct-1", "currency": "USD" },
+      "effective_at": 100,
+      "published_at": 150,
+      "revision": "revision-1",
+      "revision_number": 1,
+      "superseded_at": null,
+      "row_policy": {
+        "identity_field": "id",
+        "fields": [{ "source": "value", "field": "price", "decimal_scale": 2, "unit": "USD" }]
+      }
+    }
+  ]
+}
