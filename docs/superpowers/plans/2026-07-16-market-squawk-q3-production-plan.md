@@ -1,10 +1,9 @@
-# Market Squawk Q3 Production Implementation Plan
+# Market Squawk Live Execution Stage Implementation Plan
 
-> **Status: Superseded. No current execution authority.** The historical Q3 identifier and findings
-> remain traceability locators, but this plan's audit base, paths, signatures, and quarter-checkpoint
-> language cannot be executed. Task 2 of the
-> [usable complete-release implementation plan](2026-07-17-market-squawk-usable-complete-release.md)
-> owns the refreshed Stage/Wave implementation after the active release gate closes.
+> **Status: Active Task 2 execution contract.** The filename and historical `Q3` locators are
+> retained for audit continuity only. Active scheduling uses Stage/Wave terminology and this work
+> participates in **Quarter 1 of 4** of the usable complete-release plan. It does not conduct or
+> create a separate quarter checkpoint.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development
 > (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use
@@ -25,15 +24,39 @@ realistic market simulation.
 Rust Decimal, UUID, Chrono, Thiserror, Tracing, Tokio-Tungstenite, Proptest, Trybuild, Criterion,
 Cargo-fuzz targets, Python 3 boundary checks, and local Git worktrees.
 
-**Planning evidence base:** `834674aa40198656b4486c4c64dec1fa788eae29`. This is an audit anchor,
-not Q2 approval or the automatic Q3 execution base. Task 0 replaces it with the formally approved
-integrated Q2 commit and refreshes every path/line anchor before implementation.
+**Execution base:** `223a8a1f0250f9e8cffe4e5899b4a7b3ecba4ad8`. This is the clean,
+integrated Task 2 branch point supplied by the release integration owner. The mandatory refresh
+below was performed against that exact tree before implementation. Any later rebase must repeat the
+path, signature, dependency, and ownership refresh before workers resume.
+
+**Normative ownership:**
+[`docs/verification/stage-live-execution-path-ownership.json`](../../verification/stage-live-execution-path-ownership.json)
+is the closed path/DAG contract for all 19 tasks. If prose and the ownership record diverge,
+implementation stops until the integration owner repairs both at one commit.
+
+**Refresh overrides for retained historical task text:**
+
+- Task 1 verifies the already-expanded production DAG checker at this base and changes it only after
+  a behaviorally failing dependency-edge case; it creates no plan/prose/wrapper test.
+- The current domain module path is `crates/market-squawk-domain/src/identifiers/mod.rs`.
+- Current source-authority integration cases are split across
+  `tests/registry_authority.rs`, `tests/registry_authority/pre_feed_cases.rs`, and
+  `tests/registry_authority/current_scope_cases.rs`; the extraction lane must preserve that split.
+- Task 15 composes through the existing `market-squawk-services` and `market-squawk-mcp` contracts.
+  It does not create a second MCP implementation or duplicate business logic in the transport.
+- In Task 16, every fuzz workspace, toolchain, target, campaign, and fuzz-evidence step is removed
+  and owned exclusively by usable-release Task 20. Task 16 retains parser property tests, committed
+  seed fixtures, benchmarks, latency/RSS harnesses, and measured stage performance.
+- Task 18 freezes and hands the clean Task 2 candidate to the master **Quarter 1 of 4** grouped
+  checkpoint. Historical `docs/reviews/q3/*` paths and standalone reviewer dispatch steps are not
+  executable and are not owned by this stage.
+- The sole consolidated stage evidence is `docs/verification/stage-live-execution.md`; historical
+  `q3-baseline.md`, `q3-performance.md`, and `q3-production.md` names are not created.
 
 ## Global Constraints
 
-- This plan is **proposed for execution only after formal Q2 approval**.
-- Before execution, rebase or recreate every implementation worktree at the approved integrated Q2
-  commit, update the recorded base commit, and refresh every file/line anchor with `rg -n`/`nl -ba`.
+- Execute only from exact base `223a8a1f0250f9e8cffe4e5899b4a7b3ecba4ad8` or from a later clean
+  integrated head after the mandatory refresh gate is rerun and recorded.
 - Local build/test results are local evidence only. Never state that hosted CI ran or passed without
   inspecting the hosted check result.
 - Rust toolchain is exactly `1.97.1`, stable, Edition 2024, resolver 3; every package inherits
@@ -55,8 +78,9 @@ integrated Q2 commit and refreshes every path/line anchor before implementation.
   persistence, no unrelated network request, and no unbounded queue write.
 - Every queue has count and byte bounds. Saturation has a typed fail-closed policy and is included in
   the checked startup memory model.
-- Root `Cargo.toml`, `Cargo.lock`, app composition files, and cross-lane conflict resolution are owned
-  only by the integration owner.
+- Root `Cargo.toml`, `Cargo.lock`, application composition, shared service/MCP wiring, live
+  actor/authority handoff, execution approval/dispatch seams, and cross-lane conflict resolution are
+  owned only by the integration owner, exactly as enumerated in the ownership JSON.
 - External network tests are ignored/opt-in. Deterministic local WebSocket tests are mandatory in the
   default suite.
 - Research conclusions, provider protocol choices, retrieval date, official links, fixture schema,
@@ -113,10 +137,10 @@ workspace.
 
 | Wave | Parallel lane A | Parallel lane B | Parallel lane C | Integration owner |
 | --- | --- | --- | --- | --- |
-| 0 | Boundary checker + domain execution identities | Live actor split | Sources fixture/module split + decoder outcomes | Merge in order, freeze cross-crate contracts, register nonempty Q3 crates, minimally resolve root lockfile |
+| 0 | Domain execution identities and intent invariants | Live actor split | Sources fixture/module split + decoder outcomes | Maintain the closed boundary checker, merge in order, freeze cross-crate contracts, register nonempty Stage crates, minimally resolve root lockfile |
 | 1 | Complete analytics kernels/registry | Complete authoritative account/risk core | Complete Coinbase adapter | Merge manifests without lane lockfiles; run Wave 1 gate |
 | 2 | Live feature/cross-venue integration | Coinbase app production composition | Complete realistic paper adapter | Subwave 2A: no competing live edits; review/merge Task 10. Subwave 2B: serialize execution approval/dispatcher/live hook from Task 11 on that merge before Task 14. |
-| 3 | 3B after Task 15: analytics + execution benches/manifests | 3B after Task 15: Coinbase + paper benches and isolated fuzz workspace | 3B after Task 15: app latency/RSS harness, measurement script, tooling research | 3A serialize Task 15; 3B merge benchmark manifests/root lock and measure; 3C Task 17 docs; 3D Task 18 grouped review |
+| 3 | 3B after Task 15: analytics + execution benches/manifests | 3B after Task 15: Coinbase + paper benches and parser property/seed fixtures | 3B after Task 15: app latency/RSS harness, measurement script, tooling research | 3A serialize Task 15; 3B merge benchmark manifests/root lock and measure; 3C Task 17 stage evidence; 3D Task 18 exact-head handoff into Quarter 1 of 4 |
 
 Shared conflict hotspots are always serialized:
 
@@ -142,13 +166,14 @@ respectively. Task 14 starts only when Tasks 10–13 are complete.
 Wave 3 is also barriered. Subwave 3A runs Task 15 alone and reaches its clean exact-head gate before
 performance work begins. In subwave 3B, Task 16 may use three disjoint lanes: lane A owns analytics
 and execution benches/package manifests; lane B owns Coinbase and paper benches/package manifests
-plus the isolated `fuzz/` workspace; lane C owns the app latency/RSS harness, app manifest request,
-measurement script, and tooling research. No lane edits root `Cargo.toml` or `Cargo.lock`; after all
-three handoffs, the integration owner merges package manifests, resolves the root lock once, runs
-measurements, writes final performance evidence, commits, and runs the exact-head gate. Subwave 3C
-runs Task 17 only after that measured evidence exists. Subwave 3D runs Task 18 only after Task 17's
-docs-inclusive candidate is clean. No review-evidence preparation starts before that exact candidate
-exists.
+plus parser property tests and committed seed fixtures; lane C owns the app latency/RSS harness, app
+manifest request, measurement script, and tooling research. Task 20 of the usable-release plan is
+the sole owner of fuzz workspaces, targets, toolchains, campaigns, and fuzz evidence. No lane edits
+root `Cargo.toml` or `Cargo.lock`; after all three handoffs, the integration owner merges package
+manifests, resolves the root lock once, runs measurements, writes stage performance evidence,
+commits, and runs the exact-head gate. Subwave 3C runs Task 17 only after that measured evidence
+exists. Subwave 3D freezes and hands off Task 18 into the single grouped Quarter 1 of 4 checkpoint;
+it does not dispatch an additional set of independent reviewers.
 
 ## Wave candidate and exact-head integration gates
 
@@ -441,7 +466,7 @@ git commit -m "build(q3): enforce workspace dependency DAG"
 **Files:**
 
 - Create: `crates/market-squawk-domain/src/identifiers/execution.rs`
-- Modify: `crates/market-squawk-domain/src/identifiers.rs`
+- Modify: `crates/market-squawk-domain/src/identifiers/mod.rs`
 - Create: `crates/market-squawk-domain/src/order.rs`
 - Modify: `crates/market-squawk-domain/src/instrument/definition.rs`
 - Modify: `crates/market-squawk-domain/src/lib.rs`
