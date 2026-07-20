@@ -8,21 +8,26 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use super::admission::{
-    LiveRuntimeHealthEvent, LiveRuntimeHealthKind, RegistrationCommand, RegistrationFailure,
-    ShardCommand,
+    LiveRuntimeHealthEvent, LiveRuntimeHealthKind, RegistrationCommand, ShardCommand,
 };
 use super::{LiveRouteConfig, system_timestamp};
 use crate::authority::{RuntimeLease, ShardLeaseOwner};
 use crate::processor::{
     GenerationAuthorityRegistry, GenerationRegistryExitHandle, InstrumentLiveProcessor,
-    LiveApplyError, ProcessorLivenessBinding, ProcessorSnapshotLimits, ProcessorSnapshotSeed,
+    LiveApplyError, ProcessorLivenessBinding,
 };
 use crate::provider_book::BookProcessingScratch;
 use crate::snapshot::{SnapshotBuildError, SnapshotPublisher};
-use crate::{
-    RouteSnapshot, ShardId, ShardLifecycleSnapshot, ShardRoutingVersion, ShardSnapshot,
-    SnapshotDimension, SnapshotLimits,
-};
+use crate::{ShardId, ShardLifecycleSnapshot, ShardRoutingVersion, SnapshotLimits};
+
+#[path = "actor/processing.rs"]
+mod processing;
+#[path = "actor/scheduling.rs"]
+mod scheduling;
+#[path = "actor/snapshot_publication.rs"]
+mod snapshot_publication;
+
+use scheduling::{FairEvent, FairSources, FairTurn, select_fair_event};
 
 #[derive(Debug)]
 struct RouteOwner {
@@ -173,116 +178,6 @@ impl Drop for ShardActor {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum FairTurn {
-    Registration,
-    Market,
-    Snapshot,
-}
-
-impl FairTurn {
-    const fn next(self) -> Self {
-        match self {
-            Self::Registration => Self::Market,
-            Self::Market => Self::Snapshot,
-            Self::Snapshot => Self::Registration,
-        }
-    }
-}
-
-#[derive(Debug)]
-enum FairEvent<R, M> {
-    Cancelled,
-    Registration(Option<R>),
-    Market(Option<M>),
-    SnapshotDue,
-    SnapshotPublish,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SnapshotSchedule {
-    Due,
-    Publish,
-}
-
-struct FairSources<'a, R, M> {
-    cancellation: &'a CancellationToken,
-    registrations: &'a mut mpsc::Receiver<R>,
-    mailbox: &'a mut mpsc::Receiver<M>,
-    registrations_open: bool,
-    mailbox_open: bool,
-    interval: &'a mut tokio::time::Interval,
-}
-
-async fn select_fair_event<R, M>(
-    turn: FairTurn,
-    snapshot_pending: bool,
-    sources: FairSources<'_, R, M>,
-) -> FairEvent<R, M> {
-    async fn snapshot_event(
-        snapshot_pending: bool,
-        interval: &mut tokio::time::Interval,
-    ) -> SnapshotSchedule {
-        if snapshot_pending {
-            SnapshotSchedule::Publish
-        } else {
-            interval.tick().await;
-            SnapshotSchedule::Due
-        }
-    }
-
-    match turn {
-        FairTurn::Registration => {
-            tokio::select! {
-                biased;
-                () = sources.cancellation.cancelled() => FairEvent::Cancelled,
-                command = sources.registrations.recv(), if sources.registrations_open => {
-                    FairEvent::Registration(command)
-                }
-                command = sources.mailbox.recv(), if sources.mailbox_open => {
-                    FairEvent::Market(command)
-                },
-                event = snapshot_event(snapshot_pending, sources.interval) => match event {
-                    SnapshotSchedule::Due => FairEvent::SnapshotDue,
-                    SnapshotSchedule::Publish => FairEvent::SnapshotPublish,
-                },
-            }
-        }
-        FairTurn::Market => {
-            tokio::select! {
-                biased;
-                () = sources.cancellation.cancelled() => FairEvent::Cancelled,
-                command = sources.mailbox.recv(), if sources.mailbox_open => {
-                    FairEvent::Market(command)
-                },
-                event = snapshot_event(snapshot_pending, sources.interval) => match event {
-                    SnapshotSchedule::Due => FairEvent::SnapshotDue,
-                    SnapshotSchedule::Publish => FairEvent::SnapshotPublish,
-                },
-                command = sources.registrations.recv(), if sources.registrations_open => {
-                    FairEvent::Registration(command)
-                }
-            }
-        }
-        FairTurn::Snapshot => {
-            tokio::select! {
-                biased;
-                () = sources.cancellation.cancelled() => FairEvent::Cancelled,
-                event = snapshot_event(snapshot_pending, sources.interval) => match event {
-                    SnapshotSchedule::Due => FairEvent::SnapshotDue,
-                    SnapshotSchedule::Publish => FairEvent::SnapshotPublish,
-                },
-                command = sources.registrations.recv(), if sources.registrations_open => {
-                    FairEvent::Registration(command)
-                }
-                command = sources.mailbox.recv(), if sources.mailbox_open => {
-                    FairEvent::Market(command)
-                },
-            }
-        }
-    }
-}
-
 impl ShardActor {
     fn try_new(input: ShardActorInput) -> Result<Self, ActorError> {
         let shard_lease = input.shard_owner.lease();
@@ -426,193 +321,6 @@ impl ShardActor {
         Ok(())
     }
 
-    fn register(&mut self, command: RegistrationCommand) {
-        let result = self.register_inner(&command);
-        if result.is_err() {
-            self.health_revision = self.health_revision.saturating_add(1);
-            self.emit_health(
-                LiveRuntimeHealthKind::GenerationRejected,
-                Some(command.route.clone()),
-            );
-        }
-        if let Err(Ok(admission)) = command.response.send(result) {
-            admission.invalidate_on_admission_failure();
-        }
-    }
-
-    fn register_inner(
-        &mut self,
-        command: &RegistrationCommand,
-    ) -> Result<crate::processor::GenerationAdmission, RegistrationFailure> {
-        let now = system_timestamp().map_err(|_| RegistrationFailure::NotCurrent)?;
-        let owner = self
-            .routes
-            .get_mut(&command.route)
-            .ok_or(RegistrationFailure::UnknownRoute)?;
-        owner
-            .generations
-            .bind_current(&command.source, now)
-            .map_err(|error| match error {
-                LiveApplyError::GenerationCapacityExhausted => RegistrationFailure::Capacity,
-                _ => RegistrationFailure::NotCurrent,
-            })
-    }
-
-    fn process(&mut self, command: ShardCommand) -> Result<(), ActorError> {
-        let admission = command.admission.clone();
-        match self.process_inner(command) {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                admission.invalidate_on_admission_failure();
-                self.health_revision = self.health_revision.saturating_add(1);
-                self.emit_health(LiveRuntimeHealthKind::ProcessingRejected, None);
-                if error.is_fatal() { Err(error) } else { Ok(()) }
-            }
-        }
-    }
-
-    fn process_inner(&mut self, command: ShardCommand) -> Result<(), ActorError> {
-        self._guard.validate()?;
-        let now = system_timestamp().map_err(|_| ActorError::ClockRange)?;
-        command
-            .admission
-            .validate_at(now)
-            .map_err(|_| ActorError::GenerationNotCurrent)?;
-        let key = crate::ShardKey::new(
-            command.batch.key().venue().clone(),
-            command.batch.key().instrument(),
-        );
-        let admission = command.admission.clone();
-        let _retained_bytes = command.retained_bytes;
-        let mut publish_after_batch = false;
-        {
-            let Some(owner) = self.routes.get_mut(&key) else {
-                admission.invalidate_on_admission_failure();
-                return Err(ActorError::UnknownRoute);
-            };
-            let mut cursor = match owner
-                .processor
-                .accept_batch(command.batch, &command.admission)
-            {
-                Ok(cursor) => cursor,
-                Err(error) => {
-                    admission.invalidate_on_admission_failure();
-                    return Err(error.into());
-                }
-            };
-            loop {
-                let applied = match owner
-                    .processor
-                    .apply_next(&mut cursor, &mut self.book_scratch)
-                {
-                    Ok(Some(applied)) => applied,
-                    Ok(None) => break,
-                    Err(error) => {
-                        admission.invalidate_on_admission_failure();
-                        return Err(error.into());
-                    }
-                };
-                if let Some(authority) = applied.authority.as_ref() {
-                    owner.processor.validate_applied_current(authority)?;
-                    // The bounded feature hook linearizes here.
-                    owner.processor.validate_applied_current(authority)?;
-                    // NoStrategy produces no order intent, so no capability is minted.
-                }
-                self.events_since_snapshot = self.events_since_snapshot.saturating_add(1);
-                self.dirty = true;
-                publish_after_batch |= self.events_since_snapshot >= self.snapshot_event_trigger;
-            }
-        }
-        if publish_after_batch {
-            self.publish_snapshot(ShardLifecycleSnapshot::Ready)?;
-        }
-        Ok(())
-    }
-
-    fn publish_snapshot(&mut self, lifecycle: ShardLifecycleSnapshot) -> Result<(), ActorError> {
-        let next = self
-            .snapshot_revision
-            .get()
-            .checked_add(1)
-            .and_then(NonZeroU64::new)
-            .ok_or(SnapshotBuildError::RevisionExhausted)?;
-        let evaluated_at = system_timestamp().map_err(|_| SnapshotBuildError::ClockRange)?;
-        let mut route_keys = self.routes.keys().cloned().collect::<Vec<_>>();
-        route_keys.sort_by(|left, right| {
-            left.venue()
-                .as_str()
-                .cmp(right.venue().as_str())
-                .then_with(|| left.instrument().cmp(&right.instrument()))
-        });
-        let available_routes = route_keys.len();
-        let route_limit = self.snapshot_limits.maximum_routes().get();
-        let mut routes = Vec::new();
-        routes
-            .try_reserve(route_limit.min(available_routes))
-            .map_err(|_| ActorError::Allocation)?;
-        let mut retained_bytes = std::mem::size_of::<ShardSnapshot>();
-        for key in route_keys.into_iter().take(route_limit) {
-            let remaining = usize::try_from(self.snapshot_limits.maximum_retained_bytes().get())
-                .map_err(|_| SnapshotBuildError::RetainedSizeOverflow)?
-                .checked_sub(retained_bytes)
-                .ok_or(SnapshotBuildError::RetainedSizeOverflow)?;
-            let minimum = std::mem::size_of::<ProcessorSnapshotSeed>();
-            if remaining < minimum {
-                break;
-            }
-            let owner = self.routes.get(&key).ok_or(ActorError::UnknownRoute)?;
-            let seed = owner
-                .processor
-                .snapshot_seed(ProcessorSnapshotLimits::try_new(
-                    self.snapshot_limits.maximum_streams_per_route().get(),
-                    self.snapshot_limits.maximum_statuses_per_route().get(),
-                    self.snapshot_limits.maximum_levels_per_side().get() as usize,
-                    remaining,
-                )?)?;
-            let candidate_retained_bytes = retained_bytes
-                .checked_add(seed.retained_bytes)
-                .and_then(|value| value.checked_add(std::mem::size_of::<RouteSnapshot>()))
-                .and_then(|value| value.checked_add(key.venue().as_str().len()))
-                .ok_or(SnapshotBuildError::RetainedSizeOverflow)?;
-            if candidate_retained_bytes
-                > self.snapshot_limits.maximum_retained_bytes().get() as usize
-            {
-                break;
-            }
-            retained_bytes = candidate_retained_bytes;
-            routes.push(seed.into_route(key));
-        }
-        let route_dimension =
-            SnapshotDimension::from_counts(available_routes, routes.len(), route_limit)?;
-        let published_at = system_timestamp().map_err(|_| SnapshotBuildError::ClockRange)?;
-        let snapshot = ShardSnapshot {
-            routing_version: self.routing_version,
-            shard_count: self.shard.count(),
-            runtime_incarnation: self.runtime_incarnation,
-            shard_id: self.shard,
-            snapshot_revision: next,
-            health_revision: self.health_revision,
-            lifecycle,
-            evaluated_at,
-            published_at,
-            routes: routes.into_boxed_slice(),
-            route_dimension,
-            retained_bytes: u64::try_from(retained_bytes)
-                .map_err(|_| SnapshotBuildError::RetainedSizeOverflow)?,
-        };
-        self.publisher.publish(snapshot)?;
-        let notification_drops = self.publisher.dropped_notifications();
-        if notification_drops > self.observed_notification_drops {
-            self.observed_notification_drops = notification_drops;
-            self.health_revision = self.health_revision.saturating_add(1);
-            self.emit_health(LiveRuntimeHealthKind::SnapshotNotificationDropped, None);
-        }
-        self.snapshot_revision = next;
-        self.events_since_snapshot = 0;
-        self.dirty = false;
-        Ok(())
-    }
-
     fn emit_health(&self, kind: LiveRuntimeHealthKind, route: Option<crate::ShardKey>) {
         let Ok(observed_at) = system_timestamp() else {
             return;
@@ -694,85 +402,5 @@ impl ActorError {
             ),
             Self::GenerationNotCurrent => false,
         }
-    }
-}
-
-#[cfg(test)]
-mod fairness_tests {
-    use super::{FairEvent, FairSources, FairTurn, select_fair_event};
-    use tokio::sync::mpsc;
-    use tokio::time::{Duration, advance};
-    use tokio_util::sync::CancellationToken;
-
-    #[tokio::test(start_paused = true)]
-    async fn perpetually_ready_snapshot_work_services_both_queues_within_one_rotation() {
-        let (registrations, mut registration_rx) = mpsc::channel(1);
-        let (market, mut market_rx) = mpsc::channel(1);
-        assert!(registrations.send(11_u8).await.is_ok());
-        assert!(market.send(22_u8).await.is_ok());
-        let cancellation = CancellationToken::new();
-        let mut interval = tokio::time::interval(Duration::from_millis(1));
-        interval.tick().await;
-        advance(Duration::from_secs(1)).await;
-
-        let mut turn = FairTurn::Snapshot;
-        let mut saw_registration = false;
-        let mut saw_market = false;
-        let mut unexpected = None;
-        for _ in 0..3 {
-            let event = select_fair_event(
-                turn,
-                true,
-                FairSources {
-                    cancellation: &cancellation,
-                    registrations: &mut registration_rx,
-                    mailbox: &mut market_rx,
-                    registrations_open: true,
-                    mailbox_open: true,
-                    interval: &mut interval,
-                },
-            )
-            .await;
-            turn = turn.next();
-            match event {
-                FairEvent::SnapshotPublish => {}
-                FairEvent::Registration(Some(11)) => saw_registration = true,
-                FairEvent::Market(Some(22)) => saw_market = true,
-                other => unexpected = Some(format!("{other:?}")),
-            }
-        }
-        assert!(unexpected.is_none(), "unexpected event: {unexpected:?}");
-        assert!(saw_registration);
-        assert!(saw_market);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn cancellation_wins_when_snapshot_and_both_queues_are_ready() {
-        let (registrations, mut registration_rx) = mpsc::channel(1);
-        let (market, mut market_rx) = mpsc::channel(1);
-        assert!(registrations.send(1_u8).await.is_ok());
-        assert!(market.send(2_u8).await.is_ok());
-        let cancellation = CancellationToken::new();
-        cancellation.cancel();
-        let mut interval = tokio::time::interval(Duration::from_millis(1));
-        interval.tick().await;
-        advance(Duration::from_secs(1)).await;
-
-        assert!(matches!(
-            select_fair_event(
-                FairTurn::Snapshot,
-                true,
-                FairSources {
-                    cancellation: &cancellation,
-                    registrations: &mut registration_rx,
-                    mailbox: &mut market_rx,
-                    registrations_open: true,
-                    mailbox_open: true,
-                    interval: &mut interval,
-                },
-            )
-            .await,
-            FairEvent::Cancelled
-        ));
     }
 }
