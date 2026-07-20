@@ -46,7 +46,7 @@ use authority::RootAuthority;
 use authority::acquire_root_authority;
 pub(crate) use authority::{
     ActivatedRootAuthority, ArtifactRootIdentity, PreparedRootAuthority,
-    RootBindingCheckpointInternal, VerifiedLegacyRootAuthority,
+    RootBindingCheckpointInternal, VerifiedLegacyRootAuthority, VerifiedRestoreControlSubset,
 };
 pub(crate) use pinned::VerifiedPinnedObject;
 pub use recovery::OrphanRecoveryReport;
@@ -146,6 +146,20 @@ impl ParquetObjectStore {
         create_lock: bool,
     ) -> Result<PreparedRootAuthority, ParquetStoreError> {
         authority::acquire_prepared_root_authority(root, create_lock)
+    }
+
+    pub(crate) fn restore_root_endpoint(
+        root: &ArtifactRoot,
+    ) -> Result<crate::authority_transition::RootEndpointIdentity, ParquetStoreError> {
+        authority::restore_root_endpoint(root)
+    }
+
+    pub(crate) fn validate_restore_control_subset(
+        directory: &Dir,
+        prepared: &crate::authority_transition::PreparedAuthorityTransition,
+        catalog_bound: bool,
+    ) -> Result<VerifiedRestoreControlSubset, ParquetStoreError> {
+        authority::validate_restore_control_subset(directory, prepared, catalog_bound)
     }
 
     pub(crate) fn from_activated_root(

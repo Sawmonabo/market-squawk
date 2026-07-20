@@ -6,6 +6,7 @@ mod evidence;
 mod publication;
 mod query_artifacts;
 mod records;
+mod restore_logical;
 mod runs;
 mod storage;
 mod types;
@@ -16,10 +17,12 @@ use rusqlite::{Connection, OpenFlags};
 
 use self::authority::exact_catalog_file_binding;
 pub use self::backup::BackupReceipt;
-pub(crate) use self::backup::{InstalledBackupCatalog, VerifiedBackupCatalog};
+pub(crate) use self::backup::{
+    InstalledBackupCatalog, InstalledCatalogState, VerifiedBackupCatalog,
+};
 use self::storage::{
     apply_migrations, initialize_catalog_identity, pragma_bool, prepare_local_path,
-    verify_integrity,
+    verify_integrity, verify_migration_identities,
 };
 use self::types::WriterPermit;
 pub use self::types::{
@@ -32,6 +35,7 @@ pub(crate) use query_artifacts::QueryArtifactPublisher;
 pub use query_artifacts::{
     QueryArtifactReservation, QueryArtifactReservationInput, QueryArtifactResult,
 };
+pub(crate) use restore_logical::RestoreCatalogBaseline;
 pub use runs::{CatalogAuthority, ResumedIngest};
 
 impl Catalog {
@@ -45,14 +49,14 @@ impl Catalog {
             .location
             .prepare_catalog_file()
             .map_err(map_catalog_location_error)?;
-        Self::open_with_capabilities(config, cross_process_writer, catalog_file)
+        Self::open_with_capabilities(config, cross_process_writer, catalog_file, true)
     }
 
     pub(super) fn open_installed(
         config: CatalogConfig,
         installed: InstalledBackupCatalog,
-    ) -> Result<Self, CatalogError> {
-        let (installed, location, _receipt) = installed.into_parts();
+    ) -> Result<(Self, InstalledCatalogState), CatalogError> {
+        let (installed, location, _receipt, state) = installed.into_parts();
         if config.location.path() != location.path() {
             return Err(CatalogError::UnsafePath);
         }
@@ -64,13 +68,15 @@ impl Catalog {
             .validate_for_open()
             .map_err(map_catalog_location_error)?;
         let (catalog_file, cross_process_writer) = installed.into_parts();
-        Self::open_with_capabilities(config, cross_process_writer, catalog_file)
+        Self::open_with_capabilities(config, cross_process_writer, catalog_file, false)
+            .map(|catalog| (catalog, state))
     }
 
     fn open_with_capabilities(
         config: CatalogConfig,
         cross_process_writer: CatalogWriterGuard,
         catalog_file: CatalogFileGuard,
+        initialize: bool,
     ) -> Result<Self, CatalogError> {
         config
             .location
@@ -85,6 +91,8 @@ impl Catalog {
         let sqlite_length_limit = i32::try_from(config.result_bytes.max_record_bytes())
             .map_err(|_| CatalogError::InvalidConfiguration)?;
         connection.set_limit(Limit::SQLITE_LIMIT_LENGTH, sqlite_length_limit)?;
+        connection.busy_timeout(config.busy_timeout)?;
+        connection.pragma_update(None, "trusted_schema", "OFF")?;
         catalog_file
             .validate_identity()
             .map_err(map_catalog_location_error)?;
@@ -94,22 +102,32 @@ impl Catalog {
                 .map_err(map_catalog_location_error)?,
             &path,
         )?;
-        initialize_catalog_identity(&connection)?;
+        if initialize {
+            initialize_catalog_identity(&connection)?;
+        } else {
+            verify_migration_identities(&connection)?;
+            verify_integrity(&connection)?;
+        }
         config
             .location
             .validate_for_open()
             .map_err(|_| CatalogError::UnsafePath)?;
-        connection.busy_timeout(config.busy_timeout)?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
-        connection.pragma_update(None, "trusted_schema", "OFF")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         connection.pragma_update(None, "wal_autocheckpoint", 1_000_i64)?;
-        let journal_mode: String =
-            connection.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
+        let journal_mode: String = if initialize {
+            connection.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?
+        } else {
+            connection.query_row("PRAGMA journal_mode", [], |row| row.get(0))?
+        };
         if !journal_mode.eq_ignore_ascii_case("wal") {
             return Err(CatalogError::UnsafeJournalMode);
         }
-        apply_migrations(&mut connection, artifact_root_binding)?;
+        if initialize {
+            apply_migrations(&mut connection, artifact_root_binding)?;
+        } else {
+            verify_migration_identities(&connection)?;
+        }
         verify_integrity(&connection)?;
         Ok(Self {
             connection,
@@ -155,6 +173,90 @@ impl Catalog {
     /// Runs SQLite integrity and foreign-key checks.
     pub fn integrity_check(&self) -> Result<(), CatalogError> {
         verify_integrity(&self.connection)
+    }
+
+    pub(crate) fn checkpoint_restore_state(&self) -> Result<BackupReceipt, CatalogError> {
+        let (busy, log, checkpointed): (i64, i64, i64) =
+            self.connection
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?;
+        if busy != 0 || log != 0 || checkpointed != 0 {
+            return Err(CatalogError::BackupRestoreConflict);
+        }
+        self._catalog_file
+            .validate_checkpointed_sidecars()
+            .map_err(map_catalog_location_error)?;
+        let file = self
+            ._catalog_file
+            .try_clone_file()
+            .map_err(map_catalog_location_error)?;
+        self._catalog_file
+            .validate_identity()
+            .map_err(map_catalog_location_error)?;
+        self.integrity_check()?;
+        self._catalog_file
+            .validate_checkpointed_sidecars()
+            .map_err(map_catalog_location_error)?;
+        self::backup::receipt_for_file(&file)
+    }
+
+    pub(crate) fn acquire_restore_exclusive_locking(&self) -> Result<(), CatalogError> {
+        // SQLite retains locks after a transaction in exclusive locking mode. Restore releases
+        // this mode only after the exact Bound state and artifact root are activated. See:
+        // https://www.sqlite.org/pragma.html#pragma_locking_mode
+        let mode: String =
+            self.connection
+                .query_row("PRAGMA main.locking_mode=EXCLUSIVE", [], |row| row.get(0))?;
+        if !mode.eq_ignore_ascii_case("exclusive") {
+            return Err(CatalogError::BackupRestoreConflict);
+        }
+        self.connection.execute_batch("BEGIN EXCLUSIVE; COMMIT;")?;
+        let retained: String =
+            self.connection
+                .query_row("PRAGMA main.locking_mode", [], |row| row.get(0))?;
+        if !retained.eq_ignore_ascii_case("exclusive") {
+            return Err(CatalogError::BackupRestoreConflict);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn release_restore_exclusive_locking(&self) -> Result<(), CatalogError> {
+        let mode: String =
+            self.connection
+                .query_row("PRAGMA main.locking_mode=NORMAL", [], |row| row.get(0))?;
+        if !mode.eq_ignore_ascii_case("normal") {
+            return Err(CatalogError::BackupRestoreConflict);
+        }
+        self.connection
+            .query_row("SELECT rootpage FROM sqlite_schema LIMIT 1", [], |_| Ok(()))?;
+        let released: String =
+            self.connection
+                .query_row("PRAGMA main.locking_mode", [], |row| row.get(0))?;
+        if !released.eq_ignore_ascii_case("normal") {
+            return Err(CatalogError::BackupRestoreConflict);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn revalidate_restore_state(
+        &self,
+        expected: BackupReceipt,
+    ) -> Result<(), CatalogError> {
+        self._catalog_file
+            .validate_checkpointed_sidecars()
+            .map_err(map_catalog_location_error)?;
+        let file = self
+            ._catalog_file
+            .try_clone_file()
+            .map_err(map_catalog_location_error)?;
+        if self::backup::receipt_for_file(&file)? != expected {
+            return Err(CatalogError::BackupRestoreConflict);
+        }
+        self.integrity_check()?;
+        self._catalog_file
+            .validate_checkpointed_sidecars()
+            .map_err(map_catalog_location_error)
     }
 }
 

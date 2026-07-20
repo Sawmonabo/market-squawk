@@ -20,7 +20,7 @@ const BACKUP_HASH_BUFFER_BYTES: usize = 64 * 1024;
 
 mod restore;
 
-pub(crate) use restore::{InstalledBackupCatalog, VerifiedBackupCatalog};
+pub(crate) use restore::{InstalledBackupCatalog, InstalledCatalogState, VerifiedBackupCatalog};
 
 /// Exact, path-free identity for one verified SQLite backup payload.
 #[derive(Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
@@ -277,7 +277,7 @@ fn backup_cleanup_pending(receipt: BackupReceipt) -> CatalogError {
     CatalogError::BackupPublishedWithCleanupPending { receipt }
 }
 
-fn receipt_for_file(file: &File) -> Result<BackupReceipt, CatalogError> {
+pub(super) fn receipt_for_file(file: &File) -> Result<BackupReceipt, CatalogError> {
     let expected_length = file.metadata()?.len();
     let mut reader = file.try_clone()?;
     reader.seek(SeekFrom::Start(0))?;

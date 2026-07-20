@@ -21,7 +21,7 @@ use crate::authority_transition::evidence::{
 };
 use crate::authority_transition::restore::{
     ReceiptValidatedRestoreEvidence, RestoreArtifactMode, RestoreValidationError,
-    materialize_verified_restore, validate_restore_evidence,
+    VerifiedRestoreHandoff, materialize_verified_restore, validate_restore_evidence,
 };
 use crate::authority_transition::{
     ArtifactInventoryDigest, AuthorityEventDigest, AuthorityEvidenceDigest, AuthorityGeneration,
@@ -330,30 +330,90 @@ impl VerifiedAnalyticalBackup {
         target: AnalyticalRestoreTarget,
         cancellation: &CancellationToken,
     ) -> Result<AnalyticalDataService, AnalyticalBackupError> {
+        let (handoff, catalog_location, max_objects_per_generation, object_config) =
+            self.prepare_restore_handoff(target, cancellation)?;
+        let (authority, objects) = AuthorityTransitionService::restore(handoff, object_config)
+            .map_err(|_| AnalyticalBackupError::RestoreIndeterminate)?;
+        let manifests =
+            AnalyticalManifestCatalog::open(&catalog_location, max_objects_per_generation)?;
+        Ok(AnalyticalDataService::from_active_parts(
+            authority, manifests, objects,
+        ))
+    }
+
+    fn prepare_restore_handoff(
+        self,
+        target: AnalyticalRestoreTarget,
+        cancellation: &CancellationToken,
+    ) -> Result<
+        (
+            VerifiedRestoreHandoff,
+            CatalogLocation,
+            usize,
+            ObjectStoreConfig,
+        ),
+        AnalyticalBackupError,
+    > {
         if cancellation.is_cancelled() {
             return Err(AnalyticalBackupError::Cancelled);
         }
+        let catalog_baseline =
+            Catalog::verified_restore_baseline(&self.source_catalog, cancellation).map_err(
+                |error| {
+                    if matches!(error, CatalogError::AnalyticalEvidenceCancelled) {
+                        AnalyticalBackupError::Cancelled
+                    } else {
+                        AnalyticalBackupError::Catalog(error)
+                    }
+                },
+            )?;
         let catalog_location = target.catalog.location().clone();
+        let target_root = ParquetObjectStore::restore_root_endpoint(&target.artifacts)
+            .map_err(|_| AnalyticalBackupError::RestoreIndeterminate)?;
         let installed =
             Catalog::install_verified_backup_no_replace(&self.source_catalog, &catalog_location)
                 .map_err(map_catalog_restore_install_error)?;
+        let target_catalog = AuthorityTransitionService::admit_restore_catalog(
+            installed,
+            target.catalog.clone(),
+            self.receipt(),
+            target_root,
+            self.source_evidence.request(),
+            catalog_baseline,
+            cancellation,
+        )
+        .map_err(|_| AnalyticalBackupError::RestoreIndeterminate)?;
         let handoff = materialize_verified_restore(
             self.source_catalog,
-            installed,
+            target_catalog,
             self.source_evidence,
             &target.artifacts,
             target.mode.into(),
             cancellation,
         )
         .map_err(|_| AnalyticalBackupError::RestoreIndeterminate)?;
-        let (authority, objects) =
-            AuthorityTransitionService::restore(handoff, target.catalog, target.objects)
-                .map_err(|_| AnalyticalBackupError::RestoreIndeterminate)?;
-        let manifests =
-            AnalyticalManifestCatalog::open(&catalog_location, target.max_objects_per_generation)?;
-        Ok(AnalyticalDataService::from_active_parts(
-            authority, manifests, objects,
+        Ok((
+            handoff,
+            catalog_location,
+            target.max_objects_per_generation,
+            target.objects,
         ))
+    }
+
+    #[cfg(test)]
+    fn restore_fault_fixture(
+        self,
+        target: AnalyticalRestoreTarget,
+        cancellation: &CancellationToken,
+    ) -> Result<(), AnalyticalBackupError> {
+        let (handoff, _catalog_location, _max_objects_per_generation, object_config) =
+            self.prepare_restore_handoff(target, cancellation)?;
+        AuthorityTransitionService::restore_fault_fixture(
+            handoff,
+            object_config,
+            crate::authority_transition::FirstBindCheckpoint::BindingFinal,
+        )
+        .map_err(|_| AnalyticalBackupError::RestoreIndeterminate)
     }
 }
 
@@ -970,6 +1030,54 @@ mod tests {
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
+    struct EmptyBackupFixture {
+        directory: tempfile::TempDir,
+        location: AnalyticalBackupLocation,
+        receipt: AnalyticalBackupBundleReceipt,
+        limits: AnalyticalBackupLimits,
+    }
+
+    async fn empty_backup_fixture() -> TestResult<EmptyBackupFixture> {
+        let directory = tempfile::tempdir()?;
+        let source_paths = LocalPaths::prepare(directory.path().join("source"))?;
+        let source_catalog = source_paths.catalog()?.clone();
+        let source = AnalyticalDataService::initialize(
+            CatalogAuthority::open(catalog_config(source_catalog.clone())?)?,
+            AnalyticalManifestCatalog::open(&source_catalog, 8)?,
+            source_paths.artifacts()?.clone(),
+            object_config()?,
+        )?;
+        let backup_paths = LocalPaths::prepare(directory.path().join("backup"))?;
+        let location = AnalyticalBackupLocation::try_new(
+            backup_paths.catalog()?.clone(),
+            backup_paths.artifacts()?.clone(),
+        )?;
+        let limits = AnalyticalBackupLimits::try_new(
+            32,
+            128,
+            8 * 1024 * 1024,
+            8 * 1024 * 1024,
+            1024 * 1024,
+        )?;
+        let created = source
+            .backup_service()
+            .create(
+                location.clone(),
+                Timestamp::from_unix_nanos(100),
+                limits,
+                &CancellationToken::new(),
+            )
+            .await?;
+        let receipt = created.receipt();
+        drop(created);
+        Ok(EmptyBackupFixture {
+            directory,
+            location,
+            receipt,
+            limits,
+        })
+    }
+
     #[tokio::test]
     async fn service_creates_reopens_and_restores_one_exact_bundle() -> TestResult {
         let directory = tempfile::tempdir()?;
@@ -1034,6 +1142,187 @@ mod tests {
             object_config()?,
         )?;
         drop(reopened);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restore_rejects_a_catalog_that_aliases_the_retained_backup() -> TestResult {
+        let fixture = empty_backup_fixture().await?;
+        let cancellation = CancellationToken::new();
+        let verified = AnalyticalBackupService::open_verified(
+            fixture.location.clone(),
+            fixture.receipt,
+            fixture.limits,
+            &cancellation,
+        )?;
+        let target_paths = LocalPaths::prepare(fixture.directory.path().join("target"))?;
+        let result = verified.restore(
+            AnalyticalRestoreTarget::try_new(
+                catalog_config(fixture.location.catalog().clone())?,
+                target_paths.artifacts()?.clone(),
+                8,
+                object_config()?,
+                AnalyticalRestoreMode::Fresh,
+            )?,
+            &cancellation,
+        );
+
+        assert!(result.is_err());
+        assert!(
+            std::fs::read_dir(target_paths.artifacts()?.root())?
+                .next()
+                .is_none()
+        );
+        crate::Catalog::verify_backup(
+            fixture.location.catalog(),
+            fixture.receipt.catalog_backup(),
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn same_receipt_retry_recovers_a_durable_prepared_restore() -> TestResult {
+        let fixture = empty_backup_fixture().await?;
+        let cancellation = CancellationToken::new();
+        let restored_paths = LocalPaths::prepare(fixture.directory.path().join("restored"))?;
+        let restored_catalog = restored_paths.catalog()?.clone();
+
+        AnalyticalBackupService::open_verified(
+            fixture.location.clone(),
+            fixture.receipt,
+            fixture.limits,
+            &cancellation,
+        )?
+        .restore_fault_fixture(
+            AnalyticalRestoreTarget::try_new(
+                catalog_config(restored_catalog.clone())?,
+                restored_paths.artifacts()?.clone(),
+                8,
+                object_config()?,
+                AnalyticalRestoreMode::Fresh,
+            )?,
+            &cancellation,
+        )?;
+
+        let restored = AnalyticalBackupService::open_verified(
+            fixture.location.clone(),
+            fixture.receipt,
+            fixture.limits,
+            &cancellation,
+        )?
+        .restore(
+            AnalyticalRestoreTarget::try_new(
+                catalog_config(restored_catalog.clone())?,
+                restored_paths.artifacts()?.clone(),
+                8,
+                object_config()?,
+                AnalyticalRestoreMode::ResumeExactSubset,
+            )?,
+            &cancellation,
+        )?;
+        drop(restored);
+        let completed_retry = AnalyticalBackupService::open_verified(
+            fixture.location,
+            fixture.receipt,
+            fixture.limits,
+            &cancellation,
+        )?
+        .restore(
+            AnalyticalRestoreTarget::try_new(
+                catalog_config(restored_catalog.clone())?,
+                restored_paths.artifacts()?.clone(),
+                8,
+                object_config()?,
+                AnalyticalRestoreMode::ResumeExactSubset,
+            )?,
+            &cancellation,
+        )?;
+        drop(completed_retry);
+        let reopened = AnalyticalDataService::open(
+            CatalogAuthority::open(catalog_config(restored_catalog.clone())?)?,
+            AnalyticalManifestCatalog::open(&restored_catalog, 8)?,
+            restored_paths.artifacts()?.clone(),
+            object_config()?,
+        )?;
+        drop(reopened);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restore_retry_rejects_unrelated_wal_and_main_catalog_state() -> TestResult {
+        let fixture = empty_backup_fixture().await?;
+        let cancellation = CancellationToken::new();
+        let restored_paths = LocalPaths::prepare(fixture.directory.path().join("restored"))?;
+        let restored_catalog = restored_paths.catalog()?.clone();
+
+        AnalyticalBackupService::open_verified(
+            fixture.location.clone(),
+            fixture.receipt,
+            fixture.limits,
+            &cancellation,
+        )?
+        .restore_fault_fixture(
+            AnalyticalRestoreTarget::try_new(
+                catalog_config(restored_catalog.clone())?,
+                restored_paths.artifacts()?.clone(),
+                8,
+                object_config()?,
+                AnalyticalRestoreMode::Fresh,
+            )?,
+            &cancellation,
+        )?;
+
+        let injection = rusqlite::Connection::open(restored_catalog.path())?;
+        injection.busy_timeout(Duration::from_millis(750))?;
+        injection.execute_batch("CREATE TABLE restore_injected(value INTEGER NOT NULL);")?;
+        let wal = restored_catalog
+            .path()
+            .with_file_name("catalog.sqlite3-wal");
+        assert!(std::fs::metadata(&wal)?.len() > 0);
+
+        let retry = AnalyticalBackupService::open_verified(
+            fixture.location.clone(),
+            fixture.receipt,
+            fixture.limits,
+            &cancellation,
+        )?
+        .restore(
+            AnalyticalRestoreTarget::try_new(
+                catalog_config(restored_catalog.clone())?,
+                restored_paths.artifacts()?.clone(),
+                8,
+                object_config()?,
+                AnalyticalRestoreMode::ResumeExactSubset,
+            )?,
+            &cancellation,
+        );
+        assert!(retry.is_err());
+        assert!(std::fs::metadata(&wal)?.len() > 0);
+
+        injection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+        drop(injection);
+        assert!(
+            std::fs::metadata(&wal)
+                .map(|metadata| metadata.len() == 0)
+                .unwrap_or(true)
+        );
+        let main_retry = AnalyticalBackupService::open_verified(
+            fixture.location,
+            fixture.receipt,
+            fixture.limits,
+            &cancellation,
+        )?
+        .restore(
+            AnalyticalRestoreTarget::try_new(
+                catalog_config(restored_catalog)?,
+                restored_paths.artifacts()?.clone(),
+                8,
+                object_config()?,
+                AnalyticalRestoreMode::ResumeExactSubset,
+            )?,
+            &cancellation,
+        );
+        assert!(main_retry.is_err());
         Ok(())
     }
 

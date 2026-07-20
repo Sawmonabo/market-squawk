@@ -6,9 +6,10 @@ use std::path::Path;
 
 use market_squawk_domain::{SourceId, Timestamp};
 use rusqlite::{OptionalExtension as _, Row, Transaction, params};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use super::InstalledBackupCatalog;
+use super::RestoreCatalogBaseline;
 use super::publication::{PublishedIngest, publication_for_run};
 use super::storage::{
     AppendOutcome, ResultBudget, append_audit, digest_columns, existing_reservation, parse_digest,
@@ -18,6 +19,7 @@ use super::types::{
     Catalog, CatalogConfig, CatalogError, CatalogLimit, ContractCompletion, IngestReservation,
     IngestRunRecord, IngestRunState,
 };
+use super::{InstalledBackupCatalog, InstalledCatalogState};
 use crate::authority_transition::{
     AuthorityEvidenceDigest, AuthorityMutationToken, AuthoritySnapshot, BoundAuthorityTransition,
     CatalogEndpointIdentity, PreparedAuthorityTransition, RootEndpointIdentity,
@@ -42,9 +44,9 @@ impl CatalogAuthority {
     pub(crate) fn open_installed(
         config: CatalogConfig,
         installed: InstalledBackupCatalog,
-    ) -> Result<Self, CatalogError> {
-        let catalog = Catalog::open_installed(config, installed)?;
-        Ok(Self::from_catalog(catalog))
+    ) -> Result<(Self, InstalledCatalogState), CatalogError> {
+        let (catalog, state) = Catalog::open_installed(config, installed)?;
+        Ok((Self::from_catalog(catalog), state))
     }
 
     fn from_catalog(catalog: Catalog) -> Self {
@@ -111,6 +113,33 @@ impl CatalogAuthority {
         transition: BoundAuthorityTransition,
     ) -> Result<AuthoritySnapshot, CatalogError> {
         self.catalog.append_bound_authority(token, transition)
+    }
+
+    pub(crate) fn checkpoint_restore_state(&self) -> Result<super::BackupReceipt, CatalogError> {
+        self.catalog.checkpoint_restore_state()
+    }
+
+    pub(crate) fn acquire_restore_exclusive_locking(&self) -> Result<(), CatalogError> {
+        self.catalog.acquire_restore_exclusive_locking()
+    }
+
+    pub(crate) fn release_restore_exclusive_locking(&self) -> Result<(), CatalogError> {
+        self.catalog.release_restore_exclusive_locking()
+    }
+
+    pub(crate) fn revalidate_restore_state(
+        &self,
+        expected: super::BackupReceipt,
+    ) -> Result<(), CatalogError> {
+        self.catalog.revalidate_restore_state(expected)
+    }
+
+    pub(crate) fn verify_restore_baseline(
+        &self,
+        expected: RestoreCatalogBaseline,
+        cancellation: &CancellationToken,
+    ) -> Result<(), CatalogError> {
+        self.catalog.verify_restore_baseline(expected, cancellation)
     }
 
     /// Validates and durably admits rights evidence through the composition authority.

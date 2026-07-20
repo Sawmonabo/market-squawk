@@ -12,8 +12,12 @@ use crate::{CatalogAuthority, ObjectStoreConfig, ParquetObjectStore};
 use market_squawk_platform::ArtifactRoot;
 
 use self::restore::{
-    RestoreValidationError, VerifiedRestoreHandoff, target_authority_evidence_from_receipt,
+    RestoreValidationError, VerifiedRestoreCatalogAuthority, VerifiedRestoreHandoff,
+    target_authority_evidence_from_receipt,
 };
+use crate::catalog::RestoreCatalogBaseline;
+use crate::catalog::{InstalledBackupCatalog, InstalledCatalogState};
+use tokio_util::sync::CancellationToken;
 
 pub(crate) mod evidence;
 mod legacy;
@@ -706,16 +710,25 @@ impl AuthorityTransitionService {
 
     pub(crate) fn restore(
         handoff: VerifiedRestoreHandoff,
-        catalog_config: CatalogConfig,
         object_config: ObjectStoreConfig,
     ) -> Result<(CatalogAuthority, ParquetObjectStore), AuthorityTransitionError> {
+        Self::restore_with_checkpoint(handoff, object_config, &mut |_| Ok(()))
+    }
+
+    pub(crate) fn restore_with_checkpoint(
+        handoff: VerifiedRestoreHandoff,
+        object_config: ObjectStoreConfig,
+        checkpoint: &mut impl FnMut(
+            crate::parquet_store::RootBindingCheckpointInternal,
+        ) -> Result<(), ParquetStoreError>,
+    ) -> Result<(CatalogAuthority, ParquetObjectStore), AuthorityTransitionError> {
         let receipt = handoff.receipt();
-        let (source_catalog, installed_catalog, materialized_root, _source_evidence) =
+        let (source_catalog, target_catalog, materialized_root, _source_evidence) =
             handoff.into_retained_parts();
         source_catalog.revalidate()?;
-        let mut authority = CatalogAuthority::open_installed(catalog_config, installed_catalog)?;
-        authority.integrity_check()?;
-        let snapshot = authority.authority_snapshot_without_endpoint()?;
+        target_catalog.revalidate()?;
+        let (mut authority, snapshot, mut catalog_state_receipt, catalog_baseline, cancellation) =
+            target_catalog.into_parts();
         let (artifact_root, retained_directory) = materialized_root.into_retained_capabilities();
         let prepared_root =
             ParquetObjectStore::acquire_prepared_root_authority(artifact_root, true)?;
@@ -756,6 +769,24 @@ impl AuthorityTransitionService {
                 )
                 .ok_or(AuthorityTransitionError::InvalidIdentity)?;
                 authority.append_prepared_authority(&token, prepared.clone())?;
+                let expected = authority.authority_snapshot_without_endpoint()?;
+                let receipt = checkpoint_verified_restore_descendant(
+                    &authority,
+                    &expected,
+                    catalog_baseline,
+                    &cancellation,
+                )?;
+                checkpoint(
+                    crate::parquet_store::RootBindingCheckpointInternal::CatalogPreparedDurable,
+                )?;
+                revalidate_verified_restore_descendant(
+                    &authority,
+                    &expected,
+                    receipt,
+                    catalog_baseline,
+                    &cancellation,
+                )?;
+                catalog_state_receipt = receipt;
                 prepared
             }
             AuthorityState::Prepared { transition, .. }
@@ -776,9 +807,17 @@ impl AuthorityTransitionService {
                     && transition.prepared().evidence_digest() == evidence_digest
                     && transition.prepared().restore_receipt() == Some(&restore_receipt) =>
             {
+                revalidate_verified_restore_descendant(
+                    &authority,
+                    &snapshot,
+                    catalog_state_receipt,
+                    catalog_baseline,
+                    &cancellation,
+                )?;
                 let activated = prepared_root.activate_bound_v2(transition)?;
                 let objects = ParquetObjectStore::from_activated_root(activated, object_config)?;
                 source_catalog.revalidate()?;
+                authority.release_restore_exclusive_locking()?;
                 return Ok((authority, objects));
             }
             AuthorityState::InitializationRequired
@@ -788,15 +827,142 @@ impl AuthorityTransitionService {
                 return Err(AuthorityTransitionError::TransitionConflict);
             }
         };
+        let prepared_snapshot = authority.authority_snapshot_without_endpoint()?;
+        if !matches!(prepared_snapshot.state(), AuthorityState::Prepared { transition, .. }
+            if transition == &prepared)
+        {
+            return Err(AuthorityTransitionError::TransitionConflict);
+        }
         source_catalog.revalidate()?;
-        let evidence = prepared_root.publish_or_recover_v2(&prepared)?;
+        revalidate_verified_restore_descendant(
+            &authority,
+            &prepared_snapshot,
+            catalog_state_receipt,
+            catalog_baseline,
+            &cancellation,
+        )?;
+        let evidence =
+            prepared_root.publish_or_recover_v2_with_checkpoint(&prepared, checkpoint)?;
         source_catalog.revalidate()?;
+        revalidate_verified_restore_descendant(
+            &authority,
+            &prepared_snapshot,
+            catalog_state_receipt,
+            catalog_baseline,
+            &cancellation,
+        )?;
         let bound = evidence.bind(prepared);
         authority.append_bound_authority(&token, bound.clone())?;
+        let expected = authority.authority_snapshot_without_endpoint()?;
+        let receipt = checkpoint_verified_restore_descendant(
+            &authority,
+            &expected,
+            catalog_baseline,
+            &cancellation,
+        )?;
+        checkpoint(crate::parquet_store::RootBindingCheckpointInternal::CatalogBoundDurable)?;
+        revalidate_verified_restore_descendant(
+            &authority,
+            &expected,
+            receipt,
+            catalog_baseline,
+            &cancellation,
+        )?;
         let activated = prepared_root.activate_bound_v2(&bound)?;
         let objects = ParquetObjectStore::from_activated_root(activated, object_config)?;
         source_catalog.revalidate()?;
+        authority.release_restore_exclusive_locking()?;
         Ok((authority, objects))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn restore_fault_fixture(
+        handoff: VerifiedRestoreHandoff,
+        object_config: ObjectStoreConfig,
+        crash_at: FirstBindCheckpoint,
+    ) -> Result<(), AuthorityTransitionError> {
+        let result = Self::restore_with_checkpoint(handoff, object_config, &mut |checkpoint| {
+            if first_bind_checkpoint(checkpoint) == crash_at {
+                Err(ParquetStoreError::FirstBindFaultInjected)
+            } else {
+                Ok(())
+            }
+        });
+        match result {
+            Err(AuthorityTransitionError::Root(ParquetStoreError::FirstBindFaultInjected)) => {
+                Ok(())
+            }
+            Ok(_) | Err(_) => Err(AuthorityTransitionError::TransitionConflict),
+        }
+    }
+
+    pub(crate) fn admit_restore_catalog(
+        installed_catalog: InstalledBackupCatalog,
+        catalog_config: CatalogConfig,
+        receipt: crate::analytical_backup::AnalyticalBackupBundleReceipt,
+        target_root: RootEndpointIdentity,
+        request: self::evidence::EvidenceSnapshotRequest,
+        baseline: RestoreCatalogBaseline,
+        cancellation: &CancellationToken,
+    ) -> Result<VerifiedRestoreCatalogAuthority, AuthorityTransitionError> {
+        let (authority, installed_state) =
+            CatalogAuthority::open_installed(catalog_config, installed_catalog)?;
+        authority.integrity_check()?;
+        let snapshot = authority.authority_snapshot_without_endpoint()?;
+        let target_catalog = authority.catalog_endpoint_identity()?;
+        let evidence_digest =
+            target_authority_evidence_from_receipt(receipt, target_catalog, target_root)?;
+        let generation = receipt
+            .source_authority_generation()
+            .get()
+            .checked_add(1)
+            .and_then(AuthorityGeneration::try_new)
+            .ok_or(AuthorityTransitionError::InvalidIdentity)?;
+        let restore_receipt = restore_receipt_fields(receipt);
+        let source_state = matches!(snapshot.state(),
+            AuthorityState::Bound { head, transition }
+                if head.event_digest() == receipt.source_authority_event()
+                    && transition.prepared().target_catalog_identity()
+                        == receipt.source_catalog_identity()
+                    && transition.prepared().authority_generation()
+                        == receipt.source_authority_generation()
+                    && transition.prepared().evidence_digest()
+                        == receipt.source_authority_evidence()
+                    && transition.stable_root_identity() == receipt.source_root_identity()
+        );
+        let target_state = matches!(snapshot.state(),
+            AuthorityState::Prepared { transition, .. }
+                if transition.kind() == AuthorityTransitionKind::BackupRestore
+                    && transition.authority_generation() == generation
+                    && transition.target_catalog_identity() == target_catalog
+                    && transition.target_root_endpoint_identity() == target_root
+                    && transition.evidence_digest() == evidence_digest
+                    && transition.restore_receipt() == Some(&restore_receipt)
+        ) || matches!(snapshot.state(),
+            AuthorityState::Bound { transition, .. }
+                if transition.prepared().kind() == AuthorityTransitionKind::BackupRestore
+                    && transition.prepared().authority_generation() == generation
+                    && transition.prepared().target_catalog_identity() == target_catalog
+                    && transition.prepared().target_root_endpoint_identity() == target_root
+                    && transition.prepared().evidence_digest() == evidence_digest
+                    && transition.prepared().restore_receipt() == Some(&restore_receipt)
+        );
+        let admitted = match installed_state {
+            InstalledCatalogState::ExactBackup => source_state || target_state,
+            InstalledCatalogState::ExistingCandidate => target_state,
+        };
+        if !admitted {
+            return Err(AuthorityTransitionError::TransitionConflict);
+        }
+        VerifiedRestoreCatalogAuthority::try_new(
+            authority,
+            snapshot,
+            request,
+            receipt.catalog_content_evidence(),
+            baseline,
+            cancellation,
+        )
+        .map_err(Into::into)
     }
 
     pub(crate) fn open_bound(
@@ -825,6 +991,38 @@ impl AuthorityTransitionService {
         let objects = ParquetObjectStore::from_activated_root(activated, object_config)?;
         Ok((authority, objects))
     }
+}
+
+fn checkpoint_verified_restore_descendant(
+    authority: &CatalogAuthority,
+    expected: &AuthoritySnapshot,
+    baseline: RestoreCatalogBaseline,
+    cancellation: &CancellationToken,
+) -> Result<BackupReceipt, AuthorityTransitionError> {
+    authority.verify_restore_baseline(baseline, cancellation)?;
+    if &authority.authority_snapshot_without_endpoint()? != expected {
+        return Err(AuthorityTransitionError::TransitionConflict);
+    }
+    let receipt = authority.checkpoint_restore_state()?;
+    revalidate_verified_restore_descendant(authority, expected, receipt, baseline, cancellation)?;
+    Ok(receipt)
+}
+
+fn revalidate_verified_restore_descendant(
+    authority: &CatalogAuthority,
+    expected: &AuthoritySnapshot,
+    receipt: BackupReceipt,
+    baseline: RestoreCatalogBaseline,
+    cancellation: &CancellationToken,
+) -> Result<(), AuthorityTransitionError> {
+    authority.verify_restore_baseline(baseline, cancellation)?;
+    authority.revalidate_restore_state(receipt)?;
+    if &authority.authority_snapshot_without_endpoint()? != expected {
+        return Err(AuthorityTransitionError::TransitionConflict);
+    }
+    authority.verify_restore_baseline(baseline, cancellation)?;
+    authority.revalidate_restore_state(receipt)?;
+    Ok(())
 }
 
 fn exact_legacy_transition(

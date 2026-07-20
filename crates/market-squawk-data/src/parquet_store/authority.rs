@@ -6,7 +6,7 @@ use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
+use cap_fs_ext::{DirExt as _, FollowSymlinks, OpenOptionsFollowExt as _};
 use cap_std::fs::{Dir, OpenOptions};
 use fs2::FileExt as _;
 use market_squawk_platform::ArtifactRoot;
@@ -102,6 +102,16 @@ pub(crate) struct PreparedRootAuthority {
     endpoint: RootEndpointIdentity,
     lock: File,
     registry: RootRegistryGuard,
+}
+
+pub(crate) struct VerifiedRestoreControlSubset {
+    names: BTreeSet<String>,
+}
+
+impl VerifiedRestoreControlSubset {
+    pub(crate) fn contains(&self, name: &str) -> bool {
+        self.names.contains(name)
+    }
 }
 
 impl std::fmt::Debug for PreparedRootAuthority {
@@ -252,6 +262,194 @@ pub(crate) fn acquire_prepared_root_authority(
         lock,
         registry,
     })
+}
+
+pub(crate) fn restore_root_endpoint(
+    root: &ArtifactRoot,
+) -> Result<RootEndpointIdentity, ParquetStoreError> {
+    require_supported_root_authority_platform()?;
+    let directory = root
+        .try_clone_directory()
+        .map_err(crate::parquet_store::map_artifact_root_clone_error)?;
+    root_endpoint_identity(&directory, root.root())
+}
+
+pub(crate) fn validate_restore_control_subset(
+    directory: &Dir,
+    prepared: &PreparedAuthorityTransition,
+    catalog_bound: bool,
+) -> Result<VerifiedRestoreControlSubset, ParquetStoreError> {
+    require_only_expected_v2_control_files(directory, prepared)?;
+    let lock = open_root_control_file(directory, ROOT_AUTHORITY_LOCK, 1)?
+        .ok_or(ParquetStoreError::RootCatalogMismatch)?;
+    if lock.metadata()?.len() != 0 {
+        return Err(ParquetStoreError::RootCatalogMismatch);
+    }
+    validate_root_control_file(directory, ROOT_AUTHORITY_LOCK, &lock, 1)?;
+    let marker = validate_exact_record_subset(
+        directory,
+        ROOT_IDENTITY_MARKER_V2,
+        ROOT_IDENTITY_PENDING_V2,
+        &encode_root_marker_v2(prepared),
+    )?;
+    let binding_name = root_binding_generation_name(prepared);
+    let binding_pending = format!("{binding_name}.pending");
+    let marker_digest = control_record_digest(&encode_root_marker_v2(prepared))?;
+    let stable_root = stable_root_identity_v2(prepared, marker_digest)?;
+    let binding = validate_exact_record_subset(
+        directory,
+        &binding_name,
+        &binding_pending,
+        &encode_root_binding_v2(prepared, marker_digest, stable_root),
+    )?;
+    if !matches!(binding.state, RestoreRecordState::Absent)
+        && !matches!(marker.state, RestoreRecordState::Committed)
+    {
+        return Err(ParquetStoreError::RootCatalogMismatch);
+    }
+    if catalog_bound
+        && (!matches!(marker.state, RestoreRecordState::Committed)
+            || marker.pending_present
+            || !matches!(binding.state, RestoreRecordState::Committed)
+            || binding.pending_present)
+    {
+        return Err(ParquetStoreError::RootCatalogMismatch);
+    }
+    let mut names = BTreeSet::new();
+    names.insert(ROOT_AUTHORITY_LOCK.to_owned());
+    names.extend(marker.names);
+    names.extend(binding.names);
+    if catalog_bound {
+        let staging = root_control_exists(directory, "staging")?;
+        let quarantine = root_control_exists(directory, "quarantine")?;
+        match (staging, quarantine) {
+            (false, false) => {}
+            (true, true) => {
+                validate_empty_store_namespace(directory, "staging", "parquet")?;
+                validate_empty_store_namespace(directory, "quarantine", "parquet")?;
+                names.insert("staging".to_owned());
+                names.insert("quarantine".to_owned());
+            }
+            (false, true) | (true, false) => {
+                return Err(ParquetStoreError::RootCatalogMismatch);
+            }
+        }
+    }
+    Ok(VerifiedRestoreControlSubset { names })
+}
+
+fn validate_empty_store_namespace(
+    directory: &Dir,
+    namespace: &str,
+    leaf: &str,
+) -> Result<(), ParquetStoreError> {
+    let namespace = directory
+        .open_dir_nofollow(namespace)
+        .map_err(|_| ParquetStoreError::RootCatalogMismatch)?;
+    let mut entries = namespace.entries()?;
+    let entry = entries
+        .next()
+        .transpose()?
+        .ok_or(ParquetStoreError::RootCatalogMismatch)?;
+    if entry.file_name() != leaf || entries.next().transpose()?.is_some() {
+        return Err(ParquetStoreError::RootCatalogMismatch);
+    }
+    let leaf = namespace
+        .open_dir_nofollow(leaf)
+        .map_err(|_| ParquetStoreError::RootCatalogMismatch)?;
+    if leaf.entries()?.next().transpose()?.is_some() {
+        return Err(ParquetStoreError::RootCatalogMismatch);
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum RestoreRecordState {
+    Absent,
+    Pending,
+    Committed,
+}
+
+struct RestoreRecordSubset {
+    state: RestoreRecordState,
+    pending_present: bool,
+    names: BTreeSet<String>,
+}
+
+fn validate_exact_record_subset(
+    directory: &Dir,
+    final_name: &str,
+    pending_name: &str,
+    expected: &[u8],
+) -> Result<RestoreRecordSubset, ParquetStoreError> {
+    let final_exists = root_control_exists(directory, final_name)?;
+    let pending_exists = root_control_exists(directory, pending_name)?;
+    let mut names = BTreeSet::new();
+    match (final_exists, pending_exists) {
+        (false, false) => Ok(RestoreRecordSubset {
+            state: RestoreRecordState::Absent,
+            pending_present: false,
+            names,
+        }),
+        (false, true) => {
+            open_exact_root_control_file(directory, pending_name, expected, 1)?
+                .ok_or(ParquetStoreError::RootCatalogMismatch)?;
+            names.insert(pending_name.to_owned());
+            Ok(RestoreRecordSubset {
+                state: RestoreRecordState::Pending,
+                pending_present: true,
+                names,
+            })
+        }
+        (true, false) => {
+            open_exact_root_control_file(directory, final_name, expected, 1)?
+                .ok_or(ParquetStoreError::RootCatalogMismatch)?;
+            names.insert(final_name.to_owned());
+            Ok(RestoreRecordSubset {
+                state: RestoreRecordState::Committed,
+                pending_present: false,
+                names,
+            })
+        }
+        (true, true) => {
+            validate_linked_record_subset(directory, final_name, pending_name, expected, names)
+        }
+    }
+}
+
+#[cfg(unix)]
+fn validate_linked_record_subset(
+    directory: &Dir,
+    final_name: &str,
+    pending_name: &str,
+    expected: &[u8],
+    mut names: BTreeSet<String>,
+) -> Result<RestoreRecordSubset, ParquetStoreError> {
+    let final_file = open_exact_root_control_file(directory, final_name, expected, 2)?
+        .ok_or(ParquetStoreError::RootCatalogMismatch)?;
+    let pending_file = open_exact_root_control_file(directory, pending_name, expected, 2)?
+        .ok_or(ParquetStoreError::RootCatalogMismatch)?;
+    if !same_exact_opened_file(&final_file, &pending_file)? {
+        return Err(ParquetStoreError::RootCatalogMismatch);
+    }
+    names.insert(final_name.to_owned());
+    names.insert(pending_name.to_owned());
+    Ok(RestoreRecordSubset {
+        state: RestoreRecordState::Committed,
+        pending_present: true,
+        names,
+    })
+}
+
+#[cfg(not(unix))]
+fn validate_linked_record_subset(
+    _directory: &Dir,
+    _final_name: &str,
+    _pending_name: &str,
+    _expected: &[u8],
+    _names: BTreeSet<String>,
+) -> Result<RestoreRecordSubset, ParquetStoreError> {
+    Err(ParquetStoreError::RootCatalogMismatch)
 }
 
 impl PreparedRootAuthority {

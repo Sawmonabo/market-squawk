@@ -1,7 +1,7 @@
 //! Retained immutable backup verification and no-replace restore installation.
 
 use std::fmt;
-use std::fs::File;
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read as _, Seek as _, SeekFrom};
 
 use fs2::FileExt as _;
@@ -62,15 +62,25 @@ pub(crate) struct InstalledBackupCatalog {
     installed: InstalledCatalogFile,
     location: CatalogLocation,
     receipt: BackupReceipt,
+    state: InstalledCatalogState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InstalledCatalogState {
+    ExactBackup,
+    ExistingCandidate,
 }
 
 impl InstalledBackupCatalog {
-    pub(crate) const fn receipt(&self) -> BackupReceipt {
-        self.receipt
-    }
-
-    pub(crate) fn into_parts(self) -> (InstalledCatalogFile, CatalogLocation, BackupReceipt) {
-        (self.installed, self.location, self.receipt)
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        InstalledCatalogFile,
+        CatalogLocation,
+        BackupReceipt,
+        InstalledCatalogState,
+    ) {
+        (self.installed, self.location, self.receipt, self.state)
     }
 }
 
@@ -127,14 +137,21 @@ impl Catalog {
         destination: &CatalogLocation,
     ) -> Result<InstalledBackupCatalog, CatalogError> {
         source.revalidate()?;
+        reject_catalog_alias(source, destination)?;
         let receipt = source.receipt();
-        let installed = match destination
+        let (installed, state) = match destination
             .prepare_catalog_restore(receipt.sha256())
             .map_err(map_catalog_restore_error)?
         {
             CatalogRestoreTarget::Installed(installed) => {
-                verify_installed_receipt(destination, &installed, &receipt)?;
-                installed
+                let state = match verify_installed_receipt(destination, &installed, &receipt) {
+                    Ok(()) => InstalledCatalogState::ExactBackup,
+                    Err(CatalogError::BackupReceiptMismatch) => {
+                        InstalledCatalogState::ExistingCandidate
+                    }
+                    Err(error) => return Err(error),
+                };
+                (installed, state)
             }
             CatalogRestoreTarget::Staged(stage) => {
                 if stage.created() {
@@ -147,16 +164,70 @@ impl Catalog {
                     .publish_no_replace()
                     .map_err(map_catalog_restore_error)?;
                 verify_installed_receipt(destination, &installed, &receipt)?;
-                installed
+                (installed, InstalledCatalogState::ExactBackup)
             }
         };
         Ok(InstalledBackupCatalog {
             installed,
             location: destination.clone(),
             receipt,
+            state,
         })
     }
 }
+
+fn reject_catalog_alias(
+    source: &VerifiedBackupCatalog,
+    destination: &CatalogLocation,
+) -> Result<(), CatalogError> {
+    source.revalidate()?;
+    destination
+        .validate_for_open()
+        .map_err(map_catalog_restore_error)?;
+    if source.location().path() == destination.path() {
+        return Err(CatalogError::BackupRestoreConflict);
+    }
+    let source_path = fs::canonicalize(source.location().path())?;
+    match fs::canonicalize(destination.path()) {
+        Ok(destination_path) if destination_path == source_path => {
+            return Err(CatalogError::BackupRestoreConflict);
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    configure_alias_read(&mut options);
+    let destination_file = options.open(destination.path())?;
+    let source_file = source.try_clone_file()?;
+    if backup_file_identity(&source_file)? == backup_file_identity(&destination_file)? {
+        return Err(CatalogError::BackupRestoreConflict);
+    }
+    source.revalidate()
+}
+
+#[cfg(unix)]
+fn configure_alias_read(options: &mut OpenOptions) {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+}
+
+#[cfg(windows)]
+fn configure_alias_read(options: &mut OpenOptions) {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    options
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+}
+
+#[cfg(not(any(unix, windows)))]
+fn configure_alias_read(_options: &mut OpenOptions) {}
 
 fn copy_exact_backup(
     source: &VerifiedBackupCatalog,

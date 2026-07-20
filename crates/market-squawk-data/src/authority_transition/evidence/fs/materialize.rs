@@ -16,6 +16,7 @@ use super::{
     validate_private_std_regular_file,
 };
 use crate::Sha256Digest;
+use crate::parquet_store::VerifiedRestoreControlSubset;
 
 pub(crate) struct MaterializedArtifactRoot {
     root: ArtifactRoot,
@@ -50,7 +51,7 @@ impl VerifiedArtifactInventory {
         if directory.read_dir(".")?.next().transpose()?.is_some() {
             return Err(EvidenceError::DestinationNotFresh);
         }
-        self.materialize_verified_subset(destination, directory, identity, cancellation)
+        self.materialize_verified_subset(destination, directory, identity, cancellation, None)
     }
 
     /// Resumes only an exact subset left by this already receipt-verified bundle.
@@ -62,10 +63,17 @@ impl VerifiedArtifactInventory {
         &self,
         destination: &ArtifactRoot,
         cancellation: &CancellationToken,
+        controls: &VerifiedRestoreControlSubset,
     ) -> Result<MaterializedArtifactRoot, EvidenceError> {
         let (directory, identity) = self.prepare_destination(destination, cancellation)?;
-        self.validate_exact_subset(&directory, false, cancellation)?;
-        self.materialize_verified_subset(destination, directory, identity, cancellation)
+        self.validate_exact_subset(&directory, false, cancellation, Some(controls))?;
+        self.materialize_verified_subset(
+            destination,
+            directory,
+            identity,
+            cancellation,
+            Some(controls),
+        )
     }
 
     fn prepare_destination(
@@ -96,10 +104,11 @@ impl VerifiedArtifactInventory {
         directory: Dir,
         identity: FileIdentity,
         cancellation: &CancellationToken,
+        controls: Option<&VerifiedRestoreControlSubset>,
     ) -> Result<MaterializedArtifactRoot, EvidenceError> {
         if self
             .materialize_missing(&directory, cancellation)
-            .and_then(|()| self.validate_exact_subset(&directory, true, cancellation))
+            .and_then(|()| self.validate_exact_subset(&directory, true, cancellation, controls))
             .and_then(|()| synchronize_layout(&directory, &self.artifacts))
             .is_err()
         {
@@ -157,13 +166,30 @@ impl VerifiedArtifactInventory {
         directory: &Dir,
         require_complete: bool,
         cancellation: &CancellationToken,
+        controls: Option<&VerifiedRestoreControlSubset>,
     ) -> Result<(), EvidenceError> {
         if cancellation.is_cancelled() {
             return Err(EvidenceError::Cancelled);
         }
         let expected = expected_layout(&self.artifacts)?;
-        let mut root_entries = directory.read_dir(".")?;
-        let Some(root_entry) = root_entries.next().transpose()? else {
+        let mut objects_present = false;
+        let mut any_entry = false;
+        for root_entry in directory.read_dir(".")? {
+            let name = root_entry?.file_name();
+            any_entry = true;
+            if name == "objects" {
+                if objects_present {
+                    return Err(EvidenceError::DestinationConflict);
+                }
+                objects_present = true;
+            } else if !name
+                .to_str()
+                .is_some_and(|name| controls.is_some_and(|controls| controls.contains(name)))
+            {
+                return Err(EvidenceError::DestinationConflict);
+            }
+        }
+        if !any_entry {
             return if require_complete || !self.artifacts.is_empty() {
                 if require_complete {
                     Err(EvidenceError::DestinationConflict)
@@ -173,8 +199,15 @@ impl VerifiedArtifactInventory {
             } else {
                 Ok(())
             };
-        };
-        if root_entry.file_name() != "objects" || root_entries.next().transpose()?.is_some() {
+        }
+        if !objects_present {
+            return if require_complete {
+                Err(EvidenceError::DestinationConflict)
+            } else {
+                Ok(())
+            };
+        }
+        if controls.is_none() && directory.read_dir(".")?.count() != 1 {
             return Err(EvidenceError::DestinationConflict);
         }
         let objects = directory

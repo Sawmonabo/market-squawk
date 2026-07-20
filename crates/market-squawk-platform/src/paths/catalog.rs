@@ -2,12 +2,14 @@
 
 use std::fmt;
 use std::fs::File;
+use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
 use cap_std::fs::{Dir, OpenOptions};
 use fs2::FileExt as _;
+use sha2::{Digest as _, Sha256};
 
 use super::PathError;
 
@@ -17,6 +19,8 @@ pub use restore::{CatalogRestoreStage, CatalogRestoreTarget, InstalledCatalogFil
 
 const WRITER_LOCK_FILE: &str = ".catalog.writer.lock";
 const CATALOG_FILE: &str = "catalog.sqlite3";
+const CATALOG_WAL_FILE: &str = "catalog.sqlite3-wal";
+const CATALOG_SHM_FILE: &str = "catalog.sqlite3-shm";
 
 /// Lifetime guard for one private, unique-link, capability-relative catalog writer lock.
 pub struct CatalogWriterGuard {
@@ -27,6 +31,23 @@ pub struct CatalogWriterGuard {
 pub struct CatalogFileGuard {
     file: File,
     location: CatalogLocation,
+}
+
+/// Retained main-file and SQLite-sidecar observation bracketing one restore proof transaction.
+pub struct CatalogRestoreScanGuard {
+    main: RestoreFileObservation,
+    wal: Option<RestoreFileObservation>,
+    shm: Option<RestoreFileObservation>,
+    location: CatalogLocation,
+    max_main_bytes: u64,
+    max_sidecar_bytes: u64,
+}
+
+struct RestoreFileObservation {
+    file: File,
+    name: &'static str,
+    byte_length: u64,
+    sha256: [u8; 32],
 }
 
 impl CatalogFileGuard {
@@ -41,11 +62,289 @@ impl CatalogFileGuard {
     pub fn validate_identity(&self) -> Result<(), PathError> {
         validate_private_file_identity(&self.location, CATALOG_FILE, &self.file)
     }
+
+    /// Rejects a durable SQLite WAL payload and unsafe WAL/shared-memory sidecar identities.
+    ///
+    /// Restore authority calls this only after an exclusive `TRUNCATE` checkpoint. The shared
+    /// memory file may remain while the connection is open, but both sidecars must be private,
+    /// unique-link regular files and the WAL must contain no bytes that could alter the retained
+    /// main-file state.
+    pub fn validate_checkpointed_sidecars(&self) -> Result<(), PathError> {
+        self.validate_identity()?;
+        validate_optional_sqlite_sidecar(&self.location, CATALOG_WAL_FILE, true)?;
+        validate_optional_sqlite_sidecar(&self.location, CATALOG_SHM_FILE, false)?;
+        self.validate_identity()
+    }
+
+    /// Retains exact main, WAL, and shared-memory identities and content around one logical scan.
+    ///
+    /// The caller must begin its SQLite read transaction before acquiring this guard and must
+    /// revalidate the guard before ending that transaction. Sidecars are bounded before hashing.
+    pub fn retain_restore_scan_state(
+        &self,
+        max_main_bytes: u64,
+        max_sidecar_bytes: u64,
+    ) -> Result<CatalogRestoreScanGuard, PathError> {
+        if max_main_bytes == 0 || max_sidecar_bytes == 0 {
+            return Err(PathError::PreparedRootChanged);
+        }
+        self.validate_identity()?;
+        let main = RestoreFileObservation::capture(
+            &self.location,
+            CATALOG_FILE,
+            self.try_clone_file()?,
+            Some(max_main_bytes),
+        )?;
+        let wal =
+            capture_optional_restore_file(&self.location, CATALOG_WAL_FILE, max_sidecar_bytes)?;
+        let shm =
+            capture_optional_restore_file(&self.location, CATALOG_SHM_FILE, max_sidecar_bytes)?;
+        self.validate_identity()?;
+        Ok(CatalogRestoreScanGuard {
+            main,
+            wal,
+            shm,
+            location: self.location.clone(),
+            max_main_bytes,
+            max_sidecar_bytes,
+        })
+    }
+}
+
+impl CatalogRestoreScanGuard {
+    /// Proves durable main/WAL content plus every retained sidecar identity and size.
+    ///
+    /// SQLite may update shared-memory read marks while establishing a read snapshot, so callers
+    /// use this narrower check across snapshot acquisition and a full [`Self::revalidate`] guard
+    /// around the subsequent logical scan.
+    pub fn revalidate_durable(&self) -> Result<(), PathError> {
+        self.main
+            .revalidate(&self.location, Some(self.max_main_bytes))?;
+        revalidate_optional_restore_file(
+            &self.location,
+            CATALOG_WAL_FILE,
+            self.wal.as_ref(),
+            self.max_sidecar_bytes,
+        )?;
+        revalidate_optional_restore_file_identity(
+            &self.location,
+            CATALOG_SHM_FILE,
+            self.shm.as_ref(),
+            self.max_sidecar_bytes,
+        )
+    }
+
+    /// Proves the retained names, file identities, lengths, and bytes did not change during scan.
+    pub fn revalidate(&self) -> Result<(), PathError> {
+        self.main
+            .revalidate(&self.location, Some(self.max_main_bytes))?;
+        revalidate_optional_restore_file(
+            &self.location,
+            CATALOG_WAL_FILE,
+            self.wal.as_ref(),
+            self.max_sidecar_bytes,
+        )?;
+        revalidate_optional_restore_file(
+            &self.location,
+            CATALOG_SHM_FILE,
+            self.shm.as_ref(),
+            self.max_sidecar_bytes,
+        )
+    }
+}
+
+impl RestoreFileObservation {
+    fn capture(
+        location: &CatalogLocation,
+        name: &'static str,
+        file: File,
+        maximum_bytes: Option<u64>,
+    ) -> Result<Self, PathError> {
+        validate_private_file_identity(location, name, &file)?;
+        let byte_length = file
+            .metadata()
+            .map_err(|source| PathError::io("failed to inspect SQLite restore file", source))?
+            .len();
+        if maximum_bytes.is_some_and(|maximum| byte_length > maximum) {
+            return Err(PathError::PreparedRootChanged);
+        }
+        let sha256 = restore_file_sha256(&file)?;
+        validate_private_file_identity(location, name, &file)?;
+        Ok(Self {
+            file,
+            name,
+            byte_length,
+            sha256,
+        })
+    }
+
+    fn revalidate(
+        &self,
+        location: &CatalogLocation,
+        maximum_bytes: Option<u64>,
+    ) -> Result<(), PathError> {
+        validate_private_file_identity(location, self.name, &self.file)?;
+        let byte_length = self
+            .file
+            .metadata()
+            .map_err(|source| PathError::io("failed to reinspect SQLite restore file", source))?
+            .len();
+        if byte_length != self.byte_length
+            || maximum_bytes.is_some_and(|maximum| byte_length > maximum)
+            || restore_file_sha256(&self.file)? != self.sha256
+        {
+            return Err(PathError::PreparedRootChanged);
+        }
+        validate_private_file_identity(location, self.name, &self.file)
+    }
+}
+
+fn capture_optional_restore_file(
+    location: &CatalogLocation,
+    name: &'static str,
+    maximum_bytes: u64,
+) -> Result<Option<RestoreFileObservation>, PathError> {
+    match open_optional_restore_file(location, name) {
+        Ok(Some(file)) => {
+            RestoreFileObservation::capture(location, name, file, Some(maximum_bytes)).map(Some)
+        }
+        Ok(None) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn revalidate_optional_restore_file(
+    location: &CatalogLocation,
+    name: &'static str,
+    expected: Option<&RestoreFileObservation>,
+    maximum_bytes: u64,
+) -> Result<(), PathError> {
+    match (expected, open_optional_restore_file(location, name)?) {
+        (None, None) => Ok(()),
+        (Some(expected), Some(_)) => expected.revalidate(location, Some(maximum_bytes)),
+        (None, Some(_)) | (Some(_), None) => Err(PathError::PreparedRootChanged),
+    }
+}
+
+fn revalidate_optional_restore_file_identity(
+    location: &CatalogLocation,
+    name: &'static str,
+    expected: Option<&RestoreFileObservation>,
+    maximum_bytes: u64,
+) -> Result<(), PathError> {
+    match (expected, open_optional_restore_file(location, name)?) {
+        (None, None) => Ok(()),
+        (Some(expected), Some(_)) => {
+            validate_private_file_identity(location, name, &expected.file)?;
+            let byte_length = expected.file.metadata().map_err(|source| {
+                PathError::io("failed to reinspect SQLite restore file", source)
+            })?;
+            if byte_length.len() > maximum_bytes {
+                return Err(PathError::PreparedRootChanged);
+            }
+            validate_private_file_identity(location, name, &expected.file)
+        }
+        (None, Some(_)) | (Some(_), None) => Err(PathError::PreparedRootChanged),
+    }
+}
+
+fn open_optional_restore_file(
+    location: &CatalogLocation,
+    name: &'static str,
+) -> Result<Option<File>, PathError> {
+    match location.root_capability.symlink_metadata(name) {
+        Ok(metadata) => validate_private_file_metadata(&metadata)?,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(PathError::io(
+                "failed to inspect SQLite restore sidecar",
+                source,
+            ));
+        }
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    options.follow(FollowSymlinks::No);
+    configure_private_catalog_creation(&mut options);
+    let file = location
+        .root_capability
+        .open_with(name, &options)
+        .map_err(|source| PathError::io("failed to open SQLite restore sidecar", source))?
+        .into_std();
+    validate_private_file_identity(location, name, &file)?;
+    Ok(Some(file))
+}
+
+fn restore_file_sha256(file: &File) -> Result<[u8; 32], PathError> {
+    let mut file = file
+        .try_clone()
+        .map_err(|source| PathError::io("failed to clone SQLite restore file", source))?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|source| PathError::io("failed to seek SQLite restore file", source))?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|source| PathError::io("failed to hash SQLite restore file", source))?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(digest.finalize().into())
+}
+
+fn validate_optional_sqlite_sidecar(
+    location: &CatalogLocation,
+    name: &str,
+    require_empty: bool,
+) -> Result<(), PathError> {
+    let named = match location.root_capability.symlink_metadata(name) {
+        Ok(named) => named,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(PathError::io(
+                "failed to inspect SQLite catalog sidecar",
+                source,
+            ));
+        }
+    };
+    validate_private_file_metadata(&named)?;
+    if require_empty && named.len() != 0 {
+        return Err(PathError::PreparedRootChanged);
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    options.follow(FollowSymlinks::No);
+    configure_private_catalog_creation(&mut options);
+    let opened = location
+        .root_capability
+        .open_with(name, &options)
+        .map_err(|source| PathError::io("failed to open SQLite catalog sidecar", source))?
+        .into_std();
+    validate_private_file_identity(location, name, &opened)?;
+    if require_empty
+        && opened
+            .metadata()
+            .map_err(|source| PathError::io("failed to reinspect SQLite catalog sidecar", source))?
+            .len()
+            != 0
+    {
+        return Err(PathError::PreparedRootChanged);
+    }
+    Ok(())
 }
 
 impl fmt::Debug for CatalogFileGuard {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("CatalogFileGuard([PRIVATE FILE CAPABILITY])")
+    }
+}
+
+impl fmt::Debug for CatalogRestoreScanGuard {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CatalogRestoreScanGuard([RETAINED SQLITE FILE SET])")
     }
 }
 

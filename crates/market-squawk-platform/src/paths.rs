@@ -15,7 +15,9 @@ use crate::journal::ParentDirectorySync;
 use crate::{JournalError, JournalSinkConstructionError, JournalSinkLimits, JournalWriter};
 
 use self::catalog::open_prepared_root;
-pub use self::catalog::{CatalogFileGuard, CatalogLocation, CatalogWriterGuard};
+pub use self::catalog::{
+    CatalogFileGuard, CatalogLocation, CatalogRestoreScanGuard, CatalogWriterGuard,
+};
 pub use self::catalog::{CatalogRestoreStage, CatalogRestoreTarget, InstalledCatalogFile};
 
 const MAX_ARTIFACT_COMPONENT_BYTES: usize = 255;

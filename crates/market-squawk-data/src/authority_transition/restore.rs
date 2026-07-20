@@ -10,11 +10,14 @@ use super::evidence::fs::{MaterializedArtifactRoot, VerifiedArtifactInventory};
 use super::evidence::{CatalogContentEvidenceDigest, CatalogEvidenceSnapshot, EvidenceError};
 use super::{
     ArtifactInventoryDigest, AuthorityEventDigest, AuthorityEvidenceDigest, AuthorityGeneration,
-    AuthoritySnapshot, CatalogEndpointIdentity, RootEndpointIdentity, StableArtifactRootIdentity,
+    AuthoritySnapshot, AuthorityState, CatalogEndpointIdentity, RootEndpointIdentity,
+    StableArtifactRootIdentity,
 };
+use crate::ParquetObjectStore;
 use crate::analytical_backup::AnalyticalBackupBundleReceipt;
-use crate::catalog::{InstalledBackupCatalog, VerifiedBackupCatalog};
-use crate::{BackupReceipt, CatalogError};
+use crate::catalog::RestoreCatalogBaseline;
+use crate::catalog::VerifiedBackupCatalog;
+use crate::{BackupReceipt, CatalogAuthority, CatalogError};
 
 /// Exact receipt-bound facts derived from retained source catalog and artifact capabilities.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -45,6 +48,10 @@ pub(crate) struct ReceiptValidatedRestoreEvidence {
 impl ReceiptValidatedRestoreEvidence {
     pub(crate) const fn receipt(&self) -> AnalyticalBackupBundleReceipt {
         self.receipt
+    }
+
+    pub(crate) const fn request(&self) -> super::evidence::EvidenceSnapshotRequest {
+        self._catalog_evidence.request()
     }
 }
 
@@ -116,10 +123,109 @@ pub(crate) enum RestoreArtifactMode {
     ResumeExactSubset,
 }
 
+/// Retained destination writer admitted against one exact restore state and main-file receipt.
+pub(crate) struct VerifiedRestoreCatalogAuthority {
+    authority: CatalogAuthority,
+    snapshot: AuthoritySnapshot,
+    state_receipt: BackupReceipt,
+    request: super::evidence::EvidenceSnapshotRequest,
+    content_evidence: CatalogContentEvidenceDigest,
+    baseline: RestoreCatalogBaseline,
+    cancellation: CancellationToken,
+}
+
+impl VerifiedRestoreCatalogAuthority {
+    pub(super) fn try_new(
+        authority: CatalogAuthority,
+        expected: AuthoritySnapshot,
+        request: super::evidence::EvidenceSnapshotRequest,
+        content_evidence: CatalogContentEvidenceDigest,
+        baseline: RestoreCatalogBaseline,
+        cancellation: &CancellationToken,
+    ) -> Result<Self, CatalogError> {
+        authority.acquire_restore_exclusive_locking()?;
+        authority.verify_restore_baseline(baseline, cancellation)?;
+        if authority.authority_snapshot_without_endpoint()? != expected {
+            return Err(CatalogError::BackupRestoreConflict);
+        }
+        let state_receipt = authority.checkpoint_restore_state()?;
+        let snapshot = authority.authority_snapshot_without_endpoint()?;
+        if snapshot != expected {
+            return Err(CatalogError::BackupRestoreConflict);
+        }
+        let retained = Self {
+            authority,
+            snapshot,
+            state_receipt,
+            request,
+            content_evidence,
+            baseline,
+            cancellation: cancellation.clone(),
+        };
+        retained.revalidate()?;
+        Ok(retained)
+    }
+
+    pub(crate) fn snapshot(&self) -> &AuthoritySnapshot {
+        &self.snapshot
+    }
+
+    pub(crate) fn revalidate(&self) -> Result<(), CatalogError> {
+        self.authority
+            .verify_restore_baseline(self.baseline, &self.cancellation)?;
+        self.authority
+            .revalidate_restore_state(self.state_receipt)?;
+        if self.authority.authority_snapshot_without_endpoint()? != self.snapshot {
+            return Err(CatalogError::BackupRestoreConflict);
+        }
+        let (snapshot, evidence) = self.authority.analytical_evidence_snapshot(self.request)?;
+        if snapshot != self.snapshot
+            || evidence
+                .evidence_digest()
+                .map_err(|_| CatalogError::AnalyticalEvidenceInvalid)?
+                != self.content_evidence
+        {
+            return Err(CatalogError::BackupRestoreConflict);
+        }
+        self.authority
+            .verify_restore_baseline(self.baseline, &self.cancellation)?;
+        self.authority.revalidate_restore_state(self.state_receipt)
+    }
+
+    pub(super) fn into_parts(
+        self,
+    ) -> (
+        CatalogAuthority,
+        AuthoritySnapshot,
+        BackupReceipt,
+        RestoreCatalogBaseline,
+        CancellationToken,
+    ) {
+        (
+            self.authority,
+            self.snapshot,
+            self.state_receipt,
+            self.baseline,
+            self.cancellation,
+        )
+    }
+}
+
+impl std::fmt::Debug for VerifiedRestoreCatalogAuthority {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VerifiedRestoreCatalogAuthority")
+            .field("authority", &"[RETAINED CATALOG WRITER]")
+            .field("snapshot", &self.snapshot)
+            .field("state_receipt", &self.state_receipt)
+            .finish()
+    }
+}
+
 /// Non-forgeable, retained-capability proof admitted by the sealed authority transition service.
 pub(crate) struct VerifiedRestoreHandoff {
     source_catalog: VerifiedBackupCatalog,
-    installed_catalog: InstalledBackupCatalog,
+    target_catalog: VerifiedRestoreCatalogAuthority,
     materialized_root: MaterializedArtifactRoot,
     source_evidence: ReceiptValidatedRestoreEvidence,
 }
@@ -133,13 +239,13 @@ impl VerifiedRestoreHandoff {
         self,
     ) -> (
         VerifiedBackupCatalog,
-        InstalledBackupCatalog,
+        VerifiedRestoreCatalogAuthority,
         MaterializedArtifactRoot,
         ReceiptValidatedRestoreEvidence,
     ) {
         (
             self.source_catalog,
-            self.installed_catalog,
+            self.target_catalog,
             self.materialized_root,
             self.source_evidence,
         )
@@ -178,7 +284,7 @@ impl std::fmt::Debug for VerifiedRestoreHandoff {
         formatter
             .debug_struct("VerifiedRestoreHandoff")
             .field("source_catalog", &self.source_catalog)
-            .field("installed_catalog", &self.installed_catalog)
+            .field("target_catalog", &self.target_catalog)
             .field("materialized_root", &self.materialized_root)
             .field("source_evidence", &self.source_evidence)
             .finish()
@@ -188,7 +294,7 @@ impl std::fmt::Debug for VerifiedRestoreHandoff {
 /// Installs verified artifacts only after the exact catalog backup is retained at destination.
 pub(crate) fn materialize_verified_restore(
     source_catalog: VerifiedBackupCatalog,
-    installed_catalog: InstalledBackupCatalog,
+    target_catalog: VerifiedRestoreCatalogAuthority,
     source_evidence: ReceiptValidatedRestoreEvidence,
     destination: &ArtifactRoot,
     mode: RestoreArtifactMode,
@@ -196,23 +302,54 @@ pub(crate) fn materialize_verified_restore(
 ) -> Result<VerifiedRestoreHandoff, RestoreValidationError> {
     let expected_catalog = *source_evidence.receipt.catalog_backup();
     require_catalog_receipt(source_catalog.receipt(), expected_catalog)?;
-    require_catalog_receipt(installed_catalog.receipt(), expected_catalog)?;
     if cancellation.is_cancelled() {
         return Err(RestoreValidationError::Cancelled);
     }
     source_catalog.revalidate()?;
+    target_catalog.revalidate()?;
     let materialized_root = match mode {
         RestoreArtifactMode::Fresh => source_evidence
             .artifact_inventory
             .materialize_no_replace(destination, cancellation)?,
-        RestoreArtifactMode::ResumeExactSubset => source_evidence
-            .artifact_inventory
-            .resume_exact_subset_no_replace(destination, cancellation)?,
+        RestoreArtifactMode::ResumeExactSubset => {
+            let (prepared, catalog_bound) = match target_catalog.snapshot().state() {
+                AuthorityState::Prepared { transition, .. }
+                    if transition.kind() == super::AuthorityTransitionKind::BackupRestore =>
+                {
+                    (transition, false)
+                }
+                AuthorityState::Bound { transition, .. }
+                    if transition.prepared().kind()
+                        == super::AuthorityTransitionKind::BackupRestore =>
+                {
+                    (transition.prepared(), true)
+                }
+                AuthorityState::InitializationRequired
+                | AuthorityState::LegacyRequired { .. }
+                | AuthorityState::Prepared { .. }
+                | AuthorityState::Bound { .. } => {
+                    return Err(RestoreValidationError::CatalogReceiptMismatch);
+                }
+            };
+            let directory = destination
+                .try_clone_directory()
+                .map_err(|_| EvidenceError::DestinationConflict)?;
+            let controls = ParquetObjectStore::validate_restore_control_subset(
+                &directory,
+                prepared,
+                catalog_bound,
+            )
+            .map_err(|_| EvidenceError::DestinationConflict)?;
+            source_evidence
+                .artifact_inventory
+                .resume_exact_subset_no_replace(destination, cancellation, &controls)?
+        }
     };
     source_catalog.revalidate()?;
+    target_catalog.revalidate()?;
     Ok(VerifiedRestoreHandoff {
         source_catalog,
-        installed_catalog,
+        target_catalog,
         materialized_root,
         source_evidence,
     })
