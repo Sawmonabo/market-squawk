@@ -326,10 +326,7 @@ struct PinnedSequentialRead {
 impl Read for PinnedSequentialRead {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         if self.cancellation.is_cancelled() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                "pinned Parquet reader cancelled",
-            ));
+            return Err(std::io::Error::other(PinnedIoCancelledError));
         }
         let mut file = self
             .file
@@ -464,4 +461,34 @@ fn blocking_admission_datafusion(error: BlockingIoAdmissionError) -> DataFusionE
 
 fn parquet_datafusion(error: ParquetError) -> DataFusionError {
     DataFusionError::External(Box::new(error))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancelled_sequential_reader_uses_terminal_io_error() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let mut reader = PinnedSequentialRead {
+            file: Arc::new(Mutex::new(tempfile::tempfile()?)),
+            position: 0,
+            cancellation,
+        };
+
+        let error = reader
+            .read(&mut [0_u8])
+            .err()
+            .ok_or("cancelled read unexpectedly succeeded")?;
+
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert!(
+            error
+                .get_ref()
+                .is_some_and(|source| source.is::<PinnedIoCancelledError>())
+        );
+        Ok(())
+    }
 }
