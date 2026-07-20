@@ -3,6 +3,7 @@
 mod authority_state;
 mod capture;
 mod config;
+mod input;
 mod journal;
 mod paths;
 mod raw_record;
@@ -35,6 +36,10 @@ pub use capture::{
 pub use config::{
     AppConfig, ConfigError, ConfigOverrides, ConfigSources, SecretError, SecretProvider,
     SecretReference, SecretValue,
+};
+pub use input::{
+    BoundedInput, InputFileCapability, InputFileError, InputFileIdentity, UserAuthorizedInputRoot,
+    VerifiedInputFile,
 };
 pub use journal::{
     JournalError, JournalReader, JournalReplayAuthority, JournalSinkConstructionError,
