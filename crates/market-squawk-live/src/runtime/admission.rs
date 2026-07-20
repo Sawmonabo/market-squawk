@@ -108,7 +108,29 @@ fn checked_command_retained_bytes(
 pub(crate) struct RegistrationCommand {
     pub(crate) route: ShardKey,
     pub(crate) source: CurrentSourceAuthorityLease,
-    pub(crate) response: oneshot::Sender<Result<GenerationAdmission, RegistrationFailure>>,
+    pub(crate) response: oneshot::Sender<Result<RegistrationGrant, RegistrationFailure>>,
+}
+
+/// Drop-invalidating transfer guard for one actor-minted generation admission.
+#[derive(Debug)]
+pub(crate) struct RegistrationGrant(Option<GenerationAdmission>);
+
+impl RegistrationGrant {
+    pub(crate) const fn new(admission: GenerationAdmission) -> Self {
+        Self(Some(admission))
+    }
+
+    fn into_admission(mut self) -> Option<GenerationAdmission> {
+        self.0.take()
+    }
+}
+
+impl Drop for RegistrationGrant {
+    fn drop(&mut self) {
+        if let Some(admission) = self.0.take() {
+            admission.invalidate_on_admission_failure();
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -142,13 +164,16 @@ pub struct LiveRuntimeIngress {
 }
 
 impl LiveRuntimeIngress {
-    /// Binds one exact current source generation before its producer starts feeding data.
-    pub async fn bind_generation(
+    /// Reserves one bounded route-registration slot without accepting or retaining source authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when the runtime or shard is closed, the route is not configured, or
+    /// the bounded registration-control plane has no available slot.
+    pub fn reserve_route(
         &self,
         route: ShardKey,
-        source: CurrentSourceAuthorityLease,
-        cancellation: CancellationToken,
-    ) -> Result<BoundShardIngress, LiveIngressBindError> {
+    ) -> Result<DormantRouteIngress, LiveIngressBindError> {
         self.runtime
             .validate()
             .map_err(|_| LiveIngressBindError::RuntimeClosed)?;
@@ -161,6 +186,81 @@ impl LiveRuntimeIngress {
             .shard_liveness
             .validate()
             .map_err(|_| LiveIngressBindError::ShardClosed)?;
+        let registration = channels
+            .registration
+            .clone()
+            .try_reserve_owned()
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => LiveIngressBindError::ControlCapacityFull,
+                mpsc::error::TrySendError::Closed(_) => LiveIngressBindError::ControlClosed,
+            })?;
+        Ok(DormantRouteIngress {
+            route,
+            shard: channels.shard,
+            runtime: channels.runtime,
+            shard_liveness: channels.shard_liveness,
+            mailbox: channels.mailbox,
+            byte_budget: channels.byte_budget,
+            registration,
+            registration_deadline: channels.registration_deadline,
+            maximum_message_bytes: channels.maximum_message_bytes,
+            health: channels.health,
+        })
+    }
+
+    /// Binds one exact current source generation before its producer starts feeding data.
+    pub async fn bind_generation(
+        &self,
+        route: ShardKey,
+        source: CurrentSourceAuthorityLease,
+        cancellation: CancellationToken,
+    ) -> Result<BoundShardIngress, LiveIngressBindError> {
+        self.reserve_route(route)?
+            .activate(source, cancellation)
+            .await
+    }
+}
+
+/// One non-cloneable bounded route reservation with no source authority or publish surface.
+#[derive(Debug)]
+pub struct DormantRouteIngress {
+    route: ShardKey,
+    shard: ShardId,
+    runtime: RuntimeLease,
+    shard_liveness: ShardLease,
+    mailbox: mpsc::Sender<ShardCommand>,
+    byte_budget: Arc<Semaphore>,
+    registration: mpsc::OwnedPermit<RegistrationCommand>,
+    registration_deadline: Duration,
+    maximum_message_bytes: u32,
+    health: mpsc::Sender<LiveRuntimeHealthEvent>,
+}
+
+impl DormantRouteIngress {
+    /// Consumes this reservation and binds the exact current source authority once.
+    ///
+    /// A completed actor response linearizes before simultaneous cancellation. Otherwise,
+    /// cancellation or timeout drops the response receiver, causing the actor to invalidate any
+    /// admission it subsequently mints.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when runtime, shard, or source authority is no longer current; the
+    /// bounded deadline or cancellation fires; the actor rejects registration; or control closes.
+    pub async fn activate(
+        self,
+        source: CurrentSourceAuthorityLease,
+        cancellation: CancellationToken,
+    ) -> Result<BoundShardIngress, LiveIngressBindError> {
+        if cancellation.is_cancelled() {
+            return Err(LiveIngressBindError::Cancelled);
+        }
+        self.runtime
+            .validate()
+            .map_err(|_| LiveIngressBindError::RuntimeClosed)?;
+        self.shard_liveness
+            .validate()
+            .map_err(|_| LiveIngressBindError::ShardClosed)?;
         let now = system_timestamp().map_err(|_| LiveIngressBindError::ClockRange)?;
         source
             .validate_at(now)
@@ -168,46 +268,53 @@ impl LiveRuntimeIngress {
 
         let (response, receiver) = oneshot::channel();
         let command = RegistrationCommand {
-            route: route.clone(),
+            route: self.route.clone(),
             source,
             response,
         };
         let deadline = Instant::now()
-            .checked_add(channels.registration_deadline)
+            .checked_add(self.registration_deadline)
             .ok_or(LiveIngressBindError::DeadlineRange)?;
-        tokio::select! {
-            biased;
-            () = cancellation.cancelled() => return Err(LiveIngressBindError::Cancelled),
-            () = tokio::time::sleep_until(deadline) => {
-                return Err(LiveIngressBindError::DeadlineExceeded);
-            }
-            result = channels.registration.send(command) => {
-                result.map_err(|_| LiveIngressBindError::ControlClosed)?;
-            }
+        if cancellation.is_cancelled() {
+            return Err(LiveIngressBindError::Cancelled);
         }
-        let admission = tokio::select! {
+        self.registration.send(command);
+        let grant = tokio::select! {
             biased;
-            () = cancellation.cancelled() => return Err(LiveIngressBindError::Cancelled),
-            () = tokio::time::sleep_until(deadline) => {
-                return Err(LiveIngressBindError::DeadlineExceeded);
-            }
             result = receiver => {
                 result
                     .map_err(|_| LiveIngressBindError::ControlClosed)?
                     .map_err(LiveIngressBindError::Registration)?
             }
+            () = cancellation.cancelled() => return Err(LiveIngressBindError::Cancelled),
+            () = tokio::time::sleep_until(deadline) => {
+                return Err(LiveIngressBindError::DeadlineExceeded);
+            }
         };
+        let admission = grant
+            .into_admission()
+            .ok_or(LiveIngressBindError::ControlClosed)?;
         Ok(BoundShardIngress {
-            route,
-            shard: channels.shard,
-            runtime: channels.runtime,
-            shard_liveness: channels.shard_liveness,
-            mailbox: channels.mailbox,
-            byte_budget: channels.byte_budget,
-            maximum_message_bytes: channels.maximum_message_bytes,
+            route: self.route,
+            shard: self.shard,
+            runtime: self.runtime,
+            shard_liveness: self.shard_liveness,
+            mailbox: self.mailbox,
+            byte_budget: self.byte_budget,
+            maximum_message_bytes: self.maximum_message_bytes,
             admission,
-            health: channels.health,
+            health: self.health,
         })
+    }
+
+    /// Returns the exact configured route held by this dormant reservation.
+    pub const fn route(&self) -> &ShardKey {
+        &self.route
+    }
+
+    /// Returns the owning shard identity without granting publish authority.
+    pub const fn shard(&self) -> ShardId {
+        self.shard
     }
 }
 
@@ -334,6 +441,8 @@ pub enum LiveIngressBindError {
     DeadlineRange,
     #[error("generation registration channel is closed")]
     ControlClosed,
+    #[error("generation registration control capacity is full")]
+    ControlCapacityFull,
     #[error("trusted system clock is outside the supported range")]
     ClockRange,
     #[error(transparent)]

@@ -1,6 +1,8 @@
 //! Registration and message-atomic committed observation processing.
 
-use super::super::admission::{RegistrationCommand, RegistrationFailure, ShardCommand};
+use super::super::admission::{
+    RegistrationCommand, RegistrationFailure, RegistrationGrant, ShardCommand,
+};
 use super::super::system_timestamp;
 use super::{ActorError, RouteOwner, ShardActor};
 use crate::features::{CommittedFeatureInput, FeatureInvalidationReason, FeatureUpdateDisposition};
@@ -9,7 +11,7 @@ use crate::{LiveRuntimeHealthKind, ShardLifecycleSnapshot};
 
 impl ShardActor {
     pub(super) fn register(&mut self, command: RegistrationCommand) {
-        let result = self.register_inner(&command);
+        let result = self.register_inner(&command).map(RegistrationGrant::new);
         if result.is_err() {
             self.health_revision = self.health_revision.saturating_add(1);
             self.emit_health(
@@ -17,9 +19,7 @@ impl ShardActor {
                 Some(command.route.clone()),
             );
         }
-        if let Err(Ok(admission)) = command.response.send(result) {
-            admission.invalidate_on_admission_failure();
-        }
+        drop(command.response.send(result));
     }
 
     fn register_inner(
