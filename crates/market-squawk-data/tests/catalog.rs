@@ -67,6 +67,24 @@ fn catalog_enforces_rights_and_recovers_the_complete_control_record() -> TestRes
         Err(CatalogError::WriterAlreadyOpen)
     ));
 
+    let alias_paths = LocalPaths::prepare(directory.path().join("alias"))?;
+    let alias_location = alias_paths.catalog()?.clone();
+    std::fs::hard_link(&database, alias_location.path())?;
+    let alias_config = CatalogConfig::try_new(
+        alias_location.clone(),
+        Duration::from_millis(750),
+        CatalogLimit::new(32)?,
+        CatalogResultLimits::try_new(1024 * 1024, 8 * 1024 * 1024)?,
+    )?;
+    assert!(matches!(
+        CatalogAuthority::open(alias_config),
+        Err(CatalogError::UnsafePath)
+    ));
+    assert_eq!(catalog.health()?.applied_migrations(), 2);
+    drop(catalog);
+    std::fs::remove_file(alias_location.path())?;
+    let catalog = CatalogAuthority::open(config.clone())?;
+
     catalog.register_source(&source_v1, Timestamp::from_unix_nanos(9))?;
     catalog.register_source(&source, Timestamp::from_unix_nanos(10))?;
     assert!(matches!(

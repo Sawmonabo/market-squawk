@@ -14,12 +14,12 @@ use super::PathError;
 const WRITER_LOCK_FILE: &str = ".catalog.writer.lock";
 const CATALOG_FILE: &str = "catalog.sqlite3";
 
-/// Lifetime guard for one capability-relative cross-process catalog writer lock.
+/// Lifetime guard for one private, unique-link, capability-relative catalog writer lock.
 pub struct CatalogWriterGuard {
     _file: File,
 }
 
-/// Retained handle proving the fixed catalog path names a private capability-opened file.
+/// Retained handle proving the fixed catalog path names one private, unique-link file.
 pub struct CatalogFileGuard {
     file: File,
     location: CatalogLocation,
@@ -35,23 +35,7 @@ impl CatalogFileGuard {
 
     /// Revalidates the retained handle against the capability-relative catalog name.
     pub fn validate_identity(&self) -> Result<(), PathError> {
-        use cap_fs_ext::MetadataExt as _;
-
-        self.location.validate_for_open()?;
-        let opened = self
-            .file
-            .metadata()
-            .map_err(|source| PathError::io("failed to inspect opened catalog", source))?;
-        let named = self
-            .location
-            .root_capability
-            .symlink_metadata(CATALOG_FILE)
-            .map_err(|source| PathError::io("failed to inspect named catalog", source))?;
-        if !named.is_file() || (opened.dev(), opened.ino()) != (named.dev(), named.ino()) {
-            return Err(PathError::PreparedRootChanged);
-        }
-        validate_private_catalog_metadata(&named)?;
-        Ok(())
+        validate_private_file_identity(&self.location, CATALOG_FILE, &self.file)
     }
 }
 
@@ -91,8 +75,8 @@ impl CatalogLocation {
 
     /// Opens or creates the fixed catalog capability-relative, without following links.
     ///
-    /// Unix files must be owner-only. Windows opens retain no-delete sharing and reject reparse
-    /// points; POSIX permission claims are intentionally not made there.
+    /// Catalogs must have exactly one hard link. Unix files must also be owner-only. Windows opens
+    /// retain no-delete sharing and reject reparse points; POSIX permission claims are not made.
     pub fn prepare_catalog_file(&self) -> Result<CatalogFileGuard, PathError> {
         self.validate_for_open()?;
         let mut options = OpenOptions::new();
@@ -110,7 +94,7 @@ impl CatalogLocation {
         if !named.is_file() {
             return Err(PathError::PreparedRootChanged);
         }
-        validate_private_catalog_metadata(&named)?;
+        validate_private_file_metadata(&named)?;
         let guard = CatalogFileGuard {
             file: file.into_std(),
             location: self.clone(),
@@ -137,7 +121,7 @@ impl CatalogLocation {
         if !named.is_file() {
             return Err(PathError::PreparedRootChanged);
         }
-        validate_private_catalog_metadata(&named)?;
+        validate_private_file_metadata(&named)?;
         let guard = CatalogFileGuard {
             file: file.into_std(),
             location: self.clone(),
@@ -178,13 +162,8 @@ impl CatalogLocation {
             .root_capability
             .open_with(WRITER_LOCK_FILE, &options)
             .map_err(|source| PathError::io("failed to open catalog writer lock", source))?;
-        let metadata = file
-            .metadata()
-            .map_err(|source| PathError::io("failed to inspect catalog writer lock", source))?;
-        if !metadata.is_file() {
-            return Err(PathError::PreparedRootChanged);
-        }
         let file = file.into_std();
+        validate_private_file_identity(self, WRITER_LOCK_FILE, &file)?;
         file.try_lock_exclusive().map_err(|source| {
             if source.kind() == std::io::ErrorKind::WouldBlock {
                 PathError::CatalogAlreadyLocked
@@ -192,9 +171,41 @@ impl CatalogLocation {
                 PathError::io("failed to acquire catalog writer lock", source)
             }
         })?;
-        self.validate_for_open()?;
+        validate_private_file_identity(self, WRITER_LOCK_FILE, &file)?;
         Ok(CatalogWriterGuard { _file: file })
     }
+}
+
+fn validate_private_file_identity(
+    location: &CatalogLocation,
+    name: &str,
+    file: &File,
+) -> Result<(), PathError> {
+    use cap_fs_ext::MetadataExt as _;
+
+    location.validate_for_open()?;
+    let opened = file
+        .metadata()
+        .map_err(|source| PathError::io("failed to inspect opened catalog control file", source))?;
+    let named = location
+        .root_capability
+        .symlink_metadata(name)
+        .map_err(|source| PathError::io("failed to inspect named catalog control file", source))?;
+    if !opened.is_file()
+        || !named.is_file()
+        || (opened.dev(), opened.ino()) != (named.dev(), named.ino())
+    {
+        return Err(PathError::PreparedRootChanged);
+    }
+    validate_unique_file_metadata(&opened)?;
+    validate_private_file_metadata(&named)
+}
+
+fn validate_unique_file_metadata(metadata: &impl cap_fs_ext::MetadataExt) -> Result<(), PathError> {
+    if metadata.nlink() != 1 {
+        return Err(PathError::PreparedRootChanged);
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -227,28 +238,28 @@ fn configure_private_catalog_creation(options: &mut OpenOptions) {
 fn configure_private_catalog_creation(_options: &mut OpenOptions) {}
 
 #[cfg(unix)]
-fn validate_private_catalog_metadata(metadata: &cap_std::fs::Metadata) -> Result<(), PathError> {
+fn validate_private_file_metadata(metadata: &cap_std::fs::Metadata) -> Result<(), PathError> {
     use cap_std::fs::PermissionsExt as _;
 
     if metadata.permissions().mode() & 0o077 != 0 {
         return Err(PathError::PreparedRootChanged);
     }
-    Ok(())
+    validate_unique_file_metadata(metadata)
 }
 
 #[cfg(windows)]
-fn validate_private_catalog_metadata(metadata: &cap_std::fs::Metadata) -> Result<(), PathError> {
+fn validate_private_file_metadata(metadata: &cap_std::fs::Metadata) -> Result<(), PathError> {
     use cap_fs_ext::MetadataExt as _;
 
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
     if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err(PathError::PreparedRootChanged);
     }
-    Ok(())
+    validate_unique_file_metadata(metadata)
 }
 
 #[cfg(not(any(unix, windows)))]
-fn validate_private_catalog_metadata(_metadata: &cap_std::fs::Metadata) -> Result<(), PathError> {
+fn validate_private_file_metadata(_metadata: &cap_std::fs::Metadata) -> Result<(), PathError> {
     Err(PathError::PreparedRootChanged)
 }
 

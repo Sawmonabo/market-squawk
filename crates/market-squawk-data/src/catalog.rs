@@ -329,9 +329,9 @@ impl PreparedBackup {
             Err(error) => return self.reconcile_publication_error(location, &receipt, error),
         }
         synchronize_backup_publication(&self.parent).map_err(|_| backup_indeterminate(receipt))?;
+        finalize_backup_temporary(self, receipt)?;
         verify_published_backup(location, &self.identity, &receipt)
             .map_err(|_| backup_indeterminate(receipt))?;
-        finalize_backup_temporary(self, receipt)?;
         Ok(())
     }
 
