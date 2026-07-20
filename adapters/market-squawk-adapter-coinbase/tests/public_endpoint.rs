@@ -73,6 +73,8 @@ async fn production_endpoint_smoke_is_opt_in_and_bounded() -> TestResult {
         outcome,
         Err(SourceError::Cancelled
             | SourceError::ProviderUnavailable
+            | SourceError::BudgetWaitUntil { .. }
+            | SourceError::BudgetUnavailable { .. }
             | SourceError::Network
             | SourceError::Sink(_))
     ));

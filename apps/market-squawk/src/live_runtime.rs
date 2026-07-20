@@ -11,8 +11,8 @@
 
 use market_squawk_live::{
     BoundShardIngress, LiveIngressBindError, LiveRouteConfig, LiveRuntime, LiveRuntimeConfig,
-    LiveRuntimeHealthEvent, LiveRuntimeReplaceError, LiveRuntimeShutdown, LiveRuntimeStartError,
-    LiveSnapshotReader, ShardId, ShardKey,
+    LiveRuntimeHealthEvent, LiveRuntimeIngress, LiveRuntimeReplaceError, LiveRuntimeShutdown,
+    LiveRuntimeStartError, LiveSnapshotReader, ShardId, ShardKey,
 };
 use market_squawk_sources::CurrentSourceAuthorityLease;
 use thiserror::Error;
@@ -38,6 +38,15 @@ impl LiveRuntimeComposition {
     /// Returns bounded authority-free immutable snapshot access.
     pub fn snapshots(&self) -> LiveSnapshotReader {
         self.runtime.snapshots()
+    }
+
+    /// Returns the bind-only ingress capability to the crate-private production source owner.
+    ///
+    /// This is not part of the public application API: CLI, MCP, diagnostic, and strategy code
+    /// cannot obtain it. The production source composition uses it only to reserve every route
+    /// before opening a provider connection and to complete the current-authority handshake.
+    pub(crate) fn production_ingress(&self) -> LiveRuntimeIngress {
+        self.runtime.ingress()
     }
 
     /// Performs the bounded pre-feed control handshake for one exact current source allocation.

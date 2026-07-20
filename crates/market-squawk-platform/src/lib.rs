@@ -33,7 +33,9 @@ pub use capture::{
     initialize_capture_process_infrastructure, raw_capture_channel, spawn_capture_writer,
 };
 pub use config::{
-    AppConfig, ConfigError, ConfigOverrides, ConfigSources, SecretError, SecretProvider,
+    AppConfig, COINBASE_EXCHANGE_ENDPOINT, CoinbaseAuthorizationAttestation,
+    CoinbaseConfigurationError, CoinbaseControlLimits, CoinbaseInstrumentMapping,
+    CoinbaseSourceConfig, ConfigError, ConfigOverrides, ConfigSources, SecretError, SecretProvider,
     SecretReference, SecretValue,
 };
 pub use journal::{

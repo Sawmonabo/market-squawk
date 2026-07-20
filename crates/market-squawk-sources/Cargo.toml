@@ -13,6 +13,7 @@ blake3 = { workspace = true }
 bytes = { workspace = true }
 crc32fast = { workspace = true }
 futures-util = { workspace = true }
+httpdate = { workspace = true }
 market-squawk-domain = { workspace = true }
 market-squawk-platform = { workspace = true }
 rust_decimal = { workspace = true }

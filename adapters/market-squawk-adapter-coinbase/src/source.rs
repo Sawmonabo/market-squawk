@@ -7,7 +7,7 @@ use futures_util::{FutureExt, SinkExt, StreamExt, future::BoxFuture};
 use market_squawk_sources::{
     BudgetDecision, BudgetPermit, CurrentSourceSession, LiveMarketSource, RawFrameFactory,
     RawMarketSink, SharedProviderBudget, SourceError, SourceMetadata, SourceMetadataProvider,
-    TransportFrameKind,
+    TransportFrameKind, apply_http_retry_after,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message, protocol::WebSocketConfig};
@@ -62,9 +62,8 @@ impl CoinbaseExchangeSource {
     fn acquire_budget(&self) -> Result<BudgetPermit, SourceError> {
         match self.budget.try_acquire() {
             BudgetDecision::Ready(permit) => Ok(permit),
-            BudgetDecision::WaitUntil(_) | BudgetDecision::Unavailable(_) => {
-                Err(SourceError::ProviderUnavailable)
-            }
+            BudgetDecision::WaitUntil(deadline) => Err(SourceError::BudgetWaitUntil { deadline }),
+            BudgetDecision::Unavailable(reason) => Err(SourceError::BudgetUnavailable { reason }),
         }
     }
 
@@ -93,13 +92,11 @@ impl CoinbaseExchangeSource {
             .max_frame_size(Some(limits.max_frame_bytes()));
         let connect =
             connect_async_with_config(self.config.endpoint(), Some(websocket_config), true);
-        let (socket, _response) = await_websocket(
-            &cancellation,
-            limits.connect_timeout(),
-            connect,
-            map_connect_error,
-        )
-        .await?;
+        let (socket, _response) =
+            await_websocket(&cancellation, limits.connect_timeout(), connect, |error| {
+                map_connect_error(error, &self.budget)
+            })
+            .await?;
         self.run_socket(socket, permit, frames, sink, cancellation)
             .await
     }
@@ -284,13 +281,22 @@ fn ensure_frame_bound(actual: usize, maximum: usize) -> Result<(), SourceError> 
     }
 }
 
-fn map_connect_error(error: WebSocketError) -> SourceError {
+fn map_connect_error(error: WebSocketError, budget: &SharedProviderBudget) -> SourceError {
     if let WebSocketError::Http(response) = &error {
-        return match response.status().as_u16() {
-            401 | 403 => SourceError::Unauthorized,
-            429 | 503 => SourceError::ProviderUnavailable,
-            _ => SourceError::Network,
-        };
+        let status = response.status();
+        if matches!(status.as_u16(), 401 | 403) {
+            return SourceError::Unauthorized;
+        }
+        if status.as_u16() == 429 || status.is_server_error() {
+            return SourceError::from_applied_budget_refusal(apply_http_retry_after(
+                budget,
+                response
+                    .headers()
+                    .get(tokio_tungstenite::tungstenite::http::header::RETRY_AFTER)
+                    .map(|value| value.as_bytes()),
+                1_000,
+            ));
+        }
     }
     SourceError::Network
 }

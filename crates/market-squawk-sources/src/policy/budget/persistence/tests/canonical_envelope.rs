@@ -203,17 +203,15 @@ fn deterministic_shuffle<T>(values: &mut [T], seed: &mut u64) -> TestResult {
 }
 
 #[test]
-fn reversed_nested_revisions_are_rejected_at_the_authenticated_envelope_boundary() -> TestResult {
-    let canonical = registry_with_single_source(&[1, 2, 3])?;
-    let canonical_payload = raw_envelope_bytes(&canonical)?;
-    assert!(deserialize_canonical_envelope(&canonical_payload).is_ok());
+fn distinct_semantic_revision_histories_are_canonical_at_the_envelope_boundary() -> TestResult {
+    let chronological = registry_with_single_source(&[1, 2, 3])?;
+    let chronological_payload = raw_envelope_bytes(&chronological)?;
+    assert!(deserialize_canonical_envelope(&chronological_payload).is_ok());
 
     let reversed = registry_with_single_source(&[3, 2, 1])?;
     let reversed_payload = raw_envelope_bytes(&reversed)?;
-    assert!(matches!(
-        deserialize_canonical_envelope(&reversed_payload),
-        Err(AuthorityPersistenceError::InvalidState)
-    ));
+    assert!(deserialize_canonical_envelope(&reversed_payload).is_ok());
+    assert_ne!(chronological_payload, reversed_payload);
     Ok(())
 }
 
@@ -241,16 +239,10 @@ fn canonical_envelope_roundtrip_preserves_identical_authenticated_bytes() -> Tes
 }
 
 #[test]
-fn canonical_envelope_is_identical_across_all_nested_permutations() -> TestResult {
+fn canonical_envelope_is_identical_across_structural_permutations() -> TestResult {
     let fixture = rich_fixture()?;
     const { assert!(PERMUTATION_COUNT >= 100) };
     assert!(fixture.sources.len() >= 2);
-    assert!(
-        fixture
-            .sources
-            .iter()
-            .all(|source| source.used_revisions.len() >= 3)
-    );
     assert!(fixture.policies.len() >= 2);
     assert!(fixture.groups.len() >= 2);
     assert!(
@@ -265,9 +257,6 @@ fn canonical_envelope_is_identical_across_all_nested_permutations() -> TestResul
     for _ in 0..PERMUTATION_COUNT {
         let mut candidate = fixture.clone();
         deterministic_shuffle(&mut candidate.sources, &mut seed)?;
-        for source in &mut candidate.sources {
-            deterministic_shuffle(&mut source.used_revisions, &mut seed)?;
-        }
         deterministic_shuffle(&mut candidate.policies, &mut seed)?;
         deterministic_shuffle(&mut candidate.groups, &mut seed)?;
         for group in &mut candidate.groups {

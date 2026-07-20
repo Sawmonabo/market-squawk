@@ -10,9 +10,10 @@ use market_squawk_domain::{
     SourceIdentifier, Timestamp,
 };
 use market_squawk_sources::{
-    AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode, BackoffPolicy, BudgetScope,
-    DecodeOutcome, FreshnessPolicy, MarketDecoder, ProviderBudgetPolicy, RawMarketFrame,
-    RawMarketSink, SessionId, SinkError, SourceError, SourceMetadataProvider,
+    AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode, BackoffPolicy,
+    BudgetDecision, BudgetScope, DecodeOutcome, FreshnessPolicy, MarketDecoder,
+    ProviderBudgetPolicy, RawMarketFrame, RawMarketSink, SessionId, SinkError, SourceError,
+    SourceMetadataProvider,
 };
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -102,6 +103,7 @@ async fn source_captures_and_decodes_then_quarantines_on_metadata_idle() -> Test
     )?;
     let mut frames = registry.take_raw_frame_factory(&session)?;
     let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}")).await?;
+    let budget = config.budget().clone();
     let mut source = KrakenSource::new(config);
     let mut sink = RecordingSink::default();
 
@@ -139,6 +141,24 @@ async fn source_captures_and_decodes_then_quarantines_on_metadata_idle() -> Test
         DecodeOutcome::Data(_)
     ));
 
+    let refusal = tokio_tungstenite::tungstenite::Error::Http(
+        tokio_tungstenite::tungstenite::http::Response::builder()
+            .status(429)
+            .header(
+                tokio_tungstenite::tungstenite::http::header::RETRY_AFTER,
+                "1",
+            )
+            .body(None)?,
+    );
+    let returned_deadline = match super::map_connect_error(refusal, &budget) {
+        SourceError::BudgetWaitUntil { deadline } => deadline,
+        error => return Err(format!("429 mapped to {error:?} instead of a budget wait").into()),
+    };
+    assert!(matches!(
+        budget.try_acquire(),
+        BudgetDecision::WaitUntil(recorded_deadline) if recorded_deadline == returned_deadline
+    ));
+
     let _release_result = release_tx.send(());
     server.await??;
     Ok(())
@@ -157,6 +177,12 @@ fn test_source() -> TestResult<(
         ))
     };
     let provider = SourceIdentifier::try_from("kraken")?;
+    let authorization = AuthorizationGrant::new(
+        AuthorizationMode::PublicInterface,
+        AuthorizationBasis::new(SourceIdentifier::try_from("kraken-terms-reviewed")?),
+        exact(2),
+        effective,
+    );
     let budget = ProviderBudgetPolicy::try_new(
         BudgetScope::new(provider),
         NonZeroU32::new(20).ok_or("zero request budget")?,
@@ -175,12 +201,7 @@ fn test_source() -> TestResult<(
             MetadataRevision::new(SourceIdentifier::try_from("kraken-policy-v1")?),
             exact(1),
         ),
-        AuthorizationGrant::new(
-            AuthorizationMode::PublicInterface,
-            AuthorizationBasis::new(SourceIdentifier::try_from("kraken-terms-reviewed")?),
-            exact(2),
-            effective,
-        ),
+        authorization,
         exact(3),
         effective,
         instrument,

@@ -390,11 +390,22 @@ impl ProcessBudgetCoordinator {
         }
     }
 
+    fn discard_cleanly_closed_durable_allocations(&mut self) {
+        self.allocations.retain(|allocation| {
+            allocation
+                .allocation
+                .durability
+                .as_ref()
+                .is_none_or(|binding| !binding.session.closed_clean())
+        });
+    }
+
     fn coordinate(
         &mut self,
         policies: &[ResolvedProviderBudgetPolicy],
         durable: Option<DurableRegistration<'_>>,
     ) -> Result<Vec<SharedProviderBudget>, BudgetPoolError> {
+        self.discard_cleanly_closed_durable_allocations();
         let remaining_capacity = self
             .capacity
             .checked_sub(self.allocations.len())
@@ -536,6 +547,7 @@ impl ProcessBudgetCoordinator {
         groups: &[(ResolvedProviderBudgetPolicy, BudgetCheckpointState)],
         session: &Arc<AuthorityDurabilitySession>,
     ) -> Result<Vec<SharedProviderBudget>, BudgetPoolError> {
+        self.discard_cleanly_closed_durable_allocations();
         let total = self
             .allocations
             .len()

@@ -6,8 +6,9 @@ use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use market_squawk_domain::{LiveEventClass, Timestamp};
 use market_squawk_sources::{
-    BudgetDecision, LiveMarketSource, RawFrameFactory, RawMarketSink, SourceError, SourceMetadata,
-    SourceMetadataProvider, TransportFrameKind,
+    BudgetDecision, BudgetPermit, LiveMarketSource, RawFrameFactory, RawMarketSink,
+    SharedProviderBudget, SourceError, SourceMetadata, SourceMetadataProvider, TransportFrameKind,
+    apply_http_retry_after,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::WebSocketStream;
@@ -134,12 +135,7 @@ impl KrakenSource {
         self.health.book_subscribed = false;
         self.health.trade_subscribed = false;
         self.health.last_market_timestamp = None;
-        let permit = match self.config.budget().try_acquire() {
-            BudgetDecision::Ready(permit) => permit,
-            BudgetDecision::WaitUntil(_) | BudgetDecision::Unavailable(_) => {
-                return Err(SourceError::ProviderUnavailable);
-            }
-        };
+        let permit = acquire_budget(self.config.budget())?;
         let socket_config = WebSocketConfig::default()
             .read_buffer_size(READ_BUFFER_BYTES)
             .write_buffer_size(WRITE_BUFFER_BYTES)
@@ -459,12 +455,7 @@ async fn send_subscription<S>(
 where
     S: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
 {
-    let permit = match budget.try_acquire() {
-        BudgetDecision::Ready(permit) => permit,
-        BudgetDecision::WaitUntil(_) | BudgetDecision::Unavailable(_) => {
-            return Err(SourceError::ProviderUnavailable);
-        }
-    };
+    let permit = acquire_budget(budget)?;
     send_message_with_deadline(
         socket,
         Message::Text(payload.into()),
@@ -476,6 +467,14 @@ where
     budget
         .record_success()
         .map_err(|_| SourceError::ProviderUnavailable)
+}
+
+fn acquire_budget(budget: &SharedProviderBudget) -> Result<BudgetPermit, SourceError> {
+    match budget.try_acquire() {
+        BudgetDecision::Ready(permit) => Ok(permit),
+        BudgetDecision::WaitUntil(deadline) => Err(SourceError::BudgetWaitUntil { deadline }),
+        BudgetDecision::Unavailable(reason) => Err(SourceError::BudgetUnavailable { reason }),
+    }
 }
 
 async fn send_message_with_deadline<S>(
@@ -524,8 +523,14 @@ fn map_connect_error(
     if let tokio_tungstenite::tungstenite::Error::Http(response) = &error
         && (response.status().as_u16() == 429 || response.status().is_server_error())
     {
-        let _backoff = budget.apply_refusal(1_000);
-        return SourceError::ProviderUnavailable;
+        return SourceError::from_applied_budget_refusal(apply_http_retry_after(
+            budget,
+            response
+                .headers()
+                .get(tokio_tungstenite::tungstenite::http::header::RETRY_AFTER)
+                .map(|value| value.as_bytes()),
+            1_000,
+        ));
     }
     map_websocket_error(error)
 }

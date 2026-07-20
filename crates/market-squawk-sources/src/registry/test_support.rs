@@ -38,6 +38,21 @@ pub(super) fn direct_metadata(source: &str, revision: &str) -> TestResult<Source
     direct_metadata_with_provider_and_limit(source, revision, source, 10)
 }
 
+pub(super) fn direct_metadata_with_revision_evidence(
+    source: &str,
+    revision: &str,
+    evidence_byte: u8,
+) -> TestResult<SourceMetadata> {
+    direct_metadata_with_provider_limit_quality_and_evidence(
+        source,
+        revision,
+        source,
+        10,
+        DataQuality::DirectVerified,
+        evidence_byte,
+    )
+}
+
 pub(super) fn direct_metadata_with_quality(
     source: &str,
     revision: &str,
@@ -67,6 +82,24 @@ fn direct_metadata_with_provider_limit_and_quality(
     provider: &str,
     requests_per_window: u32,
     quality_ceiling: DataQuality,
+) -> TestResult<SourceMetadata> {
+    direct_metadata_with_provider_limit_quality_and_evidence(
+        source,
+        revision,
+        provider,
+        requests_per_window,
+        quality_ceiling,
+        source.as_bytes()[0],
+    )
+}
+
+fn direct_metadata_with_provider_limit_quality_and_evidence(
+    source: &str,
+    revision: &str,
+    provider: &str,
+    requests_per_window: u32,
+    quality_ceiling: DataQuality,
+    evidence_byte: u8,
 ) -> TestResult<SourceMetadata> {
     let endpoint = format!("wss://{provider}.source.test/feed");
     let source_id = SourceId::try_from(source)?;
@@ -116,7 +149,7 @@ fn direct_metadata_with_provider_limit_and_quality(
     let input = SourceMetadataInput::new(
         SchemaVersion::CURRENT,
         source_id,
-        RevisionBoundPayloadEvidence::new(revision, exact_evidence(source.as_bytes()[0])),
+        RevisionBoundPayloadEvidence::new(revision, exact_evidence(evidence_byte)),
         SourceClass::Exchange,
         provider,
         authorization,

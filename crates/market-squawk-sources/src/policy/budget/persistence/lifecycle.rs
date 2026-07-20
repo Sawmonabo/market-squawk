@@ -400,6 +400,10 @@ impl AuthorityDurabilitySession {
         self.lifecycle_phase() == AuthorityLifecyclePhase::Active
     }
 
+    pub(super) fn lifecycle_is_closed(&self) -> bool {
+        self.lifecycle_phase() == AuthorityLifecyclePhase::Closed
+    }
+
     pub(super) fn begin_clean_close(&self) -> Result<(), AuthorityPersistenceError> {
         self.lifecycle
             .begin_clean_close()

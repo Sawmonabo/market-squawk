@@ -27,12 +27,14 @@ fs2 = { workspace = true }
 futures-util = { workspace = true }
 parking_lot = { workspace = true }
 market-squawk-domain = { workspace = true }
+market-squawk-adapter-coinbase = { workspace = true }
 market-squawk-live = { workspace = true }
 market-squawk-platform = { workspace = true }
 market-squawk-sources = { workspace = true }
 rust_decimal = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

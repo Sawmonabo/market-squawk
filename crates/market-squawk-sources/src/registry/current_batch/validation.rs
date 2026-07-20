@@ -94,12 +94,24 @@ pub enum RegistryError {
     /// A prior metadata incarnation already used the proposed revision identity.
     #[error("metadata revision identity was already used for this source")]
     RevisionAlreadyUsed,
+    /// A durable resume attempted to reuse a revision older than the latest registered revision.
+    #[error("only the latest durable metadata revision can be resumed")]
+    RevisionNotLatest,
+    /// The latest durable revision lacks the exact payload evidence required for safe resume.
+    #[error("latest durable metadata revision has no resumable payload evidence")]
+    RevisionEvidenceUnavailable,
+    /// The proposed metadata payload evidence differs from the latest durable revision evidence.
+    #[error("metadata revision payload evidence changed across restart")]
+    RevisionEvidenceMismatch,
     /// Bounded source metadata revision history is full.
     #[error("source metadata revision history exhausted")]
     RevisionHistoryExhausted,
     /// Session generation did not strictly advance.
     #[error("connection generation must strictly advance")]
     GenerationNotAdvanced,
+    /// The persisted connection-generation high-water cannot advance.
+    #[error("connection generation space exhausted")]
+    ConnectionGenerationExhausted,
     /// Session ended or another session became current.
     #[error("source session is not current")]
     SessionNotCurrent,

@@ -15,8 +15,9 @@ mod tests {
     };
 
     use super::{
-        AuthoritativeSourceRegistry, RawFrameFactory, RegistryError, MAX_AUTHORITY_SOURCES,
-        SessionLeaseState, SourceAuthorityHistory, UnconfiguredAuthorizationSubjectResolver,
+        AuthoritativeSourceRegistry, BoundedVec, PersistedSourceAuthority, RawFrameFactory,
+        RegistryAuthorityState, RegistryError, MAX_AUTHORITY_SOURCES, SessionLeaseState,
+        SourceAuthorityHistory, UnconfiguredAuthorizationSubjectResolver,
         validate_observation_profile,
     };
     use crate::authority_time::{
@@ -36,8 +37,8 @@ mod tests {
     };
     use crate::registry::test_support::{
         TestResult, direct_metadata, direct_metadata_with_provider_and_limit,
-        direct_metadata_with_quality, exact_evidence, freshness_policy, healthy_snapshot,
-        source_identifier,
+        direct_metadata_with_quality, direct_metadata_with_revision_evidence, exact_evidence,
+        freshness_policy, healthy_snapshot, source_identifier,
     };
 
     #[derive(Clone, Copy, Debug)]
@@ -580,6 +581,125 @@ mod tests {
             validate_observation_profile(&protocol, DataQuality::DirectUnverified, &trade),
             Err(RegistryError::DecoderProfileMismatch)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn exact_restart_resume_preserves_revision_and_allocates_the_next_generation() -> TestResult {
+        let at = Timestamp::from_unix_nanos(1_000_000_000);
+        let store = Arc::new(FailingAuthorityStore::default());
+        let metadata = direct_metadata("restart-resume", "revision-1")?;
+        let mut first = durable_registry_with_test_store(store.clone())?;
+        let registered = first.register_or_resume_exact(metadata.clone(), at)?;
+        let session = first.begin_session(
+            &registered,
+            SessionId::new(SourceIdentifier::try_from("session-7")?),
+            ConnectionGeneration::new(7)?,
+            at,
+        )?;
+        first.end_session(&session, at)?;
+        drop(session);
+        drop(registered);
+        first.shutdown()?;
+
+        let mut restarted = durable_registry_with_test_store(store.clone())?;
+        let resumed = restarted.register_or_resume_exact(metadata.clone(), at)?;
+        assert_eq!(resumed.revision(), metadata.revision());
+        let next = restarted.begin_next_session(
+            &resumed,
+            SessionId::new(SourceIdentifier::try_from("session-8")?),
+            at,
+        )?;
+        assert_eq!(next.generation(), ConnectionGeneration::new(8)?);
+        restarted.end_session(&next, at)?;
+        drop(next);
+        drop(resumed);
+        restarted.shutdown()?;
+
+        let mut changed = durable_registry_with_test_store(store)?;
+        assert!(matches!(
+            changed.register_or_resume_exact(
+                direct_metadata_with_revision_evidence("restart-resume", "revision-1", 99)?,
+                at,
+            ),
+            Err(RegistryError::RevisionEvidenceMismatch)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_revision_history_loads_but_cannot_exact_resume_without_evidence() -> TestResult {
+        let at = Timestamp::from_unix_nanos(1_000_000_000);
+        let metadata = direct_metadata("legacy-restart", "revision-1")?;
+        let legacy_state = RegistryAuthorityState::try_new(
+            vec![PersistedSourceAuthority {
+                source_id: metadata.source_id().clone(),
+                used_revisions: BoundedVec::try_new(vec![metadata.revision().clone()])?,
+                latest_revision_evidence: None,
+                revoked: false,
+                last_epoch: 1,
+                generation_high_water: None,
+            }],
+            Vec::new(),
+        )?;
+        let legacy_wire = serde_json::to_vec(&legacy_state)?;
+        let loaded: RegistryAuthorityState = serde_json::from_slice(&legacy_wire)?;
+        let mut restarted =
+            AuthoritativeSourceRegistry::try_new_ephemeral_with_authority_state_for_diagnostics(
+                loaded,
+            )?;
+
+        assert!(matches!(
+            restarted.register_or_resume_exact(metadata, at),
+            Err(RegistryError::RevisionEvidenceUnavailable)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn restart_rejects_stale_revision_and_exhausted_generation_without_mutation() -> TestResult {
+        let at = Timestamp::from_unix_nanos(1_000_000_000);
+        let store = Arc::new(FailingAuthorityStore::default());
+        let mut first = durable_registry_with_test_store(store.clone())?;
+        let revision_1 = direct_metadata("restart-stale", "revision-1")?;
+        let registered = first.register_or_resume_exact(revision_1.clone(), at)?;
+        let revision_2 = direct_metadata("restart-stale", "revision-2")?;
+        let replacement = first.replace_metadata(&registered, revision_2.clone(), at)?;
+        let maximum = first.begin_session(
+            &replacement,
+            SessionId::new(SourceIdentifier::try_from("maximum-generation")?),
+            ConnectionGeneration::new(u64::MAX)?,
+            at,
+        )?;
+        first.end_session(&maximum, at)?;
+        drop(maximum);
+        drop(replacement);
+        drop(registered);
+        first.shutdown()?;
+
+        let mut restarted = durable_registry_with_test_store(store.clone())?;
+        assert!(matches!(
+            restarted.register_or_resume_exact(revision_1, at),
+            Err(RegistryError::RevisionNotLatest)
+        ));
+        let resumed = restarted.register_or_resume_exact(revision_2, at)?;
+        let before = restarted.export_authority_state()?;
+        let stores_before = store.store_calls.load(Ordering::Acquire);
+        assert!(matches!(
+            restarted.begin_next_session(
+                &resumed,
+                SessionId::new(SourceIdentifier::try_from("never-started")?),
+                at,
+            ),
+            Err(RegistryError::ConnectionGenerationExhausted)
+        ));
+        assert_eq!(restarted.export_authority_state()?, before);
+        assert_eq!(store.store_calls.load(Ordering::Acquire), stores_before);
+        let entry = restarted
+            .entries
+            .get(resumed.source_id())
+            .ok_or("resumed entry disappeared")?;
+        assert!(entry.active.is_none());
         Ok(())
     }
 

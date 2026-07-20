@@ -10,7 +10,8 @@ use market_squawk_domain::SchemaVersion;
 use market_squawk_domain::{
     ConnectionGeneration, CoverageConsolidation, CoverageDelay, DeliveryEvidence,
     EffectiveInterval, ExactPayloadEvidence, InstrumentId, LiveEventClass, MarketDepth,
-    MetadataRevision, ProviderProduct, SourceId, SourceIdentifier, Timestamp, VenueId,
+    MetadataRevision, ProviderProduct, RevisionBoundPayloadEvidence, SourceId, SourceIdentifier,
+    Timestamp, VenueId,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
@@ -307,6 +308,8 @@ impl InstrumentUniverseAttestation {
 #[derive(Clone, Debug)]
 struct SourceAuthorityHistory {
     used_revisions: Vec<MetadataRevision>,
+    latest_revision_evidence: Option<RevisionBoundPayloadEvidence>,
+    revoked: bool,
     last_epoch: u64,
     generation_high_water: Option<ConnectionGeneration>,
 }
@@ -316,6 +319,10 @@ struct SourceAuthorityHistory {
 struct PersistedSourceAuthority {
     source_id: SourceId,
     used_revisions: BoundedVec<MetadataRevision, MAX_REVISIONS_PER_SOURCE>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    latest_revision_evidence: Option<RevisionBoundPayloadEvidence>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    revoked: bool,
     last_epoch: u64,
     generation_high_water: Option<ConnectionGeneration>,
 }
@@ -349,6 +356,17 @@ impl RegistryAuthorityState {
             source.last_epoch == 0
                 || source.used_revisions.is_empty()
                 || contains_duplicate_revisions(source.used_revisions.as_slice())
+                || (source.revoked && source.latest_revision_evidence.is_some())
+                || source
+                    .latest_revision_evidence
+                    .as_ref()
+                    .is_some_and(|evidence| {
+                        source
+                            .used_revisions
+                            .as_slice()
+                            .last()
+                            .is_none_or(|latest| latest != evidence.metadata_revision())
+                    })
         }) || sources.iter().enumerate().any(|(index, source)| {
             sources[index.saturating_add(1)..]
                 .iter()
@@ -375,22 +393,22 @@ impl RegistryAuthorityState {
             .try_reserve(self.sources.len())
             .map_err(|_| crate::policy::AuthorityPersistenceError::StateTooLarge)?;
         for source in self.sources.as_slice() {
-            let mut revisions = Vec::new();
-            revisions
-                .try_reserve(source.used_revisions.len())
-                .map_err(|_| crate::policy::AuthorityPersistenceError::StateTooLarge)?;
-            revisions.extend(source.used_revisions.as_slice().iter().cloned());
-            revisions.sort_by(|left, right| {
-                left.as_source_identifier()
-                    .cmp(right.as_source_identifier())
-            });
-            if revisions.windows(2).any(|pair| pair[0] == pair[1]) {
+            if contains_duplicate_revisions(source.used_revisions.as_slice())
+                || (source.revoked && source.latest_revision_evidence.is_some())
+                || source
+                    .latest_revision_evidence
+                    .as_ref()
+                    .is_some_and(|evidence| {
+                        source
+                            .used_revisions
+                            .as_slice()
+                            .last()
+                            .is_none_or(|latest| latest != evidence.metadata_revision())
+                    })
+            {
                 return Err(crate::policy::AuthorityPersistenceError::InvalidState);
             }
-            let mut canonical_source = source.clone();
-            canonical_source.used_revisions = BoundedVec::try_new(revisions)
-                .map_err(|_| crate::policy::AuthorityPersistenceError::StateTooLarge)?;
-            sources.push(canonical_source);
+            sources.push(source.clone());
         }
         sources.sort_by(|left, right| left.source_id.cmp(&right.source_id));
         if sources
@@ -429,6 +447,10 @@ impl RegistryAuthorityState {
     pub(crate) fn budget_policies(&self) -> &[PersistedProviderBudgetPolicy] {
         self.budget_policies.as_slice()
     }
+}
+
+const fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Deserialize)]

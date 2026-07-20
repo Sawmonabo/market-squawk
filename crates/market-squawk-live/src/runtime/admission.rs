@@ -316,6 +316,11 @@ impl DormantRouteIngress {
     pub const fn shard(&self) -> ShardId {
         self.shard
     }
+
+    /// Returns a conservative charge for memory uniquely retained by this reservation.
+    pub fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(self.route.venue().retained_bytes())
+    }
 }
 
 /// Nonblocking producer handle bound to one route and one exact generation allocation.
