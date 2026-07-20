@@ -1,0 +1,28 @@
+[package]
+name = "market-squawk-adapter-kraken"
+description = "Integrity-bounded Kraken Spot WebSocket v2 market-data adapter"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+license.workspace = true
+repository = "https://github.com/Sawmonabo/market-squawk"
+publish = false
+
+[dependencies]
+bytes.workspace = true
+chrono.workspace = true
+futures-util.workspace = true
+market-squawk-domain.workspace = true
+market-squawk-live.workspace = true
+market-squawk-sources.workspace = true
+rust_decimal.workspace = true
+serde.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
+thiserror.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tokio-util.workspace = true
+url.workspace = true
+
+[lints]
+workspace = true

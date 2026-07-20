@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "fixtures": [{
+    "path": "official_book_checksum.json",
+    "source": "https://docs.kraken.com/api/docs/guides/spot-ws-book-v2/",
+    "retrieved_at": "2026-07-20",
+    "derivation": "Kraken's published checksum sample wrapped in the documented WebSocket v2 book envelope with a schema-valid RFC3339 timestamp",
+    "sha256": "dac86e903deed67b1e7ca84eb36a1435f452d1ce4312161993e15b352916bf92",
+    "expected_crc32": 3310070434
+  }],
+  "protocol_sources": [
+    "https://docs.kraken.com/api/docs/websocket-v2/book/",
+    "https://docs.kraken.com/api/docs/websocket-v2/trade/",
+    "https://docs.kraken.com/api/docs/websocket-v2/status/",
+    "https://docs.kraken.com/api/docs/websocket-v2/heartbeat/",
+    "https://docs.kraken.com/api/docs/guides/reconnection/"
+  ],
+  "qualification_policy": {
+    "version": 1,
+    "canonical_record": "kraken-ws-v2|book-sequence=unsupported|trade-id-not-channel-sequence|book-checksum=crc32-every-update|quality=direct-unverified|execution=ineligible|version=1",
+    "sha256": "23f1d350faa0dbfb95f3521f43b0b200ac34e680c8b6c8d346da95c91be12f5b",
+    "blocked_consumer": "Task 2 risk and paper-execution services are absent at audit base 223a8a1f0250f9e8cffe4e5899b4a7b3ecba4ad8; automated action remains ineligible and the live-to-paper acceptance row remains open."
+  },
+  "licensing": {
+    "statement": "No redistribution license is inferred. Operators must retain evidence that their use complies with Kraken's current terms.",
+    "terms": "https://www.kraken.com/legal"
+  }
+}
