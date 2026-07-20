@@ -1,6 +1,7 @@
 //! SQLite-backed immutable analytical generation storage.
 
 use std::fmt;
+use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -19,7 +20,7 @@ use crate::{ArtifactRecord, DatasetManifestRecord};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PinnedManifestObject {
     artifact_id: Uuid,
-    relative_reference: String,
+    relative_reference: Box<str>,
     object: ManifestObject,
 }
 
@@ -45,7 +46,8 @@ impl PinnedManifestObject {
 pub struct PinnedDataset {
     manifest: DatasetManifestRef,
     plan: ManifestPlan,
-    objects: Vec<PinnedManifestObject>,
+    objects: Box<[PinnedManifestObject]>,
+    retained_bytes: usize,
 }
 
 impl PinnedDataset {
@@ -62,6 +64,11 @@ impl PinnedDataset {
     /// Returns objects in stable row order.
     pub fn objects(&self) -> &[PinnedManifestObject] {
         &self.objects
+    }
+
+    /// Returns the checked requested bytes retained by this complete immutable pin graph.
+    pub(crate) const fn retained_bytes(&self) -> usize {
+        self.retained_bytes
     }
 }
 
@@ -103,7 +110,7 @@ impl AnalyticalManifestCatalog {
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "trusted_schema", "OFF")?;
         let migrated: bool = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=4)",
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=5)",
             [],
             |row| row.get(0),
         )?;
@@ -441,6 +448,9 @@ pub enum ManifestCatalogError {
     /// Row, byte, version, or ordinal conversion overflowed.
     #[error("analytical manifest count overflow")]
     CountOverflow,
+    /// An exact-capacity immutable construction changed allocation identity.
+    #[error("analytical manifest immutable allocation contract changed")]
+    AllocationContract,
     /// The connection lock was poisoned.
     #[error("analytical manifest catalog lock is unavailable")]
     LockPoisoned,
@@ -508,6 +518,20 @@ fn load_pinned(
     if parse_digest(&header.0)? != reference.content_hash {
         return Err(ManifestCatalogError::GenerationConflict);
     }
+    let object_count = connection.query_row(
+        "SELECT COUNT(*) FROM analytical_generation_objects
+         WHERE dataset_id=?1 AND manifest_version=?2",
+        params![
+            reference.dataset_id.as_str(),
+            to_i64(reference.manifest_version)?
+        ],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let object_count =
+        usize::try_from(object_count).map_err(|_| ManifestCatalogError::CountOverflow)?;
+    if object_count == 0 {
+        return Err(ManifestCatalogError::CorruptCatalog);
+    }
     let mut statement = connection.prepare(
         "SELECT objects.artifact_id, artifacts.relative_reference, objects.content_hash,
                 objects.row_count, objects.size_bytes, objects.lineage_hash
@@ -533,12 +557,18 @@ fn load_pinned(
         },
     )?;
     let mut objects = Vec::new();
+    objects
+        .try_reserve_exact(object_count)
+        .map_err(|_| ManifestCatalogError::CountOverflow)?;
+    if objects.capacity() != object_count {
+        return Err(ManifestCatalogError::AllocationContract);
+    }
     for row in rows {
         let (artifact_id, relative_reference, content, rows, bytes, lineage) = row?;
         objects.push(PinnedManifestObject {
             artifact_id: Uuid::parse_str(&artifact_id)
                 .map_err(|_| ManifestCatalogError::CorruptCatalog)?,
-            relative_reference,
+            relative_reference: relative_reference.into_boxed_str(),
             object: ManifestObject::try_new(
                 parse_digest(&content)?,
                 from_i64(rows)?,
@@ -547,10 +577,23 @@ fn load_pinned(
             )?,
         });
     }
-    let plan = ManifestPlan::from_objects(
-        reference.dataset_id.clone(),
-        objects.iter().map(|value| value.object.clone()).collect(),
-    )?;
+    if objects.len() != object_count {
+        return Err(ManifestCatalogError::CorruptCatalog);
+    }
+    let mut plan_objects = Vec::new();
+    plan_objects
+        .try_reserve_exact(object_count)
+        .map_err(|_| ManifestCatalogError::CountOverflow)?;
+    if plan_objects.capacity() != object_count {
+        return Err(ManifestCatalogError::AllocationContract);
+    }
+    plan_objects.extend(objects.iter().map(|value| value.object.clone()));
+    let plan_allocation = plan_objects.as_ptr();
+    let plan_objects = plan_objects.into_boxed_slice();
+    if plan_objects.as_ptr() != plan_allocation {
+        return Err(ManifestCatalogError::AllocationContract);
+    }
+    let plan = ManifestPlan::from_exact_objects(reference.dataset_id.clone(), plan_objects)?;
     if plan.content_hash != reference.content_hash
         || plan.lineage_digest != parse_digest(&header.1)?
         || plan.row_count != from_i64(header.2)?
@@ -558,11 +601,47 @@ fn load_pinned(
     {
         return Err(ManifestCatalogError::CorruptCatalog);
     }
+    let object_allocation = objects.as_ptr();
+    let objects = objects.into_boxed_slice();
+    if objects.as_ptr() != object_allocation {
+        return Err(ManifestCatalogError::AllocationContract);
+    }
+    let retained_bytes = pinned_dataset_retained_bytes(reference, &plan, &objects)?;
     Ok(PinnedDataset {
         manifest: reference.clone(),
         plan,
         objects,
+        retained_bytes,
     })
+}
+
+fn pinned_dataset_retained_bytes(
+    manifest: &DatasetManifestRef,
+    plan: &ManifestPlan,
+    objects: &[PinnedManifestObject],
+) -> Result<usize, ManifestCatalogError> {
+    let inline_objects = objects
+        .len()
+        .checked_mul(size_of::<PinnedManifestObject>())
+        .ok_or(ManifestCatalogError::CountOverflow)?;
+    let plan_objects = plan
+        .objects()
+        .len()
+        .checked_mul(size_of::<ManifestObject>())
+        .ok_or(ManifestCatalogError::CountOverflow)?;
+    objects.iter().try_fold(
+        size_of::<PinnedDataset>()
+            .checked_add(inline_objects)
+            .and_then(|value| value.checked_add(plan_objects))
+            .and_then(|value| value.checked_add(manifest.dataset_id().as_str().len()))
+            .and_then(|value| value.checked_add(plan.dataset_id().as_str().len()))
+            .ok_or(ManifestCatalogError::CountOverflow)?,
+        |total, object| {
+            total
+                .checked_add(object.relative_reference().len())
+                .ok_or(ManifestCatalogError::CountOverflow)
+        },
+    )
 }
 
 fn manifest_for_anchor(

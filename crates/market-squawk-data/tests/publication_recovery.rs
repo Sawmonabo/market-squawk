@@ -43,14 +43,14 @@ fn a_live_service_excludes_a_second_catalog_from_the_same_artifact_root() -> Tes
     let first_location = first_paths.catalog()?.clone();
     let second_location = second_paths.catalog()?.clone();
     let store_config = ObjectStoreConfig::try_new(1024 * 1024, 32, Duration::from_secs(60))?;
-    let first = AnalyticalDataService::open(
+    let first = AnalyticalDataService::initialize(
         CatalogAuthority::open(test_catalog_config(first_location.clone())?)?,
         AnalyticalManifestCatalog::open(&first_location, 8)?,
         first_paths.artifacts()?.clone(),
         store_config,
     )?;
 
-    let conflicting = AnalyticalDataService::open(
+    let conflicting = AnalyticalDataService::initialize(
         CatalogAuthority::open(test_catalog_config(second_location.clone())?)?,
         AnalyticalManifestCatalog::open(&second_location, 8)?,
         first_paths.artifacts()?.clone(),
@@ -85,6 +85,149 @@ fn a_live_service_excludes_a_second_catalog_from_the_same_artifact_root() -> Tes
     Ok(())
 }
 
+#[test]
+fn a_catalog_rejects_a_replacement_directory_at_the_same_artifact_path() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let local_root = directory.path().join("market-squawk");
+    let paths = LocalPaths::prepare(&local_root)?;
+    let location = paths.catalog()?.clone();
+    let artifact_path = paths.artifacts()?.root().to_path_buf();
+    let store_config = ObjectStoreConfig::try_new(1024 * 1024, 32, Duration::from_secs(60))?;
+    let service = AnalyticalDataService::initialize(
+        CatalogAuthority::open(test_catalog_config(location.clone())?)?,
+        AnalyticalManifestCatalog::open(&location, 8)?,
+        paths.artifacts()?.clone(),
+        store_config,
+    )?;
+    drop(service);
+    drop(paths);
+
+    std::fs::rename(&artifact_path, local_root.join("replaced-artifacts"))?;
+    std::fs::create_dir(&artifact_path)?;
+    let replacement_paths = LocalPaths::prepare(&local_root)?;
+    let replacement = AnalyticalDataService::open(
+        CatalogAuthority::open(test_catalog_config(location.clone())?)?,
+        AnalyticalManifestCatalog::open(&location, 8)?,
+        replacement_paths.artifacts()?.clone(),
+        store_config,
+    );
+
+    assert!(matches!(
+        replacement,
+        Err(IngestError::Parquet(ParquetStoreError::RootCatalogMismatch))
+    ));
+    Ok(())
+}
+
+#[test]
+fn a_legacy_v4_catalog_requires_explicit_root_migration_after_replacement() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let local_root = directory.path().join("market-squawk");
+    let paths = LocalPaths::prepare(&local_root)?;
+    let location = paths.catalog()?.clone();
+    let artifact_path = paths.artifacts()?.root().to_path_buf();
+    let store_config = ObjectStoreConfig::try_new(1024 * 1024, 32, Duration::from_secs(60))?;
+    let service = AnalyticalDataService::initialize(
+        CatalogAuthority::open(test_catalog_config(location.clone())?)?,
+        AnalyticalManifestCatalog::open(&location, 8)?,
+        paths.artifacts()?.clone(),
+        store_config,
+    )?;
+    drop(service);
+    drop(paths);
+
+    let connection = rusqlite::Connection::open(location.path())?;
+    connection.execute_batch(
+        "INSERT INTO query_artifact_reservations(
+             reservation_id, owner, request_algorithm, request_digest, max_bytes,
+             requested_at_ns, expires_at_ns, state, bound_at_ns
+         ) VALUES (
+             '00000000-0000-0000-0000-000000000001', 'legacy-v4', 1, zeroblob(32), 1,
+             1, 2, 'reserved', NULL
+         );
+         DROP TRIGGER analytical_artifact_root_authority_events_immutable_update;
+         DROP TRIGGER analytical_artifact_root_authority_events_immutable_delete;
+         DROP TRIGGER analytical_artifact_root_authority_events_append_guard;
+         DROP TABLE analytical_artifact_root_authority_events;
+         DELETE FROM schema_migrations WHERE version = 5;",
+    )?;
+    drop(connection);
+
+    std::fs::rename(&artifact_path, local_root.join("legacy-artifacts"))?;
+    std::fs::create_dir(&artifact_path)?;
+    for _attempt in 0..2 {
+        let replacement_paths = LocalPaths::prepare(&local_root)?;
+        let replacement = AnalyticalDataService::open(
+            CatalogAuthority::open(test_catalog_config(location.clone())?)?,
+            AnalyticalManifestCatalog::open(&location, 8)?,
+            replacement_paths.artifacts()?.clone(),
+            store_config,
+        );
+        assert!(matches!(
+            replacement,
+            Err(IngestError::Catalog(
+                CatalogError::ArtifactRootMigrationRequired
+            ))
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn a_v2_catalog_with_artifacts_cannot_fabricate_root_authority() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let paths = LocalPaths::prepare(directory.path().join("market-squawk"))?;
+    let location = paths.catalog()?.clone();
+    let catalog_config = test_catalog_config(location.clone())?;
+    drop(CatalogAuthority::open(catalog_config.clone())?);
+
+    let connection = rusqlite::Connection::open(location.path())?;
+    connection.execute_batch(
+        "PRAGMA foreign_keys = ON;
+         BEGIN;
+         INSERT INTO sources VALUES ('v2-source', zeroblob(32), 1, 1);
+         INSERT INTO source_revisions VALUES ('v2-source', zeroblob(32), '{}', 1);
+         INSERT INTO source_rights VALUES (
+             zeroblob(32), 'v2-source', 1, zeroblob(32), 1,
+             'https://example.test/terms', 1, zeroblob(32), 1, zeroblob(32), NULL, 4, 1
+         );
+         INSERT INTO ingest_runs VALUES (
+             '00000000-0000-0000-0000-000000000001', 'v2-artifact', 'v2-source',
+             1, zeroblob(32), 'persist', zeroblob(32), 'succeeded', 1, 2
+         );
+         INSERT INTO artifacts VALUES (
+             '00000000-0000-0000-0000-000000000002',
+             '00000000-0000-0000-0000-000000000001',
+             'objects/sha256/00/fixture.parquet', 1, zeroblob(32), 1, 2
+         );
+         DROP TABLE query_artifact_results;
+         DROP TABLE query_artifact_reservations;
+         DROP TABLE analytical_generation_objects;
+         DROP TABLE analytical_generations;
+         DROP TRIGGER analytical_artifact_root_authority_events_immutable_update;
+         DROP TRIGGER analytical_artifact_root_authority_events_immutable_delete;
+         DROP TRIGGER analytical_artifact_root_authority_events_append_guard;
+         DROP TABLE analytical_artifact_root_authority_events;
+         DELETE FROM schema_migrations WHERE version >= 3;
+         COMMIT;",
+    )?;
+    drop(connection);
+
+    let service = AnalyticalDataService::initialize(
+        CatalogAuthority::open(catalog_config)?,
+        AnalyticalManifestCatalog::open(&location, 8)?,
+        paths.artifacts()?.clone(),
+        ObjectStoreConfig::try_new(1024 * 1024, 32, Duration::from_secs(60))?,
+    );
+    assert!(matches!(
+        service,
+        Err(IngestError::Catalog(
+            CatalogError::ArtifactRootAuthorityTransitionConflict
+        ))
+    ));
+    Ok(())
+}
+
 #[tokio::test]
 async fn cross_root_artifact_authority_fails_before_publication_or_bind() -> TestResult {
     let first_directory = tempfile::tempdir()?;
@@ -94,13 +237,13 @@ async fn cross_root_artifact_authority_fails_before_publication_or_bind() -> Tes
     let first_location = first_paths.catalog()?.clone();
     let second_location = second_paths.catalog()?.clone();
     let store_config = ObjectStoreConfig::try_new(8 * 1024 * 1024, 8192, Duration::from_secs(60))?;
-    let first = AnalyticalDataService::open(
+    let first = AnalyticalDataService::initialize(
         CatalogAuthority::open(test_catalog_config(first_location.clone())?)?,
         AnalyticalManifestCatalog::open(&first_location, 8)?,
         first_paths.artifacts()?.clone(),
         store_config,
     )?;
-    let second = AnalyticalDataService::open(
+    let second = AnalyticalDataService::initialize(
         CatalogAuthority::open(test_catalog_config(second_location.clone())?)?,
         AnalyticalManifestCatalog::open(&second_location, 8)?,
         second_paths.artifacts()?.clone(),
@@ -126,12 +269,17 @@ async fn cross_root_artifact_authority_fails_before_publication_or_bind() -> Tes
     )?;
     let request = QueryRequest::try_new(manifest.clone(), "SELECT value FROM observations")?;
     let wall_nanos = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos())?;
-    let reservation = first.reserve_query_artifact(QueryArtifactReservationInput::try_new(
-        SourceIdentifier::try_from("cross-root-owner")?,
-        request.artifact_identity(&limits),
-        limits.max_bytes(),
-        Timestamp::from_unix_nanos(wall_nanos).checked_add_nanos(120_000_000_000)?,
-    )?)?;
+    let reservation = first
+        .reserve_query_artifact(
+            QueryArtifactReservationInput::try_new(
+                SourceIdentifier::try_from("cross-root-owner")?,
+                request.artifact_identity(&limits),
+                limits.max_bytes(),
+                Timestamp::from_unix_nanos(wall_nanos).checked_add_nanos(120_000_000_000)?,
+            )?,
+            &CancellationToken::new(),
+        )
+        .await?;
     let before = count_published_objects(second_paths.artifacts()?.root())?;
     let result = ResearchQueryEngine::from_pinned_batches(manifest, "observations", vec![batch])?
         .with_artifact_publication(second.query_artifact_publication())?
@@ -167,7 +315,7 @@ async fn authorized_query_artifact_survives_restart_until_expiry() -> TestResult
         CatalogResultLimits::try_new(1024 * 1024, 8 * 1024 * 1024)?,
     )?;
     let store_config = ObjectStoreConfig::try_new(8 * 1024 * 1024, 8192, Duration::from_secs(60))?;
-    let service = AnalyticalDataService::open(
+    let service = AnalyticalDataService::initialize(
         CatalogAuthority::open(catalog_config.clone())?,
         AnalyticalManifestCatalog::open(&location, 8)?,
         paths.artifacts()?.clone(),
@@ -197,20 +345,30 @@ async fn authorized_query_artifact_survives_restart_until_expiry() -> TestResult
     let expires_at = Timestamp::from_unix_nanos(wall_nanos).checked_add_nanos(120_000_000_000)?;
     let owner = SourceIdentifier::try_from("research-session-1")?;
     assert!(matches!(
-        service.reserve_query_artifact(QueryArtifactReservationInput::try_new(
-            owner.clone(),
-            request.artifact_identity(&limits),
-            limits.max_bytes(),
-            Timestamp::from_unix_nanos(i64::MAX),
-        )?),
+        service
+            .reserve_query_artifact(
+                QueryArtifactReservationInput::try_new(
+                    owner.clone(),
+                    request.artifact_identity(&limits),
+                    limits.max_bytes(),
+                    Timestamp::from_unix_nanos(i64::MAX),
+                )?,
+                &CancellationToken::new(),
+            )
+            .await,
         Err(IngestError::Catalog(CatalogError::QueryArtifactExpired))
     ));
-    let reservation = service.reserve_query_artifact(QueryArtifactReservationInput::try_new(
-        owner.clone(),
-        request.artifact_identity(&limits),
-        limits.max_bytes(),
-        expires_at,
-    )?)?;
+    let reservation = service
+        .reserve_query_artifact(
+            QueryArtifactReservationInput::try_new(
+                owner.clone(),
+                request.artifact_identity(&limits),
+                limits.max_bytes(),
+                expires_at,
+            )?,
+            &CancellationToken::new(),
+        )
+        .await?;
     let publisher = service.query_artifact_publication();
     let engine = ResearchQueryEngine::from_pinned_batches(manifest, "observations", vec![batch])?
         .with_artifact_publication(publisher)?;
@@ -299,7 +457,7 @@ async fn rights_bound_ingest_replays_one_complete_pinned_generation() -> TestRes
         )?,
         &rights,
     )?;
-    let service = AnalyticalDataService::open(
+    let service = AnalyticalDataService::initialize(
         authority,
         AnalyticalManifestCatalog::open(&location, 8)?,
         paths.artifacts()?.clone(),

@@ -13,6 +13,8 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
+use crate::analytical_backup::AnalyticalOperationGate;
+use crate::authority_transition::{AuthorityTransitionError, AuthorityTransitionService};
 use crate::catalog::QueryArtifactPublisher;
 use crate::parquet_store::ArtifactRootIdentity;
 use crate::{
@@ -110,6 +112,7 @@ pub struct AnalyticalDataService {
     catalog_id: uuid::Uuid,
     manifests: AnalyticalManifestCatalog,
     objects: Arc<ParquetObjectStore>,
+    operation_gate: AnalyticalOperationGate,
 }
 
 /// Non-separable query-result publication authority for one catalog and artifact root.
@@ -118,6 +121,7 @@ pub struct QueryArtifactPublication {
     publisher: QueryArtifactPublisher,
     catalog_id: uuid::Uuid,
     root_identity: ArtifactRootIdentity,
+    operation_gate: AnalyticalOperationGate,
 }
 
 impl fmt::Debug for QueryArtifactPublication {
@@ -143,6 +147,11 @@ impl QueryArtifactPublication {
         reservation: &QueryArtifactReservation,
     ) -> Result<(PublishedObject, ArtifactRecord, crate::QueryArtifactResult), crate::QueryError>
     {
+        let _operation = self
+            .operation_gate
+            .acquire(cancellation)
+            .await
+            .ok_or(crate::QueryError::Cancelled)?;
         if reservation.catalog_id() != self.catalog_id {
             return Err(crate::QueryError::Catalog(
                 CatalogError::InvalidReservationCapability,
@@ -191,6 +200,38 @@ fn map_query_store_error(error: ParquetStoreError) -> crate::QueryError {
 }
 
 impl AnalyticalDataService {
+    /// Explicitly prepares, durably binds, and activates a fresh analytical catalog/root pair.
+    pub fn initialize(
+        authority: CatalogAuthority,
+        manifests: AnalyticalManifestCatalog,
+        artifact_root: market_squawk_platform::ArtifactRoot,
+        object_config: ObjectStoreConfig,
+    ) -> Result<Self, IngestError> {
+        if authority.catalog_path() != manifests.catalog_path() {
+            return Err(IngestError::CatalogCompositionMismatch);
+        }
+        let (authority, objects) =
+            AuthorityTransitionService::initialize(authority, artifact_root, object_config)
+                .map_err(map_authority_transition_error)?;
+        Ok(Self::from_active_parts(authority, manifests, objects))
+    }
+
+    /// Explicitly verifies and migrates an exact version-3/version-4 catalog and v1 root pair.
+    pub fn migrate_legacy(
+        authority: CatalogAuthority,
+        manifests: AnalyticalManifestCatalog,
+        artifact_root: market_squawk_platform::ArtifactRoot,
+        object_config: ObjectStoreConfig,
+    ) -> Result<Self, IngestError> {
+        if authority.catalog_path() != manifests.catalog_path() {
+            return Err(IngestError::CatalogCompositionMismatch);
+        }
+        let (authority, objects) =
+            AuthorityTransitionService::migrate_legacy(authority, artifact_root, object_config)
+                .map_err(map_authority_transition_error)?;
+        Ok(Self::from_active_parts(authority, manifests, objects))
+    }
+
     /// Opens immutable storage from controlled capabilities and a validated generation catalog.
     pub fn open(
         authority: CatalogAuthority,
@@ -198,23 +239,28 @@ impl AnalyticalDataService {
         artifact_root: market_squawk_platform::ArtifactRoot,
         object_config: ObjectStoreConfig,
     ) -> Result<Self, IngestError> {
-        authority.integrity_check()?;
         if authority.catalog_path() != manifests.catalog_path() {
             return Err(IngestError::CatalogCompositionMismatch);
         }
-        let objects = ParquetObjectStore::open(
-            artifact_root,
-            object_config,
-            authority.catalog_path(),
-            authority.artifact_root_binding(),
-        )?;
+        let (authority, objects) =
+            AuthorityTransitionService::open_bound(authority, artifact_root, object_config)
+                .map_err(map_authority_transition_error)?;
+        Ok(Self::from_active_parts(authority, manifests, objects))
+    }
+
+    pub(crate) fn from_active_parts(
+        authority: CatalogAuthority,
+        manifests: AnalyticalManifestCatalog,
+        objects: ParquetObjectStore,
+    ) -> Self {
         let catalog_id = authority.session_id();
-        Ok(Self {
+        Self {
             authority: Arc::new(Mutex::new(authority)),
             catalog_id,
             manifests,
             objects: Arc::new(objects),
-        })
+            operation_gate: AnalyticalOperationGate::default(),
+        }
     }
 
     /// Returns the controlled object capability for manifest-pinned query construction.
@@ -222,11 +268,26 @@ impl AnalyticalDataService {
         Arc::clone(&self.objects)
     }
 
+    /// Returns sealed backup authority for this exact active catalog and artifact root.
+    pub fn backup_service(&self) -> crate::AnalyticalBackupService {
+        crate::AnalyticalBackupService::new(
+            self.operation_gate.clone(),
+            Arc::clone(&self.authority),
+            Arc::clone(&self.objects),
+        )
+    }
+
     /// Persists query-result ownership and expiry before artifact publication begins.
-    pub fn reserve_query_artifact(
+    pub async fn reserve_query_artifact(
         &self,
         input: QueryArtifactReservationInput,
+        cancellation: &CancellationToken,
     ) -> Result<QueryArtifactReservation, IngestError> {
+        let _operation = self
+            .operation_gate
+            .acquire(cancellation)
+            .await
+            .ok_or(IngestError::Cancelled)?;
         Ok(self.lock_authority()?.reserve_query_artifact(input)?)
     }
 
@@ -237,6 +298,7 @@ impl AnalyticalDataService {
             publisher: QueryArtifactPublisher::new(Arc::clone(&self.authority)),
             catalog_id: self.catalog_id,
             root_identity: self.objects.authority_identity().clone(),
+            operation_gate: self.operation_gate.clone(),
         })
     }
 
@@ -280,6 +342,23 @@ impl AnalyticalDataService {
             request.payload_digest(),
             batches,
         )?;
+        let _operation = self
+            .operation_gate
+            .acquire(&cancellation)
+            .await
+            .ok_or(IngestError::Cancelled)?;
+        {
+            let authority = self.lock_authority()?;
+            let run = self.validate_run(
+                &authority,
+                &reservation,
+                request.payload_digest(),
+                Some(&source_id),
+            )?;
+            if run.state() == IngestRunState::Failed {
+                return Err(IngestError::TerminalRun);
+            }
+        }
         let publication = self.objects.begin_publication(&cancellation).await?;
         let published = self
             .objects
@@ -330,6 +409,7 @@ impl AnalyticalDataService {
         &self,
         now: Timestamp,
     ) -> Result<OrphanRecoveryReport, IngestError> {
+        let _operation = self.operation_gate.acquire_uninterruptible().await;
         let mut recovery = self.objects.begin_recovery(now).await?;
         let _authority = self.lock_authority()?;
         let referenced: BTreeSet<_> = self.manifests.referenced_hashes(now)?.into_iter().collect();
@@ -365,6 +445,19 @@ impl AnalyticalDataService {
         }
         let converted = ResearchArrowBatch::try_from_extraction_batch(&batch)?;
         let lineage = converted.lineage_digest()?;
+        let _operation = self
+            .operation_gate
+            .acquire(&cancellation)
+            .await
+            .ok_or(IngestError::Cancelled)?;
+        {
+            let authority = self.lock_authority()?;
+            let run =
+                self.validate_run(&authority, &reservation, payload_digest, Some(&source_id))?;
+            if run.state() == IngestRunState::Failed {
+                return Err(IngestError::TerminalRun);
+            }
+        }
         let publication = self.objects.begin_publication(&cancellation).await?;
         let published = self
             .objects
@@ -499,6 +592,26 @@ impl AnalyticalDataService {
     }
 }
 
+fn map_root_authority_catalog_error(error: CatalogError) -> IngestError {
+    if matches!(error, CatalogError::ArtifactRootAuthorityMismatch) {
+        IngestError::Parquet(ParquetStoreError::RootCatalogMismatch)
+    } else {
+        IngestError::Catalog(error)
+    }
+}
+
+fn map_authority_transition_error(error: AuthorityTransitionError) -> IngestError {
+    match error {
+        AuthorityTransitionError::Catalog(error) => map_root_authority_catalog_error(error),
+        AuthorityTransitionError::Root(error) => IngestError::Parquet(error),
+        AuthorityTransitionError::Restore(_) => IngestError::AuthorityTransitionRejected,
+        AuthorityTransitionError::InvalidIdentity
+        | AuthorityTransitionError::TransitionConflict
+        | AuthorityTransitionError::LegacyEvidenceMismatch
+        | AuthorityTransitionError::NotBound => IngestError::AuthorityTransitionRejected,
+    }
+}
+
 impl ResearchIngestService for AnalyticalDataService {
     async fn ingest(
         &self,
@@ -513,6 +626,9 @@ impl ResearchIngestService for AnalyticalDataService {
 /// Analytical ingestion, publication, reconciliation, or compaction failure.
 #[derive(Debug, Error)]
 pub enum IngestError {
+    /// The explicit analytical catalog/root authority transition was rejected.
+    #[error("analytical artifact-root authority transition was rejected")]
+    AuthorityTransitionRejected,
     /// Canonical observation conversion failed.
     #[error("research observation conversion failed")]
     Arrow(#[from] ArrowConversionError),
@@ -562,3 +678,6 @@ pub enum IngestError {
     #[error("analytical catalog authority is unavailable")]
     AuthorityLockPoisoned,
 }
+
+#[cfg(test)]
+mod tests;

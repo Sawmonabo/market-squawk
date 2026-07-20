@@ -1,8 +1,8 @@
 use std::path::Path;
 
-#[cfg(unix)]
-use market_squawk_platform::JournalError;
 use market_squawk_platform::{ArtifactPathError, LocalPaths};
+#[cfg(unix)]
+use market_squawk_platform::{JournalError, PathError};
 use tempfile::tempdir;
 
 #[test]
@@ -88,6 +88,23 @@ fn resolved_artifact_revalidates_before_create_new() -> Result<(), Box<dyn std::
     file.write_all(b"{}")?;
 
     assert!(resolved.create_new().is_err());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn artifact_capability_clone_rejects_same_path_directory_replacement()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let paths = LocalPaths::prepare(directory.path().join("data"))?;
+    let artifact_path = paths.artifacts()?.root().to_path_buf();
+    std::fs::rename(&artifact_path, directory.path().join("original-artifacts"))?;
+    std::fs::create_dir(&artifact_path)?;
+
+    assert!(matches!(
+        paths.artifacts()?.try_clone_directory(),
+        Err(PathError::PreparedRootChanged)
+    ));
     Ok(())
 }
 

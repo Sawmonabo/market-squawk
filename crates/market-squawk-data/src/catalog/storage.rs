@@ -13,6 +13,7 @@ use serde::de::DeserializeOwned;
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
+use super::authority::append_legacy_authority_requirement;
 use super::types::{CatalogError, CatalogResultLimits, IngestReservation};
 use crate::migrations::MIGRATIONS;
 use crate::rights::SourceRightsDecision;
@@ -99,17 +100,30 @@ pub(super) fn prepare_local_path(path: &Path) -> Result<PathBuf, CatalogError> {
     Ok(prepared)
 }
 
-pub(super) fn apply_migrations(connection: &mut Connection) -> Result<(), CatalogError> {
+pub(super) fn apply_migrations(
+    connection: &mut Connection,
+    catalog_identity: [u8; 32],
+) -> Result<(), CatalogError> {
     validate_migration_registry()?;
     let applied = read_applied_migrations(connection)?;
     validate_applied_migrations(&applied)?;
     if applied.len() == MIGRATIONS.len() {
         return Ok(());
     }
+    let legacy_root_migration_required = matches!(applied.len(), 3 | 4);
     let applied_at = now_timestamp()?;
     let transaction = connection.transaction()?;
     for migration in &MIGRATIONS[applied.len()..] {
         transaction.execute_batch(migration.sql)?;
+        if migration.version == 5 && legacy_root_migration_required {
+            let legacy_schema_version = u64::try_from(applied.len())
+                .map_err(|_| CatalogError::MigrationRegistryMismatch)?;
+            append_legacy_authority_requirement(
+                &transaction,
+                catalog_identity,
+                legacy_schema_version,
+            )?;
+        }
         transaction.execute(
             "INSERT INTO schema_migrations(version, sha256, applied_at_ns) VALUES (?1, ?2, ?3)",
             params![migration.version, migration.sha256, applied_at.unix_nanos()],

@@ -8,6 +8,7 @@ use market_squawk_domain::{SourceId, Timestamp};
 use rusqlite::{OptionalExtension as _, Row, Transaction, params};
 use uuid::Uuid;
 
+use super::InstalledBackupCatalog;
 use super::publication::{PublishedIngest, publication_for_run};
 use super::storage::{
     AppendOutcome, ResultBudget, append_audit, digest_columns, existing_reservation, parse_digest,
@@ -16,6 +17,10 @@ use super::storage::{
 use super::types::{
     Catalog, CatalogConfig, CatalogError, CatalogLimit, ContractCompletion, IngestReservation,
     IngestRunRecord, IngestRunState,
+};
+use crate::authority_transition::{
+    AuthorityEvidenceDigest, AuthorityMutationToken, AuthoritySnapshot, BoundAuthorityTransition,
+    CatalogEndpointIdentity, PreparedAuthorityTransition, RootEndpointIdentity,
 };
 use crate::rights::RightsRegistrar;
 use crate::rights::SourceRightsDecision;
@@ -31,13 +36,25 @@ impl CatalogAuthority {
     /// Opens the exclusive durable catalog writer and its non-duplicable rights registrar.
     pub fn open(config: CatalogConfig) -> Result<Self, CatalogError> {
         let catalog = Catalog::open(config)?;
+        Ok(Self::from_catalog(catalog))
+    }
+
+    pub(crate) fn open_installed(
+        config: CatalogConfig,
+        installed: InstalledBackupCatalog,
+    ) -> Result<Self, CatalogError> {
+        let catalog = Catalog::open_installed(config, installed)?;
+        Ok(Self::from_catalog(catalog))
+    }
+
+    fn from_catalog(catalog: Catalog) -> Self {
         let rights_registrar = RightsRegistrar {
             catalog_id: catalog.catalog_id,
         };
-        Ok(Self {
+        Self {
             catalog,
             rights_registrar,
-        })
+        }
     }
 
     /// Returns the catalog service edge while retaining the private registrar authority.
@@ -55,6 +72,45 @@ impl CatalogAuthority {
 
     pub(crate) const fn artifact_root_binding(&self) -> [u8; 32] {
         self.catalog.artifact_root_binding
+    }
+
+    pub(crate) fn catalog_endpoint_identity(
+        &self,
+    ) -> Result<CatalogEndpointIdentity, CatalogError> {
+        self.catalog.catalog_endpoint_identity()
+    }
+
+    pub(crate) fn initialization_evidence_digest(
+        &self,
+        root_endpoint: RootEndpointIdentity,
+    ) -> Result<AuthorityEvidenceDigest, CatalogError> {
+        self.catalog.initialization_evidence_digest(root_endpoint)
+    }
+
+    pub(crate) fn authority_snapshot(&self) -> Result<AuthoritySnapshot, CatalogError> {
+        self.catalog.authority_snapshot()
+    }
+
+    pub(crate) fn authority_snapshot_without_endpoint(
+        &self,
+    ) -> Result<AuthoritySnapshot, CatalogError> {
+        self.catalog.authority_snapshot_without_endpoint()
+    }
+
+    pub(crate) fn append_prepared_authority(
+        &mut self,
+        token: &AuthorityMutationToken,
+        transition: PreparedAuthorityTransition,
+    ) -> Result<AuthoritySnapshot, CatalogError> {
+        self.catalog.append_prepared_authority(token, transition)
+    }
+
+    pub(crate) fn append_bound_authority(
+        &mut self,
+        token: &AuthorityMutationToken,
+        transition: BoundAuthorityTransition,
+    ) -> Result<AuthoritySnapshot, CatalogError> {
+        self.catalog.append_bound_authority(token, transition)
     }
 
     /// Validates and durably admits rights evidence through the composition authority.

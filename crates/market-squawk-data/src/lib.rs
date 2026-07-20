@@ -3,7 +3,9 @@
 //! This crate is a control- and research-plane boundary. It is never queried from the live
 //! event-to-action path.
 
+mod analytical_backup;
 mod arrow_convert;
+mod authority_transition;
 mod blocking_supervisor;
 mod catalog;
 mod ingest;
@@ -15,7 +17,17 @@ mod query;
 mod rights;
 mod schema;
 
+pub use analytical_backup::{
+    AnalyticalBackupBundleReceipt, AnalyticalBackupError, AnalyticalBackupLimits,
+    AnalyticalBackupLocation, AnalyticalBackupReceiptError, AnalyticalBackupService,
+    AnalyticalRestoreMode, AnalyticalRestoreTarget, VerifiedAnalyticalBackup,
+};
 pub use arrow_convert::{ArrowConversionError, ResearchArrowBatch};
+pub use authority_transition::evidence::CatalogContentEvidenceDigest;
+pub use authority_transition::{
+    ArtifactInventoryDigest, AuthorityEventDigest, AuthorityEvidenceDigest, AuthorityGeneration,
+    CatalogEndpointIdentity, StableArtifactRootIdentity,
+};
 pub use catalog::{
     ArtifactRecord, AuditEvent, BackupReceipt, Catalog, CatalogAuthority, CatalogConfig,
     CatalogError, CatalogHealth, CatalogLimit, CatalogResultLimits, ContractCompletion,

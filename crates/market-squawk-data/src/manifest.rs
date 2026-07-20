@@ -15,7 +15,7 @@ pub use self::catalog::{
 
 /// Stable local analytical dataset identity.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct DatasetId(String);
+pub struct DatasetId(Box<str>);
 
 impl DatasetId {
     /// Returns the validated dataset identity.
@@ -36,7 +36,7 @@ impl TryFrom<&str> for DatasetId {
         {
             Err(ManifestPlanError::InvalidDatasetId)
         } else {
-            Ok(Self(value.to_owned()))
+            Ok(Self(value.into()))
         }
     }
 }
@@ -161,7 +161,7 @@ impl ManifestObject {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ManifestPlan {
     dataset_id: DatasetId,
-    objects: Vec<ManifestObject>,
+    objects: Box<[ManifestObject]>,
     row_count: u64,
     total_bytes: u64,
     lineage_digest: Sha256Digest,
@@ -179,14 +179,26 @@ impl ManifestPlan {
         if max_objects == 0 {
             return Err(ManifestPlanError::SmallFileCeiling { max_objects });
         }
-        let mut objects = match previous {
-            Some(previous) if previous.dataset_id == dataset_id => previous.objects.clone(),
+        let previous_objects = match previous {
+            Some(previous) if previous.dataset_id == dataset_id => previous.objects.as_ref(),
             Some(_) => return Err(ManifestPlanError::DatasetMismatch),
-            None => Vec::new(),
+            None => &[],
         };
-        if objects.len() >= max_objects {
+        if previous_objects.len() >= max_objects {
             return Err(ManifestPlanError::SmallFileCeiling { max_objects });
         }
+        let object_count = previous_objects
+            .len()
+            .checked_add(1)
+            .ok_or(ManifestPlanError::CountOverflow)?;
+        let mut objects = Vec::new();
+        objects
+            .try_reserve_exact(object_count)
+            .map_err(|_| ManifestPlanError::CountOverflow)?;
+        if objects.capacity() != object_count {
+            return Err(ManifestPlanError::AllocationContract);
+        }
+        objects.extend_from_slice(previous_objects);
         objects.push(object);
         Self::from_objects(dataset_id, objects)
     }
@@ -234,6 +246,18 @@ impl ManifestPlan {
     fn from_objects(
         dataset_id: DatasetId,
         objects: Vec<ManifestObject>,
+    ) -> Result<Self, ManifestPlanError> {
+        let allocation = objects.as_ptr();
+        let objects = objects.into_boxed_slice();
+        if objects.as_ptr() != allocation {
+            return Err(ManifestPlanError::AllocationContract);
+        }
+        Self::from_exact_objects(dataset_id, objects)
+    }
+
+    pub(super) fn from_exact_objects(
+        dataset_id: DatasetId,
+        objects: Box<[ManifestObject]>,
     ) -> Result<Self, ManifestPlanError> {
         let row_count = objects.iter().try_fold(0_u64, |total, object| {
             total
@@ -303,4 +327,7 @@ pub enum ManifestPlanError {
     /// Compaction changed row count or semantic lineage.
     #[error("compaction changed row or lineage semantics")]
     CompactionSemanticMismatch,
+    /// An exact-capacity immutable construction changed allocation identity.
+    #[error("manifest immutable allocation contract changed")]
+    AllocationContract,
 }

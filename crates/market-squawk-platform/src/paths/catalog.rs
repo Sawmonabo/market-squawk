@@ -11,6 +11,10 @@ use fs2::FileExt as _;
 
 use super::PathError;
 
+mod restore;
+
+pub use restore::{CatalogRestoreStage, CatalogRestoreTarget, InstalledCatalogFile};
+
 const WRITER_LOCK_FILE: &str = ".catalog.writer.lock";
 const CATALOG_FILE: &str = "catalog.sqlite3";
 
@@ -181,6 +185,15 @@ fn validate_private_file_identity(
     name: &str,
     file: &File,
 ) -> Result<(), PathError> {
+    validate_private_file_identity_with_links(location, name, file, 1)
+}
+
+fn validate_private_file_identity_with_links(
+    location: &CatalogLocation,
+    name: &str,
+    file: &File,
+    expected_links: u64,
+) -> Result<(), PathError> {
     use cap_fs_ext::MetadataExt as _;
 
     location.validate_for_open()?;
@@ -197,12 +210,15 @@ fn validate_private_file_identity(
     {
         return Err(PathError::PreparedRootChanged);
     }
-    validate_unique_file_metadata(&opened)?;
-    validate_private_file_metadata(&named)
+    validate_file_link_count(&opened, expected_links)?;
+    validate_private_file_metadata_with_links(&named, expected_links)
 }
 
-fn validate_unique_file_metadata(metadata: &impl cap_fs_ext::MetadataExt) -> Result<(), PathError> {
-    if metadata.nlink() != 1 {
+fn validate_file_link_count(
+    metadata: &impl cap_fs_ext::MetadataExt,
+    expected_links: u64,
+) -> Result<(), PathError> {
+    if metadata.nlink() != expected_links {
         return Err(PathError::PreparedRootChanged);
     }
     Ok(())
@@ -239,27 +255,51 @@ fn configure_private_catalog_creation(_options: &mut OpenOptions) {}
 
 #[cfg(unix)]
 fn validate_private_file_metadata(metadata: &cap_std::fs::Metadata) -> Result<(), PathError> {
+    validate_private_file_metadata_with_links(metadata, 1)
+}
+
+#[cfg(unix)]
+fn validate_private_file_metadata_with_links(
+    metadata: &cap_std::fs::Metadata,
+    expected_links: u64,
+) -> Result<(), PathError> {
     use cap_std::fs::PermissionsExt as _;
 
     if metadata.permissions().mode() & 0o077 != 0 {
         return Err(PathError::PreparedRootChanged);
     }
-    validate_unique_file_metadata(metadata)
+    validate_file_link_count(metadata, expected_links)
 }
 
 #[cfg(windows)]
 fn validate_private_file_metadata(metadata: &cap_std::fs::Metadata) -> Result<(), PathError> {
+    validate_private_file_metadata_with_links(metadata, 1)
+}
+
+#[cfg(windows)]
+fn validate_private_file_metadata_with_links(
+    metadata: &cap_std::fs::Metadata,
+    expected_links: u64,
+) -> Result<(), PathError> {
     use cap_fs_ext::MetadataExt as _;
 
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
     if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err(PathError::PreparedRootChanged);
     }
-    validate_unique_file_metadata(metadata)
+    validate_file_link_count(metadata, expected_links)
 }
 
 #[cfg(not(any(unix, windows)))]
 fn validate_private_file_metadata(_metadata: &cap_std::fs::Metadata) -> Result<(), PathError> {
+    Err(PathError::PreparedRootChanged)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn validate_private_file_metadata_with_links(
+    _metadata: &cap_std::fs::Metadata,
+    _expected_links: u64,
+) -> Result<(), PathError> {
     Err(PathError::PreparedRootChanged)
 }
 

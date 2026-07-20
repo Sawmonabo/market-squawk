@@ -61,6 +61,10 @@ impl CatalogConfig {
             result_bytes,
         })
     }
+
+    pub(crate) const fn location(&self) -> &CatalogLocation {
+        &self.location
+    }
 }
 
 impl fmt::Debug for CatalogConfig {
@@ -719,6 +723,24 @@ pub enum CatalogError {
     /// SQLite integrity or foreign-key verification failed.
     #[error("catalog integrity verification failed")]
     CorruptCatalog,
+    /// The immutable catalog/root authority pair differs from the retained live capabilities.
+    #[error("catalog analytical artifact-root authority does not match")]
+    ArtifactRootAuthorityMismatch,
+    /// No authority lineage exists; explicit initialization is required before ordinary open.
+    #[error("catalog analytical artifact-root authority requires explicit initialization")]
+    ArtifactRootAuthorityInitializationRequired,
+    /// The append-only authority event sequence, hash chain, or payload is invalid.
+    #[error("catalog analytical artifact-root authority event chain is invalid")]
+    ArtifactRootAuthorityChainInvalid,
+    /// A repeated transition differs from the exact durable intent or result.
+    #[error("catalog analytical artifact-root authority transition conflicts")]
+    ArtifactRootAuthorityTransitionConflict,
+    /// The catalog has no exact bound authority result eligible for ordinary activation.
+    #[error("catalog analytical artifact-root authority is not bound")]
+    ArtifactRootAuthorityNotBound,
+    /// A legacy analytical catalog requires an explicit artifact-root migration.
+    #[error("catalog analytical artifact-root migration is required")]
+    ArtifactRootMigrationRequired,
     /// The requested operation was not admitted by exact rights evidence.
     #[error("catalog rights admission failed: {0}")]
     RightsDenied(#[from] RightsError),
@@ -806,6 +828,24 @@ pub enum CatalogError {
     /// A backup no longer matches its exact byte-length and SHA-256 receipt.
     #[error("catalog backup does not match its receipt")]
     BackupReceiptMismatch,
+    /// Another process retains a non-mutating lease over the backup file.
+    #[error("catalog backup is already leased for another authority operation")]
+    BackupLeaseUnavailable,
+    /// A digest-addressed restore stage or final target contains different immutable bytes.
+    #[error("catalog backup restore conflicts with retained destination state")]
+    BackupRestoreConflict,
+    /// Restore publication may have reached durable storage and requires exact receipt retry.
+    #[error("catalog backup restore publication outcome is indeterminate")]
+    BackupRestoreIndeterminate,
+    /// Analytical evidence exceeded caller-selected or fixed process bounds.
+    #[error("catalog analytical evidence resource limit was exceeded")]
+    AnalyticalEvidenceLimitExceeded,
+    /// Analytical evidence capture was cancelled before completion.
+    #[error("catalog analytical evidence capture was cancelled")]
+    AnalyticalEvidenceCancelled,
+    /// Stored analytical relationships failed canonical semantic validation.
+    #[error("catalog analytical evidence is invalid")]
+    AnalyticalEvidenceInvalid,
     /// A bounded allocation failed.
     #[error("catalog bounded allocation failed")]
     Allocation,

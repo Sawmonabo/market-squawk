@@ -2,9 +2,10 @@
 
 use std::error::Error as StdError;
 use std::io::Write;
-use std::mem::{size_of, size_of_val};
+use std::mem::size_of;
 
 use arrow::datatypes::{Schema, SchemaRef};
+use arrow::record_batch::RecordBatch;
 use datafusion::error::DataFusionError;
 use datafusion::execution::memory_pool::MemoryReservation;
 
@@ -33,22 +34,59 @@ impl Write for CountingWriter {
 
 pub(super) fn schema_retained_bytes(schema: &SchemaRef) -> Result<usize, QueryError> {
     let fields = schema.fields().iter().try_fold(0_usize, |total, field| {
+        // Arrow's locked `Field::size` includes the complete recursive field, owned string
+        // capacities, data-type backing, and occupied metadata buckets. Doubling that public
+        // measurement conservatively covers hash-table control bytes, allocator rounding, and
+        // Arc-backed data-type nodes whose allocation headers are not exposed by Arrow.
+        let field_graph = field
+            .size()
+            .checked_mul(2)
+            .ok_or(QueryError::SizeOverflow)?;
         total
-            .checked_add(size_of_val(field.as_ref()))
-            .and_then(|value| value.checked_add(field.name().len()))
+            .checked_add(size_of::<[usize; 2]>())
+            .and_then(|value| value.checked_add(field_graph))
             .ok_or(QueryError::SizeOverflow)
     })?;
-    schema.metadata().iter().try_fold(
-        size_of::<Schema>()
-            .checked_add(fields)
-            .ok_or(QueryError::SizeOverflow)?,
-        |total, (key, value)| {
-            total
-                .checked_add(key.len())
-                .and_then(|value_total| value_total.checked_add(value.len()))
-                .ok_or(QueryError::SizeOverflow)
-        },
-    )
+    let metadata_buckets = schema
+        .metadata()
+        .capacity()
+        .checked_mul(size_of::<(String, String)>())
+        .and_then(|value| value.checked_mul(2))
+        .ok_or(QueryError::SizeOverflow)?;
+    let metadata_backing =
+        schema
+            .metadata()
+            .iter()
+            .try_fold(metadata_buckets, |total, (key, value)| {
+                key.capacity()
+                    .checked_add(value.capacity())
+                    .and_then(|backing| backing.checked_mul(2))
+                    .and_then(|backing| total.checked_add(backing))
+                    .ok_or(QueryError::SizeOverflow)
+            })?;
+    // One Arc allocation owns Schema, and a second Arc allocation owns Fields' FieldRef slice.
+    size_of::<Schema>()
+        .checked_add(size_of::<[usize; 2]>())
+        .and_then(|value| value.checked_add(size_of::<[usize; 2]>()))
+        .and_then(|value| {
+            schema
+                .fields()
+                .len()
+                .checked_mul(size_of::<arrow::datatypes::FieldRef>())
+                .and_then(|field_refs| value.checked_add(field_refs))
+        })
+        .and_then(|value| value.checked_add(fields))
+        .and_then(|value| value.checked_add(metadata_backing))
+        .ok_or(QueryError::SizeOverflow)
+}
+
+pub(super) fn record_batch_retained_bytes(batch: &RecordBatch) -> Result<usize, QueryError> {
+    batch
+        .num_columns()
+        .checked_mul(size_of::<arrow::array::ArrayRef>())
+        .and_then(|columns| columns.checked_add(size_of::<RecordBatch>()))
+        .and_then(|inline| inline.checked_add(batch.get_array_memory_size()))
+        .ok_or(QueryError::SizeOverflow)
 }
 
 pub(super) fn reserve_memory(

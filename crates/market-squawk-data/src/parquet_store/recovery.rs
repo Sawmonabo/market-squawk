@@ -283,8 +283,8 @@ mod tests {
         let store = Arc::new(ParquetObjectStore::open(
             paths.artifacts()?.clone(),
             ObjectStoreConfig::try_new(1024 * 1024, 2, Duration::from_secs(60))?,
-            paths.catalog()?.path(),
             [7; 32],
+            None,
         )?);
         let batch = RecordBatch::try_new(
             Schema::new(vec![Field::new("value", DataType::Int64, false)]).into(),

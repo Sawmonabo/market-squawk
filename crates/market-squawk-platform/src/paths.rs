@@ -16,6 +16,7 @@ use crate::{JournalError, JournalSinkConstructionError, JournalSinkLimits, Journ
 
 use self::catalog::open_prepared_root;
 pub use self::catalog::{CatalogFileGuard, CatalogLocation, CatalogWriterGuard};
+pub use self::catalog::{CatalogRestoreStage, CatalogRestoreTarget, InstalledCatalogFile};
 
 const MAX_ARTIFACT_COMPONENT_BYTES: usize = 255;
 const MAX_ARTIFACT_DEPTH: usize = 32;
@@ -48,6 +49,12 @@ pub enum PathError {
     /// Another process owns the prepared catalog writer lock.
     #[error("prepared catalog already has an active writer")]
     CatalogAlreadyLocked,
+    /// A catalog restore stage or final target contains different immutable bytes.
+    #[error("prepared catalog restore target conflicts with retained state")]
+    CatalogRestoreConflict,
+    /// Catalog restore publication may have reached durable storage and requires exact retry.
+    #[error("prepared catalog restore publication is indeterminate")]
+    CatalogRestoreIndeterminate,
 }
 
 impl PathError {
@@ -117,6 +124,39 @@ impl ArtifactRoot {
     /// Returns the canonical display path; it is not used as the creation authority.
     pub fn root(&self) -> &Path {
         &self.display_root
+    }
+
+    /// Clones the retained directory capability after proving its display path still names it.
+    ///
+    /// The returned directory is derived from the retained handle, never reopened as ambient
+    /// authority. The display path check exists only to reject renamed or substituted configured
+    /// roots before a path-bound durable identity is accepted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PathError::PreparedRootChanged`] if the canonical display path no longer names
+    /// the retained directory, or [`PathError::Io`] if cloning or identity inspection fails.
+    pub fn try_clone_directory(&self) -> Result<Dir, PathError> {
+        use cap_fs_ext::MetadataExt as _;
+
+        let directory = self
+            .directory
+            .try_clone()
+            .map_err(|source| PathError::io("failed to clone artifact root", source))?;
+        let retained = directory
+            .dir_metadata()
+            .map_err(|source| PathError::io("failed to inspect retained artifact root", source))?;
+        let reopened = open_prepared_root(&self.display_root)?;
+        let displayed = reopened
+            .dir_metadata()
+            .map_err(|source| PathError::io("failed to inspect displayed artifact root", source))?;
+        if !retained.is_dir()
+            || !displayed.is_dir()
+            || (retained.dev(), retained.ino()) != (displayed.dev(), displayed.ino())
+        {
+            return Err(PathError::PreparedRootChanged);
+        }
+        Ok(directory)
     }
 
     /// Validates a canonical portable reference and binds it to this open directory capability.

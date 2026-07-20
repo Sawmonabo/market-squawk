@@ -28,10 +28,10 @@ mod source;
 mod validation;
 
 use self::budget::{
-    CountingWriter, map_datafusion, reserve_memory, resize_memory, schema_retained_bytes,
-    valid_table_name,
+    CountingWriter, map_datafusion, record_batch_retained_bytes, reserve_memory, resize_memory,
+    schema_retained_bytes, valid_table_name,
 };
-use self::source::QuerySource;
+use self::source::{PinnedObjectStoreRegistry, QuerySource, RetainedSourceReceipt};
 use self::validation::{validate_read_only_statement, validate_relations};
 use crate::blocking_supervisor::BlockingIoSupervisor;
 use crate::schema::research_schema;
@@ -279,6 +279,12 @@ impl ResearchQueryEngine {
             .fields()
             .clone(),
         ));
+        let retained_bytes = dataset
+            .retained_bytes()
+            .checked_add(schema_retained_bytes(&schema)?)
+            .and_then(|value| value.checked_add(dataset.manifest().dataset_id().as_str().len()))
+            .and_then(|value| value.checked_add(table_name.capacity()))
+            .ok_or(QueryError::SizeOverflow)?;
         Ok(Self {
             manifest: dataset.manifest().clone(),
             table_name,
@@ -286,6 +292,7 @@ impl ResearchQueryEngine {
                 dataset,
                 store: Arc::clone(&store),
                 schema,
+                receipt: RetainedSourceReceipt::new(retained_bytes),
             },
             artifact_publication: None,
         })
@@ -305,12 +312,35 @@ impl ResearchQueryEngine {
         if batches.iter().any(|batch| batch.schema() != schema) {
             return Err(QueryError::InvalidSource);
         }
+        if batches.capacity() != batches.len() {
+            return Err(QueryError::DependencyAllocationContract);
+        }
+        let batch_allocation = batches.as_ptr();
+        let batches = batches.into_boxed_slice();
+        if batches.as_ptr() != batch_allocation {
+            return Err(QueryError::DependencyAllocationContract);
+        }
+        let retained_bytes = batches.iter().try_fold(
+            schema_retained_bytes(&schema)?
+                .checked_add(size_of::<[usize; 2]>())
+                .and_then(|value| value.checked_add(size_of::<Box<[RecordBatch]>>()))
+                .and_then(|value| value.checked_add(manifest.dataset_id().as_str().len()))
+                .and_then(|value| value.checked_add(table_name.capacity()))
+                .ok_or(QueryError::SizeOverflow)?,
+            |total, batch| {
+                total
+                    .checked_add(record_batch_retained_bytes(batch)?)
+                    .ok_or(QueryError::SizeOverflow)
+            },
+        )?;
+        let batches = Arc::new(batches);
         Ok(Self {
             manifest,
             table_name,
             source: QuerySource::Batches {
                 schema: batches[0].schema(),
                 batches,
+                receipt: RetainedSourceReceipt::new(retained_bytes),
             },
             artifact_publication: None,
         })
@@ -362,8 +392,10 @@ impl ResearchQueryEngine {
         let execution = async {
             let memory =
                 usize::try_from(limits.max_memory_bytes).map_err(|_| QueryError::InvalidLimits)?;
+            let object_store_registry = Arc::new(PinnedObjectStoreRegistry::default());
             let runtime = RuntimeEnvBuilder::new()
                 .with_memory_limit(memory, 1.0)
+                .with_object_store_registry(object_store_registry.clone())
                 .with_disk_manager_builder(
                     DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled),
                 )
@@ -395,6 +427,8 @@ impl ResearchQueryEngine {
                     &context,
                     &self.table_name,
                     &execution_io_supervisor,
+                    &input_memory,
+                    &object_store_registry,
                     limits.max_memory_bytes,
                 )
                 .await?;
@@ -455,10 +489,7 @@ impl ResearchQueryEngine {
                         limit: limits.max_rows,
                     });
                 }
-                let batch_memory = batch
-                    .get_array_memory_size()
-                    .checked_add(size_of::<RecordBatch>())
-                    .ok_or(QueryError::SizeOverflow)?;
+                let batch_memory = record_batch_retained_bytes(&batch)?;
                 reserve_memory(&output_memory, batch_memory, limits.max_memory_bytes)?;
                 batches
                     .try_reserve_exact(1)
@@ -503,18 +534,14 @@ impl ResearchQueryEngine {
                 .ok_or(QueryError::ArtifactAuthorityRequired)?;
             let retained_output = batches.iter().try_fold(0_usize, |total, batch| {
                 total
-                    .checked_add(batch.get_array_memory_size())
-                    .and_then(|value| value.checked_add(size_of::<RecordBatch>()))
+                    .checked_add(record_batch_retained_bytes(batch)?)
                     .ok_or(QueryError::SizeOverflow)
             })?;
             resize_memory(&artifact_memory, retained_output, limits.max_memory_bytes)?;
             let compact = concat_batches(&result_schema, &batches)?;
             drop(batches);
             output_memory.free();
-            let compact_memory = compact
-                .get_array_memory_size()
-                .checked_add(size_of::<RecordBatch>())
-                .ok_or(QueryError::SizeOverflow)?;
+            let compact_memory = record_batch_retained_bytes(&compact)?;
             let publication_work = compact_memory
                 .checked_mul(2)
                 .ok_or(QueryError::SizeOverflow)?;
@@ -606,6 +633,15 @@ pub enum QueryError {
     /// A retained byte count could not be represented safely.
     #[error("query retained byte count overflow")]
     SizeOverflow,
+    /// A pinned Rust or DataFusion allocation assumption no longer matches the locked dependency.
+    #[error("query dependency allocation contract changed")]
+    DependencyAllocationContract,
+    /// A source schema has nested, dictionary, or variable-width shapes without a proved bound.
+    #[error("query source schema has no supported bounded reader representation")]
+    UnsupportedSourceSchema,
+    /// Verified Parquet metadata requires more than the compiled active-reader ceiling.
+    #[error("query source exceeds the compiled active-reader memory bound")]
+    ReaderMemoryBoundExceeded,
     /// Cancellation was observed before a result crossed the service boundary.
     #[error("query was cancelled")]
     Cancelled,
