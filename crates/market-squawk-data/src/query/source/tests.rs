@@ -41,6 +41,35 @@ use crate::{
 
 type TestResult = Result<(), Box<dyn Error>>;
 
+const ARTIFACT_QUERY: &str = "SELECT a.value FROM observations
+     CROSS JOIN (VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9)) AS a(value)
+     CROSS JOIN (VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9)) AS b(value)
+     CROSS JOIN (VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9)) AS c(value)
+     CROSS JOIN (VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9)) AS d(value)
+     CROSS JOIN (VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9)) AS e(value)";
+
+#[tokio::test]
+async fn arbitrary_batches_cannot_attach_durable_publication_authority() -> TestResult {
+    let (_directory, service, _pinned) = published_dataset_fixture().await?;
+    let fabricated_manifest = DatasetManifestRef::try_new(
+        DatasetId::try_from("fabricated-query-source")?,
+        1,
+        Sha256Digest::new([99; 32]),
+    )?;
+    let batch = RecordBatch::try_new(
+        Schema::new(vec![Field::new("value", DataType::Int64, false)]).into(),
+        vec![Arc::new(Int64Array::from(vec![1])) as ArrayRef],
+    )?;
+    let engine =
+        ResearchQueryEngine::from_pinned_batches(fabricated_manifest, "observations", vec![batch])?;
+
+    assert!(matches!(
+        engine.with_artifact_publication(service.query_artifact_publication()),
+        Err(QueryError::InvalidSource)
+    ));
+    Ok(())
+}
+
 #[tokio::test]
 async fn pinned_io_is_joined_and_repeated_scans_share_admitted_metadata() -> TestResult {
     let _blocking_worker_serial = BlockingIoSupervisor::acquire_test_serial_guard().await;
@@ -218,26 +247,17 @@ async fn durable_query_artifact_bind_has_deterministic_cancellation_precedence()
             true,
         ),
     ] {
-        let (_directory, service, _pinned) = published_dataset_fixture().await?;
-        let manifest = DatasetManifestRef::try_new(
-            DatasetId::try_from("bind-precedence-query-result")?,
-            1,
-            Sha256Digest::new([43; 32]),
-        )?;
-        let batch = RecordBatch::try_new(
-            Schema::new(vec![Field::new("value", DataType::Int64, false)]).into(),
-            vec![Arc::new(Int64Array::from_iter_values(0..100_000)) as ArrayRef],
-        )?;
+        let (_directory, service, pinned) = published_dataset_fixture().await?;
         let limits = QueryLimits::try_new(
             100_000,
             4 * 1024 * 1024,
             64 * 1024 * 1024,
             1,
-            128,
-            128,
+            512,
+            512,
             Duration::from_secs(5),
         )?;
-        let request = QueryRequest::try_new(manifest.clone(), "SELECT value FROM observations")?;
+        let request = QueryRequest::try_new(pinned.manifest().clone(), ARTIFACT_QUERY)?;
         let wall_nanos = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos())?;
         let reservation = service
             .reserve_query_artifact(
@@ -252,9 +272,14 @@ async fn durable_query_artifact_bind_has_deterministic_cancellation_precedence()
             .await?;
         let publication = service.query_artifact_publication();
         let mut barrier = publication.install_test_bind_barrier(checkpoint)?;
-        let engine =
-            ResearchQueryEngine::from_pinned_batches(manifest, "observations", vec![batch])?
-                .with_artifact_publication(publication)?;
+        let engine = ResearchQueryEngine::from_pinned_dataset(
+            pinned,
+            "observations",
+            service.object_store(),
+            CancellationToken::new(),
+        )
+        .await?
+        .with_artifact_publication(publication)?;
         let cancellation = CancellationToken::new();
         let query_cancellation = cancellation.clone();
         let query = tokio::spawn(async move {
@@ -280,27 +305,18 @@ async fn durable_query_artifact_bind_has_deterministic_cancellation_precedence()
         );
     }
 
-    let (_directory, service, _pinned) = published_dataset_fixture().await?;
-    let manifest = DatasetManifestRef::try_new(
-        DatasetId::try_from("deadline-precedence-query-result")?,
-        1,
-        Sha256Digest::new([44; 32]),
-    )?;
-    let batch = RecordBatch::try_new(
-        Schema::new(vec![Field::new("value", DataType::Int64, false)]).into(),
-        vec![Arc::new(Int64Array::from_iter_values(0..100_000)) as ArrayRef],
-    )?;
+    let (_directory, service, pinned) = published_dataset_fixture().await?;
     let limits = QueryLimits::try_new(
         100_000,
         4 * 1024 * 1024,
         64 * 1024 * 1024,
         1,
-        128,
-        128,
+        512,
+        512,
         Duration::from_secs(5),
     )?
     .with_test_bind_precommit_deadline(tokio::time::Instant::now());
-    let request = QueryRequest::try_new(manifest.clone(), "SELECT value FROM observations")?;
+    let request = QueryRequest::try_new(pinned.manifest().clone(), ARTIFACT_QUERY)?;
     let wall_nanos = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos())?;
     let reservation = service
         .reserve_query_artifact(
@@ -316,8 +332,14 @@ async fn durable_query_artifact_bind_has_deterministic_cancellation_precedence()
     let publication = service.query_artifact_publication();
     let mut barrier = publication
         .install_test_bind_barrier(crate::catalog::QueryArtifactBindCheckpoint::BeforeCommit)?;
-    let engine = ResearchQueryEngine::from_pinned_batches(manifest, "observations", vec![batch])?
-        .with_artifact_publication(publication)?;
+    let engine = ResearchQueryEngine::from_pinned_dataset(
+        pinned,
+        "observations",
+        service.object_store(),
+        CancellationToken::new(),
+    )
+    .await?
+    .with_artifact_publication(publication)?;
     let query = tokio::spawn(async move {
         engine
             .query(
@@ -342,26 +364,17 @@ async fn cancelled_query_artifact_writer_retains_admission_until_reaped() -> Tes
     let _blocking_worker_serial = BlockingIoSupervisor::acquire_test_serial_guard().await;
     let available_before = BlockingIoSupervisor::globally_available();
     assert_eq!(available_before, BlockingIoSupervisor::global_limit());
-    let (_directory, service, _pinned) = published_dataset_fixture().await?;
-    let manifest = DatasetManifestRef::try_new(
-        DatasetId::try_from("held-writer-query-result")?,
-        1,
-        Sha256Digest::new([45; 32]),
-    )?;
-    let batch = RecordBatch::try_new(
-        Schema::new(vec![Field::new("value", DataType::Int64, false)]).into(),
-        vec![Arc::new(Int64Array::from_iter_values(0..100_000)) as ArrayRef],
-    )?;
+    let (_directory, service, pinned) = published_dataset_fixture().await?;
     let limits = QueryLimits::try_new(
         100_000,
         4 * 1024 * 1024,
         64 * 1024 * 1024,
         1,
-        128,
-        128,
+        512,
+        512,
         Duration::from_secs(5),
     )?;
-    let request = QueryRequest::try_new(manifest.clone(), "SELECT value FROM observations")?;
+    let request = QueryRequest::try_new(pinned.manifest().clone(), ARTIFACT_QUERY)?;
     let wall_nanos = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos())?;
     let reservation = service
         .reserve_query_artifact(
@@ -376,8 +389,14 @@ async fn cancelled_query_artifact_writer_retains_admission_until_reaped() -> Tes
         .await?;
     let publication = service.query_artifact_publication();
     let mut barrier = publication.install_test_writer_barrier()?;
-    let engine = ResearchQueryEngine::from_pinned_batches(manifest, "observations", vec![batch])?
-        .with_artifact_publication(publication)?;
+    let engine = ResearchQueryEngine::from_pinned_dataset(
+        pinned,
+        "observations",
+        service.object_store(),
+        CancellationToken::new(),
+    )
+    .await?
+    .with_artifact_publication(publication)?;
     let cancellation = CancellationToken::new();
     let query_cancellation = cancellation.clone();
     let query = tokio::spawn(async move {

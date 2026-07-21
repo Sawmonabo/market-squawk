@@ -126,7 +126,10 @@ impl ParquetObjectStore {
                 })
                 .map_err(|error| match error {
                     BlockingIoAdmissionError::Cancelled => ParquetStoreError::Cancelled,
-                    BlockingIoAdmissionError::Saturated => ParquetStoreError::BlockingTaskFailed,
+                    BlockingIoAdmissionError::Saturated
+                    | BlockingIoAdmissionError::ReaperUnavailable => {
+                        ParquetStoreError::BlockingTaskFailed
+                    }
                 })?;
             tokio::select! {
                 result = &mut worker => {

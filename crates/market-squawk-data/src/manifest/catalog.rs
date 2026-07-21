@@ -1,20 +1,25 @@
 //! SQLite-backed immutable analytical generation storage.
 
 use std::fmt;
+use std::fmt::Write as _;
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::Instant;
 
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceId, Timestamp};
 use market_squawk_platform::CatalogLocation;
 use rusqlite::{Connection, OpenFlags, OptionalExtension as _, TransactionBehavior, params};
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
     DatasetId, DatasetManifestRef, ManifestObject, ManifestPlan, ManifestPlanError, Sha256Digest,
 };
 use crate::{ArtifactRecord, DatasetManifestRecord};
+
+const REFERENCE_MEMBERSHIP_CHUNK: usize = 128;
 
 /// One manifest-pinned object resolved from immutable catalog metadata.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -135,7 +140,7 @@ impl AnalyticalManifestCatalog {
         object: ManifestObject,
     ) -> Result<ManifestPlan, ManifestCatalogError> {
         let connection = self.lock()?;
-        let previous = load_latest(&connection, &dataset_id)?;
+        let previous = load_latest(&connection, &dataset_id, self.max_objects_per_generation)?;
         ManifestPlan::append(
             dataset_id,
             previous.as_ref().map(PinnedDataset::plan),
@@ -152,7 +157,7 @@ impl AnalyticalManifestCatalog {
         compacted: ManifestObject,
     ) -> Result<ManifestPlan, ManifestCatalogError> {
         let connection = self.lock()?;
-        let previous = load_pinned(&connection, previous)?;
+        let previous = load_pinned(&connection, previous, self.max_objects_per_generation)?;
         ManifestPlan::compact(previous.plan(), compacted).map_err(Into::into)
     }
 
@@ -185,7 +190,11 @@ impl AnalyticalManifestCatalog {
             }
             return Err(ManifestCatalogError::GenerationConflict);
         }
-        let previous = load_latest(&transaction, &plan.dataset_id)?;
+        let previous = load_latest(
+            &transaction,
+            &plan.dataset_id,
+            self.max_objects_per_generation,
+        )?;
         let current_source = source_for_artifact(&transaction, artifact.artifact_id())?;
         if let Some(previous) = previous.as_ref()
             && generation_source(&transaction, previous.manifest())? != current_source
@@ -291,7 +300,7 @@ impl AnalyticalManifestCatalog {
         manifest: &DatasetManifestRef,
     ) -> Result<PinnedDataset, ManifestCatalogError> {
         let connection = self.lock()?;
-        load_pinned(&connection, manifest)
+        load_pinned(&connection, manifest, self.max_objects_per_generation)
     }
 
     /// Returns the current generation only as an explicit pin, never as a directory inference.
@@ -300,7 +309,10 @@ impl AnalyticalManifestCatalog {
         dataset_id: &DatasetId,
     ) -> Result<Option<DatasetManifestRef>, ManifestCatalogError> {
         let connection = self.lock()?;
-        Ok(load_latest(&connection, dataset_id)?.map(|value| value.manifest))
+        Ok(
+            load_latest(&connection, dataset_id, self.max_objects_per_generation)?
+                .map(|value| value.manifest),
+        )
     }
 
     /// Resolves the immutable generation anchored by one Task 3 ingest run, when present.
@@ -336,7 +348,7 @@ impl AnalyticalManifestCatalog {
             .transpose()?;
         reference
             .as_ref()
-            .map(|reference| load_pinned(&connection, reference))
+            .map(|reference| load_pinned(&connection, reference, self.max_objects_per_generation))
             .transpose()
     }
 
@@ -349,54 +361,68 @@ impl AnalyticalManifestCatalog {
         generation_source(&connection, manifest)
     }
 
-    /// Returns generation objects and query results whose exclusive expiry is still in the future.
-    pub(crate) fn referenced_hashes(
+    /// Resolves only candidate reachability in bounded chunks under one consistent read snapshot.
+    pub(crate) fn referenced_candidates<I>(
         &self,
+        candidates: I,
         now: Timestamp,
-    ) -> Result<Vec<Sha256Digest>, ManifestCatalogError> {
-        let connection = self.lock()?;
-        let mut statement = connection.prepare(
-            "SELECT content_hash FROM analytical_generation_objects
-             UNION
-             SELECT results.content_digest
-             FROM query_artifact_results AS results
-             JOIN query_artifact_reservations AS reservations USING (reservation_id)
-             WHERE results.content_algorithm=1
-               AND reservations.state='published'
-               AND reservations.expires_at_ns>?1
-             ORDER BY 1",
-        )?;
-        let hashes = statement
-            .query_map([now.unix_nanos()], |row| row.get::<_, Vec<u8>>(0))?
-            .map(|row| parse_digest(&row?))
-            .collect::<Result<Vec<_>, ManifestCatalogError>>()?;
-        Ok(hashes)
-    }
-
-    /// Re-checks durable generation reachability immediately before orphan quarantine.
-    pub(crate) fn is_referenced(
-        &self,
-        content_hash: Sha256Digest,
-        now: Timestamp,
-    ) -> Result<bool, ManifestCatalogError> {
-        let connection = self.lock()?;
-        connection
-            .query_row(
-                "SELECT EXISTS(
-                    SELECT 1 FROM analytical_generation_objects WHERE content_hash=?1
-                    UNION ALL
-                    SELECT 1
-                    FROM query_artifact_results AS results
-                    JOIN query_artifact_reservations AS reservations USING (reservation_id)
-                    WHERE results.content_algorithm=1
-                      AND results.content_digest=?1
-                      AND reservations.state='published'
-                      AND reservations.expires_at_ns>?2
-                 )",
-                params![content_hash.bytes().as_slice(), now.unix_nanos()],
-                |row| row.get(0),
-            )
-            .map_err(Into::into)
+        max_candidates: usize,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<bool>, ManifestCatalogError>
+    where
+        I: ExactSizeIterator<Item = Sha256Digest>,
+    {
+        check_reference_operation(deadline, cancellation)?;
+        let expected = candidates.len();
+        if expected > max_candidates {
+            return Err(ManifestCatalogError::ReferenceWorkLimitExceeded { max_candidates });
+        }
+        let mut membership = Vec::new();
+        membership
+            .try_reserve_exact(expected)
+            .map_err(|_| ManifestCatalogError::CountOverflow)?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let mut candidates = candidates.peekable();
+        while candidates.peek().is_some() {
+            check_reference_operation(deadline, cancellation)?;
+            let mut chunk = Vec::new();
+            chunk
+                .try_reserve_exact(REFERENCE_MEMBERSHIP_CHUNK.min(expected))
+                .map_err(|_| ManifestCatalogError::CountOverflow)?;
+            while chunk.len() < REFERENCE_MEMBERSHIP_CHUNK {
+                let Some(candidate) = candidates.next() else {
+                    break;
+                };
+                chunk.push(candidate);
+                let collected = membership
+                    .len()
+                    .checked_add(chunk.len())
+                    .ok_or(ManifestCatalogError::CountOverflow)?;
+                if collected > max_candidates
+                    || (collected == max_candidates && candidates.peek().is_some())
+                {
+                    return Err(ManifestCatalogError::ReferenceWorkLimitExceeded {
+                        max_candidates,
+                    });
+                }
+            }
+            append_reference_membership(
+                &transaction,
+                &chunk,
+                now,
+                deadline,
+                cancellation,
+                &mut membership,
+            )?;
+        }
+        if membership.len() != expected {
+            return Err(ManifestCatalogError::CorruptCatalog);
+        }
+        check_reference_operation(deadline, cancellation)?;
+        transaction.commit()?;
+        Ok(membership)
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>, ManifestCatalogError> {
@@ -445,6 +471,18 @@ pub enum ManifestCatalogError {
     /// Stored generation metadata does not reconstruct exactly.
     #[error("analytical manifest catalog is corrupt")]
     CorruptCatalog,
+    /// Stored generation membership exceeds the configured reader ceiling.
+    #[error("analytical generation exceeds the {max_objects}-object reader ceiling")]
+    ObjectLimitExceeded { max_objects: usize },
+    /// Candidate reachability work exceeds the explicit operation ceiling.
+    #[error("analytical reference lookup exceeds the {max_candidates}-candidate work ceiling")]
+    ReferenceWorkLimitExceeded { max_candidates: usize },
+    /// Candidate reachability was cancelled before its read snapshot completed.
+    #[error("analytical reference lookup was cancelled")]
+    Cancelled,
+    /// Candidate reachability exceeded its elapsed-time deadline.
+    #[error("analytical reference lookup deadline exceeded")]
+    DeadlineExceeded,
     /// Row, byte, version, or ordinal conversion overflowed.
     #[error("analytical manifest count overflow")]
     CountOverflow,
@@ -465,9 +503,102 @@ pub enum ManifestCatalogError {
     Sqlite(#[from] rusqlite::Error),
 }
 
+fn append_reference_membership(
+    connection: &Connection,
+    candidates: &[Sha256Digest],
+    now: Timestamp,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+    membership: &mut Vec<bool>,
+) -> Result<(), ManifestCatalogError> {
+    if candidates.is_empty() || candidates.len() > REFERENCE_MEMBERSHIP_CHUNK {
+        return Err(ManifestCatalogError::ReferenceWorkLimitExceeded {
+            max_candidates: REFERENCE_MEMBERSHIP_CHUNK,
+        });
+    }
+    let query_capacity = candidates
+        .len()
+        .checked_mul(24)
+        .and_then(|value| value.checked_add(768))
+        .ok_or(ManifestCatalogError::CountOverflow)?;
+    let mut query = String::new();
+    query
+        .try_reserve_exact(query_capacity)
+        .map_err(|_| ManifestCatalogError::CountOverflow)?;
+    query.push_str("WITH candidates(candidate_ordinal, content_hash) AS (VALUES ");
+    for ordinal in 0..candidates.len() {
+        if ordinal > 0 {
+            query.push(',');
+        }
+        write!(&mut query, "({ordinal}, ?{})", ordinal + 1)
+            .map_err(|_| ManifestCatalogError::AllocationContract)?;
+    }
+    let now_parameter = candidates
+        .len()
+        .checked_add(1)
+        .ok_or(ManifestCatalogError::CountOverflow)?;
+    write!(
+        &mut query,
+        ") SELECT candidate_ordinal,
+            EXISTS(
+                SELECT 1 FROM analytical_generation_objects AS objects
+                WHERE objects.content_hash=candidates.content_hash
+            ) OR EXISTS(
+                SELECT 1
+                FROM query_artifact_results AS results
+                JOIN query_artifact_reservations AS reservations USING (reservation_id)
+                WHERE results.content_algorithm=1
+                  AND results.content_digest=candidates.content_hash
+                  AND reservations.state='published'
+                  AND reservations.expires_at_ns>?{now_parameter}
+            )
+         FROM candidates ORDER BY candidate_ordinal"
+    )
+    .map_err(|_| ManifestCatalogError::AllocationContract)?;
+    let mut statement = connection.prepare(&query)?;
+    for (index, candidate) in candidates.iter().enumerate() {
+        let bytes = candidate.bytes();
+        statement.raw_bind_parameter(index + 1, bytes.as_slice())?;
+    }
+    statement.raw_bind_parameter(now_parameter, now.unix_nanos())?;
+    let mut rows = statement.raw_query();
+    let membership_start = membership.len();
+    while let Some(row) = rows.next()? {
+        check_reference_operation(deadline, cancellation)?;
+        let expected_ordinal = membership
+            .len()
+            .checked_sub(membership_start)
+            .ok_or(ManifestCatalogError::CountOverflow)?;
+        let ordinal = usize::try_from(row.get::<_, i64>(0)?)
+            .map_err(|_| ManifestCatalogError::CorruptCatalog)?;
+        if ordinal != expected_ordinal {
+            return Err(ManifestCatalogError::CorruptCatalog);
+        }
+        membership.push(row.get::<_, bool>(1)?);
+    }
+    if membership.len().saturating_sub(membership_start) != candidates.len() {
+        return Err(ManifestCatalogError::CorruptCatalog);
+    }
+    Ok(())
+}
+
+fn check_reference_operation(
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<(), ManifestCatalogError> {
+    if cancellation.is_cancelled() {
+        Err(ManifestCatalogError::Cancelled)
+    } else if Instant::now() >= deadline {
+        Err(ManifestCatalogError::DeadlineExceeded)
+    } else {
+        Ok(())
+    }
+}
+
 fn load_latest(
     connection: &Connection,
     dataset_id: &DatasetId,
+    max_objects: usize,
 ) -> Result<Option<PinnedDataset>, ManifestCatalogError> {
     let reference = connection
         .query_row(
@@ -488,13 +619,14 @@ fn load_latest(
         .transpose()?;
     reference
         .as_ref()
-        .map(|reference| load_pinned(connection, reference))
+        .map(|reference| load_pinned(connection, reference, max_objects))
         .transpose()
 }
 
 fn load_pinned(
     connection: &Connection,
     reference: &DatasetManifestRef,
+    max_objects: usize,
 ) -> Result<PinnedDataset, ManifestCatalogError> {
     let header = connection
         .query_row(
@@ -518,37 +650,27 @@ fn load_pinned(
     if parse_digest(&header.0)? != reference.content_hash {
         return Err(ManifestCatalogError::GenerationConflict);
     }
-    let object_count = connection.query_row(
-        "SELECT COUNT(*) FROM analytical_generation_objects
-         WHERE dataset_id=?1 AND manifest_version=?2",
-        params![
-            reference.dataset_id.as_str(),
-            to_i64(reference.manifest_version)?
-        ],
-        |row| row.get::<_, i64>(0),
-    )?;
-    let object_count =
-        usize::try_from(object_count).map_err(|_| ManifestCatalogError::CountOverflow)?;
-    if object_count == 0 {
-        return Err(ManifestCatalogError::CorruptCatalog);
-    }
+    let retrieval_limit = max_objects
+        .checked_add(1)
+        .ok_or(ManifestCatalogError::CountOverflow)?;
     let mut statement = connection.prepare(
         "SELECT objects.artifact_id, artifacts.relative_reference, objects.content_hash,
                 objects.row_count, objects.size_bytes, objects.lineage_hash
          FROM analytical_generation_objects AS objects
-         JOIN artifacts USING (artifact_id)
+         LEFT JOIN artifacts USING (artifact_id)
          WHERE objects.dataset_id=?1 AND objects.manifest_version=?2
-         ORDER BY objects.ordinal",
+         ORDER BY objects.ordinal LIMIT ?3",
     )?;
     let rows = statement.query_map(
         params![
             reference.dataset_id.as_str(),
-            to_i64(reference.manifest_version)?
+            to_i64(reference.manifest_version)?,
+            i64::try_from(retrieval_limit).map_err(|_| ManifestCatalogError::CountOverflow)?
         ],
         |row| {
             Ok((
                 row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(1)?,
                 row.get::<_, Vec<u8>>(2)?,
                 row.get::<_, i64>(3)?,
                 row.get::<_, i64>(4)?,
@@ -556,6 +678,23 @@ fn load_pinned(
             ))
         },
     )?;
+    let mut staged = Vec::new();
+    staged
+        .try_reserve_exact(retrieval_limit)
+        .map_err(|_| ManifestCatalogError::CountOverflow)?;
+    if staged.capacity() != retrieval_limit {
+        return Err(ManifestCatalogError::AllocationContract);
+    }
+    for row in rows {
+        staged.push(row?);
+    }
+    if staged.len() > max_objects {
+        return Err(ManifestCatalogError::ObjectLimitExceeded { max_objects });
+    }
+    if staged.is_empty() {
+        return Err(ManifestCatalogError::CorruptCatalog);
+    }
+    let object_count = staged.len();
     let mut objects = Vec::new();
     objects
         .try_reserve_exact(object_count)
@@ -563,12 +702,13 @@ fn load_pinned(
     if objects.capacity() != object_count {
         return Err(ManifestCatalogError::AllocationContract);
     }
-    for row in rows {
-        let (artifact_id, relative_reference, content, rows, bytes, lineage) = row?;
+    for (artifact_id, relative_reference, content, rows, bytes, lineage) in staged {
         objects.push(PinnedManifestObject {
             artifact_id: Uuid::parse_str(&artifact_id)
                 .map_err(|_| ManifestCatalogError::CorruptCatalog)?,
-            relative_reference: relative_reference.into_boxed_str(),
+            relative_reference: relative_reference
+                .ok_or(ManifestCatalogError::CorruptCatalog)?
+                .into_boxed_str(),
             object: ManifestObject::try_new(
                 parse_digest(&content)?,
                 from_i64(rows)?,
@@ -576,9 +716,6 @@ fn load_pinned(
                 parse_digest(&lineage)?,
             )?,
         });
-    }
-    if objects.len() != object_count {
-        return Err(ManifestCatalogError::CorruptCatalog);
     }
     let mut plan_objects = Vec::new();
     plan_objects
@@ -776,4 +913,133 @@ fn to_i64(value: u64) -> Result<i64, ManifestCatalogError> {
 
 fn from_i64(value: i64) -> Result<u64, ManifestCatalogError> {
     u64::try_from(value).map_err(|_| ManifestCatalogError::CorruptCatalog)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error;
+    use std::time::{Duration, Instant};
+
+    use market_squawk_domain::Timestamp;
+    use market_squawk_platform::LocalPaths;
+    use rusqlite::{Connection, params};
+    use tokio_util::sync::CancellationToken;
+
+    use super::{AnalyticalManifestCatalog, ManifestCatalogError};
+    use crate::{
+        CatalogAuthority, CatalogConfig, CatalogLimit, CatalogResultLimits, DatasetId,
+        DatasetManifestRef, Sha256Digest,
+    };
+
+    type TestResult = Result<(), Box<dyn Error>>;
+
+    #[test]
+    fn pinned_read_rejects_max_plus_one_objects_before_reconstruction() -> TestResult {
+        let (_directory, location) = migrated_catalog()?;
+        let connection = Connection::open(location.path())?;
+        connection.pragma_update(None, "foreign_keys", false)?;
+        connection.execute(
+            "INSERT INTO analytical_generations
+             (dataset_id, manifest_version, content_hash, lineage_hash, row_count, total_bytes,
+              schema_version, anchor_manifest_id, parent_version, generation_kind, created_at_ns)
+             VALUES ('over-limit', 1, ?1, ?2, 2, 2, 1, ?3, NULL, 'ingest', 1)",
+            params![
+                [7_u8; 32].as_slice(),
+                [8_u8; 32].as_slice(),
+                uuid::Uuid::new_v4().to_string()
+            ],
+        )?;
+        for ordinal in 0_i64..2 {
+            connection.execute(
+                "INSERT INTO analytical_generation_objects
+                 (dataset_id, manifest_version, ordinal, artifact_id, content_hash, row_count,
+                  size_bytes, lineage_hash)
+                 VALUES ('over-limit', 1, ?1, ?2, ?3, 1, 1, ?4)",
+                params![
+                    ordinal,
+                    uuid::Uuid::new_v4().to_string(),
+                    [ordinal as u8; 32].as_slice(),
+                    [8_u8; 32].as_slice()
+                ],
+            )?;
+        }
+        drop(connection);
+        let catalog = AnalyticalManifestCatalog::open(&location, 1)?;
+        let manifest = DatasetManifestRef::try_new(
+            DatasetId::try_from("over-limit")?,
+            1,
+            Sha256Digest::new([7; 32]),
+        )?;
+
+        assert!(matches!(
+            catalog.pinned(&manifest),
+            Err(ManifestCatalogError::ObjectLimitExceeded { max_objects: 1 })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn long_history_membership_is_candidate_bounded_and_cancelable() -> TestResult {
+        let (_directory, location) = migrated_catalog()?;
+        let mut connection = Connection::open(location.path())?;
+        connection.pragma_update(None, "foreign_keys", false)?;
+        let transaction = connection.transaction()?;
+        for ordinal in 0_i64..4_096 {
+            transaction.execute(
+                "INSERT INTO analytical_generation_objects
+                 (dataset_id, manifest_version, ordinal, artifact_id, content_hash, row_count,
+                  size_bytes, lineage_hash)
+                 VALUES ('history', 1, ?1, ?2, ?3, 1, 1, ?4)",
+                params![
+                    ordinal,
+                    uuid::Uuid::new_v4().to_string(),
+                    [ordinal.rem_euclid(251) as u8; 32].as_slice(),
+                    [8_u8; 32].as_slice()
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        drop(connection);
+        let catalog = AnalyticalManifestCatalog::open(&location, 8)?;
+        let candidate = Sha256Digest::new([254; 32]);
+        let deadline = Instant::now() + Duration::from_secs(1);
+
+        assert_eq!(
+            catalog.referenced_candidates(
+                [candidate].into_iter(),
+                Timestamp::from_unix_nanos(1),
+                1,
+                deadline,
+                &CancellationToken::new(),
+            )?,
+            vec![false]
+        );
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert!(matches!(
+            catalog.referenced_candidates(
+                [candidate].into_iter(),
+                Timestamp::from_unix_nanos(1),
+                1,
+                deadline,
+                &cancelled,
+            ),
+            Err(ManifestCatalogError::Cancelled)
+        ));
+        Ok(())
+    }
+
+    fn migrated_catalog()
+    -> Result<(tempfile::TempDir, market_squawk_platform::CatalogLocation), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let paths = LocalPaths::prepare(directory.path().join("market-squawk"))?;
+        let location = paths.catalog()?.clone();
+        drop(CatalogAuthority::open(CatalogConfig::try_new(
+            location.clone(),
+            Duration::from_millis(750),
+            CatalogLimit::new(32)?,
+            CatalogResultLimits::try_new(1024 * 1024, 8 * 1024 * 1024)?,
+        )?)?);
+        Ok((directory, location))
+    }
 }

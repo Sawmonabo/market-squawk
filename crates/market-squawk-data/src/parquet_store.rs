@@ -31,7 +31,7 @@ use crate::schema::{decode_hex, encode_hex};
 const OBJECTS: &str = "objects/sha256";
 const STAGING: &str = "staging/parquet";
 const QUARANTINE: &str = "quarantine/parquet";
-const MAX_SCAN_OBJECTS: usize = 100_000;
+pub(crate) const MAX_SCAN_OBJECTS: usize = 100_000;
 const MAX_BLOCKING_TASKS: usize = 4;
 const QUERY_WRITER_FIXED_RECEIPT: usize = 128 * 1024;
 const QUERY_WRITER_INPUT_EXPANSION: usize = 3;
@@ -424,6 +424,9 @@ impl ParquetObjectStore {
             .map_err(|error| match error {
                 BlockingIoAdmissionError::Cancelled => ParquetStoreError::Cancelled,
                 BlockingIoAdmissionError::Saturated => ParquetStoreError::BlockingTaskLimitExceeded,
+                BlockingIoAdmissionError::ReaperUnavailable => {
+                    ParquetStoreError::BlockingTaskFailed
+                }
             })?;
         tokio::select! {
             result = &mut worker => {
@@ -857,6 +860,9 @@ pub enum ParquetStoreError {
     /// Recovery enumeration exceeded its defensive ceiling.
     #[error("Parquet recovery object scan exceeded its ceiling")]
     RecoveryScanLimit,
+    /// Recovery exceeded its elapsed-time deadline.
+    #[error("Parquet recovery deadline exceeded")]
+    RecoveryDeadlineExceeded,
     /// Artifact reference validation failed.
     #[error("controlled artifact reference is invalid")]
     ArtifactPath(#[from] market_squawk_platform::ArtifactPathError),

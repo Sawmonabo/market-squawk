@@ -4,10 +4,6 @@ use std::time::Duration;
 use arrow::array::{ArrayRef, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use market_squawk_data::{
-    DatasetId, DatasetManifestRef, QueryError, QueryLimits, QueryRequest, QueryResult,
-    ResearchArrowBatch, ResearchQueryEngine, Sha256Digest,
-};
 use market_squawk_domain::{
     AvailabilityEvidence, DataQuality, DigestAlgorithm, EvidenceDigest, MacroObservation,
     PayloadReference, ResearchContext, ResearchObservation, ResearchProvenance,
@@ -15,6 +11,9 @@ use market_squawk_domain::{
 };
 use rust_decimal::Decimal;
 use tokio_util::sync::CancellationToken;
+
+use super::{QueryError, QueryLimits, QueryRequest, QueryResult, ResearchQueryEngine};
+use crate::{DatasetId, DatasetManifestRef, ResearchArrowBatch, Sha256Digest};
 
 type TestResult = Result<(), Box<dyn Error>>;
 
@@ -40,7 +39,8 @@ async fn query_service_allows_only_bounded_read_only_sql() -> TestResult {
         .query(
             QueryRequest::try_new(
                 manifest.clone(),
-                "WITH bounded AS (SELECT value FROM observations) SELECT value FROM bounded ORDER BY value",
+                "WITH bounded AS (SELECT value FROM observations) \
+                 SELECT value FROM bounded ORDER BY value",
             )?,
             limits,
             CancellationToken::new(),
@@ -65,28 +65,6 @@ async fn query_service_allows_only_bounded_read_only_sql() -> TestResult {
                 | Err(QueryError::Parse(_))
         ));
     }
-    Ok(())
-}
-
-#[tokio::test]
-async fn query_service_honors_cancellation_and_manifest_pinning() -> TestResult {
-    let manifest = manifest()?;
-    let engine = ResearchQueryEngine::from_pinned_batches(
-        manifest.clone(),
-        "observations",
-        vec![RecordBatch::new_empty(Schema::empty().into())],
-    )?;
-    let cancellation = CancellationToken::new();
-    cancellation.cancel();
-    let result = engine
-        .query(
-            QueryRequest::try_new(manifest, "SELECT 1")?,
-            QueryLimits::try_new(1, 1024, 1024 * 1024, 1, 32, 32, Duration::from_secs(1))?,
-            cancellation,
-        )
-        .await;
-    assert!(matches!(result, Err(QueryError::Cancelled)));
-    assert!(!matches!(result, Ok(QueryResult::Inline { .. })));
     Ok(())
 }
 
@@ -141,60 +119,6 @@ async fn available_at_cutoff_excludes_inferred_and_unknown_rows() -> TestResult 
         return Err("expected inline result".into());
     };
     assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
-    Ok(())
-}
-
-#[tokio::test]
-async fn one_memory_budget_charges_retained_input_output_and_ipc_work() -> TestResult {
-    let manifest = manifest()?;
-    let batch = RecordBatch::try_new(
-        Schema::new(vec![Field::new("value", DataType::Int64, false)]).into(),
-        vec![std::sync::Arc::new(Int64Array::from_iter_values(0..64)) as ArrayRef],
-    )?;
-    let engine =
-        ResearchQueryEngine::from_pinned_batches(manifest.clone(), "observations", vec![batch])?;
-    let result = engine
-        .query(
-            QueryRequest::try_new(manifest, "SELECT value FROM observations")?,
-            QueryLimits::try_new(64, 1800, 1800, 1, 128, 128, Duration::from_secs(1))?,
-            CancellationToken::new(),
-        )
-        .await;
-    assert!(matches!(
-        result,
-        Err(QueryError::MemoryLimitExceeded { limit: 1800 })
-    ));
-    Ok(())
-}
-
-#[tokio::test]
-async fn planning_memory_is_reserved_from_the_configured_ceiling_before_context() -> TestResult {
-    let manifest = manifest()?;
-    let batch = RecordBatch::try_new(
-        Schema::new(vec![Field::new("value", DataType::Int64, false)]).into(),
-        vec![std::sync::Arc::new(Int64Array::from(vec![1])) as ArrayRef],
-    )?;
-    let engine =
-        ResearchQueryEngine::from_pinned_batches(manifest.clone(), "observations", vec![batch])?;
-    let result = engine
-        .query(
-            QueryRequest::try_new(manifest, "SELECT value FROM observations")?,
-            QueryLimits::try_new(
-                1,
-                64 * 1024,
-                256 * 1024,
-                1,
-                128,
-                10_000,
-                Duration::from_secs(1),
-            )?,
-            CancellationToken::new(),
-        )
-        .await;
-    assert!(matches!(
-        result,
-        Err(QueryError::MemoryLimitExceeded { limit }) if limit == 256 * 1024
-    ));
     Ok(())
 }
 

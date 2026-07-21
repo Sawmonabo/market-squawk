@@ -2,14 +2,16 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::LazyLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{SyncSender, sync_channel};
+use std::sync::{Arc, LazyLock};
 use std::task::{Context, Poll};
+use std::thread::JoinHandle as ThreadJoinHandle;
 
+use thiserror::Error;
 #[cfg(test)]
 use tokio::sync::{Mutex as TokioMutex, OwnedMutexGuard};
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::task::{JoinError, JoinHandle};
 use tokio_util::sync::CancellationToken;
 
@@ -17,6 +19,8 @@ const MAX_QUERY_BLOCKING_WORKERS: usize = 64;
 const _: () = assert!(MAX_QUERY_BLOCKING_WORKERS <= Semaphore::MAX_PERMITS);
 static QUERY_BLOCKING_WORKERS: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(MAX_QUERY_BLOCKING_WORKERS)));
+static BLOCKING_TASK_REAPER: LazyLock<BlockingTaskReaper> =
+    LazyLock::new(BlockingTaskReaper::start);
 #[cfg(test)]
 static QUERY_BLOCKING_WORKER_TEST_SERIAL: LazyLock<Arc<TokioMutex<()>>> =
     LazyLock::new(|| Arc::new(TokioMutex::new(())));
@@ -41,15 +45,42 @@ pub(crate) struct BlockingIoLease {
     _global_permit: OwnedSemaphorePermit,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub(crate) enum BlockingIoAdmissionError {
+    #[error("blocking I/O was cancelled before admission")]
     Cancelled,
+    #[error("blocking I/O worker or reaper capacity is saturated")]
     Saturated,
+    #[error("blocking I/O reaper could not be started")]
+    ReaperUnavailable,
 }
 
 #[derive(Debug)]
 pub(crate) struct BlockingIoTask<T: Send + 'static> {
-    worker: Option<JoinHandle<T>>,
+    command: Option<ReapCommand>,
+    result: oneshot::Receiver<T>,
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum BlockingIoTaskError {
+    #[error("blocking I/O worker failed")]
+    Join(#[from] JoinError),
+    #[error("blocking I/O worker closed without returning its result")]
+    ResultChannelClosed,
+}
+
+#[derive(Debug)]
+struct ReapCommand {
+    worker: JoinHandle<()>,
+    _permit: OwnedSemaphorePermit,
+}
+
+struct BlockingTaskReaper {
+    sender: Option<SyncSender<ReapCommand>>,
+    capacity: Arc<Semaphore>,
+    pending: Arc<AtomicUsize>,
+    idle: Arc<Notify>,
+    _thread: Option<ThreadJoinHandle<()>>,
 }
 
 impl BlockingIoSupervisor {
@@ -80,6 +111,7 @@ impl BlockingIoSupervisor {
         if self.inner.cancellation.is_cancelled() {
             return Err(BlockingIoAdmissionError::Cancelled);
         }
+        let reaper_permit = BLOCKING_TASK_REAPER.try_reserve()?;
         let global_permit = Arc::clone(&QUERY_BLOCKING_WORKERS)
             .try_acquire_owned()
             .map_err(|_| BlockingIoAdmissionError::Saturated)?;
@@ -92,11 +124,17 @@ impl BlockingIoSupervisor {
             drop(lease);
             return Err(BlockingIoAdmissionError::Cancelled);
         }
+        let (result_sender, result) = oneshot::channel();
         Ok(BlockingIoTask {
-            worker: Some(tokio::task::spawn_blocking(move || {
-                let _lease = lease;
-                operation()
-            })),
+            command: Some(ReapCommand {
+                worker: tokio::task::spawn_blocking(move || {
+                    let _lease = lease;
+                    let outcome = operation();
+                    let _ignored = result_sender.send(outcome);
+                }),
+                _permit: reaper_permit,
+            }),
+            result,
         })
     }
 
@@ -126,15 +164,21 @@ impl BlockingIoSupervisor {
         loop {
             let idle = self.inner.idle.notified();
             if self.inner.active.load(Ordering::Acquire) == 0 {
-                return;
+                break;
             }
             idle.await;
         }
+        BLOCKING_TASK_REAPER.drain().await;
     }
 
     #[cfg(test)]
     pub(crate) fn active(&self) -> usize {
         self.inner.active.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reaper_pending() -> usize {
+        BLOCKING_TASK_REAPER.pending.load(Ordering::Acquire)
     }
 
     #[cfg(test)]
@@ -180,34 +224,144 @@ impl BlockingIoSupervisor {
 }
 
 impl<T: Send + 'static> Future for BlockingIoTask<T> {
-    type Output = Result<T, JoinError>;
+    type Output = Result<T, BlockingIoTaskError>;
 
     fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        let Some(worker) = self.worker.as_mut() else {
-            return Poll::Pending;
-        };
-        match Pin::new(worker).poll(context) {
-            Poll::Ready(result) => {
-                self.worker = None;
-                Poll::Ready(result)
+        match Pin::new(&mut self.result).poll(context) {
+            Poll::Ready(Ok(result)) => {
+                self.handoff_pending_worker();
+                Poll::Ready(Ok(result))
+            }
+            Poll::Ready(Err(_closed)) => {
+                let Some(command) = self.command.as_mut() else {
+                    return Poll::Ready(Err(BlockingIoTaskError::ResultChannelClosed));
+                };
+                match Pin::new(&mut command.worker).poll(context) {
+                    Poll::Ready(result) => {
+                        self.command = None;
+                        match result {
+                            Ok(()) => Poll::Ready(Err(BlockingIoTaskError::ResultChannelClosed)),
+                            Err(error) => Poll::Ready(Err(error.into())),
+                        }
+                    }
+                    Poll::Pending => Poll::Pending,
+                }
             }
             Poll::Pending => Poll::Pending,
         }
     }
 }
 
-impl<T: Send + 'static> Drop for BlockingIoTask<T> {
-    fn drop(&mut self) {
-        let Some(worker) = self.worker.take() else {
+impl<T: Send + 'static> BlockingIoTask<T> {
+    fn handoff_pending_worker(&mut self) {
+        let Some(command) = self.command.take() else {
             return;
         };
-        if worker.is_finished() {
+        if command.worker.is_finished() {
             return;
         }
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                let _ignored = worker.await;
+        BLOCKING_TASK_REAPER.reap(command);
+    }
+}
+
+impl<T: Send + 'static> Drop for BlockingIoTask<T> {
+    fn drop(&mut self) {
+        self.handoff_pending_worker();
+    }
+}
+
+impl BlockingTaskReaper {
+    fn start() -> Self {
+        let capacity = Arc::new(Semaphore::new(MAX_QUERY_BLOCKING_WORKERS));
+        let pending = Arc::new(AtomicUsize::new(0));
+        let idle = Arc::new(Notify::new());
+        let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return Self {
+                sender: None,
+                capacity,
+                pending,
+                idle,
+                _thread: None,
+            };
+        };
+        let (sender, receiver) = sync_channel::<ReapCommand>(MAX_QUERY_BLOCKING_WORKERS);
+        let thread_pending = Arc::clone(&pending);
+        let thread_idle = Arc::clone(&idle);
+        let thread = std::thread::Builder::new()
+            .name("market-squawk-blocking-reaper".to_owned())
+            .spawn(move || {
+                while let Ok(command) = receiver.recv() {
+                    let _outcome = runtime.block_on(command.worker);
+                    drop(command._permit);
+                    if thread_pending.fetch_sub(1, Ordering::AcqRel) == 1 {
+                        thread_idle.notify_waiters();
+                    }
+                }
             });
+        match thread {
+            Ok(thread) => Self {
+                sender: Some(sender),
+                capacity,
+                pending,
+                idle,
+                _thread: Some(thread),
+            },
+            Err(_error) => Self {
+                sender: None,
+                capacity,
+                pending,
+                idle,
+                _thread: None,
+            },
+        }
+    }
+
+    fn try_reserve(&self) -> Result<OwnedSemaphorePermit, BlockingIoAdmissionError> {
+        if self.sender.is_none() {
+            return Err(BlockingIoAdmissionError::ReaperUnavailable);
+        }
+        Arc::clone(&self.capacity)
+            .try_acquire_owned()
+            .map_err(|_| BlockingIoAdmissionError::Saturated)
+    }
+
+    fn reap(&self, command: ReapCommand) {
+        self.pending.fetch_add(1, Ordering::AcqRel);
+        let Some(sender) = self.sender.as_ref() else {
+            self.reap_without_worker_thread(command);
+            return;
+        };
+        if let Err(error) = sender.send(command) {
+            self.reap_without_worker_thread(error.0);
+        }
+    }
+
+    fn reap_without_worker_thread(&self, mut command: ReapCommand) {
+        let waker = futures_util::task::noop_waker();
+        let mut context = Context::from_waker(&waker);
+        while Pin::new(&mut command.worker)
+            .poll(&mut context)
+            .is_pending()
+        {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        drop(command._permit);
+        if self.pending.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.idle.notify_waiters();
+        }
+    }
+
+    #[cfg(test)]
+    async fn drain(&self) {
+        loop {
+            let idle = self.idle.notified();
+            if self.pending.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            idle.await;
         }
     }
 }
@@ -247,6 +401,64 @@ impl RangeTestBarrier {
 
     pub(crate) fn release(&self) -> Result<(), Box<dyn std::error::Error>> {
         self.release_sender.send(())?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error;
+    use std::time::{Duration, Instant};
+
+    use super::BlockingIoSupervisor;
+    use tokio_util::sync::CancellationToken;
+
+    type TestResult = Result<(), Box<dyn Error>>;
+
+    #[test]
+    fn no_runtime_drop_retains_and_reaps_the_origin_runtime_handle() -> TestResult {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()?;
+        let serial = runtime.block_on(BlockingIoSupervisor::acquire_test_serial_guard());
+        let supervisor = BlockingIoSupervisor::new(CancellationToken::new());
+        let (entered_sender, entered_receiver) = std::sync::mpsc::sync_channel(1);
+        let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(1);
+        let task = runtime
+            .block_on(async {
+                supervisor.spawn_blocking(move || {
+                    let _ignored = entered_sender.send(());
+                    let _ignored = release_receiver.recv();
+                })
+            })
+            .map_err(|_| "blocking worker was not admitted")?;
+        entered_receiver.recv_timeout(Duration::from_secs(1))?;
+        runtime.shutdown_background();
+
+        drop(task);
+        wait_until(Duration::from_secs(1), || {
+            BlockingIoSupervisor::reaper_pending() == 1
+        })?;
+        release_sender.send(())?;
+        wait_until(Duration::from_secs(1), || {
+            BlockingIoSupervisor::reaper_pending() == 0 && supervisor.active() == 0
+        })?;
+        drop(serial);
+        Ok(())
+    }
+
+    fn wait_until(
+        timeout: Duration,
+        mut predicate: impl FnMut() -> bool,
+    ) -> Result<(), &'static str> {
+        let deadline = Instant::now() + timeout;
+        while !predicate() {
+            if Instant::now() >= deadline {
+                return Err("timed out waiting for blocking-worker reaper");
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
         Ok(())
     }
 }

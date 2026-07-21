@@ -1,5 +1,6 @@
 //! Bounded read-only DataFusion execution over one immutable manifest pin.
 
+#[cfg(test)]
 use std::mem::size_of;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,6 +27,9 @@ use tokio_util::sync::CancellationToken;
 mod budget;
 #[path = "query/source.rs"]
 mod source;
+#[cfg(test)]
+#[path = "query/tests.rs"]
+mod tests;
 #[path = "query/validation.rs"]
 mod validation;
 
@@ -300,6 +304,17 @@ pub trait ResearchQueryService {
 }
 
 /// DataFusion query engine over an exact immutable input snapshot.
+///
+/// Arbitrary in-memory batches cannot be attached to a fabricated or real durable manifest:
+///
+/// ```compile_fail
+/// use arrow::record_batch::RecordBatch;
+/// use market_squawk_data::{DatasetManifestRef, ResearchQueryEngine};
+///
+/// fn fabricate(manifest: DatasetManifestRef, batches: Vec<RecordBatch>) {
+///     let _ = ResearchQueryEngine::from_pinned_batches(manifest, "observations", batches);
+/// }
+/// ```
 #[derive(Debug)]
 pub struct ResearchQueryEngine {
     manifest: DatasetManifestRef,
@@ -355,8 +370,9 @@ impl ResearchQueryEngine {
         })
     }
 
-    /// Registers only caller-supplied batches already bound to one immutable manifest.
-    pub fn from_pinned_batches(
+    /// Test-only in-memory source with no durable provenance authority.
+    #[cfg(test)]
+    pub(crate) fn from_pinned_batches(
         manifest: DatasetManifestRef,
         table_name: impl Into<String>,
         batches: Vec<RecordBatch>,
@@ -408,11 +424,11 @@ impl ResearchQueryEngine {
         mut self,
         publication: Arc<QueryArtifactPublication>,
     ) -> Result<Self, QueryError> {
-        if self
+        let source_root = self
             .source
             .root_identity()
-            .is_some_and(|identity| identity != publication.root_identity())
-        {
+            .ok_or(QueryError::InvalidSource)?;
+        if source_root != publication.root_identity() {
             return Err(QueryError::ArtifactRootMismatch);
         }
         self.artifact_publication = Some(publication);

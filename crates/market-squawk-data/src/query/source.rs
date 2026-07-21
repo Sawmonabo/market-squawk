@@ -6,6 +6,7 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use arrow::datatypes::SchemaRef;
+#[cfg(test)]
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -167,6 +168,7 @@ pub(super) enum QuerySource {
         schema: SchemaRef,
         receipt: RetainedSourceReceipt,
     },
+    #[cfg(test)]
     Batches {
         schema: SchemaRef,
         batches: Arc<Box<[RecordBatch]>>,
@@ -177,20 +179,25 @@ pub(super) enum QuerySource {
 impl QuerySource {
     pub(super) fn schema(&self) -> &SchemaRef {
         match self {
-            Self::Pinned { schema, .. } | Self::Batches { schema, .. } => schema,
+            Self::Pinned { schema, .. } => schema,
+            #[cfg(test)]
+            Self::Batches { schema, .. } => schema,
         }
     }
 
     pub(super) fn root_identity(&self) -> Option<&ArtifactRootIdentity> {
         match self {
             Self::Pinned { store, .. } => Some(store.authority_identity()),
+            #[cfg(test)]
             Self::Batches { .. } => None,
         }
     }
 
     pub(super) fn retained_bytes(&self) -> Result<usize, QueryError> {
         match self {
-            Self::Pinned { receipt, .. } | Self::Batches { receipt, .. } => Ok(receipt.bytes()),
+            Self::Pinned { receipt, .. } => Ok(receipt.bytes()),
+            #[cfg(test)]
+            Self::Batches { receipt, .. } => Ok(receipt.bytes()),
         }
     }
 
@@ -227,6 +234,7 @@ impl QuerySource {
                 )?
                 .publish(context, table_name, registry)
             }
+            #[cfg(test)]
             Self::Batches {
                 schema, batches, ..
             } => {
@@ -467,7 +475,10 @@ async fn read_exact_range(
         })
         .map_err(blocking_admission_object_store)?;
     tokio::select! {
-        result = &mut worker => result.map_err(ObjectStoreError::from)?,
+        result = &mut worker => result.map_err(|source| ObjectStoreError::Generic {
+            store: STORE_NAME,
+            source: Box::new(source),
+        })?,
         _ = supervisor.cancellation().cancelled() => Err(cancelled_object_store()),
     }
 }
@@ -477,7 +488,9 @@ fn blocking_admission_object_store(error: BlockingIoAdmissionError) -> ObjectSto
         store: STORE_NAME,
         source: match error {
             BlockingIoAdmissionError::Cancelled => Box::new(PinnedIoCancelledError),
-            BlockingIoAdmissionError::Saturated => Box::new(PinnedIoAdmissionError),
+            BlockingIoAdmissionError::Saturated | BlockingIoAdmissionError::ReaperUnavailable => {
+                Box::new(PinnedIoAdmissionError)
+            }
         },
     }
 }

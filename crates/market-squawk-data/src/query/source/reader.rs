@@ -33,6 +33,7 @@ const DECODER_FIXED_SCRATCH: usize = 64 * 1024;
 const MAX_ACTIVE_FILE_RECEIPT: usize = 512 * 1024 * 1024;
 const READER_BATCH_ROWS: usize = 8_192;
 
+#[cfg(test)]
 pub(super) fn shared_batch_stream(
     schema: SchemaRef,
     batches: Arc<Box<[RecordBatch]>>,
@@ -128,6 +129,7 @@ struct ActiveReaderReceipt {
     _reservation: MemoryReservation,
 }
 
+#[cfg(test)]
 struct SharedBatchStream {
     schema: SchemaRef,
     batches: Arc<Box<[RecordBatch]>>,
@@ -135,6 +137,7 @@ struct SharedBatchStream {
     _receipt: MemoryReservation,
 }
 
+#[cfg(test)]
 impl Stream for SharedBatchStream {
     type Item = DataFusionResult<RecordBatch>;
 
@@ -152,6 +155,7 @@ impl Stream for SharedBatchStream {
     }
 }
 
+#[cfg(test)]
 impl RecordBatchStream for SharedBatchStream {
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
@@ -453,7 +457,7 @@ fn cancelled_datafusion() -> DataFusionError {
 fn blocking_admission_datafusion(error: BlockingIoAdmissionError) -> DataFusionError {
     match error {
         BlockingIoAdmissionError::Cancelled => cancelled_datafusion(),
-        BlockingIoAdmissionError::Saturated => {
+        BlockingIoAdmissionError::Saturated | BlockingIoAdmissionError::ReaperUnavailable => {
             DataFusionError::External(Box::new(PinnedIoAdmissionError))
         }
     }

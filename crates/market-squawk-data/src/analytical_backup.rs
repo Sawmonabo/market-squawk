@@ -192,13 +192,6 @@ impl AnalyticalOperationGate {
             _ = cancellation.cancelled() => None,
         }
     }
-
-    /// Acquires admission for a legacy operation whose public contract is not yet cancellable.
-    pub(crate) async fn acquire_uninterruptible(&self) -> AnalyticalOperationLease {
-        AnalyticalOperationLease {
-            _guard: Arc::clone(&self.owner).lock_owned().await,
-        }
-    }
 }
 
 impl fmt::Debug for AnalyticalOperationGate {

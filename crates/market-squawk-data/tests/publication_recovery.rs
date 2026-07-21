@@ -3,16 +3,13 @@ use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use arrow::array::{ArrayRef, Int64Array};
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatch;
 use market_squawk_data::{
     AnalyticalDataService, AnalyticalManifestCatalog, CatalogAuthority, CatalogConfig,
-    CatalogError, CatalogLimit, CatalogResultLimits, CompactionRequest, DatasetId,
-    DatasetManifestRef, IngestError, IngestIdentity, ObjectStoreConfig, ParquetStoreError,
+    CatalogError, CatalogLimit, CatalogResultLimits, CommittedDataset, CompactionRequest,
+    IngestError, IngestIdentity, ObjectStoreConfig, ParquetStoreError,
     QueryArtifactReservationInput, QueryError, QueryLimits, QueryRequest, QueryResult,
     ResearchArrowBatch, ResearchIngestService, ResearchQueryEngine, RightsDecisionInput,
-    Sha256Digest, SourceOperation, extraction_batch_digest,
+    SourceOperation, extraction_batch_digest,
 };
 use market_squawk_domain::{
     AuthorizationBasis, ChecksumCapability, CoverageDelay, DataQuality, DeliveryEvidence,
@@ -33,6 +30,13 @@ use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
 
 type TestResult = Result<(), Box<dyn Error>>;
+
+const ARTIFACT_QUERY: &str = "SELECT a.value FROM observations
+     CROSS JOIN (VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9)) AS a(value)
+     CROSS JOIN (VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9)) AS b(value)
+     CROSS JOIN (VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9)) AS c(value)
+     CROSS JOIN (VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9)) AS d(value)
+     CROSS JOIN (VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9)) AS e(value)";
 
 #[test]
 fn a_live_service_excludes_a_second_catalog_from_the_same_artifact_root() -> TestResult {
@@ -237,65 +241,29 @@ async fn cross_root_artifact_authority_fails_before_publication_or_bind() -> Tes
     let first_location = first_paths.catalog()?.clone();
     let second_location = second_paths.catalog()?.clone();
     let store_config = ObjectStoreConfig::try_new(8 * 1024 * 1024, 8192, Duration::from_secs(60))?;
-    let first = AnalyticalDataService::initialize(
-        CatalogAuthority::open(test_catalog_config(first_location.clone())?)?,
-        AnalyticalManifestCatalog::open(&first_location, 8)?,
-        first_paths.artifacts()?.clone(),
+    let (first, committed) = initialized_service_with_dataset(
+        &first_paths,
+        test_catalog_config(first_location.clone())?,
         store_config,
-    )?;
+    )
+    .await?;
     let second = AnalyticalDataService::initialize(
         CatalogAuthority::open(test_catalog_config(second_location.clone())?)?,
         AnalyticalManifestCatalog::open(&second_location, 8)?,
         second_paths.artifacts()?.clone(),
         store_config,
     )?;
-    let manifest = DatasetManifestRef::try_new(
-        DatasetId::try_from("cross-root-query-result")?,
-        1,
-        Sha256Digest::new([42; 32]),
-    )?;
-    let batch = RecordBatch::try_new(
-        Schema::new(vec![Field::new("value", DataType::Int64, false)]).into(),
-        vec![Arc::new(Int64Array::from_iter_values(0..100_000)) as ArrayRef],
-    )?;
-    let limits = QueryLimits::try_new(
-        100_000,
-        4 * 1024 * 1024,
-        64 * 1024 * 1024,
-        1,
-        128,
-        128,
-        Duration::from_secs(5),
-    )?;
-    let request = QueryRequest::try_new(manifest.clone(), "SELECT value FROM observations")?;
-    let wall_nanos = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos())?;
-    let reservation = first
-        .reserve_query_artifact(
-            QueryArtifactReservationInput::try_new(
-                SourceIdentifier::try_from("cross-root-owner")?,
-                request.artifact_identity(&limits),
-                limits.max_bytes(),
-                Timestamp::from_unix_nanos(wall_nanos).checked_add_nanos(120_000_000_000)?,
-            )?,
-            &CancellationToken::new(),
-        )
-        .await?;
     let before = count_published_objects(second_paths.artifacts()?.root())?;
-    let result = ResearchQueryEngine::from_pinned_batches(manifest, "observations", vec![batch])?
-        .with_artifact_publication(second.query_artifact_publication())?
-        .query(
-            request.with_artifact_reservation(reservation),
-            limits,
-            CancellationToken::new(),
-        )
-        .await;
+    let result = ResearchQueryEngine::from_pinned_dataset(
+        committed.pinned().clone(),
+        "observations",
+        first.object_store(),
+        CancellationToken::new(),
+    )
+    .await?
+    .with_artifact_publication(second.query_artifact_publication());
 
-    assert!(matches!(
-        result,
-        Err(QueryError::Catalog(
-            CatalogError::InvalidReservationCapability
-        ))
-    ));
+    assert!(matches!(result, Err(QueryError::ArtifactRootMismatch)));
     assert_eq!(
         count_published_objects(second_paths.artifacts()?.root())?,
         before
@@ -315,32 +283,19 @@ async fn authorized_query_artifact_survives_restart_until_expiry() -> TestResult
         CatalogResultLimits::try_new(1024 * 1024, 8 * 1024 * 1024)?,
     )?;
     let store_config = ObjectStoreConfig::try_new(8 * 1024 * 1024, 8192, Duration::from_secs(60))?;
-    let service = AnalyticalDataService::initialize(
-        CatalogAuthority::open(catalog_config.clone())?,
-        AnalyticalManifestCatalog::open(&location, 8)?,
-        paths.artifacts()?.clone(),
-        store_config,
-    )?;
+    let (service, committed) =
+        initialized_service_with_dataset(&paths, catalog_config.clone(), store_config).await?;
     let store = service.object_store();
-    let manifest = DatasetManifestRef::try_new(
-        DatasetId::try_from("authorized-query-result")?,
-        1,
-        Sha256Digest::new([41; 32]),
-    )?;
-    let batch = RecordBatch::try_new(
-        Schema::new(vec![Field::new("value", DataType::Int64, false)]).into(),
-        vec![Arc::new(Int64Array::from_iter_values(0..100_000)) as ArrayRef],
-    )?;
     let limits = QueryLimits::try_new(
         100_000,
         4 * 1024 * 1024,
         64 * 1024 * 1024,
         1,
-        128,
-        128,
+        512,
+        512,
         Duration::from_secs(5),
     )?;
-    let request = QueryRequest::try_new(manifest.clone(), "SELECT value FROM observations")?;
+    let request = QueryRequest::try_new(committed.manifest().clone(), ARTIFACT_QUERY)?;
     let wall_nanos = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos())?;
     let expires_at = Timestamp::from_unix_nanos(wall_nanos).checked_add_nanos(120_000_000_000)?;
     let owner = SourceIdentifier::try_from("research-session-1")?;
@@ -370,8 +325,14 @@ async fn authorized_query_artifact_survives_restart_until_expiry() -> TestResult
         )
         .await?;
     let publisher = service.query_artifact_publication();
-    let engine = ResearchQueryEngine::from_pinned_batches(manifest, "observations", vec![batch])?
-        .with_artifact_publication(publisher)?;
+    let engine = ResearchQueryEngine::from_pinned_dataset(
+        committed.pinned().clone(),
+        "observations",
+        service.object_store(),
+        CancellationToken::new(),
+    )
+    .await?
+    .with_artifact_publication(publisher)?;
     let result = engine
         .query(
             request.with_artifact_reservation(reservation),
@@ -404,7 +365,10 @@ async fn authorized_query_artifact_survives_restart_until_expiry() -> TestResult
     let before_expiry = object.created_at().checked_add_nanos(61_000_000_000)?;
     assert!(before_expiry < expires_at);
     assert_eq!(
-        service.recover_orphans(before_expiry).await?.quarantined(),
+        service
+            .recover_orphans(before_expiry, CancellationToken::new())
+            .await?
+            .quarantined(),
         0
     );
     assert!(service.object_store().verify(&object)?);
@@ -418,7 +382,13 @@ async fn authorized_query_artifact_survives_restart_until_expiry() -> TestResult
     )?;
     assert!(restarted.object_store().verify(&object)?);
     let expired = expires_at.checked_add_nanos(61_000_000_000)?;
-    assert_eq!(restarted.recover_orphans(expired).await?.quarantined(), 1);
+    assert_eq!(
+        restarted
+            .recover_orphans(expired, CancellationToken::new())
+            .await?
+            .quarantined(),
+        1
+    );
     Ok(())
 }
 
@@ -427,31 +397,22 @@ async fn query_artifact_writer_memory_is_pre_admitted_by_the_object_store() -> T
     let directory = tempfile::tempdir()?;
     let paths = LocalPaths::prepare(directory.path().join("market-squawk"))?;
     let location = paths.catalog()?.clone();
-    let service = AnalyticalDataService::initialize(
-        CatalogAuthority::open(test_catalog_config(location.clone())?)?,
-        AnalyticalManifestCatalog::open(&location, 8)?,
-        paths.artifacts()?.clone(),
+    let (service, committed) = initialized_service_with_dataset(
+        &paths,
+        test_catalog_config(location.clone())?,
         ObjectStoreConfig::try_new(1024 * 1024, 100_000, Duration::from_secs(60))?,
-    )?;
-    let manifest = DatasetManifestRef::try_new(
-        DatasetId::try_from("writer-memory-query-result")?,
-        1,
-        Sha256Digest::new([42; 32]),
-    )?;
-    let batch = RecordBatch::try_new(
-        Schema::new(vec![Field::new("value", DataType::Int64, false)]).into(),
-        vec![Arc::new(Int64Array::from_iter_values(0..100_000)) as ArrayRef],
-    )?;
+    )
+    .await?;
     let limits = QueryLimits::try_new(
         100_000,
         4 * 1024 * 1024,
         64 * 1024 * 1024,
         1,
-        128,
-        128,
+        512,
+        512,
         Duration::from_secs(5),
     )?;
-    let request = QueryRequest::try_new(manifest.clone(), "SELECT value FROM observations")?;
+    let request = QueryRequest::try_new(committed.manifest().clone(), ARTIFACT_QUERY)?;
     let wall_nanos = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos())?;
     let reservation = service
         .reserve_query_artifact(
@@ -464,14 +425,20 @@ async fn query_artifact_writer_memory_is_pre_admitted_by_the_object_store() -> T
             &CancellationToken::new(),
         )
         .await?;
-    let result = ResearchQueryEngine::from_pinned_batches(manifest, "observations", vec![batch])?
-        .with_artifact_publication(service.query_artifact_publication())?
-        .query(
-            request.with_artifact_reservation(reservation),
-            limits,
-            CancellationToken::new(),
-        )
-        .await;
+    let result = ResearchQueryEngine::from_pinned_dataset(
+        committed.pinned().clone(),
+        "observations",
+        service.object_store(),
+        CancellationToken::new(),
+    )
+    .await?
+    .with_artifact_publication(service.query_artifact_publication())?
+    .query(
+        request.with_artifact_reservation(reservation),
+        limits,
+        CancellationToken::new(),
+    )
+    .await;
     assert!(matches!(
         result,
         Err(QueryError::Artifact(
@@ -723,6 +690,48 @@ async fn rights_bound_ingest_replays_one_complete_pinned_generation() -> TestRes
     }
 
     Ok(())
+}
+
+async fn initialized_service_with_dataset(
+    paths: &LocalPaths,
+    catalog_config: CatalogConfig,
+    store_config: ObjectStoreConfig,
+) -> Result<(AnalyticalDataService, CommittedDataset), Box<dyn Error>> {
+    let location = paths.catalog()?.clone();
+    let authority = CatalogAuthority::open(catalog_config)?;
+    let source = local_source()?;
+    authority.register_source(&source, Timestamp::from_unix_nanos(10))?;
+    let batch = extraction_batch()?;
+    let payload_digest = extraction_batch_digest(&batch)?;
+    let rights = authority.admit_source_rights(RightsDecisionInput {
+        source_id: source.source_id().clone(),
+        payload_digest,
+        retrieved_at: Timestamp::from_unix_nanos(15),
+        terms_url: "https://example.test/terms/v1".to_owned(),
+        terms_digest: digest(31),
+        authorization_evidence: digest(32),
+        authorization_expires_at: Some(Timestamp::from_unix_nanos(i64::MAX)),
+        permitted_operations: vec![SourceOperation::Persist],
+    })?;
+    let reservation = authority.reserve_ingest(
+        &IngestIdentity::try_new(
+            source.source_id().clone(),
+            payload_digest,
+            SourceOperation::Persist,
+            "fred:gdp:query-fixture:v1",
+        )?,
+        &rights,
+    )?;
+    let service = AnalyticalDataService::initialize(
+        authority,
+        AnalyticalManifestCatalog::open(&location, 8)?,
+        paths.artifacts()?.clone(),
+        store_config,
+    )?;
+    let committed = service
+        .ingest(reservation, batch, CancellationToken::new())
+        .await?;
+    Ok((service, committed))
 }
 
 fn extraction_batch() -> Result<ExtractionBatch, Box<dyn Error>> {

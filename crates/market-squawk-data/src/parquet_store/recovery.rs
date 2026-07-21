@@ -4,8 +4,10 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::Duration;
+use std::time::Instant;
 
 use market_squawk_domain::Timestamp;
+use tokio_util::sync::CancellationToken;
 
 use super::*;
 
@@ -31,6 +33,8 @@ impl OrphanRecoveryReport {
 #[derive(Debug)]
 pub(crate) struct OrphanRecoverySession<'a> {
     store: &'a ParquetObjectStore,
+    cancellation: &'a CancellationToken,
+    deadline: Instant,
     _lease: PublicationLease,
     candidates: Vec<PublishedObject>,
     quarantined: usize,
@@ -42,10 +46,16 @@ impl OrphanRecoverySession<'_> {
         &self.candidates
     }
 
+    #[cfg(test)]
     pub(crate) fn quarantine(&mut self, object: &PublishedObject) -> Result<(), ParquetStoreError> {
+        check_recovery_operation(self.cancellation, self.deadline)?;
         if !self.candidates.contains(object) {
             return Err(ParquetStoreError::ObjectMetadataMismatch);
         }
+        self.quarantine_verified(object)
+    }
+
+    fn quarantine_verified(&mut self, object: &PublishedObject) -> Result<(), ParquetStoreError> {
         let name = format!("{}.parquet", encode_hex(object.content_hash.bytes()));
         let destination = format!("{QUARANTINE}/{name}");
         match self
@@ -68,7 +78,18 @@ impl OrphanRecoverySession<'_> {
         Ok(())
     }
 
+    pub(crate) fn quarantine_candidate(&mut self, index: usize) -> Result<(), ParquetStoreError> {
+        let object = self
+            .candidates
+            .get(index)
+            .cloned()
+            .ok_or(ParquetStoreError::ObjectMetadataMismatch)?;
+        check_recovery_operation(self.cancellation, self.deadline)?;
+        self.quarantine_verified(&object)
+    }
+
     pub(crate) fn finish(self) -> Result<OrphanRecoveryReport, ParquetStoreError> {
+        check_recovery_operation(self.cancellation, self.deadline)?;
         sync_directory(&self.store.directory, QUARANTINE)?;
         sync_directory(&self.store.directory, OBJECTS)?;
         Ok(OrphanRecoveryReport {
@@ -82,7 +103,13 @@ impl ParquetObjectStore {
     /// Returns a bounded snapshot of content-addressed final objects.
     #[cfg(test)]
     pub(crate) fn published_objects(&self) -> Result<Vec<PublishedObject>, ParquetStoreError> {
-        scan_objects(&self.directory, OBJECTS)
+        let cancellation = CancellationToken::new();
+        scan_objects(
+            &self.directory,
+            OBJECTS,
+            &cancellation,
+            Instant::now() + Duration::from_secs(60),
+        )
     }
 
     #[cfg(test)]
@@ -92,7 +119,10 @@ impl ParquetObjectStore {
         now: Timestamp,
     ) -> Result<OrphanRecoveryReport, ParquetStoreError> {
         let referenced: BTreeSet<_> = referenced.iter().copied().collect();
-        let mut recovery = self.begin_recovery(now).await?;
+        let cancellation = CancellationToken::new();
+        let mut recovery = self
+            .begin_recovery(now, &cancellation, Instant::now() + Duration::from_secs(60))
+            .await?;
         for object in recovery.candidates().to_vec() {
             if !referenced.contains(&object.content_hash) {
                 recovery.quarantine(&object)?;
@@ -101,20 +131,39 @@ impl ParquetObjectStore {
         recovery.finish()
     }
 
-    pub(crate) async fn begin_recovery(
-        &self,
+    pub(crate) async fn begin_recovery<'a>(
+        &'a self,
         now: Timestamp,
-    ) -> Result<OrphanRecoverySession<'_>, ParquetStoreError> {
-        let lease = self.authority.publication.acquire_recovery().await;
-        let deleted = delete_expired_quarantine(&self.directory, now, self.config.orphan_grace)?;
-        let quarantined = self.quarantine_expired_staging(now)?;
+        cancellation: &'a CancellationToken,
+        deadline: Instant,
+    ) -> Result<OrphanRecoverySession<'a>, ParquetStoreError> {
+        check_recovery_operation(cancellation, deadline)?;
+        let lease = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(ParquetStoreError::Cancelled),
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                return Err(ParquetStoreError::RecoveryDeadlineExceeded);
+            }
+            lease = self.authority.publication.acquire_recovery() => lease,
+        };
+        check_recovery_operation(cancellation, deadline)?;
+        let deleted = delete_expired_quarantine(
+            &self.directory,
+            now,
+            self.config.orphan_grace,
+            cancellation,
+            deadline,
+        )?;
+        let quarantined = self.quarantine_expired_staging(now, cancellation, deadline)?;
         let cutoff = recovery_cutoff(now, self.config.orphan_grace)?;
-        let candidates = scan_objects(&self.directory, OBJECTS)?
+        let candidates = scan_objects(&self.directory, OBJECTS, cancellation, deadline)?
             .into_iter()
             .filter(|object| object.created_at.unix_nanos() <= cutoff)
             .collect();
         Ok(OrphanRecoverySession {
             store: self,
+            cancellation,
+            deadline,
             _lease: lease,
             candidates,
             quarantined,
@@ -122,11 +171,17 @@ impl ParquetObjectStore {
         })
     }
 
-    fn quarantine_expired_staging(&self, now: Timestamp) -> Result<usize, ParquetStoreError> {
+    fn quarantine_expired_staging(
+        &self,
+        now: Timestamp,
+        cancellation: &CancellationToken,
+        deadline: Instant,
+    ) -> Result<usize, ParquetStoreError> {
         let cutoff = recovery_cutoff(now, self.config.orphan_grace)?;
         let mut quarantined = 0_usize;
         let mut scanned = 0_usize;
         for entry in self.directory.read_dir(STAGING)? {
+            check_recovery_operation(cancellation, deadline)?;
             scanned = scanned
                 .checked_add(1)
                 .ok_or(ParquetStoreError::RecoveryScanLimit)?;
@@ -167,10 +222,16 @@ impl ParquetObjectStore {
     }
 }
 
-fn scan_objects(directory: &Dir, root: &str) -> Result<Vec<PublishedObject>, ParquetStoreError> {
+fn scan_objects(
+    directory: &Dir,
+    root: &str,
+    cancellation: &CancellationToken,
+    deadline: Instant,
+) -> Result<Vec<PublishedObject>, ParquetStoreError> {
     let mut objects = Vec::new();
     let mut prefixes = 0_usize;
     for prefix in directory.read_dir(root)? {
+        check_recovery_operation(cancellation, deadline)?;
         let prefix = prefix?;
         prefixes = prefixes
             .checked_add(1)
@@ -193,6 +254,7 @@ fn scan_objects(directory: &Dir, root: &str) -> Result<Vec<PublishedObject>, Par
             .ok_or(ParquetStoreError::ObjectMetadataMismatch)?;
         let prefix_path = format!("{root}/{prefix_name}");
         for entry in directory.read_dir(&prefix_path)? {
+            check_recovery_operation(cancellation, deadline)?;
             if objects.len() >= MAX_SCAN_OBJECTS {
                 return Err(ParquetStoreError::RecoveryScanLimit);
             }
@@ -226,11 +288,14 @@ fn delete_expired_quarantine(
     directory: &Dir,
     now: Timestamp,
     grace: Duration,
+    cancellation: &CancellationToken,
+    deadline: Instant,
 ) -> Result<usize, ParquetStoreError> {
     let cutoff = recovery_cutoff(now, grace)?;
     let mut deleted = 0_usize;
     let mut scanned = 0_usize;
     for entry in directory.read_dir(QUARANTINE)? {
+        check_recovery_operation(cancellation, deadline)?;
         scanned = scanned
             .checked_add(1)
             .ok_or(ParquetStoreError::RecoveryScanLimit)?;
@@ -251,6 +316,19 @@ fn delete_expired_quarantine(
         }
     }
     Ok(deleted)
+}
+
+fn check_recovery_operation(
+    cancellation: &CancellationToken,
+    deadline: Instant,
+) -> Result<(), ParquetStoreError> {
+    if cancellation.is_cancelled() {
+        Err(ParquetStoreError::Cancelled)
+    } else if Instant::now() >= deadline {
+        Err(ParquetStoreError::RecoveryDeadlineExceeded)
+    } else {
+        Ok(())
+    }
 }
 
 fn recovery_cutoff(now: Timestamp, grace: Duration) -> Result<i64, ParquetStoreError> {

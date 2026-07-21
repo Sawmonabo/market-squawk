@@ -1,11 +1,11 @@
 //! Rights-bound analytical ingestion, immutable generation commit, and compaction.
 
-use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::atomic::AtomicBool;
 #[cfg(test)]
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use arrow::record_batch::RecordBatch;
 use market_squawk_domain::{
@@ -22,6 +22,7 @@ use crate::blocking_supervisor::BlockingIoSupervisor;
 #[cfg(test)]
 use crate::catalog::QueryArtifactBindCheckpoint;
 use crate::catalog::QueryArtifactPublisher;
+use crate::parquet_store::MAX_SCAN_OBJECTS;
 use crate::parquet_store::{ArtifactRootIdentity, QueryArtifactWriterAdmission};
 use crate::query::QueryArtifactMemoryLease;
 use crate::{
@@ -32,6 +33,8 @@ use crate::{
     ParquetStoreError, PinnedDataset, PublishedObject, QueryArtifactReservation,
     QueryArtifactReservationInput, ResearchArrowBatch, Sha256Digest, SourceOperation,
 };
+
+const ORPHAN_RECOVERY_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Exact immutable generation returned after successful reconciliation or commit.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -372,6 +375,22 @@ fn map_query_catalog_error(error: CatalogError) -> crate::QueryError {
     }
 }
 
+fn map_recovery_store_error(error: ParquetStoreError) -> IngestError {
+    match error {
+        ParquetStoreError::Cancelled => IngestError::Cancelled,
+        ParquetStoreError::RecoveryDeadlineExceeded => IngestError::DeadlineExceeded,
+        error => IngestError::Parquet(error),
+    }
+}
+
+fn map_recovery_manifest_error(error: ManifestCatalogError) -> IngestError {
+    match error {
+        ManifestCatalogError::Cancelled => IngestError::Cancelled,
+        ManifestCatalogError::DeadlineExceeded => IngestError::DeadlineExceeded,
+        error => IngestError::Manifest(error),
+    }
+}
+
 #[cfg(test)]
 impl QueryArtifactBindTestBarrier {
     pub(crate) async fn wait_until_entered(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -628,24 +647,54 @@ impl AnalyticalDataService {
     }
 
     /// Quarantines only content-addressed objects absent from every retained generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngestError::Cancelled`] when cancellation wins admission or is observed during
+    /// bounded recovery. Returns [`IngestError::DeadlineExceeded`] when recovery exceeds its fixed
+    /// elapsed-time ceiling. Catalog, object-store, or authority failures retain their typed
+    /// [`IngestError`] variants.
     pub async fn recover_orphans(
         &self,
         now: Timestamp,
+        cancellation: CancellationToken,
     ) -> Result<OrphanRecoveryReport, IngestError> {
-        let _operation = self.operation_gate.acquire_uninterruptible().await;
-        let mut recovery = self.objects.begin_recovery(now).await?;
+        let deadline = Instant::now()
+            .checked_add(ORPHAN_RECOVERY_DEADLINE)
+            .ok_or(IngestError::DeadlineExceeded)?;
+        let _operation = self
+            .operation_gate
+            .acquire(&cancellation)
+            .await
+            .ok_or(IngestError::Cancelled)?;
+        let mut recovery = self
+            .objects
+            .begin_recovery(now, &cancellation, deadline)
+            .await
+            .map_err(map_recovery_store_error)?;
         let _authority = self.lock_authority()?;
-        let referenced: BTreeSet<_> = self.manifests.referenced_hashes(now)?.into_iter().collect();
-        for object in recovery.candidates().to_vec() {
-            if referenced.contains(&object.content_hash()) {
+        let referenced = self
+            .manifests
+            .referenced_candidates(
+                recovery
+                    .candidates()
+                    .iter()
+                    .map(PublishedObject::content_hash),
+                now,
+                MAX_SCAN_OBJECTS,
+                deadline,
+                &cancellation,
+            )
+            .map_err(map_recovery_manifest_error)?;
+        for (index, is_referenced) in referenced.into_iter().enumerate() {
+            if is_referenced {
                 continue;
             }
-            if self.manifests.is_referenced(object.content_hash(), now)? {
-                continue;
-            }
-            recovery.quarantine(&object)?;
+            recovery
+                .quarantine_candidate(index)
+                .map_err(map_recovery_store_error)?;
         }
-        Ok(recovery.finish()?)
+        recovery.finish().map_err(map_recovery_store_error)
     }
 
     async fn ingest_batch(
@@ -897,6 +946,9 @@ pub enum IngestError {
     /// Cancellation was observed before commit.
     #[error("analytical operation was cancelled")]
     Cancelled,
+    /// Recovery exceeded its fixed elapsed-time deadline.
+    #[error("analytical operation deadline exceeded")]
+    DeadlineExceeded,
     /// The process-owned Task 3 authority lock was poisoned.
     #[error("analytical catalog authority is unavailable")]
     AuthorityLockPoisoned,

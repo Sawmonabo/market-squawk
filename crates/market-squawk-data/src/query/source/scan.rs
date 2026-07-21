@@ -34,9 +34,8 @@ pub(super) enum ImmutableSourceStorage {
         files: Arc<Box<[VerifiedPinnedObject]>>,
         _receipt: Arc<RetainedPinnedMetadata>,
     },
-    Batches {
-        batches: Arc<Box<[RecordBatch]>>,
-    },
+    #[cfg(test)]
+    Batches { batches: Arc<Box<[RecordBatch]>> },
 }
 
 impl ImmutableSourceStorage {
@@ -50,6 +49,7 @@ impl ImmutableSourceStorage {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn batches(batches: Arc<Box<[RecordBatch]>>) -> Self {
         Self::Batches { batches }
     }
@@ -72,15 +72,19 @@ impl ImmutableSourceTable {
         memory_pool: Arc<dyn MemoryPool>,
         supervisor: BlockingIoSupervisor,
     ) -> Result<Self, QueryError> {
-        if let ImmutableSourceStorage::Pinned { files, .. } = storage.as_ref() {
-            reader::validate_supported_schema(&schema)?;
-            if files.is_empty() {
-                return Err(QueryError::InvalidSource);
+        match storage.as_ref() {
+            ImmutableSourceStorage::Pinned { files, .. } => {
+                reader::validate_supported_schema(&schema)?;
+                if files.is_empty() {
+                    return Err(QueryError::InvalidSource);
+                }
+                for file in files.iter() {
+                    reader::validate_file_schema(&schema, file)?;
+                    let _ = reader::active_file_receipt(&schema, None, file)?;
+                }
             }
-            for file in files.iter() {
-                reader::validate_file_schema(&schema, file)?;
-                let _ = reader::active_file_receipt(&schema, None, file)?;
-            }
+            #[cfg(test)]
+            ImmutableSourceStorage::Batches { .. } => {}
         }
         Ok(Self {
             schema,
@@ -120,6 +124,7 @@ impl TableProvider for ImmutableSourceTable {
         })?;
         let scan_lease = Arc::new(scan_lease);
         let projection = ScanProjection::try_new(&self.schema, projection)?;
+        #[cfg(test)]
         let batch_projection = match self.storage.as_ref() {
             ImmutableSourceStorage::Batches { batches } => match projection.indices.as_deref() {
                 Some(indices) => Some(Arc::new(project_batches(batches, indices)?)),
@@ -130,6 +135,7 @@ impl TableProvider for ImmutableSourceTable {
         let plan = ImmutableSourcePlan::try_new(
             Arc::clone(&self.storage),
             Arc::new(projection),
+            #[cfg(test)]
             batch_projection,
             Arc::clone(&self.memory_pool),
             self.supervisor.clone(),
@@ -144,6 +150,7 @@ impl TableProvider for ImmutableSourceTable {
 #[derive(Debug)]
 pub(super) struct ScanProjection {
     pub(super) schema: SchemaRef,
+    #[cfg(test)]
     pub(super) indices: Option<Box<[usize]>>,
     pub(super) decode_indices: Option<Box<[usize]>>,
     pub(super) output_remap: Option<Box<[usize]>>,
@@ -154,6 +161,7 @@ impl ScanProjection {
         let Some(indices) = projection else {
             return Ok(Self {
                 schema: Arc::clone(schema),
+                #[cfg(test)]
                 indices: None,
                 decode_indices: None,
                 output_remap: None,
@@ -183,6 +191,7 @@ impl ScanProjection {
             && output_remap.len() == decode_indices.len();
         Ok(Self {
             schema: projected,
+            #[cfg(test)]
             indices: Some(indices.clone().into_boxed_slice()),
             decode_indices: Some(decode_indices.into_boxed_slice()),
             output_remap: (!identity).then(|| output_remap.into_boxed_slice()),
@@ -222,6 +231,7 @@ impl Drop for ScanLease {
 pub(super) struct ImmutableSourcePlan {
     storage: Arc<ImmutableSourceStorage>,
     projection: Arc<ScanProjection>,
+    #[cfg(test)]
     projected_batches: Option<Arc<Box<[RecordBatch]>>>,
     memory_pool: Arc<dyn MemoryPool>,
     supervisor: BlockingIoSupervisor,
@@ -235,7 +245,7 @@ impl ImmutableSourcePlan {
     fn try_new(
         storage: Arc<ImmutableSourceStorage>,
         projection: Arc<ScanProjection>,
-        projected_batches: Option<Arc<Box<[RecordBatch]>>>,
+        #[cfg(test)] projected_batches: Option<Arc<Box<[RecordBatch]>>>,
         memory_pool: Arc<dyn MemoryPool>,
         supervisor: BlockingIoSupervisor,
         plan_receipt: MemoryReservation,
@@ -253,6 +263,7 @@ impl ImmutableSourcePlan {
         Ok(Self {
             storage,
             projection,
+            #[cfg(test)]
             projected_batches,
             memory_pool,
             supervisor,
@@ -314,6 +325,7 @@ impl ExecutionPlan for ImmutableSourcePlan {
             ));
         }
         match self.storage.as_ref() {
+            #[cfg(test)]
             ImmutableSourceStorage::Batches { .. } => {
                 let batches = self.projected_batches.as_ref().ok_or_else(|| {
                     DataFusionError::Internal("immutable batches were not projected".into())
@@ -334,6 +346,7 @@ impl ExecutionPlan for ImmutableSourcePlan {
     }
 }
 
+#[cfg(test)]
 fn project_batches(
     batches: &[RecordBatch],
     projection: &[usize],
@@ -353,9 +366,11 @@ fn plan_receipt_bytes(
     let projection_bytes = fields
         .checked_mul(size_of::<usize>() + size_of::<ArrayRef>())
         .ok_or_else(|| DataFusionError::ResourcesExhausted("scan receipt overflow".into()))?;
-    let batches = match (storage, projection) {
+    let batches: usize = match (storage, projection) {
+        #[cfg(test)]
         (ImmutableSourceStorage::Batches { batches }, Some(_)) => batches.len(),
         (ImmutableSourceStorage::Pinned { .. }, _) => 0,
+        #[cfg(test)]
         (ImmutableSourceStorage::Batches { .. }, None) => 0,
     };
     let batch_bytes = batches
