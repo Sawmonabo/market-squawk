@@ -102,6 +102,14 @@ lanes when capacity is tight; never delete a dirty worktree, research evidence, 
 state to make room. Generated build caches are convenience state, not project memory or approval
 evidence.
 
+Because Cargo writers are serialized, scheduled lane and integration commands share the repository-
+scoped `target/agent-shared` cache through an explicit absolute `CARGO_TARGET_DIR`. This reuses
+third-party dependency compilation across temporary worktrees without sharing source state. Only one
+scheduled Cargo command may own that cache at a time; rust-analyzer and other unscheduled processes
+remain on the default `target/` and do not participate. A lane already compiling in its private cache
+may finish, but subsequent commands use the shared cache instead of rebuilding Arrow/DataFusion and
+other large dependencies per worktree.
+
 ### Worktree lifecycle
 
 An isolated lane worktree is temporary execution infrastructure, not a permanent archive. Remove it
