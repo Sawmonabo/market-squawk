@@ -78,8 +78,8 @@ pub use instrument::{
 pub use market::{
     AggressorSide, AuctionEvent, AuctionPhase, BookChange, BookDeltaEvent, BookLevel,
     BookSnapshotEvent, CorporateActionEvent, CorporateActionKind, HaltTransition,
-    InstrumentStatusEvent, MarketEvent, MarketEventError, MarketSide, QuoteEvent, TradeEvent,
-    TradingHaltEvent,
+    InstrumentStatusEvent, MarketEvent, MarketEventError, MarketSide, MergerConsideration,
+    QuoteEvent, TradeEvent, TradingHaltEvent,
 };
 pub use order::{
     InstrumentDefinitionRevision, InstrumentExecutionTerms, OrderContractError, OrderReasonCode,

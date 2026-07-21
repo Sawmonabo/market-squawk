@@ -1,17 +1,18 @@
 use std::error::Error;
+use std::num::NonZeroU32;
 use std::str::FromStr;
 
 use market_squawk_domain::{
     AggressorSide, AlternativeDataObservation, AuctionEvent, AuctionPhase, AvailabilityEvidence,
     BookDeltaEvent, BookLevel, BookSnapshotEvent, CorporateActionEvent, CorporateActionKind,
-    CorporateActionObservation, CoverageStatus, DataQuality, DecodedLiveProvenanceInput,
+    CorporateActionObservation, CoverageStatus, Currency, DataQuality, DecodedLiveProvenanceInput,
     FilingObservation, FundamentalObservation, HaltTransition, InstrumentId, InstrumentStatusEvent,
     LiveEventClass, LiveProvenance, MacroMissingValue, MacroObservation, MarketDepth, MarketEvent,
-    MarketEventError, MarketSide, PayloadReference, PositionObservation, PositionSide, PriceTicks,
-    QuantityLots, QuoteEvent, ResearchContext, ResearchError, ResearchObservation,
-    ResearchProvenance, ResearchProvenanceInput, ResearchTime, RevisionNumber, SourceId,
-    SourceIdentifier, Timestamp, TradeEvent, TradingHaltEvent, TradingStatus,
-    TransactionObservation,
+    MarketEventError, MarketSide, MergerConsideration, Money, PayloadReference,
+    PositionObservation, PositionSide, PriceTicks, QuantityLots, QuoteEvent, ResearchContext,
+    ResearchError, ResearchObservation, ResearchProvenance, ResearchProvenanceInput, ResearchTime,
+    RevisionNumber, SourceId, SourceIdentifier, Timestamp, TradeEvent, TradingHaltEvent,
+    TradingStatus, TransactionObservation,
 };
 use rust_decimal::Decimal;
 
@@ -306,6 +307,159 @@ fn research_instrument_payloads_reject_missing_identity() -> Result<(), Box<dyn 
         ),
         Err(ResearchError::ZeroPosition)
     ));
+    Ok(())
+}
+
+#[test]
+fn corporate_action_economic_terms_are_exact_and_validated() -> Result<(), Box<dyn Error>> {
+    let subject = InstrumentId::from_str("0187f5f1-6fc2-7fa2-bf05-2ce5354c55cb")?;
+    let related = InstrumentId::from_str("0187f5f1-6fc2-7fa2-bf05-2ce5354c55cc")?;
+    let one = NonZeroU32::try_from(1_u32)?;
+    let two = NonZeroU32::try_from(2_u32)?;
+    let three = NonZeroU32::try_from(3_u32)?;
+    let usd = Currency::try_from("USD")?;
+    let cash = Money::new(Decimal::new(125, 2), usd);
+
+    let valid_actions = [
+        CorporateActionKind::Split {
+            numerator: two,
+            denominator: one,
+        },
+        CorporateActionKind::CashDividend { amount: cash },
+        CorporateActionKind::Spinoff {
+            distributed_instrument: related,
+            numerator: one,
+            denominator: three,
+        },
+        CorporateActionKind::ReturnOfCapital { amount: cash },
+        CorporateActionKind::Merger {
+            successor: related,
+            consideration: MergerConsideration::Stock {
+                numerator: two,
+                denominator: three,
+            },
+        },
+        CorporateActionKind::Merger {
+            successor: related,
+            consideration: MergerConsideration::Cash { amount: cash },
+        },
+        CorporateActionKind::Merger {
+            successor: related,
+            consideration: MergerConsideration::Mixed {
+                numerator: one,
+                denominator: two,
+                cash,
+            },
+        },
+    ];
+
+    for action in valid_actions {
+        let live = CorporateActionEvent::new(
+            live_provenance(LiveEventClass::CorporateAction)?,
+            Timestamp::from_unix_nanos(500),
+            action.clone(),
+        )?;
+        assert_eq!(
+            serde_json::from_value::<CorporateActionEvent>(serde_json::to_value(&live)?)?,
+            live
+        );
+
+        let research = CorporateActionObservation::new(research_context(true)?, action)?;
+        assert_eq!(
+            serde_json::from_value::<CorporateActionObservation>(serde_json::to_value(&research)?)?,
+            research
+        );
+    }
+
+    let legacy_merger: CorporateActionKind = serde_json::from_value(serde_json::json!({
+        "kind": "merger",
+        "successor": related,
+    }))?;
+    assert_eq!(
+        legacy_merger,
+        CorporateActionKind::Merger {
+            successor: related,
+            consideration: MergerConsideration::Unspecified,
+        }
+    );
+
+    assert!(matches!(
+        CorporateActionEvent::new(
+            live_provenance(LiveEventClass::CorporateAction)?,
+            Timestamp::from_unix_nanos(500),
+            CorporateActionKind::Merger {
+                successor: subject,
+                consideration: MergerConsideration::Unspecified,
+            },
+        ),
+        Err(MarketEventError::SelfMerger)
+    ));
+    assert!(matches!(
+        CorporateActionObservation::new(
+            research_context(true)?,
+            CorporateActionKind::Spinoff {
+                distributed_instrument: subject,
+                numerator: one,
+                denominator: two,
+            },
+        ),
+        Err(ResearchError::SelfSpinoff)
+    ));
+
+    for invalid in [
+        CorporateActionKind::CashDividend {
+            amount: Money::new(Decimal::ZERO, usd),
+        },
+        CorporateActionKind::ReturnOfCapital {
+            amount: Money::new(Decimal::NEGATIVE_ONE, usd),
+        },
+        CorporateActionKind::Merger {
+            successor: related,
+            consideration: MergerConsideration::Cash {
+                amount: Money::new(Decimal::ZERO, usd),
+            },
+        },
+        CorporateActionKind::Merger {
+            successor: related,
+            consideration: MergerConsideration::Mixed {
+                numerator: one,
+                denominator: two,
+                cash: Money::new(Decimal::NEGATIVE_ONE, usd),
+            },
+        },
+    ] {
+        assert!(matches!(
+            CorporateActionEvent::new(
+                live_provenance(LiveEventClass::CorporateAction)?,
+                Timestamp::from_unix_nanos(500),
+                invalid.clone(),
+            ),
+            Err(MarketEventError::NonPositiveCorporateActionAmount)
+        ));
+        assert!(matches!(
+            CorporateActionObservation::new(research_context(true)?, invalid),
+            Err(ResearchError::NonPositiveCorporateActionAmount)
+        ));
+    }
+
+    let valid_live = CorporateActionEvent::new(
+        live_provenance(LiveEventClass::CorporateAction)?,
+        Timestamp::from_unix_nanos(500),
+        CorporateActionKind::CashDividend { amount: cash },
+    )?;
+    let mut invalid_live = serde_json::to_value(valid_live)?;
+    invalid_live["action"]["amount"] = serde_json::to_value(Money::new(Decimal::ZERO, usd))?;
+    assert!(serde_json::from_value::<CorporateActionEvent>(invalid_live).is_err());
+
+    let valid_research = CorporateActionObservation::new(
+        research_context(true)?,
+        CorporateActionKind::ReturnOfCapital { amount: cash },
+    )?;
+    let mut invalid_research = serde_json::to_value(valid_research)?;
+    invalid_research["action"]["amount"] =
+        serde_json::to_value(Money::new(Decimal::NEGATIVE_ONE, usd))?;
+    assert!(serde_json::from_value::<CorporateActionObservation>(invalid_research).is_err());
+
     Ok(())
 }
 

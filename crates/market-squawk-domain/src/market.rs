@@ -3,6 +3,7 @@
 use std::fmt;
 use std::num::NonZeroU32;
 
+use rust_decimal::Decimal;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{
@@ -148,6 +149,36 @@ impl BookChange {
     }
 }
 
+/// Exact merger consideration retained from the source record.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
+pub enum MergerConsideration {
+    /// The source identifies a merger but does not provide complete economic terms.
+    #[default]
+    Unspecified,
+    /// Stock-only consideration expressed as new units per old unit.
+    Stock {
+        /// New successor units issued.
+        numerator: NonZeroU32,
+        /// Old subject units surrendered.
+        denominator: NonZeroU32,
+    },
+    /// Cash-only consideration per acquired unit.
+    Cash {
+        /// Exact cash amount with explicit currency.
+        amount: Money,
+    },
+    /// Stock and cash consideration per acquired unit.
+    Mixed {
+        /// New successor units issued.
+        numerator: NonZeroU32,
+        /// Old subject units surrendered.
+        denominator: NonZeroU32,
+        /// Exact cash component with explicit currency.
+        cash: Money,
+    },
+}
+
 /// A typed corporate action shared by live and research payloads.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
@@ -164,10 +195,27 @@ pub enum CorporateActionKind {
         /// Amount per entitled unit.
         amount: Money,
     },
+    /// Distribution of a distinct instrument at an exact nonzero ratio.
+    Spinoff {
+        /// Stable identity of the distributed instrument.
+        distributed_instrument: InstrumentId,
+        /// Distributed units received.
+        numerator: NonZeroU32,
+        /// Subject units held.
+        denominator: NonZeroU32,
+    },
+    /// Return of invested capital with explicit currency.
+    ReturnOfCapital {
+        /// Amount returned per entitled unit.
+        amount: Money,
+    },
     /// Merger into a distinct stable internal instrument.
     Merger {
         /// Successor instrument.
         successor: InstrumentId,
+        /// Exact source-supplied economics, or an explicit incomplete legacy state.
+        #[serde(default)]
+        consideration: MergerConsideration,
     },
     /// Instrument delisting with no invented successor.
     Delisting,
@@ -180,6 +228,51 @@ pub enum CorporateActionKind {
         /// New venue symbol.
         current: VenueSymbol,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CorporateActionInvariantError {
+    SelfMerger,
+    SelfSpinoff,
+    NonPositiveMonetaryAmount,
+}
+
+impl CorporateActionKind {
+    pub(crate) fn validate_for_instrument(
+        &self,
+        instrument_id: InstrumentId,
+    ) -> Result<(), CorporateActionInvariantError> {
+        match self {
+            Self::Merger { successor, .. } if *successor == instrument_id => {
+                return Err(CorporateActionInvariantError::SelfMerger);
+            }
+            Self::Spinoff {
+                distributed_instrument,
+                ..
+            } if *distributed_instrument == instrument_id => {
+                return Err(CorporateActionInvariantError::SelfSpinoff);
+            }
+            _ => {}
+        }
+
+        let monetary_amount = match self {
+            Self::CashDividend { amount } | Self::ReturnOfCapital { amount } => Some(*amount),
+            Self::Merger {
+                consideration: MergerConsideration::Cash { amount },
+                ..
+            } => Some(*amount),
+            Self::Merger {
+                consideration: MergerConsideration::Mixed { cash, .. },
+                ..
+            } => Some(*cash),
+            _ => None,
+        };
+        if monetary_amount.is_some_and(|amount| amount.amount() <= Decimal::ZERO) {
+            Err(CorporateActionInvariantError::NonPositiveMonetaryAmount)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 /// A canonical live-market event.
@@ -235,6 +328,10 @@ pub enum MarketEventError {
     EmptyBookDelta,
     /// A merger successor is the same stable instrument.
     SelfMerger,
+    /// A spinoff distributes the same stable instrument.
+    SelfSpinoff,
+    /// A corporate-action monetary distribution or consideration is not strictly positive.
+    NonPositiveCorporateActionAmount,
     /// A symbol-change action does not change the symbol.
     UnchangedSymbol,
     /// A symbol-change action's venue disagrees with record provenance.
@@ -264,6 +361,12 @@ impl fmt::Display for MarketEventError {
             Self::EmptyBookDelta => formatter.write_str("book delta requires at least one change"),
             Self::SelfMerger => {
                 formatter.write_str("merger successor must be a distinct instrument")
+            }
+            Self::SelfSpinoff => {
+                formatter.write_str("spinoff distribution must be a distinct instrument")
+            }
+            Self::NonPositiveCorporateActionAmount => {
+                formatter.write_str("corporate-action monetary amount must be positive")
             }
             Self::UnchangedSymbol => formatter.write_str("symbol change requires distinct symbols"),
             Self::CorporateActionVenueMismatch => {

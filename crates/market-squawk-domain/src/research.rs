@@ -4,6 +4,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::market::CorporateActionInvariantError;
 use crate::{CorporateActionKind, InstrumentId, QuantityLots, ResearchContext, SourceIdentifier};
 
 #[path = "research/observations.rs"]
@@ -74,6 +75,10 @@ pub enum ResearchError {
     InvalidMacroValueState,
     /// A merger successor is the same stable instrument.
     SelfMerger,
+    /// A spinoff distributes the same stable instrument.
+    SelfSpinoff,
+    /// A corporate-action monetary distribution or consideration is not strictly positive.
+    NonPositiveCorporateActionAmount,
     /// A symbol-change action does not change the symbol.
     UnchangedSymbol,
     /// A symbol-change action's venue disagrees with research provenance.
@@ -96,6 +101,12 @@ impl fmt::Display for ResearchError {
                 .write_str("macro observation requires exactly one observed or missing value"),
             Self::SelfMerger => {
                 formatter.write_str("merger successor must be a distinct instrument")
+            }
+            Self::SelfSpinoff => {
+                formatter.write_str("spinoff distribution must be a distinct instrument")
+            }
+            Self::NonPositiveCorporateActionAmount => {
+                formatter.write_str("corporate-action monetary amount must be positive")
             }
             Self::UnchangedSymbol => formatter.write_str("symbol change requires distinct symbols"),
             Self::CorporateActionVenueMismatch => {
@@ -126,10 +137,16 @@ pub(super) fn validate_corporate_action(
     action: &CorporateActionKind,
 ) -> Result<(), ResearchError> {
     let instrument_id = require_instrument(context)?;
+    action
+        .validate_for_instrument(instrument_id)
+        .map_err(|error| match error {
+            CorporateActionInvariantError::SelfMerger => ResearchError::SelfMerger,
+            CorporateActionInvariantError::SelfSpinoff => ResearchError::SelfSpinoff,
+            CorporateActionInvariantError::NonPositiveMonetaryAmount => {
+                ResearchError::NonPositiveCorporateActionAmount
+            }
+        })?;
     match action {
-        CorporateActionKind::Merger { successor } if *successor == instrument_id => {
-            Err(ResearchError::SelfMerger)
-        }
         CorporateActionKind::SymbolChange {
             venue_id,
             previous,
