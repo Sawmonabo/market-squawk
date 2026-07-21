@@ -6,9 +6,9 @@ use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use market_squawk_domain::{LiveEventClass, Timestamp};
 use market_squawk_sources::{
-    BudgetDecision, BudgetPermit, LiveMarketSource, RawFrameFactory, RawMarketSink,
-    SharedProviderBudget, SourceError, SourceMetadata, SourceMetadataProvider, TransportFrameKind,
-    apply_http_retry_after,
+    BudgetDecision, BudgetPermit, CurrentSourceSession, LiveMarketSource, RawFrameFactory,
+    RawMarketSink, SharedProviderBudget, SourceError, SourceMetadata, SourceMetadataProvider,
+    TransportFrameKind, apply_http_retry_after,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::WebSocketStream;
@@ -17,8 +17,8 @@ use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    KrakenChannel, KrakenConfig, KrakenControl, KrakenDecodeOutcome, KrakenDecoder,
-    KrakenDecoderState, KrakenSubscription,
+    KrakenChannel, KrakenConfig, KrakenConfigError, KrakenControl, KrakenDecodeOutcome,
+    KrakenDecoder, KrakenDecoderState, KrakenSubscription,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -100,14 +100,35 @@ impl KrakenHealth {
 #[derive(Debug)]
 pub struct KrakenSource {
     config: KrakenConfig,
+    budget: SharedProviderBudget,
+    generation_started: bool,
     health: KrakenHealth,
 }
 
 impl KrakenSource {
-    /// Constructs a source from checked immutable configuration.
-    pub const fn new(config: KrakenConfig) -> Self {
-        Self {
+    /// Binds checked configuration to one exact current registry connection generation.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a session for another source or metadata revision or a session without the
+    /// registry-coordinated Kraken provider budget.
+    pub fn try_new(
+        config: KrakenConfig,
+        session: &CurrentSourceSession,
+    ) -> Result<Self, KrakenConfigError> {
+        if session.source_id() != config.metadata().source_id()
+            || session.revision() != config.metadata().revision()
+        {
+            return Err(KrakenConfigError::SessionMismatch);
+        }
+        let budget = session
+            .budget()
+            .cloned()
+            .ok_or(KrakenConfigError::MissingSharedBudget)?;
+        Ok(Self {
             config,
+            budget,
+            generation_started: false,
             health: KrakenHealth {
                 state: KrakenDecoderState::AwaitingSnapshot,
                 captured_frames: 0,
@@ -117,12 +138,20 @@ impl KrakenSource {
                 book_subscribed: false,
                 trade_subscribed: false,
             },
-        }
+        })
     }
 
     /// Returns the current non-authoritative operational snapshot.
     pub const fn health(&self) -> KrakenHealth {
         self.health
+    }
+
+    fn begin_generation(&mut self) -> Result<(), SourceError> {
+        if self.generation_started {
+            return Err(SourceError::InvalidProtocolState);
+        }
+        self.generation_started = true;
+        Ok(())
     }
 
     async fn run_generation(
@@ -131,11 +160,15 @@ impl KrakenSource {
         sink: &mut dyn RawMarketSink,
         cancellation: CancellationToken,
     ) -> Result<(), SourceError> {
+        self.begin_generation()?;
+        if cancellation.is_cancelled() {
+            return Err(SourceError::Cancelled);
+        }
         self.health.state = KrakenDecoderState::AwaitingSnapshot;
         self.health.book_subscribed = false;
         self.health.trade_subscribed = false;
         self.health.last_market_timestamp = None;
-        let permit = acquire_budget(self.config.budget())?;
+        let permit = acquire_budget(&self.budget)?;
         let socket_config = WebSocketConfig::default()
             .read_buffer_size(READ_BUFFER_BYTES)
             .write_buffer_size(WRITE_BUFFER_BYTES)
@@ -152,7 +185,7 @@ impl KrakenSource {
             _ = cancellation.cancelled() => return Err(SourceError::Cancelled),
             result = tokio::time::timeout(CONNECT_TIMEOUT, connect) => {
                 let result = result.map_err(|_| SourceError::Network)?;
-                result.map_err(|error| map_connect_error(error, self.config.budget()))?
+                result.map_err(|error| map_connect_error(error, &self.budget))?
             }
         };
         drop(permit);
@@ -160,7 +193,7 @@ impl KrakenSource {
             self.health.state = KrakenDecoderState::Quarantined;
             return Err(SourceError::InvalidProtocolState);
         }
-        if self.config.budget().record_success().is_err() {
+        if self.budget.record_success().is_err() {
             self.health.state = KrakenDecoderState::Quarantined;
             return Err(SourceError::ProviderUnavailable);
         }
@@ -209,7 +242,7 @@ impl KrakenSource {
         let subscribe_payload = subscription(self.config.symbol(), channel, depth)?;
         send_subscription(
             socket,
-            self.config.budget(),
+            &self.budget,
             subscribe_payload,
             cancellation,
             deadlines.write,

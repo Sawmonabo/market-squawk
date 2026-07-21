@@ -7,8 +7,8 @@ use market_squawk_domain::{
 };
 use market_squawk_sources::{
     ChecksumValidationProfile, InstrumentCoverageMembership, MAX_RAW_FRAME_BYTES,
-    NetworkAccessPolicy, ResolvedChecksumValidator, SharedProviderBudget, SourceClass,
-    SourceMetadata, SourceMetadataProvider,
+    NetworkAccessPolicy, ResolvedChecksumValidator, SourceClass, SourceMetadata,
+    SourceMetadataProvider,
 };
 use thiserror::Error;
 use url::Url;
@@ -57,7 +57,6 @@ pub enum KrakenChannel {
 #[derive(Clone, Debug)]
 pub struct KrakenConfig {
     metadata: SourceMetadata,
-    budget: SharedProviderBudget,
     endpoint: Url,
     symbol: String,
     instrument: InstrumentId,
@@ -66,7 +65,7 @@ pub struct KrakenConfig {
 }
 
 impl KrakenConfig {
-    /// Constructs a configuration bound to authoritative metadata and a shared provider budget.
+    /// Constructs a configuration bound to authoritative Kraken metadata.
     ///
     /// # Errors
     ///
@@ -75,7 +74,6 @@ impl KrakenConfig {
     /// ceiling.
     pub fn try_new(
         metadata: SourceMetadata,
-        budget: SharedProviderBudget,
         symbol: impl Into<String>,
         instrument: InstrumentId,
         depth: KrakenDepth,
@@ -83,7 +81,6 @@ impl KrakenConfig {
     ) -> Result<Self, KrakenConfigError> {
         Self::try_for_channel(
             metadata,
-            budget,
             symbol,
             instrument,
             KrakenChannel::Book(depth),
@@ -94,14 +91,12 @@ impl KrakenConfig {
     /// Constructs a trade-channel configuration with checksum-unsupported metadata.
     pub fn try_trades(
         metadata: SourceMetadata,
-        budget: SharedProviderBudget,
         symbol: impl Into<String>,
         instrument: InstrumentId,
         max_message_bytes: NonZeroUsize,
     ) -> Result<Self, KrakenConfigError> {
         Self::try_for_channel(
             metadata,
-            budget,
             symbol,
             instrument,
             KrakenChannel::Trades,
@@ -111,7 +106,6 @@ impl KrakenConfig {
 
     fn try_for_channel(
         metadata: SourceMetadata,
-        budget: SharedProviderBudget,
         symbol: impl Into<String>,
         instrument: InstrumentId,
         channel: KrakenChannel,
@@ -180,7 +174,6 @@ impl KrakenConfig {
         }
         Ok(Self {
             metadata,
-            budget,
             endpoint,
             symbol,
             instrument,
@@ -213,10 +206,6 @@ impl KrakenConfig {
     pub const fn max_message_bytes(&self) -> usize {
         self.max_message_bytes.get()
     }
-
-    pub(crate) const fn budget(&self) -> &SharedProviderBudget {
-        &self.budget
-    }
 }
 
 impl SourceMetadataProvider for KrakenConfig {
@@ -240,4 +229,10 @@ pub enum KrakenConfigError {
     /// The per-message bound exceeds global capture limits.
     #[error("Kraken message bound is invalid")]
     MessageBound,
+    /// The source was paired with another registered source or metadata revision.
+    #[error("Kraken source session does not match configured source metadata")]
+    SessionMismatch,
+    /// The current registry session has no coordinated provider budget.
+    #[error("Kraken source session has no coordinated provider budget")]
+    MissingSharedBudget,
 }

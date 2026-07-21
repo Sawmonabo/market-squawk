@@ -9,9 +9,8 @@ use market_squawk_domain::{
     RevisionBoundPayloadEvidence, SourceId, SourceIdentifier, Timestamp,
 };
 use market_squawk_sources::{
-    AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode, BackoffPolicy, BudgetScope,
-    ChecksumValidationProfile, FreshnessPolicy, ProviderBudgetPolicy, ProviderChecksumEvidence,
-    SourceProtocolProfile,
+    AuthorizationGrant, AuthorizationMode, BackoffPolicy, BudgetScope, ChecksumValidationProfile,
+    FreshnessPolicy, ProviderBudgetPolicy, ProviderChecksumEvidence, SourceProtocolProfile,
 };
 use std::error::Error;
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64, NonZeroUsize};
@@ -60,22 +59,9 @@ fn metadata_binds_the_reviewed_ceiling_and_contains_no_fabricated_sequence()
     assert!(!json.contains("sequence_number"));
     assert!(json.contains(KRAKEN_QUALIFICATION_POLICY_DIGEST));
 
-    let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
-    let book_registration = registry.register(metadata.clone(), Timestamp::from_unix_nanos(1))?;
-    let book_budget = book_registration
-        .budget()
-        .cloned()
-        .ok_or("book registration has no budget")?;
-    let trade_registration =
-        registry.register(trade_metadata.clone(), Timestamp::from_unix_nanos(1))?;
-    let trade_budget = trade_registration
-        .budget()
-        .cloned()
-        .ok_or("trade registration has no budget")?;
     let instrument = InstrumentId::from_str("4c74ab95-53b9-42ad-9b66-0ed403b88fed")?;
     let _book_config = KrakenConfig::try_new(
         metadata,
-        book_budget,
         "BTC/USD",
         instrument,
         KrakenDepth::Ten,
@@ -83,7 +69,6 @@ fn metadata_binds_the_reviewed_ceiling_and_contains_no_fabricated_sequence()
     )?;
     let _trade_config = KrakenConfig::try_trades(
         trade_metadata,
-        trade_budget,
         "BTC/USD",
         instrument,
         NonZeroUsize::new(1 << 20).ok_or("zero frame bound")?,

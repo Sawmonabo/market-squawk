@@ -11,7 +11,7 @@ use market_squawk_domain::{
 };
 use market_squawk_sources::{
     AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode, BackoffPolicy,
-    BudgetDecision, BudgetScope, DecodeOutcome, FreshnessPolicy, MarketDecoder,
+    BudgetDecision, BudgetScope, DecodeOutcome, FreshnessPolicy, LiveMarketSource, MarketDecoder,
     ProviderBudgetPolicy, RawMarketFrame, RawMarketSink, SessionId, SinkError, SourceError,
     SourceMetadataProvider,
 };
@@ -21,7 +21,9 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 
 use super::{KrakenDecoderState, KrakenSource};
-use crate::{KrakenConfig, KrakenDepth, KrakenMarketDecoder, KrakenMetadataInput};
+use crate::{
+    KrakenConfig, KrakenConfigError, KrakenDepth, KrakenMarketDecoder, KrakenMetadataInput,
+};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -94,7 +96,8 @@ async fn source_captures_and_decodes_then_quarantines_on_metadata_idle() -> Test
         TestResult::Ok(())
     });
 
-    let (config, mut registry, registered) = test_source()?;
+    let (config, mut registry, registered) =
+        test_source("kraken-public-book-v2", "kraken-policy-v1")?;
     let session = registry.begin_session(
         &registered,
         SessionId::new(SourceIdentifier::try_from("kraken-session-test")?),
@@ -103,8 +106,11 @@ async fn source_captures_and_decodes_then_quarantines_on_metadata_idle() -> Test
     )?;
     let mut frames = registry.take_raw_frame_factory(&session)?;
     let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}")).await?;
-    let budget = config.budget().clone();
-    let mut source = KrakenSource::new(config);
+    let budget = session
+        .budget()
+        .cloned()
+        .ok_or("source session has no coordinated budget")?;
+    let mut source = KrakenSource::try_new(config, &session)?;
     let mut sink = RecordingSink::default();
 
     let result = source
@@ -164,7 +170,76 @@ async fn source_captures_and_decodes_then_quarantines_on_metadata_idle() -> Test
     Ok(())
 }
 
-fn test_source() -> TestResult<(
+#[test]
+fn source_rejects_a_session_with_different_source_or_revision() -> TestResult {
+    let (config, _config_registry, _config_registration) =
+        test_source("kraken-public-book-v2", "kraken-policy-v1")?;
+    let (_other_source_config, mut other_source_registry, other_source_registration) =
+        test_source("kraken-public-book-other", "kraken-policy-v2")?;
+    let other_source_session = other_source_registry.begin_session(
+        &other_source_registration,
+        SessionId::new(SourceIdentifier::try_from("kraken-session-other-source")?),
+        ConnectionGeneration::new(1)?,
+        Timestamp::from_unix_nanos(1),
+    )?;
+    let (_other_revision_config, mut other_revision_registry, other_revision_registration) =
+        test_source("kraken-public-book-v2", "kraken-policy-v2")?;
+    let other_revision_session = other_revision_registry.begin_session(
+        &other_revision_registration,
+        SessionId::new(SourceIdentifier::try_from("kraken-session-other-revision")?),
+        ConnectionGeneration::new(1)?,
+        Timestamp::from_unix_nanos(1),
+    )?;
+
+    assert!(matches!(
+        KrakenSource::try_new(config.clone(), &other_source_session),
+        Err(KrakenConfigError::SessionMismatch)
+    ));
+    assert!(matches!(
+        KrakenSource::try_new(config, &other_revision_session),
+        Err(KrakenConfigError::SessionMismatch)
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn source_uses_the_session_budget_and_cannot_run_twice() -> TestResult {
+    let (config, mut registry, registered) =
+        test_source("kraken-public-book-v2", "kraken-policy-v1")?;
+    let session = registry.begin_session(
+        &registered,
+        SessionId::new(SourceIdentifier::try_from("kraken-session-single-run")?),
+        ConnectionGeneration::new(1)?,
+        Timestamp::from_unix_nanos(1),
+    )?;
+    let expected_budget = session
+        .budget()
+        .cloned()
+        .ok_or("source session has no coordinated budget")?;
+    let mut frames = registry.take_raw_frame_factory(&session)?;
+    let mut source = KrakenSource::try_new(config, &session)?;
+    assert!(source.budget.shares_allocation_with(&expected_budget));
+
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    let mut sink = RecordingSink::default();
+    assert_eq!(
+        source
+            .run(&mut frames, &mut sink, cancellation.clone())
+            .await,
+        Err(SourceError::Cancelled)
+    );
+    assert_eq!(
+        source.run(&mut frames, &mut sink, cancellation).await,
+        Err(SourceError::InvalidProtocolState)
+    );
+    Ok(())
+}
+
+fn test_source(
+    source_id: &str,
+    metadata_revision: &str,
+) -> TestResult<(
     KrakenConfig,
     AuthoritativeSourceRegistry,
     market_squawk_sources::RegisteredSource,
@@ -196,9 +271,9 @@ fn test_source() -> TestResult<(
     )?;
     let instrument = InstrumentId::from_str("4c74ab95-53b9-42ad-9b66-0ed403b88fed")?;
     let metadata = KrakenMetadataInput::new(
-        SourceId::try_from("kraken-public-book-v2")?,
+        SourceId::try_from(source_id)?,
         RevisionBoundPayloadEvidence::new(
-            MetadataRevision::new(SourceIdentifier::try_from("kraken-policy-v1")?),
+            MetadataRevision::new(SourceIdentifier::try_from(metadata_revision)?),
             exact(1),
         ),
         authorization,
@@ -217,13 +292,8 @@ fn test_source() -> TestResult<(
     .try_build()?;
     let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
     let registered = registry.register(metadata.clone(), Timestamp::from_unix_nanos(1))?;
-    let source_budget = registered
-        .budget()
-        .cloned()
-        .ok_or("source registration has no budget")?;
     let config = KrakenConfig::try_new(
         metadata,
-        source_budget,
         "BTC/USD",
         instrument,
         KrakenDepth::Ten,
