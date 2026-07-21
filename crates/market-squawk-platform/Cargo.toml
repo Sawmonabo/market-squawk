@@ -7,7 +7,16 @@ license.workspace = true
 description = "Local configuration, paths, journals, and asynchronous capture for Market Squawk"
 repository = "https://github.com/Sawmonabo/market-squawk"
 publish = false
+autotests = false
 autobenches = false
+
+[[test]]
+name = "configuration_security"
+path = "tests/harnesses/configuration_security.rs"
+
+[[test]]
+name = "capture_journal"
+path = "tests/harnesses/capture_journal.rs"
 
 [features]
 default = []

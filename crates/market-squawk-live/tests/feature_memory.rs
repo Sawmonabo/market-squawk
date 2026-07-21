@@ -1,14 +1,11 @@
 use std::time::Duration;
 
-pub(crate) use market_squawk_live::{DepthLimit, LiveRouteConfig, LiveRouteConfigInput, ShardKey};
 use market_squawk_live::{
     LiveRuntimeConfig, LiveRuntimeConfigError, LiveRuntimeConfigInput, ShardRoutingVersion,
     SnapshotLimits,
 };
 
-#[allow(dead_code)]
-#[path = "support/current_source.rs"]
-mod current_source;
+use crate::current_source;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 

@@ -7,6 +7,20 @@ version.workspace = true
 license.workspace = true
 repository = "https://github.com/Sawmonabo/market-squawk"
 publish = false
+autotests = false
+
+[[test]]
+name = "market_state_features"
+path = "tests/harnesses/market_state_features.rs"
+
+[[test]]
+name = "action_runtime"
+path = "tests/harnesses/action_runtime.rs"
+
+[[test]]
+name = "ui"
+path = "tests/harnesses/ui.rs"
+test = false
 
 [dependencies]
 arc-swap.workspace = true

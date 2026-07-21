@@ -36,19 +36,10 @@ use market_squawk_execution::{
     StrategyContext, StrategyError,
 };
 use market_squawk_live::{ActionAuthorityIssueLimit, LiveRuntime, RouteActionHook};
-pub(crate) use market_squawk_live::{
-    DepthLimit, LiveRouteConfig, LiveRouteConfigInput, LiveRuntimeConfig, LiveRuntimeConfigInput,
-    ShardKey, ShardRoutingVersion, SnapshotLimits,
-};
 use rust_decimal::Decimal;
 use tokio_util::sync::CancellationToken;
 
-#[allow(
-    dead_code,
-    reason = "the deterministic shared live-source fixture exposes helpers for several test binaries"
-)]
-#[path = "../../../crates/market-squawk-live/tests/support/current_source.rs"]
-mod current_source;
+use crate::current_source;
 
 use current_source::{
     INSTRUMENT_ONE, SourceHarness, TestResult, route, route_config, runtime_config,

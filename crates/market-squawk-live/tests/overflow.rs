@@ -1,15 +1,9 @@
-pub(crate) use market_squawk_live::{
-    DepthLimit, LiveRouteConfig, LiveRouteConfigInput, LiveRuntimeConfig, LiveRuntimeConfigInput,
-    ShardKey, ShardRoutingVersion, SnapshotLimits,
-};
-
 use market_squawk_live::{BoundShardIngress, LiveIngressError, LiveRuntime, LiveRuntimeHealthKind};
 use tokio_util::sync::CancellationToken;
 
-#[path = "support/current_source.rs"]
-mod current_source;
+use crate::current_source;
 
-use self::current_source::{
+use crate::current_source::{
     INSTRUMENT_ONE, INSTRUMENT_TWO, SourceHarness, TestResult, route_config, runtime_config,
 };
 
