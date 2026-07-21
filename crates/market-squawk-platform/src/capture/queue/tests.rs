@@ -297,6 +297,52 @@ fn waiter_registration_try_lock_miss_is_closed_by_pre_park_recheck()
 
 #[test]
 #[cfg(not(loom))]
+fn receiver_pause_request_cannot_be_lost_during_waiter_registration()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (sender, receiver, control, _receipt) = FixedQueue::try_new(NonZeroUsize::MIN)?;
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let entered_worker = Arc::clone(&entered);
+    let release_worker = Arc::clone(&release);
+    let waiter = std::thread::spawn(move || {
+        receiver.recv_timeout_with_registration_paused_for_test(
+            Duration::from_secs(1),
+            &entered_worker,
+            &release_worker,
+        )
+    });
+
+    entered.wait();
+    let request_probe = control.clone();
+    let requester = std::thread::spawn(move || {
+        control.with_receiver_paused_for_test(Duration::from_millis(250), || sender.try_send(23_u8))
+    });
+    let request_deadline = std::time::Instant::now()
+        .checked_add(Duration::from_secs(1))
+        .ok_or("request deadline overflow")?;
+    while !request_probe
+        .core
+        .receiver_test_coordination
+        .requested_hint
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        if std::time::Instant::now() >= request_deadline {
+            return Err("receiver pause request was not published".into());
+        }
+        std::thread::yield_now();
+    }
+    release.wait();
+
+    assert_eq!(
+        requester.join().map_err(|_| "requester panicked")?,
+        Ok(Ok(()))
+    );
+    assert_eq!(waiter.join().map_err(|_| "waiter panicked")?, Ok(23));
+    Ok(())
+}
+
+#[test]
+#[cfg(not(loom))]
 fn final_failed_operation_wakes_a_receiver_that_reparked_before_terminal_close()
 -> Result<(), Box<dyn std::error::Error>> {
     let (sender, receiver, control, _receipt) = FixedQueue::<u8>::try_new(NonZeroUsize::MIN)?;

@@ -95,6 +95,19 @@ impl<T> FixedReceiver<T> {
                     hook();
                 }
                 drop(registered);
+                #[cfg(any(test, all(feature = "capture-test", debug_assertions)))]
+                if self
+                    .core
+                    .receiver_test_coordination
+                    .requested_hint
+                    .load(Ordering::Acquire)
+                {
+                    self.core
+                        .receiver_test_coordination
+                        .park_if_requested()
+                        .map_err(|_error| RecvTimeoutError::Poisoned)?;
+                    continue;
+                }
                 match self.core.try_pop() {
                     Ok(value) => return Ok(value),
                     Err(TryRecvError::Closed) => return Err(RecvTimeoutError::Closed),
