@@ -731,6 +731,8 @@ pub enum ProductionPaperCheckpointError {
     DispatcherOwnership,
     #[error("paper financial state did not become terminal and reconciled")]
     UnsettledFinancialState,
+    #[error("paper settlement did not complete before the shutdown deadline")]
+    SettlementDeadlineExceeded,
     #[error("paper checkpoint bounded allocation failed")]
     Allocation,
     #[error("persisted checkpoint sequence did not match the final paper checkpoint")]
@@ -869,8 +871,11 @@ async fn persist_paper_checkpoint(
     repository: &mut PaperCheckpointRepository,
     timeout: Duration,
 ) -> Result<ProductionPaperCheckpointEvidence, ProductionPaperCheckpointError> {
-    settle_paper_accounts(dispatcher, accounts.reconciliation_fence()).await?;
-    let control = PaperControlContext::try_new(timeout, CancellationToken::new())?;
+    let deadline = tokio::time::Instant::now()
+        .checked_add(timeout)
+        .ok_or(ProductionPaperCheckpointError::SettlementDeadlineExceeded)?;
+    settle_paper_accounts(dispatcher, accounts.reconciliation_fence(), deadline).await?;
+    let control = paper_control_before(deadline)?;
     let adapter = paper.adapter();
     let checkpoint = adapter.checkpoint(control).await?;
     if checkpoint.has_nonterminal_orders() || !accounts.reconciliation_fence().is_current() {
@@ -883,15 +888,23 @@ async fn persist_paper_checkpoint(
         return Err(ProductionPaperCheckpointError::FinalSequenceMismatch);
     }
     let authority = dispatcher.persistence_acknowledgement()?;
-    adapter.acknowledge_persistence(authority, receipt).await?;
+    tokio::time::timeout_at(
+        deadline,
+        adapter.acknowledge_persistence(authority, receipt),
+    )
+    .await
+    .map_err(|_| ProductionPaperCheckpointError::SettlementDeadlineExceeded)??;
 
-    let control = PaperControlContext::try_new(timeout, CancellationToken::new())?;
+    let control = paper_control_before(deadline)?;
     let stabilized = adapter.checkpoint(control).await?;
     if stabilized.has_nonterminal_orders() || !accounts.reconciliation_fence().is_current() {
         return Err(ProductionPaperCheckpointError::UnsettledFinancialState);
     }
     let replay = account_replay(accounts, account_ids)?;
     let receipt = repository.persist_with_replay(&stabilized, &replay)?;
+    if tokio::time::Instant::now() >= deadline {
+        return Err(ProductionPaperCheckpointError::SettlementDeadlineExceeded);
+    }
     let recovery_digest = stabilized.recovery_digest()?;
     if receipt.sequence() != stabilized.sequence()
         || receipt.recovery_digest() != recovery_digest
@@ -945,8 +958,12 @@ async fn verify_stabilized_checkpoint(
 async fn settle_paper_accounts(
     dispatcher: &ExecutionDispatcher,
     fence: market_squawk_execution::AccountRiskReconciliationFence,
+    deadline: tokio::time::Instant,
 ) -> Result<(), ProductionPaperCheckpointError> {
-    let initial = match dispatcher.reconcile().await {
+    let initial = match tokio::time::timeout_at(deadline, dispatcher.reconcile())
+        .await
+        .map_err(|_| ProductionPaperCheckpointError::SettlementDeadlineExceeded)?
+    {
         Ok(state) => Some(state),
         Err(market_squawk_execution::ExecutionDispatchError::OrderNotTracked) => None,
         Err(error) => return Err(error.into()),
@@ -964,27 +981,56 @@ async fn settle_paper_accounts(
             .then_some(order.order_id())
         }));
         for order_id in open_orders {
-            dispatcher.cancel(order_id).await?;
+            tokio::time::timeout_at(deadline, dispatcher.cancel(order_id))
+                .await
+                .map_err(|_| ProductionPaperCheckpointError::SettlementDeadlineExceeded)??;
         }
         if !state.orders().is_empty() {
-            let terminal = dispatcher.reconcile().await?;
-            if terminal.orders().iter().any(|order| {
-                matches!(
-                    order.status(),
-                    ReconciledOrderStatus::Open | ReconciledOrderStatus::PartiallyFilled
-                )
-            }) {
-                return Err(ProductionPaperCheckpointError::UnsettledFinancialState);
+            loop {
+                let terminal = tokio::time::timeout_at(deadline, dispatcher.reconcile())
+                    .await
+                    .map_err(|_| ProductionPaperCheckpointError::SettlementDeadlineExceeded)??;
+                if !terminal.orders().iter().any(|order| {
+                    matches!(
+                        order.status(),
+                        ReconciledOrderStatus::Open | ReconciledOrderStatus::PartiallyFilled
+                    )
+                }) {
+                    break;
+                }
+                let now = tokio::time::Instant::now();
+                let wake = now
+                    .checked_add(Duration::from_millis(1))
+                    .map_or(deadline, |wake| wake.min(deadline));
+                if wake >= deadline {
+                    return Err(ProductionPaperCheckpointError::SettlementDeadlineExceeded);
+                }
+                tokio::time::sleep_until(wake).await;
             }
         }
     }
     if !fence.is_current() {
-        dispatcher.reconcile_accounts().await?;
+        tokio::time::timeout_at(deadline, dispatcher.reconcile_accounts())
+            .await
+            .map_err(|_| ProductionPaperCheckpointError::SettlementDeadlineExceeded)??;
     }
     if !fence.is_current() {
         return Err(ProductionPaperCheckpointError::UnsettledFinancialState);
     }
     Ok(())
+}
+
+fn paper_control_before(
+    deadline: tokio::time::Instant,
+) -> Result<PaperControlContext, ProductionPaperCheckpointError> {
+    let remaining = deadline
+        .checked_duration_since(tokio::time::Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or(ProductionPaperCheckpointError::SettlementDeadlineExceeded)?;
+    Ok(PaperControlContext::try_new(
+        remaining,
+        CancellationToken::new(),
+    )?)
 }
 
 async fn drain_execution_tasks(
