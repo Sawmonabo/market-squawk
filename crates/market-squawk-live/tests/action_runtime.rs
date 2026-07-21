@@ -13,15 +13,9 @@ use market_squawk_live::{
     ActionAuthorityIssueLimit, ActionHookDisposition, CommittedActionContext, CurrentAuthorityGate,
     CurrentAuthorityGateError, LiveActionHook, LiveActionHookError, LiveRuntime, RouteActionHook,
 };
-pub(crate) use market_squawk_live::{
-    DepthLimit, LiveRouteConfig, LiveRouteConfigInput, LiveRuntimeConfig, LiveRuntimeConfigInput,
-    ShardKey, ShardRoutingVersion, SnapshotLimits,
-};
 use tokio_util::sync::CancellationToken;
 
-#[allow(dead_code)]
-#[path = "support/current_source.rs"]
-mod current_source;
+use crate::current_source;
 
 use current_source::{
     INSTRUMENT_ONE, SourceHarness, TestResult, route, route_config, runtime_config,

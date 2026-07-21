@@ -7,6 +7,20 @@ license.workspace = true
 description = "Invariant-preserving shared contracts for Market Squawk"
 repository = "https://github.com/Sawmonabo/market-squawk"
 publish = false
+autotests = false
+
+[[test]]
+name = "domain_contracts"
+path = "tests/harnesses/domain_contracts.rs"
+
+[[test]]
+name = "domain_values_identity"
+path = "tests/harnesses/domain_values_identity.rs"
+
+[[test]]
+name = "ui"
+path = "tests/harnesses/ui.rs"
+test = false
 
 [dependencies]
 bs58 = { workspace = true }

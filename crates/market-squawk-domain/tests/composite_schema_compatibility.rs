@@ -113,4 +113,4 @@ fn unknown_v1_market_and_research_payload_fields_are_rejected() -> Result<(), Bo
     assert!(serde_json::from_value::<ResearchObservation>(research).is_err());
     Ok(())
 }
-mod support;
+use crate::support;
