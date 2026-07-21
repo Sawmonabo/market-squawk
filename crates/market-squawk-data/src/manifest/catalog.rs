@@ -1593,7 +1593,9 @@ mod tests {
     use std::fmt::Write as _;
     use std::time::{Duration, Instant};
 
-    use market_squawk_domain::{DigestAlgorithm, SourceIdentifier, Timestamp};
+    use market_squawk_domain::{
+        DigestAlgorithm, EvidenceDigest, SourceId, SourceIdentifier, Timestamp,
+    };
     use market_squawk_platform::LocalPaths;
     use rusqlite::{Connection, params};
     use tokio_util::sync::CancellationToken;
@@ -1603,15 +1605,16 @@ mod tests {
     };
     use crate::authority_transition::evidence::{EvidenceLimits, EvidenceSnapshotRequest};
     use crate::manifest::{DatasetBuildSpecDigest, DerivedGenerationParents};
+    use crate::rights::SourceRightsDecision;
     use crate::{
         ArtifactRecord, CatalogAuthority, CatalogConfig, CatalogLimit, CatalogResultLimits,
         DatasetId, DatasetManifestRecord, DatasetManifestRef, DatasetSchemaRef,
-        DatasetSchemaRegistry, GenerationKind, ManifestObject, ManifestPlan, Sha256Digest,
+        DatasetSchemaRegistry, GenerationKind, ManifestObject, ManifestPlan, RightsBasis,
+        RightsDecisionInput, Sha256Digest, SourceOperation,
     };
 
     type TestResult = Result<(), Box<dyn Error>>;
     const FIXTURE_SOURCE_ID: &str = "derived-lineage-fixture";
-    const FIXTURE_RIGHTS_ID: [u8; 32] = [91; 32];
 
     #[test]
     fn append_rejects_mixed_row_schema_before_planning() -> TestResult {
@@ -2018,6 +2021,48 @@ mod tests {
             DigestAlgorithm::Sha256 => 1_i64,
             DigestAlgorithm::Blake3 => 2_i64,
         };
+        let rights = SourceRightsDecision::try_new(RightsDecisionInput {
+            source_id: SourceId::try_from(FIXTURE_SOURCE_ID)?,
+            payload_digest: artifact.content_digest(),
+            retrieved_at: Timestamp::from_unix_nanos(1),
+            basis: RightsBasis::reviewed_terms(
+                "https://fixture.invalid/terms",
+                EvidenceDigest::new(DigestAlgorithm::Sha256, [93; 32]),
+            )?,
+            authorization_evidence: EvidenceDigest::new(DigestAlgorithm::Sha256, [94; 32]),
+            authorization_expires_at: None,
+            permitted_operations: vec![SourceOperation::Persist],
+        })?;
+        let (basis_algorithm, basis_digest) = match rights.basis().digest().algorithm() {
+            DigestAlgorithm::Sha256 => (1_i64, rights.basis().digest().bytes()),
+            DigestAlgorithm::Blake3 => (2_i64, rights.basis().digest().bytes()),
+        };
+        let (authorization_algorithm, authorization_digest) =
+            match rights.authorization_evidence().algorithm() {
+                DigestAlgorithm::Sha256 => (1_i64, rights.authorization_evidence().bytes()),
+                DigestAlgorithm::Blake3 => (2_i64, rights.authorization_evidence().bytes()),
+            };
+        connection.execute(
+            "INSERT INTO source_rights
+             (rights_id, source_id, payload_algorithm, payload_digest, retrieved_at_ns,
+              basis_reference, basis_algorithm, basis_digest, authorization_algorithm,
+              authorization_digest, authorization_expires_at_ns, operation_mask, admitted_at_ns,
+              basis_kind, basis_root_algorithm, basis_root_digest, fingerprint_version)
+             VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7, ?8, ?9, NULL, ?10, 1,
+                     'reviewed_terms', NULL, NULL, 2)",
+            params![
+                rights.fingerprint().as_slice(),
+                FIXTURE_SOURCE_ID,
+                algorithm,
+                artifact.content_digest().bytes(),
+                rights.basis().reference(),
+                basis_algorithm,
+                basis_digest.as_slice(),
+                authorization_algorithm,
+                authorization_digest.as_slice(),
+                i64::from(rights.operation_mask()),
+            ],
+        )?;
         let run_id = uuid::Uuid::new_v4();
         connection.execute(
             "INSERT INTO ingest_runs
@@ -2030,7 +2075,7 @@ mod tests {
                 FIXTURE_SOURCE_ID,
                 algorithm,
                 artifact.content_digest().bytes(),
-                FIXTURE_RIGHTS_ID.as_slice(),
+                rights.fingerprint().as_slice(),
                 artifact.created_at().unix_nanos(),
             ],
         )?;
@@ -2066,21 +2111,6 @@ mod tests {
              (source_id, revision_digest, metadata_json, registered_at_ns)
              VALUES (?1, ?2, '{\"fixture\":true}', 1)",
             params![FIXTURE_SOURCE_ID, revision.as_slice()],
-        )?;
-        connection.execute(
-            "INSERT INTO source_rights
-             (rights_id, source_id, payload_algorithm, payload_digest, retrieved_at_ns,
-              terms_url, terms_algorithm, terms_digest, authorization_algorithm,
-              authorization_digest, authorization_expires_at_ns, operation_mask, admitted_at_ns)
-             VALUES (?1, ?2, 1, ?3, 1, 'https://fixture.invalid/terms', 1, ?4, 1, ?5,
-                     NULL, 4, 1)",
-            params![
-                FIXTURE_RIGHTS_ID.as_slice(),
-                FIXTURE_SOURCE_ID,
-                [92_u8; 32].as_slice(),
-                [93_u8; 32].as_slice(),
-                [94_u8; 32].as_slice(),
-            ],
         )?;
         Ok(())
     }

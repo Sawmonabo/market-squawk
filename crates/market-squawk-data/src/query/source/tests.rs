@@ -35,8 +35,8 @@ use crate::{
     AnalyticalDataService, AnalyticalManifestCatalog, CatalogAuthority, CatalogConfig,
     CatalogLimit, CatalogResultLimits, DatasetId, DatasetManifestRef, DatasetSchemaRegistry,
     IngestIdentity, ObjectStoreConfig, ParquetStoreError, QueryArtifactReservationInput,
-    QueryLimits, QueryRequest, QueryResult, ResearchIngestService, RightsDecisionInput,
-    Sha256Digest, SourceOperation, extraction_batch_digest,
+    QueryLimits, QueryRequest, QueryResult, ResearchIngestService, RightsBasis,
+    RightsDecisionInput, Sha256Digest, SourceOperation, extraction_batch_digest,
 };
 
 type TestResult = Result<(), Box<dyn Error>>;
@@ -460,8 +460,7 @@ async fn published_dataset_fixture()
         source_id: source.source_id().clone(),
         payload_digest,
         retrieved_at: Timestamp::from_unix_nanos(15),
-        terms_url: "https://example.test/terms/v1".to_owned(),
-        terms_digest: digest(31),
+        basis: RightsBasis::reviewed_terms("https://example.test/terms/v1", digest(31))?,
         authorization_evidence: digest(32),
         authorization_expires_at: Some(Timestamp::from_unix_nanos(i64::MAX)),
         permitted_operations: vec![SourceOperation::Persist],

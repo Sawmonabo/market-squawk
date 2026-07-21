@@ -23,8 +23,8 @@ use crate::authority_transition::{
     AuthorityEvidenceDigest, AuthorityMutationToken, AuthoritySnapshot, BoundAuthorityTransition,
     CatalogEndpointIdentity, PreparedAuthorityTransition, RootEndpointIdentity,
 };
-use crate::rights::RightsRegistrar;
-use crate::rights::SourceRightsDecision;
+use crate::research_use::ResearchUseCatalogError;
+use crate::rights::{RightsBasis, RightsBasisKind, RightsRegistrar, SourceRightsDecision};
 use crate::{IngestIdentity, RegisteredRightsGrant, RightsDecisionInput, SourceOperation};
 
 /// Sole composition-owned authority for one open catalog writer session.
@@ -65,6 +65,28 @@ impl CatalogAuthority {
 
     pub(crate) const fn session_id(&self) -> Uuid {
         self.catalog.catalog_id
+    }
+
+    /// Runs one ResearchUse authority mutation against a single trusted-time transaction.
+    ///
+    /// This is deliberately narrower than exposing the catalog connection: ResearchUse owns the
+    /// callback, the catalog owns transaction construction, the rollback-latched clock, and commit.
+    pub(crate) fn with_research_use_transaction<T, F>(
+        &self,
+        operation: F,
+    ) -> Result<T, ResearchUseCatalogError>
+    where
+        F: for<'transaction> FnOnce(
+            &Transaction<'transaction>,
+            Uuid,
+            Timestamp,
+        ) -> Result<T, ResearchUseCatalogError>,
+    {
+        let transaction = self.catalog.connection.unchecked_transaction()?;
+        let now = trusted_catalog_now(&transaction)?;
+        let result = operation(&transaction, self.catalog.catalog_id, now)?;
+        transaction.commit()?;
+        Ok(result)
     }
 
     pub(crate) fn validate_ingest_reservation(
@@ -354,10 +376,12 @@ impl Catalog {
                         runs.payload_digest, runs.operation, runs.rights_id, runs.state,
                         runs.requested_at_ns, runs.completed_at_ns,
                         rights.source_id, rights.payload_algorithm, rights.payload_digest,
-                        rights.retrieved_at_ns, rights.terms_url, rights.terms_algorithm,
-                        rights.terms_digest, rights.authorization_algorithm,
+                        rights.retrieved_at_ns, rights.basis_reference, rights.basis_algorithm,
+                        rights.basis_digest, rights.authorization_algorithm,
                         rights.authorization_digest, rights.authorization_expires_at_ns,
-                        rights.operation_mask, rights.admitted_at_ns
+                        rights.operation_mask, rights.admitted_at_ns, rights.basis_kind,
+                        rights.basis_root_algorithm, rights.basis_root_digest,
+                        rights.fingerprint_version
                  FROM ingest_runs AS runs
                  JOIN source_rights AS rights USING (rights_id)
                  WHERE runs.run_id=?1",
@@ -396,10 +420,12 @@ impl Catalog {
                         runs.payload_digest, runs.operation, runs.rights_id, runs.state,
                         runs.requested_at_ns, runs.completed_at_ns,
                         rights.source_id, rights.payload_algorithm, rights.payload_digest,
-                        rights.retrieved_at_ns, rights.terms_url, rights.terms_algorithm,
-                        rights.terms_digest, rights.authorization_algorithm,
+                        rights.retrieved_at_ns, rights.basis_reference, rights.basis_algorithm,
+                        rights.basis_digest, rights.authorization_algorithm,
                         rights.authorization_digest, rights.authorization_expires_at_ns,
-                        rights.operation_mask, rights.admitted_at_ns
+                        rights.operation_mask, rights.admitted_at_ns, rights.basis_kind,
+                        rights.basis_root_algorithm, rights.basis_root_digest,
+                        rights.fingerprint_version
                  FROM ingest_runs AS runs
                  JOIN source_rights AS rights USING (rights_id)
                  WHERE runs.run_id=?1",
@@ -428,10 +454,12 @@ impl Catalog {
                     runs.payload_digest, runs.operation, runs.rights_id, runs.state,
                     runs.requested_at_ns, runs.completed_at_ns,
                     rights.source_id, rights.payload_algorithm, rights.payload_digest,
-                    rights.retrieved_at_ns, rights.terms_url, rights.terms_algorithm,
-                    rights.terms_digest, rights.authorization_algorithm,
+                    rights.retrieved_at_ns, rights.basis_reference, rights.basis_algorithm,
+                    rights.basis_digest, rights.authorization_algorithm,
                     rights.authorization_digest, rights.authorization_expires_at_ns,
-                    rights.operation_mask, rights.admitted_at_ns
+                    rights.operation_mask, rights.admitted_at_ns, rights.basis_kind,
+                    rights.basis_root_algorithm, rights.basis_root_digest,
+                    rights.fingerprint_version
              FROM ingest_runs AS runs
              JOIN source_rights AS rights USING (rights_id)
              WHERE runs.state='reserved'
@@ -472,14 +500,18 @@ struct StoredRights {
     payload_algorithm: i64,
     payload_digest: Vec<u8>,
     retrieved_at_ns: i64,
-    terms_url: String,
-    terms_algorithm: i64,
-    terms_digest: Vec<u8>,
+    basis_reference: String,
+    basis_algorithm: i64,
+    basis_digest: Vec<u8>,
     authorization_algorithm: i64,
     authorization_digest: Vec<u8>,
     authorization_expires_at_ns: Option<i64>,
     operation_mask: i64,
     admitted_at_ns: i64,
+    basis_kind: String,
+    basis_root_algorithm: Option<i64>,
+    basis_root_digest: Option<Vec<u8>>,
+    fingerprint_version: i64,
 }
 
 fn read_stored_run(row: &Row<'_>, offset: usize) -> rusqlite::Result<StoredRun> {
@@ -503,14 +535,18 @@ fn read_stored_rights(row: &Row<'_>, offset: usize) -> rusqlite::Result<StoredRi
         payload_algorithm: row.get(offset + 1)?,
         payload_digest: row.get(offset + 2)?,
         retrieved_at_ns: row.get(offset + 3)?,
-        terms_url: row.get(offset + 4)?,
-        terms_algorithm: row.get(offset + 5)?,
-        terms_digest: row.get(offset + 6)?,
+        basis_reference: row.get(offset + 4)?,
+        basis_algorithm: row.get(offset + 5)?,
+        basis_digest: row.get(offset + 6)?,
         authorization_algorithm: row.get(offset + 7)?,
         authorization_digest: row.get(offset + 8)?,
         authorization_expires_at_ns: row.get(offset + 9)?,
         operation_mask: row.get(offset + 10)?,
         admitted_at_ns: row.get(offset + 11)?,
+        basis_kind: row.get(offset + 12)?,
+        basis_root_algorithm: row.get(offset + 13)?,
+        basis_root_digest: row.get(offset + 14)?,
+        fingerprint_version: row.get(offset + 15)?,
     })
 }
 
@@ -521,9 +557,11 @@ fn load_admitted_rights(
 ) -> Result<SourceRightsDecision, CatalogError> {
     let stored = transaction
         .query_row(
-            "SELECT source_id, payload_algorithm, payload_digest, retrieved_at_ns, terms_url,
-                    terms_algorithm, terms_digest, authorization_algorithm, authorization_digest,
-                    authorization_expires_at_ns, operation_mask, admitted_at_ns
+            "SELECT source_id, payload_algorithm, payload_digest, retrieved_at_ns,
+                    basis_reference, basis_algorithm, basis_digest, authorization_algorithm,
+                    authorization_digest, authorization_expires_at_ns, operation_mask,
+                    admitted_at_ns, basis_kind, basis_root_algorithm, basis_root_digest,
+                    fingerprint_version
              FROM source_rights WHERE rights_id=?1",
             [rights_id],
             |row| read_stored_rights(row, 0),
@@ -557,9 +595,11 @@ fn charge_stored_rights(
     budget.charge([
         stored.source_id.len(),
         stored.payload_digest.len(),
-        stored.terms_url.len(),
-        stored.terms_digest.len(),
+        stored.basis_reference.len(),
+        stored.basis_digest.len(),
         stored.authorization_digest.len(),
+        stored.basis_kind.len(),
+        stored.basis_root_digest.as_ref().map_or(0, Vec::len),
     ])
 }
 
@@ -616,7 +656,15 @@ fn decode_rights(stored: StoredRights) -> Result<SourceRightsDecision, CatalogEr
     let source_id =
         SourceId::try_from(stored.source_id.as_str()).map_err(|_| CatalogError::CorruptCatalog)?;
     let payload_digest = parse_digest(stored.payload_algorithm, &stored.payload_digest)?;
-    let terms_digest = parse_digest(stored.terms_algorithm, &stored.terms_digest)?;
+    let basis_digest = parse_digest(stored.basis_algorithm, &stored.basis_digest)?;
+    let basis_root_digest = match (
+        stored.basis_root_algorithm,
+        stored.basis_root_digest.as_deref(),
+    ) {
+        (Some(algorithm), Some(digest)) => Some(parse_digest(algorithm, digest)?),
+        (None, None) => None,
+        _ => return Err(CatalogError::CorruptCatalog),
+    };
     let authorization_evidence =
         parse_digest(stored.authorization_algorithm, &stored.authorization_digest)?;
     let operation_mask = u8::try_from(stored.operation_mask)
@@ -634,18 +682,31 @@ fn decode_rights(stored: StoredRights) -> Result<SourceRightsDecision, CatalogEr
     .into_iter()
     .filter(|operation| operation_mask & operation.mask() != 0)
     .collect();
-    let rights = SourceRightsDecision::try_new(RightsDecisionInput {
+    let basis_kind = RightsBasisKind::from_database_name(&stored.basis_kind)
+        .ok_or(CatalogError::CorruptCatalog)?;
+    let basis = RightsBasis::from_stored(
+        basis_kind,
+        stored.basis_reference,
+        basis_digest,
+        basis_root_digest,
+    )
+    .map_err(|_| CatalogError::CorruptCatalog)?;
+    let input = RightsDecisionInput {
         source_id,
         payload_digest,
         retrieved_at: Timestamp::from_unix_nanos(stored.retrieved_at_ns),
-        terms_url: stored.terms_url,
-        terms_digest,
+        basis,
         authorization_evidence,
         authorization_expires_at: stored
             .authorization_expires_at_ns
             .map(Timestamp::from_unix_nanos),
         permitted_operations: operations,
-    })
+    };
+    let rights = match stored.fingerprint_version {
+        1 => SourceRightsDecision::try_new_legacy(input),
+        2 => SourceRightsDecision::try_new(input),
+        _ => return Err(CatalogError::CorruptCatalog),
+    }
     .map_err(|_| CatalogError::CorruptCatalog)?;
     rights
         .validate_at(admitted_at)

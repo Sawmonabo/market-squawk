@@ -1,5 +1,6 @@
 use std::error::Error;
 use std::num::NonZeroU32;
+use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use market_squawk_data::{
@@ -9,15 +10,128 @@ use market_squawk_data::{
     Sha256Digest,
 };
 use market_squawk_domain::{
-    AvailabilityEvidence, CalendarDate, DataQuality, DigestAlgorithm, MacroObservation,
-    PayloadHash, PayloadReference, ResearchContext, ResearchObservation, ResearchProvenance,
-    ResearchProvenanceInput, ResearchTemporalCoordinate, ResearchTime, RevisionNumber, SourceId,
-    SourceIdentifier, Timestamp,
+    AlternativeDataObservation, AvailabilityEvidence, CalendarDate, CorporateActionKind,
+    CorporateActionObservation, DataQuality, DigestAlgorithm, FilingObservation,
+    FundamentalObservation, InstrumentId, MacroObservation, PayloadHash, PayloadReference,
+    PositionObservation, PositionSide, QuantityLots, ResearchContext, ResearchObservation,
+    ResearchProvenance, ResearchProvenanceInput, ResearchTemporalCoordinate, ResearchTime,
+    RevisionNumber, SourceId, SourceIdentifier, Timestamp, TransactionObservation,
 };
+use market_squawk_sources::{CanonicalObservationFamily, CanonicalObservationPayload};
 use rust_decimal::Decimal;
 use tokio_util::sync::CancellationToken;
 
 type TestResult = Result<(), Box<dyn Error>>;
+
+#[tokio::test]
+async fn source_revision_encodings_match_pit_for_every_observation_variant() -> TestResult {
+    let instrument = InstrumentId::from_str("0187f5f1-6fc2-7fa2-bf05-2ce5354c55c1")?;
+    let source = SourceId::try_from("canonical-compatibility")?;
+    let context = |source_record: &str,
+                   instrument_id: Option<InstrumentId>|
+     -> Result<ResearchContext, Box<dyn Error>> {
+        Ok(ResearchContext::new(
+            ResearchProvenance::try_new(ResearchProvenanceInput {
+                source_id: source.clone(),
+                instrument_id,
+                venue_id: None,
+                source_identifier: SourceIdentifier::try_from(source_record)?,
+                source_timestamp: None,
+                received_at: timestamp(10),
+                ingested_at: timestamp(11),
+                quality: DataQuality::OfficialDelayed,
+                payload_reference: PayloadReference::ContentHash(PayloadHash::new(
+                    DigestAlgorithm::Sha256,
+                    [7; 32],
+                )),
+                availability: AvailabilityEvidence::local_first_observed(timestamp(10)),
+            })?,
+            ResearchTime::try_new_with_coordinates(exact(50), None, RevisionNumber::new(1)?, None)?,
+        )?)
+    };
+    let observations = vec![
+        ResearchObservation::Filing(FilingObservation::new(
+            context("filing-record", Some(instrument))?,
+            SourceIdentifier::try_from("10-K")?,
+            SourceIdentifier::try_from("0000000000-24-000001")?,
+        )?),
+        ResearchObservation::Fundamental(FundamentalObservation::new(
+            context("fundamental-record", Some(instrument))?,
+            SourceIdentifier::try_from("us-gaap:Assets")?,
+            Decimal::new(12_345, 2),
+            SourceIdentifier::try_from("USD")?,
+        )?),
+        ResearchObservation::Macro(MacroObservation::new(
+            context("macro-record", None)?,
+            SourceIdentifier::try_from("GDP")?,
+            Decimal::new(31_415, 3),
+            SourceIdentifier::try_from("billions-usd")?,
+        )),
+        ResearchObservation::PortfolioPosition(PositionObservation::new(
+            context("position-record", Some(instrument))?,
+            SourceIdentifier::try_from("taxable-account")?,
+            PositionSide::Long,
+            QuantityLots::new(25)?,
+        )?),
+        ResearchObservation::Transaction(TransactionObservation::new(
+            context("transaction-provenance", None)?,
+            SourceIdentifier::try_from("taxable-account")?,
+            SourceIdentifier::try_from("trade")?,
+            SourceIdentifier::try_from("broker-transaction-1")?,
+        )),
+        ResearchObservation::CorporateAction(CorporateActionObservation::new(
+            context("corporate-action-record", Some(instrument))?,
+            CorporateActionKind::Delisting,
+        )?),
+        ResearchObservation::AlternativeData(AlternativeDataObservation::new(
+            context("alternative-record", None)?,
+            SourceIdentifier::try_from("local-factors")?,
+            SourceIdentifier::try_from("quality-score")?,
+            Decimal::new(875, 3),
+            None,
+        )),
+    ];
+    let candidates = observations
+        .into_iter()
+        .enumerate()
+        .map(|(index, observation)| {
+            let marker = u8::try_from(index + 1)?;
+            Ok(PointInTimeCandidate::new(
+                observation,
+                manifest(u64::from(marker), marker)?,
+            ))
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    let selection = select(
+        &PointInTimeService::new(),
+        &request(
+            policy(PointInTimeRevisionMode::LatestKnown)?,
+            timestamp(100),
+            None,
+            exact(100),
+            None,
+            limits(16, 16, 4, 16, 1 << 20)?,
+        )?,
+        &candidates,
+    )
+    .await?;
+
+    assert_eq!(selection.records().len(), candidates.len());
+    for record in selection.records() {
+        let observation = record.candidate().observation();
+        let family = CanonicalObservationFamily::try_from_observation(observation)?;
+        let payload = CanonicalObservationPayload::try_from_observation(observation)?;
+        assert!(family.exact_bytes().starts_with(b"MSQPIT"));
+        assert!(payload.exact_bytes().starts_with(b"MSQPIT"));
+        assert_eq!(family.identity().bytes(), record.family_identity().bytes());
+        assert_eq!(
+            payload.identity().bytes(),
+            record.payload_identity().bytes()
+        );
+    }
+
+    Ok(())
+}
 
 #[tokio::test]
 async fn point_in_time_selection_is_causal_bounded_and_auditable() -> TestResult {

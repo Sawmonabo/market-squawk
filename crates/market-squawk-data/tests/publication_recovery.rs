@@ -8,8 +8,8 @@ use market_squawk_data::{
     CatalogError, CatalogLimit, CatalogResultLimits, CommittedDataset, CompactionRequest,
     IngestError, IngestIdentity, ObjectStoreConfig, ParquetStoreError,
     QueryArtifactReservationInput, QueryError, QueryLimits, QueryRequest, QueryResult,
-    ResearchArrowBatch, ResearchIngestService, ResearchQueryEngine, RightsDecisionInput,
-    SourceOperation, extraction_batch_digest,
+    ResearchArrowBatch, ResearchIngestService, ResearchQueryEngine, RightsBasis,
+    RightsDecisionInput, SourceOperation, extraction_batch_digest,
 };
 use market_squawk_domain::{
     AuthorizationBasis, ChecksumCapability, CoverageDelay, DataQuality, DeliveryEvidence,
@@ -25,6 +25,7 @@ use market_squawk_sources::{
     FreshnessPolicy, HistoricalCapability, NetworkAccessPolicy, SourceCapabilities, SourceClass,
     SourceCoverage, SourceMetadata, SourceMetadataInput, SourceObject, SourceProtocolProfile,
 };
+use rusqlite::params;
 use rust_decimal::Decimal;
 use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -167,37 +168,8 @@ fn a_legacy_v4_catalog_requires_explicit_root_migration_after_replacement() -> T
     let paths = LocalPaths::prepare(&local_root)?;
     let location = paths.catalog()?.clone();
     let artifact_path = paths.artifacts()?.root().to_path_buf();
-    let store_config = ObjectStoreConfig::try_new(1024 * 1024, 32, Duration::from_secs(60))?;
-    let service = AnalyticalDataService::initialize(
-        CatalogAuthority::open(test_catalog_config(location.clone())?)?,
-        AnalyticalManifestCatalog::open(&location, 8)?,
-        paths.artifacts()?.clone(),
-        store_config,
-    )?;
-    drop(service);
+    drop(create_legacy_catalog(&location, 4)?);
     drop(paths);
-
-    let connection = rusqlite::Connection::open(location.path())?;
-    connection.execute_batch(
-        "BEGIN;
-         INSERT INTO query_artifact_reservations(
-             reservation_id, owner, request_algorithm, request_digest, max_bytes,
-             requested_at_ns, expires_at_ns, state, bound_at_ns
-         ) VALUES (
-             '00000000-0000-0000-0000-000000000001', 'legacy-v4', 1, zeroblob(32), 1,
-             1, 2, 'reserved', NULL
-         );
-         DROP TRIGGER analytical_artifact_root_authority_events_immutable_update;
-         DROP TRIGGER analytical_artifact_root_authority_events_immutable_delete;
-         DROP TRIGGER analytical_artifact_root_authority_events_append_guard;
-         DROP TABLE analytical_artifact_root_authority_events;
-         DROP TABLE analytical_generation_parents;
-         DROP TABLE analytical_generation_objects;
-         DROP TABLE analytical_generations;",
-    )?;
-    connection.execute_batch(include_str!("../migrations/0003_analytical.sql"))?;
-    connection.execute_batch("DELETE FROM schema_migrations WHERE version >= 5; COMMIT;")?;
-    drop(connection);
 
     std::fs::rename(&artifact_path, local_root.join("legacy-artifacts"))?;
     std::fs::create_dir(&artifact_path)?;
@@ -207,7 +179,7 @@ fn a_legacy_v4_catalog_requires_explicit_root_migration_after_replacement() -> T
             CatalogAuthority::open(test_catalog_config(location.clone())?)?,
             AnalyticalManifestCatalog::open(&location, 8)?,
             replacement_paths.artifacts()?.clone(),
-            store_config,
+            ObjectStoreConfig::try_new(1024 * 1024, 32, Duration::from_secs(60))?,
         );
         assert!(matches!(
             replacement,
@@ -225,37 +197,46 @@ fn a_v2_catalog_with_artifacts_cannot_fabricate_root_authority() -> TestResult {
     let paths = LocalPaths::prepare(directory.path().join("market-squawk"))?;
     let location = paths.catalog()?.clone();
     let catalog_config = test_catalog_config(location.clone())?;
-    drop(CatalogAuthority::open(catalog_config.clone())?);
-
-    let connection = rusqlite::Connection::open(location.path())?;
-    connection.execute_batch(
-        "PRAGMA foreign_keys = ON;
-         BEGIN;
-         INSERT INTO sources VALUES ('v2-source', zeroblob(32), 1, 1);
-         INSERT INTO source_revisions VALUES ('v2-source', zeroblob(32), '{}', 1);
-         INSERT INTO source_rights VALUES (
-             zeroblob(32), 'v2-source', 1, zeroblob(32), 1,
+    let connection = create_legacy_catalog(&location, 2)?;
+    connection.execute_batch("BEGIN;")?;
+    connection.execute(
+        "INSERT INTO sources VALUES ('v2-source', zeroblob(32), 1, 1)",
+        [],
+    )?;
+    connection.execute(
+        "INSERT INTO source_revisions VALUES ('v2-source', zeroblob(32), '{}', 1)",
+        [],
+    )?;
+    let rights_id = legacy_rights_id(
+        "v2-source",
+        digest(0),
+        Timestamp::from_unix_nanos(1),
+        "https://example.test/terms",
+        digest(0),
+        digest(0),
+        None,
+        4,
+    );
+    connection.execute(
+        "INSERT INTO source_rights VALUES (
+             ?1, 'v2-source', 1, zeroblob(32), 1,
              'https://example.test/terms', 1, zeroblob(32), 1, zeroblob(32), NULL, 4, 1
-         );
-         INSERT INTO ingest_runs VALUES (
+         )",
+        [rights_id.as_slice()],
+    )?;
+    connection.execute(
+        "INSERT INTO ingest_runs VALUES (
              '00000000-0000-0000-0000-000000000001', 'v2-artifact', 'v2-source',
-             1, zeroblob(32), 'persist', zeroblob(32), 'succeeded', 1, 2
-         );
-         INSERT INTO artifacts VALUES (
+             1, zeroblob(32), 'persist', ?1, 'succeeded', 1, 2
+         )",
+        [rights_id.as_slice()],
+    )?;
+    connection.execute_batch(
+        "INSERT INTO artifacts VALUES (
              '00000000-0000-0000-0000-000000000002',
              '00000000-0000-0000-0000-000000000001',
              'objects/sha256/00/fixture.parquet', 1, zeroblob(32), 1, 2
          );
-         DROP TABLE query_artifact_results;
-         DROP TABLE query_artifact_reservations;
-         DROP TABLE analytical_generation_parents;
-         DROP TABLE analytical_generation_objects;
-         DROP TABLE analytical_generations;
-         DROP TRIGGER analytical_artifact_root_authority_events_immutable_update;
-         DROP TRIGGER analytical_artifact_root_authority_events_immutable_delete;
-         DROP TRIGGER analytical_artifact_root_authority_events_append_guard;
-         DROP TABLE analytical_artifact_root_authority_events;
-         DELETE FROM schema_migrations WHERE version >= 3;
          COMMIT;",
     )?;
     drop(connection);
@@ -271,6 +252,113 @@ fn a_v2_catalog_with_artifacts_cannot_fabricate_root_authority() -> TestResult {
         Err(IngestError::Catalog(
             CatalogError::ArtifactRootAuthorityTransitionConflict
         ))
+    ));
+    Ok(())
+}
+
+#[test]
+fn legacy_rights_fingerprint_corruption_blocks_authority_migration() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let paths = LocalPaths::prepare(directory.path().join("market-squawk"))?;
+    let location = paths.catalog()?.clone();
+    let connection = create_legacy_catalog(&location, 2)?;
+    connection.execute_batch(
+        "PRAGMA foreign_keys = ON;
+         BEGIN;
+         INSERT INTO sources VALUES ('corrupt-v2-source', zeroblob(32), 1, 1);
+         INSERT INTO source_revisions VALUES ('corrupt-v2-source', zeroblob(32), '{}', 1);
+         INSERT INTO source_rights VALUES (
+             zeroblob(32), 'corrupt-v2-source', 1, zeroblob(32), 1,
+             'https://example.test/terms', 1, zeroblob(32), 1, zeroblob(32), NULL, 4, 1
+         );
+         COMMIT;",
+    )?;
+    drop(connection);
+
+    assert!(matches!(
+        CatalogAuthority::open(test_catalog_config(location)?),
+        Err(CatalogError::CorruptCatalog)
+    ));
+    Ok(())
+}
+
+#[test]
+fn ingest_rights_guards_reject_future_mismatch_and_expired_legacy_run() -> TestResult {
+    let current_directory = tempfile::tempdir()?;
+    let current_paths = LocalPaths::prepare(current_directory.path().join("current"))?;
+    let current_location = current_paths.catalog()?.clone();
+    drop(CatalogAuthority::open(test_catalog_config(
+        current_location.clone(),
+    )?)?);
+    let current = rusqlite::Connection::open(current_location.path())?;
+    current.execute_batch(
+        "PRAGMA foreign_keys = ON;
+         BEGIN;
+         INSERT INTO sources VALUES ('source-a', zeroblob(32), 1, 1);
+         INSERT INTO source_revisions VALUES ('source-a', zeroblob(32), '{}', 1);
+         INSERT INTO sources VALUES ('source-b', zeroblob(32), 1, 1);
+         INSERT INTO source_revisions VALUES ('source-b', zeroblob(32), '{}', 1);
+         INSERT INTO source_rights VALUES (
+             X'0707070707070707070707070707070707070707070707070707070707070707',
+             'source-a', 1, X'0101010101010101010101010101010101010101010101010101010101010101',
+             1, 'https://example.test/terms', 1, zeroblob(32), 1, zeroblob(32),
+             NULL, 4, 1, 'reviewed_terms', NULL, NULL, 2
+         );",
+    )?;
+    let mismatch = current.execute(
+        "INSERT INTO ingest_runs VALUES (
+             '00000000-0000-0000-0000-000000000010', 'mismatch', 'source-b',
+             1, X'0202020202020202020202020202020202020202020202020202020202020202',
+             'train',
+             X'0707070707070707070707070707070707070707070707070707070707070707',
+             'reserved', 2, NULL
+         )",
+        [],
+    );
+    assert!(mismatch.is_err());
+    current.execute_batch("ROLLBACK;")?;
+
+    let legacy_directory = tempfile::tempdir()?;
+    let legacy_paths = LocalPaths::prepare(legacy_directory.path().join("legacy"))?;
+    let legacy_location = legacy_paths.catalog()?.clone();
+    let legacy = create_legacy_catalog(&legacy_location, 2)?;
+    let rights_id = legacy_rights_id(
+        "expired-source",
+        digest(1),
+        Timestamp::from_unix_nanos(1),
+        "https://example.test/terms",
+        digest(0),
+        digest(0),
+        Some(Timestamp::from_unix_nanos(10)),
+        4,
+    );
+    legacy.execute_batch(
+        "PRAGMA foreign_keys = ON;
+         BEGIN;
+         INSERT INTO sources VALUES ('expired-source', zeroblob(32), 1, 1);
+         INSERT INTO source_revisions VALUES ('expired-source', zeroblob(32), '{}', 1);",
+    )?;
+    legacy.execute(
+        "INSERT INTO source_rights VALUES (
+             ?1, 'expired-source', 1,
+             X'0101010101010101010101010101010101010101010101010101010101010101',
+             1, 'https://example.test/terms', 1, zeroblob(32), 1, zeroblob(32), 10, 4, 1
+         )",
+        [rights_id.as_slice()],
+    )?;
+    legacy.execute(
+        "INSERT INTO ingest_runs VALUES (
+             '00000000-0000-0000-0000-000000000011', 'expired', 'expired-source',
+             1, X'0101010101010101010101010101010101010101010101010101010101010101',
+             'persist', ?1, 'reserved', 10, NULL
+         )",
+        [rights_id.as_slice()],
+    )?;
+    legacy.execute_batch("COMMIT;")?;
+    drop(legacy);
+    assert!(matches!(
+        CatalogAuthority::open(test_catalog_config(legacy_location)?),
+        Err(CatalogError::CorruptCatalog)
     ));
     Ok(())
 }
@@ -511,8 +599,7 @@ async fn rights_bound_ingest_replays_one_complete_pinned_generation() -> TestRes
         source_id: source.source_id().clone(),
         payload_digest,
         retrieved_at: Timestamp::from_unix_nanos(15),
-        terms_url: "https://example.test/terms/v1".to_owned(),
-        terms_digest: digest(31),
+        basis: RightsBasis::reviewed_terms("https://example.test/terms/v1", digest(31))?,
         authorization_evidence: digest(32),
         authorization_expires_at: Some(Timestamp::from_unix_nanos(i64::MAX)),
         permitted_operations: vec![SourceOperation::Persist],
@@ -604,8 +691,7 @@ async fn rights_bound_ingest_replays_one_complete_pinned_generation() -> TestRes
         source_id: source.source_id().clone(),
         payload_digest: compaction.payload_digest(),
         retrieved_at: Timestamp::from_unix_nanos(15),
-        terms_url: "https://example.test/terms/v1".to_owned(),
-        terms_digest: digest(31),
+        basis: RightsBasis::reviewed_terms("https://example.test/terms/v1", digest(31))?,
         authorization_evidence: digest(32),
         authorization_expires_at: Some(Timestamp::from_unix_nanos(i64::MAX)),
         permitted_operations: vec![SourceOperation::Persist],
@@ -751,8 +837,7 @@ async fn initialized_service_with_dataset(
         source_id: source.source_id().clone(),
         payload_digest,
         retrieved_at: Timestamp::from_unix_nanos(15),
-        terms_url: "https://example.test/terms/v1".to_owned(),
-        terms_digest: digest(31),
+        basis: RightsBasis::reviewed_terms("https://example.test/terms/v1", digest(31))?,
         authorization_evidence: digest(32),
         authorization_expires_at: Some(Timestamp::from_unix_nanos(i64::MAX)),
         permitted_operations: vec![SourceOperation::Persist],
@@ -897,6 +982,83 @@ fn local_source() -> Result<SourceMetadata, Box<dyn Error>> {
 
 fn digest(byte: u8) -> EvidenceDigest {
     EvidenceDigest::new(DigestAlgorithm::Sha256, [byte; 32])
+}
+
+fn create_legacy_catalog(
+    location: &market_squawk_platform::CatalogLocation,
+    migration_count: usize,
+) -> Result<rusqlite::Connection, Box<dyn Error>> {
+    let migrations = [
+        (1_i64, include_str!("../migrations/0001_control.sql")),
+        (2_i64, include_str!("../migrations/0002_instruments.sql")),
+        (3_i64, include_str!("../migrations/0003_analytical.sql")),
+        (
+            4_i64,
+            include_str!("../migrations/0004_query_artifacts.sql"),
+        ),
+    ];
+    if migration_count == 0 || migration_count > migrations.len() {
+        return Err(rusqlite::Error::InvalidParameterName("migration_count".to_owned()).into());
+    }
+    drop(location.prepare_catalog_file()?);
+    let connection = rusqlite::Connection::open(location.path())?;
+    connection.execute_batch(
+        "PRAGMA application_id = 1297305931;
+         PRAGMA foreign_keys = ON;
+         BEGIN;",
+    )?;
+    for (version, sql) in migrations.iter().take(migration_count) {
+        connection.execute_batch(sql)?;
+        let digest: [u8; 32] = Sha256::digest(sql.as_bytes()).into();
+        connection.execute(
+            "INSERT INTO schema_migrations(version, sha256, applied_at_ns)
+             VALUES (?1, ?2, ?3)",
+            params![version, digest.as_slice(), version],
+        )?;
+    }
+    connection.execute_batch("COMMIT;")?;
+    Ok(connection)
+}
+
+fn legacy_rights_id(
+    source_id: &str,
+    payload_digest: EvidenceDigest,
+    retrieved_at: Timestamp,
+    terms_url: &str,
+    terms_digest: EvidenceDigest,
+    authorization_digest: EvidenceDigest,
+    authorization_expires_at: Option<Timestamp>,
+    operation_mask: u8,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hash_length_prefixed(&mut hasher, source_id.as_bytes());
+    hash_evidence_digest(&mut hasher, payload_digest);
+    hasher.update(retrieved_at.unix_nanos().to_be_bytes());
+    hash_length_prefixed(&mut hasher, terms_url.as_bytes());
+    hash_evidence_digest(&mut hasher, terms_digest);
+    hash_evidence_digest(&mut hasher, authorization_digest);
+    match authorization_expires_at {
+        Some(expiry) => {
+            hasher.update([1]);
+            hasher.update(expiry.unix_nanos().to_be_bytes());
+        }
+        None => hasher.update([0]),
+    }
+    hasher.update([operation_mask]);
+    hasher.finalize().into()
+}
+
+fn hash_evidence_digest(hasher: &mut Sha256, digest: EvidenceDigest) {
+    hasher.update([match digest.algorithm() {
+        DigestAlgorithm::Sha256 => 1,
+        DigestAlgorithm::Blake3 => 2,
+    }]);
+    hasher.update(digest.bytes());
+}
+
+fn hash_length_prefixed(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
+    hasher.update(value);
 }
 
 fn test_catalog_config(

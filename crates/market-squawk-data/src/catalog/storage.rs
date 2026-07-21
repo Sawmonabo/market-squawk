@@ -114,6 +114,9 @@ pub(super) fn apply_migrations(
     let applied_at = now_timestamp()?;
     let transaction = connection.transaction()?;
     for migration in &MIGRATIONS[applied.len()..] {
+        if migration.version == 8 {
+            super::migration_preflight::preflight_research_use_migration(&transaction)?;
+        }
         transaction.execute_batch(migration.sql)?;
         if migration.version == 5 && legacy_root_migration_required {
             let legacy_schema_version = u64::try_from(applied.len())
@@ -387,29 +390,42 @@ pub(super) fn persist_rights(
     admitted_at: Timestamp,
 ) -> Result<AppendOutcome, CatalogError> {
     let (payload_algorithm, payload_digest) = digest_columns(rights.payload_digest());
-    let (terms_algorithm, terms_digest) = digest_columns(rights.terms_digest());
+    let (basis_algorithm, basis_digest) = digest_columns(rights.basis().digest());
+    let (basis_root_algorithm, basis_root_digest) = rights
+        .basis()
+        .root_identity_digest()
+        .map(digest_columns)
+        .map_or((None, None), |(algorithm, digest)| {
+            (Some(algorithm), Some(digest))
+        });
     let (authorization_algorithm, authorization_digest) =
         digest_columns(rights.authorization_evidence());
     let inserted = transaction.execute(
         "INSERT OR IGNORE INTO source_rights
-         (rights_id, source_id, payload_algorithm, payload_digest, retrieved_at_ns, terms_url,
-          terms_algorithm, terms_digest, authorization_algorithm, authorization_digest,
-          authorization_expires_at_ns, operation_mask, admitted_at_ns)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+         (rights_id, source_id, payload_algorithm, payload_digest, retrieved_at_ns,
+          basis_reference, basis_algorithm, basis_digest, authorization_algorithm,
+          authorization_digest, authorization_expires_at_ns, operation_mask, admitted_at_ns,
+          basis_kind, basis_root_algorithm, basis_root_digest, fingerprint_version)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+                 ?17)",
         params![
             rights.fingerprint(),
             rights.source_id().as_str(),
             payload_algorithm,
             payload_digest,
             rights.retrieved_at().unix_nanos(),
-            rights.terms_url(),
-            terms_algorithm,
-            terms_digest,
+            rights.basis().reference(),
+            basis_algorithm,
+            basis_digest,
             authorization_algorithm,
             authorization_digest,
             rights.authorization_expires_at().map(Timestamp::unix_nanos),
             i64::from(rights.operation_mask()),
-            admitted_at.unix_nanos()
+            admitted_at.unix_nanos(),
+            rights.basis().kind().database_name(),
+            basis_root_algorithm,
+            basis_root_digest,
+            i64::from(rights.fingerprint_version()),
         ],
     )?;
     if inserted == 0 {
@@ -425,7 +441,14 @@ pub(super) fn require_admitted_rights(
     rights: &SourceRightsDecision,
 ) -> Result<(), CatalogError> {
     let (payload_algorithm, payload_digest) = digest_columns(rights.payload_digest());
-    let (terms_algorithm, terms_digest) = digest_columns(rights.terms_digest());
+    let (basis_algorithm, basis_digest) = digest_columns(rights.basis().digest());
+    let (basis_root_algorithm, basis_root_digest) = rights
+        .basis()
+        .root_identity_digest()
+        .map(digest_columns)
+        .map_or((None, None), |(algorithm, digest)| {
+            (Some(algorithm), Some(digest))
+        });
     let (authorization_algorithm, authorization_digest) =
         digest_columns(rights.authorization_evidence());
     let matches: bool = transaction.query_row(
@@ -433,10 +456,13 @@ pub(super) fn require_admitted_rights(
              SELECT 1 FROM source_rights
              WHERE rights_id=?1 AND source_id=?2
                AND payload_algorithm=?3 AND payload_digest=?4
-               AND retrieved_at_ns=?5 AND terms_url=?6
-               AND terms_algorithm=?7 AND terms_digest=?8
+               AND retrieved_at_ns=?5 AND basis_reference=?6
+               AND basis_algorithm=?7 AND basis_digest=?8
                AND authorization_algorithm=?9 AND authorization_digest=?10
                AND authorization_expires_at_ns IS ?11 AND operation_mask=?12
+               AND basis_kind=?13
+               AND basis_root_algorithm IS ?14 AND basis_root_digest IS ?15
+               AND fingerprint_version=?16
                AND retrieved_at_ns <= admitted_at_ns
                AND (
                    authorization_expires_at_ns IS NULL
@@ -449,13 +475,17 @@ pub(super) fn require_admitted_rights(
             payload_algorithm,
             payload_digest,
             rights.retrieved_at().unix_nanos(),
-            rights.terms_url(),
-            terms_algorithm,
-            terms_digest,
+            rights.basis().reference(),
+            basis_algorithm,
+            basis_digest,
             authorization_algorithm,
             authorization_digest,
             rights.authorization_expires_at().map(Timestamp::unix_nanos),
-            i64::from(rights.operation_mask())
+            i64::from(rights.operation_mask()),
+            rights.basis().kind().database_name(),
+            basis_root_algorithm,
+            basis_root_digest,
+            i64::from(rights.fingerprint_version()),
         ],
         |row| row.get(0),
     )?;

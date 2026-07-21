@@ -18,7 +18,7 @@ use market_squawk_data::{
     AnalyticalDataService, AnalyticalManifestCatalog, CatalogAuthority, CatalogConfig,
     CatalogError, CatalogLimit, CatalogResultLimits, IngestIdentity, ObjectStoreConfig,
     QueryLimits, QueryRequest, QueryResult, ResearchIngestService, ResearchQueryEngine,
-    RightsDecisionInput, SourceOperation, extraction_batch_digest,
+    RightsBasis, RightsDecisionInput, SourceOperation, extraction_batch_digest,
 };
 use market_squawk_domain::{
     AuthorizationBasis, ChecksumCapability, CoverageDelay, DataQuality, DeliveryEvidence,
@@ -363,11 +363,16 @@ async fn every_local_format_survives_rights_publish_restart_and_exact_query() ->
     fs::write(directory.path().join("manifest.json"), MANIFEST)?;
     let representation_state_root = representation_state_directory.path().join("authority");
 
-    let root = UserAuthorizedInputRoot::open(fs::canonicalize(directory.path())?)?;
+    let (root, ownership_authority) = UserAuthorizedInputRoot::open_with_ownership_authority(
+        fs::canonicalize(directory.path())?,
+    )?;
     let manifest_input = root
         .resolve("manifest.json")?
         .open_bounded(u64::try_from(MANIFEST.len())?)?
         .read_bounded()?;
+    let local_rights_basis = RightsBasis::user_owned_local(
+        ownership_authority.issue_manifest_evidence(&manifest_input)?,
+    );
     let metadata = local_metadata()?;
     let source = FileExtractionSource::try_new_with_clock(
         metadata.clone(),
@@ -592,7 +597,12 @@ async fn every_local_format_survives_rights_publish_restart_and_exact_query() ->
     for batch in batches {
         let key = idempotency_key(&batch);
         let payload_digest = extraction_batch_digest(&batch)?;
-        let rights = admit_rights(&authority, metadata.source_id().clone(), payload_digest)?;
+        let rights = admit_rights(
+            &authority,
+            metadata.source_id().clone(),
+            payload_digest,
+            &local_rights_basis,
+        )?;
         let reservation = authority.reserve_ingest(
             &IngestIdentity::try_new(
                 metadata.source_id().clone(),
@@ -649,8 +659,12 @@ async fn every_local_format_survives_rights_publish_restart_and_exact_query() ->
         )
         .await?;
     let restarted_digest = extraction_batch_digest(&restarted_batch)?;
-    let restarted_rights =
-        admit_rights(&authority, metadata.source_id().clone(), restarted_digest)?;
+    let restarted_rights = admit_rights(
+        &authority,
+        metadata.source_id().clone(),
+        restarted_digest,
+        &local_rights_basis,
+    )?;
     let restarted_reservation = authority.reserve_ingest(
         &IngestIdentity::try_new(
             metadata.source_id().clone(),
@@ -662,7 +676,12 @@ async fn every_local_format_survives_rights_publish_restart_and_exact_query() ->
     )?;
 
     let changed_digest = extraction_batch_digest(&changed_csv)?;
-    let changed_rights = admit_rights(&authority, metadata.source_id().clone(), changed_digest)?;
+    let changed_rights = admit_rights(
+        &authority,
+        metadata.source_id().clone(),
+        changed_digest,
+        &local_rights_basis,
+    )?;
     let conflict = authority.reserve_ingest(
         &IngestIdentity::try_new(
             metadata.source_id().clone(),
@@ -753,13 +772,13 @@ fn admit_rights(
     authority: &CatalogAuthority,
     source_id: SourceId,
     payload_digest: EvidenceDigest,
+    basis: &RightsBasis,
 ) -> Result<market_squawk_data::RegisteredRightsGrant, CatalogError> {
     authority.admit_source_rights(RightsDecisionInput {
         source_id,
         payload_digest,
         retrieved_at: Timestamp::from_unix_nanos(15),
-        terms_url: "https://example.test/user-owned-local-file-terms".to_owned(),
-        terms_digest: digest(31),
+        basis: basis.clone(),
         authorization_evidence: digest(32),
         authorization_expires_at: Some(Timestamp::from_unix_nanos(i64::MAX)),
         permitted_operations: vec![SourceOperation::Persist],

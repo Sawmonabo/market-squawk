@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 
 use arrow::record_batch::RecordBatch;
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp};
-use market_squawk_sources::{ExtractionBatch, ExtractionContentIdentity, ExtractionError};
+use market_squawk_sources::{
+    ExtractionBatch, ExtractionContentIdentity, ExtractionError, ObservedRevisionAuthority,
+};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -17,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 use crate::analytical_backup::AnalyticalOperationGate;
 use crate::authority_transition::{AuthorityTransitionError, AuthorityTransitionService};
 use crate::blocking_supervisor::BlockingIoSupervisor;
+use crate::catalog::CatalogObservedRevisionAuthority;
 #[cfg(test)]
 use crate::catalog::QueryArtifactBindCheckpoint;
 use crate::catalog::QueryArtifactPublisher;
@@ -505,6 +508,13 @@ impl AnalyticalDataService {
     /// Returns the controlled object capability for manifest-pinned query construction.
     pub fn object_store(&self) -> Arc<ParquetObjectStore> {
         Arc::clone(&self.objects)
+    }
+
+    /// Returns object-safe observed-revision authority over this exact shared catalog writer.
+    pub fn observed_revision_authority(&self) -> Arc<dyn ObservedRevisionAuthority> {
+        Arc::new(CatalogObservedRevisionAuthority::new(Arc::clone(
+            &self.authority,
+        )))
     }
 
     /// Returns sealed backup authority for this exact active catalog and artifact root.

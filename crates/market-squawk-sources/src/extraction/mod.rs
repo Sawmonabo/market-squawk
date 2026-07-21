@@ -2,6 +2,7 @@
 
 mod batch;
 mod contracts;
+mod revisions;
 
 use futures_util::future::BoxFuture;
 use thiserror::Error;
@@ -21,6 +22,14 @@ pub use contracts::{
     MAX_DISCOVERY_OBJECTS, MAX_EXTRACTION_BATCH_BYTES, MAX_EXTRACTION_RECORD_BYTES,
     MAX_EXTRACTION_RECORDS, MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES, SourceObject,
     payload_matches_exact_evidence,
+};
+pub use revisions::{
+    CanonicalObservationFamily, CanonicalObservationPayload, MAX_OBSERVED_REVISION_BATCH_BYTES,
+    MAX_OBSERVED_REVISION_BATCH_RECORDS, MAX_OBSERVED_SEMANTIC_PAYLOAD_BYTES,
+    MAX_OBSERVED_VERSION_EVIDENCE_BYTES, ObservedProviderOrder, ObservedRevisionAssignments,
+    ObservedRevisionAuthority, ObservedRevisionBatch, ObservedRevisionError,
+    ObservedRevisionRecord, ObservedSemanticPayload, ObservedVersionEvidence, ObservedVersionKind,
+    PitV1CanonicalEncoder, PitV1EncodingControl, PitV1EncodingError,
 };
 
 /// Object-safe research extraction contract with one boxed future per request.

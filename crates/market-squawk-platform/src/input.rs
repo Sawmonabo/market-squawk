@@ -15,6 +15,13 @@ use market_squawk_domain::{DigestAlgorithm, EvidenceDigest};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
+#[path = "input/ownership.rs"]
+mod ownership;
+
+pub use ownership::{
+    UserOwnedInputAuthority, UserOwnedInputEvidence, UserOwnedInputRootIdentityDigest,
+};
+
 const MAX_INPUT_DEPTH: usize = 64;
 const MAX_COMPONENT_BYTES: usize = 255;
 const INPUT_READ_CHUNK_BYTES: usize = 64 * 1024;
@@ -29,6 +36,11 @@ struct InputRootInner {
     display_root: PathBuf,
     directory: Dir,
     identity: FileSystemIdentity,
+    ownership_binding: Arc<InputRootOwnershipBinding>,
+}
+
+struct InputRootOwnershipBinding {
+    identity_digest: UserOwnedInputRootIdentityDigest,
 }
 
 /// A one-shot capability for one regular file below a user-authorized root.
@@ -68,6 +80,7 @@ pub struct BoundedInput {
     bytes: Box<[u8]>,
     identity: InputFileIdentity,
     digest: EvidenceDigest,
+    root_ownership_binding: Arc<InputRootOwnershipBinding>,
 }
 
 /// One of the two exact passes over a controlled input handle.
@@ -224,11 +237,15 @@ impl UserAuthorizedInputRoot {
         if !metadata.is_dir() || is_windows_reparse(&metadata) {
             return Err(InputFileError::SymlinkOrReparsePoint);
         }
+        let identity = filesystem_identity(&metadata);
         Ok(Self {
             inner: Arc::new(InputRootInner {
                 display_root,
-                identity: filesystem_identity(&metadata),
+                identity,
                 directory,
+                ownership_binding: Arc::new(InputRootOwnershipBinding {
+                    identity_digest: ownership::root_identity_digest(identity),
+                }),
             }),
         })
     }
@@ -596,6 +613,7 @@ impl VerifiedInputFile {
             bytes: bytes.into_boxed_slice(),
             identity: self.identity,
             digest: EvidenceDigest::new(DigestAlgorithm::Sha256, first_digest.into()),
+            root_ownership_binding: Arc::clone(&self.root.ownership_binding),
         })
     }
 }
@@ -948,7 +966,14 @@ fn configure_windows_nofollow(_options: &mut OpenOptions) {}
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
+    use static_assertions::assert_not_impl_any;
+
     use super::*;
+
+    assert_not_impl_any!(UserOwnedInputAuthority: Clone, serde::Serialize);
+    assert_not_impl_any!(UserOwnedInputEvidence: Clone, serde::Serialize);
 
     #[test]
     fn fixed_input_reservation_rejects_before_capacity_growth() {
@@ -959,5 +984,83 @@ mod tests {
             Err(InputFileError::ByteLimitExceeded { max: 1 })
         ));
         assert_eq!(bytes.capacity(), initial_capacity);
+    }
+
+    #[test]
+    fn user_owned_manifest_evidence_is_exact_stable_and_fail_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let parent = tempfile::tempdir()?;
+        let root_path = parent.path().join("authorized-input");
+        fs::create_dir(&root_path)?;
+        fs::write(root_path.join("manifest.json"), br#"{"schema_version":3}"#)?;
+        let root_path = fs::canonicalize(root_path)?;
+
+        let (root, authority) = UserAuthorizedInputRoot::open_with_ownership_authority(&root_path)?;
+        let ordinary_adapter_root = root.clone();
+        let manifest = ordinary_adapter_root
+            .resolve("manifest.json")?
+            .open_bounded(1_024)?
+            .read_bounded()?;
+        let expected_manifest_digest = manifest.digest();
+        let evidence = authority.issue_manifest_evidence(&manifest)?;
+        assert_eq!(evidence.manifest_digest(), expected_manifest_digest);
+        assert_eq!(
+            evidence
+                .root_identity_digest()
+                .evidence_digest()
+                .algorithm(),
+            DigestAlgorithm::Sha256
+        );
+        assert_eq!(
+            format!("{:?}", evidence.root_identity_digest()),
+            "UserOwnedInputRootIdentityDigest([REDACTED])"
+        );
+        assert_eq!(
+            format!("{evidence:?}"),
+            "UserOwnedInputEvidence([REDACTED])"
+        );
+
+        let (reopened_root, reopened_authority) =
+            UserAuthorizedInputRoot::open_with_ownership_authority(&root_path)?;
+        let reopened_manifest = reopened_root
+            .resolve("manifest.json")?
+            .open_bounded(1_024)?
+            .read_bounded()?;
+        let reopened_evidence = reopened_authority.issue_manifest_evidence(&reopened_manifest)?;
+        assert_eq!(
+            reopened_evidence.root_identity_digest(),
+            evidence.root_identity_digest()
+        );
+        assert!(matches!(
+            reopened_authority.issue_manifest_evidence(&manifest),
+            Err(InputFileError::IdentityChanged)
+        ));
+
+        #[cfg(unix)]
+        {
+            let retained_path = parent.path().join("retained-input");
+            fs::rename(&root_path, &retained_path)?;
+            fs::create_dir(&root_path)?;
+            fs::write(root_path.join("manifest.json"), br#"{"schema_version":3}"#)?;
+            assert!(matches!(
+                authority.issue_manifest_evidence(&manifest),
+                Err(InputFileError::IdentityChanged)
+            ));
+
+            let (replacement_root, replacement_authority) =
+                UserAuthorizedInputRoot::open_with_ownership_authority(&root_path)?;
+            let replacement_manifest = replacement_root
+                .resolve("manifest.json")?
+                .open_bounded(1_024)?
+                .read_bounded()?;
+            let replacement_evidence =
+                replacement_authority.issue_manifest_evidence(&replacement_manifest)?;
+            assert_ne!(
+                replacement_evidence.root_identity_digest(),
+                evidence.root_identity_digest()
+            );
+        }
+
+        Ok(())
     }
 }
