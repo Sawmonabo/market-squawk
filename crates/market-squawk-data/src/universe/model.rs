@@ -462,6 +462,18 @@ pub enum UniverseError {
         /// Instrument with ambiguous venue civil dates.
         instrument_id: InstrumentId,
     },
+    /// A venue civil date was computed for a different instant than the requested snapshot.
+    #[error("derivative venue civil date is not bound to the snapshot for {instrument_id}")]
+    DerivativeCivilDateSnapshotMismatch {
+        /// Instrument whose calendar conversion used another instant.
+        instrument_id: InstrumentId,
+    },
+    /// The exact venue-calendar rule was not evidenced as knowable by the snapshot instant.
+    #[error("derivative venue calendar rule is unavailable at the snapshot for {instrument_id}")]
+    DerivativeCalendarRuleUnavailable {
+        /// Instrument whose calendar rule lacks conservative availability.
+        instrument_id: InstrumentId,
+    },
     /// Multiple roll edges compete for one source or target contract.
     #[error("ambiguous explicit contract roll involving {instrument_id}")]
     AmbiguousContractRoll {

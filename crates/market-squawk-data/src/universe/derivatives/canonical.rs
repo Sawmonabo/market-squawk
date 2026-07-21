@@ -31,11 +31,13 @@ pub(super) fn compare_civil_dates(
     left.instrument_id
         .cmp(&right.instrument_id)
         .then_with(|| left.date.cmp(&right.date))
+        .then_with(|| left.snapshot_at.cmp(&right.snapshot_at))
         .then_with(|| {
             left.calendar_rule
                 .as_str()
                 .cmp(right.calendar_rule.as_str())
         })
+        .then_with(|| compare_evidence(left.rule_evidence, right.rule_evidence))
 }
 
 pub(super) fn compare_roll_evidence(
@@ -87,7 +89,7 @@ pub(super) fn audit_hash(
     decisions: &[DerivativeDecisionRecord],
 ) -> Result<Sha256Digest, UniverseError> {
     let mut digest = Sha256::new();
-    digest.update(b"market-squawk.derivative-universe-audit.v1\0");
+    digest.update(b"market-squawk.derivative-universe-audit.v2\0");
     digest.update(base.audit_hash().bytes());
     hash_length(&mut digest, lifecycle.len())?;
     for evidence in lifecycle {
@@ -97,7 +99,10 @@ pub(super) fn audit_hash(
     for value in civil_dates {
         digest.update(value.instrument_id.as_uuid().as_bytes());
         hash_date(&mut digest, value.date);
+        digest.update(value.snapshot_at.unix_nanos().to_be_bytes());
         hash_string(&mut digest, value.calendar_rule.as_str())?;
+        hash_evidence(&mut digest, value.rule_evidence);
+        hash_availability(&mut digest, &value.rule_availability)?;
     }
     hash_length(&mut digest, rolls.len())?;
     for roll in rolls {

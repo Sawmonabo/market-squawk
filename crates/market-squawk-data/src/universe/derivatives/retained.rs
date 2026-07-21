@@ -59,6 +59,9 @@ pub(super) fn retained_bytes(
     for civil_date in civil_dates {
         retained = retained
             .checked_add(civil_date.calendar_rule.retained_bytes())
+            .and_then(|value| {
+                value.checked_add(dynamic_availability_bytes(&civil_date.rule_availability))
+            })
             .ok_or(UniverseError::RetainedSizeOverflow)?;
     }
     for roll in rolls {

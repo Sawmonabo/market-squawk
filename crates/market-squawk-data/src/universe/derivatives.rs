@@ -33,20 +33,29 @@ use roll::{apply_roll_graph, reject_ambiguous_rolls};
 pub struct DerivativeCivilDate {
     instrument_id: InstrumentId,
     date: CalendarDate,
+    snapshot_at: Timestamp,
     calendar_rule: SourceIdentifier,
+    rule_evidence: EvidenceDigest,
+    rule_availability: AvailabilityEvidence,
 }
 
 impl DerivativeCivilDate {
-    /// Binds one instrument's venue civil date to an explicit calendar-rule revision.
+    /// Binds one instrument's venue civil date to an exact snapshot and evidenced calendar rule.
     pub const fn new(
         instrument_id: InstrumentId,
         date: CalendarDate,
+        snapshot_at: Timestamp,
         calendar_rule: SourceIdentifier,
+        rule_evidence: EvidenceDigest,
+        rule_availability: AvailabilityEvidence,
     ) -> Self {
         Self {
             instrument_id,
             date,
+            snapshot_at,
             calendar_rule,
+            rule_evidence,
+            rule_availability,
         }
     }
 
@@ -60,9 +69,24 @@ impl DerivativeCivilDate {
         self.date
     }
 
+    /// Returns the exact query instant converted by this rule application.
+    pub const fn snapshot_at(&self) -> Timestamp {
+        self.snapshot_at
+    }
+
     /// Returns the versioned venue-calendar conversion rule.
     pub const fn calendar_rule(&self) -> &SourceIdentifier {
         &self.calendar_rule
+    }
+
+    /// Returns exact content evidence for the versioned venue-calendar rule.
+    pub const fn rule_evidence(&self) -> EvidenceDigest {
+        self.rule_evidence
+    }
+
+    /// Returns when this exact calendar-rule evidence became knowable.
+    pub const fn rule_availability(&self) -> &AvailabilityEvidence {
+        &self.rule_availability
     }
 }
 
@@ -319,6 +343,7 @@ impl DerivativeUniverseSnapshot {
         roll_evidence.sort_by(compare_roll_evidence);
         reject_duplicate_lifecycle(&lifecycle_evidence)?;
         reject_duplicate_civil_dates(&civil_dates)?;
+        validate_civil_dates(&civil_dates, as_of)?;
 
         let mut decisions = Vec::new();
         decisions
@@ -596,6 +621,25 @@ fn reject_duplicate_civil_dates(values: &[DerivativeCivilDate]) -> Result<(), Un
     } else {
         Ok(())
     }
+}
+
+fn validate_civil_dates(
+    values: &[DerivativeCivilDate],
+    as_of: Timestamp,
+) -> Result<(), UniverseError> {
+    for value in values {
+        if value.snapshot_at != as_of {
+            return Err(UniverseError::DerivativeCivilDateSnapshotMismatch {
+                instrument_id: value.instrument_id,
+            });
+        }
+        if !evidence_available(&value.rule_availability, as_of) {
+            return Err(UniverseError::DerivativeCalendarRuleUnavailable {
+                instrument_id: value.instrument_id,
+            });
+        }
+    }
+    Ok(())
 }
 
 const fn boundary_rank(value: DerivativeBoundary) -> u8 {

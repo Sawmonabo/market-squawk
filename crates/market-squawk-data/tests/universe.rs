@@ -327,11 +327,18 @@ fn derivative_lifecycle_is_civil_date_conservative_and_rolls_only_on_explicit_ev
         )?,
     ];
     let calendar_rule = SourceIdentifier::try_from("cme-calendar-2026-v1")?;
-    let dates = |date| {
+    let dates = |date, snapshot_at| {
         listed
             .into_iter()
             .map(|instrument_id| {
-                DerivativeCivilDate::new(instrument_id, date, calendar_rule.clone())
+                DerivativeCivilDate::new(
+                    instrument_id,
+                    date,
+                    snapshot_at,
+                    calendar_rule.clone(),
+                    EvidenceDigest::new(DigestAlgorithm::Sha256, [30; 32]),
+                    AvailabilityEvidence::local_first_observed(Timestamp::from_unix_nanos(1)),
+                )
             })
             .collect::<Vec<_>>()
     };
@@ -341,7 +348,10 @@ fn derivative_lifecycle_is_civil_date_conservative_and_rolls_only_on_explicit_ev
         Timestamp::from_unix_nanos(99),
         candidates.clone(),
         lifecycle.clone(),
-        dates(CalendarDate::new(2026, 3, 19)?),
+        dates(
+            CalendarDate::new(2026, 3, 19)?,
+            Timestamp::from_unix_nanos(99),
+        ),
         Vec::new(),
         limits,
     )?;
@@ -353,7 +363,10 @@ fn derivative_lifecycle_is_civil_date_conservative_and_rolls_only_on_explicit_ev
         Timestamp::from_unix_nanos(100),
         candidates.clone(),
         lifecycle.clone(),
-        dates(CalendarDate::new(2026, 3, 20)?),
+        dates(
+            CalendarDate::new(2026, 3, 20)?,
+            Timestamp::from_unix_nanos(100),
+        ),
         Vec::new(),
         limits,
     )?;
@@ -389,7 +402,10 @@ fn derivative_lifecycle_is_civil_date_conservative_and_rolls_only_on_explicit_ev
         Timestamp::from_unix_nanos(101),
         candidates.clone(),
         lifecycle.clone(),
-        dates(CalendarDate::new(2026, 3, 22)?),
+        dates(
+            CalendarDate::new(2026, 3, 22)?,
+            Timestamp::from_unix_nanos(101),
+        ),
         vec![roll.clone()],
         limits,
     )?;
@@ -427,12 +443,30 @@ fn derivative_lifecycle_is_civil_date_conservative_and_rolls_only_on_explicit_ev
         Timestamp::from_unix_nanos(101),
         reversed_candidates,
         reversed_lifecycle,
-        dates(CalendarDate::new(2026, 3, 22)?),
+        dates(
+            CalendarDate::new(2026, 3, 22)?,
+            Timestamp::from_unix_nanos(101),
+        ),
         vec![roll],
         limits,
     )?;
     assert_eq!(after.content_hash(), reordered.content_hash());
     assert_eq!(after.audit_hash(), reordered.audit_hash());
+    assert!(matches!(
+        DerivativeUniverseSnapshot::try_build(
+            UniverseId::try_from("listed-derivatives.historical")?,
+            Timestamp::from_unix_nanos(102),
+            candidates.clone(),
+            after.lifecycle_evidence().to_vec(),
+            dates(
+                CalendarDate::new(2026, 3, 22)?,
+                Timestamp::from_unix_nanos(101),
+            ),
+            Vec::new(),
+            limits,
+        ),
+        Err(UniverseError::DerivativeCivilDateSnapshotMismatch { .. })
+    ));
     assert_eq!(candidates[0].effective_interval().ends_at(), None);
     Ok(())
 }
