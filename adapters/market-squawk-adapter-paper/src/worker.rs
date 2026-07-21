@@ -299,20 +299,32 @@ impl PaperWorker {
         }
     }
 
-    fn fence_financial_mutation(&mut self, sequence: u64) -> bool {
+    fn prepare_financial_audit(
+        &mut self,
+        sequence: u64,
+        audit: PaperAuditRecord,
+    ) -> Option<PreparedFinancialMutationAudit> {
+        self.refresh_audit_health();
+        if self.state.reconciliation_required {
+            return None;
+        }
         let Some(sequence) = NonZeroU64::new(sequence) else {
             self.state.reconciliation_required = true;
-            return false;
+            return None;
         };
-        if self
-            .reconciliation_fence
-            .as_ref()
-            .is_some_and(|fence| fence.require(sequence).is_err())
-        {
-            self.state.reconciliation_required = true;
-            return false;
+        let prepared = prepare_financial_mutation(
+            &self.audit,
+            self.reconciliation_fence.as_ref(),
+            sequence,
+            audit,
+        );
+        match prepared {
+            Ok(prepared) => Some(prepared),
+            Err(_) => {
+                self.state.reconciliation_required = true;
+                None
+            }
         }
-        true
     }
 
     fn publish_financial_mutation(&self, sequence: u64) {
@@ -1149,15 +1161,21 @@ impl PaperWorker {
             self.config.digest(),
             mark_mutation_digest(event),
         );
-        if account_risk_changed && !self.fence_financial_mutation(mark_sequence) {
-            return;
-        }
-        if !self.admit_committed_event_audit(mark_audit) {
-            return;
-        }
+        let financial_audit = if account_risk_changed {
+            let Some(prepared) = self.prepare_financial_audit(mark_sequence, mark_audit) else {
+                return;
+            };
+            Some(prepared)
+        } else {
+            if !self.admit_committed_event_audit(mark_audit) {
+                return;
+            }
+            None
+        };
         self.state.sequence = mark_sequence;
         self.state.ledger = marked_ledger;
-        if account_risk_changed {
+        if let Some(financial_audit) = financial_audit {
+            financial_audit.commit();
             self.publish_financial_mutation(mark_sequence);
         }
         let mut ids: Vec<_> = self
@@ -1273,12 +1291,10 @@ impl PaperWorker {
                     self.state.reconciliation_required = true;
                     break;
                 }
-                if !self.fence_financial_mutation(mutation_sequence) {
+                let Some(financial_audit) = self.prepare_financial_audit(mutation_sequence, audit)
+                else {
                     break;
-                }
-                if !self.admit_committed_event_audit(audit) {
-                    break;
-                }
+                };
                 self.state.sequence = mutation_sequence;
                 self.state.ledger = candidate_ledger;
                 self.state.fills.push(PaperFillSnapshot::new(
@@ -1293,6 +1309,7 @@ impl PaperWorker {
                     fill.liquidity(),
                 ));
                 self.state.orders.insert(order_id, candidate);
+                financial_audit.commit();
                 self.publish_financial_mutation(mutation_sequence);
             } else if plan.triggered != order.triggered || plan.became_resting {
                 self.update_matching_state(order, &plan, event);
@@ -1397,10 +1414,11 @@ impl PaperWorker {
             PaperAuditKind::Canceled,
             event_at,
         );
-        if self.fence_financial_mutation(sequence) && self.admit_committed_event_audit(audit) {
+        if let Some(financial_audit) = self.prepare_financial_audit(sequence, audit) {
             self.state.sequence = sequence;
             self.state.ledger = ledger;
             self.state.orders.insert(order.order_id, candidate);
+            financial_audit.commit();
             self.publish_financial_mutation(sequence);
         }
     }
@@ -1437,11 +1455,11 @@ impl PaperWorker {
             PaperAuditKind::Canceled,
             event_at,
         );
-        if self.fence_financial_mutation(cancel_sequence) && self.admit_committed_event_audit(audit)
-        {
+        if let Some(financial_audit) = self.prepare_financial_audit(cancel_sequence, audit) {
             self.state.sequence = cancel_sequence;
             self.state.ledger = ledger;
             self.state.orders.insert(order.order_id, candidate);
+            financial_audit.commit();
             self.publish_financial_mutation(cancel_sequence);
         }
     }
@@ -1469,22 +1487,65 @@ impl PaperWorker {
             PaperAuditKind::Expired,
             event_at,
         );
-        if self.fence_financial_mutation(sequence) && self.admit_committed_event_audit(audit) {
+        if let Some(financial_audit) = self.prepare_financial_audit(sequence, audit) {
             self.state.sequence = sequence;
             self.state.ledger = ledger;
             self.state.orders.insert(order.order_id, candidate);
+            financial_audit.commit();
             self.publish_financial_mutation(sequence);
         }
     }
 }
 
+#[must_use = "a prepared financial audit must be committed after the state mutation"]
+struct PreparedFinancialMutationAudit {
+    permit: mpsc::OwnedPermit<PaperAuditRecord>,
+    record: PaperAuditRecord,
+}
+
+impl PreparedFinancialMutationAudit {
+    fn commit(self) {
+        let _sender = self.permit.send(self.record);
+    }
+}
+
+fn prepare_financial_mutation(
+    audit: &mpsc::Sender<PaperAuditRecord>,
+    reconciliation_fence: Option<&AccountRiskReconciliationFence>,
+    sequence: NonZeroU64,
+    record: PaperAuditRecord,
+) -> Result<PreparedFinancialMutationAudit, ExecutionAdapterError> {
+    let permit = audit
+        .clone()
+        .try_reserve_owned()
+        .map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => ExecutionAdapterError::NotAttemptedBusy,
+            mpsc::error::TrySendError::Closed(_) => ExecutionAdapterError::ReconciliationRequired,
+        })?;
+    if let Some(fence) = reconciliation_fence {
+        fence
+            .require(sequence)
+            .map_err(|_| ExecutionAdapterError::ReconciliationRequired)?;
+    }
+    Ok(PreparedFinancialMutationAudit { permit, record })
+}
+
 #[cfg(test)]
 mod tests {
-    use market_squawk_domain::Timestamp;
+    use std::num::NonZeroU64;
+    use std::str::FromStr as _;
+
+    use market_squawk_domain::{AccountId, Currency, Money, Timestamp};
+    use market_squawk_execution::{
+        AccountBootstrap, AccountCoordinatorConfig, AccountIdempotencyBootstrap,
+        AccountRiskCoordinator, ExecutionAdapterError,
+    };
+    use rust_decimal::Decimal;
+    use tokio::sync::mpsc;
 
     use super::{
-        QueuedMarketFreshness, WORKER_ENVELOPE_RETAINED_BYTES, WorkerEnvelope, WorkerMarketUpdate,
-        queued_market_freshness,
+        PaperAuditKind, PaperAuditRecord, QueuedMarketFreshness, WORKER_ENVELOPE_RETAINED_BYTES,
+        WorkerEnvelope, WorkerMarketUpdate, prepare_financial_mutation, queued_market_freshness,
     };
 
     #[test]
@@ -1508,5 +1569,61 @@ mod tests {
             std::mem::size_of::<WorkerEnvelope>()
         );
         assert!(WORKER_ENVELOPE_RETAINED_BYTES > std::mem::size_of::<WorkerMarketUpdate>());
+    }
+
+    #[test]
+    fn saturated_audit_admission_never_advances_the_financial_fence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let usd = Currency::try_from("USD")?;
+        let account_id = AccountId::from_str("50000000-0000-0000-0000-000000000099")?;
+        let accounts = AccountRiskCoordinator::try_new(
+            AccountCoordinatorConfig::default(),
+            [AccountBootstrap {
+                account_id,
+                revision: NonZeroU64::MIN,
+                eligible: true,
+                cash: Money::new(Decimal::TEN, usd),
+                capital: Money::new(Decimal::TEN, usd),
+                peak_capital: Money::new(Decimal::TEN, usd),
+                gross_exposure: Money::new(Decimal::ZERO, usd),
+                realized_pnl: Money::new(Decimal::ZERO, usd),
+                realized_loss: Money::new(Decimal::ZERO, usd),
+                positions: Vec::new(),
+                position_cost_basis: Vec::new(),
+                idempotency: AccountIdempotencyBootstrap::empty(),
+            }],
+        )?;
+        let fence = accounts.reconciliation_fence();
+        let (sender, mut receiver) = mpsc::channel(1);
+        let record = PaperAuditRecord::new(
+            1,
+            None,
+            PaperAuditKind::MarketMarked,
+            None,
+            None,
+            Timestamp::from_unix_nanos(1),
+            None,
+            [1; 32],
+            [2; 32],
+        );
+        sender.try_send(record)?;
+
+        assert_eq!(
+            prepare_financial_mutation(&sender, Some(&fence), NonZeroU64::MIN, record)
+                .map(|prepared| prepared.commit()),
+            Err(ExecutionAdapterError::NotAttemptedBusy)
+        );
+        assert!(fence.is_current());
+
+        assert_eq!(receiver.try_recv(), Ok(record));
+        let prepared = prepare_financial_mutation(&sender, Some(&fence), NonZeroU64::MIN, record)?;
+        assert!(!fence.is_current());
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        prepared.commit();
+        assert_eq!(receiver.try_recv(), Ok(record));
+        Ok(())
     }
 }

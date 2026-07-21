@@ -546,7 +546,7 @@ pub struct ProductionPaperBotShutdown {
     source_and_live: Result<(), ProductionLiveSourceRuntimeError>,
     supervisor: PaperFinancialSupervisorShutdown,
     dispatcher_quiesce: ExecutionDispatcherQuiesce,
-    checkpoint: Result<(), ProductionPaperCheckpointError>,
+    checkpoint: Result<u64, ProductionPaperCheckpointError>,
     dispatcher: ExecutionDispatcherShutdown,
     paper: Result<PaperExecutionSnapshot, PaperControlError>,
     task_drain: ExecutionTaskDrain,
@@ -563,12 +563,14 @@ impl ProductionPaperBotShutdown {
                 self.dispatcher_quiesce,
                 ExecutionDispatcherQuiesce::Complete | ExecutionDispatcherQuiesce::AlreadyQuiesced
             )
-            && self.checkpoint.is_ok()
             && self.dispatcher == ExecutionDispatcherShutdown::Complete
-            && self
-                .paper
-                .as_ref()
-                .is_ok_and(PaperExecutionSnapshot::complete)
+            && self.paper.as_ref().is_ok_and(|paper| {
+                paper.complete()
+                    && self
+                        .checkpoint
+                        .as_ref()
+                        .is_ok_and(|sequence| *sequence == paper.sequence())
+            })
             && self.task_drain.is_complete()
     }
 
@@ -594,7 +596,7 @@ impl ProductionPaperBotShutdown {
         self.supervisor.reader_closed()
     }
 
-    pub const fn checkpoint(&self) -> &Result<(), ProductionPaperCheckpointError> {
+    pub const fn checkpoint(&self) -> &Result<u64, ProductionPaperCheckpointError> {
         &self.checkpoint
     }
 
@@ -712,6 +714,8 @@ pub enum ProductionPaperCheckpointError {
     UnsettledFinancialState,
     #[error("paper checkpoint bounded allocation failed")]
     Allocation,
+    #[error("persisted checkpoint sequence did not match the final paper checkpoint")]
+    FinalSequenceMismatch,
     #[error(transparent)]
     Control(#[from] PaperControlError),
     #[error(transparent)]
@@ -814,7 +818,7 @@ async fn persist_paper_checkpoint(
     paper: &PaperExecutionRuntime,
     repository: &mut PaperCheckpointRepository,
     timeout: Duration,
-) -> Result<(), ProductionPaperCheckpointError> {
+) -> Result<u64, ProductionPaperCheckpointError> {
     settle_paper_accounts(dispatcher, accounts.reconciliation_fence()).await?;
     let control = PaperControlContext::try_new(timeout, CancellationToken::new())?;
     let adapter = paper.adapter();
@@ -833,9 +837,13 @@ async fn persist_paper_checkpoint(
         ));
     }
     let receipt = repository.persist_with_replay(&checkpoint, &replay)?;
+    let persisted_sequence = receipt.sequence();
+    if persisted_sequence != checkpoint.sequence() {
+        return Err(ProductionPaperCheckpointError::FinalSequenceMismatch);
+    }
     let authority = dispatcher.persistence_acknowledgement()?;
     adapter.acknowledge_persistence(authority, receipt).await?;
-    Ok(())
+    Ok(persisted_sequence)
 }
 
 async fn settle_paper_accounts(

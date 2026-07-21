@@ -119,8 +119,8 @@ impl AccountRiskCoordinator {
                 accounts: HashMap::with_capacity(config.max_accounts_per_partition.get()),
             });
         }
-        for account in accounts {
-            validate_idempotency(&account.idempotency, config, now)?;
+        for mut account in accounts {
+            compact_recovered_idempotency(&mut account.idempotency, config, now)?;
             let account_id = account.state.account_id();
             let index = partition_index(account_id, config.partition_count.get());
             let partition = &mut partitions[index];
@@ -535,6 +535,11 @@ impl AccountState {
             monotonic_expiry,
         ));
 
+        let _publication = reconciliation
+            .try_begin_reservation_publication()
+            .map_err(|_| {
+                AccountReservationError::from_reason(AccountRiskViolation::ReconciliationRequired)
+            })?;
         if !reconciliation.is_current() {
             return Err(AccountReservationError::from_reason(
                 AccountRiskViolation::ReconciliationRequired,
@@ -926,6 +931,44 @@ fn validate_idempotency(
         return Err(AccountCoordinatorError::InvalidIdempotencyBootstrap);
     }
     Ok(())
+}
+
+fn compact_recovered_idempotency(
+    idempotency: &mut AccountIdempotencyBootstrap,
+    config: AccountCoordinatorConfig,
+    now: ClockReading,
+) -> Result<(), AccountCoordinatorError> {
+    let maximum_expiry = now
+        .wall
+        .checked_add_nanos(
+            i64::try_from(config.maximum_intent_lifetime_nanos.get())
+                .map_err(|_| AccountCoordinatorError::InvalidIdempotencyBootstrap)?,
+        )
+        .unwrap_or(Timestamp::from_unix_nanos(i64::MAX));
+    if idempotency.tombstones.len() > config.max_idempotency_keys_per_account.get()
+        || idempotency
+            .tombstones
+            .iter()
+            .any(|tombstone| tombstone.intent_expires_at > maximum_expiry)
+    {
+        return Err(AccountCoordinatorError::InvalidIdempotencyBootstrap);
+    }
+    if idempotency
+        .tombstones
+        .iter()
+        .any(|tombstone| now.wall > tombstone.intent_expires_at)
+    {
+        idempotency.revision = idempotency
+            .revision
+            .get()
+            .checked_add(1)
+            .and_then(NonZeroU64::new)
+            .ok_or(AccountCoordinatorError::InvalidIdempotencyBootstrap)?;
+        let mut tombstones = std::mem::take(&mut idempotency.tombstones).into_vec();
+        tombstones.retain(|tombstone| now.wall <= tombstone.intent_expires_at);
+        idempotency.tombstones = tombstones.into_boxed_slice();
+    }
+    validate_idempotency(idempotency, config, now)
 }
 
 fn partition_index(account_id: AccountId, partition_count: usize) -> usize {

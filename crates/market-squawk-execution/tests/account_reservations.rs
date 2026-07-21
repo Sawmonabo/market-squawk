@@ -17,7 +17,8 @@ use market_squawk_domain::{
 };
 use market_squawk_execution::{
     AccountBootstrap, AccountCoordinatorConfig, AccountIdempotencyBootstrap,
-    AccountRiskCoordinator, AccountRiskViolation, OrderIntent, OrderIntentInput, RiskLimits,
+    AccountIdempotencyTombstone, AccountRecoveryBootstrap, AccountRiskCoordinator,
+    AccountRiskViolation, OrderIntent, OrderIntentInput, ReconciledAccountState, RiskLimits,
     RiskLimitsInput,
 };
 use rust_decimal::Decimal;
@@ -303,6 +304,61 @@ fn newer_backend_sequence_fences_reservations_before_financial_reconciliation() 
         rejection.reasons(),
         &[AccountRiskViolation::ReconciliationRequired]
     );
+}
+
+#[test]
+fn recovery_compacts_tombstones_that_expired_during_downtime() {
+    let fixture = Fixture::new();
+    let account = fixture.account();
+    let state = ReconciledAccountState::try_new(
+        account.account_id,
+        account.revision,
+        account.eligible,
+        account.cash.currency(),
+        account.cash,
+        account.capital,
+        account.capital,
+        account.peak_capital,
+        account.gross_exposure,
+        Money::new(Decimal::ZERO, fixture.usd),
+        account
+            .peak_capital
+            .checked_sub(account.capital)
+            .unwrap_or_else(|error| panic!("fixture drawdown: {error}")),
+        [1; 32],
+        account.realized_pnl,
+        account.realized_loss,
+        account.positions,
+        account.position_cost_basis,
+    )
+    .unwrap_or_else(|error| panic!("fixture recovery state: {error}"));
+    let intent = fixture.intent(8, 1);
+    let expired_at = current_timestamp()
+        .checked_sub_nanos(1)
+        .unwrap_or_else(|error| panic!("fixture expired timestamp: {error}"));
+    let idempotency = AccountIdempotencyBootstrap::try_new(
+        NonZeroU64::new(7).unwrap_or_else(|| panic!("fixture revision is nonzero")),
+        vec![AccountIdempotencyTombstone::new(
+            intent.order_id(),
+            intent.client_order_id().clone(),
+            intent.digest(),
+            expired_at,
+        )],
+    )
+    .unwrap_or_else(|error| panic!("fixture replay fence: {error}"));
+
+    let coordinator = AccountRiskCoordinator::try_new_from_recovery(
+        AccountCoordinatorConfig::default(),
+        [AccountRecoveryBootstrap { state, idempotency }],
+        9,
+    )
+    .unwrap_or_else(|error| panic!("downtime expiry remains restartable: {error}"));
+    let compacted = coordinator
+        .snapshot_idempotency(fixture.account_id)
+        .unwrap_or_else(|error| panic!("snapshot compacted replay fence: {error}"));
+    assert_eq!(compacted.revision().get(), 8);
+    assert!(compacted.tombstones().is_empty());
+    assert_eq!(coordinator.reconciliation_fence().applied_sequence(), 9);
 }
 
 fn current_timestamp() -> Timestamp {

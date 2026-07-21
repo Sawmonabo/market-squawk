@@ -346,11 +346,26 @@ enum PendingReconciliationStatus {
     BackendAcknowledged,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingReconciliationScope {
+    TrackedOrders,
+    CompleteAccounts,
+}
+
+const fn reconciliation_scope(order_ids: &[OrderId]) -> PendingReconciliationScope {
+    if order_ids.is_empty() {
+        PendingReconciliationScope::CompleteAccounts
+    } else {
+        PendingReconciliationScope::TrackedOrders
+    }
+}
+
 #[derive(Debug)]
 struct PendingReconciliation {
     batch: ReconciliationBatchBinding,
     order_ids: Box<[OrderId]>,
     state: ExecutionState,
+    scope: PendingReconciliationScope,
     status: PendingReconciliationStatus,
     retained_bytes: usize,
 }
@@ -374,6 +389,7 @@ impl PendingReconciliation {
         let retained_bytes = Self::retained_bytes_for(&order_ids, &state)?;
         Ok(Self {
             batch,
+            scope: reconciliation_scope(&order_ids),
             order_ids,
             state,
             status: PendingReconciliationStatus::Ready,
@@ -643,4 +659,29 @@ pub enum ExecutionDispatcherQuiesce {
     AlreadyQuiesced,
     JoinError,
     Incomplete,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr as _;
+
+    use market_squawk_domain::OrderId;
+
+    use super::{PendingReconciliationScope, reconciliation_scope};
+
+    #[test]
+    fn only_complete_account_reconciliation_may_acknowledge_a_financial_sequence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tracked = OrderId::from_str("20000000-0000-0000-0000-000000000099")?;
+
+        assert_eq!(
+            reconciliation_scope(&[tracked]),
+            PendingReconciliationScope::TrackedOrders
+        );
+        assert_eq!(
+            reconciliation_scope(&[]),
+            PendingReconciliationScope::CompleteAccounts
+        );
+        Ok(())
+    }
 }

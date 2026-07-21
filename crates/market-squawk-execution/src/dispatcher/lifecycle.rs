@@ -10,7 +10,8 @@ use super::attempt::attempt_adapter_call;
 use super::{
     DispatchRecord, DispatchRegistry, DispatchState, ExecutionDispatchError, ExecutionDispatcher,
     ExecutionDispatcherQuiesce, ExecutionDispatcherShutdown, PendingReconciliation,
-    PendingReconciliationStatus, adapter_reason, commit_dispatch_audit, try_registry,
+    PendingReconciliationScope, PendingReconciliationStatus, adapter_reason, commit_dispatch_audit,
+    try_registry,
 };
 use crate::account::{AccountOutcomeFailSafe, AccountRiskReservation};
 use crate::audit::{ExecutionAuditContext, ExecutionAuditPermit};
@@ -613,9 +614,9 @@ impl ExecutionDispatcher {
                     return Err(ExecutionDispatchError::ReconciliationAcknowledgementPending);
                 }
                 PendingReconciliationStatus::BackendAcknowledged => {
-                    let state = finalize_pending_reconciliation(&mut registry)?;
+                    let (state, scope) = finalize_pending_reconciliation(&mut registry)?;
                     drop(registry);
-                    self.acknowledge_account_sequence(&state)?;
+                    self.acknowledge_account_sequence(&state, scope)?;
                     return Ok(state);
                 }
                 PendingReconciliationStatus::Ready => {}
@@ -669,9 +670,9 @@ impl ExecutionDispatcher {
                     return Err(ExecutionDispatchError::RegistryInvariant);
                 }
                 pending.status = PendingReconciliationStatus::BackendAcknowledged;
-                let state = finalize_pending_reconciliation(&mut registry)?;
+                let (state, scope) = finalize_pending_reconciliation(&mut registry)?;
                 drop(registry);
-                self.acknowledge_account_sequence(&state)?;
+                self.acknowledge_account_sequence(&state, scope)?;
                 Ok(state)
             }
         }
@@ -680,8 +681,11 @@ impl ExecutionDispatcher {
     fn acknowledge_account_sequence(
         &self,
         state: &ExecutionState,
+        scope: PendingReconciliationScope,
     ) -> Result<(), ExecutionDispatchError> {
-        if let Some(source) = state.source_binding() {
+        if scope == PendingReconciliationScope::CompleteAccounts
+            && let Some(source) = state.source_binding()
+        {
             self.accounts
                 .reconciliation_fence()
                 .acknowledge(source.snapshot_sequence())
@@ -797,7 +801,7 @@ fn restore_pending_acknowledgement(
 
 fn finalize_pending_reconciliation(
     registry: &mut DispatchRegistry,
-) -> Result<ExecutionState, ExecutionDispatchError> {
+) -> Result<(ExecutionState, PendingReconciliationScope), ExecutionDispatchError> {
     let Some(pending) = registry.pending_reconciliation.as_ref() else {
         return Err(ExecutionDispatchError::OrderNotTracked);
     };
@@ -812,7 +816,7 @@ fn finalize_pending_reconciliation(
         .take()
         .ok_or(ExecutionDispatchError::RegistryInvariant)?;
     registry.finalized_reconciliations.push(pending.batch);
-    Ok(pending.state)
+    Ok((pending.state, pending.scope))
 }
 
 fn restore_or_reconcile(

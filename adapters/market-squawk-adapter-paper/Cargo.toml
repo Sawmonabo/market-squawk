@@ -13,6 +13,7 @@ cap-fs-ext.workspace = true
 cap-std.workspace = true
 chrono-tz.workspace = true
 getrandom.workspace = true
+fs2.workspace = true
 libc.workspace = true
 market-squawk-domain.workspace = true
 market-squawk-execution.workspace = true

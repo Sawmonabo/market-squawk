@@ -4,8 +4,9 @@ use std::io::{Read as _, Write as _};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
 
-use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
+use cap_fs_ext::{FollowSymlinks, MetadataExt as _, OpenOptionsFollowExt as _};
 use cap_std::fs::{Dir, OpenOptions};
+use fs2::FileExt as _;
 use market_squawk_domain::{
     AccountId, ClientOrderId, Currency, InstrumentId, Money, OrderId, Timestamp,
 };
@@ -23,6 +24,7 @@ use crate::{PaperCheckpointError, PaperExecutionCheckpoint, PaperExecutionConfig
 
 const CHECKPOINT_OBJECT_ROOT: &str = "paper-checkpoints/v1";
 const CURRENT_MANIFEST_PATH: &str = "paper-checkpoints/v1/current.json";
+const REPOSITORY_LOCK_PATH: &str = ".market-squawk-paper-checkpoints.lock";
 const MANIFEST_SCHEMA_VERSION: u32 = 1;
 
 /// Single-writer durable publisher bound to one artifact root and paper configuration.
@@ -34,6 +36,7 @@ pub struct PaperCheckpointRepository {
     repository_id: [u8; 32],
     generation: u64,
     recovery: Option<PaperCheckpointRecovery>,
+    _writer_lock: std::fs::File,
 }
 
 impl PaperCheckpointRepository {
@@ -43,8 +46,9 @@ impl PaperCheckpointRepository {
         config: PaperExecutionConfig,
         maximum_bytes: NonZeroUsize,
     ) -> Result<Self, PaperCheckpointRepositoryError> {
-        drop(root.try_clone_directory()?);
         let directory = root.try_clone_directory()?;
+        let writer_lock = acquire_repository_writer(&directory)?;
+        cleanup_stale_staging(&directory)?;
         if let Some(recovered) = read_current_manifest(&directory, &config, maximum_bytes.get())? {
             return Ok(Self {
                 root,
@@ -56,6 +60,7 @@ impl PaperCheckpointRepository {
                     checkpoint: recovered.checkpoint,
                     accounts: recovered.accounts,
                 }),
+                _writer_lock: writer_lock,
             });
         }
         let mut nonce = [0_u8; 32];
@@ -76,20 +81,13 @@ impl PaperCheckpointRepository {
             repository_id,
             generation: 0,
             recovery: None,
+            _writer_lock: writer_lock,
         })
     }
 
     /// Transfers the exact current checkpoint and replay fence discovered at repository open.
     pub fn take_recovery(&mut self) -> Option<PaperCheckpointRecovery> {
         self.recovery.take()
-    }
-
-    /// Publishes, synchronizes, reopens, and fully validates one immutable checkpoint.
-    pub fn persist(
-        &mut self,
-        checkpoint: &PaperExecutionCheckpoint,
-    ) -> Result<PaperCheckpointReceipt, PaperCheckpointRepositoryError> {
-        self.persist_with_replay(checkpoint, &[])
     }
 
     /// Atomically advances the fixed current manifest with one exact checkpoint and replay image.
@@ -124,6 +122,8 @@ impl PaperCheckpointRepository {
         {
             return Err(PaperCheckpointRepositoryError::ConfigurationMismatch);
         }
+        let directory = self.root.try_clone_directory()?;
+        self.validate_current_authority(&directory)?;
         let generation = self
             .generation
             .checked_add(1)
@@ -135,15 +135,18 @@ impl PaperCheckpointRepository {
         let recovery_digest = checkpoint.recovery_input_digest()?;
         let digest_hex = hex_bytes(&artifact_digest)?;
         let repository_hex = hex_bytes(&self.repository_id)?;
+        let stage_nonce = random_hex()?;
         let parent = format!("{CHECKPOINT_OBJECT_ROOT}/{}", &digest_hex[..2]);
         let artifact_reference = format!("{parent}/{digest_hex}.json");
-        let staging_reference = format!("{parent}/stage-{repository_hex}-{}.tmp", generation.get());
+        let staging_reference = format!(
+            "{parent}/stage-{repository_hex}-{}-{stage_nonce}.tmp",
+            generation.get()
+        );
         let artifact_path = Path::new(&artifact_reference);
         let staging_path = Path::new(&staging_reference);
         drop(self.root.resolve(artifact_path)?);
         drop(self.root.resolve(staging_path)?);
 
-        let directory = self.root.try_clone_directory()?;
         directory
             .create_dir_all(&parent)
             .map_err(|source| io_error("create paper checkpoint object directory", source))?;
@@ -224,6 +227,34 @@ impl PaperCheckpointRepository {
             artifact_digest,
             artifact_reference: artifact_reference.into_boxed_str(),
         })
+    }
+
+    fn validate_current_authority(
+        &self,
+        directory: &Dir,
+    ) -> Result<(), PaperCheckpointRepositoryError> {
+        if self.generation == 0 {
+            match directory.symlink_metadata(CURRENT_MANIFEST_PATH) {
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(source) => {
+                    return Err(io_error(
+                        "inspect current paper checkpoint authority",
+                        source,
+                    ));
+                }
+                Ok(_) => {}
+            }
+        }
+        match read_current_manifest(directory, &self.config, self.maximum_bytes.get())? {
+            Some(current)
+                if current.repository_id == self.repository_id
+                    && current.generation.get() == self.generation =>
+            {
+                Ok(())
+            }
+            None => Err(PaperCheckpointRepositoryError::AuthorityChanged),
+            _ => Err(PaperCheckpointRepositoryError::AuthorityChanged),
+        }
     }
 }
 
@@ -380,13 +411,12 @@ impl CurrentManifestWire {
         account_replay: &[PaperAccountReplaySnapshot],
     ) -> Result<Self, PaperCheckpointRepositoryError> {
         let states = checkpoint.reconciled_accounts_for_recovery()?;
-        if !account_replay.is_empty()
-            && (account_replay.len() != states.len()
-                || account_replay.iter().any(|snapshot| {
-                    !states
-                        .iter()
-                        .any(|state| state.account_id() == snapshot.account_id)
-                }))
+        if account_replay.len() != states.len()
+            || account_replay.iter().any(|snapshot| {
+                !states
+                    .iter()
+                    .any(|state| state.account_id() == snapshot.account_id)
+            })
         {
             return Err(PaperCheckpointRepositoryError::InvalidReplay);
         }
@@ -397,14 +427,10 @@ impl CurrentManifestWire {
         for state in states {
             let snapshot = account_replay
                 .iter()
-                .find(|snapshot| snapshot.account_id == state.account_id());
-            let idempotency = snapshot
-                .map_or_else(AccountIdempotencyBootstrap::empty, |snapshot| {
-                    snapshot.idempotency.clone()
-                });
-            let recovery_state = snapshot
-                .and_then(|snapshot| snapshot.state.clone())
-                .unwrap_or_else(|| state.clone());
+                .find(|snapshot| snapshot.account_id == state.account_id())
+                .ok_or(PaperCheckpointRepositoryError::InvalidReplay)?;
+            let idempotency = snapshot.idempotency.clone();
+            let recovery_state = snapshot.state.clone().unwrap_or_else(|| state.clone());
             if !same_financial_state(&recovery_state, &state) {
                 return Err(PaperCheckpointRepositoryError::InvalidReplay);
             }
@@ -629,9 +655,10 @@ fn publish_current_manifest(
     serde_json::to_writer(&mut output, manifest)
         .map_err(PaperCheckpointRepositoryError::ManifestEncoding)?;
     let bytes = output.into_inner();
+    let stage_nonce = random_hex()?;
     let staging_reference = format!(
-        "{CHECKPOINT_OBJECT_ROOT}/current-stage-{repository_hex}-{}.tmp",
-        generation.get()
+        "{CHECKPOINT_OBJECT_ROOT}/current-stage-{repository_hex}-{}-{stage_nonce}.tmp",
+        generation.get(),
     );
     let staging_path = Path::new(&staging_reference);
     let current_path = Path::new(CURRENT_MANIFEST_PATH);
@@ -669,6 +696,190 @@ fn publish_current_manifest(
         return Err(PaperCheckpointRepositoryError::VerificationFailed);
     }
     Ok(())
+}
+
+fn acquire_repository_writer(
+    directory: &Dir,
+) -> Result<std::fs::File, PaperCheckpointRepositoryError> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    options.follow(FollowSymlinks::No);
+    configure_private_creation(&mut options);
+    let lock = directory
+        .open_with(REPOSITORY_LOCK_PATH, &options)
+        .map_err(|source| io_error("open paper checkpoint repository lock", source))?;
+    let metadata = lock
+        .metadata()
+        .map_err(|source| io_error("inspect paper checkpoint repository lock", source))?;
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        return Err(PaperCheckpointRepositoryError::UnsafeArtifact);
+    }
+    let lock = lock.into_std();
+    lock.try_lock_exclusive().map_err(|source| {
+        if is_lock_contended(&source) {
+            PaperCheckpointRepositoryError::RepositoryAlreadyOwned
+        } else {
+            io_error("acquire paper checkpoint repository lock", source)
+        }
+    })?;
+    Ok(lock)
+}
+
+fn cleanup_stale_staging(directory: &Dir) -> Result<(), PaperCheckpointRepositoryError> {
+    match directory.symlink_metadata(CHECKPOINT_OBJECT_ROOT) {
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => return Err(io_error("inspect paper checkpoint namespace", source)),
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => return Err(PaperCheckpointRepositoryError::UnsafeArtifact),
+    }
+    let mut changed = false;
+    for entry in directory
+        .read_dir(CHECKPOINT_OBJECT_ROOT)
+        .map_err(|source| io_error("scan paper checkpoint staging namespace", source))?
+    {
+        let entry =
+            entry.map_err(|source| io_error("read paper checkpoint staging entry", source))?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| PaperCheckpointRepositoryError::UnsafeArtifact)?;
+        let file_type = entry
+            .file_type()
+            .map_err(|source| io_error("inspect paper checkpoint staging entry", source))?;
+        let reference = format!("{CHECKPOINT_OBJECT_ROOT}/{name}");
+        if is_current_stage_name(&name) {
+            if !file_type.is_file() {
+                return Err(PaperCheckpointRepositoryError::UnsafeArtifact);
+            }
+            directory
+                .remove_file(&reference)
+                .map_err(|source| io_error("remove stale current-manifest stage", source))?;
+            changed = true;
+            continue;
+        }
+        if !is_lower_hex(&name, 2) || !file_type.is_dir() {
+            continue;
+        }
+        for object in directory
+            .read_dir(&reference)
+            .map_err(|source| io_error("scan paper checkpoint object stages", source))?
+        {
+            let object =
+                object.map_err(|source| io_error("read paper checkpoint object stage", source))?;
+            let object_name = object
+                .file_name()
+                .into_string()
+                .map_err(|_| PaperCheckpointRepositoryError::UnsafeArtifact)?;
+            if !is_object_stage_name(&object_name) {
+                continue;
+            }
+            if !object
+                .file_type()
+                .map_err(|source| io_error("inspect paper checkpoint object stage", source))?
+                .is_file()
+            {
+                return Err(PaperCheckpointRepositoryError::UnsafeArtifact);
+            }
+            directory
+                .remove_file(format!("{reference}/{object_name}"))
+                .map_err(|source| io_error("remove stale checkpoint object stage", source))?;
+            changed = true;
+        }
+        if directory
+            .read_dir(&reference)
+            .map_err(|source| io_error("rescan paper checkpoint object shard", source))?
+            .next()
+            .transpose()
+            .map_err(|source| io_error("inspect paper checkpoint object shard", source))?
+            .is_none()
+        {
+            directory
+                .remove_dir(&reference)
+                .map_err(|source| io_error("remove empty paper checkpoint object shard", source))?;
+            changed = true;
+        }
+    }
+    if directory
+        .read_dir(CHECKPOINT_OBJECT_ROOT)
+        .map_err(|source| io_error("rescan paper checkpoint namespace", source))?
+        .next()
+        .transpose()
+        .map_err(|source| io_error("inspect paper checkpoint namespace", source))?
+        .is_none()
+    {
+        directory
+            .remove_dir(CHECKPOINT_OBJECT_ROOT)
+            .map_err(|source| io_error("remove empty paper checkpoint namespace", source))?;
+        if directory
+            .read_dir("paper-checkpoints")
+            .map_err(|source| io_error("inspect paper checkpoint root", source))?
+            .next()
+            .transpose()
+            .map_err(|source| io_error("read paper checkpoint root", source))?
+            .is_none()
+        {
+            directory
+                .remove_dir("paper-checkpoints")
+                .map_err(|source| io_error("remove empty paper checkpoint root", source))?;
+        }
+        changed = true;
+    }
+    if changed {
+        directory
+            .try_clone()
+            .map(Dir::into_std_file)
+            .and_then(|root| root.sync_all())
+            .map_err(|source| io_error("synchronize stale-stage cleanup", source))?;
+    }
+    Ok(())
+}
+
+fn is_current_stage_name(name: &str) -> bool {
+    name.strip_prefix("current-stage-")
+        .is_some_and(is_stage_suffix)
+}
+
+fn is_object_stage_name(name: &str) -> bool {
+    name.strip_prefix("stage-").is_some_and(is_stage_suffix)
+}
+
+fn is_stage_suffix(suffix: &str) -> bool {
+    let Some(suffix) = suffix.strip_suffix(".tmp") else {
+        return false;
+    };
+    let mut parts = suffix.split('-');
+    let Some(repository) = parts.next() else {
+        return false;
+    };
+    let Some(generation) = parts.next() else {
+        return false;
+    };
+    let nonce = parts.next();
+    is_lower_hex(repository, 64)
+        && generation.parse::<u64>().is_ok_and(|value| value != 0)
+        && nonce.is_none_or(|value| is_lower_hex(value, 64))
+        && parts.next().is_none()
+}
+
+fn is_lower_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn random_hex() -> Result<String, PaperCheckpointRepositoryError> {
+    let mut nonce = [0_u8; 32];
+    getrandom::fill(&mut nonce).map_err(|_| PaperCheckpointRepositoryError::RandomUnavailable)?;
+    hex_bytes(&nonce)
+}
+
+fn is_lock_contended(source: &std::io::Error) -> bool {
+    let expected = fs2::lock_contended_error();
+    match (source.raw_os_error(), expected.raw_os_error()) {
+        (Some(actual), Some(expected)) => actual == expected,
+        _ => source.kind() == expected.kind(),
+    }
 }
 
 struct BoundedRepositoryWriter {
@@ -797,6 +1008,10 @@ pub enum PaperCheckpointRepositoryError {
     RandomUnavailable,
     #[error("paper checkpoint repository generation is exhausted")]
     GenerationExhausted,
+    #[error("paper checkpoint repository is already owned by another writer")]
+    RepositoryAlreadyOwned,
+    #[error("paper checkpoint current authority changed while the writer was active")]
+    AuthorityChanged,
     #[error("paper checkpoint configuration does not match the bound repository")]
     ConfigurationMismatch,
     #[error("paper checkpoint repository bounded allocation failed")]
@@ -1030,16 +1245,22 @@ mod tests {
     use std::time::Duration;
 
     use market_squawk_domain::{
-        AccountId, Currency, Money, RuleVersion, SourceIdentifier, Timestamp, VenueId,
+        AccountId, ClientOrderId, Currency, Money, OrderId, RuleVersion, SourceIdentifier,
+        Timestamp, VenueId,
     };
-    use market_squawk_execution::{AccountIdempotencyBootstrap, ReconciledAccountState};
+    use market_squawk_execution::{
+        AccountIdempotencyBootstrap, AccountIdempotencyTombstone, OrderIntentDigest,
+        ReconciledAccountState,
+    };
     use market_squawk_platform::LocalPaths;
     use rust_decimal::Decimal;
+    use sha2::{Digest, Sha256};
     use static_assertions::assert_not_impl_any;
 
     use super::{
-        PaperAccountReplaySnapshot, PaperCheckpointPublicationPoint, PaperCheckpointReceipt,
-        PaperCheckpointRepository, PaperCheckpointRepositoryError, read_bounded_regular,
+        CHECKPOINT_OBJECT_ROOT, PaperAccountReplaySnapshot, PaperCheckpointPublicationPoint,
+        PaperCheckpointReceipt, PaperCheckpointRepository, PaperCheckpointRepositoryError,
+        hex_bytes, read_bounded_regular,
     };
     use crate::{
         FeeSchedule, PaperAccountBootstrap, PaperExecutionCheckpoint, PaperExecutionConfig,
@@ -1078,17 +1299,19 @@ mod tests {
                 config,
                 NonZeroUsize::new(1024 * 1024).ok_or("zero checkpoint bound")?,
             )?;
+            let replay = exact_empty_replay(&checkpoint)?;
 
-            let interrupted = repository.persist_with_checkpoint(&checkpoint, &[], |observed| {
-                if observed == interrupted_at {
-                    Err(PaperCheckpointRepositoryError::TestInterruption)
-                } else {
-                    Ok(())
-                }
-            });
+            let interrupted =
+                repository.persist_with_checkpoint(&checkpoint, &replay, |observed| {
+                    if observed == interrupted_at {
+                        Err(PaperCheckpointRepositoryError::TestInterruption)
+                    } else {
+                        Ok(())
+                    }
+                });
             assert!(interrupted.is_err());
 
-            let receipt = repository.persist(&checkpoint)?;
+            let receipt = repository.persist_with_replay(&checkpoint, &replay)?;
             assert_eq!(
                 receipt.configuration_digest(),
                 checkpoint.configuration_digest()
@@ -1103,7 +1326,7 @@ mod tests {
                     .is_file()
             );
 
-            let recovered = repository.persist(&checkpoint)?;
+            let recovered = repository.persist_with_replay(&checkpoint, &replay)?;
             assert_eq!(recovered.artifact_digest(), receipt.artifact_digest());
             assert_eq!(recovered.artifact_reference(), receipt.artifact_reference());
         }
@@ -1121,16 +1344,122 @@ mod tests {
             config.clone(),
             maximum_bytes,
         )?;
-        let receipt = repository.persist(&checkpoint)?;
+        let replay = exact_empty_replay(&checkpoint)?;
+        let receipt = repository.persist_with_replay(&checkpoint, &replay)?;
         std::fs::write(
             paths.artifacts()?.root().join(receipt.artifact_reference()),
             b"conflicting checkpoint bytes",
         )?;
+        drop(repository);
 
         assert!(matches!(
             PaperCheckpointRepository::try_new(paths.artifacts()?.clone(), config, maximum_bytes),
             Err(PaperCheckpointRepositoryError::VerificationFailed)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn repository_writer_is_exclusively_owned_for_its_full_lifetime() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let paths = LocalPaths::prepare(directory.path().join("data"))?;
+        let (config, _) = checkpoint_fixture()?;
+        let maximum_bytes = NonZeroUsize::new(1024 * 1024).ok_or("zero checkpoint bound")?;
+        let repository = PaperCheckpointRepository::try_new(
+            paths.artifacts()?.clone(),
+            config.clone(),
+            maximum_bytes,
+        )?;
+
+        assert!(matches!(
+            PaperCheckpointRepository::try_new(
+                paths.artifacts()?.clone(),
+                config.clone(),
+                maximum_bytes,
+            ),
+            Err(PaperCheckpointRepositoryError::RepositoryAlreadyOwned)
+        ));
+
+        drop(repository);
+        let _reopened =
+            PaperCheckpointRepository::try_new(paths.artifacts()?.clone(), config, maximum_bytes)?;
+        Ok(())
+    }
+
+    #[test]
+    fn crash_residue_cannot_wedge_the_next_checkpoint_publication() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let paths = LocalPaths::prepare(directory.path().join("data"))?;
+        let (config, checkpoint) = checkpoint_fixture()?;
+        let maximum_bytes = NonZeroUsize::new(1024 * 1024).ok_or("zero checkpoint bound")?;
+        let repository = PaperCheckpointRepository::try_new(
+            paths.artifacts()?.clone(),
+            config.clone(),
+            maximum_bytes,
+        )?;
+        let bytes = checkpoint.encode(maximum_bytes.get())?;
+        let digest: [u8; 32] = Sha256::digest(bytes).into();
+        let digest_hex = hex_bytes(&digest)?;
+        let repository_hex = hex_bytes(&repository.binding_identity())?;
+        let parent = format!("{CHECKPOINT_OBJECT_ROOT}/{}", &digest_hex[..2]);
+        let stale = format!("{parent}/stage-{repository_hex}-1.tmp");
+        let stale_current =
+            format!("{CHECKPOINT_OBJECT_ROOT}/current-stage-{repository_hex}-1.tmp");
+        std::fs::create_dir_all(paths.artifacts()?.root().join(&parent))?;
+        std::fs::write(paths.artifacts()?.root().join(&stale), b"crash residue")?;
+        std::fs::write(
+            paths.artifacts()?.root().join(&stale_current),
+            b"current crash residue",
+        )?;
+        drop(repository);
+
+        let mut reopened =
+            PaperCheckpointRepository::try_new(paths.artifacts()?.clone(), config, maximum_bytes)?;
+        assert!(!paths.artifacts()?.root().join(&stale).exists());
+        assert!(!paths.artifacts()?.root().join(&stale_current).exists());
+        let replay = exact_empty_replay(&checkpoint)?;
+        let receipt = reopened.persist_with_replay(&checkpoint, &replay)?;
+        assert_eq!(receipt.sequence(), checkpoint.sequence());
+        Ok(())
+    }
+
+    #[test]
+    fn every_manifest_advance_preserves_the_explicit_replay_image() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let paths = LocalPaths::prepare(directory.path().join("data"))?;
+        let (config, checkpoint) = checkpoint_fixture()?;
+        let maximum_bytes = NonZeroUsize::new(1024 * 1024).ok_or("zero checkpoint bound")?;
+        let mut repository = PaperCheckpointRepository::try_new(
+            paths.artifacts()?.clone(),
+            config.clone(),
+            maximum_bytes,
+        )?;
+        let state = checkpoint.reconciled_accounts_for_recovery()?[0].clone();
+        let replay = [PaperAccountReplaySnapshot::from_reconciled_state(
+            state,
+            AccountIdempotencyBootstrap::try_new(
+                NonZeroU64::new(7).ok_or("zero replay revision")?,
+                vec![AccountIdempotencyTombstone::new(
+                    OrderId::from_str("20000000-0000-0000-0000-000000000077")?,
+                    ClientOrderId::try_from("persisted-client-77")?,
+                    OrderIntentDigest::from_bytes([7; 32]),
+                    Timestamp::from_unix_nanos(i64::MAX),
+                )],
+            )?,
+        )];
+
+        repository.persist_with_replay(&checkpoint, &replay)?;
+        repository.persist_with_replay(&checkpoint, &replay)?;
+        drop(repository);
+
+        let mut reopened =
+            PaperCheckpointRepository::try_new(paths.artifacts()?.clone(), config, maximum_bytes)?;
+        let recovered = reopened.take_recovery().ok_or("missing recovery")?;
+        assert_eq!(recovered.accounts().len(), replay.len());
+        assert_eq!(
+            recovered.accounts()[0].idempotency(),
+            replay[0].idempotency()
+        );
         Ok(())
     }
 
@@ -1146,8 +1475,10 @@ mod tests {
             config.clone(),
             maximum_bytes,
         )?;
-        let first = repository.persist(&checkpoint)?;
-        checkpoint.accepted_repository_id = repository.binding_identity();
+        let first_replay = exact_empty_replay(&checkpoint)?;
+        let first = repository.persist_with_replay(&checkpoint, &first_replay)?;
+        let repository_id = repository.binding_identity();
+        checkpoint.accepted_repository_id = repository_id;
         checkpoint.accepted_repository_generation = first.generation().get();
         let recovered = PaperExecutionCheckpoint::decode(
             config.clone(),
@@ -1181,15 +1512,16 @@ mod tests {
             AccountIdempotencyBootstrap::empty(),
         )];
         let second = repository.persist_with_replay(&recovered, &replay)?;
+        drop(repository);
         let mut reopened = PaperCheckpointRepository::try_new(
             paths.artifacts()?.clone(),
             config.clone(),
             maximum_bytes,
         )?;
         let current = reopened.take_recovery().ok_or("missing current recovery")?;
-        assert_eq!(reopened.binding_identity(), repository.binding_identity());
+        assert_eq!(reopened.binding_identity(), repository_id);
         let mut expected_current = recovered.clone();
-        expected_current.bind_current_manifest(repository.binding_identity(), second.generation());
+        expected_current.bind_current_manifest(repository_id, second.generation());
         assert_eq!(current.checkpoint(), &expected_current);
         assert_eq!(current.accounts().len(), 1);
         assert_eq!(current.accounts()[0].state(), &risk_state);
@@ -1202,22 +1534,22 @@ mod tests {
             config,
             maximum_bytes,
         )?;
-        let wrong_root = alternate.persist(&recovered)?;
+        let wrong_root = alternate.persist_with_replay(&recovered, &replay)?;
 
         assert!(!crate::worker::receipt_authority_is_current(
-            repository.binding_identity(),
+            repository_id,
             recovered.accepted_repository_id,
             recovered.accepted_repository_generation,
             &first,
         ));
         assert!(crate::worker::receipt_authority_is_current(
-            repository.binding_identity(),
+            repository_id,
             recovered.accepted_repository_id,
             recovered.accepted_repository_generation,
             &second,
         ));
         assert!(!crate::worker::receipt_authority_is_current(
-            repository.binding_identity(),
+            repository_id,
             recovered.accepted_repository_id,
             recovered.accepted_repository_generation,
             &wrong_root,
@@ -1324,6 +1656,21 @@ mod tests {
             idempotency: BTreeMap::new(),
         };
         Ok((config, checkpoint))
+    }
+
+    fn exact_empty_replay(
+        checkpoint: &PaperExecutionCheckpoint,
+    ) -> TestResultWith<Vec<PaperAccountReplaySnapshot>> {
+        Ok(checkpoint
+            .reconciled_accounts_for_recovery()?
+            .into_iter()
+            .map(|state| {
+                PaperAccountReplaySnapshot::from_reconciled_state(
+                    state,
+                    AccountIdempotencyBootstrap::empty(),
+                )
+            })
+            .collect())
     }
 
     type TestResultWith<T> = Result<T, Box<dyn std::error::Error>>;

@@ -485,7 +485,10 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
     let cancel = dispatcher.cancel(order_ids[4]).await?;
     assert_eq!(cancel.status(), CancelStatus::Pending);
     let active_checkpoint = paper_adapter.checkpoint(paper_control()?).await?;
-    let active_receipt = checkpoint_repository.persist(&active_checkpoint)?;
+    let active_replay = explicit_replay(&accounts, account_id)?;
+    let active_receipt =
+        checkpoint_repository.persist_with_replay(&active_checkpoint, &active_replay)?;
+    drop(checkpoint_repository);
     let mut reopened_repository = PaperCheckpointRepository::try_new(
         checkpoint_paths.artifacts()?.clone(),
         paper_config.clone(),
@@ -518,8 +521,11 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
         .checkpoint(paper_control()?)
         .await?;
     assert!(!terminal_recovery.has_nonterminal_orders());
-    let terminal_receipt = reopened_repository.persist(&terminal_recovery)?;
+    let terminal_replay = explicit_replay(&accounts, account_id)?;
+    let terminal_receipt =
+        reopened_repository.persist_with_replay(&terminal_recovery, &terminal_replay)?;
     assert!(recovered_paper.shutdown(paper_control()?).await?.complete());
+    drop(reopened_repository);
     let mut terminal_repository = PaperCheckpointRepository::try_new(
         checkpoint_paths.artifacts()?.clone(),
         paper_config.clone(),
@@ -600,7 +606,9 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
         market_squawk_adapter_paper::PaperOrderState::Filled
     );
     let durable_checkpoint = paper_adapter.checkpoint(paper_control()?).await?;
-    let persistence = checkpoint_repository.persist(&durable_checkpoint)?;
+    let durable_replay = explicit_replay(&accounts, account_id)?;
+    let persistence =
+        checkpoint_repository.persist_with_replay(&durable_checkpoint, &durable_replay)?;
     let persistence_authority = dispatcher.persistence_acknowledgement()?;
     paper_adapter
         .acknowledge_persistence(persistence_authority, persistence)
@@ -704,7 +712,9 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
             .map(Vec::len),
         Some(1)
     );
-    let persistence = checkpoint_repository.persist(&finalized_checkpoint)?;
+    let finalized_replay = explicit_replay(&accounts, account_id)?;
+    let persistence =
+        checkpoint_repository.persist_with_replay(&finalized_checkpoint, &finalized_replay)?;
     let persistence_authority = dispatcher.persistence_acknowledgement()?;
     let stale_persistence_authority = dispatcher.persistence_acknowledgement()?;
     paper_adapter
@@ -721,7 +731,9 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
     let stale_checkpoint = stale_adapter.checkpoint(paper_control()?).await?;
     let stale_bytes = stale_checkpoint.encode(1024 * 1024)?;
     let stale_value: serde_json::Value = serde_json::from_slice(&stale_bytes)?;
-    let stale_evidence = checkpoint_repository.persist(&stale_checkpoint)?;
+    let stale_replay = explicit_replay(&accounts, account_id)?;
+    let stale_evidence =
+        checkpoint_repository.persist_with_replay(&stale_checkpoint, &stale_replay)?;
     assert!(matches!(
         stale_adapter
             .acknowledge_persistence(stale_persistence_authority, stale_evidence)
@@ -1089,4 +1101,17 @@ async fn assert_accepted(
     accepted
         .execution_identity_digest()
         .ok_or_else(|| std::io::Error::other("accepted audit omitted execution identity").into())
+}
+
+fn explicit_replay(
+    accounts: &AccountRiskCoordinator,
+    account_id: AccountId,
+) -> Result<[market_squawk_adapter_paper::PaperAccountReplaySnapshot; 1], Box<dyn std::error::Error>>
+{
+    Ok([
+        market_squawk_adapter_paper::PaperAccountReplaySnapshot::new(
+            account_id,
+            accounts.snapshot_idempotency(account_id)?,
+        ),
+    ])
 }

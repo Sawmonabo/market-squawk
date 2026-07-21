@@ -99,10 +99,11 @@ async fn run_supervisor(
         }
         while !fence.is_current() {
             let result = match dispatcher.reconcile().await {
-                Err(ExecutionDispatchError::OrderNotTracked) => {
+                Ok(state) if fence.is_current() => Ok(state),
+                Ok(_) | Err(ExecutionDispatchError::OrderNotTracked) => {
                     dispatcher.reconcile_accounts().await
                 }
-                other => other,
+                Err(error) => Err(error),
             };
             match result {
                 Ok(_) => last_error = None,

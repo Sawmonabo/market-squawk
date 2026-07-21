@@ -2,7 +2,7 @@
 
 use std::num::NonZeroU64;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use thiserror::Error;
 
@@ -19,6 +19,13 @@ pub struct AccountRiskReconciliationFence {
 struct AccountRiskReconciliationState {
     required_sequence: AtomicU64,
     applied_sequence: AtomicU64,
+    publication_owned: AtomicBool,
+}
+
+/// Try-only linearization guard shared by reservation publication and backend financial fencing.
+#[derive(Debug)]
+pub(crate) struct AccountReservationPublication {
+    state: Arc<AccountRiskReconciliationState>,
 }
 
 impl AccountRiskReconciliationFence {
@@ -27,8 +34,21 @@ impl AccountRiskReconciliationFence {
             state: Arc::new(AccountRiskReconciliationState {
                 required_sequence: AtomicU64::new(applied_sequence),
                 applied_sequence: AtomicU64::new(applied_sequence),
+                publication_owned: AtomicBool::new(false),
             }),
         }
+    }
+
+    pub(crate) fn try_begin_reservation_publication(
+        &self,
+    ) -> Result<AccountReservationPublication, AccountReconciliationFenceError> {
+        self.state
+            .publication_owned
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| AccountReconciliationFenceError::PublicationBusy)?;
+        Ok(AccountReservationPublication {
+            state: Arc::clone(&self.state),
+        })
     }
 
     /// Fences subsequent account reservations before the backend commits this sequence.
@@ -36,6 +56,7 @@ impl AccountRiskReconciliationFence {
     /// Duplicate/coalesced notifications are accepted. A sequence already superseded by an
     /// applied reconciliation is rejected as backend rollback.
     pub fn require(&self, sequence: NonZeroU64) -> Result<(), AccountReconciliationFenceError> {
+        let _publication = self.try_begin_reservation_publication()?;
         let sequence = sequence.get();
         if sequence <= self.state.applied_sequence.load(Ordering::Acquire) {
             return Err(AccountReconciliationFenceError::SequenceRollback);
@@ -80,6 +101,12 @@ impl AccountRiskReconciliationFence {
     }
 }
 
+impl Drop for AccountReservationPublication {
+    fn drop(&mut self) {
+        self.state.publication_owned.store(false, Ordering::Release);
+    }
+}
+
 /// Invalid backend financial sequence transition.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum AccountReconciliationFenceError {
@@ -87,4 +114,46 @@ pub enum AccountReconciliationFenceError {
     SequenceRollback,
     #[error("reconciled backend sequence does not match the required risk fence")]
     SequenceMismatch,
+    #[error("account reservation publication is currently being committed")]
+    PublicationBusy,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroU64;
+    use std::sync::{Arc, Barrier, mpsc};
+
+    use super::{AccountReconciliationFenceError, AccountRiskReconciliationFence};
+
+    #[test]
+    fn financial_fence_cannot_cross_an_inflight_reservation_publication()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fence = AccountRiskReconciliationFence::new(0);
+        let publication = fence.try_begin_reservation_publication()?;
+        let start = Arc::new(Barrier::new(2));
+        let (result_sender, result_receiver) = mpsc::channel();
+        let worker_fence = fence.clone();
+        let worker_start = Arc::clone(&start);
+        let worker = std::thread::spawn(move || {
+            worker_start.wait();
+            let result = worker_fence.require(NonZeroU64::MIN);
+            let _ignored = result_sender.send(result);
+        });
+
+        start.wait();
+        let result = result_receiver.recv()?;
+        assert_eq!(
+            result,
+            Err(AccountReconciliationFenceError::PublicationBusy)
+        );
+        assert!(fence.is_current());
+
+        drop(publication);
+        worker
+            .join()
+            .map_err(|_| std::io::Error::other("fence worker panicked"))?;
+        fence.require(NonZeroU64::MIN)?;
+        assert!(!fence.is_current());
+        Ok(())
+    }
 }
