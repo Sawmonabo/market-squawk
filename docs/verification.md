@@ -52,12 +52,19 @@ miscompilation:
 ```
 
 That entry point runs focused behavioral support tests, workspace inheritance and repository-input
-hygiene checks, workspace formatting, strict all-target/all-feature Clippy, the locked all-target/
-all-feature workspace suite, locked all-feature doctests, a release build, rustdoc with warnings
-denied, CLI help, the deterministic 101-event offline mock, and a timeout-bounded local stdio MCP
-interaction. Cargo Deny, Cargo Audit, and Gitleaks run directly in the same local and CI entry point
-rather than through configuration-shape unit tests. `cargo doc` remains a separate warning-denied
-documentation build; it is not treated as a substitute for running doctests.
+hygiene checks, workspace formatting, strict all-target/all-feature Clippy, the ordinary locked
+all-feature workspace suite (including Cargo's default doctest run), the explicitly isolated domain,
+live, and execution Trybuild UI targets, a release build, rustdoc with warnings denied, CLI help, the
+deterministic 101-event offline mock, and a timeout-bounded local stdio MCP interaction. Cargo Deny,
+Cargo Audit, and Gitleaks run directly in the same local and CI entry point rather than through
+configuration-shape unit tests. `cargo doc` remains a separate warning-denied documentation build;
+it is not treated as a substitute for running doctests.
+
+The wrapper rejects nonempty `CARGO_TARGET_DIR` and `CARGO_BUILD_BUILD_DIR`, exports
+`CARGO_INCREMENTAL=0`, and checks the default worktree-local `target/` against a 20 GiB hard ceiling
+before and after verification. Run it from the repository root without an external target or build
+directory. Ordinary `dev` and `test` work remains incremental with line-table debug information;
+use `cargo build --profile debugging` only when full workspace debug information is required.
 
 The historical 24-test count above applies only to the pre-workspace artifact. Current harness and
 doctest counts are read from the fresh release-gate transcript and will be recorded in the

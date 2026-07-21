@@ -1,3 +1,7 @@
+// Rust #159105: this macOS-only test-link diagnostic is caused by the measured
+// `__eh_frame` exceeding arm64 compact-unwind's 24-bit offset range.
+#![allow(linker_messages)]
+
 use std::error::Error;
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 use std::sync::Arc;

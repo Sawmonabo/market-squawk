@@ -7,6 +7,19 @@ license.workspace = true
 description = "Local-first Market Squawk CLI, live capture engine, diagnostic replay, and MCP server"
 repository = "https://github.com/Sawmonabo/market-squawk"
 publish = false
+autotests = false
+
+[[test]]
+name = "live_pipeline"
+path = "tests/harnesses/live_pipeline.rs"
+
+[[test]]
+name = "risk_execution"
+path = "tests/harnesses/risk_execution.rs"
+
+[[test]]
+name = "control_plane"
+path = "tests/harnesses/control_plane.rs"
 
 [lib]
 name = "market_squawk"

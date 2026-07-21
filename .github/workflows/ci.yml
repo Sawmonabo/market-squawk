@@ -12,6 +12,9 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  CARGO_INCREMENTAL: "0"
+
 jobs:
   verify:
     runs-on: ubuntu-24.04
@@ -29,6 +32,13 @@ jobs:
           components: rustfmt, clippy
       # Swatinem/rust-cache v2.9.1, verified release commit (2026-03-12).
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        with:
+          workspaces: ". -> target"
+          cache-targets: "true"
+          cache-on-failure: "false"
+          cache-all-crates: "false"
+          cache-workspace-crates: "false"
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       # taiki-e/install-action v2.83.4, verified release commit (2026-07-17).
       - uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b
         with:
@@ -64,10 +74,16 @@ jobs:
           toolchain: 1.97.1
       # Swatinem/rust-cache v2.9.1, verified release commit (2026-03-12).
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        with:
+          workspaces: ". -> target"
+          cache-targets: "true"
+          cache-on-failure: "false"
+          cache-all-crates: "false"
+          cache-workspace-crates: "false"
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - run: rustc --version
       - run: cargo --version
-      - run: cargo build --workspace --all-features --locked
-      - run: cargo test --workspace --all-targets --all-features --locked
+      - run: cargo test --workspace --all-features --locked
 
   windows:
     runs-on: windows-2025
@@ -83,7 +99,13 @@ jobs:
           toolchain: 1.97.1
       # Swatinem/rust-cache v2.9.1, verified release commit (2026-03-12).
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        with:
+          workspaces: ". -> target"
+          cache-targets: "true"
+          cache-on-failure: "false"
+          cache-all-crates: "false"
+          cache-workspace-crates: "false"
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - run: rustc --version
       - run: cargo --version
-      - run: cargo build --workspace --all-features --locked
-      - run: cargo test --workspace --all-targets --all-features --locked
+      - run: cargo test --workspace --all-features --locked

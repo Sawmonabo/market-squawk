@@ -757,7 +757,9 @@ execution -> domain, live, analytics, modeling, portfolio
 valuation -> domain, analytics, data, portfolio
 mcp -> domain, platform, services
 python bindings -> domain, analytics
-provider adapters -> declared domain/source/platform contracts, never data
+provider adapter normal/build edges -> declared domain/source/platform contracts, never data
+explicit package-local dev verticals -> Kraken to execution/paper; files and portfolio to data
+paper adapter -> domain, execution, platform confinement contracts
 app -> composition dependencies
 ```
 

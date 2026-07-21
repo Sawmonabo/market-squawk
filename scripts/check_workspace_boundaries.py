@@ -125,6 +125,10 @@ PROVIDER_DEPENDENCIES = {
     "market-squawk-sources",
 }
 DEV_ONLY_LOCAL_DEPENDENCIES = {
+    # These package-local verticals prove that canonical adapter output reaches the data-plane
+    # ingestion boundary. The production adapter graphs remain forbidden from depending on data.
+    "market-squawk-adapter-files": {"market-squawk-data"},
+    "market-squawk-adapter-portfolio": {"market-squawk-data"},
     # The required Kraken package-local vertical drives decoded source events through the public
     # execution and paper APIs. It may use those two crates only as test harnesses; provider
     # production edges remain restricted to domain/source/platform contracts.
@@ -209,7 +213,11 @@ def allowed_local_dependencies(package_name: str) -> set[str]:
     if package_name in PROVIDER_ADAPTERS:
         return PROVIDER_DEPENDENCIES
     if package_name == "market-squawk-adapter-paper":
-        return {"market-squawk-domain", "market-squawk-execution"}
+        return {
+            "market-squawk-domain",
+            "market-squawk-execution",
+            "market-squawk-platform",
+        }
     return CORE_LOCAL_DEPENDENCIES.get(package_name, set())
 
 
@@ -302,6 +310,12 @@ def validate_dependency_graph(
                 for dependency in sorted(
                     dependencies & {"market-squawk-data", "market-squawk-live"}
                 ):
+                    if (
+                        dependency_kind == "dev"
+                        and dependency
+                        in DEV_ONLY_LOCAL_DEPENDENCIES.get(package_name, set())
+                    ):
+                        continue
                     diagnostics.add(
                         f"{package_name}: {dependency_kind} adapter dependency on "
                         f"{dependency} is forbidden"

@@ -1,5 +1,3 @@
-mod common;
-
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -13,7 +11,7 @@ use market_squawk_sources::{
 };
 use static_assertions::assert_not_impl_any;
 
-use common::{TestResult, direct_metadata, source_identifier};
+use crate::common::{TestResult, direct_metadata, source_identifier};
 
 assert_not_impl_any!(ValidatedSessionDecodeOutcome: Clone, serde::Serialize, serde::de::DeserializeOwned);
 

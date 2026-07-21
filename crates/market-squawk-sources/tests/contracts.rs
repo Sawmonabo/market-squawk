@@ -1,5 +1,3 @@
-mod common;
-
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 
 use bytes::Bytes;
@@ -21,7 +19,7 @@ use market_squawk_sources::{
     SourceMetadata, SourceMetadataInput, SourceObject, SourceProtocolProfile, TransportFrameKind,
 };
 
-use common::{TestResult, direct_metadata, exact_evidence, source_identifier};
+use crate::common::{TestResult, direct_metadata, exact_evidence, source_identifier};
 use sha2::{Digest as _, Sha256};
 
 static_assertions::assert_not_impl_any!(

@@ -106,6 +106,14 @@ def main() -> int:
                 == "market-squawk",
                 "MCP initialize response has the wrong server identity",
             )
+            require(process.stdin is not None, "MCP process stdin is unavailable")
+            process.stdin.write(
+                json.dumps(
+                    {"jsonrpc": "2.0", "method": "notifications/initialized"}
+                )
+                + "\n"
+            )
+            process.stdin.flush()
 
             tools = request(
                 process,

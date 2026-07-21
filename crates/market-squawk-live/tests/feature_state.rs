@@ -1,18 +1,12 @@
 use std::time::Duration;
 
 use market_squawk_analytics::{FeatureValidity, RequiredLiveFeature};
-pub(crate) use market_squawk_live::{
-    DepthLimit, LiveRouteConfig, LiveRouteConfigInput, LiveRuntimeConfig, LiveRuntimeConfigInput,
-    ShardKey, ShardRoutingVersion, SnapshotLimits,
-};
 use market_squawk_live::{
     LiveFeatureSnapshot, LiveRuntime, SnapshotCompleteness, StreamPhaseSnapshot,
 };
 use tokio_util::sync::CancellationToken;
 
-#[allow(dead_code)]
-#[path = "support/current_source.rs"]
-mod current_source;
+use crate::current_source;
 
 use current_source::{
     INSTRUMENT_ONE, SourceHarness, TestResult, route, route_config, runtime_config,

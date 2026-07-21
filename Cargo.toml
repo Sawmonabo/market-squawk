@@ -150,11 +150,32 @@ panic = "deny"
 todo = "deny"
 unimplemented = "deny"
 
+[profile.dev]
+debug = "line-tables-only"
+incremental = true
+
+[profile.dev.package."*"]
+debug = false
+
 [profile.dev.package.argon2]
+debug = false
 opt-level = 3
 
+[profile.test]
+debug = "line-tables-only"
+incremental = true
+
+[profile.test.package."*"]
+debug = false
+
 [profile.test.package.argon2]
+debug = false
 opt-level = 3
+
+[profile.debugging]
+inherits = "dev"
+debug = "full"
+incremental = false
 
 [profile.release]
 opt-level = 3

@@ -1,20 +1,13 @@
 use std::time::Duration;
 
 use market_squawk_analytics::{FeatureValidity, RequiredLiveFeature};
-pub(crate) use market_squawk_live::{
-    DepthLimit, LiveRouteConfig, LiveRouteConfigInput, ShardKey, ShardRoutingVersion,
-    SnapshotLimits,
-};
 use market_squawk_live::{
     LiveRuntime, LiveRuntimeConfig, LiveRuntimeConfigInput, LiveRuntimeHealthKind,
     ShardShutdownStatus, StreamPhaseSnapshot,
 };
 use tokio_util::sync::CancellationToken;
 
-// This integration test intentionally consumes only the rejection subset of the shared harness.
-#[allow(dead_code)]
-#[path = "support/current_source.rs"]
-mod current_source;
+use crate::current_source;
 
 use current_source::{
     INSTRUMENT_ONE, INSTRUMENT_TWO, SourceHarness, TestResult, route, route_config, runtime_config,

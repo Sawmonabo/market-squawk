@@ -18,10 +18,10 @@ use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
     model::{
         CallToolRequestParams, CallToolResult, CancelledNotificationParam, ErrorCode,
-        Implementation, InitializeRequestParams, InitializeResult, ListToolsResult, NumberOrString,
-        PaginatedRequestParams, ProgressToken, ProtocolVersion, RequestId, ServerCapabilities,
-        ServerInfo, ServerJsonRpcMessage, ServerResult, TaskSupport, Tool, ToolAnnotations,
-        ToolExecution,
+        Implementation, InitializeRequestParams, InitializeResult, ListToolsResult, Meta,
+        NumberOrString, PaginatedRequestParams, ProgressToken, ProtocolVersion, RequestId,
+        ServerCapabilities, ServerInfo, ServerJsonRpcMessage, ServerResult, TaskSupport, Tool,
+        ToolAnnotations, ToolExecution,
     },
     service::{NotificationContext, QuitReason, RequestContext as McpRequestContext},
 };
@@ -640,7 +640,7 @@ impl Write for FrameCounter {
 
 fn to_rmcp_tool(descriptor: &ToolDescriptor) -> Tool {
     let effects = descriptor.effects();
-    Tool::new(
+    let mut tool = Tool::new(
         Cow::Owned(descriptor.name().to_owned()),
         Cow::Owned(descriptor.description().to_owned()),
         Arc::new(descriptor.input_schema().clone()),
@@ -652,7 +652,11 @@ fn to_rmcp_tool(descriptor: &ToolDescriptor) -> Tool {
             .idempotent(effects.idempotent())
             .open_world(effects.open_world()),
     )
-    .with_execution(ToolExecution::new().with_task_support(TaskSupport::Forbidden))
+    .with_execution(ToolExecution::new().with_task_support(TaskSupport::Forbidden));
+    if !descriptor.metadata().is_empty() {
+        tool = tool.with_meta(Meta(descriptor.metadata().clone()));
+    }
+    tool
 }
 
 fn service_request_id(id: &rmcp::model::RequestId) -> Result<ServiceRequestId, McpError> {
