@@ -299,7 +299,7 @@ fn authoritative_child_inherits_the_bound_outer_process_group()
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn bounded_command_rejects_output_flood_and_extinguishes_pipe_holding_descendants()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -397,7 +397,7 @@ fn bounded_command_rejects_output_flood_and_extinguishes_pipe_holding_descendant
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn bounded_command_cleans_up_after_setup_poll_and_read_failures()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -472,6 +472,38 @@ struct FailingProcessGroupControl {
 }
 
 #[cfg(unix)]
+#[derive(Debug)]
+struct ExtinctionBeforeLeaderReapControl<'a> {
+    leader_reaped: &'a std::cell::Cell<bool>,
+    probes: std::cell::Cell<usize>,
+    signals: Mutex<Vec<build_support::ProcessGroupSignal>>,
+}
+
+#[cfg(unix)]
+impl build_support::ProcessGroupControl for ExtinctionBeforeLeaderReapControl<'_> {
+    fn signal(
+        &self,
+        _process_id: rustix::process::Pid,
+        signal: build_support::ProcessGroupSignal,
+    ) -> Result<(), String> {
+        match self.signals.lock() {
+            Ok(mut signals) => signals.push(signal),
+            Err(poisoned) => poisoned.into_inner().push(signal),
+        }
+        Ok(())
+    }
+
+    fn exists(&self, _process_id: rustix::process::Pid) -> Result<bool, String> {
+        if self.leader_reaped.get() {
+            return Err("leader was reaped before process-group extinction".to_owned());
+        }
+        let probes = self.probes.get() + 1;
+        self.probes.set(probes);
+        Ok(probes == 1)
+    }
+}
+
+#[cfg(unix)]
 impl build_support::ProcessGroupControl for FailingProcessGroupControl {
     fn signal(
         &self,
@@ -496,9 +528,17 @@ fn process_group_signal_failures_are_bounded_and_reported() -> Result<(), Box<dy
 {
     let controller = FailingProcessGroupControl::default();
     let process_id = rustix::process::Pid::from_raw(42).ok_or("fixture PID must be nonzero")?;
+    let leader_reaped = std::cell::Cell::new(false);
     let started = std::time::Instant::now();
-    assert!(build_support::terminate_process_group(&controller, process_id, || Ok(())).is_err());
+    assert!(
+        build_support::terminate_process_group(&controller, process_id, || {
+            leader_reaped.set(true);
+            Ok(())
+        })
+        .is_err()
+    );
     assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(leader_reaped.get());
     let signals = match controller.signals.lock() {
         Ok(signals) => signals.clone(),
         Err(poisoned) => poisoned.into_inner().clone(),
@@ -510,6 +550,32 @@ fn process_group_signal_failures_are_bounded_and_reported() -> Result<(), Box<dy
             build_support::ProcessGroupSignal::Kill,
         ]
     );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn process_group_cleanup_reaps_leader_only_after_extinction()
+-> Result<(), Box<dyn std::error::Error>> {
+    let leader_reaped = std::cell::Cell::new(false);
+    let controller = ExtinctionBeforeLeaderReapControl {
+        leader_reaped: &leader_reaped,
+        probes: std::cell::Cell::new(0),
+        signals: Mutex::new(Vec::new()),
+    };
+    let process_id = rustix::process::Pid::from_raw(42).ok_or("fixture PID must be nonzero")?;
+
+    build_support::terminate_process_group(&controller, process_id, || {
+        leader_reaped.set(true);
+        Ok(())
+    })?;
+
+    assert!(leader_reaped.get());
+    let signals = match controller.signals.lock() {
+        Ok(signals) => signals.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    };
+    assert_eq!(signals, [build_support::ProcessGroupSignal::Terminate]);
     Ok(())
 }
 

@@ -33,6 +33,8 @@ const PROCESS_GROUP_TERM_GRACE: Duration = Duration::from_millis(PROCESS_GROUP_T
 const PROCESS_GROUP_KILL_GRACE: Duration = Duration::from_millis(PROCESS_GROUP_KILL_GRACE_MILLIS);
 const LEADER_REAP_GRACE: Duration = Duration::from_millis(LEADER_REAP_GRACE_MILLIS);
 const PIPE_READER_GRACE: Duration = Duration::from_millis(PIPE_READER_GRACE_MILLIS);
+const OWNED_PROCESS_GROUP_SUPERVISION_SUPPORTED: bool =
+    cfg!(any(target_os = "linux", target_os = "macos"));
 /// Additive TERM + KILL + leader reap + concurrent pipe-finish grace after execution enforcement.
 const MAXIMUM_CLEANUP_GRACE_MILLIS: u64 = PROCESS_GROUP_TERM_GRACE_MILLIS
     + PROCESS_GROUP_KILL_GRACE_MILLIS
@@ -341,7 +343,7 @@ fn run_command_with_charged_post_spawn_deadline_inner(
     spec: BoundedCommandSpec<'_>,
     fault: RunFault,
 ) -> Result<BoundedOutput, Box<dyn Error>> {
-    validate_process_group_support(spec.policy, cfg!(unix))?;
+    validate_process_group_support(spec.policy, OWNED_PROCESS_GROUP_SUPERVISION_SUPPORTED)?;
     spec.policy.validate_current_process_group()?;
     // Process creation is charged against this deadline but cannot be preempted in-process. After
     // spawn returns, reader initialization and child polling consume its remainder. Containment
@@ -514,14 +516,41 @@ impl BoundedExecution {
             return Err("injected child-poll failure".into());
         }
         loop {
-            if let Some(status) = self.child.try_wait()? {
-                self.status = Some(status);
+            if self.observe_leader_exit()? {
                 return Ok(PollOutcome { timed_out: false });
             }
             if Instant::now() >= deadline {
                 return Ok(PollOutcome { timed_out: true });
             }
             std::thread::sleep(PROCESS_GROUP_POLL_INTERVAL);
+        }
+    }
+
+    fn observe_leader_exit(&mut self) -> Result<bool, Box<dyn Error>> {
+        if self.policy.owns_process_group() {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            {
+                let process_id = self
+                    .process_group_id
+                    .ok_or("bounded child process-group ID is invalid")?;
+                // Keep an exited leader waitable so its PID continues to reserve the owned process-
+                // group identity while cleanup signals and checks the remaining group members.
+                let options = rustix::process::WaitIdOptions::EXITED
+                    | rustix::process::WaitIdOptions::NOHANG
+                    | rustix::process::WaitIdOptions::NOWAIT;
+                return rustix::process::waitid(rustix::process::WaitId::Pid(process_id), options)
+                    .map(|status| status.is_some())
+                    .map_err(Into::into);
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            return Err("bounded command requires supported process-group control".into());
+        }
+
+        if let Some(status) = self.child.try_wait()? {
+            self.status = Some(status);
+            Ok(true)
+        } else {
+            Ok(false)
         }
     }
 
@@ -767,13 +796,23 @@ impl ProcessGroupControl for SystemProcessGroupControl {
             ProcessGroupSignal::Terminate => rustix::process::Signal::TERM,
             ProcessGroupSignal::Kill => rustix::process::Signal::KILL,
         };
-        rustix::process::kill_process_group(process_id, signal).map_err(|error| error.to_string())
+        match rustix::process::kill_process_group(process_id, signal) {
+            // An exited, deliberately unreaped leader makes macOS return EPERM even though the
+            // signal is still delivered to signalable group members. This is not success by
+            // itself: cleanup requires a terminal extinction probe after reaping the leader.
+            Ok(()) | Err(rustix::io::Errno::PERM) => Ok(()),
+            Err(error) => Err(error.to_string()),
+        }
     }
 
     fn exists(&self, process_id: rustix::process::Pid) -> Result<bool, String> {
         match rustix::process::test_kill_process_group(process_id) {
             Ok(()) => Ok(true),
             Err(rustix::io::Errno::SRCH) => Ok(false),
+            // macOS reports EPERM while an exited group leader remains waitable. It therefore
+            // proves presence, not extinction; the terminal post-reap probe below must still
+            // establish ESRCH before cleanup succeeds.
+            Err(rustix::io::Errno::PERM) => Ok(true),
             Err(error) => Err(error.to_string()),
         }
     }
@@ -789,73 +828,81 @@ fn process_group_id_from_raw(process_id: u32) -> Result<rustix::process::Pid, Bo
 pub(crate) fn terminate_process_group<C, F>(
     controller: &C,
     process_id: rustix::process::Pid,
-    mut reap_leader: F,
+    mut reap_leader_after_group: F,
 ) -> Result<(), Box<dyn Error>>
 where
     C: ProcessGroupControl,
     F: FnMut() -> Result<(), Box<dyn Error>>,
 {
     let mut failures = Vec::new();
-    if let Err(error) = reap_leader() {
+    let mut extinct = match controller.exists(process_id) {
+        Ok(false) => true,
+        Ok(true) => false,
+        Err(error) => {
+            failures.push(format!("initial process-group probe failed: {error}"));
+            false
+        }
+    };
+    if !extinct {
+        if let Err(error) = controller.signal(process_id, ProcessGroupSignal::Terminate) {
+            failures.push(format!("process-group TERM failed: {error}"));
+        }
+        extinct = wait_for_group_extinction(
+            controller,
+            process_id,
+            PROCESS_GROUP_TERM_GRACE,
+            &mut failures,
+        );
+    }
+    if !extinct {
+        if let Err(error) = controller.signal(process_id, ProcessGroupSignal::Kill) {
+            failures.push(format!("process-group KILL failed: {error}"));
+        }
+        extinct = wait_for_group_extinction(
+            controller,
+            process_id,
+            PROCESS_GROUP_KILL_GRACE,
+            &mut failures,
+        );
+    }
+
+    if let Err(error) = reap_leader_after_group() {
         failures.push(format!(
-            "leader reap failed before group termination: {error}"
+            "leader reap failed after process-group termination: {error}"
         ));
     }
-    match controller.exists(process_id) {
-        Ok(false) => return group_cleanup_result(failures),
-        Ok(true) => {}
-        Err(error) => failures.push(format!("initial process-group probe failed: {error}")),
+
+    if !extinct {
+        extinct = match controller.exists(process_id) {
+            Ok(false) => true,
+            Ok(true) => false,
+            Err(error) => {
+                failures.push(format!("terminal process-group probe failed: {error}"));
+                false
+            }
+        };
     }
-    if let Err(error) = controller.signal(process_id, ProcessGroupSignal::Terminate) {
-        failures.push(format!("process-group TERM failed: {error}"));
+    if !extinct {
+        failures.push("bounded process group survived TERM and KILL deadlines".to_owned());
     }
-    if wait_for_group_extinction(
-        controller,
-        process_id,
-        PROCESS_GROUP_TERM_GRACE,
-        &mut reap_leader,
-        &mut failures,
-    ) {
-        return group_cleanup_result(failures);
-    }
-    if let Err(error) = controller.signal(process_id, ProcessGroupSignal::Kill) {
-        failures.push(format!("process-group KILL failed: {error}"));
-    }
-    if wait_for_group_extinction(
-        controller,
-        process_id,
-        PROCESS_GROUP_KILL_GRACE,
-        &mut reap_leader,
-        &mut failures,
-    ) {
-        return group_cleanup_result(failures);
-    }
-    failures.push("bounded process group survived TERM and KILL deadlines".to_owned());
     group_cleanup_result(failures)
 }
 
 #[cfg(unix)]
-fn wait_for_group_extinction<C, F>(
+fn wait_for_group_extinction<C>(
     controller: &C,
     process_id: rustix::process::Pid,
     grace: Duration,
-    reap_leader: &mut F,
     failures: &mut Vec<String>,
 ) -> bool
 where
     C: ProcessGroupControl,
-    F: FnMut() -> Result<(), Box<dyn Error>>,
 {
     let deadline = Instant::now().checked_add(grace).unwrap_or_else(|| {
         failures.push("process-group extinction deadline overflowed".to_owned());
         Instant::now()
     });
     loop {
-        if let Err(error) = reap_leader() {
-            failures.push(format!(
-                "leader reap failed during group termination: {error}"
-            ));
-        }
         match controller.exists(process_id) {
             Ok(false) => return true,
             Ok(true) => {}
