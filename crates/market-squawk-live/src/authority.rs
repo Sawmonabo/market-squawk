@@ -70,6 +70,7 @@ pub struct ConsumedLiveAuthority {
     expected_status_revision: u64,
     assessment_id: QualificationAssessmentId,
     binding: LiveEvidenceBinding,
+    binding_digest: [u8; 32],
     valid_until: Timestamp,
     monotonic_deadline: Instant,
     not_sync: PhantomData<Cell<()>>,
@@ -99,6 +100,45 @@ impl ConsumedLiveAuthority {
         &self.binding
     }
 
+    /// Returns the fixed digest that was nonce-bound when this authority was issued.
+    pub const fn binding_digest(&self) -> [u8; 32] {
+        self.binding_digest
+    }
+
+    /// Returns the inclusive wall deadline already minimized across source, authorization,
+    /// coverage, freshness, and live capability policy.
+    pub const fn valid_until(&self) -> Timestamp {
+        self.valid_until
+    }
+
+    /// Consumes current authority after final validation and retains only non-authoritative audit
+    /// evidence for an adapter command.
+    pub fn into_evidence(self) -> ConsumedLiveEvidence {
+        let Self {
+            source: _,
+            generation: _,
+            shard: _,
+            runtime: _,
+            status: _,
+            revision: _,
+            expected_revision: _,
+            status_revision: _,
+            expected_status_revision: _,
+            assessment_id,
+            binding,
+            binding_digest,
+            valid_until,
+            monotonic_deadline: _,
+            not_sync: _,
+        } = self;
+        ConsumedLiveEvidence {
+            assessment_id,
+            binding,
+            binding_digest,
+            valid_until,
+        }
+    }
+
     fn validate_at(&self, now: ClockReading) -> Result<(), AuthorityError> {
         validate_allocations(
             &self.source,
@@ -119,6 +159,40 @@ impl ConsumedLiveAuthority {
     #[cfg(test)]
     pub(crate) fn validate_at_for_test(&self, now: ClockReading) -> Result<(), AuthorityError> {
         self.validate_at(now)
+    }
+}
+
+/// Non-authoritative evidence retained after a consumed capability passes final dispatch checks.
+///
+/// Private fields prevent callers from inventing a live qualification. This value cannot mint or
+/// revalidate authority and is intentionally non-cloneable and non-serializable.
+#[derive(Debug)]
+pub struct ConsumedLiveEvidence {
+    assessment_id: QualificationAssessmentId,
+    binding: LiveEvidenceBinding,
+    binding_digest: [u8; 32],
+    valid_until: Timestamp,
+}
+
+impl ConsumedLiveEvidence {
+    /// Returns the exact qualification assessment accepted by live authority.
+    pub const fn assessment_id(&self) -> &QualificationAssessmentId {
+        &self.assessment_id
+    }
+
+    /// Returns the complete source, venue, instrument, generation, and state evidence binding.
+    pub const fn binding(&self) -> &LiveEvidenceBinding {
+        &self.binding
+    }
+
+    /// Returns the fixed nonce-bound evidence digest.
+    pub const fn binding_digest(&self) -> [u8; 32] {
+        self.binding_digest
+    }
+
+    /// Returns the inclusive authority deadline that was current at final validation.
+    pub const fn valid_until(&self) -> Timestamp {
+        self.valid_until
     }
 }
 
@@ -411,6 +485,7 @@ impl AuthorityGate {
             expected_status_revision,
             assessment_id,
             binding,
+            binding_digest,
             valid_until,
             monotonic_deadline,
             not_sync: PhantomData,

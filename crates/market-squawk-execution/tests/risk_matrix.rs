@@ -4,35 +4,59 @@
 )]
 
 use std::collections::BTreeSet;
-use std::num::{NonZeroU32, NonZeroU64};
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::str::FromStr;
 use std::sync::Arc;
 
 use market_squawk_domain::{
     AccountId, BasisPoints, ClientOrderId, Currency, DataQuality, Denomination,
     InstrumentDefinitionRevision, InstrumentExecutionTerms, InstrumentId, LotSize, Money, OrderId,
-    OrderReasonCode, OrderSide, OrderType, PriceTicks, QuantityLots, StrategyId, TickSize,
-    TimeInForce, Timestamp,
+    OrderReasonCode, OrderSide, OrderType, PriceTicks, QuantityLots, RuleVersion, SourceIdentifier,
+    StrategyId, TickSize, TimeInForce, Timestamp,
 };
 use market_squawk_execution::{
-    AccountBootstrap, AccountCoordinatorConfig, AccountRiskCoordinator, AccountRiskViolation,
+    AccountBootstrap, AccountCoordinatorConfig, AccountIdempotencyBootstrap,
+    AccountRiskCoordinator, AccountRiskViolation, ExecutionAuditConfig, ExecutionAuditWriter,
     MarketRiskInput, OrderIntent, OrderIntentInput, PreAuthorityRiskOutcome, RiskLimits,
-    RiskLimitsInput, RiskRejectionCode, RiskService,
+    RiskLimitsInput, RiskPolicyIdentity, RiskRejectionCode, RiskService, RiskServiceConfig,
 };
 use rust_decimal::Decimal;
 
 #[test]
 fn risk_returns_stably_ordered_source_market_and_account_reasons_before_mutation() {
     let fixture = Fixture::new();
+    let account_config = AccountCoordinatorConfig {
+        maximum_intent_lifetime_nanos: NonZeroU64::new(i64::MAX as u64)
+            .unwrap_or_else(|| panic!("fixture intent lifetime is nonzero")),
+        ..AccountCoordinatorConfig::default()
+    };
     let coordinator = Arc::new(
-        AccountRiskCoordinator::try_new(
-            AccountCoordinatorConfig::default(),
-            [fixture.account(Decimal::new(50, 0))],
-        )
-        .unwrap_or_else(|error| panic!("valid coordinator: {error}")),
+        AccountRiskCoordinator::try_new(account_config, [fixture.account(Decimal::new(50, 0))])
+            .unwrap_or_else(|error| panic!("valid coordinator: {error}")),
     );
-    let service = RiskService::new(coordinator, fixture.limits());
-    let intent = fixture.intent(1, 1, 100);
+    let (audit, _audit_reader) = ExecutionAuditWriter::try_new(ExecutionAuditConfig {
+        maximum_records: NonZeroUsize::new(8)
+            .unwrap_or_else(|| panic!("fixture audit count is nonzero")),
+        maximum_bytes: NonZeroU32::new(8_192)
+            .unwrap_or_else(|| panic!("fixture audit bytes are nonzero")),
+    })
+    .unwrap_or_else(|error| panic!("valid audit fixture: {error}"));
+    let service = RiskService::try_new(
+        coordinator,
+        fixture.limits(),
+        audit,
+        RiskServiceConfig {
+            policy: RiskPolicyIdentity::new(
+                &SourceIdentifier::try_from("risk/default")
+                    .unwrap_or_else(|error| panic!("valid policy identity: {error}")),
+                RuleVersion::new(1).unwrap_or_else(|error| panic!("valid policy version: {error}")),
+            ),
+            policy_valid_until: Timestamp::from_unix_nanos(i64::MAX),
+            maximum_approval_lifetime: std::time::Duration::from_secs(1),
+        },
+    )
+    .unwrap_or_else(|error| panic!("valid risk service: {error}"));
+    let intent = fixture.intent(1, 1, 100, 50);
     let market = MarketRiskInput::try_new(
         fixture.terms,
         DataQuality::DirectUnverified,
@@ -66,7 +90,7 @@ fn risk_returns_stably_ordered_source_market_and_account_reasons_before_mutation
         );
     }
 
-    let overflow_intent = fixture.intent(2, i64::MAX, i64::MAX);
+    let overflow_intent = fixture.intent(2, i64::MAX, i64::MAX, 50);
     let current_market = MarketRiskInput::try_new(
         fixture.terms,
         DataQuality::DirectVerified,
@@ -86,6 +110,18 @@ fn risk_returns_stably_ordered_source_market_and_account_reasons_before_mutation
     assert!(overflow.reasons().contains(&RiskRejectionCode::Account(
         AccountRiskViolation::ArithmeticOverflow
     )));
+
+    let loose_intent = fixture.intent(3, 1, 100, 101);
+    let PreAuthorityRiskOutcome::Rejected(loose) =
+        service.evaluate_pre_authority(&loose_intent, &current_market)
+    else {
+        panic!("intent slippage above policy must be rejected before reservation");
+    };
+    assert!(
+        loose
+            .reasons()
+            .contains(&RiskRejectionCode::PolicySlippageLimit)
+    );
 }
 
 struct Fixture {
@@ -133,8 +169,11 @@ impl Fixture {
             capital: Money::new(capital, self.usd),
             peak_capital: Money::new(Decimal::new(100, 0), self.usd),
             gross_exposure: Money::new(Decimal::ZERO, self.usd),
+            realized_pnl: Money::new(Decimal::ZERO, self.usd),
             realized_loss: Money::new(Decimal::ZERO, self.usd),
             positions: vec![(self.instrument_id, 0)],
+            position_cost_basis: vec![(self.instrument_id, Money::new(Decimal::ZERO, self.usd))],
+            idempotency: AccountIdempotencyBootstrap::empty(),
         }
     }
 
@@ -162,7 +201,13 @@ impl Fixture {
         .unwrap_or_else(|error| panic!("valid risk limits: {error}"))
     }
 
-    fn intent(&self, suffix: u8, quantity: i64, limit_price: i64) -> OrderIntent {
+    fn intent(
+        &self,
+        suffix: u8,
+        quantity: i64,
+        limit_price: i64,
+        maximum_slippage: i32,
+    ) -> OrderIntent {
         let order_id = format!("20000000-0000-0000-0000-{suffix:012}");
         OrderIntent::try_new(OrderIntentInput {
             order_id: OrderId::from_str(&order_id)
@@ -187,7 +232,7 @@ impl Fixture {
                 OrderReasonCode::try_from("risk.test")
                     .unwrap_or_else(|error| panic!("valid reason fixture: {error}")),
             ],
-            maximum_slippage: BasisPoints::new(50),
+            maximum_slippage: BasisPoints::new(maximum_slippage),
             required_quality: DataQuality::DirectVerified,
         })
         .unwrap_or_else(|error| panic!("valid intent fixture: {error}"))

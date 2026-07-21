@@ -14,8 +14,8 @@ use market_squawk_domain::{
     TimeInForce, Timestamp,
 };
 use market_squawk_execution::{
-    AccountBootstrap, AccountCoordinatorConfig, AccountRiskCoordinator, OrderIntent,
-    OrderIntentInput, RiskLimits, RiskLimitsInput,
+    AccountBootstrap, AccountCoordinatorConfig, AccountIdempotencyBootstrap,
+    AccountRiskCoordinator, OrderIntent, OrderIntentInput, RiskLimits, RiskLimitsInput,
 };
 use proptest::prelude::*;
 use rust_decimal::Decimal;
@@ -26,8 +26,13 @@ proptest! {
         quantities in prop::collection::vec(1_i64..50, 1..24)
     ) {
         let fixture = Fixture::new();
+        let account_config = AccountCoordinatorConfig {
+            maximum_intent_lifetime_nanos: NonZeroU64::new(i64::MAX as u64)
+                .unwrap_or_else(|| panic!("fixture intent lifetime is nonzero")),
+            ..AccountCoordinatorConfig::default()
+        };
         let coordinator = AccountRiskCoordinator::try_new(
-            AccountCoordinatorConfig::default(),
+            account_config,
             [fixture.account()],
         ).unwrap_or_else(|error| panic!("valid coordinator: {error}"));
         let limits = fixture.limits();
@@ -95,8 +100,11 @@ impl Fixture {
             capital: cash,
             peak_capital: cash,
             gross_exposure: Money::new(Decimal::ZERO, self.usd),
+            realized_pnl: Money::new(Decimal::ZERO, self.usd),
             realized_loss: Money::new(Decimal::ZERO, self.usd),
             positions: vec![(self.instrument_id, 0)],
+            position_cost_basis: vec![(self.instrument_id, Money::new(Decimal::ZERO, self.usd))],
+            idempotency: AccountIdempotencyBootstrap::empty(),
         }
     }
 

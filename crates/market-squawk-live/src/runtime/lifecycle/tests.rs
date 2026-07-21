@@ -301,6 +301,8 @@ async fn actor_exit_invalidates_shared_runtime_before_completion_is_observed() -
         runtime: runtime_lease.clone(),
         shard_owner,
         routes: Vec::new(),
+        action_hooks: Vec::new(),
+        maximum_action_hook_bytes_per_route: config.maximum_action_hook_bytes_per_route().get(),
         maximum_sources_per_route: 1,
         maximum_streams_per_route: 1,
         feature_capacity: config.feature_capacity(),

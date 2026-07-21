@@ -47,7 +47,7 @@ pub struct OrderIntentInput {
     pub time_in_force: TimeInForce,
     /// Trusted event-derived signal time.
     pub signal_at: Timestamp,
-    /// Exclusive intent expiration time.
+    /// Inclusive intent expiration time.
     pub expires_at: Timestamp,
     /// Nonempty bounded machine-readable rationale.
     pub reason_codes: Vec<OrderReasonCode>,
@@ -68,6 +68,11 @@ impl OrderIntentDigest {
     /// Returns the fixed SHA-256 bytes.
     pub const fn as_bytes(self) -> [u8; 32] {
         self.0
+    }
+
+    /// Restores exact canonical digest bytes from an authoritative persisted tombstone.
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
     }
 }
 
@@ -220,7 +225,7 @@ impl OrderIntent {
         self.signal_at
     }
 
-    /// Returns the exclusive intent expiration timestamp.
+    /// Returns the inclusive intent expiration timestamp.
     pub const fn expires_at(&self) -> Timestamp {
         self.expires_at
     }

@@ -7,6 +7,7 @@ use std::collections::BTreeSet;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::str::FromStr;
 use std::sync::{Arc, Barrier};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use market_squawk_domain::{
     AccountId, BasisPoints, ClientOrderId, Currency, DataQuality, Denomination,
@@ -15,8 +16,9 @@ use market_squawk_domain::{
     TimeInForce, Timestamp,
 };
 use market_squawk_execution::{
-    AccountBootstrap, AccountCoordinatorConfig, AccountRiskCoordinator, AccountRiskViolation,
-    OrderIntent, OrderIntentInput, RiskLimits, RiskLimitsInput,
+    AccountBootstrap, AccountCoordinatorConfig, AccountIdempotencyBootstrap,
+    AccountRiskCoordinator, AccountRiskViolation, OrderIntent, OrderIntentInput, RiskLimits,
+    RiskLimitsInput,
 };
 use rust_decimal::Decimal;
 
@@ -36,6 +38,8 @@ fn concurrent_reservations_cannot_jointly_exceed_account_limits() {
                     .unwrap_or_else(|| panic!("fixture position capacity is nonzero")),
                 max_idempotency_keys_per_account: NonZeroUsize::new(8)
                     .unwrap_or_else(|| panic!("fixture idempotency capacity is nonzero")),
+                maximum_intent_lifetime_nanos: NonZeroU64::new(i64::MAX as u64)
+                    .unwrap_or_else(|| panic!("fixture intent lifetime is nonzero")),
                 max_rate_events_per_account: NonZeroUsize::new(8)
                     .unwrap_or_else(|| panic!("fixture rate capacity is nonzero")),
             },
@@ -94,9 +98,13 @@ fn concurrent_reservations_cannot_jointly_exceed_account_limits() {
 #[test]
 fn drop_releases_capacity_but_idempotency_identity_remains_consumed() {
     let fixture = Fixture::new();
-    let coordinator =
-        AccountRiskCoordinator::try_new(AccountCoordinatorConfig::default(), [fixture.account()])
-            .unwrap_or_else(|error| panic!("valid coordinator: {error}"));
+    let account_config = AccountCoordinatorConfig {
+        maximum_intent_lifetime_nanos: NonZeroU64::new(i64::MAX as u64)
+            .unwrap_or_else(|| panic!("fixture intent lifetime is nonzero")),
+        ..AccountCoordinatorConfig::default()
+    };
+    let coordinator = AccountRiskCoordinator::try_new(account_config, [fixture.account()])
+        .unwrap_or_else(|error| panic!("valid coordinator: {error}"));
     let limits = fixture.limits(Decimal::new(150, 0));
     let first = fixture.intent(1, 1);
     let reservation = coordinator
@@ -118,6 +126,162 @@ fn drop_releases_capacity_but_idempotency_identity_remains_consumed() {
             .reasons()
             .contains(&AccountRiskViolation::DuplicateClientOrder)
     );
+
+    let persisted = coordinator
+        .snapshot_idempotency(fixture.account_id)
+        .unwrap_or_else(|error| panic!("snapshot replay fence: {error}"));
+    let mut restarted_account = fixture.account();
+    restarted_account.idempotency = persisted;
+    let restarted = AccountRiskCoordinator::try_new(account_config, [restarted_account])
+        .unwrap_or_else(|error| panic!("restart loads replay fence: {error}"));
+    let restart_duplicate = restarted
+        .try_reserve(&first, PriceTicks::new(100), &limits)
+        .err()
+        .unwrap_or_else(|| panic!("restart must not reauthorize a non-expired replay"));
+    assert!(
+        restart_duplicate
+            .reasons()
+            .contains(&AccountRiskViolation::DuplicateOrder)
+    );
+}
+
+#[test]
+fn expired_tombstone_compaction_restores_capacity_and_snapshot_preserves_the_successor() {
+    let fixture = Fixture::new();
+    let config = AccountCoordinatorConfig {
+        max_idempotency_keys_per_account: NonZeroUsize::MIN,
+        maximum_intent_lifetime_nanos: NonZeroU64::new(1_000_000_000)
+            .unwrap_or_else(|| panic!("fixture intent lifetime is nonzero")),
+        ..AccountCoordinatorConfig::default()
+    };
+    let coordinator = AccountRiskCoordinator::try_new(config, [fixture.account()])
+        .unwrap_or_else(|error| panic!("valid coordinator: {error}"));
+    let limits = fixture.limits(Decimal::new(150, 0));
+    let first_signal = current_timestamp();
+    let first_expiry = first_signal
+        .checked_add_nanos(10_000_000)
+        .unwrap_or_else(|error| panic!("bounded first expiry: {error}"));
+    let first = fixture.intent_with_times(1, 1, first_signal, first_expiry);
+    drop(
+        coordinator
+            .try_reserve(&first, PriceTicks::new(100), &limits)
+            .unwrap_or_else(|error| panic!("first reservation succeeds: {error}")),
+    );
+    let stale_snapshot = coordinator
+        .snapshot_idempotency(fixture.account_id)
+        .unwrap_or_else(|error| panic!("snapshot first replay fence: {error}"));
+    let stale_revision = stale_snapshot.revision();
+
+    let blocked_signal = current_timestamp();
+    let blocked = fixture.intent_with_times(
+        2,
+        1,
+        blocked_signal,
+        blocked_signal
+            .checked_add_nanos(100_000_000)
+            .unwrap_or_else(|error| panic!("bounded blocked expiry: {error}")),
+    );
+    let capacity = coordinator
+        .try_reserve(&blocked, PriceTicks::new(100), &limits)
+        .err()
+        .unwrap_or_else(|| panic!("non-expired tombstone must retain the sole slot"));
+    assert!(
+        capacity
+            .reasons()
+            .contains(&AccountRiskViolation::IdempotencyCapacity)
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while current_timestamp() <= first_expiry {
+        assert!(
+            Instant::now() < deadline,
+            "trusted wall clock did not advance beyond the fixed tombstone expiry"
+        );
+        std::thread::yield_now();
+    }
+    let mut expired_bootstrap = fixture.account();
+    expired_bootstrap.idempotency = stale_snapshot;
+    assert_eq!(
+        AccountRiskCoordinator::try_new(config, [expired_bootstrap]).err(),
+        Some(market_squawk_execution::AccountCoordinatorError::InvalidIdempotencyBootstrap)
+    );
+    let compacted = coordinator
+        .snapshot_idempotency(fixture.account_id)
+        .unwrap_or_else(|error| panic!("idle snapshot compacts expired identities: {error}"));
+    assert!(compacted.tombstones().is_empty());
+    assert!(compacted.revision() > stale_revision);
+    let successor_signal = current_timestamp();
+    let successor = fixture.intent_with_times(
+        2,
+        1,
+        successor_signal,
+        successor_signal
+            .checked_add_nanos(100_000_000)
+            .unwrap_or_else(|error| panic!("bounded successor expiry: {error}")),
+    );
+    drop(
+        coordinator
+            .try_reserve(&successor, PriceTicks::new(100), &limits)
+            .unwrap_or_else(|error| panic!("expired tombstone capacity is reusable: {error}")),
+    );
+    let snapshot = coordinator
+        .snapshot_idempotency(fixture.account_id)
+        .unwrap_or_else(|error| panic!("snapshot successor replay fence: {error}"));
+    assert_eq!(snapshot.tombstones().len(), 1);
+    assert_eq!(snapshot.tombstones()[0].order_id(), successor.order_id());
+
+    let mut restarted_account = fixture.account();
+    restarted_account.idempotency = snapshot;
+    let restarted = AccountRiskCoordinator::try_new(config, [restarted_account])
+        .unwrap_or_else(|error| panic!("restart loads compacted fence: {error}"));
+    let replay = restarted
+        .try_reserve(&successor, PriceTicks::new(100), &limits)
+        .err()
+        .unwrap_or_else(|| panic!("restart must reject the successor replay"));
+    assert!(
+        replay
+            .reasons()
+            .contains(&AccountRiskViolation::DuplicateOrder)
+    );
+}
+
+#[test]
+fn deadline_construction_failure_does_not_mutate_the_replay_fence() {
+    let fixture = Fixture::new();
+    let config = AccountCoordinatorConfig {
+        maximum_intent_lifetime_nanos: NonZeroU64::new(i64::MAX as u64)
+            .unwrap_or_else(|| panic!("fixture intent lifetime is nonzero")),
+        ..AccountCoordinatorConfig::default()
+    };
+    let coordinator = AccountRiskCoordinator::try_new(config, [fixture.account()])
+        .unwrap_or_else(|error| panic!("valid coordinator: {error}"));
+    let before = coordinator
+        .snapshot_idempotency(fixture.account_id)
+        .unwrap_or_else(|error| panic!("snapshot initial replay fence: {error}"));
+    let limits = fixture.limits_with_ttl(Decimal::new(150, 0), i64::MAX);
+    let rejection = coordinator
+        .try_reserve(&fixture.intent(1, 1), PriceTicks::new(100), &limits)
+        .err()
+        .unwrap_or_else(|| panic!("unrepresentable deadline must fail closed"));
+    assert!(
+        rejection
+            .reasons()
+            .contains(&AccountRiskViolation::ArithmeticOverflow)
+    );
+    let after = coordinator
+        .snapshot_idempotency(fixture.account_id)
+        .unwrap_or_else(|error| panic!("snapshot unchanged replay fence: {error}"));
+    assert_eq!(after, before);
+}
+
+fn current_timestamp() -> Timestamp {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|error| panic!("system clock after epoch: {error}"));
+    let nanos = i128::from(elapsed.as_secs()) * 1_000_000_000 + i128::from(elapsed.subsec_nanos());
+    Timestamp::from_unix_nanos(
+        i64::try_from(nanos).unwrap_or_else(|error| panic!("timestamp range: {error}")),
+    )
 }
 
 struct Fixture {
@@ -165,12 +329,19 @@ impl Fixture {
             capital: Money::new(Decimal::new(150, 0), self.usd),
             peak_capital: Money::new(Decimal::new(150, 0), self.usd),
             gross_exposure: Money::new(Decimal::ZERO, self.usd),
+            realized_pnl: Money::new(Decimal::ZERO, self.usd),
             realized_loss: Money::new(Decimal::ZERO, self.usd),
             positions: vec![(self.instrument_id, 0)],
+            position_cost_basis: vec![(self.instrument_id, Money::new(Decimal::ZERO, self.usd))],
+            idempotency: AccountIdempotencyBootstrap::empty(),
         }
     }
 
     fn limits(&self, account_ceiling: Decimal) -> RiskLimits {
+        self.limits_with_ttl(account_ceiling, 1_000_000_000)
+    }
+
+    fn limits_with_ttl(&self, account_ceiling: Decimal, reservation_ttl_nanos: i64) -> RiskLimits {
         RiskLimits::try_new(RiskLimitsInput {
             currency: self.usd,
             eligible_instruments: BTreeSet::from([self.instrument_id]),
@@ -187,7 +358,7 @@ impl Fixture {
             maximum_orders_per_window: NonZeroU32::new(8)
                 .unwrap_or_else(|| panic!("fixture rate count is nonzero")),
             order_rate_window_nanos: 1_000_000_000,
-            reservation_ttl_nanos: 1_000_000_000,
+            reservation_ttl_nanos,
             allow_short: false,
             kill_switch: false,
         })
@@ -195,6 +366,21 @@ impl Fixture {
     }
 
     fn intent(&self, suffix: u8, quantity: i64) -> OrderIntent {
+        self.intent_with_times(
+            suffix,
+            quantity,
+            Timestamp::from_unix_nanos(1),
+            Timestamp::from_unix_nanos(i64::MAX),
+        )
+    }
+
+    fn intent_with_times(
+        &self,
+        suffix: u8,
+        quantity: i64,
+        signal_at: Timestamp,
+        expires_at: Timestamp,
+    ) -> OrderIntent {
         let order_id = format!("20000000-0000-0000-0000-{suffix:012}");
         OrderIntent::try_new(OrderIntentInput {
             order_id: OrderId::from_str(&order_id)
@@ -213,8 +399,8 @@ impl Fixture {
             limit_price: Some(PriceTicks::new(100)),
             stop_price: None,
             time_in_force: TimeInForce::Day,
-            signal_at: Timestamp::from_unix_nanos(1),
-            expires_at: Timestamp::from_unix_nanos(i64::MAX),
+            signal_at,
+            expires_at,
             reason_codes: vec![
                 OrderReasonCode::try_from("test")
                     .unwrap_or_else(|error| panic!("valid reason fixture: {error}")),

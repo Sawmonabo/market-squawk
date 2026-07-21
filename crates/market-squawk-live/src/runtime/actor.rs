@@ -38,6 +38,7 @@ struct RouteOwner {
     processor: InstrumentLiveProcessor<crate::authority::SystemTrustedClock>,
     generations: GenerationAuthorityRegistry,
     features: RouteFeatureState,
+    action_hook: Option<crate::RouteActionHook>,
     cross_venue_publisher: Option<CrossVenueRoutePublisher>,
     cross_venue_reader: Option<CrossVenueRuntimeReader>,
 }
@@ -51,6 +52,8 @@ pub(crate) struct ShardActorInput {
     pub(crate) runtime: RuntimeLease,
     pub(crate) shard_owner: ShardLeaseOwner,
     pub(crate) routes: Vec<LiveRouteConfig>,
+    pub(crate) action_hooks: Vec<crate::RouteActionHook>,
+    pub(crate) maximum_action_hook_bytes_per_route: usize,
     pub(crate) maximum_sources_per_route: usize,
     pub(crate) maximum_streams_per_route: usize,
     pub(crate) feature_capacity: LiveFeatureCapacity,
@@ -200,6 +203,17 @@ impl ShardActor {
         handles
             .try_reserve_exact(input.routes.len())
             .map_err(|_| ActorError::Allocation)?;
+        let mut action_hooks = HashMap::new();
+        action_hooks
+            .try_reserve(input.action_hooks.len())
+            .map_err(|_| ActorError::Allocation)?;
+        for hook in input.action_hooks {
+            hook.validate_retained_bytes(input.maximum_action_hook_bytes_per_route)?;
+            let route = hook.route().clone();
+            if action_hooks.insert(route, hook).is_some() {
+                return Err(ActorError::DuplicateActionHook);
+            }
+        }
         for route in input.routes {
             let cross_venue = input.cross_venue.route(route.route());
             let generations =
@@ -216,13 +230,16 @@ impl ShardActor {
                 liveness.clone(),
             )?;
             let features = RouteFeatureState::try_new(input.feature_capacity, route.depth())?;
+            let route_key = route.route().clone();
+            let action_hook = action_hooks.remove(&route_key);
             if routes
                 .insert(
-                    route.route().clone(),
+                    route_key.clone(),
                     RouteOwner {
                         processor,
                         generations,
                         features,
+                        action_hook,
                         cross_venue_publisher: cross_venue
                             .as_ref()
                             .map(|(publisher, _)| publisher.clone()),
@@ -233,6 +250,9 @@ impl ShardActor {
             {
                 return Err(ActorError::DuplicateRoute);
             }
+        }
+        if !action_hooks.is_empty() {
+            return Err(ActorError::UnknownActionHook);
         }
         let book_scratch = BookProcessingScratch::try_new(input.maximum_book_items_per_message)
             .map_err(|_| ActorError::Allocation)?;
@@ -382,6 +402,10 @@ pub(crate) enum ActorError {
     Allocation,
     #[error("actor route table contained a duplicate route")]
     DuplicateRoute,
+    #[error("actor received duplicate action hook ownership")]
+    DuplicateActionHook,
+    #[error("actor received action hook ownership for an unknown route")]
+    UnknownActionHook,
     #[error("actor received a command for an unknown route")]
     UnknownRoute,
     #[error("actor received a command whose generation is no longer current")]
@@ -406,6 +430,8 @@ pub(crate) enum ActorError {
     Publish(#[from] crate::snapshot::SnapshotPublishError),
     #[error(transparent)]
     Feature(#[from] crate::RouteFeatureError),
+    #[error(transparent)]
+    ActionHook(#[from] crate::RouteActionHookError),
 }
 
 impl ActorError {
@@ -413,11 +439,14 @@ impl ActorError {
         match self {
             Self::Allocation
             | Self::DuplicateRoute
+            | Self::DuplicateActionHook
+            | Self::UnknownActionHook
             | Self::UnknownRoute
             | Self::RuntimeClosed
             | Self::ShardClosed
             | Self::ClockRange
             | Self::Feature(_)
+            | Self::ActionHook(_)
             | Self::Snapshot(_)
             | Self::Publish(_)
             | Self::StartupReceiverDropped

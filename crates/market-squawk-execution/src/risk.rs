@@ -2,16 +2,22 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::Duration;
 
 use market_squawk_domain::{
-    DataQuality, InstrumentExecutionTerms, OrderSide, OrderType, PriceTicks, Timestamp,
+    ApprovalId, DataQuality, InstrumentExecutionTerms, OrderSide, OrderType, PriceTicks, Timestamp,
 };
 use thiserror::Error;
 
-use crate::clock::system_now;
+use market_squawk_live::{CurrentAuthorityGate, LiveExecutionCapability};
+
+use crate::approval::approved_order_from_risk;
+use crate::audit::{ExecutionAuditContext, ExecutionAuditPermit};
+use crate::clock::{monotonic_deadline, system_now};
 use crate::{
     AccountReservationError, AccountRiskCoordinator, AccountRiskReservation, AccountRiskViolation,
-    OrderIntent, RiskLimits,
+    ApprovedOrder, ExecutionAuditEvent, ExecutionAuditKind, ExecutionAuditWriter,
+    ExecutionMarketReference, OrderIntent, RiskLimits, RiskPolicyIdentity,
 };
 
 /// Structurally validated but authority-free market input for pre-dispatch risk.
@@ -121,6 +127,16 @@ pub enum RiskRejectionCode {
     ClockFailure,
     /// Wall time regressed within this service instance.
     ClockRollback,
+    /// The actor-owned live capability was stale, revoked, expired, or transplanted.
+    Authority,
+    /// A supposedly non-nil order identity could not form its one-use approval identity.
+    ApprovalIdentity,
+    /// Mandatory bounded audit capacity was unavailable before account mutation.
+    AuditUnavailable,
+    /// The exact risk policy deadline passed.
+    PolicyExpired,
+    /// The committed canonical book cannot supply an executable side price.
+    MarketDepthUnavailable,
     /// Market data is not direct and verified.
     SourceQuality,
     /// Source authorization, coverage, or health is ineligible.
@@ -187,22 +203,293 @@ pub enum PreAuthorityRiskOutcome {
     Reserved(AccountRiskReservation),
 }
 
+/// Full current-authority risk result. Only the approved variant can enter dispatch.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "approval keeps bounded depth and one-use authority inline to avoid a live-path allocation"
+)]
+#[derive(Debug)]
+pub enum RiskOutcome {
+    /// One or more checks failed without retaining a new account reservation.
+    Rejected(RiskRejection),
+    /// Current authority and account capacity were atomically bound into one opaque approval.
+    Approved(ApprovedOrder),
+}
+
+/// Startup-fixed current risk policy chronology.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RiskServiceConfig {
+    /// Fixed policy and ruleset identity retained through approval, dispatch, and audit.
+    pub policy: RiskPolicyIdentity,
+    /// Inclusive risk-policy deadline.
+    pub policy_valid_until: Timestamp,
+    /// Maximum additional wall/monotonic lifetime of one approval.
+    pub maximum_approval_lifetime: Duration,
+}
+
+/// Risk service construction failure.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum RiskServiceError {
+    /// Approval lifetime must make bounded positive progress.
+    #[error("maximum approval lifetime must be positive")]
+    ZeroApprovalLifetime,
+}
+
 /// Deterministic risk policy owner with authoritative account coordination and trusted time.
 #[derive(Debug)]
 pub struct RiskService {
     accounts: Arc<AccountRiskCoordinator>,
     limits: RiskLimits,
+    audit: ExecutionAuditWriter,
+    config: RiskServiceConfig,
     last_wall_nanos: AtomicI64,
 }
 
 impl RiskService {
-    /// Creates a risk service over an authoritative account coordinator.
-    pub fn new(accounts: Arc<AccountRiskCoordinator>, limits: RiskLimits) -> Self {
-        Self {
+    /// Creates a risk service over authoritative account state and mandatory bounded audit.
+    pub fn try_new(
+        accounts: Arc<AccountRiskCoordinator>,
+        limits: RiskLimits,
+        audit: ExecutionAuditWriter,
+        config: RiskServiceConfig,
+    ) -> Result<Self, RiskServiceError> {
+        if config.maximum_approval_lifetime.is_zero() {
+            return Err(RiskServiceError::ZeroApprovalLifetime);
+        }
+        Ok(Self {
             accounts,
             limits,
+            audit,
+            config,
             last_wall_nanos: AtomicI64::new(i64::MIN),
+        })
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        // The coordinator is an independently composed shared owner charged once by the
+        // application memory model. A route hook retains only this Arc handle.
+        std::mem::size_of::<Self>().saturating_add(self.limits.retained_byte_ceiling())
+    }
+
+    /// Consumes actor-owned live authority exactly once and approves only after mandatory audit
+    /// admission and atomic account reservation.
+    pub fn evaluate(
+        &mut self,
+        authority_gate: &mut CurrentAuthorityGate<'_>,
+        capability: LiveExecutionCapability,
+        intent: OrderIntent,
+        market: &ExecutionMarketReference,
+    ) -> RiskOutcome {
+        let order_id = intent.order_id();
+        let approval_id = match ApprovalId::try_from(order_id.as_uuid()) {
+            Ok(approval_id) => approval_id,
+            Err(_) => {
+                return RiskOutcome::Rejected(RiskRejection::new(vec![
+                    RiskRejectionCode::ApprovalIdentity,
+                ]));
+            }
+        };
+        let audit = match self.audit.try_reserve() {
+            Ok(permit) => permit,
+            Err(_) => {
+                return RiskOutcome::Rejected(RiskRejection::new(vec![
+                    RiskRejectionCode::AuditUnavailable,
+                ]));
+            }
+        };
+        let now = match system_now() {
+            Ok(now) => now,
+            Err(_) => {
+                let context = ExecutionAuditContext::from_risk(
+                    approval_id,
+                    &intent,
+                    *market,
+                    None,
+                    self.config.policy,
+                    intent.expires_at().min(self.config.policy_valid_until),
+                );
+                let reasons = [RiskRejectionCode::ClockFailure];
+                commit_audit(
+                    audit,
+                    ExecutionAuditKind::RiskRejected,
+                    context,
+                    intent.signal_at(),
+                    &reasons,
+                );
+                return RiskOutcome::Rejected(RiskRejection::new(reasons.to_vec()));
+            }
+        };
+        let authority = match authority_gate.consume(capability) {
+            Ok(authority) => authority,
+            Err(_) => {
+                let reasons = [RiskRejectionCode::Authority];
+                let context = ExecutionAuditContext::from_risk(
+                    approval_id,
+                    &intent,
+                    *market,
+                    None,
+                    self.config.policy,
+                    intent.expires_at().min(self.config.policy_valid_until),
+                );
+                commit_audit(
+                    audit,
+                    ExecutionAuditKind::RiskRejected,
+                    context,
+                    now.wall,
+                    &reasons,
+                );
+                return RiskOutcome::Rejected(RiskRejection::new(reasons.to_vec()));
+            }
+        };
+        let mut reasons = Vec::new();
+        let previous = self
+            .last_wall_nanos
+            .fetch_max(now.wall.unix_nanos(), Ordering::AcqRel);
+        if now.wall.unix_nanos() < previous {
+            reasons.push(RiskRejectionCode::ClockRollback);
         }
+        if authority.validate_current().is_err() {
+            reasons.push(RiskRejectionCode::Authority);
+        }
+        if now.wall > self.config.policy_valid_until {
+            reasons.push(RiskRejectionCode::PolicyExpired);
+        }
+        let execution_price = market.execution_price(intent.side());
+        self.evaluate_current_market(&intent, market, execution_price, now.wall, &mut reasons);
+        if let Some(execution_price) = execution_price
+            && let Err(rejection) = self.accounts.assess(&intent, execution_price, &self.limits)
+        {
+            extend_account_reasons(&mut reasons, &rejection);
+        }
+        if !reasons.is_empty() {
+            let context = ExecutionAuditContext::from_risk(
+                approval_id,
+                &intent,
+                *market,
+                Some(&authority),
+                self.config.policy,
+                intent
+                    .expires_at()
+                    .min(authority.valid_until())
+                    .min(self.config.policy_valid_until),
+            );
+            commit_audit(
+                audit,
+                ExecutionAuditKind::RiskRejected,
+                context,
+                now.wall,
+                &reasons,
+            );
+            return RiskOutcome::Rejected(RiskRejection::new(reasons));
+        }
+        let Some(execution_price) = execution_price else {
+            let reasons = [RiskRejectionCode::MarketDepthUnavailable];
+            let context = ExecutionAuditContext::from_risk(
+                approval_id,
+                &intent,
+                *market,
+                Some(&authority),
+                self.config.policy,
+                intent
+                    .expires_at()
+                    .min(authority.valid_until())
+                    .min(self.config.policy_valid_until),
+            );
+            commit_audit(
+                audit,
+                ExecutionAuditKind::RiskRejected,
+                context,
+                now.wall,
+                &reasons,
+            );
+            return RiskOutcome::Rejected(RiskRejection::new(reasons.to_vec()));
+        };
+        let reservation = match self
+            .accounts
+            .try_reserve(&intent, execution_price, &self.limits)
+        {
+            Ok(reservation) => reservation,
+            Err(rejection) => {
+                extend_account_reasons(&mut reasons, &rejection);
+                let context = ExecutionAuditContext::from_risk(
+                    approval_id,
+                    &intent,
+                    *market,
+                    Some(&authority),
+                    self.config.policy,
+                    intent
+                        .expires_at()
+                        .min(authority.valid_until())
+                        .min(self.config.policy_valid_until),
+                );
+                commit_audit(
+                    audit,
+                    ExecutionAuditKind::RiskRejected,
+                    context,
+                    now.wall,
+                    &reasons,
+                );
+                return RiskOutcome::Rejected(RiskRejection::new(reasons));
+            }
+        };
+        let valid_until = intent
+            .expires_at()
+            .min(authority.valid_until())
+            .min(reservation.valid_until())
+            .min(self.config.policy_valid_until);
+        let remaining = valid_until
+            .unix_nanos()
+            .checked_sub(now.wall.unix_nanos())
+            .unwrap_or(-1);
+        let maximum =
+            i64::try_from(self.config.maximum_approval_lifetime.as_nanos()).unwrap_or(i64::MAX);
+        let monotonic_deadline = match monotonic_deadline(now, remaining.min(maximum)) {
+            Ok(deadline) if remaining >= 0 => deadline,
+            _ => {
+                let reasons = [RiskRejectionCode::ClockFailure];
+                let context = ExecutionAuditContext::from_risk(
+                    approval_id,
+                    &intent,
+                    *market,
+                    Some(&authority),
+                    self.config.policy,
+                    valid_until,
+                );
+                commit_audit(
+                    audit,
+                    ExecutionAuditKind::RiskRejected,
+                    context,
+                    now.wall,
+                    &reasons,
+                );
+                return RiskOutcome::Rejected(RiskRejection::new(reasons.to_vec()));
+            }
+        };
+        let context = ExecutionAuditContext::from_risk(
+            approval_id,
+            &intent,
+            *market,
+            Some(&authority),
+            self.config.policy,
+            valid_until,
+        );
+        commit_audit(
+            audit,
+            ExecutionAuditKind::RiskApproved,
+            context,
+            now.wall,
+            &[],
+        );
+        RiskOutcome::Approved(approved_order_from_risk(
+            approval_id,
+            intent,
+            *market,
+            authority,
+            reservation,
+            self.config.policy,
+            valid_until,
+            monotonic_deadline,
+        ))
     }
 
     /// Runs every deterministic pre-authority check and atomically reserves only on success.
@@ -259,6 +546,9 @@ impl RiskService {
         now: Timestamp,
         reasons: &mut Vec<RiskRejectionCode>,
     ) {
+        if intent.maximum_slippage().get() > self.limits.maximum_slippage().get() {
+            reasons.push(RiskRejectionCode::PolicySlippageLimit);
+        }
         if market.quality != DataQuality::DirectVerified
             || intent.required_quality() != DataQuality::DirectVerified
         {
@@ -267,7 +557,7 @@ impl RiskService {
         if !market.source_eligible {
             reasons.push(RiskRejectionCode::SourceIneligible);
         }
-        if now >= market.valid_until {
+        if now > market.valid_until {
             reasons.push(RiskRejectionCode::SourceStale);
         }
         if market.observed_at > now {
@@ -282,7 +572,7 @@ impl RiskService {
         if market.execution_terms != intent.execution_terms() {
             reasons.push(RiskRejectionCode::InstrumentDefinitionMismatch);
         }
-        if now >= intent.expires_at() {
+        if now > intent.expires_at() {
             reasons.push(RiskRejectionCode::IntentExpired);
         }
         if market.reference_price.get() == 0 {
@@ -317,6 +607,41 @@ impl RiskService {
             reasons.push(RiskRejectionCode::StopNotTriggered);
         }
     }
+
+    fn evaluate_current_market(
+        &self,
+        intent: &OrderIntent,
+        market: &ExecutionMarketReference,
+        execution_price: Option<PriceTicks>,
+        now: Timestamp,
+        reasons: &mut Vec<RiskRejectionCode>,
+    ) {
+        if intent.maximum_slippage().get() > self.limits.maximum_slippage().get() {
+            reasons.push(RiskRejectionCode::PolicySlippageLimit);
+        }
+        if market.execution_terms() != intent.execution_terms() {
+            reasons.push(RiskRejectionCode::InstrumentDefinitionMismatch);
+        }
+        if market.observed_at() > now {
+            reasons.push(RiskRejectionCode::MarketTimestampInFuture);
+        }
+        if market.observed_at() < intent.signal_at() {
+            reasons.push(RiskRejectionCode::MarketPredatesSignal);
+        }
+        if now > intent.expires_at() {
+            reasons.push(RiskRejectionCode::IntentExpired);
+        }
+        let Some(execution_price) = execution_price else {
+            reasons.push(RiskRejectionCode::MarketDepthUnavailable);
+            return;
+        };
+        if violates_limit(intent, execution_price) {
+            reasons.push(RiskRejectionCode::OrderPriceLimit);
+        }
+        if !stop_triggered(intent, execution_price) {
+            reasons.push(RiskRejectionCode::StopNotTriggered);
+        }
+    }
 }
 
 fn extend_account_reasons(
@@ -330,6 +655,17 @@ fn extend_account_reasons(
             .copied()
             .map(RiskRejectionCode::Account),
     );
+}
+
+fn commit_audit(
+    permit: ExecutionAuditPermit,
+    kind: ExecutionAuditKind,
+    context: ExecutionAuditContext,
+    observed_at: Timestamp,
+    reasons: &[RiskRejectionCode],
+) {
+    let event = ExecutionAuditEvent::from_risk_context(kind, context, observed_at, reasons);
+    permit.commit(event);
 }
 
 fn violates_limit(intent: &OrderIntent, execution_price: PriceTicks) -> bool {

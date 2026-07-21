@@ -1,6 +1,6 @@
 use market_squawk_live::{
-    ActionHookDisposition, CommittedActionContext, CurrentAuthorityGate, LiveActionHook,
-    LiveActionHookError,
+    ActionAuthorityIssueLimit, ActionHookDisposition, CommittedActionContext, CurrentAuthorityGate,
+    LiveActionHook, LiveActionHookError,
 };
 use static_assertions::{assert_impl_all, assert_not_impl_any};
 
@@ -22,6 +22,10 @@ impl LiveActionHook for NoAction {
 
     fn retained_bytes(&self) -> Result<usize, LiveActionHookError> {
         Ok(std::mem::size_of::<Self>())
+    }
+
+    fn maximum_authority_issues(&self) -> ActionAuthorityIssueLimit {
+        ActionAuthorityIssueLimit::MIN
     }
 }
 
