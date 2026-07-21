@@ -402,6 +402,7 @@ impl FredSource {
         let mut offset = 0_usize;
         let mut expected_count = None;
         let mut previous_observation_date = None;
+        let mut previous_realtime_start = None;
         let mut revisions_for_previous_observation = 0_u32;
         while objects.len() < usize::from(request.max_results()) {
             let fetched = self
@@ -444,6 +445,13 @@ impl FredSource {
                     ));
                 }
                 if previous_observation_date == Some(observation_date) {
+                    if previous_realtime_start
+                        .is_some_and(|previous| observation.realtime_start() <= previous)
+                    {
+                        return Err(ExtractionSourceError::Source(
+                            SourceError::InvalidProtocolState,
+                        ));
+                    }
                     revisions_for_previous_observation =
                         revisions_for_previous_observation.checked_add(1).ok_or(
                             ExtractionSourceError::Source(SourceError::InvalidProtocolState),
@@ -452,6 +460,7 @@ impl FredSource {
                     previous_observation_date = Some(observation_date);
                     revisions_for_previous_observation = 1;
                 }
+                previous_realtime_start = Some(observation.realtime_start());
             }
             let evidence = evidence_for_payload(&fetched.response.body, &fetched.public_url)
                 .map_err(map_adapter_error)?;

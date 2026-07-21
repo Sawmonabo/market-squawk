@@ -21,6 +21,11 @@ fn preserves_closed_realtime_dates_missing_values_and_page_cursor() -> TestResul
     let vintages = FredVintagePage::parse(include_bytes!("../fixtures/vintages.json"), limits)?;
     assert_eq!(vintages.next_offset(), Some(2));
     assert_eq!(vintages.vintage_dates()[0].to_string(), "2024-01-10");
+
+    let mut unstable: serde_json::Value =
+        serde_json::from_slice(include_bytes!("../fixtures/observations.json"))?;
+    unstable["observations"][1]["date"] = "2023-01-01".into();
+    assert!(FredObservationPage::parse(&serde_json::to_vec(&unstable)?, limits).is_err());
     Ok(())
 }
 

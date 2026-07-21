@@ -158,6 +158,8 @@ impl FredObservationPage {
         }
 
         let mut observations = Vec::with_capacity(wire.observations.len());
+        let mut previous_observation_date = None;
+        let mut previous_realtime_start = None;
         for observation in wire.observations {
             validate_strings(
                 [
@@ -170,11 +172,20 @@ impl FredObservationPage {
             )?;
             let row_start = parse_date(&observation.realtime_start)?;
             let row_end = parse_date(&observation.realtime_end)?;
+            let observation_date = parse_date(&observation.date)?;
             if row_start > row_end {
                 return Err(FredProtocolError::InvalidField(
                     "observation realtime interval",
                 ));
             }
+            if previous_observation_date.is_some_and(|previous| observation_date < previous)
+                || (previous_observation_date == Some(observation_date)
+                    && previous_realtime_start.is_some_and(|previous| row_start <= previous))
+            {
+                return Err(FredProtocolError::InvalidField("observation ordering"));
+            }
+            previous_observation_date = Some(observation_date);
+            previous_realtime_start = Some(row_start);
             let value = if observation.value == "." {
                 None
             } else {
@@ -186,7 +197,7 @@ impl FredObservationPage {
             observations.push(FredObservation {
                 realtime_start: row_start,
                 realtime_end: row_end,
-                observation_date: parse_date(&observation.date)?,
+                observation_date,
                 raw_value: observation.value,
                 value,
             });

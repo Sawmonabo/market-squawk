@@ -15,8 +15,9 @@ research temporal schema changes.
   exclusive supersession coordinate. `9999-12-31` remains open-ended.
 - FRED `output_type=1` can return multiple real-time-period rows for one effective observation
   date. Canonical response order therefore assigns a deterministic one-based revision ordinal per
-  effective observation. Discovery carries the prior same-date count across page boundaries in the
-  exact page object identity; refetch must still match the page's exact content evidence.
+  effective observation only after validating strictly increasing `realtime_start` within each
+  same-date group, including across page boundaries. Discovery carries the prior same-date count in
+  the exact page object identity; refetch must still match the page's exact content evidence.
 - Effective observation time and revision transaction time are independent axes. A historical
   revision may have been superseded before local ingestion, and a forecast may be superseded before
   its future effective date. Only the same-axis invariant `superseded > published` is enforced.
