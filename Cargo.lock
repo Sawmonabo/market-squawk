@@ -3387,6 +3387,9 @@ name = "market-squawk-analytics"
 version = "0.1.0"
 dependencies = [
  "market-squawk-domain",
+ "proptest",
+ "rust_decimal",
+ "sha2",
  "thiserror",
 ]
 
