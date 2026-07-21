@@ -2,6 +2,8 @@
 
 use std::ffi::OsString;
 use std::io::{BufReader, BufWriter, Read, Write};
+#[cfg(all(feature = "capture-test", debug_assertions))]
+use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -15,6 +17,10 @@ use crate::{LocalPaths, RawCaptureRecord};
 const TEST_MODE_ENVIRONMENT: &str = "MARKET_SQUAWK_CAPTURE_HELPER_TEST_MODE";
 #[cfg(all(feature = "capture-test", debug_assertions))]
 const TEST_STALL_AFTER_APPEND: &str = "stall-after-append";
+#[cfg(all(feature = "capture-test", debug_assertions))]
+const TEST_DELAY_SHUTDOWN: &str = "delay-shutdown-after-post-handshake-failure";
+#[cfg(all(feature = "capture-test", debug_assertions))]
+const TEST_SHUTDOWN_DELAY: Duration = Duration::from_millis(250);
 
 pub fn run_capture_helper(
     arguments: impl IntoIterator<Item = OsString>,
@@ -112,6 +118,7 @@ pub fn run_capture_helper(
             }
             MessageKind::Shutdown => {
                 validate_control(&header, MessageKind::Shutdown)?;
+                delay_shutdown_for_test();
                 journal
                     .flush()
                     .map_err(|_error| CaptureHelperError::Journal)?;
@@ -173,6 +180,13 @@ fn should_stall_after_append() -> bool {
     }
 }
 
+fn delay_shutdown_for_test() {
+    #[cfg(all(feature = "capture-test", debug_assertions))]
+    if std::env::var(TEST_MODE_ENVIRONMENT).is_ok_and(|mode| mode == TEST_DELAY_SHUTDOWN) {
+        std::thread::sleep(TEST_SHUTDOWN_DELAY);
+    }
+}
+
 #[cfg(all(feature = "capture-test", debug_assertions))]
 pub(super) const fn test_mode_environment() -> &'static str {
     TEST_MODE_ENVIRONMENT
@@ -181,6 +195,11 @@ pub(super) const fn test_mode_environment() -> &'static str {
 #[cfg(all(feature = "capture-test", debug_assertions))]
 pub(super) const fn test_stall_after_append() -> &'static str {
     TEST_STALL_AFTER_APPEND
+}
+
+#[cfg(all(feature = "capture-test", debug_assertions))]
+pub(super) const fn test_delay_shutdown() -> &'static str {
+    TEST_DELAY_SHUTDOWN
 }
 
 #[derive(Debug, Error)]

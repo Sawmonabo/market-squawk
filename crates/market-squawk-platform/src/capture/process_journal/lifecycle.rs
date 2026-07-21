@@ -11,7 +11,10 @@ use super::config::ProcessJournalCaptureConfig;
 use super::process::{
     ProcessOwner, ProcessSupervisionError, ProcessWaitHandle, TerminalReaperReservation,
 };
-use super::sink::{ProcessJournalSink, ProcessJournalSinkStartError};
+use super::sink::{
+    ProcessJournalSink, ProcessJournalSinkStartError, StartedProcessJournalSink,
+    wait_for_startup_cleanup,
+};
 use crate::capture::writer::{
     CaptureShutdownStatus, CaptureWorkerTermination, CaptureWriterHandle, CaptureWriterSpawnError,
     PendingCaptureWriter, spawn_capture_writer,
@@ -100,6 +103,94 @@ enum CompanionCommand<B: CaptureAuthorityBundle> {
         pending: PendingCaptureWriter<B>,
         process: ProcessWaitHandle,
     },
+}
+
+type CommittedStartupResources<B> = (
+    ProcessOwner,
+    TerminalReaperReservation,
+    mpsc::SyncSender<CompanionCommand<B>>,
+    JoinHandle<()>,
+);
+
+#[derive(Debug)]
+struct PostHandshakeStartupOwner<B: CaptureAuthorityBundle> {
+    sink: Option<ProcessJournalSink>,
+    process: Option<ProcessOwner>,
+    reaper: Option<TerminalReaperReservation>,
+    cleanup_deadline: Duration,
+    companion_sender: Option<mpsc::SyncSender<CompanionCommand<B>>>,
+    companion: Option<JoinHandle<()>>,
+    committed: bool,
+}
+
+impl<B: CaptureAuthorityBundle> PostHandshakeStartupOwner<B> {
+    fn new(started: StartedProcessJournalSink, cleanup_deadline: Duration) -> Self {
+        Self {
+            sink: Some(started.sink),
+            process: Some(started.process),
+            reaper: Some(started.reaper),
+            cleanup_deadline,
+            companion_sender: None,
+            companion: None,
+            committed: false,
+        }
+    }
+
+    fn start_companion(&mut self) -> Result<(), std::io::Error> {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let companion = std::thread::Builder::new()
+            .name("msq-capture-terminal".to_owned())
+            .stack_size(128 * 1024)
+            .spawn(move || run_companion(receiver))?;
+        self.companion_sender = Some(sender);
+        self.companion = Some(companion);
+        Ok(())
+    }
+
+    fn take_sink(&mut self) -> Option<ProcessJournalSink> {
+        self.sink.take()
+    }
+
+    fn commit(mut self) -> Option<CommittedStartupResources<B>> {
+        let resources = Some((
+            self.process.take()?,
+            self.reaper.take()?,
+            self.companion_sender.take()?,
+            self.companion.take()?,
+        ));
+        self.committed = true;
+        resources
+    }
+}
+
+impl<B: CaptureAuthorityBundle> Drop for PostHandshakeStartupOwner<B> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        if let Some(process) = self.process.as_ref() {
+            process.kill();
+        }
+        drop(self.sink.take());
+        if let Some(sender) = self.companion_sender.take() {
+            let _stopped = sender.try_send(CompanionCommand::Stop);
+        }
+        let process = self.process.take();
+        let reaper = self.reaper.take();
+        match (process, reaper) {
+            (Some(process), Some(reaper)) => wait_for_startup_cleanup(
+                process,
+                self.companion.take(),
+                reaper,
+                self.cleanup_deadline,
+            ),
+            (_process, _reaper) => {
+                if let Some(companion) = self.companion.take() {
+                    let _joined = companion.join();
+                }
+            }
+        }
+    }
 }
 
 /// Sole live owner of a process-isolated journal capture worker.
@@ -275,26 +366,39 @@ pub fn spawn_process_journal_capture_writer<B: CaptureAuthorityBundle>(
     config: ProcessJournalCaptureConfig,
     policy: CaptureWriterPolicy,
 ) -> Result<ProcessJournalCaptureWriter<B>, ProcessCaptureWriterSpawnError> {
+    let cleanup_deadline = config.post_handshake_cleanup_deadline();
+    #[cfg(all(feature = "capture-test", debug_assertions))]
+    let inject_post_handshake_failure = config.inject_post_handshake_failure();
     let started = ProcessJournalSink::try_start(config)?;
-    let (companion_sender, companion_receiver) = mpsc::sync_channel(1);
-    let companion = std::thread::Builder::new()
-        .name("msq-capture-terminal".to_owned())
-        .stack_size(128 * 1024)
-        .spawn(move || run_companion(companion_receiver))
+    let mut startup = PostHandshakeStartupOwner::new(started, cleanup_deadline);
+    #[cfg(all(feature = "capture-test", debug_assertions))]
+    if inject_post_handshake_failure {
+        let rollback_started = Instant::now();
+        drop(startup);
+        return Err(
+            ProcessCaptureWriterSpawnError::InjectedPostHandshakeFailure {
+                rollback_elapsed: rollback_started.elapsed(),
+            },
+        );
+    }
+    startup
+        .start_companion()
         .map_err(ProcessCaptureWriterSpawnError::CompanionThread)?;
-    let capture = match spawn_capture_writer(writer, started.sink, policy) {
+    let sink = startup
+        .take_sink()
+        .ok_or(ProcessCaptureWriterSpawnError::MissingStartupResource)?;
+    let capture = match spawn_capture_writer(writer, sink, policy) {
         Ok(capture) => capture,
-        Err(error) => {
-            let _stopped = companion_sender.try_send(CompanionCommand::Stop);
-            let _joined = companion.join();
-            return Err(ProcessCaptureWriterSpawnError::CaptureWriter(error));
-        }
+        Err(error) => return Err(ProcessCaptureWriterSpawnError::CaptureWriter(error)),
     };
+    let (process, reaper, companion_sender, companion) = startup
+        .commit()
+        .ok_or(ProcessCaptureWriterSpawnError::MissingStartupResource)?;
     Ok(ProcessJournalCaptureWriter {
         writer: Some(capture),
         pending: None,
-        process: Some(started.process),
-        reaper: Some(started.reaper),
+        process: Some(process),
+        reaper: Some(reaper),
         companion_sender,
         companion: Some(companion),
         completed: false,
@@ -347,6 +451,16 @@ pub enum ProcessCaptureWriterSpawnError {
     /// The in-process capture writer refused startup.
     #[error(transparent)]
     CaptureWriter(#[from] CaptureWriterSpawnError),
+    /// A post-handshake failure was injected by the deterministic lifecycle test harness.
+    #[cfg(all(feature = "capture-test", debug_assertions))]
+    #[error("capture helper post-handshake startup failure was injected")]
+    InjectedPostHandshakeFailure {
+        /// Time spent killing, closing pipes, and either reaping or transferring ownership.
+        rollback_elapsed: Duration,
+    },
+    /// A proven startup resource was unexpectedly absent during ownership handoff.
+    #[error("capture helper startup ownership was incomplete")]
+    MissingStartupResource,
 }
 
 impl From<ProcessJournalSinkStartError> for ProcessCaptureWriterSpawnError {

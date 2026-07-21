@@ -13,8 +13,10 @@ use uuid::Uuid;
 use super::config::ProcessCaptureHelperTestBehavior;
 use super::config::ProcessJournalCaptureConfig;
 #[cfg(all(feature = "capture-test", debug_assertions))]
-use super::helper::{test_mode_environment, test_stall_after_append};
-use super::process::{ProcessOwner, ProcessSupervisionError, TerminalReaperReservation};
+use super::helper::{test_delay_shutdown, test_mode_environment, test_stall_after_append};
+use super::process::{
+    ProcessOwner, ProcessSupervisionError, ProcessWaitHandle, TerminalReaperReservation,
+};
 use super::protocol::{
     CountingDigestWriter, Header, MessageKind, ProtocolError, VerifyingForwardWriter,
     control_digest, startup_digest,
@@ -39,7 +41,8 @@ pub(super) struct ProcessJournalSink {
     input: BufWriter<ChildStdin>,
     output: BufReader<ChildStdout>,
     next_sequence: u64,
-    shutdown_sent: bool,
+    process: ProcessWaitHandle,
+    shutdown_acknowledged: bool,
 }
 
 impl ProcessJournalSink {
@@ -58,11 +61,14 @@ impl ProcessJournalSink {
             .stderr(Stdio::null())
             .env_clear();
         #[cfg(all(feature = "capture-test", debug_assertions))]
-        if matches!(
-            config.test_behavior(),
-            Some(ProcessCaptureHelperTestBehavior::StallAfterAppend)
-        ) {
-            command.env(test_mode_environment(), test_stall_after_append());
+        if let Some(behavior) = config.test_behavior() {
+            let mode = match behavior {
+                ProcessCaptureHelperTestBehavior::StallAfterAppend => test_stall_after_append(),
+                ProcessCaptureHelperTestBehavior::DelayShutdownAfterPostHandshakeFailure {
+                    ..
+                } => test_delay_shutdown(),
+            };
+            command.env(test_mode_environment(), mode);
         }
         let mut child = command
             .spawn()
@@ -153,7 +159,8 @@ impl ProcessJournalSink {
                 input: BufWriter::new(input),
                 output,
                 next_sequence: 1,
-                shutdown_sent: false,
+                process: process.wait_handle(),
+                shutdown_acknowledged: false,
             },
             process,
             reaper,
@@ -240,18 +247,24 @@ impl CaptureSink for ProcessJournalSink {
         context.checkpoint()?;
         self.control(MessageKind::Flush)
     }
+
+    fn finish(&mut self, context: &CaptureIoContext) -> Result<(), CaptureSinkError> {
+        context.checkpoint()?;
+        self.control(MessageKind::Shutdown)?;
+        self.shutdown_acknowledged = true;
+        Ok(())
+    }
 }
 
 impl Drop for ProcessJournalSink {
     fn drop(&mut self) {
-        if !self.shutdown_sent {
-            self.shutdown_sent = true;
-            let _shutdown = self.control(MessageKind::Shutdown);
+        if !self.shutdown_acknowledged {
+            self.process.kill();
         }
     }
 }
 
-fn wait_for_startup_cleanup(
+pub(super) fn wait_for_startup_cleanup(
     mut process: ProcessOwner,
     bootstrap: Option<JoinHandle<()>>,
     reaper: TerminalReaperReservation,
@@ -260,10 +273,12 @@ fn wait_for_startup_cleanup(
     let expires = Instant::now()
         .checked_add(deadline)
         .unwrap_or_else(Instant::now);
-    while !process.is_reaped() && Instant::now() < expires {
+    while !(process.is_reaped() && bootstrap.as_ref().is_none_or(JoinHandle::is_finished))
+        && Instant::now() < expires
+    {
         std::thread::sleep(STARTUP_REAP_POLL_INTERVAL);
     }
-    if process.is_reaped() {
+    if process.is_reaped() && bootstrap.as_ref().is_none_or(JoinHandle::is_finished) {
         let _joined = process.join_if_reaped();
         if let Some(bootstrap) = bootstrap {
             let _bootstrap = bootstrap.join();

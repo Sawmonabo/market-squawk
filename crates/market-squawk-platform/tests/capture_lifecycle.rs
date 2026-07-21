@@ -14,10 +14,10 @@ use market_squawk_platform::{
     CaptureWriterHandle, CaptureWriterOutcome, CaptureWriterPolicy, CaptureWriterSpawnError,
     CapturedRawRecord, DiagnosticCaptureBundle, DiagnosticCaptureFrame, DiagnosticCaptureReceipt,
     LocalPaths, MemoryCaptureSink, ProcessCaptureHelperTestBehavior,
-    ProcessCaptureShutdownDisposition, ProcessCaptureShutdownPolicy, ProcessJournalCaptureConfig,
-    RawCaptureChannel, RawCaptureControl, RawCapturePublisher,
-    initialize_capture_process_infrastructure, raw_capture_channel, spawn_capture_writer,
-    spawn_process_journal_capture_writer,
+    ProcessCaptureShutdownDisposition, ProcessCaptureShutdownPolicy,
+    ProcessCaptureWriterSpawnError, ProcessJournalCaptureConfig, RawCaptureChannel,
+    RawCaptureControl, RawCapturePublisher, initialize_capture_process_infrastructure,
+    raw_capture_channel, spawn_capture_writer, spawn_process_journal_capture_writer,
 };
 use static_assertions::{assert_impl_all, assert_not_impl_any};
 
@@ -658,6 +658,50 @@ async fn stalled_process_journal_is_killed_reaped_and_releases_its_destination()
         .ok_or("killed helper did not yield a capture-worker termination")?;
     assert!(worker.shutdown_deadline_elapsed());
     assert!(worker.outcome().is_incomplete());
+    drop(control);
+    drop(publisher);
+
+    let successor = paths.open_journal_writer(source)?;
+    drop(successor);
+    Ok(())
+}
+
+#[test]
+fn post_handshake_startup_failure_kills_helper_before_sink_drop()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let paths = LocalPaths::prepare(directory.path().join("data"))?;
+    let source = "capture-lifecycle-startup-rollback";
+    let (publisher, control, writer) = test_capture_channel(
+        NonZeroUsize::MIN,
+        DiagnosticCaptureBundle::new(identity(1)?),
+    )?;
+    let process = ProcessJournalCaptureConfig::try_new_for_test(
+        paths.root(),
+        source,
+        env!("CARGO_BIN_EXE_market-squawk-platform-capture-helper-test"),
+        ProcessCaptureHelperTestBehavior::DelayShutdownAfterPostHandshakeFailure {
+            cleanup_deadline: Duration::from_millis(25),
+        },
+        Duration::from_secs(1),
+    )?;
+
+    let error =
+        match spawn_process_journal_capture_writer(writer, process, CaptureWriterPolicy::default())
+        {
+            Ok(_writer) => {
+                return Err(
+                    "injected post-handshake startup failure unexpectedly returned a writer".into(),
+                );
+            }
+            Err(error) => error,
+        };
+
+    let ProcessCaptureWriterSpawnError::InjectedPostHandshakeFailure { rollback_elapsed } = error
+    else {
+        return Err(format!("unexpected startup error: {error:?}").into());
+    };
+    assert!(rollback_elapsed < Duration::from_millis(150));
     drop(control);
     drop(publisher);
 

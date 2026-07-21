@@ -131,6 +131,14 @@ pub trait CaptureSink: fmt::Debug + Send + 'static {
     ) -> Result<(), CaptureSinkError>;
     /// Flushes buffered records durably according to the sink contract.
     fn flush(&mut self, context: &CaptureIoContext) -> Result<(), CaptureSinkError>;
+    /// Completes the sink's explicit shutdown protocol after the capture queue is drained.
+    ///
+    /// The default implementation performs a final durable flush. Sinks with a distinct shutdown
+    /// handshake override this method so normal completion can be acknowledged without placing
+    /// blocking protocol work in [`Drop`].
+    fn finish(&mut self, context: &CaptureIoContext) -> Result<(), CaptureSinkError> {
+        self.flush(context)
+    }
 }
 
 impl CaptureSink for JournalWriter {

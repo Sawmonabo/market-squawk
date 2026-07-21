@@ -383,7 +383,7 @@ fn drain_and_flush<B: CaptureAuthorityBundle, S: CaptureSink, T: CaptureQueueTra
     if io_context.deadline_reached() {
         return shutdown_deadline_outcome(state, progress.records_written);
     }
-    match sink.flush(io_context) {
+    match sink.finish(io_context) {
         Ok(()) => {}
         Err(CaptureSinkError::ShutdownDeadline) => {
             return shutdown_deadline_outcome(state, progress.records_written);

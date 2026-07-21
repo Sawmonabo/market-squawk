@@ -104,9 +104,28 @@ impl ProcessJournalCaptureConfig {
         self.startup_deadline
     }
 
+    pub(super) fn post_handshake_cleanup_deadline(&self) -> Duration {
+        #[cfg(all(feature = "capture-test", debug_assertions))]
+        if let Some(ProcessCaptureHelperTestBehavior::DelayShutdownAfterPostHandshakeFailure {
+            cleanup_deadline,
+        }) = self.test_behavior
+        {
+            return cleanup_deadline;
+        }
+        self.startup_deadline
+    }
+
     #[cfg(all(feature = "capture-test", debug_assertions))]
     pub(super) const fn test_behavior(&self) -> Option<ProcessCaptureHelperTestBehavior> {
         self.test_behavior
+    }
+
+    #[cfg(all(feature = "capture-test", debug_assertions))]
+    pub(super) fn inject_post_handshake_failure(&self) -> bool {
+        matches!(
+            self.test_behavior,
+            Some(ProcessCaptureHelperTestBehavior::DelayShutdownAfterPostHandshakeFailure { .. })
+        )
     }
 }
 
@@ -115,6 +134,7 @@ impl ProcessJournalCaptureConfig {
 #[doc(hidden)]
 pub enum ProcessCaptureHelperTestBehavior {
     StallAfterAppend,
+    DelayShutdownAfterPostHandshakeFailure { cleanup_deadline: Duration },
 }
 
 fn validated_sibling_helper() -> Result<PathBuf, ProcessJournalCaptureConfigError> {
