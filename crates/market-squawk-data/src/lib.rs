@@ -13,6 +13,7 @@ mod authority_transition;
 mod blocking_supervisor;
 mod catalog;
 mod corporate_actions;
+mod dataset_builder;
 mod ingest;
 mod manifest;
 mod migrations;
@@ -51,6 +52,13 @@ pub use corporate_actions::{
     CorporateActionError, CorporateActionExclusion, CorporateActionExclusionReason,
     CorporateActionLimits, CorporateActionPlan, CorporateActionPolicy, CorporateActionRecord,
     MAX_CORPORATE_ACTION_RETAINED_BYTES, MAX_CORPORATE_ACTIONS,
+};
+pub use dataset_builder::{
+    ChronologicalSplitPolicy, ComponentKind, ComponentSelector, ComponentValue, DatasetBuildError,
+    DatasetBuildInputs, DatasetBuildLimits, DatasetBuildPolicy, DatasetBuildRequest,
+    DatasetBuilder, DatasetBuilderService, DatasetExample, DatasetOutputAuthorization,
+    DatasetSplit, DatasetSplitCounts, FeatureLabelComponentInput, FeatureLabelComponentSpec,
+    FeatureLabelDataset, MissingValuePolicy,
 };
 pub use ingest::{
     AnalyticalDataService, CommittedDataset, CompactionRequest, IngestError,

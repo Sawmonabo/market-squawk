@@ -521,6 +521,15 @@ impl AnalyticalDataService {
         Arc::clone(&self.objects)
     }
 
+    /// Returns the rights-bound point-in-time dataset builder for this exact catalog/root pair.
+    pub fn dataset_builder(&self) -> crate::DatasetBuilderService<'_> {
+        crate::DatasetBuilderService::new(
+            self,
+            Arc::clone(&self.authority),
+            self.operation_gate.clone(),
+        )
+    }
+
     /// Returns object-safe observed-revision authority over this exact shared catalog writer.
     pub fn observed_revision_authority(&self) -> Arc<dyn ObservedRevisionAuthority> {
         Arc::new(CatalogObservedRevisionAuthority::new(Arc::clone(
@@ -569,6 +578,17 @@ impl AnalyticalDataService {
     /// Resolves one exact immutable generation.
     pub fn pinned(&self, manifest: &DatasetManifestRef) -> Result<PinnedDataset, IngestError> {
         Ok(self.manifests.pinned(manifest)?)
+    }
+
+    /// Resolves a unique derived generation by its complete immutable build identity.
+    pub(crate) fn matching_derived_build(
+        &self,
+        dataset_id: &DatasetId,
+        build_spec_digest: crate::DatasetBuildSpecDigest,
+    ) -> Result<Option<PinnedDataset>, IngestError> {
+        self.manifests
+            .matching_derived_build(dataset_id, build_spec_digest)
+            .map_err(Into::into)
     }
 
     /// Rewrites the current pinned generation into one immutable object without changing rows.
@@ -663,7 +683,7 @@ impl AnalyticalDataService {
         self.commit_plan(
             &authority,
             &reservation,
-            run.state(),
+            &run,
             dataset_name,
             schema,
             plan,
@@ -832,7 +852,7 @@ impl AnalyticalDataService {
         self.commit_plan(
             &authority,
             &reservation,
-            run.state(),
+            &run,
             dataset_name,
             schema,
             plan,
@@ -930,14 +950,14 @@ impl AnalyticalDataService {
         &self,
         authority: &CatalogAuthority,
         reservation: &IngestReservation,
-        state: IngestRunState,
+        run: &crate::IngestRunRecord,
         dataset_name: SourceIdentifier,
         schema: DatasetSchemaRef,
         plan: ManifestPlan,
         published: PublishedObject,
         kind: GenerationKind,
     ) -> Result<CommittedDataset, IngestError> {
-        if state != IngestRunState::Reserved {
+        if run.state() != IngestRunState::Reserved {
             return Err(IngestError::TerminalRun);
         }
         let created_at = published.created_at().max(reservation.requested_at());
@@ -961,6 +981,10 @@ impl AnalyticalDataService {
             publication.manifest(),
             &schema,
             kind,
+            match kind {
+                GenerationKind::Ingest => Some(run),
+                GenerationKind::Compaction | GenerationKind::Derived => None,
+            },
         )?;
         authority.complete_ingest(reservation, ContractCompletion::Succeeded)?;
         Ok(CommittedDataset::new(self.manifests.pinned(&manifest)?))

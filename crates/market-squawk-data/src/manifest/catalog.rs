@@ -21,7 +21,9 @@ use super::{
 };
 use crate::catalog::exact_catalog_file_binding;
 use crate::schema::{DatasetSchemaRef, DatasetSchemaRegistry};
-use crate::{ArtifactRecord, CatalogError, DatasetManifestRecord};
+use crate::{
+    ArtifactRecord, CatalogError, DatasetManifestRecord, IngestRunRecord, SourceOperation,
+};
 
 const REFERENCE_MEMBERSHIP_CHUNK: usize = 128;
 
@@ -228,8 +230,14 @@ impl AnalyticalManifestCatalog {
         anchor: &DatasetManifestRecord,
         schema: &DatasetSchemaRef,
         kind: GenerationKind,
+        source_input: Option<&IngestRunRecord>,
     ) -> Result<DatasetManifestRef, ManifestCatalogError> {
-        if kind == GenerationKind::Derived {
+        if kind == GenerationKind::Derived
+            || !matches!(
+                (kind, source_input),
+                (GenerationKind::Ingest, Some(_)) | (GenerationKind::Compaction, None)
+            )
+        {
             return Err(ManifestCatalogError::GenerationConflict);
         }
         DatasetSchemaRegistry::local().resolve(schema)?;
@@ -253,6 +261,7 @@ impl AnalyticalManifestCatalog {
                 && pinned.manifest.schema == *schema
                 && pinned.generation_kind == kind
                 && pinned.build_spec_digest.is_none()
+                && generation_source_input_matches(&transaction, &existing, kind, source_input)?
             {
                 transaction.commit()?;
                 return Ok(existing);
@@ -337,6 +346,12 @@ impl AnalyticalManifestCatalog {
                 i64::from(parent.is_some()),
                 anchor.created_at().unix_nanos(),
             ],
+        )?;
+        insert_generation_source_input(
+            &transaction,
+            transaction.last_insert_rowid(),
+            kind,
+            source_input,
         )?;
         let prior_objects = previous
             .as_ref()
@@ -555,6 +570,52 @@ impl AnalyticalManifestCatalog {
             load_latest(&connection, dataset_id, self.max_objects_per_generation)?
                 .map(|value| value.manifest),
         )
+    }
+
+    /// Resolves one unique immutable derived generation by its complete build identity.
+    pub(crate) fn matching_derived_build(
+        &self,
+        dataset_id: &DatasetId,
+        build_spec_digest: DatasetBuildSpecDigest,
+    ) -> Result<Option<PinnedDataset>, ManifestCatalogError> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT dataset_id, manifest_version, schema_name, schema_version,
+                    schema_fingerprint, content_hash
+             FROM analytical_generations
+             WHERE dataset_id=?1 AND generation_kind='derived' AND build_spec_digest=?2
+             ORDER BY manifest_version LIMIT 2",
+        )?;
+        let rows = statement.query_map(
+            params![dataset_id.as_str(), build_spec_digest.digest().bytes()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                ))
+            },
+        )?;
+        let mut matching = None;
+        for row in rows {
+            if matching.is_some() {
+                return Err(ManifestCatalogError::CorruptCatalog);
+            }
+            let (dataset, version, schema_name, schema_version, fingerprint, content) = row?;
+            matching = Some(DatasetManifestRef::try_new_with_schema(
+                DatasetId::try_from(dataset.as_str())?,
+                from_i64(version)?,
+                parse_schema_identity(&schema_name, schema_version, &fingerprint)?,
+                parse_digest(&content)?,
+            )?);
+        }
+        matching
+            .as_ref()
+            .map(|manifest| load_pinned(&connection, manifest, self.max_objects_per_generation))
+            .transpose()
     }
 
     /// Resolves the immutable generation anchored by one Task 3 ingest run, when present.
@@ -1290,6 +1351,88 @@ fn manifest_for_anchor(
             },
         )
         .transpose()
+}
+
+fn insert_generation_source_input(
+    transaction: &rusqlite::Transaction<'_>,
+    generation_sequence: i64,
+    kind: GenerationKind,
+    source_input: Option<&IngestRunRecord>,
+) -> Result<(), ManifestCatalogError> {
+    match (kind, source_input) {
+        (GenerationKind::Ingest, Some(source_input))
+            if source_input.operation() == SourceOperation::Persist =>
+        {
+            if generation_sequence <= 0 {
+                return Err(ManifestCatalogError::CorruptCatalog);
+            }
+            transaction.execute(
+                "INSERT INTO analytical_generation_source_inputs
+                 (generation_sequence, run_id, source_id, rights_id)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    generation_sequence,
+                    source_input.run_id().to_string(),
+                    source_input.source_id().as_str(),
+                    source_input.rights_id(),
+                ],
+            )?;
+            Ok(())
+        }
+        (GenerationKind::Compaction, None) => Ok(()),
+        (GenerationKind::Ingest | GenerationKind::Compaction | GenerationKind::Derived, _) => {
+            Err(ManifestCatalogError::GenerationConflict)
+        }
+    }
+}
+
+fn generation_source_input_matches(
+    connection: &Connection,
+    manifest: &DatasetManifestRef,
+    kind: GenerationKind,
+    source_input: Option<&IngestRunRecord>,
+) -> Result<bool, ManifestCatalogError> {
+    let exists = match (kind, source_input) {
+        (GenerationKind::Ingest, Some(source_input))
+            if source_input.operation() == SourceOperation::Persist =>
+        {
+            connection.query_row(
+                "SELECT EXISTS(
+                    SELECT 1
+                    FROM analytical_generations AS generation
+                    JOIN analytical_generation_source_inputs AS source_input
+                      ON source_input.generation_sequence=generation.generation_sequence
+                    WHERE generation.dataset_id=?1 AND generation.manifest_version=?2
+                      AND source_input.run_id=?3 AND source_input.source_id=?4
+                      AND source_input.rights_id=?5
+                 )",
+                params![
+                    manifest.dataset_id().as_str(),
+                    to_i64(manifest.manifest_version())?,
+                    source_input.run_id().to_string(),
+                    source_input.source_id().as_str(),
+                    source_input.rights_id(),
+                ],
+                |row| row.get(0),
+            )?
+        }
+        (GenerationKind::Compaction, None) => !connection.query_row(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM analytical_generations AS generation
+                JOIN analytical_generation_source_inputs AS source_input
+                  ON source_input.generation_sequence=generation.generation_sequence
+                WHERE generation.dataset_id=?1 AND generation.manifest_version=?2
+             )",
+            params![
+                manifest.dataset_id().as_str(),
+                to_i64(manifest.manifest_version())?
+            ],
+            |row| row.get::<_, bool>(0),
+        )?,
+        (GenerationKind::Ingest | GenerationKind::Compaction | GenerationKind::Derived, _) => false,
+    };
+    Ok(exists)
 }
 
 fn generation_source(

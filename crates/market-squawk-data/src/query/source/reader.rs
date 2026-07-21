@@ -354,10 +354,12 @@ pub(super) fn validate_supported_schema(schema: &SchemaRef) -> Result<(), QueryE
             | DataType::UInt32
             | DataType::Date32
             | DataType::Int64
+            | DataType::Float64
             | DataType::Timestamp(_, _)
             | DataType::Decimal128(_, _)
             | DataType::Utf8
-            | DataType::Binary => {}
+            | DataType::Binary
+            | DataType::FixedSizeBinary(_) => {}
             _ => return Err(QueryError::UnsupportedSourceSchema),
         }
     }
@@ -413,8 +415,13 @@ pub(super) fn active_file_receipt(
                 DataType::UInt8 => Some(rows),
                 DataType::UInt16 => rows.checked_mul(2),
                 DataType::UInt32 | DataType::Date32 => rows.checked_mul(4),
-                DataType::Int64 | DataType::Timestamp(_, _) => rows.checked_mul(8),
+                DataType::Int64 | DataType::Float64 | DataType::Timestamp(_, _) => {
+                    rows.checked_mul(8)
+                }
                 DataType::Decimal128(_, _) => rows.checked_mul(16),
+                DataType::FixedSizeBinary(width) => usize::try_from(*width)
+                    .ok()
+                    .and_then(|width| rows.checked_mul(width)),
                 DataType::Utf8 | DataType::Binary => rows
                     .checked_add(1)
                     .and_then(|value| value.checked_mul(size_of::<i32>()))
