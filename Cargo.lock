@@ -2978,6 +2978,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "market-squawk-adapter-bls"
+version = "0.1.0"
+dependencies = [
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "market-squawk-adapter-coinbase"
 version = "0.1.0"
 dependencies = [
@@ -3025,6 +3035,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "market-squawk-adapter-fred"
+version = "0.1.0"
+dependencies = [
+ "market-squawk-domain",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "url",
+]
+
+[[package]]
 name = "market-squawk-adapter-kraken"
 version = "0.1.0"
 dependencies = [
@@ -3069,6 +3091,18 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "market-squawk-adapter-treasury"
+version = "0.1.0"
+dependencies = [
+ "market-squawk-domain",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
 ]
 
 [[package]]

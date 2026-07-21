@@ -1,0 +1,20 @@
+[package]
+name = "market-squawk-adapter-treasury"
+description = "Bounded U.S. Treasury Fiscal Data extraction adapter"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+license.workspace = true
+repository = "https://github.com/Sawmonabo/market-squawk"
+publish = false
+
+[dependencies]
+market-squawk-domain.workspace = true
+rust_decimal.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

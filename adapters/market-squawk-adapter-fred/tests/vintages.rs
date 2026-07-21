@@ -1,0 +1,35 @@
+use market_squawk_adapter_fred::{FredObservationPage, FredParseLimits, FredVintagePage};
+
+type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+#[test]
+fn preserves_closed_realtime_dates_missing_values_and_page_cursor() -> TestResult {
+    let limits = FredParseLimits::production_defaults();
+    let observations =
+        FredObservationPage::parse(include_bytes!("../fixtures/observations.json"), limits)?;
+    assert_eq!(observations.offset(), 0);
+    assert_eq!(observations.next_offset(), Some(2));
+    assert_eq!(observations.observations().len(), 2);
+    assert_eq!(observations.observations()[0].raw_value(), "101.25");
+    assert_eq!(
+        observations.observations()[0].realtime_start().to_string(),
+        "2024-01-01"
+    );
+    assert!(observations.observations()[1].value().is_none());
+    assert_eq!(observations.observations()[1].raw_value(), ".");
+
+    let vintages = FredVintagePage::parse(include_bytes!("../fixtures/vintages.json"), limits)?;
+    assert_eq!(vintages.next_offset(), Some(2));
+    assert_eq!(vintages.vintage_dates()[0].to_string(), "2024-01-10");
+    Ok(())
+}
+
+#[test]
+fn rejects_a_page_larger_than_the_parser_record_budget() -> TestResult {
+    let limits = FredParseLimits::try_new(1, 16 * 1024, 1_024)?;
+    assert!(
+        FredObservationPage::parse(include_bytes!("../fixtures/observations.json"), limits)
+            .is_err()
+    );
+    Ok(())
+}

@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "provider": "Federal Reserve Bank of St. Louis FRED/ALFRED",
+  "fixtures": [
+    {
+      "path": "observations.json",
+      "sha256": "810d1431996a3089fd1904472afba2f7e65d0de0af72e71582b65ae1f8ed15ac",
+      "source_url": "https://fred.stlouisfed.org/docs/api/fred/series_observations.html",
+      "accessed_on": "2026-07-20",
+      "evidence_class": "documented_schema_fixture",
+      "note": "Reduced deterministic JSON exercising the exact documented output_type=1 fields; values are test data, not a captured provider observation."
+    },
+    {
+      "path": "vintages.json",
+      "sha256": "ecd23b767ae458dda9731c7258b5ddad87ba5550f7f5a2ecb37d25b78d073840",
+      "source_url": "https://fred.stlouisfed.org/docs/api/fred/series_vintagedates.html",
+      "accessed_on": "2026-07-20",
+      "evidence_class": "documented_schema_fixture",
+      "note": "Reduced deterministic JSON exercising the exact documented vintage pagination fields; dates are test data."
+    }
+  ]
+}

@@ -1,0 +1,209 @@
+use std::collections::BTreeSet;
+
+use thiserror::Error;
+
+const MAX_PLAN_SERIES: usize = 1_000;
+const MIN_YEAR: u16 = 1900;
+const MAX_YEAR: u16 = 9999;
+
+/// An official BLS Public Data API access tier.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlsAccessTier {
+    /// Unregistered public v1 access.
+    PublicV1,
+    /// Registered v2 access using a user-supplied key.
+    RegisteredV2,
+}
+
+/// Exact documented and conservatively enforced request limits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlsRequestLimits {
+    series_per_query: usize,
+    documented_years_per_query: u16,
+    enforced_years_per_query: u16,
+    daily_queries: u16,
+}
+
+impl BlsRequestLimits {
+    /// Returns the maximum series identifiers in one request.
+    pub const fn series_per_query(self) -> usize {
+        self.series_per_query
+    }
+
+    /// Returns the years per request stated by the provider tier table.
+    pub const fn documented_years_per_query(self) -> u16 {
+        self.documented_years_per_query
+    }
+
+    /// Returns the conservative years per request actually enforced.
+    pub const fn enforced_years_per_query(self) -> u16 {
+        self.enforced_years_per_query
+    }
+
+    /// Returns the documented daily request limit.
+    pub const fn daily_queries(self) -> u16 {
+        self.daily_queries
+    }
+}
+
+/// One deterministic BLS request chunk.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlsRequestChunk {
+    series: Vec<String>,
+    start_year: u16,
+    end_year: u16,
+}
+
+impl BlsRequestChunk {
+    /// Returns the ordered exact series identifiers.
+    pub fn series(&self) -> &[String] {
+        &self.series
+    }
+
+    /// Returns the inclusive start year.
+    pub const fn start_year(&self) -> u16 {
+        self.start_year
+    }
+
+    /// Returns the inclusive end year.
+    pub const fn end_year(&self) -> u16 {
+        self.end_year
+    }
+
+    /// Returns the inclusive year count.
+    pub const fn year_count(&self) -> u16 {
+        self.end_year - self.start_year + 1
+    }
+}
+
+/// A bounded deterministic BLS request plan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlsRequestPlan {
+    tier: BlsAccessTier,
+    limits: BlsRequestLimits,
+    chunks: Vec<BlsRequestChunk>,
+}
+
+impl BlsRequestPlan {
+    /// Splits an exact series/year request into stable provider-compliant chunks.
+    pub fn try_new(
+        tier: BlsAccessTier,
+        series: Vec<String>,
+        start_year: u16,
+        end_year: u16,
+    ) -> Result<Self, BlsChunkError> {
+        let limits = limits_for(tier);
+        validate_series(&series)?;
+        if !(MIN_YEAR..=MAX_YEAR).contains(&start_year)
+            || !(MIN_YEAR..=MAX_YEAR).contains(&end_year)
+            || start_year > end_year
+        {
+            return Err(BlsChunkError::InvalidYearRange);
+        }
+
+        let mut year_windows = Vec::new();
+        let mut window_start = start_year;
+        loop {
+            let window_end = window_start
+                .saturating_add(limits.enforced_years_per_query - 1)
+                .min(end_year);
+            year_windows.push((window_start, window_end));
+            if window_end == end_year {
+                break;
+            }
+            window_start = window_end
+                .checked_add(1)
+                .ok_or(BlsChunkError::InvalidYearRange)?;
+        }
+
+        let series_chunk_count = series.len().div_ceil(limits.series_per_query);
+        let total_chunks = series_chunk_count
+            .checked_mul(year_windows.len())
+            .ok_or(BlsChunkError::PlanTooLarge)?;
+        if total_chunks > 10_000 {
+            return Err(BlsChunkError::PlanTooLarge);
+        }
+        let mut chunks = Vec::with_capacity(total_chunks);
+        for (year_start, year_end) in year_windows {
+            for series_chunk in series.chunks(limits.series_per_query) {
+                chunks.push(BlsRequestChunk {
+                    series: series_chunk.to_vec(),
+                    start_year: year_start,
+                    end_year: year_end,
+                });
+            }
+        }
+        Ok(Self {
+            tier,
+            limits,
+            chunks,
+        })
+    }
+
+    /// Returns the selected API tier.
+    pub const fn tier(&self) -> BlsAccessTier {
+        self.tier
+    }
+
+    /// Returns the exact limits used to construct the plan.
+    pub const fn limits(&self) -> BlsRequestLimits {
+        self.limits
+    }
+
+    /// Returns deterministic request chunks ordered by year window then series group.
+    pub fn chunks(&self) -> &[BlsRequestChunk] {
+        &self.chunks
+    }
+}
+
+/// A deterministic request-plan validation failure.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum BlsChunkError {
+    /// The requested series set is empty or exceeds the plan bound.
+    #[error("BLS series set is empty or too large")]
+    InvalidSeriesCount,
+    /// A series identifier is malformed or duplicated.
+    #[error("BLS series identifier is malformed or duplicated")]
+    InvalidSeries,
+    /// The inclusive year range is invalid.
+    #[error("BLS year range is invalid")]
+    InvalidYearRange,
+    /// The expanded plan exceeds its deterministic chunk budget.
+    #[error("BLS request plan exceeds its chunk budget")]
+    PlanTooLarge,
+}
+
+pub(crate) const fn limits_for(tier: BlsAccessTier) -> BlsRequestLimits {
+    match tier {
+        BlsAccessTier::PublicV1 => BlsRequestLimits {
+            series_per_query: 25,
+            documented_years_per_query: 10,
+            enforced_years_per_query: 10,
+            daily_queries: 25,
+        },
+        BlsAccessTier::RegisteredV2 => BlsRequestLimits {
+            series_per_query: 50,
+            documented_years_per_query: 20,
+            // The official FAQ conflicts with its tier table; enforce the smaller stated limit.
+            enforced_years_per_query: 10,
+            daily_queries: 500,
+        },
+    }
+}
+
+fn validate_series(series: &[String]) -> Result<(), BlsChunkError> {
+    if series.is_empty() || series.len() > MAX_PLAN_SERIES {
+        return Err(BlsChunkError::InvalidSeriesCount);
+    }
+    let mut unique = BTreeSet::new();
+    for identifier in series {
+        if identifier.is_empty()
+            || identifier.len() > 50
+            || !identifier.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            || !unique.insert(identifier.as_str())
+        {
+            return Err(BlsChunkError::InvalidSeries);
+        }
+    }
+    Ok(())
+}

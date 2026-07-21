@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "series_scope": "unresolved",
+  "terms_url": "https://fred.stlouisfed.org/docs/api/terms_of_use.html",
+  "terms_digest": "c7d9171a6895a56e22de9c33247428ed226bea9117bec06952995fc80fe5cc62",
+  "terms_bytes": 48781,
+  "assessed_at_unix_nanos": 1784592000000000000,
+  "review_required_by_unix_nanos": 1785196800000000000,
+  "operations": ["persist", "cache", "archive", "train"],
+  "disposition": "blocked_unknown_rights",
+  "confirmed_facts": [
+    "FRED or ALFRED availability does not override a series owner's restrictions.",
+    "The reviewed terms provide no blanket grant for persistence, caching, archiving, redistribution, or model training.",
+    "The reviewed terms may change without notice and contain no visible version identifier."
+  ],
+  "engineering_inferences": [
+    "Registered ephemeral retrieval may proceed within provider terms and shared budgets.",
+    "Every durable series and intended operation remains blocked until exact owner and terms evidence affirmatively grants that scope.",
+    "The review-required timestamp is a local fail-closed revalidation deadline, not a provider-declared terms expiration."
+  ],
+  "sources": [
+    {
+      "url": "https://fred.stlouisfed.org/docs/api/terms_of_use.html",
+      "accessed_on": "2026-07-21",
+      "sha256": "c7d9171a6895a56e22de9c33247428ed226bea9117bec06952995fc80fe5cc62",
+      "byte_length": 48781,
+      "evidence_class": "confirmed"
+    },
+    {
+      "url": "https://fred.stlouisfed.org/docs/api/fred/errors.html",
+      "accessed_on": "2026-07-20",
+      "evidence_class": "confirmed"
+    }
+  ]
+}

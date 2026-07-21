@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "provider": "U.S. Department of the Treasury Bureau of the Fiscal Service",
+  "fixtures": [
+    {
+      "path": "average_interest_rates.json",
+      "sha256": "0657174f6827a50935660f3af28ae2c8df3629f5f258803dcb20e78be42e1225",
+      "source_url": "https://api.fiscaldata.treasury.gov/services/api/fiscal_service/v2/accounting/od/avg_interest_rates?sort=-record_date&page%5Bsize%5D=1&format=json",
+      "documentation_url": "https://fiscaldata.treasury.gov/api-documentation/",
+      "accessed_on": "2026-07-21",
+      "evidence_class": "captured_official_response",
+      "note": "Exact authorized public JSON response captured with one explicit row and page size."
+    }
+  ]
+}
