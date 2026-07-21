@@ -6,7 +6,9 @@ use super::{
     EvidenceSnapshotRequest, GenerationEvidenceRow, GenerationObjectEvidenceRow,
     ManifestEvidenceRow, QueryArtifactEvidenceRow,
 };
-use crate::{DatasetId, GenerationKind, ManifestObject, ManifestPlan, Sha256Digest};
+use crate::{
+    DatasetId, DatasetSchemaRegistry, GenerationKind, ManifestObject, ManifestPlan, Sha256Digest,
+};
 
 #[test]
 fn snapshot_rejects_generation_whose_lineage_differs_from_ordered_objects()
@@ -31,7 +33,7 @@ fn snapshot_rejects_generation_whose_lineage_differs_from_ordered_objects()
     let manifest = ManifestEvidenceRow::try_new(
         manifest_id,
         dataset.clone(),
-        1,
+        3,
         artifact_id,
         plan.content_hash(),
     )?;
@@ -49,7 +51,7 @@ fn snapshot_rejects_generation_whose_lineage_differs_from_ordered_objects()
         Sha256Digest::new([99; 32]),
         plan.row_count(),
         plan.total_bytes(),
-        1,
+        DatasetSchemaRegistry::local().canonical_research_observations()?,
         manifest_id,
         None,
         GenerationKind::Ingest,

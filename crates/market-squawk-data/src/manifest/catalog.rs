@@ -6,7 +6,7 @@ use std::mem::size_of;
 use std::sync::Mutex;
 use std::time::Instant;
 
-use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SchemaVersion, SourceId, Timestamp};
+use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceId, Timestamp};
 use market_squawk_platform::{CatalogFileGuard, CatalogLocation};
 use rusqlite::{Connection, OpenFlags, OptionalExtension as _, TransactionBehavior, params};
 use thiserror::Error;
@@ -17,6 +17,7 @@ use super::{
     DatasetId, DatasetManifestRef, ManifestObject, ManifestPlan, ManifestPlanError, Sha256Digest,
 };
 use crate::catalog::exact_catalog_file_binding;
+use crate::schema::{DatasetSchemaRef, DatasetSchemaRegistry};
 use crate::{ArtifactRecord, CatalogError, DatasetManifestRecord};
 
 const REFERENCE_MEMBERSHIP_CHUNK: usize = 128;
@@ -103,12 +104,13 @@ impl AnalyticalManifestCatalog {
     pub(crate) fn validate_append_schema(
         &self,
         dataset_id: &DatasetId,
-        schema_version: SchemaVersion,
+        schema: &DatasetSchemaRef,
     ) -> Result<(), ManifestCatalogError> {
+        DatasetSchemaRegistry::local().resolve(schema)?;
         let connection = self.lock()?;
         ensure_append_schema(
             load_latest(&connection, dataset_id, self.max_objects_per_generation)?.as_ref(),
-            schema_version,
+            schema,
         )
     }
 
@@ -132,7 +134,7 @@ impl AnalyticalManifestCatalog {
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "trusted_schema", "OFF")?;
         let migrated: bool = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=5)",
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=6)",
             [],
             |row| row.get(0),
         )?;
@@ -156,12 +158,13 @@ impl AnalyticalManifestCatalog {
     pub(crate) fn preview_append(
         &self,
         dataset_id: DatasetId,
-        schema_version: SchemaVersion,
+        schema: &DatasetSchemaRef,
         object: ManifestObject,
     ) -> Result<ManifestPlan, ManifestCatalogError> {
+        DatasetSchemaRegistry::local().resolve(schema)?;
         let connection = self.lock()?;
         let previous = load_latest(&connection, &dataset_id, self.max_objects_per_generation)?;
-        ensure_append_schema(previous.as_ref(), schema_version)?;
+        ensure_append_schema(previous.as_ref(), schema)?;
         ManifestPlan::append(
             dataset_id,
             previous.as_ref().map(PinnedDataset::plan),
@@ -188,9 +191,12 @@ impl AnalyticalManifestCatalog {
         plan: &ManifestPlan,
         artifact: &ArtifactRecord,
         anchor: &DatasetManifestRecord,
+        schema: &DatasetSchemaRef,
         kind: GenerationKind,
     ) -> Result<DatasetManifestRef, ManifestCatalogError> {
+        DatasetSchemaRegistry::local().resolve(schema)?;
         if anchor.artifact_id() != artifact.artifact_id()
+            || anchor.schema_version() != schema.version()
             || sha256_from_evidence(anchor.content_digest())? != plan.content_hash
             || sha256_from_evidence(artifact.content_digest())?
                 != plan
@@ -206,7 +212,7 @@ impl AnalyticalManifestCatalog {
         if let Some(existing) = manifest_for_anchor(&transaction, anchor.manifest_id())? {
             if existing.content_hash == plan.content_hash
                 && existing.dataset_id == plan.dataset_id
-                && existing.schema_version == anchor.schema_version()
+                && existing.schema == *schema
             {
                 transaction.commit()?;
                 return Ok(existing);
@@ -224,10 +230,9 @@ impl AnalyticalManifestCatalog {
         {
             return Err(ManifestCatalogError::SourceMismatch);
         }
-        if kind == GenerationKind::Ingest
-            && previous
-                .as_ref()
-                .is_some_and(|value| value.manifest().schema_version() != anchor.schema_version())
+        if previous
+            .as_ref()
+            .is_some_and(|value| value.manifest().schema() != schema)
         {
             return Err(ManifestCatalogError::SchemaMismatch);
         }
@@ -264,8 +269,9 @@ impl AnalyticalManifestCatalog {
         transaction.execute(
             "INSERT INTO analytical_generations
              (dataset_id, manifest_version, content_hash, lineage_hash, row_count, total_bytes,
-              schema_version, anchor_manifest_id, parent_version, generation_kind, created_at_ns)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+              schema_name, schema_version, schema_fingerprint, anchor_manifest_id, parent_version,
+              generation_kind, created_at_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 plan.dataset_id.as_str(),
                 to_i64(version)?,
@@ -273,7 +279,9 @@ impl AnalyticalManifestCatalog {
                 plan.lineage_digest.bytes(),
                 to_i64(plan.row_count)?,
                 to_i64(plan.total_bytes)?,
-                i64::from(anchor.schema_version().get()),
+                schema.name(),
+                i64::from(schema.version().get()),
+                schema.fingerprint().as_slice(),
                 anchor.manifest_id().to_string(),
                 parent.map(to_i64).transpose()?,
                 kind.database_name(),
@@ -318,10 +326,10 @@ impl AnalyticalManifestCatalog {
                     .ok_or(ManifestCatalogError::CorruptCatalog)?,
             )?,
         }
-        let manifest = DatasetManifestRef::try_new(
+        let manifest = DatasetManifestRef::try_new_with_schema(
             plan.dataset_id.clone(),
             version,
-            anchor.schema_version(),
+            schema.clone(),
             plan.content_hash,
         )?;
         transaction.commit()?;
@@ -333,6 +341,9 @@ impl AnalyticalManifestCatalog {
         &self,
         manifest: &DatasetManifestRef,
     ) -> Result<PinnedDataset, ManifestCatalogError> {
+        DatasetSchemaRegistry::local()
+            .resolve(manifest.schema())
+            .map_err(|_| ManifestCatalogError::SchemaMismatch)?;
         let connection = self.lock()?;
         load_pinned(&connection, manifest, self.max_objects_per_generation)
     }
@@ -355,7 +366,8 @@ impl AnalyticalManifestCatalog {
         let reference = connection
             .query_row(
                 "SELECT generations.dataset_id, generations.manifest_version,
-                        generations.schema_version, generations.content_hash
+                        generations.schema_name, generations.schema_version,
+                        generations.schema_fingerprint, generations.content_hash
                  FROM analytical_generations AS generations
                  JOIN dataset_manifests AS manifests
                    ON manifests.manifest_id=generations.anchor_manifest_id
@@ -366,21 +378,25 @@ impl AnalyticalManifestCatalog {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, i64>(1)?,
-                        row.get::<_, i64>(2)?,
-                        row.get::<_, Vec<u8>>(3)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Vec<u8>>(4)?,
+                        row.get::<_, Vec<u8>>(5)?,
                     ))
                 },
             )
             .optional()?
-            .map(|(dataset, version, schema_version, content)| {
-                DatasetManifestRef::try_new(
-                    DatasetId::try_from(dataset.as_str())?,
-                    from_i64(version)?,
-                    parse_schema_version(schema_version)?,
-                    parse_digest(&content)?,
-                )
-                .map_err(ManifestCatalogError::from)
-            })
+            .map(
+                |(dataset, version, schema_name, schema_version, fingerprint, content)| {
+                    DatasetManifestRef::try_new_with_schema(
+                        DatasetId::try_from(dataset.as_str())?,
+                        from_i64(version)?,
+                        parse_schema_identity(&schema_name, schema_version, &fingerprint)?,
+                        parse_digest(&content)?,
+                    )
+                    .map_err(ManifestCatalogError::from)
+                },
+            )
             .transpose()?;
         reference
             .as_ref()
@@ -471,9 +487,9 @@ impl AnalyticalManifestCatalog {
 
 fn ensure_append_schema(
     previous: Option<&PinnedDataset>,
-    schema_version: SchemaVersion,
+    schema: &DatasetSchemaRef,
 ) -> Result<(), ManifestCatalogError> {
-    if previous.is_some_and(|value| value.manifest().schema_version() != schema_version) {
+    if previous.is_some_and(|value| value.manifest().schema() != schema) {
         Err(ManifestCatalogError::SchemaMismatch)
     } else {
         Ok(())
@@ -519,6 +535,9 @@ pub enum ManifestCatalogError {
     /// Append cannot mix row schemas in one immutable generation; migration must be explicit.
     #[error("analytical dataset schema conflicts with its prior generation")]
     SchemaMismatch,
+    /// A supplied dataset schema is unknown or its fingerprint is not canonical.
+    #[error("analytical dataset schema identity is invalid")]
+    SchemaIdentity(#[from] crate::schema::DatasetSchemaError),
     /// Stored generation metadata does not reconstruct exactly.
     #[error("analytical manifest catalog is corrupt")]
     CorruptCatalog,
@@ -656,27 +675,32 @@ fn load_latest(
 ) -> Result<Option<PinnedDataset>, ManifestCatalogError> {
     let reference = connection
         .query_row(
-            "SELECT manifest_version, schema_version, content_hash FROM analytical_generations
+            "SELECT manifest_version, schema_name, schema_version, schema_fingerprint, content_hash
+             FROM analytical_generations
              WHERE dataset_id=?1 ORDER BY manifest_version DESC LIMIT 1",
             [dataset_id.as_str()],
             |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
                 ))
             },
         )
         .optional()?
-        .map(|(version, schema_version, digest)| {
-            DatasetManifestRef::try_new(
-                dataset_id.clone(),
-                from_i64(version)?,
-                parse_schema_version(schema_version)?,
-                parse_digest(&digest)?,
-            )
-            .map_err(ManifestCatalogError::from)
-        })
+        .map(
+            |(version, schema_name, schema_version, fingerprint, digest)| {
+                DatasetManifestRef::try_new_with_schema(
+                    dataset_id.clone(),
+                    from_i64(version)?,
+                    parse_schema_identity(&schema_name, schema_version, &fingerprint)?,
+                    parse_digest(&digest)?,
+                )
+                .map_err(ManifestCatalogError::from)
+            },
+        )
         .transpose()?;
     reference
         .as_ref()
@@ -689,9 +713,13 @@ fn load_pinned(
     reference: &DatasetManifestRef,
     max_objects: usize,
 ) -> Result<PinnedDataset, ManifestCatalogError> {
+    DatasetSchemaRegistry::local()
+        .resolve(reference.schema())
+        .map_err(|_| ManifestCatalogError::SchemaMismatch)?;
     let header = connection
         .query_row(
-            "SELECT content_hash, lineage_hash, row_count, total_bytes, schema_version
+            "SELECT content_hash, lineage_hash, row_count, total_bytes, schema_name,
+                    schema_version, schema_fingerprint
              FROM analytical_generations WHERE dataset_id=?1 AND manifest_version=?2",
             params![
                 reference.dataset_id.as_str(),
@@ -703,14 +731,16 @@ fn load_pinned(
                     row.get::<_, Vec<u8>>(1)?,
                     row.get::<_, i64>(2)?,
                     row.get::<_, i64>(3)?,
-                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Vec<u8>>(6)?,
                 ))
             },
         )
         .optional()?
         .ok_or(ManifestCatalogError::GenerationConflict)?;
     if parse_digest(&header.0)? != reference.content_hash
-        || parse_schema_version(header.4)? != reference.schema_version
+        || parse_schema_identity(&header.4, header.5, &header.6)? != *reference.schema()
     {
         return Err(ManifestCatalogError::GenerationConflict);
     }
@@ -835,6 +865,7 @@ fn pinned_dataset_retained_bytes(
             .checked_add(inline_objects)
             .and_then(|value| value.checked_add(plan_objects))
             .and_then(|value| value.checked_add(manifest.dataset_id().as_str().len()))
+            .and_then(|value| value.checked_add(manifest.schema().name().len()))
             .and_then(|value| value.checked_add(plan.dataset_id().as_str().len()))
             .ok_or(ManifestCatalogError::CountOverflow)?,
         |total, object| {
@@ -851,7 +882,8 @@ fn manifest_for_anchor(
 ) -> Result<Option<DatasetManifestRef>, ManifestCatalogError> {
     connection
         .query_row(
-            "SELECT dataset_id, manifest_version, schema_version, content_hash
+            "SELECT dataset_id, manifest_version, schema_name, schema_version,
+                    schema_fingerprint, content_hash
              FROM analytical_generations
              WHERE anchor_manifest_id=?1",
             [anchor.to_string()],
@@ -859,21 +891,25 @@ fn manifest_for_anchor(
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
                 ))
             },
         )
         .optional()?
-        .map(|(dataset, version, schema_version, digest)| {
-            DatasetManifestRef::try_new(
-                DatasetId::try_from(dataset.as_str())?,
-                from_i64(version)?,
-                parse_schema_version(schema_version)?,
-                parse_digest(&digest)?,
-            )
-            .map_err(ManifestCatalogError::from)
-        })
+        .map(
+            |(dataset, version, schema_name, schema_version, fingerprint, digest)| {
+                DatasetManifestRef::try_new_with_schema(
+                    DatasetId::try_from(dataset.as_str())?,
+                    from_i64(version)?,
+                    parse_schema_identity(&schema_name, schema_version, &fingerprint)?,
+                    parse_digest(&digest)?,
+                )
+                .map_err(ManifestCatalogError::from)
+            },
+        )
         .transpose()
 }
 
@@ -974,9 +1010,29 @@ fn parse_digest(value: &[u8]) -> Result<Sha256Digest, ManifestCatalogError> {
     Ok(Sha256Digest::new(bytes))
 }
 
-fn parse_schema_version(value: i64) -> Result<SchemaVersion, ManifestCatalogError> {
+fn parse_schema_identity(
+    name: &str,
+    version: i64,
+    fingerprint: &[u8],
+) -> Result<DatasetSchemaRef, ManifestCatalogError> {
+    let version = parse_schema_version(version)?;
+    let fingerprint: [u8; 32] = fingerprint
+        .try_into()
+        .map_err(|_| ManifestCatalogError::CorruptCatalog)?;
+    let schema = DatasetSchemaRef::try_new(name, version, fingerprint)
+        .map_err(|_| ManifestCatalogError::CorruptCatalog)?;
+    DatasetSchemaRegistry::local()
+        .resolve(&schema)
+        .map_err(|_| ManifestCatalogError::CorruptCatalog)?;
+    Ok(schema)
+}
+
+fn parse_schema_version(
+    value: i64,
+) -> Result<market_squawk_domain::SchemaVersion, ManifestCatalogError> {
     let value = u16::try_from(value).map_err(|_| ManifestCatalogError::CorruptCatalog)?;
-    SchemaVersion::new(value).map_err(|_| ManifestCatalogError::CorruptCatalog)
+    market_squawk_domain::SchemaVersion::new(value)
+        .map_err(|_| ManifestCatalogError::CorruptCatalog)
 }
 
 fn to_i64(value: u64) -> Result<i64, ManifestCatalogError> {
@@ -1000,14 +1056,16 @@ mod tests {
     use super::{AnalyticalManifestCatalog, ManifestCatalogError};
     use crate::{
         CatalogAuthority, CatalogConfig, CatalogLimit, CatalogResultLimits, DatasetId,
-        DatasetManifestRef, ManifestObject, ManifestPlan, Sha256Digest,
+        DatasetManifestRef, DatasetSchemaRegistry, ManifestObject, ManifestPlan, Sha256Digest,
     };
-    use market_squawk_domain::SchemaVersion;
 
     type TestResult = Result<(), Box<dyn Error>>;
 
     #[test]
     fn append_rejects_mixed_row_schema_before_planning() -> TestResult {
+        let registry = DatasetSchemaRegistry::local();
+        let research = registry.canonical_research_observations()?;
+        let feature_labels = registry.canonical_feature_labels()?;
         let (_directory, location) = migrated_catalog()?;
         let dataset = DatasetId::try_from("schema-bound")?;
         let prior_object =
@@ -1030,12 +1088,16 @@ mod tests {
         connection.execute(
             "INSERT INTO analytical_generations
              (dataset_id, manifest_version, content_hash, lineage_hash, row_count, total_bytes,
-              schema_version, anchor_manifest_id, parent_version, generation_kind, created_at_ns)
-             VALUES (?1, 1, ?2, ?3, 1, 1, 1, ?4, NULL, 'ingest', 1)",
+              schema_name, schema_version, schema_fingerprint, anchor_manifest_id, parent_version,
+              generation_kind, created_at_ns)
+             VALUES (?1, 1, ?2, ?3, 1, 1, ?4, ?5, ?6, ?7, NULL, 'ingest', 1)",
             params![
                 dataset.as_str(),
                 prior_plan.content_hash().bytes().as_slice(),
                 prior_plan.lineage_digest().bytes().as_slice(),
+                research.name(),
+                i64::from(research.version().get()),
+                research.fingerprint().as_slice(),
                 uuid::Uuid::new_v4().to_string(),
             ],
         )?;
@@ -1055,7 +1117,7 @@ mod tests {
         let catalog = AnalyticalManifestCatalog::open(&location, 8)?;
 
         assert!(matches!(
-            catalog.validate_append_schema(&dataset, SchemaVersion::new(2)?),
+            catalog.validate_append_schema(&dataset, &feature_labels),
             Err(ManifestCatalogError::SchemaMismatch)
         ));
         Ok(())
@@ -1064,16 +1126,21 @@ mod tests {
     #[test]
     fn pinned_read_rejects_max_plus_one_objects_before_reconstruction() -> TestResult {
         let (_directory, location) = migrated_catalog()?;
+        let schema = DatasetSchemaRegistry::local().canonical_research_observations()?;
         let connection = Connection::open(location.path())?;
         connection.pragma_update(None, "foreign_keys", false)?;
         connection.execute(
             "INSERT INTO analytical_generations
              (dataset_id, manifest_version, content_hash, lineage_hash, row_count, total_bytes,
-              schema_version, anchor_manifest_id, parent_version, generation_kind, created_at_ns)
-             VALUES ('over-limit', 1, ?1, ?2, 2, 2, 1, ?3, NULL, 'ingest', 1)",
+              schema_name, schema_version, schema_fingerprint, anchor_manifest_id, parent_version,
+              generation_kind, created_at_ns)
+             VALUES ('over-limit', 1, ?1, ?2, 2, 2, ?3, ?4, ?5, ?6, NULL, 'ingest', 1)",
             params![
                 [7_u8; 32].as_slice(),
                 [8_u8; 32].as_slice(),
+                schema.name(),
+                i64::from(schema.version().get()),
+                schema.fingerprint().as_slice(),
                 uuid::Uuid::new_v4().to_string()
             ],
         )?;
@@ -1093,10 +1160,10 @@ mod tests {
         }
         drop(connection);
         let catalog = AnalyticalManifestCatalog::open(&location, 1)?;
-        let manifest = DatasetManifestRef::try_new(
+        let manifest = DatasetManifestRef::try_new_with_schema(
             DatasetId::try_from("over-limit")?,
             1,
-            SchemaVersion::CURRENT,
+            schema,
             Sha256Digest::new([7; 32]),
         )?;
 

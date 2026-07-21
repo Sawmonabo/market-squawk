@@ -7,7 +7,10 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{CatalogContentEvidenceDigest, EvidenceError, MAX_PARQUET_METADATA_BYTES};
-use crate::{DatasetId, GenerationKind, ManifestObject, ManifestPlan, Sha256Digest};
+use crate::{
+    DatasetId, DatasetSchemaRef, DatasetSchemaRegistry, GenerationKind, ManifestObject,
+    ManifestPlan, Sha256Digest,
+};
 
 const MAX_EVIDENCE_ARTIFACTS: usize = 100_000;
 const MAX_EVIDENCE_REFERENCES: usize = 400_000;
@@ -271,7 +274,7 @@ pub(crate) struct GenerationEvidenceRow {
     lineage_hash: Sha256Digest,
     row_count: u64,
     total_bytes: u64,
-    schema_version: u32,
+    schema: DatasetSchemaRef,
     anchor_manifest_id: Uuid,
     parent_version: Option<u64>,
     kind: GenerationKind,
@@ -290,7 +293,7 @@ impl GenerationEvidenceRow {
         lineage_hash: Sha256Digest,
         row_count: u64,
         total_bytes: u64,
-        schema_version: u32,
+        schema: DatasetSchemaRef,
         anchor_manifest_id: Uuid,
         parent_version: Option<u64>,
         kind: GenerationKind,
@@ -299,7 +302,6 @@ impl GenerationEvidenceRow {
         if manifest_version == 0
             || row_count == 0
             || total_bytes == 0
-            || schema_version == 0
             || anchor_manifest_id.is_nil()
             || objects.is_empty()
             || (manifest_version == 1) != parent_version.is_none()
@@ -307,6 +309,9 @@ impl GenerationEvidenceRow {
         {
             return Err(EvidenceError::InvalidCatalogEvidence);
         }
+        DatasetSchemaRegistry::local()
+            .resolve(&schema)
+            .map_err(|_| EvidenceError::InvalidCatalogEvidence)?;
         Ok(Self {
             dataset_id,
             manifest_version,
@@ -314,7 +319,7 @@ impl GenerationEvidenceRow {
             lineage_hash,
             row_count,
             total_bytes,
-            schema_version,
+            schema,
             anchor_manifest_id,
             parent_version,
             kind,
@@ -346,8 +351,8 @@ impl GenerationEvidenceRow {
         self.total_bytes
     }
 
-    pub(super) const fn schema_version(&self) -> u32 {
-        self.schema_version
+    pub(super) const fn schema(&self) -> &DatasetSchemaRef {
+        &self.schema
     }
 
     pub(super) const fn anchor_manifest_id(&self) -> Uuid {
@@ -592,7 +597,7 @@ fn validate_relational_evidence(
             .get(&generation.anchor_manifest_id)
             .ok_or(EvidenceError::GenerationSemanticMismatch)?;
         if anchor.dataset_id != generation.dataset_id
-            || anchor.schema_version != generation.schema_version
+            || anchor.schema_version != u32::from(generation.schema.version().get())
             || anchor.content_hash != generation.content_hash
         {
             return Err(EvidenceError::GenerationSemanticMismatch);
@@ -644,11 +649,13 @@ fn validate_dataset_history(
     versions: &BTreeMap<u64, &GenerationEvidenceRow>,
 ) -> Result<(), EvidenceError> {
     let mut previous_plan: Option<ManifestPlan> = None;
+    let mut retained_schema: Option<&DatasetSchemaRef> = None;
     let mut expected_version = 1_u64;
     for generation in versions.values() {
         if generation.manifest_version != expected_version
             || generation.parent_version
                 != expected_version.checked_sub(1).filter(|value| *value > 0)
+            || retained_schema.is_some_and(|schema| schema != &generation.schema)
         {
             return Err(EvidenceError::GenerationSemanticMismatch);
         }
@@ -697,6 +704,7 @@ fn validate_dataset_history(
             return Err(EvidenceError::GenerationSemanticMismatch);
         }
         previous_plan = Some(plan);
+        retained_schema = Some(&generation.schema);
         expected_version = expected_version
             .checked_add(1)
             .ok_or(EvidenceError::ResourceLimitExceeded)?;

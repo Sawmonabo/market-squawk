@@ -6,6 +6,8 @@ use market_squawk_domain::{DigestAlgorithm, EvidenceDigest};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
+use crate::schema::{DatasetSchemaRef, DatasetSchemaRegistry};
+
 mod catalog;
 
 pub use self::catalog::{
@@ -72,7 +74,7 @@ impl fmt::Debug for Sha256Digest {
 pub struct DatasetManifestRef {
     dataset_id: DatasetId,
     manifest_version: u64,
-    schema_version: market_squawk_domain::SchemaVersion,
+    schema: DatasetSchemaRef,
     content_hash: Sha256Digest,
 }
 
@@ -84,13 +86,32 @@ impl DatasetManifestRef {
         schema_version: market_squawk_domain::SchemaVersion,
         content_hash: Sha256Digest,
     ) -> Result<Self, ManifestPlanError> {
+        let schema = DatasetSchemaRegistry::local()
+            .canonical_research_observations()
+            .map_err(|_| ManifestPlanError::InvalidDatasetSchema)?;
+        if schema.version() != schema_version {
+            return Err(ManifestPlanError::InvalidDatasetSchema);
+        }
+        Self::try_new_with_schema(dataset_id, manifest_version, schema, content_hash)
+    }
+
+    /// Constructs a nonzero generation pin carrying one complete retained schema identity.
+    ///
+    /// Construction preserves an untrusted retained identity exactly. Catalog readers and query
+    /// registration resolve it through [`DatasetSchemaRegistry`] before use.
+    pub fn try_new_with_schema(
+        dataset_id: DatasetId,
+        manifest_version: u64,
+        schema: DatasetSchemaRef,
+        content_hash: Sha256Digest,
+    ) -> Result<Self, ManifestPlanError> {
         if manifest_version == 0 {
             return Err(ManifestPlanError::InvalidManifestVersion);
         }
         Ok(Self {
             dataset_id,
             manifest_version,
-            schema_version,
+            schema,
             content_hash,
         })
     }
@@ -107,7 +128,12 @@ impl DatasetManifestRef {
 
     /// Returns the exact analytical row-schema version for this immutable generation.
     pub const fn schema_version(&self) -> market_squawk_domain::SchemaVersion {
-        self.schema_version
+        self.schema.version()
+    }
+
+    /// Returns the exact registered dataset-schema identity for this immutable generation.
+    pub const fn schema(&self) -> &DatasetSchemaRef {
+        &self.schema
     }
 
     /// Returns the semantic manifest hash.
@@ -320,6 +346,9 @@ pub enum ManifestPlanError {
     /// Generation zero is reserved.
     #[error("manifest version must be nonzero")]
     InvalidManifestVersion,
+    /// The compatibility constructor was asked to manufacture a noncanonical research identity.
+    #[error("manifest dataset schema identity is invalid")]
+    InvalidDatasetSchema,
     /// A Parquet object cannot be empty.
     #[error("manifest object must contain rows and bytes")]
     EmptyObject,

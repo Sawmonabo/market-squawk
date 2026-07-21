@@ -33,10 +33,10 @@ use super::super::ResearchQueryEngine;
 use super::*;
 use crate::{
     AnalyticalDataService, AnalyticalManifestCatalog, CatalogAuthority, CatalogConfig,
-    CatalogLimit, CatalogResultLimits, DatasetId, DatasetManifestRef, IngestIdentity,
-    ObjectStoreConfig, ParquetStoreError, QueryArtifactReservationInput, QueryLimits, QueryRequest,
-    QueryResult, ResearchIngestService, RightsDecisionInput, Sha256Digest, SourceOperation,
-    extraction_batch_digest,
+    CatalogLimit, CatalogResultLimits, DatasetId, DatasetManifestRef, DatasetSchemaRegistry,
+    IngestIdentity, ObjectStoreConfig, ParquetStoreError, QueryArtifactReservationInput,
+    QueryLimits, QueryRequest, QueryResult, ResearchIngestService, RightsDecisionInput,
+    Sha256Digest, SourceOperation, extraction_batch_digest,
 };
 
 type TestResult = Result<(), Box<dyn Error>>;
@@ -51,10 +51,10 @@ const ARTIFACT_QUERY: &str = "SELECT a.value FROM observations
 #[tokio::test]
 async fn arbitrary_batches_cannot_attach_durable_publication_authority() -> TestResult {
     let (_directory, service, _pinned) = published_dataset_fixture().await?;
-    let fabricated_manifest = DatasetManifestRef::try_new(
+    let fabricated_manifest = DatasetManifestRef::try_new_with_schema(
         DatasetId::try_from("fabricated-query-source")?,
         1,
-        SchemaVersion::CURRENT,
+        DatasetSchemaRegistry::local().canonical_research_observations()?,
         Sha256Digest::new([99; 32]),
     )?;
     let batch = RecordBatch::try_new(

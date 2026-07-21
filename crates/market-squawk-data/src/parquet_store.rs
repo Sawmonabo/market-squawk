@@ -22,6 +22,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::arrow_convert::DatasetArrowBatch;
 use crate::blocking_supervisor::{BlockingIoAdmissionError, BlockingIoSupervisor};
 use crate::manifest::{PinnedDataset, Sha256Digest};
 use crate::publication_coordinator::PublicationLease;
@@ -372,6 +373,7 @@ impl ParquetObjectStore {
     }
 
     /// Publishes while the caller retains exclusion through its durable reference commit.
+    #[cfg(test)]
     pub(crate) async fn publish_under_lease(
         &self,
         batch: &RecordBatch,
@@ -379,6 +381,17 @@ impl ParquetObjectStore {
         lease: &PublicationLease,
     ) -> Result<PublishedObject, ParquetStoreError> {
         self.publish_under_lease_inner(batch, cancellation, lease)
+            .await
+    }
+
+    /// Publishes only a batch that retained and validated one registered dataset schema identity.
+    pub(crate) async fn publish_dataset_under_lease(
+        &self,
+        batch: &DatasetArrowBatch,
+        cancellation: &CancellationToken,
+        lease: &PublicationLease,
+    ) -> Result<PublishedObject, ParquetStoreError> {
+        self.publish_under_lease_inner(batch.record_batch(), cancellation, lease)
             .await
     }
 

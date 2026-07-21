@@ -22,7 +22,10 @@ pub use analytical_backup::{
     AnalyticalBackupLocation, AnalyticalBackupReceiptError, AnalyticalBackupService,
     AnalyticalRestoreMode, AnalyticalRestoreTarget, VerifiedAnalyticalBackup,
 };
-pub use arrow_convert::{ArrowConversionError, ResearchArrowBatch};
+pub use arrow_convert::{
+    ArrowConversionError, DatasetArrowBatch, DatasetSchemaError, DatasetSchemaRef,
+    DatasetSchemaRegistry, FeatureLabelBatchBindings, ResearchArrowBatch,
+};
 pub use authority_transition::evidence::CatalogContentEvidenceDigest;
 pub use authority_transition::{
     ArtifactInventoryDigest, AuthorityEventDigest, AuthorityEvidenceDigest, AuthorityGeneration,

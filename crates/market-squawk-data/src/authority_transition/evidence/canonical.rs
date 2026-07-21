@@ -9,7 +9,7 @@ pub(super) fn evidence_digest(
     snapshot: &CatalogEvidenceSnapshot,
 ) -> Result<CatalogContentEvidenceDigest, EvidenceError> {
     let mut digest = Sha256::new();
-    digest.update(b"market-squawk/analytical-catalog-evidence/v1");
+    digest.update(b"market-squawk/analytical-catalog-evidence/v2");
     digest.update(snapshot.request().cutoff().unix_nanos().to_be_bytes());
 
     let mut artifacts: Vec<_> = snapshot.artifacts().iter().collect();
@@ -49,7 +49,9 @@ pub(super) fn evidence_digest(
         digest.update(generation.lineage_hash().bytes());
         digest.update(generation.row_count().to_be_bytes());
         digest.update(generation.total_bytes().to_be_bytes());
-        digest.update(generation.schema_version().to_be_bytes());
+        text(&mut digest, generation.schema().name())?;
+        digest.update(generation.schema().version().get().to_be_bytes());
+        digest.update(generation.schema().fingerprint());
         digest.update(generation.anchor_manifest_id().as_bytes());
         match generation.parent_version() {
             Some(parent) => {

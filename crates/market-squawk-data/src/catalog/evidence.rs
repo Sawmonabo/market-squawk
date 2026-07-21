@@ -18,7 +18,7 @@ use crate::authority_transition::evidence::{
     GenerationEvidenceRow, GenerationObjectEvidenceRow, ManifestEvidenceRow,
     QueryArtifactEvidenceRow,
 };
-use crate::{DatasetId, GenerationKind, Sha256Digest};
+use crate::{DatasetId, DatasetSchemaRef, DatasetSchemaRegistry, GenerationKind, Sha256Digest};
 
 impl Catalog {
     /// Captures authority and analytical relationships from one consistent live read transaction.
@@ -161,7 +161,7 @@ struct GenerationHeader {
     lineage_hash: Sha256Digest,
     row_count: u64,
     total_bytes: u64,
-    schema_version: u32,
+    schema: DatasetSchemaRef,
     anchor_manifest_id: Uuid,
     parent_version: Option<u64>,
     kind: GenerationKind,
@@ -190,7 +190,7 @@ fn read_generations(
                 header.lineage_hash,
                 header.row_count,
                 header.total_bytes,
-                header.schema_version,
+                header.schema,
                 header.anchor_manifest_id,
                 header.parent_version,
                 header.kind,
@@ -212,7 +212,8 @@ fn read_generation_headers(
     let limit = limit_with_sentinel(maximum)?;
     let mut statement = connection.prepare(
         "SELECT dataset_id, manifest_version, content_hash, lineage_hash, row_count, total_bytes, \
-                schema_version, anchor_manifest_id, parent_version, generation_kind \
+                schema_name, schema_version, schema_fingerprint, anchor_manifest_id, \
+                parent_version, generation_kind \
          FROM analytical_generations ORDER BY dataset_id, manifest_version LIMIT ?1",
     )?;
     let mut rows = statement.query([limit])?;
@@ -220,8 +221,25 @@ fn read_generation_headers(
     while let Some(row) = rows.next()? {
         require_capacity(&result, maximum)?;
         let dataset_key: String = row.get(0)?;
-        let parent: Option<i64> = row.get(8)?;
-        let kind: String = row.get(9)?;
+        let parent: Option<i64> = row.get(10)?;
+        let kind: String = row.get(11)?;
+        let schema_name: String = row.get(6)?;
+        let schema_version =
+            u16::try_from(row.get::<_, i64>(7)?).map_err(|_| CatalogError::CorruptCatalog)?;
+        let schema_fingerprint: [u8; 32] = row
+            .get::<_, Vec<u8>>(8)?
+            .try_into()
+            .map_err(|_| CatalogError::CorruptCatalog)?;
+        let schema = DatasetSchemaRef::try_new(
+            &schema_name,
+            market_squawk_domain::SchemaVersion::new(schema_version)
+                .map_err(|_| CatalogError::CorruptCatalog)?,
+            schema_fingerprint,
+        )
+        .map_err(|_| CatalogError::CorruptCatalog)?;
+        DatasetSchemaRegistry::local()
+            .resolve(&schema)
+            .map_err(|_| CatalogError::CorruptCatalog)?;
         result.push(GenerationHeader {
             dataset_id: DatasetId::try_from(dataset_key.as_str())
                 .map_err(|_| CatalogError::CorruptCatalog)?,
@@ -231,8 +249,8 @@ fn read_generation_headers(
             lineage_hash: parse_sha256(1, row.get::<_, Vec<u8>>(3)?)?,
             row_count: parse_positive_u64(row.get(4)?)?,
             total_bytes: parse_positive_u64(row.get(5)?)?,
-            schema_version: parse_positive_u32(row.get(6)?)?,
-            anchor_manifest_id: parse_uuid(row.get::<_, String>(7)?)?,
+            schema,
+            anchor_manifest_id: parse_uuid(row.get::<_, String>(9)?)?,
             parent_version: parent.map(parse_positive_u64).transpose()?,
             kind: match kind.as_str() {
                 "ingest" => GenerationKind::Ingest,

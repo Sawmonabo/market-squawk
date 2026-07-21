@@ -25,13 +25,21 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use crate::schema::{
-    DATASET_KEY, REQUEST_DIGEST_KEY, RESEARCH_RECORD_SCHEMA, RESEARCH_SCHEMA_VERSION,
-    SCHEMA_VERSION_KEY, decode_hex, research_schema,
+    DATASET_KEY, REQUEST_DIGEST_KEY, RESEARCH_RECORD_SCHEMA, RESEARCH_SCHEMA_NAME,
+    RESEARCH_SCHEMA_VERSION, SCHEMA_VERSION_KEY, decode_hex, research_schema,
 };
+pub use crate::schema::{
+    DatasetSchemaError, DatasetSchemaRef, DatasetSchemaRegistry, FeatureLabelBatchBindings,
+};
+
+#[path = "arrow_convert/dataset.rs"]
+mod dataset;
+pub use dataset::DatasetArrowBatch;
 
 /// A request- and dataset-bound canonical Arrow record batch.
 #[derive(Clone, Debug)]
 pub struct ResearchArrowBatch {
+    schema_ref: DatasetSchemaRef,
     batch: RecordBatch,
 }
 
@@ -158,7 +166,7 @@ impl ResearchArrowBatch {
         if batches.is_empty() {
             return Err(ArrowConversionError::EmptyBatch);
         }
-        let target_schema = research_schema(&dataset, compaction_digest);
+        let target_schema = research_schema(&dataset, compaction_digest)?;
         let mut normalized = Vec::with_capacity(batches.len());
         for batch in batches {
             let validated = Self::try_from_record_batch(batch)?;
@@ -391,8 +399,12 @@ impl ResearchArrowBatch {
             Arc::new(BinaryArray::from_iter_values(payload_digests)),
             Arc::new(BinaryArray::from_iter_values(payloads)),
         ];
+        let schema_ref = DatasetSchemaRegistry::local().canonical_research_observations()?;
+        let batch = RecordBatch::try_new(research_schema(&dataset, batch_digest)?, arrays)?;
+        let validated = DatasetArrowBatch::try_new(schema_ref, batch)?;
         Ok(Self {
-            batch: RecordBatch::try_new(research_schema(&dataset, batch_digest), arrays)?,
+            schema_ref: validated.schema_ref,
+            batch: validated.batch,
         })
     }
 
@@ -406,6 +418,11 @@ impl ResearchArrowBatch {
         if version != RESEARCH_SCHEMA_VERSION {
             return Err(ArrowConversionError::UnsupportedSchemaVersion { found: version });
         }
+        let validated = DatasetArrowBatch::try_from_record_batch(batch)?;
+        if validated.schema_ref.name() != RESEARCH_SCHEMA_NAME {
+            return Err(ArrowConversionError::UnexpectedDatasetSchema);
+        }
+        let DatasetArrowBatch { schema_ref, batch } = validated;
         let dataset = metadata
             .get(DATASET_KEY)
             .ok_or(ArrowConversionError::InvalidSchemaMetadata)
@@ -421,12 +438,12 @@ impl ResearchArrowBatch {
             != research_schema(
                 &dataset,
                 EvidenceDigest::new(DigestAlgorithm::Sha256, request_digest),
-            )
+            )?
             .fields()
         {
             return Err(ArrowConversionError::InvalidSchema);
         }
-        let candidate = Self { batch };
+        let candidate = Self { schema_ref, batch };
         let observations = candidate.decode_payloads()?;
         let request_digests = candidate.decode_request_digests()?;
         let row_lineages = candidate.decode_row_lineages()?;
@@ -448,6 +465,19 @@ impl ResearchArrowBatch {
         &self.batch
     }
 
+    /// Returns the complete canonical research dataset-schema identity.
+    pub const fn schema_ref(&self) -> &DatasetSchemaRef {
+        &self.schema_ref
+    }
+
+    /// Returns the generic registered-dataset publication view.
+    pub fn dataset_batch(&self) -> DatasetArrowBatch {
+        DatasetArrowBatch {
+            schema_ref: self.schema_ref.clone(),
+            batch: self.batch.clone(),
+        }
+    }
+
     /// Returns the exact analytical row-schema version retained in this batch.
     ///
     /// # Errors
@@ -455,13 +485,7 @@ impl ResearchArrowBatch {
     /// Returns [`ArrowConversionError::InvalidSchemaMetadata`] when the mandatory version is
     /// absent, malformed, or zero.
     pub fn schema_version(&self) -> Result<SchemaVersion, ArrowConversionError> {
-        self.batch
-            .schema()
-            .metadata()
-            .get(SCHEMA_VERSION_KEY)
-            .and_then(|value| value.parse::<u16>().ok())
-            .and_then(|value| SchemaVersion::new(value).ok())
-            .ok_or(ArrowConversionError::InvalidSchemaMetadata)
+        Ok(self.schema_ref.version())
     }
 
     /// Reconstructs canonical observations after validating every projected column.
@@ -559,6 +583,15 @@ impl ResearchArrowBatch {
                 serde_json::from_slice(lineage).map_err(ArrowConversionError::from)
             })
             .collect()
+    }
+}
+
+impl From<ResearchArrowBatch> for DatasetArrowBatch {
+    fn from(value: ResearchArrowBatch) -> Self {
+        Self {
+            schema_ref: value.schema_ref,
+            batch: value.batch,
+        }
     }
 }
 
@@ -714,9 +747,15 @@ pub enum ArrowConversionError {
     /// This reader cannot interpret the retained schema version.
     #[error("unsupported Arrow schema version {found}")]
     UnsupportedSchemaVersion { found: u16 },
-    /// Field names, types, nullability, or order do not match the current schema.
-    #[error("Arrow fields do not match the current research schema")]
+    /// Fields, nullability, stable metadata, or mandatory values violate the registered schema.
+    #[error("Arrow batch does not match its registered dataset schema")]
     InvalidSchema,
+    /// A generic batch used a registered non-research schema where research rows were required.
+    #[error("Arrow batch does not use the canonical research-observation schema")]
+    UnexpectedDatasetSchema,
+    /// A typed feature/label component violates its closed row-level contract.
+    #[error("Arrow feature/label component row is invalid")]
+    InvalidFeatureLabelRow,
     /// Canonical payload and analytical projections disagree.
     #[error("Arrow analytical projection does not match its canonical payload")]
     ProjectionMismatch,
@@ -729,6 +768,9 @@ pub enum ArrowConversionError {
     /// Canonical JSON encoding or decoding failed.
     #[error("canonical observation serialization failed")]
     Json(#[from] JsonError),
+    /// Dataset schema identity is unknown, malformed, or fingerprint-inconsistent.
+    #[error("Arrow dataset schema identity is invalid")]
+    DatasetSchema(#[from] DatasetSchemaError),
 }
 
 fn observation_context(observation: &ResearchObservation) -> &ResearchContext {

@@ -190,7 +190,11 @@ fn a_legacy_v4_catalog_requires_explicit_root_migration_after_replacement() -> T
          DROP TRIGGER analytical_artifact_root_authority_events_immutable_delete;
          DROP TRIGGER analytical_artifact_root_authority_events_append_guard;
          DROP TABLE analytical_artifact_root_authority_events;
-         DELETE FROM schema_migrations WHERE version = 5;",
+         DROP TRIGGER analytical_generations_registered_schema_insert;
+         DROP TRIGGER analytical_generations_parent_schema_insert;
+         ALTER TABLE analytical_generations DROP COLUMN schema_fingerprint;
+         ALTER TABLE analytical_generations DROP COLUMN schema_name;
+         DELETE FROM schema_migrations WHERE version >= 5;",
     )?;
     drop(connection);
 

@@ -8,9 +8,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use arrow::record_batch::RecordBatch;
-use market_squawk_domain::{
-    DigestAlgorithm, EvidenceDigest, SchemaVersion, SourceIdentifier, Timestamp,
-};
+use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp};
 use market_squawk_sources::{ExtractionBatch, ExtractionContentIdentity, ExtractionError};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -27,11 +25,12 @@ use crate::parquet_store::{ArtifactRootIdentity, QueryArtifactWriterAdmission};
 use crate::query::QueryArtifactMemoryLease;
 use crate::{
     AnalyticalManifestCatalog, ArrowConversionError, ArtifactRecord, CatalogAuthority,
-    CatalogError, ContractCompletion, DatasetId, DatasetManifestRecord, DatasetManifestRef,
-    GenerationKind, IngestReservation, IngestRunState, ManifestCatalogError, ManifestObject,
-    ManifestPlan, ManifestPlanError, ObjectStoreConfig, OrphanRecoveryReport, ParquetObjectStore,
-    ParquetStoreError, PinnedDataset, PublishedObject, QueryArtifactReservation,
-    QueryArtifactReservationInput, ResearchArrowBatch, Sha256Digest, SourceOperation,
+    CatalogError, ContractCompletion, DatasetArrowBatch, DatasetId, DatasetManifestRecord,
+    DatasetManifestRef, DatasetSchemaRef, GenerationKind, IngestReservation, IngestRunState,
+    ManifestCatalogError, ManifestObject, ManifestPlan, ManifestPlanError, ObjectStoreConfig,
+    OrphanRecoveryReport, ParquetObjectStore, ParquetStoreError, PinnedDataset, PublishedObject,
+    QueryArtifactReservation, QueryArtifactReservationInput, ResearchArrowBatch, Sha256Digest,
+    SourceOperation,
 };
 
 const ORPHAN_RECOVERY_DEADLINE: Duration = Duration::from_secs(30);
@@ -69,11 +68,14 @@ impl CompactionRequest {
     /// Constructs a request bound to one exact immutable source generation.
     pub fn new(source: DatasetManifestRef) -> Self {
         let mut digest = Sha256::new();
-        digest.update(b"market-squawk/analytical-compaction/v1");
+        digest.update(b"market-squawk/analytical-compaction/v2");
         digest.update((source.dataset_id().as_str().len() as u64).to_be_bytes());
         digest.update(source.dataset_id().as_str().as_bytes());
         digest.update(source.manifest_version().to_be_bytes());
+        digest.update((source.schema().name().len() as u64).to_be_bytes());
+        digest.update(source.schema().name().as_bytes());
         digest.update(source.schema_version().get().to_be_bytes());
+        digest.update(source.schema().fingerprint());
         digest.update(source.content_hash().bytes());
         Self {
             source,
@@ -583,7 +585,8 @@ impl AnalyticalDataService {
             request.payload_digest(),
             batches,
         )?;
-        let schema_version = compacted.schema_version()?;
+        let schema = compacted.schema_ref().clone();
+        let compacted = DatasetArrowBatch::from(compacted);
         let _operation = self
             .operation_gate
             .acquire(&cancellation)
@@ -604,7 +607,7 @@ impl AnalyticalDataService {
         let publication = self.objects.begin_publication(&cancellation).await?;
         let published = self
             .objects
-            .publish_under_lease(compacted.record_batch(), &cancellation, &publication)
+            .publish_dataset_under_lease(&compacted, &cancellation, &publication)
             .await?;
         if cancellation.is_cancelled() {
             return Err(IngestError::Cancelled);
@@ -628,7 +631,7 @@ impl AnalyticalDataService {
             &reservation,
             run.state(),
             request.source().dataset_id(),
-            schema_version,
+            &schema,
             &object,
         )? {
             return Ok(committed);
@@ -641,7 +644,7 @@ impl AnalyticalDataService {
             &reservation,
             run.state(),
             dataset_name,
-            schema_version,
+            schema,
             plan,
             published,
             GenerationKind::Compaction,
@@ -723,10 +726,11 @@ impl AnalyticalDataService {
             }
         }
         let converted = ResearchArrowBatch::try_from_extraction_batch(&batch)?;
-        let schema_version = converted.schema_version()?;
+        let schema = converted.schema_ref().clone();
         let lineage = converted.lineage_digest()?;
+        let converted = DatasetArrowBatch::from(converted);
         self.manifests
-            .validate_append_schema(&dataset_id, schema_version)?;
+            .validate_append_schema(&dataset_id, &schema)?;
         let _operation = self
             .operation_gate
             .acquire(&cancellation)
@@ -743,7 +747,7 @@ impl AnalyticalDataService {
         let publication = self.objects.begin_publication(&cancellation).await?;
         let published = self
             .objects
-            .publish_under_lease(converted.record_batch(), &cancellation, &publication)
+            .publish_dataset_under_lease(&converted, &cancellation, &publication)
             .await?;
         if cancellation.is_cancelled() {
             return Err(IngestError::Cancelled);
@@ -762,20 +766,18 @@ impl AnalyticalDataService {
             &reservation,
             run.state(),
             &dataset_id,
-            schema_version,
+            &schema,
             &object,
         )? {
             return Ok(committed);
         }
-        let plan = self
-            .manifests
-            .preview_append(dataset_id, schema_version, object)?;
+        let plan = self.manifests.preview_append(dataset_id, &schema, object)?;
         self.commit_plan(
             &authority,
             &reservation,
             run.state(),
             dataset_name,
-            schema_version,
+            schema,
             plan,
             published,
             GenerationKind::Ingest,
@@ -837,7 +839,7 @@ impl AnalyticalDataService {
         reservation: &IngestReservation,
         state: IngestRunState,
         dataset_id: &DatasetId,
-        schema_version: SchemaVersion,
+        schema: &DatasetSchemaRef,
         object: &ManifestObject,
     ) -> Result<Option<CommittedDataset>, IngestError> {
         let Some(existing) = self.manifests.for_run(reservation.run_id())? else {
@@ -848,7 +850,7 @@ impl AnalyticalDataService {
             };
         };
         if existing.manifest().dataset_id() != dataset_id
-            || existing.manifest().schema_version() != schema_version
+            || existing.manifest().schema() != schema
             || existing.plan().objects().last() != Some(object)
         {
             return Err(IngestError::ReplayConflict);
@@ -873,7 +875,7 @@ impl AnalyticalDataService {
         reservation: &IngestReservation,
         state: IngestRunState,
         dataset_name: SourceIdentifier,
-        schema_version: SchemaVersion,
+        schema: DatasetSchemaRef,
         plan: ManifestPlan,
         published: PublishedObject,
         kind: GenerationKind,
@@ -890,7 +892,7 @@ impl AnalyticalDataService {
         )?;
         let anchor = DatasetManifestRecord::try_new(
             dataset_name,
-            schema_version,
+            schema.version(),
             artifact.artifact_id(),
             plan.content_hash().evidence(),
             created_at,
@@ -900,6 +902,7 @@ impl AnalyticalDataService {
             &plan,
             publication.artifact(),
             publication.manifest(),
+            &schema,
             kind,
         )?;
         authority.complete_ingest(reservation, ContractCompletion::Succeeded)?;
