@@ -624,6 +624,11 @@ impl ResearchTime {
         revision: RevisionNumber,
         superseded: Option<ResearchTemporalCoordinate>,
     ) -> Result<Self, ProvenanceError> {
+        if let Some(superseded) = superseded.as_ref()
+            && superseded.partial_cmp(&effective) != Some(Ordering::Greater)
+        {
+            return Err(ProvenanceError::SupersededNotAfterEffective);
+        }
         if let (Some(published), Some(superseded)) = (published.as_ref(), superseded.as_ref()) {
             match superseded.partial_cmp(published) {
                 Some(Ordering::Greater) => {}

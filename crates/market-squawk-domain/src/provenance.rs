@@ -78,6 +78,8 @@ pub enum ProvenanceError {
     AvailabilityBeforePublished,
     /// A superseding revision is not strictly later than publication.
     SupersededNotAfterPublished,
+    /// A superseding revision is not provably later than the effective coordinate.
+    SupersededNotAfterEffective,
     /// A superseding revision is not strictly later than conservative availability.
     SupersededNotAfterAvailable,
     /// Revision numbers are one-based.
@@ -116,6 +118,9 @@ impl fmt::Display for ProvenanceError {
             }
             Self::SupersededNotAfterPublished => {
                 formatter.write_str("superseded time must be later than publication time")
+            }
+            Self::SupersededNotAfterEffective => {
+                formatter.write_str("superseded time must be later than effective time")
             }
             Self::SupersededNotAfterAvailable => {
                 formatter.write_str("superseded time must be later than conservative availability")

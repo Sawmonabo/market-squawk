@@ -207,7 +207,7 @@ fn legacy_exact_research_time_decodes_without_precision_loss() -> Result<(), Box
 #[test]
 fn research_time_rejects_incomparable_supersession_precision() -> Result<(), Box<dyn Error>> {
     let result = ResearchTime::try_new_with_coordinates(
-        ResearchTemporalCoordinate::calendar_date(CalendarDate::new(2026, 7, 1)?),
+        ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(0)),
         Some(ResearchTemporalCoordinate::calendar_date(
             CalendarDate::new(2026, 7, 2)?,
         )),
@@ -221,6 +221,38 @@ fn research_time_rejects_incomparable_supersession_precision() -> Result<(), Box
         result,
         Err(ProvenanceError::SupersededNotAfterPublished)
     ));
+    Ok(())
+}
+
+#[test]
+fn research_time_rejects_unprovable_supersession_after_effective() -> Result<(), Box<dyn Error>> {
+    let effective = ResearchTemporalCoordinate::source_period(ResearchPeriod::try_new(
+        SourceIdentifier::try_from("bls-monthly")?,
+        2026,
+        NonZeroU16::try_from(12_u16)?,
+        SourceIdentifier::try_from("M12")?,
+    )?);
+    let candidates = [
+        ResearchTemporalCoordinate::source_period(ResearchPeriod::try_new(
+            SourceIdentifier::try_from("bls-monthly")?,
+            2025,
+            NonZeroU16::try_from(1_u16)?,
+            SourceIdentifier::try_from("M01")?,
+        )?),
+        ResearchTemporalCoordinate::calendar_date(CalendarDate::new(2027, 1, 1)?),
+    ];
+
+    for superseded in candidates {
+        assert!(matches!(
+            ResearchTime::try_new_with_coordinates(
+                effective.clone(),
+                None,
+                RevisionNumber::new(1)?,
+                Some(superseded),
+            ),
+            Err(ProvenanceError::SupersededNotAfterEffective)
+        ));
+    }
     Ok(())
 }
 
