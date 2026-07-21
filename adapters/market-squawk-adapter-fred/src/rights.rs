@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use market_squawk_domain::{SourceIdentifier, Timestamp};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use url::Url;
 
@@ -38,6 +39,10 @@ impl Sha256Digest {
 
     fn is_zero(self) -> bool {
         self.0 == [0; 32]
+    }
+
+    fn of(bytes: &[u8]) -> Self {
+        Self(Sha256::digest(bytes).into())
     }
 }
 
@@ -129,8 +134,8 @@ pub struct FredRightsArtifact {
 }
 
 impl FredRightsArtifact {
-    /// Parses and validates the machine-readable release evidence artifact.
-    pub fn parse(bytes: &[u8]) -> Result<Self, FredRightsError> {
+    /// Parses the release artifact and verifies its declarations against the exact reviewed terms.
+    pub fn parse(bytes: &[u8], terms_bytes: &[u8]) -> Result<Self, FredRightsError> {
         if bytes.len() > 256 * 1024 {
             return Err(FredRightsError::ArtifactTooLarge);
         }
@@ -147,6 +152,9 @@ impl FredRightsArtifact {
             review_required_by: Timestamp::from_unix_nanos(wire.review_required_by_unix_nanos),
         };
         validate_terms(&terms)?;
+        if terms.byte_length != terms_bytes.len() || terms.digest != Sha256Digest::of(terms_bytes) {
+            return Err(FredRightsError::TermsEvidenceMismatch);
+        }
         validate_operations(&wire.operations)?;
         if wire.operations.contains(&FredOperation::RetrieveEphemeral)
             || wire.disposition != FredRightsDisposition::BlockedUnknownRights
@@ -202,13 +210,59 @@ impl FredRightsArtifact {
     }
 }
 
+/// Independently verified exact owner-authorization evidence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FredOwnerAuthorizationEvidence {
+    url: String,
+    digest: Sha256Digest,
+    byte_length: usize,
+}
+
+impl FredOwnerAuthorizationEvidence {
+    /// Verifies declared evidence identity against the exact supplied authorization bytes.
+    pub fn try_new(
+        url: String,
+        digest: Sha256Digest,
+        byte_length: usize,
+        authorization_bytes: &[u8],
+    ) -> Result<Self, FredRightsError> {
+        validate_https_url(&url)?;
+        if digest.is_zero()
+            || byte_length == 0
+            || byte_length != authorization_bytes.len()
+            || digest != Sha256Digest::of(authorization_bytes)
+        {
+            return Err(FredRightsError::OwnerEvidenceMismatch);
+        }
+        Ok(Self {
+            url,
+            digest,
+            byte_length,
+        })
+    }
+
+    /// Returns the exact evidence URL.
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// Returns the verified authorization digest.
+    pub const fn digest(&self) -> Sha256Digest {
+        self.digest
+    }
+
+    /// Returns the verified authorization byte length.
+    pub const fn byte_length(&self) -> usize {
+        self.byte_length
+    }
+}
+
 /// An exact-series authorization supplied by the series owner.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FredSeriesRightsGrant {
     series: SourceIdentifier,
     owner: SourceIdentifier,
-    authorization_url: String,
-    authorization_digest: Sha256Digest,
+    authorization: FredOwnerAuthorizationEvidence,
     terms_digest: Sha256Digest,
     operations: BTreeSet<FredOperation>,
     effective_at: Timestamp,
@@ -224,27 +278,20 @@ impl FredSeriesRightsGrant {
     pub fn try_new(
         series: SourceIdentifier,
         owner: SourceIdentifier,
-        authorization_url: String,
-        authorization_digest: Sha256Digest,
+        authorization: FredOwnerAuthorizationEvidence,
         terms_digest: Sha256Digest,
         operations: Vec<FredOperation>,
         effective_at: Timestamp,
         expires_at: Timestamp,
     ) -> Result<Self, FredRightsError> {
-        validate_https_url(&authorization_url)?;
         validate_operations(&operations)?;
-        if authorization_digest.is_zero()
-            || terms_digest.is_zero()
-            || effective_at >= expires_at
-            || series.as_str().contains('*')
-        {
+        if terms_digest.is_zero() || effective_at >= expires_at || series.as_str().contains('*') {
             return Err(FredRightsError::InvalidGrant);
         }
         Ok(Self {
             series,
             owner,
-            authorization_url,
-            authorization_digest,
+            authorization,
             terms_digest,
             operations: operations.into_iter().collect(),
             effective_at,
@@ -264,12 +311,17 @@ impl FredSeriesRightsGrant {
 
     /// Returns the exact owner-authorization evidence URL.
     pub fn authorization_url(&self) -> &str {
-        &self.authorization_url
+        self.authorization.url()
     }
 
     /// Returns the digest of the owner-authorization evidence bytes.
     pub const fn authorization_digest(&self) -> Sha256Digest {
-        self.authorization_digest
+        self.authorization.digest()
+    }
+
+    /// Returns the verified owner-authorization evidence byte length.
+    pub const fn authorization_byte_length(&self) -> usize {
+        self.authorization.byte_length()
     }
 
     /// Returns the FRED terms digest to which this grant is bound.
@@ -407,6 +459,12 @@ pub enum FredRightsError {
     /// Terms evidence is internally inconsistent or stale at construction.
     #[error("invalid FRED terms evidence")]
     InvalidTerms,
+    /// Supplied terms bytes do not match the artifact's declared exact evidence.
+    #[error("FRED terms bytes do not match the release artifact")]
+    TermsEvidenceMismatch,
+    /// Supplied owner-authorization bytes do not match their declared exact evidence.
+    #[error("FRED owner authorization bytes do not match declared evidence")]
+    OwnerEvidenceMismatch,
     /// An exact-series grant is invalid or duplicates another grant.
     #[error("invalid FRED series rights grant")]
     InvalidGrant,
