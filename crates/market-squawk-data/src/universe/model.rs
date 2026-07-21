@@ -424,6 +424,78 @@ pub enum UniverseError {
         /// Candidates presented to the build.
         observed: usize,
     },
+    /// Derivative lifecycle, civil-date, or roll inputs exceed the caller-selected work bound.
+    #[error("derivative universe has {observed} inputs in one class; caller limit is {limit}")]
+    DerivativeInputLimitExceeded {
+        /// Caller-selected per-input-class limit.
+        limit: usize,
+        /// Inputs presented in that class.
+        observed: usize,
+    },
+    /// A full option expiration date conflicts with its OCC identity fields.
+    #[error("option expiration evidence conflicts with OCC identity for {instrument_id}")]
+    OptionExpirationMismatch {
+        /// Instrument carrying conflicting option identity evidence.
+        instrument_id: InstrumentId,
+    },
+    /// A PIT-admitted derivative had no lifecycle evidence.
+    #[error("missing derivative lifecycle evidence for {instrument_id}")]
+    MissingDerivativeLifecycle {
+        /// Instrument missing lifecycle evidence.
+        instrument_id: InstrumentId,
+    },
+    /// More than one lifecycle record was supplied for one instrument.
+    #[error("duplicate derivative lifecycle evidence for {instrument_id}")]
+    DuplicateDerivativeLifecycle {
+        /// Instrument with ambiguous lifecycle evidence.
+        instrument_id: InstrumentId,
+    },
+    /// A PIT-admitted derivative had no venue civil date.
+    #[error("missing derivative venue civil date for {instrument_id}")]
+    MissingDerivativeCivilDate {
+        /// Instrument missing a venue civil date.
+        instrument_id: InstrumentId,
+    },
+    /// More than one venue civil date was supplied for one instrument.
+    #[error("duplicate derivative venue civil date for {instrument_id}")]
+    DuplicateDerivativeCivilDate {
+        /// Instrument with ambiguous venue civil dates.
+        instrument_id: InstrumentId,
+    },
+    /// Multiple roll edges compete for one source or target contract.
+    #[error("ambiguous explicit contract roll involving {instrument_id}")]
+    AmbiguousContractRoll {
+        /// First ambiguously mapped instrument.
+        instrument_id: InstrumentId,
+    },
+    /// Effective roll mappings form a cycle and therefore have no terminal contract.
+    #[error("explicit contract-roll cycle includes {instrument_id}")]
+    ContractRollCycle {
+        /// First deterministic source found in the cycle.
+        instrument_id: InstrumentId,
+    },
+    /// An effective roll names a source absent from the PIT snapshot.
+    #[error("explicit roll source is unavailable at the snapshot: {instrument_id}")]
+    RollSourceUnavailable {
+        /// Missing roll source.
+        instrument_id: InstrumentId,
+    },
+    /// An effective roll names a target absent or inactive at the PIT snapshot.
+    #[error("explicit roll target is unavailable at the snapshot: {instrument_id}")]
+    RollTargetUnavailable {
+        /// Missing or inactive roll target.
+        instrument_id: InstrumentId,
+    },
+    /// A contract-roll mapping referenced a non-futures lifecycle record.
+    #[error(
+        "contract roll requires futures on both ends: {from_instrument_id} -> {to_instrument_id}"
+    )]
+    RollRequiresFutures {
+        /// Roll source.
+        from_instrument_id: InstrumentId,
+        /// Roll target.
+        to_instrument_id: InstrumentId,
+    },
     /// Multiple point-in-time-admissible memberships overlap for a stable instrument.
     #[error("overlapping admitted memberships begin with instrument {first_instrument}")]
     OverlappingAdmittedMemberships {

@@ -96,6 +96,8 @@ pub use rights::{
     RightsError, SourceOperation, UserOwnedLocalBasis,
 };
 pub use universe::{
+    ContractRollEvidence, DerivativeBoundary, DerivativeCivilDate, DerivativeLifecycle,
+    DerivativeLifecycleEvidence, DerivativeSelectionDecision, DerivativeUniverseSnapshot,
     MAX_UNIVERSE_CANDIDATES, MAX_UNIVERSE_RETAINED_BYTES, UniverseConflictCounts,
     UniverseConflictEvidence, UniverseError, UniverseExclusion, UniverseExclusionCounts,
     UniverseExclusionReason, UniverseId, UniverseLimits, UniverseMembership, UniverseSnapshot,
