@@ -1,5 +1,3 @@
-mod common;
-
 use std::fs;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
@@ -16,7 +14,7 @@ use market_squawk_sources::{
     TransportFrameKind,
 };
 
-use common::{TestResult, direct_metadata, now_timestamp, source_identifier};
+use crate::common::{TestResult, direct_metadata, now_timestamp, source_identifier};
 
 const CHILD_PHASE: &str = "MARKET_SQUAWK_AUTHORITY_CHILD_PHASE";
 const CHILD_ROOT: &str = "MARKET_SQUAWK_AUTHORITY_CHILD_ROOT";
@@ -51,7 +49,7 @@ impl Drop for TemporaryAuthorityRoot {
 fn run_child(root: &Path, phase: &str) -> TestResult {
     let output = Command::new(std::env::current_exe()?)
         .arg("--exact")
-        .arg("durable_authority_child")
+        .arg("authority_persistence::durable_authority_child")
         .arg("--nocapture")
         .env(CHILD_PHASE, phase)
         .env(CHILD_ROOT, root)
