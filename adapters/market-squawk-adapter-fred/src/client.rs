@@ -9,7 +9,8 @@ use market_squawk_domain::{
 use market_squawk_sources::{
     AuthorizationMode, CURRENT_RESEARCH_RECORD_SCHEMA, CoverageDomain, DiscoveryBatch,
     DiscoveryRequest, ExtractionAuthority, ExtractionBatch, ExtractionRecord, ExtractionRequest,
-    ExtractionSource, ExtractionSourceError, HistoricalCapability, NetworkAccessPolicy,
+    ExtractionRevisionEvidence, ExtractionRevisionPlan, ExtractionSource, ExtractionSourceError,
+    HistoricalCapability, NetworkAccessPolicy, ObservedProviderOrder, ObservedRevisionError,
     SourceClass, SourceError, SourceMetadata, SourceMetadataProvider, SourceObject,
     payload_matches_exact_evidence,
 };
@@ -85,6 +86,8 @@ pub enum FredSourceError {
     DeadlineExceeded,
     /// Caller cancellation interrupted the operation.
     Cancelled,
+    /// Exact provider revision evidence violated the bounded durable-authority contract.
+    RevisionAuthority(ObservedRevisionError),
 }
 
 impl std::fmt::Display for FredSourceError {
@@ -98,11 +101,28 @@ impl std::fmt::Display for FredSourceError {
             Self::InvalidConfiguration => formatter.write_str("invalid FRED source configuration"),
             Self::DeadlineExceeded => formatter.write_str("FRED operation deadline elapsed"),
             Self::Cancelled => formatter.write_str("FRED operation was cancelled"),
+            Self::RevisionAuthority(error) => {
+                write!(formatter, "invalid FRED revision authority: {error}")
+            }
         }
     }
 }
 
-impl std::error::Error for FredSourceError {}
+impl std::error::Error for FredSourceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::RevisionAuthority(error) => Some(error),
+            Self::InvalidApiKey
+            | Self::InvalidDataset
+            | Self::BodyTooLarge
+            | Self::Network
+            | Self::Protocol
+            | Self::InvalidConfiguration
+            | Self::DeadlineExceeded
+            | Self::Cancelled => None,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FredNamespace {
@@ -233,6 +253,50 @@ impl FredSource {
         };
         let transport = Arc::new(ReqwestFredTransport::try_new(bounds)?);
         Self::try_new_with_transport(metadata, api_key, rights, transport, DISCOVERY_PAGE_RECORDS)
+    }
+
+    /// Builds the exact provider-owned revision authority aligned to an extracted FRED batch.
+    ///
+    /// FRED's `realtime_start` civil date is retained as the provider order coordinate. The
+    /// canonical ALFRED revision identifier is retained as both version evidence and the stable
+    /// tie-breaker, so durable assignment never depends on an invented time zone or arrival order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FredSourceError::InvalidConfiguration`] when the batch belongs to another source
+    /// metadata revision. Returns [`FredSourceError::Protocol`] when any record lacks an exact
+    /// FRED publication date, and [`FredSourceError::RevisionAuthority`] when exact evidence
+    /// violates bounded revision-authority invariants.
+    pub fn revision_plan(
+        &self,
+        batch: &ExtractionBatch,
+    ) -> Result<ExtractionRevisionPlan, FredSourceError> {
+        if batch.request().object().source_id() != self.metadata.source_id()
+            || batch.request().object().metadata_revision() != self.metadata.revision()
+        {
+            return Err(FredSourceError::InvalidConfiguration);
+        }
+        let mut evidence = Vec::new();
+        evidence
+            .try_reserve_exact(batch.records().len())
+            .map_err(|_| {
+                FredSourceError::RevisionAuthority(ObservedRevisionError::AllocationFailure)
+            })?;
+        for record in batch.records() {
+            let published = record
+                .published_time()
+                .filter(|coordinate| coordinate.calendar_date_value().is_some())
+                .cloned()
+                .ok_or(FredSourceError::Protocol)?;
+            let version = record.revision().as_str().as_bytes();
+            let order = ObservedProviderOrder::try_new(published, version)
+                .map_err(FredSourceError::RevisionAuthority)?;
+            evidence.push(
+                ExtractionRevisionEvidence::provider_supplied(version, order)
+                    .map_err(FredSourceError::RevisionAuthority)?,
+            );
+        }
+        ExtractionRevisionPlan::try_new(evidence).map_err(FredSourceError::RevisionAuthority)
     }
 
     fn try_new_with_transport(

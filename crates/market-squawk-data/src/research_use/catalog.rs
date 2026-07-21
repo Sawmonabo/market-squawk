@@ -418,7 +418,7 @@ impl CatalogAuthority {
             persistence::authorize(transaction, session_id, now, request, cancellation)
         })?;
         match outcome {
-            AuthorizationTransactionOutcome::Allowed(authorization) => Ok(authorization),
+            AuthorizationTransactionOutcome::Allowed(authorization) => Ok(*authorization),
             AuthorizationTransactionOutcome::Denied {
                 decision_digest,
                 reason,
@@ -453,7 +453,7 @@ impl CatalogAuthority {
 }
 
 pub(super) enum AuthorizationTransactionOutcome {
-    Allowed(AuthorizedResearchUse),
+    Allowed(Box<AuthorizedResearchUse>),
     Denied {
         decision_digest: ResearchUseDecisionDigest,
         reason: ResearchUseDenialReason,

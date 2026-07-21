@@ -24,12 +24,13 @@ pub use contracts::{
     payload_matches_exact_evidence,
 };
 pub use revisions::{
-    CanonicalObservationFamily, CanonicalObservationPayload, MAX_OBSERVED_REVISION_BATCH_BYTES,
-    MAX_OBSERVED_REVISION_BATCH_RECORDS, MAX_OBSERVED_SEMANTIC_PAYLOAD_BYTES,
-    MAX_OBSERVED_VERSION_EVIDENCE_BYTES, ObservedProviderOrder, ObservedRevisionAssignments,
-    ObservedRevisionAuthority, ObservedRevisionBatch, ObservedRevisionError,
-    ObservedRevisionRecord, ObservedSemanticPayload, ObservedVersionEvidence, ObservedVersionKind,
-    PitV1CanonicalEncoder, PitV1EncodingControl, PitV1EncodingError,
+    CanonicalObservationFamily, CanonicalObservationPayload, ExtractionRevisionEvidence,
+    ExtractionRevisionPlan, MAX_OBSERVED_REVISION_BATCH_BYTES, MAX_OBSERVED_REVISION_BATCH_RECORDS,
+    MAX_OBSERVED_SEMANTIC_PAYLOAD_BYTES, MAX_OBSERVED_VERSION_EVIDENCE_BYTES,
+    ObservedProviderOrder, ObservedRevisionAssignments, ObservedRevisionAuthority,
+    ObservedRevisionBatch, ObservedRevisionError, ObservedRevisionRecord, ObservedSemanticPayload,
+    ObservedVersionEvidence, ObservedVersionKind, PitV1CanonicalEncoder, PitV1EncodingControl,
+    PitV1EncodingError,
 };
 
 /// Object-safe research extraction contract with one boxed future per request.

@@ -5,7 +5,10 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::market::CorporateActionInvariantError;
-use crate::{CorporateActionKind, InstrumentId, QuantityLots, ResearchContext, SourceIdentifier};
+use crate::{
+    CorporateActionKind, InstrumentId, QuantityLots, ResearchContext, RevisionNumber,
+    SourceIdentifier,
+};
 
 #[path = "research/observations.rs"]
 mod observations;
@@ -60,6 +63,89 @@ pub enum ResearchObservation {
     CorporateAction(CorporateActionObservation),
     /// User-owned, licensed, or public alternative dataset observation.
     AlternativeData(AlternativeDataObservation),
+}
+
+impl ResearchObservation {
+    /// Rebinds one finalized observation to a durable revision without changing its payload,
+    /// provenance, or source-authored temporal coordinates.
+    ///
+    /// # Errors
+    ///
+    /// Returns the original variant's invariant error if reconstruction detects corrupted retained
+    /// state. Valid canonical observations remain valid because revision is not a payload invariant.
+    pub fn with_revision(&self, revision: RevisionNumber) -> Result<Self, ResearchError> {
+        match self {
+            Self::Filing(value) => FilingObservation::new(
+                value.context().with_revision(revision),
+                value.form_type().clone(),
+                value.accession().clone(),
+            )
+            .map(Self::Filing),
+            Self::Fundamental(value) => match value.xbrl_evidence() {
+                Some(evidence) => FundamentalObservation::new_with_xbrl_evidence(
+                    value.context().with_revision(revision),
+                    value.concept().clone(),
+                    value.value(),
+                    value.unit().clone(),
+                    evidence.clone(),
+                ),
+                None => FundamentalObservation::new(
+                    value.context().with_revision(revision),
+                    value.concept().clone(),
+                    value.value(),
+                    value.unit().clone(),
+                ),
+            }
+            .map(Self::Fundamental),
+            Self::Macro(value) => {
+                let context = value.context().with_revision(revision);
+                if let Some(observed) = value.value().observed_value() {
+                    Ok(Self::Macro(MacroObservation::new(
+                        context,
+                        value.series().clone(),
+                        observed,
+                        value.unit().clone(),
+                    )))
+                } else if let Some(missing) = value.value().missing_value() {
+                    Ok(Self::Macro(MacroObservation::missing(
+                        context,
+                        value.series().clone(),
+                        missing.clone(),
+                        value.unit().clone(),
+                    )))
+                } else {
+                    Err(ResearchError::InvalidMacroValueState)
+                }
+            }
+            Self::PortfolioPosition(value) => PositionObservation::new(
+                value.context().with_revision(revision),
+                value.account_id().clone(),
+                value.side(),
+                value.absolute_quantity(),
+            )
+            .map(Self::PortfolioPosition),
+            Self::Transaction(value) => Ok(Self::Transaction(TransactionObservation::new(
+                value.context().with_revision(revision),
+                value.account_id().clone(),
+                value.transaction_type().clone(),
+                value.source_record_id().clone(),
+            ))),
+            Self::CorporateAction(value) => CorporateActionObservation::new(
+                value.context().with_revision(revision),
+                value.action().clone(),
+            )
+            .map(Self::CorporateAction),
+            Self::AlternativeData(value) => {
+                Ok(Self::AlternativeData(AlternativeDataObservation::new(
+                    value.context().with_revision(revision),
+                    value.dataset().clone(),
+                    value.field().clone(),
+                    value.value(),
+                    value.unit().cloned(),
+                )))
+            }
+        }
+    }
 }
 
 /// A canonical research-payload invariant failure.

@@ -67,6 +67,10 @@ impl ExactObservedEvidence {
     const fn identity(&self) -> EvidenceDigest {
         self.identity
     }
+
+    const fn retained_bytes(&self) -> usize {
+        self.exact_bytes.len()
+    }
 }
 
 /// Bounded exact version evidence whose identity is independent of semantic response content.
@@ -130,6 +134,10 @@ impl ObservedVersionEvidence {
     /// Returns the complete token or canonical-row evidence retained for digest collision checks.
     pub fn exact_evidence(&self) -> &[u8] {
         self.evidence.exact_bytes()
+    }
+
+    pub(super) const fn retained_bytes(&self) -> usize {
+        self.evidence.retained_bytes()
     }
 }
 
@@ -235,7 +243,7 @@ impl ObservedProviderOrder {
             }
         };
         coordinate_bytes
-            .checked_add(self.tie_breaker.exact_bytes.len())
+            .checked_add(self.tie_breaker.retained_bytes())
             .ok_or(ObservedRevisionError::ByteCountOverflow)
     }
 }

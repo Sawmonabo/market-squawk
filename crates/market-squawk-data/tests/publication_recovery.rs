@@ -26,8 +26,9 @@ use market_squawk_platform::LocalPaths;
 use market_squawk_sources::{
     AuthorizationGrant, AuthorizationMode, AvailabilityEvidence as SourceAvailabilityEvidence,
     CoverageDomain, DiscoveryRequest, ExtractionBatch, ExtractionRecord, ExtractionRequest,
-    FreshnessPolicy, HistoricalCapability, NetworkAccessPolicy, SourceCapabilities, SourceClass,
-    SourceCoverage, SourceMetadata, SourceMetadataInput, SourceObject, SourceProtocolProfile,
+    ExtractionRevisionEvidence, ExtractionRevisionPlan, FreshnessPolicy, HistoricalCapability,
+    NetworkAccessPolicy, ObservedProviderOrder, SourceCapabilities, SourceClass, SourceCoverage,
+    SourceMetadata, SourceMetadataInput, SourceObject, SourceProtocolProfile,
 };
 use rusqlite::params;
 use rust_decimal::Decimal;
@@ -598,6 +599,7 @@ async fn rights_bound_ingest_replays_one_complete_pinned_generation() -> TestRes
     let source = local_source()?;
     authority.register_source(&source, Timestamp::from_unix_nanos(10))?;
     let batch = extraction_batch()?;
+    let revisions = provider_revision_plan(&batch)?;
     let payload_digest = extraction_batch_digest(&batch)?;
     let rights = authority.admit_source_rights(RightsDecisionInput {
         source_id: source.source_id().clone(),
@@ -625,11 +627,16 @@ async fn rights_bound_ingest_replays_one_complete_pinned_generation() -> TestRes
     )?;
 
     let first = service
-        .ingest(reservation.clone(), batch.clone(), CancellationToken::new())
+        .ingest_with_revision_plan(
+            reservation.clone(),
+            batch.clone(),
+            revisions.clone(),
+            CancellationToken::new(),
+        )
         .await?;
     assert_eq!(first.manifest().schema_version().get(), 3);
     let replay = service
-        .ingest(reservation, batch, CancellationToken::new())
+        .ingest_with_revision_plan(reservation, batch, revisions, CancellationToken::new())
         .await?;
     assert_eq!(first, replay);
     let batches = service
@@ -643,6 +650,12 @@ async fn rights_bound_ingest_replays_one_complete_pinned_generation() -> TestRes
         .map(|batch| batch.observations())
         .collect::<Result<Vec<_>, _>>()?;
     assert_eq!(observations.iter().map(Vec::len).sum::<usize>(), 1);
+    let Some(ResearchObservation::Macro(observation)) =
+        observations.first().and_then(|batch| batch.first())
+    else {
+        return Err("expected one rebound macro observation".into());
+    };
+    assert_eq!(observation.context().time().revision().get(), 1);
     let query = ResearchQueryEngine::from_pinned_dataset(
         first.pinned().clone(),
         "observations",
@@ -910,6 +923,25 @@ fn extraction_batch() -> Result<ExtractionBatch, Box<dyn Error>> {
     Ok(ExtractionBatch::try_new(&request, vec![record])?)
 }
 
+fn provider_revision_plan(
+    batch: &ExtractionBatch,
+) -> Result<ExtractionRevisionPlan, Box<dyn Error>> {
+    let evidence = batch
+        .records()
+        .iter()
+        .map(|record| {
+            let version = record.revision().as_str().as_bytes();
+            let published = record
+                .published_time()
+                .cloned()
+                .ok_or("provider fixture must retain publication order")?;
+            let order = ObservedProviderOrder::try_new(published, version)?;
+            ExtractionRevisionEvidence::provider_supplied(version, order).map_err(Into::into)
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    Ok(ExtractionRevisionPlan::try_new(evidence)?)
+}
+
 fn macro_observation() -> Result<ResearchObservation, Box<dyn Error>> {
     let context = ResearchContext::new(
         ResearchProvenance::try_new(ResearchProvenanceInput {
@@ -932,7 +964,7 @@ fn macro_observation() -> Result<ResearchObservation, Box<dyn Error>> {
         ResearchTime::new(
             Timestamp::from_unix_nanos(90),
             Some(Timestamp::from_unix_nanos(100)),
-            RevisionNumber::new(1)?,
+            RevisionNumber::new(17)?,
             Some(Timestamp::from_unix_nanos(200)),
         )?,
     )?;
@@ -1024,6 +1056,10 @@ fn create_legacy_catalog(
     Ok(connection)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the legacy catalog digest fixture must expose every v3 canonical field explicitly"
+)]
 fn legacy_rights_id(
     source_id: &str,
     payload_digest: EvidenceDigest,

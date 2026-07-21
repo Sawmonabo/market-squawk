@@ -14,7 +14,8 @@ pub(super) fn map_adapter_error(error: FredSourceError) -> ExtractionSourceError
         FredSourceError::InvalidApiKey
         | FredSourceError::InvalidDataset
         | FredSourceError::Protocol
-        | FredSourceError::InvalidConfiguration => {
+        | FredSourceError::InvalidConfiguration
+        | FredSourceError::RevisionAuthority(_) => {
             ExtractionSourceError::Source(SourceError::InvalidProtocolState)
         }
         FredSourceError::BodyTooLarge | FredSourceError::Network => {

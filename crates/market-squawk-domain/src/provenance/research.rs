@@ -759,6 +759,24 @@ impl ResearchContext {
     pub const fn time(&self) -> &ResearchTime {
         &self.time
     }
+
+    /// Rebinds only the durable one-based revision while preserving all source-authored context.
+    ///
+    /// This is the sole post-normalization mutation supported by the canonical research context.
+    /// Effective, publication, supersession, availability, provenance, and payload evidence remain
+    /// byte-for-byte unchanged.
+    pub fn with_revision(&self, revision: RevisionNumber) -> Self {
+        Self {
+            provenance: self.provenance.clone(),
+            time: ResearchTime {
+                schema_version: self.time.schema_version,
+                effective: self.time.effective.clone(),
+                published: self.time.published.clone(),
+                revision,
+                superseded: self.time.superseded.clone(),
+            },
+        }
+    }
 }
 
 #[derive(Deserialize)]

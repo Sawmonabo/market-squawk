@@ -11,7 +11,10 @@ mod canonical;
 mod evidence;
 mod semantic;
 
-pub use batch::{ObservedRevisionAssignments, ObservedRevisionBatch, ObservedRevisionRecord};
+pub use batch::{
+    ExtractionRevisionEvidence, ExtractionRevisionPlan, ObservedRevisionAssignments,
+    ObservedRevisionBatch, ObservedRevisionRecord,
+};
 pub use canonical::CanonicalObservationFamily;
 pub use evidence::{
     MAX_OBSERVED_SEMANTIC_PAYLOAD_BYTES, MAX_OBSERVED_VERSION_EVIDENCE_BYTES,

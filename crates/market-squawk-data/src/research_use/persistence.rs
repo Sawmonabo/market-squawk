@@ -264,13 +264,15 @@ pub(super) fn authorize(
     )?;
     persist_decision(
         transaction,
-        &graph,
-        &decision,
-        now,
-        &selections,
-        frontier,
-        cancellation,
-        deadline,
+        DecisionPersistence {
+            graph: &graph,
+            decision: &decision,
+            requested_at: now,
+            selections: &selections,
+            frontier,
+            cancellation,
+            deadline,
+        },
     )?;
     append_audit(
         transaction,
@@ -287,9 +289,9 @@ pub(super) fn authorize(
         });
     }
     let permit = issue_permit(session_id, &decision)?;
-    Ok(AuthorizationTransactionOutcome::Allowed(
+    Ok(AuthorizationTransactionOutcome::Allowed(Box::new(
         AuthorizedResearchUse::new(graph, permit),
-    ))
+    )))
 }
 
 pub(super) fn bind_derived_output(
@@ -369,9 +371,16 @@ pub(super) fn publish_derived(
 
 #[derive(Clone)]
 enum SourceSelection {
-    Selected(ResearchUseAuthorityEvidence),
+    Selected(Box<ResearchUseAuthorityEvidence>),
     Missing,
 }
+
+type AuthoritySelections = (
+    Vec<ResearchUseAuthorityEvidence>,
+    BTreeMap<u64, SourceSelection>,
+    u64,
+    Option<ResearchUseDenialReason>,
+);
 
 fn select_authorities(
     transaction: &Transaction<'_>,
@@ -380,15 +389,7 @@ fn select_authorities(
     now: Timestamp,
     cancellation: &CancellationToken,
     deadline: Instant,
-) -> Result<
-    (
-        Vec<ResearchUseAuthorityEvidence>,
-        BTreeMap<u64, SourceSelection>,
-        u64,
-        Option<ResearchUseDenialReason>,
-    ),
-    ResearchUseCatalogError,
-> {
+) -> Result<AuthoritySelections, ResearchUseCatalogError> {
     let frontier: i64 = transaction.query_row(
         "SELECT COALESCE(MAX(revocation_sequence), 0)
          FROM source_research_use_revocations WHERE recorded_at_ns<=?1",
@@ -406,7 +407,7 @@ fn select_authorities(
         super::traversal::check_control(cancellation, deadline)?;
         match select_source_authority(transaction, source, requested_use, now, frontier)? {
             SourceAuthority::Selected(authority) => {
-                authorities.push(authority.clone());
+                authorities.push(authority.as_ref().clone());
                 selections.insert(
                     source.generation_sequence(),
                     SourceSelection::Selected(authority),
@@ -422,7 +423,7 @@ fn select_authorities(
 }
 
 enum SourceAuthority {
-    Selected(ResearchUseAuthorityEvidence),
+    Selected(Box<ResearchUseAuthorityEvidence>),
     Denied(ResearchUseDenialReason),
 }
 
@@ -518,7 +519,7 @@ fn select_source_authority(
             frontier,
         )
         .map_err(|_| ResearchUseCatalogError::CorruptCatalog)?;
-        return Ok(SourceAuthority::Selected(authority));
+        return Ok(SourceAuthority::Selected(Box::new(authority)));
     }
     let reason = if saw_revoked {
         ResearchUseDenialReason::Revoked
@@ -555,16 +556,29 @@ fn decision_expiry(
     }
 }
 
+struct DecisionPersistence<'a> {
+    graph: &'a ResearchUseGraph,
+    decision: &'a ResearchUseDecisionInput,
+    requested_at: Timestamp,
+    selections: &'a BTreeMap<u64, SourceSelection>,
+    frontier: u64,
+    cancellation: &'a CancellationToken,
+    deadline: Instant,
+}
+
 fn persist_decision(
     transaction: &Transaction<'_>,
-    graph: &ResearchUseGraph,
-    decision: &ResearchUseDecisionInput,
-    requested_at: Timestamp,
-    selections: &BTreeMap<u64, SourceSelection>,
-    frontier: u64,
-    cancellation: &CancellationToken,
-    deadline: Instant,
+    persistence: DecisionPersistence<'_>,
 ) -> Result<(), ResearchUseCatalogError> {
+    let DecisionPersistence {
+        graph,
+        decision,
+        requested_at,
+        selections,
+        frontier,
+        cancellation,
+        deadline,
+    } = persistence;
     let decision_id = decision.digest().bytes();
     for (ordinal, node) in graph.nodes().iter().enumerate() {
         super::traversal::check_control(cancellation, deadline)?;

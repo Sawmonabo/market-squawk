@@ -12,11 +12,11 @@ use arrow::record_batch::RecordBatch;
 use market_squawk_domain::{
     AvailabilityEvidence, DataQuality, DigestAlgorithm, EvidenceDigest, ExactPayloadEvidence,
     MetadataRevision, ResearchContext, ResearchObservation, ResearchTemporalCoordinate,
-    SchemaVersion, SourceId, SourceIdentifier, Timestamp,
+    RevisionNumber, SchemaVersion, SourceId, SourceIdentifier, Timestamp,
 };
 use market_squawk_sources::{
-    AvailabilityEvidence as SourceAvailabilityEvidence, DiscoveryRequestId, ExtractionBatch,
-    ExtractionRequestId, payload_matches_exact_evidence,
+    AvailabilityEvidence as SourceAvailabilityEvidence, CanonicalObservationPayload,
+    DiscoveryRequestId, ExtractionBatch, ExtractionRequestId, payload_matches_exact_evidence,
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -73,13 +73,31 @@ struct ExtractionRowLineage {
     availability: SourceAvailabilityEvidence,
     revision: SourceIdentifier,
     superseded_time: Option<ResearchTemporalCoordinate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    revision_assignment: Option<RevisionAssignmentLineage>,
 }
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct RevisionAssignmentLineage {
+    assigned_revision: RevisionNumber,
+    semantic_payload_identity: EvidenceDigest,
+}
+
+const EXTRACTION_LINEAGE_SCHEMA_VERSION: u16 = 4;
+const LEGACY_EXTRACTION_LINEAGE_SCHEMA_VERSION: u16 = 3;
 
 impl ResearchArrowBatch {
     /// Converts only canonical observations retained by one exact extraction request.
     pub fn try_from_extraction_batch(
         extraction: &ExtractionBatch,
     ) -> Result<Self, ArrowConversionError> {
+        Self::try_from_extraction_batch_with_revisions(extraction, None)
+    }
+
+    /// Returns source-validated canonical observations before durable revision rebinding.
+    pub(crate) fn validated_extraction_observations(
+        extraction: &ExtractionBatch,
+    ) -> Result<Vec<ResearchObservation>, ArrowConversionError> {
         if extraction.records().is_empty() {
             return Err(ArrowConversionError::EmptyBatch);
         }
@@ -87,11 +105,10 @@ impl ResearchArrowBatch {
         let request_digest =
             EvidenceDigest::new(DigestAlgorithm::Sha256, Sha256::digest(request).into());
         let mut observations = Vec::with_capacity(extraction.records().len());
-        let mut lineages = Vec::with_capacity(extraction.records().len());
         for record in extraction.records() {
             let observation: ResearchObservation = serde_json::from_slice(record.payload())?;
             let lineage = RowLineage::Extraction(Box::new(ExtractionRowLineage {
-                schema_version: RESEARCH_SCHEMA_VERSION,
+                schema_version: LEGACY_EXTRACTION_LINEAGE_SCHEMA_VERSION,
                 source_id: record.source_id().clone(),
                 metadata_revision: record.metadata_revision().clone(),
                 dataset: record.dataset().clone(),
@@ -107,6 +124,7 @@ impl ResearchArrowBatch {
                 availability: record.availability().clone(),
                 revision: record.revision().clone(),
                 superseded_time: record.superseded_time().cloned(),
+                revision_assignment: None,
             }));
             validate_row_lineage(
                 &lineage,
@@ -116,7 +134,80 @@ impl ResearchArrowBatch {
                 record.payload(),
             )?;
             observations.push(observation);
-            lineages.push(lineage);
+        }
+        Ok(observations)
+    }
+
+    pub(crate) fn try_from_extraction_batch_with_assigned_revisions(
+        extraction: &ExtractionBatch,
+        revisions: &[RevisionNumber],
+    ) -> Result<Self, ArrowConversionError> {
+        Self::try_from_extraction_batch_with_revisions(extraction, Some(revisions))
+    }
+
+    fn try_from_extraction_batch_with_revisions(
+        extraction: &ExtractionBatch,
+        revisions: Option<&[RevisionNumber]>,
+    ) -> Result<Self, ArrowConversionError> {
+        let original_observations = Self::validated_extraction_observations(extraction)?;
+        if revisions.is_some_and(|values| values.len() != original_observations.len()) {
+            return Err(ArrowConversionError::RevisionAssignmentMismatch);
+        }
+        let request = serde_json::to_vec(extraction.request())?;
+        let request_digest =
+            EvidenceDigest::new(DigestAlgorithm::Sha256, Sha256::digest(request).into());
+        let mut observations = Vec::with_capacity(original_observations.len());
+        let mut lineages = Vec::with_capacity(original_observations.len());
+        for (index, (record, original)) in extraction
+            .records()
+            .iter()
+            .zip(original_observations)
+            .enumerate()
+        {
+            let assignment = revisions
+                .map(
+                    |values| -> Result<RevisionAssignmentLineage, ArrowConversionError> {
+                        let assigned_revision = values
+                            .get(index)
+                            .copied()
+                            .ok_or(ArrowConversionError::RevisionAssignmentMismatch)?;
+                        let payload = CanonicalObservationPayload::try_from_observation(&original)
+                            .map_err(ArrowConversionError::RevisionAuthority)?;
+                        Ok(RevisionAssignmentLineage {
+                            assigned_revision,
+                            semantic_payload_identity: payload.identity(),
+                        })
+                    },
+                )
+                .transpose()?;
+            let observation = match &assignment {
+                Some(assignment) => original.with_revision(assignment.assigned_revision)?,
+                None => original,
+            };
+            lineages.push(RowLineage::Extraction(Box::new(ExtractionRowLineage {
+                schema_version: if assignment.is_some() {
+                    EXTRACTION_LINEAGE_SCHEMA_VERSION
+                } else {
+                    LEGACY_EXTRACTION_LINEAGE_SCHEMA_VERSION
+                },
+                source_id: record.source_id().clone(),
+                metadata_revision: record.metadata_revision().clone(),
+                dataset: record.dataset().clone(),
+                discovery_request_id: record.discovery_request_id(),
+                extraction_request_id: record.extraction_request_id(),
+                request_digest,
+                object_id: record.object_id().clone(),
+                object_evidence: record.object_evidence().clone(),
+                record_schema: record.schema().clone(),
+                record_evidence: record.evidence().clone(),
+                effective_time: record.effective_time().clone(),
+                published_time: record.published_time().cloned(),
+                availability: record.availability().clone(),
+                revision: record.revision().clone(),
+                superseded_time: record.superseded_time().cloned(),
+                revision_assignment: assignment,
+            })));
+            observations.push(observation);
         }
         let request_digests = vec![request_digest.bytes(); observations.len()];
         Self::try_from_observations_with_requests(
@@ -607,8 +698,10 @@ fn validate_row_lineage(
     let time = context.time();
     let matches = match lineage {
         RowLineage::Extraction(lineage) => {
-            lineage.schema_version == RESEARCH_SCHEMA_VERSION
-                && lineage.source_id == *provenance.source_id()
+            matches!(
+                lineage.schema_version,
+                LEGACY_EXTRACTION_LINEAGE_SCHEMA_VERSION | EXTRACTION_LINEAGE_SCHEMA_VERSION
+            ) && lineage.source_id == *provenance.source_id()
                 && lineage.dataset == *dataset
                 && lineage.request_digest.algorithm() == DigestAlgorithm::Sha256
                 && lineage.request_digest.bytes() == request_digest
@@ -617,7 +710,20 @@ fn validate_row_lineage(
                 && lineage.published_time.as_ref() == time.published()
                 && availability_basis_matches(&lineage.availability, provenance.availability())
                 && lineage.superseded_time.as_ref() == time.superseded()
-                && payload_matches_exact_evidence(payload, &lineage.record_evidence)
+                && match &lineage.revision_assignment {
+                    Some(assignment) => {
+                        lineage.schema_version == EXTRACTION_LINEAGE_SCHEMA_VERSION
+                            && assignment.assigned_revision == time.revision()
+                            && CanonicalObservationPayload::try_from_observation(observation)
+                                .is_ok_and(|semantic| {
+                                    semantic.identity() == assignment.semantic_payload_identity
+                                })
+                    }
+                    None => {
+                        lineage.schema_version == LEGACY_EXTRACTION_LINEAGE_SCHEMA_VERSION
+                            && payload_matches_exact_evidence(payload, &lineage.record_evidence)
+                    }
+                }
         }
         RowLineage::CanonicalObservation {
             schema_version,
@@ -738,6 +844,15 @@ pub enum ArrowConversionError {
     /// Canonical provenance or time disagrees with exact extraction lineage.
     #[error("canonical observation does not match its extraction request and record lineage")]
     ExtractionBindingMismatch,
+    /// Durable assignments were not aligned one-for-one with normalized extraction records.
+    #[error("durable revision assignments do not match the extraction batch")]
+    RevisionAssignmentMismatch,
+    /// Exact observed-revision evidence could not be constructed.
+    #[error("observed revision authority rejected canonical evidence")]
+    RevisionAuthority(market_squawk_sources::ObservedRevisionError),
+    /// Rebinding a retained canonical observation exposed invalid source state.
+    #[error("canonical observation revision rebinding failed")]
+    Research(#[from] market_squawk_domain::ResearchError),
     /// The request binding was not SHA-256.
     #[error("Arrow request binding must use SHA-256")]
     RequestDigestNotSha256,

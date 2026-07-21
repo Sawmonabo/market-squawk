@@ -3,13 +3,193 @@
 use std::cmp::Ordering;
 use std::mem::size_of;
 
-use market_squawk_domain::{RevisionNumber, SourceId};
+use market_squawk_domain::{ResearchObservation, RevisionNumber, SourceId};
 
 use super::{
-    CanonicalObservationFamily, MAX_OBSERVED_REVISION_BATCH_BYTES,
+    CanonicalObservationFamily, CanonicalObservationPayload, MAX_OBSERVED_REVISION_BATCH_BYTES,
     MAX_OBSERVED_REVISION_BATCH_RECORDS, ObservedProviderOrder, ObservedRevisionError,
     ObservedSemanticPayload, ObservedVersionEvidence, ObservedVersionKind,
 };
+
+/// Exact source-specific version authority aligned to one normalized extraction record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExtractionRevisionEvidence {
+    /// A provider supplied both a stable version token and an explicit total-order coordinate.
+    ProviderSupplied {
+        /// Exact provider-owned version identity.
+        version: ObservedVersionEvidence,
+        /// Exact provider-owned order within the natural observation family.
+        order: ObservedProviderOrder,
+    },
+    /// Market Squawk derives version identity from exact canonical semantic row content.
+    LocallyObservedContent,
+}
+
+impl ExtractionRevisionEvidence {
+    /// Constructs provider-owned version and ordering evidence without interpreting either value.
+    ///
+    /// # Errors
+    ///
+    /// Rejects empty or oversized exact evidence and invalid checked allocations.
+    pub fn provider_supplied(
+        provider_token: &[u8],
+        order: ObservedProviderOrder,
+    ) -> Result<Self, ObservedRevisionError> {
+        Ok(Self::ProviderSupplied {
+            version: ObservedVersionEvidence::provider_supplied(provider_token)?,
+            order,
+        })
+    }
+
+    /// Selects exact canonical semantic row content as the local version authority.
+    pub const fn locally_observed_content() -> Self {
+        Self::LocallyObservedContent
+    }
+
+    fn into_record(
+        self,
+        observation: &ResearchObservation,
+    ) -> Result<ObservedRevisionRecord, ObservedRevisionError> {
+        let family = CanonicalObservationFamily::try_from_observation(observation)?;
+        let canonical_payload = CanonicalObservationPayload::try_from_observation(observation)?;
+        let payload = ObservedSemanticPayload::try_from(&canonical_payload)?;
+        match self {
+            Self::ProviderSupplied { version, order } => {
+                ObservedRevisionRecord::try_new(family, version, payload, Some(order))
+            }
+            Self::LocallyObservedContent => {
+                let version = ObservedVersionEvidence::locally_observed_content(&payload)?;
+                ObservedRevisionRecord::try_new(family, version, payload, None)
+            }
+        }
+    }
+
+    fn retained_bytes(&self) -> Result<usize, ObservedRevisionError> {
+        match self {
+            Self::ProviderSupplied { version, order } => version
+                .retained_bytes()
+                .checked_add(order.retained_bytes()?)
+                .ok_or(ObservedRevisionError::ByteCountOverflow),
+            Self::LocallyObservedContent => Ok(0),
+        }
+    }
+}
+
+/// Bounded one-for-one version-authority plan for a normalized extraction batch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExtractionRevisionPlan {
+    evidence: Box<[ExtractionRevisionEvidence]>,
+    retained_bytes: usize,
+}
+
+impl ExtractionRevisionPlan {
+    /// Constructs an aligned bounded evidence plan.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an empty plan, excessive record count, or deep-retained bytes above the revision
+    /// authority batch ceiling.
+    pub fn try_new(
+        evidence: Vec<ExtractionRevisionEvidence>,
+    ) -> Result<Self, ObservedRevisionError> {
+        if evidence.is_empty() {
+            return Err(ObservedRevisionError::RecordLimitExceeded { max: 0 });
+        }
+        if evidence.len() > MAX_OBSERVED_REVISION_BATCH_RECORDS {
+            return Err(ObservedRevisionError::RecordLimitExceeded {
+                max: MAX_OBSERVED_REVISION_BATCH_RECORDS,
+            });
+        }
+        let locally_observed = matches!(
+            evidence.first(),
+            Some(ExtractionRevisionEvidence::LocallyObservedContent)
+        );
+        if evidence.iter().any(|value| {
+            matches!(value, ExtractionRevisionEvidence::LocallyObservedContent) != locally_observed
+        }) {
+            return Err(ObservedRevisionError::Conflict);
+        }
+        let mut retained_bytes = size_of::<ExtractionRevisionEvidence>()
+            .checked_mul(evidence.len())
+            .ok_or(ObservedRevisionError::ByteCountOverflow)?;
+        for value in &evidence {
+            retained_bytes = retained_bytes
+                .checked_add(value.retained_bytes()?)
+                .ok_or(ObservedRevisionError::ByteCountOverflow)?;
+        }
+        if retained_bytes > MAX_OBSERVED_REVISION_BATCH_BYTES {
+            return Err(ObservedRevisionError::BatchByteLimitExceeded {
+                max: MAX_OBSERVED_REVISION_BATCH_BYTES,
+            });
+        }
+        Ok(Self {
+            evidence: evidence.into_boxed_slice(),
+            retained_bytes,
+        })
+    }
+
+    /// Constructs local content authority for every record in a bounded nonempty batch.
+    pub fn locally_observed(record_count: usize) -> Result<Self, ObservedRevisionError> {
+        if record_count == 0 || record_count > MAX_OBSERVED_REVISION_BATCH_RECORDS {
+            return Err(ObservedRevisionError::RecordLimitExceeded {
+                max: MAX_OBSERVED_REVISION_BATCH_RECORDS,
+            });
+        }
+        Self::try_new(vec![
+            ExtractionRevisionEvidence::LocallyObservedContent;
+            record_count
+        ])
+    }
+
+    /// Returns the exact input cardinality this plan must accompany.
+    pub const fn len(&self) -> usize {
+        self.evidence.len()
+    }
+
+    /// Returns whether the plan has no aligned evidence.
+    pub const fn is_empty(&self) -> bool {
+        self.evidence.is_empty()
+    }
+
+    /// Returns checked deep bytes retained before canonical family/payload construction.
+    pub const fn retained_bytes(&self) -> usize {
+        self.retained_bytes
+    }
+
+    /// Returns whether every aligned record uses exact local content as version authority.
+    pub fn is_locally_observed(&self) -> bool {
+        matches!(
+            self.evidence.first(),
+            Some(ExtractionRevisionEvidence::LocallyObservedContent)
+        )
+    }
+
+    /// Consumes aligned evidence into one atomic durable authority request.
+    ///
+    /// # Errors
+    ///
+    /// Rejects cardinality mismatch or any canonical family, payload, source, or batch invariant.
+    pub fn into_observed_batch(
+        self,
+        source_id: SourceId,
+        observations: &[ResearchObservation],
+    ) -> Result<ObservedRevisionBatch, ObservedRevisionError> {
+        if observations.len() != self.evidence.len() {
+            return Err(ObservedRevisionError::AssignmentCountMismatch {
+                expected: observations.len(),
+                observed: self.evidence.len(),
+            });
+        }
+        let records = self
+            .evidence
+            .into_vec()
+            .into_iter()
+            .zip(observations)
+            .map(|(evidence, observation)| evidence.into_record(observation))
+            .collect::<Result<Vec<_>, _>>()?;
+        ObservedRevisionBatch::try_new(source_id, records)
+    }
+}
 
 /// One exact observed family/version/payload tuple awaiting durable revision assignment.
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 use arrow::record_batch::RecordBatch;
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp};
 use market_squawk_sources::{
-    ExtractionBatch, ExtractionContentIdentity, ExtractionError, ObservedRevisionAuthority,
+    ExtractionBatch, ExtractionContentIdentity, ExtractionError, ExtractionRevisionPlan,
+    ObservedRevisionAuthority, ObservedRevisionError, SourceClass,
 };
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -37,6 +38,7 @@ use crate::{
 };
 
 const ORPHAN_RECOVERY_DEADLINE: Duration = Duration::from_secs(30);
+const REVISION_ASSIGNMENT_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Exact immutable generation returned after successful reconciliation or commit.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -115,6 +117,15 @@ pub trait ResearchIngestService {
         &self,
         reservation: IngestReservation,
         batch: ExtractionBatch,
+        cancellation: CancellationToken,
+    ) -> Result<CommittedDataset, IngestError>;
+
+    /// Assigns durable revisions from explicit source-specific evidence before publication.
+    async fn ingest_with_revision_plan(
+        &self,
+        reservation: IngestReservation,
+        batch: ExtractionBatch,
+        revisions: ExtractionRevisionPlan,
         cancellation: CancellationToken,
     ) -> Result<CommittedDataset, IngestError>;
 }
@@ -716,6 +727,7 @@ impl AnalyticalDataService {
         &self,
         reservation: IngestReservation,
         batch: ExtractionBatch,
+        revision_plan: Option<ExtractionRevisionPlan>,
         cancellation: CancellationToken,
     ) -> Result<CommittedDataset, IngestError> {
         let payload_digest = extraction_batch_digest(&batch)?;
@@ -735,7 +747,42 @@ impl AnalyticalDataService {
                 return Ok(committed);
             }
         }
-        let converted = ResearchArrowBatch::try_from_extraction_batch(&batch)?;
+        let observations = ResearchArrowBatch::validated_extraction_observations(&batch)?;
+        let revision_plan = match revision_plan {
+            Some(plan) => plan,
+            None => {
+                let authority = self.lock_authority()?;
+                let source = authority
+                    .source(&source_id)?
+                    .ok_or(IngestError::UnknownSource)?;
+                if !matches!(
+                    source.source_class(),
+                    SourceClass::LocalFile | SourceClass::PortfolioExport
+                ) {
+                    return Err(IngestError::RevisionEvidenceRequired);
+                }
+                ExtractionRevisionPlan::locally_observed(observations.len())
+                    .map_err(map_revision_error)?
+            }
+        };
+        if revision_plan.len() != observations.len() {
+            return Err(IngestError::RevisionEvidenceMismatch);
+        }
+        let observed_batch = revision_plan
+            .into_observed_batch(source_id.clone(), &observations)
+            .map_err(map_revision_error)?;
+        let deadline = Instant::now()
+            .checked_add(REVISION_ASSIGNMENT_DEADLINE)
+            .ok_or(IngestError::DeadlineExceeded)?;
+        let assignments = self
+            .observed_revision_authority()
+            .assign(observed_batch, deadline, cancellation.clone())
+            .await
+            .map_err(map_revision_error)?;
+        let converted = ResearchArrowBatch::try_from_extraction_batch_with_assigned_revisions(
+            &batch,
+            assignments.as_slice(),
+        )?;
         let schema = converted.schema_ref().clone();
         let lineage = converted.lineage_digest()?;
         let converted = DatasetArrowBatch::from(converted);
@@ -946,6 +993,14 @@ fn map_authority_transition_error(error: AuthorityTransitionError) -> IngestErro
     }
 }
 
+fn map_revision_error(error: ObservedRevisionError) -> IngestError {
+    match error {
+        ObservedRevisionError::Cancelled => IngestError::Cancelled,
+        ObservedRevisionError::DeadlineExceeded => IngestError::DeadlineExceeded,
+        error => IngestError::RevisionAuthority(error),
+    }
+}
+
 impl ResearchIngestService for AnalyticalDataService {
     async fn ingest(
         &self,
@@ -953,7 +1008,19 @@ impl ResearchIngestService for AnalyticalDataService {
         batch: ExtractionBatch,
         cancellation: CancellationToken,
     ) -> Result<CommittedDataset, IngestError> {
-        self.ingest_batch(reservation, batch, cancellation).await
+        self.ingest_batch(reservation, batch, None, cancellation)
+            .await
+    }
+
+    async fn ingest_with_revision_plan(
+        &self,
+        reservation: IngestReservation,
+        batch: ExtractionBatch,
+        revisions: ExtractionRevisionPlan,
+        cancellation: CancellationToken,
+    ) -> Result<CommittedDataset, IngestError> {
+        self.ingest_batch(reservation, batch, Some(revisions), cancellation)
+            .await
     }
 }
 
@@ -987,6 +1054,18 @@ pub enum IngestError {
     /// Canonical extraction content identity could not be constructed.
     #[error("extraction batch semantic identity construction failed")]
     ContentIdentity(#[source] ExtractionError),
+    /// Source-specific revision evidence or durable assignment failed.
+    #[error("observed revision assignment failed")]
+    RevisionAuthority(#[source] ObservedRevisionError),
+    /// A non-local source omitted mandatory provider version and ordering evidence.
+    #[error("provider extraction requires explicit revision evidence")]
+    RevisionEvidenceRequired,
+    /// Revision evidence did not align one-for-one with normalized extraction records.
+    #[error("revision evidence does not match the extraction batch")]
+    RevisionEvidenceMismatch,
+    /// The extraction source was not registered in the retained catalog.
+    #[error("analytical ingest source is unknown")]
+    UnknownSource,
     /// The reservation does not exist in this authority.
     #[error("analytical ingest reservation is unknown")]
     UnknownReservation,

@@ -270,8 +270,11 @@ async fn durable_extraction_emits_canonical_schema_v3_macro_observations() -> Te
             CancellationToken::new(),
         )
         .await?;
+    let revisions = source.source.revision_plan(&batch)?;
 
     assert_eq!(batch.records().len(), 2);
+    assert_eq!(revisions.len(), batch.records().len());
+    assert!(!revisions.is_locally_observed());
     for record in batch.records() {
         assert_eq!(record.schema().as_str(), CURRENT_RESEARCH_RECORD_SCHEMA);
         assert!(payload_matches_exact_evidence(
