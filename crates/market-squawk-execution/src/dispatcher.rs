@@ -363,22 +363,50 @@ impl PersistenceFinalization {
     pub(crate) fn commit(
         self,
         persisted: &[ReconciliationBatchBinding],
+        operation: &ExecutionOperation,
     ) -> Result<(), ExecutionAdapterError> {
         let mut registry = self
             .registry
             .try_lock()
             .map_err(|_| ExecutionAdapterError::NotAttemptedBusy)?;
-        if persisted.iter().any(|binding| {
-            !registry
-                .finalized_reconciliations
-                .iter()
-                .any(|candidate| candidate == binding)
-        }) {
+        for binding in persisted {
+            let mut finalized = false;
+            for candidate in &registry.finalized_reconciliations {
+                if operation.is_expired() {
+                    return Err(ExecutionAdapterError::KnownFailure);
+                }
+                if candidate == binding {
+                    finalized = true;
+                    break;
+                }
+            }
+            if !finalized {
+                return Err(ExecutionAdapterError::KnownFailure);
+            }
+        }
+        let mut retained = Vec::new();
+        retained
+            .try_reserve_exact(registry.finalized_reconciliations.len())
+            .map_err(|_| ExecutionAdapterError::KnownFailure)?;
+        for binding in &registry.finalized_reconciliations {
+            let mut is_persisted = false;
+            for candidate in persisted {
+                if operation.is_expired() {
+                    return Err(ExecutionAdapterError::KnownFailure);
+                }
+                if candidate == binding {
+                    is_persisted = true;
+                    break;
+                }
+            }
+            if !is_persisted {
+                retained.push(*binding);
+            }
+        }
+        if operation.is_expired() {
             return Err(ExecutionAdapterError::KnownFailure);
         }
-        registry
-            .finalized_reconciliations
-            .retain(|binding| !persisted.iter().any(|candidate| candidate == binding));
+        registry.finalized_reconciliations = retained;
         Ok(())
     }
 }

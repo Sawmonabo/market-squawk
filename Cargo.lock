@@ -2939,6 +2939,7 @@ dependencies = [
  "futures-util",
  "market-squawk-adapter-coinbase",
  "market-squawk-adapter-paper",
+ "market-squawk-analytics",
  "market-squawk-domain",
  "market-squawk-execution",
  "market-squawk-live",

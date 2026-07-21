@@ -66,6 +66,14 @@ bench = false
 doc = false
 required-features = ["capture-benchmark"]
 
+[[bin]]
+name = "market-squawk-platform-capture-helper-test"
+path = "src/bin/market-squawk-platform-capture-helper-test.rs"
+test = false
+bench = false
+doc = false
+required-features = ["capture-test"]
+
 [[bench]]
 name = "capture_admission_criterion"
 path = "benches/capture_admission_criterion.rs"

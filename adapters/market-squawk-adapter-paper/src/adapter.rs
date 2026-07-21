@@ -25,8 +25,6 @@ use crate::snapshot::{
 use crate::worker::{PaperWorker, WorkerCommand, WorkerEnvelope, WorkerEvent, WorkerMarketUpdate};
 use crate::{PaperAccountBootstrap, PaperExecutionConfig, PaperLedger};
 
-const SUBMIT_COMMAND_RETAINED_CEILING: usize = 64 * 1024;
-
 /// Caller-owned absolute deadline and cooperative cancellation for paper control operations.
 #[derive(Debug)]
 pub struct PaperControlContext {
@@ -70,6 +68,8 @@ impl PaperControlContext {
 pub struct PaperExecutionAdapter {
     events: mpsc::Sender<WorkerEnvelope>,
     command_slots: Arc<Semaphore>,
+    command_bytes: Arc<Semaphore>,
+    maximum_command_bytes: usize,
     event_sequence: Arc<Mutex<u64>>,
     retained_bytes: usize,
 }
@@ -120,7 +120,6 @@ impl PaperExecutionAdapter {
         authority: PersistenceAcknowledgement,
         evidence: PaperCheckpointPersistenceEvidence,
     ) -> Result<(), PaperControlError> {
-        let deadline = authority.operation().deadline();
         let (reply, response) = oneshot::channel();
         self.try_send_command(WorkerCommand::AcknowledgePersistence {
             authority,
@@ -128,14 +127,14 @@ impl PaperExecutionAdapter {
             reply,
         })
         .map_err(PaperControlError::Adapter)?;
-        match tokio::time::timeout_at(deadline, response).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(PaperControlError::Closed),
-            Err(_) => Err(PaperControlError::DeadlineExceeded),
-        }
+        await_admitted_persistence_outcome(response).await
     }
 
     fn try_send_command(&self, command: WorkerCommand) -> Result<(), ExecutionAdapterError> {
+        let retained_bytes = command.retained_bytes()?;
+        if retained_bytes > self.maximum_command_bytes {
+            return Err(ExecutionAdapterError::KnownFailure);
+        }
         let slot = Arc::clone(&self.command_slots)
             .try_acquire_owned()
             .map_err(|_| {
@@ -145,11 +144,17 @@ impl PaperExecutionAdapter {
                     ExecutionAdapterError::NotAttemptedBusy
                 }
             })?;
+        let retained_bytes = Arc::clone(&self.command_bytes)
+            .try_acquire_many_owned(
+                u32::try_from(retained_bytes).map_err(|_| ExecutionAdapterError::KnownFailure)?,
+            )
+            .map_err(|_| ExecutionAdapterError::NotAttemptedBusy)?;
         try_send_event(
             &self.events,
             &self.event_sequence,
             WorkerEvent::Command(command),
             slot,
+            Some(retained_bytes),
         )
         .map_err(|error| match error {
             EnqueueError::Busy | EnqueueError::Full => ExecutionAdapterError::NotAttemptedBusy,
@@ -165,6 +170,14 @@ impl PaperExecutionAdapter {
         deadline: tokio::time::Instant,
         cancellation: &CancellationToken,
     ) -> Result<(), PaperControlError> {
+        let retained_bytes = command
+            .retained_bytes()
+            .map_err(PaperControlError::Adapter)?;
+        if retained_bytes > self.maximum_command_bytes {
+            return Err(PaperControlError::Adapter(
+                ExecutionAdapterError::KnownFailure,
+            ));
+        }
         let slot = tokio::select! {
             biased;
             () = cancellation.cancelled() => return Err(PaperControlError::Cancelled),
@@ -176,11 +189,28 @@ impl PaperExecutionAdapter {
                 }
             }
         };
+        let retained_bytes = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return Err(PaperControlError::Cancelled),
+            result = tokio::time::timeout_at(
+                deadline,
+                Arc::clone(&self.command_bytes).acquire_many_owned(
+                    u32::try_from(retained_bytes).map_err(|_| {
+                        PaperControlError::Adapter(ExecutionAdapterError::KnownFailure)
+                    })?,
+                ),
+            ) => match result {
+                Ok(Ok(bytes)) => bytes,
+                Ok(Err(_)) => return Err(PaperControlError::Closed),
+                Err(_) => return Err(PaperControlError::DeadlineExceeded),
+            }
+        };
         send_control_event(
             &self.events,
             &self.event_sequence,
             WorkerEvent::Command(command),
             slot,
+            Some(retained_bytes),
             deadline,
             cancellation,
         )
@@ -297,6 +327,7 @@ impl ExecutionMarketSink for PaperMarketIngress {
             &self.event_sequence,
             WorkerEvent::Market(update),
             slot,
+            None,
         )
         .map_err(|error| match error {
             EnqueueError::Busy | EnqueueError::Full => ExecutionMarketSinkError::Saturated,
@@ -374,11 +405,12 @@ impl PaperExecutionRuntime {
         let handle = Handle::try_current().map_err(|_| PaperStartError::NoRuntime)?;
         let input = config.input().clone();
         let abort_join_deadline = input.abort_join_deadline;
-        let command_capacity = byte_limited_capacity(
-            input.command_capacity.get(),
-            input.command_maximum_bytes.get() as usize,
-            SUBMIT_COMMAND_RETAINED_CEILING,
-        )?;
+        let command_capacity = input.command_capacity.get();
+        let command_bytes = usize::try_from(input.command_maximum_bytes.get())
+            .map_err(|_| PaperStartError::CapacityOverflow)?;
+        if command_bytes > Semaphore::MAX_PERMITS {
+            return Err(PaperStartError::CapacityOverflow);
+        }
         let market_capacity = byte_limited_capacity(
             input.market_capacity.get(),
             input.market_maximum_bytes.get() as usize,
@@ -392,6 +424,9 @@ impl PaperExecutionRuntime {
         let event_capacity = command_capacity
             .checked_add(market_capacity)
             .ok_or(PaperStartError::CapacityOverflow)?;
+        if event_capacity > Semaphore::MAX_PERMITS {
+            return Err(PaperStartError::CapacityOverflow);
+        }
         let (event_tx, event_rx) = mpsc::channel(event_capacity);
         let (audit_tx, audit_rx) = mpsc::channel(audit_capacity);
         let recovery_audits = prepare_recovery_audits(&config, &mut checkpoint)?;
@@ -404,6 +439,7 @@ impl PaperExecutionRuntime {
             checkpoint.as_ref().map_or(0, |state| state.sequence),
         ));
         let command_slots = Arc::new(Semaphore::new(command_capacity));
+        let command_byte_slots = Arc::new(Semaphore::new(command_bytes));
         let market_slots = Arc::new(Semaphore::new(market_capacity));
         let audit_failed = Arc::new(AtomicBool::new(false));
         let cancellation = CancellationToken::new();
@@ -417,9 +453,6 @@ impl PaperExecutionRuntime {
             cancellation.clone(),
         );
         let join = handle.spawn(worker.run());
-        let command_bytes = command_capacity
-            .checked_mul(SUBMIT_COMMAND_RETAINED_CEILING)
-            .ok_or(PaperStartError::CapacityOverflow)?;
         let market_bytes = market_capacity
             .checked_mul(size_of::<WorkerMarketUpdate>())
             .ok_or(PaperStartError::CapacityOverflow)?;
@@ -427,6 +460,8 @@ impl PaperExecutionRuntime {
             adapter: Arc::new(PaperExecutionAdapter {
                 events: event_tx.clone(),
                 command_slots,
+                command_bytes: command_byte_slots,
+                maximum_command_bytes: command_bytes,
                 event_sequence: Arc::clone(&event_sequence),
                 retained_bytes: command_bytes,
             }),
@@ -580,6 +615,7 @@ fn try_send_event(
     sequence: &Mutex<u64>,
     event: WorkerEvent,
     slot: OwnedSemaphorePermit,
+    retained_bytes: Option<OwnedSemaphorePermit>,
 ) -> Result<(), EnqueueError> {
     let mut sequence = match sequence.try_lock() {
         Ok(sequence) => sequence,
@@ -594,6 +630,7 @@ fn try_send_event(
             sequence: next,
             event,
             _lane_slot: slot,
+            _retained_bytes: retained_bytes,
         })
         .map_err(|error| match error {
             mpsc::error::TrySendError::Full(_) => EnqueueError::Full,
@@ -608,13 +645,15 @@ async fn send_control_event(
     sequence: &Mutex<u64>,
     event: WorkerEvent,
     slot: OwnedSemaphorePermit,
+    retained_bytes: Option<OwnedSemaphorePermit>,
     deadline: tokio::time::Instant,
     cancellation: &CancellationToken,
 ) -> Result<(), PaperControlError> {
     let mut event = Some(event);
     let mut slot = Some(slot);
+    let mut retained_bytes = retained_bytes;
     loop {
-        match try_send_control_once(events, sequence, &mut event, &mut slot) {
+        match try_send_control_once(events, sequence, &mut event, &mut slot, &mut retained_bytes) {
             ControlEnqueueOutcome::Sent => return Ok(()),
             ControlEnqueueOutcome::Retry => {
                 tokio::select! {
@@ -647,11 +686,18 @@ async fn control_response<T>(
     }
 }
 
+async fn await_admitted_persistence_outcome(
+    response: oneshot::Receiver<Result<(), PaperControlError>>,
+) -> Result<(), PaperControlError> {
+    response.await.map_err(|_| PaperControlError::Closed)?
+}
+
 fn try_send_control_once(
     events: &mpsc::Sender<WorkerEnvelope>,
     sequence: &Mutex<u64>,
     event: &mut Option<WorkerEvent>,
     slot: &mut Option<OwnedSemaphorePermit>,
+    retained_bytes: &mut Option<OwnedSemaphorePermit>,
 ) -> ControlEnqueueOutcome {
     let mut sequence = match sequence.try_lock() {
         Ok(sequence) => sequence,
@@ -671,6 +717,7 @@ fn try_send_control_once(
             Some(slot) => slot,
             None => return ControlEnqueueOutcome::Closed,
         },
+        _retained_bytes: retained_bytes.take(),
     }) {
         Ok(()) => {
             *sequence = next;
@@ -679,6 +726,7 @@ fn try_send_control_once(
         Err(mpsc::error::TrySendError::Full(envelope)) => {
             *event = Some(envelope.event);
             *slot = Some(envelope._lane_slot);
+            *retained_bytes = envelope._retained_bytes;
             ControlEnqueueOutcome::Retry
         }
         Err(mpsc::error::TrySendError::Closed(_)) => ControlEnqueueOutcome::Closed,
@@ -749,4 +797,27 @@ pub enum PaperControlError {
     ShutdownIncomplete,
     #[error(transparent)]
     Adapter(ExecutionAdapterError),
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::{Future, poll_fn};
+    use std::task::Poll;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn admitted_persistence_outcome_waits_for_definitive_worker_reply() {
+        let (reply, response) = oneshot::channel::<Result<(), PaperControlError>>();
+        let mut outcome = Box::pin(await_admitted_persistence_outcome(response));
+        let first_poll = poll_fn(|context| Poll::Ready(outcome.as_mut().poll(context))).await;
+        assert!(matches!(first_poll, Poll::Pending));
+
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let definitive = Err(PaperControlError::Adapter(
+            ExecutionAdapterError::KnownFailure,
+        ));
+        assert!(reply.send(definitive).is_ok());
+        assert_eq!(outcome.await, definitive);
+    }
 }

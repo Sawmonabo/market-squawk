@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use market_squawk::{
     AppConfig, AppPaths, DiagnosticEngine, DiagnosticEngineSnapshot, JournalFileFormat,
     mcp::McpServer,
+    paper_bot::local_coinbase_paper_bot,
     replay::replay_coinbase_journal,
     source::{MarketSource, coinbase::CoinbaseSource, mock::MockSource},
     source_supervisor::{
@@ -21,7 +22,9 @@ use market_squawk_platform::{
     initialize_capture_process_infrastructure, raw_capture_channel, spawn_capture_writer,
 };
 use parking_lot::RwLock;
+use rust_decimal::Decimal;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -94,6 +97,22 @@ enum Command {
         /// Enable paper simulation only; it has no production order authority.
         #[arg(long)]
         paper_bot: bool,
+    },
+
+    /// Run the sealed Coinbase-to-risk-to-paper production composition.
+    #[command(
+        long_about = "Run the bounded production paper-execution service over the configured Coinbase instrument set. Coinbase remains DirectUnverified and cannot issue execution authority; the CLI installs an additional no-intent strategy. This command exercises production ownership and shutdown without permitting orders."
+    )]
+    PaperBot {
+        /// Stop after this many seconds. Omit to run until Ctrl-C.
+        #[arg(long)]
+        seconds: Option<u64>,
+        /// Explicit virtual starting cash in the configured common quote currency.
+        #[arg(long, default_value = "100000")]
+        initial_cash: Decimal,
+        /// Explicit maker and taker fee assumption for the local simulation.
+        #[arg(long, default_value_t = 100)]
+        fee_basis_points: u32,
     },
 
     /// Run the local diagnostic, authority-free MCP stdio compatibility server.
@@ -201,6 +220,37 @@ async fn main() -> Result<()> {
             let disposition = run_source(config, source, mode).await?;
             let snapshot = finish_run_source(disposition).await?;
             println!("{}", serde_json::to_string_pretty(&snapshot)?);
+        }
+        Command::PaperBot {
+            seconds,
+            initial_cash,
+            fee_basis_points,
+        } => {
+            let config = load_config(config_file.as_deref(), cli_overrides)?;
+            let composition = local_coinbase_paper_bot(config, initial_cash, fee_basis_points)?;
+            let cancellation = CancellationToken::new();
+            let runtime = composition.start(cancellation.clone()).await?;
+            match seconds {
+                Some(seconds) => tokio::time::sleep(Duration::from_secs(seconds)).await,
+                None => tokio::signal::ctrl_c().await?,
+            }
+            cancellation.cancel();
+            let shutdown = runtime.shutdown().await;
+            if !shutdown.is_complete() {
+                return Err(anyhow!(
+                    "production paper-bot shutdown was incomplete: {shutdown:?}"
+                ));
+            }
+            let paper = shutdown
+                .paper()
+                .as_ref()
+                .map_err(|error| anyhow!(error.to_string()))?;
+            println!(
+                "paper bot stopped cleanly: sequence={}, orders={}, fills={}",
+                paper.sequence(),
+                paper.orders().len(),
+                paper.fills().len()
+            );
         }
         Command::Mcp {
             products,

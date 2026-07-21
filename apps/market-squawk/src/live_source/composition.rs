@@ -13,10 +13,13 @@ use market_squawk_domain::{
     DigestAlgorithm, EvidenceDigest, ExactPayloadEvidence, IdentityError, InstrumentDefinition,
     MetadataRevision, RevisionBoundPayloadEvidence, SourceId, SourceIdentifier, Timestamp,
 };
-use market_squawk_live::{LiveRouteConfig, LiveRuntimeConfig, LiveSnapshotReader, ShardKey};
+use market_squawk_live::{
+    LiveRouteConfig, LiveRuntimeConfig, LiveSnapshotReader, RouteActionHook, ShardKey,
+};
 use market_squawk_platform::{
-    AppConfig, CaptureProcessInfrastructureLimits, CoinbaseAuthorizationAttestation,
-    CoinbaseSourceConfig, DestinationFenceRegistryInitializationError, LocalPaths, PathError,
+    AppConfig, CaptureProcessInfrastructure, CaptureProcessInfrastructureLimits,
+    CoinbaseAuthorizationAttestation, CoinbaseSourceConfig,
+    DestinationFenceRegistryInitializationError, LocalPaths, PathError,
     initialize_capture_process_infrastructure,
 };
 use market_squawk_sources::{
@@ -124,6 +127,65 @@ impl ProductionLiveSourceComposition {
                     .capture_destination_registry_memory_ceiling_bytes(),
             ))?;
         let live = LiveRuntimeComposition::start(runtime_config, self.routes.clone()).await?;
+        self.start_on_live_runtime(
+            live,
+            route_buffer_limits,
+            paths,
+            capture_process,
+            cancellation,
+        )
+        .await
+    }
+
+    /// Starts the sealed source only after every route has transferred its execution action hook.
+    ///
+    /// This is the production paper/live boundary. Hook admission and live actor startup complete
+    /// before source supervision can open the provider connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed startup or rollback failure without leaving an unowned source or live
+    /// runtime.
+    pub async fn start_with_action_hooks(
+        self,
+        runtime_config: LiveRuntimeConfig,
+        action_hooks: Vec<RouteActionHook>,
+        cancellation: CancellationToken,
+    ) -> Result<ProductionLiveSourceRuntime, ProductionLiveSourceRuntimeError> {
+        let route_buffer_limits = RouteBufferLimits::new(
+            runtime_config.mailbox_count_per_shard(),
+            runtime_config.maximum_message_bytes(),
+        );
+        let paths = LocalPaths::prepare(self.config.data_dir())?;
+        let capture_process =
+            initialize_capture_process_infrastructure(CaptureProcessInfrastructureLimits::new(
+                self.config
+                    .capture_destination_registry_memory_ceiling_bytes(),
+            ))?;
+        let live = LiveRuntimeComposition::start_with_action_hooks(
+            runtime_config,
+            self.routes.clone(),
+            action_hooks,
+        )
+        .await?;
+        self.start_on_live_runtime(
+            live,
+            route_buffer_limits,
+            paths,
+            capture_process,
+            cancellation,
+        )
+        .await
+    }
+
+    async fn start_on_live_runtime(
+        self,
+        live: LiveRuntimeComposition,
+        route_buffer_limits: RouteBufferLimits,
+        paths: LocalPaths,
+        capture_process: CaptureProcessInfrastructure,
+        cancellation: CancellationToken,
+    ) -> Result<ProductionLiveSourceRuntime, ProductionLiveSourceRuntimeError> {
         let routes = self
             .routes
             .iter()

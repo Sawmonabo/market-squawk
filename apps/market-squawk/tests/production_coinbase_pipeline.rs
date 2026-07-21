@@ -1,9 +1,12 @@
 use std::{collections::BTreeMap, ffi::OsString, time::Duration};
 
-use market_squawk::{AppConfig, ProductionLiveSourceComposition};
+use market_squawk::{
+    AppConfig, ProductionLiveSourceComposition, paper_bot::local_coinbase_paper_bot,
+};
 use market_squawk_domain::{DataQuality, VenueId};
 use market_squawk_live::{DepthLimit, LiveRouteConfig, LiveRouteConfigInput, ShardKey};
 use market_squawk_platform::{ConfigOverrides, ConfigSources};
+use rust_decimal::Decimal;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -38,6 +41,13 @@ fn production_contract_is_exactly_allowlisted_typed_and_non_executable() -> Test
     );
     assert_eq!(production.routes().len(), 1);
     assert!(production.metadata().coverage().live().is_some());
+    Ok(())
+}
+
+#[test]
+fn controlled_local_paper_service_composes_without_network_access() -> TestResult {
+    let composition = local_coinbase_paper_bot(app_config()?, Decimal::new(100_000, 0), 100)?;
+    drop(composition);
     Ok(())
 }
 

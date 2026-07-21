@@ -356,8 +356,17 @@ impl RiskService {
         }
         let execution_price = market.execution_price(intent.side());
         self.evaluate_current_market(&intent, market, execution_price, now.wall, &mut reasons);
-        if let Some(execution_price) = execution_price
-            && let Err(rejection) = self.accounts.assess(&intent, execution_price, &self.limits)
+        let reservation_price = execution_price
+            .and_then(|execution_price| conservative_reservation_price(&intent, execution_price));
+        if execution_price.is_some() && reservation_price.is_none() {
+            reasons.push(RiskRejectionCode::Account(
+                AccountRiskViolation::ArithmeticOverflow,
+            ));
+        }
+        if let Some(reservation_price) = reservation_price
+            && let Err(rejection) = self
+                .accounts
+                .assess(&intent, reservation_price, &self.limits)
         {
             extend_account_reasons(&mut reasons, &rejection);
         }
@@ -382,7 +391,7 @@ impl RiskService {
             );
             return RiskOutcome::Rejected(RiskRejection::new(reasons));
         }
-        let Some(execution_price) = execution_price else {
+        let Some(reservation_price) = reservation_price else {
             let reasons = [RiskRejectionCode::MarketDepthUnavailable];
             let context = ExecutionAuditContext::from_risk(
                 approval_id,
@@ -406,7 +415,7 @@ impl RiskService {
         };
         let reservation = match self
             .accounts
-            .try_reserve(&intent, execution_price, &self.limits)
+            .try_reserve(&intent, reservation_price, &self.limits)
         {
             Ok(reservation) => reservation,
             Err(rejection) => {
@@ -517,19 +526,32 @@ impl RiskService {
             reasons.push(RiskRejectionCode::ClockRollback);
         }
         self.evaluate_market(intent, market, now.wall, &mut reasons);
-        if let Err(rejection) =
-            self.accounts
-                .assess(intent, market.estimated_execution_price, &self.limits)
+        let reservation_price =
+            conservative_reservation_price(intent, market.estimated_execution_price);
+        if reservation_price.is_none() {
+            reasons.push(RiskRejectionCode::Account(
+                AccountRiskViolation::ArithmeticOverflow,
+            ));
+        }
+        if let Some(reservation_price) = reservation_price
+            && let Err(rejection) = self
+                .accounts
+                .assess(intent, reservation_price, &self.limits)
         {
             extend_account_reasons(&mut reasons, &rejection);
         }
         if !reasons.is_empty() {
             return PreAuthorityRiskOutcome::Rejected(RiskRejection::new(reasons));
         }
+        let Some(reservation_price) = reservation_price else {
+            return PreAuthorityRiskOutcome::Rejected(RiskRejection::new(vec![
+                RiskRejectionCode::Account(AccountRiskViolation::ArithmeticOverflow),
+            ]));
+        };
 
         match self
             .accounts
-            .try_reserve(intent, market.estimated_execution_price, &self.limits)
+            .try_reserve(intent, reservation_price, &self.limits)
         {
             Ok(reservation) => PreAuthorityRiskOutcome::Reserved(reservation),
             Err(rejection) => {
@@ -689,6 +711,38 @@ fn stop_triggered(intent: &OrderIntent, reference_price: PriceTicks) -> bool {
         OrderSide::Buy => reference_price >= stop,
         OrderSide::Sell => reference_price <= stop,
     }
+}
+
+/// Returns the maximum executable notional price permitted by the intent for account reservation.
+///
+/// Buys reserve through the adverse slippage ceiling, capped by an explicit limit. Sells reserve
+/// at the current best executable price because lower adverse prices reduce absolute notional;
+/// a sell limit is a price floor and therefore cannot increase exposure beyond the current best.
+fn conservative_reservation_price(
+    intent: &OrderIntent,
+    execution_price: PriceTicks,
+) -> Option<PriceTicks> {
+    if execution_price.get() <= 0 || !(0..=10_000).contains(&intent.maximum_slippage().get()) {
+        return None;
+    }
+    if intent.side() == OrderSide::Sell {
+        return Some(execution_price);
+    }
+    let factor = 10_000_i128.checked_add(i128::from(intent.maximum_slippage().get()))?;
+    let numerator = i128::from(execution_price.get()).checked_mul(factor)?;
+    let quotient = numerator / 10_000_i128;
+    let remainder = numerator % 10_000_i128;
+    let adverse = if remainder == 0 {
+        quotient
+    } else {
+        quotient.checked_add(1)?
+    };
+    let adverse = PriceTicks::new(i64::try_from(adverse).ok()?);
+    Some(
+        intent
+            .limit_price()
+            .map_or(adverse, |limit| adverse.min(limit)),
+    )
 }
 
 fn deviation_exceeds(reference: PriceTicks, candidate: PriceTicks, maximum_bps: i32) -> bool {

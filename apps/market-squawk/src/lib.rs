@@ -11,6 +11,7 @@ pub mod live_runtime;
 mod live_source;
 pub mod mcp;
 pub mod order_book;
+pub mod paper_bot;
 pub mod quality;
 pub mod replay;
 pub mod risk;
@@ -38,4 +39,9 @@ pub use live_source::{
 };
 pub use market_squawk_platform::{
     AppConfig, JournalFileFormat, JournalSelectionError, LocalPaths as AppPaths,
+};
+pub use paper_bot::{
+    ProductionPaperBotComposition, ProductionPaperBotCompositionError,
+    ProductionPaperBotExecutionConfig, ProductionPaperBotRollback, ProductionPaperBotRoute,
+    ProductionPaperBotRuntime, ProductionPaperBotShutdown, ProductionPaperBotStartError,
 };

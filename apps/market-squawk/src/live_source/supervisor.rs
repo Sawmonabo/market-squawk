@@ -7,10 +7,12 @@ use market_squawk_domain::{ConnectionGeneration, IdentityError, SourceIdentifier
 use market_squawk_live::{LiveIngressBindError, LiveRuntimeIngress, ShardKey};
 use market_squawk_platform::{
     AppConfig, CaptureChannelError, CaptureChannelLimits, CaptureGenerationError,
-    CaptureProcessInfrastructure, CaptureShutdownStatus, CaptureWorkerReapError,
-    CaptureWriterHandle, CaptureWriterPolicy, CaptureWriterPolicyError, CaptureWriterSpawnError,
-    JournalSinkConstructionError, LocalAuthorityStateStore, LocalAuthorityStateStoreError,
-    LocalPaths, RawCaptureControl, raw_capture_channel, spawn_capture_writer,
+    CaptureProcessInfrastructure, CaptureWriterPolicy, CaptureWriterPolicyError,
+    LocalAuthorityStateStore, LocalAuthorityStateStoreError, LocalPaths,
+    ProcessCaptureShutdownDisposition, ProcessCaptureShutdownPolicy,
+    ProcessCaptureShutdownPolicyError, ProcessCaptureWriterSpawnError, ProcessJournalCaptureConfig,
+    ProcessJournalCaptureConfigError, RawCaptureControl, raw_capture_channel,
+    spawn_process_journal_capture_writer,
 };
 use market_squawk_sources::{
     AuthoritativeSourceRegistry, BudgetDecision, BudgetUnavailableReason,
@@ -147,12 +149,16 @@ impl ProductionSourceSupervisor {
                 ),
                 capabilities,
             )?;
-            let journal = self.paths.open_journal_writer(CAPTURE_JOURNAL)?;
             let flush_records = NonZeroUsize::new(CAPTURE_FLUSH_RECORDS)
                 .ok_or(ProductionSupervisorError::InvalidStaticPolicy)?;
             let policy =
                 CaptureWriterPolicy::try_new(flush_records, self.config.capture_flush_interval())?;
-            let handle = spawn_capture_writer(writer, journal, policy)?;
+            let process_config = ProcessJournalCaptureConfig::try_new(
+                self.paths.root(),
+                CAPTURE_JOURNAL,
+                self.config.capture_shutdown(),
+            )?;
+            let handle = spawn_process_journal_capture_writer(writer, process_config, policy)?;
             capture_control = Some(control);
             writer_handle = Some(handle);
             activate_owned_capture(&mut capture_control, &writer_handle)?;
@@ -244,29 +250,19 @@ impl ProductionSourceSupervisor {
             drop(control);
         }
         if let Some(handle) = writer_handle {
-            let mut pending = handle.shutdown(self.config.capture_shutdown());
-            let status = pending.wait_until_deadline().await;
-            if status == CaptureShutdownStatus::DeadlineElapsed {
-                pending.wait_until_terminated().await;
-            }
-            match pending.try_reap() {
-                Ok(Some(termination))
-                    if termination.shutdown_deadline_elapsed()
-                        || termination.outcome().is_incomplete() =>
-                {
-                    if cleanup_error.is_none() {
-                        cleanup_error = Some(ProductionSupervisorError::IncompleteCaptureShutdown);
-                    }
-                }
-                Ok(Some(_termination)) => {}
-                Ok(None) if cleanup_error.is_none() => {
-                    cleanup_error = Some(ProductionSupervisorError::MissingCaptureTermination);
-                }
-                Ok(None) => {}
-                Err(error) if cleanup_error.is_none() => {
-                    cleanup_error = Some(ProductionSupervisorError::CaptureWorkerReap(error));
-                }
-                Err(_error) => {}
+            let shutdown_policy = ProcessCaptureShutdownPolicy::try_new(
+                self.config.capture_shutdown(),
+                self.config.capture_shutdown(),
+            )?;
+            let shutdown = handle.shutdown(shutdown_policy).await;
+            let clean = shutdown.disposition() == ProcessCaptureShutdownDisposition::Complete
+                && shutdown.helper_reaped()
+                && shutdown.worker_termination().is_some_and(|termination| {
+                    !termination.shutdown_deadline_elapsed()
+                        && !termination.outcome().is_incomplete()
+                });
+            if !clean && cleanup_error.is_none() {
+                cleanup_error = Some(ProductionSupervisorError::IncompleteCaptureShutdown);
             }
         }
         if let Some(error) = cleanup_error {
@@ -411,9 +407,9 @@ pub(super) async fn route_worker_cleanup_error(
     }
 }
 
-pub(super) fn activate_owned_capture(
+pub(super) fn activate_owned_capture<W>(
     control: &mut Option<RawCaptureControl<CaptureGenerationCapabilities>>,
-    writer: &Option<CaptureWriterHandle<CaptureGenerationCapabilities>>,
+    writer: &Option<W>,
 ) -> Result<(), ProductionSupervisorError> {
     if writer.is_none() {
         return Err(ProductionSupervisorError::MissingCaptureWriterOwnership);
@@ -436,8 +432,6 @@ pub enum ProductionSupervisorError {
     AllocationFailed,
     #[error("production source supervisor static policy is invalid")]
     InvalidStaticPolicy,
-    #[error("capture writer terminated without a final report")]
-    MissingCaptureTermination,
     #[error("capture activation began without cleanup-owned control")]
     MissingCaptureControlOwnership,
     #[error("capture activation began without cleanup-owned writer")]
@@ -479,11 +473,11 @@ pub enum ProductionSupervisorError {
     #[error(transparent)]
     CaptureWriterPolicy(#[from] CaptureWriterPolicyError),
     #[error(transparent)]
-    CaptureWriterSpawn(#[from] CaptureWriterSpawnError),
+    ProcessCaptureConfig(#[from] ProcessJournalCaptureConfigError),
     #[error(transparent)]
-    CaptureWorkerReap(#[from] CaptureWorkerReapError),
+    ProcessCaptureShutdownPolicy(#[from] ProcessCaptureShutdownPolicyError),
     #[error(transparent)]
-    Journal(#[from] JournalSinkConstructionError),
+    ProcessCaptureSpawn(#[from] ProcessCaptureWriterSpawnError),
     #[error(transparent)]
     RouteBind(#[from] LiveIngressBindError),
     #[error(transparent)]

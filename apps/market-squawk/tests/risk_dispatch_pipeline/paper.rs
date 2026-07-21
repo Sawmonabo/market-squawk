@@ -302,7 +302,7 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
         configuration_version: NonZeroU64::MIN,
         deterministic_seed: [7; 32],
         command_capacity: NonZeroUsize::new(16).ok_or("zero command capacity")?,
-        command_maximum_bytes: NonZeroU32::new(16 * 64 * 1024).ok_or("zero command bytes")?,
+        command_maximum_bytes: NonZeroU32::new(16 * 64 * 1024 + 7).ok_or("zero command bytes")?,
         market_capacity: NonZeroUsize::new(16).ok_or("zero market capacity")?,
         market_maximum_bytes: NonZeroU32::new(512 * 1024).ok_or("zero market bytes")?,
         audit_capacity: NonZeroUsize::new(64).ok_or("zero paper audit capacity")?,
@@ -625,9 +625,46 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
     );
     let persistence = finalized_checkpoint.persistence_evidence(&finalized_bytes)?;
     let persistence_authority = dispatcher.persistence_acknowledgement()?;
+    let stale_persistence_authority = dispatcher.persistence_acknowledgement()?;
     paper_adapter
         .acknowledge_persistence(persistence_authority, persistence)
         .await?;
+    let mut stale_paper = PaperExecutionRuntime::try_start_from_checkpoint(
+        paper_config.clone(),
+        finalized_checkpoint.clone(),
+    )?;
+    let _ = stale_paper.take_audit_reader();
+    let stale_adapter = stale_paper.adapter();
+    let stale_checkpoint = stale_adapter.checkpoint(paper_control()?).await?;
+    let stale_bytes = stale_checkpoint.encode(1024 * 1024)?;
+    let stale_value: serde_json::Value = serde_json::from_slice(&stale_bytes)?;
+    let stale_evidence = stale_checkpoint.persistence_evidence(&stale_bytes)?;
+    assert!(matches!(
+        stale_adapter
+            .acknowledge_persistence(stale_persistence_authority, stale_evidence)
+            .await,
+        Err(market_squawk_adapter_paper::PaperControlError::Adapter(
+            ExecutionAdapterError::KnownFailure
+        ))
+    ));
+    let after_failed_persistence: serde_json::Value = serde_json::from_slice(
+        &stale_adapter
+            .checkpoint(paper_control()?)
+            .await?
+            .encode(1024 * 1024)?,
+    )?;
+    assert_eq!(
+        after_failed_persistence["durable_sequence"],
+        stale_value["durable_sequence"]
+    );
+    assert_eq!(
+        after_failed_persistence["acknowledged_reconciliation_batches"],
+        stale_value["acknowledged_reconciliation_batches"]
+    );
+    assert_eq!(
+        paper_adapter.retained_bytes(),
+        usize::try_from(paper_config.input().command_maximum_bytes.get())?
+    );
     let pruned_checkpoint = paper_adapter.checkpoint(paper_control()?).await?;
     let pruned_value: serde_json::Value =
         serde_json::from_slice(&pruned_checkpoint.encode(1024 * 1024)?)?;

@@ -12,15 +12,13 @@ pub use authority_state::{
     AuthorityCommitContext, AuthorityStateSnapshot, LocalAuthorityStateStore,
     LocalAuthorityStateStoreError,
 };
-#[cfg(all(feature = "capture-test", debug_assertions))]
-pub use capture::CaptureReceiverTestCoordinationError;
 #[cfg(feature = "capture-benchmark")]
 pub use capture::benchmark_support as capture_benchmark_support;
 pub use capture::{
     CaptureAccountingSnapshot, CaptureAccountingSnapshotError, CaptureChannelError,
     CaptureChannelLimits, CaptureDestination, CaptureDestinationError,
     CaptureDestinationFenceError, CaptureGenerationError, CaptureHealthEvent, CaptureHealthReason,
-    CaptureHealthSnapshot, CaptureIoContext, CaptureProcessInfrastructure,
+    CaptureHealthSnapshot, CaptureHelperError, CaptureIoContext, CaptureProcessInfrastructure,
     CaptureProcessInfrastructureLimits, CapturePublishError, CapturePublisherCloneError,
     CaptureQueueKind, CaptureShutdownStatus, CaptureSink, CaptureSinkError,
     CaptureStorageErrorClass, CaptureWorkerReapError, CaptureWorkerTermination,
@@ -28,10 +26,16 @@ pub use capture::{
     CaptureWriterSpawnError, CapturedRawRecord, DestinationFenceRegistryInitializationError,
     DestinationFenceRegistryPermanentInitializationError, DiagnosticCaptureBundle,
     DiagnosticCaptureError, DiagnosticCaptureFrame, DiagnosticCaptureReceipt, MemoryCaptureSink,
-    MemoryCaptureSinkConstructionError, PendingCaptureWriter, RawCaptureChannel, RawCaptureControl,
-    RawCapturePublisher, RawCaptureWriter, WriterFixedStorageReceipt, WriterRuntimeProofError,
-    initialize_capture_process_infrastructure, raw_capture_channel, spawn_capture_writer,
+    MemoryCaptureSinkConstructionError, PendingCaptureWriter, ProcessCaptureShutdownDisposition,
+    ProcessCaptureShutdownOutcome, ProcessCaptureShutdownPolicy, ProcessCaptureShutdownPolicyError,
+    ProcessCaptureWriterSpawnError, ProcessJournalCaptureConfig, ProcessJournalCaptureConfigError,
+    ProcessJournalCaptureWriter, RawCaptureChannel, RawCaptureControl, RawCapturePublisher,
+    RawCaptureWriter, WriterFixedStorageReceipt, WriterRuntimeProofError,
+    initialize_capture_process_infrastructure, raw_capture_channel, run_capture_helper,
+    spawn_capture_writer, spawn_process_journal_capture_writer,
 };
+#[cfg(all(feature = "capture-test", debug_assertions))]
+pub use capture::{CaptureReceiverTestCoordinationError, ProcessCaptureHelperTestBehavior};
 pub use config::{
     AppConfig, COINBASE_EXCHANGE_ENDPOINT, CoinbaseAuthorizationAttestation,
     CoinbaseConfigurationError, CoinbaseControlLimits, CoinbaseInstrumentMapping,

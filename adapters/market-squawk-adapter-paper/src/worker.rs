@@ -74,6 +74,32 @@ pub(crate) enum WorkerCommand {
     },
 }
 
+impl WorkerCommand {
+    pub(crate) fn retained_bytes(&self) -> Result<usize, ExecutionAdapterError> {
+        let inline = std::mem::size_of::<Self>();
+        let additional = match self {
+            Self::Submit { .. } => return Ok(inline.max(64 * 1024)),
+            Self::Reconcile { request, .. } => std::mem::size_of_val(request.order_ids()),
+            Self::AcknowledgeReconciliation {
+                acknowledgement, ..
+            } => std::mem::size_of_val(acknowledgement.order_ids()),
+            Self::AcknowledgePersistence { authority, .. } => authority
+                .retained_bytes()
+                .and_then(|retained| {
+                    retained.checked_sub(std::mem::size_of::<PersistenceAcknowledgement>())
+                })
+                .ok_or(ExecutionAdapterError::KnownFailure)?,
+            Self::Cancel { .. }
+            | Self::Snapshot { .. }
+            | Self::Checkpoint { .. }
+            | Self::Shutdown { .. } => 0,
+        };
+        inline
+            .checked_add(additional)
+            .ok_or(ExecutionAdapterError::KnownFailure)
+    }
+}
+
 #[derive(Debug)]
 #[allow(
     clippy::large_enum_variant,
@@ -89,6 +115,7 @@ pub(crate) struct WorkerEnvelope {
     pub(crate) sequence: u64,
     pub(crate) event: WorkerEvent,
     pub(crate) _lane_slot: OwnedSemaphorePermit,
+    pub(crate) _retained_bytes: Option<OwnedSemaphorePermit>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -127,6 +154,26 @@ struct WorkerState {
 struct IssuedCheckpoint {
     evidence: PaperCheckpointPersistenceEvidence,
     acknowledged_reconciliation_batches: Box<[ReconciliationBatchBinding]>,
+}
+
+#[derive(Debug)]
+struct CompactionPlan {
+    orders: BTreeMap<OrderId, PaperOrder>,
+    archived_orders: BTreeMap<OrderId, PaperOrder>,
+    fills: Vec<PaperFillSnapshot>,
+    archived_fills: Vec<PaperFillSnapshot>,
+    idempotency: BTreeMap<(AccountId, ClientOrderId), OrderId>,
+    reconciled_orders: BTreeSet<OrderId>,
+}
+
+fn ensure_compaction_active(
+    operation: Option<&market_squawk_execution::ExecutionOperation>,
+) -> Result<(), ExecutionAdapterError> {
+    if operation.is_some_and(market_squawk_execution::ExecutionOperation::is_expired) {
+        Err(ExecutionAdapterError::KnownFailure)
+    } else {
+        Ok(())
+    }
 }
 
 impl PaperWorker {
@@ -194,6 +241,7 @@ impl PaperWorker {
                         sequence,
                         event,
                         _lane_slot,
+                        _retained_bytes,
                     } = envelope;
                     match event {
                         WorkerEvent::Command(command) => {
@@ -362,7 +410,7 @@ impl PaperWorker {
         authority: PersistenceAcknowledgement,
         evidence: PaperCheckpointPersistenceEvidence,
     ) -> Result<(), PaperControlError> {
-        let Some(issued) = self.state.issued_checkpoint.take() else {
+        let Some(issued) = self.state.issued_checkpoint.as_ref() else {
             return Err(PaperControlError::Adapter(
                 ExecutionAdapterError::KnownFailure,
             ));
@@ -372,7 +420,6 @@ impl PaperWorker {
             || evidence.sequence > self.state.sequence
             || issued.evidence != evidence
         {
-            self.state.issued_checkpoint = Some(issued);
             return Err(PaperControlError::Adapter(
                 ExecutionAdapterError::KnownFailure,
             ));
@@ -382,67 +429,111 @@ impl PaperWorker {
             .try_reserve_exact(issued.acknowledged_reconciliation_batches.len())
             .is_err()
         {
-            self.state.issued_checkpoint = Some(issued);
             return Err(PaperControlError::Adapter(
                 ExecutionAdapterError::NotAttemptedBusy,
             ));
         }
-        prunable.extend(
-            issued
-                .acknowledged_reconciliation_batches
-                .iter()
-                .copied()
-                .filter(|binding| {
-                    authority
-                        .finalized_reconciliations()
-                        .iter()
-                        .any(|finalized| finalized == binding)
-                }),
-        );
+        for binding in &issued.acknowledged_reconciliation_batches {
+            if authority.operation().is_expired() {
+                return Err(PaperControlError::DeadlineExceeded);
+            }
+            for finalized in authority.finalized_reconciliations() {
+                if authority.operation().is_expired() {
+                    return Err(PaperControlError::DeadlineExceeded);
+                }
+                if finalized == binding {
+                    prunable.push(*binding);
+                    break;
+                }
+            }
+        }
+        let mut retained_batches = Vec::new();
+        retained_batches
+            .try_reserve_exact(self.state.acknowledged_reconciliation_batches.len())
+            .map_err(|_| PaperControlError::Adapter(ExecutionAdapterError::NotAttemptedBusy))?;
+        for binding in &self.state.acknowledged_reconciliation_batches {
+            if authority.operation().is_expired() {
+                return Err(PaperControlError::DeadlineExceeded);
+            }
+            let mut is_prunable = false;
+            for persisted in &prunable {
+                if authority.operation().is_expired() {
+                    return Err(PaperControlError::DeadlineExceeded);
+                }
+                if persisted == binding {
+                    is_prunable = true;
+                    break;
+                }
+            }
+            if !is_prunable {
+                retained_batches.push(*binding);
+            }
+        }
         let observed_at = match crate::adapter::system_timestamp() {
             Ok(observed_at) => observed_at,
             Err(_) => {
-                self.state.issued_checkpoint = Some(issued);
                 return Err(PaperControlError::Adapter(
                     ExecutionAdapterError::KnownFailure,
                 ));
             }
         };
-        let prior_durable_sequence = self.state.durable_sequence;
-        self.state.durable_sequence = prior_durable_sequence.max(evidence.sequence);
-        if let Err(error) = self.compact(observed_at) {
-            self.state.durable_sequence = prior_durable_sequence;
-            self.state.issued_checkpoint = Some(issued);
-            return Err(PaperControlError::Adapter(error));
+        let durable_sequence = self.state.durable_sequence.max(evidence.sequence);
+        let compaction = match self.prepare_compaction(
+            observed_at,
+            durable_sequence,
+            Some(authority.operation()),
+        ) {
+            Ok(compaction) => compaction,
+            Err(_) if authority.operation().is_expired() => {
+                return Err(PaperControlError::DeadlineExceeded);
+            }
+            Err(error) => return Err(PaperControlError::Adapter(error)),
+        };
+        if authority.operation().is_expired() {
+            return Err(PaperControlError::DeadlineExceeded);
         }
-        if let Err(error) = authority.commit_persisted(&prunable) {
-            self.state.issued_checkpoint = Some(issued);
-            return Err(PaperControlError::Adapter(error));
-        }
-        self.state
-            .acknowledged_reconciliation_batches
-            .retain(|binding| !prunable.iter().any(|persisted| persisted == binding));
+        authority
+            .commit_persisted(&prunable)
+            .map_err(PaperControlError::Adapter)?;
+        self.state.durable_sequence = durable_sequence;
+        self.apply_compaction(compaction);
+        self.state.acknowledged_reconciliation_batches = retained_batches;
+        self.state.issued_checkpoint = None;
         Ok(())
     }
 
     fn compact(&mut self, observed_at: Timestamp) -> Result<(), ExecutionAdapterError> {
-        let durable_sequence = self.state.durable_sequence;
+        let plan = self.prepare_compaction(observed_at, self.state.durable_sequence, None)?;
+        self.apply_compaction(plan);
+        Ok(())
+    }
+
+    fn prepare_compaction(
+        &mut self,
+        observed_at: Timestamp,
+        durable_sequence: u64,
+        operation: Option<&market_squawk_execution::ExecutionOperation>,
+    ) -> Result<CompactionPlan, ExecutionAdapterError> {
         let should_purge = |order_id: &OrderId, order: &PaperOrder| {
             observed_at > order.expires_at
                 && order.lifecycle.last_sequence() <= durable_sequence
                 && self.state.reconciled_orders.contains(order_id)
         };
-        let purge_count = self
-            .state
-            .archived_orders
-            .iter()
-            .filter(|(order_id, order)| should_purge(order_id, order))
-            .count();
+        let mut purged_archived_orders = Vec::new();
+        purged_archived_orders
+            .try_reserve_exact(self.state.archived_orders.len())
+            .map_err(|_| ExecutionAdapterError::KnownFailure)?;
+        for (order_id, order) in &self.state.archived_orders {
+            ensure_compaction_active(operation)?;
+            if should_purge(order_id, order) {
+                purged_archived_orders.push(*order_id);
+            }
+        }
         let retained_archive_count = self
             .state
             .archived_orders
             .len()
-            .checked_sub(purge_count)
+            .checked_sub(purged_archived_orders.len())
             .ok_or(ExecutionAdapterError::KnownFailure)?;
         let available_archive = self
             .config
@@ -455,30 +546,30 @@ impl PaperWorker {
         candidates
             .try_reserve_exact(available_archive.min(self.state.orders.len()))
             .map_err(|_| ExecutionAdapterError::KnownFailure)?;
-        candidates.extend(
-            self.state
-                .orders
-                .iter()
-                .filter(|(order_id, order)| {
-                    is_terminal(order.lifecycle.state())
-                        && order.lifecycle.last_sequence() <= durable_sequence
-                        && self.state.reconciled_orders.contains(order_id)
-                })
-                .map(|(order_id, _)| *order_id)
-                .take(available_archive),
-        );
-        if candidates
-            .iter()
-            .any(|order_id| self.state.archived_orders.contains_key(order_id))
-        {
-            return Err(ExecutionAdapterError::KnownFailure);
+        for (order_id, order) in &self.state.orders {
+            ensure_compaction_active(operation)?;
+            if candidates.len() >= available_archive {
+                break;
+            }
+            if is_terminal(order.lifecycle.state())
+                && order.lifecycle.last_sequence() <= durable_sequence
+                && self.state.reconciled_orders.contains(order_id)
+            {
+                if self.state.archived_orders.contains_key(order_id) {
+                    return Err(ExecutionAdapterError::KnownFailure);
+                }
+                candidates.push(*order_id);
+            }
         }
-        let moving_fills = self
-            .state
-            .fills
-            .iter()
-            .filter(|fill| candidates.binary_search(&fill.order_id()).is_ok())
-            .count();
+        let mut moving_fills = 0_usize;
+        for fill in &self.state.fills {
+            ensure_compaction_active(operation)?;
+            if candidates.binary_search(&fill.order_id()).is_ok() {
+                moving_fills = moving_fills
+                    .checked_add(1)
+                    .ok_or(ExecutionAdapterError::KnownFailure)?;
+            }
+        }
         let maximum_archived_fills = self
             .config
             .input()
@@ -486,68 +577,173 @@ impl PaperWorker {
             .get()
             .checked_mul(self.config.input().maximum_fills.get())
             .ok_or(ExecutionAdapterError::KnownFailure)?;
-        let retained_archived_fills = self
-            .state
-            .archived_fills
-            .iter()
-            .filter(|fill| {
-                self.state
-                    .archived_orders
-                    .get(&fill.order_id())
-                    .is_some_and(|order| !should_purge(&fill.order_id(), order))
-            })
-            .count();
+        let mut retained_archived_fills = 0_usize;
+        for fill in &self.state.archived_fills {
+            ensure_compaction_active(operation)?;
+            if self
+                .state
+                .archived_orders
+                .get(&fill.order_id())
+                .is_some_and(|order| !should_purge(&fill.order_id(), order))
+            {
+                retained_archived_fills = retained_archived_fills
+                    .checked_add(1)
+                    .ok_or(ExecutionAdapterError::KnownFailure)?;
+            }
+        }
         if retained_archived_fills
             .checked_add(moving_fills)
             .is_none_or(|total| total > maximum_archived_fills)
         {
             return Err(ExecutionAdapterError::KnownFailure);
         }
-        self.state
-            .archived_fills
-            .try_reserve_exact(moving_fills)
-            .map_err(|_| ExecutionAdapterError::KnownFailure)?;
 
-        let reconciled_orders = &self.state.reconciled_orders;
-        self.state.archived_orders.retain(|order_id, order| {
-            !(observed_at > order.expires_at
-                && order.lifecycle.last_sequence() <= durable_sequence
-                && reconciled_orders.contains(order_id))
-        });
-        self.state
-            .archived_fills
-            .retain(|fill| self.state.archived_orders.contains_key(&fill.order_id()));
-        for order_id in candidates {
-            let order = self
-                .state
-                .orders
-                .remove(&order_id)
-                .ok_or(ExecutionAdapterError::KnownFailure)?;
-            for fill in self
-                .state
-                .fills
-                .iter()
-                .filter(|fill| fill.order_id() == order_id)
+        let mut fills = Vec::new();
+        fills
+            .try_reserve_exact(
+                self.state
+                    .fills
+                    .len()
+                    .checked_sub(moving_fills)
+                    .ok_or(ExecutionAdapterError::KnownFailure)?,
+            )
+            .map_err(|_| ExecutionAdapterError::KnownFailure)?;
+        let final_archived_fill_count = retained_archived_fills
+            .checked_add(moving_fills)
+            .ok_or(ExecutionAdapterError::KnownFailure)?;
+        let mut archived_fills = Vec::new();
+        archived_fills
+            .try_reserve_exact(final_archived_fill_count)
+            .map_err(|_| ExecutionAdapterError::KnownFailure)?;
+        for fill in &self.state.archived_fills {
+            ensure_compaction_active(operation)?;
+            if purged_archived_orders
+                .binary_search(&fill.order_id())
+                .is_err()
+                && self.state.archived_orders.contains_key(&fill.order_id())
             {
-                self.state.archived_fills.push(*fill);
+                archived_fills.push(*fill);
             }
-            self.state.fills.retain(|fill| fill.order_id() != order_id);
-            self.state
-                .idempotency
-                .retain(|_, retained_order_id| *retained_order_id != order_id);
-            if self.state.archived_orders.insert(order_id, order).is_some() {
+        }
+        for fill in &self.state.fills {
+            ensure_compaction_active(operation)?;
+            if candidates.binary_search(&fill.order_id()).is_ok() {
+                archived_fills.push(*fill);
+            } else {
+                fills.push(*fill);
+            }
+        }
+        if archived_fills.len() != final_archived_fill_count {
+            return Err(ExecutionAdapterError::KnownFailure);
+        }
+        ensure_compaction_active(operation)?;
+        archived_fills.sort_unstable_by_key(|fill| fill.sequence());
+
+        let expected_order_count = self
+            .state
+            .orders
+            .len()
+            .checked_sub(candidates.len())
+            .ok_or(ExecutionAdapterError::KnownFailure)?;
+        let mut orders = BTreeMap::new();
+        for (order_id, order) in &self.state.orders {
+            ensure_compaction_active(operation)?;
+            if candidates.binary_search(order_id).is_err()
+                && orders.insert(*order_id, order.clone()).is_some()
+            {
                 return Err(ExecutionAdapterError::KnownFailure);
             }
         }
-        self.state
-            .archived_fills
-            .sort_unstable_by_key(|fill| fill.sequence());
-        let active_orders = &self.state.orders;
-        let archived_orders = &self.state.archived_orders;
-        self.state.reconciled_orders.retain(|order_id| {
-            active_orders.contains_key(order_id) || archived_orders.contains_key(order_id)
-        });
-        Ok(())
+        if orders.len() != expected_order_count {
+            return Err(ExecutionAdapterError::KnownFailure);
+        }
+
+        let expected_archived_order_count = retained_archive_count
+            .checked_add(candidates.len())
+            .ok_or(ExecutionAdapterError::KnownFailure)?;
+        let mut archived_orders = BTreeMap::new();
+        for (order_id, order) in &self.state.archived_orders {
+            ensure_compaction_active(operation)?;
+            if purged_archived_orders.binary_search(order_id).is_err()
+                && archived_orders.insert(*order_id, order.clone()).is_some()
+            {
+                return Err(ExecutionAdapterError::KnownFailure);
+            }
+        }
+        for order_id in &candidates {
+            ensure_compaction_active(operation)?;
+            let order = self
+                .state
+                .orders
+                .get(order_id)
+                .ok_or(ExecutionAdapterError::KnownFailure)?;
+            if archived_orders.insert(*order_id, order.clone()).is_some() {
+                return Err(ExecutionAdapterError::KnownFailure);
+            }
+        }
+        if archived_orders.len() != expected_archived_order_count {
+            return Err(ExecutionAdapterError::KnownFailure);
+        }
+
+        for fill in &fills {
+            ensure_compaction_active(operation)?;
+            if !orders.contains_key(&fill.order_id()) {
+                return Err(ExecutionAdapterError::KnownFailure);
+            }
+        }
+        for fill in &archived_fills {
+            ensure_compaction_active(operation)?;
+            if !archived_orders.contains_key(&fill.order_id()) {
+                return Err(ExecutionAdapterError::KnownFailure);
+            }
+        }
+
+        let mut idempotency = BTreeMap::new();
+        for (key, order_id) in &self.state.idempotency {
+            ensure_compaction_active(operation)?;
+            if candidates.binary_search(order_id).is_err()
+                && (!orders.contains_key(order_id)
+                    || idempotency.insert(key.clone(), *order_id).is_some())
+            {
+                return Err(ExecutionAdapterError::KnownFailure);
+            }
+        }
+
+        let mut reconciled_orders = BTreeSet::new();
+        for order_id in &self.state.reconciled_orders {
+            ensure_compaction_active(operation)?;
+            if (orders.contains_key(order_id) || archived_orders.contains_key(order_id))
+                && !reconciled_orders.insert(*order_id)
+            {
+                return Err(ExecutionAdapterError::KnownFailure);
+            }
+        }
+        ensure_compaction_active(operation)?;
+        Ok(CompactionPlan {
+            orders,
+            archived_orders,
+            fills,
+            archived_fills,
+            idempotency,
+            reconciled_orders,
+        })
+    }
+
+    fn apply_compaction(&mut self, plan: CompactionPlan) {
+        let CompactionPlan {
+            orders,
+            archived_orders,
+            fills,
+            archived_fills,
+            idempotency,
+            reconciled_orders,
+        } = plan;
+        self.state.orders = orders;
+        self.state.archived_orders = archived_orders;
+        self.state.fills = fills;
+        self.state.archived_fills = archived_fills;
+        self.state.idempotency = idempotency;
+        self.state.reconciled_orders = reconciled_orders;
     }
 
     fn submit(

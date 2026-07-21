@@ -543,6 +543,7 @@ mod control;
 mod diagnostic;
 mod generation;
 mod policy;
+mod process_journal;
 mod queue;
 mod transport;
 mod writer;
@@ -560,6 +561,14 @@ pub use diagnostic::{
     DiagnosticCaptureReceipt,
 };
 pub use policy::{CaptureWriterPolicy, CaptureWriterPolicyError};
+#[cfg(all(feature = "capture-test", debug_assertions))]
+pub use process_journal::ProcessCaptureHelperTestBehavior;
+pub use process_journal::{
+    CaptureHelperError, ProcessCaptureShutdownDisposition, ProcessCaptureShutdownOutcome,
+    ProcessCaptureShutdownPolicy, ProcessCaptureShutdownPolicyError,
+    ProcessCaptureWriterSpawnError, ProcessJournalCaptureConfig, ProcessJournalCaptureConfigError,
+    ProcessJournalCaptureWriter, run_capture_helper, spawn_process_journal_capture_writer,
+};
 #[cfg(all(feature = "capture-test", debug_assertions))]
 pub use writer::CaptureReceiverTestCoordinationError;
 pub use writer::{

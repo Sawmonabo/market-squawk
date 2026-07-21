@@ -31,8 +31,8 @@ use market_squawk_execution::{
     ExecutionMarketSink, ExecutionMarketSinkError, ExecutionMarketUpdate, ExecutionReceipt,
     ExecutionState, ExecutionStateSourceBinding, OrderIntent, OrderIntentInput, ReconcileOrders,
     ReconciledAccountState, ReconciledOrder, ReconciledOrderStatus, ReconciliationAcknowledgement,
-    RiskLimits, RiskLimitsInput, RiskPolicyIdentity, RiskService, RiskServiceConfig, Strategy,
-    StrategyContext, StrategyError,
+    RiskLimits, RiskLimitsInput, RiskPolicyIdentity, RiskRejectionCode, RiskService,
+    RiskServiceConfig, Strategy, StrategyContext, StrategyError,
 };
 use market_squawk_live::{ActionAuthorityIssueLimit, LiveRuntime, RouteActionHook};
 pub(crate) use market_squawk_live::{
@@ -55,11 +55,11 @@ use current_source::{
 
 #[derive(Debug)]
 struct SnapshotStrategy {
-    account_ids: [AccountId; 5],
+    account_ids: [AccountId; 6],
     strategy_id: StrategyId,
     terms: market_squawk_domain::InstrumentExecutionTerms,
-    order_ids: [OrderId; 5],
-    client_ids: [ClientOrderId; 5],
+    order_ids: [OrderId; 6],
+    client_ids: [ClientOrderId; 6],
     reason: OrderReasonCode,
     emitted: usize,
 }
@@ -88,6 +88,7 @@ impl Strategy for SnapshotStrategy {
             .observed_at()
             .checked_add_nanos(30_000_000_000)
             .map_err(|_| StrategyError::Evaluation)?;
+        let is_adverse_price_probe = index == 5;
         let intent = OrderIntent::try_new(OrderIntentInput {
             order_id: self.order_ids[index],
             client_order_id: self.client_ids[index].clone(),
@@ -95,16 +96,21 @@ impl Strategy for SnapshotStrategy {
             model_id: None,
             account_id: self.account_ids[index],
             execution_terms: self.terms,
-            side: OrderSide::Sell,
+            side: if is_adverse_price_probe {
+                OrderSide::Buy
+            } else {
+                OrderSide::Sell
+            },
             order_type: OrderType::Market,
-            quantity: QuantityLots::new(2).map_err(|_| StrategyError::Evaluation)?,
+            quantity: QuantityLots::new(if is_adverse_price_probe { 99 } else { 2 })
+                .map_err(|_| StrategyError::Evaluation)?,
             limit_price: None,
             stop_price: None,
             time_in_force: TimeInForce::ImmediateOrCancel,
             signal_at: context.market().observed_at(),
             expires_at,
             reason_codes: vec![self.reason.clone()],
-            maximum_slippage: BasisPoints::new(100),
+            maximum_slippage: BasisPoints::new(if is_adverse_price_probe { 1_000 } else { 100 }),
             required_quality: DataQuality::DirectVerified,
         })
         .map_err(|_| StrategyError::Evaluation)?;
@@ -356,6 +362,7 @@ async fn committed_market_risk_and_dispatch_are_one_use_bounded_and_fill_safe() 
         AccountId::from_str("50000000-0000-0000-0000-000000000002")?;
     let accepted_shutdown_account_id = AccountId::from_str("50000000-0000-0000-0000-000000000003")?;
     let queued_expired_account_id = AccountId::from_str("50000000-0000-0000-0000-000000000004")?;
+    let adverse_price_account_id = AccountId::from_str("50000000-0000-0000-0000-000000000005")?;
     let strategy_id = StrategyId::from_str("30000000-0000-0000-0000-000000000001")?;
     let accounts = Arc::new(AccountRiskCoordinator::try_new(
         AccountCoordinatorConfig::default(),
@@ -364,14 +371,36 @@ async fn committed_market_risk_and_dispatch_are_one_use_bounded_and_fill_safe() 
             submitted_shutdown_account_id,
             accepted_shutdown_account_id,
             queued_expired_account_id,
+            adverse_price_account_id,
         ]
         .map(|account_id| AccountBootstrap {
             account_id,
             revision: NonZeroU64::MIN,
             eligible: true,
-            cash: Money::new(Decimal::new(10_000, 0), usd),
-            capital: Money::new(Decimal::new(10_000, 0), usd),
-            peak_capital: Money::new(Decimal::new(10_000, 0), usd),
+            cash: Money::new(
+                if account_id == adverse_price_account_id {
+                    Decimal::new(2_000_000, 0)
+                } else {
+                    Decimal::new(10_000, 0)
+                },
+                usd,
+            ),
+            capital: Money::new(
+                if account_id == adverse_price_account_id {
+                    Decimal::new(2_000_000, 0)
+                } else {
+                    Decimal::new(10_000, 0)
+                },
+                usd,
+            ),
+            peak_capital: Money::new(
+                if account_id == adverse_price_account_id {
+                    Decimal::new(2_000_000, 0)
+                } else {
+                    Decimal::new(10_000, 0)
+                },
+                usd,
+            ),
             gross_exposure: Money::new(Decimal::ZERO, usd),
             realized_pnl: Money::new(Decimal::ZERO, usd),
             realized_loss: Money::new(Decimal::ZERO, usd),
@@ -384,8 +413,8 @@ async fn committed_market_risk_and_dispatch_are_one_use_bounded_and_fill_safe() 
         currency: usd,
         eligible_instruments: BTreeSet::from([terms.instrument_id()]),
         maximum_position_lots: 100,
-        maximum_order_notional: Money::new(Decimal::new(1_000_000, 0), usd),
-        maximum_gross_exposure: Money::new(Decimal::new(1_000_000, 0), usd),
+        maximum_order_notional: Money::new(Decimal::new(105, 0), usd),
+        maximum_gross_exposure: Money::new(Decimal::new(105, 0), usd),
         maximum_leverage: BasisPoints::new(100_000),
         minimum_capital: Money::new(Decimal::ONE, usd),
         maximum_loss: Money::new(Decimal::new(1_000_000, 0), usd),
@@ -456,6 +485,7 @@ async fn committed_market_risk_and_dispatch_are_one_use_bounded_and_fill_safe() 
             accepted_shutdown_account_id,
             submitted_shutdown_account_id,
             queued_expired_account_id,
+            adverse_price_account_id,
         ],
         strategy_id,
         terms,
@@ -465,6 +495,7 @@ async fn committed_market_risk_and_dispatch_are_one_use_bounded_and_fill_safe() 
             OrderId::from_str("20000000-0000-0000-0000-000000000003")?,
             OrderId::from_str("20000000-0000-0000-0000-000000000004")?,
             OrderId::from_str("20000000-0000-0000-0000-000000000005")?,
+            OrderId::from_str("20000000-0000-0000-0000-000000000008")?,
         ],
         client_ids: [
             ClientOrderId::try_from("dispatch-1")?,
@@ -472,6 +503,7 @@ async fn committed_market_risk_and_dispatch_are_one_use_bounded_and_fill_safe() 
             ClientOrderId::try_from("dispatch-3")?,
             ClientOrderId::try_from("dispatch-4")?,
             ClientOrderId::try_from("dispatch-5")?,
+            ClientOrderId::try_from("dispatch-adverse-price")?,
         ],
         reason: OrderReasonCode::try_from("dispatch.integration")?,
         emitted: 0,
@@ -643,6 +675,22 @@ async fn committed_market_risk_and_dispatch_are_one_use_bounded_and_fill_safe() 
             && event.account_id() == queued_expired_account_id
     }));
     assert_eq!(adapter.calls.load(Ordering::Acquire), 4);
+    let (_, sixth) = source.batch("trade-6", 6)?;
+    ingress.try_publish(sixth)?;
+    tokio::time::timeout(Duration::from_secs(1), market_sink.wait_for(6)).await?;
+    let adverse_price_rejection =
+        wait_for_audit(&mut audit_reader, ExecutionAuditKind::RiskRejected).await?;
+    assert_eq!(
+        adverse_price_rejection.account_id(),
+        adverse_price_account_id
+    );
+    assert!(adverse_price_rejection.reasons().any(|reason| {
+        reason
+            == ExecutionAuditReason::Risk(RiskRejectionCode::Account(
+                market_squawk_execution::AccountRiskViolation::OrderNotionalLimit,
+            ))
+    }));
+    assert_eq!(adapter.calls.load(Ordering::Acquire), 4);
     assert!(runtime.shutdown().await.is_complete());
     assert_eq!(
         dispatcher.shutdown().await,
@@ -705,7 +753,7 @@ async fn committed_market_risk_and_dispatch_are_one_use_bounded_and_fill_safe() 
     accounts.assess(&queued_probe, PriceTicks::new(10_000), &limits)?;
     assert_eq!(adapter.calls.load(Ordering::Acquire), 4);
     assert!(adapter.evidence_valid.load(Ordering::Acquire));
-    assert_eq!(market_sink.updates.load(Ordering::Acquire), 5);
+    assert_eq!(market_sink.updates.load(Ordering::Acquire), 6);
     assert!(market_sink.valid.load(Ordering::Acquire));
     Ok(())
 }

@@ -159,7 +159,7 @@ impl DispatchOrder {
         self.market
     }
 
-    /// Returns the side-aware executable top-of-book price used by risk.
+    /// Returns the side-aware top-of-book reference bound into approval and paper matching.
     pub fn execution_price(&self) -> Option<PriceTicks> {
         self.market.execution_price(self.side())
     }
@@ -446,20 +446,42 @@ impl PersistenceAcknowledgement {
         &self.finalized_reconciliations
     }
 
+    /// Returns the exact bytes exclusively retained by this sealed authority.
+    pub fn retained_bytes(&self) -> Option<usize> {
+        std::mem::size_of::<Self>().checked_add(std::mem::size_of_val(
+            self.finalized_reconciliations.as_ref(),
+        ))
+    }
+
     /// Commits only the exact finalized proofs covered by durable adapter evidence.
     pub fn commit_persisted(
         self,
         persisted: &[ReconciliationBatchBinding],
     ) -> Result<(), ExecutionAdapterError> {
-        if persisted.iter().any(|binding| {
-            !self
-                .finalized_reconciliations
-                .iter()
-                .any(|candidate| candidate == binding)
-        }) {
+        let Self {
+            operation,
+            finalized_reconciliations,
+            finalization,
+        } = self;
+        for binding in persisted {
+            let mut finalized = false;
+            for candidate in &finalized_reconciliations {
+                if operation.is_expired() {
+                    return Err(ExecutionAdapterError::KnownFailure);
+                }
+                if candidate == binding {
+                    finalized = true;
+                    break;
+                }
+            }
+            if !finalized {
+                return Err(ExecutionAdapterError::KnownFailure);
+            }
+        }
+        if operation.is_expired() {
             return Err(ExecutionAdapterError::KnownFailure);
         }
-        self.finalization.commit(persisted)
+        finalization.commit(persisted, &operation)
     }
 }
 

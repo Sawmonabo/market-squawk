@@ -1,16 +1,22 @@
 use std::{
     collections::BTreeMap,
     ffi::OsString,
+    mem::size_of,
     num::{NonZeroU32, NonZeroUsize},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use bytes::Bytes;
 use market_squawk_domain::{DataQuality, SourceIdentifier, Timestamp, VenueId};
 use market_squawk_live::{
-    DepthLimit, LiveIngressError, LiveRouteConfig, LiveRouteConfigInput, LiveRuntime,
-    LiveRuntimeConfig, LiveRuntimeConfigInput, LiveSnapshotReader, ShardKey, ShardRoutingVersion,
-    SnapshotLimits,
+    ActionAuthorityIssueLimit, ActionHookDisposition, CommittedActionContext, CurrentAuthorityGate,
+    DepthLimit, LiveActionHook, LiveActionHookError, LiveIngressError, LiveRouteConfig,
+    LiveRouteConfigInput, LiveRuntime, LiveRuntimeConfig, LiveRuntimeConfigInput,
+    LiveSnapshotReader, RouteActionHook, ShardKey, ShardRoutingVersion, SnapshotLimits,
 };
 use market_squawk_platform::{
     AppConfig, CaptureChannelLimits, CaptureProcessInfrastructureLimits, CaptureWriterPolicy,
@@ -38,6 +44,30 @@ use super::super::{
 use super::budget_free_metadata;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+#[derive(Debug)]
+struct ActionInvocationProbe {
+    count: Arc<AtomicUsize>,
+}
+
+impl LiveActionHook for ActionInvocationProbe {
+    fn on_committed(
+        &mut self,
+        _context: CommittedActionContext<'_>,
+        _authority: &mut CurrentAuthorityGate<'_>,
+    ) -> ActionHookDisposition {
+        self.count.fetch_add(1, Ordering::AcqRel);
+        ActionHookDisposition::NoAction
+    }
+
+    fn retained_bytes(&self) -> Result<usize, LiveActionHookError> {
+        Ok(size_of::<Self>())
+    }
+
+    fn maximum_authority_issues(&self) -> ActionAuthorityIssueLimit {
+        ActionAuthorityIssueLimit::MIN
+    }
+}
 
 #[tokio::test]
 async fn capture_receipt_precedes_fail_closed_pre_acknowledgement_data() -> TestResult {
@@ -182,16 +212,25 @@ async fn acknowledged_frames_reach_the_immutable_live_book_without_execution_qua
         VenueId::try_from("coinbase-exchange")?,
         definition.instrument_id(),
     );
-    let runtime = LiveRuntime::start(
+    let action_invocations = Arc::new(AtomicUsize::new(0));
+    let route_config = LiveRouteConfig::try_new(LiveRouteConfigInput {
+        route: route.clone(),
+        definition,
+        depth: DepthLimit::new(32)?,
+        nonce_capacity: 32,
+        nonce_reclaim_budget: 4,
+        maximum_capability_lifetime: Duration::from_secs(1),
+    })?;
+    let runtime = LiveRuntime::start_with_action_hooks(
         runtime_config()?,
-        vec![LiveRouteConfig::try_new(LiveRouteConfigInput {
-            route: route.clone(),
-            definition,
-            depth: DepthLimit::new(32)?,
-            nonce_capacity: 32,
-            nonce_reclaim_budget: 4,
-            maximum_capability_lifetime: Duration::from_secs(1),
-        })?],
+        vec![route_config],
+        vec![RouteActionHook::try_new(
+            route.clone(),
+            Box::new(ActionInvocationProbe {
+                count: Arc::clone(&action_invocations),
+            }),
+            Vec::new(),
+        )?],
     )
     .await?;
     let snapshots = runtime.snapshots();
@@ -263,6 +302,7 @@ async fn acknowledged_frames_reach_the_immutable_live_book_without_execution_qua
     publish_fixture(&mut sink, &mut frame_factory, "heartbeat.json")?;
     assert_eq!(current_book_revision(&snapshots, &route)?, updated);
     assert_eq!(sink.terminal_failure(), None);
+    assert_eq!(action_invocations.load(Ordering::Acquire), 0);
 
     assert!(runtime.shutdown().await.is_complete());
     publish_fixture(&mut sink, &mut frame_factory, "match.json")?;

@@ -13,8 +13,11 @@ use market_squawk_platform::{
     CaptureSinkError, CaptureStorageErrorClass, CaptureWorkerReapError, CaptureWorkerTermination,
     CaptureWriterHandle, CaptureWriterOutcome, CaptureWriterPolicy, CaptureWriterSpawnError,
     CapturedRawRecord, DiagnosticCaptureBundle, DiagnosticCaptureFrame, DiagnosticCaptureReceipt,
-    LocalPaths, MemoryCaptureSink, RawCaptureChannel, RawCaptureControl, RawCapturePublisher,
+    LocalPaths, MemoryCaptureSink, ProcessCaptureHelperTestBehavior,
+    ProcessCaptureShutdownDisposition, ProcessCaptureShutdownPolicy, ProcessJournalCaptureConfig,
+    RawCaptureChannel, RawCaptureControl, RawCapturePublisher,
     initialize_capture_process_infrastructure, raw_capture_channel, spawn_capture_writer,
+    spawn_process_journal_capture_writer,
 };
 use static_assertions::{assert_impl_all, assert_not_impl_any};
 
@@ -612,6 +615,54 @@ async fn finished_unreaped_journal_destination_remains_fenced()
     )?;
     let successor_termination = shutdown_and_reap(successor, Duration::from_secs(1)).await?;
     assert!(!successor_termination.outcome().is_incomplete());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stalled_process_journal_is_killed_reaped_and_releases_its_destination()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let paths = LocalPaths::prepare(directory.path().join("data"))?;
+    let source = "capture-lifecycle-process";
+    let generation = identity(1)?;
+    let (publisher, mut control, writer) = test_capture_channel(
+        NonZeroUsize::MIN,
+        DiagnosticCaptureBundle::new(generation.clone()),
+    )?;
+    let process = ProcessJournalCaptureConfig::try_new_for_test(
+        paths.root(),
+        source,
+        env!("CARGO_BIN_EXE_market-squawk-platform-capture-helper-test"),
+        ProcessCaptureHelperTestBehavior::StallAfterAppend,
+        Duration::from_secs(1),
+    )?;
+    let handle =
+        spawn_process_journal_capture_writer(writer, process, CaptureWriterPolicy::default())?;
+    control.activate_initial()?;
+    let _receipt = publisher.try_publish(&frame(generation, 1)?)?;
+
+    let shutdown = handle
+        .shutdown(ProcessCaptureShutdownPolicy::try_new(
+            Duration::from_millis(25),
+            Duration::from_secs(1),
+        )?)
+        .await;
+
+    assert_eq!(
+        shutdown.disposition(),
+        ProcessCaptureShutdownDisposition::HelperKilled
+    );
+    assert!(shutdown.helper_reaped());
+    let worker = shutdown
+        .worker_termination()
+        .ok_or("killed helper did not yield a capture-worker termination")?;
+    assert!(worker.shutdown_deadline_elapsed());
+    assert!(worker.outcome().is_incomplete());
+    drop(control);
+    drop(publisher);
+
+    let successor = paths.open_journal_writer(source)?;
+    drop(successor);
     Ok(())
 }
 

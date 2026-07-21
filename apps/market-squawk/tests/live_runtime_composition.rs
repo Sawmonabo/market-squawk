@@ -6,16 +6,38 @@ use market_squawk_domain::{
     InstrumentId, LotSize, TickSize, TradingStatus, VenueId, VenueMapping, VenueSymbol,
 };
 use market_squawk_live::{
-    DepthLimit, LiveRouteConfig, LiveRouteConfigInput, LiveRuntimeConfig, LiveRuntimeConfigError,
-    LiveRuntimeConfigInput, LiveRuntimeHealthKind, LiveRuntimeStartError, ShardId, ShardKey,
-    ShardLifecycleSnapshot, ShardRoutingVersion, ShardShutdownStatus, SnapshotLimits,
-    SnapshotReadError,
+    ActionAuthorityIssueLimit, ActionHookDisposition, CommittedActionContext, CurrentAuthorityGate,
+    DepthLimit, LiveActionHook, LiveActionHookError, LiveRouteConfig, LiveRouteConfigInput,
+    LiveRuntimeConfig, LiveRuntimeConfigError, LiveRuntimeConfigInput, LiveRuntimeHealthKind,
+    LiveRuntimeStartError, RouteActionHook, ShardId, ShardKey, ShardLifecycleSnapshot,
+    ShardRoutingVersion, ShardShutdownStatus, SnapshotLimits, SnapshotReadError,
 };
 use rust_decimal::Decimal;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 const INSTRUMENT: &str = "018f0000-0000-7000-8000-000000000001";
+
+#[derive(Debug)]
+struct NoAction;
+
+impl LiveActionHook for NoAction {
+    fn on_committed(
+        &mut self,
+        _context: CommittedActionContext<'_>,
+        _authority: &mut CurrentAuthorityGate<'_>,
+    ) -> ActionHookDisposition {
+        ActionHookDisposition::NoAction
+    }
+
+    fn retained_bytes(&self) -> Result<usize, LiveActionHookError> {
+        Ok(std::mem::size_of::<Self>())
+    }
+
+    fn maximum_authority_issues(&self) -> ActionAuthorityIssueLimit {
+        ActionAuthorityIssueLimit::MIN
+    }
+}
 
 fn instrument_id() -> TestResult<InstrumentId> {
     Ok(InstrumentId::from_str(INSTRUMENT)?)
@@ -141,6 +163,19 @@ async fn startup_exposes_every_ready_shard_and_shutdown_joins_the_incarnation() 
             .iter()
             .all(|outcome| outcome.status() == ShardShutdownStatus::Complete)
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn application_composition_can_install_one_owned_action_hook_per_route() -> TestResult {
+    let route = route_config()?;
+    let hook = RouteActionHook::try_new(route.route().clone(), Box::new(NoAction), Vec::new())?;
+
+    let composition =
+        LiveRuntimeComposition::start_with_action_hooks(runtime_config()?, vec![route], vec![hook])
+            .await?;
+
+    assert!(composition.shutdown().await?.is_complete());
     Ok(())
 }
 

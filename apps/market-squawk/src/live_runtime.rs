@@ -12,7 +12,7 @@
 use market_squawk_live::{
     BoundShardIngress, LiveIngressBindError, LiveRouteConfig, LiveRuntime, LiveRuntimeConfig,
     LiveRuntimeHealthEvent, LiveRuntimeIngress, LiveRuntimeReplaceError, LiveRuntimeShutdown,
-    LiveRuntimeStartError, LiveSnapshotReader, ShardId, ShardKey,
+    LiveRuntimeStartError, LiveSnapshotReader, RouteActionHook, ShardId, ShardKey,
 };
 use market_squawk_sources::CurrentSourceAuthorityLease;
 use thiserror::Error;
@@ -32,6 +32,22 @@ impl LiveRuntimeComposition {
     ) -> Result<Self, LiveRuntimeCompositionError> {
         Ok(Self {
             runtime: LiveRuntime::start(config, routes).await?,
+        })
+    }
+
+    /// Starts every shard only after one execution action hook is transferred for every route.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed startup error when routes, hooks, resource bounds, or actor startup are
+    /// invalid. A failed startup does not leave detached live actors.
+    pub async fn start_with_action_hooks(
+        config: LiveRuntimeConfig,
+        routes: Vec<LiveRouteConfig>,
+        action_hooks: Vec<RouteActionHook>,
+    ) -> Result<Self, LiveRuntimeCompositionError> {
+        Ok(Self {
+            runtime: LiveRuntime::start_with_action_hooks(config, routes, action_hooks).await?,
         })
     }
 

@@ -1,10 +1,12 @@
-use std::num::NonZeroU64;
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::str::FromStr;
+use std::time::Duration;
 
 use market_squawk_adapter_paper::{
-    FeeSchedule, LiquidityRole, PaperAccountBootstrap, PaperExposureValuation, PaperLedger,
+    FeeSchedule, LiquidityRole, PaperAccountBootstrap, PaperExecutionConfig,
+    PaperExecutionConfigInput, PaperExecutionRuntime, PaperExposureValuation, PaperLedger,
     PaperLedgerConfig, PaperOrderLifecycle, PaperOrderState, PaperSessionCalendarError,
-    PaperStateError, PaperVenueSession, PaperVenueSessionCalendar,
+    PaperStartError, PaperStateError, PaperVenueSession, PaperVenueSessionCalendar,
 };
 use market_squawk_domain::{
     AccountId, Currency, Denomination, InstrumentDefinitionRevision, InstrumentExecutionTerms,
@@ -12,8 +14,79 @@ use market_squawk_domain::{
     SourceIdentifier, TickSize, Timestamp, VenueId,
 };
 use rust_decimal::Decimal;
+use tokio::sync::Semaphore;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+#[tokio::test]
+async fn oversized_combined_event_capacity_is_rejected_before_tokio_construction() -> TestResult {
+    let usd = Currency::try_from("USD")?;
+    let venue = VenueId::try_from("coinbase")?;
+    let calendar = PaperVenueSessionCalendar::try_new(
+        SourceIdentifier::try_from("capacity-calendar")?,
+        RuleVersion::new(1)?,
+        venue,
+        "UTC",
+        vec![PaperVenueSession::try_new(
+            SourceIdentifier::try_from("capacity-session")?,
+            Timestamp::from_unix_nanos(i64::MIN),
+            Timestamp::from_unix_nanos(i64::MAX),
+        )?],
+    )?;
+    let command_capacity = NonZeroUsize::new(Semaphore::MAX_PERMITS)
+        .ok_or("Tokio command capacity is not representable")?;
+    let config = PaperExecutionConfig::try_new(PaperExecutionConfigInput {
+        configuration_version: NonZeroU64::MIN,
+        deterministic_seed: [0; 32],
+        command_capacity,
+        command_maximum_bytes: NonZeroU32::new(64 * 1024).ok_or("zero command bytes")?,
+        market_capacity: NonZeroUsize::MIN,
+        market_maximum_bytes: NonZeroU32::MAX,
+        audit_capacity: NonZeroUsize::MIN,
+        audit_maximum_bytes: NonZeroU32::MAX,
+        maximum_orders: NonZeroUsize::MIN,
+        maximum_fills: NonZeroUsize::MIN,
+        maximum_idempotency_keys: NonZeroUsize::MIN,
+        maximum_archived_orders: NonZeroUsize::MIN,
+        minimum_latency_nanos: 0,
+        maximum_latency_nanos: 0,
+        cancel_latency_nanos: 0,
+        day_session_calendar: calendar,
+        maximum_participation_basis_points: 10_000,
+        impact_basis_points_per_level: 0,
+        reporting_currency: usd,
+        ledger_maximum_accounts: NonZeroUsize::MIN,
+        ledger_maximum_balances: NonZeroUsize::MIN,
+        ledger_maximum_positions: NonZeroUsize::MIN,
+        allow_short: false,
+        exposure_valuation: PaperExposureValuation::OpenCost,
+        abort_join_deadline: Duration::from_secs(1),
+        fee_schedule: FeeSchedule::try_new(0, 0, Money::new(Decimal::ZERO, usd), None, 2)?,
+    })?;
+
+    let account_id = AccountId::from_str("50000000-0000-0000-0000-000000000099")?;
+    let result = PaperExecutionRuntime::try_start(
+        config,
+        [PaperAccountBootstrap {
+            account_id,
+            revision: NonZeroU64::MIN,
+            eligible: true,
+            cash: vec![Money::new(Decimal::ONE, usd)],
+            capital: Money::new(Decimal::ONE, usd),
+            peak_capital: Money::new(Decimal::ONE, usd),
+            gross_exposure: Money::new(Decimal::ZERO, usd),
+            realized_loss: Money::new(Decimal::ZERO, usd),
+            realized_pnl: Money::new(Decimal::ZERO, usd),
+            positions: Vec::new(),
+            position_cost_basis: Vec::new(),
+        }],
+    );
+    assert!(
+        matches!(result, Err(PaperStartError::CapacityOverflow)),
+        "unexpected oversized-capacity startup result: {result:?}"
+    );
+    Ok(())
+}
 
 #[test]
 fn day_session_calendar_is_exact_versioned_and_fails_closed_without_evidence() -> TestResult {
