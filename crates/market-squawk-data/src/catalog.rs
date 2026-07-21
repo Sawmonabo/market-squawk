@@ -15,7 +15,7 @@ use market_squawk_platform::{CatalogFileGuard, CatalogWriterGuard, PathError};
 use rusqlite::limits::Limit;
 use rusqlite::{Connection, OpenFlags};
 
-use self::authority::exact_catalog_file_binding;
+pub(crate) use self::authority::exact_catalog_file_binding;
 pub use self::backup::BackupReceipt;
 pub(crate) use self::backup::{
     InstalledBackupCatalog, InstalledCatalogState, VerifiedBackupCatalog,
@@ -140,7 +140,6 @@ impl Catalog {
             max_result_rows: config.max_result_rows,
             result_bytes: config.result_bytes,
             catalog_id: uuid::Uuid::new_v4(),
-            catalog_path: path,
             artifact_root_binding,
         })
     }

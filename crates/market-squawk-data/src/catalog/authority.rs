@@ -946,7 +946,7 @@ fn required_array<const SIZE: usize>(value: Option<Vec<u8>>) -> Result<[u8; SIZE
 }
 
 #[cfg(unix)]
-pub(super) fn exact_catalog_file_binding(
+pub(crate) fn exact_catalog_file_binding(
     file: &File,
     path: &Path,
 ) -> Result<[u8; 32], CatalogError> {
@@ -961,7 +961,7 @@ pub(super) fn exact_catalog_file_binding(
 }
 
 #[cfg(windows)]
-pub(super) fn exact_catalog_file_binding(
+pub(crate) fn exact_catalog_file_binding(
     file: &File,
     path: &Path,
 ) -> Result<[u8; 32], CatalogError> {
@@ -976,7 +976,7 @@ pub(super) fn exact_catalog_file_binding(
 }
 
 #[cfg(not(any(unix, windows)))]
-pub(super) fn exact_catalog_file_binding(
+pub(crate) fn exact_catalog_file_binding(
     _file: &File,
     _path: &Path,
 ) -> Result<[u8; 32], CatalogError> {

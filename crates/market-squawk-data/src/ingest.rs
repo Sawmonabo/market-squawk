@@ -445,7 +445,7 @@ impl AnalyticalDataService {
         artifact_root: market_squawk_platform::ArtifactRoot,
         object_config: ObjectStoreConfig,
     ) -> Result<Self, IngestError> {
-        if authority.catalog_path() != manifests.catalog_path() {
+        if authority.artifact_root_binding() != manifests.catalog_binding() {
             return Err(IngestError::CatalogCompositionMismatch);
         }
         let (authority, objects) =
@@ -461,7 +461,7 @@ impl AnalyticalDataService {
         artifact_root: market_squawk_platform::ArtifactRoot,
         object_config: ObjectStoreConfig,
     ) -> Result<Self, IngestError> {
-        if authority.catalog_path() != manifests.catalog_path() {
+        if authority.artifact_root_binding() != manifests.catalog_binding() {
             return Err(IngestError::CatalogCompositionMismatch);
         }
         let (authority, objects) =
@@ -477,7 +477,7 @@ impl AnalyticalDataService {
         artifact_root: market_squawk_platform::ArtifactRoot,
         object_config: ObjectStoreConfig,
     ) -> Result<Self, IngestError> {
-        if authority.catalog_path() != manifests.catalog_path() {
+        if authority.artifact_root_binding() != manifests.catalog_binding() {
             return Err(IngestError::CatalogCompositionMismatch);
         }
         let (authority, objects) =

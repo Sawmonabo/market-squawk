@@ -3,12 +3,11 @@
 use std::fmt;
 use std::fmt::Write as _;
 use std::mem::size_of;
-use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Instant;
 
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceId, Timestamp};
-use market_squawk_platform::CatalogLocation;
+use market_squawk_platform::{CatalogFileGuard, CatalogLocation};
 use rusqlite::{Connection, OpenFlags, OptionalExtension as _, TransactionBehavior, params};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -17,7 +16,8 @@ use uuid::Uuid;
 use super::{
     DatasetId, DatasetManifestRef, ManifestObject, ManifestPlan, ManifestPlanError, Sha256Digest,
 };
-use crate::{ArtifactRecord, DatasetManifestRecord};
+use crate::catalog::exact_catalog_file_binding;
+use crate::{ArtifactRecord, CatalogError, DatasetManifestRecord};
 
 const REFERENCE_MEMBERSHIP_CHUNK: usize = 128;
 
@@ -81,7 +81,8 @@ impl PinnedDataset {
 pub struct AnalyticalManifestCatalog {
     connection: Mutex<Connection>,
     max_objects_per_generation: usize,
-    catalog_path: PathBuf,
+    catalog_binding: [u8; 32],
+    catalog_file: CatalogFileGuard,
 }
 
 impl fmt::Debug for AnalyticalManifestCatalog {
@@ -107,11 +108,14 @@ impl AnalyticalManifestCatalog {
             return Err(ManifestCatalogError::InvalidConfiguration);
         }
         location.validate_for_open()?;
+        let catalog_file = location.prepare_catalog_file()?;
+        let catalog_binding =
+            exact_catalog_file_binding(&catalog_file.try_clone_file()?, location.path())?;
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_NOFOLLOW;
         let connection = Connection::open_with_flags(location.path(), flags)?;
-        location.validate_for_open()?;
+        catalog_file.validate_identity()?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "trusted_schema", "OFF")?;
         let migrated: bool = connection.query_row(
@@ -122,15 +126,17 @@ impl AnalyticalManifestCatalog {
         if !migrated {
             return Err(ManifestCatalogError::MigrationMissing);
         }
+        catalog_file.validate_identity()?;
         Ok(Self {
             connection: Mutex::new(connection),
             max_objects_per_generation,
-            catalog_path: location.path().to_path_buf(),
+            catalog_binding,
+            catalog_file,
         })
     }
 
-    pub(crate) fn catalog_path(&self) -> &Path {
-        &self.catalog_path
+    pub(crate) const fn catalog_binding(&self) -> [u8; 32] {
+        self.catalog_binding
     }
 
     /// Builds the exact next ingest plan while the process-owned catalog writer is serialized.
@@ -426,6 +432,7 @@ impl AnalyticalManifestCatalog {
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>, ManifestCatalogError> {
+        self.catalog_file.validate_identity()?;
         self.connection
             .lock()
             .map_err(|_| ManifestCatalogError::LockPoisoned)
@@ -501,6 +508,9 @@ pub enum ManifestCatalogError {
     /// SQLite rejected a transaction or retained invariant.
     #[error("analytical catalog SQLite operation failed")]
     Sqlite(#[from] rusqlite::Error),
+    /// Exact catalog-file identity could not be established for analytical composition.
+    #[error("analytical catalog file authority is invalid")]
+    CatalogAuthority(#[from] CatalogError),
 }
 
 fn append_reference_membership(

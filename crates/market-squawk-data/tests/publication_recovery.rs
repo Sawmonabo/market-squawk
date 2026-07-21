@@ -89,6 +89,43 @@ fn a_live_service_excludes_a_second_catalog_from_the_same_artifact_root() -> Tes
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn analytical_composition_rejects_catalog_replacement_between_opens() -> TestResult {
+    let first_directory = tempfile::tempdir()?;
+    let first_paths = LocalPaths::prepare(first_directory.path().join("market-squawk"))?;
+    let first_location = first_paths.catalog()?.clone();
+    let authority = CatalogAuthority::open(test_catalog_config(first_location.clone())?)?;
+
+    let replacement_directory = tempfile::tempdir()?;
+    let replacement_paths =
+        LocalPaths::prepare(replacement_directory.path().join("market-squawk"))?;
+    let replacement_location = replacement_paths.catalog()?.clone();
+    drop(CatalogAuthority::open(test_catalog_config(
+        replacement_location.clone(),
+    )?)?);
+
+    let displaced = first_location
+        .path()
+        .with_file_name("displaced-catalog.sqlite3");
+    std::fs::rename(first_location.path(), displaced)?;
+    std::fs::rename(replacement_location.path(), first_location.path())?;
+    let manifests = AnalyticalManifestCatalog::open(&first_location, 8)?;
+
+    let composition = AnalyticalDataService::initialize(
+        authority,
+        manifests,
+        first_paths.artifacts()?.clone(),
+        ObjectStoreConfig::try_new(1024 * 1024, 32, Duration::from_secs(60))?,
+    );
+
+    assert!(matches!(
+        composition,
+        Err(IngestError::CatalogCompositionMismatch)
+    ));
+    Ok(())
+}
+
 #[test]
 fn a_catalog_rejects_a_replacement_directory_at_the_same_artifact_path() -> TestResult {
     let directory = tempfile::tempdir()?;
