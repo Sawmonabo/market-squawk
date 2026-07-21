@@ -16,7 +16,6 @@ use sha2::{Digest, Sha256};
 use super::{FredDataset, FredNamespace, FredSeriesMetadataDocument, FredSourceError};
 
 pub(super) struct CanonicalPageContext {
-    pub(super) prior_revisions_for_first_observation: u32,
     pub(super) payload_digest: [u8; 32],
 }
 
@@ -36,34 +35,15 @@ pub(super) fn canonical_observation_payloads(
         DigestAlgorithm::Sha256,
         page_context.payload_digest,
     ));
-    let mut previous_effective = if page_context.prior_revisions_for_first_observation > 0 {
-        page.observations()
-            .first()
-            .map(|observation| observation.observation_date())
-    } else {
-        None
-    };
-    let mut revision = page_context.prior_revisions_for_first_observation;
     page.observations()
         .iter()
         .map(|observation| {
-            let revision_number = next_revision_number(
-                observation.observation_date(),
-                &mut previous_effective,
-                &mut revision,
-            )?;
-            let source_revision = SourceIdentifier::try_from(format!(
-                "{}:{}:{}:{}:{}",
-                match dataset.namespace {
-                    FredNamespace::Fred => "fred",
-                    FredNamespace::Alfred => "alfred",
-                },
-                dataset.series_id(),
+            let revision_number = revision_number_for_vintage(observation.realtime_start())?;
+            let source_revision = source_revision_identifier(
+                dataset,
                 observation.observation_date(),
                 observation.realtime_start(),
-                observation.realtime_end(),
-            ))
-            .map_err(|_| FredSourceError::Protocol)?;
+            )?;
             let availability = ResearchAvailabilityEvidence::local_first_observed(received_at);
             let provenance = ResearchProvenance::try_new(ResearchProvenanceInput {
                 source_id: source.source_id().clone(),
@@ -126,18 +106,33 @@ pub(super) fn canonical_observation_payloads(
         .collect()
 }
 
-fn next_revision_number(
-    effective: CalendarDate,
-    previous_effective: &mut Option<CalendarDate>,
-    revision: &mut u32,
+fn revision_number_for_vintage(
+    realtime_start: CalendarDate,
 ) -> Result<RevisionNumber, FredSourceError> {
-    if *previous_effective == Some(effective) {
-        *revision = revision.checked_add(1).ok_or(FredSourceError::Protocol)?;
-    } else {
-        *previous_effective = Some(effective);
-        *revision = 1;
-    }
-    RevisionNumber::new(*revision).map_err(|_| FredSourceError::Protocol)
+    const DAYS_FROM_YEAR_ONE_TO_UNIX_EPOCH: i32 = 719_163;
+
+    let one_based_day = realtime_start
+        .days_since_unix_epoch()
+        .checked_add(DAYS_FROM_YEAR_ONE_TO_UNIX_EPOCH)
+        .ok_or(FredSourceError::Protocol)?;
+    let one_based_day = u32::try_from(one_based_day).map_err(|_| FredSourceError::Protocol)?;
+    RevisionNumber::new(one_based_day).map_err(|_| FredSourceError::Protocol)
+}
+
+fn source_revision_identifier(
+    dataset: &FredDataset,
+    effective: CalendarDate,
+    realtime_start: CalendarDate,
+) -> Result<SourceIdentifier, FredSourceError> {
+    SourceIdentifier::try_from(format!(
+        "{}:{}:{effective}:{realtime_start}",
+        match dataset.namespace {
+            FredNamespace::Fred => "fred",
+            FredNamespace::Alfred => "alfred",
+        },
+        dataset.series_id(),
+    ))
+    .map_err(|_| FredSourceError::Protocol)
 }
 
 fn fred_unit_identifier(value: &str) -> Result<SourceIdentifier, FredSourceError> {
@@ -217,51 +212,134 @@ fn exclusive_superseded_at(
 
 #[cfg(test)]
 mod tests {
-    use market_squawk_domain::CalendarDate;
+    use market_squawk_domain::{CalendarDate, SourceIdentifier};
 
-    use super::{exclusive_superseded_at, next_revision_number};
+    use crate::{FredObservationPage, FredParseLimits};
+
+    use super::{FredDataset, FredNamespace};
+    use super::{exclusive_superseded_at, revision_number_for_vintage, source_revision_identifier};
 
     #[test]
-    fn revisions_are_one_based_per_effective_observation_across_page_boundaries()
+    fn provider_vintage_identity_is_window_invariant_ordered_and_exact()
     -> Result<(), Box<dyn std::error::Error>> {
-        let effective = CalendarDate::new(2024, 1, 1)?;
-        let mut previous = None;
-        let mut revision = 0;
+        let page = |realtime_start: &str,
+                    realtime_end: &str,
+                    observations: serde_json::Value|
+         -> Result<Vec<u8>, serde_json::Error> {
+            serde_json::to_vec(&serde_json::json!({
+                "realtime_start": realtime_start,
+                "realtime_end": realtime_end,
+                "observation_start": "2023-01-01",
+                "observation_end": "2023-01-01",
+                "units": "lin",
+                "output_type": 1,
+                "file_type": "json",
+                "order_by": "observation_date",
+                "sort_order": "asc",
+                "count": observations.as_array().map_or(0, Vec::len),
+                "offset": 0,
+                "limit": 100,
+                "observations": observations,
+            }))
+        };
+        let vintage = serde_json::json!({
+            "realtime_start": "2024-01-15",
+            "realtime_end": "2024-01-31",
+            "date": "2023-01-01",
+            "value": "101.25",
+        });
+        let later_vintage = serde_json::json!({
+            "realtime_start": "2024-02-01",
+            "realtime_end": "9999-12-31",
+            "date": "2023-01-01",
+            "value": "102.5",
+        });
+        let limits = FredParseLimits::production_defaults();
+        let narrow = FredObservationPage::parse(
+            &page(
+                "2024-01-01",
+                "2024-01-31",
+                serde_json::json!([vintage.clone()]),
+            )?,
+            limits,
+        )?;
+        let wide = FredObservationPage::parse(
+            &page(
+                "2023-01-01",
+                "2024-12-31",
+                serde_json::json!([vintage, later_vintage]),
+            )?,
+            limits,
+        )?;
+        let narrow_vintage = &narrow.observations()[0];
+        let wide_vintage = &wide.observations()[0];
+        let narrow_revision = revision_number_for_vintage(narrow_vintage.realtime_start())?;
+        let wide_revision = revision_number_for_vintage(wide_vintage.realtime_start())?;
+        assert_eq!(narrow_revision, wide_revision);
         assert_eq!(
-            next_revision_number(effective, &mut previous, &mut revision)?.get(),
-            1
+            wide_revision,
+            revision_number_for_vintage(wide_vintage.realtime_start())?
         );
-        assert_eq!(
-            next_revision_number(effective, &mut previous, &mut revision)?.get(),
-            2
+        assert!(
+            revision_number_for_vintage(wide.observations()[1].realtime_start())?.get()
+                > wide_revision.get()
         );
 
-        let mut prior_page_effective = Some(effective);
-        let mut prior_page_revisions = 2;
+        let narrow_dataset = FredDataset {
+            namespace: FredNamespace::Alfred,
+            series_id: "CPIAUCSL".to_owned(),
+            realtime_start: narrow.realtime_start(),
+            realtime_end: narrow.realtime_end(),
+        };
+        let wide_dataset = FredDataset {
+            namespace: FredNamespace::Alfred,
+            series_id: "CPIAUCSL".to_owned(),
+            realtime_start: wide.realtime_start(),
+            realtime_end: wide.realtime_end(),
+        };
+        let effective = narrow_vintage.observation_date();
+        let expected_identifier =
+            SourceIdentifier::try_from("alfred:CPIAUCSL:2023-01-01:2024-01-15")?;
         assert_eq!(
-            next_revision_number(
+            source_revision_identifier(
+                &narrow_dataset,
                 effective,
-                &mut prior_page_effective,
-                &mut prior_page_revisions
-            )?
-            .get(),
-            3
+                narrow_vintage.realtime_start()
+            )?,
+            expected_identifier
         );
-        Ok(())
-    }
+        assert_eq!(
+            source_revision_identifier(&wide_dataset, effective, wide_vintage.realtime_start())?,
+            expected_identifier
+        );
 
-    #[test]
-    fn closed_realtime_end_becomes_checked_exclusive_boundary()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let january = exclusive_superseded_at(CalendarDate::new(2024, 1, 31)?)?
+        let january = exclusive_superseded_at(narrow_vintage.realtime_end())?
             .and_then(|value| value.calendar_date_value())
             .ok_or("missing January boundary")?;
-        let leap_day = exclusive_superseded_at(CalendarDate::new(2024, 2, 29)?)?
-            .and_then(|value| value.calendar_date_value())
-            .ok_or("missing leap-day boundary")?;
         assert_eq!(january, CalendarDate::new(2024, 2, 1)?);
-        assert_eq!(leap_day, CalendarDate::new(2024, 3, 1)?);
-        assert!(exclusive_superseded_at(CalendarDate::new(9999, 12, 31)?)?.is_none());
+        assert!(exclusive_superseded_at(wide.observations()[1].realtime_end())?.is_none());
+
+        let divergent_same_version = serde_json::json!([
+            {
+                "realtime_start": "2024-01-15",
+                "realtime_end": "2024-01-31",
+                "date": "2023-01-01",
+                "value": "101.25",
+            },
+            {
+                "realtime_start": "2024-01-15",
+                "realtime_end": "2024-02-29",
+                "date": "2023-01-01",
+                "value": ".",
+            }
+        ]);
+        assert!(
+            FredObservationPage::parse(
+                &page("2024-01-01", "2024-02-29", divergent_same_version)?,
+                limits,
+            )
+            .is_err()
+        );
         Ok(())
     }
 }

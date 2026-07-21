@@ -7,10 +7,11 @@ use market_squawk_domain::{
     CalendarDate, DataQuality, EffectiveInterval, ExactPayloadEvidence, SourceIdentifier, Timestamp,
 };
 use market_squawk_sources::{
-    AuthorizationMode, CoverageDomain, DiscoveryBatch, DiscoveryRequest, ExtractionAuthority,
-    ExtractionBatch, ExtractionRecord, ExtractionRequest, ExtractionSource, ExtractionSourceError,
-    HistoricalCapability, NetworkAccessPolicy, SourceClass, SourceError, SourceMetadata,
-    SourceMetadataProvider, SourceObject, payload_matches_exact_evidence,
+    AuthorizationMode, CURRENT_RESEARCH_RECORD_SCHEMA, CoverageDomain, DiscoveryBatch,
+    DiscoveryRequest, ExtractionAuthority, ExtractionBatch, ExtractionRecord, ExtractionRequest,
+    ExtractionSource, ExtractionSourceError, HistoricalCapability, NetworkAccessPolicy,
+    SourceClass, SourceError, SourceMetadata, SourceMetadataProvider, SourceObject,
+    payload_matches_exact_evidence,
 };
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -342,7 +343,6 @@ impl FredSource {
             &dataset,
             &fetched.page,
             CanonicalPageContext {
-                prior_revisions_for_first_observation: object.prior_revisions_for_first_observation,
                 payload_digest: fetched.digest,
             },
             &series_metadata,
@@ -403,7 +403,6 @@ impl FredSource {
         let mut expected_count = None;
         let mut previous_observation_date = None;
         let mut previous_realtime_start = None;
-        let mut revisions_for_previous_observation = 0_u32;
         while objects.len() < usize::from(request.max_results()) {
             let fetched = self
                 .fetch_page(
@@ -429,14 +428,6 @@ impl FredSource {
                 ));
             }
             expected_count = Some(fetched.page.count());
-            let prior_revisions_for_first_observation = fetched
-                .page
-                .observations()
-                .first()
-                .filter(|observation| {
-                    previous_observation_date == Some(observation.observation_date())
-                })
-                .map_or(0, |_| revisions_for_previous_observation);
             for observation in fetched.page.observations() {
                 let observation_date = observation.observation_date();
                 if previous_observation_date.is_some_and(|previous| observation_date < previous) {
@@ -452,13 +443,8 @@ impl FredSource {
                             SourceError::InvalidProtocolState,
                         ));
                     }
-                    revisions_for_previous_observation =
-                        revisions_for_previous_observation.checked_add(1).ok_or(
-                            ExtractionSourceError::Source(SourceError::InvalidProtocolState),
-                        )?;
                 } else {
                     previous_observation_date = Some(observation_date);
-                    revisions_for_previous_observation = 1;
                 }
                 previous_realtime_start = Some(observation.realtime_start());
             }
@@ -467,7 +453,6 @@ impl FredSource {
             let object_id = page_object_id(
                 offset,
                 self.discovery_page_records,
-                prior_revisions_for_first_observation,
                 fetched.digest,
                 metadata_digest,
             )
@@ -567,7 +552,6 @@ impl FredSource {
             &dataset,
             &fetched.page,
             CanonicalPageContext {
-                prior_revisions_for_first_observation: object.prior_revisions_for_first_observation,
                 payload_digest: fetched.digest,
             },
             &series_metadata,
@@ -575,7 +559,7 @@ impl FredSource {
             ingested_at,
         )
         .map_err(map_adapter_error)?;
-        let schema = SourceIdentifier::try_from("market-squawk-research-v3")
+        let schema = SourceIdentifier::try_from(CURRENT_RESEARCH_RECORD_SCHEMA)
             .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?;
         let records = canonical
             .into_iter()

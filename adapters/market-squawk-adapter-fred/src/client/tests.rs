@@ -13,11 +13,12 @@ use market_squawk_domain::{
 use market_squawk_sources::{
     ApiEndpointRule, AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode,
     AuthorizationSubjectResolutionError, AuthorizationSubjectResolver, BackoffPolicy, BudgetScope,
-    CoverageDomain, EndpointPolicy, ExtractionAuthority, ExtractionRequest, ExtractionSource,
-    FreshnessPolicy, HistoricalCapability, NetworkAccessPolicy, PathScope, ProviderBudgetPolicy,
-    QueryParameterRule, QuerySensitivity, SourceCapabilities, SourceClass, SourceCoverage,
-    SourceError, SourceMetadata, SourceMetadataInput, SourceMetadataProvider, SourceObject,
-    SourceProtocolProfile, payload_matches_exact_evidence,
+    CURRENT_RESEARCH_RECORD_SCHEMA, CoverageDomain, EndpointPolicy, ExtractionAuthority,
+    ExtractionRequest, ExtractionSource, FreshnessPolicy, HistoricalCapability,
+    NetworkAccessPolicy, PathScope, ProviderBudgetPolicy, QueryParameterRule, QuerySensitivity,
+    SourceCapabilities, SourceClass, SourceCoverage, SourceError, SourceMetadata,
+    SourceMetadataInput, SourceMetadataProvider, SourceObject, SourceProtocolProfile,
+    payload_matches_exact_evidence,
 };
 use sha2::Digest;
 use tokio_util::sync::CancellationToken;
@@ -272,7 +273,7 @@ async fn durable_extraction_emits_canonical_schema_v3_macro_observations() -> Te
 
     assert_eq!(batch.records().len(), 2);
     for record in batch.records() {
-        assert_eq!(record.schema().as_str(), "market-squawk-research-v3");
+        assert_eq!(record.schema().as_str(), CURRENT_RESEARCH_RECORD_SCHEMA);
         assert!(payload_matches_exact_evidence(
             record.payload(),
             record.evidence()
