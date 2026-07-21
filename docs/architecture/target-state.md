@@ -114,9 +114,15 @@ domain
 ├── valuation -> domain, analytics, data
 └── mcp -> domain + platform application-service traits, never concrete adapters
 
-adapters -> domain + the contract crate they implement
+provider adapters -> domain + sources + platform contracts; normal/build edges to data are forbidden
+paper adapter -> domain + execution + platform confinement contracts
 app -> all composition roots and concrete service implementations
 ```
+
+An adapter package may receive an explicit development-only edge to a terminal consumer solely for
+an end-to-end integration test. The current exceptions are Kraken to execution/paper and the file
+and portfolio adapters to data. These exceptions never authorize a production edge or runtime call
+from an adapter into data, live, or another terminal consumer.
 
 The dependency graph must remain acyclic. `domain` performs no network, database, filesystem, MCP,
 Python, or model-runtime work. `live` cannot depend on `data`, `platform` catalog code, `mcp`, or

@@ -323,16 +323,17 @@
   "dependency_edge_policy": {
     "source": "cargo metadata --locked --all-features",
     "normal_and_build_edges": "production allowlist",
-    "development_edges": "production allowlist plus only the explicit Kraken execution/paper package-local vertical harness",
+    "development_edges": "production allowlist plus only the explicit package-local vertical harnesses: Kraken to execution/paper, files to data, and portfolio to data",
     "provider_production_edges": [
       "market-squawk-domain",
       "market-squawk-platform",
       "market-squawk-sources"
     ],
-    "provider_forbidden_edges_all_kinds": [
+    "provider_forbidden_edges_normal_and_build": [
       "market-squawk-live",
       "market-squawk-data"
     ],
+    "provider_forbidden_development_edges": "market-squawk-live and market-squawk-data except the exact files-to-data and portfolio-to-data verticals above",
     "hot_path_forbidden_edges_all_kinds": [
       "market-squawk-data",
       "market-squawk-mcp",
