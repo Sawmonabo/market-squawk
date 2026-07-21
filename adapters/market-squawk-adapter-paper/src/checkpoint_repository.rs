@@ -956,6 +956,11 @@ impl PaperCheckpointReceipt {
         self.artifact_digest
     }
 
+    /// Returns the exact restart-content digest verified before this receipt was minted.
+    pub const fn recovery_digest(&self) -> [u8; 32] {
+        self.recovery_digest
+    }
+
     pub fn artifact_reference(&self) -> &Path {
         Path::new(self.artifact_reference.as_ref())
     }

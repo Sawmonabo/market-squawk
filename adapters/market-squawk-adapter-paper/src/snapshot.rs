@@ -384,11 +384,16 @@ impl PaperExecutionCheckpoint {
         Ok(output.into_inner())
     }
 
-    pub(crate) fn recovery_input_digest(&self) -> Result<[u8; 32], PaperCheckpointError> {
+    /// Returns the exact digest of the complete restart input encoded by this checkpoint.
+    pub fn recovery_digest(&self) -> Result<[u8; 32], PaperCheckpointError> {
         let mut output = CheckpointDigestWriter(Sha256::new());
         serde_json::to_writer(&mut output, &self.recovery_wire())
             .map_err(PaperCheckpointError::Encoding)?;
         Ok(output.0.finalize().into())
+    }
+
+    pub(crate) fn recovery_input_digest(&self) -> Result<[u8; 32], PaperCheckpointError> {
+        self.recovery_digest()
     }
 
     pub(crate) fn bind_current_manifest(

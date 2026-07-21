@@ -118,15 +118,21 @@ async fn public_kraken_reaches_live_state_but_both_execution_safety_layers_rejec
     cancellation.cancel();
     let shutdown = tokio::time::timeout(Duration::from_secs(10), runtime.shutdown()).await?;
     assert!(shutdown.is_complete());
-    let persisted_sequence = *shutdown
+    let persisted_checkpoint = *shutdown
         .checkpoint()
+        .as_ref()
+        .map_err(|error| error.to_string())?;
+    let recovery_digest = *shutdown
+        .recovery_content()
         .as_ref()
         .map_err(|error| error.to_string())?;
     let paper = shutdown
         .paper()
         .as_ref()
         .map_err(|error| error.to_string())?;
-    assert_eq!(persisted_sequence, paper.sequence());
+    assert_eq!(persisted_checkpoint.generation().get(), 2);
+    assert_eq!(persisted_checkpoint.sequence(), paper.sequence());
+    assert_eq!(persisted_checkpoint.recovery_digest(), recovery_digest);
     assert!(paper.orders().is_empty());
     assert!(paper.fills().is_empty());
     assert!(paper.positions().is_empty());

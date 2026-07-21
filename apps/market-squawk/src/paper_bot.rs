@@ -524,6 +524,12 @@ impl ProductionPaperBotRuntime {
                 ExecutionDispatcherShutdown::Incomplete,
             ),
         };
+        let recovery_content = match checkpoint.as_ref() {
+            Ok(checkpoint) => {
+                verify_stabilized_checkpoint(&paper, paper_control_timeout, *checkpoint).await
+            }
+            Err(_) => Err(ProductionPaperCheckpointError::FinalContentMismatch),
+        };
         let paper = shutdown_paper(paper, paper_control_timeout).await;
         let task_drain = drain_execution_tasks(&task_reaper, paper_control_timeout).await;
         ProductionPaperBotShutdown {
@@ -531,6 +537,7 @@ impl ProductionPaperBotRuntime {
             supervisor,
             dispatcher_quiesce,
             checkpoint,
+            recovery_content,
             dispatcher,
             paper,
             task_drain,
@@ -546,7 +553,8 @@ pub struct ProductionPaperBotShutdown {
     source_and_live: Result<(), ProductionLiveSourceRuntimeError>,
     supervisor: PaperFinancialSupervisorShutdown,
     dispatcher_quiesce: ExecutionDispatcherQuiesce,
-    checkpoint: Result<u64, ProductionPaperCheckpointError>,
+    checkpoint: Result<ProductionPaperCheckpointEvidence, ProductionPaperCheckpointError>,
+    recovery_content: Result<[u8; 32], ProductionPaperCheckpointError>,
     dispatcher: ExecutionDispatcherShutdown,
     paper: Result<PaperExecutionSnapshot, PaperControlError>,
     task_drain: ExecutionTaskDrain,
@@ -564,12 +572,17 @@ impl ProductionPaperBotShutdown {
                 ExecutionDispatcherQuiesce::Complete | ExecutionDispatcherQuiesce::AlreadyQuiesced
             )
             && self.dispatcher == ExecutionDispatcherShutdown::Complete
+            && matches!(
+                (&self.checkpoint, &self.recovery_content),
+                (Ok(checkpoint), Ok(recovery_digest))
+                    if checkpoint.recovery_digest() == *recovery_digest
+            )
             && self.paper.as_ref().is_ok_and(|paper| {
                 paper.complete()
                     && self
                         .checkpoint
                         .as_ref()
-                        .is_ok_and(|sequence| *sequence == paper.sequence())
+                        .is_ok_and(|checkpoint| checkpoint.sequence() == paper.sequence())
             })
             && self.task_drain.is_complete()
     }
@@ -596,8 +609,14 @@ impl ProductionPaperBotShutdown {
         self.supervisor.reader_closed()
     }
 
-    pub const fn checkpoint(&self) -> &Result<u64, ProductionPaperCheckpointError> {
+    pub const fn checkpoint(
+        &self,
+    ) -> &Result<ProductionPaperCheckpointEvidence, ProductionPaperCheckpointError> {
         &self.checkpoint
+    }
+
+    pub const fn recovery_content(&self) -> &Result<[u8; 32], ProductionPaperCheckpointError> {
+        &self.recovery_content
     }
 
     pub const fn paper(&self) -> &Result<PaperExecutionSnapshot, PaperControlError> {
@@ -716,16 +735,47 @@ pub enum ProductionPaperCheckpointError {
     Allocation,
     #[error("persisted checkpoint sequence did not match the final paper checkpoint")]
     FinalSequenceMismatch,
+    #[error("durable paper checkpoint content did not match the stabilized runtime recovery image")]
+    FinalContentMismatch,
     #[error(transparent)]
     Control(#[from] PaperControlError),
     #[error(transparent)]
     Repository(#[from] PaperCheckpointRepositoryError),
+    #[error(transparent)]
+    Checkpoint(#[from] market_squawk_adapter_paper::PaperCheckpointError),
     #[error(transparent)]
     Dispatch(#[from] market_squawk_execution::ExecutionDispatchError),
     #[error(transparent)]
     Idempotency(#[from] market_squawk_execution::AccountIdempotencySnapshotError),
     #[error(transparent)]
     AccountRecovery(#[from] market_squawk_execution::AccountRecoverySnapshotError),
+}
+
+/// Exact durable identity of the post-acknowledgement paper recovery image.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProductionPaperCheckpointEvidence {
+    generation: std::num::NonZeroU64,
+    sequence: u64,
+    recovery_digest: [u8; 32],
+    artifact_digest: [u8; 32],
+}
+
+impl ProductionPaperCheckpointEvidence {
+    pub const fn generation(self) -> std::num::NonZeroU64 {
+        self.generation
+    }
+
+    pub const fn sequence(self) -> u64 {
+        self.sequence
+    }
+
+    pub const fn recovery_digest(self) -> [u8; 32] {
+        self.recovery_digest
+    }
+
+    pub const fn artifact_digest(self) -> [u8; 32] {
+        self.artifact_digest
+    }
 }
 
 fn validate_strategy_routes(
@@ -818,7 +868,7 @@ async fn persist_paper_checkpoint(
     paper: &PaperExecutionRuntime,
     repository: &mut PaperCheckpointRepository,
     timeout: Duration,
-) -> Result<u64, ProductionPaperCheckpointError> {
+) -> Result<ProductionPaperCheckpointEvidence, ProductionPaperCheckpointError> {
     settle_paper_accounts(dispatcher, accounts.reconciliation_fence()).await?;
     let control = PaperControlContext::try_new(timeout, CancellationToken::new())?;
     let adapter = paper.adapter();
@@ -826,6 +876,41 @@ async fn persist_paper_checkpoint(
     if checkpoint.has_nonterminal_orders() || !accounts.reconciliation_fence().is_current() {
         return Err(ProductionPaperCheckpointError::UnsettledFinancialState);
     }
+    let replay = account_replay(accounts, account_ids)?;
+    let receipt = repository.persist_with_replay(&checkpoint, &replay)?;
+    let persisted_sequence = receipt.sequence();
+    if persisted_sequence != checkpoint.sequence() {
+        return Err(ProductionPaperCheckpointError::FinalSequenceMismatch);
+    }
+    let authority = dispatcher.persistence_acknowledgement()?;
+    adapter.acknowledge_persistence(authority, receipt).await?;
+
+    let control = PaperControlContext::try_new(timeout, CancellationToken::new())?;
+    let stabilized = adapter.checkpoint(control).await?;
+    if stabilized.has_nonterminal_orders() || !accounts.reconciliation_fence().is_current() {
+        return Err(ProductionPaperCheckpointError::UnsettledFinancialState);
+    }
+    let replay = account_replay(accounts, account_ids)?;
+    let receipt = repository.persist_with_replay(&stabilized, &replay)?;
+    let recovery_digest = stabilized.recovery_digest()?;
+    if receipt.sequence() != stabilized.sequence()
+        || receipt.recovery_digest() != recovery_digest
+        || receipt.artifact_digest() != recovery_digest
+    {
+        return Err(ProductionPaperCheckpointError::FinalContentMismatch);
+    }
+    Ok(ProductionPaperCheckpointEvidence {
+        generation: receipt.generation(),
+        sequence: receipt.sequence(),
+        recovery_digest,
+        artifact_digest: receipt.artifact_digest(),
+    })
+}
+
+fn account_replay(
+    accounts: &AccountRiskCoordinator,
+    account_ids: &[market_squawk_domain::AccountId],
+) -> Result<Vec<PaperAccountReplaySnapshot>, ProductionPaperCheckpointError> {
     let mut replay = Vec::new();
     replay
         .try_reserve_exact(account_ids.len())
@@ -836,14 +921,25 @@ async fn persist_paper_checkpoint(
             accounts.snapshot_idempotency(*account_id)?,
         ));
     }
-    let receipt = repository.persist_with_replay(&checkpoint, &replay)?;
-    let persisted_sequence = receipt.sequence();
-    if persisted_sequence != checkpoint.sequence() {
-        return Err(ProductionPaperCheckpointError::FinalSequenceMismatch);
+    Ok(replay)
+}
+
+async fn verify_stabilized_checkpoint(
+    paper: &PaperExecutionRuntime,
+    timeout: Duration,
+    expected: ProductionPaperCheckpointEvidence,
+) -> Result<[u8; 32], ProductionPaperCheckpointError> {
+    let control = PaperControlContext::try_new(timeout, CancellationToken::new())?;
+    let checkpoint = paper.adapter().checkpoint(control).await?;
+    let digest = checkpoint.recovery_digest()?;
+    if checkpoint.has_nonterminal_orders()
+        || checkpoint.sequence() != expected.sequence()
+        || digest != expected.recovery_digest()
+        || digest != expected.artifact_digest()
+    {
+        return Err(ProductionPaperCheckpointError::FinalContentMismatch);
     }
-    let authority = dispatcher.persistence_acknowledgement()?;
-    adapter.acknowledge_persistence(authority, receipt).await?;
-    Ok(persisted_sequence)
+    Ok(digest)
 }
 
 async fn settle_paper_accounts(

@@ -44,5 +44,5 @@ pub use paper_bot::{
     ProductionPaperBotComposition, ProductionPaperBotCompositionError,
     ProductionPaperBotExecutionConfig, ProductionPaperBotRollback, ProductionPaperBotRoute,
     ProductionPaperBotRuntime, ProductionPaperBotShutdown, ProductionPaperBotStartError,
-    ProductionPaperCheckpointError,
+    ProductionPaperCheckpointError, ProductionPaperCheckpointEvidence,
 };
