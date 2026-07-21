@@ -436,6 +436,24 @@ async fn serve_resynchronizing_kraken_sessions(
     Ok(())
 }
 
+async fn serve_one_kraken_session(
+    listener: TcpListener,
+    acknowledgement: String,
+    snapshot: String,
+) -> TestResult {
+    let mut socket = accept_kraken_subscription(&listener).await?;
+    socket.send(Message::Text(acknowledgement.into())).await?;
+    socket.send(Message::Text(snapshot.into())).await?;
+    while let Some(message) = socket.next().await {
+        match message? {
+            Message::Close(_) => return Ok(()),
+            Message::Ping(payload) => socket.send(Message::Pong(payload)).await?,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 async fn observe_silent_generation_rotation(listener: TcpListener) -> TestResult<Duration> {
     let mut first = accept_kraken_subscription(&listener).await?;
     let started_at = std::time::Instant::now();

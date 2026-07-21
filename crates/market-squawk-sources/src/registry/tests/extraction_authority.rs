@@ -83,6 +83,31 @@ fn extraction_authority_fails_closed_when_registry_is_dropped() -> TestResult {
 }
 
 #[test]
+fn provider_backoff_authority_is_narrow_and_revocation_aware() -> TestResult {
+    let at = Timestamp::from_unix_nanos(1_000_000_000);
+    let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
+    let metadata = direct_metadata("backoff-source", "revision-1")?;
+    let registered = registry.register(metadata, at)?;
+    let authority = registry.provider_backoff_authority(&registered)?;
+
+    let deadline = match authority.apply_refusal(0)? {
+        crate::ProviderBackoffDecision::WaitUntil(deadline) => deadline,
+        crate::ProviderBackoffDecision::Unavailable(reason) => {
+            return Err(format!("provider backoff unexpectedly unavailable: {reason:?}").into());
+        }
+    };
+    let _remaining = authority.remaining_wait(deadline)?;
+
+    let replacement = direct_metadata("backoff-source", "revision-2")?;
+    let _current = registry.replace_metadata(&registered, replacement, at)?;
+    assert_eq!(
+        authority.remaining_wait(deadline),
+        Err(crate::ProviderBackoffError::NotCurrent)
+    );
+    Ok(())
+}
+
+#[test]
 fn redirect_hops_are_origin_bound_and_each_consume_one_request_admission() -> TestResult {
     let at = Timestamp::from_unix_nanos(1_000_000_000);
     let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;

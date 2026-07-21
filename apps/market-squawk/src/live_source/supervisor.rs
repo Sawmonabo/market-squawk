@@ -14,8 +14,9 @@ use market_squawk_platform::{
     spawn_process_journal_capture_writer,
 };
 use market_squawk_sources::{
-    AuthoritativeSourceRegistry, BudgetDecision, BudgetUnavailableReason,
-    CaptureGenerationCapabilities, RegisteredSource, RegistryError, SessionId, SourceError,
+    AuthoritativeSourceRegistry, BudgetUnavailableReason, CaptureGenerationCapabilities,
+    ProviderBackoffAuthority, ProviderBackoffDecision, ProviderBackoffError, RegisteredSource,
+    RegistryError, SessionId, SourceError,
 };
 use thiserror::Error;
 use tokio::sync::oneshot;
@@ -63,6 +64,7 @@ pub(super) struct ProductionSourceSupervisor {
     profile: ProductionSourceProfile,
     registry: Option<AuthoritativeSourceRegistry>,
     registered: RegisteredSource,
+    backoff: ProviderBackoffAuthority,
     paths: LocalPaths,
     capture_process: CaptureProcessInfrastructure,
     live_ingress: LiveRuntimeIngress,
@@ -98,11 +100,13 @@ impl ProductionSourceSupervisor {
                 };
             }
         };
+        let backoff = registry.provider_backoff_authority(&registered)?;
         Ok(Self {
             config: config.clone(),
             profile,
             registry: Some(registry),
             registered,
+            backoff,
             paths,
             capture_process,
             live_ingress,
@@ -346,19 +350,15 @@ impl ProductionSourceSupervisor {
         &self,
         cancellation: &CancellationToken,
     ) -> Result<(), ProductionSupervisorError> {
-        let budget = self
-            .registered
-            .budget()
-            .ok_or(ProductionSupervisorError::MissingProviderBudget)?;
-        let decision = budget.apply_refusal(BACKOFF_JITTER_SAMPLE_BASIS_POINTS);
+        let decision = self
+            .backoff
+            .apply_refusal(BACKOFF_JITTER_SAMPLE_BASIS_POINTS)?;
         match decision {
-            BudgetDecision::WaitUntil(deadline) => self.wait_until(cancellation, deadline).await,
-            BudgetDecision::Unavailable(reason) => {
-                Err(ProductionSupervisorError::BudgetUnavailable(reason))
+            ProviderBackoffDecision::WaitUntil(deadline) => {
+                self.wait_until(cancellation, deadline).await
             }
-            BudgetDecision::Ready(permit) => {
-                drop(permit);
-                Err(ProductionSupervisorError::UnexpectedBudgetReady)
+            ProviderBackoffDecision::Unavailable(reason) => {
+                Err(ProductionSupervisorError::BudgetUnavailable(reason))
             }
         }
     }
@@ -368,13 +368,7 @@ impl ProductionSourceSupervisor {
         cancellation: &CancellationToken,
         deadline: market_squawk_sources::MonotonicInstant,
     ) -> Result<(), ProductionSupervisorError> {
-        let budget = self
-            .registered
-            .budget()
-            .ok_or(ProductionSupervisorError::MissingProviderBudget)?;
-        let wait = budget
-            .remaining_wait(deadline)
-            .map_err(ProductionSupervisorError::BudgetUnavailable)?;
+        let wait = self.backoff.remaining_wait(deadline)?;
         tokio::select! {
             biased;
             () = cancellation.cancelled() => Ok(()),
@@ -443,14 +437,12 @@ pub enum ProductionSupervisorError {
     IncompleteCaptureShutdown,
     #[error("production source startup observer was dropped")]
     StartupObserverDropped,
-    #[error("production source has no registry-coordinated provider budget")]
-    MissingProviderBudget,
-    #[error("provider budget returned ready after a refusal or closed generation")]
-    UnexpectedBudgetReady,
     #[error("production source generation failed terminally: {0}")]
     TerminalSource(SourceError),
     #[error("production provider budget is unavailable: {0:?}")]
     BudgetUnavailable(BudgetUnavailableReason),
+    #[error(transparent)]
+    ProviderBackoff(#[from] ProviderBackoffError),
     #[error(transparent)]
     AuthorityStore(#[from] LocalAuthorityStateStoreError),
     #[error(transparent)]

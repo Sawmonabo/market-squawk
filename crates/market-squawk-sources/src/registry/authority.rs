@@ -70,6 +70,102 @@ pub struct RegisteredSource {
     lease: Arc<RegistrationLeaseState>,
 }
 
+/// Registration-bound authority for conservative provider backoff between live generations.
+///
+/// This capability deliberately cannot acquire a request permit. It permits only refusal recording
+/// and deadline conversion against the exact coordinated budget retained by one current source
+/// registration.
+#[derive(Debug)]
+pub struct ProviderBackoffAuthority {
+    lease: Arc<RegistrationLeaseState>,
+    budget: SharedProviderBudget,
+}
+
+/// Result of conservatively recording a provider refusal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderBackoffDecision {
+    /// The caller must wait until the inclusive coordinated-budget deadline.
+    WaitUntil(crate::MonotonicInstant),
+    /// The provider budget cannot recover without an external state change.
+    Unavailable(crate::BudgetUnavailableReason),
+}
+
+/// Provider-backoff authority validation or budget failure.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum ProviderBackoffError {
+    /// The registration was replaced, revoked, or its registry was dropped.
+    #[error("provider backoff authority is no longer current")]
+    NotCurrent,
+    /// The registered source has no coordinated provider budget.
+    #[error("registered source has no coordinated provider budget")]
+    MissingProviderBudget,
+    /// A refusal operation unexpectedly produced a request-admission permit.
+    #[error("provider refusal unexpectedly produced request admission")]
+    UnexpectedReady,
+    /// The coordinated provider budget is unavailable.
+    #[error("provider budget is unavailable: {0:?}")]
+    BudgetUnavailable(crate::BudgetUnavailableReason),
+    /// The registration handle failed structural registry validation.
+    #[error(transparent)]
+    Registry(#[from] RegistryError),
+}
+
+impl ProviderBackoffAuthority {
+    fn validate_current(&self) -> Result<(), ProviderBackoffError> {
+        if self.lease.is_current() {
+            Ok(())
+        } else {
+            Err(ProviderBackoffError::NotCurrent)
+        }
+    }
+
+    /// Records one refusal without exposing request-admission authority.
+    ///
+    /// # Errors
+    ///
+    /// Fails after registration invalidation, on terminal budget state, or if the underlying
+    /// refusal operation violates its contract by returning a request permit.
+    pub fn apply_refusal(
+        &self,
+        jitter_sample_basis_points: u16,
+    ) -> Result<ProviderBackoffDecision, ProviderBackoffError> {
+        self.validate_current()?;
+        let decision = match self.budget.apply_refusal(jitter_sample_basis_points) {
+            crate::BudgetDecision::WaitUntil(deadline) => {
+                ProviderBackoffDecision::WaitUntil(deadline)
+            }
+            crate::BudgetDecision::Unavailable(reason) => {
+                ProviderBackoffDecision::Unavailable(reason)
+            }
+            crate::BudgetDecision::Ready(permit) => {
+                drop(permit);
+                return Err(ProviderBackoffError::UnexpectedReady);
+            }
+        };
+        self.validate_current()?;
+        Ok(decision)
+    }
+
+    /// Converts a coordinated monotonic deadline into the remaining local wait duration.
+    ///
+    /// # Errors
+    ///
+    /// Fails after registration invalidation or when the coordinated budget cannot safely observe
+    /// its clock or deadline.
+    pub fn remaining_wait(
+        &self,
+        deadline: crate::MonotonicInstant,
+    ) -> Result<std::time::Duration, ProviderBackoffError> {
+        self.validate_current()?;
+        let remaining = self
+            .budget
+            .remaining_wait(deadline)
+            .map_err(ProviderBackoffError::BudgetUnavailable)?;
+        self.validate_current()?;
+        Ok(remaining)
+    }
+}
+
 /// Cloneable, non-serializable authority for one exact registered extraction revision.
 ///
 /// The authority is minted only after the registry binds an adapter's immutable metadata to the
@@ -190,6 +286,26 @@ impl ExtractionAuthority {
 }
 
 impl AuthoritativeSourceRegistry {
+    /// Mints refusal-only budget authority for one exact current source registration.
+    ///
+    /// # Errors
+    ///
+    /// Rejects stale, revoked, transplanted, or budget-free registrations.
+    pub fn provider_backoff_authority(
+        &self,
+        registered: &RegisteredSource,
+    ) -> Result<ProviderBackoffAuthority, ProviderBackoffError> {
+        self.validate_registered_structure(registered)?;
+        let budget = registered
+            .budget
+            .clone()
+            .ok_or(ProviderBackoffError::MissingProviderBudget)?;
+        Ok(ProviderBackoffAuthority {
+            lease: Arc::clone(&registered.lease),
+            budget,
+        })
+    }
+
     /// Mints extraction authority for an exact current registration and adapter metadata identity.
     ///
     /// # Errors
