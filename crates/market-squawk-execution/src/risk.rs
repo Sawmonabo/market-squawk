@@ -305,6 +305,7 @@ impl RiskService {
                     &intent,
                     *market,
                     None,
+                    None,
                     self.config.policy,
                     intent.expires_at().min(self.config.policy_valid_until),
                 );
@@ -327,6 +328,7 @@ impl RiskService {
                     approval_id,
                     &intent,
                     *market,
+                    None,
                     None,
                     self.config.policy,
                     intent.expires_at().min(self.config.policy_valid_until),
@@ -377,6 +379,7 @@ impl RiskService {
                 &intent,
                 *market,
                 Some(&authority),
+                execution_price_bound,
                 self.config.policy,
                 intent
                     .expires_at()
@@ -399,6 +402,7 @@ impl RiskService {
                 &intent,
                 *market,
                 Some(&authority),
+                None,
                 self.config.policy,
                 intent
                     .expires_at()
@@ -427,6 +431,7 @@ impl RiskService {
                     &intent,
                     *market,
                     Some(&authority),
+                    Some(execution_price_bound),
                     self.config.policy,
                     intent
                         .expires_at()
@@ -463,6 +468,7 @@ impl RiskService {
                     &intent,
                     *market,
                     Some(&authority),
+                    Some(execution_price_bound),
                     self.config.policy,
                     valid_until,
                 );
@@ -481,6 +487,7 @@ impl RiskService {
             &intent,
             *market,
             Some(&authority),
+            Some(execution_price_bound),
             self.config.policy,
             valid_until,
         );

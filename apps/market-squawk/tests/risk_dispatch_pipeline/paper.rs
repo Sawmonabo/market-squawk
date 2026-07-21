@@ -602,6 +602,17 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
         .find(|order| order.order_id() == order_ids[3])
         .ok_or("paper order missing from retried reconciliation")?;
     assert_eq!(observed.status(), ReconciledOrderStatus::Filled);
+    let observed_maximum = observed
+        .maximum_fill_price()
+        .ok_or("filled paper reconciliation omitted maximum individual fill price")?;
+    let approved_maximum = execution_adapter
+        .execution_price_bounds
+        .lock()
+        .map_err(|_| "paper execution-price bounds poisoned")?
+        .get(&order_ids[3])
+        .copied()
+        .ok_or("filled paper order omitted its approved execution-price bound")?;
+    assert!(observed_maximum <= approved_maximum);
     assert_eq!(
         execution_adapter
             .acknowledgement_calls
@@ -741,6 +752,10 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
     assert_eq!(continuation_fills.len(), 2);
     assert_eq!(continuation_fills[0].quantity().get(), 100);
     assert_eq!(continuation_fills[1].quantity().get(), 50);
+    for fill in &continuation_fills {
+        assert!(fill.maximum_price() >= fill.average_price());
+        assert!(fill.maximum_price() <= approved_maximum);
+    }
     assert_eq!(
         continuation_fills[0].liquidity(),
         market_squawk_adapter_paper::LiquidityRole::Taker
@@ -770,9 +785,41 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
 
     let checkpoint = paper_adapter.checkpoint(paper_control()?).await?;
     assert!(checkpoint.complete());
-    assert_eq!(checkpoint.schema_version(), 5);
+    assert_eq!(checkpoint.schema_version(), 6);
     assert!(checkpoint.encode(1).is_err());
     let encoded_checkpoint = checkpoint.encode(1024 * 1024)?;
+    let checkpoint_value: serde_json::Value = serde_json::from_slice(&encoded_checkpoint)?;
+    let archived_orders = checkpoint_value["archived_orders"]
+        .as_array()
+        .ok_or("checkpoint archived orders are not an array")?;
+    let filled_order_index = archived_orders
+        .iter()
+        .position(|order| order["order_id"].as_str() == Some(order_ids[3].to_string().as_str()))
+        .ok_or("filled order missing from checkpoint archive")?;
+    let maximum_execution_price = archived_orders[filled_order_index]["maximum_execution_price"]
+        .as_i64()
+        .ok_or("checkpoint maximum execution price is not an integer")?;
+    let mut over_bound_fill = checkpoint_value.clone();
+    over_bound_fill["archived_orders"][filled_order_index]["maximum_fill_price"] =
+        serde_json::json!(maximum_execution_price + 1);
+    assert!(
+        market_squawk_adapter_paper::PaperExecutionCheckpoint::decode(
+            paper_config.clone(),
+            &serde_json::to_vec(&over_bound_fill)?,
+            1024 * 1024,
+        )
+        .is_err()
+    );
+    let mut previous_schema = checkpoint_value.clone();
+    previous_schema["schema_version"] = serde_json::json!(5);
+    assert!(
+        market_squawk_adapter_paper::PaperExecutionCheckpoint::decode(
+            paper_config.clone(),
+            &serde_json::to_vec(&previous_schema)?,
+            1024 * 1024,
+        )
+        .is_err()
+    );
     let mut incompatible_input = paper_config.input().clone();
     incompatible_input.fee_schedule = FeeSchedule::try_new(
         0,
@@ -905,6 +952,11 @@ async fn assert_accepted(
     reader: &mut ExecutionAuditReader,
     order_id: OrderId,
 ) -> TestResult<[u8; 32]> {
+    let risk_approved = wait_for_audit(reader, ExecutionAuditKind::RiskApproved)
+        .await
+        .map_err(|error| {
+            std::io::Error::other(format!("order {order_id} was not risk-approved: {error}"))
+        })?;
     let accepted = wait_for_audit(reader, ExecutionAuditKind::DispatchAccepted)
         .await
         .map_err(|error| {
@@ -917,5 +969,16 @@ async fn assert_accepted(
         ))
         .into());
     }
-    Ok(accepted.intent_digest().as_bytes())
+    if risk_approved.order_id() != order_id
+        || risk_approved.execution_price_bound() != accepted.execution_price_bound()
+        || risk_approved.execution_identity_digest() != accepted.execution_identity_digest()
+    {
+        return Err(std::io::Error::other(format!(
+            "risk and dispatch execution identities differ for order {order_id}"
+        ))
+        .into());
+    }
+    accepted
+        .execution_identity_digest()
+        .ok_or_else(|| std::io::Error::other("accepted audit omitted execution identity").into())
 }

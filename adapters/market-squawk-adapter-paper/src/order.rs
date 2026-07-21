@@ -38,6 +38,7 @@ pub(crate) struct PaperOrder {
     pub(crate) lifecycle: PaperOrderLifecycle,
     pub(crate) cumulative_fee: Money,
     pub(crate) weighted_fill_ticks: i128,
+    pub(crate) maximum_fill_price: Option<PriceTicks>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -70,6 +71,7 @@ pub(crate) struct PaperOrderRecoveryWire {
     last_sequence: u64,
     cumulative_fee: Money,
     weighted_fill_ticks: i128,
+    maximum_fill_price: Option<PriceTicks>,
 }
 
 impl PaperOrder {
@@ -114,6 +116,7 @@ impl PaperOrder {
             lifecycle,
             cumulative_fee: Money::new(Decimal::ZERO, currency),
             weighted_fill_ticks: 0,
+            maximum_fill_price: None,
         })
     }
 
@@ -128,7 +131,9 @@ impl PaperOrder {
         fill: PaperFill,
         sequence: u64,
     ) -> Result<(), PaperStateError> {
-        if !self.execution_price_bound.permits(fill.average_price()) {
+        if !self.execution_price_bound.permits(fill.maximum_price())
+            || fill.maximum_price() < fill.average_price()
+        {
             return Err(PaperStateError::InvalidTransition);
         }
         self.lifecycle.apply_fill(fill.quantity(), sequence)?;
@@ -143,6 +148,12 @@ impl PaperOrder {
             .weighted_fill_ticks
             .checked_add(weighted)
             .ok_or(PaperStateError::QuantityOverflow)?;
+        self.maximum_fill_price = Some(
+            self.maximum_fill_price
+                .map_or(fill.maximum_price(), |current| {
+                    current.max(fill.maximum_price())
+                }),
+        );
         Ok(())
     }
 
@@ -173,7 +184,8 @@ impl PaperOrder {
     }
 
     pub(crate) fn input_digest(&self) -> [u8; 32] {
-        self.intent_digest.as_bytes()
+        self.execution_price_bound
+            .order_audit_digest(self.intent_digest)
     }
 
     pub(crate) fn recovery_wire(&self) -> PaperOrderRecoveryWire {
@@ -205,6 +217,7 @@ impl PaperOrder {
             last_sequence: self.lifecycle.last_sequence(),
             cumulative_fee: self.cumulative_fee,
             weighted_fill_ticks: self.weighted_fill_ticks,
+            maximum_fill_price: self.maximum_fill_price,
         }
     }
 
@@ -226,6 +239,19 @@ impl PaperOrder {
                 .and_then(|ticks| i64::try_from(ticks).ok())
                 .is_some_and(|ticks| ticks > 0 && ticks <= wire.maximum_execution_price.get())
         };
+        let maximum_fill_valid = match (fill_lots, wire.maximum_fill_price) {
+            (0, None) => true,
+            (filled, Some(maximum)) if filled > 0 => {
+                maximum.get() > 0
+                    && maximum.get() <= wire.maximum_execution_price.get()
+                    && wire
+                        .weighted_fill_ticks
+                        .checked_div(i128::from(filled))
+                        .and_then(|ticks| i64::try_from(ticks).ok())
+                        .is_some_and(|average| maximum.get() >= average)
+            }
+            _ => false,
+        };
         let execution_price_bound = ExecutionPriceBound::try_new(wire.maximum_execution_price)
             .map_err(|_| PaperStateError::InvalidTransition)?;
         if !price_shape_valid
@@ -240,6 +266,7 @@ impl PaperOrder {
             || wire.cumulative_fee.currency() != wire.terms.quote_currency()
             || wire.cumulative_fee.amount().is_sign_negative()
             || !average_fill_valid
+            || !maximum_fill_valid
             || wire.weighted_fill_ticks.is_negative()
             || wire.state == PaperOrderState::New
             || (matches!(wire.order_type, OrderType::Market | OrderType::Limit) && !wire.triggered)
@@ -278,6 +305,7 @@ impl PaperOrder {
             lifecycle,
             cumulative_fee: wire.cumulative_fee,
             weighted_fill_ticks: wire.weighted_fill_ticks,
+            maximum_fill_price: wire.maximum_fill_price,
         })
     }
 }

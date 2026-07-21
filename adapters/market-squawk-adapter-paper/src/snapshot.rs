@@ -28,6 +28,7 @@ pub struct PaperOrderSnapshot {
     requested: QuantityLots,
     cumulative_filled: QuantityLots,
     average_fill_price: Option<PriceTicks>,
+    maximum_fill_price: Option<PriceTicks>,
     maximum_execution_price: PriceTicks,
     cumulative_fees: Money,
     accepted_at: Timestamp,
@@ -45,6 +46,7 @@ impl PaperOrderSnapshot {
             requested: order.quantity,
             cumulative_filled: order.lifecycle.cumulative_filled(),
             average_fill_price: order.average_fill_price(),
+            maximum_fill_price: order.maximum_fill_price,
             maximum_execution_price: order.execution_price_bound.maximum_price(),
             cumulative_fees: order.cumulative_fee,
             accepted_at: order.accepted_at,
@@ -71,6 +73,9 @@ impl PaperOrderSnapshot {
     }
     pub const fn average_fill_price(&self) -> Option<PriceTicks> {
         self.average_fill_price
+    }
+    pub const fn maximum_fill_price(&self) -> Option<PriceTicks> {
+        self.maximum_fill_price
     }
     pub const fn maximum_execution_price(&self) -> PriceTicks {
         self.maximum_execution_price
@@ -100,6 +105,7 @@ pub struct PaperFillSnapshot {
     event_at: Timestamp,
     quantity: QuantityLots,
     average_price: PriceTicks,
+    maximum_price: PriceTicks,
     notional: Money,
     fee: Money,
     liquidity: LiquidityRole,
@@ -116,6 +122,7 @@ impl PaperFillSnapshot {
         event_at: Timestamp,
         quantity: QuantityLots,
         average_price: PriceTicks,
+        maximum_price: PriceTicks,
         notional: Money,
         fee: Money,
         liquidity: LiquidityRole,
@@ -126,6 +133,7 @@ impl PaperFillSnapshot {
             event_at,
             quantity,
             average_price,
+            maximum_price,
             notional,
             fee,
             liquidity,
@@ -145,6 +153,9 @@ impl PaperFillSnapshot {
     }
     pub const fn average_price(self) -> PriceTicks {
         self.average_price
+    }
+    pub const fn maximum_price(self) -> PriceTicks {
+        self.maximum_price
     }
     pub const fn notional(self) -> Money {
         self.notional
@@ -306,6 +317,7 @@ struct FillRecoveryWire {
     event_at: Timestamp,
     quantity: QuantityLots,
     average_price: PriceTicks,
+    maximum_price: PriceTicks,
     notional: Money,
     fee: Money,
     liquidity: LiquidityRole,
@@ -396,6 +408,7 @@ impl PaperExecutionCheckpoint {
                     event_at: fill.event_at,
                     quantity: fill.quantity,
                     average_price: fill.average_price,
+                    maximum_price: fill.maximum_price,
                     notional: fill.notional,
                     fee: fill.fee,
                     liquidity: fill.liquidity,
@@ -415,6 +428,7 @@ impl PaperExecutionCheckpoint {
                     event_at: fill.event_at,
                     quantity: fill.quantity,
                     average_price: fill.average_price,
+                    maximum_price: fill.maximum_price,
                     notional: fill.notional,
                     fee: fill.fee,
                     liquidity: fill.liquidity,
@@ -627,6 +641,7 @@ impl Write for BoundedCheckpointWriter {
 struct FillTotals {
     quantity: i64,
     weighted_ticks: i128,
+    maximum_price: Option<PriceTicks>,
     fees: Decimal,
     maker_notional: Decimal,
     taker_notional: Decimal,
@@ -655,7 +670,8 @@ fn validate_fills(
             || fill.sequence > order.lifecycle.last_sequence()
             || fill.quantity.get() == 0
             || fill.average_price.get() <= 0
-            || !order.execution_price_bound.permits(fill.average_price)
+            || fill.maximum_price < fill.average_price
+            || !order.execution_price_bound.permits(fill.maximum_price)
             || fill.event_at < order.eligible_at
             || fill.event_at > order.expires_at
             || fill.notional.currency() != order.terms.quote_currency()
@@ -680,6 +696,9 @@ fn validate_fills(
                     .ok_or(PaperCheckpointError::InvalidFill)?,
             )
             .ok_or(PaperCheckpointError::InvalidFill)?;
+        total.maximum_price = Some(total.maximum_price.map_or(fill.maximum_price, |current| {
+            current.max(fill.maximum_price)
+        }));
         total.fees = total
             .fees
             .checked_add(fill.fee.amount())
@@ -711,6 +730,7 @@ fn validate_fills(
             fill.event_at,
             fill.quantity,
             fill.average_price,
+            fill.maximum_price,
             fill.notional,
             fill.fee,
             fill.liquidity,
@@ -720,6 +740,7 @@ fn validate_fills(
         let total = totals.get(&order.order_id).copied().unwrap_or_default();
         if total.quantity != order.lifecycle.cumulative_filled().get()
             || total.weighted_ticks != order.weighted_fill_ticks
+            || total.maximum_price != order.maximum_fill_price
             || total.fees != order.cumulative_fee.amount()
         {
             return Err(PaperCheckpointError::InvalidFill);

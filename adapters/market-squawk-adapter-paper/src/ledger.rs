@@ -100,6 +100,7 @@ struct Reservation {
 pub struct PaperFill {
     quantity: QuantityLots,
     average_price: PriceTicks,
+    maximum_price: PriceTicks,
     notional: Money,
     fee: Money,
     liquidity: LiquidityRole,
@@ -111,6 +112,9 @@ impl PaperFill {
     }
     pub const fn average_price(self) -> PriceTicks {
         self.average_price
+    }
+    pub const fn maximum_price(self) -> PriceTicks {
+        self.maximum_price
     }
     pub const fn notional(self) -> Money {
         self.notional
@@ -507,7 +511,7 @@ impl PaperLedger {
         if reservation.terms != terms {
             return Err(PaperLedgerError::TermsMismatch);
         }
-        let (quantity, notional, weighted_ticks) = aggregate_legs(terms, legs)?;
+        let (quantity, notional, weighted_ticks, maximum_price) = aggregate_legs(terms, legs)?;
         if quantity > reservation.remaining {
             return Err(PaperLedgerError::Overfill);
         }
@@ -703,6 +707,7 @@ impl PaperLedger {
         Ok(PaperFill {
             quantity,
             average_price,
+            maximum_price,
             notional,
             fee,
             liquidity,
@@ -936,13 +941,14 @@ pub(crate) fn checked_notional(
 fn aggregate_legs(
     terms: InstrumentExecutionTerms,
     legs: &[(PriceTicks, QuantityLots)],
-) -> Result<(QuantityLots, Money, i128), PaperLedgerError> {
+) -> Result<(QuantityLots, Money, i128, PriceTicks), PaperLedgerError> {
     if legs.is_empty() {
         return Err(PaperLedgerError::InvalidQuantityOrPrice);
     }
     let mut quantity = QuantityLots::new(0).map_err(|_| PaperLedgerError::Overflow)?;
     let mut notional = Money::new(Decimal::ZERO, terms.quote_currency());
     let mut weighted_ticks = 0_i128;
+    let mut maximum_price = None;
     for (price, leg_quantity) in legs {
         if price.get() <= 0 || leg_quantity.get() == 0 {
             return Err(PaperLedgerError::InvalidQuantityOrPrice);
@@ -960,8 +966,11 @@ fn aggregate_legs(
                     .ok_or(PaperLedgerError::Overflow)?,
             )
             .ok_or(PaperLedgerError::Overflow)?;
+        maximum_price =
+            Some(maximum_price.map_or(*price, |current: PriceTicks| current.max(*price)));
     }
-    Ok((quantity, notional, weighted_ticks))
+    let maximum_price = maximum_price.ok_or(PaperLedgerError::InvalidQuantityOrPrice)?;
+    Ok((quantity, notional, weighted_ticks, maximum_price))
 }
 
 fn adverse_average(

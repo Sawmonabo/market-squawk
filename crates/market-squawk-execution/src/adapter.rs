@@ -688,22 +688,34 @@ pub struct CancelReceipt {
     observed_at: Timestamp,
     cumulative_filled: QuantityLots,
     average_fill_price: Option<PriceTicks>,
+    maximum_fill_price: Option<PriceTicks>,
     cumulative_fees: Money,
 }
 
 impl CancelReceipt {
-    /// Validates a cancellation observation with cumulative fill and fee evidence.
+    /// Validates a cancellation observation with cumulative fill, authoritative maximum-price,
+    /// and fee evidence.
     pub fn try_new(
         order_id: OrderId,
         status: CancelStatus,
         observed_at: Timestamp,
         cumulative_filled: QuantityLots,
         average_fill_price: Option<PriceTicks>,
+        maximum_fill_price: Option<PriceTicks>,
         cumulative_fees: Money,
     ) -> Result<Self, ExecutionStateError> {
-        if (cumulative_filled.get() != 0) != average_fill_price.is_some()
-            || cumulative_fees.amount().is_sign_negative()
-        {
+        let fill_shape_valid = match (
+            cumulative_filled.get(),
+            average_fill_price,
+            maximum_fill_price,
+        ) {
+            (0, None, None) => true,
+            (filled, Some(average), Some(maximum)) => {
+                filled > 0 && average.get() > 0 && maximum.get() > 0 && maximum >= average
+            }
+            _ => false,
+        };
+        if !fill_shape_valid || cumulative_fees.amount().is_sign_negative() {
             return Err(ExecutionStateError::InvalidOrderState);
         }
         Ok(Self {
@@ -712,6 +724,7 @@ impl CancelReceipt {
             observed_at,
             cumulative_filled,
             average_fill_price,
+            maximum_fill_price,
             cumulative_fees,
         })
     }
@@ -730,6 +743,9 @@ impl CancelReceipt {
     }
     pub const fn average_fill_price(self) -> Option<PriceTicks> {
         self.average_fill_price
+    }
+    pub const fn maximum_fill_price(self) -> Option<PriceTicks> {
+        self.maximum_fill_price
     }
     pub const fn cumulative_fees(self) -> Money {
         self.cumulative_fees
@@ -755,20 +771,34 @@ pub struct ReconciledOrder {
     status: ReconciledOrderStatus,
     cumulative_filled: QuantityLots,
     average_fill_price: Option<PriceTicks>,
+    maximum_fill_price: Option<PriceTicks>,
     cumulative_fees: Money,
 }
 
 impl ReconciledOrder {
-    /// Validates fill/price/fee consistency for one backend order observation.
+    /// Validates cumulative fill, average-price, authoritative maximum-price, and fee consistency
+    /// for one backend order observation.
     pub fn try_new(
         order_id: OrderId,
         status: ReconciledOrderStatus,
         cumulative_filled: QuantityLots,
         average_fill_price: Option<PriceTicks>,
+        maximum_fill_price: Option<PriceTicks>,
         cumulative_fees: Money,
     ) -> Result<Self, ExecutionStateError> {
         let has_fill = cumulative_filled.get() != 0;
-        if has_fill != average_fill_price.is_some()
+        let fill_shape_valid = match (
+            cumulative_filled.get(),
+            average_fill_price,
+            maximum_fill_price,
+        ) {
+            (0, None, None) => true,
+            (filled, Some(average), Some(maximum)) => {
+                filled > 0 && average.get() > 0 && maximum.get() > 0 && maximum >= average
+            }
+            _ => false,
+        };
+        if !fill_shape_valid
             || matches!(
                 status,
                 ReconciledOrderStatus::Open
@@ -789,6 +819,7 @@ impl ReconciledOrder {
             status,
             cumulative_filled,
             average_fill_price,
+            maximum_fill_price,
             cumulative_fees,
         })
     }
@@ -803,6 +834,9 @@ impl ReconciledOrder {
     }
     pub const fn average_fill_price(self) -> Option<PriceTicks> {
         self.average_fill_price
+    }
+    pub const fn maximum_fill_price(self) -> Option<PriceTicks> {
+        self.maximum_fill_price
     }
     pub const fn cumulative_fees(self) -> Money {
         self.cumulative_fees

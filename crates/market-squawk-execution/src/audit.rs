@@ -13,7 +13,8 @@ use thiserror::Error;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
 use crate::{
-    ExecutionMarketReference, OrderIntent, OrderIntentDigest, RiskPolicyIdentity, RiskRejectionCode,
+    ExecutionMarketReference, ExecutionPriceBound, OrderIntent, OrderIntentDigest,
+    RiskPolicyIdentity, RiskRejectionCode,
 };
 
 /// Maximum typed rejection reasons retained in a single fixed audit fact.
@@ -79,6 +80,7 @@ pub(crate) struct ExecutionAuditContext {
     assessment_digest: [u8; 32],
     evidence_binding_digest: [u8; 32],
     evidence_present: bool,
+    execution_price_bound: Option<ExecutionPriceBound>,
     policy: RiskPolicyIdentity,
     market_observed_at: Timestamp,
     valid_until: Timestamp,
@@ -90,6 +92,7 @@ impl ExecutionAuditContext {
         intent: &OrderIntent,
         market: ExecutionMarketReference,
         authority: Option<&ConsumedLiveAuthority>,
+        execution_price_bound: Option<ExecutionPriceBound>,
         policy: RiskPolicyIdentity,
         valid_until: Timestamp,
     ) -> Self {
@@ -121,6 +124,7 @@ impl ExecutionAuditContext {
             assessment_digest,
             evidence_binding_digest,
             evidence_present,
+            execution_price_bound,
             policy,
             market_observed_at: market.observed_at(),
             valid_until,
@@ -208,6 +212,17 @@ impl ExecutionAuditEvent {
         } else {
             None
         }
+    }
+    /// Returns the exact risk-minted execution ceiling, or explicit absence for a pre-bound
+    /// rejection.
+    pub const fn execution_price_bound(&self) -> Option<ExecutionPriceBound> {
+        self.context.execution_price_bound
+    }
+    /// Returns the versioned identity binding the canonical intent to its exact execution ceiling.
+    pub fn execution_identity_digest(&self) -> Option<[u8; 32]> {
+        self.context
+            .execution_price_bound
+            .map(|bound| bound.order_audit_digest(self.context.intent_digest))
     }
     pub const fn risk_policy(&self) -> RiskPolicyIdentity {
         self.context.policy

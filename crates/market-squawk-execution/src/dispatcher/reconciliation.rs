@@ -162,6 +162,7 @@ fn validate_order(
         observed.cumulative_filled().get() < previous.cumulative_filled().get()
             || observed.cumulative_fees().currency() != previous.cumulative_fees().currency()
             || observed.cumulative_fees().amount() < previous.cumulative_fees().amount()
+            || observed.maximum_fill_price() < previous.maximum_fill_price()
     });
     let filled = observed.cumulative_filled().get();
     let requested = record.requested_quantity.get();
@@ -170,7 +171,7 @@ fn validate_order(
         || filled > requested
         || record.settlement_currency != Some(observed.cumulative_fees().currency())
         || observed
-            .average_fill_price()
+            .maximum_fill_price()
             .is_some_and(|price| !record.execution_price_bound.permits(price))
         || matches!(observed.status(), ReconciledOrderStatus::Filled) && filled != requested
         || matches!(observed.status(), ReconciledOrderStatus::PartiallyFilled)
@@ -202,7 +203,7 @@ pub(super) fn reconciliation_digest(
     invoked_at: Timestamp,
 ) -> [u8; 32] {
     let mut digest = Sha256::new();
-    digest.update(b"market-squawk/dispatcher-account-reconciliation\0");
+    digest.update(b"market-squawk/dispatcher-account-reconciliation/v2\0");
     digest.update(invoked_at.unix_nanos().to_be_bytes());
     if let Some(source) = state.source_binding() {
         digest.update([1]);
@@ -293,6 +294,13 @@ fn digest_order(digest: &mut Sha256, order: ReconciledOrder) {
         }
         None => digest.update([0]),
     }
+    match order.maximum_fill_price() {
+        Some(price) => {
+            digest.update([1]);
+            digest.update(price.get().to_be_bytes());
+        }
+        None => digest.update([0]),
+    }
     digest_money(digest, order.cumulative_fees());
 }
 
@@ -300,4 +308,49 @@ fn digest_money(digest: &mut Sha256, money: market_squawk_domain::Money) {
     digest.update(money.currency().as_str().as_bytes());
     digest.update(money.amount().mantissa().to_be_bytes());
     digest.update(money.amount().scale().to_be_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use market_squawk_domain::{AccountId, Currency, Money, OrderId, PriceTicks, QuantityLots};
+    use rust_decimal::Decimal;
+
+    use super::{ReconciliationRecordBinding, validate_order};
+    use crate::{
+        ExecutionDispatchError, ExecutionPriceBound, OrderIntentDigest, ReconciledOrder,
+        ReconciledOrderStatus,
+    };
+
+    #[test]
+    fn maximum_individual_fill_above_approved_ceiling_fails_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let usd = Currency::try_from("USD")?;
+        let record = ReconciliationRecordBinding {
+            account_id: AccountId::from_str("50000000-0000-0000-0000-000000000001")?,
+            order_id: OrderId::from_str("20000000-0000-0000-0000-000000000001")?,
+            intent_digest: OrderIntentDigest::from_bytes([7; 32]),
+            account_revision: 1,
+            requested_quantity: QuantityLots::new(2)?,
+            execution_price_bound: ExecutionPriceBound::try_new(PriceTicks::new(10_000))?,
+            settlement_currency: Some(usd),
+            previous: None,
+            was_reconciliation: true,
+        };
+        let observed = ReconciledOrder::try_new(
+            record.order_id,
+            ReconciledOrderStatus::Filled,
+            record.requested_quantity,
+            Some(PriceTicks::new(9_900)),
+            Some(PriceTicks::new(10_001)),
+            Money::new(Decimal::ZERO, usd),
+        )?;
+
+        assert_eq!(
+            validate_order(&record, observed),
+            Err(ExecutionDispatchError::AccountReplacementRejected)
+        );
+        Ok(())
+    }
 }

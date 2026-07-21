@@ -22,7 +22,7 @@ pub const MAX_EXECUTION_MARKET_LEVELS_PER_SIDE: usize = 64;
 // schema; shared lease allocations already exist before queue admission and are not queue-owned.
 pub(crate) const APPROVAL_COMMAND_RETAINED_BYTE_CEILING: usize = 64 * 1024;
 
-/// Positive hard ceiling for the average execution price of one approved order.
+/// Positive hard ceiling for every individual fill price of one approved order.
 ///
 /// Risk derives this bound with checked fixed-point arithmetic and reserves account resources at
 /// its maximum price. Carrying it as a distinct type prevents side-aware slippage semantics from
@@ -45,14 +45,23 @@ impl ExecutionPriceBound {
         Ok(Self { maximum_price })
     }
 
-    /// Returns the inclusive maximum average execution price.
+    /// Returns the inclusive maximum individual fill price.
     pub const fn maximum_price(self) -> PriceTicks {
         self.maximum_price
     }
 
-    /// Returns whether a positive observed average price is within this inclusive ceiling.
+    /// Returns whether a positive observed fill price is within this inclusive ceiling.
     pub const fn permits(self, price: PriceTicks) -> bool {
         price.get() > 0 && price.get() <= self.maximum_price.get()
+    }
+
+    /// Returns the versioned execution-audit identity binding this exact ceiling to an intent.
+    pub fn order_audit_digest(self, intent_digest: crate::OrderIntentDigest) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        digest.update(b"market-squawk/approved-execution-audit-identity/v1\0");
+        digest.update(intent_digest.as_bytes());
+        digest.update(self.maximum_price.get().to_be_bytes());
+        digest.finalize().into()
     }
 }
 
@@ -261,6 +270,7 @@ impl ApprovedOrder {
             &self.intent,
             self.market,
             Some(&self.authority),
+            Some(self.execution_price_bound),
             self.policy,
             self.valid_until,
         )

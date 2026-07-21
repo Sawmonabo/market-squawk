@@ -1049,6 +1049,7 @@ impl PaperWorker {
                     event_at,
                     fill.quantity(),
                     fill.average_price(),
+                    fill.maximum_price(),
                     fill.notional(),
                     fill.fee(),
                     fill.liquidity(),

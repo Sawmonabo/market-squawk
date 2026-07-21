@@ -259,13 +259,14 @@ fn cancel_observation_invalid_reason(
         receipt.cumulative_filled().get() < previous.cumulative_filled().get()
             || receipt.cumulative_fees().currency() != previous.cumulative_fees().currency()
             || receipt.cumulative_fees().amount() < previous.cumulative_fees().amount()
+            || receipt.maximum_fill_price() < previous.maximum_fill_price()
     });
     if cumulative_regression
         || receipt.cumulative_filled().get() < 0
         || receipt.cumulative_filled().get() > record.requested_quantity.get()
         || record.settlement_currency != Some(receipt.cumulative_fees().currency())
         || receipt
-            .average_fill_price()
+            .maximum_fill_price()
             .is_some_and(|price| !record.execution_price_bound.permits(price))
     {
         return Some(ExecutionAuditReason::ReconciliationRequired);
@@ -283,6 +284,7 @@ fn cancel_observation_invalid_reason(
         status,
         receipt.cumulative_filled(),
         receipt.average_fill_price(),
+        receipt.maximum_fill_price(),
         receipt.cumulative_fees(),
     )
     .err()
@@ -307,6 +309,7 @@ fn retain_cancel_observation(
             status,
             receipt.cumulative_filled(),
             receipt.average_fill_price(),
+            receipt.maximum_fill_price(),
             receipt.cumulative_fees(),
         )
         .map_err(|_| ())?,

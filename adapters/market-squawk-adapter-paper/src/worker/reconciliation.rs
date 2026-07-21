@@ -48,6 +48,7 @@ impl PaperWorker {
                     order.reconciled_status(),
                     order.lifecycle.cumulative_filled(),
                     order.average_fill_price(),
+                    order.maximum_fill_price,
                     order.cumulative_fee,
                 )
             } else {
@@ -55,6 +56,7 @@ impl PaperWorker {
                     *order_id,
                     ReconciledOrderStatus::Unknown,
                     QuantityLots::new(0).map_err(|_| ExecutionAdapterError::KnownFailure)?,
+                    None,
                     None,
                     Money::new(Decimal::ZERO, currency),
                 )
@@ -238,6 +240,7 @@ pub(super) fn cancel_receipt(
         observed_at,
         order.lifecycle.cumulative_filled(),
         order.average_fill_price(),
+        order.maximum_fill_price,
         order.cumulative_fee,
     )
     .map_err(|_| ExecutionAdapterError::KnownFailure)
@@ -266,7 +269,7 @@ pub(super) fn state_audit(
 
 pub(super) fn market_digest(order: &PaperOrder, event: WorkerMarketUpdate) -> [u8; 32] {
     let mut digest = Sha256::new();
-    digest.update(b"market-squawk/paper-market-mutation/v1\0");
+    digest.update(b"market-squawk/paper-market-mutation/v2\0");
     digest.update(order.input_digest());
     digest.update(event.sequence.to_be_bytes());
     digest.update(event.update.assessment_digest());

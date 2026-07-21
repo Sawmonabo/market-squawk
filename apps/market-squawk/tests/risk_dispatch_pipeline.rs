@@ -233,6 +233,7 @@ impl ExecutionAdapter for ScriptedAdapter {
                 observed_at,
                 QuantityLots::new(1).unwrap_or_else(|error| panic!("valid partial fill: {error}")),
                 Some(PriceTicks::new(10_000)),
+                Some(PriceTicks::new(10_000)),
                 Money::new(Decimal::new(1, 2), self.usd),
             )
             .map_err(|_| ExecutionAdapterError::KnownFailure)
@@ -259,6 +260,7 @@ impl ExecutionAdapter for ScriptedAdapter {
                         ReconciledOrderStatus::Filled,
                         QuantityLots::new(2)
                             .unwrap_or_else(|error| panic!("valid cumulative fill: {error}")),
+                        Some(PriceTicks::new(10_000)),
                         Some(PriceTicks::new(10_000)),
                         Money::new(Decimal::new(2, 2), self.usd),
                     )
@@ -540,10 +542,24 @@ async fn committed_market_risk_and_dispatch_are_one_use_bounded_and_fill_safe() 
 
     let (_, second) = source.batch("trade-2", 2)?;
     ingress.try_publish(second)?;
+    let risk_approved = wait_for_audit(&mut audit_reader, ExecutionAuditKind::RiskApproved).await?;
     let accepted = wait_for_audit(&mut audit_reader, ExecutionAuditKind::DispatchAccepted).await?;
     assert_eq!(accepted.strategy_id(), strategy_id);
     assert!(accepted.assessment_digest().is_some());
     assert!(accepted.evidence_binding_digest().is_some());
+    let accepted_bound = accepted
+        .execution_price_bound()
+        .ok_or("accepted execution audit omitted the approved price ceiling")?;
+    assert_eq!(
+        accepted.execution_identity_digest(),
+        Some(accepted_bound.order_audit_digest(accepted.intent_digest()))
+    );
+    assert_eq!(risk_approved.order_id(), accepted.order_id());
+    assert_eq!(risk_approved.execution_price_bound(), Some(accepted_bound));
+    assert_eq!(
+        risk_approved.execution_identity_digest(),
+        accepted.execution_identity_digest()
+    );
     assert_eq!(accepted.risk_policy(), policy);
 
     let accepted_order = adapter
@@ -554,6 +570,7 @@ async fn committed_market_risk_and_dispatch_are_one_use_bounded_and_fill_safe() 
         .ok_or("adapter did not retain accepted order")?;
     let canceled = dispatcher.cancel(accepted_order).await?;
     assert_eq!(canceled.cumulative_filled().get(), 1);
+    assert_eq!(canceled.maximum_fill_price(), Some(PriceTicks::new(10_000)));
     let cancel_audit =
         wait_for_audit(&mut audit_reader, ExecutionAuditKind::DispatchUncertain).await?;
     assert!(
@@ -588,6 +605,10 @@ async fn committed_market_risk_and_dispatch_are_one_use_bounded_and_fill_safe() 
     assert_eq!(state.accounts().len(), 1);
     assert_eq!(state.accounts()[0].revision().get(), 2);
     assert_eq!(state.orders()[0].cumulative_filled().get(), 2);
+    assert_eq!(
+        state.orders()[0].maximum_fill_price(),
+        Some(PriceTicks::new(10_000))
+    );
     assert_eq!(
         state.orders()[0].cumulative_fees().amount(),
         Decimal::new(2, 2)
