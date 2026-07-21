@@ -3337,6 +3337,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "market-squawk-adapter-portfolio"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "market-squawk-data",
+ "market-squawk-domain",
+ "market-squawk-platform",
+ "market-squawk-sources",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "market-squawk-adapter-sec"
 version = "0.1.0"
 dependencies = [
