@@ -5,8 +5,8 @@ use market_squawk_domain::{
     CalendarDate, ExactPayloadEvidence, MetadataRevision, SourceId, SourceIdentifier, Timestamp,
 };
 use market_squawk_sources::{
-    ApiEndpointRule, BudgetDecision, ExtractionSourceError, NetworkPolicyError, PathScope,
-    QueryParameterRule, QuerySensitivity, SourceError, apply_http_retry_after,
+    ApiEndpointRule, ExtractionAuthority, ExtractionSourceError, NetworkPolicyError, PathScope,
+    QueryParameterRule, QuerySensitivity, SourceError,
 };
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
@@ -207,9 +207,8 @@ impl FredSeriesMetadataDocument {
 impl FredSource {
     /// Acquires one exact, identity-validated `fred/series` metadata document.
     ///
-    /// This method uses the source's shared provider budget and configured endpoint policy. The API
-    /// key is authorized and transmitted separately but is never retained in the public locator,
-    /// result, or adapter error.
+    /// The API key is authorized and transmitted separately but is never retained in the public
+    /// locator, result, or adapter error.
     ///
     /// # Errors
     ///
@@ -217,10 +216,13 @@ impl FredSource {
     /// schema, civil-date interval, or requested series identity cannot be verified.
     pub async fn acquire_series_metadata(
         &self,
+        authority: &ExtractionAuthority,
         dataset: &SourceIdentifier,
         deadline: Timestamp,
         cancellation: CancellationToken,
+        operation: FredOperation,
     ) -> Result<FredSeriesMetadataDocument, ExtractionSourceError> {
+        self.validate_authority(authority)?;
         if cancellation.is_cancelled() {
             return Err(ExtractionSourceError::Cancelled);
         }
@@ -236,7 +238,7 @@ impl FredSource {
                 &SourceIdentifier::try_from(dataset_identity.series_id()).map_err(|_| {
                     ExtractionSourceError::Source(SourceError::InvalidProtocolState)
                 })?,
-                &[FredOperation::RetrieveEphemeral],
+                &[operation],
                 now,
             )
             .map_err(|_| ExtractionSourceError::Source(SourceError::Unauthorized))?;
@@ -259,25 +261,9 @@ impl FredSource {
         authorization_target
             .query_pairs_mut()
             .append_pair("api_key", self.api_key.expose());
-        self.metadata
-            .network_policy()
-            .authorize(authorization_target.as_str())
-            .map_err(|_| ExtractionSourceError::Source(SourceError::Network))?;
+        let permit = authority.try_network_request(authorization_target.as_str())?;
+        let in_flight = permit.authorize_send(authorization_target.as_str())?;
         drop(authorization_target);
-
-        let _permit = match self.budget.try_acquire() {
-            BudgetDecision::Ready(permit) => permit,
-            BudgetDecision::WaitUntil(deadline) => {
-                return Err(ExtractionSourceError::Source(
-                    SourceError::BudgetWaitUntil { deadline },
-                ));
-            }
-            BudgetDecision::Unavailable(reason) => {
-                return Err(ExtractionSourceError::Source(
-                    SourceError::BudgetUnavailable { reason },
-                ));
-            }
-        };
         let wall_remaining = deadline
             .unix_nanos()
             .checked_sub(now.unix_nanos())
@@ -298,6 +284,10 @@ impl FredSource {
             )
             .await
             .map_err(map_adapter_error)?;
+        in_flight.validate_response_size(
+            u64::try_from(response.body.len())
+                .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?,
+        )?;
         if response
             .content_encoding
             .as_deref()
@@ -311,10 +301,10 @@ impl FredSource {
             200 => {}
             401 | 403 => return Err(ExtractionSourceError::Source(SourceError::Unauthorized)),
             429 | 503 => {
-                let decision =
-                    apply_http_retry_after(&self.budget, response.retry_after.as_deref(), 0);
+                let deadline =
+                    in_flight.apply_retry_after_header(response.retry_after.as_deref(), 0)?;
                 return Err(ExtractionSourceError::Source(
-                    SourceError::from_applied_budget_refusal(decision),
+                    SourceError::BudgetWaitUntil { deadline },
                 ));
             }
             _ => return Err(ExtractionSourceError::Source(SourceError::Network)),

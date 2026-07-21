@@ -1,17 +1,35 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "series_scope": "unresolved",
-  "terms_url": "https://fred.stlouisfed.org/docs/api/terms_of_use.html",
-  "terms_digest": "c7d9171a6895a56e22de9c33247428ed226bea9117bec06952995fc80fe5cc62",
-  "terms_bytes": 48781,
+  "terms_bundle_digest": "481a016d3505c9b53d940d71b87cdbfdc6ae578cea7a3d9c731ef6d0a94f9419",
+  "terms_documents": [
+    {
+      "role": "api_terms",
+      "url": "https://fred.stlouisfed.org/docs/api/terms_of_use.html",
+      "sha256": "482472134ff5607196d1f519acdefc0ac6d694a3ec540dd8b94896b108ad0c89",
+      "byte_length": 48781
+    },
+    {
+      "role": "fred_services_legal_terms",
+      "url": "https://fred.stlouisfed.org/legal/",
+      "sha256": "0213ae084164b7b641314c3c292d259a047016e75cde40615bebc31bcc79cf76",
+      "byte_length": 116856
+    },
+    {
+      "role": "privacy_policy",
+      "url": "https://www.stlouisfed.org/about-us/privacy-policy/online-notice",
+      "sha256": "bc3f9deeb390d7848c512bd46662a5abd3b1ecb734c4c8c0f5620f0573fb834a",
+      "byte_length": 246328
+    }
+  ],
   "assessed_at_unix_nanos": 1784592000000000000,
   "review_required_by_unix_nanos": 1785196800000000000,
   "operations": ["persist", "cache", "archive", "train"],
   "disposition": "blocked_unknown_rights",
   "confirmed_facts": [
-    "FRED or ALFRED availability does not override a series owner's restrictions.",
-    "The reviewed terms provide no blanket grant for persistence, caching, archiving, redistribution, or model training.",
-    "The reviewed terms may change without notice and contain no visible version identifier."
+    "The three required canonical terms documents were acquired as exact bounded HTTPS response bodies on 2026-07-21.",
+    "A second immediate acquisition of the online privacy notice matched the retained response byte-for-byte.",
+    "The reviewed terms bundle does not itself establish exact-series owner authorization for durable use."
   ],
   "engineering_inferences": [
     "Registered ephemeral retrieval may proceed within provider terms and shared budgets.",
@@ -22,13 +40,22 @@
     {
       "url": "https://fred.stlouisfed.org/docs/api/terms_of_use.html",
       "accessed_on": "2026-07-21",
-      "sha256": "c7d9171a6895a56e22de9c33247428ed226bea9117bec06952995fc80fe5cc62",
+      "sha256": "482472134ff5607196d1f519acdefc0ac6d694a3ec540dd8b94896b108ad0c89",
       "byte_length": 48781,
       "evidence_class": "confirmed"
     },
     {
-      "url": "https://fred.stlouisfed.org/docs/api/fred/errors.html",
-      "accessed_on": "2026-07-20",
+      "url": "https://fred.stlouisfed.org/legal/",
+      "accessed_on": "2026-07-21",
+      "sha256": "0213ae084164b7b641314c3c292d259a047016e75cde40615bebc31bcc79cf76",
+      "byte_length": 116856,
+      "evidence_class": "confirmed"
+    },
+    {
+      "url": "https://www.stlouisfed.org/about-us/privacy-policy/online-notice",
+      "accessed_on": "2026-07-21",
+      "sha256": "bc3f9deeb390d7848c512bd46662a5abd3b1ecb734c4c8c0f5620f0573fb834a",
+      "byte_length": 246328,
       "evidence_class": "confirmed"
     }
   ]

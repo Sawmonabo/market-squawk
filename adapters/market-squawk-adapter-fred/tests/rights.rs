@@ -8,6 +8,33 @@ use market_squawk_domain::{SourceIdentifier, Timestamp};
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 #[test]
+#[ignore = "requires the controlled local exact FRED terms evidence directory"]
+fn controlled_release_artifact_verifies_exact_terms_and_remains_blocked() -> TestResult {
+    let root = std::env::var_os("MARKET_SQUAWK_FRED_RIGHTS_EVIDENCE_DIR")
+        .ok_or("MARKET_SQUAWK_FRED_RIGHTS_EVIDENCE_DIR is required")?;
+    let root = std::path::PathBuf::from(root);
+    let artifact_bytes = std::fs::read(root.join("fred-rights-decision.json"))?;
+    let api_terms = std::fs::read(root.join("api-terms.html"))?;
+    let legal_terms = std::fs::read(root.join("fred-legal.html"))?;
+    let privacy_policy = std::fs::read(root.join("privacy.html"))?;
+    let terms_bytes = [
+        FredTermsDocumentBytes::try_new(FredTermsDocumentRole::ApiTerms, &api_terms)?,
+        FredTermsDocumentBytes::try_new(
+            FredTermsDocumentRole::FredServicesLegalTerms,
+            &legal_terms,
+        )?,
+        FredTermsDocumentBytes::try_new(FredTermsDocumentRole::PrivacyPolicy, &privacy_policy)?,
+    ];
+    let artifact = FredRightsArtifact::parse(&artifact_bytes, &terms_bytes)?;
+    assert_eq!(
+        artifact.disposition(),
+        FredRightsDisposition::BlockedUnknownRights
+    );
+    assert_eq!(artifact.terms_evidence().documents().count(), 3);
+    Ok(())
+}
+
+#[test]
 fn release_artifact_and_runtime_policy_fail_closed_for_durable_use() -> TestResult {
     let artifact_bytes = test_artifact();
     let terms_bytes = test_terms_bytes()?;

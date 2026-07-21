@@ -7,32 +7,55 @@ use futures_util::stream;
 use market_squawk_domain::{
     AuthorizationBasis, ChecksumCapability, CoverageDelay, DataQuality, DeliveryEvidence,
     DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence, MetadataRevision,
-    RevisionBoundPayloadEvidence, SchemaVersion, SequenceCapability, SourceId, SourceIdentifier,
-    Timestamp,
+    ResearchObservation, RevisionBoundPayloadEvidence, SchemaVersion, SequenceCapability, SourceId,
+    SourceIdentifier, Timestamp,
 };
 use market_squawk_sources::{
     ApiEndpointRule, AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode,
     AuthorizationSubjectResolutionError, AuthorizationSubjectResolver, BackoffPolicy, BudgetScope,
-    CoverageDomain, EndpointPolicy, ExtractionRequest, ExtractionSource, FreshnessPolicy,
-    HistoricalCapability, NetworkAccessPolicy, PathScope, ProviderBudgetPolicy, QueryParameterRule,
-    QuerySensitivity, SourceCapabilities, SourceClass, SourceCoverage, SourceError, SourceMetadata,
-    SourceMetadataInput, SourceMetadataProvider, SourceObject, SourceProtocolProfile,
-    payload_matches_exact_evidence,
+    CoverageDomain, EndpointPolicy, ExtractionAuthority, ExtractionRequest, ExtractionSource,
+    FreshnessPolicy, HistoricalCapability, NetworkAccessPolicy, PathScope, ProviderBudgetPolicy,
+    QueryParameterRule, QuerySensitivity, SourceCapabilities, SourceClass, SourceCoverage,
+    SourceError, SourceMetadata, SourceMetadataInput, SourceMetadataProvider, SourceObject,
+    SourceProtocolProfile, payload_matches_exact_evidence,
 };
+use sha2::Digest;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    FredObservationPage, FredParseLimits, FredRightsArtifact, FredRightsPolicy,
-    FredTermsDocumentBytes, FredTermsDocumentRole,
+    FredOperation, FredOwnerAuthorizationEvidence, FredRightsArtifact, FredRightsPolicy,
+    FredSeriesRightsGrant, FredTermsDocumentBytes, FredTermsDocumentRole, Sha256Digest,
 };
 
 use super::http::collect_bounded_stream;
 use super::{
     FredApiKey, FredDataset, FredHttpRequest, FredHttpResponse, FredSource, FredSourceError,
-    FredTransport, canonical_payloads, fred_series_endpoint_rule, system_timestamp,
+    FredTransport, fred_series_endpoint_rule, system_timestamp,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+const EXACT_SERIES_RESPONSE: &[u8] = br#"{
+    "realtime_start":"2024-01-01",
+    "realtime_end":"2024-01-31",
+    "seriess":[{
+        "id":"CPIAUCSL",
+        "realtime_start":"2024-01-01",
+        "realtime_end":"2024-01-31",
+        "title":"Consumer Price Index for All Urban Consumers: All Items in U.S. City Average",
+        "observation_start":"1947-01-01",
+        "observation_end":"2023-12-01",
+        "frequency":"Monthly",
+        "frequency_short":"M",
+        "units":"Index 1982-1984=100",
+        "units_short":"Index 1982-1984=100",
+        "seasonal_adjustment":"Seasonally Adjusted",
+        "seasonal_adjustment_short":"SA",
+        "last_updated":"2024-01-11 07:42:02-06",
+        "popularity":95,
+        "notes":"Exact provider notes"
+    }]
+}"#;
 
 #[test]
 fn api_key_is_exactly_validated_and_never_debugged() -> TestResult {
@@ -72,25 +95,6 @@ async fn response_body_is_bounded_across_streamed_chunks() {
 }
 
 #[test]
-fn canonical_payload_preserves_civil_dates_without_a_fabricated_publication_time() -> TestResult {
-    let dataset = FredDataset::parse(&SourceIdentifier::try_from(
-        "alfred:series-observations:CPIAUCSL:2024-01-01:2024-02-01",
-    )?)?;
-    let page = FredObservationPage::parse(
-        include_bytes!("../../fixtures/observations.json"),
-        FredParseLimits::production_defaults(),
-    )?;
-    let payloads = canonical_payloads(&dataset, &page, Timestamp::from_unix_nanos(77))?;
-    let first: serde_json::Value = serde_json::from_slice(&payloads[0])?;
-    assert_eq!(first["observation_date"], "2023-01-01");
-    assert_eq!(first["realtime_start"], "2024-01-01");
-    assert_eq!(first["received_at_unix_nanos"], 77);
-    assert!(first.get("published_at").is_none());
-    assert!(first.get("effective_at").is_none());
-    Ok(())
-}
-
-#[test]
 fn source_implements_the_sync_extraction_contract() {
     fn assert_contract<T: ExtractionSource + Sync>() {}
     assert_contract::<FredSource>();
@@ -117,7 +121,12 @@ async fn discovery_and_ephemeral_extraction_are_exact_source_request_and_payload
     )?;
     assert!(matches!(
         source
-            .discover(instant_request, CancellationToken::new())
+            .source
+            .discover(
+                source.authority.clone(),
+                instant_request,
+                CancellationToken::new(),
+            )
             .await,
         Err(market_squawk_sources::ExtractionSourceError::Source(
             SourceError::InvalidProtocolState
@@ -129,7 +138,15 @@ async fn discovery_and_ephemeral_extraction_are_exact_source_request_and_payload
         NonZeroU16::new(1).ok_or("nonzero result limit")?,
         deadline,
     )?;
-    let discovered = source.discover(discovery, CancellationToken::new()).await?;
+    let discovered = source
+        .source
+        .discover(
+            source.authority.clone(),
+            discovery,
+            CancellationToken::new(),
+        )
+        .await
+        .map_err(|error| format!("discovery contract failed: {error:?}"))?;
     assert_eq!(discovered.objects().len(), 1);
     let object = discovered.objects()[0].clone();
     assert!(
@@ -160,7 +177,12 @@ async fn discovery_and_ephemeral_extraction_are_exact_source_request_and_payload
     )?;
     assert!(matches!(
         source
-            .extract_page_ephemeral(&transplanted_request, CancellationToken::new())
+            .source
+            .extract_page_ephemeral(
+                &source.authority,
+                &transplanted_request,
+                CancellationToken::new(),
+            )
             .await,
         Err(market_squawk_sources::ExtractionSourceError::Source(
             SourceError::InvalidProtocolState
@@ -173,10 +195,133 @@ async fn discovery_and_ephemeral_extraction_are_exact_source_request_and_payload
         deadline,
     )?;
     let page = source
-        .extract_page_ephemeral(&extraction, CancellationToken::new())
-        .await?;
+        .source
+        .extract_page_ephemeral(&source.authority, &extraction, CancellationToken::new())
+        .await
+        .map_err(|error| format!("ephemeral extraction failed: {error:?}"))?;
     assert_eq!(page.canonical_payloads().len(), 2);
     assert_eq!(page.received_at(), now);
+    assert!(matches!(
+        source
+            .source
+            .extract(
+                source.authority.clone(),
+                extraction,
+                CancellationToken::new(),
+            )
+            .await,
+        Err(market_squawk_sources::ExtractionSourceError::Source(
+            SourceError::Unauthorized
+        ))
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn durable_extraction_emits_canonical_schema_v3_macro_observations() -> TestResult {
+    let now = system_timestamp()?;
+    let observations_response = FredHttpResponse {
+        status: 200,
+        retry_after: None,
+        content_encoding: None,
+        body: Bytes::from_static(include_bytes!("../../fixtures/observations.json")),
+        received_at: now,
+    };
+    let source = source_with_options(
+        now,
+        observations_response,
+        FredHttpResponse {
+            status: 200,
+            retry_after: None,
+            content_encoding: None,
+            body: Bytes::from_static(EXACT_SERIES_RESPONSE),
+            received_at: now,
+        },
+        "fred-durable-extraction-test-user",
+        true,
+    )?;
+    let deadline = now.checked_add_nanos(10_000_000_000)?;
+    let discovery = market_squawk_sources::DiscoveryRequest::try_new(
+        SourceIdentifier::try_from("alfred:series-observations:CPIAUCSL:2024-01-01:2024-01-31")?,
+        None,
+        NonZeroU16::new(1).ok_or("nonzero result limit")?,
+        deadline,
+    )?;
+    let discovered = source
+        .source
+        .discover(
+            source.authority.clone(),
+            discovery,
+            CancellationToken::new(),
+        )
+        .await?;
+    let extraction = ExtractionRequest::try_new(
+        discovered.objects()[0].clone(),
+        NonZeroU32::new(2).ok_or("nonzero record limit")?,
+        NonZeroU64::new(1024 * 1024).ok_or("nonzero byte limit")?,
+        deadline,
+    )?;
+    let batch = source
+        .source
+        .extract(
+            source.authority.clone(),
+            extraction,
+            CancellationToken::new(),
+        )
+        .await?;
+
+    assert_eq!(batch.records().len(), 2);
+    for record in batch.records() {
+        assert_eq!(record.schema().as_str(), "market-squawk-research-v3");
+        assert!(payload_matches_exact_evidence(
+            record.payload(),
+            record.evidence()
+        ));
+    }
+    let first: ResearchObservation = serde_json::from_slice(batch.records()[0].payload())?;
+    let second: ResearchObservation = serde_json::from_slice(batch.records()[1].payload())?;
+    let ResearchObservation::Macro(first) = first else {
+        return Err("expected canonical macro observation".into());
+    };
+    let ResearchObservation::Macro(second) = second else {
+        return Err("expected canonical macro observation".into());
+    };
+    assert_eq!(first.series().as_str(), "CPIAUCSL");
+    assert_eq!(
+        first.unit().as_str(),
+        "fred-unit:v1:Index%201982-1984%3D100"
+    );
+    assert_eq!(
+        first
+            .value()
+            .observed_value()
+            .map(|value| value.to_string())
+            .as_deref(),
+        Some("101.25")
+    );
+    assert_eq!(
+        first
+            .context()
+            .time()
+            .effective()
+            .calendar_date_value()
+            .map(|date| date.to_string())
+            .as_deref(),
+        Some("2023-01-01")
+    );
+    assert!(first.context().time().published().is_none());
+    assert!(first.context().provenance().source_timestamp().is_none());
+    assert_eq!(
+        first.context().provenance().quality(),
+        DataQuality::OfficialDelayed
+    );
+    assert_eq!(
+        second
+            .value()
+            .missing_value()
+            .map(|missing| missing.marker().as_str()),
+        Some(".")
+    );
     Ok(())
 }
 
@@ -205,7 +350,8 @@ async fn provider_refusals_apply_retry_after_to_the_shared_budget() -> TestResul
             now.checked_add_nanos(10_000_000_000)?,
         )?;
         let error = source
-            .discover(request, CancellationToken::new())
+            .source
+            .discover(source.authority.clone(), request, CancellationToken::new())
             .await
             .err()
             .ok_or("provider refusal must stop discovery")?;
@@ -240,7 +386,10 @@ async fn non_identity_content_encoding_is_rejected() -> TestResult {
         now.checked_add_nanos(10_000_000_000)?,
     )?;
     assert!(matches!(
-        source.discover(request, CancellationToken::new()).await,
+        source
+            .source
+            .discover(source.authority.clone(), request, CancellationToken::new(),)
+            .await,
         Err(market_squawk_sources::ExtractionSourceError::Source(
             SourceError::InvalidProtocolState
         ))
@@ -250,27 +399,6 @@ async fn non_identity_content_encoding_is_rejected() -> TestResult {
 
 #[tokio::test]
 async fn series_metadata_is_exact_request_bound_and_rejects_non_unique_identity() -> TestResult {
-    const EXACT_RESPONSE: &[u8] = br#"{
-        "realtime_start":"2024-01-01",
-        "realtime_end":"2024-01-31",
-        "seriess":[{
-            "id":"CPIAUCSL",
-            "realtime_start":"2024-01-01",
-            "realtime_end":"2024-01-31",
-            "title":"Consumer Price Index for All Urban Consumers: All Items in U.S. City Average",
-            "observation_start":"1947-01-01",
-            "observation_end":"2023-12-01",
-            "frequency":"Monthly",
-            "frequency_short":"M",
-            "units":"Index 1982-1984=100",
-            "units_short":"Index 1982-1984=100",
-            "seasonal_adjustment":"Seasonally Adjusted",
-            "seasonal_adjustment_short":"SA",
-            "last_updated":"2024-01-11 07:42:02-06",
-            "popularity":95,
-            "notes":"Exact provider notes"
-        }]
-    }"#;
     let now = system_timestamp()?;
     let fred_source = source(
         now,
@@ -278,7 +406,7 @@ async fn series_metadata_is_exact_request_bound_and_rejects_non_unique_identity(
             status: 200,
             retry_after: None,
             content_encoding: None,
-            body: Bytes::from_static(EXACT_RESPONSE),
+            body: Bytes::from_static(include_bytes!("../../fixtures/observations.json")),
             received_at: now,
         },
         "fred-series-metadata-test-user",
@@ -286,21 +414,30 @@ async fn series_metadata_is_exact_request_bound_and_rejects_non_unique_identity(
     let dataset =
         SourceIdentifier::try_from("alfred:series-observations:CPIAUCSL:2024-01-01:2024-01-31")?;
     let document = fred_source
+        .source
         .acquire_series_metadata(
+            &fred_source.authority,
             &dataset,
             now.checked_add_nanos(10_000_000_000)?,
             CancellationToken::new(),
+            FredOperation::RetrieveEphemeral,
         )
         .await?;
 
-    assert_eq!(document.source_id(), fred_source.metadata().source_id());
+    assert_eq!(
+        document.source_id(),
+        fred_source.source.metadata().source_id()
+    );
     assert_eq!(
         document.metadata_revision(),
-        fred_source.metadata().revision()
+        fred_source.source.metadata().revision()
     );
     assert_eq!(document.dataset(), &dataset);
-    assert_eq!(document.response_bytes().as_ref(), EXACT_RESPONSE);
-    assert_eq!(document.response_length(), EXACT_RESPONSE.len() as u64);
+    assert_eq!(document.response_bytes().as_ref(), EXACT_SERIES_RESPONSE);
+    assert_eq!(
+        document.response_length(),
+        EXACT_SERIES_RESPONSE.len() as u64
+    );
     assert_eq!(document.received_at(), now);
     assert!(payload_matches_exact_evidence(
         document.response_bytes(),
@@ -336,7 +473,7 @@ async fn series_metadata_is_exact_request_bound_and_rejects_non_unique_identity(
     assert_eq!(series.popularity(), 95);
     assert_eq!(series.notes(), Some("Exact provider notes"));
 
-    let exact_value: serde_json::Value = serde_json::from_slice(EXACT_RESPONSE)?;
+    let exact_value: serde_json::Value = serde_json::from_slice(EXACT_SERIES_RESPONSE)?;
     let mut absent_value = exact_value.clone();
     absent_value["seriess"] = serde_json::json!([]);
     let mut mismatch_value = exact_value.clone();
@@ -367,8 +504,15 @@ async fn series_metadata_is_exact_request_bound_and_rejects_non_unique_identity(
             serde_json::to_vec(&extra_value)?,
         ),
     ] {
-        let rejecting_source = source(
+        let rejecting_source = source_with_options(
             now,
+            FredHttpResponse {
+                status: 200,
+                retry_after: None,
+                content_encoding: None,
+                body: Bytes::from_static(include_bytes!("../../fixtures/observations.json")),
+                received_at: now,
+            },
             FredHttpResponse {
                 status: 200,
                 retry_after: None,
@@ -377,13 +521,17 @@ async fn series_metadata_is_exact_request_bound_and_rejects_non_unique_identity(
                 received_at: now,
             },
             subject,
+            false,
         )?;
         assert!(matches!(
             rejecting_source
+                .source
                 .acquire_series_metadata(
+                    &rejecting_source.authority,
                     &dataset,
                     now.checked_add_nanos(10_000_000_000)?,
                     CancellationToken::new(),
+                    FredOperation::RetrieveEphemeral,
                 )
                 .await,
             Err(market_squawk_sources::ExtractionSourceError::Source(
@@ -396,7 +544,8 @@ async fn series_metadata_is_exact_request_bound_and_rejects_non_unique_identity(
 
 #[derive(Debug)]
 struct ScriptedTransport {
-    response: FredHttpResponse,
+    observations_response: FredHttpResponse,
+    series_response: FredHttpResponse,
 }
 
 impl FredTransport for ScriptedTransport {
@@ -411,9 +560,19 @@ impl FredTransport for ScriptedTransport {
             if cancellation.is_cancelled() || request.public_url.as_str().contains("api_key") {
                 return Err(FredSourceError::Cancelled);
             }
-            Ok(self.response.clone())
+            if request.public_url.path() == "/fred/series" {
+                Ok(self.series_response.clone())
+            } else {
+                Ok(self.observations_response.clone())
+            }
         })
     }
+}
+
+struct TestFredSource {
+    source: FredSource,
+    authority: ExtractionAuthority,
+    _registry: AuthoritativeSourceRegistry,
 }
 
 #[derive(Debug)]
@@ -436,23 +595,53 @@ impl AuthorizationSubjectResolver for TestSubjectResolver {
 
 fn source(
     now: Timestamp,
-    response: FredHttpResponse,
+    observations_response: FredHttpResponse,
     authorization_subject: &'static str,
-) -> TestResult<FredSource> {
+) -> TestResult<TestFredSource> {
+    source_with_options(
+        now,
+        observations_response,
+        FredHttpResponse {
+            status: 200,
+            retry_after: None,
+            content_encoding: None,
+            body: Bytes::from_static(EXACT_SERIES_RESPONSE),
+            received_at: now,
+        },
+        authorization_subject,
+        false,
+    )
+}
+
+fn source_with_options(
+    now: Timestamp,
+    observations_response: FredHttpResponse,
+    series_response: FredHttpResponse,
+    authorization_subject: &'static str,
+    permit_persistence: bool,
+) -> TestResult<TestFredSource> {
     let subject = SourceIdentifier::try_from(authorization_subject)?;
     let metadata = metadata(now, subject.clone())?;
     let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_with_authorization_subject_resolver_for_diagnostics(
         Arc::new(TestSubjectResolver { subject }),
     )?;
     let registered = registry.register(metadata.clone(), now)?;
-    Ok(FredSource::try_new_with_transport(
-        metadata,
-        &registered,
+    let source = FredSource::try_new_with_transport(
+        metadata.clone(),
         FredApiKey::try_new("abcdefghijklmnopqrstuvwxyz123456".to_owned())?,
-        rights(now)?,
-        Arc::new(ScriptedTransport { response }),
+        rights(now, permit_persistence)?,
+        Arc::new(ScriptedTransport {
+            observations_response,
+            series_response,
+        }),
         2,
-    )?)
+    )?;
+    let authority = registry.extraction_authority(&registered, &source)?;
+    Ok(TestFredSource {
+        source,
+        authority,
+        _registry: registry,
+    })
 }
 
 fn metadata(now: Timestamp, authorization_subject: SourceIdentifier) -> TestResult<SourceMetadata> {
@@ -549,7 +738,7 @@ fn metadata(now: Timestamp, authorization_subject: SourceIdentifier) -> TestResu
     ))?)
 }
 
-fn rights(now: Timestamp) -> TestResult<FredRightsPolicy> {
+fn rights(now: Timestamp, permit_persistence: bool) -> TestResult<FredRightsPolicy> {
     let assessed = now.checked_sub_nanos(1_000_000_000)?;
     let review = now.checked_add_nanos(60_000_000_000)?;
     let artifact = format!(
@@ -622,9 +811,29 @@ fn rights(now: Timestamp) -> TestResult<FredRightsPolicy> {
         )?,
     ];
     let artifact = FredRightsArtifact::parse(artifact.as_bytes(), &terms_bytes)?;
+    let grants = if permit_persistence {
+        let authorization_bytes = b"exact CPI series owner authorization";
+        let authorization = FredOwnerAuthorizationEvidence::try_new(
+            "https://owner.example.test/cpiaucsl-authorization".to_owned(),
+            Sha256Digest::from_bytes(sha2::Sha256::digest(authorization_bytes).into()),
+            authorization_bytes.len(),
+            authorization_bytes,
+        )?;
+        vec![FredSeriesRightsGrant::try_new(
+            SourceIdentifier::try_from("CPIAUCSL")?,
+            SourceIdentifier::try_from("test-series-owner")?,
+            authorization,
+            artifact.terms_evidence().bundle_digest(),
+            vec![FredOperation::Persist],
+            assessed,
+            review,
+        )?]
+    } else {
+        Vec::new()
+    };
     Ok(FredRightsPolicy::try_new(
         artifact.terms_evidence().clone(),
-        Vec::new(),
+        grants,
     )?)
 }
 

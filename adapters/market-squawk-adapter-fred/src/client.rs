@@ -7,13 +7,11 @@ use market_squawk_domain::{
     CalendarDate, DataQuality, EffectiveInterval, ExactPayloadEvidence, SourceIdentifier, Timestamp,
 };
 use market_squawk_sources::{
-    AuthorizationMode, BudgetDecision, CoverageDomain, DiscoveryBatch, DiscoveryRequest,
-    ExtractionBatch, ExtractionRequest, ExtractionSource, ExtractionSourceError,
-    HistoricalCapability, NetworkAccessPolicy, RegisteredSource, SharedProviderBudget, SourceClass,
-    SourceError, SourceMetadata, SourceMetadataProvider, SourceObject, apply_http_retry_after,
-    payload_matches_exact_evidence,
+    AuthorizationMode, CoverageDomain, DiscoveryBatch, DiscoveryRequest, ExtractionAuthority,
+    ExtractionBatch, ExtractionRecord, ExtractionRequest, ExtractionSource, ExtractionSourceError,
+    HistoricalCapability, NetworkAccessPolicy, SourceClass, SourceError, SourceMetadata,
+    SourceMetadataProvider, SourceObject, payload_matches_exact_evidence,
 };
-use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
@@ -26,6 +24,7 @@ use crate::{
 mod http;
 mod lineage;
 mod metadata;
+mod normalize;
 
 pub use metadata::{FredSeriesMetadata, FredSeriesMetadataDocument, fred_series_endpoint_rule};
 
@@ -33,6 +32,7 @@ use http::{
     FredHttpRequest, FredHttpResponse, FredTransport, ReqwestFredTransport, system_timestamp,
 };
 use lineage::{evidence_for_payload, map_adapter_error, page_object_id, parse_object_id};
+use normalize::canonical_observation_payloads;
 
 const OBSERVATIONS_ENDPOINT: &str = "https://api.stlouisfed.org/fred/series/observations";
 const DISCOVERY_PAGE_RECORDS: usize = 10_000;
@@ -167,67 +167,6 @@ impl FredDataset {
     }
 }
 
-#[derive(Serialize)]
-#[serde(deny_unknown_fields)]
-struct CanonicalFredObservation<'a> {
-    schema_version: u16,
-    provider_namespace: &'static str,
-    series_id: &'a str,
-    observation_date: String,
-    realtime_start: String,
-    realtime_end: String,
-    raw_value: &'a str,
-    value: Option<&'a str>,
-    missing: bool,
-    received_at_unix_nanos: i64,
-    availability: CanonicalAvailability,
-    quality: &'static str,
-    coverage: &'static str,
-}
-
-#[derive(Serialize)]
-#[serde(deny_unknown_fields)]
-struct CanonicalAvailability {
-    kind: &'static str,
-    observed_at_unix_nanos: i64,
-}
-
-fn canonical_payloads(
-    dataset: &FredDataset,
-    page: &crate::FredObservationPage,
-    received_at: Timestamp,
-) -> Result<Vec<Bytes>, FredSourceError> {
-    page.observations()
-        .iter()
-        .map(|observation| {
-            let missing = observation.value().is_none();
-            serde_json::to_vec(&CanonicalFredObservation {
-                schema_version: 1,
-                provider_namespace: match dataset.namespace {
-                    FredNamespace::Fred => "fred",
-                    FredNamespace::Alfred => "alfred",
-                },
-                series_id: dataset.series_id(),
-                observation_date: observation.observation_date().to_string(),
-                realtime_start: observation.realtime_start().to_string(),
-                realtime_end: observation.realtime_end().to_string(),
-                raw_value: observation.raw_value(),
-                value: (!missing).then_some(observation.raw_value()),
-                missing,
-                received_at_unix_nanos: received_at.unix_nanos(),
-                availability: CanonicalAvailability {
-                    kind: "local_first_observed",
-                    observed_at_unix_nanos: received_at.unix_nanos(),
-                },
-                quality: "official_delayed",
-                coverage: "macroeconomic",
-            })
-            .map(Bytes::from)
-            .map_err(|_| FredSourceError::Protocol)
-        })
-        .collect()
-}
-
 /// One exact, request-bound page retrieved for ephemeral inspection.
 #[derive(Clone, Debug)]
 pub struct FredExtractedPage {
@@ -255,12 +194,11 @@ impl FredExtractedPage {
 
 /// Registry-bound FRED and ALFRED extraction source.
 ///
-/// Discovery and [`Self::extract_page_ephemeral`] preserve provider civil dates without inventing
-/// an instant. The common durable [`ExtractionSource::extract`] entry point fails closed until the
-/// shared record contract can represent civil-date effective time and durable rights are granted.
+/// Every network operation requires a fresh registry-minted [`ExtractionAuthority`]. Durable
+/// extraction preserves provider civil dates and fails closed unless the exact series has an
+/// effective grant for [`FredOperation::Persist`].
 pub struct FredSource {
     metadata: SourceMetadata,
-    budget: SharedProviderBudget,
     api_key: FredApiKey,
     rights: FredRightsPolicy,
     transport: Arc<dyn FredTransport>,
@@ -282,10 +220,9 @@ impl std::fmt::Debug for FredSource {
 }
 
 impl FredSource {
-    /// Builds a production HTTP source from exact registry-issued budget authority.
+    /// Builds a production HTTP source whose network authority is supplied per operation.
     pub fn try_new(
         metadata: SourceMetadata,
-        registered: &RegisteredSource,
         api_key: FredApiKey,
         rights: FredRightsPolicy,
     ) -> Result<Self, FredSourceError> {
@@ -294,27 +231,17 @@ impl FredSource {
             NetworkAccessPolicy::Denied => return Err(FredSourceError::InvalidConfiguration),
         };
         let transport = Arc::new(ReqwestFredTransport::try_new(bounds)?);
-        Self::try_new_with_transport(
-            metadata,
-            registered,
-            api_key,
-            rights,
-            transport,
-            DISCOVERY_PAGE_RECORDS,
-        )
+        Self::try_new_with_transport(metadata, api_key, rights, transport, DISCOVERY_PAGE_RECORDS)
     }
 
     fn try_new_with_transport(
         metadata: SourceMetadata,
-        registered: &RegisteredSource,
         api_key: FredApiKey,
         rights: FredRightsPolicy,
         transport: Arc<dyn FredTransport>,
         discovery_page_records: usize,
     ) -> Result<Self, FredSourceError> {
-        if metadata.source_id() != registered.source_id()
-            || metadata.revision() != registered.revision()
-            || metadata.source_class() != SourceClass::OfficialAgency
+        if metadata.source_class() != SourceClass::OfficialAgency
             || metadata.provider().as_str() != "fred"
             || metadata.authorization().mode() != AuthorizationMode::UserAuthorized
             || metadata.coverage().domain() != CoverageDomain::Macroeconomic
@@ -328,10 +255,6 @@ impl FredSource {
             NetworkAccessPolicy::Allowlisted(policy) => policy,
             NetworkAccessPolicy::Denied => return Err(FredSourceError::InvalidConfiguration),
         };
-        let budget = registered
-            .budget()
-            .cloned()
-            .ok_or(FredSourceError::InvalidConfiguration)?;
         let bounds = policy.request_bounds();
         if discovery_page_records == 0 || discovery_page_records > 100_000 {
             return Err(FredSourceError::InvalidConfiguration);
@@ -340,7 +263,6 @@ impl FredSource {
             .map_err(|_| FredSourceError::InvalidConfiguration)?;
         Ok(Self {
             metadata,
-            budget,
             api_key,
             rights,
             transport,
@@ -353,9 +275,11 @@ impl FredSource {
     /// Refetches and verifies one exact page for ephemeral inspection only.
     pub async fn extract_page_ephemeral(
         &self,
+        authority: &ExtractionAuthority,
         request: &ExtractionRequest,
         cancellation: CancellationToken,
     ) -> Result<FredExtractedPage, ExtractionSourceError> {
+        self.validate_authority(authority)?;
         if request.object().source_id() != self.metadata.source_id()
             || request.object().metadata_revision() != self.metadata.revision()
         {
@@ -365,10 +289,35 @@ impl FredSource {
         }
         let dataset = FredDataset::parse(request.object().dataset())
             .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?;
-        let (offset, limit, expected_digest) = parse_object_id(request.object().object_id())
-            .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?;
+        let (offset, limit, expected_digest, expected_metadata_digest) =
+            parse_object_id(request.object().object_id())
+                .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?;
+        let series_metadata = self
+            .acquire_series_metadata(
+                authority,
+                request.object().dataset(),
+                request.deadline(),
+                cancellation.clone(),
+                FredOperation::RetrieveEphemeral,
+            )
+            .await?;
+        if series_metadata.evidence().content_digest().bytes() != expected_metadata_digest {
+            return Err(ExtractionSourceError::Source(
+                SourceError::GenerationResynchronizationRequired,
+            ));
+        }
         let fetched = self
-            .fetch_page(&dataset, offset, limit, request.deadline(), cancellation)
+            .fetch_page(
+                authority,
+                FredPageRequest {
+                    dataset: &dataset,
+                    offset,
+                    limit,
+                    deadline: request.deadline(),
+                    operation: FredOperation::RetrieveEphemeral,
+                },
+                cancellation,
+            )
             .await?;
         if fetched.digest != expected_digest
             || !payload_matches_exact_evidence(&fetched.response.body, request.object().evidence())
@@ -388,9 +337,21 @@ impl FredSource {
                 },
             ));
         }
-        let canonical_payloads =
-            canonical_payloads(&dataset, &fetched.page, fetched.response.received_at)
-                .map_err(map_adapter_error)?;
+        let ingested_at = system_timestamp().map_err(map_adapter_error)?;
+        let canonical = canonical_observation_payloads(
+            &self.metadata,
+            &dataset,
+            &fetched.page,
+            fetched.digest,
+            &series_metadata,
+            fetched.response.received_at,
+            ingested_at,
+        )
+        .map_err(map_adapter_error)?;
+        let canonical_payloads = canonical
+            .into_iter()
+            .map(|record| record.payload)
+            .collect::<Vec<_>>();
         let total = canonical_payloads.iter().try_fold(0_u64, |total, payload| {
             u64::try_from(payload.len())
                 .ok()
@@ -413,9 +374,11 @@ impl FredSource {
 
     async fn discover_impl(
         &self,
+        authority: ExtractionAuthority,
         request: DiscoveryRequest,
         cancellation: CancellationToken,
     ) -> Result<DiscoveryBatch, ExtractionSourceError> {
+        self.validate_authority(&authority)?;
         if request.effective_at().is_some() {
             return Err(ExtractionSourceError::Source(
                 SourceError::InvalidProtocolState,
@@ -423,16 +386,30 @@ impl FredSource {
         }
         let dataset = FredDataset::parse(request.dataset())
             .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?;
+        let series_metadata = self
+            .acquire_series_metadata(
+                &authority,
+                request.dataset(),
+                request.deadline(),
+                cancellation.clone(),
+                FredOperation::RetrieveEphemeral,
+            )
+            .await?;
+        let metadata_digest = series_metadata.evidence().content_digest().bytes();
         let mut objects = Vec::new();
         let mut offset = 0_usize;
         let mut expected_count = None;
         while objects.len() < usize::from(request.max_results()) {
             let fetched = self
                 .fetch_page(
-                    &dataset,
-                    offset,
-                    self.discovery_page_records,
-                    request.deadline(),
+                    &authority,
+                    FredPageRequest {
+                        dataset: &dataset,
+                        offset,
+                        limit: self.discovery_page_records,
+                        deadline: request.deadline(),
+                        operation: FredOperation::RetrieveEphemeral,
+                    },
                     cancellation.clone(),
                 )
                 .await?;
@@ -449,8 +426,13 @@ impl FredSource {
             expected_count = Some(fetched.page.count());
             let evidence = evidence_for_payload(&fetched.response.body, &fetched.public_url)
                 .map_err(map_adapter_error)?;
-            let object_id = page_object_id(offset, self.discovery_page_records, fetched.digest)
-                .map_err(map_adapter_error)?;
+            let object_id = page_object_id(
+                offset,
+                self.discovery_page_records,
+                fetched.digest,
+                metadata_digest,
+            )
+            .map_err(map_adapter_error)?;
             let effective = EffectiveInterval::new(fetched.response.received_at, None)
                 .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?;
             objects.push(SourceObject::try_new(
@@ -477,14 +459,116 @@ impl FredSource {
         DiscoveryBatch::try_new(&request, objects).map_err(ExtractionSourceError::from)
     }
 
+    async fn extract_impl(
+        &self,
+        authority: ExtractionAuthority,
+        request: ExtractionRequest,
+        cancellation: CancellationToken,
+    ) -> Result<ExtractionBatch, ExtractionSourceError> {
+        self.validate_authority(&authority)?;
+        if request.object().source_id() != self.metadata.source_id()
+            || request.object().metadata_revision() != self.metadata.revision()
+        {
+            return Err(ExtractionSourceError::Source(
+                SourceError::InvalidProtocolState,
+            ));
+        }
+        let dataset = FredDataset::parse(request.object().dataset())
+            .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?;
+        let (offset, limit, expected_page_digest, expected_metadata_digest) =
+            parse_object_id(request.object().object_id())
+                .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?;
+        let series_metadata = self
+            .acquire_series_metadata(
+                &authority,
+                request.object().dataset(),
+                request.deadline(),
+                cancellation.clone(),
+                FredOperation::Persist,
+            )
+            .await?;
+        if series_metadata.evidence().content_digest().bytes() != expected_metadata_digest {
+            return Err(ExtractionSourceError::Source(
+                SourceError::GenerationResynchronizationRequired,
+            ));
+        }
+        let fetched = self
+            .fetch_page(
+                &authority,
+                FredPageRequest {
+                    dataset: &dataset,
+                    offset,
+                    limit,
+                    deadline: request.deadline(),
+                    operation: FredOperation::Persist,
+                },
+                cancellation,
+            )
+            .await?;
+        if fetched.digest != expected_page_digest
+            || !payload_matches_exact_evidence(&fetched.response.body, request.object().evidence())
+            || request
+                .object()
+                .expected_bytes()
+                .is_some_and(|expected| expected != fetched.response.body.len() as u64)
+        {
+            return Err(ExtractionSourceError::Source(
+                SourceError::GenerationResynchronizationRequired,
+            ));
+        }
+        if fetched.page.observations().len() > request.max_records() as usize {
+            return Err(ExtractionSourceError::Contract(
+                market_squawk_sources::ExtractionError::RecordLimitExceeded {
+                    requested: request.max_records(),
+                },
+            ));
+        }
+        let ingested_at = system_timestamp().map_err(map_adapter_error)?;
+        let canonical = canonical_observation_payloads(
+            &self.metadata,
+            &dataset,
+            &fetched.page,
+            fetched.digest,
+            &series_metadata,
+            fetched.response.received_at,
+            ingested_at,
+        )
+        .map_err(map_adapter_error)?;
+        let schema = SourceIdentifier::try_from("market-squawk-research-v3")
+            .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?;
+        let records = canonical
+            .into_iter()
+            .map(|record| {
+                ExtractionRecord::try_new_with_time(
+                    &request,
+                    schema.clone(),
+                    record.evidence,
+                    record.effective,
+                    None,
+                    record.availability,
+                    record.revision,
+                    None,
+                    record.payload,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        ExtractionBatch::try_new(&request, records).map_err(ExtractionSourceError::from)
+    }
+
     async fn fetch_page(
         &self,
-        dataset: &FredDataset,
-        offset: usize,
-        limit: usize,
-        deadline: Timestamp,
+        authority: &ExtractionAuthority,
+        request: FredPageRequest<'_>,
         cancellation: CancellationToken,
     ) -> Result<FetchedPage, ExtractionSourceError> {
+        let FredPageRequest {
+            dataset,
+            offset,
+            limit,
+            deadline,
+            operation,
+        } = request;
+        self.validate_authority(authority)?;
         if cancellation.is_cancelled() {
             return Err(ExtractionSourceError::Cancelled);
         }
@@ -498,7 +582,7 @@ impl FredSource {
                 &SourceIdentifier::try_from(dataset.series_id()).map_err(|_| {
                     ExtractionSourceError::Source(SourceError::InvalidProtocolState)
                 })?,
-                &[FredOperation::RetrieveEphemeral],
+                &[operation],
                 now,
             )
             .map_err(|_| ExtractionSourceError::Source(SourceError::Unauthorized))?;
@@ -522,25 +606,9 @@ impl FredSource {
         authorization_target
             .query_pairs_mut()
             .append_pair("api_key", self.api_key.expose());
-        self.metadata
-            .network_policy()
-            .authorize(authorization_target.as_str())
-            .map_err(|_| ExtractionSourceError::Source(SourceError::Network))?;
+        let permit = authority.try_network_request(authorization_target.as_str())?;
+        let in_flight = permit.authorize_send(authorization_target.as_str())?;
         drop(authorization_target);
-
-        let _permit = match self.budget.try_acquire() {
-            BudgetDecision::Ready(permit) => permit,
-            BudgetDecision::WaitUntil(deadline) => {
-                return Err(ExtractionSourceError::Source(
-                    SourceError::BudgetWaitUntil { deadline },
-                ));
-            }
-            BudgetDecision::Unavailable(reason) => {
-                return Err(ExtractionSourceError::Source(
-                    SourceError::BudgetUnavailable { reason },
-                ));
-            }
-        };
         let wall_remaining = deadline
             .unix_nanos()
             .checked_sub(now.unix_nanos())
@@ -561,6 +629,10 @@ impl FredSource {
             )
             .await
             .map_err(map_adapter_error)?;
+        in_flight.validate_response_size(
+            u64::try_from(response.body.len())
+                .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?,
+        )?;
         if response
             .content_encoding
             .as_deref()
@@ -574,10 +646,10 @@ impl FredSource {
             200 => {}
             401 | 403 => return Err(ExtractionSourceError::Source(SourceError::Unauthorized)),
             429 | 503 => {
-                let decision =
-                    apply_http_retry_after(&self.budget, response.retry_after.as_deref(), 0);
+                let deadline =
+                    in_flight.apply_retry_after_header(response.retry_after.as_deref(), 0)?;
                 return Err(ExtractionSourceError::Source(
-                    SourceError::from_applied_budget_refusal(decision),
+                    SourceError::BudgetWaitUntil { deadline },
                 ));
             }
             _ => return Err(ExtractionSourceError::Source(SourceError::Network)),
@@ -596,6 +668,19 @@ impl FredSource {
             public_url,
         })
     }
+
+    fn validate_authority(
+        &self,
+        authority: &ExtractionAuthority,
+    ) -> Result<(), ExtractionSourceError> {
+        authority.validate_current()?;
+        if authority.metadata() != &self.metadata {
+            return Err(ExtractionSourceError::Source(
+                SourceError::InvalidProtocolState,
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl SourceMetadataProvider for FredSource {
@@ -607,22 +692,20 @@ impl SourceMetadataProvider for FredSource {
 impl ExtractionSource for FredSource {
     fn discover(
         &self,
+        authority: ExtractionAuthority,
         request: DiscoveryRequest,
         cancellation: CancellationToken,
     ) -> BoxFuture<'_, Result<DiscoveryBatch, ExtractionSourceError>> {
-        Box::pin(self.discover_impl(request, cancellation))
+        Box::pin(self.discover_impl(authority, request, cancellation))
     }
 
     fn extract(
         &self,
-        _request: ExtractionRequest,
-        _cancellation: CancellationToken,
+        authority: ExtractionAuthority,
+        request: ExtractionRequest,
+        cancellation: CancellationToken,
     ) -> BoxFuture<'_, Result<ExtractionBatch, ExtractionSourceError>> {
-        Box::pin(async {
-            Err(ExtractionSourceError::Source(
-                SourceError::InvalidProtocolState,
-            ))
-        })
+        Box::pin(self.extract_impl(authority, request, cancellation))
     }
 }
 
@@ -631,6 +714,14 @@ struct FetchedPage {
     page: FredObservationPage,
     digest: [u8; 32],
     public_url: url::Url,
+}
+
+struct FredPageRequest<'a> {
+    dataset: &'a FredDataset,
+    offset: usize,
+    limit: usize,
+    deadline: Timestamp,
+    operation: FredOperation,
 }
 
 #[cfg(test)]

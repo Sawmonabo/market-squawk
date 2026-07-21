@@ -43,15 +43,20 @@ pub(super) fn evidence_for_payload(
 pub(super) fn page_object_id(
     offset: usize,
     limit: usize,
-    digest: [u8; 32],
+    page_digest: [u8; 32],
+    metadata_digest: [u8; 32],
 ) -> Result<SourceIdentifier, FredSourceError> {
-    SourceIdentifier::try_from(format!("fred-page:{offset}:{limit}:{}", lower_hex(digest)))
-        .map_err(|_| FredSourceError::InvalidConfiguration)
+    SourceIdentifier::try_from(format!(
+        "fred-page:{offset}:{limit}:{}:{}",
+        lower_hex(page_digest),
+        lower_hex(metadata_digest),
+    ))
+    .map_err(|_| FredSourceError::InvalidConfiguration)
 }
 
 pub(super) fn parse_object_id(
     value: &SourceIdentifier,
-) -> Result<(usize, usize, [u8; 32]), FredSourceError> {
+) -> Result<(usize, usize, [u8; 32], [u8; 32]), FredSourceError> {
     let mut fields = value.as_str().split(':');
     if fields.next() != Some("fred-page") {
         return Err(FredSourceError::InvalidDataset);
@@ -66,15 +71,29 @@ pub(super) fn parse_object_id(
         .ok_or(FredSourceError::InvalidDataset)?
         .parse()
         .map_err(|_| FredSourceError::InvalidDataset)?;
-    let digest = fields.next().ok_or(FredSourceError::InvalidDataset)?;
-    if fields.next().is_some() || limit == 0 || digest.len() != 64 {
+    let page_digest = fields.next().ok_or(FredSourceError::InvalidDataset)?;
+    let metadata_digest = fields.next().ok_or(FredSourceError::InvalidDataset)?;
+    if fields.next().is_some()
+        || limit == 0
+        || page_digest.len() != 64
+        || metadata_digest.len() != 64
+    {
         return Err(FredSourceError::InvalidDataset);
     }
+    Ok((
+        offset,
+        limit,
+        parse_lower_hex(page_digest)?,
+        parse_lower_hex(metadata_digest)?,
+    ))
+}
+
+fn parse_lower_hex(value: &str) -> Result<[u8; 32], FredSourceError> {
     let mut bytes = [0_u8; 32];
-    for (index, pair) in digest.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
         bytes[index] = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
     }
-    Ok((offset, limit, bytes))
+    Ok(bytes)
 }
 
 fn hex_nibble(value: u8) -> Result<u8, FredSourceError> {
