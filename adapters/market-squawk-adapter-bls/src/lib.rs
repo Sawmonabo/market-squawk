@@ -12,4 +12,4 @@ pub use observations::{
     BlsFootnote, BlsObservation, BlsParseError, BlsResponse, BlsSeries, BlsVintageCapability,
 };
 pub use series_metadata::BlsSeriesMetadata;
-pub use source::{BlsNormalizedPage, BlsSource, BlsSourceConfig};
+pub use source::{BlsNormalizedPage, BlsSource, BlsSourceConfig, BlsSourceHealth};

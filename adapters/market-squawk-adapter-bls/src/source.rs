@@ -1,31 +1,40 @@
 use std::collections::BTreeMap;
-use std::mem::size_of;
-use std::sync::{Arc, Mutex};
+#[cfg(test)]
+use std::sync::Arc;
+use std::sync::Mutex;
 
 use bytes::Bytes;
+use futures_util::future::BoxFuture;
 use market_squawk_domain::{
     DataQuality, DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence,
-    SourceIdentifier,
+    SourceIdentifier, Timestamp,
 };
 use market_squawk_sources::{
-    AuthorizationMode, DiscoveryBatch, DiscoveryRequest, ExtractionRequest, ExtractionSourceError,
-    HistoricalCapability, MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES, RegisteredSource, SourceClass,
-    SourceError, SourceMetadata, SourceMetadataProvider, SourceObject, SourceProtocolProfile,
+    AuthorizationMode, BudgetWindowSemantics, CoverageDomain, DiscoveryBatch, DiscoveryRequest,
+    ExtractionAuthority, ExtractionBatch, ExtractionRequest, ExtractionSource,
+    ExtractionSourceError, HistoricalCapability, ProviderBudgetPolicy, SourceClass, SourceError,
+    SourceMetadata, SourceMetadataProvider, SourceObject, SourceProtocolProfile,
     payload_matches_exact_evidence,
 };
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
-use crate::client::{BlsHttpClient, RetrievedBlsPage, ensure_deadline_open};
-use crate::observations::canonical_payloads;
+use crate::client::{BlsHttpClient, RetrievedBlsPage, ensure_deadline_open, system_timestamp};
 use crate::{
     BlsAccessTier, BlsAuthorization, BlsRequestLimits, BlsRequestPlan, BlsSeriesMetadata,
     BlsSourceError,
 };
 
 const NANOS_PER_DAY: u64 = 86_400_000_000_000;
+const NANOS_PER_TEN_SECONDS: u64 = 10_000_000_000;
 const REQUESTS_PER_TEN_SECONDS: u16 = 50;
-const CACHE_ENTRY_OVERHEAD_BYTES: usize = 512;
+
+mod normalize;
+mod state;
+
+use normalize::canonical_records;
+use state::PageCache;
+pub use state::{BlsNormalizedPage, BlsSourceHealth};
 
 /// Exact, deterministic BLS source configuration bound into its dataset identity.
 #[derive(Clone, Debug)]
@@ -36,126 +45,13 @@ pub struct BlsSourceConfig {
     dataset: SourceIdentifier,
 }
 
-#[derive(Debug)]
-struct PageCache {
-    limit: u64,
-    retained_bytes: u64,
-    pages: BTreeMap<String, CachedBlsPage>,
-}
-
-#[derive(Clone, Debug)]
-struct CachedBlsPage {
-    bytes: Arc<[u8]>,
-    received_at: market_squawk_domain::Timestamp,
-    sha256_hex: String,
-}
-
-impl PageCache {
-    fn new() -> Self {
-        Self::with_limit(MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES)
-    }
-
-    fn with_limit(limit: u64) -> Self {
-        Self {
-            limit,
-            retained_bytes: 0,
-            pages: BTreeMap::new(),
-        }
-    }
-
-    fn insert(
-        &mut self,
-        object_id: &SourceIdentifier,
-        page: &RetrievedBlsPage,
-    ) -> Result<bool, SourceError> {
-        if self.pages.contains_key(object_id.as_str()) {
-            return Ok(true);
-        }
-        let bytes = Self::retained_charge(object_id, page)?;
-        let next = self
-            .retained_bytes
-            .checked_add(bytes)
-            .ok_or(SourceError::FrameTooLarge {
-                max: MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES as usize,
-            })?;
-        if next > self.limit {
-            return Ok(false);
-        }
-        self.retained_bytes = next;
-        self.pages.insert(
-            object_id.as_str().to_owned(),
-            CachedBlsPage {
-                bytes: Arc::from(page.bytes.as_ref()),
-                received_at: page.received_at,
-                sha256_hex: page.sha256_hex.clone(),
-            },
-        );
-        Ok(true)
-    }
-
-    fn retained_charge(
-        object_id: &SourceIdentifier,
-        page: &RetrievedBlsPage,
-    ) -> Result<u64, SourceError> {
-        let charge = page
-            .bytes
-            .len()
-            .checked_add(object_id.as_str().len())
-            .and_then(|bytes| bytes.checked_add(page.sha256_hex.len()))
-            .and_then(|bytes| bytes.checked_add(size_of::<CachedBlsPage>()))
-            .and_then(|bytes| bytes.checked_add(CACHE_ENTRY_OVERHEAD_BYTES))
-            .ok_or(SourceError::FrameTooLarge {
-                max: MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES as usize,
-            })?;
-        u64::try_from(charge).map_err(|_| SourceError::FrameTooLarge {
-            max: MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES as usize,
-        })
-    }
-}
-
-impl std::fmt::Debug for RetrievedBlsPage {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("RetrievedBlsPage")
-            .field("bytes", &self.bytes.len())
-            .field("received_at", &self.received_at)
-            .field("sha256_hex", &self.sha256_hex)
-            .finish_non_exhaustive()
-    }
-}
-
-/// A normalized BLS response page retaining local availability and exact source evidence.
-#[derive(Clone, Debug)]
-pub struct BlsNormalizedPage {
-    received_at: market_squawk_domain::Timestamp,
-    source_payload_sha256: String,
-    payloads: Vec<Bytes>,
-}
-
-impl BlsNormalizedPage {
-    /// Returns the process-local first-observation time for this exact source response.
-    pub const fn received_at(&self) -> market_squawk_domain::Timestamp {
-        self.received_at
-    }
-
-    /// Returns the lowercase SHA-256 identity of the exact provider response.
-    pub fn source_payload_sha256(&self) -> &str {
-        &self.source_payload_sha256
-    }
-
-    /// Returns deterministic normalized record payloads without fabricated temporal precision.
-    pub fn payloads(&self) -> &[Bytes] {
-        &self.payloads
-    }
-}
-
 /// Registered, allowlisted, budget-coordinated BLS extraction producer.
 pub struct BlsSource {
     metadata: SourceMetadata,
-    budget: market_squawk_sources::SharedProviderBudget,
     config: BlsSourceConfig,
     http: BlsHttpClient,
     cache: Mutex<PageCache>,
+    health: Mutex<BlsSourceHealth>,
 }
 
 impl std::fmt::Debug for BlsSource {
@@ -171,7 +67,7 @@ impl std::fmt::Debug for BlsSource {
 }
 
 impl BlsSource {
-    /// Binds a provider configuration to registry-issued budget authority and exact metadata.
+    /// Binds a provider configuration to exact immutable metadata.
     ///
     /// # Errors
     ///
@@ -179,9 +75,44 @@ impl BlsSource {
     /// extraction-only source with an allowlisted endpoint and the matching authorization mode.
     pub fn try_new(
         metadata: SourceMetadata,
-        registered: &RegisteredSource,
         config: BlsSourceConfig,
     ) -> Result<Self, BlsSourceError> {
+        Self::validate_metadata(&metadata, &config)?;
+        let http = BlsHttpClient::try_new(&metadata, config.authorization().clone())?;
+        Ok(Self {
+            metadata,
+            config,
+            http,
+            cache: Mutex::new(PageCache::new()),
+            health: Mutex::new(BlsSourceHealth::new()),
+        })
+    }
+
+    #[cfg(test)]
+    fn try_new_with_transport(
+        metadata: SourceMetadata,
+        config: BlsSourceConfig,
+        transport: Arc<dyn crate::client::BlsTransport>,
+    ) -> Result<Self, BlsSourceError> {
+        Self::validate_metadata(&metadata, &config)?;
+        let http = BlsHttpClient::try_new_with_transport(
+            &metadata,
+            config.authorization().clone(),
+            transport,
+        )?;
+        Ok(Self {
+            metadata,
+            config,
+            http,
+            cache: Mutex::new(PageCache::new()),
+            health: Mutex::new(BlsSourceHealth::new()),
+        })
+    }
+
+    fn validate_metadata(
+        metadata: &SourceMetadata,
+        config: &BlsSourceConfig,
+    ) -> Result<(), BlsSourceError> {
         let expected_mode = match config.authorization() {
             BlsAuthorization::PublicV1 => AuthorizationMode::PublicInterface,
             BlsAuthorization::RegisteredV2(_) => AuthorizationMode::UserAuthorized,
@@ -189,21 +120,12 @@ impl BlsSource {
         let budget_policy = metadata
             .budget_policy()
             .ok_or(BlsSourceError::InvalidMetadata)?;
-        if registered.source_id() != metadata.source_id()
-            || registered.revision() != metadata.revision()
-            || metadata.source_class() != SourceClass::OfficialAgency
-            || metadata.coverage().domain() != market_squawk_sources::CoverageDomain::Macroeconomic
+        if metadata.source_class() != SourceClass::OfficialAgency
+            || metadata.provider().as_str() != "us-bls"
+            || metadata.coverage().domain() != CoverageDomain::Macroeconomic
             || metadata.quality_ceiling() != DataQuality::OfficialDelayed
             || metadata.authorization().mode() != expected_mode
-            || budget_policy.requests_per_window()
-                > u32::from(
-                    config
-                        .plan()
-                        .limits()
-                        .daily_queries()
-                        .min(REQUESTS_PER_TEN_SECONDS),
-                )
-            || budget_policy.window_nanos() < NANOS_PER_DAY
+            || !budget_matches_provider_limits(budget_policy, config.limits())
             || metadata.capabilities().live()
             || !metadata.capabilities().extraction()
             || metadata.capabilities().historical() != HistoricalCapability::Historical
@@ -211,18 +133,10 @@ impl BlsSource {
         {
             return Err(BlsSourceError::InvalidMetadata);
         }
-        let budget = registered
-            .budget()
-            .cloned()
-            .ok_or(BlsSourceError::InvalidMetadata)?;
-        let http = BlsHttpClient::try_new(&metadata, config.authorization().clone())?;
-        Ok(Self {
-            metadata,
-            budget,
-            config,
-            http,
-            cache: Mutex::new(PageCache::new()),
-        })
+        metadata
+            .network_policy()
+            .authorize(config.authorization().endpoint())
+            .map_err(|_| BlsSourceError::InvalidMetadata)
     }
 
     /// Returns the exact request-plan-bound dataset callers use for discovery.
@@ -230,12 +144,26 @@ impl BlsSource {
         self.config.dataset()
     }
 
+    /// Returns a bounded copy of local producer health.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed if health synchronization was poisoned.
+    pub fn health(&self) -> Result<BlsSourceHealth, BlsSourceError> {
+        self.health
+            .lock()
+            .map(|health| *health)
+            .map_err(|_| BlsSourceError::HealthUnavailable)
+    }
+
     /// Fetches and discovers exact response objects under bounded network and cache limits.
     pub async fn discover_pages(
         &self,
+        authority: ExtractionAuthority,
         request: DiscoveryRequest,
         cancellation: CancellationToken,
     ) -> Result<DiscoveryBatch, ExtractionSourceError> {
+        self.validate_authority(&authority)?;
         if request.dataset() != self.config.dataset()
             || request.effective_at().is_some()
             || self.config.plan().chunks().len() > usize::from(request.max_results())
@@ -245,14 +173,7 @@ impl BlsSource {
         let mut discovered = Vec::with_capacity(self.config.plan().chunks().len());
         for (index, chunk) in self.config.plan().chunks().iter().enumerate() {
             let page = self
-                .http
-                .fetch(
-                    &self.metadata,
-                    &self.budget,
-                    chunk,
-                    request.deadline(),
-                    &cancellation,
-                )
+                .fetch_page(&authority, chunk, request.deadline(), &cancellation)
                 .await?;
             if page.response.is_partial() {
                 return Err(SourceError::GenerationResynchronizationRequired.into());
@@ -294,9 +215,11 @@ impl BlsSource {
     /// if the provider response no longer matches the discovered content digest.
     pub async fn normalized_page(
         &self,
+        authority: &ExtractionAuthority,
         request: &ExtractionRequest,
         cancellation: CancellationToken,
     ) -> Result<BlsNormalizedPage, ExtractionSourceError> {
+        self.validate_authority(authority)?;
         if cancellation.is_cancelled() {
             return Err(ExtractionSourceError::Cancelled);
         }
@@ -346,14 +269,7 @@ impl BlsSource {
             }
             None => {
                 let page = self
-                    .http
-                    .fetch(
-                        &self.metadata,
-                        &self.budget,
-                        chunk,
-                        request.deadline(),
-                        &cancellation,
-                    )
+                    .fetch_page(authority, chunk, request.deadline(), &cancellation)
                     .await?;
                 if !payload_matches_exact_evidence(&page.bytes, request.object().evidence()) {
                     return Err(SourceError::GenerationResynchronizationRequired.into());
@@ -375,9 +291,18 @@ impl BlsSource {
             return Err(ExtractionSourceError::Cancelled);
         }
         ensure_deadline_open(request.deadline())?;
-        let payloads = canonical_payloads(&page.response, page.received_at, &page.sha256_hex)
-            .map_err(|_| SourceError::InvalidProtocolState)?;
-        if payloads.len() > request.max_records() as usize {
+        let observed_at = request.object().effective_interval().starts_at();
+        let ingested_at = system_timestamp().map_err(|_| SourceError::TrustedTimeUnavailable)?;
+        let records = canonical_records(
+            &self.metadata,
+            &self.config,
+            &page.response,
+            &page.bytes,
+            observed_at,
+            ingested_at,
+        )
+        .map_err(|_| SourceError::InvalidProtocolState)?;
+        if records.len() > request.max_records() as usize {
             return Err(
                 market_squawk_sources::ExtractionError::RecordLimitExceeded {
                     requested: request.max_records(),
@@ -385,8 +310,8 @@ impl BlsSource {
                 .into(),
             );
         }
-        let payload_bytes = payloads.iter().try_fold(0_u64, |total, payload| {
-            u64::try_from(payload.len())
+        let payload_bytes = records.iter().try_fold(0_u64, |total, record| {
+            u64::try_from(record.payload.len())
                 .ok()
                 .and_then(|length| total.checked_add(length))
                 .ok_or(SourceError::InvalidProtocolState)
@@ -397,11 +322,107 @@ impl BlsSource {
             }
             .into());
         }
+        let payloads = records
+            .iter()
+            .map(|record| record.payload.clone())
+            .collect();
         Ok(BlsNormalizedPage {
-            received_at: page.received_at,
+            received_at: observed_at,
             source_payload_sha256: page.sha256_hex,
+            exact_payload: page.bytes,
             payloads,
+            records,
         })
+    }
+
+    async fn extract_impl(
+        &self,
+        authority: ExtractionAuthority,
+        request: ExtractionRequest,
+        cancellation: CancellationToken,
+    ) -> Result<ExtractionBatch, ExtractionSourceError> {
+        let page = self
+            .normalized_page(&authority, &request, cancellation)
+            .await?;
+        let schema = SourceIdentifier::try_from("market-squawk-research-v3")
+            .map_err(|_| SourceError::InvalidProtocolState)?;
+        let records = page
+            .records
+            .into_iter()
+            .map(|record| {
+                market_squawk_sources::ExtractionRecord::try_new_with_time(
+                    &request,
+                    schema.clone(),
+                    record.evidence,
+                    record.effective,
+                    None,
+                    record.availability,
+                    record.revision,
+                    None,
+                    record.payload,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        ExtractionBatch::try_new(&request, records).map_err(Into::into)
+    }
+
+    fn validate_authority(
+        &self,
+        authority: &ExtractionAuthority,
+    ) -> Result<(), ExtractionSourceError> {
+        authority.validate_current()?;
+        if authority.metadata() != &self.metadata {
+            return Err(SourceError::InvalidProtocolState.into());
+        }
+        Ok(())
+    }
+
+    async fn fetch_page(
+        &self,
+        authority: &ExtractionAuthority,
+        chunk: &crate::BlsRequestChunk,
+        deadline: Timestamp,
+        cancellation: &CancellationToken,
+    ) -> Result<RetrievedBlsPage, ExtractionSourceError> {
+        self.record_attempt()
+            .map_err(|_| SourceError::InvalidProtocolState)?;
+        let result = self
+            .http
+            .fetch(&self.metadata, authority, chunk, deadline, cancellation)
+            .await;
+        self.record_result(&result)?;
+        result
+    }
+
+    fn record_attempt(&self) -> Result<(), BlsSourceError> {
+        let now = system_timestamp()?;
+        let mut health = self
+            .health
+            .lock()
+            .map_err(|_| BlsSourceError::HealthUnavailable)?;
+        health.last_attempt_at = Some(now);
+        Ok(())
+    }
+
+    fn record_result(
+        &self,
+        result: &Result<RetrievedBlsPage, ExtractionSourceError>,
+    ) -> Result<(), ExtractionSourceError> {
+        let mut health = self
+            .health
+            .lock()
+            .map_err(|_| SourceError::InvalidProtocolState)?;
+        match result {
+            Ok(page) => {
+                health.last_success_at = Some(page.received_at);
+                health.last_payload_digest = Some(Sha256::digest(&page.bytes).into());
+                health.consecutive_failures = 0;
+            }
+            Err(_) => {
+                health.consecutive_failures = health.consecutive_failures.saturating_add(1);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -409,6 +430,42 @@ impl SourceMetadataProvider for BlsSource {
     fn metadata(&self) -> &SourceMetadata {
         &self.metadata
     }
+}
+
+impl ExtractionSource for BlsSource {
+    fn discover(
+        &self,
+        authority: ExtractionAuthority,
+        request: DiscoveryRequest,
+        cancellation: CancellationToken,
+    ) -> BoxFuture<'_, Result<DiscoveryBatch, ExtractionSourceError>> {
+        Box::pin(self.discover_pages(authority, request, cancellation))
+    }
+
+    fn extract(
+        &self,
+        authority: ExtractionAuthority,
+        request: ExtractionRequest,
+        cancellation: CancellationToken,
+    ) -> BoxFuture<'_, Result<ExtractionBatch, ExtractionSourceError>> {
+        Box::pin(self.extract_impl(authority, request, cancellation))
+    }
+}
+
+fn budget_matches_provider_limits(policy: &ProviderBudgetPolicy, limits: BlsRequestLimits) -> bool {
+    let Some(short) = policy.window(0) else {
+        return false;
+    };
+    let Some(daily) = policy.window(1) else {
+        return false;
+    };
+    policy.window_count() == 2
+        && short.requests_per_window() == u32::from(REQUESTS_PER_TEN_SECONDS)
+        && short.window_nanos() == NANOS_PER_TEN_SECONDS
+        && short.semantics() == BudgetWindowSemantics::Sliding
+        && daily.requests_per_window() == u32::from(limits.daily_queries())
+        && daily.window_nanos() == NANOS_PER_DAY
+        && daily.semantics() == BudgetWindowSemantics::Sliding
 }
 
 fn exact_evidence(payload: &[u8]) -> ExactPayloadEvidence {
@@ -563,53 +620,5 @@ fn hash_field(hash: &mut Sha256, value: &[u8]) -> Result<(), BlsSourceError> {
 }
 
 #[cfg(test)]
-mod tests {
-    use bytes::Bytes;
-    use market_squawk_domain::{SourceIdentifier, Timestamp};
-
-    use super::{PageCache, RetrievedBlsPage, parse_object_id};
-    use crate::{BlsAccessTier, BlsResponse};
-
-    fn page(
-        bytes: &'static [u8],
-        digest: &str,
-    ) -> Result<RetrievedBlsPage, Box<dyn std::error::Error>> {
-        Ok(RetrievedBlsPage {
-            bytes: Bytes::from_static(bytes),
-            response: BlsResponse::parse(
-                include_bytes!("../fixtures/series.json"),
-                BlsAccessTier::PublicV1,
-            )?,
-            received_at: Timestamp::from_unix_nanos(1),
-            sha256_hex: digest.to_owned(),
-        })
-    }
-
-    #[test]
-    fn object_id_requires_exact_lowercase_sha256() -> Result<(), Box<dyn std::error::Error>> {
-        let lowercase = SourceIdentifier::try_from(format!("bls:0:{}", "a".repeat(64)))?;
-        assert_eq!(parse_object_id(&lowercase)?.0, 0);
-
-        let uppercase = SourceIdentifier::try_from(format!("bls:0:{}", "A".repeat(64)))?;
-        assert!(parse_object_id(&uppercase).is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn full_cache_skips_new_pages_without_crossing_its_bound()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let first_id = SourceIdentifier::try_from("bls:first")?;
-        let second_id = SourceIdentifier::try_from("bls:second")?;
-
-        let first = page(b"1234", "first")?;
-        let first_charge = PageCache::retained_charge(&first_id, &first)?;
-        let mut cache = PageCache::with_limit(first_charge);
-
-        assert!(cache.insert(&first_id, &first)?);
-        assert!(!cache.insert(&second_id, &page(b"5", "second")?)?);
-        assert_eq!(cache.retained_bytes, first_charge);
-        assert!(cache.pages.contains_key(first_id.as_str()));
-        assert!(!cache.pages.contains_key(second_id.as_str()));
-        Ok(())
-    }
-}
+#[path = "source/tests.rs"]
+mod tests;

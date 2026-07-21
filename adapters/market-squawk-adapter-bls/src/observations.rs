@@ -1,13 +1,10 @@
 use std::collections::BTreeSet;
 use std::str::FromStr;
 
-use bytes::Bytes;
-use market_squawk_domain::Timestamp;
 use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use thiserror::Error;
 
-use crate::BlsSourceError;
 use crate::chunks::{BlsAccessTier, is_valid_identifier_byte, limits_for};
 
 pub(crate) const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
@@ -143,15 +140,16 @@ impl BlsResponse {
                 return Err(BlsParseError::LimitExceeded);
             }
             let mut observations = Vec::with_capacity(series_wire.data.len());
+            let mut periods = BTreeSet::new();
             for observation in series_wire.data {
                 let year = u16::from_str(&observation.year)
                     .map_err(|_| BlsParseError::InvalidField("year"))?;
                 if year < 1900 {
                     return Err(BlsParseError::InvalidField("year"));
                 }
-                if observation.period.is_empty()
-                    || observation.period.len() > 8
+                if period_parts(&observation.period).is_none()
                     || observation.period_name.len() > 64
+                    || !periods.insert((year, observation.period.clone()))
                 {
                     return Err(BlsParseError::InvalidField("period"));
                 }
@@ -363,127 +361,26 @@ fn validate_identifier(value: &str) -> Result<(), BlsParseError> {
     Ok(())
 }
 
+pub(crate) fn period_parts(code: &str) -> Option<(&'static str, u16, &'static str)> {
+    let bytes = code.as_bytes();
+    if bytes.len() != 3 || !bytes[1..].iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let ordinal = u16::from(bytes[1] - b'0')
+        .checked_mul(10)?
+        .checked_add(u16::from(bytes[2] - b'0'))?;
+    match (bytes[0], ordinal) {
+        (b'M', 1..=13) => Some(("bls-monthly", ordinal, "monthly")),
+        (b'Q', 1..=5) => Some(("bls-quarterly", ordinal, "quarterly")),
+        (b'S', 1..=3) => Some(("bls-semiannual", ordinal, "semiannual")),
+        (b'A', 1) => Some(("bls-annual", ordinal, "annual")),
+        _ => None,
+    }
+}
+
 fn validate_messages(messages: &[String]) -> Result<(), BlsParseError> {
     if messages.len() > 100 || messages.iter().any(|message| message.len() > 8 * 1024) {
         return Err(BlsParseError::LimitExceeded);
     }
     Ok(())
-}
-
-#[derive(Serialize)]
-#[serde(deny_unknown_fields)]
-struct CanonicalBlsObservation<'a> {
-    schema_version: u16,
-    series_id: &'a str,
-    source_period: CanonicalBlsPeriod<'a>,
-    raw_value: &'a str,
-    value: Option<String>,
-    latest: bool,
-    preliminary: bool,
-    footnotes: Vec<CanonicalBlsFootnote<'a>>,
-    source_payload_sha256: &'a str,
-    received_at_unix_nanos: i64,
-    availability: CanonicalAvailability,
-    revision_capability: &'static str,
-    quality: &'static str,
-    coverage: &'static str,
-}
-
-#[derive(Serialize)]
-#[serde(deny_unknown_fields)]
-struct CanonicalBlsPeriod<'a> {
-    year: u16,
-    code: &'a str,
-    name: &'a str,
-}
-
-#[derive(Serialize)]
-#[serde(deny_unknown_fields)]
-struct CanonicalBlsFootnote<'a> {
-    code: Option<&'a str>,
-    text: Option<&'a str>,
-}
-
-#[derive(Serialize)]
-#[serde(deny_unknown_fields)]
-struct CanonicalAvailability {
-    kind: &'static str,
-    observed_at_unix_nanos: i64,
-}
-
-pub(crate) fn canonical_payloads(
-    response: &BlsResponse,
-    received_at: Timestamp,
-    source_payload_sha256: &str,
-) -> Result<Vec<Bytes>, BlsSourceError> {
-    response
-        .series
-        .iter()
-        .flat_map(|series| {
-            series.observations.iter().map(move |observation| {
-                let footnotes = observation
-                    .footnotes
-                    .iter()
-                    .map(|footnote| CanonicalBlsFootnote {
-                        code: footnote.code.as_deref(),
-                        text: footnote.text.as_deref(),
-                    })
-                    .collect();
-                serde_json::to_vec(&CanonicalBlsObservation {
-                    schema_version: 1,
-                    series_id: &series.series_id,
-                    source_period: CanonicalBlsPeriod {
-                        year: observation.year,
-                        code: &observation.period,
-                        name: &observation.period_name,
-                    },
-                    raw_value: &observation.raw_value,
-                    value: observation.value.map(|value| value.to_string()),
-                    latest: observation.latest,
-                    preliminary: observation.preliminary,
-                    footnotes,
-                    source_payload_sha256,
-                    received_at_unix_nanos: received_at.unix_nanos(),
-                    availability: CanonicalAvailability {
-                        kind: "local_first_observed",
-                        observed_at_unix_nanos: received_at.unix_nanos(),
-                    },
-                    revision_capability: "locally_observed_versions_only",
-                    quality: "official_delayed",
-                    coverage: "macroeconomic",
-                })
-                .map(Bytes::from)
-                .map_err(|_| BlsSourceError::Protocol)
-            })
-        })
-        .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use market_squawk_domain::Timestamp;
-
-    use super::{BlsAccessTier, BlsResponse, canonical_payloads};
-
-    #[test]
-    fn canonical_payload_preserves_provider_period_without_invented_day_or_publication_time()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let response = BlsResponse::parse(
-            include_bytes!("../fixtures/series.json"),
-            BlsAccessTier::PublicV1,
-        )?;
-        let payloads = canonical_payloads(
-            &response,
-            Timestamp::from_unix_nanos(77),
-            "0123456789abcdef",
-        )?;
-        let first: serde_json::Value = serde_json::from_slice(&payloads[0])?;
-        assert_eq!(first["series_id"], "LNS14000000");
-        assert_eq!(first["source_period"]["year"], 2026);
-        assert_eq!(first["source_period"]["code"], "M06");
-        assert_eq!(first["received_at_unix_nanos"], 77);
-        assert!(first.get("effective_at").is_none());
-        assert!(first.get("published_at").is_none());
-        Ok(())
-    }
 }

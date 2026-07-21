@@ -148,6 +148,24 @@ fn requested_series_binding_rejects_missing_extra_and_duplicate_results() -> Tes
         ),
         Err(BlsParseError::RequestYearMismatch)
     ));
+
+    let invalid_period = br#"{
+        "status":"REQUEST_SUCCEEDED","responseTime":1,"message":[],
+        "Results":{"series":[{"seriesID":"LNS14000000","data":[{
+            "year":"2026","period":"M14","periodName":"invalid","value":"1.0",
+            "footnotes":[]
+        }]}]}
+    }"#;
+    assert!(matches!(
+        BlsResponse::parse_for_request(
+            invalid_period,
+            BlsAccessTier::PublicV1,
+            &["LNS14000000"],
+            2026,
+            2026,
+        ),
+        Err(BlsParseError::InvalidField("period"))
+    ));
     Ok(())
 }
 
