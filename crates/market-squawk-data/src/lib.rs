@@ -8,6 +8,7 @@ mod arrow_convert;
 mod authority_transition;
 mod blocking_supervisor;
 mod catalog;
+mod corporate_actions;
 mod ingest;
 mod manifest;
 mod migrations;
@@ -38,6 +39,12 @@ pub use catalog::{
     DatasetManifestRecord, IngestReservation, IngestRunRecord, IngestRunState, PublishedIngest,
     QueryArtifactReservation, QueryArtifactReservationInput, QueryArtifactResult, ReferenceBundle,
     ResumedIngest, SourceCursor,
+};
+pub use corporate_actions::{
+    AdjustmentConflict, AdjustmentRatio, AdjustmentStep, CorporateActionAdjustment,
+    CorporateActionError, CorporateActionExclusion, CorporateActionExclusionReason,
+    CorporateActionLimits, CorporateActionPlan, CorporateActionPolicy, CorporateActionRecord,
+    MAX_CORPORATE_ACTION_RETAINED_BYTES, MAX_CORPORATE_ACTIONS,
 };
 pub use ingest::{
     AnalyticalDataService, CommittedDataset, CompactionRequest, IngestError,
