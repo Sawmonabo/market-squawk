@@ -2,7 +2,9 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::marker::PhantomData;
 use std::mem::size_of;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Serialize;
@@ -16,6 +18,18 @@ use market_squawk_sources::ExtractionError;
 /// Input fields used to construct one cohesive bounded extraction policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExtractionLimitsInput {
+    /// Maximum exact bytes in the source manifest.
+    pub max_manifest_bytes: u64,
+    /// Maximum manifest container nesting depth before typed deserialization.
+    pub max_manifest_nesting_depth: usize,
+    /// Maximum declared source objects in one manifest.
+    pub max_manifest_objects: usize,
+    /// Maximum cumulative row-field mappings in one manifest.
+    pub max_manifest_mappings: usize,
+    /// Maximum encoded bytes in one manifest string.
+    pub max_manifest_string_bytes: usize,
+    /// Maximum conservatively retained bytes while admitting one manifest.
+    pub max_manifest_retained_bytes: u64,
     /// Maximum exact bytes read from one source file.
     pub max_source_bytes: u64,
     /// Maximum decompressed bytes across a container.
@@ -50,6 +64,12 @@ impl ExtractionLimitsInput {
     /// Returns conservative local defaults below global extraction ceilings.
     pub const fn standard() -> Self {
         Self {
+            max_manifest_bytes: 4 * 1024 * 1024,
+            max_manifest_nesting_depth: 32,
+            max_manifest_objects: 4_096,
+            max_manifest_mappings: 65_536,
+            max_manifest_string_bytes: 256 * 1024,
+            max_manifest_retained_bytes: 16 * 1024 * 1024,
             max_source_bytes: 64 * 1024 * 1024,
             max_decompressed_bytes: 256 * 1024 * 1024,
             max_retained_bytes: 256 * 1024 * 1024,
@@ -81,7 +101,21 @@ impl ExtractionLimits {
     ///
     /// Rejects zero, address-space-incompatible, or excessive limits.
     pub fn try_new(input: ExtractionLimitsInput) -> Result<Self, FileAdapterError> {
-        let valid = input.max_source_bytes > 0
+        let valid = input.max_manifest_bytes > 0
+            && input.max_manifest_bytes <= 64 * 1024 * 1024
+            && usize::try_from(input.max_manifest_bytes).is_ok()
+            && input.max_manifest_nesting_depth > 0
+            && input.max_manifest_nesting_depth <= 256
+            && input.max_manifest_objects > 0
+            && input.max_manifest_objects <= 4_096
+            && input.max_manifest_mappings > 0
+            && input.max_manifest_mappings <= 1_048_576
+            && input.max_manifest_string_bytes > 0
+            && input.max_manifest_string_bytes <= 4 * 1024 * 1024
+            && input.max_manifest_retained_bytes > 0
+            && input.max_manifest_retained_bytes <= 256 * 1024 * 1024
+            && usize::try_from(input.max_manifest_retained_bytes).is_ok()
+            && input.max_source_bytes > 0
             && input.max_source_bytes <= 1024 * 1024 * 1024
             && usize::try_from(input.max_source_bytes).is_ok()
             && input.max_decompressed_bytes >= input.max_source_bytes
@@ -125,6 +159,18 @@ impl ExtractionLimits {
 /// Independently reportable parser ceiling.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ParserLimit {
+    /// Exact source-manifest bytes.
+    ManifestBytes,
+    /// Manifest container nesting depth.
+    ManifestNestingDepth,
+    /// Manifest source-object declarations.
+    ManifestObjects,
+    /// Manifest row-field mappings.
+    ManifestMappings,
+    /// Encoded bytes in one manifest string.
+    ManifestStringBytes,
+    /// Conservative retained manifest bytes.
+    ManifestRetainedBytes,
     /// Exact source bytes.
     SourceBytes,
     /// Decompressed container bytes.
@@ -169,6 +215,21 @@ pub enum FileAdapterError {
     /// Exact manifest bytes do not match the source-metadata revision evidence.
     #[error("local extraction manifest evidence does not match source metadata")]
     ManifestEvidenceMismatch,
+    /// The authority root overlaps the user-authorized input capability.
+    #[error("local extraction representation authority overlaps the input root")]
+    RepresentationAuthorityScope,
+    /// Another source instance owns the representation authority lifetime lock.
+    #[error("local extraction representation authority is already locked")]
+    RepresentationAuthorityLocked,
+    /// Durable representation authority is corrupt, ambiguous, or namespace-mismatched.
+    #[error("local extraction representation authority is invalid")]
+    RepresentationAuthorityInvalid,
+    /// Durable representation authority could not be read or committed safely.
+    #[error("local extraction representation authority is unavailable")]
+    RepresentationAuthorityUnavailable,
+    /// Durable exact-object representation state reached its fixed record ceiling.
+    #[error("local extraction representation authority is full")]
+    RepresentationAuthorityExhausted,
     /// Source metadata is not a user-owned, network-denied extraction source.
     #[error("local extraction source metadata is incompatible")]
     MetadataPolicyMismatch,
@@ -184,12 +245,6 @@ pub enum FileAdapterError {
     /// Object availability does not match the evidence retained at exact-byte discovery.
     #[error("local extraction object availability does not match discovery")]
     ObjectAvailabilityMismatch,
-    /// The bounded exact-object availability registry reached its fixed capacity.
-    #[error("local extraction availability registry is full")]
-    AvailabilityStateExhausted,
-    /// The exact-object availability registry could not be accessed.
-    #[error("local extraction availability registry is unavailable")]
-    AvailabilityStateUnavailable,
     /// A SQLite file, schema object, query plan, or value violates the closed read policy.
     #[error("local extraction database violates safety policy")]
     UnsafeDatabase,
@@ -311,14 +366,29 @@ impl CellValue {
 
 pub(crate) struct ParseBudget<'a> {
     pub(crate) limits: ExtractionLimits,
-    cancellation: &'a CancellationToken,
-    clock: &'a dyn ExtractionClock,
-    deadline: RequestDeadline,
+    control: ParseControl,
+    lifetime: PhantomData<&'a ()>,
     row_limit: SourceRowLimit,
     records: usize,
     cells: usize,
     decompressed_bytes: u64,
     allocated_bytes: u64,
+}
+
+#[derive(Clone)]
+pub(crate) struct ParseControl {
+    cancellation: CancellationToken,
+    clock: Arc<dyn ExtractionClock>,
+    deadline: RequestDeadline,
+}
+
+impl ParseControl {
+    pub(crate) fn checkpoint(&self) -> Result<(), FileAdapterError> {
+        if self.cancellation.is_cancelled() {
+            return Err(FileAdapterError::Cancelled);
+        }
+        self.deadline.checkpoint(self.clock.as_ref())
+    }
 }
 
 struct BoundedFormatter<'a> {
@@ -381,15 +451,18 @@ impl<'a> ParseBudget<'a> {
     pub(crate) fn new(
         limits: ExtractionLimits,
         cancellation: &'a CancellationToken,
-        clock: &'a dyn ExtractionClock,
+        clock: Arc<dyn ExtractionClock>,
         deadline: RequestDeadline,
         row_limit: SourceRowLimit,
     ) -> Self {
         Self {
             limits,
-            cancellation,
-            clock,
-            deadline,
+            control: ParseControl {
+                cancellation: cancellation.clone(),
+                clock,
+                deadline,
+            },
+            lifetime: PhantomData,
             row_limit,
             records: 0,
             cells: 0,
@@ -399,10 +472,11 @@ impl<'a> ParseBudget<'a> {
     }
 
     pub(crate) fn checkpoint(&self) -> Result<(), FileAdapterError> {
-        if self.cancellation.is_cancelled() {
-            return Err(FileAdapterError::Cancelled);
-        }
-        self.deadline.checkpoint(self.clock)
+        self.control.checkpoint()
+    }
+
+    pub(crate) fn control(&self) -> ParseControl {
+        self.control.clone()
     }
 
     pub(crate) fn record(&mut self) -> Result<(), FileAdapterError> {

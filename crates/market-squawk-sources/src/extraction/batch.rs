@@ -2,13 +2,15 @@
 
 use serde::de::{IgnoredAny, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
+use sha2::{Digest as _, Sha256};
 use std::fmt;
 use std::mem::size_of;
 
 use super::contracts::{
-    ExtractionError, ExtractionRecord, ExtractionRequest, MAX_EXTRACTION_RECORDS,
-    MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES,
+    AvailabilityEvidence, ExtractionError, ExtractionRecord, ExtractionRequest,
+    MAX_EXTRACTION_RECORDS, MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES,
 };
+use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, ExactPayloadEvidence, Timestamp};
 
 const ALLOCATOR_CAPACITY_ALLOWANCE_FACTOR: usize = 2;
 
@@ -31,6 +33,81 @@ pub struct ExtractionBatchAccumulator {
     request: ExtractionRequest,
     retained_record_bytes: u64,
     records: Vec<ExtractionRecord>,
+}
+
+/// Typed, request-attempt-independent identity of one normalized extraction's semantic content.
+///
+/// The identity binds source, metadata revision, exact source-object evidence and size, media and
+/// dataset identity, durable availability, and every ordered record's schema, exact semantic
+/// payload evidence, point-in-time fields, and revision. Discovery/extraction request IDs,
+/// deadlines, and requested ceilings are deliberately excluded because they are operation-attempt
+/// controls rather than persisted research content.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExtractionContentIdentity {
+    digest: EvidenceDigest,
+    record_count: usize,
+}
+
+impl ExtractionContentIdentity {
+    /// Constructs a stable semantic identity from a fully validated extraction batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExtractionError::ByteCountOverflow`] if a platform length cannot be represented
+    /// in the architecture-independent framing format.
+    pub fn try_from_batch(batch: &ExtractionBatch) -> Result<Self, ExtractionError> {
+        let object = batch.request.object();
+        let records = batch.records();
+        let mut identity = Sha256::new();
+        identity.update(b"market-squawk/extraction-content/v1");
+        hash_text(&mut identity, object.source_id().as_str())?;
+        hash_text(
+            &mut identity,
+            object.metadata_revision().as_source_identifier().as_str(),
+        )?;
+        hash_text(&mut identity, object.dataset().as_str())?;
+        hash_text(&mut identity, object.object_id().as_str())?;
+        hash_text(&mut identity, object.media_type().as_str())?;
+        hash_evidence(&mut identity, object.evidence());
+        hash_timestamp(&mut identity, object.effective_interval().starts_at());
+        hash_optional_timestamp(&mut identity, object.effective_interval().ends_at());
+        hash_optional_timestamp(&mut identity, object.published_at());
+        hash_availability(&mut identity, object.availability())?;
+        hash_optional_u64(&mut identity, object.expected_bytes());
+        hash_length(&mut identity, records.len())?;
+        for (ordinal, record) in records.iter().enumerate() {
+            hash_length(&mut identity, ordinal)?;
+            hash_text(&mut identity, record.source_id().as_str())?;
+            hash_text(
+                &mut identity,
+                record.metadata_revision().as_source_identifier().as_str(),
+            )?;
+            hash_text(&mut identity, record.dataset().as_str())?;
+            hash_text(&mut identity, record.object_id().as_str())?;
+            hash_evidence(&mut identity, record.object_evidence());
+            hash_text(&mut identity, record.schema().as_str())?;
+            hash_evidence(&mut identity, record.evidence());
+            hash_timestamp(&mut identity, record.effective_at());
+            hash_optional_timestamp(&mut identity, record.published_at());
+            hash_availability(&mut identity, record.availability())?;
+            hash_text(&mut identity, record.revision().as_str())?;
+            hash_optional_timestamp(&mut identity, record.superseded_at());
+        }
+        Ok(Self {
+            digest: EvidenceDigest::new(DigestAlgorithm::Sha256, identity.finalize().into()),
+            record_count: records.len(),
+        })
+    }
+
+    /// Returns the version-qualified semantic content digest.
+    pub const fn digest(self) -> EvidenceDigest {
+        self.digest
+    }
+
+    /// Returns the ordered record count bound into the digest.
+    pub const fn record_count(self) -> usize {
+        self.record_count
+    }
 }
 
 impl ExtractionBatchAccumulator {
@@ -193,6 +270,81 @@ impl<'de> Deserialize<'de> for ExtractionBatch {
         }
         Ok(rebuilt)
     }
+}
+
+fn hash_length(identity: &mut Sha256, value: usize) -> Result<(), ExtractionError> {
+    let value = u64::try_from(value).map_err(|_| ExtractionError::ByteCountOverflow)?;
+    identity.update(value.to_be_bytes());
+    Ok(())
+}
+
+fn hash_text(identity: &mut Sha256, value: &str) -> Result<(), ExtractionError> {
+    hash_length(identity, value.len())?;
+    identity.update(value.as_bytes());
+    Ok(())
+}
+
+fn hash_evidence(identity: &mut Sha256, evidence: &ExactPayloadEvidence) {
+    let digest = evidence.content_digest();
+    identity.update([match digest.algorithm() {
+        DigestAlgorithm::Sha256 => 1,
+        DigestAlgorithm::Blake3 => 2,
+    }]);
+    identity.update(digest.bytes());
+}
+
+fn hash_timestamp(identity: &mut Sha256, timestamp: Timestamp) {
+    identity.update(timestamp.unix_nanos().to_be_bytes());
+}
+
+fn hash_optional_timestamp(identity: &mut Sha256, timestamp: Option<Timestamp>) {
+    match timestamp {
+        Some(timestamp) => {
+            identity.update([1]);
+            hash_timestamp(identity, timestamp);
+        }
+        None => identity.update([0]),
+    }
+}
+
+fn hash_optional_u64(identity: &mut Sha256, value: Option<u64>) {
+    match value {
+        Some(value) => {
+            identity.update([1]);
+            identity.update(value.to_be_bytes());
+        }
+        None => identity.update([0]),
+    }
+}
+
+fn hash_availability(
+    identity: &mut Sha256,
+    availability: &AvailabilityEvidence,
+) -> Result<(), ExtractionError> {
+    match availability {
+        AvailabilityEvidence::Observed {
+            available_at,
+            evidence,
+        } => {
+            identity.update([1]);
+            hash_timestamp(identity, *available_at);
+            hash_text(identity, evidence.as_str())?;
+        }
+        AvailabilityEvidence::LocalFirstObserved { observed_at } => {
+            identity.update([2]);
+            hash_timestamp(identity, *observed_at);
+        }
+        AvailabilityEvidence::Inferred {
+            inferred_at,
+            method,
+        } => {
+            identity.update([3]);
+            hash_timestamp(identity, *inferred_at);
+            hash_text(identity, method.as_str())?;
+        }
+        AvailabilityEvidence::Unknown => identity.update([4]),
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Serialize)]

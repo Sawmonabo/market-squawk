@@ -12,8 +12,10 @@ mod database;
 mod excel;
 mod json;
 mod manifest;
+mod manifest_bounds;
 mod ofx;
 mod parquet;
+mod representation;
 mod source;
 mod xml;
 

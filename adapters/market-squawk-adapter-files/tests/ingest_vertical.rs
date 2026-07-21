@@ -77,8 +77,10 @@ impl ExtractionClock for AdvancingClock {
 #[tokio::test]
 async fn every_local_format_survives_rights_publish_restart_and_exact_query() -> TestResult {
     let directory = tempfile::tempdir()?;
+    let representation_state_directory = tempfile::tempdir()?;
     write_format_fixtures(directory.path())?;
     fs::write(directory.path().join("manifest.json"), MANIFEST)?;
+    let representation_state_root = representation_state_directory.path().join("authority");
 
     let root = UserAuthorizedInputRoot::open(fs::canonicalize(directory.path())?)?;
     let manifest_input = root
@@ -89,6 +91,7 @@ async fn every_local_format_survives_rights_publish_restart_and_exact_query() ->
     let source = FileExtractionSource::try_new_with_clock(
         metadata.clone(),
         root,
+        &representation_state_root,
         manifest_input,
         ExtractionLimits::try_new(ExtractionLimitsInput::standard())?,
         Arc::new(AdvancingClock {
@@ -313,6 +316,61 @@ async fn every_local_format_survives_rights_publish_restart_and_exact_query() ->
         admitted.push((reservation, batch));
     }
 
+    fs::write(
+        directory.path().join("prices.csv"),
+        b"id,value\ncsv-row,1.00\n",
+    )?;
+    drop(source);
+    let root = UserAuthorizedInputRoot::open(fs::canonicalize(directory.path())?)?;
+    let manifest_input = root
+        .resolve("manifest.json")?
+        .open_bounded(u64::try_from(MANIFEST.len())?)?
+        .read_bounded()?;
+    let restarted_source = FileExtractionSource::try_new_with_clock(
+        metadata.clone(),
+        root,
+        &representation_state_root,
+        manifest_input,
+        ExtractionLimits::try_new(ExtractionLimitsInput::standard())?,
+        Arc::new(AdvancingClock {
+            origin: Instant::now(),
+            next_offset_nanos: Mutex::new(10_000),
+        }),
+    )?;
+    let restarted_object = restarted_source
+        .discover_files(&discovery, &CancellationToken::new())
+        .await?
+        .objects()
+        .iter()
+        .find(|object| object.object_id().as_str() == "csv-fixture")
+        .cloned()
+        .ok_or("restarted CSV discovery is absent")?;
+    assert_eq!(restarted_object.evidence(), original_csv.evidence());
+    assert_eq!(restarted_object.availability(), original_csv.availability());
+    let restarted_batch = restarted_source
+        .extract_file(
+            &ExtractionRequest::try_new(
+                restarted_object,
+                NonZeroU32::new(1).ok_or("nonzero record limit")?,
+                NonZeroU64::new(1024 * 1024).ok_or("nonzero byte limit")?,
+                Timestamp::from_unix_nanos(10_000_000_000),
+            )?,
+            &CancellationToken::new(),
+        )
+        .await?;
+    let restarted_digest = extraction_batch_digest(&restarted_batch)?;
+    let restarted_rights =
+        admit_rights(&authority, metadata.source_id().clone(), restarted_digest)?;
+    let restarted_reservation = authority.reserve_ingest(
+        &IngestIdentity::try_new(
+            metadata.source_id().clone(),
+            restarted_digest,
+            SourceOperation::Persist,
+            "local-file:csv-fixture",
+        )?,
+        &restarted_rights,
+    )?;
+
     let changed_digest = extraction_batch_digest(&changed_csv)?;
     let changed_rights = admit_rights(&authority, metadata.source_id().clone(), changed_digest)?;
     let conflict = authority.reserve_ingest(
@@ -334,7 +392,9 @@ async fn every_local_format_survives_rights_publish_restart_and_exact_query() ->
         object_config,
     )?;
     let mut final_manifest = None;
+    let mut committed_csv = None;
     for (reservation, batch) in admitted {
+        let is_csv = batch.request().object().object_id().as_str() == "csv-fixture";
         let committed = service
             .ingest(reservation.clone(), batch.clone(), CancellationToken::new())
             .await?;
@@ -342,8 +402,22 @@ async fn every_local_format_survives_rights_publish_restart_and_exact_query() ->
             .ingest(reservation, batch, CancellationToken::new())
             .await?;
         assert_eq!(replayed, committed);
+        if is_csv {
+            committed_csv = Some(committed.clone());
+        }
         final_manifest = Some(committed.manifest().clone());
     }
+    let restarted_commit = service
+        .ingest(
+            restarted_reservation,
+            restarted_batch,
+            CancellationToken::new(),
+        )
+        .await?;
+    assert_eq!(
+        restarted_commit,
+        committed_csv.ok_or("CSV was not committed before restart replay")?
+    );
     let final_manifest = final_manifest.ok_or("no local format was published")?;
     drop(service);
 
@@ -462,11 +536,11 @@ fn write_format_fixtures(root: &std::path::Path) -> TestResult {
     fs::write(root.join("prices.tsv"), b"id\tvalue\ntsv-row\t2.00\n")?;
     fs::write(
         root.join("prices.json"),
-        br#"[{"id":"json-row","value":"3.00"}]"#,
+        br#"[{"id":"json-row","value":3.00}]"#,
     )?;
     fs::write(
         root.join("prices.ndjson"),
-        b"{\"id\":\"ndjson-row\",\"value\":\"4.00\"}\n",
+        b"{\"id\":\"ndjson-row\",\"value\":4.00e0}\n",
     )?;
     fs::write(
         root.join("prices.xml"),

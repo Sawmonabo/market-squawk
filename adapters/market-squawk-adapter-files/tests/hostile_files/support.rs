@@ -99,6 +99,7 @@ pub(super) async fn extract_fixture_with_limits(
     format: &str,
     limits: ExtractionLimitsInput,
 ) -> Result<Result<market_squawk_sources::ExtractionBatch, FileAdapterError>, Box<dyn Error>> {
+    let representation_state = tempfile::tempdir()?;
     let request_max_records = NonZeroU32::new(u32::try_from(limits.max_records)?)
         .ok_or("nonzero extraction record limit")?;
     let manifest = manifest(name, format);
@@ -111,6 +112,7 @@ pub(super) async fn extract_fixture_with_limits(
     let source = FileExtractionSource::try_new_with_clock(
         local_metadata(&manifest)?,
         root,
+        representation_state_root(&representation_state, &manifest),
         manifest_input,
         ExtractionLimits::try_new(limits)?,
         fixed_clock(),
@@ -133,6 +135,24 @@ pub(super) async fn extract_fixture_with_limits(
     Ok(source
         .extract_file(&request, &CancellationToken::new())
         .await)
+}
+
+pub(super) fn representation_state_root(
+    state_directory: &tempfile::TempDir,
+    manifest: &[u8],
+) -> std::path::PathBuf {
+    representation_state_root_for(state_directory, manifest, "default")
+}
+
+pub(super) fn representation_state_root_for(
+    state_directory: &tempfile::TempDir,
+    manifest: &[u8],
+    namespace: &str,
+) -> std::path::PathBuf {
+    state_directory.path().join(format!(
+        "representation-authority-{:x}-{namespace}",
+        Sha256::digest(manifest)
+    ))
 }
 
 pub(super) fn manifest(name: &str, format: &str) -> Vec<u8> {

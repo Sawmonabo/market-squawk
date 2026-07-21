@@ -11,7 +11,7 @@ use arrow::record_batch::RecordBatch;
 use market_squawk_domain::{
     DigestAlgorithm, EvidenceDigest, SchemaVersion, SourceIdentifier, Timestamp,
 };
-use market_squawk_sources::ExtractionBatch;
+use market_squawk_sources::{ExtractionBatch, ExtractionContentIdentity, ExtractionError};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -90,11 +90,9 @@ impl CompactionRequest {
 
 /// Returns the exact canonical digest a Task 3 ingest reservation must carry for this batch.
 pub fn extraction_batch_digest(batch: &ExtractionBatch) -> Result<EvidenceDigest, IngestError> {
-    let encoded = serde_json::to_vec(batch)?;
-    Ok(EvidenceDigest::new(
-        DigestAlgorithm::Sha256,
-        Sha256::digest(encoded).into(),
-    ))
+    ExtractionContentIdentity::try_from_batch(batch)
+        .map(ExtractionContentIdentity::digest)
+        .map_err(IngestError::ContentIdentity)
 }
 
 /// Rights-bound research ingestion service.
@@ -665,6 +663,11 @@ impl AnalyticalDataService {
             if run.state() == IngestRunState::Failed {
                 return Err(IngestError::TerminalRun);
             }
+            if let Some(committed) =
+                self.reconcile_committed_run(&authority, &reservation, run.state(), &dataset_id)?
+            {
+                return Ok(committed);
+            }
         }
         let converted = ResearchArrowBatch::try_from_extraction_batch(&batch)?;
         let lineage = converted.lineage_digest()?;
@@ -722,6 +725,7 @@ impl AnalyticalDataService {
         payload_digest: EvidenceDigest,
         source_id: Option<&market_squawk_domain::SourceId>,
     ) -> Result<crate::IngestRunRecord, IngestError> {
+        authority.validate_ingest_reservation(reservation)?;
         let run = authority
             .ingest_run(reservation.run_id())?
             .ok_or(IngestError::UnknownReservation)?;
@@ -734,6 +738,33 @@ impl AnalyticalDataService {
             return Err(IngestError::PersistRightsRequired);
         }
         Ok(run)
+    }
+
+    fn reconcile_committed_run(
+        &self,
+        authority: &CatalogAuthority,
+        reservation: &IngestReservation,
+        state: IngestRunState,
+        dataset_id: &DatasetId,
+    ) -> Result<Option<CommittedDataset>, IngestError> {
+        let Some(existing) = self.manifests.for_run(reservation.run_id())? else {
+            return match state {
+                IngestRunState::Reserved => Ok(None),
+                IngestRunState::Succeeded => Err(IngestError::IncompleteSuccessfulRun),
+                IngestRunState::Failed => Err(IngestError::TerminalRun),
+            };
+        };
+        if existing.manifest().dataset_id() != dataset_id {
+            return Err(IngestError::ReplayConflict);
+        }
+        match state {
+            IngestRunState::Reserved => {
+                authority.complete_ingest(reservation, ContractCompletion::Succeeded)?;
+            }
+            IngestRunState::Succeeded => {}
+            IngestRunState::Failed => return Err(IngestError::TerminalRun),
+        }
+        Ok(Some(CommittedDataset::new(existing)))
     }
 
     fn reconcile_existing(
@@ -873,6 +904,9 @@ pub enum IngestError {
     /// Exact extraction-batch serialization failed.
     #[error("extraction batch identity serialization failed")]
     Serialization(#[from] serde_json::Error),
+    /// Canonical extraction content identity could not be constructed.
+    #[error("extraction batch semantic identity construction failed")]
+    ContentIdentity(#[source] ExtractionError),
     /// The reservation does not exist in this authority.
     #[error("analytical ingest reservation is unknown")]
     UnknownReservation,

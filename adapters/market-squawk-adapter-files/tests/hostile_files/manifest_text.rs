@@ -4,6 +4,7 @@ use super::*;
 async fn manifest_and_text_parsers_reject_ambiguous_or_expansive_inputs()
 -> Result<(), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;
+    let representation_state = tempfile::tempdir()?;
     fs::write(directory.path().join("source.csv"), b"id,value\none,1.00\n")?;
     let oversized_manifest = manifest("source.csv", "csv");
     fs::write(directory.path().join("manifest.json"), &oversized_manifest)?;
@@ -13,18 +14,126 @@ async fn manifest_and_text_parsers_reject_ambiguous_or_expansive_inputs()
         .open_bounded(u64::try_from(oversized_manifest.len())?)?
         .read_bounded()?;
     let mut limits = ExtractionLimitsInput::standard();
-    limits.max_source_bytes = u64::try_from(oversized_manifest.len().saturating_sub(1))?;
+    limits.max_manifest_bytes = u64::try_from(oversized_manifest.len().saturating_sub(1))?;
     let source = FileExtractionSource::try_new_with_clock(
         local_metadata(&oversized_manifest)?,
         root,
+        representation_state_root(&representation_state, &oversized_manifest),
         manifest_input,
         ExtractionLimits::try_new(limits)?,
         fixed_clock(),
     );
     assert!(matches!(
         source,
-        Err(FileAdapterError::LimitExceeded(ParserLimit::SourceBytes))
+        Err(FileAdapterError::LimitExceeded(ParserLimit::ManifestBytes))
     ));
+    for unsafe_state_root in [
+        directory.path().to_path_buf(),
+        directory.path().join("nested-representation-state"),
+    ] {
+        let root = UserAuthorizedInputRoot::open(fs::canonicalize(directory.path())?)?;
+        let manifest_input = root
+            .resolve("manifest.json")?
+            .open_bounded(u64::try_from(oversized_manifest.len())?)?
+            .read_bounded()?;
+        assert!(matches!(
+            FileExtractionSource::try_new_with_clock(
+                local_metadata(&oversized_manifest)?,
+                root,
+                unsafe_state_root,
+                manifest_input,
+                ExtractionLimits::try_new(ExtractionLimitsInput::standard())?,
+                fixed_clock(),
+            ),
+            Err(FileAdapterError::RepresentationAuthorityScope)
+        ));
+    }
+
+    let mut unknown_format: serde_json::Value = serde_json::from_slice(&oversized_manifest)?;
+    unknown_format["objects"][0]["format"]["undeclared_policy"] = serde_json::json!(true);
+    let unknown_format = serde_json::to_vec(&unknown_format)?;
+    let mut two_objects: serde_json::Value = serde_json::from_slice(&oversized_manifest)?;
+    let second = two_objects["objects"][0].clone();
+    two_objects["objects"]
+        .as_array_mut()
+        .ok_or("manifest objects changed type")?
+        .push(second);
+    let two_objects = serde_json::to_vec(&two_objects)?;
+    let mut two_mappings: serde_json::Value = serde_json::from_slice(&oversized_manifest)?;
+    let second = two_mappings["objects"][0]["row_policy"]["fields"][0].clone();
+    two_mappings["objects"][0]["row_policy"]["fields"]
+        .as_array_mut()
+        .ok_or("manifest mappings changed type")?
+        .push(second);
+    let two_mappings = serde_json::to_vec(&two_mappings)?;
+    let deeply_nested = br#"{"schema_version":1,"objects":[[[[[[]]]]]]}"#.to_vec();
+    let manifest_cases = [
+        (
+            unknown_format,
+            ExtractionLimitsInput::standard(),
+            FileAdapterError::InvalidManifest,
+        ),
+        (
+            two_objects,
+            ExtractionLimitsInput {
+                max_manifest_objects: 1,
+                ..ExtractionLimitsInput::standard()
+            },
+            FileAdapterError::LimitExceeded(ParserLimit::ManifestObjects),
+        ),
+        (
+            deeply_nested,
+            ExtractionLimitsInput {
+                max_manifest_nesting_depth: 4,
+                ..ExtractionLimitsInput::standard()
+            },
+            FileAdapterError::LimitExceeded(ParserLimit::ManifestNestingDepth),
+        ),
+        (
+            two_mappings,
+            ExtractionLimitsInput {
+                max_manifest_mappings: 1,
+                ..ExtractionLimitsInput::standard()
+            },
+            FileAdapterError::LimitExceeded(ParserLimit::ManifestMappings),
+        ),
+        (
+            oversized_manifest.clone(),
+            ExtractionLimitsInput {
+                max_manifest_string_bytes: 8,
+                ..ExtractionLimitsInput::standard()
+            },
+            FileAdapterError::LimitExceeded(ParserLimit::ManifestStringBytes),
+        ),
+        (
+            oversized_manifest.clone(),
+            ExtractionLimitsInput {
+                max_manifest_retained_bytes: 1,
+                ..ExtractionLimitsInput::standard()
+            },
+            FileAdapterError::LimitExceeded(ParserLimit::ManifestRetainedBytes),
+        ),
+    ];
+    for (manifest, limits, expected) in manifest_cases {
+        let directory = tempfile::tempdir()?;
+        let representation_state = tempfile::tempdir()?;
+        fs::write(directory.path().join("source.csv"), b"id,value\none,1.00\n")?;
+        fs::write(directory.path().join("manifest.json"), &manifest)?;
+        let root = UserAuthorizedInputRoot::open(fs::canonicalize(directory.path())?)?;
+        let manifest_input = root
+            .resolve("manifest.json")?
+            .open_bounded(u64::try_from(manifest.len())?)?
+            .read_bounded()?;
+        let result = FileExtractionSource::try_new_with_clock(
+            local_metadata(&manifest)?,
+            root,
+            representation_state_root(&representation_state, &manifest),
+            manifest_input,
+            ExtractionLimits::try_new(limits)?,
+            fixed_clock(),
+        );
+        assert!(matches!(result, Err(error) if error == expected));
+    }
 
     let directory = tempfile::tempdir()?;
     let amplified_csv = "id,value,aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb,\
@@ -101,6 +210,24 @@ async fn manifest_and_text_parsers_reject_ambiguous_or_expansive_inputs()
             FileAdapterError::DuplicateField,
         ),
         (
+            "numeric-scale.json",
+            br#"[{"id":"one","value":1e0}]"#.as_slice(),
+            "json",
+            FileAdapterError::DecimalScaleMismatch,
+        ),
+        (
+            "numeric-overprecision.json",
+            br#"[{"id":"one","value":12345678901234567890123456789.00}]"#.as_slice(),
+            "json",
+            FileAdapterError::InvalidDecimal,
+        ),
+        (
+            "malformed-exponent.json",
+            br#"[{"id":"one","value":"1.2.3e0"}]"#.as_slice(),
+            "json",
+            FileAdapterError::InvalidDecimal,
+        ),
+        (
             "hostile.xml",
             br#"<!DOCTYPE rows [<!ENTITY x SYSTEM 'https://example.test/x'>]><rows/>"#.as_slice(),
             "xml",
@@ -129,6 +256,7 @@ async fn manifest_and_text_parsers_reject_ambiguous_or_expansive_inputs()
 
     for (name, payload, format, expected) in cases {
         let directory = tempfile::tempdir()?;
+        let representation_state = tempfile::tempdir()?;
         fs::write(directory.path().join(name), payload)?;
         let manifest = manifest(name, format);
         fs::write(directory.path().join("manifest.json"), &manifest)?;
@@ -144,6 +272,7 @@ async fn manifest_and_text_parsers_reject_ambiguous_or_expansive_inputs()
         let source = FileExtractionSource::try_new_with_clock(
             local_metadata(&manifest)?,
             root,
+            representation_state_root(&representation_state, &manifest),
             manifest_input,
             ExtractionLimits::try_new(limits)?,
             fixed_clock(),

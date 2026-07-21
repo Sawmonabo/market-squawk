@@ -16,7 +16,7 @@ const PARQUET_MAGIC: &[u8; 4] = b"PAR1";
 const METADATA_BYTES_PER_CONFIGURED_COLUMN: usize = 1_024;
 const ARRAY_FIXED_BYTES_PER_COLUMN: usize = 4_096;
 const ARRAY_BYTES_PER_CELL: usize = 64;
-const MAXIMUM_BATCH_ROWS: usize = 8_192;
+const MAXIMUM_BATCH_ROWS: usize = 256;
 
 #[derive(Clone, Copy, Debug)]
 struct ParquetLayout {
@@ -66,6 +66,7 @@ pub(crate) fn parse(
         .with_limit(limit)
         .build()
         .map_err(|_| FileAdapterError::UnsafeParquet)?;
+    budget.checkpoint()?;
     let mut rows = Vec::new();
     loop {
         budget.checkpoint()?;
@@ -75,6 +76,7 @@ pub(crate) fn parse(
         let Some(batch) = reader.next() else {
             break;
         };
+        budget.checkpoint()?;
         let batch = batch.map_err(|_| FileAdapterError::UnsafeParquet)?;
         if batch.num_columns() != schema.fields().len() {
             return Err(FileAdapterError::UnsafeParquet);
