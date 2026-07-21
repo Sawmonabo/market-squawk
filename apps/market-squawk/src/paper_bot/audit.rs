@@ -5,7 +5,7 @@ use std::{
     io::Write as _,
     sync::mpsc,
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
@@ -29,13 +29,15 @@ const PAPER_AUDIT_FILE: &str = "paper-state-audit-v1.jsonl";
 /// Sole owner of both mandatory production audit consumers and their durable files.
 #[derive(Debug)]
 pub(super) struct ProductionAuditService {
-    control: mpsc::Sender<AuditControl>,
+    control: mpsc::SyncSender<AuditControl>,
     worker: Option<JoinHandle<Result<ProductionAuditEvidence, ProductionAuditError>>>,
+    drop_deadline: Duration,
 }
 
 #[derive(Debug)]
 enum AuditControl {
-    Flush(mpsc::SyncSender<Option<ProductionAuditEvidence>>),
+    Flush(tokio::sync::oneshot::Sender<Result<ProductionAuditEvidence, ()>>),
+    Stop,
 }
 
 impl ProductionAuditService {
@@ -43,10 +45,11 @@ impl ProductionAuditService {
         directory: Dir,
         execution: ExecutionAuditReader,
         paper: PaperAuditReader,
+        drop_deadline: Duration,
     ) -> Result<Self, ProductionAuditError> {
         let execution_file = open_audit_file(&directory, EXECUTION_AUDIT_FILE)?;
         let paper_file = open_audit_file(&directory, PAPER_AUDIT_FILE)?;
-        let (control, commands) = mpsc::channel();
+        let (control, commands) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
             .name(String::from("market-squawk-paper-audit"))
             .spawn(move || {
@@ -56,36 +59,89 @@ impl ProductionAuditService {
         Ok(Self {
             control,
             worker: Some(worker),
+            drop_deadline,
         })
     }
 
-    pub(super) fn flush(&self) -> Result<ProductionAuditEvidence, ProductionAuditBarrierError> {
-        let (reply, response) = mpsc::sync_channel(1);
+    pub(super) async fn flush(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<ProductionAuditEvidence, ProductionAuditBarrierError> {
+        let (reply, response) = tokio::sync::oneshot::channel();
         self.control
-            .send(AuditControl::Flush(reply))
-            .map_err(|_| ProductionAuditBarrierError::Unavailable)?;
-        response
-            .recv()
+            .try_send(AuditControl::Flush(reply))
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => ProductionAuditBarrierError::Saturated,
+                mpsc::TrySendError::Disconnected(_) => ProductionAuditBarrierError::Unavailable,
+            })?;
+        tokio::time::timeout_at(deadline, response)
+            .await
+            .map_err(|_| ProductionAuditBarrierError::DeadlineExceeded)?
             .map_err(|_| ProductionAuditBarrierError::Unavailable)?
-            .ok_or(ProductionAuditBarrierError::PersistenceFailed)
+            .map_err(|()| ProductionAuditBarrierError::PersistenceFailed)
     }
 
-    pub(super) fn shutdown(mut self) -> ProductionAuditShutdown {
+    pub(super) async fn shutdown(
+        mut self,
+        deadline: tokio::time::Instant,
+        producers_complete: bool,
+    ) -> ProductionAuditShutdown {
+        if !producers_complete {
+            return ProductionAuditShutdown::with_owner(
+                ProductionAuditShutdownStatus::ProducersIncomplete,
+                self,
+            );
+        }
+        if let Err(error) = self.control.try_send(AuditControl::Stop) {
+            return ProductionAuditShutdown::with_owner(
+                match error {
+                    mpsc::TrySendError::Full(_) => ProductionAuditShutdownStatus::ControlSaturated,
+                    mpsc::TrySendError::Disconnected(_) => {
+                        ProductionAuditShutdownStatus::ControlUnavailable
+                    }
+                },
+                self,
+            );
+        }
         let Some(worker) = self.worker.take() else {
-            return ProductionAuditShutdown::Panicked;
+            return ProductionAuditShutdown::new(ProductionAuditShutdownStatus::Panicked);
         };
+        while !worker.is_finished() {
+            if tokio::time::Instant::now() >= deadline {
+                self.worker = Some(worker);
+                return ProductionAuditShutdown::with_owner(
+                    ProductionAuditShutdownStatus::DeadlineExceeded,
+                    self,
+                );
+            }
+            tokio::time::sleep(IDLE_POLL_INTERVAL).await;
+        }
         match worker.join() {
-            Ok(Ok(evidence)) => ProductionAuditShutdown::Complete(evidence),
-            Ok(Err(error)) => ProductionAuditShutdown::Failed(error),
-            Err(_) => ProductionAuditShutdown::Panicked,
+            Ok(Ok(evidence)) => {
+                ProductionAuditShutdown::new(ProductionAuditShutdownStatus::Complete(evidence))
+            }
+            Ok(Err(error)) => {
+                ProductionAuditShutdown::new(ProductionAuditShutdownStatus::Failed(error))
+            }
+            Err(_) => ProductionAuditShutdown::new(ProductionAuditShutdownStatus::Panicked),
         }
     }
 }
 
 impl Drop for ProductionAuditService {
     fn drop(&mut self) {
-        if let Some(worker) = self.worker.take() {
+        let Some(worker) = self.worker.take() else {
+            return;
+        };
+        let _ = self.control.try_send(AuditControl::Stop);
+        let deadline = Instant::now().checked_add(self.drop_deadline);
+        while !worker.is_finished() && deadline.is_some_and(|limit| Instant::now() < limit) {
+            thread::sleep(IDLE_POLL_INTERVAL);
+        }
+        if worker.is_finished() {
             drop(worker.join());
+        } else {
+            std::process::abort();
         }
     }
 }
@@ -192,17 +248,21 @@ fn run_audit_worker(
     commands: &mpsc::Receiver<AuditControl>,
 ) -> Result<ProductionAuditEvidence, ProductionAuditError> {
     loop {
-        while let Ok(command) = commands.try_recv() {
-            match command {
-                AuditControl::Flush(reply) => match worker.flush() {
+        loop {
+            match commands.try_recv() {
+                Ok(AuditControl::Flush(reply)) => match worker.flush() {
                     Ok(evidence) => {
-                        let _ = reply.send(Some(evidence));
+                        let _ = reply.send(Ok(evidence));
                     }
                     Err(error) => {
-                        let _ = reply.send(None);
+                        let _ = reply.send(Err(()));
                         return Err(error);
                     }
                 },
+                Ok(AuditControl::Stop) | Err(mpsc::TryRecvError::Disconnected) => {
+                    return worker.flush();
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
             }
         }
         if worker.closed() {
@@ -353,22 +413,55 @@ impl ProductionAuditEvidence {
 }
 
 #[derive(Debug)]
-pub enum ProductionAuditShutdown {
+pub struct ProductionAuditShutdown {
+    status: ProductionAuditShutdownStatus,
+    owner: Option<ProductionAuditService>,
+}
+
+#[derive(Debug)]
+pub enum ProductionAuditShutdownStatus {
     Complete(ProductionAuditEvidence),
     Failed(ProductionAuditError),
+    ProducersIncomplete,
+    ControlSaturated,
+    ControlUnavailable,
+    DeadlineExceeded,
     Panicked,
 }
 
 impl ProductionAuditShutdown {
+    const fn new(status: ProductionAuditShutdownStatus) -> Self {
+        Self {
+            status,
+            owner: None,
+        }
+    }
+
+    fn with_owner(status: ProductionAuditShutdownStatus, owner: ProductionAuditService) -> Self {
+        Self {
+            status,
+            owner: Some(owner),
+        }
+    }
+
     pub const fn is_complete(&self) -> bool {
-        matches!(self, Self::Complete(_))
+        matches!(self.status, ProductionAuditShutdownStatus::Complete(_)) && self.owner.is_none()
     }
 
     pub const fn evidence(&self) -> Option<ProductionAuditEvidence> {
-        match self {
-            Self::Complete(evidence) => Some(*evidence),
-            Self::Failed(_) | Self::Panicked => None,
+        match &self.status {
+            ProductionAuditShutdownStatus::Complete(evidence) => Some(*evidence),
+            ProductionAuditShutdownStatus::Failed(_)
+            | ProductionAuditShutdownStatus::ProducersIncomplete
+            | ProductionAuditShutdownStatus::ControlSaturated
+            | ProductionAuditShutdownStatus::ControlUnavailable
+            | ProductionAuditShutdownStatus::DeadlineExceeded
+            | ProductionAuditShutdownStatus::Panicked => None,
         }
+    }
+
+    pub const fn status(&self) -> &ProductionAuditShutdownStatus {
+        &self.status
     }
 }
 
@@ -376,6 +469,10 @@ impl ProductionAuditShutdown {
 pub enum ProductionAuditBarrierError {
     #[error("production audit service is unavailable")]
     Unavailable,
+    #[error("production audit control channel is saturated")]
+    Saturated,
+    #[error("production audit durable barrier exceeded its caller-owned deadline")]
+    DeadlineExceeded,
     #[error("production audit service could not durably flush admitted records")]
     PersistenceFailed,
 }

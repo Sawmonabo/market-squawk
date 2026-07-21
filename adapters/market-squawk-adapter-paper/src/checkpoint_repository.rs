@@ -24,8 +24,11 @@ use crate::{PaperCheckpointError, PaperExecutionCheckpoint, PaperExecutionConfig
 
 const CHECKPOINT_OBJECT_ROOT: &str = "paper-checkpoints/v1";
 const CURRENT_MANIFEST_PATH: &str = "paper-checkpoints/v1/current.json";
+const RUN_DIRTY_PATH: &str = "paper-checkpoints/v1/run-dirty.json";
 const REPOSITORY_LOCK_PATH: &str = ".market-squawk-paper-checkpoints.lock";
 const MANIFEST_SCHEMA_VERSION: u32 = 1;
+const RUN_DIRTY_SCHEMA_VERSION: u32 = 1;
+const MAXIMUM_RUN_DIRTY_BYTES: usize = 4 * 1024;
 
 /// Single-writer durable publisher bound to one artifact root and paper configuration.
 #[derive(Debug)]
@@ -36,6 +39,7 @@ pub struct PaperCheckpointRepository {
     repository_id: [u8; 32],
     generation: u64,
     recovery: Option<PaperCheckpointRecovery>,
+    dirty_authority: Option<[u8; 32]>,
     _writer_lock: std::fs::File,
 }
 
@@ -49,6 +53,7 @@ impl PaperCheckpointRepository {
         let directory = root.try_clone_directory()?;
         let writer_lock = acquire_repository_writer(&directory)?;
         cleanup_stale_staging(&directory)?;
+        reject_unclean_run(&directory)?;
         if let Some(recovered) = read_current_manifest(&directory, &config, maximum_bytes.get())? {
             return Ok(Self {
                 root,
@@ -60,6 +65,7 @@ impl PaperCheckpointRepository {
                     checkpoint: recovered.checkpoint,
                     accounts: recovered.accounts,
                 }),
+                dirty_authority: None,
                 _writer_lock: writer_lock,
             });
         }
@@ -81,6 +87,7 @@ impl PaperCheckpointRepository {
             repository_id,
             generation: 0,
             recovery: None,
+            dirty_authority: None,
             _writer_lock: writer_lock,
         })
     }
@@ -97,6 +104,78 @@ impl PaperCheckpointRepository {
         account_replay: &[PaperAccountReplaySnapshot],
     ) -> Result<PaperCheckpointReceipt, PaperCheckpointRepositoryError> {
         self.persist_with_checkpoint(checkpoint, account_replay, |_| Ok(()))
+    }
+
+    /// Durably marks this run unsafe to restore until one exact stabilized checkpoint is published.
+    pub fn mark_run_dirty(&mut self) -> Result<(), PaperCheckpointRepositoryError> {
+        if self.dirty_authority.is_some() {
+            return Ok(());
+        }
+        let directory = self.root.try_clone_directory()?;
+        self.validate_current_authority(&directory)?;
+        directory
+            .create_dir_all(CHECKPOINT_OBJECT_ROOT)
+            .map_err(|source| io_error("create paper run-dirty namespace", source))?;
+        let marker = RunDirtyWire {
+            schema_version: RUN_DIRTY_SCHEMA_VERSION,
+            repository_id: self.repository_id,
+            generation: self.generation,
+            nonce: random_bytes()?,
+        };
+        let mut output = BoundedRepositoryWriter::new(MAXIMUM_RUN_DIRTY_BYTES)?;
+        serde_json::to_writer(&mut output, &marker)
+            .map_err(PaperCheckpointRepositoryError::ManifestEncoding)?;
+        let bytes = output.into_inner();
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        options.follow(FollowSymlinks::No);
+        configure_private_creation(&mut options);
+        let mut file = directory
+            .open_with(RUN_DIRTY_PATH, &options)
+            .map_err(|source| io_error("create paper run-dirty authority", source))?;
+        file.write_all(&bytes)
+            .map_err(|source| io_error("write paper run-dirty authority", source))?;
+        file.sync_all()
+            .map_err(|source| io_error("synchronize paper run-dirty authority", source))?;
+        drop(file);
+        synchronize_current_manifest_directories(&directory)?;
+        let persisted = read_bounded_regular(
+            &directory,
+            Path::new(RUN_DIRTY_PATH),
+            MAXIMUM_RUN_DIRTY_BYTES,
+        )?;
+        if persisted != bytes {
+            return Err(PaperCheckpointRepositoryError::DirtyAuthorityChanged);
+        }
+        self.dirty_authority = Some(Sha256::digest(&persisted).into());
+        Ok(())
+    }
+
+    /// Publishes the exact stabilized recovery image and only then clears run-dirty authority.
+    pub fn persist_stabilized_with_replay(
+        &mut self,
+        checkpoint: &PaperExecutionCheckpoint,
+        account_replay: &[PaperAccountReplaySnapshot],
+    ) -> Result<PaperCheckpointReceipt, PaperCheckpointRepositoryError> {
+        if self.dirty_authority.is_none() {
+            return Err(PaperCheckpointRepositoryError::DirtyAuthorityRequired);
+        }
+        if checkpoint.has_nonterminal_orders()
+            || checkpoint.reconciliation_required()
+            || checkpoint.durable_sequence != checkpoint.sequence()
+        {
+            return Err(PaperCheckpointRepositoryError::UnstabilizedCheckpoint);
+        }
+        let receipt = self.persist_with_replay(checkpoint, account_replay)?;
+        let recovery_digest = checkpoint.recovery_digest()?;
+        if receipt.sequence() != checkpoint.sequence()
+            || receipt.recovery_digest() != recovery_digest
+            || receipt.artifact_digest() != recovery_digest
+        {
+            return Err(PaperCheckpointRepositoryError::VerificationFailed);
+        }
+        self.clear_run_dirty()?;
+        Ok(receipt)
     }
 
     pub(crate) const fn binding_identity(&self) -> [u8; 32] {
@@ -259,6 +338,34 @@ impl PaperCheckpointRepository {
             _ => Err(PaperCheckpointRepositoryError::AuthorityChanged),
         }
     }
+
+    fn clear_run_dirty(&mut self) -> Result<(), PaperCheckpointRepositoryError> {
+        let expected = self
+            .dirty_authority
+            .ok_or(PaperCheckpointRepositoryError::DirtyAuthorityRequired)?;
+        let directory = self.root.try_clone_directory()?;
+        let bytes = read_bounded_regular(
+            &directory,
+            Path::new(RUN_DIRTY_PATH),
+            MAXIMUM_RUN_DIRTY_BYTES,
+        )?;
+        if <[u8; 32]>::from(Sha256::digest(&bytes)) != expected {
+            return Err(PaperCheckpointRepositoryError::DirtyAuthorityChanged);
+        }
+        directory
+            .remove_file(RUN_DIRTY_PATH)
+            .map_err(|source| io_error("clear paper run-dirty authority", source))?;
+        synchronize_current_manifest_directories(&directory)?;
+        match directory.symlink_metadata(RUN_DIRTY_PATH) {
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(io_error("verify cleared paper run-dirty authority", source));
+            }
+            Ok(_) => return Err(PaperCheckpointRepositoryError::DirtyAuthorityChanged),
+        }
+        self.dirty_authority = None;
+        Ok(())
+    }
 }
 
 /// Exact persisted replay fence for one paper account.
@@ -358,6 +465,15 @@ struct CurrentManifestWire {
     artifact_digest: [u8; 32],
     artifact_reference: String,
     account_replay: Vec<AccountReplayWire>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RunDirtyWire {
+    schema_version: u32,
+    repository_id: [u8; 32],
+    generation: u64,
+    nonce: [u8; 32],
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -629,6 +745,17 @@ fn read_current_manifest(
     }))
 }
 
+fn reject_unclean_run(directory: &Dir) -> Result<(), PaperCheckpointRepositoryError> {
+    match directory.symlink_metadata(RUN_DIRTY_PATH) {
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(io_error("inspect paper run-dirty authority", source)),
+        Ok(metadata) if metadata.file_type().is_file() => {
+            Err(PaperCheckpointRepositoryError::UncleanShutdown)
+        }
+        Ok(_) => Err(PaperCheckpointRepositoryError::UnsafeArtifact),
+    }
+}
+
 fn same_financial_state(left: &ReconciledAccountState, right: &ReconciledAccountState) -> bool {
     left.account_id() == right.account_id()
         && left.revision() == right.revision()
@@ -873,9 +1000,13 @@ fn is_lower_hex(value: &str, length: usize) -> bool {
 }
 
 fn random_hex() -> Result<String, PaperCheckpointRepositoryError> {
+    hex_bytes(&random_bytes()?)
+}
+
+fn random_bytes() -> Result<[u8; 32], PaperCheckpointRepositoryError> {
     let mut nonce = [0_u8; 32];
     getrandom::fill(&mut nonce).map_err(|_| PaperCheckpointRepositoryError::RandomUnavailable)?;
-    hex_bytes(&nonce)
+    Ok(nonce)
 }
 
 fn is_lock_contended(source: &std::io::Error) -> bool {
@@ -1021,6 +1152,14 @@ pub enum PaperCheckpointRepositoryError {
     RepositoryAlreadyOwned,
     #[error("paper checkpoint current authority changed while the writer was active")]
     AuthorityChanged,
+    #[error("paper checkpoint repository records an unclean prior run")]
+    UncleanShutdown,
+    #[error("paper run-dirty authority changed while the writer was active")]
+    DirtyAuthorityChanged,
+    #[error("a stabilized paper checkpoint requires active run-dirty authority")]
+    DirtyAuthorityRequired,
+    #[error("paper run-dirty authority requires an exact durable terminal checkpoint")]
+    UnstabilizedCheckpoint,
     #[error("paper checkpoint configuration does not match the bound repository")]
     ConfigurationMismatch,
     #[error("quarantined paper state cannot be published as a clean recovery checkpoint")]
@@ -1360,6 +1499,36 @@ mod tests {
         assert!(matches!(
             repository.persist_with_replay(&checkpoint, &replay),
             Err(PaperCheckpointRepositoryError::QuarantinedCheckpoint)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn dirty_run_cannot_restore_an_older_clean_manifest_after_crash() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let paths = LocalPaths::prepare(directory.path().join("data"))?;
+        let (config, checkpoint) = checkpoint_fixture()?;
+        let maximum_bytes = NonZeroUsize::new(1024 * 1024).ok_or("zero checkpoint bound")?;
+        let mut repository = PaperCheckpointRepository::try_new(
+            paths.artifacts()?.clone(),
+            config.clone(),
+            maximum_bytes,
+        )?;
+        let replay = exact_empty_replay(&checkpoint)?;
+        repository.persist_with_replay(&checkpoint, &replay)?;
+        repository.mark_run_dirty()?;
+        let mut unstabilized = checkpoint.clone();
+        unstabilized.sequence = 1;
+        assert!(matches!(
+            repository.persist_stabilized_with_replay(&unstabilized, &replay),
+            Err(PaperCheckpointRepositoryError::UnstabilizedCheckpoint)
+        ));
+        repository.persist_with_replay(&checkpoint, &replay)?;
+        drop(repository);
+
+        assert!(matches!(
+            PaperCheckpointRepository::try_new(paths.artifacts()?.clone(), config, maximum_bytes,),
+            Err(PaperCheckpointRepositoryError::UncleanShutdown)
         ));
         Ok(())
     }

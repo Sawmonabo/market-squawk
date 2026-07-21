@@ -503,43 +503,13 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
     );
     assert!(recovered_active.checkpoint().has_nonterminal_orders());
     assert_eq!(active_receipt.sequence(), active_checkpoint.sequence());
-    let (recovered_checkpoint, _) = recovered_active.into_parts();
-    let mut recovered_paper = PaperExecutionRuntime::try_start_from_checkpoint(
-        paper_config.clone(),
-        recovered_checkpoint,
-        &reopened_repository,
-        task_reaper.clone(),
-    )?;
-    let _recovery_audit = recovered_paper
-        .take_audit_reader()
-        .ok_or("recovery audit reader was already transferred")?;
-    recovered_paper
-        .terminalize_recovered_orders(paper_control()?)
-        .await?;
-    let terminal_recovery = recovered_paper
-        .adapter()
-        .checkpoint(paper_control()?)
-        .await?;
-    assert!(!terminal_recovery.has_nonterminal_orders());
-    let terminal_replay = explicit_replay(&accounts, account_id)?;
-    let terminal_receipt =
-        reopened_repository.persist_with_replay(&terminal_recovery, &terminal_replay)?;
-    assert!(recovered_paper.shutdown(paper_control()?).await?.complete());
-    drop(reopened_repository);
-    let mut terminal_repository = PaperCheckpointRepository::try_new(
-        checkpoint_paths.artifacts()?.clone(),
-        paper_config.clone(),
-        NonZeroUsize::new(1024 * 1024).ok_or("zero checkpoint capacity")?,
-    )?;
-    let terminal_current = terminal_repository
-        .take_recovery()
-        .ok_or("terminal successor manifest was not recovered")?;
-    assert_eq!(
-        terminal_current.checkpoint().sequence(),
-        terminal_receipt.sequence()
+    assert!(
+        !recovered_active
+            .checkpoint()
+            .recovered_dispatch_orders()?
+            .is_empty()
     );
-    assert!(!terminal_current.checkpoint().has_nonterminal_orders());
-    checkpoint_repository = terminal_repository;
+    checkpoint_repository = reopened_repository;
     let active_checkpoint_bytes = active_checkpoint.encode(1024 * 1024)?;
     let active_checkpoint_value: serde_json::Value =
         serde_json::from_slice(&active_checkpoint_bytes)?;
@@ -726,7 +696,10 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
         &checkpoint_repository,
         task_reaper.clone(),
     )?;
-    let _ = stale_paper.take_audit_reader();
+    let _stale_audit = stale_paper
+        .take_audit_reader()
+        .ok_or("stale recovery audit reader was already transferred")?;
+    stale_paper.initialize_recovery(paper_control()?).await?;
     let stale_adapter = stale_paper.adapter();
     let stale_checkpoint = stale_adapter.checkpoint(paper_control()?).await?;
     let stale_bytes = stale_checkpoint.encode(1024 * 1024)?;
@@ -998,6 +971,9 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
     let mut recovered_audit = recovered
         .take_audit_reader()
         .ok_or("recovered audit reader was already transferred")?;
+    assert!(recovered_audit.try_next()?.is_none());
+    let recovery = recovered.initialize_recovery(paper_control()?).await?;
+    assert!(!recovery.quarantined());
     let recovery_loaded = tokio::time::timeout(Duration::from_secs(1), recovered_audit.recv())
         .await?
         .ok_or("recovery audit stream closed")?;
@@ -1031,6 +1007,11 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
     let mut reconciled_recovery_audit = reconciled_recovery
         .take_audit_reader()
         .ok_or("reconciliation recovery audit reader was already transferred")?;
+    assert!(reconciled_recovery_audit.try_next()?.is_none());
+    let recovery = reconciled_recovery
+        .initialize_recovery(paper_control()?)
+        .await?;
+    assert!(recovery.quarantined());
     let recovery_loaded =
         tokio::time::timeout(Duration::from_secs(1), reconciled_recovery_audit.recv())
             .await?

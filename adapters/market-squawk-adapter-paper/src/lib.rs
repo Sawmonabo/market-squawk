@@ -17,7 +17,8 @@ mod worker;
 
 pub use adapter::{
     PaperControlContext, PaperControlError, PaperExecutionAdapter, PaperExecutionRuntime,
-    PaperFinancialChangeReadError, PaperFinancialChangeReader, PaperMarketIngress, PaperStartError,
+    PaperFinancialChangeReadError, PaperFinancialChangeReader, PaperMarketIngress,
+    PaperRecoveryInitialization, PaperStartError,
 };
 pub use audit::{PaperAuditKind, PaperAuditReadError, PaperAuditReader, PaperAuditRecord};
 pub use checkpoint_repository::{

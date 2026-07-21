@@ -155,6 +155,44 @@ async fn public_kraken_reaches_live_state_but_both_execution_safety_layers_rejec
     assert_eq!(records[1].payload(), UPDATE_BEFORE_SNAPSHOT.as_bytes());
     assert_eq!(records[2].payload(), expected_acknowledgement.as_bytes());
     assert_eq!(records[3].payload(), expected_snapshot.as_bytes());
+
+    let restart_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let restart_endpoint = format!("ws://{}/", restart_listener.local_addr()?);
+    let (restart_acknowledgement, restart_snapshot) = current_kraken_frames()?;
+    let restart_server = tokio::spawn(serve_one_kraken_session(
+        restart_listener,
+        restart_acknowledgement,
+        restart_snapshot,
+    ));
+    let restart_composition = local_kraken_paper_bot_with_strategy_for_test(
+        kraken_config(temporary.path())?,
+        Decimal::new(100_000, 0),
+        100,
+        Box::new(InvocationProbeStrategy {
+            invocations: Arc::new(AtomicUsize::new(0)),
+        }),
+    )?
+    .with_local_kraken_endpoint_for_test(&restart_endpoint)?;
+    let restart_cancellation = CancellationToken::new();
+    let restarted = restart_composition
+        .start(restart_cancellation.clone())
+        .await?;
+    let _restart_observed =
+        wait_for_kraken_snapshot(restarted.snapshots(), metadata.source_id()).await?;
+    assert!(restarted.financial_reconciliation_current());
+    restart_cancellation.cancel();
+    let restart_shutdown =
+        tokio::time::timeout(Duration::from_secs(10), restarted.shutdown()).await?;
+    assert!(restart_shutdown.is_complete());
+    assert_eq!(
+        restart_shutdown
+            .audit()
+            .evidence()
+            .ok_or("restart audit drain incomplete")?
+            .paper_records(),
+        1
+    );
+    restart_server.await??;
     Ok(())
 }
 

@@ -26,7 +26,7 @@ use crate::snapshot::{
 };
 use crate::{
     PaperCheckpointReceipt, PaperControlContext, PaperControlError, PaperExecutionConfig,
-    PaperLedger, PaperOrderState,
+    PaperLedger, PaperOrderState, PaperRecoveryInitialization,
 };
 
 #[path = "worker/reconciliation.rs"]
@@ -77,9 +77,9 @@ pub(crate) enum WorkerCommand {
         control: PaperControlContext,
         reply: oneshot::Sender<Result<PaperExecutionCheckpoint, PaperControlError>>,
     },
-    TerminalizeRecovery {
+    InitializeRecovery {
         control: PaperControlContext,
-        reply: oneshot::Sender<Result<(), PaperControlError>>,
+        reply: oneshot::Sender<Result<PaperRecoveryInitialization, PaperControlError>>,
     },
     Shutdown {
         control: PaperControlContext,
@@ -109,7 +109,7 @@ impl WorkerCommand {
             Self::Cancel { .. }
             | Self::Snapshot { .. }
             | Self::Checkpoint { .. }
-            | Self::TerminalizeRecovery { .. }
+            | Self::InitializeRecovery { .. }
             | Self::Shutdown { .. } => 0,
         };
         inline
@@ -155,6 +155,7 @@ pub(crate) struct PaperWorker {
     cancellation: CancellationToken,
     reconciliation_fence: Option<AccountRiskReconciliationFence>,
     financial_changes: watch::Sender<u64>,
+    event_sequence: Arc<std::sync::Mutex<u64>>,
 }
 
 #[derive(Debug)]
@@ -173,6 +174,8 @@ struct WorkerState {
     issued_checkpoint: Option<IssuedCheckpoint>,
     ledger: PaperLedger,
     idempotency: BTreeMap<(AccountId, ClientOrderId), OrderId>,
+    recovery_pending: bool,
+    recovery_input_digest: Option<[u8; 32]>,
 }
 
 #[derive(Debug)]
@@ -255,7 +258,10 @@ impl PaperWorker {
         cancellation: CancellationToken,
         reconciliation_fence: Option<AccountRiskReconciliationFence>,
         financial_changes: watch::Sender<u64>,
+        event_sequence: Arc<std::sync::Mutex<u64>>,
+        recovery_input_digest: Option<[u8; 32]>,
     ) -> Self {
+        let recovery_pending = checkpoint.is_some();
         let state = if let Some(checkpoint) = checkpoint {
             WorkerState {
                 sequence: checkpoint.sequence,
@@ -272,6 +278,8 @@ impl PaperWorker {
                 issued_checkpoint: None,
                 ledger: checkpoint.ledger,
                 idempotency: checkpoint.idempotency,
+                recovery_pending,
+                recovery_input_digest,
             }
         } else {
             WorkerState {
@@ -289,6 +297,8 @@ impl PaperWorker {
                 issued_checkpoint: None,
                 ledger,
                 idempotency: BTreeMap::new(),
+                recovery_pending,
+                recovery_input_digest,
             }
         };
         Self {
@@ -301,6 +311,7 @@ impl PaperWorker {
             cancellation,
             reconciliation_fence,
             financial_changes,
+            event_sequence,
         }
     }
 
@@ -366,7 +377,9 @@ impl PaperWorker {
     fn handle_command(&mut self, event_sequence: u64, command: WorkerCommand) -> bool {
         match command {
             WorkerCommand::Submit { order, reply } => {
-                let result = if order.operation().is_expired() {
+                let result = if self.state.recovery_pending {
+                    Err(ExecutionAdapterError::ReconciliationRequired)
+                } else if order.operation().is_expired() {
                     Err(ExecutionAdapterError::KnownFailure)
                 } else {
                     self.submit(event_sequence, order)
@@ -379,7 +392,9 @@ impl PaperWorker {
                 requested_at,
                 reply,
             } => {
-                let result = if order.operation().is_expired() {
+                let result = if self.state.recovery_pending {
+                    Err(ExecutionAdapterError::ReconciliationRequired)
+                } else if order.operation().is_expired() {
                     Err(ExecutionAdapterError::KnownFailure)
                 } else {
                     self.cancel(event_sequence, order.order_id(), requested_at)
@@ -392,7 +407,9 @@ impl PaperWorker {
                 request,
                 reply,
             } => {
-                let result = if request.operation().is_expired() {
+                let result = if self.state.recovery_pending {
+                    Err(ExecutionAdapterError::ReconciliationRequired)
+                } else if request.operation().is_expired() {
                     Err(ExecutionAdapterError::KnownFailure)
                 } else {
                     self.advance_due(requested_at);
@@ -405,12 +422,20 @@ impl PaperWorker {
                 acknowledgement,
                 reply,
             } => {
-                let result = self.acknowledge_reconciliation(acknowledgement);
+                let result = if self.state.recovery_pending {
+                    Err(ExecutionAdapterError::ReconciliationRequired)
+                } else {
+                    self.acknowledge_reconciliation(acknowledgement)
+                };
                 let _ = reply.send(result);
                 false
             }
             WorkerCommand::RecoverQuarantined { recovery, reply } => {
-                let result = self.recover_quarantined(recovery);
+                let result = if self.state.recovery_pending {
+                    Err(ExecutionAdapterError::ReconciliationRequired)
+                } else {
+                    self.recover_quarantined(recovery)
+                };
                 let _ = reply.send(result);
                 false
             }
@@ -419,13 +444,19 @@ impl PaperWorker {
                 receipt,
                 reply,
             } => {
-                let result = self.acknowledge_persistence(authority, receipt);
+                let result = if self.state.recovery_pending {
+                    Err(PaperControlError::RecoveryInitializationUnavailable)
+                } else {
+                    self.acknowledge_persistence(authority, receipt)
+                };
                 let _ = reply.send(result);
                 false
             }
             WorkerCommand::Snapshot { control, reply } => {
                 let result = if control.is_expired() {
                     Err(PaperControlError::DeadlineExceeded)
+                } else if self.state.recovery_pending {
+                    Err(PaperControlError::RecoveryInitializationUnavailable)
                 } else {
                     self.refresh_audit_health();
                     Ok(self.snapshot())
@@ -436,6 +467,8 @@ impl PaperWorker {
             WorkerCommand::Checkpoint { control, reply } => {
                 let result = if control.is_expired() {
                     Err(PaperControlError::DeadlineExceeded)
+                } else if self.state.recovery_pending {
+                    Err(PaperControlError::RecoveryInitializationUnavailable)
                 } else {
                     self.refresh_audit_health();
                     self.checkpoint().map_err(|_| PaperControlError::Closed)
@@ -443,11 +476,11 @@ impl PaperWorker {
                 let _ = reply.send(result);
                 false
             }
-            WorkerCommand::TerminalizeRecovery { control, reply } => {
+            WorkerCommand::InitializeRecovery { control, reply } => {
                 let result = if control.is_expired() {
                     Err(PaperControlError::DeadlineExceeded)
                 } else {
-                    self.terminalize_recovery_orders()
+                    self.initialize_recovery()
                 };
                 let _ = reply.send(result);
                 false
@@ -465,42 +498,91 @@ impl PaperWorker {
         }
     }
 
-    fn terminalize_recovery_orders(&mut self) -> Result<(), PaperControlError> {
-        let event_at = crate::adapter::system_timestamp().map_err(PaperControlError::Adapter)?;
-        let mut orders = Vec::new();
-        orders
-            .try_reserve_exact(self.state.orders.len())
-            .map_err(|_| PaperControlError::Adapter(ExecutionAdapterError::NotAttemptedBusy))?;
-        orders.extend(
-            self.state
-                .orders
-                .values()
-                .filter(|order| !is_terminal(order.lifecycle.state()))
-                .cloned(),
-        );
-        for order in orders {
-            if order.lifecycle.state() == PaperOrderState::CancelPending {
-                self.confirm_cancel(order, event_at);
-            } else {
-                self.cancel_remainder(order, event_at);
-            }
-            if self.state.reconciliation_required {
-                return Err(PaperControlError::Adapter(
-                    ExecutionAdapterError::ReconciliationRequired,
-                ));
-            }
+    fn initialize_recovery(&mut self) -> Result<PaperRecoveryInitialization, PaperControlError> {
+        self.refresh_audit_health();
+        if !self.state.recovery_pending || self.audit_failed.load(AtomicOrdering::Acquire) {
+            return Err(PaperControlError::RecoveryInitializationUnavailable);
         }
-        if self
+        let input_digest = self
             .state
-            .orders
-            .values()
-            .any(|order| !is_terminal(order.lifecycle.state()))
-        {
-            return Err(PaperControlError::Adapter(
-                ExecutionAdapterError::ReconciliationRequired,
+            .recovery_input_digest
+            .ok_or(PaperControlError::RecoveryInitializationUnavailable)?;
+        let recovered_at =
+            crate::adapter::system_timestamp().map_err(PaperControlError::Adapter)?;
+        let recovery_sequence = self
+            .state
+            .sequence
+            .checked_add(1)
+            .ok_or(PaperControlError::RecoveryInitializationUnavailable)?;
+        let final_sequence = if self.state.reconciliation_required {
+            recovery_sequence
+                .checked_add(1)
+                .ok_or(PaperControlError::RecoveryInitializationUnavailable)?
+        } else {
+            recovery_sequence
+        };
+        let record_count = 1 + usize::from(self.state.reconciliation_required);
+        let mut permits =
+            self.audit
+                .try_reserve_many(record_count)
+                .map_err(|error| match error {
+                    mpsc::error::TrySendError::Full(_) => {
+                        PaperControlError::Adapter(ExecutionAdapterError::NotAttemptedBusy)
+                    }
+                    mpsc::error::TrySendError::Closed(_) => {
+                        PaperControlError::RecoveryInitializationUnavailable
+                    }
+                })?;
+        let mut event_sequence = self
+            .event_sequence
+            .try_lock()
+            .map_err(|_| PaperControlError::Adapter(ExecutionAdapterError::NotAttemptedBusy))?;
+        let recovery_permit = permits
+            .next()
+            .ok_or(PaperControlError::RecoveryInitializationUnavailable)?;
+        let reconciliation_permit = if self.state.reconciliation_required {
+            Some(
+                permits
+                    .next()
+                    .ok_or(PaperControlError::RecoveryInitializationUnavailable)?,
+            )
+        } else {
+            None
+        };
+        *event_sequence = (*event_sequence).max(final_sequence);
+        let recovery = PaperAuditRecord::new(
+            recovery_sequence,
+            None,
+            PaperAuditKind::RecoveryLoaded,
+            None,
+            None,
+            recovered_at,
+            None,
+            self.config.digest(),
+            input_digest,
+        );
+        recovery_permit.send(recovery);
+        if let Some(reconciliation_permit) = reconciliation_permit {
+            reconciliation_permit.send(PaperAuditRecord::new(
+                final_sequence,
+                None,
+                PaperAuditKind::ReconciliationRequired,
+                None,
+                None,
+                recovered_at,
+                None,
+                self.config.digest(),
+                input_digest,
             ));
         }
-        Ok(())
+        self.state.sequence = final_sequence;
+        self.state.recovery_pending = false;
+        self.state.recovery_input_digest = None;
+        Ok(PaperRecoveryInitialization {
+            sequence: NonZeroU64::new(final_sequence)
+                .ok_or(PaperControlError::RecoveryInitializationUnavailable)?,
+            quarantined: self.state.reconciliation_required,
+        })
     }
 
     fn recover_quarantined(
@@ -1157,7 +1239,7 @@ impl PaperWorker {
 
     async fn process_market(&mut self, event: WorkerMarketUpdate) {
         self.refresh_audit_health();
-        if self.state.reconciliation_required {
+        if self.state.recovery_pending || self.state.reconciliation_required {
             return;
         }
         let Ok(mut available) = AvailableMarket::try_new(event.update, &self.config) else {

@@ -42,8 +42,9 @@ pub use market_squawk_platform::{
 };
 pub use paper_bot::{
     ProductionAuditBarrierError, ProductionAuditError, ProductionAuditEvidence,
-    ProductionAuditShutdown, ProductionPaperBotComposition, ProductionPaperBotCompositionError,
-    ProductionPaperBotExecutionConfig, ProductionPaperBotRollback, ProductionPaperBotRoute,
-    ProductionPaperBotRuntime, ProductionPaperBotShutdown, ProductionPaperBotStartError,
-    ProductionPaperCheckpointError, ProductionPaperCheckpointEvidence,
+    ProductionAuditShutdown, ProductionAuditShutdownStatus, ProductionPaperBotComposition,
+    ProductionPaperBotCompositionError, ProductionPaperBotExecutionConfig,
+    ProductionPaperBotRollback, ProductionPaperBotRoute, ProductionPaperBotRuntime,
+    ProductionPaperBotShutdown, ProductionPaperBotStartError, ProductionPaperCheckpointError,
+    ProductionPaperCheckpointEvidence,
 };

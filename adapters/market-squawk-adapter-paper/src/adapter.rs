@@ -17,7 +17,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::PaperCheckpointRepository;
-use crate::audit::{PaperAuditKind, PaperAuditReader, PaperAuditRecord};
+use crate::audit::{PaperAuditReader, PaperAuditRecord};
 use crate::snapshot::{PaperExecutionCheckpoint, PaperExecutionSnapshot};
 use crate::worker::{PaperWorker, WorkerCommand, WorkerEnvelope, WorkerEvent};
 use crate::{PaperAccountBootstrap, PaperCheckpointReceipt, PaperExecutionConfig, PaperLedger};
@@ -493,7 +493,7 @@ impl PaperExecutionRuntime {
     fn start_with_state(
         config: PaperExecutionConfig,
         ledger: PaperLedger,
-        mut checkpoint: Option<PaperExecutionCheckpoint>,
+        checkpoint: Option<PaperExecutionCheckpoint>,
         repository_id: [u8; 32],
         task_reaper: ExecutionTaskReaper,
         reconciliation_fence: Option<market_squawk_execution::AccountRiskReconciliationFence>,
@@ -523,6 +523,12 @@ impl PaperExecutionRuntime {
             input.audit_maximum_bytes.get() as usize,
             PaperAuditRecord::retained_bytes(),
         )?;
+        let required_recovery_audits = checkpoint
+            .as_ref()
+            .map_or(0, |state| 1 + usize::from(state.reconciliation_required));
+        if audit_capacity < required_recovery_audits {
+            return Err(PaperStartError::RecoveryAuditUnavailable);
+        }
         let event_capacity = command_capacity
             .checked_add(market_capacity)
             .ok_or(PaperStartError::CapacityOverflow)?;
@@ -531,12 +537,11 @@ impl PaperExecutionRuntime {
         }
         let (event_tx, event_rx) = mpsc::channel(event_capacity);
         let (audit_tx, audit_rx) = mpsc::channel(audit_capacity);
-        let recovery_audits = prepare_recovery_audits(&config, &mut checkpoint)?;
-        for record in recovery_audits.into_iter().flatten() {
-            audit_tx
-                .try_send(record)
-                .map_err(|_| PaperStartError::RecoveryAuditUnavailable)?;
-        }
+        let recovery_input_digest = checkpoint
+            .as_ref()
+            .map(PaperExecutionCheckpoint::recovery_input_digest)
+            .transpose()
+            .map_err(|_| PaperStartError::InvalidCheckpoint)?;
         let event_sequence = Arc::new(Mutex::new(
             checkpoint.as_ref().map_or(0, |state| state.sequence),
         ));
@@ -558,6 +563,8 @@ impl PaperExecutionRuntime {
             cancellation.clone(),
             reconciliation_fence,
             financial_change_sender,
+            Arc::clone(&event_sequence),
+            recovery_input_digest,
         );
         let join = task_reaper
             .try_reserve()
@@ -606,17 +613,17 @@ impl PaperExecutionRuntime {
         self.financial_changes.take()
     }
 
-    /// Deterministically cancels every nonterminal recovered order before live admission.
-    pub async fn terminalize_recovered_orders(
+    /// Admits mandatory recovery evidence after the durable audit consumer owns its stream.
+    pub async fn initialize_recovery(
         &self,
         control: PaperControlContext,
-    ) -> Result<(), PaperControlError> {
+    ) -> Result<PaperRecoveryInitialization, PaperControlError> {
         let (reply, response) = oneshot::channel();
         let deadline = control.deadline();
         let cancellation = control.cancellation();
         self.adapter
             .send_control(
-                WorkerCommand::TerminalizeRecovery { control, reply },
+                WorkerCommand::InitializeRecovery { control, reply },
                 deadline,
                 &cancellation,
             )
@@ -673,6 +680,23 @@ impl PaperExecutionRuntime {
     }
 }
 
+/// Exact post-audit sequence and quarantine state of one initialized recovery image.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PaperRecoveryInitialization {
+    pub(crate) sequence: std::num::NonZeroU64,
+    pub(crate) quarantined: bool,
+}
+
+impl PaperRecoveryInitialization {
+    pub const fn sequence(self) -> std::num::NonZeroU64 {
+        self.sequence
+    }
+
+    pub const fn quarantined(self) -> bool {
+        self.quarantined
+    }
+}
+
 /// Sole bounded coalescing consumer for paper financial mutation sequences.
 #[derive(Debug)]
 pub struct PaperFinancialChangeReader {
@@ -700,55 +724,6 @@ impl PaperFinancialChangeReader {
 pub enum PaperFinancialChangeReadError {
     #[error("paper financial-change stream closed")]
     Closed,
-}
-
-fn prepare_recovery_audits(
-    config: &PaperExecutionConfig,
-    checkpoint: &mut Option<PaperExecutionCheckpoint>,
-) -> Result<[Option<PaperAuditRecord>; 2], PaperStartError> {
-    let Some(checkpoint) = checkpoint.as_mut() else {
-        return Ok([None, None]);
-    };
-    let input_digest = checkpoint
-        .recovery_input_digest()
-        .map_err(|_| PaperStartError::InvalidCheckpoint)?;
-    let recovered_at = system_timestamp().map_err(|_| PaperStartError::Clock)?;
-    let recovery_sequence = checkpoint
-        .sequence
-        .checked_add(1)
-        .ok_or(PaperStartError::InvalidCheckpoint)?;
-    let recovery = PaperAuditRecord::new(
-        recovery_sequence,
-        None,
-        PaperAuditKind::RecoveryLoaded,
-        None,
-        None,
-        recovered_at,
-        None,
-        config.digest(),
-        input_digest,
-    );
-    let reconciliation = if checkpoint.reconciliation_required {
-        let sequence = recovery_sequence
-            .checked_add(1)
-            .ok_or(PaperStartError::InvalidCheckpoint)?;
-        checkpoint.sequence = sequence;
-        Some(PaperAuditRecord::new(
-            sequence,
-            None,
-            PaperAuditKind::ReconciliationRequired,
-            None,
-            None,
-            recovered_at,
-            None,
-            config.digest(),
-            input_digest,
-        ))
-    } else {
-        checkpoint.sequence = recovery_sequence;
-        None
-    };
-    Ok([Some(recovery), reconciliation])
 }
 
 impl Drop for PaperExecutionRuntime {
@@ -940,8 +915,6 @@ pub enum PaperStartError {
     CheckpointRepositoryMismatch,
     #[error("paper recovery audit capacity cannot admit mandatory startup evidence")]
     RecoveryAuditUnavailable,
-    #[error("paper recovery could not obtain a valid wall-clock timestamp")]
-    Clock,
     #[error(transparent)]
     TaskOwnership(#[from] ExecutionTaskReaperError),
     #[error(transparent)]
@@ -963,6 +936,8 @@ pub enum PaperControlError {
     WorkerFailed,
     #[error("paper execution worker could not be reaped within the abort deadline")]
     ShutdownIncomplete,
+    #[error("paper recovery initialization is unavailable in the current state")]
+    RecoveryInitializationUnavailable,
     #[error(transparent)]
     Adapter(ExecutionAdapterError),
 }
