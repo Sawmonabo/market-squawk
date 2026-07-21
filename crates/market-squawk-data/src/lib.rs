@@ -16,6 +16,7 @@ mod publication_coordinator;
 mod query;
 mod rights;
 mod schema;
+mod universe;
 
 pub use analytical_backup::{
     AnalyticalBackupBundleReceipt, AnalyticalBackupError, AnalyticalBackupLimits,
@@ -55,4 +56,9 @@ pub use query::{
 };
 pub use rights::{
     IngestIdentity, RegisteredRightsGrant, RightsDecisionInput, RightsError, SourceOperation,
+};
+pub use universe::{
+    MAX_UNIVERSE_CANDIDATES, MAX_UNIVERSE_RETAINED_BYTES, UniverseConflictCounts,
+    UniverseConflictEvidence, UniverseError, UniverseExclusion, UniverseExclusionCounts,
+    UniverseExclusionReason, UniverseId, UniverseLimits, UniverseMembership, UniverseSnapshot,
 };
