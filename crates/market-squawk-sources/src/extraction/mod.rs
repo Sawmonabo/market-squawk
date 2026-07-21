@@ -14,7 +14,7 @@ use crate::{
     SourceMetadataProvider,
 };
 
-pub use batch::{ExtractionBatch, ExtractionBatchAccumulator};
+pub use batch::{ExtractionBatch, ExtractionBatchAccumulator, ExtractionContentIdentity};
 pub use contracts::{
     AvailabilityEvidence, DiscoveryBatch, DiscoveryRequest, DiscoveryRequestId, ExtractionError,
     ExtractionRecord, ExtractionRequest, ExtractionRequestId, MAX_DISCOVERY_OBJECTS,

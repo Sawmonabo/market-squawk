@@ -1,9 +1,9 @@
 //! Manifest-bound source discovery, extraction, and canonical row mapping.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::fmt::{self, Write as _};
-use std::str::FromStr as _;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::path::Path;
+use std::sync::{Arc, LazyLock};
 
 use bytes::Bytes;
 use market_squawk_domain::{
@@ -32,22 +32,16 @@ use crate::contracts::{
     ExtractionLimits, FileAdapterError, ParseBudget, ParsedRow, ParserLimit, SourceRowLimit,
 };
 use crate::manifest::{FileFormat, FileObjectSpec, FileSourceManifest};
+use crate::representation::FileRepresentationAuthority;
 use crate::{csv, database, excel, json, ofx, parquet, xml};
 
 const RECORD_SCHEMA: &str = "market-squawk-research-v1";
 const MAX_CONCURRENT_BLOCKING_OPERATIONS: usize = 4;
 const MAX_CONCURRENT_DEADLINE_SAMPLES: usize = 4;
-const MAX_RETAINED_OBJECT_VERSIONS: usize = 16_384;
 static BLOCKING_SLOTS: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(MAX_CONCURRENT_BLOCKING_OPERATIONS)));
 static DEADLINE_SAMPLING_SLOTS: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(MAX_CONCURRENT_DEADLINE_SAMPLES)));
-
-#[derive(Debug, Default)]
-struct ObjectAvailabilityState {
-    exact_observations: HashMap<(SourceIdentifier, EvidenceDigest), Timestamp>,
-    latest_by_object: HashMap<SourceIdentifier, Timestamp>,
-}
 
 struct FileInputReadControl<'a> {
     cancellation: &'a CancellationToken,
@@ -76,7 +70,7 @@ pub struct FileExtractionSource {
     root: UserAuthorizedInputRoot,
     manifest: Arc<FileSourceManifest>,
     limits: ExtractionLimits,
-    availability: Arc<Mutex<ObjectAvailabilityState>>,
+    representation: Arc<FileRepresentationAuthority>,
     clock: Arc<dyn ExtractionClock>,
 }
 
@@ -88,7 +82,7 @@ impl fmt::Debug for FileExtractionSource {
             .field("root", &"[USER-AUTHORIZED INPUT ROOT]")
             .field("objects", &self.manifest.objects.len())
             .field("limits", &self.limits)
-            .field("retained_object_versions", &"[BOUNDED AVAILABILITY STATE]")
+            .field("representation", &"[DURABLE EXACT-OBJECT AUTHORITY]")
             .field("clock", &"[PAIRED EXTRACTION CLOCK]")
             .finish()
     }
@@ -97,19 +91,29 @@ impl fmt::Debug for FileExtractionSource {
 impl FileExtractionSource {
     /// Constructs an immutable source bound to exact manifest bytes and one local root.
     ///
+    /// `representation_state_root` is a controlled, writable local directory that must be disjoint
+    /// from the user-authorized input root. The source holds its authority store exclusively for
+    /// its lifetime. State is namespaced by source identity, metadata revision, and manifest digest
+    /// so reconstruction can recover exact-object availability and operation-time evidence without
+    /// trusting caller-provided provenance.
+    ///
     /// # Errors
     ///
     /// Rejects non-local/networked metadata, mismatched manifest evidence, duplicate objects,
-    /// unsafe row policies, and unsupported manifest versions.
+    /// unsafe row policies, unsupported manifest versions, overlapping authority/input roots, an
+    /// authority namespace mismatch, corrupt or oversized authority state, and concurrent access to
+    /// the same authority directory.
     pub fn try_new(
         metadata: SourceMetadata,
         root: UserAuthorizedInputRoot,
+        representation_state_root: impl AsRef<Path>,
         manifest_input: BoundedInput,
         limits: ExtractionLimits,
     ) -> Result<Self, FileAdapterError> {
         Self::try_new_with_clock(
             metadata,
             root,
+            representation_state_root,
             manifest_input,
             limits,
             Arc::new(SystemExtractionClock),
@@ -123,10 +127,12 @@ impl FileExtractionSource {
     ///
     /// # Errors
     ///
-    /// Applies the same metadata, manifest, and row-policy validation as [`Self::try_new`].
+    /// Applies the same metadata, manifest, row-policy, and durable authority validation as
+    /// [`Self::try_new`].
     pub fn try_new_with_clock(
         metadata: SourceMetadata,
         root: UserAuthorizedInputRoot,
+        representation_state_root: impl AsRef<Path>,
         manifest_input: BoundedInput,
         limits: ExtractionLimits,
         clock: Arc<dyn ExtractionClock>,
@@ -138,11 +144,6 @@ impl FileExtractionSource {
         {
             return Err(FileAdapterError::MetadataPolicyMismatch);
         }
-        let manifest_bytes = u64::try_from(manifest_input.as_bytes().len())
-            .map_err(|_| FileAdapterError::LimitExceeded(ParserLimit::SourceBytes))?;
-        if manifest_bytes > limits.source_bytes() {
-            return Err(FileAdapterError::LimitExceeded(ParserLimit::SourceBytes));
-        }
         let expected = metadata
             .revision_evidence()
             .payload_evidence()
@@ -150,15 +151,22 @@ impl FileExtractionSource {
         if manifest_input.digest() != expected {
             return Err(FileAdapterError::ManifestEvidenceMismatch);
         }
-        let manifest: FileSourceManifest = serde_json::from_slice(manifest_input.as_bytes())
-            .map_err(|_| FileAdapterError::InvalidManifest)?;
+        let manifest_digest = manifest_input.digest();
+        let manifest = FileSourceManifest::parse(manifest_input.as_bytes(), limits)?;
         manifest.validate()?;
+        let representation = FileRepresentationAuthority::try_open(
+            &root,
+            representation_state_root,
+            metadata.source_id(),
+            metadata.revision(),
+            manifest_digest,
+        )?;
         Ok(Self {
             metadata: Arc::new(metadata),
             root,
             manifest: Arc::new(manifest),
             limits,
-            availability: Arc::new(Mutex::new(ObjectAvailabilityState::default())),
+            representation: Arc::new(representation),
             clock,
         })
     }
@@ -175,13 +183,12 @@ impl FileExtractionSource {
         let permit = Self::acquire_blocking_slot(cancellation, deadline).await?;
         let source = self.clone();
         let request = request.clone();
-        let cancellation = cancellation.clone();
-        tokio::task::spawn_blocking(move || {
+        let worker_cancellation = cancellation.clone();
+        let worker = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            source.discover_files_blocking(&request, &cancellation, deadline)
-        })
-        .await
-        .map_err(|_| FileAdapterError::BlockingTaskFailed)?
+            source.discover_files_blocking(&request, &worker_cancellation, deadline)
+        });
+        Self::await_blocking(worker, cancellation, deadline).await
     }
 
     fn discover_files_blocking(
@@ -211,8 +218,10 @@ impl FileExtractionSource {
             let input = self.read_object(specification, cancellation, deadline)?;
             let sampled_at = self.control_timestamp(cancellation, deadline)?;
             let availability = self.bind_object_availability(
+                &specification.dataset,
                 &specification.object_id,
                 input.digest(),
+                input.identity().size_bytes(),
                 sampled_at,
             )?;
             let effective =
@@ -252,13 +261,12 @@ impl FileExtractionSource {
         let permit = Self::acquire_blocking_slot(cancellation, deadline).await?;
         let source = self.clone();
         let request = request.clone();
-        let cancellation = cancellation.clone();
-        tokio::task::spawn_blocking(move || {
+        let worker_cancellation = cancellation.clone();
+        let worker = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            source.extract_file_blocking(&request, &cancellation, deadline)
-        })
-        .await
-        .map_err(|_| FileAdapterError::BlockingTaskFailed)?
+            source.extract_file_blocking(&request, &worker_cancellation, deadline)
+        });
+        Self::await_blocking(worker, cancellation, deadline).await
     }
 
     fn extract_file_blocking(
@@ -291,22 +299,24 @@ impl FileExtractionSource {
             return Err(FileAdapterError::ObjectLineageMismatch);
         }
         let input = self.read_object(specification, cancellation, deadline)?;
-        let received_at = self.control_timestamp(cancellation, deadline)?;
+        let sampled_received_at = self.control_timestamp(cancellation, deadline)?;
         if request.object().evidence().content_digest() != input.digest()
             || request.object().expected_bytes() != Some(input.identity().size_bytes())
         {
             return Err(FileAdapterError::ObjectEvidenceMismatch);
         }
         self.verify_object_availability(
+            request.object().dataset(),
             request.object().object_id(),
             input.digest(),
+            input.identity().size_bytes(),
             request.object().availability(),
         )?;
         if request
             .object()
             .availability()
             .reported_at()
-            .is_some_and(|available_at| available_at > received_at)
+            .is_some_and(|available_at| available_at > sampled_received_at)
         {
             return Err(FileAdapterError::ClockFailure);
         }
@@ -323,11 +333,21 @@ impl FileExtractionSource {
             row_limit,
         )?;
         self.check_control(cancellation, deadline)?;
+        let sampled_ingested_at = self.control_timestamp(cancellation, deadline)?;
+        let operation_times = self.representation.operation_times(
+            request.object().dataset(),
+            request.object().object_id(),
+            input.digest(),
+            input.identity().size_bytes(),
+            request.object().availability(),
+            sampled_received_at,
+            sampled_ingested_at,
+        )?;
         self.rows_to_batch(
             request,
             specification,
             rows,
-            received_at,
+            operation_times,
             cancellation,
             deadline,
         )
@@ -345,6 +365,30 @@ impl FileExtractionSource {
             () = tokio::time::sleep_until(expiry) => Err(FileAdapterError::DeadlineExceeded),
             permit = slots.acquire_owned() => {
                 permit.map_err(|_| FileAdapterError::BlockingTaskFailed)
+            }
+        }
+    }
+
+    async fn await_blocking<T>(
+        mut worker: tokio::task::JoinHandle<Result<T, FileAdapterError>>,
+        cancellation: &CancellationToken,
+        deadline: RequestDeadline,
+    ) -> Result<T, FileAdapterError> {
+        let expiry = tokio::time::Instant::from_std(deadline.monotonic_expiry());
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => {
+                // Tokio cannot stop a running blocking closure. Aborting detaches it; the owned
+                // semaphore permit remains inside the closure until that worker actually exits.
+                worker.abort();
+                Err(FileAdapterError::Cancelled)
+            }
+            () = tokio::time::sleep_until(expiry) => {
+                worker.abort();
+                Err(FileAdapterError::DeadlineExceeded)
+            }
+            result = &mut worker => {
+                result.map_err(|_| FileAdapterError::BlockingTaskFailed)?
             }
         }
     }
@@ -396,58 +440,26 @@ impl FileExtractionSource {
 
     fn bind_object_availability(
         &self,
+        dataset: &SourceIdentifier,
         object_id: &SourceIdentifier,
         digest: EvidenceDigest,
+        size_bytes: u64,
         sampled_at: Timestamp,
     ) -> Result<AvailabilityEvidence, FileAdapterError> {
-        let mut state = self
-            .availability
-            .lock()
-            .map_err(|_| FileAdapterError::AvailabilityStateUnavailable)?;
-        let key = (object_id.clone(), digest);
-        if let Some(observed_at) = state.exact_observations.get(&key) {
-            return Ok(AvailabilityEvidence::LocalFirstObserved {
-                observed_at: *observed_at,
-            });
-        }
-        if state.exact_observations.len() >= MAX_RETAINED_OBJECT_VERSIONS {
-            return Err(FileAdapterError::AvailabilityStateExhausted);
-        }
-        let observed_at = match state.latest_by_object.get(object_id) {
-            Some(previous) if sampled_at <= *previous => previous
-                .checked_add_nanos(1)
-                .map_err(|_| FileAdapterError::ClockFailure)?,
-            _ => sampled_at,
-        };
-        let _ = state.exact_observations.insert(key, observed_at);
-        let _ = state
-            .latest_by_object
-            .insert(object_id.clone(), observed_at);
-        Ok(AvailabilityEvidence::LocalFirstObserved { observed_at })
+        self.representation
+            .bind_object(dataset, object_id, digest, size_bytes, sampled_at)
     }
 
     fn verify_object_availability(
         &self,
+        dataset: &SourceIdentifier,
         object_id: &SourceIdentifier,
         digest: EvidenceDigest,
+        size_bytes: u64,
         availability: &AvailabilityEvidence,
     ) -> Result<(), FileAdapterError> {
-        let state = self
-            .availability
-            .lock()
-            .map_err(|_| FileAdapterError::AvailabilityStateUnavailable)?;
-        let retained = state
-            .exact_observations
-            .get(&(object_id.clone(), digest))
-            .copied();
-        match (retained, availability) {
-            (Some(retained), AvailabilityEvidence::LocalFirstObserved { observed_at })
-                if retained == *observed_at =>
-            {
-                Ok(())
-            }
-            _ => Err(FileAdapterError::ObjectAvailabilityMismatch),
-        }
+        self.representation
+            .verify_object(dataset, object_id, digest, size_bytes, availability)
     }
 
     fn read_object(
@@ -481,7 +493,7 @@ impl FileExtractionSource {
         let mut budget = ParseBudget::new(
             self.limits,
             cancellation,
-            self.clock.as_ref(),
+            Arc::clone(&self.clock),
             deadline,
             row_limit,
         );
@@ -532,10 +544,11 @@ impl FileExtractionSource {
         request: &ExtractionRequest,
         specification: &FileObjectSpec,
         rows: Vec<ParsedRow>,
-        received_at: Timestamp,
+        operation_times: (Timestamp, Timestamp),
         cancellation: &CancellationToken,
         deadline: RequestDeadline,
     ) -> Result<ExtractionBatch, FileAdapterError> {
+        let (received_at, ingested_at) = operation_times;
         let record_availability = request.object().availability().clone();
         let domain_availability = domain_availability(&record_availability);
         let maximum_records = usize::try_from(request.max_records())
@@ -565,7 +578,6 @@ impl FileExtractionSource {
                 SourceIdentifier::try_from(row_id).map_err(|_| FileAdapterError::InvalidRecord)?;
             let payload_reference = row_reference(specification, &row)?;
             for mapping in &specification.row_policy.fields {
-                let ingested_at = self.control_timestamp(cancellation, deadline)?;
                 if received_at > ingested_at {
                     return Err(FileAdapterError::ClockFailure);
                 }
@@ -574,8 +586,7 @@ impl FileExtractionSource {
                     .get(&mapping.source)
                     .ok_or(FileAdapterError::InvalidRecord)?
                     .as_text()?;
-                let value =
-                    Decimal::from_str(text).map_err(|_| FileAdapterError::InvalidDecimal)?;
+                let value = parse_decimal_lexeme(text)?;
                 if value.scale() != mapping.decimal_scale {
                     return Err(FileAdapterError::DecimalScaleMismatch);
                 }
@@ -721,6 +732,85 @@ fn row_reference(
         write!(&mut reference, "{byte:02x}").map_err(|_| FileAdapterError::Contract)?;
     }
     SourceIdentifier::try_from(reference).map_err(|_| FileAdapterError::Contract)
+}
+
+fn parse_decimal_lexeme(value: &str) -> Result<Decimal, FileAdapterError> {
+    let Some(exponent_index) = value.find(['e', 'E']) else {
+        return Decimal::from_str_exact(value).map_err(|_| FileAdapterError::InvalidDecimal);
+    };
+    let (base, exponent) = value.split_at(exponent_index);
+    let exponent = exponent
+        .get(1..)
+        .ok_or(FileAdapterError::InvalidDecimal)?
+        .parse::<i32>()
+        .map_err(|_| FileAdapterError::InvalidDecimal)?;
+    let (negative, unsigned) = match base.as_bytes().first() {
+        Some(b'-') => (true, base.get(1..).ok_or(FileAdapterError::InvalidDecimal)?),
+        Some(b'+') => (
+            false,
+            base.get(1..).ok_or(FileAdapterError::InvalidDecimal)?,
+        ),
+        _ => (false, base),
+    };
+    let (whole, fractional) = match unsigned.split_once('.') {
+        Some((whole, fractional))
+            if !whole.is_empty() && !fractional.is_empty() && !fractional.contains('.') =>
+        {
+            (whole, fractional)
+        }
+        Some(_) => return Err(FileAdapterError::InvalidDecimal),
+        None if !unsigned.is_empty() => (unsigned, ""),
+        None => return Err(FileAdapterError::InvalidDecimal),
+    };
+    if !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || !fractional.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(FileAdapterError::InvalidDecimal);
+    }
+    let scale = i32::try_from(fractional.len())
+        .map_err(|_| FileAdapterError::InvalidDecimal)?
+        .checked_sub(exponent)
+        .ok_or(FileAdapterError::InvalidDecimal)?;
+    if scale > i32::try_from(Decimal::MAX_SCALE).map_err(|_| FileAdapterError::InvalidDecimal)? {
+        return Err(FileAdapterError::InvalidDecimal);
+    }
+    let extra_zeroes = if scale < 0 {
+        scale
+            .checked_neg()
+            .ok_or(FileAdapterError::InvalidDecimal)?
+    } else {
+        0
+    };
+    if extra_zeroes
+        > i32::try_from(Decimal::MAX_SCALE).map_err(|_| FileAdapterError::InvalidDecimal)?
+    {
+        return Err(FileAdapterError::InvalidDecimal);
+    }
+    let mut canonical = String::new();
+    let zeroes = usize::try_from(extra_zeroes).map_err(|_| FileAdapterError::InvalidDecimal)?;
+    let capacity = usize::from(negative)
+        .checked_add(whole.len())
+        .and_then(|bytes| bytes.checked_add(fractional.len()))
+        .and_then(|bytes| bytes.checked_add(zeroes))
+        .and_then(|bytes| bytes.checked_add(1))
+        .ok_or(FileAdapterError::InvalidDecimal)?;
+    canonical
+        .try_reserve_exact(capacity)
+        .map_err(|_| FileAdapterError::InvalidDecimal)?;
+    if negative {
+        canonical.push('-');
+    }
+    canonical.push_str(whole);
+    canonical.push_str(fractional);
+    canonical.extend(std::iter::repeat_n('0', zeroes));
+    let mut decimal =
+        Decimal::from_str_exact(&canonical).map_err(|_| FileAdapterError::InvalidDecimal)?;
+    if scale > 0 {
+        decimal
+            .set_scale(u32::try_from(scale).map_err(|_| FileAdapterError::InvalidDecimal)?)
+            .map_err(|_| FileAdapterError::InvalidDecimal)?;
+    }
+    Ok(decimal)
 }
 
 impl SourceMetadataProvider for FileExtractionSource {

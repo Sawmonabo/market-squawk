@@ -67,6 +67,17 @@ impl CatalogAuthority {
         self.catalog.catalog_id
     }
 
+    pub(crate) fn validate_ingest_reservation(
+        &self,
+        reservation: &IngestReservation,
+    ) -> Result<(), CatalogError> {
+        if reservation.catalog_id == self.catalog.catalog_id {
+            Ok(())
+        } else {
+            Err(CatalogError::InvalidReservationCapability)
+        }
+    }
+
     pub(crate) const fn artifact_root_binding(&self) -> [u8; 32] {
         self.catalog.artifact_root_binding
     }

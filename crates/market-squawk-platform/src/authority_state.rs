@@ -116,6 +116,11 @@ pub enum LocalAuthorityStateStoreError {
 }
 
 impl LocalAuthorityStateStore {
+    /// Returns the maximum logical payload accepted by one authority-state commit.
+    pub const fn maximum_payload_bytes() -> usize {
+        envelope::MAX_PAYLOAD_BYTES
+    }
+
     /// Opens or creates `root`, acquires its exclusive lifetime lock, and repairs a provably older
     /// missing or invalid peer before returning.
     pub fn try_open(root: impl AsRef<Path>) -> Result<Self, LocalAuthorityStateStoreError> {

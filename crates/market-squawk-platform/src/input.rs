@@ -154,6 +154,9 @@ pub enum InputFileError {
     /// Input roots must be explicit absolute local paths.
     #[error("user-authorized input root must be an absolute local path")]
     RootNotAbsolute,
+    /// A controlled state/output root is equal to, contains, or is contained by the input root.
+    #[error("controlled state root overlaps the user-authorized input root")]
+    RootOverlap,
     /// Root paths or relative input references contain unsafe components.
     #[error("input path contains an unsafe component")]
     UnsafeComponent,
@@ -258,6 +261,50 @@ impl UserAuthorizedInputRoot {
             identity,
         })
     }
+
+    /// Verifies that a controlled writable root is disjoint from this read-only input capability.
+    ///
+    /// The candidate may name a not-yet-created final directory, but its nearest existing parent
+    /// must be resolvable without lexical parent traversal. Both containment directions are
+    /// rejected so a manifest can never name authority files as input and authority publication
+    /// can never occur through an ancestor of the input capability.
+    ///
+    /// # Errors
+    ///
+    /// Rejects relative, parent-traversing, unresolvable, or overlapping roots.
+    pub fn ensure_disjoint_root(&self, candidate: impl AsRef<Path>) -> Result<(), InputFileError> {
+        self.inner.validate_root()?;
+        let input = canonical_candidate(&self.inner.display_root)?;
+        let candidate = canonical_candidate(candidate.as_ref())?;
+        if candidate.starts_with(&input) || input.starts_with(&candidate) {
+            return Err(InputFileError::RootOverlap);
+        }
+        Ok(())
+    }
+}
+
+fn canonical_candidate(path: &Path) -> Result<PathBuf, InputFileError> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| component == Component::ParentDir)
+    {
+        return Err(InputFileError::RootNotAbsolute);
+    }
+    let mut missing = Vec::new();
+    let mut existing = path;
+    while !existing.exists() {
+        let name = existing
+            .file_name()
+            .ok_or(InputFileError::UnsafeComponent)?;
+        missing.push(name.to_os_string());
+        existing = existing.parent().ok_or(InputFileError::UnsafeComponent)?;
+    }
+    let mut canonical = existing.canonicalize().map_err(InputFileError::io)?;
+    for component in missing.into_iter().rev() {
+        canonical.push(component);
+    }
+    Ok(canonical)
 }
 
 impl InputRootInner {
@@ -631,22 +678,6 @@ impl InputFileError {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn fixed_input_reservation_rejects_before_capacity_growth() {
-        let mut bytes = Vec::new();
-        let initial_capacity = bytes.capacity();
-        assert!(matches!(
-            reserve_fixed_input_buffer(&mut bytes, 2, 1),
-            Err(InputFileError::ByteLimitExceeded { max: 1 })
-        ));
-        assert_eq!(bytes.capacity(), initial_capacity);
-    }
-}
-
 impl fmt::Debug for UserAuthorizedInputRoot {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("UserAuthorizedInputRoot([RETAINED ROOT CAPABILITY])")
@@ -914,3 +945,19 @@ fn configure_windows_nofollow(options: &mut OpenOptions) {
 
 #[cfg(not(windows))]
 fn configure_windows_nofollow(_options: &mut OpenOptions) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixed_input_reservation_rejects_before_capacity_growth() {
+        let mut bytes = Vec::new();
+        let initial_capacity = bytes.capacity();
+        assert!(matches!(
+            reserve_fixed_input_buffer(&mut bytes, 2, 1),
+            Err(InputFileError::ByteLimitExceeded { max: 1 })
+        ));
+        assert_eq!(bytes.capacity(), initial_capacity);
+    }
+}

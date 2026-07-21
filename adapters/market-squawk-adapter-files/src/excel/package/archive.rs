@@ -22,6 +22,7 @@ const MAX_ZIP_COMMENT_BYTES: usize = u16::MAX as usize;
 const CONSERVATIVE_METADATA_BYTES_PER_ENTRY: usize = 1_024;
 const CONSERVATIVE_METADATA_DIRECTORY_MULTIPLIER: usize = 2;
 const CONSERVATIVE_PAYLOAD_ALLOCATION_MULTIPLIER: usize = 2;
+const DECOMPRESSION_CHUNK_BYTES: usize = 64 * 1024;
 
 pub(super) fn read_package(
     bytes: &[u8],
@@ -103,13 +104,25 @@ pub(super) fn read_package(
                 .ok_or(FileAdapterError::LimitExceeded(
                     ParserLimit::DecompressedBytes,
                 ))?;
-        file.by_ref()
-            .take(maximum)
-            .read_to_end(&mut payload)
-            .map_err(|_| FileAdapterError::UnsafeArchive)?;
+        let mut limited = file.by_ref().take(maximum);
+        let mut chunk = [0_u8; DECOMPRESSION_CHUNK_BYTES];
+        loop {
+            budget.checkpoint()?;
+            let read = limited
+                .read(&mut chunk)
+                .map_err(|_| FileAdapterError::UnsafeArchive)?;
+            budget.checkpoint()?;
+            if read == 0 {
+                break;
+            }
+            budget
+                .decompressed(u64::try_from(read).map_err(|_| {
+                    FileAdapterError::LimitExceeded(ParserLimit::DecompressedBytes)
+                })?)?;
+            payload.extend_from_slice(chunk.get(..read).ok_or(FileAdapterError::UnsafeArchive)?);
+        }
         let actual = u64::try_from(payload.len())
             .map_err(|_| FileAdapterError::LimitExceeded(ParserLimit::DecompressedBytes))?;
-        budget.decompressed(actual)?;
         if actual != declared {
             return Err(FileAdapterError::UnsafeArchive);
         }

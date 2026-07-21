@@ -53,10 +53,10 @@ pub use decoder::{
 };
 pub use extraction::{
     AvailabilityEvidence, DiscoveryBatch, DiscoveryRequest, DiscoveryRequestId,
-    ExtractionAuthorityError, ExtractionBatch, ExtractionBatchAccumulator, ExtractionError,
-    ExtractionRecord, ExtractionRedirectPermit, ExtractionRequest, ExtractionRequestId,
-    ExtractionRequestPermit, ExtractionSource, ExtractionSourceError, InFlightExtractionRequest,
-    MAX_DISCOVERY_OBJECTS,
+    ExtractionAuthorityError, ExtractionBatch, ExtractionBatchAccumulator,
+    ExtractionContentIdentity, ExtractionError, ExtractionRecord, ExtractionRedirectPermit,
+    ExtractionRequest, ExtractionRequestId, ExtractionRequestPermit, ExtractionSource,
+    ExtractionSourceError, InFlightExtractionRequest, MAX_DISCOVERY_OBJECTS,
     MAX_EXTRACTION_BATCH_BYTES, MAX_EXTRACTION_RECORD_BYTES, MAX_EXTRACTION_RECORDS,
     MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES, SourceObject, payload_matches_exact_evidence,
 };

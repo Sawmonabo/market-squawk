@@ -32,6 +32,14 @@ struct SamplingSlotClock {
 }
 
 #[derive(Debug)]
+struct BlockingWorkerClock {
+    calls: AtomicUsize,
+    sealing_together: Arc<Barrier>,
+    workers_entered: Arc<Barrier>,
+    workers_release: Arc<Barrier>,
+}
+
+#[derive(Debug)]
 struct BlockedClockRelease {
     barrier: Option<Arc<Barrier>>,
 }
@@ -118,6 +126,25 @@ impl ExtractionClock for SamplingSlotClock {
         }
         Ok(ExtractionClockReading::new(
             Timestamp::from_unix_nanos(0),
+            Instant::now(),
+        ))
+    }
+}
+
+impl ExtractionClock for BlockingWorkerClock {
+    fn observe(&self) -> Result<ExtractionClockReading, ExtractionClockError> {
+        match self.calls.fetch_add(1, Ordering::SeqCst) {
+            0..=3 => {
+                self.sealing_together.wait();
+            }
+            4..=7 => {
+                self.workers_entered.wait();
+                self.workers_release.wait();
+            }
+            _ => {}
+        }
+        Ok(ExtractionClockReading::new(
+            Timestamp::from_unix_nanos(300),
             Instant::now(),
         ))
     }
@@ -236,6 +263,110 @@ fn verify_deadline_sampling_saturation(
     result
 }
 
+fn verify_blocking_worker_cancellation(
+    source: FileExtractionSource,
+    request: DiscoveryRequest,
+    sealing_together: Arc<Barrier>,
+    workers_entered: Arc<Barrier>,
+    workers_release: Arc<Barrier>,
+) -> Result<(), String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .start_paused(true)
+        .build()
+        .map_err(|error| format!("could not build isolated blocking-worker runtime: {error}"))?;
+    let result = runtime.block_on(async move {
+        let mut cancellations = Vec::new();
+        let mut operations = Vec::new();
+        for _ in 0..4 {
+            let source = source.clone();
+            let request = request.clone();
+            let cancellation = CancellationToken::new();
+            cancellations.push(cancellation.clone());
+            operations.push(tokio::spawn(async move {
+                source.discover_files(&request, &cancellation).await
+            }));
+        }
+        tokio::task::spawn_blocking(move || sealing_together.wait())
+            .await
+            .map_err(|error| format!("sealing barrier task failed: {error}"))?;
+        tokio::task::spawn_blocking({
+            let workers_entered = Arc::clone(&workers_entered);
+            move || workers_entered.wait()
+        })
+        .await
+        .map_err(|error| format!("worker-entry barrier task failed: {error}"))?;
+        let mut release = BlockedClockRelease::new(workers_release);
+        for cancellation in &cancellations {
+            cancellation.cancel();
+        }
+
+        let mut completed = 0;
+        for operation in &mut operations {
+            let result = tokio::select! {
+                biased;
+                result = operation => Some(result),
+                () = tokio::time::sleep(Duration::from_secs(1)) => None,
+            };
+            let Some(result) = result else {
+                break;
+            };
+            require_cancelled(result)?;
+            completed += 1;
+        }
+        let callers_released = completed == operations.len();
+
+        let queued_cancellation = CancellationToken::new();
+        let mut queued_operation = tokio::spawn({
+            let source = source.clone();
+            let request = request.clone();
+            let queued_cancellation = queued_cancellation.clone();
+            async move { source.discover_files(&request, &queued_cancellation).await }
+        });
+        queued_cancellation.cancel();
+        let queued_result = tokio::select! {
+            biased;
+            result = &mut queued_operation => Some(result),
+            () = tokio::time::sleep(Duration::from_secs(1)) => None,
+        };
+        let queued_released = queued_result.is_some();
+        if let Some(result) = queued_result {
+            require_cancelled(result)?;
+        }
+
+        release.release();
+        for operation in operations.into_iter().skip(completed) {
+            require_cancelled(operation.await)?;
+        }
+        if !queued_released {
+            require_cancelled(queued_operation.await)?;
+        }
+        if !callers_released {
+            return Err("cancelled callers remained joined to four blocking workers".to_owned());
+        }
+        if !queued_released {
+            return Err(
+                "a fifth caller did not fail promptly while detached workers held permits"
+                    .to_owned(),
+            );
+        }
+        Ok(())
+    });
+    drop(runtime);
+    result
+}
+
+fn require_cancelled<T>(
+    result: Result<Result<T, FileAdapterError>, tokio::task::JoinError>,
+) -> Result<(), String> {
+    match result {
+        Ok(Err(FileAdapterError::Cancelled)) => Ok(()),
+        Ok(Err(error)) => Err(format!("caller returned the wrong typed error: {error}")),
+        Ok(Ok(_)) => Err("cancelled caller unexpectedly succeeded".to_owned()),
+        Err(error) => Err(format!("cancelled caller task failed: {error}")),
+    }
+}
+
 impl ExtractionClock for ScriptedClock {
     fn observe(&self) -> Result<ExtractionClockReading, ExtractionClockError> {
         self.readings
@@ -250,6 +381,7 @@ impl ExtractionClock for ScriptedClock {
 async fn discovery_control_path_fails_closed_without_blocking_the_runtime()
 -> Result<(), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;
+    let representation_state = tempfile::tempdir()?;
     fs::write(directory.path().join("source.csv"), b"id,value\none,1.00\n")?;
     let manifest = manifest("source.csv", "csv");
     fs::write(directory.path().join("manifest.json"), &manifest)?;
@@ -274,6 +406,7 @@ async fn discovery_control_path_fails_closed_without_blocking_the_runtime()
     let source = FileExtractionSource::try_new_with_clock(
         local_metadata(&manifest)?,
         root,
+        representation_state_root_for(&representation_state, &manifest, "scripted"),
         manifest_input,
         ExtractionLimits::try_new(ExtractionLimitsInput::standard())?,
         clock,
@@ -297,6 +430,7 @@ async fn discovery_control_path_fails_closed_without_blocking_the_runtime()
     let source = FileExtractionSource::try_new_with_clock(
         local_metadata(&manifest)?,
         root,
+        representation_state_root_for(&representation_state, &manifest, "thread-probe"),
         manifest_input,
         ExtractionLimits::try_new(ExtractionLimitsInput::standard())?,
         Arc::new(ThreadProbeClock {
@@ -334,6 +468,7 @@ async fn discovery_control_path_fails_closed_without_blocking_the_runtime()
     let source = FileExtractionSource::try_new_with_clock(
         local_metadata(&manifest)?,
         root,
+        representation_state_root_for(&representation_state, &manifest, "panic"),
         manifest_input,
         ExtractionLimits::try_new(ExtractionLimitsInput::standard())?,
         Arc::new(PanickingClock),
@@ -360,6 +495,11 @@ async fn discovery_control_path_fails_closed_without_blocking_the_runtime()
         let source = FileExtractionSource::try_new_with_clock(
             local_metadata(&manifest)?,
             root,
+            representation_state_root_for(
+                &representation_state,
+                &manifest,
+                &format!("discovery-fail-{fail_at}"),
+            ),
             manifest_input,
             ExtractionLimits::try_new(ExtractionLimitsInput::standard())?,
             Arc::new(FailAtClock {
@@ -390,6 +530,11 @@ async fn discovery_control_path_fails_closed_without_blocking_the_runtime()
         let source = FileExtractionSource::try_new_with_clock(
             local_metadata(&manifest)?,
             root,
+            representation_state_root_for(
+                &representation_state,
+                &manifest,
+                &format!("extraction-fail-{fail_at}"),
+            ),
             manifest_input,
             ExtractionLimits::try_new(ExtractionLimitsInput::standard())?,
             Arc::new(FailAtClock {
@@ -438,6 +583,7 @@ async fn discovery_control_path_fails_closed_without_blocking_the_runtime()
     let bounded_source = FileExtractionSource::try_new_with_clock(
         local_metadata(&manifest)?,
         root,
+        representation_state_root_for(&representation_state, &manifest, "deadline-sampling"),
         manifest_input,
         ExtractionLimits::try_new(bounded_limits)?,
         Arc::new(SamplingSlotClock {
@@ -463,6 +609,44 @@ async fn discovery_control_path_fails_closed_without_blocking_the_runtime()
         )
     })
     .await??;
+
+    let sealing_together = Arc::new(Barrier::new(5));
+    let workers_entered = Arc::new(Barrier::new(5));
+    let workers_release = Arc::new(Barrier::new(5));
+    let root = UserAuthorizedInputRoot::open(fs::canonicalize(directory.path())?)?;
+    let manifest_input = root
+        .resolve("manifest.json")?
+        .open_bounded(16 * 1024)?
+        .read_bounded()?;
+    let source = FileExtractionSource::try_new_with_clock(
+        local_metadata(&manifest)?,
+        root,
+        representation_state_root_for(&representation_state, &manifest, "blocking-workers"),
+        manifest_input,
+        ExtractionLimits::try_new(ExtractionLimitsInput::standard())?,
+        Arc::new(BlockingWorkerClock {
+            calls: AtomicUsize::new(0),
+            sealing_together: Arc::clone(&sealing_together),
+            workers_entered: Arc::clone(&workers_entered),
+            workers_release: Arc::clone(&workers_release),
+        }),
+    )?;
+    let request = DiscoveryRequest::try_new(
+        SourceIdentifier::try_from("alternative-prices")?,
+        None,
+        NonZeroU16::new(1).ok_or("nonzero")?,
+        Timestamp::from_unix_nanos(10_000_000_000),
+    )?;
+    tokio::task::spawn_blocking(move || {
+        verify_blocking_worker_cancellation(
+            source,
+            request,
+            sealing_together,
+            workers_entered,
+            workers_release,
+        )
+    })
+    .await??;
     Ok(())
 }
 
@@ -470,6 +654,7 @@ async fn discovery_control_path_fails_closed_without_blocking_the_runtime()
 async fn discovery_uses_half_open_manifest_intervals_before_file_reads()
 -> Result<(), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;
+    let representation_state = tempfile::tempdir()?;
     fs::write(directory.path().join("source.csv"), b"id,value\none,1.00\n")?;
     let manifest = manifest_with_superseded("source.csv", "csv", Some(500));
     fs::write(directory.path().join("manifest.json"), &manifest)?;
@@ -481,6 +666,7 @@ async fn discovery_uses_half_open_manifest_intervals_before_file_reads()
     let source = FileExtractionSource::try_new_with_clock(
         local_metadata(&manifest)?,
         root,
+        representation_state_root_for(&representation_state, &manifest, "half-open"),
         manifest_input,
         ExtractionLimits::try_new(ExtractionLimitsInput::standard())?,
         fixed_clock(),
@@ -521,6 +707,7 @@ async fn discovery_uses_half_open_manifest_intervals_before_file_reads()
 async fn extraction_rejects_a_discovered_object_transplanted_from_another_source()
 -> Result<(), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;
+    let representation_state = tempfile::tempdir()?;
     fs::write(directory.path().join("source.csv"), b"id,value\none,1.00\n")?;
     let manifest = manifest("source.csv", "csv");
     fs::write(directory.path().join("manifest.json"), &manifest)?;
@@ -532,6 +719,7 @@ async fn extraction_rejects_a_discovered_object_transplanted_from_another_source
     let source = FileExtractionSource::try_new_with_clock(
         local_metadata(&manifest)?,
         root,
+        representation_state_root_for(&representation_state, &manifest, "transplant"),
         manifest_input,
         ExtractionLimits::try_new(ExtractionLimitsInput::standard())?,
         fixed_clock(),

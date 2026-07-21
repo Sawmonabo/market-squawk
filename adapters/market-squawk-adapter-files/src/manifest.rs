@@ -4,9 +4,12 @@ use std::collections::BTreeSet;
 
 use market_squawk_domain::{SourceIdentifier, Timestamp};
 use rust_decimal::Decimal;
-use serde::Deserialize;
+use serde::de::{IgnoredAny, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer};
+use std::fmt;
+use std::marker::PhantomData;
 
-use crate::FileAdapterError;
+use crate::{ExtractionLimits, FileAdapterError};
 
 const MANIFEST_SCHEMA_VERSION: u16 = 1;
 const MAX_MANIFEST_OBJECTS: usize = 4_096;
@@ -16,10 +19,16 @@ const MAX_MAPPINGS: usize = 1_024;
 #[serde(deny_unknown_fields)]
 pub(crate) struct FileSourceManifest {
     schema_version: u16,
+    #[serde(deserialize_with = "deserialize_objects")]
     pub(crate) objects: Vec<FileObjectSpec>,
 }
 
 impl FileSourceManifest {
+    pub(crate) fn parse(bytes: &[u8], limits: ExtractionLimits) -> Result<Self, FileAdapterError> {
+        crate::manifest_bounds::admit(bytes, limits)?;
+        serde_json::from_slice(bytes).map_err(|_| FileAdapterError::InvalidManifest)
+    }
+
     pub(crate) fn validate(&self) -> Result<(), FileAdapterError> {
         if self.schema_version != MANIFEST_SCHEMA_VERSION
             || self.objects.is_empty()
@@ -82,7 +91,7 @@ impl FileObjectSpec {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
 pub(crate) enum FileFormat {
     Csv {
         delimiter: u8,
@@ -186,6 +195,7 @@ pub(crate) enum FormulaPolicy {
 #[serde(deny_unknown_fields)]
 pub(crate) struct RowPolicy {
     pub(crate) identity_field: String,
+    #[serde(deserialize_with = "deserialize_mappings")]
     pub(crate) fields: Vec<FieldMapping>,
 }
 
@@ -243,4 +253,63 @@ fn valid_account_id(value: &str) -> bool {
 
 fn valid_currency(value: &str) -> bool {
     value.len() == 3 && value.bytes().all(|byte| byte.is_ascii_uppercase())
+}
+
+fn deserialize_objects<'de, D>(deserializer: D) -> Result<Vec<FileObjectSpec>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserializer.deserialize_seq(FallibleVecVisitor::<FileObjectSpec, MAX_MANIFEST_OBJECTS>(
+        PhantomData,
+    ))
+}
+
+fn deserialize_mappings<'de, D>(deserializer: D) -> Result<Vec<FieldMapping>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserializer.deserialize_seq(FallibleVecVisitor::<FieldMapping, MAX_MAPPINGS>(
+        PhantomData,
+    ))
+}
+
+struct FallibleVecVisitor<T, const MAXIMUM: usize>(PhantomData<T>);
+
+impl<'de, T, const MAXIMUM: usize> Visitor<'de> for FallibleVecVisitor<T, MAXIMUM>
+where
+    T: Deserialize<'de>,
+{
+    type Value = Vec<T>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "a sequence containing at most {MAXIMUM} entries")
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        if sequence.size_hint().is_some_and(|hint| hint > MAXIMUM) {
+            return Err(serde::de::Error::custom(
+                "bounded manifest sequence is too large",
+            ));
+        }
+        let mut values = Vec::new();
+        while values.len() < MAXIMUM {
+            let Some(value) = sequence.next_element()? else {
+                return Ok(values);
+            };
+            values
+                .try_reserve_exact(1)
+                .map_err(|_| serde::de::Error::custom("bounded manifest allocation failed"))?;
+            values.push(value);
+        }
+        if sequence.next_element::<IgnoredAny>()?.is_some() {
+            Err(serde::de::Error::custom(
+                "bounded manifest sequence is too large",
+            ))
+        } else {
+            Ok(values)
+        }
+    }
 }

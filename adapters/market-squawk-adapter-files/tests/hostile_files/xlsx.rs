@@ -3,6 +3,7 @@ use super::*;
 #[tokio::test]
 async fn xlsx_rejects_archive_traversal_and_case_collisions() -> Result<(), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;
+    let representation_state = tempfile::tempdir()?;
     let mut archive = ZipWriter::new(Cursor::new(Vec::new()));
     archive.start_file("../outside.xml", SimpleFileOptions::default())?;
     archive.write_all(b"<outside/>")?;
@@ -19,6 +20,7 @@ async fn xlsx_rejects_archive_traversal_and_case_collisions() -> Result<(), Box<
     let source = FileExtractionSource::try_new_with_clock(
         local_metadata(&manifest)?,
         root,
+        representation_state_root(&representation_state, &manifest),
         manifest_input,
         ExtractionLimits::try_new(ExtractionLimitsInput::standard())?,
         fixed_clock(),

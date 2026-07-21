@@ -7,6 +7,8 @@ use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor};
 
 use crate::{CellValue, FileAdapterError, ParseBudget, ParsedRow, ParserLimit};
 
+const ARBITRARY_PRECISION_NUMBER_TOKEN: &str = "$serde_json::private::Number";
+
 enum JsonValue {
     Object(BTreeMap<String, JsonValue>),
     Array(Vec<JsonValue>),
@@ -86,16 +88,33 @@ impl<'de> Visitor<'de> for JsonVisitor<'_, '_> {
         Ok(JsonValue::Unsupported)
     }
 
-    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
-        Ok(JsonValue::Unsupported)
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        let value = self
+            .budget
+            .formatted_text(20, format_args!("{value}"))
+            .map_err(E::custom)?;
+        Ok(JsonValue::Text(value))
     }
 
-    fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
-        Ok(JsonValue::Unsupported)
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        let value = self
+            .budget
+            .formatted_text(20, format_args!("{value}"))
+            .map_err(E::custom)?;
+        Ok(JsonValue::Text(value))
     }
 
-    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
-        Ok(JsonValue::Unsupported)
+    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Err(E::custom("floating-point JSON boundary is forbidden"))
     }
 
     fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
@@ -129,6 +148,7 @@ impl<'de> Visitor<'de> for JsonVisitor<'_, '_> {
             .vec_with_capacity(capacity)
             .map_err(serde::de::Error::custom)?;
         while values.len() < maximum {
+            self.budget.checkpoint().map_err(serde::de::Error::custom)?;
             let value = if self.admit_row {
                 sequence.next_element_seed(RowJsonSeed {
                     budget: self.budget,
@@ -173,12 +193,34 @@ impl<'de> Visitor<'de> for JsonVisitor<'_, '_> {
     where
         A: MapAccess<'de>,
     {
+        self.budget.checkpoint().map_err(serde::de::Error::custom)?;
+        let Some(first_key) = map.next_key::<String>()? else {
+            if self.admit_row {
+                self.budget.record().map_err(serde::de::Error::custom)?;
+            }
+            return Ok(JsonValue::Object(BTreeMap::new()));
+        };
+        if first_key == ARBITRARY_PRECISION_NUMBER_TOKEN {
+            let value = map.next_value::<String>()?;
+            self.budget
+                .text(value.len())
+                .map_err(serde::de::Error::custom)?;
+            self.budget
+                .string_allocation(&value)
+                .map_err(serde::de::Error::custom)?;
+            if map.next_key::<serde::de::IgnoredAny>()?.is_some() {
+                return Err(serde::de::Error::custom(FileAdapterError::InvalidRecord));
+            }
+            return Ok(JsonValue::Text(value));
+        }
         if self.admit_row {
             self.budget.record().map_err(serde::de::Error::custom)?;
         }
         let maximum = self.budget.limits.input.max_fields_per_record;
         let mut values = BTreeMap::new();
-        while let Some(key) = map.next_key::<String>()? {
+        let mut next_key = Some(first_key);
+        while let Some(key) = next_key {
+            self.budget.checkpoint().map_err(serde::de::Error::custom)?;
             self.budget
                 .text(key.len())
                 .map_err(serde::de::Error::custom)?;
@@ -199,6 +241,7 @@ impl<'de> Visitor<'de> for JsonVisitor<'_, '_> {
                 .map_entry::<String, JsonValue>()
                 .map_err(serde::de::Error::custom)?;
             values.insert(key, value);
+            next_key = map.next_key::<String>()?;
         }
         Ok(JsonValue::Object(values))
     }
@@ -270,7 +313,13 @@ fn parse_one(
 }
 
 fn classify_json_error(message: &str, budget: &ParseBudget<'_>) -> FileAdapterError {
-    if message.contains("duplicate field") {
+    if message.contains("local extraction was cancelled") {
+        FileAdapterError::Cancelled
+    } else if message.contains("local extraction deadline was exceeded") {
+        FileAdapterError::DeadlineExceeded
+    } else if message.contains("local extraction clock failed") {
+        FileAdapterError::ClockFailure
+    } else if message.contains("duplicate field") {
         FileAdapterError::DuplicateField
     } else if message.contains("NestingDepth") {
         FileAdapterError::LimitExceeded(ParserLimit::NestingDepth)

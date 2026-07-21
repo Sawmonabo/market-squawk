@@ -3,6 +3,8 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
 
 use rusqlite::config::DbConfig;
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
@@ -18,6 +20,11 @@ const SQLITE_CACHE_KIBIBYTES: usize = 512;
 const SQLITE_CONNECTION_ALLOWANCE_BYTES: usize = 256 * 1024;
 const SCHEMA_QUERY: &str =
     "SELECT type, sql FROM main.sqlite_schema WHERE name = ?1 COLLATE BINARY";
+const PROGRESS_INSTRUCTION_INTERVAL: i32 = 1_000;
+const INTERRUPT_NONE: u8 = 0;
+const INTERRUPT_CANCELLED: u8 = 1;
+const INTERRUPT_DEADLINE: u8 = 2;
+const INTERRUPT_CLOCK: u8 = 3;
 
 pub(crate) fn parse(
     bytes: &[u8],
@@ -46,11 +53,58 @@ pub(crate) fn parse(
     budget.pre_admit_dynamic_bytes(runtime_bound)?;
     let query = select_query(table, columns, budget.row_limit(), budget)?;
     let mut connection = hardened_connection(bytes, query.len(), budget)?;
-    require_base_table(&connection, table, budget)?;
-    install_authorizer(&connection, table, columns, budget)?;
-    let mut rows = read_rows(&mut connection, &query, columns, budget)?;
+    let interrupt = install_progress_handler(&connection, budget)?;
+    let result = (|| {
+        require_base_table(&connection, table, budget)?;
+        install_authorizer(&connection, table, columns, budget)?;
+        read_rows(&mut connection, &query, columns, budget)
+    })();
+    connection
+        .progress_handler(0, None::<fn() -> bool>)
+        .map_err(database_error)?;
+    let mut rows = result.map_err(|error| interrupted_error(&interrupt, error))?;
     rows.sort_by(|left, right| compare_rows(left, right, order_by));
     Ok(rows)
+}
+
+fn install_progress_handler(
+    connection: &Connection,
+    budget: &ParseBudget<'_>,
+) -> Result<Arc<AtomicU8>, FileAdapterError> {
+    let control = budget.control();
+    let interrupted = Arc::new(AtomicU8::new(INTERRUPT_NONE));
+    let callback_state = Arc::clone(&interrupted);
+    connection
+        .progress_handler(
+            PROGRESS_INSTRUCTION_INTERVAL,
+            Some(move || match control.checkpoint() {
+                Ok(()) => false,
+                Err(FileAdapterError::Cancelled) => {
+                    callback_state.store(INTERRUPT_CANCELLED, AtomicOrdering::Release);
+                    true
+                }
+                Err(FileAdapterError::DeadlineExceeded)
+                | Err(FileAdapterError::LimitExceeded(ParserLimit::Elapsed)) => {
+                    callback_state.store(INTERRUPT_DEADLINE, AtomicOrdering::Release);
+                    true
+                }
+                Err(_) => {
+                    callback_state.store(INTERRUPT_CLOCK, AtomicOrdering::Release);
+                    true
+                }
+            }),
+        )
+        .map_err(database_error)?;
+    Ok(interrupted)
+}
+
+fn interrupted_error(interrupted: &AtomicU8, fallback: FileAdapterError) -> FileAdapterError {
+    match interrupted.load(AtomicOrdering::Acquire) {
+        INTERRUPT_CANCELLED => FileAdapterError::Cancelled,
+        INTERRUPT_DEADLINE => FileAdapterError::DeadlineExceeded,
+        INTERRUPT_CLOCK => FileAdapterError::ClockFailure,
+        _ => fallback,
+    }
 }
 
 fn validate_header(bytes: &[u8]) -> Result<usize, FileAdapterError> {
