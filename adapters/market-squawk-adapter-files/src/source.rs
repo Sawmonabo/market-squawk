@@ -10,7 +10,7 @@ use market_squawk_domain::{
     AlternativeDataObservation, AvailabilityEvidence as DomainAvailabilityEvidence, DataQuality,
     DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence, PayloadReference,
     ResearchContext, ResearchObservation, ResearchProvenance, ResearchProvenanceInput,
-    ResearchTime, RevisionNumber, SourceIdentifier, Timestamp,
+    ResearchTime, RevisionNumber, SourceIdentifier, Timestamp, VersionPinnedSourceLocator,
 };
 use market_squawk_platform::{
     BoundedInput, ControlledInputFileError, InputReadCheckpoint, InputReadControl,
@@ -31,7 +31,7 @@ use crate::clock::{ExtractionClock, RequestDeadline, SystemExtractionClock};
 use crate::contracts::{
     ExtractionLimits, FileAdapterError, ParseBudget, ParsedRow, ParserLimit, SourceRowLimit,
 };
-use crate::manifest::{FileFormat, FileObjectSpec, FileSourceManifest};
+use crate::manifest::{FileFormat, FileObjectSpec, FileSourceManifest, MANIFEST_SCHEMA_VERSION};
 use crate::representation::FileRepresentationAuthority;
 use crate::{csv, database, excel, json, ofx, parquet, xml};
 
@@ -241,6 +241,7 @@ impl FileExtractionSource {
             let effective =
                 EffectiveInterval::new(specification.effective_at, specification.superseded_at)
                     .map_err(|_| FileAdapterError::InvalidManifest)?;
+            let evidence = object_evidence(specification, input.digest())?;
             objects.push(
                 SourceObject::try_new_with_availability(
                     self.metadata.source_id().clone(),
@@ -248,7 +249,7 @@ impl FileExtractionSource {
                     request,
                     specification.object_id.clone(),
                     specification.format.media_type()?,
-                    ExactPayloadEvidence::from_content_digest(input.digest()),
+                    evidence,
                     effective,
                     specification.published_at,
                     availability,
@@ -330,7 +331,7 @@ impl FileExtractionSource {
         let input = self.read_object(specification, cancellation, deadline)?;
         self.validate_authority(authority)?;
         let sampled_received_at = self.control_timestamp(cancellation, deadline)?;
-        if request.object().evidence().content_digest() != input.digest()
+        if request.object().evidence() != &object_evidence(specification, input.digest())?
             || request.object().expected_bytes() != Some(input.identity().size_bytes())
         {
             return Err(FileAdapterError::ObjectEvidenceMismatch);
@@ -625,7 +626,7 @@ impl FileExtractionSource {
                 let context = ResearchContext::new(
                     ResearchProvenance::try_new(ResearchProvenanceInput {
                         source_id: self.metadata.source_id().clone(),
-                        instrument_id: None,
+                        instrument_id: specification.instrument_binding.instrument_id(),
                         venue_id: None,
                         source_identifier: source_row.clone(),
                         source_timestamp: None,
@@ -762,8 +763,11 @@ fn row_reference(
     row: &ParsedRow,
 ) -> Result<SourceIdentifier, FileAdapterError> {
     let mut hasher = Sha256::new();
-    hasher.update(specification.object_id.as_str().as_bytes());
-    hasher.update([0]);
+    hasher.update(b"market-squawk/local-file-row/v2");
+    hasher.update(MANIFEST_SCHEMA_VERSION.to_be_bytes());
+    hash_identifier(&mut hasher, &specification.dataset)?;
+    hash_identifier(&mut hasher, &specification.object_id)?;
+    specification.instrument_binding.bind_identity(&mut hasher);
     hasher.update(row.canonical_row_sha256);
     let digest = hasher.finalize();
     let mut reference = String::from("local-object-row:canonical-sha256:");
@@ -771,6 +775,45 @@ fn row_reference(
         write!(&mut reference, "{byte:02x}").map_err(|_| FileAdapterError::Contract)?;
     }
     SourceIdentifier::try_from(reference).map_err(|_| FileAdapterError::Contract)
+}
+
+fn object_evidence(
+    specification: &FileObjectSpec,
+    content_digest: EvidenceDigest,
+) -> Result<ExactPayloadEvidence, FileAdapterError> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"market-squawk/local-file-object-binding/v1");
+    hasher.update(MANIFEST_SCHEMA_VERSION.to_be_bytes());
+    hash_identifier(&mut hasher, &specification.dataset)?;
+    hash_identifier(&mut hasher, &specification.object_id)?;
+    specification.instrument_binding.bind_identity(&mut hasher);
+    let digest = hasher.finalize();
+    let mut version = String::from("sha256:");
+    for byte in digest {
+        write!(&mut version, "{byte:02x}").map_err(|_| FileAdapterError::Contract)?;
+    }
+    Ok(ExactPayloadEvidence::with_version_pinned_locator(
+        content_digest,
+        VersionPinnedSourceLocator::new(
+            SourceIdentifier::try_from("market-squawk-local-file-object:v3")
+                .map_err(|_| FileAdapterError::Contract)?,
+            SourceIdentifier::try_from(version).map_err(|_| FileAdapterError::Contract)?,
+        ),
+    ))
+}
+
+fn hash_identifier(
+    hasher: &mut Sha256,
+    identifier: &SourceIdentifier,
+) -> Result<(), FileAdapterError> {
+    let bytes = identifier.as_str().as_bytes();
+    hasher.update(
+        u64::try_from(bytes.len())
+            .map_err(|_| FileAdapterError::Contract)?
+            .to_be_bytes(),
+    );
+    hasher.update(bytes);
+    Ok(())
 }
 
 fn parse_decimal_lexeme(value: &str) -> Result<Decimal, FileAdapterError> {

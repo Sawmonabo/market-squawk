@@ -12,7 +12,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use market_squawk_adapter_files::{
     ExtractionClock, ExtractionClockError, ExtractionClockReading, ExtractionLimits,
-    ExtractionLimitsInput, FileExtractionSource,
+    ExtractionLimitsInput, FileAdapterError, FileExtractionSource,
 };
 use market_squawk_data::{
     AnalyticalDataService, AnalyticalManifestCatalog, CatalogAuthority, CatalogConfig,
@@ -22,17 +22,18 @@ use market_squawk_data::{
 };
 use market_squawk_domain::{
     AuthorizationBasis, ChecksumCapability, CoverageDelay, DataQuality, DeliveryEvidence,
-    DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence, MetadataRevision,
-    ResearchObservation, RevisionBoundPayloadEvidence, SchemaVersion, SequenceCapability, SourceId,
-    SourceIdentifier, Timestamp,
+    DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence, InstrumentId,
+    MetadataRevision, ResearchObservation, ResearchTemporalCoordinate,
+    RevisionBoundPayloadEvidence, SchemaVersion, SequenceCapability, SourceId, SourceIdentifier,
+    Timestamp,
 };
 use market_squawk_platform::{LocalPaths, UserAuthorizedInputRoot};
 use market_squawk_sources::{
     AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode, CoverageDomain,
-    DiscoveryRequest, ExtractionBatch, ExtractionError, ExtractionRequest, ExtractionSource,
-    ExtractionSourceError, FreshnessPolicy, HistoricalCapability, NetworkAccessPolicy,
-    SourceCapabilities, SourceClass, SourceCoverage, SourceMetadata, SourceMetadataInput,
-    SourceProtocolProfile,
+    DiscoveryRequest, ExtractionAuthority, ExtractionBatch, ExtractionError, ExtractionRequest,
+    ExtractionSource, ExtractionSourceError, FreshnessPolicy, HistoricalCapability,
+    NetworkAccessPolicy, SourceCapabilities, SourceClass, SourceCoverage, SourceMetadata,
+    SourceMetadataInput, SourceMetadataProvider, SourceProtocolProfile,
 };
 use parquet::arrow::ArrowWriter;
 use rusqlite::Connection;
@@ -46,10 +47,289 @@ const EXPECTED_FORMAT_ROWS: usize = 10;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
+const FIRST_INSTRUMENT: &str = "11111111-1111-4111-8111-111111111111";
+const SECOND_INSTRUMENT: &str = "22222222-2222-4222-8222-222222222222";
+
 #[derive(Debug)]
 struct AdvancingClock {
     origin: Instant,
     next_offset_nanos: Mutex<u64>,
+}
+
+struct AuthorizedLocalSource {
+    source: FileExtractionSource,
+    authority: ExtractionAuthority,
+    _registry: AuthoritativeSourceRegistry,
+}
+
+#[tokio::test]
+async fn instrument_binding_is_explicit_exact_and_replay_bound() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let state = tempfile::tempdir()?;
+    fs::write(
+        directory.path().join("explicit.csv"),
+        b"id,ticker,value\nrow-1,AAPL,1.00\n",
+    )?;
+    fs::write(
+        directory.path().join("unscoped.csv"),
+        b"id,ticker,value\nrow-2,MSFT,2.00\n",
+    )?;
+    let manifest = binding_manifest(Some(serde_json::json!({
+        "kind": "internal_instrument",
+        "instrument_id": FIRST_INSTRUMENT,
+    })))?;
+    let original = authorized_local_source(
+        directory.path(),
+        state.path().join("original"),
+        "manifest-original.json",
+        &manifest,
+    )?;
+    let discovery = DiscoveryRequest::try_new(
+        SourceIdentifier::try_from("alternative-prices")?,
+        None,
+        NonZeroU16::new(2).ok_or("nonzero result limit")?,
+        Timestamp::from_unix_nanos(10_000_000_000),
+    )?;
+    let discovered = original
+        .source
+        .discover_files(&original.authority, &discovery, &CancellationToken::new())
+        .await?;
+    let explicit = discovered
+        .objects()
+        .iter()
+        .find(|object| object.object_id().as_str() == "explicit")
+        .cloned()
+        .ok_or("explicit object was not discovered")?;
+    let unscoped = discovered
+        .objects()
+        .iter()
+        .find(|object| object.object_id().as_str() == "unscoped")
+        .cloned()
+        .ok_or("unscoped object was not discovered")?;
+    let rediscovered = original
+        .source
+        .discover_files(&original.authority, &discovery, &CancellationToken::new())
+        .await?;
+    assert_eq!(rediscovered.objects(), discovered.objects());
+
+    let explicit_batch = extract_one(&original, explicit.clone()).await?;
+    let explicit_replay = extract_one(&original, explicit.clone()).await?;
+    assert_eq!(
+        extraction_batch_digest(&explicit_batch)?,
+        extraction_batch_digest(&explicit_replay)?
+    );
+    assert_eq!(
+        observation_instrument(&explicit_batch)?,
+        Some(FIRST_INSTRUMENT.parse::<InstrumentId>()?)
+    );
+    assert_eq!(
+        observation_instrument(&extract_one(&original, unscoped).await?)?,
+        None
+    );
+
+    for (name, invalid_binding) in [
+        ("missing", None),
+        (
+            "ticker",
+            Some(serde_json::json!({
+                "kind": "internal_instrument",
+                "instrument_id": "AAPL",
+            })),
+        ),
+        (
+            "nil",
+            Some(serde_json::json!({
+                "kind": "internal_instrument",
+                "instrument_id": "00000000-0000-0000-0000-000000000000",
+            })),
+        ),
+    ] {
+        let invalid = binding_manifest(invalid_binding)?;
+        let invalid_source = unregistered_local_source(
+            directory.path(),
+            state.path().join(format!("invalid-{name}")),
+            &format!("manifest-invalid-{name}.json"),
+            &invalid,
+        )?;
+        assert!(matches!(
+            invalid_source,
+            Err(FileAdapterError::InvalidManifest)
+        ));
+    }
+
+    let changed_manifest = binding_manifest(Some(serde_json::json!({
+        "kind": "internal_instrument",
+        "instrument_id": SECOND_INSTRUMENT,
+    })))?;
+    let changed = authorized_local_source(
+        directory.path(),
+        state.path().join("changed"),
+        "manifest-changed.json",
+        &changed_manifest,
+    )?;
+    let changed_discovery = changed
+        .source
+        .discover_files(&changed.authority, &discovery, &CancellationToken::new())
+        .await?;
+    let changed_explicit = changed_discovery
+        .objects()
+        .iter()
+        .find(|object| object.object_id().as_str() == "explicit")
+        .cloned()
+        .ok_or("changed explicit object was not discovered")?;
+    assert_eq!(
+        changed_explicit.evidence().content_digest(),
+        explicit.evidence().content_digest()
+    );
+    assert_ne!(changed_explicit.evidence(), explicit.evidence());
+    let old_request = ExtractionRequest::try_new(
+        explicit,
+        NonZeroU32::new(1).ok_or("nonzero record limit")?,
+        NonZeroU64::new(1024 * 1024).ok_or("nonzero byte limit")?,
+        Timestamp::from_unix_nanos(10_000_000_000),
+    )?;
+    assert_eq!(
+        changed
+            .source
+            .extract_file(&changed.authority, &old_request, &CancellationToken::new())
+            .await
+            .err()
+            .ok_or("old binding replay unexpectedly succeeded")?,
+        FileAdapterError::ObjectEvidenceMismatch
+    );
+    assert_eq!(
+        observation_instrument(&extract_one(&changed, changed_explicit).await?)?,
+        Some(SECOND_INSTRUMENT.parse::<InstrumentId>()?)
+    );
+    Ok(())
+}
+
+fn binding_manifest(
+    explicit_binding: Option<serde_json::Value>,
+) -> Result<Vec<u8>, serde_json::Error> {
+    let object =
+        |object_id: &str, path: &str, instrument_binding: serde_json::Value| -> serde_json::Value {
+            serde_json::json!({
+                "dataset": "alternative-prices",
+                "object_id": object_id,
+                "path": path,
+                "format": { "kind": "csv", "delimiter": 44 },
+                "effective_at": 100,
+                "published_at": 150,
+                "revision": "revision-1",
+                "revision_number": 1,
+                "superseded_at": null,
+                "record_time": {
+                    "effective": ResearchTemporalCoordinate::exact(
+                        Timestamp::from_unix_nanos(100)
+                    ),
+                    "published": ResearchTemporalCoordinate::exact(
+                        Timestamp::from_unix_nanos(150)
+                    ),
+                    "superseded": null,
+                },
+                "instrument_binding": instrument_binding,
+                "row_policy": {
+                    "identity_field": "id",
+                    "fields": [{
+                        "source": "value",
+                        "field": "price",
+                        "decimal_scale": 2,
+                        "unit": "USD",
+                    }],
+                },
+            })
+        };
+    let mut explicit = object(
+        "explicit",
+        "explicit.csv",
+        explicit_binding
+            .clone()
+            .unwrap_or_else(|| serde_json::json!({ "kind": "unscoped" })),
+    );
+    if explicit_binding.is_none() {
+        let _ = explicit
+            .as_object_mut()
+            .and_then(|object| object.remove("instrument_binding"));
+    }
+    serde_json::to_vec(&serde_json::json!({
+        "schema_version": 3,
+        "objects": [
+            explicit,
+            object(
+                "unscoped",
+                "unscoped.csv",
+                serde_json::json!({ "kind": "unscoped" }),
+            ),
+        ],
+    }))
+}
+
+fn authorized_local_source(
+    input_root: &std::path::Path,
+    state_root: std::path::PathBuf,
+    manifest_name: &str,
+    manifest: &[u8],
+) -> TestResult<AuthorizedLocalSource> {
+    let source = unregistered_local_source(input_root, state_root, manifest_name, manifest)??;
+    let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
+    let registered =
+        registry.register(source.metadata().clone(), Timestamp::from_unix_nanos(300))?;
+    let authority = registry.extraction_authority(&registered, &source)?;
+    Ok(AuthorizedLocalSource {
+        source,
+        authority,
+        _registry: registry,
+    })
+}
+
+fn unregistered_local_source(
+    input_root: &std::path::Path,
+    state_root: std::path::PathBuf,
+    manifest_name: &str,
+    manifest: &[u8],
+) -> TestResult<Result<FileExtractionSource, FileAdapterError>> {
+    fs::write(input_root.join(manifest_name), manifest)?;
+    let root = UserAuthorizedInputRoot::open(fs::canonicalize(input_root)?)?;
+    let manifest_input = root
+        .resolve(manifest_name)?
+        .open_bounded(u64::try_from(manifest.len())?)?
+        .read_bounded()?;
+    Ok(FileExtractionSource::try_new_with_clock(
+        local_metadata_for(manifest)?,
+        root,
+        state_root,
+        manifest_input,
+        ExtractionLimits::try_new(ExtractionLimitsInput::standard())?,
+        Arc::new(AdvancingClock {
+            origin: Instant::now(),
+            next_offset_nanos: Mutex::new(0),
+        }),
+    ))
+}
+
+async fn extract_one(
+    source: &AuthorizedLocalSource,
+    object: market_squawk_sources::SourceObject,
+) -> TestResult<ExtractionBatch> {
+    let request = ExtractionRequest::try_new(
+        object,
+        NonZeroU32::new(1).ok_or("nonzero record limit")?,
+        NonZeroU64::new(1024 * 1024).ok_or("nonzero byte limit")?,
+        Timestamp::from_unix_nanos(10_000_000_000),
+    )?;
+    Ok(source
+        .source
+        .extract_file(&source.authority, &request, &CancellationToken::new())
+        .await?)
+}
+
+fn observation_instrument(batch: &ExtractionBatch) -> TestResult<Option<InstrumentId>> {
+    let observation: ResearchObservation = serde_json::from_slice(batch.records()[0].payload())?;
+    let ResearchObservation::AlternativeData(observation) = observation else {
+        return Err("local binding extraction produced the wrong observation kind".into());
+    };
+    Ok(observation.context().provenance().instrument_id())
 }
 
 impl ExtractionClock for AdvancingClock {
@@ -628,9 +908,13 @@ fn xml_ofx_fixture() -> Vec<u8> {
 }
 
 fn local_metadata() -> Result<SourceMetadata, Box<dyn Error>> {
+    local_metadata_for(MANIFEST)
+}
+
+fn local_metadata_for(manifest: &[u8]) -> Result<SourceMetadata, Box<dyn Error>> {
     let evidence = ExactPayloadEvidence::from_content_digest(EvidenceDigest::new(
         DigestAlgorithm::Sha256,
-        Sha256::digest(MANIFEST).into(),
+        Sha256::digest(manifest).into(),
     ));
     let effective = EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?;
     Ok(SourceMetadata::try_new(SourceMetadataInput::new(
