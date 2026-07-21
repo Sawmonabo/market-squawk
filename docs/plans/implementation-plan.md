@@ -14,6 +14,8 @@ locators only.
 
 ## Current execution rule
 
+- Exact pushed heads, active worktrees, blockers, next release events, issue state, and cleanup
+  disposition are maintained in the [delivery ledger](delivery-ledger.md).
 - Work continues to the usable complete local release terminal condition in
   [`project-memory.md`](../project-memory.md).
 - A Stage or Wave is an ordering boundary, not a partial-release stopping point.
