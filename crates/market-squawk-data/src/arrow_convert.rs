@@ -3,15 +3,16 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    Array as _, ArrayRef, BinaryArray, Decimal128Array, StringArray, TimestampNanosecondArray,
-    UInt8Array, UInt16Array, UInt32Array,
+    Array as _, ArrayRef, BinaryArray, Date32Array, Decimal128Array, StringArray,
+    TimestampNanosecondArray, UInt8Array, UInt16Array, UInt32Array,
 };
 use arrow::compute::concat_batches;
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 use market_squawk_domain::{
     AvailabilityEvidence, DataQuality, DigestAlgorithm, EvidenceDigest, ExactPayloadEvidence,
-    MetadataRevision, ResearchContext, ResearchObservation, SourceId, SourceIdentifier, Timestamp,
+    MetadataRevision, ResearchContext, ResearchObservation, ResearchTemporalCoordinate, SourceId,
+    SourceIdentifier, Timestamp,
 };
 use market_squawk_sources::{
     AvailabilityEvidence as SourceAvailabilityEvidence, DiscoveryRequestId, ExtractionBatch,
@@ -24,8 +25,8 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use crate::schema::{
-    DATASET_KEY, REQUEST_DIGEST_KEY, RESEARCH_RECORD_SCHEMA, SCHEMA_VERSION_KEY, decode_hex,
-    research_schema,
+    DATASET_KEY, REQUEST_DIGEST_KEY, RESEARCH_RECORD_SCHEMA, RESEARCH_SCHEMA_VERSION,
+    SCHEMA_VERSION_KEY, decode_hex, research_schema,
 };
 
 /// A request- and dataset-bound canonical Arrow record batch.
@@ -59,11 +60,11 @@ struct ExtractionRowLineage {
     object_evidence: ExactPayloadEvidence,
     record_schema: SourceIdentifier,
     record_evidence: ExactPayloadEvidence,
-    effective_at: Timestamp,
-    published_at: Option<Timestamp>,
+    effective_time: ResearchTemporalCoordinate,
+    published_time: Option<ResearchTemporalCoordinate>,
     availability: SourceAvailabilityEvidence,
     revision: SourceIdentifier,
-    superseded_at: Option<Timestamp>,
+    superseded_time: Option<ResearchTemporalCoordinate>,
 }
 
 impl ResearchArrowBatch {
@@ -82,7 +83,7 @@ impl ResearchArrowBatch {
         for record in extraction.records() {
             let observation: ResearchObservation = serde_json::from_slice(record.payload())?;
             let lineage = RowLineage::Extraction(Box::new(ExtractionRowLineage {
-                schema_version: 1,
+                schema_version: RESEARCH_SCHEMA_VERSION,
                 source_id: record.source_id().clone(),
                 metadata_revision: record.metadata_revision().clone(),
                 dataset: record.dataset().clone(),
@@ -93,11 +94,11 @@ impl ResearchArrowBatch {
                 object_evidence: record.object_evidence().clone(),
                 record_schema: record.schema().clone(),
                 record_evidence: record.evidence().clone(),
-                effective_at: record.effective_at(),
-                published_at: record.published_at(),
+                effective_time: record.effective_time(),
+                published_time: record.published_time(),
                 availability: record.availability().clone(),
                 revision: record.revision().clone(),
-                superseded_at: record.superseded_at(),
+                superseded_time: record.superseded_time(),
             }));
             validate_row_lineage(
                 &lineage,
@@ -129,7 +130,7 @@ impl ResearchArrowBatch {
         let lineages = observations
             .iter()
             .map(|observation| RowLineage::CanonicalObservation {
-                schema_version: 1,
+                schema_version: RESEARCH_SCHEMA_VERSION,
                 source_id: observation_context(observation)
                     .provenance()
                     .source_id()
@@ -218,10 +219,16 @@ impl ResearchArrowBatch {
         let mut availability_evidence = Vec::with_capacity(observations.len());
         let mut availability_methods = Vec::with_capacity(observations.len());
         let mut ingested_at = Vec::with_capacity(observations.len());
+        let mut effective_precision = Vec::with_capacity(observations.len());
         let mut effective_at = Vec::with_capacity(observations.len());
+        let mut effective_date = Vec::with_capacity(observations.len());
+        let mut published_precision = Vec::with_capacity(observations.len());
         let mut published_at = Vec::with_capacity(observations.len());
+        let mut published_date = Vec::with_capacity(observations.len());
         let mut revisions = Vec::with_capacity(observations.len());
+        let mut superseded_precision = Vec::with_capacity(observations.len());
         let mut superseded_at = Vec::with_capacity(observations.len());
+        let mut superseded_date = Vec::with_capacity(observations.len());
         let mut qualities = Vec::with_capacity(observations.len());
         let mut mantissas = Vec::with_capacity(observations.len());
         let mut scales = Vec::with_capacity(observations.len());
@@ -259,10 +266,19 @@ impl ResearchArrowBatch {
             availability_evidence.push(evidence);
             availability_methods.push(method);
             ingested_at.push(provenance.ingested_at().unix_nanos());
-            effective_at.push(time.effective_at().unix_nanos());
-            published_at.push(time.published_at().map(|value| value.unix_nanos()));
+            let (precision, timestamp, date) = temporal_projection(time.effective());
+            effective_precision.push(precision);
+            effective_at.push(timestamp);
+            effective_date.push(date);
+            let (precision, timestamp, date) = optional_temporal_projection(time.published());
+            published_precision.push(precision);
+            published_at.push(timestamp);
+            published_date.push(date);
             revisions.push(time.revision().get());
-            superseded_at.push(time.superseded_at().map(|value| value.unix_nanos()));
+            let (precision, timestamp, date) = optional_temporal_projection(time.superseded());
+            superseded_precision.push(precision);
+            superseded_at.push(timestamp);
+            superseded_date.push(date);
             qualities.push(quality_name(provenance.quality()));
             let (decimal, unit) = analytical_value(observation);
             mantissas.push(decimal.map(|value| value.mantissa()));
@@ -282,7 +298,10 @@ impl ResearchArrowBatch {
         let utc =
             |values: Vec<Option<i64>>| TimestampNanosecondArray::from(values).with_timezone_utc();
         let arrays: Vec<ArrayRef> = vec![
-            Arc::new(UInt16Array::from_value(1, observations.len())),
+            Arc::new(UInt16Array::from_value(
+                RESEARCH_SCHEMA_VERSION,
+                observations.len(),
+            )),
             Arc::new(BinaryArray::from_iter_values(request_digests)),
             Arc::new(BinaryArray::from_iter_values(row_lineages)),
             Arc::new(StringArray::from(kinds)),
@@ -298,10 +317,16 @@ impl ResearchArrowBatch {
             Arc::new(StringArray::from(availability_evidence)),
             Arc::new(StringArray::from(availability_methods)),
             Arc::new(TimestampNanosecondArray::from(ingested_at).with_timezone_utc()),
-            Arc::new(TimestampNanosecondArray::from(effective_at).with_timezone_utc()),
+            Arc::new(StringArray::from(effective_precision)),
+            Arc::new(utc(effective_at)),
+            Arc::new(Date32Array::from(effective_date)),
+            Arc::new(StringArray::from(published_precision)),
             Arc::new(utc(published_at)),
+            Arc::new(Date32Array::from(published_date)),
             Arc::new(UInt32Array::from(revisions)),
+            Arc::new(StringArray::from(superseded_precision)),
             Arc::new(utc(superseded_at)),
+            Arc::new(Date32Array::from(superseded_date)),
             Arc::new(StringArray::from(qualities)),
             Arc::new(decimal),
             Arc::new(UInt8Array::from(scales)),
@@ -322,7 +347,7 @@ impl ResearchArrowBatch {
             .get(SCHEMA_VERSION_KEY)
             .and_then(|value| value.parse::<u16>().ok())
             .ok_or(ArrowConversionError::InvalidSchemaMetadata)?;
-        if version != 1 {
+        if version != RESEARCH_SCHEMA_VERSION {
             return Err(ArrowConversionError::UnsupportedSchemaVersion { found: version });
         }
         let dataset = metadata
@@ -477,16 +502,16 @@ fn validate_row_lineage(
     let time = context.time();
     let matches = match lineage {
         RowLineage::Extraction(lineage) => {
-            lineage.schema_version == 1
+            lineage.schema_version == RESEARCH_SCHEMA_VERSION
                 && lineage.source_id == *provenance.source_id()
                 && lineage.dataset == *dataset
                 && lineage.request_digest.algorithm() == DigestAlgorithm::Sha256
                 && lineage.request_digest.bytes() == request_digest
                 && lineage.record_schema.as_str() == RESEARCH_RECORD_SCHEMA
-                && lineage.effective_at == time.effective_at()
-                && lineage.published_at == time.published_at()
+                && lineage.effective_time == time.effective()
+                && lineage.published_time == time.published()
                 && availability_basis_matches(&lineage.availability, provenance.availability())
-                && lineage.superseded_at == time.superseded_at()
+                && lineage.superseded_time == time.superseded()
                 && payload_matches_exact_evidence(payload, &lineage.record_evidence)
         }
         RowLineage::CanonicalObservation {
@@ -495,7 +520,7 @@ fn validate_row_lineage(
             dataset: lineage_dataset,
             request_digest: lineage_request_digest,
         } => {
-            *schema_version == 1
+            *schema_version == RESEARCH_SCHEMA_VERSION
                 && source_id == provenance.source_id()
                 && lineage_dataset == dataset
                 && lineage_request_digest.algorithm() == DigestAlgorithm::Sha256
@@ -506,6 +531,30 @@ fn validate_row_lineage(
         Ok(())
     } else {
         Err(ArrowConversionError::ExtractionBindingMismatch)
+    }
+}
+
+fn temporal_projection(
+    value: ResearchTemporalCoordinate,
+) -> (&'static str, Option<i64>, Option<i32>) {
+    (
+        value.precision().as_str(),
+        value.exact_timestamp().map(Timestamp::unix_nanos),
+        value
+            .calendar_date_value()
+            .map(|date| date.days_since_unix_epoch()),
+    )
+}
+
+fn optional_temporal_projection(
+    value: Option<ResearchTemporalCoordinate>,
+) -> (Option<&'static str>, Option<i64>, Option<i32>) {
+    match value {
+        Some(value) => {
+            let (precision, timestamp, date) = temporal_projection(value);
+            (Some(precision), timestamp, date)
+        }
+        None => (None, None, None),
     }
 }
 

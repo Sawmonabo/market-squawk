@@ -369,6 +369,11 @@ impl Catalog {
         action: &CorporateActionObservation,
     ) -> Result<(), CatalogError> {
         let context = action.context();
+        let effective_at = context
+            .time()
+            .effective()
+            .exact_timestamp()
+            .ok_or(CatalogError::InvalidRecord)?;
         let instrument_id = context
             .provenance()
             .instrument_id()
@@ -403,7 +408,7 @@ impl Catalog {
             params![
                 instrument_id.to_string(),
                 context.provenance().source_id().as_str(),
-                context.time().effective_at().unix_nanos(),
+                effective_at.unix_nanos(),
                 json,
                 digest
             ],

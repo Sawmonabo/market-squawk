@@ -4,11 +4,11 @@ use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 
 use bytes::Bytes;
 use market_squawk_domain::{
-    AuthorizationBasis, CaptureIntegrityState, ChecksumCapability, CoverageDelay, DataQuality,
-    DeliveryEvidence, DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence,
-    MetadataRevision, ProviderChannel, ProviderProduct, RawCaptureFrameView,
-    RevisionBoundPayloadEvidence, SchemaVersion, SequenceCapability, SourceId,
-    StreamIntegrityState, Timestamp, VersionPinnedSourceLocator,
+    AuthorizationBasis, CalendarDate, CaptureIntegrityState, ChecksumCapability, CoverageDelay,
+    DataQuality, DeliveryEvidence, DigestAlgorithm, EffectiveInterval, EvidenceDigest,
+    ExactPayloadEvidence, MetadataRevision, ProviderChannel, ProviderProduct, RawCaptureFrameView,
+    ResearchTemporalCoordinate, RevisionBoundPayloadEvidence, SchemaVersion, SequenceCapability,
+    SourceId, StreamIntegrityState, Timestamp, VersionPinnedSourceLocator,
     checked_arc_bytes_allocation_bytes,
 };
 use market_squawk_sources::{
@@ -516,6 +516,80 @@ fn extraction_availability_retains_conservative_basis_and_inference_method() -> 
             basis
         );
     }
+    Ok(())
+}
+
+#[test]
+fn extraction_identity_and_wire_preserve_calendar_date_precision() -> TestResult {
+    let effective_date = CalendarDate::new(2026, 7, 1)?;
+    let published_date = CalendarDate::new(2026, 7, 15)?;
+    let discovery = DiscoveryRequest::try_new_with_effective(
+        source_identifier("macro-series")?,
+        Some(ResearchTemporalCoordinate::calendar_date(effective_date)),
+        NonZeroU16::try_from(1_u16)?,
+        Timestamp::from_unix_nanos(100),
+    )?;
+    let object = SourceObject::try_new(
+        SourceId::try_from("source-a")?,
+        MetadataRevision::new(source_identifier("metadata-a")?),
+        &discovery,
+        source_identifier("object-a")?,
+        source_identifier("application-json")?,
+        exact_evidence(4),
+        EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?,
+        None,
+        Some(100),
+    )?;
+    let request = ExtractionRequest::try_new(
+        object,
+        NonZeroU32::try_from(1_u32)?,
+        NonZeroU64::try_from(10_000_u64)?,
+        Timestamp::from_unix_nanos(100),
+    )?;
+    let payload = Bytes::from_static(b"record");
+    let date_record = ExtractionRecord::try_new_with_time(
+        &request,
+        source_identifier("schema-v2")?,
+        payload_evidence(DigestAlgorithm::Sha256, &payload),
+        ResearchTemporalCoordinate::calendar_date(effective_date),
+        Some(ResearchTemporalCoordinate::calendar_date(published_date)),
+        AvailabilityEvidence::Unknown,
+        source_identifier("revision-1")?,
+        None,
+        payload.clone(),
+    )?;
+    let exact_record = ExtractionRecord::try_new_with_time(
+        &request,
+        source_identifier("schema-v2")?,
+        payload_evidence(DigestAlgorithm::Sha256, &payload),
+        ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(i64::from(
+            effective_date.days_since_unix_epoch(),
+        ))),
+        Some(ResearchTemporalCoordinate::exact(
+            Timestamp::from_unix_nanos(i64::from(published_date.days_since_unix_epoch())),
+        )),
+        AvailabilityEvidence::Unknown,
+        source_identifier("revision-1")?,
+        None,
+        payload,
+    )?;
+    let date_batch = ExtractionBatch::try_new(&request, vec![date_record])?;
+    let exact_batch = ExtractionBatch::try_new(&request, vec![exact_record])?;
+
+    assert_ne!(
+        market_squawk_sources::ExtractionContentIdentity::try_from_batch(&date_batch)?,
+        market_squawk_sources::ExtractionContentIdentity::try_from_batch(&exact_batch)?
+    );
+    let restored: ExtractionBatch = serde_json::from_slice(&serde_json::to_vec(&date_batch)?)?;
+    assert_eq!(
+        restored.records()[0].effective_time().exact_timestamp(),
+        None
+    );
+    assert_eq!(
+        restored.records()[0].effective_time().calendar_date_value(),
+        Some(effective_date)
+    );
+    assert_eq!(restored.records()[0].available_at(), None);
     Ok(())
 }
 

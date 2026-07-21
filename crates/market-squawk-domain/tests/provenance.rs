@@ -2,8 +2,9 @@ use std::error::Error;
 use std::str::FromStr;
 
 use market_squawk_domain::{
-    AvailabilityEvidence, DataQuality, InstrumentId, PayloadReference, ProvenanceError,
-    ResearchContext, ResearchProvenance, ResearchProvenanceInput, ResearchTime, RevisionNumber,
+    AvailabilityEvidence, CalendarDate, DataQuality, InstrumentId, PayloadReference,
+    ProvenanceError, ResearchContext, ResearchProvenance, ResearchProvenanceInput,
+    ResearchTemporalCoordinate, ResearchTemporalPrecision, ResearchTime, RevisionNumber,
     SchemaVersion, SourceId, SourceIdentifier, Timestamp, VenueId,
 };
 
@@ -119,18 +120,53 @@ fn research_context_preserves_point_in_time_fields() -> Result<(), Box<dyn Error
     )?;
 
     assert_eq!(
-        context.time().effective_at(),
-        Timestamp::from_unix_nanos(50)
+        context.time().effective(),
+        ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(50))
     );
     assert_eq!(
-        context.time().published_at(),
-        Some(Timestamp::from_unix_nanos(90))
+        context.time().published(),
+        Some(ResearchTemporalCoordinate::exact(
+            Timestamp::from_unix_nanos(90)
+        ))
     );
     assert_eq!(context.time().revision().get(), 2);
     assert_eq!(
-        context.time().superseded_at(),
-        Some(Timestamp::from_unix_nanos(250))
+        context.time().superseded(),
+        Some(ResearchTemporalCoordinate::exact(
+            Timestamp::from_unix_nanos(250)
+        ))
     );
+    Ok(())
+}
+
+#[test]
+fn calendar_date_roundtrip_never_manufactures_an_intraday_instant() -> Result<(), Box<dyn Error>> {
+    assert_eq!(CalendarDate::new(1970, 1, 1)?.days_since_unix_epoch(), 0);
+    let effective = ResearchTemporalCoordinate::calendar_date(CalendarDate::new(2026, 7, 1)?);
+    let published = ResearchTemporalCoordinate::calendar_date(CalendarDate::new(2026, 7, 15)?);
+    let time = ResearchTime::try_new_with_coordinates(
+        effective,
+        Some(published),
+        RevisionNumber::new(1)?,
+        None,
+    )?;
+
+    let encoded = serde_json::to_vec(&time)?;
+    let restored: ResearchTime = serde_json::from_slice(&encoded)?;
+    assert_eq!(restored.effective(), effective);
+    assert_eq!(restored.published(), Some(published));
+    assert_eq!(
+        effective.precision(),
+        ResearchTemporalPrecision::CalendarDate
+    );
+    assert_eq!(effective.exact_timestamp(), None);
+    assert_eq!(
+        effective.calendar_date_value(),
+        Some(CalendarDate::new(2026, 7, 1)?)
+    );
+    let mut future = serde_json::to_value(time)?;
+    future["effective"]["schema_version"] = serde_json::json!(2);
+    assert!(serde_json::from_value::<ResearchTime>(future).is_err());
     Ok(())
 }
 

@@ -352,6 +352,7 @@ pub(super) fn validate_supported_schema(schema: &SchemaRef) -> Result<(), QueryE
             DataType::UInt8
             | DataType::UInt16
             | DataType::UInt32
+            | DataType::Date32
             | DataType::Int64
             | DataType::Timestamp(_, _)
             | DataType::Decimal128(_, _)
@@ -411,7 +412,7 @@ pub(super) fn active_file_receipt(
             let arrow = match field.data_type() {
                 DataType::UInt8 => Some(rows),
                 DataType::UInt16 => rows.checked_mul(2),
-                DataType::UInt32 => rows.checked_mul(4),
+                DataType::UInt32 | DataType::Date32 => rows.checked_mul(4),
                 DataType::Int64 | DataType::Timestamp(_, _) => rows.checked_mul(8),
                 DataType::Decimal128(_, _) => rows.checked_mul(16),
                 DataType::Utf8 | DataType::Binary => rows

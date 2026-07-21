@@ -63,6 +63,22 @@ impl CalendarDate {
     pub const fn day(self) -> u8 {
         self.day
     }
+
+    /// Returns the Arrow-compatible signed day offset from 1970-01-01.
+    ///
+    /// This conversion preserves calendar precision: it does not assign a time of day or time
+    /// zone to the date.
+    pub const fn days_since_unix_epoch(self) -> i32 {
+        let month = self.month as i32;
+        let year = self.year as i32 - if month <= 2 { 1 } else { 0 };
+        let era = year / 400;
+        let year_of_era = year - (era * 400);
+        let month_prime = month + if month > 2 { -3 } else { 9 };
+        let day_of_year = ((153 * month_prime + 2) / 5) + self.day as i32 - 1;
+        let day_of_era =
+            (year_of_era * 365) + (year_of_era / 4) - (year_of_era / 100) + day_of_year;
+        (era * 146_097) + day_of_era - 719_468
+    }
 }
 
 const fn is_leap_year(year: u16) -> bool {

@@ -16,7 +16,7 @@ pub use live::{
 };
 pub use research::{
     AvailabilityEvidence, ResearchContext, ResearchProvenance, ResearchProvenanceInput,
-    ResearchTime, RevisionNumber,
+    ResearchTemporalCoordinate, ResearchTemporalPrecision, ResearchTime, RevisionNumber,
 };
 
 /// An algorithm-qualified 256-bit content digest.

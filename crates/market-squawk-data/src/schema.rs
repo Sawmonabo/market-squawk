@@ -4,13 +4,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
-use market_squawk_domain::{EvidenceDigest, SchemaVersion, SourceIdentifier};
+use market_squawk_domain::{EvidenceDigest, SourceIdentifier};
 
 pub(crate) const SCHEMA_VERSION_KEY: &str = "market_squawk.schema_version";
 pub(crate) const DATASET_KEY: &str = "market_squawk.dataset";
 pub(crate) const REQUEST_DIGEST_KEY: &str = "market_squawk.request_sha256";
 pub(crate) const SCHEMA_NAME: &str = "market_squawk.research_observations";
-pub(crate) const RESEARCH_RECORD_SCHEMA: &str = "market-squawk-research-v1";
+pub(crate) const RESEARCH_RECORD_SCHEMA: &str = "market-squawk-research-v2";
+pub(crate) const RESEARCH_SCHEMA_VERSION: u16 = 2;
 
 pub(crate) fn research_schema(
     dataset: &SourceIdentifier,
@@ -39,10 +40,16 @@ pub(crate) fn research_schema(
         Field::new("availability_evidence", DataType::Utf8, true),
         Field::new("availability_method", DataType::Utf8, true),
         Field::new("ingested_at", timestamp.clone(), false),
-        Field::new("effective_at", timestamp.clone(), false),
+        Field::new("effective_precision", DataType::Utf8, false),
+        Field::new("effective_at", timestamp.clone(), true),
+        Field::new("effective_date", DataType::Date32, true),
+        Field::new("published_precision", DataType::Utf8, true),
         Field::new("published_at", timestamp.clone(), true),
+        Field::new("published_date", DataType::Date32, true),
         Field::new("revision", DataType::UInt32, false),
+        Field::new("superseded_precision", DataType::Utf8, true),
         Field::new("superseded_at", timestamp, true),
+        Field::new("superseded_date", DataType::Date32, true),
         Field::new("quality", DataType::Utf8, false),
         Field::new("value_mantissa", DataType::Decimal128(38, 0), true),
         Field::new("value_scale", DataType::UInt8, true),
@@ -55,7 +62,7 @@ pub(crate) fn research_schema(
         ("market_squawk.schema".to_owned(), SCHEMA_NAME.to_owned()),
         (
             SCHEMA_VERSION_KEY.to_owned(),
-            SchemaVersion::CURRENT.get().to_string(),
+            RESEARCH_SCHEMA_VERSION.to_string(),
         ),
         (DATASET_KEY.to_owned(), dataset.as_str().to_owned()),
         (

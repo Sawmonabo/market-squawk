@@ -1,12 +1,14 @@
 //! Research provenance with explicit conservative availability semantics.
 
+use std::cmp::Ordering;
 use std::num::NonZeroU32;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::{PayloadReference, ProvenanceError, ensure_current_schema};
 use crate::{
-    DataQuality, InstrumentId, SchemaVersion, SourceId, SourceIdentifier, Timestamp, VenueId,
+    CalendarDate, DataQuality, InstrumentId, SchemaVersion, SourceId, SourceIdentifier, Timestamp,
+    VenueId,
 };
 
 /// Evidence for when research data became available to a point-in-time consumer.
@@ -300,13 +302,177 @@ impl RevisionNumber {
     }
 }
 
+/// Precision retained by one research temporal coordinate.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ResearchTemporalPrecision {
+    /// An exact UTC instant.
+    ExactTimestamp,
+    /// A civil calendar date with no time of day or time zone.
+    CalendarDate,
+}
+
+impl ResearchTemporalPrecision {
+    /// Returns the stable analytical storage label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ExactTimestamp => "exact_timestamp",
+            Self::CalendarDate => "calendar_date",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(
+    deny_unknown_fields,
+    tag = "precision",
+    content = "value",
+    rename_all = "snake_case"
+)]
+enum ResearchTemporalValue {
+    ExactTimestamp(Timestamp),
+    CalendarDate(CalendarDate),
+}
+
+/// A research time coordinate that preserves source precision without inventing midnight.
+///
+/// Coordinates are ordered only when both values have the same precision. Comparing a calendar
+/// date with an exact [`Timestamp`] is intentionally unordered and therefore fails closed in
+/// range predicates.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResearchTemporalCoordinate {
+    schema_version: SchemaVersion,
+    coordinate: ResearchTemporalValue,
+}
+
+impl ResearchTemporalCoordinate {
+    /// Constructs an exact-instant coordinate.
+    pub const fn exact(timestamp: Timestamp) -> Self {
+        Self {
+            schema_version: SchemaVersion::CURRENT,
+            coordinate: ResearchTemporalValue::ExactTimestamp(timestamp),
+        }
+    }
+
+    /// Constructs a calendar-precision coordinate.
+    pub const fn calendar_date(date: CalendarDate) -> Self {
+        Self {
+            schema_version: SchemaVersion::CURRENT,
+            coordinate: ResearchTemporalValue::CalendarDate(date),
+        }
+    }
+
+    /// Returns the retained source precision.
+    pub const fn precision(self) -> ResearchTemporalPrecision {
+        match self.coordinate {
+            ResearchTemporalValue::ExactTimestamp(_) => ResearchTemporalPrecision::ExactTimestamp,
+            ResearchTemporalValue::CalendarDate(_) => ResearchTemporalPrecision::CalendarDate,
+        }
+    }
+
+    /// Returns the exact instant only when the source supplied exact-instant precision.
+    pub const fn exact_timestamp(self) -> Option<Timestamp> {
+        match self.coordinate {
+            ResearchTemporalValue::ExactTimestamp(timestamp) => Some(timestamp),
+            ResearchTemporalValue::CalendarDate(_) => None,
+        }
+    }
+
+    /// Returns the civil date only when the source supplied calendar-date precision.
+    pub const fn calendar_date_value(self) -> Option<CalendarDate> {
+        match self.coordinate {
+            ResearchTemporalValue::ExactTimestamp(_) => None,
+            ResearchTemporalValue::CalendarDate(date) => Some(date),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResearchTemporalCoordinateWire {
+    schema_version: SchemaVersion,
+    coordinate: ResearchTemporalValue,
+}
+
+impl<'de> Deserialize<'de> for ResearchTemporalCoordinate {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ResearchTemporalCoordinateWire::deserialize(deserializer)?;
+        ensure_current_schema(wire.schema_version).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            schema_version: SchemaVersion::CURRENT,
+            coordinate: wire.coordinate,
+        })
+    }
+}
+
+impl From<Timestamp> for ResearchTemporalCoordinate {
+    fn from(value: Timestamp) -> Self {
+        Self::exact(value)
+    }
+}
+
+impl From<CalendarDate> for ResearchTemporalCoordinate {
+    fn from(value: CalendarDate) -> Self {
+        Self::calendar_date(value)
+    }
+}
+
+impl PartialOrd for ResearchTemporalCoordinate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        match (self.coordinate, other.coordinate) {
+            (
+                ResearchTemporalValue::ExactTimestamp(left),
+                ResearchTemporalValue::ExactTimestamp(right),
+            ) => left.partial_cmp(&right),
+            (
+                ResearchTemporalValue::CalendarDate(left),
+                ResearchTemporalValue::CalendarDate(right),
+            ) => left.partial_cmp(&right),
+            _ => None,
+        }
+    }
+}
+
+impl PartialEq<ResearchTemporalCoordinate> for Timestamp {
+    fn eq(&self, other: &ResearchTemporalCoordinate) -> bool {
+        other
+            .exact_timestamp()
+            .is_some_and(|timestamp| *self == timestamp)
+    }
+}
+
+impl PartialOrd<ResearchTemporalCoordinate> for Timestamp {
+    fn partial_cmp(&self, other: &ResearchTemporalCoordinate) -> Option<Ordering> {
+        other
+            .exact_timestamp()
+            .and_then(|timestamp| self.partial_cmp(&timestamp))
+    }
+}
+
+impl PartialEq<Timestamp> for ResearchTemporalCoordinate {
+    fn eq(&self, other: &Timestamp) -> bool {
+        other == self
+    }
+}
+
+impl PartialOrd<Timestamp> for ResearchTemporalCoordinate {
+    fn partial_cmp(&self, other: &Timestamp) -> Option<Ordering> {
+        self.exact_timestamp()
+            .and_then(|timestamp| timestamp.partial_cmp(other))
+    }
+}
+
 /// Effective, publication, revision, and supersession time for research data.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct ResearchTime {
-    effective_at: Timestamp,
-    published_at: Option<Timestamp>,
+    schema_version: SchemaVersion,
+    effective: ResearchTemporalCoordinate,
+    published: Option<ResearchTemporalCoordinate>,
     revision: RevisionNumber,
-    superseded_at: Option<Timestamp>,
+    superseded: Option<ResearchTemporalCoordinate>,
 }
 
 impl ResearchTime {
@@ -321,27 +487,49 @@ impl ResearchTime {
         revision: RevisionNumber,
         superseded_at: Option<Timestamp>,
     ) -> Result<Self, ProvenanceError> {
-        if let (Some(published), Some(superseded)) = (published_at, superseded_at)
-            && superseded <= published
+        Self::try_new_with_coordinates(
+            ResearchTemporalCoordinate::exact(effective_at),
+            published_at.map(ResearchTemporalCoordinate::exact),
+            revision,
+            superseded_at.map(ResearchTemporalCoordinate::exact),
+        )
+    }
+
+    /// Constructs research time while preserving exact or calendar-date source precision.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a same-precision superseding coordinate at or before publication.
+    pub fn try_new_with_coordinates(
+        effective: ResearchTemporalCoordinate,
+        published: Option<ResearchTemporalCoordinate>,
+        revision: RevisionNumber,
+        superseded: Option<ResearchTemporalCoordinate>,
+    ) -> Result<Self, ProvenanceError> {
+        if let (Some(published), Some(superseded)) = (published, superseded)
+            && superseded
+                .partial_cmp(&published)
+                .is_some_and(|ordering| ordering != Ordering::Greater)
         {
             return Err(ProvenanceError::SupersededNotAfterPublished);
         }
         Ok(Self {
-            effective_at,
-            published_at,
+            schema_version: SchemaVersion::CURRENT,
+            effective,
+            published,
             revision,
-            superseded_at,
+            superseded,
         })
     }
 
-    /// Returns the observation's reference or effective time.
-    pub const fn effective_at(self) -> Timestamp {
-        self.effective_at
+    /// Returns the observation's reference or effective coordinate without precision loss.
+    pub const fn effective(self) -> ResearchTemporalCoordinate {
+        self.effective
     }
 
-    /// Returns publication time when supplied.
-    pub const fn published_at(self) -> Option<Timestamp> {
-        self.published_at
+    /// Returns the publication coordinate when supplied.
+    pub const fn published(self) -> Option<ResearchTemporalCoordinate> {
+        self.published
     }
 
     /// Returns the one-based revision number.
@@ -349,19 +537,20 @@ impl ResearchTime {
         self.revision
     }
 
-    /// Returns when this revision ceased being current.
-    pub const fn superseded_at(self) -> Option<Timestamp> {
-        self.superseded_at
+    /// Returns the coordinate at which this revision ceased being current.
+    pub const fn superseded(self) -> Option<ResearchTemporalCoordinate> {
+        self.superseded
     }
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ResearchTimeWire {
-    effective_at: Timestamp,
-    published_at: Option<Timestamp>,
+    schema_version: SchemaVersion,
+    effective: ResearchTemporalCoordinate,
+    published: Option<ResearchTemporalCoordinate>,
     revision: RevisionNumber,
-    superseded_at: Option<Timestamp>,
+    superseded: Option<ResearchTemporalCoordinate>,
 }
 
 impl<'de> Deserialize<'de> for ResearchTime {
@@ -370,11 +559,12 @@ impl<'de> Deserialize<'de> for ResearchTime {
         D: Deserializer<'de>,
     {
         let wire = ResearchTimeWire::deserialize(deserializer)?;
-        Self::new(
-            wire.effective_at,
-            wire.published_at,
+        ensure_current_schema(wire.schema_version).map_err(serde::de::Error::custom)?;
+        Self::try_new_with_coordinates(
+            wire.effective,
+            wire.published,
             wire.revision,
-            wire.superseded_at,
+            wire.superseded,
         )
         .map_err(serde::de::Error::custom)
     }
@@ -398,14 +588,15 @@ impl ResearchContext {
         provenance: ResearchProvenance,
         time: ResearchTime,
     ) -> Result<Self, ProvenanceError> {
-        if let (Some(published), Some(available)) =
-            (time.published_at, provenance.availability.reported_at())
-            && available < published
+        if let (Some(published), Some(available)) = (
+            time.published.and_then(|value| value.exact_timestamp()),
+            provenance.availability.reported_at(),
+        ) && available < published
         {
             return Err(ProvenanceError::AvailabilityBeforePublished);
         }
         if let (Some(superseded), Some(available)) = (
-            time.superseded_at,
+            time.superseded.and_then(|value| value.exact_timestamp()),
             provenance.availability.conservative_available_at(),
         ) && superseded <= available
         {

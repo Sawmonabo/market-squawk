@@ -3,15 +3,17 @@ use std::error::Error;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array as _, ArrayRef, Decimal128Array, StringArray, TimestampNanosecondArray, UInt8Array,
+    Array as _, ArrayRef, Date32Array, Decimal128Array, StringArray, TimestampNanosecondArray,
+    UInt8Array,
 };
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use market_squawk_data::{ArrowConversionError, ResearchArrowBatch};
 use market_squawk_domain::{
-    AvailabilityEvidence, DataQuality, DigestAlgorithm, EvidenceDigest, MacroObservation,
-    PayloadReference, ResearchContext, ResearchObservation, ResearchProvenance,
-    ResearchProvenanceInput, ResearchTime, RevisionNumber, SourceId, SourceIdentifier, Timestamp,
+    AvailabilityEvidence, CalendarDate, DataQuality, DigestAlgorithm, EvidenceDigest,
+    MacroObservation, PayloadReference, ResearchContext, ResearchObservation, ResearchProvenance,
+    ResearchProvenanceInput, ResearchTemporalCoordinate, ResearchTime, RevisionNumber, SourceId,
+    SourceIdentifier, Timestamp,
 };
 use rust_decimal::Decimal;
 
@@ -58,6 +60,51 @@ fn arrow_roundtrip_preserves_exact_decimal_and_point_in_time_metadata() -> TestR
 }
 
 #[test]
+fn arrow_roundtrip_preserves_calendar_precision_without_intraday_availability() -> TestResult {
+    let effective = CalendarDate::new(2026, 7, 1)?;
+    let published = CalendarDate::new(2026, 7, 15)?;
+    let observation = macro_observation_with_time(
+        Decimal::new(1, 0),
+        AvailabilityEvidence::unknown(),
+        ResearchTime::try_new_with_coordinates(
+            ResearchTemporalCoordinate::calendar_date(effective),
+            Some(ResearchTemporalCoordinate::calendar_date(published)),
+            RevisionNumber::new(1)?,
+            None,
+        )?,
+    )?;
+    let expected = vec![observation];
+    let converted = ResearchArrowBatch::try_from_observations(
+        SourceIdentifier::try_from("fred-gdp")?,
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [8; 32]),
+        expected.clone(),
+    )?;
+    let batch = converted.record_batch();
+
+    assert_eq!(
+        string_column(batch, "effective_precision")?.value(0),
+        "calendar_date"
+    );
+    assert!(timestamp_column(batch, "effective_at")?.is_null(0));
+    assert_eq!(
+        date_column(batch, "effective_date")?.value(0),
+        effective.days_since_unix_epoch()
+    );
+    assert_eq!(
+        string_column(batch, "published_precision")?.value(0),
+        "calendar_date"
+    );
+    assert!(timestamp_column(batch, "published_at")?.is_null(0));
+    assert_eq!(
+        date_column(batch, "published_date")?.value(0),
+        published.days_since_unix_epoch()
+    );
+    assert!(timestamp_column(batch, "available_at")?.is_null(0));
+    assert_eq!(converted.observations()?, expected);
+    Ok(())
+}
+
+#[test]
 fn arrow_reader_rejects_an_unsupported_schema_version() -> TestResult {
     let converted = ResearchArrowBatch::try_from_observations(
         SourceIdentifier::try_from("fred-gdp")?,
@@ -65,7 +112,7 @@ fn arrow_reader_rejects_an_unsupported_schema_version() -> TestResult {
         vec![macro_observation(Decimal::new(1, 0))?],
     )?;
     let mut metadata = converted.record_batch().schema().metadata().clone();
-    metadata.insert("market_squawk.schema_version".to_owned(), "2".to_owned());
+    metadata.insert("market_squawk.schema_version".to_owned(), "3".to_owned());
     let schema = converted
         .record_batch()
         .schema()
@@ -75,7 +122,7 @@ fn arrow_reader_rejects_an_unsupported_schema_version() -> TestResult {
     let hostile = RecordBatch::try_new(schema.into(), converted.record_batch().columns().to_vec())?;
     assert!(matches!(
         ResearchArrowBatch::try_from_record_batch(hostile),
-        Err(ArrowConversionError::UnsupportedSchemaVersion { found: 2 })
+        Err(ArrowConversionError::UnsupportedSchemaVersion { found: 3 })
     ));
     Ok(())
 }
@@ -177,6 +224,13 @@ fn string_column<'a>(
         .ok_or_else(|| format!("missing string column {name}").into())
 }
 
+fn date_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a Date32Array, Box<dyn Error>> {
+    batch
+        .column_by_name(name)
+        .and_then(|array| array.as_any().downcast_ref::<Date32Array>())
+        .ok_or_else(|| format!("missing date column {name}").into())
+}
+
 fn macro_observation(value: Decimal) -> Result<ResearchObservation, Box<dyn Error>> {
     macro_observation_with_availability(
         value,
@@ -190,6 +244,23 @@ fn macro_observation(value: Decimal) -> Result<ResearchObservation, Box<dyn Erro
 fn macro_observation_with_availability(
     value: Decimal,
     availability: AvailabilityEvidence,
+) -> Result<ResearchObservation, Box<dyn Error>> {
+    macro_observation_with_time(
+        value,
+        availability,
+        ResearchTime::new(
+            Timestamp::from_unix_nanos(90),
+            Some(Timestamp::from_unix_nanos(100)),
+            RevisionNumber::new(1)?,
+            Some(Timestamp::from_unix_nanos(200)),
+        )?,
+    )
+}
+
+fn macro_observation_with_time(
+    value: Decimal,
+    availability: AvailabilityEvidence,
+    time: ResearchTime,
 ) -> Result<ResearchObservation, Box<dyn Error>> {
     let context = ResearchContext::new(
         ResearchProvenance::try_new(ResearchProvenanceInput {
@@ -206,12 +277,7 @@ fn macro_observation_with_availability(
             )?),
             availability,
         })?,
-        ResearchTime::new(
-            Timestamp::from_unix_nanos(90),
-            Some(Timestamp::from_unix_nanos(100)),
-            RevisionNumber::new(1)?,
-            Some(Timestamp::from_unix_nanos(200)),
-        )?,
+        time,
     )?;
     Ok(ResearchObservation::Macro(MacroObservation::new(
         context,
