@@ -505,23 +505,21 @@ impl CorporateActionEvent {
                     MarketEventError::NonPositiveCorporateActionAmount
                 }
             })?;
-        match &action {
-            CorporateActionKind::SymbolChange {
-                venue_id,
-                previous,
-                current,
-            } => {
-                let provenance_venue = provenance
-                    .venue_id()
-                    .ok_or(MarketEventError::MissingVenue)?;
-                if provenance_venue != venue_id {
-                    return Err(MarketEventError::CorporateActionVenueMismatch);
-                }
-                if previous == current {
-                    return Err(MarketEventError::UnchangedSymbol);
-                }
+        if let CorporateActionKind::SymbolChange {
+            venue_id,
+            previous,
+            current,
+        } = &action
+        {
+            let provenance_venue = provenance
+                .venue_id()
+                .ok_or(MarketEventError::MissingVenue)?;
+            if provenance_venue != venue_id {
+                return Err(MarketEventError::CorporateActionVenueMismatch);
             }
-            _ => {}
+            if previous == current {
+                return Err(MarketEventError::UnchangedSymbol);
+            }
         }
         Ok(Self {
             provenance,

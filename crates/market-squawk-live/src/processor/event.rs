@@ -3,8 +3,8 @@
 use market_squawk_domain::{
     AuctionEvent, BookChange, BookDeltaEvent, BookSnapshotEvent, CorporateActionEvent,
     CorporateActionKind, InstrumentDefinition, InstrumentStatusEvent, LiveProvenance, MarketEvent,
-    PriceTicks, QuantityLots, QuoteEvent, SourceIdentifier, Timestamp, TradeEvent,
-    TradingHaltEvent, TradingStatus,
+    MergerConsideration, Money, PriceTicks, QuantityLots, QuoteEvent, SourceIdentifier, Timestamp,
+    TradeEvent, TradingHaltEvent, TradingStatus,
 };
 use market_squawk_sources::ProviderObservationPayload;
 use sha2::{Digest, Sha256};
@@ -347,12 +347,15 @@ fn encode_action(output: &mut Vec<u8>, action: &CorporateActionKind) -> Result<(
         }
         CorporateActionKind::CashDividend { amount } => {
             output.push(2);
-            encode_bytes(output, amount.amount().to_string().as_bytes())?;
-            output.extend_from_slice(amount.currency().as_str().as_bytes());
+            encode_money(output, *amount)?;
         }
-        CorporateActionKind::Merger { successor } => {
+        CorporateActionKind::Merger {
+            successor,
+            consideration,
+        } => {
             output.push(3);
             output.extend_from_slice(successor.as_uuid().as_bytes());
+            encode_merger_consideration(output, *consideration)?;
         }
         CorporateActionKind::Delisting => output.push(4),
         CorporateActionKind::SymbolChange {
@@ -365,7 +368,60 @@ fn encode_action(output: &mut Vec<u8>, action: &CorporateActionKind) -> Result<(
             encode_bytes(output, previous.as_str().as_bytes())?;
             encode_bytes(output, current.as_str().as_bytes())?;
         }
+        CorporateActionKind::Spinoff {
+            distributed_instrument,
+            numerator,
+            denominator,
+        } => {
+            output.push(6);
+            output.extend_from_slice(distributed_instrument.as_uuid().as_bytes());
+            encode_u32(output, numerator.get());
+            encode_u32(output, denominator.get());
+        }
+        CorporateActionKind::ReturnOfCapital { amount } => {
+            output.push(7);
+            encode_money(output, *amount)?;
+        }
     }
+    Ok(())
+}
+
+fn encode_merger_consideration(
+    output: &mut Vec<u8>,
+    consideration: MergerConsideration,
+) -> Result<(), LiveApplyError> {
+    match consideration {
+        // Preserve the canonical v1 bytes produced for legacy merger records.
+        MergerConsideration::Unspecified => {}
+        MergerConsideration::Stock {
+            numerator,
+            denominator,
+        } => {
+            output.push(1);
+            encode_u32(output, numerator.get());
+            encode_u32(output, denominator.get());
+        }
+        MergerConsideration::Cash { amount } => {
+            output.push(2);
+            encode_money(output, amount)?;
+        }
+        MergerConsideration::Mixed {
+            numerator,
+            denominator,
+            cash,
+        } => {
+            output.push(3);
+            encode_u32(output, numerator.get());
+            encode_u32(output, denominator.get());
+            encode_money(output, cash)?;
+        }
+    }
+    Ok(())
+}
+
+fn encode_money(output: &mut Vec<u8>, money: Money) -> Result<(), LiveApplyError> {
+    encode_bytes(output, money.amount().to_string().as_bytes())?;
+    output.extend_from_slice(money.currency().as_str().as_bytes());
     Ok(())
 }
 
@@ -381,15 +437,19 @@ const fn trading_status_tag(status: TradingStatus) -> u8 {
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU32;
+    use std::str::FromStr;
 
-    use market_squawk_domain::{CorporateActionKind, LotSize, TickSize, Timestamp};
+    use market_squawk_domain::{
+        CorporateActionKind, Currency, InstrumentId, LotSize, MergerConsideration, Money, TickSize,
+        Timestamp,
+    };
     use market_squawk_sources::{
         ProviderBookLevel, ProviderDecimalLexeme, ProviderPrice, ProviderQuantity,
     };
     use rust_decimal::Decimal;
     use sha2::{Digest, Sha256};
 
-    use super::{PreparedEvent, digest_book};
+    use super::{PreparedEvent, digest_book, encode_action};
     use crate::{
         DepthLimit,
         provider_book::{BookProcessingScratch, ProviderBook},
@@ -449,6 +509,41 @@ mod tests {
         assert_ne!(baseline, action(11, 2, 1)?.canonical_bytes()?);
         assert_ne!(baseline, action(10, 3, 1)?.canonical_bytes()?);
         assert_ne!(baseline, action(10, 2, 3)?.canonical_bytes()?);
+
+        let successor = InstrumentId::from_str("0187f5f1-6fc2-7fa2-bf05-2ce5354c55cc")?;
+        let unspecified = CorporateActionKind::Merger {
+            successor,
+            consideration: MergerConsideration::Unspecified,
+        };
+        let mut legacy_merger = Vec::new();
+        encode_action(&mut legacy_merger, &unspecified)?;
+        let mut expected_legacy_merger = vec![3];
+        expected_legacy_merger.extend_from_slice(successor.as_uuid().as_bytes());
+        assert_eq!(legacy_merger, expected_legacy_merger);
+
+        let stock_merger = CorporateActionKind::Merger {
+            successor,
+            consideration: MergerConsideration::Stock {
+                numerator: NonZeroU32::MIN,
+                denominator: NonZeroU32::new(2).ok_or("zero denominator")?,
+            },
+        };
+        let mut stock_merger_bytes = Vec::new();
+        encode_action(&mut stock_merger_bytes, &stock_merger)?;
+        assert_ne!(stock_merger_bytes, legacy_merger);
+
+        let amount = Money::new(Decimal::ONE, Currency::try_from("USD")?);
+        let mut return_of_capital = Vec::new();
+        encode_action(
+            &mut return_of_capital,
+            &CorporateActionKind::ReturnOfCapital { amount },
+        )?;
+        let mut cash_dividend = Vec::new();
+        encode_action(
+            &mut cash_dividend,
+            &CorporateActionKind::CashDividend { amount },
+        )?;
+        assert_ne!(return_of_capital, cash_dividend);
         Ok(())
     }
 }
