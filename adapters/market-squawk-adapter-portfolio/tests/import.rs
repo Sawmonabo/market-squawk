@@ -10,7 +10,8 @@ use market_squawk_adapter_portfolio::{
 use market_squawk_data::{ResearchArrowBatch, extraction_batch_digest};
 use market_squawk_domain::{
     AccountId, DataQuality, DigestAlgorithm, EffectiveInterval, EvidenceDigest,
-    ExactPayloadEvidence, InstrumentId, MetadataRevision, SourceId, SourceIdentifier, Timestamp,
+    ExactPayloadEvidence, InstrumentId, MetadataRevision, ResearchObservation, RevisionNumber,
+    SourceId, SourceIdentifier, Timestamp,
 };
 use market_squawk_platform::{LocalAuthorityStateStore, SecretReference};
 use market_squawk_sources::{
@@ -172,9 +173,25 @@ fn import_preserves_exact_records_normalizes_typed_portfolio_and_replays_for_dat
 #[test]
 fn duplicate_broker_ids_fail_after_raw_archive_and_corrections_supersede_without_deletion()
 -> TestResult {
+    let unbound_archive = tempfile::tempdir()?;
+    let mut source = open_source(unbound_archive.path())?;
+    let unbound = [raw_transaction(
+        "unbound-record",
+        None,
+        "unbound-fitid",
+        "9.00",
+    )];
+    let unbound = batch(&unbound, "unbound-statement")?;
+    assert!(matches!(
+        source.import_batch(&unbound),
+        Err(market_squawk_adapter_portfolio::PortfolioImportError::AccountMismatch)
+    ));
+    assert_eq!(source.raw_records().len(), 1);
+
     let duplicate_archive = tempfile::tempdir()?;
     let mut source = open_source(duplicate_archive.path())?;
     let duplicate = [
+        raw_account(),
         raw_transaction("record-a", None, "duplicate-fitid", "10.00"),
         raw_transaction("record-b", None, "duplicate-fitid", "11.00"),
     ];
@@ -183,19 +200,28 @@ fn duplicate_broker_ids_fail_after_raw_archive_and_corrections_supersede_without
         source.import_batch(&duplicate),
         Err(market_squawk_adapter_portfolio::PortfolioImportError::DuplicateBrokerTransactionId)
     ));
-    assert_eq!(source.raw_records().len(), 2);
+    assert_eq!(source.raw_records().len(), 3);
 
     let correction_archive = tempfile::tempdir()?;
     let mut source = open_source(correction_archive.path())?;
-    let original = [raw_transaction(
-        "corrected-record",
-        None,
-        "correct-fitid",
-        "10.00",
-    )];
+    let original = [
+        raw_account(),
+        raw_transaction("corrected-record", None, "correct-fitid", "10.00"),
+    ];
     let original_batch = batch(&original, "corrected-statement")?;
     let imported = source.import_batch(&original_batch)?;
-    let original_reference = imported.raw_records()[0].source_reference().clone();
+    let original_reference = imported.raw_records()[1].source_reference().clone();
+    let stable_record_id = SourceIdentifier::try_from("corrected-record")?;
+    let revision_one = RevisionNumber::new(1)?;
+    let original_lineage = transaction_lineage(imported.normalized_batch())?;
+    assert_eq!(original_lineage.len(), 2);
+    assert!(
+        original_lineage
+            .iter()
+            .all(|(source_identifier, revision)| {
+                source_identifier == &stable_record_id && *revision == revision_one
+            })
+    );
     drop(imported);
 
     let correction = [FixtureRecord {
@@ -205,22 +231,106 @@ fn duplicate_broker_ids_fail_after_raw_archive_and_corrections_supersede_without
             Some("statement-1"),
             "correct-fitid",
             "10.25",
+            2,
         ),
     }];
     let correction_batch = batch(&correction, "corrected-statement")?;
     let corrected = source.import_batch(&correction_batch)?;
+    let revision_two = RevisionNumber::new(2)?;
     assert_eq!(corrected.disposition(), ImportDisposition::Applied);
-    assert_eq!(source.raw_records().len(), 2);
+    assert_eq!(source.raw_records().len(), 3);
     assert!(source.is_superseded(&original_reference));
     let active = source
         .active_record(&SourceIdentifier::try_from("corrected-record")?)
         .ok_or("corrected record absent")?;
     assert_ne!(active.source_reference(), &original_reference);
+    assert_eq!(active.revision_number(), revision_two);
     assert_eq!(
         corrected.transactions()[0].amount().amount().to_string(),
         "10.25"
     );
+    let corrected_lineage = transaction_lineage(corrected.normalized_batch())?;
+    assert_eq!(corrected_lineage.len(), 2);
+    assert!(
+        corrected_lineage
+            .iter()
+            .all(|(source_identifier, revision)| {
+                source_identifier == &stable_record_id && *revision == revision_two
+            })
+    );
+    drop(corrected);
+
+    let non_increasing = [FixtureRecord {
+        revision: "statement-3".to_owned(),
+        payload: raw_transaction_payload(
+            "corrected-record",
+            Some("statement-2"),
+            "correct-fitid",
+            "10.50",
+            2,
+        ),
+    }];
+    let non_increasing_batch = batch(&non_increasing, "non-increasing-correction")?;
+    assert!(matches!(
+        source.import_batch(&non_increasing_batch),
+        Err(market_squawk_adapter_portfolio::PortfolioImportError::NonIncreasingRevision)
+    ));
+    assert_eq!(source.raw_records().len(), 4);
+
+    let incompatible_account_correction = [FixtureRecord {
+        revision: "statement-2".to_owned(),
+        payload: raw_account_payload(Some("statement-1"), "EUR", 2),
+    }];
+    let incompatible_account_batch = batch(
+        &incompatible_account_correction,
+        "incompatible-account-correction",
+    )?;
+    assert!(matches!(
+        source.import_batch(&incompatible_account_batch),
+        Err(market_squawk_adapter_portfolio::PortfolioImportError::CurrencyMismatch)
+    ));
+    assert_eq!(source.raw_records().len(), 5);
     Ok(())
+}
+
+fn observation_revision(observation: &ResearchObservation) -> RevisionNumber {
+    match observation {
+        ResearchObservation::Filing(value) => value.context().time().revision(),
+        ResearchObservation::Fundamental(value) => value.context().time().revision(),
+        ResearchObservation::Macro(value) => value.context().time().revision(),
+        ResearchObservation::PortfolioPosition(value) => value.context().time().revision(),
+        ResearchObservation::Transaction(value) => value.context().time().revision(),
+        ResearchObservation::CorporateAction(value) => value.context().time().revision(),
+        ResearchObservation::AlternativeData(value) => value.context().time().revision(),
+    }
+}
+
+fn transaction_lineage(
+    batch: &ExtractionBatch,
+) -> Result<Vec<(SourceIdentifier, RevisionNumber)>, Box<dyn Error>> {
+    let observations = batch
+        .records()
+        .iter()
+        .map(|record| serde_json::from_slice::<ResearchObservation>(record.payload()))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(observations
+        .into_iter()
+        .filter_map(|observation| match &observation {
+            ResearchObservation::Transaction(value) => Some((
+                value.context().provenance().source_identifier().clone(),
+                observation_revision(&observation),
+            )),
+            ResearchObservation::AlternativeData(value)
+                if value.dataset().as_str() == "portfolio-transactions" =>
+            {
+                Some((
+                    value.context().provenance().source_identifier().clone(),
+                    observation_revision(&observation),
+                ))
+            }
+            _ => None,
+        })
+        .collect())
 }
 
 fn open_source(archive: &Path) -> Result<PortfolioExtractionSource, Box<dyn Error>> {
@@ -242,8 +352,28 @@ fn raw_transaction(
 ) -> FixtureRecord {
     FixtureRecord {
         revision: "statement-1".to_owned(),
-        payload: raw_transaction_payload(record_id, supersedes_revision, broker_id, amount),
+        payload: raw_transaction_payload(record_id, supersedes_revision, broker_id, amount, 1),
     }
+}
+
+fn raw_account() -> FixtureRecord {
+    FixtureRecord {
+        revision: "statement-1".to_owned(),
+        payload: raw_account_payload(None, "USD", 1),
+    }
+}
+
+fn raw_account_payload(
+    supersedes_revision: Option<&str>,
+    currency: &str,
+    revision_number: u32,
+) -> String {
+    let supersedes = supersedes_revision.map_or_else(String::new, |revision| {
+        format!("\"supersedes_revision\":\"{revision}\",")
+    });
+    format!(
+        "{{\"record_id\":\"account-authority\",{supersedes}\"revision_number\":{revision_number},\"received_at_unix_nanos\":\"103\",\"ingested_at_unix_nanos\":\"104\",\"record\":{{\"kind\":\"account\",\"account_id\":\"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\",\"currency\":\"{currency}\",\"cash_balance\":\"1000.00\",\"as_of_unix_nanos\":\"100\"}}}}"
+    )
 }
 
 fn raw_transaction_payload(
@@ -251,11 +381,12 @@ fn raw_transaction_payload(
     supersedes_revision: Option<&str>,
     broker_id: &str,
     amount: &str,
+    revision_number: u32,
 ) -> String {
     let supersedes =
         supersedes_revision.map_or_else(|| "null".to_owned(), |revision| format!("\"{revision}\""));
     format!(
-        "{{\"record_id\":\"{record_id}\",\"supersedes_revision\":{supersedes},\"revision_number\":1,\"received_at_unix_nanos\":\"103\",\"ingested_at_unix_nanos\":\"104\",\"record\":{{\"kind\":\"transaction\",\"broker_transaction_id\":\"{broker_id}\",\"account_id\":\"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\",\"instrument_id\":null,\"currency\":\"USD\",\"transaction_type\":\"cash_transfer\",\"amount\":\"{amount}\",\"quantity\":null,\"occurred_at_unix_nanos\":\"99\",\"lot_method\":null}}}}"
+        "{{\"record_id\":\"{record_id}\",\"supersedes_revision\":{supersedes},\"revision_number\":{revision_number},\"received_at_unix_nanos\":\"103\",\"ingested_at_unix_nanos\":\"104\",\"record\":{{\"kind\":\"transaction\",\"broker_transaction_id\":\"{broker_id}\",\"account_id\":\"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\",\"instrument_id\":null,\"currency\":\"USD\",\"transaction_type\":\"cash_transfer\",\"amount\":\"{amount}\",\"quantity\":null,\"occurred_at_unix_nanos\":\"99\",\"lot_method\":null}}}}"
     )
 }
 
