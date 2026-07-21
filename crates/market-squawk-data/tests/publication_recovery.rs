@@ -530,6 +530,7 @@ async fn rights_bound_ingest_replays_one_complete_pinned_generation() -> TestRes
     let first = service
         .ingest(reservation.clone(), batch.clone(), CancellationToken::new())
         .await?;
+    assert_eq!(first.manifest().schema_version().get(), 2);
     let replay = service
         .ingest(reservation, batch, CancellationToken::new())
         .await?;

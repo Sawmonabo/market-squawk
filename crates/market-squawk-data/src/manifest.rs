@@ -72,6 +72,7 @@ impl fmt::Debug for Sha256Digest {
 pub struct DatasetManifestRef {
     dataset_id: DatasetId,
     manifest_version: u64,
+    schema_version: market_squawk_domain::SchemaVersion,
     content_hash: Sha256Digest,
 }
 
@@ -80,6 +81,7 @@ impl DatasetManifestRef {
     pub fn try_new(
         dataset_id: DatasetId,
         manifest_version: u64,
+        schema_version: market_squawk_domain::SchemaVersion,
         content_hash: Sha256Digest,
     ) -> Result<Self, ManifestPlanError> {
         if manifest_version == 0 {
@@ -88,6 +90,7 @@ impl DatasetManifestRef {
         Ok(Self {
             dataset_id,
             manifest_version,
+            schema_version,
             content_hash,
         })
     }
@@ -100,6 +103,11 @@ impl DatasetManifestRef {
     /// Returns the immutable generation number.
     pub const fn manifest_version(&self) -> u64 {
         self.manifest_version
+    }
+
+    /// Returns the exact analytical row-schema version for this immutable generation.
+    pub const fn schema_version(&self) -> market_squawk_domain::SchemaVersion {
+        self.schema_version
     }
 
     /// Returns the semantic manifest hash.

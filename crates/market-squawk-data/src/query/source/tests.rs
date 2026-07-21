@@ -54,6 +54,7 @@ async fn arbitrary_batches_cannot_attach_durable_publication_authority() -> Test
     let fabricated_manifest = DatasetManifestRef::try_new(
         DatasetId::try_from("fabricated-query-source")?,
         1,
+        SchemaVersion::CURRENT,
         Sha256Digest::new([99; 32]),
     )?;
     let batch = RecordBatch::try_new(

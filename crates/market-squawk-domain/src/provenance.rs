@@ -15,8 +15,9 @@ pub use live::{
     DecodedLiveProvenanceInput, LiveProvenance, LiveRecordState, RecordedLiveProvenanceInput,
 };
 pub use research::{
-    AvailabilityEvidence, ResearchContext, ResearchProvenance, ResearchProvenanceInput,
-    ResearchTemporalCoordinate, ResearchTemporalPrecision, ResearchTime, RevisionNumber,
+    AvailabilityEvidence, ResearchContext, ResearchPeriod, ResearchProvenance,
+    ResearchProvenanceInput, ResearchTemporalCoordinate, ResearchTemporalPrecision, ResearchTime,
+    RevisionNumber,
 };
 
 /// An algorithm-qualified 256-bit content digest.
@@ -81,6 +82,10 @@ pub enum ProvenanceError {
     SupersededNotAfterAvailable,
     /// Revision numbers are one-based.
     ZeroRevision,
+    /// A provider-qualified research period used year zero.
+    InvalidResearchPeriod,
+    /// Serialized research-time input uses an unsupported temporal schema version.
+    UnsupportedResearchTemporalSchema { found: u16 },
     /// Decoder output cannot claim `DirectVerified`; a recorded label is only a caller-supplied
     /// archival assertion paired with an opaque reference and does not prove successful
     /// qualification.
@@ -116,6 +121,13 @@ impl fmt::Display for ProvenanceError {
                 formatter.write_str("superseded time must be later than conservative availability")
             }
             Self::ZeroRevision => formatter.write_str("revision number must be nonzero"),
+            Self::InvalidResearchPeriod => {
+                formatter.write_str("research period year must be nonzero")
+            }
+            Self::UnsupportedResearchTemporalSchema { found } => write!(
+                formatter,
+                "research temporal schema version {found} is unsupported"
+            ),
             Self::UnqualifiedDirectVerified => {
                 formatter.write_str("decoded provenance cannot claim direct-verified quality")
             }

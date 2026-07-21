@@ -227,6 +227,7 @@ impl QueryRequest {
         );
         identity.update(self.manifest.dataset_id().as_str().as_bytes());
         identity.update(self.manifest.manifest_version().to_be_bytes());
+        identity.update(self.manifest.schema_version().get().to_be_bytes());
         identity.update(self.manifest.content_hash().bytes());
         identity.update(
             u64::try_from(self.sql.len())

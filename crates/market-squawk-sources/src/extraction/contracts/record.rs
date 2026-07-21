@@ -1,3 +1,5 @@
+const EXTRACTION_RECORD_TEMPORAL_SCHEMA_VERSION: u16 = 2;
+
 /// Explicit source availability basis without promoting inference to point-in-time evidence.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
@@ -43,6 +45,7 @@ impl AvailabilityEvidence {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExtractionRecord {
+    temporal_schema_version: u16,
     source_id: SourceId,
     metadata_revision: MetadataRevision,
     dataset: SourceIdentifier,
@@ -156,11 +159,13 @@ impl ExtractionRecord {
     ) -> Result<Self, ExtractionError> {
         let reported_at = availability.reported_at();
         if published_time
+            .as_ref()
             .and_then(ResearchTemporalCoordinate::exact_timestamp)
             .is_some_and(|published| reported_at.is_some_and(|value| value < published))
-            || superseded_time.is_some_and(|superseded| {
-                temporal_not_after(superseded, effective_time)
+            || superseded_time.as_ref().is_some_and(|superseded| {
+                temporal_not_after(superseded, &effective_time)
                     || published_time
+                        .as_ref()
                         .is_some_and(|published| temporal_not_after(superseded, published))
                     || superseded
                         .exact_timestamp()
@@ -178,6 +183,7 @@ impl ExtractionRecord {
             return Err(ExtractionError::PayloadEvidenceMismatch);
         }
         Ok(Self {
+            temporal_schema_version: EXTRACTION_RECORD_TEMPORAL_SCHEMA_VERSION,
             source_id: normalize_source_id(&source_id)?,
             metadata_revision: normalize_metadata_revision(&metadata_revision)?,
             dataset: normalize_identifier(&dataset)?,
@@ -242,13 +248,13 @@ impl ExtractionRecord {
     }
 
     /// Returns the record's effective coordinate without precision loss.
-    pub const fn effective_time(&self) -> ResearchTemporalCoordinate {
-        self.effective_time
+    pub const fn effective_time(&self) -> &ResearchTemporalCoordinate {
+        &self.effective_time
     }
 
     /// Returns the source publication coordinate, when supplied.
-    pub const fn published_time(&self) -> Option<ResearchTemporalCoordinate> {
-        self.published_time
+    pub fn published_time(&self) -> Option<&ResearchTemporalCoordinate> {
+        self.published_time.as_ref()
     }
 
     /// Returns exact normalized payload bytes.
@@ -272,8 +278,8 @@ impl ExtractionRecord {
     }
 
     /// Returns the exclusive supersession coordinate when known.
-    pub const fn superseded_time(&self) -> Option<ResearchTemporalCoordinate> {
-        self.superseded_time
+    pub fn superseded_time(&self) -> Option<&ResearchTemporalCoordinate> {
+        self.superseded_time.as_ref()
     }
 
     pub(crate) fn matches_request(&self, request: &ExtractionRequest) -> bool {
@@ -309,7 +315,8 @@ impl ExtractionRecord {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ExtractionRecordWire {
+struct CurrentExtractionRecordWire {
+    temporal_schema_version: u16,
     source_id: SourceId,
     metadata_revision: MetadataRevision,
     dataset: SourceIdentifier,
@@ -327,30 +334,85 @@ struct ExtractionRecordWire {
     payload: BoundedBytes<MAX_EXTRACTION_RECORD_BYTES>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyExtractionRecordWire {
+    source_id: SourceId,
+    metadata_revision: MetadataRevision,
+    dataset: SourceIdentifier,
+    discovery_request_id: DiscoveryRequestId,
+    extraction_request_id: ExtractionRequestId,
+    object_id: SourceIdentifier,
+    object_evidence: ExactPayloadEvidence,
+    schema: SourceIdentifier,
+    evidence: ExactPayloadEvidence,
+    effective_at: Timestamp,
+    published_at: Option<Timestamp>,
+    availability: AvailabilityEvidence,
+    revision: SourceIdentifier,
+    superseded_at: Option<Timestamp>,
+    payload: BoundedBytes<MAX_EXTRACTION_RECORD_BYTES>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ExtractionRecordWire {
+    Current(CurrentExtractionRecordWire),
+    Legacy(LegacyExtractionRecordWire),
+}
+
 impl<'de> Deserialize<'de> for ExtractionRecord {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        let wire = ExtractionRecordWire::deserialize(deserializer)?;
-        Self::try_from_parts(
-            wire.source_id,
-            wire.metadata_revision,
-            wire.dataset,
-            wire.discovery_request_id,
-            wire.extraction_request_id,
-            wire.object_id,
-            wire.object_evidence,
-            wire.schema,
-            wire.evidence,
-            wire.effective_time,
-            wire.published_time,
-            wire.availability,
-            wire.revision,
-            wire.superseded_time,
-            wire.payload.as_bytes().clone(),
-        )
-        .map_err(serde::de::Error::custom)
+        match ExtractionRecordWire::deserialize(deserializer)? {
+            ExtractionRecordWire::Current(wire) => {
+                if wire.temporal_schema_version != EXTRACTION_RECORD_TEMPORAL_SCHEMA_VERSION {
+                    return Err(serde::de::Error::custom(
+                        ExtractionError::UnsupportedTemporalSchema {
+                            found: wire.temporal_schema_version,
+                        },
+                    ));
+                }
+                Self::try_from_parts(
+                    wire.source_id,
+                    wire.metadata_revision,
+                    wire.dataset,
+                    wire.discovery_request_id,
+                    wire.extraction_request_id,
+                    wire.object_id,
+                    wire.object_evidence,
+                    wire.schema,
+                    wire.evidence,
+                    wire.effective_time,
+                    wire.published_time,
+                    wire.availability,
+                    wire.revision,
+                    wire.superseded_time,
+                    wire.payload.as_bytes().clone(),
+                )
+                .map_err(serde::de::Error::custom)
+            }
+            ExtractionRecordWire::Legacy(wire) => Self::try_from_parts(
+                wire.source_id,
+                wire.metadata_revision,
+                wire.dataset,
+                wire.discovery_request_id,
+                wire.extraction_request_id,
+                wire.object_id,
+                wire.object_evidence,
+                wire.schema,
+                wire.evidence,
+                ResearchTemporalCoordinate::exact(wire.effective_at),
+                wire.published_at.map(ResearchTemporalCoordinate::exact),
+                wire.availability,
+                wire.revision,
+                wire.superseded_at.map(ResearchTemporalCoordinate::exact),
+                wire.payload.as_bytes().clone(),
+            )
+            .map_err(serde::de::Error::custom),
+        }
     }
 }
 
@@ -371,6 +433,8 @@ pub enum ExtractionError {
     ByteCountOverflow,
     #[error("record availability/publication/supersession ordering is invalid")]
     InvalidPointInTimeOrdering,
+    #[error("extraction temporal schema version {found} is unsupported")]
+    UnsupportedTemporalSchema { found: u16 },
     #[error("discovery or extraction request identity does not match")]
     RequestBindingMismatch,
     #[error("source identity or metadata revision does not match")]
@@ -393,14 +457,14 @@ pub fn payload_matches_exact_evidence(payload: &[u8], evidence: &ExactPayloadEvi
 
 fn discovery_request_id(
     dataset: &SourceIdentifier,
-    effective: Option<ResearchTemporalCoordinate>,
+    effective_at: Option<Timestamp>,
     max_results: NonZeroU16,
     deadline: Timestamp,
 ) -> DiscoveryRequestId {
     let mut hash = Sha256::new();
-    hash.update(b"market-squawk/discovery-request/v3");
+    hash.update(b"market-squawk/discovery-request/v2");
     hash_field(&mut hash, b"dataset", dataset.as_str().as_bytes());
-    hash_optional_temporal_coordinate(&mut hash, b"effective", effective);
+    hash_optional_timestamp(&mut hash, b"effective_at", effective_at);
     hash_field(&mut hash, b"max_results", &max_results.get().to_be_bytes());
     hash_field(&mut hash, b"deadline", &deadline.unix_nanos().to_be_bytes());
     DiscoveryRequestId(EvidenceDigest::new(
@@ -500,32 +564,11 @@ fn hash_optional_timestamp(hash: &mut Sha256, tag: &[u8], value: Option<Timestam
     hash_field(hash, tag, &encoded);
 }
 
-fn hash_optional_temporal_coordinate(
-    hash: &mut Sha256,
-    tag: &[u8],
-    value: Option<ResearchTemporalCoordinate>,
-) {
-    match value {
-        Some(value) => {
-            hash_field(hash, tag, &[1]);
-            if let Some(timestamp) = value.exact_timestamp() {
-                hash_field(hash, b"temporal_precision", b"exact_timestamp");
-                hash_field(hash, b"temporal_value", &timestamp.unix_nanos().to_be_bytes());
-            } else if let Some(date) = value.calendar_date_value() {
-                hash_field(hash, b"temporal_precision", b"calendar_date");
-                hash_field(hash, b"temporal_value", &date.days_since_unix_epoch().to_be_bytes());
-            }
-        }
-        None => hash_field(hash, tag, &[0]),
-    }
-}
-
 fn temporal_not_after(
-    left: ResearchTemporalCoordinate,
-    right: ResearchTemporalCoordinate,
+    left: &ResearchTemporalCoordinate,
+    right: &ResearchTemporalCoordinate,
 ) -> bool {
-    left.partial_cmp(&right)
-        .is_some_and(|ordering| !ordering.is_gt())
+    !matches!(left.partial_cmp(right), Some(std::cmp::Ordering::Greater))
 }
 
 fn hash_optional_u64(hash: &mut Sha256, tag: &[u8], value: Option<u64>) {

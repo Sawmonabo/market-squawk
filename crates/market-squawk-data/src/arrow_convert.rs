@@ -11,8 +11,8 @@ use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 use market_squawk_domain::{
     AvailabilityEvidence, DataQuality, DigestAlgorithm, EvidenceDigest, ExactPayloadEvidence,
-    MetadataRevision, ResearchContext, ResearchObservation, ResearchTemporalCoordinate, SourceId,
-    SourceIdentifier, Timestamp,
+    MetadataRevision, ResearchContext, ResearchObservation, ResearchTemporalCoordinate,
+    SchemaVersion, SourceId, SourceIdentifier, Timestamp,
 };
 use market_squawk_sources::{
     AvailabilityEvidence as SourceAvailabilityEvidence, DiscoveryRequestId, ExtractionBatch,
@@ -94,11 +94,11 @@ impl ResearchArrowBatch {
                 object_evidence: record.object_evidence().clone(),
                 record_schema: record.schema().clone(),
                 record_evidence: record.evidence().clone(),
-                effective_time: record.effective_time(),
-                published_time: record.published_time(),
+                effective_time: record.effective_time().clone(),
+                published_time: record.published_time().cloned(),
                 availability: record.availability().clone(),
                 revision: record.revision().clone(),
-                superseded_time: record.superseded_time(),
+                superseded_time: record.superseded_time().cloned(),
             }));
             validate_row_lineage(
                 &lineage,
@@ -222,13 +222,25 @@ impl ResearchArrowBatch {
         let mut effective_precision = Vec::with_capacity(observations.len());
         let mut effective_at = Vec::with_capacity(observations.len());
         let mut effective_date = Vec::with_capacity(observations.len());
+        let mut effective_period_scheme = Vec::with_capacity(observations.len());
+        let mut effective_period_year = Vec::with_capacity(observations.len());
+        let mut effective_period_ordinal = Vec::with_capacity(observations.len());
+        let mut effective_period_code = Vec::with_capacity(observations.len());
         let mut published_precision = Vec::with_capacity(observations.len());
         let mut published_at = Vec::with_capacity(observations.len());
         let mut published_date = Vec::with_capacity(observations.len());
+        let mut published_period_scheme = Vec::with_capacity(observations.len());
+        let mut published_period_year = Vec::with_capacity(observations.len());
+        let mut published_period_ordinal = Vec::with_capacity(observations.len());
+        let mut published_period_code = Vec::with_capacity(observations.len());
         let mut revisions = Vec::with_capacity(observations.len());
         let mut superseded_precision = Vec::with_capacity(observations.len());
         let mut superseded_at = Vec::with_capacity(observations.len());
         let mut superseded_date = Vec::with_capacity(observations.len());
+        let mut superseded_period_scheme = Vec::with_capacity(observations.len());
+        let mut superseded_period_year = Vec::with_capacity(observations.len());
+        let mut superseded_period_ordinal = Vec::with_capacity(observations.len());
+        let mut superseded_period_code = Vec::with_capacity(observations.len());
         let mut qualities = Vec::with_capacity(observations.len());
         let mut mantissas = Vec::with_capacity(observations.len());
         let mut scales = Vec::with_capacity(observations.len());
@@ -266,19 +278,31 @@ impl ResearchArrowBatch {
             availability_evidence.push(evidence);
             availability_methods.push(method);
             ingested_at.push(provenance.ingested_at().unix_nanos());
-            let (precision, timestamp, date) = temporal_projection(time.effective());
-            effective_precision.push(precision);
-            effective_at.push(timestamp);
-            effective_date.push(date);
-            let (precision, timestamp, date) = optional_temporal_projection(time.published());
-            published_precision.push(precision);
-            published_at.push(timestamp);
-            published_date.push(date);
+            let effective = temporal_projection(Some(time.effective()));
+            effective_precision.push(effective.precision);
+            effective_at.push(effective.timestamp);
+            effective_date.push(effective.date);
+            effective_period_scheme.push(effective.period_scheme);
+            effective_period_year.push(effective.period_year);
+            effective_period_ordinal.push(effective.period_ordinal);
+            effective_period_code.push(effective.period_code);
+            let published = temporal_projection(time.published());
+            published_precision.push(published.precision);
+            published_at.push(published.timestamp);
+            published_date.push(published.date);
+            published_period_scheme.push(published.period_scheme);
+            published_period_year.push(published.period_year);
+            published_period_ordinal.push(published.period_ordinal);
+            published_period_code.push(published.period_code);
             revisions.push(time.revision().get());
-            let (precision, timestamp, date) = optional_temporal_projection(time.superseded());
-            superseded_precision.push(precision);
-            superseded_at.push(timestamp);
-            superseded_date.push(date);
+            let superseded = temporal_projection(time.superseded());
+            superseded_precision.push(superseded.precision);
+            superseded_at.push(superseded.timestamp);
+            superseded_date.push(superseded.date);
+            superseded_period_scheme.push(superseded.period_scheme);
+            superseded_period_year.push(superseded.period_year);
+            superseded_period_ordinal.push(superseded.period_ordinal);
+            superseded_period_code.push(superseded.period_code);
             qualities.push(quality_name(provenance.quality()));
             let (decimal, unit) = analytical_value(observation);
             mantissas.push(decimal.map(|value| value.mantissa()));
@@ -320,13 +344,25 @@ impl ResearchArrowBatch {
             Arc::new(StringArray::from(effective_precision)),
             Arc::new(utc(effective_at)),
             Arc::new(Date32Array::from(effective_date)),
+            Arc::new(StringArray::from(effective_period_scheme)),
+            Arc::new(UInt16Array::from(effective_period_year)),
+            Arc::new(UInt16Array::from(effective_period_ordinal)),
+            Arc::new(StringArray::from(effective_period_code)),
             Arc::new(StringArray::from(published_precision)),
             Arc::new(utc(published_at)),
             Arc::new(Date32Array::from(published_date)),
+            Arc::new(StringArray::from(published_period_scheme)),
+            Arc::new(UInt16Array::from(published_period_year)),
+            Arc::new(UInt16Array::from(published_period_ordinal)),
+            Arc::new(StringArray::from(published_period_code)),
             Arc::new(UInt32Array::from(revisions)),
             Arc::new(StringArray::from(superseded_precision)),
             Arc::new(utc(superseded_at)),
             Arc::new(Date32Array::from(superseded_date)),
+            Arc::new(StringArray::from(superseded_period_scheme)),
+            Arc::new(UInt16Array::from(superseded_period_year)),
+            Arc::new(UInt16Array::from(superseded_period_ordinal)),
+            Arc::new(StringArray::from(superseded_period_code)),
             Arc::new(StringArray::from(qualities)),
             Arc::new(decimal),
             Arc::new(UInt8Array::from(scales)),
@@ -390,6 +426,22 @@ impl ResearchArrowBatch {
     /// Returns the immutable Arrow batch.
     pub const fn record_batch(&self) -> &RecordBatch {
         &self.batch
+    }
+
+    /// Returns the exact analytical row-schema version retained in this batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArrowConversionError::InvalidSchemaMetadata`] when the mandatory version is
+    /// absent, malformed, or zero.
+    pub fn schema_version(&self) -> Result<SchemaVersion, ArrowConversionError> {
+        self.batch
+            .schema()
+            .metadata()
+            .get(SCHEMA_VERSION_KEY)
+            .and_then(|value| value.parse::<u16>().ok())
+            .and_then(|value| SchemaVersion::new(value).ok())
+            .ok_or(ArrowConversionError::InvalidSchemaMetadata)
     }
 
     /// Reconstructs canonical observations after validating every projected column.
@@ -508,10 +560,10 @@ fn validate_row_lineage(
                 && lineage.request_digest.algorithm() == DigestAlgorithm::Sha256
                 && lineage.request_digest.bytes() == request_digest
                 && lineage.record_schema.as_str() == RESEARCH_RECORD_SCHEMA
-                && lineage.effective_time == time.effective()
-                && lineage.published_time == time.published()
+                && &lineage.effective_time == time.effective()
+                && lineage.published_time.as_ref() == time.published()
                 && availability_basis_matches(&lineage.availability, provenance.availability())
-                && lineage.superseded_time == time.superseded()
+                && lineage.superseded_time.as_ref() == time.superseded()
                 && payload_matches_exact_evidence(payload, &lineage.record_evidence)
         }
         RowLineage::CanonicalObservation {
@@ -534,27 +586,42 @@ fn validate_row_lineage(
     }
 }
 
-fn temporal_projection(
-    value: ResearchTemporalCoordinate,
-) -> (&'static str, Option<i64>, Option<i32>) {
-    (
-        value.precision().as_str(),
-        value.exact_timestamp().map(Timestamp::unix_nanos),
-        value
-            .calendar_date_value()
-            .map(|date| date.days_since_unix_epoch()),
-    )
+#[derive(Debug)]
+struct TemporalProjection {
+    precision: Option<&'static str>,
+    timestamp: Option<i64>,
+    date: Option<i32>,
+    period_scheme: Option<String>,
+    period_year: Option<u16>,
+    period_ordinal: Option<u16>,
+    period_code: Option<String>,
 }
 
-fn optional_temporal_projection(
-    value: Option<ResearchTemporalCoordinate>,
-) -> (Option<&'static str>, Option<i64>, Option<i32>) {
+fn temporal_projection(value: Option<&ResearchTemporalCoordinate>) -> TemporalProjection {
     match value {
         Some(value) => {
-            let (precision, timestamp, date) = temporal_projection(value);
-            (Some(precision), timestamp, date)
+            let period = value.source_period_value();
+            TemporalProjection {
+                precision: Some(value.precision().as_str()),
+                timestamp: value.exact_timestamp().map(Timestamp::unix_nanos),
+                date: value
+                    .calendar_date_value()
+                    .map(|date| date.days_since_unix_epoch()),
+                period_scheme: period.map(|period| period.scheme().as_str().to_owned()),
+                period_year: period.map(|period| period.year()),
+                period_ordinal: period.map(|period| period.ordinal().get()),
+                period_code: period.map(|period| period.code().as_str().to_owned()),
+            }
         }
-        None => (None, None, None),
+        None => TemporalProjection {
+            precision: None,
+            timestamp: None,
+            date: None,
+            period_scheme: None,
+            period_year: None,
+            period_ordinal: None,
+            period_code: None,
+        },
     }
 }
 

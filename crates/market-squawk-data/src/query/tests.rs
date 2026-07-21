@@ -7,7 +7,8 @@ use arrow::record_batch::RecordBatch;
 use market_squawk_domain::{
     AvailabilityEvidence, DataQuality, DigestAlgorithm, EvidenceDigest, MacroObservation,
     PayloadReference, ResearchContext, ResearchObservation, ResearchProvenance,
-    ResearchProvenanceInput, ResearchTime, RevisionNumber, SourceId, SourceIdentifier, Timestamp,
+    ResearchProvenanceInput, ResearchTime, RevisionNumber, SchemaVersion, SourceId,
+    SourceIdentifier, Timestamp,
 };
 use rust_decimal::Decimal;
 use tokio_util::sync::CancellationToken;
@@ -16,6 +17,37 @@ use super::{QueryError, QueryLimits, QueryRequest, QueryResult, ResearchQueryEng
 use crate::{DatasetId, DatasetManifestRef, ResearchArrowBatch, Sha256Digest};
 
 type TestResult = Result<(), Box<dyn Error>>;
+
+#[test]
+fn query_artifact_identity_binds_exact_row_schema() -> TestResult {
+    let first = DatasetManifestRef::try_new(
+        DatasetId::try_from("fred-gdp")?,
+        7,
+        SchemaVersion::CURRENT,
+        Sha256Digest::new([7; 32]),
+    )?;
+    let second = DatasetManifestRef::try_new(
+        DatasetId::try_from("fred-gdp")?,
+        7,
+        SchemaVersion::new(2)?,
+        Sha256Digest::new([7; 32]),
+    )?;
+    let limits = QueryLimits::try_new(
+        2,
+        4096,
+        8 * 1024 * 1024,
+        1,
+        128,
+        128,
+        Duration::from_secs(1),
+    )?;
+
+    assert_ne!(
+        QueryRequest::try_new(first, "SELECT 1")?.artifact_identity(&limits),
+        QueryRequest::try_new(second, "SELECT 1")?.artifact_identity(&limits)
+    );
+    Ok(())
+}
 
 #[tokio::test]
 async fn query_service_allows_only_bounded_read_only_sql() -> TestResult {
@@ -160,6 +192,7 @@ fn manifest() -> Result<DatasetManifestRef, Box<dyn Error>> {
     Ok(DatasetManifestRef::try_new(
         DatasetId::try_from("fred-gdp")?,
         7,
+        SchemaVersion::CURRENT,
         Sha256Digest::new([7; 32]),
     )?)
 }

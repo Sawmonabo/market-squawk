@@ -88,7 +88,7 @@ pub use order::{
 pub use provenance::{
     AvailabilityEvidence, DecodedLiveProvenanceInput, LiveProvenance, LiveRecordState, PayloadHash,
     PayloadReference, ProvenanceError, RecordedLiveProvenanceInput, ResearchContext,
-    ResearchProvenance, ResearchProvenanceInput, ResearchTemporalCoordinate,
+    ResearchPeriod, ResearchProvenance, ResearchProvenanceInput, ResearchTemporalCoordinate,
     ResearchTemporalPrecision, ResearchTime, RevisionNumber,
 };
 pub use research::{

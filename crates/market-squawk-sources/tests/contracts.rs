@@ -7,8 +7,8 @@ use market_squawk_domain::{
     AuthorizationBasis, CalendarDate, CaptureIntegrityState, ChecksumCapability, CoverageDelay,
     DataQuality, DeliveryEvidence, DigestAlgorithm, EffectiveInterval, EvidenceDigest,
     ExactPayloadEvidence, MetadataRevision, ProviderChannel, ProviderProduct, RawCaptureFrameView,
-    ResearchTemporalCoordinate, RevisionBoundPayloadEvidence, SchemaVersion, SequenceCapability,
-    SourceId, StreamIntegrityState, Timestamp, VersionPinnedSourceLocator,
+    ResearchPeriod, ResearchTemporalCoordinate, RevisionBoundPayloadEvidence, SchemaVersion,
+    SequenceCapability, SourceId, StreamIntegrityState, Timestamp, VersionPinnedSourceLocator,
     checked_arc_bytes_allocation_bytes,
 };
 use market_squawk_sources::{
@@ -523,9 +523,9 @@ fn extraction_availability_retains_conservative_basis_and_inference_method() -> 
 fn extraction_identity_and_wire_preserve_calendar_date_precision() -> TestResult {
     let effective_date = CalendarDate::new(2026, 7, 1)?;
     let published_date = CalendarDate::new(2026, 7, 15)?;
-    let discovery = DiscoveryRequest::try_new_with_effective(
+    let discovery = DiscoveryRequest::try_new(
         source_identifier("macro-series")?,
-        Some(ResearchTemporalCoordinate::calendar_date(effective_date)),
+        None,
         NonZeroU16::try_from(1_u16)?,
         Timestamp::from_unix_nanos(100),
     )?;
@@ -573,14 +573,56 @@ fn extraction_identity_and_wire_preserve_calendar_date_precision() -> TestResult
         None,
         payload,
     )?;
+    let mut legacy_wire = serde_json::to_value(&exact_record)?;
+    let legacy_object = legacy_wire
+        .as_object_mut()
+        .ok_or("extraction record must serialize as an object")?;
+    legacy_object.remove("temporal_schema_version");
+    legacy_object.remove("effective_time");
+    legacy_object.remove("published_time");
+    legacy_object.remove("superseded_time");
+    legacy_object.insert(
+        "effective_at".to_owned(),
+        serde_json::json!(i64::from(effective_date.days_since_unix_epoch())),
+    );
+    legacy_object.insert(
+        "published_at".to_owned(),
+        serde_json::json!(i64::from(published_date.days_since_unix_epoch())),
+    );
+    legacy_object.insert("superseded_at".to_owned(), serde_json::Value::Null);
+    let restored_legacy: ExtractionRecord = serde_json::from_value(legacy_wire)?;
+    assert_eq!(
+        restored_legacy.effective_time().exact_timestamp(),
+        Some(Timestamp::from_unix_nanos(i64::from(
+            effective_date.days_since_unix_epoch()
+        )))
+    );
     let date_batch = ExtractionBatch::try_new(&request, vec![date_record])?;
     let exact_batch = ExtractionBatch::try_new(&request, vec![exact_record])?;
 
-    assert_ne!(
-        market_squawk_sources::ExtractionContentIdentity::try_from_batch(&date_batch)?,
-        market_squawk_sources::ExtractionContentIdentity::try_from_batch(&exact_batch)?
-    );
-    let restored: ExtractionBatch = serde_json::from_slice(&serde_json::to_vec(&date_batch)?)?;
+    let period = ResearchPeriod::try_new(
+        source_identifier("bls-monthly")?,
+        2026,
+        NonZeroU16::try_from(13_u16)?,
+        source_identifier("M13")?,
+    )?;
+    let period_record = ExtractionRecord::try_new_with_time(
+        &request,
+        source_identifier("schema-v2")?,
+        payload_evidence(DigestAlgorithm::Sha256, &Bytes::from_static(b"record")),
+        ResearchTemporalCoordinate::source_period(period.clone()),
+        None,
+        AvailabilityEvidence::Unknown,
+        source_identifier("revision-1")?,
+        None,
+        Bytes::from_static(b"record"),
+    )?;
+    let period_batch = ExtractionBatch::try_new(&request, vec![period_record])?;
+
+    let date_bytes = serde_json::to_vec(&date_batch)?;
+    let exact_bytes = serde_json::to_vec(&exact_batch)?;
+    assert_ne!(date_bytes, exact_bytes);
+    let restored: ExtractionBatch = serde_json::from_slice(&date_bytes)?;
     assert_eq!(
         restored.records()[0].effective_time().exact_timestamp(),
         None
@@ -590,6 +632,20 @@ fn extraction_identity_and_wire_preserve_calendar_date_precision() -> TestResult
         Some(effective_date)
     );
     assert_eq!(restored.records()[0].available_at(), None);
+    let restored_period: ExtractionBatch =
+        serde_json::from_slice(&serde_json::to_vec(&period_batch)?)?;
+    assert_eq!(
+        restored_period.records()[0]
+            .effective_time()
+            .source_period_value(),
+        Some(&period)
+    );
+    assert_eq!(
+        restored_period.records()[0]
+            .effective_time()
+            .calendar_date_value(),
+        None
+    );
     Ok(())
 }
 

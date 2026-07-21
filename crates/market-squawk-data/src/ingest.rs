@@ -73,6 +73,7 @@ impl CompactionRequest {
         digest.update((source.dataset_id().as_str().len() as u64).to_be_bytes());
         digest.update(source.dataset_id().as_str().as_bytes());
         digest.update(source.manifest_version().to_be_bytes());
+        digest.update(source.schema_version().get().to_be_bytes());
         digest.update(source.content_hash().bytes());
         Self {
             source,
@@ -584,6 +585,7 @@ impl AnalyticalDataService {
             request.payload_digest(),
             batches,
         )?;
+        let schema_version = compacted.schema_version()?;
         let _operation = self
             .operation_gate
             .acquire(&cancellation)
@@ -628,6 +630,7 @@ impl AnalyticalDataService {
             &reservation,
             run.state(),
             request.source().dataset_id(),
+            schema_version,
             &object,
         )? {
             return Ok(committed);
@@ -640,6 +643,7 @@ impl AnalyticalDataService {
             &reservation,
             run.state(),
             dataset_name,
+            schema_version,
             plan,
             published,
             GenerationKind::Compaction,
@@ -716,7 +720,10 @@ impl AnalyticalDataService {
             }
         }
         let converted = ResearchArrowBatch::try_from_extraction_batch(&batch)?;
+        let schema_version = converted.schema_version()?;
         let lineage = converted.lineage_digest()?;
+        self.manifests
+            .validate_append_schema(&dataset_id, schema_version)?;
         let _operation = self
             .operation_gate
             .acquire(&cancellation)
@@ -747,17 +754,25 @@ impl AnalyticalDataService {
 
         let authority = self.lock_authority()?;
         let run = self.validate_run(&authority, &reservation, payload_digest, Some(&source_id))?;
-        if let Some(committed) =
-            self.reconcile_existing(&authority, &reservation, run.state(), &dataset_id, &object)?
-        {
+        if let Some(committed) = self.reconcile_existing(
+            &authority,
+            &reservation,
+            run.state(),
+            &dataset_id,
+            schema_version,
+            &object,
+        )? {
             return Ok(committed);
         }
-        let plan = self.manifests.preview_append(dataset_id, object)?;
+        let plan = self
+            .manifests
+            .preview_append(dataset_id, schema_version, object)?;
         self.commit_plan(
             &authority,
             &reservation,
             run.state(),
             dataset_name,
+            schema_version,
             plan,
             published,
             GenerationKind::Ingest,
@@ -791,6 +806,7 @@ impl AnalyticalDataService {
         reservation: &IngestReservation,
         state: IngestRunState,
         dataset_id: &DatasetId,
+        schema_version: SchemaVersion,
         object: &ManifestObject,
     ) -> Result<Option<CommittedDataset>, IngestError> {
         let Some(existing) = self.manifests.for_run(reservation.run_id())? else {
@@ -801,6 +817,7 @@ impl AnalyticalDataService {
             };
         };
         if existing.manifest().dataset_id() != dataset_id
+            || existing.manifest().schema_version() != schema_version
             || existing.plan().objects().last() != Some(object)
         {
             return Err(IngestError::ReplayConflict);
@@ -825,6 +842,7 @@ impl AnalyticalDataService {
         reservation: &IngestReservation,
         state: IngestRunState,
         dataset_name: SourceIdentifier,
+        schema_version: SchemaVersion,
         plan: ManifestPlan,
         published: PublishedObject,
         kind: GenerationKind,
@@ -841,7 +859,7 @@ impl AnalyticalDataService {
         )?;
         let anchor = DatasetManifestRecord::try_new(
             dataset_name,
-            SchemaVersion::CURRENT,
+            schema_version,
             artifact.artifact_id(),
             plan.content_hash().evidence(),
             created_at,

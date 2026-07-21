@@ -1,9 +1,10 @@
 use std::error::Error;
+use std::num::NonZeroU16;
 use std::str::FromStr;
 
 use market_squawk_domain::{
     AvailabilityEvidence, CalendarDate, DataQuality, InstrumentId, PayloadReference,
-    ProvenanceError, ResearchContext, ResearchProvenance, ResearchProvenanceInput,
+    ProvenanceError, ResearchContext, ResearchPeriod, ResearchProvenance, ResearchProvenanceInput,
     ResearchTemporalCoordinate, ResearchTemporalPrecision, ResearchTime, RevisionNumber,
     SchemaVersion, SourceId, SourceIdentifier, Timestamp, VenueId,
 };
@@ -121,20 +122,22 @@ fn research_context_preserves_point_in_time_fields() -> Result<(), Box<dyn Error
 
     assert_eq!(
         context.time().effective(),
-        ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(50))
+        &ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(50))
     );
     assert_eq!(
-        context.time().published(),
-        Some(ResearchTemporalCoordinate::exact(
-            Timestamp::from_unix_nanos(90)
-        ))
+        context
+            .time()
+            .published()
+            .and_then(ResearchTemporalCoordinate::exact_timestamp),
+        Some(Timestamp::from_unix_nanos(90))
     );
     assert_eq!(context.time().revision().get(), 2);
     assert_eq!(
-        context.time().superseded(),
-        Some(ResearchTemporalCoordinate::exact(
-            Timestamp::from_unix_nanos(250)
-        ))
+        context
+            .time()
+            .superseded()
+            .and_then(ResearchTemporalCoordinate::exact_timestamp),
+        Some(Timestamp::from_unix_nanos(250))
     );
     Ok(())
 }
@@ -145,16 +148,16 @@ fn calendar_date_roundtrip_never_manufactures_an_intraday_instant() -> Result<()
     let effective = ResearchTemporalCoordinate::calendar_date(CalendarDate::new(2026, 7, 1)?);
     let published = ResearchTemporalCoordinate::calendar_date(CalendarDate::new(2026, 7, 15)?);
     let time = ResearchTime::try_new_with_coordinates(
-        effective,
-        Some(published),
+        effective.clone(),
+        Some(published.clone()),
         RevisionNumber::new(1)?,
         None,
     )?;
 
     let encoded = serde_json::to_vec(&time)?;
     let restored: ResearchTime = serde_json::from_slice(&encoded)?;
-    assert_eq!(restored.effective(), effective);
-    assert_eq!(restored.published(), Some(published));
+    assert_eq!(restored.effective(), &effective);
+    assert_eq!(restored.published(), Some(&published));
     assert_eq!(
         effective.precision(),
         ResearchTemporalPrecision::CalendarDate
@@ -165,8 +168,87 @@ fn calendar_date_roundtrip_never_manufactures_an_intraday_instant() -> Result<()
         Some(CalendarDate::new(2026, 7, 1)?)
     );
     let mut future = serde_json::to_value(time)?;
-    future["effective"]["schema_version"] = serde_json::json!(2);
+    future["effective"]["schema_version"] = serde_json::json!(3);
     assert!(serde_json::from_value::<ResearchTime>(future).is_err());
+    Ok(())
+}
+
+#[test]
+fn legacy_exact_research_time_decodes_without_precision_loss() -> Result<(), Box<dyn Error>> {
+    let legacy = serde_json::json!({
+        "effective_at": 50,
+        "published_at": 75,
+        "revision": 2,
+        "superseded_at": 100
+    });
+
+    let restored: ResearchTime = serde_json::from_value(legacy)?;
+
+    assert_eq!(
+        restored.effective().exact_timestamp(),
+        Some(Timestamp::from_unix_nanos(50))
+    );
+    assert_eq!(
+        restored
+            .published()
+            .and_then(ResearchTemporalCoordinate::exact_timestamp),
+        Some(Timestamp::from_unix_nanos(75))
+    );
+    assert_eq!(restored.revision().get(), 2);
+    assert_eq!(
+        restored
+            .superseded()
+            .and_then(ResearchTemporalCoordinate::exact_timestamp),
+        Some(Timestamp::from_unix_nanos(100))
+    );
+    Ok(())
+}
+
+#[test]
+fn research_time_rejects_incomparable_supersession_precision() -> Result<(), Box<dyn Error>> {
+    let result = ResearchTime::try_new_with_coordinates(
+        ResearchTemporalCoordinate::calendar_date(CalendarDate::new(2026, 7, 1)?),
+        Some(ResearchTemporalCoordinate::calendar_date(
+            CalendarDate::new(2026, 7, 2)?,
+        )),
+        RevisionNumber::new(1)?,
+        Some(ResearchTemporalCoordinate::exact(
+            Timestamp::from_unix_nanos(100),
+        )),
+    );
+
+    assert!(matches!(
+        result,
+        Err(ProvenanceError::SupersededNotAfterPublished)
+    ));
+    Ok(())
+}
+
+#[test]
+fn provider_period_roundtrip_never_manufactures_a_calendar_day() -> Result<(), Box<dyn Error>> {
+    let period = ResearchPeriod::try_new(
+        SourceIdentifier::try_from("bls-monthly")?,
+        2026,
+        NonZeroU16::try_from(13_u16)?,
+        SourceIdentifier::try_from("M13")?,
+    )?;
+    let effective = ResearchTemporalCoordinate::source_period(period.clone());
+    let time = ResearchTime::try_new_with_coordinates(
+        effective.clone(),
+        None,
+        RevisionNumber::new(1)?,
+        None,
+    )?;
+
+    let restored: ResearchTime = serde_json::from_slice(&serde_json::to_vec(&time)?)?;
+    assert_eq!(restored.effective(), &effective);
+    assert_eq!(restored.effective().exact_timestamp(), None);
+    assert_eq!(restored.effective().calendar_date_value(), None);
+    assert_eq!(restored.effective().source_period_value(), Some(&period));
+    assert_eq!(period.scheme().as_str(), "bls-monthly");
+    assert_eq!(period.year(), 2026);
+    assert_eq!(period.ordinal().get(), 13);
+    assert_eq!(period.code().as_str(), "M13");
     Ok(())
 }
 

@@ -35,7 +35,7 @@ pub struct DiscoveryRequestId(EvidenceDigest);
 #[serde(deny_unknown_fields)]
 pub struct DiscoveryRequest {
     dataset: SourceIdentifier,
-    effective: Option<ResearchTemporalCoordinate>,
+    effective_at: Option<Timestamp>,
     max_results: NonZeroU16,
     deadline: Timestamp,
     request_id: DiscoveryRequestId,
@@ -53,25 +53,6 @@ impl DiscoveryRequest {
         max_results: NonZeroU16,
         deadline: Timestamp,
     ) -> Result<Self, ExtractionError> {
-        Self::try_new_with_effective(
-            dataset,
-            effective_at.map(ResearchTemporalCoordinate::exact),
-            max_results,
-            deadline,
-        )
-    }
-
-    /// Constructs a bounded request while retaining exact or calendar-date source precision.
-    ///
-    /// # Errors
-    ///
-    /// Rejects a result cap above [`MAX_DISCOVERY_OBJECTS`].
-    pub fn try_new_with_effective(
-        dataset: SourceIdentifier,
-        effective: Option<ResearchTemporalCoordinate>,
-        max_results: NonZeroU16,
-        deadline: Timestamp,
-    ) -> Result<Self, ExtractionError> {
         if usize::from(max_results.get()) > MAX_DISCOVERY_OBJECTS {
             return Err(ExtractionError::LimitTooLarge {
                 field: "max_results",
@@ -79,10 +60,10 @@ impl DiscoveryRequest {
             });
         }
         let dataset = normalize_identifier(&dataset)?;
-        let request_id = discovery_request_id(&dataset, effective, max_results, deadline);
+        let request_id = discovery_request_id(&dataset, effective_at, max_results, deadline);
         Ok(Self {
             dataset,
-            effective,
+            effective_at,
             max_results,
             deadline,
             request_id,
@@ -104,9 +85,9 @@ impl DiscoveryRequest {
         &self.dataset
     }
 
-    /// Returns the optional point-in-time discovery coordinate without precision loss.
-    pub const fn effective_at(&self) -> Option<ResearchTemporalCoordinate> {
-        self.effective
+    /// Returns the optional point-in-time discovery instant.
+    pub const fn effective_at(&self) -> Option<Timestamp> {
+        self.effective_at
     }
 
     /// Returns operation deadline.
@@ -119,7 +100,7 @@ impl DiscoveryRequest {
 #[serde(deny_unknown_fields)]
 struct DiscoveryRequestWire {
     dataset: SourceIdentifier,
-    effective: Option<ResearchTemporalCoordinate>,
+    effective_at: Option<Timestamp>,
     max_results: NonZeroU16,
     deadline: Timestamp,
     request_id: DiscoveryRequestId,
@@ -131,9 +112,9 @@ impl<'de> Deserialize<'de> for DiscoveryRequest {
         D: Deserializer<'de>,
     {
         let wire = DiscoveryRequestWire::deserialize(deserializer)?;
-        let rebuilt = Self::try_new_with_effective(
+        let rebuilt = Self::try_new(
             wire.dataset,
-            wire.effective,
+            wire.effective_at,
             wire.max_results,
             wire.deadline,
         )

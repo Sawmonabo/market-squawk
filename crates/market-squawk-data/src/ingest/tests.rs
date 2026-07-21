@@ -2,18 +2,42 @@
 
 use std::time::Duration;
 
+use market_squawk_domain::SchemaVersion;
 use market_squawk_platform::LocalPaths;
 use rusqlite::{Connection, params};
 
-use super::{AnalyticalDataService, IngestError};
+use super::{AnalyticalDataService, CompactionRequest, IngestError};
 use crate::authority_transition::{AuthorityTransitionService, FirstBindCheckpoint};
 use crate::migrations::MIGRATIONS;
 use crate::{
     AnalyticalManifestCatalog, CatalogAuthority, CatalogConfig, CatalogError, CatalogLimit,
-    CatalogResultLimits, ObjectStoreConfig, ParquetObjectStore,
+    CatalogResultLimits, DatasetId, DatasetManifestRef, ObjectStoreConfig, ParquetObjectStore,
+    Sha256Digest,
 };
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+#[test]
+fn compaction_identity_binds_exact_source_schema() -> TestResult {
+    let source_v1 = DatasetManifestRef::try_new(
+        DatasetId::try_from("fred-gdp")?,
+        4,
+        SchemaVersion::CURRENT,
+        Sha256Digest::new([7; 32]),
+    )?;
+    let source_v2 = DatasetManifestRef::try_new(
+        DatasetId::try_from("fred-gdp")?,
+        4,
+        SchemaVersion::new(2)?,
+        Sha256Digest::new([7; 32]),
+    )?;
+
+    assert_ne!(
+        CompactionRequest::new(source_v1).payload_digest(),
+        CompactionRequest::new(source_v2).payload_digest()
+    );
+    Ok(())
+}
 
 #[test]
 fn ordinary_open_does_not_implicitly_initialize_authority() -> TestResult {

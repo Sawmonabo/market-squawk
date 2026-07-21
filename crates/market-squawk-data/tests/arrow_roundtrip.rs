@@ -1,19 +1,20 @@
 use std::error::Error;
+use std::num::NonZeroU16;
 
 use std::sync::Arc;
 
 use arrow::array::{
     Array as _, ArrayRef, Date32Array, Decimal128Array, StringArray, TimestampNanosecondArray,
-    UInt8Array,
+    UInt8Array, UInt16Array,
 };
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use market_squawk_data::{ArrowConversionError, ResearchArrowBatch};
 use market_squawk_domain::{
     AvailabilityEvidence, CalendarDate, DataQuality, DigestAlgorithm, EvidenceDigest,
-    MacroObservation, PayloadReference, ResearchContext, ResearchObservation, ResearchProvenance,
-    ResearchProvenanceInput, ResearchTemporalCoordinate, ResearchTime, RevisionNumber, SourceId,
-    SourceIdentifier, Timestamp,
+    MacroObservation, PayloadReference, ResearchContext, ResearchObservation, ResearchPeriod,
+    ResearchProvenance, ResearchProvenanceInput, ResearchTemporalCoordinate, ResearchTime,
+    RevisionNumber, SourceId, SourceIdentifier, Timestamp,
 };
 use rust_decimal::Decimal;
 
@@ -100,6 +101,52 @@ fn arrow_roundtrip_preserves_calendar_precision_without_intraday_availability() 
         published.days_since_unix_epoch()
     );
     assert!(timestamp_column(batch, "available_at")?.is_null(0));
+    assert_eq!(converted.observations()?, expected);
+    Ok(())
+}
+
+#[test]
+fn arrow_roundtrip_preserves_provider_period_without_fabricated_day() -> TestResult {
+    let period = ResearchPeriod::try_new(
+        SourceIdentifier::try_from("bls-monthly")?,
+        2026,
+        NonZeroU16::try_from(13_u16)?,
+        SourceIdentifier::try_from("M13")?,
+    )?;
+    let observation = macro_observation_with_time(
+        Decimal::new(1, 0),
+        AvailabilityEvidence::unknown(),
+        ResearchTime::try_new_with_coordinates(
+            ResearchTemporalCoordinate::source_period(period.clone()),
+            None,
+            RevisionNumber::new(1)?,
+            None,
+        )?,
+    )?;
+    let expected = vec![observation];
+    let converted = ResearchArrowBatch::try_from_observations(
+        SourceIdentifier::try_from("bls-cpi")?,
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [7; 32]),
+        expected.clone(),
+    )?;
+    let batch = converted.record_batch();
+
+    assert_eq!(
+        string_column(batch, "effective_precision")?.value(0),
+        "source_period"
+    );
+    assert!(timestamp_column(batch, "effective_at")?.is_null(0));
+    assert!(date_column(batch, "effective_date")?.is_null(0));
+    assert_eq!(
+        string_column(batch, "effective_period_scheme")?.value(0),
+        "bls-monthly"
+    );
+    assert_eq!(u16_column(batch, "effective_period_year")?.value(0), 2026);
+    assert_eq!(u16_column(batch, "effective_period_ordinal")?.value(0), 13);
+    assert_eq!(
+        string_column(batch, "effective_period_code")?.value(0),
+        "M13"
+    );
     assert_eq!(converted.observations()?, expected);
     Ok(())
 }
@@ -229,6 +276,13 @@ fn date_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a Date32Array
         .column_by_name(name)
         .and_then(|array| array.as_any().downcast_ref::<Date32Array>())
         .ok_or_else(|| format!("missing date column {name}").into())
+}
+
+fn u16_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a UInt16Array, Box<dyn Error>> {
+    batch
+        .column_by_name(name)
+        .and_then(|array| array.as_any().downcast_ref::<UInt16Array>())
+        .ok_or_else(|| format!("missing u16 column {name}").into())
 }
 
 fn macro_observation(value: Decimal) -> Result<ResearchObservation, Box<dyn Error>> {
