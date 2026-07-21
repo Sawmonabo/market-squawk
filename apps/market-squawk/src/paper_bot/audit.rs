@@ -82,7 +82,7 @@ impl ProductionAuditService {
     }
 
     pub(super) async fn shutdown(
-        mut self,
+        self,
         deadline: tokio::time::Instant,
         producers_complete: bool,
     ) -> ProductionAuditShutdown {
@@ -92,17 +92,23 @@ impl ProductionAuditService {
                 self,
             );
         }
-        if let Err(error) = self.control.try_send(AuditControl::Stop) {
-            return ProductionAuditShutdown::with_owner(
-                match error {
-                    mpsc::TrySendError::Full(_) => ProductionAuditShutdownStatus::ControlSaturated,
-                    mpsc::TrySendError::Disconnected(_) => {
-                        ProductionAuditShutdownStatus::ControlUnavailable
-                    }
-                },
-                self,
-            );
+        if self
+            .worker
+            .as_ref()
+            .is_some_and(|worker| worker.is_finished())
+        {
+            return self.join_worker(deadline).await;
         }
+        match self.control.try_send(AuditControl::Stop) {
+            Ok(()) | Err(mpsc::TrySendError::Disconnected(_)) => self.join_worker(deadline).await,
+            Err(mpsc::TrySendError::Full(_)) => ProductionAuditShutdown::with_owner(
+                ProductionAuditShutdownStatus::ControlSaturated,
+                self,
+            ),
+        }
+    }
+
+    async fn join_worker(mut self, deadline: tokio::time::Instant) -> ProductionAuditShutdown {
         let Some(worker) = self.worker.take() else {
             return ProductionAuditShutdown::new(ProductionAuditShutdownStatus::Panicked);
         };
@@ -503,3 +509,34 @@ fn configure_private_creation(options: &mut OpenOptions) {
 
 #[cfg(not(unix))]
 fn configure_private_creation(_options: &mut OpenOptions) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn shutdown_joins_a_naturally_completed_worker_before_sending_stop() {
+        let expected = ProductionAuditEvidence {
+            execution_records: 7,
+            paper_records: 11,
+        };
+        let (control, commands) = mpsc::sync_channel(1);
+        drop(commands);
+        let worker = thread::spawn(move || Ok(expected));
+        let started_waiting = Instant::now();
+        while !worker.is_finished() && started_waiting.elapsed() < Duration::from_secs(1) {
+            thread::yield_now();
+        }
+        assert!(worker.is_finished());
+
+        let service = ProductionAuditService {
+            control,
+            worker: Some(worker),
+            drop_deadline: Duration::from_secs(1),
+        };
+        let shutdown = service.shutdown(tokio::time::Instant::now(), true).await;
+
+        assert!(shutdown.is_complete());
+        assert_eq!(shutdown.evidence(), Some(expected));
+    }
+}
