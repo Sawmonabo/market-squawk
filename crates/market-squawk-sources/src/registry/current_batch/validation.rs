@@ -88,6 +88,12 @@ pub enum RegistryError {
     /// Source was explicitly revoked.
     #[error("source registration is revoked")]
     SourceRevoked,
+    /// The adapter's immutable metadata did not exactly match the registered revision.
+    #[error("extraction adapter metadata does not match registered source metadata")]
+    AdapterMetadataMismatch,
+    /// The registered source does not declare extraction capability.
+    #[error("source metadata does not declare extraction capability")]
+    ExtractionNotSupported,
     /// Metadata replacement did not change revision identity.
     #[error("metadata revision must advance")]
     RevisionNotAdvanced,

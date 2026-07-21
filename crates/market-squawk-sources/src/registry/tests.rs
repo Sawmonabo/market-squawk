@@ -38,7 +38,7 @@ mod tests {
     use crate::registry::test_support::{
         TestResult, direct_metadata, direct_metadata_with_provider_and_limit,
         direct_metadata_with_quality, direct_metadata_with_revision_evidence, exact_evidence,
-        freshness_policy, healthy_snapshot, source_identifier,
+        extraction_metadata, freshness_policy, healthy_snapshot, source_identifier,
     };
 
     #[derive(Clone, Copy, Debug)]
@@ -794,6 +794,7 @@ mod tests {
     }
 
     include!("tests/temporal_cases.rs");
+    include!("tests/extraction_authority.rs");
     mod time_cases {
         use super::*;
 

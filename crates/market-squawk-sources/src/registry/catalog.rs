@@ -21,6 +21,7 @@ impl Drop for AuthoritativeSourceRegistry {
         // Registry lifetime is an authority dimension. Retained session, capture, frame, and
         // pre-feed handles must fail closed once their sole authoritative owner exits.
         for entry in self.entries.values_mut() {
+            entry.registration_lease.invalidate();
             if let Some(active) = entry.active.take() {
                 active.lease.invalidate();
                 active.capture.mark_incomplete();
@@ -135,12 +136,14 @@ impl AuthoritativeSourceRegistry {
         let source_id = metadata.source_id().clone();
         let revision = metadata.revision().clone();
         self.history = candidate_history;
+        let registration_lease = Arc::new(RegistrationLeaseState::new());
         self.entries.insert(
             source_id.clone(),
             RegistryEntry {
                 metadata,
                 epoch,
                 revoked: false,
+                registration_lease: Arc::clone(&registration_lease),
                 active: None,
                 health_authority: None,
                 universe_attestation: None,
@@ -154,6 +157,7 @@ impl AuthoritativeSourceRegistry {
             revision,
             epoch,
             budget,
+            lease: registration_lease,
         })
     }
 
@@ -248,12 +252,14 @@ impl AuthoritativeSourceRegistry {
             }
         };
         self.history = candidate_history;
+        let registration_lease = Arc::new(RegistrationLeaseState::new());
         self.entries.insert(
             source_id.clone(),
             RegistryEntry {
                 metadata,
                 epoch,
                 revoked: false,
+                registration_lease: Arc::clone(&registration_lease),
                 active: None,
                 health_authority: None,
                 universe_attestation: None,
@@ -267,6 +273,7 @@ impl AuthoritativeSourceRegistry {
             revision,
             epoch,
             budget,
+            lease: registration_lease,
         })
     }
 
@@ -341,11 +348,14 @@ impl AuthoritativeSourceRegistry {
             .entries
             .get_mut(&registered.source_id)
             .ok_or(RegistryError::UnknownSource)?;
+        entry.registration_lease.invalidate();
+        let registration_lease = Arc::new(RegistrationLeaseState::new());
         entry.metadata = metadata;
         entry.health_authority = None;
         entry.universe_attestation = None;
         entry.used_revisions.push(revision.clone());
         entry.epoch = epoch;
+        entry.registration_lease = Arc::clone(&registration_lease);
         if let Some(active) = entry.active.take() {
             active.lease.invalidate();
             active.capture.mark_incomplete();
@@ -357,6 +367,7 @@ impl AuthoritativeSourceRegistry {
             revision,
             epoch,
             budget,
+            lease: registration_lease,
         })
     }
 
@@ -739,6 +750,7 @@ impl AuthoritativeSourceRegistry {
         self.history = candidate_history;
         entry.epoch = revoked_epoch;
         entry.revoked = true;
+        entry.registration_lease.invalidate();
         if let Some(active) = entry.active.take() {
             active.lease.invalidate();
             active.capture.mark_incomplete();

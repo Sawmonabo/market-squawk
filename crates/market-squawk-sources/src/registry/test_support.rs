@@ -38,6 +38,65 @@ pub(super) fn direct_metadata(source: &str, revision: &str) -> TestResult<Source
     direct_metadata_with_provider_and_limit(source, revision, source, 10)
 }
 
+pub(super) fn extraction_metadata(
+    source: &str,
+    revision: &str,
+    requests_per_window: u32,
+) -> TestResult<SourceMetadata> {
+    let source_id = SourceId::try_from(source)?;
+    let revision = MetadataRevision::new(source_identifier(revision)?);
+    let effective = EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?;
+    let authorization = AuthorizationGrant::new(
+        AuthorizationMode::PublicInterface,
+        AuthorizationBasis::new(source_identifier("public-interface-terms-v1")?),
+        exact_evidence(41),
+        effective,
+    );
+    let coverage = SourceCoverage::try_non_instrument(
+        exact_evidence(42),
+        effective,
+        crate::CoverageDomain::Macroeconomic,
+        CoverageDelay::Delayed(1),
+        DeliveryEvidence::DirectVenue,
+    )?;
+    let provider = source_identifier(source)?;
+    let budget = ProviderBudgetPolicy::try_new(
+        BudgetScope::for_authorization(provider.clone(), &authorization)?,
+        NonZeroU32::new(requests_per_window).ok_or("test request budget must be nonzero")?,
+        NonZeroU64::new(60_000_000_000).ok_or("test budget window must be nonzero")?,
+        NonZeroU16::new(1).ok_or("test concurrency budget must be nonzero")?,
+        BackoffPolicy::try_new(
+            NonZeroU64::new(1_000_000).ok_or("test backoff must be nonzero")?,
+            NonZeroU64::new(60_000_000_000).ok_or("test backoff cap must be nonzero")?,
+            1_000,
+        )?,
+    )?;
+    Ok(SourceMetadata::try_new(SourceMetadataInput::new(
+        SchemaVersion::CURRENT,
+        source_id,
+        RevisionBoundPayloadEvidence::new(revision, exact_evidence(43)),
+        SourceClass::OfficialAgency,
+        provider,
+        authorization,
+        coverage,
+        DataQuality::OfficialDelayed,
+        NetworkAccessPolicy::Allowlisted(EndpointPolicy::try_new([
+            "https://api.source.test/data",
+        ])?),
+        freshness_policy()?,
+        Some(budget),
+        SourceCapabilities::new(
+            false,
+            true,
+            SequenceCapability::Unsupported,
+            ChecksumCapability::Unsupported,
+            HistoricalCapability::RevisionPreserving,
+            false,
+        ),
+        SourceProtocolProfile::NotLive,
+    ))?)
+}
+
 pub(super) fn direct_metadata_with_revision_evidence(
     source: &str,
     revision: &str,

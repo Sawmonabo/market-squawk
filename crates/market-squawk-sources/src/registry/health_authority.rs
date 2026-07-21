@@ -229,6 +229,8 @@ impl AuthoritativeSourceRegistry {
         if entry.epoch != registered.epoch
             || entry.metadata.revision() != &registered.revision
             || entry.metadata.source_id() != &registered.source_id
+            || !Arc::ptr_eq(&entry.registration_lease, &registered.lease)
+            || !entry.registration_lease.is_current()
         {
             return Err(RegistryError::StaleHandle);
         }

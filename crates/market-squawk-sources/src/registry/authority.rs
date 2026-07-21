@@ -67,6 +67,141 @@ pub struct RegisteredSource {
     revision: MetadataRevision,
     epoch: u64,
     budget: Option<SharedProviderBudget>,
+    lease: Arc<RegistrationLeaseState>,
+}
+
+/// Cloneable, non-serializable authority for one exact registered extraction revision.
+///
+/// The authority is minted only after the registry binds an adapter's immutable metadata to the
+/// current registration. Every operation rechecks the registry lease, sealed trusted time,
+/// authorization and coverage before provider-budget or network admission.
+#[derive(Clone)]
+pub struct ExtractionAuthority {
+    metadata: Arc<SourceMetadata>,
+    lease: Arc<RegistrationLeaseState>,
+    clock: Arc<SealedRegistryClock>,
+    budget: Option<SharedProviderBudget>,
+}
+
+impl std::fmt::Debug for ExtractionAuthority {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExtractionAuthority")
+            .field("source_id", self.metadata.source_id())
+            .field("revision", self.metadata.revision())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ExtractionAuthority {
+    /// Returns the exact metadata revision bound to this authority.
+    pub fn metadata(&self) -> &SourceMetadata {
+        &self.metadata
+    }
+
+    /// Revalidates registration currentness and effective authorization/coverage using sealed time.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed after metadata replacement, revocation, registry drop, effective-time expiry,
+    /// or trusted-time discontinuity.
+    pub fn validate_current(&self) -> Result<(), crate::ExtractionAuthorityError> {
+        if !self.lease.is_current() {
+            return Err(crate::ExtractionAuthorityError::NotCurrent);
+        }
+        let observed = self.clock.observe().map_err(|error| match error {
+            RegistryError::TrustedClockUnavailable => {
+                crate::ExtractionAuthorityError::TrustedTimeUnavailable
+            }
+            RegistryError::TrustedClockRegression | RegistryError::AuthorityTimeDiscontinuous => {
+                crate::ExtractionAuthorityError::TrustedTimeDiscontinuous
+            }
+            _ => crate::ExtractionAuthorityError::TrustedTimeDiscontinuous,
+        })?;
+        if !self.lease.is_current() {
+            return Err(crate::ExtractionAuthorityError::NotCurrent);
+        }
+        if !self.metadata.is_effective_at(observed.wall()) {
+            return Err(crate::ExtractionAuthorityError::NotEffective);
+        }
+        Ok(())
+    }
+
+    /// Atomically authorizes an exact target and reserves the registry-coordinated request budget.
+    ///
+    /// The returned permit retains this authority and must be revalidated during paged or streamed
+    /// I/O. Dropping it releases concurrency while preserving request-window consumption.
+    ///
+    /// # Errors
+    ///
+    /// Rejects stale authority, denied targets, absent budget authority, and every shared-budget
+    /// wait or terminal state without performing network I/O.
+    pub fn try_network_request(
+        &self,
+        target: &str,
+    ) -> Result<crate::ExtractionRequestPermit, crate::ExtractionAuthorityError> {
+        self.validate_current()?;
+        let endpoint_policy = match self.metadata.network_policy() {
+            crate::NetworkAccessPolicy::Allowlisted(policy) => policy,
+            crate::NetworkAccessPolicy::Denied => {
+                return Err(crate::ExtractionAuthorityError::NetworkDenied);
+            }
+        };
+        let authorization = endpoint_policy
+            .authorize_request(target)
+            .map_err(crate::ExtractionAuthorityError::NetworkPolicy)?;
+        let budget = self
+            .budget
+            .as_ref()
+            .ok_or(crate::ExtractionAuthorityError::BudgetNotConfigured)?;
+        let budget_permit = match budget.try_acquire() {
+            crate::BudgetDecision::Ready(permit) => permit,
+            crate::BudgetDecision::WaitUntil(deadline) => {
+                return Err(crate::ExtractionAuthorityError::BudgetWaitUntil { deadline });
+            }
+            crate::BudgetDecision::Unavailable(reason) => {
+                return Err(crate::ExtractionAuthorityError::BudgetUnavailable { reason });
+            }
+        };
+        self.validate_current()?;
+        Ok(crate::ExtractionRequestPermit::new(
+            self.clone(),
+            authorization,
+            budget_permit,
+        ))
+    }
+}
+
+impl AuthoritativeSourceRegistry {
+    /// Mints extraction authority for an exact current registration and adapter metadata identity.
+    ///
+    /// # Errors
+    ///
+    /// Rejects stale/transplanted registration handles, non-extraction sources, adapter metadata
+    /// mismatch, ineffective metadata, or unavailable trusted time.
+    pub fn extraction_authority(
+        &self,
+        registered: &RegisteredSource,
+        adapter: &dyn crate::SourceMetadataProvider,
+    ) -> Result<ExtractionAuthority, RegistryError> {
+        let entry = self.validate_registered_structure(registered)?;
+        if !entry.metadata.capabilities().extraction() {
+            return Err(RegistryError::ExtractionNotSupported);
+        }
+        if adapter.metadata() != &entry.metadata {
+            return Err(RegistryError::AdapterMetadataMismatch);
+        }
+        let observed = self.clock.observe()?;
+        if !entry.metadata.is_effective_at(observed.wall()) {
+            return Err(RegistryError::MetadataNotEffective);
+        }
+        Ok(ExtractionAuthority {
+            metadata: Arc::new(entry.metadata.clone()),
+            lease: Arc::clone(&entry.registration_lease),
+            clock: Arc::clone(&self.clock),
+            budget: registered.budget.clone(),
+        })
+    }
 }
 
 impl RegisteredSource {
@@ -80,8 +215,24 @@ impl RegisteredSource {
         &self.revision
     }
 
-    /// Returns the registry-coordinated shared provider budget when networking is enabled.
-    pub const fn budget(&self) -> Option<&SharedProviderBudget> {
+    /// Returns whether this registration retained a coordinated provider budget.
+    pub const fn has_provider_budget(&self) -> bool {
+        self.budget.is_some()
+    }
+
+    /// Reports whether two current registration handles share one coordinated allocation.
+    ///
+    /// This comparison exposes no request-admission capability.
+    pub fn shares_provider_budget_with(&self, other: &Self) -> Option<bool> {
+        Some(
+            self.budget
+                .as_ref()?
+                .shares_allocation_with(other.budget.as_ref()?),
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) const fn budget(&self) -> Option<&SharedProviderBudget> {
         self.budget.as_ref()
     }
 }

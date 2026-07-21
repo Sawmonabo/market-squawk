@@ -52,11 +52,12 @@ pub use decoder::{
     ProviderTimestampEvidence, QuarantineReason, ResynchronizationReason,
 };
 pub use extraction::{
-    AvailabilityEvidence, DiscoveryBatch, DiscoveryRequest, DiscoveryRequestId, ExtractionBatch,
-    ExtractionError, ExtractionRecord, ExtractionRequest, ExtractionRequestId, ExtractionSource,
-    ExtractionSourceError, MAX_DISCOVERY_OBJECTS, MAX_EXTRACTION_BATCH_BYTES,
-    MAX_EXTRACTION_RECORD_BYTES, MAX_EXTRACTION_RECORDS, MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES,
-    SourceObject, payload_matches_exact_evidence,
+    AvailabilityEvidence, DiscoveryBatch, DiscoveryRequest, DiscoveryRequestId,
+    ExtractionAuthorityError, ExtractionBatch, ExtractionError, ExtractionRecord,
+    ExtractionRedirectPermit, ExtractionRequest, ExtractionRequestId, ExtractionRequestPermit,
+    ExtractionSource, ExtractionSourceError, InFlightExtractionRequest, MAX_DISCOVERY_OBJECTS,
+    MAX_EXTRACTION_BATCH_BYTES, MAX_EXTRACTION_RECORD_BYTES, MAX_EXTRACTION_RECORDS,
+    MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES, SourceObject, payload_matches_exact_evidence,
 };
 pub use health::{
     AuthorizationHealth, BudgetHealth, ConnectionLiveness, CoverageHealth, HealthErrorClass,
@@ -89,7 +90,7 @@ pub use registry::{
     CurrentBatchIter, CurrentBatchKey, CurrentCoveragePolicy, CurrentDecodedProviderBatch,
     CurrentDecodedProviderBatches, CurrentFrameEvidence, CurrentHealthReporter,
     CurrentHealthUpdate, CurrentLivePolicy, CurrentObservationIter, CurrentProviderObservation,
-    CurrentSourceAuthorityLease, CurrentSourceSession, CurrentStreamKey,
+    CurrentSourceAuthorityLease, CurrentSourceSession, CurrentStreamKey, ExtractionAuthority,
     InstrumentUniverseAttestation, LiveSourceGeneration, RawFrameFactory, RegisteredSource,
     RegistryAuthorityState, RegistryError, SessionControlDisposition, SessionIgnoredDisposition,
     SessionQuarantineDisposition, SessionRecoveryDisposition, ValidatedCurrentSourceAuthority,

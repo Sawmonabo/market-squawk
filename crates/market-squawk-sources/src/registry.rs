@@ -59,6 +59,27 @@ struct SessionLeaseState {
     started_at: TrustedRegistryTime,
 }
 
+#[derive(Debug)]
+struct RegistrationLeaseState {
+    current: AtomicBool,
+}
+
+impl RegistrationLeaseState {
+    fn new() -> Self {
+        Self {
+            current: AtomicBool::new(true),
+        }
+    }
+
+    fn invalidate(&self) {
+        self.current.store(false, Ordering::Release);
+    }
+
+    fn is_current(&self) -> bool {
+        self.current.load(Ordering::Acquire)
+    }
+}
+
 impl SessionLeaseState {
     fn invalidate(&self) {
         self.current.store(false, Ordering::Release);
@@ -238,6 +259,7 @@ struct RegistryEntry {
     metadata: SourceMetadata,
     epoch: u64,
     revoked: bool,
+    registration_lease: Arc<RegistrationLeaseState>,
     active: Option<ActiveSessionKey>,
     health_authority: Option<CurrentHealthAuthority>,
     universe_attestation: Option<InstrumentUniverseAttestation>,

@@ -101,6 +101,7 @@ impl EndpointPolicy {
         if url.query().is_none() && self.endpoints.as_slice().contains(&normalized) {
             return Ok(AuthorizedRequest {
                 contains_sensitive_query: false,
+                target_sha256: Sha256::digest(target.as_bytes()).into(),
             });
         }
         for rule in self.api_rules.as_slice() {
@@ -108,6 +109,7 @@ impl EndpointPolicy {
                 Ok(contains_sensitive_query) => {
                     return Ok(AuthorizedRequest {
                         contains_sensitive_query,
+                        target_sha256: Sha256::digest(target.as_bytes()).into(),
                     });
                 }
                 Err(NetworkPolicyError::EndpointDenied { .. }) => {}
@@ -228,15 +230,29 @@ fn endpoint_text_is_ambiguous(value: &str) -> bool {
 }
 
 /// Redacted result of final target authorization.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct AuthorizedRequest {
     contains_sensitive_query: bool,
+    target_sha256: [u8; 32],
+}
+
+impl std::fmt::Debug for AuthorizedRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthorizedRequest")
+            .field("contains_sensitive_query", &self.contains_sensitive_query)
+            .finish_non_exhaustive()
+    }
 }
 
 impl AuthorizedRequest {
     /// Returns whether an allowlisted secret query key was present, never its value.
     pub const fn contains_sensitive_query(self) -> bool {
         self.contains_sensitive_query
+    }
+
+    pub(crate) fn matches_exact_target(self, target: &str) -> bool {
+        self.target_sha256 == <[u8; 32]>::from(Sha256::digest(target.as_bytes()))
     }
 }
 

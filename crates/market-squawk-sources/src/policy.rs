@@ -7,6 +7,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use market_squawk_domain::{SourceIdentifier, Timestamp};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use url::Url;
 

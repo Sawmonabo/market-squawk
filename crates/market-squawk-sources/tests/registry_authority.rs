@@ -17,8 +17,8 @@ use market_squawk_sources::{
     AuthoritativeSourceRegistry, AuthorizationHealth, AuthorizationMode,
     AuthorizationSubjectResolutionError, AuthorizationSubjectResolver, BudgetDecision,
     BudgetHealth, ConnectionLiveness, CoverageHealth, FreshnessPolicy, RawMarketFrame,
-    RegistryAuthorityState, RegistryError, RetryAfter, SessionId, SourceHealthSnapshot,
-    TransportFrameKind,
+    RegisteredSource, RegistryAuthorityState, RegistryError, RetryAfter, SessionId,
+    SharedProviderBudget, SourceHealthSnapshot, TransportFrameKind,
 };
 use static_assertions::{assert_impl_all, assert_not_impl_any};
 
@@ -94,6 +94,24 @@ fn direct_metadata_for_provider(
         .ok_or("source metadata allowlist was absent")?;
     network.insert("endpoints".to_owned(), serde_json::json!([endpoint]));
     Ok(serde_json::from_value(wire)?)
+}
+
+fn take_live_budget(
+    registry: &mut AuthoritativeSourceRegistry,
+    registered: &RegisteredSource,
+    label: &str,
+) -> TestResult<SharedProviderBudget> {
+    let session = registry.begin_next_session(
+        registered,
+        SessionId::new(source_identifier(label)?),
+        Timestamp::from_unix_nanos(1),
+    )?;
+    let budget = session
+        .budget()
+        .ok_or("live session budget missing")?
+        .clone();
+    registry.end_session(&session, Timestamp::from_unix_nanos(2))?;
+    Ok(budget)
 }
 
 type RemoteAuthorizationAlias<'a> = (&'a str, u8, Option<(&'a str, &'a str)>);
@@ -497,8 +515,8 @@ fn two_sources_with_one_scope_share_concurrency_and_cooldown() -> TestResult {
         direct_metadata("source-b", "rev-b", 0, None)?,
         Timestamp::from_unix_nanos(1),
     )?;
-    let first_budget = first.budget().ok_or("missing first budget")?;
-    let second_budget = second.budget().ok_or("missing second budget")?;
+    let first_budget = take_live_budget(&mut registry, &first, "shared-budget-first")?;
+    let second_budget = take_live_budget(&mut registry, &second, "shared-budget-second")?;
     let permit = match first_budget.try_acquire() {
         BudgetDecision::Ready(permit) => permit,
         other => return Err(format!("unexpected first budget decision: {other:?}").into()),
@@ -527,7 +545,7 @@ fn process_coordinator_interns_registry_and_restored_budget_allocations() -> Tes
         )?,
         Timestamp::from_unix_nanos(1),
     )?;
-    let first_budget = first.budget().ok_or("first coordinated budget missing")?;
+    let first_budget = take_live_budget(&mut first_registry, &first, "interner-first")?;
 
     let mut second_registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
     let second = second_registry.register(
@@ -539,8 +557,8 @@ fn process_coordinator_interns_registry_and_restored_budget_allocations() -> Tes
         )?,
         Timestamp::from_unix_nanos(1),
     )?;
-    let second_budget = second.budget().ok_or("second coordinated budget missing")?;
-    assert!(first_budget.shares_allocation_with(second_budget));
+    let second_budget = take_live_budget(&mut second_registry, &second, "interner-second")?;
+    assert!(first_budget.shares_allocation_with(&second_budget));
 
     let state = first_registry.export_authority_state()?;
     let mut restored =
@@ -554,13 +572,8 @@ fn process_coordinator_interns_registry_and_restored_budget_allocations() -> Tes
         )?,
         Timestamp::from_unix_nanos(1),
     )?;
-    assert!(
-        first_budget.shares_allocation_with(
-            restored_source
-                .budget()
-                .ok_or("restored coordinated budget missing")?
-        )
-    );
+    let restored_budget = take_live_budget(&mut restored, &restored_source, "interner-restored")?;
+    assert!(first_budget.shares_allocation_with(&restored_budget));
 
     let permit = match first_budget.try_acquire() {
         BudgetDecision::Ready(permit) => permit,
@@ -589,10 +602,7 @@ fn process_coordinator_interns_registry_and_restored_budget_allocations() -> Tes
         BudgetDecision::WaitUntil(deadline) if deadline == cooldown
     ));
     assert!(matches!(
-        restored_source
-            .budget()
-            .ok_or("restored coordinated budget missing")?
-            .try_acquire(),
+        restored_budget.try_acquire(),
         BudgetDecision::WaitUntil(deadline) if deadline == cooldown
     ));
     Ok(())
@@ -629,13 +639,9 @@ fn account_aliases_and_locator_metadata_cannot_multiply_one_credential_budget() 
         )?,
         Timestamp::from_unix_nanos(1),
     )?;
-    let first_budget = first_source
-        .budget()
-        .ok_or("first account budget missing")?;
-    let second_budget = second_source
-        .budget()
-        .ok_or("second account budget missing")?;
-    assert!(first_budget.shares_allocation_with(second_budget));
+    let first_budget = take_live_budget(&mut first, &first_source, "account-alias-first")?;
+    let second_budget = take_live_budget(&mut second, &second_source, "account-alias-second")?;
+    assert!(first_budget.shares_allocation_with(&second_budget));
 
     let permit = match first_budget.try_acquire() {
         BudgetDecision::Ready(permit) => permit,
@@ -680,15 +686,9 @@ fn public_endpoint_subset_and_superset_share_on_any_authority_overlap() -> TestR
         )?,
         Timestamp::from_unix_nanos(1),
     )?;
-    assert!(
-        first_source
-            .budget()
-            .ok_or("first overlap budget missing")?
-            .shares_allocation_with(
-                second_source
-                    .budget()
-                    .ok_or("second overlap budget missing")?
-            )
+    assert_eq!(
+        first_source.shares_provider_budget_with(&second_source),
+        Some(true)
     );
     Ok(())
 }
@@ -718,9 +718,9 @@ fn public_bridge_declaration_fails_without_merging_existing_allocations() -> Tes
         )?,
         Timestamp::from_unix_nanos(1),
     )?;
-    let first_budget = first.budget().ok_or("first bridge budget missing")?;
-    let second_budget = second.budget().ok_or("second bridge budget missing")?;
-    assert!(!first_budget.shares_allocation_with(second_budget));
+    let first_budget = take_live_budget(&mut registry, &first, "bridge-first")?;
+    let second_budget = take_live_budget(&mut registry, &second, "bridge-second")?;
+    assert!(!first_budget.shares_allocation_with(&second_budget));
 
     assert!(matches!(
         registry.register(
@@ -739,7 +739,7 @@ fn public_bridge_declaration_fails_without_merging_existing_allocations() -> Tes
         ),
         Err(RegistryError::BudgetCoordinator)
     ));
-    assert!(!first_budget.shares_allocation_with(second_budget));
+    assert!(!first_budget.shares_allocation_with(&second_budget));
     let first_permit = match first_budget.try_acquire() {
         BudgetDecision::Ready(permit) => permit,
         other => return Err(format!("first bridge allocation changed: {other:?}").into()),
@@ -804,7 +804,7 @@ fn restored_account_subject_is_freshly_resolved_and_tampering_fails_closed() -> 
             state.clone(),
             Arc::clone(&resolver),
         )?;
-    let owner_budget = registered.budget().ok_or("owner account budget missing")?;
+    let owner_budget = take_live_budget(&mut owner, &registered, "restore-owner")?;
     let restored_state = restored.export_authority_state()?;
     let mut second_restore =
         AuthoritativeSourceRegistry::try_new_ephemeral_with_authority_state_and_authorization_subject_resolver_for_diagnostics(
@@ -822,13 +822,8 @@ fn restored_account_subject_is_freshly_resolved_and_tampering_fails_closed() -> 
         )?,
         Timestamp::from_unix_nanos(1),
     )?;
-    assert!(
-        owner_budget.shares_allocation_with(
-            restored_alias
-                .budget()
-                .ok_or("restored account budget missing")?
-        )
-    );
+    let restored_budget = take_live_budget(&mut second_restore, &restored_alias, "restore-alias")?;
+    assert!(owner_budget.shares_allocation_with(&restored_budget));
 
     let mut tampered = serde_json::to_value(state)?;
     let subject = tampered
@@ -878,12 +873,7 @@ fn distinct_resolved_credentials_receive_distinct_account_allocations() -> TestR
         )?,
         Timestamp::from_unix_nanos(1),
     )?;
-    assert!(
-        !first
-            .budget()
-            .ok_or("first distinct budget missing")?
-            .shares_allocation_with(second.budget().ok_or("second distinct budget missing")?)
-    );
+    assert_eq!(first.shares_provider_budget_with(&second), Some(false));
     Ok(())
 }
 
@@ -919,15 +909,9 @@ fn canonical_endpoint_origins_normalize_idna_ports_paths_and_allowlist_order() -
         )?,
         Timestamp::from_unix_nanos(1),
     )?;
-    assert!(
-        first_source
-            .budget()
-            .ok_or("first canonical budget missing")?
-            .shares_allocation_with(
-                second_source
-                    .budget()
-                    .ok_or("second canonical budget missing")?
-            )
+    assert_eq!(
+        first_source.shares_provider_budget_with(&second_source),
+        Some(true)
     );
 
     let mut scheme_alias = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
@@ -945,15 +929,9 @@ fn canonical_endpoint_origins_normalize_idna_ports_paths_and_allowlist_order() -
         )?,
         Timestamp::from_unix_nanos(1),
     )?;
-    assert!(
-        first_source
-            .budget()
-            .ok_or("first canonical budget missing")?
-            .shares_allocation_with(
-                third_source
-                    .budget()
-                    .ok_or("third canonical budget missing")?
-            )
+    assert_eq!(
+        first_source.shares_provider_budget_with(&third_source),
+        Some(true)
     );
     Ok(())
 }
@@ -986,7 +964,7 @@ fn one_canonical_identity_rejects_conflicting_alias_policy_without_publication()
         ),
         Err(RegistryError::BudgetCoordinator)
     ));
-    assert!(first.budget().is_some());
+    assert!(first.has_provider_budget());
     assert!(
         registry
             .validate_registered(&first, Timestamp::from_unix_nanos(1))
