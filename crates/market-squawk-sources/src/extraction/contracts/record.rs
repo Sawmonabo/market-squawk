@@ -168,15 +168,9 @@ impl ExtractionRecord {
             .and_then(ResearchTemporalCoordinate::exact_timestamp)
             .is_some_and(|published| reported_at.is_some_and(|value| value < published))
             || superseded_time.as_ref().is_some_and(|superseded| {
-                temporal_not_after(superseded, &effective_time)
-                    || published_time
-                        .as_ref()
-                        .is_some_and(|published| temporal_not_after(superseded, published))
-                    || superseded
-                        .exact_timestamp()
-                        .is_some_and(|superseded| {
-                            reported_at.is_some_and(|available| superseded <= available)
-                        })
+                published_time
+                    .as_ref()
+                    .is_some_and(|published| temporal_not_after(superseded, published))
             })
         {
             return Err(ExtractionError::InvalidPointInTimeOrdering);

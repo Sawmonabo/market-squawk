@@ -568,7 +568,7 @@ impl TreasurySource {
                     schema.clone(),
                     record.evidence,
                     record.effective,
-                    None,
+                    record.published,
                     record.availability,
                     record.revision,
                     None,

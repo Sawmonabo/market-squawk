@@ -544,10 +544,10 @@ impl FredSource {
                     schema.clone(),
                     record.evidence,
                     record.effective,
-                    None,
+                    record.published,
                     record.availability,
                     record.revision,
-                    None,
+                    record.superseded,
                     record.payload,
                 )
             })

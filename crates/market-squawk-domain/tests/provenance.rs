@@ -225,7 +225,7 @@ fn research_time_rejects_incomparable_supersession_precision() -> Result<(), Box
 }
 
 #[test]
-fn research_time_rejects_unprovable_supersession_after_effective() -> Result<(), Box<dyn Error>> {
+fn research_time_keeps_effective_and_revision_axes_independent() -> Result<(), Box<dyn Error>> {
     let effective = ResearchTemporalCoordinate::source_period(ResearchPeriod::try_new(
         SourceIdentifier::try_from("bls-monthly")?,
         2026,
@@ -243,15 +243,13 @@ fn research_time_rejects_unprovable_supersession_after_effective() -> Result<(),
     ];
 
     for superseded in candidates {
-        assert!(matches!(
-            ResearchTime::try_new_with_coordinates(
-                effective.clone(),
-                None,
-                RevisionNumber::new(1)?,
-                Some(superseded),
-            ),
-            Err(ProvenanceError::SupersededNotAfterEffective)
-        ));
+        let time = ResearchTime::try_new_with_coordinates(
+            effective.clone(),
+            None,
+            RevisionNumber::new(1)?,
+            Some(superseded.clone()),
+        )?;
+        assert_eq!(time.superseded(), Some(&superseded));
     }
     Ok(())
 }

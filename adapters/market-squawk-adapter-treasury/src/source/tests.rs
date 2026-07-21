@@ -85,6 +85,7 @@ async fn authority_bound_sources_emit_canonical_fiscal_and_yield_macro_records()
         "treasury:average-interest-rate:v2:Marketable:Treasury%20Bills",
         "3.706",
         DataQuality::OfficialDelayed,
+        None,
     )?;
 
     let yield_config = TreasurySourceConfig::daily_par_yield_curve(2026)?;
@@ -111,6 +112,7 @@ async fn authority_bound_sources_emit_canonical_fiscal_and_yield_macro_records()
         "treasury:daily-par-yield-curve:1m",
         "3.72",
         DataQuality::Indicative,
+        Some("2026-07-21T06:54:08+00:00"),
     )?;
     Ok(())
 }
@@ -188,6 +190,7 @@ fn assert_macro_record(
     series: &str,
     value: &str,
     quality: DataQuality,
+    expected_published: Option<&str>,
 ) -> TestResult {
     assert_eq!(record.schema().as_str(), "market-squawk-research-v3");
     let observation: ResearchObservation = serde_json::from_slice(record.payload())?;
@@ -205,15 +208,46 @@ fn assert_macro_record(
         Some(value)
     );
     assert_eq!(observation.context().provenance().quality(), quality);
-    assert!(
+    assert_eq!(
         observation
             .context()
             .provenance()
             .source_timestamp()
-            .is_none()
+            .map(Timestamp::unix_nanos),
+        expected_published
+            .map(parse_expected_timestamp)
+            .transpose()?,
     );
-    assert!(observation.context().time().published().is_none());
+    assert_eq!(
+        observation
+            .context()
+            .time()
+            .published()
+            .and_then(|coordinate| coordinate.exact_timestamp())
+            .map(Timestamp::unix_nanos),
+        expected_published
+            .map(parse_expected_timestamp)
+            .transpose()?,
+    );
+    assert_eq!(
+        record
+            .published_time()
+            .and_then(|coordinate| coordinate.exact_timestamp())
+            .map(Timestamp::unix_nanos),
+        expected_published
+            .map(parse_expected_timestamp)
+            .transpose()?,
+    );
     Ok(())
+}
+
+fn parse_expected_timestamp(value: &str) -> TestResult<i64> {
+    let parsed = chrono::DateTime::parse_from_rfc3339(value)?;
+    parsed
+        .timestamp()
+        .checked_mul(1_000_000_000)
+        .and_then(|nanos| nanos.checked_add(i64::from(parsed.timestamp_subsec_nanos())))
+        .ok_or_else(|| "expected timestamp overflow".into())
 }
 
 fn metadata(

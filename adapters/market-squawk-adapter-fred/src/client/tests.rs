@@ -5,10 +5,10 @@ use bytes::Bytes;
 use futures_util::future::BoxFuture;
 use futures_util::stream;
 use market_squawk_domain::{
-    AuthorizationBasis, ChecksumCapability, CoverageDelay, DataQuality, DeliveryEvidence,
-    DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence, MetadataRevision,
-    ResearchObservation, RevisionBoundPayloadEvidence, SchemaVersion, SequenceCapability, SourceId,
-    SourceIdentifier, Timestamp,
+    AuthorizationBasis, CalendarDate, ChecksumCapability, CoverageDelay, DataQuality,
+    DeliveryEvidence, DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence,
+    MetadataRevision, ResearchObservation, RevisionBoundPayloadEvidence, SchemaVersion,
+    SequenceCapability, SourceId, SourceIdentifier, Timestamp,
 };
 use market_squawk_sources::{
     ApiEndpointRule, AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode,
@@ -278,6 +278,18 @@ async fn durable_extraction_emits_canonical_schema_v3_macro_observations() -> Te
             record.evidence()
         ));
     }
+    assert_eq!(
+        batch.records()[0]
+            .published_time()
+            .and_then(|coordinate| coordinate.calendar_date_value()),
+        Some(CalendarDate::new(2024, 1, 1)?)
+    );
+    assert_eq!(
+        batch.records()[0]
+            .superseded_time()
+            .and_then(|coordinate| coordinate.calendar_date_value()),
+        Some(CalendarDate::new(2024, 2, 1)?)
+    );
     let first: ResearchObservation = serde_json::from_slice(batch.records()[0].payload())?;
     let second: ResearchObservation = serde_json::from_slice(batch.records()[1].payload())?;
     let ResearchObservation::Macro(first) = first else {
@@ -309,7 +321,26 @@ async fn durable_extraction_emits_canonical_schema_v3_macro_observations() -> Te
             .as_deref(),
         Some("2023-01-01")
     );
-    assert!(first.context().time().published().is_none());
+    assert_eq!(
+        first
+            .context()
+            .time()
+            .published()
+            .and_then(|coordinate| coordinate.calendar_date_value())
+            .map(|date| date.to_string())
+            .as_deref(),
+        Some("2024-01-01")
+    );
+    assert_eq!(
+        first
+            .context()
+            .time()
+            .superseded()
+            .and_then(|coordinate| coordinate.calendar_date_value())
+            .map(|date| date.to_string())
+            .as_deref(),
+        Some("2024-02-01")
+    );
     assert!(first.context().provenance().source_timestamp().is_none());
     assert_eq!(
         first.context().provenance().quality(),

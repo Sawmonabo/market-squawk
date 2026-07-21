@@ -103,6 +103,22 @@ fn daily_par_yield_curve_rejects_wrong_namespace_and_rows_without_rates() -> Tes
         .is_err()
     );
 
+    for invalid in [
+        "not-an-rfc3339-instant",
+        "2026-07-21T06:54:08z",
+        "2026-07-21T06:54:08-00:00",
+    ] {
+        let invalid_atom_date = exact_payload.replace("2026-07-21T06:54:08Z", invalid);
+        assert!(
+            DailyParYieldCurvePage::parse(
+                invalid_atom_date.as_bytes(),
+                &request,
+                FiscalDataParseLimits::production_defaults(),
+            )
+            .is_err()
+        );
+    }
+
     let no_rates = br#"<?xml version="1.0"?>
       <feed xmlns="http://www.w3.org/2005/Atom"
             xmlns:d="http://schemas.microsoft.com/ado/2007/08/dataservices"

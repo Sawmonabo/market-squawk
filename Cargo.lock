@@ -3310,6 +3310,7 @@ name = "market-squawk-adapter-treasury"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "chrono",
  "futures-util",
  "market-squawk-domain",
  "market-squawk-sources",

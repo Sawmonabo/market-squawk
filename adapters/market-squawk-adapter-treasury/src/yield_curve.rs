@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use market_squawk_domain::{CalendarDate, DataQuality};
+use chrono::DateTime;
+use market_squawk_domain::{CalendarDate, DataQuality, Timestamp};
 use quick_xml::XmlVersion;
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::name::ResolveResult;
@@ -204,7 +205,7 @@ pub struct DailyParYieldCurveObservation {
     source_record_id: String,
     record_date: CalendarDate,
     rates_percent: BTreeMap<TreasuryMaturity, Decimal>,
-    source_published_at: String,
+    source_published_at: Timestamp,
     row_identity: [u8; 32],
     source_payload_digest: [u8; 32],
 }
@@ -241,9 +242,9 @@ impl DailyParYieldCurveObservation {
         self.rate_percent(TreasuryMaturity::ThirtyYears)
     }
 
-    /// Returns the provider feed revision text exactly as published.
-    pub fn source_published_at(&self) -> &str {
-        &self.source_published_at
+    /// Returns the RFC 3339 Atom instant at which the provider last updated this entry.
+    pub const fn source_published_at(&self) -> Timestamp {
+        self.source_published_at
     }
 
     /// Returns the canonical provider row identity.
@@ -263,7 +264,7 @@ pub struct DailyParYieldCurvePage {
     request_digest: [u8; 32],
     query_digest: [u8; 32],
     response_payload_digest: [u8; 32],
-    feed_published_at: String,
+    feed_published_at: Timestamp,
     observations: Vec<DailyParYieldCurveObservation>,
 }
 
@@ -432,7 +433,14 @@ impl DailyParYieldCurvePage {
         {
             return Err(TreasuryProtocolError::SchemaDrift);
         }
-        let feed_published_at = feed_published_at.ok_or(TreasuryProtocolError::SchemaDrift)?;
+        let feed_published_at =
+            parse_atom_timestamp(&feed_published_at.ok_or(TreasuryProtocolError::SchemaDrift)?)?;
+        if observations
+            .iter()
+            .any(|observation| observation.source_published_at > feed_published_at)
+        {
+            return Err(TreasuryProtocolError::SchemaDrift);
+        }
         let mut identities = BTreeSet::new();
         if observations
             .iter()
@@ -459,9 +467,9 @@ impl DailyParYieldCurvePage {
         &self.observations
     }
 
-    /// Returns the exact feed update text retained as revision evidence.
-    pub fn feed_published_at(&self) -> &str {
-        &self.feed_published_at
+    /// Returns the RFC 3339 Atom instant at which the provider last updated this feed.
+    pub const fn feed_published_at(&self) -> Timestamp {
+        self.feed_published_at
     }
 
     /// Returns the canonical query-family digest.
@@ -588,10 +596,11 @@ impl EntryBuilder {
         {
             return Err(TreasuryProtocolError::SchemaDrift);
         }
-        let source_published_at = self
-            .published_at
-            .clone()
-            .ok_or(TreasuryProtocolError::SchemaDrift)?;
+        let source_published_at = parse_atom_timestamp(
+            self.published_at
+                .as_deref()
+                .ok_or(TreasuryProtocolError::SchemaDrift)?,
+        )?;
         let mut row_identity = Sha256::new();
         update_component(&mut row_identity, "treasury-yield-row-v1");
         update_component(&mut row_identity, &source_record_id);
@@ -740,4 +749,22 @@ fn yield_query_digest(year: u16) -> [u8; 32] {
     update_component(&mut digest, PROVIDER_YEAR_RESPONSE_ID);
     digest.update(year.to_be_bytes());
     digest.finalize().into()
+}
+
+fn parse_atom_timestamp(value: &str) -> Result<Timestamp, TreasuryProtocolError> {
+    if value.bytes().any(|byte| byte.is_ascii_whitespace())
+        || value.as_bytes().get(10) != Some(&b'T')
+        || value.ends_with('z')
+        || value.ends_with("-00:00")
+    {
+        return Err(TreasuryProtocolError::SchemaDrift);
+    }
+    let parsed =
+        DateTime::parse_from_rfc3339(value).map_err(|_| TreasuryProtocolError::SchemaDrift)?;
+    let nanos = parsed
+        .timestamp()
+        .checked_mul(1_000_000_000)
+        .and_then(|nanos| nanos.checked_add(i64::from(parsed.timestamp_subsec_nanos())))
+        .ok_or(TreasuryProtocolError::SchemaDrift)?;
+    Ok(Timestamp::from_unix_nanos(nanos))
 }

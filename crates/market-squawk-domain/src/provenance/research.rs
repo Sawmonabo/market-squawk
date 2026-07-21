@@ -624,11 +624,6 @@ impl ResearchTime {
         revision: RevisionNumber,
         superseded: Option<ResearchTemporalCoordinate>,
     ) -> Result<Self, ProvenanceError> {
-        if let Some(superseded) = superseded.as_ref()
-            && superseded.partial_cmp(&effective) != Some(Ordering::Greater)
-        {
-            return Err(ProvenanceError::SupersededNotAfterEffective);
-        }
         if let (Some(published), Some(superseded)) = (published.as_ref(), superseded.as_ref()) {
             match superseded.partial_cmp(published) {
                 Some(Ordering::Greater) => {}
@@ -738,8 +733,7 @@ impl ResearchContext {
     ///
     /// # Errors
     ///
-    /// Rejects reported availability before publication and supersession at or before conservative
-    /// availability.
+    /// Rejects reported availability before an exact publication instant.
     pub fn new(
         provenance: ResearchProvenance,
         time: ResearchTime,
@@ -752,15 +746,6 @@ impl ResearchContext {
         ) && available < published
         {
             return Err(ProvenanceError::AvailabilityBeforePublished);
-        }
-        if let (Some(superseded), Some(available)) = (
-            time.superseded
-                .as_ref()
-                .and_then(|value| value.exact_timestamp()),
-            provenance.availability.conservative_available_at(),
-        ) && superseded <= available
-        {
-            return Err(ProvenanceError::SupersededNotAfterAvailable);
         }
         Ok(Self { provenance, time })
     }

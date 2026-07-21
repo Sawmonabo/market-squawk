@@ -19,6 +19,7 @@ use crate::{
 
 pub(super) struct CanonicalTreasuryRecord {
     pub(super) effective: ResearchTemporalCoordinate,
+    pub(super) published: Option<ResearchTemporalCoordinate>,
     pub(super) availability: ExtractionAvailabilityEvidence,
     pub(super) revision: SourceIdentifier,
     pub(super) evidence: ExactPayloadEvidence,
@@ -55,6 +56,7 @@ pub(super) fn canonical_fiscal_records(
                 revision,
                 rate.record_date(),
                 page.response_payload_digest(),
+                None,
                 received_at,
                 ingested_at,
             )
@@ -85,7 +87,7 @@ pub(super) fn canonical_yield_records(
                 observation.record_date(),
                 observation.source_record_id(),
                 maturity.as_str(),
-                encode_component(observation.source_published_at()),
+                observation.source_published_at().unix_nanos(),
             ))?;
             canonical_record(
                 source,
@@ -95,6 +97,7 @@ pub(super) fn canonical_yield_records(
                 revision,
                 observation.record_date(),
                 page.response_payload_digest(),
+                Some(observation.source_published_at()),
                 received_at,
                 ingested_at,
             )
@@ -114,6 +117,7 @@ fn canonical_record(
     revision: SourceIdentifier,
     effective_at: market_squawk_domain::CalendarDate,
     page_digest: [u8; 32],
+    published_at: Option<Timestamp>,
     received_at: Timestamp,
     ingested_at: Timestamp,
 ) -> Result<CanonicalTreasuryRecord, TreasurySourceError> {
@@ -123,7 +127,7 @@ fn canonical_record(
         instrument_id: None,
         venue_id: None,
         source_identifier: revision.clone(),
-        source_timestamp: None,
+        source_timestamp: published_at,
         received_at,
         ingested_at,
         quality,
@@ -137,7 +141,7 @@ fn canonical_record(
     let effective = ResearchTemporalCoordinate::calendar_date(effective_at);
     let time = ResearchTime::try_new_with_coordinates(
         effective.clone(),
-        None,
+        published_at.map(ResearchTemporalCoordinate::exact),
         RevisionNumber::new(1).map_err(|_| TreasurySourceError::InvalidProtocol)?,
         None,
     )
@@ -153,6 +157,7 @@ fn canonical_record(
     let digest: [u8; 32] = Sha256::digest(&payload).into();
     Ok(CanonicalTreasuryRecord {
         effective,
+        published: published_at.map(ResearchTemporalCoordinate::exact),
         availability: ExtractionAvailabilityEvidence::LocalFirstObserved {
             observed_at: received_at,
         },
