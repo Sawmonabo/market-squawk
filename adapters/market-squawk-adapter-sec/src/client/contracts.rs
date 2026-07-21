@@ -391,6 +391,7 @@ pub(super) const fn validation_health_for_error(
         | SecClientError::BlockingWorkerFailed
         | SecClientError::RawEvidence(_)
         | SecClientError::Representation(_)
+        | SecClientError::RevisionAuthority(_)
         | SecClientError::Normalization(_) => Some(SecExtractionHealthState::LocalFailure),
         SecClientError::Parser(_)
         | SecClientError::InvalidCompanionSet
@@ -536,6 +537,8 @@ pub enum SecClientError {
     Normalization(crate::SecNormalizationError),
     #[error(transparent)]
     Identity(#[from] market_squawk_domain::IdentityError),
+    #[error(transparent)]
+    RevisionAuthority(#[from] market_squawk_sources::ObservedRevisionError),
 }
 
 impl From<RawEvidenceError> for SecClientError {
