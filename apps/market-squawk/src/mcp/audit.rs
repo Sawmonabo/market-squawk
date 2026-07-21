@@ -48,6 +48,7 @@ impl DurableAuditSink {
             }
         })?;
         validate_private_file_identity(&control, &file)?;
+        synchronize_parent_directory(&control)?;
         recover_audit_file(&file)?;
         validate_private_file_identity(&control, &file)?;
         let mut records = Vec::new();
@@ -522,6 +523,25 @@ fn configure_private_creation(options: &mut OpenOptions) {
 #[cfg(not(unix))]
 fn configure_private_creation(_options: &mut OpenOptions) {}
 
+#[cfg(unix)]
+fn synchronize_parent_directory(control: &Dir) -> Result<(), LocalAuditError> {
+    use cap_std::fs::OpenOptionsExt as _;
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let directory = control
+        .open_with(".", &options)
+        .map_err(LocalAuditError::Io)?
+        .into_std();
+    directory.sync_all().map_err(LocalAuditError::Io)
+}
+
+#[cfg(not(unix))]
+fn synchronize_parent_directory(_control: &Dir) -> Result<(), LocalAuditError> {
+    Err(LocalAuditError::DirectoryDurabilityUnavailable)
+}
+
 /// Durable local audit construction or drain failure.
 #[derive(Debug, Error)]
 pub enum LocalAuditError {
@@ -535,6 +555,8 @@ pub enum LocalAuditError {
     OwnerMismatch,
     #[error("local MCP audit endpoint permissions cannot be proven private")]
     PermissionProofUnavailable,
+    #[error("local MCP audit parent-directory durability cannot be established")]
+    DirectoryDurabilityUnavailable,
     #[error("local MCP audit endpoint is already locked")]
     AlreadyLocked,
     #[error("local MCP audit contains a corrupt complete record")]
