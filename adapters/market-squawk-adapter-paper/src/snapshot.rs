@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
+use std::num::NonZeroU64;
 
 use market_squawk_domain::{
     AccountId, ClientOrderId, Money, OrderId, PriceTicks, QuantityLots, Timestamp,
@@ -234,6 +235,7 @@ impl PaperExecutionSnapshot {
     pub const fn sequence(&self) -> u64 {
         self.sequence
     }
+
     pub const fn complete(&self) -> bool {
         self.complete
     }
@@ -356,6 +358,21 @@ impl PaperExecutionCheckpoint {
         self.sequence
     }
 
+    /// Reports whether restart would require restoring live dispatcher order ownership.
+    pub fn has_nonterminal_orders(&self) -> bool {
+        self.orders
+            .values()
+            .any(|order| !is_terminal(order.lifecycle.state()))
+    }
+
+    pub(crate) fn reconciled_accounts_for_recovery(
+        &self,
+    ) -> Result<Vec<market_squawk_execution::ReconciledAccountState>, PaperCheckpointError> {
+        self.ledger
+            .recovery_reconciled_account_states()
+            .map_err(PaperCheckpointError::Ledger)
+    }
+
     /// Encodes a complete checkpoint without filesystem access under a caller-selected byte cap.
     pub fn encode(&self, maximum_bytes: usize) -> Result<Vec<u8>, PaperCheckpointError> {
         if maximum_bytes == 0 || !self.complete {
@@ -372,6 +389,16 @@ impl PaperExecutionCheckpoint {
         serde_json::to_writer(&mut output, &self.recovery_wire())
             .map_err(PaperCheckpointError::Encoding)?;
         Ok(output.0.finalize().into())
+    }
+
+    pub(crate) fn bind_current_manifest(
+        &mut self,
+        repository_id: [u8; 32],
+        generation: NonZeroU64,
+    ) {
+        self.durable_sequence = self.sequence;
+        self.accepted_repository_id = repository_id;
+        self.accepted_repository_generation = generation.get();
     }
 
     fn recovery_wire(&self) -> CheckpointWire {

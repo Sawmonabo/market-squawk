@@ -365,6 +365,9 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
     let mut paper_audit = paper
         .take_audit_reader()
         .ok_or("paper audit reader was already transferred")?;
+    let financial_changes = paper
+        .take_financial_change_reader()
+        .ok_or("paper financial-change reader was already transferred")?;
     let paper_audit_task = tokio::spawn(async move {
         let mut records = Vec::new();
         while let Some(record) = paper_audit.recv().await {
@@ -384,7 +387,7 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
         published: AtomicUsize::new(0),
         notification: tokio::sync::Notify::new(),
     });
-    let dispatcher = ExecutionDispatcher::try_start(
+    let mut dispatcher = ExecutionDispatcher::try_start(
         Arc::clone(&execution_adapter) as Arc<dyn ExecutionAdapter>,
         Arc::clone(&accounts),
         execution_audit.clone(),
@@ -482,6 +485,55 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
     let cancel = dispatcher.cancel(order_ids[4]).await?;
     assert_eq!(cancel.status(), CancelStatus::Pending);
     let active_checkpoint = paper_adapter.checkpoint(paper_control()?).await?;
+    let active_receipt = checkpoint_repository.persist(&active_checkpoint)?;
+    let mut reopened_repository = PaperCheckpointRepository::try_new(
+        checkpoint_paths.artifacts()?.clone(),
+        paper_config.clone(),
+        NonZeroUsize::new(1024 * 1024).ok_or("zero checkpoint capacity")?,
+    )?;
+    let recovered_active = reopened_repository
+        .take_recovery()
+        .ok_or("active current checkpoint was not recovered")?;
+    assert_eq!(
+        recovered_active.checkpoint().sequence(),
+        active_checkpoint.sequence()
+    );
+    assert!(recovered_active.checkpoint().has_nonterminal_orders());
+    assert_eq!(active_receipt.sequence(), active_checkpoint.sequence());
+    let (recovered_checkpoint, _) = recovered_active.into_parts();
+    let mut recovered_paper = PaperExecutionRuntime::try_start_from_checkpoint(
+        paper_config.clone(),
+        recovered_checkpoint,
+        &reopened_repository,
+        task_reaper.clone(),
+    )?;
+    let _recovery_audit = recovered_paper
+        .take_audit_reader()
+        .ok_or("recovery audit reader was already transferred")?;
+    recovered_paper
+        .terminalize_recovered_orders(paper_control()?)
+        .await?;
+    let terminal_recovery = recovered_paper
+        .adapter()
+        .checkpoint(paper_control()?)
+        .await?;
+    assert!(!terminal_recovery.has_nonterminal_orders());
+    let terminal_receipt = reopened_repository.persist(&terminal_recovery)?;
+    assert!(recovered_paper.shutdown(paper_control()?).await?.complete());
+    let mut terminal_repository = PaperCheckpointRepository::try_new(
+        checkpoint_paths.artifacts()?.clone(),
+        paper_config.clone(),
+        NonZeroUsize::new(1024 * 1024).ok_or("zero checkpoint capacity")?,
+    )?;
+    let terminal_current = terminal_repository
+        .take_recovery()
+        .ok_or("terminal successor manifest was not recovered")?;
+    assert_eq!(
+        terminal_current.checkpoint().sequence(),
+        terminal_receipt.sequence()
+    );
+    assert!(!terminal_current.checkpoint().has_nonterminal_orders());
+    checkpoint_repository = terminal_repository;
     let active_checkpoint_bytes = active_checkpoint.encode(1024 * 1024)?;
     let active_checkpoint_value: serde_json::Value =
         serde_json::from_slice(&active_checkpoint_bytes)?;
@@ -869,6 +921,24 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
     )?;
 
     assert!(runtime.shutdown().await.is_complete());
+    assert_eq!(
+        dispatcher.quiesce().await,
+        market_squawk_execution::ExecutionDispatcherQuiesce::Complete
+    );
+    let final_checkpoint = paper_adapter.checkpoint(paper_control()?).await?;
+    assert!(financial_changes.latest() > 0);
+    let final_replay = [
+        market_squawk_adapter_paper::PaperAccountReplaySnapshot::new(
+            account_id,
+            accounts.snapshot_idempotency(account_id)?,
+        ),
+    ];
+    let final_receipt =
+        checkpoint_repository.persist_with_replay(&final_checkpoint, &final_replay)?;
+    let final_authority = dispatcher.persistence_acknowledgement()?;
+    paper_adapter
+        .acknowledge_persistence(final_authority, final_receipt)
+        .await?;
     assert_eq!(
         dispatcher.shutdown().await,
         ExecutionDispatcherShutdown::Complete

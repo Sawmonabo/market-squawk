@@ -6,7 +6,15 @@ use std::path::Path;
 
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
 use cap_std::fs::{Dir, OpenOptions};
+use market_squawk_domain::{
+    AccountId, ClientOrderId, Currency, InstrumentId, Money, OrderId, Timestamp,
+};
+use market_squawk_execution::{
+    AccountIdempotencyBootstrap, AccountIdempotencyBootstrapError, AccountIdempotencyTombstone,
+    OrderIntentDigest, ReconciledAccountState, ReconciledAccountStateError,
+};
 use market_squawk_platform::{ArtifactPathError, ArtifactRoot, PathError};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -14,6 +22,8 @@ use crate::snapshot::PaperCheckpointPersistenceEvidence;
 use crate::{PaperCheckpointError, PaperExecutionCheckpoint, PaperExecutionConfig};
 
 const CHECKPOINT_OBJECT_ROOT: &str = "paper-checkpoints/v1";
+const CURRENT_MANIFEST_PATH: &str = "paper-checkpoints/v1/current.json";
+const MANIFEST_SCHEMA_VERSION: u32 = 1;
 
 /// Single-writer durable publisher bound to one artifact root and paper configuration.
 #[derive(Debug)]
@@ -23,6 +33,7 @@ pub struct PaperCheckpointRepository {
     maximum_bytes: NonZeroUsize,
     repository_id: [u8; 32],
     generation: u64,
+    recovery: Option<PaperCheckpointRecovery>,
 }
 
 impl PaperCheckpointRepository {
@@ -33,6 +44,20 @@ impl PaperCheckpointRepository {
         maximum_bytes: NonZeroUsize,
     ) -> Result<Self, PaperCheckpointRepositoryError> {
         drop(root.try_clone_directory()?);
+        let directory = root.try_clone_directory()?;
+        if let Some(recovered) = read_current_manifest(&directory, &config, maximum_bytes.get())? {
+            return Ok(Self {
+                root,
+                config,
+                maximum_bytes,
+                repository_id: recovered.repository_id,
+                generation: recovered.generation.get(),
+                recovery: Some(PaperCheckpointRecovery {
+                    checkpoint: recovered.checkpoint,
+                    accounts: recovered.accounts,
+                }),
+            });
+        }
         let mut nonce = [0_u8; 32];
         getrandom::fill(&mut nonce)
             .map_err(|_| PaperCheckpointRepositoryError::RandomUnavailable)?;
@@ -50,7 +75,13 @@ impl PaperCheckpointRepository {
             maximum_bytes,
             repository_id,
             generation: 0,
+            recovery: None,
         })
+    }
+
+    /// Transfers the exact current checkpoint and replay fence discovered at repository open.
+    pub fn take_recovery(&mut self) -> Option<PaperCheckpointRecovery> {
+        self.recovery.take()
     }
 
     /// Publishes, synchronizes, reopens, and fully validates one immutable checkpoint.
@@ -58,7 +89,16 @@ impl PaperCheckpointRepository {
         &mut self,
         checkpoint: &PaperExecutionCheckpoint,
     ) -> Result<PaperCheckpointReceipt, PaperCheckpointRepositoryError> {
-        self.persist_with_checkpoint(checkpoint, |_| Ok(()))
+        self.persist_with_replay(checkpoint, &[])
+    }
+
+    /// Atomically advances the fixed current manifest with one exact checkpoint and replay image.
+    pub fn persist_with_replay(
+        &mut self,
+        checkpoint: &PaperExecutionCheckpoint,
+        account_replay: &[PaperAccountReplaySnapshot],
+    ) -> Result<PaperCheckpointReceipt, PaperCheckpointRepositoryError> {
+        self.persist_with_checkpoint(checkpoint, account_replay, |_| Ok(()))
     }
 
     pub(crate) const fn binding_identity(&self) -> [u8; 32] {
@@ -72,6 +112,7 @@ impl PaperCheckpointRepository {
     fn persist_with_checkpoint<F>(
         &mut self,
         checkpoint: &PaperExecutionCheckpoint,
+        account_replay: &[PaperAccountReplaySnapshot],
         mut publication_checkpoint: F,
     ) -> Result<PaperCheckpointReceipt, PaperCheckpointRepositoryError>
     where
@@ -88,8 +129,6 @@ impl PaperCheckpointRepository {
             .checked_add(1)
             .and_then(NonZeroU64::new)
             .ok_or(PaperCheckpointRepositoryError::GenerationExhausted)?;
-        self.generation = generation.get();
-
         let maximum_bytes = self.maximum_bytes.get();
         let bytes = checkpoint.encode(maximum_bytes)?;
         let artifact_digest: [u8; 32] = Sha256::digest(&bytes).into();
@@ -155,6 +194,27 @@ impl PaperCheckpointRepository {
             return Err(PaperCheckpointRepositoryError::VerificationFailed);
         }
 
+        let manifest = CurrentManifestWire::try_new(
+            self.repository_id,
+            generation,
+            self.config.digest(),
+            checkpoint,
+            recovery_digest,
+            artifact_digest,
+            artifact_reference.clone(),
+            account_replay,
+        )?;
+        // Burn the generation before the atomic current-name replacement. If a later durability
+        // or read-back barrier fails, this process can never reissue that generation for different
+        // bytes; reopening recovers the manifest generation that actually became current.
+        self.generation = generation.get();
+        publish_current_manifest(
+            &directory,
+            &manifest,
+            &repository_hex,
+            generation,
+            maximum_bytes,
+        )?;
         Ok(PaperCheckpointReceipt {
             repository_id: self.repository_id,
             generation,
@@ -164,6 +224,494 @@ impl PaperCheckpointRepository {
             artifact_digest,
             artifact_reference: artifact_reference.into_boxed_str(),
         })
+    }
+}
+
+/// Exact persisted replay fence for one paper account.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaperAccountReplaySnapshot {
+    account_id: AccountId,
+    state: Option<ReconciledAccountState>,
+    idempotency: AccountIdempotencyBootstrap,
+}
+
+impl PaperAccountReplaySnapshot {
+    pub const fn new(account_id: AccountId, idempotency: AccountIdempotencyBootstrap) -> Self {
+        Self {
+            account_id,
+            state: None,
+            idempotency,
+        }
+    }
+
+    /// Binds the replay fence to the risk coordinator's exact quiescent financial revision.
+    pub fn from_reconciled_state(
+        state: ReconciledAccountState,
+        idempotency: AccountIdempotencyBootstrap,
+    ) -> Self {
+        Self {
+            account_id: state.account_id(),
+            state: Some(state),
+            idempotency,
+        }
+    }
+
+    pub const fn account_id(&self) -> AccountId {
+        self.account_id
+    }
+
+    pub const fn idempotency(&self) -> &AccountIdempotencyBootstrap {
+        &self.idempotency
+    }
+}
+
+/// One verified current recovery image. No directory scan participates in selection.
+#[derive(Debug)]
+pub struct PaperCheckpointRecovery {
+    checkpoint: PaperExecutionCheckpoint,
+    accounts: Box<[PaperAccountRecoverySnapshot]>,
+}
+
+impl PaperCheckpointRecovery {
+    pub const fn checkpoint(&self) -> &PaperExecutionCheckpoint {
+        &self.checkpoint
+    }
+
+    pub const fn accounts(&self) -> &[PaperAccountRecoverySnapshot] {
+        &self.accounts
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        PaperExecutionCheckpoint,
+        Box<[PaperAccountRecoverySnapshot]>,
+    ) {
+        (self.checkpoint, self.accounts)
+    }
+}
+
+/// Exact marked account state and replay fence bound to the current checkpoint.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaperAccountRecoverySnapshot {
+    state: ReconciledAccountState,
+    idempotency: AccountIdempotencyBootstrap,
+}
+
+impl PaperAccountRecoverySnapshot {
+    pub const fn state(&self) -> &ReconciledAccountState {
+        &self.state
+    }
+
+    pub const fn idempotency(&self) -> &AccountIdempotencyBootstrap {
+        &self.idempotency
+    }
+
+    pub fn into_parts(self) -> (ReconciledAccountState, AccountIdempotencyBootstrap) {
+        (self.state, self.idempotency)
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CurrentManifestWire {
+    schema_version: u32,
+    repository_id: [u8; 32],
+    generation: NonZeroU64,
+    configuration_digest: [u8; 32],
+    sequence: u64,
+    recovery_digest: [u8; 32],
+    artifact_digest: [u8; 32],
+    artifact_reference: String,
+    account_replay: Vec<AccountReplayWire>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AccountReplayWire {
+    account_id: AccountId,
+    state: AccountStateWire,
+    revision: NonZeroU64,
+    tombstones: Vec<ReplayTombstoneWire>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AccountStateWire {
+    revision: NonZeroU64,
+    eligible: bool,
+    currency: Currency,
+    cash: Money,
+    settled_capital: Money,
+    marked_equity: Money,
+    peak_marked_equity: Money,
+    marked_gross_exposure: Money,
+    unrealized_pnl: Money,
+    drawdown: Money,
+    mark_digest: [u8; 32],
+    realized_pnl: Money,
+    realized_loss: Money,
+    positions: Vec<(InstrumentId, i64)>,
+    position_cost_basis: Vec<(InstrumentId, Money)>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ReplayTombstoneWire {
+    order_id: OrderId,
+    client_order_id: ClientOrderId,
+    intent_digest: [u8; 32],
+    intent_expires_at: Timestamp,
+}
+
+impl CurrentManifestWire {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "manifest binds independent recovery authorities"
+    )]
+    fn try_new(
+        repository_id: [u8; 32],
+        generation: NonZeroU64,
+        configuration_digest: [u8; 32],
+        checkpoint: &PaperExecutionCheckpoint,
+        recovery_digest: [u8; 32],
+        artifact_digest: [u8; 32],
+        artifact_reference: String,
+        account_replay: &[PaperAccountReplaySnapshot],
+    ) -> Result<Self, PaperCheckpointRepositoryError> {
+        let states = checkpoint.reconciled_accounts_for_recovery()?;
+        if !account_replay.is_empty()
+            && (account_replay.len() != states.len()
+                || account_replay.iter().any(|snapshot| {
+                    !states
+                        .iter()
+                        .any(|state| state.account_id() == snapshot.account_id)
+                }))
+        {
+            return Err(PaperCheckpointRepositoryError::InvalidReplay);
+        }
+        let mut replay = Vec::new();
+        replay
+            .try_reserve_exact(states.len())
+            .map_err(|_| PaperCheckpointRepositoryError::Allocation)?;
+        for state in states {
+            let snapshot = account_replay
+                .iter()
+                .find(|snapshot| snapshot.account_id == state.account_id());
+            let idempotency = snapshot
+                .map_or_else(AccountIdempotencyBootstrap::empty, |snapshot| {
+                    snapshot.idempotency.clone()
+                });
+            let recovery_state = snapshot
+                .and_then(|snapshot| snapshot.state.clone())
+                .unwrap_or_else(|| state.clone());
+            if !same_financial_state(&recovery_state, &state) {
+                return Err(PaperCheckpointRepositoryError::InvalidReplay);
+            }
+            let mut tombstones = Vec::new();
+            tombstones
+                .try_reserve_exact(idempotency.tombstones().len())
+                .map_err(|_| PaperCheckpointRepositoryError::Allocation)?;
+            tombstones.extend(idempotency.tombstones().iter().map(|tombstone| {
+                ReplayTombstoneWire {
+                    order_id: tombstone.order_id(),
+                    client_order_id: tombstone.client_order_id().clone(),
+                    intent_digest: tombstone.intent_digest().as_bytes(),
+                    intent_expires_at: tombstone.intent_expires_at(),
+                }
+            }));
+            replay.push(AccountReplayWire {
+                account_id: state.account_id(),
+                state: AccountStateWire::from_state(&recovery_state),
+                revision: idempotency.revision(),
+                tombstones,
+            });
+        }
+        replay.sort_unstable_by_key(|entry| entry.account_id);
+        Ok(Self {
+            schema_version: MANIFEST_SCHEMA_VERSION,
+            repository_id,
+            generation,
+            configuration_digest,
+            sequence: checkpoint.sequence(),
+            recovery_digest,
+            artifact_digest,
+            artifact_reference,
+            account_replay: replay,
+        })
+    }
+}
+
+struct OpenedRecovery {
+    repository_id: [u8; 32],
+    generation: NonZeroU64,
+    checkpoint: PaperExecutionCheckpoint,
+    accounts: Box<[PaperAccountRecoverySnapshot]>,
+}
+
+impl AccountStateWire {
+    fn from_state(state: &ReconciledAccountState) -> Self {
+        Self {
+            revision: state.revision(),
+            eligible: state.eligible(),
+            currency: state.currency(),
+            cash: state.cash(),
+            settled_capital: state.settled_capital(),
+            marked_equity: state.marked_equity(),
+            peak_marked_equity: state.peak_marked_equity(),
+            marked_gross_exposure: state.marked_gross_exposure(),
+            unrealized_pnl: state.unrealized_pnl(),
+            drawdown: state.drawdown(),
+            mark_digest: state.mark_digest(),
+            realized_pnl: state.realized_pnl(),
+            realized_loss: state.realized_loss(),
+            positions: state.positions().to_vec(),
+            position_cost_basis: state.position_cost_basis().to_vec(),
+        }
+    }
+
+    fn into_state(
+        self,
+        account_id: AccountId,
+    ) -> Result<ReconciledAccountState, ReconciledAccountStateError> {
+        ReconciledAccountState::try_new(
+            account_id,
+            self.revision,
+            self.eligible,
+            self.currency,
+            self.cash,
+            self.settled_capital,
+            self.marked_equity,
+            self.peak_marked_equity,
+            self.marked_gross_exposure,
+            self.unrealized_pnl,
+            self.drawdown,
+            self.mark_digest,
+            self.realized_pnl,
+            self.realized_loss,
+            self.positions,
+            self.position_cost_basis,
+        )
+    }
+}
+
+fn read_current_manifest(
+    directory: &Dir,
+    config: &PaperExecutionConfig,
+    maximum_bytes: usize,
+) -> Result<Option<OpenedRecovery>, PaperCheckpointRepositoryError> {
+    match directory.symlink_metadata(CURRENT_MANIFEST_PATH) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => return Err(PaperCheckpointRepositoryError::UnsafeArtifact),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return match directory.symlink_metadata("paper-checkpoints") {
+                Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Ok(_) => Err(PaperCheckpointRepositoryError::PartialState),
+                Err(source) => Err(io_error("inspect paper checkpoint namespace", source)),
+            };
+        }
+        Err(source) => {
+            return Err(io_error(
+                "inspect current paper checkpoint manifest",
+                source,
+            ));
+        }
+    }
+    let bytes = read_bounded_regular(directory, Path::new(CURRENT_MANIFEST_PATH), maximum_bytes)?;
+    let manifest: CurrentManifestWire =
+        serde_json::from_slice(&bytes).map_err(PaperCheckpointRepositoryError::ManifestEncoding)?;
+    if manifest.schema_version != MANIFEST_SCHEMA_VERSION
+        || manifest.repository_id == [0; 32]
+        || manifest.configuration_digest != config.digest()
+        || manifest.artifact_digest == [0; 32]
+        || manifest.recovery_digest == [0; 32]
+    {
+        return Err(PaperCheckpointRepositoryError::InvalidManifest);
+    }
+    let digest_hex = hex_bytes(&manifest.artifact_digest)?;
+    let expected_reference = format!(
+        "{CHECKPOINT_OBJECT_ROOT}/{}/{}.json",
+        &digest_hex[..2],
+        digest_hex
+    );
+    if manifest.artifact_reference != expected_reference {
+        return Err(PaperCheckpointRepositoryError::InvalidManifest);
+    }
+    let artifact_path = Path::new(&manifest.artifact_reference);
+    let persisted = read_bounded_regular(directory, artifact_path, maximum_bytes)?;
+    if <[u8; 32]>::from(Sha256::digest(&persisted)) != manifest.artifact_digest {
+        return Err(PaperCheckpointRepositoryError::VerificationFailed);
+    }
+    let mut checkpoint =
+        PaperExecutionCheckpoint::decode(config.clone(), &persisted, maximum_bytes)?;
+    if checkpoint.sequence() != manifest.sequence
+        || checkpoint.configuration_digest() != manifest.configuration_digest
+        || checkpoint.recovery_input_digest()? != manifest.recovery_digest
+    {
+        return Err(PaperCheckpointRepositoryError::InvalidManifest);
+    }
+    checkpoint.bind_current_manifest(manifest.repository_id, manifest.generation);
+    let mut accounts = Vec::new();
+    accounts
+        .try_reserve_exact(manifest.account_replay.len())
+        .map_err(|_| PaperCheckpointRepositoryError::Allocation)?;
+    for replay in manifest.account_replay {
+        if accounts
+            .iter()
+            .any(|candidate: &PaperAccountRecoverySnapshot| {
+                candidate.state.account_id() == replay.account_id
+            })
+        {
+            return Err(PaperCheckpointRepositoryError::InvalidReplay);
+        }
+        let mut tombstones = Vec::new();
+        tombstones
+            .try_reserve_exact(replay.tombstones.len())
+            .map_err(|_| PaperCheckpointRepositoryError::Allocation)?;
+        tombstones.extend(replay.tombstones.into_iter().map(|tombstone| {
+            AccountIdempotencyTombstone::new(
+                tombstone.order_id,
+                tombstone.client_order_id,
+                OrderIntentDigest::from_bytes(tombstone.intent_digest),
+                tombstone.intent_expires_at,
+            )
+        }));
+        let idempotency = AccountIdempotencyBootstrap::try_new(replay.revision, tombstones)?;
+        let state = replay.state.into_state(replay.account_id)?;
+        accounts.push(PaperAccountRecoverySnapshot { state, idempotency });
+    }
+    accounts.sort_unstable_by_key(|account| account.state.account_id());
+    let checkpoint_accounts = checkpoint.reconciled_accounts_for_recovery()?;
+    if accounts.len() != checkpoint_accounts.len()
+        || accounts.iter().any(|account| {
+            !checkpoint_accounts.iter().any(|state| {
+                state.account_id() == account.state.account_id()
+                    && same_financial_state(state, &account.state)
+            })
+        })
+    {
+        return Err(PaperCheckpointRepositoryError::InvalidReplay);
+    }
+    Ok(Some(OpenedRecovery {
+        repository_id: manifest.repository_id,
+        generation: manifest.generation,
+        checkpoint,
+        accounts: accounts.into_boxed_slice(),
+    }))
+}
+
+fn same_financial_state(left: &ReconciledAccountState, right: &ReconciledAccountState) -> bool {
+    left.account_id() == right.account_id()
+        && left.eligible() == right.eligible()
+        && left.currency() == right.currency()
+        && left.cash() == right.cash()
+        && left.settled_capital() == right.settled_capital()
+        && left.marked_equity() == right.marked_equity()
+        && left.peak_marked_equity() == right.peak_marked_equity()
+        && left.marked_gross_exposure() == right.marked_gross_exposure()
+        && left.unrealized_pnl() == right.unrealized_pnl()
+        && left.drawdown() == right.drawdown()
+        && left.mark_digest() == right.mark_digest()
+        && left.realized_pnl() == right.realized_pnl()
+        && left.realized_loss() == right.realized_loss()
+        && left.positions() == right.positions()
+        && left.position_cost_basis() == right.position_cost_basis()
+}
+
+fn publish_current_manifest(
+    directory: &Dir,
+    manifest: &CurrentManifestWire,
+    repository_hex: &str,
+    generation: NonZeroU64,
+    maximum_bytes: usize,
+) -> Result<(), PaperCheckpointRepositoryError> {
+    let mut output = BoundedRepositoryWriter::new(maximum_bytes)?;
+    serde_json::to_writer(&mut output, manifest)
+        .map_err(PaperCheckpointRepositoryError::ManifestEncoding)?;
+    let bytes = output.into_inner();
+    let staging_reference = format!(
+        "{CHECKPOINT_OBJECT_ROOT}/current-stage-{repository_hex}-{}.tmp",
+        generation.get()
+    );
+    let staging_path = Path::new(&staging_reference);
+    let current_path = Path::new(CURRENT_MANIFEST_PATH);
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    options.follow(FollowSymlinks::No);
+    configure_private_creation(&mut options);
+    let mut staging = directory
+        .open_with(staging_path, &options)
+        .map_err(|source| io_error("create current paper checkpoint manifest", source))?;
+    let mut staging_guard = StagingGuard::new(directory, staging_path);
+    staging
+        .write_all(&bytes)
+        .map_err(|source| io_error("write current paper checkpoint manifest", source))?;
+    staging
+        .sync_all()
+        .map_err(|source| io_error("synchronize current paper checkpoint manifest", source))?;
+    drop(staging);
+    directory
+        .rename(staging_path, directory, current_path)
+        .map_err(|source| io_error("publish current paper checkpoint manifest", source))?;
+    staging_guard.disarm();
+    synchronize_current_manifest_directories(directory)?;
+    let persisted = read_bounded_regular(directory, current_path, maximum_bytes)?;
+    if persisted != bytes {
+        return Err(PaperCheckpointRepositoryError::VerificationFailed);
+    }
+    let verified: CurrentManifestWire = serde_json::from_slice(&persisted)
+        .map_err(PaperCheckpointRepositoryError::ManifestEncoding)?;
+    if verified.repository_id != manifest.repository_id
+        || verified.generation != manifest.generation
+        || verified.artifact_digest != manifest.artifact_digest
+        || verified.sequence != manifest.sequence
+    {
+        return Err(PaperCheckpointRepositoryError::VerificationFailed);
+    }
+    Ok(())
+}
+
+struct BoundedRepositoryWriter {
+    bytes: Vec<u8>,
+    maximum_bytes: usize,
+}
+
+impl BoundedRepositoryWriter {
+    fn new(maximum_bytes: usize) -> Result<Self, PaperCheckpointRepositoryError> {
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve(maximum_bytes.min(8 * 1024))
+            .map_err(|_| PaperCheckpointRepositoryError::Allocation)?;
+        Ok(Self {
+            bytes,
+            maximum_bytes,
+        })
+    }
+
+    fn into_inner(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+impl std::io::Write for BoundedRepositoryWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let next_len = self
+            .bytes
+            .len()
+            .checked_add(buffer.len())
+            .ok_or_else(|| std::io::Error::other("paper manifest byte bound overflowed"))?;
+        if next_len > self.maximum_bytes {
+            return Err(std::io::Error::other("paper manifest byte bound exceeded"));
+        }
+        self.bytes
+            .try_reserve(buffer.len())
+            .map_err(|_| std::io::Error::other("paper manifest allocation failed"))?;
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -253,6 +801,12 @@ pub enum PaperCheckpointRepositoryError {
     ConfigurationMismatch,
     #[error("paper checkpoint repository bounded allocation failed")]
     Allocation,
+    #[error("paper checkpoint namespace exists without one valid current manifest")]
+    PartialState,
+    #[error("current paper checkpoint manifest is structurally invalid")]
+    InvalidManifest,
+    #[error("current paper account replay image is structurally invalid")]
+    InvalidReplay,
     #[error("paper checkpoint artifact is not an unambiguous regular file")]
     UnsafeArtifact,
     #[error("paper checkpoint content-addressed object contains conflicting bytes")]
@@ -273,6 +827,12 @@ pub enum PaperCheckpointRepositoryError {
     ArtifactPath(#[from] ArtifactPathError),
     #[error(transparent)]
     Checkpoint(#[from] PaperCheckpointError),
+    #[error("paper checkpoint replay snapshot is invalid")]
+    Idempotency(#[from] AccountIdempotencyBootstrapError),
+    #[error("paper recovered account state is invalid")]
+    ReconciledAccount(#[from] ReconciledAccountStateError),
+    #[error("paper current-manifest encoding failed")]
+    ManifestEncoding(#[source] serde_json::Error),
     #[cfg(test)]
     #[error("injected paper checkpoint publication interruption")]
     TestInterruption,
@@ -300,6 +860,10 @@ impl<'directory> StagingGuard<'directory> {
             .map_err(|source| io_error("remove paper checkpoint staging file", source))?;
         self.armed = false;
         Ok(())
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
     }
 }
 
@@ -417,6 +981,31 @@ fn synchronize_publication_directories(
     Ok(())
 }
 
+#[cfg(unix)]
+fn synchronize_current_manifest_directories(
+    directory: &Dir,
+) -> Result<(), PaperCheckpointRepositoryError> {
+    for path in [
+        Path::new("paper-checkpoints/v1"),
+        Path::new("paper-checkpoints"),
+        Path::new("."),
+    ] {
+        directory
+            .open_dir(path)
+            .map(Dir::into_std_file)
+            .and_then(|file| file.sync_all())
+            .map_err(|source| io_error("synchronize current manifest directory", source))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn synchronize_current_manifest_directories(
+    _directory: &Dir,
+) -> Result<(), PaperCheckpointRepositoryError> {
+    Err(PaperCheckpointRepositoryError::UnsupportedDurability)
+}
+
 #[cfg(windows)]
 fn synchronize_publication_directories(
     _directory: &Dir,
@@ -443,13 +1032,14 @@ mod tests {
     use market_squawk_domain::{
         AccountId, Currency, Money, RuleVersion, SourceIdentifier, Timestamp, VenueId,
     };
+    use market_squawk_execution::{AccountIdempotencyBootstrap, ReconciledAccountState};
     use market_squawk_platform::LocalPaths;
     use rust_decimal::Decimal;
     use static_assertions::assert_not_impl_any;
 
     use super::{
-        PaperCheckpointPublicationPoint, PaperCheckpointReceipt, PaperCheckpointRepository,
-        PaperCheckpointRepositoryError, read_bounded_regular,
+        PaperAccountReplaySnapshot, PaperCheckpointPublicationPoint, PaperCheckpointReceipt,
+        PaperCheckpointRepository, PaperCheckpointRepositoryError, read_bounded_regular,
     };
     use crate::{
         FeeSchedule, PaperAccountBootstrap, PaperExecutionCheckpoint, PaperExecutionConfig,
@@ -489,7 +1079,7 @@ mod tests {
                 NonZeroUsize::new(1024 * 1024).ok_or("zero checkpoint bound")?,
             )?;
 
-            let interrupted = repository.persist_with_checkpoint(&checkpoint, |observed| {
+            let interrupted = repository.persist_with_checkpoint(&checkpoint, &[], |observed| {
                 if observed == interrupted_at {
                     Err(PaperCheckpointRepositoryError::TestInterruption)
                 } else {
@@ -537,11 +1127,9 @@ mod tests {
             b"conflicting checkpoint bytes",
         )?;
 
-        let mut retry =
-            PaperCheckpointRepository::try_new(paths.artifacts()?.clone(), config, maximum_bytes)?;
         assert!(matches!(
-            retry.persist(&checkpoint),
-            Err(PaperCheckpointRepositoryError::ContentConflict)
+            PaperCheckpointRepository::try_new(paths.artifacts()?.clone(), config, maximum_bytes),
+            Err(PaperCheckpointRepositoryError::VerificationFailed)
         ));
         Ok(())
     }
@@ -566,7 +1154,49 @@ mod tests {
             &checkpoint.encode(maximum_bytes.get())?,
             maximum_bytes.get(),
         )?;
-        let second = repository.persist(&recovered)?;
+        let paper_state = &recovered.reconciled_accounts_for_recovery()?[0];
+        let risk_state = ReconciledAccountState::try_new(
+            paper_state.account_id(),
+            paper_state
+                .revision()
+                .checked_add(1)
+                .ok_or("risk revision overflow")?,
+            paper_state.eligible(),
+            paper_state.currency(),
+            paper_state.cash(),
+            paper_state.settled_capital(),
+            paper_state.marked_equity(),
+            paper_state.peak_marked_equity(),
+            paper_state.marked_gross_exposure(),
+            paper_state.unrealized_pnl(),
+            paper_state.drawdown(),
+            paper_state.mark_digest(),
+            paper_state.realized_pnl(),
+            paper_state.realized_loss(),
+            paper_state.positions().to_vec(),
+            paper_state.position_cost_basis().to_vec(),
+        )?;
+        let replay = [PaperAccountReplaySnapshot::from_reconciled_state(
+            risk_state.clone(),
+            AccountIdempotencyBootstrap::empty(),
+        )];
+        let second = repository.persist_with_replay(&recovered, &replay)?;
+        let mut reopened = PaperCheckpointRepository::try_new(
+            paths.artifacts()?.clone(),
+            config.clone(),
+            maximum_bytes,
+        )?;
+        let current = reopened.take_recovery().ok_or("missing current recovery")?;
+        assert_eq!(reopened.binding_identity(), repository.binding_identity());
+        let mut expected_current = recovered.clone();
+        expected_current.bind_current_manifest(repository.binding_identity(), second.generation());
+        assert_eq!(current.checkpoint(), &expected_current);
+        assert_eq!(current.accounts().len(), 1);
+        assert_eq!(current.accounts()[0].state(), &risk_state);
+        assert_eq!(
+            current.accounts()[0].idempotency(),
+            &AccountIdempotencyBootstrap::empty()
+        );
         let mut alternate = PaperCheckpointRepository::try_new(
             alternate_paths.artifacts()?.clone(),
             config,

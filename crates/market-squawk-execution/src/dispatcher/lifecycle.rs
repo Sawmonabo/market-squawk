@@ -9,8 +9,8 @@ use market_squawk_domain::{ApprovalId, OrderId, Timestamp};
 use super::attempt::attempt_adapter_call;
 use super::{
     DispatchRecord, DispatchRegistry, DispatchState, ExecutionDispatchError, ExecutionDispatcher,
-    ExecutionDispatcherShutdown, PendingReconciliation, PendingReconciliationStatus,
-    adapter_reason, commit_dispatch_audit, try_registry,
+    ExecutionDispatcherQuiesce, ExecutionDispatcherShutdown, PendingReconciliation,
+    PendingReconciliationStatus, adapter_reason, commit_dispatch_audit, try_registry,
 };
 use crate::account::{AccountOutcomeFailSafe, AccountRiskReservation};
 use crate::audit::{ExecutionAuditContext, ExecutionAuditPermit};
@@ -252,7 +252,10 @@ impl ExecutionDispatcher {
             (admissions, order_ids, invoked)
         };
 
-        let operation = super::operation(self.operation_deadline, self.cancellation.child_token())?;
+        let operation = super::operation(
+            self.operation_deadline,
+            self.control_cancellation.child_token(),
+        )?;
         let deadline = operation.deadline();
         let cancellation = operation.cancellation();
         let request = ReconcileOrders::new(order_ids.clone().into_boxed_slice(), operation);
@@ -528,6 +531,75 @@ impl ExecutionDispatcher {
         self.retry_pending_reconciliation().await
     }
 
+    /// Reconciles complete backend account state when no accepted-order reservation can serve as
+    /// the replacement anchor. This control-plane operation is used for mark-only financial
+    /// changes after terminal order ownership has already closed.
+    pub async fn reconcile_accounts(&self) -> Result<ExecutionState, ExecutionDispatchError> {
+        let has_pending = {
+            let registry = try_registry(&self.registry)?;
+            registry.pending_reconciliation.is_some()
+        };
+        if has_pending {
+            return self.retry_pending_reconciliation().await;
+        }
+        let task_permit = self.try_reserve_adapter_task()?;
+        let invoked = system_now().map_err(|_| ExecutionDispatchError::ClockUnavailable)?;
+        let operation = super::operation(
+            self.operation_deadline,
+            self.control_cancellation.child_token(),
+        )?;
+        let deadline = operation.deadline();
+        let cancellation = operation.cancellation();
+        let request = ReconcileOrders::new(Box::new([]), operation);
+        let (result, deadline_exceeded) = attempt_adapter_call(
+            &self.adapter,
+            deadline,
+            &cancellation,
+            task_permit,
+            move |adapter| async move { adapter.reconcile(request).await },
+        )
+        .await;
+        if deadline_exceeded {
+            return Err(ExecutionDispatchError::OperationDeadlineExceeded);
+        }
+        let state = result.map_err(ExecutionDispatchError::Adapter)?;
+        let post_call = system_now().map_err(|_| ExecutionDispatchError::ClockUnavailable)?;
+        if cancellation.is_cancelled()
+            || tokio::time::Instant::now() >= deadline
+            || post_call.wall < invoked.wall
+            || post_call.monotonic < invoked.monotonic
+            || state.observed_at() < invoked.wall
+            || state.observed_at() > post_call.wall
+            || !state.orders().is_empty()
+            || state.accounts().is_empty()
+            || state.source_binding().is_none()
+            || state.reconciliation_required()
+        {
+            return Err(ExecutionDispatchError::AccountReplacementRejected);
+        }
+        let source = state
+            .source_binding()
+            .ok_or(ExecutionDispatchError::AccountReplacementRejected)?;
+        let invocation_digest = reconciliation_digest(&state, &[], invoked.wall);
+        self.accounts
+            .replace_unreserved_reconciled_accounts(source, invocation_digest, state.accounts())
+            .map_err(|_| ExecutionDispatchError::AccountReplacementRejected)?;
+        let batch = ReconciliationBatchBinding::from_dispatcher_digest(invocation_digest)
+            .map_err(|_| ExecutionDispatchError::AccountReplacementRejected)?;
+        let pending = PendingReconciliation::try_new(batch, Box::new([]), state)?;
+        {
+            let mut registry = try_registry(&self.registry)?;
+            if pending.retained_bytes > self.maximum_pending_reconciliation_bytes
+                || registry.finalized_reconciliations.len()
+                    >= registry.maximum_finalized_reconciliations
+            {
+                return Err(ExecutionDispatchError::PendingReconciliationCapacity);
+            }
+            registry.pending_reconciliation = Some(pending);
+        }
+        self.retry_pending_reconciliation().await
+    }
+
     async fn retry_pending_reconciliation(&self) -> Result<ExecutionState, ExecutionDispatchError> {
         let task_permit = self.try_reserve_adapter_task()?;
         let (batch, order_ids) = {
@@ -541,7 +613,10 @@ impl ExecutionDispatcher {
                     return Err(ExecutionDispatchError::ReconciliationAcknowledgementPending);
                 }
                 PendingReconciliationStatus::BackendAcknowledged => {
-                    return finalize_pending_reconciliation(&mut registry);
+                    let state = finalize_pending_reconciliation(&mut registry)?;
+                    drop(registry);
+                    self.acknowledge_account_sequence(&state)?;
+                    return Ok(state);
                 }
                 PendingReconciliationStatus::Ready => {}
             }
@@ -553,14 +628,16 @@ impl ExecutionDispatcher {
             pending.status = PendingReconciliationStatus::InFlight;
             (pending.batch, order_ids.into_boxed_slice())
         };
-        let operation =
-            match super::operation(self.operation_deadline, self.cancellation.child_token()) {
-                Ok(operation) => operation,
-                Err(error) => {
-                    restore_pending_acknowledgement(&self.registry, batch);
-                    return Err(error);
-                }
-            };
+        let operation = match super::operation(
+            self.operation_deadline,
+            self.control_cancellation.child_token(),
+        ) {
+            Ok(operation) => operation,
+            Err(error) => {
+                restore_pending_acknowledgement(&self.registry, batch);
+                return Err(error);
+            }
+        };
         let deadline = operation.deadline();
         let cancellation = operation.cancellation();
         let acknowledgement = ReconciliationAcknowledgement::new(batch, order_ids, operation);
@@ -592,34 +669,63 @@ impl ExecutionDispatcher {
                     return Err(ExecutionDispatchError::RegistryInvariant);
                 }
                 pending.status = PendingReconciliationStatus::BackendAcknowledged;
-                finalize_pending_reconciliation(&mut registry)
+                let state = finalize_pending_reconciliation(&mut registry)?;
+                drop(registry);
+                self.acknowledge_account_sequence(&state)?;
+                Ok(state)
             }
         }
     }
 
-    /// Closes admission, drains accepted queue entries, and joins the worker within the deadline.
-    pub async fn shutdown(mut self) -> ExecutionDispatcherShutdown {
-        self.cancellation.cancel();
+    fn acknowledge_account_sequence(
+        &self,
+        state: &ExecutionState,
+    ) -> Result<(), ExecutionDispatchError> {
+        if let Some(source) = state.source_binding() {
+            self.accounts
+                .reconciliation_fence()
+                .acknowledge(source.snapshot_sequence())
+                .map_err(|_| ExecutionDispatchError::AccountReplacementRejected)?;
+        }
+        Ok(())
+    }
+
+    /// Closes admission, drains accepted queue entries, and joins the worker while retaining
+    /// control-plane authority for final reconciliation and persistence.
+    pub async fn quiesce(&mut self) -> ExecutionDispatcherQuiesce {
+        self.admission_cancellation.cancel();
         let Some(mut worker) = self.worker.take() else {
-            mark_shutdown_reconciliation(&self.registry);
-            return ExecutionDispatcherShutdown::JoinError;
+            return ExecutionDispatcherQuiesce::AlreadyQuiesced;
         };
-        let outcome = match tokio::time::timeout(self.shutdown_deadline, worker.join()).await {
-            Ok(Ok(())) => ExecutionDispatcherShutdown::Complete,
-            Ok(Err(_)) => ExecutionDispatcherShutdown::JoinError,
+        match tokio::time::timeout(self.shutdown_deadline, worker.join()).await {
+            Ok(Ok(())) => ExecutionDispatcherQuiesce::Complete,
+            Ok(Err(_)) => ExecutionDispatcherQuiesce::JoinError,
             Err(_) => {
                 worker.transfer();
-                ExecutionDispatcherShutdown::Incomplete
+                ExecutionDispatcherQuiesce::Incomplete
             }
-        };
+        }
+    }
+
+    /// Closes admission and control operations and releases every remaining reservation fail-safe.
+    pub async fn shutdown(mut self) -> ExecutionDispatcherShutdown {
+        let quiesce = self.quiesce().await;
+        self.control_cancellation.cancel();
         mark_shutdown_reconciliation(&self.registry);
-        outcome
+        match quiesce {
+            ExecutionDispatcherQuiesce::Complete | ExecutionDispatcherQuiesce::AlreadyQuiesced => {
+                ExecutionDispatcherShutdown::Complete
+            }
+            ExecutionDispatcherQuiesce::JoinError => ExecutionDispatcherShutdown::JoinError,
+            ExecutionDispatcherQuiesce::Incomplete => ExecutionDispatcherShutdown::Incomplete,
+        }
     }
 }
 
 impl Drop for ExecutionDispatcher {
     fn drop(&mut self) {
-        self.cancellation.cancel();
+        self.admission_cancellation.cancel();
+        self.control_cancellation.cancel();
         if let Some(worker) = self.worker.take() {
             worker.transfer();
         }

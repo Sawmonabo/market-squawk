@@ -78,29 +78,29 @@ impl PaperWorker {
         }
         affected_accounts.sort_unstable();
         affected_accounts.dedup();
-        if affected_accounts.is_empty() {
-            return ExecutionState::try_new(
-                observed_at,
-                orders,
-                self.state.reconciliation_required,
-            )
-            .map_err(|_| ExecutionAdapterError::KnownFailure);
-        }
         let mut accounts = Vec::new();
-        accounts
-            .try_reserve_exact(affected_accounts.len())
-            .map_err(|_| ExecutionAdapterError::KnownFailure)?;
-        for account_id in affected_accounts {
-            accounts.push(
-                self.state
-                    .ledger
-                    .reconciled_account_state(
-                        account_id,
-                        observed_at,
-                        self.config.input().maximum_mark_age_nanos,
-                    )
-                    .map_err(|_| ExecutionAdapterError::ReconciliationRequired)?,
-            );
+        if order_ids.is_empty() {
+            accounts = self
+                .state
+                .ledger
+                .reconciled_account_states(observed_at, self.config.input().maximum_mark_age_nanos)
+                .map_err(|_| ExecutionAdapterError::ReconciliationRequired)?;
+        } else {
+            accounts
+                .try_reserve_exact(affected_accounts.len())
+                .map_err(|_| ExecutionAdapterError::KnownFailure)?;
+            for account_id in affected_accounts {
+                accounts.push(
+                    self.state
+                        .ledger
+                        .reconciled_account_state(
+                            account_id,
+                            observed_at,
+                            self.config.input().maximum_mark_age_nanos,
+                        )
+                        .map_err(|_| ExecutionAdapterError::ReconciliationRequired)?,
+                );
+            }
         }
         let checkpoint = self
             .checkpoint()

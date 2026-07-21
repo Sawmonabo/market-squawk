@@ -64,8 +64,10 @@ impl ExecutionDispatcher {
             (fail_safe, invoked)
         };
         let (fail_safe, invoked) = fail_safe;
-        let operation =
-            super::super::operation(self.operation_deadline, self.cancellation.child_token())?;
+        let operation = super::super::operation(
+            self.operation_deadline,
+            self.control_cancellation.child_token(),
+        )?;
         let deadline = operation.deadline();
         let cancellation = operation.cancellation();
         let (result, deadline_exceeded) =

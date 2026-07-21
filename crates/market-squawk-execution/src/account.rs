@@ -1,14 +1,16 @@
 //! Fixed-capacity account ownership and atomic risk reservations.
 
 mod contracts;
+mod reconciliation;
 mod replacement;
 mod reservation;
 
 pub use contracts::{
     AccountBootstrap, AccountCoordinatorConfig, AccountCoordinatorError,
     AccountIdempotencyBootstrap, AccountIdempotencyBootstrapError, AccountIdempotencySnapshotError,
-    AccountIdempotencyTombstone,
+    AccountIdempotencyTombstone, AccountRecoveryBootstrap, AccountRecoverySnapshotError,
 };
+pub use reconciliation::{AccountReconciliationFenceError, AccountRiskReconciliationFence};
 pub(crate) use replacement::{
     AccountReplacementCandidate, AccountReplacementReservationBinding, AccountStateReplacementBatch,
 };
@@ -38,6 +40,7 @@ use crate::{OrderIntent, RiskLimits};
 pub struct AccountRiskCoordinator {
     config: AccountCoordinatorConfig,
     partitions: Box<[Mutex<AccountPartition>]>,
+    reconciliation: AccountRiskReconciliationFence,
 }
 
 impl AccountRiskCoordinator {
@@ -49,6 +52,19 @@ impl AccountRiskCoordinator {
     pub fn try_new(
         config: AccountCoordinatorConfig,
         accounts: impl IntoIterator<Item = AccountBootstrap>,
+    ) -> Result<Self, AccountCoordinatorError> {
+        Self::try_new_at_reconciled_sequence(config, accounts, 0)
+    }
+
+    /// Restores account ownership at the exact durably reconciled backend sequence.
+    ///
+    /// # Errors
+    ///
+    /// Applies the same validation as [`Self::try_new`].
+    pub fn try_new_at_reconciled_sequence(
+        config: AccountCoordinatorConfig,
+        accounts: impl IntoIterator<Item = AccountBootstrap>,
+        reconciled_sequence: u64,
     ) -> Result<Self, AccountCoordinatorError> {
         let now = system_now().map_err(|_| AccountCoordinatorError::ClockFailure)?;
         if config.maximum_intent_lifetime_nanos.get() > i64::MAX as u64 {
@@ -83,7 +99,56 @@ impl AccountRiskCoordinator {
                 .map(Mutex::new)
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
+            reconciliation: AccountRiskReconciliationFence::new(reconciled_sequence),
         })
+    }
+
+    /// Restores exact marked financial state and replay identities at one durable backend sequence.
+    pub fn try_new_from_recovery(
+        config: AccountCoordinatorConfig,
+        accounts: impl IntoIterator<Item = AccountRecoveryBootstrap>,
+        reconciled_sequence: u64,
+    ) -> Result<Self, AccountCoordinatorError> {
+        let now = system_now().map_err(|_| AccountCoordinatorError::ClockFailure)?;
+        if config.maximum_intent_lifetime_nanos.get() > i64::MAX as u64 {
+            return Err(AccountCoordinatorError::InvalidIdempotencyBootstrap);
+        }
+        let mut partitions = Vec::with_capacity(config.partition_count.get());
+        for _ in 0..config.partition_count.get() {
+            partitions.push(AccountPartition {
+                accounts: HashMap::with_capacity(config.max_accounts_per_partition.get()),
+            });
+        }
+        for account in accounts {
+            validate_idempotency(&account.idempotency, config, now)?;
+            let account_id = account.state.account_id();
+            let index = partition_index(account_id, config.partition_count.get());
+            let partition = &mut partitions[index];
+            if partition.accounts.contains_key(&account_id) {
+                return Err(AccountCoordinatorError::DuplicateAccount);
+            }
+            if partition.accounts.len() >= config.max_accounts_per_partition.get() {
+                return Err(AccountCoordinatorError::AccountCapacity);
+            }
+            partition.accounts.insert(
+                account_id,
+                AccountState::try_from_recovery(account.state, account.idempotency, config)?,
+            );
+        }
+        Ok(Self {
+            config,
+            partitions: partitions
+                .into_iter()
+                .map(Mutex::new)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            reconciliation: AccountRiskReconciliationFence::new(reconciled_sequence),
+        })
+    }
+
+    /// Returns the fail-closed sequence fence passed to the authoritative execution backend.
+    pub fn reconciliation_fence(&self) -> AccountRiskReconciliationFence {
+        self.reconciliation.clone()
     }
 
     /// Evaluates current authoritative account state without consuming rate or idempotency space.
@@ -96,6 +161,7 @@ impl AccountRiskCoordinator {
         reservation_price: PriceTicks,
         limits: &RiskLimits,
     ) -> Result<(), AccountReservationError> {
+        self.require_reconciled()?;
         let now = system_now().map_err(|_| {
             AccountReservationError::from_reason(AccountRiskViolation::ClockFailure)
         })?;
@@ -118,9 +184,11 @@ impl AccountRiskCoordinator {
                 AccountRiskViolation::AccountNotFound,
             ));
         };
-        account
+        let result = account
             .assess(intent, reservation_price, limits, now, self.config)
-            .map(|_| ())
+            .map(|_| ());
+        self.require_reconciled()?;
+        result
     }
 
     /// Atomically reserves account cash, position, exposure, rate, and idempotency capacity.
@@ -155,7 +223,14 @@ impl AccountRiskCoordinator {
                 AccountRiskViolation::AccountNotFound,
             ));
         };
-        account.try_reserve(intent, reservation_price, limits, now, self.config)
+        account.try_reserve(
+            intent,
+            reservation_price,
+            limits,
+            now,
+            self.config,
+            &self.reconciliation,
+        )
     }
 
     /// Returns one bounded, restart-loadable replay-fence snapshot for durable persistence.
@@ -187,6 +262,76 @@ impl AccountRiskCoordinator {
             revision: account.idempotency_revision,
             tombstones: account.idempotency_tombstones.clone().into_boxed_slice(),
         })
+    }
+
+    /// Captures exact marked financial state after admission has quiesced and reservations closed.
+    pub fn snapshot_recovery_state(
+        &self,
+        account_id: AccountId,
+    ) -> Result<crate::ReconciledAccountState, AccountRecoverySnapshotError> {
+        let index = partition_index(account_id, self.config.partition_count.get());
+        let partition = match self.partitions[index].try_lock() {
+            Ok(partition) => partition,
+            Err(TryLockError::WouldBlock) => return Err(AccountRecoverySnapshotError::Busy),
+            Err(TryLockError::Poisoned(_)) => return Err(AccountRecoverySnapshotError::Poisoned),
+        };
+        let account = partition
+            .accounts
+            .get(&account_id)
+            .ok_or(AccountRecoverySnapshotError::AccountNotFound)?;
+        if account.reservations.iter().any(ReservationRecord::retained) {
+            return Err(AccountRecoverySnapshotError::ActiveReservation);
+        }
+        let mut positions = Vec::new();
+        positions
+            .try_reserve_exact(account.positions.len())
+            .map_err(|_| AccountRecoverySnapshotError::Allocation)?;
+        positions.extend(
+            account
+                .positions
+                .iter()
+                .map(|(instrument, lots)| (*instrument, *lots)),
+        );
+        let mut position_cost_basis = Vec::new();
+        position_cost_basis
+            .try_reserve_exact(account.position_cost_basis.len())
+            .map_err(|_| AccountRecoverySnapshotError::Allocation)?;
+        position_cost_basis.extend(
+            account
+                .position_cost_basis
+                .iter()
+                .map(|(instrument, basis)| (*instrument, *basis)),
+        );
+        crate::ReconciledAccountState::try_new(
+            account_id,
+            NonZeroU64::new(account.account_revision.load(Ordering::Acquire))
+                .ok_or(AccountRecoverySnapshotError::InvalidState)?,
+            account.eligible,
+            account.currency,
+            account.cash,
+            account.settled_capital,
+            account.capital,
+            account.peak_capital,
+            account.gross_exposure,
+            account.unrealized_pnl,
+            account.drawdown,
+            account.mark_digest,
+            account.realized_pnl,
+            account.realized_loss,
+            positions,
+            position_cost_basis,
+        )
+        .map_err(|_| AccountRecoverySnapshotError::InvalidState)
+    }
+
+    fn require_reconciled(&self) -> Result<(), AccountReservationError> {
+        if self.reconciliation.is_current() {
+            Ok(())
+        } else {
+            Err(AccountReservationError::from_reason(
+                AccountRiskViolation::ReconciliationRequired,
+            ))
+        }
     }
 }
 
@@ -277,6 +422,64 @@ impl AccountState {
         })
     }
 
+    fn try_from_recovery(
+        state: crate::ReconciledAccountState,
+        idempotency: AccountIdempotencyBootstrap,
+        config: AccountCoordinatorConfig,
+    ) -> Result<Self, AccountCoordinatorError> {
+        if state.positions().len() > config.max_positions_per_account.get()
+            || state.position_cost_basis().len() > config.max_positions_per_account.get()
+        {
+            return Err(AccountCoordinatorError::InvalidBootstrap);
+        }
+        let mut positions = HashMap::new();
+        positions
+            .try_reserve(config.max_positions_per_account.get())
+            .map_err(|_| AccountCoordinatorError::Allocation)?;
+        positions.extend(state.positions().iter().copied());
+        let mut position_cost_basis = HashMap::new();
+        position_cost_basis
+            .try_reserve(config.max_positions_per_account.get())
+            .map_err(|_| AccountCoordinatorError::Allocation)?;
+        position_cost_basis.extend(state.position_cost_basis().iter().copied());
+        let mut reservations = Vec::new();
+        reservations
+            .try_reserve_exact(config.max_reservations_per_account.get())
+            .map_err(|_| AccountCoordinatorError::Allocation)?;
+        let mut idempotency_tombstones = Vec::new();
+        idempotency_tombstones
+            .try_reserve_exact(config.max_idempotency_keys_per_account.get())
+            .map_err(|_| AccountCoordinatorError::Allocation)?;
+        idempotency_tombstones.extend(idempotency.tombstones.iter().cloned());
+        let mut rate_events = VecDeque::new();
+        rate_events
+            .try_reserve_exact(config.max_rate_events_per_account.get())
+            .map_err(|_| AccountCoordinatorError::Allocation)?;
+        Ok(Self {
+            eligible: state.eligible(),
+            currency: state.currency(),
+            cash: state.cash(),
+            settled_capital: state.settled_capital(),
+            capital: state.marked_equity(),
+            peak_capital: state.peak_marked_equity(),
+            gross_exposure: state.marked_gross_exposure(),
+            unrealized_pnl: state.unrealized_pnl(),
+            drawdown: state.drawdown(),
+            mark_digest: state.mark_digest(),
+            realized_pnl: state.realized_pnl(),
+            realized_loss: state.realized_loss(),
+            positions,
+            position_cost_basis,
+            account_revision: Arc::new(AtomicU64::new(state.revision().get())),
+            reconciliation_required: Arc::new(AtomicBool::new(false)),
+            reservations,
+            idempotency_revision: idempotency.revision,
+            idempotency_tombstones,
+            rate_events,
+            last_reconciliation: None,
+        })
+    }
+
     fn try_reserve(
         &mut self,
         intent: &OrderIntent,
@@ -284,7 +487,13 @@ impl AccountState {
         limits: &RiskLimits,
         now: ClockReading,
         config: AccountCoordinatorConfig,
+        reconciliation: &AccountRiskReconciliationFence,
     ) -> Result<AccountRiskReservation, AccountReservationError> {
+        if !reconciliation.is_current() {
+            return Err(AccountReservationError::from_reason(
+                AccountRiskViolation::ReconciliationRequired,
+            ));
+        }
         let oldest = now
             .wall
             .unix_nanos()
@@ -325,6 +534,12 @@ impl AccountState {
             wall_expiry,
             monotonic_expiry,
         ));
+
+        if !reconciliation.is_current() {
+            return Err(AccountReservationError::from_reason(
+                AccountRiskViolation::ReconciliationRequired,
+            ));
+        }
 
         // Every fallible calculation is complete. The preallocated collections below now publish
         // the reservation, tombstone, revision, and rate event as one infallible lock-owned step.
@@ -501,13 +716,12 @@ impl AccountState {
                 return;
             }
         };
-        if intent.side() == OrderSide::Buy
-            && active
-                .cash
-                .checked_add(calculation.cash)
-                .is_ok_and(|reserved| reserved.amount() > self.cash.amount())
-        {
-            reasons.push(AccountRiskViolation::InsufficientCash);
+        if intent.side() == OrderSide::Buy {
+            match checked_reserved_cash(active.cash, calculation.cash, self.cash) {
+                Ok(true) => reasons.push(AccountRiskViolation::InsufficientCash),
+                Ok(false) => {}
+                Err(()) => reasons.push(AccountRiskViolation::ArithmeticOverflow),
+            }
         }
         let current_position = self
             .positions
@@ -605,6 +819,13 @@ struct ActiveTotals {
     signed_quantity: i64,
 }
 
+fn checked_reserved_cash(active: Money, candidate: Money, available: Money) -> Result<bool, ()> {
+    active
+        .checked_add(candidate)
+        .map(|reserved| reserved.amount() > available.amount())
+        .map_err(|_| ())
+}
+
 #[derive(Debug)]
 struct ReservationRecord {
     order_id: market_squawk_domain::OrderId,
@@ -682,6 +903,14 @@ fn validate_bootstrap(
     {
         return Err(AccountCoordinatorError::InvalidBootstrap);
     }
+    validate_idempotency(&account.idempotency, config, now)
+}
+
+fn validate_idempotency(
+    idempotency: &AccountIdempotencyBootstrap,
+    config: AccountCoordinatorConfig,
+    now: ClockReading,
+) -> Result<(), AccountCoordinatorError> {
     let maximum_expiry = now
         .wall
         .checked_add_nanos(
@@ -689,8 +918,8 @@ fn validate_bootstrap(
                 .map_err(|_| AccountCoordinatorError::InvalidIdempotencyBootstrap)?,
         )
         .unwrap_or(Timestamp::from_unix_nanos(i64::MAX));
-    if account.idempotency.tombstones.len() > config.max_idempotency_keys_per_account.get()
-        || account.idempotency.tombstones.iter().any(|tombstone| {
+    if idempotency.tombstones.len() > config.max_idempotency_keys_per_account.get()
+        || idempotency.tombstones.iter().any(|tombstone| {
             now.wall > tombstone.intent_expires_at || tombstone.intent_expires_at > maximum_expiry
         })
     {
@@ -708,4 +937,23 @@ fn partition_index(account_id: AccountId, partition_count: usize) -> usize {
             (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
         });
     usize::try_from(hash % partition_count as u64).unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use market_squawk_domain::{Currency, Money};
+    use rust_decimal::Decimal;
+
+    use super::checked_reserved_cash;
+
+    #[test]
+    fn candidate_cash_overflow_is_not_treated_as_available()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let currency = Currency::try_from("USD")?;
+        let maximum = Money::new(Decimal::MAX, currency);
+        let candidate = Money::new(Decimal::ONE, currency);
+
+        assert!(checked_reserved_cash(maximum, candidate, maximum).is_err());
+        Ok(())
+    }
 }

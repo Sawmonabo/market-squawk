@@ -6,6 +6,7 @@ use market_squawk_domain::{AccountId, ClientOrderId, InstrumentId, Money, OrderI
 use thiserror::Error;
 
 use crate::OrderIntentDigest;
+use crate::ReconciledAccountState;
 
 /// Startup-fixed memory and partition bounds for authoritative account coordination.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -74,6 +75,13 @@ pub struct AccountBootstrap {
     /// Nonnegative open cost basis keyed exactly to every retained position.
     pub position_cost_basis: Vec<(InstrumentId, Money)>,
     /// Authoritative non-expired replay fence loaded before live risk admission.
+    pub idempotency: AccountIdempotencyBootstrap,
+}
+
+/// Exact authoritative account image and replay fence restored before live admission.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AccountRecoveryBootstrap {
+    pub state: ReconciledAccountState,
     pub idempotency: AccountIdempotencyBootstrap,
 }
 
@@ -220,4 +228,21 @@ pub enum AccountIdempotencySnapshotError {
     ClockFailure,
     #[error("idempotency replay-fence revision exhausted")]
     RevisionExhausted,
+}
+
+/// Nonblocking exact financial-state snapshot failure used only at a quiescent persistence barrier.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum AccountRecoverySnapshotError {
+    #[error("account does not exist")]
+    AccountNotFound,
+    #[error("account coordinator partition is busy")]
+    Busy,
+    #[error("account coordinator partition is poisoned")]
+    Poisoned,
+    #[error("account still owns an active reservation")]
+    ActiveReservation,
+    #[error("account financial state cannot be represented as a recovery image")]
+    InvalidState,
+    #[error("account recovery snapshot allocation failed")]
+    Allocation,
 }

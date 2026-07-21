@@ -1,16 +1,18 @@
 //! Single-writer paper state, matching, reconciliation, and shutdown.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use market_squawk_domain::{AccountId, ClientOrderId, OrderId, TimeInForce, Timestamp};
 use market_squawk_execution::{
-    CancelOrder, CancelReceipt, CancelStatus, DispatchOrder, ExecutionAdapterError,
-    ExecutionMarketUpdate, ExecutionReceipt, ExecutionState, PersistenceAcknowledgement,
-    ReconcileOrders, ReconciliationAcknowledgement, ReconciliationBatchBinding,
+    AccountRiskReconciliationFence, CancelOrder, CancelReceipt, CancelStatus, DispatchOrder,
+    ExecutionAdapterError, ExecutionMarketUpdate, ExecutionReceipt, ExecutionState,
+    PersistenceAcknowledgement, ReconcileOrders, ReconciliationAcknowledgement,
+    ReconciliationBatchBinding,
 };
-use tokio::sync::{OwnedSemaphorePermit, mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::audit::{PaperAuditKind, PaperAuditRecord};
@@ -71,6 +73,10 @@ pub(crate) enum WorkerCommand {
         control: PaperControlContext,
         reply: oneshot::Sender<Result<PaperExecutionCheckpoint, PaperControlError>>,
     },
+    TerminalizeRecovery {
+        control: PaperControlContext,
+        reply: oneshot::Sender<Result<(), PaperControlError>>,
+    },
     Shutdown {
         control: PaperControlContext,
         reply: oneshot::Sender<Result<PaperExecutionSnapshot, PaperControlError>>,
@@ -98,6 +104,7 @@ impl WorkerCommand {
             Self::Cancel { .. }
             | Self::Snapshot { .. }
             | Self::Checkpoint { .. }
+            | Self::TerminalizeRecovery { .. }
             | Self::Shutdown { .. } => 0,
         };
         inline
@@ -141,6 +148,8 @@ pub(crate) struct PaperWorker {
     audit: mpsc::Sender<PaperAuditRecord>,
     audit_failed: Arc<AtomicBool>,
     cancellation: CancellationToken,
+    reconciliation_fence: Option<AccountRiskReconciliationFence>,
+    financial_changes: watch::Sender<u64>,
 }
 
 #[derive(Debug)]
@@ -239,6 +248,8 @@ impl PaperWorker {
         audit: mpsc::Sender<PaperAuditRecord>,
         audit_failed: Arc<AtomicBool>,
         cancellation: CancellationToken,
+        reconciliation_fence: Option<AccountRiskReconciliationFence>,
+        financial_changes: watch::Sender<u64>,
     ) -> Self {
         let state = if let Some(checkpoint) = checkpoint {
             WorkerState {
@@ -283,7 +294,29 @@ impl PaperWorker {
             audit,
             audit_failed,
             cancellation,
+            reconciliation_fence,
+            financial_changes,
         }
+    }
+
+    fn fence_financial_mutation(&mut self, sequence: u64) -> bool {
+        let Some(sequence) = NonZeroU64::new(sequence) else {
+            self.state.reconciliation_required = true;
+            return false;
+        };
+        if self
+            .reconciliation_fence
+            .as_ref()
+            .is_some_and(|fence| fence.require(sequence).is_err())
+        {
+            self.state.reconciliation_required = true;
+            return false;
+        }
+        true
+    }
+
+    fn publish_financial_mutation(&self, sequence: u64) {
+        self.financial_changes.send_replace(sequence);
     }
 
     pub(crate) async fn run(mut self) {
@@ -388,6 +421,15 @@ impl PaperWorker {
                 let _ = reply.send(result);
                 false
             }
+            WorkerCommand::TerminalizeRecovery { control, reply } => {
+                let result = if control.is_expired() {
+                    Err(PaperControlError::DeadlineExceeded)
+                } else {
+                    self.terminalize_recovery_orders()
+                };
+                let _ = reply.send(result);
+                false
+            }
             WorkerCommand::Shutdown { control, reply } => {
                 if control.is_expired() {
                     let _ = reply.send(Err(PaperControlError::DeadlineExceeded));
@@ -399,6 +441,44 @@ impl PaperWorker {
                 }
             }
         }
+    }
+
+    fn terminalize_recovery_orders(&mut self) -> Result<(), PaperControlError> {
+        let event_at = crate::adapter::system_timestamp().map_err(PaperControlError::Adapter)?;
+        let mut orders = Vec::new();
+        orders
+            .try_reserve_exact(self.state.orders.len())
+            .map_err(|_| PaperControlError::Adapter(ExecutionAdapterError::NotAttemptedBusy))?;
+        orders.extend(
+            self.state
+                .orders
+                .values()
+                .filter(|order| !is_terminal(order.lifecycle.state()))
+                .cloned(),
+        );
+        for order in orders {
+            if order.lifecycle.state() == PaperOrderState::CancelPending {
+                self.confirm_cancel(order, event_at);
+            } else {
+                self.cancel_remainder(order, event_at);
+            }
+            if self.state.reconciliation_required {
+                return Err(PaperControlError::Adapter(
+                    ExecutionAdapterError::ReconciliationRequired,
+                ));
+            }
+        }
+        if self
+            .state
+            .orders
+            .values()
+            .any(|order| !is_terminal(order.lifecycle.state()))
+        {
+            return Err(PaperControlError::Adapter(
+                ExecutionAdapterError::ReconciliationRequired,
+            ));
+        }
+        Ok(())
     }
 
     fn acknowledge_reconciliation(
@@ -1052,6 +1132,8 @@ impl PaperWorker {
                 return;
             }
         }
+        let account_risk_changed =
+            marked_ledger.account_risk_snapshot() != self.state.ledger.account_risk_snapshot();
         let Ok(mark_sequence) = self.next_mutation_sequence() else {
             self.state.reconciliation_required = true;
             return;
@@ -1067,11 +1149,17 @@ impl PaperWorker {
             self.config.digest(),
             mark_mutation_digest(event),
         );
+        if account_risk_changed && !self.fence_financial_mutation(mark_sequence) {
+            return;
+        }
         if !self.admit_committed_event_audit(mark_audit) {
             return;
         }
         self.state.sequence = mark_sequence;
         self.state.ledger = marked_ledger;
+        if account_risk_changed {
+            self.publish_financial_mutation(mark_sequence);
+        }
         let mut ids: Vec<_> = self
             .state
             .orders
@@ -1185,6 +1273,9 @@ impl PaperWorker {
                     self.state.reconciliation_required = true;
                     break;
                 }
+                if !self.fence_financial_mutation(mutation_sequence) {
+                    break;
+                }
                 if !self.admit_committed_event_audit(audit) {
                     break;
                 }
@@ -1202,6 +1293,7 @@ impl PaperWorker {
                     fill.liquidity(),
                 ));
                 self.state.orders.insert(order_id, candidate);
+                self.publish_financial_mutation(mutation_sequence);
             } else if plan.triggered != order.triggered || plan.became_resting {
                 self.update_matching_state(order, &plan, event);
             }
@@ -1305,10 +1397,11 @@ impl PaperWorker {
             PaperAuditKind::Canceled,
             event_at,
         );
-        if self.admit_committed_event_audit(audit) {
+        if self.fence_financial_mutation(sequence) && self.admit_committed_event_audit(audit) {
             self.state.sequence = sequence;
             self.state.ledger = ledger;
             self.state.orders.insert(order.order_id, candidate);
+            self.publish_financial_mutation(sequence);
         }
     }
 
@@ -1344,10 +1437,12 @@ impl PaperWorker {
             PaperAuditKind::Canceled,
             event_at,
         );
-        if self.admit_committed_event_audit(audit) {
+        if self.fence_financial_mutation(cancel_sequence) && self.admit_committed_event_audit(audit)
+        {
             self.state.sequence = cancel_sequence;
             self.state.ledger = ledger;
             self.state.orders.insert(order.order_id, candidate);
+            self.publish_financial_mutation(cancel_sequence);
         }
     }
 
@@ -1374,10 +1469,11 @@ impl PaperWorker {
             PaperAuditKind::Expired,
             event_at,
         );
-        if self.admit_committed_event_audit(audit) {
+        if self.fence_financial_mutation(sequence) && self.admit_committed_event_audit(audit) {
             self.state.sequence = sequence;
             self.state.ledger = ledger;
             self.state.orders.insert(order.order_id, candidate);
+            self.publish_financial_mutation(sequence);
         }
     }
 }

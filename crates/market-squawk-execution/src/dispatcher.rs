@@ -53,7 +53,8 @@ pub struct ExecutionDispatcher {
     accounts: Arc<AccountRiskCoordinator>,
     registry: Arc<Mutex<DispatchRegistry>>,
     audit: ExecutionAuditWriter,
-    cancellation: CancellationToken,
+    admission_cancellation: CancellationToken,
+    control_cancellation: CancellationToken,
     worker: Option<ExecutionTask<()>>,
     task_reaper: ExecutionTaskReaper,
     operation_deadline: Duration,
@@ -98,7 +99,8 @@ impl ExecutionDispatcher {
         }));
         let (sender, receiver) = mpsc::channel(config.maximum_queued_commands.get());
         let bytes = Arc::new(Semaphore::new(command_bytes));
-        let cancellation = CancellationToken::new();
+        let admission_cancellation = CancellationToken::new();
+        let control_cancellation = CancellationToken::new();
         let retained_bytes = retained_dispatcher_bytes(config)?;
         let worker = task_reaper
             .try_reserve()
@@ -107,7 +109,7 @@ impl ExecutionDispatcher {
                     Arc::clone(&adapter),
                     Arc::clone(&registry),
                     receiver,
-                    cancellation.child_token(),
+                    admission_cancellation.child_token(),
                     task_reaper.clone(),
                 ))
             })
@@ -119,7 +121,7 @@ impl ExecutionDispatcher {
             audit: audit.clone(),
             retained_bytes,
             operation_deadline: config.operation_deadline,
-            cancellation: cancellation.clone(),
+            cancellation: admission_cancellation.clone(),
         };
         Ok(Self {
             handle,
@@ -127,7 +129,8 @@ impl ExecutionDispatcher {
             accounts,
             registry,
             audit,
-            cancellation,
+            admission_cancellation,
+            control_cancellation,
             worker: Some(worker),
             task_reaper,
             operation_deadline: config.operation_deadline,
@@ -148,7 +151,10 @@ impl ExecutionDispatcher {
     pub fn persistence_acknowledgement(
         &self,
     ) -> Result<PersistenceAcknowledgement, ExecutionDispatchError> {
-        let operation = operation(self.operation_deadline, self.cancellation.child_token())?;
+        let operation = operation(
+            self.operation_deadline,
+            self.control_cancellation.child_token(),
+        )?;
         let registry = try_registry(&self.registry)?;
         if registry.pending_reconciliation.is_some() {
             return Err(ExecutionDispatchError::ReconciliationAcknowledgementPending);
@@ -627,5 +633,14 @@ pub enum ExecutionDispatcherShutdown {
     Complete,
     JoinError,
     DeadlineAborted,
+    Incomplete,
+}
+
+/// Admission-drain result that retains reconciliation and persistence authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExecutionDispatcherQuiesce {
+    Complete,
+    AlreadyQuiesced,
+    JoinError,
     Incomplete,
 }

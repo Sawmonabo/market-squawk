@@ -274,6 +274,37 @@ fn deadline_construction_failure_does_not_mutate_the_replay_fence() {
     assert_eq!(after, before);
 }
 
+#[test]
+fn newer_backend_sequence_fences_reservations_before_financial_reconciliation() {
+    let fixture = Fixture::new();
+    let coordinator = AccountRiskCoordinator::try_new(
+        AccountCoordinatorConfig {
+            maximum_intent_lifetime_nanos: NonZeroU64::new(i64::MAX as u64)
+                .unwrap_or_else(|| panic!("fixture intent lifetime is nonzero")),
+            ..AccountCoordinatorConfig::default()
+        },
+        [fixture.account()],
+    )
+    .unwrap_or_else(|error| panic!("valid coordinator: {error}"));
+    let fence = coordinator.reconciliation_fence();
+    fence
+        .require(NonZeroU64::new(2).unwrap_or_else(|| panic!("fixture sequence is nonzero")))
+        .unwrap_or_else(|error| panic!("advance backend sequence: {error}"));
+
+    let rejection = coordinator
+        .try_reserve(
+            &fixture.intent(7, 1),
+            PriceTicks::new(100),
+            &fixture.limits(Decimal::new(150, 0)),
+        )
+        .err()
+        .unwrap_or_else(|| panic!("unreconciled backend state must fail closed"));
+    assert_eq!(
+        rejection.reasons(),
+        &[AccountRiskViolation::ReconciliationRequired]
+    );
+}
+
 fn current_timestamp() -> Timestamp {
     let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)

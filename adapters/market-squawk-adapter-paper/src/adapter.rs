@@ -13,7 +13,7 @@ use market_squawk_execution::{
     ReconciliationAcknowledgement,
 };
 use thiserror::Error;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::PaperCheckpointRepository;
@@ -338,6 +338,7 @@ pub struct PaperExecutionRuntime {
     adapter: Arc<PaperExecutionAdapter>,
     market_ingress: Arc<PaperMarketIngress>,
     audit_reader: Option<PaperAuditReader>,
+    financial_changes: Option<PaperFinancialChangeReader>,
     cancellation: CancellationToken,
     worker: Option<ExecutionTask<()>>,
     abort_join_deadline: Duration,
@@ -351,6 +352,39 @@ impl PaperExecutionRuntime {
         checkpoint_repository: &PaperCheckpointRepository,
         task_reaper: ExecutionTaskReaper,
     ) -> Result<Self, PaperStartError> {
+        Self::try_start_with_optional_fence(
+            config,
+            accounts,
+            checkpoint_repository,
+            task_reaper,
+            None,
+        )
+    }
+
+    /// Starts fresh paper state bound to the production account-reconciliation fence.
+    pub fn try_start_with_reconciliation_fence(
+        config: PaperExecutionConfig,
+        accounts: impl IntoIterator<Item = PaperAccountBootstrap>,
+        checkpoint_repository: &PaperCheckpointRepository,
+        task_reaper: ExecutionTaskReaper,
+        reconciliation_fence: market_squawk_execution::AccountRiskReconciliationFence,
+    ) -> Result<Self, PaperStartError> {
+        Self::try_start_with_optional_fence(
+            config,
+            accounts,
+            checkpoint_repository,
+            task_reaper,
+            Some(reconciliation_fence),
+        )
+    }
+
+    fn try_start_with_optional_fence(
+        config: PaperExecutionConfig,
+        accounts: impl IntoIterator<Item = PaperAccountBootstrap>,
+        checkpoint_repository: &PaperCheckpointRepository,
+        task_reaper: ExecutionTaskReaper,
+        reconciliation_fence: Option<market_squawk_execution::AccountRiskReconciliationFence>,
+    ) -> Result<Self, PaperStartError> {
         if !checkpoint_repository.binds_config(&config) {
             return Err(PaperStartError::CheckpointRepositoryMismatch);
         }
@@ -361,6 +395,7 @@ impl PaperExecutionRuntime {
             None,
             checkpoint_repository.binding_identity(),
             task_reaper,
+            reconciliation_fence,
         )
     }
 
@@ -370,6 +405,39 @@ impl PaperExecutionRuntime {
         checkpoint: PaperExecutionCheckpoint,
         checkpoint_repository: &PaperCheckpointRepository,
         task_reaper: ExecutionTaskReaper,
+    ) -> Result<Self, PaperStartError> {
+        Self::try_start_from_checkpoint_with_optional_fence(
+            config,
+            checkpoint,
+            checkpoint_repository,
+            task_reaper,
+            None,
+        )
+    }
+
+    /// Restores paper state bound to the production account-reconciliation fence.
+    pub fn try_start_from_checkpoint_with_reconciliation_fence(
+        config: PaperExecutionConfig,
+        checkpoint: PaperExecutionCheckpoint,
+        checkpoint_repository: &PaperCheckpointRepository,
+        task_reaper: ExecutionTaskReaper,
+        reconciliation_fence: market_squawk_execution::AccountRiskReconciliationFence,
+    ) -> Result<Self, PaperStartError> {
+        Self::try_start_from_checkpoint_with_optional_fence(
+            config,
+            checkpoint,
+            checkpoint_repository,
+            task_reaper,
+            Some(reconciliation_fence),
+        )
+    }
+
+    fn try_start_from_checkpoint_with_optional_fence(
+        config: PaperExecutionConfig,
+        checkpoint: PaperExecutionCheckpoint,
+        checkpoint_repository: &PaperCheckpointRepository,
+        task_reaper: ExecutionTaskReaper,
+        reconciliation_fence: Option<market_squawk_execution::AccountRiskReconciliationFence>,
     ) -> Result<Self, PaperStartError> {
         if !checkpoint_repository.binds_config(&config) {
             return Err(PaperStartError::CheckpointRepositoryMismatch);
@@ -405,6 +473,7 @@ impl PaperExecutionRuntime {
             Some(checkpoint),
             checkpoint_repository.binding_identity(),
             task_reaper,
+            reconciliation_fence,
         )
     }
 
@@ -414,6 +483,7 @@ impl PaperExecutionRuntime {
         mut checkpoint: Option<PaperExecutionCheckpoint>,
         repository_id: [u8; 32],
         task_reaper: ExecutionTaskReaper,
+        reconciliation_fence: Option<market_squawk_execution::AccountRiskReconciliationFence>,
     ) -> Result<Self, PaperStartError> {
         let input = config.input().clone();
         let abort_join_deadline = input.abort_join_deadline;
@@ -462,6 +532,8 @@ impl PaperExecutionRuntime {
         let market_slots = Arc::new(Semaphore::new(market_capacity));
         let audit_failed = Arc::new(AtomicBool::new(false));
         let cancellation = CancellationToken::new();
+        let initial_sequence = checkpoint.as_ref().map_or(0, |state| state.sequence);
+        let (financial_change_sender, financial_change_receiver) = watch::channel(initial_sequence);
         let worker = PaperWorker::new(
             config,
             repository_id,
@@ -471,6 +543,8 @@ impl PaperExecutionRuntime {
             audit_tx,
             Arc::clone(&audit_failed),
             cancellation.clone(),
+            reconciliation_fence,
+            financial_change_sender,
         );
         let join = task_reaper
             .try_reserve()
@@ -492,6 +566,9 @@ impl PaperExecutionRuntime {
                 retained_bytes: market_bytes,
             }),
             audit_reader: Some(PaperAuditReader::new(audit_rx, audit_failed)),
+            financial_changes: Some(PaperFinancialChangeReader {
+                receiver: financial_change_receiver,
+            }),
             cancellation,
             worker: Some(join),
             abort_join_deadline,
@@ -509,6 +586,29 @@ impl PaperExecutionRuntime {
     /// Transfers the sole audit consumer to application persistence composition.
     pub fn take_audit_reader(&mut self) -> Option<PaperAuditReader> {
         self.audit_reader.take()
+    }
+
+    /// Transfers the sole coalescing financial-change consumer to application supervision.
+    pub fn take_financial_change_reader(&mut self) -> Option<PaperFinancialChangeReader> {
+        self.financial_changes.take()
+    }
+
+    /// Deterministically cancels every nonterminal recovered order before live admission.
+    pub async fn terminalize_recovered_orders(
+        &self,
+        control: PaperControlContext,
+    ) -> Result<(), PaperControlError> {
+        let (reply, response) = oneshot::channel();
+        let deadline = control.deadline();
+        let cancellation = control.cancellation();
+        self.adapter
+            .send_control(
+                WorkerCommand::TerminalizeRecovery { control, reply },
+                deadline,
+                &cancellation,
+            )
+            .await?;
+        control_response(response, deadline, cancellation).await
     }
 
     /// Requests deterministic shutdown, returns the final state, and reaps the writer.
@@ -558,6 +658,35 @@ impl PaperExecutionRuntime {
             }
         }
     }
+}
+
+/// Sole bounded coalescing consumer for paper financial mutation sequences.
+#[derive(Debug)]
+pub struct PaperFinancialChangeReader {
+    receiver: watch::Receiver<u64>,
+}
+
+impl PaperFinancialChangeReader {
+    /// Waits until a newer financial sequence is published or the paper worker closes.
+    pub async fn changed(&mut self) -> Result<u64, PaperFinancialChangeReadError> {
+        self.receiver
+            .changed()
+            .await
+            .map_err(|_| PaperFinancialChangeReadError::Closed)?;
+        Ok(*self.receiver.borrow_and_update())
+    }
+
+    /// Returns the latest coalesced financial sequence without waiting.
+    pub fn latest(&self) -> u64 {
+        *self.receiver.borrow()
+    }
+}
+
+/// Terminal paper financial-change notification failure.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum PaperFinancialChangeReadError {
+    #[error("paper financial-change stream closed")]
+    Closed,
 }
 
 fn prepare_recovery_audits(

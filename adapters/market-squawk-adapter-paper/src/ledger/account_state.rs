@@ -152,6 +152,14 @@ impl PaperLedger {
             .copied()
             .ok_or(PaperLedgerError::UnknownAccountOrCurrency)?;
         self.validate_account_marks(account_id, account, valued_at, maximum_mark_age_nanos)?;
+        self.reconciled_account_state_projection(account_id, account)
+    }
+
+    fn reconciled_account_state_projection(
+        &self,
+        account_id: AccountId,
+        account: PaperAccountRiskState,
+    ) -> Result<ReconciledAccountState, PaperLedgerError> {
         let cash = self.cash(account_id, account.currency)?;
         let positions = self
             .positions
@@ -186,5 +194,37 @@ impl PaperLedger {
             position_cost_basis,
         )
         .map_err(|_| PaperLedgerError::InvalidRecovery)
+    }
+
+    pub(crate) fn recovery_reconciled_account_states(
+        &self,
+    ) -> Result<Vec<ReconciledAccountState>, PaperLedgerError> {
+        let mut states = Vec::new();
+        states
+            .try_reserve_exact(self.accounts.len())
+            .map_err(|_| PaperLedgerError::Capacity)?;
+        for (account_id, account) in &self.accounts {
+            states.push(self.reconciled_account_state_projection(*account_id, *account)?);
+        }
+        Ok(states)
+    }
+
+    pub(crate) fn reconciled_account_states(
+        &self,
+        valued_at: market_squawk_domain::Timestamp,
+        maximum_mark_age_nanos: u64,
+    ) -> Result<Vec<ReconciledAccountState>, PaperLedgerError> {
+        let mut states = Vec::new();
+        states
+            .try_reserve_exact(self.accounts.len())
+            .map_err(|_| PaperLedgerError::Capacity)?;
+        for account_id in self.accounts.keys() {
+            states.push(self.reconciled_account_state(
+                *account_id,
+                valued_at,
+                maximum_mark_age_nanos,
+            )?);
+        }
+        Ok(states)
     }
 }

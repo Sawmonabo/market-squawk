@@ -16,8 +16,9 @@ mod task_reaper;
 pub use account::{
     AccountBootstrap, AccountCoordinatorConfig, AccountCoordinatorError,
     AccountIdempotencyBootstrap, AccountIdempotencyBootstrapError, AccountIdempotencySnapshotError,
-    AccountIdempotencyTombstone, AccountReservationError, AccountReservationStateError,
-    AccountRiskCoordinator, AccountRiskReservation,
+    AccountIdempotencyTombstone, AccountReconciliationFenceError, AccountRecoveryBootstrap,
+    AccountRecoverySnapshotError, AccountReservationError, AccountReservationStateError,
+    AccountRiskCoordinator, AccountRiskReconciliationFence, AccountRiskReservation,
 };
 pub use adapter::{
     ACCOUNT_REPLACEMENT_SCHEMA_VERSION, CancelOrder, CancelReceipt, CancelStatus, DispatchOrder,
@@ -39,7 +40,8 @@ pub use audit::{
 };
 pub use dispatcher::{
     ExecutionDispatchError, ExecutionDispatcher, ExecutionDispatcherConfig,
-    ExecutionDispatcherError, ExecutionDispatcherHandle, ExecutionDispatcherShutdown,
+    ExecutionDispatcherError, ExecutionDispatcherHandle, ExecutionDispatcherQuiesce,
+    ExecutionDispatcherShutdown,
 };
 pub use intent::{
     MAX_INTENT_SLIPPAGE_BASIS_POINTS, MAX_ORDER_REASON_CODES, OrderIntent, OrderIntentDigest,

@@ -65,6 +65,20 @@ impl AccountReplacementCandidate {
         })
     }
 
+    fn try_new_unreserved(
+        state: ReconciledAccountState,
+        expected_revision: u64,
+    ) -> Result<Self, AccountReplacementError> {
+        if expected_revision == 0 {
+            return Err(AccountReplacementError::InvalidReservationClosure);
+        }
+        Ok(Self {
+            state,
+            expected_revision,
+            reservations: Box::new([]),
+        })
+    }
+
     pub(crate) const fn account_id(&self) -> AccountId {
         self.state.account_id()
     }
@@ -133,6 +147,59 @@ struct PreparedAccountState {
 }
 
 impl AccountRiskCoordinator {
+    pub(crate) fn replace_unreserved_reconciled_accounts(
+        &self,
+        source: ExecutionStateSourceBinding,
+        invocation_digest: [u8; 32],
+        states: &[ReconciledAccountState],
+    ) -> Result<(), AccountReplacementError> {
+        if states.is_empty() || states.len() > MAX_RECONCILED_ACCOUNTS {
+            return Err(AccountReplacementError::InvalidAccountClosure);
+        }
+        let mut candidates = Vec::new();
+        candidates
+            .try_reserve_exact(states.len())
+            .map_err(|_| AccountReplacementError::Allocation)?;
+        for state in states {
+            let index = partition_index(state.account_id(), self.config.partition_count.get());
+            let partition = match self.partitions[index].try_lock() {
+                Ok(partition) => partition,
+                Err(TryLockError::WouldBlock) => return Err(AccountReplacementError::Busy),
+                Err(TryLockError::Poisoned(_)) => return Err(AccountReplacementError::Poisoned),
+            };
+            let current = partition
+                .accounts
+                .get(&state.account_id())
+                .ok_or(AccountReplacementError::AccountNotFound)?;
+            if current
+                .reservations
+                .iter()
+                .any(|reservation| reservation.retained())
+            {
+                return Err(AccountReplacementError::InvalidReservationClosure);
+            }
+            let current_revision = current.account_revision.load(Ordering::Acquire);
+            if state.revision().get() <= current_revision {
+                if !current.matches_reconciled(state) {
+                    return Err(AccountReplacementError::RevisionRollback);
+                }
+                continue;
+            }
+            candidates.push(AccountReplacementCandidate::try_new_unreserved(
+                state.clone(),
+                current_revision,
+            )?);
+        }
+        if candidates.is_empty() {
+            return Ok(());
+        }
+        self.replace_reconciled_accounts(AccountStateReplacementBatch::try_new(
+            source,
+            invocation_digest,
+            candidates,
+        )?)
+    }
+
     pub(crate) fn replace_reconciled_accounts(
         &self,
         batch: AccountStateReplacementBatch,
@@ -230,6 +297,33 @@ impl AccountRiskCoordinator {
             current.last_reconciliation = Some(source);
         }
         Ok(())
+    }
+}
+
+impl AccountState {
+    fn matches_reconciled(&self, state: &ReconciledAccountState) -> bool {
+        self.eligible == state.eligible()
+            && self.currency == state.currency()
+            && self.cash == state.cash()
+            && self.settled_capital == state.settled_capital()
+            && self.capital == state.marked_equity()
+            && self.peak_capital == state.peak_marked_equity()
+            && self.gross_exposure == state.marked_gross_exposure()
+            && self.unrealized_pnl == state.unrealized_pnl()
+            && self.drawdown == state.drawdown()
+            && self.mark_digest == state.mark_digest()
+            && self.realized_pnl == state.realized_pnl()
+            && self.realized_loss == state.realized_loss()
+            && self.positions.len() == state.positions().len()
+            && state
+                .positions()
+                .iter()
+                .all(|(instrument, lots)| self.positions.get(instrument) == Some(lots))
+            && self.position_cost_basis.len() == state.position_cost_basis().len()
+            && state
+                .position_cost_basis()
+                .iter()
+                .all(|(instrument, basis)| self.position_cost_basis.get(instrument) == Some(basis))
     }
 }
 

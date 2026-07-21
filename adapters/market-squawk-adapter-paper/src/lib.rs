@@ -17,11 +17,12 @@ mod worker;
 
 pub use adapter::{
     PaperControlContext, PaperControlError, PaperExecutionAdapter, PaperExecutionRuntime,
-    PaperMarketIngress, PaperStartError,
+    PaperFinancialChangeReadError, PaperFinancialChangeReader, PaperMarketIngress, PaperStartError,
 };
 pub use audit::{PaperAuditKind, PaperAuditReader, PaperAuditRecord};
 pub use checkpoint_repository::{
-    PaperCheckpointReceipt, PaperCheckpointRepository, PaperCheckpointRepositoryError,
+    PaperAccountRecoverySnapshot, PaperAccountReplaySnapshot, PaperCheckpointReceipt,
+    PaperCheckpointRecovery, PaperCheckpointRepository, PaperCheckpointRepositoryError,
 };
 pub use config::{PaperConfigError, PaperExecutionConfig, PaperExecutionConfigInput};
 pub use fees::{FeeError, FeeSchedule, LiquidityRole};

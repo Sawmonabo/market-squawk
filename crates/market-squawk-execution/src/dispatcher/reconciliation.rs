@@ -61,14 +61,18 @@ pub(super) fn prepare_account_replacement(
     if !has_replacement_evidence {
         return Ok(None);
     }
-    if state.reconciliation_required()
-        || state.accounts().is_empty()
-        || state.source_binding().is_none()
-    {
+    if state.reconciliation_required() || state.source_binding().is_none() {
         return Err(ExecutionDispatchError::AccountReplacementRejected);
     }
 
     if affected_accounts.is_empty() {
+        return if state.accounts().is_empty() {
+            Ok(None)
+        } else {
+            Err(ExecutionDispatchError::AccountReplacementRejected)
+        };
+    }
+    if state.accounts().is_empty() {
         return Err(ExecutionDispatchError::AccountReplacementRejected);
     }
 

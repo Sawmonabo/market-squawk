@@ -455,7 +455,7 @@ async fn committed_market_risk_and_dispatch_are_one_use_bounded_and_fill_safe() 
     let task_reaper = ExecutionTaskReaper::try_new(
         NonZeroUsize::new(4).ok_or("zero execution task ownership capacity")?,
     )?;
-    let dispatcher = ExecutionDispatcher::try_start(
+    let mut dispatcher = ExecutionDispatcher::try_start(
         Arc::clone(&adapter) as Arc<dyn ExecutionAdapter>,
         Arc::clone(&accounts),
         audit.clone(),
@@ -722,6 +722,11 @@ async fn committed_market_risk_and_dispatch_are_one_use_bounded_and_fill_safe() 
     }));
     assert_eq!(adapter.calls.load(Ordering::Acquire), 4);
     assert!(runtime.shutdown().await.is_complete());
+    assert_eq!(
+        dispatcher.quiesce().await,
+        market_squawk_execution::ExecutionDispatcherQuiesce::Complete
+    );
+    assert!(dispatcher.persistence_acknowledgement().is_ok());
     assert_eq!(
         dispatcher.shutdown().await,
         ExecutionDispatcherShutdown::Complete
