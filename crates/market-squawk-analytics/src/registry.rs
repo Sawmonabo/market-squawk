@@ -6,12 +6,22 @@ use std::num::NonZeroUsize;
 
 use thiserror::Error;
 
+use crate::catalog::is_known_local_implementation;
 use crate::{FeatureError, FeatureKey, FeatureMetadata, FeatureScalar, FeatureValue};
 
 /// Maximum entries accepted by one in-process metadata registry.
 pub const MAX_FEATURE_REGISTRY_ENTRIES: usize = 4_096;
 /// Maximum configured retained-byte limit for one registry.
 pub const MAX_FEATURE_REGISTRY_RETAINED_BYTES: usize = 64 * 1024 * 1024;
+
+/// Execution plane required by a feature metadata resolution request.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum FeatureCompatibility {
+    /// Resolve only a feature version declared safe for bounded live execution.
+    Live,
+    /// Resolve only a feature version that preserves point-in-time research semantics.
+    PointInTime,
+}
 
 /// Result of an accepted deterministic registration attempt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -102,6 +112,9 @@ impl FeatureRegistry {
         &mut self,
         metadata: FeatureMetadata,
     ) -> Result<RegistrationOutcome, FeatureRegistryError> {
+        if !is_known_local_implementation(&metadata) {
+            return Err(FeatureRegistryError::UnknownImplementationDigest);
+        }
         match self.position(metadata.key()) {
             Ok(index) => {
                 if self.slots[index].as_ref() == Some(&metadata) {
@@ -148,6 +161,12 @@ impl FeatureRegistry {
         &mut self,
         metadata: &[FeatureMetadata],
     ) -> Result<BatchRegistrationOutcome, FeatureRegistryError> {
+        if metadata
+            .iter()
+            .any(|candidate| !is_known_local_implementation(candidate))
+        {
+            return Err(FeatureRegistryError::UnknownImplementationDigest);
+        }
         if metadata.len() > self.slots.len() {
             return Err(FeatureRegistryError::RegistryFull);
         }
@@ -216,6 +235,41 @@ impl FeatureRegistry {
             .ok()
             .and_then(|index| self.slots.get(index))
             .and_then(Option::as_ref)
+    }
+
+    /// Resolves one exact feature version for a required execution plane.
+    ///
+    /// Resolution never selects a different version implicitly. A known feature name with a
+    /// missing requested version is distinguished from an entirely unknown feature, and an exact
+    /// version that is unsafe for the requested plane fails closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed unknown-feature, unknown-version, or compatibility error.
+    pub fn try_resolve(
+        &self,
+        key: &FeatureKey,
+        compatibility: FeatureCompatibility,
+    ) -> Result<&FeatureMetadata, FeatureRegistryError> {
+        if let Some(metadata) = self.metadata(key) {
+            let is_compatible = match compatibility {
+                FeatureCompatibility::Live => metadata.is_live_compatible(),
+                FeatureCompatibility::PointInTime => metadata.is_point_in_time_compatible(),
+            };
+            return if is_compatible {
+                Ok(metadata)
+            } else {
+                Err(FeatureRegistryError::IncompatibleRequestedVersion)
+            };
+        }
+        if self
+            .entries()
+            .any(|metadata| metadata.key().name() == key.name())
+        {
+            Err(FeatureRegistryError::UnknownRequestedVersion)
+        } else {
+            Err(FeatureRegistryError::UnknownFeature)
+        }
     }
 
     /// Iterates metadata in deterministic [`FeatureKey`] order without allocation.
@@ -314,6 +368,18 @@ pub enum FeatureRegistryError {
     /// The same feature key was registered with different metadata.
     #[error("conflicting metadata for an existing feature key")]
     MetadataConflict,
+    /// Metadata referenced an implementation identity not authorized by this local build.
+    #[error("feature implementation digest is not in the code-owned local catalog")]
+    UnknownImplementationDigest,
+    /// No registered feature has the requested canonical name.
+    #[error("requested feature is unknown")]
+    UnknownFeature,
+    /// The feature name is registered, but the exact requested version is not.
+    #[error("requested feature version is unknown")]
+    UnknownRequestedVersion,
+    /// The exact requested version is incompatible with the required execution plane.
+    #[error("requested feature version is incompatible with the required execution plane")]
+    IncompatibleRequestedVersion,
     /// One submitted batch repeated a feature key.
     #[error("feature metadata batch contains a duplicate key")]
     DuplicateBatchKey,

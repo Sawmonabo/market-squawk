@@ -1,10 +1,11 @@
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 
 use market_squawk_analytics::{
-    FeatureDataType, FeatureInput, FeatureInputSchema, FeatureKey, FeatureMetadata,
-    FeatureMetadataError, FeatureNullPolicy, FeatureOutputType, FeatureParameter,
-    FeatureParameterValue, FeatureParameters, FeatureRegistry, FeatureRegistryError,
-    FeatureTimeSemantics, FeatureUnit, FeatureWarmUp, LiveFeatureCatalog, LiveFeatureCatalogConfig,
+    FeatureCompatibility, FeatureDataType, FeatureImplementationDigest, FeatureInput,
+    FeatureInputSchema, FeatureKey, FeatureMetadata, FeatureMetadataError, FeatureNullPolicy,
+    FeatureOutputType, FeatureParameter, FeatureParameterValue, FeatureParameters, FeatureRegistry,
+    FeatureRegistryError, FeatureTimeSemantics, FeatureUnit, FeatureWarmUp,
+    KnownFeatureImplementation, LiveFeatureCatalog, LiveFeatureCatalogConfig,
     LiveFeatureCatalogConfigError, REQUIRED_LIVE_FEATURE_COUNT, RegistrationOutcome,
     RequiredLiveFeature,
 };
@@ -24,22 +25,44 @@ fn metadata_with_output(
     output_type: FeatureOutputType,
     unit: FeatureUnit,
 ) -> Result<FeatureMetadata, FeatureMetadataError> {
+    metadata_with_contract(
+        implementation_revision,
+        output_type,
+        unit,
+        true,
+        RequiredLiveFeature::Spread.implementation_digest()?,
+        false,
+    )
+}
+
+fn metadata_with_contract(
+    implementation_revision: &str,
+    output_type: FeatureOutputType,
+    unit: FeatureUnit,
+    point_in_time_compatible: bool,
+    implementation_digest: FeatureImplementationDigest,
+    reverse_inputs: bool,
+) -> Result<FeatureMetadata, FeatureMetadataError> {
+    let mut inputs = vec![
+        FeatureInput::try_new(
+            "best_bid",
+            FeatureDataType::PriceTicks,
+            FeatureUnit::PriceTicks,
+            false,
+        )?,
+        FeatureInput::try_new(
+            "best_ask",
+            FeatureDataType::PriceTicks,
+            FeatureUnit::PriceTicks,
+            false,
+        )?,
+    ];
+    if reverse_inputs {
+        inputs.reverse();
+    }
     FeatureMetadata::try_new(
-        FeatureKey::try_new("spread", NonZeroU32::MIN)?,
-        FeatureInputSchema::try_new(vec![
-            FeatureInput::try_new(
-                "best_bid",
-                FeatureDataType::PriceTicks,
-                FeatureUnit::PriceTicks,
-                false,
-            )?,
-            FeatureInput::try_new(
-                "best_ask",
-                FeatureDataType::PriceTicks,
-                FeatureUnit::PriceTicks,
-                false,
-            )?,
-        ])?,
+        FeatureKey::try_new(RequiredLiveFeature::Spread.name(), NonZeroU32::MIN)?,
+        FeatureInputSchema::try_new(inputs)?,
         FeatureParameters::try_new(vec![FeatureParameter::try_new(
             "depth",
             FeatureParameterValue::UnsignedInteger(1),
@@ -50,15 +73,160 @@ fn metadata_with_output(
         output_type,
         unit,
         true,
-        true,
+        point_in_time_compatible,
         implementation_revision,
+        implementation_digest,
+    )
+}
+
+fn batch_return_metadata() -> Result<FeatureMetadata, FeatureMetadataError> {
+    FeatureMetadata::try_new(
+        FeatureKey::try_new("research.price-return", NonZeroU32::MIN)?,
+        FeatureInputSchema::try_new(vec![
+            FeatureInput::try_new(
+                "previous_price",
+                FeatureDataType::PriceTicks,
+                FeatureUnit::PriceTicks,
+                false,
+            )?,
+            FeatureInput::try_new(
+                "current_price",
+                FeatureDataType::PriceTicks,
+                FeatureUnit::PriceTicks,
+                false,
+            )?,
+        ])?,
+        FeatureParameters::default(),
+        FeatureTimeSemantics::EventTime,
+        FeatureWarmUp::Observations(
+            NonZeroU32::new(2).ok_or(FeatureMetadataError::RetainedSizeOverflow)?,
+        ),
+        FeatureNullPolicy::Unavailable,
+        FeatureOutputType::StatisticalF64,
+        FeatureUnit::Return,
+        false,
+        true,
+        "git:batch-returns-v1",
+        KnownFeatureImplementation::BatchReturns.implementation_digest()?,
+    )
+}
+
+fn batch_risk_metadata(name: &str) -> Result<FeatureMetadata, FeatureMetadataError> {
+    FeatureMetadata::try_new(
+        FeatureKey::try_new(name, NonZeroU32::MIN)?,
+        FeatureInputSchema::try_new(vec![
+            FeatureInput::try_new(
+                "asset_return",
+                FeatureDataType::StatisticalF64,
+                FeatureUnit::Return,
+                false,
+            )?,
+            FeatureInput::try_new(
+                "benchmark_return",
+                FeatureDataType::StatisticalF64,
+                FeatureUnit::Return,
+                false,
+            )?,
+        ])?,
+        FeatureParameters::default(),
+        FeatureTimeSemantics::EventTime,
+        FeatureWarmUp::Observations(
+            NonZeroU32::new(2).ok_or(FeatureMetadataError::RetainedSizeOverflow)?,
+        ),
+        FeatureNullPolicy::Unavailable,
+        FeatureOutputType::StatisticalF64,
+        FeatureUnit::Return,
+        false,
+        true,
+        "git:batch-risk-v1",
+        KnownFeatureImplementation::BatchRisk.implementation_digest()?,
+    )
+}
+
+fn exact_rate_metadata() -> Result<FeatureMetadata, FeatureMetadataError> {
+    FeatureMetadata::try_new(
+        FeatureKey::try_new("macro.yield-curve-slope", NonZeroU32::MIN)?,
+        FeatureInputSchema::try_new(vec![
+            FeatureInput::try_new(
+                "short_rate",
+                FeatureDataType::Decimal,
+                FeatureUnit::Rate,
+                false,
+            )?,
+            FeatureInput::try_new(
+                "long_rate",
+                FeatureDataType::Decimal,
+                FeatureUnit::Rate,
+                false,
+            )?,
+        ])?,
+        FeatureParameters::default(),
+        FeatureTimeSemantics::EventTime,
+        FeatureWarmUp::Observations(
+            NonZeroU32::new(2).ok_or(FeatureMetadataError::RetainedSizeOverflow)?,
+        ),
+        FeatureNullPolicy::Unavailable,
+        FeatureOutputType::Decimal,
+        FeatureUnit::Rate,
+        false,
+        true,
+        "git:batch-macro-v1",
+        KnownFeatureImplementation::BatchMacro.implementation_digest()?,
     )
 }
 
 #[test]
-fn registration_is_idempotent_and_same_key_conflicts_fail_closed() -> TestResult {
+fn registration_binds_known_code_and_semantics_and_resolution_fails_closed() -> TestResult {
     let metadata = spread_metadata("git:0123456789abcdef")?;
     let conflicting = spread_metadata("git:fedcba9876543210")?;
+    let reordered = metadata_with_contract(
+        "git:0123456789abcdef",
+        FeatureOutputType::PriceTicks,
+        FeatureUnit::PriceTicks,
+        true,
+        RequiredLiveFeature::Spread.implementation_digest()?,
+        true,
+    )?;
+    let live_only = metadata_with_contract(
+        "git:0123456789abcdef",
+        FeatureOutputType::PriceTicks,
+        FeatureUnit::PriceTicks,
+        false,
+        RequiredLiveFeature::Spread.implementation_digest()?,
+        false,
+    )?;
+    let unknown_digest = FeatureImplementationDigest::try_from_sha256([0xa5; 32])?;
+    let unknown_implementation = metadata_with_contract(
+        "git:unknown",
+        FeatureOutputType::PriceTicks,
+        FeatureUnit::PriceTicks,
+        true,
+        unknown_digest,
+        false,
+    )?;
+    assert_eq!(
+        FeatureImplementationDigest::try_from_sha256([0; 32]),
+        Err(FeatureMetadataError::ZeroImplementationDigest)
+    );
+    assert_eq!(
+        metadata.input_schema_digest(),
+        metadata.clone().input_schema_digest()
+    );
+    assert_eq!(
+        metadata.semantic_digest(),
+        metadata.clone().semantic_digest()
+    );
+    assert_ne!(
+        metadata.input_schema_digest(),
+        reordered.input_schema_digest()
+    );
+    assert_ne!(metadata.semantic_digest(), reordered.semantic_digest());
+    assert_ne!(metadata.semantic_digest(), conflicting.semantic_digest());
+    assert_ne!(metadata.semantic_digest(), live_only.semantic_digest());
+    let batch_only = batch_return_metadata()?;
+    let exact_rate = exact_rate_metadata()?;
+    let scalar_alpha = batch_risk_metadata("risk.alpha")?;
+    let legacy_multi_output = batch_risk_metadata("risk.alpha-beta")?;
     let mut registry = FeatureRegistry::try_new(
         NonZeroUsize::new(4).ok_or("invalid registry test capacity")?,
         NonZeroUsize::new(64 * 1024).ok_or("invalid registry test budget")?,
@@ -76,14 +244,93 @@ fn registration_is_idempotent_and_same_key_conflicts_fail_closed() -> TestResult
         registry.try_register(conflicting),
         Err(FeatureRegistryError::MetadataConflict)
     );
-    assert_eq!(registry.len(), 1);
+    assert_eq!(
+        registry.try_register(batch_only.clone())?,
+        RegistrationOutcome::Inserted
+    );
+    assert_eq!(
+        registry.try_register(exact_rate.clone())?,
+        RegistrationOutcome::Inserted
+    );
+    assert_eq!(
+        registry.try_register(scalar_alpha)?,
+        RegistrationOutcome::Inserted
+    );
+    assert_eq!(
+        registry.try_register(unknown_implementation),
+        Err(FeatureRegistryError::UnknownImplementationDigest)
+    );
+    assert_eq!(
+        registry.try_register(legacy_multi_output),
+        Err(FeatureRegistryError::UnknownImplementationDigest)
+    );
+    assert_eq!(registry.len(), 4);
     assert!(registry.retained_bytes() <= registry.retained_byte_limit().get());
+    let key = FeatureKey::try_new(RequiredLiveFeature::Spread.name(), NonZeroU32::MIN)?;
+    assert_eq!(
+        registry
+            .try_resolve(&key, FeatureCompatibility::Live)?
+            .semantic_digest(),
+        metadata_with_output(
+            "git:0123456789abcdef",
+            FeatureOutputType::PriceTicks,
+            FeatureUnit::PriceTicks,
+        )?
+        .semantic_digest()
+    );
+    assert_eq!(
+        registry.try_resolve(
+            &FeatureKey::try_new(
+                RequiredLiveFeature::Spread.name(),
+                NonZeroU32::new(2).ok_or("version")?,
+            )?,
+            FeatureCompatibility::Live,
+        ),
+        Err(FeatureRegistryError::UnknownRequestedVersion)
+    );
+    assert_eq!(
+        registry.try_resolve(
+            &FeatureKey::try_new("unknown.feature", NonZeroU32::MIN)?,
+            FeatureCompatibility::Live,
+        ),
+        Err(FeatureRegistryError::UnknownFeature)
+    );
+    let batch_key = batch_only.key().clone();
+    assert_eq!(
+        registry
+            .try_resolve(&batch_key, FeatureCompatibility::PointInTime)?
+            .semantic_digest(),
+        batch_only.semantic_digest()
+    );
+    assert_eq!(
+        registry.try_resolve(&batch_key, FeatureCompatibility::Live),
+        Err(FeatureRegistryError::IncompatibleRequestedVersion)
+    );
+    assert_eq!(
+        registry
+            .try_resolve(exact_rate.key(), FeatureCompatibility::PointInTime)?
+            .output_type(),
+        FeatureOutputType::Decimal
+    );
+    assert_eq!(exact_rate.unit(), FeatureUnit::Rate);
+    assert_eq!(
+        registry
+            .entries()
+            .map(|entry| entry.key().name())
+            .collect::<Vec<_>>(),
+        vec![
+            "book.spread",
+            "macro.yield-curve-slope",
+            "research.price-return",
+            "risk.alpha",
+        ]
+    );
     Ok(())
 }
 
 #[test]
 fn output_type_unit_compatibility_is_closed() {
-    const ALL_UNITS: [FeatureUnit; 10] = [
+    const ALL_UNITS: [FeatureUnit; 12] = [
         FeatureUnit::PriceTicks,
         FeatureUnit::QuantityLots,
         FeatureUnit::BasisPoints,
@@ -94,6 +341,8 @@ fn output_type_unit_compatibility_is_closed() {
         FeatureUnit::Count,
         FeatureUnit::Nanoseconds,
         FeatureUnit::Unitless,
+        FeatureUnit::Rate,
+        FeatureUnit::CurrencyAmount,
     ];
     let cases: &[(FeatureOutputType, &[FeatureUnit])] = &[
         (FeatureOutputType::PriceTicks, &[FeatureUnit::PriceTicks]),
@@ -125,6 +374,7 @@ fn output_type_unit_compatibility_is_closed() {
                 FeatureUnit::Volatility,
                 FeatureUnit::LotsPerSecond,
                 FeatureUnit::Unitless,
+                FeatureUnit::Rate,
             ],
         ),
         (
@@ -138,8 +388,21 @@ fn output_type_unit_compatibility_is_closed() {
                 FeatureUnit::Count,
                 FeatureUnit::Nanoseconds,
                 FeatureUnit::Unitless,
+                FeatureUnit::Rate,
             ],
         ),
+        (
+            FeatureOutputType::Decimal,
+            &[
+                FeatureUnit::BasisPoints,
+                FeatureUnit::Ratio,
+                FeatureUnit::Return,
+                FeatureUnit::Volatility,
+                FeatureUnit::Unitless,
+                FeatureUnit::Rate,
+            ],
+        ),
+        (FeatureOutputType::Money, &[FeatureUnit::CurrencyAmount]),
     ];
 
     for &(output_type, allowed_units) in cases {
@@ -314,6 +577,7 @@ fn catalog_registration_fails_atomically_on_conflict_or_capacity() -> TestResult
         true,
         true,
         "git:conflicting-implementation",
+        RequiredLiveFeature::Momentum.implementation_digest()?,
     )?;
     let mut conflicting_registry = FeatureRegistry::try_new(
         NonZeroUsize::new(REQUIRED_LIVE_FEATURE_COUNT).ok_or("catalog capacity")?,

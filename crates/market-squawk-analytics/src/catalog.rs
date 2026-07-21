@@ -3,14 +3,70 @@
 use std::num::{NonZeroU32, NonZeroU64};
 
 use crate::{
-    BatchRegistrationOutcome, FeatureDataType, FeatureInput, FeatureInputSchema, FeatureKey,
-    FeatureMetadata, FeatureMetadataError, FeatureNullPolicy, FeatureOutputType, FeatureParameter,
-    FeatureParameterValue, FeatureParameters, FeatureRegistry, FeatureRegistryError,
-    FeatureTimeSemantics, FeatureUnit, FeatureWarmUp, LiveFeatureCatalogConfig,
+    BatchRegistrationOutcome, FeatureDataType, FeatureImplementationDigest, FeatureInput,
+    FeatureInputSchema, FeatureKey, FeatureMetadata, FeatureMetadataError, FeatureNullPolicy,
+    FeatureOutputType, FeatureParameter, FeatureParameterValue, FeatureParameters, FeatureRegistry,
+    FeatureRegistryError, FeatureTimeSemantics, FeatureUnit, FeatureWarmUp,
+    LiveFeatureCatalogConfig,
 };
+
+mod implementations;
+
+pub(crate) use implementations::is_known_local_implementation;
 
 /// Number of mandatory live feature definitions in the production catalog.
 pub const REQUIRED_LIVE_FEATURE_COUNT: usize = 15;
+
+/// Closed code-owned implementation identities accepted by the feature registry.
+///
+/// Live entries bind one exact required feature. Batch entries bind an implementation family to
+/// an explicit closed set of Task 12 feature keys. Configuration can reference these identities,
+/// but it cannot extend this catalog or authorize a new digest.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum KnownFeatureImplementation {
+    /// Best-bid/ask spread.
+    LiveSpread,
+    /// Top-of-book midpoint.
+    LiveMidpoint,
+    /// Top-of-book microprice.
+    LiveMicroprice,
+    /// Top-of-book quantity imbalance.
+    LiveBookImbalance,
+    /// Top-of-book order-flow imbalance.
+    LiveOrderFlowImbalance,
+    /// Displayed-depth weighted price.
+    LiveDepthWeightedPrice,
+    /// Classified trade aggressor imbalance.
+    LiveAggressorImbalance,
+    /// Rolling VWAP.
+    LiveRollingVwap,
+    /// Rolling volume velocity.
+    LiveVolumeVelocity,
+    /// Rolling momentum.
+    LiveMomentum,
+    /// Rolling return.
+    LiveRollingReturn,
+    /// Rolling volatility.
+    LiveRollingVolatility,
+    /// Cross-venue divergence.
+    LiveCrossVenueDivergence,
+    /// Available displayed liquidity.
+    LiveAvailableLiquidity,
+    /// Displayed-book slippage.
+    LiveSlippage,
+    /// Price, total, and cumulative research returns.
+    BatchReturns,
+    /// Dispersion, regression, performance-ratio, and tail-risk analytics.
+    BatchRisk,
+    /// Factor exposure regression.
+    BatchFactors,
+    /// Fundamental, valuation, free-cash-flow, and earnings analytics.
+    BatchFundamentals,
+    /// Macro surprise, yield-curve, and rate analytics.
+    BatchMacro,
+    /// Portfolio exposure, attribution, and scenario analytics.
+    BatchPortfolioScenarios,
+}
 
 /// Closed identity set for the mandatory production live features.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -87,6 +143,17 @@ impl RequiredLiveFeature {
             Self::AvailableLiquidity => "liquidity.available-quantity",
             Self::Slippage => "liquidity.slippage",
         }
+    }
+
+    /// Returns the SHA-256 implementation identity compiled for this required feature.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed if the identity hash ever equals the reserved all-zero sentinel.
+    pub fn implementation_digest(
+        self,
+    ) -> Result<FeatureImplementationDigest, FeatureMetadataError> {
+        implementations::required_live_implementation(self).implementation_digest()
     }
 
     const fn index(self) -> usize {
@@ -602,6 +669,7 @@ fn metadata(
         true,
         true,
         revision,
+        feature.implementation_digest()?,
     )
 }
 
