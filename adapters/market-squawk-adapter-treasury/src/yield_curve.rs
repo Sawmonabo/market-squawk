@@ -76,6 +76,28 @@ pub enum TreasuryMaturity {
     ThirtyYears,
 }
 
+impl TreasuryMaturity {
+    /// Returns the stable maturity token used in canonical Treasury series identities.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OneMonth => "1m",
+            Self::OneAndOneHalfMonths => "1.5m",
+            Self::TwoMonths => "2m",
+            Self::ThreeMonths => "3m",
+            Self::FourMonths => "4m",
+            Self::SixMonths => "6m",
+            Self::OneYear => "1y",
+            Self::TwoYears => "2y",
+            Self::ThreeYears => "3y",
+            Self::FiveYears => "5y",
+            Self::SevenYears => "7y",
+            Self::TenYears => "10y",
+            Self::TwentyYears => "20y",
+            Self::ThirtyYears => "30y",
+        }
+    }
+}
+
 /// Official daily par-yield-curve profile with explicit indicative methodology evidence.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TreasuryYieldCurveProfile;
@@ -201,6 +223,12 @@ impl DailyParYieldCurveObservation {
     /// Returns one exact published percentage when the maturity existed on this date.
     pub fn rate_percent(&self, maturity: TreasuryMaturity) -> Option<Decimal> {
         self.rates_percent.get(&maturity).copied()
+    }
+
+    pub(crate) fn rates_percent(&self) -> impl Iterator<Item = (TreasuryMaturity, Decimal)> + '_ {
+        self.rates_percent
+            .iter()
+            .map(|(maturity, value)| (*maturity, *value))
     }
 
     /// Returns the one-month rate when published.
