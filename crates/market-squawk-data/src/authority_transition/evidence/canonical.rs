@@ -4,12 +4,13 @@ use sha2::{Digest as _, Sha256};
 
 use super::{CatalogContentEvidenceDigest, CatalogEvidenceSnapshot, EvidenceError};
 use crate::GenerationKind;
+use crate::manifest::GenerationParentRelation;
 
 pub(super) fn evidence_digest(
     snapshot: &CatalogEvidenceSnapshot,
 ) -> Result<CatalogContentEvidenceDigest, EvidenceError> {
     let mut digest = Sha256::new();
-    digest.update(b"market-squawk/analytical-catalog-evidence/v2");
+    digest.update(b"market-squawk/analytical-catalog-evidence/v3");
     digest.update(snapshot.request().cutoff().unix_nanos().to_be_bytes());
 
     let mut artifacts: Vec<_> = snapshot.artifacts().iter().collect();
@@ -43,6 +44,7 @@ pub(super) fn evidence_digest(
     });
     section_count(&mut digest, b"generations", generations.len())?;
     for generation in generations {
+        digest.update(generation.generation_sequence().to_be_bytes());
         text(&mut digest, generation.dataset_id().as_str())?;
         digest.update(generation.manifest_version().to_be_bytes());
         digest.update(generation.content_hash().bytes());
@@ -53,17 +55,39 @@ pub(super) fn evidence_digest(
         digest.update(generation.schema().version().get().to_be_bytes());
         digest.update(generation.schema().fingerprint());
         digest.update(generation.anchor_manifest_id().as_bytes());
-        match generation.parent_version() {
-            Some(parent) => {
+        match generation.build_spec_digest() {
+            Some(build_spec) => {
                 digest.update([1]);
-                digest.update(parent.to_be_bytes());
+                digest.update(build_spec.digest().bytes());
             }
             None => digest.update([0]),
         }
         digest.update([match generation.kind() {
             GenerationKind::Ingest => 1,
             GenerationKind::Compaction => 2,
+            GenerationKind::Derived => 3,
         }]);
+        section_count(&mut digest, b"parents", generation.parents().len())?;
+        for (ordinal, edge) in generation.parents().iter().enumerate() {
+            digest.update(
+                u64::try_from(ordinal)
+                    .map_err(|_| EvidenceError::ResourceLimitExceeded)?
+                    .to_be_bytes(),
+            );
+            digest.update(edge.generation_sequence().to_be_bytes());
+            digest.update([match edge.parent().relation() {
+                GenerationParentRelation::AppendPredecessor => 1,
+                GenerationParentRelation::CompactionPredecessor => 2,
+                GenerationParentRelation::DerivedInput => 3,
+            }]);
+            let parent = edge.parent().manifest();
+            text(&mut digest, parent.dataset_id().as_str())?;
+            digest.update(parent.manifest_version().to_be_bytes());
+            text(&mut digest, parent.schema().name())?;
+            digest.update(parent.schema().version().get().to_be_bytes());
+            digest.update(parent.schema().fingerprint());
+            digest.update(parent.content_hash().bytes());
+        }
         section_count(&mut digest, b"objects", generation.objects().len())?;
         for (ordinal, object) in generation.objects().iter().enumerate() {
             digest.update(

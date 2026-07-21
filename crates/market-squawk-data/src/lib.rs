@@ -13,6 +13,7 @@ mod ingest;
 mod manifest;
 mod migrations;
 mod parquet_store;
+mod pit;
 mod publication_coordinator;
 mod query;
 mod rights;
@@ -51,12 +52,23 @@ pub use ingest::{
     QueryArtifactPublication, ResearchIngestService, extraction_batch_digest,
 };
 pub use manifest::{
-    AnalyticalManifestCatalog, DatasetId, DatasetManifestRef, GenerationKind, ManifestCatalogError,
-    ManifestObject, ManifestPlan, ManifestPlanError, PinnedDataset, PinnedManifestObject,
-    Sha256Digest,
+    AnalyticalManifestCatalog, DatasetBuildSpecDigest, DatasetId, DatasetManifestRef,
+    DerivedGenerationParents, GenerationKind, GenerationParent, GenerationParentRelation,
+    MAX_DERIVED_GENERATION_PARENTS, ManifestCatalogError, ManifestObject, ManifestPlan,
+    ManifestPlanError, PinnedDataset, PinnedManifestObject, Sha256Digest,
 };
 pub use parquet_store::{
     ObjectStoreConfig, OrphanRecoveryReport, ParquetObjectStore, ParquetStoreError, PublishedObject,
+};
+pub use pit::{
+    MAX_POINT_IN_TIME_CANDIDATES, MAX_POINT_IN_TIME_CONFLICTS, MAX_POINT_IN_TIME_FAMILIES,
+    MAX_POINT_IN_TIME_RESULT_ROWS, MAX_POINT_IN_TIME_RETAINED_BYTES, ObservationFamilyKey,
+    POINT_IN_TIME_IDENTITY_SCHEMA_VERSION, PointInTimeCandidate, PointInTimeConflict,
+    PointInTimeConflictCounts, PointInTimeConflictReport, PointInTimeError, PointInTimeExclusion,
+    PointInTimeExclusionCounts, PointInTimeExclusionReason, PointInTimeExclusionReasons,
+    PointInTimeLimits, PointInTimePolicy, PointInTimeRecord, PointInTimeRequest,
+    PointInTimeRevisionCounts, PointInTimeRevisionMode, PointInTimeRevisionState,
+    PointInTimeSelection, PointInTimeService,
 };
 pub use query::{
     QueryError, QueryLimits, QueryRequest, QueryResult, ResearchQueryEngine, ResearchQueryService,

@@ -15,10 +15,14 @@ use super::{Catalog, CatalogError};
 use crate::authority_transition::AuthoritySnapshot;
 use crate::authority_transition::evidence::{
     ArtifactEvidenceRow, CatalogEvidenceSnapshot, EvidenceError, EvidenceSnapshotRequest,
-    GenerationEvidenceRow, GenerationObjectEvidenceRow, ManifestEvidenceRow,
-    QueryArtifactEvidenceRow,
+    GenerationEvidenceRow, GenerationObjectEvidenceRow, GenerationParentEvidenceRow,
+    ManifestEvidenceRow, QueryArtifactEvidenceRow,
 };
-use crate::{DatasetId, DatasetSchemaRef, DatasetSchemaRegistry, GenerationKind, Sha256Digest};
+use crate::manifest::{DatasetBuildSpecDigest, GenerationParentRelation};
+use crate::{
+    DatasetId, DatasetManifestRef, DatasetSchemaRef, DatasetSchemaRegistry, GenerationKind,
+    Sha256Digest,
+};
 
 impl Catalog {
     /// Captures authority and analytical relationships from one consistent live read transaction.
@@ -78,9 +82,9 @@ fn evidence_snapshot(
     remaining_references = remaining_references
         .checked_sub(manifests.len())
         .ok_or(CatalogError::AnalyticalEvidenceLimitExceeded)?;
-    let (generations, generation_objects) = read_generations(transaction, remaining_references)?;
+    let (generations, generation_references) = read_generations(transaction, remaining_references)?;
     remaining_references = remaining_references
-        .checked_sub(generation_objects)
+        .checked_sub(generation_references)
         .ok_or(CatalogError::AnalyticalEvidenceLimitExceeded)?;
     let query_artifacts =
         read_query_artifacts(transaction, request.cutoff(), remaining_references)?;
@@ -154,6 +158,7 @@ fn read_manifests(
 
 #[derive(Debug)]
 struct GenerationHeader {
+    generation_sequence: u64,
     dataset_id: DatasetId,
     dataset_key: String,
     manifest_version: u64,
@@ -163,8 +168,8 @@ struct GenerationHeader {
     total_bytes: u64,
     schema: DatasetSchemaRef,
     anchor_manifest_id: Uuid,
-    parent_version: Option<u64>,
     kind: GenerationKind,
+    build_spec_digest: Option<DatasetBuildSpecDigest>,
 }
 
 fn read_generations(
@@ -173,17 +178,31 @@ fn read_generations(
 ) -> Result<(Vec<GenerationEvidenceRow>, usize), CatalogError> {
     let headers = read_generation_headers(connection, maximum_references)?;
     let mut objects = read_generation_objects(connection, maximum_references)?;
+    let mut parents = read_generation_parents(connection, maximum_references)?;
     let object_count = objects.values().try_fold(0_usize, |total, members| {
         total
             .checked_add(members.len())
             .ok_or(CatalogError::AnalyticalEvidenceLimitExceeded)
     })?;
+    let parent_count = parents.values().try_fold(0_usize, |total, members| {
+        total
+            .checked_add(members.len())
+            .ok_or(CatalogError::AnalyticalEvidenceLimitExceeded)
+    })?;
+    let reference_count = object_count
+        .checked_add(parent_count)
+        .ok_or(CatalogError::AnalyticalEvidenceLimitExceeded)?;
+    if reference_count > maximum_references {
+        return Err(CatalogError::AnalyticalEvidenceLimitExceeded);
+    }
     let mut result = Vec::with_capacity(headers.len());
     for header in headers {
         let key = (header.dataset_key.clone(), header.manifest_version);
         let generation_objects = objects.remove(&key).ok_or(CatalogError::CorruptCatalog)?;
+        let generation_parents = parents.remove(&key).unwrap_or_default();
         result.push(
             GenerationEvidenceRow::try_new(
+                header.generation_sequence,
                 header.dataset_id,
                 header.manifest_version,
                 header.content_hash,
@@ -192,17 +211,18 @@ fn read_generations(
                 header.total_bytes,
                 header.schema,
                 header.anchor_manifest_id,
-                header.parent_version,
                 header.kind,
+                header.build_spec_digest,
+                generation_parents,
                 generation_objects,
             )
             .map_err(map_evidence_error)?,
         );
     }
-    if !objects.is_empty() {
+    if !objects.is_empty() || !parents.is_empty() {
         return Err(CatalogError::CorruptCatalog);
     }
-    Ok((result, object_count))
+    Ok((result, reference_count))
 }
 
 fn read_generation_headers(
@@ -211,23 +231,23 @@ fn read_generation_headers(
 ) -> Result<Vec<GenerationHeader>, CatalogError> {
     let limit = limit_with_sentinel(maximum)?;
     let mut statement = connection.prepare(
-        "SELECT dataset_id, manifest_version, content_hash, lineage_hash, row_count, total_bytes, \
+        "SELECT generation_sequence, dataset_id, manifest_version, content_hash, lineage_hash, \
+                row_count, total_bytes, \
                 schema_name, schema_version, schema_fingerprint, anchor_manifest_id, \
-                parent_version, generation_kind \
+                generation_kind, build_spec_digest \
          FROM analytical_generations ORDER BY dataset_id, manifest_version LIMIT ?1",
     )?;
     let mut rows = statement.query([limit])?;
     let mut result = Vec::new();
     while let Some(row) = rows.next()? {
         require_capacity(&result, maximum)?;
-        let dataset_key: String = row.get(0)?;
-        let parent: Option<i64> = row.get(10)?;
+        let dataset_key: String = row.get(1)?;
         let kind: String = row.get(11)?;
-        let schema_name: String = row.get(6)?;
+        let schema_name: String = row.get(7)?;
         let schema_version =
-            u16::try_from(row.get::<_, i64>(7)?).map_err(|_| CatalogError::CorruptCatalog)?;
+            u16::try_from(row.get::<_, i64>(8)?).map_err(|_| CatalogError::CorruptCatalog)?;
         let schema_fingerprint: [u8; 32] = row
-            .get::<_, Vec<u8>>(8)?
+            .get::<_, Vec<u8>>(9)?
             .try_into()
             .map_err(|_| CatalogError::CorruptCatalog)?;
         let schema = DatasetSchemaRef::try_new(
@@ -241,23 +261,95 @@ fn read_generation_headers(
             .resolve(&schema)
             .map_err(|_| CatalogError::CorruptCatalog)?;
         result.push(GenerationHeader {
+            generation_sequence: parse_positive_u64(row.get(0)?)?,
             dataset_id: DatasetId::try_from(dataset_key.as_str())
                 .map_err(|_| CatalogError::CorruptCatalog)?,
             dataset_key,
-            manifest_version: parse_positive_u64(row.get(1)?)?,
-            content_hash: parse_sha256(1, row.get::<_, Vec<u8>>(2)?)?,
-            lineage_hash: parse_sha256(1, row.get::<_, Vec<u8>>(3)?)?,
-            row_count: parse_positive_u64(row.get(4)?)?,
-            total_bytes: parse_positive_u64(row.get(5)?)?,
+            manifest_version: parse_positive_u64(row.get(2)?)?,
+            content_hash: parse_sha256(1, row.get::<_, Vec<u8>>(3)?)?,
+            lineage_hash: parse_sha256(1, row.get::<_, Vec<u8>>(4)?)?,
+            row_count: parse_positive_u64(row.get(5)?)?,
+            total_bytes: parse_positive_u64(row.get(6)?)?,
             schema,
-            anchor_manifest_id: parse_uuid(row.get::<_, String>(9)?)?,
-            parent_version: parent.map(parse_positive_u64).transpose()?,
-            kind: match kind.as_str() {
-                "ingest" => GenerationKind::Ingest,
-                "compaction" => GenerationKind::Compaction,
-                _ => return Err(CatalogError::CorruptCatalog),
-            },
+            anchor_manifest_id: parse_uuid(row.get::<_, String>(10)?)?,
+            kind: GenerationKind::from_database_name(&kind).ok_or(CatalogError::CorruptCatalog)?,
+            build_spec_digest: row
+                .get::<_, Option<Vec<u8>>>(12)?
+                .map(parse_build_spec_digest)
+                .transpose()?,
         });
+    }
+    Ok(result)
+}
+
+fn read_generation_parents(
+    connection: &Connection,
+    maximum: usize,
+) -> Result<BTreeMap<(String, u64), Vec<GenerationParentEvidenceRow>>, CatalogError> {
+    let limit = limit_with_sentinel(maximum)?;
+    let mut statement = connection.prepare(
+        "SELECT child_dataset_id, child_manifest_version, ordinal, relation, \
+                parent_generation_sequence, parent_dataset_id, parent_manifest_version, \
+                parent_schema_name, parent_schema_version, parent_schema_fingerprint, \
+                parent_content_hash \
+         FROM analytical_generation_parents \
+         ORDER BY child_dataset_id, child_manifest_version, ordinal LIMIT ?1",
+    )?;
+    let mut rows = statement.query([limit])?;
+    let mut result: BTreeMap<(String, u64), Vec<GenerationParentEvidenceRow>> = BTreeMap::new();
+    let mut observed = 0_usize;
+    while let Some(row) = rows.next()? {
+        if observed >= maximum {
+            return Err(CatalogError::AnalyticalEvidenceLimitExceeded);
+        }
+        observed = observed
+            .checked_add(1)
+            .ok_or(CatalogError::AnalyticalEvidenceLimitExceeded)?;
+        let child_dataset: String = row.get(0)?;
+        DatasetId::try_from(child_dataset.as_str()).map_err(|_| CatalogError::CorruptCatalog)?;
+        let child_version = parse_positive_u64(row.get(1)?)?;
+        let ordinal =
+            usize::try_from(row.get::<_, i64>(2)?).map_err(|_| CatalogError::CorruptCatalog)?;
+        let members = result.entry((child_dataset, child_version)).or_default();
+        if ordinal != members.len() {
+            return Err(CatalogError::CorruptCatalog);
+        }
+
+        let relation = GenerationParentRelation::from_database_name(&row.get::<_, String>(3)?)
+            .ok_or(CatalogError::CorruptCatalog)?;
+        let parent_sequence = parse_positive_u64(row.get(4)?)?;
+        let parent_dataset_key: String = row.get(5)?;
+        let parent_dataset = DatasetId::try_from(parent_dataset_key.as_str())
+            .map_err(|_| CatalogError::CorruptCatalog)?;
+        let parent_version = parse_positive_u64(row.get(6)?)?;
+        let parent_schema_name: String = row.get(7)?;
+        let parent_schema_version =
+            u16::try_from(row.get::<_, i64>(8)?).map_err(|_| CatalogError::CorruptCatalog)?;
+        let parent_schema_fingerprint: [u8; 32] = row
+            .get::<_, Vec<u8>>(9)?
+            .try_into()
+            .map_err(|_| CatalogError::CorruptCatalog)?;
+        let parent_schema = DatasetSchemaRef::try_new(
+            &parent_schema_name,
+            market_squawk_domain::SchemaVersion::new(parent_schema_version)
+                .map_err(|_| CatalogError::CorruptCatalog)?,
+            parent_schema_fingerprint,
+        )
+        .map_err(|_| CatalogError::CorruptCatalog)?;
+        DatasetSchemaRegistry::local()
+            .resolve(&parent_schema)
+            .map_err(|_| CatalogError::CorruptCatalog)?;
+        let parent = DatasetManifestRef::try_new_with_schema(
+            parent_dataset,
+            parent_version,
+            parent_schema,
+            parse_sha256(1, row.get::<_, Vec<u8>>(10)?)?,
+        )
+        .map_err(|_| CatalogError::CorruptCatalog)?;
+        members.push(
+            GenerationParentEvidenceRow::try_new(parent_sequence, relation, parent)
+                .map_err(map_evidence_error)?,
+        );
     }
     Ok(result)
 }
@@ -376,6 +468,11 @@ fn parse_sha256(algorithm: i64, value: Vec<u8>) -> Result<Sha256Digest, CatalogE
     value
         .try_into()
         .map(Sha256Digest::new)
+        .map_err(|_| CatalogError::CorruptCatalog)
+}
+
+fn parse_build_spec_digest(value: Vec<u8>) -> Result<DatasetBuildSpecDigest, CatalogError> {
+    DatasetBuildSpecDigest::try_new(value.try_into().map_err(|_| CatalogError::CorruptCatalog)?)
         .map_err(|_| CatalogError::CorruptCatalog)
 }
 

@@ -361,7 +361,7 @@ impl ResearchQueryEngine {
             manifest: dataset.manifest().clone(),
             table_name,
             source: QuerySource::Pinned {
-                dataset,
+                dataset: Box::new(dataset),
                 store: Arc::clone(&store),
                 schema,
                 receipt: RetainedSourceReceipt::new(retained_bytes),

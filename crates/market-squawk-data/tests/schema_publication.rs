@@ -114,9 +114,9 @@ fn schema_identity_is_causal_across_publication_pinning_and_restart() -> TestRes
     connection.execute(
         "INSERT INTO analytical_generations
          (dataset_id, manifest_version, content_hash, lineage_hash, row_count, total_bytes,
-          schema_name, schema_version, schema_fingerprint, anchor_manifest_id, parent_version,
-          generation_kind, created_at_ns)
-         VALUES (?1, 1, ?2, ?3, 1, 1, ?4, ?5, ?6, ?7, NULL, 'ingest', 1)",
+          schema_name, schema_version, schema_fingerprint, anchor_manifest_id, generation_kind,
+          parent_count, build_spec_digest, created_at_ns)
+         VALUES (?1, 1, ?2, ?3, 1, 1, ?4, ?5, ?6, ?7, 'ingest', 0, NULL, 1)",
         params![
             dataset.as_str(),
             plan.content_hash().bytes().as_slice(),
@@ -144,10 +144,10 @@ fn schema_identity_is_causal_across_publication_pinning_and_restart() -> TestRes
             .execute(
                 "INSERT INTO analytical_generations
                  (dataset_id, manifest_version, content_hash, lineage_hash, row_count, total_bytes,
-                  schema_version, anchor_manifest_id, parent_version, generation_kind,
-                  created_at_ns)
-                 VALUES ('unknown-schema', 1, zeroblob(32), zeroblob(32), 1, 1, 2, ?1, NULL,
-                         'ingest', 1)",
+                  schema_version, anchor_manifest_id, generation_kind, parent_count,
+                  build_spec_digest, created_at_ns)
+                 VALUES ('unknown-schema', 1, zeroblob(32), zeroblob(32), 1, 1, 2, ?1,
+                         'ingest', 0, NULL, 1)",
                 [uuid::Uuid::new_v4().to_string()],
             )
             .is_err()

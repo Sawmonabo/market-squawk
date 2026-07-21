@@ -14,7 +14,10 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
-    DatasetId, DatasetManifestRef, ManifestObject, ManifestPlan, ManifestPlanError, Sha256Digest,
+    DatasetBuildSpecDigest, DatasetId, DatasetManifestRef, DerivedGenerationCommitAuthority,
+    DerivedGenerationParents, GenerationParent, GenerationParentRelation,
+    MAX_DERIVED_GENERATION_PARENTS, ManifestObject, ManifestPlan, ManifestPlanError, Sha256Digest,
+    compare_manifest_refs,
 };
 use crate::catalog::exact_catalog_file_binding;
 use crate::schema::{DatasetSchemaRef, DatasetSchemaRegistry};
@@ -52,6 +55,9 @@ impl PinnedManifestObject {
 pub struct PinnedDataset {
     manifest: DatasetManifestRef,
     plan: ManifestPlan,
+    generation_kind: GenerationKind,
+    build_spec_digest: Option<DatasetBuildSpecDigest>,
+    parents: Box<[GenerationParent]>,
     objects: Box<[PinnedManifestObject]>,
     retained_bytes: usize,
 }
@@ -65,6 +71,21 @@ impl PinnedDataset {
     /// Returns the immutable manifest plan.
     pub const fn plan(&self) -> &ManifestPlan {
         &self.plan
+    }
+
+    /// Returns how this generation relates to its exact retained parents.
+    pub const fn generation_kind(&self) -> GenerationKind {
+        self.generation_kind
+    }
+
+    /// Returns the caller-supplied build identity for a derived generation.
+    pub const fn build_spec_digest(&self) -> Option<DatasetBuildSpecDigest> {
+        self.build_spec_digest
+    }
+
+    /// Returns every exact parent in canonical durable ordinal order.
+    pub fn parents(&self) -> &[GenerationParent] {
+        &self.parents
     }
 
     /// Returns objects in stable row order.
@@ -134,7 +155,7 @@ impl AnalyticalManifestCatalog {
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "trusted_schema", "OFF")?;
         let migrated: bool = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=6)",
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=7)",
             [],
             |row| row.get(0),
         )?;
@@ -185,6 +206,20 @@ impl AnalyticalManifestCatalog {
         ManifestPlan::compact(previous.plan(), compacted).map_err(Into::into)
     }
 
+    /// Builds a complete multi-object derived plan in canonical content order.
+    #[allow(
+        dead_code,
+        reason = "the immediately following ResearchUse dataset builder is the sole caller"
+    )]
+    pub(crate) fn preview_derived(
+        &self,
+        dataset_id: DatasetId,
+        objects: Vec<ManifestObject>,
+    ) -> Result<ManifestPlan, ManifestCatalogError> {
+        ManifestPlan::derive(dataset_id, objects, self.max_objects_per_generation)
+            .map_err(Into::into)
+    }
+
     /// Commits one complete generation using `BEGIN IMMEDIATE` after the Task 3 anchor exists.
     pub(crate) fn commit_generation(
         &self,
@@ -194,6 +229,9 @@ impl AnalyticalManifestCatalog {
         schema: &DatasetSchemaRef,
         kind: GenerationKind,
     ) -> Result<DatasetManifestRef, ManifestCatalogError> {
+        if kind == GenerationKind::Derived {
+            return Err(ManifestCatalogError::GenerationConflict);
+        }
         DatasetSchemaRegistry::local().resolve(schema)?;
         if anchor.artifact_id() != artifact.artifact_id()
             || anchor.schema_version() != schema.version()
@@ -210,9 +248,11 @@ impl AnalyticalManifestCatalog {
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(existing) = manifest_for_anchor(&transaction, anchor.manifest_id())? {
-            if existing.content_hash == plan.content_hash
-                && existing.dataset_id == plan.dataset_id
-                && existing.schema == *schema
+            let pinned = load_pinned(&transaction, &existing, self.max_objects_per_generation)?;
+            if pinned.plan == *plan
+                && pinned.manifest.schema == *schema
+                && pinned.generation_kind == kind
+                && pinned.build_spec_digest.is_none()
             {
                 transaction.commit()?;
                 return Ok(existing);
@@ -258,6 +298,7 @@ impl AnalyticalManifestCatalog {
                         .ok_or(ManifestCatalogError::CorruptCatalog)?,
                 )?
             }
+            GenerationKind::Derived => return Err(ManifestCatalogError::GenerationConflict),
         };
         if expected != *plan {
             return Err(ManifestCatalogError::GenerationConflict);
@@ -265,13 +306,22 @@ impl AnalyticalManifestCatalog {
         let version = previous_version(&transaction, &plan.dataset_id)?
             .checked_add(1)
             .ok_or(ManifestCatalogError::CountOverflow)?;
-        let parent = version.checked_sub(1).filter(|value| *value > 0);
+        let parent = previous.as_ref().map(|previous| {
+            GenerationParent::new(
+                match kind {
+                    GenerationKind::Ingest => GenerationParentRelation::AppendPredecessor,
+                    GenerationKind::Compaction => GenerationParentRelation::CompactionPredecessor,
+                    GenerationKind::Derived => GenerationParentRelation::DerivedInput,
+                },
+                previous.manifest().clone(),
+            )
+        });
         transaction.execute(
             "INSERT INTO analytical_generations
              (dataset_id, manifest_version, content_hash, lineage_hash, row_count, total_bytes,
-              schema_name, schema_version, schema_fingerprint, anchor_manifest_id, parent_version,
-              generation_kind, created_at_ns)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+              schema_name, schema_version, schema_fingerprint, anchor_manifest_id,
+              generation_kind, parent_count, build_spec_digest, created_at_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL, ?13)",
             params![
                 plan.dataset_id.as_str(),
                 to_i64(version)?,
@@ -283,8 +333,8 @@ impl AnalyticalManifestCatalog {
                 i64::from(schema.version().get()),
                 schema.fingerprint().as_slice(),
                 anchor.manifest_id().to_string(),
-                parent.map(to_i64).transpose()?,
                 kind.database_name(),
+                i64::from(parent.is_some()),
                 anchor.created_at().unix_nanos(),
             ],
         )?;
@@ -325,6 +375,153 @@ impl AnalyticalManifestCatalog {
                     .last()
                     .ok_or(ManifestCatalogError::CorruptCatalog)?,
             )?,
+            GenerationKind::Derived => return Err(ManifestCatalogError::GenerationConflict),
+        }
+        if let Some(parent) = parent.as_ref() {
+            insert_generation_parent(&transaction, &plan.dataset_id, version, 0, parent)?;
+        }
+        let manifest = DatasetManifestRef::try_new_with_schema(
+            plan.dataset_id.clone(),
+            version,
+            schema.clone(),
+            plan.content_hash,
+        )?;
+        transaction.commit()?;
+        Ok(manifest)
+    }
+
+    /// Commits one complete derived generation and every exact input edge atomically.
+    #[allow(
+        dead_code,
+        clippy::too_many_arguments,
+        reason = "the ResearchUse-gated atomic commit verifies seven independent retained identities"
+    )]
+    pub(crate) fn commit_derived_generation(
+        &self,
+        _authority: &DerivedGenerationCommitAuthority,
+        plan: &ManifestPlan,
+        artifacts: &[ArtifactRecord],
+        anchor: &DatasetManifestRecord,
+        schema: &DatasetSchemaRef,
+        parents: &DerivedGenerationParents,
+        build_spec_digest: DatasetBuildSpecDigest,
+    ) -> Result<DatasetManifestRef, ManifestCatalogError> {
+        DatasetSchemaRegistry::local().resolve(schema)?;
+        if artifacts.len() != plan.objects.len() || artifacts.is_empty() {
+            return Err(ManifestCatalogError::AnchorMismatch);
+        }
+        let mut canonical_artifacts: Vec<_> = artifacts.iter().collect();
+        for artifact in &canonical_artifacts {
+            if !matches!(
+                artifact.content_digest().algorithm(),
+                DigestAlgorithm::Sha256
+            ) {
+                return Err(ManifestCatalogError::AnchorMismatch);
+            }
+        }
+        canonical_artifacts.sort_unstable_by_key(|artifact| artifact.content_digest().bytes());
+        if anchor.artifact_id() != canonical_artifacts[0].artifact_id()
+            || anchor.dataset_name().as_str() != plan.dataset_id.as_str()
+            || anchor.schema_version() != schema.version()
+            || sha256_from_evidence(anchor.content_digest())? != plan.content_hash
+            || canonical_artifacts
+                .iter()
+                .zip(&plan.objects)
+                .any(|(artifact, object)| {
+                    sha256_from_evidence(artifact.content_digest()).ok()
+                        != Some(object.content_hash)
+                        || artifact.size_bytes() != object.size_bytes
+                })
+        {
+            return Err(ManifestCatalogError::AnchorMismatch);
+        }
+        let expected = ManifestPlan::derive(
+            plan.dataset_id.clone(),
+            plan.objects.to_vec(),
+            self.max_objects_per_generation,
+        )?;
+        if expected != *plan {
+            return Err(ManifestCatalogError::GenerationConflict);
+        }
+        let requested_parents: Vec<_> = parents
+            .as_slice()
+            .iter()
+            .cloned()
+            .map(|manifest| GenerationParent::new(GenerationParentRelation::DerivedInput, manifest))
+            .collect();
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for artifact in &canonical_artifacts {
+            require_exact_artifact(&transaction, artifact)?;
+        }
+        require_exact_anchor(&transaction, anchor)?;
+        if let Some(existing) = manifest_for_anchor(&transaction, anchor.manifest_id())? {
+            let pinned = load_pinned(&transaction, &existing, self.max_objects_per_generation)?;
+            if pinned.plan == *plan
+                && pinned.manifest.schema == *schema
+                && pinned.generation_kind == GenerationKind::Derived
+                && pinned.build_spec_digest == Some(build_spec_digest)
+                && pinned.parents.as_ref() == requested_parents
+            {
+                transaction.commit()?;
+                return Ok(existing);
+            }
+            return Err(ManifestCatalogError::GenerationConflict);
+        }
+        let previous = load_latest(
+            &transaction,
+            &plan.dataset_id,
+            self.max_objects_per_generation,
+        )?;
+        if previous
+            .as_ref()
+            .is_some_and(|value| value.manifest().schema() != schema)
+        {
+            return Err(ManifestCatalogError::SchemaMismatch);
+        }
+        for parent in parents.as_slice() {
+            require_exact_generation(&transaction, parent)?;
+        }
+        let version = previous_version(&transaction, &plan.dataset_id)?
+            .checked_add(1)
+            .ok_or(ManifestCatalogError::CountOverflow)?;
+        transaction.execute(
+            "INSERT INTO analytical_generations
+             (dataset_id, manifest_version, content_hash, lineage_hash, row_count, total_bytes,
+              schema_name, schema_version, schema_fingerprint, anchor_manifest_id,
+              generation_kind, parent_count, build_spec_digest, created_at_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'derived', ?11, ?12, ?13)",
+            params![
+                plan.dataset_id.as_str(),
+                to_i64(version)?,
+                plan.content_hash.bytes(),
+                plan.lineage_digest.bytes(),
+                to_i64(plan.row_count)?,
+                to_i64(plan.total_bytes)?,
+                schema.name(),
+                i64::from(schema.version().get()),
+                schema.fingerprint().as_slice(),
+                anchor.manifest_id().to_string(),
+                i64::try_from(requested_parents.len())
+                    .map_err(|_| ManifestCatalogError::CountOverflow)?,
+                build_spec_digest.digest().bytes(),
+                anchor.created_at().unix_nanos(),
+            ],
+        )?;
+        for (ordinal, (artifact, object)) in
+            canonical_artifacts.iter().zip(&plan.objects).enumerate()
+        {
+            insert_generation_object(
+                &transaction,
+                &plan.dataset_id,
+                version,
+                ordinal,
+                artifact.artifact_id(),
+                object,
+            )?;
+        }
+        for (ordinal, parent) in requested_parents.iter().enumerate() {
+            insert_generation_parent(&transaction, &plan.dataset_id, version, ordinal, parent)?;
         }
         let manifest = DatasetManifestRef::try_new_with_schema(
             plan.dataset_id.clone(),
@@ -503,13 +700,25 @@ pub enum GenerationKind {
     Ingest,
     /// Replace all prior objects with one equivalent compacted object.
     Compaction,
+    /// Publish a complete output computed from explicit exact input generations.
+    Derived,
 }
 
 impl GenerationKind {
-    const fn database_name(self) -> &'static str {
+    pub(crate) const fn database_name(self) -> &'static str {
         match self {
             Self::Ingest => "ingest",
             Self::Compaction => "compaction",
+            Self::Derived => "derived",
+        }
+    }
+
+    pub(crate) fn from_database_name(value: &str) -> Option<Self> {
+        match value {
+            "ingest" => Some(Self::Ingest),
+            "compaction" => Some(Self::Compaction),
+            "derived" => Some(Self::Derived),
+            _ => None,
         }
     }
 }
@@ -718,8 +927,9 @@ fn load_pinned(
         .map_err(|_| ManifestCatalogError::SchemaMismatch)?;
     let header = connection
         .query_row(
-            "SELECT content_hash, lineage_hash, row_count, total_bytes, schema_name,
-                    schema_version, schema_fingerprint
+            "SELECT generation_sequence, content_hash, lineage_hash, row_count, total_bytes,
+                    schema_name, schema_version, schema_fingerprint, generation_kind,
+                    parent_count, build_spec_digest
              FROM analytical_generations WHERE dataset_id=?1 AND manifest_version=?2",
             params![
                 reference.dataset_id.as_str(),
@@ -727,23 +937,46 @@ fn load_pinned(
             ],
             |row| {
                 Ok((
-                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, i64>(0)?,
                     row.get::<_, Vec<u8>>(1)?,
-                    row.get::<_, i64>(2)?,
+                    row.get::<_, Vec<u8>>(2)?,
                     row.get::<_, i64>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, i64>(5)?,
-                    row.get::<_, Vec<u8>>(6)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, Vec<u8>>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, Option<Vec<u8>>>(10)?,
                 ))
             },
         )
         .optional()?
         .ok_or(ManifestCatalogError::GenerationConflict)?;
-    if parse_digest(&header.0)? != reference.content_hash
-        || parse_schema_identity(&header.4, header.5, &header.6)? != *reference.schema()
+    if parse_digest(&header.1)? != reference.content_hash
+        || parse_schema_identity(&header.5, header.6, &header.7)? != *reference.schema()
     {
         return Err(ManifestCatalogError::GenerationConflict);
     }
+    let generation_sequence = from_i64(header.0)?;
+    let generation_kind = GenerationKind::from_database_name(&header.8)
+        .ok_or(ManifestCatalogError::CorruptCatalog)?;
+    let parent_count = usize::try_from(header.9)
+        .ok()
+        .filter(|count| *count <= MAX_DERIVED_GENERATION_PARENTS)
+        .ok_or(ManifestCatalogError::CorruptCatalog)?;
+    let build_spec_digest = header
+        .10
+        .as_deref()
+        .map(parse_build_spec_digest)
+        .transpose()?;
+    let parents = load_generation_parents(
+        connection,
+        reference,
+        generation_sequence,
+        generation_kind,
+        parent_count,
+    )?;
     let retrieval_limit = max_objects
         .checked_add(1)
         .ok_or(ManifestCatalogError::CountOverflow)?;
@@ -826,9 +1059,16 @@ fn load_pinned(
     }
     let plan = ManifestPlan::from_exact_objects(reference.dataset_id.clone(), plan_objects)?;
     if plan.content_hash != reference.content_hash
-        || plan.lineage_digest != parse_digest(&header.1)?
-        || plan.row_count != from_i64(header.2)?
-        || plan.total_bytes != from_i64(header.3)?
+        || plan.lineage_digest != parse_digest(&header.2)?
+        || plan.row_count != from_i64(header.3)?
+        || plan.total_bytes != from_i64(header.4)?
+        || (generation_kind == GenerationKind::Derived
+            && ManifestPlan::derive(
+                reference.dataset_id.clone(),
+                plan.objects.to_vec(),
+                max_objects,
+            )? != plan)
+        || (generation_kind == GenerationKind::Derived) != build_spec_digest.is_some()
     {
         return Err(ManifestCatalogError::CorruptCatalog);
     }
@@ -837,18 +1077,143 @@ fn load_pinned(
     if objects.as_ptr() != object_allocation {
         return Err(ManifestCatalogError::AllocationContract);
     }
-    let retained_bytes = pinned_dataset_retained_bytes(reference, &plan, &objects)?;
+    let retained_bytes = pinned_dataset_retained_bytes(reference, &plan, &parents, &objects)?;
     Ok(PinnedDataset {
         manifest: reference.clone(),
         plan,
+        generation_kind,
+        build_spec_digest,
+        parents,
         objects,
         retained_bytes,
     })
 }
 
+fn load_generation_parents(
+    connection: &Connection,
+    child: &DatasetManifestRef,
+    child_sequence: u64,
+    kind: GenerationKind,
+    expected_count: usize,
+) -> Result<Box<[GenerationParent]>, ManifestCatalogError> {
+    let retrieval_limit = expected_count
+        .checked_add(1)
+        .ok_or(ManifestCatalogError::CountOverflow)?;
+    let mut statement = connection.prepare(
+        "SELECT ordinal, relation, parent_generation_sequence, parent_dataset_id,
+                parent_manifest_version, parent_schema_name, parent_schema_version,
+                parent_schema_fingerprint, parent_content_hash
+         FROM analytical_generation_parents
+         WHERE child_dataset_id=?1 AND child_manifest_version=?2
+         ORDER BY ordinal LIMIT ?3",
+    )?;
+    let rows = statement.query_map(
+        params![
+            child.dataset_id().as_str(),
+            to_i64(child.manifest_version())?,
+            i64::try_from(retrieval_limit).map_err(|_| ManifestCatalogError::CountOverflow)?,
+        ],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, Vec<u8>>(7)?,
+                row.get::<_, Vec<u8>>(8)?,
+            ))
+        },
+    )?;
+    let mut parents = Vec::new();
+    parents
+        .try_reserve_exact(retrieval_limit)
+        .map_err(|_| ManifestCatalogError::CountOverflow)?;
+    for row in rows {
+        let (
+            ordinal,
+            relation,
+            parent_sequence,
+            dataset,
+            version,
+            schema_name,
+            schema_version,
+            schema_fingerprint,
+            content_hash,
+        ) = row?;
+        if usize::try_from(ordinal).ok() != Some(parents.len())
+            || from_i64(parent_sequence)? >= child_sequence
+        {
+            return Err(ManifestCatalogError::CorruptCatalog);
+        }
+        let manifest = DatasetManifestRef::try_new_with_schema(
+            DatasetId::try_from(dataset.as_str())?,
+            from_i64(version)?,
+            parse_schema_identity(&schema_name, schema_version, &schema_fingerprint)?,
+            parse_digest(&content_hash)?,
+        )?;
+        parents.push(GenerationParent::new(
+            GenerationParentRelation::from_database_name(&relation)
+                .ok_or(ManifestCatalogError::CorruptCatalog)?,
+            manifest,
+        ));
+    }
+    if parents.len() != expected_count
+        || !valid_parent_semantics(child, kind, &parents)
+        || (kind == GenerationKind::Derived
+            && parents
+                .windows(2)
+                .any(|pair| compare_manifest_refs(pair[0].manifest(), pair[1].manifest()).is_ge()))
+    {
+        return Err(ManifestCatalogError::CorruptCatalog);
+    }
+    Ok(parents.into_boxed_slice())
+}
+
+fn valid_parent_semantics(
+    child: &DatasetManifestRef,
+    kind: GenerationKind,
+    parents: &[GenerationParent],
+) -> bool {
+    match kind {
+        GenerationKind::Ingest if child.manifest_version() == 1 => parents.is_empty(),
+        GenerationKind::Ingest => {
+            predecessor_matches(child, parents, GenerationParentRelation::AppendPredecessor)
+        }
+        GenerationKind::Compaction => predecessor_matches(
+            child,
+            parents,
+            GenerationParentRelation::CompactionPredecessor,
+        ),
+        GenerationKind::Derived => {
+            !parents.is_empty()
+                && parents
+                    .iter()
+                    .all(|parent| parent.relation() == GenerationParentRelation::DerivedInput)
+        }
+    }
+}
+
+fn predecessor_matches(
+    child: &DatasetManifestRef,
+    parents: &[GenerationParent],
+    relation: GenerationParentRelation,
+) -> bool {
+    let Some(parent) = parents.first().filter(|_| parents.len() == 1) else {
+        return false;
+    };
+    parent.relation() == relation
+        && parent.manifest().dataset_id() == child.dataset_id()
+        && parent.manifest().manifest_version().checked_add(1) == Some(child.manifest_version())
+        && parent.manifest().schema() == child.schema()
+}
+
 fn pinned_dataset_retained_bytes(
     manifest: &DatasetManifestRef,
     plan: &ManifestPlan,
+    parents: &[GenerationParent],
     objects: &[PinnedManifestObject],
 ) -> Result<usize, ManifestCatalogError> {
     let inline_objects = objects
@@ -860,13 +1225,27 @@ fn pinned_dataset_retained_bytes(
         .len()
         .checked_mul(size_of::<ManifestObject>())
         .ok_or(ManifestCatalogError::CountOverflow)?;
+    let inline_parents = parents
+        .len()
+        .checked_mul(size_of::<GenerationParent>())
+        .ok_or(ManifestCatalogError::CountOverflow)?;
     objects.iter().try_fold(
         size_of::<PinnedDataset>()
             .checked_add(inline_objects)
             .and_then(|value| value.checked_add(plan_objects))
+            .and_then(|value| value.checked_add(inline_parents))
             .and_then(|value| value.checked_add(manifest.dataset_id().as_str().len()))
             .and_then(|value| value.checked_add(manifest.schema().name().len()))
             .and_then(|value| value.checked_add(plan.dataset_id().as_str().len()))
+            .and_then(|value| {
+                parents.iter().try_fold(value, |retained, parent| {
+                    retained
+                        .checked_add(parent.manifest().dataset_id().as_str().len())
+                        .and_then(|value| {
+                            value.checked_add(parent.manifest().schema().name().len())
+                        })
+                })
+            })
             .ok_or(ManifestCatalogError::CountOverflow)?,
         |total, object| {
             total
@@ -996,6 +1375,164 @@ fn insert_generation_object(
     Ok(())
 }
 
+fn insert_generation_parent(
+    connection: &Connection,
+    child_dataset_id: &DatasetId,
+    child_version: u64,
+    ordinal: usize,
+    parent: &GenerationParent,
+) -> Result<(), ManifestCatalogError> {
+    let parent_sequence: i64 = connection
+        .query_row(
+            "SELECT generation_sequence
+             FROM analytical_generations
+             WHERE dataset_id=?1 AND manifest_version=?2
+               AND schema_name=?3 AND schema_version=?4
+               AND schema_fingerprint=?5 AND content_hash=?6",
+            params![
+                parent.manifest().dataset_id().as_str(),
+                to_i64(parent.manifest().manifest_version())?,
+                parent.manifest().schema().name(),
+                i64::from(parent.manifest().schema_version().get()),
+                parent.manifest().schema().fingerprint().as_slice(),
+                parent.manifest().content_hash().bytes(),
+            ],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or(ManifestCatalogError::GenerationConflict)?;
+    connection.execute(
+        "INSERT INTO analytical_generation_parents
+         (child_dataset_id, child_manifest_version, ordinal, relation,
+          parent_generation_sequence, parent_dataset_id, parent_manifest_version,
+          parent_schema_name, parent_schema_version, parent_schema_fingerprint,
+          parent_content_hash)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            child_dataset_id.as_str(),
+            to_i64(child_version)?,
+            i64::try_from(ordinal).map_err(|_| ManifestCatalogError::CountOverflow)?,
+            parent.relation().database_name(),
+            parent_sequence,
+            parent.manifest().dataset_id().as_str(),
+            to_i64(parent.manifest().manifest_version())?,
+            parent.manifest().schema().name(),
+            i64::from(parent.manifest().schema_version().get()),
+            parent.manifest().schema().fingerprint().as_slice(),
+            parent.manifest().content_hash().bytes(),
+        ],
+    )?;
+    Ok(())
+}
+
+#[allow(
+    dead_code,
+    reason = "used only by the sealed derived commit pending its ResearchUse-authorized caller"
+)]
+fn require_exact_generation(
+    connection: &Connection,
+    manifest: &DatasetManifestRef,
+) -> Result<(), ManifestCatalogError> {
+    DatasetSchemaRegistry::local()
+        .resolve(manifest.schema())
+        .map_err(|_| ManifestCatalogError::SchemaMismatch)?;
+    let exists: bool = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM analytical_generations
+             WHERE dataset_id=?1 AND manifest_version=?2
+               AND schema_name=?3 AND schema_version=?4
+               AND schema_fingerprint=?5 AND content_hash=?6
+         )",
+        params![
+            manifest.dataset_id().as_str(),
+            to_i64(manifest.manifest_version())?,
+            manifest.schema().name(),
+            i64::from(manifest.schema_version().get()),
+            manifest.schema().fingerprint().as_slice(),
+            manifest.content_hash().bytes(),
+        ],
+        |row| row.get(0),
+    )?;
+    if exists {
+        Ok(())
+    } else {
+        Err(ManifestCatalogError::GenerationConflict)
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "used only by the sealed derived commit pending its ResearchUse-authorized caller"
+)]
+fn require_exact_artifact(
+    connection: &Connection,
+    artifact: &ArtifactRecord,
+) -> Result<(), ManifestCatalogError> {
+    let (algorithm, digest) = match artifact.content_digest().algorithm() {
+        DigestAlgorithm::Sha256 => (1_i64, artifact.content_digest().bytes()),
+        DigestAlgorithm::Blake3 => (2_i64, artifact.content_digest().bytes()),
+    };
+    let exists: bool = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM artifacts
+             WHERE artifact_id=?1 AND relative_reference=?2
+               AND content_algorithm=?3 AND content_digest=?4
+               AND size_bytes=?5 AND created_at_ns=?6
+         )",
+        params![
+            artifact.artifact_id().to_string(),
+            artifact.relative_reference(),
+            algorithm,
+            digest,
+            to_i64(artifact.size_bytes())?,
+            artifact.created_at().unix_nanos(),
+        ],
+        |row| row.get(0),
+    )?;
+    if exists {
+        Ok(())
+    } else {
+        Err(ManifestCatalogError::AnchorMismatch)
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "used only by the sealed derived commit pending its ResearchUse-authorized caller"
+)]
+fn require_exact_anchor(
+    connection: &Connection,
+    anchor: &DatasetManifestRecord,
+) -> Result<(), ManifestCatalogError> {
+    let (algorithm, digest) = match anchor.content_digest().algorithm() {
+        DigestAlgorithm::Sha256 => (1_i64, anchor.content_digest().bytes()),
+        DigestAlgorithm::Blake3 => (2_i64, anchor.content_digest().bytes()),
+    };
+    let exists: bool = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM dataset_manifests
+             WHERE manifest_id=?1 AND dataset_name=?2 AND schema_version=?3
+               AND artifact_id=?4 AND content_algorithm=?5 AND content_digest=?6
+               AND created_at_ns=?7
+         )",
+        params![
+            anchor.manifest_id().to_string(),
+            anchor.dataset_name().as_str(),
+            i64::from(anchor.schema_version().get()),
+            anchor.artifact_id().to_string(),
+            algorithm,
+            digest,
+            anchor.created_at().unix_nanos(),
+        ],
+        |row| row.get(0),
+    )?;
+    if exists {
+        Ok(())
+    } else {
+        Err(ManifestCatalogError::AnchorMismatch)
+    }
+}
+
 fn sha256_from_evidence(value: EvidenceDigest) -> Result<Sha256Digest, ManifestCatalogError> {
     if !matches!(value.algorithm(), DigestAlgorithm::Sha256) {
         return Err(ManifestCatalogError::AnchorMismatch);
@@ -1008,6 +1545,13 @@ fn parse_digest(value: &[u8]) -> Result<Sha256Digest, ManifestCatalogError> {
         .try_into()
         .map_err(|_| ManifestCatalogError::CorruptCatalog)?;
     Ok(Sha256Digest::new(bytes))
+}
+
+fn parse_build_spec_digest(value: &[u8]) -> Result<DatasetBuildSpecDigest, ManifestCatalogError> {
+    let bytes: [u8; 32] = value
+        .try_into()
+        .map_err(|_| ManifestCatalogError::CorruptCatalog)?;
+    DatasetBuildSpecDigest::try_new(bytes).map_err(|_| ManifestCatalogError::CorruptCatalog)
 }
 
 fn parse_schema_identity(
@@ -1046,20 +1590,28 @@ fn from_i64(value: i64) -> Result<u64, ManifestCatalogError> {
 #[cfg(test)]
 mod tests {
     use std::error::Error;
+    use std::fmt::Write as _;
     use std::time::{Duration, Instant};
 
-    use market_squawk_domain::Timestamp;
+    use market_squawk_domain::{DigestAlgorithm, SourceIdentifier, Timestamp};
     use market_squawk_platform::LocalPaths;
     use rusqlite::{Connection, params};
     use tokio_util::sync::CancellationToken;
 
-    use super::{AnalyticalManifestCatalog, ManifestCatalogError};
+    use super::{
+        AnalyticalManifestCatalog, DerivedGenerationCommitAuthority, ManifestCatalogError,
+    };
+    use crate::authority_transition::evidence::{EvidenceLimits, EvidenceSnapshotRequest};
+    use crate::manifest::{DatasetBuildSpecDigest, DerivedGenerationParents};
     use crate::{
-        CatalogAuthority, CatalogConfig, CatalogLimit, CatalogResultLimits, DatasetId,
-        DatasetManifestRef, DatasetSchemaRegistry, ManifestObject, ManifestPlan, Sha256Digest,
+        ArtifactRecord, CatalogAuthority, CatalogConfig, CatalogLimit, CatalogResultLimits,
+        DatasetId, DatasetManifestRecord, DatasetManifestRef, DatasetSchemaRef,
+        DatasetSchemaRegistry, GenerationKind, ManifestObject, ManifestPlan, Sha256Digest,
     };
 
     type TestResult = Result<(), Box<dyn Error>>;
+    const FIXTURE_SOURCE_ID: &str = "derived-lineage-fixture";
+    const FIXTURE_RIGHTS_ID: [u8; 32] = [91; 32];
 
     #[test]
     fn append_rejects_mixed_row_schema_before_planning() -> TestResult {
@@ -1088,9 +1640,9 @@ mod tests {
         connection.execute(
             "INSERT INTO analytical_generations
              (dataset_id, manifest_version, content_hash, lineage_hash, row_count, total_bytes,
-              schema_name, schema_version, schema_fingerprint, anchor_manifest_id, parent_version,
-              generation_kind, created_at_ns)
-             VALUES (?1, 1, ?2, ?3, 1, 1, ?4, ?5, ?6, ?7, NULL, 'ingest', 1)",
+              schema_name, schema_version, schema_fingerprint, anchor_manifest_id,
+              generation_kind, parent_count, build_spec_digest, created_at_ns)
+             VALUES (?1, 1, ?2, ?3, 1, 1, ?4, ?5, ?6, ?7, 'ingest', 0, NULL, 1)",
             params![
                 dataset.as_str(),
                 prior_plan.content_hash().bytes().as_slice(),
@@ -1132,9 +1684,9 @@ mod tests {
         connection.execute(
             "INSERT INTO analytical_generations
              (dataset_id, manifest_version, content_hash, lineage_hash, row_count, total_bytes,
-              schema_name, schema_version, schema_fingerprint, anchor_manifest_id, parent_version,
-              generation_kind, created_at_ns)
-             VALUES ('over-limit', 1, ?1, ?2, 2, 2, ?3, ?4, ?5, ?6, NULL, 'ingest', 1)",
+              schema_name, schema_version, schema_fingerprint, anchor_manifest_id,
+              generation_kind, parent_count, build_spec_digest, created_at_ns)
+             VALUES ('over-limit', 1, ?1, ?2, 2, 2, ?3, ?4, ?5, ?6, 'ingest', 0, NULL, 1)",
             params![
                 [7_u8; 32].as_slice(),
                 [8_u8; 32].as_slice(),
@@ -1171,6 +1723,138 @@ mod tests {
             catalog.pinned(&manifest),
             Err(ManifestCatalogError::ObjectLimitExceeded { max_objects: 1 })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn derived_commit_retains_canonical_multi_object_and_parent_evidence() -> TestResult {
+        let (_directory, location) = migrated_catalog()?;
+        let schema = DatasetSchemaRegistry::local().canonical_research_observations()?;
+        let connection = Connection::open(location.path())?;
+        connection.pragma_update(None, "foreign_keys", false)?;
+        insert_control_fixture(&connection)?;
+
+        let first_parent = insert_ingest_fixture(
+            &connection,
+            &schema,
+            "inputs.second",
+            ManifestObject::try_new(
+                Sha256Digest::new([21; 32]),
+                7,
+                211,
+                Sha256Digest::new([22; 32]),
+            )?,
+            11,
+        )?;
+        let second_parent = insert_ingest_fixture(
+            &connection,
+            &schema,
+            "inputs.first",
+            ManifestObject::try_new(
+                Sha256Digest::new([11; 32]),
+                5,
+                111,
+                Sha256Digest::new([12; 32]),
+            )?,
+            12,
+        )?;
+        let output_dataset = DatasetId::try_from("features.derived")?;
+        let high = ManifestObject::try_new(
+            Sha256Digest::new([41; 32]),
+            4,
+            410,
+            Sha256Digest::new([42; 32]),
+        )?;
+        let low = ManifestObject::try_new(
+            Sha256Digest::new([31; 32]),
+            3,
+            310,
+            Sha256Digest::new([32; 32]),
+        )?;
+        let plan =
+            ManifestPlan::derive(output_dataset.clone(), vec![high.clone(), low.clone()], 8)?;
+        let low_artifact = fixture_artifact(&low, 21)?;
+        let high_artifact = fixture_artifact(&high, 22)?;
+        insert_artifact(&connection, &low_artifact)?;
+        insert_artifact(&connection, &high_artifact)?;
+        let anchor = DatasetManifestRecord::try_new(
+            SourceIdentifier::try_from(output_dataset.as_str())?,
+            schema.version(),
+            low_artifact.artifact_id(),
+            plan.content_hash().evidence(),
+            Timestamp::from_unix_nanos(21),
+        );
+        insert_manifest(&connection, &anchor)?;
+        drop(connection);
+
+        let parents =
+            DerivedGenerationParents::try_new(vec![first_parent.clone(), second_parent.clone()])?;
+        let build = DatasetBuildSpecDigest::try_new([71; 32])?;
+        let authority = DerivedGenerationCommitAuthority::for_test();
+        let catalog = AnalyticalManifestCatalog::open(&location, 8)?;
+        let mismatched_high = ArtifactRecord::try_new(
+            high_artifact.relative_reference(),
+            high_artifact.content_digest(),
+            high_artifact.size_bytes(),
+            Timestamp::from_unix_nanos(99),
+        )?;
+        assert!(matches!(
+            catalog.commit_derived_generation(
+                &authority,
+                &plan,
+                &[mismatched_high.clone(), low_artifact.clone()],
+                &anchor,
+                &schema,
+                &parents,
+                build,
+            ),
+            Err(ManifestCatalogError::AnchorMismatch)
+        ));
+
+        let committed = catalog.commit_derived_generation(
+            &authority,
+            &plan,
+            &[high_artifact.clone(), low_artifact.clone()],
+            &anchor,
+            &schema,
+            &parents,
+            build,
+        );
+        assert!(committed.is_ok(), "derived commit failed: {committed:?}");
+        let manifest = committed?;
+        let resolved = catalog.pinned(&manifest);
+        assert!(resolved.is_ok(), "derived pin failed: {resolved:?}");
+        let pinned = resolved?;
+        assert_eq!(pinned.generation_kind(), GenerationKind::Derived);
+        assert_eq!(pinned.build_spec_digest(), Some(build));
+        assert_eq!(pinned.parents().len(), 2);
+        assert_eq!(pinned.parents()[0].manifest(), &second_parent);
+        assert_eq!(pinned.parents()[1].manifest(), &first_parent);
+        assert_eq!(pinned.plan().objects(), &[low, high]);
+        assert!(matches!(
+            catalog.commit_derived_generation(
+                &authority,
+                &plan,
+                &[mismatched_high, low_artifact],
+                &anchor,
+                &schema,
+                &parents,
+                build,
+            ),
+            Err(ManifestCatalogError::AnchorMismatch)
+        ));
+        drop(catalog);
+
+        let reopened = CatalogAuthority::open(test_catalog_config(location)?);
+        assert!(reopened.is_ok(), "catalog reopen failed: {reopened:?}");
+        let catalog_authority = reopened?;
+        let limits = EvidenceLimits::try_new(16, 64, 1 << 20, 1 << 20, 64 << 10)?;
+        let captured = catalog_authority.analytical_evidence_snapshot(
+            EvidenceSnapshotRequest::new(Timestamp::from_unix_nanos(100), limits),
+        );
+        assert!(captured.is_ok(), "evidence capture failed: {captured:?}");
+        let (_, evidence) = captured?;
+        assert_ne!(evidence.evidence_digest()?.bytes(), [0; 32]);
         Ok(())
     }
 
@@ -1237,5 +1921,193 @@ mod tests {
             CatalogResultLimits::try_new(1024 * 1024, 8 * 1024 * 1024)?,
         )?)?);
         Ok((directory, location))
+    }
+
+    fn test_catalog_config(
+        location: market_squawk_platform::CatalogLocation,
+    ) -> Result<CatalogConfig, Box<dyn Error>> {
+        Ok(CatalogConfig::try_new(
+            location,
+            Duration::from_millis(750),
+            CatalogLimit::new(32)?,
+            CatalogResultLimits::try_new(1024 * 1024, 8 * 1024 * 1024)?,
+        )?)
+    }
+
+    fn insert_ingest_fixture(
+        connection: &Connection,
+        schema: &DatasetSchemaRef,
+        dataset_name: &str,
+        object: ManifestObject,
+        created_at_ns: i64,
+    ) -> Result<DatasetManifestRef, Box<dyn Error>> {
+        let dataset = DatasetId::try_from(dataset_name)?;
+        let plan = ManifestPlan::append(dataset.clone(), None, object.clone(), 8)?;
+        let artifact = fixture_artifact(&object, created_at_ns)?;
+        insert_artifact(connection, &artifact)?;
+        let anchor = DatasetManifestRecord::try_new(
+            SourceIdentifier::try_from(dataset_name)?,
+            schema.version(),
+            artifact.artifact_id(),
+            plan.content_hash().evidence(),
+            Timestamp::from_unix_nanos(created_at_ns),
+        );
+        insert_manifest(connection, &anchor)?;
+        connection.execute(
+            "INSERT INTO analytical_generations
+             (dataset_id, manifest_version, content_hash, lineage_hash, row_count, total_bytes,
+              schema_name, schema_version, schema_fingerprint, anchor_manifest_id,
+              generation_kind, parent_count, build_spec_digest, created_at_ns)
+             VALUES (?1, 1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'ingest', 0, NULL, ?10)",
+            params![
+                dataset.as_str(),
+                plan.content_hash().bytes(),
+                plan.lineage_digest().bytes(),
+                i64::try_from(plan.row_count())?,
+                i64::try_from(plan.total_bytes())?,
+                schema.name(),
+                i64::from(schema.version().get()),
+                schema.fingerprint().as_slice(),
+                anchor.manifest_id().to_string(),
+                created_at_ns,
+            ],
+        )?;
+        connection.execute(
+            "INSERT INTO analytical_generation_objects
+             (dataset_id, manifest_version, ordinal, artifact_id, content_hash, row_count,
+              size_bytes, lineage_hash)
+             VALUES (?1, 1, 0, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                dataset.as_str(),
+                artifact.artifact_id().to_string(),
+                object.content_hash().bytes(),
+                i64::try_from(object.row_count())?,
+                i64::try_from(object.size_bytes())?,
+                object.lineage_digest().bytes(),
+            ],
+        )?;
+        Ok(DatasetManifestRef::try_new_with_schema(
+            dataset,
+            1,
+            schema.clone(),
+            plan.content_hash(),
+        )?)
+    }
+
+    fn fixture_artifact(
+        object: &ManifestObject,
+        created_at_ns: i64,
+    ) -> Result<ArtifactRecord, Box<dyn Error>> {
+        let mut encoded = String::with_capacity(64);
+        for byte in object.content_hash().bytes() {
+            write!(&mut encoded, "{byte:02x}")?;
+        }
+        Ok(ArtifactRecord::try_new(
+            format!("objects/sha256/{}/{}.parquet", &encoded[..2], encoded),
+            object.content_hash().evidence(),
+            object.size_bytes(),
+            Timestamp::from_unix_nanos(created_at_ns),
+        )?)
+    }
+
+    fn insert_artifact(
+        connection: &Connection,
+        artifact: &ArtifactRecord,
+    ) -> Result<(), Box<dyn Error>> {
+        let algorithm = match artifact.content_digest().algorithm() {
+            DigestAlgorithm::Sha256 => 1_i64,
+            DigestAlgorithm::Blake3 => 2_i64,
+        };
+        let run_id = uuid::Uuid::new_v4();
+        connection.execute(
+            "INSERT INTO ingest_runs
+             (run_id, idempotency_key, source_id, payload_algorithm, payload_digest, operation,
+              rights_id, state, requested_at_ns, completed_at_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'persist', ?6, 'succeeded', 2, ?7)",
+            params![
+                run_id.to_string(),
+                artifact.artifact_id().to_string(),
+                FIXTURE_SOURCE_ID,
+                algorithm,
+                artifact.content_digest().bytes(),
+                FIXTURE_RIGHTS_ID.as_slice(),
+                artifact.created_at().unix_nanos(),
+            ],
+        )?;
+        connection.execute(
+            "INSERT INTO artifacts
+             (artifact_id, run_id, relative_reference, content_algorithm, content_digest,
+              size_bytes, created_at_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                artifact.artifact_id().to_string(),
+                run_id.to_string(),
+                artifact.relative_reference(),
+                algorithm,
+                artifact.content_digest().bytes(),
+                i64::try_from(artifact.size_bytes())?,
+                artifact.created_at().unix_nanos(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn insert_control_fixture(connection: &Connection) -> Result<(), Box<dyn Error>> {
+        let revision = [90_u8; 32];
+        connection.execute(
+            "INSERT INTO sources
+             (source_id, current_revision_digest, current_registered_at_ns,
+              first_registered_at_ns)
+             VALUES (?1, ?2, 1, 1)",
+            params![FIXTURE_SOURCE_ID, revision.as_slice()],
+        )?;
+        connection.execute(
+            "INSERT INTO source_revisions
+             (source_id, revision_digest, metadata_json, registered_at_ns)
+             VALUES (?1, ?2, '{\"fixture\":true}', 1)",
+            params![FIXTURE_SOURCE_ID, revision.as_slice()],
+        )?;
+        connection.execute(
+            "INSERT INTO source_rights
+             (rights_id, source_id, payload_algorithm, payload_digest, retrieved_at_ns,
+              terms_url, terms_algorithm, terms_digest, authorization_algorithm,
+              authorization_digest, authorization_expires_at_ns, operation_mask, admitted_at_ns)
+             VALUES (?1, ?2, 1, ?3, 1, 'https://fixture.invalid/terms', 1, ?4, 1, ?5,
+                     NULL, 4, 1)",
+            params![
+                FIXTURE_RIGHTS_ID.as_slice(),
+                FIXTURE_SOURCE_ID,
+                [92_u8; 32].as_slice(),
+                [93_u8; 32].as_slice(),
+                [94_u8; 32].as_slice(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn insert_manifest(
+        connection: &Connection,
+        manifest: &DatasetManifestRecord,
+    ) -> Result<(), Box<dyn Error>> {
+        let algorithm = match manifest.content_digest().algorithm() {
+            DigestAlgorithm::Sha256 => 1_i64,
+            DigestAlgorithm::Blake3 => 2_i64,
+        };
+        connection.execute(
+            "INSERT INTO dataset_manifests
+             (manifest_id, dataset_name, schema_version, artifact_id, content_algorithm,
+              content_digest, created_at_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                manifest.manifest_id().to_string(),
+                manifest.dataset_name().as_str(),
+                i64::from(manifest.schema_version().get()),
+                manifest.artifact_id().to_string(),
+                algorithm,
+                manifest.content_digest().bytes(),
+                manifest.created_at().unix_nanos(),
+            ],
+        )?;
+        Ok(())
     }
 }

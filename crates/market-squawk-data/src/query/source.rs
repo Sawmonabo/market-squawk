@@ -163,7 +163,7 @@ impl ObjectStoreRegistry for PinnedObjectStoreRegistry {
 #[derive(Debug)]
 pub(super) enum QuerySource {
     Pinned {
-        dataset: PinnedDataset,
+        dataset: Box<PinnedDataset>,
         store: Arc<ParquetObjectStore>,
         schema: SchemaRef,
         receipt: RetainedSourceReceipt,

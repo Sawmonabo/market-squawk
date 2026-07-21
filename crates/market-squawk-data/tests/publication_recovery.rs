@@ -179,7 +179,8 @@ fn a_legacy_v4_catalog_requires_explicit_root_migration_after_replacement() -> T
 
     let connection = rusqlite::Connection::open(location.path())?;
     connection.execute_batch(
-        "INSERT INTO query_artifact_reservations(
+        "BEGIN;
+         INSERT INTO query_artifact_reservations(
              reservation_id, owner, request_algorithm, request_digest, max_bytes,
              requested_at_ns, expires_at_ns, state, bound_at_ns
          ) VALUES (
@@ -190,12 +191,12 @@ fn a_legacy_v4_catalog_requires_explicit_root_migration_after_replacement() -> T
          DROP TRIGGER analytical_artifact_root_authority_events_immutable_delete;
          DROP TRIGGER analytical_artifact_root_authority_events_append_guard;
          DROP TABLE analytical_artifact_root_authority_events;
-         DROP TRIGGER analytical_generations_registered_schema_insert;
-         DROP TRIGGER analytical_generations_parent_schema_insert;
-         ALTER TABLE analytical_generations DROP COLUMN schema_fingerprint;
-         ALTER TABLE analytical_generations DROP COLUMN schema_name;
-         DELETE FROM schema_migrations WHERE version >= 5;",
+         DROP TABLE analytical_generation_parents;
+         DROP TABLE analytical_generation_objects;
+         DROP TABLE analytical_generations;",
     )?;
+    connection.execute_batch(include_str!("../migrations/0003_analytical.sql"))?;
+    connection.execute_batch("DELETE FROM schema_migrations WHERE version >= 5; COMMIT;")?;
     drop(connection);
 
     std::fs::rename(&artifact_path, local_root.join("legacy-artifacts"))?;
@@ -247,6 +248,7 @@ fn a_v2_catalog_with_artifacts_cannot_fabricate_root_authority() -> TestResult {
          );
          DROP TABLE query_artifact_results;
          DROP TABLE query_artifact_reservations;
+         DROP TABLE analytical_generation_parents;
          DROP TABLE analytical_generation_objects;
          DROP TABLE analytical_generations;
          DROP TRIGGER analytical_artifact_root_authority_events_immutable_update;

@@ -45,6 +45,7 @@ fn snapshot_rejects_generation_whose_lineage_differs_from_ordered_objects()
         object.lineage_digest(),
     )?;
     let generation = GenerationEvidenceRow::try_new(
+        1,
         dataset,
         1,
         plan.content_hash(),
@@ -53,8 +54,9 @@ fn snapshot_rejects_generation_whose_lineage_differs_from_ordered_objects()
         plan.total_bytes(),
         DatasetSchemaRegistry::local().canonical_research_observations()?,
         manifest_id,
-        None,
         GenerationKind::Ingest,
+        None,
+        Vec::new(),
         vec![generation_object],
     )?;
     let limits = EvidenceLimits::try_new(16, 64, 1 << 20, 1 << 20, 64 << 10)?;
