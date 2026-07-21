@@ -2,58 +2,82 @@
 
 Last updated: 2026-07-21
 
-This is the compact operational handoff record required by
-[`project-memory.md`](../project-memory.md). It records integration state; it does not replace
-behavioral verification, review evidence, the README capability truth, or the canonical release
-plan.
+This is the compact operational handoff required by
+[`project-memory.md`](../project-memory.md). It records integrated work and exact verification
+evidence; it does not replace the README capability truth or the canonical release plan.
 
 ## Current integration state
 
-- Integration branch: `feature/dev-test-hardening`
-- Pushed head: `793498bcabafbd1621a3d41f0bf584c1ff3afdc3`
-- Review state: Quarter 2 of 4 approved at that unchanged exact head
-- GitHub owner: issue `#30`, Project 5, status `In Progress`
-- Next release event: clean integrated measurement and conditional tool-pilot candidate for Quarter
-  3 of 4
-- Open blocker: Task 4 measurements and acceptance gates have not yet been completed
+- Release branch: `release/market-squawk-v0.1.0`
+- Integrated and pushed hardening code head: `2d39b0a34eb818f817973210148355c88f8f4b52`
+- Hardening owner: GitHub issue `#30`, Project 5
+- Hardening status: implemented, verified, integrated, pushed, and cleaned up
+- Product release status: still blocked on the mandatory capabilities listed in the README and
+  canonical complete-release plan
 
-## Completed hardening work
+## Rust development and test hardening delivered
 
-- Removed 96 GiB of root Cargo output and 4 GiB from the preserved research worktree after dry-run,
-  ignore, process, and source-state checks.
-- Established worktree-local Cargo output, bounded routine debug information, nonincremental
-  approval gates, a 20 GiB verifier ceiling, and trusted-main-only CI cache writes.
-- Integrated core harness commit `788223b208322dd74227f357245b987f1778cb52` and service harness
-  commit `a40a30dcd61045d2b295c7ec36e360f74443032b`.
-- Reduced workspace integration-test executables from 115 to exactly 41 while preserving the
-  inventoried tests, ignored-state inventory, and Trybuild fixtures.
-- Explicitly retained domain, live, and execution UI verification outside the routine Cargo test
-  selection.
-- Quarter 2 received parallel core, service, and integration/storage-policy reviews with no
-  substantiated Critical, Important, or Minor findings.
-- Cleaned the completed lane targets (3.7 GiB and 1.5 GiB), removed both lane worktrees, deleted the
-  merged local and origin lane branches, and pruned worktree metadata.
+- Removed 96 GiB of generated root Cargo output and 4 GiB from the preserved research worktree
+  without deleting source, branches, commits, or uncommitted research changes.
+- Retired `target/agent-shared`. Each worktree now owns one default local `target/`; verification
+  rejects Cargo target/build-directory overrides and compiler wrappers.
+- Routine dev/test profiles retain incremental feedback with line-table debug information and no
+  dependency debug information. Agent, CI, benchmark, and approval gates are nonincremental. Full
+  debugging is an explicit opt-in profile.
+- The verifier enforces a 20 GiB target ceiling before and after its gate. CI cache writes are
+  restricted to trusted mainline events.
+- Consolidated existing integration tests from 115 separately linked executables to 41 without
+  adding behavioral tests or removing the inventoried assertions, ignored network tests, Loom
+  models, or Trybuild privacy checks.
+- Scoped Rust 1.97's macOS compact-unwind linker diagnostic only at the three affected large test
+  crates. The production binary and workspace-wide diagnostics remain unsuppressed; unsafe linker
+  workarounds were not introduced.
+- Corrected the stdio MCP smoke client's required initialization handshake and published bounded,
+  namespaced machine-readable authority contracts from the transport-neutral tool descriptors.
 
-## Active worktrees
+## Verification evidence
 
-- Root release worktree: clean at `34b8cc17f6fcf66f3b4d7735b3d98a60e43ad076`.
-- Dev/test hardening worktree: clean at the Quarter 2 approved head above before this ledger update.
-- Research analytics worktree: active and intentionally dirty at
-  `f92c7f13491bc9388d523024a9801db3c9caf0a0`; its unique source state must not be overwritten,
-  cleaned, or removed.
+The authoritative full gate ran at exact pushed head
+`2d39b0a34eb818f817973210148355c88f8f4b52`:
 
-## Remaining hardening work
+```text
+CARGO_INCREMENTAL=0 ./scripts/verify.sh
+exit: 0
+elapsed: 370.23 seconds
+maximum resident set size: 1,675,378,688 bytes
+```
 
-1. Build a clean nonincremental integrated baseline and record hardware, toolchain, elapsed time,
-   target size, file/executable counts, and peak memory.
-2. Enforce the 15 GiB clean full-gate acceptance limit and compare normal developer clean, warm,
-   and incremental feedback against the fixed-head baseline.
-3. Evaluate pinned local-only `sccache` and `cargo-nextest` pilots against the plan's measured
-   adoption thresholds; reject them if the thresholds are not met.
-4. Run the unchanged exact-head full verification and release gates, obtain the remaining grouped
-   reviews, integrate the accepted branch into the release branch, update GitHub evidence, and
-   perform final cleanup.
+The gate passed formatting, workspace-boundary policy, dependency/license/vulnerability checks,
+current-tree and Git-history credential scans, strict all-target/all-feature Clippy, the complete
+consolidated workspace tests, explicit UI/Trybuild tests, Loom models, locked all-feature release
+build, rustdoc, compiler-derived capture-contract checks, offline product smoke, and stdio MCP
+smoke. Authorized external-network tests remained explicitly opt-in.
 
-Market Squawk's broader usable-release capability work remains governed by the canonical release
-plan and README. Completion of this hardening lane is not a claim that the product release is
+Measurement host and artifacts:
+
+```text
+macOS 26.5.1 (25F80), Apple M1 Pro, 16 GiB RAM
+rustc 1.97.1, LLVM 22.1.6, aarch64-apple-darwin
+clean nonincremental pre-fix gate footprint: 8.7 GiB
+exact-head checkpoint footprint after focused recompiles and the full gate: 12 GiB
+exact-head target files: 29,662
+exact-head executable files: 637
+release application: 8,804,512 bytes
+hard ceiling: 20 GiB
+```
+
+The 12 GiB checkpoint includes retained focused-build variants accumulated after the clean
+baseline; it remained bounded below the enforced ceiling. It is generated compiler state, not
+application size.
+
+## Cleanup state
+
+- Removed the completed hardening target: 29,662 files and 11.9 GiB.
+- Removed `.worktrees/dev-test-hardening` and pruned worktree metadata.
+- Deleted merged local and origin branch `feature/dev-test-hardening`.
+- Preserved the root release worktree and active dirty
+  `.worktrees/research-analytics` worktree. Its unique source state remains protected from cleanup.
+
+The next delivery event is the next mandatory product capability in the canonical release plan.
+Completion of this hardening lane is not a claim that the Market Squawk product release is
 complete.
