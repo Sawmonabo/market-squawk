@@ -1,9 +1,12 @@
-use market_squawk_adapter_bls::{BlsAccessTier, BlsRequestPlan, BlsResponse, BlsVintageCapability};
+use market_squawk_adapter_bls::{
+    BlsAccessTier, BlsAuthorization, BlsParseError, BlsRegistrationKey, BlsRequestPlan,
+    BlsResponse, BlsSourceConfig, BlsVintageCapability,
+};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 #[test]
-fn public_and_registered_plans_obey_tier_and_conflict_safe_bounds() -> TestResult {
+fn public_and_registered_plans_obey_documented_tier_bounds() -> TestResult {
     let series = (0..26)
         .map(|index| format!("SERIES{index:04}"))
         .collect::<Vec<_>>();
@@ -18,7 +21,7 @@ fn public_and_registered_plans_obey_tier_and_conflict_safe_bounds() -> TestResul
     assert!(public.chunks().iter().all(|chunk| chunk.year_count() <= 10));
 
     let registered = BlsRequestPlan::try_new(BlsAccessTier::RegisteredV2, series, 2000, 2021)?;
-    assert_eq!(registered.chunks().len(), 3);
+    assert_eq!(registered.chunks().len(), 2);
     assert!(
         registered
             .chunks()
@@ -29,10 +32,10 @@ fn public_and_registered_plans_obey_tier_and_conflict_safe_bounds() -> TestResul
         registered
             .chunks()
             .iter()
-            .all(|chunk| chunk.year_count() <= 10)
+            .all(|chunk| chunk.year_count() <= 20)
     );
     assert_eq!(registered.limits().documented_years_per_query(), 20);
-    assert_eq!(registered.limits().enforced_years_per_query(), 10);
+    assert_eq!(registered.limits().enforced_years_per_query(), 20);
     Ok(())
 }
 
@@ -55,6 +58,137 @@ fn parser_retains_partial_messages_preliminary_flags_and_missing_values() -> Tes
     assert_eq!(
         response.vintage_capability(),
         BlsVintageCapability::LocallyObservedVersionsOnly
+    );
+    Ok(())
+}
+
+#[test]
+fn requested_series_binding_rejects_missing_extra_and_duplicate_results() -> TestResult {
+    let requested = ["LNS14000000", "CIU1010000000000A"];
+    let missing = br#"{
+        "status":"REQUEST_SUCCEEDED","responseTime":1,"message":[],
+        "Results":{"series":[{"seriesID":"LNS14000000","data":[]}]}
+    }"#;
+    assert!(matches!(
+        BlsResponse::parse_for_request(missing, BlsAccessTier::PublicV1, &requested, 2020, 2026),
+        Err(BlsParseError::RequestSeriesMismatch)
+    ));
+
+    let duplicate = br#"{
+        "status":"REQUEST_SUCCEEDED","responseTime":1,"message":[],
+        "Results":{"series":[
+            {"seriesID":"LNS14000000","data":[]},
+            {"seriesID":"LNS14000000","data":[]}
+        ]}
+    }"#;
+    assert!(matches!(
+        BlsResponse::parse_for_request(
+            duplicate,
+            BlsAccessTier::PublicV1,
+            &["LNS14000000"],
+            2020,
+            2026,
+        ),
+        Err(BlsParseError::RequestSeriesMismatch)
+    ));
+
+    let extra = br#"{
+        "status":"REQUEST_SUCCEEDED","responseTime":1,"message":[],
+        "Results":{"series":[
+            {"seriesID":"LNS14000000","data":[]},
+            {"seriesID":"UNREQUESTED","data":[]}
+        ]}
+    }"#;
+    assert!(matches!(
+        BlsResponse::parse_for_request(
+            extra,
+            BlsAccessTier::PublicV1,
+            &["LNS14000000"],
+            2020,
+            2026,
+        ),
+        Err(BlsParseError::RequestSeriesMismatch)
+    ));
+
+    let wrong_year = br#"{
+        "status":"REQUEST_SUCCEEDED","responseTime":1,"message":[],
+        "Results":{"series":[{"seriesID":"LNS14000000","data":[{
+            "year":"2019","period":"M01","periodName":"January","value":"1.0",
+            "footnotes":[]
+        }]}]}
+    }"#;
+    assert!(matches!(
+        BlsResponse::parse_for_request(
+            wrong_year,
+            BlsAccessTier::PublicV1,
+            &["LNS14000000"],
+            2020,
+            2026,
+        ),
+        Err(BlsParseError::RequestYearMismatch)
+    ));
+    Ok(())
+}
+
+#[test]
+fn documented_identifier_characters_are_accepted_consistently() -> TestResult {
+    let identifier = "SERIES_1-2#A".to_owned();
+    let plan = BlsRequestPlan::try_new(
+        BlsAccessTier::PublicV1,
+        vec![identifier.clone()],
+        2025,
+        2025,
+    )?;
+    assert_eq!(plan.chunks()[0].series(), &[identifier]);
+    Ok(())
+}
+
+#[test]
+fn registered_key_is_validated_and_debug_redacted() -> TestResult {
+    let secret = "0123456789abcdef0123456789abcdef";
+    let key = BlsRegistrationKey::try_new(secret.to_owned())?;
+    assert!(!format!("{key:?}").contains(secret));
+    assert!(BlsRegistrationKey::try_new(String::new()).is_err());
+    assert!(BlsRegistrationKey::try_new("contains whitespace".to_owned()).is_err());
+    assert!(BlsRegistrationKey::try_new("x".repeat(257)).is_err());
+    Ok(())
+}
+
+#[test]
+fn source_dataset_identity_binds_tier_series_and_year_window() -> TestResult {
+    let public = BlsSourceConfig::try_new(
+        BlsAuthorization::PublicV1,
+        vec!["LNS14000000".to_owned()],
+        2020,
+        2026,
+    )?;
+    let other_series = BlsSourceConfig::try_new(
+        BlsAuthorization::PublicV1,
+        vec!["CUUR0000SA0".to_owned()],
+        2020,
+        2026,
+    )?;
+    let registered = BlsSourceConfig::try_new(
+        BlsAuthorization::RegisteredV2(BlsRegistrationKey::try_new(
+            "0123456789abcdef0123456789abcdef".to_owned(),
+        )?),
+        vec!["LNS14000000".to_owned()],
+        2020,
+        2026,
+    )?;
+    assert!(
+        public
+            .dataset()
+            .as_str()
+            .starts_with("bls:timeseries:public-v1:")
+    );
+    assert_ne!(public.dataset(), other_series.dataset());
+    assert_ne!(public.dataset(), registered.dataset());
+    let over_daily_plan = (0..626)
+        .map(|index| format!("SERIES{index:04}"))
+        .collect::<Vec<_>>();
+    assert!(
+        BlsSourceConfig::try_new(BlsAuthorization::PublicV1, over_daily_plan, 2026, 2026).is_err()
     );
     Ok(())
 }

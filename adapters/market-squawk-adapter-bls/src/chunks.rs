@@ -184,8 +184,7 @@ pub(crate) const fn limits_for(tier: BlsAccessTier) -> BlsRequestLimits {
         BlsAccessTier::RegisteredV2 => BlsRequestLimits {
             series_per_query: 50,
             documented_years_per_query: 20,
-            // The official FAQ conflicts with its tier table; enforce the smaller stated limit.
-            enforced_years_per_query: 10,
+            enforced_years_per_query: 20,
             daily_queries: 500,
         },
     }
@@ -199,11 +198,15 @@ fn validate_series(series: &[String]) -> Result<(), BlsChunkError> {
     for identifier in series {
         if identifier.is_empty()
             || identifier.len() > 50
-            || !identifier.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            || !identifier.bytes().all(is_valid_identifier_byte)
             || !unique.insert(identifier.as_str())
         {
             return Err(BlsChunkError::InvalidSeries);
         }
     }
     Ok(())
+}
+
+pub(crate) const fn is_valid_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_uppercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-' | b'#')
 }

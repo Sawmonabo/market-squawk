@@ -1,12 +1,16 @@
+use std::collections::BTreeSet;
 use std::str::FromStr;
 
+use bytes::Bytes;
+use market_squawk_domain::Timestamp;
 use rust_decimal::Decimal;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::chunks::{BlsAccessTier, limits_for};
+use crate::BlsSourceError;
+use crate::chunks::{BlsAccessTier, is_valid_identifier_byte, limits_for};
 
-const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_OBSERVATIONS_PER_SERIES: usize = 2_000;
 
 /// The historical-revision capability exposed by the BLS API.
@@ -202,6 +206,57 @@ impl BlsResponse {
         })
     }
 
+    /// Parses a response and binds it to the exact requested series set.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed requested identifiers, duplicate requests, or any missing, duplicate, or
+    /// unrequested provider result. Provider messages and empty observation sets remain retained as
+    /// partial-result evidence after the set is proven exact.
+    pub fn parse_for_request(
+        bytes: &[u8],
+        tier: BlsAccessTier,
+        requested_series: &[&str],
+        start_year: u16,
+        end_year: u16,
+    ) -> Result<Self, BlsParseError> {
+        if start_year > end_year {
+            return Err(BlsParseError::RequestYearMismatch);
+        }
+        if requested_series.is_empty()
+            || requested_series.len() > limits_for(tier).series_per_query()
+        {
+            return Err(BlsParseError::RequestSeriesMismatch);
+        }
+        let mut requested = BTreeSet::new();
+        for identifier in requested_series {
+            validate_identifier(identifier)?;
+            if !requested.insert(*identifier) {
+                return Err(BlsParseError::RequestSeriesMismatch);
+            }
+        }
+
+        let response = Self::parse(bytes, tier)?;
+        let mut returned = BTreeSet::new();
+        for series in &response.series {
+            if !returned.insert(series.series_id.as_str()) {
+                return Err(BlsParseError::RequestSeriesMismatch);
+            }
+        }
+        if returned != requested {
+            return Err(BlsParseError::RequestSeriesMismatch);
+        }
+        if response.series.iter().any(|series| {
+            series
+                .observations
+                .iter()
+                .any(|observation| observation.year < start_year || observation.year > end_year)
+        }) {
+            return Err(BlsParseError::RequestYearMismatch);
+        }
+        Ok(response)
+    }
+
     /// Returns whether messages or empty series prove a partial response.
     pub const fn is_partial(&self) -> bool {
         self.partial
@@ -246,6 +301,12 @@ pub enum BlsParseError {
     /// Response cardinality exceeds a provider or parser limit.
     #[error("BLS response exceeds a cardinality limit")]
     LimitExceeded,
+    /// Provider results do not match the exact requested series set.
+    #[error("BLS response series do not match the exact request")]
+    RequestSeriesMismatch,
+    /// Provider results contain an observation outside the exact requested year window.
+    #[error("BLS response year does not match the exact request")]
+    RequestYearMismatch,
 }
 
 #[derive(Deserialize)]
@@ -296,12 +357,7 @@ struct FootnoteWire {
 }
 
 fn validate_identifier(value: &str) -> Result<(), BlsParseError> {
-    if value.is_empty()
-        || value.len() > 50
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-    {
+    if value.is_empty() || value.len() > 50 || !value.bytes().all(is_valid_identifier_byte) {
         return Err(BlsParseError::InvalidField("series identifier"));
     }
     Ok(())
@@ -312,4 +368,122 @@ fn validate_messages(messages: &[String]) -> Result<(), BlsParseError> {
         return Err(BlsParseError::LimitExceeded);
     }
     Ok(())
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalBlsObservation<'a> {
+    schema_version: u16,
+    series_id: &'a str,
+    source_period: CanonicalBlsPeriod<'a>,
+    raw_value: &'a str,
+    value: Option<String>,
+    latest: bool,
+    preliminary: bool,
+    footnotes: Vec<CanonicalBlsFootnote<'a>>,
+    source_payload_sha256: &'a str,
+    received_at_unix_nanos: i64,
+    availability: CanonicalAvailability,
+    revision_capability: &'static str,
+    quality: &'static str,
+    coverage: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalBlsPeriod<'a> {
+    year: u16,
+    code: &'a str,
+    name: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalBlsFootnote<'a> {
+    code: Option<&'a str>,
+    text: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalAvailability {
+    kind: &'static str,
+    observed_at_unix_nanos: i64,
+}
+
+pub(crate) fn canonical_payloads(
+    response: &BlsResponse,
+    received_at: Timestamp,
+    source_payload_sha256: &str,
+) -> Result<Vec<Bytes>, BlsSourceError> {
+    response
+        .series
+        .iter()
+        .flat_map(|series| {
+            series.observations.iter().map(move |observation| {
+                let footnotes = observation
+                    .footnotes
+                    .iter()
+                    .map(|footnote| CanonicalBlsFootnote {
+                        code: footnote.code.as_deref(),
+                        text: footnote.text.as_deref(),
+                    })
+                    .collect();
+                serde_json::to_vec(&CanonicalBlsObservation {
+                    schema_version: 1,
+                    series_id: &series.series_id,
+                    source_period: CanonicalBlsPeriod {
+                        year: observation.year,
+                        code: &observation.period,
+                        name: &observation.period_name,
+                    },
+                    raw_value: &observation.raw_value,
+                    value: observation.value.map(|value| value.to_string()),
+                    latest: observation.latest,
+                    preliminary: observation.preliminary,
+                    footnotes,
+                    source_payload_sha256,
+                    received_at_unix_nanos: received_at.unix_nanos(),
+                    availability: CanonicalAvailability {
+                        kind: "local_first_observed",
+                        observed_at_unix_nanos: received_at.unix_nanos(),
+                    },
+                    revision_capability: "locally_observed_versions_only",
+                    quality: "official_delayed",
+                    coverage: "macroeconomic",
+                })
+                .map(Bytes::from)
+                .map_err(|_| BlsSourceError::Protocol)
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use market_squawk_domain::Timestamp;
+
+    use super::{BlsAccessTier, BlsResponse, canonical_payloads};
+
+    #[test]
+    fn canonical_payload_preserves_provider_period_without_invented_day_or_publication_time()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let response = BlsResponse::parse(
+            include_bytes!("../fixtures/series.json"),
+            BlsAccessTier::PublicV1,
+        )?;
+        let payloads = canonical_payloads(
+            &response,
+            Timestamp::from_unix_nanos(77),
+            "0123456789abcdef",
+        )?;
+        let first: serde_json::Value = serde_json::from_slice(&payloads[0])?;
+        assert_eq!(first["series_id"], "LNS14000000");
+        assert_eq!(first["source_period"]["year"], 2026);
+        assert_eq!(first["source_period"]["code"], "M06");
+        assert_eq!(first["received_at_unix_nanos"], 77);
+        assert!(first.get("effective_at").is_none());
+        assert!(first.get("published_at").is_none());
+        Ok(())
+    }
 }
