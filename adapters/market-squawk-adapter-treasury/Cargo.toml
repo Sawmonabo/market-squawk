@@ -9,12 +9,20 @@ repository = "https://github.com/Sawmonabo/market-squawk"
 publish = false
 
 [dependencies]
+bytes.workspace = true
+futures-util.workspace = true
 market-squawk-domain.workspace = true
+market-squawk-sources.workspace = true
+quick-xml = { version = "=0.41.0", default-features = false }
+reqwest = { version = "=0.13.4", default-features = false, features = ["rustls", "stream"] }
 rust_decimal.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+url.workspace = true
 
 [lints]
 workspace = true

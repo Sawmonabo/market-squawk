@@ -1,7 +1,9 @@
 use std::str::FromStr;
 
 use market_squawk_domain::CalendarDate;
+use market_squawk_domain::DataQuality;
 use rust_decimal::Decimal;
+use serde::Serialize;
 use thiserror::Error;
 
 use crate::fiscal_data::FiscalDataRecord;
@@ -38,16 +40,23 @@ impl TreasuryRateProfile {
     pub const fn api_version(self) -> &'static str {
         self.api_version
     }
+
+    /// Returns the official-publication quality of this accounting dataset.
+    pub const fn quality(self) -> DataQuality {
+        DataQuality::OfficialDelayed
+    }
 }
 
 /// One exact published average-interest-rate row.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct AverageInterestRate {
     record_date: CalendarDate,
     security_type_description: String,
     security_description: String,
     rate_percent: Decimal,
+    source_line_number: String,
     schema_digest: [u8; 32],
+    source_payload_digest: [u8; 32],
 }
 
 impl AverageInterestRate {
@@ -60,6 +69,7 @@ impl AverageInterestRate {
         require_schema(record, "security_type_desc", "STRING", "String")?;
         require_schema(record, "security_desc", "STRING", "String")?;
         require_schema(record, "avg_interest_rate_amt", "PERCENTAGE", "10.2%")?;
+        require_schema(record, "src_line_nbr", "INTEGER", "10")?;
         let rate_percent = Decimal::from_str_exact(required(record, "avg_interest_rate_amt")?)
             .map_err(|_| TreasuryRateError::InvalidRate)?;
         Ok(Self {
@@ -67,7 +77,9 @@ impl AverageInterestRate {
             security_type_description: required(record, "security_type_desc")?.to_owned(),
             security_description: required(record, "security_desc")?.to_owned(),
             rate_percent,
+            source_line_number: required(record, "src_line_nbr")?.to_owned(),
             schema_digest: record.schema_digest(),
+            source_payload_digest: record.source_payload_digest(),
         })
     }
 
@@ -91,9 +103,19 @@ impl AverageInterestRate {
         &self.security_description
     }
 
+    /// Returns the provider-supplied source line identity.
+    pub fn source_line_number(&self) -> &str {
+        &self.source_line_number
+    }
+
     /// Returns the exact response schema digest.
     pub const fn schema_digest(&self) -> [u8; 32] {
         self.schema_digest
+    }
+
+    /// Returns the SHA-256 identity of the exact provider response containing this row.
+    pub const fn source_payload_digest(&self) -> [u8; 32] {
+        self.source_payload_digest
     }
 }
 
@@ -137,7 +159,7 @@ fn require_schema(
     Ok(())
 }
 
-fn parse_date(value: &str) -> Result<CalendarDate, TreasuryRateError> {
+pub(crate) fn parse_date(value: &str) -> Result<CalendarDate, TreasuryRateError> {
     let bytes = value.as_bytes();
     if bytes.len() != 10
         || bytes.get(4) != Some(&b'-')

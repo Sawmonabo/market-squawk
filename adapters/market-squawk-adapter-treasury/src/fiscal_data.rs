@@ -1,9 +1,13 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+
+use crate::query::{TreasuryFiscalQuery, TreasuryPageRequest, update_component};
+use crate::rates::parse_date;
+use market_squawk_domain::CalendarDate;
 
 /// Parser admission limits for one Treasury Fiscal Data page.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -42,6 +46,18 @@ impl FiscalDataParseLimits {
             max_total_pages: 100_000,
         }
     }
+
+    pub(crate) const fn max_bytes(self) -> usize {
+        self.max_bytes
+    }
+
+    pub(crate) const fn max_records(self) -> usize {
+        self.max_records
+    }
+
+    pub(crate) const fn max_fields(self) -> usize {
+        self.max_fields
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -66,6 +82,9 @@ impl FiscalDataSchema {
 pub struct FiscalDataRecord {
     values: BTreeMap<String, String>,
     schema: Arc<FiscalDataSchema>,
+    row_identity: [u8; 32],
+    sort_key: (CalendarDate, u64),
+    source_payload_digest: [u8; 32],
 }
 
 impl FiscalDataRecord {
@@ -77,6 +96,16 @@ impl FiscalDataRecord {
     /// Returns the canonical digest of labels, logical types, and formats.
     pub fn schema_digest(&self) -> [u8; 32] {
         self.schema.digest
+    }
+
+    /// Returns the canonical provider-primary-key identity for this row.
+    pub const fn row_identity(&self) -> [u8; 32] {
+        self.row_identity
+    }
+
+    /// Returns the SHA-256 identity of the exact response payload containing this row.
+    pub const fn source_payload_digest(&self) -> [u8; 32] {
+        self.source_payload_digest
     }
 
     pub(crate) fn schema(&self) -> &FiscalDataSchema {
@@ -92,15 +121,19 @@ pub struct FiscalDataPage {
     total_pages: usize,
     schema: Arc<FiscalDataSchema>,
     records: Vec<FiscalDataRecord>,
+    query_digest: [u8; 32],
+    request_digest: [u8; 32],
+    source_payload_digest: [u8; 32],
 }
 
 impl FiscalDataPage {
     /// Parses a page and proves its links match the expected one-based page number.
     pub fn parse(
         bytes: &[u8],
-        expected_page: usize,
+        request: &TreasuryPageRequest,
         limits: FiscalDataParseLimits,
     ) -> Result<Self, TreasuryProtocolError> {
+        let expected_page = request.page_number();
         if expected_page == 0 {
             return Err(TreasuryProtocolError::UnexpectedPage {
                 expected: 1,
@@ -128,6 +161,17 @@ impl FiscalDataPage {
         {
             return Err(TreasuryProtocolError::SchemaDrift);
         }
+        let expected_fields = request.fields().iter().copied().collect::<BTreeSet<_>>();
+        if wire
+            .meta
+            .labels
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>()
+            != expected_fields
+        {
+            return Err(TreasuryProtocolError::SchemaDrift);
+        }
         for record in &wire.data {
             if label_keys != record.keys().collect::<Vec<_>>() {
                 return Err(TreasuryProtocolError::SchemaDrift);
@@ -147,20 +191,26 @@ impl FiscalDataPage {
                 actual: actual_page,
             });
         }
-        if page_from_link(&wire.links.first)? != 1
+        let expected_page_size = usize::from(request.page_size().get());
+        if page_size_from_link(&wire.links.self_link)? != expected_page_size
+            || page_from_link(&wire.links.first)? != 1
+            || page_size_from_link(&wire.links.first)? != expected_page_size
             || page_from_link(&wire.links.last)? != wire.meta.total_pages
+            || page_size_from_link(&wire.links.last)? != expected_page_size
         {
             return Err(TreasuryProtocolError::InvalidLinks);
         }
         validate_optional_link(
             wire.links.prev.as_deref(),
             expected_page.checked_sub(1).filter(|_| expected_page > 1),
+            expected_page_size,
         )?;
         validate_optional_link(
             wire.links.next.as_deref(),
             expected_page
                 .checked_add(1)
                 .filter(|_| expected_page < wire.meta.total_pages),
+            expected_page_size,
         )?;
 
         let digest = schema_digest(
@@ -173,20 +223,53 @@ impl FiscalDataPage {
             data_formats: wire.meta.data_formats,
             digest,
         });
+        let source_payload_digest = Sha256::digest(bytes).into();
         let records = wire
             .data
             .into_iter()
-            .map(|values| FiscalDataRecord {
-                values,
-                schema: Arc::clone(&schema),
+            .map(|values| {
+                let row_identity = row_identity(request.primary_key(), &values)?;
+                let record_date = values
+                    .get("record_date")
+                    .ok_or(TreasuryProtocolError::SchemaDrift)
+                    .and_then(|value| {
+                        parse_date(value).map_err(|_| TreasuryProtocolError::SchemaDrift)
+                    })?;
+                if !request.contains_record_date(record_date) {
+                    return Err(TreasuryProtocolError::QueryBindingMismatch);
+                }
+                let source_line = values
+                    .get("src_line_nbr")
+                    .ok_or(TreasuryProtocolError::SchemaDrift)?
+                    .parse::<u64>()
+                    .map_err(|_| TreasuryProtocolError::SchemaDrift)?;
+                if source_line == 0 {
+                    return Err(TreasuryProtocolError::SchemaDrift);
+                }
+                Ok(FiscalDataRecord {
+                    values,
+                    schema: Arc::clone(&schema),
+                    row_identity,
+                    sort_key: (record_date, source_line),
+                    source_payload_digest,
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, TreasuryProtocolError>>()?;
+        if records
+            .windows(2)
+            .any(|records| records[0].sort_key >= records[1].sort_key)
+        {
+            return Err(TreasuryProtocolError::PageDrift);
+        }
         Ok(Self {
             page_number: expected_page,
             total_count: wire.meta.total_count,
             total_pages: wire.meta.total_pages,
             schema,
             records,
+            query_digest: request.query_digest(),
+            request_digest: request.request_digest(),
+            source_payload_digest,
         })
     }
 
@@ -214,11 +297,27 @@ impl FiscalDataPage {
     pub fn schema_digest(&self) -> [u8; 32] {
         self.schema.digest
     }
+
+    /// Returns the canonical query-family digest used to request this page.
+    pub const fn query_digest(&self) -> [u8; 32] {
+        self.query_digest
+    }
+
+    /// Returns the canonical request digest including this page number.
+    pub const fn request_digest(&self) -> [u8; 32] {
+        self.request_digest
+    }
+
+    /// Returns the SHA-256 identity of the exact source response.
+    pub const fn response_payload_digest(&self) -> [u8; 32] {
+        self.source_payload_digest
+    }
 }
 
 /// Cross-page state that rejects repetition and schema or total drift.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TreasuryPaginationTracker {
+    query_digest: [u8; 32],
     max_pages: usize,
     max_records: usize,
     expected_page: usize,
@@ -226,15 +325,22 @@ pub struct TreasuryPaginationTracker {
     expected_total_count: Option<usize>,
     expected_schema: Option<[u8; 32]>,
     accepted_records: usize,
+    accepted_row_identities: BTreeSet<[u8; 32]>,
+    last_sort_key: Option<(CalendarDate, u64)>,
 }
 
 impl TreasuryPaginationTracker {
     /// Builds a one-based tracker with explicit whole-query limits.
-    pub fn try_new(max_pages: usize, max_records: usize) -> Result<Self, TreasuryProtocolError> {
+    pub fn try_new(
+        query: &TreasuryFiscalQuery,
+        max_pages: usize,
+        max_records: usize,
+    ) -> Result<Self, TreasuryProtocolError> {
         if max_pages == 0 || max_records == 0 {
             return Err(TreasuryProtocolError::InvalidLimits);
         }
         Ok(Self {
+            query_digest: query.query_digest(),
             max_pages,
             max_records,
             expected_page: 1,
@@ -242,11 +348,16 @@ impl TreasuryPaginationTracker {
             expected_total_count: None,
             expected_schema: None,
             accepted_records: 0,
+            accepted_row_identities: BTreeSet::new(),
+            last_sort_key: None,
         })
     }
 
     /// Accepts exactly the next page and returns `true` only for the terminal page.
     pub fn accept(&mut self, page: &FiscalDataPage) -> Result<bool, TreasuryProtocolError> {
+        if page.query_digest != self.query_digest {
+            return Err(TreasuryProtocolError::QueryBindingMismatch);
+        }
         if page.page_number != self.expected_page {
             return Err(TreasuryProtocolError::UnexpectedPage {
                 expected: self.expected_page,
@@ -275,6 +386,18 @@ impl TreasuryPaginationTracker {
         if self.accepted_records > self.max_records {
             return Err(TreasuryProtocolError::PaginationLimitExceeded);
         }
+        for record in &page.records {
+            if self
+                .last_sort_key
+                .is_some_and(|last| last >= record.sort_key)
+            {
+                return Err(TreasuryProtocolError::PageDrift);
+            }
+            if !self.accepted_row_identities.insert(record.row_identity) {
+                return Err(TreasuryProtocolError::DuplicateRecordIdentity);
+            }
+            self.last_sort_key = Some(record.sort_key);
+        }
         let terminal = page.page_number == page.total_pages;
         if terminal {
             if self.accepted_records != page.total_count {
@@ -296,12 +419,18 @@ pub enum TreasuryProtocolError {
     /// Parser or pagination limits are zero.
     #[error("Treasury parser limits must be non-zero")]
     InvalidLimits,
+    /// The configured official query is invalid or outside supported bounds.
+    #[error("invalid Treasury query")]
+    InvalidQuery,
     /// The body exceeds its byte budget.
     #[error("Treasury response exceeds its byte budget")]
     BodyTooLarge,
     /// The JSON shape is invalid.
     #[error("invalid Treasury JSON response: {0}")]
     InvalidJson(String),
+    /// The Treasury XML shape is invalid.
+    #[error("invalid Treasury XML response: {0}")]
+    InvalidXml(String),
     /// Page metadata is inconsistent.
     #[error("invalid Treasury page metadata")]
     InvalidMetadata,
@@ -328,6 +457,12 @@ pub enum TreasuryProtocolError {
     /// Totals or schema changed across a paginated query.
     #[error("Treasury page totals or schema changed during pagination")]
     PageDrift,
+    /// A page was produced for a different canonical query.
+    #[error("Treasury page does not belong to the tracked canonical query")]
+    QueryBindingMismatch,
+    /// A provider primary key repeated within the bounded query.
+    #[error("Treasury response repeated a provider row identity")]
+    DuplicateRecordIdentity,
 }
 
 impl From<serde_json::Error> for TreasuryProtocolError {
@@ -390,12 +525,51 @@ fn page_from_link(link: &str) -> Result<usize, TreasuryProtocolError> {
 fn validate_optional_link(
     link: Option<&str>,
     expected: Option<usize>,
+    expected_page_size: usize,
 ) -> Result<(), TreasuryProtocolError> {
     match (link, expected) {
         (None, None) => Ok(()),
-        (Some(value), Some(page)) if page_from_link(value)? == page => Ok(()),
+        (Some(value), Some(page))
+            if page_from_link(value)? == page
+                && page_size_from_link(value)? == expected_page_size =>
+        {
+            Ok(())
+        }
         _ => Err(TreasuryProtocolError::InvalidLinks),
     }
+}
+
+fn page_size_from_link(link: &str) -> Result<usize, TreasuryProtocolError> {
+    const MARKER: &str = "page%5Bsize%5D=";
+    let start = link
+        .find(MARKER)
+        .ok_or(TreasuryProtocolError::InvalidLinks)?
+        + MARKER.len();
+    let tail = &link[start..];
+    let end = tail.find('&').unwrap_or(tail.len());
+    let page_size = tail[..end]
+        .parse::<usize>()
+        .map_err(|_| TreasuryProtocolError::InvalidLinks)?;
+    if page_size == 0 {
+        return Err(TreasuryProtocolError::InvalidLinks);
+    }
+    Ok(page_size)
+}
+
+fn row_identity(
+    primary_key: &[&str],
+    values: &BTreeMap<String, String>,
+) -> Result<[u8; 32], TreasuryProtocolError> {
+    let mut digest = Sha256::new();
+    update_component(&mut digest, "treasury-row-identity-v1");
+    for field in primary_key {
+        let value = values
+            .get(*field)
+            .ok_or(TreasuryProtocolError::SchemaDrift)?;
+        update_component(&mut digest, field);
+        update_component(&mut digest, value);
+    }
+    Ok(digest.finalize().into())
 }
 
 fn schema_digest(
@@ -415,9 +589,4 @@ fn schema_digest(
         }
     }
     digest.finalize().into()
-}
-
-fn update_component(digest: &mut Sha256, value: &str) {
-    digest.update((value.len() as u128).to_be_bytes());
-    digest.update(value.as_bytes());
 }
