@@ -1,6 +1,7 @@
 //! Validated payloads carried by [`super::ResearchObservation`].
 
 use rust_decimal::Decimal;
+use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::{
@@ -132,12 +133,80 @@ impl<'de> Deserialize<'de> for FundamentalObservation {
     }
 }
 
-/// Exact decimal macroeconomic series value.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+/// Provider-native evidence explaining why a macro series has no observed decimal value.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MacroMissingValue {
+    marker: SourceIdentifier,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason: Option<SourceIdentifier>,
+}
+
+impl MacroMissingValue {
+    /// Retains an exact bounded provider marker and optional provider reason code.
+    pub const fn new(marker: SourceIdentifier, reason: Option<SourceIdentifier>) -> Self {
+        Self { marker, reason }
+    }
+
+    /// Returns the exact provider lexical marker, such as `.` or `-`.
+    pub const fn marker(&self) -> &SourceIdentifier {
+        &self.marker
+    }
+
+    /// Returns the provider-native missing-value reason when supplied.
+    pub const fn reason(&self) -> Option<&SourceIdentifier> {
+        self.reason.as_ref()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum MacroValueKind {
+    Observed(Decimal),
+    Missing(MacroMissingValue),
+}
+
+/// Exact observed decimal or explicit provider-reported missing-value evidence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MacroValue {
+    kind: MacroValueKind,
+}
+
+impl MacroValue {
+    fn observed(value: Decimal) -> Self {
+        Self {
+            kind: MacroValueKind::Observed(value.normalize()),
+        }
+    }
+
+    fn missing(value: MacroMissingValue) -> Self {
+        Self {
+            kind: MacroValueKind::Missing(value),
+        }
+    }
+
+    /// Returns the exact normalized decimal when the provider reported an observation.
+    pub const fn observed_value(&self) -> Option<Decimal> {
+        match &self.kind {
+            MacroValueKind::Observed(value) => Some(*value),
+            MacroValueKind::Missing(_) => None,
+        }
+    }
+
+    /// Returns provider-native missing-value evidence when no decimal was observed.
+    pub const fn missing_value(&self) -> Option<&MacroMissingValue> {
+        match &self.kind {
+            MacroValueKind::Observed(_) => None,
+            MacroValueKind::Missing(value) => Some(value),
+        }
+    }
+}
+
+/// Exact decimal or explicitly missing macroeconomic series value.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MacroObservation {
     context: ResearchContext,
     series: SourceIdentifier,
-    value: Decimal,
+    value: MacroValue,
     unit: SourceIdentifier,
 }
 
@@ -152,7 +221,22 @@ impl MacroObservation {
         Self {
             context,
             series,
-            value: value.normalize(),
+            value: MacroValue::observed(value),
+            unit,
+        }
+    }
+
+    /// Constructs a macroeconomic observation with provider-native missing-value evidence.
+    pub fn missing(
+        context: ResearchContext,
+        series: SourceIdentifier,
+        missing: MacroMissingValue,
+        unit: SourceIdentifier,
+    ) -> Self {
+        Self {
+            context,
+            series,
+            value: MacroValue::missing(missing),
             unit,
         }
     }
@@ -167,9 +251,9 @@ impl MacroObservation {
         &self.series
     }
 
-    /// Returns the exact decimal series value.
-    pub const fn value(&self) -> Decimal {
-        self.value
+    /// Returns the exact observed-or-missing series value.
+    pub const fn value(&self) -> &MacroValue {
+        &self.value
     }
 
     /// Returns the source-native unit identity.
@@ -178,13 +262,48 @@ impl MacroObservation {
     }
 }
 
+impl Serialize for MacroObservation {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut state = serializer.serialize_struct("MacroObservation", 4)?;
+        state.serialize_field("context", &self.context)?;
+        state.serialize_field("series", &self.series)?;
+        match &self.value.kind {
+            MacroValueKind::Observed(value) => state.serialize_field("value", value)?,
+            MacroValueKind::Missing(missing) => state.serialize_field("missing", missing)?,
+        }
+        state.serialize_field("unit", &self.unit)?;
+        state.end()
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MacroObservationWire {
     context: ResearchContext,
     series: SourceIdentifier,
-    value: Decimal,
+    #[serde(default, deserialize_with = "deserialize_present_field")]
+    value: PresentField<Decimal>,
+    #[serde(default, deserialize_with = "deserialize_present_field")]
+    missing: PresentField<MacroMissingValue>,
     unit: SourceIdentifier,
+}
+
+#[derive(Default)]
+enum PresentField<T> {
+    #[default]
+    Absent,
+    Present(T),
+}
+
+fn deserialize_present_field<'de, D, T>(deserializer: D) -> Result<PresentField<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(PresentField::Present)
 }
 
 impl<'de> Deserialize<'de> for MacroObservation {
@@ -193,7 +312,18 @@ impl<'de> Deserialize<'de> for MacroObservation {
         D: Deserializer<'de>,
     {
         let wire = MacroObservationWire::deserialize(deserializer)?;
-        Ok(Self::new(wire.context, wire.series, wire.value, wire.unit))
+        match (wire.value, wire.missing) {
+            (PresentField::Present(value), PresentField::Absent) => {
+                Ok(Self::new(wire.context, wire.series, value, wire.unit))
+            }
+            (PresentField::Absent, PresentField::Present(missing)) => {
+                Ok(Self::missing(wire.context, wire.series, missing, wire.unit))
+            }
+            (PresentField::Present(_), PresentField::Present(_))
+            | (PresentField::Absent, PresentField::Absent) => Err(serde::de::Error::custom(
+                ResearchError::InvalidMacroValueState,
+            )),
+        }
     }
 }
 

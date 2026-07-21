@@ -12,9 +12,9 @@ use arrow::record_batch::RecordBatch;
 use market_squawk_data::{ArrowConversionError, ResearchArrowBatch};
 use market_squawk_domain::{
     AvailabilityEvidence, CalendarDate, DataQuality, DigestAlgorithm, EvidenceDigest,
-    MacroObservation, PayloadReference, ResearchContext, ResearchObservation, ResearchPeriod,
-    ResearchProvenance, ResearchProvenanceInput, ResearchTemporalCoordinate, ResearchTime,
-    RevisionNumber, SourceId, SourceIdentifier, Timestamp,
+    MacroMissingValue, MacroObservation, PayloadReference, ResearchContext, ResearchObservation,
+    ResearchPeriod, ResearchProvenance, ResearchProvenanceInput, ResearchTemporalCoordinate,
+    ResearchTime, RevisionNumber, SourceId, SourceIdentifier, Timestamp,
 };
 use rust_decimal::Decimal;
 
@@ -57,6 +57,54 @@ fn arrow_roundtrip_preserves_exact_decimal_and_point_in_time_metadata() -> TestR
         converted.lineage_digest()?,
         differently_bound.lineage_digest()?
     );
+    Ok(())
+}
+
+#[test]
+fn arrow_roundtrip_preserves_macro_missing_semantics_with_null_decimal() -> TestResult {
+    let context = macro_context(
+        AvailabilityEvidence::unknown(),
+        ResearchTime::new(
+            Timestamp::from_unix_nanos(90),
+            Some(Timestamp::from_unix_nanos(100)),
+            RevisionNumber::new(1)?,
+            None,
+        )?,
+    )?;
+    let observation = ResearchObservation::Macro(MacroObservation::missing(
+        context,
+        SourceIdentifier::try_from("CPI")?,
+        MacroMissingValue::new(
+            SourceIdentifier::try_from("-")?,
+            Some(SourceIdentifier::try_from("not-reported")?),
+        ),
+        SourceIdentifier::try_from("index")?,
+    ));
+    let expected = vec![observation];
+    let converted = ResearchArrowBatch::try_from_observations(
+        SourceIdentifier::try_from("bls-cpi")?,
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [17; 32]),
+        expected.clone(),
+    )?;
+    let batch = converted.record_batch();
+    let mantissas = batch
+        .column_by_name("value_mantissa")
+        .and_then(|array| array.as_any().downcast_ref::<Decimal128Array>())
+        .ok_or("missing decimal mantissa")?;
+    let scales = batch
+        .column_by_name("value_scale")
+        .and_then(|array| array.as_any().downcast_ref::<UInt8Array>())
+        .ok_or("missing decimal scale")?;
+
+    assert!(mantissas.is_null(0));
+    assert!(scales.is_null(0));
+    assert_eq!(string_column(batch, "value_state")?.value(0), "missing");
+    assert_eq!(string_column(batch, "missing_marker")?.value(0), "-");
+    assert_eq!(
+        string_column(batch, "missing_reason")?.value(0),
+        "not-reported"
+    );
+    assert_eq!(converted.observations()?, expected);
     Ok(())
 }
 
@@ -159,7 +207,7 @@ fn arrow_reader_rejects_an_unsupported_schema_version() -> TestResult {
         vec![macro_observation(Decimal::new(1, 0))?],
     )?;
     let mut metadata = converted.record_batch().schema().metadata().clone();
-    metadata.insert("market_squawk.schema_version".to_owned(), "3".to_owned());
+    metadata.insert("market_squawk.schema_version".to_owned(), "4".to_owned());
     let schema = converted
         .record_batch()
         .schema()
@@ -169,7 +217,7 @@ fn arrow_reader_rejects_an_unsupported_schema_version() -> TestResult {
     let hostile = RecordBatch::try_new(schema.into(), converted.record_batch().columns().to_vec())?;
     assert!(matches!(
         ResearchArrowBatch::try_from_record_batch(hostile),
-        Err(ArrowConversionError::UnsupportedSchemaVersion { found: 3 })
+        Err(ArrowConversionError::UnsupportedSchemaVersion { found: 4 })
     ));
     Ok(())
 }
@@ -316,7 +364,20 @@ fn macro_observation_with_time(
     availability: AvailabilityEvidence,
     time: ResearchTime,
 ) -> Result<ResearchObservation, Box<dyn Error>> {
-    let context = ResearchContext::new(
+    let context = macro_context(availability, time)?;
+    Ok(ResearchObservation::Macro(MacroObservation::new(
+        context,
+        SourceIdentifier::try_from("GDP")?,
+        value,
+        SourceIdentifier::try_from("USD")?,
+    )))
+}
+
+fn macro_context(
+    availability: AvailabilityEvidence,
+    time: ResearchTime,
+) -> Result<ResearchContext, Box<dyn Error>> {
+    Ok(ResearchContext::new(
         ResearchProvenance::try_new(ResearchProvenanceInput {
             source_id: SourceId::try_from("fred-local-fixture")?,
             instrument_id: None,
@@ -332,11 +393,5 @@ fn macro_observation_with_time(
             availability,
         })?,
         time,
-    )?;
-    Ok(ResearchObservation::Macro(MacroObservation::new(
-        context,
-        SourceIdentifier::try_from("GDP")?,
-        value,
-        SourceIdentifier::try_from("USD")?,
-    )))
+    )?)
 }

@@ -10,8 +10,8 @@ pub(crate) const SCHEMA_VERSION_KEY: &str = "market_squawk.schema_version";
 pub(crate) const DATASET_KEY: &str = "market_squawk.dataset";
 pub(crate) const REQUEST_DIGEST_KEY: &str = "market_squawk.request_sha256";
 pub(crate) const SCHEMA_NAME: &str = "market_squawk.research_observations";
-pub(crate) const RESEARCH_RECORD_SCHEMA: &str = "market-squawk-research-v2";
-pub(crate) const RESEARCH_SCHEMA_VERSION: u16 = 2;
+pub(crate) const RESEARCH_RECORD_SCHEMA: &str = "market-squawk-research-v3";
+pub(crate) const RESEARCH_SCHEMA_VERSION: u16 = 3;
 
 pub(crate) fn research_schema(
     dataset: &SourceIdentifier,
@@ -63,6 +63,9 @@ pub(crate) fn research_schema(
         Field::new("superseded_period_ordinal", DataType::UInt16, true),
         Field::new("superseded_period_code", DataType::Utf8, true),
         Field::new("quality", DataType::Utf8, false),
+        Field::new("value_state", DataType::Utf8, false),
+        Field::new("missing_marker", DataType::Utf8, true),
+        Field::new("missing_reason", DataType::Utf8, true),
         Field::new("value_mantissa", DataType::Decimal128(38, 0), true),
         Field::new("value_scale", DataType::UInt8, true),
         Field::new("unit", DataType::Utf8, true),

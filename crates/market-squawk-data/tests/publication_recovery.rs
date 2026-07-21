@@ -530,7 +530,7 @@ async fn rights_bound_ingest_replays_one_complete_pinned_generation() -> TestRes
     let first = service
         .ingest(reservation.clone(), batch.clone(), CancellationToken::new())
         .await?;
-    assert_eq!(first.manifest().schema_version().get(), 2);
+    assert_eq!(first.manifest().schema_version().get(), 3);
     let replay = service
         .ingest(reservation, batch, CancellationToken::new())
         .await?;
@@ -800,7 +800,7 @@ fn extraction_batch() -> Result<ExtractionBatch, Box<dyn Error>> {
     let evidence = EvidenceDigest::new(DigestAlgorithm::Sha256, Sha256::digest(&payload).into());
     let record = ExtractionRecord::try_new(
         &request,
-        SourceIdentifier::try_from("market-squawk-research-v2")?,
+        SourceIdentifier::try_from("market-squawk-research-v3")?,
         ExactPayloadEvidence::from_content_digest(evidence),
         Timestamp::from_unix_nanos(90),
         Some(Timestamp::from_unix_nanos(100)),

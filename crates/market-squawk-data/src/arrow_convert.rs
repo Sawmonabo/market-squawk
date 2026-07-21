@@ -242,6 +242,9 @@ impl ResearchArrowBatch {
         let mut superseded_period_ordinal = Vec::with_capacity(observations.len());
         let mut superseded_period_code = Vec::with_capacity(observations.len());
         let mut qualities = Vec::with_capacity(observations.len());
+        let mut value_states = Vec::with_capacity(observations.len());
+        let mut missing_markers = Vec::with_capacity(observations.len());
+        let mut missing_reasons = Vec::with_capacity(observations.len());
         let mut mantissas = Vec::with_capacity(observations.len());
         let mut scales = Vec::with_capacity(observations.len());
         let mut units = Vec::with_capacity(observations.len());
@@ -304,17 +307,31 @@ impl ResearchArrowBatch {
             superseded_period_ordinal.push(superseded.period_ordinal);
             superseded_period_code.push(superseded.period_code);
             qualities.push(quality_name(provenance.quality()));
-            let (decimal, unit) = analytical_value(observation);
-            mantissas.push(decimal.map(|value| value.mantissa()));
+            let value = analytical_value(observation);
+            value_states.push(value.state);
+            missing_markers.push(
+                value
+                    .missing_marker
+                    .map(|marker| marker.as_str().to_owned()),
+            );
+            missing_reasons.push(
+                value
+                    .missing_reason
+                    .map(|reason| reason.as_str().to_owned()),
+            );
+            mantissas.push(value.decimal.map(|decimal| decimal.mantissa()));
             scales.push(
-                decimal
-                    .map(|value| u8::try_from(value.scale()))
+                value
+                    .decimal
+                    .map(|decimal| u8::try_from(decimal.scale()))
                     .transpose()?,
             );
-            units.push(unit.map(|value| value.as_str().to_owned()));
+            units.push(value.unit.map(|unit| unit.as_str().to_owned()));
             currencies.push(
-                unit.filter(|value| is_currency(value.as_str()))
-                    .map(|value| value.as_str().to_owned()),
+                value
+                    .unit
+                    .filter(|unit| is_currency(unit.as_str()))
+                    .map(|unit| unit.as_str().to_owned()),
             );
         }
 
@@ -364,6 +381,9 @@ impl ResearchArrowBatch {
             Arc::new(UInt16Array::from(superseded_period_ordinal)),
             Arc::new(StringArray::from(superseded_period_code)),
             Arc::new(StringArray::from(qualities)),
+            Arc::new(StringArray::from(value_states)),
+            Arc::new(StringArray::from(missing_markers)),
+            Arc::new(StringArray::from(missing_reasons)),
             Arc::new(decimal),
             Arc::new(UInt8Array::from(scales)),
             Arc::new(StringArray::from(units)),
@@ -735,14 +755,53 @@ const fn observation_kind(observation: &ResearchObservation) -> &'static str {
     }
 }
 
-fn analytical_value(
-    observation: &ResearchObservation,
-) -> (Option<Decimal>, Option<&SourceIdentifier>) {
+struct AnalyticalValue<'a> {
+    state: &'static str,
+    decimal: Option<Decimal>,
+    unit: Option<&'a SourceIdentifier>,
+    missing_marker: Option<&'a SourceIdentifier>,
+    missing_reason: Option<&'a SourceIdentifier>,
+}
+
+fn analytical_value(observation: &ResearchObservation) -> AnalyticalValue<'_> {
     match observation {
-        ResearchObservation::Fundamental(value) => (Some(value.value()), Some(value.unit())),
-        ResearchObservation::Macro(value) => (Some(value.value()), Some(value.unit())),
-        ResearchObservation::AlternativeData(value) => (Some(value.value()), value.unit()),
-        _ => (None, None),
+        ResearchObservation::Fundamental(value) => AnalyticalValue {
+            state: "observed",
+            decimal: Some(value.value()),
+            unit: Some(value.unit()),
+            missing_marker: None,
+            missing_reason: None,
+        },
+        ResearchObservation::Macro(value) => match value.value().missing_value() {
+            Some(missing) => AnalyticalValue {
+                state: "missing",
+                decimal: None,
+                unit: Some(value.unit()),
+                missing_marker: Some(missing.marker()),
+                missing_reason: missing.reason(),
+            },
+            None => AnalyticalValue {
+                state: "observed",
+                decimal: value.value().observed_value(),
+                unit: Some(value.unit()),
+                missing_marker: None,
+                missing_reason: None,
+            },
+        },
+        ResearchObservation::AlternativeData(value) => AnalyticalValue {
+            state: "observed",
+            decimal: Some(value.value()),
+            unit: value.unit(),
+            missing_marker: None,
+            missing_reason: None,
+        },
+        _ => AnalyticalValue {
+            state: "not_applicable",
+            decimal: None,
+            unit: None,
+            missing_marker: None,
+            missing_reason: None,
+        },
     }
 }
 

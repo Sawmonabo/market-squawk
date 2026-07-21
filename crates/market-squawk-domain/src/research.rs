@@ -11,7 +11,8 @@ mod observations;
 
 pub use observations::{
     AlternativeDataObservation, CorporateActionObservation, FilingObservation,
-    FundamentalObservation, MacroObservation, PositionObservation, TransactionObservation,
+    FundamentalObservation, MacroMissingValue, MacroObservation, MacroValue, PositionObservation,
+    TransactionObservation,
 };
 
 /// Direction of a nonzero portfolio position.
@@ -58,6 +59,8 @@ pub enum ResearchError {
     MissingVenue,
     /// Persisted positions must have a nonzero absolute quantity.
     ZeroPosition,
+    /// A macro observation encoded both or neither observed and missing value state.
+    InvalidMacroValueState,
     /// A merger successor is the same stable instrument.
     SelfMerger,
     /// A symbol-change action does not change the symbol.
@@ -76,6 +79,8 @@ impl fmt::Display for ResearchError {
                 formatter.write_str("venue-scoped research observation requires a venue")
             }
             Self::ZeroPosition => formatter.write_str("portfolio position must be nonzero"),
+            Self::InvalidMacroValueState => formatter
+                .write_str("macro observation requires exactly one observed or missing value"),
             Self::SelfMerger => {
                 formatter.write_str("merger successor must be a distinct instrument")
             }

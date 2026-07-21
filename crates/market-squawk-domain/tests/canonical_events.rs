@@ -6,11 +6,12 @@ use market_squawk_domain::{
     BookDeltaEvent, BookLevel, BookSnapshotEvent, CorporateActionEvent, CorporateActionKind,
     CorporateActionObservation, CoverageStatus, DataQuality, DecodedLiveProvenanceInput,
     FilingObservation, FundamentalObservation, HaltTransition, InstrumentId, InstrumentStatusEvent,
-    LiveEventClass, LiveProvenance, MacroObservation, MarketDepth, MarketEvent, MarketEventError,
-    MarketSide, PayloadReference, PositionObservation, PositionSide, PriceTicks, QuantityLots,
-    QuoteEvent, ResearchContext, ResearchError, ResearchObservation, ResearchProvenance,
-    ResearchProvenanceInput, ResearchTime, RevisionNumber, SourceId, SourceIdentifier, Timestamp,
-    TradeEvent, TradingHaltEvent, TradingStatus, TransactionObservation,
+    LiveEventClass, LiveProvenance, MacroMissingValue, MacroObservation, MarketDepth, MarketEvent,
+    MarketEventError, MarketSide, PayloadReference, PositionObservation, PositionSide, PriceTicks,
+    QuantityLots, QuoteEvent, ResearchContext, ResearchError, ResearchObservation,
+    ResearchProvenance, ResearchProvenanceInput, ResearchTime, RevisionNumber, SourceId,
+    SourceIdentifier, Timestamp, TradeEvent, TradingHaltEvent, TradingStatus,
+    TransactionObservation,
 };
 use rust_decimal::Decimal;
 
@@ -354,7 +355,10 @@ fn research_payload_fields_are_available_through_typed_views() -> Result<(), Box
     assert_eq!(fundamental.concept().as_str(), "Assets");
     assert_eq!(fundamental.unit().as_str(), "USD");
     assert_eq!(macro_observation.series().as_str(), "CPI");
-    assert_eq!(macro_observation.value(), Decimal::new(321, 1));
+    assert_eq!(
+        macro_observation.value().observed_value(),
+        Some(Decimal::new(321, 1))
+    );
     assert_eq!(position.account_id().as_str(), "account-1");
     assert_eq!(transaction.transaction_type().as_str(), "sell");
     assert_eq!(transaction.source_record_id().as_str(), "transaction-1");
@@ -368,6 +372,75 @@ fn research_payload_fields_are_available_through_typed_views() -> Result<(), Box
         alternative.unit().map(SourceIdentifier::as_str),
         Some("percent")
     );
+    Ok(())
+}
+
+#[test]
+fn macro_missing_values_preserve_provider_marker_and_reason() -> Result<(), Box<dyn Error>> {
+    let missing = MacroMissingValue::new(
+        SourceIdentifier::try_from("-")?,
+        Some(SourceIdentifier::try_from("not-reported")?),
+    );
+    let observation = MacroObservation::missing(
+        research_context(false)?,
+        SourceIdentifier::try_from("CPI")?,
+        missing.clone(),
+        SourceIdentifier::try_from("index")?,
+    );
+    let wire = serde_json::to_value(&observation)?;
+
+    assert!(wire.get("value").is_none());
+    assert_eq!(wire["missing"]["marker"], "-");
+    assert_eq!(wire["missing"]["reason"], "not-reported");
+    assert_eq!(
+        serde_json::from_value::<MacroObservation>(wire)?,
+        observation
+    );
+    assert_eq!(observation.value().missing_value(), Some(&missing));
+
+    let observed = MacroObservation::new(
+        research_context(false)?,
+        SourceIdentifier::try_from("CPI")?,
+        Decimal::new(321, 1),
+        SourceIdentifier::try_from("index")?,
+    );
+    let observed_wire = serde_json::to_value(&observed)?;
+    assert!(observed_wire.get("missing").is_none());
+    assert_eq!(
+        serde_json::from_value::<MacroObservation>(observed_wire.clone())?,
+        observed
+    );
+    let context = observed_wire["context"].clone();
+    for invalid in [
+        serde_json::json!({
+            "context": context.clone(),
+            "series": "CPI",
+            "value": null,
+            "missing": {"marker": "-"},
+            "unit": "index"
+        }),
+        serde_json::json!({
+            "context": context.clone(),
+            "series": "CPI",
+            "value": 32.1,
+            "missing": null,
+            "unit": "index"
+        }),
+        serde_json::json!({
+            "context": context.clone(),
+            "series": "CPI",
+            "value": 32.1,
+            "missing": {"marker": "-"},
+            "unit": "index"
+        }),
+        serde_json::json!({
+            "context": context,
+            "series": "CPI",
+            "unit": "index"
+        }),
+    ] {
+        assert!(serde_json::from_value::<MacroObservation>(invalid).is_err());
+    }
     Ok(())
 }
 mod support;

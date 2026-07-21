@@ -93,8 +93,8 @@ pub use provenance::{
 };
 pub use research::{
     AlternativeDataObservation, CorporateActionObservation, FilingObservation,
-    FundamentalObservation, MacroObservation, PositionObservation, PositionSide, ResearchError,
-    ResearchObservation, TransactionObservation,
+    FundamentalObservation, MacroMissingValue, MacroObservation, MacroValue, PositionObservation,
+    PositionSide, ResearchError, ResearchObservation, TransactionObservation,
 };
 pub use retained::{
     RetainedLayoutError, checked_arc_bytes_allocation_bytes, checked_arc_str_allocation_bytes,
