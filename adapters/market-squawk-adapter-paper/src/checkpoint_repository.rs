@@ -628,6 +628,7 @@ fn read_current_manifest(
 
 fn same_financial_state(left: &ReconciledAccountState, right: &ReconciledAccountState) -> bool {
     left.account_id() == right.account_id()
+        && left.revision() == right.revision()
         && left.eligible() == right.eligible()
         && left.currency() == right.currency()
         && left.cash() == right.cash()
@@ -1464,6 +1465,48 @@ mod tests {
     }
 
     #[test]
+    fn account_replay_rejects_a_financial_revision_mismatch() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let paths = LocalPaths::prepare(directory.path().join("data"))?;
+        let (config, checkpoint) = checkpoint_fixture()?;
+        let maximum_bytes = NonZeroUsize::new(1024 * 1024).ok_or("zero checkpoint bound")?;
+        let mut repository =
+            PaperCheckpointRepository::try_new(paths.artifacts()?.clone(), config, maximum_bytes)?;
+        let paper = &checkpoint.reconciled_accounts_for_recovery()?[0];
+        let replay_state = ReconciledAccountState::try_new(
+            paper.account_id(),
+            paper
+                .revision()
+                .checked_add(1)
+                .ok_or("risk revision overflow")?,
+            paper.eligible(),
+            paper.currency(),
+            paper.cash(),
+            paper.settled_capital(),
+            paper.marked_equity(),
+            paper.peak_marked_equity(),
+            paper.marked_gross_exposure(),
+            paper.unrealized_pnl(),
+            paper.drawdown(),
+            paper.mark_digest(),
+            paper.realized_pnl(),
+            paper.realized_loss(),
+            paper.positions().to_vec(),
+            paper.position_cost_basis().to_vec(),
+        )?;
+        let replay = [PaperAccountReplaySnapshot::from_reconciled_state(
+            replay_state,
+            AccountIdempotencyBootstrap::empty(),
+        )];
+
+        assert!(matches!(
+            repository.persist_with_replay(&checkpoint, &replay),
+            Err(PaperCheckpointRepositoryError::InvalidReplay)
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn recovered_receipt_authority_is_runtime_bound_and_strictly_monotonic() -> TestResult {
         let directory = tempfile::tempdir()?;
         let paths = LocalPaths::prepare(directory.path().join("primary"))?;
@@ -1486,27 +1529,7 @@ mod tests {
             maximum_bytes.get(),
         )?;
         let paper_state = &recovered.reconciled_accounts_for_recovery()?[0];
-        let risk_state = ReconciledAccountState::try_new(
-            paper_state.account_id(),
-            paper_state
-                .revision()
-                .checked_add(1)
-                .ok_or("risk revision overflow")?,
-            paper_state.eligible(),
-            paper_state.currency(),
-            paper_state.cash(),
-            paper_state.settled_capital(),
-            paper_state.marked_equity(),
-            paper_state.peak_marked_equity(),
-            paper_state.marked_gross_exposure(),
-            paper_state.unrealized_pnl(),
-            paper_state.drawdown(),
-            paper_state.mark_digest(),
-            paper_state.realized_pnl(),
-            paper_state.realized_loss(),
-            paper_state.positions().to_vec(),
-            paper_state.position_cost_basis().to_vec(),
-        )?;
+        let risk_state = paper_state.clone();
         let replay = [PaperAccountReplaySnapshot::from_reconciled_state(
             risk_state.clone(),
             AccountIdempotencyBootstrap::empty(),
