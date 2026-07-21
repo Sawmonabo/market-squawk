@@ -18,9 +18,9 @@ use market_squawk_domain::{
     AvailabilityEvidence, DigestAlgorithm, EvidenceDigest, ProviderIdentityRegistry,
 };
 use market_squawk_sources::{
-    AuthorizationMode, BudgetDecision, EndpointPolicy, NetworkAccessPolicy, RegisteredSource,
-    SharedProviderBudget, SourceMetadata, SourceMetadataProvider, TlsProviderCapability,
-    apply_http_retry_after,
+    AuthorizationMode, ExtractionAuthority, ExtractionAuthorityError, ExtractionRedirectPermit,
+    HttpRequestBounds, NetworkAccessPolicy, SourceMetadata, SourceMetadataProvider,
+    TlsProviderCapability,
 };
 use reqwest::header::{
     ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, LOCATION, RETRY_AFTER,
@@ -36,18 +36,14 @@ use crate::{
     XbrlDocumentParser,
 };
 
-const MAX_EXPLICIT_RETRIES: usize = 3;
 const SEC_REQUEST_CEILING_PER_SECOND: u32 = 10;
 const ONE_SECOND_NANOS: u64 = 1_000_000_000;
 const MAX_BLOCKING_WORKERS: usize = 4;
 
-/// Production SEC source bound to registered metadata, shared budget, and local raw persistence.
+/// Production SEC source bound to exact metadata and local persistence.
 #[derive(Debug)]
 pub struct SecEdgarSource {
     metadata: SourceMetadata,
-    registered: RegisteredSource,
-    endpoint_policy: EndpointPolicy,
-    budget: SharedProviderBudget,
     client: reqwest::Client,
     raw_store: Arc<RawEvidenceStore>,
     representation_registry: Arc<SecRepresentationRegistry>,
@@ -58,14 +54,17 @@ pub struct SecEdgarSource {
 }
 
 impl SecEdgarSource {
-    /// Constructs a source only from current registration and an installed TLS capability.
+    /// Constructs a source from exact metadata and an installed TLS capability.
+    ///
+    /// Runtime discovery and extraction remain impossible without a matching registry-minted
+    /// [`ExtractionAuthority`]. The source deliberately retains no registration handle, endpoint
+    /// authorization, or provider-budget capability that could substitute for that authority.
     #[allow(
         clippy::too_many_arguments,
-        reason = "each argument is a distinct authority, identity, persistence, or parsing capability"
+        reason = "each argument is distinct metadata, identity, persistence, or parsing state"
     )]
     pub fn try_new(
         metadata: SourceMetadata,
-        registered: RegisteredSource,
         contact: SecContact,
         tls_provider: TlsProviderCapability,
         raw_store: RawEvidenceStore,
@@ -73,9 +72,7 @@ impl SecEdgarSource {
         identities: ProviderIdentityRegistry,
         parser_limits: SecParserLimits,
     ) -> Result<Self, SecClientError> {
-        if metadata.source_id() != registered.source_id()
-            || metadata.revision() != registered.revision()
-            || metadata.source_class() != market_squawk_sources::SourceClass::RegulatoryFiling
+        if metadata.source_class() != market_squawk_sources::SourceClass::RegulatoryFiling
             || !metadata.capabilities().extraction()
             || metadata.authorization().mode() != AuthorizationMode::PublicInterface
         {
@@ -85,10 +82,6 @@ impl SecEdgarSource {
             NetworkAccessPolicy::Allowlisted(policy) => policy.clone(),
             NetworkAccessPolicy::Denied => return Err(SecClientError::NetworkDenied),
         };
-        let budget = registered
-            .budget()
-            .cloned()
-            .ok_or(SecClientError::MissingSharedBudget)?;
         let budget_policy = metadata
             .budget_policy()
             .ok_or(SecClientError::MissingSharedBudget)?;
@@ -129,9 +122,6 @@ impl SecEdgarSource {
             usize::from(budget_policy.max_concurrent()).min(MAX_BLOCKING_WORKERS);
         Ok(Self {
             metadata,
-            registered,
-            endpoint_policy,
-            budget,
             client,
             raw_store: Arc::new(raw_store),
             representation_registry: Arc::new(representation_registry),
@@ -157,11 +147,17 @@ impl SecEdgarSource {
     /// Retrieves and parses current submissions without inventing publication time.
     pub async fn fetch_submissions(
         &self,
+        authority: &ExtractionAuthority,
         cik: &str,
         cancellation: CancellationToken,
     ) -> Result<RetrievedSubmissions, SecClientError> {
+        self.validate_authority(authority)?;
         let raw = self
-            .retrieve(&SecObjectLocator::submissions(cik)?, &cancellation)
+            .retrieve(
+                authority,
+                &SecObjectLocator::submissions(cik)?,
+                &cancellation,
+            )
             .await?;
         let bytes = raw.bytes().clone();
         let limits = self.parser_limits;
@@ -171,17 +167,24 @@ impl SecEdgarSource {
                     .map_err(Into::into)
             })
             .await?;
+        self.validate_authority(authority)?;
         Ok(RetrievedSubmissions::new(document, raw, Vec::new()))
     }
 
     /// Retrieves and parses one submissions companion file.
     pub async fn fetch_submissions_archive(
         &self,
+        authority: &ExtractionAuthority,
         name: &str,
         cancellation: CancellationToken,
     ) -> Result<(SubmissionsArchive, RetrievedSecBytes), SecClientError> {
+        self.validate_authority(authority)?;
         let raw = self
-            .retrieve(&SecObjectLocator::companion(name)?, &cancellation)
+            .retrieve(
+                authority,
+                &SecObjectLocator::companion(name)?,
+                &cancellation,
+            )
             .await?;
         let bytes = raw.bytes().clone();
         let limits = self.parser_limits;
@@ -195,17 +198,24 @@ impl SecEdgarSource {
                 .map_err(Into::into)
             })
             .await?;
+        self.validate_authority(authority)?;
         Ok((document, raw))
     }
 
     /// Retrieves and parses current SEC Company Facts.
     pub async fn fetch_company_facts(
         &self,
+        authority: &ExtractionAuthority,
         cik: &str,
         cancellation: CancellationToken,
     ) -> Result<RetrievedCompanyFacts, SecClientError> {
+        self.validate_authority(authority)?;
         let raw = self
-            .retrieve(&SecObjectLocator::company_facts(cik)?, &cancellation)
+            .retrieve(
+                authority,
+                &SecObjectLocator::company_facts(cik)?,
+                &cancellation,
+            )
             .await?;
         let bytes = raw.bytes().clone();
         let limits = self.parser_limits;
@@ -215,18 +225,22 @@ impl SecEdgarSource {
                     .map_err(Into::into)
             })
             .await?;
+        self.validate_authority(authority)?;
         Ok(RetrievedCompanyFacts { document, raw })
     }
 
     /// Retrieves and persists one validated filing document for bounded XBRL parsing.
     pub async fn fetch_filing_document(
         &self,
+        authority: &ExtractionAuthority,
         cik: &str,
         accession: &str,
         document: &str,
         cancellation: CancellationToken,
     ) -> Result<RetrievedSecBytes, SecClientError> {
+        self.validate_authority(authority)?;
         self.retrieve(
+            authority,
             &SecObjectLocator::filing_document(cik, accession, document)?,
             &cancellation,
         )
@@ -236,14 +250,16 @@ impl SecEdgarSource {
     /// Retrieves, persists, and parses one filing XBRL or Inline-XBRL document.
     pub async fn fetch_xbrl_document(
         &self,
+        authority: &ExtractionAuthority,
         cik: &str,
         accession: &str,
         document: &str,
         taxonomy_set: market_squawk_domain::XbrlTaxonomySet,
         cancellation: CancellationToken,
     ) -> Result<RetrievedXbrlDocument, SecClientError> {
+        self.validate_authority(authority)?;
         let raw = self
-            .fetch_filing_document(cik, accession, document, cancellation)
+            .fetch_filing_document(authority, cik, accession, document, cancellation)
             .await?;
         let parsed = XbrlDocumentParser::parse(
             raw.bytes(),
@@ -255,6 +271,7 @@ impl SecEdgarSource {
                 raw.received_at(),
             ),
         )?;
+        self.validate_authority(authority)?;
         Ok(RetrievedXbrlDocument {
             document: parsed,
             raw,
@@ -263,37 +280,17 @@ impl SecEdgarSource {
 
     async fn retrieve(
         &self,
+        authority: &ExtractionAuthority,
         locator: &SecObjectLocator,
         cancellation: &CancellationToken,
     ) -> Result<RetrievedSecBytes, SecClientError> {
-        let now = system_timestamp()?;
-        if !self.metadata.is_effective_at(now)
-            || self.registered.source_id() != self.metadata.source_id()
-            || self.registered.revision() != self.metadata.revision()
-        {
-            return Err(SecClientError::InactiveAuthority);
-        }
+        self.validate_authority(authority)?;
+        let request_bounds = self.request_bounds(authority)?;
         let mut current = locator.url().to_owned();
-        let mut redirects = 0_u8;
-        let mut retries = 0_usize;
+        let mut redirect_permit: Option<ExtractionRedirectPermit> = None;
         loop {
-            self.endpoint_policy.authorize_request(&current)?;
+            self.validate_authority(authority)?;
             let conditional = self.representation_registry.conditional_request(&current)?;
-            let permit = loop {
-                match self.budget.try_acquire() {
-                    BudgetDecision::Ready(permit) => break permit,
-                    BudgetDecision::WaitUntil(deadline) => {
-                        let wait = self.budget.remaining_wait(deadline)?;
-                        tokio::select! {
-                            () = tokio::time::sleep(wait) => {}
-                            () = cancellation.cancelled() => return Err(SecClientError::Cancelled),
-                        }
-                    }
-                    BudgetDecision::Unavailable(reason) => {
-                        return Err(SecClientError::BudgetUnavailable(reason));
-                    }
-                }
-            };
             let mut request = self.client.get(&current);
             if let Some(validators) = conditional {
                 if let Some(etag) = validators.etag() {
@@ -303,6 +300,12 @@ impl SecEdgarSource {
                     request = request.header(IF_MODIFIED_SINCE, last_modified);
                 }
             }
+            let in_flight = match redirect_permit.take() {
+                Some(permit) => permit.authorize_send(&current)?,
+                None => authority
+                    .try_network_request(&current)?
+                    .authorize_send(&current)?,
+            };
             let response = tokio::select! {
                 response = request.send() => match response {
                     Ok(response) => response,
@@ -313,6 +316,7 @@ impl SecEdgarSource {
                 },
                 () = cancellation.cancelled() => return Err(SecClientError::Cancelled),
             };
+            in_flight.validate_current()?;
             let status = response.status();
             if status.is_redirection() && status.as_u16() != 304 {
                 let location = response
@@ -324,15 +328,9 @@ impl SecEdgarSource {
                     .and_then(|base| base.join(location))
                     .map_err(|_| SecClientError::InvalidRedirect)?
                     .to_string();
-                self.endpoint_policy
-                    .authorize_redirect_from(&current, &target, false)?;
-                redirects = redirects
-                    .checked_add(1)
-                    .ok_or(SecClientError::RedirectLimitExceeded)?;
-                if redirects > self.endpoint_policy.request_bounds().max_redirects() {
-                    return Err(SecClientError::RedirectLimitExceeded);
-                }
-                permit.release();
+                drop(response);
+                redirect_permit =
+                    Some(in_flight.authorize_redirect_from(&current, &target, false)?);
                 current = target;
                 continue;
             }
@@ -344,35 +342,20 @@ impl SecEdgarSource {
                 let retry_after = response
                     .headers()
                     .get(RETRY_AFTER)
-                    .map(|value| value.as_bytes());
-                permit.release();
-                if retries >= MAX_EXPLICIT_RETRIES {
-                    return Err(SecClientError::RetryLimitExceeded);
-                }
-                retries += 1;
-                match apply_http_retry_after(&self.budget, retry_after, 5_000) {
-                    BudgetDecision::Ready(permit) => permit.release(),
-                    BudgetDecision::WaitUntil(deadline) => {
-                        let wait = self.budget.remaining_wait(deadline)?;
-                        tokio::select! {
-                            () = tokio::time::sleep(wait) => {}
-                            () = cancellation.cancelled() => return Err(SecClientError::Cancelled),
-                        }
-                    }
-                    BudgetDecision::Unavailable(reason) => {
-                        return Err(SecClientError::BudgetUnavailable(reason));
-                    }
-                }
-                continue;
+                    .map(|value| value.as_bytes().to_vec());
+                drop(response);
+                let deadline = in_flight.apply_retry_after_header(retry_after.as_deref(), 5_000)?;
+                return Err(SecClientError::Authority(
+                    ExtractionAuthorityError::BudgetWaitUntil { deadline },
+                ));
             }
             if status.as_u16() == 304 {
                 let validators = self.response_validators(response.headers())?;
-                permit.release();
-                self.budget.record_success()?;
+                drop(response);
                 let raw_store = Arc::clone(&self.raw_store);
                 let representations = Arc::clone(&self.representation_registry);
                 let retained_locator = current.clone();
-                let max_bytes = self.endpoint_policy.request_bounds().max_response_bytes();
+                let max_bytes = request_bounds.max_response_bytes();
                 let retrieved = self
                     .run_blocking(cancellation, move |worker_cancellation| {
                         let retained = representations.record_not_modified_cancellable(
@@ -391,20 +374,24 @@ impl SecEdgarSource {
                         Ok(retrieved_from_representation(bytes, retained))
                     })
                     .await;
+                in_flight.validate_current()?;
+                self.validate_authority(authority)?;
+                in_flight.release();
                 return self.finish_local_retrieval(retrieved);
             }
             if !status.is_success() {
                 let health = health_for_http_status(status.as_u16());
                 self.update_health(health, Some(status.as_u16()))?;
+                drop(response);
+                in_flight.validate_current()?;
+                in_flight.release();
                 return Err(SecClientError::HttpStatus(status.as_u16()));
             }
             let validators = self.response_validators(response.headers())?;
             if let Some(length) = response.content_length() {
-                self.endpoint_policy.validate_response_size(length)?;
+                in_flight.validate_response_size(length)?;
             }
-            let read_timeout =
-                Duration::from_nanos(self.endpoint_policy.request_bounds().read_timeout_nanos());
-            let max_bytes = self.endpoint_policy.request_bounds().max_response_bytes();
+            let read_timeout = Duration::from_nanos(request_bounds.read_timeout_nanos());
             let initial_capacity = response
                 .content_length()
                 .and_then(|size| usize::try_from(size).ok())
@@ -416,6 +403,7 @@ impl SecEdgarSource {
                 .map_err(|_| SecClientError::AllocationFailed)?;
             let mut stream = response.bytes_stream();
             loop {
+                in_flight.validate_current()?;
                 let next = tokio::select! {
                     result = tokio::time::timeout(read_timeout, stream.next()) => {
                         match result {
@@ -443,17 +431,16 @@ impl SecEdgarSource {
                     .len()
                     .checked_add(chunk.len())
                     .ok_or(SecClientError::ResponseTooLarge)?;
-                if u64::try_from(new_len).map_err(|_| SecClientError::ResponseTooLarge)? > max_bytes
-                {
-                    return Err(SecClientError::ResponseTooLarge);
-                }
+                let new_size =
+                    u64::try_from(new_len).map_err(|_| SecClientError::ResponseTooLarge)?;
+                in_flight.validate_response_size(new_size)?;
                 bytes
                     .try_reserve(chunk.len())
                     .map_err(|_| SecClientError::AllocationFailed)?;
                 bytes.extend_from_slice(&chunk);
             }
-            permit.release();
-            self.budget.record_success()?;
+            drop(stream);
+            in_flight.validate_current()?;
             let raw_store = Arc::clone(&self.raw_store);
             let representations = Arc::clone(&self.representation_registry);
             let retained_locator = current.clone();
@@ -476,6 +463,9 @@ impl SecEdgarSource {
                     Ok(retrieved_from_representation(bytes, retained))
                 })
                 .await;
+            in_flight.validate_current()?;
+            self.validate_authority(authority)?;
+            in_flight.release();
             return self.finish_local_retrieval(retrieved);
         }
     }
@@ -583,6 +573,27 @@ impl SecEdgarSource {
                 self.update_health(SecExtractionHealthState::InvalidResponse, None)?;
                 Err(error)
             }
+        }
+    }
+
+    pub(crate) fn validate_authority(
+        &self,
+        authority: &ExtractionAuthority,
+    ) -> Result<(), SecClientError> {
+        if authority.metadata() != &self.metadata {
+            return Err(SecClientError::RegistrationMismatch);
+        }
+        authority.validate_current().map_err(Into::into)
+    }
+
+    fn request_bounds(
+        &self,
+        authority: &ExtractionAuthority,
+    ) -> Result<HttpRequestBounds, SecClientError> {
+        self.validate_authority(authority)?;
+        match authority.metadata().network_policy() {
+            NetworkAccessPolicy::Allowlisted(policy) => Ok(policy.request_bounds()),
+            NetworkAccessPolicy::Denied => Err(SecClientError::NetworkDenied),
         }
     }
 

@@ -5,6 +5,7 @@ use std::io::Write;
 use std::time::Duration;
 
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, Timestamp};
+use market_squawk_sources::ExtractionAuthority;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -166,15 +167,17 @@ impl SecEdgarSource {
     /// Retrieves every provider-declared submissions companion and persists one composite manifest.
     pub async fn fetch_complete_submissions(
         &self,
+        authority: &ExtractionAuthority,
         cik: &str,
         bounds: SecCompositeBounds,
         deadline: Timestamp,
         cancellation: CancellationToken,
     ) -> Result<RetrievedSubmissions, SecClientError> {
+        self.validate_authority(authority)?;
         let recent_cancellation = cancellation.child_token();
         let remaining = deadline_remaining(deadline)?;
         let recent = tokio::select! {
-            result = self.fetch_submissions(cik, recent_cancellation.clone()) => result?,
+            result = self.fetch_submissions(authority, cik, recent_cancellation.clone()) => result?,
             () = tokio::time::sleep(remaining) => {
                 recent_cancellation.cancel();
                 return Err(SecClientError::DeadlineExceeded);
@@ -220,6 +223,7 @@ impl SecEdgarSource {
             let remaining = deadline_remaining(deadline)?;
             let (archive, raw) = tokio::select! {
                 result = self.fetch_submissions_archive(
+                    authority,
                     name.as_str(),
                     attempt_cancellation.clone(),
                 ) => result?,
@@ -252,6 +256,7 @@ impl SecEdgarSource {
                 .map_err(Into::into)
             })
             .await?;
+        self.validate_authority(authority)?;
         let manifest_raw = persist_manifest(
             self,
             reconciled.cik().as_str().to_owned(),
@@ -259,6 +264,7 @@ impl SecEdgarSource {
             &cancellation,
         )
         .await?;
+        self.validate_authority(authority)?;
         Ok(RetrievedSubmissions::new(
             reconciled,
             manifest_raw,

@@ -23,10 +23,7 @@ fn extraction_authority_is_exact_revocation_aware_and_budget_bound() -> TestResu
 
     let permit = authority.try_network_request("https://api.source.test/data")?;
     assert!(!permit.authorization().contains_sensitive_query());
-    assert!(matches!(
-        permit.authorize_send("https://api.source.test/other"),
-        Err(crate::ExtractionAuthorityError::RequestTargetMismatch)
-    ));
+    let in_flight = permit.authorize_send("https://api.source.test/data")?;
     assert!(matches!(
         authority.try_network_request("https://attacker.invalid/data"),
         Err(crate::ExtractionAuthorityError::NetworkPolicy(_))
@@ -43,6 +40,10 @@ fn extraction_authority_is_exact_revocation_aware_and_budget_bound() -> TestResu
     let replacement = registry.replace_metadata(&registered, replacement_metadata, at)?;
     assert_eq!(
         authority.validate_current(),
+        Err(crate::ExtractionAuthorityError::NotCurrent)
+    );
+    assert_eq!(
+        in_flight.validate_current(),
         Err(crate::ExtractionAuthorityError::NotCurrent)
     );
     assert!(matches!(
@@ -133,9 +134,10 @@ fn redirect_hops_are_origin_bound_and_each_consume_one_request_admission() -> Te
             reason: crate::BudgetUnavailableReason::ConcurrencyExhausted
         })
     ));
-    redirect
-        .authorize_send("https://redirect-source.example.test/next")?
-        .release();
+    assert!(matches!(
+        redirect.authorize_send("https://redirect-source.example.test/data"),
+        Err(crate::ExtractionAuthorityError::RequestTargetMismatch)
+    ));
 
     authority
         .try_network_request("https://redirect-source.example.test/data")?

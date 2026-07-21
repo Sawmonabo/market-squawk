@@ -12,8 +12,9 @@ use market_squawk_domain::{
 };
 use market_squawk_sources::{
     AvailabilityEvidence as ExtractionAvailabilityEvidence, DiscoveryBatch, DiscoveryRequest,
-    ExtractionBatch, ExtractionRecord, ExtractionRequest, ExtractionSource, ExtractionSourceError,
-    MAX_EXTRACTION_RECORD_BYTES, SourceError, SourceMetadataProvider, SourceObject,
+    ExtractionAuthority, ExtractionBatch, ExtractionRecord, ExtractionRequest, ExtractionSource,
+    ExtractionSourceError, MAX_EXTRACTION_RECORD_BYTES, SourceError, SourceMetadataProvider,
+    SourceObject,
 };
 use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -23,6 +24,8 @@ use crate::{
     SecNormalizationError, SecParserError, SecParserLimits,
     normalize_company_facts_with_cancellation, normalize_filings_with_cancellation,
 };
+
+const RESEARCH_RECORD_SCHEMA: &str = "market-squawk-research-v3";
 
 enum DatasetLocator<'a> {
     Submissions(&'a str),
@@ -44,10 +47,13 @@ impl<'a> DatasetLocator<'a> {
 impl ExtractionSource for SecEdgarSource {
     fn discover(
         &self,
+        authority: ExtractionAuthority,
         request: DiscoveryRequest,
         cancellation: CancellationToken,
     ) -> BoxFuture<'_, Result<DiscoveryBatch, ExtractionSourceError>> {
         Box::pin(async move {
+            self.validate_authority(&authority)
+                .map_err(map_client_error)?;
             let child = cancellation.child_token();
             let remaining = deadline_remaining(request.deadline())?;
             let dataset = DatasetLocator::parse(request.dataset().as_str())?;
@@ -55,6 +61,7 @@ impl ExtractionSource for SecEdgarSource {
                 match dataset {
                     DatasetLocator::Submissions(cik) => self
                         .fetch_complete_submissions(
+                            &authority,
                             cik,
                             SecCompositeBounds::production_defaults(),
                             request.deadline(),
@@ -70,7 +77,7 @@ impl ExtractionSource for SecEdgarSource {
                             .map_err(Into::into)
                         }),
                     DatasetLocator::CompanyFacts(cik) => self
-                        .fetch_company_facts(cik, child.clone())
+                        .fetch_company_facts(&authority, cik, child.clone())
                         .await
                         .and_then(|value| {
                             let object_id = value
@@ -90,6 +97,8 @@ impl ExtractionSource for SecEdgarSource {
                 ExtractionSourceError::DeadlineExceeded
             })?
             .map_err(map_client_error)?;
+            self.validate_authority(&authority)
+                .map_err(map_client_error)?;
             let object = SourceObject::try_new(
                 self.metadata().source_id().clone(),
                 self.metadata().revision().clone(),
@@ -102,12 +111,16 @@ impl ExtractionSource for SecEdgarSource {
                 None,
                 Some(u64::try_from(retrieved.bytes().len()).map_err(|_| invalid_protocol())?),
             )?;
-            DiscoveryBatch::try_new(&request, vec![object]).map_err(Into::into)
+            let batch = DiscoveryBatch::try_new(&request, vec![object])?;
+            self.validate_authority(&authority)
+                .map_err(map_client_error)?;
+            Ok(batch)
         })
     }
 
     fn extract(
         &self,
+        authority: ExtractionAuthority,
         request: ExtractionRequest,
         cancellation: CancellationToken,
     ) -> BoxFuture<'_, Result<ExtractionBatch, ExtractionSourceError>> {
@@ -115,14 +128,28 @@ impl ExtractionSource for SecEdgarSource {
         let identities = self.identity_registry();
         let source_id = self.metadata().source_id().clone();
         Box::pin(async move {
+            self.validate_authority(&authority)
+                .map_err(map_client_error)?;
             let remaining = deadline_remaining(request.deadline())?;
             let worker_cancellation = cancellation.child_token();
+            let worker_authority = authority.clone();
             let worker = self.run_validation_blocking(&worker_cancellation, move |worker_token| {
-                extract_blocking(request, raw_store, identities, source_id, worker_token)
+                extract_blocking(
+                    request,
+                    raw_store,
+                    identities,
+                    source_id,
+                    worker_authority,
+                    worker_token,
+                )
             });
             tokio::pin!(worker);
             tokio::select! {
-                result = &mut worker => result.map_err(map_client_error),
+                result = &mut worker => {
+                    let batch = result.map_err(map_client_error)?;
+                    self.validate_authority(&authority).map_err(map_client_error)?;
+                    Ok(batch)
+                },
                 () = tokio::time::sleep(remaining) => {
                     worker_cancellation.cancel();
                     Err(ExtractionSourceError::DeadlineExceeded)
@@ -141,8 +168,10 @@ fn extract_blocking(
     raw_store: Arc<RawEvidenceStore>,
     identities: Arc<ProviderIdentityRegistry>,
     source_id: SourceId,
+    authority: ExtractionAuthority,
     cancellation: &CancellationToken,
 ) -> Result<ExtractionBatch, SecClientError> {
+    authority.validate_current()?;
     if cancellation.is_cancelled() {
         return Err(SecClientError::Cancelled);
     }
@@ -151,6 +180,7 @@ fn extract_blocking(
         request.max_bytes(),
         cancellation,
     )?;
+    authority.validate_current()?;
     let received_at = request.object().effective_interval().starts_at();
     let availability = AvailabilityEvidence::LocalFirstObserved {
         observed_at: received_at,
@@ -195,33 +225,40 @@ fn extract_blocking(
             )?
         }
     };
+    authority.validate_current()?;
     let mut records = Vec::new();
     records
         .try_reserve(observations.len())
         .map_err(|_| SecClientError::AllocationFailed)?;
     for observation in observations {
+        authority.validate_current()?;
         if cancellation.is_cancelled() {
             return Err(SecClientError::Cancelled);
         }
-        records.push(canonical_record(&request, observation, cancellation)?);
+        records.push(canonical_record(
+            &request,
+            observation,
+            &authority,
+            cancellation,
+        )?);
     }
-    ExtractionBatch::try_new(&request, records)
-        .map_err(|_| SecClientError::InvalidCompositeRepresentation)
+    authority.validate_current()?;
+    let batch = ExtractionBatch::try_new(&request, records)
+        .map_err(|_| SecClientError::InvalidCompositeRepresentation)?;
+    authority.validate_current()?;
+    Ok(batch)
 }
 
 fn canonical_record(
     request: &ExtractionRequest,
     observation: ResearchObservation,
+    authority: &ExtractionAuthority,
     cancellation: &CancellationToken,
 ) -> Result<ExtractionRecord, SecClientError> {
+    authority.validate_current()?;
     let context = observation_context(&observation)?;
     let time = context.time();
-    let availability = extraction_availability(
-        context.provenance().availability(),
-        time.effective_at(),
-        time.published_at(),
-        time.superseded_at(),
-    )?;
+    let availability = extraction_availability(context.provenance().availability());
     let revision = SourceIdentifier::try_from(time.revision().get().to_string())?;
     let mut writer = CanonicalRecordWriter::new(cancellation);
     if serde_json::to_writer(&mut writer, &observation).is_err() {
@@ -232,41 +269,27 @@ fn canonical_record(
         };
     }
     let payload = writer.into_inner();
+    authority.validate_current()?;
     let digest: [u8; 32] = Sha256::digest(&payload).into();
-    ExtractionRecord::try_new(
+    ExtractionRecord::try_new_with_time(
         request,
-        SourceIdentifier::try_from("market-squawk-research-v1")?,
+        SourceIdentifier::try_from(RESEARCH_RECORD_SCHEMA)?,
         ExactPayloadEvidence::from_content_digest(EvidenceDigest::new(
             DigestAlgorithm::Sha256,
             digest,
         )),
-        time.effective_at(),
-        time.published_at(),
+        time.effective().clone(),
+        time.published().cloned(),
         availability,
         revision,
-        time.superseded_at(),
+        time.superseded().cloned(),
         Bytes::from(payload),
     )
     .map_err(|_| SecClientError::InvalidCompositeRepresentation)
 }
 
-fn extraction_availability(
-    availability: &AvailabilityEvidence,
-    effective_at: market_squawk_domain::Timestamp,
-    published_at: Option<market_squawk_domain::Timestamp>,
-    superseded_at: Option<market_squawk_domain::Timestamp>,
-) -> Result<ExtractionAvailabilityEvidence, SecClientError> {
-    let reported_at = availability.reported_at();
-    if published_at.is_some_and(|published| reported_at.is_some_and(|value| value < published))
-        || superseded_at.is_some_and(|superseded| {
-            superseded <= effective_at
-                || published_at.is_some_and(|published| superseded < published)
-                || reported_at.is_some_and(|available| superseded < available)
-        })
-    {
-        return Err(SecClientError::InvalidCompositeRepresentation);
-    }
-    Ok(match availability {
+fn extraction_availability(availability: &AvailabilityEvidence) -> ExtractionAvailabilityEvidence {
+    match availability {
         AvailabilityEvidence::Evidenced {
             available_at,
             evidence,
@@ -287,7 +310,7 @@ fn extraction_availability(
             method: method.clone(),
         },
         AvailabilityEvidence::Unknown => ExtractionAvailabilityEvidence::Unknown,
-    })
+    }
 }
 
 struct CanonicalRecordWriter<'a> {
@@ -388,11 +411,9 @@ fn map_client_error(error: SecClientError) -> ExtractionSourceError {
     let source = match error {
         SecClientError::Cancelled => return ExtractionSourceError::Cancelled,
         SecClientError::DeadlineExceeded => return ExtractionSourceError::DeadlineExceeded,
+        SecClientError::Authority(error) => return ExtractionSourceError::Authority(error),
         SecClientError::HttpStatus(401 | 403) => SourceError::Unauthorized,
-        SecClientError::RetryLimitExceeded | SecClientError::HttpStatus(429 | 503) => {
-            SourceError::ProviderUnavailable
-        }
-        SecClientError::BudgetUnavailable(reason) => SourceError::BudgetUnavailable { reason },
+        SecClientError::HttpStatus(429 | 503) => SourceError::ProviderUnavailable,
         SecClientError::ClockOutOfRange => SourceError::TrustedTimeUnavailable,
         SecClientError::Parser(SecParserError::Cancelled)
         | SecClientError::Normalization(SecNormalizationError::Cancelled) => {
@@ -401,6 +422,7 @@ fn map_client_error(error: SecClientError) -> ExtractionSourceError {
         SecClientError::Parser(_)
         | SecClientError::Normalization(_)
         | SecClientError::Xbrl(_)
+        | SecClientError::RegistrationMismatch
         | SecClientError::InvalidCompositeRepresentation
         | SecClientError::InvalidCompanionSet => SourceError::InvalidProtocolState,
         _ => SourceError::Network,

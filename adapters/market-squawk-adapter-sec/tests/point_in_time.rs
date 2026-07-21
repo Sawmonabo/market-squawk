@@ -9,7 +9,7 @@ use market_squawk_domain::{
     AvailabilityEvidence, EffectiveInterval, EvidenceDigest, InstrumentId, MetadataRevision,
     PayloadHashAlgorithm, ProviderIdentityEvidence, ProviderIdentityRecord,
     ProviderIdentityRecordInput, ProviderIdentityRegistry, ProviderInstrumentId,
-    ResearchObservation, SourceId, SourceIdentifier, Timestamp,
+    ResearchObservation, ResearchTemporalPrecision, SourceId, SourceIdentifier, Timestamp,
 };
 use uuid::Uuid;
 
@@ -63,6 +63,10 @@ fn company_facts_resolve_cik_and_preserve_amendments_as_pit_revisions() -> Resul
                     fact.context().provenance().availability(),
                     AvailabilityEvidence::Unknown
                 ));
+                assert_eq!(
+                    fact.context().time().effective().precision(),
+                    ResearchTemporalPrecision::CalendarDate
+                );
                 Some(fact.context().time().revision().get())
             }
             _ => None,
@@ -92,6 +96,11 @@ fn company_facts_resolve_cik_and_preserve_amendments_as_pit_revisions() -> Resul
         })
         .ok_or("missing canonical amendment")?;
     assert_eq!(amendment.context().time().revision().get(), 2);
+    assert_eq!(
+        amendment.context().time().effective().precision(),
+        ResearchTemporalPrecision::CalendarDate
+    );
+    assert!(amendment.context().time().superseded().is_none());
     assert!(matches!(
         amendment.context().provenance().availability(),
         AvailabilityEvidence::Unknown

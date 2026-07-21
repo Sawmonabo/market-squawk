@@ -480,8 +480,6 @@ pub enum SecClientError {
     UnsafeBudgetPolicy,
     #[error("SEC source HTTP client profile is unsafe")]
     UnsafeClientProfile,
-    #[error("SEC source authority is inactive")]
-    InactiveAuthority,
     #[error("SEC retrieval was cancelled")]
     Cancelled,
     #[error("SEC response read timed out")]
@@ -492,10 +490,6 @@ pub enum SecClientError {
     AllocationFailed,
     #[error("SEC redirect was invalid")]
     InvalidRedirect,
-    #[error("SEC redirect limit exceeded")]
-    RedirectLimitExceeded,
-    #[error("SEC explicit retry limit exceeded")]
-    RetryLimitExceeded,
     #[error("SEC complete-submissions deadline was exceeded")]
     DeadlineExceeded,
     #[error("SEC complete-submissions bounds are invalid")]
@@ -524,8 +518,8 @@ pub enum SecClientError {
     BlockingAdmissionClosed,
     #[error("SEC bounded blocking worker failed")]
     BlockingWorkerFailed,
-    #[error("SEC request budget unavailable: {0:?}")]
-    BudgetUnavailable(market_squawk_sources::BudgetUnavailableReason),
+    #[error(transparent)]
+    Authority(#[from] market_squawk_sources::ExtractionAuthorityError),
     #[error(transparent)]
     NetworkPolicy(#[from] market_squawk_sources::NetworkPolicyError),
     #[error(transparent)]
@@ -542,12 +536,6 @@ pub enum SecClientError {
     Normalization(crate::SecNormalizationError),
     #[error(transparent)]
     Identity(#[from] market_squawk_domain::IdentityError),
-}
-
-impl From<market_squawk_sources::BudgetUnavailableReason> for SecClientError {
-    fn from(value: market_squawk_sources::BudgetUnavailableReason) -> Self {
-        Self::BudgetUnavailable(value)
-    }
 }
 
 impl From<RawEvidenceError> for SecClientError {

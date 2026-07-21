@@ -2,12 +2,11 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{NaiveDate, TimeZone as _, Utc};
 use market_squawk_domain::{
     DataQuality, FilingObservation, FundamentalObservation, PayloadHash, PayloadReference,
     ProviderIdentityRegistry, ProviderInstrumentId, ResearchContext, ResearchObservation,
-    ResearchProvenance, ResearchProvenanceInput, ResearchTime, RevisionNumber, SourceId,
-    SourceIdentifier, Timestamp,
+    ResearchProvenance, ResearchProvenanceInput, ResearchTemporalCoordinate, ResearchTime,
+    RevisionNumber, SourceId, SourceIdentifier, Timestamp,
 };
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -60,15 +59,6 @@ pub fn normalize_filings_with_cancellation(
             filing.accession().as_str().to_owned(),
         )
     });
-    let mut family_sizes = BTreeMap::<(String, String), u32>::new();
-    for filing in &ordered {
-        check_cancelled(cancellation)?;
-        let family = filing_family(filing);
-        let count = family_sizes.entry(family).or_insert(0);
-        *count = count
-            .checked_add(1)
-            .ok_or(SecNormalizationError::RevisionOverflow)?;
-    }
     let mut family_revisions = BTreeMap::<(String, String), u32>::new();
     let mut observations = Vec::new();
     observations
@@ -87,16 +77,6 @@ pub fn normalize_filings_with_cancellation(
         *revision = revision
             .checked_add(1)
             .ok_or(SecNormalizationError::RevisionOverflow)?;
-        let family_size = family_sizes
-            .get(&family)
-            .copied()
-            .ok_or(SecNormalizationError::NormalizationInvariant)?;
-        let superseded_at = (*revision < family_size
-            && ingested_at > received_at
-            && filing
-                .accepted_at()
-                .is_none_or(|published_at| ingested_at > published_at))
-        .then_some(ingested_at);
         let provenance = ResearchProvenance::try_new(ResearchProvenanceInput {
             source_id: source_id.clone(),
             instrument_id: Some(instrument_id),
@@ -113,11 +93,11 @@ pub fn normalize_filings_with_cancellation(
             availability: retrieved.raw().availability().clone(),
         })?;
         let effective_date = filing.report_date().unwrap_or(filing.filed_on());
-        let time = ResearchTime::new(
-            date_start_utc(effective_date)?,
-            filing.accepted_at(),
+        let time = ResearchTime::try_new_with_coordinates(
+            ResearchTemporalCoordinate::calendar_date(effective_date),
+            filing.accepted_at().map(ResearchTemporalCoordinate::exact),
             RevisionNumber::new(*revision)?,
-            superseded_at,
+            None,
         )?;
         observations.push(ResearchObservation::Filing(FilingObservation::new(
             ResearchContext::new(provenance, time)?,
@@ -240,8 +220,8 @@ pub fn normalize_company_facts_with_cancellation(
             )),
             availability: retrieved.raw().availability().clone(),
         })?;
-        let research_time = ResearchTime::new(
-            date_start_utc(occurrence.period().end())?,
+        let research_time = ResearchTime::try_new_with_coordinates(
+            ResearchTemporalCoordinate::calendar_date(occurrence.period().end()),
             None,
             RevisionNumber::new(*revision)?,
             None,
@@ -266,25 +246,6 @@ fn check_cancelled(cancellation: &CancellationToken) -> Result<(), SecNormalizat
     }
 }
 
-fn date_start_utc(
-    date: market_squawk_domain::CalendarDate,
-) -> Result<Timestamp, SecNormalizationError> {
-    let date = NaiveDate::from_ymd_opt(
-        i32::from(date.year()),
-        u32::from(date.month()),
-        u32::from(date.day()),
-    )
-    .ok_or(SecNormalizationError::DateOutOfRange)?;
-    let instant = date
-        .and_hms_opt(0, 0, 0)
-        .ok_or(SecNormalizationError::DateOutOfRange)?;
-    let nanos = Utc
-        .from_utc_datetime(&instant)
-        .timestamp_nanos_opt()
-        .ok_or(SecNormalizationError::DateOutOfRange)?;
-    Ok(Timestamp::from_unix_nanos(nanos))
-}
-
 /// SEC Company Facts normalization failure.
 #[derive(Debug, Error)]
 pub enum SecNormalizationError {
@@ -296,14 +257,10 @@ pub enum SecNormalizationError {
     IngestedBeforeReceived,
     #[error("Company Facts revision counter overflow")]
     RevisionOverflow,
-    #[error("Company Facts date is outside timestamp range")]
-    DateOutOfRange,
     #[error("SEC canonical normalization bounded allocation failed")]
     AllocationFailed,
     #[error("SEC publication time is later than local ingestion")]
     PublicationAfterIngestion,
-    #[error("SEC canonical normalization invariant failed")]
-    NormalizationInvariant,
     #[error(transparent)]
     Identity(#[from] market_squawk_domain::IdentityError),
     #[error(transparent)]
