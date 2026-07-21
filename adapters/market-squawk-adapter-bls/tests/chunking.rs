@@ -184,7 +184,7 @@ fn documented_identifier_characters_are_accepted_consistently() -> TestResult {
 
 #[test]
 fn registered_key_is_validated_and_debug_redacted() -> TestResult {
-    let secret = "0123456789abcdef0123456789abcdef";
+    let secret = "fake-fake-fake-fake-fake-fake-fake-fake";
     let key = BlsRegistrationKey::try_new(secret.to_owned())?;
     assert!(!format!("{key:?}").contains(secret));
     assert!(BlsRegistrationKey::try_new(String::new()).is_err());
@@ -209,7 +209,7 @@ fn source_dataset_identity_binds_tier_series_and_year_window() -> TestResult {
     )?;
     let registered = BlsSourceConfig::try_new(
         BlsAuthorization::RegisteredV2(BlsRegistrationKey::try_new(
-            "0123456789abcdef0123456789abcdef".to_owned(),
+            "fake-fake-fake-fake-fake-fake-fake-fake".to_owned(),
         )?),
         vec![metadata("LNS14000000", "percent")?],
         2020,
