@@ -31,9 +31,11 @@ work is bound by the single canonical
   `DirectUnverified`, so it remains execution-ineligible.
 - A bounded Kraken WebSocket v2 production-source crate for price-level books and trades, with
   capture-before-decode, official CRC32 book validation, bounded control traffic, cancellation,
-  source metadata, and session lifecycle enforcement. Its current qualification ceiling is
-  intentionally `DirectUnverified` and execution-ineligible until the downstream qualification,
-  risk, and paper-execution vertical is complete.
+  source metadata, exact registry-session/budget binding, one-use connection generations, and
+  fresh-snapshot recovery after quarantine. Its current qualification ceiling is intentionally
+  `DirectUnverified` because Kraken does not supply the venue sequence required by the current
+  execution policy. The canonical risk-to-paper terminal test proves `SourceQuality` rejection
+  before any paper cash, availability, position, or account-risk state can change.
 - Level 2 price-level snapshots and updates, heartbeat tracking separated from market freshness,
   match/trade capture, fixed-point prices and quantities, and in-memory order books.
 - MSJ1 append-only journal writing, CRC32 validation, a single-writer OS lock, bounded legacy read
@@ -77,7 +79,7 @@ terminal consumer, focused verification, immutable evidence, and exact commit ex
 | State | Mandatory capability | Current blocker | Closing task |
 | --- | --- | --- | --- |
 | `Missing` | Coinbase direct-source qualification | The bounded source-to-live-to-risk-to-dispatch-to-paper ownership path is runnable, but Coinbase remains capped at `DirectUnverified`; it cannot satisfy the `DirectVerified` execution gate, and the CLI adds a no-intent strategy | Task 2 |
-| `Missing` | Kraken direct-source qualification | Production transport, decoder, checksum, metadata, and session lifecycle exist; the authority-qualified live ingress, risk decision, and live-to-paper terminal path do not | Task 6 |
+| `Missing` | Kraken direct-source qualification | The production transport, decoder, checksum, exact-generation session lifecycle, fresh-snapshot recovery, and canonical risk/no-paper-mutation terminal proof exist; Kraken WebSocket v2 supplies no venue sequence satisfying the current `DirectVerified` execution predicate | Task 20 |
 | `Missing` | CSV/TSV | No bounded production extraction adapter | Task 7 |
 | `Missing` | JSON/NDJSON | No bounded production extraction adapter | Task 7 |
 | `Missing` | XML | No entity-safe production extraction adapter | Task 7 |
