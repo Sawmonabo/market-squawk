@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 
 use market_squawk_domain::{SourceIdentifier, Timestamp};
 use rust_decimal::Decimal;
-use serde::de::{IgnoredAny, SeqAccess, Visitor};
+use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use std::fmt;
 use std::marker::PhantomData;
@@ -13,7 +13,7 @@ use crate::{ExtractionLimits, FileAdapterError};
 
 const MANIFEST_SCHEMA_VERSION: u16 = 1;
 const MAX_MANIFEST_OBJECTS: usize = 4_096;
-const MAX_MAPPINGS: usize = 1_024;
+pub(super) const MAX_MAPPINGS: usize = 1_024;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -90,8 +90,7 @@ impl FileObjectSpec {
     }
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
+#[derive(Debug)]
 pub(crate) enum FileFormat {
     Csv {
         delimiter: u8,
@@ -119,6 +118,275 @@ pub(crate) enum FileFormat {
         account_id: String,
         currency: String,
     },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum FileFormatKind {
+    Csv,
+    Tsv,
+    Json,
+    Ndjson,
+    Xml,
+    Excel,
+    Parquet,
+    Sqlite,
+    Ofx,
+    Qfx,
+}
+
+#[derive(Clone, Copy)]
+enum FileFormatField {
+    Kind,
+    Delimiter,
+    RecordElement,
+    FormulaPolicy,
+    Table,
+    Columns,
+    OrderBy,
+    AccountId,
+    Currency,
+}
+
+#[derive(Default)]
+struct FileFormatWire {
+    kind: Option<FileFormatKind>,
+    delimiter: Option<u8>,
+    record_element: Option<String>,
+    formula_policy: Option<FormulaPolicy>,
+    table: Option<String>,
+    columns: Option<Vec<String>>,
+    order_by: Option<Vec<String>>,
+    account_id: Option<String>,
+    currency: Option<String>,
+}
+
+struct FileFormatVisitor;
+struct FileFormatFieldVisitor;
+struct FormatStrings(Vec<String>);
+
+const FILE_FORMAT_FIELDS: &[&str] = &[
+    "kind",
+    "delimiter",
+    "record_element",
+    "formula_policy",
+    "table",
+    "columns",
+    "order_by",
+    "account_id",
+    "currency",
+];
+
+impl FileFormatKind {
+    const fn allows(self, field: FileFormatField) -> bool {
+        matches!(
+            (self, field),
+            (Self::Csv, FileFormatField::Delimiter)
+                | (Self::Xml, FileFormatField::RecordElement)
+                | (Self::Excel, FileFormatField::FormulaPolicy)
+                | (Self::Sqlite, FileFormatField::Table)
+                | (Self::Sqlite, FileFormatField::Columns)
+                | (Self::Sqlite, FileFormatField::OrderBy)
+                | (Self::Ofx | Self::Qfx, FileFormatField::AccountId)
+                | (Self::Ofx | Self::Qfx, FileFormatField::Currency)
+        )
+    }
+}
+
+impl FileFormatWire {
+    fn finish<E>(self) -> Result<FileFormat, E>
+    where
+        E: serde::de::Error,
+    {
+        let kind = self.kind.ok_or_else(|| E::missing_field("kind"))?;
+        for (present, field) in [
+            (self.delimiter.is_some(), FileFormatField::Delimiter),
+            (
+                self.record_element.is_some(),
+                FileFormatField::RecordElement,
+            ),
+            (
+                self.formula_policy.is_some(),
+                FileFormatField::FormulaPolicy,
+            ),
+            (self.table.is_some(), FileFormatField::Table),
+            (self.columns.is_some(), FileFormatField::Columns),
+            (self.order_by.is_some(), FileFormatField::OrderBy),
+            (self.account_id.is_some(), FileFormatField::AccountId),
+            (self.currency.is_some(), FileFormatField::Currency),
+        ] {
+            if present && !kind.allows(field) {
+                return Err(E::custom("file format field does not match its kind"));
+            }
+        }
+        match kind {
+            FileFormatKind::Csv => Ok(FileFormat::Csv {
+                delimiter: self
+                    .delimiter
+                    .ok_or_else(|| E::missing_field("delimiter"))?,
+            }),
+            FileFormatKind::Tsv => Ok(FileFormat::Tsv {}),
+            FileFormatKind::Json => Ok(FileFormat::Json {}),
+            FileFormatKind::Ndjson => Ok(FileFormat::Ndjson {}),
+            FileFormatKind::Xml => Ok(FileFormat::Xml {
+                record_element: self
+                    .record_element
+                    .ok_or_else(|| E::missing_field("record_element"))?,
+            }),
+            FileFormatKind::Excel => Ok(FileFormat::Excel {
+                formula_policy: self
+                    .formula_policy
+                    .ok_or_else(|| E::missing_field("formula_policy"))?,
+            }),
+            FileFormatKind::Parquet => Ok(FileFormat::Parquet {}),
+            FileFormatKind::Sqlite => Ok(FileFormat::Sqlite {
+                table: self.table.ok_or_else(|| E::missing_field("table"))?,
+                columns: self.columns.ok_or_else(|| E::missing_field("columns"))?,
+                order_by: self.order_by.ok_or_else(|| E::missing_field("order_by"))?,
+            }),
+            FileFormatKind::Ofx => Ok(FileFormat::Ofx {
+                account_id: self
+                    .account_id
+                    .ok_or_else(|| E::missing_field("account_id"))?,
+                currency: self.currency.ok_or_else(|| E::missing_field("currency"))?,
+            }),
+            FileFormatKind::Qfx => Ok(FileFormat::Qfx {
+                account_id: self
+                    .account_id
+                    .ok_or_else(|| E::missing_field("account_id"))?,
+                currency: self.currency.ok_or_else(|| E::missing_field("currency"))?,
+            }),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for FileFormat {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(FileFormatVisitor)
+    }
+}
+
+impl<'de> Visitor<'de> for FileFormatVisitor {
+    type Value = FileFormat;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a closed file format object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut wire = FileFormatWire::default();
+        while let Some(field) = map.next_key::<FileFormatField>()? {
+            match field {
+                FileFormatField::Kind => {
+                    if wire.kind.is_some() {
+                        return Err(serde::de::Error::duplicate_field("kind"));
+                    }
+                    wire.kind = Some(map.next_value()?);
+                }
+                FileFormatField::Delimiter => {
+                    if wire.delimiter.is_some() {
+                        return Err(serde::de::Error::duplicate_field("delimiter"));
+                    }
+                    wire.delimiter = Some(map.next_value()?);
+                }
+                FileFormatField::RecordElement => {
+                    if wire.record_element.is_some() {
+                        return Err(serde::de::Error::duplicate_field("record_element"));
+                    }
+                    wire.record_element = Some(map.next_value()?);
+                }
+                FileFormatField::FormulaPolicy => {
+                    if wire.formula_policy.is_some() {
+                        return Err(serde::de::Error::duplicate_field("formula_policy"));
+                    }
+                    wire.formula_policy = Some(map.next_value()?);
+                }
+                FileFormatField::Table => {
+                    if wire.table.is_some() {
+                        return Err(serde::de::Error::duplicate_field("table"));
+                    }
+                    wire.table = Some(map.next_value()?);
+                }
+                FileFormatField::Columns => {
+                    if wire.columns.is_some() {
+                        return Err(serde::de::Error::duplicate_field("columns"));
+                    }
+                    wire.columns = Some(map.next_value::<FormatStrings>()?.0);
+                }
+                FileFormatField::OrderBy => {
+                    if wire.order_by.is_some() {
+                        return Err(serde::de::Error::duplicate_field("order_by"));
+                    }
+                    wire.order_by = Some(map.next_value::<FormatStrings>()?.0);
+                }
+                FileFormatField::AccountId => {
+                    if wire.account_id.is_some() {
+                        return Err(serde::de::Error::duplicate_field("account_id"));
+                    }
+                    wire.account_id = Some(map.next_value()?);
+                }
+                FileFormatField::Currency => {
+                    if wire.currency.is_some() {
+                        return Err(serde::de::Error::duplicate_field("currency"));
+                    }
+                    wire.currency = Some(map.next_value()?);
+                }
+            }
+        }
+        wire.finish()
+    }
+}
+
+impl<'de> Deserialize<'de> for FileFormatField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_identifier(FileFormatFieldVisitor)
+    }
+}
+
+impl<'de> Visitor<'de> for FileFormatFieldVisitor {
+    type Value = FileFormatField;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a known file format field")
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        match value {
+            "kind" => Ok(FileFormatField::Kind),
+            "delimiter" => Ok(FileFormatField::Delimiter),
+            "record_element" => Ok(FileFormatField::RecordElement),
+            "formula_policy" => Ok(FileFormatField::FormulaPolicy),
+            "table" => Ok(FileFormatField::Table),
+            "columns" => Ok(FileFormatField::Columns),
+            "order_by" => Ok(FileFormatField::OrderBy),
+            "account_id" => Ok(FileFormatField::AccountId),
+            "currency" => Ok(FileFormatField::Currency),
+            _ => Err(E::unknown_field(value, FILE_FORMAT_FIELDS)),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for FormatStrings {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer
+            .deserialize_seq(FallibleVecVisitor::<String, MAX_MAPPINGS>(PhantomData))
+            .map(Self)
+    }
 }
 
 impl FileFormat {
