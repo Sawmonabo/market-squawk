@@ -7,10 +7,19 @@ version.workspace = true
 license.workspace = true
 repository = "https://github.com/Sawmonabo/market-squawk"
 publish = false
+autotests = false
 
 [dependencies]
 market-squawk-domain = { workspace = true }
 thiserror.workspace = true
+
+[[test]]
+name = "market_features"
+path = "tests/market_features.rs"
+
+[[test]]
+name = "feature_contracts"
+path = "tests/feature_contracts.rs"
 
 [lints]
 workspace = true

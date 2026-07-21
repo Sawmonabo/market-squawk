@@ -7,6 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 repository = "https://github.com/Sawmonabo/market-squawk"
 publish = false
+autotests = false
 
 [dependencies]
 market-squawk-analytics.workspace = true
@@ -23,6 +24,15 @@ tokio-util.workspace = true
 proptest.workspace = true
 static_assertions.workspace = true
 trybuild.workspace = true
+
+[[test]]
+name = "orders_risk"
+path = "tests/orders_risk.rs"
+
+[[test]]
+name = "ui"
+path = "tests/ui.rs"
+test = false
 
 [lints]
 workspace = true

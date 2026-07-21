@@ -7,6 +7,7 @@ version.workspace = true
 license.workspace = true
 repository = "https://github.com/Sawmonabo/market-squawk"
 publish = false
+autotests = false
 
 [dependencies]
 bytes.workspace = true
@@ -30,6 +31,14 @@ uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[[test]]
+name = "filings"
+path = "tests/filings.rs"
+
+[[test]]
+name = "xbrl_point_in_time"
+path = "tests/xbrl_point_in_time.rs"
 
 [lints]
 workspace = true

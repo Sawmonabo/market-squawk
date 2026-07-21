@@ -1,5 +1,3 @@
-mod common;
-
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 
 use market_squawk_sources::{
@@ -8,7 +6,7 @@ use market_squawk_sources::{
     QuerySensitivity, RetryAfter, install_ring_tls_provider,
 };
 
-use common::{TestResult, source_identifier};
+use crate::common::{TestResult, source_identifier};
 
 #[test]
 fn rustls_provider_installation_is_explicit_and_project_idempotent() -> TestResult {

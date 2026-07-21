@@ -1,5 +1,3 @@
-mod common;
-
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -23,7 +21,9 @@ use market_squawk_sources::{
     SessionId, SourceHealthSnapshot, TransportFrameKind, ValidatedSessionDecodeOutcome,
 };
 
-use common::{TestResult, direct_metadata, exact_evidence, now_timestamp, source_identifier};
+use crate::common::{
+    TestResult, direct_metadata, exact_evidence, now_timestamp, source_identifier,
+};
 
 const TEST_MEMORY_SINK_MAX_RECORDS: usize = 4_096;
 const TEST_MEMORY_SINK_RETAINED_CEILING_BYTES: usize = 64 * 1024 * 1024;

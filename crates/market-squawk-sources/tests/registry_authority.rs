@@ -1,5 +1,3 @@
-mod common;
-
 use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::sync::Arc;
@@ -22,7 +20,7 @@ use market_squawk_sources::{
 };
 use static_assertions::{assert_impl_all, assert_not_impl_any};
 
-use common::{
+use crate::common::{
     TestResult, direct_metadata, direct_metadata_with_instruments, exact_evidence,
     next_timestamp_after, now_timestamp, source_identifier,
 };
