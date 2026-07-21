@@ -46,8 +46,13 @@ work is bound by the single canonical
   authority history, backup/restore recovery, and tamper-evident catalog state.
 - Versioned Arrow analytical interchange plus authority-bound immutable Parquet publication,
   manifests, lineage, compaction, recovery, and bounded read-only DataFusion queries with
-  point-in-time availability filtering. Production extraction adapters and the complete
+  point-in-time availability filtering. Other required extraction adapters and the complete
   point-in-time dataset builder remain release-blocking below.
+- A production local-file extraction vertical for CSV/TSV, JSON/NDJSON, entity-safe XML,
+  formula- and external-link-constrained Excel, allowlisted read-only SQLite exports, OFX/QFX, and
+  Parquet. User-authorized capability roots, bounded parsing and decompression, revocable source
+  authority, precision-preserving research time, immutable representation evidence, and the
+  analytical ingestion service are composed end to end.
 - Authority-free midpoint, spread, spread-basis-point, microprice, imbalance, feed-quality,
   pre-trade calculation, and paper-only momentum diagnostics.
 - Immutable typed order intents plus fixed-capacity, nonblocking account risk coordination with
@@ -86,13 +91,6 @@ terminal consumer, focused verification, immutable evidence, and exact commit ex
 | --- | --- | --- | --- |
 | `Missing` | Coinbase direct-source qualification | The bounded source-to-live-to-risk-to-dispatch-to-paper ownership path is runnable, but Coinbase remains capped at `DirectUnverified`; it cannot satisfy the `DirectVerified` execution gate, and the CLI adds a no-intent strategy | Task 2 |
 | `Missing` | Kraken direct-source qualification | The production transport, decoder, checksum, exact-generation session lifecycle, fresh-snapshot recovery, and canonical risk/no-paper-mutation terminal proof exist; Kraken WebSocket v2 supplies no venue sequence satisfying the current `DirectVerified` execution predicate | Task 20 |
-| `Missing` | CSV/TSV | No bounded production extraction adapter | Task 7 |
-| `Missing` | JSON/NDJSON | No bounded production extraction adapter | Task 7 |
-| `Missing` | XML | No entity-safe production extraction adapter | Task 7 |
-| `Missing` | Excel | No macro/formula-safe production extraction adapter | Task 7 |
-| `Missing` | SQLite/database export | No allowlisted read-only production extraction adapter | Task 7 |
-| `Missing` | OFX/QFX | No raw-preserving production extraction adapter | Task 7 |
-| `Missing` | Parquet import | No schema- and provenance-validating import adapter | Task 7 |
 | `Missing` | SEC filings/XBRL/Company Facts | No lawful, revision-preserving SEC vertical | Task 8 |
 | `Missing` | FRED/ALFRED | No vintage-aware production macro adapter | Task 9 |
 | `Missing` | BLS | No quota-honest production macro adapter | Task 9 |
