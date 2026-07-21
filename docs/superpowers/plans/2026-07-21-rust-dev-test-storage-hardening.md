@@ -112,8 +112,8 @@ Verification:
 1. Run the exact required format, all-target/all-feature Clippy, workspace test, and locked release
    build from an unchanged candidate head, plus the existing specialized security and behavior
    gates.
-2. Obtain one broad whole-branch review and remediate all Critical or Important findings in one
-   grouped fix wave.
+2. Obtain one broad whole-branch review and, in one grouped fix wave, fix every substantiated
+   Critical, Important, and Minor finding or obtain its retraction with specific contrary evidence.
 3. Push and merge the accepted branch into `release/market-squawk-v0.1.0`, then update draft PR #26
    and the owning hardening issue with exact evidence.
 4. Merge the updated release into `feature/research-analytics` only after that lane reaches a clean

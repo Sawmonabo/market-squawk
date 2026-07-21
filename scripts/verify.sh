@@ -53,12 +53,12 @@ reject_ambient_capture_benchmark_variables() {
   done < <(compgen -e)
 }
 
+tmp_dir=""
+trap finalize_verification EXIT
 reject_cargo_directory_overrides
 reject_ambient_capture_benchmark_variables
 export CARGO_INCREMENTAL=0
 enforce_target_ceiling pre-verification
-tmp_dir=""
-trap finalize_verification EXIT
 
 python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 python3 scripts/check_workspace_boundaries.py
