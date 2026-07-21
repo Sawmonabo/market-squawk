@@ -671,3 +671,25 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use std::error::Error;
+
+    use market_squawk_platform::LocalPaths;
+
+    use super::{DurableAuditSink, LocalAuditError};
+
+    #[test]
+    fn audit_open_reports_unavailable_private_permission_proof() -> Result<(), Box<dyn Error>> {
+        let temporary = tempfile::tempdir()?;
+        let paths = LocalPaths::prepare(temporary.path())?;
+        let control = paths.control_root()?;
+
+        assert!(matches!(
+            DurableAuditSink::try_new(control.try_clone_directory()?),
+            Err(LocalAuditError::PermissionProofUnavailable)
+        ));
+        Ok(())
+    }
+}
