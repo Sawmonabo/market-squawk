@@ -15,8 +15,9 @@ use market_squawk_sources::{
     ProviderBudgetPolicy, RawMarketFrame, RawMarketSink, SessionId, SinkError, SourceError,
     SourceMetadataProvider,
 };
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
+use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 
@@ -52,23 +53,23 @@ impl RawMarketSink for RecordingSink {
     }
 }
 
+const BOOK_ACK: &str = r#"{"method":"subscribe","result":{"channel":"book","depth":10,"snapshot":true,"symbol":"BTC/USD","warnings":["advisory"]},"success":true,"time_in":"2023-10-04T07:48:25Z","time_out":"2023-10-04T07:48:25Z"}"#;
+const UPDATE_BEFORE_SNAPSHOT: &str = r#"{"channel":"book","type":"update","data":[{"symbol":"BTC/USD","bids":[{"price":"45283.5","qty":"0"}],"asks":[],"checksum":1,"timestamp":"2023-10-04T07:48:26Z"}]}"#;
+
 #[tokio::test]
-async fn source_captures_and_decodes_then_quarantines_on_metadata_idle() -> TestResult {
+async fn successor_generation_requires_a_fresh_snapshot_before_health() -> TestResult {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let (release_tx, release_rx) = oneshot::channel();
     let server = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await?;
-        let mut socket = tokio_tungstenite::accept_async(stream).await?;
-        let Some(Ok(Message::Text(subscription))) =
-            tokio::time::timeout(Duration::from_secs(1), socket.next()).await?
-        else {
-            return Err("source did not send a text subscription".into());
-        };
-        let request: serde_json::Value = serde_json::from_str(&subscription)?;
-        if request["method"] != "subscribe" || request["params"]["channel"] != "book" {
-            return Err("source sent the wrong subscription".into());
-        }
+        let mut first = accept_book_source(&listener).await?;
+        first.send(Message::Text(BOOK_ACK.into())).await?;
+        first
+            .send(Message::Text(UPDATE_BEFORE_SNAPSHOT.into()))
+            .await?;
+        drop(first);
+
+        let mut socket = accept_book_source(&listener).await?;
         socket
             .send(Message::Ping(b"health".as_slice().into()))
             .await?;
@@ -80,12 +81,7 @@ async fn source_captures_and_decodes_then_quarantines_on_metadata_idle() -> Test
         if payload.as_ref() != b"health" {
             return Err("source changed the protocol pong payload".into());
         }
-        socket
-            .send(Message::Text(
-                r#"{"method":"subscribe","result":{"channel":"book","depth":10,"snapshot":true,"symbol":"BTC/USD","warnings":["advisory"]},"success":true,"time_in":"2023-10-04T07:48:25Z","time_out":"2023-10-04T07:48:25Z"}"#
-                    .into(),
-            ))
-            .await?;
+        socket.send(Message::Text(BOOK_ACK.into())).await?;
         socket
             .send(Message::Text(
                 include_str!("../fixtures/official_book_checksum.json").into(),
@@ -98,19 +94,68 @@ async fn source_captures_and_decodes_then_quarantines_on_metadata_idle() -> Test
 
     let (config, mut registry, registered) =
         test_source("kraken-public-book-v2", "kraken-policy-v1")?;
-    let session = registry.begin_session(
+    let first_session = registry.begin_session(
         &registered,
-        SessionId::new(SourceIdentifier::try_from("kraken-session-test")?),
+        SessionId::new(SourceIdentifier::try_from("kraken-session-quarantined")?),
         ConnectionGeneration::new(1)?,
         Timestamp::from_unix_nanos(1),
     )?;
-    let mut frames = registry.take_raw_frame_factory(&session)?;
+    let mut first_frames = registry.take_raw_frame_factory(&first_session)?;
+    let (mut first_socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}")).await?;
+    let mut first_source = KrakenSource::try_new(config.clone(), &first_session)?;
+    let mut first_sink = RecordingSink::default();
+
+    let first_result = first_source
+        .run_established(
+            &mut first_socket,
+            &mut first_frames,
+            &mut first_sink,
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(first_result, Err(SourceError::InvalidProtocolState));
+    assert_eq!(
+        first_source.health().state(),
+        KrakenDecoderState::Quarantined
+    );
+    assert_eq!(first_source.health().captured_frames(), 2);
+    assert_eq!(first_source.health().market_messages(), 0);
+    let mut first_bridge = KrakenMarketDecoder::try_new(
+        first_source.metadata().clone(),
+        "BTC/USD",
+        InstrumentId::from_str("4c74ab95-53b9-42ad-9b66-0ed403b88fed")?,
+        KrakenDepth::Ten,
+    )?;
+    assert!(matches!(
+        first_bridge.decode(&first_session.validate_live_frame(&first_sink.frames[0])?)?,
+        DecodeOutcome::Control(_)
+    ));
+    assert!(matches!(
+        first_bridge.decode(&first_session.validate_live_frame(&first_sink.frames[1])?)?,
+        DecodeOutcome::Resynchronize(_)
+    ));
+    assert_eq!(first_bridge.state(), KrakenDecoderState::Quarantined);
+    registry.end_session(&first_session, Timestamp::from_unix_nanos(2))?;
+    assert!(
+        first_session
+            .validate_live_frame(&first_sink.frames[0])
+            .is_err()
+    );
+
+    let successor_session = registry.begin_session(
+        &registered,
+        SessionId::new(SourceIdentifier::try_from("kraken-session-successor")?),
+        ConnectionGeneration::new(2)?,
+        Timestamp::from_unix_nanos(3),
+    )?;
+    let mut frames = registry.take_raw_frame_factory(&successor_session)?;
     let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}")).await?;
-    let budget = session
+    let budget = successor_session
         .budget()
         .cloned()
         .ok_or("source session has no coordinated budget")?;
-    let mut source = KrakenSource::try_new(config, &session)?;
+    let mut source = KrakenSource::try_new(config, &successor_session)?;
     let mut sink = RecordingSink::default();
 
     let result = source
@@ -130,7 +175,7 @@ async fn source_captures_and_decodes_then_quarantines_on_metadata_idle() -> Test
     assert!(source.health().book_subscribed());
     assert!(source.health().last_market_timestamp().is_some());
     assert_eq!(sink.frames.len(), 2);
-    let validated_ack = session.validate_live_frame(&sink.frames[0])?;
+    let validated_ack = successor_session.validate_live_frame(&sink.frames[0])?;
     let mut bridge = KrakenMarketDecoder::try_new(
         source.metadata().clone(),
         "BTC/USD",
@@ -141,11 +186,14 @@ async fn source_captures_and_decodes_then_quarantines_on_metadata_idle() -> Test
         bridge.decode(&validated_ack)?,
         DecodeOutcome::Control(_)
     ));
-    let validated_snapshot = session.validate_live_frame(&sink.frames[1])?;
+    assert_eq!(bridge.state(), KrakenDecoderState::AwaitingSnapshot);
+    let validated_snapshot = successor_session.validate_live_frame(&sink.frames[1])?;
     assert!(matches!(
         bridge.decode(&validated_snapshot)?,
         DecodeOutcome::Data(_)
     ));
+    assert_eq!(bridge.state(), KrakenDecoderState::Healthy);
+    assert!(first_session.validate_live_frame(&sink.frames[1]).is_err());
 
     let refusal = tokio_tungstenite::tungstenite::Error::Http(
         tokio_tungstenite::tungstenite::http::Response::builder()
@@ -168,6 +216,21 @@ async fn source_captures_and_decodes_then_quarantines_on_metadata_idle() -> Test
     let _release_result = release_tx.send(());
     server.await??;
     Ok(())
+}
+
+async fn accept_book_source(listener: &TcpListener) -> TestResult<WebSocketStream<TcpStream>> {
+    let (stream, _) = listener.accept().await?;
+    let mut socket = tokio_tungstenite::accept_async(stream).await?;
+    let Some(Ok(Message::Text(subscription))) =
+        tokio::time::timeout(Duration::from_secs(1), socket.next()).await?
+    else {
+        return Err("source did not send a text subscription".into());
+    };
+    let request: serde_json::Value = serde_json::from_str(&subscription)?;
+    if request["method"] != "subscribe" || request["params"]["channel"] != "book" {
+        return Err("source sent the wrong subscription".into());
+    }
+    Ok(socket)
 }
 
 #[test]

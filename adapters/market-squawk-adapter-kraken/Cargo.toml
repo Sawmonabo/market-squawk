@@ -23,5 +23,9 @@ tokio-tungstenite.workspace = true
 tokio-util.workspace = true
 url.workspace = true
 
+[dev-dependencies]
+market-squawk-adapter-paper.workspace = true
+market-squawk-execution.workspace = true
+
 [lints]
 workspace = true

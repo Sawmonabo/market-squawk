@@ -3,18 +3,34 @@ use market_squawk_adapter_kraken::{
     KRAKEN_QUALIFICATION_POLICY_VERSION, KrakenConfig, KrakenDecodeOutcome, KrakenDecoder,
     KrakenDecoderState, KrakenDepth, KrakenMetadataInput, KrakenQualificationPolicy,
 };
+use market_squawk_adapter_paper::{
+    FeeSchedule, PaperAccountBootstrap, PaperExposureValuation, PaperLedger, PaperLedgerConfig,
+};
 use market_squawk_domain::{
-    AuthorizationBasis, DataQuality, DigestAlgorithm, EffectiveInterval, EvidenceDigest,
-    ExactPayloadEvidence, ExecutionEligibility, InstrumentId, MetadataRevision,
-    RevisionBoundPayloadEvidence, SourceId, SourceIdentifier, Timestamp,
+    AccountId, AuthorizationBasis, BasisPoints, ClientOrderId, Currency, DataQuality, Denomination,
+    DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence, ExecutionEligibility,
+    InstrumentDefinitionRevision, InstrumentExecutionTerms, InstrumentId, LotSize,
+    MetadataRevision, Money, OrderId, OrderReasonCode, OrderSide, OrderType, PriceTicks,
+    QuantityLots, RevisionBoundPayloadEvidence, RuleVersion, SourceId, SourceIdentifier,
+    StrategyId, TickSize, TimeInForce, Timestamp,
+};
+use market_squawk_execution::{
+    AccountBootstrap, AccountCoordinatorConfig, AccountIdempotencyBootstrap,
+    AccountRiskCoordinator, ExecutionAuditConfig, ExecutionAuditWriter, MarketRiskInput,
+    OrderIntent, OrderIntentInput, PreAuthorityRiskOutcome, RiskLimits, RiskLimitsInput,
+    RiskPolicyIdentity, RiskRejectionCode, RiskService, RiskServiceConfig,
 };
 use market_squawk_sources::{
     AuthorizationGrant, AuthorizationMode, BackoffPolicy, BudgetScope, ChecksumValidationProfile,
     FreshnessPolicy, ProviderBudgetPolicy, ProviderChecksumEvidence, SourceProtocolProfile,
 };
+use rust_decimal::Decimal;
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::str::FromStr;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[test]
 fn no_book_sequence_means_no_automated_action() {
@@ -85,6 +101,171 @@ fn metadata_binds_the_reviewed_ceiling_and_contains_no_fabricated_sequence()
     ));
     assert_eq!(decoder.state(), KrakenDecoderState::Healthy);
     Ok(())
+}
+
+#[test]
+fn kraken_quality_is_rejected_before_paper_state_mutation() -> Result<(), Box<dyn Error>> {
+    let metadata = metadata_input(false)?.try_build()?;
+    let instrument = InstrumentId::from_str("4c74ab95-53b9-42ad-9b66-0ed403b88fed")?;
+    let account = AccountId::from_str("50000000-0000-0000-0000-000000000006")?;
+    let usd = Currency::try_from("USD")?;
+    let terms = InstrumentExecutionTerms::try_new(
+        instrument,
+        InstrumentDefinitionRevision::try_from(1)?,
+        TickSize::try_from_decimal(Decimal::new(1, 2))?,
+        LotSize::try_from_decimal(Decimal::new(1, 8))?,
+        usd,
+        Denomination::Currency(usd),
+        Decimal::ONE,
+    )?;
+    let capital = Money::new(Decimal::new(1_000_000, 0), usd);
+    let zero = Money::new(Decimal::ZERO, usd);
+    let bootstrap = PaperAccountBootstrap {
+        account_id: account,
+        revision: NonZeroU64::MIN,
+        eligible: true,
+        cash: vec![capital],
+        capital,
+        peak_capital: capital,
+        gross_exposure: zero,
+        realized_pnl: zero,
+        realized_loss: zero,
+        positions: vec![(instrument, 0)],
+        position_cost_basis: vec![(instrument, zero)],
+    };
+    let mut paper = PaperLedger::try_new(
+        PaperLedgerConfig {
+            allow_short: false,
+            exposure_valuation: PaperExposureValuation::OpenCost,
+            maximum_accounts: 1,
+            maximum_balances: 1,
+            maximum_positions: 1,
+            maximum_reservations: 1,
+            fee_schedule: FeeSchedule::try_new(0, 0, zero, None, 2)?,
+        },
+        [bootstrap],
+    )?;
+    let settled_before = paper.cash(account, usd)?;
+    let available_before = paper.available_cash(account, usd)?;
+    let position_before = paper.position_lots(account, instrument)?;
+    let risk_before = paper.account_risk(account)?;
+
+    let coordinator = Arc::new(AccountRiskCoordinator::try_new(
+        AccountCoordinatorConfig::default(),
+        [AccountBootstrap {
+            account_id: account,
+            revision: NonZeroU64::MIN,
+            eligible: true,
+            cash: capital,
+            capital,
+            peak_capital: capital,
+            gross_exposure: zero,
+            realized_pnl: zero,
+            realized_loss: zero,
+            positions: vec![(instrument, 0)],
+            position_cost_basis: vec![(instrument, zero)],
+            idempotency: AccountIdempotencyBootstrap::empty(),
+        }],
+    )?);
+    let limits = RiskLimits::try_new(RiskLimitsInput {
+        currency: usd,
+        eligible_instruments: BTreeSet::from([instrument]),
+        maximum_position_lots: 1_000,
+        maximum_order_notional: capital,
+        maximum_gross_exposure: capital,
+        maximum_leverage: BasisPoints::new(100_000),
+        minimum_capital: Money::new(Decimal::ONE, usd),
+        maximum_loss: capital,
+        maximum_drawdown: capital,
+        maximum_fee: BasisPoints::new(100),
+        maximum_price_deviation: BasisPoints::new(1_000),
+        maximum_slippage: BasisPoints::new(1_000),
+        maximum_orders_per_window: NonZeroU32::MIN,
+        order_rate_window_nanos: 60_000_000_000,
+        reservation_ttl_nanos: 5_000_000_000,
+        allow_short: false,
+        kill_switch: false,
+    })?;
+    let (audit, _audit_reader) = ExecutionAuditWriter::try_new(ExecutionAuditConfig {
+        maximum_records: NonZeroUsize::new(4).ok_or("zero audit record bound")?,
+        maximum_bytes: NonZeroU32::new(64 * 1024).ok_or("zero audit byte bound")?,
+    })?;
+    let risk = RiskService::try_new(
+        coordinator,
+        limits,
+        audit,
+        RiskServiceConfig {
+            policy: RiskPolicyIdentity::new(
+                &SourceIdentifier::try_from("risk/kraken-v1")?,
+                RuleVersion::new(1)?,
+            ),
+            policy_valid_until: Timestamp::from_unix_nanos(i64::MAX),
+            maximum_approval_lifetime: Duration::from_secs(1),
+        },
+    )?;
+    let observed_at = current_timestamp()?;
+    let expires_at = observed_at.checked_add_nanos(30_000_000_000)?;
+    let intent = OrderIntent::try_new(OrderIntentInput {
+        order_id: OrderId::from_str("20000000-0000-0000-0000-000000000006")?,
+        client_order_id: ClientOrderId::try_from("kraken-risk-ceiling")?,
+        strategy_id: StrategyId::from_str("30000000-0000-0000-0000-000000000006")?,
+        model_id: None,
+        account_id: account,
+        execution_terms: terms,
+        side: OrderSide::Buy,
+        order_type: OrderType::Market,
+        quantity: QuantityLots::new(1)?,
+        limit_price: None,
+        stop_price: None,
+        time_in_force: TimeInForce::ImmediateOrCancel,
+        signal_at: observed_at,
+        expires_at,
+        reason_codes: vec![OrderReasonCode::try_from("kraken.quality-ceiling")?],
+        maximum_slippage: BasisPoints::new(100),
+        required_quality: DataQuality::DirectVerified,
+    })?;
+    let market = MarketRiskInput::try_new(
+        terms,
+        metadata.quality_ceiling(),
+        true,
+        true,
+        observed_at,
+        expires_at,
+        PriceTicks::new(10_000),
+        PriceTicks::new(10_000),
+    )?;
+
+    let rejection = match risk.evaluate_pre_authority(&intent, &market) {
+        PreAuthorityRiskOutcome::Rejected(rejection) => Some(rejection),
+        PreAuthorityRiskOutcome::Reserved(_reservation) => {
+            paper.reserve(
+                intent.order_id(),
+                intent.account_id(),
+                intent.execution_terms(),
+                intent.side(),
+                intent.quantity(),
+                market.estimated_execution_price(),
+            )?;
+            None
+        }
+    };
+
+    assert_eq!(paper.cash(account, usd)?, settled_before);
+    assert_eq!(paper.available_cash(account, usd)?, available_before);
+    assert_eq!(paper.position_lots(account, instrument)?, position_before);
+    assert_eq!(paper.account_risk(account)?, risk_before);
+    let rejection = rejection.ok_or("Kraken quality unexpectedly passed canonical risk")?;
+    assert_eq!(rejection.reasons(), &[RiskRejectionCode::SourceQuality]);
+    Ok(())
+}
+
+fn current_timestamp() -> Result<Timestamp, Box<dyn Error>> {
+    let elapsed = SystemTime::now().duration_since(UNIX_EPOCH)?;
+    let nanos = i128::from(elapsed.as_secs())
+        .checked_mul(1_000_000_000)
+        .and_then(|value| value.checked_add(i128::from(elapsed.subsec_nanos())))
+        .ok_or("system timestamp overflow")?;
+    Ok(Timestamp::from_unix_nanos(i64::try_from(nanos)?))
 }
 
 fn metadata_input(trades: bool) -> Result<KrakenMetadataInput, Box<dyn Error>> {
