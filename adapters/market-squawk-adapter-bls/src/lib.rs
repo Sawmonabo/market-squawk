@@ -3,6 +3,7 @@
 mod chunks;
 mod client;
 mod observations;
+mod series_metadata;
 mod source;
 
 pub use chunks::{BlsAccessTier, BlsChunkError, BlsRequestChunk, BlsRequestLimits, BlsRequestPlan};
@@ -10,4 +11,5 @@ pub use client::{BlsAuthorization, BlsRegistrationKey, BlsSourceError};
 pub use observations::{
     BlsFootnote, BlsObservation, BlsParseError, BlsResponse, BlsSeries, BlsVintageCapability,
 };
+pub use series_metadata::BlsSeriesMetadata;
 pub use source::{BlsNormalizedPage, BlsSource, BlsSourceConfig};

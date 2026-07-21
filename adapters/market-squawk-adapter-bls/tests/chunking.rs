@@ -1,9 +1,30 @@
+use bytes::Bytes;
 use market_squawk_adapter_bls::{
     BlsAccessTier, BlsAuthorization, BlsParseError, BlsRegistrationKey, BlsRequestPlan,
-    BlsResponse, BlsSourceConfig, BlsVintageCapability,
+    BlsResponse, BlsSeriesMetadata, BlsSourceConfig, BlsSourceError, BlsVintageCapability,
 };
+use market_squawk_domain::{
+    DigestAlgorithm, EvidenceDigest, ExactPayloadEvidence, SourceIdentifier,
+};
+use sha2::{Digest, Sha256};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+fn metadata(series_id: &str, unit: &str) -> Result<BlsSeriesMetadata, BlsSourceError> {
+    let payload = Bytes::from(format!(
+        r#"{{"schema_version":1,"series_id":"{series_id}","title":"Test series","unit":"{unit}","frequency":"monthly","seasonal_adjustment":"not-specified","measure":"test-measure"}}"#
+    ));
+    let evidence = ExactPayloadEvidence::from_content_digest(EvidenceDigest::new(
+        DigestAlgorithm::Sha256,
+        Sha256::digest(&payload).into(),
+    ));
+    BlsSeriesMetadata::parse_exact(
+        payload,
+        evidence,
+        SourceIdentifier::try_from("user-approved:test-metadata")
+            .map_err(|_| BlsSourceError::InvalidSeriesMetadata)?,
+    )
+}
 
 #[test]
 fn public_and_registered_plans_obey_documented_tier_bounds() -> TestResult {
@@ -158,13 +179,13 @@ fn registered_key_is_validated_and_debug_redacted() -> TestResult {
 fn source_dataset_identity_binds_tier_series_and_year_window() -> TestResult {
     let public = BlsSourceConfig::try_new(
         BlsAuthorization::PublicV1,
-        vec!["LNS14000000".to_owned()],
+        vec![metadata("LNS14000000", "percent")?],
         2020,
         2026,
     )?;
     let other_series = BlsSourceConfig::try_new(
         BlsAuthorization::PublicV1,
-        vec!["CUUR0000SA0".to_owned()],
+        vec![metadata("CUUR0000SA0", "index")?],
         2020,
         2026,
     )?;
@@ -172,7 +193,7 @@ fn source_dataset_identity_binds_tier_series_and_year_window() -> TestResult {
         BlsAuthorization::RegisteredV2(BlsRegistrationKey::try_new(
             "0123456789abcdef0123456789abcdef".to_owned(),
         )?),
-        vec!["LNS14000000".to_owned()],
+        vec![metadata("LNS14000000", "percent")?],
         2020,
         2026,
     )?;
@@ -185,8 +206,8 @@ fn source_dataset_identity_binds_tier_series_and_year_window() -> TestResult {
     assert_ne!(public.dataset(), other_series.dataset());
     assert_ne!(public.dataset(), registered.dataset());
     let over_daily_plan = (0..626)
-        .map(|index| format!("SERIES{index:04}"))
-        .collect::<Vec<_>>();
+        .map(|index| metadata(&format!("SERIES{index:04}"), "count"))
+        .collect::<Result<Vec<_>, _>>()?;
     assert!(
         BlsSourceConfig::try_new(BlsAuthorization::PublicV1, over_daily_plan, 2026, 2026).is_err()
     );

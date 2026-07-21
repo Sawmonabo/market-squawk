@@ -97,6 +97,9 @@ pub enum BlsSourceError {
     /// Series, year, or deterministic request-plan configuration is invalid.
     #[error("invalid BLS source configuration")]
     InvalidConfiguration,
+    /// Exact user-authorized BLS series metadata is missing, malformed, or unverified.
+    #[error("invalid BLS series metadata")]
+    InvalidSeriesMetadata,
     /// Provider data or canonical normalization violated its exact schema.
     #[error("invalid BLS protocol data")]
     Protocol,
@@ -338,6 +341,7 @@ fn map_source_error(error: BlsSourceError, max_response_bytes: usize) -> SourceE
         BlsSourceError::Network => SourceError::Network,
         BlsSourceError::InvalidRegistrationKey
         | BlsSourceError::InvalidConfiguration
+        | BlsSourceError::InvalidSeriesMetadata
         | BlsSourceError::Protocol
         | BlsSourceError::InvalidMetadata => SourceError::InvalidProtocolState,
     }

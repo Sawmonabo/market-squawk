@@ -18,7 +18,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::client::{BlsHttpClient, RetrievedBlsPage, ensure_deadline_open};
 use crate::observations::canonical_payloads;
-use crate::{BlsAccessTier, BlsAuthorization, BlsRequestLimits, BlsRequestPlan, BlsSourceError};
+use crate::{
+    BlsAccessTier, BlsAuthorization, BlsRequestLimits, BlsRequestPlan, BlsSeriesMetadata,
+    BlsSourceError,
+};
 
 const NANOS_PER_DAY: u64 = 86_400_000_000_000;
 const REQUESTS_PER_TEN_SECONDS: u16 = 50;
@@ -29,6 +32,7 @@ const CACHE_ENTRY_OVERHEAD_BYTES: usize = 512;
 pub struct BlsSourceConfig {
     authorization: BlsAuthorization,
     plan: BlsRequestPlan,
+    series_metadata: BTreeMap<String, BlsSeriesMetadata>,
     dataset: SourceIdentifier,
 }
 
@@ -444,11 +448,19 @@ impl BlsSourceConfig {
     /// Rejects malformed series/year plans or a dataset identity outside domain bounds.
     pub fn try_new(
         authorization: BlsAuthorization,
-        series: Vec<String>,
+        series_metadata: Vec<BlsSeriesMetadata>,
         start_year: u16,
         end_year: u16,
     ) -> Result<Self, BlsSourceError> {
         let tier = authorization.tier();
+        let mut metadata_by_series = BTreeMap::new();
+        for metadata in series_metadata {
+            let series_id = metadata.series_id().to_owned();
+            if metadata_by_series.insert(series_id, metadata).is_some() {
+                return Err(BlsSourceError::InvalidSeriesMetadata);
+            }
+        }
+        let series = metadata_by_series.keys().cloned().collect::<Vec<_>>();
         let plan = BlsRequestPlan::try_new(tier, series, start_year, end_year)
             .map_err(|_| BlsSourceError::InvalidConfiguration)?;
         if plan.chunks().len()
@@ -457,7 +469,7 @@ impl BlsSourceConfig {
             return Err(BlsSourceError::InvalidConfiguration);
         }
         let mut hash = Sha256::new();
-        hash.update(b"market-squawk/bls-request-plan/v1");
+        hash.update(b"market-squawk/bls-request-plan/v2");
         hash.update(match tier {
             BlsAccessTier::PublicV1 => b"public-v1".as_slice(),
             BlsAccessTier::RegisteredV2 => b"registered-v2".as_slice(),
@@ -478,6 +490,22 @@ impl BlsSourceConfig {
                 hash.update(identifier.as_bytes());
             }
         }
+        let metadata_count = u16::try_from(metadata_by_series.len())
+            .map_err(|_| BlsSourceError::InvalidSeriesMetadata)?;
+        hash.update(metadata_count.to_be_bytes());
+        for metadata in metadata_by_series.values() {
+            hash_field(&mut hash, metadata.series_id().as_bytes())?;
+            hash_field(
+                &mut hash,
+                metadata.authorization_reference().as_str().as_bytes(),
+            )?;
+            let content_digest = metadata.evidence().content_digest();
+            hash.update(match content_digest.algorithm() {
+                DigestAlgorithm::Sha256 => b"sha256".as_slice(),
+                DigestAlgorithm::Blake3 => b"blake3".as_slice(),
+            });
+            hash.update(content_digest.bytes());
+        }
         let digest = hash.finalize();
         let tier_label = match tier {
             BlsAccessTier::PublicV1 => "public-v1",
@@ -488,6 +516,7 @@ impl BlsSourceConfig {
         Ok(Self {
             authorization,
             plan,
+            series_metadata: metadata_by_series,
             dataset,
         })
     }
@@ -512,6 +541,11 @@ impl BlsSourceConfig {
         self.plan.chunks().len()
     }
 
+    /// Returns exact user-authorized semantic metadata for a configured series.
+    pub fn series_metadata(&self, series_id: &str) -> Option<&BlsSeriesMetadata> {
+        self.series_metadata.get(series_id)
+    }
+
     pub(crate) const fn authorization(&self) -> &BlsAuthorization {
         &self.authorization
     }
@@ -519,6 +553,13 @@ impl BlsSourceConfig {
     pub(crate) const fn plan(&self) -> &BlsRequestPlan {
         &self.plan
     }
+}
+
+fn hash_field(hash: &mut Sha256, value: &[u8]) -> Result<(), BlsSourceError> {
+    let length = u16::try_from(value.len()).map_err(|_| BlsSourceError::InvalidSeriesMetadata)?;
+    hash.update(length.to_be_bytes());
+    hash.update(value);
+    Ok(())
 }
 
 #[cfg(test)]

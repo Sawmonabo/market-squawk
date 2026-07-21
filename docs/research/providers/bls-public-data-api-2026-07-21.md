@@ -1,7 +1,7 @@
 # BLS Public Data API contract — 2026-07-21
 
-Audit base: `d8bc66d3e0b1e3f1971ec83c485882de4aff4d80` (macro adapter lane rebased
-onto release `dc3016593edebe8114d792e1268a56dd8c126fa4`).
+Audit base: `069ccc39add6d5f185fefb1d3a51e96505a5773d` (macro adapter lane rebased
+onto release `6960e41`).
 
 Refresh this note before release when BLS changes its API signatures, terms, quota table, or
 response schema. Network smoke tests remain opt-in; deterministic fixtures are the default suite.
@@ -17,6 +17,9 @@ response schema. Network smoke tests remain opt-in; deterministic fixtures are t
 - Series identifiers use uppercase letters and digits and may include `_`, `-`, and `#`.
 - V1 permits 25 series, 10 years, and 25 daily queries. Registered v2 permits 50 series,
   20 years, and 500 daily queries. Both tiers publish a 50-requests-per-10-seconds rate limit.
+- BLS confirms that the daily allowance resets, but does not document a reset anchor or timezone.
+  The implementation therefore treats both limits as conjunctive rolling windows rather than
+  guessing a provider calendar boundary that could permit a boundary burst.
 - The version-specific v2 signature and the FAQ tier table both state a 20-year v2 window. The
   generic FAQ sentence stating 10 years is applied to v1, not used to double v2 request count.
 - The v2 JSON field is `registrationkey` with a lowercase `k`.
@@ -26,24 +29,36 @@ response schema. Network smoke tests remain opt-in; deterministic fixtures are t
 - The API returns published historical observations but no documented historical-vintage query.
   Revisions are therefore retained as locally observed exact response versions, not presented as
   reconstructed BLS publication vintages.
+- The observation response does not include a universal unit contract. The optional v2 catalog
+  fields are available only for some Data Finder series and do not establish an explicit unit for
+  every BLS series. Production configuration therefore requires one exact, bounded, separately
+  verified metadata record per requested series, including explicit unit, title, frequency,
+  seasonal-adjustment, and measure semantics plus the user's authorization-record reference.
 
 ## Implementation decisions
 
 - Endpoint policy, registry-issued shared provider budget, response byte bounds, request deadline,
   cancellation, and exact series/year response binding all fail closed before normalization.
-- Because the current shared budget has one window, the adapter requires a conservative 24-hour
-  shared window capped at 25 requests for v1 or 50 requests for v2. This single limit satisfies
-  both the daily and short-window provider restrictions without identity or account rotation.
+- Registry authority must enforce every applicable window atomically for the same canonical
+  public or registered allocation: 25 requests per rolling day plus 50 per 10 seconds for v1, and
+  500 requests per rolling day plus 50 per 10 seconds for v2. This preserves lawful v2 capacity
+  without identity or account rotation and without an adapter-local limiter that aliases could
+  bypass.
 - Automatic redirects, ambient proxies, implicit retries, and compression are disabled. The
   adapter requests and accepts identity encoding only, then counts every streamed response byte.
 - Partial responses, missing or extra series, duplicates, out-of-window observations, changed
   refetch content, and provider messages/empty series invalidate the normalized batch.
 - Raw-response SHA-256, request-plan identity, source/revision metadata, local first-observation
   time, preliminary/latest flags, lexical value, decimal value, and footnotes are preserved.
+- The request-plan identity binds each series metadata payload digest and authorization reference.
+  Missing, duplicate, malformed, mismatched-digest, or schema-unknown metadata fails closed; the
+  adapter never derives a unit from the series identifier, title, or observed values.
 
 ## Primary sources
 
 - BLS v1 signatures: https://www.bls.gov/developers/api_signature.htm
-- BLS v2 signatures: https://www.bls.gov/developers/api_signature_v2.htm
+- BLS v2 signatures and optional catalog fields:
+  https://www.bls.gov/developers/api_signature_v2.htm
 - BLS API FAQ and quota table: https://www.bls.gov/developers/api_faqs.htm
+- BLS API features and daily reset behavior: https://www.bls.gov/bls/api_features.htm
 - BLS API terms of service: https://www.bls.gov/developers/termsOfService.htm
