@@ -143,20 +143,28 @@ impl LocalToolServices {
 
 fn diagnostic_capabilities() -> Result<ServiceCapabilities, ServiceCapabilityError> {
     let mut tools = Vec::with_capacity(5);
-    tools.push(ToolDescriptor::try_new(
-        MARKET_GET_SNAPSHOT,
-        CONTRACT_VERSION,
-        "Get the latest diagnostic and authority-free compatibility snapshot from Coinbase Exchange single-venue, partial coverage. Omit product to return all observed products. Diagnostic values cannot mint production live authority.",
-        json!({
-            "type": "object",
-            "properties": {
-                "product": {"type": "string", "minLength": 1, "maxLength": 128}
-            },
-            "additionalProperties": false
-        }),
-        ToolEffects::read_only_closed_world(),
-        |arguments: &Map<String, Value>| admit_optional_string(arguments, "product", MAXIMUM_PRODUCT_BYTES),
-    )?);
+    tools.push(
+        ToolDescriptor::try_new(
+            MARKET_GET_SNAPSHOT,
+            CONTRACT_VERSION,
+            "Get the latest diagnostic and authority-free compatibility snapshot from Coinbase Exchange single-venue, partial coverage. Omit product to return all observed products. Diagnostic values cannot mint production live authority.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "product": {"type": "string", "minLength": 1, "maxLength": 128}
+                },
+                "additionalProperties": false
+            }),
+            ToolEffects::read_only_closed_world(),
+            |arguments: &Map<String, Value>| admit_optional_string(arguments, "product", MAXIMUM_PRODUCT_BYTES),
+        )?
+        .try_with_metadata(json!({
+            "org.market-squawk/tool-contract": {
+                "maximumDataQuality": "direct_unverified",
+                "executionAuthority": "none"
+            }
+        }))?,
+    );
     tools.push(ToolDescriptor::try_new(
         MARKET_GET_QUALITY,
         CONTRACT_VERSION,
@@ -181,29 +189,39 @@ fn diagnostic_capabilities() -> Result<ServiceCapabilities, ServiceCapabilityErr
         ToolEffects::read_only_closed_world(),
         admit_empty,
     )?);
-    tools.push(ToolDescriptor::try_new(
-        RISK_TRIGGER_KILL_SWITCH,
-        CONTRACT_VERSION,
-        "Irreversibly stop the compatibility paper simulation only for the current run. It has no production order authority and cannot control production execution. Requires explicit confirmation and a reason.",
-        json!({
-            "type": "object",
-            "properties": {
-                "confirm": {"type": "boolean", "const": true},
-                "reason": {"type": "string", "minLength": 1, "maxLength": 500}
+    tools.push(
+        ToolDescriptor::try_new(
+            RISK_TRIGGER_KILL_SWITCH,
+            CONTRACT_VERSION,
+            "Irreversibly stop the compatibility paper simulation only for the current run. It has no production order authority and cannot control production execution. Requires explicit confirmation and a reason.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "confirm": {"type": "boolean", "const": true},
+                    "reason": {"type": "string", "minLength": 1, "maxLength": 500}
+                },
+                "required": ["confirm", "reason"],
+                "additionalProperties": false
+            }),
+            ToolEffects::try_new(false, true, true, false)?,
+            |arguments: &Map<String, Value>| {
+                if arguments.len() != 2 || arguments.get("confirm") != Some(&Value::Bool(true)) {
+                    return Err(ToolInputError::Invalid);
+                }
+                admitted_string(arguments, "reason", MAXIMUM_REASON_BYTES)
+                    .map(|_reason| ())
+                    .map_err(|_error| ToolInputError::Invalid)
             },
-            "required": ["confirm", "reason"],
-            "additionalProperties": false
-        }),
-        ToolEffects::try_new(false, true, true, false)?,
-        |arguments: &Map<String, Value>| {
-            if arguments.len() != 2 || arguments.get("confirm") != Some(&Value::Bool(true)) {
-                return Err(ToolInputError::Invalid);
+        )?
+        .try_with_metadata(json!({
+            "org.market-squawk/tool-contract": {
+                "executionAuthority": "none",
+                "simulationAccess": "none",
+                "controlAuthority": "paper_simulation_stop_only",
+                "resourceScope": "current_paper_simulation_run"
             }
-            admitted_string(arguments, "reason", MAXIMUM_REASON_BYTES)
-                .map(|_reason| ())
-                .map_err(|_error| ToolInputError::Invalid)
-        },
-    )?);
+        }))?,
+    );
     ServiceCapabilities::try_new(tools)
 }
 

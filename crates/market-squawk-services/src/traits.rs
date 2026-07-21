@@ -16,6 +16,7 @@ const MAXIMUM_TOOL_VERSION_BYTES: usize = 64;
 const MAXIMUM_TOOL_DESCRIPTION_BYTES: usize = 1024;
 const MAXIMUM_TOOLS: usize = 256;
 const MAXIMUM_DESCRIPTOR_SCHEMA_BYTES: usize = 64 * 1024;
+const MAXIMUM_DESCRIPTOR_METADATA_BYTES: usize = 8 * 1024;
 const MAXIMUM_TOOL_ARGUMENT_BYTES: usize = 1024 * 1024;
 
 /// Versioned, schema-bearing description of one application-service operation.
@@ -26,6 +27,7 @@ pub struct ToolDescriptor {
     description: Arc<str>,
     input_schema: Map<String, Value>,
     input_schema_bytes: usize,
+    metadata: Map<String, Value>,
     effects: ToolEffects,
     input_admission: Arc<dyn ToolInputAdmission>,
 }
@@ -39,6 +41,7 @@ impl fmt::Debug for ToolDescriptor {
             .field("description", &self.description)
             .field("input_schema", &"[INPUT SCHEMA REDACTED]")
             .field("input_schema_bytes", &self.input_schema_bytes)
+            .field("metadata", &"[PUBLIC METADATA REDACTED]")
             .field("effects", &self.effects)
             .field("input_admission", &"[TYPED ADMISSION REDACTED]")
             .finish()
@@ -103,9 +106,32 @@ impl ToolDescriptor {
             description,
             input_schema,
             input_schema_bytes,
+            metadata: Map::new(),
             effects,
             input_admission: Arc::new(input_admission),
         })
+    }
+
+    /// Adds bounded public extension metadata advertised with this operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceCapabilityError::InvalidMetadata`] when the value is not an object or
+    /// exceeds the descriptor metadata limits.
+    pub fn try_with_metadata(mut self, metadata: Value) -> Result<Self, ServiceCapabilityError> {
+        let metadata_limits = JsonStructureLimits::try_new(8, 4 * 1024, 128, 128)
+            .map_err(|_| ServiceCapabilityError::InvalidMetadata)?;
+        validate_json_contract(
+            &metadata,
+            metadata_limits,
+            MAXIMUM_DESCRIPTOR_METADATA_BYTES,
+        )
+        .map_err(|_| ServiceCapabilityError::InvalidMetadata)?;
+        let Value::Object(metadata) = metadata else {
+            return Err(ServiceCapabilityError::InvalidMetadata);
+        };
+        self.metadata = metadata;
+        Ok(self)
     }
 
     /// Stable operation name.
@@ -130,6 +156,12 @@ impl ToolDescriptor {
     #[must_use]
     pub const fn input_schema(&self) -> &Map<String, Value> {
         &self.input_schema
+    }
+
+    /// Bounded public extension metadata for transport capability discovery.
+    #[must_use]
+    pub const fn metadata(&self) -> &Map<String, Value> {
+        &self.metadata
     }
 
     /// Explicit operation side-effect annotations advertised to MCP clients.
@@ -347,6 +379,9 @@ pub enum ServiceCapabilityError {
     /// Input schema is not a closed JSON object schema.
     #[error("service tool input schema must be a closed object")]
     InvalidSchema,
+    /// Public descriptor metadata is not a bounded JSON object.
+    #[error("service tool metadata must be a bounded object")]
+    InvalidMetadata,
     /// Side-effect annotations contradict each other.
     #[error("service tool effect annotations are inconsistent")]
     InvalidEffects,
