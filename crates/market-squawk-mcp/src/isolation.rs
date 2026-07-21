@@ -1,6 +1,15 @@
 //! Owned bounded bridges around the payload-suppressing official-SDK runtime.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    num::NonZeroUsize,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc::{SyncSender, TrySendError, sync_channel},
+    },
+    thread::JoinHandle as ThreadJoinHandle,
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use market_squawk_services::{
@@ -16,9 +25,10 @@ use rmcp::{
     service::{QuitReason, RxJsonRpcMessage, TxJsonRpcMessage, serve_server_with_ct},
     transport::Transport,
 };
+use thiserror::Error;
 use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
-    task::{JoinHandle, JoinSet},
+    task::{JoinHandle as TokioJoinHandle, JoinSet},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -507,6 +517,267 @@ pub(crate) enum IsolatedSdkOutcome {
     Finished(Result<QuitReason, tokio::task::JoinError>),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SdkThreadShutdown {
+    Joined,
+    TransferredToReaper,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SdkReaperDrain {
+    Complete,
+    Pending,
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum SdkThreadError {
+    #[error("MCP SDK reaper capacity is exhausted")]
+    ReaperCapacity,
+    #[error("MCP SDK reaper thread could not be spawned")]
+    ReaperSpawn(#[source] std::io::Error),
+    #[error("MCP SDK worker thread could not be spawned")]
+    WorkerSpawn(#[source] std::io::Error),
+    #[error("MCP SDK worker thread panicked")]
+    WorkerPanicked,
+    #[error("MCP SDK reaper is unavailable")]
+    ReaperUnavailable,
+    #[error("MCP SDK reaper observed a worker panic")]
+    ReapedWorkerPanicked,
+}
+
+#[derive(Debug)]
+struct ReapRequest {
+    thread: ThreadJoinHandle<()>,
+    _permit: OwnedSemaphorePermit,
+}
+
+#[derive(Clone, Debug)]
+struct SdkThreadReaperHandle {
+    sender: SyncSender<ReapRequest>,
+    pending: Arc<AtomicUsize>,
+}
+
+impl SdkThreadReaperHandle {
+    fn transfer(&self, request: ReapRequest) -> Result<(), ReapRequest> {
+        self.pending.fetch_add(1, Ordering::SeqCst);
+        match self.sender.try_send(request) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(request) | TrySendError::Disconnected(request)) => {
+                self.pending.fetch_sub(1, Ordering::SeqCst);
+                Err(request)
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct SdkThreadReaper {
+    capacity: Arc<Semaphore>,
+    sender: Option<SyncSender<ReapRequest>>,
+    pending: Arc<AtomicUsize>,
+    failed: Arc<AtomicBool>,
+    changed: Arc<tokio::sync::Notify>,
+    thread: Option<ThreadJoinHandle<()>>,
+}
+
+impl SdkThreadReaper {
+    pub(crate) fn try_new(maximum_pending: NonZeroUsize) -> Result<Self, SdkThreadError> {
+        let (sender, receiver) = sync_channel::<ReapRequest>(maximum_pending.get());
+        let pending = Arc::new(AtomicUsize::new(0));
+        let failed = Arc::new(AtomicBool::new(false));
+        let changed = Arc::new(tokio::sync::Notify::new());
+        let reaper_pending = Arc::clone(&pending);
+        let reaper_failed = Arc::clone(&failed);
+        let reaper_changed = Arc::clone(&changed);
+        let thread = std::thread::Builder::new()
+            .name("market-squawk-mcp-sdk-reaper".to_owned())
+            .spawn(move || {
+                while let Ok(request) = receiver.recv() {
+                    if request.thread.join().is_err() {
+                        reaper_failed.store(true, Ordering::SeqCst);
+                    }
+                    drop(request._permit);
+                    reaper_pending.fetch_sub(1, Ordering::SeqCst);
+                    reaper_changed.notify_waiters();
+                }
+            })
+            .map_err(SdkThreadError::ReaperSpawn)?;
+        Ok(Self {
+            capacity: Arc::new(Semaphore::new(maximum_pending.get())),
+            sender: Some(sender),
+            pending,
+            failed,
+            changed,
+            thread: Some(thread),
+        })
+    }
+
+    fn handle(&self) -> Result<SdkThreadReaperHandle, SdkThreadError> {
+        let sender = self
+            .sender
+            .as_ref()
+            .cloned()
+            .ok_or(SdkThreadError::ReaperUnavailable)?;
+        Ok(SdkThreadReaperHandle {
+            sender,
+            pending: Arc::clone(&self.pending),
+        })
+    }
+
+    fn try_reserve(&self) -> Result<OwnedSemaphorePermit, SdkThreadError> {
+        Arc::clone(&self.capacity)
+            .try_acquire_owned()
+            .map_err(|_error| SdkThreadError::ReaperCapacity)
+    }
+
+    pub(crate) fn pending_count(&self) -> usize {
+        self.pending.load(Ordering::SeqCst)
+    }
+
+    pub(crate) async fn drain(&self, timeout: Duration) -> Result<SdkReaperDrain, SdkThreadError> {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or(SdkThreadError::ReaperUnavailable)?;
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.pending_count() == 0 {
+                if self.failed.load(Ordering::SeqCst) {
+                    return Err(SdkThreadError::ReapedWorkerPanicked);
+                }
+                return Ok(SdkReaperDrain::Complete);
+            }
+            if tokio::time::timeout_at(deadline, changed.as_mut())
+                .await
+                .is_err()
+            {
+                return Ok(SdkReaperDrain::Pending);
+            }
+        }
+    }
+}
+
+impl Drop for SdkThreadReaper {
+    fn drop(&mut self) {
+        self.sender.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+pub(crate) struct OwnedSdkThread<T: Send + 'static> {
+    cancellation: CancellationToken,
+    outcome: oneshot::Receiver<T>,
+    thread: Option<ThreadJoinHandle<()>>,
+    reaper: SdkThreadReaperHandle,
+    reaper_permit: Option<OwnedSemaphorePermit>,
+}
+
+impl<T: Send + 'static> std::fmt::Debug for OwnedSdkThread<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OwnedSdkThread")
+            .field("thread_owned", &self.thread.is_some())
+            .field("reaper_permit_owned", &self.reaper_permit.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<T> OwnedSdkThread<T>
+where
+    T: Send + 'static,
+{
+    pub(crate) fn try_spawn<F>(
+        reaper: &SdkThreadReaper,
+        name: &str,
+        work: F,
+    ) -> Result<Self, SdkThreadError>
+    where
+        F: FnOnce(CancellationToken) -> T + Send + 'static,
+    {
+        let reaper_permit = reaper.try_reserve()?;
+        let reaper = reaper.handle()?;
+        let cancellation = CancellationToken::new();
+        let worker_cancellation = cancellation.clone();
+        let (outcome_sender, outcome) = oneshot::channel();
+        let thread = std::thread::Builder::new()
+            .name(name.to_owned())
+            .spawn(move || {
+                let outcome = work(worker_cancellation);
+                let _ = outcome_sender.send(outcome);
+            })
+            .map_err(SdkThreadError::WorkerSpawn)?;
+        Ok(Self {
+            cancellation,
+            outcome,
+            thread: Some(thread),
+            reaper,
+            reaper_permit: Some(reaper_permit),
+        })
+    }
+
+    pub(crate) async fn wait(mut self) -> Result<T, SdkThreadError> {
+        let outcome = (&mut self.outcome)
+            .await
+            .map_err(|_error| SdkThreadError::WorkerPanicked)?;
+        self.join()?;
+        Ok(outcome)
+    }
+
+    pub(crate) async fn shutdown(
+        mut self,
+        timeout: Duration,
+    ) -> Result<SdkThreadShutdown, SdkThreadError> {
+        self.cancellation.cancel();
+        match tokio::time::timeout(timeout, &mut self.outcome).await {
+            Ok(Ok(_outcome)) => {
+                self.join()?;
+                Ok(SdkThreadShutdown::Joined)
+            }
+            Ok(Err(_error)) => {
+                self.join()?;
+                Err(SdkThreadError::WorkerPanicked)
+            }
+            Err(_elapsed) => {
+                self.transfer_or_join();
+                Ok(SdkThreadShutdown::TransferredToReaper)
+            }
+        }
+    }
+
+    fn join(&mut self) -> Result<(), SdkThreadError> {
+        let thread = self.thread.take().ok_or(SdkThreadError::WorkerPanicked)?;
+        let joined = thread
+            .join()
+            .map_err(|_panic| SdkThreadError::WorkerPanicked);
+        self.reaper_permit.take();
+        joined
+    }
+
+    fn transfer_or_join(&mut self) {
+        let (Some(thread), Some(permit)) = (self.thread.take(), self.reaper_permit.take()) else {
+            return;
+        };
+        let request = ReapRequest {
+            thread,
+            _permit: permit,
+        };
+        if let Err(request) = self.reaper.transfer(request) {
+            let _ = request.thread.join();
+            drop(request._permit);
+        }
+    }
+}
+
+impl<T: Send + 'static> Drop for OwnedSdkThread<T> {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        self.transfer_or_join();
+    }
+}
+
 pub(crate) fn run_isolated_sdk(
     handler: ServiceHandler<SdkToolServices>,
     transport: SdkTransport,
@@ -548,8 +819,9 @@ pub(crate) fn run_isolated_sdk(
 
 pub(crate) struct SessionSupervisor {
     cancellation: CancellationToken,
-    sdk_task: Option<JoinHandle<IsolatedSdkOutcome>>,
-    host_tasks: Vec<JoinHandle<()>>,
+    sdk_thread: Option<OwnedSdkThread<IsolatedSdkOutcome>>,
+    sdk_reaper: SdkThreadReaper,
+    host_tasks: Vec<TokioJoinHandle<()>>,
     writer: WriterSupervisor,
     shutdown_timeout: Duration,
 }
@@ -558,7 +830,8 @@ impl std::fmt::Debug for SessionSupervisor {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("SessionSupervisor")
-            .field("sdk_task_owned", &self.sdk_task.is_some())
+            .field("sdk_thread_owned", &self.sdk_thread.is_some())
+            .field("sdk_reaper", &self.sdk_reaper)
             .field("host_task_count", &self.host_tasks.len())
             .field("writer", &self.writer)
             .field("shutdown_timeout", &self.shutdown_timeout)
@@ -569,14 +842,16 @@ impl std::fmt::Debug for SessionSupervisor {
 impl SessionSupervisor {
     pub(crate) fn new(
         cancellation: CancellationToken,
-        sdk_task: JoinHandle<IsolatedSdkOutcome>,
-        host_tasks: Vec<JoinHandle<()>>,
+        sdk_thread: OwnedSdkThread<IsolatedSdkOutcome>,
+        sdk_reaper: SdkThreadReaper,
+        host_tasks: Vec<TokioJoinHandle<()>>,
         writer: WriterSupervisor,
         shutdown_timeout: Duration,
     ) -> Self {
         Self {
             cancellation,
-            sdk_task: Some(sdk_task),
+            sdk_thread: Some(sdk_thread),
+            sdk_reaper,
             host_tasks,
             writer,
             shutdown_timeout,
@@ -584,12 +859,8 @@ impl SessionSupervisor {
     }
 
     pub(crate) async fn wait_sdk(&mut self) -> Result<IsolatedSdkOutcome, ServerError> {
-        let result = match self.sdk_task.as_mut() {
-            Some(task) => task.await.map_err(ServerError::RuntimeTask),
-            None => return Err(ServerError::Transport),
-        };
-        self.sdk_task.take();
-        result
+        let thread = self.sdk_thread.take().ok_or(ServerError::Transport)?;
+        thread.wait().await.map_err(|_error| ServerError::SdkThread)
     }
 
     pub(crate) async fn shutdown(
@@ -598,6 +869,19 @@ impl SessionSupervisor {
         terminal_marker: &'static [u8],
     ) -> Result<(), TransportError> {
         self.cancellation.cancel();
+        let sdk_result = match self.sdk_thread.take() {
+            Some(thread) => thread
+                .shutdown(self.shutdown_timeout)
+                .await
+                .map(|_shutdown| ())
+                .map_err(|_error| TransportError::WriterTask),
+            None => Ok(()),
+        };
+        let reaper_result = match self.sdk_reaper.drain(self.shutdown_timeout).await {
+            Ok(SdkReaperDrain::Complete) => Ok(()),
+            Ok(SdkReaperDrain::Pending) => Err(TransportError::WriteTimedOut),
+            Err(_error) => Err(TransportError::WriterTask),
+        };
         let mut host_tasks = std::mem::take(&mut self.host_tasks);
         let host_result = match tokio::time::timeout(self.shutdown_timeout, async {
             let mut joined_cleanly = true;
@@ -621,18 +905,19 @@ impl SessionSupervisor {
             }
         };
         let writer_result = self.writer.shutdown(result_class, terminal_marker).await;
-        host_result.and(writer_result)
+        sdk_result
+            .and(reaper_result)
+            .and(host_result)
+            .and(writer_result)
     }
 }
 
 impl Drop for SessionSupervisor {
     fn drop(&mut self) {
-        // Cancellation is the public service/artifact Drop-safety boundary. Keep it before every
-        // abort so only contract-covered futures are reaped.
+        // Cancellation is the public service/artifact Drop-safety boundary. Keep it before
+        // transferring the SDK thread or aborting contract-covered host futures.
         self.cancellation.cancel();
-        if let Some(task) = self.sdk_task.take() {
-            task.abort();
-        }
+        self.sdk_thread.take();
         for task in self.host_tasks.drain(..) {
             task.abort();
         }
@@ -698,7 +983,12 @@ mod thread_reaper_tests {
             worker.shutdown(Duration::from_millis(10)).await?,
             SdkThreadShutdown::TransferredToReaper
         );
-        assert!(cancelled.load(Ordering::SeqCst));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !cancelled.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
         assert_eq!(reaper.pending_count(), 1);
         assert_eq!(
             reaper.drain(Duration::from_millis(10)).await?,

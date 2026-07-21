@@ -3,6 +3,7 @@
 use std::{
     borrow::Cow,
     io::Write,
+    num::NonZeroUsize,
     sync::{
         Arc,
         atomic::{AtomicU8, Ordering},
@@ -38,9 +39,9 @@ use crate::{
     AuditResultClass, AuditSink, LocalProcessIdentityClass, McpLimits,
     framing::OutputChannel,
     isolation::{
-        IsolatedSdkOutcome, McpProgressSink, ProgressDelivery, SdkArtifactRepository,
-        SdkToolServices, SessionSupervisor, run_artifact_calls, run_isolated_sdk, run_sdk_output,
-        run_service_calls, sdk_transport,
+        IsolatedSdkOutcome, McpProgressSink, OwnedSdkThread, ProgressDelivery,
+        SdkArtifactRepository, SdkThreadReaper, SdkToolServices, SessionSupervisor,
+        run_artifact_calls, run_isolated_sdk, run_sdk_output, run_service_calls, sdk_transport,
     },
     protocol::{
         BoundedInputDriver, STATE_AWAIT_INITIALIZE, STATE_AWAIT_INITIALIZED, STATE_READY,
@@ -206,6 +207,23 @@ impl<S: ToolServices> McpServer<S> {
             output: Arc::clone(&output),
         };
         let (sdk_transport, sdk_input, sdk_output) = sdk_transport(self.limits);
+        let shutdown_timeout = self.limits.shutdown_timeout();
+        let sdk_reaper =
+            SdkThreadReaper::try_new(NonZeroUsize::MIN).map_err(|_error| ServerError::SdkThread)?;
+        let sdk_thread = OwnedSdkThread::try_spawn(
+            &sdk_reaper,
+            "market-squawk-mcp-sdk",
+            move |sdk_cancellation| {
+                run_isolated_sdk(
+                    handler,
+                    sdk_transport,
+                    progress_receiver,
+                    sdk_cancellation,
+                    shutdown_timeout,
+                )
+            },
+        )
+        .map_err(|_error| ServerError::SdkThread)?;
         let host_tasks = vec![
             tokio::spawn(input.run(sdk_input)),
             tokio::spawn(run_sdk_output(output, sdk_output)),
@@ -220,20 +238,10 @@ impl<S: ToolServices> McpServer<S> {
                 session_cancellation.clone(),
             )),
         ];
-        let sdk_cancellation = session_cancellation.child_token();
-        let shutdown_timeout = self.limits.shutdown_timeout();
-        let sdk_task = tokio::task::spawn_blocking(move || {
-            run_isolated_sdk(
-                handler,
-                sdk_transport,
-                progress_receiver,
-                sdk_cancellation,
-                shutdown_timeout,
-            )
-        });
         let mut supervisor = SessionSupervisor::new(
             session_cancellation,
-            sdk_task,
+            sdk_thread,
+            sdk_reaper,
             host_tasks,
             writer,
             shutdown_timeout,
@@ -778,6 +786,9 @@ pub enum ServerError {
     /// Official SDK runtime task failed.
     #[error("MCP runtime task failed: {0}")]
     RuntimeTask(#[source] tokio::task::JoinError),
+    /// Dedicated official-SDK OS thread or its bounded reaper failed.
+    #[error("MCP isolation thread failed")]
+    SdkThread,
     /// Dedicated official-SDK isolation runtime could not be constructed.
     #[error("MCP isolation runtime construction failed: {0}")]
     SdkRuntime(#[source] std::io::Error),
