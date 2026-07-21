@@ -5,12 +5,13 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use market_squawk_domain::{EvidenceDigest, SourceIdentifier};
+use market_squawk_sources::CURRENT_RESEARCH_RECORD_SCHEMA;
 
 pub(crate) const SCHEMA_VERSION_KEY: &str = "market_squawk.schema_version";
 pub(crate) const DATASET_KEY: &str = "market_squawk.dataset";
 pub(crate) const REQUEST_DIGEST_KEY: &str = "market_squawk.request_sha256";
 pub(crate) const SCHEMA_NAME: &str = "market_squawk.research_observations";
-pub(crate) const RESEARCH_RECORD_SCHEMA: &str = "market-squawk-research-v3";
+pub(crate) const RESEARCH_RECORD_SCHEMA: &str = CURRENT_RESEARCH_RECORD_SCHEMA;
 pub(crate) const RESEARCH_SCHEMA_VERSION: u16 = 3;
 
 pub(crate) fn research_schema(

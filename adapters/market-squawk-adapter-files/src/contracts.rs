@@ -206,7 +206,7 @@ pub enum ParserLimit {
 }
 
 /// Bounded local extraction failure.
-#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum FileAdapterError {
     /// Limits were zero, excessive, or relationally invalid.
     #[error("local extraction limits are invalid")]
@@ -235,6 +235,12 @@ pub enum FileAdapterError {
     /// Source metadata is not a user-owned, network-denied extraction source.
     #[error("local extraction source metadata is incompatible")]
     MetadataPolicyMismatch,
+    /// Registry authority belongs to another source metadata revision.
+    #[error("local extraction authority does not match this source")]
+    AuthorityMismatch,
+    /// Registry authority was replaced, revoked, expired, or otherwise rejected.
+    #[error("local extraction authority was rejected: {0}")]
+    Authority(#[from] market_squawk_sources::ExtractionAuthorityError),
     /// A requested object is absent from the manifest.
     #[error("local extraction object is not declared")]
     ObjectNotFound,

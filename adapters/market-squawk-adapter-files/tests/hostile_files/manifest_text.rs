@@ -1,6 +1,88 @@
 use super::*;
 
 #[tokio::test]
+async fn user_json_object_cannot_alias_the_arbitrary_precision_number_token()
+-> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    fs::write(
+        directory.path().join("source.json"),
+        br#"[{"id":"row","value":{"$serde_json::private::Number":"1.00"}}]"#,
+    )?;
+
+    let result = extract_fixture(&directory, "source.json", "json").await?;
+    assert!(matches!(result, Err(FileAdapterError::InvalidRecord)));
+    Ok(())
+}
+
+#[tokio::test]
+async fn manifest_record_time_preserves_calendar_precision_in_every_output()
+-> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let representation_state = tempfile::tempdir()?;
+    fs::write(directory.path().join("source.csv"), b"id,value\nrow,1.00\n")?;
+    let effective = ResearchTemporalCoordinate::calendar_date(CalendarDate::new(2024, 3, 31)?);
+    let published = ResearchTemporalCoordinate::calendar_date(CalendarDate::new(2024, 4, 15)?);
+    let mut manifest_value: serde_json::Value =
+        serde_json::from_slice(&manifest("source.csv", "csv"))?;
+    manifest_value["objects"][0]["record_time"] = serde_json::json!({
+        "effective": effective,
+        "published": published,
+        "superseded": null
+    });
+    let manifest = serde_json::to_vec(&manifest_value)?;
+    fs::write(directory.path().join("manifest.json"), &manifest)?;
+    let root = UserAuthorizedInputRoot::open(fs::canonicalize(directory.path())?)?;
+    let manifest_input = root
+        .resolve("manifest.json")?
+        .open_bounded(16 * 1024)?
+        .read_bounded()?;
+    let source = authorize_source(FileExtractionSource::try_new_with_clock(
+        local_metadata(&manifest)?,
+        root,
+        representation_state_root(&representation_state, &manifest),
+        manifest_input,
+        ExtractionLimits::try_new(ExtractionLimitsInput::standard())?,
+        fixed_clock(),
+    )?)?;
+    let discovery = DiscoveryRequest::try_new(
+        SourceIdentifier::try_from("alternative-prices")?,
+        None,
+        NonZeroU16::new(1).ok_or("nonzero")?,
+        Timestamp::from_unix_nanos(10_000_000_000),
+    )?;
+    let object = source
+        .discover_files(&discovery, &CancellationToken::new())
+        .await?
+        .objects()[0]
+        .clone();
+    let batch = source
+        .extract_file(
+            &ExtractionRequest::try_new(
+                object,
+                NonZeroU32::new(1).ok_or("nonzero")?,
+                NonZeroU64::new(1024 * 1024).ok_or("nonzero")?,
+                Timestamp::from_unix_nanos(10_000_000_000),
+            )?,
+            &CancellationToken::new(),
+        )
+        .await?;
+    let record = &batch.records()[0];
+    assert_eq!(
+        record.effective_time().calendar_date_value(),
+        Some(CalendarDate::new(2024, 3, 31)?)
+    );
+    let observation: ResearchObservation = serde_json::from_slice(record.payload())?;
+    let ResearchObservation::AlternativeData(observation) = observation else {
+        return Err("local extraction produced the wrong observation kind".into());
+    };
+    assert_eq!(
+        observation.context().time().effective(),
+        record.effective_time()
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn manifest_and_text_parsers_reject_ambiguous_or_expansive_inputs()
 -> Result<(), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;
@@ -297,14 +379,14 @@ async fn manifest_and_text_parsers_reject_ambiguous_or_expansive_inputs()
         if format == "csv" {
             limits.max_text_bytes = 4;
         }
-        let source = FileExtractionSource::try_new_with_clock(
+        let source = authorize_source(FileExtractionSource::try_new_with_clock(
             local_metadata(&manifest)?,
             root,
             representation_state_root(&representation_state, &manifest),
             manifest_input,
             ExtractionLimits::try_new(limits)?,
             fixed_clock(),
-        )?;
+        )?)?;
         let discovery = DiscoveryRequest::try_new(
             SourceIdentifier::try_from("alternative-prices")?,
             None,

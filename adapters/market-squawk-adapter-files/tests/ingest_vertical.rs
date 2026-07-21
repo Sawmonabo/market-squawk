@@ -28,10 +28,11 @@ use market_squawk_domain::{
 };
 use market_squawk_platform::{LocalPaths, UserAuthorizedInputRoot};
 use market_squawk_sources::{
-    AuthorizationGrant, AuthorizationMode, CoverageDomain, DiscoveryRequest, ExtractionBatch,
-    ExtractionError, ExtractionRequest, ExtractionSource, ExtractionSourceError, FreshnessPolicy,
-    HistoricalCapability, NetworkAccessPolicy, SourceCapabilities, SourceClass, SourceCoverage,
-    SourceMetadata, SourceMetadataInput, SourceProtocolProfile,
+    AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode, CoverageDomain,
+    DiscoveryRequest, ExtractionBatch, ExtractionError, ExtractionRequest, ExtractionSource,
+    ExtractionSourceError, FreshnessPolicy, HistoricalCapability, NetworkAccessPolicy,
+    SourceCapabilities, SourceClass, SourceCoverage, SourceMetadata, SourceMetadataInput,
+    SourceProtocolProfile,
 };
 use parquet::arrow::ArrowWriter;
 use rusqlite::Connection;
@@ -99,6 +100,10 @@ async fn every_local_format_survives_rights_publish_restart_and_exact_query() ->
             next_offset_nanos: Mutex::new(0),
         }),
     )?;
+    let mut extraction_registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
+    let registered =
+        extraction_registry.register(metadata.clone(), Timestamp::from_unix_nanos(300))?;
+    let extraction_authority = extraction_registry.extraction_authority(&registered, &source)?;
     let discovery = DiscoveryRequest::try_new(
         SourceIdentifier::try_from("alternative-prices")?,
         None,
@@ -106,7 +111,7 @@ async fn every_local_format_survives_rights_publish_restart_and_exact_query() ->
         Timestamp::from_unix_nanos(10_000_000_000),
     )?;
     let discovered = source
-        .discover_files(&discovery, &CancellationToken::new())
+        .discover_files(&extraction_authority, &discovery, &CancellationToken::new())
         .await?;
     assert_eq!(discovered.objects().len(), EXPECTED_FORMAT_ROWS);
     let original_csv = discovered
@@ -116,7 +121,7 @@ async fn every_local_format_survives_rights_publish_restart_and_exact_query() ->
         .cloned()
         .ok_or("original CSV discovery is absent")?;
     let rediscovered_csv = source
-        .discover_files(&discovery, &CancellationToken::new())
+        .discover_files(&extraction_authority, &discovery, &CancellationToken::new())
         .await?
         .objects()
         .iter()
@@ -136,7 +141,7 @@ async fn every_local_format_survives_rights_publish_restart_and_exact_query() ->
         )?;
         batches.push(
             source
-                .extract_file(&request, &CancellationToken::new())
+                .extract_file(&extraction_authority, &request, &CancellationToken::new())
                 .await?,
         );
     }
@@ -166,7 +171,7 @@ async fn every_local_format_survives_rights_publish_restart_and_exact_query() ->
         b"id,value\nfirst,1.00\nsecond,not-a-decimal\n",
     )?;
     let bounded_csv = source
-        .discover_files(&discovery, &CancellationToken::new())
+        .discover_files(&extraction_authority, &discovery, &CancellationToken::new())
         .await?
         .objects()
         .iter()
@@ -175,6 +180,7 @@ async fn every_local_format_survives_rights_publish_restart_and_exact_query() ->
         .ok_or("bounded CSV discovery is absent")?;
     let bounded_error = source
         .extract(
+            extraction_authority.clone(),
             ExtractionRequest::try_new(
                 bounded_csv,
                 NonZeroU32::new(2).ok_or("nonzero record limit")?,
@@ -196,7 +202,7 @@ async fn every_local_format_survives_rights_publish_restart_and_exact_query() ->
         b"id,value\nwithin-limit,1.00\nafter-limit,\"unterminated\n",
     )?;
     let request_limited_csv = source
-        .discover_files(&discovery, &CancellationToken::new())
+        .discover_files(&extraction_authority, &discovery, &CancellationToken::new())
         .await?
         .objects()
         .iter()
@@ -205,6 +211,7 @@ async fn every_local_format_survives_rights_publish_restart_and_exact_query() ->
         .ok_or("request-limited CSV discovery is absent")?;
     let request_limit_error = source
         .extract(
+            extraction_authority.clone(),
             ExtractionRequest::try_new(
                 request_limited_csv,
                 NonZeroU32::new(1).ok_or("nonzero record limit")?,
@@ -226,7 +233,7 @@ async fn every_local_format_survives_rights_publish_restart_and_exact_query() ->
         b"id,value\nduplicate,1.00\nduplicate,2.00\n",
     )?;
     let duplicate_csv = source
-        .discover_files(&discovery, &CancellationToken::new())
+        .discover_files(&extraction_authority, &discovery, &CancellationToken::new())
         .await?
         .objects()
         .iter()
@@ -235,6 +242,7 @@ async fn every_local_format_survives_rights_publish_restart_and_exact_query() ->
         .ok_or("duplicate CSV discovery is absent")?;
     let duplicate_error = source
         .extract_file(
+            &extraction_authority,
             &ExtractionRequest::try_new(
                 duplicate_csv,
                 NonZeroU32::new(2).ok_or("nonzero record limit")?,
@@ -256,7 +264,7 @@ async fn every_local_format_survives_rights_publish_restart_and_exact_query() ->
         b"id,value\ncsv-row,99.00\n",
     )?;
     let changed_csv = source
-        .discover_files(&discovery, &CancellationToken::new())
+        .discover_files(&extraction_authority, &discovery, &CancellationToken::new())
         .await?
         .objects()
         .iter()
@@ -274,6 +282,7 @@ async fn every_local_format_survives_rights_publish_restart_and_exact_query() ->
     let changed_availability = changed_csv.availability().clone();
     let changed_csv = source
         .extract_file(
+            &extraction_authority,
             &ExtractionRequest::try_new(
                 changed_csv,
                 NonZeroU32::new(1).ok_or("nonzero record limit")?,
@@ -338,7 +347,7 @@ async fn every_local_format_survives_rights_publish_restart_and_exact_query() ->
         }),
     )?;
     let restarted_object = restarted_source
-        .discover_files(&discovery, &CancellationToken::new())
+        .discover_files(&extraction_authority, &discovery, &CancellationToken::new())
         .await?
         .objects()
         .iter()
@@ -349,6 +358,7 @@ async fn every_local_format_survives_rights_publish_restart_and_exact_query() ->
     assert_eq!(restarted_object.availability(), original_csv.availability());
     let restarted_batch = restarted_source
         .extract_file(
+            &extraction_authority,
             &ExtractionRequest::try_new(
                 restarted_object,
                 NonZeroU32::new(1).ok_or("nonzero record limit")?,

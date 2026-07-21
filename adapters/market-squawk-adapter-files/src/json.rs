@@ -287,6 +287,7 @@ fn parse_one(
     budget: &mut ParseBudget<'_>,
     admit_row: bool,
 ) -> Result<JsonValue, FileAdapterError> {
+    reject_reserved_number_keys(bytes, budget)?;
     // serde_json may allocate a decoded scratch string before invoking the visitor for escaped
     // values and owned map keys. Decoded UTF-8 cannot exceed the raw JSON slice, and the doubled
     // bound covers allocator growth before any visitor callback can run.
@@ -310,6 +311,89 @@ fn parse_one(
         .end()
         .map_err(|_| FileAdapterError::InvalidRecord)?;
     Ok(value)
+}
+
+fn reject_reserved_number_keys(
+    bytes: &[u8],
+    budget: &mut ParseBudget<'_>,
+) -> Result<(), FileAdapterError> {
+    let mut index = 0_usize;
+    let mut next_checkpoint = 4_096_usize;
+    while index < bytes.len() {
+        if index >= next_checkpoint {
+            budget.checkpoint()?;
+            next_checkpoint = next_checkpoint.saturating_add(4_096);
+        }
+        if bytes[index] != b'"' {
+            index += 1;
+            continue;
+        }
+        let (matches_reserved, after_string) = string_matches_reserved_number_token(bytes, index);
+        index = after_string;
+        let mut following = after_string;
+        while bytes.get(following).is_some_and(u8::is_ascii_whitespace) {
+            following += 1;
+        }
+        if matches_reserved && bytes.get(following) == Some(&b':') {
+            return Err(FileAdapterError::InvalidRecord);
+        }
+    }
+    Ok(())
+}
+
+fn string_matches_reserved_number_token(bytes: &[u8], opening_quote: usize) -> (bool, usize) {
+    let token = ARBITRARY_PRECISION_NUMBER_TOKEN.as_bytes();
+    let mut index = opening_quote.saturating_add(1);
+    let mut token_index = 0_usize;
+    let mut matches = true;
+    while let Some(&byte) = bytes.get(index) {
+        if byte == b'"' {
+            return (matches && token_index == token.len(), index + 1);
+        }
+        let (decoded, consumed) = if byte == b'\\' {
+            match bytes.get(index + 1).copied() {
+                Some(b'"') => (Some(b'"'), 2),
+                Some(b'\\') => (Some(b'\\'), 2),
+                Some(b'/') => (Some(b'/'), 2),
+                Some(b'b') => (Some(0x08), 2),
+                Some(b'f') => (Some(0x0c), 2),
+                Some(b'n') => (Some(b'\n'), 2),
+                Some(b'r') => (Some(b'\r'), 2),
+                Some(b't') => (Some(b'\t'), 2),
+                Some(b'u') => {
+                    let value = bytes
+                        .get(index + 2..index + 6)
+                        .and_then(decode_ascii_hex_quad);
+                    (value.and_then(|value| u8::try_from(value).ok()), 6)
+                }
+                Some(_) => (None, 2),
+                None => return (false, bytes.len()),
+            }
+        } else {
+            (Some(byte), 1)
+        };
+        if decoded.is_none_or(|decoded| token.get(token_index) != Some(&decoded)) {
+            matches = false;
+        }
+        token_index = token_index.saturating_add(1);
+        index = index.saturating_add(consumed).min(bytes.len());
+    }
+    (false, bytes.len())
+}
+
+fn decode_ascii_hex_quad(bytes: &[u8]) -> Option<u16> {
+    if bytes.len() != 4 {
+        return None;
+    }
+    bytes.iter().try_fold(0_u16, |value, byte| {
+        let digit = match byte {
+            b'0'..=b'9' => u16::from(byte - b'0'),
+            b'a'..=b'f' => u16::from(byte - b'a') + 10,
+            b'A'..=b'F' => u16::from(byte - b'A') + 10,
+            _ => return None,
+        };
+        value.checked_mul(16)?.checked_add(digit)
+    })
 }
 
 fn classify_json_error(message: &str, budget: &ParseBudget<'_>) -> FileAdapterError {

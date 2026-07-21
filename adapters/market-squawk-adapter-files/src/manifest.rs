@@ -2,7 +2,9 @@
 
 use std::collections::BTreeSet;
 
-use market_squawk_domain::{SourceIdentifier, Timestamp};
+use market_squawk_domain::{
+    ResearchTemporalCoordinate, ResearchTime, RevisionNumber, SourceIdentifier, Timestamp,
+};
 use rust_decimal::Decimal;
 use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
@@ -11,7 +13,7 @@ use std::marker::PhantomData;
 
 use crate::{ExtractionLimits, FileAdapterError};
 
-const MANIFEST_SCHEMA_VERSION: u16 = 1;
+const MANIFEST_SCHEMA_VERSION: u16 = 2;
 const MAX_MANIFEST_OBJECTS: usize = 4_096;
 pub(super) const MAX_MAPPINGS: usize = 1_024;
 
@@ -45,6 +47,14 @@ impl FileSourceManifest {
                     .superseded_at
                     .is_some_and(|value| value <= object.effective_at)
                 || object.revision_number == 0
+                || ResearchTime::try_new_with_coordinates(
+                    object.record_time.effective.clone(),
+                    object.record_time.published.clone(),
+                    RevisionNumber::new(object.revision_number)
+                        .map_err(|_| FileAdapterError::InvalidManifest)?,
+                    object.record_time.superseded.clone(),
+                )
+                .is_err()
             {
                 return Err(FileAdapterError::InvalidManifest);
             }
@@ -68,7 +78,17 @@ pub(crate) struct FileObjectSpec {
     pub(crate) revision: SourceIdentifier,
     pub(crate) revision_number: u32,
     pub(crate) superseded_at: Option<Timestamp>,
+    /// Record coordinates retained independently from the exact discovery-object interval.
+    pub(crate) record_time: FileRecordTimeSpec,
     pub(crate) row_policy: RowPolicy,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FileRecordTimeSpec {
+    pub(crate) effective: ResearchTemporalCoordinate,
+    pub(crate) published: Option<ResearchTemporalCoordinate>,
+    pub(crate) superseded: Option<ResearchTemporalCoordinate>,
 }
 
 impl FileObjectSpec {

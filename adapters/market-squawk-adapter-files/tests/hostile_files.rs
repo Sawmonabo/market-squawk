@@ -17,19 +17,22 @@ use market_squawk_adapter_files::{
     ExtractionLimitsInput, FileAdapterError, FileExtractionSource, ParserLimit,
 };
 use market_squawk_domain::{
-    AuthorizationBasis, ChecksumCapability, CoverageDelay, DataQuality, DeliveryEvidence,
-    DigestAlgorithm, EffectiveInterval, ExactPayloadEvidence, MetadataRevision, PayloadReference,
-    ResearchObservation, RevisionBoundPayloadEvidence, SchemaVersion, SequenceCapability, SourceId,
-    SourceIdentifier, Timestamp,
+    AuthorizationBasis, CalendarDate, ChecksumCapability, CoverageDelay, DataQuality,
+    DeliveryEvidence, DigestAlgorithm, EffectiveInterval, ExactPayloadEvidence, MetadataRevision,
+    PayloadReference, ResearchObservation, ResearchTemporalCoordinate,
+    RevisionBoundPayloadEvidence, SchemaVersion, SequenceCapability, SourceId, SourceIdentifier,
+    Timestamp,
 };
 use market_squawk_platform::{
     ControlledInputFileError, InputFileError, InputReadCheckpoint, InputReadControl,
     InputReadControlError, InputReadPass, UserAuthorizedInputRoot,
 };
 use market_squawk_sources::{
-    AuthorizationGrant, AuthorizationMode, CoverageDomain, DiscoveryRequest, ExtractionRequest,
+    AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode, CoverageDomain,
+    DiscoveryBatch, DiscoveryRequest, ExtractionAuthority, ExtractionBatch, ExtractionRequest,
     FreshnessPolicy, HistoricalCapability, NetworkAccessPolicy, SourceCapabilities, SourceClass,
-    SourceCoverage, SourceMetadata, SourceMetadataInput, SourceObject, SourceProtocolProfile,
+    SourceCoverage, SourceMetadata, SourceMetadataInput, SourceMetadataProvider, SourceObject,
+    SourceProtocolProfile,
 };
 use parquet::arrow::ArrowWriter;
 use rusqlite::Connection;

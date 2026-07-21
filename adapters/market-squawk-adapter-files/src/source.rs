@@ -17,10 +17,10 @@ use market_squawk_platform::{
     InputReadControlError, UserAuthorizedInputRoot,
 };
 use market_squawk_sources::{
-    AvailabilityEvidence, DiscoveryBatch, DiscoveryRequest, ExtractionBatch,
-    ExtractionBatchAccumulator, ExtractionRecord, ExtractionRequest, ExtractionSource,
-    ExtractionSourceError, NetworkAccessPolicy, SourceClass, SourceError, SourceMetadata,
-    SourceMetadataProvider, SourceObject,
+    AvailabilityEvidence, CURRENT_RESEARCH_RECORD_SCHEMA, DiscoveryBatch, DiscoveryRequest,
+    ExtractionAuthority, ExtractionBatch, ExtractionBatchAccumulator, ExtractionRecord,
+    ExtractionRequest, ExtractionSource, ExtractionSourceError, NetworkAccessPolicy, SourceClass,
+    SourceError, SourceMetadata, SourceMetadataProvider, SourceObject,
 };
 use rust_decimal::Decimal;
 use sha2::{Digest as _, Sha256};
@@ -35,7 +35,6 @@ use crate::manifest::{FileFormat, FileObjectSpec, FileSourceManifest};
 use crate::representation::FileRepresentationAuthority;
 use crate::{csv, database, excel, json, ofx, parquet, xml};
 
-const RECORD_SCHEMA: &str = "market-squawk-research-v1";
 const MAX_CONCURRENT_BLOCKING_OPERATIONS: usize = 4;
 const MAX_CONCURRENT_DEADLINE_SAMPLES: usize = 4;
 static BLOCKING_SLOTS: LazyLock<Arc<Semaphore>> =
@@ -171,32 +170,46 @@ impl FileExtractionSource {
         })
     }
 
-    /// Discovers exact manifest objects with fresh no-follow reads on a bounded blocking lane.
+    /// Discovers exact manifest objects under current registry authority.
+    ///
+    /// Authority is checked at admission, after each blocking input read, and before publication.
     pub async fn discover_files(
         &self,
+        authority: &ExtractionAuthority,
         request: &DiscoveryRequest,
         cancellation: &CancellationToken,
     ) -> Result<DiscoveryBatch, FileAdapterError> {
+        self.validate_authority(authority)?;
         let deadline = self
             .seal_request_deadline(request.deadline(), cancellation)
             .await?;
         let permit = Self::acquire_blocking_slot(cancellation, deadline).await?;
         let source = self.clone();
+        let worker_authority = authority.clone();
         let request = request.clone();
         let worker_cancellation = cancellation.clone();
         let worker = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            source.discover_files_blocking(&request, &worker_cancellation, deadline)
+            source.discover_files_blocking(
+                &worker_authority,
+                &request,
+                &worker_cancellation,
+                deadline,
+            )
         });
-        Self::await_blocking(worker, cancellation, deadline).await
+        let batch = Self::await_blocking(worker, cancellation, deadline).await?;
+        self.validate_authority(authority)?;
+        Ok(batch)
     }
 
     fn discover_files_blocking(
         &self,
+        authority: &ExtractionAuthority,
         request: &DiscoveryRequest,
         cancellation: &CancellationToken,
         deadline: RequestDeadline,
     ) -> Result<DiscoveryBatch, FileAdapterError> {
+        self.validate_authority(authority)?;
         self.check_control(cancellation, deadline)?;
         let mut objects = Vec::new();
         for specification in self
@@ -216,6 +229,7 @@ impl FileExtractionSource {
         {
             self.check_control(cancellation, deadline)?;
             let input = self.read_object(specification, cancellation, deadline)?;
+            self.validate_authority(authority)?;
             let sampled_at = self.control_timestamp(cancellation, deadline)?;
             let availability = self.bind_object_availability(
                 &specification.dataset,
@@ -245,36 +259,51 @@ impl FileExtractionSource {
         }
         let batch =
             DiscoveryBatch::try_new(request, objects).map_err(|_| FileAdapterError::Contract)?;
+        self.validate_authority(authority)?;
         self.check_control(cancellation, deadline)?;
         Ok(batch)
     }
 
-    /// Extracts one object on a bounded blocking lane into canonical observations.
+    /// Extracts one object under current registry authority into canonical observations.
+    ///
+    /// Authority is checked at admission, after the blocking input read, and before publication.
     pub async fn extract_file(
         &self,
+        authority: &ExtractionAuthority,
         request: &ExtractionRequest,
         cancellation: &CancellationToken,
     ) -> Result<ExtractionBatch, FileAdapterError> {
+        self.validate_authority(authority)?;
         let deadline = self
             .seal_request_deadline(request.deadline(), cancellation)
             .await?;
         let permit = Self::acquire_blocking_slot(cancellation, deadline).await?;
         let source = self.clone();
+        let worker_authority = authority.clone();
         let request = request.clone();
         let worker_cancellation = cancellation.clone();
         let worker = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            source.extract_file_blocking(&request, &worker_cancellation, deadline)
+            source.extract_file_blocking(
+                &worker_authority,
+                &request,
+                &worker_cancellation,
+                deadline,
+            )
         });
-        Self::await_blocking(worker, cancellation, deadline).await
+        let batch = Self::await_blocking(worker, cancellation, deadline).await?;
+        self.validate_authority(authority)?;
+        Ok(batch)
     }
 
     fn extract_file_blocking(
         &self,
+        authority: &ExtractionAuthority,
         request: &ExtractionRequest,
         cancellation: &CancellationToken,
         deadline: RequestDeadline,
     ) -> Result<ExtractionBatch, FileAdapterError> {
+        self.validate_authority(authority)?;
         self.check_control(cancellation, deadline)?;
         let specification = self
             .manifest
@@ -299,6 +328,7 @@ impl FileExtractionSource {
             return Err(FileAdapterError::ObjectLineageMismatch);
         }
         let input = self.read_object(specification, cancellation, deadline)?;
+        self.validate_authority(authority)?;
         let sampled_received_at = self.control_timestamp(cancellation, deadline)?;
         if request.object().evidence().content_digest() != input.digest()
             || request.object().expected_bytes() != Some(input.identity().size_bytes())
@@ -343,14 +373,16 @@ impl FileExtractionSource {
             sampled_received_at,
             sampled_ingested_at,
         )?;
-        self.rows_to_batch(
+        let batch = self.rows_to_batch(
             request,
             specification,
             rows,
             operation_times,
             cancellation,
             deadline,
-        )
+        )?;
+        self.validate_authority(authority)?;
+        Ok(batch)
     }
 
     async fn acquire_blocking_slot(
@@ -606,12 +638,12 @@ impl FileExtractionSource {
                         availability: domain_availability.clone(),
                     })
                     .map_err(|_| FileAdapterError::Contract)?,
-                    ResearchTime::new(
-                        specification.effective_at,
-                        specification.published_at,
+                    ResearchTime::try_new_with_coordinates(
+                        specification.record_time.effective.clone(),
+                        specification.record_time.published.clone(),
                         RevisionNumber::new(specification.revision_number)
                             .map_err(|_| FileAdapterError::InvalidManifest)?,
-                        specification.superseded_at,
+                        specification.record_time.superseded.clone(),
                     )
                     .map_err(|_| FileAdapterError::Contract)?,
                 )
@@ -630,16 +662,16 @@ impl FileExtractionSource {
                     EvidenceDigest::new(DigestAlgorithm::Sha256, Sha256::digest(&payload).into());
                 batch
                     .push(
-                        ExtractionRecord::try_new(
+                        ExtractionRecord::try_new_with_time(
                             request,
-                            SourceIdentifier::try_from(RECORD_SCHEMA)
+                            SourceIdentifier::try_from(CURRENT_RESEARCH_RECORD_SCHEMA)
                                 .map_err(|_| FileAdapterError::Contract)?,
                             ExactPayloadEvidence::from_content_digest(evidence),
-                            specification.effective_at,
-                            specification.published_at,
+                            specification.record_time.effective.clone(),
+                            specification.record_time.published.clone(),
                             record_availability.clone(),
                             specification.revision.clone(),
-                            specification.superseded_at,
+                            specification.record_time.superseded.clone(),
                             Bytes::from(payload),
                         )
                         .map_err(FileAdapterError::ExtractionContract)?,
@@ -664,6 +696,13 @@ impl FileExtractionSource {
             return Err(FileAdapterError::Cancelled);
         }
         deadline.checkpoint(self.clock.as_ref())
+    }
+
+    fn validate_authority(&self, authority: &ExtractionAuthority) -> Result<(), FileAdapterError> {
+        if authority.metadata() != self.metadata.as_ref() {
+            return Err(FileAdapterError::AuthorityMismatch);
+        }
+        authority.validate_current().map_err(FileAdapterError::from)
     }
 
     fn control_timestamp(
@@ -822,11 +861,12 @@ impl SourceMetadataProvider for FileExtractionSource {
 impl ExtractionSource for FileExtractionSource {
     fn discover(
         &self,
+        authority: ExtractionAuthority,
         request: DiscoveryRequest,
         cancellation: CancellationToken,
     ) -> futures_util::future::BoxFuture<'_, Result<DiscoveryBatch, ExtractionSourceError>> {
         Box::pin(async move {
-            self.discover_files(&request, &cancellation)
+            self.discover_files(&authority, &request, &cancellation)
                 .await
                 .map_err(map_extraction_error)
         })
@@ -834,11 +874,12 @@ impl ExtractionSource for FileExtractionSource {
 
     fn extract(
         &self,
+        authority: ExtractionAuthority,
         request: ExtractionRequest,
         cancellation: CancellationToken,
     ) -> futures_util::future::BoxFuture<'_, Result<ExtractionBatch, ExtractionSourceError>> {
         Box::pin(async move {
-            self.extract_file(&request, &cancellation)
+            self.extract_file(&authority, &request, &cancellation)
                 .await
                 .map_err(map_extraction_error)
         })
@@ -859,6 +900,7 @@ fn map_extraction_error(error: FileAdapterError) -> ExtractionSourceError {
             ExtractionSourceError::Source(SourceError::InvalidProtocolState)
         }
         FileAdapterError::ExtractionContract(error) => ExtractionSourceError::Contract(error),
+        FileAdapterError::Authority(error) => ExtractionSourceError::Authority(error),
         _ => ExtractionSourceError::Source(SourceError::InvalidProtocolState),
     }
 }

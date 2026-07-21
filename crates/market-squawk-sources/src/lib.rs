@@ -52,8 +52,8 @@ pub use decoder::{
     ProviderTimestampEvidence, QuarantineReason, ResynchronizationReason,
 };
 pub use extraction::{
-    AvailabilityEvidence, DiscoveryBatch, DiscoveryRequest, DiscoveryRequestId,
-    ExtractionAuthorityError, ExtractionBatch, ExtractionBatchAccumulator,
+    AvailabilityEvidence, CURRENT_RESEARCH_RECORD_SCHEMA, DiscoveryBatch, DiscoveryRequest,
+    DiscoveryRequestId, ExtractionAuthorityError, ExtractionBatch, ExtractionBatchAccumulator,
     ExtractionContentIdentity, ExtractionError, ExtractionRecord, ExtractionRedirectPermit,
     ExtractionRequest, ExtractionRequestId, ExtractionRequestPermit, ExtractionSource,
     ExtractionSourceError, InFlightExtractionRequest, MAX_DISCOVERY_OBJECTS,

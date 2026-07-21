@@ -1,5 +1,48 @@
 use super::*;
 
+#[derive(Clone, Debug)]
+pub(super) struct AuthorizedFileSource {
+    source: FileExtractionSource,
+    authority: ExtractionAuthority,
+    _registry: Arc<Mutex<AuthoritativeSourceRegistry>>,
+}
+
+impl AuthorizedFileSource {
+    pub(super) async fn discover_files(
+        &self,
+        request: &DiscoveryRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<DiscoveryBatch, FileAdapterError> {
+        self.source
+            .discover_files(&self.authority, request, cancellation)
+            .await
+    }
+
+    pub(super) async fn extract_file(
+        &self,
+        request: &ExtractionRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<ExtractionBatch, FileAdapterError> {
+        self.source
+            .extract_file(&self.authority, request, cancellation)
+            .await
+    }
+}
+
+pub(super) fn authorize_source(
+    source: FileExtractionSource,
+) -> Result<AuthorizedFileSource, Box<dyn Error>> {
+    let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
+    let registered =
+        registry.register(source.metadata().clone(), Timestamp::from_unix_nanos(300))?;
+    let authority = registry.extraction_authority(&registered, &source)?;
+    Ok(AuthorizedFileSource {
+        source,
+        authority,
+        _registry: Arc::new(Mutex::new(registry)),
+    })
+}
+
 pub(super) fn xlsx_package(sheet: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
     xlsx_package_with_relationship(sheet, "worksheets/sheet1.xml")
 }
@@ -109,14 +152,14 @@ pub(super) async fn extract_fixture_with_limits(
         .resolve("manifest.json")?
         .open_bounded(16 * 1024)?
         .read_bounded()?;
-    let source = FileExtractionSource::try_new_with_clock(
+    let source = authorize_source(FileExtractionSource::try_new_with_clock(
         local_metadata(&manifest)?,
         root,
         representation_state_root(&representation_state, &manifest),
         manifest_input,
         ExtractionLimits::try_new(limits)?,
         fixed_clock(),
-    )?;
+    )?)?;
     let discovery = DiscoveryRequest::try_new(
         SourceIdentifier::try_from("alternative-prices")?,
         None,
@@ -185,7 +228,7 @@ pub(super) fn manifest_with_superseded(
         _ => serde_json::json!({ "kind": format }),
     };
     serde_json::to_vec(&serde_json::json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "objects": [{
             "dataset": "alternative-prices",
             "object_id": format!("{format}-fixture"),
@@ -196,6 +239,13 @@ pub(super) fn manifest_with_superseded(
             "revision": "revision-1",
             "revision_number": 1,
             "superseded_at": superseded_at,
+            "record_time": {
+                "effective": ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(100)),
+                "published": ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(150)),
+                "superseded": superseded_at.map(|value| {
+                    ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(value))
+                })
+            },
             "row_policy": {
                 "identity_field": "id",
                 "fields": [{

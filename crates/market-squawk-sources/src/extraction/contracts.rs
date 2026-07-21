@@ -24,6 +24,8 @@ pub const MAX_EXTRACTION_RECORD_BYTES: usize = 1024 * 1024;
 pub const MAX_EXTRACTION_BATCH_BYTES: u64 = 1024 * 1024 * 1024;
 /// Conservative deep-retained ceiling for one in-memory extraction batch.
 pub const MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES: u64 = 64 * 1024 * 1024;
+/// Current normalized research-record schema accepted by analytical storage.
+pub const CURRENT_RESEARCH_RECORD_SCHEMA: &str = "market-squawk-research-v3";
 
 /// Deterministic identity of all discovery request semantics.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

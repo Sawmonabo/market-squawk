@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "objects": [
     {
       "dataset": "alternative-prices",
@@ -11,6 +11,11 @@
       "revision": "revision-1",
       "revision_number": 1,
       "superseded_at": null,
+      "record_time": {
+        "effective": { "schema_version": 2, "coordinate": { "precision": "exact_timestamp", "value": 100 } },
+        "published": { "schema_version": 2, "coordinate": { "precision": "exact_timestamp", "value": 150 } },
+        "superseded": null
+      },
       "row_policy": {
         "identity_field": "id",
         "fields": [{ "source": "value", "field": "price", "decimal_scale": 2, "unit": "USD" }]
@@ -26,6 +31,11 @@
       "revision": "revision-1",
       "revision_number": 1,
       "superseded_at": null,
+      "record_time": {
+        "effective": { "schema_version": 2, "coordinate": { "precision": "exact_timestamp", "value": 100 } },
+        "published": { "schema_version": 2, "coordinate": { "precision": "exact_timestamp", "value": 150 } },
+        "superseded": null
+      },
       "row_policy": {
         "identity_field": "id",
         "fields": [{ "source": "value", "field": "price", "decimal_scale": 2, "unit": "USD" }]
@@ -41,6 +51,11 @@
       "revision": "revision-1",
       "revision_number": 1,
       "superseded_at": null,
+      "record_time": {
+        "effective": { "schema_version": 2, "coordinate": { "precision": "exact_timestamp", "value": 100 } },
+        "published": { "schema_version": 2, "coordinate": { "precision": "exact_timestamp", "value": 150 } },
+        "superseded": null
+      },
       "row_policy": {
         "identity_field": "id",
         "fields": [{ "source": "value", "field": "price", "decimal_scale": 2, "unit": "USD" }]
@@ -56,6 +71,11 @@
       "revision": "revision-1",
       "revision_number": 1,
       "superseded_at": null,
+      "record_time": {
+        "effective": { "schema_version": 2, "coordinate": { "precision": "exact_timestamp", "value": 100 } },
+        "published": { "schema_version": 2, "coordinate": { "precision": "exact_timestamp", "value": 150 } },
+        "superseded": null
+      },
       "row_policy": {
         "identity_field": "id",
         "fields": [{ "source": "value", "field": "price", "decimal_scale": 2, "unit": "USD" }]
@@ -71,6 +91,11 @@
       "revision": "revision-1",
       "revision_number": 1,
       "superseded_at": null,
+      "record_time": {
+        "effective": { "schema_version": 2, "coordinate": { "precision": "exact_timestamp", "value": 100 } },
+        "published": { "schema_version": 2, "coordinate": { "precision": "exact_timestamp", "value": 150 } },
+        "superseded": null
+      },
       "row_policy": {
         "identity_field": "id",
         "fields": [{ "source": "value", "field": "price", "decimal_scale": 2, "unit": "USD" }]
@@ -86,6 +111,11 @@
       "revision": "revision-1",
       "revision_number": 1,
       "superseded_at": null,
+      "record_time": {
+        "effective": { "schema_version": 2, "coordinate": { "precision": "exact_timestamp", "value": 100 } },
+        "published": { "schema_version": 2, "coordinate": { "precision": "exact_timestamp", "value": 150 } },
+        "superseded": null
+      },
       "row_policy": {
         "identity_field": "id",
         "fields": [{ "source": "value", "field": "price", "decimal_scale": 2, "unit": "USD" }]
@@ -101,6 +131,11 @@
       "revision": "revision-1",
       "revision_number": 1,
       "superseded_at": null,
+      "record_time": {
+        "effective": { "schema_version": 2, "coordinate": { "precision": "exact_timestamp", "value": 100 } },
+        "published": { "schema_version": 2, "coordinate": { "precision": "exact_timestamp", "value": 150 } },
+        "superseded": null
+      },
       "row_policy": {
         "identity_field": "id",
         "fields": [{ "source": "value", "field": "price", "decimal_scale": 2, "unit": "USD" }]
@@ -121,6 +156,11 @@
       "revision": "revision-1",
       "revision_number": 1,
       "superseded_at": null,
+      "record_time": {
+        "effective": { "schema_version": 2, "coordinate": { "precision": "exact_timestamp", "value": 100 } },
+        "published": { "schema_version": 2, "coordinate": { "precision": "exact_timestamp", "value": 150 } },
+        "superseded": null
+      },
       "row_policy": {
         "identity_field": "id",
         "fields": [{ "source": "value", "field": "price", "decimal_scale": 2, "unit": "USD" }]
@@ -136,6 +176,11 @@
       "revision": "revision-1",
       "revision_number": 1,
       "superseded_at": null,
+      "record_time": {
+        "effective": { "schema_version": 2, "coordinate": { "precision": "exact_timestamp", "value": 100 } },
+        "published": { "schema_version": 2, "coordinate": { "precision": "exact_timestamp", "value": 150 } },
+        "superseded": null
+      },
       "row_policy": {
         "identity_field": "id",
         "fields": [{ "source": "value", "field": "price", "decimal_scale": 2, "unit": "USD" }]
@@ -151,6 +196,11 @@
       "revision": "revision-1",
       "revision_number": 1,
       "superseded_at": null,
+      "record_time": {
+        "effective": { "schema_version": 2, "coordinate": { "precision": "exact_timestamp", "value": 100 } },
+        "published": { "schema_version": 2, "coordinate": { "precision": "exact_timestamp", "value": 150 } },
+        "superseded": null
+      },
       "row_policy": {
         "identity_field": "id",
         "fields": [{ "source": "value", "field": "price", "decimal_scale": 2, "unit": "USD" }]

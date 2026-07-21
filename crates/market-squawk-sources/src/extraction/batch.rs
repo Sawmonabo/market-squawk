@@ -10,7 +10,10 @@ use super::contracts::{
     AvailabilityEvidence, ExtractionError, ExtractionRecord, ExtractionRequest,
     MAX_EXTRACTION_RECORDS, MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES,
 };
-use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, ExactPayloadEvidence, Timestamp};
+use market_squawk_domain::{
+    DigestAlgorithm, EvidenceDigest, ExactPayloadEvidence, ResearchTemporalCoordinate,
+    ResearchTemporalPrecision, Timestamp,
+};
 
 const ALLOCATOR_CAPACITY_ALLOWANCE_FACTOR: usize = 2;
 
@@ -59,7 +62,7 @@ impl ExtractionContentIdentity {
         let object = batch.request.object();
         let records = batch.records();
         let mut identity = Sha256::new();
-        identity.update(b"market-squawk/extraction-content/v1");
+        identity.update(b"market-squawk/extraction-content/v2");
         hash_text(&mut identity, object.source_id().as_str())?;
         hash_text(
             &mut identity,
@@ -87,11 +90,11 @@ impl ExtractionContentIdentity {
             hash_evidence(&mut identity, record.object_evidence());
             hash_text(&mut identity, record.schema().as_str())?;
             hash_evidence(&mut identity, record.evidence());
-            hash_timestamp(&mut identity, record.effective_at());
-            hash_optional_timestamp(&mut identity, record.published_at());
+            hash_temporal_coordinate(&mut identity, record.effective_time())?;
+            hash_optional_temporal_coordinate(&mut identity, record.published_time())?;
             hash_availability(&mut identity, record.availability())?;
             hash_text(&mut identity, record.revision().as_str())?;
-            hash_optional_timestamp(&mut identity, record.superseded_at());
+            hash_optional_temporal_coordinate(&mut identity, record.superseded_time())?;
         }
         Ok(Self {
             digest: EvidenceDigest::new(DigestAlgorithm::Sha256, identity.finalize().into()),
@@ -304,6 +307,56 @@ fn hash_optional_timestamp(identity: &mut Sha256, timestamp: Option<Timestamp>) 
             hash_timestamp(identity, timestamp);
         }
         None => identity.update([0]),
+    }
+}
+
+fn hash_temporal_coordinate(
+    identity: &mut Sha256,
+    coordinate: &ResearchTemporalCoordinate,
+) -> Result<(), ExtractionError> {
+    match coordinate.precision() {
+        ResearchTemporalPrecision::ExactTimestamp => {
+            identity.update([1]);
+            let timestamp = coordinate
+                .exact_timestamp()
+                .ok_or(ExtractionError::InvalidPointInTimeOrdering)?;
+            hash_timestamp(identity, timestamp);
+        }
+        ResearchTemporalPrecision::CalendarDate => {
+            identity.update([2]);
+            let date = coordinate
+                .calendar_date_value()
+                .ok_or(ExtractionError::InvalidPointInTimeOrdering)?;
+            identity.update(date.year().to_be_bytes());
+            identity.update([date.month(), date.day()]);
+        }
+        ResearchTemporalPrecision::SourcePeriod => {
+            identity.update([3]);
+            let period = coordinate
+                .source_period_value()
+                .ok_or(ExtractionError::InvalidPointInTimeOrdering)?;
+            hash_text(identity, period.scheme().as_str())?;
+            identity.update(period.year().to_be_bytes());
+            identity.update(period.ordinal().get().to_be_bytes());
+            hash_text(identity, period.code().as_str())?;
+        }
+    }
+    Ok(())
+}
+
+fn hash_optional_temporal_coordinate(
+    identity: &mut Sha256,
+    coordinate: Option<&ResearchTemporalCoordinate>,
+) -> Result<(), ExtractionError> {
+    match coordinate {
+        Some(coordinate) => {
+            identity.update([1]);
+            hash_temporal_coordinate(identity, coordinate)
+        }
+        None => {
+            identity.update([0]);
+            Ok(())
+        }
     }
 }
 

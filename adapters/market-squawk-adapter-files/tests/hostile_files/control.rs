@@ -40,6 +40,13 @@ struct BlockingWorkerClock {
 }
 
 #[derive(Debug)]
+struct RevocationReadClock {
+    calls: AtomicUsize,
+    entered: Arc<Barrier>,
+    release: Arc<Barrier>,
+}
+
+#[derive(Debug)]
 struct BlockedClockRelease {
     barrier: Option<Arc<Barrier>>,
 }
@@ -150,6 +157,19 @@ impl ExtractionClock for BlockingWorkerClock {
     }
 }
 
+impl ExtractionClock for RevocationReadClock {
+    fn observe(&self) -> Result<ExtractionClockReading, ExtractionClockError> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 3 {
+            self.entered.wait();
+            self.release.wait();
+        }
+        Ok(ExtractionClockReading::new(
+            Timestamp::from_unix_nanos(300),
+            Instant::now(),
+        ))
+    }
+}
+
 impl ExtractionClock for PanickingClock {
     #[allow(
         clippy::panic,
@@ -167,8 +187,64 @@ pub(super) fn fixed_clock() -> Arc<dyn ExtractionClock> {
     )))
 }
 
+#[tokio::test]
+async fn revocation_during_blocking_read_prevents_discovery_publication()
+-> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let representation_state = tempfile::tempdir()?;
+    fs::write(directory.path().join("source.csv"), b"id,value\nrow,1.00\n")?;
+    let manifest = manifest("source.csv", "csv");
+    fs::write(directory.path().join("manifest.json"), &manifest)?;
+    let root = UserAuthorizedInputRoot::open(fs::canonicalize(directory.path())?)?;
+    let manifest_input = root
+        .resolve("manifest.json")?
+        .open_bounded(16 * 1024)?
+        .read_bounded()?;
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let metadata = local_metadata(&manifest)?;
+    let source = FileExtractionSource::try_new_with_clock(
+        metadata.clone(),
+        root,
+        representation_state_root(&representation_state, &manifest),
+        manifest_input,
+        ExtractionLimits::try_new(ExtractionLimitsInput::standard())?,
+        Arc::new(RevocationReadClock {
+            calls: AtomicUsize::new(0),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        }),
+    )?;
+    let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
+    let registered = registry.register(metadata, Timestamp::from_unix_nanos(300))?;
+    let authority = registry.extraction_authority(&registered, &source)?;
+    let request = DiscoveryRequest::try_new(
+        SourceIdentifier::try_from("alternative-prices")?,
+        None,
+        NonZeroU16::new(1).ok_or("nonzero")?,
+        Timestamp::from_unix_nanos(10_000_000_000),
+    )?;
+    let operation = tokio::spawn(async move {
+        source
+            .discover_files(&authority, &request, &CancellationToken::new())
+            .await
+    });
+
+    tokio::task::spawn_blocking(move || entered.wait()).await?;
+    registry.revoke(&registered, Timestamp::from_unix_nanos(300))?;
+    tokio::task::spawn_blocking(move || release.wait()).await?;
+
+    assert!(matches!(
+        operation.await?,
+        Err(FileAdapterError::Authority(
+            market_squawk_sources::ExtractionAuthorityError::NotCurrent
+        ))
+    ));
+    Ok(())
+}
+
 fn verify_deadline_sampling_saturation(
-    source: FileExtractionSource,
+    source: AuthorizedFileSource,
     request: DiscoveryRequest,
     blocked_entered: Arc<Barrier>,
     blocked_release: Arc<Barrier>,
@@ -264,7 +340,7 @@ fn verify_deadline_sampling_saturation(
 }
 
 fn verify_blocking_worker_cancellation(
-    source: FileExtractionSource,
+    source: AuthorizedFileSource,
     request: DiscoveryRequest,
     sealing_together: Arc<Barrier>,
     workers_entered: Arc<Barrier>,
@@ -403,14 +479,14 @@ async fn discovery_control_path_fails_closed_without_blocking_the_runtime()
     let entered = Arc::new(Barrier::new(2));
     let release = Arc::new(Barrier::new(2));
     let sampling_thread = Arc::new(Mutex::new(None));
-    let source = FileExtractionSource::try_new_with_clock(
+    let source = authorize_source(FileExtractionSource::try_new_with_clock(
         local_metadata(&manifest)?,
         root,
         representation_state_root_for(&representation_state, &manifest, "scripted"),
         manifest_input,
         ExtractionLimits::try_new(ExtractionLimitsInput::standard())?,
         clock,
-    )?;
+    )?)?;
     let request = DiscoveryRequest::try_new(
         SourceIdentifier::try_from("alternative-prices")?,
         None,
@@ -427,7 +503,7 @@ async fn discovery_control_path_fails_closed_without_blocking_the_runtime()
         .resolve("manifest.json")?
         .open_bounded(16 * 1024)?
         .read_bounded()?;
-    let source = FileExtractionSource::try_new_with_clock(
+    let source = authorize_source(FileExtractionSource::try_new_with_clock(
         local_metadata(&manifest)?,
         root,
         representation_state_root_for(&representation_state, &manifest, "thread-probe"),
@@ -439,7 +515,7 @@ async fn discovery_control_path_fails_closed_without_blocking_the_runtime()
             release: Arc::clone(&release),
             sampling_thread: Arc::clone(&sampling_thread),
         }),
-    )?;
+    )?)?;
     let responsive_request = DiscoveryRequest::try_new(
         SourceIdentifier::try_from("alternative-prices")?,
         None,
@@ -465,14 +541,14 @@ async fn discovery_control_path_fails_closed_without_blocking_the_runtime()
         .resolve("manifest.json")?
         .open_bounded(16 * 1024)?
         .read_bounded()?;
-    let source = FileExtractionSource::try_new_with_clock(
+    let source = authorize_source(FileExtractionSource::try_new_with_clock(
         local_metadata(&manifest)?,
         root,
         representation_state_root_for(&representation_state, &manifest, "panic"),
         manifest_input,
         ExtractionLimits::try_new(ExtractionLimitsInput::standard())?,
         Arc::new(PanickingClock),
-    )?;
+    )?)?;
     let panic_request = DiscoveryRequest::try_new(
         SourceIdentifier::try_from("alternative-prices")?,
         None,
@@ -492,7 +568,7 @@ async fn discovery_control_path_fails_closed_without_blocking_the_runtime()
             .resolve("manifest.json")?
             .open_bounded(16 * 1024)?
             .read_bounded()?;
-        let source = FileExtractionSource::try_new_with_clock(
+        let source = authorize_source(FileExtractionSource::try_new_with_clock(
             local_metadata(&manifest)?,
             root,
             representation_state_root_for(
@@ -507,7 +583,7 @@ async fn discovery_control_path_fails_closed_without_blocking_the_runtime()
                 calls: AtomicUsize::new(0),
                 fail_at,
             }),
-        )?;
+        )?)?;
         let request = DiscoveryRequest::try_new(
             SourceIdentifier::try_from("alternative-prices")?,
             None,
@@ -527,7 +603,7 @@ async fn discovery_control_path_fails_closed_without_blocking_the_runtime()
             .resolve("manifest.json")?
             .open_bounded(16 * 1024)?
             .read_bounded()?;
-        let source = FileExtractionSource::try_new_with_clock(
+        let source = authorize_source(FileExtractionSource::try_new_with_clock(
             local_metadata(&manifest)?,
             root,
             representation_state_root_for(
@@ -542,7 +618,7 @@ async fn discovery_control_path_fails_closed_without_blocking_the_runtime()
                 calls: AtomicUsize::new(0),
                 fail_at,
             }),
-        )?;
+        )?)?;
         let discovery = DiscoveryRequest::try_new(
             SourceIdentifier::try_from("alternative-prices")?,
             None,
@@ -580,7 +656,7 @@ async fn discovery_control_path_fails_closed_without_blocking_the_runtime()
         .read_bounded()?;
     let mut bounded_limits = ExtractionLimitsInput::standard();
     bounded_limits.max_elapsed = Duration::from_secs(1);
-    let bounded_source = FileExtractionSource::try_new_with_clock(
+    let bounded_source = authorize_source(FileExtractionSource::try_new_with_clock(
         local_metadata(&manifest)?,
         root,
         representation_state_root_for(&representation_state, &manifest, "deadline-sampling"),
@@ -592,7 +668,7 @@ async fn discovery_control_path_fails_closed_without_blocking_the_runtime()
             blocked_release: Arc::clone(&blocked_release),
             reused_together: Arc::clone(&reused_together),
         }),
-    )?;
+    )?)?;
     let bounded_request = DiscoveryRequest::try_new(
         SourceIdentifier::try_from("alternative-prices")?,
         None,
@@ -618,7 +694,7 @@ async fn discovery_control_path_fails_closed_without_blocking_the_runtime()
         .resolve("manifest.json")?
         .open_bounded(16 * 1024)?
         .read_bounded()?;
-    let source = FileExtractionSource::try_new_with_clock(
+    let source = authorize_source(FileExtractionSource::try_new_with_clock(
         local_metadata(&manifest)?,
         root,
         representation_state_root_for(&representation_state, &manifest, "blocking-workers"),
@@ -630,7 +706,7 @@ async fn discovery_control_path_fails_closed_without_blocking_the_runtime()
             workers_entered: Arc::clone(&workers_entered),
             workers_release: Arc::clone(&workers_release),
         }),
-    )?;
+    )?)?;
     let request = DiscoveryRequest::try_new(
         SourceIdentifier::try_from("alternative-prices")?,
         None,
@@ -663,14 +739,14 @@ async fn discovery_uses_half_open_manifest_intervals_before_file_reads()
         .resolve("manifest.json")?
         .open_bounded(16 * 1024)?
         .read_bounded()?;
-    let source = FileExtractionSource::try_new_with_clock(
+    let source = authorize_source(FileExtractionSource::try_new_with_clock(
         local_metadata(&manifest)?,
         root,
         representation_state_root_for(&representation_state, &manifest, "half-open"),
         manifest_input,
         ExtractionLimits::try_new(ExtractionLimitsInput::standard())?,
         fixed_clock(),
-    )?;
+    )?)?;
     let before = DiscoveryRequest::try_new(
         SourceIdentifier::try_from("alternative-prices")?,
         Some(Timestamp::from_unix_nanos(499)),
@@ -716,14 +792,14 @@ async fn extraction_rejects_a_discovered_object_transplanted_from_another_source
         .resolve("manifest.json")?
         .open_bounded(16 * 1024)?
         .read_bounded()?;
-    let source = FileExtractionSource::try_new_with_clock(
+    let source = authorize_source(FileExtractionSource::try_new_with_clock(
         local_metadata(&manifest)?,
         root,
         representation_state_root_for(&representation_state, &manifest, "transplant"),
         manifest_input,
         ExtractionLimits::try_new(ExtractionLimitsInput::standard())?,
         fixed_clock(),
-    )?;
+    )?)?;
     let discovery = DiscoveryRequest::try_new(
         SourceIdentifier::try_from("alternative-prices")?,
         None,

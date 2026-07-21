@@ -17,14 +17,14 @@ async fn xlsx_rejects_archive_traversal_and_case_collisions() -> Result<(), Box<
         .resolve("manifest.json")?
         .open_bounded(16 * 1024)?
         .read_bounded()?;
-    let source = FileExtractionSource::try_new_with_clock(
+    let source = authorize_source(FileExtractionSource::try_new_with_clock(
         local_metadata(&manifest)?,
         root,
         representation_state_root(&representation_state, &manifest),
         manifest_input,
         ExtractionLimits::try_new(ExtractionLimitsInput::standard())?,
         fixed_clock(),
-    )?;
+    )?)?;
     let discovery = DiscoveryRequest::try_new(
         SourceIdentifier::try_from("alternative-prices")?,
         None,
