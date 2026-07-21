@@ -167,6 +167,8 @@ pub enum ParserLimit {
     ManifestObjects,
     /// Manifest row-field mappings.
     ManifestMappings,
+    /// Entries in one manifest format string sequence.
+    ManifestFormatSequenceEntries,
     /// Encoded bytes in one manifest string.
     ManifestStringBytes,
     /// Conservative retained manifest bytes.

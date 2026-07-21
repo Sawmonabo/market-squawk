@@ -66,6 +66,18 @@ async fn manifest_and_text_parsers_reject_ambiguous_or_expansive_inputs()
         .ok_or("manifest mappings changed type")?
         .push(second);
     let two_mappings = serde_json::to_vec(&two_mappings)?;
+    let mut sqlite_vectors: serde_json::Value =
+        serde_json::from_slice(&manifest("source.sqlite", "sqlite"))?;
+    let empty_names = vec![serde_json::Value::String(String::new()); 512];
+    sqlite_vectors["objects"][0]["format"]["columns"] =
+        serde_json::Value::Array(empty_names.clone());
+    sqlite_vectors["objects"][0]["format"]["order_by"] = serde_json::Value::Array(empty_names);
+    let sqlite_vectors = serde_json::to_vec(&sqlite_vectors)?;
+    let mut excessive_sqlite_columns: serde_json::Value =
+        serde_json::from_slice(&manifest("source.sqlite", "sqlite"))?;
+    excessive_sqlite_columns["objects"][0]["format"]["columns"] =
+        serde_json::Value::Array(vec![serde_json::Value::String(String::new()); 1_025]);
+    let excessive_sqlite_columns = serde_json::to_vec(&excessive_sqlite_columns)?;
     let deeply_nested = br#"{"schema_version":1,"objects":[[[[[[]]]]]]}"#.to_vec();
     let manifest_cases = [
         (
@@ -113,6 +125,19 @@ async fn manifest_and_text_parsers_reject_ambiguous_or_expansive_inputs()
             },
             FileAdapterError::LimitExceeded(ParserLimit::ManifestRetainedBytes),
         ),
+        (
+            sqlite_vectors,
+            ExtractionLimitsInput {
+                max_manifest_retained_bytes: 16 * 1024,
+                ..ExtractionLimitsInput::standard()
+            },
+            FileAdapterError::LimitExceeded(ParserLimit::ManifestRetainedBytes),
+        ),
+        (
+            excessive_sqlite_columns,
+            ExtractionLimitsInput::standard(),
+            FileAdapterError::LimitExceeded(ParserLimit::ManifestFormatSequenceEntries),
+        ),
     ];
     for (manifest, limits, expected) in manifest_cases {
         let directory = tempfile::tempdir()?;
@@ -132,7 +157,10 @@ async fn manifest_and_text_parsers_reject_ambiguous_or_expansive_inputs()
             ExtractionLimits::try_new(limits)?,
             fixed_clock(),
         );
-        assert!(matches!(result, Err(error) if error == expected));
+        let error = result
+            .err()
+            .ok_or("expansive manifest unexpectedly passed admission")?;
+        assert_eq!(error, expected);
     }
 
     let directory = tempfile::tempdir()?;
