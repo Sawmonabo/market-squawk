@@ -34,8 +34,10 @@ work is bound by the single canonical
   source metadata, exact registry-session/budget binding, one-use connection generations, and
   fresh-snapshot recovery after quarantine. Its current qualification ceiling is intentionally
   `DirectUnverified` because Kraken does not supply the venue sequence required by the current
-  execution policy. The canonical risk-to-paper terminal test proves `SourceQuality` rejection
-  before any paper cash, availability, position, or account-risk state can change.
+  execution policy. The application authority layer therefore never invokes strategy, approval,
+  dispatch, or paper execution for Kraken observations. An independent canonical risk probe also
+  proves both `SourceQuality` and unsupported-settlement rejection before any paper cash,
+  availability, position, or account-risk state can change.
 - Level 2 price-level snapshots and updates, heartbeat tracking separated from market freshness,
   match/trade capture, fixed-point prices and quantities, and in-memory order books.
 - MSJ1 append-only journal writing, CRC32 validation, a single-writer OS lock, bounded legacy read
@@ -60,16 +62,20 @@ work is bound by the single canonical
   one-time dispatcher, and paper worker under one lifecycle. Coinbase remains `DirectUnverified`,
   and the command installs a no-intent strategy, so this runnable ownership path cannot authorize or
   place an order.
-- A five-tool diagnostic stdio MCP compatibility server with strict schemas and per-process call
-  limiting; it is not the complete typed MCP product.
+- A hardened five-tool local stdio MCP surface with typed schemas, bounded admission, deadlines,
+  cancellation, result limits, controlled artifacts, durable audit, and bounded worker shutdown.
+  Audit, artifacts, capture, and configured journal reads derive from the same prepared local
+  capability graph. This is not the complete typed MCP product.
 - A deterministic mock source for offline diagnostic verification. It is never represented as a
   production source.
 
-The app-local Coinbase reader and MCP server remain compatibility paths. Their app-local
-`QualityState::Valid` is not canonical `DataQuality::DirectVerified` and cannot authorize an order.
-The separately composed production Coinbase source can enter the production live runtime only at
-its declared `DirectUnverified` ceiling; Coinbase and Kraken therefore remain execution-ineligible.
-All fills remain local paper simulation; no broker adapter or live order authority is enabled.
+The app-local Coinbase reader remains a compatibility path. Its app-local `QualityState::Valid` is
+not canonical `DataQuality::DirectVerified` and cannot authorize an order. The MCP command uses the
+sole hardened application MCP composition over that authority-free diagnostic state; there is no
+second legacy MCP server or unchecked application-local handler. The separately composed production
+Coinbase source can enter the production live runtime only at its declared `DirectUnverified`
+ceiling; Coinbase and Kraken therefore remain execution-ineligible. All fills remain local paper
+simulation; no broker adapter or live order authority is enabled.
 
 ## Required but missing
 
@@ -193,11 +199,15 @@ cargo build --workspace --all-features --release --locked
 
 All local data defaults to `.market-squawk/`. Override it with `--data-dir` or `MARKET_SQUAWK_DATA_DIR`.
 
-## Diagnostic MCP compatibility server
+## Hardened diagnostic MCP surface
 
-This is the five-tool diagnostic stdio MCP compatibility server, not the complete typed MCP product.
-Source, Research, Fundamental, Macro, Portfolio, Analysis, Model, FairValue, Bot, and Execution
-coverage remains release-blocking.
+This is the hardened five-tool diagnostic stdio MCP surface, not the complete typed MCP product.
+It is the application's sole MCP server path and enforces typed schemas, bounded requests and
+results, cancellation and deadlines, durable local audit, controlled artifacts, and bounded worker
+lifecycle. Audit, artifact, capture, and configured-journal authority share one prepared local path
+capability graph; journal tools accept no caller-supplied filesystem path. Source, Research,
+Fundamental, Macro, Portfolio, Analysis, Model, FairValue, Bot, and Execution coverage remains
+release-blocking.
 
 Offline mode is useful for verifying protocol integration without opening a market-data connection:
 
@@ -207,8 +217,8 @@ Offline mode is useful for verifying protocol integration without opening a mark
 market-squawk mcp --offline
 ```
 
-Diagnostic live-display mode starts the Coinbase Exchange compatibility reader and MCP server in
-the same process. It does not create `DirectVerified` authority:
+Diagnostic live-display mode starts the Coinbase Exchange compatibility reader and the sole hardened
+MCP composition in the same process. It does not create `DirectVerified` authority:
 
 **Diagnostic only — single-venue partial-coverage display plus five-tool MCP:**
 
@@ -235,7 +245,10 @@ Generic MCP client configuration:
 }
 ```
 
-The server writes protocol responses only to stdout. Operational logs go to stderr. Local stdio access inherits the operating-system identity of the process that launches it, and tool calls are schema-validated and rate-limited.
+The server writes protocol responses only to stdout. Operational logs go to stderr. Local stdio
+access inherits the operating-system identity of the process that launches it. Tool calls are
+schema-validated, rate-limited, deadline- and cancellation-aware, result-bounded, and durably
+audited before accepted mutations are reported complete.
 
 ### MCP tools
 
