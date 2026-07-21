@@ -15,11 +15,16 @@ use sha2::{Digest, Sha256};
 
 use super::{FredDataset, FredNamespace, FredSeriesMetadataDocument, FredSourceError};
 
+pub(super) struct CanonicalPageContext {
+    pub(super) prior_revisions_for_first_observation: u32,
+    pub(super) payload_digest: [u8; 32],
+}
+
 pub(super) fn canonical_observation_payloads(
     source: &SourceMetadata,
     dataset: &FredDataset,
     page: &crate::FredObservationPage,
-    page_digest: [u8; 32],
+    page_context: CanonicalPageContext,
     series_metadata: &FredSeriesMetadataDocument,
     received_at: Timestamp,
     ingested_at: Timestamp,
@@ -27,12 +32,27 @@ pub(super) fn canonical_observation_payloads(
     let unit = fred_unit_identifier(series_metadata.series().units())?;
     let series =
         SourceIdentifier::try_from(dataset.series_id()).map_err(|_| FredSourceError::Protocol)?;
-    let page_reference =
-        PayloadReference::ContentHash(PayloadHash::new(DigestAlgorithm::Sha256, page_digest));
+    let page_reference = PayloadReference::ContentHash(PayloadHash::new(
+        DigestAlgorithm::Sha256,
+        page_context.payload_digest,
+    ));
+    let mut previous_effective = if page_context.prior_revisions_for_first_observation > 0 {
+        page.observations()
+            .first()
+            .map(|observation| observation.observation_date())
+    } else {
+        None
+    };
+    let mut revision = page_context.prior_revisions_for_first_observation;
     page.observations()
         .iter()
         .map(|observation| {
-            let revision = SourceIdentifier::try_from(format!(
+            let revision_number = next_revision_number(
+                observation.observation_date(),
+                &mut previous_effective,
+                &mut revision,
+            )?;
+            let source_revision = SourceIdentifier::try_from(format!(
                 "{}:{}:{}:{}:{}",
                 match dataset.namespace {
                     FredNamespace::Fred => "fred",
@@ -49,7 +69,7 @@ pub(super) fn canonical_observation_payloads(
                 source_id: source.source_id().clone(),
                 instrument_id: None,
                 venue_id: None,
-                source_identifier: revision.clone(),
+                source_identifier: source_revision.clone(),
                 source_timestamp: None,
                 received_at,
                 ingested_at,
@@ -65,7 +85,7 @@ pub(super) fn canonical_observation_payloads(
             let time = ResearchTime::try_new_with_coordinates(
                 effective.clone(),
                 Some(published.clone()),
-                RevisionNumber::new(1).map_err(|_| FredSourceError::Protocol)?,
+                revision_number,
                 superseded.clone(),
             )
             .map_err(|_| FredSourceError::Protocol)?;
@@ -95,7 +115,7 @@ pub(super) fn canonical_observation_payloads(
                 availability: ExtractionAvailabilityEvidence::LocalFirstObserved {
                     observed_at: received_at,
                 },
-                revision,
+                revision: source_revision,
                 evidence: ExactPayloadEvidence::from_content_digest(EvidenceDigest::new(
                     DigestAlgorithm::Sha256,
                     digest,
@@ -104,6 +124,20 @@ pub(super) fn canonical_observation_payloads(
             })
         })
         .collect()
+}
+
+fn next_revision_number(
+    effective: CalendarDate,
+    previous_effective: &mut Option<CalendarDate>,
+    revision: &mut u32,
+) -> Result<RevisionNumber, FredSourceError> {
+    if *previous_effective == Some(effective) {
+        *revision = revision.checked_add(1).ok_or(FredSourceError::Protocol)?;
+    } else {
+        *previous_effective = Some(effective);
+        *revision = 1;
+    }
+    RevisionNumber::new(*revision).map_err(|_| FredSourceError::Protocol)
 }
 
 fn fred_unit_identifier(value: &str) -> Result<SourceIdentifier, FredSourceError> {
@@ -185,7 +219,36 @@ fn exclusive_superseded_at(
 mod tests {
     use market_squawk_domain::CalendarDate;
 
-    use super::exclusive_superseded_at;
+    use super::{exclusive_superseded_at, next_revision_number};
+
+    #[test]
+    fn revisions_are_one_based_per_effective_observation_across_page_boundaries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let effective = CalendarDate::new(2024, 1, 1)?;
+        let mut previous = None;
+        let mut revision = 0;
+        assert_eq!(
+            next_revision_number(effective, &mut previous, &mut revision)?.get(),
+            1
+        );
+        assert_eq!(
+            next_revision_number(effective, &mut previous, &mut revision)?.get(),
+            2
+        );
+
+        let mut prior_page_effective = Some(effective);
+        let mut prior_page_revisions = 2;
+        assert_eq!(
+            next_revision_number(
+                effective,
+                &mut prior_page_effective,
+                &mut prior_page_revisions
+            )?
+            .get(),
+            3
+        );
+        Ok(())
+    }
 
     #[test]
     fn closed_realtime_end_becomes_checked_exclusive_boundary()

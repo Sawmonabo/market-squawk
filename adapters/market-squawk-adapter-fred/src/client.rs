@@ -32,7 +32,7 @@ use http::{
     FredHttpRequest, FredHttpResponse, FredTransport, ReqwestFredTransport, system_timestamp,
 };
 use lineage::{evidence_for_payload, map_adapter_error, page_object_id, parse_object_id};
-use normalize::canonical_observation_payloads;
+use normalize::{CanonicalPageContext, canonical_observation_payloads};
 
 const OBSERVATIONS_ENDPOINT: &str = "https://api.stlouisfed.org/fred/series/observations";
 const DISCOVERY_PAGE_RECORDS: usize = 10_000;
@@ -289,9 +289,8 @@ impl FredSource {
         }
         let dataset = FredDataset::parse(request.object().dataset())
             .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?;
-        let (offset, limit, expected_digest, expected_metadata_digest) =
-            parse_object_id(request.object().object_id())
-                .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?;
+        let object = parse_object_id(request.object().object_id())
+            .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?;
         let series_metadata = self
             .acquire_series_metadata(
                 authority,
@@ -301,7 +300,7 @@ impl FredSource {
                 FredOperation::RetrieveEphemeral,
             )
             .await?;
-        if series_metadata.evidence().content_digest().bytes() != expected_metadata_digest {
+        if series_metadata.evidence().content_digest().bytes() != object.metadata_digest {
             return Err(ExtractionSourceError::Source(
                 SourceError::GenerationResynchronizationRequired,
             ));
@@ -311,15 +310,15 @@ impl FredSource {
                 authority,
                 FredPageRequest {
                     dataset: &dataset,
-                    offset,
-                    limit,
+                    offset: object.offset,
+                    limit: object.limit,
                     deadline: request.deadline(),
                     operation: FredOperation::RetrieveEphemeral,
                 },
                 cancellation,
             )
             .await?;
-        if fetched.digest != expected_digest
+        if fetched.digest != object.page_digest
             || !payload_matches_exact_evidence(&fetched.response.body, request.object().evidence())
             || request
                 .object()
@@ -342,7 +341,10 @@ impl FredSource {
             &self.metadata,
             &dataset,
             &fetched.page,
-            fetched.digest,
+            CanonicalPageContext {
+                prior_revisions_for_first_observation: object.prior_revisions_for_first_observation,
+                payload_digest: fetched.digest,
+            },
             &series_metadata,
             fetched.response.received_at,
             ingested_at,
@@ -399,6 +401,8 @@ impl FredSource {
         let mut objects = Vec::new();
         let mut offset = 0_usize;
         let mut expected_count = None;
+        let mut previous_observation_date = None;
+        let mut revisions_for_previous_observation = 0_u32;
         while objects.len() < usize::from(request.max_results()) {
             let fetched = self
                 .fetch_page(
@@ -424,11 +428,37 @@ impl FredSource {
                 ));
             }
             expected_count = Some(fetched.page.count());
+            let prior_revisions_for_first_observation = fetched
+                .page
+                .observations()
+                .first()
+                .filter(|observation| {
+                    previous_observation_date == Some(observation.observation_date())
+                })
+                .map_or(0, |_| revisions_for_previous_observation);
+            for observation in fetched.page.observations() {
+                let observation_date = observation.observation_date();
+                if previous_observation_date.is_some_and(|previous| observation_date < previous) {
+                    return Err(ExtractionSourceError::Source(
+                        SourceError::InvalidProtocolState,
+                    ));
+                }
+                if previous_observation_date == Some(observation_date) {
+                    revisions_for_previous_observation =
+                        revisions_for_previous_observation.checked_add(1).ok_or(
+                            ExtractionSourceError::Source(SourceError::InvalidProtocolState),
+                        )?;
+                } else {
+                    previous_observation_date = Some(observation_date);
+                    revisions_for_previous_observation = 1;
+                }
+            }
             let evidence = evidence_for_payload(&fetched.response.body, &fetched.public_url)
                 .map_err(map_adapter_error)?;
             let object_id = page_object_id(
                 offset,
                 self.discovery_page_records,
+                prior_revisions_for_first_observation,
                 fetched.digest,
                 metadata_digest,
             )
@@ -475,9 +505,8 @@ impl FredSource {
         }
         let dataset = FredDataset::parse(request.object().dataset())
             .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?;
-        let (offset, limit, expected_page_digest, expected_metadata_digest) =
-            parse_object_id(request.object().object_id())
-                .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?;
+        let object = parse_object_id(request.object().object_id())
+            .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?;
         let series_metadata = self
             .acquire_series_metadata(
                 &authority,
@@ -487,7 +516,7 @@ impl FredSource {
                 FredOperation::Persist,
             )
             .await?;
-        if series_metadata.evidence().content_digest().bytes() != expected_metadata_digest {
+        if series_metadata.evidence().content_digest().bytes() != object.metadata_digest {
             return Err(ExtractionSourceError::Source(
                 SourceError::GenerationResynchronizationRequired,
             ));
@@ -497,15 +526,15 @@ impl FredSource {
                 &authority,
                 FredPageRequest {
                     dataset: &dataset,
-                    offset,
-                    limit,
+                    offset: object.offset,
+                    limit: object.limit,
                     deadline: request.deadline(),
                     operation: FredOperation::Persist,
                 },
                 cancellation,
             )
             .await?;
-        if fetched.digest != expected_page_digest
+        if fetched.digest != object.page_digest
             || !payload_matches_exact_evidence(&fetched.response.body, request.object().evidence())
             || request
                 .object()
@@ -528,7 +557,10 @@ impl FredSource {
             &self.metadata,
             &dataset,
             &fetched.page,
-            fetched.digest,
+            CanonicalPageContext {
+                prior_revisions_for_first_observation: object.prior_revisions_for_first_observation,
+                payload_digest: fetched.digest,
+            },
             &series_metadata,
             fetched.response.received_at,
             ingested_at,
