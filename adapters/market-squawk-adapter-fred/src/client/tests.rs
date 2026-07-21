@@ -16,7 +16,8 @@ use market_squawk_sources::{
     CoverageDomain, EndpointPolicy, ExtractionRequest, ExtractionSource, FreshnessPolicy,
     HistoricalCapability, NetworkAccessPolicy, PathScope, ProviderBudgetPolicy, QueryParameterRule,
     QuerySensitivity, SourceCapabilities, SourceClass, SourceCoverage, SourceError, SourceMetadata,
-    SourceMetadataInput, SourceObject, SourceProtocolProfile,
+    SourceMetadataInput, SourceMetadataProvider, SourceObject, SourceProtocolProfile,
+    payload_matches_exact_evidence,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -28,7 +29,7 @@ use crate::{
 use super::http::collect_bounded_stream;
 use super::{
     FredApiKey, FredDataset, FredHttpRequest, FredHttpResponse, FredSource, FredSourceError,
-    FredTransport, canonical_payloads, system_timestamp,
+    FredTransport, canonical_payloads, fred_series_endpoint_rule, system_timestamp,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -247,6 +248,152 @@ async fn non_identity_content_encoding_is_rejected() -> TestResult {
     Ok(())
 }
 
+#[tokio::test]
+async fn series_metadata_is_exact_request_bound_and_rejects_non_unique_identity() -> TestResult {
+    const EXACT_RESPONSE: &[u8] = br#"{
+        "realtime_start":"2024-01-01",
+        "realtime_end":"2024-01-31",
+        "seriess":[{
+            "id":"CPIAUCSL",
+            "realtime_start":"2024-01-01",
+            "realtime_end":"2024-01-31",
+            "title":"Consumer Price Index for All Urban Consumers: All Items in U.S. City Average",
+            "observation_start":"1947-01-01",
+            "observation_end":"2023-12-01",
+            "frequency":"Monthly",
+            "frequency_short":"M",
+            "units":"Index 1982-1984=100",
+            "units_short":"Index 1982-1984=100",
+            "seasonal_adjustment":"Seasonally Adjusted",
+            "seasonal_adjustment_short":"SA",
+            "last_updated":"2024-01-11 07:42:02-06",
+            "popularity":95,
+            "notes":"Exact provider notes"
+        }]
+    }"#;
+    let now = system_timestamp()?;
+    let fred_source = source(
+        now,
+        FredHttpResponse {
+            status: 200,
+            retry_after: None,
+            content_encoding: None,
+            body: Bytes::from_static(EXACT_RESPONSE),
+            received_at: now,
+        },
+        "fred-series-metadata-test-user",
+    )?;
+    let dataset =
+        SourceIdentifier::try_from("alfred:series-observations:CPIAUCSL:2024-01-01:2024-01-31")?;
+    let document = fred_source
+        .acquire_series_metadata(
+            &dataset,
+            now.checked_add_nanos(10_000_000_000)?,
+            CancellationToken::new(),
+        )
+        .await?;
+
+    assert_eq!(document.source_id(), fred_source.metadata().source_id());
+    assert_eq!(
+        document.metadata_revision(),
+        fred_source.metadata().revision()
+    );
+    assert_eq!(document.dataset(), &dataset);
+    assert_eq!(document.response_bytes().as_ref(), EXACT_RESPONSE);
+    assert_eq!(document.response_length(), EXACT_RESPONSE.len() as u64);
+    assert_eq!(document.received_at(), now);
+    assert!(payload_matches_exact_evidence(
+        document.response_bytes(),
+        document.evidence()
+    ));
+    let locator = document
+        .evidence()
+        .version_pinned_locator()
+        .ok_or("series metadata must retain its secret-free exact request locator")?;
+    assert_eq!(
+        locator.reference().as_str(),
+        "https://api.stlouisfed.org/fred/series?series_id=CPIAUCSL&realtime_start=2024-01-01&realtime_end=2024-01-31&file_type=json"
+    );
+    assert!(!locator.reference().as_str().contains("api_key"));
+
+    let series = document.series();
+    assert_eq!(series.series_id().as_str(), "CPIAUCSL");
+    assert_eq!(series.realtime_start().to_string(), "2024-01-01");
+    assert_eq!(series.realtime_end().to_string(), "2024-01-31");
+    assert_eq!(
+        series.title(),
+        "Consumer Price Index for All Urban Consumers: All Items in U.S. City Average"
+    );
+    assert_eq!(series.observation_start().to_string(), "1947-01-01");
+    assert_eq!(series.observation_end().to_string(), "2023-12-01");
+    assert_eq!(series.frequency(), "Monthly");
+    assert_eq!(series.frequency_short(), "M");
+    assert_eq!(series.units(), "Index 1982-1984=100");
+    assert_eq!(series.units_short(), "Index 1982-1984=100");
+    assert_eq!(series.seasonal_adjustment(), "Seasonally Adjusted");
+    assert_eq!(series.seasonal_adjustment_short(), "SA");
+    assert_eq!(series.last_updated(), "2024-01-11 07:42:02-06");
+    assert_eq!(series.popularity(), 95);
+    assert_eq!(series.notes(), Some("Exact provider notes"));
+
+    let exact_value: serde_json::Value = serde_json::from_slice(EXACT_RESPONSE)?;
+    let mut absent_value = exact_value.clone();
+    absent_value["seriess"] = serde_json::json!([]);
+    let mut mismatch_value = exact_value.clone();
+    mismatch_value["seriess"][0]["id"] = serde_json::json!("GDPDEF");
+    let mut malformed_value = exact_value.clone();
+    malformed_value["seriess"][0]["last_updated"] = serde_json::json!("not-a-provider-timestamp");
+    let mut extra_value = exact_value;
+    let duplicate = extra_value["seriess"][0].clone();
+    extra_value["seriess"]
+        .as_array_mut()
+        .ok_or("test series list")?
+        .push(duplicate);
+    for (subject, body) in [
+        (
+            "fred-series-metadata-absent-user",
+            serde_json::to_vec(&absent_value)?,
+        ),
+        (
+            "fred-series-metadata-mismatch-user",
+            serde_json::to_vec(&mismatch_value)?,
+        ),
+        (
+            "fred-series-metadata-malformed-user",
+            serde_json::to_vec(&malformed_value)?,
+        ),
+        (
+            "fred-series-metadata-extra-user",
+            serde_json::to_vec(&extra_value)?,
+        ),
+    ] {
+        let rejecting_source = source(
+            now,
+            FredHttpResponse {
+                status: 200,
+                retry_after: None,
+                content_encoding: None,
+                body: Bytes::from(body),
+                received_at: now,
+            },
+            subject,
+        )?;
+        assert!(matches!(
+            rejecting_source
+                .acquire_series_metadata(
+                    &dataset,
+                    now.checked_add_nanos(10_000_000_000)?,
+                    CancellationToken::new(),
+                )
+                .await,
+            Err(market_squawk_sources::ExtractionSourceError::Source(
+                SourceError::InvalidProtocolState
+            ))
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 struct ScriptedTransport {
     response: FredHttpResponse,
@@ -337,15 +484,16 @@ fn metadata(now: Timestamp, authorization_subject: SourceIdentifier) -> TestResu
             .map_err(Into::into)
     })
     .collect::<TestResult<Vec<_>>>()?;
-    let endpoint = ApiEndpointRule::try_new(
+    let observations_endpoint = ApiEndpointRule::try_new(
         "https://api.stlouisfed.org/fred/series/observations",
         PathScope::Exact,
         query_rules,
         10,
         1024,
     )?;
+    let series_endpoint = fred_series_endpoint_rule()?;
     let network = EndpointPolicy::try_from_api_rules(
-        vec![endpoint],
+        vec![observations_endpoint, series_endpoint],
         market_squawk_sources::HttpRequestBounds::default(),
     )?;
     let budget = ProviderBudgetPolicy::try_new(

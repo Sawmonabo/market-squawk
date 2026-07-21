@@ -25,6 +25,9 @@ use crate::{
 
 mod http;
 mod lineage;
+mod metadata;
+
+pub use metadata::{FredSeriesMetadata, FredSeriesMetadataDocument, fred_series_endpoint_rule};
 
 use http::{
     FredHttpRequest, FredHttpResponse, FredTransport, ReqwestFredTransport, system_timestamp,

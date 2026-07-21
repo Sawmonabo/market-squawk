@@ -5,7 +5,10 @@ mod rights;
 mod series;
 mod vintages;
 
-pub use client::{FredApiKey, FredExtractedPage, FredSource, FredSourceError};
+pub use client::{
+    FredApiKey, FredExtractedPage, FredSeriesMetadata, FredSeriesMetadataDocument, FredSource,
+    FredSourceError, fred_series_endpoint_rule,
+};
 pub use rights::{
     FredOperation, FredOwnerAuthorizationEvidence, FredRightsArtifact, FredRightsDecision,
     FredRightsDisposition, FredRightsError, FredRightsPolicy, FredSeriesRightsGrant,
