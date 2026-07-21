@@ -558,10 +558,19 @@ impl FredSource {
             )
             .await
             .map_err(map_adapter_error)?;
+        if response
+            .content_encoding
+            .as_deref()
+            .is_some_and(|value| !value.eq_ignore_ascii_case(b"identity"))
+        {
+            return Err(ExtractionSourceError::Source(
+                SourceError::InvalidProtocolState,
+            ));
+        }
         match response.status {
             200 => {}
             401 | 403 => return Err(ExtractionSourceError::Source(SourceError::Unauthorized)),
-            429 => {
+            429 | 503 => {
                 let decision =
                     apply_http_retry_after(&self.budget, response.retry_after.as_deref(), 0);
                 return Err(ExtractionSourceError::Source(

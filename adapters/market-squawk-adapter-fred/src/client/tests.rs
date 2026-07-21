@@ -20,7 +20,10 @@ use market_squawk_sources::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::{FredObservationPage, FredParseLimits, FredRightsArtifact, FredRightsPolicy};
+use crate::{
+    FredObservationPage, FredParseLimits, FredRightsArtifact, FredRightsPolicy,
+    FredTermsDocumentBytes, FredTermsDocumentRole,
+};
 
 use super::http::collect_bounded_stream;
 use super::{
@@ -99,6 +102,7 @@ async fn discovery_and_ephemeral_extraction_are_exact_source_request_and_payload
     let response = FredHttpResponse {
         status: 200,
         retry_after: None,
+        content_encoding: None,
         body: Bytes::from_static(include_bytes!("../../fixtures/observations.json")),
         received_at: now,
     };
@@ -176,17 +180,57 @@ async fn discovery_and_ephemeral_extraction_are_exact_source_request_and_payload
 }
 
 #[tokio::test]
-async fn rate_limit_applies_retry_after_to_the_shared_budget() -> TestResult {
+async fn provider_refusals_apply_retry_after_to_the_shared_budget() -> TestResult {
+    let now = system_timestamp()?;
+    for (status, subject) in [
+        (429, "fred-rate-limit-test-user"),
+        (503, "fred-unavailable-test-user"),
+    ] {
+        let source = source(
+            now,
+            FredHttpResponse {
+                status,
+                retry_after: Some(b"1".to_vec()),
+                content_encoding: None,
+                body: Bytes::from_static(b"{}"),
+                received_at: now,
+            },
+            subject,
+        )?;
+        let request = market_squawk_sources::DiscoveryRequest::try_new(
+            SourceIdentifier::try_from("fred:series-observations:CPIAUCSL:2024-01-01:2024-01-31")?,
+            None,
+            NonZeroU16::new(1).ok_or("nonzero result limit")?,
+            now.checked_add_nanos(10_000_000_000)?,
+        )?;
+        let error = source
+            .discover(request, CancellationToken::new())
+            .await
+            .err()
+            .ok_or("provider refusal must stop discovery")?;
+        assert!(matches!(
+            error,
+            market_squawk_sources::ExtractionSourceError::Source(
+                SourceError::BudgetWaitUntil { .. }
+            )
+        ));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn non_identity_content_encoding_is_rejected() -> TestResult {
     let now = system_timestamp()?;
     let source = source(
         now,
         FredHttpResponse {
-            status: 429,
-            retry_after: Some(b"1".to_vec()),
-            body: Bytes::from_static(b"{}"),
+            status: 200,
+            retry_after: None,
+            content_encoding: Some(b"gzip".to_vec()),
+            body: Bytes::from_static(include_bytes!("../../fixtures/observations.json")),
             received_at: now,
         },
-        "fred-rate-limit-test-user",
+        "fred-content-encoding-test-user",
     )?;
     let request = market_squawk_sources::DiscoveryRequest::try_new(
         SourceIdentifier::try_from("fred:series-observations:CPIAUCSL:2024-01-01:2024-01-31")?,
@@ -194,14 +238,11 @@ async fn rate_limit_applies_retry_after_to_the_shared_budget() -> TestResult {
         NonZeroU16::new(1).ok_or("nonzero result limit")?,
         now.checked_add_nanos(10_000_000_000)?,
     )?;
-    let error = source
-        .discover(request, CancellationToken::new())
-        .await
-        .err()
-        .ok_or("429 must refuse discovery")?;
     assert!(matches!(
-        error,
-        market_squawk_sources::ExtractionSourceError::Source(SourceError::BudgetWaitUntil { .. })
+        source.discover(request, CancellationToken::new()).await,
+        Err(market_squawk_sources::ExtractionSourceError::Source(
+            SourceError::InvalidProtocolState
+        ))
     ));
     Ok(())
 }
@@ -365,29 +406,74 @@ fn rights(now: Timestamp) -> TestResult<FredRightsPolicy> {
     let review = now.checked_add_nanos(60_000_000_000)?;
     let artifact = format!(
         r#"{{
-            "schema_version":1,
+            "schema_version":2,
             "series_scope":"unresolved",
-            "terms_url":"https://fred.example.test/terms",
-            "terms_digest":"e84779cc4eed635dff13aea470f60c17889fa934750e178856edaa0796df830f",
-            "terms_bytes":17,
+            "terms_bundle_digest":"06323e093a0db740245f21c0cc89682998bfbfa0d1c02bd02691d72780659ce7",
+            "terms_documents":[
+                {{
+                    "role":"api_terms",
+                    "url":"https://fred.stlouisfed.org/docs/api/terms_of_use.html",
+                    "sha256":"27d66951a524848e3777300299a69ef16f868ab2dbc9ca04a00ddea0b4db13bd",
+                    "byte_length":20
+                }},
+                {{
+                    "role":"fred_services_legal_terms",
+                    "url":"https://fred.stlouisfed.org/legal/",
+                    "sha256":"97da0ed4fc87909604e691990b7344467c66e7b1bc9424a2bfbcf41dcf25b9e5",
+                    "byte_length":25
+                }},
+                {{
+                    "role":"privacy_policy",
+                    "url":"https://www.stlouisfed.org/about-us/privacy-policy/online-notice",
+                    "sha256":"2b4d39194871cb7e47314173f79cf2491ac46edb364c4bf17e7ab98749ebe722",
+                    "byte_length":41
+                }}
+            ],
             "assessed_at_unix_nanos":{},
             "review_required_by_unix_nanos":{},
             "operations":["persist"],
             "disposition":"blocked_unknown_rights",
             "confirmed_facts":["test"],
             "engineering_inferences":["test"],
-            "sources":[{{
-                "url":"https://fred.example.test/terms",
-                "accessed_on":"2026-07-21",
-                "sha256":"e84779cc4eed635dff13aea470f60c17889fa934750e178856edaa0796df830f",
-                "byte_length":17,
-                "evidence_class":"confirmed"
-            }}]
+            "sources":[
+                {{
+                    "url":"https://fred.stlouisfed.org/docs/api/terms_of_use.html",
+                    "accessed_on":"2026-07-21",
+                    "sha256":"27d66951a524848e3777300299a69ef16f868ab2dbc9ca04a00ddea0b4db13bd",
+                    "byte_length":20,
+                    "evidence_class":"confirmed"
+                }},
+                {{
+                    "url":"https://fred.stlouisfed.org/legal/",
+                    "accessed_on":"2026-07-21",
+                    "sha256":"97da0ed4fc87909604e691990b7344467c66e7b1bc9424a2bfbcf41dcf25b9e5",
+                    "byte_length":25,
+                    "evidence_class":"confirmed"
+                }},
+                {{
+                    "url":"https://www.stlouisfed.org/about-us/privacy-policy/online-notice",
+                    "accessed_on":"2026-07-21",
+                    "sha256":"2b4d39194871cb7e47314173f79cf2491ac46edb364c4bf17e7ab98749ebe722",
+                    "byte_length":41,
+                    "evidence_class":"confirmed"
+                }}
+            ]
         }}"#,
         assessed.unix_nanos(),
         review.unix_nanos()
     );
-    let artifact = FredRightsArtifact::parse(artifact.as_bytes(), b"exact terms bytes")?;
+    let terms_bytes = [
+        FredTermsDocumentBytes::try_new(FredTermsDocumentRole::ApiTerms, b"exact FRED API terms")?,
+        FredTermsDocumentBytes::try_new(
+            FredTermsDocumentRole::FredServicesLegalTerms,
+            b"exact FRED services terms",
+        )?,
+        FredTermsDocumentBytes::try_new(
+            FredTermsDocumentRole::PrivacyPolicy,
+            b"exact St. Louis Fed online privacy notice",
+        )?,
+    ];
+    let artifact = FredRightsArtifact::parse(artifact.as_bytes(), &terms_bytes)?;
     Ok(FredRightsPolicy::try_new(
         artifact.terms_evidence().clone(),
         Vec::new(),

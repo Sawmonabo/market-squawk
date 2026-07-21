@@ -12,6 +12,7 @@ use super::{FredApiKey, FredSourceError};
 pub(super) struct FredHttpResponse {
     pub(super) status: u16,
     pub(super) retry_after: Option<Vec<u8>>,
+    pub(super) content_encoding: Option<Vec<u8>>,
     pub(super) body: Bytes,
     pub(super) received_at: Timestamp,
 }
@@ -101,10 +102,15 @@ impl FredTransport for ReqwestFredTransport {
                     .headers()
                     .get(reqwest::header::RETRY_AFTER)
                     .map(|value| value.as_bytes().to_vec());
+                let content_encoding = response
+                    .headers()
+                    .get(reqwest::header::CONTENT_ENCODING)
+                    .map(|value| value.as_bytes().to_vec());
                 let body = collect_bounded_stream(response.bytes_stream(), max_bytes).await?;
                 Ok(FredHttpResponse {
                     status,
                     retry_after,
+                    content_encoding,
                     body,
                     received_at: system_timestamp()?,
                 })
