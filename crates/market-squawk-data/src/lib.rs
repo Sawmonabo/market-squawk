@@ -1,3 +1,7 @@
+// Rust #159105: this macOS-only test-link diagnostic is caused by the measured
+// `__eh_frame` exceeding arm64 compact-unwind's 24-bit offset range.
+#![cfg_attr(test, allow(linker_messages))]
+
 //! Durable local catalog, source-rights admission, and recovery metadata.
 //!
 //! This crate is a control- and research-plane boundary. It is never queried from the live
