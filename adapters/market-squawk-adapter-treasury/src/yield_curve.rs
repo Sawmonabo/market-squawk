@@ -20,7 +20,7 @@ const FEED_ENDPOINT: &str =
 const FEED_SOURCE_IDENTITY: &str = "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/pages/xml-item?data=daily_treasury_yield_curve";
 const METHODOLOGY_URL: &str = "https://home.treasury.gov/policy-issues/financing-the-government/interest-rate-statistics/treasury-yield-curve-methodology";
 const METHODOLOGY_REVISION: &str = "monotone-convex-2021-12-06/reviewed-2025-02-18";
-const PROVIDER_PAGE_SIZE_ID: &str = "provider-defined-xml-page-v1";
+const PROVIDER_YEAR_RESPONSE_ID: &str = "provider-year-filter-single-response-v1";
 const ATOM_NAMESPACE: &[u8] = b"http://www.w3.org/2005/Atom";
 const DATA_NAMESPACE: &[u8] = b"http://schemas.microsoft.com/ado/2007/08/dataservices";
 const METADATA_NAMESPACE: &[u8] = b"http://schemas.microsoft.com/ado/2007/08/dataservices/metadata";
@@ -106,24 +106,24 @@ impl TreasuryYieldCurveProfile {
         METHODOLOGY_REVISION
     }
 
-    /// Binds the provider year filter and zero-based page into one exact request.
+    /// Binds the provider year filter into one exact non-paginated request.
     ///
     /// # Errors
     ///
-    /// Rejects years before the official nominal curve begins or an invalid URL.
+    /// Rejects years before the official nominal curve begins, nonzero page numbers, or an invalid
+    /// URL. Treasury documents pagination only for the separate all-years query.
     pub fn page(
         self,
         year: u16,
         page_number: usize,
     ) -> Result<TreasuryYieldCurvePageRequest, TreasuryProtocolError> {
-        if !(1990..=9999).contains(&year) {
+        if !(1990..=9999).contains(&year) || page_number != 0 {
             return Err(TreasuryProtocolError::InvalidQuery);
         }
         let mut url = Url::parse(FEED_ENDPOINT).map_err(|_| TreasuryProtocolError::InvalidQuery)?;
         url.query_pairs_mut()
             .append_pair("data", "daily_treasury_yield_curve")
-            .append_pair("field_tdr_date_value", &year.to_string())
-            .append_pair("page", &page_number.to_string());
+            .append_pair("field_tdr_date_value", &year.to_string());
         let query_digest = yield_query_digest(year);
         let mut request_digest = Sha256::new();
         update_component(&mut request_digest, "treasury-yield-curve-page-v1");
@@ -160,7 +160,7 @@ impl TreasuryYieldCurvePageRequest {
         self.year
     }
 
-    /// Returns the provider's zero-based page number.
+    /// Returns zero, the internal identity sentinel for one complete year response.
     pub const fn page_number(&self) -> usize {
         self.page_number
     }
@@ -709,7 +709,7 @@ fn yield_query_digest(year: u16) -> [u8; 32] {
     }
     update_component(&mut digest, "NEW_DATE:year");
     update_component(&mut digest, "NEW_DATE:ascending");
-    update_component(&mut digest, PROVIDER_PAGE_SIZE_ID);
+    update_component(&mut digest, PROVIDER_YEAR_RESPONSE_ID);
     digest.update(year.to_be_bytes());
     digest.finalize().into()
 }

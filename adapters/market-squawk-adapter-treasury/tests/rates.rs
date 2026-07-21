@@ -40,10 +40,13 @@ fn official_average_rate_profile_preserves_exact_decimal_and_methodology_evidenc
 #[test]
 fn daily_par_yield_curve_is_civil_dated_and_indicative() -> TestResult {
     let profile = TreasuryYieldCurveProfile::daily_par_yield_curve();
+    let request = profile.page(2026, 0)?;
+    assert!(!request.url().contains("page="));
+    assert!(profile.page(2026, 1).is_err());
     let exact_payload = include_bytes!("../fixtures/daily_par_yield_curve.xml");
     let page = DailyParYieldCurvePage::parse(
         exact_payload,
-        &profile.page(2026, 0)?,
+        &request,
         FiscalDataParseLimits::production_defaults(),
     )?;
 
