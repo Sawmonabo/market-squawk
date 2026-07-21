@@ -13,7 +13,8 @@ use market_squawk_domain::{
 use market_squawk_sources::{
     ApiEndpointRule, AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode,
     BackoffPolicy, BudgetScope, BudgetWindowSemantics, CoverageDomain, DiscoveryRequest,
-    EndpointPolicy, ExtractionRequest, ExtractionSource, FreshnessPolicy, HistoricalCapability,
+    EndpointPolicy, ExtractionAuthority, ExtractionAuthorityError, ExtractionRequest,
+    ExtractionSource, ExtractionSourceError, FreshnessPolicy, HistoricalCapability,
     NetworkAccessPolicy, PathScope, ProviderBudgetPolicy, ProviderBudgetWindow, SourceCapabilities,
     SourceClass, SourceCoverage, SourceMetadata, SourceMetadataInput, SourceProtocolProfile,
 };
@@ -187,6 +188,130 @@ async fn authority_bound_source_emits_canonical_period_precision() -> TestResult
     assert!(health.last_payload_digest().is_some());
     assert_eq!(health.consecutive_failures(), 0);
     Ok(())
+}
+
+#[tokio::test]
+async fn authority_loss_during_completed_work_prevents_every_publication() -> TestResult {
+    let now = system_timestamp()?;
+
+    let (source, registry, authority, deadline) = source_harness(now)?;
+    source.queue_test_publication_action(Some(registry))?;
+    let discovery = source
+        .discover(
+            authority,
+            discovery_request(&source, deadline)?,
+            CancellationToken::new(),
+        )
+        .await;
+    assert_not_current(discovery)?;
+
+    let (source, registry, authority, deadline) = source_harness(now)?;
+    let object = discover_object(&source, authority.clone(), deadline).await?;
+    let request = extraction_request(object, deadline)?;
+    source.queue_test_publication_action(Some(registry))?;
+    let normalized = source
+        .normalized_page(&authority, &request, CancellationToken::new())
+        .await;
+    assert_not_current(normalized)?;
+
+    let (source, registry, authority, deadline) = source_harness(now)?;
+    let object = discover_object(&source, authority.clone(), deadline).await?;
+    source.queue_test_publication_action(None)?;
+    source.queue_test_publication_action(Some(registry))?;
+    let extraction = source
+        .extract(
+            authority,
+            extraction_request(object, deadline)?,
+            CancellationToken::new(),
+        )
+        .await;
+    assert_not_current(extraction)?;
+    Ok(())
+}
+
+fn source_harness(
+    now: Timestamp,
+) -> TestResult<(
+    BlsSource,
+    AuthoritativeSourceRegistry,
+    ExtractionAuthority,
+    Timestamp,
+)> {
+    let config = source_config()?;
+    let metadata = source_metadata(now, &config, true)?;
+    let transport = Arc::new(ScriptedTransport {
+        responses: Mutex::new(VecDeque::from([BlsHttpResponse {
+            status: 200,
+            retry_after: None,
+            content_encoding: None,
+            content_type: Some(b"application/json".to_vec()),
+            body: Bytes::from_static(COMPLETE_RESPONSE),
+            received_at: now,
+        }])),
+        request_count: Mutex::new(0),
+    });
+    let source = BlsSource::try_new_with_transport(metadata.clone(), config, transport)?;
+    let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
+    let registered = registry.register(metadata, now)?;
+    let authority = registry.extraction_authority(&registered, &source)?;
+    Ok((
+        source,
+        registry,
+        authority,
+        now.checked_add_nanos(60_000_000_000)?,
+    ))
+}
+
+fn discovery_request(source: &BlsSource, deadline: Timestamp) -> TestResult<DiscoveryRequest> {
+    Ok(DiscoveryRequest::try_new(
+        source.dataset().clone(),
+        None,
+        NonZeroU16::new(1).ok_or("nonzero discovery bound")?,
+        deadline,
+    )?)
+}
+
+async fn discover_object(
+    source: &BlsSource,
+    authority: ExtractionAuthority,
+    deadline: Timestamp,
+) -> TestResult<market_squawk_sources::SourceObject> {
+    source
+        .discover(
+            authority,
+            discovery_request(source, deadline)?,
+            CancellationToken::new(),
+        )
+        .await?
+        .objects()
+        .first()
+        .cloned()
+        .ok_or_else(|| "missing BLS source object".into())
+}
+
+fn extraction_request(
+    object: market_squawk_sources::SourceObject,
+    deadline: Timestamp,
+) -> TestResult<ExtractionRequest> {
+    Ok(ExtractionRequest::try_new(
+        object,
+        NonZeroU32::new(10).ok_or("nonzero record bound")?,
+        NonZeroU64::new(1024 * 1024).ok_or("nonzero byte bound")?,
+        deadline,
+    )?)
+}
+
+fn assert_not_current<T>(result: Result<T, ExtractionSourceError>) -> TestResult {
+    if matches!(
+        result,
+        Err(ExtractionSourceError::Authority(
+            ExtractionAuthorityError::NotCurrent
+        ))
+    ) {
+        Ok(())
+    } else {
+        Err("stale extraction authority published a BLS result".into())
+    }
 }
 
 fn source_config() -> Result<BlsSourceConfig, BlsSourceError> {

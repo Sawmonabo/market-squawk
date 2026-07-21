@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 #[cfg(test)]
+use std::collections::VecDeque;
+#[cfg(test)]
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -9,6 +11,8 @@ use market_squawk_domain::{
     DataQuality, DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence,
     SourceIdentifier, Timestamp,
 };
+#[cfg(test)]
+use market_squawk_sources::AuthoritativeSourceRegistry;
 use market_squawk_sources::{
     AuthorizationMode, BudgetWindowSemantics, CoverageDomain, DiscoveryBatch, DiscoveryRequest,
     ExtractionAuthority, ExtractionBatch, ExtractionRequest, ExtractionSource,
@@ -52,6 +56,8 @@ pub struct BlsSource {
     http: BlsHttpClient,
     cache: Mutex<PageCache>,
     health: Mutex<BlsSourceHealth>,
+    #[cfg(test)]
+    publication_actions: Mutex<VecDeque<Option<AuthoritativeSourceRegistry>>>,
 }
 
 impl std::fmt::Debug for BlsSource {
@@ -85,6 +91,8 @@ impl BlsSource {
             http,
             cache: Mutex::new(PageCache::new()),
             health: Mutex::new(BlsSourceHealth::new()),
+            #[cfg(test)]
+            publication_actions: Mutex::new(VecDeque::new()),
         })
     }
 
@@ -106,6 +114,7 @@ impl BlsSource {
             http,
             cache: Mutex::new(PageCache::new()),
             health: Mutex::new(BlsSourceHealth::new()),
+            publication_actions: Mutex::new(VecDeque::new()),
         })
     }
 
@@ -206,6 +215,9 @@ impl BlsSource {
             return Err(ExtractionSourceError::Cancelled);
         }
         ensure_deadline_open(request.deadline())?;
+        #[cfg(test)]
+        self.apply_test_publication_action()?;
+        authority.validate_current()?;
         DiscoveryBatch::try_new(&request, discovered).map_err(Into::into)
     }
 
@@ -326,6 +338,9 @@ impl BlsSource {
             .iter()
             .map(|record| record.payload.clone())
             .collect();
+        #[cfg(test)]
+        self.apply_test_publication_action()?;
+        authority.validate_current()?;
         Ok(BlsNormalizedPage {
             received_at: observed_at,
             source_payload_sha256: page.sha256_hex,
@@ -363,7 +378,11 @@ impl BlsSource {
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        ExtractionBatch::try_new(&request, records).map_err(Into::into)
+        let batch = ExtractionBatch::try_new(&request, records)?;
+        #[cfg(test)]
+        self.apply_test_publication_action()?;
+        authority.validate_current()?;
+        Ok(batch)
     }
 
     fn validate_authority(
@@ -422,6 +441,30 @@ impl BlsSource {
                 health.consecutive_failures = health.consecutive_failures.saturating_add(1);
             }
         }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn queue_test_publication_action(
+        &self,
+        registry_to_drop: Option<AuthoritativeSourceRegistry>,
+    ) -> Result<(), BlsSourceError> {
+        self.publication_actions
+            .lock()
+            .map_err(|_| BlsSourceError::HealthUnavailable)?
+            .push_back(registry_to_drop);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn apply_test_publication_action(&self) -> Result<(), ExtractionSourceError> {
+        let registry_to_drop = self
+            .publication_actions
+            .lock()
+            .map_err(|_| SourceError::InvalidProtocolState)?
+            .pop_front()
+            .flatten();
+        drop(registry_to_drop);
         Ok(())
     }
 }
