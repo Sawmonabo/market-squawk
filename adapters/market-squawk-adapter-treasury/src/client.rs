@@ -259,7 +259,8 @@ fn map_adapter_error(error: TreasurySourceError) -> ExtractionSourceError {
         | TreasurySourceError::InvalidProtocol
         | TreasurySourceError::Protocol(_)
         | TreasurySourceError::Rate(_)
-        | TreasurySourceError::HealthUnavailable => {
+        | TreasurySourceError::HealthUnavailable
+        | TreasurySourceError::RevisionAuthority(_) => {
             ExtractionSourceError::Source(SourceError::InvalidProtocolState)
         }
         TreasurySourceError::BodyTooLarge => ExtractionSourceError::Source(SourceError::Network),

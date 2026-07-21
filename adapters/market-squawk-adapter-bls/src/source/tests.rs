@@ -133,7 +133,9 @@ async fn authority_bound_source_emits_canonical_period_precision() -> TestResult
             CancellationToken::new(),
         )
         .await?;
+    let revisions = source.revision_plan(&extraction)?;
     assert_eq!(extraction.records().len(), 1);
+    assert!(revisions.is_locally_observed());
     let record = &extraction.records()[0];
     assert_eq!(record.schema().as_str(), "market-squawk-research-v3");
     assert!(record.published_time().is_none());
