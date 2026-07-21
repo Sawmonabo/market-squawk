@@ -50,7 +50,7 @@ pub struct PaperExecutionConfig {
 }
 
 impl PaperExecutionConfig {
-    pub const CHECKPOINT_SCHEMA_VERSION: u32 = 8;
+    pub const CHECKPOINT_SCHEMA_VERSION: u32 = 9;
 
     /// Validates bounds and seals a stable configuration digest.
     pub fn try_new(input: PaperExecutionConfigInput) -> Result<Self, PaperConfigError> {

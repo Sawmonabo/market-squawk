@@ -49,6 +49,7 @@ pub struct DispatchOrder {
     policy: RiskPolicyIdentity,
     valid_until: Timestamp,
     submitted_at: Timestamp,
+    account_revision: u64,
     operation: ExecutionOperation,
 }
 
@@ -188,6 +189,24 @@ impl DispatchOrder {
         self.submitted_at
     }
 
+    /// Returns the exact account-state revision reserved before submission.
+    pub const fn account_revision(&self) -> u64 {
+        self.account_revision
+    }
+
+    /// Returns the stable digest used by execution audit for the qualification assessment.
+    pub fn assessment_digest(&self) -> [u8; 32] {
+        let mut assessment = Sha256::new();
+        assessment.update(b"market-squawk/qualification-assessment\0");
+        assessment.update(
+            self.assessment_id()
+                .as_source_identifier()
+                .as_str()
+                .as_bytes(),
+        );
+        assessment.finalize().into()
+    }
+
     /// Returns the monotonic deadline and cooperative cancellation signal for this one attempt.
     pub const fn operation(&self) -> &ExecutionOperation {
         &self.operation
@@ -207,6 +226,7 @@ pub(crate) const fn dispatch_order_from_approval(
     policy: RiskPolicyIdentity,
     valid_until: Timestamp,
     submitted_at: Timestamp,
+    account_revision: u64,
     operation: ExecutionOperation,
 ) -> DispatchOrder {
     DispatchOrder {
@@ -218,8 +238,134 @@ pub(crate) const fn dispatch_order_from_approval(
         policy,
         valid_until,
         submitted_at,
+        account_revision,
         operation,
     }
+}
+
+/// Exact non-authoritative dispatcher ownership restored from a durable backend checkpoint.
+#[derive(Debug)]
+pub struct RecoveredDispatchOrder {
+    approval_id: ApprovalId,
+    order_id: OrderId,
+    account_id: AccountId,
+    intent_digest: OrderIntentDigest,
+    account_revision: u64,
+    requested_quantity: QuantityLots,
+    execution_price_bound: ExecutionPriceBound,
+    settlement_currency: Option<market_squawk_domain::Currency>,
+    lifecycle: ReconciledOrder,
+    audit_context: crate::audit::ExecutionAuditContext,
+    recovered_at: Timestamp,
+}
+
+impl RecoveredDispatchOrder {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "recovery validates every persisted dispatch and audit identity dimension"
+    )]
+    pub fn try_new(
+        approval_id: ApprovalId,
+        order_id: OrderId,
+        account_id: AccountId,
+        instrument_id: market_squawk_domain::InstrumentId,
+        intent_digest: OrderIntentDigest,
+        account_revision: u64,
+        requested_quantity: QuantityLots,
+        execution_price_bound: ExecutionPriceBound,
+        settlement_currency: Option<market_squawk_domain::Currency>,
+        lifecycle: ReconciledOrder,
+        strategy_id: StrategyId,
+        model_id: Option<ModelId>,
+        assessment_digest: [u8; 32],
+        evidence_binding_digest: [u8; 32],
+        policy: RiskPolicyIdentity,
+        market_observed_at: Timestamp,
+        valid_until: Timestamp,
+        recovered_at: Timestamp,
+    ) -> Result<Self, RecoveredDispatchOrderError> {
+        if account_revision == 0
+            || requested_quantity.get() <= 0
+            || lifecycle.order_id() != order_id
+            || lifecycle.cumulative_filled().get() < 0
+            || lifecycle.cumulative_filled().get() > requested_quantity.get()
+            || lifecycle
+                .maximum_fill_price()
+                .is_some_and(|price| !execution_price_bound.permits(price))
+            || settlement_currency != Some(lifecycle.cumulative_fees().currency())
+            || assessment_digest == [0; 32]
+            || evidence_binding_digest == [0; 32]
+            || valid_until < market_observed_at
+            || recovered_at < market_observed_at
+        {
+            return Err(RecoveredDispatchOrderError::InvalidIdentity);
+        }
+        Ok(Self {
+            approval_id,
+            order_id,
+            account_id,
+            intent_digest,
+            account_revision,
+            requested_quantity,
+            execution_price_bound,
+            settlement_currency,
+            lifecycle,
+            audit_context: crate::audit::ExecutionAuditContext::from_recovery(
+                approval_id,
+                order_id,
+                intent_digest,
+                strategy_id,
+                model_id,
+                account_id,
+                instrument_id,
+                assessment_digest,
+                evidence_binding_digest,
+                execution_price_bound,
+                policy,
+                market_observed_at,
+                valid_until,
+            ),
+            recovered_at,
+        })
+    }
+
+    pub(crate) fn into_parts(self) -> RecoveredDispatchOrderParts {
+        RecoveredDispatchOrderParts {
+            approval_id: self.approval_id,
+            order_id: self.order_id,
+            account_id: self.account_id,
+            intent_digest: self.intent_digest,
+            account_revision: self.account_revision,
+            requested_quantity: self.requested_quantity,
+            execution_price_bound: self.execution_price_bound,
+            settlement_currency: self.settlement_currency,
+            lifecycle: self.lifecycle,
+            audit_context: self.audit_context,
+            recovered_at: self.recovered_at,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct RecoveredDispatchOrderParts {
+    pub(crate) approval_id: ApprovalId,
+    pub(crate) order_id: OrderId,
+    pub(crate) account_id: AccountId,
+    pub(crate) intent_digest: OrderIntentDigest,
+    pub(crate) account_revision: u64,
+    pub(crate) requested_quantity: QuantityLots,
+    pub(crate) execution_price_bound: ExecutionPriceBound,
+    pub(crate) settlement_currency: Option<market_squawk_domain::Currency>,
+    pub(crate) lifecycle: ReconciledOrder,
+    pub(crate) audit_context: crate::audit::ExecutionAuditContext,
+    pub(crate) recovered_at: Timestamp,
+}
+
+/// Invalid durable dispatcher recovery identity.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum RecoveredDispatchOrderError {
+    #[error("persisted dispatcher recovery identity is inconsistent")]
+    InvalidIdentity,
 }
 
 /// Dispatcher-minted monotonic operation lifetime supplied to an execution adapter.
@@ -227,6 +373,26 @@ pub(crate) const fn dispatch_order_from_approval(
 pub struct ExecutionOperation {
     deadline: Instant,
     cancellation: CancellationToken,
+}
+
+/// Private-construction authority to clear one backend recovery quarantine.
+///
+/// Only the dispatcher can mint this capability. Adapters must not clear durable quarantine state
+/// through ordinary control-plane or adapter-specific APIs.
+#[derive(Debug)]
+pub struct RecoverExecutionState {
+    operation: ExecutionOperation,
+}
+
+impl RecoverExecutionState {
+    pub(crate) const fn new(operation: ExecutionOperation) -> Self {
+        Self { operation }
+    }
+
+    /// Returns the dispatcher-owned monotonic operation lifetime.
+    pub const fn operation(&self) -> &ExecutionOperation {
+        &self.operation
+    }
 }
 
 impl ExecutionOperation {
@@ -675,6 +841,20 @@ pub trait ExecutionAdapter: Send + Sync + std::fmt::Debug + 'static {
         &self,
         acknowledgement: ReconciliationAcknowledgement,
     ) -> ExecutionAdapterFuture<'_, Result<(), ExecutionAdapterError>>;
+
+    /// Clears a durably recovered backend quarantine after dispatcher ownership is established.
+    ///
+    /// The default rejects recovery so adapters cannot silently opt into clearing a fail-closed
+    /// state. A successful implementation must durably audit the transition before returning.
+    fn recover_quarantined(
+        &self,
+        recovery: RecoverExecutionState,
+    ) -> ExecutionAdapterFuture<'_, Result<(), ExecutionAdapterError>> {
+        Box::pin(async move {
+            let _ = recovery;
+            Err(ExecutionAdapterError::KnownFailure)
+        })
+    }
 }
 
 /// Successful backend acceptance of one risk-dispatched order.

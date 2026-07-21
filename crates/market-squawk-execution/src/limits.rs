@@ -8,12 +8,14 @@ use market_squawk_domain::{
     BasisPoints, Currency, InstrumentId, Money, OrderSide, PriceTicks, RoundingPolicy,
 };
 use rust_decimal::Decimal;
+use serde::Serialize;
 use thiserror::Error;
 
 use crate::OrderIntent;
 
 /// Deterministic reason that account state cannot reserve an intent.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AccountRiskViolation {
     /// Global risk policy is fail-closed.
     KillSwitch,

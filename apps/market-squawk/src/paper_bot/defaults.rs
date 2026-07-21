@@ -313,6 +313,7 @@ where
         dispatcher,
         paper,
         paper_checkpoint_repository,
+        audit_directory: paths.control_root()?.try_clone_directory()?,
         paper_accounts: vec![paper_account],
         paper_control_timeout: Duration::from_secs(5),
     };

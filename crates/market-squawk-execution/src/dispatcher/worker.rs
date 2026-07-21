@@ -190,6 +190,7 @@ async fn process_command(
         effective_operation_deadline(parts.monotonic_deadline.into(), operation_deadline);
     let approval_id = parts.approval_id;
     let order_id = parts.intent.order_id();
+    let account_revision = parts.reservation.expected_account_revision();
     if !parts
         .market
         .execution_price(parts.intent.side())
@@ -327,7 +328,7 @@ async fn process_command(
         }
         record.state = DispatchState::Submitted;
         record.last_transition_at = final_now.wall;
-        record.reservation = Some(parts.reservation);
+        record.reservation = Some(super::DispatchReservation::Live(parts.reservation));
     }
     let outcome = SubmissionOutcomeFailSafe::new(
         Arc::clone(registry),
@@ -346,6 +347,7 @@ async fn process_command(
         parts.policy,
         parts.valid_until,
         final_now.wall,
+        account_revision,
         ExecutionOperation::new(operation_deadline, operation_cancellation.clone()),
     );
     let (result, deadline_exceeded) = attempt_submit(

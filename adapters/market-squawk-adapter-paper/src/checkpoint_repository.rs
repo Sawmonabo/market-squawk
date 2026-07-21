@@ -122,6 +122,9 @@ impl PaperCheckpointRepository {
         {
             return Err(PaperCheckpointRepositoryError::ConfigurationMismatch);
         }
+        if checkpoint.reconciliation_required() {
+            return Err(PaperCheckpointRepositoryError::QuarantinedCheckpoint);
+        }
         let directory = self.root.try_clone_directory()?;
         self.validate_current_authority(&directory)?;
         let generation = self
@@ -1020,6 +1023,8 @@ pub enum PaperCheckpointRepositoryError {
     AuthorityChanged,
     #[error("paper checkpoint configuration does not match the bound repository")]
     ConfigurationMismatch,
+    #[error("quarantined paper state cannot be published as a clean recovery checkpoint")]
+    QuarantinedCheckpoint,
     #[error("paper checkpoint repository bounded allocation failed")]
     Allocation,
     #[error("paper checkpoint namespace exists without one valid current manifest")]
@@ -1336,6 +1341,26 @@ mod tests {
             assert_eq!(recovered.artifact_digest(), receipt.artifact_digest());
             assert_eq!(recovered.artifact_reference(), receipt.artifact_reference());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn quarantined_checkpoint_cannot_be_published_as_clean_recovery() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let paths = LocalPaths::prepare(directory.path().join("data"))?;
+        let (config, mut checkpoint) = checkpoint_fixture()?;
+        checkpoint.reconciliation_required = true;
+        let mut repository = PaperCheckpointRepository::try_new(
+            paths.artifacts()?.clone(),
+            config,
+            NonZeroUsize::new(1024 * 1024).ok_or("zero checkpoint bound")?,
+        )?;
+        let replay = exact_empty_replay(&checkpoint)?;
+
+        assert!(matches!(
+            repository.persist_with_replay(&checkpoint, &replay),
+            Err(PaperCheckpointRepositoryError::QuarantinedCheckpoint)
+        ));
         Ok(())
     }
 

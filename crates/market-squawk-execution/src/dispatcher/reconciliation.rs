@@ -22,6 +22,7 @@ pub(super) struct ReconciliationRecordBinding {
     pub(super) settlement_currency: Option<Currency>,
     pub(super) previous: Option<ReconciledOrder>,
     pub(super) was_reconciliation: bool,
+    pub(super) recovered: bool,
 }
 
 #[derive(Debug)]
@@ -41,6 +42,18 @@ pub(super) fn prepare_account_replacement(
     records: &[ReconciliationRecordBinding],
     invoked_at: Timestamp,
 ) -> Result<Option<PreparedAccountReplacement>, ExecutionDispatchError> {
+    let recovered = records.iter().filter(|record| record.recovered).count();
+    if recovered != 0 {
+        if recovered != records.len() || state.reconciliation_required() {
+            return Err(ExecutionDispatchError::AccountReplacementRejected);
+        }
+        for record in records {
+            let observed = observed_order(state, record.order_id)
+                .ok_or(ExecutionDispatchError::AccountReplacementRejected)?;
+            validate_order(record, observed)?;
+        }
+        return Ok(None);
+    }
     let mut affected_accounts = Vec::new();
     affected_accounts
         .try_reserve_exact(records.len())
@@ -345,6 +358,7 @@ mod tests {
             settlement_currency: Some(usd),
             previous: None,
             was_reconciliation: true,
+            recovered: false,
         };
         let observed = ReconciledOrder::try_new(
             record.order_id,

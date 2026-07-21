@@ -28,11 +28,12 @@ pub use adapter::{
     MAX_RECONCILED_ORDERS, MAX_RECONCILED_POSITIONS_PER_ACCOUNT, PersistenceAcknowledgement,
     ReconcileOrders, ReconciledAccountState, ReconciledAccountStateError, ReconciledOrder,
     ReconciledOrderStatus, ReconciliationAcknowledgement, ReconciliationBatchBinding,
-    ReconciliationBatchBindingError, ReconciliationBatchId,
+    ReconciliationBatchBindingError, ReconciliationBatchId, RecoverExecutionState,
+    RecoveredDispatchOrder, RecoveredDispatchOrderError,
 };
 pub use approval::{
     ApprovedOrder, ExecutionMarketReference, ExecutionPriceBound, ExecutionPriceBoundError,
-    MAX_EXECUTION_MARKET_LEVELS_PER_SIDE, RiskPolicyIdentity,
+    MAX_EXECUTION_MARKET_LEVELS_PER_SIDE, RiskPolicyIdentity, RiskPolicyIdentityError,
 };
 pub use audit::{
     ExecutionAuditConfig, ExecutionAuditError, ExecutionAuditEvent, ExecutionAuditKind,

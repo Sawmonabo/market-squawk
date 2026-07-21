@@ -289,6 +289,19 @@ impl ExecutionAdapter for PaperExecutionAdapter {
                 .unwrap_or(Err(ExecutionAdapterError::ReconciliationRequired))
         })
     }
+
+    fn recover_quarantined(
+        &self,
+        recovery: market_squawk_execution::RecoverExecutionState,
+    ) -> ExecutionAdapterFuture<'_, Result<(), ExecutionAdapterError>> {
+        Box::pin(async move {
+            let (reply, response) = oneshot::channel();
+            self.try_send_command(WorkerCommand::RecoverQuarantined { recovery, reply })?;
+            response
+                .await
+                .unwrap_or(Err(ExecutionAdapterError::ReconciliationRequired))
+        })
+    }
 }
 
 /// Bounded nonblocking market-update ingress for the paper worker.

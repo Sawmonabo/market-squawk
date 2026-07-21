@@ -1,11 +1,13 @@
 //! Actor-owned paper order representation.
 
 use market_squawk_domain::{
-    AccountId, BasisPoints, ClientOrderId, InstrumentExecutionTerms, Money, OrderId, OrderSide,
-    OrderType, PriceTicks, QuantityLots, TimeInForce, Timestamp,
+    AccountId, ApprovalId, BasisPoints, ClientOrderId, InstrumentExecutionTerms, ModelId, Money,
+    OrderId, OrderSide, OrderType, PriceTicks, QuantityLots, RuleVersion, StrategyId, TimeInForce,
+    Timestamp,
 };
 use market_squawk_execution::{
-    DispatchOrder, ExecutionPriceBound, OrderIntentDigest, ReconciledOrderStatus,
+    DispatchOrder, ExecutionPriceBound, OrderIntentDigest, ReconciledOrder, ReconciledOrderStatus,
+    RecoveredDispatchOrder, RiskPolicyIdentity,
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -14,9 +16,11 @@ use crate::{PaperFill, PaperOrderLifecycle, PaperOrderState, PaperStateError};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PaperOrder {
+    pub(crate) approval_id: ApprovalId,
     pub(crate) order_id: OrderId,
     pub(crate) client_order_id: ClientOrderId,
     pub(crate) account_id: AccountId,
+    pub(crate) account_revision: u64,
     pub(crate) terms: InstrumentExecutionTerms,
     pub(crate) side: OrderSide,
     pub(crate) order_type: OrderType,
@@ -39,14 +43,23 @@ pub(crate) struct PaperOrder {
     pub(crate) cumulative_fee: Money,
     pub(crate) weighted_fill_ticks: i128,
     pub(crate) maximum_fill_price: Option<PriceTicks>,
+    pub(crate) strategy_id: StrategyId,
+    pub(crate) model_id: Option<ModelId>,
+    pub(crate) assessment_digest: [u8; 32],
+    pub(crate) evidence_binding_digest: [u8; 32],
+    pub(crate) risk_policy: RiskPolicyIdentity,
+    pub(crate) market_observed_at: Timestamp,
+    pub(crate) valid_until: Timestamp,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PaperOrderRecoveryWire {
+    approval_id: ApprovalId,
     order_id: OrderId,
     client_order_id: ClientOrderId,
     account_id: AccountId,
+    account_revision: u64,
     terms: InstrumentExecutionTerms,
     side: OrderSide,
     order_type: OrderType,
@@ -72,6 +85,14 @@ pub(crate) struct PaperOrderRecoveryWire {
     cumulative_fee: Money,
     weighted_fill_ticks: i128,
     maximum_fill_price: Option<PriceTicks>,
+    strategy_id: StrategyId,
+    model_id: Option<ModelId>,
+    assessment_digest: [u8; 32],
+    evidence_binding_digest: [u8; 32],
+    risk_policy_digest: [u8; 32],
+    risk_policy_version: RuleVersion,
+    market_observed_at: Timestamp,
+    valid_until: Timestamp,
 }
 
 impl PaperOrder {
@@ -92,9 +113,11 @@ impl PaperOrder {
         let lifecycle = PaperOrderLifecycle::try_new(dispatch.quantity())?;
         let intent_digest = dispatch.intent_digest();
         Ok(Self {
+            approval_id: dispatch.approval_id(),
             order_id: dispatch.order_id(),
             client_order_id: dispatch.client_order_id().clone(),
             account_id: dispatch.account_id(),
+            account_revision: dispatch.account_revision(),
             terms: dispatch.execution_terms(),
             side: dispatch.side(),
             order_type: dispatch.order_type(),
@@ -117,6 +140,13 @@ impl PaperOrder {
             cumulative_fee: Money::new(Decimal::ZERO, currency),
             weighted_fill_ticks: 0,
             maximum_fill_price: None,
+            strategy_id: dispatch.strategy_id(),
+            model_id: dispatch.model_id(),
+            assessment_digest: dispatch.assessment_digest(),
+            evidence_binding_digest: dispatch.evidence_binding_digest(),
+            risk_policy: dispatch.risk_policy(),
+            market_observed_at: dispatch.market().observed_at(),
+            valid_until: dispatch.valid_until(),
         })
     }
 
@@ -190,9 +220,11 @@ impl PaperOrder {
 
     pub(crate) fn recovery_wire(&self) -> PaperOrderRecoveryWire {
         PaperOrderRecoveryWire {
+            approval_id: self.approval_id,
             order_id: self.order_id,
             client_order_id: self.client_order_id.clone(),
             account_id: self.account_id,
+            account_revision: self.account_revision,
             terms: self.terms,
             side: self.side,
             order_type: self.order_type,
@@ -218,6 +250,14 @@ impl PaperOrder {
             cumulative_fee: self.cumulative_fee,
             weighted_fill_ticks: self.weighted_fill_ticks,
             maximum_fill_price: self.maximum_fill_price,
+            strategy_id: self.strategy_id,
+            model_id: self.model_id,
+            assessment_digest: self.assessment_digest,
+            evidence_binding_digest: self.evidence_binding_digest,
+            risk_policy_digest: self.risk_policy.digest(),
+            risk_policy_version: self.risk_policy.ruleset_version(),
+            market_observed_at: self.market_observed_at,
+            valid_until: self.valid_until,
         }
     }
 
@@ -254,6 +294,11 @@ impl PaperOrder {
         };
         let execution_price_bound = ExecutionPriceBound::try_new(wire.maximum_execution_price)
             .map_err(|_| PaperStateError::InvalidTransition)?;
+        let risk_policy = RiskPolicyIdentity::try_from_recovery(
+            wire.risk_policy_digest,
+            wire.risk_policy_version,
+        )
+        .map_err(|_| PaperStateError::InvalidTransition)?;
         if !price_shape_valid
             || wire.reference_price.get() <= 0
             || !execution_price_bound.permits(wire.reference_price)
@@ -268,6 +313,10 @@ impl PaperOrder {
             || !average_fill_valid
             || !maximum_fill_valid
             || wire.weighted_fill_ticks.is_negative()
+            || wire.account_revision == 0
+            || wire.assessment_digest == [0; 32]
+            || wire.evidence_binding_digest == [0; 32]
+            || wire.valid_until < wire.market_observed_at
             || wire.state == PaperOrderState::New
             || (matches!(wire.order_type, OrderType::Market | OrderType::Limit) && !wire.triggered)
         {
@@ -281,9 +330,11 @@ impl PaperOrder {
             wire.last_sequence,
         )?;
         Ok(Self {
+            approval_id: wire.approval_id,
             order_id: wire.order_id,
             client_order_id: wire.client_order_id,
             account_id: wire.account_id,
+            account_revision: wire.account_revision,
             terms: wire.terms,
             side: wire.side,
             order_type: wire.order_type,
@@ -306,6 +357,48 @@ impl PaperOrder {
             cumulative_fee: wire.cumulative_fee,
             weighted_fill_ticks: wire.weighted_fill_ticks,
             maximum_fill_price: wire.maximum_fill_price,
+            strategy_id: wire.strategy_id,
+            model_id: wire.model_id,
+            assessment_digest: wire.assessment_digest,
+            evidence_binding_digest: wire.evidence_binding_digest,
+            risk_policy,
+            market_observed_at: wire.market_observed_at,
+            valid_until: wire.valid_until,
         })
+    }
+
+    pub(crate) fn recovered_dispatch_order(
+        &self,
+    ) -> Result<RecoveredDispatchOrder, PaperStateError> {
+        let lifecycle = ReconciledOrder::try_new(
+            self.order_id,
+            self.reconciled_status(),
+            self.lifecycle.cumulative_filled(),
+            self.average_fill_price(),
+            self.maximum_fill_price,
+            self.cumulative_fee,
+        )
+        .map_err(|_| PaperStateError::InvalidTransition)?;
+        RecoveredDispatchOrder::try_new(
+            self.approval_id,
+            self.order_id,
+            self.account_id,
+            self.terms.instrument_id(),
+            self.intent_digest,
+            self.account_revision,
+            self.quantity,
+            self.execution_price_bound,
+            self.terms.settlement_currency(),
+            lifecycle,
+            self.strategy_id,
+            self.model_id,
+            self.assessment_digest,
+            self.evidence_binding_digest,
+            self.risk_policy,
+            self.market_observed_at,
+            self.valid_until,
+            self.accepted_at,
+        )
+        .map_err(|_| PaperStateError::InvalidTransition)
     }
 }

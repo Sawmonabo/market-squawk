@@ -23,9 +23,9 @@ use market_squawk_domain::{
 use market_squawk_execution::{
     AccountBootstrap, AccountCoordinatorConfig, AccountIdempotencyBootstrap,
     AccountRiskCoordinator, AccountRiskViolation, BoundedOrderIntents, ExecutionAuditConfig,
-    ExecutionAuditError, ExecutionAuditWriter, MarketRiskInput, OrderIntent, OrderIntentInput,
-    PreAuthorityRiskOutcome, RiskLimits, RiskLimitsInput, RiskPolicyIdentity, RiskRejectionCode,
-    RiskService, RiskServiceConfig, Strategy, StrategyContext, StrategyError,
+    ExecutionAuditWriter, MarketRiskInput, OrderIntent, OrderIntentInput, PreAuthorityRiskOutcome,
+    RiskLimits, RiskLimitsInput, RiskPolicyIdentity, RiskRejectionCode, RiskService,
+    RiskServiceConfig, Strategy, StrategyContext, StrategyError,
 };
 use market_squawk_live::StreamPhaseSnapshot;
 use market_squawk_platform::{
@@ -87,7 +87,7 @@ async fn public_kraken_reaches_live_state_but_both_execution_safety_layers_rejec
     )?
     .with_local_kraken_endpoint_for_test(&endpoint)?;
     let cancellation = CancellationToken::new();
-    let mut runtime = composition.start(cancellation.clone()).await?;
+    let runtime = composition.start(cancellation.clone()).await?;
 
     let observed = wait_for_kraken_snapshot(runtime.snapshots(), metadata.source_id()).await?;
     assert_eq!(metadata.quality_ceiling(), DataQuality::DirectUnverified);
@@ -102,7 +102,6 @@ async fn public_kraken_reaches_live_state_but_both_execution_safety_layers_rejec
     assert!(observed.snapshot_initialized);
     assert_eq!(observed.trading_status, Some(TradingStatus::Active));
     assert_eq!(invocations.load(Ordering::SeqCst), 0);
-    assert!(runtime.execution_audit_reader().try_next()?.is_none());
 
     let rejection = defense_in_depth_risk_probe(&definition.execution_terms(), observed)?;
     assert_eq!(
@@ -113,7 +112,6 @@ async fn public_kraken_reaches_live_state_but_both_execution_safety_layers_rejec
         ]
     );
     assert_eq!(invocations.load(Ordering::SeqCst), 0);
-    assert!(runtime.execution_audit_reader().try_next()?.is_none());
 
     cancellation.cancel();
     let shutdown = tokio::time::timeout(Duration::from_secs(10), runtime.shutdown()).await?;
@@ -141,8 +139,12 @@ async fn public_kraken_reaches_live_state_but_both_execution_safety_layers_rejec
         paper.cash()[0].balance(),
         Money::new(Decimal::new(100_000, 0), Currency::try_from("USD")?)
     );
-    let (mut execution_audit, _paper_audit) = shutdown.into_audit_readers();
-    assert_eq!(execution_audit.try_next(), Err(ExecutionAuditError::Closed));
+    let audit = shutdown
+        .audit()
+        .evidence()
+        .ok_or("audit drain incomplete")?;
+    assert_eq!(audit.execution_records(), 0);
+    assert_eq!(audit.paper_records(), 0);
 
     server.await??;
     let paths = LocalPaths::prepare(temporary.path())?;

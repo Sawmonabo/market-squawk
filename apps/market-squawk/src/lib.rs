@@ -41,7 +41,8 @@ pub use market_squawk_platform::{
     AppConfig, JournalFileFormat, JournalSelectionError, LocalPaths as AppPaths,
 };
 pub use paper_bot::{
-    ProductionPaperBotComposition, ProductionPaperBotCompositionError,
+    ProductionAuditBarrierError, ProductionAuditError, ProductionAuditEvidence,
+    ProductionAuditShutdown, ProductionPaperBotComposition, ProductionPaperBotCompositionError,
     ProductionPaperBotExecutionConfig, ProductionPaperBotRollback, ProductionPaperBotRoute,
     ProductionPaperBotRuntime, ProductionPaperBotShutdown, ProductionPaperBotStartError,
     ProductionPaperCheckpointError, ProductionPaperCheckpointEvidence,

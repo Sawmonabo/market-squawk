@@ -358,11 +358,43 @@ impl PaperExecutionCheckpoint {
         self.sequence
     }
 
+    /// Reports whether the recovered backend remains fail-closed for reconciliation.
+    pub const fn reconciliation_required(&self) -> bool {
+        self.reconciliation_required
+    }
+
     /// Reports whether restart would require restoring live dispatcher order ownership.
     pub fn has_nonterminal_orders(&self) -> bool {
         self.orders
             .values()
             .any(|order| !is_terminal(order.lifecycle.state()))
+    }
+
+    /// Restores exact dispatcher ownership for every nonterminal backend order.
+    pub fn recovered_dispatch_orders(
+        &self,
+    ) -> Result<Vec<market_squawk_execution::RecoveredDispatchOrder>, PaperCheckpointError> {
+        let count = self
+            .orders
+            .values()
+            .filter(|order| !is_terminal(order.lifecycle.state()))
+            .count();
+        let mut recovered = Vec::new();
+        recovered
+            .try_reserve_exact(count)
+            .map_err(|_| PaperCheckpointError::Allocation)?;
+        for order in self
+            .orders
+            .values()
+            .filter(|order| !is_terminal(order.lifecycle.state()))
+        {
+            recovered.push(
+                order
+                    .recovered_dispatch_order()
+                    .map_err(|_| PaperCheckpointError::InvalidOrder)?,
+            );
+        }
+        Ok(recovered)
     }
 
     pub(crate) fn reconciled_accounts_for_recovery(

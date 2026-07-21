@@ -8,12 +8,11 @@ use market_squawk_domain::{ApprovalId, OrderId, Timestamp};
 
 use super::attempt::attempt_adapter_call;
 use super::{
-    DispatchRecord, DispatchRegistry, DispatchState, ExecutionDispatchError, ExecutionDispatcher,
-    ExecutionDispatcherQuiesce, ExecutionDispatcherShutdown, PendingReconciliation,
-    PendingReconciliationScope, PendingReconciliationStatus, adapter_reason, commit_dispatch_audit,
-    try_registry,
+    DispatchOutcomeFailSafe, DispatchRecord, DispatchRegistry, DispatchReservation, DispatchState,
+    ExecutionDispatchError, ExecutionDispatcher, ExecutionDispatcherQuiesce,
+    ExecutionDispatcherShutdown, PendingReconciliation, PendingReconciliationScope,
+    PendingReconciliationStatus, adapter_reason, commit_dispatch_audit, try_registry,
 };
-use crate::account::{AccountOutcomeFailSafe, AccountRiskReservation};
 use crate::audit::{ExecutionAuditContext, ExecutionAuditPermit};
 use crate::clock::system_now;
 use crate::dispatcher::reconciliation::{
@@ -22,14 +21,14 @@ use crate::dispatcher::reconciliation::{
 use crate::{
     ExecutionAdapterError, ExecutionAuditKind, ExecutionAuditReason, ExecutionState,
     ExecutionTaskPermit, ReconcileOrders, ReconciledOrder, ReconciledOrderStatus,
-    ReconciliationAcknowledgement, ReconciliationBatchBinding,
+    ReconciliationAcknowledgement, ReconciliationBatchBinding, RecoverExecutionState,
 };
 
 #[derive(Debug)]
 struct LifecycleOutcomeFailSafe {
     registry: Arc<Mutex<DispatchRegistry>>,
     order_id: OrderId,
-    account: Option<AccountOutcomeFailSafe>,
+    account: Option<DispatchOutcomeFailSafe>,
     audit: Option<ExecutionAuditPermit>,
     context: ExecutionAuditContext,
     fallback_at: Timestamp,
@@ -40,7 +39,7 @@ impl LifecycleOutcomeFailSafe {
     fn new(
         registry: Arc<Mutex<DispatchRegistry>>,
         order_id: OrderId,
-        account: AccountOutcomeFailSafe,
+        account: DispatchOutcomeFailSafe,
         audit: ExecutionAuditPermit,
         context: ExecutionAuditContext,
         fallback_at: Timestamp,
@@ -131,6 +130,30 @@ impl ExecutionDispatcher {
                 .map(Some)
                 .map_err(|_| ExecutionDispatchError::TaskOwnershipUnavailable)
         }
+    }
+
+    /// Clears a durably recovered backend quarantine through dispatcher-owned authority.
+    pub async fn recover_quarantined(&self) -> Result<(), ExecutionDispatchError> {
+        let task_permit = self.try_reserve_adapter_task()?;
+        let operation = super::operation(
+            self.operation_deadline,
+            self.control_cancellation.child_token(),
+        )?;
+        let deadline = operation.deadline();
+        let cancellation = operation.cancellation();
+        let recovery = RecoverExecutionState::new(operation);
+        let (result, deadline_exceeded) = attempt_adapter_call(
+            &self.adapter,
+            deadline,
+            &cancellation,
+            task_permit,
+            move |adapter| async move { adapter.recover_quarantined(recovery).await },
+        )
+        .await;
+        if deadline_exceeded {
+            return Err(ExecutionDispatchError::OperationDeadlineExceeded);
+        }
+        result.map_err(ExecutionDispatchError::Adapter)
     }
 
     /// Obtains and applies a bounded backend state image for every accepted or uncertain order.
@@ -387,6 +410,7 @@ impl ExecutionDispatcher {
                         settlement_currency: record.settlement_currency,
                         previous: record.lifecycle,
                         was_reconciliation: admission.prior_state == DispatchState::Reconciliation,
+                        recovered: record.recovered,
                     });
                 }
                 Ok(bindings)
@@ -885,7 +909,7 @@ fn mark_shutdown_reconciliation(registry: &Arc<Mutex<DispatchRegistry>>) {
 
 fn mark_shutdown_reservation(
     state: &mut DispatchState,
-    reservation: Option<&AccountRiskReservation>,
+    reservation: Option<&DispatchReservation>,
 ) -> bool {
     if !matches!(
         state,
@@ -947,6 +971,26 @@ fn apply_reconciled_order(
         || matches!(observed.status(), ReconciledOrderStatus::Filled) && filled != requested
         || matches!(observed.status(), ReconciledOrderStatus::PartiallyFilled)
             && (filled <= 0 || filled >= requested);
+    if record.recovered {
+        if backend_requires_reconciliation
+            || invalid_evidence
+            || matches!(observed.status(), ReconciledOrderStatus::Unknown)
+        {
+            record.state = DispatchState::Reconciliation;
+            return Some(ExecutionAuditReason::ReconciliationRequired);
+        }
+        record.state = match observed.status() {
+            ReconciledOrderStatus::Open | ReconciledOrderStatus::PartiallyFilled => {
+                DispatchState::Accepted
+            }
+            ReconciledOrderStatus::Filled
+            | ReconciledOrderStatus::Canceled
+            | ReconciledOrderStatus::Rejected
+            | ReconciledOrderStatus::Expired => DispatchState::Terminal,
+            ReconciledOrderStatus::Unknown => DispatchState::Reconciliation,
+        };
+        return None;
+    }
     if backend_requires_reconciliation
         || invalid_evidence
         || financial_effect
@@ -983,7 +1027,7 @@ fn apply_reconciled_order(
 mod tests {
     use std::sync::atomic::Ordering;
 
-    use super::{DispatchState, mark_shutdown_reservation};
+    use super::{DispatchReservation, DispatchState, mark_shutdown_reservation};
     use crate::account::accepted_reservation_for_test;
 
     #[test]
@@ -992,6 +1036,7 @@ mod tests {
         let (reservation, reconciliation_required) = accepted_reservation_for_test()?;
         let mut state = DispatchState::Accepted;
 
+        let reservation = DispatchReservation::Live(reservation);
         assert!(mark_shutdown_reservation(&mut state, Some(&reservation)));
         assert_eq!(state, DispatchState::Reconciliation);
         assert!(reconciliation_required.load(Ordering::Acquire));

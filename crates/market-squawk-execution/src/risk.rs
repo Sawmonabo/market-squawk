@@ -10,6 +10,7 @@ use market_squawk_domain::{
 use thiserror::Error;
 
 use market_squawk_live::{CurrentAuthorityGate, LiveExecutionCapability};
+use serde::Serialize;
 
 use crate::approval::approved_order_from_risk;
 use crate::audit::{ExecutionAuditContext, ExecutionAuditPermit};
@@ -121,7 +122,8 @@ pub enum MarketRiskInputError {
 }
 
 /// Stable complete pre-authority risk rejection reason.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RiskRejectionCode {
     /// Trusted decision clock failed.
     ClockFailure,

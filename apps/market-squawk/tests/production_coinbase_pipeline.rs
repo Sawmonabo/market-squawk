@@ -46,12 +46,24 @@ fn production_contract_is_exactly_allowlisted_typed_and_non_executable() -> Test
 
 #[test]
 fn controlled_local_paper_service_composes_without_network_access() -> TestResult {
-    let composition = local_coinbase_paper_bot(app_config()?, Decimal::new(100_000, 0), 100)?;
+    let temporary = tempfile::tempdir()?;
+    let composition = local_coinbase_paper_bot(
+        app_config_with_overrides(ConfigOverrides {
+            data_dir: Some(temporary.path().join("data")),
+            ..ConfigOverrides::default()
+        })?,
+        Decimal::new(100_000, 0),
+        100,
+    )?;
     drop(composition);
     Ok(())
 }
 
 fn app_config() -> TestResult<AppConfig> {
+    app_config_with_overrides(ConfigOverrides::default())
+}
+
+fn app_config_with_overrides(overrides: ConfigOverrides) -> TestResult<AppConfig> {
     let json = r#"{
       "endpoint":"wss://ws-feed.exchange.coinbase.com",
       "event_classes":["book_snapshot","book_delta","trade"],
@@ -92,6 +104,6 @@ fn app_config() -> TestResult<AppConfig> {
     Ok(AppConfig::load(ConfigSources::new(
         None,
         &environment,
-        ConfigOverrides::default(),
+        overrides,
     ))?)
 }

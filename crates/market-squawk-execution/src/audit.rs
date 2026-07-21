@@ -8,6 +8,7 @@ use market_squawk_domain::{
     AccountId, ApprovalId, InstrumentId, ModelId, OrderId, StrategyId, Timestamp,
 };
 use market_squawk_live::ConsumedLiveAuthority;
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
@@ -30,7 +31,8 @@ pub struct ExecutionAuditConfig {
 }
 
 /// Closed execution audit outcome.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ExecutionAuditKind {
     RiskRejected,
     RiskApproved,
@@ -44,7 +46,8 @@ pub enum ExecutionAuditKind {
 }
 
 /// Closed machine-readable reason retained with an audit outcome.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ExecutionAuditReason {
     Risk(RiskRejectionCode),
     QueueCountSaturated,
@@ -134,6 +137,43 @@ impl ExecutionAuditContext {
 
     pub(crate) const fn market_observed_at(self) -> Timestamp {
         self.market_observed_at
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "recovery binds every independently persisted audit dimension"
+    )]
+    pub(crate) const fn from_recovery(
+        approval_id: ApprovalId,
+        order_id: OrderId,
+        intent_digest: OrderIntentDigest,
+        strategy_id: StrategyId,
+        model_id: Option<ModelId>,
+        account_id: AccountId,
+        instrument_id: InstrumentId,
+        assessment_digest: [u8; 32],
+        evidence_binding_digest: [u8; 32],
+        execution_price_bound: ExecutionPriceBound,
+        policy: RiskPolicyIdentity,
+        market_observed_at: Timestamp,
+        valid_until: Timestamp,
+    ) -> Self {
+        Self {
+            approval_id,
+            order_id,
+            intent_digest,
+            strategy_id,
+            model_id,
+            account_id,
+            instrument_id,
+            assessment_digest,
+            evidence_binding_digest,
+            evidence_present: true,
+            execution_price_bound: Some(execution_price_bound),
+            policy,
+            market_observed_at,
+            valid_until,
+        }
     }
 }
 

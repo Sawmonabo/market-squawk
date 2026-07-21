@@ -102,6 +102,27 @@ impl RiskPolicyIdentity {
     pub const fn ruleset_version(self) -> RuleVersion {
         self.ruleset_version
     }
+
+    /// Restores a persisted, non-authoritative policy identity.
+    pub fn try_from_recovery(
+        digest: [u8; 32],
+        ruleset_version: RuleVersion,
+    ) -> Result<Self, RiskPolicyIdentityError> {
+        if digest == [0; 32] {
+            return Err(RiskPolicyIdentityError::ZeroDigest);
+        }
+        Ok(Self {
+            digest,
+            ruleset_version,
+        })
+    }
+}
+
+/// Invalid persisted risk-policy audit identity.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum RiskPolicyIdentityError {
+    #[error("persisted risk-policy digest is zero")]
+    ZeroDigest,
 }
 
 /// Opaque bounded market reference derived only from a real committed live actor context.

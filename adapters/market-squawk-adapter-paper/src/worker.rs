@@ -3,14 +3,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU64;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 use market_squawk_domain::{AccountId, ClientOrderId, OrderId, TimeInForce, Timestamp};
 use market_squawk_execution::{
     AccountRiskReconciliationFence, CancelOrder, CancelReceipt, CancelStatus, DispatchOrder,
     ExecutionAdapterError, ExecutionMarketUpdate, ExecutionReceipt, ExecutionState,
     PersistenceAcknowledgement, ReconcileOrders, ReconciliationAcknowledgement,
-    ReconciliationBatchBinding,
+    ReconciliationBatchBinding, RecoverExecutionState,
 };
 use tokio::sync::{OwnedSemaphorePermit, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
@@ -60,6 +60,10 @@ pub(crate) enum WorkerCommand {
         acknowledgement: ReconciliationAcknowledgement,
         reply: oneshot::Sender<Result<(), ExecutionAdapterError>>,
     },
+    RecoverQuarantined {
+        recovery: RecoverExecutionState,
+        reply: oneshot::Sender<Result<(), ExecutionAdapterError>>,
+    },
     AcknowledgePersistence {
         authority: PersistenceAcknowledgement,
         receipt: PaperCheckpointReceipt,
@@ -92,6 +96,7 @@ impl WorkerCommand {
             Self::AcknowledgeReconciliation {
                 acknowledgement, ..
             } => std::mem::size_of_val(acknowledgement.order_ids()),
+            Self::RecoverQuarantined { .. } => 0,
             Self::AcknowledgePersistence {
                 authority, receipt, ..
             } => authority
@@ -404,6 +409,11 @@ impl PaperWorker {
                 let _ = reply.send(result);
                 false
             }
+            WorkerCommand::RecoverQuarantined { recovery, reply } => {
+                let result = self.recover_quarantined(recovery);
+                let _ = reply.send(result);
+                false
+            }
             WorkerCommand::AcknowledgePersistence {
                 authority,
                 receipt,
@@ -490,6 +500,59 @@ impl PaperWorker {
                 ExecutionAdapterError::ReconciliationRequired,
             ));
         }
+        Ok(())
+    }
+
+    fn recover_quarantined(
+        &mut self,
+        recovery: RecoverExecutionState,
+    ) -> Result<(), ExecutionAdapterError> {
+        if recovery.operation().is_expired() {
+            return Err(ExecutionAdapterError::KnownFailure);
+        }
+        self.refresh_audit_health();
+        if self.audit_failed.load(AtomicOrdering::Acquire) {
+            return Err(ExecutionAdapterError::ReconciliationRequired);
+        }
+        if !self.state.reconciliation_required {
+            return Ok(());
+        }
+        let sequence = self.next_mutation_sequence()?;
+        let sequence_authority =
+            NonZeroU64::new(sequence).ok_or(ExecutionAdapterError::ReconciliationRequired)?;
+        self.reconciliation_fence
+            .as_ref()
+            .ok_or(ExecutionAdapterError::ReconciliationRequired)?
+            .require(sequence_authority)
+            .map_err(|_| ExecutionAdapterError::ReconciliationRequired)?;
+        let recovered_at = crate::adapter::system_timestamp()?;
+        let input_digest = self
+            .checkpoint()
+            .and_then(|checkpoint| checkpoint.recovery_input_digest())
+            .map_err(|_| ExecutionAdapterError::KnownFailure)?;
+        if recovery.operation().is_expired() {
+            return Err(ExecutionAdapterError::KnownFailure);
+        }
+        self.audit
+            .try_send(PaperAuditRecord::new(
+                sequence,
+                None,
+                PaperAuditKind::ReconciliationCleared,
+                None,
+                None,
+                recovered_at,
+                None,
+                self.config.digest(),
+                input_digest,
+            ))
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => ExecutionAdapterError::NotAttemptedBusy,
+                mpsc::error::TrySendError::Closed(_) => {
+                    ExecutionAdapterError::ReconciliationRequired
+                }
+            })?;
+        self.state.sequence = sequence;
+        self.state.reconciliation_required = false;
         Ok(())
     }
 

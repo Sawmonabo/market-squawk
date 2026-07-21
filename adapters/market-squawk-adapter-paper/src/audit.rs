@@ -5,12 +5,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use market_squawk_domain::{OrderId, QuantityLots, Timestamp};
+use serde::Serialize;
+use thiserror::Error;
 use tokio::sync::mpsc;
 
 use crate::PaperOrderState;
 
 /// Paper state mutation represented without unbounded text.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PaperAuditKind {
     MarketMarked,
     Accepted,
@@ -22,6 +25,7 @@ pub enum PaperAuditKind {
     Expired,
     RecoveryLoaded,
     ReconciliationRequired,
+    ReconciliationCleared,
 }
 
 /// One fixed-size before/after mutation record.
@@ -122,9 +126,25 @@ impl PaperAuditReader {
         self.receiver.recv().await
     }
 
+    /// Reads one queued mutation fact without waiting.
+    pub fn try_next(&mut self) -> Result<Option<PaperAuditRecord>, PaperAuditReadError> {
+        match self.receiver.try_recv() {
+            Ok(record) => Ok(Some(record)),
+            Err(mpsc::error::TryRecvError::Empty) => Ok(None),
+            Err(mpsc::error::TryRecvError::Disconnected) => Err(PaperAuditReadError::Closed),
+        }
+    }
+
     /// Reports a downstream persistence failure. The worker then blocks new submissions and
     /// preserves outstanding state for reconciliation.
     pub fn report_persistence_failure(&self) {
         self.persistence_failed.store(true, Ordering::Release);
     }
+}
+
+/// Terminal paper-audit reader state.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum PaperAuditReadError {
+    #[error("paper audit stream is closed")]
+    Closed,
 }

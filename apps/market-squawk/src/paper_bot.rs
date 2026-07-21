@@ -5,25 +5,37 @@
 //! worker and defines the only supported shutdown order: source, live actors, dispatcher, then
 //! paper execution.
 
+mod audit;
 mod defaults;
 mod supervisor;
 
-use std::{num::NonZeroUsize, sync::Arc, time::Duration};
+use audit::ProductionAuditService;
+pub use audit::{
+    ProductionAuditBarrierError, ProductionAuditError, ProductionAuditEvidence,
+    ProductionAuditShutdown,
+};
+
+use std::{
+    num::{NonZeroU64, NonZeroUsize},
+    sync::Arc,
+    time::Duration,
+};
 
 use market_squawk_adapter_paper::{
-    PaperAccountBootstrap, PaperAccountReplaySnapshot, PaperAuditReader, PaperCheckpointRepository,
-    PaperCheckpointRepositoryError, PaperControlContext, PaperControlError, PaperExecutionConfig,
-    PaperExecutionRuntime, PaperExecutionSnapshot, PaperStartError,
+    PaperAccountBootstrap, PaperAccountReplaySnapshot, PaperCheckpointError,
+    PaperCheckpointRepository, PaperCheckpointRepositoryError, PaperControlContext,
+    PaperControlError, PaperExecutionConfig, PaperExecutionRuntime, PaperExecutionSnapshot,
+    PaperStartError,
 };
 use market_squawk_analytics::RequiredLiveFeature;
 use market_squawk_execution::{
     AccountBootstrap, AccountCoordinatorConfig, AccountCoordinatorError, AccountRecoveryBootstrap,
     AccountRiskCoordinator, ExecutionAdapter, ExecutionAuditConfig, ExecutionAuditError,
-    ExecutionAuditReader, ExecutionAuditWriter, ExecutionDispatcher, ExecutionDispatcherConfig,
-    ExecutionDispatcherError, ExecutionDispatcherQuiesce, ExecutionDispatcherShutdown,
-    ExecutionLiveActionHook, ExecutionLiveActionHookError, ExecutionMarketSink, ExecutionTaskDrain,
-    ExecutionTaskReaper, ExecutionTaskReaperError, ReconciledOrderStatus, RiskLimits, RiskService,
-    RiskServiceConfig, RiskServiceError, Strategy,
+    ExecutionAuditWriter, ExecutionDispatcher, ExecutionDispatcherConfig, ExecutionDispatcherError,
+    ExecutionDispatcherQuiesce, ExecutionDispatcherShutdown, ExecutionLiveActionHook,
+    ExecutionLiveActionHookError, ExecutionMarketSink, ExecutionTaskDrain, ExecutionTaskReaper,
+    ExecutionTaskReaperError, ReconciledOrderStatus, RecoveredDispatchOrder, RiskLimits,
+    RiskService, RiskServiceConfig, RiskServiceError, Strategy,
 };
 use market_squawk_live::{
     ActionAuthorityIssueLimit, LiveRouteConfig, LiveRuntimeConfig, LiveSnapshotReader,
@@ -38,6 +50,13 @@ use crate::{
 use supervisor::{PaperFinancialSupervisor, PaperFinancialSupervisorShutdown};
 
 const PRODUCTION_EXECUTION_TASK_CAPACITY: usize = 3;
+
+#[derive(Debug)]
+struct ProductionPaperRecovery {
+    runtime_sequence: NonZeroU64,
+    orders: Vec<RecoveredDispatchOrder>,
+    quarantined: bool,
+}
 
 #[cfg(test)]
 pub(crate) use defaults::local_kraken_paper_bot_with_strategy_for_test;
@@ -54,6 +73,7 @@ pub struct ProductionPaperBotExecutionConfig {
     pub dispatcher: ExecutionDispatcherConfig,
     pub paper: PaperExecutionConfig,
     pub paper_checkpoint_repository: PaperCheckpointRepository,
+    pub audit_directory: cap_std::fs::Dir,
     pub paper_accounts: Vec<PaperAccountBootstrap>,
     pub paper_control_timeout: Duration,
 }
@@ -163,7 +183,7 @@ impl ProductionPaperBotComposition {
         account_ids.extend(execution.accounts.iter().map(|account| account.account_id));
         let mut checkpoint_repository = execution.paper_checkpoint_repository;
         let recovery = checkpoint_repository.take_recovery();
-        let (accounts, mut paper, recovered_nonterminal_orders) = match recovery {
+        let (accounts, mut paper, dispatcher_recovery) = match recovery {
             Some(recovery) => {
                 let (checkpoint, recovered_accounts) = recovery.into_parts();
                 if recovered_accounts.len() != execution.accounts.len()
@@ -175,8 +195,16 @@ impl ProductionPaperBotComposition {
                 {
                     return Err(ProductionPaperBotStartError::InvalidRecoveryOwnership);
                 }
-                let recovered_nonterminal_orders = checkpoint.has_nonterminal_orders();
+                let recovered_orders = checkpoint
+                    .recovered_dispatch_orders()
+                    .map_err(ProductionPaperBotStartError::RecoveryCheckpoint)?;
+                let quarantined = checkpoint.reconciliation_required();
                 let sequence = checkpoint.sequence();
+                let recovery_audit_count = 1_u64 + u64::from(quarantined);
+                let runtime_sequence = sequence
+                    .checked_add(recovery_audit_count)
+                    .and_then(NonZeroU64::new)
+                    .ok_or(ProductionPaperBotStartError::InvalidRecoveryOwnership)?;
                 let account_bootstraps = recovered_accounts.into_vec().into_iter().map(|account| {
                     let (state, idempotency) = account.into_parts();
                     AccountRecoveryBootstrap { state, idempotency }
@@ -198,7 +226,15 @@ impl ProductionPaperBotComposition {
                         accounts.reconciliation_fence(),
                     )
                     .map_err(ProductionPaperBotStartError::Paper)?;
-                (accounts, paper, recovered_nonterminal_orders)
+                (
+                    accounts,
+                    paper,
+                    Some(ProductionPaperRecovery {
+                        runtime_sequence,
+                        orders: recovered_orders,
+                        quarantined,
+                    }),
+                )
             }
             None => {
                 let accounts = Arc::new(
@@ -216,30 +252,9 @@ impl ProductionPaperBotComposition {
                     accounts.reconciliation_fence(),
                 )
                 .map_err(ProductionPaperBotStartError::Paper)?;
-                (accounts, paper, false)
+                (accounts, paper, None)
             }
         };
-        if recovered_nonterminal_orders {
-            let terminalization = match PaperControlContext::try_new(
-                execution.paper_control_timeout,
-                CancellationToken::new(),
-            ) {
-                Ok(control) => paper.terminalize_recovered_orders(control).await,
-                Err(error) => Err(error),
-            };
-            if let Err(error) = terminalization {
-                let startup = ProductionPaperBotStartError::RecoveryControl(error);
-                let rollback = rollback_execution(
-                    None,
-                    None,
-                    paper,
-                    task_reaper,
-                    execution.paper_control_timeout,
-                )
-                .await;
-                return Err(with_rollback(startup, rollback));
-            }
-        }
         let paper_audit_reader = match paper.take_audit_reader() {
             Some(reader) => reader,
             None => {
@@ -272,13 +287,37 @@ impl ProductionPaperBotComposition {
         };
         let paper_adapter = paper.adapter();
         let paper_market = paper.market_ingress();
-        let dispatcher = match ExecutionDispatcher::try_start(
-            paper_adapter as Arc<dyn ExecutionAdapter>,
-            Arc::clone(&accounts),
-            execution_audit.clone(),
-            execution.dispatcher,
-            task_reaper.clone(),
-        ) {
+        let (dispatcher_result, recovered_quarantine, recovered_order_ownership) =
+            match dispatcher_recovery {
+                Some(recovery) => {
+                    let recovered_order_ownership = !recovery.orders.is_empty();
+                    (
+                        ExecutionDispatcher::try_start_with_recovery(
+                            paper_adapter as Arc<dyn ExecutionAdapter>,
+                            Arc::clone(&accounts),
+                            execution_audit.clone(),
+                            execution.dispatcher,
+                            task_reaper.clone(),
+                            recovery.runtime_sequence,
+                            recovery.orders,
+                        ),
+                        recovery.quarantined,
+                        recovered_order_ownership,
+                    )
+                }
+                None => (
+                    ExecutionDispatcher::try_start(
+                        paper_adapter as Arc<dyn ExecutionAdapter>,
+                        Arc::clone(&accounts),
+                        execution_audit.clone(),
+                        execution.dispatcher,
+                        task_reaper.clone(),
+                    ),
+                    false,
+                    false,
+                ),
+            };
+        let dispatcher = match dispatcher_result {
             Ok(dispatcher) => Arc::new(dispatcher),
             Err(error) => {
                 let startup = ProductionPaperBotStartError::Dispatcher(error);
@@ -293,24 +332,58 @@ impl ProductionPaperBotComposition {
                 return Err(with_rollback(startup, rollback));
             }
         };
-        if recovered_nonterminal_orders
-            && let Err(error) = persist_paper_checkpoint(
-                &dispatcher,
-                &accounts,
-                &account_ids,
-                &paper,
-                &mut checkpoint_repository,
-                execution.paper_control_timeout,
-            )
-            .await
-        {
-            let startup = ProductionPaperBotStartError::RecoveryFinalization(error);
+        if recovered_quarantine && let Err(error) = dispatcher.recover_quarantined().await {
+            let startup = ProductionPaperBotStartError::RecoveryRevalidation(error);
             let rollback = rollback_execution(
                 Some(dispatcher),
                 None,
                 paper,
                 task_reaper,
                 execution.paper_control_timeout,
+            )
+            .await;
+            return Err(with_rollback(startup, rollback));
+        }
+        let audit_service = match ProductionAuditService::try_start(
+            execution.audit_directory,
+            execution_audit_reader,
+            paper_audit_reader,
+        ) {
+            Ok(service) => service,
+            Err(error) => {
+                let startup = ProductionPaperBotStartError::Audit(error);
+                let rollback = rollback_execution(
+                    Some(dispatcher),
+                    None,
+                    paper,
+                    task_reaper,
+                    execution.paper_control_timeout,
+                )
+                .await;
+                return Err(with_rollback(startup, rollback));
+            }
+        };
+        if (recovered_order_ownership || recovered_quarantine)
+            && let Err(error) = persist_paper_checkpoint(
+                &dispatcher,
+                &accounts,
+                &account_ids,
+                &paper,
+                &mut checkpoint_repository,
+                &audit_service,
+                execution.paper_control_timeout,
+            )
+            .await
+        {
+            let startup = ProductionPaperBotStartError::RecoveryFinalization(error);
+            drop(execution_audit);
+            let rollback = rollback_execution_with_audit(
+                Some(dispatcher),
+                None,
+                paper,
+                task_reaper,
+                execution.paper_control_timeout,
+                audit_service,
             )
             .await;
             return Err(with_rollback(startup, rollback));
@@ -324,12 +397,14 @@ impl ProductionPaperBotComposition {
             Ok(supervisor) => supervisor,
             Err(error) => {
                 let startup = ProductionPaperBotStartError::TaskOwnership(error);
-                let rollback = rollback_execution(
+                drop(execution_audit);
+                let rollback = rollback_execution_with_audit(
                     Some(dispatcher),
                     None,
                     paper,
                     task_reaper,
                     execution.paper_control_timeout,
+                    audit_service,
                 )
                 .await;
                 return Err(with_rollback(startup, rollback));
@@ -338,12 +413,14 @@ impl ProductionPaperBotComposition {
         let mut action_hooks = Vec::new();
         if action_hooks.try_reserve_exact(strategies.len()).is_err() {
             let startup = ProductionPaperBotStartError::Allocation;
-            let rollback = rollback_execution(
+            drop(execution_audit);
+            let rollback = rollback_execution_with_audit(
                 Some(dispatcher),
                 Some(supervisor),
                 paper,
                 task_reaper,
                 execution.paper_control_timeout,
+                audit_service,
             )
             .await;
             return Err(with_rollback(startup, rollback));
@@ -358,12 +435,14 @@ impl ProductionPaperBotComposition {
                 Ok(risk) => risk,
                 Err(error) => {
                     let startup = ProductionPaperBotStartError::Risk(error);
-                    let rollback = rollback_execution(
+                    drop(execution_audit);
+                    let rollback = rollback_execution_with_audit(
                         Some(dispatcher),
                         Some(supervisor),
                         paper,
                         task_reaper,
                         execution.paper_control_timeout,
+                        audit_service,
                     )
                     .await;
                     return Err(with_rollback(startup, rollback));
@@ -379,12 +458,14 @@ impl ProductionPaperBotComposition {
                 Ok(hook) => hook,
                 Err(error) => {
                     let startup = ProductionPaperBotStartError::ExecutionHook(error);
-                    let rollback = rollback_execution(
+                    drop(execution_audit);
+                    let rollback = rollback_execution_with_audit(
                         Some(dispatcher),
                         Some(supervisor),
                         paper,
                         task_reaper,
                         execution.paper_control_timeout,
+                        audit_service,
                     )
                     .await;
                     return Err(with_rollback(startup, rollback));
@@ -398,12 +479,14 @@ impl ProductionPaperBotComposition {
                 Ok(hook) => hook,
                 Err(error) => {
                     let startup = ProductionPaperBotStartError::RouteHook(error);
-                    let rollback = rollback_execution(
+                    drop(execution_audit);
+                    let rollback = rollback_execution_with_audit(
                         Some(dispatcher),
                         Some(supervisor),
                         paper,
                         task_reaper,
                         execution.paper_control_timeout,
+                        audit_service,
                     )
                     .await;
                     return Err(with_rollback(startup, rollback));
@@ -418,12 +501,14 @@ impl ProductionPaperBotComposition {
             Ok(live) => live,
             Err(error) => {
                 let startup = ProductionPaperBotStartError::Source(error);
-                let rollback = rollback_execution(
+                drop(execution_audit);
+                let rollback = rollback_execution_with_audit(
                     Some(dispatcher),
                     Some(supervisor),
                     paper,
                     task_reaper,
                     execution.paper_control_timeout,
+                    audit_service,
                 )
                 .await;
                 return Err(with_rollback(startup, rollback));
@@ -439,8 +524,7 @@ impl ProductionPaperBotComposition {
             checkpoint_repository,
             task_reaper,
             paper_control_timeout: execution.paper_control_timeout,
-            execution_audit_reader,
-            paper_audit_reader,
+            audit_service,
         })
     }
 }
@@ -457,24 +541,13 @@ pub struct ProductionPaperBotRuntime {
     checkpoint_repository: PaperCheckpointRepository,
     task_reaper: ExecutionTaskReaper,
     paper_control_timeout: Duration,
-    execution_audit_reader: ExecutionAuditReader,
-    paper_audit_reader: PaperAuditReader,
+    audit_service: ProductionAuditService,
 }
 
 impl ProductionPaperBotRuntime {
     /// Returns authority-free immutable market snapshots.
     pub fn snapshots(&self) -> LiveSnapshotReader {
         self.live.snapshots()
-    }
-
-    /// Returns the sole bounded execution-audit consumer for out-of-hot-path persistence.
-    pub const fn execution_audit_reader(&mut self) -> &mut ExecutionAuditReader {
-        &mut self.execution_audit_reader
-    }
-
-    /// Returns the sole bounded paper-audit consumer for out-of-hot-path persistence.
-    pub const fn paper_audit_reader(&mut self) -> &mut PaperAuditReader {
-        &mut self.paper_audit_reader
     }
 
     /// Stops the source and live actors before dispatch and paper execution, attempting every
@@ -490,8 +563,7 @@ impl ProductionPaperBotRuntime {
             mut checkpoint_repository,
             task_reaper,
             paper_control_timeout,
-            execution_audit_reader,
-            paper_audit_reader,
+            audit_service,
         } = self;
         let source_and_live = live.shutdown().await;
         let supervisor = supervisor.shutdown().await;
@@ -509,6 +581,7 @@ impl ProductionPaperBotRuntime {
                         &account_ids,
                         &paper,
                         &mut checkpoint_repository,
+                        &audit_service,
                         paper_control_timeout,
                     )
                     .await
@@ -532,6 +605,7 @@ impl ProductionPaperBotRuntime {
         };
         let paper = shutdown_paper(paper, paper_control_timeout).await;
         let task_drain = drain_execution_tasks(&task_reaper, paper_control_timeout).await;
+        let audit = audit_service.shutdown();
         ProductionPaperBotShutdown {
             source_and_live,
             supervisor,
@@ -541,13 +615,12 @@ impl ProductionPaperBotRuntime {
             dispatcher,
             paper,
             task_drain,
-            execution_audit_reader,
-            paper_audit_reader,
+            audit,
         }
     }
 }
 
-/// Fully inspected shutdown result, including sole ownership of both audit consumers.
+/// Fully inspected shutdown result, including durable drain of both audit streams.
 #[derive(Debug)]
 pub struct ProductionPaperBotShutdown {
     source_and_live: Result<(), ProductionLiveSourceRuntimeError>,
@@ -558,8 +631,7 @@ pub struct ProductionPaperBotShutdown {
     dispatcher: ExecutionDispatcherShutdown,
     paper: Result<PaperExecutionSnapshot, PaperControlError>,
     task_drain: ExecutionTaskDrain,
-    execution_audit_reader: ExecutionAuditReader,
-    paper_audit_reader: PaperAuditReader,
+    audit: ProductionAuditShutdown,
 }
 
 impl ProductionPaperBotShutdown {
@@ -585,6 +657,7 @@ impl ProductionPaperBotShutdown {
                         .is_ok_and(|checkpoint| checkpoint.sequence() == paper.sequence())
             })
             && self.task_drain.is_complete()
+            && self.audit.is_complete()
     }
 
     pub const fn source_and_live(&self) -> &Result<(), ProductionLiveSourceRuntimeError> {
@@ -627,9 +700,8 @@ impl ProductionPaperBotShutdown {
         self.task_drain
     }
 
-    /// Returns both sole audit consumers after every producer has stopped.
-    pub fn into_audit_readers(self) -> (ExecutionAuditReader, PaperAuditReader) {
-        (self.execution_audit_reader, self.paper_audit_reader)
+    pub const fn audit(&self) -> &ProductionAuditShutdown {
+        &self.audit
     }
 }
 
@@ -654,6 +726,8 @@ pub enum ProductionPaperBotStartError {
     #[error(transparent)]
     ExecutionAudit(ExecutionAuditError),
     #[error(transparent)]
+    Audit(ProductionAuditError),
+    #[error(transparent)]
     TaskOwnership(ExecutionTaskReaperError),
     #[error(transparent)]
     Paper(PaperStartError),
@@ -663,8 +737,10 @@ pub enum ProductionPaperBotStartError {
     MissingPaperFinancialChangeReader,
     #[error("current recovery image cannot restore exact dispatcher order ownership")]
     InvalidRecoveryOwnership,
-    #[error("recovered paper orders could not be terminalized before live admission")]
-    RecoveryControl(#[source] PaperControlError),
+    #[error(transparent)]
+    RecoveryCheckpoint(PaperCheckpointError),
+    #[error("dispatcher-owned paper recovery could not clear durable quarantine")]
+    RecoveryRevalidation(#[source] market_squawk_execution::ExecutionDispatchError),
     #[error("terminal recovered paper state could not be published before live admission")]
     RecoveryFinalization(#[source] ProductionPaperCheckpointError),
     #[error(transparent)]
@@ -693,6 +769,7 @@ pub struct ProductionPaperBotRollback {
     supervisor: Option<PaperFinancialSupervisorShutdown>,
     paper: Result<PaperExecutionSnapshot, PaperControlError>,
     task_drain: ExecutionTaskDrain,
+    audit: Option<ProductionAuditShutdown>,
 }
 
 impl ProductionPaperBotRollback {
@@ -705,8 +782,12 @@ impl ProductionPaperBotRollback {
             && self
                 .paper
                 .as_ref()
-                .is_ok_and(PaperExecutionSnapshot::complete)
+                .is_ok_and(|paper| paper.complete() && !paper.reconciliation_required())
             && self.task_drain.is_complete()
+            && self
+                .audit
+                .as_ref()
+                .is_none_or(ProductionAuditShutdown::is_complete)
     }
 
     pub const fn dispatcher(&self) -> Option<ExecutionDispatcherShutdown> {
@@ -719,6 +800,10 @@ impl ProductionPaperBotRollback {
 
     pub const fn task_drain(&self) -> ExecutionTaskDrain {
         self.task_drain
+    }
+
+    pub const fn audit(&self) -> Option<&ProductionAuditShutdown> {
+        self.audit.as_ref()
     }
 }
 
@@ -743,6 +828,8 @@ pub enum ProductionPaperCheckpointError {
     Control(#[from] PaperControlError),
     #[error(transparent)]
     Repository(#[from] PaperCheckpointRepositoryError),
+    #[error(transparent)]
+    AuditBarrier(#[from] ProductionAuditBarrierError),
     #[error(transparent)]
     Checkpoint(#[from] market_squawk_adapter_paper::PaperCheckpointError),
     #[error(transparent)]
@@ -860,7 +947,28 @@ async fn rollback_execution(
         supervisor,
         paper,
         task_drain,
+        audit: None,
     }
+}
+
+async fn rollback_execution_with_audit(
+    dispatcher: Option<Arc<ExecutionDispatcher>>,
+    supervisor: Option<PaperFinancialSupervisor>,
+    paper: PaperExecutionRuntime,
+    task_reaper: ExecutionTaskReaper,
+    paper_control_timeout: Duration,
+    audit: ProductionAuditService,
+) -> ProductionPaperBotRollback {
+    let mut rollback = rollback_execution(
+        dispatcher,
+        supervisor,
+        paper,
+        task_reaper,
+        paper_control_timeout,
+    )
+    .await;
+    rollback.audit = Some(audit.shutdown());
+    rollback
 }
 
 async fn persist_paper_checkpoint(
@@ -869,6 +977,7 @@ async fn persist_paper_checkpoint(
     account_ids: &[market_squawk_domain::AccountId],
     paper: &PaperExecutionRuntime,
     repository: &mut PaperCheckpointRepository,
+    audit: &ProductionAuditService,
     timeout: Duration,
 ) -> Result<ProductionPaperCheckpointEvidence, ProductionPaperCheckpointError> {
     let deadline = tokio::time::Instant::now()
@@ -878,9 +987,13 @@ async fn persist_paper_checkpoint(
     let control = paper_control_before(deadline)?;
     let adapter = paper.adapter();
     let checkpoint = adapter.checkpoint(control).await?;
-    if checkpoint.has_nonterminal_orders() || !accounts.reconciliation_fence().is_current() {
+    if checkpoint.has_nonterminal_orders()
+        || checkpoint.reconciliation_required()
+        || !accounts.reconciliation_fence().is_current()
+    {
         return Err(ProductionPaperCheckpointError::UnsettledFinancialState);
     }
+    let _audit_evidence = audit.flush()?;
     let replay = account_replay(accounts, account_ids)?;
     let receipt = repository.persist_with_replay(&checkpoint, &replay)?;
     let persisted_sequence = receipt.sequence();
@@ -897,9 +1010,13 @@ async fn persist_paper_checkpoint(
 
     let control = paper_control_before(deadline)?;
     let stabilized = adapter.checkpoint(control).await?;
-    if stabilized.has_nonterminal_orders() || !accounts.reconciliation_fence().is_current() {
+    if stabilized.has_nonterminal_orders()
+        || stabilized.reconciliation_required()
+        || !accounts.reconciliation_fence().is_current()
+    {
         return Err(ProductionPaperCheckpointError::UnsettledFinancialState);
     }
+    let _audit_evidence = audit.flush()?;
     let replay = account_replay(accounts, account_ids)?;
     let receipt = repository.persist_with_replay(&stabilized, &replay)?;
     if tokio::time::Instant::now() >= deadline {
@@ -946,6 +1063,7 @@ async fn verify_stabilized_checkpoint(
     let checkpoint = paper.adapter().checkpoint(control).await?;
     let digest = checkpoint.recovery_digest()?;
     if checkpoint.has_nonterminal_orders()
+        || checkpoint.reconciliation_required()
         || checkpoint.sequence() != expected.sequence()
         || digest != expected.recovery_digest()
         || digest != expected.artifact_digest()

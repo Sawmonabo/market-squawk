@@ -6,7 +6,7 @@ mod reconciliation;
 mod worker;
 
 use std::collections::HashMap;
-use std::num::{NonZeroU32, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::sync::{Arc, Mutex, TryLockError};
 use std::time::Duration;
 
@@ -15,7 +15,7 @@ use thiserror::Error;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use crate::account::CompleteAccountReplacement;
+use crate::account::{AccountOutcomeFailSafe, CompleteAccountReplacement};
 use crate::approval::APPROVAL_COMMAND_RETAINED_BYTE_CEILING;
 use crate::audit::{ExecutionAuditContext, ExecutionAuditPermit};
 use crate::clock::system_now;
@@ -24,7 +24,7 @@ use crate::{
     ExecutionAdapterError, ExecutionAuditEvent, ExecutionAuditKind, ExecutionAuditReason,
     ExecutionAuditWriter, ExecutionOperation, ExecutionPriceBound, ExecutionState, ExecutionTask,
     ExecutionTaskReaper, ExecutionTaskReaperError, OrderIntentDigest, PersistenceAcknowledgement,
-    ReconciledOrder, ReconciliationBatchBinding,
+    ReconciledOrder, ReconciliationBatchBinding, RecoveredDispatchOrder,
 };
 use worker::run_worker;
 
@@ -72,6 +72,37 @@ impl ExecutionDispatcher {
         config: ExecutionDispatcherConfig,
         task_reaper: ExecutionTaskReaper,
     ) -> Result<Self, ExecutionDispatcherError> {
+        Self::try_start_inner(adapter, accounts, audit, config, task_reaper, None)
+    }
+
+    /// Starts with exact durable ownership for backend orders recovered before live admission.
+    pub fn try_start_with_recovery(
+        adapter: Arc<dyn ExecutionAdapter>,
+        accounts: Arc<AccountRiskCoordinator>,
+        audit: ExecutionAuditWriter,
+        config: ExecutionDispatcherConfig,
+        task_reaper: ExecutionTaskReaper,
+        recovery_sequence: NonZeroU64,
+        recovered: Vec<RecoveredDispatchOrder>,
+    ) -> Result<Self, ExecutionDispatcherError> {
+        Self::try_start_inner(
+            adapter,
+            accounts,
+            audit,
+            config,
+            task_reaper,
+            Some((recovery_sequence, recovered)),
+        )
+    }
+
+    fn try_start_inner(
+        adapter: Arc<dyn ExecutionAdapter>,
+        accounts: Arc<AccountRiskCoordinator>,
+        audit: ExecutionAuditWriter,
+        config: ExecutionDispatcherConfig,
+        task_reaper: ExecutionTaskReaper,
+        recovery: Option<(NonZeroU64, Vec<RecoveredDispatchOrder>)>,
+    ) -> Result<Self, ExecutionDispatcherError> {
         if config.operation_deadline.is_zero() || config.shutdown_deadline.is_zero() {
             return Err(ExecutionDispatcherError::ZeroShutdownDeadline);
         }
@@ -87,6 +118,53 @@ impl ExecutionDispatcher {
         entries
             .try_reserve(config.maximum_registry_entries.get())
             .map_err(|_| ExecutionDispatcherError::Allocation)?;
+        let mut recovery_audits = Vec::new();
+        if let Some((_, recovered)) = recovery.as_ref() {
+            if recovered.len() > config.maximum_registry_entries.get() {
+                return Err(ExecutionDispatcherError::InvalidRecovery);
+            }
+            recovery_audits
+                .try_reserve_exact(recovered.len())
+                .map_err(|_| ExecutionDispatcherError::Allocation)?;
+        }
+        let recovery_sequence = recovery.as_ref().map(|(sequence, _)| *sequence);
+        if let Some((_, recovered)) = recovery {
+            for order in recovered {
+                let parts = order.into_parts();
+                if entries.contains_key(&parts.approval_id)
+                    || entries
+                        .values()
+                        .any(|record: &DispatchRecord| record.order_id == parts.order_id)
+                {
+                    return Err(ExecutionDispatcherError::InvalidRecovery);
+                }
+                recovery_audits.push((
+                    audit
+                        .try_reserve()
+                        .map_err(|_| ExecutionDispatcherError::RecoveryAuditUnavailable)?,
+                    parts.audit_context,
+                    parts.recovered_at,
+                ));
+                entries.insert(
+                    parts.approval_id,
+                    DispatchRecord {
+                        order_id: parts.order_id,
+                        account_id: parts.account_id,
+                        intent_digest: parts.intent_digest,
+                        account_revision: parts.account_revision,
+                        state: DispatchState::Accepted,
+                        reservation: Some(DispatchReservation::Recovered),
+                        audit_context: parts.audit_context,
+                        requested_quantity: parts.requested_quantity,
+                        execution_price_bound: parts.execution_price_bound,
+                        settlement_currency: parts.settlement_currency,
+                        last_transition_at: parts.recovered_at,
+                        lifecycle: Some(parts.lifecycle),
+                        recovered: true,
+                    },
+                );
+            }
+        }
         let mut finalized_reconciliations = Vec::new();
         finalized_reconciliations
             .try_reserve_exact(config.maximum_registry_entries.get())
@@ -103,6 +181,12 @@ impl ExecutionDispatcher {
         let admission_cancellation = CancellationToken::new();
         let control_cancellation = CancellationToken::new();
         let retained_bytes = retained_dispatcher_bytes(config)?;
+        if let Some(sequence) = recovery_sequence {
+            accounts
+                .reconciliation_fence()
+                .require(sequence)
+                .map_err(|_| ExecutionDispatcherError::InvalidRecovery)?;
+        }
         let worker = task_reaper
             .try_reserve()
             .and_then(|permit| {
@@ -115,6 +199,15 @@ impl ExecutionDispatcher {
                 ))
             })
             .map_err(ExecutionDispatcherError::TaskOwnership)?;
+        for (permit, context, recovered_at) in recovery_audits {
+            commit_dispatch_audit(
+                permit,
+                ExecutionAuditKind::DispatchUncertain,
+                context,
+                trusted_now_or(recovered_at),
+                &[ExecutionAuditReason::ReconciliationRequired],
+            );
+        }
         let handle = ExecutionDispatcherHandle {
             sender,
             bytes,
@@ -301,6 +394,7 @@ impl ExecutionDispatcherHandle {
                     settlement_currency: approval.execution_terms().settlement_currency(),
                     last_transition_at: context.market_observed_at(),
                     lifecycle: None,
+                    recovered: false,
                 },
             );
         }
@@ -470,13 +564,70 @@ struct DispatchRecord {
     intent_digest: OrderIntentDigest,
     account_revision: u64,
     state: DispatchState,
-    reservation: Option<AccountRiskReservation>,
+    reservation: Option<DispatchReservation>,
     audit_context: ExecutionAuditContext,
     requested_quantity: QuantityLots,
     execution_price_bound: ExecutionPriceBound,
     settlement_currency: Option<Currency>,
     last_transition_at: Timestamp,
     lifecycle: Option<ReconciledOrder>,
+    recovered: bool,
+}
+
+#[derive(Debug)]
+enum DispatchReservation {
+    Live(AccountRiskReservation),
+    Recovered,
+}
+
+impl DispatchReservation {
+    fn outcome_fail_safe(&self) -> DispatchOutcomeFailSafe {
+        match self {
+            Self::Live(reservation) => {
+                DispatchOutcomeFailSafe::Live(reservation.outcome_fail_safe())
+            }
+            Self::Recovered => DispatchOutcomeFailSafe::Recovered,
+        }
+    }
+
+    fn mark_accepted(&self) -> Result<(), crate::AccountReservationStateError> {
+        match self {
+            Self::Live(reservation) => reservation.mark_accepted(),
+            Self::Recovered => Err(crate::AccountReservationStateError::NotSubmitted),
+        }
+    }
+
+    fn mark_known_not_accepted(&self) {
+        if let Self::Live(reservation) = self {
+            reservation.mark_known_not_accepted();
+        }
+    }
+
+    fn mark_reconciliation_required(&self) {
+        if let Self::Live(reservation) = self {
+            reservation.mark_reconciliation_required();
+        }
+    }
+
+    fn mark_terminal_unfilled(&self) {
+        if let Self::Live(reservation) = self {
+            reservation.mark_terminal_unfilled();
+        }
+    }
+}
+
+#[derive(Debug)]
+enum DispatchOutcomeFailSafe {
+    Live(AccountOutcomeFailSafe),
+    Recovered,
+}
+
+impl DispatchOutcomeFailSafe {
+    fn disarm(self) {
+        if let Self::Live(fail_safe) = self {
+            fail_safe.disarm();
+        }
+    }
 }
 
 impl DispatchRecord {
@@ -637,6 +788,10 @@ pub enum ExecutionDispatcherError {
     RuntimeUnavailable,
     #[error("dispatcher retained-size accounting overflowed")]
     RetainedSizeOverflow,
+    #[error("durable dispatcher recovery ownership is invalid")]
+    InvalidRecovery,
+    #[error("mandatory dispatcher recovery audit admission is unavailable")]
+    RecoveryAuditUnavailable,
     #[error(transparent)]
     TaskOwnership(#[from] ExecutionTaskReaperError),
 }
