@@ -1,6 +1,6 @@
 //! Bounded one-generation WebSocket session.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
@@ -270,17 +270,19 @@ impl KrakenSource {
         }
         .map_err(|_| SourceError::InvalidProtocolState)?;
         loop {
+            let deadline = ReceiveDeadline::strictest(sink, deadlines.receive_idle)?;
             let message = tokio::select! {
+                biased;
                 _ = cancellation.cancelled() => return Err(SourceError::Cancelled),
-                result = tokio::time::timeout(deadlines.receive_idle, socket.next()) => {
-                    match result {
-                        Ok(message) => message,
-                        Err(_) => {
-                            self.health.state = KrakenDecoderState::Quarantined;
-                            return Err(SourceError::ConnectionIdle);
-                        }
+                () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline.at)) => {
+                    self.health.state = KrakenDecoderState::Quarantined;
+                    if deadline.sink_owned {
+                        sink.poll_deadline(Instant::now())?;
+                        return Err(SourceError::InvalidProtocolState);
                     }
+                    return Err(SourceError::ConnectionIdle);
                 },
+                message = socket.next() => message,
             };
             let Some(message) = message else {
                 self.health.state = KrakenDecoderState::Quarantined;
@@ -454,6 +456,33 @@ impl KrakenSource {
         }
         self.health.state = decoder.state();
         Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ReceiveDeadline {
+    at: Instant,
+    sink_owned: bool,
+}
+
+impl ReceiveDeadline {
+    fn strictest(
+        sink: &dyn RawMarketSink,
+        transport_timeout: Duration,
+    ) -> Result<Self, SourceError> {
+        let transport = Instant::now()
+            .checked_add(transport_timeout)
+            .ok_or(SourceError::InvalidProtocolState)?;
+        match sink.next_deadline() {
+            Some(sink_deadline) if sink_deadline <= transport => Ok(Self {
+                at: sink_deadline,
+                sink_owned: true,
+            }),
+            _ => Ok(Self {
+                at: transport,
+                sink_owned: false,
+            }),
+        }
     }
 }
 

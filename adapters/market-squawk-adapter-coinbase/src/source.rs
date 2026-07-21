@@ -1,6 +1,6 @@
 //! One-generation Coinbase transport implementation.
 
-use std::future::Future;
+use std::{future::Future, time::Instant};
 
 use bytes::Bytes;
 use futures_util::{FutureExt, SinkExt, StreamExt, future::BoxFuture};
@@ -134,7 +134,7 @@ impl CoinbaseExchangeSource {
 
         loop {
             let message =
-                read_with_deadline(&mut socket, &cancellation, limits.io_timeout()).await?;
+                read_with_deadline(&mut socket, sink, &cancellation, limits.io_timeout()).await?;
             match message {
                 Message::Text(text) => {
                     let payload = text.as_bytes();
@@ -265,22 +265,57 @@ where
 
 async fn read_with_deadline<S>(
     socket: &mut WebSocketStream<S>,
+    sink: &mut dyn RawMarketSink,
     cancellation: &CancellationToken,
-    deadline: std::time::Duration,
+    transport_timeout: std::time::Duration,
 ) -> Result<Message, SourceError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let deadline = ReceiveDeadline::strictest(sink, transport_timeout)?;
     let next = tokio::select! {
         biased;
         () = cancellation.cancelled() => return Err(SourceError::Cancelled),
-        result = tokio::time::timeout(deadline, socket.next()) => result,
+        () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline.at)) => {
+            if deadline.sink_owned {
+                sink.poll_deadline(Instant::now())?;
+                return Err(SourceError::InvalidProtocolState);
+            }
+            return Err(SourceError::Network);
+        }
+        result = socket.next() => result,
     };
     match next {
-        Ok(Some(Ok(message))) => Ok(message),
-        Ok(Some(Err(_))) => Err(SourceError::Network),
-        Ok(None) => Err(SourceError::ProviderUnavailable),
-        Err(_) => Err(SourceError::Network),
+        Some(Ok(message)) => Ok(message),
+        Some(Err(_)) => Err(SourceError::Network),
+        None => Err(SourceError::ProviderUnavailable),
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ReceiveDeadline {
+    at: Instant,
+    sink_owned: bool,
+}
+
+impl ReceiveDeadline {
+    fn strictest(
+        sink: &dyn RawMarketSink,
+        transport_timeout: std::time::Duration,
+    ) -> Result<Self, SourceError> {
+        let transport = Instant::now()
+            .checked_add(transport_timeout)
+            .ok_or(SourceError::InvalidProtocolState)?;
+        match sink.next_deadline() {
+            Some(sink_deadline) if sink_deadline <= transport => Ok(Self {
+                at: sink_deadline,
+                sink_owned: true,
+            }),
+            _ => Ok(Self {
+                at: transport,
+                sink_owned: false,
+            }),
+        }
     }
 }
 

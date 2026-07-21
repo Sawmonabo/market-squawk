@@ -337,6 +337,21 @@ impl RawMarketSink for ProductionRawMarketSink<'_> {
         self.process_frame(frame)
             .map_err(|failure| self.fail(failure))
     }
+
+    fn next_deadline(&self) -> Option<Instant> {
+        self.subscription.next_deadline()
+    }
+
+    fn poll_deadline(&mut self, now: Instant) -> Result<(), SinkError> {
+        if let Some(failure) = self.terminal {
+            return Err(failure.as_sink_error());
+        }
+        self.subscription
+            .poll_deadline(now)
+            .map(|_phase| ())
+            .map_err(ProductionSinkFailure::Subscription)
+            .map_err(|failure| self.fail(failure))
+    }
 }
 
 fn decoded_route(outcome: &DecodeOutcome) -> Result<Option<ShardKey>, ProductionSinkFailure> {
@@ -435,6 +450,41 @@ pub enum ProductionSinkFailure {
 }
 
 impl ProductionSinkFailure {
+    pub(super) const fn requires_generation_resynchronization(self) -> bool {
+        match self {
+            Self::Resynchronize(_) | Self::Quarantine(_) => true,
+            Self::Subscription(
+                SubscriptionFailure::AcknowledgementMismatch
+                | SubscriptionFailure::DuplicateAcknowledgement
+                | SubscriptionFailure::AcknowledgementDeadlineExceeded
+                | SubscriptionFailure::DataBeforeAcknowledgement,
+            ) => true,
+            Self::Subscription(
+                SubscriptionFailure::GenerationInvalid
+                | SubscriptionFailure::StaleGeneration
+                | SubscriptionFailure::RejectedDataCounterOverflow
+                | SubscriptionFailure::TransitionSequenceExhausted
+                | SubscriptionFailure::AuditAccountingInvariant,
+            )
+            | Self::Capture(_)
+            | Self::Registry(_)
+            | Self::Decode(_)
+            | Self::Health(_)
+            | Self::Ingress(_)
+            | Self::RouteActivation(_)
+            | Self::ActivationBufferCountSaturated
+            | Self::ActivationBufferBytesSaturated
+            | Self::ActivationWorkerClosed
+            | Self::UnknownRoute
+            | Self::RouteMismatch
+            | Self::UnexpectedRouteCount
+            | Self::UnboundedAuthorization
+            | Self::MissingLiveCoverage
+            | Self::HealthDeadlineRange
+            | Self::RouteUnavailableBeforeUpgrade => false,
+        }
+    }
+
     const fn as_sink_error(self) -> SinkError {
         match self {
             Self::Capture(CapturePublishError::QueueFull | CapturePublishError::AuthorityBusy)

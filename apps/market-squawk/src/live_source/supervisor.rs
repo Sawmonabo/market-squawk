@@ -220,8 +220,14 @@ impl ProductionSourceSupervisor {
             let terminal = sink.terminal_failure();
             drop(sink);
             match (result, terminal) {
+                (Err(_error), Some(failure)) if failure.requires_generation_resynchronization() => {
+                    Ok(Some(SourceError::GenerationResynchronizationRequired))
+                }
                 (Err(_error), Some(failure)) => Err(ProductionSupervisorError::Sink(failure)),
                 (Err(error), None) => Ok(Some(error)),
+                (Ok(()), Some(failure)) if failure.requires_generation_resynchronization() => {
+                    Ok(Some(SourceError::GenerationResynchronizationRequired))
+                }
                 (Ok(()), Some(failure)) => Err(ProductionSupervisorError::Sink(failure)),
                 (Ok(()), None) => Ok(None),
             }
@@ -315,11 +321,12 @@ impl ProductionSourceSupervisor {
                 }
                 SourceError::Network
                 | SourceError::ConnectionIdle
+                | SourceError::FrameTooLarge { .. }
+                | SourceError::GenerationResynchronizationRequired
                 | SourceError::ProviderUnavailable => {
                     self.wait_after_refusal(cancellation).await?;
                 }
-                SourceError::FrameTooLarge { .. }
-                | SourceError::InvalidProtocolState
+                SourceError::InvalidProtocolState
                 | SourceError::Unauthorized
                 | SourceError::Sink(_)
                 | SourceError::Cancelled

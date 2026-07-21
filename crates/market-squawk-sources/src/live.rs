@@ -436,6 +436,25 @@ pub trait RawMarketSink: Send {
     /// Saturation, closure, and capture-integrity failure are explicit and must invalidate or
     /// degrade the affected stream according to supervision policy.
     fn try_publish(&mut self, frame: RawMarketFrame) -> Result<(), SinkError>;
+
+    /// Returns the earliest generation-local monotonic deadline that must interrupt transport
+    /// receive waiting.
+    ///
+    /// Sources must wait on the strictest of this deadline, their transport-idle deadline, and
+    /// cancellation. The default is no sink-owned deadline.
+    fn next_deadline(&self) -> Option<std::time::Instant> {
+        None
+    }
+
+    /// Polls a sink-owned deadline after [`Self::next_deadline`] interrupts transport waiting.
+    ///
+    /// # Errors
+    ///
+    /// Returns a fail-closed sink error when the exact generation can no longer continue. The
+    /// default accepts the poll for sinks without generation-local timers.
+    fn poll_deadline(&mut self, _now: std::time::Instant) -> Result<(), SinkError> {
+        Ok(())
+    }
 }
 
 /// Immutable source metadata access shared by distinct adapter contracts.
@@ -480,6 +499,9 @@ pub enum SourceError {
     /// Source configuration or protocol state was invalid.
     #[error("source protocol state is invalid")]
     InvalidProtocolState,
+    /// Provider input invalidated the exact generation and requires a fresh synchronized session.
+    #[error("source generation requires resynchronization")]
+    GenerationResynchronizationRequired,
     /// Provider authorization failed.
     #[error("source authorization failed")]
     Unauthorized,

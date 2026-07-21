@@ -207,6 +207,13 @@ impl SubscriptionStateMachine {
         self.estimated_peak_bytes
     }
 
+    pub(super) const fn next_deadline(&self) -> Option<Instant> {
+        match self.phase {
+            SubscriptionPhase::AwaitingAcknowledgement => Some(self.acknowledgement_deadline),
+            SubscriptionPhase::Active | SubscriptionPhase::Invalid => None,
+        }
+    }
+
     #[cfg(test)]
     pub(super) const fn last_market_data_at(&self) -> Option<Instant> {
         self.last_market_data_at
@@ -323,7 +330,6 @@ impl SubscriptionStateMachine {
         Ok(self.phase)
     }
 
-    #[cfg(test)]
     pub(super) fn poll_deadline(
         &mut self,
         now: Instant,

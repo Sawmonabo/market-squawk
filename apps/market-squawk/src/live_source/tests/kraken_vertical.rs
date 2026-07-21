@@ -15,9 +15,10 @@ use std::{
 use chrono::{SecondsFormat, Utc};
 use futures_util::{SinkExt, StreamExt};
 use market_squawk_domain::{
-    AccountId, BasisPoints, ClientOrderId, Currency, DataQuality, InstrumentExecutionTerms,
-    InstrumentId, Money, OrderId, OrderReasonCode, OrderSide, OrderType, PriceTicks, QuantityLots,
-    RuleVersion, SourceId, SourceIdentifier, StrategyId, TimeInForce, Timestamp, TradingStatus,
+    AccountId, BasisPoints, ClientOrderId, ConnectionGeneration, Currency, DataQuality,
+    InstrumentExecutionTerms, InstrumentId, Money, OrderId, OrderReasonCode, OrderSide, OrderType,
+    PriceTicks, QuantityLots, RuleVersion, SourceId, SourceIdentifier, StrategyId, TimeInForce,
+    Timestamp, TradingStatus,
 };
 use market_squawk_execution::{
     AccountBootstrap, AccountCoordinatorConfig, AccountIdempotencyBootstrap,
@@ -41,6 +42,8 @@ type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 
 const PAPER_ACCOUNT_ID: &str = "c8cadf63-d1ce-4c37-837c-8f9f71f9525e";
 const INSTRUMENT_ID: &str = "4c74ab95-53b9-42ad-9b66-0ed403b88fed";
+const UPDATE_BEFORE_SNAPSHOT: &str = r#"{"channel":"book","type":"update","data":[{"symbol":"BTC/USD","bids":[{"price":"45283.5","qty":"0"}],"asks":[],"checksum":1,"timestamp":"2023-10-04T07:48:26Z"}]}"#;
+static KRAKEN_VERTICAL_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// This integration test preserves the two independent safety layers:
 ///
@@ -54,13 +57,14 @@ const INSTRUMENT_ID: &str = "4c74ab95-53b9-42ad-9b66-0ed403b88fed";
 #[tokio::test]
 async fn public_kraken_reaches_live_state_but_both_execution_safety_layers_reject_it() -> TestResult
 {
+    let _budget_guard = KRAKEN_VERTICAL_TEST_LOCK.lock().await;
     let temporary = tempfile::tempdir()?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = format!("ws://{}/", listener.local_addr()?);
     let (acknowledgement, snapshot) = current_kraken_frames()?;
     let expected_acknowledgement = acknowledgement.clone();
     let expected_snapshot = snapshot.clone();
-    let server = tokio::spawn(serve_one_kraken_session(
+    let server = tokio::spawn(serve_resynchronizing_kraken_sessions(
         listener,
         acknowledgement,
         snapshot,
@@ -89,6 +93,10 @@ async fn public_kraken_reaches_live_state_but_both_execution_safety_layers_rejec
     assert_eq!(metadata.quality_ceiling(), DataQuality::DirectUnverified);
     assert_eq!(observed.source, *metadata.source_id());
     assert_eq!(observed.instrument, definition.instrument_id());
+    assert_eq!(
+        observed.connection_generation,
+        ConnectionGeneration::new(2)?
+    );
     assert!(observed.generation_current);
     assert_eq!(observed.phase, StreamPhaseSnapshot::Healthy);
     assert!(observed.snapshot_initialized);
@@ -128,10 +136,50 @@ async fn public_kraken_reaches_live_state_but_both_execution_safety_layers_rejec
     server.await??;
     let paths = LocalPaths::prepare(temporary.path())?;
     let records = JournalReader::open(paths.journal_write_file("kraken-public-book-v2")?)?
-        .read_all_bounded(2, 4 * 1024 * 1024)?;
-    assert_eq!(records.len(), 2);
+        .read_all_bounded(4, 4 * 1024 * 1024)?;
+    assert_eq!(records.len(), 4);
     assert_eq!(records[0].payload(), expected_acknowledgement.as_bytes());
-    assert_eq!(records[1].payload(), expected_snapshot.as_bytes());
+    assert_eq!(records[1].payload(), UPDATE_BEFORE_SNAPSHOT.as_bytes());
+    assert_eq!(records[2].payload(), expected_acknowledgement.as_bytes());
+    assert_eq!(records[3].payload(), expected_snapshot.as_bytes());
+    Ok(())
+}
+
+#[tokio::test]
+async fn silent_peer_is_replaced_at_the_ack_deadline_before_transport_idle() -> TestResult {
+    let _budget_guard = KRAKEN_VERTICAL_TEST_LOCK.lock().await;
+    let temporary = tempfile::tempdir()?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("ws://{}/", listener.local_addr()?);
+    let mut server = tokio::spawn(observe_silent_generation_rotation(listener));
+    let config = kraken_config_with_ack_timeout(temporary.path(), 100)?;
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let composition = local_kraken_paper_bot_with_strategy_for_test(
+        config,
+        Decimal::new(100_000, 0),
+        100,
+        Box::new(InvocationProbeStrategy {
+            invocations: Arc::clone(&invocations),
+        }),
+    )?
+    .with_local_kraken_endpoint_for_test(&endpoint)?;
+    let cancellation = CancellationToken::new();
+    let runtime = composition.start(cancellation.clone()).await?;
+
+    let rotation = tokio::time::timeout(Duration::from_secs(3), &mut server).await;
+    cancellation.cancel();
+    let shutdown = tokio::time::timeout(Duration::from_secs(10), runtime.shutdown()).await?;
+    assert!(shutdown.is_complete());
+    assert_eq!(invocations.load(Ordering::SeqCst), 0);
+    let elapsed = match rotation {
+        Ok(result) => result??,
+        Err(_elapsed) => {
+            server.abort();
+            let _aborted = server.await;
+            return Err("silent Kraken generation outlived its acknowledgement deadline".into());
+        }
+    };
+    assert!(elapsed < Duration::from_secs(2));
     Ok(())
 }
 
@@ -159,6 +207,7 @@ impl Strategy for InvocationProbeStrategy {
 struct ObservedKrakenSession {
     source: SourceId,
     instrument: InstrumentId,
+    connection_generation: ConnectionGeneration,
     generation_current: bool,
     phase: StreamPhaseSnapshot,
     snapshot_initialized: bool,
@@ -190,6 +239,7 @@ async fn wait_for_kraken_snapshot(
                                 return TestResult::Ok(ObservedKrakenSession {
                                     source: stream.source().clone(),
                                     instrument: stream.instrument(),
+                                    connection_generation: stream.connection_generation(),
                                     generation_current: stream.generation_current(),
                                     phase: stream.phase(),
                                     snapshot_initialized: stream.snapshot_initialized(),
@@ -308,11 +358,49 @@ fn defense_in_depth_risk_probe(
     }
 }
 
-async fn serve_one_kraken_session(
+async fn serve_resynchronizing_kraken_sessions(
     listener: TcpListener,
     acknowledgement: String,
     snapshot: String,
 ) -> TestResult {
+    let mut first = accept_kraken_subscription(&listener).await?;
+    first
+        .send(Message::Text(acknowledgement.clone().into()))
+        .await?;
+    first
+        .send(Message::Text(UPDATE_BEFORE_SNAPSHOT.into()))
+        .await?;
+    drop(first);
+
+    let mut socket = accept_kraken_subscription(&listener).await?;
+    socket.send(Message::Text(acknowledgement.into())).await?;
+    socket.send(Message::Text(snapshot.into())).await?;
+    while let Some(message) = socket.next().await {
+        match message? {
+            Message::Close(_) => return Ok(()),
+            Message::Ping(payload) => socket.send(Message::Pong(payload)).await?,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+async fn observe_silent_generation_rotation(listener: TcpListener) -> TestResult<Duration> {
+    let mut first = accept_kraken_subscription(&listener).await?;
+    let started_at = std::time::Instant::now();
+    while let Some(message) = first.next().await {
+        match message {
+            Ok(Message::Close(_)) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
+    let _successor = accept_kraken_subscription(&listener).await?;
+    Ok(started_at.elapsed())
+}
+
+async fn accept_kraken_subscription(
+    listener: &TcpListener,
+) -> TestResult<tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>> {
     let (stream, _) = listener.accept().await?;
     let mut socket = tokio_tungstenite::accept_async(stream).await?;
     let Some(Ok(Message::Text(subscription))) =
@@ -329,16 +417,7 @@ async fn serve_one_kraken_session(
     {
         return Err("Kraken source sent a mismatched production subscription".into());
     }
-    socket.send(Message::Text(acknowledgement.into())).await?;
-    socket.send(Message::Text(snapshot.into())).await?;
-    while let Some(message) = socket.next().await {
-        match message? {
-            Message::Close(_) => return Ok(()),
-            Message::Ping(payload) => socket.send(Message::Pong(payload)).await?,
-            _ => {}
-        }
-    }
-    Ok(())
+    Ok(socket)
 }
 
 fn current_kraken_frames() -> TestResult<(String, String)> {
@@ -365,6 +444,13 @@ fn current_kraken_frames() -> TestResult<(String, String)> {
 }
 
 fn kraken_config(data_dir: &std::path::Path) -> TestResult<AppConfig> {
+    kraken_config_with_ack_timeout(data_dir, 5_000)
+}
+
+fn kraken_config_with_ack_timeout(
+    data_dir: &std::path::Path,
+    acknowledgement_timeout_ms: u64,
+) -> TestResult<AppConfig> {
     let json = format!(
         r#"{{
           "endpoint":"wss://ws.kraken.com/v2",
@@ -372,7 +458,7 @@ fn kraken_config(data_dir: &std::path::Path) -> TestResult<AppConfig> {
           "depth":10,
           "freshness_ms":30000,
           "max_frame_bytes":1048576,
-          "subscription_ack_timeout_ms":5000,
+          "subscription_ack_timeout_ms":{acknowledgement_timeout_ms},
           "control_message_capacity":64,
           "control_byte_capacity":65536,
           "authorization":{{
