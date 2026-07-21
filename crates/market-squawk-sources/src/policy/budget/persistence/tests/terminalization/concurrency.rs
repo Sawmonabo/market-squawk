@@ -26,6 +26,8 @@ fn blocking_budget() -> TestResult<BlockingBudgetFixture> {
             window_started_at: observation.monotonic,
             restored_window_ends_at: None,
             requests_used: 0,
+            primary_sliding_releases: VecDeque::new(),
+            additional_windows: Vec::new(),
             in_flight: 0,
             unavailable_until: None,
             disabled: false,

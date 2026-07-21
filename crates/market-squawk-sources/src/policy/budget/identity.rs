@@ -233,6 +233,112 @@ impl<'de> Deserialize<'de> for BackoffPolicy {
     }
 }
 
+pub(in crate::policy) const MAX_PROVIDER_BUDGET_WINDOWS: usize = 4;
+const MAX_ADDITIONAL_PROVIDER_BUDGET_WINDOWS: usize = MAX_PROVIDER_BUDGET_WINDOWS - 1;
+pub(in crate::policy) const MAX_SLIDING_WINDOW_RELEASES: usize = 4_096;
+
+/// Whether a provider request limit resets as a fixed interval or rolls per request.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BudgetWindowSemantics {
+    /// Capacity resets at the end of the currently anchored interval.
+    #[default]
+    Tumbling,
+    /// Each admitted request returns capacity exactly one duration after admission.
+    Sliding,
+}
+
+impl BudgetWindowSemantics {
+    const fn is_tumbling(&self) -> bool {
+        matches!(self, Self::Tumbling)
+    }
+}
+
+/// One explicit, checked request-limit window in a conjunctive provider policy.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderBudgetWindow {
+    requests_per_window: NonZeroU32,
+    window_nanos: NonZeroU64,
+    semantics: BudgetWindowSemantics,
+}
+
+impl ProviderBudgetWindow {
+    /// Constructs one bounded provider request window.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetworkPolicyError::InvalidBudgetPolicy`] when the duration cannot be represented
+    /// by durable wall-clock arithmetic.
+    pub fn try_new(
+        requests_per_window: NonZeroU32,
+        window_nanos: NonZeroU64,
+        semantics: BudgetWindowSemantics,
+    ) -> Result<Self, NetworkPolicyError> {
+        if window_nanos.get() > i64::MAX as u64 {
+            return Err(NetworkPolicyError::InvalidBudgetPolicy);
+        }
+        Ok(Self {
+            requests_per_window,
+            window_nanos,
+            semantics,
+        })
+    }
+
+    /// Returns the maximum number of requests admitted within this window.
+    pub const fn requests_per_window(self) -> u32 {
+        self.requests_per_window.get()
+    }
+
+    /// Returns this window's duration in nanoseconds.
+    pub const fn window_nanos(self) -> u64 {
+        self.window_nanos.get()
+    }
+
+    /// Returns this window's reset semantics.
+    pub const fn semantics(self) -> BudgetWindowSemantics {
+        self.semantics
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderBudgetWindowWire {
+    requests_per_window: NonZeroU32,
+    window_nanos: NonZeroU64,
+    semantics: BudgetWindowSemantics,
+}
+
+impl<'de> Deserialize<'de> for ProviderBudgetWindow {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ProviderBudgetWindowWire::deserialize(deserializer)?;
+        Self::try_new(
+            wire.requests_per_window,
+            wire.window_nanos,
+            wire.semantics,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+fn default_window_semantics() -> BudgetWindowSemantics {
+    BudgetWindowSemantics::Tumbling
+}
+
+fn empty_additional_budget_windows(
+) -> BoundedVec<ProviderBudgetWindow, MAX_ADDITIONAL_PROVIDER_BUDGET_WINDOWS> {
+    BoundedVec::empty()
+}
+
+fn no_additional_budget_windows(
+    windows: &BoundedVec<ProviderBudgetWindow, MAX_ADDITIONAL_PROVIDER_BUDGET_WINDOWS>,
+) -> bool {
+    windows.is_empty()
+}
+
 /// Published request-window and local concurrency limits for one shared scope.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -242,6 +348,17 @@ pub struct ProviderBudgetPolicy {
     window_nanos: NonZeroU64,
     max_concurrent: NonZeroU16,
     backoff: BackoffPolicy,
+    #[serde(
+        default = "default_window_semantics",
+        skip_serializing_if = "BudgetWindowSemantics::is_tumbling"
+    )]
+    window_semantics: BudgetWindowSemantics,
+    #[serde(
+        default = "empty_additional_budget_windows",
+        skip_serializing_if = "no_additional_budget_windows"
+    )]
+    additional_windows:
+        BoundedVec<ProviderBudgetWindow, MAX_ADDITIONAL_PROVIDER_BUDGET_WINDOWS>,
 }
 
 impl ProviderBudgetPolicy {
@@ -253,17 +370,82 @@ impl ProviderBudgetPolicy {
         max_concurrent: NonZeroU16,
         backoff: BackoffPolicy,
     ) -> Result<Self, NetworkPolicyError> {
-        if window_nanos.get() > i64::MAX as u64
-            || u32::from(max_concurrent.get()) > requests_per_window.get()
-        {
-            return Err(NetworkPolicyError::InvalidBudgetPolicy);
-        }
-        Ok(Self {
+        Self::try_new_conjunctive(
             scope,
-            requests_per_window,
-            window_nanos,
+            &[ProviderBudgetWindow::try_new(
+                requests_per_window,
+                window_nanos,
+                BudgetWindowSemantics::Tumbling,
+            )?],
             max_concurrent,
             backoff,
+        )
+    }
+
+    /// Constructs a canonical conjunction of one to four unique request windows.
+    ///
+    /// Windows are ordered by duration, and every admission must have capacity in every window.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetworkPolicyError::InvalidBudgetPolicy`] for an empty or oversized conjunction,
+    /// duplicate durations, an unrepresentable duration, concurrency above any request limit, or
+    /// more than 4,096 total preallocated sliding-window release slots.
+    pub fn try_new_conjunctive(
+        scope: BudgetScope,
+        windows: &[ProviderBudgetWindow],
+        max_concurrent: NonZeroU16,
+        backoff: BackoffPolicy,
+    ) -> Result<Self, NetworkPolicyError> {
+        if windows.is_empty() || windows.len() > MAX_PROVIDER_BUDGET_WINDOWS {
+            return Err(NetworkPolicyError::InvalidBudgetPolicy);
+        }
+        let mut canonical = Vec::new();
+        canonical
+            .try_reserve(windows.len())
+            .map_err(|_| NetworkPolicyError::InvalidBudgetPolicy)?;
+        canonical.extend_from_slice(windows);
+        canonical.sort_unstable_by_key(|window| window.window_nanos());
+        let concurrency = u32::from(max_concurrent.get());
+        let mut sliding_capacity = 0_usize;
+        let mut previous_duration = None;
+        for window in canonical.iter().copied() {
+            if window.window_nanos() > i64::MAX as u64
+                || concurrency > window.requests_per_window()
+                || previous_duration == Some(window.window_nanos())
+            {
+                return Err(NetworkPolicyError::InvalidBudgetPolicy);
+            }
+            previous_duration = Some(window.window_nanos());
+            if window.semantics() == BudgetWindowSemantics::Sliding {
+                sliding_capacity = sliding_capacity
+                    .checked_add(
+                        usize::try_from(window.requests_per_window())
+                            .map_err(|_| NetworkPolicyError::InvalidBudgetPolicy)?,
+                    )
+                    .filter(|capacity| *capacity <= MAX_SLIDING_WINDOW_RELEASES)
+                    .ok_or(NetworkPolicyError::InvalidBudgetPolicy)?;
+            }
+        }
+        let mut canonical = canonical.into_iter();
+        let primary = canonical
+            .next()
+            .ok_or(NetworkPolicyError::InvalidBudgetPolicy)?;
+        let mut additional = Vec::new();
+        additional
+            .try_reserve(MAX_ADDITIONAL_PROVIDER_BUDGET_WINDOWS)
+            .map_err(|_| NetworkPolicyError::InvalidBudgetPolicy)?;
+        additional.extend(canonical);
+        let additional_windows = BoundedVec::try_new(additional)
+            .map_err(|_| NetworkPolicyError::InvalidBudgetPolicy)?;
+        Ok(Self {
+            scope,
+            requests_per_window: primary.requests_per_window,
+            window_nanos: primary.window_nanos,
+            max_concurrent,
+            backoff,
+            window_semantics: primary.semantics,
+            additional_windows,
         })
     }
 
@@ -282,6 +464,34 @@ impl ProviderBudgetPolicy {
         self.window_nanos.get()
     }
 
+    /// Returns the number of conjunctive request windows.
+    pub fn window_count(&self) -> usize {
+        self.additional_windows.len() + 1
+    }
+
+    /// Returns a canonical request window by ascending duration.
+    pub fn window(&self, index: usize) -> Option<ProviderBudgetWindow> {
+        if index == 0 {
+            return Some(self.primary_window());
+        }
+        self.additional_windows.as_slice().get(index - 1).copied()
+    }
+
+    pub(in crate::policy) fn windows(
+        &self,
+    ) -> impl Iterator<Item = ProviderBudgetWindow> + '_ {
+        std::iter::once(self.primary_window())
+            .chain(self.additional_windows.as_slice().iter().copied())
+    }
+
+    const fn primary_window(&self) -> ProviderBudgetWindow {
+        ProviderBudgetWindow {
+            requests_per_window: self.requests_per_window,
+            window_nanos: self.window_nanos,
+            semantics: self.window_semantics,
+        }
+    }
+
     /// Returns the maximum number of requests concurrently in flight.
     pub const fn max_concurrent(&self) -> u16 {
         self.max_concurrent.get()
@@ -297,6 +507,8 @@ impl ProviderBudgetPolicy {
             && self.window_nanos == other.window_nanos
             && self.max_concurrent == other.max_concurrent
             && self.backoff == other.backoff
+            && self.window_semantics == other.window_semantics
+            && self.additional_windows == other.additional_windows
     }
 
     pub(in crate::policy) fn dynamic_retained_bytes(&self) -> Option<usize> {
@@ -306,10 +518,17 @@ impl ProviderBudgetPolicy {
             window_nanos: _,
             max_concurrent: _,
             backoff,
+            window_semantics: _,
+            additional_windows,
         } = self;
         scope
             .dynamic_retained_bytes()?
             .checked_add(backoff.dynamic_retained_bytes()?)
+            .and_then(|bytes| {
+                additional_windows
+                    .checked_allocation_bytes()
+                    .and_then(|windows| bytes.checked_add(windows))
+            })
     }
 }
 
@@ -321,6 +540,11 @@ struct ProviderBudgetPolicyWire {
     window_nanos: NonZeroU64,
     max_concurrent: NonZeroU16,
     backoff: BackoffPolicy,
+    #[serde(default = "default_window_semantics")]
+    window_semantics: BudgetWindowSemantics,
+    #[serde(default = "empty_additional_budget_windows")]
+    additional_windows:
+        BoundedVec<ProviderBudgetWindow, MAX_ADDITIONAL_PROVIDER_BUDGET_WINDOWS>,
 }
 
 impl<'de> Deserialize<'de> for ProviderBudgetPolicy {
@@ -329,13 +553,20 @@ impl<'de> Deserialize<'de> for ProviderBudgetPolicy {
         D: Deserializer<'de>,
     {
         let wire = ProviderBudgetPolicyWire::deserialize(deserializer)?;
-        Self::try_new(
-            wire.scope,
-            wire.requests_per_window,
-            wire.window_nanos,
-            wire.max_concurrent,
-            wire.backoff,
-        )
+        let mut windows = Vec::new();
+        windows
+            .try_reserve(wire.additional_windows.len() + 1)
+            .map_err(|_| serde::de::Error::custom(NetworkPolicyError::InvalidBudgetPolicy))?;
+        windows.push(
+            ProviderBudgetWindow::try_new(
+                wire.requests_per_window,
+                wire.window_nanos,
+                wire.window_semantics,
+            )
+            .map_err(serde::de::Error::custom)?,
+        );
+        windows.extend(wire.additional_windows.into_vec());
+        Self::try_new_conjunctive(wire.scope, &windows, wire.max_concurrent, wire.backoff)
         .map_err(serde::de::Error::custom)
     }
 }

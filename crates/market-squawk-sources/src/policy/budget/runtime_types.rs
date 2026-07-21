@@ -96,10 +96,91 @@ pub(in crate::policy) struct BudgetState {
     pub(in crate::policy) window_started_at: MonotonicInstant,
     pub(in crate::policy) restored_window_ends_at: Option<MonotonicInstant>,
     pub(in crate::policy) requests_used: u32,
+    pub(in crate::policy) primary_sliding_releases: VecDeque<MonotonicInstant>,
+    pub(in crate::policy) additional_windows: Vec<BudgetWindowRuntimeState>,
     pub(in crate::policy) in_flight: u16,
     pub(in crate::policy) unavailable_until: Option<MonotonicInstant>,
     pub(in crate::policy) disabled: bool,
     pub(in crate::policy) consecutive_refusals: u32,
+}
+
+#[derive(Debug)]
+pub(in crate::policy) struct BudgetWindowRuntimeState {
+    pub(in crate::policy) window_started_at: MonotonicInstant,
+    pub(in crate::policy) restored_window_ends_at: Option<MonotonicInstant>,
+    pub(in crate::policy) requests_used: u32,
+    pub(in crate::policy) sliding_releases: VecDeque<MonotonicInstant>,
+}
+
+impl BudgetWindowRuntimeState {
+    fn new(window: ProviderBudgetWindow, starts_at: MonotonicInstant) -> Self {
+        Self {
+            window_started_at: starts_at,
+            restored_window_ends_at: None,
+            requests_used: 0,
+            sliding_releases: preallocated_sliding_releases(window),
+        }
+    }
+
+    fn dynamic_retained_bytes(&self) -> Option<usize> {
+        self.sliding_releases
+            .capacity()
+            .checked_mul(std::mem::size_of::<MonotonicInstant>())
+    }
+}
+
+impl BudgetState {
+    pub(in crate::policy) fn new(
+        policy: &ProviderBudgetPolicy,
+        starts_at: MonotonicInstant,
+    ) -> Self {
+        let additional_windows = policy
+            .windows()
+            .skip(1)
+            .map(|window| BudgetWindowRuntimeState::new(window, starts_at))
+            .collect();
+        Self {
+            window_started_at: starts_at,
+            restored_window_ends_at: None,
+            requests_used: 0,
+            primary_sliding_releases: policy
+                .window(0)
+                .map_or_else(VecDeque::new, preallocated_sliding_releases),
+            additional_windows,
+            in_flight: 0,
+            unavailable_until: None,
+            disabled: false,
+            consecutive_refusals: 0,
+        }
+    }
+
+    pub(in crate::policy) fn dynamic_retained_bytes(&self) -> Option<usize> {
+        let primary = self
+            .primary_sliding_releases
+            .capacity()
+            .checked_mul(std::mem::size_of::<MonotonicInstant>())?;
+        let windows = self
+            .additional_windows
+            .capacity()
+            .checked_mul(std::mem::size_of::<BudgetWindowRuntimeState>())?;
+        self.additional_windows
+            .iter()
+            .try_fold(primary.checked_add(windows)?, |bytes, window| {
+                bytes.checked_add(window.dynamic_retained_bytes()?)
+            })
+    }
+}
+
+fn preallocated_sliding_releases(
+    window: ProviderBudgetWindow,
+) -> VecDeque<MonotonicInstant> {
+    if window.semantics() == BudgetWindowSemantics::Sliding {
+        VecDeque::with_capacity(
+            usize::try_from(window.requests_per_window()).map_or(0, std::convert::identity),
+        )
+    } else {
+        VecDeque::new()
+    }
 }
 
 pub(in crate::policy) struct BudgetAllocation {

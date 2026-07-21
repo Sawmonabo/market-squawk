@@ -289,6 +289,73 @@ mod coordinator_tests {
     }
 
     #[test]
+    fn colliding_scopes_share_only_an_exact_window_conjunction() -> TestResult {
+        fn resolved_with_windows(
+            scope: &str,
+            windows: &[ProviderBudgetWindow],
+        ) -> TestResult<ResolvedProviderBudgetPolicy> {
+            let policy = ProviderBudgetPolicy::try_new_conjunctive(
+                BudgetScope::new(SourceIdentifier::try_from(scope)?),
+                windows,
+                NonZeroU16::new(1).ok_or("concurrency must be nonzero")?,
+                BackoffPolicy::try_new(
+                    NonZeroU64::new(1_000_000).ok_or("backoff must be nonzero")?,
+                    NonZeroU64::new(60_000_000_000)
+                        .ok_or("backoff cap must be nonzero")?,
+                    0,
+                )?,
+            )?;
+            let authorization = crate::AuthorizationGrant::new(
+                crate::AuthorizationMode::PublicInterface,
+                AuthorizationBasis::new(SourceIdentifier::try_from("public-interface-terms")?),
+                ExactPayloadEvidence::from_content_digest(EvidenceDigest::new(
+                    DigestAlgorithm::Sha256,
+                    [1; 32],
+                )),
+                EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?,
+            );
+            Ok(ResolvedProviderBudgetPolicy::try_new(
+                policy,
+                EndpointPolicy::try_new(["https://conjunction.example.test/path"] )?,
+                authorization,
+                &NoAccountSubjects,
+            )?)
+        }
+
+        let base = [
+            ProviderBudgetWindow::try_new(
+                NonZeroU32::new(2).ok_or("request limit must be nonzero")?,
+                NonZeroU64::new(1_000).ok_or("window must be nonzero")?,
+                BudgetWindowSemantics::Sliding,
+            )?,
+            ProviderBudgetWindow::try_new(
+                NonZeroU32::new(10).ok_or("request limit must be nonzero")?,
+                NonZeroU64::new(10_000).ok_or("window must be nonzero")?,
+                BudgetWindowSemantics::Tumbling,
+            )?,
+        ];
+        let exact = resolved_with_windows("conjunction-exact", &base)?;
+        let conflicting_windows = [base[0], ProviderBudgetWindow::try_new(
+            NonZeroU32::new(9).ok_or("request limit must be nonzero")?,
+            NonZeroU64::new(10_000).ok_or("window must be nonzero")?,
+            BudgetWindowSemantics::Tumbling,
+        )?];
+        let conflicting = resolved_with_windows("conjunction-conflict", &conflicting_windows)?;
+        let mut coordinator = ProcessBudgetCoordinator::new(2);
+        let first = coordinator.coordinate(std::slice::from_ref(&exact), None)?;
+        let repeated = coordinator.coordinate(std::slice::from_ref(&exact), None)?;
+        assert!(Arc::ptr_eq(
+            &first.first().ok_or("first allocation missing")?.allocation,
+            &repeated.first().ok_or("repeated allocation missing")?.allocation,
+        ));
+        assert!(matches!(
+            coordinator.coordinate(std::slice::from_ref(&conflicting), None),
+            Err(BudgetPoolError::ConflictingPolicy)
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn canonical_authority_union_accepts_exact_bound_and_rejects_one_over_atomically() -> TestResult
     {
         fn authority(host: &str) -> TestResult<CanonicalNetworkAuthority> {
@@ -369,6 +436,8 @@ mod coordinator_tests {
             window_started_at: observation.monotonic,
             restored_window_ends_at: None,
             requests_used: 0,
+            primary_sliding_releases: VecDeque::new(),
+            additional_windows: Vec::new(),
             in_flight: 0,
             unavailable_until: None,
             disabled: false,
@@ -378,7 +447,13 @@ mod coordinator_tests {
             checkpoint_from_runtime(first.policy(), &state, observation, 1, false)?;
         let mut invalid_checkpoint =
             checkpoint_from_runtime(second.policy(), &state, observation, 1, false)?;
-        invalid_checkpoint.requests_used = second.policy().requests_per_window() + 1;
+        let (_started, _ends, requests_used) = invalid_checkpoint
+            .windows
+            .as_mut_slice()
+            .first_mut()
+            .and_then(BudgetWindowCheckpointState::tumbling_mut)
+            .ok_or("checkpoint window was not tumbling")?;
+        *requests_used = second.policy().requests_per_window() + 1;
         let store: Arc<dyn AuthorityStateStore> = Arc::new(NoopAuthorityStore);
         let session = AuthorityDurabilitySession::open(store, observation.wall_clock)?;
         let mut coordinator = ProcessBudgetCoordinator::new(4);
@@ -404,6 +479,8 @@ mod coordinator_tests {
                 window_started_at: observation.monotonic,
                 restored_window_ends_at: None,
                 requests_used: 0,
+                primary_sliding_releases: VecDeque::new(),
+                additional_windows: Vec::new(),
                 in_flight: 0,
                 unavailable_until: None,
                 disabled: false,

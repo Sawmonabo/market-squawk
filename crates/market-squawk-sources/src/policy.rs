@@ -1,5 +1,6 @@
 //! Network endpoint and shared provider-budget policy.
 
+use std::collections::VecDeque;
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};

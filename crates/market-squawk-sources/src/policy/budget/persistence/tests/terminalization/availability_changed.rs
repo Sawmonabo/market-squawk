@@ -69,6 +69,8 @@ fn legitimate_post_mint_generation_change_returns_precise_nonterminal_reason() -
             window_started_at: observation.monotonic,
             restored_window_ends_at: None,
             requests_used: 0,
+            primary_sliding_releases: VecDeque::new(),
+            additional_windows: Vec::new(),
             in_flight: 0,
             unavailable_until: None,
             disabled: false,

@@ -162,6 +162,142 @@ mod tests {
         )
     }
 
+    #[test]
+    fn conjunctive_budget_policy_preserves_legacy_wire_and_enforces_invariants()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let legacy = policy()?;
+        let legacy_json = serde_json::to_string(&legacy)?;
+        assert_eq!(
+            legacy_json,
+            r#"{"scope":{"provider":"provider","authorization_account":null},"requests_per_window":2,"window_nanos":100,"max_concurrent":1,"backoff":{"initial_nanos":10,"maximum_nanos":100,"jitter_basis_points":1000}}"#
+        );
+        assert_eq!(serde_json::from_str::<ProviderBudgetPolicy>(&legacy_json)?, legacy);
+
+        let windows = [
+            ProviderBudgetWindow::try_new(
+                NonZeroU32::new(1).ok_or("window limit must be nonzero")?,
+                NonZeroU64::new(500).ok_or("window duration must be nonzero")?,
+                BudgetWindowSemantics::Sliding,
+            )?,
+            ProviderBudgetWindow::try_new(
+                NonZeroU32::new(2).ok_or("window limit must be nonzero")?,
+                NonZeroU64::new(1_000).ok_or("window duration must be nonzero")?,
+                BudgetWindowSemantics::Sliding,
+            )?,
+        ];
+        let conjunctive = ProviderBudgetPolicy::try_new_conjunctive(
+            legacy.scope().clone(),
+            &windows,
+            NonZeroU16::new(1).ok_or("concurrency must be nonzero")?,
+            legacy.backoff(),
+        )?;
+        assert_eq!(conjunctive.window_count(), 2);
+        assert_eq!(conjunctive.window(0), Some(windows[0]));
+        assert_eq!(conjunctive.window(1), Some(windows[1]));
+        assert!(serde_json::to_string(&conjunctive)?.contains("additional_windows"));
+
+        let duplicate_duration = [windows[0], ProviderBudgetWindow::try_new(
+            NonZeroU32::new(2).ok_or("window limit must be nonzero")?,
+            NonZeroU64::new(500).ok_or("window duration must be nonzero")?,
+            BudgetWindowSemantics::Tumbling,
+        )?];
+        assert_eq!(
+            ProviderBudgetPolicy::try_new_conjunctive(
+                legacy.scope().clone(),
+                &duplicate_duration,
+                NonZeroU16::new(1).ok_or("concurrency must be nonzero")?,
+                legacy.backoff(),
+            ),
+            Err(NetworkPolicyError::InvalidBudgetPolicy)
+        );
+        assert_eq!(
+            ProviderBudgetPolicy::try_new_conjunctive(
+                legacy.scope().clone(),
+                &windows,
+                NonZeroU16::new(2).ok_or("concurrency must be nonzero")?,
+                legacy.backoff(),
+            ),
+            Err(NetworkPolicyError::InvalidBudgetPolicy)
+        );
+        let oversized_sliding = [ProviderBudgetWindow::try_new(
+            NonZeroU32::new(4_097).ok_or("window limit must be nonzero")?,
+            NonZeroU64::new(1).ok_or("window duration must be nonzero")?,
+            BudgetWindowSemantics::Sliding,
+        )?];
+        assert_eq!(
+            ProviderBudgetPolicy::try_new_conjunctive(
+                legacy.scope().clone(),
+                &oversized_sliding,
+                NonZeroU16::new(1).ok_or("concurrency must be nonzero")?,
+                legacy.backoff(),
+            ),
+            Err(NetworkPolicyError::InvalidBudgetPolicy)
+        );
+        assert_eq!(
+            ProviderBudgetWindow::try_new(
+                NonZeroU32::new(1).ok_or("window limit must be nonzero")?,
+                NonZeroU64::new((i64::MAX as u64) + 1)
+                    .ok_or("window duration must be nonzero")?,
+                BudgetWindowSemantics::Tumbling,
+            ),
+            Err(NetworkPolicyError::InvalidBudgetPolicy)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn conjunctive_sliding_admission_is_all_or_nothing() -> Result<(), NetworkPolicyError> {
+        let clock = Arc::new(ManualClock::new(0, 0));
+        let windows = [
+            ProviderBudgetWindow::try_new(
+                NonZeroU32::new(1).ok_or(NetworkPolicyError::InvalidBudgetPolicy)?,
+                NonZeroU64::new(500).ok_or(NetworkPolicyError::InvalidBudgetPolicy)?,
+                BudgetWindowSemantics::Sliding,
+            )?,
+            ProviderBudgetWindow::try_new(
+                NonZeroU32::new(1).ok_or(NetworkPolicyError::InvalidBudgetPolicy)?,
+                NonZeroU64::new(700).ok_or(NetworkPolicyError::InvalidBudgetPolicy)?,
+                BudgetWindowSemantics::Sliding,
+            )?,
+            ProviderBudgetWindow::try_new(
+                NonZeroU32::new(2).ok_or(NetworkPolicyError::InvalidBudgetPolicy)?,
+                NonZeroU64::new(1_000).ok_or(NetworkPolicyError::InvalidBudgetPolicy)?,
+                BudgetWindowSemantics::Sliding,
+            )?,
+        ];
+        let budget = SharedProviderBudget::new(
+            ProviderBudgetPolicy::try_new_conjunctive(
+                BudgetScope::new(
+                    SourceIdentifier::try_from("conjunctive-provider")
+                        .map_err(|_| NetworkPolicyError::InvalidBudgetPolicy)?,
+                ),
+                &windows,
+                NonZeroU16::new(1).ok_or(NetworkPolicyError::InvalidBudgetPolicy)?,
+                policy()?.backoff(),
+            )?,
+            MonotonicInstant::from_nanos(0),
+            clock.clone(),
+        );
+        let BudgetDecision::Ready(first) = budget.try_acquire() else {
+            return Err(NetworkPolicyError::InvalidBudgetPolicy);
+        };
+        first.release();
+
+        assert!(clock.set(100, 100));
+        assert!(
+            matches!(budget.try_acquire(), BudgetDecision::WaitUntil(deadline) if deadline.as_nanos() == 700)
+        );
+        assert!(clock.set(700, 700));
+        let BudgetDecision::Ready(second) = budget.try_acquire() else {
+            return Err(NetworkPolicyError::InvalidBudgetPolicy);
+        };
+        second.release();
+        assert!(
+            matches!(budget.try_acquire(), BudgetDecision::WaitUntil(deadline) if deadline.as_nanos() == 1_400)
+        );
+        Ok(())
+    }
+
     fn retry_after_policy() -> Result<ProviderBudgetPolicy, NetworkPolicyError> {
         ProviderBudgetPolicy::try_new(
             BudgetScope::new(
@@ -649,6 +785,8 @@ mod tests {
             window_started_at: observation.monotonic,
             restored_window_ends_at: None,
             requests_used: 1,
+            primary_sliding_releases: VecDeque::new(),
+            additional_windows: Vec::new(),
             in_flight: 0,
             unavailable_until: None,
             disabled: false,
@@ -659,7 +797,13 @@ mod tests {
         assert!(validate_checkpoint(&policy, &valid, observation).is_ok());
 
         let mut excessive_requests = valid.clone();
-        excessive_requests.requests_used = policy.requests_per_window() + 1;
+        let (_started, _ends, requests_used) = excessive_requests
+            .windows
+            .as_mut_slice()
+            .first_mut()
+            .and_then(BudgetWindowCheckpointState::tumbling_mut)
+            .ok_or(NetworkPolicyError::InvalidBudgetPolicy)?;
+        *requests_used = policy.requests_per_window() + 1;
         assert_eq!(
             validate_checkpoint(&policy, &excessive_requests, observation),
             Err(AuthorityPersistenceError::InvalidState)
@@ -687,8 +831,13 @@ mod tests {
         );
 
         let mut wrong_window = valid.clone();
-        wrong_window.window_ends_wall = wrong_window
-            .window_ends_wall
+        let (_started, window_ends_wall, _requests) = wrong_window
+            .windows
+            .as_mut_slice()
+            .first_mut()
+            .and_then(BudgetWindowCheckpointState::tumbling_mut)
+            .ok_or(NetworkPolicyError::InvalidBudgetPolicy)?;
+        *window_ends_wall = window_ends_wall
             .checked_add_nanos(1)
             .map_err(|_| NetworkPolicyError::InvalidBudgetPolicy)?;
         assert_eq!(
@@ -697,8 +846,14 @@ mod tests {
         );
 
         let mut future_window = valid.clone();
-        future_window.window_started_wall = Timestamp::from_unix_nanos(1_001);
-        future_window.window_ends_wall = Timestamp::from_unix_nanos(1_101);
+        let (window_started_wall, window_ends_wall, _requests) = future_window
+            .windows
+            .as_mut_slice()
+            .first_mut()
+            .and_then(BudgetWindowCheckpointState::tumbling_mut)
+            .ok_or(NetworkPolicyError::InvalidBudgetPolicy)?;
+        *window_started_wall = Timestamp::from_unix_nanos(1_001);
+        *window_ends_wall = Timestamp::from_unix_nanos(1_101);
         assert_eq!(
             validate_checkpoint(&policy, &future_window, observation),
             Err(AuthorityPersistenceError::FutureState)
@@ -708,6 +863,95 @@ mod tests {
         excessive_cooldown.unavailable_until_wall = Some(Timestamp::from_unix_nanos(1_101));
         assert_eq!(
             validate_checkpoint(&policy, &excessive_cooldown, observation),
+            Err(AuthorityPersistenceError::InvalidState)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn v2_sliding_checkpoint_restores_exact_deadlines_and_rejects_corruption()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let windows = [
+            ProviderBudgetWindow::try_new(
+                NonZeroU32::new(2).ok_or("window limit must be nonzero")?,
+                NonZeroU64::new(100).ok_or("window duration must be nonzero")?,
+                BudgetWindowSemantics::Sliding,
+            )?,
+            ProviderBudgetWindow::try_new(
+                NonZeroU32::new(2).ok_or("window limit must be nonzero")?,
+                NonZeroU64::new(200).ok_or("window duration must be nonzero")?,
+                BudgetWindowSemantics::Sliding,
+            )?,
+        ];
+        let policy = ProviderBudgetPolicy::try_new_conjunctive(
+            BudgetScope::new(SourceIdentifier::try_from("restart-provider")?),
+            &windows,
+            NonZeroU16::new(1).ok_or("concurrency must be nonzero")?,
+            policy()?.backoff(),
+        )?;
+        let saved = ClockObservation::new(
+            Timestamp::from_unix_nanos(1_000),
+            MonotonicInstant::from_nanos(100),
+        );
+        let mut state = BudgetState::new(&policy, saved.monotonic);
+        state.primary_sliding_releases.extend([
+            MonotonicInstant::from_nanos(150),
+            MonotonicInstant::from_nanos(190),
+        ]);
+        state.requests_used = 2;
+        let additional = state
+            .additional_windows
+            .first_mut()
+            .ok_or("additional window missing")?;
+        additional
+            .sliding_releases
+            .push_back(MonotonicInstant::from_nanos(250));
+        additional.requests_used = 1;
+
+        let checkpoint = checkpoint_from_runtime(&policy, &state, saved, 1, false)?;
+        let restored = runtime_state_from_checkpoint(
+            &policy,
+            &checkpoint,
+            ClockObservation::new(
+                Timestamp::from_unix_nanos(1_050),
+                MonotonicInstant::from_nanos(500),
+            ),
+        )?;
+        assert_eq!(
+            restored
+                .primary_sliding_releases
+                .iter()
+                .map(|deadline| deadline.as_nanos())
+                .collect::<Vec<_>>(),
+            [540]
+        );
+        assert_eq!(
+            restored
+                .additional_windows
+                .first()
+                .ok_or("restored additional window missing")?
+                .sliding_releases
+                .front()
+                .map(|deadline| deadline.as_nanos()),
+            Some(600)
+        );
+
+        let mut corrupt = checkpoint;
+        corrupt.windows = BoundedVec::try_new(vec![
+            BudgetWindowCheckpointState::Sliding {
+                release_deadlines_wall: BoundedVec::try_new(vec![
+                    Timestamp::from_unix_nanos(1_090),
+                    Timestamp::from_unix_nanos(1_050),
+                ])?,
+            },
+            BudgetWindowCheckpointState::Sliding {
+                release_deadlines_wall: BoundedVec::singleton(
+                    Timestamp::from_unix_nanos(1_150),
+                ),
+            },
+        ])?;
+        assert_eq!(
+            validate_checkpoint(&policy, &corrupt, saved),
             Err(AuthorityPersistenceError::InvalidState)
         );
         Ok(())

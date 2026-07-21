@@ -31,6 +31,7 @@ impl BudgetAvailabilityLease {
     }
 
     pub(crate) fn shared_allocation_charge(&self) -> Option<usize> {
+        let state_dynamic = self.allocation.state.lock().ok()?.dynamic_retained_bytes()?;
         std::mem::size_of::<BudgetAllocation>()
             .checked_add(crate::conservative_arc_control_block_charge::<
                 BudgetAllocation,
@@ -41,6 +42,7 @@ impl BudgetAvailabilityLease {
                     .dynamic_retained_bytes()
                     .and_then(|dynamic| bytes.checked_add(dynamic))
             })
+            .and_then(|bytes| bytes.checked_add(state_dynamic))
             .and_then(|bytes| {
                 bytes.checked_add(self.allocation.clock.shared_allocation_charge())
             })
@@ -81,12 +83,6 @@ impl SharedProviderBudget {
                 &operation,
             );
         }
-        if observation.monotonic < state.window_started_at {
-            return self.terminal_fail(
-                BudgetUnavailableReason::ClockRegression,
-                &operation,
-            );
-        }
         if state
             .unavailable_until
             .is_some_and(|until| observation.monotonic < until)
@@ -99,27 +95,13 @@ impl SharedProviderBudget {
             );
         }
         state.unavailable_until = None;
-        let Some(window_end) = state.restored_window_ends_at.or_else(|| {
-            state
-                .window_started_at
-                .checked_add(self.policy().window_nanos())
-        })
-        else {
-            return self.terminal_fail(
-                BudgetUnavailableReason::DeadlineOverflow,
-                &operation,
-            );
-        };
-        if observation.monotonic >= window_end {
-            state.window_started_at = observation.monotonic;
-            state.restored_window_ends_at = None;
-            state.requests_used = 0;
-        } else if state.requests_used > self.policy().requests_per_window() {
-            return self.terminal_fail(
-                BudgetUnavailableReason::StateCorrupt,
-                &operation,
-            );
-        } else if state.requests_used == self.policy().requests_per_window() {
+        let availability = evaluate_budget_windows(
+            self.policy(),
+            &mut state,
+            observation.monotonic,
+        )
+        .map_err(|reason| self.terminal_fault(reason, &operation))?;
+        if availability.blocker.is_some() {
             return self.revoke_persist_and_fail(
                 &state,
                 observation,

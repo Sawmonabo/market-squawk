@@ -35,6 +35,11 @@ impl<T, const MAX: usize> BoundedVec<T, MAX> {
         &self.0
     }
 
+    #[cfg(test)]
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [T] {
+        &mut self.0
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.0.len()
     }

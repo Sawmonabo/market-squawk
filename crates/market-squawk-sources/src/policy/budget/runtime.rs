@@ -5,6 +5,289 @@ use super::*;
 #[path = "runtime/failure.rs"]
 mod failure;
 
+#[derive(Clone, Copy)]
+pub(in crate::policy) struct BudgetWindowsAvailability {
+    pub(in crate::policy) blocker: Option<MonotonicInstant>,
+    sliding_deadlines: [Option<MonotonicInstant>; MAX_PROVIDER_BUDGET_WINDOWS],
+}
+
+pub(in crate::policy) fn evaluate_budget_windows(
+    policy: &ProviderBudgetPolicy,
+    state: &mut BudgetState,
+    now: MonotonicInstant,
+) -> Result<BudgetWindowsAvailability, BudgetUnavailableReason> {
+    if state.additional_windows.len() + 1 != policy.window_count() {
+        return Err(BudgetUnavailableReason::StateCorrupt);
+    }
+    let mut availability = BudgetWindowsAvailability {
+        blocker: None,
+        sliding_deadlines: [None; MAX_PROVIDER_BUDGET_WINDOWS],
+    };
+    let primary = policy
+        .window(0)
+        .ok_or(BudgetUnavailableReason::StateCorrupt)?;
+    evaluate_budget_window(
+        primary,
+        &mut state.window_started_at,
+        &mut state.restored_window_ends_at,
+        &mut state.requests_used,
+        &mut state.primary_sliding_releases,
+        now,
+        0,
+        &mut availability,
+    )?;
+    for (index, (window, window_state)) in policy
+        .windows()
+        .skip(1)
+        .zip(&mut state.additional_windows)
+        .enumerate()
+    {
+        evaluate_budget_window(
+            window,
+            &mut window_state.window_started_at,
+            &mut window_state.restored_window_ends_at,
+            &mut window_state.requests_used,
+            &mut window_state.sliding_releases,
+            now,
+            index + 1,
+            &mut availability,
+        )?;
+    }
+    Ok(availability)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_budget_window(
+    window: ProviderBudgetWindow,
+    window_started_at: &mut MonotonicInstant,
+    restored_window_ends_at: &mut Option<MonotonicInstant>,
+    requests_used: &mut u32,
+    sliding_releases: &mut VecDeque<MonotonicInstant>,
+    now: MonotonicInstant,
+    index: usize,
+    availability: &mut BudgetWindowsAvailability,
+) -> Result<(), BudgetUnavailableReason> {
+    if now < *window_started_at {
+        return Err(BudgetUnavailableReason::ClockRegression);
+    }
+    match window.semantics() {
+        BudgetWindowSemantics::Tumbling => {
+            if !sliding_releases.is_empty() || sliding_releases.capacity() != 0 {
+                return Err(BudgetUnavailableReason::StateCorrupt);
+            }
+            let window_ends_at = restored_window_ends_at
+                .or_else(|| window_started_at.checked_add(window.window_nanos()))
+                .ok_or(BudgetUnavailableReason::DeadlineOverflow)?;
+            if now >= window_ends_at {
+                *window_started_at = now;
+                *restored_window_ends_at = None;
+                *requests_used = 0;
+            } else if *requests_used > window.requests_per_window() {
+                return Err(BudgetUnavailableReason::StateCorrupt);
+            } else if *requests_used == window.requests_per_window() {
+                availability.blocker = Some(
+                    availability
+                        .blocker
+                        .map_or(window_ends_at, |blocker| blocker.max(window_ends_at)),
+                );
+            }
+        }
+        BudgetWindowSemantics::Sliding => {
+            if restored_window_ends_at.is_some() {
+                return Err(BudgetUnavailableReason::StateCorrupt);
+            }
+            while sliding_releases.front().is_some_and(|deadline| *deadline <= now) {
+                let _expired = sliding_releases.pop_front();
+            }
+            let retained = u32::try_from(sliding_releases.len())
+                .map_err(|_| BudgetUnavailableReason::StateCorrupt)?;
+            let required_capacity = usize::try_from(window.requests_per_window())
+                .map_err(|_| BudgetUnavailableReason::StateCorrupt)?;
+            if retained > window.requests_per_window()
+                || sliding_releases.capacity() < required_capacity
+            {
+                return Err(BudgetUnavailableReason::StateCorrupt);
+            }
+            *requests_used = retained;
+            *window_started_at = now;
+            if retained == window.requests_per_window() {
+                let blocker = sliding_releases
+                    .front()
+                    .copied()
+                    .ok_or(BudgetUnavailableReason::StateCorrupt)?;
+                availability.blocker = Some(
+                    availability
+                        .blocker
+                        .map_or(blocker, |current| current.max(blocker)),
+                );
+            } else {
+                let deadline = now
+                    .checked_add(window.window_nanos())
+                    .ok_or(BudgetUnavailableReason::DeadlineOverflow)?;
+                let slot = availability
+                    .sliding_deadlines
+                    .get_mut(index)
+                    .ok_or(BudgetUnavailableReason::StateCorrupt)?;
+                *slot = Some(deadline);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_budget_windows(
+    policy: &ProviderBudgetPolicy,
+    state: &BudgetState,
+    now: MonotonicInstant,
+) -> Result<(), BudgetUnavailableReason> {
+    if state.additional_windows.len() + 1 != policy.window_count() {
+        return Err(BudgetUnavailableReason::StateCorrupt);
+    }
+    let primary = policy
+        .window(0)
+        .ok_or(BudgetUnavailableReason::StateCorrupt)?;
+    validate_budget_window(
+        primary,
+        state.window_started_at,
+        state.restored_window_ends_at,
+        state.requests_used,
+        &state.primary_sliding_releases,
+        now,
+    )?;
+    for (window, window_state) in policy
+        .windows()
+        .skip(1)
+        .zip(&state.additional_windows)
+    {
+        validate_budget_window(
+            window,
+            window_state.window_started_at,
+            window_state.restored_window_ends_at,
+            window_state.requests_used,
+            &window_state.sliding_releases,
+            now,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_budget_window(
+    window: ProviderBudgetWindow,
+    window_started_at: MonotonicInstant,
+    restored_window_ends_at: Option<MonotonicInstant>,
+    requests_used: u32,
+    sliding_releases: &VecDeque<MonotonicInstant>,
+    now: MonotonicInstant,
+) -> Result<(), BudgetUnavailableReason> {
+    if now < window_started_at {
+        return Err(BudgetUnavailableReason::ClockRegression);
+    }
+    match window.semantics() {
+        BudgetWindowSemantics::Tumbling => {
+            if !sliding_releases.is_empty()
+                || sliding_releases.capacity() != 0
+                || requests_used > window.requests_per_window()
+                || restored_window_ends_at
+                    .or_else(|| window_started_at.checked_add(window.window_nanos()))
+                    .is_none()
+            {
+                return Err(BudgetUnavailableReason::StateCorrupt);
+            }
+        }
+        BudgetWindowSemantics::Sliding => {
+            let retained = u32::try_from(sliding_releases.len())
+                .map_err(|_| BudgetUnavailableReason::StateCorrupt)?;
+            let required_capacity = usize::try_from(window.requests_per_window())
+                .map_err(|_| BudgetUnavailableReason::StateCorrupt)?;
+            if restored_window_ends_at.is_some()
+                || retained != requests_used
+                || retained > window.requests_per_window()
+                || sliding_releases.capacity() < required_capacity
+                || sliding_releases
+                    .iter()
+                    .zip(sliding_releases.iter().skip(1))
+                    .any(|(left, right)| left > right)
+            {
+                return Err(BudgetUnavailableReason::StateCorrupt);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn admit_budget_windows(
+    policy: &ProviderBudgetPolicy,
+    state: &mut BudgetState,
+    availability: BudgetWindowsAvailability,
+) -> Result<bool, BudgetUnavailableReason> {
+    for (index, window) in policy.windows().enumerate() {
+        if window.semantics() == BudgetWindowSemantics::Sliding
+            && availability
+                .sliding_deadlines
+                .get(index)
+                .copied()
+                .flatten()
+                .is_none()
+        {
+            return Err(BudgetUnavailableReason::StateCorrupt);
+        }
+    }
+    let primary_deadline = availability
+        .sliding_deadlines
+        .first()
+        .copied()
+        .flatten();
+    admit_budget_window(
+        policy
+            .window(0)
+            .ok_or(BudgetUnavailableReason::StateCorrupt)?,
+        &mut state.requests_used,
+        &mut state.primary_sliding_releases,
+        primary_deadline,
+    );
+    for (index, (window, window_state)) in policy
+        .windows()
+        .skip(1)
+        .zip(&mut state.additional_windows)
+        .enumerate()
+    {
+        let deadline = availability
+            .sliding_deadlines
+            .get(index + 1)
+            .copied()
+            .flatten();
+        admit_budget_window(
+            window,
+            &mut window_state.requests_used,
+            &mut window_state.sliding_releases,
+            deadline,
+        );
+    }
+    let primary_exhausted = policy
+        .window(0)
+        .is_some_and(|window| state.requests_used >= window.requests_per_window());
+    let additional_exhausted = policy
+        .windows()
+        .skip(1)
+        .zip(&state.additional_windows)
+        .any(|(window, runtime)| runtime.requests_used >= window.requests_per_window());
+    Ok(primary_exhausted || additional_exhausted)
+}
+
+fn admit_budget_window(
+    window: ProviderBudgetWindow,
+    requests_used: &mut u32,
+    sliding_releases: &mut VecDeque<MonotonicInstant>,
+    sliding_deadline: Option<MonotonicInstant>,
+) {
+    *requests_used += 1;
+    if window.semantics() == BudgetWindowSemantics::Sliding
+        && let Some(deadline) = sliding_deadline
+    {
+        sliding_releases.push_back(deadline);
+    }
+}
+
 /// Thread-safe budget shared by every worker in one canonical collision group.
 #[derive(Clone)]
 pub struct SharedProviderBudget {
@@ -79,18 +362,11 @@ impl SharedProviderBudget {
         starts_at: MonotonicInstant,
         clock: Arc<dyn BudgetClock>,
     ) -> Self {
+        let state = BudgetState::new(&policy, starts_at);
         Self {
             allocation: Arc::new(BudgetAllocation {
                 policy,
-                state: Mutex::new(BudgetState {
-                    window_started_at: starts_at,
-                    restored_window_ends_at: None,
-                    requests_used: 0,
-                    in_flight: 0,
-                    unavailable_until: None,
-                    disabled: false,
-                    consecutive_refusals: 0,
-                }),
+                state: Mutex::new(state),
                 clock,
                 availability_generation: AtomicU64::new(1),
                 terminal: AtomicBool::new(false),
@@ -105,18 +381,11 @@ impl SharedProviderBudget {
         clock: Arc<dyn BudgetClock>,
         binding: BudgetDurabilityBinding,
     ) -> Self {
+        let state = BudgetState::new(&policy, starts_at);
         Self {
             allocation: Arc::new(BudgetAllocation {
                 policy,
-                state: Mutex::new(BudgetState {
-                    window_started_at: starts_at,
-                    restored_window_ends_at: None,
-                    requests_used: 0,
-                    in_flight: 0,
-                    unavailable_until: None,
-                    disabled: false,
-                    consecutive_refusals: 0,
-                }),
+                state: Mutex::new(state),
                 clock,
                 availability_generation: AtomicU64::new(1),
                 terminal: AtomicBool::new(false),
@@ -134,60 +403,11 @@ impl SharedProviderBudget {
         let observation = clock
             .observation()
             .map_err(|_| AuthorityPersistenceError::InvalidState)?;
-        validate_checkpoint(&policy, checkpoint, observation)?;
-        let window_remaining = checkpoint
-            .window_ends_wall
-            .unix_nanos()
-            .saturating_sub(observation.wall_clock.unix_nanos());
-        let restored_window_ends_at = if window_remaining > 0 {
-            let remaining = u64::try_from(window_remaining)
-                .map_err(|_| AuthorityPersistenceError::InvalidState)?;
-            Some(
-                observation
-                    .monotonic
-                    .checked_add(remaining)
-                    .ok_or(AuthorityPersistenceError::InvalidState)?,
-            )
-        } else {
-            None
-        };
-        let unavailable_until = match checkpoint.unavailable_until_wall {
-            Some(until) if until > observation.wall_clock => {
-                let delta = until
-                    .unix_nanos()
-                    .checked_sub(observation.wall_clock.unix_nanos())
-                    .and_then(|value| u64::try_from(value).ok())
-                    .ok_or(AuthorityPersistenceError::InvalidState)?;
-                Some(
-                    observation
-                        .monotonic
-                        .checked_add(delta)
-                        .ok_or(AuthorityPersistenceError::InvalidState)?,
-                )
-            }
-            Some(_) | None => None,
-        };
-        let window_expired = restored_window_ends_at.is_none();
+        let state = runtime_state_from_checkpoint(&policy, checkpoint, observation)?;
         Ok(Self {
             allocation: Arc::new(BudgetAllocation {
                 policy,
-                state: Mutex::new(BudgetState {
-                    window_started_at: observation.monotonic,
-                    restored_window_ends_at,
-                    requests_used: if window_expired {
-                        0
-                    } else {
-                        checkpoint.requests_used
-                    },
-                    in_flight: if window_expired {
-                        0
-                    } else {
-                        checkpoint.in_flight
-                    },
-                    unavailable_until,
-                    disabled: checkpoint.disabled || checkpoint.poisoned,
-                    consecutive_refusals: checkpoint.consecutive_refusals,
-                }),
+                state: Mutex::new(state),
                 clock,
                 availability_generation: AtomicU64::new(
                     checkpoint.availability_generation,
@@ -412,13 +632,11 @@ impl SharedProviderBudget {
                 return self.terminal_fail(BudgetUnavailableReason::StatePoisoned, &operation);
             }
         };
-        if observation.monotonic < state.window_started_at {
+        if let Err(reason) = validate_budget_windows(self.policy(), &state, observation.monotonic) {
             drop(state);
-            return self.terminal_fail(BudgetUnavailableReason::ClockRegression, &operation);
+            return self.terminal_fail(reason, &operation);
         }
-        if state.requests_used > self.policy().requests_per_window()
-            || state.in_flight > self.policy().max_concurrent()
-        {
+        if state.in_flight > self.policy().max_concurrent() {
             drop(state);
             return self.terminal_fail(BudgetUnavailableReason::StateCorrupt, &operation);
         }
@@ -463,12 +681,6 @@ impl SharedProviderBudget {
                 &operation,
             );
         }
-        if now < state.window_started_at {
-            return self.terminal_unavailable(
-                BudgetUnavailableReason::ClockRegression,
-                &operation,
-            );
-        }
         if let Some(until) = state.unavailable_until {
             if now < until {
                 return self.wait_until_locked(
@@ -480,31 +692,15 @@ impl SharedProviderBudget {
             }
             state.unavailable_until = None;
         }
-        let Some(window_ends_at) = state.restored_window_ends_at.or_else(|| {
-            state
-                .window_started_at
-                .checked_add(self.policy().window_nanos())
-        })
-        else {
-            return self.terminal_unavailable(
-                BudgetUnavailableReason::DeadlineOverflow,
-                &operation,
-            );
+        let availability = match evaluate_budget_windows(self.policy(), &mut state, now) {
+            Ok(availability) => availability,
+            Err(reason) => return self.terminal_unavailable(reason, &operation),
         };
-        if now >= window_ends_at {
-            state.window_started_at = now;
-            state.restored_window_ends_at = None;
-            state.requests_used = 0;
-        } else if state.requests_used > self.policy().requests_per_window() {
-            return self.terminal_unavailable(
-                BudgetUnavailableReason::StateCorrupt,
-                &operation,
-            );
-        } else if state.requests_used == self.policy().requests_per_window() {
+        if let Some(blocker) = availability.blocker {
             return self.wait_until_locked(
                 &state,
                 observation,
-                window_ends_at,
+                blocker,
                 &operation,
             );
         }
@@ -522,22 +718,19 @@ impl SharedProviderBudget {
                 &operation,
             );
         }
-        let Some(requests_used) = state.requests_used.checked_add(1) else {
-            return self.terminal_unavailable(
-                BudgetUnavailableReason::StateCorrupt,
-                &operation,
-            );
-        };
         let Some(in_flight) = state.in_flight.checked_add(1) else {
             return self.terminal_unavailable(
                 BudgetUnavailableReason::StateCorrupt,
                 &operation,
             );
         };
-        state.requests_used = requests_used;
+        let windows_exhausted = match admit_budget_windows(self.policy(), &mut state, availability)
+        {
+            Ok(exhausted) => exhausted,
+            Err(reason) => return self.terminal_unavailable(reason, &operation),
+        };
         state.in_flight = in_flight;
-        let became_unavailable = requests_used >= self.policy().requests_per_window()
-            || in_flight >= self.policy().max_concurrent();
+        let became_unavailable = windows_exhausted || in_flight >= self.policy().max_concurrent();
         let revoked = if became_unavailable {
             self.revoke_availability(&operation)
         } else {

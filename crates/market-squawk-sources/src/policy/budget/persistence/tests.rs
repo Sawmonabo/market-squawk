@@ -249,9 +249,13 @@ mod tests {
 
     fn checkpoint(index: u8) -> BudgetCheckpointState {
         BudgetCheckpointState {
-            window_started_wall: Timestamp::from_unix_nanos(i64::from(index)),
-            window_ends_wall: Timestamp::from_unix_nanos(60_000_000_000 + i64::from(index)),
-            requests_used: u32::from(index),
+            windows: BoundedVec::singleton(BudgetWindowCheckpointState::Tumbling {
+                window_started_wall: Timestamp::from_unix_nanos(i64::from(index)),
+                window_ends_wall: Timestamp::from_unix_nanos(
+                    60_000_000_000 + i64::from(index),
+                ),
+                requests_used: u32::from(index),
+            }),
             in_flight: 0,
             unavailable_until_wall: None,
             disabled: false,
@@ -260,6 +264,71 @@ mod tests {
             terminal: false,
             poisoned: false,
         }
+    }
+
+    #[test]
+    fn canonical_v1_migrates_without_quota_reset_and_in_use_remains_unclean() -> TestResult {
+        let legacy_checkpoint = BudgetCheckpointStateV1 {
+            window_started_wall: Timestamp::from_unix_nanos(0),
+            window_ends_wall: Timestamp::from_unix_nanos(60_000_000_000),
+            requests_used: 7,
+            in_flight: 0,
+            unavailable_until_wall: None,
+            disabled: false,
+            consecutive_refusals: 0,
+            availability_generation: 3,
+            terminal: false,
+            poisoned: false,
+        };
+        let declaration = PersistedProviderBudgetPolicyV1::try_from_current(declaration(1)?)?;
+        let envelope = DurableAuthorityEnvelopeV1 {
+            format_version: 1,
+            run_generation: 4,
+            run_state: DurableRunState::Clean,
+            saved_at_wall: Timestamp::from_unix_nanos(100),
+            wall_high_water: Timestamp::from_unix_nanos(100),
+            registry: crate::RegistryAuthorityState::empty(),
+            budgets: BoundedVec::singleton(DurableBudgetGroupV1 {
+                declarations: BoundedVec::singleton(declaration.clone()),
+                checkpoint: legacy_checkpoint.clone(),
+            }),
+        };
+        let store = Arc::new(MemoryStore::default());
+        store.replace(serialize_canonical_envelope_v1(&envelope)?)?;
+        let session = AuthorityDurabilitySession::open(
+            store.clone(),
+            Timestamp::from_unix_nanos(100),
+        )?;
+        let migrated = session
+            .budget_groups()?
+            .into_iter()
+            .next()
+            .ok_or("migrated budget missing")?;
+        assert_eq!(migrated.checkpoint().request_count(0), Some(7));
+        assert_eq!(
+            deserialize_canonical_envelope(&store.payload()?)?.format_version,
+            DURABLE_AUTHORITY_FORMAT_VERSION
+        );
+
+        let unclean = DurableAuthorityEnvelopeV1 {
+            run_state: DurableRunState::InUse,
+            ..envelope
+        };
+        let unclean_store = Arc::new(MemoryStore::default());
+        unclean_store.replace(serialize_canonical_envelope_v1(&unclean)?)?;
+        let recovered = AuthorityDurabilitySession::open(
+            unclean_store,
+            Timestamp::from_unix_nanos(100),
+        )?;
+        assert!(recovered.recovered_unclean());
+        assert!(!recovered.is_available());
+        assert!(
+            recovered
+                .budget_groups()?
+                .into_iter()
+                .all(|group| group.checkpoint().terminal && group.checkpoint().poisoned)
+        );
+        Ok(())
     }
 
     #[test]
@@ -327,8 +396,11 @@ mod tests {
         ));
 
         let future_checkpoint = BudgetCheckpointState {
-            window_started_wall: Timestamp::from_unix_nanos(151),
-            window_ends_wall: Timestamp::from_unix_nanos(60_000_000_151),
+            windows: BoundedVec::singleton(BudgetWindowCheckpointState::Tumbling {
+                window_started_wall: Timestamp::from_unix_nanos(151),
+                window_ends_wall: Timestamp::from_unix_nanos(60_000_000_151),
+                requests_used: 1,
+            }),
             ..checkpoint(1)
         };
         let future = DurableAuthorityEnvelope {
@@ -443,9 +515,11 @@ mod tests {
             Timestamp::from_unix_nanos(100),
         )?;
         let stale = BudgetCheckpointState {
-            window_started_wall: Timestamp::from_unix_nanos(90),
-            window_ends_wall: Timestamp::from_unix_nanos(60_000_000_090),
-            requests_used: 2,
+            windows: BoundedVec::singleton(BudgetWindowCheckpointState::Tumbling {
+                window_started_wall: Timestamp::from_unix_nanos(90),
+                window_ends_wall: Timestamp::from_unix_nanos(60_000_000_090),
+                requests_used: 2,
+            }),
             in_flight: 0,
             unavailable_until_wall: Some(Timestamp::from_unix_nanos(190)),
             disabled: false,
@@ -460,14 +534,16 @@ mod tests {
             .get(slot)
             .ok_or("anchored budget group missing")?
             .checkpoint();
-        assert_eq!(
-            anchored.window_started_wall,
-            Timestamp::from_unix_nanos(100)
-        );
-        assert_eq!(
-            anchored.window_ends_wall,
-            Timestamp::from_unix_nanos(60_000_000_100)
-        );
+        let BudgetWindowCheckpointState::Tumbling {
+            window_started_wall,
+            window_ends_wall,
+            requests_used: _,
+        } = anchored.windows.as_slice().first().ok_or("window missing")?
+        else {
+            return Err("expected tumbling window".into());
+        };
+        assert_eq!(*window_started_wall, Timestamp::from_unix_nanos(100));
+        assert_eq!(*window_ends_wall, Timestamp::from_unix_nanos(60_000_000_100));
         assert_eq!(
             anchored.unavailable_until_wall,
             Some(Timestamp::from_unix_nanos(200))

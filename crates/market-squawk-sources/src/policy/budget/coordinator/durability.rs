@@ -487,15 +487,7 @@ impl ProcessBudgetCoordinator {
                 .observation()
                 .map_err(|_| BudgetPoolError::ClockUnavailable)?;
             let budget = if let Some(registration) = &durable {
-                let state = BudgetState {
-                    window_started_at: observation.monotonic,
-                    restored_window_ends_at: None,
-                    requests_used: 0,
-                    in_flight: 0,
-                    unavailable_until: None,
-                    disabled: false,
-                    consecutive_refusals: 0,
-                };
+                let state = BudgetState::new(resolved.policy(), observation.monotonic);
                 let checkpoint = checkpoint_from_runtime(
                     resolved.policy(),
                     &state,

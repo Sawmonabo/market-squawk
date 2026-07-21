@@ -80,10 +80,11 @@ pub use metadata::{
 };
 pub use policy::{
     ApiEndpointRule, AuthorizedRequest, BackoffPolicy, BudgetDecision, BudgetPermit,
-    BudgetPoolError, BudgetScope, BudgetUnavailableReason, EndpointDenialReason, EndpointPolicy,
-    HttpClientProfile, HttpRequestBounds, MonotonicInstant, NetworkPolicyError, PathScope,
-    ProviderBudgetPolicy, QueryParameterRule, QuerySensitivity, RedirectAuthorization, RetryAfter,
-    SharedProviderBudget, apply_http_retry_after,
+    BudgetPoolError, BudgetScope, BudgetUnavailableReason, BudgetWindowSemantics,
+    EndpointDenialReason, EndpointPolicy, HttpClientProfile, HttpRequestBounds, MonotonicInstant,
+    NetworkPolicyError, PathScope, ProviderBudgetPolicy, ProviderBudgetWindow, QueryParameterRule,
+    QuerySensitivity, RedirectAuthorization, RetryAfter, SharedProviderBudget,
+    apply_http_retry_after,
 };
 pub use registry::{
     ActiveLiveSourceGeneration, AuthoritativeSourceRegistry, CapturedDecodedProviderBatch,
