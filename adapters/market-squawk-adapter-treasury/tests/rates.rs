@@ -80,3 +80,49 @@ fn daily_par_yield_curve_is_civil_dated_and_indicative() -> TestResult {
     );
     Ok(())
 }
+
+#[test]
+fn daily_par_yield_curve_rejects_wrong_namespace_and_rows_without_rates() -> TestResult {
+    let profile = TreasuryYieldCurveProfile::daily_par_yield_curve();
+    let request = profile.page(2026, 0)?;
+    let exact_payload =
+        std::str::from_utf8(include_bytes!("../fixtures/daily_par_yield_curve.xml"))?;
+    let wrong_namespace = exact_payload.replace(
+        "http://schemas.microsoft.com/ado/2007/08/dataservices\"",
+        "https://attacker.invalid/dataservices\"",
+    );
+    assert!(
+        DailyParYieldCurvePage::parse(
+            wrong_namespace.as_bytes(),
+            &request,
+            FiscalDataParseLimits::production_defaults(),
+        )
+        .is_err()
+    );
+
+    let no_rates = br#"<?xml version="1.0"?>
+      <feed xmlns="http://www.w3.org/2005/Atom"
+            xmlns:d="http://schemas.microsoft.com/ado/2007/08/dataservices"
+            xmlns:m="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata">
+        <title>DailyTreasuryYieldCurveRateData</title>
+        <id>https://home.treasury.gov/resource-center/data-chart-center/interest-rates/pages/xml-item?data=daily_treasury_yield_curve</id>
+        <updated>2026-07-21T06:54:08Z</updated>
+        <entry>
+          <id>https://home.treasury.gov/resource-center/data-chart-center/interest-rates/pages/xml-item?data=daily_treasury_yield_curve&amp;id=140</id>
+          <updated>2026-07-21T06:54:08Z</updated>
+          <content><m:properties>
+            <d:Id m:type="Edm.Int32">140</d:Id>
+            <d:NEW_DATE m:type="Edm.DateTime">2026-01-02T00:00:00</d:NEW_DATE>
+          </m:properties></content>
+        </entry>
+      </feed>"#;
+    assert!(
+        DailyParYieldCurvePage::parse(
+            no_rates,
+            &request,
+            FiscalDataParseLimits::production_defaults(),
+        )
+        .is_err()
+    );
+    Ok(())
+}

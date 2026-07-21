@@ -1,8 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use market_squawk_domain::{CalendarDate, DataQuality};
+use quick_xml::XmlVersion;
 use quick_xml::events::{BytesStart, Event};
-use quick_xml::{Reader, XmlVersion};
+use quick_xml::name::ResolveResult;
+use quick_xml::reader::NsReader;
 use rust_decimal::Decimal;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -19,6 +21,9 @@ const FEED_SOURCE_IDENTITY: &str = "https://home.treasury.gov/resource-center/da
 const METHODOLOGY_URL: &str = "https://home.treasury.gov/policy-issues/financing-the-government/interest-rate-statistics/treasury-yield-curve-methodology";
 const METHODOLOGY_REVISION: &str = "monotone-convex-2021-12-06/reviewed-2025-02-18";
 const PROVIDER_PAGE_SIZE_ID: &str = "provider-defined-xml-page-v1";
+const ATOM_NAMESPACE: &[u8] = b"http://www.w3.org/2005/Atom";
+const DATA_NAMESPACE: &[u8] = b"http://schemas.microsoft.com/ado/2007/08/dataservices";
+const METADATA_NAMESPACE: &[u8] = b"http://schemas.microsoft.com/ado/2007/08/dataservices/metadata";
 
 const RATE_FIELDS: [(&str, TreasuryMaturity); 14] = [
     ("BC_1MONTH", TreasuryMaturity::OneMonth),
@@ -250,7 +255,7 @@ impl DailyParYieldCurvePage {
             return Err(TreasuryProtocolError::BodyTooLarge);
         }
         let source_payload_digest = Sha256::digest(bytes).into();
-        let mut reader = Reader::from_reader(bytes);
+        let mut reader = NsReader::from_reader(bytes);
         reader.config_mut().trim_text(true);
         let mut xml_version = XmlVersion::Implicit1_0;
         let mut target = TextTarget::None;
@@ -263,19 +268,24 @@ impl DailyParYieldCurvePage {
         let mut observations = Vec::new();
 
         loop {
-            match reader.read_event() {
-                Ok(Event::Start(start)) => {
+            match reader.read_resolved_event() {
+                Ok((namespace, Event::Start(start))) => {
                     let name = local_name(&start)?;
                     match name.as_str() {
                         "entry" => {
+                            require_namespace(&namespace, ATOM_NAMESPACE)?;
                             if in_entry {
                                 return Err(TreasuryProtocolError::SchemaDrift);
                             }
                             in_entry = true;
                             entry = EntryBuilder::default();
                         }
-                        "properties" if in_entry => in_properties = true,
+                        "properties" if in_entry => {
+                            require_namespace(&namespace, METADATA_NAMESPACE)?;
+                            in_properties = true;
+                        }
                         _ if in_properties => {
+                            require_namespace(&namespace, DATA_NAMESPACE)?;
                             target = TextTarget::Property(property_target(
                                 &reader,
                                 xml_version,
@@ -283,15 +293,31 @@ impl DailyParYieldCurvePage {
                                 name,
                             )?);
                         }
-                        "title" if !in_entry => target = TextTarget::FeedTitle,
-                        "id" if in_entry => target = TextTarget::EntryId,
-                        "id" => target = TextTarget::FeedId,
-                        "updated" if in_entry => target = TextTarget::EntryUpdated,
-                        "updated" => target = TextTarget::FeedUpdated,
+                        "title" if !in_entry => {
+                            require_namespace(&namespace, ATOM_NAMESPACE)?;
+                            target = TextTarget::FeedTitle;
+                        }
+                        "id" if in_entry => {
+                            require_namespace(&namespace, ATOM_NAMESPACE)?;
+                            target = TextTarget::EntryId;
+                        }
+                        "id" => {
+                            require_namespace(&namespace, ATOM_NAMESPACE)?;
+                            target = TextTarget::FeedId;
+                        }
+                        "updated" if in_entry => {
+                            require_namespace(&namespace, ATOM_NAMESPACE)?;
+                            target = TextTarget::EntryUpdated;
+                        }
+                        "updated" => {
+                            require_namespace(&namespace, ATOM_NAMESPACE)?;
+                            target = TextTarget::FeedUpdated;
+                        }
                         _ => {}
                     }
                 }
-                Ok(Event::Empty(start)) if in_properties => {
+                Ok((namespace, Event::Empty(start))) if in_properties => {
+                    require_namespace(&namespace, DATA_NAMESPACE)?;
                     let name = local_name(&start)?;
                     let property = property_target(&reader, xml_version, &start, name)?;
                     if !property.is_null {
@@ -299,7 +325,7 @@ impl DailyParYieldCurvePage {
                     }
                     entry.insert(property, None, limits.max_fields())?;
                 }
-                Ok(Event::Text(text)) => {
+                Ok((_, Event::Text(text))) => {
                     let decoded = text
                         .decode()
                         .map_err(|error| TreasuryProtocolError::InvalidXml(error.to_string()))?;
@@ -318,7 +344,7 @@ impl DailyParYieldCurvePage {
                         limits.max_fields(),
                     )?;
                 }
-                Ok(Event::GeneralRef(reference)) => {
+                Ok((_, Event::GeneralRef(reference))) => {
                     let reference = reference
                         .decode()
                         .map_err(|error| TreasuryProtocolError::InvalidXml(error.to_string()))?;
@@ -335,12 +361,13 @@ impl DailyParYieldCurvePage {
                         limits.max_fields(),
                     )?;
                 }
-                Ok(Event::End(end)) => {
+                Ok((namespace, Event::End(end))) => {
                     let local_name = end.local_name();
                     let name = std::str::from_utf8(local_name.as_ref())
                         .map_err(|error| TreasuryProtocolError::InvalidXml(error.to_string()))?;
                     match name {
                         "entry" => {
+                            require_namespace(&namespace, ATOM_NAMESPACE)?;
                             let observation = entry.finish(request, source_payload_digest)?;
                             if observations.len() == limits.max_records() {
                                 return Err(TreasuryProtocolError::PaginationLimitExceeded);
@@ -352,19 +379,20 @@ impl DailyParYieldCurvePage {
                             entry = EntryBuilder::default();
                         }
                         "properties" => {
+                            require_namespace(&namespace, METADATA_NAMESPACE)?;
                             in_properties = false;
                             target = TextTarget::None;
                         }
                         _ => target = TextTarget::None,
                     }
                 }
-                Ok(Event::Decl(declaration)) => {
+                Ok((_, Event::Decl(declaration))) => {
                     xml_version = declaration
                         .xml_version()
                         .map_err(|error| TreasuryProtocolError::InvalidXml(error.to_string()))?;
                 }
-                Ok(Event::DocType(_)) => return Err(TreasuryProtocolError::SchemaDrift),
-                Ok(Event::Eof) => break,
+                Ok((_, Event::DocType(_))) => return Err(TreasuryProtocolError::SchemaDrift),
+                Ok((_, Event::Eof)) => break,
                 Ok(_) => {}
                 Err(error) => return Err(TreasuryProtocolError::InvalidXml(error.to_string())),
             }
@@ -507,6 +535,9 @@ impl EntryBuilder {
                 }
             }
         }
+        if rates_percent.is_empty() {
+            return Err(TreasuryProtocolError::SchemaDrift);
+        }
         let allowed = RATE_FIELDS
             .iter()
             .map(|(field, _)| *field)
@@ -612,7 +643,7 @@ fn local_name(start: &BytesStart<'_>) -> Result<String, TreasuryProtocolError> {
 }
 
 fn property_target(
-    reader: &Reader<&[u8]>,
+    reader: &NsReader<&[u8]>,
     xml_version: XmlVersion,
     start: &BytesStart<'_>,
     name: String,
@@ -622,7 +653,8 @@ fn property_target(
     for attribute in start.attributes() {
         let attribute =
             attribute.map_err(|error| TreasuryProtocolError::InvalidXml(error.to_string()))?;
-        let local_name = attribute.key.local_name();
+        let (namespace, local_name) = reader.resolver().resolve_attribute(attribute.key);
+        require_namespace(&namespace, METADATA_NAMESPACE)?;
         let key = std::str::from_utf8(local_name.as_ref())
             .map_err(|error| TreasuryProtocolError::InvalidXml(error.to_string()))?;
         let value = attribute
@@ -639,6 +671,17 @@ fn property_target(
         data_type,
         is_null,
     })
+}
+
+fn require_namespace(
+    actual: &ResolveResult<'_>,
+    expected: &[u8],
+) -> Result<(), TreasuryProtocolError> {
+    if matches!(actual, ResolveResult::Bound(namespace) if namespace.as_ref() == expected) {
+        Ok(())
+    } else {
+        Err(TreasuryProtocolError::SchemaDrift)
+    }
 }
 
 fn required_property(
