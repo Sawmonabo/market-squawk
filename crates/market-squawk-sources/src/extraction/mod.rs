@@ -219,6 +219,41 @@ impl InFlightExtractionRequest {
         self.validate_current()
     }
 
+    /// Applies one provider HTTP `Retry-After` response to this request's shared allocation.
+    ///
+    /// Missing or malformed fields use the existing capped refusal backoff. Valid fields retain
+    /// their provider-supplied deadline, and instructions beyond configured policy fail closed.
+    /// The operation consumes the completed in-flight response so one response cannot apply the
+    /// refusal more than once, and releases its concurrency slot on return. No provider-budget
+    /// admission capability is exposed to the adapter.
+    ///
+    /// # Errors
+    ///
+    /// Fails when this request's extraction authority is stale, the coordinated budget is absent,
+    /// persistence or budget state is unavailable, or the refusal terminally violates policy.
+    pub fn apply_retry_after_header(
+        self,
+        field: Option<&[u8]>,
+        fallback_jitter_sample_basis_points: u16,
+    ) -> Result<MonotonicInstant, ExtractionAuthorityError> {
+        self.validate_current()?;
+        match self
+            .authority
+            .apply_retry_after_header(field, fallback_jitter_sample_basis_points)?
+        {
+            crate::BudgetDecision::WaitUntil(deadline) => Ok(deadline),
+            crate::BudgetDecision::Unavailable(reason) => {
+                Err(ExtractionAuthorityError::BudgetUnavailable { reason })
+            }
+            crate::BudgetDecision::Ready(permit) => {
+                permit.release();
+                Err(ExtractionAuthorityError::BudgetUnavailable {
+                    reason: BudgetUnavailableReason::StateCorrupt,
+                })
+            }
+        }
+    }
+
     /// Completes one redirect response and admits the next exact request hop.
     ///
     /// The current in-flight slot is released before the next hop reserves a distinct shared

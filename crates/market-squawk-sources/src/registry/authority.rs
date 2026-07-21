@@ -170,6 +170,23 @@ impl ExtractionAuthority {
             budget_permit,
         ))
     }
+
+    pub(crate) fn apply_retry_after_header(
+        &self,
+        field: Option<&[u8]>,
+        fallback_jitter_sample_basis_points: u16,
+    ) -> Result<crate::BudgetDecision, crate::ExtractionAuthorityError> {
+        self.validate_current()?;
+        let budget = self
+            .budget
+            .as_ref()
+            .ok_or(crate::ExtractionAuthorityError::BudgetNotConfigured)?;
+        Ok(crate::apply_http_retry_after(
+            budget,
+            field,
+            fallback_jitter_sample_basis_points,
+        ))
+    }
 }
 
 impl AuthoritativeSourceRegistry {

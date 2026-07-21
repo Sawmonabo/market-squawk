@@ -146,3 +146,33 @@ fn redirect_hops_are_origin_bound_and_each_consume_one_request_admission() -> Te
     ));
     Ok(())
 }
+
+#[test]
+fn in_flight_refusal_applies_shared_bounded_retry_after_without_budget_access() -> TestResult {
+    let at = Timestamp::from_unix_nanos(1_000_000_000);
+    let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
+    let mut metadata_wire = serde_json::to_value(extraction_metadata(
+        "retry-after-source",
+        "revision-1",
+        4,
+    )?)?;
+    metadata_wire["network"]["allowlisted"]["endpoints"] =
+        serde_json::json!(["https://retry-after-source.example.test/data"]);
+    let metadata: crate::SourceMetadata = serde_json::from_value(metadata_wire)?;
+    let adapter = TestExtractionAdapter {
+        metadata: metadata.clone(),
+    };
+    let registered = registry.register(metadata, at)?;
+    let authority = registry.extraction_authority(&registered, &adapter)?;
+    let in_flight = authority
+        .try_network_request("https://retry-after-source.example.test/data")?
+        .authorize_send("https://retry-after-source.example.test/data")?;
+
+    let deadline = in_flight.apply_retry_after_header(Some(b"2"), 0)?;
+    assert!(matches!(
+        authority.try_network_request("https://retry-after-source.example.test/data"),
+        Err(crate::ExtractionAuthorityError::BudgetWaitUntil { deadline: actual })
+            if actual == deadline
+    ));
+    Ok(())
+}
