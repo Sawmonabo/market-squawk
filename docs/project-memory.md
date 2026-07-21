@@ -102,13 +102,19 @@ lanes when capacity is tight; never delete a dirty worktree, research evidence, 
 state to make room. Generated build caches are convenience state, not project memory or approval
 evidence.
 
-Because Cargo writers are serialized, scheduled lane and integration commands share the repository-
-scoped `target/agent-shared` cache through an explicit absolute `CARGO_TARGET_DIR`. This reuses
-third-party dependency compilation across temporary worktrees without sharing source state. Only one
-scheduled Cargo command may own that cache at a time; rust-analyzer and other unscheduled processes
-remain on the default `target/` and do not participate. A lane already compiling in its private cache
-may finish, but subsequent commands use the shared cache instead of rebuilding Arrow/DataFusion and
-other large dependencies per worktree.
+Every checkout and worktree owns its default worktree-local `target/`. Scheduled commands,
+verification, and CI must not redirect Cargo output through `CARGO_TARGET_DIR`,
+`CARGO_BUILD_BUILD_DIR`, `target-dir`, or `build-dir`, and must not install a compiler wrapper by
+default. Sharing mutable Cargo output across distinct source paths is prohibited even when Cargo
+writers are serialized.
+
+Normal developer `dev` and `test` builds remain incremental with line-table debug information;
+non-workspace dependencies carry no debug information. The opt-in `debugging` profile provides full
+workspace debug information with incremental compilation disabled. Agent, CI, benchmark, and
+approval commands export `CARGO_INCREMENTAL=0` so their evidence does not depend on incremental
+state. The verification entry point enforces a 20 GiB hard ceiling on its local `target/` before and
+after the gate. Reclaim only ignored reproducible Cargo output after checking active processes and
+preserving every dirty or unique worktree state.
 
 ### Worktree lifecycle
 

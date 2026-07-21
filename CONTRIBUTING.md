@@ -13,5 +13,11 @@ Older Q-prefixed plans remain historical audit records and have no current execu
 3. Keep source-specific schemas inside adapters.
 4. Keep MCP, SQL, notebooks, and model training outside the live event-to-decision path.
 5. Never silently discard raw data, sequence gaps, checksum failures, or risk rejections.
-6. Run `./scripts/verify.sh` before committing.
-7. Do not add credentialed live execution without a separate design, explicit authorization model, reconciliation, and adversarial review.
+6. Keep each checkout and worktree on its default local `target/`; do not set `CARGO_TARGET_DIR`,
+   `CARGO_BUILD_BUILD_DIR`, `target-dir`, or `build-dir` for repository verification.
+7. Normal `dev` and `test` commands are incremental and retain line tables. Use
+   `cargo build --profile debugging` for full workspace debug information.
+8. Run `./scripts/verify.sh` before committing. It disables incremental compilation for gate
+   evidence and enforces the local 20 GiB target ceiling.
+9. Do not add credentialed live execution without a separate design, explicit authorization model,
+   reconciliation, and adversarial review.

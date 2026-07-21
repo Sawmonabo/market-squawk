@@ -45,6 +45,9 @@ decisions can be audited without relying on conversation history.
 - [Capability traceability](2026-07-18-usable-release-traceability.md) — honest current state and the
   mandatory producer-to-terminal-consumer, dataset, evidence, closing-task, and exact-head refresh
   map for the complete local release.
+- [Rust development/test storage hardening](2026-07-21-rust-dev-test-storage-hardening.md) — Cargo
+  profile, worktree-local output, test-target, CI cache, and measurement decisions for the storage
+  hardening plan.
 
 ## Evidence policy
 
