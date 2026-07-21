@@ -112,6 +112,14 @@ impl ProcessJournalCaptureConfig {
         {
             return cleanup_deadline;
         }
+        #[cfg(all(feature = "capture-test", debug_assertions))]
+        if let Some(ProcessCaptureHelperTestBehavior::FailAfterDestinationFence {
+            cleanup_deadline,
+            ..
+        }) = self.test_behavior
+        {
+            return cleanup_deadline;
+        }
         self.startup_deadline
     }
 
@@ -127,6 +135,26 @@ impl ProcessJournalCaptureConfig {
             Some(ProcessCaptureHelperTestBehavior::DelayShutdownAfterPostHandshakeFailure { .. })
         )
     }
+
+    #[cfg(all(feature = "capture-test", debug_assertions))]
+    pub(super) fn inject_post_fence_failure(&self) -> bool {
+        matches!(
+            self.test_behavior,
+            Some(ProcessCaptureHelperTestBehavior::FailAfterDestinationFence { .. })
+        )
+    }
+
+    pub(super) fn reap_observation_delay(&self) -> Duration {
+        #[cfg(all(feature = "capture-test", debug_assertions))]
+        if let Some(ProcessCaptureHelperTestBehavior::FailAfterDestinationFence {
+            reap_observation_delay,
+            ..
+        }) = self.test_behavior
+        {
+            return reap_observation_delay;
+        }
+        Duration::ZERO
+    }
 }
 
 #[cfg(all(feature = "capture-test", debug_assertions))]
@@ -134,7 +162,13 @@ impl ProcessJournalCaptureConfig {
 #[doc(hidden)]
 pub enum ProcessCaptureHelperTestBehavior {
     StallAfterAppend,
-    DelayShutdownAfterPostHandshakeFailure { cleanup_deadline: Duration },
+    DelayShutdownAfterPostHandshakeFailure {
+        cleanup_deadline: Duration,
+    },
+    FailAfterDestinationFence {
+        cleanup_deadline: Duration,
+        reap_observation_delay: Duration,
+    },
 }
 
 fn validated_sibling_helper() -> Result<PathBuf, ProcessJournalCaptureConfigError> {

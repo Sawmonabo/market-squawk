@@ -666,8 +666,8 @@ async fn stalled_process_journal_is_killed_reaped_and_releases_its_destination()
     Ok(())
 }
 
-#[test]
-fn post_handshake_startup_failure_kills_helper_before_sink_drop()
+#[tokio::test]
+async fn post_fence_startup_failure_retains_destination_until_helper_reap()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let paths = LocalPaths::prepare(directory.path().join("data"))?;
@@ -680,8 +680,9 @@ fn post_handshake_startup_failure_kills_helper_before_sink_drop()
         paths.root(),
         source,
         env!("CARGO_BIN_EXE_market-squawk-platform-capture-helper-test"),
-        ProcessCaptureHelperTestBehavior::DelayShutdownAfterPostHandshakeFailure {
+        ProcessCaptureHelperTestBehavior::FailAfterDestinationFence {
             cleanup_deadline: Duration::from_millis(25),
+            reap_observation_delay: Duration::from_millis(250),
         },
         Duration::from_secs(1),
     )?;
@@ -691,13 +692,13 @@ fn post_handshake_startup_failure_kills_helper_before_sink_drop()
         {
             Ok(_writer) => {
                 return Err(
-                    "injected post-handshake startup failure unexpectedly returned a writer".into(),
+                    "injected post-fence startup failure unexpectedly returned a writer".into(),
                 );
             }
             Err(error) => error,
         };
 
-    let ProcessCaptureWriterSpawnError::InjectedPostHandshakeFailure { rollback_elapsed } = error
+    let ProcessCaptureWriterSpawnError::InjectedPostFenceFailure { rollback_elapsed } = error
     else {
         return Err(format!("unexpected startup error: {error:?}").into());
     };
@@ -705,8 +706,59 @@ fn post_handshake_startup_failure_kills_helper_before_sink_drop()
     drop(control);
     drop(publisher);
 
-    let successor = paths.open_journal_writer(source)?;
-    drop(successor);
+    let (_busy_publisher, _busy_control, busy_writer) = test_capture_channel(
+        NonZeroUsize::MIN,
+        DiagnosticCaptureBundle::new(identity(1)?),
+    )?;
+    let busy_process = ProcessJournalCaptureConfig::try_new_for_test(
+        paths.root(),
+        source,
+        env!("CARGO_BIN_EXE_market-squawk-platform-capture-helper-test"),
+        ProcessCaptureHelperTestBehavior::StallAfterAppend,
+        Duration::from_secs(1),
+    )?;
+    assert!(matches!(
+        spawn_process_journal_capture_writer(
+            busy_writer,
+            busy_process,
+            CaptureWriterPolicy::default(),
+        ),
+        Err(ProcessCaptureWriterSpawnError::CaptureWriter(
+            CaptureWriterSpawnError::DestinationFence {
+                source: market_squawk_platform::CaptureDestinationFenceError::Busy,
+                ..
+            }
+        ))
+    ));
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (_successor_publisher, _successor_control, successor_writer) = test_capture_channel(
+        NonZeroUsize::MIN,
+        DiagnosticCaptureBundle::new(identity(1)?),
+    )?;
+    let successor_process = ProcessJournalCaptureConfig::try_new_for_test(
+        paths.root(),
+        source,
+        env!("CARGO_BIN_EXE_market-squawk-platform-capture-helper-test"),
+        ProcessCaptureHelperTestBehavior::StallAfterAppend,
+        Duration::from_secs(1),
+    )?;
+    let successor = spawn_process_journal_capture_writer(
+        successor_writer,
+        successor_process,
+        CaptureWriterPolicy::default(),
+    )?;
+    let shutdown = successor
+        .shutdown(ProcessCaptureShutdownPolicy::try_new(
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )?)
+        .await;
+    assert_eq!(
+        shutdown.disposition(),
+        ProcessCaptureShutdownDisposition::Complete
+    );
+    assert!(shutdown.helper_reaped());
     Ok(())
 }
 

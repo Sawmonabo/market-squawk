@@ -63,12 +63,17 @@ impl ProcessJournalSink {
         #[cfg(all(feature = "capture-test", debug_assertions))]
         if let Some(behavior) = config.test_behavior() {
             let mode = match behavior {
-                ProcessCaptureHelperTestBehavior::StallAfterAppend => test_stall_after_append(),
+                ProcessCaptureHelperTestBehavior::StallAfterAppend => {
+                    Some(test_stall_after_append())
+                }
                 ProcessCaptureHelperTestBehavior::DelayShutdownAfterPostHandshakeFailure {
                     ..
-                } => test_delay_shutdown(),
+                } => Some(test_delay_shutdown()),
+                ProcessCaptureHelperTestBehavior::FailAfterDestinationFence { .. } => None,
             };
-            command.env(test_mode_environment(), mode);
+            if let Some(mode) = mode {
+                command.env(test_mode_environment(), mode);
+            }
         }
         let mut child = command
             .spawn()
@@ -81,7 +86,7 @@ impl ProcessJournalSink {
             Some(output) => output,
             None => return Err(terminate_unowned_child(child)),
         };
-        let process = ProcessOwner::try_start(child)?;
+        let process = ProcessOwner::try_start(child, config.reap_observation_delay())?;
         let (sender, receiver) = mpsc::sync_channel(1);
         let startup_thread = match std::thread::Builder::new()
             .name("msq-capture-ready".to_owned())
@@ -94,7 +99,7 @@ impl ProcessJournalSink {
             Ok(startup_thread) => startup_thread,
             Err(source) => {
                 process.kill();
-                wait_for_startup_cleanup(process, None, reaper, config.startup_deadline());
+                wait_for_startup_cleanup(process, None, reaper, config.startup_deadline(), None);
                 return Err(ProcessJournalSinkStartError::StartupThread(source));
             }
         };
@@ -108,6 +113,7 @@ impl ProcessJournalSink {
                     Some(startup_thread),
                     reaper,
                     config.startup_deadline(),
+                    None,
                 );
                 return Err(ProcessJournalSinkStartError::StartupProtocol);
             }
@@ -118,6 +124,7 @@ impl ProcessJournalSink {
                     Some(startup_thread),
                     reaper,
                     config.startup_deadline(),
+                    None,
                 );
                 return Err(ProcessJournalSinkStartError::StartupDeadline);
             }
@@ -128,6 +135,7 @@ impl ProcessJournalSink {
                     Some(startup_thread),
                     reaper,
                     config.startup_deadline(),
+                    None,
                 );
                 return Err(ProcessJournalSinkStartError::StartupProtocol);
             }
@@ -144,13 +152,14 @@ impl ProcessJournalSink {
                 Some(startup_thread),
                 reaper,
                 config.startup_deadline(),
+                None,
             );
             return Err(ProcessJournalSinkStartError::StartupProtocol);
         }
         if startup_thread.join().is_err() {
             drop(output);
             process.kill();
-            wait_for_startup_cleanup(process, None, reaper, config.startup_deadline());
+            wait_for_startup_cleanup(process, None, reaper, config.startup_deadline(), None);
             return Err(ProcessJournalSinkStartError::StartupThreadPanicked);
         }
         Ok(StartedProcessJournalSink {
@@ -269,6 +278,7 @@ pub(super) fn wait_for_startup_cleanup(
     bootstrap: Option<JoinHandle<()>>,
     reaper: TerminalReaperReservation,
     deadline: Duration,
+    destination_fences: Option<super::super::writer::CaptureWriterDestinationFences>,
 ) {
     let expires = Instant::now()
         .checked_add(deadline)
@@ -283,10 +293,11 @@ pub(super) fn wait_for_startup_cleanup(
         if let Some(bootstrap) = bootstrap {
             let _bootstrap = bootstrap.join();
         }
+        drop(destination_fences);
         return;
     }
     if let Some(supervisor) = process.take_supervisor() {
-        reaper.retain(supervisor, bootstrap);
+        reaper.retain(supervisor, bootstrap, destination_fences);
     }
 }
 

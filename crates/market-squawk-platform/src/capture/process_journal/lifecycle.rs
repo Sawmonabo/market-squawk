@@ -16,8 +16,9 @@ use super::sink::{
     wait_for_startup_cleanup,
 };
 use crate::capture::writer::{
-    CaptureShutdownStatus, CaptureWorkerTermination, CaptureWriterHandle, CaptureWriterSpawnError,
-    PendingCaptureWriter, spawn_capture_writer,
+    CaptureShutdownStatus, CaptureWorkerTermination, CaptureWriterDestinationFences,
+    CaptureWriterHandle, CaptureWriterSpawnError, CaptureWriterStartupOptions,
+    PendingCaptureWriter, spawn_capture_writer_recoverable,
 };
 use crate::capture::{CaptureWriterPolicy, RawCaptureWriter};
 
@@ -103,6 +104,10 @@ enum CompanionCommand<B: CaptureAuthorityBundle> {
         pending: PendingCaptureWriter<B>,
         process: ProcessWaitHandle,
     },
+    RetainStartupFences {
+        destination_fences: CaptureWriterDestinationFences,
+        process: ProcessWaitHandle,
+    },
 }
 
 type CommittedStartupResources<B> = (
@@ -120,6 +125,7 @@ struct PostHandshakeStartupOwner<B: CaptureAuthorityBundle> {
     cleanup_deadline: Duration,
     companion_sender: Option<mpsc::SyncSender<CompanionCommand<B>>>,
     companion: Option<JoinHandle<()>>,
+    destination_fences: Option<CaptureWriterDestinationFences>,
     committed: bool,
 }
 
@@ -132,6 +138,7 @@ impl<B: CaptureAuthorityBundle> PostHandshakeStartupOwner<B> {
             cleanup_deadline,
             companion_sender: None,
             companion: None,
+            destination_fences: None,
             committed: false,
         }
     }
@@ -151,7 +158,82 @@ impl<B: CaptureAuthorityBundle> PostHandshakeStartupOwner<B> {
         self.sink.take()
     }
 
+    fn restore_writer_startup_resources(
+        &mut self,
+        sink: ProcessJournalSink,
+        destination_fences: Option<CaptureWriterDestinationFences>,
+    ) {
+        self.sink = Some(sink);
+        self.destination_fences = destination_fences;
+    }
+
+    fn rollback(mut self) -> Duration {
+        let started = Instant::now();
+        self.rollback_resources();
+        self.committed = true;
+        started.elapsed()
+    }
+
+    fn rollback_resources(&mut self) {
+        if let Some(process) = self.process.as_ref() {
+            process.kill();
+        }
+        drop(self.sink.take());
+        let mut fallback_fences = self.destination_fences.take();
+        let mut fences_sent = false;
+        if let (Some(sender), Some(process)) =
+            (self.companion_sender.as_ref(), self.process.as_ref())
+            && let Some(destination_fences) = fallback_fences.take()
+        {
+            let command = CompanionCommand::RetainStartupFences {
+                destination_fences,
+                process: process.wait_handle(),
+            };
+            match sender.try_send(command) {
+                Ok(()) => fences_sent = true,
+                Err(error) => {
+                    let command = match error {
+                        mpsc::TrySendError::Full(command)
+                        | mpsc::TrySendError::Disconnected(command) => command,
+                    };
+                    if let CompanionCommand::RetainStartupFences {
+                        destination_fences, ..
+                    } = command
+                    {
+                        fallback_fences = Some(destination_fences);
+                    }
+                }
+            }
+        }
+        if !fences_sent
+            && fallback_fences.is_none()
+            && let Some(sender) = self.companion_sender.as_ref()
+        {
+            let _stopped = sender.try_send(CompanionCommand::Stop);
+        }
+        let process = self.process.take();
+        let reaper = self.reaper.take();
+        match (process, reaper) {
+            (Some(process), Some(reaper)) => wait_for_startup_cleanup(
+                process,
+                self.companion.take(),
+                reaper,
+                self.cleanup_deadline,
+                fallback_fences,
+            ),
+            (_process, _reaper) => {
+                if let Some(companion) = self.companion.take() {
+                    let _joined = companion.join();
+                }
+                drop(fallback_fences);
+            }
+        }
+    }
+
     fn commit(mut self) -> Option<CommittedStartupResources<B>> {
+        if self.sink.is_some() || self.destination_fences.is_some() {
+            return None;
+        }
         let resources = Some((
             self.process.take()?,
             self.reaper.take()?,
@@ -168,28 +250,7 @@ impl<B: CaptureAuthorityBundle> Drop for PostHandshakeStartupOwner<B> {
         if self.committed {
             return;
         }
-        if let Some(process) = self.process.as_ref() {
-            process.kill();
-        }
-        drop(self.sink.take());
-        if let Some(sender) = self.companion_sender.take() {
-            let _stopped = sender.try_send(CompanionCommand::Stop);
-        }
-        let process = self.process.take();
-        let reaper = self.reaper.take();
-        match (process, reaper) {
-            (Some(process), Some(reaper)) => wait_for_startup_cleanup(
-                process,
-                self.companion.take(),
-                reaper,
-                self.cleanup_deadline,
-            ),
-            (_process, _reaper) => {
-                if let Some(companion) = self.companion.take() {
-                    let _joined = companion.join();
-                }
-            }
-        }
+        self.rollback_resources();
     }
 }
 
@@ -321,7 +382,7 @@ impl<B: CaptureAuthorityBundle> ProcessJournalCaptureWriter<B> {
         let supervisor = process.take_supervisor();
         let companion = self.companion.take();
         match (self.reaper.take(), supervisor) {
-            (Some(reaper), Some(supervisor)) => reaper.retain(supervisor, companion),
+            (Some(reaper), Some(supervisor)) => reaper.retain(supervisor, companion, None),
             (reaper, _supervisor) => {
                 drop(reaper);
                 if let Some(companion) = companion {
@@ -368,6 +429,14 @@ pub fn spawn_process_journal_capture_writer<B: CaptureAuthorityBundle>(
 ) -> Result<ProcessJournalCaptureWriter<B>, ProcessCaptureWriterSpawnError> {
     let cleanup_deadline = config.post_handshake_cleanup_deadline();
     #[cfg(all(feature = "capture-test", debug_assertions))]
+    let writer_startup_options = if config.inject_post_fence_failure() {
+        CaptureWriterStartupOptions::fail_after_destination_fence_for_test()
+    } else {
+        CaptureWriterStartupOptions::default()
+    };
+    #[cfg(not(all(feature = "capture-test", debug_assertions)))]
+    let writer_startup_options = CaptureWriterStartupOptions::default();
+    #[cfg(all(feature = "capture-test", debug_assertions))]
     let inject_post_handshake_failure = config.inject_post_handshake_failure();
     let started = ProcessJournalSink::try_start(config)?;
     let mut startup = PostHandshakeStartupOwner::new(started, cleanup_deadline);
@@ -387,10 +456,24 @@ pub fn spawn_process_journal_capture_writer<B: CaptureAuthorityBundle>(
     let sink = startup
         .take_sink()
         .ok_or(ProcessCaptureWriterSpawnError::MissingStartupResource)?;
-    let capture = match spawn_capture_writer(writer, sink, policy) {
-        Ok(capture) => capture,
-        Err(error) => return Err(ProcessCaptureWriterSpawnError::CaptureWriter(error)),
-    };
+    let capture =
+        match spawn_capture_writer_recoverable(writer, sink, policy, writer_startup_options) {
+            Ok(capture) => capture,
+            Err(failure) => {
+                let (error, sink, destination_fences) = failure.into_parts();
+                startup.restore_writer_startup_resources(sink, destination_fences);
+                #[cfg(all(feature = "capture-test", debug_assertions))]
+                if matches!(
+                    &error,
+                    CaptureWriterSpawnError::InjectedAfterDestinationFence
+                ) {
+                    return Err(ProcessCaptureWriterSpawnError::InjectedPostFenceFailure {
+                        rollback_elapsed: startup.rollback(),
+                    });
+                }
+                return Err(ProcessCaptureWriterSpawnError::CaptureWriter(error));
+            }
+        };
     let (process, reaper, companion_sender, companion) = startup
         .commit()
         .ok_or(ProcessCaptureWriterSpawnError::MissingStartupResource)?;
@@ -411,6 +494,13 @@ fn run_companion<B: CaptureAuthorityBundle>(receiver: mpsc::Receiver<CompanionCo
         Ok(CompanionCommand::Own { pending, process }) => {
             process.wait_blocking();
             drop(pending);
+        }
+        Ok(CompanionCommand::RetainStartupFences {
+            destination_fences,
+            process,
+        }) => {
+            process.wait_blocking();
+            drop(destination_fences);
         }
     }
 }
@@ -455,6 +545,13 @@ pub enum ProcessCaptureWriterSpawnError {
     #[cfg(all(feature = "capture-test", debug_assertions))]
     #[error("capture helper post-handshake startup failure was injected")]
     InjectedPostHandshakeFailure {
+        /// Time spent killing, closing pipes, and either reaping or transferring ownership.
+        rollback_elapsed: Duration,
+    },
+    /// A post-fence failure was injected by the deterministic lifecycle test harness.
+    #[cfg(all(feature = "capture-test", debug_assertions))]
+    #[error("capture helper post-fence startup failure was injected")]
+    InjectedPostFenceFailure {
         /// Time spent killing, closing pipes, and either reaping or transferring ownership.
         rollback_elapsed: Duration,
     },

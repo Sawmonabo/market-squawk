@@ -8,6 +8,8 @@ use std::time::Duration;
 
 use thiserror::Error;
 
+use crate::capture::writer::CaptureWriterDestinationFences;
+
 const MAX_TERMINAL_CAPTURE_REAPERS: usize = 16;
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
@@ -25,6 +27,7 @@ enum TerminalReaperSlot {
 struct TerminalThreads {
     process: JoinHandle<()>,
     companion: Option<JoinHandle<()>>,
+    destination_fences: Option<CaptureWriterDestinationFences>,
 }
 
 impl TerminalThreads {
@@ -37,6 +40,7 @@ impl TerminalThreads {
         if let Some(companion) = self.companion {
             let _companion = companion.join();
         }
+        drop(self.destination_fences);
     }
 }
 
@@ -82,8 +86,17 @@ impl TerminalReaperReservation {
         Err(ProcessSupervisionError::ReaperCapacity)
     }
 
-    pub(super) fn retain(mut self, process: JoinHandle<()>, companion: Option<JoinHandle<()>>) {
-        let replacement = TerminalReaperSlot::Running(TerminalThreads { process, companion });
+    pub(super) fn retain(
+        mut self,
+        process: JoinHandle<()>,
+        companion: Option<JoinHandle<()>>,
+        destination_fences: Option<CaptureWriterDestinationFences>,
+    ) {
+        let replacement = TerminalReaperSlot::Running(TerminalThreads {
+            process,
+            companion,
+            destination_fences,
+        });
         match TERMINAL_REAPER_SLOTS[self.index].lock() {
             Ok(mut state) if matches!(&*state, TerminalReaperSlot::Reserved) => {
                 *state = replacement;
@@ -195,7 +208,10 @@ pub(super) struct ProcessOwner {
 }
 
 impl ProcessOwner {
-    pub(super) fn try_start(child: Child) -> Result<Self, ProcessSupervisionError> {
+    pub(super) fn try_start(
+        child: Child,
+        reap_observation_delay: Duration,
+    ) -> Result<Self, ProcessSupervisionError> {
         let (commands, receiver) = mpsc::sync_channel(1);
         let observation = Arc::new(ProcessObservation::new());
         let task_observation = Arc::clone(&observation);
@@ -210,7 +226,7 @@ impl ProcessOwner {
                     Err(poisoned) => poisoned.into_inner().take(),
                 };
                 if let Some(child) = child {
-                    supervise(child, receiver, &task_observation);
+                    supervise(child, receiver, &task_observation, reap_observation_delay);
                 } else {
                     task_observation.failed.store(true, Ordering::Release);
                     task_observation.mark_reaped();
@@ -292,12 +308,13 @@ fn supervise(
     mut child: Child,
     commands: mpsc::Receiver<ProcessCommand>,
     observation: &ProcessObservation,
+    reap_observation_delay: Duration,
 ) {
     let mut kill_requested = false;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                record_exit(status, kill_requested, observation);
+                record_exit(status, kill_requested, observation, reap_observation_delay);
                 return;
             }
             Ok(None) => {}
@@ -315,7 +332,12 @@ fn supervise(
                     if child.kill().is_err() {
                         match child.try_wait() {
                             Ok(Some(status)) => {
-                                record_exit(status, kill_requested, observation);
+                                record_exit(
+                                    status,
+                                    kill_requested,
+                                    observation,
+                                    reap_observation_delay,
+                                );
                                 return;
                             }
                             Ok(None) | Err(_) => {
@@ -331,14 +353,27 @@ fn supervise(
     if child.wait().is_err() {
         observation.failed.store(true, Ordering::Release);
     }
+    delay_reap_observation(reap_observation_delay);
     observation.mark_reaped();
 }
 
-fn record_exit(status: ExitStatus, kill_requested: bool, observation: &ProcessObservation) {
+fn record_exit(
+    status: ExitStatus,
+    kill_requested: bool,
+    observation: &ProcessObservation,
+    reap_observation_delay: Duration,
+) {
     if !kill_requested && !status.success() {
         observation.failed.store(true, Ordering::Release);
     }
+    delay_reap_observation(reap_observation_delay);
     observation.mark_reaped();
+}
+
+fn delay_reap_observation(delay: Duration) {
+    if !delay.is_zero() {
+        std::thread::sleep(delay);
+    }
 }
 
 #[derive(Debug, Error)]

@@ -10,8 +10,8 @@ pub(super) mod lifecycle;
 mod runtime;
 mod sink;
 
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use crate::{RawCaptureRecord, RawCaptureRecordError};
@@ -30,9 +30,8 @@ use super::{
 pub(super) use benchmark::{
     BenchmarkCaptureWriterHandle, BenchmarkCaptureWriterShutdown, spawn_benchmark_capture_writer,
 };
-use destination::{
-    CaptureDestinationLease, acquire_destination_fence, destination_lease_allocation_bytes,
-};
+pub(in crate::capture) use destination::CaptureDestinationLease;
+use destination::{acquire_destination_fence, destination_lease_allocation_bytes};
 use lifecycle::CaptureWorkerFinalReport;
 pub(super) use lifecycle::WriterLifecycleCore;
 use runtime::{
@@ -137,6 +136,72 @@ pub enum CaptureWriterSpawnError {
         #[source]
         source: std::io::Error,
     },
+    /// A post-fence failure was injected by the deterministic lifecycle test harness.
+    #[cfg(all(feature = "capture-test", debug_assertions))]
+    #[error("capture writer post-fence startup failure was injected")]
+    InjectedAfterDestinationFence,
+}
+
+#[derive(Debug)]
+pub(in crate::capture) struct CaptureWriterDestinationFences {
+    worker: Arc<CaptureDestinationLease>,
+    owner: Arc<CaptureDestinationLease>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(in crate::capture) struct CaptureWriterStartupOptions {
+    fail_after_destination_fence: bool,
+}
+
+impl CaptureWriterStartupOptions {
+    #[cfg(all(feature = "capture-test", debug_assertions))]
+    pub(in crate::capture) const fn fail_after_destination_fence_for_test() -> Self {
+        Self {
+            fail_after_destination_fence: true,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(in crate::capture) struct CaptureWriterStartupFailure<S: CaptureSink> {
+    error: CaptureWriterSpawnError,
+    sink: S,
+    destination_fences: Option<CaptureWriterDestinationFences>,
+}
+
+impl<S: CaptureSink> CaptureWriterStartupFailure<S> {
+    fn new(
+        error: CaptureWriterSpawnError,
+        sink: S,
+        destination_fences: Option<CaptureWriterDestinationFences>,
+    ) -> Self {
+        Self {
+            error,
+            sink,
+            destination_fences,
+        }
+    }
+
+    pub(in crate::capture) fn into_parts(
+        self,
+    ) -> (
+        CaptureWriterSpawnError,
+        S,
+        Option<CaptureWriterDestinationFences>,
+    ) {
+        (self.error, self.sink, self.destination_fences)
+    }
+
+    fn release_for_generic_caller(self) -> CaptureWriterSpawnError {
+        let Self {
+            error,
+            sink,
+            destination_fences,
+        } = self;
+        drop(sink);
+        drop(destination_fences);
+        error
+    }
 }
 
 pub(super) fn writer_failed<B: CaptureAuthorityBundle>(
@@ -520,6 +585,15 @@ impl<B: CaptureAuthorityBundle, S: CaptureSink, T: CaptureQueueTransport>
         drop(self.destination_fence);
         drop(self.fixed_storage);
     }
+
+    fn into_startup_resources(self) -> (S, Arc<CaptureDestinationLease>) {
+        let Self {
+            sink,
+            destination_fence,
+            ..
+        } = self;
+        (sink, destination_fence)
+    }
 }
 
 fn writer_runtime_error(
@@ -566,7 +640,27 @@ pub fn spawn_capture_writer<B: CaptureAuthorityBundle, S: CaptureSink>(
     sink: S,
     policy: CaptureWriterPolicy,
 ) -> Result<CaptureWriterHandle<B>, CaptureWriterSpawnError> {
-    let spawned = spawn_capture_writer_core(writer.core, sink, policy)?;
+    match spawn_capture_writer_recoverable(
+        writer,
+        sink,
+        policy,
+        CaptureWriterStartupOptions::default(),
+    ) {
+        Ok(handle) => Ok(handle),
+        Err(failure) => Err(failure.release_for_generic_caller()),
+    }
+}
+
+pub(in crate::capture) fn spawn_capture_writer_recoverable<
+    B: CaptureAuthorityBundle,
+    S: CaptureSink,
+>(
+    writer: RawCaptureWriter<B>,
+    sink: S,
+    policy: CaptureWriterPolicy,
+    options: CaptureWriterStartupOptions,
+) -> Result<CaptureWriterHandle<B>, CaptureWriterStartupFailure<S>> {
+    let spawned = spawn_capture_writer_core_recoverable(writer.core, sink, policy, options)?;
     Ok(CaptureWriterHandle {
         thread: spawned.thread,
         queue_control: spawned.queue_control,
@@ -588,6 +682,7 @@ struct SpawnedCaptureWriter<B: CaptureAuthorityBundle, T: CaptureQueueTransport>
     fixed_storage: Option<Arc<WriterFixedStorageOwner>>,
 }
 
+#[cfg(feature = "capture-benchmark")]
 fn spawn_capture_writer_core<
     B: CaptureAuthorityBundle,
     S: CaptureSink,
@@ -597,49 +692,106 @@ fn spawn_capture_writer_core<
     sink: S,
     policy: CaptureWriterPolicy,
 ) -> Result<SpawnedCaptureWriter<B, T>, CaptureWriterSpawnError> {
+    match spawn_capture_writer_core_recoverable(
+        writer,
+        sink,
+        policy,
+        CaptureWriterStartupOptions::default(),
+    ) {
+        Ok(spawned) => Ok(spawned),
+        Err(failure) => Err(failure.release_for_generic_caller()),
+    }
+}
+
+fn spawn_capture_writer_core_recoverable<
+    B: CaptureAuthorityBundle,
+    S: CaptureSink,
+    T: CaptureQueueTransport,
+>(
+    writer: CaptureWriterCore<B, T>,
+    sink: S,
+    policy: CaptureWriterPolicy,
+    options: CaptureWriterStartupOptions,
+) -> Result<SpawnedCaptureWriter<B, T>, CaptureWriterStartupFailure<S>> {
     let destination = sink.destination();
-    let (worker_destination_fence, owner_destination_fence) =
-        match acquire_destination_fence(writer.state.process, &destination) {
-            Ok(fences) => fences,
-            Err(CaptureDestinationFenceError::Busy) => {
-                return Err(CaptureWriterSpawnError::DestinationFence {
+    let destination_fences = match acquire_destination_fence(writer.state.process, &destination) {
+        Ok((worker, owner)) => CaptureWriterDestinationFences { worker, owner },
+        Err(CaptureDestinationFenceError::Busy) => {
+            return Err(CaptureWriterStartupFailure::new(
+                CaptureWriterSpawnError::DestinationFence {
                     destination: destination.clone(),
                     source: CaptureDestinationFenceError::Busy,
-                });
-            }
-            Err(CaptureDestinationFenceError::Capacity) => {
-                return Err(CaptureWriterSpawnError::DestinationFence {
+                },
+                sink,
+                None,
+            ));
+        }
+        Err(CaptureDestinationFenceError::Capacity) => {
+            return Err(CaptureWriterStartupFailure::new(
+                CaptureWriterSpawnError::DestinationFence {
                     destination: destination.clone(),
                     source: CaptureDestinationFenceError::Capacity,
-                });
-            }
-            Err(CaptureDestinationFenceError::RegistryPoisoned) => {
-                return Err(CaptureWriterSpawnError::DestinationFence {
+                },
+                sink,
+                None,
+            ));
+        }
+        Err(CaptureDestinationFenceError::RegistryPoisoned) => {
+            return Err(CaptureWriterStartupFailure::new(
+                CaptureWriterSpawnError::DestinationFence {
                     destination: destination.clone(),
                     source: CaptureDestinationFenceError::RegistryPoisoned,
-                });
-            }
-        };
+                },
+                sink,
+                None,
+            ));
+        }
+    };
+    #[cfg(all(feature = "capture-test", debug_assertions))]
+    if options.fail_after_destination_fence {
+        return Err(CaptureWriterStartupFailure::new(
+            CaptureWriterSpawnError::InjectedAfterDestinationFence,
+            sink,
+            Some(destination_fences),
+        ));
+    }
+    #[cfg(not(all(feature = "capture-test", debug_assertions)))]
+    let _options = options;
     let state = Arc::clone(&writer.state);
     let queue_control = writer.queue_control.clone();
     let ceiling = state.accounting.configured_ceiling().get();
-    let destination_lease_bytes = destination_lease_allocation_bytes().map_err(|_error| {
-        CaptureWriterSpawnError::FixedStorageBudgetExceeded {
-            required: usize::MAX,
-            limit: ceiling,
+    let destination_lease_bytes = match destination_lease_allocation_bytes() {
+        Ok(bytes) => bytes,
+        Err(_error) => {
+            return Err(CaptureWriterStartupFailure::new(
+                CaptureWriterSpawnError::FixedStorageBudgetExceeded {
+                    required: usize::MAX,
+                    limit: ceiling,
+                },
+                sink,
+                Some(destination_fences),
+            ));
         }
-    })?;
+    };
     let PreparedWriterRuntime {
         scratch,
         thread_name,
         fixed_storage,
-    } = prepare_writer_runtime(
+    } = match prepare_writer_runtime(
         &state.accounting,
         destination_lease_bytes,
         std::mem::size_of::<WriterSpawnPacket<B, S, T>>(),
-    )
-    .map_err(|error| writer_runtime_error(error, ceiling))?;
-    writer
+    ) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            return Err(CaptureWriterStartupFailure::new(
+                writer_runtime_error(error, ceiling),
+                sink,
+                Some(destination_fences),
+            ));
+        }
+    };
+    if writer
         .state
         .writer_lifecycle
         .compare_exchange(
@@ -648,10 +800,21 @@ fn spawn_capture_writer_core<
             Ordering::AcqRel,
             Ordering::Acquire,
         )
-        .map_err(|_previous| CaptureWriterSpawnError::ThreadSpawnFailed {
-            source: std::io::Error::other("capture writer lifecycle is not startable"),
-        })?;
+        .is_err()
+    {
+        return Err(CaptureWriterStartupFailure::new(
+            CaptureWriterSpawnError::ThreadSpawnFailed {
+                source: std::io::Error::other("capture writer lifecycle is not startable"),
+            },
+            sink,
+            Some(destination_fences),
+        ));
+    }
     let io_context = CaptureIoContext::new(Arc::clone(&state.writer_lifecycle_core));
+    let CaptureWriterDestinationFences {
+        worker: worker_destination_fence,
+        owner: owner_destination_fence,
+    } = destination_fences;
     let packet = WriterSpawnPacket {
         writer,
         sink,
@@ -661,13 +824,45 @@ fn spawn_capture_writer_core<
         fixed_storage: Arc::clone(&fixed_storage),
         scratch,
     };
-    let thread = std::thread::Builder::new()
+    let (packet_sender, packet_receiver) = mpsc::sync_channel::<WriterSpawnPacket<B, S, T>>(1);
+    let thread = match std::thread::Builder::new()
         .name(thread_name)
-        .spawn(move || packet.run())
-        .map_err(|source| {
+        .spawn(move || {
+            if let Ok(packet) = packet_receiver.recv() {
+                packet.run();
+            }
+        }) {
+        Ok(thread) => thread,
+        Err(source) => {
             state.mark_writer_failed();
-            CaptureWriterSpawnError::ThreadSpawnFailed { source }
-        })?;
+            let (sink, worker) = packet.into_startup_resources();
+            return Err(CaptureWriterStartupFailure::new(
+                CaptureWriterSpawnError::ThreadSpawnFailed { source },
+                sink,
+                Some(CaptureWriterDestinationFences {
+                    worker,
+                    owner: owner_destination_fence,
+                }),
+            ));
+        }
+    };
+    if let Err(mpsc::SendError(packet)) = packet_sender.send(packet) {
+        state.mark_writer_failed();
+        let _joined = thread.join();
+        let (sink, worker) = packet.into_startup_resources();
+        return Err(CaptureWriterStartupFailure::new(
+            CaptureWriterSpawnError::ThreadSpawnFailed {
+                source: std::io::Error::other(
+                    "capture writer startup packet receiver disconnected",
+                ),
+            },
+            sink,
+            Some(CaptureWriterDestinationFences {
+                worker,
+                owner: owner_destination_fence,
+            }),
+        ));
+    }
     Ok(SpawnedCaptureWriter {
         thread: Some(thread),
         queue_control,

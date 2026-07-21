@@ -89,7 +89,7 @@ pub enum CaptureDestinationError {
 }
 
 #[derive(Debug)]
-pub(super) struct CaptureDestinationLease {
+pub(in crate::capture) struct CaptureDestinationLease {
     destination: CaptureDestination,
     registry: &'static Mutex<CaptureDestinationFenceRegistry>,
 }
