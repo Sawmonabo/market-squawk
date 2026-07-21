@@ -429,25 +429,29 @@ impl ExecutionDispatcher {
                     return Err(ExecutionDispatchError::AccountReplacementRejected);
                 }
             };
-            let pending =
-                match PendingReconciliation::try_new(batch, order_ids.into_boxed_slice(), state) {
-                    Ok(pending)
-                        if pending.retained_bytes <= self.maximum_pending_reconciliation_bytes
-                            && registry.finalized_reconciliations.len()
-                                < registry.maximum_finalized_reconciliations =>
-                    {
-                        pending
-                    }
-                    _ => {
-                        drop(registry);
-                        fail_all(
-                            admissions,
-                            post_call.wall,
-                            ExecutionAuditReason::PendingReconciliationCapacity,
-                        );
-                        return Err(ExecutionDispatchError::PendingReconciliationCapacity);
-                    }
-                };
+            let pending = match PendingReconciliation::try_new(
+                batch,
+                order_ids.into_boxed_slice(),
+                state,
+                None,
+            ) {
+                Ok(pending)
+                    if pending.retained_bytes <= self.maximum_pending_reconciliation_bytes
+                        && registry.finalized_reconciliations.len()
+                            < registry.maximum_finalized_reconciliations =>
+                {
+                    pending
+                }
+                _ => {
+                    drop(registry);
+                    fail_all(
+                        admissions,
+                        post_call.wall,
+                        ExecutionAuditReason::PendingReconciliationCapacity,
+                    );
+                    return Err(ExecutionDispatchError::PendingReconciliationCapacity);
+                }
+            };
             if cancellation.is_cancelled() || tokio::time::Instant::now() >= deadline {
                 cancellation.cancel();
                 drop(registry);
@@ -582,12 +586,14 @@ impl ExecutionDispatcher {
             .source_binding()
             .ok_or(ExecutionDispatchError::AccountReplacementRejected)?;
         let invocation_digest = reconciliation_digest(&state, &[], invoked.wall);
-        self.accounts
+        let complete_accounts = self
+            .accounts
             .replace_unreserved_reconciled_accounts(source, invocation_digest, state.accounts())
             .map_err(|_| ExecutionDispatchError::AccountReplacementRejected)?;
         let batch = ReconciliationBatchBinding::from_dispatcher_digest(invocation_digest)
             .map_err(|_| ExecutionDispatchError::AccountReplacementRejected)?;
-        let pending = PendingReconciliation::try_new(batch, Box::new([]), state)?;
+        let pending =
+            PendingReconciliation::try_new(batch, Box::new([]), state, Some(complete_accounts))?;
         {
             let mut registry = try_registry(&self.registry)?;
             if pending.retained_bytes > self.maximum_pending_reconciliation_bytes
@@ -614,9 +620,8 @@ impl ExecutionDispatcher {
                     return Err(ExecutionDispatchError::ReconciliationAcknowledgementPending);
                 }
                 PendingReconciliationStatus::BackendAcknowledged => {
-                    let (state, scope) = finalize_pending_reconciliation(&mut registry)?;
-                    drop(registry);
-                    self.acknowledge_account_sequence(&state, scope)?;
+                    acknowledge_pending_account_sequence(&registry)?;
+                    let state = finalize_pending_reconciliation(&mut registry)?;
                     return Ok(state);
                 }
                 PendingReconciliationStatus::Ready => {}
@@ -670,28 +675,11 @@ impl ExecutionDispatcher {
                     return Err(ExecutionDispatchError::RegistryInvariant);
                 }
                 pending.status = PendingReconciliationStatus::BackendAcknowledged;
-                let (state, scope) = finalize_pending_reconciliation(&mut registry)?;
-                drop(registry);
-                self.acknowledge_account_sequence(&state, scope)?;
+                acknowledge_pending_account_sequence(&registry)?;
+                let state = finalize_pending_reconciliation(&mut registry)?;
                 Ok(state)
             }
         }
-    }
-
-    fn acknowledge_account_sequence(
-        &self,
-        state: &ExecutionState,
-        scope: PendingReconciliationScope,
-    ) -> Result<(), ExecutionDispatchError> {
-        if scope == PendingReconciliationScope::CompleteAccounts
-            && let Some(source) = state.source_binding()
-        {
-            self.accounts
-                .reconciliation_fence()
-                .acknowledge(source.snapshot_sequence())
-                .map_err(|_| ExecutionDispatchError::AccountReplacementRejected)?;
-        }
-        Ok(())
     }
 
     /// Closes admission, drains accepted queue entries, and joins the worker while retaining
@@ -801,7 +789,7 @@ fn restore_pending_acknowledgement(
 
 fn finalize_pending_reconciliation(
     registry: &mut DispatchRegistry,
-) -> Result<(ExecutionState, PendingReconciliationScope), ExecutionDispatchError> {
+) -> Result<ExecutionState, ExecutionDispatchError> {
     let Some(pending) = registry.pending_reconciliation.as_ref() else {
         return Err(ExecutionDispatchError::OrderNotTracked);
     };
@@ -816,7 +804,25 @@ fn finalize_pending_reconciliation(
         .take()
         .ok_or(ExecutionDispatchError::RegistryInvariant)?;
     registry.finalized_reconciliations.push(pending.batch);
-    Ok((pending.state, pending.scope))
+    Ok(pending.state)
+}
+
+fn acknowledge_pending_account_sequence(
+    registry: &DispatchRegistry,
+) -> Result<(), ExecutionDispatchError> {
+    let pending = registry
+        .pending_reconciliation
+        .as_ref()
+        .ok_or(ExecutionDispatchError::OrderNotTracked)?;
+    if pending.scope == PendingReconciliationScope::CompleteAccounts {
+        pending
+            .complete_accounts
+            .as_ref()
+            .ok_or(ExecutionDispatchError::AccountReplacementRejected)?
+            .acknowledge()
+            .map_err(|_| ExecutionDispatchError::AccountReplacementRejected)?;
+    }
+    Ok(())
 }
 
 fn restore_or_reconcile(

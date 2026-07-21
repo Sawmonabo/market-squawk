@@ -15,6 +15,7 @@ use thiserror::Error;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 
+use crate::account::CompleteAccountReplacement;
 use crate::approval::APPROVAL_COMMAND_RETAINED_BYTE_CEILING;
 use crate::audit::{ExecutionAuditContext, ExecutionAuditPermit};
 use crate::clock::system_now;
@@ -366,6 +367,7 @@ struct PendingReconciliation {
     order_ids: Box<[OrderId]>,
     state: ExecutionState,
     scope: PendingReconciliationScope,
+    complete_accounts: Option<CompleteAccountReplacement>,
     status: PendingReconciliationStatus,
     retained_bytes: usize,
 }
@@ -385,11 +387,17 @@ impl PendingReconciliation {
         batch: ReconciliationBatchBinding,
         order_ids: Box<[OrderId]>,
         state: ExecutionState,
+        complete_accounts: Option<CompleteAccountReplacement>,
     ) -> Result<Self, ExecutionDispatchError> {
         let retained_bytes = Self::retained_bytes_for(&order_ids, &state)?;
+        let scope = reconciliation_scope(&order_ids);
+        if (scope == PendingReconciliationScope::CompleteAccounts) != complete_accounts.is_some() {
+            return Err(ExecutionDispatchError::AccountReplacementRejected);
+        }
         Ok(Self {
             batch,
-            scope: reconciliation_scope(&order_ids),
+            scope,
+            complete_accounts,
             order_ids,
             state,
             status: PendingReconciliationStatus::Ready,

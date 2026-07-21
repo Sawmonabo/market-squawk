@@ -146,7 +146,7 @@ fn complete_replacement_invalidates_old_lease_and_publishes_clear_new_revision()
             wall: Timestamp::from_unix_nanos(1),
             monotonic: Instant::now(),
         }),
-        Err(AccountReservationStateError::AccountStateChanged)
+        Err(AccountReservationStateError::ReconciliationRequired)
     );
     let partition = coordinator.partitions[index]
         .lock()
@@ -176,6 +176,27 @@ fn complete_replacement_invalidates_old_lease_and_publishes_clear_new_revision()
         rejection
             .reasons()
             .contains(&AccountRiskViolation::CapitalLimit)
+    );
+    Ok(())
+}
+
+#[test]
+fn complete_account_replacement_rejects_a_partial_configured_account_set() -> TestResult {
+    let fixture = Fixture::new()?;
+    let mut second = fixture.bootstrap();
+    second.account_id = AccountId::from_str("51000000-0000-0000-0000-000000000100")?;
+    let coordinator = AccountRiskCoordinator::try_new(
+        AccountCoordinatorConfig::default(),
+        [fixture.bootstrap(), second],
+    )?;
+    let source = fixture.source([1; 32], 11, [4; 32])?;
+    let state = fixture.image(2, 100, 1)?;
+
+    assert_eq!(
+        coordinator
+            .replace_unreserved_reconciled_accounts(source, [5; 32], &[state])
+            .err(),
+        Some(AccountReplacementError::InvalidAccountClosure)
     );
     Ok(())
 }

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use market_squawk_domain::AccountId;
 use thiserror::Error;
 
+use crate::account::AccountRiskReconciliationFence;
 use crate::clock::{AccountReservationLease, system_now};
 use crate::{AccountRiskViolation, OrderIntentDigest};
 
@@ -58,6 +59,7 @@ pub struct AccountRiskReservation {
     pub(super) account_id: AccountId,
     pub(super) intent_digest: OrderIntentDigest,
     pub(super) lease: Arc<AccountReservationLease>,
+    pub(super) reconciliation: AccountRiskReconciliationFence,
 }
 
 impl AccountRiskReservation {
@@ -99,8 +101,21 @@ impl AccountRiskReservation {
 
     pub(crate) fn begin_submission(
         &self,
+        approval_valid_until: market_squawk_domain::Timestamp,
+        approval_monotonic_deadline: std::time::Instant,
     ) -> Result<AccountSubmissionFailSafe, AccountReservationStateError> {
-        self.lease.begin_submission()?;
+        let _publication = self
+            .reconciliation
+            .try_begin_reservation_publication()
+            .map_err(|_| AccountReservationStateError::ReconciliationRequired)?;
+        if !self.reconciliation.is_current() {
+            return Err(AccountReservationStateError::ReconciliationRequired);
+        }
+        let now = system_now().map_err(|_| AccountReservationStateError::ClockFailure)?;
+        if crate::clock::deadline_expired(now, approval_valid_until, approval_monotonic_deadline) {
+            return Err(AccountReservationStateError::Expired);
+        }
+        self.lease.begin_submission(now)?;
         Ok(AccountSubmissionFailSafe {
             lease: Arc::clone(&self.lease),
             armed: true,
@@ -200,13 +215,14 @@ pub(crate) fn accepted_reservation_for_test()
         Timestamp::from_unix_nanos(i64::MAX),
         monotonic_deadline(now, 1_000_000_000)?,
     ));
-    lease.begin_submission()?;
+    lease.begin_submission(now)?;
     lease.mark_accepted()?;
     Ok((
         AccountRiskReservation {
             account_id,
             intent_digest: OrderIntentDigest::from_bytes([1; 32]),
             lease,
+            reconciliation: AccountRiskReconciliationFence::new(0),
         },
         reconciliation_required,
     ))
@@ -224,10 +240,85 @@ pub enum AccountReservationStateError {
     /// Authoritative account state changed after reservation.
     #[error("account state revision changed")]
     AccountStateChanged,
+    /// Authoritative account state requires reconciliation before submission.
+    #[error("account reconciliation is required")]
+    ReconciliationRequired,
     /// Either wall or monotonic expiry was reached.
     #[error("account reservation expired")]
     Expired,
     /// Trusted clock failure.
     #[error("trusted account-reservation clock failed")]
     ClockFailure,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::time::{Duration, Instant};
+
+    use market_squawk_domain::{AccountId, Timestamp};
+
+    use super::{AccountReservationStateError, AccountRiskReservation};
+    use crate::OrderIntentDigest;
+    use crate::account::AccountRiskReconciliationFence;
+    use crate::clock::AccountReservationLease;
+
+    #[test]
+    fn financial_fence_invalidates_an_active_approval_before_submission()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fence = AccountRiskReconciliationFence::new(0);
+        let reservation = AccountRiskReservation {
+            account_id: "50000000-0000-0000-0000-000000000001".parse::<AccountId>()?,
+            intent_digest: OrderIntentDigest::from_bytes([1; 32]),
+            lease: Arc::new(AccountReservationLease::new(
+                Arc::new(AtomicU64::new(1)),
+                Arc::new(AtomicBool::new(false)),
+                1,
+                Timestamp::from_unix_nanos(i64::MAX),
+                Instant::now() + Duration::from_secs(60),
+            )),
+            reconciliation: fence.clone(),
+        };
+        fence.require(std::num::NonZeroU64::MIN)?;
+
+        assert_eq!(
+            reservation
+                .begin_submission(
+                    Timestamp::from_unix_nanos(i64::MAX),
+                    Instant::now() + Duration::from_secs(60),
+                )
+                .err(),
+            Some(AccountReservationStateError::ReconciliationRequired)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn submission_rejects_expired_approval_when_reservation_is_still_current()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let reservation = AccountRiskReservation {
+            account_id: "50000000-0000-0000-0000-000000000001".parse::<AccountId>()?,
+            intent_digest: OrderIntentDigest::from_bytes([1; 32]),
+            lease: Arc::new(AccountReservationLease::new(
+                Arc::new(AtomicU64::new(1)),
+                Arc::new(AtomicBool::new(false)),
+                1,
+                Timestamp::from_unix_nanos(i64::MAX),
+                Instant::now() + Duration::from_secs(60),
+            )),
+            reconciliation: AccountRiskReconciliationFence::new(0),
+        };
+
+        assert_eq!(
+            reservation
+                .begin_submission(
+                    Timestamp::from_unix_nanos(i64::MIN),
+                    Instant::now() + Duration::from_secs(60),
+                )
+                .err(),
+            Some(AccountReservationStateError::Expired)
+        );
+        Ok(())
+    }
 }

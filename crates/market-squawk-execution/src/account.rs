@@ -12,7 +12,8 @@ pub use contracts::{
 };
 pub use reconciliation::{AccountReconciliationFenceError, AccountRiskReconciliationFence};
 pub(crate) use replacement::{
-    AccountReplacementCandidate, AccountReplacementReservationBinding, AccountStateReplacementBatch,
+    AccountReplacementCandidate, AccountReplacementReservationBinding,
+    AccountStateReplacementBatch, CompleteAccountReplacement,
 };
 #[cfg(test)]
 pub(crate) use reservation::accepted_reservation_for_test;
@@ -582,6 +583,7 @@ impl AccountState {
             account_id: intent.account_id(),
             intent_digest: intent.digest(),
             lease,
+            reconciliation: reconciliation.clone(),
         })
     }
 

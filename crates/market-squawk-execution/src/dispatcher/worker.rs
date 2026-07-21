@@ -12,7 +12,7 @@ use super::{
 use crate::account::AccountSubmissionFailSafe;
 use crate::adapter::dispatch_order_from_approval;
 use crate::audit::{ExecutionAuditContext, ExecutionAuditPermit};
-use crate::clock::system_now;
+use crate::clock::{deadline_expired, system_now};
 use crate::dispatcher::attempt::attempt_adapter_call;
 use crate::{
     ExecutionAdapter, ExecutionAdapterError, ExecutionAuditKind, ExecutionAuditReason,
@@ -237,8 +237,8 @@ async fn process_command(
             }
         }
     };
-    let fail_safe = match parts.reservation.begin_submission() {
-        Ok(guard) => guard,
+    let final_now = match system_now() {
+        Ok(final_now) => final_now,
         Err(_) => {
             mark_terminal(registry, approval_id, now.wall);
             commit_dispatch_audit(
@@ -246,6 +246,38 @@ async fn process_command(
                 ExecutionAuditKind::DispatchRejected,
                 context,
                 now.wall,
+                &[ExecutionAuditReason::ClockFailure],
+            );
+            return;
+        }
+    };
+    if parts.authority.validate_current().is_err()
+        || deadline_expired(final_now, parts.valid_until, parts.monotonic_deadline)
+        || operation_cancellation.is_cancelled()
+        || tokio::time::Instant::now() >= operation_deadline
+    {
+        mark_terminal(registry, approval_id, final_now.wall);
+        commit_dispatch_audit(
+            audit,
+            ExecutionAuditKind::DispatchRejected,
+            context,
+            final_now.wall,
+            &[ExecutionAuditReason::ApprovalInvalid],
+        );
+        return;
+    }
+    let fail_safe = match parts
+        .reservation
+        .begin_submission(parts.valid_until, parts.monotonic_deadline)
+    {
+        Ok(guard) => guard,
+        Err(_) => {
+            mark_terminal(registry, approval_id, final_now.wall);
+            commit_dispatch_audit(
+                audit,
+                ExecutionAuditKind::DispatchRejected,
+                context,
+                final_now.wall,
                 &[ExecutionAuditReason::ApprovalInvalid],
             );
             return;
@@ -257,12 +289,12 @@ async fn process_command(
             Err(_) => {
                 parts.reservation.mark_known_not_accepted();
                 fail_safe.disarm();
-                mark_terminal(registry, approval_id, now.wall);
+                mark_terminal(registry, approval_id, final_now.wall);
                 commit_dispatch_audit(
                     audit,
                     ExecutionAuditKind::DispatchRejected,
                     context,
-                    now.wall,
+                    final_now.wall,
                     &[ExecutionAuditReason::RegistryUnavailable],
                 );
                 return;
@@ -275,7 +307,7 @@ async fn process_command(
                 audit,
                 ExecutionAuditKind::DispatchRejected,
                 context,
-                now.wall,
+                final_now.wall,
                 &[ExecutionAuditReason::RegistryUnavailable],
             );
             return;
@@ -288,13 +320,13 @@ async fn process_command(
                 audit,
                 ExecutionAuditKind::DispatchRejected,
                 context,
-                now.wall,
+                final_now.wall,
                 &[ExecutionAuditReason::RegistryUnavailable],
             );
             return;
         }
         record.state = DispatchState::Submitted;
-        record.last_transition_at = now.wall;
+        record.last_transition_at = final_now.wall;
         record.reservation = Some(parts.reservation);
     }
     let outcome = SubmissionOutcomeFailSafe::new(
@@ -303,7 +335,7 @@ async fn process_command(
         fail_safe,
         audit,
         context,
-        now.wall,
+        final_now.wall,
     );
     let dispatch = dispatch_order_from_approval(
         approval_id,
@@ -313,7 +345,7 @@ async fn process_command(
         parts.authority.into_evidence(),
         parts.policy,
         parts.valid_until,
-        now.wall,
+        final_now.wall,
         ExecutionOperation::new(operation_deadline, operation_cancellation.clone()),
     );
     let (result, deadline_exceeded) = attempt_submit(

@@ -70,7 +70,11 @@ fn duration_to_i128(duration: Duration) -> i128 {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClockReading, deadline_expired};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+
+    use super::{AccountReservationLease, ClockReading, deadline_expired};
+    use crate::AccountReservationStateError;
     use market_squawk_domain::Timestamp;
     use std::time::{Duration, Instant};
 
@@ -91,6 +95,27 @@ mod tests {
             monotonic: monotonic + Duration::from_nanos(1),
         };
         assert!(deadline_expired(after_monotonic, wall, monotonic));
+    }
+
+    #[test]
+    fn active_lease_rejects_account_reconciliation_latch() {
+        let now = ClockReading {
+            wall: Timestamp::from_unix_nanos(100),
+            monotonic: Instant::now(),
+        };
+        let reconciliation_required = Arc::new(AtomicBool::new(true));
+        let lease = AccountReservationLease::new(
+            Arc::new(AtomicU64::new(1)),
+            reconciliation_required,
+            1,
+            Timestamp::from_unix_nanos(200),
+            now.monotonic + Duration::from_secs(1),
+        );
+
+        assert_eq!(
+            lease.validate(now),
+            Err(AccountReservationStateError::ReconciliationRequired)
+        );
     }
 }
 
@@ -126,6 +151,9 @@ impl AccountReservationLease {
         if self.status.load(Ordering::Acquire) != RESERVATION_ACTIVE {
             return Err(AccountReservationStateError::NotActive);
         }
+        if self.reconciliation_required.load(Ordering::Acquire) {
+            return Err(AccountReservationStateError::ReconciliationRequired);
+        }
         if self.account_revision.load(Ordering::Acquire) != self.expected_account_revision {
             return Err(AccountReservationStateError::AccountStateChanged);
         }
@@ -153,7 +181,11 @@ impl AccountReservationLease {
         self.expected_account_revision
     }
 
-    pub(crate) fn begin_submission(&self) -> Result<(), AccountReservationStateError> {
+    pub(crate) fn begin_submission(
+        &self,
+        now: ClockReading,
+    ) -> Result<(), AccountReservationStateError> {
+        self.validate(now)?;
         self.status
             .compare_exchange(
                 RESERVATION_ACTIVE,
@@ -161,8 +193,31 @@ impl AccountReservationLease {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
-            .map(|_| ())
-            .map_err(|_| AccountReservationStateError::NotActive)
+            .map_err(|_| AccountReservationStateError::NotActive)?;
+        match self.validate_submitted(now) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                if error == AccountReservationStateError::ReconciliationRequired {
+                    self.mark_reconciliation_required();
+                } else {
+                    self.mark_known_not_accepted();
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn validate_submitted(&self, now: ClockReading) -> Result<(), AccountReservationStateError> {
+        if self.reconciliation_required.load(Ordering::Acquire) {
+            return Err(AccountReservationStateError::ReconciliationRequired);
+        }
+        if self.account_revision.load(Ordering::Acquire) != self.expected_account_revision {
+            return Err(AccountReservationStateError::AccountStateChanged);
+        }
+        if deadline_expired(now, self.wall_expiry, self.monotonic_expiry) {
+            return Err(AccountReservationStateError::Expired);
+        }
+        Ok(())
     }
 
     pub(crate) fn mark_accepted(&self) -> Result<(), AccountReservationStateError> {

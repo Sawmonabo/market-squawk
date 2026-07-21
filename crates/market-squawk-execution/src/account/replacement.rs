@@ -127,6 +127,19 @@ pub(super) struct AccountReplacementSource {
     invocation_digest: [u8; 32],
 }
 
+/// Opaque proof that every configured account was replaced from one exact backend sequence.
+#[derive(Debug)]
+pub(crate) struct CompleteAccountReplacement {
+    reconciliation: super::AccountRiskReconciliationFence,
+    sequence: std::num::NonZeroU64,
+}
+
+impl CompleteAccountReplacement {
+    pub(crate) fn acknowledge(&self) -> Result<(), super::AccountReconciliationFenceError> {
+        self.reconciliation.acknowledge(self.sequence)
+    }
+}
+
 #[derive(Debug)]
 struct PreparedAccountState {
     account_id: AccountId,
@@ -152,8 +165,32 @@ impl AccountRiskCoordinator {
         source: ExecutionStateSourceBinding,
         invocation_digest: [u8; 32],
         states: &[ReconciledAccountState],
-    ) -> Result<(), AccountReplacementError> {
+    ) -> Result<CompleteAccountReplacement, AccountReplacementError> {
         if states.is_empty() || states.len() > MAX_RECONCILED_ACCOUNTS {
+            return Err(AccountReplacementError::InvalidAccountClosure);
+        }
+        let mut configured_accounts = Vec::new();
+        for partition in &self.partitions {
+            let partition = match partition.try_lock() {
+                Ok(partition) => partition,
+                Err(TryLockError::WouldBlock) => return Err(AccountReplacementError::Busy),
+                Err(TryLockError::Poisoned(_)) => return Err(AccountReplacementError::Poisoned),
+            };
+            configured_accounts
+                .try_reserve(partition.accounts.len())
+                .map_err(|_| AccountReplacementError::Allocation)?;
+            configured_accounts.extend(partition.accounts.keys().copied());
+        }
+        configured_accounts.sort_unstable();
+        let mut returned_accounts = Vec::new();
+        returned_accounts
+            .try_reserve_exact(states.len())
+            .map_err(|_| AccountReplacementError::Allocation)?;
+        returned_accounts.extend(states.iter().map(ReconciledAccountState::account_id));
+        returned_accounts.sort_unstable();
+        if returned_accounts.windows(2).any(|pair| pair[0] == pair[1])
+            || returned_accounts != configured_accounts
+        {
             return Err(AccountReplacementError::InvalidAccountClosure);
         }
         let mut candidates = Vec::new();
@@ -191,13 +228,20 @@ impl AccountRiskCoordinator {
             )?);
         }
         if candidates.is_empty() {
-            return Ok(());
+            return Ok(CompleteAccountReplacement {
+                reconciliation: self.reconciliation.clone(),
+                sequence: source.snapshot_sequence(),
+            });
         }
         self.replace_reconciled_accounts(AccountStateReplacementBatch::try_new(
             source,
             invocation_digest,
             candidates,
-        )?)
+        )?)?;
+        Ok(CompleteAccountReplacement {
+            reconciliation: self.reconciliation.clone(),
+            sequence: source.snapshot_sequence(),
+        })
     }
 
     pub(crate) fn replace_reconciled_accounts(
@@ -226,6 +270,10 @@ impl AccountRiskCoordinator {
             };
             guards.push((index, guard));
         }
+        let _publication = self
+            .reconciliation
+            .try_begin_reservation_publication()
+            .map_err(|_| AccountReplacementError::Busy)?;
 
         let mut prepared = Vec::new();
         prepared
