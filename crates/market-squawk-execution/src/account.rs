@@ -203,8 +203,10 @@ struct AccountState {
     capital: Money,
     peak_capital: Money,
     gross_exposure: Money,
+    realized_pnl: Money,
     realized_loss: Money,
     positions: HashMap<InstrumentId, i64>,
+    position_cost_basis: HashMap<InstrumentId, Money>,
     account_revision: Arc<AtomicU64>,
     reconciliation_required: Arc<AtomicBool>,
     reservations: Vec<ReservationRecord>,
@@ -224,6 +226,11 @@ impl AccountState {
             .try_reserve(config.max_positions_per_account.get())
             .map_err(|_| AccountCoordinatorError::Allocation)?;
         positions.extend(bootstrap.positions);
+        let mut position_cost_basis = HashMap::new();
+        position_cost_basis
+            .try_reserve(config.max_positions_per_account.get())
+            .map_err(|_| AccountCoordinatorError::Allocation)?;
+        position_cost_basis.extend(bootstrap.position_cost_basis);
         let mut reservations = Vec::new();
         reservations
             .try_reserve_exact(config.max_reservations_per_account.get())
@@ -244,8 +251,10 @@ impl AccountState {
             capital: bootstrap.capital,
             peak_capital: bootstrap.peak_capital,
             gross_exposure: bootstrap.gross_exposure,
+            realized_pnl: bootstrap.realized_pnl,
             realized_loss: bootstrap.realized_loss,
             positions,
+            position_cost_basis,
             account_revision: Arc::new(AtomicU64::new(bootstrap.revision.get())),
             reconciliation_required: Arc::new(AtomicBool::new(false)),
             reservations,
@@ -609,9 +618,11 @@ fn validate_bootstrap(
     if money
         .iter()
         .any(|value| value.currency() != currency || value.amount().is_sign_negative())
+        || account.realized_pnl.currency() != currency
         || account.capital.amount().is_zero()
         || account.peak_capital.amount() < account.capital.amount()
         || account.positions.len() > config.max_positions_per_account.get()
+        || account.position_cost_basis.len() > config.max_positions_per_account.get()
     {
         return Err(AccountCoordinatorError::InvalidBootstrap);
     }
@@ -622,6 +633,28 @@ fn validate_bootstrap(
         .positions
         .windows(2)
         .any(|pair| pair[0].0 == pair[1].0)
+    {
+        return Err(AccountCoordinatorError::InvalidBootstrap);
+    }
+    account
+        .position_cost_basis
+        .sort_unstable_by_key(|(instrument_id, _)| *instrument_id);
+    if account
+        .position_cost_basis
+        .windows(2)
+        .any(|pair| pair[0].0 == pair[1].0)
+        || account.positions.len() != account.position_cost_basis.len()
+        || account
+            .positions
+            .iter()
+            .zip(&account.position_cost_basis)
+            .any(|((position_id, lots), (basis_id, basis))| {
+                position_id != basis_id
+                    || basis.currency() != currency
+                    || basis.amount().is_sign_negative()
+                    || (*lots == 0 && !basis.amount().is_zero())
+                    || (*lots != 0 && basis.amount().is_zero())
+            })
     {
         return Err(AccountCoordinatorError::InvalidBootstrap);
     }

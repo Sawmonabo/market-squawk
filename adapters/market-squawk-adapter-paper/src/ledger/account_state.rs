@@ -18,8 +18,12 @@ pub struct PaperAccountBootstrap {
     pub peak_capital: Money,
     pub gross_exposure: Money,
     pub realized_loss: Money,
+    /// Signed cumulative realized trading profit and loss, excluding fees.
+    pub realized_pnl: Money,
     /// Signed lots by stable instrument identity.
     pub positions: Vec<(InstrumentId, i64)>,
+    /// Nonnegative open-cost basis keyed exactly to every retained position.
+    pub position_cost_basis: Vec<(InstrumentId, Money)>,
 }
 
 /// Versioned financial-risk dimensions retained with a complete paper snapshot.
@@ -33,6 +37,7 @@ pub struct PaperAccountRiskSnapshot {
     peak_capital: Money,
     gross_exposure: Money,
     realized_loss: Money,
+    realized_pnl: Money,
 }
 
 impl PaperAccountRiskSnapshot {
@@ -60,6 +65,10 @@ impl PaperAccountRiskSnapshot {
     pub const fn realized_loss(self) -> Money {
         self.realized_loss
     }
+
+    pub const fn realized_pnl(self) -> Money {
+        self.realized_pnl
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -71,22 +80,30 @@ pub(super) struct PaperAccountRiskState {
     pub(super) peak_capital: Money,
     pub(super) gross_exposure: Money,
     pub(super) realized_loss: Money,
+    pub(super) realized_pnl: Money,
+}
+
+impl PaperAccountRiskSnapshot {
+    pub(super) const fn new(account_id: AccountId, account: PaperAccountRiskState) -> Self {
+        Self {
+            account_id,
+            revision: account.revision,
+            eligible: account.eligible,
+            currency: account.currency,
+            capital: account.capital,
+            peak_capital: account.peak_capital,
+            gross_exposure: account.gross_exposure,
+            realized_loss: account.realized_loss,
+            realized_pnl: account.realized_pnl,
+        }
+    }
 }
 
 impl PaperLedger {
     pub(crate) fn account_risk_snapshot(&self) -> Vec<PaperAccountRiskSnapshot> {
         self.accounts
             .iter()
-            .map(|(account_id, account)| PaperAccountRiskSnapshot {
-                account_id: *account_id,
-                revision: account.revision,
-                eligible: account.eligible,
-                currency: account.currency,
-                capital: account.capital,
-                peak_capital: account.peak_capital,
-                gross_exposure: account.gross_exposure,
-                realized_loss: account.realized_loss,
-            })
+            .map(|(account_id, account)| PaperAccountRiskSnapshot::new(*account_id, *account))
             .collect()
     }
 
@@ -106,6 +123,14 @@ impl PaperLedger {
             .filter(|((candidate, _), _)| *candidate == account_id)
             .map(|((_, instrument_id), lots)| (*instrument_id, *lots))
             .collect();
+        let position_cost_basis = self
+            .position_cost_basis
+            .iter()
+            .filter(|((candidate, _), _)| *candidate == account_id)
+            .map(|((_, instrument_id), amount)| {
+                (*instrument_id, Money::new(*amount, account.currency))
+            })
+            .collect();
         ReconciledAccountState::try_new(
             account_id,
             account.revision,
@@ -115,8 +140,10 @@ impl PaperLedger {
             account.capital,
             account.peak_capital,
             account.gross_exposure,
+            account.realized_pnl,
             account.realized_loss,
             positions,
+            position_cost_basis,
         )
         .map_err(|_| PaperLedgerError::InvalidRecovery)
     }

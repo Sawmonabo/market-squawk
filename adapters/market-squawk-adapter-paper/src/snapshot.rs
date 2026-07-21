@@ -1,17 +1,18 @@
 //! Bounded paper state images and strict opaque recovery checkpoints.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
 
 use market_squawk_domain::{
     AccountId, ClientOrderId, Money, OrderId, PriceTicks, QuantityLots, Timestamp,
 };
+use market_squawk_execution::{ReconciliationBatchBinding, ReconciliationBatchId};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::ledger::LedgerRecoveryWire;
+use crate::ledger::{LedgerRecoveryWire, checked_notional};
 use crate::order::{PaperOrder, PaperOrderRecoveryWire};
 use crate::{
     LiquidityRole, PaperAccountRiskSnapshot, PaperCashBalance, PaperLedger, PaperOrderState,
@@ -159,6 +160,8 @@ pub struct PaperExecutionSnapshot {
     complete: bool,
     reconciliation_required: bool,
     orders: Box<[PaperOrderSnapshot]>,
+    active_orders: Box<[PaperOrderSnapshot]>,
+    archived_orders: Box<[PaperOrderSnapshot]>,
     fills: Box<[PaperFillSnapshot]>,
     accounts: Box<[PaperAccountRiskSnapshot]>,
     cash: Box<[PaperCashBalance]>,
@@ -166,25 +169,43 @@ pub struct PaperExecutionSnapshot {
 }
 
 impl PaperExecutionSnapshot {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a snapshot binds eight independent persisted state components at one consistency boundary"
+    )]
     pub(crate) fn from_state(
         configuration_digest: [u8; 32],
         sequence: u64,
         reconciliation_required: bool,
         orders: &BTreeMap<OrderId, PaperOrder>,
         fills: &[PaperFillSnapshot],
+        archived_orders: &BTreeMap<OrderId, PaperOrder>,
+        archived_fills: &[PaperFillSnapshot],
         ledger: &PaperLedger,
     ) -> Self {
+        let active_orders = orders
+            .values()
+            .map(PaperOrderSnapshot::from_order)
+            .collect::<Vec<_>>();
+        let archived_order_snapshots = archived_orders
+            .values()
+            .map(PaperOrderSnapshot::from_order)
+            .collect::<Vec<_>>();
+        let mut all_orders = active_orders.clone();
+        all_orders.extend(archived_order_snapshots.iter().cloned());
+        all_orders.sort_unstable_by_key(PaperOrderSnapshot::order_id);
+        let mut all_fills = fills.to_vec();
+        all_fills.extend_from_slice(archived_fills);
+        all_fills.sort_unstable_by_key(|fill| fill.sequence);
         Self {
             configuration_digest,
             sequence,
             complete: true,
             reconciliation_required,
-            orders: orders
-                .values()
-                .map(PaperOrderSnapshot::from_order)
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
-            fills: fills.to_vec().into_boxed_slice(),
+            orders: all_orders.into_boxed_slice(),
+            active_orders: active_orders.into_boxed_slice(),
+            archived_orders: archived_order_snapshots.into_boxed_slice(),
+            fills: all_fills.into_boxed_slice(),
             accounts: ledger.account_risk_snapshot().into_boxed_slice(),
             cash: ledger.cash_snapshot().into_boxed_slice(),
             positions: ledger.position_snapshot().into_boxed_slice(),
@@ -205,6 +226,12 @@ impl PaperExecutionSnapshot {
     }
     pub const fn orders(&self) -> &[PaperOrderSnapshot] {
         &self.orders
+    }
+    pub const fn active_orders(&self) -> &[PaperOrderSnapshot] {
+        &self.active_orders
+    }
+    pub const fn archived_orders(&self) -> &[PaperOrderSnapshot] {
+        &self.archived_orders
     }
     pub const fn fills(&self) -> &[PaperFillSnapshot] {
         &self.fills
@@ -230,8 +257,21 @@ pub struct PaperExecutionCheckpoint {
     pub(crate) reconciliation_required: bool,
     pub(crate) orders: BTreeMap<OrderId, PaperOrder>,
     pub(crate) fills: Vec<PaperFillSnapshot>,
+    pub(crate) archived_orders: BTreeMap<OrderId, PaperOrder>,
+    pub(crate) archived_fills: Vec<PaperFillSnapshot>,
+    pub(crate) durable_sequence: u64,
+    pub(crate) reconciled_orders: BTreeSet<OrderId>,
+    pub(crate) acknowledged_reconciliation_batches: Vec<ReconciliationBatchBinding>,
     pub(crate) ledger: PaperLedger,
     pub(crate) idempotency: BTreeMap<(AccountId, ClientOrderId), OrderId>,
+}
+
+/// Exact checkpoint identity supplied with dispatcher-minted persistence authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PaperCheckpointPersistenceEvidence {
+    pub(crate) configuration_digest: [u8; 32],
+    pub(crate) sequence: u64,
+    pub(crate) recovery_digest: [u8; 32],
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -244,6 +284,11 @@ struct CheckpointWire {
     reconciliation_required: bool,
     orders: Vec<PaperOrderRecoveryWire>,
     fills: Vec<FillRecoveryWire>,
+    archived_orders: Vec<PaperOrderRecoveryWire>,
+    archived_fills: Vec<FillRecoveryWire>,
+    durable_sequence: u64,
+    reconciled_orders: Vec<OrderId>,
+    acknowledged_reconciliation_batches: Vec<AcknowledgedReconciliationBatchWire>,
     ledger: LedgerRecoveryWire,
     idempotency: Vec<IdempotencyRecoveryWire>,
 }
@@ -269,6 +314,13 @@ struct IdempotencyRecoveryWire {
     order_id: OrderId,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AcknowledgedReconciliationBatchWire {
+    batch_id: [u8; 32],
+    binding_digest: [u8; 32],
+}
+
 impl PaperExecutionCheckpoint {
     pub const fn schema_version(&self) -> u32 {
         self.schema_version
@@ -292,6 +344,23 @@ impl PaperExecutionCheckpoint {
         let mut output = BoundedCheckpointWriter::new(maximum_bytes)?;
         serde_json::to_writer(&mut output, &wire).map_err(PaperCheckpointError::Encoding)?;
         Ok(output.into_inner())
+    }
+
+    /// Binds caller-confirmed persisted bytes to this exact complete checkpoint image.
+    pub fn persistence_evidence(
+        &self,
+        persisted_bytes: &[u8],
+    ) -> Result<PaperCheckpointPersistenceEvidence, PaperCheckpointError> {
+        if persisted_bytes.is_empty()
+            || self.encode(persisted_bytes.len())?.as_slice() != persisted_bytes
+        {
+            return Err(PaperCheckpointError::InvalidPersistenceEvidence);
+        }
+        Ok(PaperCheckpointPersistenceEvidence {
+            configuration_digest: self.configuration_digest,
+            sequence: self.sequence,
+            recovery_digest: self.recovery_input_digest()?,
+        })
     }
 
     pub(crate) fn recovery_input_digest(&self) -> Result<[u8; 32], PaperCheckpointError> {
@@ -327,6 +396,35 @@ impl PaperExecutionCheckpoint {
                     liquidity: fill.liquidity,
                 })
                 .collect(),
+            archived_orders: self
+                .archived_orders
+                .values()
+                .map(PaperOrder::recovery_wire)
+                .collect(),
+            archived_fills: self
+                .archived_fills
+                .iter()
+                .map(|fill| FillRecoveryWire {
+                    sequence: fill.sequence,
+                    order_id: fill.order_id,
+                    event_at: fill.event_at,
+                    quantity: fill.quantity,
+                    average_price: fill.average_price,
+                    notional: fill.notional,
+                    fee: fill.fee,
+                    liquidity: fill.liquidity,
+                })
+                .collect(),
+            durable_sequence: self.durable_sequence,
+            reconciled_orders: self.reconciled_orders.iter().copied().collect(),
+            acknowledged_reconciliation_batches: self
+                .acknowledged_reconciliation_batches
+                .iter()
+                .map(|binding| AcknowledgedReconciliationBatchWire {
+                    batch_id: *binding.batch_id().as_bytes(),
+                    binding_digest: binding.binding_digest(),
+                })
+                .collect(),
             ledger: self.ledger.recovery_wire(),
             idempotency: self
                 .idempotency
@@ -354,12 +452,26 @@ impl PaperExecutionCheckpoint {
         let wire: CheckpointWire =
             serde_json::from_slice(bytes).map_err(PaperCheckpointError::Encoding)?;
         let limits = config.input();
+        let maximum_archived_fills = limits
+            .maximum_archived_orders
+            .get()
+            .checked_mul(limits.maximum_fills.get())
+            .ok_or(PaperCheckpointError::InvalidHeader)?;
+        let maximum_reconciled_orders = limits
+            .maximum_orders
+            .get()
+            .checked_add(limits.maximum_archived_orders.get())
+            .ok_or(PaperCheckpointError::InvalidHeader)?;
         if wire.schema_version != crate::PaperExecutionConfig::CHECKPOINT_SCHEMA_VERSION
             || wire.configuration_digest != config.digest()
             || !wire.complete
             || wire.orders.len() > limits.maximum_orders.get()
             || wire.fills.len() > limits.maximum_fills.get()
+            || wire.archived_orders.len() > limits.maximum_archived_orders.get()
+            || wire.archived_fills.len() > maximum_archived_fills
             || wire.idempotency.len() > limits.maximum_idempotency_keys.get()
+            || wire.acknowledged_reconciliation_batches.len() > maximum_reconciled_orders
+            || wire.durable_sequence > wire.sequence
         {
             return Err(PaperCheckpointError::InvalidHeader);
         }
@@ -373,11 +485,61 @@ impl PaperExecutionCheckpoint {
                 return Err(PaperCheckpointError::InvalidOrder);
             }
         }
-        let fills = validate_fills(wire.fills, wire.sequence, &orders)?;
+        let mut archived_orders = BTreeMap::new();
+        for order_wire in wire.archived_orders {
+            let order = PaperOrder::try_from_recovery_wire(order_wire)
+                .map_err(|_| PaperCheckpointError::InvalidOrder)?;
+            if order.lifecycle.last_sequence() > wire.durable_sequence
+                || !is_terminal(order.lifecycle.state())
+                || orders.contains_key(&order.order_id)
+                || archived_orders.insert(order.order_id, order).is_some()
+            {
+                return Err(PaperCheckpointError::InvalidOrder);
+            }
+        }
+        let (fills, fill_totals) =
+            validate_fills(wire.fills, wire.sequence, &orders, limits.fee_schedule)?;
+        let (archived_fills, _) = validate_fills(
+            wire.archived_fills,
+            wire.durable_sequence,
+            &archived_orders,
+            limits.fee_schedule,
+        )?;
         let ledger = PaperLedger::try_from_recovery_wire(config.ledger_config(), wire.ledger)
             .map_err(PaperCheckpointError::Ledger)?;
-        validate_reservation_shape(&orders, &ledger)?;
+        validate_reservation_shape(&orders, &ledger, &fill_totals)?;
         let idempotency = validate_idempotency(wire.idempotency, &orders)?;
+        validate_archive_identities(&orders, &idempotency, &archived_orders)?;
+        let reconciled_orders = wire.reconciled_orders.into_iter().collect::<BTreeSet<_>>();
+        if reconciled_orders.len() > maximum_reconciled_orders
+            || archived_orders
+                .keys()
+                .any(|order_id| !reconciled_orders.contains(order_id))
+            || reconciled_orders.iter().any(|order_id| {
+                orders
+                    .get(order_id)
+                    .or_else(|| archived_orders.get(order_id))
+                    .is_none_or(|order| !is_terminal(order.lifecycle.state()))
+            })
+        {
+            return Err(PaperCheckpointError::InvalidArchive);
+        }
+        let mut acknowledged_reconciliation_batches = Vec::new();
+        acknowledged_reconciliation_batches
+            .try_reserve_exact(wire.acknowledged_reconciliation_batches.len())
+            .map_err(|_| PaperCheckpointError::Allocation)?;
+        for persisted in wire.acknowledged_reconciliation_batches {
+            let batch_id = ReconciliationBatchId::try_from_bytes(persisted.batch_id)
+                .map_err(|_| PaperCheckpointError::InvalidArchive)?;
+            let binding = ReconciliationBatchBinding::try_new(batch_id, persisted.binding_digest)
+                .map_err(|_| PaperCheckpointError::InvalidArchive)?;
+            if acknowledged_reconciliation_batches.iter().any(
+                |candidate: &ReconciliationBatchBinding| candidate.batch_id() == binding.batch_id(),
+            ) {
+                return Err(PaperCheckpointError::InvalidArchive);
+            }
+            acknowledged_reconciliation_batches.push(binding);
+        }
         Ok(Self {
             schema_version: wire.schema_version,
             configuration_digest: wire.configuration_digest,
@@ -386,6 +548,11 @@ impl PaperExecutionCheckpoint {
             reconciliation_required: wire.reconciliation_required,
             orders,
             fills,
+            archived_orders,
+            archived_fills,
+            durable_sequence: wire.durable_sequence,
+            reconciled_orders,
+            acknowledged_reconciliation_batches,
             ledger,
             idempotency,
         })
@@ -451,51 +618,86 @@ impl Write for BoundedCheckpointWriter {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct FillTotals {
+    quantity: i64,
+    weighted_ticks: i128,
+    fees: Decimal,
+    maker_notional: Decimal,
+    taker_notional: Decimal,
+}
+
 fn validate_fills(
     wire_fills: Vec<FillRecoveryWire>,
     checkpoint_sequence: u64,
     orders: &BTreeMap<OrderId, PaperOrder>,
-) -> Result<Vec<PaperFillSnapshot>, PaperCheckpointError> {
+    fee_schedule: crate::FeeSchedule,
+) -> Result<(Vec<PaperFillSnapshot>, BTreeMap<OrderId, FillTotals>), PaperCheckpointError> {
     let mut fills = Vec::new();
     fills
         .try_reserve_exact(wire_fills.len())
         .map_err(|_| PaperCheckpointError::Allocation)?;
-    let mut totals: BTreeMap<OrderId, (i64, i128, Decimal)> = BTreeMap::new();
+    let mut totals: BTreeMap<OrderId, FillTotals> = BTreeMap::new();
     let mut last_sequence = 0_u64;
     for fill in wire_fills {
         let order = orders
             .get(&fill.order_id)
             .ok_or(PaperCheckpointError::InvalidFill)?;
+        let expected_notional = checked_notional(order.terms, fill.average_price, fill.quantity)
+            .map_err(|_| PaperCheckpointError::InvalidFill)?;
         if fill.sequence <= last_sequence
             || fill.sequence > checkpoint_sequence
+            || fill.sequence > order.lifecycle.last_sequence()
             || fill.quantity.get() == 0
             || fill.average_price.get() <= 0
             || fill.event_at < order.eligible_at
             || fill.event_at > order.expires_at
             || fill.notional.currency() != order.terms.quote_currency()
             || fill.notional.amount() <= Decimal::ZERO
+            || fill.notional != expected_notional
             || fill.fee.currency() != order.terms.quote_currency()
             || fill.fee.amount().is_sign_negative()
         {
             return Err(PaperCheckpointError::InvalidFill);
         }
-        let total = totals.entry(fill.order_id).or_insert((0, 0, Decimal::ZERO));
-        total.0 = total
-            .0
+        let total = totals.entry(fill.order_id).or_default();
+        let prior_fees = total.fees;
+        total.quantity = total
+            .quantity
             .checked_add(fill.quantity.get())
             .ok_or(PaperCheckpointError::InvalidFill)?;
-        total.1 = total
-            .1
+        total.weighted_ticks = total
+            .weighted_ticks
             .checked_add(
                 i128::from(fill.average_price.get())
                     .checked_mul(i128::from(fill.quantity.get()))
                     .ok_or(PaperCheckpointError::InvalidFill)?,
             )
             .ok_or(PaperCheckpointError::InvalidFill)?;
-        total.2 = total
-            .2
+        total.fees = total
+            .fees
             .checked_add(fill.fee.amount())
             .ok_or(PaperCheckpointError::InvalidFill)?;
+        let role_notional = match fill.liquidity {
+            LiquidityRole::Maker => &mut total.maker_notional,
+            LiquidityRole::Taker => &mut total.taker_notional,
+        };
+        *role_notional = role_notional
+            .checked_add(fill.notional.amount())
+            .ok_or(PaperCheckpointError::InvalidFill)?;
+        let expected_cumulative_fee = fee_schedule
+            .charge_cumulative(
+                Money::new(total.maker_notional, order.terms.quote_currency()),
+                Money::new(total.taker_notional, order.terms.quote_currency()),
+            )
+            .map_err(|_| PaperCheckpointError::InvalidFill)?;
+        let expected_increment = expected_cumulative_fee
+            .amount()
+            .checked_sub(prior_fees)
+            .ok_or(PaperCheckpointError::InvalidFill)?;
+        if fill.fee.amount() != expected_increment {
+            return Err(PaperCheckpointError::InvalidFill);
+        }
         last_sequence = fill.sequence;
         fills.push(PaperFillSnapshot::new(
             fill.sequence,
@@ -509,24 +711,21 @@ fn validate_fills(
         ));
     }
     for order in orders.values() {
-        let (quantity, weighted, fees) =
-            totals
-                .get(&order.order_id)
-                .copied()
-                .unwrap_or((0, 0, Decimal::ZERO));
-        if quantity != order.lifecycle.cumulative_filled().get()
-            || weighted != order.weighted_fill_ticks
-            || fees != order.cumulative_fee.amount()
+        let total = totals.get(&order.order_id).copied().unwrap_or_default();
+        if total.quantity != order.lifecycle.cumulative_filled().get()
+            || total.weighted_ticks != order.weighted_fill_ticks
+            || total.fees != order.cumulative_fee.amount()
         {
             return Err(PaperCheckpointError::InvalidFill);
         }
     }
-    Ok(fills)
+    Ok((fills, totals))
 }
 
 fn validate_reservation_shape(
     orders: &BTreeMap<OrderId, PaperOrder>,
     ledger: &PaperLedger,
+    fill_totals: &BTreeMap<OrderId, FillTotals>,
 ) -> Result<(), PaperCheckpointError> {
     let mut required_count = 0_usize;
     for order in orders.values() {
@@ -543,6 +742,40 @@ fn validate_reservation_shape(
         }
         if ledger.has_reservation(order.order_id) != requires_reservation {
             return Err(PaperCheckpointError::InvalidReservation);
+        }
+        if requires_reservation {
+            let totals = fill_totals
+                .get(&order.order_id)
+                .copied()
+                .unwrap_or_default();
+            let remaining = order
+                .remaining()
+                .map_err(|_| PaperCheckpointError::InvalidReservation)?;
+            let adverse = crate::slippage::adverse_bound(
+                order.reference_price,
+                order.side,
+                order.maximum_slippage,
+            )
+            .map_err(|_| PaperCheckpointError::InvalidReservation)?;
+            let reservation_price = match (order.side, order.limit_price) {
+                (market_squawk_domain::OrderSide::Buy, Some(limit)) => adverse.min(limit),
+                (market_squawk_domain::OrderSide::Sell, Some(limit)) => adverse.max(limit),
+                (_, None) => adverse,
+            };
+            if !ledger.reservation_matches(
+                order.order_id,
+                order.account_id,
+                order.terms,
+                order.side,
+                order.quantity,
+                reservation_price,
+                remaining,
+                Money::new(totals.maker_notional, order.terms.quote_currency()),
+                Money::new(totals.taker_notional, order.terms.quote_currency()),
+                order.cumulative_fee,
+            ) {
+                return Err(PaperCheckpointError::InvalidReservation);
+            }
         }
     }
     if ledger.reservation_count() != required_count {
@@ -575,6 +808,32 @@ fn validate_idempotency(
     Ok(idempotency)
 }
 
+fn validate_archive_identities(
+    active_orders: &BTreeMap<OrderId, PaperOrder>,
+    active_idempotency: &BTreeMap<(AccountId, ClientOrderId), OrderId>,
+    archived_orders: &BTreeMap<OrderId, PaperOrder>,
+) -> Result<(), PaperCheckpointError> {
+    let mut identities = active_idempotency.keys().cloned().collect::<BTreeSet<_>>();
+    for order in archived_orders.values() {
+        if active_orders.contains_key(&order.order_id)
+            || !identities.insert((order.account_id, order.client_order_id.clone()))
+        {
+            return Err(PaperCheckpointError::InvalidArchive);
+        }
+    }
+    Ok(())
+}
+
+const fn is_terminal(state: PaperOrderState) -> bool {
+    matches!(
+        state,
+        PaperOrderState::Filled
+            | PaperOrderState::Canceled
+            | PaperOrderState::Rejected
+            | PaperOrderState::Expired
+    )
+}
+
 /// Strict bounded checkpoint codec or invariant failure.
 #[derive(Debug, Error)]
 pub enum PaperCheckpointError {
@@ -590,6 +849,10 @@ pub enum PaperCheckpointError {
     InvalidReservation,
     #[error("paper checkpoint idempotency state is invalid")]
     InvalidIdempotency,
+    #[error("paper checkpoint archive state is invalid")]
+    InvalidArchive,
+    #[error("paper checkpoint persistence evidence does not match encoded bytes")]
+    InvalidPersistenceEvidence,
     #[error("paper checkpoint bounded allocation failed")]
     Allocation,
     #[error("paper checkpoint JSON encoding or decoding failed")]

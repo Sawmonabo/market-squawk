@@ -2,9 +2,9 @@ use std::num::NonZeroU64;
 use std::str::FromStr;
 
 use market_squawk_adapter_paper::{
-    FeeSchedule, LiquidityRole, PaperAccountBootstrap, PaperLedger, PaperLedgerConfig,
-    PaperOrderLifecycle, PaperOrderState, PaperSessionCalendarError, PaperStateError,
-    PaperVenueSession, PaperVenueSessionCalendar,
+    FeeSchedule, LiquidityRole, PaperAccountBootstrap, PaperExposureValuation, PaperLedger,
+    PaperLedgerConfig, PaperOrderLifecycle, PaperOrderState, PaperSessionCalendarError,
+    PaperStateError, PaperVenueSession, PaperVenueSessionCalendar,
 };
 use market_squawk_domain::{
     AccountId, Currency, Denomination, InstrumentDefinitionRevision, InstrumentExecutionTerms,
@@ -141,6 +141,7 @@ fn ledger_is_exact_reserved_and_transactional_across_scaled_fills() -> TestResul
     let mut ledger = PaperLedger::try_new(
         PaperLedgerConfig {
             allow_short: false,
+            exposure_valuation: PaperExposureValuation::OpenCost,
             maximum_accounts: 1,
             maximum_balances: 1,
             maximum_positions: 1,
@@ -155,8 +156,10 @@ fn ledger_is_exact_reserved_and_transactional_across_scaled_fills() -> TestResul
             capital: Money::new(Decimal::new(100, 0), usd),
             peak_capital: Money::new(Decimal::new(100, 0), usd),
             gross_exposure: Money::new(Decimal::ZERO, usd),
+            realized_pnl: Money::new(Decimal::ZERO, usd),
             realized_loss: Money::new(Decimal::ZERO, usd),
             positions: vec![(instrument_id, 0)],
+            position_cost_basis: vec![(instrument_id, Money::new(Decimal::ZERO, usd))],
         }],
     )?;
     let order_id = OrderId::from_str("20000000-0000-0000-0000-000000000001")?;
@@ -215,5 +218,236 @@ fn ledger_is_exact_reserved_and_transactional_across_scaled_fills() -> TestResul
         ledger.cash(account_id, usd)?.amount(),
         Decimal::new(9549, 2)
     );
+    Ok(())
+}
+
+#[test]
+fn minimum_fee_is_charged_once_across_partial_fills() -> TestResult {
+    let usd = Currency::try_from("USD")?;
+    let account_id = AccountId::from_str("50000000-0000-0000-0000-000000000011")?;
+    let instrument_id = InstrumentId::from_str("10000000-0000-0000-0000-000000000011")?;
+    let terms = InstrumentExecutionTerms::try_new(
+        instrument_id,
+        InstrumentDefinitionRevision::try_from(1)?,
+        TickSize::try_from_decimal(Decimal::ONE)?,
+        LotSize::try_from_decimal(Decimal::ONE)?,
+        usd,
+        Denomination::Currency(usd),
+        Decimal::ONE,
+    )?;
+    let mut ledger = PaperLedger::try_new(
+        PaperLedgerConfig {
+            allow_short: false,
+            exposure_valuation: PaperExposureValuation::OpenCost,
+            maximum_accounts: 1,
+            maximum_balances: 1,
+            maximum_positions: 1,
+            maximum_reservations: 2,
+            fee_schedule: FeeSchedule::try_new(0, 0, Money::new(Decimal::new(2, 0), usd), None, 2)?,
+        },
+        [PaperAccountBootstrap {
+            account_id,
+            revision: NonZeroU64::MIN,
+            eligible: true,
+            cash: vec![Money::new(Decimal::TEN, usd)],
+            capital: Money::new(Decimal::TEN, usd),
+            peak_capital: Money::new(Decimal::TEN, usd),
+            gross_exposure: Money::new(Decimal::ZERO, usd),
+            realized_pnl: Money::new(Decimal::ZERO, usd),
+            realized_loss: Money::new(Decimal::ZERO, usd),
+            positions: vec![(instrument_id, 0)],
+            position_cost_basis: vec![(instrument_id, Money::new(Decimal::ZERO, usd))],
+        }],
+    )?;
+    let order_id = OrderId::from_str("20000000-0000-0000-0000-000000000011")?;
+    ledger.reserve(
+        order_id,
+        account_id,
+        terms,
+        OrderSide::Buy,
+        QuantityLots::new(2)?,
+        PriceTicks::new(1),
+    )?;
+
+    let first = ledger.apply_fill(
+        order_id,
+        terms,
+        &[(PriceTicks::new(1), QuantityLots::new(1)?)],
+        LiquidityRole::Taker,
+    )?;
+    let second = ledger.apply_fill(
+        order_id,
+        terms,
+        &[(PriceTicks::new(1), QuantityLots::new(1)?)],
+        LiquidityRole::Taker,
+    )?;
+
+    assert_eq!(first.fee().amount(), Decimal::new(2, 0));
+    assert_eq!(second.fee().amount(), Decimal::ZERO);
+    assert_eq!(ledger.cash(account_id, usd)?.amount(), Decimal::new(6, 0));
+
+    let sell_id = OrderId::from_str("20000000-0000-0000-0000-000000000014")?;
+    ledger.reserve(
+        sell_id,
+        account_id,
+        terms,
+        OrderSide::Sell,
+        QuantityLots::new(1)?,
+        PriceTicks::new(1),
+    )?;
+    assert_eq!(
+        ledger.available_cash(account_id, usd)?.amount(),
+        Decimal::new(5, 0)
+    );
+    let sell = ledger.apply_fill(
+        sell_id,
+        terms,
+        &[(PriceTicks::new(1), QuantityLots::new(1)?)],
+        LiquidityRole::Taker,
+    )?;
+    assert_eq!(sell.fee().amount(), Decimal::new(2, 0));
+    assert_eq!(ledger.cash(account_id, usd)?.amount(), Decimal::new(5, 0));
+    Ok(())
+}
+
+#[test]
+fn allowed_short_open_and_cover_are_accounted_without_exposure_underflow() -> TestResult {
+    let usd = Currency::try_from("USD")?;
+    let account_id = AccountId::from_str("50000000-0000-0000-0000-000000000012")?;
+    let instrument_id = InstrumentId::from_str("10000000-0000-0000-0000-000000000012")?;
+    let terms = InstrumentExecutionTerms::try_new(
+        instrument_id,
+        InstrumentDefinitionRevision::try_from(1)?,
+        TickSize::try_from_decimal(Decimal::ONE)?,
+        LotSize::try_from_decimal(Decimal::ONE)?,
+        usd,
+        Denomination::Currency(usd),
+        Decimal::ONE,
+    )?;
+    let mut ledger = PaperLedger::try_new(
+        PaperLedgerConfig {
+            allow_short: true,
+            exposure_valuation: PaperExposureValuation::OpenCost,
+            maximum_accounts: 1,
+            maximum_balances: 1,
+            maximum_positions: 1,
+            maximum_reservations: 2,
+            fee_schedule: FeeSchedule::try_new(0, 0, Money::new(Decimal::ZERO, usd), None, 2)?,
+        },
+        [PaperAccountBootstrap {
+            account_id,
+            revision: NonZeroU64::MIN,
+            eligible: true,
+            cash: vec![Money::new(Decimal::new(100, 0), usd)],
+            capital: Money::new(Decimal::new(100, 0), usd),
+            peak_capital: Money::new(Decimal::new(100, 0), usd),
+            gross_exposure: Money::new(Decimal::ZERO, usd),
+            realized_pnl: Money::new(Decimal::ZERO, usd),
+            realized_loss: Money::new(Decimal::ZERO, usd),
+            positions: vec![(instrument_id, 0)],
+            position_cost_basis: vec![(instrument_id, Money::new(Decimal::ZERO, usd))],
+        }],
+    )?;
+    let sell_id = OrderId::from_str("20000000-0000-0000-0000-000000000012")?;
+    ledger.reserve(
+        sell_id,
+        account_id,
+        terms,
+        OrderSide::Sell,
+        QuantityLots::new(1)?,
+        PriceTicks::new(10),
+    )?;
+    ledger.apply_fill(
+        sell_id,
+        terms,
+        &[(PriceTicks::new(10), QuantityLots::new(1)?)],
+        LiquidityRole::Taker,
+    )?;
+    assert_eq!(ledger.position_lots(account_id, instrument_id)?, -1);
+    assert_eq!(
+        ledger
+            .position_cost_basis(account_id, instrument_id)?
+            .amount(),
+        Decimal::TEN
+    );
+    let opened = ledger.account_risk(account_id)?;
+    assert_eq!(opened.gross_exposure().amount(), Decimal::TEN);
+    assert_eq!(opened.realized_pnl().amount(), Decimal::ZERO);
+
+    let cover_id = OrderId::from_str("20000000-0000-0000-0000-000000000013")?;
+    ledger.reserve(
+        cover_id,
+        account_id,
+        terms,
+        OrderSide::Buy,
+        QuantityLots::new(1)?,
+        PriceTicks::new(8),
+    )?;
+    ledger.apply_fill(
+        cover_id,
+        terms,
+        &[(PriceTicks::new(8), QuantityLots::new(1)?)],
+        LiquidityRole::Taker,
+    )?;
+
+    assert_eq!(ledger.position_lots(account_id, instrument_id)?, 0);
+    assert_eq!(ledger.cash(account_id, usd)?.amount(), Decimal::new(102, 0));
+    assert_eq!(
+        ledger
+            .position_cost_basis(account_id, instrument_id)?
+            .amount(),
+        Decimal::ZERO
+    );
+    let covered = ledger.account_risk(account_id)?;
+    assert_eq!(covered.capital().amount(), Decimal::new(102, 0));
+    assert_eq!(covered.peak_capital().amount(), Decimal::new(102, 0));
+    assert_eq!(covered.gross_exposure().amount(), Decimal::ZERO);
+    assert_eq!(covered.realized_pnl().amount(), Decimal::new(2, 0));
+    assert_eq!(covered.realized_loss().amount(), Decimal::ZERO);
+
+    let buy_id = OrderId::from_str("20000000-0000-0000-0000-000000000015")?;
+    ledger.reserve(
+        buy_id,
+        account_id,
+        terms,
+        OrderSide::Buy,
+        QuantityLots::new(2)?,
+        PriceTicks::new(10),
+    )?;
+    ledger.apply_fill(
+        buy_id,
+        terms,
+        &[(PriceTicks::new(10), QuantityLots::new(2)?)],
+        LiquidityRole::Taker,
+    )?;
+    let cross_id = OrderId::from_str("20000000-0000-0000-0000-000000000016")?;
+    ledger.reserve(
+        cross_id,
+        account_id,
+        terms,
+        OrderSide::Sell,
+        QuantityLots::new(3)?,
+        PriceTicks::new(8),
+    )?;
+    ledger.apply_fill(
+        cross_id,
+        terms,
+        &[(PriceTicks::new(8), QuantityLots::new(3)?)],
+        LiquidityRole::Taker,
+    )?;
+
+    assert_eq!(ledger.position_lots(account_id, instrument_id)?, -1);
+    assert_eq!(
+        ledger
+            .position_cost_basis(account_id, instrument_id)?
+            .amount(),
+        Decimal::new(8, 0)
+    );
+    let crossed = ledger.account_risk(account_id)?;
+    assert_eq!(crossed.capital().amount(), Decimal::new(98, 0));
+    assert_eq!(crossed.peak_capital().amount(), Decimal::new(102, 0));
+    assert_eq!(crossed.gross_exposure().amount(), Decimal::new(8, 0));
+    assert_eq!(crossed.realized_pnl().amount(), Decimal::new(-2, 0));
+    assert_eq!(crossed.realized_loss().amount(), Decimal::new(4, 0));
     Ok(())
 }

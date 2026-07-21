@@ -15,22 +15,22 @@ mod state;
 mod worker;
 
 pub use adapter::{
-    PaperControlError, PaperExecutionAdapter, PaperExecutionRuntime, PaperMarketIngress,
-    PaperStartError,
+    PaperControlContext, PaperControlError, PaperExecutionAdapter, PaperExecutionRuntime,
+    PaperMarketIngress, PaperStartError,
 };
 pub use audit::{PaperAuditKind, PaperAuditReader, PaperAuditRecord};
 pub use config::{PaperConfigError, PaperExecutionConfig, PaperExecutionConfigInput};
 pub use fees::{FeeError, FeeSchedule, LiquidityRole};
 pub use ledger::{
-    PaperAccountBootstrap, PaperAccountRiskSnapshot, PaperCashBalance, PaperFill, PaperLedger,
-    PaperLedgerConfig, PaperLedgerError, PaperPosition,
+    PaperAccountBootstrap, PaperAccountRiskSnapshot, PaperCashBalance, PaperExposureValuation,
+    PaperFill, PaperLedger, PaperLedgerConfig, PaperLedgerError, PaperPosition,
 };
 pub use session::{
     MAX_PAPER_VENUE_SESSIONS, PaperSessionCalendarError, PaperVenueSession,
     PaperVenueSessionCalendar,
 };
 pub use snapshot::{
-    PaperCheckpointError, PaperExecutionCheckpoint, PaperExecutionSnapshot, PaperFillSnapshot,
-    PaperOrderSnapshot,
+    PaperCheckpointError, PaperCheckpointPersistenceEvidence, PaperExecutionCheckpoint,
+    PaperExecutionSnapshot, PaperFillSnapshot, PaperOrderSnapshot,
 };
 pub use state::{PaperOrderLifecycle, PaperOrderState, PaperStateError};

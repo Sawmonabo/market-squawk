@@ -11,8 +11,8 @@ use crate::dispatcher::{
     commit_dispatch_audit, try_registry,
 };
 use crate::{
-    CancelReceipt, CancelStatus, ExecutionAdapterError, ExecutionAuditKind, ExecutionAuditReason,
-    ReconciledOrder, ReconciledOrderStatus,
+    CancelOrder, CancelReceipt, CancelStatus, ExecutionAdapterError, ExecutionAuditKind,
+    ExecutionAuditReason, ReconciledOrder, ReconciledOrderStatus,
 };
 
 impl ExecutionDispatcher {
@@ -62,7 +62,26 @@ impl ExecutionDispatcher {
             (fail_safe, invoked)
         };
         let (fail_safe, invoked) = fail_safe;
-        let result = self.adapter.cancel(&order_id).await;
+        let operation =
+            super::super::operation(self.operation_deadline, self.cancellation.child_token())?;
+        let deadline = operation.deadline();
+        let cancellation = operation.cancellation();
+        let result = match tokio::time::timeout_at(
+            deadline,
+            self.adapter.cancel(CancelOrder::new(order_id, operation)),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                cancellation.cancel();
+                fail_safe.fail_uncertain(
+                    invoked.wall,
+                    &[ExecutionAuditReason::OperationDeadlineExceeded],
+                );
+                return Err(ExecutionDispatchError::OperationDeadlineExceeded);
+            }
+        };
         let post_call = match system_now() {
             Ok(post_call)
                 if post_call.wall >= invoked.wall && post_call.monotonic >= invoked.monotonic =>
@@ -74,6 +93,14 @@ impl ExecutionDispatcher {
                 return Err(ExecutionDispatchError::ClockUnavailable);
             }
         };
+        if cancellation.is_cancelled() || tokio::time::Instant::now() >= deadline {
+            cancellation.cancel();
+            fail_safe.fail_uncertain(
+                post_call.wall,
+                &[ExecutionAuditReason::OperationDeadlineExceeded],
+            );
+            return Err(ExecutionDispatchError::OperationDeadlineExceeded);
+        }
         let mut registry = match try_registry(&self.registry) {
             Ok(registry) => registry,
             Err(error) => {

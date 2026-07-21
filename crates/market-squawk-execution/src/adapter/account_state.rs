@@ -6,7 +6,7 @@ use market_squawk_domain::{AccountId, Currency, InstrumentId, Money};
 use thiserror::Error;
 
 /// Current complete account-replacement schema.
-pub const ACCOUNT_REPLACEMENT_SCHEMA_VERSION: u32 = 1;
+pub const ACCOUNT_REPLACEMENT_SCHEMA_VERSION: u32 = 2;
 
 /// Maximum account images returned by one bounded reconciliation call.
 pub const MAX_RECONCILED_ACCOUNTS: usize = 256;
@@ -70,8 +70,10 @@ pub struct ReconciledAccountState {
     capital: Money,
     peak_capital: Money,
     gross_exposure: Money,
+    realized_pnl: Money,
     realized_loss: Money,
     positions: Box<[(InstrumentId, i64)]>,
+    position_cost_basis: Box<[(InstrumentId, Money)]>,
 }
 
 impl ReconciledAccountState {
@@ -89,16 +91,21 @@ impl ReconciledAccountState {
         capital: Money,
         peak_capital: Money,
         gross_exposure: Money,
+        realized_pnl: Money,
         realized_loss: Money,
         mut positions: Vec<(InstrumentId, i64)>,
+        mut position_cost_basis: Vec<(InstrumentId, Money)>,
     ) -> Result<Self, ReconciledAccountStateError> {
-        if positions.len() > MAX_RECONCILED_POSITIONS_PER_ACCOUNT {
+        if positions.len() > MAX_RECONCILED_POSITIONS_PER_ACCOUNT
+            || position_cost_basis.len() > MAX_RECONCILED_POSITIONS_PER_ACCOUNT
+        {
             return Err(ReconciledAccountStateError::TooManyPositions);
         }
         let money = [cash, capital, peak_capital, gross_exposure, realized_loss];
         if money
             .iter()
             .any(|value| value.currency() != currency || value.amount().is_sign_negative())
+            || realized_pnl.currency() != currency
             || capital.amount().is_zero()
             || peak_capital.amount() < capital.amount()
         {
@@ -107,6 +114,23 @@ impl ReconciledAccountState {
         positions.sort_unstable_by_key(|(instrument_id, _)| *instrument_id);
         if positions.windows(2).any(|pair| pair[0].0 == pair[1].0) {
             return Err(ReconciledAccountStateError::DuplicatePosition);
+        }
+        position_cost_basis.sort_unstable_by_key(|(instrument_id, _)| *instrument_id);
+        if position_cost_basis
+            .windows(2)
+            .any(|pair| pair[0].0 == pair[1].0)
+            || positions.len() != position_cost_basis.len()
+            || positions.iter().zip(&position_cost_basis).any(
+                |((position_id, lots), (basis_id, basis))| {
+                    position_id != basis_id
+                        || basis.currency() != currency
+                        || basis.amount().is_sign_negative()
+                        || (*lots == 0 && !basis.amount().is_zero())
+                        || (*lots != 0 && basis.amount().is_zero())
+                },
+            )
+        {
+            return Err(ReconciledAccountStateError::InvalidPositionCostBasis);
         }
         Ok(Self {
             account_id,
@@ -117,8 +141,10 @@ impl ReconciledAccountState {
             capital,
             peak_capital,
             gross_exposure,
+            realized_pnl,
             realized_loss,
             positions: positions.into_boxed_slice(),
+            position_cost_basis: position_cost_basis.into_boxed_slice(),
         })
     }
 
@@ -146,11 +172,17 @@ impl ReconciledAccountState {
     pub const fn gross_exposure(&self) -> Money {
         self.gross_exposure
     }
+    pub const fn realized_pnl(&self) -> Money {
+        self.realized_pnl
+    }
     pub const fn realized_loss(&self) -> Money {
         self.realized_loss
     }
     pub const fn positions(&self) -> &[(InstrumentId, i64)] {
         &self.positions
+    }
+    pub const fn position_cost_basis(&self) -> &[(InstrumentId, Money)] {
+        &self.position_cost_basis
     }
 }
 
@@ -165,6 +197,8 @@ pub enum ReconciledAccountStateError {
     InvalidFinancialState,
     #[error("account replacement contains a duplicate instrument position")]
     DuplicatePosition,
+    #[error("account replacement position cost basis is incomplete or invalid")]
+    InvalidPositionCostBasis,
     #[error("account replacement source digest must be nonzero")]
     InvalidDigest,
 }

@@ -1,5 +1,41 @@
 error: cannot construct `DispatchOrder` with struct literal syntax due to private fields
- --> tests/ui/dispatch_order_is_private.rs:4:13
+ --> tests/ui/dispatch_order_is_private.rs:6:13
   |
-4 |     let _ = DispatchOrder {};
+6 |     let _ = DispatchOrder {};
   |             ^^^^^^^^^^^^^
+
+error: cannot construct `CancelOrder` with struct literal syntax due to private fields
+ --> tests/ui/dispatch_order_is_private.rs:7:13
+  |
+7 |     let _ = CancelOrder {};
+  |             ^^^^^^^^^^^
+  |
+help: you might have meant to use the `new` associated function
+  |
+7 -     let _ = CancelOrder {};
+7 +     let _ = CancelOrder::new(_, _);
+  |
+
+error: cannot construct `ReconcileOrders` with struct literal syntax due to private fields
+ --> tests/ui/dispatch_order_is_private.rs:8:13
+  |
+8 |     let _ = ReconcileOrders {};
+  |             ^^^^^^^^^^^^^^^
+  |
+help: you might have meant to use the `new` associated function
+  |
+8 -     let _ = ReconcileOrders {};
+8 +     let _ = ReconcileOrders::new(_, _);
+  |
+
+error: cannot construct `ReconciliationAcknowledgement` with struct literal syntax due to private fields
+ --> tests/ui/dispatch_order_is_private.rs:9:13
+  |
+9 |     let _ = ReconciliationAcknowledgement {};
+  |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+help: you might have meant to use the `new` associated function
+  |
+9 -     let _ = ReconciliationAcknowledgement {};
+9 +     let _ = ReconciliationAcknowledgement::new(_, _, _);
+  |

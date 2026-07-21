@@ -20,7 +20,8 @@ use crate::clock::system_now;
 use crate::{
     AccountRiskCoordinator, AccountRiskReservation, ApprovedOrder, ExecutionAdapter,
     ExecutionAdapterError, ExecutionAuditEvent, ExecutionAuditKind, ExecutionAuditReason,
-    ExecutionAuditWriter, OrderIntentDigest, ReconciledOrder,
+    ExecutionAuditWriter, ExecutionOperation, ExecutionState, OrderIntentDigest,
+    PersistenceAcknowledgement, ReconciledOrder, ReconciliationBatchBinding,
 };
 use worker::run_worker;
 
@@ -30,6 +31,8 @@ pub struct ExecutionDispatcherConfig {
     pub maximum_queued_commands: NonZeroUsize,
     pub maximum_queued_bytes: NonZeroU32,
     pub maximum_registry_entries: NonZeroUsize,
+    pub maximum_pending_reconciliation_bytes: NonZeroU32,
+    pub operation_deadline: Duration,
     pub shutdown_deadline: Duration,
 }
 
@@ -43,7 +46,9 @@ pub struct ExecutionDispatcher {
     audit: ExecutionAuditWriter,
     cancellation: CancellationToken,
     worker: Option<tokio::task::JoinHandle<()>>,
+    operation_deadline: Duration,
     shutdown_deadline: Duration,
+    maximum_pending_reconciliation_bytes: usize,
 }
 
 impl ExecutionDispatcher {
@@ -54,7 +59,7 @@ impl ExecutionDispatcher {
         audit: ExecutionAuditWriter,
         config: ExecutionDispatcherConfig,
     ) -> Result<Self, ExecutionDispatcherError> {
-        if config.shutdown_deadline.is_zero() {
+        if config.operation_deadline.is_zero() || config.shutdown_deadline.is_zero() {
             return Err(ExecutionDispatcherError::ZeroShutdownDeadline);
         }
         let command_bytes = usize::try_from(config.maximum_queued_bytes.get())
@@ -69,9 +74,16 @@ impl ExecutionDispatcher {
         entries
             .try_reserve(config.maximum_registry_entries.get())
             .map_err(|_| ExecutionDispatcherError::Allocation)?;
+        let mut finalized_reconciliations = Vec::new();
+        finalized_reconciliations
+            .try_reserve_exact(config.maximum_registry_entries.get())
+            .map_err(|_| ExecutionDispatcherError::Allocation)?;
         let registry = Arc::new(Mutex::new(DispatchRegistry {
             entries,
             maximum_entries: config.maximum_registry_entries.get(),
+            pending_reconciliation: None,
+            finalized_reconciliations,
+            maximum_finalized_reconciliations: config.maximum_registry_entries.get(),
         }));
         let (sender, receiver) = mpsc::channel(config.maximum_queued_commands.get());
         let bytes = Arc::new(Semaphore::new(command_bytes));
@@ -91,6 +103,8 @@ impl ExecutionDispatcher {
             registry: Arc::clone(&registry),
             audit: audit.clone(),
             retained_bytes,
+            operation_deadline: config.operation_deadline,
+            cancellation: cancellation.clone(),
         };
         Ok(Self {
             handle,
@@ -100,13 +114,42 @@ impl ExecutionDispatcher {
             audit,
             cancellation,
             worker: Some(worker),
+            operation_deadline: config.operation_deadline,
             shutdown_deadline: config.shutdown_deadline,
+            maximum_pending_reconciliation_bytes: usize::try_from(
+                config.maximum_pending_reconciliation_bytes.get(),
+            )
+            .map_err(|_| ExecutionDispatcherError::ByteCapacityUnsupported)?,
         })
     }
 
     /// Returns the cloneable nonblocking handoff used by live action hooks.
     pub fn handle(&self) -> ExecutionDispatcherHandle {
         self.handle.clone()
+    }
+
+    /// Mints one non-cloneable bounded capability after the caller durably persists a checkpoint.
+    pub fn persistence_acknowledgement(
+        &self,
+    ) -> Result<PersistenceAcknowledgement, ExecutionDispatchError> {
+        let operation = operation(self.operation_deadline, self.cancellation.child_token())?;
+        let registry = try_registry(&self.registry)?;
+        if registry.pending_reconciliation.is_some() {
+            return Err(ExecutionDispatchError::ReconciliationAcknowledgementPending);
+        }
+        let mut finalized_reconciliations = Vec::new();
+        finalized_reconciliations
+            .try_reserve_exact(registry.finalized_reconciliations.len())
+            .map_err(|_| ExecutionDispatchError::Allocation)?;
+        finalized_reconciliations.extend_from_slice(&registry.finalized_reconciliations);
+        drop(registry);
+        Ok(PersistenceAcknowledgement::new(
+            operation,
+            finalized_reconciliations.into_boxed_slice(),
+            PersistenceFinalization {
+                registry: Arc::clone(&self.registry),
+            },
+        ))
     }
 }
 
@@ -118,6 +161,8 @@ pub struct ExecutionDispatcherHandle {
     registry: Arc<Mutex<DispatchRegistry>>,
     audit: ExecutionAuditWriter,
     retained_bytes: usize,
+    operation_deadline: Duration,
+    cancellation: CancellationToken,
 }
 
 impl ExecutionDispatcherHandle {
@@ -134,6 +179,9 @@ impl ExecutionDispatcherHandle {
         let intent_digest = approval.intent_digest();
         let account_revision = approval.account_revision();
         let observed_at = trusted_now_or(context.market_observed_at());
+        let operation = operation(self.operation_deadline, self.cancellation.child_token())?;
+        let operation_deadline = operation.deadline();
+        let operation_cancellation = operation.cancellation();
         let slot = match self.sender.clone().try_reserve_owned() {
             Ok(slot) => slot,
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -231,6 +279,8 @@ impl ExecutionDispatcherHandle {
             approval,
             audit,
             context,
+            operation_deadline,
+            operation_cancellation,
             _bytes: bytes,
         }));
         Ok(())
@@ -247,6 +297,8 @@ struct DispatchCommand {
     approval: ApprovedOrder,
     audit: ExecutionAuditPermit,
     context: ExecutionAuditContext,
+    operation_deadline: tokio::time::Instant,
+    operation_cancellation: CancellationToken,
     _bytes: OwnedSemaphorePermit,
 }
 
@@ -254,6 +306,81 @@ struct DispatchCommand {
 struct DispatchRegistry {
     entries: HashMap<ApprovalId, DispatchRecord>,
     maximum_entries: usize,
+    pending_reconciliation: Option<PendingReconciliation>,
+    finalized_reconciliations: Vec<ReconciliationBatchBinding>,
+    maximum_finalized_reconciliations: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingReconciliationStatus {
+    Ready,
+    InFlight,
+    BackendAcknowledged,
+}
+
+#[derive(Debug)]
+struct PendingReconciliation {
+    batch: ReconciliationBatchBinding,
+    order_ids: Box<[OrderId]>,
+    state: ExecutionState,
+    status: PendingReconciliationStatus,
+    retained_bytes: usize,
+}
+
+impl PendingReconciliation {
+    fn retained_bytes_for(
+        order_ids: &[OrderId],
+        state: &ExecutionState,
+    ) -> Result<usize, ExecutionDispatchError> {
+        std::mem::size_of::<Self>()
+            .checked_add(std::mem::size_of_val(order_ids))
+            .and_then(|retained| retained.checked_add(state.retained_heap_bytes()?))
+            .ok_or(ExecutionDispatchError::PendingReconciliationCapacity)
+    }
+
+    fn try_new(
+        batch: ReconciliationBatchBinding,
+        order_ids: Box<[OrderId]>,
+        state: ExecutionState,
+    ) -> Result<Self, ExecutionDispatchError> {
+        let retained_bytes = Self::retained_bytes_for(&order_ids, &state)?;
+        Ok(Self {
+            batch,
+            order_ids,
+            state,
+            status: PendingReconciliationStatus::Ready,
+            retained_bytes,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct PersistenceFinalization {
+    registry: Arc<Mutex<DispatchRegistry>>,
+}
+
+impl PersistenceFinalization {
+    pub(crate) fn commit(
+        self,
+        persisted: &[ReconciliationBatchBinding],
+    ) -> Result<(), ExecutionAdapterError> {
+        let mut registry = self
+            .registry
+            .try_lock()
+            .map_err(|_| ExecutionAdapterError::NotAttemptedBusy)?;
+        if persisted.iter().any(|binding| {
+            !registry
+                .finalized_reconciliations
+                .iter()
+                .any(|candidate| candidate == binding)
+        }) {
+            return Err(ExecutionAdapterError::KnownFailure);
+        }
+        registry
+            .finalized_reconciliations
+            .retain(|binding| !persisted.iter().any(|candidate| candidate == binding));
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -348,6 +475,19 @@ fn retained_dispatcher_bytes(
                     .checked_mul(std::mem::size_of::<DispatchRecord>())?,
             )
         })
+        .and_then(|value| {
+            value.checked_add(
+                usize::try_from(config.maximum_pending_reconciliation_bytes.get()).ok()?,
+            )
+        })
+        .and_then(|value| {
+            value.checked_add(
+                config
+                    .maximum_registry_entries
+                    .get()
+                    .checked_mul(std::mem::size_of::<ReconciliationBatchBinding>())?,
+            )
+        })
         .ok_or(ExecutionDispatcherError::RetainedSizeOverflow)
 }
 
@@ -386,6 +526,12 @@ pub enum ExecutionDispatchError {
     ReceiptMismatch,
     #[error("authoritative account replacement was rejected")]
     AccountReplacementRejected,
+    #[error("a reconciliation acknowledgement remains pending")]
+    ReconciliationAcknowledgementPending,
+    #[error("pending reconciliation retained-state capacity is exhausted")]
+    PendingReconciliationCapacity,
+    #[error("execution operation exceeded its monotonic deadline")]
+    OperationDeadlineExceeded,
     #[error(transparent)]
     Adapter(ExecutionAdapterError),
 }
@@ -407,10 +553,21 @@ pub enum ExecutionDispatcherError {
     RetainedSizeOverflow,
 }
 
+fn operation(
+    deadline: Duration,
+    cancellation: CancellationToken,
+) -> Result<ExecutionOperation, ExecutionDispatchError> {
+    let deadline = tokio::time::Instant::now()
+        .checked_add(deadline)
+        .ok_or(ExecutionDispatchError::OperationDeadlineExceeded)?;
+    Ok(ExecutionOperation::new(deadline, cancellation))
+}
+
 /// Bounded worker shutdown outcome.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExecutionDispatcherShutdown {
     Complete,
     JoinError,
     DeadlineAborted,
+    Incomplete,
 }

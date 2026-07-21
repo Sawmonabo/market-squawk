@@ -19,12 +19,14 @@ pub use account::{
     AccountRiskCoordinator, AccountRiskReservation,
 };
 pub use adapter::{
-    ACCOUNT_REPLACEMENT_SCHEMA_VERSION, CancelReceipt, CancelStatus, DispatchOrder,
+    ACCOUNT_REPLACEMENT_SCHEMA_VERSION, CancelOrder, CancelReceipt, CancelStatus, DispatchOrder,
     ExecutionAdapter, ExecutionAdapterError, ExecutionAdapterFuture, ExecutionMarketSink,
-    ExecutionMarketSinkError, ExecutionMarketUpdate, ExecutionReceipt, ExecutionState,
-    ExecutionStateError, ExecutionStateSourceBinding, MAX_RECONCILED_ACCOUNTS,
-    MAX_RECONCILED_ORDERS, MAX_RECONCILED_POSITIONS_PER_ACCOUNT, ReconciledAccountState,
-    ReconciledAccountStateError, ReconciledOrder, ReconciledOrderStatus,
+    ExecutionMarketSinkError, ExecutionMarketUpdate, ExecutionOperation, ExecutionReceipt,
+    ExecutionState, ExecutionStateError, ExecutionStateSourceBinding, MAX_RECONCILED_ACCOUNTS,
+    MAX_RECONCILED_ORDERS, MAX_RECONCILED_POSITIONS_PER_ACCOUNT, PersistenceAcknowledgement,
+    ReconcileOrders, ReconciledAccountState, ReconciledAccountStateError, ReconciledOrder,
+    ReconciledOrderStatus, ReconciliationAcknowledgement, ReconciliationBatchBinding,
+    ReconciliationBatchBindingError, ReconciliationBatchId,
 };
 pub use approval::{
     ApprovedOrder, ExecutionMarketReference, MAX_EXECUTION_MARKET_LEVELS_PER_SIDE,

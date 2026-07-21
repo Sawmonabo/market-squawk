@@ -3,13 +3,14 @@
 use std::mem::size_of;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, TryLockError};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use market_squawk_domain::{OrderId, Timestamp};
+use market_squawk_domain::Timestamp;
 use market_squawk_execution::{
-    CancelReceipt, DispatchOrder, ExecutionAdapter, ExecutionAdapterError, ExecutionAdapterFuture,
-    ExecutionMarketSink, ExecutionMarketSinkError, ExecutionMarketUpdate, ExecutionReceipt,
-    ExecutionState, MAX_RECONCILED_ORDERS,
+    CancelOrder, CancelReceipt, DispatchOrder, ExecutionAdapter, ExecutionAdapterError,
+    ExecutionAdapterFuture, ExecutionMarketSink, ExecutionMarketSinkError, ExecutionMarketUpdate,
+    ExecutionReceipt, ExecutionState, MAX_RECONCILED_ORDERS, PersistenceAcknowledgement,
+    ReconcileOrders, ReconciliationAcknowledgement,
 };
 use thiserror::Error;
 use tokio::runtime::Handle;
@@ -18,11 +19,51 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::audit::{PaperAuditKind, PaperAuditReader, PaperAuditRecord};
-use crate::snapshot::{PaperExecutionCheckpoint, PaperExecutionSnapshot};
+use crate::snapshot::{
+    PaperCheckpointPersistenceEvidence, PaperExecutionCheckpoint, PaperExecutionSnapshot,
+};
 use crate::worker::{PaperWorker, WorkerCommand, WorkerEnvelope, WorkerEvent, WorkerMarketUpdate};
 use crate::{PaperAccountBootstrap, PaperExecutionConfig, PaperLedger};
 
 const SUBMIT_COMMAND_RETAINED_CEILING: usize = 64 * 1024;
+
+/// Caller-owned absolute deadline and cooperative cancellation for paper control operations.
+#[derive(Debug)]
+pub struct PaperControlContext {
+    deadline: tokio::time::Instant,
+    cancellation: CancellationToken,
+}
+
+impl PaperControlContext {
+    /// Creates one bounded control lifetime starting now.
+    pub fn try_new(
+        timeout: Duration,
+        cancellation: CancellationToken,
+    ) -> Result<Self, PaperControlError> {
+        if timeout.is_zero() {
+            return Err(PaperControlError::InvalidDeadline);
+        }
+        let deadline = tokio::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or(PaperControlError::InvalidDeadline)?;
+        Ok(Self {
+            deadline,
+            cancellation,
+        })
+    }
+
+    pub(crate) const fn deadline(&self) -> tokio::time::Instant {
+        self.deadline
+    }
+
+    pub(crate) fn cancellation(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+
+    pub(crate) fn is_expired(&self) -> bool {
+        self.cancellation.is_cancelled() || tokio::time::Instant::now() >= self.deadline
+    }
+}
 
 /// Nonblocking dispatcher-facing paper adapter.
 #[derive(Debug)]
@@ -40,18 +81,58 @@ impl PaperExecutionAdapter {
     }
 
     /// Requests a complete bounded state snapshot outside the live path.
-    pub async fn snapshot(&self) -> Result<PaperExecutionSnapshot, PaperControlError> {
+    pub async fn snapshot(
+        &self,
+        control: PaperControlContext,
+    ) -> Result<PaperExecutionSnapshot, PaperControlError> {
         let (reply, response) = oneshot::channel();
-        self.send_control(WorkerCommand::Snapshot { reply }).await?;
-        response.await.map_err(|_| PaperControlError::Closed)
+        let deadline = control.deadline();
+        let cancellation = control.cancellation();
+        self.send_control(
+            WorkerCommand::Snapshot { control, reply },
+            deadline,
+            &cancellation,
+        )
+        .await?;
+        control_response(response, deadline, cancellation).await
     }
 
     /// Exports a strict complete recovery checkpoint without performing filesystem I/O.
-    pub async fn checkpoint(&self) -> Result<PaperExecutionCheckpoint, PaperControlError> {
+    pub async fn checkpoint(
+        &self,
+        control: PaperControlContext,
+    ) -> Result<PaperExecutionCheckpoint, PaperControlError> {
         let (reply, response) = oneshot::channel();
-        self.send_control(WorkerCommand::Checkpoint { reply })
-            .await?;
-        response.await.map_err(|_| PaperControlError::Closed)
+        let deadline = control.deadline();
+        let cancellation = control.cancellation();
+        self.send_control(
+            WorkerCommand::Checkpoint { control, reply },
+            deadline,
+            &cancellation,
+        )
+        .await?;
+        control_response(response, deadline, cancellation).await
+    }
+
+    /// Advances the durable checkpoint fence only with dispatcher-minted one-use authority.
+    pub async fn acknowledge_persistence(
+        &self,
+        authority: PersistenceAcknowledgement,
+        evidence: PaperCheckpointPersistenceEvidence,
+    ) -> Result<(), PaperControlError> {
+        let deadline = authority.operation().deadline();
+        let (reply, response) = oneshot::channel();
+        self.try_send_command(WorkerCommand::AcknowledgePersistence {
+            authority,
+            evidence,
+            reply,
+        })
+        .map_err(PaperControlError::Adapter)?;
+        match tokio::time::timeout_at(deadline, response).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(PaperControlError::Closed),
+            Err(_) => Err(PaperControlError::DeadlineExceeded),
+        }
     }
 
     fn try_send_command(&self, command: WorkerCommand) -> Result<(), ExecutionAdapterError> {
@@ -78,16 +159,30 @@ impl PaperExecutionAdapter {
         })
     }
 
-    async fn send_control(&self, command: WorkerCommand) -> Result<(), PaperControlError> {
-        let slot = Arc::clone(&self.command_slots)
-            .acquire_owned()
-            .await
-            .map_err(|_| PaperControlError::Closed)?;
+    async fn send_control(
+        &self,
+        command: WorkerCommand,
+        deadline: tokio::time::Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(), PaperControlError> {
+        let slot = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return Err(PaperControlError::Cancelled),
+            result = tokio::time::timeout_at(deadline, Arc::clone(&self.command_slots).acquire_owned()) => {
+                match result {
+                    Ok(Ok(slot)) => slot,
+                    Ok(Err(_)) => return Err(PaperControlError::Closed),
+                    Err(_) => return Err(PaperControlError::DeadlineExceeded),
+                }
+            }
+        };
         send_control_event(
             &self.events,
             &self.event_sequence,
             WorkerEvent::Command(command),
             slot,
+            deadline,
+            cancellation,
         )
         .await
     }
@@ -111,7 +206,7 @@ impl ExecutionAdapter for PaperExecutionAdapter {
 
     fn cancel(
         &self,
-        order_id: &OrderId,
+        order: CancelOrder,
     ) -> ExecutionAdapterFuture<'_, Result<CancelReceipt, ExecutionAdapterError>> {
         let requested_at = match system_timestamp() {
             Ok(timestamp) => timestamp,
@@ -119,7 +214,7 @@ impl ExecutionAdapter for PaperExecutionAdapter {
         };
         let (reply, response) = oneshot::channel();
         match self.try_send_command(WorkerCommand::Cancel {
-            order_id: *order_id,
+            order,
             requested_at,
             reply,
         }) {
@@ -132,26 +227,39 @@ impl ExecutionAdapter for PaperExecutionAdapter {
         }
     }
 
-    fn reconcile<'adapter>(
-        &'adapter self,
-        order_ids: &'adapter [OrderId],
-    ) -> ExecutionAdapterFuture<'adapter, Result<ExecutionState, ExecutionAdapterError>> {
-        if order_ids.len() > MAX_RECONCILED_ORDERS {
+    fn reconcile(
+        &self,
+        request: ReconcileOrders,
+    ) -> ExecutionAdapterFuture<'_, Result<ExecutionState, ExecutionAdapterError>> {
+        if request.order_ids().len() > MAX_RECONCILED_ORDERS {
             return Box::pin(async { Err(ExecutionAdapterError::KnownFailure) });
         }
         let requested_at = match system_timestamp() {
             Ok(timestamp) => timestamp,
             Err(error) => return Box::pin(async move { Err(error) }),
         };
-        let mut requested = Vec::new();
-        if requested.try_reserve_exact(order_ids.len()).is_err() {
-            return Box::pin(async { Err(ExecutionAdapterError::KnownFailure) });
-        }
-        requested.extend_from_slice(order_ids);
         let (reply, response) = oneshot::channel();
         match self.try_send_command(WorkerCommand::Reconcile {
             requested_at,
-            order_ids: requested,
+            request,
+            reply,
+        }) {
+            Ok(()) => Box::pin(async move {
+                response
+                    .await
+                    .unwrap_or(Err(ExecutionAdapterError::ReconciliationRequired))
+            }),
+            Err(error) => Box::pin(async move { Err(error) }),
+        }
+    }
+
+    fn acknowledge_reconciliation(
+        &self,
+        acknowledgement: ReconciliationAcknowledgement,
+    ) -> ExecutionAdapterFuture<'_, Result<(), ExecutionAdapterError>> {
+        let (reply, response) = oneshot::channel();
+        match self.try_send_command(WorkerCommand::AcknowledgeReconciliation {
+            acknowledgement,
             reply,
         }) {
             Ok(()) => Box::pin(async move {
@@ -212,6 +320,7 @@ pub struct PaperExecutionRuntime {
     audit_reader: Option<PaperAuditReader>,
     cancellation: CancellationToken,
     worker: Option<JoinHandle<()>>,
+    abort_join_deadline: Duration,
 }
 
 impl PaperExecutionRuntime {
@@ -234,6 +343,21 @@ impl PaperExecutionRuntime {
             || !checkpoint.complete
             || checkpoint.orders.len() > config.input().maximum_orders.get()
             || checkpoint.fills.len() > config.input().maximum_fills.get()
+            || checkpoint.archived_orders.len() > config.input().maximum_archived_orders.get()
+            || checkpoint.archived_fills.len()
+                > config
+                    .input()
+                    .maximum_archived_orders
+                    .get()
+                    .checked_mul(config.input().maximum_fills.get())
+                    .ok_or(PaperStartError::CapacityOverflow)?
+            || checkpoint.acknowledged_reconciliation_batches.len()
+                > config
+                    .input()
+                    .maximum_orders
+                    .get()
+                    .checked_add(config.input().maximum_archived_orders.get())
+                    .ok_or(PaperStartError::CapacityOverflow)?
             || checkpoint.idempotency.len() > config.input().maximum_idempotency_keys.get()
         {
             return Err(PaperStartError::InvalidCheckpoint);
@@ -249,6 +373,7 @@ impl PaperExecutionRuntime {
     ) -> Result<Self, PaperStartError> {
         let handle = Handle::try_current().map_err(|_| PaperStartError::NoRuntime)?;
         let input = config.input().clone();
+        let abort_join_deadline = input.abort_join_deadline;
         let command_capacity = byte_limited_capacity(
             input.command_capacity.get(),
             input.command_maximum_bytes.get() as usize,
@@ -314,6 +439,7 @@ impl PaperExecutionRuntime {
             audit_reader: Some(PaperAuditReader::new(audit_rx, audit_failed)),
             cancellation,
             worker: Some(join),
+            abort_join_deadline,
         })
     }
 
@@ -331,16 +457,49 @@ impl PaperExecutionRuntime {
     }
 
     /// Requests deterministic shutdown, returns the final state, and reaps the writer.
-    pub async fn shutdown(mut self) -> Result<PaperExecutionSnapshot, PaperControlError> {
+    pub async fn shutdown(
+        mut self,
+        control: PaperControlContext,
+    ) -> Result<PaperExecutionSnapshot, PaperControlError> {
         let (reply, response) = oneshot::channel();
-        self.adapter
-            .send_control(WorkerCommand::Shutdown { reply })
-            .await?;
-        let snapshot = response.await.map_err(|_| PaperControlError::Closed)?;
-        if let Some(worker) = self.worker.take() {
-            worker.await.map_err(|_| PaperControlError::WorkerFailed)?;
+        let deadline = control.deadline();
+        let cancellation = control.cancellation();
+        let sent = self
+            .adapter
+            .send_control(
+                WorkerCommand::Shutdown { control, reply },
+                deadline,
+                &cancellation,
+            )
+            .await;
+        let snapshot = match sent {
+            Ok(()) => control_response(response, deadline, cancellation).await,
+            Err(error) => Err(error),
+        };
+        let Some(mut worker) = self.worker.take() else {
+            return Err(PaperControlError::WorkerFailed);
+        };
+        match snapshot {
+            Ok(snapshot) => {
+                match tokio::time::timeout(self.abort_join_deadline, &mut worker).await {
+                    Ok(Ok(())) => Ok(snapshot),
+                    Ok(Err(_)) => Err(PaperControlError::WorkerFailed),
+                    Err(_) => {
+                        worker.abort();
+                        let _ = tokio::time::timeout(self.abort_join_deadline, &mut worker).await;
+                        Err(PaperControlError::ShutdownIncomplete)
+                    }
+                }
+            }
+            Err(error) => {
+                self.cancellation.cancel();
+                worker.abort();
+                match tokio::time::timeout(self.abort_join_deadline, &mut worker).await {
+                    Ok(_) => Err(error),
+                    Err(_) => Err(PaperControlError::ShutdownIncomplete),
+                }
+            }
         }
-        Ok(snapshot)
     }
 }
 
@@ -449,14 +608,41 @@ async fn send_control_event(
     sequence: &Mutex<u64>,
     event: WorkerEvent,
     slot: OwnedSemaphorePermit,
+    deadline: tokio::time::Instant,
+    cancellation: &CancellationToken,
 ) -> Result<(), PaperControlError> {
     let mut event = Some(event);
     let mut slot = Some(slot);
     loop {
         match try_send_control_once(events, sequence, &mut event, &mut slot) {
             ControlEnqueueOutcome::Sent => return Ok(()),
-            ControlEnqueueOutcome::Retry => tokio::task::yield_now().await,
+            ControlEnqueueOutcome::Retry => {
+                tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => return Err(PaperControlError::Cancelled),
+                    () = tokio::time::sleep_until(deadline) => {
+                        return Err(PaperControlError::DeadlineExceeded);
+                    }
+                    () = tokio::task::yield_now() => {}
+                }
+            }
             ControlEnqueueOutcome::Closed => return Err(PaperControlError::Closed),
+        }
+    }
+}
+
+async fn control_response<T>(
+    response: oneshot::Receiver<Result<T, PaperControlError>>,
+    deadline: tokio::time::Instant,
+    cancellation: CancellationToken,
+) -> Result<T, PaperControlError> {
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => Err(PaperControlError::Cancelled),
+        result = tokio::time::timeout_at(deadline, response) => match result {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(PaperControlError::Closed),
+            Err(_) => Err(PaperControlError::DeadlineExceeded),
         }
     }
 }
@@ -549,8 +735,18 @@ pub enum PaperStartError {
 /// Out-of-band lifecycle control failure.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum PaperControlError {
+    #[error("paper control deadline is invalid")]
+    InvalidDeadline,
+    #[error("paper control operation was cancelled")]
+    Cancelled,
+    #[error("paper control operation exceeded its deadline")]
+    DeadlineExceeded,
     #[error("paper execution worker is closed")]
     Closed,
     #[error("paper execution worker failed while being reaped")]
     WorkerFailed,
+    #[error("paper execution worker could not be reaped within the abort deadline")]
+    ShutdownIncomplete,
+    #[error(transparent)]
+    Adapter(ExecutionAdapterError),
 }

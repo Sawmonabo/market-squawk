@@ -195,7 +195,7 @@ const fn is_terminal(status: ReconciledOrderStatus) -> bool {
     )
 }
 
-fn reconciliation_digest(
+pub(super) fn reconciliation_digest(
     state: &ExecutionState,
     records: &[ReconciliationRecordBinding],
     invoked_at: Timestamp,
@@ -250,11 +250,17 @@ fn reconciliation_digest(
         digest_money(&mut digest, account.capital());
         digest_money(&mut digest, account.peak_capital());
         digest_money(&mut digest, account.gross_exposure());
+        digest_money(&mut digest, account.realized_pnl());
         digest_money(&mut digest, account.realized_loss());
         digest.update((account.positions().len() as u64).to_be_bytes());
         for (instrument_id, lots) in account.positions() {
             digest.update(instrument_id.as_uuid().as_bytes());
             digest.update(lots.to_be_bytes());
+        }
+        digest.update((account.position_cost_basis().len() as u64).to_be_bytes());
+        for (instrument_id, basis) in account.position_cost_basis() {
+            digest.update(instrument_id.as_uuid().as_bytes());
+            digest_money(&mut digest, *basis);
         }
     }
     digest.finalize().into()

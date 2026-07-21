@@ -122,8 +122,10 @@ struct PreparedAccountState {
     capital: market_squawk_domain::Money,
     peak_capital: market_squawk_domain::Money,
     gross_exposure: market_squawk_domain::Money,
+    realized_pnl: market_squawk_domain::Money,
     realized_loss: market_squawk_domain::Money,
     positions: HashMap<market_squawk_domain::InstrumentId, i64>,
+    position_cost_basis: HashMap<market_squawk_domain::InstrumentId, market_squawk_domain::Money>,
 }
 
 impl AccountRiskCoordinator {
@@ -211,8 +213,10 @@ impl AccountRiskCoordinator {
             current.capital = replacement.capital;
             current.peak_capital = replacement.peak_capital;
             current.gross_exposure = replacement.gross_exposure;
+            current.realized_pnl = replacement.realized_pnl;
             current.realized_loss = replacement.realized_loss;
             current.positions = replacement.positions;
+            current.position_cost_basis = replacement.position_cost_basis;
             current.account_revision = Arc::new(AtomicU64::new(replacement.revision));
             current.reconciliation_required = Arc::new(AtomicBool::new(false));
             current.last_reconciliation = Some(source);
@@ -295,6 +299,15 @@ fn prepare_candidate(
             return Err(AccountReplacementError::InvalidAccountClosure);
         }
     }
+    let mut position_cost_basis = HashMap::new();
+    position_cost_basis
+        .try_reserve(candidate.state.position_cost_basis().len())
+        .map_err(|_| AccountReplacementError::Allocation)?;
+    for (instrument_id, basis) in candidate.state.position_cost_basis() {
+        if position_cost_basis.insert(*instrument_id, *basis).is_some() {
+            return Err(AccountReplacementError::InvalidAccountClosure);
+        }
+    }
     Ok(PreparedAccountState {
         account_id: candidate.account_id(),
         revision: candidate.state.revision().get(),
@@ -303,8 +316,10 @@ fn prepare_candidate(
         capital: candidate.state.capital(),
         peak_capital: candidate.state.peak_capital(),
         gross_exposure: candidate.state.gross_exposure(),
+        realized_pnl: candidate.state.realized_pnl(),
         realized_loss: candidate.state.realized_loss(),
         positions,
+        position_cost_basis,
     })
 }
 

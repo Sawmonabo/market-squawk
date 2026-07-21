@@ -48,6 +48,62 @@ impl ExecutionMarketSink for PaperMarketProbe {
 }
 
 #[derive(Debug)]
+struct LostAcknowledgementAdapter {
+    inner: Arc<market_squawk_adapter_paper::PaperExecutionAdapter>,
+    acknowledgement_calls: AtomicUsize,
+    acknowledgement_bindings: Mutex<Vec<([u8; 32], [u8; 32])>>,
+}
+
+impl ExecutionAdapter for LostAcknowledgementAdapter {
+    fn submit(
+        &self,
+        order: DispatchOrder,
+    ) -> ExecutionAdapterFuture<'_, Result<ExecutionReceipt, ExecutionAdapterError>> {
+        self.inner.submit(order)
+    }
+
+    fn cancel(
+        &self,
+        order: CancelOrder,
+    ) -> ExecutionAdapterFuture<'_, Result<CancelReceipt, ExecutionAdapterError>> {
+        self.inner.cancel(order)
+    }
+
+    fn reconcile(
+        &self,
+        request: ReconcileOrders,
+    ) -> ExecutionAdapterFuture<'_, Result<ExecutionState, ExecutionAdapterError>> {
+        self.inner.reconcile(request)
+    }
+
+    fn acknowledge_reconciliation(
+        &self,
+        acknowledgement: ReconciliationAcknowledgement,
+    ) -> ExecutionAdapterFuture<'_, Result<(), ExecutionAdapterError>> {
+        let invocation = self.acknowledgement_calls.fetch_add(1, Ordering::AcqRel);
+        let binding = (
+            *acknowledgement.batch_id().as_bytes(),
+            acknowledgement.binding_digest(),
+        );
+        let recorded = self
+            .acknowledgement_bindings
+            .try_lock()
+            .map(|mut bindings| bindings.push(binding))
+            .map_err(|_| ExecutionAdapterError::KnownFailure);
+        let acknowledged = self.inner.acknowledge_reconciliation(acknowledgement);
+        Box::pin(async move {
+            recorded?;
+            acknowledged.await?;
+            if invocation == 1 {
+                Err(ExecutionAdapterError::UncertainOutcome)
+            } else {
+                Ok(())
+            }
+        })
+    }
+}
+
+#[derive(Debug)]
 pub(super) struct PaperScenarioStrategy {
     account_id: AccountId,
     strategy_id: StrategyId,
@@ -186,9 +242,14 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
             cash: Money::new(Decimal::new(10_000, 0), usd),
             capital: Money::new(Decimal::new(10_500, 0), usd),
             peak_capital: Money::new(Decimal::new(10_500, 0), usd),
-            gross_exposure: Money::new(Decimal::new(50_000, 0), usd),
+            gross_exposure: Money::new(Decimal::new(500, 0), usd),
+            realized_pnl: Money::new(Decimal::ZERO, usd),
             realized_loss: Money::new(Decimal::ZERO, usd),
             positions: vec![(terms.instrument_id(), 500)],
+            position_cost_basis: vec![(
+                terms.instrument_id(),
+                Money::new(Decimal::new(500, 0), usd),
+            )],
             idempotency: AccountIdempotencyBootstrap::empty(),
         }],
     )?);
@@ -219,7 +280,7 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
     let fees = FeeSchedule::try_new(
         0,
         10,
-        Money::new(Decimal::ZERO, usd),
+        Money::new(Decimal::new(2, 2), usd),
         Some(Money::new(Decimal::new(100, 0), usd)),
         2,
     )?;
@@ -246,9 +307,10 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
         market_maximum_bytes: NonZeroU32::new(512 * 1024).ok_or("zero market bytes")?,
         audit_capacity: NonZeroUsize::new(64).ok_or("zero paper audit capacity")?,
         audit_maximum_bytes: NonZeroU32::new(2 * 1024 * 1024).ok_or("zero paper audit bytes")?,
-        maximum_orders: NonZeroUsize::new(8).ok_or("zero maximum orders")?,
-        maximum_fills: NonZeroUsize::new(16).ok_or("zero maximum fills")?,
-        maximum_idempotency_keys: NonZeroUsize::new(8).ok_or("zero idempotency")?,
+        maximum_orders: NonZeroUsize::new(5).ok_or("zero maximum orders")?,
+        maximum_fills: NonZeroUsize::new(4).ok_or("zero maximum fills")?,
+        maximum_idempotency_keys: NonZeroUsize::new(5).ok_or("zero idempotency")?,
+        maximum_archived_orders: NonZeroUsize::new(8).ok_or("zero archived orders")?,
         minimum_latency_nanos: 0,
         maximum_latency_nanos: 0,
         cancel_latency_nanos: 1_000_000,
@@ -260,6 +322,8 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
         ledger_maximum_balances: NonZeroUsize::MIN,
         ledger_maximum_positions: NonZeroUsize::MIN,
         allow_short: false,
+        exposure_valuation: PaperExposureValuation::OpenCost,
+        abort_join_deadline: Duration::from_secs(1),
         fee_schedule: fees,
     })?;
     let mut paper = PaperExecutionRuntime::try_start(
@@ -271,9 +335,14 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
             cash: vec![Money::new(Decimal::new(10_000, 0), usd)],
             capital: Money::new(Decimal::new(10_500, 0), usd),
             peak_capital: Money::new(Decimal::new(10_500, 0), usd),
-            gross_exposure: Money::new(Decimal::new(50_000, 0), usd),
+            gross_exposure: Money::new(Decimal::new(500, 0), usd),
+            realized_pnl: Money::new(Decimal::ZERO, usd),
             realized_loss: Money::new(Decimal::ZERO, usd),
             positions: vec![(terms.instrument_id(), 500)],
+            position_cost_basis: vec![(
+                terms.instrument_id(),
+                Money::new(Decimal::new(500, 0), usd),
+            )],
         }],
     )?;
     let mut paper_audit = paper
@@ -287,19 +356,27 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
         records
     });
     let paper_adapter = paper.adapter();
+    let execution_adapter = Arc::new(LostAcknowledgementAdapter {
+        inner: Arc::clone(&paper_adapter),
+        acknowledgement_calls: AtomicUsize::new(0),
+        acknowledgement_bindings: Mutex::new(Vec::new()),
+    });
     let paper_market = Arc::new(PaperMarketProbe {
         sink: paper.market_ingress(),
         published: AtomicUsize::new(0),
         notification: tokio::sync::Notify::new(),
     });
     let dispatcher = ExecutionDispatcher::try_start(
-        Arc::clone(&paper_adapter) as Arc<dyn ExecutionAdapter>,
+        Arc::clone(&execution_adapter) as Arc<dyn ExecutionAdapter>,
         Arc::clone(&accounts),
         execution_audit.clone(),
         ExecutionDispatcherConfig {
             maximum_queued_commands: NonZeroUsize::new(8).ok_or("zero dispatch queue")?,
             maximum_queued_bytes: NonZeroU32::new(512 * 1024).ok_or("zero dispatch bytes")?,
             maximum_registry_entries: NonZeroUsize::new(8).ok_or("zero registry")?,
+            maximum_pending_reconciliation_bytes: NonZeroU32::new(512 * 1024)
+                .ok_or("zero pending reconciliation bytes")?,
+            operation_deadline: Duration::from_secs(1),
             shutdown_deadline: Duration::from_secs(1),
         },
     )?;
@@ -385,21 +462,63 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
     }
     let cancel = dispatcher.cancel(order_ids[4]).await?;
     assert_eq!(cancel.status(), CancelStatus::Pending);
+    let active_checkpoint = paper_adapter.checkpoint(paper_control()?).await?;
+    let active_checkpoint_bytes = active_checkpoint.encode(1024 * 1024)?;
+    let active_checkpoint_value: serde_json::Value =
+        serde_json::from_slice(&active_checkpoint_bytes)?;
+    let reservations = active_checkpoint_value["ledger"]["reservations"]
+        .as_array()
+        .ok_or("checkpoint reservations are not an array")?;
+    let active_order_id = order_ids[4].to_string();
+    let reservation_index = reservations
+        .iter()
+        .position(|reservation| reservation["order_id"].as_str() == Some(active_order_id.as_str()))
+        .ok_or("active sell reservation missing from checkpoint")?;
+    assert_ne!(
+        reservations[reservation_index]["reserved_cash"],
+        serde_json::to_value(Money::new(Decimal::ZERO, usd))?
+    );
+    for (field, invalid) in [
+        ("side", serde_json::json!("buy")),
+        ("original_quantity", serde_json::json!(1)),
+        ("remaining", serde_json::json!(1)),
+        ("reservation_price", serde_json::json!(1)),
+        (
+            "reserved_cash",
+            serde_json::to_value(Money::new(Decimal::ZERO, usd))?,
+        ),
+        ("reserved_position_lots", serde_json::json!(1)),
+    ] {
+        let mut corrupted = active_checkpoint_value.clone();
+        corrupted["ledger"]["reservations"][reservation_index][field] = invalid;
+        let corrupted = serde_json::to_vec(&corrupted)?;
+        assert!(
+            market_squawk_adapter_paper::PaperExecutionCheckpoint::decode(
+                paper_config.clone(),
+                &corrupted,
+                1024 * 1024,
+            )
+            .is_err(),
+            "corrupted reservation field {field} was accepted"
+        );
+    }
     tokio::time::sleep(Duration::from_millis(2)).await;
     let canceled_before_next_market = dispatcher
         .reconcile()
         .await
         .map_err(|error| std::io::Error::other(format!("cancel reconciliation: {error}")))?;
-    let canceled = canceled_before_next_market
-        .orders()
-        .iter()
-        .find(|order| order.order_id() == order_ids[4])
-        .ok_or("paper cancel probe missing from reconciliation")?;
-    assert_eq!(canceled.status(), ReconciledOrderStatus::Canceled);
+    for canceled_id in [order_ids[2], order_ids[4]] {
+        let canceled = canceled_before_next_market
+            .orders()
+            .iter()
+            .find(|order| order.order_id() == canceled_id)
+            .ok_or("terminal paper cancellation missing from reconciliation")?;
+        assert_eq!(canceled.status(), ReconciledOrderStatus::Canceled);
+    }
     let (_, continuation) = source.batch_with_price("paper-trade-5", 6, "98.00")?;
     ingress.try_publish(continuation)?;
     paper_market.wait_for(6).await?;
-    let barrier_snapshot = paper_adapter.snapshot().await?;
+    let barrier_snapshot = paper_adapter.snapshot(paper_control()?).await?;
     let continued = barrier_snapshot
         .orders()
         .iter()
@@ -409,28 +528,118 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
         continued.state(),
         market_squawk_adapter_paper::PaperOrderState::Filled
     );
-    let dispatcher_reconciled = dispatcher
+    let durable_checkpoint = paper_adapter.checkpoint(paper_control()?).await?;
+    let durable_bytes = durable_checkpoint.encode(1024 * 1024)?;
+    let persistence = durable_checkpoint.persistence_evidence(&durable_bytes)?;
+    let persistence_authority = dispatcher.persistence_acknowledgement()?;
+    paper_adapter
+        .acknowledge_persistence(persistence_authority, persistence)
+        .await?;
+
+    assert!(matches!(
+        dispatcher.reconcile().await,
+        Err(market_squawk_execution::ExecutionDispatchError::Adapter(
+            ExecutionAdapterError::UncertainOutcome
+        ))
+    ));
+    assert!(matches!(
+        dispatcher.persistence_acknowledgement(),
+        Err(market_squawk_execution::ExecutionDispatchError::ReconciliationAcknowledgementPending)
+    ));
+    let archived_while_pending = paper_adapter.snapshot(paper_control()?).await?;
+    assert!(
+        archived_while_pending
+            .archived_orders()
+            .iter()
+            .any(|order| order.order_id() == order_ids[3])
+    );
+    let replay_checkpoint = paper_adapter.checkpoint(paper_control()?).await?;
+    let replay_bytes = replay_checkpoint.encode(1024 * 1024)?;
+    let replay_value: serde_json::Value = serde_json::from_slice(&replay_bytes)?;
+    let replay_fences = replay_value["acknowledged_reconciliation_batches"]
+        .as_array()
+        .ok_or("checkpoint acknowledgement fences are not an array")?;
+    assert_eq!(replay_fences.len(), 1);
+    let restored_replay = market_squawk_adapter_paper::PaperExecutionCheckpoint::decode(
+        paper_config.clone(),
+        &replay_bytes,
+        1024 * 1024,
+    )?;
+    let restored_replay_value: serde_json::Value =
+        serde_json::from_slice(&restored_replay.encode(1024 * 1024)?)?;
+    assert_eq!(
+        restored_replay_value["acknowledged_reconciliation_batches"],
+        replay_value["acknowledged_reconciliation_batches"]
+    );
+    let maximum_replay_fences = paper_config
+        .input()
+        .maximum_orders
+        .get()
+        .checked_add(paper_config.input().maximum_archived_orders.get())
+        .ok_or("acknowledgement replay bound overflowed")?;
+    let mut over_bound = replay_value.clone();
+    over_bound["acknowledged_reconciliation_batches"] =
+        serde_json::Value::Array(vec![replay_fences[0].clone(); maximum_replay_fences + 1]);
+    assert!(
+        market_squawk_adapter_paper::PaperExecutionCheckpoint::decode(
+            paper_config.clone(),
+            &serde_json::to_vec(&over_bound)?,
+            1024 * 1024,
+        )
+        .is_err()
+    );
+
+    let reconciled = dispatcher
         .reconcile()
         .await
-        .map_err(|error| std::io::Error::other(format!("initial fill reconciliation: {error}")))?;
-    assert!(!dispatcher_reconciled.reconciliation_required());
-    let reconciled = paper_adapter.reconcile(&order_ids).await?;
-    let initial_expected = [
-        ReconciledOrderStatus::Filled,
-        ReconciledOrderStatus::Filled,
-        ReconciledOrderStatus::Canceled,
-        ReconciledOrderStatus::Filled,
-        ReconciledOrderStatus::Canceled,
-    ];
-    for (order_id, expected_status) in order_ids.into_iter().zip(initial_expected) {
-        let observed = reconciled
-            .orders()
-            .iter()
-            .find(|order| order.order_id() == order_id)
-            .ok_or("paper order missing from reconciliation")?;
-        assert_eq!(observed.status(), expected_status);
-    }
+        .map_err(|error| std::io::Error::other(format!("acknowledgement retry: {error}")))?;
     assert!(!reconciled.reconciliation_required());
+    let observed = reconciled
+        .orders()
+        .iter()
+        .find(|order| order.order_id() == order_ids[3])
+        .ok_or("paper order missing from retried reconciliation")?;
+    assert_eq!(observed.status(), ReconciledOrderStatus::Filled);
+    assert_eq!(
+        execution_adapter
+            .acknowledgement_calls
+            .load(Ordering::Acquire),
+        3
+    );
+    {
+        let acknowledgement_bindings = execution_adapter
+            .acknowledgement_bindings
+            .lock()
+            .map_err(|_| "paper acknowledgement bindings poisoned")?;
+        assert_eq!(acknowledgement_bindings[1], acknowledgement_bindings[2]);
+    }
+
+    let finalized_checkpoint = paper_adapter.checkpoint(paper_control()?).await?;
+    let finalized_bytes = finalized_checkpoint.encode(1024 * 1024)?;
+    let finalized_value: serde_json::Value = serde_json::from_slice(&finalized_bytes)?;
+    assert_eq!(
+        finalized_value["acknowledged_reconciliation_batches"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+    let persistence = finalized_checkpoint.persistence_evidence(&finalized_bytes)?;
+    let persistence_authority = dispatcher.persistence_acknowledgement()?;
+    paper_adapter
+        .acknowledge_persistence(persistence_authority, persistence)
+        .await?;
+    let pruned_checkpoint = paper_adapter.checkpoint(paper_control()?).await?;
+    let pruned_value: serde_json::Value =
+        serde_json::from_slice(&pruned_checkpoint.encode(1024 * 1024)?)?;
+    assert_eq!(
+        pruned_value["acknowledged_reconciliation_batches"]
+            .as_array()
+            .map(Vec::len),
+        Some(0)
+    );
+    let compacted = paper_adapter.snapshot(paper_control()?).await?;
+    assert!(!compacted.archived_orders().is_empty());
+    assert!(compacted.active_orders().len() < paper_config.input().maximum_orders.get());
     let (_, subsequent) = source.batch_with_price("paper-subsequent-order", 7, "97.00")?;
     ingress.try_publish(subsequent)?;
     accepted_digests.insert(
@@ -440,7 +649,7 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
     let (_, subsequent_fill) = source.batch_with_price("paper-subsequent-fill", 8, "97.00")?;
     ingress.try_publish(subsequent_fill)?;
     paper_market.wait_for(8).await?;
-    let subsequent_barrier = paper_adapter.snapshot().await?;
+    let subsequent_barrier = paper_adapter.snapshot(paper_control()?).await?;
     let subsequent_order = subsequent_barrier
         .orders()
         .iter()
@@ -459,7 +668,7 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
             )))?
             .reconciliation_required()
     );
-    let final_active_snapshot = paper_adapter.snapshot().await?;
+    let final_active_snapshot = paper_adapter.snapshot(paper_control()?).await?;
     assert_eq!(final_active_snapshot.fills().len(), 5);
     let continuation_fills = final_active_snapshot
         .fills()
@@ -496,8 +705,9 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
         .ok_or("Day paper order missing from final snapshot")?;
     assert_eq!(day_order.expires_at(), day_expires_at);
 
-    let checkpoint = paper_adapter.checkpoint().await?;
+    let checkpoint = paper_adapter.checkpoint(paper_control()?).await?;
     assert!(checkpoint.complete());
+    assert_eq!(checkpoint.schema_version(), 4);
     assert!(checkpoint.encode(1).is_err());
     let encoded_checkpoint = checkpoint.encode(1024 * 1024)?;
     let mut incompatible_input = paper_config.input().clone();
@@ -527,7 +737,7 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
         dispatcher.shutdown().await,
         ExecutionDispatcherShutdown::Complete
     );
-    let final_snapshot = paper.shutdown().await?;
+    let final_snapshot = paper.shutdown(paper_control()?).await?;
     let paper_audit_records = paper_audit_task.await?;
     let fill_audits = paper_audit_records
         .iter()
@@ -577,30 +787,18 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
             .checked_add(1)
             .ok_or("sequence overflow")?
     );
-    let recovered_snapshot = recovered_adapter.snapshot().await?;
+    let recovered_snapshot = recovered_adapter.snapshot(paper_control()?).await?;
     assert_eq!(recovered_snapshot.accounts(), final_snapshot.accounts());
     assert_eq!(recovered_snapshot.orders(), final_snapshot.orders());
     assert_eq!(recovered_snapshot.fills(), final_snapshot.fills());
     assert_eq!(recovered_snapshot.cash(), final_snapshot.cash());
     assert_eq!(recovered_snapshot.positions(), final_snapshot.positions());
-    let recovered_state = recovered_adapter.reconcile(&order_ids).await?;
-    let final_expected = [
-        ReconciledOrderStatus::Filled,
-        ReconciledOrderStatus::Filled,
-        ReconciledOrderStatus::Canceled,
-        ReconciledOrderStatus::Filled,
-        ReconciledOrderStatus::Canceled,
-        ReconciledOrderStatus::Filled,
-    ];
-    for (observed, expected_status) in recovered_state.orders().iter().zip(final_expected) {
-        assert_eq!(observed.status(), expected_status);
-    }
     recovered_audit.report_persistence_failure();
-    let failed_snapshot = recovered_adapter.snapshot().await?;
+    let failed_snapshot = recovered_adapter.snapshot(paper_control()?).await?;
     assert!(failed_snapshot.complete());
     assert!(failed_snapshot.reconciliation_required());
-    let reconciliation_checkpoint = recovered_adapter.checkpoint().await?;
-    assert!(recovered.shutdown().await?.complete());
+    let reconciliation_checkpoint = recovered_adapter.checkpoint(paper_control()?).await?;
+    assert!(recovered.shutdown(paper_control()?).await?.complete());
 
     let mut reconciled_recovery =
         PaperExecutionRuntime::try_start_from_checkpoint(paper_config, reconciliation_checkpoint)?;
@@ -629,11 +827,15 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
     );
     assert!(
         reconciled_recovery
-            .shutdown()
+            .shutdown(paper_control()?)
             .await?
             .reconciliation_required()
     );
     Ok(())
+}
+
+fn paper_control() -> Result<PaperControlContext, market_squawk_adapter_paper::PaperControlError> {
+    PaperControlContext::try_new(Duration::from_secs(1), CancellationToken::new())
 }
 
 async fn assert_accepted(

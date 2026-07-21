@@ -13,7 +13,10 @@ use crate::account::AccountSubmissionFailSafe;
 use crate::adapter::dispatch_order_from_approval;
 use crate::audit::{ExecutionAuditContext, ExecutionAuditPermit};
 use crate::clock::system_now;
-use crate::{ExecutionAdapter, ExecutionAdapterError, ExecutionAuditKind, ExecutionAuditReason};
+use crate::{
+    ExecutionAdapter, ExecutionAdapterError, ExecutionAuditKind, ExecutionAuditReason,
+    ExecutionOperation,
+};
 
 #[derive(Debug)]
 struct SubmissionOutcomeFailSafe {
@@ -146,6 +149,8 @@ async fn process_command(
         approval,
         audit,
         context,
+        operation_deadline,
+        operation_cancellation,
         _bytes,
     } = command;
     let now = match system_now() {
@@ -180,6 +185,18 @@ async fn process_command(
     let parts = approval.into_parts();
     let approval_id = parts.approval_id;
     let order_id = parts.intent.order_id();
+    if operation_cancellation.is_cancelled() || tokio::time::Instant::now() >= operation_deadline {
+        parts.reservation.mark_known_not_accepted();
+        mark_terminal(registry, approval_id, now.wall);
+        commit_dispatch_audit(
+            audit,
+            ExecutionAuditKind::DispatchRejected,
+            context,
+            now.wall,
+            &[ExecutionAuditReason::OperationDeadlineExceeded],
+        );
+        return;
+    }
     let fail_safe = match parts.reservation.begin_submission() {
         Ok(guard) => guard,
         Err(_) => {
@@ -256,8 +273,16 @@ async fn process_command(
         parts.policy,
         parts.valid_until,
         now.wall,
+        ExecutionOperation::new(operation_deadline, operation_cancellation.clone()),
     );
-    let result = adapter.submit(dispatch).await;
+    let (result, deadline_exceeded) =
+        match tokio::time::timeout_at(operation_deadline, adapter.submit(dispatch)).await {
+            Ok(result) => (result, false),
+            Err(_) => {
+                operation_cancellation.cancel();
+                (Err(ExecutionAdapterError::UncertainOutcome), true)
+            }
+        };
     let post_call = match system_now() {
         Ok(reading) => reading,
         Err(_) => {
@@ -267,6 +292,14 @@ async fn process_command(
     };
     if post_call.wall < now.wall || post_call.monotonic < now.monotonic {
         outcome.fail_uncertain(now.wall, &[ExecutionAuditReason::ClockFailure]);
+        return;
+    }
+    if operation_cancellation.is_cancelled() || tokio::time::Instant::now() >= operation_deadline {
+        operation_cancellation.cancel();
+        outcome.fail_uncertain(
+            post_call.wall,
+            &[ExecutionAuditReason::OperationDeadlineExceeded],
+        );
         return;
     }
     let mut registry = match try_registry(registry) {
@@ -340,7 +373,14 @@ async fn process_command(
             reservation.mark_reconciliation_required();
             record.state = DispatchState::Reconciliation;
             record.last_transition_at = post_call.wall;
-            outcome.complete_uncertain(post_call.wall, &[adapter_reason(error)]);
+            outcome.complete_uncertain(
+                post_call.wall,
+                &[if deadline_exceeded {
+                    ExecutionAuditReason::OperationDeadlineExceeded
+                } else {
+                    adapter_reason(error)
+                }],
+            );
         }
     }
 }

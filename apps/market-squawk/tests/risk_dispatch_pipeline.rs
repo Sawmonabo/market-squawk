@@ -12,24 +12,27 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use market_squawk_adapter_paper::{
-    FeeSchedule, PaperAccountBootstrap, PaperAuditKind, PaperExecutionConfig,
-    PaperExecutionConfigInput, PaperExecutionRuntime, PaperVenueSession, PaperVenueSessionCalendar,
+    FeeSchedule, PaperAccountBootstrap, PaperAuditKind, PaperControlContext, PaperExecutionConfig,
+    PaperExecutionConfigInput, PaperExecutionRuntime, PaperExposureValuation, PaperVenueSession,
+    PaperVenueSessionCalendar,
 };
 use market_squawk_domain::{
-    AccountId, BasisPoints, ClientOrderId, Currency, DataQuality, Money, OrderId, OrderReasonCode,
-    OrderSide, OrderType, PriceTicks, QuantityLots, RuleVersion, SourceIdentifier, StrategyId,
-    TimeInForce, Timestamp, VenueId,
+    AccountId, BasisPoints, ClientOrderId, Currency, DataQuality, InstrumentId, Money, OrderId,
+    OrderReasonCode, OrderSide, OrderType, PriceTicks, QuantityLots, RuleVersion, SourceIdentifier,
+    StrategyId, TimeInForce, Timestamp, VenueId,
 };
 use market_squawk_execution::{
-    AccountBootstrap, AccountCoordinatorConfig, AccountIdempotencyBootstrap,
-    AccountRiskCoordinator, BoundedOrderIntents, CancelReceipt, CancelStatus, DispatchOrder,
-    ExecutionAdapter, ExecutionAdapterError, ExecutionAdapterFuture, ExecutionAuditConfig,
-    ExecutionAuditEvent, ExecutionAuditKind, ExecutionAuditReader, ExecutionAuditReason,
-    ExecutionAuditWriter, ExecutionDispatcher, ExecutionDispatcherConfig,
-    ExecutionDispatcherShutdown, ExecutionLiveActionHook, ExecutionMarketSink,
-    ExecutionMarketSinkError, ExecutionMarketUpdate, ExecutionReceipt, ExecutionState, OrderIntent,
-    OrderIntentInput, ReconciledOrder, ReconciledOrderStatus, RiskLimits, RiskLimitsInput,
-    RiskPolicyIdentity, RiskService, RiskServiceConfig, Strategy, StrategyContext, StrategyError,
+    ACCOUNT_REPLACEMENT_SCHEMA_VERSION, AccountBootstrap, AccountCoordinatorConfig,
+    AccountIdempotencyBootstrap, AccountRiskCoordinator, BoundedOrderIntents, CancelOrder,
+    CancelReceipt, CancelStatus, DispatchOrder, ExecutionAdapter, ExecutionAdapterError,
+    ExecutionAdapterFuture, ExecutionAuditConfig, ExecutionAuditEvent, ExecutionAuditKind,
+    ExecutionAuditReader, ExecutionAuditReason, ExecutionAuditWriter, ExecutionDispatcher,
+    ExecutionDispatcherConfig, ExecutionDispatcherShutdown, ExecutionLiveActionHook,
+    ExecutionMarketSink, ExecutionMarketSinkError, ExecutionMarketUpdate, ExecutionReceipt,
+    ExecutionState, ExecutionStateSourceBinding, OrderIntent, OrderIntentInput, ReconcileOrders,
+    ReconciledAccountState, ReconciledOrder, ReconciledOrderStatus, ReconciliationAcknowledgement,
+    RiskLimits, RiskLimitsInput, RiskPolicyIdentity, RiskService, RiskServiceConfig, Strategy,
+    StrategyContext, StrategyError,
 };
 use market_squawk_live::{ActionAuthorityIssueLimit, LiveRuntime, RouteActionHook};
 pub(crate) use market_squawk_live::{
@@ -52,11 +55,11 @@ use current_source::{
 
 #[derive(Debug)]
 struct SnapshotStrategy {
-    account_ids: [AccountId; 4],
+    account_ids: [AccountId; 5],
     strategy_id: StrategyId,
     terms: market_squawk_domain::InstrumentExecutionTerms,
-    order_ids: [OrderId; 4],
-    client_ids: [ClientOrderId; 4],
+    order_ids: [OrderId; 5],
+    client_ids: [ClientOrderId; 5],
     reason: OrderReasonCode,
     emitted: usize,
 }
@@ -125,6 +128,15 @@ impl Strategy for SnapshotStrategy {
 struct CountingMarketSink {
     updates: AtomicUsize,
     valid: AtomicBool,
+    notification: tokio::sync::Notify,
+}
+
+impl CountingMarketSink {
+    async fn wait_for(&self, expected: usize) {
+        while self.updates.load(Ordering::Acquire) < expected {
+            self.notification.notified().await;
+        }
+    }
 }
 
 impl ExecutionMarketSink for CountingMarketSink {
@@ -137,6 +149,7 @@ impl ExecutionMarketSink for CountingMarketSink {
             self.valid.store(false, Ordering::Release);
         }
         self.updates.fetch_add(1, Ordering::AcqRel);
+        self.notification.notify_one();
         Ok(())
     }
 
@@ -148,9 +161,15 @@ impl ExecutionMarketSink for CountingMarketSink {
 #[derive(Debug)]
 struct ScriptedAdapter {
     calls: AtomicUsize,
+    cancel_calls: AtomicUsize,
+    reconcile_calls: AtomicUsize,
+    acknowledgement_calls: AtomicUsize,
     evidence_valid: AtomicBool,
-    accepted: Mutex<Option<OrderId>>,
+    accepted: Mutex<Option<(OrderId, AccountId)>>,
+    acknowledgement_bindings: Mutex<Vec<([u8; 32], [u8; 32])>>,
+    submit_started: tokio::sync::Notify,
     usd: Currency,
+    instrument_id: InstrumentId,
 }
 
 impl ExecutionAdapter for ScriptedAdapter {
@@ -174,6 +193,7 @@ impl ExecutionAdapter for ScriptedAdapter {
             self.evidence_valid.store(false, Ordering::Release);
         }
         if invocation >= 3 {
+            self.submit_started.notify_one();
             return Box::pin(std::future::pending());
         }
         let result = if invocation == 0 {
@@ -181,7 +201,7 @@ impl ExecutionAdapter for ScriptedAdapter {
         } else {
             match self.accepted.try_lock() {
                 Ok(mut accepted) => {
-                    *accepted = Some(order.order_id());
+                    *accepted = Some((order.order_id(), order.account_id()));
                     Ok(ExecutionReceipt::new(
                         order.order_id(),
                         order.submitted_at(),
@@ -195,11 +215,14 @@ impl ExecutionAdapter for ScriptedAdapter {
 
     fn cancel(
         &self,
-        order_id: &OrderId,
+        order: CancelOrder,
     ) -> ExecutionAdapterFuture<'_, Result<CancelReceipt, ExecutionAdapterError>> {
+        if self.cancel_calls.fetch_add(1, Ordering::AcqRel) != 0 {
+            return Box::pin(std::future::pending());
+        }
         let result = current_timestamp().and_then(|observed_at| {
             CancelReceipt::try_new(
-                *order_id,
+                order.order_id(),
                 CancelStatus::Canceled,
                 observed_at,
                 QuantityLots::new(1).unwrap_or_else(|error| panic!("valid partial fill: {error}")),
@@ -211,15 +234,21 @@ impl ExecutionAdapter for ScriptedAdapter {
         Box::pin(async move { result })
     }
 
-    fn reconcile<'adapter>(
-        &'adapter self,
-        order_ids: &'adapter [OrderId],
-    ) -> ExecutionAdapterFuture<'adapter, Result<ExecutionState, ExecutionAdapterError>> {
+    fn reconcile(
+        &self,
+        request: ReconcileOrders,
+    ) -> ExecutionAdapterFuture<'_, Result<ExecutionState, ExecutionAdapterError>> {
+        let invocation = self.reconcile_calls.fetch_add(1, Ordering::AcqRel);
+        if invocation >= 2 {
+            return Box::pin(std::future::pending());
+        }
         let accepted = self.accepted.try_lock().ok().and_then(|accepted| *accepted);
         let result = match accepted {
-            Some(order_id) if order_ids == [order_id] => {
-                current_timestamp().and_then(|observed_at| {
-                    ReconciledOrder::try_new(
+            Some((order_id, account_id)) if request.order_ids() == [order_id] => {
+                (|| -> Result<ExecutionState, ExecutionAdapterError> {
+                    let observed_at =
+                        current_timestamp().map_err(|_| ExecutionAdapterError::KnownFailure)?;
+                    let order = ReconciledOrder::try_new(
                         order_id,
                         ReconciledOrderStatus::Filled,
                         QuantityLots::new(2)
@@ -227,13 +256,81 @@ impl ExecutionAdapter for ScriptedAdapter {
                         Some(PriceTicks::new(10_000)),
                         Money::new(Decimal::new(2, 2), self.usd),
                     )
-                    .and_then(|order| ExecutionState::try_new(observed_at, vec![order], false))
-                    .map_err(|_| ExecutionAdapterError::KnownFailure)
-                })
+                    .map_err(|_| ExecutionAdapterError::KnownFailure)?;
+                    let position_count = if invocation == 0 { 1 } else { 128 };
+                    let mut positions = Vec::with_capacity(position_count);
+                    let mut position_cost_basis = Vec::with_capacity(position_count);
+                    for index in 1..=position_count {
+                        let instrument_id = if index == 1 {
+                            self.instrument_id
+                        } else {
+                            InstrumentId::from_str(&format!("10000000-0000-0000-0001-{index:012}"))
+                                .map_err(|_| ExecutionAdapterError::KnownFailure)?
+                        };
+                        positions.push((instrument_id, 0));
+                        position_cost_basis
+                            .push((instrument_id, Money::new(Decimal::ZERO, self.usd)));
+                    }
+                    let account = ReconciledAccountState::try_new(
+                        account_id,
+                        NonZeroU64::new(2).unwrap_or(NonZeroU64::MIN),
+                        true,
+                        self.usd,
+                        Money::new(Decimal::new(10_000, 0), self.usd),
+                        Money::new(Decimal::new(10_000, 0), self.usd),
+                        Money::new(Decimal::new(10_000, 0), self.usd),
+                        Money::new(Decimal::ZERO, self.usd),
+                        Money::new(Decimal::ZERO, self.usd),
+                        Money::new(Decimal::ZERO, self.usd),
+                        positions,
+                        position_cost_basis,
+                    )
+                    .map_err(|_| ExecutionAdapterError::KnownFailure)?;
+                    let source = ExecutionStateSourceBinding::try_new(
+                        ACCOUNT_REPLACEMENT_SCHEMA_VERSION,
+                        [8; 32],
+                        NonZeroU64::MIN,
+                        [9; 32],
+                    )
+                    .map_err(|_| ExecutionAdapterError::KnownFailure)?;
+                    let state = ExecutionState::try_new_complete(
+                        observed_at,
+                        vec![order],
+                        vec![account],
+                        source,
+                        false,
+                    )
+                    .map_err(|_| ExecutionAdapterError::KnownFailure)?;
+                    Ok(state)
+                })()
             }
             _ => Err(ExecutionAdapterError::KnownFailure),
         };
         Box::pin(async move { result })
+    }
+
+    fn acknowledge_reconciliation(
+        &self,
+        acknowledgement: ReconciliationAcknowledgement,
+    ) -> ExecutionAdapterFuture<'_, Result<(), ExecutionAdapterError>> {
+        let invocation = self.acknowledgement_calls.fetch_add(1, Ordering::AcqRel);
+        let binding = (
+            *acknowledgement.batch_id().as_bytes(),
+            acknowledgement.binding_digest(),
+        );
+        let recorded = self
+            .acknowledgement_bindings
+            .try_lock()
+            .map(|mut bindings| bindings.push(binding))
+            .map_err(|_| ExecutionAdapterError::KnownFailure);
+        Box::pin(async move {
+            recorded?;
+            if invocation == 0 {
+                Err(ExecutionAdapterError::NotAttemptedBusy)
+            } else {
+                Ok(())
+            }
+        })
     }
 }
 
@@ -249,7 +346,7 @@ fn current_timestamp() -> Result<Timestamp, ExecutionAdapterError> {
     Ok(Timestamp::from_unix_nanos(nanos))
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn committed_market_risk_and_dispatch_are_one_use_bounded_and_fill_safe() -> TestResult {
     let route_config = route_config(INSTRUMENT_ONE)?;
     let terms = route_config.definition().execution_terms();
@@ -258,6 +355,7 @@ async fn committed_market_risk_and_dispatch_are_one_use_bounded_and_fill_safe() 
     let submitted_shutdown_account_id =
         AccountId::from_str("50000000-0000-0000-0000-000000000002")?;
     let accepted_shutdown_account_id = AccountId::from_str("50000000-0000-0000-0000-000000000003")?;
+    let queued_expired_account_id = AccountId::from_str("50000000-0000-0000-0000-000000000004")?;
     let strategy_id = StrategyId::from_str("30000000-0000-0000-0000-000000000001")?;
     let accounts = Arc::new(AccountRiskCoordinator::try_new(
         AccountCoordinatorConfig::default(),
@@ -265,6 +363,7 @@ async fn committed_market_risk_and_dispatch_are_one_use_bounded_and_fill_safe() 
             account_id,
             submitted_shutdown_account_id,
             accepted_shutdown_account_id,
+            queued_expired_account_id,
         ]
         .map(|account_id| AccountBootstrap {
             account_id,
@@ -274,8 +373,10 @@ async fn committed_market_risk_and_dispatch_are_one_use_bounded_and_fill_safe() 
             capital: Money::new(Decimal::new(10_000, 0), usd),
             peak_capital: Money::new(Decimal::new(10_000, 0), usd),
             gross_exposure: Money::new(Decimal::ZERO, usd),
+            realized_pnl: Money::new(Decimal::ZERO, usd),
             realized_loss: Money::new(Decimal::ZERO, usd),
             positions: vec![(terms.instrument_id(), 0)],
+            position_cost_basis: vec![(terms.instrument_id(), Money::new(Decimal::ZERO, usd))],
             idempotency: AccountIdempotencyBootstrap::empty(),
         }),
     )?);
@@ -305,9 +406,15 @@ async fn committed_market_risk_and_dispatch_are_one_use_bounded_and_fill_safe() 
     })?;
     let adapter = Arc::new(ScriptedAdapter {
         calls: AtomicUsize::new(0),
+        cancel_calls: AtomicUsize::new(0),
+        reconcile_calls: AtomicUsize::new(0),
+        acknowledgement_calls: AtomicUsize::new(0),
         evidence_valid: AtomicBool::new(true),
         accepted: Mutex::new(None),
+        acknowledgement_bindings: Mutex::new(Vec::new()),
+        submit_started: tokio::sync::Notify::new(),
         usd,
+        instrument_id: terms.instrument_id(),
     });
     let dispatcher = ExecutionDispatcher::try_start(
         Arc::clone(&adapter) as Arc<dyn ExecutionAdapter>,
@@ -317,12 +424,16 @@ async fn committed_market_risk_and_dispatch_are_one_use_bounded_and_fill_safe() 
             maximum_queued_commands: NonZeroUsize::MIN,
             maximum_queued_bytes: NonZeroU32::new(64 * 1024).ok_or("zero dispatch bytes")?,
             maximum_registry_entries: NonZeroUsize::new(4).ok_or("zero registry entries")?,
+            maximum_pending_reconciliation_bytes: NonZeroU32::new(4 * 1024)
+                .ok_or("zero pending reconciliation bytes")?,
+            operation_deadline: Duration::from_secs(1),
             shutdown_deadline: Duration::from_millis(10),
         },
     )?;
     let market_sink = Arc::new(CountingMarketSink {
         updates: AtomicUsize::new(0),
         valid: AtomicBool::new(true),
+        notification: tokio::sync::Notify::new(),
     });
     let policy = RiskPolicyIdentity::new(
         &SourceIdentifier::try_from("risk-default")?,
@@ -344,6 +455,7 @@ async fn committed_market_risk_and_dispatch_are_one_use_bounded_and_fill_safe() 
             account_id,
             accepted_shutdown_account_id,
             submitted_shutdown_account_id,
+            queued_expired_account_id,
         ],
         strategy_id,
         terms,
@@ -352,12 +464,14 @@ async fn committed_market_risk_and_dispatch_are_one_use_bounded_and_fill_safe() 
             OrderId::from_str("20000000-0000-0000-0000-000000000002")?,
             OrderId::from_str("20000000-0000-0000-0000-000000000003")?,
             OrderId::from_str("20000000-0000-0000-0000-000000000004")?,
+            OrderId::from_str("20000000-0000-0000-0000-000000000005")?,
         ],
         client_ids: [
             ClientOrderId::try_from("dispatch-1")?,
             ClientOrderId::try_from("dispatch-2")?,
             ClientOrderId::try_from("dispatch-3")?,
             ClientOrderId::try_from("dispatch-4")?,
+            ClientOrderId::try_from("dispatch-5")?,
         ],
         reason: OrderReasonCode::try_from("dispatch.integration")?,
         emitted: 0,
@@ -404,7 +518,7 @@ async fn committed_market_risk_and_dispatch_are_one_use_bounded_and_fill_safe() 
         .accepted
         .try_lock()
         .ok()
-        .and_then(|order| *order)
+        .and_then(|order| order.map(|(order_id, _)| order_id))
         .ok_or("adapter did not retain accepted order")?;
     let canceled = dispatcher.cancel(accepted_order).await?;
     assert_eq!(canceled.cumulative_filled().get(), 1);
@@ -415,8 +529,32 @@ async fn committed_market_risk_and_dispatch_are_one_use_bounded_and_fill_safe() 
             .reasons()
             .any(|reason| reason == ExecutionAuditReason::ReconciliationRequired)
     );
+    assert!(matches!(
+        dispatcher.reconcile().await,
+        Err(market_squawk_execution::ExecutionDispatchError::Adapter(
+            ExecutionAdapterError::NotAttemptedBusy
+        ))
+    ));
+    assert!(matches!(
+        dispatcher.persistence_acknowledgement(),
+        Err(market_squawk_execution::ExecutionDispatchError::ReconciliationAcknowledgementPending)
+    ));
     let state = dispatcher.reconcile().await?;
+    assert_eq!(adapter.reconcile_calls.load(Ordering::Acquire), 1);
+    assert_eq!(adapter.acknowledgement_calls.load(Ordering::Acquire), 2);
+    {
+        let acknowledgement_bindings = adapter
+            .acknowledgement_bindings
+            .lock()
+            .map_err(|_| "acknowledgement bindings poisoned")?;
+        assert_eq!(acknowledgement_bindings.len(), 2);
+        assert_eq!(acknowledgement_bindings[0], acknowledgement_bindings[1]);
+        assert_ne!(acknowledgement_bindings[0].0, [0; 32]);
+        assert_ne!(acknowledgement_bindings[0].1, [0; 32]);
+    }
     assert_eq!(state.orders().len(), 1);
+    assert_eq!(state.accounts().len(), 1);
+    assert_eq!(state.accounts()[0].revision().get(), 2);
     assert_eq!(state.orders()[0].cumulative_filled().get(), 2);
     assert_eq!(
         state.orders()[0].cumulative_fees().amount(),
@@ -428,7 +566,7 @@ async fn committed_market_risk_and_dispatch_are_one_use_bounded_and_fill_safe() 
     )
     .await?;
     assert!(
-        reconciliation
+        !reconciliation
             .reasons()
             .any(|reason| reason == ExecutionAuditReason::ReconciliationRequired)
     );
@@ -441,20 +579,77 @@ async fn committed_market_risk_and_dispatch_are_one_use_bounded_and_fill_safe() 
         accepted_for_shutdown.account_id(),
         accepted_shutdown_account_id
     );
+    assert!(matches!(
+        dispatcher.cancel(accepted_for_shutdown.order_id()).await,
+        Err(market_squawk_execution::ExecutionDispatchError::OperationDeadlineExceeded)
+    ));
+    let _cancel_timeout_audit =
+        wait_for_audit(&mut audit_reader, ExecutionAuditKind::DispatchUncertain).await?;
+    assert!(matches!(
+        dispatcher.reconcile().await,
+        Err(market_squawk_execution::ExecutionDispatchError::PendingReconciliationCapacity)
+    ));
+    assert_eq!(adapter.reconcile_calls.load(Ordering::Acquire), 2);
+    assert_eq!(adapter.acknowledgement_calls.load(Ordering::Acquire), 2);
+    let capacity_audit =
+        wait_for_audit(&mut audit_reader, ExecutionAuditKind::DispatchUncertain).await?;
+    assert!(
+        capacity_audit
+            .reasons()
+            .any(|reason| reason == ExecutionAuditReason::PendingReconciliationCapacity)
+    );
+    assert!(dispatcher.persistence_acknowledgement().is_ok());
+    assert!(matches!(
+        dispatcher.reconcile().await,
+        Err(market_squawk_execution::ExecutionDispatchError::OperationDeadlineExceeded)
+    ));
+    let _reconcile_timeout_audit =
+        wait_for_audit(&mut audit_reader, ExecutionAuditKind::DispatchUncertain).await?;
 
     let (_, fourth) = source.batch("trade-4", 4)?;
     ingress.try_publish(fourth)?;
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while adapter.calls.load(Ordering::Acquire) != 4 {
-            tokio::task::yield_now().await;
+    tokio::time::timeout(Duration::from_secs(1), adapter.submit_started.notified()).await?;
+    assert_eq!(adapter.calls.load(Ordering::Acquire), 4);
+    let fourth_approved =
+        wait_for_audit(&mut audit_reader, ExecutionAuditKind::RiskApproved).await?;
+    assert_eq!(fourth_approved.account_id(), submitted_shutdown_account_id);
+    let (_, fifth) = source.batch("trade-5", 5)?;
+    ingress.try_publish(fifth)?;
+    tokio::time::timeout(Duration::from_secs(1), market_sink.wait_for(5)).await?;
+    let fifth_approved =
+        wait_for_audit(&mut audit_reader, ExecutionAuditKind::RiskApproved).await?;
+    assert_eq!(fifth_approved.account_id(), queued_expired_account_id);
+    tokio::time::advance(Duration::from_secs(2)).await;
+    let dispatch_outcomes = tokio::time::timeout(Duration::from_secs(2), async {
+        let mut outcomes = Vec::new();
+        while outcomes.len() < 2 {
+            while let Some(event) = audit_reader.try_next()? {
+                outcomes.push(event);
+            }
+            if outcomes.len() < 2 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
         }
+        Ok::<_, market_squawk_execution::ExecutionAuditError>(outcomes)
     })
-    .await?;
+    .await??;
+    assert_eq!(dispatch_outcomes.len(), 2);
+    assert!(dispatch_outcomes.iter().any(|event| {
+        event.kind() == ExecutionAuditKind::DispatchUncertain
+            && event.account_id() == submitted_shutdown_account_id
+    }));
+    assert!(dispatch_outcomes.iter().any(|event| {
+        event.kind() == ExecutionAuditKind::DispatchRejected
+            && event.account_id() == queued_expired_account_id
+    }));
+    assert_eq!(adapter.calls.load(Ordering::Acquire), 4);
     assert!(runtime.shutdown().await.is_complete());
     assert_eq!(
         dispatcher.shutdown().await,
-        ExecutionDispatcherShutdown::DeadlineAborted
+        ExecutionDispatcherShutdown::Complete
     );
+    let probe_signal_at = current_timestamp()?;
+    let probe_expires_at = probe_signal_at.checked_add_nanos(30_000_000_000)?;
     for (suffix, account_id) in [
         (5_u8, submitted_shutdown_account_id),
         (6_u8, accepted_shutdown_account_id),
@@ -472,8 +667,8 @@ async fn committed_market_risk_and_dispatch_are_one_use_bounded_and_fill_safe() 
             limit_price: None,
             stop_price: None,
             time_in_force: TimeInForce::ImmediateOrCancel,
-            signal_at: Timestamp::from_unix_nanos(0),
-            expires_at: Timestamp::from_unix_nanos(i64::MAX),
+            signal_at: probe_signal_at,
+            expires_at: probe_expires_at,
             reason_codes: vec![OrderReasonCode::try_from("dispatch.shutdown.probe")?],
             maximum_slippage: BasisPoints::new(100),
             required_quality: DataQuality::DirectVerified,
@@ -488,9 +683,29 @@ async fn committed_market_risk_and_dispatch_are_one_use_bounded_and_fill_safe() 
                 .contains(&market_squawk_execution::AccountRiskViolation::ReconciliationRequired)
         );
     }
+    let queued_probe = OrderIntent::try_new(OrderIntentInput {
+        order_id: OrderId::from_str("20000000-0000-0000-0000-000000000007")?,
+        client_order_id: ClientOrderId::try_from("dispatch-probe-queued")?,
+        strategy_id,
+        model_id: None,
+        account_id: queued_expired_account_id,
+        execution_terms: terms,
+        side: OrderSide::Sell,
+        order_type: OrderType::Market,
+        quantity: QuantityLots::new(1)?,
+        limit_price: None,
+        stop_price: None,
+        time_in_force: TimeInForce::ImmediateOrCancel,
+        signal_at: probe_signal_at,
+        expires_at: probe_expires_at,
+        reason_codes: vec![OrderReasonCode::try_from("dispatch.queued.probe")?],
+        maximum_slippage: BasisPoints::new(100),
+        required_quality: DataQuality::DirectVerified,
+    })?;
+    accounts.assess(&queued_probe, PriceTicks::new(10_000), &limits)?;
     assert_eq!(adapter.calls.load(Ordering::Acquire), 4);
     assert!(adapter.evidence_valid.load(Ordering::Acquire));
-    assert_eq!(market_sink.updates.load(Ordering::Acquire), 4);
+    assert_eq!(market_sink.updates.load(Ordering::Acquire), 5);
     assert!(market_sink.valid.load(Ordering::Acquire));
     Ok(())
 }
@@ -512,7 +727,7 @@ async fn wait_for_audit(
                     event.reasons().collect::<Vec<_>>()
                 ));
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(1)).await;
         }
     })
     .await;

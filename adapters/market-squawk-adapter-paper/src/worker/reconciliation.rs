@@ -14,7 +14,7 @@ use rust_decimal::Decimal;
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
-use super::{PaperWorker, WorkerMarketUpdate};
+use super::{IssuedCheckpoint, PaperWorker, WorkerMarketUpdate};
 use crate::audit::{PaperAuditKind, PaperAuditRecord};
 use crate::order::PaperOrder;
 use crate::slippage::adverse_bound;
@@ -23,7 +23,7 @@ use crate::{PaperExecutionConfig, PaperOrderState};
 
 impl PaperWorker {
     pub(super) fn reconcile(
-        &self,
+        &mut self,
         observed_at: Timestamp,
         order_ids: &[OrderId],
     ) -> Result<ExecutionState, ExecutionAdapterError> {
@@ -37,7 +37,12 @@ impl PaperWorker {
             .try_reserve_exact(order_ids.len())
             .map_err(|_| ExecutionAdapterError::KnownFailure)?;
         for order_id in order_ids {
-            let reconciled = if let Some(order) = self.state.orders.get(order_id) {
+            let reconciled = if let Some(order) = self
+                .state
+                .orders
+                .get(order_id)
+                .or_else(|| self.state.archived_orders.get(order_id))
+            {
                 ReconciledOrder::try_new(
                     *order_id,
                     order.reconciled_status(),
@@ -62,6 +67,7 @@ impl PaperWorker {
                     .state
                     .orders
                     .get(order_id)
+                    .or_else(|| self.state.archived_orders.get(order_id))
                     .map(|order| order.account_id)
                     .ok_or(ExecutionAdapterError::KnownFailure)?;
                 affected_accounts.push(account_id);
@@ -90,7 +96,9 @@ impl PaperWorker {
                     .map_err(|_| ExecutionAdapterError::ReconciliationRequired)?,
             );
         }
-        let checkpoint = self.checkpoint();
+        let checkpoint = self
+            .checkpoint()
+            .map_err(|_| ExecutionAdapterError::KnownFailure)?;
         let snapshot_digest = checkpoint
             .recovery_input_digest()
             .map_err(|_| ExecutionAdapterError::KnownFailure)?;
@@ -120,12 +128,16 @@ impl PaperWorker {
             self.state.reconciliation_required,
             &self.state.orders,
             &self.state.fills,
+            &self.state.archived_orders,
+            &self.state.archived_fills,
             &self.state.ledger,
         )
     }
 
-    pub(super) fn checkpoint(&self) -> PaperExecutionCheckpoint {
-        PaperExecutionCheckpoint {
+    pub(super) fn checkpoint(
+        &mut self,
+    ) -> Result<PaperExecutionCheckpoint, crate::PaperCheckpointError> {
+        let checkpoint = PaperExecutionCheckpoint {
             schema_version: PaperExecutionConfig::CHECKPOINT_SCHEMA_VERSION,
             configuration_digest: self.config.digest(),
             complete: true,
@@ -133,9 +145,29 @@ impl PaperWorker {
             reconciliation_required: self.state.reconciliation_required,
             orders: self.state.orders.clone(),
             fills: self.state.fills.clone(),
+            archived_orders: self.state.archived_orders.clone(),
+            archived_fills: self.state.archived_fills.clone(),
+            durable_sequence: self.state.durable_sequence,
+            reconciled_orders: self.state.reconciled_orders.clone(),
+            acknowledged_reconciliation_batches: self
+                .state
+                .acknowledged_reconciliation_batches
+                .clone(),
             ledger: self.state.ledger.clone(),
             idempotency: self.state.idempotency.clone(),
-        }
+        };
+        self.state.issued_checkpoint = Some(IssuedCheckpoint {
+            evidence: crate::PaperCheckpointPersistenceEvidence {
+                configuration_digest: checkpoint.configuration_digest,
+                sequence: checkpoint.sequence,
+                recovery_digest: checkpoint.recovery_input_digest()?,
+            },
+            acknowledged_reconciliation_batches: checkpoint
+                .acknowledged_reconciliation_batches
+                .clone()
+                .into_boxed_slice(),
+        });
+        Ok(checkpoint)
     }
 
     pub(super) fn next_mutation_sequence(&self) -> Result<u64, ExecutionAdapterError> {

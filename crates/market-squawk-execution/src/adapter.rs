@@ -9,6 +9,8 @@ pub use account_state::{
 
 use std::future::Future;
 use std::pin::Pin;
+use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 use market_squawk_domain::{
     AccountId, AggressorSide, ApprovalId, BasisPoints, ClientOrderId, InstrumentExecutionTerms,
@@ -20,6 +22,7 @@ use market_squawk_live::{CommittedActionContext, ConsumedLiveEvidence};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::dispatcher::PersistenceFinalization;
 use crate::{ExecutionMarketReference, OrderIntent, OrderIntentDigest, RiskPolicyIdentity};
 
 /// Object-safe boxed future returned by execution adapters.
@@ -42,6 +45,7 @@ pub struct DispatchOrder {
     policy: RiskPolicyIdentity,
     valid_until: Timestamp,
     submitted_at: Timestamp,
+    operation: ExecutionOperation,
 }
 
 impl DispatchOrder {
@@ -174,6 +178,11 @@ impl DispatchOrder {
     pub const fn submitted_at(&self) -> Timestamp {
         self.submitted_at
     }
+
+    /// Returns the monotonic deadline and cooperative cancellation signal for this one attempt.
+    pub const fn operation(&self) -> &ExecutionOperation {
+        &self.operation
+    }
 }
 
 #[allow(
@@ -188,6 +197,7 @@ pub(crate) const fn dispatch_order_from_approval(
     policy: RiskPolicyIdentity,
     valid_until: Timestamp,
     submitted_at: Timestamp,
+    operation: ExecutionOperation,
 ) -> DispatchOrder {
     DispatchOrder {
         approval_id,
@@ -197,6 +207,259 @@ pub(crate) const fn dispatch_order_from_approval(
         policy,
         valid_until,
         submitted_at,
+        operation,
+    }
+}
+
+/// Dispatcher-minted monotonic operation lifetime supplied to an execution adapter.
+#[derive(Debug)]
+pub struct ExecutionOperation {
+    deadline: Instant,
+    cancellation: CancellationToken,
+}
+
+impl ExecutionOperation {
+    pub(crate) fn new(deadline: Instant, cancellation: CancellationToken) -> Self {
+        Self {
+            deadline,
+            cancellation,
+        }
+    }
+
+    /// Returns the absolute monotonic deadline.
+    pub const fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
+    /// Returns whether cancellation has already been requested.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation.is_cancelled()
+    }
+
+    /// Waits for cooperative cancellation.
+    pub async fn cancelled(&self) {
+        self.cancellation.cancelled().await;
+    }
+
+    pub(crate) fn cancellation(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+
+    /// Returns whether cancellation or the monotonic deadline already forbids mutation.
+    pub fn is_expired(&self) -> bool {
+        self.is_cancelled() || Instant::now() >= self.deadline
+    }
+}
+
+/// Private-construction cancellation authority for one dispatcher-owned order.
+#[derive(Debug)]
+pub struct CancelOrder {
+    order_id: OrderId,
+    operation: ExecutionOperation,
+}
+
+impl CancelOrder {
+    pub(crate) fn new(order_id: OrderId, operation: ExecutionOperation) -> Self {
+        Self {
+            order_id,
+            operation,
+        }
+    }
+
+    pub const fn order_id(&self) -> OrderId {
+        self.order_id
+    }
+
+    pub const fn operation(&self) -> &ExecutionOperation {
+        &self.operation
+    }
+}
+
+/// Private-construction bounded reconciliation authority.
+#[derive(Debug)]
+pub struct ReconcileOrders {
+    order_ids: Box<[OrderId]>,
+    operation: ExecutionOperation,
+}
+
+impl ReconcileOrders {
+    pub(crate) fn new(order_ids: Box<[OrderId]>, operation: ExecutionOperation) -> Self {
+        Self {
+            order_ids,
+            operation,
+        }
+    }
+
+    pub const fn order_ids(&self) -> &[OrderId] {
+        &self.order_ids
+    }
+
+    pub const fn operation(&self) -> &ExecutionOperation {
+        &self.operation
+    }
+}
+
+/// Private-construction proof that dispatcher-side reconciliation completed successfully.
+#[derive(Debug)]
+pub struct ReconciliationAcknowledgement {
+    batch: ReconciliationBatchBinding,
+    order_ids: Box<[OrderId]>,
+    operation: ExecutionOperation,
+}
+
+impl ReconciliationAcknowledgement {
+    pub(crate) fn new(
+        batch: ReconciliationBatchBinding,
+        order_ids: Box<[OrderId]>,
+        operation: ExecutionOperation,
+    ) -> Self {
+        Self {
+            batch,
+            order_ids,
+            operation,
+        }
+    }
+
+    /// Returns the stable dispatcher-minted idempotency identity for this exact batch.
+    pub const fn batch_id(&self) -> ReconciliationBatchId {
+        self.batch.batch_id
+    }
+
+    /// Returns the digest binding the backend image, orders, accounts, and dispatcher invocation.
+    pub const fn binding_digest(&self) -> [u8; 32] {
+        self.batch.binding_digest
+    }
+
+    pub const fn order_ids(&self) -> &[OrderId] {
+        &self.order_ids
+    }
+
+    pub const fn operation(&self) -> &ExecutionOperation {
+        &self.operation
+    }
+}
+
+/// Opaque nonzero dispatcher-minted reconciliation idempotency identity.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ReconciliationBatchId([u8; 32]);
+
+impl ReconciliationBatchId {
+    /// Restores a bounded persisted identity while rejecting the reserved zero value.
+    pub fn try_from_bytes(bytes: [u8; 32]) -> Result<Self, ReconciliationBatchBindingError> {
+        if bytes == [0; 32] {
+            return Err(ReconciliationBatchBindingError::ZeroIdentity);
+        }
+        Ok(Self(bytes))
+    }
+
+    /// Returns the fixed identity bytes.
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// Exact stable reconciliation identity and immutable state binding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReconciliationBatchBinding {
+    batch_id: ReconciliationBatchId,
+    binding_digest: [u8; 32],
+}
+
+impl ReconciliationBatchBinding {
+    /// Restores and validates one persisted replay-fence binding.
+    pub fn try_new(
+        batch_id: ReconciliationBatchId,
+        binding_digest: [u8; 32],
+    ) -> Result<Self, ReconciliationBatchBindingError> {
+        if binding_digest == [0; 32] {
+            return Err(ReconciliationBatchBindingError::ZeroDigest);
+        }
+        Ok(Self {
+            batch_id,
+            binding_digest,
+        })
+    }
+
+    pub(crate) fn from_dispatcher_digest(
+        binding_digest: [u8; 32],
+    ) -> Result<Self, ReconciliationBatchBindingError> {
+        if binding_digest == [0; 32] {
+            return Err(ReconciliationBatchBindingError::ZeroDigest);
+        }
+        let mut digest = Sha256::new();
+        digest.update(b"market-squawk/reconciliation-batch-id/v1\0");
+        digest.update(binding_digest);
+        let batch_id = ReconciliationBatchId::try_from_bytes(digest.finalize().into())?;
+        Ok(Self {
+            batch_id,
+            binding_digest,
+        })
+    }
+
+    /// Returns the opaque batch identity.
+    pub const fn batch_id(self) -> ReconciliationBatchId {
+        self.batch_id
+    }
+
+    /// Returns the immutable batch binding digest.
+    pub const fn binding_digest(self) -> [u8; 32] {
+        self.binding_digest
+    }
+}
+
+/// Invalid persisted or dispatcher-created reconciliation binding.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum ReconciliationBatchBindingError {
+    #[error("reconciliation batch identity must be nonzero")]
+    ZeroIdentity,
+    #[error("reconciliation batch binding digest must be nonzero")]
+    ZeroDigest,
+}
+
+/// One-use dispatcher-minted authority to acknowledge externally durable checkpoint evidence.
+#[derive(Debug)]
+pub struct PersistenceAcknowledgement {
+    operation: ExecutionOperation,
+    finalized_reconciliations: Box<[ReconciliationBatchBinding]>,
+    finalization: PersistenceFinalization,
+}
+
+impl PersistenceAcknowledgement {
+    pub(crate) fn new(
+        operation: ExecutionOperation,
+        finalized_reconciliations: Box<[ReconciliationBatchBinding]>,
+        finalization: PersistenceFinalization,
+    ) -> Self {
+        Self {
+            operation,
+            finalized_reconciliations,
+            finalization,
+        }
+    }
+
+    pub const fn operation(&self) -> &ExecutionOperation {
+        &self.operation
+    }
+
+    /// Returns exact locally finalized reconciliation batches eligible for persisted-fence prune.
+    pub const fn finalized_reconciliations(&self) -> &[ReconciliationBatchBinding] {
+        &self.finalized_reconciliations
+    }
+
+    /// Commits only the exact finalized proofs covered by durable adapter evidence.
+    pub fn commit_persisted(
+        self,
+        persisted: &[ReconciliationBatchBinding],
+    ) -> Result<(), ExecutionAdapterError> {
+        if persisted.iter().any(|binding| {
+            !self
+                .finalized_reconciliations
+                .iter()
+                .any(|candidate| candidate == binding)
+        }) {
+            return Err(ExecutionAdapterError::KnownFailure);
+        }
+        self.finalization.commit(persisted)
     }
 }
 
@@ -325,15 +588,22 @@ pub trait ExecutionAdapter: Send + Sync + std::fmt::Debug + 'static {
     /// [`ExecutionAdapter::submit`].
     fn cancel(
         &self,
-        order_id: &OrderId,
+        order: CancelOrder,
     ) -> ExecutionAdapterFuture<'_, Result<CancelReceipt, ExecutionAdapterError>>;
 
     /// Returns a bounded current order-state image for only the requested order identities under
     /// the same error guarantees as [`ExecutionAdapter::submit`].
-    fn reconcile<'adapter>(
-        &'adapter self,
-        order_ids: &'adapter [OrderId],
-    ) -> ExecutionAdapterFuture<'adapter, Result<ExecutionState, ExecutionAdapterError>>;
+    fn reconcile(
+        &self,
+        request: ReconcileOrders,
+    ) -> ExecutionAdapterFuture<'_, Result<ExecutionState, ExecutionAdapterError>>;
+
+    /// Records that dispatcher-side validation and account replacement completed for the exact
+    /// reconciliation set. This command may advance bounded backend compaction fences only.
+    fn acknowledge_reconciliation(
+        &self,
+        acknowledgement: ReconciliationAcknowledgement,
+    ) -> ExecutionAdapterFuture<'_, Result<(), ExecutionAdapterError>>;
 }
 
 /// Successful backend acceptance of one risk-dispatched order.
@@ -579,6 +849,17 @@ impl ExecutionState {
     }
     pub const fn reconciliation_required(&self) -> bool {
         self.reconciliation_required
+    }
+
+    pub(crate) fn retained_heap_bytes(&self) -> Option<usize> {
+        let mut retained = std::mem::size_of_val(self.orders.as_ref())
+            .checked_add(std::mem::size_of_val(self.accounts.as_ref()))?;
+        for account in &self.accounts {
+            retained = retained
+                .checked_add(std::mem::size_of_val(account.positions()))?
+                .checked_add(std::mem::size_of_val(account.position_cost_basis()))?;
+        }
+        Some(retained)
     }
 }
 

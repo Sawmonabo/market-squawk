@@ -25,6 +25,9 @@ type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 #[test]
 fn replacement_validation_rejects_stale_partial_mismatched_and_rollback_images() -> TestResult {
+    assert_eq!(ACCOUNT_REPLACEMENT_SCHEMA_VERSION, 2);
+    assert!(ExecutionStateSourceBinding::try_new(1, [1; 32], NonZeroU64::MIN, [2; 32]).is_err());
+    assert!(ExecutionStateSourceBinding::try_new(2, [1; 32], NonZeroU64::MIN, [2; 32]).is_ok());
     let fixture = Fixture::new()?;
     let mut current = crate::account::AccountState::try_from_bootstrap(
         fixture.bootstrap(),
@@ -180,8 +183,10 @@ impl Fixture {
             capital: self.money(100),
             peak_capital: self.money(100),
             gross_exposure: self.money(10),
+            realized_pnl: self.money(0),
             realized_loss: self.money(1),
             positions: vec![(self.instrument_id, 1)],
+            position_cost_basis: vec![(self.instrument_id, self.money(10))],
             idempotency: AccountIdempotencyBootstrap::empty(),
         }
     }
@@ -237,8 +242,10 @@ impl Fixture {
             self.money(99),
             self.money(peak_capital),
             self.money(9),
+            self.money(0),
             self.money(realized_loss),
             vec![(self.instrument_id, 1)],
+            vec![(self.instrument_id, self.money(9))],
         )?)
     }
 

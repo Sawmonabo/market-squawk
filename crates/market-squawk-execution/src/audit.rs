@@ -61,6 +61,8 @@ pub enum ExecutionAuditReason {
     UnexpectedReconciliationOrder,
     ReconciliationRequired,
     AccountReplacementRejected,
+    PendingReconciliationCapacity,
+    OperationDeadlineExceeded,
     AuditReasonOverflow,
 }
 

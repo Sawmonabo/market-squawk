@@ -100,8 +100,10 @@ impl Fixture {
             capital: cash,
             peak_capital: cash,
             gross_exposure: Money::new(Decimal::ZERO, self.usd),
+            realized_pnl: Money::new(Decimal::ZERO, self.usd),
             realized_loss: Money::new(Decimal::ZERO, self.usd),
             positions: vec![(self.instrument_id, 0)],
+            position_cost_basis: vec![(self.instrument_id, Money::new(Decimal::ZERO, self.usd))],
             idempotency: AccountIdempotencyBootstrap::empty(),
         }
     }

@@ -7,7 +7,7 @@ use market_squawk_domain::{
     AccountId, Currency, InstrumentExecutionTerms, InstrumentId, Money, OrderId, OrderSide,
     PriceTicks, QuantityLots,
 };
-use rust_decimal::Decimal;
+use rust_decimal::{Decimal, RoundingStrategy};
 use thiserror::Error;
 
 use crate::{FeeError, FeeSchedule, LiquidityRole};
@@ -24,11 +24,19 @@ pub(crate) use recovery::LedgerRecoveryWire;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PaperLedgerConfig {
     pub allow_short: bool,
+    pub exposure_valuation: PaperExposureValuation,
     pub maximum_accounts: usize,
     pub maximum_balances: usize,
     pub maximum_positions: usize,
     pub maximum_reservations: usize,
     pub fee_schedule: FeeSchedule,
+}
+
+/// Fixed valuation policy used for paper risk exposure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PaperExposureValuation {
+    /// Values each signed open position at its exact retained open cost basis.
+    OpenCost,
 }
 
 /// One exact settled cash balance in a checkpoint/snapshot.
@@ -53,6 +61,7 @@ pub struct PaperPosition {
     account_id: AccountId,
     instrument_id: InstrumentId,
     lots: i64,
+    cost_basis: Money,
 }
 
 impl PaperPosition {
@@ -65,6 +74,10 @@ impl PaperPosition {
     pub const fn lots(self) -> i64 {
         self.lots
     }
+
+    pub const fn cost_basis(self) -> Money {
+        self.cost_basis
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -72,9 +85,14 @@ struct Reservation {
     account_id: AccountId,
     terms: InstrumentExecutionTerms,
     side: OrderSide,
+    original_quantity: QuantityLots,
+    reservation_price: PriceTicks,
     remaining: QuantityLots,
     reserved_cash: Money,
     reserved_position_lots: i64,
+    cumulative_maker_notional: Money,
+    cumulative_taker_notional: Money,
+    cumulative_fee: Money,
 }
 
 /// Exact result of one atomic fill application.
@@ -112,6 +130,7 @@ pub struct PaperLedger {
     accounts: BTreeMap<AccountId, PaperAccountRiskState>,
     cash: BTreeMap<(AccountId, Currency), Decimal>,
     positions: BTreeMap<(AccountId, InstrumentId), i64>,
+    position_cost_basis: BTreeMap<(AccountId, InstrumentId), Decimal>,
     reservations: BTreeMap<OrderId, Reservation>,
 }
 
@@ -128,8 +147,12 @@ impl PaperLedger {
         {
             return Err(PaperLedgerError::InvalidConfiguration);
         }
+        match config.exposure_valuation {
+            PaperExposureValuation::OpenCost => {}
+        }
         let mut cash = BTreeMap::new();
         let mut positions = BTreeMap::new();
+        let mut position_cost_basis = BTreeMap::new();
         let mut account_states = BTreeMap::new();
         let mut account_count = 0_usize;
         for account in accounts {
@@ -152,6 +175,7 @@ impl PaperLedger {
                     .any(|value| value.currency() != currency || value.amount().is_sign_negative())
                 || account.capital.amount().is_zero()
                 || account.peak_capital.amount() < account.capital.amount()
+                || account.realized_pnl.currency() != currency
                 || !account
                     .cash
                     .iter()
@@ -167,6 +191,7 @@ impl PaperLedger {
                             peak_capital: account.peak_capital,
                             gross_exposure: account.gross_exposure,
                             realized_loss: account.realized_loss,
+                            realized_pnl: account.realized_pnl,
                         },
                     )
                     .is_some()
@@ -197,15 +222,47 @@ impl PaperLedger {
                     return Err(PaperLedgerError::InvalidBootstrap);
                 }
             }
+            for (instrument, basis) in account.position_cost_basis {
+                if basis.currency() != currency
+                    || basis.amount().is_sign_negative()
+                    || position_cost_basis
+                        .insert((account.account_id, instrument), basis.amount())
+                        .is_some()
+                {
+                    return Err(PaperLedgerError::InvalidBootstrap);
+                }
+            }
         }
         if account_count == 0 {
             return Err(PaperLedgerError::InvalidBootstrap);
+        }
+        if positions.len() != position_cost_basis.len()
+            || positions.iter().any(|(key, lots)| {
+                let Some(basis) = position_cost_basis.get(key) else {
+                    return true;
+                };
+                (*lots == 0 && !basis.is_zero()) || (*lots != 0 && basis.is_zero())
+            })
+        {
+            return Err(PaperLedgerError::InvalidBootstrap);
+        }
+        for (account_id, account) in &account_states {
+            let basis = position_cost_basis
+                .iter()
+                .filter(|((candidate, _), _)| candidate == account_id)
+                .try_fold(Decimal::ZERO, |sum, (_, basis)| {
+                    sum.checked_add(*basis).ok_or(PaperLedgerError::Overflow)
+                })?;
+            if basis != account.gross_exposure.amount() {
+                return Err(PaperLedgerError::InvalidBootstrap);
+            }
         }
         Ok(Self {
             config,
             accounts: account_states,
             cash,
             positions,
+            position_cost_basis,
             reservations: BTreeMap::new(),
         })
     }
@@ -260,6 +317,39 @@ impl PaperLedger {
             .unwrap_or(0))
     }
 
+    /// Returns the nonnegative open-cost basis for one signed position.
+    pub fn position_cost_basis(
+        &self,
+        account: AccountId,
+        instrument: InstrumentId,
+    ) -> Result<Money, PaperLedgerError> {
+        let currency = self
+            .accounts
+            .get(&account)
+            .map(|state| state.currency)
+            .ok_or(PaperLedgerError::UnknownAccountOrCurrency)?;
+        Ok(Money::new(
+            self.position_cost_basis
+                .get(&(account, instrument))
+                .copied()
+                .unwrap_or(Decimal::ZERO),
+            currency,
+        ))
+    }
+
+    /// Returns the exact current account-risk dimensions used for reconciliation.
+    pub fn account_risk(
+        &self,
+        account_id: AccountId,
+    ) -> Result<PaperAccountRiskSnapshot, PaperLedgerError> {
+        let account = self
+            .accounts
+            .get(&account_id)
+            .copied()
+            .ok_or(PaperLedgerError::UnknownAccountOrCurrency)?;
+        Ok(PaperAccountRiskSnapshot::new(account_id, account))
+    }
+
     pub(crate) fn cash_snapshot(&self) -> Vec<PaperCashBalance> {
         self.cash
             .iter()
@@ -277,6 +367,17 @@ impl PaperLedger {
                 account_id: *account_id,
                 instrument_id: *instrument_id,
                 lots: *lots,
+                cost_basis: Money::new(
+                    self.position_cost_basis
+                        .get(&(*account_id, *instrument_id))
+                        .copied()
+                        .unwrap_or(Decimal::ZERO),
+                    self.accounts
+                        .get(account_id)
+                        .map_or(self.config.fee_schedule.currency(), |account| {
+                            account.currency
+                        }),
+                ),
             })
             .collect()
     }
@@ -312,14 +413,16 @@ impl PaperLedger {
         let zero = Money::new(Decimal::ZERO, terms.quote_currency());
         let (reserved_cash, reserved_position_lots) = match side {
             OrderSide::Buy => {
-                let notional = checked_notional(terms, reservation_price, quantity)?;
-                let fee = self
-                    .config
-                    .fee_schedule
-                    .charge(notional, LiquidityRole::Taker)?;
-                let required = notional
-                    .checked_add(fee)
-                    .map_err(|_| PaperLedgerError::Overflow)?;
+                let required = expected_reserved_cash(
+                    self.config.fee_schedule,
+                    terms,
+                    side,
+                    quantity,
+                    reservation_price,
+                    zero,
+                    zero,
+                    zero,
+                )?;
                 if self
                     .available_cash(account_id, required.currency())?
                     .amount()
@@ -330,6 +433,23 @@ impl PaperLedger {
                 (required, 0)
             }
             OrderSide::Sell => {
+                let cash_shortfall = expected_reserved_cash(
+                    self.config.fee_schedule,
+                    terms,
+                    side,
+                    quantity,
+                    reservation_price,
+                    zero,
+                    zero,
+                    zero,
+                )?;
+                if self
+                    .available_cash(account_id, terms.quote_currency())?
+                    .amount()
+                    < cash_shortfall.amount()
+                {
+                    return Err(PaperLedgerError::InsufficientCash);
+                }
                 let already_reserved = self
                     .reservations
                     .values()
@@ -349,7 +469,7 @@ impl PaperLedger {
                 if !self.config.allow_short && available < quantity.get() {
                     return Err(PaperLedgerError::InsufficientPosition);
                 }
-                (zero, quantity.get())
+                (cash_shortfall, quantity.get())
             }
         };
         self.reservations.insert(
@@ -358,9 +478,14 @@ impl PaperLedger {
                 account_id,
                 terms,
                 side,
+                original_quantity: quantity,
+                reservation_price,
                 remaining: quantity,
                 reserved_cash,
                 reserved_position_lots,
+                cumulative_maker_notional: zero,
+                cumulative_taker_notional: zero,
+                cumulative_fee: zero,
             },
         );
         Ok(())
@@ -386,11 +511,38 @@ impl PaperLedger {
         if quantity > reservation.remaining {
             return Err(PaperLedgerError::Overfill);
         }
-        let fee = self.config.fee_schedule.charge(notional, liquidity)?;
+        let (next_maker_notional, next_taker_notional) = match liquidity {
+            LiquidityRole::Maker => (
+                reservation
+                    .cumulative_maker_notional
+                    .checked_add(notional)
+                    .map_err(|_| PaperLedgerError::Overflow)?,
+                reservation.cumulative_taker_notional,
+            ),
+            LiquidityRole::Taker => (
+                reservation.cumulative_maker_notional,
+                reservation
+                    .cumulative_taker_notional
+                    .checked_add(notional)
+                    .map_err(|_| PaperLedgerError::Overflow)?,
+            ),
+        };
+        let cumulative_fee = self
+            .config
+            .fee_schedule
+            .charge_cumulative(next_maker_notional, next_taker_notional)?;
+        let fee = cumulative_fee
+            .checked_sub(reservation.cumulative_fee)
+            .map_err(|_| PaperLedgerError::Overflow)?;
+        if fee.amount().is_sign_negative() {
+            return Err(PaperLedgerError::Overflow);
+        }
         let average_price = adverse_average(weighted_ticks, quantity, reservation.side)?;
         let currency = terms.quote_currency();
         let current_cash = self.cash(reservation.account_id, currency)?.amount();
         let current_position = self.position_lots(reservation.account_id, terms.instrument_id())?;
+        let current_cost_basis =
+            self.position_cost_basis(reservation.account_id, terms.instrument_id())?;
         let current_account = self
             .accounts
             .get(&reservation.account_id)
@@ -419,9 +571,6 @@ impl PaperLedger {
                 let proceeds = notional
                     .checked_sub(fee)
                     .map_err(|_| PaperLedgerError::Overflow)?;
-                if proceeds.amount().is_sign_negative() {
-                    return Err(PaperLedgerError::FeeExceedsNotional);
-                }
                 let position = current_position
                     .checked_sub(quantity.get())
                     .ok_or(PaperLedgerError::Overflow)?;
@@ -431,53 +580,99 @@ impl PaperLedger {
                 let cash = current_cash
                     .checked_add(proceeds.amount())
                     .ok_or(PaperLedgerError::Overflow)?;
-                (cash, position, Decimal::ZERO)
+                if cash.is_sign_negative() {
+                    return Err(PaperLedgerError::InsufficientCash);
+                }
+                let consumed = (-proceeds.amount()).max(Decimal::ZERO);
+                if consumed > reservation.reserved_cash.amount() {
+                    return Err(PaperLedgerError::ReservationExceeded);
+                }
+                (cash, position, consumed)
             }
         };
         let next_remaining = reservation
             .remaining
             .checked_sub(quantity)
             .map_err(|_| PaperLedgerError::Overfill)?;
-        let next_reserved_cash = reservation
+        let next_reserved_cash = if next_remaining.get() == 0 {
+            Decimal::ZERO
+        } else {
+            expected_reserved_cash(
+                self.config.fee_schedule,
+                reservation.terms,
+                reservation.side,
+                next_remaining,
+                reservation.reservation_price,
+                next_maker_notional,
+                next_taker_notional,
+                cumulative_fee,
+            )?
+            .amount()
+        };
+        let maximum_remaining_cash = reservation
             .reserved_cash
             .amount()
             .checked_sub(consumed_cash)
             .ok_or(PaperLedgerError::ReservationExceeded)?;
+        if next_reserved_cash > maximum_remaining_cash {
+            return Err(PaperLedgerError::ReservationExceeded);
+        }
         let next_revision = current_account
             .revision
             .get()
             .checked_add(1)
             .and_then(NonZeroU64::new)
             .ok_or(PaperLedgerError::Overflow)?;
+        let position_transition = transition_position(
+            current_position,
+            current_cost_basis,
+            reservation.side,
+            quantity,
+            notional,
+            self.config.fee_schedule.money_scale(),
+        )?;
+        if position_transition.next_lots != next_position {
+            return Err(PaperLedgerError::Overflow);
+        }
         let next_capital = current_account
             .capital
-            .checked_sub(fee)
+            .checked_add(position_transition.realized_pnl)
+            .and_then(|capital| capital.checked_sub(fee))
             .map_err(|_| PaperLedgerError::Overflow)?;
         if next_capital.amount().is_zero() || next_capital.amount().is_sign_negative() {
             return Err(PaperLedgerError::InsufficientCapital);
         }
+        let realized_loss_delta = Money::new(
+            (-position_transition.realized_pnl.amount()).max(Decimal::ZERO),
+            currency,
+        )
+        .checked_add(fee)
+        .map_err(|_| PaperLedgerError::Overflow)?;
         let next_realized_loss = current_account
             .realized_loss
-            .checked_add(fee)
+            .checked_add(realized_loss_delta)
             .map_err(|_| PaperLedgerError::Overflow)?;
-        let next_gross_exposure = match reservation.side {
-            OrderSide::Buy => current_account
-                .gross_exposure
-                .checked_add(notional)
-                .map_err(|_| PaperLedgerError::Overflow)?,
-            OrderSide::Sell => current_account
-                .gross_exposure
-                .checked_sub(notional)
-                .map_err(|_| PaperLedgerError::Overflow)?,
+        let next_realized_pnl = current_account
+            .realized_pnl
+            .checked_add(position_transition.realized_pnl)
+            .map_err(|_| PaperLedgerError::Overflow)?;
+        let next_gross_exposure = current_account
+            .gross_exposure
+            .checked_sub(current_cost_basis)
+            .and_then(|exposure| exposure.checked_add(position_transition.next_cost_basis))
+            .map_err(|_| PaperLedgerError::Overflow)?;
+        let next_peak_capital = if next_capital.amount() > current_account.peak_capital.amount() {
+            next_capital
+        } else {
+            current_account.peak_capital
         };
-        if next_gross_exposure.amount().is_sign_negative() {
-            return Err(PaperLedgerError::ExposureUnderflow);
-        }
         let next_account = PaperAccountRiskState {
             revision: next_revision,
             capital: next_capital,
+            peak_capital: next_peak_capital,
             gross_exposure: next_gross_exposure,
             realized_loss: next_realized_loss,
+            realized_pnl: next_realized_pnl,
             ..current_account
         };
 
@@ -486,6 +681,10 @@ impl PaperLedger {
         self.positions.insert(
             (reservation.account_id, terms.instrument_id()),
             next_position,
+        );
+        self.position_cost_basis.insert(
+            (reservation.account_id, terms.instrument_id()),
+            position_transition.next_cost_basis.amount(),
         );
         self.accounts.insert(reservation.account_id, next_account);
         if next_remaining.get() == 0 {
@@ -497,6 +696,9 @@ impl PaperLedger {
                 OrderSide::Buy => 0,
                 OrderSide::Sell => next_remaining.get(),
             };
+            stored.cumulative_maker_notional = next_maker_notional;
+            stored.cumulative_taker_notional = next_taker_notional;
+            stored.cumulative_fee = cumulative_fee;
         }
         Ok(PaperFill {
             quantity,
@@ -516,6 +718,185 @@ impl PaperLedger {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PositionTransition {
+    next_lots: i64,
+    next_cost_basis: Money,
+    realized_pnl: Money,
+}
+
+fn transition_position(
+    current_position: i64,
+    current_cost_basis: Money,
+    side: OrderSide,
+    quantity: QuantityLots,
+    fill_notional: Money,
+    money_scale: u32,
+) -> Result<PositionTransition, PaperLedgerError> {
+    let signed_fill = match side {
+        OrderSide::Buy => quantity.get(),
+        OrderSide::Sell => quantity
+            .get()
+            .checked_neg()
+            .ok_or(PaperLedgerError::Overflow)?,
+    };
+    let next_position = current_position
+        .checked_add(signed_fill)
+        .ok_or(PaperLedgerError::Overflow)?;
+    let current_abs = current_position.unsigned_abs();
+    let fill_quantity = quantity.get().unsigned_abs();
+    let closing_lots = if current_position == 0 || current_position.signum() == signed_fill.signum()
+    {
+        0
+    } else {
+        current_abs.min(fill_quantity)
+    };
+    let closing_notional = if closing_lots == fill_quantity {
+        fill_notional.amount()
+    } else {
+        proportional_amount(
+            fill_notional.amount(),
+            closing_lots,
+            fill_quantity,
+            money_scale,
+        )?
+    };
+    let closed_basis = if closing_lots == current_abs {
+        current_cost_basis.amount()
+    } else {
+        proportional_amount(
+            current_cost_basis.amount(),
+            closing_lots,
+            current_abs,
+            money_scale,
+        )?
+    };
+    let opening_notional = fill_notional
+        .amount()
+        .checked_sub(closing_notional)
+        .ok_or(PaperLedgerError::Overflow)?;
+    let remaining_basis = current_cost_basis
+        .amount()
+        .checked_sub(closed_basis)
+        .ok_or(PaperLedgerError::Overflow)?;
+    let next_basis = remaining_basis
+        .checked_add(opening_notional)
+        .ok_or(PaperLedgerError::Overflow)?;
+    let realized = if current_position > 0 {
+        closing_notional.checked_sub(closed_basis)
+    } else if current_position < 0 {
+        closed_basis.checked_sub(closing_notional)
+    } else {
+        Some(Decimal::ZERO)
+    }
+    .ok_or(PaperLedgerError::Overflow)?;
+    if next_basis.is_sign_negative() || (next_position == 0 && !next_basis.is_zero()) {
+        return Err(PaperLedgerError::Overflow);
+    }
+    Ok(PositionTransition {
+        next_lots: next_position,
+        next_cost_basis: Money::new(next_basis, current_cost_basis.currency()),
+        realized_pnl: Money::new(realized, current_cost_basis.currency()),
+    })
+}
+
+fn proportional_amount(
+    amount: Decimal,
+    numerator: u64,
+    denominator: u64,
+    money_scale: u32,
+) -> Result<Decimal, PaperLedgerError> {
+    if numerator == 0 {
+        return Ok(Decimal::ZERO);
+    }
+    if denominator == 0 {
+        return Err(PaperLedgerError::Overflow);
+    }
+    amount
+        .checked_mul(Decimal::from(numerator))
+        .and_then(|value| value.checked_div(Decimal::from(denominator)))
+        .map(|value| {
+            value.round_dp_with_strategy(money_scale, RoundingStrategy::MidpointNearestEven)
+        })
+        .ok_or(PaperLedgerError::Overflow)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "reservation recovery validates eight independent financial dimensions as one invariant"
+)]
+fn expected_reserved_cash(
+    fee_schedule: FeeSchedule,
+    terms: InstrumentExecutionTerms,
+    side: OrderSide,
+    remaining: QuantityLots,
+    reservation_price: PriceTicks,
+    cumulative_maker_notional: Money,
+    cumulative_taker_notional: Money,
+    cumulative_fee: Money,
+) -> Result<Money, PaperLedgerError> {
+    let remaining_notional = checked_notional(terms, reservation_price, remaining)?;
+    let future_fee = match side {
+        OrderSide::Buy => {
+            let maker_total = cumulative_maker_notional
+                .checked_add(remaining_notional)
+                .map_err(|_| PaperLedgerError::Overflow)?;
+            let taker_total = cumulative_taker_notional
+                .checked_add(remaining_notional)
+                .map_err(|_| PaperLedgerError::Overflow)?;
+            let all_maker =
+                fee_schedule.charge_cumulative(maker_total, cumulative_taker_notional)?;
+            let all_taker =
+                fee_schedule.charge_cumulative(cumulative_maker_notional, taker_total)?;
+            if all_maker.amount() >= all_taker.amount() {
+                all_maker
+            } else {
+                all_taker
+            }
+        }
+        OrderSide::Sell => {
+            let one_lot =
+                QuantityLots::new(1).map_err(|_| PaperLedgerError::InvalidQuantityOrPrice)?;
+            // Sell proceeds can deteriorate below the admission price. Reserve against the
+            // smallest valid positive execution price so a minimum fee cannot drive cash below
+            // zero before cancellation or resynchronization.
+            let one_lot_notional = checked_notional(terms, PriceTicks::new(1), one_lot)?;
+            let maker_total = cumulative_maker_notional
+                .checked_add(one_lot_notional)
+                .map_err(|_| PaperLedgerError::Overflow)?;
+            let taker_total = cumulative_taker_notional
+                .checked_add(one_lot_notional)
+                .map_err(|_| PaperLedgerError::Overflow)?;
+            let maker_increment = fee_schedule
+                .charge_cumulative(maker_total, cumulative_taker_notional)?
+                .checked_sub(cumulative_fee)
+                .map_err(|_| PaperLedgerError::Overflow)?;
+            let taker_increment = fee_schedule
+                .charge_cumulative(cumulative_maker_notional, taker_total)?
+                .checked_sub(cumulative_fee)
+                .map_err(|_| PaperLedgerError::Overflow)?;
+            let worst_increment = if maker_increment.amount() >= taker_increment.amount() {
+                maker_increment
+            } else {
+                taker_increment
+            };
+            let shortfall = worst_increment
+                .amount()
+                .checked_sub(one_lot_notional.amount())
+                .ok_or(PaperLedgerError::Overflow)?
+                .max(Decimal::ZERO);
+            return Ok(Money::new(shortfall, terms.quote_currency()));
+        }
+    };
+    remaining_notional
+        .checked_add(
+            future_fee
+                .checked_sub(cumulative_fee)
+                .map_err(|_| PaperLedgerError::Overflow)?,
+        )
+        .map_err(|_| PaperLedgerError::Overflow)
+}
+
 fn validate_terms(
     terms: InstrumentExecutionTerms,
     fee_currency: Currency,
@@ -529,7 +910,7 @@ fn validate_terms(
     Ok(())
 }
 
-fn checked_notional(
+pub(crate) fn checked_notional(
     terms: InstrumentExecutionTerms,
     price: PriceTicks,
     quantity: QuantityLots,

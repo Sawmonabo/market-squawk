@@ -91,21 +91,41 @@ impl FeeSchedule {
     ///
     /// Rejects mixed currencies, negative notional, or checked decimal overflow.
     pub fn charge(self, notional: Money, role: LiquidityRole) -> Result<Money, FeeError> {
-        if notional.currency() != self.currency() {
+        let zero = Money::new(Decimal::ZERO, notional.currency());
+        match role {
+            LiquidityRole::Maker => self.charge_cumulative(notional, zero),
+            LiquidityRole::Taker => self.charge_cumulative(zero, notional),
+        }
+    }
+
+    pub(crate) fn charge_cumulative(
+        self,
+        maker_notional: Money,
+        taker_notional: Money,
+    ) -> Result<Money, FeeError> {
+        if maker_notional.currency() != self.currency()
+            || taker_notional.currency() != self.currency()
+        {
             return Err(FeeError::CurrencyMismatch);
         }
-        if notional.amount().is_sign_negative() {
+        if maker_notional.amount().is_sign_negative() || taker_notional.amount().is_sign_negative()
+        {
             return Err(FeeError::NegativeNotional);
         }
-        let basis_points = match role {
-            LiquidityRole::Maker => self.maker_basis_points,
-            LiquidityRole::Taker => self.taker_basis_points,
-        };
-        let raw = notional
+        if maker_notional.amount().is_zero() && taker_notional.amount().is_zero() {
+            return Ok(Money::new(Decimal::ZERO, self.currency()));
+        }
+        let maker_raw = maker_notional
             .amount()
-            .checked_mul(Decimal::from(basis_points))
+            .checked_mul(Decimal::from(self.maker_basis_points))
             .and_then(|value| value.checked_div(Decimal::from(10_000_u32)))
             .ok_or(FeeError::Overflow)?;
+        let taker_raw = taker_notional
+            .amount()
+            .checked_mul(Decimal::from(self.taker_basis_points))
+            .and_then(|value| value.checked_div(Decimal::from(10_000_u32)))
+            .ok_or(FeeError::Overflow)?;
+        let raw = maker_raw.checked_add(taker_raw).ok_or(FeeError::Overflow)?;
         let mut amount =
             raw.round_dp_with_strategy(self.money_scale, RoundingStrategy::MidpointNearestEven);
         amount = amount.max(self.minimum_fee.amount());

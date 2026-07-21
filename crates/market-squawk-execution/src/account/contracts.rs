@@ -65,10 +65,14 @@ pub struct AccountBootstrap {
     pub peak_capital: Money,
     /// Current gross exposure before new reservations.
     pub gross_exposure: Money,
+    /// Signed cumulative realized trading profit and loss, excluding fees.
+    pub realized_pnl: Money,
     /// Current nonnegative realized loss measure.
     pub realized_loss: Money,
     /// Current signed positions in instrument lots.
     pub positions: Vec<(InstrumentId, i64)>,
+    /// Nonnegative open cost basis keyed exactly to every retained position.
+    pub position_cost_basis: Vec<(InstrumentId, Money)>,
     /// Authoritative non-expired replay fence loaded before live risk admission.
     pub idempotency: AccountIdempotencyBootstrap,
 }
