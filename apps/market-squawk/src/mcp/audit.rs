@@ -376,6 +376,9 @@ fn validate_private_file_identity(control: &Dir, file: &File) -> Result<(), Loca
 fn validate_private_permissions(metadata: &std::fs::Metadata) -> Result<(), LocalAuditError> {
     use std::os::unix::fs::MetadataExt as _;
 
+    if metadata.uid() != rustix::process::geteuid().as_raw() {
+        return Err(LocalAuditError::OwnerMismatch);
+    }
     if metadata.mode() & 0o077 == 0 {
         Ok(())
     } else {
@@ -528,6 +531,8 @@ pub enum LocalAuditError {
     UnsafeFileIdentity,
     #[error("local MCP audit endpoint permissions are not private")]
     InsecurePermissions,
+    #[error("local MCP audit endpoint is not owned by the effective user")]
+    OwnerMismatch,
     #[error("local MCP audit endpoint permissions cannot be proven private")]
     PermissionProofUnavailable,
     #[error("local MCP audit endpoint is already locked")]
