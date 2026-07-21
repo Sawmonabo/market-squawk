@@ -78,6 +78,12 @@ CAPTURE_BENCH_DEVELOPMENT_BACKEND=standard \
   cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 CAPTURE_BENCH_DEVELOPMENT_BACKEND=standard \
   cargo test --workspace --all-features --locked
+CAPTURE_BENCH_DEVELOPMENT_BACKEND=standard \
+  cargo test --locked \
+    -p market-squawk-domain \
+    -p market-squawk-live \
+    -p market-squawk-execution \
+    --test ui
 CAPTURE_BENCH_DEVELOPMENT_BACKEND=standard ./scripts/check_authority_lifecycle_loom.sh
 CAPTURE_BENCH_DEVELOPMENT_BACKEND=standard ./scripts/check_capture_queue_loom.sh
 CAPTURE_BENCH_DEVELOPMENT_BACKEND=standard \
