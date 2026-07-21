@@ -14,7 +14,8 @@ use async_trait::async_trait;
 use market_squawk_mcp::{
     ArtifactError, ArtifactPublication, ArtifactPublicationContext, ArtifactReference,
     ArtifactRepository, AuditCompletion, AuditCompletionReservation, AuditError, AuditEvent,
-    AuditResultClass, AuditSink, McpLimitError, McpLimitSpec, McpLimits, McpServer, ServerExit,
+    AuditPhase, AuditResultClass, AuditSink, McpLimitError, McpLimitSpec, McpLimits, McpServer,
+    MutationAuditBundle, MutationAuditReservation, ServerExit,
 };
 use market_squawk_services::{
     JsonStructureLimits, RequestContext, ServiceCapabilities, ServiceError, ServiceLimits,
@@ -41,6 +42,35 @@ impl CountingAudit {
 
 #[derive(Debug, Default)]
 struct RejectingCompletionAudit;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MutationAuditFault {
+    None,
+    Reservation,
+    AdmissionPersist,
+}
+
+#[derive(Debug)]
+struct AtomicMutationAudit {
+    events: Arc<Mutex<Vec<AuditEvent>>>,
+    fault: MutationAuditFault,
+}
+
+impl AtomicMutationAudit {
+    fn new(fault: MutationAuditFault) -> Self {
+        Self {
+            events: Arc::new(Mutex::new(Vec::new())),
+            fault,
+        }
+    }
+
+    fn events(&self) -> Result<Vec<AuditEvent>, AuditError> {
+        self.events
+            .lock()
+            .map(|events| events.clone())
+            .map_err(|_| AuditError::Unavailable)
+    }
+}
 
 impl AuditSink for RejectingCompletionAudit {
     fn record(&self, event: AuditEvent) -> Result<(), AuditError> {
@@ -79,6 +109,98 @@ impl AuditSink for CountingAudit {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(event);
         }))
+    }
+
+    fn reserve_mutation(
+        &self,
+        bundle: MutationAuditBundle,
+    ) -> Result<MutationAuditReservation, AuditError> {
+        let admitted = Arc::clone(&self.0);
+        let service = Arc::clone(&self.0);
+        let delivery = Arc::clone(&self.0);
+        MutationAuditReservation::try_new(
+            bundle,
+            move |event| {
+                admitted
+                    .lock()
+                    .map_err(|_| AuditError::Unavailable)?
+                    .push(event);
+                Ok(())
+            },
+            move |event| {
+                service
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(event);
+            },
+            move |event| {
+                delivery
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(event);
+            },
+        )
+    }
+}
+
+impl AuditSink for AtomicMutationAudit {
+    fn record(&self, event: AuditEvent) -> Result<(), AuditError> {
+        self.events
+            .lock()
+            .map_err(|_| AuditError::Unavailable)?
+            .push(event);
+        Ok(())
+    }
+
+    fn reserve_completion(
+        &self,
+        completion: AuditCompletion,
+    ) -> Result<AuditCompletionReservation, AuditError> {
+        let events = Arc::clone(&self.events);
+        Ok(AuditCompletionReservation::new(completion, move |event| {
+            events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(event);
+        }))
+    }
+
+    fn reserve_mutation(
+        &self,
+        bundle: MutationAuditBundle,
+    ) -> Result<MutationAuditReservation, AuditError> {
+        if self.fault == MutationAuditFault::Reservation {
+            return Err(AuditError::Unavailable);
+        }
+        let admitted = Arc::clone(&self.events);
+        let service = Arc::clone(&self.events);
+        let delivery = Arc::clone(&self.events);
+        let fail_admission = self.fault == MutationAuditFault::AdmissionPersist;
+        MutationAuditReservation::try_new(
+            bundle,
+            move |event| {
+                if fail_admission {
+                    return Err(AuditError::Unavailable);
+                }
+                admitted
+                    .lock()
+                    .map_err(|_| AuditError::Unavailable)?
+                    .push(event);
+                Ok(())
+            },
+            move |event| {
+                service
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(event);
+            },
+            move |event| {
+                delivery
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(event);
+            },
+        )
     }
 }
 
@@ -224,6 +346,64 @@ impl ToolServices for BoundaryService {
 #[derive(Debug, Default)]
 struct TraceService;
 
+#[derive(Debug)]
+struct KillSwitchService {
+    mutations: AtomicUsize,
+    audit: Arc<AtomicMutationAudit>,
+}
+
+impl KillSwitchService {
+    fn new(audit: Arc<AtomicMutationAudit>) -> Self {
+        Self {
+            mutations: AtomicUsize::new(0),
+            audit,
+        }
+    }
+}
+
+#[async_trait]
+impl ToolServices for KillSwitchService {
+    fn capabilities(&self) -> ServiceCapabilities {
+        let effects = ToolEffects::try_new(false, true, false, false);
+        let descriptor = effects.ok().and_then(|effects| {
+            ToolDescriptor::try_new(
+                "test.kill-switch",
+                "1",
+                "Irreversibly trigger the test-only kill switch.",
+                json!({"type":"object","properties":{},"additionalProperties":false}),
+                effects,
+                |arguments: &serde_json::Map<String, Value>| {
+                    arguments
+                        .is_empty()
+                        .then_some(())
+                        .ok_or(ToolInputError::Invalid)
+                },
+            )
+            .ok()
+        });
+        ServiceCapabilities::try_new(descriptor.into_iter().collect())
+            .unwrap_or_else(|_| ServiceCapabilities::empty())
+    }
+
+    async fn call(
+        &self,
+        _request: TypedToolRequest,
+        context: RequestContext,
+    ) -> Result<TypedToolResult, ServiceError> {
+        if !self
+            .audit
+            .events()
+            .map_err(|_| ServiceError::Unavailable)?
+            .iter()
+            .any(|event| event.phase() == AuditPhase::MutationAdmitted)
+        {
+            return Err(ServiceError::Internal);
+        }
+        self.mutations.fetch_add(1, Ordering::SeqCst);
+        TypedToolResult::try_new(json!({"triggered":true}), 1, context.limits()).map_err(Into::into)
+    }
+}
+
 #[async_trait]
 impl ToolServices for TraceService {
     fn capabilities(&self) -> ServiceCapabilities {
@@ -275,6 +455,52 @@ async fn receive<R: tokio::io::AsyncRead + Unpin>(
     let mut line = String::new();
     reader.read_line(&mut line).await?;
     Ok(serde_json::from_str(&line)?)
+}
+
+async fn initialized_mutation_session(
+    service: Arc<KillSwitchService>,
+    audit: Arc<AtomicMutationAudit>,
+) -> Result<
+    (
+        BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
+        tokio::io::WriteHalf<tokio::io::DuplexStream>,
+        tokio::task::JoinHandle<Result<ServerExit, market_squawk_mcp::ServerError>>,
+    ),
+    Box<dyn Error>,
+> {
+    let server = McpServer::try_new(
+        service,
+        McpLimits::try_from(McpLimitSpec::default())?,
+        audit,
+        Arc::new(RecordingArtifacts::default()),
+    )?;
+    let (client, server_io) = tokio::io::duplex(64 * 1024);
+    let (server_reader, server_writer) = tokio::io::split(server_io);
+    let task = tokio::spawn(server.serve_unverified_io(
+        server_reader,
+        server_writer,
+        CancellationToken::new(),
+    ));
+    let (client_reader, mut client_writer) = tokio::io::split(client);
+    let mut client_reader = BufReader::new(client_reader);
+    send(
+        &mut client_writer,
+        json!({
+            "jsonrpc":"2.0","id":"initialize","method":"initialize",
+            "params":{
+                "protocolVersion":"2025-11-25","capabilities":{},
+                "clientInfo":{"name":"tests","version":"1"}
+            }
+        }),
+    )
+    .await?;
+    let _initialize = receive(&mut client_reader).await?;
+    send(
+        &mut client_writer,
+        json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+    )
+    .await?;
+    Ok((client_reader, client_writer, task))
 }
 
 #[derive(Debug)]
@@ -631,6 +857,90 @@ async fn rejected_completion_audit_releases_no_response_bytes() -> Result<(), Bo
     let read = tokio::time::timeout(Duration::from_secs(1), reader.read_line(&mut line)).await??;
     assert_eq!(read, 0, "completion audit failure leaked: {line}");
     assert_eq!(task.await??, ServerExit::AuditFailed);
+    Ok(())
+}
+
+#[tokio::test]
+async fn mutation_audit_is_atomic_and_output_failure_cannot_rewrite_service_success()
+-> Result<(), Box<dyn Error>> {
+    for fault in [
+        MutationAuditFault::Reservation,
+        MutationAuditFault::AdmissionPersist,
+    ] {
+        let audit = Arc::new(AtomicMutationAudit::new(fault));
+        let service = Arc::new(KillSwitchService::new(Arc::clone(&audit)));
+        let (_reader, mut writer, task) =
+            initialized_mutation_session(Arc::clone(&service), Arc::clone(&audit)).await?;
+        send(
+            &mut writer,
+            json!({
+                "jsonrpc":"2.0","id":"kill-rejected","method":"tools/call",
+                "params":{"name":"test.kill-switch","arguments":{}}
+            }),
+        )
+        .await?;
+        assert_eq!(task.await??, ServerExit::AuditFailed);
+        assert_eq!(service.mutations.load(Ordering::SeqCst), 0);
+        assert!(audit.events()?.iter().all(|event| {
+            event.phase() != AuditPhase::MutationServiceCompleted
+                || event.result_class() != Some(AuditResultClass::Succeeded)
+        }));
+    }
+
+    let audit = Arc::new(AtomicMutationAudit::new(MutationAuditFault::None));
+    let service = Arc::new(KillSwitchService::new(Arc::clone(&audit)));
+    let (reader, mut writer, task) =
+        initialized_mutation_session(Arc::clone(&service), Arc::clone(&audit)).await?;
+    drop(reader);
+    send(
+        &mut writer,
+        json!({
+            "jsonrpc":"2.0","id":"kill-delivery-fails","method":"tools/call",
+            "params":{"name":"test.kill-switch","arguments":{}}
+        }),
+    )
+    .await?;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while service.mutations.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    let exit = task.await??;
+    assert!(matches!(
+        exit,
+        ServerExit::PeerClosed | ServerExit::OutputFailed
+    ));
+    assert_eq!(service.mutations.load(Ordering::SeqCst), 1);
+
+    let events = audit.events()?;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.phase() == AuditPhase::MutationAdmitted)
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| {
+                event.phase() == AuditPhase::MutationServiceCompleted
+                    && event.result_class() == Some(AuditResultClass::Succeeded)
+            })
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| {
+                event.phase() == AuditPhase::Completed
+                    && event.result_class() == Some(AuditResultClass::OutputUnavailable)
+            })
+            .count(),
+        1
+    );
     Ok(())
 }
 

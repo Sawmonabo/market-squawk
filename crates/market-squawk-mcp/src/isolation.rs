@@ -638,3 +638,84 @@ impl Drop for SessionSupervisor {
         }
     }
 }
+
+#[cfg(test)]
+mod thread_reaper_tests {
+    use std::{
+        num::NonZeroUsize,
+        sync::{
+            Arc, Condvar, Mutex,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
+
+    use super::{OwnedSdkThread, SdkReaperDrain, SdkThreadReaper, SdkThreadShutdown};
+
+    #[tokio::test]
+    async fn sdk_thread_start_pre_reserves_reaping_and_timeout_never_detaches_the_join_handle()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let reaper = SdkThreadReaper::try_new(NonZeroUsize::MIN)?;
+        let entered = Arc::new(AtomicUsize::new(0));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let latch = Arc::new((Mutex::new(false), Condvar::new()));
+        let worker = {
+            let entered = Arc::clone(&entered);
+            let cancelled = Arc::clone(&cancelled);
+            let latch = Arc::clone(&latch);
+            OwnedSdkThread::try_spawn(&reaper, "market-squawk-mcp-test-sdk", move |token| {
+                entered.fetch_add(1, Ordering::SeqCst);
+                while !token.is_cancelled() {
+                    std::thread::yield_now();
+                }
+                cancelled.store(true, Ordering::SeqCst);
+                let (released, changed) = &*latch;
+                let mut released = released
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                while !*released {
+                    released = changed
+                        .wait(released)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+            })?
+        };
+        while entered.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+
+        let rejected_spawns = Arc::new(AtomicUsize::new(0));
+        let rejected_counter = Arc::clone(&rejected_spawns);
+        assert!(
+            OwnedSdkThread::try_spawn(&reaper, "must-not-spawn", move |_token| {
+                rejected_counter.fetch_add(1, Ordering::SeqCst);
+            })
+            .is_err()
+        );
+        assert_eq!(rejected_spawns.load(Ordering::SeqCst), 0);
+
+        assert_eq!(
+            worker.shutdown(Duration::from_millis(10)).await?,
+            SdkThreadShutdown::TransferredToReaper
+        );
+        assert!(cancelled.load(Ordering::SeqCst));
+        assert_eq!(reaper.pending_count(), 1);
+        assert_eq!(
+            reaper.drain(Duration::from_millis(10)).await?,
+            SdkReaperDrain::Pending
+        );
+        assert_eq!(reaper.pending_count(), 1);
+
+        let (released, changed) = &*latch;
+        *released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        changed.notify_all();
+        assert_eq!(
+            reaper.drain(Duration::from_secs(1)).await?,
+            SdkReaperDrain::Complete
+        );
+        assert_eq!(reaper.pending_count(), 0);
+        Ok(())
+    }
+}
