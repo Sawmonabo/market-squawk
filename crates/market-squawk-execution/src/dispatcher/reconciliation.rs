@@ -7,8 +7,8 @@ use crate::account::{
     AccountReplacementCandidate, AccountReplacementReservationBinding, AccountStateReplacementBatch,
 };
 use crate::{
-    ExecutionDispatchError, ExecutionState, OrderIntentDigest, ReconciledOrder,
-    ReconciledOrderStatus,
+    ExecutionDispatchError, ExecutionPriceBound, ExecutionState, OrderIntentDigest,
+    ReconciledOrder, ReconciledOrderStatus,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -18,6 +18,7 @@ pub(super) struct ReconciliationRecordBinding {
     pub(super) intent_digest: OrderIntentDigest,
     pub(super) account_revision: u64,
     pub(super) requested_quantity: QuantityLots,
+    pub(super) execution_price_bound: ExecutionPriceBound,
     pub(super) settlement_currency: Option<Currency>,
     pub(super) previous: Option<ReconciledOrder>,
     pub(super) was_reconciliation: bool,
@@ -170,7 +171,7 @@ fn validate_order(
         || record.settlement_currency != Some(observed.cumulative_fees().currency())
         || observed
             .average_fill_price()
-            .is_some_and(|price| price.get() <= 0)
+            .is_some_and(|price| !record.execution_price_bound.permits(price))
         || matches!(observed.status(), ReconciledOrderStatus::Filled) && filled != requested
         || matches!(observed.status(), ReconciledOrderStatus::PartiallyFilled)
             && (filled <= 0 || filled >= requested)
@@ -219,6 +220,13 @@ pub(super) fn reconciliation_digest(
         digest.update(record.intent_digest.as_bytes());
         digest.update(record.account_revision.to_be_bytes());
         digest.update(record.requested_quantity.get().to_be_bytes());
+        digest.update(
+            record
+                .execution_price_bound
+                .maximum_price()
+                .get()
+                .to_be_bytes(),
+        );
         match record.settlement_currency {
             Some(currency) => {
                 digest.update([1]);

@@ -23,7 +23,10 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::dispatcher::PersistenceFinalization;
-use crate::{ExecutionMarketReference, OrderIntent, OrderIntentDigest, RiskPolicyIdentity};
+use crate::{
+    ExecutionMarketReference, ExecutionPriceBound, OrderIntent, OrderIntentDigest,
+    RiskPolicyIdentity,
+};
 
 /// Object-safe boxed future returned by execution adapters.
 pub type ExecutionAdapterFuture<'adapter, Output> =
@@ -41,6 +44,7 @@ pub struct DispatchOrder {
     approval_id: ApprovalId,
     intent: OrderIntent,
     market: ExecutionMarketReference,
+    execution_price_bound: ExecutionPriceBound,
     evidence: ConsumedLiveEvidence,
     policy: RiskPolicyIdentity,
     valid_until: Timestamp,
@@ -164,6 +168,11 @@ impl DispatchOrder {
         self.market.execution_price(self.side())
     }
 
+    /// Returns the inclusive risk-reserved upper average execution-price bound.
+    pub const fn execution_price_bound(&self) -> ExecutionPriceBound {
+        self.execution_price_bound
+    }
+
     /// Returns the fixed risk policy/ruleset identity.
     pub const fn risk_policy(&self) -> RiskPolicyIdentity {
         self.policy
@@ -193,6 +202,7 @@ pub(crate) const fn dispatch_order_from_approval(
     approval_id: ApprovalId,
     intent: OrderIntent,
     market: ExecutionMarketReference,
+    execution_price_bound: ExecutionPriceBound,
     evidence: ConsumedLiveEvidence,
     policy: RiskPolicyIdentity,
     valid_until: Timestamp,
@@ -203,6 +213,7 @@ pub(crate) const fn dispatch_order_from_approval(
         approval_id,
         intent,
         market,
+        execution_price_bound,
         evidence,
         policy,
         valid_until,
@@ -600,7 +611,9 @@ pub trait ExecutionAdapter: Send + Sync + std::fmt::Debug + 'static {
     /// [`ExecutionAdapterError::NotAttemptedBusy`] guarantee that no backend or transport side
     /// effect was attempted. Every ambiguous attempt must return
     /// [`ExecutionAdapterError::UncertainOutcome`] or
-    /// [`ExecutionAdapterError::ReconciliationRequired`].
+    /// [`ExecutionAdapterError::ReconciliationRequired`]. Implementations must enforce
+    /// [`DispatchOrder::execution_price_bound`] on every fill and reject the order before a side
+    /// effect when they cannot guarantee that ceiling.
     fn submit(
         &self,
         order: DispatchOrder,

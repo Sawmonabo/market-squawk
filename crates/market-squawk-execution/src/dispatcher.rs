@@ -20,8 +20,8 @@ use crate::clock::system_now;
 use crate::{
     AccountRiskCoordinator, AccountRiskReservation, ApprovedOrder, ExecutionAdapter,
     ExecutionAdapterError, ExecutionAuditEvent, ExecutionAuditKind, ExecutionAuditReason,
-    ExecutionAuditWriter, ExecutionOperation, ExecutionState, OrderIntentDigest,
-    PersistenceAcknowledgement, ReconciledOrder, ReconciliationBatchBinding,
+    ExecutionAuditWriter, ExecutionOperation, ExecutionPriceBound, ExecutionState,
+    OrderIntentDigest, PersistenceAcknowledgement, ReconciledOrder, ReconciliationBatchBinding,
 };
 use worker::run_worker;
 
@@ -269,6 +269,7 @@ impl ExecutionDispatcherHandle {
                     reservation: None,
                     audit_context: context,
                     requested_quantity: approval.quantity(),
+                    execution_price_bound: approval.execution_price_bound(),
                     settlement_currency: approval.execution_terms().settlement_currency(),
                     last_transition_at: context.market_observed_at(),
                     lifecycle: None,
@@ -421,6 +422,7 @@ struct DispatchRecord {
     reservation: Option<AccountRiskReservation>,
     audit_context: ExecutionAuditContext,
     requested_quantity: QuantityLots,
+    execution_price_bound: ExecutionPriceBound,
     settlement_currency: Option<Currency>,
     last_transition_at: Timestamp,
     lifecycle: Option<ReconciledOrder>,

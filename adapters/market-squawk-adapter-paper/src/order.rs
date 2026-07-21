@@ -4,7 +4,9 @@ use market_squawk_domain::{
     AccountId, BasisPoints, ClientOrderId, InstrumentExecutionTerms, Money, OrderId, OrderSide,
     OrderType, PriceTicks, QuantityLots, TimeInForce, Timestamp,
 };
-use market_squawk_execution::{DispatchOrder, OrderIntentDigest, ReconciledOrderStatus};
+use market_squawk_execution::{
+    DispatchOrder, ExecutionPriceBound, OrderIntentDigest, ReconciledOrderStatus,
+};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
@@ -25,6 +27,7 @@ pub(crate) struct PaperOrder {
     pub(crate) maximum_slippage: BasisPoints,
     pub(crate) intent_digest: OrderIntentDigest,
     pub(crate) reference_price: PriceTicks,
+    pub(crate) execution_price_bound: ExecutionPriceBound,
     pub(crate) accepted_at: Timestamp,
     pub(crate) eligible_at: Timestamp,
     pub(crate) expires_at: Timestamp,
@@ -53,6 +56,7 @@ pub(crate) struct PaperOrderRecoveryWire {
     maximum_slippage: BasisPoints,
     intent_digest: [u8; 32],
     reference_price: PriceTicks,
+    maximum_execution_price: PriceTicks,
     accepted_at: Timestamp,
     eligible_at: Timestamp,
     expires_at: Timestamp,
@@ -78,6 +82,10 @@ impl PaperOrder {
         let reference_price = dispatch
             .execution_price()
             .ok_or(PaperStateError::InvalidTransition)?;
+        let execution_price_bound = dispatch.execution_price_bound();
+        if !execution_price_bound.permits(reference_price) {
+            return Err(PaperStateError::InvalidTransition);
+        }
         let currency = dispatch.execution_terms().quote_currency();
         let lifecycle = PaperOrderLifecycle::try_new(dispatch.quantity())?;
         let intent_digest = dispatch.intent_digest();
@@ -95,6 +103,7 @@ impl PaperOrder {
             maximum_slippage: dispatch.maximum_slippage(),
             intent_digest,
             reference_price,
+            execution_price_bound,
             accepted_at: dispatch.submitted_at(),
             eligible_at,
             expires_at,
@@ -119,6 +128,9 @@ impl PaperOrder {
         fill: PaperFill,
         sequence: u64,
     ) -> Result<(), PaperStateError> {
+        if !self.execution_price_bound.permits(fill.average_price()) {
+            return Err(PaperStateError::InvalidTransition);
+        }
         self.lifecycle.apply_fill(fill.quantity(), sequence)?;
         self.cumulative_fee = self
             .cumulative_fee
@@ -179,6 +191,7 @@ impl PaperOrder {
             maximum_slippage: self.maximum_slippage,
             intent_digest: self.intent_digest.as_bytes(),
             reference_price: self.reference_price,
+            maximum_execution_price: self.execution_price_bound.maximum_price(),
             accepted_at: self.accepted_at,
             eligible_at: self.eligible_at,
             expires_at: self.expires_at,
@@ -211,10 +224,13 @@ impl PaperOrder {
             wire.weighted_fill_ticks
                 .checked_div(i128::from(fill_lots))
                 .and_then(|ticks| i64::try_from(ticks).ok())
-                .is_some_and(|ticks| ticks > 0)
+                .is_some_and(|ticks| ticks > 0 && ticks <= wire.maximum_execution_price.get())
         };
+        let execution_price_bound = ExecutionPriceBound::try_new(wire.maximum_execution_price)
+            .map_err(|_| PaperStateError::InvalidTransition)?;
         if !price_shape_valid
             || wire.reference_price.get() <= 0
+            || !execution_price_bound.permits(wire.reference_price)
             || wire.limit_price.is_some_and(|price| price.get() <= 0)
             || wire.stop_price.is_some_and(|price| price.get() <= 0)
             || !(0..=10_000).contains(&wire.maximum_slippage.get())
@@ -251,6 +267,7 @@ impl PaperOrder {
             maximum_slippage: wire.maximum_slippage,
             intent_digest: OrderIntentDigest::from_bytes(wire.intent_digest),
             reference_price: wire.reference_price,
+            execution_price_bound,
             accepted_at: wire.accepted_at,
             eligible_at: wire.eligible_at,
             expires_at: wire.expires_at,

@@ -28,6 +28,7 @@ pub struct PaperOrderSnapshot {
     requested: QuantityLots,
     cumulative_filled: QuantityLots,
     average_fill_price: Option<PriceTicks>,
+    maximum_execution_price: PriceTicks,
     cumulative_fees: Money,
     accepted_at: Timestamp,
     eligible_at: Timestamp,
@@ -44,6 +45,7 @@ impl PaperOrderSnapshot {
             requested: order.quantity,
             cumulative_filled: order.lifecycle.cumulative_filled(),
             average_fill_price: order.average_fill_price(),
+            maximum_execution_price: order.execution_price_bound.maximum_price(),
             cumulative_fees: order.cumulative_fee,
             accepted_at: order.accepted_at,
             eligible_at: order.eligible_at,
@@ -69,6 +71,9 @@ impl PaperOrderSnapshot {
     }
     pub const fn average_fill_price(&self) -> Option<PriceTicks> {
         self.average_fill_price
+    }
+    pub const fn maximum_execution_price(&self) -> PriceTicks {
+        self.maximum_execution_price
     }
     pub const fn cumulative_fees(&self) -> Money {
         self.cumulative_fees
@@ -650,6 +655,7 @@ fn validate_fills(
             || fill.sequence > order.lifecycle.last_sequence()
             || fill.quantity.get() == 0
             || fill.average_price.get() <= 0
+            || !order.execution_price_bound.permits(fill.average_price)
             || fill.event_at < order.eligible_at
             || fill.event_at > order.expires_at
             || fill.notional.currency() != order.terms.quote_currency()

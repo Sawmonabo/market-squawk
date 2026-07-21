@@ -185,6 +185,22 @@ async fn process_command(
     let parts = approval.into_parts();
     let approval_id = parts.approval_id;
     let order_id = parts.intent.order_id();
+    if !parts
+        .market
+        .execution_price(parts.intent.side())
+        .is_some_and(|price| parts.execution_price_bound.permits(price))
+    {
+        parts.reservation.mark_known_not_accepted();
+        mark_terminal(registry, approval_id, now.wall);
+        commit_dispatch_audit(
+            audit,
+            ExecutionAuditKind::DispatchRejected,
+            context,
+            now.wall,
+            &[ExecutionAuditReason::ApprovalInvalid],
+        );
+        return;
+    }
     if operation_cancellation.is_cancelled() || tokio::time::Instant::now() >= operation_deadline {
         parts.reservation.mark_known_not_accepted();
         mark_terminal(registry, approval_id, now.wall);
@@ -269,6 +285,7 @@ async fn process_command(
         approval_id,
         parts.intent,
         parts.market,
+        parts.execution_price_bound,
         parts.authority.into_evidence(),
         parts.policy,
         parts.valid_until,

@@ -22,6 +22,48 @@ pub const MAX_EXECUTION_MARKET_LEVELS_PER_SIDE: usize = 64;
 // schema; shared lease allocations already exist before queue admission and are not queue-owned.
 pub(crate) const APPROVAL_COMMAND_RETAINED_BYTE_CEILING: usize = 64 * 1024;
 
+/// Positive hard ceiling for the average execution price of one approved order.
+///
+/// Risk derives this bound with checked fixed-point arithmetic and reserves account resources at
+/// its maximum price. Carrying it as a distinct type prevents side-aware slippage semantics from
+/// accidentally treating a higher sell price as harmless when it increases absolute exposure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExecutionPriceBound {
+    maximum_price: PriceTicks,
+}
+
+impl ExecutionPriceBound {
+    /// Validates a positive upper execution-price ceiling.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecutionPriceBoundError::NonPositive`] for zero or negative prices.
+    pub fn try_new(maximum_price: PriceTicks) -> Result<Self, ExecutionPriceBoundError> {
+        if maximum_price.get() <= 0 {
+            return Err(ExecutionPriceBoundError::NonPositive);
+        }
+        Ok(Self { maximum_price })
+    }
+
+    /// Returns the inclusive maximum average execution price.
+    pub const fn maximum_price(self) -> PriceTicks {
+        self.maximum_price
+    }
+
+    /// Returns whether a positive observed average price is within this inclusive ceiling.
+    pub const fn permits(self, price: PriceTicks) -> bool {
+        price.get() > 0 && price.get() <= self.maximum_price.get()
+    }
+}
+
+/// Invalid upper execution-price bound.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum ExecutionPriceBoundError {
+    /// Execution prices must be strictly positive.
+    #[error("maximum execution price must be positive")]
+    NonPositive,
+}
+
 /// Fixed risk-policy identity retained through risk, audit, and adapter dispatch.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct RiskPolicyIdentity {
@@ -178,6 +220,7 @@ pub struct ApprovedOrder {
     approval_id: ApprovalId,
     intent: OrderIntent,
     market: ExecutionMarketReference,
+    execution_price_bound: ExecutionPriceBound,
     authority: ConsumedLiveAuthority,
     reservation: AccountRiskReservation,
     policy: RiskPolicyIdentity,
@@ -231,6 +274,10 @@ impl ApprovedOrder {
         self.intent.quantity()
     }
 
+    pub(crate) const fn execution_price_bound(&self) -> ExecutionPriceBound {
+        self.execution_price_bound
+    }
+
     pub(crate) fn validate_current(
         &self,
         now: ClockReading,
@@ -248,6 +295,7 @@ impl ApprovedOrder {
             approval_id,
             intent,
             market,
+            execution_price_bound,
             authority,
             reservation,
             policy,
@@ -258,6 +306,7 @@ impl ApprovedOrder {
             approval_id,
             intent,
             market,
+            execution_price_bound,
             authority,
             reservation,
             policy,
@@ -274,6 +323,7 @@ pub(crate) fn approved_order_from_risk(
     approval_id: ApprovalId,
     intent: OrderIntent,
     market: ExecutionMarketReference,
+    execution_price_bound: ExecutionPriceBound,
     authority: ConsumedLiveAuthority,
     reservation: AccountRiskReservation,
     policy: RiskPolicyIdentity,
@@ -284,6 +334,7 @@ pub(crate) fn approved_order_from_risk(
         approval_id,
         intent,
         market,
+        execution_price_bound,
         authority,
         reservation,
         policy,
@@ -297,6 +348,7 @@ pub(crate) struct ApprovedOrderParts {
     pub(crate) approval_id: ApprovalId,
     pub(crate) intent: OrderIntent,
     pub(crate) market: ExecutionMarketReference,
+    pub(crate) execution_price_bound: ExecutionPriceBound,
     pub(crate) authority: ConsumedLiveAuthority,
     pub(crate) reservation: AccountRiskReservation,
     pub(crate) policy: RiskPolicyIdentity,

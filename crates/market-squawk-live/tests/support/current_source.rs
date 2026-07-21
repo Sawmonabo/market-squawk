@@ -24,13 +24,14 @@ use market_squawk_sources::{
     CurrentHealthReporter, CurrentSourceAuthorityLease, CurrentSourceSession, DecodeOutcome,
     DecodedProviderBatch, DecoderEvidence, EndpointPolicy, FreshnessPolicy, HistoricalCapability,
     InstrumentCoverage, LiveCoverageDeclaration, LiveCoverageRule, LiveProtocolProfile,
-    NetworkAccessPolicy, ProviderAggressorEvidence, ProviderBookLevel, ProviderBudgetPolicy,
-    ProviderChecksumEvidence, ProviderDecimalLexeme, ProviderNormalizedObservation,
-    ProviderNumericPolicy, ProviderObservationPayload, ProviderPrice, ProviderQuantity,
-    ProviderSequenceEvidence, ProviderSnapshotEvidence, ProviderTimestampEvidence, RawFrameFactory,
-    RegisteredSource, SemanticInterpretationProfile, SequenceValidationProfile, SessionId,
-    SourceCapabilities, SourceClass, SourceCoverage, SourceHealthSnapshot, SourceMetadata,
-    SourceMetadataInput, SourceProtocolProfile, TransportFrameKind, ValidatedSessionDecodeOutcome,
+    NetworkAccessPolicy, ProviderAggressorEvidence, ProviderBookChange, ProviderBookLevel,
+    ProviderBookSide, ProviderBudgetPolicy, ProviderChecksumEvidence, ProviderDecimalLexeme,
+    ProviderNormalizedObservation, ProviderNumericPolicy, ProviderObservationPayload,
+    ProviderPrice, ProviderQuantity, ProviderSequenceEvidence, ProviderSnapshotEvidence,
+    ProviderTimestampEvidence, RawFrameFactory, RegisteredSource, SemanticInterpretationProfile,
+    SequenceValidationProfile, SessionId, SourceCapabilities, SourceClass, SourceCoverage,
+    SourceHealthSnapshot, SourceMetadata, SourceMetadataInput, SourceProtocolProfile,
+    TransportFrameKind, ValidatedSessionDecodeOutcome,
 };
 use rust_decimal::Decimal;
 
@@ -205,6 +206,11 @@ fn metadata(source: &str, revision: &str, instrument_id: &str) -> TestResult<Sou
             LiveCoverageRule::try_new(LiveEventClass::Trade, None, non_book)?,
             LiveCoverageRule::try_new(
                 LiveEventClass::BookSnapshot,
+                Some(market_squawk_domain::MarketDepth::PriceLevel),
+                SnapshotApplicability::Required,
+            )?,
+            LiveCoverageRule::try_new(
+                LiveEventClass::BookDelta,
                 Some(market_squawk_domain::MarketDepth::PriceLevel),
                 SnapshotApplicability::Required,
             )?,
@@ -519,6 +525,84 @@ impl SourceHarness {
         sequence: u64,
     ) -> TestResult<(CurrentSourceAuthorityLease, CurrentDecodedProviderBatch)> {
         self.book_snapshot_with_sides(source_identifier, sequence, 1, 1)
+    }
+
+    #[allow(
+        dead_code,
+        reason = "execution integration tests use explicit prices to probe approved price bounds"
+    )]
+    pub(super) fn two_sided_book_delta_at_prices(
+        &mut self,
+        source_identifier: &str,
+        sequence: u64,
+        bid_price: &str,
+        ask_price: &str,
+    ) -> TestResult<(CurrentSourceAuthorityLease, CurrentDecodedProviderBatch)> {
+        let frame_at = next_after(self.last_frame_at)?;
+        self.last_frame_at = frame_at;
+        let frame = self.frames.try_frame(
+            TransportFrameKind::Binary,
+            source_identifier.as_bytes().to_vec().into(),
+        )?;
+        self.capture_admission.preflight(&frame)?;
+        let receipt = self
+            .capture_admission
+            .issue_after_enqueue(&frame, fixture_resident_lease())?;
+        self.capture_admission.validate_active(&frame)?;
+        let validated = self.session.validate_live_frame(&frame)?;
+        let decoder = DecoderEvidence::from_validated_frame(&validated, rule("coinbase-decoder")?);
+        let level = |price: &str, quantity: &str| -> TestResult<ProviderBookLevel> {
+            Ok(ProviderBookLevel::new(
+                ProviderPrice::new(ProviderDecimalLexeme::try_new(price)?),
+                ProviderQuantity::new(ProviderDecimalLexeme::try_new(quantity)?),
+            ))
+        };
+        let observation = ProviderNormalizedObservation::try_new(
+            id(source_identifier)?,
+            VenueId::try_from(VENUE)?,
+            instrument(&self.instrument_id)?,
+            ProviderTimestampEvidence::Provided {
+                value: frame_at,
+                rule: rule("coinbase-timestamp")?,
+            },
+            ProviderSequenceEvidence::Provided {
+                value: SequenceNumber::new(sequence),
+                rule: rule("coinbase-sequence")?,
+            },
+            ProviderSnapshotEvidence::Delta {
+                provider_snapshot_reference: None,
+            },
+            ProviderChecksumEvidence::Unsupported {
+                rule: rule("coinbase-no-checksum")?,
+            },
+            ProviderObservationPayload::book_delta(
+                market_squawk_domain::MarketDepth::PriceLevel,
+                vec![
+                    ProviderBookChange::new(ProviderBookSide::Bid, level("100.00", "0.00")?),
+                    ProviderBookChange::new(ProviderBookSide::Ask, level("101.00", "0.00")?),
+                    ProviderBookChange::new(ProviderBookSide::Bid, level(bid_price, "1.00")?),
+                    ProviderBookChange::new(ProviderBookSide::Ask, level(ask_price, "1.00")?),
+                ],
+            )?,
+        )?;
+        let decoded = DecodedProviderBatch::try_new(decoder, vec![observation])?;
+        let validated_session = self
+            .registry
+            .validate_session(&self.session, frame.received_at())?;
+        let validated_outcome = validated_session
+            .validate_decode_outcome_owned(DecodeOutcome::Data(decoded), receipt)?;
+        let ValidatedSessionDecodeOutcome::Data(captured) = validated_outcome else {
+            return Err("data outcome changed disposition".into());
+        };
+        let current = self.registry.validate_current_authority(&self.session)?;
+        let lease = current.try_current_lease()?;
+        let batches = current.validate_data_outcome_owned(captured)?;
+        let mut batches = batches.into_iter();
+        let batch = batches.next().ok_or("missing routed current batch")?;
+        if batches.next().is_some() {
+            return Err("fixture unexpectedly produced multiple routes".into());
+        }
+        Ok((lease, batch))
     }
 
     fn book_snapshot_with_sides(

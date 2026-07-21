@@ -215,6 +215,9 @@ impl PaperWorker {
 }
 
 pub(super) fn reservation_price(order: &PaperOrder) -> Result<PriceTicks, ExecutionAdapterError> {
+    if !order.execution_price_bound.permits(order.reference_price) {
+        return Err(ExecutionAdapterError::Rejected);
+    }
     let adverse = adverse_bound(order.reference_price, order.side, order.maximum_slippage)
         .map_err(|_| ExecutionAdapterError::Rejected)?;
     Ok(match (order.side, order.limit_price) {

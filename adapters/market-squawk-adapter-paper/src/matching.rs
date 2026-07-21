@@ -262,7 +262,7 @@ fn price_is_eligible(order: &PaperOrder, price: PriceTicks, adverse: PriceTicks)
         (OrderSide::Buy, Some(limit)) => price <= limit,
         (OrderSide::Sell, Some(limit)) => price >= limit,
     };
-    within_slippage && within_limit
+    within_slippage && within_limit && order.execution_price_bound.permits(price)
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]

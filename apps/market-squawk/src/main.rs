@@ -230,17 +230,23 @@ async fn main() -> Result<()> {
             let composition = local_coinbase_paper_bot(config, initial_cash, fee_basis_points)?;
             let cancellation = CancellationToken::new();
             let runtime = composition.start(cancellation.clone()).await?;
-            match seconds {
-                Some(seconds) => tokio::time::sleep(Duration::from_secs(seconds)).await,
-                None => tokio::signal::ctrl_c().await?,
-            }
-            cancellation.cancel();
-            let shutdown = runtime.shutdown().await;
-            if !shutdown.is_complete() {
-                return Err(anyhow!(
-                    "production paper-bot shutdown was incomplete: {shutdown:?}"
-                ));
-            }
+            let primary = match seconds {
+                Some(seconds) => {
+                    tokio::time::sleep(Duration::from_secs(seconds)).await;
+                    None
+                }
+                None => tokio::signal::ctrl_c()
+                    .await
+                    .err()
+                    .map(|error| anyhow!(error).context("failed to listen for Ctrl-C")),
+            };
+            let shutdown = cancel_and_shutdown_paper_bot(
+                &cancellation,
+                primary,
+                runtime.shutdown(),
+                |shutdown| shutdown.is_complete(),
+            )
+            .await?;
             let paper = shutdown
                 .paper()
                 .as_ref()
@@ -295,6 +301,29 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn cancel_and_shutdown_paper_bot<T, Shutdown, Complete>(
+    cancellation: &CancellationToken,
+    primary: Option<anyhow::Error>,
+    shutdown: Shutdown,
+    is_complete: Complete,
+) -> Result<T>
+where
+    T: std::fmt::Debug,
+    Shutdown: std::future::Future<Output = T>,
+    Complete: FnOnce(&T) -> bool,
+{
+    cancellation.cancel();
+    let outcome = shutdown.await;
+    let cleanup_failure = (!is_complete(&outcome))
+        .then(|| format!("production paper-bot shutdown was incomplete: {outcome:?}"));
+    match (primary, cleanup_failure) {
+        (Some(error), Some(cleanup)) => Err(error.context(cleanup)),
+        (Some(error), None) => Err(error),
+        (None, Some(cleanup)) => Err(anyhow!(cleanup)),
+        (None, None) => Ok(outcome),
+    }
 }
 
 fn load_config(
@@ -647,7 +676,14 @@ async fn run_offline_mcp(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, num::NonZeroUsize, sync::Arc};
+    use std::{
+        collections::BTreeMap,
+        num::NonZeroUsize,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+    };
 
     use async_trait::async_trait;
     use clap::Parser;
@@ -666,8 +702,8 @@ mod tests {
 
     use super::{
         Cli, PipelineShutdownReport, RunMode, RunSourceDisposition, SourceEventShutdownReport,
-        capture_identity, compose_deferred_capture_error, compose_pipeline_error, run_source,
-        shutdown_source_then_event,
+        cancel_and_shutdown_paper_bot, capture_identity, compose_deferred_capture_error,
+        compose_pipeline_error, run_source, shutdown_source_then_event,
     };
 
     const TEST_MEMORY_SINK_MAX_RECORDS: usize = 4_096;
@@ -719,6 +755,35 @@ mod tests {
         assert!(rendered.contains(PRIMARY_FAILURE));
         assert!(rendered.contains("failed to reap deferred capture worker"));
         assert!(rendered.contains("capture worker is still running"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn paper_bot_primary_wait_failure_still_cancels_and_awaits_shutdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let cancellation = CancellationToken::new();
+        let shutdown_awaited = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&shutdown_awaited);
+        let result = cancel_and_shutdown_paper_bot(
+            &cancellation,
+            Some(anyhow::anyhow!("injected signal-listener failure")),
+            async move {
+                observed.store(true, Ordering::Release);
+                false
+            },
+            |complete| *complete,
+        )
+        .await;
+
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => return Err("the primary wait failure must remain fatal".into()),
+        };
+        let rendered = format!("{error:#}");
+        assert!(cancellation.is_cancelled());
+        assert!(shutdown_awaited.load(Ordering::Acquire));
+        assert!(rendered.contains("injected signal-listener failure"));
+        assert!(rendered.contains("shutdown was incomplete"));
         Ok(())
     }
 

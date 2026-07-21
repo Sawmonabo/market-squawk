@@ -17,7 +17,7 @@ use crate::clock::{monotonic_deadline, system_now};
 use crate::{
     AccountReservationError, AccountRiskCoordinator, AccountRiskReservation, AccountRiskViolation,
     ApprovedOrder, ExecutionAuditEvent, ExecutionAuditKind, ExecutionAuditWriter,
-    ExecutionMarketReference, OrderIntent, RiskLimits, RiskPolicyIdentity,
+    ExecutionMarketReference, ExecutionPriceBound, OrderIntent, RiskLimits, RiskPolicyIdentity,
 };
 
 /// Structurally validated but authority-free market input for pre-dispatch risk.
@@ -356,17 +356,18 @@ impl RiskService {
         }
         let execution_price = market.execution_price(intent.side());
         self.evaluate_current_market(&intent, market, execution_price, now.wall, &mut reasons);
-        let reservation_price = execution_price
-            .and_then(|execution_price| conservative_reservation_price(&intent, execution_price));
-        if execution_price.is_some() && reservation_price.is_none() {
+        let execution_price_bound = execution_price.and_then(|execution_price| {
+            execution_price_bound(&intent, execution_price, &self.limits)
+        });
+        if execution_price.is_some() && execution_price_bound.is_none() {
             reasons.push(RiskRejectionCode::Account(
                 AccountRiskViolation::ArithmeticOverflow,
             ));
         }
-        if let Some(reservation_price) = reservation_price
-            && let Err(rejection) = self
-                .accounts
-                .assess(&intent, reservation_price, &self.limits)
+        if let Some(execution_price_bound) = execution_price_bound
+            && let Err(rejection) =
+                self.accounts
+                    .assess(&intent, execution_price_bound.maximum_price(), &self.limits)
         {
             extend_account_reasons(&mut reasons, &rejection);
         }
@@ -391,7 +392,7 @@ impl RiskService {
             );
             return RiskOutcome::Rejected(RiskRejection::new(reasons));
         }
-        let Some(reservation_price) = reservation_price else {
+        let Some(execution_price_bound) = execution_price_bound else {
             let reasons = [RiskRejectionCode::MarketDepthUnavailable];
             let context = ExecutionAuditContext::from_risk(
                 approval_id,
@@ -413,10 +414,11 @@ impl RiskService {
             );
             return RiskOutcome::Rejected(RiskRejection::new(reasons.to_vec()));
         };
-        let reservation = match self
-            .accounts
-            .try_reserve(&intent, reservation_price, &self.limits)
-        {
+        let reservation = match self.accounts.try_reserve(
+            &intent,
+            execution_price_bound.maximum_price(),
+            &self.limits,
+        ) {
             Ok(reservation) => reservation,
             Err(rejection) => {
                 extend_account_reasons(&mut reasons, &rejection);
@@ -493,6 +495,7 @@ impl RiskService {
             approval_id,
             intent,
             *market,
+            execution_price_bound,
             authority,
             reservation,
             self.config.policy,
@@ -526,24 +529,24 @@ impl RiskService {
             reasons.push(RiskRejectionCode::ClockRollback);
         }
         self.evaluate_market(intent, market, now.wall, &mut reasons);
-        let reservation_price =
-            conservative_reservation_price(intent, market.estimated_execution_price);
-        if reservation_price.is_none() {
+        let execution_price_bound =
+            execution_price_bound(intent, market.estimated_execution_price, &self.limits);
+        if execution_price_bound.is_none() {
             reasons.push(RiskRejectionCode::Account(
                 AccountRiskViolation::ArithmeticOverflow,
             ));
         }
-        if let Some(reservation_price) = reservation_price
-            && let Err(rejection) = self
-                .accounts
-                .assess(intent, reservation_price, &self.limits)
+        if let Some(execution_price_bound) = execution_price_bound
+            && let Err(rejection) =
+                self.accounts
+                    .assess(intent, execution_price_bound.maximum_price(), &self.limits)
         {
             extend_account_reasons(&mut reasons, &rejection);
         }
         if !reasons.is_empty() {
             return PreAuthorityRiskOutcome::Rejected(RiskRejection::new(reasons));
         }
-        let Some(reservation_price) = reservation_price else {
+        let Some(execution_price_bound) = execution_price_bound else {
             return PreAuthorityRiskOutcome::Rejected(RiskRejection::new(vec![
                 RiskRejectionCode::Account(AccountRiskViolation::ArithmeticOverflow),
             ]));
@@ -551,7 +554,7 @@ impl RiskService {
 
         match self
             .accounts
-            .try_reserve(intent, reservation_price, &self.limits)
+            .try_reserve(intent, execution_price_bound.maximum_price(), &self.limits)
         {
             Ok(reservation) => PreAuthorityRiskOutcome::Reserved(reservation),
             Err(rejection) => {
@@ -713,36 +716,51 @@ fn stop_triggered(intent: &OrderIntent, reference_price: PriceTicks) -> bool {
     }
 }
 
-/// Returns the maximum executable notional price permitted by the intent for account reservation.
+/// Derives the hard upper average execution-price ceiling used for account reservation.
 ///
-/// Buys reserve through the adverse slippage ceiling, capped by an explicit limit. Sells reserve
-/// at the current best executable price because lower adverse prices reduce absolute notional;
-/// a sell limit is a price floor and therefore cannot increase exposure beyond the current best.
-fn conservative_reservation_price(
+/// Buy intent slippage and limit prices can tighten the policy ceiling. Sell limits remain price
+/// floors, so the symmetric policy-deviation ceiling is retained to bound growing short exposure.
+fn execution_price_bound(
     intent: &OrderIntent,
     execution_price: PriceTicks,
-) -> Option<PriceTicks> {
-    if execution_price.get() <= 0 || !(0..=10_000).contains(&intent.maximum_slippage().get()) {
+    limits: &RiskLimits,
+) -> Option<ExecutionPriceBound> {
+    if execution_price.get() <= 0
+        || !(0..=10_000).contains(&intent.maximum_slippage().get())
+        || !(0..=10_000).contains(&limits.maximum_price_deviation().get())
+    {
         return None;
     }
-    if intent.side() == OrderSide::Sell {
-        return Some(execution_price);
+    let policy_ceiling =
+        checked_upper_price(execution_price, limits.maximum_price_deviation().get())?;
+    let maximum_price = match intent.side() {
+        OrderSide::Sell => policy_ceiling,
+        OrderSide::Buy => {
+            let intent_ceiling =
+                checked_upper_price(execution_price, intent.maximum_slippage().get())?;
+            let ceiling = policy_ceiling.min(intent_ceiling);
+            intent
+                .limit_price()
+                .map_or(ceiling, |limit| ceiling.min(limit))
+        }
+    };
+    ExecutionPriceBound::try_new(maximum_price).ok()
+}
+
+fn checked_upper_price(price: PriceTicks, basis_points: i32) -> Option<PriceTicks> {
+    if price.get() <= 0 || !(0..=10_000).contains(&basis_points) {
+        return None;
     }
-    let factor = 10_000_i128.checked_add(i128::from(intent.maximum_slippage().get()))?;
-    let numerator = i128::from(execution_price.get()).checked_mul(factor)?;
+    let factor = 10_000_i128.checked_add(i128::from(basis_points))?;
+    let numerator = i128::from(price.get()).checked_mul(factor)?;
     let quotient = numerator / 10_000_i128;
     let remainder = numerator % 10_000_i128;
-    let adverse = if remainder == 0 {
+    let ceiling = if remainder == 0 {
         quotient
     } else {
         quotient.checked_add(1)?
     };
-    let adverse = PriceTicks::new(i64::try_from(adverse).ok()?);
-    Some(
-        intent
-            .limit_price()
-            .map_or(adverse, |limit| adverse.min(limit)),
-    )
+    Some(PriceTicks::new(i64::try_from(ceiling).ok()?))
 }
 
 fn deviation_exceeds(reference: PriceTicks, candidate: PriceTicks, maximum_bps: i32) -> bool {

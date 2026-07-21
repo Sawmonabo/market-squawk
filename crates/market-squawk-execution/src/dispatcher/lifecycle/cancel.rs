@@ -266,7 +266,7 @@ fn cancel_observation_invalid_reason(
         || record.settlement_currency != Some(receipt.cumulative_fees().currency())
         || receipt
             .average_fill_price()
-            .is_some_and(|price| price.get() <= 0)
+            .is_some_and(|price| !record.execution_price_bound.permits(price))
     {
         return Some(ExecutionAuditReason::ReconciliationRequired);
     }

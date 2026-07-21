@@ -52,6 +52,7 @@ struct LostAcknowledgementAdapter {
     inner: Arc<market_squawk_adapter_paper::PaperExecutionAdapter>,
     acknowledgement_calls: AtomicUsize,
     acknowledgement_bindings: Mutex<Vec<([u8; 32], [u8; 32])>>,
+    execution_price_bounds: Mutex<BTreeMap<OrderId, PriceTicks>>,
 }
 
 impl ExecutionAdapter for LostAcknowledgementAdapter {
@@ -59,6 +60,12 @@ impl ExecutionAdapter for LostAcknowledgementAdapter {
         &self,
         order: DispatchOrder,
     ) -> ExecutionAdapterFuture<'_, Result<ExecutionReceipt, ExecutionAdapterError>> {
+        if let Ok(mut bounds) = self.execution_price_bounds.try_lock() {
+            bounds.insert(
+                order.order_id(),
+                order.execution_price_bound().maximum_price(),
+            );
+        }
         self.inner.submit(order)
     }
 
@@ -242,14 +249,11 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
             cash: Money::new(Decimal::new(10_000, 0), usd),
             capital: Money::new(Decimal::new(10_500, 0), usd),
             peak_capital: Money::new(Decimal::new(10_500, 0), usd),
-            gross_exposure: Money::new(Decimal::new(500, 0), usd),
+            gross_exposure: Money::new(Decimal::ZERO, usd),
             realized_pnl: Money::new(Decimal::ZERO, usd),
             realized_loss: Money::new(Decimal::ZERO, usd),
-            positions: vec![(terms.instrument_id(), 500)],
-            position_cost_basis: vec![(
-                terms.instrument_id(),
-                Money::new(Decimal::new(500, 0), usd),
-            )],
+            positions: vec![(terms.instrument_id(), 0)],
+            position_cost_basis: vec![(terms.instrument_id(), Money::new(Decimal::ZERO, usd))],
             idempotency: AccountIdempotencyBootstrap::empty(),
         }],
     )?);
@@ -269,7 +273,7 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
         maximum_orders_per_window: NonZeroU32::new(8).ok_or("zero order rate")?,
         order_rate_window_nanos: 60_000_000_000,
         reservation_ttl_nanos: 5_000_000_000,
-        allow_short: false,
+        allow_short: true,
         kill_switch: false,
     })?;
     let (execution_audit, mut execution_audit_reader) =
@@ -321,7 +325,7 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
         ledger_maximum_accounts: NonZeroUsize::MIN,
         ledger_maximum_balances: NonZeroUsize::MIN,
         ledger_maximum_positions: NonZeroUsize::MIN,
-        allow_short: false,
+        allow_short: true,
         exposure_valuation: PaperExposureValuation::OpenCost,
         abort_join_deadline: Duration::from_secs(1),
         fee_schedule: fees,
@@ -335,14 +339,11 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
             cash: vec![Money::new(Decimal::new(10_000, 0), usd)],
             capital: Money::new(Decimal::new(10_500, 0), usd),
             peak_capital: Money::new(Decimal::new(10_500, 0), usd),
-            gross_exposure: Money::new(Decimal::new(500, 0), usd),
+            gross_exposure: Money::new(Decimal::ZERO, usd),
             realized_pnl: Money::new(Decimal::ZERO, usd),
             realized_loss: Money::new(Decimal::ZERO, usd),
-            positions: vec![(terms.instrument_id(), 500)],
-            position_cost_basis: vec![(
-                terms.instrument_id(),
-                Money::new(Decimal::new(500, 0), usd),
-            )],
+            positions: vec![(terms.instrument_id(), 0)],
+            position_cost_basis: vec![(terms.instrument_id(), Money::new(Decimal::ZERO, usd))],
         }],
     )?;
     let mut paper_audit = paper
@@ -360,6 +361,7 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
         inner: Arc::clone(&paper_adapter),
         acknowledgement_calls: AtomicUsize::new(0),
         acknowledgement_bindings: Mutex::new(Vec::new()),
+        execution_price_bounds: Mutex::new(BTreeMap::new()),
     });
     let paper_market = Arc::new(PaperMarketProbe {
         sink: paper.market_ingress(),
@@ -677,14 +679,31 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
     let compacted = paper_adapter.snapshot(paper_control()?).await?;
     assert!(!compacted.archived_orders().is_empty());
     assert!(compacted.active_orders().len() < paper_config.input().maximum_orders.get());
+    assert!(
+        compacted
+            .positions()
+            .iter()
+            .any(
+                |position| position.instrument_id() == terms.instrument_id() && position.lots() < 0
+            ),
+        "the final sell probe must increase an existing short exposure"
+    );
     let (_, subsequent) = source.batch_with_price("paper-subsequent-order", 7, "97.00")?;
     ingress.try_publish(subsequent)?;
     accepted_digests.insert(
         order_ids[5],
         assert_accepted(&mut execution_audit_reader, order_ids[5]).await?,
     );
-    let (_, subsequent_fill) = source.batch_with_price("paper-subsequent-fill", 8, "97.00")?;
-    ingress.try_publish(subsequent_fill)?;
+    let maximum_execution_price = execution_adapter
+        .execution_price_bounds
+        .try_lock()
+        .ok()
+        .and_then(|bounds| bounds.get(&order_ids[5]).copied())
+        .ok_or("final sell approval did not propagate its execution-price bound")?;
+    let (_, above_bound) =
+        source.two_sided_book_delta_at_prices("paper-above-bound-book", 8, "120.00", "121.00")?;
+    assert!(PriceTicks::new(12_000) > maximum_execution_price);
+    ingress.try_publish(above_bound)?;
     paper_market.wait_for(8).await?;
     let subsequent_barrier = paper_adapter.snapshot(paper_control()?).await?;
     let subsequent_order = subsequent_barrier
@@ -694,7 +713,14 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
         .ok_or("subsequent paper order missing after risk-state replacement")?;
     assert_eq!(
         subsequent_order.state(),
-        market_squawk_adapter_paper::PaperOrderState::Filled
+        market_squawk_adapter_paper::PaperOrderState::Canceled
+    );
+    assert!(
+        subsequent_barrier
+            .fills()
+            .iter()
+            .all(|fill| fill.order_id() != order_ids[5]),
+        "paper settlement must not publish a fill above the approved upper price bound"
     );
     assert!(
         !dispatcher
@@ -706,7 +732,7 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
             .reconciliation_required()
     );
     let final_active_snapshot = paper_adapter.snapshot(paper_control()?).await?;
-    assert_eq!(final_active_snapshot.fills().len(), 5);
+    assert_eq!(final_active_snapshot.fills().len(), 4);
     let continuation_fills = final_active_snapshot
         .fills()
         .iter()
@@ -744,7 +770,7 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
 
     let checkpoint = paper_adapter.checkpoint(paper_control()?).await?;
     assert!(checkpoint.complete());
-    assert_eq!(checkpoint.schema_version(), 4);
+    assert_eq!(checkpoint.schema_version(), 5);
     assert!(checkpoint.encode(1).is_err());
     let encoded_checkpoint = checkpoint.encode(1024 * 1024)?;
     let mut incompatible_input = paper_config.input().clone();

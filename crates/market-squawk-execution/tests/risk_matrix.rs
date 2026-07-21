@@ -122,6 +122,31 @@ fn risk_returns_stably_ordered_source_market_and_account_reasons_before_mutation
             .reasons()
             .contains(&RiskRejectionCode::PolicySlippageLimit)
     );
+
+    let sell = fixture.sell_market_intent(4, 10, 100);
+    let sell_market = MarketRiskInput::try_new(
+        fixture.terms,
+        DataQuality::DirectVerified,
+        true,
+        true,
+        Timestamp::from_unix_nanos(1),
+        Timestamp::from_unix_nanos(i64::MAX),
+        PriceTicks::new(100),
+        PriceTicks::new(100),
+    )
+    .unwrap_or_else(|error| panic!("valid sell market input: {error}"));
+    let PreAuthorityRiskOutcome::Rejected(sell_rejection) =
+        service.evaluate_pre_authority(&sell, &sell_market)
+    else {
+        panic!("sell exposure must reserve through its enforceable upper execution-price bound");
+    };
+    assert!(
+        sell_rejection
+            .reasons()
+            .contains(&RiskRejectionCode::Account(
+                AccountRiskViolation::OrderNotionalLimit
+            ))
+    );
 }
 
 struct Fixture {
@@ -226,6 +251,37 @@ impl Fixture {
             limit_price: Some(PriceTicks::new(limit_price)),
             stop_price: None,
             time_in_force: TimeInForce::Day,
+            signal_at: Timestamp::from_unix_nanos(1),
+            expires_at: Timestamp::from_unix_nanos(i64::MAX),
+            reason_codes: vec![
+                OrderReasonCode::try_from("risk.test")
+                    .unwrap_or_else(|error| panic!("valid reason fixture: {error}")),
+            ],
+            maximum_slippage: BasisPoints::new(maximum_slippage),
+            required_quality: DataQuality::DirectVerified,
+        })
+        .unwrap_or_else(|error| panic!("valid intent fixture: {error}"))
+    }
+
+    fn sell_market_intent(&self, suffix: u8, quantity: i64, maximum_slippage: i32) -> OrderIntent {
+        let order_id = format!("20000000-0000-0000-0000-{suffix:012}");
+        OrderIntent::try_new(OrderIntentInput {
+            order_id: OrderId::from_str(&order_id)
+                .unwrap_or_else(|error| panic!("valid order fixture: {error}")),
+            client_order_id: ClientOrderId::try_from(format!("risk-{suffix}"))
+                .unwrap_or_else(|error| panic!("valid client-order fixture: {error}")),
+            strategy_id: StrategyId::from_str("30000000-0000-0000-0000-000000000001")
+                .unwrap_or_else(|error| panic!("valid strategy fixture: {error}")),
+            model_id: None,
+            account_id: self.account_id,
+            execution_terms: self.terms,
+            side: OrderSide::Sell,
+            order_type: OrderType::Market,
+            quantity: QuantityLots::new(quantity)
+                .unwrap_or_else(|error| panic!("valid quantity fixture: {error}")),
+            limit_price: None,
+            stop_price: None,
+            time_in_force: TimeInForce::ImmediateOrCancel,
             signal_at: Timestamp::from_unix_nanos(1),
             expires_at: Timestamp::from_unix_nanos(i64::MAX),
             reason_codes: vec![

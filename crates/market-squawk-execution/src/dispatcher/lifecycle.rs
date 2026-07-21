@@ -359,6 +359,7 @@ impl ExecutionDispatcher {
                         intent_digest: record.intent_digest,
                         account_revision: record.account_revision,
                         requested_quantity: record.requested_quantity,
+                        execution_price_bound: record.execution_price_bound,
                         settlement_currency: record.settlement_currency,
                         previous: record.lifecycle,
                         was_reconciliation: admission.prior_state == DispatchState::Reconciliation,
@@ -806,7 +807,7 @@ fn apply_reconciled_order(
         || record.settlement_currency != Some(fees.currency())
         || observed
             .average_fill_price()
-            .is_some_and(|price| price.get() <= 0)
+            .is_some_and(|price| !record.execution_price_bound.permits(price))
         || matches!(observed.status(), ReconciledOrderStatus::Filled) && filled != requested
         || matches!(observed.status(), ReconciledOrderStatus::PartiallyFilled)
             && (filled <= 0 || filled >= requested);

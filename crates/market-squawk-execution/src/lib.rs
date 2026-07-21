@@ -29,8 +29,8 @@ pub use adapter::{
     ReconciliationBatchBindingError, ReconciliationBatchId,
 };
 pub use approval::{
-    ApprovedOrder, ExecutionMarketReference, MAX_EXECUTION_MARKET_LEVELS_PER_SIDE,
-    RiskPolicyIdentity,
+    ApprovedOrder, ExecutionMarketReference, ExecutionPriceBound, ExecutionPriceBoundError,
+    MAX_EXECUTION_MARKET_LEVELS_PER_SIDE, RiskPolicyIdentity,
 };
 pub use audit::{
     ExecutionAuditConfig, ExecutionAuditError, ExecutionAuditEvent, ExecutionAuditKind,
