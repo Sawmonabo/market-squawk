@@ -29,10 +29,11 @@ use market_squawk_execution::{
     ExecutionAuditReader, ExecutionAuditReason, ExecutionAuditWriter, ExecutionDispatcher,
     ExecutionDispatcherConfig, ExecutionDispatcherShutdown, ExecutionLiveActionHook,
     ExecutionMarketSink, ExecutionMarketSinkError, ExecutionMarketUpdate, ExecutionReceipt,
-    ExecutionState, ExecutionStateSourceBinding, OrderIntent, OrderIntentInput, ReconcileOrders,
-    ReconciledAccountState, ReconciledOrder, ReconciledOrderStatus, ReconciliationAcknowledgement,
-    RiskLimits, RiskLimitsInput, RiskPolicyIdentity, RiskRejectionCode, RiskService,
-    RiskServiceConfig, Strategy, StrategyContext, StrategyError,
+    ExecutionState, ExecutionStateSourceBinding, ExecutionTaskReaper, OrderIntent,
+    OrderIntentInput, ReconcileOrders, ReconciledAccountState, ReconciledOrder,
+    ReconciledOrderStatus, ReconciliationAcknowledgement, RiskLimits, RiskLimitsInput,
+    RiskPolicyIdentity, RiskRejectionCode, RiskService, RiskServiceConfig, Strategy,
+    StrategyContext, StrategyError,
 };
 use market_squawk_live::{ActionAuthorityIssueLimit, LiveRuntime, RouteActionHook};
 pub(crate) use market_squawk_live::{
@@ -287,7 +288,11 @@ impl ExecutionAdapter for ScriptedAdapter {
                         Money::new(Decimal::new(10_000, 0), self.usd),
                         Money::new(Decimal::new(10_000, 0), self.usd),
                         Money::new(Decimal::new(10_000, 0), self.usd),
+                        Money::new(Decimal::new(10_000, 0), self.usd),
                         Money::new(Decimal::ZERO, self.usd),
+                        Money::new(Decimal::ZERO, self.usd),
+                        Money::new(Decimal::ZERO, self.usd),
+                        [6; 32],
                         Money::new(Decimal::ZERO, self.usd),
                         Money::new(Decimal::ZERO, self.usd),
                         positions,
@@ -447,6 +452,9 @@ async fn committed_market_risk_and_dispatch_are_one_use_bounded_and_fill_safe() 
         usd,
         instrument_id: terms.instrument_id(),
     });
+    let task_reaper = ExecutionTaskReaper::try_new(
+        NonZeroUsize::new(4).ok_or("zero execution task ownership capacity")?,
+    )?;
     let dispatcher = ExecutionDispatcher::try_start(
         Arc::clone(&adapter) as Arc<dyn ExecutionAdapter>,
         Arc::clone(&accounts),
@@ -460,6 +468,7 @@ async fn committed_market_risk_and_dispatch_are_one_use_bounded_and_fill_safe() 
             operation_deadline: Duration::from_secs(1),
             shutdown_deadline: Duration::from_millis(10),
         },
+        task_reaper.clone(),
     )?;
     let market_sink = Arc::new(CountingMarketSink {
         updates: AtomicUsize::new(0),
@@ -717,6 +726,11 @@ async fn committed_market_risk_and_dispatch_are_one_use_bounded_and_fill_safe() 
         dispatcher.shutdown().await,
         ExecutionDispatcherShutdown::Complete
     );
+    let drain_deadline = tokio::time::Instant::now()
+        .checked_add(Duration::from_secs(1))
+        .ok_or("execution task drain deadline overflow")?;
+    let task_drain = task_reaper.drain(drain_deadline).await;
+    assert!(task_drain.is_complete());
     let probe_signal_at = current_timestamp()?;
     let probe_expires_at = probe_signal_at.checked_add_nanos(30_000_000_000)?;
     for (suffix, account_id) in [

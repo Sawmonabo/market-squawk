@@ -487,7 +487,7 @@ fn validate_product(product: &str) -> Result<(), SubscriptionConstructionError> 
         || product.len() > MAX_PRODUCT_BYTES
         || !product
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.'))
     {
         return Err(SubscriptionConstructionError::InvalidProduct);
     }

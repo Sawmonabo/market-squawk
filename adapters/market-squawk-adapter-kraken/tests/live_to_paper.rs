@@ -136,7 +136,7 @@ fn kraken_quality_is_rejected_before_paper_state_mutation() -> Result<(), Box<dy
     let mut paper = PaperLedger::try_new(
         PaperLedgerConfig {
             allow_short: false,
-            exposure_valuation: PaperExposureValuation::OpenCost,
+            exposure_valuation: PaperExposureValuation::ExecutableExit,
             maximum_accounts: 1,
             maximum_balances: 1,
             maximum_positions: 1,

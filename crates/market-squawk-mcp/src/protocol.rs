@@ -25,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     AuditError, AuditEvent, AuditOperation, AuditResultClass, AuditSink, LocalProcessIdentityClass,
-    McpLimits,
+    McpLimits, MutationAuditBundle,
     framing::{
         ActiveAdmission, BoundedFrameReader, Frame, FramingError, OutputChannel, PendingAudit,
         run_writer,
@@ -568,6 +568,23 @@ fn admit_request(
         return RequestAdmission::InvalidIdentifier;
     };
     let operation = operation_for(&request.request, capabilities);
+    if request_is_mutating(&request.request, capabilities) {
+        let Ok(bundle) = MutationAuditBundle::new(
+            &request_id,
+            output.identity_class(),
+            operation.clone(),
+            limits.service_limits(),
+            frame,
+        ) else {
+            return RequestAdmission::AuditFailed;
+        };
+        let Ok(mutation) = output.reserve_mutation(bundle) else {
+            return RequestAdmission::AuditFailed;
+        };
+        return RequestAdmission::Admitted(PendingAudit::new_mutation(
+            request_id, operation, mutation,
+        ));
+    }
     let Ok(event) = AuditEvent::admitted(
         &request_id,
         output.identity_class(),
@@ -581,6 +598,15 @@ fn admit_request(
         return RequestAdmission::AuditFailed;
     }
     RequestAdmission::Admitted(PendingAudit::new(request_id, operation))
+}
+
+fn request_is_mutating(request: &ClientRequest, capabilities: &ServiceCapabilities) -> bool {
+    match request {
+        ClientRequest::CallToolRequest(call) => capabilities
+            .find(call.params.name.as_ref())
+            .is_some_and(|descriptor| !descriptor.effects().read_only()),
+        _ => false,
+    }
 }
 
 fn admit_direct(

@@ -8,6 +8,9 @@ license.workspace = true
 repository = "https://github.com/Sawmonabo/market-squawk"
 publish = false
 
+[features]
+loopback-fixture = []
+
 [dependencies]
 bytes.workspace = true
 chrono.workspace = true

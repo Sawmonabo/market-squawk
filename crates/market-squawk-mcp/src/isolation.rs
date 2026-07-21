@@ -1,11 +1,10 @@
 //! Owned bounded bridges around the payload-suppressing official-SDK runtime.
 
 use std::{
-    num::NonZeroUsize,
     sync::{
-        Arc,
+        Arc, LazyLock, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        mpsc::{SyncSender, TrySendError, sync_channel},
+        mpsc::{RecvTimeoutError, SyncSender, TrySendError, sync_channel},
     },
     thread::JoinHandle as ThreadJoinHandle,
     time::Duration,
@@ -14,13 +13,14 @@ use std::{
 use async_trait::async_trait;
 use market_squawk_services::{
     ProgressDelivery as ServiceProgressDelivery, ProgressError, ProgressSink, RequestContext,
-    ServiceCapabilities, ServiceError, ToolServices, TypedToolRequest, TypedToolResult,
+    RequestId as ServiceRequestId, ServiceCapabilities, ServiceError, ServiceErrorClass,
+    ToolServices, TypedToolRequest, TypedToolResult,
 };
 use rmcp::{
     RoleServer,
     model::{
         ClientJsonRpcMessage, Notification, ProgressNotificationParam, ProgressToken,
-        ServerJsonRpcMessage, ServerNotification,
+        RequestId as ProtocolRequestId, ServerJsonRpcMessage, ServerNotification,
     },
     service::{QuitReason, RxJsonRpcMessage, TxJsonRpcMessage, serve_server_with_ct},
     transport::Transport,
@@ -162,6 +162,8 @@ impl Transport<RoleServer> for SdkTransport {
 pub(crate) struct ServiceCall {
     request: TypedToolRequest,
     context: RequestContext,
+    protocol_request_id: ProtocolRequestId,
+    output: Arc<OutputChannel>,
     response: oneshot::Sender<Result<TypedToolResult, ServiceError>>,
     ownership: OwnedSemaphorePermit,
 }
@@ -171,6 +173,7 @@ pub(crate) struct SdkToolServices {
     pub(crate) capabilities: ServiceCapabilities,
     pub(crate) calls: mpsc::Sender<ServiceCall>,
     pub(crate) ownership: Arc<Semaphore>,
+    pub(crate) output: Arc<OutputChannel>,
 }
 
 impl std::fmt::Debug for SdkToolServices {
@@ -180,6 +183,7 @@ impl std::fmt::Debug for SdkToolServices {
             .field("capabilities", &self.capabilities)
             .field("calls", &"[BOUNDED SERVICE CHANNEL]")
             .field("ownership", &"[BOUNDED HOST WORK OWNERSHIP]")
+            .field("output", &"[MUTATION AUDIT OUTCOMES]")
             .finish()
     }
 }
@@ -195,42 +199,66 @@ impl ToolServices for SdkToolServices {
         request: TypedToolRequest,
         context: RequestContext,
     ) -> Result<TypedToolResult, ServiceError> {
+        let protocol_request_id = protocol_request_id(context.request_id());
         let cancellation = context.cancellation().clone();
         let deadline = tokio::time::Instant::from_std(context.deadline());
-        let ownership = tokio::select! {
-            biased;
-            () = cancellation.cancelled() => return Err(ServiceError::Cancelled),
-            () = tokio::time::sleep_until(deadline) => {
-                return Err(ServiceError::DeadlineExceeded);
+        let mut host_dispatched = false;
+        let outcome = async {
+            let ownership = tokio::select! {
+                biased;
+                () = cancellation.cancelled() => Err(ServiceError::Cancelled)?,
+                () = tokio::time::sleep_until(deadline) => {
+                    Err(ServiceError::DeadlineExceeded)?
+                }
+                permit = Arc::clone(&self.ownership).acquire_owned() => {
+                    permit.map_err(|_| ServiceError::Unavailable)?
+                }
+            };
+            let sender = self.calls.clone();
+            let permit = tokio::select! {
+                biased;
+                () = cancellation.cancelled() => Err(ServiceError::Cancelled)?,
+                () = tokio::time::sleep_until(deadline) => {
+                    Err(ServiceError::DeadlineExceeded)?
+                }
+                permit = sender.reserve_owned() => {
+                    permit.map_err(|_| ServiceError::Unavailable)?
+                }
+            };
+            if !self
+                .output
+                .begin_service_dispatch(&protocol_request_id)
+                .map_err(|_| ServiceError::Internal)?
+            {
+                return Err(ServiceError::Cancelled);
             }
-            permit = Arc::clone(&self.ownership).acquire_owned() => {
-                permit.map_err(|_| ServiceError::Unavailable)?
+            host_dispatched = true;
+            let (response, result) = oneshot::channel();
+            permit.send(ServiceCall {
+                request,
+                context,
+                protocol_request_id: protocol_request_id.clone(),
+                output: Arc::clone(&self.output),
+                response,
+                ownership,
+            });
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => Err(ServiceError::Cancelled),
+                () = tokio::time::sleep_until(deadline) => Err(ServiceError::DeadlineExceeded),
+                outcome = result => outcome.map_err(|_| ServiceError::Unavailable)?,
             }
-        };
-        let sender = self.calls.clone();
-        let permit = tokio::select! {
-            biased;
-            () = cancellation.cancelled() => return Err(ServiceError::Cancelled),
-            () = tokio::time::sleep_until(deadline) => {
-                return Err(ServiceError::DeadlineExceeded);
-            }
-            permit = sender.reserve_owned() => {
-                permit.map_err(|_| ServiceError::Unavailable)?
-            }
-        };
-        let (response, result) = oneshot::channel();
-        permit.send(ServiceCall {
-            request,
-            context,
-            response,
-            ownership,
-        });
-        tokio::select! {
-            biased;
-            () = cancellation.cancelled() => Err(ServiceError::Cancelled),
-            () = tokio::time::sleep_until(deadline) => Err(ServiceError::DeadlineExceeded),
-            outcome = result => outcome.map_err(|_| ServiceError::Unavailable)?,
         }
+        .await;
+        if !host_dispatched
+            && self
+                .output
+                .commit_mutation_service(&protocol_request_id, service_result_class(&outcome))
+                .is_err()
+        {
+            return Err(ServiceError::Internal);
+        }
+        outcome
     }
 }
 
@@ -256,10 +284,21 @@ pub(crate) async fn run_service_calls<S: ToolServices>(
                     let ServiceCall {
                         request,
                         context,
+                        protocol_request_id,
+                        output,
                         response,
                         ownership,
                     } = call;
-                    let result = services.call(request, context).await;
+                    let mut result = services.call(request, context).await;
+                    if output
+                        .commit_mutation_service(
+                            &protocol_request_id,
+                            service_result_class(&result),
+                        )
+                        .is_err()
+                    {
+                        result = Err(ServiceError::Internal);
+                    }
                     drop(ownership);
                     let _ = response.send(result);
                 });
@@ -268,6 +307,31 @@ pub(crate) async fn run_service_calls<S: ToolServices>(
     }
     drop(receiver);
     while active.join_next().await.is_some() {}
+}
+
+fn protocol_request_id(request_id: &ServiceRequestId) -> ProtocolRequestId {
+    match request_id {
+        ServiceRequestId::Integer(value) => ProtocolRequestId::Number(*value),
+        ServiceRequestId::String(value) => ProtocolRequestId::String(Arc::clone(value)),
+    }
+}
+
+fn service_result_class<T>(result: &Result<T, ServiceError>) -> AuditResultClass {
+    match result {
+        Ok(_value) => AuditResultClass::Succeeded,
+        Err(error) => match error.class() {
+            ServiceErrorClass::Cancelled => AuditResultClass::Cancelled,
+            ServiceErrorClass::DeadlineExceeded => AuditResultClass::DeadlineExceeded,
+            ServiceErrorClass::ResourceExhausted | ServiceErrorClass::InvalidResult => {
+                AuditResultClass::ResourceExhausted
+            }
+            ServiceErrorClass::InvalidRequest
+            | ServiceErrorClass::NotFound
+            | ServiceErrorClass::Unauthorized
+            | ServiceErrorClass::Unavailable
+            | ServiceErrorClass::Internal => AuditResultClass::ServiceRejected,
+        },
+    }
 }
 
 pub(crate) struct ArtifactCall {
@@ -533,8 +597,6 @@ pub(crate) enum SdkReaperDrain {
 pub(crate) enum SdkThreadError {
     #[error("MCP SDK reaper capacity is exhausted")]
     ReaperCapacity,
-    #[error("MCP SDK reaper thread could not be spawned")]
-    ReaperSpawn(#[source] std::io::Error),
     #[error("MCP SDK worker thread could not be spawned")]
     WorkerSpawn(#[source] std::io::Error),
     #[error("MCP SDK worker thread panicked")]
@@ -548,86 +610,194 @@ pub(crate) enum SdkThreadError {
 #[derive(Debug)]
 struct ReapRequest {
     thread: ThreadJoinHandle<()>,
-    _permit: OwnedSemaphorePermit,
 }
 
-#[derive(Clone, Debug)]
-struct SdkThreadReaperHandle {
-    sender: SyncSender<ReapRequest>,
-    pending: Arc<AtomicUsize>,
-}
+const MAX_PROCESS_SDK_THREADS: usize = 64;
+const SDK_REAPER_POLL_INTERVAL: Duration = Duration::from_millis(1);
+const _: () = assert!(MAX_PROCESS_SDK_THREADS > 0);
 
-impl SdkThreadReaperHandle {
-    fn transfer(&self, request: ReapRequest) -> Result<(), ReapRequest> {
-        self.pending.fetch_add(1, Ordering::SeqCst);
-        match self.sender.try_send(request) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(request) | TrySendError::Disconnected(request)) => {
-                self.pending.fetch_sub(1, Ordering::SeqCst);
-                Err(request)
-            }
-        }
-    }
+static SDK_THREAD_SLOTS: [Mutex<SdkThreadSlot>; MAX_PROCESS_SDK_THREADS] =
+    [const { Mutex::new(SdkThreadSlot::Available) }; MAX_PROCESS_SDK_THREADS];
+static PROCESS_SDK_REAPER: LazyLock<Result<ProcessSdkThreadReaper, std::io::Error>> =
+    LazyLock::new(ProcessSdkThreadReaper::try_new);
+
+#[derive(Debug)]
+enum SdkThreadSlot {
+    Available,
+    Reserved,
+    Running(ReapRequest),
 }
 
 #[derive(Debug)]
-pub(crate) struct SdkThreadReaper {
-    capacity: Arc<Semaphore>,
-    sender: Option<SyncSender<ReapRequest>>,
-    pending: Arc<AtomicUsize>,
-    failed: Arc<AtomicBool>,
-    changed: Arc<tokio::sync::Notify>,
-    thread: Option<ThreadJoinHandle<()>>,
+struct ProcessSdkThreadReaper {
+    handle: SdkThreadReaper,
+    _observer: ThreadJoinHandle<()>,
 }
 
-impl SdkThreadReaper {
-    pub(crate) fn try_new(maximum_pending: NonZeroUsize) -> Result<Self, SdkThreadError> {
-        let (sender, receiver) = sync_channel::<ReapRequest>(maximum_pending.get());
+impl ProcessSdkThreadReaper {
+    fn try_new() -> Result<Self, std::io::Error> {
+        let (wake, receiver) = sync_channel::<()>(1);
         let pending = Arc::new(AtomicUsize::new(0));
         let failed = Arc::new(AtomicBool::new(false));
         let changed = Arc::new(tokio::sync::Notify::new());
-        let reaper_pending = Arc::clone(&pending);
-        let reaper_failed = Arc::clone(&failed);
-        let reaper_changed = Arc::clone(&changed);
-        let thread = std::thread::Builder::new()
+        #[cfg(test)]
+        let scans = Arc::new(AtomicUsize::new(0));
+        #[cfg(test)]
+        let scan_changed = Arc::new(tokio::sync::Notify::new());
+        let observer_pending = Arc::clone(&pending);
+        let observer_failed = Arc::clone(&failed);
+        let observer_changed = Arc::clone(&changed);
+        #[cfg(test)]
+        let observer_scans = Arc::clone(&scans);
+        #[cfg(test)]
+        let observer_scan_changed = Arc::clone(&scan_changed);
+        let observer = std::thread::Builder::new()
             .name("market-squawk-mcp-sdk-reaper".to_owned())
             .spawn(move || {
-                while let Ok(request) = receiver.recv() {
-                    if request.thread.join().is_err() {
-                        reaper_failed.store(true, Ordering::SeqCst);
+                loop {
+                    let available = if observer_pending.load(Ordering::SeqCst) == 0 {
+                        receiver.recv().is_ok()
+                    } else {
+                        match receiver.recv_timeout(SDK_REAPER_POLL_INTERVAL) {
+                            Ok(()) | Err(RecvTimeoutError::Timeout) => true,
+                            Err(RecvTimeoutError::Disconnected) => false,
+                        }
+                    };
+                    if !available {
+                        return;
                     }
-                    drop(request._permit);
-                    reaper_pending.fetch_sub(1, Ordering::SeqCst);
-                    reaper_changed.notify_waiters();
+                    reap_finished_sdk_threads(
+                        &observer_pending,
+                        &observer_failed,
+                        &observer_changed,
+                        #[cfg(test)]
+                        &observer_scans,
+                        #[cfg(test)]
+                        &observer_scan_changed,
+                    );
                 }
-            })
-            .map_err(SdkThreadError::ReaperSpawn)?;
+            })?;
         Ok(Self {
-            capacity: Arc::new(Semaphore::new(maximum_pending.get())),
-            sender: Some(sender),
-            pending,
-            failed,
-            changed,
-            thread: Some(thread),
+            handle: SdkThreadReaper {
+                wake,
+                pending,
+                failed,
+                changed,
+                #[cfg(test)]
+                scans,
+                #[cfg(test)]
+                scan_changed,
+            },
+            _observer: observer,
         })
     }
+}
 
-    fn handle(&self) -> Result<SdkThreadReaperHandle, SdkThreadError> {
-        let sender = self
-            .sender
+fn reap_finished_sdk_threads(
+    pending: &AtomicUsize,
+    failed: &AtomicBool,
+    changed: &tokio::sync::Notify,
+    #[cfg(test)] scans: &AtomicUsize,
+    #[cfg(test)] scan_changed: &tokio::sync::Notify,
+) {
+    for slot in &SDK_THREAD_SLOTS {
+        let request = {
+            let mut state = slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match &*state {
+                SdkThreadSlot::Running(request) if request.thread.is_finished() => {
+                    match std::mem::replace(&mut *state, SdkThreadSlot::Available) {
+                        SdkThreadSlot::Running(request) => Some(request),
+                        SdkThreadSlot::Available | SdkThreadSlot::Reserved => None,
+                    }
+                }
+                SdkThreadSlot::Available | SdkThreadSlot::Reserved | SdkThreadSlot::Running(_) => {
+                    None
+                }
+            }
+        };
+        if let Some(request) = request {
+            if request.thread.join().is_err() {
+                failed.store(true, Ordering::SeqCst);
+            }
+            pending.fetch_sub(1, Ordering::SeqCst);
+            changed.notify_waiters();
+        }
+    }
+    #[cfg(test)]
+    {
+        scans.fetch_add(1, Ordering::SeqCst);
+        scan_changed.notify_waiters();
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SdkThreadReaper {
+    wake: SyncSender<()>,
+    pending: Arc<AtomicUsize>,
+    failed: Arc<AtomicBool>,
+    changed: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    scans: Arc<AtomicUsize>,
+    #[cfg(test)]
+    scan_changed: Arc<tokio::sync::Notify>,
+}
+
+impl SdkThreadReaper {
+    pub(crate) fn process() -> Result<Self, SdkThreadError> {
+        PROCESS_SDK_REAPER
             .as_ref()
-            .cloned()
-            .ok_or(SdkThreadError::ReaperUnavailable)?;
-        Ok(SdkThreadReaperHandle {
-            sender,
-            pending: Arc::clone(&self.pending),
-        })
+            .map(|service| service.handle.clone())
+            .map_err(|_error| SdkThreadError::ReaperUnavailable)
     }
 
-    fn try_reserve(&self) -> Result<OwnedSemaphorePermit, SdkThreadError> {
-        Arc::clone(&self.capacity)
-            .try_acquire_owned()
-            .map_err(|_error| SdkThreadError::ReaperCapacity)
+    fn try_reserve(&self) -> Result<SdkThreadReaperReservation, SdkThreadError> {
+        for (index, slot) in SDK_THREAD_SLOTS.iter().enumerate() {
+            let completed = {
+                let mut state = slot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                match &*state {
+                    SdkThreadSlot::Available => {
+                        *state = SdkThreadSlot::Reserved;
+                        return Ok(SdkThreadReaperReservation {
+                            index,
+                            active: true,
+                        });
+                    }
+                    SdkThreadSlot::Running(request) if request.thread.is_finished() => {
+                        match std::mem::replace(&mut *state, SdkThreadSlot::Reserved) {
+                            SdkThreadSlot::Running(request) => Some(request),
+                            SdkThreadSlot::Available | SdkThreadSlot::Reserved => None,
+                        }
+                    }
+                    SdkThreadSlot::Reserved | SdkThreadSlot::Running(_) => None,
+                }
+            };
+            if let Some(request) = completed {
+                if request.thread.join().is_err() {
+                    self.failed.store(true, Ordering::SeqCst);
+                }
+                self.pending.fetch_sub(1, Ordering::SeqCst);
+                self.changed.notify_waiters();
+                return Ok(SdkThreadReaperReservation {
+                    index,
+                    active: true,
+                });
+            }
+        }
+        Err(SdkThreadError::ReaperCapacity)
+    }
+
+    fn worker_finished(&self) {
+        match self.wake.try_send(()) {
+            Ok(()) | Err(TrySendError::Full(())) => {}
+            Err(TrySendError::Disconnected(())) => {
+                self.failed.store(true, Ordering::SeqCst);
+                self.changed.notify_waiters();
+            }
+        }
     }
 
     pub(crate) fn pending_count(&self) -> usize {
@@ -656,13 +826,48 @@ impl SdkThreadReaper {
             }
         }
     }
+
+    #[cfg(test)]
+    async fn wait_for_scan_after(&self, prior: usize) {
+        loop {
+            let changed = self.scan_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.scans.load(Ordering::SeqCst) > prior {
+                return;
+            }
+            changed.as_mut().await;
+        }
+    }
 }
 
-impl Drop for SdkThreadReaper {
+#[derive(Debug)]
+struct SdkThreadReaperReservation {
+    index: usize,
+    active: bool,
+}
+
+impl SdkThreadReaperReservation {
+    fn retain(mut self, thread: ThreadJoinHandle<()>, reaper: &SdkThreadReaper) {
+        reaper.pending.fetch_add(1, Ordering::SeqCst);
+        let mut state = SDK_THREAD_SLOTS[self.index]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *state = SdkThreadSlot::Running(ReapRequest { thread });
+        self.active = false;
+        drop(state);
+        reaper.worker_finished();
+    }
+}
+
+impl Drop for SdkThreadReaperReservation {
     fn drop(&mut self) {
-        self.sender.take();
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+        if self.active {
+            let mut state = SDK_THREAD_SLOTS[self.index]
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *state = SdkThreadSlot::Available;
+            self.active = false;
         }
     }
 }
@@ -671,8 +876,8 @@ pub(crate) struct OwnedSdkThread<T: Send + 'static> {
     cancellation: CancellationToken,
     outcome: oneshot::Receiver<T>,
     thread: Option<ThreadJoinHandle<()>>,
-    reaper: SdkThreadReaperHandle,
-    reaper_permit: Option<OwnedSemaphorePermit>,
+    reaper: SdkThreadReaper,
+    reaper_reservation: Option<SdkThreadReaperReservation>,
 }
 
 impl<T: Send + 'static> std::fmt::Debug for OwnedSdkThread<T> {
@@ -680,7 +885,10 @@ impl<T: Send + 'static> std::fmt::Debug for OwnedSdkThread<T> {
         formatter
             .debug_struct("OwnedSdkThread")
             .field("thread_owned", &self.thread.is_some())
-            .field("reaper_permit_owned", &self.reaper_permit.is_some())
+            .field(
+                "reaper_reservation_owned",
+                &self.reaper_reservation.is_some(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -697,8 +905,9 @@ where
     where
         F: FnOnce(CancellationToken) -> T + Send + 'static,
     {
-        let reaper_permit = reaper.try_reserve()?;
-        let reaper = reaper.handle()?;
+        let reaper_reservation = reaper.try_reserve()?;
+        let reaper = reaper.clone();
+        let worker_reaper = reaper.clone();
         let cancellation = CancellationToken::new();
         let worker_cancellation = cancellation.clone();
         let (outcome_sender, outcome) = oneshot::channel();
@@ -707,6 +916,7 @@ where
             .spawn(move || {
                 let outcome = work(worker_cancellation);
                 let _ = outcome_sender.send(outcome);
+                worker_reaper.worker_finished();
             })
             .map_err(SdkThreadError::WorkerSpawn)?;
         Ok(Self {
@@ -714,7 +924,7 @@ where
             outcome,
             thread: Some(thread),
             reaper,
-            reaper_permit: Some(reaper_permit),
+            reaper_reservation: Some(reaper_reservation),
         })
     }
 
@@ -752,22 +962,17 @@ where
         let joined = thread
             .join()
             .map_err(|_panic| SdkThreadError::WorkerPanicked);
-        self.reaper_permit.take();
+        self.reaper_reservation.take();
         joined
     }
 
     fn transfer_or_join(&mut self) {
-        let (Some(thread), Some(permit)) = (self.thread.take(), self.reaper_permit.take()) else {
+        let (Some(thread), Some(reservation)) =
+            (self.thread.take(), self.reaper_reservation.take())
+        else {
             return;
         };
-        let request = ReapRequest {
-            thread,
-            _permit: permit,
-        };
-        if let Err(request) = self.reaper.transfer(request) {
-            let _ = request.thread.join();
-            drop(request._permit);
-        }
+        reservation.retain(thread, &self.reaper);
     }
 }
 
@@ -927,20 +1132,124 @@ impl Drop for SessionSupervisor {
 #[cfg(test)]
 mod thread_reaper_tests {
     use std::{
-        num::NonZeroUsize,
         sync::{
-            Arc, Condvar, Mutex,
+            Arc, Condvar, LazyLock, Mutex,
             atomic::{AtomicBool, AtomicUsize, Ordering},
+            mpsc,
         },
         time::Duration,
     };
 
     use super::{OwnedSdkThread, SdkReaperDrain, SdkThreadReaper, SdkThreadShutdown};
 
+    static REAPER_TEST_SERIAL: LazyLock<tokio::sync::Mutex<()>> =
+        LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+    #[tokio::test]
+    async fn process_reaper_rescans_after_a_precompletion_wake()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let _serial = REAPER_TEST_SERIAL.lock().await;
+        let reaper = SdkThreadReaper::process()?;
+        assert_eq!(
+            reaper.drain(Duration::from_secs(1)).await?,
+            SdkReaperDrain::Complete
+        );
+        let prior_scans = reaper.scans.load(Ordering::SeqCst);
+        let reservation = reaper.try_reserve()?;
+        let latch = Arc::new((Mutex::new(false), Condvar::new()));
+        let worker_latch = Arc::clone(&latch);
+        let (entered_sender, entered) = mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let _ = entered_sender.send(());
+            let (released, changed) = &*worker_latch;
+            let mut released = released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while !*released {
+                released = changed
+                    .wait(released)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        });
+        entered.recv_timeout(Duration::from_secs(1))?;
+        reservation.retain(worker, &reaper);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            reaper.wait_for_scan_after(prior_scans),
+        )
+        .await?;
+        let (released, changed) = &*latch;
+        *released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        changed.notify_all();
+        assert_eq!(
+            reaper.drain(Duration::from_secs(1)).await?,
+            SdkReaperDrain::Complete
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_owner_drop_never_joins_a_transferred_sdk_thread()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let _serial = REAPER_TEST_SERIAL.lock().await;
+        let latch = Arc::new((Mutex::new(false), Condvar::new()));
+        let (entered_sender, entered) = mpsc::sync_channel(1);
+        let (session_dropped_sender, session_dropped) = mpsc::sync_channel(1);
+        let owner_latch = Arc::clone(&latch);
+        let owner = std::thread::spawn(move || -> Result<(), super::SdkThreadError> {
+            let reaper = SdkThreadReaper::process()?;
+            let worker_latch = Arc::clone(&owner_latch);
+            let worker = OwnedSdkThread::try_spawn(
+                &reaper,
+                "market-squawk-mcp-stuck-sdk-test",
+                move |_token| {
+                    let _ = entered_sender.send(());
+                    let (released, changed) = &*worker_latch;
+                    let mut released = released
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    while !*released {
+                        released = changed
+                            .wait(released)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    }
+                },
+            )?;
+            drop(worker);
+            drop(reaper);
+            let _ = session_dropped_sender.send(());
+            Ok(())
+        });
+        entered.recv_timeout(Duration::from_secs(1))?;
+        let dropped_before_release = session_dropped.recv_timeout(Duration::from_secs(1)).is_ok();
+        let (released, changed) = &*latch;
+        *released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        changed.notify_all();
+        owner
+            .join()
+            .map_err(|_| "session owner thread panicked")??;
+        assert_eq!(
+            SdkThreadReaper::process()?
+                .drain(Duration::from_secs(1))
+                .await?,
+            SdkReaperDrain::Complete
+        );
+        assert!(
+            dropped_before_release,
+            "session drop joined the still-running SDK worker"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn sdk_thread_start_pre_reserves_reaping_and_timeout_never_detaches_the_join_handle()
     -> Result<(), Box<dyn std::error::Error>> {
-        let reaper = SdkThreadReaper::try_new(NonZeroUsize::MIN)?;
+        let _serial = REAPER_TEST_SERIAL.lock().await;
+        let reaper = SdkThreadReaper::process()?;
         let entered = Arc::new(AtomicUsize::new(0));
         let cancelled = Arc::new(AtomicBool::new(false));
         let latch = Arc::new((Mutex::new(false), Condvar::new()));
@@ -968,16 +1277,6 @@ mod thread_reaper_tests {
         while entered.load(Ordering::SeqCst) == 0 {
             tokio::task::yield_now().await;
         }
-
-        let rejected_spawns = Arc::new(AtomicUsize::new(0));
-        let rejected_counter = Arc::clone(&rejected_spawns);
-        assert!(
-            OwnedSdkThread::try_spawn(&reaper, "must-not-spawn", move |_token| {
-                rejected_counter.fetch_add(1, Ordering::SeqCst);
-            })
-            .is_err()
-        );
-        assert_eq!(rejected_spawns.load(Ordering::SeqCst), 0);
 
         assert_eq!(
             worker.shutdown(Duration::from_millis(10)).await?,

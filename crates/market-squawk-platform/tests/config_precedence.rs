@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, ffi::OsString, path::PathBuf};
 use market_squawk_domain::{AssetClass, Denomination, LiveEventClass, MarketDepth, TradingStatus};
 use market_squawk_platform::{
     AppConfig, COINBASE_EXCHANGE_ENDPOINT, ConfigError, ConfigOverrides, ConfigSources,
-    SecretReference,
+    KRAKEN_WEBSOCKET_V2_ENDPOINT, SecretReference,
 };
 use tempfile::tempdir;
 
@@ -89,6 +89,76 @@ fn coinbase_config_json(max_frame_bytes: usize) -> String {
   }}]
 }}"#
     )
+}
+
+fn kraken_config_json(endpoint: &str) -> String {
+    format!(
+        r#"{{
+  "endpoint":"{endpoint}",
+  "channel":"book",
+  "depth":10,
+  "freshness_ms":5000,
+  "max_frame_bytes":1048576,
+  "subscription_ack_timeout_ms":5000,
+  "control_message_capacity":64,
+  "control_byte_capacity":65536,
+  "authorization":{{
+    "mode":"public_interface",
+    "provider":"kraken",
+    "basis":"user-reviewed-kraken-public-interface",
+    "evidence_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "evidence_reference":"https://docs.kraken.com/api/docs/websocket-v2/book/",
+    "evidence_version":"reviewed-2026-07-21",
+    "effective_from_unix_nanos":1700000000000000000,
+    "effective_until_unix_nanos":1900000000000000000
+  }},
+  "instrument":{{
+    "symbol":"BTC/USD",
+    "instrument_id":"4c74ab95-53b9-42ad-9b66-0ed403b88fed",
+    "definition_revision":1,
+    "asset_class":"crypto",
+    "primary_asset":"b9f6d14f-9140-4ca3-a412-9bd59b3b5e67",
+    "quote_currency":"USD",
+    "tick_size":"0.1",
+    "lot_size":"0.00000001",
+    "contract_multiplier":"1",
+    "venue":"kraken",
+    "trading_status":"active"
+  }}
+}}"#
+    )
+}
+
+#[test]
+fn production_kraken_config_is_explicit_typed_and_endpoint_sealed()
+-> Result<(), Box<dyn std::error::Error>> {
+    let json = kraken_config_json(KRAKEN_WEBSOCKET_V2_ENDPOINT);
+    let kraken_environment = environment(&[("MARKET_SQUAWK_KRAKEN_JSON", &json)]);
+    let config = AppConfig::load(ConfigSources::new(
+        None,
+        &kraken_environment,
+        ConfigOverrides::default(),
+    ))?;
+    let kraken = config.kraken().ok_or("Kraken configuration missing")?;
+    assert_eq!(kraken.endpoint(), KRAKEN_WEBSOCKET_V2_ENDPOINT);
+    assert_eq!(kraken.symbol(), "BTC/USD");
+    assert_eq!(kraken.depth(), 10);
+    assert_eq!(
+        kraken.definition().venue_mappings()[0].venue_id().as_str(),
+        "kraken"
+    );
+
+    let local = kraken_config_json("ws://127.0.0.1:9000");
+    let local_environment = environment(&[("MARKET_SQUAWK_KRAKEN_JSON", &local)]);
+    assert!(
+        AppConfig::load(ConfigSources::new(
+            None,
+            &local_environment,
+            ConfigOverrides::default(),
+        ))
+        .is_err()
+    );
+    Ok(())
 }
 
 #[test]

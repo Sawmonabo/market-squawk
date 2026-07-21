@@ -150,6 +150,7 @@ pub(in crate::capture) struct CaptureWriterDestinationFences {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(in crate::capture) struct CaptureWriterStartupOptions {
+    #[cfg(all(feature = "capture-test", debug_assertions))]
     fail_after_destination_fence: bool,
 }
 

@@ -31,6 +31,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::super::{
     composition::ProductionCoinbaseProfile,
+    provider::ProductionMarketDecoder,
     route_actor::{RouteBufferLimits, spawn_route_activation},
     sink::{
         ProductionRawMarketSink, ProductionRawMarketSinkInput, ProductionSinkFailure,
@@ -153,7 +154,7 @@ async fn capture_receipt_precedes_fail_closed_pre_acknowledgement_data() -> Test
         registry: &mut registry,
         session: &session,
         health_reporter,
-        decoder: profile.decoder().clone(),
+        decoder: ProductionMarketDecoder::Coinbase(profile.decoder().clone()),
         subscription,
         live_ingress,
         routes: vec![route_activation],
@@ -288,7 +289,7 @@ async fn acknowledged_frames_reach_the_immutable_live_book_without_execution_qua
         registry: &mut registry,
         session: &session,
         health_reporter,
-        decoder: profile.decoder().clone(),
+        decoder: ProductionMarketDecoder::Coinbase(profile.decoder().clone()),
         subscription,
         live_ingress,
         routes: vec![route_activation],

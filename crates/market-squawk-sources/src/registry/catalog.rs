@@ -632,6 +632,52 @@ impl AuthoritativeSourceRegistry {
         })
     }
 
+    /// Mints the sole one-use live-adapter authority for this exact current generation.
+    ///
+    /// Capture initialization must already be healthy. The returned capability internally owns
+    /// the session lease, capture generation, sole frame factory, registry clock, and exact shared
+    /// provider-budget allocation; callers cannot assemble or substitute those components.
+    ///
+    /// # Errors
+    ///
+    /// Rejects stale/transplanted sessions, unhealthy capture, and any prior frame-factory or
+    /// live-generation issuance for this generation.
+    pub fn take_live_source_generation(
+        &mut self,
+        session: &CurrentSourceSession,
+    ) -> Result<LiveSourceGeneration, RegistryError> {
+        self.validate_session_structure(session)?;
+        let entry = self
+            .entries
+            .get_mut(session.source_id())
+            .ok_or(RegistryError::UnknownSource)?;
+        let active = entry
+            .active
+            .as_mut()
+            .ok_or(RegistryError::SessionNotCurrent)?;
+        if !active.capture_issuer_taken || !active.capture.is_healthy() {
+            return Err(RegistryError::CaptureNotHealthy);
+        }
+        if active.raw_frame_factory_taken {
+            return Err(RegistryError::RawFrameFactoryAlreadyTaken);
+        }
+        active.raw_frame_factory_taken = true;
+        Ok(LiveSourceGeneration {
+            binding: session.binding.clone(),
+            lease: Arc::clone(&session.lease),
+            capture: session.capture.clone(),
+            frames: RawFrameFactory {
+                binding: session.binding.clone(),
+                lease: Arc::clone(&session.lease),
+                clock: Arc::clone(&self.clock),
+                not_sync: PhantomData,
+            },
+            budget: session.budget.clone(),
+            budget_witness: session.budget.clone(),
+            not_sync: PhantomData,
+        })
+    }
+
     /// Ends the exact current session, invalidating its retained handle.
     ///
     /// # Errors

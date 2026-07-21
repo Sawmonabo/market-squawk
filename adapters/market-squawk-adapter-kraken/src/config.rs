@@ -206,6 +206,56 @@ impl KrakenConfig {
     pub const fn max_message_bytes(&self) -> usize {
         self.max_message_bytes.get()
     }
+
+    pub(crate) fn authorize_endpoint(&self) -> Result<(), KrakenConfigError> {
+        if self.endpoint.as_str() == KRAKEN_ENDPOINT {
+            return self
+                .metadata
+                .network_policy()
+                .authorize(KRAKEN_ENDPOINT)
+                .map_err(|_| KrakenConfigError::Endpoint);
+        }
+        #[cfg(all(feature = "loopback-fixture", debug_assertions))]
+        if is_local_test_endpoint(&self.endpoint) {
+            return Ok(());
+        }
+        Err(KrakenConfigError::Endpoint)
+    }
+
+    /// Replaces the sealed endpoint with a loopback-only deterministic test connector.
+    ///
+    /// This API does not exist unless both the explicit loopback-fixture feature and debug
+    /// assertions are enabled. Production and release all-features builds therefore have no
+    /// endpoint override.
+    #[cfg(all(feature = "loopback-fixture", debug_assertions))]
+    pub fn with_local_endpoint_for_test(
+        mut self,
+        endpoint: &str,
+    ) -> Result<Self, KrakenConfigError> {
+        let endpoint = Url::parse(endpoint).map_err(|_| KrakenConfigError::Endpoint)?;
+        if !is_local_test_endpoint(&endpoint) {
+            return Err(KrakenConfigError::Endpoint);
+        }
+        self.endpoint = endpoint;
+        Ok(self)
+    }
+}
+
+#[cfg(all(feature = "loopback-fixture", debug_assertions))]
+fn is_local_test_endpoint(endpoint: &Url) -> bool {
+    let loopback = match endpoint.host() {
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        Some(url::Host::Domain(_)) | None => false,
+    };
+    endpoint.scheme() == "ws"
+        && loopback
+        && endpoint.port().is_some()
+        && endpoint.username().is_empty()
+        && endpoint.password().is_none()
+        && endpoint.query().is_none()
+        && endpoint.fragment().is_none()
+        && endpoint.path() == "/"
 }
 
 impl SourceMetadataProvider for KrakenConfig {
@@ -229,10 +279,4 @@ pub enum KrakenConfigError {
     /// The per-message bound exceeds global capture limits.
     #[error("Kraken message bound is invalid")]
     MessageBound,
-    /// The source was paired with another registered source or metadata revision.
-    #[error("Kraken source session does not match configured source metadata")]
-    SessionMismatch,
-    /// The current registry session has no coordinated provider budget.
-    #[error("Kraken source session has no coordinated provider budget")]
-    MissingSharedBudget,
 }

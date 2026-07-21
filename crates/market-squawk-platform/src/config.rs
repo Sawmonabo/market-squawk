@@ -19,6 +19,8 @@ mod instruments;
 pub use instruments::{
     COINBASE_EXCHANGE_ENDPOINT, CoinbaseAuthorizationAttestation, CoinbaseConfigurationError,
     CoinbaseControlLimits, CoinbaseInstrumentMapping, CoinbaseSourceConfig,
+    KRAKEN_WEBSOCKET_V2_ENDPOINT, KrakenAuthorizationAttestation, KrakenConfigurationError,
+    KrakenInstrumentMapping, KrakenSourceConfig,
 };
 
 const ENV_PREFIX: &str = "MARKET_SQUAWK_";
@@ -161,6 +163,8 @@ pub struct ConfigOverrides {
     pub source_secret: Option<SecretReference>,
     /// Complete validated production Coinbase source profile.
     pub coinbase: Option<CoinbaseSourceConfig>,
+    /// Complete validated production Kraken book-v2 source profile.
+    pub kraken: Option<KrakenSourceConfig>,
 }
 
 /// Explicit input set for deterministic configuration loading.
@@ -218,6 +222,7 @@ struct FileConfig {
     source_shutdown_ms: Option<u64>,
     source_secret: Option<String>,
     coinbase: Option<CoinbaseSourceConfig>,
+    kraken: Option<KrakenSourceConfig>,
 }
 
 /// Validated effective local configuration.
@@ -235,6 +240,7 @@ pub struct AppConfig {
     source_shutdown: Duration,
     source_secret: Option<SecretReference>,
     coinbase: Option<CoinbaseSourceConfig>,
+    kraken: Option<KrakenSourceConfig>,
 }
 
 impl fmt::Debug for AppConfig {
@@ -262,6 +268,7 @@ impl fmt::Debug for AppConfig {
                 &self.source_secret.as_ref().map(|_| "[REDACTED]"),
             )
             .field("coinbase", &self.coinbase)
+            .field("kraken", &self.kraken)
             .finish()
     }
 }
@@ -294,6 +301,7 @@ impl Default for AppConfig {
             source_shutdown: Duration::from_millis(DEFAULT_SOURCE_SHUTDOWN_MS),
             source_secret: None,
             coinbase: None,
+            kraken: None,
         }
     }
 }
@@ -381,6 +389,11 @@ impl AppConfig {
     pub const fn coinbase(&self) -> Option<&CoinbaseSourceConfig> {
         self.coinbase.as_ref()
     }
+
+    /// Returns the optional strict production Kraken book-v2 source profile.
+    pub const fn kraken(&self) -> Option<&KrakenSourceConfig> {
+        self.kraken.as_ref()
+    }
 }
 
 impl From<AppConfig> for ConfigOverrides {
@@ -402,6 +415,7 @@ impl From<AppConfig> for ConfigOverrides {
             source_shutdown_ms: Some(duration_millis(config.source_shutdown)),
             source_secret: config.source_secret,
             coinbase: config.coinbase,
+            kraken: config.kraken,
         }
     }
 }
@@ -456,6 +470,9 @@ impl ConfigOverrides {
         if higher.coinbase.is_some() {
             self.coinbase = higher.coinbase;
         }
+        if higher.kraken.is_some() {
+            self.kraken = higher.kraken;
+        }
     }
 
     fn apply_file(&mut self, file: FileConfig) -> Result<(), ConfigError> {
@@ -477,6 +494,7 @@ impl ConfigOverrides {
                 .map(SecretReference::try_from)
                 .transpose()?,
             coinbase: file.coinbase,
+            kraken: file.kraken,
         });
         Ok(())
     }
@@ -532,6 +550,9 @@ impl ConfigOverrides {
                 }
                 "MARKET_SQUAWK_COINBASE_JSON" => {
                     layer.coinbase = Some(instruments::parse_environment_profile(value)?);
+                }
+                "MARKET_SQUAWK_KRAKEN_JSON" => {
+                    layer.kraken = Some(instruments::parse_kraken_environment_profile(value)?);
                 }
                 _ => return Err(ConfigError::UnknownEnvironmentKey),
             }
@@ -626,6 +647,7 @@ impl TryFrom<ConfigOverrides> for AppConfig {
             source_shutdown: Duration::from_millis(source_shutdown_ms.get()),
             source_secret: values.source_secret,
             coinbase: values.coinbase,
+            kraken: values.kraken,
         })
     }
 }

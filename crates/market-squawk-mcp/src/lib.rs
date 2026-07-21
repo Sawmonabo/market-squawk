@@ -19,7 +19,8 @@ pub use artifact::{
 };
 pub use audit::{
     AuditCompletion, AuditCompletionReservation, AuditError, AuditEvent, AuditOperation,
-    AuditPhase, AuditResultClass, AuditSink, LocalProcessIdentityClass,
+    AuditPhase, AuditResultClass, AuditSink, LocalProcessIdentityClass, MutationAuditBundle,
+    MutationAuditReservation,
 };
 pub use limits::{McpLimitError, McpLimitSpec, McpLimits};
 pub use server::{McpServer, ServerError, ServerExit};

@@ -180,6 +180,21 @@ pub struct RawFrameFactory {
 }
 
 impl RawFrameFactory {
+    fn shares_generation_graph_with(
+        &self,
+        binding: &FrameSessionBinding,
+        lease: &Arc<SessionLeaseState>,
+        capture: &crate::CaptureGenerationLease,
+    ) -> bool {
+        self.binding.shares_allocation_with(binding)
+            && Arc::ptr_eq(&self.lease, lease)
+            && self
+                .clock
+                .continuity()
+                .shares_allocation_with(&lease.continuity)
+            && capture.is_bound_to(self.clock.continuity(), lease.started_at)
+    }
+
     /// Constructs one bounded exact transport frame under this generation's identity.
     ///
     /// # Errors
@@ -205,6 +220,132 @@ impl RawFrameFactory {
             transport,
             payload,
         )
+    }
+}
+
+/// Registry-minted, one-use authority for constructing one exact live-source generation.
+///
+/// This capability cannot be cloned, serialized, or assembled by an adapter. It retains the exact
+/// registry-issued session lease, capture generation, raw-frame factory, and shared-budget
+/// allocation until an adapter consumes it with [`Self::try_start`].
+#[derive(Debug)]
+pub struct LiveSourceGeneration {
+    binding: FrameSessionBinding,
+    lease: Arc<SessionLeaseState>,
+    capture: crate::CaptureGenerationLease,
+    frames: RawFrameFactory,
+    budget: Option<SharedProviderBudget>,
+    budget_witness: Option<SharedProviderBudget>,
+    not_sync: PhantomData<Cell<()>>,
+}
+
+impl LiveSourceGeneration {
+    /// Consumes this one-use capability and proves it matches the adapter metadata and current
+    /// registry generation before any provider-budget or network operation can be attempted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::SourceError::SessionNotCurrent`] after rollover or revocation,
+    /// [`crate::SourceError::CaptureNotHealthy`] until lossless capture is healthy, and
+    /// [`crate::SourceError::GenerationAuthorityMismatch`] for any metadata or internal authority
+    /// graph mismatch.
+    pub fn try_start(
+        self,
+        metadata: &SourceMetadata,
+    ) -> Result<ActiveLiveSourceGeneration, crate::SourceError> {
+        let Self {
+            binding,
+            lease,
+            capture,
+            frames,
+            budget,
+            budget_witness,
+            not_sync,
+        } = self;
+        let active = ActiveLiveSourceGeneration {
+            binding,
+            lease,
+            capture,
+            frames,
+            budget,
+            budget_witness,
+            not_sync,
+        };
+        if metadata.source_id() != active.binding.source_id()
+            || metadata.revision() != active.binding.metadata_revision()
+        {
+            return Err(crate::SourceError::GenerationAuthorityMismatch);
+        }
+        active.validate_current()?;
+        Ok(active)
+    }
+}
+
+/// Activated exact-generation authority retained privately by one live adapter.
+#[derive(Debug)]
+pub struct ActiveLiveSourceGeneration {
+    binding: FrameSessionBinding,
+    lease: Arc<SessionLeaseState>,
+    capture: crate::CaptureGenerationLease,
+    frames: RawFrameFactory,
+    budget: Option<SharedProviderBudget>,
+    budget_witness: Option<SharedProviderBudget>,
+    not_sync: PhantomData<Cell<()>>,
+}
+
+impl ActiveLiveSourceGeneration {
+    fn authority_graph_is_exact(&self) -> bool {
+        let budget_is_exact = match (&self.budget, &self.budget_witness) {
+            (Some(budget), Some(witness)) => budget.shares_allocation_with(witness),
+            (None, None) => true,
+            _ => false,
+        };
+        budget_is_exact
+            && self.frames.shares_generation_graph_with(
+                &self.binding,
+                &self.lease,
+                &self.capture,
+            )
+    }
+
+    /// Revalidates the registry lease, capture state, and complete generation authority graph.
+    ///
+    /// Adapters call this immediately before provider-budget admission and network connection.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed after rollover/revocation, capture degradation, or an invalid authority graph.
+    pub fn validate_current(&self) -> Result<(), crate::SourceError> {
+        if !self.lease.is_current() {
+            return Err(crate::SourceError::SessionNotCurrent);
+        }
+        if !self.capture.is_healthy() {
+            return Err(crate::SourceError::CaptureNotHealthy);
+        }
+        if !self.authority_graph_is_exact() {
+            return Err(crate::SourceError::GenerationAuthorityMismatch);
+        }
+        Ok(())
+    }
+
+    /// Returns the exact registry-coordinated provider budget after revalidating this generation.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed under the same conditions as [`Self::validate_current`].
+    pub fn budget(&self) -> Result<Option<&SharedProviderBudget>, crate::SourceError> {
+        self.validate_current()?;
+        Ok(self.budget.as_ref())
+    }
+
+    /// Returns the exact generation's sole frame factory after revalidating this generation.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed under the same conditions as [`Self::validate_current`].
+    pub fn frames_mut(&mut self) -> Result<&mut RawFrameFactory, crate::SourceError> {
+        self.validate_current()?;
+        Ok(&mut self.frames)
     }
 }
 

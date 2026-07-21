@@ -35,6 +35,28 @@ fn official_protocol_fixtures_match_the_pinned_manifest() -> TestResult {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
     let manifest: serde_json::Value =
         serde_json::from_slice(&std::fs::read(root.join("manifest.json"))?)?;
+    for (field, expected) in [
+        (
+            "authoritative_url",
+            "https://docs.cdp.coinbase.com/exchange/websocket-feed/channels",
+        ),
+        ("retrieved_at", "2026-07-21"),
+        (
+            "derivation",
+            "Minimal deterministic fixtures transcribed from the documented snapshot, l2update, match, heartbeat, and subscriptions schemas; product, price, quantity, identifiers, and timestamps were normalized for decoder coverage",
+        ),
+        (
+            "protocol_revision",
+            "Coinbase Exchange WebSocket Feed documentation (unversioned; retrieved 2026-07-21)",
+        ),
+        ("terms_url", "https://www.coinbase.com/legal/market_data"),
+    ] {
+        assert_eq!(
+            manifest.get(field).and_then(serde_json::Value::as_str),
+            Some(expected),
+            "fixture manifest omitted exact {field} provenance"
+        );
+    }
     let fixtures = manifest
         .get("fixtures")
         .and_then(serde_json::Value::as_array)

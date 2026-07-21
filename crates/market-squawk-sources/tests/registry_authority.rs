@@ -41,6 +41,7 @@ assert_not_impl_any!(market_squawk_sources::CaptureGenerationCapabilities: Clone
 assert_not_impl_any!(market_squawk_sources::CurrentHealthReporter: Clone, Sync, serde::Serialize);
 assert_not_impl_any!(market_squawk_sources::CurrentHealthUpdate: Clone, serde::Serialize, serde::de::DeserializeOwned);
 assert_not_impl_any!(market_squawk_sources::RawFrameFactory: Clone, Sync, serde::Serialize, serde::de::DeserializeOwned);
+assert_not_impl_any!(market_squawk_sources::LiveSourceGeneration: Clone, Sync, serde::Serialize, serde::de::DeserializeOwned);
 assert_not_impl_any!(market_squawk_sources::CurrentCoveragePolicy: serde::Serialize, serde::de::DeserializeOwned);
 assert_not_impl_any!(market_squawk_platform::LocalAuthorityStateStore: Clone);
 assert_impl_all!(market_squawk_sources::RawMarketFrame: RawCaptureFrameView);
@@ -381,6 +382,78 @@ fn raw_frame_factory_is_once_issued_and_fails_after_session_end() -> TestResult 
         frames.try_frame(TransportFrameKind::Binary, Bytes::from_static(b"late"),),
         Err(market_squawk_sources::SourceError::SessionNotCurrent)
     ));
+    Ok(())
+}
+
+#[test]
+fn live_generation_mint_is_exact_once_current_and_registry_bound() -> TestResult {
+    let metadata = direct_metadata("source-a", "rev-a", 0, Some(100))?;
+    let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
+    let registered = registry.register(metadata.clone(), Timestamp::from_unix_nanos(1))?;
+    let session = registry.begin_session(
+        &registered,
+        SessionId::new(source_identifier("session-a")?),
+        ConnectionGeneration::new(1)?,
+        Timestamp::from_unix_nanos(1),
+    )?;
+    let capture = registry.take_capture_generation_capabilities(&session)?;
+    let (mut capture_initialization, _capture_admission, _capture_degradation) =
+        capture.into_parts();
+    capture_initialization.mark_healthy()?;
+
+    let generation = registry.take_live_source_generation(&session)?;
+    assert!(matches!(
+        registry.take_live_source_generation(&session),
+        Err(RegistryError::RawFrameFactoryAlreadyTaken)
+    ));
+
+    let mut foreign_registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
+    let foreign_registered =
+        foreign_registry.register(metadata.clone(), Timestamp::from_unix_nanos(1))?;
+    let foreign_session = foreign_registry.begin_session(
+        &foreign_registered,
+        SessionId::new(source_identifier("session-a")?),
+        ConnectionGeneration::new(1)?,
+        Timestamp::from_unix_nanos(1),
+    )?;
+    let foreign_capture =
+        foreign_registry.take_capture_generation_capabilities(&foreign_session)?;
+    let (mut foreign_initialization, _foreign_admission, _foreign_degradation) =
+        foreign_capture.into_parts();
+    foreign_initialization.mark_healthy()?;
+    assert!(matches!(
+        foreign_registry.take_live_source_generation(&session),
+        Err(RegistryError::HandleTransplanted)
+    ));
+
+    let successor = registry.begin_next_session(
+        &registered,
+        SessionId::new(source_identifier("session-b")?),
+        Timestamp::from_unix_nanos(2),
+    )?;
+    assert!(matches!(
+        generation.try_start(&metadata),
+        Err(market_squawk_sources::SourceError::SessionNotCurrent)
+    ));
+
+    let successor_capture = registry.take_capture_generation_capabilities(&successor)?;
+    let (mut successor_initialization, _successor_admission, _successor_degradation) =
+        successor_capture.into_parts();
+    successor_initialization.mark_healthy()?;
+    let successor_generation = registry.take_live_source_generation(&successor)?;
+    let mut active = successor_generation.try_start(&metadata)?;
+    assert!(match (active.budget()?, successor.budget()) {
+        (Some(active_budget), Some(session_budget)) => {
+            active_budget.shares_allocation_with(session_budget)
+        }
+        (None, None) => true,
+        _ => false,
+    });
+    let frame = active.frames_mut()?.try_frame(
+        TransportFrameKind::Binary,
+        Bytes::from_static(b"successor-frame"),
+    )?;
+    successor.validate_live_frame(&frame)?;
     Ok(())
 }
 

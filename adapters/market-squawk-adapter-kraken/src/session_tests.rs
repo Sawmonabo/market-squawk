@@ -11,9 +11,9 @@ use market_squawk_domain::{
 };
 use market_squawk_sources::{
     AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode, BackoffPolicy,
-    BudgetDecision, BudgetScope, DecodeOutcome, FreshnessPolicy, LiveMarketSource, MarketDecoder,
-    ProviderBudgetPolicy, RawMarketFrame, RawMarketSink, SessionId, SinkError, SourceError,
-    SourceMetadataProvider,
+    BudgetDecision, BudgetScope, DecodeOutcome, FreshnessPolicy, LiveMarketSource,
+    LiveSourceGeneration, MarketDecoder, ProviderBudgetPolicy, RawMarketFrame, RawMarketSink,
+    RegistryError, SessionId, SinkError, SourceError, SourceMetadataProvider,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
@@ -22,9 +22,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 
 use super::{KrakenDecoderState, KrakenSource};
-use crate::{
-    KrakenConfig, KrakenConfigError, KrakenDepth, KrakenMarketDecoder, KrakenMetadataInput,
-};
+use crate::{KrakenConfig, KrakenDepth, KrakenMarketDecoder, KrakenMetadataInput};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -100,18 +98,13 @@ async fn successor_generation_requires_a_fresh_snapshot_before_health() -> TestR
         ConnectionGeneration::new(1)?,
         Timestamp::from_unix_nanos(1),
     )?;
-    let mut first_frames = registry.take_raw_frame_factory(&first_session)?;
+    let first_generation = live_generation(&mut registry, &first_session)?;
     let (mut first_socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}")).await?;
-    let mut first_source = KrakenSource::try_new(config.clone(), &first_session)?;
+    let mut first_source = KrakenSource::try_new(config.clone(), first_generation)?;
     let mut first_sink = RecordingSink::default();
 
     let first_result = first_source
-        .run_established(
-            &mut first_socket,
-            &mut first_frames,
-            &mut first_sink,
-            CancellationToken::new(),
-        )
+        .run_established(&mut first_socket, &mut first_sink, CancellationToken::new())
         .await;
 
     assert_eq!(first_result, Err(SourceError::InvalidProtocolState));
@@ -149,22 +142,17 @@ async fn successor_generation_requires_a_fresh_snapshot_before_health() -> TestR
         ConnectionGeneration::new(2)?,
         Timestamp::from_unix_nanos(3),
     )?;
-    let mut frames = registry.take_raw_frame_factory(&successor_session)?;
+    let successor_generation = live_generation(&mut registry, &successor_session)?;
     let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}")).await?;
     let budget = successor_session
         .budget()
         .cloned()
         .ok_or("source session has no coordinated budget")?;
-    let mut source = KrakenSource::try_new(config, &successor_session)?;
+    let mut source = KrakenSource::try_new(config, successor_generation)?;
     let mut sink = RecordingSink::default();
 
     let result = source
-        .run_established(
-            &mut socket,
-            &mut frames,
-            &mut sink,
-            CancellationToken::new(),
-        )
+        .run_established(&mut socket, &mut sink, CancellationToken::new())
         .await;
 
     assert_eq!(result, Err(SourceError::ConnectionIdle));
@@ -234,33 +222,60 @@ async fn accept_book_source(listener: &TcpListener) -> TestResult<WebSocketStrea
 }
 
 #[test]
-fn source_rejects_a_session_with_different_source_or_revision() -> TestResult {
-    let (config, _config_registry, _config_registration) =
+fn source_authority_rejects_rollover_factory_grafting_and_cross_registry_sessions() -> TestResult {
+    let (config, mut registry, registered) =
         test_source("kraken-public-book-v2", "kraken-policy-v1")?;
-    let (_other_source_config, mut other_source_registry, other_source_registration) =
-        test_source("kraken-public-book-other", "kraken-policy-v2")?;
-    let other_source_session = other_source_registry.begin_session(
-        &other_source_registration,
-        SessionId::new(SourceIdentifier::try_from("kraken-session-other-source")?),
+    let first = registry.begin_session(
+        &registered,
+        SessionId::new(SourceIdentifier::try_from("kraken-session-first")?),
         ConnectionGeneration::new(1)?,
         Timestamp::from_unix_nanos(1),
     )?;
-    let (_other_revision_config, mut other_revision_registry, other_revision_registration) =
-        test_source("kraken-public-book-v2", "kraken-policy-v2")?;
-    let other_revision_session = other_revision_registry.begin_session(
-        &other_revision_registration,
-        SessionId::new(SourceIdentifier::try_from("kraken-session-other-revision")?),
-        ConnectionGeneration::new(1)?,
-        Timestamp::from_unix_nanos(1),
+    let stale_generation = live_generation(&mut registry, &first)?;
+    let successor = registry.begin_session(
+        &registered,
+        SessionId::new(SourceIdentifier::try_from("kraken-session-successor")?),
+        ConnectionGeneration::new(2)?,
+        Timestamp::from_unix_nanos(2),
     )?;
-
     assert!(matches!(
-        KrakenSource::try_new(config.clone(), &other_source_session),
-        Err(KrakenConfigError::SessionMismatch)
+        KrakenSource::try_new(config.clone(), stale_generation),
+        Err(SourceError::SessionNotCurrent)
     ));
+
+    let successor_capture = registry.take_capture_generation_capabilities(&successor)?;
+    let (mut successor_initialization, _successor_admission, _successor_degradation) =
+        successor_capture.into_parts();
+    successor_initialization.mark_healthy()?;
+    let _successor_factory = registry.take_raw_frame_factory(&successor)?;
     assert!(matches!(
-        KrakenSource::try_new(config, &other_revision_session),
-        Err(KrakenConfigError::SessionMismatch)
+        registry.take_live_source_generation(&successor),
+        Err(RegistryError::RawFrameFactoryAlreadyTaken)
+    ));
+
+    let (foreign_config, mut foreign_registry, foreign_registered) =
+        test_source("kraken-public-book-v2", "kraken-policy-v1")?;
+    assert_eq!(
+        foreign_config.metadata().source_id(),
+        config.metadata().source_id()
+    );
+    assert_eq!(
+        foreign_config.metadata().revision(),
+        config.metadata().revision()
+    );
+    let foreign = foreign_registry.begin_session(
+        &foreign_registered,
+        SessionId::new(SourceIdentifier::try_from("kraken-session-successor")?),
+        ConnectionGeneration::new(1)?,
+        Timestamp::from_unix_nanos(1),
+    )?;
+    let foreign_capture = foreign_registry.take_capture_generation_capabilities(&foreign)?;
+    let (mut foreign_initialization, _foreign_admission, _foreign_degradation) =
+        foreign_capture.into_parts();
+    foreign_initialization.mark_healthy()?;
+    assert!(matches!(
+        foreign_registry.take_live_source_generation(&successor),
+        Err(RegistryError::HandleTransplanted)
     ));
     Ok(())
 }
@@ -279,24 +294,32 @@ async fn source_uses_the_session_budget_and_cannot_run_twice() -> TestResult {
         .budget()
         .cloned()
         .ok_or("source session has no coordinated budget")?;
-    let mut frames = registry.take_raw_frame_factory(&session)?;
-    let mut source = KrakenSource::try_new(config, &session)?;
+    let generation = live_generation(&mut registry, &session)?;
+    let mut source = KrakenSource::try_new(config, generation)?;
     assert!(source.budget.shares_allocation_with(&expected_budget));
 
     let cancellation = CancellationToken::new();
     cancellation.cancel();
     let mut sink = RecordingSink::default();
     assert_eq!(
-        source
-            .run(&mut frames, &mut sink, cancellation.clone())
-            .await,
+        source.run(&mut sink, cancellation.clone()).await,
         Err(SourceError::Cancelled)
     );
     assert_eq!(
-        source.run(&mut frames, &mut sink, cancellation).await,
+        source.run(&mut sink, cancellation).await,
         Err(SourceError::InvalidProtocolState)
     );
     Ok(())
+}
+
+fn live_generation(
+    registry: &mut AuthoritativeSourceRegistry,
+    session: &market_squawk_sources::CurrentSourceSession,
+) -> TestResult<LiveSourceGeneration> {
+    let capture = registry.take_capture_generation_capabilities(session)?;
+    let (mut initialization, _admission, _degradation) = capture.into_parts();
+    initialization.mark_healthy()?;
+    Ok(registry.take_live_source_generation(session)?)
 }
 
 fn test_source(

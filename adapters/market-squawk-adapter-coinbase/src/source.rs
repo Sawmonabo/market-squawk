@@ -5,50 +5,59 @@ use std::future::Future;
 use bytes::Bytes;
 use futures_util::{FutureExt, SinkExt, StreamExt, future::BoxFuture};
 use market_squawk_sources::{
-    BudgetDecision, BudgetPermit, CurrentSourceSession, LiveMarketSource, RawFrameFactory,
-    RawMarketSink, SharedProviderBudget, SourceError, SourceMetadata, SourceMetadataProvider,
-    TransportFrameKind, apply_http_retry_after,
+    ActiveLiveSourceGeneration, BudgetDecision, BudgetPermit, LiveMarketSource,
+    LiveSourceGeneration, RawMarketSink, SharedProviderBudget, SourceError, SourceMetadata,
+    SourceMetadataProvider, TransportFrameKind, apply_http_retry_after,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message, protocol::WebSocketConfig};
 use tokio_tungstenite::{WebSocketStream, connect_async_with_config};
 use tokio_util::sync::CancellationToken;
 
-use crate::{CoinbaseConfigError, CoinbaseExchangeConfig};
+use crate::CoinbaseExchangeConfig;
 
 /// Production Coinbase Exchange one-generation source.
 #[derive(Debug)]
 pub struct CoinbaseExchangeSource {
     config: CoinbaseExchangeConfig,
+    authority: ActiveLiveSourceGeneration,
     budget: SharedProviderBudget,
     generation_started: bool,
 }
 
 impl CoinbaseExchangeSource {
-    /// Binds a validated configuration to the exact registry-coordinated session budget.
+    /// Consumes the exact registry-minted live-generation authority for this configuration.
     ///
     /// # Errors
     ///
-    /// Rejects a session from another source/revision or a session without the required shared
-    /// provider budget.
+    /// Rejects stale, capture-unhealthy, mismatched, or incomplete generation authority before any
+    /// provider-budget or network operation can occur.
     pub fn try_new(
         config: CoinbaseExchangeConfig,
-        session: &CurrentSourceSession,
-    ) -> Result<Self, CoinbaseConfigError> {
-        if session.source_id() != config.metadata().source_id()
-            || session.revision() != config.metadata().revision()
-        {
-            return Err(CoinbaseConfigError::SessionMismatch);
-        }
-        let budget = session
-            .budget()
+        generation: LiveSourceGeneration,
+    ) -> Result<Self, SourceError> {
+        let authority = generation.try_start(config.metadata())?;
+        let budget = authority
+            .budget()?
             .cloned()
-            .ok_or(CoinbaseConfigError::MissingSharedBudget)?;
+            .ok_or(SourceError::GenerationAuthorityMismatch)?;
         Ok(Self {
             config,
+            authority,
             budget,
             generation_started: false,
         })
+    }
+
+    fn validate_generation(&self) -> Result<(), SourceError> {
+        let issued = self
+            .authority
+            .budget()?
+            .ok_or(SourceError::GenerationAuthorityMismatch)?;
+        if !self.budget.shares_allocation_with(issued) {
+            return Err(SourceError::GenerationAuthorityMismatch);
+        }
+        Ok(())
     }
 
     fn begin_generation(&mut self) -> Result<(), SourceError> {
@@ -69,7 +78,6 @@ impl CoinbaseExchangeSource {
 
     async fn run_production(
         &mut self,
-        frames: &mut RawFrameFactory,
         sink: &mut dyn RawMarketSink,
         cancellation: CancellationToken,
     ) -> Result<(), SourceError> {
@@ -77,6 +85,7 @@ impl CoinbaseExchangeSource {
         if cancellation.is_cancelled() {
             return Err(SourceError::Cancelled);
         }
+        self.validate_generation()?;
         self.config
             .metadata()
             .network_policy()
@@ -97,21 +106,20 @@ impl CoinbaseExchangeSource {
                 map_connect_error(error, &self.budget)
             })
             .await?;
-        self.run_socket(socket, permit, frames, sink, cancellation)
-            .await
+        self.run_socket(socket, permit, sink, cancellation).await
     }
 
     async fn run_socket<S>(
-        &self,
+        &mut self,
         mut socket: WebSocketStream<S>,
         _permit: BudgetPermit,
-        frames: &mut RawFrameFactory,
         sink: &mut dyn RawMarketSink,
         cancellation: CancellationToken,
     ) -> Result<(), SourceError>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
+        self.validate_generation()?;
         let limits = self.config.transport_limits();
         send_with_deadline(
             &mut socket,
@@ -131,13 +139,18 @@ impl CoinbaseExchangeSource {
                 Message::Text(text) => {
                     let payload = text.as_bytes();
                     ensure_frame_bound(payload.len(), limits.max_frame_bytes())?;
-                    let frame = frames
+                    let frame = self
+                        .authority
+                        .frames_mut()?
                         .try_frame(TransportFrameKind::Text, Bytes::copy_from_slice(payload))?;
                     sink.try_publish(frame)?;
                 }
                 Message::Binary(payload) => {
                     ensure_frame_bound(payload.len(), limits.max_frame_bytes())?;
-                    let frame = frames.try_frame(TransportFrameKind::Binary, payload)?;
+                    let frame = self
+                        .authority
+                        .frames_mut()?
+                        .try_frame(TransportFrameKind::Binary, payload)?;
                     sink.try_publish(frame)?;
                 }
                 Message::Ping(payload) => {
@@ -164,7 +177,6 @@ impl CoinbaseExchangeSource {
     async fn run_with_socket_for_test<S>(
         &mut self,
         socket: WebSocketStream<S>,
-        frames: &mut RawFrameFactory,
         sink: &mut dyn RawMarketSink,
         cancellation: CancellationToken,
     ) -> Result<(), SourceError>
@@ -175,9 +187,9 @@ impl CoinbaseExchangeSource {
         if cancellation.is_cancelled() {
             return Err(SourceError::Cancelled);
         }
+        self.validate_generation()?;
         let permit = self.acquire_budget()?;
-        self.run_socket(socket, permit, frames, sink, cancellation)
-            .await
+        self.run_socket(socket, permit, sink, cancellation).await
     }
 
     #[cfg(test)]
@@ -195,11 +207,10 @@ impl SourceMetadataProvider for CoinbaseExchangeSource {
 impl LiveMarketSource for CoinbaseExchangeSource {
     fn run<'a>(
         &'a mut self,
-        frames: &'a mut RawFrameFactory,
         sink: &'a mut dyn RawMarketSink,
         cancellation: CancellationToken,
     ) -> BoxFuture<'a, Result<(), SourceError>> {
-        self.run_production(frames, sink, cancellation).boxed()
+        self.run_production(sink, cancellation).boxed()
     }
 }
 

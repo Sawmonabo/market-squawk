@@ -3,7 +3,6 @@
 use std::{
     borrow::Cow,
     io::Write,
-    num::NonZeroUsize,
     sync::{
         Arc,
         atomic::{AtomicU8, Ordering},
@@ -59,6 +58,7 @@ pub struct McpServer<S: ToolServices> {
     limits: McpLimits,
     audit: Arc<dyn AuditSink>,
     artifacts: Arc<dyn ArtifactRepository>,
+    sdk_reaper: SdkThreadReaper,
 }
 
 impl<S: ToolServices> std::fmt::Debug for McpServer<S> {
@@ -70,6 +70,7 @@ impl<S: ToolServices> std::fmt::Debug for McpServer<S> {
             .field("limits", &self.limits)
             .field("audit", &"[AUDIT SINK]")
             .field("artifacts", &"[ARTIFACT REPOSITORY]")
+            .field("sdk_reaper", &"[PROCESS SDK REAPER HANDLE]")
             .finish_non_exhaustive()
     }
 }
@@ -87,6 +88,7 @@ impl<S: ToolServices> McpServer<S> {
         audit: Arc<dyn AuditSink>,
         artifacts: Arc<dyn ArtifactRepository>,
     ) -> Result<Self, ServerError> {
+        let sdk_reaper = SdkThreadReaper::process().map_err(|_error| ServerError::SdkThread)?;
         let capabilities = services.capabilities();
         let tools: Arc<[Tool]> = capabilities
             .tools()
@@ -102,6 +104,7 @@ impl<S: ToolServices> McpServer<S> {
             limits,
             audit,
             artifacts,
+            sdk_reaper,
         })
     }
 
@@ -193,6 +196,7 @@ impl<S: ToolServices> McpServer<S> {
                 capabilities: self.capabilities.clone(),
                 calls: service_calls,
                 ownership: Arc::clone(&host_work_ownership),
+                output: Arc::clone(&output),
             }),
             capabilities: self.capabilities.clone(),
             tools: Arc::clone(&self.tools),
@@ -208,8 +212,7 @@ impl<S: ToolServices> McpServer<S> {
         };
         let (sdk_transport, sdk_input, sdk_output) = sdk_transport(self.limits);
         let shutdown_timeout = self.limits.shutdown_timeout();
-        let sdk_reaper =
-            SdkThreadReaper::try_new(NonZeroUsize::MIN).map_err(|_error| ServerError::SdkThread)?;
+        let sdk_reaper = self.sdk_reaper.clone();
         let sdk_thread = OwnedSdkThread::try_spawn(
             &sdk_reaper,
             "market-squawk-mcp-sdk",

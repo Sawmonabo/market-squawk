@@ -40,7 +40,11 @@ pub enum AuditOperation {
 pub enum AuditPhase {
     /// Request passed outer admission and entered protocol handling.
     Admitted,
-    /// Protocol or service handling reached a terminal class.
+    /// A mutating request atomically persisted admission and reserved both terminal records.
+    MutationAdmitted,
+    /// A mutating service reached its authoritative outcome, independently of delivery.
+    MutationServiceCompleted,
+    /// Response delivery reached its terminal class.
     Completed,
 }
 
@@ -117,9 +121,27 @@ impl AuditCompletion {
         limits: ServiceLimits,
         response_bytes: &[u8],
     ) -> Result<Self, AuditError> {
+        Self::with_phase(
+            request_id,
+            identity_class,
+            operation,
+            limits,
+            response_bytes,
+            AuditPhase::Completed,
+        )
+    }
+
+    fn with_phase(
+        request_id: &RequestId,
+        identity_class: LocalProcessIdentityClass,
+        operation: AuditOperation,
+        limits: ServiceLimits,
+        response_bytes: &[u8],
+        phase: AuditPhase,
+    ) -> Result<Self, AuditError> {
         Ok(Self {
             event: AuditEvent {
-                phase: AuditPhase::Completed,
+                phase,
                 request_id_sha256: hash_request_id(request_id)?,
                 identity_class,
                 operation,
@@ -137,6 +159,176 @@ impl AuditCompletion {
     }
 }
 
+/// Atomically admitted mutation audit material.
+///
+/// An [`AuditSink`] must reserve capacity for this admission, its authoritative service outcome,
+/// and its independent delivery outcome before it persists admission and returns a
+/// [`MutationAuditReservation`].
+pub struct MutationAuditBundle {
+    admission: AuditEvent,
+    service_completion: Box<AuditCompletion>,
+    delivery_fallback: Box<AuditCompletion>,
+}
+
+impl MutationAuditBundle {
+    pub(crate) fn new(
+        request_id: &RequestId,
+        identity_class: LocalProcessIdentityClass,
+        operation: AuditOperation,
+        limits: ServiceLimits,
+        request_bytes: &[u8],
+    ) -> Result<Self, AuditError> {
+        let mut admission = AuditEvent::admitted(
+            request_id,
+            identity_class,
+            operation.clone(),
+            limits,
+            request_bytes,
+        )?;
+        admission.phase = AuditPhase::MutationAdmitted;
+        let service_completion = Box::new(AuditCompletion::with_phase(
+            request_id,
+            identity_class,
+            operation.clone(),
+            limits,
+            b"authoritative mutation service outcome",
+            AuditPhase::MutationServiceCompleted,
+        )?);
+        let delivery_fallback = Box::new(AuditCompletion::new(
+            request_id,
+            identity_class,
+            operation,
+            limits,
+            b"mutation delivery unavailable",
+        )?);
+        Ok(Self {
+            admission,
+            service_completion,
+            delivery_fallback,
+        })
+    }
+}
+
+impl fmt::Debug for MutationAuditBundle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MutationAuditBundle")
+            .field("admission", &self.admission)
+            .field("service_completion", &self.service_completion)
+            .field("delivery_fallback", &self.delivery_fallback)
+            .finish()
+    }
+}
+
+/// Capacity-backed mutation outcome commits after durable admission.
+pub struct MutationAuditReservation {
+    service_completion: Option<Box<AuditCompletion>>,
+    delivery_fallback: Option<Box<AuditCompletion>>,
+    service_commit: Option<Box<AuditCommit>>,
+    delivery_commit: Option<Box<AuditCommit>>,
+}
+
+type AuditCommit = dyn FnOnce(AuditEvent) -> Result<(), AuditError> + Send + 'static;
+
+impl MutationAuditReservation {
+    /// Persists mutation admission and binds the two pre-reserved terminal slots.
+    ///
+    /// Callers must atomically reserve capacity for all three records before invoking this
+    /// constructor. `persist_admission` must durably persist the admission record before it
+    /// returns success. Terminal callbacks must synchronously report whether the event is durable;
+    /// on failure they retain ownership for a later sink drain because the reservation is one-use.
+    ///
+    /// # Errors
+    ///
+    /// Returns the admission persistence failure without creating mutation authority.
+    pub fn try_new<P, S, D>(
+        bundle: MutationAuditBundle,
+        persist_admission: P,
+        service_commit: S,
+        delivery_commit: D,
+    ) -> Result<Self, AuditError>
+    where
+        P: FnOnce(AuditEvent) -> Result<(), AuditError>,
+        S: FnOnce(AuditEvent) -> Result<(), AuditError> + Send + 'static,
+        D: FnOnce(AuditEvent) -> Result<(), AuditError> + Send + 'static,
+    {
+        let MutationAuditBundle {
+            admission,
+            service_completion,
+            delivery_fallback,
+        } = bundle;
+        let service_commit: Box<AuditCommit> = Box::new(service_commit);
+        let delivery_commit: Box<AuditCommit> = Box::new(delivery_commit);
+        persist_admission(admission)?;
+        Ok(Self {
+            service_completion: Some(service_completion),
+            delivery_fallback: Some(delivery_fallback),
+            service_commit: Some(service_commit),
+            delivery_commit: Some(delivery_commit),
+        })
+    }
+
+    pub(crate) fn commit_service(
+        &mut self,
+        result_class: AuditResultClass,
+    ) -> Result<(), AuditError> {
+        if let (Some(completion), Some(commit)) =
+            (self.service_completion.take(), self.service_commit.take())
+        {
+            commit((*completion).into_event(result_class))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) const fn service_pending(&self) -> bool {
+        self.service_completion.is_some() && self.service_commit.is_some()
+    }
+
+    pub(crate) const fn delivery_pending(&self) -> bool {
+        self.delivery_fallback.is_some() && self.delivery_commit.is_some()
+    }
+
+    pub(crate) const fn is_terminalized(&self) -> bool {
+        !self.service_pending() && !self.delivery_pending()
+    }
+
+    pub(crate) fn reserve_delivery(
+        &mut self,
+        completion: AuditCompletion,
+    ) -> Result<AuditCompletionReservation, AuditError> {
+        let Some(delivery_fallback) = self.delivery_fallback.take() else {
+            return Err(AuditError::Unavailable);
+        };
+        let Some(commit) = self.delivery_commit.take() else {
+            self.delivery_fallback = Some(delivery_fallback);
+            return Err(AuditError::Unavailable);
+        };
+        drop(delivery_fallback);
+        Ok(AuditCompletionReservation::new(completion, commit))
+    }
+}
+
+impl fmt::Debug for MutationAuditReservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MutationAuditReservation")
+            .field("service_pending", &self.service_completion.is_some())
+            .field("delivery_pending", &self.delivery_fallback.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for MutationAuditReservation {
+    fn drop(&mut self) {
+        let _ = self.commit_service(AuditResultClass::OutputUnavailable);
+        if let (Some(completion), Some(commit)) =
+            (self.delivery_fallback.take(), self.delivery_commit.take())
+        {
+            let _ = commit((*completion).into_event(AuditResultClass::OutputUnavailable));
+        }
+    }
+}
+
 impl fmt::Debug for AuditCompletion {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -146,21 +338,22 @@ impl fmt::Debug for AuditCompletion {
     }
 }
 
-/// Infallible one-shot terminal commit backed by capacity accepted from an [`AuditSink`].
+/// Result-bearing one-shot terminal commit backed by capacity accepted from an [`AuditSink`].
 pub struct AuditCompletionReservation {
     completion: Option<AuditCompletion>,
-    commit: Option<Box<dyn FnOnce(AuditEvent) + Send + 'static>>,
+    commit: Option<Box<AuditCommit>>,
 }
 
 impl AuditCompletionReservation {
     /// Creates a reservation after the sink has durably or boundedly accepted its capacity.
     ///
-    /// The callback must be infallible and must not perform unbounded or blocking work. Dropping an
-    /// uncommitted reservation records [`AuditResultClass::OutputUnavailable`].
+    /// The callback must synchronously report whether the event is durable and retain it for later
+    /// drain on failure. Dropping an uncommitted reservation attempts to record
+    /// [`AuditResultClass::OutputUnavailable`].
     #[must_use]
     pub fn new<F>(completion: AuditCompletion, commit: F) -> Self
     where
-        F: FnOnce(AuditEvent) + Send + 'static,
+        F: FnOnce(AuditEvent) -> Result<(), AuditError> + Send + 'static,
     {
         Self {
             completion: Some(completion),
@@ -168,14 +361,15 @@ impl AuditCompletionReservation {
         }
     }
 
-    pub(crate) fn commit(mut self, result_class: AuditResultClass) {
-        self.finish(result_class);
+    pub(crate) fn commit(mut self, result_class: AuditResultClass) -> Result<(), AuditError> {
+        self.finish(result_class)
     }
 
-    fn finish(&mut self, result_class: AuditResultClass) {
+    fn finish(&mut self, result_class: AuditResultClass) -> Result<(), AuditError> {
         if let (Some(completion), Some(commit)) = (self.completion.take(), self.commit.take()) {
-            commit(completion.into_event(result_class));
+            commit(completion.into_event(result_class))?;
         }
+        Ok(())
     }
 }
 
@@ -191,7 +385,7 @@ impl fmt::Debug for AuditCompletionReservation {
 
 impl Drop for AuditCompletionReservation {
     fn drop(&mut self) {
-        self.finish(AuditResultClass::OutputUnavailable);
+        let _ = self.finish(AuditResultClass::OutputUnavailable);
     }
 }
 
@@ -288,12 +482,25 @@ pub trait AuditSink: Send + Sync + 'static {
     ///
     /// # Errors
     ///
-    /// Returns [`AuditError`] unless the returned reservation can later commit exactly one
-    /// terminal event without failure or further capacity acquisition.
+    /// Returns [`AuditError`] unless the returned reservation owns capacity for exactly one
+    /// terminal event without further capacity acquisition. Its terminal commit remains
+    /// result-bearing because durability can fail after reservation.
     fn reserve_completion(
         &self,
         completion: AuditCompletion,
     ) -> Result<AuditCompletionReservation, AuditError>;
+
+    /// Atomically reserves all mutation records and durably persists admission before dispatch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuditError`] unless admission is durable and both terminal records own capacity
+    /// without additional acquisition. Terminal commits remain result-bearing because durability
+    /// can fail after reservation.
+    fn reserve_mutation(
+        &self,
+        bundle: MutationAuditBundle,
+    ) -> Result<MutationAuditReservation, AuditError>;
 }
 
 /// Audit admission or encoding failure.

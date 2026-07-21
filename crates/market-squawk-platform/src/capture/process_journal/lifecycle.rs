@@ -167,6 +167,7 @@ impl<B: CaptureAuthorityBundle> PostHandshakeStartupOwner<B> {
         self.destination_fences = destination_fences;
     }
 
+    #[cfg(all(feature = "capture-test", debug_assertions))]
     fn rollback(mut self) -> Duration {
         let started = Instant::now();
         self.rollback_resources();

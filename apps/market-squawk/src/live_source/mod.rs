@@ -2,6 +2,8 @@
 
 mod composition;
 mod instruments;
+mod kraken;
+mod provider;
 mod route_actor;
 mod sink;
 mod subscription_state;
@@ -12,6 +14,7 @@ pub use composition::{
     ProductionLiveSourceCompositionError, ProductionLiveSourceRuntime,
     ProductionLiveSourceRuntimeError,
 };
+pub use provider::ProductionSourceProvider;
 pub use supervisor::ProductionSupervisorError;
 
 #[cfg(test)]

@@ -14,9 +14,9 @@ use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
+use crate::SourceMetadata;
 use crate::authority_time::TrustedReceiptObservation;
 use crate::bounded::BoundedBytes;
-use crate::{RawFrameFactory, SourceMetadata};
 
 /// Maximum exact wire payload retained in one live frame.
 pub const MAX_RAW_FRAME_BYTES: usize = MAX_LIVE_CAPTURE_PAYLOAD_BYTES;
@@ -439,7 +439,7 @@ pub trait RawMarketSink: Send {
 }
 
 /// Immutable source metadata access shared by distinct adapter contracts.
-pub trait SourceMetadataProvider: Send + Sync {
+pub trait SourceMetadataProvider: Send {
     /// Returns this adapter's immutable configured source metadata.
     fn metadata(&self) -> &SourceMetadata;
 }
@@ -449,7 +449,6 @@ pub trait LiveMarketSource: SourceMetadataProvider {
     /// Runs the source until cancellation or a typed terminal error.
     fn run<'a>(
         &'a mut self,
-        frames: &'a mut RawFrameFactory,
         sink: &'a mut dyn RawMarketSink,
         cancellation: CancellationToken,
     ) -> BoxFuture<'a, Result<(), SourceError>>;
@@ -517,6 +516,12 @@ pub enum SourceError {
     /// The generation ended, rolled over, or was revoked before frame construction.
     #[error("source session is no longer current")]
     SessionNotCurrent,
+    /// Lossless capture is not healthy for this exact generation.
+    #[error("source capture generation is not healthy")]
+    CaptureNotHealthy,
+    /// The adapter metadata or retained generation authority graph does not match the registry.
+    #[error("source generation authority does not match adapter metadata")]
+    GenerationAuthorityMismatch,
     /// The registry clock source could not provide one sealed paired observation.
     #[error("source-owned trusted receipt time is unavailable")]
     TrustedTimeUnavailable,

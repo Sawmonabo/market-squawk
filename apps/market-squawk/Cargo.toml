@@ -24,19 +24,26 @@ path = "src/bin/market-squawk-capture-helper.rs"
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
+cap-fs-ext = { workspace = true }
+cap-std = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
 crc32fast = { workspace = true }
 fs2 = { workspace = true }
 futures-util = { workspace = true }
+getrandom = { workspace = true }
+libc = { workspace = true }
 parking_lot = { workspace = true }
 market-squawk-domain = { workspace = true }
 market-squawk-adapter-coinbase = { workspace = true }
+market-squawk-adapter-kraken = { workspace = true }
 market-squawk-adapter-paper = { workspace = true }
 market-squawk-analytics = { workspace = true }
 market-squawk-execution = { workspace = true }
 market-squawk-live = { workspace = true }
+market-squawk-mcp = { workspace = true }
 market-squawk-platform = { workspace = true }
+market-squawk-services = { workspace = true }
 market-squawk-sources = { workspace = true }
 rust_decimal = { workspace = true }
 serde = { workspace = true }
@@ -51,6 +58,7 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+market-squawk-adapter-kraken = { workspace = true, features = ["loopback-fixture"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 

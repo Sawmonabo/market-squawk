@@ -59,6 +59,15 @@ pub struct RouteActionHook {
 }
 
 impl RouteActionHook {
+    /// Returns the exact complete route-hook charge before transferring hook ownership.
+    pub fn retained_bytes_for_composition(
+        route: &ShardKey,
+        required_feature_count: usize,
+        hook_retained_bytes: usize,
+    ) -> Result<usize, RouteActionHookError> {
+        route_action_retained_bytes(route, required_feature_count, hook_retained_bytes)
+    }
+
     /// Binds one hook, requirement set, and issue bound to one exact route.
     ///
     /// # Errors

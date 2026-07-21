@@ -1,3 +1,7 @@
+mod artifact;
+mod audit;
+mod services;
+
 use std::{
     collections::VecDeque,
     num::NonZeroUsize,
@@ -7,13 +11,25 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use artifact::ControlledArtifactRepository;
+use audit::DurableAuditSink;
 use market_squawk_domain::DataQuality;
+use market_squawk_mcp::{
+    ArtifactError, McpLimitError, McpLimitSpec, McpLimits, McpServer as HardenedMcpServer,
+    ServerError, ServerExit,
+};
+use market_squawk_platform::{AppConfig, LocalPaths, PathError};
+use market_squawk_services::ServiceCapabilityError;
 use parking_lot::Mutex;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio_util::sync::CancellationToken;
+
+use services::LocalToolServices;
+
+pub use audit::LocalAuditError;
 
 use crate::{diagnostic_engine::SharedDiagnosticEngine, replay::summarize_journal};
 
@@ -22,6 +38,117 @@ const MAX_TOOL_CALLS_PER_SECOND: usize = 100;
 const MAX_MCP_LINE_BYTES: usize = 1024 * 1024;
 const MCP_READER_SCRATCH_BYTES: usize = 8 * 1024;
 const DIAGNOSTIC_CONTRACT_SCHEMA_VERSION: u16 = 1;
+const LOCAL_MCP_MAXIMUM_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
+
+/// Shipping local MCP ownership composed over the hardened protocol crate.
+pub struct LocalMcpComposition {
+    server: HardenedMcpServer<LocalToolServices>,
+    audit: Arc<DurableAuditSink>,
+}
+
+impl std::fmt::Debug for LocalMcpComposition {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LocalMcpComposition")
+            .field("server", &self.server)
+            .field("audit", &"[DURABLE BOUNDED AUDIT]")
+            .finish_non_exhaustive()
+    }
+}
+
+impl LocalMcpComposition {
+    /// Prepares local capabilities and acquires the hardened process SDK reaper before serving.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when local path, limit, audit, artifact, or server ownership cannot be
+    /// established without opening a protocol session.
+    pub fn try_new(
+        config: &AppConfig,
+        diagnostic_engine: SharedDiagnosticEngine,
+        journal_path: PathBuf,
+    ) -> std::result::Result<Self, LocalMcpCompositionError> {
+        let paths = LocalPaths::prepare(config.data_dir())?;
+        let audit = Arc::new(DurableAuditSink::try_new(config.data_dir())?);
+        let maximum_artifact_bytes = NonZeroUsize::new(LOCAL_MCP_MAXIMUM_ARTIFACT_BYTES)
+            .ok_or(LocalMcpCompositionError::InvalidArtifactLimit)?;
+        let artifacts = Arc::new(ControlledArtifactRepository::try_new(
+            paths.artifacts()?.clone(),
+            maximum_artifact_bytes,
+        )?);
+        let services = Arc::new(LocalToolServices::try_new(diagnostic_engine, journal_path)?);
+        let limits = McpLimits::try_from(McpLimitSpec::default())?;
+        let server = HardenedMcpServer::try_new(services, limits, audit.clone(), artifacts)?;
+        Ok(Self { server, audit })
+    }
+
+    /// Serves one inherited-stdio session and durably drains accepted audit records before return.
+    pub async fn serve_stdio(
+        self,
+        cancellation: CancellationToken,
+    ) -> std::result::Result<ServerExit, LocalMcpCompositionError> {
+        let Self { server, audit } = self;
+        let server = server.serve_stdio(cancellation).await;
+        finish_hardened_session(server, audit.flush())
+    }
+
+    /// Serves caller-supplied test or embedding I/O without asserting peer identity.
+    pub async fn serve_unverified_io<R, W>(
+        self,
+        reader: R,
+        writer: W,
+        cancellation: CancellationToken,
+    ) -> std::result::Result<ServerExit, LocalMcpCompositionError>
+    where
+        R: AsyncRead + Send + Unpin + 'static,
+        W: AsyncWrite + Send + Unpin + 'static,
+    {
+        let Self { server, audit } = self;
+        let server = server
+            .serve_unverified_io(reader, writer, cancellation)
+            .await;
+        finish_hardened_session(server, audit.flush())
+    }
+}
+
+fn finish_hardened_session(
+    server: std::result::Result<ServerExit, ServerError>,
+    audit: std::result::Result<(), LocalAuditError>,
+) -> std::result::Result<ServerExit, LocalMcpCompositionError> {
+    match (server, audit) {
+        (Ok(exit), Ok(())) => Ok(exit),
+        (Err(server), Ok(())) => Err(LocalMcpCompositionError::Server(server)),
+        (Ok(_exit), Err(audit)) => Err(LocalMcpCompositionError::Audit(audit)),
+        (Err(server), Err(audit)) => {
+            Err(LocalMcpCompositionError::ServerAndAudit { server, audit })
+        }
+    }
+}
+
+/// Shipping MCP composition, session, or durable-drain failure.
+#[derive(Debug, Error)]
+pub enum LocalMcpCompositionError {
+    #[error(transparent)]
+    Path(#[from] PathError),
+    #[error(transparent)]
+    Limits(#[from] McpLimitError),
+    #[error(transparent)]
+    Artifact(#[from] ArtifactError),
+    #[error(transparent)]
+    Capability(#[from] ServiceCapabilityError),
+    #[error(transparent)]
+    Audit(#[from] LocalAuditError),
+    #[error(transparent)]
+    Server(#[from] ServerError),
+    #[error("local MCP artifact limit is invalid")]
+    InvalidArtifactLimit,
+    #[error("local MCP server failed and audit drain also failed")]
+    ServerAndAudit {
+        #[source]
+        server: ServerError,
+        audit: LocalAuditError,
+    },
+}
 
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]

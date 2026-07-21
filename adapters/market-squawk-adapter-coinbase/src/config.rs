@@ -425,12 +425,6 @@ pub enum CoinbaseConfigError {
     /// Subscription bytes exceeded the fixed outbound ceiling.
     #[error("Coinbase subscription exceeds its byte ceiling")]
     SubscriptionTooLarge,
-    /// Source construction was attempted with a different registry session.
-    #[error("Coinbase source configuration does not match the current registry session")]
-    SessionMismatch,
-    /// The current registry session did not carry its coordinated provider budget.
-    #[error("Coinbase current session is missing the registry-coordinated provider budget")]
-    MissingSharedBudget,
     /// Validated source metadata did not expose the exact live protocol invariants.
     #[error("Coinbase source metadata is missing its validated live protocol profile")]
     InvalidProtocolProfile,

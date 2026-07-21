@@ -22,9 +22,13 @@ use super::ConfigError;
 
 /// Pinned public Coinbase Exchange WebSocket endpoint accepted by production configuration.
 pub const COINBASE_EXCHANGE_ENDPOINT: &str = "wss://ws-feed.exchange.coinbase.com";
+/// Pinned public Kraken Spot WebSocket v2 endpoint accepted by production configuration.
+pub const KRAKEN_WEBSOCKET_V2_ENDPOINT: &str = "wss://ws.kraken.com/v2";
 
 const COINBASE_VENUE: &str = "coinbase-exchange";
 const COINBASE_PROVIDER: &str = "coinbase-exchange";
+const KRAKEN_VENUE: &str = "kraken";
+const KRAKEN_PROVIDER: &str = "kraken";
 const MAX_INSTRUMENTS: usize = 100;
 const MAX_COINBASE_PRODUCT_BYTES: usize = 64;
 const MAX_SUBSCRIPTION_BYTES: usize = 16 * 1024;
@@ -431,6 +435,351 @@ fn decode_hex_nibble(value: u8) -> Result<u8, CoinbaseConfigurationError> {
         b'A'..=b'F' => Ok(value - b'A' + 10),
         _ => Err(CoinbaseConfigurationError::InvalidAuthorizationAttestation),
     }
+}
+
+/// Explicit Kraken symbol binding to one invariant-preserving internal instrument definition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KrakenInstrumentMapping {
+    symbol: Box<str>,
+    definition: InstrumentDefinition,
+}
+
+impl KrakenInstrumentMapping {
+    /// Returns the exact Kraken v2 symbol.
+    pub fn symbol(&self) -> &str {
+        &self.symbol
+    }
+
+    /// Returns the validated canonical instrument definition.
+    pub const fn definition(&self) -> &InstrumentDefinition {
+        &self.definition
+    }
+}
+
+/// Explicit local authorization evidence for the Kraken public interface.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct KrakenAuthorizationAttestation {
+    provider: SourceIdentifier,
+    basis: AuthorizationBasis,
+    evidence: ExactPayloadEvidence,
+    effective: EffectiveInterval,
+}
+
+impl KrakenAuthorizationAttestation {
+    /// Returns the exact provider namespace admitted by this attestation.
+    pub const fn provider(&self) -> &SourceIdentifier {
+        &self.provider
+    }
+
+    /// Returns the reviewed authorization basis.
+    pub const fn basis(&self) -> &AuthorizationBasis {
+        &self.basis
+    }
+
+    /// Returns the content-hashed, version-pinned authorization evidence.
+    pub const fn evidence(&self) -> &ExactPayloadEvidence {
+        &self.evidence
+    }
+
+    /// Returns the finite authorization validity interval.
+    pub const fn effective_interval(&self) -> EffectiveInterval {
+        self.effective
+    }
+
+    /// Returns whether this attestation covers the supplied instant.
+    pub fn is_effective_at(&self, at: Timestamp) -> bool {
+        at >= self.effective.starts_at() && self.effective.ends_at().is_some_and(|end| at < end)
+    }
+}
+
+/// Complete validated Kraken book-v2 production configuration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KrakenSourceConfig {
+    authorization: KrakenAuthorizationAttestation,
+    instrument: KrakenInstrumentMapping,
+    freshness: Duration,
+    max_frame_bytes: NonZeroUsize,
+    subscription_ack_timeout: Duration,
+    control_limits: CoinbaseControlLimits,
+}
+
+impl KrakenSourceConfig {
+    /// Returns the sole permitted production endpoint.
+    pub const fn endpoint(&self) -> &'static str {
+        KRAKEN_WEBSOCKET_V2_ENDPOINT
+    }
+
+    /// Returns explicit locally admitted public-interface authorization evidence.
+    pub const fn authorization(&self) -> &KrakenAuthorizationAttestation {
+        &self.authorization
+    }
+
+    /// Returns the exact Kraken v2 symbol.
+    pub fn symbol(&self) -> &str {
+        self.instrument.symbol()
+    }
+
+    /// Returns the validated canonical instrument definition.
+    pub const fn definition(&self) -> &InstrumentDefinition {
+        self.instrument.definition()
+    }
+
+    /// Returns the only checksum scope currently admitted by the reviewed adapter policy.
+    pub const fn depth(&self) -> usize {
+        10
+    }
+
+    /// Returns the configured market-price freshness threshold.
+    pub const fn freshness(&self) -> Duration {
+        self.freshness
+    }
+
+    /// Returns the exact incoming frame ceiling.
+    pub const fn max_frame_bytes(&self) -> NonZeroUsize {
+        self.max_frame_bytes
+    }
+
+    /// Returns the deadline for the exact subscription acknowledgement.
+    pub const fn subscription_ack_timeout(&self) -> Duration {
+        self.subscription_ack_timeout
+    }
+
+    /// Returns bounded one-generation control state limits.
+    pub const fn control_limits(&self) -> CoinbaseControlLimits {
+        self.control_limits
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum KrakenChannelWire {
+    Book,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KrakenSourceConfigWire {
+    endpoint: String,
+    authorization: KrakenAuthorizationAttestationWire,
+    channel: KrakenChannelWire,
+    depth: usize,
+    freshness_ms: u64,
+    max_frame_bytes: usize,
+    subscription_ack_timeout_ms: u64,
+    control_message_capacity: usize,
+    control_byte_capacity: usize,
+    instrument: KrakenInstrumentWire,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KrakenAuthorizationAttestationWire {
+    mode: CoinbaseAuthorizationModeWire,
+    provider: String,
+    basis: String,
+    evidence_sha256: String,
+    evidence_reference: String,
+    evidence_version: String,
+    effective_from_unix_nanos: i64,
+    effective_until_unix_nanos: i64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KrakenInstrumentWire {
+    symbol: String,
+    instrument_id: InstrumentId,
+    definition_revision: InstrumentDefinitionRevision,
+    asset_class: AssetClass,
+    primary_currency: Option<Currency>,
+    primary_asset: Option<InstrumentId>,
+    quote_currency: Currency,
+    tick_size: TickSize,
+    lot_size: LotSize,
+    contract_multiplier: Decimal,
+    venue: VenueId,
+    trading_status: TradingStatus,
+}
+
+impl<'de> Deserialize<'de> for KrakenSourceConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = KrakenSourceConfigWire::deserialize(deserializer)?;
+        Self::try_from(wire).map_err(serde::de::Error::custom)
+    }
+}
+
+impl TryFrom<KrakenSourceConfigWire> for KrakenSourceConfig {
+    type Error = KrakenConfigurationError;
+
+    fn try_from(wire: KrakenSourceConfigWire) -> Result<Self, Self::Error> {
+        if wire.endpoint != KRAKEN_WEBSOCKET_V2_ENDPOINT
+            || wire.channel != KrakenChannelWire::Book
+            || wire.depth != 10
+        {
+            return Err(KrakenConfigurationError::InvalidProtocolProfile);
+        }
+        if !(MIN_FRESHNESS_MS..=MAX_FRESHNESS_MS).contains(&wire.freshness_ms) {
+            return Err(KrakenConfigurationError::InvalidFreshness);
+        }
+        let max_frame_bytes = NonZeroUsize::new(wire.max_frame_bytes)
+            .filter(|bound| bound.get() <= MAX_LIVE_CAPTURE_PAYLOAD_BYTES)
+            .ok_or(KrakenConfigurationError::InvalidFrameLimit)?;
+        if wire.subscription_ack_timeout_ms == 0
+            || wire.subscription_ack_timeout_ms > MAX_ACK_TIMEOUT_MS
+        {
+            return Err(KrakenConfigurationError::InvalidAcknowledgementTimeout);
+        }
+        let control_limits = CoinbaseControlLimits {
+            message_capacity: NonZeroUsize::new(wire.control_message_capacity)
+                .filter(|bound| bound.get() <= MAX_CONTROL_MESSAGES)
+                .ok_or(KrakenConfigurationError::InvalidControlLimits)?,
+            byte_capacity: NonZeroUsize::new(wire.control_byte_capacity)
+                .filter(|bound| bound.get() <= MAX_CONTROL_BYTES)
+                .ok_or(KrakenConfigurationError::InvalidControlLimits)?,
+        };
+        Ok(Self {
+            authorization: wire.authorization.try_into()?,
+            instrument: wire.instrument.try_into()?,
+            freshness: Duration::from_millis(wire.freshness_ms),
+            max_frame_bytes,
+            subscription_ack_timeout: Duration::from_millis(wire.subscription_ack_timeout_ms),
+            control_limits,
+        })
+    }
+}
+
+impl TryFrom<KrakenAuthorizationAttestationWire> for KrakenAuthorizationAttestation {
+    type Error = KrakenConfigurationError;
+
+    fn try_from(wire: KrakenAuthorizationAttestationWire) -> Result<Self, Self::Error> {
+        let CoinbaseAuthorizationModeWire::PublicInterface = wire.mode;
+        if wire.provider != KRAKEN_PROVIDER {
+            return Err(KrakenConfigurationError::AuthorizationProviderMismatch);
+        }
+        let identifier = |value: String| {
+            SourceIdentifier::try_from(value)
+                .map_err(|_error| KrakenConfigurationError::InvalidAuthorizationAttestation)
+        };
+        let digest = decode_kraken_sha256(&wire.evidence_sha256)?;
+        let effective = EffectiveInterval::new(
+            Timestamp::from_unix_nanos(wire.effective_from_unix_nanos),
+            Some(Timestamp::from_unix_nanos(wire.effective_until_unix_nanos)),
+        )
+        .map_err(|_error| KrakenConfigurationError::InvalidAuthorizationAttestation)?;
+        Ok(Self {
+            provider: identifier(wire.provider)?,
+            basis: AuthorizationBasis::new(identifier(wire.basis)?),
+            evidence: ExactPayloadEvidence::with_version_pinned_locator(
+                EvidenceDigest::new(DigestAlgorithm::Sha256, digest),
+                VersionPinnedSourceLocator::new(
+                    identifier(wire.evidence_reference)?,
+                    identifier(wire.evidence_version)?,
+                ),
+            ),
+            effective,
+        })
+    }
+}
+
+impl TryFrom<KrakenInstrumentWire> for KrakenInstrumentMapping {
+    type Error = KrakenConfigurationError;
+
+    fn try_from(wire: KrakenInstrumentWire) -> Result<Self, Self::Error> {
+        if wire.symbol.is_empty()
+            || wire.symbol.len() > MAX_COINBASE_PRODUCT_BYTES
+            || !wire.symbol.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.')
+            })
+        {
+            return Err(KrakenConfigurationError::InvalidSymbol);
+        }
+        if wire.venue.as_str() != KRAKEN_VENUE || wire.asset_class != AssetClass::Crypto {
+            return Err(KrakenConfigurationError::InvalidInstrumentDefinition);
+        }
+        let primary_denomination = match (wire.primary_currency, wire.primary_asset) {
+            (Some(currency), None) => Denomination::Currency(currency),
+            (None, Some(instrument)) => Denomination::Asset(instrument),
+            _ => return Err(KrakenConfigurationError::InvalidInstrumentDefinition),
+        };
+        let venue_symbol = VenueSymbol::try_from(wire.symbol.as_str())
+            .map_err(|_error| KrakenConfigurationError::InvalidSymbol)?;
+        let definition = InstrumentDefinition::try_new(InstrumentDefinitionInput {
+            instrument_id: wire.instrument_id,
+            definition_revision: wire.definition_revision,
+            asset_class: wire.asset_class,
+            primary_denomination,
+            quote_currency: wire.quote_currency,
+            tick_size: wire.tick_size,
+            lot_size: wire.lot_size,
+            contract_multiplier: wire.contract_multiplier,
+            venue_mappings: vec![VenueMapping::new(wire.venue, venue_symbol)],
+            provider_identities: Vec::new(),
+            identifiers: Vec::new(),
+            trading_status: wire.trading_status,
+        })
+        .map_err(|_error| KrakenConfigurationError::InvalidInstrumentDefinition)?;
+        Ok(Self {
+            symbol: wire.symbol.into_boxed_str(),
+            definition,
+        })
+    }
+}
+
+fn decode_kraken_sha256(value: &str) -> Result<[u8; 32], KrakenConfigurationError> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 64 {
+        return Err(KrakenConfigurationError::InvalidAuthorizationAttestation);
+    }
+    let mut digest = [0_u8; 32];
+    for (index, pair) in bytes.chunks_exact(2).enumerate() {
+        let nibble = |value: u8| match value {
+            b'0'..=b'9' => Some(value - b'0'),
+            b'a'..=b'f' => Some(value - b'a' + 10),
+            b'A'..=b'F' => Some(value - b'A' + 10),
+            _ => None,
+        };
+        let high =
+            nibble(pair[0]).ok_or(KrakenConfigurationError::InvalidAuthorizationAttestation)?;
+        let low =
+            nibble(pair[1]).ok_or(KrakenConfigurationError::InvalidAuthorizationAttestation)?;
+        digest[index] = (high << 4) | low;
+    }
+    Ok(digest)
+}
+
+pub(super) fn parse_kraken_environment_profile(
+    value: &str,
+) -> Result<KrakenSourceConfig, ConfigError> {
+    if value.len() > MAX_ENVIRONMENT_PROFILE_BYTES {
+        return Err(ConfigError::InvalidEnvironmentValue);
+    }
+    serde_json::from_str(value).map_err(|_error| ConfigError::InvalidEnvironmentValue)
+}
+
+/// Strict Kraken configuration failure without rendering source input.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum KrakenConfigurationError {
+    #[error("Kraken production protocol profile is invalid")]
+    InvalidProtocolProfile,
+    #[error("Kraken authorization attestation is invalid or unbounded")]
+    InvalidAuthorizationAttestation,
+    #[error("Kraken authorization attestation names another provider")]
+    AuthorizationProviderMismatch,
+    #[error("Kraken symbol is invalid")]
+    InvalidSymbol,
+    #[error("Kraken instrument definition is invalid")]
+    InvalidInstrumentDefinition,
+    #[error("Kraken freshness limit is invalid")]
+    InvalidFreshness,
+    #[error("Kraken frame limit is invalid")]
+    InvalidFrameLimit,
+    #[error("Kraken subscription acknowledgement timeout is invalid")]
+    InvalidAcknowledgementTimeout,
+    #[error("Kraken control-state limits are invalid")]
+    InvalidControlLimits,
 }
 
 pub(super) fn parse_environment_profile(value: &str) -> Result<CoinbaseSourceConfig, ConfigError> {

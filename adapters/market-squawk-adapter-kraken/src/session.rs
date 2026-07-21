@@ -6,9 +6,9 @@ use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use market_squawk_domain::{LiveEventClass, Timestamp};
 use market_squawk_sources::{
-    BudgetDecision, BudgetPermit, CurrentSourceSession, LiveMarketSource, RawFrameFactory,
-    RawMarketSink, SharedProviderBudget, SourceError, SourceMetadata, SourceMetadataProvider,
-    TransportFrameKind, apply_http_retry_after,
+    ActiveLiveSourceGeneration, BudgetDecision, BudgetPermit, LiveMarketSource,
+    LiveSourceGeneration, RawMarketSink, SharedProviderBudget, SourceError, SourceMetadata,
+    SourceMetadataProvider, TransportFrameKind, apply_http_retry_after,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::WebSocketStream;
@@ -17,8 +17,8 @@ use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    KrakenChannel, KrakenConfig, KrakenConfigError, KrakenControl, KrakenDecodeOutcome,
-    KrakenDecoder, KrakenDecoderState, KrakenSubscription,
+    KrakenChannel, KrakenConfig, KrakenControl, KrakenDecodeOutcome, KrakenDecoder,
+    KrakenDecoderState, KrakenSubscription,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -100,33 +100,31 @@ impl KrakenHealth {
 #[derive(Debug)]
 pub struct KrakenSource {
     config: KrakenConfig,
+    authority: ActiveLiveSourceGeneration,
     budget: SharedProviderBudget,
     generation_started: bool,
     health: KrakenHealth,
 }
 
 impl KrakenSource {
-    /// Binds checked configuration to one exact current registry connection generation.
+    /// Consumes one exact registry-minted current-generation authority.
     ///
     /// # Errors
     ///
-    /// Rejects a session for another source or metadata revision or a session without the
-    /// registry-coordinated Kraken provider budget.
+    /// Rejects stale, capture-unhealthy, mismatched, or incomplete generation authority before any
+    /// provider-budget or network operation can occur.
     pub fn try_new(
         config: KrakenConfig,
-        session: &CurrentSourceSession,
-    ) -> Result<Self, KrakenConfigError> {
-        if session.source_id() != config.metadata().source_id()
-            || session.revision() != config.metadata().revision()
-        {
-            return Err(KrakenConfigError::SessionMismatch);
-        }
-        let budget = session
-            .budget()
+        generation: LiveSourceGeneration,
+    ) -> Result<Self, SourceError> {
+        let authority = generation.try_start(config.metadata())?;
+        let budget = authority
+            .budget()?
             .cloned()
-            .ok_or(KrakenConfigError::MissingSharedBudget)?;
+            .ok_or(SourceError::GenerationAuthorityMismatch)?;
         Ok(Self {
             config,
+            authority,
             budget,
             generation_started: false,
             health: KrakenHealth {
@@ -139,6 +137,17 @@ impl KrakenSource {
                 trade_subscribed: false,
             },
         })
+    }
+
+    fn validate_generation(&self) -> Result<(), SourceError> {
+        let issued = self
+            .authority
+            .budget()?
+            .ok_or(SourceError::GenerationAuthorityMismatch)?;
+        if !self.budget.shares_allocation_with(issued) {
+            return Err(SourceError::GenerationAuthorityMismatch);
+        }
+        Ok(())
     }
 
     /// Returns the current non-authoritative operational snapshot.
@@ -156,7 +165,6 @@ impl KrakenSource {
 
     async fn run_generation(
         &mut self,
-        frames: &mut RawFrameFactory,
         sink: &mut dyn RawMarketSink,
         cancellation: CancellationToken,
     ) -> Result<(), SourceError> {
@@ -164,6 +172,10 @@ impl KrakenSource {
         if cancellation.is_cancelled() {
             return Err(SourceError::Cancelled);
         }
+        self.validate_generation()?;
+        self.config
+            .authorize_endpoint()
+            .map_err(|_| SourceError::InvalidProtocolState)?;
         self.health.state = KrakenDecoderState::AwaitingSnapshot;
         self.health.book_subscribed = false;
         self.health.trade_subscribed = false;
@@ -197,23 +209,22 @@ impl KrakenSource {
             self.health.state = KrakenDecoderState::Quarantined;
             return Err(SourceError::ProviderUnavailable);
         }
-        self.run_established(&mut socket, frames, sink, cancellation)
-            .await
+        self.run_established(&mut socket, sink, cancellation).await
     }
 
     async fn run_established<S>(
         &mut self,
         socket: &mut WebSocketStream<S>,
-        frames: &mut RawFrameFactory,
         sink: &mut dyn RawMarketSink,
         cancellation: CancellationToken,
     ) -> Result<(), SourceError>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
+        self.validate_generation()?;
         let deadlines = SessionDeadlines::from_metadata(self.config.metadata());
         let result = self
-            .run_established_inner(socket, frames, sink, &cancellation, deadlines)
+            .run_established_inner(socket, sink, &cancellation, deadlines)
             .await;
         if result.is_err() {
             self.health.state = KrakenDecoderState::Quarantined;
@@ -227,7 +238,6 @@ impl KrakenSource {
     async fn run_established_inner<S>(
         &mut self,
         socket: &mut WebSocketStream<S>,
-        frames: &mut RawFrameFactory,
         sink: &mut dyn RawMarketSink,
         cancellation: &CancellationToken,
         deadlines: SessionDeadlines,
@@ -235,6 +245,7 @@ impl KrakenSource {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
+        self.validate_generation()?;
         let (channel, depth) = match self.config.channel() {
             KrakenChannel::Book(depth) => ("book", Some(depth.get())),
             KrakenChannel::Trades => ("trade", None),
@@ -286,7 +297,6 @@ impl KrakenSource {
                 Message::Text(text) => {
                     let payload = Bytes::copy_from_slice(text.as_bytes());
                     self.capture_then_decode(
-                        frames,
                         sink,
                         &mut decoder,
                         TransportFrameKind::Text,
@@ -295,7 +305,11 @@ impl KrakenSource {
                 }
                 Message::Binary(binary) => {
                     let payload = Bytes::copy_from_slice(binary.as_ref());
-                    let frame = match frames.try_frame(TransportFrameKind::Binary, payload) {
+                    let frame = match self
+                        .authority
+                        .frames_mut()?
+                        .try_frame(TransportFrameKind::Binary, payload)
+                    {
                         Ok(frame) => frame,
                         Err(error) => {
                             self.health.state = KrakenDecoderState::Quarantined;
@@ -342,7 +356,6 @@ impl KrakenSource {
 
     fn capture_then_decode(
         &mut self,
-        frames: &mut RawFrameFactory,
         sink: &mut dyn RawMarketSink,
         decoder: &mut KrakenDecoder,
         transport: TransportFrameKind,
@@ -354,7 +367,11 @@ impl KrakenSource {
                 max: self.config.max_message_bytes(),
             });
         }
-        let frame = match frames.try_frame(transport, payload.clone()) {
+        let frame = match self
+            .authority
+            .frames_mut()?
+            .try_frame(transport, payload.clone())
+        {
             Ok(frame) => frame,
             Err(error) => {
                 self.health.state = KrakenDecoderState::Quarantined;
@@ -449,11 +466,10 @@ impl SourceMetadataProvider for KrakenSource {
 impl LiveMarketSource for KrakenSource {
     fn run<'a>(
         &'a mut self,
-        frames: &'a mut RawFrameFactory,
         sink: &'a mut dyn RawMarketSink,
         cancellation: CancellationToken,
     ) -> futures_util::future::BoxFuture<'a, Result<(), SourceError>> {
-        Box::pin(self.run_generation(frames, sink, cancellation))
+        Box::pin(self.run_generation(sink, cancellation))
     }
 }
 

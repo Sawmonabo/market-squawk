@@ -60,16 +60,74 @@ async fn shipping_mcp_constructor_uses_the_bounded_sdk_durable_audit_and_control
     .await?;
     write_message(
         &mut client_writer,
-        json!({"jsonrpc":"2.0","id":"shipping-ping","method":"ping"}),
+        json!({"jsonrpc":"2.0","id":"shipping-tools","method":"tools/list"}),
     )
     .await?;
-    assert_eq!(read_message(&mut client_reader).await?["result"], json!({}));
+    let tools = read_message(&mut client_reader).await?;
+    let names = tools["result"]["tools"]
+        .as_array()
+        .ok_or("tools/list response is missing tools")?
+        .iter()
+        .map(|tool| tool["name"].as_str().ok_or("tool is missing its name"))
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(
+        names,
+        [
+            "Bot.GetStatus",
+            "Journal.GetSummary",
+            "Market.GetQuality",
+            "Market.GetSnapshot",
+            "Risk.TriggerKillSwitch",
+        ]
+    );
+    write_message(
+        &mut client_writer,
+        json!({
+            "jsonrpc":"2.0","id":"shipping-read","method":"tools/call",
+            "params":{"name":"Bot.GetStatus","arguments":{}}
+        }),
+    )
+    .await?;
+    let status = read_message(&mut client_reader).await?;
+    assert_eq!(status["result"]["structuredContent"]["mode"], "paper_only");
+    write_message(
+        &mut client_writer,
+        json!({
+            "jsonrpc":"2.0","id":"shipping-mutation","method":"tools/call",
+            "params":{
+                "name":"Risk.TriggerKillSwitch",
+                "arguments":{"confirm":true,"reason":"production composition test"}
+            }
+        }),
+    )
+    .await?;
+    let mutation = read_message(&mut client_reader).await?;
+    assert_eq!(mutation["result"]["structuredContent"]["triggered"], true);
     client_writer.shutdown().await?;
     let _exit = task.await??;
 
     let audit = temporary.path().join("control").join("mcp-audit.jsonl");
     assert!(audit.is_file());
-    assert!(std::fs::metadata(audit)?.len() > 0);
+    assert!(std::fs::metadata(&audit)?.len() > 0);
+    let mutation_phases = std::fs::read_to_string(&audit)?
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|record| {
+            record["operation"]["kind"] == "call_tool"
+                && record["operation"]["name"] == "Risk.TriggerKillSwitch"
+        })
+        .map(|record| record["phase"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        mutation_phases,
+        [
+            "mutation_admitted",
+            "mutation_service_completed",
+            "completed"
+        ]
+    );
     assert!(temporary.path().join("artifacts").join("mcp").is_dir());
     Ok(())
 }

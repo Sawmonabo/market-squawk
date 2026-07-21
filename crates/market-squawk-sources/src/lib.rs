@@ -85,15 +85,15 @@ pub use policy::{
     SharedProviderBudget, apply_http_retry_after,
 };
 pub use registry::{
-    AuthoritativeSourceRegistry, CapturedDecodedProviderBatch, CurrentBatchIter, CurrentBatchKey,
-    CurrentCoveragePolicy, CurrentDecodedProviderBatch, CurrentDecodedProviderBatches,
-    CurrentFrameEvidence, CurrentHealthReporter, CurrentHealthUpdate, CurrentLivePolicy,
-    CurrentObservationIter, CurrentProviderObservation, CurrentSourceAuthorityLease,
-    CurrentSourceSession, CurrentStreamKey, InstrumentUniverseAttestation, RawFrameFactory,
-    RegisteredSource, RegistryAuthorityState, RegistryError, SessionControlDisposition,
-    SessionIgnoredDisposition, SessionQuarantineDisposition, SessionRecoveryDisposition,
-    ValidatedCurrentSourceAuthority, ValidatedLiveScope, ValidatedSessionDecodeOutcome,
-    ValidatedSourceSession,
+    ActiveLiveSourceGeneration, AuthoritativeSourceRegistry, CapturedDecodedProviderBatch,
+    CurrentBatchIter, CurrentBatchKey, CurrentCoveragePolicy, CurrentDecodedProviderBatch,
+    CurrentDecodedProviderBatches, CurrentFrameEvidence, CurrentHealthReporter,
+    CurrentHealthUpdate, CurrentLivePolicy, CurrentObservationIter, CurrentProviderObservation,
+    CurrentSourceAuthorityLease, CurrentSourceSession, CurrentStreamKey,
+    InstrumentUniverseAttestation, LiveSourceGeneration, RawFrameFactory, RegisteredSource,
+    RegistryAuthorityState, RegistryError, SessionControlDisposition, SessionIgnoredDisposition,
+    SessionQuarantineDisposition, SessionRecoveryDisposition, ValidatedCurrentSourceAuthority,
+    ValidatedLiveScope, ValidatedSessionDecodeOutcome, ValidatedSourceSession,
 };
 
 #[cfg(test)]

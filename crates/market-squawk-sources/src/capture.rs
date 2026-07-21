@@ -197,6 +197,15 @@ impl CaptureGenerationLease {
             && self.session_started_at == other.session_started_at
     }
 
+    pub(crate) fn is_bound_to(
+        &self,
+        continuity: &AuthorityTimeContinuity,
+        session_started_at: TrustedRegistryTime,
+    ) -> bool {
+        self.continuity.shares_allocation_with(continuity)
+            && self.session_started_at == session_started_at
+    }
+
     pub(crate) fn validate_receipt(
         &self,
         receipt: &TrustedReceiptObservation,

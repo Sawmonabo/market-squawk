@@ -2,7 +2,6 @@
 
 use std::{num::NonZeroUsize, time::Instant};
 
-use market_squawk_adapter_coinbase::CoinbaseConfigError;
 use market_squawk_domain::{ConnectionGeneration, IdentityError, SourceIdentifier};
 use market_squawk_live::{LiveIngressBindError, LiveRuntimeIngress, ShardKey};
 use market_squawk_platform::{
@@ -16,15 +15,15 @@ use market_squawk_platform::{
 };
 use market_squawk_sources::{
     AuthoritativeSourceRegistry, BudgetDecision, BudgetUnavailableReason,
-    CaptureGenerationCapabilities, LiveMarketSource, RegisteredSource, RegistryError, SessionId,
-    SourceError,
+    CaptureGenerationCapabilities, RegisteredSource, RegistryError, SessionId, SourceError,
 };
 use thiserror::Error;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    composition::{ProductionCoinbaseProfile, ProductionCoinbaseProfileError, system_timestamp},
+    composition::{ProductionCoinbaseProfileError, system_timestamp},
+    provider::{ProductionProviderError, ProductionSourceProfile},
     route_actor::{RouteActorWorker, RouteBufferLimits, spawn_route_activation},
     sink::{
         ProductionRawMarketSink, ProductionRawMarketSinkInput, ProductionSinkConstructionError,
@@ -36,8 +35,6 @@ use super::{
     },
 };
 
-const AUTHORITY_DIRECTORY: &str = "authority/coinbase-exchange-public";
-const CAPTURE_JOURNAL: &str = "coinbase-exchange-public";
 const CAPTURE_FLUSH_RECORDS: usize = 256;
 const BACKOFF_JITTER_SAMPLE_BASIS_POINTS: u16 = 1_000;
 
@@ -63,7 +60,7 @@ impl ProductionGenerationOutcome {
 #[derive(Debug)]
 pub(super) struct ProductionSourceSupervisor {
     config: AppConfig,
-    profile: ProductionCoinbaseProfile,
+    profile: ProductionSourceProfile,
     registry: Option<AuthoritativeSourceRegistry>,
     registered: RegisteredSource,
     paths: LocalPaths,
@@ -76,7 +73,7 @@ pub(super) struct ProductionSourceSupervisor {
 impl ProductionSourceSupervisor {
     pub(super) fn try_new(
         config: &AppConfig,
-        profile: ProductionCoinbaseProfile,
+        profile: ProductionSourceProfile,
         paths: LocalPaths,
         capture_process: CaptureProcessInfrastructure,
         live_ingress: LiveRuntimeIngress,
@@ -84,8 +81,9 @@ impl ProductionSourceSupervisor {
         route_buffer_limits: RouteBufferLimits,
     ) -> Result<Self, ProductionSupervisorError> {
         let registered_at = system_timestamp()?;
-        let authority_store =
-            LocalAuthorityStateStore::try_open(paths.root().join(AUTHORITY_DIRECTORY))?;
+        let authority_store = LocalAuthorityStateStore::try_open(
+            paths.root().join("authority").join(profile.source_key()),
+        )?;
         let mut registry = AuthoritativeSourceRegistry::try_new_durable(authority_store)?;
         let registered = match registry
             .register_or_resume_exact(profile.metadata().clone(), registered_at)
@@ -120,7 +118,8 @@ impl ProductionSourceSupervisor {
     ) -> Result<ProductionGenerationOutcome, ProductionSupervisorError> {
         let at = system_timestamp()?;
         let session_id = SessionId::new(SourceIdentifier::try_from(format!(
-            "coinbase-{}",
+            "{}-{}",
+            self.profile.source_key(),
             uuid::Uuid::new_v4()
         ))?);
         let mut route_workers = Vec::new();
@@ -139,7 +138,6 @@ impl ProductionSourceSupervisor {
 
         let source_result = async {
             let capabilities = registry.take_capture_generation_capabilities(&session)?;
-            let mut frame_factory = registry.take_raw_frame_factory(&session)?;
             let health_reporter = registry.take_current_health_reporter(&session)?;
             let (publisher, control, writer) = raw_capture_channel(
                 &self.capture_process,
@@ -155,13 +153,14 @@ impl ProductionSourceSupervisor {
                 CaptureWriterPolicy::try_new(flush_records, self.config.capture_flush_interval())?;
             let process_config = ProcessJournalCaptureConfig::try_new(
                 self.paths.root(),
-                CAPTURE_JOURNAL,
+                self.profile.source_key(),
                 self.config.capture_shutdown(),
             )?;
             let handle = spawn_process_journal_capture_writer(writer, process_config, policy)?;
             capture_control = Some(control);
             writer_handle = Some(handle);
             activate_owned_capture(&mut capture_control, &writer_handle)?;
+            let source_generation = registry.take_live_source_generation(&session)?;
 
             let mut route_publishers = Vec::new();
             route_publishers
@@ -178,37 +177,36 @@ impl ProductionSourceSupervisor {
                 route_workers.push(worker);
             }
 
-            let source_config = self
-                .config
-                .coinbase()
-                .ok_or(ProductionSupervisorError::MissingCoinbaseConfiguration)?;
-            let controls = source_config.control_limits();
             let subscription = SubscriptionStateMachine::try_new(
                 GenerationIdentity::from_session(&session),
-                source_config
-                    .instruments()
+                self.profile
+                    .subscription_products()
                     .iter()
-                    .map(market_squawk_platform::CoinbaseInstrumentMapping::product),
-                source_config.subscription_ack_timeout(),
+                    .map(String::as_str),
+                self.profile.subscription_ack_timeout(),
                 Instant::now(),
                 SubscriptionLimits::try_new(
-                    controls.message_capacity().get(),
-                    controls.byte_capacity().get(),
+                    self.profile.control_message_capacity(),
+                    self.profile.control_byte_capacity(),
                 )?,
             )?;
             tracing::debug!(
-                source = CAPTURE_JOURNAL,
+                source = self.profile.source_key(),
                 generation = session.generation().get(),
                 subscription_state_peak_bytes = subscription.estimated_peak_bytes().get(),
                 "prepared bounded production subscription state"
             );
-            let mut source = self.profile.try_source(&session)?;
+            let mut source = self
+                .profile
+                .try_source(source_generation)
+                .map_err(ProductionSupervisorError::TerminalSource)?;
+            let decoder = self.profile.decoder()?;
             let mut sink = ProductionRawMarketSink::try_new(ProductionRawMarketSinkInput {
                 capture: publisher,
                 registry,
                 session: &session,
                 health_reporter,
-                decoder: self.profile.decoder().clone(),
+                decoder,
                 subscription,
                 live_ingress: self.live_ingress.clone(),
                 routes: route_publishers,
@@ -218,9 +216,7 @@ impl ProductionSourceSupervisor {
                     .send(())
                     .map_err(|_value| ProductionSupervisorError::StartupObserverDropped)?;
             }
-            let result = source
-                .run(&mut frame_factory, &mut sink, cancellation)
-                .await;
+            let result = source.run(&mut sink, cancellation).await;
             let terminal = sink.terminal_failure();
             drop(sink);
             match (result, terminal) {
@@ -329,6 +325,8 @@ impl ProductionSourceSupervisor {
                 | SourceError::Cancelled
                 | SourceError::FrameIdentityExhausted
                 | SourceError::SessionNotCurrent
+                | SourceError::CaptureNotHealthy
+                | SourceError::GenerationAuthorityMismatch
                 | SourceError::TrustedTimeUnavailable
                 | SourceError::TrustedTimeDiscontinuity => {
                     return Err(ProductionSupervisorError::TerminalSource(error));
@@ -426,8 +424,6 @@ pub(super) fn activate_owned_capture<W>(
 pub enum ProductionSupervisorError {
     #[error("production source supervisor is already shut down")]
     AlreadyShutdown,
-    #[error("production Coinbase configuration disappeared after validation")]
-    MissingCoinbaseConfiguration,
     #[error("production source supervisor bounded allocation failed")]
     AllocationFailed,
     #[error("production source supervisor static policy is invalid")]
@@ -465,6 +461,8 @@ pub enum ProductionSupervisorError {
     #[error(transparent)]
     Profile(#[from] ProductionCoinbaseProfileError),
     #[error(transparent)]
+    Provider(#[from] ProductionProviderError),
+    #[error(transparent)]
     Identity(#[from] IdentityError),
     #[error(transparent)]
     CaptureChannel(#[from] CaptureChannelError),
@@ -488,6 +486,4 @@ pub enum ProductionSupervisorError {
     SinkConstruction(#[from] ProductionSinkConstructionError),
     #[error("production sink failed closed: {0}")]
     Sink(ProductionSinkFailure),
-    #[error(transparent)]
-    Adapter(#[from] CoinbaseConfigError),
 }

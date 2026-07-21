@@ -164,11 +164,23 @@ fn offline_mcp(data_dir: &Path, journal_format: Option<&str>) -> Result<Output> 
     let mut child = command.spawn()?;
     let mut stdin = child.stdin.take().context("MCP stdin was not piped")?;
     stdin.write_all(
-        br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"Journal.GetSummary","arguments":{}}}
+        br#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"market-squawk-tests","version":"1"}}}
+{"jsonrpc":"2.0","method":"notifications/initialized"}
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"Journal.GetSummary","arguments":{}}}
 "#,
     )?;
     drop(stdin);
     Ok(child.wait_with_output()?)
+}
+
+fn mcp_response(output: &Output, id: u64) -> Result<Value> {
+    String::from_utf8(output.stdout.clone())?
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .find(|response| response["id"].as_u64() == Some(id))
+        .context("MCP response was missing")
 }
 
 #[test]
@@ -179,7 +191,7 @@ fn offline_mcp_reads_the_sole_legacy_journal_without_creating_current_data() -> 
     let output = offline_mcp(directory.path(), None)?;
 
     assert_success(&output)?;
-    let response: Value = serde_json::from_slice(&output.stdout)?;
+    let response = mcp_response(&output, 1)?;
     assert_eq!(response["result"]["structuredContent"]["records"], 1);
     assert!(
         !directory
@@ -192,14 +204,29 @@ fn offline_mcp_reads_the_sole_legacy_journal_without_creating_current_data() -> 
 }
 
 #[test]
-fn offline_mcp_does_not_create_storage_when_no_journal_exists() -> Result<()> {
+fn offline_mcp_creates_only_controlled_state_when_no_journal_exists() -> Result<()> {
     let directory = tempdir()?;
     let data_dir = directory.path().join("not-created");
 
     let output = offline_mcp(&data_dir, None)?;
 
     assert_success(&output)?;
-    assert!(!data_dir.exists());
+    let response = mcp_response(&output, 1)?;
+    assert_eq!(response["result"]["structuredContent"]["records"], 0);
+    assert!(data_dir.join("control").join("mcp-audit.jsonl").is_file());
+    assert!(data_dir.join("artifacts").join("mcp").join("v1").is_dir());
+    assert!(
+        !data_dir
+            .join("journal")
+            .join(format!("{SOURCE}.msj"))
+            .exists()
+    );
+    assert!(
+        !data_dir
+            .join("journal")
+            .join(format!("{SOURCE}.mej"))
+            .exists()
+    );
     Ok(())
 }
 

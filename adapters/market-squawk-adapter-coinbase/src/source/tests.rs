@@ -12,8 +12,8 @@ use market_squawk_domain::{
 };
 use market_squawk_sources::{
     AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode, BackoffPolicy, BudgetScope,
-    DecodeOutcome, FreshnessPolicy, MarketDecoder, ProviderBudgetPolicy, RawMarketFrame,
-    RawMarketSink, SessionId, SinkError, SourceError,
+    DecodeOutcome, FreshnessPolicy, LiveSourceGeneration, MarketDecoder, ProviderBudgetPolicy,
+    RawMarketFrame, RawMarketSink, RegistryError, SessionId, SinkError, SourceError,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{
@@ -49,8 +49,8 @@ async fn one_generation_subscribes_captures_controls_and_returns_typed_close() -
     let _budget_guard = SOURCE_BUDGET_TEST_LOCK.lock().await;
     let config = config()?;
     let (mut registry, session) = session(&config, "source-local-1")?;
-    let mut frames = registry.take_raw_frame_factory(&session)?;
-    let mut source = CoinbaseExchangeSource::try_new(config.clone(), &session)?;
+    let generation = live_generation(&mut registry, &session)?;
+    let mut source = CoinbaseExchangeSource::try_new(config.clone(), generation)?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move {
@@ -92,7 +92,7 @@ async fn one_generation_subscribes_captures_controls_and_returns_typed_close() -
     let (socket, _) = client_async(format!("ws://{address}"), stream).await?;
     let mut sink = RecordingSink::default();
     let outcome = source
-        .run_with_socket_for_test(socket, &mut frames, &mut sink, CancellationToken::new())
+        .run_with_socket_for_test(socket, &mut sink, CancellationToken::new())
         .await;
     assert_eq!(outcome, Err(SourceError::ProviderUnavailable));
     server
@@ -156,8 +156,8 @@ async fn cancellation_preempts_read_and_source_refuses_same_generation_restart()
     let _budget_guard = SOURCE_BUDGET_TEST_LOCK.lock().await;
     let config = config()?;
     let (mut registry, session) = session(&config, "source-local-2")?;
-    let mut frames = registry.take_raw_frame_factory(&session)?;
-    let mut source = CoinbaseExchangeSource::try_new(config, &session)?;
+    let generation = live_generation(&mut registry, &session)?;
+    let mut source = CoinbaseExchangeSource::try_new(config, generation)?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move {
@@ -172,12 +172,7 @@ async fn cancellation_preempts_read_and_source_refuses_same_generation_restart()
     cancellation.cancel();
     let outcome = tokio::time::timeout(
         Duration::from_secs(1),
-        source.run_with_socket_for_test(
-            socket,
-            &mut frames,
-            &mut RecordingSink::default(),
-            cancellation,
-        ),
+        source.run_with_socket_for_test(socket, &mut RecordingSink::default(), cancellation),
     )
     .await?;
     assert_eq!(outcome, Err(SourceError::Cancelled));
@@ -187,6 +182,59 @@ async fn cancellation_preempts_read_and_source_refuses_same_generation_restart()
     );
     server.abort();
     let _server_result = server.await;
+    Ok(())
+}
+
+#[test]
+fn source_authority_rejects_rollover_factory_grafting_and_cross_registry_sessions() -> TestResult {
+    let config = config()?;
+    let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
+    let registered = registry.register(config.metadata().clone(), Timestamp::from_unix_nanos(1))?;
+    let first = registry.begin_session(
+        &registered,
+        SessionId::new(identifier("coinbase-session-first")?),
+        ConnectionGeneration::new(1)?,
+        Timestamp::from_unix_nanos(1),
+    )?;
+    let stale_generation = live_generation(&mut registry, &first)?;
+    let successor = registry.begin_session(
+        &registered,
+        SessionId::new(identifier("coinbase-session-successor")?),
+        ConnectionGeneration::new(2)?,
+        Timestamp::from_unix_nanos(2),
+    )?;
+    assert!(matches!(
+        CoinbaseExchangeSource::try_new(config.clone(), stale_generation),
+        Err(SourceError::SessionNotCurrent)
+    ));
+
+    let successor_capture = registry.take_capture_generation_capabilities(&successor)?;
+    let (mut successor_initialization, _successor_admission, _successor_degradation) =
+        successor_capture.into_parts();
+    successor_initialization.mark_healthy()?;
+    let _successor_factory = registry.take_raw_frame_factory(&successor)?;
+    assert!(matches!(
+        registry.take_live_source_generation(&successor),
+        Err(RegistryError::RawFrameFactoryAlreadyTaken)
+    ));
+
+    let mut foreign_registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
+    let foreign_registered =
+        foreign_registry.register(config.metadata().clone(), Timestamp::from_unix_nanos(1))?;
+    let foreign = foreign_registry.begin_session(
+        &foreign_registered,
+        SessionId::new(identifier("coinbase-session-successor")?),
+        ConnectionGeneration::new(1)?,
+        Timestamp::from_unix_nanos(1),
+    )?;
+    let foreign_capture = foreign_registry.take_capture_generation_capabilities(&foreign)?;
+    let (mut foreign_initialization, _foreign_admission, _foreign_degradation) =
+        foreign_capture.into_parts();
+    foreign_initialization.mark_healthy()?;
+    assert!(matches!(
+        foreign_registry.take_live_source_generation(&successor),
+        Err(RegistryError::HandleTransplanted)
+    ));
     Ok(())
 }
 
@@ -206,6 +254,16 @@ fn session(
         Timestamp::from_unix_nanos(1),
     )?;
     Ok((registry, session))
+}
+
+fn live_generation(
+    registry: &mut AuthoritativeSourceRegistry,
+    session: &market_squawk_sources::CurrentSourceSession,
+) -> TestResult<LiveSourceGeneration> {
+    let capture = registry.take_capture_generation_capabilities(session)?;
+    let (mut initialization, _admission, _degradation) = capture.into_parts();
+    initialization.mark_healthy()?;
+    Ok(registry.take_live_source_generation(session)?)
 }
 
 fn config() -> TestResult<CoinbaseExchangeConfig> {

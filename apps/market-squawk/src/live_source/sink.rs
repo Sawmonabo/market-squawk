@@ -3,10 +3,10 @@
 use std::{collections::HashMap, time::Instant};
 
 use super::{
+    provider::ProductionMarketDecoder,
     route_actor::{RouteActivationBinding, RouteActivationPublisher},
     subscription_state::{GenerationIdentity, SubscriptionFailure, SubscriptionStateMachine},
 };
-use market_squawk_adapter_coinbase::CoinbaseExchangeDecoder;
 use market_squawk_domain::{ExactPayloadEvidence, StreamIntegrityState, Timestamp};
 use market_squawk_live::{LiveIngressBindError, LiveIngressError, LiveRuntimeIngress, ShardKey};
 use market_squawk_platform::{CapturePublishError, RawCapturePublisher};
@@ -27,7 +27,7 @@ pub(super) struct ProductionRawMarketSinkInput<'a> {
     pub(super) registry: &'a mut AuthoritativeSourceRegistry,
     pub(super) session: &'a CurrentSourceSession,
     pub(super) health_reporter: CurrentHealthReporter,
-    pub(super) decoder: CoinbaseExchangeDecoder,
+    pub(super) decoder: ProductionMarketDecoder,
     pub(super) subscription: SubscriptionStateMachine,
     pub(super) live_ingress: LiveRuntimeIngress,
     pub(super) routes: Vec<RouteActivationPublisher>,
@@ -40,7 +40,7 @@ pub(super) struct ProductionRawMarketSink<'a> {
     registry: &'a mut AuthoritativeSourceRegistry,
     session: &'a CurrentSourceSession,
     health_reporter: CurrentHealthReporter,
-    decoder: CoinbaseExchangeDecoder,
+    decoder: ProductionMarketDecoder,
     generation: GenerationIdentity,
     subscription: SubscriptionStateMachine,
     live_ingress: LiveRuntimeIngress,

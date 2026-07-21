@@ -15,7 +15,7 @@ use market_squawk_mcp::{
     ArtifactError, ArtifactPublication, ArtifactPublicationContext, ArtifactReference,
     ArtifactRepository, AuditCompletion, AuditCompletionReservation, AuditError, AuditEvent,
     AuditPhase, AuditSink, LocalProcessIdentityClass, McpLimitSpec, McpLimits, McpServer,
-    ServerError, ServerExit,
+    MutationAuditBundle, MutationAuditReservation, ServerError, ServerExit,
 };
 use market_squawk_services::{
     ProgressError, RequestContext, ServiceCapabilities, ServiceError, ToolDescriptor, ToolEffects,
@@ -98,7 +98,47 @@ impl AuditSink for CollectingAudit {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(event);
             changed.notify_waiters();
+            Ok(())
         }))
+    }
+
+    fn reserve_mutation(
+        &self,
+        bundle: MutationAuditBundle,
+    ) -> Result<MutationAuditReservation, AuditError> {
+        let admitted = Arc::clone(&self.events);
+        let admitted_changed = Arc::clone(&self.changed);
+        let service = Arc::clone(&self.events);
+        let service_changed = Arc::clone(&self.changed);
+        let delivery = Arc::clone(&self.events);
+        let delivery_changed = Arc::clone(&self.changed);
+        MutationAuditReservation::try_new(
+            bundle,
+            move |event| {
+                admitted
+                    .lock()
+                    .map_err(|_| AuditError::Unavailable)?
+                    .push(event);
+                admitted_changed.notify_waiters();
+                Ok(())
+            },
+            move |event| {
+                service
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(event);
+                service_changed.notify_waiters();
+                Ok(())
+            },
+            move |event| {
+                delivery
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(event);
+                delivery_changed.notify_waiters();
+                Ok(())
+            },
+        )
     }
 }
 
@@ -686,6 +726,7 @@ async fn duplicate_active_ids_are_rejected_and_cancellation_reaches_the_service(
         match event.phase() {
             AuditPhase::Admitted => counts.0 += 1,
             AuditPhase::Completed => counts.1 += 1,
+            AuditPhase::MutationAdmitted | AuditPhase::MutationServiceCompleted => {}
         }
     }
     assert!(

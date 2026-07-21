@@ -56,7 +56,9 @@ market-squawk-analytics = { path = "crates/market-squawk-analytics", version = "
 market-squawk-domain = { path = "crates/market-squawk-domain", version = "=0.1.0" }
 market-squawk-execution = { path = "crates/market-squawk-execution", version = "=0.1.0" }
 market-squawk-live = { path = "crates/market-squawk-live", version = "=0.1.0" }
+market-squawk-mcp = { path = "crates/market-squawk-mcp", version = "=0.1.0" }
 market-squawk-platform = { path = "crates/market-squawk-platform", version = "=0.1.0" }
+market-squawk-services = { path = "crates/market-squawk-services", version = "=0.1.0" }
 market-squawk-sources = { path = "crates/market-squawk-sources", version = "=0.1.0" }
 memory-stats = "=1.2.0"
 num-bigint = "0.4"

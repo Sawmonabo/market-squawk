@@ -4,8 +4,9 @@ use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand, ValueEnum};
 use market_squawk::{
     AppConfig, AppPaths, DiagnosticEngine, DiagnosticEngineSnapshot, JournalFileFormat,
-    mcp::McpServer,
-    paper_bot::local_coinbase_paper_bot,
+    ProductionSourceProvider,
+    mcp::LocalMcpComposition,
+    paper_bot::local_paper_bot,
     replay::replay_coinbase_journal,
     source::{MarketSource, coinbase::CoinbaseSource, mock::MockSource},
     source_supervisor::{
@@ -104,6 +105,9 @@ enum Command {
         long_about = "Run the bounded production paper-execution service over the configured Coinbase instrument set. Coinbase remains DirectUnverified and cannot issue execution authority; the CLI installs an additional no-intent strategy. This command exercises production ownership and shutdown without permitting orders."
     )]
     PaperBot {
+        /// Select the explicitly configured sealed production source.
+        #[arg(long, value_enum, default_value_t = ProductionSourceArgument::Coinbase)]
+        provider: ProductionSourceArgument,
         /// Stop after this many seconds. Omit to run until Ctrl-C.
         #[arg(long)]
         seconds: Option<u64>,
@@ -147,6 +151,21 @@ enum Command {
 enum JournalFormatArgument {
     Current,
     Legacy,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ProductionSourceArgument {
+    Coinbase,
+    Kraken,
+}
+
+impl From<ProductionSourceArgument> for ProductionSourceProvider {
+    fn from(value: ProductionSourceArgument) -> Self {
+        match value {
+            ProductionSourceArgument::Coinbase => Self::Coinbase,
+            ProductionSourceArgument::Kraken => Self::Kraken,
+        }
+    }
 }
 
 impl From<JournalFormatArgument> for JournalFileFormat {
@@ -222,12 +241,14 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&snapshot)?);
         }
         Command::PaperBot {
+            provider,
             seconds,
             initial_cash,
             fee_basis_points,
         } => {
             let config = load_config(config_file.as_deref(), cli_overrides)?;
-            let composition = local_coinbase_paper_bot(config, initial_cash, fee_basis_points)?;
+            let composition =
+                local_paper_bot(config, provider.into(), initial_cash, fee_basis_points)?;
             let cancellation = CancellationToken::new();
             let runtime = composition.start(cancellation.clone()).await?;
             let primary = match seconds {
@@ -536,17 +557,35 @@ async fn run_source(
             }
         }
         RunMode::Mcp => {
-            let mcp = McpServer::new(Arc::clone(&diagnostic_engine), journal_path.clone());
+            let mcp = LocalMcpComposition::try_new(
+                &config,
+                Arc::clone(&diagnostic_engine),
+                journal_path.clone(),
+            )?;
+            let mcp_cancellation = CancellationToken::new();
+            let mut mcp_task = tokio::spawn(mcp.serve_stdio(mcp_cancellation.child_token()));
+            let mut mcp_outcome = None;
             tokio::select! {
                 result = source_task.wait() => source_outcome = Some(result),
-                result = mcp.serve_stdio() => {
-                    if let Err(error) = result {
-                        primary_error = Some(error.context("MCP stdio server failed"));
-                    }
-                },
+                result = &mut mcp_task => mcp_outcome = Some(result),
                 signal = tokio::signal::ctrl_c() => {
                     if let Err(error) = signal {
                         primary_error = Some(anyhow!(error).context("failed to listen for Ctrl-C"));
+                    }
+                }
+            }
+            mcp_cancellation.cancel();
+            if mcp_outcome.is_none() {
+                mcp_outcome = Some(mcp_task.await);
+            }
+            if let Some(result) = mcp_outcome {
+                match result {
+                    Ok(Ok(_exit)) => {}
+                    Ok(Err(error)) => {
+                        primary_error = Some(anyhow!(error).context("MCP stdio server failed"));
+                    }
+                    Err(error) => {
+                        primary_error = Some(anyhow!(error).context("MCP task join failed"));
                     }
                 }
             }
@@ -669,9 +708,9 @@ async fn run_offline_mcp(
         duration_millis_i64(config.stale_after())?,
         config.paper_bot_enabled(),
     )));
-    McpServer::new(diagnostic_engine, journal_path)
-        .serve_stdio()
-        .await
+    let composition = LocalMcpComposition::try_new(&config, diagnostic_engine, journal_path)?;
+    let _exit = composition.serve_stdio(CancellationToken::new()).await?;
+    Ok(())
 }
 
 #[cfg(test)]

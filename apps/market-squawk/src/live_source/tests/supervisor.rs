@@ -13,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::super::{
     composition::{ProductionCoinbaseProfile, SupervisorDropCancellation, system_timestamp},
+    provider::ProductionSourceProfile,
     route_actor::RouteBufferLimits,
     supervisor::{ProductionSourceSupervisor, activate_owned_capture},
 };
@@ -62,6 +63,7 @@ async fn activation_failure_keeps_capture_control_and_writer_under_cleanup_owner
         .coinbase()
         .ok_or("Coinbase production configuration missing")?;
     let profile = ProductionCoinbaseProfile::try_from(source)?;
+    let profile = ProductionSourceProfile::coinbase(profile, source)?;
     let now = system_timestamp()?;
     let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
     let registered = registry.register(budget_free_metadata(profile.metadata())?, now)?;
@@ -125,6 +127,7 @@ async fn run_cancelled_generation(root: &std::path::Path) -> TestResult<Connecti
         .coinbase()
         .ok_or("Coinbase production configuration missing")?;
     let profile = ProductionCoinbaseProfile::try_from(source)?;
+    let profile = ProductionSourceProfile::coinbase(profile, source)?;
     let runtime_config = runtime_config()?;
     let route_buffer_limits = RouteBufferLimits::new(
         runtime_config.mailbox_count_per_shard(),

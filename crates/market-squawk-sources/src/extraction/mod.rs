@@ -18,7 +18,7 @@ pub use contracts::{
 };
 
 /// Object-safe research extraction contract with one boxed future per request.
-pub trait ExtractionSource: SourceMetadataProvider {
+pub trait ExtractionSource: SourceMetadataProvider + Sync {
     /// Discovers a bounded set of versioned source objects.
     fn discover(
         &self,

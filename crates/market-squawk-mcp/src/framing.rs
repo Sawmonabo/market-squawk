@@ -24,7 +24,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     AuditCompletion, AuditCompletionReservation, AuditError, AuditEvent, AuditOperation,
-    AuditResultClass, AuditSink, LocalProcessIdentityClass, McpLimits,
+    AuditResultClass, AuditSink, LocalProcessIdentityClass, McpLimits, MutationAuditBundle,
+    MutationAuditReservation,
 };
 
 const OUTPUT_RUNNING: u8 = 0;
@@ -168,11 +169,13 @@ fn trim_carriage_return(bytes: &[u8]) -> usize {
     bytes.strip_suffix(b"\r").map_or(bytes.len(), <[u8]>::len)
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct PendingAudit {
     pub(crate) request_id: ServiceRequestId,
     pub(crate) operation: AuditOperation,
     cancellation_requested: bool,
+    service_dispatched: bool,
+    mutation: Option<MutationAuditReservation>,
 }
 
 impl PendingAudit {
@@ -181,6 +184,61 @@ impl PendingAudit {
             request_id,
             operation,
             cancellation_requested: false,
+            service_dispatched: false,
+            mutation: None,
+        }
+    }
+
+    pub(crate) fn new_mutation(
+        request_id: ServiceRequestId,
+        operation: AuditOperation,
+        mutation: MutationAuditReservation,
+    ) -> Self {
+        Self {
+            request_id,
+            operation,
+            cancellation_requested: false,
+            service_dispatched: false,
+            mutation: Some(mutation),
+        }
+    }
+
+    fn begin_service_dispatch(&mut self) -> bool {
+        if self.cancellation_requested {
+            return false;
+        }
+        self.service_dispatched = true;
+        true
+    }
+
+    fn commit_mutation_service(
+        &mut self,
+        result_class: AuditResultClass,
+    ) -> Result<(), AuditError> {
+        if let Some(mutation) = &mut self.mutation {
+            mutation.commit_service(result_class)?;
+        }
+        Ok(())
+    }
+
+    fn commit_undispatched_mutation_service(
+        &mut self,
+        result_class: AuditResultClass,
+    ) -> Result<(), AuditError> {
+        if !self.service_dispatched {
+            self.commit_mutation_service(result_class)?;
+        }
+        Ok(())
+    }
+
+    fn reserve_delivery(
+        &mut self,
+        completion: AuditCompletion,
+        audit: &dyn AuditSink,
+    ) -> Result<AuditCompletionReservation, AuditError> {
+        match &mut self.mutation {
+            Some(mutation) => mutation.reserve_delivery(completion),
+            None => audit.reserve_completion(completion),
         }
     }
 
@@ -191,6 +249,24 @@ impl PendingAudit {
             default
         }
     }
+
+    fn needs_delivery(&self) -> bool {
+        self.mutation
+            .as_ref()
+            .is_none_or(MutationAuditReservation::delivery_pending)
+    }
+
+    fn can_remove(&self) -> bool {
+        self.mutation
+            .as_ref()
+            .is_none_or(MutationAuditReservation::is_terminalized)
+    }
+
+    fn mutation_is_terminalized(&self) -> bool {
+        self.mutation
+            .as_ref()
+            .is_some_and(MutationAuditReservation::is_terminalized)
+    }
 }
 
 #[derive(Debug)]
@@ -200,8 +276,8 @@ struct ReservedCompletion {
 }
 
 impl ReservedCompletion {
-    fn commit(self, result_class: AuditResultClass) {
-        self.reservation.commit(result_class);
+    fn commit(self, result_class: AuditResultClass) -> Result<(), AuditError> {
+        self.reservation.commit(result_class)
     }
 }
 
@@ -216,6 +292,7 @@ pub(crate) struct OutboundMessage {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DeliveryFailure {
+    Audit,
     PeerClosed,
     TimedOut,
     Io,
@@ -279,6 +356,13 @@ impl OutputChannel {
         self.audit.record(event)
     }
 
+    pub(crate) fn reserve_mutation(
+        &self,
+        bundle: MutationAuditBundle,
+    ) -> Result<MutationAuditReservation, AuditError> {
+        self.audit.reserve_mutation(bundle)
+    }
+
     pub(crate) const fn identity_class(&self) -> LocalProcessIdentityClass {
         self.identity_class
     }
@@ -315,15 +399,66 @@ impl OutputChannel {
         Ok(())
     }
 
-    pub(crate) fn complete_cancelled(&self, request_id: &RequestId) -> Result<(), TransportError> {
-        let Some(audit) =
-            self.claim_pending_when(request_id, |pending| pending.cancellation_requested)?
-        else {
-            return Ok(());
+    pub(crate) fn begin_service_dispatch(
+        &self,
+        request_id: &RequestId,
+    ) -> Result<bool, TransportError> {
+        let mut pending = self.pending.lock().map_err(|_| TransportError::State)?;
+        Ok(pending
+            .get_mut(request_id)
+            .is_some_and(PendingAudit::begin_service_dispatch))
+    }
+
+    pub(crate) fn commit_mutation_service(
+        &self,
+        request_id: &RequestId,
+        result_class: AuditResultClass,
+    ) -> Result<(), TransportError> {
+        let mut pending = self.pending.lock().map_err(|_| TransportError::State)?;
+        let remove = if let Some(audit) = pending.get_mut(request_id) {
+            audit.commit_mutation_service(result_class).map_err(|_| {
+                self.fail(OUTPUT_AUDIT_FAILED);
+                TransportError::Audit
+            })?;
+            audit.mutation_is_terminalized()
+        } else {
+            false
         };
-        let completion =
-            self.reserve_completion(&audit, AuditResultClass::Cancelled, b"request cancelled")?;
-        completion.commit(AuditResultClass::Cancelled);
+        if remove {
+            pending.remove(request_id);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn complete_cancelled(&self, request_id: &RequestId) -> Result<(), TransportError> {
+        let mut pending = self.pending.lock().map_err(|_| TransportError::State)?;
+        let (completion, remove) = {
+            let Some(audit) = pending
+                .get_mut(request_id)
+                .filter(|audit| audit.cancellation_requested && audit.needs_delivery())
+            else {
+                return Ok(());
+            };
+            audit
+                .commit_undispatched_mutation_service(AuditResultClass::Cancelled)
+                .map_err(|_| {
+                    self.fail(OUTPUT_AUDIT_FAILED);
+                    TransportError::Audit
+                })?;
+            let completion =
+                self.reserve_completion(audit, AuditResultClass::Cancelled, b"request cancelled")?;
+            (completion, audit.can_remove())
+        };
+        if remove {
+            pending.remove(request_id);
+        }
+        drop(pending);
+        completion
+            .commit(AuditResultClass::Cancelled)
+            .map_err(|_| {
+                self.fail(OUTPUT_AUDIT_FAILED);
+                TransportError::Audit
+            })?;
         Ok(())
     }
 
@@ -366,7 +501,13 @@ impl OutputChannel {
         }
         encoded.push(b'\n');
         let completion = pending
-            .map(|audit| self.reserve_completion(&audit, result_class, &encoded))
+            .map(|mut audit| {
+                audit.commit_mutation_service(result_class).map_err(|_| {
+                    self.fail(OUTPUT_AUDIT_FAILED);
+                    TransportError::Audit
+                })?;
+                self.reserve_completion(&mut audit, result_class, &encoded)
+            })
             .transpose()?;
         self.enqueue(encoded, completion).await
     }
@@ -432,7 +573,7 @@ impl OutputChannel {
 
     fn reserve_completion(
         &self,
-        audit: &PendingAudit,
+        audit: &mut PendingAudit,
         intended_result_class: AuditResultClass,
         encoded: &[u8],
     ) -> Result<ReservedCompletion, TransportError> {
@@ -443,10 +584,9 @@ impl OutputChannel {
             self.limits.service_limits(),
             encoded,
         )?;
-        let reservation = self
-            .audit
-            .reserve_completion(audit_completion)
-            .map_err(|_| {
+        let reservation = audit
+            .reserve_delivery(audit_completion, self.audit.as_ref())
+            .map_err(|_error| {
                 self.fail(OUTPUT_AUDIT_FAILED);
                 TransportError::Audit
             })?;
@@ -462,28 +602,27 @@ impl OutputChannel {
         intended_result_class: AuditResultClass,
         encoded: &[u8],
     ) -> Result<Option<ReservedCompletion>, TransportError> {
-        let Some(audit) =
-            self.claim_pending_when(request_id, |pending| !pending.cancellation_requested)?
-        else {
-            return Ok(None);
-        };
-        let completion = self.reserve_completion(&audit, intended_result_class, encoded)?;
-        Ok(Some(completion))
-    }
-
-    fn claim_pending_when(
-        &self,
-        request_id: &RequestId,
-        can_claim: impl FnOnce(&PendingAudit) -> bool,
-    ) -> Result<Option<PendingAudit>, TransportError> {
         let mut pending = self.pending.lock().map_err(|_| TransportError::State)?;
-        if pending
-            .get(request_id)
-            .is_none_or(|entry| !can_claim(entry))
-        {
-            return Ok(None);
+        let (completion, remove) = {
+            let Some(audit) = pending
+                .get_mut(request_id)
+                .filter(|audit| !audit.cancellation_requested && audit.needs_delivery())
+            else {
+                return Ok(None);
+            };
+            audit
+                .commit_undispatched_mutation_service(intended_result_class)
+                .map_err(|_| {
+                    self.fail(OUTPUT_AUDIT_FAILED);
+                    TransportError::Audit
+                })?;
+            let completion = self.reserve_completion(audit, intended_result_class, encoded)?;
+            (completion, audit.can_remove())
+        };
+        if remove {
+            pending.remove(request_id);
         }
-        Ok(pending.remove(request_id))
+        Ok(Some(completion))
     }
 
     pub(crate) fn close_sender(&self) -> Result<(), TransportError> {
@@ -500,16 +639,33 @@ impl OutputChannel {
         terminal_marker: &[u8],
     ) -> Result<(), TransportError> {
         loop {
-            let audit = {
-                let mut pending = self.pending.lock().map_err(|_| TransportError::State)?;
-                let Some(request_id) = pending.keys().next().cloned() else {
-                    return Ok(());
-                };
-                pending.remove(&request_id).ok_or(TransportError::State)?
+            let mut pending = self.pending.lock().map_err(|_| TransportError::State)?;
+            let Some(request_id) = pending
+                .iter()
+                .find_map(|(request_id, audit)| audit.needs_delivery().then(|| request_id.clone()))
+            else {
+                return Ok(());
             };
-            let terminal_class = audit.shutdown_result_class(result_class);
-            let completion = self.reserve_completion(&audit, terminal_class, terminal_marker)?;
-            completion.commit(terminal_class);
+            let (completion, terminal_class, remove) = {
+                let audit = pending.get_mut(&request_id).ok_or(TransportError::State)?;
+                let terminal_class = audit.shutdown_result_class(result_class);
+                audit
+                    .commit_undispatched_mutation_service(terminal_class)
+                    .map_err(|_| {
+                        self.fail(OUTPUT_AUDIT_FAILED);
+                        TransportError::Audit
+                    })?;
+                let completion = self.reserve_completion(audit, terminal_class, terminal_marker)?;
+                (completion, terminal_class, audit.can_remove())
+            };
+            if remove {
+                pending.remove(&request_id);
+            }
+            drop(pending);
+            completion.commit(terminal_class).map_err(|_| {
+                self.fail(OUTPUT_AUDIT_FAILED);
+                TransportError::Audit
+            })?;
         }
     }
 
@@ -547,32 +703,54 @@ pub(crate) async fn run_writer<W>(
         .await;
         let delivery = match result {
             Ok(Ok(())) => {
-                if let Some(completion) = completion {
+                let committed = if let Some(completion) = completion {
                     let result_class = completion.intended_result_class;
-                    completion.commit(result_class);
+                    completion.commit(result_class)
+                } else {
+                    Ok(())
+                };
+                if committed.is_err() {
+                    output.fail(OUTPUT_AUDIT_FAILED);
+                    Err(DeliveryFailure::Audit)
+                } else {
+                    Ok(())
                 }
-                Ok(())
             }
             Ok(Err(error)) if error.kind() == std::io::ErrorKind::BrokenPipe => {
-                if let Some(completion) = completion {
-                    completion.commit(AuditResultClass::OutputUnavailable);
+                let committed = completion.map_or(Ok(()), |completion| {
+                    completion.commit(AuditResultClass::OutputUnavailable)
+                });
+                if committed.is_err() {
+                    output.fail(OUTPUT_AUDIT_FAILED);
+                    Err(DeliveryFailure::Audit)
+                } else {
+                    output.fail(OUTPUT_PEER_CLOSED);
+                    Err(DeliveryFailure::PeerClosed)
                 }
-                output.fail(OUTPUT_PEER_CLOSED);
-                Err(DeliveryFailure::PeerClosed)
             }
             Ok(Err(_)) => {
-                if let Some(completion) = completion {
-                    completion.commit(AuditResultClass::OutputUnavailable);
+                let committed = completion.map_or(Ok(()), |completion| {
+                    completion.commit(AuditResultClass::OutputUnavailable)
+                });
+                if committed.is_err() {
+                    output.fail(OUTPUT_AUDIT_FAILED);
+                    Err(DeliveryFailure::Audit)
+                } else {
+                    output.fail(OUTPUT_IO_FAILED);
+                    Err(DeliveryFailure::Io)
                 }
-                output.fail(OUTPUT_IO_FAILED);
-                Err(DeliveryFailure::Io)
             }
             Err(_) => {
-                if let Some(completion) = completion {
-                    completion.commit(AuditResultClass::OutputUnavailable);
+                let committed = completion.map_or(Ok(()), |completion| {
+                    completion.commit(AuditResultClass::OutputUnavailable)
+                });
+                if committed.is_err() {
+                    output.fail(OUTPUT_AUDIT_FAILED);
+                    Err(DeliveryFailure::Audit)
+                } else {
+                    output.fail(OUTPUT_WRITE_TIMED_OUT);
+                    Err(DeliveryFailure::TimedOut)
                 }
-                output.fail(OUTPUT_WRITE_TIMED_OUT);
-                Err(DeliveryFailure::TimedOut)
             }
         };
         let failed = delivery.is_err();
@@ -648,6 +826,7 @@ impl From<AuditError> for TransportError {
 impl From<DeliveryFailure> for TransportError {
     fn from(failure: DeliveryFailure) -> Self {
         match failure {
+            DeliveryFailure::Audit => Self::Audit,
             DeliveryFailure::PeerClosed => Self::PeerClosed,
             DeliveryFailure::TimedOut => Self::WriteTimedOut,
             DeliveryFailure::Io => Self::Io,
@@ -735,7 +914,41 @@ mod tests {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .push(event);
+                Ok(())
             }))
+        }
+
+        fn reserve_mutation(
+            &self,
+            bundle: MutationAuditBundle,
+        ) -> Result<MutationAuditReservation, AuditError> {
+            let admitted = Arc::clone(&self.events);
+            let service = Arc::clone(&self.events);
+            let delivery = Arc::clone(&self.events);
+            MutationAuditReservation::try_new(
+                bundle,
+                move |event| {
+                    admitted
+                        .lock()
+                        .map_err(|_| AuditError::Unavailable)?
+                        .push(event);
+                    Ok(())
+                },
+                move |event| {
+                    service
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(event);
+                    Ok(())
+                },
+                move |event| {
+                    delivery
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(event);
+                    Ok(())
+                },
+            )
         }
     }
 
@@ -790,7 +1003,7 @@ mod tests {
                 b"replacement response",
             )?
             .ok_or("delayed cancellation callback claimed the replacement generation")?;
-        replacement.commit(AuditResultClass::Succeeded);
+        replacement.commit(AuditResultClass::Succeeded)?;
 
         let events = audit.events()?;
         assert_eq!(events.len(), 2);

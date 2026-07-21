@@ -21,7 +21,7 @@ pub struct ReplaySummary {
 }
 
 impl ReplaySummary {
-    fn observe(&mut self, record: &DiagnosticRawEnvelope) -> Result<()> {
+    pub(crate) fn observe(&mut self, record: &DiagnosticRawEnvelope) -> Result<()> {
         self.records = self.records.saturating_add(1);
         self.bytes = self
             .bytes

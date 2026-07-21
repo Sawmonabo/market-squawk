@@ -23,8 +23,9 @@ use market_squawk_platform::{
     initialize_capture_process_infrastructure,
 };
 use market_squawk_sources::{
-    AuthorizationGrant, AuthorizationMode, BackoffPolicy, BudgetScope, CurrentSourceSession,
-    FreshnessPolicy, NetworkPolicyError, ProviderBudgetPolicy, SourceMetadata, SourceMetadataError,
+    AuthorizationGrant, AuthorizationMode, BackoffPolicy, BudgetScope, FreshnessPolicy,
+    LiveSourceGeneration, NetworkPolicyError, ProviderBudgetPolicy, SourceError, SourceMetadata,
+    SourceMetadataError,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -34,6 +35,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::super::live_runtime::{LiveRuntimeComposition, LiveRuntimeCompositionError};
 use super::instruments::ProductionInstrumentSet;
+use super::kraken::{ProductionKrakenProfile, ProductionKrakenProfileError};
+use super::provider::{ProductionProviderError, ProductionSourceProfile, ProductionSourceProvider};
 use super::route_actor::RouteBufferLimits;
 use super::supervisor::{ProductionSourceSupervisor, ProductionSupervisorError};
 
@@ -60,7 +63,7 @@ const MAX_CLOCK_SKEW_NANOS: u64 = 1_000_000_000;
 #[derive(Debug)]
 pub struct ProductionLiveSourceComposition {
     config: AppConfig,
-    profile: ProductionCoinbaseProfile,
+    profile: ProductionSourceProfile,
     routes: Vec<LiveRouteConfig>,
 }
 
@@ -75,11 +78,39 @@ impl ProductionLiveSourceComposition {
         config: AppConfig,
         routes: Vec<LiveRouteConfig>,
     ) -> Result<Self, ProductionLiveSourceCompositionError> {
-        let source = config
-            .coinbase()
-            .ok_or(ProductionLiveSourceCompositionError::MissingCoinbaseConfiguration)?;
-        validate_routes(source, &routes)?;
-        let profile = ProductionCoinbaseProfile::try_from(source)?;
+        Self::try_for_provider(config, routes, ProductionSourceProvider::Coinbase)
+    }
+
+    /// Validates and seals one explicitly selected production provider.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an absent selected profile, route mismatch, or any provider/profile invariant
+    /// failure before capture, live actors, or networking start.
+    pub fn try_for_provider(
+        config: AppConfig,
+        routes: Vec<LiveRouteConfig>,
+        provider: ProductionSourceProvider,
+    ) -> Result<Self, ProductionLiveSourceCompositionError> {
+        let profile = match provider {
+            ProductionSourceProvider::Coinbase => {
+                let source = config
+                    .coinbase()
+                    .ok_or(ProductionLiveSourceCompositionError::MissingCoinbaseConfiguration)?;
+                validate_coinbase_routes(source, &routes)?;
+                ProductionSourceProfile::coinbase(
+                    ProductionCoinbaseProfile::try_from(source)?,
+                    source,
+                )?
+            }
+            ProductionSourceProvider::Kraken => {
+                let source = config
+                    .kraken()
+                    .ok_or(ProductionLiveSourceCompositionError::MissingKrakenConfiguration)?;
+                validate_kraken_routes(source, &routes)?;
+                ProductionSourceProfile::kraken(ProductionKrakenProfile::try_from(source)?, source)
+            }
+        };
         Ok(Self {
             config,
             profile,
@@ -88,18 +119,27 @@ impl ProductionLiveSourceComposition {
     }
 
     /// Returns the only provider endpoint accepted by the sealed production adapter.
-    pub const fn endpoint(&self) -> &'static str {
-        self.profile.adapter_config.endpoint()
+    pub fn endpoint(&self) -> &str {
+        self.profile.endpoint()
     }
 
     /// Returns exact canonical source metadata, including coverage and quality ceiling.
-    pub const fn metadata(&self) -> &SourceMetadata {
+    pub fn metadata(&self) -> &SourceMetadata {
         self.profile.metadata()
     }
 
     /// Returns the complete validated route set that will be reserved before network access.
     pub fn routes(&self) -> &[LiveRouteConfig] {
         &self.routes
+    }
+
+    #[cfg(all(test, debug_assertions))]
+    pub(crate) fn with_local_kraken_endpoint_for_test(
+        mut self,
+        endpoint: &str,
+    ) -> Result<Self, ProductionLiveSourceCompositionError> {
+        self.profile = self.profile.with_local_kraken_endpoint_for_test(endpoint)?;
+        Ok(self)
     }
 
     /// Starts the bounded live runtime and exact-generation Coinbase supervisor.
@@ -341,7 +381,7 @@ impl Drop for SupervisorDropCancellation {
     }
 }
 
-fn validate_routes(
+fn validate_coinbase_routes(
     config: &CoinbaseSourceConfig,
     routes: &[LiveRouteConfig],
 ) -> Result<(), ProductionLiveSourceCompositionError> {
@@ -378,6 +418,29 @@ fn validate_routes(
     Ok(())
 }
 
+fn validate_kraken_routes(
+    config: &market_squawk_platform::KrakenSourceConfig,
+    routes: &[LiveRouteConfig],
+) -> Result<(), ProductionLiveSourceCompositionError> {
+    if routes.len() != 1 {
+        return Err(ProductionLiveSourceCompositionError::RouteSetMismatch);
+    }
+    let expected = ShardKey::new(
+        market_squawk_domain::VenueId::try_from("kraken")?,
+        config.definition().instrument_id(),
+    );
+    let route = routes
+        .first()
+        .ok_or(ProductionLiveSourceCompositionError::RouteSetMismatch)?;
+    if route.route() != &expected {
+        return Err(ProductionLiveSourceCompositionError::RouteSetMismatch);
+    }
+    if route.definition() != config.definition() {
+        return Err(ProductionLiveSourceCompositionError::RouteDefinitionMismatch);
+    }
+    Ok(())
+}
+
 /// Complete immutable Coinbase provider profile derived from validated local configuration.
 #[derive(Debug)]
 pub(super) struct ProductionCoinbaseProfile {
@@ -386,6 +449,9 @@ pub(super) struct ProductionCoinbaseProfile {
 }
 
 impl ProductionCoinbaseProfile {
+    pub(super) const fn endpoint(&self) -> &'static str {
+        self.adapter_config.endpoint()
+    }
     pub(super) const fn metadata(&self) -> &SourceMetadata {
         self.adapter_config.metadata()
     }
@@ -396,9 +462,9 @@ impl ProductionCoinbaseProfile {
 
     pub(super) fn try_source(
         &self,
-        session: &CurrentSourceSession,
-    ) -> Result<CoinbaseExchangeSource, CoinbaseConfigError> {
-        CoinbaseExchangeSource::try_new(self.adapter_config.clone(), session)
+        generation: LiveSourceGeneration,
+    ) -> Result<CoinbaseExchangeSource, SourceError> {
+        CoinbaseExchangeSource::try_new(self.adapter_config.clone(), generation)
     }
 
     pub(super) fn try_from_at(
@@ -701,6 +767,8 @@ pub enum ProductionCoinbaseProfileError {
 pub enum ProductionLiveSourceCompositionError {
     #[error("production Coinbase configuration is required")]
     MissingCoinbaseConfiguration,
+    #[error("production Kraken configuration is required")]
+    MissingKrakenConfiguration,
     #[error("production Coinbase route set does not exactly cover configured instruments")]
     RouteSetMismatch,
     #[error("production Coinbase route set contains a duplicate route")]
@@ -709,6 +777,12 @@ pub enum ProductionLiveSourceCompositionError {
     RouteDefinitionMismatch,
     #[error(transparent)]
     Profile(#[from] ProductionCoinbaseProfileError),
+    #[error(transparent)]
+    KrakenProfile(#[from] ProductionKrakenProfileError),
+    #[error(transparent)]
+    Provider(#[from] ProductionProviderError),
+    #[error("production provider route identity is invalid")]
+    RouteIdentity(#[from] IdentityError),
 }
 
 /// Production live-source startup or coordinated shutdown failure.

@@ -58,17 +58,18 @@ async fn production_endpoint_smoke_is_opt_in_and_bounded() -> TestResult {
         ConnectionGeneration::new(1)?,
         Timestamp::from_unix_nanos(1),
     )?;
-    let mut frames = registry.take_raw_frame_factory(&session)?;
-    let mut source = CoinbaseExchangeSource::try_new(config, &session)?;
+    let capture = registry.take_capture_generation_capabilities(&session)?;
+    let (mut initialization, _admission, _degradation) = capture.into_parts();
+    initialization.mark_healthy()?;
+    let generation = registry.take_live_source_generation(&session)?;
+    let mut source = CoinbaseExchangeSource::try_new(config, generation)?;
     let cancellation = CancellationToken::new();
     let timed = cancellation.clone();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(5)).await;
         timed.cancel();
     });
-    let outcome = source
-        .run(&mut frames, &mut RejectingSink, cancellation)
-        .await;
+    let outcome = source.run(&mut RejectingSink, cancellation).await;
     assert!(matches!(
         outcome,
         Err(SourceError::Cancelled

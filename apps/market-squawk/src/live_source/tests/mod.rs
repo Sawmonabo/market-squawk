@@ -1,3 +1,4 @@
+mod kraken_vertical;
 mod pipeline;
 mod sink;
 mod subscription;

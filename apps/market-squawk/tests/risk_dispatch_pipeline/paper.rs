@@ -1,4 +1,6 @@
 use super::*;
+use market_squawk_adapter_paper::PaperCheckpointRepository;
+use market_squawk_platform::LocalPaths;
 
 const PAPER_ORDER_COUNT: usize = 6;
 
@@ -315,9 +317,11 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
         maximum_fills: NonZeroUsize::new(4).ok_or("zero maximum fills")?,
         maximum_idempotency_keys: NonZeroUsize::new(5).ok_or("zero idempotency")?,
         maximum_archived_orders: NonZeroUsize::new(8).ok_or("zero archived orders")?,
+        matching_work_quantum: NonZeroUsize::new(64).ok_or("zero matching work quantum")?,
         minimum_latency_nanos: 0,
         maximum_latency_nanos: 0,
         cancel_latency_nanos: 1_000_000,
+        maximum_mark_age_nanos: 60_000_000_000,
         day_session_calendar: session_calendar,
         maximum_participation_basis_points: 10_000,
         impact_basis_points_per_level: 0,
@@ -326,10 +330,20 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
         ledger_maximum_balances: NonZeroUsize::MIN,
         ledger_maximum_positions: NonZeroUsize::MIN,
         allow_short: true,
-        exposure_valuation: PaperExposureValuation::OpenCost,
+        exposure_valuation: PaperExposureValuation::ExecutableExit,
         abort_join_deadline: Duration::from_secs(1),
         fee_schedule: fees,
     })?;
+    let checkpoint_directory = tempfile::tempdir()?;
+    let checkpoint_paths = LocalPaths::prepare(checkpoint_directory.path().join("data"))?;
+    let mut checkpoint_repository = PaperCheckpointRepository::try_new(
+        checkpoint_paths.artifacts()?.clone(),
+        paper_config.clone(),
+        NonZeroUsize::new(1024 * 1024).ok_or("zero checkpoint capacity")?,
+    )?;
+    let task_reaper = ExecutionTaskReaper::try_new(
+        NonZeroUsize::new(3).ok_or("zero execution task ownership capacity")?,
+    )?;
     let mut paper = PaperExecutionRuntime::try_start(
         paper_config.clone(),
         [PaperAccountBootstrap {
@@ -345,6 +359,8 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
             positions: vec![(terms.instrument_id(), 0)],
             position_cost_basis: vec![(terms.instrument_id(), Money::new(Decimal::ZERO, usd))],
         }],
+        &checkpoint_repository,
+        task_reaper.clone(),
     )?;
     let mut paper_audit = paper
         .take_audit_reader()
@@ -381,6 +397,7 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
             operation_deadline: Duration::from_secs(1),
             shutdown_deadline: Duration::from_secs(1),
         },
+        task_reaper.clone(),
     )?;
     let policy = RiskPolicyIdentity::new(
         &SourceIdentifier::try_from("risk-paper-production")?,
@@ -531,8 +548,7 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
         market_squawk_adapter_paper::PaperOrderState::Filled
     );
     let durable_checkpoint = paper_adapter.checkpoint(paper_control()?).await?;
-    let durable_bytes = durable_checkpoint.encode(1024 * 1024)?;
-    let persistence = durable_checkpoint.persistence_evidence(&durable_bytes)?;
+    let persistence = checkpoint_repository.persist(&durable_checkpoint)?;
     let persistence_authority = dispatcher.persistence_acknowledgement()?;
     paper_adapter
         .acknowledge_persistence(persistence_authority, persistence)
@@ -636,7 +652,7 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
             .map(Vec::len),
         Some(1)
     );
-    let persistence = finalized_checkpoint.persistence_evidence(&finalized_bytes)?;
+    let persistence = checkpoint_repository.persist(&finalized_checkpoint)?;
     let persistence_authority = dispatcher.persistence_acknowledgement()?;
     let stale_persistence_authority = dispatcher.persistence_acknowledgement()?;
     paper_adapter
@@ -645,13 +661,15 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
     let mut stale_paper = PaperExecutionRuntime::try_start_from_checkpoint(
         paper_config.clone(),
         finalized_checkpoint.clone(),
+        &checkpoint_repository,
+        task_reaper.clone(),
     )?;
     let _ = stale_paper.take_audit_reader();
     let stale_adapter = stale_paper.adapter();
     let stale_checkpoint = stale_adapter.checkpoint(paper_control()?).await?;
     let stale_bytes = stale_checkpoint.encode(1024 * 1024)?;
     let stale_value: serde_json::Value = serde_json::from_slice(&stale_bytes)?;
-    let stale_evidence = stale_checkpoint.persistence_evidence(&stale_bytes)?;
+    let stale_evidence = checkpoint_repository.persist(&stale_checkpoint)?;
     assert!(matches!(
         stale_adapter
             .acknowledge_persistence(stale_persistence_authority, stale_evidence)
@@ -674,6 +692,7 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
         after_failed_persistence["acknowledged_reconciliation_batches"],
         stale_value["acknowledged_reconciliation_batches"]
     );
+    assert!(stale_paper.shutdown(paper_control()?).await?.complete());
     assert_eq!(
         paper_adapter.retained_bytes(),
         usize::try_from(paper_config.input().command_maximum_bytes.get())?
@@ -785,7 +804,10 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
 
     let checkpoint = paper_adapter.checkpoint(paper_control()?).await?;
     assert!(checkpoint.complete());
-    assert_eq!(checkpoint.schema_version(), 6);
+    assert_eq!(
+        checkpoint.schema_version(),
+        PaperExecutionConfig::CHECKPOINT_SCHEMA_VERSION
+    );
     assert!(checkpoint.encode(1).is_err());
     let encoded_checkpoint = checkpoint.encode(1024 * 1024)?;
     let checkpoint_value: serde_json::Value = serde_json::from_slice(&encoded_checkpoint)?;
@@ -811,7 +833,11 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
         .is_err()
     );
     let mut previous_schema = checkpoint_value.clone();
-    previous_schema["schema_version"] = serde_json::json!(5);
+    previous_schema["schema_version"] = serde_json::json!(
+        PaperExecutionConfig::CHECKPOINT_SCHEMA_VERSION
+            .checked_sub(1)
+            .ok_or("paper checkpoint schema has no predecessor")?
+    );
     assert!(
         market_squawk_adapter_paper::PaperExecutionCheckpoint::decode(
             paper_config.clone(),
@@ -880,8 +906,12 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
         assert_eq!(accepted.input_digest(), *expected_digest);
     }
 
-    let mut recovered =
-        PaperExecutionRuntime::try_start_from_checkpoint(paper_config.clone(), checkpoint)?;
+    let mut recovered = PaperExecutionRuntime::try_start_from_checkpoint(
+        paper_config.clone(),
+        checkpoint,
+        &checkpoint_repository,
+        task_reaper.clone(),
+    )?;
     let recovered_adapter = recovered.adapter();
     let mut recovered_audit = recovered
         .take_audit_reader()
@@ -910,8 +940,12 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
     let reconciliation_checkpoint = recovered_adapter.checkpoint(paper_control()?).await?;
     assert!(recovered.shutdown(paper_control()?).await?.complete());
 
-    let mut reconciled_recovery =
-        PaperExecutionRuntime::try_start_from_checkpoint(paper_config, reconciliation_checkpoint)?;
+    let mut reconciled_recovery = PaperExecutionRuntime::try_start_from_checkpoint(
+        paper_config,
+        reconciliation_checkpoint,
+        &checkpoint_repository,
+        task_reaper.clone(),
+    )?;
     let mut reconciled_recovery_audit = reconciled_recovery
         .take_audit_reader()
         .ok_or("reconciliation recovery audit reader was already transferred")?;
@@ -941,6 +975,10 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
             .await?
             .reconciliation_required()
     );
+    let drain_deadline = tokio::time::Instant::now()
+        .checked_add(Duration::from_secs(1))
+        .ok_or("execution task drain deadline overflowed")?;
+    assert!(task_reaper.drain(drain_deadline).await.is_complete());
     Ok(())
 }
 

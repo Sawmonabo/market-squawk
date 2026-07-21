@@ -35,7 +35,7 @@ pub use live_runtime::{LiveRuntimeComposition, LiveRuntimeCompositionError};
 pub use live_source::{
     ProductionCoinbaseProfileError, ProductionLiveSourceComposition,
     ProductionLiveSourceCompositionError, ProductionLiveSourceRuntime,
-    ProductionLiveSourceRuntimeError, ProductionSupervisorError,
+    ProductionLiveSourceRuntimeError, ProductionSourceProvider, ProductionSupervisorError,
 };
 pub use market_squawk_platform::{
     AppConfig, JournalFileFormat, JournalSelectionError, LocalPaths as AppPaths,
@@ -44,4 +44,5 @@ pub use paper_bot::{
     ProductionPaperBotComposition, ProductionPaperBotCompositionError,
     ProductionPaperBotExecutionConfig, ProductionPaperBotRollback, ProductionPaperBotRoute,
     ProductionPaperBotRuntime, ProductionPaperBotShutdown, ProductionPaperBotStartError,
+    ProductionPaperCheckpointError,
 };
