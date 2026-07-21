@@ -53,6 +53,17 @@ work is bound by the single canonical
   Parquet. User-authorized capability roots, bounded parsing and decompression, revocable source
   authority, precision-preserving research time, immutable representation evidence, and the
   analytical ingestion service are composed end to end.
+- Production macro extraction adapters for FRED/ALFRED, BLS, and U.S. Treasury. They use hardened
+  allowlisted HTTPS clients, revocable registry authority, shared conjunctive provider budgets,
+  bounded responses, exact provider metadata and payload evidence, conservative availability, and
+  precision-preserving `market-squawk-research-v3` observations. FRED/ALFRED retains vintages and
+  deterministic revision ordering; BLS enforces both the published short-window and daily limits
+  for its public and user-registered tiers; Treasury validates Fiscal Data pagination and official
+  yield-feed schemas. FRED/ALFRED durable persistence, caching, archival, and training remain
+  fail-closed until exact per-series rights affirmatively authorize those operations.
+
+  This product uses the FRED® API but is not endorsed or certified by the Federal Reserve Bank of
+  St. Louis.
 - Authority-free midpoint, spread, spread-basis-point, microprice, imbalance, feed-quality,
   pre-trade calculation, and paper-only momentum diagnostics.
 - Immutable typed order intents plus fixed-capacity, nonblocking account risk coordination with
@@ -92,9 +103,7 @@ terminal consumer, focused verification, immutable evidence, and exact commit ex
 | `Missing` | Coinbase direct-source qualification | The bounded source-to-live-to-risk-to-dispatch-to-paper ownership path is runnable, but Coinbase remains capped at `DirectUnverified`; it cannot satisfy the `DirectVerified` execution gate, and the CLI adds a no-intent strategy | Task 2 |
 | `Missing` | Kraken direct-source qualification | The production transport, decoder, checksum, exact-generation session lifecycle, fresh-snapshot recovery, and canonical risk/no-paper-mutation terminal proof exist; Kraken WebSocket v2 supplies no venue sequence satisfying the current `DirectVerified` execution predicate | Task 20 |
 | `Missing` | SEC filings/XBRL/Company Facts | No lawful, revision-preserving SEC vertical | Task 8 |
-| `Missing` | FRED/ALFRED | No vintage-aware production macro adapter | Task 9 |
-| `Missing` | BLS | No quota-honest production macro adapter | Task 9 |
-| `Missing` | US Treasury | No schema-tracked production Treasury adapter | Task 9 |
+| `Missing` | FRED/ALFRED durable local consumption | The production vintage-aware adapter is runnable for authorized ephemeral retrieval, but the exact current terms bundle does not establish per-series rights for persistence, caching, archival, or training | Task 9 / Task 20 |
 | `Missing` | portfolio import | No raw-preserving holdings/transactions reconciliation vertical | Task 10 |
 | `Missing` | point-in-time datasets | No availability-aware joins or leakage-checked builder | Task 11 |
 | `Missing` | Rust financial analytics | No complete tested batch-analytics implementation | Task 12 |
