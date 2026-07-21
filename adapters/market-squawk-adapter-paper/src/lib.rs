@@ -2,6 +2,7 @@
 
 mod adapter;
 mod audit;
+mod checkpoint_repository;
 mod config;
 mod fees;
 mod latency;
@@ -19,6 +20,9 @@ pub use adapter::{
     PaperMarketIngress, PaperStartError,
 };
 pub use audit::{PaperAuditKind, PaperAuditReader, PaperAuditRecord};
+pub use checkpoint_repository::{
+    PaperCheckpointReceipt, PaperCheckpointRepository, PaperCheckpointRepositoryError,
+};
 pub use config::{PaperConfigError, PaperExecutionConfig, PaperExecutionConfigInput};
 pub use fees::{FeeError, FeeSchedule, LiquidityRole};
 pub use ledger::{
@@ -29,8 +33,9 @@ pub use session::{
     MAX_PAPER_VENUE_SESSIONS, PaperSessionCalendarError, PaperVenueSession,
     PaperVenueSessionCalendar,
 };
+pub(crate) use snapshot::PaperCheckpointPersistenceEvidence;
 pub use snapshot::{
-    PaperCheckpointError, PaperCheckpointPersistenceEvidence, PaperExecutionCheckpoint,
-    PaperExecutionSnapshot, PaperFillSnapshot, PaperOrderSnapshot,
+    PaperCheckpointError, PaperExecutionCheckpoint, PaperExecutionSnapshot, PaperFillSnapshot,
+    PaperOrderSnapshot,
 };
 pub use state::{PaperOrderLifecycle, PaperOrderState, PaperStateError};

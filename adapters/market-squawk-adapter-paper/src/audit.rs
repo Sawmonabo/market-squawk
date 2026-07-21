@@ -12,6 +12,7 @@ use crate::PaperOrderState;
 /// Paper state mutation represented without unbounded text.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PaperAuditKind {
+    MarketMarked,
     Accepted,
     Filled,
     ActivatedOrResting,

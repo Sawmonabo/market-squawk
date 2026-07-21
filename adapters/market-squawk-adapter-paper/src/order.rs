@@ -76,7 +76,7 @@ pub(crate) struct PaperOrderRecoveryWire {
 
 impl PaperOrder {
     pub(crate) fn from_dispatch(
-        dispatch: DispatchOrder,
+        dispatch: &DispatchOrder,
         accepted_sequence: u64,
         eligible_at: Timestamp,
         expires_at: Timestamp,

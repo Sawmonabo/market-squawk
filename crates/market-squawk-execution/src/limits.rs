@@ -4,7 +4,9 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::num::NonZeroU32;
 
-use market_squawk_domain::{BasisPoints, Currency, InstrumentId, Money, OrderSide, PriceTicks};
+use market_squawk_domain::{
+    BasisPoints, Currency, InstrumentId, Money, OrderSide, PriceTicks, RoundingPolicy,
+};
 use rust_decimal::Decimal;
 use thiserror::Error;
 
@@ -258,23 +260,29 @@ impl RiskLimits {
         if capital.amount() <= Decimal::ZERO {
             return true;
         }
-        let left = exposure.amount().checked_mul(Decimal::from(10_000));
-        let right = capital
-            .amount()
-            .checked_mul(Decimal::from(self.maximum_leverage().get()));
+        let left = exposure.checked_mul_decimal(Decimal::from(10_000_u32));
+        let right = capital.checked_mul_decimal(Decimal::from(self.maximum_leverage().get()));
         match (left, right) {
-            (Some(left), Some(right)) => left > right,
+            (Ok(left), Ok(right)) => left.amount() > right.amount(),
             _ => true,
         }
     }
 
-    pub(crate) fn retained_byte_ceiling(&self) -> usize {
-        std::mem::size_of::<Self>().saturating_add(
-            self.input
-                .eligible_instruments
-                .len()
-                .saturating_mul(std::mem::size_of::<InstrumentId>() * 4),
-        )
+    /// Returns the complete conservative retained-byte ceiling using checked arithmetic.
+    pub fn checked_retained_byte_ceiling(&self) -> Result<usize, RiskLimitsError> {
+        std::mem::size_of::<Self>()
+            .checked_add(
+                self.input
+                    .eligible_instruments
+                    .len()
+                    .checked_mul(
+                        std::mem::size_of::<InstrumentId>()
+                            .checked_mul(4)
+                            .ok_or(RiskLimitsError::RetainedSizeOverflow)?,
+                    )
+                    .ok_or(RiskLimitsError::RetainedSizeOverflow)?,
+            )
+            .ok_or(RiskLimitsError::RetainedSizeOverflow)
     }
 }
 
@@ -300,20 +308,19 @@ impl ReservationCalculation {
                 terms.quote_currency(),
             )
             .map_err(|_| ())?;
-        let amount = base
-            .amount()
-            .checked_mul(terms.contract_multiplier())
-            .ok_or(())?
-            .abs();
-        let exposure = Money::new(amount, terms.quote_currency());
-        let fee = amount
-            .checked_mul(Decimal::from(limits.maximum_fee().get()))
-            .and_then(|value| value.checked_div(Decimal::from(10_000)))
-            .ok_or(())?;
+        let exposure = base
+            .checked_mul_decimal(terms.contract_multiplier())
+            .map_err(|_| ())?;
+        let exposure = Money::new(exposure.amount().abs(), terms.quote_currency());
+        let fee = exposure
+            .checked_basis_points(
+                limits.maximum_fee(),
+                Decimal::MAX_SCALE,
+                RoundingPolicy::Ceiling,
+            )
+            .map_err(|_| ())?;
         let cash = match intent.side() {
-            OrderSide::Buy => {
-                Money::new(amount.checked_add(fee).ok_or(())?, terms.quote_currency())
-            }
+            OrderSide::Buy => exposure.checked_add(fee).map_err(|_| ())?,
             OrderSide::Sell => Money::new(Decimal::ZERO, terms.quote_currency()),
         };
         let quantity = intent.quantity().get();
@@ -359,6 +366,9 @@ pub enum RiskLimitsError {
     /// A ratio exceeded its closed safety ceiling.
     #[error("risk policy basis-point limit exceeds its safety ceiling")]
     ExcessiveBasisPoints,
+    /// The complete retained-size ceiling cannot be represented on this target.
+    #[error("risk policy retained-size calculation overflowed")]
+    RetainedSizeOverflow,
     /// Rate and reservation durations must be positive.
     #[error("risk policy durations must be positive")]
     NonPositiveDuration,

@@ -15,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::audit::{PaperAuditKind, PaperAuditRecord};
 use crate::latency::sample_latency;
+use crate::ledger::PaperMarkDisposition;
 use crate::matching::AvailableMarket;
 use crate::order::PaperOrder;
 use crate::snapshot::{
@@ -22,13 +23,15 @@ use crate::snapshot::{
     PaperFillSnapshot,
 };
 use crate::{
-    PaperControlContext, PaperControlError, PaperExecutionConfig, PaperLedger, PaperOrderState,
+    PaperCheckpointReceipt, PaperControlContext, PaperControlError, PaperExecutionConfig,
+    PaperLedger, PaperOrderState,
 };
 
 #[path = "worker/reconciliation.rs"]
 mod reconciliation;
 use reconciliation::{
-    cancel_receipt, is_terminal, market_digest, order_priority, reservation_price, state_audit,
+    cancel_receipt, is_terminal, mark_mutation_digest, market_digest, order_priority,
+    reservation_price, state_audit,
 };
 
 #[derive(Debug)]
@@ -57,7 +60,7 @@ pub(crate) enum WorkerCommand {
     },
     AcknowledgePersistence {
         authority: PersistenceAcknowledgement,
-        evidence: PaperCheckpointPersistenceEvidence,
+        receipt: PaperCheckpointReceipt,
         reply: oneshot::Sender<Result<(), PaperControlError>>,
     },
     Snapshot {
@@ -76,18 +79,21 @@ pub(crate) enum WorkerCommand {
 
 impl WorkerCommand {
     pub(crate) fn retained_bytes(&self) -> Result<usize, ExecutionAdapterError> {
-        let inline = std::mem::size_of::<Self>();
+        let inline = WORKER_ENVELOPE_RETAINED_BYTES;
         let additional = match self {
             Self::Submit { .. } => return Ok(inline.max(64 * 1024)),
             Self::Reconcile { request, .. } => std::mem::size_of_val(request.order_ids()),
             Self::AcknowledgeReconciliation {
                 acknowledgement, ..
             } => std::mem::size_of_val(acknowledgement.order_ids()),
-            Self::AcknowledgePersistence { authority, .. } => authority
+            Self::AcknowledgePersistence {
+                authority, receipt, ..
+            } => authority
                 .retained_bytes()
                 .and_then(|retained| {
                     retained.checked_sub(std::mem::size_of::<PersistenceAcknowledgement>())
                 })
+                .and_then(|retained| retained.checked_add(receipt.retained_heap_bytes()))
                 .ok_or(ExecutionAdapterError::KnownFailure)?,
             Self::Cancel { .. }
             | Self::Snapshot { .. }
@@ -118,6 +124,8 @@ pub(crate) struct WorkerEnvelope {
     pub(crate) _retained_bytes: Option<OwnedSemaphorePermit>,
 }
 
+pub(crate) const WORKER_ENVELOPE_RETAINED_BYTES: usize = std::mem::size_of::<WorkerEnvelope>();
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct WorkerMarketUpdate {
     pub(crate) sequence: u64,
@@ -127,6 +135,7 @@ pub(crate) struct WorkerMarketUpdate {
 #[derive(Debug)]
 pub(crate) struct PaperWorker {
     config: PaperExecutionConfig,
+    repository_id: [u8; 32],
     state: WorkerState,
     events: mpsc::Receiver<WorkerEnvelope>,
     audit: mpsc::Sender<PaperAuditRecord>,
@@ -143,6 +152,8 @@ struct WorkerState {
     archived_orders: BTreeMap<OrderId, PaperOrder>,
     archived_fills: Vec<PaperFillSnapshot>,
     durable_sequence: u64,
+    accepted_repository_id: [u8; 32],
+    accepted_repository_generation: u64,
     reconciled_orders: BTreeSet<OrderId>,
     acknowledged_reconciliation_batches: Vec<ReconciliationBatchBinding>,
     issued_checkpoint: Option<IssuedCheckpoint>,
@@ -166,6 +177,30 @@ struct CompactionPlan {
     reconciled_orders: BTreeSet<OrderId>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QueuedMarketFreshness {
+    Fresh,
+    Stale,
+}
+
+fn queued_market_freshness(
+    observed_at: Timestamp,
+    processed_at: Timestamp,
+    maximum_age_nanos: u64,
+) -> Result<QueuedMarketFreshness, ()> {
+    if maximum_age_nanos == 0 {
+        return Err(());
+    }
+    let age = i128::from(processed_at.unix_nanos()) - i128::from(observed_at.unix_nanos());
+    if age < 0 {
+        Err(())
+    } else if age >= i128::from(maximum_age_nanos) {
+        Ok(QueuedMarketFreshness::Stale)
+    } else {
+        Ok(QueuedMarketFreshness::Fresh)
+    }
+}
+
 fn ensure_compaction_active(
     operation: Option<&market_squawk_execution::ExecutionOperation>,
 ) -> Result<(), ExecutionAdapterError> {
@@ -176,6 +211,20 @@ fn ensure_compaction_active(
     }
 }
 
+pub(crate) fn receipt_authority_is_current(
+    expected_repository_id: [u8; 32],
+    accepted_repository_id: [u8; 32],
+    accepted_repository_generation: u64,
+    receipt: &PaperCheckpointReceipt,
+) -> bool {
+    let minimum_generation = if accepted_repository_id == expected_repository_id {
+        accepted_repository_generation
+    } else {
+        0
+    };
+    receipt.authority_is_valid(expected_repository_id, minimum_generation)
+}
+
 impl PaperWorker {
     #[allow(
         clippy::too_many_arguments,
@@ -183,6 +232,7 @@ impl PaperWorker {
     )]
     pub(crate) fn new(
         config: PaperExecutionConfig,
+        repository_id: [u8; 32],
         ledger: PaperLedger,
         checkpoint: Option<PaperExecutionCheckpoint>,
         events: mpsc::Receiver<WorkerEnvelope>,
@@ -199,6 +249,8 @@ impl PaperWorker {
                 archived_orders: checkpoint.archived_orders,
                 archived_fills: checkpoint.archived_fills,
                 durable_sequence: checkpoint.durable_sequence,
+                accepted_repository_id: checkpoint.accepted_repository_id,
+                accepted_repository_generation: checkpoint.accepted_repository_generation,
                 reconciled_orders: checkpoint.reconciled_orders,
                 acknowledged_reconciliation_batches: checkpoint.acknowledged_reconciliation_batches,
                 issued_checkpoint: None,
@@ -214,6 +266,8 @@ impl PaperWorker {
                 archived_orders: BTreeMap::new(),
                 archived_fills: Vec::new(),
                 durable_sequence: 0,
+                accepted_repository_id: [0; 32],
+                accepted_repository_generation: 0,
                 reconciled_orders: BTreeSet::new(),
                 acknowledged_reconciliation_batches: Vec::new(),
                 issued_checkpoint: None,
@@ -223,6 +277,7 @@ impl PaperWorker {
         };
         Self {
             config,
+            repository_id,
             state,
             events,
             audit,
@@ -249,10 +304,9 @@ impl PaperWorker {
                                 break;
                             }
                         }
-                        WorkerEvent::Market(update) => self.process_market(WorkerMarketUpdate {
-                            sequence,
-                            update,
-                        }),
+                        WorkerEvent::Market(update) => {
+                            self.process_market(WorkerMarketUpdate { sequence, update }).await;
+                        }
                     }
                 }
             }
@@ -307,10 +361,10 @@ impl PaperWorker {
             }
             WorkerCommand::AcknowledgePersistence {
                 authority,
-                evidence,
+                receipt,
                 reply,
             } => {
-                let result = self.acknowledge_persistence(authority, evidence);
+                let result = self.acknowledge_persistence(authority, receipt);
                 let _ = reply.send(result);
                 false
             }
@@ -408,8 +462,19 @@ impl PaperWorker {
     fn acknowledge_persistence(
         &mut self,
         authority: PersistenceAcknowledgement,
-        evidence: PaperCheckpointPersistenceEvidence,
+        receipt: PaperCheckpointReceipt,
     ) -> Result<(), PaperControlError> {
+        if !receipt_authority_is_current(
+            self.repository_id,
+            self.state.accepted_repository_id,
+            self.state.accepted_repository_generation,
+            &receipt,
+        ) {
+            return Err(PaperControlError::Adapter(
+                ExecutionAdapterError::KnownFailure,
+            ));
+        }
+        let evidence = receipt.persistence_evidence();
         let Some(issued) = self.state.issued_checkpoint.as_ref() else {
             return Err(PaperControlError::Adapter(
                 ExecutionAdapterError::KnownFailure,
@@ -496,6 +561,8 @@ impl PaperWorker {
             .commit_persisted(&prunable)
             .map_err(PaperControlError::Adapter)?;
         self.state.durable_sequence = durable_sequence;
+        self.state.accepted_repository_id = self.repository_id;
+        self.state.accepted_repository_generation = receipt.generation().get();
         self.apply_compaction(compaction);
         self.state.acknowledged_reconciliation_batches = retained_batches;
         self.state.issued_checkpoint = None;
@@ -825,7 +892,7 @@ impl PaperWorker {
             return Err(ExecutionAdapterError::KnownFailure);
         }
         let mut order =
-            PaperOrder::from_dispatch(dispatch, event_sequence, eligible_at, expires_at)
+            PaperOrder::from_dispatch(&dispatch, event_sequence, eligible_at, expires_at)
                 .map_err(|_| ExecutionAdapterError::Rejected)?;
         let mutation_sequence = self.next_mutation_sequence()?;
         let reservation_price = reservation_price(&order)?;
@@ -865,6 +932,9 @@ impl PaperWorker {
             self.config.digest(),
             order.input_digest(),
         );
+        if dispatch.operation().is_expired() {
+            return Err(ExecutionAdapterError::KnownFailure);
+        }
         self.admit_audit(audit)?;
         let receipt = ExecutionReceipt::new(order.order_id, order.accepted_at);
         self.state.sequence = mutation_sequence;
@@ -930,7 +1000,7 @@ impl PaperWorker {
         cancel_receipt(&candidate, CancelStatus::Pending, requested_at)
     }
 
-    fn process_market(&mut self, event: WorkerMarketUpdate) {
+    async fn process_market(&mut self, event: WorkerMarketUpdate) {
         self.refresh_audit_health();
         if self.state.reconciliation_required {
             return;
@@ -941,6 +1011,67 @@ impl PaperWorker {
         };
         let instrument = available.market().execution_terms().instrument_id();
         let event_at = available.market().observed_at();
+        if !matches!(
+            event.update.event_class(),
+            market_squawk_domain::LiveEventClass::Trade
+                | market_squawk_domain::LiveEventClass::Quote
+                | market_squawk_domain::LiveEventClass::BookSnapshot
+                | market_squawk_domain::LiveEventClass::BookDelta
+        ) {
+            return;
+        }
+        let processed_at = match crate::adapter::system_timestamp() {
+            Ok(processed_at) => processed_at,
+            Err(_) => {
+                self.state.reconciliation_required = true;
+                return;
+            }
+        };
+        match queued_market_freshness(
+            event_at,
+            processed_at,
+            self.config.input().maximum_mark_age_nanos,
+        ) {
+            Ok(QueuedMarketFreshness::Fresh) => {}
+            Ok(QueuedMarketFreshness::Stale) => return,
+            Err(()) => {
+                self.state.reconciliation_required = true;
+                return;
+            }
+        }
+        let mut marked_ledger = self.state.ledger.clone();
+        match marked_ledger.apply_execution_market_update(
+            event.update,
+            processed_at,
+            self.config.input().maximum_mark_age_nanos,
+        ) {
+            Ok(PaperMarkDisposition::Applied) => {}
+            Ok(PaperMarkDisposition::Irrelevant) => return,
+            Err(_) => {
+                self.state.reconciliation_required = true;
+                return;
+            }
+        }
+        let Ok(mark_sequence) = self.next_mutation_sequence() else {
+            self.state.reconciliation_required = true;
+            return;
+        };
+        let mark_audit = PaperAuditRecord::new(
+            mark_sequence,
+            None,
+            PaperAuditKind::MarketMarked,
+            None,
+            None,
+            event_at,
+            None,
+            self.config.digest(),
+            mark_mutation_digest(event),
+        );
+        if !self.admit_committed_event_audit(mark_audit) {
+            return;
+        }
+        self.state.sequence = mark_sequence;
+        self.state.ledger = marked_ledger;
         let mut ids: Vec<_> = self
             .state
             .orders
@@ -951,7 +1082,12 @@ impl PaperWorker {
             .map(|order| order.order_id)
             .collect();
         ids.sort_by(|left, right| order_priority(&self.state.orders, *left, *right));
-        for order_id in ids {
+        for (processed, order_id) in ids.into_iter().enumerate() {
+            if processed != 0
+                && processed.is_multiple_of(self.config.input().matching_work_quantum.get())
+            {
+                tokio::task::yield_now().await;
+            }
             if self.state.reconciliation_required {
                 break;
             }
@@ -959,15 +1095,15 @@ impl PaperWorker {
                 self.state.reconciliation_required = true;
                 break;
             };
-            if event_at > order.expires_at {
-                self.expire_order(order, event_at);
+            if processed_at >= order.expires_at {
+                self.expire_order(order, processed_at);
                 continue;
             }
             if order
                 .cancel_effective_at
-                .is_some_and(|deadline| event_at >= deadline)
+                .is_some_and(|deadline| processed_at >= deadline)
             {
-                self.confirm_cancel(order, event_at);
+                self.confirm_cancel(order, processed_at);
                 continue;
             }
             let Ok(plan) = available.plan(&order, event.update, &self.config) else {
@@ -989,6 +1125,17 @@ impl PaperWorker {
                     self.state.reconciliation_required = true;
                     break;
                 };
+                if candidate_ledger
+                    .apply_execution_market_update(
+                        event.update,
+                        processed_at,
+                        self.config.input().maximum_mark_age_nanos,
+                    )
+                    .is_err()
+                {
+                    self.state.reconciliation_required = true;
+                    break;
+                }
                 let Ok(fill_sequence) = self.next_mutation_sequence() else {
                     self.state.reconciliation_required = true;
                     break;
@@ -1232,5 +1379,38 @@ impl PaperWorker {
             self.state.ledger = ledger;
             self.state.orders.insert(order.order_id, candidate);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use market_squawk_domain::Timestamp;
+
+    use super::{
+        QueuedMarketFreshness, WORKER_ENVELOPE_RETAINED_BYTES, WorkerEnvelope, WorkerMarketUpdate,
+        queued_market_freshness,
+    };
+
+    #[test]
+    fn queued_market_freshness_is_exclusive_at_processing_time() {
+        let observed_at = Timestamp::from_unix_nanos(100);
+        assert_eq!(
+            queued_market_freshness(observed_at, Timestamp::from_unix_nanos(109), 10),
+            Ok(QueuedMarketFreshness::Fresh)
+        );
+        assert_eq!(
+            queued_market_freshness(observed_at, Timestamp::from_unix_nanos(110), 10),
+            Ok(QueuedMarketFreshness::Stale)
+        );
+        assert!(queued_market_freshness(observed_at, Timestamp::from_unix_nanos(99), 10).is_err());
+    }
+
+    #[test]
+    fn market_ingress_charges_the_complete_channel_envelope() {
+        assert_eq!(
+            WORKER_ENVELOPE_RETAINED_BYTES,
+            std::mem::size_of::<WorkerEnvelope>()
+        );
+        assert!(WORKER_ENVELOPE_RETAINED_BYTES > std::mem::size_of::<WorkerMarketUpdate>());
     }
 }

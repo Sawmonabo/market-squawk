@@ -13,9 +13,10 @@ use crate::account::AccountSubmissionFailSafe;
 use crate::adapter::dispatch_order_from_approval;
 use crate::audit::{ExecutionAuditContext, ExecutionAuditPermit};
 use crate::clock::system_now;
+use crate::dispatcher::attempt::attempt_adapter_call;
 use crate::{
     ExecutionAdapter, ExecutionAdapterError, ExecutionAuditKind, ExecutionAuditReason,
-    ExecutionOperation,
+    ExecutionOperation, ExecutionReceipt, ExecutionTaskPermit, ExecutionTaskReaper,
 };
 
 #[derive(Debug)]
@@ -117,6 +118,7 @@ pub(super) async fn run_worker(
     registry: Arc<Mutex<DispatchRegistry>>,
     mut receiver: mpsc::Receiver<DispatchCommand>,
     cancellation: CancellationToken,
+    task_reaper: ExecutionTaskReaper,
 ) {
     let mut draining = false;
     loop {
@@ -136,13 +138,14 @@ pub(super) async fn run_worker(
         let Some(command) = command else {
             break;
         };
-        process_command(&adapter, &registry, command).await;
+        process_command(&adapter, &registry, &task_reaper, command).await;
     }
 }
 
 async fn process_command(
     adapter: &Arc<dyn ExecutionAdapter>,
     registry: &Arc<Mutex<DispatchRegistry>>,
+    task_reaper: &ExecutionTaskReaper,
     command: DispatchCommand,
 ) {
     let DispatchCommand {
@@ -183,6 +186,8 @@ async fn process_command(
         return;
     }
     let parts = approval.into_parts();
+    let operation_deadline =
+        effective_operation_deadline(parts.monotonic_deadline.into(), operation_deadline);
     let approval_id = parts.approval_id;
     let order_id = parts.intent.order_id();
     if !parts
@@ -213,6 +218,25 @@ async fn process_command(
         );
         return;
     }
+    let task_permit = if adapter.is_cooperative() {
+        None
+    } else {
+        match task_reaper.try_reserve() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                parts.reservation.mark_known_not_accepted();
+                mark_terminal(registry, approval_id, now.wall);
+                commit_dispatch_audit(
+                    audit,
+                    ExecutionAuditKind::DispatchKnownFailure,
+                    context,
+                    now.wall,
+                    &[ExecutionAuditReason::TaskOwnershipSaturated],
+                );
+                return;
+            }
+        }
+    };
     let fail_safe = match parts.reservation.begin_submission() {
         Ok(guard) => guard,
         Err(_) => {
@@ -292,14 +316,14 @@ async fn process_command(
         now.wall,
         ExecutionOperation::new(operation_deadline, operation_cancellation.clone()),
     );
-    let (result, deadline_exceeded) =
-        match tokio::time::timeout_at(operation_deadline, adapter.submit(dispatch)).await {
-            Ok(result) => (result, false),
-            Err(_) => {
-                operation_cancellation.cancel();
-                (Err(ExecutionAdapterError::UncertainOutcome), true)
-            }
-        };
+    let (result, deadline_exceeded) = attempt_submit(
+        adapter,
+        dispatch,
+        operation_deadline,
+        &operation_cancellation,
+        task_permit,
+    )
+    .await;
     let post_call = match system_now() {
         Ok(reading) => reading,
         Err(_) => {
@@ -402,6 +426,34 @@ async fn process_command(
     }
 }
 
+async fn attempt_submit(
+    adapter: &Arc<dyn ExecutionAdapter>,
+    dispatch: crate::DispatchOrder,
+    deadline: tokio::time::Instant,
+    cancellation: &CancellationToken,
+    task_permit: Option<ExecutionTaskPermit>,
+) -> (Result<ExecutionReceipt, ExecutionAdapterError>, bool) {
+    attempt_adapter_call(
+        adapter,
+        deadline,
+        cancellation,
+        task_permit,
+        move |adapter| async move { adapter.submit(dispatch).await },
+    )
+    .await
+}
+
+fn effective_operation_deadline(
+    approval_deadline: tokio::time::Instant,
+    configured_deadline: tokio::time::Instant,
+) -> tokio::time::Instant {
+    if approval_deadline < configured_deadline {
+        approval_deadline
+    } else {
+        configured_deadline
+    }
+}
+
 fn mark_terminal(
     registry: &Arc<Mutex<DispatchRegistry>>,
     approval_id: market_squawk_domain::ApprovalId,
@@ -431,5 +483,26 @@ fn mark_reconciliation(
     {
         record.state = DispatchState::Reconciliation;
         record.last_transition_at = record.last_transition_at.max(observed_at);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    #[test]
+    fn approval_deadline_cannot_be_extended_by_dispatch_configuration() {
+        let now = tokio::time::Instant::now();
+        let approval = now + Duration::from_millis(1);
+        let configured = now + Duration::from_secs(1);
+
+        assert_eq!(
+            super::effective_operation_deadline(approval, configured),
+            approval
+        );
+        assert_eq!(
+            super::effective_operation_deadline(configured, approval),
+            approval
+        );
     }
 }

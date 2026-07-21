@@ -94,7 +94,11 @@ impl PaperWorker {
             accounts.push(
                 self.state
                     .ledger
-                    .reconciled_account_state(account_id)
+                    .reconciled_account_state(
+                        account_id,
+                        observed_at,
+                        self.config.input().maximum_mark_age_nanos,
+                    )
                     .map_err(|_| ExecutionAdapterError::ReconciliationRequired)?,
             );
         }
@@ -150,6 +154,8 @@ impl PaperWorker {
             archived_orders: self.state.archived_orders.clone(),
             archived_fills: self.state.archived_fills.clone(),
             durable_sequence: self.state.durable_sequence,
+            accepted_repository_id: self.state.accepted_repository_id,
+            accepted_repository_generation: self.state.accepted_repository_generation,
             reconciled_orders: self.state.reconciled_orders.clone(),
             acknowledged_reconciliation_batches: self
                 .state
@@ -273,6 +279,24 @@ pub(super) fn market_digest(order: &PaperOrder, event: WorkerMarketUpdate) -> [u
     digest.update(order.input_digest());
     digest.update(event.sequence.to_be_bytes());
     digest.update(event.update.assessment_digest());
+    digest.update(
+        event
+            .update
+            .market()
+            .observed_at()
+            .unix_nanos()
+            .to_be_bytes(),
+    );
+    digest.finalize().into()
+}
+
+pub(super) fn mark_mutation_digest(event: WorkerMarketUpdate) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"market-squawk/paper-mark-mutation/v1\0");
+    digest.update(event.sequence.to_be_bytes());
+    digest.update(event.update.assessment_digest());
+    digest.update(event.update.venue_digest());
+    digest.update(event.update.connection_generation().get().to_be_bytes());
     digest.update(
         event
             .update

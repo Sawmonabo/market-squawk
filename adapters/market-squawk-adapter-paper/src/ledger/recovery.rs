@@ -11,8 +11,8 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    PaperAccountBootstrap, PaperLedger, PaperLedgerConfig, PaperLedgerError, Reservation,
-    expected_reserved_cash, validate_terms,
+    PaperAccountBootstrap, PaperAccountRiskState, PaperLedger, PaperLedgerConfig, PaperLedgerError,
+    PaperMarkEvidence, Reservation, expected_reserved_cash, validate_terms,
 };
 
 type AccountRecoveryParts = (
@@ -27,6 +27,7 @@ pub(crate) struct LedgerRecoveryWire {
     accounts: Vec<AccountRiskRecoveryWire>,
     cash: Vec<CashRecoveryWire>,
     positions: Vec<PositionRecoveryWire>,
+    marks: Vec<PaperMarkEvidence>,
     reservations: Vec<ReservationRecoveryWire>,
 }
 
@@ -37,9 +38,13 @@ struct AccountRiskRecoveryWire {
     revision: NonZeroU64,
     eligible: bool,
     currency: Currency,
-    capital: Money,
-    peak_capital: Money,
-    gross_exposure: Money,
+    settled_capital: Money,
+    marked_equity: Money,
+    peak_marked_equity: Money,
+    marked_gross_exposure: Money,
+    unrealized_pnl: Money,
+    drawdown: Money,
+    mark_digest: [u8; 32],
     realized_loss: Money,
     realized_pnl: Money,
 }
@@ -88,9 +93,13 @@ impl PaperLedger {
                     revision: account.revision,
                     eligible: account.eligible,
                     currency: account.currency,
-                    capital: account.capital,
-                    peak_capital: account.peak_capital,
-                    gross_exposure: account.gross_exposure,
+                    settled_capital: account.settled_capital,
+                    marked_equity: account.marked_equity,
+                    peak_marked_equity: account.peak_marked_equity,
+                    marked_gross_exposure: account.marked_gross_exposure,
+                    unrealized_pnl: account.unrealized_pnl,
+                    drawdown: account.drawdown,
+                    mark_digest: account.mark_digest,
                     realized_loss: account.realized_loss,
                     realized_pnl: account.realized_pnl,
                 })
@@ -123,6 +132,7 @@ impl PaperLedger {
                     ),
                 })
                 .collect(),
+            marks: self.marks.values().copied().collect(),
             reservations: self
                 .reservations
                 .iter()
@@ -151,6 +161,7 @@ impl PaperLedger {
         if wire.cash.len() > config.maximum_balances
             || wire.accounts.len() > config.maximum_accounts
             || wire.positions.len() > config.maximum_positions
+            || wire.marks.len() > config.maximum_positions
             || wire.reservations.len() > config.maximum_reservations
         {
             return Err(PaperLedgerError::Capacity);
@@ -172,39 +183,113 @@ impl PaperLedger {
         bootstraps
             .try_reserve_exact(wire.accounts.len())
             .map_err(|_| PaperLedgerError::Capacity)?;
+        let mut recovered_accounts = Vec::new();
+        recovered_accounts
+            .try_reserve_exact(wire.accounts.len())
+            .map_err(|_| PaperLedgerError::Capacity)?;
         for account in wire.accounts {
             let (cash, positions, position_cost_basis) = accounts
                 .remove(&account.account_id)
                 .ok_or(PaperLedgerError::InvalidRecovery)?;
-            if account.capital.currency() != account.currency
-                || account.peak_capital.currency() != account.currency
-                || account.gross_exposure.currency() != account.currency
+            let expected_equity = account
+                .settled_capital
+                .checked_add(account.unrealized_pnl)
+                .map_err(|_| PaperLedgerError::InvalidRecovery)?;
+            let expected_drawdown = account
+                .peak_marked_equity
+                .checked_sub(account.marked_equity)
+                .map_err(|_| PaperLedgerError::InvalidRecovery)?;
+            if account.settled_capital.currency() != account.currency
+                || account.marked_equity.currency() != account.currency
+                || account.peak_marked_equity.currency() != account.currency
+                || account.marked_gross_exposure.currency() != account.currency
+                || account.unrealized_pnl.currency() != account.currency
+                || account.drawdown.currency() != account.currency
                 || account.realized_loss.currency() != account.currency
                 || account.realized_pnl.currency() != account.currency
+                || account.settled_capital.amount().is_sign_negative()
+                || account.peak_marked_equity.amount().is_sign_negative()
+                || account.marked_gross_exposure.amount().is_sign_negative()
+                || account.drawdown.amount().is_sign_negative()
+                || account.realized_loss.amount().is_sign_negative()
+                || expected_equity != account.marked_equity
+                || expected_drawdown != account.drawdown
                 || !cash
                     .iter()
                     .any(|balance| balance.currency() == account.currency)
             {
                 return Err(PaperLedgerError::InvalidRecovery);
             }
+            let bootstrap_peak =
+                if account.peak_marked_equity.amount() >= account.settled_capital.amount() {
+                    account.peak_marked_equity
+                } else {
+                    account.settled_capital
+                };
             bootstraps.push(PaperAccountBootstrap {
                 account_id: account.account_id,
                 revision: account.revision,
                 eligible: account.eligible,
                 cash,
-                capital: account.capital,
-                peak_capital: account.peak_capital,
-                gross_exposure: account.gross_exposure,
+                capital: account.settled_capital,
+                peak_capital: bootstrap_peak,
+                gross_exposure: position_cost_basis.iter().try_fold(
+                    Money::new(Decimal::ZERO, account.currency),
+                    |sum, (_, basis)| {
+                        sum.checked_add(*basis)
+                            .map_err(|_| PaperLedgerError::InvalidRecovery)
+                    },
+                )?,
                 realized_loss: account.realized_loss,
                 realized_pnl: account.realized_pnl,
                 positions,
                 position_cost_basis,
             });
+            recovered_accounts.push(account);
         }
         if !accounts.is_empty() {
             return Err(PaperLedgerError::InvalidRecovery);
         }
         let mut ledger = Self::try_new(config, bootstraps)?;
+        for mark in wire.marks {
+            mark.validate_recovered()?;
+            if ledger.marks.insert(mark.instrument_id(), mark).is_some() {
+                return Err(PaperLedgerError::InvalidRecovery);
+            }
+        }
+        for account in recovered_accounts {
+            let state = PaperAccountRiskState {
+                revision: account.revision,
+                eligible: account.eligible,
+                currency: account.currency,
+                settled_capital: account.settled_capital,
+                marked_equity: account.marked_equity,
+                peak_marked_equity: account.peak_marked_equity,
+                marked_gross_exposure: account.marked_gross_exposure,
+                unrealized_pnl: account.unrealized_pnl,
+                drawdown: account.drawdown,
+                mark_digest: account.mark_digest,
+                realized_loss: account.realized_loss,
+                realized_pnl: account.realized_pnl,
+            };
+            if ledger.accounts.insert(account.account_id, state).is_none() {
+                return Err(PaperLedgerError::InvalidRecovery);
+            }
+        }
+        for (account_id, account) in &ledger.accounts {
+            if account.mark_digest == [0; 32] {
+                continue;
+            }
+            let valued_at = ledger
+                .positions
+                .keys()
+                .filter(|(candidate, _)| candidate == account_id)
+                .filter_map(|(_, instrument_id)| ledger.marks.get(instrument_id))
+                .map(|mark| mark.observed_at())
+                .max()
+                .ok_or(PaperLedgerError::InvalidRecovery)?;
+            ledger.validate_account_marks(*account_id, *account, valued_at, u64::MAX)?;
+        }
         for entry in wire.reservations {
             validate_terms(entry.terms, ledger.config.fee_schedule.currency())?;
             let expected_cash = expected_reserved_cash(

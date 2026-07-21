@@ -276,15 +276,17 @@ pub struct PaperExecutionCheckpoint {
     pub(crate) archived_orders: BTreeMap<OrderId, PaperOrder>,
     pub(crate) archived_fills: Vec<PaperFillSnapshot>,
     pub(crate) durable_sequence: u64,
+    pub(crate) accepted_repository_id: [u8; 32],
+    pub(crate) accepted_repository_generation: u64,
     pub(crate) reconciled_orders: BTreeSet<OrderId>,
     pub(crate) acknowledged_reconciliation_batches: Vec<ReconciliationBatchBinding>,
     pub(crate) ledger: PaperLedger,
     pub(crate) idempotency: BTreeMap<(AccountId, ClientOrderId), OrderId>,
 }
 
-/// Exact checkpoint identity supplied with dispatcher-minted persistence authority.
+/// Internal exact checkpoint identity carried only by a repository-minted receipt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PaperCheckpointPersistenceEvidence {
+pub(crate) struct PaperCheckpointPersistenceEvidence {
     pub(crate) configuration_digest: [u8; 32],
     pub(crate) sequence: u64,
     pub(crate) recovery_digest: [u8; 32],
@@ -303,6 +305,8 @@ struct CheckpointWire {
     archived_orders: Vec<PaperOrderRecoveryWire>,
     archived_fills: Vec<FillRecoveryWire>,
     durable_sequence: u64,
+    accepted_repository_id: [u8; 32],
+    accepted_repository_generation: u64,
     reconciled_orders: Vec<OrderId>,
     acknowledged_reconciliation_batches: Vec<AcknowledgedReconciliationBatchWire>,
     ledger: LedgerRecoveryWire,
@@ -363,23 +367,6 @@ impl PaperExecutionCheckpoint {
         Ok(output.into_inner())
     }
 
-    /// Binds caller-confirmed persisted bytes to this exact complete checkpoint image.
-    pub fn persistence_evidence(
-        &self,
-        persisted_bytes: &[u8],
-    ) -> Result<PaperCheckpointPersistenceEvidence, PaperCheckpointError> {
-        if persisted_bytes.is_empty()
-            || self.encode(persisted_bytes.len())?.as_slice() != persisted_bytes
-        {
-            return Err(PaperCheckpointError::InvalidPersistenceEvidence);
-        }
-        Ok(PaperCheckpointPersistenceEvidence {
-            configuration_digest: self.configuration_digest,
-            sequence: self.sequence,
-            recovery_digest: self.recovery_input_digest()?,
-        })
-    }
-
     pub(crate) fn recovery_input_digest(&self) -> Result<[u8; 32], PaperCheckpointError> {
         let mut output = CheckpointDigestWriter(Sha256::new());
         serde_json::to_writer(&mut output, &self.recovery_wire())
@@ -435,6 +422,8 @@ impl PaperExecutionCheckpoint {
                 })
                 .collect(),
             durable_sequence: self.durable_sequence,
+            accepted_repository_id: self.accepted_repository_id,
+            accepted_repository_generation: self.accepted_repository_generation,
             reconciled_orders: self.reconciled_orders.iter().copied().collect(),
             acknowledged_reconciliation_batches: self
                 .acknowledged_reconciliation_batches
@@ -491,6 +480,8 @@ impl PaperExecutionCheckpoint {
             || wire.idempotency.len() > limits.maximum_idempotency_keys.get()
             || wire.acknowledged_reconciliation_batches.len() > maximum_reconciled_orders
             || wire.durable_sequence > wire.sequence
+            || (wire.accepted_repository_id == [0; 32])
+                != (wire.accepted_repository_generation == 0)
         {
             return Err(PaperCheckpointError::InvalidHeader);
         }
@@ -570,6 +561,8 @@ impl PaperExecutionCheckpoint {
             archived_orders,
             archived_fills,
             durable_sequence: wire.durable_sequence,
+            accepted_repository_id: wire.accepted_repository_id,
+            accepted_repository_generation: wire.accepted_repository_generation,
             reconciled_orders,
             acknowledged_reconciliation_batches,
             ledger,
@@ -878,8 +871,6 @@ pub enum PaperCheckpointError {
     InvalidIdempotency,
     #[error("paper checkpoint archive state is invalid")]
     InvalidArchive,
-    #[error("paper checkpoint persistence evidence does not match encoded bytes")]
-    InvalidPersistenceEvidence,
     #[error("paper checkpoint bounded allocation failed")]
     Allocation,
     #[error("paper checkpoint JSON encoding or decoding failed")]

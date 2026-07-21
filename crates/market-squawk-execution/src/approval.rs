@@ -310,7 +310,7 @@ impl ApprovedOrder {
             reservation,
             policy,
             valid_until,
-            monotonic_deadline: _,
+            monotonic_deadline,
         } = self;
         ApprovedOrderParts {
             approval_id,
@@ -321,6 +321,7 @@ impl ApprovedOrder {
             reservation,
             policy,
             valid_until,
+            monotonic_deadline,
         }
     }
 }
@@ -363,6 +364,7 @@ pub(crate) struct ApprovedOrderParts {
     pub(crate) reservation: AccountRiskReservation,
     pub(crate) policy: RiskPolicyIdentity,
     pub(crate) valid_until: Timestamp,
+    pub(crate) monotonic_deadline: Instant,
 }
 
 /// Final approval revalidation failure before any adapter call.

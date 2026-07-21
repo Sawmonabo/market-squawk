@@ -71,6 +71,19 @@ portable artifact reference. Paper compaction and dispatcher reconciliation-fenc
 only after receipt validation and dispatcher finalization. Caller-created byte-comparison evidence
 is removed.
 
+Windows directory durability is explicitly unsupported until a capability-relative implementation
+can prove the required metadata barrier. The Windows branch therefore fails closed and never mints
+a receipt. Microsoft documents that `FlushFileBuffers` requires a handle opened with
+`GENERIC_WRITE`, while its directory-handle operations do not document `FlushFileBuffers` as a
+supported directory operation. `MoveFileExW` offers `MOVEFILE_WRITE_THROUGH`, and the locked
+`atomicwrites` crate uses that flag, but its ambient-path API cannot replace `ArtifactRoot`
+confinement without a separate capability-safe integration. Sources:
+
+- [FlushFileBuffers](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-flushfilebuffers)
+- [Obtaining a Handle to a Directory](https://learn.microsoft.com/en-us/windows/win32/fileio/obtaining-a-handle-to-a-directory)
+- [MoveFileExW](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-movefileexa)
+- [`atomicwrites` 0.4.4 implementation](https://docs.rs/crate/atomicwrites/0.4.4/source/src/lib.rs)
+
 ### Task ownership and bounded work
 
 Every paper, dispatcher, and isolated adapter task reserves process-lifetime reaper capacity before

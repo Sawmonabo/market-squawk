@@ -33,9 +33,13 @@ pub struct PaperAccountRiskSnapshot {
     revision: NonZeroU64,
     eligible: bool,
     currency: Currency,
-    capital: Money,
-    peak_capital: Money,
-    gross_exposure: Money,
+    settled_capital: Money,
+    marked_equity: Money,
+    peak_marked_equity: Money,
+    marked_gross_exposure: Money,
+    unrealized_pnl: Money,
+    drawdown: Money,
+    mark_digest: [u8; 32],
     realized_loss: Money,
     realized_pnl: Money,
 }
@@ -53,14 +57,35 @@ impl PaperAccountRiskSnapshot {
     pub const fn currency(self) -> Currency {
         self.currency
     }
+    pub const fn settled_capital(self) -> Money {
+        self.settled_capital
+    }
+    pub const fn marked_equity(self) -> Money {
+        self.marked_equity
+    }
+    pub const fn peak_marked_equity(self) -> Money {
+        self.peak_marked_equity
+    }
+    pub const fn marked_gross_exposure(self) -> Money {
+        self.marked_gross_exposure
+    }
+    pub const fn unrealized_pnl(self) -> Money {
+        self.unrealized_pnl
+    }
+    pub const fn drawdown(self) -> Money {
+        self.drawdown
+    }
+    pub const fn mark_digest(self) -> [u8; 32] {
+        self.mark_digest
+    }
     pub const fn capital(self) -> Money {
-        self.capital
+        self.marked_equity
     }
     pub const fn peak_capital(self) -> Money {
-        self.peak_capital
+        self.peak_marked_equity
     }
     pub const fn gross_exposure(self) -> Money {
-        self.gross_exposure
+        self.marked_gross_exposure
     }
     pub const fn realized_loss(self) -> Money {
         self.realized_loss
@@ -76,9 +101,13 @@ pub(super) struct PaperAccountRiskState {
     pub(super) revision: NonZeroU64,
     pub(super) eligible: bool,
     pub(super) currency: Currency,
-    pub(super) capital: Money,
-    pub(super) peak_capital: Money,
-    pub(super) gross_exposure: Money,
+    pub(super) settled_capital: Money,
+    pub(super) marked_equity: Money,
+    pub(super) peak_marked_equity: Money,
+    pub(super) marked_gross_exposure: Money,
+    pub(super) unrealized_pnl: Money,
+    pub(super) drawdown: Money,
+    pub(super) mark_digest: [u8; 32],
     pub(super) realized_loss: Money,
     pub(super) realized_pnl: Money,
 }
@@ -90,9 +119,13 @@ impl PaperAccountRiskSnapshot {
             revision: account.revision,
             eligible: account.eligible,
             currency: account.currency,
-            capital: account.capital,
-            peak_capital: account.peak_capital,
-            gross_exposure: account.gross_exposure,
+            settled_capital: account.settled_capital,
+            marked_equity: account.marked_equity,
+            peak_marked_equity: account.peak_marked_equity,
+            marked_gross_exposure: account.marked_gross_exposure,
+            unrealized_pnl: account.unrealized_pnl,
+            drawdown: account.drawdown,
+            mark_digest: account.mark_digest,
             realized_loss: account.realized_loss,
             realized_pnl: account.realized_pnl,
         }
@@ -110,12 +143,15 @@ impl PaperLedger {
     pub(crate) fn reconciled_account_state(
         &self,
         account_id: AccountId,
+        valued_at: market_squawk_domain::Timestamp,
+        maximum_mark_age_nanos: u64,
     ) -> Result<ReconciledAccountState, PaperLedgerError> {
         let account = self
             .accounts
             .get(&account_id)
             .copied()
             .ok_or(PaperLedgerError::UnknownAccountOrCurrency)?;
+        self.validate_account_marks(account_id, account, valued_at, maximum_mark_age_nanos)?;
         let cash = self.cash(account_id, account.currency)?;
         let positions = self
             .positions
@@ -137,9 +173,13 @@ impl PaperLedger {
             account.eligible,
             account.currency,
             cash,
-            account.capital,
-            account.peak_capital,
-            account.gross_exposure,
+            account.settled_capital,
+            account.marked_equity,
+            account.peak_marked_equity,
+            account.marked_gross_exposure,
+            account.unrealized_pnl,
+            account.drawdown,
+            account.mark_digest,
             account.realized_pnl,
             account.realized_loss,
             positions,

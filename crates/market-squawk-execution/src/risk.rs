@@ -233,6 +233,9 @@ pub enum RiskServiceError {
     /// Approval lifetime must make bounded positive progress.
     #[error("maximum approval lifetime must be positive")]
     ZeroApprovalLifetime,
+    /// Complete fixed retained-size accounting overflowed.
+    #[error("risk service retained-size calculation overflowed")]
+    RetainedSizeOverflow,
 }
 
 /// Deterministic risk policy owner with authoritative account coordination and trusted time.
@@ -243,6 +246,7 @@ pub struct RiskService {
     audit: ExecutionAuditWriter,
     config: RiskServiceConfig,
     last_wall_nanos: AtomicI64,
+    retained_bytes: usize,
 }
 
 impl RiskService {
@@ -256,19 +260,34 @@ impl RiskService {
         if config.maximum_approval_lifetime.is_zero() {
             return Err(RiskServiceError::ZeroApprovalLifetime);
         }
+        let retained_bytes = Self::retained_bytes_for_limits(&limits)?;
         Ok(Self {
             accounts,
             limits,
             audit,
             config,
             last_wall_nanos: AtomicI64::new(i64::MIN),
+            retained_bytes,
         })
     }
 
-    pub(crate) fn retained_bytes(&self) -> usize {
+    pub(crate) const fn retained_bytes(&self) -> usize {
         // The coordinator is an independently composed shared owner charged once by the
         // application memory model. A route hook retains only this Arc handle.
-        std::mem::size_of::<Self>().saturating_add(self.limits.retained_byte_ceiling())
+        self.retained_bytes
+    }
+
+    /// Returns the exact checked risk graph charge used before runtime ownership transfer.
+    pub fn retained_bytes_for_limits(limits: &RiskLimits) -> Result<usize, RiskServiceError> {
+        let limits_bytes = limits
+            .checked_retained_byte_ceiling()
+            .map_err(|_| RiskServiceError::RetainedSizeOverflow)?;
+        let limits_heap_bytes = limits_bytes
+            .checked_sub(std::mem::size_of::<RiskLimits>())
+            .ok_or(RiskServiceError::RetainedSizeOverflow)?;
+        std::mem::size_of::<Self>()
+            .checked_add(limits_heap_bytes)
+            .ok_or(RiskServiceError::RetainedSizeOverflow)
     }
 
     /// Consumes actor-owned live authority exactly once and approves only after mandatory audit
@@ -589,7 +608,7 @@ impl RiskService {
         if !market.source_eligible {
             reasons.push(RiskRejectionCode::SourceIneligible);
         }
-        if now > market.valid_until {
+        if market_freshness_expired(now, market.valid_until) {
             reasons.push(RiskRejectionCode::SourceStale);
         }
         if market.observed_at > now {
@@ -776,4 +795,24 @@ fn deviation_exceeds(reference: PriceTicks, candidate: PriceTicks, maximum_bps: 
     let difference = (candidate - reference).unsigned_abs();
     let reference = reference.unsigned_abs();
     difference * 10_000 > reference * maximum_bps.unsigned_abs() as u128
+}
+
+const fn market_freshness_expired(now: Timestamp, valid_until: Timestamp) -> bool {
+    now.unix_nanos() >= valid_until.unix_nanos()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::market_freshness_expired;
+    use market_squawk_domain::Timestamp;
+
+    #[test]
+    fn market_freshness_deadline_is_exclusive() {
+        let deadline = Timestamp::from_unix_nanos(100);
+        assert!(!market_freshness_expired(
+            Timestamp::from_unix_nanos(99),
+            deadline,
+        ));
+        assert!(market_freshness_expired(deadline, deadline));
+    }
 }

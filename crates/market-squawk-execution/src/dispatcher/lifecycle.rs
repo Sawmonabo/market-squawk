@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use market_squawk_domain::{ApprovalId, OrderId, Timestamp};
 
+use super::attempt::attempt_adapter_call;
 use super::{
     DispatchRecord, DispatchRegistry, DispatchState, ExecutionDispatchError, ExecutionDispatcher,
     ExecutionDispatcherShutdown, PendingReconciliation, PendingReconciliationStatus,
@@ -19,8 +20,8 @@ use crate::dispatcher::reconciliation::{
 };
 use crate::{
     ExecutionAdapterError, ExecutionAuditKind, ExecutionAuditReason, ExecutionState,
-    ReconcileOrders, ReconciledOrder, ReconciledOrderStatus, ReconciliationAcknowledgement,
-    ReconciliationBatchBinding,
+    ExecutionTaskPermit, ReconcileOrders, ReconciledOrder, ReconciledOrderStatus,
+    ReconciliationAcknowledgement, ReconciliationBatchBinding,
 };
 
 #[derive(Debug)]
@@ -118,6 +119,19 @@ impl Drop for LifecycleOutcomeFailSafe {
 }
 
 impl ExecutionDispatcher {
+    fn try_reserve_adapter_task(
+        &self,
+    ) -> Result<Option<ExecutionTaskPermit>, ExecutionDispatchError> {
+        if self.adapter.is_cooperative() {
+            Ok(None)
+        } else {
+            self.task_reaper
+                .try_reserve()
+                .map(Some)
+                .map_err(|_| ExecutionDispatchError::TaskOwnershipUnavailable)
+        }
+    }
+
     /// Obtains and applies a bounded backend state image for every accepted or uncertain order.
     /// Fill-bearing outcomes remain reconciliation-required until authoritative account state is
     /// replaced with matching balances, positions, fees, and revision.
@@ -129,6 +143,7 @@ impl ExecutionDispatcher {
         if has_pending {
             return self.retry_pending_reconciliation().await;
         }
+        let task_permit = self.try_reserve_adapter_task()?;
         let (admissions, order_ids, invoked) = {
             let mut registry = try_registry(&self.registry)?;
             let count = registry
@@ -241,59 +256,64 @@ impl ExecutionDispatcher {
         let deadline = operation.deadline();
         let cancellation = operation.cancellation();
         let request = ReconcileOrders::new(order_ids.clone().into_boxed_slice(), operation);
-        let state = match tokio::time::timeout_at(deadline, self.adapter.reconcile(request)).await {
-            Err(_) => {
-                cancellation.cancel();
-                fail_all(
-                    admissions,
-                    invoked.wall,
-                    ExecutionAuditReason::OperationDeadlineExceeded,
+        let (result, deadline_exceeded) = attempt_adapter_call(
+            &self.adapter,
+            deadline,
+            &cancellation,
+            task_permit,
+            move |adapter| async move { adapter.reconcile(request).await },
+        )
+        .await;
+        if deadline_exceeded {
+            fail_all(
+                admissions,
+                invoked.wall,
+                ExecutionAuditReason::OperationDeadlineExceeded,
+            );
+            return Err(ExecutionDispatchError::OperationDeadlineExceeded);
+        }
+        let state = match result {
+            Ok(state) => state,
+            Err(error) => {
+                let post_call = match system_now() {
+                    Ok(post_call)
+                        if post_call.wall >= invoked.wall
+                            && post_call.monotonic >= invoked.monotonic =>
+                    {
+                        post_call
+                    }
+                    _ => {
+                        fail_all(admissions, invoked.wall, ExecutionAuditReason::ClockFailure);
+                        return Err(ExecutionDispatchError::ClockUnavailable);
+                    }
+                };
+                let observed_at = post_call.wall;
+                let known = matches!(
+                    error,
+                    ExecutionAdapterError::Rejected
+                        | ExecutionAdapterError::KnownFailure
+                        | ExecutionAdapterError::NotAttemptedBusy
                 );
-                return Err(ExecutionDispatchError::OperationDeadlineExceeded);
-            }
-            Ok(result) => match result {
-                Ok(state) => state,
-                Err(error) => {
-                    let post_call = match system_now() {
-                        Ok(post_call)
-                            if post_call.wall >= invoked.wall
-                                && post_call.monotonic >= invoked.monotonic =>
-                        {
-                            post_call
-                        }
-                        _ => {
-                            fail_all(admissions, invoked.wall, ExecutionAuditReason::ClockFailure);
-                            return Err(ExecutionDispatchError::ClockUnavailable);
-                        }
-                    };
-                    let observed_at = post_call.wall;
-                    let known = matches!(
-                        error,
-                        ExecutionAdapterError::Rejected
-                            | ExecutionAdapterError::KnownFailure
-                            | ExecutionAdapterError::NotAttemptedBusy
-                    );
-                    restore_or_reconcile(&self.registry, &admissions, known, observed_at);
-                    for mut admission in admissions {
-                        if let Some(fail_safe) = admission.fail_safe.take() {
-                            if known {
-                                fail_safe.complete_known(
-                                    ExecutionAuditKind::DispatchKnownFailure,
-                                    observed_at,
-                                    &[adapter_reason(error)],
-                                );
-                            } else {
-                                fail_safe.complete_uncertain(
-                                    ExecutionAuditKind::DispatchUncertain,
-                                    observed_at,
-                                    &[adapter_reason(error)],
-                                );
-                            }
+                restore_or_reconcile(&self.registry, &admissions, known, observed_at);
+                for mut admission in admissions {
+                    if let Some(fail_safe) = admission.fail_safe.take() {
+                        if known {
+                            fail_safe.complete_known(
+                                ExecutionAuditKind::DispatchKnownFailure,
+                                observed_at,
+                                &[adapter_reason(error)],
+                            );
+                        } else {
+                            fail_safe.complete_uncertain(
+                                ExecutionAuditKind::DispatchUncertain,
+                                observed_at,
+                                &[adapter_reason(error)],
+                            );
                         }
                     }
-                    return Err(ExecutionDispatchError::Adapter(error));
                 }
-            },
+                return Err(ExecutionDispatchError::Adapter(error));
+            }
         };
         let post_call = match system_now() {
             Ok(post_call)
@@ -509,6 +529,7 @@ impl ExecutionDispatcher {
     }
 
     async fn retry_pending_reconciliation(&self) -> Result<ExecutionState, ExecutionDispatchError> {
+        let task_permit = self.try_reserve_adapter_task()?;
         let (batch, order_ids) = {
             let mut registry = try_registry(&self.registry)?;
             let pending = registry
@@ -543,22 +564,24 @@ impl ExecutionDispatcher {
         let deadline = operation.deadline();
         let cancellation = operation.cancellation();
         let acknowledgement = ReconciliationAcknowledgement::new(batch, order_ids, operation);
-        let result = tokio::time::timeout_at(
+        let (result, deadline_exceeded) = attempt_adapter_call(
+            &self.adapter,
             deadline,
-            self.adapter.acknowledge_reconciliation(acknowledgement),
+            &cancellation,
+            task_permit,
+            move |adapter| async move { adapter.acknowledge_reconciliation(acknowledgement).await },
         )
         .await;
+        if deadline_exceeded {
+            restore_pending_acknowledgement(&self.registry, batch);
+            return Err(ExecutionDispatchError::OperationDeadlineExceeded);
+        }
         match result {
-            Err(_) => {
-                cancellation.cancel();
-                restore_pending_acknowledgement(&self.registry, batch);
-                Err(ExecutionDispatchError::OperationDeadlineExceeded)
-            }
-            Ok(Err(error)) => {
+            Err(error) => {
                 restore_pending_acknowledgement(&self.registry, batch);
                 Err(ExecutionDispatchError::Adapter(error))
             }
-            Ok(Ok(())) => {
+            Ok(()) => {
                 let mut registry = lock_registry(&self.registry);
                 let pending = registry
                     .pending_reconciliation
@@ -581,15 +604,12 @@ impl ExecutionDispatcher {
             mark_shutdown_reconciliation(&self.registry);
             return ExecutionDispatcherShutdown::JoinError;
         };
-        let outcome = match tokio::time::timeout(self.shutdown_deadline, &mut worker).await {
+        let outcome = match tokio::time::timeout(self.shutdown_deadline, worker.join()).await {
             Ok(Ok(())) => ExecutionDispatcherShutdown::Complete,
             Ok(Err(_)) => ExecutionDispatcherShutdown::JoinError,
             Err(_) => {
-                worker.abort();
-                match tokio::time::timeout(self.shutdown_deadline, &mut worker).await {
-                    Ok(_) => ExecutionDispatcherShutdown::DeadlineAborted,
-                    Err(_) => ExecutionDispatcherShutdown::Incomplete,
-                }
+                worker.transfer();
+                ExecutionDispatcherShutdown::Incomplete
             }
         };
         mark_shutdown_reconciliation(&self.registry);
@@ -600,8 +620,8 @@ impl ExecutionDispatcher {
 impl Drop for ExecutionDispatcher {
     fn drop(&mut self) {
         self.cancellation.cancel();
-        if let Some(worker) = self.worker.as_mut() {
-            worker.abort();
+        if let Some(worker) = self.worker.take() {
+            worker.transfer();
         }
         mark_shutdown_reconciliation(&self.registry);
     }

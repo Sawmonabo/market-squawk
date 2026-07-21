@@ -121,6 +121,68 @@ pub(super) fn exact_product<const N: usize>(factors: [Decimal; N]) -> Result<Dec
     decimal_from_parts(magnitude, normalized_scale, is_negative)
 }
 
+/// Rounds the exact sum of two decimal amounts weighted by nonnegative basis-point rates.
+pub(super) fn rounded_weighted_basis_points(
+    left: (Decimal, u32),
+    right: (Decimal, u32),
+    output_scale: u32,
+    mode: RoundMode,
+) -> Result<Decimal, ()> {
+    if output_scale > Decimal::MAX_SCALE {
+        return Err(());
+    }
+    let common_scale = left.0.scale().max(right.0.scale());
+    let mut positive = BigUint::from(0_u8);
+    let mut negative = BigUint::from(0_u8);
+    for (amount, basis_points) in [left, right] {
+        let scale_shift = common_scale.checked_sub(amount.scale()).ok_or(())?;
+        let magnitude = BigUint::from(amount.mantissa().unsigned_abs())
+            * BigUint::from(10_u8).pow(scale_shift)
+            * BigUint::from(basis_points);
+        if amount.is_sign_negative() {
+            negative += magnitude;
+        } else {
+            positive += magnitude;
+        }
+    }
+    let (is_negative, magnitude) = match positive.cmp(&negative) {
+        std::cmp::Ordering::Less => (true, negative - positive),
+        std::cmp::Ordering::Equal => return Ok(Decimal::ZERO),
+        std::cmp::Ordering::Greater => (false, positive - negative),
+    };
+    let mut numerator = magnitude;
+    let denominator = BigUint::from(10_000_u32) * BigUint::from(10_u8).pow(common_scale);
+    if output_scale > 0 {
+        numerator *= BigUint::from(10_u8).pow(output_scale);
+    }
+    let mut quotient = &numerator / &denominator;
+    let remainder = numerator % &denominator;
+    let has_remainder = remainder != BigUint::from(0_u8);
+    let increment_magnitude = match mode {
+        RoundMode::TowardZero => false,
+        RoundMode::AwayFromZero => has_remainder,
+        RoundMode::Floor => is_negative && has_remainder,
+        RoundMode::Ceiling => !is_negative && has_remainder,
+        RoundMode::NearestEven => {
+            let doubled_remainder = &remainder * 2_u8;
+            doubled_remainder > denominator || (doubled_remainder == denominator && quotient.bit(0))
+        }
+    };
+    if increment_magnitude {
+        quotient += 1_u8;
+    }
+    let mut normalized_scale = output_scale;
+    while normalized_scale > 0 && &quotient % 10_u8 == BigUint::from(0_u8) {
+        quotient /= 10_u8;
+        normalized_scale -= 1;
+    }
+    let magnitude = u128::try_from(quotient).map_err(|_| ())?;
+    if magnitude > MAX_DECIMAL_MANTISSA {
+        return Err(());
+    }
+    decimal_from_parts(magnitude, normalized_scale, is_negative)
+}
+
 /// Adds decimals after exact scale alignment, returning an error instead of rounded carry loss.
 pub(super) fn exact_add(left: Decimal, right: Decimal) -> Result<Decimal, ()> {
     exact_add_or_subtract(left, right, false)

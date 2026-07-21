@@ -1,5 +1,6 @@
 //! Bounded one-use approval dispatch and accepted-order ownership.
 
+mod attempt;
 mod lifecycle;
 mod reconciliation;
 mod worker;
@@ -20,8 +21,9 @@ use crate::clock::system_now;
 use crate::{
     AccountRiskCoordinator, AccountRiskReservation, ApprovedOrder, ExecutionAdapter,
     ExecutionAdapterError, ExecutionAuditEvent, ExecutionAuditKind, ExecutionAuditReason,
-    ExecutionAuditWriter, ExecutionOperation, ExecutionPriceBound, ExecutionState,
-    OrderIntentDigest, PersistenceAcknowledgement, ReconciledOrder, ReconciliationBatchBinding,
+    ExecutionAuditWriter, ExecutionOperation, ExecutionPriceBound, ExecutionState, ExecutionTask,
+    ExecutionTaskReaper, ExecutionTaskReaperError, OrderIntentDigest, PersistenceAcknowledgement,
+    ReconciledOrder, ReconciliationBatchBinding,
 };
 use worker::run_worker;
 
@@ -36,6 +38,13 @@ pub struct ExecutionDispatcherConfig {
     pub shutdown_deadline: Duration,
 }
 
+impl ExecutionDispatcherConfig {
+    /// Returns the exact shared dispatcher-handle charge used by route-hook composition.
+    pub fn handle_retained_bytes(self) -> Result<usize, ExecutionDispatcherError> {
+        retained_dispatcher_bytes(self)
+    }
+}
+
 /// Owner of the execution worker, accepted reservations, and adapter lifecycle operations.
 #[derive(Debug)]
 pub struct ExecutionDispatcher {
@@ -45,7 +54,8 @@ pub struct ExecutionDispatcher {
     registry: Arc<Mutex<DispatchRegistry>>,
     audit: ExecutionAuditWriter,
     cancellation: CancellationToken,
-    worker: Option<tokio::task::JoinHandle<()>>,
+    worker: Option<ExecutionTask<()>>,
+    task_reaper: ExecutionTaskReaper,
     operation_deadline: Duration,
     shutdown_deadline: Duration,
     maximum_pending_reconciliation_bytes: usize,
@@ -58,6 +68,7 @@ impl ExecutionDispatcher {
         accounts: Arc<AccountRiskCoordinator>,
         audit: ExecutionAuditWriter,
         config: ExecutionDispatcherConfig,
+        task_reaper: ExecutionTaskReaper,
     ) -> Result<Self, ExecutionDispatcherError> {
         if config.operation_deadline.is_zero() || config.shutdown_deadline.is_zero() {
             return Err(ExecutionDispatcherError::ZeroShutdownDeadline);
@@ -89,14 +100,18 @@ impl ExecutionDispatcher {
         let bytes = Arc::new(Semaphore::new(command_bytes));
         let cancellation = CancellationToken::new();
         let retained_bytes = retained_dispatcher_bytes(config)?;
-        let runtime = tokio::runtime::Handle::try_current()
-            .map_err(|_| ExecutionDispatcherError::RuntimeUnavailable)?;
-        let worker = runtime.spawn(run_worker(
-            Arc::clone(&adapter),
-            Arc::clone(&registry),
-            receiver,
-            cancellation.child_token(),
-        ));
+        let worker = task_reaper
+            .try_reserve()
+            .and_then(|permit| {
+                permit.spawn(run_worker(
+                    Arc::clone(&adapter),
+                    Arc::clone(&registry),
+                    receiver,
+                    cancellation.child_token(),
+                    task_reaper.clone(),
+                ))
+            })
+            .map_err(ExecutionDispatcherError::TaskOwnership)?;
         let handle = ExecutionDispatcherHandle {
             sender,
             bytes,
@@ -114,6 +129,7 @@ impl ExecutionDispatcher {
             audit,
             cancellation,
             worker: Some(worker),
+            task_reaper,
             operation_deadline: config.operation_deadline,
             shutdown_deadline: config.shutdown_deadline,
             maximum_pending_reconciliation_bytes: usize::try_from(
@@ -150,6 +166,11 @@ impl ExecutionDispatcher {
                 registry: Arc::clone(&self.registry),
             },
         ))
+    }
+
+    /// Returns the process-lifetime owner used to drain transferred execution tasks.
+    pub fn task_reaper(&self) -> ExecutionTaskReaper {
+        self.task_reaper.clone()
     }
 }
 
@@ -489,14 +510,17 @@ fn trusted_now_or(fallback: Timestamp) -> Timestamp {
 fn retained_dispatcher_bytes(
     config: ExecutionDispatcherConfig,
 ) -> Result<usize, ExecutionDispatcherError> {
+    let command_count_bytes = config
+        .maximum_queued_commands
+        .get()
+        .checked_mul(APPROVAL_COMMAND_RETAINED_BYTE_CEILING)
+        .ok_or(ExecutionDispatcherError::RetainedSizeOverflow)?;
+    let command_bytes = command_count_bytes.min(
+        usize::try_from(config.maximum_queued_bytes.get())
+            .map_err(|_| ExecutionDispatcherError::RetainedSizeOverflow)?,
+    );
     std::mem::size_of::<ExecutionDispatcherHandle>()
-        .checked_add(
-            config
-                .maximum_queued_commands
-                .get()
-                .checked_mul(APPROVAL_COMMAND_RETAINED_BYTE_CEILING)
-                .ok_or(ExecutionDispatcherError::RetainedSizeOverflow)?,
-        )
+        .checked_add(command_bytes)
         .and_then(|value| {
             value.checked_add(
                 config
@@ -562,6 +586,8 @@ pub enum ExecutionDispatchError {
     PendingReconciliationCapacity,
     #[error("execution operation exceeded its monotonic deadline")]
     OperationDeadlineExceeded,
+    #[error("execution task ownership capacity is saturated")]
+    TaskOwnershipUnavailable,
     #[error(transparent)]
     Adapter(ExecutionAdapterError),
 }
@@ -581,6 +607,8 @@ pub enum ExecutionDispatcherError {
     RuntimeUnavailable,
     #[error("dispatcher retained-size accounting overflowed")]
     RetainedSizeOverflow,
+    #[error(transparent)]
+    TaskOwnership(#[from] ExecutionTaskReaperError),
 }
 
 fn operation(

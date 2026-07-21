@@ -9,9 +9,14 @@ repository = "https://github.com/Sawmonabo/market-squawk"
 publish = false
 
 [dependencies]
+cap-fs-ext.workspace = true
+cap-std.workspace = true
 chrono-tz.workspace = true
+getrandom.workspace = true
+libc.workspace = true
 market-squawk-domain.workspace = true
 market-squawk-execution.workspace = true
+market-squawk-platform.workspace = true
 rand_chacha.workspace = true
 rand_core.workspace = true
 rust_decimal.workspace = true
@@ -25,6 +30,7 @@ tokio-util.workspace = true
 [dev-dependencies]
 proptest.workspace = true
 static_assertions.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

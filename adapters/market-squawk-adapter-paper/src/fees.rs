@@ -1,7 +1,7 @@
 //! Exact configurable paper fee calculation.
 
-use market_squawk_domain::{Currency, Money};
-use rust_decimal::{Decimal, RoundingStrategy};
+use market_squawk_domain::{Currency, Money, RoundingPolicy};
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -115,19 +115,16 @@ impl FeeSchedule {
         if maker_notional.amount().is_zero() && taker_notional.amount().is_zero() {
             return Ok(Money::new(Decimal::ZERO, self.currency()));
         }
-        let maker_raw = maker_notional
-            .amount()
-            .checked_mul(Decimal::from(self.maker_basis_points))
-            .and_then(|value| value.checked_div(Decimal::from(10_000_u32)))
-            .ok_or(FeeError::Overflow)?;
-        let taker_raw = taker_notional
-            .amount()
-            .checked_mul(Decimal::from(self.taker_basis_points))
-            .and_then(|value| value.checked_div(Decimal::from(10_000_u32)))
-            .ok_or(FeeError::Overflow)?;
-        let raw = maker_raw.checked_add(taker_raw).ok_or(FeeError::Overflow)?;
-        let mut amount =
-            raw.round_dp_with_strategy(self.money_scale, RoundingStrategy::MidpointNearestEven);
+        let mut amount = maker_notional
+            .checked_weighted_basis_points(
+                self.maker_basis_points,
+                taker_notional,
+                self.taker_basis_points,
+                self.money_scale,
+                RoundingPolicy::NearestEven,
+            )
+            .map_err(|_| FeeError::Overflow)?
+            .amount();
         amount = amount.max(self.minimum_fee.amount());
         if let Some(maximum) = self.maximum_fee {
             amount = amount.min(maximum.amount());

@@ -24,9 +24,11 @@ pub struct PaperExecutionConfigInput {
     pub maximum_fills: NonZeroUsize,
     pub maximum_idempotency_keys: NonZeroUsize,
     pub maximum_archived_orders: NonZeroUsize,
+    pub matching_work_quantum: NonZeroUsize,
     pub minimum_latency_nanos: u64,
     pub maximum_latency_nanos: u64,
     pub cancel_latency_nanos: u64,
+    pub maximum_mark_age_nanos: u64,
     pub day_session_calendar: PaperVenueSessionCalendar,
     pub maximum_participation_basis_points: u32,
     pub impact_basis_points_per_level: u32,
@@ -48,13 +50,15 @@ pub struct PaperExecutionConfig {
 }
 
 impl PaperExecutionConfig {
-    pub const CHECKPOINT_SCHEMA_VERSION: u32 = 6;
+    pub const CHECKPOINT_SCHEMA_VERSION: u32 = 8;
 
     /// Validates bounds and seals a stable configuration digest.
     pub fn try_new(input: PaperExecutionConfigInput) -> Result<Self, PaperConfigError> {
         if input.minimum_latency_nanos > input.maximum_latency_nanos
             || input.maximum_latency_nanos > i64::MAX as u64
             || input.cancel_latency_nanos > i64::MAX as u64
+            || input.maximum_mark_age_nanos == 0
+            || input.maximum_mark_age_nanos > i64::MAX as u64
             || input.abort_join_deadline.is_zero()
             || !(1..=10_000).contains(&input.maximum_participation_basis_points)
             || input.impact_basis_points_per_level > 10_000
@@ -63,7 +67,7 @@ impl PaperExecutionConfig {
             return Err(PaperConfigError::InvalidValue);
         }
         let mut digest = Sha256::new();
-        digest.update(b"market-squawk/paper-config/v3\0");
+        digest.update(b"market-squawk/paper-config/v4\0");
         digest.update(input.configuration_version.get().to_be_bytes());
         digest.update(input.deterministic_seed);
         let count_values = [
@@ -74,6 +78,7 @@ impl PaperExecutionConfig {
             input.maximum_fills.get(),
             input.maximum_idempotency_keys.get(),
             input.maximum_archived_orders.get(),
+            input.matching_work_quantum.get(),
             input.ledger_maximum_accounts.get(),
             input.ledger_maximum_balances.get(),
             input.ledger_maximum_positions.get(),
@@ -92,6 +97,7 @@ impl PaperExecutionConfig {
             input.minimum_latency_nanos,
             input.maximum_latency_nanos,
             input.cancel_latency_nanos,
+            input.maximum_mark_age_nanos,
             u64::from(input.maximum_participation_basis_points),
             u64::from(input.impact_basis_points_per_level),
         ] {
@@ -103,7 +109,7 @@ impl PaperExecutionConfig {
         digest.update(input.abort_join_deadline.subsec_nanos().to_be_bytes());
         digest.update([u8::from(input.allow_short)]);
         match input.exposure_valuation {
-            PaperExposureValuation::OpenCost => digest.update(b"open-cost"),
+            PaperExposureValuation::ExecutableExit => digest.update(b"executable-exit"),
         }
         digest.update(input.fee_schedule.maker_basis_points().to_be_bytes());
         digest.update(input.fee_schedule.taker_basis_points().to_be_bytes());
@@ -130,6 +136,31 @@ impl PaperExecutionConfig {
         self.digest
     }
 
+    /// Returns the exact fixed retained-byte declaration exposed by a market-ingress handle.
+    ///
+    /// This uses the same count-and-byte intersection as worker startup, allowing the application
+    /// to reserve route memory before any execution task is spawned.
+    pub fn market_ingress_retained_bytes(&self) -> Result<usize, PaperConfigError> {
+        self.market_event_capacity()?
+            .checked_mul(crate::worker::WORKER_ENVELOPE_RETAINED_BYTES)
+            .ok_or(PaperConfigError::CapacityOverflow)
+    }
+
+    pub(crate) fn market_event_capacity(&self) -> Result<usize, PaperConfigError> {
+        let item_bytes = crate::worker::WORKER_ENVELOPE_RETAINED_BYTES;
+        let byte_capacity = usize::try_from(self.input.market_maximum_bytes.get())
+            .map_err(|_| PaperConfigError::CapacityOverflow)?;
+        let capacity = self
+            .input
+            .market_capacity
+            .get()
+            .min(byte_capacity / item_bytes);
+        if capacity == 0 {
+            return Err(PaperConfigError::InvalidValue);
+        }
+        Ok(capacity)
+    }
+
     pub(crate) fn ledger_config(&self) -> PaperLedgerConfig {
         PaperLedgerConfig {
             allow_short: self.input.allow_short,
@@ -154,4 +185,6 @@ fn hash_money(digest: &mut Sha256, money: market_squawk_domain::Money) {
 pub enum PaperConfigError {
     #[error("paper execution configuration contains an invalid value")]
     InvalidValue,
+    #[error("paper execution retained-size calculation overflowed")]
+    CapacityOverflow,
 }

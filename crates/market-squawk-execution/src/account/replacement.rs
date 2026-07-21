@@ -119,9 +119,13 @@ struct PreparedAccountState {
     revision: u64,
     eligible: bool,
     cash: market_squawk_domain::Money,
+    settled_capital: market_squawk_domain::Money,
     capital: market_squawk_domain::Money,
     peak_capital: market_squawk_domain::Money,
     gross_exposure: market_squawk_domain::Money,
+    unrealized_pnl: market_squawk_domain::Money,
+    drawdown: market_squawk_domain::Money,
+    mark_digest: [u8; 32],
     realized_pnl: market_squawk_domain::Money,
     realized_loss: market_squawk_domain::Money,
     positions: HashMap<market_squawk_domain::InstrumentId, i64>,
@@ -210,9 +214,13 @@ impl AccountRiskCoordinator {
             current.reservations.clear();
             current.eligible = replacement.eligible;
             current.cash = replacement.cash;
+            current.settled_capital = replacement.settled_capital;
             current.capital = replacement.capital;
             current.peak_capital = replacement.peak_capital;
             current.gross_exposure = replacement.gross_exposure;
+            current.unrealized_pnl = replacement.unrealized_pnl;
+            current.drawdown = replacement.drawdown;
+            current.mark_digest = replacement.mark_digest;
             current.realized_pnl = replacement.realized_pnl;
             current.realized_loss = replacement.realized_loss;
             current.positions = replacement.positions;
@@ -313,9 +321,13 @@ fn prepare_candidate(
         revision: candidate.state.revision().get(),
         eligible: candidate.state.eligible(),
         cash: candidate.state.cash(),
+        settled_capital: candidate.state.settled_capital(),
         capital: candidate.state.capital(),
         peak_capital: candidate.state.peak_capital(),
         gross_exposure: candidate.state.gross_exposure(),
+        unrealized_pnl: candidate.state.unrealized_pnl(),
+        drawdown: candidate.state.drawdown(),
+        mark_digest: candidate.state.mark_digest(),
         realized_pnl: candidate.state.realized_pnl(),
         realized_loss: candidate.state.realized_loss(),
         positions,

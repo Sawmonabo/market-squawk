@@ -1,9 +1,10 @@
 use std::str::FromStr;
 
 use market_squawk_domain::{
-    Currency, FinancialError, LotSize, Money, PriceError, PriceTicks, QuantityError, QuantityLots,
-    RoundingPolicy, TickSize,
+    BasisPoints, Currency, FinancialError, LotSize, Money, PriceError, PriceTicks, QuantityError,
+    QuantityLots, RoundingPolicy, TickSize,
 };
+use num_bigint::BigInt;
 use rust_decimal::Decimal;
 
 #[test]
@@ -55,6 +56,66 @@ fn notional_rejects_rounded_scaled_intermediates() -> Result<(), Box<dyn std::er
             Currency::try_from("USD")?,
         ),
         Err(FinancialError::Overflow)
+    );
+    Ok(())
+}
+
+#[test]
+fn money_scalars_reject_silent_products_and_round_exact_fee_rationals()
+-> Result<(), Box<dyn std::error::Error>> {
+    let usd = Currency::try_from("USD")?;
+    let multiplier = Decimal::from_str("7.9228162514264337593543950334")?;
+    let amount = Money::new(Decimal::new(3, 0), usd);
+    assert!(amount.amount().checked_mul(multiplier).is_some());
+    assert_eq!(
+        amount.checked_mul_decimal(multiplier),
+        Err(FinancialError::Overflow)
+    );
+
+    let dust = Money::new(Decimal::try_new(1, Decimal::MAX_SCALE)?, usd);
+    let legacy = dust
+        .amount()
+        .checked_mul(Decimal::ONE)
+        .and_then(|value| value.checked_div(Decimal::from(10_000_u32)));
+    assert_eq!(legacy, Some(Decimal::ZERO));
+
+    let exact_numerator = BigInt::from(dust.amount().mantissa());
+    let exact_denominator = BigInt::from(10_000_u32);
+    assert!(exact_numerator % exact_denominator != BigInt::from(0_u8));
+    assert_eq!(
+        dust.checked_basis_points(
+            BasisPoints::new(1),
+            Decimal::MAX_SCALE,
+            RoundingPolicy::Ceiling,
+        )?,
+        Money::new(Decimal::try_new(1, Decimal::MAX_SCALE)?, usd)
+    );
+    Ok(())
+}
+
+#[test]
+fn basis_point_rounding_normalizes_large_integral_and_adverse_fractional_fees()
+-> Result<(), Box<dyn std::error::Error>> {
+    let usd = Currency::try_from("USD")?;
+
+    let high_notional = Money::new(Decimal::from(1_000_000_u32), usd);
+    assert_eq!(
+        high_notional.checked_basis_points(
+            BasisPoints::new(100),
+            Decimal::MAX_SCALE,
+            RoundingPolicy::Ceiling,
+        )?,
+        Money::new(Decimal::from(10_000_u32), usd)
+    );
+
+    let fractional_notional = Money::new(Decimal::from_str("1234567.89")?, usd);
+    assert_eq!(
+        fractional_notional.checked_basis_points(
+            BasisPoints::new(1),
+            4,
+            RoundingPolicy::Ceiling,
+        )?,
+        Money::new(Decimal::from_str("123.4568")?, usd)
     );
     Ok(())
 }

@@ -7,6 +7,7 @@ use market_squawk_domain::{
     AccountId, Currency, InstrumentExecutionTerms, InstrumentId, Money, OrderId, OrderSide,
     PriceTicks, QuantityLots,
 };
+use market_squawk_execution::ExecutionMarketUpdate;
 use rust_decimal::{Decimal, RoundingStrategy};
 use thiserror::Error;
 
@@ -16,6 +17,10 @@ use crate::{FeeError, FeeSchedule, LiquidityRole};
 mod account_state;
 use account_state::PaperAccountRiskState;
 pub use account_state::{PaperAccountBootstrap, PaperAccountRiskSnapshot};
+#[path = "ledger/marks.rs"]
+mod marks;
+pub(crate) use marks::PaperMarkDisposition;
+use marks::PaperMarkEvidence;
 #[path = "ledger/recovery.rs"]
 mod recovery;
 pub(crate) use recovery::LedgerRecoveryWire;
@@ -35,8 +40,8 @@ pub struct PaperLedgerConfig {
 /// Fixed valuation policy used for paper risk exposure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PaperExposureValuation {
-    /// Values each signed open position at its exact retained open cost basis.
-    OpenCost,
+    /// Values long positions at the qualified bid and short positions at the qualified ask.
+    ExecutableExit,
 }
 
 /// One exact settled cash balance in a checkpoint/snapshot.
@@ -135,6 +140,7 @@ pub struct PaperLedger {
     cash: BTreeMap<(AccountId, Currency), Decimal>,
     positions: BTreeMap<(AccountId, InstrumentId), i64>,
     position_cost_basis: BTreeMap<(AccountId, InstrumentId), Decimal>,
+    marks: BTreeMap<InstrumentId, PaperMarkEvidence>,
     reservations: BTreeMap<OrderId, Reservation>,
 }
 
@@ -152,7 +158,7 @@ impl PaperLedger {
             return Err(PaperLedgerError::InvalidConfiguration);
         }
         match config.exposure_valuation {
-            PaperExposureValuation::OpenCost => {}
+            PaperExposureValuation::ExecutableExit => {}
         }
         let mut cash = BTreeMap::new();
         let mut positions = BTreeMap::new();
@@ -191,9 +197,16 @@ impl PaperLedger {
                             revision: account.revision,
                             eligible: account.eligible,
                             currency,
-                            capital: account.capital,
-                            peak_capital: account.peak_capital,
-                            gross_exposure: account.gross_exposure,
+                            settled_capital: account.capital,
+                            marked_equity: account.capital,
+                            peak_marked_equity: account.peak_capital,
+                            marked_gross_exposure: account.gross_exposure,
+                            unrealized_pnl: Money::new(Decimal::ZERO, currency),
+                            drawdown: account
+                                .peak_capital
+                                .checked_sub(account.capital)
+                                .map_err(|_| PaperLedgerError::InvalidBootstrap)?,
+                            mark_digest: [0; 32],
                             realized_loss: account.realized_loss,
                             realized_pnl: account.realized_pnl,
                         },
@@ -257,16 +270,19 @@ impl PaperLedger {
                 .try_fold(Decimal::ZERO, |sum, (_, basis)| {
                     sum.checked_add(*basis).ok_or(PaperLedgerError::Overflow)
                 })?;
-            if basis != account.gross_exposure.amount() {
+            if basis != account.marked_gross_exposure.amount() {
                 return Err(PaperLedgerError::InvalidBootstrap);
             }
         }
+        positions.retain(|_, lots| *lots != 0);
+        position_cost_basis.retain(|key, _| positions.contains_key(key));
         Ok(Self {
             config,
             accounts: account_states,
             cash,
             positions,
             position_cost_basis,
+            marks: BTreeMap::new(),
             reservations: BTreeMap::new(),
         })
     }
@@ -352,6 +368,19 @@ impl PaperLedger {
             .copied()
             .ok_or(PaperLedgerError::UnknownAccountOrCurrency)?;
         Ok(PaperAccountRiskSnapshot::new(account_id, account))
+    }
+
+    pub(crate) fn apply_execution_market_update(
+        &mut self,
+        update: ExecutionMarketUpdate,
+        valued_at: market_squawk_domain::Timestamp,
+        maximum_mark_age_nanos: u64,
+    ) -> Result<PaperMarkDisposition, PaperLedgerError> {
+        self.apply_mark(
+            PaperMarkEvidence::try_from_update(update)?,
+            valued_at,
+            maximum_mark_age_nanos,
+        )
     }
 
     pub(crate) fn cash_snapshot(&self) -> Vec<PaperCashBalance> {
@@ -638,20 +667,26 @@ impl PaperLedger {
         if position_transition.next_lots != next_position {
             return Err(PaperLedgerError::Overflow);
         }
-        let next_capital = current_account
-            .capital
+        let next_settled_capital = current_account
+            .settled_capital
             .checked_add(position_transition.realized_pnl)
             .and_then(|capital| capital.checked_sub(fee))
             .map_err(|_| PaperLedgerError::Overflow)?;
-        if next_capital.amount().is_zero() || next_capital.amount().is_sign_negative() {
+        if next_settled_capital.amount().is_zero()
+            || next_settled_capital.amount().is_sign_negative()
+        {
             return Err(PaperLedgerError::InsufficientCapital);
         }
-        let realized_loss_delta = Money::new(
-            (-position_transition.realized_pnl.amount()).max(Decimal::ZERO),
-            currency,
-        )
-        .checked_add(fee)
-        .map_err(|_| PaperLedgerError::Overflow)?;
+        let realized_loss_amount = if position_transition.realized_pnl.amount().is_sign_negative() {
+            Decimal::ZERO
+                .checked_sub(position_transition.realized_pnl.amount())
+                .ok_or(PaperLedgerError::Overflow)?
+        } else {
+            Decimal::ZERO
+        };
+        let realized_loss_delta = Money::new(realized_loss_amount, currency)
+            .checked_add(fee)
+            .map_err(|_| PaperLedgerError::Overflow)?;
         let next_realized_loss = current_account
             .realized_loss
             .checked_add(realized_loss_delta)
@@ -660,21 +695,35 @@ impl PaperLedger {
             .realized_pnl
             .checked_add(position_transition.realized_pnl)
             .map_err(|_| PaperLedgerError::Overflow)?;
-        let next_gross_exposure = current_account
-            .gross_exposure
+        let current_open_cost_exposure = self
+            .position_cost_basis
+            .iter()
+            .filter(|((account_id, _), _)| *account_id == reservation.account_id)
+            .try_fold(Money::new(Decimal::ZERO, currency), |sum, (_, amount)| {
+                sum.checked_add(Money::new(*amount, currency))
+                    .map_err(|_| PaperLedgerError::Overflow)
+            })?;
+        let next_open_cost_exposure = current_open_cost_exposure
             .checked_sub(current_cost_basis)
             .and_then(|exposure| exposure.checked_add(position_transition.next_cost_basis))
             .map_err(|_| PaperLedgerError::Overflow)?;
-        let next_peak_capital = if next_capital.amount() > current_account.peak_capital.amount() {
-            next_capital
-        } else {
-            current_account.peak_capital
-        };
+        let next_peak_capital =
+            if next_settled_capital.amount() > current_account.peak_marked_equity.amount() {
+                next_settled_capital
+            } else {
+                current_account.peak_marked_equity
+            };
         let next_account = PaperAccountRiskState {
             revision: next_revision,
-            capital: next_capital,
-            peak_capital: next_peak_capital,
-            gross_exposure: next_gross_exposure,
+            settled_capital: next_settled_capital,
+            marked_equity: next_settled_capital,
+            peak_marked_equity: next_peak_capital,
+            marked_gross_exposure: next_open_cost_exposure,
+            unrealized_pnl: Money::new(Decimal::ZERO, currency),
+            drawdown: next_peak_capital
+                .checked_sub(next_settled_capital)
+                .map_err(|_| PaperLedgerError::Overflow)?,
+            mark_digest: [0; 32],
             realized_loss: next_realized_loss,
             realized_pnl: next_realized_pnl,
             ..current_account
@@ -682,14 +731,15 @@ impl PaperLedger {
 
         self.cash
             .insert((reservation.account_id, currency), next_cash);
-        self.positions.insert(
-            (reservation.account_id, terms.instrument_id()),
-            next_position,
-        );
-        self.position_cost_basis.insert(
-            (reservation.account_id, terms.instrument_id()),
-            position_transition.next_cost_basis.amount(),
-        );
+        let position_key = (reservation.account_id, terms.instrument_id());
+        if next_position == 0 {
+            self.positions.remove(&position_key);
+            self.position_cost_basis.remove(&position_key);
+        } else {
+            self.positions.insert(position_key, next_position);
+            self.position_cost_basis
+                .insert(position_key, position_transition.next_cost_basis.amount());
+        }
         self.accounts.insert(reservation.account_id, next_account);
         if next_remaining.get() == 0 {
             self.reservations.remove(&order_id);
@@ -704,6 +754,7 @@ impl PaperLedger {
             stored.cumulative_taker_notional = next_taker_notional;
             stored.cumulative_fee = cumulative_fee;
         }
+        self.compact_unused_marks();
         Ok(PaperFill {
             quantity,
             average_price,
@@ -719,7 +770,9 @@ impl PaperLedger {
         self.reservations
             .remove(&order_id)
             .map(|_| ())
-            .ok_or(PaperLedgerError::UnknownOrder)
+            .ok_or(PaperLedgerError::UnknownOrder)?;
+        self.compact_unused_marks();
+        Ok(())
     }
 }
 
@@ -931,11 +984,8 @@ pub(crate) fn checked_notional(
             terms.quote_currency(),
         )
         .map_err(|_| PaperLedgerError::Overflow)?;
-    let amount = base
-        .amount()
-        .checked_mul(terms.contract_multiplier())
-        .ok_or(PaperLedgerError::Overflow)?;
-    Ok(Money::new(amount, base.currency()))
+    base.checked_mul_decimal(terms.contract_multiplier())
+        .map_err(|_| PaperLedgerError::Overflow)
 }
 
 fn aggregate_legs(
@@ -1034,6 +1084,12 @@ pub enum PaperLedgerError {
     FeeExceedsNotional,
     #[error("paper accounting arithmetic overflowed")]
     Overflow,
+    #[error("paper mark evidence is invalid or does not match the retained instrument state")]
+    InvalidMark,
+    #[error("paper mark evidence is missing or outside the configured freshness window")]
+    StaleMark,
+    #[error("paper mark evidence regressed its venue generation or observation time")]
+    MarkRegression,
     #[error("paper recovery ledger violates accounting invariants")]
     InvalidRecovery,
     #[error(transparent)]

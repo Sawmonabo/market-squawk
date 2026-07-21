@@ -3,16 +3,19 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use market_squawk_adapter_paper::{
-    FeeSchedule, LiquidityRole, PaperAccountBootstrap, PaperExecutionConfig,
-    PaperExecutionConfigInput, PaperExecutionRuntime, PaperExposureValuation, PaperLedger,
-    PaperLedgerConfig, PaperOrderLifecycle, PaperOrderState, PaperSessionCalendarError,
-    PaperStartError, PaperStateError, PaperVenueSession, PaperVenueSessionCalendar,
+    FeeSchedule, LiquidityRole, PaperAccountBootstrap, PaperCheckpointRepository,
+    PaperExecutionConfig, PaperExecutionConfigInput, PaperExecutionRuntime, PaperExposureValuation,
+    PaperLedger, PaperLedgerConfig, PaperOrderLifecycle, PaperOrderState,
+    PaperSessionCalendarError, PaperStartError, PaperStateError, PaperVenueSession,
+    PaperVenueSessionCalendar,
 };
 use market_squawk_domain::{
     AccountId, Currency, Denomination, InstrumentDefinitionRevision, InstrumentExecutionTerms,
     InstrumentId, LotSize, Money, OrderId, OrderSide, PriceTicks, QuantityLots, RuleVersion,
     SourceIdentifier, TickSize, Timestamp, VenueId,
 };
+use market_squawk_execution::ExecutionTaskReaper;
+use market_squawk_platform::LocalPaths;
 use rust_decimal::Decimal;
 use tokio::sync::Semaphore;
 
@@ -48,9 +51,11 @@ async fn oversized_combined_event_capacity_is_rejected_before_tokio_construction
         maximum_fills: NonZeroUsize::MIN,
         maximum_idempotency_keys: NonZeroUsize::MIN,
         maximum_archived_orders: NonZeroUsize::MIN,
+        matching_work_quantum: NonZeroUsize::MIN,
         minimum_latency_nanos: 0,
         maximum_latency_nanos: 0,
         cancel_latency_nanos: 0,
+        maximum_mark_age_nanos: 1_000_000_000,
         day_session_calendar: calendar,
         maximum_participation_basis_points: 10_000,
         impact_basis_points_per_level: 0,
@@ -59,12 +64,19 @@ async fn oversized_combined_event_capacity_is_rejected_before_tokio_construction
         ledger_maximum_balances: NonZeroUsize::MIN,
         ledger_maximum_positions: NonZeroUsize::MIN,
         allow_short: false,
-        exposure_valuation: PaperExposureValuation::OpenCost,
+        exposure_valuation: PaperExposureValuation::ExecutableExit,
         abort_join_deadline: Duration::from_secs(1),
         fee_schedule: FeeSchedule::try_new(0, 0, Money::new(Decimal::ZERO, usd), None, 2)?,
     })?;
 
     let account_id = AccountId::from_str("50000000-0000-0000-0000-000000000099")?;
+    let directory = tempfile::tempdir()?;
+    let paths = LocalPaths::prepare(directory.path().join("data"))?;
+    let repository = PaperCheckpointRepository::try_new(
+        paths.artifacts()?.clone(),
+        config.clone(),
+        NonZeroUsize::new(1024 * 1024).ok_or("zero checkpoint capacity")?,
+    )?;
     let result = PaperExecutionRuntime::try_start(
         config,
         [PaperAccountBootstrap {
@@ -80,6 +92,8 @@ async fn oversized_combined_event_capacity_is_rejected_before_tokio_construction
             positions: Vec::new(),
             position_cost_basis: Vec::new(),
         }],
+        &repository,
+        ExecutionTaskReaper::try_new(NonZeroUsize::MIN)?,
     );
     assert!(
         matches!(result, Err(PaperStartError::CapacityOverflow)),
@@ -214,7 +228,7 @@ fn ledger_is_exact_reserved_and_transactional_across_scaled_fills() -> TestResul
     let mut ledger = PaperLedger::try_new(
         PaperLedgerConfig {
             allow_short: false,
-            exposure_valuation: PaperExposureValuation::OpenCost,
+            exposure_valuation: PaperExposureValuation::ExecutableExit,
             maximum_accounts: 1,
             maximum_balances: 1,
             maximum_positions: 1,
@@ -311,7 +325,7 @@ fn minimum_fee_is_charged_once_across_partial_fills() -> TestResult {
     let mut ledger = PaperLedger::try_new(
         PaperLedgerConfig {
             allow_short: false,
-            exposure_valuation: PaperExposureValuation::OpenCost,
+            exposure_valuation: PaperExposureValuation::ExecutableExit,
             maximum_accounts: 1,
             maximum_balances: 1,
             maximum_positions: 1,
@@ -400,7 +414,7 @@ fn allowed_short_open_and_cover_are_accounted_without_exposure_underflow() -> Te
     let mut ledger = PaperLedger::try_new(
         PaperLedgerConfig {
             allow_short: true,
-            exposure_valuation: PaperExposureValuation::OpenCost,
+            exposure_valuation: PaperExposureValuation::ExecutableExit,
             maximum_accounts: 1,
             maximum_balances: 1,
             maximum_positions: 1,
@@ -477,6 +491,27 @@ fn allowed_short_open_and_cover_are_accounted_without_exposure_underflow() -> Te
     assert_eq!(covered.gross_exposure().amount(), Decimal::ZERO);
     assert_eq!(covered.realized_pnl().amount(), Decimal::new(2, 0));
     assert_eq!(covered.realized_loss().amount(), Decimal::ZERO);
+
+    let replacement_instrument = InstrumentId::from_str("10000000-0000-0000-0000-000000000013")?;
+    let replacement_terms = InstrumentExecutionTerms::try_new(
+        replacement_instrument,
+        InstrumentDefinitionRevision::try_from(1)?,
+        TickSize::try_from_decimal(Decimal::ONE)?,
+        LotSize::try_from_decimal(Decimal::ONE)?,
+        usd,
+        Denomination::Currency(usd),
+        Decimal::ONE,
+    )?;
+    let replacement_order = OrderId::from_str("20000000-0000-0000-0000-000000000017")?;
+    ledger.reserve(
+        replacement_order,
+        account_id,
+        replacement_terms,
+        OrderSide::Buy,
+        QuantityLots::new(1)?,
+        PriceTicks::new(1),
+    )?;
+    ledger.release(replacement_order)?;
 
     let buy_id = OrderId::from_str("20000000-0000-0000-0000-000000000015")?;
     ledger.reserve(

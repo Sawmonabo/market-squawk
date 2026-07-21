@@ -200,9 +200,13 @@ struct AccountState {
     eligible: bool,
     currency: Currency,
     cash: Money,
+    settled_capital: Money,
     capital: Money,
     peak_capital: Money,
     gross_exposure: Money,
+    unrealized_pnl: Money,
+    drawdown: Money,
+    mark_digest: [u8; 32],
     realized_pnl: Money,
     realized_loss: Money,
     positions: HashMap<InstrumentId, i64>,
@@ -244,13 +248,21 @@ impl AccountState {
         rate_events
             .try_reserve_exact(config.max_rate_events_per_account.get())
             .map_err(|_| AccountCoordinatorError::Allocation)?;
+        let drawdown = bootstrap
+            .peak_capital
+            .checked_sub(bootstrap.capital)
+            .map_err(|_| AccountCoordinatorError::InvalidBootstrap)?;
         Ok(Self {
             eligible: bootstrap.eligible,
             currency: bootstrap.cash.currency(),
             cash: bootstrap.cash,
+            settled_capital: bootstrap.capital,
             capital: bootstrap.capital,
             peak_capital: bootstrap.peak_capital,
             gross_exposure: bootstrap.gross_exposure,
+            unrealized_pnl: Money::new(Decimal::ZERO, bootstrap.cash.currency()),
+            drawdown,
+            mark_digest: [0; 32],
             realized_pnl: bootstrap.realized_pnl,
             realized_loss: bootstrap.realized_loss,
             positions,
@@ -534,15 +546,27 @@ impl AccountState {
         if self.capital.amount() < limits.minimum_capital().amount() {
             reasons.push(AccountRiskViolation::CapitalLimit);
         }
-        if self.realized_loss.amount() > limits.maximum_loss().amount() {
-            reasons.push(AccountRiskViolation::LossLimit);
-        }
-        match self.peak_capital.checked_sub(self.capital) {
-            Ok(drawdown) if drawdown.amount() > limits.maximum_drawdown().amount() => {
-                reasons.push(AccountRiskViolation::DrawdownLimit);
+        let unrealized_loss_amount = if self.unrealized_pnl.amount().is_sign_negative() {
+            match Decimal::ZERO.checked_sub(self.unrealized_pnl.amount()) {
+                Some(value) => value,
+                None => {
+                    reasons.push(AccountRiskViolation::ArithmeticOverflow);
+                    Decimal::ZERO
+                }
+            }
+        } else {
+            Decimal::ZERO
+        };
+        let unrealized_loss = Money::new(unrealized_loss_amount, self.currency);
+        match self.realized_loss.checked_add(unrealized_loss) {
+            Ok(loss) if loss.amount() > limits.maximum_loss().amount() => {
+                reasons.push(AccountRiskViolation::LossLimit);
             }
             Ok(_) => {}
             Err(_) => reasons.push(AccountRiskViolation::ArithmeticOverflow),
+        }
+        if self.drawdown.amount() > limits.maximum_drawdown().amount() {
+            reasons.push(AccountRiskViolation::DrawdownLimit);
         }
     }
 

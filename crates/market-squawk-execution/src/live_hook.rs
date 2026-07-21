@@ -9,8 +9,9 @@ use market_squawk_live::{
 use thiserror::Error;
 
 use crate::{
-    ExecutionDispatcherHandle, ExecutionMarketReference, ExecutionMarketSink,
-    ExecutionMarketUpdate, RiskOutcome, RiskService, Strategy, StrategyContext,
+    ExecutionDispatcherConfig, ExecutionDispatcherError, ExecutionDispatcherHandle,
+    ExecutionMarketReference, ExecutionMarketSink, ExecutionMarketUpdate, RiskLimits, RiskOutcome,
+    RiskService, RiskServiceError, Strategy, StrategyContext,
 };
 
 /// Route-owned execution graph invoked synchronously at the committed actor point.
@@ -25,6 +26,24 @@ pub struct ExecutionLiveActionHook {
 }
 
 impl ExecutionLiveActionHook {
+    /// Returns the exact route-hook graph charge before worker ownership transfer.
+    ///
+    /// Runtime construction and [`LiveActionHook::retained_bytes`] use the same checked summation,
+    /// so a strategy declaration that drifts after composition fails closed.
+    pub fn retained_bytes_for_composition(
+        strategy: &dyn Strategy,
+        risk_limits: &RiskLimits,
+        dispatcher: ExecutionDispatcherConfig,
+        market_sink_retained_bytes: usize,
+    ) -> Result<usize, ExecutionLiveActionHookError> {
+        checked_hook_retained_bytes(
+            strategy.retained_bytes()?,
+            RiskService::retained_bytes_for_limits(risk_limits)?,
+            dispatcher.handle_retained_bytes()?,
+            market_sink_retained_bytes,
+        )
+    }
+
     /// Validates one bounded route graph and fixes its exact per-observation authority ceiling.
     pub fn try_new(
         strategy: Box<dyn Strategy>,
@@ -129,11 +148,27 @@ fn hook_retained_bytes(
     dispatcher: &ExecutionDispatcherHandle,
     market_sink: &dyn ExecutionMarketSink,
 ) -> Result<usize, ExecutionLiveActionHookError> {
+    checked_hook_retained_bytes(
+        strategy.retained_bytes()?,
+        risk.retained_bytes(),
+        dispatcher.retained_bytes(),
+        market_sink
+            .retained_bytes()
+            .map_err(|_| ExecutionLiveActionHookError::RetainedSize)?,
+    )
+}
+
+fn checked_hook_retained_bytes(
+    strategy_retained_bytes: usize,
+    risk_retained_bytes: usize,
+    dispatcher_retained_bytes: usize,
+    market_sink_retained_bytes: usize,
+) -> Result<usize, ExecutionLiveActionHookError> {
     std::mem::size_of::<ExecutionLiveActionHook>()
-        .checked_add(strategy.retained_bytes()?)
-        .and_then(|value| value.checked_add(risk.retained_bytes()))
-        .and_then(|value| value.checked_add(dispatcher.retained_bytes()))
-        .and_then(|value| value.checked_add(market_sink.retained_bytes().ok()?))
+        .checked_add(strategy_retained_bytes)
+        .and_then(|value| value.checked_add(risk_retained_bytes))
+        .and_then(|value| value.checked_add(dispatcher_retained_bytes))
+        .and_then(|value| value.checked_add(market_sink_retained_bytes))
         .ok_or(ExecutionLiveActionHookError::RetainedSize)
 }
 
@@ -142,6 +177,10 @@ fn hook_retained_bytes(
 pub enum ExecutionLiveActionHookError {
     #[error(transparent)]
     Strategy(#[from] crate::StrategyError),
+    #[error(transparent)]
+    Dispatcher(#[from] ExecutionDispatcherError),
+    #[error(transparent)]
+    Risk(#[from] RiskServiceError),
     #[error("execution action-hook retained-size accounting failed")]
     RetainedSize,
 }

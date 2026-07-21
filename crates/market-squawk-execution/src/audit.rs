@@ -49,6 +49,7 @@ pub enum ExecutionAuditReason {
     Risk(RiskRejectionCode),
     QueueCountSaturated,
     QueueBytesSaturated,
+    TaskOwnershipSaturated,
     DuplicateApproval,
     RegistryCapacity,
     RegistryUnavailable,

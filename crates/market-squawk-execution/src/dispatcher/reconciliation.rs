@@ -203,7 +203,7 @@ pub(super) fn reconciliation_digest(
     invoked_at: Timestamp,
 ) -> [u8; 32] {
     let mut digest = Sha256::new();
-    digest.update(b"market-squawk/dispatcher-account-reconciliation/v2\0");
+    digest.update(b"market-squawk/dispatcher-account-reconciliation/v3\0");
     digest.update(invoked_at.unix_nanos().to_be_bytes());
     if let Some(source) = state.source_binding() {
         digest.update([1]);
@@ -256,9 +256,13 @@ pub(super) fn reconciliation_digest(
         digest.update(account.revision().get().to_be_bytes());
         digest.update([u8::from(account.eligible())]);
         digest_money(&mut digest, account.cash());
-        digest_money(&mut digest, account.capital());
-        digest_money(&mut digest, account.peak_capital());
-        digest_money(&mut digest, account.gross_exposure());
+        digest_money(&mut digest, account.settled_capital());
+        digest_money(&mut digest, account.marked_equity());
+        digest_money(&mut digest, account.peak_marked_equity());
+        digest_money(&mut digest, account.marked_gross_exposure());
+        digest_money(&mut digest, account.unrealized_pnl());
+        digest_money(&mut digest, account.drawdown());
+        digest.update(account.mark_digest());
         digest_money(&mut digest, account.realized_pnl());
         digest_money(&mut digest, account.realized_loss());
         digest.update((account.positions().len() as u64).to_be_bytes());

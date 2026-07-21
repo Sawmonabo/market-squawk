@@ -6,7 +6,7 @@ use market_squawk_domain::{AccountId, Currency, InstrumentId, Money};
 use thiserror::Error;
 
 /// Current complete account-replacement schema.
-pub const ACCOUNT_REPLACEMENT_SCHEMA_VERSION: u32 = 2;
+pub const ACCOUNT_REPLACEMENT_SCHEMA_VERSION: u32 = 3;
 
 /// Maximum account images returned by one bounded reconciliation call.
 pub const MAX_RECONCILED_ACCOUNTS: usize = 256;
@@ -67,9 +67,13 @@ pub struct ReconciledAccountState {
     eligible: bool,
     currency: Currency,
     cash: Money,
-    capital: Money,
-    peak_capital: Money,
-    gross_exposure: Money,
+    settled_capital: Money,
+    marked_equity: Money,
+    peak_marked_equity: Money,
+    marked_gross_exposure: Money,
+    unrealized_pnl: Money,
+    drawdown: Money,
+    mark_digest: [u8; 32],
     realized_pnl: Money,
     realized_loss: Money,
     positions: Box<[(InstrumentId, i64)]>,
@@ -88,9 +92,13 @@ impl ReconciledAccountState {
         eligible: bool,
         currency: Currency,
         cash: Money,
-        capital: Money,
-        peak_capital: Money,
-        gross_exposure: Money,
+        settled_capital: Money,
+        marked_equity: Money,
+        peak_marked_equity: Money,
+        marked_gross_exposure: Money,
+        unrealized_pnl: Money,
+        drawdown: Money,
+        mark_digest: [u8; 32],
         realized_pnl: Money,
         realized_loss: Money,
         mut positions: Vec<(InstrumentId, i64)>,
@@ -101,13 +109,30 @@ impl ReconciledAccountState {
         {
             return Err(ReconciledAccountStateError::TooManyPositions);
         }
-        let money = [cash, capital, peak_capital, gross_exposure, realized_loss];
-        if money
+        let nonnegative_money = [
+            cash,
+            settled_capital,
+            peak_marked_equity,
+            marked_gross_exposure,
+            drawdown,
+            realized_loss,
+        ];
+        let signed_money = [marked_equity, unrealized_pnl, realized_pnl];
+        let expected_equity = settled_capital
+            .checked_add(unrealized_pnl)
+            .map_err(|_| ReconciledAccountStateError::InvalidFinancialState)?;
+        let expected_drawdown = peak_marked_equity
+            .checked_sub(marked_equity)
+            .map_err(|_| ReconciledAccountStateError::InvalidFinancialState)?;
+        if nonnegative_money
             .iter()
             .any(|value| value.currency() != currency || value.amount().is_sign_negative())
-            || realized_pnl.currency() != currency
-            || capital.amount().is_zero()
-            || peak_capital.amount() < capital.amount()
+            || signed_money
+                .iter()
+                .any(|value| value.currency() != currency)
+            || expected_equity != marked_equity
+            || expected_drawdown != drawdown
+            || (eligible && marked_equity.amount() <= rust_decimal::Decimal::ZERO)
         {
             return Err(ReconciledAccountStateError::InvalidFinancialState);
         }
@@ -132,15 +157,22 @@ impl ReconciledAccountState {
         {
             return Err(ReconciledAccountStateError::InvalidPositionCostBasis);
         }
+        if !positions.is_empty() && mark_digest == [0; 32] {
+            return Err(ReconciledAccountStateError::InvalidDigest);
+        }
         Ok(Self {
             account_id,
             revision,
             eligible,
             currency,
             cash,
-            capital,
-            peak_capital,
-            gross_exposure,
+            settled_capital,
+            marked_equity,
+            peak_marked_equity,
+            marked_gross_exposure,
+            unrealized_pnl,
+            drawdown,
+            mark_digest,
             realized_pnl,
             realized_loss,
             positions: positions.into_boxed_slice(),
@@ -163,14 +195,45 @@ impl ReconciledAccountState {
     pub const fn cash(&self) -> Money {
         self.cash
     }
+    /// Returns capital after settled fills and fees, before current unrealized P&L.
+    pub const fn settled_capital(&self) -> Money {
+        self.settled_capital
+    }
+    /// Returns current executable-exit marked equity.
+    pub const fn marked_equity(&self) -> Money {
+        self.marked_equity
+    }
+    /// Compatibility alias for current executable-exit marked equity.
     pub const fn capital(&self) -> Money {
-        self.capital
+        self.marked_equity
     }
+    /// Returns the high-water mark of executable-exit equity.
+    pub const fn peak_marked_equity(&self) -> Money {
+        self.peak_marked_equity
+    }
+    /// Compatibility alias for the high-water mark of marked equity.
     pub const fn peak_capital(&self) -> Money {
-        self.peak_capital
+        self.peak_marked_equity
     }
+    /// Returns current gross exposure at executable exit prices.
+    pub const fn marked_gross_exposure(&self) -> Money {
+        self.marked_gross_exposure
+    }
+    /// Compatibility alias for executable-exit gross exposure.
     pub const fn gross_exposure(&self) -> Money {
-        self.gross_exposure
+        self.marked_gross_exposure
+    }
+    /// Returns signed unrealized P&L at executable exit prices.
+    pub const fn unrealized_pnl(&self) -> Money {
+        self.unrealized_pnl
+    }
+    /// Returns exact current high-water drawdown.
+    pub const fn drawdown(&self) -> Money {
+        self.drawdown
+    }
+    /// Returns the aggregate digest binding every mark used for this account image.
+    pub const fn mark_digest(&self) -> [u8; 32] {
+        self.mark_digest
     }
     pub const fn realized_pnl(&self) -> Money {
         self.realized_pnl

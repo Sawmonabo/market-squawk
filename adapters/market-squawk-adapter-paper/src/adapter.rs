@@ -1,6 +1,5 @@
 //! Bounded public adapter, market ingress, audit, and owned worker lifecycle.
 
-use std::mem::size_of;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -9,21 +8,19 @@ use market_squawk_domain::Timestamp;
 use market_squawk_execution::{
     CancelOrder, CancelReceipt, DispatchOrder, ExecutionAdapter, ExecutionAdapterError,
     ExecutionAdapterFuture, ExecutionMarketSink, ExecutionMarketSinkError, ExecutionMarketUpdate,
-    ExecutionReceipt, ExecutionState, MAX_RECONCILED_ORDERS, PersistenceAcknowledgement,
-    ReconcileOrders, ReconciliationAcknowledgement,
+    ExecutionReceipt, ExecutionState, ExecutionTask, ExecutionTaskReaper, ExecutionTaskReaperError,
+    MAX_RECONCILED_ORDERS, PersistenceAcknowledgement, ReconcileOrders,
+    ReconciliationAcknowledgement,
 };
 use thiserror::Error;
-use tokio::runtime::Handle;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::PaperCheckpointRepository;
 use crate::audit::{PaperAuditKind, PaperAuditReader, PaperAuditRecord};
-use crate::snapshot::{
-    PaperCheckpointPersistenceEvidence, PaperExecutionCheckpoint, PaperExecutionSnapshot,
-};
-use crate::worker::{PaperWorker, WorkerCommand, WorkerEnvelope, WorkerEvent, WorkerMarketUpdate};
-use crate::{PaperAccountBootstrap, PaperExecutionConfig, PaperLedger};
+use crate::snapshot::{PaperExecutionCheckpoint, PaperExecutionSnapshot};
+use crate::worker::{PaperWorker, WorkerCommand, WorkerEnvelope, WorkerEvent};
+use crate::{PaperAccountBootstrap, PaperCheckpointReceipt, PaperExecutionConfig, PaperLedger};
 
 /// Caller-owned absolute deadline and cooperative cancellation for paper control operations.
 #[derive(Debug)]
@@ -118,12 +115,12 @@ impl PaperExecutionAdapter {
     pub async fn acknowledge_persistence(
         &self,
         authority: PersistenceAcknowledgement,
-        evidence: PaperCheckpointPersistenceEvidence,
+        receipt: PaperCheckpointReceipt,
     ) -> Result<(), PaperControlError> {
         let (reply, response) = oneshot::channel();
         self.try_send_command(WorkerCommand::AcknowledgePersistence {
             authority,
-            evidence,
+            receipt,
             reply,
         })
         .map_err(PaperControlError::Adapter)?;
@@ -219,86 +216,78 @@ impl PaperExecutionAdapter {
 }
 
 impl ExecutionAdapter for PaperExecutionAdapter {
+    fn is_cooperative(&self) -> bool {
+        true
+    }
+
     fn submit(
         &self,
         order: DispatchOrder,
     ) -> ExecutionAdapterFuture<'_, Result<ExecutionReceipt, ExecutionAdapterError>> {
-        let (reply, response) = oneshot::channel();
-        match self.try_send_command(WorkerCommand::Submit { order, reply }) {
-            Ok(()) => Box::pin(async move {
-                response
+        Box::pin(async move {
+            let (reply, response) = oneshot::channel();
+            match self.try_send_command(WorkerCommand::Submit { order, reply }) {
+                Ok(()) => response
                     .await
-                    .unwrap_or(Err(ExecutionAdapterError::ReconciliationRequired))
-            }),
-            Err(error) => Box::pin(async move { Err(error) }),
-        }
+                    .unwrap_or(Err(ExecutionAdapterError::ReconciliationRequired)),
+                Err(error) => Err(error),
+            }
+        })
     }
 
     fn cancel(
         &self,
         order: CancelOrder,
     ) -> ExecutionAdapterFuture<'_, Result<CancelReceipt, ExecutionAdapterError>> {
-        let requested_at = match system_timestamp() {
-            Ok(timestamp) => timestamp,
-            Err(error) => return Box::pin(async move { Err(error) }),
-        };
-        let (reply, response) = oneshot::channel();
-        match self.try_send_command(WorkerCommand::Cancel {
-            order,
-            requested_at,
-            reply,
-        }) {
-            Ok(()) => Box::pin(async move {
-                response
-                    .await
-                    .unwrap_or(Err(ExecutionAdapterError::ReconciliationRequired))
-            }),
-            Err(error) => Box::pin(async move { Err(error) }),
-        }
+        Box::pin(async move {
+            let requested_at = system_timestamp()?;
+            let (reply, response) = oneshot::channel();
+            self.try_send_command(WorkerCommand::Cancel {
+                order,
+                requested_at,
+                reply,
+            })?;
+            response
+                .await
+                .unwrap_or(Err(ExecutionAdapterError::ReconciliationRequired))
+        })
     }
 
     fn reconcile(
         &self,
         request: ReconcileOrders,
     ) -> ExecutionAdapterFuture<'_, Result<ExecutionState, ExecutionAdapterError>> {
-        if request.order_ids().len() > MAX_RECONCILED_ORDERS {
-            return Box::pin(async { Err(ExecutionAdapterError::KnownFailure) });
-        }
-        let requested_at = match system_timestamp() {
-            Ok(timestamp) => timestamp,
-            Err(error) => return Box::pin(async move { Err(error) }),
-        };
-        let (reply, response) = oneshot::channel();
-        match self.try_send_command(WorkerCommand::Reconcile {
-            requested_at,
-            request,
-            reply,
-        }) {
-            Ok(()) => Box::pin(async move {
-                response
-                    .await
-                    .unwrap_or(Err(ExecutionAdapterError::ReconciliationRequired))
-            }),
-            Err(error) => Box::pin(async move { Err(error) }),
-        }
+        Box::pin(async move {
+            if request.order_ids().len() > MAX_RECONCILED_ORDERS {
+                return Err(ExecutionAdapterError::KnownFailure);
+            }
+            let requested_at = system_timestamp()?;
+            let (reply, response) = oneshot::channel();
+            self.try_send_command(WorkerCommand::Reconcile {
+                requested_at,
+                request,
+                reply,
+            })?;
+            response
+                .await
+                .unwrap_or(Err(ExecutionAdapterError::ReconciliationRequired))
+        })
     }
 
     fn acknowledge_reconciliation(
         &self,
         acknowledgement: ReconciliationAcknowledgement,
     ) -> ExecutionAdapterFuture<'_, Result<(), ExecutionAdapterError>> {
-        let (reply, response) = oneshot::channel();
-        match self.try_send_command(WorkerCommand::AcknowledgeReconciliation {
-            acknowledgement,
-            reply,
-        }) {
-            Ok(()) => Box::pin(async move {
-                response
-                    .await
-                    .unwrap_or(Err(ExecutionAdapterError::ReconciliationRequired))
-            }),
-            Err(error) => Box::pin(async move { Err(error) }),
-        }
+        Box::pin(async move {
+            let (reply, response) = oneshot::channel();
+            self.try_send_command(WorkerCommand::AcknowledgeReconciliation {
+                acknowledgement,
+                reply,
+            })?;
+            response
+                .await
+                .unwrap_or(Err(ExecutionAdapterError::ReconciliationRequired))
+        })
     }
 }
 
@@ -350,7 +339,7 @@ pub struct PaperExecutionRuntime {
     market_ingress: Arc<PaperMarketIngress>,
     audit_reader: Option<PaperAuditReader>,
     cancellation: CancellationToken,
-    worker: Option<JoinHandle<()>>,
+    worker: Option<ExecutionTask<()>>,
     abort_join_deadline: Duration,
 }
 
@@ -359,16 +348,32 @@ impl PaperExecutionRuntime {
     pub fn try_start(
         config: PaperExecutionConfig,
         accounts: impl IntoIterator<Item = PaperAccountBootstrap>,
+        checkpoint_repository: &PaperCheckpointRepository,
+        task_reaper: ExecutionTaskReaper,
     ) -> Result<Self, PaperStartError> {
+        if !checkpoint_repository.binds_config(&config) {
+            return Err(PaperStartError::CheckpointRepositoryMismatch);
+        }
         let ledger = PaperLedger::try_new(config.ledger_config(), accounts)?;
-        Self::start_with_state(config, ledger, None)
+        Self::start_with_state(
+            config,
+            ledger,
+            None,
+            checkpoint_repository.binding_identity(),
+            task_reaper,
+        )
     }
 
     /// Restores only a complete, same-schema, same-configuration opaque checkpoint.
     pub fn try_start_from_checkpoint(
         config: PaperExecutionConfig,
         checkpoint: PaperExecutionCheckpoint,
+        checkpoint_repository: &PaperCheckpointRepository,
+        task_reaper: ExecutionTaskReaper,
     ) -> Result<Self, PaperStartError> {
+        if !checkpoint_repository.binds_config(&config) {
+            return Err(PaperStartError::CheckpointRepositoryMismatch);
+        }
         if checkpoint.schema_version != PaperExecutionConfig::CHECKPOINT_SCHEMA_VERSION
             || checkpoint.configuration_digest != config.digest()
             || !checkpoint.complete
@@ -394,15 +399,22 @@ impl PaperExecutionRuntime {
             return Err(PaperStartError::InvalidCheckpoint);
         }
         let ledger = checkpoint.ledger.clone();
-        Self::start_with_state(config, ledger, Some(checkpoint))
+        Self::start_with_state(
+            config,
+            ledger,
+            Some(checkpoint),
+            checkpoint_repository.binding_identity(),
+            task_reaper,
+        )
     }
 
     fn start_with_state(
         config: PaperExecutionConfig,
         ledger: PaperLedger,
         mut checkpoint: Option<PaperExecutionCheckpoint>,
+        repository_id: [u8; 32],
+        task_reaper: ExecutionTaskReaper,
     ) -> Result<Self, PaperStartError> {
-        let handle = Handle::try_current().map_err(|_| PaperStartError::NoRuntime)?;
         let input = config.input().clone();
         let abort_join_deadline = input.abort_join_deadline;
         let command_capacity = input.command_capacity.get();
@@ -411,11 +423,18 @@ impl PaperExecutionRuntime {
         if command_bytes > Semaphore::MAX_PERMITS {
             return Err(PaperStartError::CapacityOverflow);
         }
-        let market_capacity = byte_limited_capacity(
-            input.market_capacity.get(),
-            input.market_maximum_bytes.get() as usize,
-            size_of::<WorkerMarketUpdate>(),
-        )?;
+        let market_capacity = config
+            .market_event_capacity()
+            .map_err(|error| match error {
+                crate::PaperConfigError::InvalidValue => PaperStartError::InvalidCapacity,
+                crate::PaperConfigError::CapacityOverflow => PaperStartError::CapacityOverflow,
+            })?;
+        let market_bytes = config
+            .market_ingress_retained_bytes()
+            .map_err(|error| match error {
+                crate::PaperConfigError::InvalidValue => PaperStartError::InvalidCapacity,
+                crate::PaperConfigError::CapacityOverflow => PaperStartError::CapacityOverflow,
+            })?;
         let audit_capacity = byte_limited_capacity(
             input.audit_capacity.get(),
             input.audit_maximum_bytes.get() as usize,
@@ -445,6 +464,7 @@ impl PaperExecutionRuntime {
         let cancellation = CancellationToken::new();
         let worker = PaperWorker::new(
             config,
+            repository_id,
             ledger,
             checkpoint,
             event_rx,
@@ -452,10 +472,10 @@ impl PaperExecutionRuntime {
             Arc::clone(&audit_failed),
             cancellation.clone(),
         );
-        let join = handle.spawn(worker.run());
-        let market_bytes = market_capacity
-            .checked_mul(size_of::<WorkerMarketUpdate>())
-            .ok_or(PaperStartError::CapacityOverflow)?;
+        let join = task_reaper
+            .try_reserve()
+            .and_then(|permit| permit.spawn(worker.run()))
+            .map_err(PaperStartError::TaskOwnership)?;
         Ok(Self {
             adapter: Arc::new(PaperExecutionAdapter {
                 events: event_tx.clone(),
@@ -516,12 +536,11 @@ impl PaperExecutionRuntime {
         };
         match snapshot {
             Ok(snapshot) => {
-                match tokio::time::timeout(self.abort_join_deadline, &mut worker).await {
+                match tokio::time::timeout(self.abort_join_deadline, worker.join()).await {
                     Ok(Ok(())) => Ok(snapshot),
                     Ok(Err(_)) => Err(PaperControlError::WorkerFailed),
                     Err(_) => {
-                        worker.abort();
-                        let _ = tokio::time::timeout(self.abort_join_deadline, &mut worker).await;
+                        worker.transfer();
                         Err(PaperControlError::ShutdownIncomplete)
                     }
                 }
@@ -529,9 +548,12 @@ impl PaperExecutionRuntime {
             Err(error) => {
                 self.cancellation.cancel();
                 worker.abort();
-                match tokio::time::timeout(self.abort_join_deadline, &mut worker).await {
+                match tokio::time::timeout(self.abort_join_deadline, worker.join()).await {
                     Ok(_) => Err(error),
-                    Err(_) => Err(PaperControlError::ShutdownIncomplete),
+                    Err(_) => {
+                        worker.transfer();
+                        Err(PaperControlError::ShutdownIncomplete)
+                    }
                 }
             }
         }
@@ -591,7 +613,7 @@ impl Drop for PaperExecutionRuntime {
     fn drop(&mut self) {
         self.cancellation.cancel();
         if let Some(worker) = self.worker.take() {
-            worker.abort();
+            worker.transfer();
         }
     }
 }
@@ -772,10 +794,14 @@ pub enum PaperStartError {
     CapacityOverflow,
     #[error("paper recovery checkpoint is incomplete or incompatible")]
     InvalidCheckpoint,
+    #[error("paper checkpoint repository configuration does not match the execution runtime")]
+    CheckpointRepositoryMismatch,
     #[error("paper recovery audit capacity cannot admit mandatory startup evidence")]
     RecoveryAuditUnavailable,
     #[error("paper recovery could not obtain a valid wall-clock timestamp")]
     Clock,
+    #[error(transparent)]
+    TaskOwnership(#[from] ExecutionTaskReaperError),
     #[error(transparent)]
     Ledger(#[from] crate::PaperLedgerError),
 }

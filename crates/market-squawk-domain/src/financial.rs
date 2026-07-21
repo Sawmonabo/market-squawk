@@ -7,7 +7,7 @@ mod exact_decimal;
 
 use exact_decimal::{
     RatioError, RoundMode, exact_add, exact_product, exact_ratio_to_i64, exact_subtract,
-    rounded_ratio_to_i64,
+    rounded_ratio_to_i64, rounded_weighted_basis_points,
 };
 
 /// A general financial-value invariant failure.
@@ -611,6 +611,64 @@ impl Money {
         exact_subtract(self.amount, other.amount)
             .map(|amount| Self::new(amount, self.currency))
             .map_err(|()| FinancialError::Overflow)
+    }
+
+    /// Multiplies by an exact decimal scalar without permitting representational rounding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FinancialError::Overflow`] if the exact product cannot be represented.
+    pub fn checked_mul_decimal(self, multiplier: Decimal) -> Result<Self, FinancialError> {
+        exact_product([self.amount, multiplier])
+            .map(|amount| Self::new(amount, self.currency))
+            .map_err(|()| FinancialError::Overflow)
+    }
+
+    /// Applies a nonnegative basis-point rate to this amount with explicit final rounding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FinancialError::Overflow`] for a negative rate, unsupported scale, or an
+    /// unrepresentable rounded result.
+    pub fn checked_basis_points(
+        self,
+        basis_points: BasisPoints,
+        scale: u32,
+        policy: RoundingPolicy,
+    ) -> Result<Self, FinancialError> {
+        let basis_points =
+            u32::try_from(basis_points.get()).map_err(|_| FinancialError::Overflow)?;
+        self.checked_weighted_basis_points(
+            basis_points,
+            Self::new(Decimal::ZERO, self.currency),
+            0,
+            scale,
+            policy,
+        )
+    }
+
+    /// Adds two nonnegative basis-point-weighted amounts before one explicit final rounding.
+    ///
+    /// # Errors
+    ///
+    /// Rejects mixed currencies, negative rates, unsupported scales, and unrepresentable results.
+    pub fn checked_weighted_basis_points(
+        self,
+        self_basis_points: u32,
+        other: Self,
+        other_basis_points: u32,
+        scale: u32,
+        policy: RoundingPolicy,
+    ) -> Result<Self, FinancialError> {
+        self.ensure_same_currency(other)?;
+        rounded_weighted_basis_points(
+            (self.amount, self_basis_points),
+            (other.amount, other_basis_points),
+            scale,
+            policy.mode(),
+        )
+        .map(|amount| Self::new(amount, self.currency))
+        .map_err(|()| FinancialError::Overflow)
     }
 
     fn ensure_same_currency(self, other: Self) -> Result<(), FinancialError> {

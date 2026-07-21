@@ -6,6 +6,7 @@ use market_squawk_domain::{OrderId, Timestamp};
 
 use super::LifecycleOutcomeFailSafe;
 use crate::clock::system_now;
+use crate::dispatcher::attempt::attempt_adapter_call;
 use crate::dispatcher::{
     DispatchRecord, DispatchState, ExecutionDispatchError, ExecutionDispatcher, adapter_reason,
     commit_dispatch_audit, try_registry,
@@ -18,6 +19,7 @@ use crate::{
 impl ExecutionDispatcher {
     /// Cancels a tracked accepted order without exposing the adapter.
     pub async fn cancel(&self, order_id: OrderId) -> Result<CancelReceipt, ExecutionDispatchError> {
+        let task_permit = self.try_reserve_adapter_task()?;
         let audit = self
             .audit
             .try_reserve()
@@ -66,22 +68,24 @@ impl ExecutionDispatcher {
             super::super::operation(self.operation_deadline, self.cancellation.child_token())?;
         let deadline = operation.deadline();
         let cancellation = operation.cancellation();
-        let result = match tokio::time::timeout_at(
-            deadline,
-            self.adapter.cancel(CancelOrder::new(order_id, operation)),
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => {
-                cancellation.cancel();
-                fail_safe.fail_uncertain(
-                    invoked.wall,
-                    &[ExecutionAuditReason::OperationDeadlineExceeded],
-                );
-                return Err(ExecutionDispatchError::OperationDeadlineExceeded);
-            }
-        };
+        let (result, deadline_exceeded) =
+            attempt_adapter_call(
+                &self.adapter,
+                deadline,
+                &cancellation,
+                task_permit,
+                move |adapter| async move {
+                    adapter.cancel(CancelOrder::new(order_id, operation)).await
+                },
+            )
+            .await;
+        if deadline_exceeded {
+            fail_safe.fail_uncertain(
+                invoked.wall,
+                &[ExecutionAuditReason::OperationDeadlineExceeded],
+            );
+            return Err(ExecutionDispatchError::OperationDeadlineExceeded);
+        }
         let post_call = match system_now() {
             Ok(post_call)
                 if post_call.wall >= invoked.wall && post_call.monotonic >= invoked.monotonic =>

@@ -11,6 +11,7 @@ mod limits;
 mod live_hook;
 mod risk;
 mod strategy;
+mod task_reaper;
 
 pub use account::{
     AccountBootstrap, AccountCoordinatorConfig, AccountCoordinatorError,
@@ -55,4 +56,8 @@ pub use risk::{
 pub use strategy::{
     BoundedOrderIntentIterator, BoundedOrderIntents, MAX_STRATEGY_ORDER_INTENTS, Strategy,
     StrategyContext, StrategyError,
+};
+pub use task_reaper::{
+    ExecutionTask, ExecutionTaskDrain, ExecutionTaskPermit, ExecutionTaskReaper,
+    ExecutionTaskReaperError,
 };

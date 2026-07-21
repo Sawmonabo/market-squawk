@@ -13,10 +13,10 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use market_squawk_domain::{
-    AccountId, AggressorSide, ApprovalId, BasisPoints, ClientOrderId, InstrumentExecutionTerms,
-    LiveEventClass, LiveEvidenceBinding, MarketEvent, ModelId, Money, OrderId, OrderReasonCode,
-    OrderSide, OrderType, PriceTicks, QualificationAssessmentId, QuantityLots, StrategyId,
-    TimeInForce, Timestamp,
+    AccountId, AggressorSide, ApprovalId, BasisPoints, ClientOrderId, ConnectionGeneration,
+    InstrumentExecutionTerms, LiveEventClass, LiveEvidenceBinding, MarketEvent, ModelId, Money,
+    OrderId, OrderReasonCode, OrderSide, OrderType, PriceTicks, QualificationAssessmentId,
+    QuantityLots, StrategyId, TimeInForce, Timestamp,
 };
 use market_squawk_live::{CommittedActionContext, ConsumedLiveEvidence};
 use sha2::{Digest, Sha256};
@@ -501,6 +501,8 @@ impl PersistenceAcknowledgement {
 pub struct ExecutionMarketUpdate {
     market: ExecutionMarketReference,
     assessment_digest: [u8; 32],
+    venue_digest: [u8; 32],
+    connection_generation: ConnectionGeneration,
     event_class: LiveEventClass,
     trade_price: Option<PriceTicks>,
     trade_quantity: Option<QuantityLots>,
@@ -521,6 +523,19 @@ impl ExecutionMarketUpdate {
                 .as_str()
                 .as_bytes(),
         );
+        let binding = match context.event() {
+            MarketEvent::Trade(event) => event.provenance().binding(),
+            MarketEvent::Quote(event) => event.provenance().binding(),
+            MarketEvent::BookSnapshot(event) => event.provenance().binding(),
+            MarketEvent::BookDelta(event) => event.provenance().binding(),
+            MarketEvent::Auction(event) => event.provenance().binding(),
+            MarketEvent::TradingHalt(event) => event.provenance().binding(),
+            MarketEvent::InstrumentStatus(event) => event.provenance().binding(),
+            MarketEvent::CorporateAction(event) => event.provenance().binding(),
+        };
+        let mut venue = Sha256::new();
+        venue.update(b"market-squawk/execution-market-venue/v1\0");
+        venue.update(binding.venue_id().as_str().as_bytes());
         let (event_class, trade_price, trade_quantity, aggressor_side) = match context.event() {
             MarketEvent::Trade(trade) => (
                 LiveEventClass::Trade,
@@ -541,6 +556,8 @@ impl ExecutionMarketUpdate {
         Self {
             market,
             assessment_digest: assessment.finalize().into(),
+            venue_digest: venue.finalize().into(),
+            connection_generation: binding.connection_generation(),
             event_class,
             trade_price,
             trade_quantity,
@@ -556,6 +573,16 @@ impl ExecutionMarketUpdate {
     /// Returns a fixed digest of the retained qualification assessment identity.
     pub const fn assessment_digest(self) -> [u8; 32] {
         self.assessment_digest
+    }
+
+    /// Returns the fixed digest of the exact venue identity bound to the live assessment.
+    pub const fn venue_digest(self) -> [u8; 32] {
+        self.venue_digest
+    }
+
+    /// Returns the exact source connection generation bound to the live assessment.
+    pub const fn connection_generation(self) -> ConnectionGeneration {
+        self.connection_generation
     }
 
     /// Returns the canonical event class that produced the update.
@@ -604,6 +631,15 @@ pub enum ExecutionMarketSinkError {
 
 /// Replaceable backend contract reachable only with a dispatcher-created order.
 pub trait ExecutionAdapter: Send + Sync + std::fmt::Debug + 'static {
+    /// Returns whether every attempt is cooperatively bounded by [`ExecutionOperation`].
+    ///
+    /// The default is fail-closed isolation in a reaper-owned task. An adapter may return `true`
+    /// only when it performs no mutation after operation cancellation or deadline expiry and does
+    /// not detach transport work from the returned future.
+    fn is_cooperative(&self) -> bool {
+        false
+    }
+
     /// Submits one non-replayable dispatcher command.
     ///
     /// [`ExecutionAdapterError::Rejected`] is an authoritative known rejection.
