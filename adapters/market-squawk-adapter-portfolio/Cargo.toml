@@ -1,0 +1,29 @@
+[package]
+name = "market-squawk-adapter-portfolio"
+description = "Raw-preserving local portfolio import and reconciliation adapter"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+license.workspace = true
+repository = "https://github.com/Sawmonabo/market-squawk"
+publish = false
+
+[dependencies]
+bytes.workspace = true
+market-squawk-domain.workspace = true
+market-squawk-platform.workspace = true
+market-squawk-sources.workspace = true
+rust_decimal.workspace = true
+serde.workspace = true
+serde_json = { workspace = true, features = ["arbitrary_precision"] }
+sha2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+market-squawk-data.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+tokio-util.workspace = true
+
+[lints]
+workspace = true
