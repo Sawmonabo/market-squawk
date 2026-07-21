@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, ffi::OsString, sync::Arc};
 
-use market_squawk::{DiagnosticEngine, mcp::LocalMcpComposition};
+use market_squawk::{AppPaths, DiagnosticEngine, mcp::LocalMcpComposition};
 use market_squawk_platform::{AppConfig, ConfigOverrides, ConfigSources};
 use parking_lot::RwLock;
 use serde_json::{Value, json};
@@ -22,14 +22,12 @@ async fn shipping_mcp_constructor_uses_the_bounded_sdk_durable_audit_and_control
             ..ConfigOverrides::default()
         },
     ))?;
-    let journal_path = temporary
-        .path()
-        .join("journal")
-        .join("coinbase-exchange.msj");
+    let paths = AppPaths::prepare(config.data_dir())?;
     let composition = LocalMcpComposition::try_new(
-        &config,
+        &paths,
         Arc::new(RwLock::new(DiagnosticEngine::new(5_000, false))),
-        journal_path,
+        "coinbase-exchange",
+        None,
     )?;
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (server_reader, server_writer) = tokio::io::split(server);

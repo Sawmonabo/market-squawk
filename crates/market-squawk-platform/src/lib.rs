@@ -50,8 +50,9 @@ pub use journal::{
 };
 pub use paths::{
     ArtifactPathError, ArtifactRoot, CatalogFileGuard, CatalogLocation, CatalogRestoreScanGuard,
-    CatalogRestoreStage, CatalogRestoreTarget, CatalogWriterGuard, InstalledCatalogFile,
-    JournalFileFormat, JournalSelectionError, LocalPaths, PathError, ResolvedArtifactPath,
+    CatalogRestoreStage, CatalogRestoreTarget, CatalogWriterGuard, ConfiguredJournalRead,
+    ConfiguredJournalReadTarget, ControlRoot, InstalledCatalogFile, JournalFileFormat,
+    JournalOpenError, JournalSelectionError, LocalPaths, PathError, ResolvedArtifactPath,
 };
 pub use raw_record::{RawCaptureRecord, RawCaptureRecordError};
 pub use secrets::{

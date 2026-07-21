@@ -2,13 +2,12 @@
 
 use std::{
     io::Write as _,
-    path::Path,
     sync::{Arc, Mutex},
     time::UNIX_EPOCH,
 };
 
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
-use cap_std::{ambient_authority, fs::OpenOptions};
+use cap_std::fs::{Dir, OpenOptions};
 use market_squawk_mcp::{
     AuditCompletion, AuditCompletionReservation, AuditError, AuditEvent, AuditOperation,
     AuditPhase, AuditResultClass, AuditSink, LocalProcessIdentityClass, MutationAuditBundle,
@@ -27,12 +26,7 @@ pub(super) struct DurableAuditSink {
 }
 
 impl DurableAuditSink {
-    pub(super) fn try_new(data_root: &Path) -> Result<Self, LocalAuditError> {
-        let root = cap_std::fs::Dir::open_ambient_dir(data_root, ambient_authority())
-            .map_err(LocalAuditError::Io)?;
-        root.create_dir_all("control")
-            .map_err(LocalAuditError::Io)?;
-        let control = root.open_dir("control").map_err(LocalAuditError::Io)?;
+    pub(super) fn try_new(control: Dir) -> Result<Self, LocalAuditError> {
         let mut options = OpenOptions::new();
         options.write(true).append(true).create(true);
         options.follow(FollowSymlinks::No);
@@ -323,20 +317,22 @@ pub enum LocalAuditError {
 mod tests {
     use std::{error::Error, process::Command};
 
+    use market_squawk_platform::LocalPaths;
+
     use super::DurableAuditSink;
 
     #[test]
     fn audit_open_rejects_a_preexisting_fifo_without_blocking() -> Result<(), Box<dyn Error>> {
         let temporary = tempfile::tempdir()?;
-        let control = temporary.path().join("control");
-        std::fs::create_dir(&control)?;
-        let fifo = control.join("mcp-audit.jsonl");
+        let paths = LocalPaths::prepare(temporary.path())?;
+        let control = paths.control_root()?;
+        let fifo = control.root().join("mcp-audit.jsonl");
         let status = Command::new("mkfifo").arg(&fifo).status()?;
         if !status.success() {
             return Err(std::io::Error::other("mkfifo failed").into());
         }
 
-        assert!(DurableAuditSink::try_new(temporary.path()).is_err());
+        assert!(DurableAuditSink::try_new(control.try_clone_directory()?).is_err());
         Ok(())
     }
 }

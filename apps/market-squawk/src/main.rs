@@ -466,7 +466,6 @@ async fn run_source(
         RunMode::UntilSourceStops => "mock",
         RunMode::UntilInterrupted | RunMode::ForDuration(_) | RunMode::Mcp => "coinbase-exchange",
     };
-    let journal_path = paths.journal_write_file(source_name)?;
     let (capture_identity, connection_id) = capture_identity(source_name)?;
     let process =
         initialize_capture_process_infrastructure(CaptureProcessInfrastructureLimits::new(
@@ -558,9 +557,10 @@ async fn run_source(
         }
         RunMode::Mcp => {
             let mcp = LocalMcpComposition::try_new(
-                &config,
+                &paths,
                 Arc::clone(&diagnostic_engine),
-                journal_path.clone(),
+                source_name,
+                None,
             )?;
             let mcp_cancellation = CancellationToken::new();
             let mut mcp_task = tokio::spawn(mcp.serve_stdio(mcp_cancellation.child_token()));
@@ -702,13 +702,17 @@ async fn run_offline_mcp(
     config: AppConfig,
     journal_format: Option<JournalFileFormat>,
 ) -> Result<()> {
-    let paths = AppPaths::for_read(config.data_dir().to_path_buf());
-    let journal_path = paths.select_journal_for_read("coinbase-exchange", journal_format)?;
+    let paths = AppPaths::prepare(config.data_dir())?;
     let diagnostic_engine = Arc::new(RwLock::new(DiagnosticEngine::new(
         duration_millis_i64(config.stale_after())?,
         config.paper_bot_enabled(),
     )));
-    let composition = LocalMcpComposition::try_new(&config, diagnostic_engine, journal_path)?;
+    let composition = LocalMcpComposition::try_new(
+        &paths,
+        diagnostic_engine,
+        "coinbase-exchange",
+        journal_format,
+    )?;
     let _exit = composition.serve_stdio(CancellationToken::new()).await?;
     Ok(())
 }

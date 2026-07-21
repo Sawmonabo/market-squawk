@@ -4,15 +4,19 @@ mod catalog;
 
 use std::{
     fmt,
+    fs::File,
     path::{Component, Path, PathBuf},
     sync::Arc,
 };
 
+use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
 use cap_std::fs::{Dir, OpenOptions};
 use thiserror::Error;
 
 use crate::journal::ParentDirectorySync;
-use crate::{JournalError, JournalSinkConstructionError, JournalSinkLimits, JournalWriter};
+use crate::{
+    JournalError, JournalReader, JournalSinkConstructionError, JournalSinkLimits, JournalWriter,
+};
 
 use self::catalog::open_prepared_root;
 pub use self::catalog::{
@@ -42,6 +46,9 @@ pub enum PathError {
     /// Artifact publication was requested from a read-only/no-create path view.
     #[error("artifact root is unavailable in read-only path mode")]
     ArtifactRootUnavailable,
+    /// Control-plane storage requires a prepared local path capability.
+    #[error("control root is unavailable in read-only path mode")]
+    ControlRootUnavailable,
     /// Catalog placement requires a prepared local path capability.
     #[error("catalog location is unavailable in read-only path mode")]
     CatalogLocationUnavailable,
@@ -57,6 +64,66 @@ pub enum PathError {
     /// Catalog restore publication may have reached durable storage and requires exact retry.
     #[error("prepared catalog restore publication is indeterminate")]
     CatalogRestoreIndeterminate,
+}
+
+/// Open directory capability for the exact prepared control-plane root.
+#[derive(Clone)]
+pub struct ControlRoot {
+    display_root: PathBuf,
+    directory: Arc<Dir>,
+}
+
+impl fmt::Debug for ControlRoot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ControlRoot")
+            .field("display_root", &self.display_root)
+            .field("directory", &"[DIRECTORY CAPABILITY]")
+            .finish()
+    }
+}
+
+impl ControlRoot {
+    fn from_open_directory(display_root: PathBuf, directory: Dir) -> Self {
+        Self {
+            display_root,
+            directory: Arc::new(directory),
+        }
+    }
+
+    /// Returns the canonical display path; it is not filesystem authority.
+    pub fn root(&self) -> &Path {
+        &self.display_root
+    }
+
+    /// Clones the retained capability after proving its display path still names that directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PathError::PreparedRootChanged`] when the displayed directory was renamed or
+    /// substituted, or [`PathError::Io`] when capability cloning or identity inspection fails.
+    pub fn try_clone_directory(&self) -> Result<Dir, PathError> {
+        use cap_fs_ext::MetadataExt as _;
+
+        let directory = self
+            .directory
+            .try_clone()
+            .map_err(|source| PathError::io("failed to clone control root", source))?;
+        let retained = directory
+            .dir_metadata()
+            .map_err(|source| PathError::io("failed to inspect retained control root", source))?;
+        let reopened = open_prepared_root(&self.display_root)?;
+        let displayed = reopened
+            .dir_metadata()
+            .map_err(|source| PathError::io("failed to inspect displayed control root", source))?;
+        if !retained.is_dir()
+            || !displayed.is_dir()
+            || (retained.dev(), retained.ino()) != (displayed.dev(), displayed.ino())
+        {
+            return Err(PathError::PreparedRootChanged);
+        }
+        Ok(directory)
+    }
 }
 
 impl PathError {
@@ -354,6 +421,9 @@ pub enum JournalSelectionError {
     /// Source text cannot safely become one filename component.
     #[error("journal source filename is invalid")]
     InvalidSource,
+    /// Capability-relative configured reads require a prepared local path layout.
+    #[error("configured journal reads require prepared local paths")]
+    PreparedPathsRequired,
     /// Read-only inspection failed.
     #[error("failed to inspect journal: {source}")]
     Io {
@@ -365,11 +435,120 @@ pub enum JournalSelectionError {
     },
 }
 
+/// Configured journal read target bound to the retained journal-directory capability.
+#[derive(Clone)]
+pub struct ConfiguredJournalReadTarget {
+    directory: Arc<Dir>,
+    filename: Arc<str>,
+    format: JournalFileFormat,
+}
+
+impl fmt::Debug for ConfiguredJournalReadTarget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConfiguredJournalReadTarget")
+            .field("directory", &"[DIRECTORY CAPABILITY]")
+            .field("filename", &self.filename)
+            .field("format", &self.format)
+            .finish()
+    }
+}
+
+impl ConfiguredJournalReadTarget {
+    /// Opens the selected configured journal relative to the retained directory capability.
+    ///
+    /// A missing default current-format journal is represented explicitly without creating it.
+    /// The final endpoint is opened without following links and the exact opened handle must be a
+    /// regular non-reparse file.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JournalOpenError::NotRegular`] for links, reparse points, FIFOs, devices, or
+    /// other non-regular endpoints, and [`JournalOpenError::Io`] for other open failures.
+    pub fn open(&self) -> Result<ConfiguredJournalRead, JournalOpenError> {
+        match self.directory.symlink_metadata(self.filename.as_ref()) {
+            Ok(metadata) if !metadata.file_type().is_file() => {
+                return Err(JournalOpenError::NotRegular);
+            }
+            Ok(_metadata) => {}
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(ConfiguredJournalRead::Missing);
+            }
+            Err(source) => {
+                return Err(JournalOpenError::io(
+                    "failed to inspect configured journal endpoint",
+                    source,
+                ));
+            }
+        }
+
+        let mut options = OpenOptions::new();
+        options.read(true);
+        options.follow(FollowSymlinks::No);
+        configure_journal_read_open(&mut options);
+        let file = match self.directory.open_with(self.filename.as_ref(), &options) {
+            Ok(file) => file.into_std(),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(ConfiguredJournalRead::Missing);
+            }
+            Err(source) if is_unsafe_journal_endpoint_error(&source) => {
+                return Err(JournalOpenError::NotRegular);
+            }
+            Err(source) => {
+                return Err(JournalOpenError::io(
+                    "failed to open configured journal",
+                    source,
+                ));
+            }
+        };
+        validate_configured_journal_handle(&file)?;
+        Ok(ConfiguredJournalRead::Reader(JournalReader::new(file)))
+    }
+
+    /// Selected compatible journal format.
+    pub const fn format(&self) -> JournalFileFormat {
+        self.format
+    }
+}
+
+/// Explicit configured journal read outcome.
+#[derive(Debug)]
+pub enum ConfiguredJournalRead {
+    /// No journal exists at the selected default target.
+    Missing,
+    /// Exact regular opened journal reader.
+    Reader(JournalReader<File>),
+}
+
+/// Capability-relative configured journal open failure.
+#[derive(Debug, Error)]
+pub enum JournalOpenError {
+    /// The configured endpoint is not an exact regular non-reparse file.
+    #[error("configured journal endpoint is not a regular file")]
+    NotRegular,
+    /// Capability-relative inspection or opening failed.
+    #[error("{context}: {source}")]
+    Io {
+        /// Non-secret operation context.
+        context: &'static str,
+        /// Underlying I/O failure.
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+impl JournalOpenError {
+    fn io(context: &'static str, source: std::io::Error) -> Self {
+        Self::Io { context, source }
+    }
+}
+
 /// Prepared local layout or read-only no-create view.
 #[derive(Clone, Debug)]
 pub struct LocalPaths {
     root: PathBuf,
     journal_dir: PathBuf,
+    control: Option<ControlRoot>,
     artifacts: Option<ArtifactRoot>,
     catalog: Option<CatalogLocation>,
     journal_capability: Option<Arc<Dir>>,
@@ -390,21 +569,29 @@ impl LocalPaths {
         root_capability
             .create_dir_all("artifacts")
             .map_err(|source| PathError::io("failed to create artifact directory", source))?;
+        root_capability
+            .create_dir_all("control")
+            .map_err(|source| PathError::io("failed to create control directory", source))?;
         let journal_capability = root_capability.open_dir("journal").map_err(|source| {
             PathError::io("failed to open journal directory capability", source)
         })?;
         let artifact_capability = root_capability.open_dir("artifacts").map_err(|source| {
             PathError::io("failed to open artifact directory capability", source)
         })?;
+        let control_capability = root_capability.open_dir("control").map_err(|source| {
+            PathError::io("failed to open control directory capability", source)
+        })?;
         let root = std::fs::canonicalize(root)
             .map_err(|source| PathError::io("failed to canonicalize local data root", source))?;
         let journal_dir = root.join("journal");
         let artifacts =
             ArtifactRoot::from_open_directory(root.join("artifacts"), artifact_capability);
+        let control = ControlRoot::from_open_directory(root.join("control"), control_capability);
         let catalog = CatalogLocation::from_prepared(root.clone(), Arc::clone(&root_capability));
         Ok(Self {
             root,
             journal_dir,
+            control: Some(control),
             artifacts: Some(artifacts),
             catalog: Some(catalog),
             journal_capability: Some(Arc::new(journal_capability)),
@@ -418,6 +605,7 @@ impl LocalPaths {
         Self {
             root,
             journal_dir,
+            control: None,
             artifacts: None,
             catalog: None,
             journal_capability: None,
@@ -432,6 +620,13 @@ impl LocalPaths {
     /// Returns the journal directory.
     pub fn journal_dir(&self) -> &Path {
         &self.journal_dir
+    }
+
+    /// Returns the exact prepared control-plane directory capability.
+    pub fn control_root(&self) -> Result<&ControlRoot, PathError> {
+        self.control
+            .as_ref()
+            .ok_or(PathError::ControlRootUnavailable)
     }
 
     /// Returns the controlled artifact root capability in prepared mode.
@@ -565,6 +760,58 @@ impl LocalPaths {
         }
     }
 
+    /// Selects a configured journal filename under the retained prepared directory capability.
+    ///
+    /// With no explicit format, a missing current and legacy journal binds a missing current
+    /// target without creating it. Explicitly selected missing formats remain selection errors.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JournalSelectionError::PreparedPathsRequired`] for a read-only ambient path view,
+    /// or the existing validation, ambiguity, and explicit-missing selection errors.
+    pub fn configured_journal_read_target(
+        &self,
+        source: &str,
+        requested: Option<JournalFileFormat>,
+    ) -> Result<ConfiguredJournalReadTarget, JournalSelectionError> {
+        validate_source_filename(source)?;
+        let directory = self
+            .journal_capability
+            .as_ref()
+            .ok_or(JournalSelectionError::PreparedPathsRequired)?;
+        let current_filename = journal_filename(source, JournalFileFormat::Current);
+        let legacy_filename = journal_filename(source, JournalFileFormat::Legacy);
+        let format = if let Some(format) = requested {
+            let filename = journal_filename(source, format);
+            if !capability_entry_exists(directory, &filename)? {
+                return Err(JournalSelectionError::SelectedFormatNotFound {
+                    format,
+                    path: self.journal_dir.join(filename),
+                });
+            }
+            format
+        } else {
+            match (
+                capability_entry_exists(directory, &current_filename)?,
+                capability_entry_exists(directory, &legacy_filename)?,
+            ) {
+                (true, true) => {
+                    return Err(JournalSelectionError::Ambiguous {
+                        current: self.journal_dir.join(current_filename),
+                        legacy: self.journal_dir.join(legacy_filename),
+                    });
+                }
+                (true, false) | (false, false) => JournalFileFormat::Current,
+                (false, true) => JournalFileFormat::Legacy,
+            }
+        };
+        Ok(ConfiguredJournalReadTarget {
+            directory: Arc::clone(directory),
+            filename: Arc::from(journal_filename(source, format)),
+            format,
+        })
+    }
+
     /// Returns the local control-plane state file.
     pub fn state_file(&self) -> PathBuf {
         self.root.join("state.json")
@@ -641,6 +888,75 @@ fn validate_source_filename(source: &str) -> Result<(), JournalSelectionError> {
         return Err(JournalSelectionError::InvalidSource);
     }
     Ok(())
+}
+
+fn journal_filename(source: &str, format: JournalFileFormat) -> String {
+    format!("{source}.{}", format.extension())
+}
+
+fn capability_entry_exists(directory: &Dir, filename: &str) -> Result<bool, JournalSelectionError> {
+    match directory.symlink_metadata(filename) {
+        Ok(_metadata) => Ok(true),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(JournalSelectionError::Io {
+            path: PathBuf::from(filename),
+            source,
+        }),
+    }
+}
+
+#[cfg(unix)]
+fn configure_journal_read_open(options: &mut OpenOptions) {
+    use cap_std::fs::OpenOptionsExt as _;
+
+    options.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
+}
+
+#[cfg(windows)]
+fn configure_journal_read_open(options: &mut OpenOptions) {
+    use cap_std::fs::OpenOptionsExt as _;
+
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+    options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+}
+
+#[cfg(not(any(unix, windows)))]
+fn configure_journal_read_open(_options: &mut OpenOptions) {}
+
+fn validate_configured_journal_handle(file: &File) -> Result<(), JournalOpenError> {
+    let metadata = file.metadata().map_err(|source| {
+        JournalOpenError::io("failed to inspect configured journal handle", source)
+    })?;
+    if !metadata.is_file() || is_windows_reparse_file(&metadata) {
+        return Err(JournalOpenError::NotRegular);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn is_windows_reparse_file(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+const fn is_windows_reparse_file(_metadata: &std::fs::Metadata) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn is_unsafe_journal_endpoint_error(source: &std::io::Error) -> bool {
+    source.raw_os_error() == Some(libc::ELOOP)
+}
+
+#[cfg(not(unix))]
+const fn is_unsafe_journal_endpoint_error(_source: &std::io::Error) -> bool {
+    false
 }
 
 fn try_exists(path: &Path) -> Result<bool, JournalSelectionError> {

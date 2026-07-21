@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use market_squawk_platform::{ArtifactPathError, LocalPaths};
+use market_squawk_platform::{ArtifactPathError, JournalFileFormat, JournalOpenError, LocalPaths};
 #[cfg(unix)]
 use market_squawk_platform::{JournalError, PathError};
 use tempfile::tempdir;
@@ -105,6 +105,40 @@ fn artifact_capability_clone_rejects_same_path_directory_replacement()
         paths.artifacts()?.try_clone_directory(),
         Err(PathError::PreparedRootChanged)
     ));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn control_capability_clone_rejects_same_path_directory_replacement()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let paths = LocalPaths::prepare(directory.path().join("data"))?;
+    let control_path = paths.control_root()?.root().to_path_buf();
+    std::fs::rename(&control_path, directory.path().join("original-control"))?;
+    std::fs::create_dir(&control_path)?;
+
+    assert!(matches!(
+        paths.control_root()?.try_clone_directory(),
+        Err(PathError::PreparedRootChanged)
+    ));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn configured_journal_read_rejects_a_fifo_without_blocking()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let paths = LocalPaths::prepare(directory.path().join("data"))?;
+    let fifo = paths.journal_dir().join("fifo.msj");
+    let status = std::process::Command::new("mkfifo").arg(&fifo).status()?;
+    if !status.success() {
+        return Err(std::io::Error::other("mkfifo failed").into());
+    }
+    let target = paths.configured_journal_read_target("fifo", Some(JournalFileFormat::Current))?;
+
+    assert!(matches!(target.open(), Err(JournalOpenError::NotRegular)));
     Ok(())
 }
 

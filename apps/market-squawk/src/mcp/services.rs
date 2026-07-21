@@ -1,18 +1,19 @@
 //! Transport-neutral ownership for the current local diagnostic state.
 
-use std::{path::PathBuf, time::Instant};
+use std::time::Instant;
 
 use async_trait::async_trait;
+use market_squawk_platform::ConfiguredJournalReadTarget;
 use market_squawk_services::{
     RequestContext, ServiceCapabilities, ServiceCapabilityError, ServiceError, ToolDescriptor,
     ToolEffects, ToolInputError, ToolServices, TypedToolRequest, TypedToolResult,
 };
 use serde_json::{Map, Value, json};
+use thiserror::Error;
 
 use crate::{
     diagnostic_engine::SharedDiagnosticEngine,
-    journal::{JournalError, JournalReader},
-    replay::ReplaySummary,
+    mcp::journal_worker::{JournalSummaryWorker, JournalWorkerShutdown, JournalWorkerStartError},
 };
 
 const CONTRACT_VERSION: &str = "1";
@@ -23,28 +24,40 @@ const JOURNAL_GET_SUMMARY: &str = "Journal.GetSummary";
 const RISK_TRIGGER_KILL_SWITCH: &str = "Risk.TriggerKillSwitch";
 const MAXIMUM_PRODUCT_BYTES: usize = 128;
 const MAXIMUM_REASON_BYTES: usize = 500;
-const MAXIMUM_JOURNAL_RECORDS: u64 = 100_000;
-const MAXIMUM_JOURNAL_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Frozen application state retained by the hardened MCP composition.
 #[derive(Debug)]
 pub(super) struct LocalToolServices {
     diagnostic_engine: SharedDiagnosticEngine,
-    journal_path: PathBuf,
+    journal_worker: JournalSummaryWorker,
     capabilities: ServiceCapabilities,
 }
 
 impl LocalToolServices {
     pub(super) fn try_new(
         diagnostic_engine: SharedDiagnosticEngine,
-        journal_path: PathBuf,
-    ) -> Result<Self, ServiceCapabilityError> {
+        journal_target: ConfiguredJournalReadTarget,
+    ) -> Result<Self, LocalToolServicesError> {
+        let capabilities = diagnostic_capabilities()?;
+        let journal_worker = JournalSummaryWorker::try_start(journal_target)?;
         Ok(Self {
             diagnostic_engine,
-            journal_path,
-            capabilities: diagnostic_capabilities()?,
+            journal_worker,
+            capabilities,
         })
     }
+
+    pub(super) async fn shutdown(&self, deadline: tokio::time::Instant) -> JournalWorkerShutdown {
+        self.journal_worker.shutdown(deadline).await
+    }
+}
+
+#[derive(Debug, Error)]
+pub(super) enum LocalToolServicesError {
+    #[error(transparent)]
+    Capability(#[from] ServiceCapabilityError),
+    #[error(transparent)]
+    JournalWorker(#[from] JournalWorkerStartError),
 }
 
 #[async_trait]
@@ -64,7 +77,7 @@ impl ToolServices for LocalToolServices {
             MARKET_GET_QUALITY => self.market_quality()?,
             BOT_GET_STATUS => self.bot_status(),
             JOURNAL_GET_SUMMARY => {
-                let summary = bounded_journal_summary(&self.journal_path, &context)?;
+                let summary = self.journal_worker.summarize(context.clone()).await?;
                 (
                     serde_json::to_value(summary).map_err(|_error| ServiceError::Internal)?,
                     1,
@@ -240,45 +253,6 @@ fn admitted_string<'arguments>(
     Ok(value)
 }
 
-fn bounded_journal_summary(
-    path: &std::path::Path,
-    context: &RequestContext,
-) -> Result<ReplaySummary, ServiceError> {
-    ensure_request_live(context)?;
-    let mut reader = match JournalReader::open(path) {
-        Ok(reader) => reader,
-        Err(JournalError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ReplaySummary::default());
-        }
-        Err(_error) => return Err(ServiceError::Unavailable),
-    };
-    let mut summary = ReplaySummary::default();
-    loop {
-        ensure_request_live(context)?;
-        let Some(record) = reader
-            .next_record()
-            .map_err(|_error| ServiceError::Unavailable)?
-        else {
-            return Ok(summary);
-        };
-        if summary.records >= MAXIMUM_JOURNAL_RECORDS {
-            return Err(ServiceError::ResourceExhausted);
-        }
-        let payload_bytes = u64::try_from(record.payload().len())
-            .map_err(|_error| ServiceError::ResourceExhausted)?;
-        let aggregate_payload_bytes = summary
-            .bytes
-            .checked_add(payload_bytes)
-            .ok_or(ServiceError::ResourceExhausted)?;
-        if aggregate_payload_bytes > MAXIMUM_JOURNAL_PAYLOAD_BYTES {
-            return Err(ServiceError::ResourceExhausted);
-        }
-        summary
-            .observe(&record)
-            .map_err(|_error| ServiceError::Internal)?;
-    }
-}
-
 fn ensure_request_live(context: &RequestContext) -> Result<(), ServiceError> {
     if context.cancellation().is_cancelled() {
         return Err(ServiceError::Cancelled);
@@ -306,11 +280,11 @@ mod tests {
     -> Result<(), Box<dyn Error>> {
         let temporary = tempfile::tempdir()?;
         let paths = AppPaths::prepare(temporary.path())?;
-        let journal_path = paths.journal_write_file("services")?;
         paths.open_journal_writer("services")?.flush()?;
+        let journal_target = paths.configured_journal_read_target("services", None)?;
         let services = LocalToolServices::try_new(
             Arc::new(RwLock::new(DiagnosticEngine::new(5_000, false))),
-            journal_path,
+            journal_target,
         )?;
         let capabilities = services.capabilities();
         let names = capabilities
@@ -360,6 +334,13 @@ mod tests {
             .await?;
         assert_eq!(result.structured_content()["records"], 0);
         assert_eq!(result.item_count(), 1);
+        let deadline = tokio::time::Instant::now()
+            .checked_add(Duration::from_secs(1))
+            .ok_or("shutdown deadline overflow")?;
+        assert_eq!(
+            services.shutdown(deadline).await,
+            crate::mcp::journal_worker::JournalWorkerShutdown::Joined
+        );
         Ok(())
     }
 }
