@@ -53,6 +53,12 @@ work is bound by the single canonical
   Parquet. User-authorized capability roots, bounded parsing and decompression, revocable source
   authority, precision-preserving research time, immutable representation evidence, and the
   analytical ingestion service are composed end to end.
+- A production SEC EDGAR extraction vertical for submissions, filing history, Company Facts, and
+  bounded inline XBRL evidence. It uses an allowlisted HTTPS client with an identified User-Agent,
+  shared request and response budgets, revocable current-source authority through publication,
+  immutable payload evidence, revision-preserving filing and fact normalization, calendar-date
+  precision, and point-in-time availability semantics without invented midnight timestamps or
+  supersession dates.
 - Production macro extraction adapters for FRED/ALFRED, BLS, and U.S. Treasury. They use hardened
   allowlisted HTTPS clients, revocable registry authority, shared conjunctive provider budgets,
   bounded responses, exact provider metadata and payload evidence, conservative availability, and
@@ -102,7 +108,6 @@ terminal consumer, focused verification, immutable evidence, and exact commit ex
 | --- | --- | --- | --- |
 | `Missing` | Coinbase direct-source qualification | The bounded source-to-live-to-risk-to-dispatch-to-paper ownership path is runnable, but Coinbase remains capped at `DirectUnverified`; it cannot satisfy the `DirectVerified` execution gate, and the CLI adds a no-intent strategy | Task 2 |
 | `Missing` | Kraken direct-source qualification | The production transport, decoder, checksum, exact-generation session lifecycle, fresh-snapshot recovery, and canonical risk/no-paper-mutation terminal proof exist; Kraken WebSocket v2 supplies no venue sequence satisfying the current `DirectVerified` execution predicate | Task 20 |
-| `Missing` | SEC filings/XBRL/Company Facts | No lawful, revision-preserving SEC vertical | Task 8 |
 | `Missing` | FRED/ALFRED durable local consumption | The production vintage-aware adapter is runnable for authorized ephemeral retrieval, but the exact current terms bundle does not establish per-series rights for persistence, caching, archival, or training | Task 9 / Task 20 |
 | `Missing` | portfolio import | No raw-preserving holdings/transactions reconciliation vertical | Task 10 |
 | `Missing` | point-in-time datasets | No availability-aware joins or leakage-checked builder | Task 11 |
