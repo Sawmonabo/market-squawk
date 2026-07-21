@@ -11,9 +11,10 @@ historical datasets to originate from or reproduce the live feed.
 `v0.1.0` is a runnable diagnostic foundation. It is not the usable complete Market Squawk release
 and it is not a production brokerage system. The linked
 [historical state audit](docs/architecture/current-state.md) records its own rejected audit anchor;
-it is not an exact-head inventory. The sections below and the tracked
-[release baseline](docs/verification/usable-release-baseline.md) are the current inventory and
-user-facing truth. All mandatory remaining work is bound by the single canonical
+it is not an exact-head inventory. The dated
+[release baseline](docs/verification/usable-release-baseline.md) is also historical audit evidence.
+The sections below are the current product inventory and user-facing truth. All mandatory remaining
+work is bound by the single canonical
 [usable complete-release implementation plan](docs/superpowers/plans/2026-07-17-market-squawk-usable-complete-release.md).
 
 ## Runnable now
@@ -27,8 +28,7 @@ user-facing truth. All mandatory remaining work is bound by the single canonical
   cancellation, pinned protocol fixtures, source metadata, explicit single-venue partial coverage,
   durable generation/revision authority, and authoritative application composition into the
   instrument-owned live runtime. Its current qualification ceiling remains intentionally
-  `DirectUnverified`; the one-time risk/dispatch and realistic paper-execution terminal path is not
-  complete.
+  `DirectUnverified`, so it remains execution-ineligible.
 - A bounded Kraken WebSocket v2 production-source crate for price-level books and trades, with
   capture-before-decode, official CRC32 book validation, bounded control traffic, cancellation,
   source metadata, and session lifecycle enforcement. Its current qualification ceiling is
@@ -48,8 +48,16 @@ user-facing truth. All mandatory remaining work is bound by the single canonical
   pre-trade calculation, and paper-only momentum diagnostics.
 - Immutable typed order intents plus fixed-capacity, nonblocking account risk coordination with
   exact cash, position, exposure, leverage, capital, loss, drawdown, rate, idempotency, freshness,
-  eligibility, price, slippage, and expiry checks. This pre-authority risk core has no public order
-  submission or approval-minting surface.
+  eligibility, price, slippage, and expiry checks; private approval minting; one-time dispatch;
+  price-bound reconciliation; and terminal, bounded audit evidence. No public unchecked order
+  submission or approval-minting surface exists.
+- A deterministic, bounded realistic paper-execution engine with configurable fees, latency,
+  slippage, partial fills, rejections, cancellations, balances, positions, reservations,
+  reconciliation, versioned recovery checkpoints, and fail-closed shutdown. The `paper-bot`
+  command composes the production Coinbase source, instrument-owned live runtime, canonical risk,
+  one-time dispatcher, and paper worker under one lifecycle. Coinbase remains `DirectUnverified`,
+  and the command installs a no-intent strategy, so this runnable ownership path cannot authorize or
+  place an order.
 - A five-tool diagnostic stdio MCP compatibility server with strict schemas and per-process call
   limiting; it is not the complete typed MCP product.
 - A deterministic mock source for offline diagnostic verification. It is never represented as a
@@ -59,7 +67,7 @@ The app-local Coinbase reader and MCP server remain compatibility paths. Their a
 `QualityState::Valid` is not canonical `DataQuality::DirectVerified` and cannot authorize an order.
 The separately composed production Coinbase source can enter the production live runtime only at
 its declared `DirectUnverified` ceiling; Coinbase and Kraken therefore remain execution-ineligible.
-All current bot and fill behavior is diagnostic paper simulation.
+All fills remain local paper simulation; no broker adapter or live order authority is enabled.
 
 ## Required but missing
 
@@ -68,7 +76,7 @@ terminal consumer, focused verification, immutable evidence, and exact commit ex
 
 | State | Mandatory capability | Current blocker | Closing task |
 | --- | --- | --- | --- |
-| `Missing` | Coinbase direct-source qualification | Authoritative production transport-to-live-runtime composition exists at a `DirectUnverified` ceiling; verified qualification, one-time risk/dispatch, and realistic live-to-paper completion do not | Task 2 |
+| `Missing` | Coinbase direct-source qualification | The bounded source-to-live-to-risk-to-dispatch-to-paper ownership path is runnable, but Coinbase remains capped at `DirectUnverified`; it cannot satisfy the `DirectVerified` execution gate, and the CLI adds a no-intent strategy | Task 2 |
 | `Missing` | Kraken direct-source qualification | Production transport, decoder, checksum, metadata, and session lifecycle exist; the authority-qualified live ingress, risk decision, and live-to-paper terminal path do not | Task 6 |
 | `Missing` | CSV/TSV | No bounded production extraction adapter | Task 7 |
 | `Missing` | JSON/NDJSON | No bounded production extraction adapter | Task 7 |
@@ -91,8 +99,8 @@ terminal consumer, focused verification, immutable evidence, and exact commit ex
 | `Missing` | constrained ONNX inference | No validated, bounded, fail-closed ONNX-compatible backend | Task 15 |
 | `Missing` | research backtesting | No point-in-time research-dataset backtester | Task 17 |
 | `Missing` | portfolio accounting/analytics | No lots, gains, performance, exposure, attribution, risk, or scenarios | Task 16 |
-| `Missing` | strategies and comprehensive risk | Comprehensive pre-authority risk/account coordination exists; canonical strategies, actor-owned authority consumption, private approval, one-time dispatch, and terminal audit do not | Task 2 |
-| `Missing` | realistic paper execution | No realistic lifecycle, fee, latency, slippage, fill, or reconciliation vertical | Task 2 |
+| `Missing` | strategies and comprehensive risk | Bounded account/risk coordination, actor-owned authority consumption, private approval, one-time dispatch, price-bound reconciliation, and terminal audit exist; a production order-producing strategy and its controlled user-facing configuration do not | Task 2 |
+| `Missing` | realistic paper execution | The bounded engine implements lifecycle, fees, latency, slippage, partial fills, rejection, cancellation, accounting, checkpoint recovery, and reconciliation; no execution-eligible source/strategy currently drives orders through the user-facing production composition | Task 2 |
 | `Missing` | ASC 820/IFRS 13 fair value | No ruleset, evidence, override, approval, or classification service | Task 18 |
 | `Missing` | complete local CLI | No complete command hierarchy over shared application services | Task 19 |
 | `Missing` | complete typed local MCP | No complete bounded tool domains over shared application services | Task 19 |
@@ -360,9 +368,9 @@ compression while retaining independent compatibility. That diagnostic-journal e
 separate from the already-runnable research Parquet compaction service and from the still-mandatory
 provider-ingestion and point-in-time dataset-construction verticals.
 
-## Diagnostic paper bot
+## Paper execution modes
 
-The optional bot exists to exercise the authority-free compatibility path without risking capital:
+The legacy optional flag exercises the authority-free compatibility path without risking capital:
 
 ```bash
 market-squawk capture --products BTC-USD --paper-bot
@@ -372,6 +380,21 @@ It is intentionally simple and not an investment recommendation. It generates fi
 intents after a warm-up window. Every intent passes through a diagnostic calculation before a
 paper-only simulated fill is recorded. It has no broker connection or production execution
 authority.
+
+The production-owned paper service is a separate command:
+
+```bash
+market-squawk paper-bot \
+  --seconds 30 \
+  --initial-cash 100000 \
+  --fee-basis-points 100
+```
+
+It starts and shuts down the sealed Coinbase-to-live-to-risk-to-dispatch-to-paper graph. The graph
+uses the realistic paper engine and canonical risk contracts, but it intentionally produces no
+orders: Coinbase is still `DirectUnverified`, and the CLI installs a no-intent strategy as a second
+fail-closed barrier. This command demonstrates production ownership and lifecycle behavior; it does
+not demonstrate an execution-qualified strategy.
 
 ## Local verification
 
@@ -408,7 +431,8 @@ crates/
 └── market-squawk-sources/         source contracts, registry, budgets, health, and supervision
 adapters/
 ├── market-squawk-adapter-coinbase/ bounded Coinbase Exchange v1 source and protocol fixtures
-└── market-squawk-adapter-kraken/   bounded Kraken v2 transport, decoder, checksum, and session source
+├── market-squawk-adapter-kraken/   bounded Kraken v2 transport, decoder, checksum, and session source
+└── market-squawk-adapter-paper/    bounded realistic paper execution, accounting, audit, and recovery
 scripts/                            deterministic local/CI policy and smoke gates
 docs/                               architecture, plans, research, and verification evidence
 ```
