@@ -353,6 +353,11 @@ fn request_parser_limits(
     let decoded_limit = decoded_bytes.max(1);
     let string_limit = decoded_limit.min(256 * 1024);
     let total_string_limit = decoded_limit.min(24 * 1024 * 1024).max(string_limit);
+    let retained_output_limit = decoded_limit
+        .checked_mul(4)
+        .ok_or(SecClientError::InvalidCompositeRepresentation)?
+        .min(128 * 1024 * 1024)
+        .max(total_string_limit);
     SecParserLimits::try_new(
         decoded_limit,
         usize::try_from(request.max_records())
@@ -360,6 +365,7 @@ fn request_parser_limits(
         128,
         string_limit,
         total_string_limit,
+        retained_output_limit,
     )
     .map_err(Into::into)
 }

@@ -1,5 +1,6 @@
 //! Versioned, bounded evidence retained for normalized XBRL numeric facts.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::str::FromStr;
 
@@ -10,10 +11,22 @@ use serde::{Deserialize, Deserializer, Serialize};
 use crate::{CalendarDate, EvidenceDigest, ExactPayloadEvidence, SourceIdentifier, Timestamp};
 
 /// Current schema version for [`XbrlFactEvidence`].
-pub const XBRL_FACT_EVIDENCE_SCHEMA_VERSION: u16 = 1;
+pub const XBRL_FACT_EVIDENCE_SCHEMA_VERSION: u16 = 2;
 
 /// Maximum dimensions retained for one XBRL context.
 pub const MAX_XBRL_DIMENSIONS: usize = 128;
+
+/// Maximum structural events retained for one context or typed-member graph.
+pub const MAX_XBRL_GRAPH_EVENTS: usize = 4_096;
+
+/// Maximum measures retained on either side of one XBRL divide unit.
+pub const MAX_XBRL_UNIT_MEASURES: usize = 64;
+
+/// Maximum fact references retained for one Inline XBRL relationship endpoint.
+pub const MAX_XBRL_RELATIONSHIP_REFS: usize = 128;
+
+/// Maximum Inline XBRL relationships retained for one occurrence.
+pub const MAX_XBRL_RELATIONSHIPS: usize = 128;
 
 /// A bounded exact XBRL text fragment.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -61,6 +74,274 @@ impl<'de> Deserialize<'de> for XbrlText {
         D: Deserializer<'de>,
     {
         Self::try_from(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+/// A source QName together with its authoritative expanded name.
+///
+/// The lexical QName retains the filing's prefix for audit evidence. Semantic comparisons must use
+/// [`Self::same_expanded_name`], which compares only namespace URI and local name.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct XbrlQualifiedName {
+    source_qname: SourceIdentifier,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    namespace_uri: Option<XbrlText>,
+    local_name: SourceIdentifier,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct XbrlQualifiedNameWire {
+    source_qname: SourceIdentifier,
+    #[serde(default)]
+    namespace_uri: Option<XbrlText>,
+    local_name: SourceIdentifier,
+}
+
+impl<'de> Deserialize<'de> for XbrlQualifiedName {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = XbrlQualifiedNameWire::deserialize(deserializer)?;
+        let candidate = match wire.namespace_uri {
+            Some(namespace_uri) => {
+                Self::try_new(wire.source_qname.as_str(), namespace_uri.as_str())
+            }
+            None => Self::unqualified(wire.source_qname.as_str()),
+        }
+        .map_err(serde::de::Error::custom)?;
+        if candidate.local_name != wire.local_name {
+            return Err(serde::de::Error::custom(
+                XbrlEvidenceError::QualifiedNameMismatch,
+            ));
+        }
+        Ok(candidate)
+    }
+}
+
+impl XbrlQualifiedName {
+    /// Constructs a source QName resolved to an authoritative namespace URI.
+    pub fn try_new(source_qname: &str, namespace_uri: &str) -> Result<Self, XbrlEvidenceError> {
+        if namespace_uri.is_empty() {
+            return Err(XbrlEvidenceError::EmptyRequiredText);
+        }
+        let local_name = validate_source_qname(source_qname)?;
+        Ok(Self {
+            source_qname: SourceIdentifier::try_from(source_qname)
+                .map_err(|_| XbrlEvidenceError::InvalidQualifiedName)?,
+            namespace_uri: Some(XbrlText::try_from(namespace_uri)?),
+            local_name: SourceIdentifier::try_from(local_name)
+                .map_err(|_| XbrlEvidenceError::InvalidQualifiedName)?,
+        })
+    }
+
+    /// Constructs an explicitly unqualified XML name.
+    pub fn unqualified(source_name: &str) -> Result<Self, XbrlEvidenceError> {
+        let local_name = validate_source_qname(source_name)?;
+        if source_name.contains(':') {
+            return Err(XbrlEvidenceError::UnboundQualifiedName);
+        }
+        Ok(Self {
+            source_qname: SourceIdentifier::try_from(source_name)
+                .map_err(|_| XbrlEvidenceError::InvalidQualifiedName)?,
+            namespace_uri: None,
+            local_name: SourceIdentifier::try_from(local_name)
+                .map_err(|_| XbrlEvidenceError::InvalidQualifiedName)?,
+        })
+    }
+
+    /// Returns the exact source QName, including its lexical prefix when present.
+    pub const fn source_qname(&self) -> &SourceIdentifier {
+        &self.source_qname
+    }
+
+    /// Returns the resolved namespace URI, or `None` for an explicitly unqualified name.
+    pub const fn namespace_uri(&self) -> Option<&XbrlText> {
+        self.namespace_uri.as_ref()
+    }
+
+    /// Returns the expanded local name.
+    pub const fn local_name(&self) -> &SourceIdentifier {
+        &self.local_name
+    }
+
+    /// Reports whether two source QNames resolve to the same expanded name.
+    pub fn same_expanded_name(&self, other: &Self) -> bool {
+        self.namespace_uri == other.namespace_uri && self.local_name == other.local_name
+    }
+}
+
+fn validate_source_qname(source_qname: &str) -> Result<&str, XbrlEvidenceError> {
+    if source_qname.is_empty() {
+        return Err(XbrlEvidenceError::EmptyRequiredText);
+    }
+    let mut parts = source_qname.split(':');
+    let first = parts
+        .next()
+        .ok_or(XbrlEvidenceError::InvalidQualifiedName)?;
+    let second = parts.next();
+    if parts.next().is_some() || first.is_empty() || second.is_some_and(str::is_empty) {
+        return Err(XbrlEvidenceError::InvalidQualifiedName);
+    }
+    Ok(second.unwrap_or(first))
+}
+
+/// One event in a bounded, non-recursive XML evidence graph.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case", tag = "kind")]
+pub enum XbrlXmlEvent {
+    /// Opens one element.
+    Start { name: XbrlQualifiedName },
+    /// Retains one source attribute immediately after its owning start event.
+    Attribute {
+        name: XbrlQualifiedName,
+        value: XbrlText,
+    },
+    /// Retains source character content.
+    Text { value: XbrlText },
+    /// Closes one element.
+    End { name: XbrlQualifiedName },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+struct BoundedXmlEvents(Vec<XbrlXmlEvent>);
+
+impl BoundedXmlEvents {
+    fn try_new(events: Vec<XbrlXmlEvent>) -> Result<Self, XbrlEvidenceError> {
+        if events.len() > MAX_XBRL_GRAPH_EVENTS {
+            return Err(XbrlEvidenceError::TooManyGraphEvents);
+        }
+        validate_xml_events(&events)?;
+        Ok(Self(events.into_boxed_slice().into_vec()))
+    }
+}
+
+struct BoundedXmlEventsVisitor;
+
+impl<'de> Visitor<'de> for BoundedXmlEventsVisitor {
+    type Value = BoundedXmlEvents;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a bounded balanced XBRL XML event list")
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut events = Vec::with_capacity(sequence.size_hint().unwrap_or(0).min(32));
+        while events.len() < MAX_XBRL_GRAPH_EVENTS {
+            let Some(event) = sequence.next_element()? else {
+                return BoundedXmlEvents::try_new(events).map_err(serde::de::Error::custom);
+            };
+            events.push(event);
+        }
+        if sequence.next_element::<IgnoredAny>()?.is_some() {
+            Err(serde::de::Error::custom(
+                XbrlEvidenceError::TooManyGraphEvents,
+            ))
+        } else {
+            BoundedXmlEvents::try_new(events).map_err(serde::de::Error::custom)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for BoundedXmlEvents {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(BoundedXmlEventsVisitor)
+    }
+}
+
+fn validate_xml_events(events: &[XbrlXmlEvent]) -> Result<(), XbrlEvidenceError> {
+    let mut stack = Vec::<&XbrlQualifiedName>::new();
+    let mut attributes_open = false;
+    let mut attributes = BTreeSet::<(&Option<XbrlText>, &SourceIdentifier)>::new();
+    for event in events {
+        match event {
+            XbrlXmlEvent::Start { name } => {
+                stack.push(name);
+                attributes_open = true;
+                attributes.clear();
+            }
+            XbrlXmlEvent::Attribute { name, .. } => {
+                if stack.is_empty() || !attributes_open {
+                    return Err(XbrlEvidenceError::InvalidGraphStructure);
+                }
+                if !attributes.insert((&name.namespace_uri, &name.local_name)) {
+                    return Err(XbrlEvidenceError::DuplicateGraphAttribute);
+                }
+            }
+            XbrlXmlEvent::Text { .. } => {
+                if stack.is_empty() {
+                    return Err(XbrlEvidenceError::InvalidGraphStructure);
+                }
+                attributes_open = false;
+            }
+            XbrlXmlEvent::End { name } => {
+                attributes_open = false;
+                let start = stack
+                    .pop()
+                    .ok_or(XbrlEvidenceError::InvalidGraphStructure)?;
+                if start != name {
+                    return Err(XbrlEvidenceError::InvalidGraphStructure);
+                }
+            }
+        }
+    }
+    if stack.is_empty() {
+        Ok(())
+    } else {
+        Err(XbrlEvidenceError::InvalidGraphStructure)
+    }
+}
+
+/// Bounded balanced source-only XML evidence retained without recursive ownership.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct XbrlContextGraph {
+    events: BoundedXmlEvents,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct XbrlContextGraphWire {
+    events: BoundedXmlEvents,
+}
+
+impl<'de> Deserialize<'de> for XbrlContextGraph {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = XbrlContextGraphWire::deserialize(deserializer)?;
+        Self::try_new(wire.events.0).map_err(serde::de::Error::custom)
+    }
+}
+
+impl XbrlContextGraph {
+    /// Constructs a bounded balanced XML evidence graph.
+    pub fn try_new(events: Vec<XbrlXmlEvent>) -> Result<Self, XbrlEvidenceError> {
+        Ok(Self {
+            events: BoundedXmlEvents::try_new(events)?,
+        })
+    }
+
+    /// Constructs an empty graph for a context with no segment or scenario content.
+    pub const fn empty() -> Self {
+        Self {
+            events: BoundedXmlEvents(Vec::new()),
+        }
+    }
+
+    /// Returns ordered structural events.
+    pub fn events(&self) -> &[XbrlXmlEvent] {
+        &self.events.0
     }
 }
 
@@ -209,19 +490,27 @@ pub enum XbrlSign {
 #[serde(deny_unknown_fields, rename_all = "snake_case", tag = "kind")]
 pub enum XbrlDimensionMember {
     /// QName of an explicit member.
-    Explicit { member: SourceIdentifier },
-    /// Canonical retained representation and exact digest of a typed member.
+    Explicit { member: XbrlQualifiedName },
+    /// Bounded source-only graph of a typed member whose taxonomy semantics were not validated.
     Typed {
-        canonical_value: XbrlText,
-        payload_digest: EvidenceDigest,
+        source_graph: XbrlContextGraph,
+        validation: XbrlTypedMemberValidation,
     },
+}
+
+/// Validation authority retained for a typed-member value.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum XbrlTypedMemberValidation {
+    /// The parser retained bounded source structure but did not resolve taxonomy semantics.
+    SourceOnly,
 }
 
 /// One context dimension with explicit segment/scenario placement.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct XbrlDimensionEvidence {
-    dimension: SourceIdentifier,
+    dimension: XbrlQualifiedName,
     member: XbrlDimensionMember,
     location: XbrlDimensionLocation,
 }
@@ -229,7 +518,7 @@ pub struct XbrlDimensionEvidence {
 impl XbrlDimensionEvidence {
     /// Constructs dimension evidence.
     pub const fn new(
-        dimension: SourceIdentifier,
+        dimension: XbrlQualifiedName,
         member: XbrlDimensionMember,
         location: XbrlDimensionLocation,
     ) -> Self {
@@ -238,6 +527,21 @@ impl XbrlDimensionEvidence {
             member,
             location,
         }
+    }
+
+    /// Returns the resolved dimension QName.
+    pub const fn dimension(&self) -> &XbrlQualifiedName {
+        &self.dimension
+    }
+
+    /// Returns explicit or source-only typed-member evidence.
+    pub const fn member(&self) -> &XbrlDimensionMember {
+        &self.member
+    }
+
+    /// Returns whether the dimension appeared in segment or scenario.
+    pub const fn location(&self) -> XbrlDimensionLocation {
+        self.location
     }
 }
 
@@ -301,6 +605,470 @@ impl<'de> Deserialize<'de> for BoundedDimensions {
         D: Deserializer<'de>,
     {
         deserializer.deserialize_seq(BoundedDimensionsVisitor)
+    }
+}
+
+/// One simple or divided XBRL unit expression with lexical and expanded measure QNames.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct XbrlUnitExpression(XbrlUnitExpressionKind);
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case", tag = "kind")]
+enum XbrlUnitExpressionKind {
+    /// One measure QName.
+    Measure { measure: XbrlQualifiedName },
+    /// A nonempty numerator divided by a nonempty denominator.
+    Divide {
+        numerator: Vec<XbrlQualifiedName>,
+        denominator: Vec<XbrlQualifiedName>,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case", tag = "kind")]
+enum XbrlUnitExpressionWire {
+    Measure {
+        measure: XbrlQualifiedName,
+    },
+    Divide {
+        numerator: BoundedQualifiedNames,
+        denominator: BoundedQualifiedNames,
+    },
+}
+
+impl<'de> Deserialize<'de> for XbrlUnitExpression {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match XbrlUnitExpressionWire::deserialize(deserializer)? {
+            XbrlUnitExpressionWire::Measure { measure } => Ok(Self::measure(measure)),
+            XbrlUnitExpressionWire::Divide {
+                numerator,
+                denominator,
+            } => Self::divide(numerator.0, denominator.0).map_err(serde::de::Error::custom),
+        }
+    }
+}
+
+impl XbrlUnitExpression {
+    /// Constructs a simple measure unit.
+    pub const fn measure(measure: XbrlQualifiedName) -> Self {
+        Self(XbrlUnitExpressionKind::Measure { measure })
+    }
+
+    /// Constructs a divided unit and rejects empty or cancelling sides.
+    pub fn divide(
+        numerator: Vec<XbrlQualifiedName>,
+        denominator: Vec<XbrlQualifiedName>,
+    ) -> Result<Self, XbrlEvidenceError> {
+        if numerator.is_empty() || denominator.is_empty() {
+            return Err(XbrlEvidenceError::EmptyUnitSide);
+        }
+        if numerator.len() > MAX_XBRL_UNIT_MEASURES || denominator.len() > MAX_XBRL_UNIT_MEASURES {
+            return Err(XbrlEvidenceError::TooManyUnitMeasures);
+        }
+        if numerator.iter().any(|left| {
+            denominator
+                .iter()
+                .any(|right| left.same_expanded_name(right))
+        }) {
+            return Err(XbrlEvidenceError::CancellingUnitMeasure);
+        }
+        Ok(Self(XbrlUnitExpressionKind::Divide {
+            numerator: numerator.into_boxed_slice().into_vec(),
+            denominator: denominator.into_boxed_slice().into_vec(),
+        }))
+    }
+
+    /// Returns a stable lexical identifier while preserving the full typed expression separately.
+    pub fn source_identifier(&self) -> Result<SourceIdentifier, XbrlEvidenceError> {
+        let value = match &self.0 {
+            XbrlUnitExpressionKind::Measure { measure } => {
+                measure.source_qname().as_str().to_owned()
+            }
+            XbrlUnitExpressionKind::Divide {
+                numerator,
+                denominator,
+            } => format!(
+                "divide({}/{})",
+                join_source_qnames(numerator),
+                join_source_qnames(denominator)
+            ),
+        };
+        SourceIdentifier::try_from(value).map_err(|_| XbrlEvidenceError::UnitIdentifierTooLong)
+    }
+
+    /// Reports semantic equality using expanded-name measure multisets on each side.
+    pub fn same_semantics(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (
+                XbrlUnitExpressionKind::Measure { measure: left },
+                XbrlUnitExpressionKind::Measure { measure: right },
+            ) => left.same_expanded_name(right),
+            (
+                XbrlUnitExpressionKind::Divide {
+                    numerator: left_numerator,
+                    denominator: left_denominator,
+                },
+                XbrlUnitExpressionKind::Divide {
+                    numerator: right_numerator,
+                    denominator: right_denominator,
+                },
+            ) => {
+                expanded_name_multisets_equal(left_numerator, right_numerator)
+                    && expanded_name_multisets_equal(left_denominator, right_denominator)
+            }
+            _ => false,
+        }
+    }
+
+    /// Returns the simple measure, if this is not a divide unit.
+    pub const fn measure_name(&self) -> Option<&XbrlQualifiedName> {
+        match &self.0 {
+            XbrlUnitExpressionKind::Measure { measure } => Some(measure),
+            XbrlUnitExpressionKind::Divide { .. } => None,
+        }
+    }
+
+    /// Returns numerator and denominator measures for a divide unit.
+    pub fn divide_parts(&self) -> Option<(&[XbrlQualifiedName], &[XbrlQualifiedName])> {
+        match &self.0 {
+            XbrlUnitExpressionKind::Measure { .. } => None,
+            XbrlUnitExpressionKind::Divide {
+                numerator,
+                denominator,
+            } => Some((numerator, denominator)),
+        }
+    }
+}
+
+fn join_source_qnames(names: &[XbrlQualifiedName]) -> String {
+    names
+        .iter()
+        .map(|name| name.source_qname().as_str())
+        .collect::<Vec<_>>()
+        .join("*")
+}
+
+fn expanded_name_multisets_equal(left: &[XbrlQualifiedName], right: &[XbrlQualifiedName]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut matched = vec![false; right.len()];
+    for left_name in left {
+        let Some((index, _)) = right.iter().enumerate().find(|(index, right_name)| {
+            !matched[*index] && left_name.same_expanded_name(right_name)
+        }) else {
+            return false;
+        };
+        matched[index] = true;
+    }
+    true
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+struct BoundedQualifiedNames(Vec<XbrlQualifiedName>);
+
+struct BoundedQualifiedNamesVisitor;
+
+impl<'de> Visitor<'de> for BoundedQualifiedNamesVisitor {
+    type Value = BoundedQualifiedNames;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a bounded XBRL unit measure list")
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut names = Vec::with_capacity(sequence.size_hint().unwrap_or(0).min(8));
+        while names.len() < MAX_XBRL_UNIT_MEASURES {
+            let Some(name) = sequence.next_element()? else {
+                return Ok(BoundedQualifiedNames(names.into_boxed_slice().into_vec()));
+            };
+            names.push(name);
+        }
+        if sequence.next_element::<IgnoredAny>()?.is_some() {
+            Err(serde::de::Error::custom(
+                XbrlEvidenceError::TooManyUnitMeasures,
+            ))
+        } else {
+            Ok(BoundedQualifiedNames(names.into_boxed_slice().into_vec()))
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for BoundedQualifiedNames {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(BoundedQualifiedNamesVisitor)
+    }
+}
+
+/// One retained Inline XBRL relationship edge.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct XbrlRelationshipEvidence {
+    arcrole: SourceIdentifier,
+    from_refs: Vec<SourceIdentifier>,
+    to_refs: Vec<SourceIdentifier>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    link_role: Option<SourceIdentifier>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    order: Option<XbrlText>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct XbrlRelationshipEvidenceWire {
+    arcrole: SourceIdentifier,
+    from_refs: BoundedSourceIdentifiers,
+    to_refs: BoundedSourceIdentifiers,
+    #[serde(default)]
+    link_role: Option<SourceIdentifier>,
+    #[serde(default)]
+    order: Option<XbrlText>,
+}
+
+impl<'de> Deserialize<'de> for XbrlRelationshipEvidence {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = XbrlRelationshipEvidenceWire::deserialize(deserializer)?;
+        Self::try_new(
+            wire.arcrole,
+            wire.from_refs.0,
+            wire.to_refs.0,
+            wire.link_role,
+            wire.order,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+impl XbrlRelationshipEvidence {
+    /// Constructs a bounded many-to-many Inline XBRL relationship edge.
+    pub fn try_new(
+        arcrole: SourceIdentifier,
+        from_refs: Vec<SourceIdentifier>,
+        to_refs: Vec<SourceIdentifier>,
+        link_role: Option<SourceIdentifier>,
+        order: Option<XbrlText>,
+    ) -> Result<Self, XbrlEvidenceError> {
+        validate_source_identifier_set(&from_refs, MAX_XBRL_RELATIONSHIP_REFS, true)?;
+        validate_source_identifier_set(&to_refs, MAX_XBRL_RELATIONSHIP_REFS, true)?;
+        Ok(Self {
+            arcrole,
+            from_refs: from_refs.into_boxed_slice().into_vec(),
+            to_refs: to_refs.into_boxed_slice().into_vec(),
+            link_role,
+            order,
+        })
+    }
+
+    /// Returns source occurrence IDs at the relationship's origin.
+    pub fn from_refs(&self) -> &[SourceIdentifier] {
+        &self.from_refs
+    }
+
+    /// Returns source occurrence IDs at the relationship's destination.
+    pub fn to_refs(&self) -> &[SourceIdentifier] {
+        &self.to_refs
+    }
+}
+
+/// Bounded nesting, continuation, and relationship evidence incident to one occurrence.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct XbrlOccurrenceRelationships {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parent_occurrence_id: Option<SourceIdentifier>,
+    child_occurrence_ids: Vec<SourceIdentifier>,
+    continuation_chain: Vec<SourceIdentifier>,
+    relationships: Vec<XbrlRelationshipEvidence>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct XbrlOccurrenceRelationshipsWire {
+    #[serde(default)]
+    parent_occurrence_id: Option<SourceIdentifier>,
+    child_occurrence_ids: BoundedSourceIdentifiers,
+    continuation_chain: BoundedSourceIdentifiers,
+    relationships: BoundedRelationships,
+}
+
+impl<'de> Deserialize<'de> for XbrlOccurrenceRelationships {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = XbrlOccurrenceRelationshipsWire::deserialize(deserializer)?;
+        Self::try_new(
+            wire.parent_occurrence_id,
+            wire.child_occurrence_ids.0,
+            wire.continuation_chain.0,
+            wire.relationships.0,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+impl XbrlOccurrenceRelationships {
+    /// Constructs bounded relationship evidence without discarding source occurrences.
+    pub fn try_new(
+        parent_occurrence_id: Option<SourceIdentifier>,
+        child_occurrence_ids: Vec<SourceIdentifier>,
+        continuation_chain: Vec<SourceIdentifier>,
+        relationships: Vec<XbrlRelationshipEvidence>,
+    ) -> Result<Self, XbrlEvidenceError> {
+        validate_source_identifier_set(&child_occurrence_ids, MAX_XBRL_RELATIONSHIP_REFS, false)?;
+        validate_source_identifier_set(&continuation_chain, MAX_XBRL_RELATIONSHIP_REFS, false)?;
+        if relationships.len() > MAX_XBRL_RELATIONSHIPS {
+            return Err(XbrlEvidenceError::TooManyRelationships);
+        }
+        Ok(Self {
+            parent_occurrence_id,
+            child_occurrence_ids: child_occurrence_ids.into_boxed_slice().into_vec(),
+            continuation_chain: continuation_chain.into_boxed_slice().into_vec(),
+            relationships: relationships.into_boxed_slice().into_vec(),
+        })
+    }
+
+    /// Constructs evidence for an occurrence with no graph edges.
+    pub const fn empty() -> Self {
+        Self {
+            parent_occurrence_id: None,
+            child_occurrence_ids: Vec::new(),
+            continuation_chain: Vec::new(),
+            relationships: Vec::new(),
+        }
+    }
+
+    /// Validates that graph edges do not self-reference their owning occurrence.
+    fn validate_owner(&self, occurrence_id: &SourceIdentifier) -> Result<(), XbrlEvidenceError> {
+        if self.parent_occurrence_id.as_ref() == Some(occurrence_id)
+            || self.child_occurrence_ids.contains(occurrence_id)
+        {
+            Err(XbrlEvidenceError::SelfReferentialOccurrence)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn validate_source_identifier_set(
+    values: &[SourceIdentifier],
+    max: usize,
+    require_nonempty: bool,
+) -> Result<(), XbrlEvidenceError> {
+    if require_nonempty && values.is_empty() {
+        return Err(XbrlEvidenceError::EmptyRelationshipEndpoint);
+    }
+    if values.len() > max {
+        return Err(XbrlEvidenceError::TooManyRelationshipRefs);
+    }
+    let mut unique = BTreeSet::new();
+    if values.iter().any(|value| !unique.insert(value.as_str())) {
+        return Err(XbrlEvidenceError::DuplicateRelationshipRef);
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+struct BoundedSourceIdentifiers(Vec<SourceIdentifier>);
+
+struct BoundedSourceIdentifiersVisitor;
+
+impl<'de> Visitor<'de> for BoundedSourceIdentifiersVisitor {
+    type Value = BoundedSourceIdentifiers;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a bounded XBRL source-reference list")
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or(0).min(16));
+        while values.len() < MAX_XBRL_RELATIONSHIP_REFS {
+            let Some(value) = sequence.next_element()? else {
+                return Ok(BoundedSourceIdentifiers(
+                    values.into_boxed_slice().into_vec(),
+                ));
+            };
+            values.push(value);
+        }
+        if sequence.next_element::<IgnoredAny>()?.is_some() {
+            Err(serde::de::Error::custom(
+                XbrlEvidenceError::TooManyRelationshipRefs,
+            ))
+        } else {
+            Ok(BoundedSourceIdentifiers(
+                values.into_boxed_slice().into_vec(),
+            ))
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for BoundedSourceIdentifiers {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(BoundedSourceIdentifiersVisitor)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+struct BoundedRelationships(Vec<XbrlRelationshipEvidence>);
+
+struct BoundedRelationshipsVisitor;
+
+impl<'de> Visitor<'de> for BoundedRelationshipsVisitor {
+    type Value = BoundedRelationships;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a bounded Inline XBRL relationship list")
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or(0).min(8));
+        while values.len() < MAX_XBRL_RELATIONSHIPS {
+            let Some(value) = sequence.next_element()? else {
+                return Ok(BoundedRelationships(values.into_boxed_slice().into_vec()));
+            };
+            values.push(value);
+        }
+        if sequence.next_element::<IgnoredAny>()?.is_some() {
+            Err(serde::de::Error::custom(
+                XbrlEvidenceError::TooManyRelationships,
+            ))
+        } else {
+            Ok(BoundedRelationships(values.into_boxed_slice().into_vec()))
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for BoundedRelationships {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(BoundedRelationshipsVisitor)
     }
 }
 
@@ -370,18 +1138,36 @@ impl XbrlDuplicateEvidence {
     }
 }
 
-/// Exact taxonomy-set identity used to interpret one fact.
+/// Authority status for taxonomy metadata attached to one fact.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum XbrlTaxonomyStatus {
+    /// A caller declared this metadata; the parser did not resolve or validate the taxonomy set.
+    CallerDeclaredUnresolved,
+}
+
+/// Bounded taxonomy metadata whose validation authority is explicit.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct XbrlTaxonomySet {
     digest: EvidenceDigest,
     version: SourceIdentifier,
+    status: XbrlTaxonomyStatus,
 }
 
 impl XbrlTaxonomySet {
-    /// Constructs taxonomy-set evidence.
-    pub const fn new(digest: EvidenceDigest, version: SourceIdentifier) -> Self {
-        Self { digest, version }
+    /// Retains caller-declared taxonomy metadata without claiming resolution or validation.
+    pub const fn declared(digest: EvidenceDigest, version: SourceIdentifier) -> Self {
+        Self {
+            digest,
+            version,
+            status: XbrlTaxonomyStatus::CallerDeclaredUnresolved,
+        }
+    }
+
+    /// Returns the explicit validation authority.
+    pub const fn status(&self) -> XbrlTaxonomyStatus {
+        self.status
     }
 }
 
@@ -392,6 +1178,8 @@ pub struct XbrlFactEvidenceInput {
     pub accession: SourceIdentifier,
     pub context_id: SourceIdentifier,
     pub unit_id: SourceIdentifier,
+    pub concept: XbrlQualifiedName,
+    pub unit: XbrlUnitExpression,
     pub entity: XbrlEntity,
     pub period: XbrlPeriod,
     pub accuracy: XbrlAccuracy,
@@ -401,7 +1189,8 @@ pub struct XbrlFactEvidenceInput {
     pub inline_scale: Option<i32>,
     pub inline_sign: Option<XbrlSign>,
     pub dimensions: Vec<XbrlDimensionEvidence>,
-    pub segment_evidence: Option<XbrlText>,
+    pub context_graph: XbrlContextGraph,
+    pub occurrence_relationships: XbrlOccurrenceRelationships,
     pub language: Option<SourceIdentifier>,
     pub duplicate: XbrlDuplicateEvidence,
     pub taxonomy_set: XbrlTaxonomySet,
@@ -419,6 +1208,8 @@ pub struct XbrlFactEvidence {
     accession: SourceIdentifier,
     context_id: SourceIdentifier,
     unit_id: SourceIdentifier,
+    concept: XbrlQualifiedName,
+    unit: XbrlUnitExpression,
     entity: XbrlEntity,
     period: XbrlPeriod,
     accuracy: XbrlAccuracy,
@@ -428,8 +1219,8 @@ pub struct XbrlFactEvidence {
     inline_scale: Option<i32>,
     inline_sign: Option<XbrlSign>,
     dimensions: BoundedDimensions,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    segment_evidence: Option<XbrlText>,
+    context_graph: XbrlContextGraph,
+    occurrence_relationships: XbrlOccurrenceRelationships,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     language: Option<SourceIdentifier>,
     duplicate: XbrlDuplicateEvidence,
@@ -449,6 +1240,15 @@ impl XbrlFactEvidence {
         {
             return Err(XbrlEvidenceError::ScaleOutOfRange);
         }
+        if matches!(
+            input.accuracy,
+            XbrlAccuracy::Precision(XbrlAccuracyValue::Finite(value)) if value <= 0
+        ) {
+            return Err(XbrlEvidenceError::InvalidAccuracy);
+        }
+        input
+            .occurrence_relationships
+            .validate_owner(&input.occurrence_id)?;
         let dimensions = BoundedDimensions::try_new(input.dimensions)?;
         let candidate = Self {
             schema_version: XBRL_FACT_EVIDENCE_SCHEMA_VERSION,
@@ -456,6 +1256,8 @@ impl XbrlFactEvidence {
             accession: input.accession,
             context_id: input.context_id,
             unit_id: input.unit_id,
+            concept: input.concept,
+            unit: input.unit,
             entity: input.entity,
             period: input.period,
             accuracy: input.accuracy,
@@ -464,7 +1266,8 @@ impl XbrlFactEvidence {
             inline_scale: input.inline_scale,
             inline_sign: input.inline_sign,
             dimensions,
-            segment_evidence: input.segment_evidence,
+            context_graph: input.context_graph,
+            occurrence_relationships: input.occurrence_relationships,
             language: input.language,
             duplicate: input.duplicate,
             taxonomy_set: input.taxonomy_set,
@@ -490,6 +1293,26 @@ impl XbrlFactEvidence {
     /// Returns source period semantics.
     pub const fn period(&self) -> XbrlPeriod {
         self.period
+    }
+
+    /// Returns the source lexical and resolved concept QName.
+    pub const fn concept(&self) -> &XbrlQualifiedName {
+        &self.concept
+    }
+
+    /// Returns the source lexical and resolved unit expression.
+    pub const fn unit(&self) -> &XbrlUnitExpression {
+        &self.unit
+    }
+
+    /// Returns bounded segment/scenario structure.
+    pub const fn context_graph(&self) -> &XbrlContextGraph {
+        &self.context_graph
+    }
+
+    /// Returns nesting, continuation, and explanatory-relationship evidence.
+    pub const fn occurrence_relationships(&self) -> &XbrlOccurrenceRelationships {
+        &self.occurrence_relationships
     }
 
     /// Returns the exact decimal after applying retained scale and sign transforms.
@@ -530,6 +1353,20 @@ impl XbrlFactEvidence {
             Err(XbrlEvidenceError::NormalizedValueMismatch)
         }
     }
+
+    /// Validates canonical concept, unit, and value against this exact occurrence evidence.
+    pub fn validate_observation(
+        &self,
+        concept: &SourceIdentifier,
+        unit: &SourceIdentifier,
+        value: Decimal,
+    ) -> Result<(), XbrlEvidenceError> {
+        let evidence_unit = self.unit.source_identifier()?;
+        if self.concept.source_qname() != concept || &evidence_unit != unit {
+            return Err(XbrlEvidenceError::ObservationIdentityMismatch);
+        }
+        self.validate_value(value)
+    }
 }
 
 #[derive(Deserialize)]
@@ -540,6 +1377,8 @@ struct XbrlFactEvidenceWire {
     accession: SourceIdentifier,
     context_id: SourceIdentifier,
     unit_id: SourceIdentifier,
+    concept: XbrlQualifiedName,
+    unit: XbrlUnitExpression,
     entity: XbrlEntity,
     period: XbrlPeriod,
     accuracy: XbrlAccuracy,
@@ -549,8 +1388,8 @@ struct XbrlFactEvidenceWire {
     inline_scale: Option<i32>,
     inline_sign: Option<XbrlSign>,
     dimensions: BoundedDimensions,
-    #[serde(default)]
-    segment_evidence: Option<XbrlText>,
+    context_graph: XbrlContextGraph,
+    occurrence_relationships: XbrlOccurrenceRelationships,
     #[serde(default)]
     language: Option<SourceIdentifier>,
     duplicate: XbrlDuplicateEvidence,
@@ -577,6 +1416,8 @@ impl<'de> Deserialize<'de> for XbrlFactEvidence {
             accession: wire.accession,
             context_id: wire.context_id,
             unit_id: wire.unit_id,
+            concept: wire.concept,
+            unit: wire.unit,
             entity: wire.entity,
             period: wire.period,
             accuracy: wire.accuracy,
@@ -585,7 +1426,8 @@ impl<'de> Deserialize<'de> for XbrlFactEvidence {
             inline_scale: wire.inline_scale,
             inline_sign: wire.inline_sign,
             dimensions: wire.dimensions.0,
-            segment_evidence: wire.segment_evidence,
+            context_graph: wire.context_graph,
+            occurrence_relationships: wire.occurrence_relationships,
             language: wire.language,
             duplicate: wire.duplicate,
             taxonomy_set: wire.taxonomy_set,
@@ -603,13 +1445,30 @@ impl<'de> Deserialize<'de> for XbrlFactEvidence {
 pub enum XbrlEvidenceError {
     EmptyRequiredText,
     TextTooLong,
+    InvalidQualifiedName,
+    UnboundQualifiedName,
+    QualifiedNameMismatch,
+    TooManyGraphEvents,
+    InvalidGraphStructure,
+    DuplicateGraphAttribute,
     InvertedPeriod,
     TooManyDimensions,
+    EmptyUnitSide,
+    TooManyUnitMeasures,
+    CancellingUnitMeasure,
+    UnitIdentifierTooLong,
+    EmptyRelationshipEndpoint,
+    TooManyRelationshipRefs,
+    DuplicateRelationshipRef,
+    TooManyRelationships,
+    SelfReferentialOccurrence,
     MissingDuplicateGroup,
+    InvalidAccuracy,
     ScaleOutOfRange,
     InvalidNumericLexeme,
     NumericOverflow,
     NormalizedValueMismatch,
+    ObservationIdentityMismatch,
     UnsupportedSchemaVersion,
 }
 
@@ -618,13 +1477,38 @@ impl fmt::Display for XbrlEvidenceError {
         let message = match self {
             Self::EmptyRequiredText => "required XBRL text is empty",
             Self::TextTooLong => "XBRL text exceeds its byte bound",
+            Self::InvalidQualifiedName => "XBRL QName lexical form is invalid",
+            Self::UnboundQualifiedName => "prefixed XBRL QName lacks namespace authority",
+            Self::QualifiedNameMismatch => "XBRL QName local name disagrees with its lexical form",
+            Self::TooManyGraphEvents => "XBRL XML evidence graph exceeds its event bound",
+            Self::InvalidGraphStructure => "XBRL XML evidence graph is not balanced",
+            Self::DuplicateGraphAttribute => "XBRL XML evidence contains a duplicate attribute",
             Self::InvertedPeriod => "XBRL duration start is after its end",
             Self::TooManyDimensions => "XBRL context exceeds its dimension bound",
+            Self::EmptyUnitSide => "XBRL divide unit requires nonempty numerator and denominator",
+            Self::TooManyUnitMeasures => "XBRL unit exceeds its measure bound",
+            Self::CancellingUnitMeasure => {
+                "XBRL divide unit repeats one expanded measure on both sides"
+            }
+            Self::UnitIdentifierTooLong => "XBRL unit lexical identifier exceeds its bound",
+            Self::EmptyRelationshipEndpoint => "Inline XBRL relationship endpoint is empty",
+            Self::TooManyRelationshipRefs => {
+                "Inline XBRL relationship endpoint exceeds its reference bound"
+            }
+            Self::DuplicateRelationshipRef => {
+                "Inline XBRL relationship endpoint repeats a source reference"
+            }
+            Self::TooManyRelationships => "Inline XBRL occurrence exceeds its relationship bound",
+            Self::SelfReferentialOccurrence => "Inline XBRL nesting edge is self-referential",
             Self::MissingDuplicateGroup => "non-unique XBRL occurrence requires a duplicate group",
+            Self::InvalidAccuracy => "XBRL precision must be positive or infinite",
             Self::ScaleOutOfRange => "Inline XBRL scale exceeds Decimal capacity",
             Self::InvalidNumericLexeme => "XBRL numeric lexical value is invalid",
             Self::NumericOverflow => "XBRL numeric transform exceeds Decimal capacity",
             Self::NormalizedValueMismatch => "XBRL evidence does not produce the canonical value",
+            Self::ObservationIdentityMismatch => {
+                "XBRL evidence concept or unit does not match the canonical observation"
+            }
             Self::UnsupportedSchemaVersion => "XBRL evidence schema version is unsupported",
         };
         formatter.write_str(message)

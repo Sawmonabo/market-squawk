@@ -109,7 +109,7 @@ impl FundamentalObservation {
         xbrl_evidence: XbrlFactEvidence,
     ) -> Result<Self, ResearchError> {
         require_instrument(&context)?;
-        xbrl_evidence.validate_value(value)?;
+        xbrl_evidence.validate_observation(&concept, &unit, value)?;
         Ok(Self {
             context,
             concept,

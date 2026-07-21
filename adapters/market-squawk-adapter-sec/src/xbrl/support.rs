@@ -13,6 +13,8 @@ pub enum SecXbrlError {
     StringLimitExceeded,
     #[error("XBRL fact count exceeds its record bound")]
     RecordLimitExceeded,
+    #[error("XBRL retained output exceeds its aggregate byte bound")]
+    RetainedOutputLimitExceeded,
     #[error("XBRL attribute count exceeds its bound")]
     AttributeLimitExceeded,
     #[error("XBRL DTDs are forbidden")]
@@ -27,6 +29,10 @@ pub enum SecXbrlError {
     MissingAttribute,
     #[error("XBRL element contains a duplicate attribute")]
     DuplicateAttribute,
+    #[error("XBRL semantic attribute is ambiguous across namespace authorities")]
+    AmbiguousSemanticAttribute,
+    #[error("XBRL QName uses an unknown namespace prefix")]
+    UnknownNamespacePrefix,
     #[error("XBRL identity is duplicated")]
     DuplicateIdentity,
     #[error("XBRL context is nested")]
@@ -45,6 +51,8 @@ pub enum SecXbrlError {
     IncompleteContext,
     #[error("XBRL unit is incomplete")]
     IncompleteUnit,
+    #[error("XBRL unit expression is invalid")]
+    InvalidUnitExpression,
     #[error("XBRL fact references an unknown context")]
     UnknownContext,
     #[error("XBRL fact references an unknown unit")]
@@ -53,6 +61,8 @@ pub enum SecXbrlError {
     UnknownContinuation,
     #[error("Inline XBRL continuation chain contains a cycle")]
     ContinuationCycle,
+    #[error("Inline XBRL relationship references an unknown fact occurrence")]
+    UnknownRelationshipReference,
     #[error("XBRL fact has conflicting accuracy attributes")]
     ConflictingAccuracy,
     #[error("XBRL numeric fact is invalid or out of range")]

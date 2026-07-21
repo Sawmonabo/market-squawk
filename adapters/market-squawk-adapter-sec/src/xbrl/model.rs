@@ -1,7 +1,8 @@
 //! Public bounded XBRL extraction result types.
 
 use market_squawk_domain::{
-    ExactPayloadEvidence, SourceIdentifier, Timestamp, XbrlFactEvidence, XbrlTaxonomySet, XbrlText,
+    ExactPayloadEvidence, SourceIdentifier, Timestamp, XbrlFactEvidence,
+    XbrlOccurrenceRelationships, XbrlQualifiedName, XbrlTaxonomySet, XbrlText,
 };
 use rust_decimal::Decimal;
 
@@ -64,14 +65,25 @@ impl XbrlNumericFact {
 pub struct XbrlNonnumericOccurrence {
     pub(super) occurrence_id: SourceIdentifier,
     pub(super) accession: SourceIdentifier,
-    pub(super) concept: SourceIdentifier,
+    pub(super) concept: XbrlQualifiedName,
     pub(super) context_id: SourceIdentifier,
     pub(super) lexical_value: XbrlText,
     pub(super) nil: bool,
     pub(super) source_payload: ExactPayloadEvidence,
+    pub(super) occurrence_relationships: XbrlOccurrenceRelationships,
 }
 
 impl XbrlNonnumericOccurrence {
+    /// Returns the source or deterministic occurrence identity.
+    pub const fn occurrence_id(&self) -> &SourceIdentifier {
+        &self.occurrence_id
+    }
+
+    /// Returns the source lexical and resolved concept QName.
+    pub const fn concept(&self) -> &XbrlQualifiedName {
+        &self.concept
+    }
+
     /// Returns the exact bounded text, empty only for an explicit nil occurrence.
     pub const fn lexical_value(&self) -> &XbrlText {
         &self.lexical_value
@@ -79,6 +91,11 @@ impl XbrlNonnumericOccurrence {
     /// Returns whether the occurrence carried explicit nil semantics.
     pub const fn is_nil(&self) -> bool {
         self.nil
+    }
+
+    /// Returns nesting, continuation, and explanatory relationship evidence.
+    pub const fn occurrence_relationships(&self) -> &XbrlOccurrenceRelationships {
+        &self.occurrence_relationships
     }
 }
 

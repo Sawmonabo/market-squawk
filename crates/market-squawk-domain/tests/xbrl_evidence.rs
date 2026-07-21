@@ -5,8 +5,11 @@ use market_squawk_domain::{
     AvailabilityEvidence, DataQuality, DigestAlgorithm, EvidenceDigest, ExactPayloadEvidence,
     FundamentalObservation, InstrumentId, PayloadReference, ResearchContext, ResearchProvenance,
     ResearchProvenanceInput, ResearchTime, RevisionNumber, SourceId, SourceIdentifier, Timestamp,
-    XbrlAccuracy, XbrlAccuracyValue, XbrlDuplicateClass, XbrlDuplicateEvidence, XbrlEntity,
-    XbrlFactEvidence, XbrlFactEvidenceInput, XbrlPeriod, XbrlTaxonomySet,
+    XbrlAccuracy, XbrlAccuracyValue, XbrlContextGraph, XbrlDimensionEvidence,
+    XbrlDimensionLocation, XbrlDimensionMember, XbrlDuplicateClass, XbrlDuplicateEvidence,
+    XbrlEntity, XbrlFactEvidence, XbrlFactEvidenceInput, XbrlOccurrenceRelationships, XbrlPeriod,
+    XbrlQualifiedName, XbrlRelationshipEvidence, XbrlTaxonomySet, XbrlTypedMemberValidation,
+    XbrlUnitExpression, XbrlXmlEvent,
 };
 use rust_decimal::Decimal;
 
@@ -43,11 +46,66 @@ fn research_context() -> Result<ResearchContext, Box<dyn Error>> {
 #[test]
 fn xbrl_evidence_round_trips_and_binds_the_exact_normalized_value() -> Result<(), Box<dyn Error>> {
     let context = research_context()?;
+    let concept =
+        XbrlQualifiedName::try_new("us-gaap:NetIncomeLoss", "http://fasb.org/us-gaap/2025")?;
+    let unit = XbrlUnitExpression::measure(XbrlQualifiedName::try_new(
+        "iso4217:USD",
+        "http://www.xbrl.org/2003/iso4217",
+    )?);
+    let channel_name =
+        XbrlQualifiedName::try_new("custom:channel", "https://example.test/taxonomy")?;
+    let typed_source_graph = XbrlContextGraph::try_new(vec![
+        XbrlXmlEvent::Start {
+            name: channel_name.clone(),
+        },
+        XbrlXmlEvent::Attribute {
+            name: XbrlQualifiedName::unqualified("code")?,
+            value: "D".try_into()?,
+        },
+        XbrlXmlEvent::Text {
+            value: "Direct".try_into()?,
+        },
+        XbrlXmlEvent::End { name: channel_name },
+    ])?;
+    let context_graph = XbrlContextGraph::try_new(vec![
+        XbrlXmlEvent::Start {
+            name: XbrlQualifiedName::try_new(
+                "xbrli:scenario",
+                "http://www.xbrl.org/2003/instance",
+            )?,
+        },
+        XbrlXmlEvent::Start {
+            name: XbrlQualifiedName::try_new("xbrldi:typedMember", "http://xbrl.org/2006/xbrldi")?,
+        },
+        XbrlXmlEvent::End {
+            name: XbrlQualifiedName::try_new("xbrldi:typedMember", "http://xbrl.org/2006/xbrldi")?,
+        },
+        XbrlXmlEvent::End {
+            name: XbrlQualifiedName::try_new(
+                "xbrli:scenario",
+                "http://www.xbrl.org/2003/instance",
+            )?,
+        },
+    ])?;
+    let relationships = XbrlOccurrenceRelationships::try_new(
+        None,
+        vec![SourceIdentifier::try_from("fact-7-child")?],
+        vec![SourceIdentifier::try_from("fact-7-continuation")?],
+        vec![XbrlRelationshipEvidence::try_new(
+            SourceIdentifier::try_from("http://www.xbrl.org/2003/arcrole/fact-explanatoryFact")?,
+            vec![SourceIdentifier::try_from("fact-7")?],
+            vec![SourceIdentifier::try_from("fact-note")?],
+            None,
+            None,
+        )?],
+    )?;
     let evidence = XbrlFactEvidence::try_new(XbrlFactEvidenceInput {
         occurrence_id: SourceIdentifier::try_from("fact-7")?,
         accession: SourceIdentifier::try_from("0000320193-25-000079")?,
         context_id: SourceIdentifier::try_from("D2025Q2")?,
         unit_id: SourceIdentifier::try_from("USD")?,
+        concept,
+        unit,
         entity: XbrlEntity::try_new("http://www.sec.gov/CIK", "0000320193")?,
         period: XbrlPeriod::duration(
             market_squawk_domain::CalendarDate::new(2025, 3, 30)?,
@@ -58,15 +116,23 @@ fn xbrl_evidence_round_trips_and_binds_the_exact_normalized_value() -> Result<()
         transformed_lexeme: None,
         inline_scale: Some(0),
         inline_sign: Some(market_squawk_domain::XbrlSign::Negative),
-        dimensions: Vec::new(),
-        segment_evidence: None,
+        dimensions: vec![XbrlDimensionEvidence::new(
+            XbrlQualifiedName::try_new("custom:ChannelAxis", "https://example.test/taxonomy")?,
+            XbrlDimensionMember::Typed {
+                source_graph: typed_source_graph,
+                validation: XbrlTypedMemberValidation::SourceOnly,
+            },
+            XbrlDimensionLocation::Scenario,
+        )],
+        context_graph,
+        occurrence_relationships: relationships,
         language: Some(SourceIdentifier::try_from("en-US")?),
         duplicate: XbrlDuplicateEvidence::try_new(
             XbrlDuplicateClass::Unique,
             None,
             SourceIdentifier::try_from("sec-xbrl-duplicate-v1")?,
         )?,
-        taxonomy_set: XbrlTaxonomySet::new(
+        taxonomy_set: XbrlTaxonomySet::declared(
             EvidenceDigest::new(DigestAlgorithm::Sha256, [3; 32]),
             SourceIdentifier::try_from("us-gaap-2025")?,
         ),
@@ -82,13 +148,27 @@ fn xbrl_evidence_round_trips_and_binds_the_exact_normalized_value() -> Result<()
         context,
         SourceIdentifier::try_from("us-gaap:NetIncomeLoss")?,
         Decimal::from(-23_434_000_000_i64),
-        SourceIdentifier::try_from("USD")?,
+        SourceIdentifier::try_from("iso4217:USD")?,
         evidence,
     )?;
 
     let wire = serde_json::to_string(&observation)?;
     let restored: FundamentalObservation = serde_json::from_str(&wire)?;
     assert_eq!(restored, observation);
+    let evidence_wire = serde_json::to_value(
+        restored
+            .xbrl_evidence()
+            .ok_or("missing restored evidence")?,
+    )?;
+    assert_eq!(evidence_wire["schema_version"], 2);
+    assert_eq!(
+        evidence_wire["taxonomy_set"]["status"],
+        "caller_declared_unresolved"
+    );
+    assert_eq!(
+        evidence_wire["dimensions"][0]["member"]["validation"],
+        "source_only"
+    );
     assert_eq!(
         restored
             .xbrl_evidence()
@@ -105,7 +185,7 @@ fn xbrl_evidence_round_trips_and_binds_the_exact_normalized_value() -> Result<()
 }
 
 #[test]
-fn xbrl_evidence_rejects_inverted_periods_and_unbounded_typed_members() -> Result<(), Box<dyn Error>>
+fn xbrl_evidence_rejects_invalid_graph_units_and_overstated_authority() -> Result<(), Box<dyn Error>>
 {
     assert!(
         XbrlPeriod::duration(
@@ -141,6 +221,26 @@ fn xbrl_evidence_rejects_inverted_periods_and_unbounded_typed_members() -> Resul
             "ruleset": "sec-xbrl-duplicate-v1"
         }))
         .is_err()
+    );
+    let name = XbrlQualifiedName::try_new("custom:value", "https://example.test/taxonomy")?;
+    assert!(XbrlContextGraph::try_new(vec![XbrlXmlEvent::Start { name: name.clone() }]).is_err());
+    assert!(
+        XbrlUnitExpression::divide(Vec::new(), vec![name.clone()]).is_err(),
+        "divide units require a numerator"
+    );
+    assert!(
+        XbrlUnitExpression::divide(vec![name.clone()], vec![name]).is_err(),
+        "the same expanded measure cannot appear on both sides"
+    );
+    let declared_taxonomy = XbrlTaxonomySet::declared(
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [3; 32]),
+        SourceIdentifier::try_from("us-gaap-2025")?,
+    );
+    let mut overstated_taxonomy = serde_json::to_value(declared_taxonomy)?;
+    overstated_taxonomy["status"] = serde_json::json!("resolved_and_validated");
+    assert!(
+        serde_json::from_value::<XbrlTaxonomySet>(overstated_taxonomy).is_err(),
+        "unresolved caller input cannot deserialize as validated taxonomy evidence"
     );
     Ok(())
 }

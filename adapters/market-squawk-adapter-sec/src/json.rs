@@ -27,6 +27,7 @@ pub struct SecParserLimits {
     max_depth: usize,
     max_string_bytes: usize,
     max_total_string_bytes: usize,
+    max_retained_output_bytes: usize,
 }
 
 impl SecParserLimits {
@@ -38,6 +39,7 @@ impl SecParserLimits {
             max_depth: 128,
             max_string_bytes: 256 * 1024,
             max_total_string_bytes: 24 * 1024 * 1024,
+            max_retained_output_bytes: 128 * 1024 * 1024,
         }
     }
 
@@ -48,12 +50,14 @@ impl SecParserLimits {
         max_depth: usize,
         max_string_bytes: usize,
         max_total_string_bytes: usize,
+        max_retained_output_bytes: usize,
     ) -> Result<Self, SecParserError> {
         if max_decoded_bytes == 0
             || max_records == 0
             || max_depth == 0
             || max_string_bytes == 0
             || max_total_string_bytes == 0
+            || max_retained_output_bytes == 0
             || max_string_bytes > max_total_string_bytes
         {
             return Err(SecParserError::InvalidLimits);
@@ -64,7 +68,13 @@ impl SecParserLimits {
             max_depth,
             max_string_bytes,
             max_total_string_bytes,
+            max_retained_output_bytes,
         })
+    }
+
+    /// Returns the aggregate retained-output ceiling for parsers that materialize owned results.
+    pub const fn retained_output_bytes(self) -> usize {
+        self.max_retained_output_bytes
     }
 
     pub(crate) const fn decoded_bytes(self) -> usize {

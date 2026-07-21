@@ -17,10 +17,13 @@ pub use observations::{
     TransactionObservation,
 };
 pub use xbrl::{
-    MAX_XBRL_DIMENSIONS, XBRL_FACT_EVIDENCE_SCHEMA_VERSION, XbrlAccuracy, XbrlAccuracyValue,
-    XbrlDimensionEvidence, XbrlDimensionLocation, XbrlDimensionMember, XbrlDuplicateClass,
-    XbrlDuplicateEvidence, XbrlEntity, XbrlEvidenceError, XbrlFactEvidence, XbrlFactEvidenceInput,
-    XbrlPeriod, XbrlSign, XbrlTaxonomySet, XbrlText,
+    MAX_XBRL_DIMENSIONS, MAX_XBRL_GRAPH_EVENTS, MAX_XBRL_RELATIONSHIP_REFS, MAX_XBRL_RELATIONSHIPS,
+    MAX_XBRL_UNIT_MEASURES, XBRL_FACT_EVIDENCE_SCHEMA_VERSION, XbrlAccuracy, XbrlAccuracyValue,
+    XbrlContextGraph, XbrlDimensionEvidence, XbrlDimensionLocation, XbrlDimensionMember,
+    XbrlDuplicateClass, XbrlDuplicateEvidence, XbrlEntity, XbrlEvidenceError, XbrlFactEvidence,
+    XbrlFactEvidenceInput, XbrlOccurrenceRelationships, XbrlPeriod, XbrlQualifiedName,
+    XbrlRelationshipEvidence, XbrlSign, XbrlTaxonomySet, XbrlTaxonomyStatus, XbrlText,
+    XbrlTypedMemberValidation, XbrlUnitExpression, XbrlXmlEvent,
 };
 
 /// Direction of a nonzero portfolio position.

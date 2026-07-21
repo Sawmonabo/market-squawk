@@ -81,6 +81,38 @@ if another process component installed a provider first; see rustls's
 [`CryptoProvider`](https://docs.rs/rustls/0.23.42/rustls/crypto/struct.CryptoProvider.html)
 contract. This proves the selected in-process implementation, not any external provider identity.
 
+### XBRL semantic authorities
+
+The SEC adapter's XBRL evidence contract was checked on 2026-07-20 against the primary XBRL
+specifications, not inferred from parser behavior:
+
+- [XBRL 2.1](https://www.xbrl.org/Specification/XBRL-2.1/REC-2003-12-31/XBRL-2.1-REC-2003-12-31%2Bcorrected-errata-2013-02-20.html)
+  defines namespace-qualified concepts and measures, precision/decimals, duplicate equality, and
+  simple versus numerator/denominator units. Source QName text is retained as evidence, while
+  semantic identity uses the resolved namespace URI and local name.
+- [XBRL Dimensions 1.0](https://www.xbrl.org/specification/dimensions/rec-2012-01-25/dimensions-rec-2006-09-18%2Bcorrected-errata-2012-01-25-clean.html)
+  requires typed members to retain their child XML structure and to be validated against the DTS.
+  Without a resolved DTS, Market Squawk records source-only typed evidence and never labels it
+  canonical or taxonomy-validated.
+- XBRL International's [duplicate-facts guidance](https://www.xbrl.org/WGN/xbrl-duplicates/WGN-2025-01-14/xbrl-duplicates-2025-01-14.html)
+  groups facts by semantic dimensions and treats numeric duplicates as consistent only when their
+  exact reported-accuracy intervals have a common overlap; context IDs and namespace prefixes are
+  not semantic identity. Non-dimensional `segment` or `scenario` content remains a distinguishing
+  context aspect. Because its QName-valued content cannot be interpreted without schema type
+  information, the adapter compares that retained source graph conservatively rather than merging
+  contexts that might differ semantically.
+- [Inline XBRL 1.1](https://www.xbrl.org/Specification/inlineXBRL-part1/REC-2013-11-18%2Berrata-2026-07-14/inlineXBRL-part1-REC-2013-11-18%2Bcorrected-errata-2026-07-14.html)
+  includes nested facts, continuations, and `ix:relationship` explanatory-fact edges. A flattened
+  text value is therefore insufficient audit evidence; the bounded occurrence/relationship graph
+  is retained separately from typed-member XML events.
+- The normative [Transformation Registry 5](https://www.xbrl.org/Specification/inlineXBRL-transformationRegistry/REC-2022-02-16/inlineXBRL-transformationRegistry-REC-2022-02-16.html)
+  identifies each registry version by an exact namespace. Numeric transforms are admitted only for
+  an explicitly supported namespace/local-name pair; lexical substring matching is not authority.
+
+These references define parsing and evidence semantics only. Market Squawk does not claim DTS or
+taxonomy validation unless the exact taxonomy artifacts were independently resolved, bounded,
+hashed, and validated for that filing.
+
 ### MCP, Python, and inference
 
 | Dependency | Exact request | License / floor | Admission decision |

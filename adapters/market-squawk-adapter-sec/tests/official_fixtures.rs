@@ -104,7 +104,7 @@ fn malformed_columnar_shapes_and_record_limits_fail_closed() -> TestResult {
         "ambiguous duplicate JSON keys must fail closed"
     );
 
-    let one_record = SecParserLimits::try_new(1024 * 1024, 1, 128, 16, 64 * 1024)?;
+    let one_record = SecParserLimits::try_new(1024 * 1024, 1, 128, 16, 64 * 1024, 4 * 1024 * 1024)?;
     assert!(
         CompanyFactsDocument::parse(include_bytes!("../fixtures/company-facts.json"), one_record,)
             .is_err()

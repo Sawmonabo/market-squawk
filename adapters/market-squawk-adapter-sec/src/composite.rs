@@ -287,6 +287,7 @@ pub(crate) fn restore_online_submissions(
         16,
         4 * 1024,
         256 * 1024,
+        1024 * 1024,
     )?;
     let value = crate::json::parse_bounded_json_with_cancellation(
         manifest_bytes,
