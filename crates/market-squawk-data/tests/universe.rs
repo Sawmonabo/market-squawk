@@ -2,12 +2,15 @@ use std::error::Error;
 use std::str::FromStr;
 
 use market_squawk_data::{
-    DatasetId, DatasetManifestRef, DatasetSchemaRegistry, Sha256Digest, UniverseError,
-    UniverseExclusionReason, UniverseId, UniverseLimits, UniverseMembership, UniverseSnapshot,
+    ContractRollEvidence, DatasetId, DatasetManifestRef, DatasetSchemaRegistry, DerivativeBoundary,
+    DerivativeCivilDate, DerivativeLifecycleEvidence, DerivativeSelectionDecision,
+    DerivativeUniverseSnapshot, Sha256Digest, UniverseError, UniverseExclusionReason, UniverseId,
+    UniverseLimits, UniverseMembership, UniverseSnapshot,
 };
 use market_squawk_domain::{
-    AvailabilityEvidence, DigestAlgorithm, EffectiveInterval, EvidenceDigest, InstrumentId,
-    SourceIdentifier, Timestamp,
+    AvailabilityEvidence, CalendarDate, ContractRollMapping, DigestAlgorithm, EffectiveInterval,
+    EvidenceDigest, FuturesLifecycleDateFields, FuturesLifecycleDates, InstrumentId,
+    OccOptionIdentity, SourceIdentifier, Timestamp,
 };
 
 type TestResult = Result<(), Box<dyn Error>>;
@@ -35,6 +38,33 @@ fn membership(
             ends_at.map(Timestamp::from_unix_nanos),
         )?,
         availability,
+        manifest(marker)?,
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [marker; 32]),
+    ))
+}
+
+fn derivative_membership(
+    instrument_id: InstrumentId,
+    marker: u8,
+) -> Result<UniverseMembership, Box<dyn Error>> {
+    Ok(UniverseMembership::new(
+        instrument_id,
+        EffectiveInterval::new(Timestamp::from_unix_nanos(1), None)?,
+        AvailabilityEvidence::local_first_observed(Timestamp::from_unix_nanos(1)),
+        manifest(marker)?,
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [marker; 32]),
+    ))
+}
+
+fn futures_lifecycle(
+    instrument_id: InstrumentId,
+    marker: u8,
+    fields: FuturesLifecycleDateFields,
+) -> Result<DerivativeLifecycleEvidence, Box<dyn Error>> {
+    Ok(DerivativeLifecycleEvidence::future(
+        instrument_id,
+        FuturesLifecycleDates::try_new(fields)?,
+        AvailabilityEvidence::local_first_observed(Timestamp::from_unix_nanos(1)),
         manifest(marker)?,
         EvidenceDigest::new(DigestAlgorithm::Sha256, [marker; 32]),
     ))
@@ -242,5 +272,167 @@ fn historical_universe_is_time_correct_deterministic_and_bounded() -> TestResult
         UniverseId::try_from("x".repeat(UniverseId::MAX_LENGTH + 1)),
         Err(UniverseError::UniverseIdTooLong { .. })
     ));
+    Ok(())
+}
+
+#[test]
+fn derivative_lifecycle_is_civil_date_conservative_and_rolls_only_on_explicit_evidence()
+-> TestResult {
+    let option_id = InstrumentId::from_str("0187f5f1-6fc2-7fa2-bf05-2ce5354c5601")?;
+    let expiring_future = InstrumentId::from_str("0187f5f1-6fc2-7fa2-bf05-2ce5354c5602")?;
+    let roll_successor = InstrumentId::from_str("0187f5f1-6fc2-7fa2-bf05-2ce5354c5603")?;
+    let no_roll_future = InstrumentId::from_str("0187f5f1-6fc2-7fa2-bf05-2ce5354c5604")?;
+    let listed = [option_id, expiring_future, roll_successor, no_roll_future];
+    let candidates = listed
+        .into_iter()
+        .enumerate()
+        .map(|(index, instrument_id)| {
+            derivative_membership(instrument_id, u8::try_from(index + 1)?)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let lifecycle = vec![
+        DerivativeLifecycleEvidence::try_option(
+            option_id,
+            OccOptionIdentity::try_from("SPX   260320C05000000")?,
+            CalendarDate::new(2026, 3, 20)?,
+            AvailabilityEvidence::local_first_observed(Timestamp::from_unix_nanos(1)),
+            manifest(11)?,
+            EvidenceDigest::new(DigestAlgorithm::Sha256, [11; 32]),
+        )?,
+        futures_lifecycle(
+            expiring_future,
+            12,
+            FuturesLifecycleDateFields {
+                last_trade_date: Some(CalendarDate::new(2026, 3, 20)?),
+                expiration_date: Some(CalendarDate::new(2026, 3, 21)?),
+                ..FuturesLifecycleDateFields::default()
+            },
+        )?,
+        futures_lifecycle(
+            roll_successor,
+            13,
+            FuturesLifecycleDateFields {
+                last_trade_date: Some(CalendarDate::new(2026, 6, 19)?),
+                expiration_date: Some(CalendarDate::new(2026, 6, 20)?),
+                ..FuturesLifecycleDateFields::default()
+            },
+        )?,
+        futures_lifecycle(
+            no_roll_future,
+            14,
+            FuturesLifecycleDateFields {
+                expiration_date: Some(CalendarDate::new(2026, 3, 21)?),
+                ..FuturesLifecycleDateFields::default()
+            },
+        )?,
+    ];
+    let calendar_rule = SourceIdentifier::try_from("cme-calendar-2026-v1")?;
+    let dates = |date| {
+        listed
+            .into_iter()
+            .map(|instrument_id| {
+                DerivativeCivilDate::new(instrument_id, date, calendar_rule.clone())
+            })
+            .collect::<Vec<_>>()
+    };
+    let limits = UniverseLimits::try_new(16, 1024 * 1024)?;
+    let before = DerivativeUniverseSnapshot::try_build(
+        UniverseId::try_from("listed-derivatives.historical")?,
+        Timestamp::from_unix_nanos(99),
+        candidates.clone(),
+        lifecycle.clone(),
+        dates(CalendarDate::new(2026, 3, 19)?),
+        Vec::new(),
+        limits,
+    )?;
+    assert!(before.contains(option_id));
+    assert!(before.contains(expiring_future));
+
+    let boundary = DerivativeUniverseSnapshot::try_build(
+        UniverseId::try_from("listed-derivatives.historical")?,
+        Timestamp::from_unix_nanos(100),
+        candidates.clone(),
+        lifecycle.clone(),
+        dates(CalendarDate::new(2026, 3, 20)?),
+        Vec::new(),
+        limits,
+    )?;
+    assert_eq!(
+        boundary.decision(option_id),
+        Some(DerivativeSelectionDecision::SameDateUnresolved {
+            boundary: DerivativeBoundary::OptionExpiration,
+            date: CalendarDate::new(2026, 3, 20)?,
+        })
+    );
+    assert!(!boundary.contains(option_id));
+    assert_eq!(
+        boundary.decision(expiring_future),
+        Some(DerivativeSelectionDecision::SameDateUnresolved {
+            boundary: DerivativeBoundary::FuturesLastTrade,
+            date: CalendarDate::new(2026, 3, 20)?,
+        })
+    );
+    assert!(boundary.contains(no_roll_future));
+
+    let roll = ContractRollEvidence::new(
+        ContractRollMapping::new(
+            expiring_future,
+            roll_successor,
+            Timestamp::from_unix_nanos(100),
+        )?,
+        AvailabilityEvidence::local_first_observed(Timestamp::from_unix_nanos(90)),
+        manifest(20)?,
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [20; 32]),
+    );
+    let after = DerivativeUniverseSnapshot::try_build(
+        UniverseId::try_from("listed-derivatives.historical")?,
+        Timestamp::from_unix_nanos(101),
+        candidates.clone(),
+        lifecycle.clone(),
+        dates(CalendarDate::new(2026, 3, 22)?),
+        vec![roll.clone()],
+        limits,
+    )?;
+    assert_eq!(
+        after.decision(expiring_future),
+        Some(DerivativeSelectionDecision::Rolled {
+            to_instrument_id: roll_successor,
+            effective_at: Timestamp::from_unix_nanos(100),
+        })
+    );
+    assert_eq!(
+        after.decision(no_roll_future),
+        Some(DerivativeSelectionDecision::FutureExpiredWithoutRoll {
+            boundary: DerivativeBoundary::FuturesExpiration,
+            date: CalendarDate::new(2026, 3, 21)?,
+        })
+    );
+    assert_eq!(
+        after.decision(option_id),
+        Some(DerivativeSelectionDecision::OptionExpired {
+            boundary: DerivativeBoundary::OptionExpiration,
+            date: CalendarDate::new(2026, 3, 20)?,
+        })
+    );
+    assert!(!after.contains(expiring_future));
+    assert!(after.contains(roll_successor));
+    assert!(!after.contains(no_roll_future));
+    assert_eq!(after.resolved_roll(expiring_future), Some(&roll));
+    let mut reversed_candidates = candidates.clone();
+    reversed_candidates.reverse();
+    let mut reversed_lifecycle = lifecycle;
+    reversed_lifecycle.reverse();
+    let reordered = DerivativeUniverseSnapshot::try_build(
+        UniverseId::try_from("listed-derivatives.historical")?,
+        Timestamp::from_unix_nanos(101),
+        reversed_candidates,
+        reversed_lifecycle,
+        dates(CalendarDate::new(2026, 3, 22)?),
+        vec![roll],
+        limits,
+    )?;
+    assert_eq!(after.content_hash(), reordered.content_hash());
+    assert_eq!(after.audit_hash(), reordered.audit_hash());
+    assert_eq!(candidates[0].effective_interval().ends_at(), None);
     Ok(())
 }
