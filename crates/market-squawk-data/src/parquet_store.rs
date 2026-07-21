@@ -794,6 +794,7 @@ fn map_artifact_root_clone_error(error: PathError) -> ParquetStoreError {
         PathError::Io { source, .. } => ParquetStoreError::Io(source),
         PathError::PreparedRootChanged => ParquetStoreError::RootCatalogMismatch,
         PathError::ReadOnly
+        | PathError::ControlRootUnavailable
         | PathError::ArtifactRootUnavailable
         | PathError::CatalogLocationUnavailable
         | PathError::CatalogAlreadyLocked => ParquetStoreError::RootCatalogMismatch,
