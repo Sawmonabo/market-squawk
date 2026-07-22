@@ -10,8 +10,8 @@ the build or application. The self-contained `tract-onnx` backend remains the re
 | Admitted version | 1.24.4 |
 | Supplier | Microsoft Corporation and contributors |
 | License | MIT |
-| Relationship | Optional operator-supplied native runtime; dynamically loaded after local admission |
-| Runtime artifacts | `libonnxruntime.dylib`, `libonnxruntime.so`, or `onnxruntime.dll`, as applicable |
+| Relationship | Optional operator-supplied Linux native runtime; descriptor-bound after local admission |
+| Runtime artifacts | `libonnxruntime.so` for admitted Linux arm64 or x86_64 targets |
 | Release | <https://github.com/microsoft/onnxruntime/releases/tag/v1.24.4> |
 | License source | <https://github.com/microsoft/onnxruntime/blob/v1.24.4/LICENSE> |
 | Upstream source | <https://github.com/microsoft/onnxruntime/tree/v1.24.4> |

@@ -321,36 +321,80 @@ fn set_sealed_file_permissions(path: &Path) -> Result<(), ExternalOnnxRuntimeErr
     fs::set_permissions(path, permissions).map_err(|_| ExternalOnnxRuntimeError::Seal)
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) fn verify_sealed_runtime(
     path: &Path,
     expected_digest: [u8; 32],
     platform_wire_id: u8,
 ) -> Result<(), ExternalOnnxRuntimeError> {
+    open_verified_sealed_runtime(path, expected_digest, platform_wire_id).map(drop)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn verify_sealed_runtime(
+    _path: &Path,
+    _expected_digest: [u8; 32],
+    _platform_wire_id: u8,
+) -> Result<(), ExternalOnnxRuntimeError> {
+    Err(ExternalOnnxRuntimeError::UnsupportedPlatform)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn open_verified_sealed_runtime(
+    path: &Path,
+    expected_digest: [u8; 32],
+    platform_wire_id: u8,
+) -> Result<File, ExternalOnnxRuntimeError> {
+    use std::os::unix::fs::MetadataExt;
+
+    use rustix::fs::{Mode, OFlags, open};
+
     let platform = ExternalRuntimePlatform::from_wire_id(platform_wire_id)
-        .filter(|platform| platform.is_current())
         .ok_or(ExternalOnnxRuntimeError::Platform)?;
-    if fs::symlink_metadata(path)
-        .map_err(|_| ExternalOnnxRuntimeError::LibraryUnavailable)?
-        .file_type()
-        .is_symlink()
-    {
-        return Err(ExternalOnnxRuntimeError::Symlink);
+    if !platform.is_current() {
+        return Err(ExternalOnnxRuntimeError::UnsupportedPlatform);
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let mode = fs::metadata(path)
-            .map_err(|_| ExternalOnnxRuntimeError::LibraryUnavailable)?
-            .mode();
-        if mode & 0o277 != 0 {
-            return Err(ExternalOnnxRuntimeError::Seal);
+    let descriptor = open(
+        path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|error| {
+        if error == rustix::io::Errno::LOOP {
+            ExternalOnnxRuntimeError::Symlink
+        } else {
+            ExternalOnnxRuntimeError::LibraryUnavailable
         }
+    })?;
+    let mut library = File::from(descriptor);
+    let metadata = library
+        .metadata()
+        .map_err(|_| ExternalOnnxRuntimeError::LibraryUnavailable)?;
+    if !metadata.is_file()
+        || metadata.mode() & 0o277 != 0
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+    {
+        return Err(ExternalOnnxRuntimeError::Seal);
     }
-    let mut library = File::open(path).map_err(|_| ExternalOnnxRuntimeError::LibraryUnavailable)?;
-    if hash_open_runtime(&mut library)? != expected_digest {
+    verify_open_runtime(&mut library, expected_digest, platform_wire_id)?;
+    Ok(library)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn verify_open_runtime(
+    library: &mut File,
+    expected_digest: [u8; 32],
+    platform_wire_id: u8,
+) -> Result<(), ExternalOnnxRuntimeError> {
+    let platform = ExternalRuntimePlatform::from_wire_id(platform_wire_id)
+        .ok_or(ExternalOnnxRuntimeError::Platform)?;
+    if !platform.is_current() {
+        return Err(ExternalOnnxRuntimeError::UnsupportedPlatform);
+    }
+    if hash_open_runtime(library)? != expected_digest {
         return Err(ExternalOnnxRuntimeError::LibraryDigest);
     }
-    verify_binary_header_open(&mut library, platform)
+    verify_binary_header_open(library, platform)
 }
 
 fn read_bounded_evidence(path: &Path) -> Result<Vec<u8>, ExternalOnnxRuntimeError> {

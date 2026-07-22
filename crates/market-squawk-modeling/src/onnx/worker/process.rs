@@ -1,8 +1,6 @@
 //! Contained child-process initialization and runtime execution.
 
 use std::io::{self, BufReader, BufWriter, Cursor, Read, Write};
-#[cfg(feature = "onnx-runtime")]
-use std::path::Path;
 use std::sync::Arc;
 
 use tract_onnx::prelude::*;
@@ -11,7 +9,7 @@ use tract_onnx::tract_hir::internal::DimLike;
 use super::protocol::{
     DecodedInitialization, REQUEST_INFER, read_initialization, read_u32, write_response,
 };
-use super::resources::apply_resource_limits;
+use super::resources::{apply_resource_limits, deny_file_growth};
 use super::{OnnxWorkerProcessError, WorkerError};
 
 const MAX_ONNX_COMPUTE_UNITS: usize = 50_000_000;
@@ -74,6 +72,7 @@ fn build_runner(
     initialization: &DecodedInitialization,
 ) -> Result<Box<dyn RuntimeRunner>, WorkerError> {
     if initialization.is_tract() {
+        deny_file_growth().map_err(|_| WorkerError::Resource)?;
         let model = tract_onnx::onnx()
             .model_for_read(&mut Cursor::new(&initialization.model))
             .map_err(|_| WorkerError::Load)?;
@@ -91,6 +90,7 @@ fn build_runner(
     if initialization.is_external() {
         return build_external_runner(initialization);
     }
+    deny_file_growth().map_err(|_| WorkerError::Resource)?;
     Err(WorkerError::Load)
 }
 
@@ -121,23 +121,14 @@ impl RuntimeRunner for TractRunner {
     }
 }
 
-#[cfg(feature = "onnx-runtime")]
+#[cfg(all(feature = "onnx-runtime", target_os = "linux"))]
 fn build_external_runner(
     initialization: &DecodedInitialization,
 ) -> Result<Box<dyn RuntimeRunner>, WorkerError> {
-    let path = Path::new(initialization.runtime_path.as_ref());
-    if !path.is_absolute()
-        || initialization.runtime_version.as_ref() != super::super::OPTIONAL_ONNX_RUNTIME_VERSION
-    {
-        return Err(WorkerError::Load);
-    }
-    super::super::external::verify_sealed_runtime(
-        path,
-        initialization.runtime_digest,
-        initialization.runtime_platform,
-    )
-    .map_err(|_| WorkerError::Load)?;
-    let committed = ort::init_from(path)
+    let runtime_image = LinuxSealedRuntimeImage::materialize(initialization);
+    deny_file_growth().map_err(|_| WorkerError::Resource)?;
+    let runtime_image = runtime_image?;
+    let committed = ort::init_from(runtime_image.loader_path())
         .map_err(|_| WorkerError::Load)?
         .with_name("market-squawk-local-onnx-runtime")
         .with_telemetry(false)
@@ -161,16 +152,120 @@ fn build_external_runner(
     Ok(Box::new(ExternalRunner {
         session,
         input_shape: initialization.input_shape.clone(),
+        _runtime_image: runtime_image,
     }))
 }
 
-#[cfg(feature = "onnx-runtime")]
+#[cfg(all(feature = "onnx-runtime", not(target_os = "linux")))]
+fn build_external_runner(
+    _initialization: &DecodedInitialization,
+) -> Result<Box<dyn RuntimeRunner>, WorkerError> {
+    deny_file_growth().map_err(|_| WorkerError::Resource)?;
+    Err(WorkerError::Load)
+}
+
+#[cfg(all(feature = "onnx-runtime", target_os = "linux"))]
+#[derive(Debug)]
+struct LinuxSealedRuntimeImage {
+    _file: std::fs::File,
+    loader_path: std::path::PathBuf,
+}
+
+#[cfg(all(feature = "onnx-runtime", target_os = "linux"))]
+impl LinuxSealedRuntimeImage {
+    fn materialize(initialization: &DecodedInitialization) -> Result<Self, WorkerError> {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::MetadataExt as _;
+
+        use rustix::fs::{
+            MemfdFlags, Mode, SealFlags, fchmod, fcntl_add_seals, fcntl_get_seals, memfd_create,
+        };
+
+        let path = std::path::Path::new(initialization.runtime_path.as_ref());
+        if !path.is_absolute()
+            || initialization.runtime_version.as_ref()
+                != super::super::OPTIONAL_ONNX_RUNTIME_VERSION
+        {
+            return Err(WorkerError::Load);
+        }
+        let mut source = super::super::external::open_verified_sealed_runtime(
+            path,
+            initialization.runtime_digest,
+            initialization.runtime_platform,
+        )
+        .map_err(|_| WorkerError::Load)?;
+        let source_size = source.metadata().map_err(|_| WorkerError::Load)?.len();
+
+        let preferred_flags = MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING | MemfdFlags::EXEC;
+        let descriptor = match memfd_create("market-squawk-onnx-runtime", preferred_flags) {
+            Ok(descriptor) => descriptor,
+            Err(error) if error == rustix::io::Errno::INVAL => memfd_create(
+                "market-squawk-onnx-runtime",
+                MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING,
+            )
+            .map_err(|_| WorkerError::Load)?,
+            Err(_) => return Err(WorkerError::Load),
+        };
+        let mut file = std::fs::File::from(descriptor);
+        std::io::Seek::seek(&mut source, io::SeekFrom::Start(0)).map_err(|_| WorkerError::Load)?;
+        let copied = io::copy(
+            &mut source.take(super::super::external::MAX_RUNTIME_LIBRARY_BYTES + 1),
+            &mut file,
+        )
+        .map_err(|_| WorkerError::Load)?;
+        if copied != source_size || copied > super::super::external::MAX_RUNTIME_LIBRARY_BYTES {
+            return Err(WorkerError::Load);
+        }
+        fchmod(&file, Mode::RUSR | Mode::XUSR).map_err(|_| WorkerError::Load)?;
+        super::super::external::verify_open_runtime(
+            &mut file,
+            initialization.runtime_digest,
+            initialization.runtime_platform,
+        )
+        .map_err(|_| WorkerError::Load)?;
+
+        let required_seals =
+            SealFlags::WRITE | SealFlags::GROW | SealFlags::SHRINK | SealFlags::SEAL;
+        fcntl_add_seals(&file, required_seals).map_err(|_| WorkerError::Load)?;
+        let applied_seals = fcntl_get_seals(&file).map_err(|_| WorkerError::Load)?;
+        if !applied_seals.contains(required_seals) {
+            return Err(WorkerError::Load);
+        }
+        super::super::external::verify_open_runtime(
+            &mut file,
+            initialization.runtime_digest,
+            initialization.runtime_platform,
+        )
+        .map_err(|_| WorkerError::Load)?;
+
+        let loader_path = std::path::PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+        let descriptor_metadata = file.metadata().map_err(|_| WorkerError::Load)?;
+        let loader_metadata = std::fs::metadata(&loader_path).map_err(|_| WorkerError::Load)?;
+        if descriptor_metadata.dev() != loader_metadata.dev()
+            || descriptor_metadata.ino() != loader_metadata.ino()
+            || descriptor_metadata.len() != loader_metadata.len()
+        {
+            return Err(WorkerError::Load);
+        }
+        Ok(Self {
+            _file: file,
+            loader_path,
+        })
+    }
+
+    fn loader_path(&self) -> &std::path::Path {
+        &self.loader_path
+    }
+}
+
+#[cfg(all(feature = "onnx-runtime", target_os = "linux"))]
 struct ExternalRunner {
     session: ort::session::Session,
     input_shape: Box<[usize]>,
+    _runtime_image: LinuxSealedRuntimeImage,
 }
 
-#[cfg(feature = "onnx-runtime")]
+#[cfg(all(feature = "onnx-runtime", target_os = "linux"))]
 impl RuntimeRunner for ExternalRunner {
     fn run(&mut self, values: &[f32]) -> Result<f32, WorkerError> {
         let input = ort::value::TensorRef::from_array_view((&*self.input_shape, values))

@@ -26,10 +26,20 @@ pub(super) fn apply_resource_limits() -> Result<ResourceGuard, OnnxWorkerProcess
     // per-request wall deadline contain work without imposing a cumulative lifetime CPU ceiling.
     setrlimit(Resource::Nofile, exact(WORKER_FILE_DESCRIPTOR_LIMIT))
         .map_err(|_| OnnxWorkerProcessError::Resource)?;
-    setrlimit(Resource::Fsize, exact(0)).map_err(|_| OnnxWorkerProcessError::Resource)?;
     #[cfg(not(target_os = "haiku"))]
     setrlimit(Resource::Core, exact(0)).map_err(|_| OnnxWorkerProcessError::Resource)?;
     Ok(ResourceGuard)
+}
+
+#[cfg(unix)]
+pub(super) fn deny_file_growth() -> Result<(), OnnxWorkerProcessError> {
+    use rustix::process::{Resource, Rlimit, setrlimit};
+
+    let denied = Rlimit {
+        current: Some(0),
+        maximum: Some(0),
+    };
+    setrlimit(Resource::Fsize, denied).map_err(|_| OnnxWorkerProcessError::Resource)
 }
 
 #[cfg(windows)]
@@ -51,11 +61,21 @@ pub(super) fn apply_resource_limits() -> Result<ResourceGuard, OnnxWorkerProcess
     Ok(ResourceGuard(job))
 }
 
+#[cfg(windows)]
+pub(super) fn deny_file_growth() -> Result<(), OnnxWorkerProcessError> {
+    Ok(())
+}
+
 #[cfg(not(any(unix, windows)))]
 #[derive(Debug)]
 pub(super) struct ResourceGuard;
 
 #[cfg(not(any(unix, windows)))]
 pub(super) fn apply_resource_limits() -> Result<ResourceGuard, OnnxWorkerProcessError> {
+    Err(OnnxWorkerProcessError::Resource)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(super) fn deny_file_growth() -> Result<(), OnnxWorkerProcessError> {
     Err(OnnxWorkerProcessError::Resource)
 }

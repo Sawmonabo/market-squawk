@@ -15,11 +15,11 @@ inference failures automatically use that exact tract generation.
 
 ## Admitted native component
 
-The current policy admits ONNX Runtime 1.24.4 on these 64-bit targets:
-
-- macOS arm64 and x86_64 Mach-O
-- Linux arm64 and x86_64 ELF
-- Windows arm64 and x86_64 PE
+The current policy admits ONNX Runtime 1.24.4 on Linux arm64 and x86_64 ELF targets. The worker
+copies the descriptor-verified library into an immutable sealed memory file and loads that exact
+descriptor through `/proc/self/fd`; the descriptor remains open for the session lifetime. External
+ONNX Runtime loading fails closed on platforms without this descriptor-bound loader. The required
+tract backend remains available there.
 
 The CPU shared library must be supplied by the operator under a dedicated local root. Retain the
 upstream MIT license with the library and inventory it using
@@ -39,7 +39,7 @@ apart from the platform-specific library name:
 
 ```text
 /absolute/path/onnx-runtime-root/
-├── lib/libonnxruntime.dylib
+├── lib/libonnxruntime.so
 ├── LICENSE
 └── admission.json
 ```
@@ -48,7 +48,7 @@ Configure exact local paths and the independently recorded library digest:
 
 ```bash
 export MARKET_SQUAWK_ONNX_RUNTIME_ROOT=/absolute/path/onnx-runtime-root
-export MARKET_SQUAWK_ONNX_RUNTIME="$MARKET_SQUAWK_ONNX_RUNTIME_ROOT/lib/libonnxruntime.dylib"
+export MARKET_SQUAWK_ONNX_RUNTIME="$MARKET_SQUAWK_ONNX_RUNTIME_ROOT/lib/libonnxruntime.so"
 export MARKET_SQUAWK_ONNX_RUNTIME_EVIDENCE="$MARKET_SQUAWK_ONNX_RUNTIME_ROOT/admission.json"
 export MARKET_SQUAWK_ONNX_RUNTIME_SHA256=<64-lowercase-hex-digest>
 
@@ -98,8 +98,10 @@ still passes through strategy and the sole risk boundary.
   paths; do not point through aliases.
 - `EvidenceDigest`, `EvidenceMismatch`, or `LibraryDigest`: rerun admission only after intentionally
   updating the exact library and configuration hashes.
-- `Platform` or `Environment`: use the CPU library built for the current operating system and
-  architecture and ensure its ordinary local loader dependencies are present.
+- `UnsupportedPlatform`: use the required tract backend; external ONNX Runtime is admitted only on
+  supported Linux targets.
+- `Platform` or `Environment`: use the CPU library built for the current Linux architecture and
+  ensure its ordinary local loader dependencies are present.
 - `Session`, `WarmUp`, `Parity`, or graph-policy errors: keep the tract backend active and inspect
   the model/operator/static-shape contract before attempting optional acceleration again.
 

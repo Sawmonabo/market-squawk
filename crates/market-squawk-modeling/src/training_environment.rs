@@ -1,6 +1,6 @@
 //! Independent verification of the installed Python training release authority.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, Metadata};
 use std::io::Read as _;
 use std::path::{Component, Path, PathBuf};
@@ -15,10 +15,12 @@ const AUTHORITY_DIRECTORY: &str = "share/market-squawk";
 const ENVIRONMENT_RECEIPT: &str = "share/market-squawk/training-environment.json";
 const RELEASE_MANIFEST: &str = "share/market-squawk/market-squawk-release.json";
 const MAX_AUTHORITY_BYTES: u64 = 16 * 1024;
-const MAX_RECORD_BYTES: u64 = 256 * 1024;
-const MAX_DISTRIBUTION_FILE_BYTES: u64 = 128 * 1024 * 1024;
-const MAX_DISTRIBUTION_BYTES: u64 = 256 * 1024 * 1024;
-const MAX_DISTRIBUTION_FILES: usize = 256;
+const MAX_RECORD_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_DISTRIBUTION_FILE_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_DISTRIBUTION_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_DISTRIBUTION_FILES: usize = 8_192;
+const MAX_DISTRIBUTION_ROOTS: usize = 64;
+const MAX_RUNTIME_DISTRIBUTIONS: usize = 32;
 const RECORD_SET_DOMAIN: &[u8] = b"market-squawk-record-set-v1\0";
 const RELEASE_MANIFEST_DOMAIN: &[u8] = b"market-squawk-release-manifest-v1\0";
 const ENVIRONMENT_RECEIPT_DOMAIN: &[u8] = b"market-squawk-training-environment-v1\0";
@@ -76,6 +78,7 @@ struct FoundationWire {
     requirements_lock_sha256: String,
     release_public_key: String,
     release_signer_sha256: String,
+    runtime_distributions: Vec<RuntimeRequirementWire>,
     schema_version: u32,
     source_closure_sha256: String,
     toolchain_sha256: String,
@@ -135,6 +138,7 @@ struct EnvironmentWire {
     native_extension: RelativeFileWire,
     project_distribution: DistributionWire,
     release_manifest_sha256: String,
+    runtime_distributions: Vec<DistributionWire>,
     training_code_revision: String,
     validator_sha256: String,
 }
@@ -163,9 +167,19 @@ struct RelativeFileWire {
 struct DistributionWire {
     file_count: usize,
     file_set_sha256: String,
+    name: String,
     record_relative_path: String,
     record_sha256: String,
     record_size_bytes: u64,
+    roots: Vec<String>,
+    version: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeRequirementWire {
+    name: String,
+    version: String,
 }
 
 struct VerifiedFiles {
@@ -341,7 +355,7 @@ fn verify_installed_files(root: &Path) -> Result<VerifiedFiles, TrainingEnvironm
         TrainingEnvironmentError::ReleaseManifest,
     )?;
 
-    verify_distribution(&canonical_root, &environment)?;
+    verify_distributions(&canonical_root, &environment, &foundation)?;
     Ok(VerifiedFiles {
         environment,
         receipt_sha256: receipt_file.sha256,
@@ -370,6 +384,7 @@ fn embedded_foundation() -> Result<FoundationWire, TrainingEnvironmentError> {
         || wire.training_code_revision != wire.source_closure_sha256
         || !valid_version(&wire.build_python_version)
         || parse_hex(&wire.release_public_key).is_err()
+        || !valid_runtime_requirements(&wire.runtime_distributions)
         || digests.into_iter().any(|value| !valid_hex(value))
     {
         return Err(TrainingEnvironmentError::EmbeddedFoundation);
@@ -377,16 +392,81 @@ fn embedded_foundation() -> Result<FoundationWire, TrainingEnvironmentError> {
     Ok(wire)
 }
 
-fn verify_distribution(
+struct VerifiedDistribution {
+    entries: BTreeMap<String, ([u8; 32], u64)>,
+    roots: BTreeSet<String>,
+    site_packages: PathBuf,
+}
+
+fn verify_distributions(
     root: &Path,
     environment: &EnvironmentWire,
+    foundation: &FoundationWire,
 ) -> Result<(), TrainingEnvironmentError> {
-    let record_relative = relative_path(&environment.project_distribution.record_relative_path)?;
+    if environment.project_distribution.name != "market-squawk"
+        || environment.project_distribution.version != "0.1.0"
+        || environment.runtime_distributions.len() != foundation.runtime_distributions.len()
+    {
+        return Err(TrainingEnvironmentError::InstalledDistribution);
+    }
+    let project = verify_distribution(root, &environment.project_distribution)?;
+    let expected_site_packages = expected_site_packages(root, &environment.interpreter.version)?;
+    if canonical(&project.site_packages)? != canonical(&expected_site_packages)? {
+        return Err(TrainingEnvironmentError::InstalledDistribution);
+    }
+    let mut owned_roots = project.roots.clone();
+    for (wire, requirement) in environment
+        .runtime_distributions
+        .iter()
+        .zip(&foundation.runtime_distributions)
+    {
+        if wire.name != requirement.name || wire.version != requirement.version {
+            return Err(TrainingEnvironmentError::InstalledDistribution);
+        }
+        let verified = verify_distribution(root, wire)?;
+        if canonical(&verified.site_packages)? != canonical(&project.site_packages)?
+            || verified
+                .roots
+                .iter()
+                .any(|value| !owned_roots.insert(value.clone()))
+        {
+            return Err(TrainingEnvironmentError::InstalledDistribution);
+        }
+    }
+
+    let native_relative = relative_path(&environment.native_extension.relative_path)?;
+    let native_path = root.join(native_relative);
+    let native_entry = native_path
+        .strip_prefix(&project.site_packages)
+        .map_err(|_| TrainingEnvironmentError::InstalledDistribution)?
+        .to_str()
+        .ok_or(TrainingEnvironmentError::InstalledDistribution)?
+        .replace('\\', "/");
+    let (digest, size) = project
+        .entries
+        .get(&native_entry)
+        .ok_or(TrainingEnvironmentError::InstalledDistribution)?;
+    if *digest != parse_hex(&environment.native_extension.sha256)?
+        || *size != environment.native_extension.size_bytes
+    {
+        return Err(TrainingEnvironmentError::InstalledDistribution);
+    }
+    Ok(())
+}
+
+fn verify_distribution(
+    root: &Path,
+    distribution: &DistributionWire,
+) -> Result<VerifiedDistribution, TrainingEnvironmentError> {
+    if !valid_distribution(distribution) {
+        return Err(TrainingEnvironmentError::InstalledDistribution);
+    }
+    let record_relative = relative_path(&distribution.record_relative_path)?;
     let record = read_controlled(root, record_relative, MAX_RECORD_BYTES, false)?;
     exact_file(
         &record,
-        &environment.project_distribution.record_sha256,
-        environment.project_distribution.record_size_bytes,
+        &distribution.record_sha256,
+        distribution.record_size_bytes,
         TrainingEnvironmentError::InstalledDistribution,
     )?;
     let record_path = root.join(record_relative);
@@ -398,8 +478,10 @@ fn verify_distribution(
     let record_entry = record_path
         .strip_prefix(site_packages)
         .map_err(|_| TrainingEnvironmentError::InstalledDistribution)?
-        .to_string_lossy()
+        .to_str()
+        .ok_or(TrainingEnvironmentError::InstalledDistribution)?
         .replace('\\', "/");
+    let roots = distribution.roots.iter().cloned().collect::<BTreeSet<_>>();
 
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(false)
@@ -430,6 +512,17 @@ fn verify_distribution(
             continue;
         }
         let relative = relative_path(name)?;
+        let first = relative
+            .components()
+            .next()
+            .and_then(|value| match value {
+                Component::Normal(value) => value.to_str(),
+                _ => None,
+            })
+            .ok_or(TrainingEnvironmentError::InstalledDistribution)?;
+        if !roots.contains(first) {
+            return Err(TrainingEnvironmentError::InstalledDistribution);
+        }
         let file = read_controlled(site_packages, relative, MAX_DISTRIBUTION_FILE_BYTES, false)?;
         let size = if digest.is_empty() && size.is_empty() {
             file.size_bytes
@@ -459,29 +552,89 @@ fn verify_distribution(
         }
     }
     if !saw_record
-        || entries.len() != environment.project_distribution.file_count
-        || record_set_digest(&entries)
-            != parse_hex(&environment.project_distribution.file_set_sha256)?
+        || entries.len() != distribution.file_count
+        || record_set_digest(&entries) != parse_hex(&distribution.file_set_sha256)?
     {
         return Err(TrainingEnvironmentError::InstalledDistribution);
     }
+    let mut expected_paths = entries.keys().cloned().collect::<BTreeSet<_>>();
+    expected_paths.insert(record_entry);
+    if scan_distribution_paths(site_packages, &roots)? != expected_paths {
+        return Err(TrainingEnvironmentError::InstalledDistribution);
+    }
+    Ok(VerifiedDistribution {
+        entries,
+        roots,
+        site_packages: site_packages.to_path_buf(),
+    })
+}
 
-    let native_relative = relative_path(&environment.native_extension.relative_path)?;
-    let native_path = root.join(native_relative);
-    let native_entry = native_path
-        .strip_prefix(site_packages)
-        .map_err(|_| TrainingEnvironmentError::InstalledDistribution)?
-        .to_string_lossy()
-        .replace('\\', "/");
-    let (digest, size) = entries
-        .get(&native_entry)
-        .ok_or(TrainingEnvironmentError::InstalledDistribution)?;
-    if *digest != parse_hex(&environment.native_extension.sha256)?
-        || *size != environment.native_extension.size_bytes
-    {
+fn expected_site_packages(root: &Path, version: &str) -> Result<PathBuf, TrainingEnvironmentError> {
+    let parts = version.split('.').collect::<Vec<_>>();
+    let [major, minor, _patch] = parts.as_slice() else {
         return Err(TrainingEnvironmentError::InstalledDistribution);
+    };
+    Ok(root.join(format!("lib/python{major}.{minor}/site-packages")))
+}
+
+fn scan_distribution_paths(
+    site_packages: &Path,
+    roots: &BTreeSet<String>,
+) -> Result<BTreeSet<String>, TrainingEnvironmentError> {
+    let mut files = BTreeSet::new();
+    let mut pending = roots.iter().map(PathBuf::from).collect::<Vec<_>>();
+    let mut directories = 0_usize;
+    let maximum_paths = MAX_DISTRIBUTION_FILES
+        .checked_mul(3)
+        .and_then(|value| value.checked_add(1))
+        .ok_or(TrainingEnvironmentError::InstalledDistribution)?;
+    let mut discovered = pending.len();
+    while let Some(relative) = pending.pop() {
+        let path = site_packages.join(&relative);
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|_| TrainingEnvironmentError::InstalledDistribution)?;
+        if metadata.file_type().is_symlink() {
+            return Err(TrainingEnvironmentError::InstalledDistribution);
+        }
+        if metadata.is_file() {
+            controlled_metadata(&metadata)
+                .map_err(|_| TrainingEnvironmentError::InstalledDistribution)?;
+            let value = relative
+                .to_str()
+                .ok_or(TrainingEnvironmentError::InstalledDistribution)?
+                .replace('\\', "/");
+            if !files.insert(value) || files.len() > MAX_DISTRIBUTION_FILES + 1 {
+                return Err(TrainingEnvironmentError::InstalledDistribution);
+            }
+            continue;
+        }
+        if !metadata.is_dir() {
+            return Err(TrainingEnvironmentError::InstalledDistribution);
+        }
+        controlled_metadata(&metadata)
+            .map_err(|_| TrainingEnvironmentError::InstalledDistribution)?;
+        directories = directories
+            .checked_add(1)
+            .ok_or(TrainingEnvironmentError::InstalledDistribution)?;
+        if directories > MAX_DISTRIBUTION_FILES * 2 {
+            return Err(TrainingEnvironmentError::InstalledDistribution);
+        }
+        for entry in
+            fs::read_dir(path).map_err(|_| TrainingEnvironmentError::InstalledDistribution)?
+        {
+            let entry = entry.map_err(|_| TrainingEnvironmentError::InstalledDistribution)?;
+            let name = entry.file_name();
+            if name.to_str().is_none() {
+                return Err(TrainingEnvironmentError::InstalledDistribution);
+            }
+            discovered = discovered
+                .checked_add(1)
+                .filter(|value| *value <= maximum_paths)
+                .ok_or(TrainingEnvironmentError::InstalledDistribution)?;
+            pending.push(relative.join(name));
+        }
     }
-    Ok(())
+    Ok(files)
 }
 
 fn verify_signature<T: Serialize>(
@@ -500,7 +653,10 @@ fn verify_signature<T: Serialize>(
         return false;
     };
     let signature = Signature::from_bytes(&signature_bytes);
-    let Ok(encoded_payload) = serde_json::to_vec(payload) else {
+    let Ok(value) = serde_json::to_value(payload) else {
+        return false;
+    };
+    let Ok(encoded_payload) = serde_json::to_vec(&value) else {
         return false;
     };
     let mut message = Vec::with_capacity(domain.len() + encoded_payload.len());
@@ -681,6 +837,70 @@ fn valid_project_wheel(value: &ProjectWheelWire) -> bool {
         && value.macos_deployment_target == "12.0"
         && value.size_bytes > 0
         && valid_hex(&value.sha256)
+}
+
+fn valid_runtime_requirements(values: &[RuntimeRequirementWire]) -> bool {
+    !values.is_empty()
+        && values.len() <= MAX_RUNTIME_DISTRIBUTIONS
+        && values.iter().all(|value| {
+            valid_distribution_name(&value.name) && valid_release_version(&value.version)
+        })
+        && values
+            .windows(2)
+            .all(|pair| pair[0].name.as_str() < pair[1].name.as_str())
+}
+
+fn valid_distribution(value: &DistributionWire) -> bool {
+    value.file_count > 0
+        && value.file_count <= MAX_DISTRIBUTION_FILES
+        && valid_hex(&value.file_set_sha256)
+        && valid_distribution_name(&value.name)
+        && valid_hex(&value.record_sha256)
+        && value.record_size_bytes > 0
+        && value.record_size_bytes <= MAX_RECORD_BYTES
+        && !value.roots.is_empty()
+        && value.roots.len() <= MAX_DISTRIBUTION_ROOTS
+        && value.roots.iter().all(|root| {
+            let path = Path::new(root);
+            !root.is_empty()
+                && root.len() <= 255
+                && path.components().count() == 1
+                && matches!(path.components().next(), Some(Component::Normal(_)))
+        })
+        && value
+            .roots
+            .windows(2)
+            .all(|pair| pair[0].as_str() < pair[1].as_str())
+        && valid_release_version(&value.version)
+}
+
+fn valid_distribution_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        && value
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && value
+            .as_bytes()
+            .last()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && !value.contains("--")
+}
+
+fn valid_release_version(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'+' | b'-' | b'_'))
 }
 
 fn valid_version(value: &str) -> bool {

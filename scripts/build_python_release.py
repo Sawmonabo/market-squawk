@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -27,6 +28,12 @@ import zipfile
 MAX_LOCK_BYTES = 2 * 1024 * 1024
 MAX_ARTIFACTS = 64
 MAX_SOURCES = 2_048
+MAX_RUNTIME_DISTRIBUTIONS = 32
+MAX_DISTRIBUTION_FILES = 8_192
+MAX_DISTRIBUTION_ROOTS = 64
+MAX_DISTRIBUTION_FILE_BYTES = 256 * 1024 * 1024
+MAX_DISTRIBUTION_BYTES = 1024 * 1024 * 1024
+MAX_RECORD_BYTES = 2 * 1024 * 1024
 RUST_TOOLCHAIN = "1.97.1"
 RUST_TOOLCHAIN_FULL = "1.97.1-aarch64-apple-darwin"
 MACOS_DEPLOYMENT_TARGET = "12.0"
@@ -121,6 +128,12 @@ class PythonRuntime:
 
 
 @dataclass(frozen=True)
+class RuntimeRequirement:
+    name: str
+    version: str
+
+
+@dataclass(frozen=True)
 class ArtifactLayout:
     root: Path
     wheelhouse: Path
@@ -133,14 +146,17 @@ class ArtifactLayout:
 
 @dataclass(frozen=True)
 class InstalledDistribution:
-    native_extension: Path
-    native_extension_sha256: str
-    native_extension_size: int
+    name: str
+    version: str
+    roots: tuple[str, ...]
     record: Path
     record_sha256: str
     record_size: int
     file_count: int
     file_set_sha256: str
+    native_extension: Path | None
+    native_extension_sha256: str | None
+    native_extension_size: int | None
 
 
 class ReleaseSigner:
@@ -384,6 +400,48 @@ def admit_wheelhouse(
         _admit_license(path, artifact.license)
         admitted.append(path)
     return tuple(admitted)
+
+
+def locked_runtime_requirements(
+    root: Path, lock: ReleaseLock
+) -> tuple[RuntimeRequirement, ...]:
+    """Resolve every exact Python project dependency against each supported wheel set."""
+
+    project = _toml(root / "python/pyproject.toml").get("project")
+    dependencies = project.get("dependencies") if isinstance(project, dict) else None
+    if (
+        not isinstance(dependencies, list)
+        or not dependencies
+        or len(dependencies) > MAX_RUNTIME_DISTRIBUTIONS
+    ):
+        raise ReleaseBuildError("Python runtime dependency policy is invalid")
+    requirements = []
+    names = set()
+    for dependency in dependencies:
+        if not isinstance(dependency, str):
+            raise ReleaseBuildError("Python runtime dependency is not exact")
+        match = re.fullmatch(r"([A-Za-z0-9][A-Za-z0-9._-]*)==([A-Za-z0-9][A-Za-z0-9._+-]*)", dependency)
+        if match is None:
+            raise ReleaseBuildError("Python runtime dependency is not exact")
+        name = _normalize_project_name(match.group(1))
+        version = match.group(2)
+        if name in names:
+            raise ReleaseBuildError("Python runtime dependency is duplicated")
+        for python_version in SUPPORTED_PYTHONS:
+            candidates = [
+                artifact
+                for artifact in lock.artifacts
+                if _normalize_project_name(artifact.project) == name
+                and artifact.version == version
+                and _compatible(artifact.filename, python_version)
+            ]
+            if len(candidates) != 1:
+                raise ReleaseBuildError(
+                    "Python runtime dependency has no unique locked wheel"
+                )
+        requirements.append(RuntimeRequirement(name, version))
+        names.add(name)
+    return tuple(sorted(requirements, key=lambda value: value.name))
 
 
 def prepare_wheelhouse(
@@ -811,6 +869,7 @@ def _build_release(
     )
     release_public_key = signer.public_key()
     build_runtime = runtimes[0]
+    runtime_requirements = locked_runtime_requirements(root, lock)
     foundation, foundation_sha256 = build_training_foundation_receipt(
         root,
         root / "python/requirements.lock",
@@ -818,6 +877,7 @@ def _build_release(
         lock,
         build_runtime,
         toolchain,
+        runtime_requirements,
         release_public_key,
         signer_helper_sha256,
     )
@@ -970,7 +1030,17 @@ def _build_release(
             root,
             runtime_environment,
         )
-        distribution = inspect_installed_distribution(release_venv, runtime)
+        distribution = inspect_installed_distribution(
+            release_venv,
+            runtime,
+            RuntimeRequirement("market-squawk", "0.1.0"),
+            native_prefix="market_squawk/_native.",
+        )
+        runtime_distributions = tuple(
+            inspect_installed_distribution(release_venv, runtime, requirement)
+            for requirement in runtime_requirements
+        )
+        _require_disjoint_distribution_roots((distribution, *runtime_distributions))
         environment_sha256 = install_training_environment(
             release_venv,
             release_python,
@@ -982,6 +1052,7 @@ def _build_release(
             project_wheel,
             validator_sha256,
             distribution,
+            runtime_distributions,
             signer,
         )
         _run(
@@ -1009,6 +1080,14 @@ def _build_release(
                 ),
                 "focused_tests": list(FOCUSED_TESTS),
                 "training_environment_sha256": environment_sha256,
+                "runtime_distributions": [
+                    {
+                        "name": value.name,
+                        "version": value.version,
+                        "file_set_sha256": value.file_set_sha256,
+                    }
+                    for value in runtime_distributions
+                ],
                 "validator_sha256": validator_sha256,
             }
         )
@@ -1076,14 +1155,33 @@ def _admit_owned_child(path: Path, root: Path, purpose: str) -> None:
 def _reset_owned_child(path: Path, root: Path, purpose: str) -> None:
     _admit_owned_child(path, root, purpose)
     if purpose in {"release-cp312", "release-cp313"}:
-        authority = path / "share/market-squawk"
-        if authority.exists() or authority.is_symlink():
-            if authority.is_symlink() or not authority.is_dir():
-                raise ReleaseBuildError("sealed release authority is invalid")
-            authority.chmod(0o700)
+        _unseal_owned_release_authority(path)
     shutil.rmtree(path)
     path.mkdir()
     (path / CHILD_MARKER).write_text(_marker_content(path, purpose), encoding="utf-8")
+
+
+def _unseal_owned_release_authority(path: Path) -> None:
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    descriptors = []
+    try:
+        descriptors.append(os.open(path, flags))
+        try:
+            descriptors.append(os.open("share", flags, dir_fd=descriptors[-1]))
+        except FileNotFoundError:
+            return
+        try:
+            descriptors.append(os.open("market-squawk", flags, dir_fd=descriptors[-1]))
+        except FileNotFoundError:
+            return
+        os.fchmod(descriptors[-1], 0o700)
+    except OSError as error:
+        raise ReleaseBuildError("sealed release authority is invalid") from error
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
 
 
 def _remove_owned_child(path: Path, root: Path, purpose: str) -> None:
@@ -1324,6 +1422,7 @@ def build_training_foundation_receipt(
     lock: ReleaseLock,
     runtime: PythonRuntime,
     toolchain: dict[str, object],
+    runtime_requirements: tuple[RuntimeRequirement, ...],
     release_public_key: str,
     release_signer_sha256: str,
 ) -> tuple[bytes, str]:
@@ -1331,6 +1430,15 @@ def build_training_foundation_receipt(
 
     _sha256(release_public_key)
     _sha256(release_signer_sha256)
+    if (
+        not runtime_requirements
+        or len(runtime_requirements) > MAX_RUNTIME_DISTRIBUTIONS
+        or tuple(sorted(runtime_requirements, key=lambda value: value.name))
+        != runtime_requirements
+        or len({value.name for value in runtime_requirements})
+        != len(runtime_requirements)
+    ):
+        raise ReleaseBuildError("Python runtime dependency policy is invalid")
     source_closure = [
         {"path": source.path, "sha256": source.sha256, "size_bytes": source.size_bytes}
         for source in sorted(lock.sources, key=lambda value: value.path)
@@ -1343,6 +1451,10 @@ def build_training_foundation_receipt(
         "requirements_lock_sha256": _file_digest(requirements_lock)[1],
         "release_public_key": release_public_key,
         "release_signer_sha256": release_signer_sha256,
+        "runtime_distributions": [
+            {"name": value.name, "version": value.version}
+            for value in runtime_requirements
+        ],
         "schema_version": 1,
         "source_closure_sha256": source_closure_sha256,
         "toolchain_sha256": _mapping_sha256(toolchain),
@@ -1414,9 +1526,13 @@ def build_release_manifest(
 
 
 def inspect_installed_distribution(
-    release_root: Path, runtime: PythonRuntime
+    release_root: Path,
+    runtime: PythonRuntime,
+    requirement: RuntimeRequirement,
+    *,
+    native_prefix: str | None = None,
 ) -> InstalledDistribution:
-    """Verify the installed project RECORD and return its canonical file-set identity."""
+    """Verify one installed distribution and its complete owned file roots."""
 
     site_packages = (
         release_root
@@ -1425,11 +1541,31 @@ def inspect_installed_distribution(
         / "site-packages"
     )
     if site_packages.is_symlink() or not site_packages.is_dir():
-        raise ReleaseBuildError("installed project site-packages root is invalid")
-    records = list(site_packages.glob("market_squawk-0.1.0.dist-info/RECORD"))
-    if len(records) != 1 or records[0].is_symlink() or not records[0].is_file():
-        raise ReleaseBuildError("installed project has no unique wheel RECORD")
-    record = records[0]
+        raise ReleaseBuildError("installed distribution root is invalid")
+    candidates = []
+    for metadata_path in site_packages.glob("*.dist-info/METADATA"):
+        if metadata_path.is_symlink() or not metadata_path.is_file():
+            continue
+        try:
+            if metadata_path.stat().st_size > 256 * 1024:
+                continue
+            metadata = BytesParser().parsebytes(metadata_path.read_bytes())
+            names = metadata.get_all("Name", [])
+            versions = metadata.get_all("Version", [])
+            if (
+                len(names) == 1
+                and len(versions) == 1
+                and _normalize_project_name(names[0]) == requirement.name
+                and versions[0] == requirement.version
+            ):
+                candidates.append(metadata_path.parent)
+        except (OSError, UnicodeError):
+            continue
+    if len(candidates) != 1:
+        raise ReleaseBuildError("installed distribution identity is not unique")
+    record = candidates[0] / "RECORD"
+    if record.is_symlink() or not record.is_file() or record.stat().st_size > MAX_RECORD_BYTES:
+        raise ReleaseBuildError("installed distribution has no bounded wheel RECORD")
     record_name = record.relative_to(site_packages).as_posix()
     entries: dict[str, tuple[str, int]] = {}
     saw_record = False
@@ -1437,29 +1573,33 @@ def inspect_installed_distribution(
     try:
         with record.open("r", encoding="utf-8", newline="") as stream:
             for row in csv.reader(stream):
-                if len(row) != 3 or len(entries) >= 256:
-                    raise ReleaseBuildError("installed project RECORD exceeds its bounds")
+                if len(row) != 3 or len(entries) >= MAX_DISTRIBUTION_FILES:
+                    raise ReleaseBuildError("installed distribution RECORD exceeds its bounds")
                 name, encoded_digest, encoded_size = row
                 if name == record_name:
                     if saw_record or encoded_digest or encoded_size:
-                        raise ReleaseBuildError("installed project RECORD self-entry is invalid")
+                        raise ReleaseBuildError(
+                            "installed distribution RECORD self-entry is invalid"
+                        )
                     saw_record = True
                     continue
                 relative = _safe_record_path(name)
                 path = site_packages / relative
                 if path.is_symlink() or not path.is_file():
-                    raise ReleaseBuildError("installed project RECORD path is unavailable")
+                    raise ReleaseBuildError("installed distribution file is unavailable")
                 observed_size, observed_sha256 = _file_digest(path)
                 if not encoded_digest and not encoded_size:
                     size = observed_size
                 else:
                     if not encoded_digest.startswith("sha256="):
-                        raise ReleaseBuildError("installed project RECORD hash is unsupported")
+                        raise ReleaseBuildError(
+                            "installed distribution RECORD hash is unsupported"
+                        )
                     try:
                         size = int(encoded_size)
                     except ValueError as error:
                         raise ReleaseBuildError(
-                            "installed project RECORD size is invalid"
+                            "installed distribution RECORD size is invalid"
                         ) from error
                     expected = base64.urlsafe_b64encode(
                         bytes.fromhex(observed_sha256)
@@ -1470,39 +1610,111 @@ def inspect_installed_distribution(
                         != expected
                     ):
                         raise ReleaseBuildError(
-                            "installed project RECORD identity mismatch"
+                            "installed distribution RECORD identity mismatch"
                         )
-                if size < 0 or size > 128 * 1024 * 1024:
-                    raise ReleaseBuildError("installed project file exceeds its byte bound")
+                if size < 0 or size > MAX_DISTRIBUTION_FILE_BYTES:
+                    raise ReleaseBuildError(
+                        "installed distribution file exceeds its byte bound"
+                    )
                 total_size += size
-                if total_size > 256 * 1024 * 1024 or name in entries:
-                    raise ReleaseBuildError("installed project RECORD is duplicated or oversized")
+                if total_size > MAX_DISTRIBUTION_BYTES or name in entries:
+                    raise ReleaseBuildError(
+                        "installed distribution RECORD is duplicated or oversized"
+                    )
                 entries[name] = (observed_sha256, size)
     except (OSError, UnicodeError, csv.Error) as error:
-        raise ReleaseBuildError("installed project RECORD is unreadable") from error
+        raise ReleaseBuildError("installed distribution RECORD is unreadable") from error
     if not saw_record or not entries:
-        raise ReleaseBuildError("installed project RECORD is incomplete")
-    native_entries = [
-        name
-        for name in entries
-        if name.startswith("market_squawk/_native.") and name.endswith(".so")
-    ]
-    if len(native_entries) != 1:
-        raise ReleaseBuildError("installed project has no unique native extension")
-    native_name = native_entries[0]
-    native = site_packages / _safe_record_path(native_name)
-    native_sha256, native_size = entries[native_name]
+        raise ReleaseBuildError("installed distribution RECORD is incomplete")
+    roots = tuple(
+        sorted(
+            {Path(name).parts[0] for name in entries}
+            | {Path(record_name).parts[0]}
+        )
+    )
+    if not roots or len(roots) > MAX_DISTRIBUTION_ROOTS:
+        raise ReleaseBuildError("installed distribution roots exceed their bound")
+    expected_paths = set(entries)
+    expected_paths.add(record_name)
+    if _installed_paths_under_roots(site_packages, roots) != expected_paths:
+        raise ReleaseBuildError("installed distribution contains an unrecorded file")
+    native = None
+    native_sha256 = None
+    native_size = None
+    if native_prefix is not None:
+        native_entries = [
+            name
+            for name in entries
+            if name.startswith(native_prefix) and name.endswith(".so")
+        ]
+        if len(native_entries) != 1:
+            raise ReleaseBuildError("installed project has no unique native extension")
+        native_name = native_entries[0]
+        native = site_packages / _safe_record_path(native_name)
+        native_sha256, native_size = entries[native_name]
     record_size, record_sha256 = _file_digest(record)
     return InstalledDistribution(
-        native_extension=native.relative_to(release_root),
-        native_extension_sha256=native_sha256,
-        native_extension_size=native_size,
+        name=requirement.name,
+        version=requirement.version,
+        roots=roots,
         record=record.relative_to(release_root),
         record_sha256=record_sha256,
         record_size=record_size,
         file_count=len(entries),
         file_set_sha256=_record_set_sha256(entries),
+        native_extension=native.relative_to(release_root) if native is not None else None,
+        native_extension_sha256=native_sha256,
+        native_extension_size=native_size,
     )
+
+
+def _installed_paths_under_roots(site_packages: Path, roots: tuple[str, ...]) -> set[str]:
+    paths = set()
+    directories = 0
+    maximum_paths = MAX_DISTRIBUTION_FILES * 3 + 1
+    for root_name in roots:
+        root = site_packages / _safe_record_path(root_name)
+        if root.is_symlink() or not root.exists():
+            raise ReleaseBuildError("installed distribution root is unavailable")
+        pending = [root]
+        while pending:
+            current = pending.pop()
+            if current.is_symlink():
+                raise ReleaseBuildError("installed distribution contains a symbolic link")
+            if current.is_file():
+                relative = current.relative_to(site_packages).as_posix()
+                _safe_record_path(relative)
+                paths.add(relative)
+                if len(paths) > MAX_DISTRIBUTION_FILES + 1:
+                    raise ReleaseBuildError("installed distribution file count is unbounded")
+                continue
+            if not current.is_dir():
+                raise ReleaseBuildError("installed distribution contains a special file")
+            directories += 1
+            if directories > MAX_DISTRIBUTION_FILES * 2:
+                raise ReleaseBuildError("installed distribution directory count is unbounded")
+            try:
+                with os.scandir(current) as stream:
+                    for entry in stream:
+                        if len(pending) + len(paths) + directories >= maximum_paths:
+                            raise ReleaseBuildError(
+                                "installed distribution path count is unbounded"
+                            )
+                        pending.append(Path(entry.path))
+            except OSError as error:
+                raise ReleaseBuildError("installed distribution root is unreadable") from error
+    return paths
+
+
+def _require_disjoint_distribution_roots(
+    distributions: tuple[InstalledDistribution, ...],
+) -> None:
+    roots = set()
+    for distribution in distributions:
+        for root in distribution.roots:
+            if root in roots:
+                raise ReleaseBuildError("installed distribution roots overlap")
+            roots.add(root)
 
 
 def install_training_environment(
@@ -1516,6 +1728,7 @@ def install_training_environment(
     project_wheel: Path,
     validator_sha256: str,
     distribution: InstalledDistribution,
+    runtime_distributions: tuple[InstalledDistribution, ...],
     signer: ReleaseSigner,
 ) -> str:
     """Install one fixed-path release receipt outside the wheel's RECORD file set."""
@@ -1534,6 +1747,13 @@ def install_training_environment(
         raise ReleaseBuildError("release interpreter escapes its environment") from error
     if interpreter_relative != "bin/python":
         raise ReleaseBuildError("release interpreter path is not canonical")
+    if (
+        distribution.native_extension is None
+        or distribution.native_extension_sha256 is None
+        or distribution.native_extension_size is None
+    ):
+        raise ReleaseBuildError("installed project native extension is absent")
+    _require_disjoint_distribution_roots((distribution, *runtime_distributions))
     interpreter_size, interpreter_sha256 = _file_digest(interpreter)
     authority_parent = release_root / "share"
     if authority_parent.is_symlink() or (
@@ -1564,14 +1784,11 @@ def install_training_environment(
             "sha256": distribution.native_extension_sha256,
             "size_bytes": distribution.native_extension_size,
         },
-        "project_distribution": {
-            "file_count": distribution.file_count,
-            "file_set_sha256": distribution.file_set_sha256,
-            "record_relative_path": distribution.record.as_posix(),
-            "record_sha256": distribution.record_sha256,
-            "record_size_bytes": distribution.record_size,
-        },
+        "project_distribution": _distribution_payload(distribution),
         "release_manifest_sha256": release_manifest_sha256,
+        "runtime_distributions": [
+            _distribution_payload(value) for value in runtime_distributions
+        ],
         "training_code_revision": training_code_revision,
         "validator_sha256": validator_sha256,
     }
@@ -1602,6 +1819,19 @@ def install_training_environment(
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _distribution_payload(distribution: InstalledDistribution) -> dict[str, object]:
+    return {
+        "file_count": distribution.file_count,
+        "file_set_sha256": distribution.file_set_sha256,
+        "name": distribution.name,
+        "record_relative_path": distribution.record.as_posix(),
+        "record_sha256": distribution.record_sha256,
+        "record_size_bytes": distribution.record_size,
+        "roots": list(distribution.roots),
+        "version": distribution.version,
+    }
+
+
 def _safe_record_path(value: str) -> Path:
     path = Path(value)
     if (
@@ -1624,6 +1854,13 @@ def _record_set_sha256(entries: dict[str, tuple[str, int]]) -> str:
         digest.update(size.to_bytes(8, "big"))
         digest.update(bytes.fromhex(sha256))
     return digest.hexdigest()
+
+
+def _normalize_project_name(value: str) -> str:
+    normalized = re.sub(r"[-_.]+", "-", value).lower()
+    if not normalized or len(normalized) > 128:
+        raise ReleaseBuildError("Python distribution name is invalid")
+    return normalized
 
 
 def _compatible(filename: str, version: tuple[int, int]) -> bool:

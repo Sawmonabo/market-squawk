@@ -13,6 +13,20 @@ use market_squawk_modeling::{
     ControlledOnnxRuntimeRoot, ExternalOnnxRuntimeBackend, ExternalOnnxRuntimeReference,
     ExternalRuntimePlatform, OPTIONAL_ONNX_RUNTIME_VERSION,
 };
+#[cfg(all(
+    feature = "onnx-runtime",
+    any(
+        all(
+            target_os = "macos",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(
+            target_os = "windows",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        )
+    )
+))]
+use market_squawk_modeling::{ExternalOnnxRuntimeError, optional_onnx_runtime_policy_digest};
 use market_squawk_modeling::{
     InferenceBackend, ModelFeatureValue, ModelInput, OnnxBackendError, OnnxFallbackPolicy,
     OnnxModelPolicy, OnnxPolicyError, OnnxWorkerProgram, TractOnnxBackend,
@@ -308,6 +322,36 @@ fn external_runtime_matches_tract_when_explicitly_configured() -> TestResult {
     assert_eq!(program.active_generations(), 2);
     drop(external);
     assert_eq!(program.active_generations(), 1);
+    Ok(())
+}
+
+#[cfg(all(
+    feature = "onnx-runtime",
+    any(
+        all(
+            target_os = "macos",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(
+            target_os = "windows",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        )
+    )
+))]
+#[test]
+fn external_runtime_fails_closed_without_a_descriptor_bound_loader() -> TestResult {
+    let error = ExternalOnnxRuntimeReference::try_new(
+        "runtime/libonnxruntime",
+        "runtime/admission.json",
+        [1; 32],
+        [2; 32],
+        optional_onnx_runtime_policy_digest(),
+        OPTIONAL_ONNX_RUNTIME_VERSION,
+        current_external_platform()?,
+    )
+    .err()
+    .ok_or("unsupported external runtime reference was admitted")?;
+    assert_eq!(error, ExternalOnnxRuntimeError::UnsupportedPlatform);
     Ok(())
 }
 

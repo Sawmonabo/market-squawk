@@ -82,8 +82,8 @@
   "sources": [
     {
       "path": "Cargo.lock",
-      "sha256": "de039e174524aaeeb4ab5a0204cbce09bd360f5ff367e6a81d393d9caf2a0552",
-      "size_bytes": 176951
+      "sha256": "a50797fc0e2bc4ca3e66751eb5ead96a4a1e4064b084e5e55ed27b24c88183c1",
+      "size_bytes": 176963
     },
     {
       "path": "Cargo.toml",
@@ -1027,8 +1027,8 @@
     },
     {
       "path": "crates/market-squawk-modeling/Cargo.toml",
-      "sha256": "b370e434ec8c5761d2ca2586cd160e225cabb4cc9f671300f361e363e1bae34c",
-      "size_bytes": 1625
+      "sha256": "74e70483614573cefaf374626fcd3a1b810fd10aaffc49fc80853917b716aaed",
+      "size_bytes": 1650
     },
     {
       "path": "crates/market-squawk-modeling/src/bin/market_squawk_model_validator.rs",
@@ -1042,8 +1042,8 @@
     },
     {
       "path": "crates/market-squawk-modeling/src/bin/market_squawk_release_signer.rs",
-      "sha256": "a01f5e1f475ac3d2e3a6d2624644c90466d7bbba439a380e946fce7d9d484e01",
-      "size_bytes": 1748
+      "sha256": "f6f8025c3638e4466d1bf67fca91772ff2215504875b75fc525e3f506c5b00f4",
+      "size_bytes": 1806
     },
     {
       "path": "crates/market-squawk-modeling/src/bundle.rs",
@@ -1087,13 +1087,13 @@
     },
     {
       "path": "crates/market-squawk-modeling/src/onnx/external.rs",
-      "sha256": "52e25c32005c3b227fdbdfbbda6899ace1ad02e1e84b73b631525c3372e6ae57",
-      "size_bytes": 12248
+      "sha256": "06e6c529c6dae7e5d095389209704a7acd4b940b52532a9e32a42056bb11d262",
+      "size_bytes": 12051
     },
     {
       "path": "crates/market-squawk-modeling/src/onnx/external/seal.rs",
-      "sha256": "52295b095aa8f2a647043dd03f8f129f292c76b6a9b91d0700eb797f7da199d5",
-      "size_bytes": 19651
+      "sha256": "747500272e74c78b7a1e14292c08a6f1fdc5325f69b9a971dcc6a2e3ed30d223",
+      "size_bytes": 20936
     },
     {
       "path": "crates/market-squawk-modeling/src/onnx/policy.rs",
@@ -1107,8 +1107,8 @@
     },
     {
       "path": "crates/market-squawk-modeling/src/onnx/worker/process.rs",
-      "sha256": "8bfc33415b8bd361848f44f2e2ac7d243288b9c67732677e826d55efe8123093",
-      "size_bytes": 9156
+      "sha256": "a285153eb99cab0c313f84205cf5020f0dbf83d043bafc77a61b47272f8c2562",
+      "size_bytes": 13289
     },
     {
       "path": "crates/market-squawk-modeling/src/onnx/worker/protocol.rs",
@@ -1117,8 +1117,8 @@
     },
     {
       "path": "crates/market-squawk-modeling/src/onnx/worker/resources.rs",
-      "sha256": "29d3c66e4a2679d38fe561f4192859c4b3adf81d1b45623fea89c81fb7f2943c",
-      "size_bytes": 2283
+      "sha256": "9e1da1b67bc5214ae50c205ca9f5d5ef313a75d71ec70818fa50ccc927b17d6c",
+      "size_bytes": 2763
     },
     {
       "path": "crates/market-squawk-modeling/src/registry.rs",
@@ -1127,8 +1127,8 @@
     },
     {
       "path": "crates/market-squawk-modeling/src/training_environment.rs",
-      "sha256": "b4aa407ba8eee03ad821e5f6ebe72fe2237680c2678218b17f7b705e6804e702",
-      "size_bytes": 26738
+      "sha256": "406b0039e7b1bfde30c1896977f6e09e74a27f827d75eefb959f60b00731b59e",
+      "size_bytes": 35135
     },
     {
       "path": "crates/market-squawk-platform/Cargo.toml",
@@ -1902,8 +1902,8 @@
     },
     {
       "path": "python/tests/test_training_bundle.py",
-      "sha256": "c0c5d9c9ed4793e4a820e011ac1d7defdbeef0ea24af5778dc76970e078dc06a",
-      "size_bytes": 10235
+      "sha256": "06f7eb27581a50e226b3bf9ad362b1da42d1006e10f9d4af1e6a5cd4948f525a",
+      "size_bytes": 11555
     },
     {
       "path": "python/tests/test_visualization_examples.py",
@@ -1917,13 +1917,13 @@
     },
     {
       "path": "scripts/build_python_release.py",
-      "sha256": "2dd2e0acfded684b73cd05cfd2e5aecb9e25f1bf50313d48076cace5330d95c6",
-      "size_bytes": 64850
+      "sha256": "8e97605df8cff7c1c08c458e68f2ba2d29259cb0aba4b60f4c8bd82455ef5e53",
+      "size_bytes": 74303
     },
     {
       "path": "scripts/tests/test_build_python_release.py",
-      "sha256": "dcd89fa5f4346aa8edb79d5256f169be5e1f220f3c27aa2b0bf0e0ed831c8fb8",
-      "size_bytes": 6838
+      "sha256": "32bcf747c4c1303c31bfa03d4b19c72114f7dea1a4bc95115f475120234a57e5",
+      "size_bytes": 8063
     }
   ]
 }

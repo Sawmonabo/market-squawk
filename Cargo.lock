@@ -3755,6 +3755,7 @@ dependencies = [
  "tokio-util",
  "tract-onnx",
  "win32job",
+ "zeroize",
 ]
 
 [[package]]

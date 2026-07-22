@@ -18,10 +18,11 @@ use super::{OnnxPolicyError, TractOnnxBackend, normalize_input};
 
 mod seal;
 
-pub(crate) use seal::verify_sealed_runtime;
 pub use seal::{ControlledOnnxRuntimeRoot, ExternalOnnxRuntimeAdmission};
+#[cfg(target_os = "linux")]
+pub(crate) use seal::{open_verified_sealed_runtime, verify_open_runtime};
 
-const MAX_RUNTIME_LIBRARY_BYTES: u64 = 512 * 1024 * 1024;
+pub(crate) const MAX_RUNTIME_LIBRARY_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_RUNTIME_EVIDENCE_BYTES: u64 = 32 * 1024;
 const MAX_RUNTIME_PATH_BYTES: usize = 256;
 const TRACKED_RUNTIME_POLICY: &[u8] =
@@ -62,16 +63,8 @@ impl ExternalRuntimePlatform {
     }
 
     fn is_current(self) -> bool {
-        cfg!(all(target_os = "macos", target_arch = "aarch64")) && self == Self::MacosArm64MachO
-            || cfg!(all(target_os = "macos", target_arch = "x86_64"))
-                && self == Self::MacosX8664MachO
-            || cfg!(all(target_os = "linux", target_arch = "aarch64"))
-                && self == Self::LinuxArm64Elf
+        cfg!(all(target_os = "linux", target_arch = "aarch64")) && self == Self::LinuxArm64Elf
             || cfg!(all(target_os = "linux", target_arch = "x86_64")) && self == Self::LinuxX8664Elf
-            || cfg!(all(target_os = "windows", target_arch = "aarch64"))
-                && self == Self::WindowsArm64Pe
-            || cfg!(all(target_os = "windows", target_arch = "x86_64"))
-                && self == Self::WindowsX8664Pe
     }
 
     pub(crate) const fn wire_id(self) -> u8 {
@@ -85,6 +78,7 @@ impl ExternalRuntimePlatform {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn from_wire_id(value: u8) -> Option<Self> {
         match value {
             1 => Some(Self::MacosArm64MachO),
@@ -132,13 +126,15 @@ impl ExternalOnnxRuntimeReference {
         let library_relative_path = library_relative_path.as_ref();
         let evidence_relative_path = evidence_relative_path.as_ref();
         let runtime_version = runtime_version.as_ref();
+        if !platform.is_current() {
+            return Err(ExternalOnnxRuntimeError::UnsupportedPlatform);
+        }
         if !controlled_relative_path(library_relative_path)
             || !controlled_relative_path(evidence_relative_path)
             || library_relative_path == evidence_relative_path
             || [library_digest, evidence_digest, verifier_policy_digest].contains(&[0; 32])
             || verifier_policy_digest != optional_onnx_runtime_policy_digest()
             || runtime_version != OPTIONAL_ONNX_RUNTIME_VERSION
-            || !platform.is_current()
         {
             return Err(ExternalOnnxRuntimeError::InvalidReference);
         }
@@ -268,6 +264,8 @@ struct ExternalRuntimeEvidenceWire {
 pub enum ExternalOnnxRuntimeError {
     #[error("external ONNX Runtime reference is invalid")]
     InvalidReference,
+    #[error("external ONNX Runtime loading is unsupported on this platform")]
+    UnsupportedPlatform,
     #[error("external ONNX Runtime root is unavailable")]
     Root,
     #[error("external ONNX Runtime artifact is unavailable")]

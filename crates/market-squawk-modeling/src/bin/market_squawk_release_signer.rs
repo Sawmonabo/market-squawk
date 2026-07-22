@@ -4,6 +4,7 @@ use std::env;
 use std::io::{Read as _, Write as _};
 
 use ed25519_dalek::{Signer as _, SigningKey};
+use zeroize::{Zeroize as _, Zeroizing};
 
 const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 
@@ -16,13 +17,13 @@ fn main() {
 
 fn run() -> Result<(), ()> {
     let maximum_request_bytes = 32 + 4 + MAX_MESSAGE_BYTES + 1;
-    let mut input = Vec::with_capacity(maximum_request_bytes);
+    let mut input = Zeroizing::new(Vec::with_capacity(maximum_request_bytes));
     let result = std::io::stdin()
         .take(maximum_request_bytes as u64)
         .read_to_end(&mut input)
         .map_err(|_| ())
         .and_then(|_| process(&input));
-    input.fill(0);
+    input.zeroize();
     result
 }
 

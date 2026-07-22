@@ -13,6 +13,7 @@ import tempfile
 import unittest
 
 import market_squawk.training as installed_training
+import pyarrow as pa
 from market_squawk import training_environment_receipt
 from market_squawk.bundle import BundleAuthorityRef, BundleExportError
 from market_squawk.data import UtcNanoseconds, open_dataset
@@ -44,10 +45,38 @@ def _run(dataset) -> TrainingRun:
 
 class TrainingBundleContracts(unittest.TestCase):
     def test_signed_environment_rejects_regenerated_record_and_receipt(self) -> None:
-        self.assertEqual(len(training_environment_receipt().sha256), 64)
+        baseline = training_environment_receipt().sha256
+        self.assertEqual(len(baseline), 64)
         authority = Path(sys.prefix) / "share/market-squawk"
         receipt = authority / "training-environment.json"
         envelope = json.loads(receipt.read_text(encoding="ascii"))
+        self.assertEqual(
+            [value["name"] for value in envelope["payload"]["runtime_distributions"]],
+            ["pyarrow"],
+        )
+        dependency_source = Path(pa.__file__)
+        dependency_content = dependency_source.read_bytes()
+        dependency_mode = stat.S_IMODE(dependency_source.stat().st_mode)
+        try:
+            dependency_source.chmod(dependency_mode | stat.S_IWUSR)
+            dependency_source.write_bytes(dependency_content + b"\n# untrusted mutation\n")
+            with self.assertRaises(ValueError):
+                training_environment_receipt()
+        finally:
+            dependency_source.write_bytes(dependency_content)
+            dependency_source.chmod(dependency_mode)
+        self.assertEqual(training_environment_receipt().sha256, baseline)
+
+        added_dependency = dependency_source.parent / "_market_squawk_unrecorded.py"
+        self.assertFalse(added_dependency.exists())
+        try:
+            added_dependency.write_bytes(b"raise RuntimeError('untrusted')\n")
+            with self.assertRaises(ValueError):
+                training_environment_receipt()
+        finally:
+            added_dependency.unlink(missing_ok=True)
+        self.assertEqual(training_environment_receipt().sha256, baseline)
+
         record = Path(sys.prefix) / envelope["payload"]["project_distribution"][
             "record_relative_path"
         ]

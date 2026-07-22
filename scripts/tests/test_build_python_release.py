@@ -82,6 +82,25 @@ class PythonReleaseBuilderContracts(unittest.TestCase):
                 builder.admit_artifact_root(artifact_root, ROOT)
             self.assertEqual(sentinel.read_text(), "operator-owned")
 
+    def test_release_reset_never_follows_an_intermediate_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            layout = builder.admit_artifact_root(root / "artifacts", ROOT)
+            release = layout.releases[0][1]
+            builder._admit_owned_child(release, layout.root, "release-cp312")
+            external = root / "external"
+            authority = external / "market-squawk"
+            authority.mkdir(parents=True, mode=0o755)
+            sentinel = authority / "operator-owned"
+            sentinel.write_text("preserve", encoding="utf-8")
+            (release / "share").symlink_to(external, target_is_directory=True)
+
+            with self.assertRaises(builder.ReleaseBuildError):
+                builder._reset_owned_child(release, layout.root, "release-cp312")
+
+            self.assertEqual(authority.stat().st_mode & 0o777, 0o755)
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "preserve")
+
     def test_toolchain_boundary_rejects_the_previous_patch_release(self) -> None:
         with self.assertRaises(builder.ReleaseBuildError):
             builder._require_tool_release(
@@ -128,6 +147,7 @@ class PythonReleaseBuilderContracts(unittest.TestCase):
                 lock,
                 builder.PythonRuntime(interpreter, (3, 12, 12)),
                 {"rustc": {"sha256": "22" * 32}},
+                (builder.RuntimeRequirement("pyarrow", "25.0.0"),),
                 "44" * 32,
                 "55" * 32,
             )
@@ -152,6 +172,10 @@ class PythonReleaseBuilderContracts(unittest.TestCase):
             self.assertEqual(value["training_code_revision"], value["source_closure_sha256"])
             self.assertEqual(hashlib.sha256(manifest).hexdigest(), manifest_digest)
             self.assertEqual(value["release_public_key"], "44" * 32)
+            self.assertEqual(
+                value["runtime_distributions"],
+                [{"name": "pyarrow", "version": "25.0.0"}],
+            )
             self.assertEqual(release["payload"]["foundation_sha256"], digest)
             self.assertEqual(release["payload"]["validator"]["sha256"], "33" * 32)
             self.assertEqual(release["signature"], "66" * 64)

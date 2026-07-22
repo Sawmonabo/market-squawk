@@ -7,15 +7,11 @@
   "evidence_schema_version": 1,
   "notice": {
     "path": "docs/licenses/onnx-runtime-notice.md",
-    "sha256": "97c2ee2296cf3e80ee60cdd94d28c26603ba7ae31a8ed60742265f0b3c44fbab"
+    "sha256": "a86d5ba1e5d829a2bbded63d70bd486e1746c348229f4dc6f9f64a2f46a80e36"
   },
   "platforms": [
     "linux-arm64-elf",
-    "linux-x86_64-elf",
-    "macos-arm64-macho",
-    "macos-x86_64-macho",
-    "windows-arm64-pe",
-    "windows-x86_64-pe"
+    "linux-x86_64-elf"
   ],
   "runtime": {
     "api_version": 24,
