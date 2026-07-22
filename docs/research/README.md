@@ -52,6 +52,18 @@ decisions can be audited without relying on conversation history.
   — capability-gated provider setup, human authorization boundaries, rights admission, credential
   lifecycle, 24 implementation acceptance criteria, and the complete source/evidence package.
 
+## Provider decisions
+
+- [Coinbase Direct Market Data execution-quality candidate](providers/coinbase-direct-market-data-2026-07-22.md)
+  — authenticated direct endpoint, full-channel snapshot/sequence contract, free-tier bound, and
+  the exact evidence still required before `DirectVerified` qualification.
+- [Coinbase Exchange public WebSocket v1 decision](providers/coinbase-exchange-websocket-2026-07-16.md)
+  — public level2/matches/heartbeat coverage and its immutable `DirectUnverified` ceiling.
+- [BLS Public Data API decision](providers/bls-public-data-api-2026-07-21.md) — registered and
+  unregistered request limits, missing-observation semantics, and source authority.
+- [Local file adapter boundaries](providers/local-file-adapter-boundaries-2026-07-20.md) —
+  controlled-root file admission and format-specific source boundaries.
+
 ## Evidence policy
 
 - Prefer official specifications, official project documentation, primary research papers, and
