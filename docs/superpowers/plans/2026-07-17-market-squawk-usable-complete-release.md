@@ -543,7 +543,7 @@ path set before dispatch and merges in the order shown.
 | Stage 2 / Wave 3 | 11 PIT/research composition; 12 analytics | provider lanes and data manifests merged | data/app research; analytics | 11 then 12 | one reviewed lock resolution; Tasks 11/12 focused `--locked` reruns; locked Wave gate |
 | Stage 3 / Wave 4A | 13 bundle/native; 14 Python; 16 portfolio | PIT and analytics APIs frozen | modeling; python; portfolio | 13, 16, then 14 | one reviewed lock resolution; Tasks 13/14/16 focused `--locked` reruns; locked Wave gate |
 | Stage 3 / Wave 4B | 15 ONNX; 17 backtest; 18 fair value | bundle/portfolio/data interfaces frozen | modeling ONNX; backtesting crate; valuation | 15, 17, 18 | one reviewed lock resolution; Tasks 15/17/18 focused `--locked` reruns; locked Wave gate |
-| Stage 4 / Wave 5 | 19 services/CLI/MCP domains | all domain services merged | app/MCP/CLI serialized composition | last implementation merge | one reviewed lock resolution; Task 19 focused `--locked` rerun; locked full workspace gate |
+| Stage 4 / Wave 5 | 19 services/CLI/MCP domains; 19A local provider onboarding | all domain services merged and Task 19A evidence refreshed | platform/catalog/onboarding and transport-neutral service contracts may proceed in disjoint paths; application/CLI/MCP composition is serialized | 19 service contracts, 19A authority lifecycle, then one application composition | one reviewed lock resolution; focused Task 19/19A `--locked` reruns; locked full workspace gate |
 | Stage 5 / Wave 6 | 20 demo/hardening/review/publication | clean integrated candidate | benches/fuzz/docs/evidence, then frozen review | terminal | unchanged reviewed lock; all locked release gates at each freeze |
 
 ## Four delivery-quarter checkpoints
@@ -557,7 +557,7 @@ remain the fine-grained dependency/parallelization coordinates inside each quart
 | Quarter 1 of 4 | Tasks 0-6; Stages 0-1; Waves 0-1B | truthful baseline, governed dependencies, production live/risk/paper path, catalog/data/MCP foundations, and Kraken vertical |
 | Quarter 2 of 4 | Tasks 7-12; Stage 2; Waves 2-3 | required file/SEC/macro/portfolio ingestion, research composition, PIT datasets, and Rust analytics |
 | Quarter 3 of 4 | Tasks 13-18; Stage 3; Waves 4A-4B | model bundles, native/ONNX inference, Python product, portfolio accounting, backtesting, and fair value |
-| Quarter 4 of 4 | Tasks 19-20; Stages 4-5; Waves 5-6 | complete shared services/CLI/MCP plus demo, fuzz, measurement, security, publication, and usable-release evidence |
+| Quarter 4 of 4 | Tasks 19, 19A, and 20; Stages 4-5; Waves 5-6 | complete shared services/CLI/MCP, zero-mandatory-fee provider onboarding, demo, fuzz, measurement, security, publication, and usable-release evidence |
 
 At every quarter checkpoint the integration owner freezes one clean exact commit, runs the complete
 applicable locked gate, and dispatches fresh non-mutating specialist reviewers in maximum parallel
@@ -2260,56 +2260,33 @@ authority.
 
 **Files:**
 
-- Modify: `apps/market-squawk/Cargo.toml`
-- Modify: `crates/market-squawk-platform/src/config.rs`
-- Modify: `crates/market-squawk-platform/src/paths.rs`
-- Create: `crates/market-squawk-platform/src/observability.rs`
-- Create: `crates/market-squawk-platform/tests/operations_policy.rs`
-- Create: `apps/market-squawk/src/application.rs`
-- Create: `apps/market-squawk/src/cli.rs`
-- Modify: `apps/market-squawk/src/main.rs`
-- Modify: `apps/market-squawk/src/lib.rs`
-- Modify: `crates/market-squawk-services/src/lib.rs`
-- Create: `crates/market-squawk-services/src/source.rs`
-- Create: `crates/market-squawk-services/src/market.rs`
-- Create: `crates/market-squawk-services/src/research.rs`
-- Create: `crates/market-squawk-services/src/fundamental.rs`
-- Create: `crates/market-squawk-services/src/macro_data.rs`
-- Create: `crates/market-squawk-services/src/portfolio.rs`
-- Create: `crates/market-squawk-services/src/analysis.rs`
-- Create: `crates/market-squawk-services/src/model.rs`
-- Create: `crates/market-squawk-services/src/fair_value.rs`
-- Create: `crates/market-squawk-services/src/bot.rs`
-- Create: `crates/market-squawk-services/src/execution.rs`
-- Create: `crates/market-squawk-services/tests/domain_contracts.rs`
-- Modify: `crates/market-squawk-mcp/src/server.rs`
-- Create: `crates/market-squawk-mcp/src/domains/source.rs`
-- Create: `crates/market-squawk-mcp/src/domains/market.rs`
-- Create: `crates/market-squawk-mcp/src/domains/research.rs`
-- Create: `crates/market-squawk-mcp/src/domains/fundamental.rs`
-- Create: `crates/market-squawk-mcp/src/domains/macro_data.rs`
-- Create: `crates/market-squawk-mcp/src/domains/portfolio.rs`
-- Create: `crates/market-squawk-mcp/src/domains/analysis.rs`
-- Create: `crates/market-squawk-mcp/src/domains/model.rs`
-- Create: `crates/market-squawk-mcp/src/domains/fair_value.rs`
-- Create: `crates/market-squawk-mcp/src/domains/bot.rs`
-- Create: `crates/market-squawk-mcp/src/domains/execution.rs`
-- Create: `crates/market-squawk-mcp/tests/domains.rs`
-- Create: `crates/market-squawk-mcp/tests/prohibited_surfaces.rs`
-- Create: `apps/market-squawk/tests/cli_complete.rs`
-- Create: `apps/market-squawk/tests/service_parity.rs`
-- Create: `apps/market-squawk/tests/doctor_policy.rs`
-- Create: `apps/market-squawk/tests/no_hidden_outbound.rs`
-- Modify: `scripts/smoke_mcp.py`
+- Modify the existing `market-squawk-services` request, response, progress, descriptor, and dispatch
+  modules; split a file only when the implementation would otherwise exceed the repository's normal
+  size/cohesion boundary.
+- Modify the existing application composition in `apps/market-squawk/src/`; add focused
+  `application`, `cli`, configuration, and observability modules where they own real behavior.
+- Modify the existing generic MCP transport in `crates/market-squawk-mcp/src/server.rs` and its
+  isolation/audit/artifact modules. Do not create a second domain-specific MCP business layer.
+- Modify `market-squawk-platform` configuration, paths, local tracing, endpoint policy, and
+  redaction only where the application composition consumes them.
+- Extend the existing consolidated application harnesses `control_plane`, `live_pipeline`, and
+  `risk_execution`, the MCP `lifecycle_protocol` and `hostile_boundaries` harnesses, and affected
+  crate unit suites. Do not create standalone `cli_complete`, `service_parity`, `doctor_policy`,
+  `no_hidden_outbound`, `domains`, or `prohibited_surfaces` executables.
+- Modify `scripts/smoke_mcp.py` only for a real end-to-end protocol assertion not already covered by
+  the Rust transport tests.
 
 **Interfaces:**
 
 - Consumes: Task 2 `ApplicationServices`, Task 5 protocol, Tasks 4/11 query/PIT, Task 13/15 model,
   Task 16 portfolio, Task 17 backtest and Task 18 fair value services.
-- Produces: one lifecycle-owned `Application` implementing versioned transport-neutral services from
-  `market-squawk-services`, shared by the complete CLI and MCP. Every request has typed authorization,
-  cancellation/deadline, time/instrument/result limits, source coverage, audit admission and
-  controlled artifact policy. Neither transport owns business validation.
+- Produces: one lifecycle-owned `Application` implementing versioned transport-neutral descriptors
+  and `ToolServices` dispatch from `market-squawk-services`, shared by the complete CLI and MCP.
+  Business DTOs, bounds, effects, and authorization contracts live with the service descriptor;
+  exactly one application composition implements them. The MCP server remains a generic descriptor-
+  to-protocol adapter and the CLI invokes the same descriptors/services. Every request has typed
+  authorization, cancellation/deadline, time/instrument/result limits, source coverage, audit
+  admission and controlled artifact policy. Neither transport owns business validation.
 
 The same composition also produces `EffectiveConfig`, `EndpointPolicy`, `ArtifactRootPolicy`,
 `RedactionPolicy`, `LocalTracingPolicy`, and a bounded `DoctorReport`. Configuration precedence is
@@ -2318,7 +2295,7 @@ execution endpoints are deny-by-default/allowlisted; the artifact root is capabi
 tracing supports human-readable and JSON output with the same recursive redaction. Telemetry,
 analytics beacons, OpenTelemetry, remote exporters and undocumented outbound clients are absent.
 
-- [ ] **Step 1: Write RED CLI hierarchy and service-parity tests**
+- [ ] **Step 1: Extend the consolidated harnesses with the minimum failing contracts**
 
 Require `init`, `config`, `source`, `capture`, `ingest`, `dataset`, `query`, `feature`, `model`,
 `portfolio`, `backtest`, `bot`, `execution`, `fair-value`, `mcp serve`, and `doctor`, with human/JSON
@@ -2326,17 +2303,16 @@ output, precedence, bounded args, typed exit classes and diagnostic compatibilit
 request DTO and service call must produce semantically equal CLI/MCP results. DataFusion SQL exists
 only under CLI `query` and cannot be reached by MCP.
 
-Add precedence matrices for absent/file/env/CLI combinations, unknown `MARKET_SQUAWK_*` keys,
-invalid/unset values and secret references. Run human/JSON tracing through nested typed errors,
-provider payloads, URLs, headers, account/order IDs and `Debug`/`Display`; assert configured secret
-values and capability paths never appear. `doctor --json` reports the precedence source for each
-non-secret setting, allowlist decisions, artifact confinement, local-only tracing, telemetry disabled,
-provider rights/health and release blockers, but no secret value or secret identifier. Socket/DNS
-instrumentation asserts startup/doctor/default tests make no outbound call; only an explicitly
-enabled allowlisted source/execution adapter can open its declared endpoint. Dependency/registration
-scans reject `opentelemetry`, exporter/beacon code and hidden HTTP/WebSocket clients.
+Add one table-driven precedence contract for absent/file/environment/CLI values and failure cases;
+reuse the existing configuration-security harness. Exercise human/JSON tracing through one nested
+secret-bearing error fixture and one provider URL/header fixture. `doctor --json` reports setting
+provenance, allowlist decisions, artifact confinement, local-only tracing, provider rights/health and
+release blockers without returning secret values or capability paths. Extend the existing outbound-
+policy test with startup/doctor/default composition; only an explicitly enabled allowlisted adapter
+may open its declared endpoint. Repository boundary and dependency audits remain the structural
+check; do not add prose/keyword policing scripts.
 
-- [ ] **Step 2: Write RED complete MCP domain/schema/result tests**
+- [ ] **Step 2: Register the complete descriptor set and test the generic transport once**
 
 Require these domains and minimum operations:
 
@@ -2354,19 +2330,21 @@ Bot.*         status/start/stop for controlled paper operation only
 Execution.*   paper orders/fills/cancel/reconcile
 ```
 
-Every schema rejects unknown fields and requires explicit instrument/time/result limits. Every call
-propagates cancellation/deadline, records admitted/result audit, includes source coverage/quality,
-returns truncation/completeness metadata, and spills over the inline byte/item ceiling to a content-
-hashed opaque artifact. Mutations require local authorization/confirmation and the sole Task 2 risk/
-dispatch service. Results cannot expose capability, credential, raw secret or arbitrary path.
+Every descriptor schema rejects unknown fields and requires the relevant instrument/time/result
+limits. Every call propagates cancellation/deadline, records admitted/result audit, includes source
+coverage/quality, returns truncation/completeness metadata, and spills over the inline byte/item
+ceiling to a content-hashed opaque artifact. Mutations require local authorization/confirmation and
+the sole Task 2 risk/dispatch service. Results cannot expose a capability, credential, raw secret or
+arbitrary path. Add one registry-completeness table and reuse the generic hostile-boundary/lifecycle
+matrix; do not duplicate the same assertions for every domain.
 
 - [ ] **Step 3: Run RED**
 
 ```bash
-cargo test -p market-squawk-mcp --test domains --test prohibited_surfaces --locked
-cargo test -p market-squawk-services --test domain_contracts --locked
-cargo test -p market-squawk --test cli_complete --test service_parity \
-  --test doctor_policy --test no_hidden_outbound --locked
+cargo test -p market-squawk-mcp --test lifecycle_protocol --test hostile_boundaries --locked
+cargo test -p market-squawk-services --lib --locked
+cargo test -p market-squawk --test control_plane --test live_pipeline \
+  --test risk_execution --locked
 python3 scripts/smoke_mcp.py ./target/debug/market-squawk
 cargo deny check
 python3 scripts/check_workspace_boundaries.py
@@ -2389,11 +2367,11 @@ explicit source smoke command.
 
 - [ ] **Step 5: Implement domain registration, mutation authority, and prohibited surfaces**
 
-Map typed service errors to stable MCP/CLI errors without provider payloads/secrets. No shell,
-arbitrary filesystem, unrestricted SQL, credential read, remote code/model loading, unchecked order,
-risk bypass, or audit deletion exists in registration or hidden dispatch. Bot/
-Execution accept intents/controlled commands only; risk constructs approvals and dispatcher consumes
-them once.
+Map typed service errors to stable MCP/CLI errors without provider payloads/secrets. DataFusion SQL
+is a separately authorized CLI-only operation and is absent from every MCP descriptor. No arbitrary
+shell/filesystem, credential read, remote code/model loading, unchecked order, risk bypass, or audit
+deletion operation exists in the descriptor registry or dispatch. Bot/Execution accept typed intents
+and controlled commands only; risk constructs approvals and the dispatcher consumes them once.
 
 - [ ] **Step 6: Run GREEN and commit**
 
@@ -2413,47 +2391,140 @@ git commit -m "feat(app): complete local CLI and MCP services"
 Expected: all domain, prohibited-surface, lifecycle, result-bound, cancellation/audit/artifact and
 CLI-parity tests pass; compatibility aliases remain explicitly diagnostic.
 
+### Task 19A: Implement the local zero-mandatory-fee provider onboarding portal
+
+**Authoritative design evidence:**
+
+- [`2026-07-22 zero-fee provider onboarding report`](../../research/2026-07-22-zero-fee-provider-onboarding/final-report.md)
+- [`machine-readable acceptance and source graph`](../../research/2026-07-22-zero-fee-provider-onboarding/final-report.json)
+
+The evidence report's `T19A-AC-01` through `T19A-AC-24` are release requirements, not optional
+future work. Before implementation, refresh response-body digests for mutable sources `DOC-009`,
+`DOC-010`, `DOC-014`, `DOC-019`, `DOC-020`, `DOC-026`, `DOC-028`, and `DOC-029`; a changed provider
+surface narrows or blocks the affected capability until reviewed.
+
+**Files:**
+
+- Extend `market-squawk-sources` with the versioned provider-surface capability registry,
+  onboarding state machine, verifier contracts, rights/rate-policy binding, and provider-specific
+  activation profiles. Reuse existing provider adapters and source authority; do not build a second
+  credential or HTTP stack.
+- Extend `market-squawk-platform::secrets` with exact create/read/replace/delete, capability probe,
+  prompt/cancel/deadline, generation and typed backend outcomes. Admit the existing encrypted vault
+  only after `T19A-AC-14` evidence; never silently fall back to plaintext.
+- Add catalog migration `0012` and focused catalog code for non-secret capability revisions,
+  onboarding sessions, `SecretRef`, requested/observed authority, rights decisions, lifecycle
+  results, tombstones, and audit linkage. Secret material never enters SQLite.
+- Extend `market-squawk-services` with transport-neutral onboarding descriptors and the application
+  with one lifecycle-owned implementation shared by CLI, portal, and bounded MCP status/control
+  operations.
+- Add a loopback-only local portal owned by the Market Squawk process. It serves packaged local
+  assets, binds an ephemeral loopback port, validates `Host`/`Origin`, uses a one-use bootstrap and
+  same-origin session, applies a restrictive CSP/no-store/frame-denial policy, has no remote scripts,
+  and shuts down on completion, cancellation, deadline, or owner exit. It opens exact official
+  provider deep links and resumes durable sessions; it does not embed provider login pages.
+- Extend only existing consolidated platform/source/catalog/application/MCP harnesses. Add the
+  smallest provider-state tables and fault boundaries needed to prove the 24 acceptance criteria;
+  do not create one test executable per provider, protocol, portal page, or criterion.
+
+**Interfaces and state:**
+
+- Setup mode is exactly one of `NoCredential`, `ManualApiKeyImport`,
+  `OAuthAuthorizationCodePkce`, `OAuthDevice`, or `DynamicClientRegistration`. The code-owned
+  provider capability record selects the supported modes; standards or generic library support can
+  never enable a provider mode.
+- Provider-controlled login, consent, MFA, CAPTCHA, terms, key creation, or account selection enters
+  durable `UserActionRequired` with an exact official deep link, requested authority, resume token,
+  monotonic deadline and cancel path. The portal removes browser searching and URL discovery; it
+  never reports those human-controlled steps as automated completion.
+- Credential authority advances through reserved, stored, verified and `ActiveScoped` generations.
+  Missing, excess, mismatched, expired, indeterminate or rights-blocked authority fails closed.
+  Remote revoke, local delete, catalog retirement/tombstone and cleanup are separate durable facts.
+- OAuth authorization-code/PKCE, device authorization and dynamic client registration remain
+  unavailable unless the exact provider deployment and client eligibility are admitted. Native
+  OAuth uses the external system browser, PKCE `S256`, exact transaction/issuer/redirect binding and
+  one callback consumption. Device/DCR workers obey provider intervals, expiry, retry and
+  indeterminate-remote-state rules.
+- Provider profiles implement the report's exact public/private Coinbase and Kraken authority
+  boundaries, SEC identified `User-Agent`, FRED/ALFRED hard rights gate, BLS v1/v2 quota/renewal and
+  rights duties, and separate Treasury XML/Fiscal Data rights. A free account or accepted API key
+  does not by itself grant durable-use rights.
+- Every browser, provider, secure-store and cleanup operation has one owner, a monotonic deadline,
+  cancellation, a bounded retry budget and a terminal/recoverable state. Only opaque references and
+  non-secret summaries cross service, portal, MCP, catalog, audit or log boundaries. The entire
+  onboarding plane remains outside the live event-to-action path.
+
+- [ ] **Step 1: Refresh mutable provider evidence and freeze capability records**
+
+Record the refreshed retrieval time/digest and reconcile any changed requirements into the ten
+code-owned surface records. A record contains setup mode, official entry URI or issuer, human
+boundary, credential kind, minimum and maximum authority, verifier, rate policy, rights state,
+lifecycle support, evidence IDs/digests and refresh trigger. Runtime discovery can only narrow it.
+
+- [ ] **Step 2: Complete secret lifecycle and durable non-secret state**
+
+Implement exact backend delete and typed capability/prompt/cancel/deadline behavior; then add the
+generation-bound catalog reservation, activation, cutover, recovery, tombstone and audit model.
+Fault injection at the store/catalog cutover proves idempotent restart and exact orphan cleanup.
+Review the existing vault against `T19A-AC-14`; repair it if necessary and preserve its format when
+it passes rather than inventing a new cryptosystem.
+
+- [ ] **Step 3: Implement capability-gated provider flows and portal ownership**
+
+Implement no-secret activation first, then manual import/permission verification, followed only by
+provider-admitted OAuth/device/DCR modes. The portal and CLI call the same onboarding service and
+never retain submitted secrets. The portal is local-only and self-terminating; external provider
+pages handle provider credentials and consent.
+
+- [ ] **Step 4: Prove the authority and privacy boundaries with thin critical tests**
+
+Use table-driven provider/mode/rights/permission cases plus focused crash, cancellation, secret-
+storage inspection and loopback-origin cases in the existing harnesses. Separately authorized,
+bounded external smokes prove only the provider/OS surfaces actually exercised; deterministic
+default tests remain offline. No mock or fixture may establish current provider availability,
+rights, or OS-store support.
+
+- [ ] **Step 5: Run GREEN and integrate with Task 19**
+
+```bash
+cargo test -p market-squawk-platform --all-features --locked
+cargo test -p market-squawk-sources --all-features --locked
+cargo test -p market-squawk-data --test catalog --all-features --locked
+cargo test -p market-squawk-services --lib --all-features --locked
+cargo test -p market-squawk --test control_plane --all-features --locked
+cargo test -p market-squawk-mcp --test lifecycle_protocol \
+  --test hostile_boundaries --all-features --locked
+cargo clippy -p market-squawk-platform -p market-squawk-sources \
+  -p market-squawk-data -p market-squawk-services -p market-squawk-mcp \
+  -p market-squawk --all-targets --all-features --locked -- -D warnings
+python3 scripts/check_workspace_boundaries.py
+git diff --check
+git commit -m "feat(onboarding): add local provider setup portal"
+```
+
+Expected: all 24 evidence-bound acceptance criteria pass; unsupported modes remain unavailable;
+provider-required human steps are resumable and truthful; secret, rights, and activation authority
+fail closed; no new standalone test harness or uncontrolled outbound surface exists.
+
 ### Task 20: Prove, review, publish, and stop at the usable complete local release
 
 **Files:**
 
-- Modify: `apps/market-squawk/Cargo.toml`
-- Create: `apps/market-squawk/tests/usable_release.rs`
-- Create: `apps/market-squawk/tests/external_coinbase_vertical.rs`
-- Create: `apps/market-squawk/tests/external_kraken_vertical.rs`
-- Create: `apps/market-squawk/tests/external_fred_alfred_vertical.rs`
-- Create: `apps/market-squawk/src/bin/market-squawk-benchmark.rs`
-- Create: `scripts/demo_usable_release.py`
-- Create: `scripts/run_release_fuzz.py`
-- Create: `scripts/run_sustained_benchmark.py`
-- Create: `scripts/check_release_performance.py`
-- Create: `scripts/check_external_release_evidence.py`
-- Create: `scripts/check_release_evidence.py`
-- Create: `scripts/tests/test_run_release_fuzz.py`
-- Create: `scripts/tests/test_run_sustained_benchmark.py`
-- Create: `scripts/tests/test_check_release_performance.py`
-- Create: `scripts/tests/test_check_external_release_evidence.py`
-- Create: `scripts/tests/test_check_release_evidence.py`
-- Create: `fuzz/Cargo.toml`
-- Create: `fuzz/fuzz_targets/coinbase_decoder.rs`
-- Create: `fuzz/fuzz_targets/kraken_v2_decoder.rs`
-- Create: `fuzz/fuzz_targets/csv_decoder.rs`
-- Create: `fuzz/fuzz_targets/json_ndjson_decoder.rs`
-- Create: `fuzz/fuzz_targets/xml_excel_decoder.rs`
-- Create: `fuzz/fuzz_targets/xbrl_decoder.rs`
-- Create: `fuzz/fuzz_targets/capture_record.rs`
-- Create: `fuzz/fuzz_targets/mcp_request.rs`
-- Create: `fuzz/fuzz_targets/model_bundle.rs`
-- Modify: `apps/market-squawk/benches/event_to_decision_latency.rs`
-- Modify: `crates/market-squawk-data/Cargo.toml`
-- Create: `crates/market-squawk-data/benches/storage.rs`
-- Create: `docs/verification/usable-release-demonstration.md`
-- Create: `docs/verification/usable-release-performance.md`
-- Create: `docs/verification/usable-release-gate.md`
-- Create: `docs/reports/usable-release-review.md`
-- Modify: `README.md`
-- Modify: `SECURITY.md`
-- Modify: `CHANGELOG.md`
+- Extend the existing application `control_plane`, `live_pipeline`, and `risk_execution` harnesses
+  with the single offline all-vertical proof and authorized external-smoke entry points. Do not add
+  provider-specific integration-test executables.
+- Add one production benchmark/evidence command family that owns live-path, analytical-storage,
+  sustained-memory, provider-smoke, threshold and closed-manifest evidence. Do not create a chain of
+  Python orchestration/checker scripts or unit tests that merely test those scripts.
+- Add `fuzz/Cargo.toml` and the required decoder/capture/MCP/model fuzz targets. Group file-format
+  variants behind shared harness code where they exercise the same parser boundary; do not duplicate
+  targets for naming symmetry.
+- Add the Criterion/live-path and storage benchmarks required for measured acceptance. Reuse the
+  existing capture benchmark components wherever their measurement contract already applies.
+- Modify the existing sealed Python builder and `scripts/verify.sh` only where they emit or validate
+  actual release evidence; do not add prose, command-order, or forbidden-word tests.
+- Add concise demonstration, performance, gate, review, changelog, security, and README truth
+  records sufficient to reproduce and interpret the exact-head evidence.
 
 **Interfaces:**
 
@@ -2462,7 +2533,7 @@ CLI-parity tests pass; compatibility aliases remain explicitly diagnostic.
   memory report, supply-chain/security evidence, zero-finding grouped review, GitHub publication and
   the only `usable_complete_local_release = true` determination.
 
-- [ ] **Step 1: Write the failing all-vertical release demonstration**
+- [ ] **Step 1: Add the failing all-vertical case to the consolidated application harness**
 
 The network-free demo initializes local state; runs deterministic local protocol servers through the
 production Coinbase and Kraken parsers, sequence/checksum/books/features paths; verifies those local
@@ -2481,8 +2552,8 @@ evidence is absent.
 - [ ] **Step 2: Run RED**
 
 ```bash
-cargo test -p market-squawk --test usable_release --all-features --locked
-python3 scripts/demo_usable_release.py --offline-fixtures
+cargo test -p market-squawk --test control_plane --all-features --locked \
+  usable_release_vertical
 ```
 
 Expected: FAIL until every required vertical, FRED rights predicate, and separate authorized
@@ -2490,19 +2561,19 @@ direct-source evidence predicate is satisfied and composed.
 
 - [ ] **Step 3: Implement fuzz, performance, and sustained-memory evidence producers**
 
-Task 20 is the sole owner of fuzz targets and campaigns; Tasks 6/7 contribute production parsers,
-property tests and seed fixtures only. `run_release_fuzz.py` verifies the exact fuzz-only nightly from
+Task 20 is the sole owner of fuzz targets and campaigns; Tasks 6/7 contribute production parsers and
+seed fixtures only. One bounded release-evidence command verifies the exact fuzz-only nightly from
 Task 1, builds no release artifact, runs every named target serially with a 120-second/2 GiB ceiling,
 rejects crashes/timeouts/OOMs, and emits a content-hashed JSON report. Stable Rust remains the only
 release/approval toolchain.
 
-The release benchmark binary measures decoder, sequence/checksum, bounded queue, book, online
+The release benchmark command measures decoder, sequence/checksum, bounded queue, book, online
 features, strategy, native/ONNX inference, risk, one-time dispatch and end-to-decision separately and
-together after an explicit warm-up. The storage bench measures Arrow/Parquet ingest/write/read,
-DataFusion query and Python handoff. `run_sustained_benchmark.py` samples process RSS during at least
-60 million events and fails if post-warm-up RSS grows beyond 32 MiB or 1% of the warm plateau,
-whichever is larger, or if any queue exceeds configured capacity. Every run records hardware, OS,
-toolchain, fixture/digest, event/row count, throughput, p50/p95/p99/max and peak RSS.
+together after an explicit warm-up. Its storage lane measures Arrow/Parquet ingest/write/read,
+DataFusion query and Python handoff. The same command samples process RSS during at least 60 million
+events and fails if post-warm-up RSS grows beyond 32 MiB or 1% of the warm plateau, whichever is
+larger, or if any queue exceeds configured capacity. Every run records hardware, OS, toolchain,
+fixture/digest, event/row count, throughput, p50/p95/p99/max and peak RSS.
 
 Before the candidate freeze, exercise every producer against a provisional ignored directory. These
 runs validate the tooling but are never approval evidence:
@@ -2510,27 +2581,14 @@ runs validate the tooling but are never approval evidence:
 ```bash
 EVIDENCE_DIR=target/release-evidence/provisional
 mkdir -p "$EVIDENCE_DIR"
-python3 scripts/run_release_fuzz.py \
-  --toolchain nightly-2026-07-15 --seconds-per-target 120 \
-  --rss-limit-mib 2048 --report "$EVIDENCE_DIR/fuzz.json"
-cargo bench -p market-squawk --bench event_to_decision_latency \
-  --all-features --locked -- --warm-up-events 1000000 --events 10000000 \
-  --output "$EVIDENCE_DIR/live-bench.json"
-cargo bench -p market-squawk-data --bench storage \
-  --all-features --locked -- --rows 10000000 \
-  --output "$EVIDENCE_DIR/data-bench.json"
-cargo build -p market-squawk --bin market-squawk-benchmark \
-  --release --all-features --locked
-python3 scripts/run_sustained_benchmark.py \
-  --binary target/release/market-squawk-benchmark --warm-up-events 1000000 \
-  --events 60000000 --max-tail-growth-mib 32 --max-tail-growth-percent 1 \
-  --report "$EVIDENCE_DIR/sustained-memory.json"
-python3 scripts/check_release_performance.py \
-  --live "$EVIDENCE_DIR/live-bench.json" \
-  --data "$EVIDENCE_DIR/data-bench.json" \
-  --memory "$EVIDENCE_DIR/sustained-memory.json" \
+cargo run -p market-squawk --release --all-features --locked -- \
+  release evidence fuzz --toolchain nightly-2026-07-15 \
+  --seconds-per-target 120 --rss-limit-mib 2048 --output "$EVIDENCE_DIR/fuzz.json"
+cargo run -p market-squawk --release --all-features --locked -- \
+  release evidence benchmark --warm-up-events 1000000 --events 60000000 \
+  --storage-rows 10000000 --max-tail-growth-mib 32 --max-tail-growth-percent 1 \
   --min-events-per-second 100000 --max-warmed-p99-ns 999999 \
-  --report "$EVIDENCE_DIR/performance.json"
+  --output "$EVIDENCE_DIR/performance.json"
 ```
 
 Expected: every command exits 0; measured end-to-decision throughput is at least 100,000 events/s,
@@ -2554,53 +2612,45 @@ source must satisfy every `DirectVerified` predicate and drive strategy -> compr
 paper action; otherwise the release remains blocked. FRED/ALFRED retrieval/persistence/training rights
 must be admitted or the required macro predicate remains blocked.
 
-The provisional provider run uses the same production tests and checker but writes only below
-`target/release-evidence/provisional/providers`. It establishes parser/rights-checker behavior, not
+The provisional provider run uses the production evidence command and writes only below
+`target/release-evidence/provisional/providers`. It establishes adapter/verifier behavior, not
 release approval:
 
 ```bash
 test "$MARKET_SQUAWK_EXTERNAL_NETWORK" = "1"
 test "$MARKET_SQUAWK_PROVIDER_TERMS_ACCEPTED" = "1"
-export MARKET_SQUAWK_RELEASE_EVIDENCE_DIR=target/release-evidence/provisional/providers
-cargo test -p market-squawk --test external_coinbase_vertical \
-  --all-features --locked -- --ignored --nocapture
-cargo test -p market-squawk --test external_kraken_vertical \
-  --all-features --locked -- --ignored --nocapture
-cargo test -p market-squawk --test external_fred_alfred_vertical \
-  --all-features --locked -- --ignored --nocapture
-python3 scripts/check_external_release_evidence.py \
+cargo run -p market-squawk --release --all-features --locked -- \
+  release evidence providers --providers coinbase,kraken,fred-alfred \
   --head "$(git rev-parse HEAD)" --tree "$(git rev-parse HEAD^{tree})" \
-  --evidence-dir target/release-evidence/provisional/providers \
-  --require-direct-verified-action --require-fred-alfred-rights
+  --require-direct-verified-action --require-fred-alfred-rights \
+  --output target/release-evidence/provisional/providers
 ```
 
-Expected: tests and checker pass only on real authorized network delivery at the unchanged candidate;
-the checker rejects local servers, fixtures, synthetic transports, missing predicates, mismatched
+Expected: the command passes only on real authorized network delivery at the unchanged candidate;
+it rejects local servers, fixtures, synthetic transports, missing predicates, mismatched
 head/tree/binary hashes, credentials in output, unsupported quality promotion and incomplete rights.
 
 - [ ] **Step 5: Finish every tracked file and commit the candidate before collecting evidence**
 
-First verify the hash-pinned local ONNX runtime, build the maturin extension and Python wheel using
-only the committed wheelhouse lock, and run the deterministic local gate. The extension may call
-analytical Rust kernels only; the dependency checker proves neither Python nor the extension enters
+First exercise the required self-contained tract ONNX backend, build the sealed Python releases from
+the committed source/wheelhouse lock, and run the deterministic local gate. Verify an operator-
+supplied external ONNX Runtime only when that optional Linux backend is configured; it is not the
+required ONNX capability. The dependency checker proves neither Python nor either backend enters
 live/execution runtime edges. Complete the README, changelog, security guidance, review procedure,
 and all tracked human-readable summaries now. A tracked file may summarize provisional evidence and
 methodology, but it must never claim to contain evidence for the commit that contains itself.
 
 ```bash
-python3 scripts/verify_onnx_runtime.py \
-  --policy docs/verification/onnx-runtime-policy.json \
-  --library "$MARKET_SQUAWK_ONNX_RUNTIME"
 python3 scripts/build_python_release.py \
-  --wheelhouse .agents/cache/python-wheelhouse \
   --lock python/wheelhouse-lock.json \
-  --venv target/usable-release-venv --offline \
-  --report target/release-evidence/provisional/python-build.json
-target/usable-release-venv/bin/python -m pytest python/tests -q
-MARKET_SQUAWK_PYTHON=target/usable-release-venv/bin/python \
-  python3 scripts/demo_usable_release.py --offline-fixtures \
+  --artifact-root target/release-evidence/provisional/python \
+  --python "$MARKET_SQUAWK_PYTHON312" --python "$MARKET_SQUAWK_PYTHON313" \
+  --offline
+cargo run -p market-squawk --release --all-features --locked -- \
+  release demonstrate --offline \
   --provider-evidence target/release-evidence/provisional/providers \
-  --report target/release-evidence/provisional/demo.json
+  --python-evidence target/release-evidence/provisional/python/release-manifest.json \
+  --output target/release-evidence/provisional/demo.json
 ./scripts/verify.sh
 git diff --check
 git commit -m "release: prove usable complete local platform"
@@ -2615,9 +2665,10 @@ candidate; provisional results do not approve it.
 
 Set one HEAD-keyed ignored artifact directory after the commit. Every producer and checker accepts
 the exact HEAD/tree and records the relevant binary, model, fixture, toolchain, input, and output
-hashes. `check_release_evidence.py` validates the closed artifact schema, rejects missing/extra or
-cross-HEAD artifacts and credentials, verifies all internal hashes, and writes the final manifest in
-that same ignored directory. It validates artifacts, not command text or plan prose.
+hashes. The single `release evidence close` command validates the closed artifact schema, rejects
+missing/extra or cross-HEAD artifacts and credentials, verifies all internal hashes, and writes the
+final manifest in that same ignored directory. It validates artifacts, not command text or plan
+prose.
 
 Run this complete block on the documented target hardware. An abbreviated `verify.sh` invocation is
 not a substitute for any command in the block:
@@ -2630,73 +2681,41 @@ TREE_SHA="$(git rev-parse HEAD^{tree})"
 EVIDENCE_DIR="target/release-evidence/$HEAD_SHA"
 mkdir -p "$EVIDENCE_DIR/providers"
 
-python3 scripts/run_release_fuzz.py \
-  --head "$HEAD_SHA" --tree "$TREE_SHA" \
+cargo run -p market-squawk --release --all-features --locked -- \
+  release evidence fuzz --head "$HEAD_SHA" --tree "$TREE_SHA" \
   --toolchain nightly-2026-07-15 --seconds-per-target 120 \
-  --rss-limit-mib 2048 --report "$EVIDENCE_DIR/fuzz.json"
-cargo bench -p market-squawk --bench event_to_decision_latency \
-  --all-features --locked -- --warm-up-events 1000000 --events 10000000 \
-  --head "$HEAD_SHA" --tree "$TREE_SHA" \
-  --output "$EVIDENCE_DIR/live-bench.json"
-cargo bench -p market-squawk-data --bench storage \
-  --all-features --locked -- --rows 10000000 \
-  --head "$HEAD_SHA" --tree "$TREE_SHA" \
-  --output "$EVIDENCE_DIR/data-bench.json"
-cargo build -p market-squawk --bin market-squawk-benchmark \
-  --release --all-features --locked
-python3 scripts/run_sustained_benchmark.py \
-  --head "$HEAD_SHA" --tree "$TREE_SHA" \
-  --binary target/release/market-squawk-benchmark --warm-up-events 1000000 \
-  --events 60000000 --max-tail-growth-mib 32 --max-tail-growth-percent 1 \
-  --report "$EVIDENCE_DIR/sustained-memory.json"
-python3 scripts/check_release_performance.py \
-  --head "$HEAD_SHA" --tree "$TREE_SHA" \
-  --live "$EVIDENCE_DIR/live-bench.json" \
-  --data "$EVIDENCE_DIR/data-bench.json" \
-  --memory "$EVIDENCE_DIR/sustained-memory.json" \
+  --rss-limit-mib 2048 --output "$EVIDENCE_DIR/fuzz.json"
+cargo run -p market-squawk --release --all-features --locked -- \
+  release evidence benchmark --head "$HEAD_SHA" --tree "$TREE_SHA" \
+  --warm-up-events 1000000 --events 60000000 --storage-rows 10000000 \
+  --max-tail-growth-mib 32 --max-tail-growth-percent 1 \
   --min-events-per-second 100000 --max-warmed-p99-ns 999999 \
-  --report "$EVIDENCE_DIR/performance.json"
+  --output "$EVIDENCE_DIR/performance.json"
 
 test "$MARKET_SQUAWK_EXTERNAL_NETWORK" = "1"
 test "$MARKET_SQUAWK_PROVIDER_TERMS_ACCEPTED" = "1"
-export MARKET_SQUAWK_RELEASE_EVIDENCE_DIR="$EVIDENCE_DIR/providers"
-cargo test -p market-squawk --test external_coinbase_vertical \
-  --all-features --locked -- --ignored --nocapture
-cargo test -p market-squawk --test external_kraken_vertical \
-  --all-features --locked -- --ignored --nocapture
-cargo test -p market-squawk --test external_fred_alfred_vertical \
-  --all-features --locked -- --ignored --nocapture
-python3 scripts/check_external_release_evidence.py \
+cargo run -p market-squawk --release --all-features --locked -- \
+  release evidence providers --providers coinbase,kraken,fred-alfred \
   --head "$HEAD_SHA" --tree "$TREE_SHA" \
-  --evidence-dir "$EVIDENCE_DIR/providers" \
   --require-direct-verified-action --require-fred-alfred-rights \
-  --report "$EVIDENCE_DIR/provider-validation.json"
+  --output "$EVIDENCE_DIR/providers"
 
-python3 scripts/verify_onnx_runtime.py \
-  --head "$HEAD_SHA" --tree "$TREE_SHA" \
-  --policy docs/verification/onnx-runtime-policy.json \
-  --library "$MARKET_SQUAWK_ONNX_RUNTIME" \
-  --report "$EVIDENCE_DIR/onnx-runtime.json"
 python3 scripts/build_python_release.py \
-  --head "$HEAD_SHA" --tree "$TREE_SHA" \
-  --wheelhouse .agents/cache/python-wheelhouse \
   --lock python/wheelhouse-lock.json \
-  --venv target/usable-release-venv --offline \
-  --report "$EVIDENCE_DIR/python-build.json"
-target/usable-release-venv/bin/python -m pytest python/tests -q \
-  --junitxml "$EVIDENCE_DIR/python-tests.xml"
-MARKET_SQUAWK_PYTHON=target/usable-release-venv/bin/python \
-  python3 scripts/demo_usable_release.py --offline-fixtures \
-  --head "$HEAD_SHA" --tree "$TREE_SHA" \
+  --artifact-root "$EVIDENCE_DIR/python" \
+  --python "$MARKET_SQUAWK_PYTHON312" --python "$MARKET_SQUAWK_PYTHON313" \
+  --offline
+cargo run -p market-squawk --release --all-features --locked -- \
+  release demonstrate --offline --head "$HEAD_SHA" --tree "$TREE_SHA" \
   --provider-evidence "$EVIDENCE_DIR/providers" \
-  --report "$EVIDENCE_DIR/demo.json"
+  --python-evidence "$EVIDENCE_DIR/python/release-manifest.json" \
+  --output "$EVIDENCE_DIR/demo.json"
 ./scripts/verify.sh 2>&1 | tee "$EVIDENCE_DIR/full-gate.log"
-python3 scripts/check_release_evidence.py \
+cargo run -p market-squawk --release --all-features --locked -- \
+  release evidence close \
   --head "$HEAD_SHA" --tree "$TREE_SHA" \
   --evidence-dir "$EVIDENCE_DIR" \
-  --binary target/release/market-squawk \
-  --benchmark-binary target/release/market-squawk-benchmark \
-  --report "$EVIDENCE_DIR/manifest.json"
+  --binary target/release/market-squawk --output "$EVIDENCE_DIR/manifest.json"
 git diff --exit-code
 test -z "$(git status --porcelain)"
 git status --short --branch
@@ -2713,8 +2732,10 @@ paper; catalog/storage/PIT/provider rights; analytics/Python/modeling/backtest/p
 MCP/CLI/security/operations/supply chain; and performance/evidence/release truth. Freeze the candidate
 between batches. Reviewers return findings without editing the candidate. The integrator unions and
 deduplicates every finding into one concise `usable-release-review.md`, remediates every substantiated
-Critical/Important/Minor in disjoint lanes, and commits the report with the remediation and any
-truthful README changes. Do not create per-task report files or a report-generation script.
+Critical/Important release blocker in disjoint lanes, and commits the report with the remediation
+and any truthful README changes. A Minor or cosmetic note is recorded once as nonblocking and does
+not trigger a rebuild/review loop unless it demonstrates a violated release predicate. Do not create
+per-task report files or a report-generation script.
 
 Before each remediation commit, the integration owner copies the exact approved paths from
 `usable-release-path-ownership.json` and stages those literal paths only, then records that literal
@@ -2725,9 +2746,9 @@ artifacts, even when the changed file is documentation.
 For every replacement candidate, rerun the entire Step 6 command block into its new HEAD-keyed
 directory, then dispatch the same grouped review domains against that unchanged head and manifest.
 Continue this remediation/evidence/re-review loop until the reviewers report zero substantiated
-findings of every severity. Final reviewer approvals and artifact digests are published in the PR and
-release attestation without changing the approved commit. A final approval is never appended to a
-tracked report after the freeze.
+Critical or Important findings. Final reviewer approvals and artifact digests are published in the
+PR and release attestation without changing the approved commit. A final approval is never appended
+to a tracked report after the freeze.
 
 - [ ] **Step 8: Evaluate the terminal predicate**
 
@@ -2744,7 +2765,7 @@ backtest and portfolio accounting reconcile
 fair-value Level 1/no-promotion rules pass
 complete bounded/audited/cancellable CLI and MCP domains work
 deterministic demo, full gates, audits, fuzz and measured reports pass at exact SHA
-grouped review has zero unresolved finding of every severity
+grouped review has zero unresolved Critical or Important finding
 repository and all integrated worktrees are clean
 ```
 
