@@ -382,6 +382,12 @@ does not call the adapter, and releases its reservation. Targeted tests, strict 
 boundaries, and diff hygiene passed; independent exact-head re-review reported no remaining Critical
 or Important finding.
 
+The Task 16 release checkpoint was pushed and recorded on PR `#26`; issue `#21` was closed and its
+Project 5 item set to `Done`. The completed generated target was cleaned, the clean worktree and
+merged local feature branch were removed, no matching origin branch remained, and Git worktree and
+remote metadata were pruned. The active Python feature lane is intentionally retained until its
+review blockers are corrected, re-reviewed, integrated, and closed out through the same invariant.
+
 After the accepted release state and GitHub evidence were pushed, both completed feature targets
 were cleaned (6.9 GiB total), both clean worktrees were removed, both merged local/origin feature
 branches were deleted, and worktree/remote metadata was pruned. Only the release worktree remains.

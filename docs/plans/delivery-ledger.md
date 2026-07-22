@@ -31,7 +31,7 @@ evidence; it does not replace the README capability truth or the canonical relea
   Clippy, workspace boundaries, formatting, and diff checks passed. Independent review rejected
   three material implementation defects and two audit-consumer/wire ripples; each was fixed, and the
   final exact-head re-review reported no remaining Critical or Important finding.
-- Task 16 owner: GitHub issue `#21`, Project 5; closure follows this ledger commit and push.
+- Task 16 owner: GitHub issue `#21`, Project 5, status `Done`.
 - Delivered through Steps 1–5 at accepted head `e124722`: source-evidenced normalized portfolio
   transactions, immutable revisions, long/short lots, FIFO/specific identification, cash flows,
   exact gains, explicit incomplete-basis measurements, authoritative corporate-action snapshots,
@@ -156,8 +156,10 @@ application size.
 - Removed the accepted model-bundle worktree after reclaiming 4.1 GiB and the accepted portfolio
   core worktree after reclaiming 2.8 GiB; deleted both merged local and origin product branches and
   pruned worktree/remote metadata. At that closeout, only the release worktree remained and issue
-  `#18` was closed with its Project 5 item `Done`. Issue `#21` subsequently completed at `7621552`
-  and awaits this release-ledger push before GitHub closeout.
+  `#18` was closed with its Project 5 item `Done`. Issue `#21` subsequently completed at `7621552`,
+  was closed, and its Project 5 item was set to `Done`. Its generated target was cleaned, its clean
+  worktree and merged local feature branch were removed, no matching origin branch remained, and
+  worktree/remote metadata was pruned. The Python feature worktree is the only active feature lane.
 
 The next delivery event is acceptance of Task 14's corrected Python financial analytics/training
 product, followed by Task 15's bounded local ONNX inference. Completed Tasks 13 and 16 do not claim
