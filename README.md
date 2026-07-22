@@ -139,11 +139,6 @@ MCP where applicable; and passes the clean, unchanged exact-head release gate. T
 empty crates, mocks, synthetic sources, diagnostic compatibility paths, plans, and focused lane tests
 do not count as implemented production capabilities.
 
-Permanently excluded: identity or account rotation to evade limits, browser or TLS fingerprint
-concealment, CAPTCHA or anti-bot bypass, blocking-evasion proxy rotation, distributed quota evasion,
-stealth scraping, arbitrary MCP shell/filesystem/network/SQL authority, risk bypass, credential
-access, audit deletion, and other access-control circumvention.
-
 Only paid or licensed provider adapters, explicitly authorized live-money execution adapters, replay
 beyond diagnostic and decoder-validation needs, and a possible observability adapter beyond required
 local structured tracing are optional after the usable complete release. Distributed deployment,
@@ -472,8 +467,7 @@ implementations are listed under **Required but missing**.
 The project has no mandatory paid software, API, cloud, telemetry, or hosted database. Existing hardware, storage, electricity, and internet access are outside the software-cost claim. External market providers retain their own coverage, availability, licensing, and rate constraints.
 
 The architecture removes avoidable vendor dependence through adapters, local persistence, caching,
-explicit coverage, source health, and fail-closed degradation. It does not attempt to evade
-legitimate provider restrictions.
+explicit coverage, source health, and fail-closed degradation.
 
 ## License
 
