@@ -1,15 +1,16 @@
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 
 use market_squawk_analytics::{
-    BatchFeatureCatalog, BatchFeatureCatalogConfig, FeatureCompatibility, FeatureDataType,
-    FeatureImplementationDigest, FeatureInput, FeatureInputSchema, FeatureKey, FeatureMetadata,
-    FeatureMetadataError, FeatureNullPolicy, FeatureOutputType, FeatureParameter,
+    BatchFeatureCatalog, BatchFeatureCatalogConfig, BatchFeaturePolicies, FeatureCompatibility,
+    FeatureDataType, FeatureImplementationDigest, FeatureInput, FeatureInputSchema, FeatureKey,
+    FeatureMetadata, FeatureMetadataError, FeatureNullPolicy, FeatureOutputType, FeatureParameter,
     FeatureParameterValue, FeatureParameters, FeatureRegistry, FeatureRegistryError,
     FeatureTimeSemantics, FeatureUnit, FeatureWarmUp, KnownFeatureImplementation,
     LiveFeatureCatalog, LiveFeatureCatalogConfig, LiveFeatureCatalogConfigError,
-    REQUIRED_BATCH_FEATURE_COUNT, REQUIRED_LIVE_FEATURE_COUNT, RegistrationOutcome,
-    RequiredLiveFeature,
+    MissingValuePolicy, REQUIRED_BATCH_FEATURE_COUNT, REQUIRED_LIVE_FEATURE_COUNT,
+    RegistrationOutcome, RequiredLiveFeature, ShockComposition, VarianceConvention, WeightPolicy,
 };
+use market_squawk_domain::RoundingPolicy;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -123,17 +124,161 @@ fn exact_rate_metadata() -> Result<FeatureMetadata, FeatureMetadataError> {
 }
 
 fn batch_metadata(name: &str) -> Result<FeatureMetadata, FeatureMetadataError> {
-    let config = BatchFeatureCatalogConfig::try_new(
-        NonZeroU32::new(252).ok_or(FeatureMetadataError::InvalidBatchCatalogPolicy)?,
-        NonZeroU32::new(950_000).ok_or(FeatureMetadataError::InvalidBatchCatalogPolicy)?,
-        6,
-    )?;
+    let config = batch_catalog_config()?;
     let catalog = BatchFeatureCatalog::try_new(config, "git:batch-catalog-v1")?;
     let key = FeatureKey::try_new(name, NonZeroU32::MIN)?;
     catalog
         .metadata(&key)
         .cloned()
         .ok_or(FeatureMetadataError::InvalidBatchCatalogPolicy)
+}
+
+fn batch_catalog_config() -> Result<BatchFeatureCatalogConfig, FeatureMetadataError> {
+    BatchFeatureCatalogConfig::try_new(
+        NonZeroU32::new(252).ok_or(FeatureMetadataError::InvalidBatchCatalogPolicy)?,
+        NonZeroU32::new(950_000).ok_or(FeatureMetadataError::InvalidBatchCatalogPolicy)?,
+        6,
+        BatchFeaturePolicies::new(
+            VarianceConvention::Sample,
+            MissingValuePolicy::Reject,
+            WeightPolicy::PositiveNormalized,
+            RoundingPolicy::NearestEven,
+            ShockComposition::Compounded,
+        ),
+    )
+}
+
+fn expected_batch_contract(
+    name: &str,
+) -> Option<(&'static [&'static str], &'static [&'static str])> {
+    let contract = match name {
+        "research.price-return"
+        | "risk.maximum-drawdown"
+        | "risk.maximum-drawdown-peak-index"
+        | "risk.maximum-drawdown-trough-index"
+        | "risk.maximum-drawdown-recovery-index" => (&["timestamps", "prices"][..], &[][..]),
+        "research.total-return" => (
+            &["timestamps", "money_prices", "distributions"][..],
+            &[][..],
+        ),
+        "research.cumulative-return" => (&["returns"][..], &[][..]),
+        "risk.volatility" => (
+            &["returns"][..],
+            &[
+                "periods_per_year",
+                "variance_convention",
+                "missing_value_policy",
+            ][..],
+        ),
+        "risk.correlation" => (&["asset_returns", "benchmark_returns"][..], &[][..]),
+        "risk.alpha" | "risk.beta" => (
+            &["asset_returns", "benchmark_returns"][..],
+            &["variance_convention"][..],
+        ),
+        "risk.sharpe" => (
+            &["returns", "risk_free_return"][..],
+            &["periods_per_year"][..],
+        ),
+        "risk.sortino" => (&["returns", "target_return"][..], &["periods_per_year"][..]),
+        "risk.tracking-error" | "risk.information-ratio" => (
+            &["asset_returns", "benchmark_returns"][..],
+            &["periods_per_year"][..],
+        ),
+        "risk.historical-var" => (&["returns"][..], &["confidence_parts_per_million"][..]),
+        "risk.parametric-var" => (
+            &["mean", "standard_deviation"][..],
+            &["periods_per_year", "confidence_parts_per_million"][..],
+        ),
+        "risk.expected-shortfall" => (
+            &["returns", "weights"][..],
+            &["confidence_parts_per_million", "weight_policy"][..],
+        ),
+        "factors.intercept" | "factors.exposure" | "factors.r-squared" => (
+            &["factor_identifiers", "asset_returns", "factor_returns"][..],
+            &[][..],
+        ),
+        "fundamentals.growth"
+        | "fundamentals.margin"
+        | "fundamentals.valuation-multiple"
+        | "fundamentals.free-cash-flow-yield"
+        | "fundamentals.earnings-surprise" => (
+            &["numerator", "denominator"][..],
+            &["decimal_scale", "rounding_policy"][..],
+        ),
+        "fundamentals.free-cash-flow" => {
+            (&["operating_cash_flow", "capital_expenditure"][..], &[][..])
+        }
+        "macro.surprise" => (
+            &["actual", "consensus", "scale"][..],
+            &["decimal_scale", "rounding_policy"][..],
+        ),
+        "macro.yield-curve-short-rate"
+        | "macro.yield-curve-middle-rate"
+        | "macro.yield-curve-long-rate"
+        | "macro.yield-curve-slope"
+        | "macro.yield-curve-curvature" => (&["maturity_days", "rates"][..], &[][..]),
+        "macro.rate-change-average-parallel-shift" => (
+            &["maturity_days", "prior_rates", "current_rates"][..],
+            &["decimal_scale", "rounding_policy"][..],
+        ),
+        "macro.rate-change-slope" | "macro.rate-change-short" | "macro.rate-change-long" => (
+            &["maturity_days", "prior_rates", "current_rates"][..],
+            &[][..],
+        ),
+        "portfolio.net-exposure"
+        | "portfolio.gross-exposure"
+        | "portfolio.attribution-contribution"
+        | "portfolio.attribution-total" => (
+            &["allocation_dimensions", "market_values", "return_rates"][..],
+            &[][..],
+        ),
+        "scenario.stress-contribution" | "scenario.stress-total" => (
+            &[
+                "allocation_dimensions",
+                "market_values",
+                "shock_dimensions",
+                "return_shocks",
+            ][..],
+            &["shock_composition"][..],
+        ),
+        _ => return None,
+    };
+    Some(contract)
+}
+
+fn expected_input_shape(name: &str) -> Option<(FeatureDataType, FeatureUnit)> {
+    let shape = match name {
+        "timestamps" => (FeatureDataType::Timestamp, FeatureUnit::Nanoseconds),
+        "prices" => (FeatureDataType::StatisticalF64, FeatureUnit::CurrencyAmount),
+        "money_prices" | "distributions" => (FeatureDataType::Money, FeatureUnit::CurrencyAmount),
+        "returns" | "risk_free_return" | "target_return" | "asset_returns"
+        | "benchmark_returns" | "factor_returns" => {
+            (FeatureDataType::StatisticalF64, FeatureUnit::Return)
+        }
+        "weights" => (FeatureDataType::StatisticalF64, FeatureUnit::Unitless),
+        "mean" => (FeatureDataType::StatisticalLocation, FeatureUnit::Return),
+        "standard_deviation" => (
+            FeatureDataType::StatisticalDispersion,
+            FeatureUnit::Volatility,
+        ),
+        "factor_identifiers" | "allocation_dimensions" | "shock_dimensions" => {
+            (FeatureDataType::CanonicalIdentifier, FeatureUnit::Unitless)
+        }
+        "numerator"
+        | "denominator"
+        | "operating_cash_flow"
+        | "capital_expenditure"
+        | "market_values" => (FeatureDataType::MonetaryValue, FeatureUnit::CurrencyAmount),
+        "maturity_days" => (FeatureDataType::UnsignedInteger, FeatureUnit::Count),
+        "rates" | "prior_rates" | "current_rates" | "return_rates" | "return_shocks" => {
+            (FeatureDataType::ExactRate, FeatureUnit::Rate)
+        }
+        "actual" | "consensus" | "scale" => {
+            (FeatureDataType::DecimalMeasurement, FeatureUnit::Unitless)
+        }
+        _ => return None,
+    };
+    Some(shape)
 }
 
 #[test]
@@ -512,15 +657,69 @@ fn required_live_catalog_is_complete_ordered_and_idempotent() -> TestResult {
     assert_eq!(second.already_registered(), REQUIRED_LIVE_FEATURE_COUNT);
     assert_eq!(registry.entries().count(), REQUIRED_LIVE_FEATURE_COUNT);
 
-    let batch = BatchFeatureCatalog::try_new(
-        BatchFeatureCatalogConfig::try_new(
-            NonZeroU32::new(252).ok_or("periods")?,
-            NonZeroU32::new(950_000).ok_or("confidence")?,
-            6,
-        )?,
-        "git:batch-catalog-v1",
-    )?;
+    let batch = BatchFeatureCatalog::try_new(batch_catalog_config()?, "git:batch-catalog-v1")?;
     assert_eq!(batch.entries().len(), REQUIRED_BATCH_FEATURE_COUNT);
+    for metadata in batch.entries() {
+        let (expected_inputs, expected_parameters) = expected_batch_contract(metadata.key().name())
+            .ok_or("batch feature is missing its executable contract audit")?;
+        assert_eq!(
+            metadata
+                .input_schema()
+                .fields()
+                .iter()
+                .map(FeatureInput::name)
+                .collect::<Vec<_>>(),
+            expected_inputs,
+            "input contract mismatch for {}",
+            metadata.key().name(),
+        );
+        for input in metadata.input_schema().fields() {
+            let expected = expected_input_shape(input.name())
+                .ok_or("batch input is missing its typed-shape audit")?;
+            assert_eq!(
+                (input.data_type(), input.unit()),
+                expected,
+                "typed input mismatch for {}.{}",
+                metadata.key().name(),
+                input.name(),
+            );
+        }
+        assert_eq!(
+            metadata
+                .parameters()
+                .entries()
+                .iter()
+                .map(FeatureParameter::name)
+                .collect::<Vec<_>>(),
+            expected_parameters,
+            "policy contract mismatch for {}",
+            metadata.key().name(),
+        );
+        for parameter in metadata.parameters().entries() {
+            let expected_value = match parameter.name() {
+                "periods_per_year" => FeatureParameterValue::UnsignedInteger(252),
+                "confidence_parts_per_million" => FeatureParameterValue::UnsignedInteger(950_000),
+                "decimal_scale" => FeatureParameterValue::UnsignedInteger(6),
+                "variance_convention" => {
+                    FeatureParameterValue::VarianceConvention(VarianceConvention::Sample)
+                }
+                "missing_value_policy" => {
+                    FeatureParameterValue::MissingValuePolicy(MissingValuePolicy::Reject)
+                }
+                "weight_policy" => {
+                    FeatureParameterValue::WeightPolicy(WeightPolicy::PositiveNormalized)
+                }
+                "rounding_policy" => {
+                    FeatureParameterValue::RoundingPolicy(RoundingPolicy::NearestEven)
+                }
+                "shock_composition" => {
+                    FeatureParameterValue::ShockComposition(ShockComposition::Compounded)
+                }
+                _ => return Err("batch parameter is missing its typed-value audit".into()),
+            };
+            assert_eq!(parameter.value(), expected_value);
+        }
+    }
     let mut batch_registry = FeatureRegistry::try_new(
         BatchFeatureCatalog::minimum_registry_capacity(),
         NonZeroUsize::new(4 * 1024 * 1024).ok_or("batch registry retained bytes")?,

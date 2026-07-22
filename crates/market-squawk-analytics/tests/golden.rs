@@ -5,14 +5,14 @@ use market_squawk_analytics::{
     DecimalPolicy, ExactDecimalScale, ExactDecimalUnit, ExactRate, FactorObservation,
     FundamentalPeriod, MeasurementUnit, MissingValuePolicy, MonetaryBasis, MonetaryValue,
     PortfolioAllocation, Quantile, RatePoint, ReturnSeries, ScenarioShock, ShockComposition,
-    StatisticalInput, StatisticalScale, StatisticalUnit, VarianceConvention, WeightPolicy,
-    WeightedStatisticalInput, alpha_beta, correlation, cumulative_return,
-    discrete_expected_shortfall, earnings_surprise, factor_regression, free_cash_flow_yield,
-    fundamental_growth, historical_var, information_ratio, macro_surprise, margin,
-    maximum_drawdown, parametric_var, portfolio_attribution, portfolio_exposure,
-    resolve_optional_inputs, scenario_impact, sharpe_ratio, simple_returns, sortino_ratio,
-    total_returns, tracking_error, valuation_multiple, volatility, weighted_expected_shortfall,
-    yield_curve_change, yield_curve_features,
+    StatisticalDispersion, StatisticalInput, StatisticalLocation, StatisticalScale,
+    StatisticalUnit, VarianceConvention, WeightPolicy, WeightedStatisticalInput, alpha_beta,
+    correlation, cumulative_return, discrete_expected_shortfall, earnings_surprise,
+    factor_regression, free_cash_flow_yield, fundamental_growth, historical_var, information_ratio,
+    macro_surprise, margin, maximum_drawdown, parametric_var, portfolio_attribution,
+    portfolio_exposure, resolve_optional_inputs, scenario_impact, sharpe_ratio, simple_returns,
+    sortino_ratio, total_returns, tracking_error, valuation_multiple, volatility,
+    weighted_expected_shortfall, yield_curve_change, yield_curve_features,
 };
 use market_squawk_domain::{Currency, Money, RoundingPolicy, Timestamp};
 use rust_decimal::Decimal;
@@ -128,6 +128,29 @@ fn risk_statistics_disclose_sampling_annualization_and_singularities() -> TestRe
     )?;
     assert!((sigma.value() - 0.02).abs() < 1e-12);
     assert_eq!(sigma.observations(), 3);
+    assert_eq!(
+        parametric_var(
+            StatisticalLocation::try_new(
+                input(0.0, StatisticalUnit::Return)?,
+                Annualization::None,
+            )?,
+            sigma,
+            Quantile::try_new(0.95)?,
+        ),
+        Err(AnalyticsError::AnnualizationMismatch)
+    );
+    assert_eq!(
+        StatisticalDispersion::try_new(
+            2.0,
+            StatisticalScale::Percent,
+            StatisticalUnit::Return,
+            3,
+            VarianceConvention::Sample,
+            annualization,
+        )?
+        .value(),
+        0.02
+    );
 
     let benchmark = [
         input(0.01, StatisticalUnit::Return)?,
@@ -215,20 +238,27 @@ fn drawdown_tracks_recovery_and_discrete_tail_mass_is_coherent() -> TestResult {
             .value(),
         20.0 / 3.0
     );
-    assert!(
-        parametric_var(
-            input(0.0, StatisticalUnit::Currency(usd))?,
-            input(1.0, StatisticalUnit::Currency(usd))?,
-            Quantile::try_new(0.975)?,
-        )?
-        .value()
-            > 1.95
-    );
+    let location = StatisticalLocation::try_new(
+        input(0.0, StatisticalUnit::Currency(usd))?,
+        Annualization::None,
+    )?;
+    let deviation = StatisticalDispersion::try_new(
+        1.0,
+        StatisticalScale::Unit,
+        StatisticalUnit::Currency(usd),
+        4,
+        VarianceConvention::Population,
+        Annualization::None,
+    )?;
+    assert!(parametric_var(location, deviation, Quantile::try_new(0.975)?)?.value() > 1.95);
     assert_eq!(
-        parametric_var(
-            input(0.0, StatisticalUnit::Currency(usd))?,
-            input(-1.0, StatisticalUnit::Currency(usd))?,
-            Quantile::try_new(0.975)?,
+        StatisticalDispersion::try_new(
+            -1.0,
+            StatisticalScale::Unit,
+            StatisticalUnit::Currency(usd),
+            4,
+            VarianceConvention::Population,
+            Annualization::None,
         ),
         Err(AnalyticsError::NegativeStandardDeviation)
     );

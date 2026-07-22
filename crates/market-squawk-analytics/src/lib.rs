@@ -24,11 +24,13 @@ pub use batch::{
     AnalyticsError, AnalyticsPolicy, Annualization, DatedMoney, DatedStatisticalInput,
     DecimalPolicy, InsufficientHistoryPolicy, MAX_ANALYTICS_IDENTIFIER_BYTES,
     MAX_BATCH_OBSERVATIONS, MAX_FACTOR_COUNT, MissingValuePolicy, Quantile, ReturnSeries,
-    StatisticalInput, StatisticalResult, StatisticalScale, StatisticalSeries, StatisticalUnit,
-    VarianceConvention, WeightPolicy, WeightedStatisticalInput, resolve_optional_inputs,
+    StatisticalDispersion, StatisticalInput, StatisticalLocation, StatisticalResult,
+    StatisticalScale, StatisticalSeries, StatisticalUnit, VarianceConvention, WeightPolicy,
+    WeightedStatisticalInput, resolve_optional_inputs,
 };
 pub use batch_catalog::{
-    BatchFeatureCatalog, BatchFeatureCatalogConfig, REQUIRED_BATCH_FEATURE_COUNT,
+    BatchFeatureCatalog, BatchFeatureCatalogConfig, BatchFeaturePolicies,
+    REQUIRED_BATCH_FEATURE_COUNT,
 };
 pub use book::{
     BookDepthView, BookFeatureError, HalfTickPrice, MAX_BOOK_FEATURE_LEVELS, PriceLevelView,

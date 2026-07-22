@@ -3,7 +3,11 @@
 use std::mem::size_of;
 use std::num::{NonZeroU32, NonZeroU64};
 
+use market_squawk_domain::RoundingPolicy;
 use thiserror::Error;
+
+use crate::batch::{MissingValuePolicy, VarianceConvention, WeightPolicy};
+use crate::scenarios::ShockComposition;
 
 pub(crate) mod digest;
 
@@ -146,6 +150,18 @@ pub enum FeatureDataType {
     Decimal,
     /// Exact amount carrying its own currency.
     Money,
+    /// Bounded canonical identifier whose ordering is execution-relevant.
+    CanonicalIdentifier,
+    /// Exact whole-unit rate retaining its admitted source scale.
+    ExactRate,
+    /// Exact named-unit decimal measurement retaining its admitted source scale.
+    DecimalMeasurement,
+    /// Exact money retaining currency and measurement basis.
+    MonetaryValue,
+    /// Statistical distribution location retaining its horizon/cadence.
+    StatisticalLocation,
+    /// Statistical dispersion retaining its underlying unit and horizon/cadence.
+    StatisticalDispersion,
 }
 
 /// Unit attached to an input or output field.
@@ -289,6 +305,16 @@ pub enum FeatureParameterValue {
     Boolean(bool),
     /// Positive duration in nanoseconds.
     DurationNanos(NonZeroU64),
+    /// Variance denominator policy.
+    VarianceConvention(VarianceConvention),
+    /// Missing-observation policy.
+    MissingValuePolicy(MissingValuePolicy),
+    /// Statistical weight policy.
+    WeightPolicy(WeightPolicy),
+    /// Exact decimal rounding policy.
+    RoundingPolicy(RoundingPolicy),
+    /// Scenario shock-composition policy.
+    ShockComposition(ShockComposition),
 }
 
 /// One bounded, named feature parameter.
@@ -782,6 +808,7 @@ const fn input_unit_is_compatible(data_type: FeatureDataType, unit: FeatureUnit)
         | FeatureDataType::OrderSide
         | FeatureDataType::InstrumentId
         | FeatureDataType::VenueId
+        | FeatureDataType::CanonicalIdentifier
         | FeatureDataType::Boolean => matches!(unit, FeatureUnit::Unitless),
         FeatureDataType::SignedInteger | FeatureDataType::UnsignedInteger => {
             matches!(unit, FeatureUnit::Count | FeatureUnit::Nanoseconds)
@@ -797,10 +824,9 @@ const fn input_unit_is_compatible(data_type: FeatureDataType, unit: FeatureUnit)
                 | FeatureUnit::Rate
                 | FeatureUnit::Unitless
         ),
-        FeatureDataType::StatisticalF64 => !matches!(
-            unit,
-            FeatureUnit::PriceTicks | FeatureUnit::QuantityLots | FeatureUnit::CurrencyAmount
-        ),
+        FeatureDataType::StatisticalF64 => {
+            !matches!(unit, FeatureUnit::PriceTicks | FeatureUnit::QuantityLots)
+        }
         FeatureDataType::Decimal => matches!(
             unit,
             FeatureUnit::BasisPoints
@@ -811,6 +837,14 @@ const fn input_unit_is_compatible(data_type: FeatureDataType, unit: FeatureUnit)
                 | FeatureUnit::Unitless
         ),
         FeatureDataType::Money => matches!(unit, FeatureUnit::CurrencyAmount),
+        FeatureDataType::ExactRate => matches!(unit, FeatureUnit::Rate),
+        FeatureDataType::DecimalMeasurement => matches!(unit, FeatureUnit::Unitless),
+        FeatureDataType::MonetaryValue => matches!(unit, FeatureUnit::CurrencyAmount),
+        FeatureDataType::StatisticalLocation => matches!(
+            unit,
+            FeatureUnit::Return | FeatureUnit::Rate | FeatureUnit::CurrencyAmount
+        ),
+        FeatureDataType::StatisticalDispersion => matches!(unit, FeatureUnit::Volatility),
     }
 }
 

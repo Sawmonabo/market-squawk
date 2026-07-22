@@ -2,15 +2,78 @@
 
 use std::num::{NonZeroU32, NonZeroUsize};
 
+use market_squawk_domain::RoundingPolicy;
+
 use crate::{
     BatchRegistrationOutcome, FeatureDataType, FeatureInput, FeatureInputSchema, FeatureKey,
     FeatureMetadata, FeatureMetadataError, FeatureNullPolicy, FeatureOutputType, FeatureParameter,
     FeatureParameterValue, FeatureParameters, FeatureRegistry, FeatureRegistryError,
     FeatureTimeSemantics, FeatureUnit, FeatureWarmUp, KnownFeatureImplementation,
+    MissingValuePolicy, ShockComposition, VarianceConvention, WeightPolicy,
 };
 
 /// Number of code-owned batch feature definitions compiled into this release.
 pub const REQUIRED_BATCH_FEATURE_COUNT: usize = 43;
+
+/// Result-changing policies shared by canonical batch-feature definitions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BatchFeaturePolicies {
+    variance: VarianceConvention,
+    missing: MissingValuePolicy,
+    weight: WeightPolicy,
+    rounding: RoundingPolicy,
+    shock_composition: ShockComposition,
+}
+
+impl BatchFeaturePolicies {
+    /// Constructs one explicit batch policy set.
+    #[must_use]
+    pub const fn new(
+        variance: VarianceConvention,
+        missing: MissingValuePolicy,
+        weight: WeightPolicy,
+        rounding: RoundingPolicy,
+        shock_composition: ShockComposition,
+    ) -> Self {
+        Self {
+            variance,
+            missing,
+            weight,
+            rounding,
+            shock_composition,
+        }
+    }
+
+    /// Returns the variance denominator policy.
+    #[must_use]
+    pub const fn variance(self) -> VarianceConvention {
+        self.variance
+    }
+
+    /// Returns the missing-observation policy.
+    #[must_use]
+    pub const fn missing(self) -> MissingValuePolicy {
+        self.missing
+    }
+
+    /// Returns the statistical weighting policy.
+    #[must_use]
+    pub const fn weight(self) -> WeightPolicy {
+        self.weight
+    }
+
+    /// Returns the exact decimal rounding policy.
+    #[must_use]
+    pub const fn rounding(self) -> RoundingPolicy {
+        self.rounding
+    }
+
+    /// Returns the scenario shock-composition policy.
+    #[must_use]
+    pub const fn shock_composition(self) -> ShockComposition {
+        self.shock_composition
+    }
+}
 
 /// Explicit policy values bound to the canonical batch-feature metadata set.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -18,6 +81,7 @@ pub struct BatchFeatureCatalogConfig {
     periods_per_year: NonZeroU32,
     confidence_parts_per_million: NonZeroU32,
     decimal_scale: u32,
+    policies: BatchFeaturePolicies,
 }
 
 impl BatchFeatureCatalogConfig {
@@ -30,6 +94,7 @@ impl BatchFeatureCatalogConfig {
         periods_per_year: NonZeroU32,
         confidence_parts_per_million: NonZeroU32,
         decimal_scale: u32,
+        policies: BatchFeaturePolicies,
     ) -> Result<Self, FeatureMetadataError> {
         if confidence_parts_per_million.get() >= 1_000_000 {
             return Err(FeatureMetadataError::InvalidBatchCatalogPolicy);
@@ -41,6 +106,7 @@ impl BatchFeatureCatalogConfig {
             periods_per_year,
             confidence_parts_per_million,
             decimal_scale,
+            policies,
         })
     }
 
@@ -60,6 +126,12 @@ impl BatchFeatureCatalogConfig {
     #[must_use]
     pub const fn decimal_scale(self) -> u32 {
         self.decimal_scale
+    }
+
+    /// Returns the complete result-changing policy set.
+    #[must_use]
+    pub const fn policies(self) -> BatchFeaturePolicies {
+        self.policies
     }
 }
 
@@ -138,6 +210,9 @@ enum InputFamily {
     Prices,
     PricesAndDistributions,
     Returns,
+    ReturnsAndRiskFree,
+    ReturnsAndTarget,
+    WeightedReturns,
     PairedReturns,
     MeanAndDeviation,
     FactorReturns,
@@ -154,8 +229,13 @@ enum InputFamily {
 enum ParameterFamily {
     None,
     Annualized,
+    Volatility,
+    Variance,
     Quantile,
+    AnnualizedQuantile,
+    QuantileWeight,
     Decimal,
+    ShockComposition,
 }
 
 const fn spec(
@@ -213,7 +293,7 @@ const BATCH_SPECS: [BatchSpec; REQUIRED_BATCH_FEATURE_COUNT] = [
         FeatureOutputType::StatisticalF64,
         FeatureUnit::Volatility,
         2,
-        ParameterFamily::Annualized,
+        ParameterFamily::Volatility,
     ),
     spec(
         "risk.maximum-drawdown",
@@ -267,7 +347,7 @@ const BATCH_SPECS: [BatchSpec; REQUIRED_BATCH_FEATURE_COUNT] = [
         FeatureOutputType::StatisticalF64,
         FeatureUnit::Return,
         2,
-        ParameterFamily::None,
+        ParameterFamily::Variance,
     ),
     spec(
         "risk.beta",
@@ -276,12 +356,12 @@ const BATCH_SPECS: [BatchSpec; REQUIRED_BATCH_FEATURE_COUNT] = [
         FeatureOutputType::StatisticalF64,
         FeatureUnit::Unitless,
         2,
-        ParameterFamily::None,
+        ParameterFamily::Variance,
     ),
     spec(
         "risk.sharpe",
         KnownFeatureImplementation::BatchRisk,
-        InputFamily::Returns,
+        InputFamily::ReturnsAndRiskFree,
         FeatureOutputType::StatisticalF64,
         FeatureUnit::Unitless,
         2,
@@ -290,7 +370,7 @@ const BATCH_SPECS: [BatchSpec; REQUIRED_BATCH_FEATURE_COUNT] = [
     spec(
         "risk.sortino",
         KnownFeatureImplementation::BatchRisk,
-        InputFamily::Returns,
+        InputFamily::ReturnsAndTarget,
         FeatureOutputType::StatisticalF64,
         FeatureUnit::Unitless,
         2,
@@ -330,16 +410,16 @@ const BATCH_SPECS: [BatchSpec; REQUIRED_BATCH_FEATURE_COUNT] = [
         FeatureOutputType::StatisticalF64,
         FeatureUnit::Return,
         1,
-        ParameterFamily::Quantile,
+        ParameterFamily::AnnualizedQuantile,
     ),
     spec(
         "risk.expected-shortfall",
         KnownFeatureImplementation::BatchRisk,
-        InputFamily::Returns,
+        InputFamily::WeightedReturns,
         FeatureOutputType::StatisticalF64,
         FeatureUnit::Return,
         1,
-        ParameterFamily::Quantile,
+        ParameterFamily::QuantileWeight,
     ),
     spec(
         "factors.intercept",
@@ -555,7 +635,7 @@ const BATCH_SPECS: [BatchSpec; REQUIRED_BATCH_FEATURE_COUNT] = [
         FeatureOutputType::Money,
         FeatureUnit::CurrencyAmount,
         1,
-        ParameterFamily::None,
+        ParameterFamily::ShockComposition,
     ),
     spec(
         "scenario.stress-total",
@@ -564,7 +644,7 @@ const BATCH_SPECS: [BatchSpec; REQUIRED_BATCH_FEATURE_COUNT] = [
         FeatureOutputType::Money,
         FeatureUnit::CurrencyAmount,
         1,
-        ParameterFamily::None,
+        ParameterFamily::ShockComposition,
     ),
 ];
 
@@ -594,14 +674,26 @@ fn metadata(
 
 fn schema(family: InputFamily) -> Result<FeatureInputSchema, FeatureMetadataError> {
     let fields = match family {
-        InputFamily::Prices => vec![field(
-            "prices",
-            FeatureDataType::PriceTicks,
-            FeatureUnit::PriceTicks,
-        )?],
-        InputFamily::PricesAndDistributions => vec![
+        InputFamily::Prices => vec![
+            field(
+                "timestamps",
+                FeatureDataType::Timestamp,
+                FeatureUnit::Nanoseconds,
+            )?,
             field(
                 "prices",
+                FeatureDataType::StatisticalF64,
+                FeatureUnit::CurrencyAmount,
+            )?,
+        ],
+        InputFamily::PricesAndDistributions => vec![
+            field(
+                "timestamps",
+                FeatureDataType::Timestamp,
+                FeatureUnit::Nanoseconds,
+            )?,
+            field(
+                "money_prices",
                 FeatureDataType::Money,
                 FeatureUnit::CurrencyAmount,
             )?,
@@ -616,6 +708,42 @@ fn schema(family: InputFamily) -> Result<FeatureInputSchema, FeatureMetadataErro
             FeatureDataType::StatisticalF64,
             FeatureUnit::Return,
         )?],
+        InputFamily::ReturnsAndRiskFree => vec![
+            field(
+                "returns",
+                FeatureDataType::StatisticalF64,
+                FeatureUnit::Return,
+            )?,
+            field(
+                "risk_free_return",
+                FeatureDataType::StatisticalF64,
+                FeatureUnit::Return,
+            )?,
+        ],
+        InputFamily::ReturnsAndTarget => vec![
+            field(
+                "returns",
+                FeatureDataType::StatisticalF64,
+                FeatureUnit::Return,
+            )?,
+            field(
+                "target_return",
+                FeatureDataType::StatisticalF64,
+                FeatureUnit::Return,
+            )?,
+        ],
+        InputFamily::WeightedReturns => vec![
+            field(
+                "returns",
+                FeatureDataType::StatisticalF64,
+                FeatureUnit::Return,
+            )?,
+            field(
+                "weights",
+                FeatureDataType::StatisticalF64,
+                FeatureUnit::Unitless,
+            )?,
+        ],
         InputFamily::PairedReturns => vec![
             field(
                 "asset_returns",
@@ -629,14 +757,23 @@ fn schema(family: InputFamily) -> Result<FeatureInputSchema, FeatureMetadataErro
             )?,
         ],
         InputFamily::MeanAndDeviation => vec![
-            field("mean", FeatureDataType::StatisticalF64, FeatureUnit::Return)?,
+            field(
+                "mean",
+                FeatureDataType::StatisticalLocation,
+                FeatureUnit::Return,
+            )?,
             field(
                 "standard_deviation",
-                FeatureDataType::StatisticalF64,
+                FeatureDataType::StatisticalDispersion,
                 FeatureUnit::Volatility,
             )?,
         ],
         InputFamily::FactorReturns => vec![
+            field(
+                "factor_identifiers",
+                FeatureDataType::CanonicalIdentifier,
+                FeatureUnit::Unitless,
+            )?,
             field(
                 "asset_returns",
                 FeatureDataType::StatisticalF64,
@@ -651,54 +788,103 @@ fn schema(family: InputFamily) -> Result<FeatureInputSchema, FeatureMetadataErro
         InputFamily::MoneyPair => vec![
             field(
                 "numerator",
-                FeatureDataType::Money,
+                FeatureDataType::MonetaryValue,
                 FeatureUnit::CurrencyAmount,
             )?,
             field(
                 "denominator",
-                FeatureDataType::Money,
+                FeatureDataType::MonetaryValue,
                 FeatureUnit::CurrencyAmount,
             )?,
         ],
         InputFamily::FundamentalPeriod => vec![
             field(
                 "operating_cash_flow",
-                FeatureDataType::Money,
+                FeatureDataType::MonetaryValue,
                 FeatureUnit::CurrencyAmount,
             )?,
             field(
                 "capital_expenditure",
-                FeatureDataType::Money,
+                FeatureDataType::MonetaryValue,
                 FeatureUnit::CurrencyAmount,
             )?,
         ],
-        InputFamily::RateCurve => {
-            vec![field("rates", FeatureDataType::Decimal, FeatureUnit::Rate)?]
-        }
+        InputFamily::RateCurve => vec![
+            field(
+                "maturity_days",
+                FeatureDataType::UnsignedInteger,
+                FeatureUnit::Count,
+            )?,
+            field("rates", FeatureDataType::ExactRate, FeatureUnit::Rate)?,
+        ],
         InputFamily::RateCurvePair => vec![
-            field("prior_rates", FeatureDataType::Decimal, FeatureUnit::Rate)?,
-            field("current_rates", FeatureDataType::Decimal, FeatureUnit::Rate)?,
+            field(
+                "maturity_days",
+                FeatureDataType::UnsignedInteger,
+                FeatureUnit::Count,
+            )?,
+            field("prior_rates", FeatureDataType::ExactRate, FeatureUnit::Rate)?,
+            field(
+                "current_rates",
+                FeatureDataType::ExactRate,
+                FeatureUnit::Rate,
+            )?,
         ],
         InputFamily::MacroSurprise => vec![
-            field("actual", FeatureDataType::Decimal, FeatureUnit::Unitless)?,
-            field("consensus", FeatureDataType::Decimal, FeatureUnit::Unitless)?,
-            field("scale", FeatureDataType::Decimal, FeatureUnit::Unitless)?,
+            field(
+                "actual",
+                FeatureDataType::DecimalMeasurement,
+                FeatureUnit::Unitless,
+            )?,
+            field(
+                "consensus",
+                FeatureDataType::DecimalMeasurement,
+                FeatureUnit::Unitless,
+            )?,
+            field(
+                "scale",
+                FeatureDataType::DecimalMeasurement,
+                FeatureUnit::Unitless,
+            )?,
         ],
         InputFamily::Portfolio => vec![
             field(
+                "allocation_dimensions",
+                FeatureDataType::CanonicalIdentifier,
+                FeatureUnit::Unitless,
+            )?,
+            field(
                 "market_values",
-                FeatureDataType::Money,
+                FeatureDataType::MonetaryValue,
                 FeatureUnit::CurrencyAmount,
             )?,
-            field("return_rates", FeatureDataType::Decimal, FeatureUnit::Rate)?,
+            field(
+                "return_rates",
+                FeatureDataType::ExactRate,
+                FeatureUnit::Rate,
+            )?,
         ],
         InputFamily::PortfolioAndScenario => vec![
             field(
+                "allocation_dimensions",
+                FeatureDataType::CanonicalIdentifier,
+                FeatureUnit::Unitless,
+            )?,
+            field(
                 "market_values",
-                FeatureDataType::Money,
+                FeatureDataType::MonetaryValue,
                 FeatureUnit::CurrencyAmount,
             )?,
-            field("return_shocks", FeatureDataType::Decimal, FeatureUnit::Rate)?,
+            field(
+                "shock_dimensions",
+                FeatureDataType::CanonicalIdentifier,
+                FeatureUnit::Unitless,
+            )?,
+            field(
+                "return_shocks",
+                FeatureDataType::ExactRate,
+                FeatureUnit::Rate,
+            )?,
         ],
     };
     FeatureInputSchema::try_new(fields)
@@ -710,17 +896,57 @@ fn parameters(
 ) -> Result<FeatureParameters, FeatureMetadataError> {
     let entries = match family {
         ParameterFamily::None => Vec::new(),
-        ParameterFamily::Annualized => vec![parameter(
+        ParameterFamily::Annualized => vec![unsigned_parameter(
             "periods_per_year",
             u64::from(config.periods_per_year.get()),
         )?],
-        ParameterFamily::Quantile => vec![parameter(
+        ParameterFamily::Volatility => vec![
+            unsigned_parameter("periods_per_year", u64::from(config.periods_per_year.get()))?,
+            FeatureParameter::try_new(
+                "variance_convention",
+                FeatureParameterValue::VarianceConvention(config.policies.variance),
+            )?,
+            FeatureParameter::try_new(
+                "missing_value_policy",
+                FeatureParameterValue::MissingValuePolicy(config.policies.missing),
+            )?,
+        ],
+        ParameterFamily::Variance => vec![FeatureParameter::try_new(
+            "variance_convention",
+            FeatureParameterValue::VarianceConvention(config.policies.variance),
+        )?],
+        ParameterFamily::Quantile => vec![unsigned_parameter(
             "confidence_parts_per_million",
             u64::from(config.confidence_parts_per_million.get()),
         )?],
-        ParameterFamily::Decimal => {
-            vec![parameter("decimal_scale", u64::from(config.decimal_scale))?]
-        }
+        ParameterFamily::AnnualizedQuantile => vec![
+            unsigned_parameter("periods_per_year", u64::from(config.periods_per_year.get()))?,
+            unsigned_parameter(
+                "confidence_parts_per_million",
+                u64::from(config.confidence_parts_per_million.get()),
+            )?,
+        ],
+        ParameterFamily::QuantileWeight => vec![
+            unsigned_parameter(
+                "confidence_parts_per_million",
+                u64::from(config.confidence_parts_per_million.get()),
+            )?,
+            FeatureParameter::try_new(
+                "weight_policy",
+                FeatureParameterValue::WeightPolicy(config.policies.weight),
+            )?,
+        ],
+        ParameterFamily::Decimal => vec![
+            unsigned_parameter("decimal_scale", u64::from(config.decimal_scale))?,
+            FeatureParameter::try_new(
+                "rounding_policy",
+                FeatureParameterValue::RoundingPolicy(config.policies.rounding),
+            )?,
+        ],
+        ParameterFamily::ShockComposition => vec![FeatureParameter::try_new(
+            "shock_composition",
+            FeatureParameterValue::ShockComposition(config.policies.shock_composition),
+        )?],
     };
     FeatureParameters::try_new(entries)
 }
@@ -733,6 +959,6 @@ fn field(
     FeatureInput::try_new(name, data_type, unit, false)
 }
 
-fn parameter(name: &str, value: u64) -> Result<FeatureParameter, FeatureMetadataError> {
+fn unsigned_parameter(name: &str, value: u64) -> Result<FeatureParameter, FeatureMetadataError> {
     FeatureParameter::try_new(name, FeatureParameterValue::UnsignedInteger(value))
 }

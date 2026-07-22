@@ -87,6 +87,21 @@ fn update_parameters(hasher: &mut Sha256, parameters: &FeatureParameters) {
                 hasher.update([3]);
                 hasher.update(value.get().to_be_bytes());
             }
+            FeatureParameterValue::VarianceConvention(value) => {
+                hasher.update([4, variance_convention_tag(value)]);
+            }
+            FeatureParameterValue::MissingValuePolicy(value) => {
+                hasher.update([5, missing_value_policy_tag(value)]);
+            }
+            FeatureParameterValue::WeightPolicy(value) => {
+                hasher.update([6, weight_policy_tag(value)]);
+            }
+            FeatureParameterValue::RoundingPolicy(value) => {
+                hasher.update([7, rounding_policy_tag(value)]);
+            }
+            FeatureParameterValue::ShockComposition(value) => {
+                hasher.update([8, shock_composition_tag(value)]);
+            }
         }
     }
 }
@@ -160,6 +175,50 @@ const fn data_type_tag(data_type: FeatureDataType) -> u8 {
         FeatureDataType::StatisticalF64 => 12,
         FeatureDataType::Decimal => 13,
         FeatureDataType::Money => 14,
+        FeatureDataType::CanonicalIdentifier => 15,
+        FeatureDataType::ExactRate => 16,
+        FeatureDataType::DecimalMeasurement => 17,
+        FeatureDataType::MonetaryValue => 18,
+        FeatureDataType::StatisticalLocation => 19,
+        FeatureDataType::StatisticalDispersion => 20,
+    }
+}
+
+const fn variance_convention_tag(value: crate::VarianceConvention) -> u8 {
+    match value {
+        crate::VarianceConvention::Sample => 0,
+        crate::VarianceConvention::Population => 1,
+    }
+}
+
+const fn missing_value_policy_tag(value: crate::MissingValuePolicy) -> u8 {
+    match value {
+        crate::MissingValuePolicy::Reject => 0,
+        crate::MissingValuePolicy::Drop => 1,
+    }
+}
+
+const fn weight_policy_tag(value: crate::WeightPolicy) -> u8 {
+    match value {
+        crate::WeightPolicy::Equal => 0,
+        crate::WeightPolicy::PositiveNormalized => 1,
+    }
+}
+
+const fn rounding_policy_tag(value: market_squawk_domain::RoundingPolicy) -> u8 {
+    match value {
+        market_squawk_domain::RoundingPolicy::NearestEven => 0,
+        market_squawk_domain::RoundingPolicy::AwayFromZero => 1,
+        market_squawk_domain::RoundingPolicy::TowardZero => 2,
+        market_squawk_domain::RoundingPolicy::Floor => 3,
+        market_squawk_domain::RoundingPolicy::Ceiling => 4,
+    }
+}
+
+const fn shock_composition_tag(value: crate::ShockComposition) -> u8 {
+    match value {
+        crate::ShockComposition::Additive => 0,
+        crate::ShockComposition::Compounded => 1,
     }
 }
 

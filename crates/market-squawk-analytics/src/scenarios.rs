@@ -140,7 +140,7 @@ pub enum ShockComposition {
     Compounded,
 }
 
-/// Exact gross and net portfolio exposure in one currency.
+/// Exact gross and net portfolio exposure in one currency and measurement basis.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PortfolioExposure {
     net: MonetaryValue,
@@ -165,7 +165,7 @@ impl PortfolioExposure {
 ///
 /// # Errors
 ///
-/// Rejects empty/excessive input, mixed currencies, or unrepresentable exact addition.
+/// Rejects empty/excessive input, mixed currencies/bases, or unrepresentable exact addition.
 pub fn portfolio_exposure(
     allocations: &[PortfolioAllocation],
 ) -> Result<PortfolioExposure, AnalyticsError> {
@@ -198,7 +198,7 @@ pub fn portfolio_exposure(
 ///
 /// # Errors
 ///
-/// Rejects empty/excessive input, mixed currencies, or unrepresentable exact multiplication/addition.
+/// Rejects empty/excessive input, mixed currencies/bases, or unrepresentable exact arithmetic.
 pub fn portfolio_attribution(
     allocations: &[PortfolioAllocation],
 ) -> Result<PortfolioAttribution, AnalyticsError> {

@@ -3,8 +3,8 @@
 use crate::batch::{neumaier_sum, validate_count, validate_homogeneous};
 use crate::{
     AnalyticsError, Annualization, DatedStatisticalInput, MissingValuePolicy, Quantile,
-    ReturnSeries, StatisticalInput, StatisticalResult, StatisticalUnit, VarianceConvention,
-    WeightPolicy, WeightedStatisticalInput,
+    ReturnSeries, StatisticalDispersion, StatisticalInput, StatisticalLocation, StatisticalResult,
+    StatisticalScale, StatisticalUnit, VarianceConvention, WeightPolicy, WeightedStatisticalInput,
 };
 
 /// Maximum drawdown and the first complete peak/trough/recovery path that realizes it.
@@ -63,7 +63,7 @@ impl AlphaBetaResult {
     }
 }
 
-/// Volatility using a declared denominator and annualization convention.
+/// Typed volatility using a declared denominator and series-bound annualization convention.
 ///
 /// Inputs have already crossed a non-null boundary. `missing_policy` is retained explicitly so a
 /// caller cannot accidentally reuse a policy-free invocation after resolving optional data.
@@ -71,22 +71,22 @@ impl AlphaBetaResult {
 /// # Errors
 ///
 /// Rejects fewer than two observations, heterogeneous units, non-return inputs, excessive input,
-/// zero/non-finite arithmetic, or invalid statistical output.
+/// zero/non-finite arithmetic, or invalid dispersion output.
 pub fn volatility(
     returns: &ReturnSeries,
     convention: VarianceConvention,
     _missing_policy: MissingValuePolicy,
-) -> Result<StatisticalResult, AnalyticsError> {
+) -> Result<StatisticalDispersion, AnalyticsError> {
     ensure_returns(returns.values(), 2)?;
     let variance = variance(returns.values(), convention)?;
     let annualization = returns.annualization();
-    StatisticalResult::try_new(
+    StatisticalDispersion::try_new(
         variance.sqrt() * annualization.volatility_multiplier(),
-        StatisticalUnit::Volatility,
+        StatisticalScale::Unit,
+        StatisticalUnit::Return,
         returns.observations(),
-        Some(convention),
+        convention,
         annualization,
-        None,
     )
 }
 
@@ -280,7 +280,7 @@ pub fn sortino_ratio(
     ratio_over_sample_deviation(returns, target_return, true)
 }
 
-/// Annualized sample standard deviation of active returns.
+/// Typed annualized sample standard deviation of active returns.
 ///
 /// # Errors
 ///
@@ -288,17 +288,17 @@ pub fn sortino_ratio(
 pub fn tracking_error(
     portfolio: &ReturnSeries,
     benchmark: &ReturnSeries,
-) -> Result<StatisticalResult, AnalyticsError> {
+) -> Result<StatisticalDispersion, AnalyticsError> {
     let active = active_returns(portfolio, benchmark)?;
     let variance = numeric_sample_variance(&active)?;
     let annualization = portfolio.annualization();
-    StatisticalResult::try_new(
+    StatisticalDispersion::try_new(
         variance.sqrt() * annualization.volatility_multiplier(),
-        StatisticalUnit::Volatility,
+        StatisticalScale::Unit,
+        StatisticalUnit::Return,
         active.len(),
-        Some(VarianceConvention::Sample),
+        VarianceConvention::Sample,
         annualization,
-        None,
     )
 }
 
@@ -426,29 +426,30 @@ pub fn weighted_expected_shortfall(
 
 /// Normal-distribution parametric Value at Risk `mean + z(confidence) * sigma`.
 ///
-/// `mean_loss` and nonnegative `standard_deviation` must carry the same explicit unit.
+/// The distribution location and dispersion must carry the same underlying unit and identical
+/// horizon/cadence contract.
 ///
 /// # Errors
 ///
-/// Rejects non-finite input, negative deviation, or invalid output.
+/// Rejects unit/horizon mismatch, non-finite input, negative deviation, or invalid output.
 pub fn parametric_var(
-    mean_loss: StatisticalInput,
-    standard_deviation: StatisticalInput,
+    mean_loss: StatisticalLocation,
+    standard_deviation: StatisticalDispersion,
     confidence: Quantile,
 ) -> Result<StatisticalResult, AnalyticsError> {
-    if mean_loss.unit() != standard_deviation.unit() {
+    if mean_loss.value().unit() != standard_deviation.underlying_unit() {
         return Err(AnalyticsError::UnitMismatch);
     }
-    if standard_deviation.value() < 0.0 {
-        return Err(AnalyticsError::NegativeStandardDeviation);
+    if mean_loss.annualization() != standard_deviation.annualization() {
+        return Err(AnalyticsError::AnnualizationMismatch);
     }
     StatisticalResult::try_new(
-        mean_loss.value()
+        mean_loss.value().value()
             + inverse_standard_normal(confidence.value()) * standard_deviation.value(),
-        mean_loss.unit(),
-        1,
-        None,
-        Annualization::None,
+        mean_loss.value().unit(),
+        standard_deviation.observations(),
+        Some(standard_deviation.variance_convention()),
+        mean_loss.annualization(),
         Some(confidence),
     )
 }

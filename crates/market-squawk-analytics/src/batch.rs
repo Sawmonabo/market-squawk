@@ -74,7 +74,10 @@ impl StatisticalInput {
         source_scale: StatisticalScale,
     ) -> Result<Self, AnalyticsError> {
         if !matches!(source_scale, StatisticalScale::Unit)
-            && !matches!(unit, StatisticalUnit::Return | StatisticalUnit::Rate)
+            && !matches!(
+                unit,
+                StatisticalUnit::Return | StatisticalUnit::Volatility | StatisticalUnit::Rate
+            )
         {
             return Err(AnalyticsError::IncompatibleScale);
         }
@@ -477,6 +480,133 @@ impl ReturnSeries {
     }
 }
 
+/// One statistical distribution location bound to an explicit horizon/cadence contract.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StatisticalLocation {
+    value: StatisticalInput,
+    annualization: Annualization,
+}
+
+impl StatisticalLocation {
+    /// Binds a finite location value to the horizon represented by that value.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a dispersion value used as a distribution location.
+    pub fn try_new(
+        value: StatisticalInput,
+        annualization: Annualization,
+    ) -> Result<Self, AnalyticsError> {
+        if value.unit() == StatisticalUnit::Volatility {
+            return Err(AnalyticsError::UnitMismatch);
+        }
+        Ok(Self {
+            value,
+            annualization,
+        })
+    }
+
+    /// Returns the normalized location value and its underlying unit.
+    #[must_use]
+    pub const fn value(self) -> StatisticalInput {
+        self.value
+    }
+
+    /// Returns the horizon/cadence contract.
+    #[must_use]
+    pub const fn annualization(self) -> Annualization {
+        self.annualization
+    }
+}
+
+/// Nonnegative statistical dispersion with its underlying unit and horizon/cadence contract.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StatisticalDispersion {
+    value: StatisticalInput,
+    underlying_unit: StatisticalUnit,
+    observations: usize,
+    variance: VarianceConvention,
+    annualization: Annualization,
+}
+
+impl StatisticalDispersion {
+    /// Constructs a typed dispersion from an explicitly scaled finite source value.
+    ///
+    /// # Errors
+    ///
+    /// Rejects negative dispersion, nested volatility units, invalid scale, or an invalid
+    /// observation count.
+    pub fn try_new(
+        source_value: f64,
+        source_scale: StatisticalScale,
+        underlying_unit: StatisticalUnit,
+        observations: usize,
+        variance: VarianceConvention,
+        annualization: Annualization,
+    ) -> Result<Self, AnalyticsError> {
+        validate_count(observations, 1)?;
+        if underlying_unit == StatisticalUnit::Volatility {
+            return Err(AnalyticsError::UnitMismatch);
+        }
+        if source_scale != StatisticalScale::Unit
+            && !matches!(
+                underlying_unit,
+                StatisticalUnit::Return | StatisticalUnit::Rate
+            )
+        {
+            return Err(AnalyticsError::IncompatibleScale);
+        }
+        let value =
+            StatisticalInput::try_new(source_value, StatisticalUnit::Volatility, source_scale)?;
+        if value.value() < 0.0 {
+            return Err(AnalyticsError::NegativeStandardDeviation);
+        }
+        Ok(Self {
+            value,
+            underlying_unit,
+            observations,
+            variance,
+            annualization,
+        })
+    }
+
+    /// Returns normalized nonnegative dispersion.
+    #[must_use]
+    pub const fn value(self) -> f64 {
+        self.value.value()
+    }
+
+    /// Returns the source scale admitted at the boundary.
+    #[must_use]
+    pub const fn source_scale(self) -> StatisticalScale {
+        self.value.source_scale()
+    }
+
+    /// Returns the unit of the observations whose dispersion was measured.
+    #[must_use]
+    pub const fn underlying_unit(self) -> StatisticalUnit {
+        self.underlying_unit
+    }
+
+    /// Returns contributing observation count.
+    #[must_use]
+    pub const fn observations(self) -> usize {
+        self.observations
+    }
+
+    /// Returns the variance denominator convention.
+    #[must_use]
+    pub const fn variance_convention(self) -> VarianceConvention {
+        self.variance
+    }
+
+    /// Returns the horizon/cadence contract.
+    #[must_use]
+    pub const fn annualization(self) -> Annualization {
+        self.annualization
+    }
+}
+
 /// One typed scalar statistical result with disclosed sample size and conventions.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct StatisticalResult {
@@ -626,7 +756,7 @@ pub enum AnalyticsError {
     /// A scenario shock does not map to a portfolio exposure.
     #[error("scenario shock has no matching portfolio exposure")]
     UnknownShockDimension,
-    /// A multiplicatively compounded asset return was below total loss.
+    /// An asset-return shock was below total loss.
     #[error("return shock cannot be below negative one")]
     ReturnBelowFloor,
 }
