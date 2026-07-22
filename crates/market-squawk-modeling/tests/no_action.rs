@@ -5,15 +5,16 @@ use market_squawk_modeling::{
 
 #[test]
 fn every_model_failure_plane_maps_to_typed_nonzero_audit_evidence() {
-    let mut failures = vec![
+    let failures = [
         ModelFailure::from(BundleError::MetadataHashMismatch),
         ModelFailure::from(ModelRegistryError::RegistryFull),
         ModelFailure::from(ModelInputError::FeatureShapeMismatch),
         ModelFailure::from(NativeBackendError::UnsupportedBundleFormat),
         ModelFailure::from(InferenceError::NonFiniteComputation),
-    ];
+    ]
+    .into_iter();
     #[cfg(feature = "onnx-tract")]
-    failures.extend([
+    let failures = failures.chain([
         ModelFailure::from(market_squawk_modeling::OnnxBackendError::Policy(
             market_squawk_modeling::OnnxPolicyError::ExternalData,
         )),
