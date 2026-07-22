@@ -63,6 +63,13 @@ work is bound by the single canonical
   borrowed, successful inference does not allocate output identity, every model failure maps to
   zero order intents, and the paper-bot audit worker durably records the typed no-action evidence in
   an explicit v2 stream without modifying historical v1 audit files.
+- Required local ONNX inference through the self-contained Rust `TractOnnxBackend`. Exact graph,
+  operator, tensor, shape, artifact, compute, queue, process, deadline, warm-up, and output contracts
+  are validated before a model generation is published; runtime failure is quarantined and produces
+  no action. An operator-supplied ONNX Runtime 1.24.4 backend is optional on Linux arm64/x86-64: it
+  admits an exact descriptor-verified library through an immutable sealed memory file, proves
+  warm-up parity, and fails back to the already-constructed tract generation. No external runtime,
+  account, service, download, or network call is required for ONNX support.
 - An offline Python financial-research and deterministic-training product for GIL-enabled CPython
   3.12 and 3.13 on macOS 12+ arm64. The tracked `python/` package opens only catalog-authorized,
   manifest-bound point-in-time Parquet exports; preserves Decimal128 as `decimal.Decimal` with exact
@@ -70,8 +77,10 @@ work is bound by the single canonical
   candidates; and validates publication through an exact, digest-bound Rust validator. Final model
   metadata, artifact, training-run, dataset, feature, label, universe, split, code, and environment
   identities are bound before external authority is accepted. The sealed builder verifies the
-  357-file source closure, hash-locked wheels, CPython runtimes, toolchain, SDK, validator, and
-  project wheel, then installs and tests without network access.
+  369-file source closure, hash-locked wheels, CPython runtimes, toolchain, SDK, validator, and
+  project wheel, then installs and tests without network access. A native package-root initializer
+  verifies the signed Market Squawk, PyArrow, interpreter, and native-library file sets before any
+  shipped mutable Python module executes.
 - A production local-file extraction vertical for CSV/TSV, JSON/NDJSON, entity-safe XML,
   formula- and external-link-constrained Excel, allowlisted read-only SQLite exports, OFX/QFX, and
   Parquet. User-authorized capability roots, bounded parsing and decompression, revocable source
@@ -116,6 +125,13 @@ work is bound by the single canonical
   derives financial limits from its complete projection, binds the exact revision and publication
   generation into the approved order, and rechecks that authority immediately before one-time
   dispatch. Missing, stale, retired, or revoked portfolio state fails closed before adapter access.
+- Governed point-in-time research backtesting over exact catalog-authorized dataset/partition
+  generations, source-authored historical universes, event/availability time, bounded strategies,
+  realistic research execution assumptions, deterministic portfolio accounting and reconciliation.
+  The application-owned service reserves every trial before execution, publishes bounded immutable
+  artifacts, commits exactly one success/failure terminal, binds executable/model/configuration and
+  data identities, and supports cohort, deflated-performance, and overfitting diagnostics without
+  promoting research results into execution authority.
 - Durable ASC 820/IFRS 13 fair-value analysis over producer-issued live, research, feature, and
   portfolio evidence. The code-owned ruleset enforces point-in-time availability, strict Level 1
   identity/quotation/adjustment/activity/access/freshness predicates, and separate Level 2, Level 3,
@@ -150,12 +166,11 @@ terminal consumer, focused verification, immutable evidence, and exact commit ex
 | `Missing` | Kraken direct-source qualification | The production transport, decoder, checksum, exact-generation session lifecycle, fresh-snapshot recovery, and canonical risk/no-paper-mutation terminal proof exist; Kraken WebSocket v2 supplies no venue sequence satisfying the current `DirectVerified` execution predicate | Task 20 |
 | `Missing` | FRED/ALFRED durable local consumption | The production vintage-aware adapter is runnable for authorized ephemeral retrieval, but the exact current terms bundle does not establish per-series rights for persistence, caching, archival, or training | Task 9 / Task 20 |
 | `Missing` | portfolio import | The raw-preserving adapter now enforces durable revisions, account/currency authority, reconciliation, supersession, and canonical data-lane output, but no application service or CLI yet composes a real Task 7 local-file/OFX producer into its required portfolio-raw contract | Task 19 |
-| `Missing` | constrained ONNX inference | No validated, bounded, fail-closed ONNX-compatible backend | Task 15 |
-| `Missing` | research backtesting | No point-in-time research-dataset backtester | Task 17 |
 | `Missing` | strategies and comprehensive risk | Bounded account/risk coordination, actor-owned authority consumption, private approval, one-time dispatch, price-bound reconciliation, and terminal audit exist; a production order-producing strategy and its controlled user-facing configuration do not | Task 2 |
 | `Missing` | realistic paper execution | The bounded engine implements lifecycle, fees, latency, slippage, partial fills, rejection, cancellation, accounting, checkpoint recovery, and reconciliation; no execution-eligible source/strategy currently drives orders through the user-facing production composition | Task 2 |
 | `Missing` | complete local CLI | No complete command hierarchy over shared application services | Task 19 |
 | `Missing` | complete typed local MCP | No complete bounded tool domains over shared application services | Task 19 |
+| `Missing` | local provider onboarding portal | No capability-gated local portal yet composes no-secret activation, official provider handoff, scoped key import, durable resume, exact secret lifecycle, provider permission verification, and rights admission | Task 19A |
 | `Missing` | release security/fuzz/performance gate | No exact-head release evidence or final integrated demonstration | Task 20 |
 
 Production-hardened Coinbase and Kraken source crates are tracked under `adapters/`; their
@@ -231,9 +246,10 @@ authority file before the digest-bound Rust validator will publish it.
 ## Diagnostic foundation quick start
 
 These Rust commands demonstrate only the authority-free diagnostic entry points. They do not
-demonstrate production execution quality, ONNX inference, portfolio or fair-value workflows through
-the CLI, or complete MCP coverage. The research datasets, native model inference, Python product,
-and portfolio-accounting libraries listed above are independently runnable now.
+demonstrate production execution quality, portfolio/fair-value/backtest/model workflows through the
+complete CLI, provider onboarding, or complete MCP coverage. The research datasets, native and ONNX
+model inference, Python product, portfolio accounting, backtesting, and fair-value libraries listed
+above are independently runnable now.
 
 Prerequisites:
 
@@ -522,6 +538,7 @@ apps/
 └── market-squawk/                 CLI, current live application, MCP, journal, and compatibility tests
 crates/
 ├── market-squawk-analytics/       exact live feature kernels and versioned feature metadata
+├── market-squawk-backtesting/     PIT research execution and immutable experiment governance
 ├── market-squawk-data/            SQLite catalog, Arrow, Parquet, DataFusion, and lineage
 ├── market-squawk-domain/          shared financial, identity, quality, provenance, and event contracts
 ├── market-squawk-execution/       typed intents and bounded pre-authority account/risk coordination
@@ -577,15 +594,18 @@ exactly four production-weighted review quarters:
    SQLite, Arrow/Parquet/DataFusion, bounded MCP protocol, and Kraken.
 2. **Quarter 2 of 4 — Stage 2 / Waves 2–3:** implement file, SEC, macro, and portfolio adapters;
    compose research ingestion, point-in-time datasets, corporate actions, and batch analytics.
-3. **Quarter 3 of 4 — Stage 3 / Waves 4A–4B:** model bundles, native inference, portfolio accounting,
-   portfolio/execution binding, fair-value analysis, and the Python product are integrated; complete
-   ONNX inference and backtesting.
-4. **Quarter 4 of 4 — Stages 4–5 / Waves 5–6:** complete shared services, CLI, and typed MCP domains;
-   then run integrated demonstrations, provider evidence, fuzzing, measured performance, security,
-   supply-chain gates, grouped review, publication, and cleanup.
+3. **Quarter 3 of 4 — Stage 3 / Waves 4A–4B:** model bundles, native/ONNX inference, portfolio
+   accounting and execution binding, the sealed Python product, point-in-time backtesting, and fair-
+   value analysis are integrated; grouped exact-head review and the single full gate remain before
+   the quarter is accepted.
+4. **Quarter 4 of 4 — Stages 4–5 / Waves 5–6:** complete shared services, CLI, typed MCP domains, and
+   the local zero-mandatory-fee provider onboarding portal; then run integrated demonstrations,
+   provider evidence, fuzzing, measured performance, security, supply-chain gates, grouped review,
+   publication, and cleanup.
 
 Every item is mandatory unless the product contract is explicitly changed. Each quarter ends at one
-clean exact commit with grouped independent review and remediation of every substantiated severity.
+clean exact commit with grouped independent review and remediation of every substantiated Critical
+or Important release blocker.
 No per-task review rounds or fifth delivery quarter are part of the plan. Stage, Wave, and percentage
 describe progress; none authorizes a partial-release stop.
 

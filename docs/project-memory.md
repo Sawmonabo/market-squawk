@@ -417,11 +417,10 @@ integration, the clean Python worktree, its 5.5 GiB target and 1.2 GiB ignored r
 the merged local feature branch were removed; no origin feature branch existed; metadata was
 pruned; and only the release worktree remains.
 
-Task 15 ONNX integration begins only against the frozen Task 13 contract and must not weaken
-controlled-root, exact-identity, bounded-runtime, or no-action semantics. Issue `#31` remains the
-mandatory zero-fee provider onboarding portal: it may automate
-official provider enrollment and key setup, while preserving and resuming any provider-required
-human consent or verification step.
+Task 15 ONNX integration was built against the frozen Task 13 contract and preserves controlled-
+root, exact-identity, bounded-runtime, and no-action semantics. Issue `#31` remains the mandatory
+zero-fee provider onboarding portal: it automates local setup, official provider handoff and key
+activation while preserving and resuming any provider-required human consent or verification step.
 
 ## 2026-07-22 Task 18 fair-value closeout
 
@@ -444,3 +443,39 @@ the merged release tree. Independent review found two material PIT/override defe
 remediation rereview found no remaining Critical or Important blocker. The closeout was pushed,
 issue `#23` and its Project 5 item were marked Done, and the 2.9 GiB feature target, clean worktree,
 merged local branch, and remote metadata were removed.
+
+## 2026-07-22 Quarter 3 integrated candidate
+
+Tasks 13–18 are integrated on `release/market-squawk-v0.1.0` at candidate head `daf183a`. This is an
+integration state, not checkpoint approval: one grouped exact-head review and one clean
+`CARGO_INCREMENTAL=0 ./scripts/verify.sh` run remain before Tasks 15 and 17 close.
+
+Task 15 provides required zero-service ONNX inference through the self-contained Rust
+`TractOnnxBackend`. It admits exact bounded graphs and tensors, runs through a bounded model-owned
+helper process, binds warm-up evidence, and maps every policy/runtime/deadline failure to no action.
+The operator-supplied ONNX Runtime 1.24.4 path is optional and Linux-only; it admits an exact
+descriptor-verified ELF library through immutable sealed memory, requires warm-up parity, and keeps
+the already-constructed tract generation as the fallback.
+
+The sealed Python package now installs its native extension as `market_squawk/__init__.abi3.so`.
+Native signed-environment verification of the complete Market Squawk, PyArrow, interpreter and
+native-library file sets is therefore the first shipped code executed by `import market_squawk`.
+Only after verification succeeds are native APIs, the compatibility alias and mutable Python
+modules exposed. The focused sealed matrix passed 10/10 on CPython 3.12 and 10/10 on CPython 3.13;
+the rebased integrated source closure was separately re-admitted without a rebuild.
+
+Task 17 provides application-owned point-in-time backtesting over exact dataset and partition
+authority, source-authored historical universes, bounded admitted strategies, research execution
+assumptions, deterministic portfolio accounting/reconciliation, reserve-before-run experiment
+governance, immutable artifacts and exactly one success/failure terminal. Cohort, deflated-
+performance and overfitting diagnostics remain research evidence and cannot mint execution
+authority. Task 18 retains the accepted fair-value closeout above.
+
+The model lane rebased with an exact 1:1 range-diff, fast-forwarded, and closed cleanly. Its 7.1 GiB
+target, worktree and merged local branch were removed; no matching origin branch existed. Only the
+release worktree remains, `.worktrees` is empty, the three protected stashes and `bundle-backup`
+remain. The root target remains generated cache only and must be cleaned immediately before the
+planned Quarter 3 gate. The canonical plan now defines Quarter 4 as Tasks 19, 19A and 20, preserves
+the descriptor-driven shared CLI/MCP architecture, adds the evidence-bound local onboarding portal,
+and forbids the previously proposed proliferation of redundant standalone test executables and
+checker scripts.

@@ -9,7 +9,9 @@ evidence; it does not replace the README capability truth or the canonical relea
 ## Current integration state
 
 - Release branch: `release/market-squawk-v0.1.0`
-- Current integrated capability code head: `02ab5cd` (`fix(python): bind model publication authority`)
+- Current integrated candidate head: `daf183a` (`fix(python): make native module the sealed package root`)
+- Quarter 3 status: Tasks 13–18 are integrated; the grouped exact-head review and single clean full
+  gate have not yet accepted the checkpoint.
 - Task 14 accepted feature and fast-forwarded release head: `02ab5cd`
 - Task 18 release merge head: `051ee3c`; reconciled lock head: `5c34b7d`
 - Task 13 accepted feature and release head: `59ba05c`
@@ -81,9 +83,19 @@ evidence; it does not replace the README capability truth or the canonical relea
   `2b8576c3e6f219f34d958c863e08cf2b68599306faa2668ba8cf348f705e1b1c`, wheelhouse/source lock
   `92657a32099c7b309e9b73b674ae1ecee26f8c70d71e69e1a72f225a5e510f9a`, and sealed build
   environment `d0a9479dae9eb8024e5a4c6bfb1e5fa606a03e0858530ca3a1622b2580379931`.
-- The next implementation barrier is the parallel-compatible Task 15 constrained local ONNX backend
-  and Task 17 point-in-time backtesting engine. Neither may weaken the accepted Task 11–14 or Task
-  16 authority contracts.
+- Task 15 owner: GitHub issue `#20`, Project 5, status `In Progress` until the Quarter 3 checkpoint
+  closes. The integrated implementation provides the required self-contained tract ONNX backend,
+  bounded helper-process/resource/deadline contracts, exact graph and warm-up admission, and
+  no-action failure. The optional operator-supplied ONNX Runtime path is Linux-only, descriptor-
+  verified, sealed in immutable memory, parity-checked, and cannot replace the required tract
+  fallback.
+- Task 17 owner: GitHub issue `#22`, Project 5, status `In Progress` until the Quarter 3 checkpoint
+  closes. The integrated application-owned PIT backtesting service binds exact dataset partitions,
+  executable/model/configuration identities, research execution assumptions, reconciled portfolio
+  accounting, immutable success/failure terminals, artifacts, cohorts and overfitting diagnostics.
+- The next barrier is one grouped review of the exact integrated Quarter 3 head followed by one clean
+  `CARGO_INCREMENTAL=0 ./scripts/verify.sh` run. Tasks 15/17 remain open until that evidence passes;
+  focused lane gates and pre-rebase release artifacts do not substitute for the checkpoint.
 
 - Task 12 owner: GitHub issue `#17`, Project 5, status `Done`.
 - Exact feature and fast-forwarded release code head: `9702556`.
@@ -194,7 +206,13 @@ application size.
   target plus 1.2 GiB ignored release evidence, deleted merged local branch
   `feature/python-financial-training`, confirmed no matching origin branch existed, and pruned
   worktree/remote metadata. Only the release worktree remains.
+- Integrated the reviewed Task 15/Python containment series by an exact 1:1 range-diff at
+  `daf183a`; reclaimed its 7.1 GiB target; removed the clean
+  `.worktrees/model-runtime-containment` worktree; deleted merged local branch
+  `feature/model-runtime-containment`; confirmed no matching origin branch existed; and pruned
+  worktree/remote metadata. The three protected stashes, `bundle-backup`, main/release branches and
+  Dependabot branches remain. `.worktrees` is empty.
 
-The next delivery event is parallel implementation of Task 15's bounded local ONNX inference and
-Task 17's point-in-time research backtesting, followed by their shared integration checkpoint.
-Completed Tasks 13, 14, 16, and 18 do not claim that the Market Squawk product release is complete.
+The next delivery event is the frozen Quarter 3 grouped review and one exact-head full gate. If that
+passes, issues `#20` and `#22` can close and Quarter 4 Tasks 19, 19A and 20 begin. Integrated Tasks
+13–18 do not claim that the Market Squawk product release is complete.
