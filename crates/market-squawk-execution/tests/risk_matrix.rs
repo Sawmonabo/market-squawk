@@ -43,6 +43,12 @@ fn risk_returns_stably_ordered_source_market_and_account_reasons_before_mutation
     .unwrap_or_else(|error| panic!("valid audit fixture: {error}"));
     let service = RiskService::try_new(
         coordinator,
+        super::portfolio_state_integration::portfolio_capability(
+            fixture.account_id,
+            fixture.usd,
+            Decimal::new(50, 0),
+        )
+        .unwrap_or_else(|error| panic!("valid portfolio fixture: {error}")),
         fixture.limits(),
         audit,
         RiskServiceConfig {
@@ -149,15 +155,15 @@ fn risk_returns_stably_ordered_source_market_and_account_reasons_before_mutation
     );
 }
 
-struct Fixture {
-    account_id: AccountId,
-    instrument_id: InstrumentId,
-    terms: InstrumentExecutionTerms,
-    usd: Currency,
+pub(super) struct Fixture {
+    pub(super) account_id: AccountId,
+    pub(super) instrument_id: InstrumentId,
+    pub(super) terms: InstrumentExecutionTerms,
+    pub(super) usd: Currency,
 }
 
 impl Fixture {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let account_id = AccountId::from_str("50000000-0000-0000-0000-000000000001")
             .unwrap_or_else(|error| panic!("valid account fixture: {error}"));
         let instrument_id = InstrumentId::from_str("10000000-0000-0000-0000-000000000001")
@@ -185,14 +191,14 @@ impl Fixture {
         }
     }
 
-    fn account(&self, capital: Decimal) -> AccountBootstrap {
+    pub(super) fn account(&self, capital: Decimal) -> AccountBootstrap {
         AccountBootstrap {
             account_id: self.account_id,
             revision: NonZeroU64::new(1).unwrap_or_else(|| panic!("fixture revision is nonzero")),
             eligible: true,
             cash: Money::new(capital, self.usd),
             capital: Money::new(capital, self.usd),
-            peak_capital: Money::new(Decimal::new(100, 0), self.usd),
+            peak_capital: Money::new(capital.max(Decimal::new(100, 0)), self.usd),
             gross_exposure: Money::new(Decimal::ZERO, self.usd),
             realized_pnl: Money::new(Decimal::ZERO, self.usd),
             realized_loss: Money::new(Decimal::ZERO, self.usd),
@@ -202,7 +208,7 @@ impl Fixture {
         }
     }
 
-    fn limits(&self) -> RiskLimits {
+    pub(super) fn limits(&self) -> RiskLimits {
         RiskLimits::try_new(RiskLimitsInput {
             currency: self.usd,
             eligible_instruments: BTreeSet::from([self.instrument_id]),
@@ -226,7 +232,7 @@ impl Fixture {
         .unwrap_or_else(|error| panic!("valid risk limits: {error}"))
     }
 
-    fn intent(
+    pub(super) fn intent(
         &self,
         suffix: u8,
         quantity: i64,

@@ -107,7 +107,6 @@ impl PortfolioLedger {
                 self.limits,
             )?;
         }
-        let previous_revision_id = self.history.last().map(PortfolioRevision::id);
         let revision = build_revision(
             self.account_id,
             self.base_currency,
@@ -115,7 +114,7 @@ impl PortfolioLedger {
             &candidate_entries,
             &candidate_seen,
             candidate_plan.as_ref(),
-            previous_revision_id,
+            self.history.last(),
             valuation,
             evidence,
         )?;

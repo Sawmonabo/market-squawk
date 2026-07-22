@@ -1,9 +1,10 @@
 use std::error::Error;
+use std::mem::{size_of, size_of_val};
 use std::num::NonZeroUsize;
 
 use market_squawk_portfolio::{
-    PortfolioQuery, PortfolioService, PortfolioServiceError, PortfolioServiceLimitInput,
-    PortfolioServiceLimits,
+    Lot, PortfolioQuery, PortfolioService, PortfolioServiceError, PortfolioServiceLimitInput,
+    PortfolioServiceLimits, PortfolioSnapshot, Position,
 };
 
 use super::analytics::{account, analytics_revision};
@@ -59,7 +60,25 @@ fn service_requires_current_opaque_revision_and_returns_only_bounded_read_models
     )?))?;
     assert_eq!(result.revision(), &current_token);
     assert_eq!(result.holdings().len(), 2);
+    let expected_retained_bytes = size_of::<PortfolioSnapshot>()
+        + size_of_val(second.positions())
+        + second
+            .positions()
+            .iter()
+            .flat_map(Position::lots)
+            .map(|lot| size_of::<Lot>() + lot.id().retained_bytes())
+            .sum::<usize>();
+    assert_eq!(result.retained_bytes(), expected_retained_bytes);
     assert!(result.retained_bytes() <= 1024 * 1024);
+    assert!(matches!(
+        service.query(Some(PortfolioQuery::try_new(
+            account()?,
+            current_token.clone(),
+            NonZeroUsize::new(8).ok_or("result limit")?,
+            NonZeroUsize::new(expected_retained_bytes - 1).ok_or("byte limit")?,
+        )?)),
+        Err(PortfolioServiceError::RetainedBytesExceeded)
+    ));
 
     let revoked =
         PortfolioService::try_new(vec![second], vec![stale_token.clone()], service_limits()?)?;

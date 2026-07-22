@@ -100,6 +100,8 @@ pub(crate) struct AppliedLiveObservation {
     pub(crate) generation: ConnectionGeneration,
     pub(crate) event: MarketEvent,
     pub(crate) assessment: QualificationAssessment,
+    pub(crate) binding_digest: [u8; 32],
+    pub(crate) committed_state_revision: u64,
     pub(crate) authority: Option<AppliedObservationAuthority>,
 }
 
@@ -319,7 +321,6 @@ impl<C: TrustedClock> InstrumentLiveProcessor<C> {
         };
         self.streams.insert(key.clone(), state);
         let status = self.statuses.commit(staged_status);
-
         let authority = if qualified.assessment.recorded_quality() == DataQuality::DirectVerified
             && committed.trading_status == TradingStatus::Active
             && execution_enabled(current.observation().event_class())
@@ -349,6 +350,8 @@ impl<C: TrustedClock> InstrumentLiveProcessor<C> {
             generation: cursor.admission.source().binding().connection_generation(),
             event: qualified.event,
             assessment: qualified.assessment,
+            binding_digest: qualified.binding_digest,
+            committed_state_revision: committed.expected_revision,
             authority,
         }))
     }

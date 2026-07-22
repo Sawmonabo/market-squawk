@@ -36,7 +36,9 @@ use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 
-use crate::paper_bot::local_kraken_paper_bot_with_strategy_for_test;
+use crate::paper_bot::{
+    local_kraken_paper_bot_with_strategy_for_test, local_paper_portfolio_capability_for_test,
+};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -360,6 +362,7 @@ fn defense_in_depth_risk_probe(
     })?;
     let risk = RiskService::try_new(
         accounts,
+        local_paper_portfolio_capability_for_test(account_id, capital, 1)?,
         limits,
         audit,
         RiskServiceConfig {

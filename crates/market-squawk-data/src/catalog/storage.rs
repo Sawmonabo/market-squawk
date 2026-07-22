@@ -73,6 +73,24 @@ impl ResultBudget {
     pub(super) fn bounded_row_capacity(&self, requested: usize) -> usize {
         requested.min(self.remaining_bytes / MIN_RESERVED_RESULT_RECORD_BYTES)
     }
+
+    pub(super) fn charge_many(
+        &mut self,
+        count: usize,
+        bytes_per_record: usize,
+    ) -> Result<(), CatalogError> {
+        if bytes_per_record > self.max_record_bytes {
+            return Err(CatalogError::ResultByteLimitExceeded);
+        }
+        let bytes = count
+            .checked_mul(bytes_per_record)
+            .ok_or(CatalogError::ResultByteLimitExceeded)?;
+        if bytes > self.remaining_bytes {
+            return Err(CatalogError::ResultByteLimitExceeded);
+        }
+        self.remaining_bytes -= bytes;
+        Ok(())
+    }
 }
 
 impl ExistingReservation {

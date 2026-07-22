@@ -50,6 +50,7 @@ pub struct DispatchOrder {
     valid_until: Timestamp,
     submitted_at: Timestamp,
     account_revision: u64,
+    portfolio: crate::PortfolioRiskBinding,
     operation: ExecutionOperation,
 }
 
@@ -194,6 +195,22 @@ impl DispatchOrder {
         self.account_revision
     }
 
+    /// Returns the exact opaque portfolio revision rechecked immediately before submission.
+    pub const fn portfolio_revision(&self) -> &market_squawk_portfolio::PortfolioRevisionToken {
+        self.portfolio.revision()
+    }
+
+    /// Returns the stable bounded portfolio snapshot identity bound by risk.
+    pub const fn portfolio_content_digest(&self) -> [u8; 32] {
+        self.portfolio.content_digest()
+    }
+
+    /// Returns the risk-minted approval identity rechecked before this adapter call.
+    pub fn approval_digest(&self) -> [u8; 32] {
+        self.portfolio
+            .approval_digest(self.intent.digest(), self.execution_price_bound)
+    }
+
     /// Returns the stable digest used by execution audit for the qualification assessment.
     pub fn assessment_digest(&self) -> [u8; 32] {
         let mut assessment = Sha256::new();
@@ -227,6 +244,7 @@ pub(crate) const fn dispatch_order_from_approval(
     valid_until: Timestamp,
     submitted_at: Timestamp,
     account_revision: u64,
+    portfolio: crate::PortfolioRiskBinding,
     operation: ExecutionOperation,
 ) -> DispatchOrder {
     DispatchOrder {
@@ -239,6 +257,7 @@ pub(crate) const fn dispatch_order_from_approval(
         valid_until,
         submitted_at,
         account_revision,
+        portfolio,
         operation,
     }
 }
@@ -273,6 +292,7 @@ impl RecoveredDispatchOrder {
         account_revision: u64,
         requested_quantity: QuantityLots,
         execution_price_bound: ExecutionPriceBound,
+        portfolio_content_digest: [u8; 32],
         settlement_currency: Option<market_squawk_domain::Currency>,
         lifecycle: ReconciledOrder,
         strategy_id: StrategyId,
@@ -295,6 +315,7 @@ impl RecoveredDispatchOrder {
             || settlement_currency != Some(lifecycle.cumulative_fees().currency())
             || assessment_digest == [0; 32]
             || evidence_binding_digest == [0; 32]
+            || portfolio_content_digest == [0; 32]
             || valid_until < market_observed_at
             || recovered_at < market_observed_at
         {
@@ -321,6 +342,7 @@ impl RecoveredDispatchOrder {
                 assessment_digest,
                 evidence_binding_digest,
                 execution_price_bound,
+                portfolio_content_digest,
                 policy,
                 market_observed_at,
                 valid_until,

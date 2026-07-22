@@ -16,10 +16,11 @@ use market_squawk_adapter_paper::{
     PaperExecutionConfigInput, PaperExecutionRuntime, PaperExposureValuation, PaperVenueSession,
     PaperVenueSessionCalendar,
 };
+use market_squawk_data::{DatasetId, DatasetManifestRef, DatasetSchemaRegistry, Sha256Digest};
 use market_squawk_domain::{
     AccountId, BasisPoints, ClientOrderId, Currency, DataQuality, InstrumentId, Money, OrderId,
-    OrderReasonCode, OrderSide, OrderType, PriceTicks, QuantityLots, RuleVersion, SourceIdentifier,
-    StrategyId, TimeInForce, Timestamp, VenueId,
+    OrderReasonCode, OrderSide, OrderType, PriceTicks, QuantityLots, RevisionNumber, RuleVersion,
+    SourceIdentifier, StrategyId, TimeInForce, Timestamp, VenueId,
 };
 use market_squawk_execution::{
     ACCOUNT_REPLACEMENT_SCHEMA_VERSION, AccountBootstrap, AccountCoordinatorConfig,
@@ -30,12 +31,19 @@ use market_squawk_execution::{
     ExecutionDispatcherConfig, ExecutionDispatcherShutdown, ExecutionLiveActionHook,
     ExecutionMarketSink, ExecutionMarketSinkError, ExecutionMarketUpdate, ExecutionReceipt,
     ExecutionState, ExecutionStateSourceBinding, ExecutionTaskReaper, OrderIntent,
-    OrderIntentInput, ReconcileOrders, ReconciledAccountState, ReconciledOrder,
-    ReconciledOrderStatus, ReconciliationAcknowledgement, RiskLimits, RiskLimitsInput,
-    RiskPolicyIdentity, RiskRejectionCode, RiskService, RiskServiceConfig, Strategy,
-    StrategyContext, StrategyError,
+    OrderIntentInput, PortfolioReadCapability, PortfolioReadLimits, PortfolioServicePublisher,
+    ReconcileOrders, ReconciledAccountState, ReconciledOrder, ReconciledOrderStatus,
+    ReconciliationAcknowledgement, RiskLimits, RiskLimitsInput, RiskPolicyIdentity,
+    RiskRejectionCode, RiskService, RiskServiceConfig, Strategy, StrategyContext, StrategyError,
+    portfolio_execution_state,
 };
 use market_squawk_live::{ActionAuthorityIssueLimit, LiveRuntime, RouteActionHook};
+use market_squawk_portfolio::{
+    CashFlow, CashFlowKind, LedgerEntry, LedgerEntryKind, LotSelection, PortfolioLedger,
+    PortfolioLimitInput, PortfolioLimits, PortfolioRevision, PortfolioService,
+    PortfolioServiceLimitInput, PortfolioServiceLimits, PriceEvidence, RevisionEvidence, Trade,
+    TradeSide, TransactionRevision, ValuationSet,
+};
 use rust_decimal::Decimal;
 use tokio_util::sync::CancellationToken;
 
@@ -47,11 +55,12 @@ use current_source::{
 
 #[derive(Debug)]
 struct SnapshotStrategy {
-    account_ids: [AccountId; 6],
+    account_ids: Vec<AccountId>,
     strategy_id: StrategyId,
     terms: market_squawk_domain::InstrumentExecutionTerms,
-    order_ids: [OrderId; 6],
-    client_ids: [ClientOrderId; 6],
+    order_ids: Vec<OrderId>,
+    client_ids: Vec<ClientOrderId>,
+    adverse_price_index: Option<usize>,
     reason: OrderReasonCode,
     emitted: usize,
 }
@@ -80,7 +89,7 @@ impl Strategy for SnapshotStrategy {
             .observed_at()
             .checked_add_nanos(30_000_000_000)
             .map_err(|_| StrategyError::Evaluation)?;
-        let is_adverse_price_probe = index == 5;
+        let is_adverse_price_probe = self.adverse_price_index == Some(index);
         let intent = OrderIntent::try_new(OrderIntentInput {
             order_id: self.order_ids[index],
             client_order_id: self.client_ids[index].clone(),
@@ -338,6 +347,55 @@ impl ExecutionAdapter for ScriptedAdapter {
     }
 }
 
+#[derive(Debug)]
+struct PortfolioBarrierAdapter {
+    calls: AtomicUsize,
+    first_started: tokio::sync::Notify,
+    release_first: tokio::sync::Notify,
+}
+
+impl ExecutionAdapter for PortfolioBarrierAdapter {
+    fn is_cooperative(&self) -> bool {
+        true
+    }
+
+    fn submit(
+        &self,
+        _order: DispatchOrder,
+    ) -> ExecutionAdapterFuture<'_, Result<ExecutionReceipt, ExecutionAdapterError>> {
+        let invocation = self.calls.fetch_add(1, Ordering::AcqRel);
+        if invocation == 0 {
+            self.first_started.notify_one();
+            return Box::pin(async move {
+                self.release_first.notified().await;
+                Err(ExecutionAdapterError::KnownFailure)
+            });
+        }
+        Box::pin(async { Err(ExecutionAdapterError::KnownFailure) })
+    }
+
+    fn cancel(
+        &self,
+        _order: CancelOrder,
+    ) -> ExecutionAdapterFuture<'_, Result<CancelReceipt, ExecutionAdapterError>> {
+        Box::pin(async { Err(ExecutionAdapterError::KnownFailure) })
+    }
+
+    fn reconcile(
+        &self,
+        _request: ReconcileOrders,
+    ) -> ExecutionAdapterFuture<'_, Result<ExecutionState, ExecutionAdapterError>> {
+        Box::pin(async { Err(ExecutionAdapterError::KnownFailure) })
+    }
+
+    fn acknowledge_reconciliation(
+        &self,
+        _acknowledgement: ReconciliationAcknowledgement,
+    ) -> ExecutionAdapterFuture<'_, Result<(), ExecutionAdapterError>> {
+        Box::pin(async { Err(ExecutionAdapterError::KnownFailure) })
+    }
+}
+
 fn current_timestamp() -> Result<Timestamp, ExecutionAdapterError> {
     let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -472,6 +530,26 @@ async fn committed_market_risk_and_dispatch_are_one_use_bounded_and_fill_safe() 
     );
     let risk = RiskService::try_new(
         Arc::clone(&accounts),
+        portfolio_state_for_cash_accounts(&[
+            (account_id, Money::new(Decimal::new(10_000, 0), usd)),
+            (
+                submitted_shutdown_account_id,
+                Money::new(Decimal::new(10_000, 0), usd),
+            ),
+            (
+                accepted_shutdown_account_id,
+                Money::new(Decimal::new(10_000, 0), usd),
+            ),
+            (
+                queued_expired_account_id,
+                Money::new(Decimal::new(10_000, 0), usd),
+            ),
+            (
+                adverse_price_account_id,
+                Money::new(Decimal::new(2_000_000, 0), usd),
+            ),
+        ])?
+        .1,
         limits.clone(),
         audit,
         RiskServiceConfig {
@@ -481,7 +559,7 @@ async fn committed_market_risk_and_dispatch_are_one_use_bounded_and_fill_safe() 
         },
     )?;
     let strategy = SnapshotStrategy {
-        account_ids: [
+        account_ids: vec![
             account_id,
             account_id,
             accepted_shutdown_account_id,
@@ -491,7 +569,7 @@ async fn committed_market_risk_and_dispatch_are_one_use_bounded_and_fill_safe() 
         ],
         strategy_id,
         terms,
-        order_ids: [
+        order_ids: vec![
             OrderId::from_str("20000000-0000-0000-0000-000000000001")?,
             OrderId::from_str("20000000-0000-0000-0000-000000000002")?,
             OrderId::from_str("20000000-0000-0000-0000-000000000003")?,
@@ -499,7 +577,7 @@ async fn committed_market_risk_and_dispatch_are_one_use_bounded_and_fill_safe() 
             OrderId::from_str("20000000-0000-0000-0000-000000000005")?,
             OrderId::from_str("20000000-0000-0000-0000-000000000008")?,
         ],
-        client_ids: [
+        client_ids: vec![
             ClientOrderId::try_from("dispatch-1")?,
             ClientOrderId::try_from("dispatch-2")?,
             ClientOrderId::try_from("dispatch-3")?,
@@ -507,6 +585,7 @@ async fn committed_market_risk_and_dispatch_are_one_use_bounded_and_fill_safe() 
             ClientOrderId::try_from("dispatch-5")?,
             ClientOrderId::try_from("dispatch-adverse-price")?,
         ],
+        adverse_price_index: Some(5),
         reason: OrderReasonCode::try_from("dispatch.integration")?,
         emitted: 0,
     };
@@ -550,9 +629,15 @@ async fn committed_market_risk_and_dispatch_are_one_use_bounded_and_fill_safe() 
     let accepted_bound = accepted
         .execution_price_bound()
         .ok_or("accepted execution audit omitted the approved price ceiling")?;
+    let accepted_portfolio = accepted
+        .portfolio_content_digest()
+        .ok_or("accepted execution audit omitted the portfolio identity")?;
     assert_eq!(
         accepted.execution_identity_digest(),
-        Some(accepted_bound.order_audit_digest(accepted.intent_digest()))
+        Some(
+            accepted_bound
+                .portfolio_bound_audit_digest(accepted.intent_digest(), accepted_portfolio,)
+        )
     );
     assert_eq!(risk_approved.order_id(), accepted.order_id());
     assert_eq!(risk_approved.execution_price_bound(), Some(accepted_bound));
@@ -787,6 +872,480 @@ async fn committed_market_risk_and_dispatch_are_one_use_bounded_and_fill_safe() 
     assert_eq!(market_sink.updates.load(Ordering::Acquire), 6);
     assert!(market_sink.valid.load(Ordering::Acquire));
     Ok(())
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn dispatch_rechecks_portfolio_after_queueing_and_releases_stale_reservation() -> TestResult {
+    let route_config = route_config(INSTRUMENT_ONE)?;
+    let terms = route_config.definition().execution_terms();
+    let usd = Currency::try_from("USD")?;
+    let first_account = AccountId::from_str("50000000-0000-0000-0000-000000000011")?;
+    let stale_account = AccountId::from_str("50000000-0000-0000-0000-000000000012")?;
+    let strategy_id = StrategyId::from_str("30000000-0000-0000-0000-000000000011")?;
+    let cash = Money::new(Decimal::new(10_000, 0), usd);
+    let zero = Money::new(Decimal::ZERO, usd);
+    let accounts = Arc::new(AccountRiskCoordinator::try_new(
+        AccountCoordinatorConfig::default(),
+        [first_account, stale_account].map(|account_id| AccountBootstrap {
+            account_id,
+            revision: NonZeroU64::MIN,
+            eligible: true,
+            cash,
+            capital: cash,
+            peak_capital: cash,
+            gross_exposure: zero,
+            realized_pnl: zero,
+            realized_loss: zero,
+            positions: vec![(terms.instrument_id(), 0)],
+            position_cost_basis: vec![(terms.instrument_id(), zero)],
+            idempotency: AccountIdempotencyBootstrap::empty(),
+        }),
+    )?);
+    let limits = RiskLimits::try_new(RiskLimitsInput {
+        currency: usd,
+        eligible_instruments: BTreeSet::from([terms.instrument_id()]),
+        maximum_position_lots: 100,
+        maximum_order_notional: Money::new(Decimal::new(105, 0), usd),
+        maximum_gross_exposure: Money::new(Decimal::new(105, 0), usd),
+        maximum_leverage: BasisPoints::new(100_000),
+        minimum_capital: Money::new(Decimal::ONE, usd),
+        maximum_loss: Money::new(Decimal::new(1_000, 0), usd),
+        maximum_drawdown: Money::new(Decimal::new(1_000, 0), usd),
+        maximum_fee: BasisPoints::new(100),
+        maximum_price_deviation: BasisPoints::new(1_000),
+        maximum_slippage: BasisPoints::new(1_000),
+        maximum_orders_per_window: NonZeroU32::new(8).ok_or("order rate")?,
+        order_rate_window_nanos: 60_000_000_000,
+        reservation_ttl_nanos: 5_000_000_000,
+        allow_short: true,
+        kill_switch: false,
+    })?;
+    let (audit, mut audit_reader) = ExecutionAuditWriter::try_new(ExecutionAuditConfig {
+        maximum_records: NonZeroUsize::new(16).ok_or("audit records")?,
+        maximum_bytes: NonZeroU32::new(256 * 1024).ok_or("audit bytes")?,
+    })?;
+    let adapter = Arc::new(PortfolioBarrierAdapter {
+        calls: AtomicUsize::new(0),
+        first_started: tokio::sync::Notify::new(),
+        release_first: tokio::sync::Notify::new(),
+    });
+    let task_reaper = ExecutionTaskReaper::try_new(
+        NonZeroUsize::new(2).ok_or("execution task ownership capacity")?,
+    )?;
+    let mut dispatcher = ExecutionDispatcher::try_start(
+        Arc::clone(&adapter) as Arc<dyn ExecutionAdapter>,
+        Arc::clone(&accounts),
+        audit.clone(),
+        ExecutionDispatcherConfig {
+            maximum_queued_commands: NonZeroUsize::new(2).ok_or("dispatch queue")?,
+            maximum_queued_bytes: NonZeroU32::new(128 * 1024).ok_or("dispatch bytes")?,
+            maximum_registry_entries: NonZeroUsize::new(4).ok_or("registry entries")?,
+            maximum_pending_reconciliation_bytes: NonZeroU32::new(4 * 1024)
+                .ok_or("reconciliation bytes")?,
+            operation_deadline: Duration::from_secs(5),
+            shutdown_deadline: Duration::from_secs(1),
+        },
+        task_reaper.clone(),
+    )?;
+    let portfolio_accounts = [(first_account, cash), (stale_account, cash)];
+    let (portfolio_publisher, portfolio) = portfolio_state_for_cash_accounts(&portfolio_accounts)?;
+    let risk = RiskService::try_new(
+        Arc::clone(&accounts),
+        portfolio,
+        limits.clone(),
+        audit,
+        RiskServiceConfig {
+            policy: RiskPolicyIdentity::new(
+                &SourceIdentifier::try_from("portfolio-dispatch-recheck")?,
+                RuleVersion::new(1)?,
+            ),
+            policy_valid_until: Timestamp::from_unix_nanos(i64::MAX),
+            maximum_approval_lifetime: Duration::from_secs(30),
+        },
+    )?;
+    let market_sink = Arc::new(CountingMarketSink {
+        updates: AtomicUsize::new(0),
+        valid: AtomicBool::new(true),
+        notification: tokio::sync::Notify::new(),
+    });
+    let strategy = SnapshotStrategy {
+        account_ids: vec![first_account, stale_account],
+        strategy_id,
+        terms,
+        order_ids: vec![
+            OrderId::from_str("20000000-0000-0000-0000-000000000011")?,
+            OrderId::from_str("20000000-0000-0000-0000-000000000012")?,
+        ],
+        client_ids: vec![
+            ClientOrderId::try_from("portfolio-blocking")?,
+            ClientOrderId::try_from("portfolio-stale")?,
+        ],
+        adverse_price_index: None,
+        reason: OrderReasonCode::try_from("dispatch.portfolio.recheck")?,
+        emitted: 0,
+    };
+    let hook = ExecutionLiveActionHook::try_new(
+        Box::new(strategy),
+        risk,
+        dispatcher.handle(),
+        Arc::clone(&market_sink) as Arc<dyn ExecutionMarketSink>,
+        ActionAuthorityIssueLimit::MIN,
+    )?;
+    let route_hook = RouteActionHook::try_new(route(INSTRUMENT_ONE)?, Box::new(hook), Vec::new())?;
+    let runtime = LiveRuntime::start_with_action_hooks(
+        runtime_config(4, 4 * 1024 * 1024, 2 * 1024 * 1024)?,
+        vec![route_config],
+        vec![route_hook],
+    )
+    .await?;
+    let mut source = SourceHarness::try_new("portfolio-dispatch-source", 1, INSTRUMENT_ONE)?;
+    let ingress = runtime
+        .ingress()
+        .bind_generation(
+            route(INSTRUMENT_ONE)?,
+            source.current_lease()?,
+            CancellationToken::new(),
+        )
+        .await?;
+
+    let (_, first) = source.two_sided_book_snapshot_batch("portfolio-book", 1)?;
+    ingress.try_publish(first)?;
+    let _first_approval =
+        wait_for_audit(&mut audit_reader, ExecutionAuditKind::RiskApproved).await?;
+    tokio::time::timeout(Duration::from_secs(1), adapter.first_started.notified()).await?;
+    let (_, second) = source.batch("portfolio-queued", 2)?;
+    ingress.try_publish(second)?;
+    let stale_approval =
+        wait_for_audit(&mut audit_reader, ExecutionAuditKind::RiskApproved).await?;
+    assert_eq!(stale_approval.account_id(), stale_account);
+
+    portfolio_publisher.publish(portfolio_service_for_cash_accounts(
+        &portfolio_accounts,
+        Some(stale_account),
+    )?)?;
+    adapter.release_first.notify_one();
+    let _first_failure =
+        wait_for_audit(&mut audit_reader, ExecutionAuditKind::DispatchKnownFailure).await?;
+    let stale_rejection =
+        wait_for_audit(&mut audit_reader, ExecutionAuditKind::DispatchRejected).await?;
+    assert_eq!(stale_rejection.account_id(), stale_account);
+    assert!(
+        stale_rejection
+            .reasons()
+            .any(|reason| reason == ExecutionAuditReason::PortfolioRevisionInvalid)
+    );
+    assert_eq!(adapter.calls.load(Ordering::Acquire), 1);
+
+    let probe_at = current_timestamp()?;
+    let probe = OrderIntent::try_new(OrderIntentInput {
+        order_id: OrderId::from_str("20000000-0000-0000-0000-000000000013")?,
+        client_order_id: ClientOrderId::try_from("portfolio-release-probe")?,
+        strategy_id,
+        model_id: None,
+        account_id: stale_account,
+        execution_terms: terms,
+        side: OrderSide::Sell,
+        order_type: OrderType::Market,
+        quantity: QuantityLots::new(100)?,
+        limit_price: None,
+        stop_price: None,
+        time_in_force: TimeInForce::ImmediateOrCancel,
+        signal_at: probe_at,
+        expires_at: probe_at.checked_add_nanos(30_000_000_000)?,
+        reason_codes: vec![OrderReasonCode::try_from("dispatch.portfolio.release")?],
+        maximum_slippage: BasisPoints::new(100),
+        required_quality: DataQuality::DirectVerified,
+    })?;
+    accounts.assess(&probe, PriceTicks::new(10_000), &limits)?;
+
+    assert!(runtime.shutdown().await.is_complete());
+    assert_eq!(
+        dispatcher.quiesce().await,
+        market_squawk_execution::ExecutionDispatcherQuiesce::Complete
+    );
+    assert_eq!(
+        dispatcher.shutdown().await,
+        ExecutionDispatcherShutdown::Complete
+    );
+    let drain_deadline = tokio::time::Instant::now()
+        .checked_add(Duration::from_secs(1))
+        .ok_or("execution task drain deadline overflow")?;
+    assert!(task_reaper.drain(drain_deadline).await.is_complete());
+    Ok(())
+}
+
+fn portfolio_state_for_cash_accounts(
+    accounts: &[(AccountId, Money)],
+) -> Result<(PortfolioServicePublisher, PortfolioReadCapability), Box<dyn std::error::Error>> {
+    let retained_bytes = NonZeroUsize::new(4 * 1024 * 1024).ok_or("portfolio byte bound")?;
+    Ok(portfolio_execution_state(
+        portfolio_service_for_cash_accounts(accounts, None)?,
+        PortfolioReadLimits::new(
+            NonZeroUsize::MIN,
+            retained_bytes,
+            NonZeroUsize::new(64).ok_or("portfolio publication history")?,
+        ),
+    )?)
+}
+
+fn portfolio_service_for_cash_accounts(
+    accounts: &[(AccountId, Money)],
+    successor_account: Option<AccountId>,
+) -> Result<PortfolioService, Box<dyn std::error::Error>> {
+    let account_count = NonZeroUsize::new(accounts.len()).ok_or("portfolio accounts are empty")?;
+    let limits = PortfolioLimits::try_new(PortfolioLimitInput {
+        max_accounts: accounts.len(),
+        max_instruments: 1,
+        max_lots: 1,
+        max_transactions: 8,
+        max_factors: 1,
+        max_scenarios: 1,
+        max_history: 2,
+        max_results: 1,
+        max_retained_bytes: 4 * 1024 * 1024,
+    })?;
+    let schema = DatasetSchemaRegistry::local().canonical_research_observations()?;
+    let mut revisions = Vec::new();
+    revisions.try_reserve_exact(accounts.len())?;
+    for (index, (account_id, cash)) in accounts.iter().copied().enumerate() {
+        let marker = u8::try_from(index.saturating_add(1))?;
+        let as_of = Timestamp::from_unix_nanos(i64::from(marker));
+        let source = SourceIdentifier::try_from(format!("risk-dispatch-portfolio-{marker}"))?;
+        let dataset = DatasetManifestRef::try_new_with_schema(
+            DatasetId::try_from("risk-dispatch-portfolio")?,
+            u64::from(marker),
+            schema.clone(),
+            Sha256Digest::new([marker; 32]),
+        )?;
+        let mut ledger = PortfolioLedger::try_new(account_id, cash.currency(), limits)?;
+        let initial = ledger.try_apply(
+            vec![LedgerEntry::try_new(
+                account_id,
+                TransactionRevision::try_new(source.clone(), RevisionNumber::new(1)?, None)?,
+                as_of,
+                source.clone(),
+                LedgerEntryKind::CashFlow(CashFlow::try_new(CashFlowKind::Deposit, cash, None)?),
+            )?],
+            None,
+            ValuationSet::try_new(
+                cash.currency(),
+                as_of,
+                dataset.clone(),
+                Sha256Digest::new([marker.wrapping_add(1); 32]),
+                Vec::new(),
+                Vec::new(),
+                limits,
+            )?,
+            RevisionEvidence::try_new(
+                as_of,
+                dataset,
+                Sha256Digest::new([marker.wrapping_add(1); 32]),
+                Sha256Digest::new([marker.wrapping_add(2); 32]),
+                vec![source],
+                Vec::new(),
+                None,
+            )?,
+        )?;
+        if successor_account == Some(account_id) {
+            let successor_marker = marker
+                .checked_add(64)
+                .ok_or("portfolio successor marker overflow")?;
+            let successor_at = Timestamp::from_unix_nanos(i64::from(successor_marker));
+            let successor_source =
+                SourceIdentifier::try_from(format!("risk-dispatch-portfolio-{successor_marker}"))?;
+            let successor_dataset = DatasetManifestRef::try_new_with_schema(
+                DatasetId::try_from("risk-dispatch-portfolio")?,
+                u64::from(successor_marker),
+                schema.clone(),
+                Sha256Digest::new([successor_marker; 32]),
+            )?;
+            revisions.push(initial.into_ledger()?.try_apply(
+                Vec::new(),
+                None,
+                ValuationSet::try_new(
+                    cash.currency(),
+                    successor_at,
+                    successor_dataset.clone(),
+                    Sha256Digest::new([successor_marker.wrapping_add(1); 32]),
+                    Vec::new(),
+                    Vec::new(),
+                    limits,
+                )?,
+                RevisionEvidence::try_new(
+                    successor_at,
+                    successor_dataset,
+                    Sha256Digest::new([successor_marker.wrapping_add(1); 32]),
+                    Sha256Digest::new([successor_marker.wrapping_add(2); 32]),
+                    vec![successor_source],
+                    Vec::new(),
+                    None,
+                )?,
+            )?);
+        } else {
+            revisions.push(initial);
+        }
+    }
+    let retained_bytes = NonZeroUsize::new(4 * 1024 * 1024).ok_or("portfolio byte bound")?;
+    Ok(PortfolioService::try_new(
+        revisions,
+        Vec::new(),
+        PortfolioServiceLimits::try_new(PortfolioServiceLimitInput {
+            max_accounts: account_count,
+            max_history_per_account: NonZeroUsize::new(2).ok_or("portfolio history")?,
+            max_results: NonZeroUsize::MIN,
+            max_retained_bytes: retained_bytes,
+        })?,
+    )?)
+}
+
+fn portfolio_service_for_reconciled_account(
+    state: &ReconciledAccountState,
+    terms: market_squawk_domain::InstrumentExecutionTerms,
+    marker: u8,
+    previous: &PortfolioRevision,
+) -> Result<PortfolioService, Box<dyn std::error::Error>> {
+    let limits = PortfolioLimits::try_new(PortfolioLimitInput {
+        max_accounts: 1,
+        max_instruments: 1,
+        max_lots: 1,
+        max_transactions: 2,
+        max_factors: 1,
+        max_scenarios: 1,
+        max_history: 2,
+        max_results: 1,
+        max_retained_bytes: 4 * 1024 * 1024,
+    })?;
+    let account_id = state.account_id();
+    let currency = state.currency();
+    let as_of = Timestamp::from_unix_nanos(i64::from(marker));
+    let source = SourceIdentifier::try_from(format!("reconciled-portfolio-{marker}"))?;
+    let dataset = DatasetManifestRef::try_new_with_schema(
+        DatasetId::try_from("reconciled-paper-portfolio")?,
+        u64::from(marker),
+        DatasetSchemaRegistry::local().canonical_research_observations()?,
+        Sha256Digest::new([marker; 32]),
+    )?;
+    let position_lots = state
+        .positions()
+        .iter()
+        .find_map(|(instrument, lots)| (*instrument == terms.instrument_id()).then_some(*lots))
+        .unwrap_or(0);
+    let basis = state
+        .position_cost_basis()
+        .iter()
+        .find_map(|(instrument, basis)| (*instrument == terms.instrument_id()).then_some(*basis))
+        .unwrap_or(Money::new(Decimal::ZERO, currency));
+    let mut entries = Vec::new();
+    entries.try_reserve_exact(2)?;
+    let mut prices = Vec::new();
+    prices.try_reserve_exact(1)?;
+    let trade_cash_effect = if position_lots == 0 {
+        Decimal::ZERO
+    } else {
+        let quantity = Decimal::from(position_lots.unsigned_abs())
+            .checked_mul(terms.lot_size().as_decimal())
+            .ok_or("portfolio quantity overflow")?;
+        let price = basis
+            .amount()
+            .checked_div(quantity)
+            .ok_or("portfolio price is not representable")?;
+        let side = if position_lots.is_positive() {
+            TradeSide::Buy
+        } else {
+            TradeSide::SellShort
+        };
+        entries.push(LedgerEntry::try_new(
+            account_id,
+            TransactionRevision::try_new(
+                SourceIdentifier::try_from(format!("reconciled-trade-{marker}"))?,
+                RevisionNumber::new(1)?,
+                None,
+            )?,
+            as_of,
+            source.clone(),
+            LedgerEntryKind::Trade(Trade::try_new(
+                side,
+                terms.instrument_id(),
+                quantity,
+                Money::new(price, currency),
+                Money::new(Decimal::ZERO, currency),
+                LotSelection::Fifo,
+            )?),
+        )?);
+        prices.push(PriceEvidence::try_new(
+            terms.instrument_id(),
+            Money::new(price, currency),
+            as_of,
+            source.clone(),
+        )?);
+        if position_lots.is_positive() {
+            -basis.amount()
+        } else {
+            basis.amount()
+        }
+    };
+    let adjustment = state
+        .cash()
+        .amount()
+        .checked_sub(previous.cash().amount())
+        .ok_or("portfolio starting cash adjustment overflow")?
+        .checked_sub(trade_cash_effect)
+        .ok_or("portfolio cash adjustment overflow")?;
+    if !adjustment.is_zero() {
+        entries.push(LedgerEntry::try_new(
+            account_id,
+            TransactionRevision::try_new(
+                SourceIdentifier::try_from(format!("reconciled-cash-{marker}"))?,
+                RevisionNumber::new(1)?,
+                None,
+            )?,
+            as_of,
+            source.clone(),
+            LedgerEntryKind::CashFlow(CashFlow::try_new(
+                if adjustment.is_sign_positive() {
+                    CashFlowKind::Deposit
+                } else {
+                    CashFlowKind::Withdrawal
+                },
+                Money::new(adjustment.abs(), currency),
+                None,
+            )?),
+        )?);
+    }
+    let mut ledger = previous.clone().into_ledger()?;
+    let point_in_time = Sha256Digest::new([marker.wrapping_add(1); 32]);
+    let revision = ledger.try_apply(
+        entries,
+        None,
+        ValuationSet::try_new(
+            currency,
+            as_of,
+            dataset.clone(),
+            point_in_time,
+            prices,
+            Vec::new(),
+            limits,
+        )?,
+        RevisionEvidence::try_new(
+            as_of,
+            dataset,
+            point_in_time,
+            Sha256Digest::new([marker.wrapping_add(2); 32]),
+            vec![source],
+            Vec::new(),
+            None,
+        )?,
+    )?;
+    Ok(PortfolioService::try_new(
+        vec![revision],
+        Vec::new(),
+        PortfolioServiceLimits::try_new(PortfolioServiceLimitInput {
+            max_accounts: NonZeroUsize::MIN,
+            max_history_per_account: NonZeroUsize::new(2).ok_or("portfolio history")?,
+            max_results: NonZeroUsize::MIN,
+            max_retained_bytes: NonZeroUsize::new(4 * 1024 * 1024).ok_or("portfolio byte bound")?,
+        })?,
+    )?)
 }
 
 async fn wait_for_audit(

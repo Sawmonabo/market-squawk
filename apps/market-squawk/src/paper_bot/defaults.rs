@@ -14,15 +14,21 @@ use market_squawk_adapter_paper::{
     PaperExecutionConfigInput, PaperExposureValuation, PaperVenueSession,
     PaperVenueSessionCalendar,
 };
+#[cfg(test)]
+use market_squawk_data::{DatasetId, DatasetManifestRef, DatasetSchemaRegistry, Sha256Digest};
+#[cfg(test)]
+use market_squawk_domain::RevisionNumber;
 use market_squawk_domain::{
     AccountId, BasisPoints, Currency, InstrumentDefinition, MarketEvent, Money, RuleVersion,
     SourceIdentifier, Timestamp,
 };
+#[cfg(test)]
+use market_squawk_execution::portfolio_execution_state;
 use market_squawk_execution::{
     AccountBootstrap, AccountCoordinatorConfig, AccountIdempotencyBootstrap, BoundedOrderIntents,
-    ExecutionAuditConfig, ExecutionDispatcherConfig, ExecutionLiveActionHook, RiskLimits,
-    RiskLimitsInput, RiskPolicyIdentity, RiskServiceConfig, Strategy, StrategyContext,
-    StrategyError,
+    ExecutionAuditConfig, ExecutionDispatcherConfig, ExecutionLiveActionHook,
+    PortfolioReadCapability, PortfolioReadLimits, RiskLimits, RiskLimitsInput, RiskPolicyIdentity,
+    RiskServiceConfig, Strategy, StrategyContext, StrategyError,
 };
 use market_squawk_live::{
     ActionAuthorityIssueLimit, DepthLimit, LiveRouteConfig, LiveRouteConfigInput,
@@ -30,7 +36,15 @@ use market_squawk_live::{
     SnapshotLimits,
 };
 use market_squawk_platform::LocalPaths;
+#[cfg(test)]
+use market_squawk_portfolio::{
+    CashFlow, CashFlowKind, LedgerEntry, LedgerEntryKind, PortfolioLedger, PortfolioLimitInput,
+    PortfolioLimits, PortfolioService, PortfolioServiceLimitInput, PortfolioServiceLimits,
+    RevisionEvidence, TransactionRevision, ValuationSet,
+};
 use rust_decimal::Decimal;
+#[cfg(test)]
+use sha2::{Digest, Sha256};
 
 use super::{
     ProductionPaperBotComposition, ProductionPaperBotExecutionConfig, ProductionPaperBotRoute,
@@ -219,6 +233,15 @@ where
         positions: Vec::new(),
         position_cost_basis: Vec::new(),
     };
+    let portfolio_results = nonzero_usize(routes.len().max(1))?;
+    let portfolio_retained_bytes = nonzero_usize(4 * 1024 * 1024)?;
+    // This no-intent profile has no published portfolio dataset. Fail closed instead of
+    // manufacturing provenance; an order-producing composition must inject real revision state.
+    let portfolio = PortfolioReadCapability::unavailable(PortfolioReadLimits::new(
+        portfolio_results,
+        portfolio_retained_bytes,
+        nonzero_usize(4_096)?,
+    ))?;
     let risk_limits = RiskLimits::try_new(RiskLimitsInput {
         currency,
         eligible_instruments: routes
@@ -300,6 +323,7 @@ where
             max_rate_events_per_account: nonzero_usize(1_024)?,
         },
         accounts: vec![account],
+        portfolio,
         risk_limits,
         risk_service: RiskServiceConfig {
             policy: risk_policy,
@@ -324,6 +348,122 @@ where
         execution,
         strategies,
     )?)
+}
+
+#[cfg(test)]
+fn local_paper_portfolio_capability(
+    account_id: AccountId,
+    cash: Money,
+    maximum_instruments: usize,
+) -> Result<PortfolioReadCapability> {
+    let maximum_instruments = maximum_instruments.max(1);
+    let limits = PortfolioLimits::try_new(PortfolioLimitInput {
+        max_accounts: 1,
+        max_instruments: maximum_instruments,
+        max_lots: maximum_instruments,
+        max_transactions: 1,
+        max_factors: 1,
+        max_scenarios: 1,
+        max_history: 2,
+        max_results: maximum_instruments,
+        max_retained_bytes: 4 * 1024 * 1024,
+    })?;
+    let source = SourceIdentifier::try_from("local-paper-account-bootstrap")?;
+    let as_of = Timestamp::from_unix_nanos(0);
+    let point_in_time_content = Sha256Digest::new(local_paper_portfolio_digest(
+        b"market-squawk/local-paper-portfolio-pit-content/v1\0",
+        account_id,
+        cash,
+    ));
+    let point_in_time_audit = Sha256Digest::new(local_paper_portfolio_digest(
+        b"market-squawk/local-paper-portfolio-pit-audit/v1\0",
+        account_id,
+        cash,
+    ));
+    let dataset = DatasetManifestRef::try_new_with_schema(
+        DatasetId::try_from("local-paper-account-bootstrap")?,
+        1,
+        DatasetSchemaRegistry::local().canonical_research_observations()?,
+        Sha256Digest::new(local_paper_portfolio_digest(
+            b"market-squawk/local-paper-portfolio-manifest/v1\0",
+            account_id,
+            cash,
+        )),
+    )?;
+    let mut ledger = PortfolioLedger::try_new(account_id, cash.currency(), limits)?;
+    let revision = ledger.try_apply(
+        vec![LedgerEntry::try_new(
+            account_id,
+            TransactionRevision::try_new(
+                SourceIdentifier::try_from("local-paper-initial-cash")?,
+                RevisionNumber::new(1)?,
+                None,
+            )?,
+            as_of,
+            source.clone(),
+            LedgerEntryKind::CashFlow(CashFlow::try_new(CashFlowKind::Deposit, cash, None)?),
+        )?],
+        None,
+        ValuationSet::try_new(
+            cash.currency(),
+            as_of,
+            dataset.clone(),
+            point_in_time_content,
+            Vec::new(),
+            Vec::new(),
+            limits,
+        )?,
+        RevisionEvidence::try_new(
+            as_of,
+            dataset,
+            point_in_time_content,
+            point_in_time_audit,
+            vec![source],
+            Vec::new(),
+            None,
+        )?,
+    )?;
+    let retained_bytes = nonzero_usize(4 * 1024 * 1024)?;
+    let service = PortfolioService::try_new(
+        vec![revision],
+        Vec::new(),
+        PortfolioServiceLimits::try_new(PortfolioServiceLimitInput {
+            max_accounts: NonZeroUsize::MIN,
+            max_history_per_account: nonzero_usize(2)?,
+            max_results: nonzero_usize(maximum_instruments)?,
+            max_retained_bytes: retained_bytes,
+        })?,
+    )?;
+    Ok(portfolio_execution_state(
+        service,
+        PortfolioReadLimits::new(
+            nonzero_usize(maximum_instruments)?,
+            retained_bytes,
+            nonzero_usize(4_096)?,
+        ),
+    )?
+    .1)
+}
+
+#[cfg(test)]
+fn local_paper_portfolio_digest(domain: &[u8], account_id: AccountId, cash: Money) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(domain);
+    digest.update(account_id.as_uuid().as_bytes());
+    digest.update([0]);
+    digest.update(cash.amount().normalize().to_string().as_bytes());
+    digest.update([0]);
+    digest.update(cash.currency().as_str().as_bytes());
+    digest.finalize().into()
+}
+
+#[cfg(test)]
+pub(crate) fn local_paper_portfolio_capability_for_test(
+    account_id: AccountId,
+    cash: Money,
+    maximum_instruments: usize,
+) -> Result<PortfolioReadCapability> {
+    local_paper_portfolio_capability(account_id, cash, maximum_instruments)
 }
 
 #[cfg(test)]

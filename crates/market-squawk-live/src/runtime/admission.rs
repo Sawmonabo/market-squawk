@@ -69,6 +69,7 @@ pub enum LiveRuntimeHealthKind {
     ProcessingRejected,
     FeatureUnavailable,
     ActionFailed,
+    QualifiedMarketExportDropped,
     SnapshotNotificationDropped,
     ShardExited,
 }

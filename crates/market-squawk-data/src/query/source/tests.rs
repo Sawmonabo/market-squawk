@@ -49,6 +49,80 @@ const ARTIFACT_QUERY: &str = "SELECT a.value FROM observations
      CROSS JOIN (VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9)) AS e(value)";
 
 #[tokio::test]
+async fn pinned_query_receipt_derives_exact_monetary_cell() -> TestResult {
+    let (_directory, service, pinned) = published_dataset_fixture().await?;
+    let manifest = pinned.manifest().clone();
+    let engine = ResearchQueryEngine::from_pinned_dataset(
+        pinned,
+        "observations",
+        service.object_store(),
+        CancellationToken::new(),
+    )
+    .await?;
+    let forged = engine
+        .query_pinned(
+            QueryRequest::try_new(
+                manifest.clone(),
+                "SELECT CAST(999 AS DECIMAL(38, 0)) AS value_mantissa, \
+                 CAST(0 AS TINYINT) AS value_scale, 'USD' AS currency FROM observations",
+            )?,
+            QueryLimits::try_new(
+                4,
+                64 * 1024,
+                8 * 1024 * 1024,
+                1,
+                128,
+                128,
+                Duration::from_secs(1),
+            )?,
+            CancellationToken::new(),
+        )
+        .await?;
+    assert!(matches!(forged.result(), QueryResult::Inline { .. }));
+    let value = engine
+        .canonical_research_monetary_value(
+            0,
+            QueryLimits::try_new(
+                1,
+                64 * 1024,
+                8 * 1024 * 1024,
+                1,
+                128,
+                128,
+                Duration::from_secs(1),
+            )?,
+            CancellationToken::new(),
+        )
+        .await?;
+
+    assert_eq!(value.manifest(), &manifest);
+    assert_ne!(value.object_graph_digest().bytes(), [0; 32]);
+    assert_ne!(value.result_digest().bytes(), [0; 32]);
+    assert_eq!(value.row(), 0);
+    assert_eq!(value.value_column(), 0);
+    assert_eq!(value.scale_column(), 1);
+    assert_eq!(value.currency_column(), 2);
+    assert_eq!(value.mantissa(), 123_456);
+    assert_eq!(value.scale(), 2);
+    assert_eq!(value.currency().as_str(), "USD");
+    assert_eq!(value.decimal()?, Decimal::new(123_456, 2));
+    assert_eq!(value.source_id().as_str(), "fred-local-fixture");
+    assert_eq!(value.source_identifier().as_str(), "GDP:2026Q1:v1");
+    assert_eq!(value.instrument_id(), None);
+    assert_eq!(value.venue_id(), None);
+    assert_eq!(value.source_timestamp(), None);
+    assert_eq!(value.received_at(), Timestamp::from_unix_nanos(110));
+    assert_eq!(value.available_at(), Some(Timestamp::from_unix_nanos(100)));
+    assert_eq!(value.ingested_at(), Timestamp::from_unix_nanos(120));
+    assert_eq!(value.effective_at(), Some(Timestamp::from_unix_nanos(90)));
+    assert_eq!(value.published_at(), Some(Timestamp::from_unix_nanos(100)));
+    assert_eq!(value.revision(), 1);
+    assert_eq!(value.data_quality(), DataQuality::OfficialDelayed);
+    assert_ne!(value.payload_digest().bytes(), [0; 32]);
+    Ok(())
+}
+
+#[tokio::test]
 async fn arbitrary_batches_cannot_attach_durable_publication_authority() -> TestResult {
     let (_directory, service, _pinned) = published_dataset_fixture().await?;
     let fabricated_manifest = DatasetManifestRef::try_new_with_schema(

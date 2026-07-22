@@ -20,6 +20,13 @@ pub struct PortfolioRevisionId(pub(crate) [u8; 32]);
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct PortfolioRevisionToken(PortfolioRevisionId);
 
+impl PortfolioRevisionToken {
+    /// Returns the stable bytes of the revision identity carried by this precondition.
+    pub const fn bytes(&self) -> [u8; 32] {
+        self.0.0
+    }
+}
+
 /// One exact feature contract bound into revision evidence.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FeatureBinding {
@@ -522,9 +529,14 @@ pub struct PortfolioRevision {
     pub(crate) cash_balances: Vec<CashBalance>,
     pub(crate) positions: Vec<Position>,
     pub(crate) market_value: Money,
+    pub(crate) gross_exposure: Money,
+    pub(crate) marked_equity: Money,
+    pub(crate) peak_marked_equity: Money,
     pub(crate) cost_basis: BasisMeasurement,
     pub(crate) realized_gain: Money,
+    pub(crate) realized_loss: Money,
     pub(crate) unrealized_gain: BasisMeasurement,
+    pub(crate) drawdown: Money,
     pub(crate) income: Money,
     pub(crate) withholding: Money,
     pub(crate) fees: Money,
@@ -592,6 +604,21 @@ impl PortfolioRevision {
         self.market_value
     }
 
+    /// Returns the sum of absolute position market values.
+    pub const fn gross_exposure(&self) -> Money {
+        self.gross_exposure
+    }
+
+    /// Returns reporting-currency cash plus signed position market value.
+    pub const fn marked_equity(&self) -> Money {
+        self.marked_equity
+    }
+
+    /// Returns the immutable revision lineage's high-water marked equity.
+    pub const fn peak_marked_equity(&self) -> Money {
+        self.peak_marked_equity
+    }
+
     /// Returns aggregate open long basis and short opening proceeds.
     pub const fn cost_basis(&self) -> BasisMeasurement {
         self.cost_basis
@@ -602,9 +629,19 @@ impl PortfolioRevision {
         self.realized_gain
     }
 
+    /// Returns cumulative loss magnitude from negative realized outcomes.
+    pub const fn realized_loss(&self) -> Money {
+        self.realized_loss
+    }
+
     /// Returns current valuation gain over open basis/proceeds.
     pub const fn unrealized_gain(&self) -> BasisMeasurement {
         self.unrealized_gain
+    }
+
+    /// Returns current high-water marked-equity drawdown.
+    pub const fn drawdown(&self) -> Money {
+        self.drawdown
     }
 
     /// Returns gross dividend and interest income.

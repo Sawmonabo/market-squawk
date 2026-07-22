@@ -29,6 +29,8 @@ pub enum AccountRiskViolation {
     InstrumentIneligible,
     /// The account, limits, and instrument terms do not use one currency.
     CurrencyMismatch,
+    /// Portfolio accounting and execution account economics disagree.
+    PortfolioStateMismatch,
     /// Asset settlement is unsupported by this cash risk coordinator.
     UnsupportedSettlement,
     /// The intent expired before reservation.

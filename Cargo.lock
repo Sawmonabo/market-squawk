@@ -3185,6 +3185,7 @@ dependencies = [
  "market-squawk-live",
  "market-squawk-mcp",
  "market-squawk-platform",
+ "market-squawk-portfolio",
  "market-squawk-services",
  "market-squawk-sources",
  "parking_lot",
@@ -3467,10 +3468,13 @@ dependencies = [
 name = "market-squawk-execution"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "market-squawk-analytics",
+ "market-squawk-data",
  "market-squawk-domain",
  "market-squawk-live",
  "market-squawk-modeling",
+ "market-squawk-portfolio",
  "proptest",
  "rust_decimal",
  "serde",
@@ -3633,6 +3637,24 @@ dependencies = [
  "tokio",
  "tokio-util",
  "url",
+]
+
+[[package]]
+name = "market-squawk-valuation"
+version = "0.1.0"
+dependencies = [
+ "market-squawk-analytics",
+ "market-squawk-data",
+ "market-squawk-domain",
+ "market-squawk-live",
+ "market-squawk-platform",
+ "market-squawk-portfolio",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]

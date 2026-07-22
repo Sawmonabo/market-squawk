@@ -20,8 +20,9 @@ use crate::authority::{RuntimeLeaseOwner, ShardLeaseOwner};
 use crate::cross_venue::create_cross_venue_plane;
 use crate::snapshot::{SnapshotPlaneBundle, create_snapshot_plane};
 use crate::{
-    LiveSnapshotReader, RouteActionHook, RouteActionHookError, ShardId, ShardKey,
-    ShardLifecycleSnapshot, ShardRouter, ShardSnapshot, SnapshotDimension, SnapshotReadError,
+    LiveSnapshotReader, RouteActionHook, RouteActionHookError, RouteQualifiedMarketExport, ShardId,
+    ShardKey, ShardLifecycleSnapshot, ShardRouter, ShardSnapshot, SnapshotDimension,
+    SnapshotReadError,
 };
 
 static NEXT_RUNTIME_INCARNATION: AtomicU64 = AtomicU64::new(1);
@@ -52,7 +53,7 @@ impl LiveRuntime {
         config: LiveRuntimeConfig,
         routes: Vec<LiveRouteConfig>,
     ) -> Result<Self, LiveRuntimeStartError> {
-        Self::start_inner(config, routes, None).await
+        Self::start_inner(config, routes, None, Vec::new()).await
     }
 
     /// Starts a runtime only after every configured route transfers one exact action hook.
@@ -66,17 +67,58 @@ impl LiveRuntime {
         routes: Vec<LiveRouteConfig>,
         action_hooks: Vec<RouteActionHook>,
     ) -> Result<Self, LiveRuntimeStartError> {
-        Self::start_inner(config, routes, Some(action_hooks)).await
+        Self::start_inner(config, routes, Some(action_hooks), Vec::new()).await
+    }
+
+    /// Starts a market-data runtime with opt-in bounded post-decision observation exports.
+    pub async fn start_with_qualified_market_exports(
+        config: LiveRuntimeConfig,
+        routes: Vec<LiveRouteConfig>,
+        qualified_market_exports: Vec<RouteQualifiedMarketExport>,
+    ) -> Result<Self, LiveRuntimeStartError> {
+        Self::start_inner(config, routes, None, qualified_market_exports).await
+    }
+
+    /// Starts an action-enabled runtime with independently bounded post-decision exports.
+    pub async fn start_with_action_hooks_and_qualified_market_exports(
+        config: LiveRuntimeConfig,
+        routes: Vec<LiveRouteConfig>,
+        action_hooks: Vec<RouteActionHook>,
+        qualified_market_exports: Vec<RouteQualifiedMarketExport>,
+    ) -> Result<Self, LiveRuntimeStartError> {
+        Self::start_inner(config, routes, Some(action_hooks), qualified_market_exports).await
     }
 
     async fn start_inner(
         config: LiveRuntimeConfig,
         routes: Vec<LiveRouteConfig>,
         action_hooks: Option<Vec<RouteActionHook>>,
+        qualified_market_exports: Vec<RouteQualifiedMarketExport>,
     ) -> Result<Self, LiveRuntimeStartError> {
         config.validate_routes(&routes)?;
         let mut action_hooks = validate_action_hooks(&config, &routes, action_hooks)?;
-        let estimated_peak_bytes = config.estimated_peak_bytes(&routes)?;
+        let mut qualified_market_exports =
+            validate_qualified_market_exports(&routes, qualified_market_exports)?;
+        let export_bytes =
+            qualified_market_exports
+                .values()
+                .try_fold(0_u64, |total, exporter| {
+                    total
+                        .checked_add(
+                            u64::try_from(exporter.reserved_bytes().get())
+                                .map_err(|_| LiveRuntimeStartError::Allocation)?,
+                        )
+                        .ok_or(LiveRuntimeStartError::Allocation)
+                })?;
+        let estimated_peak_bytes = config
+            .estimated_peak_bytes(&routes)?
+            .get()
+            .checked_add(export_bytes)
+            .and_then(NonZeroU64::new)
+            .ok_or(LiveRuntimeStartError::Allocation)?;
+        if estimated_peak_bytes > config.maximum_runtime_bytes() {
+            return Err(LiveRuntimeStartError::QualifiedMarketExportMemoryExceeded);
+        }
         let incarnation = next_incarnation()?;
         let mut runtime_owner = RuntimeLeaseOwner::new(incarnation.get());
         let runtime = runtime_owner.lease();
@@ -129,6 +171,22 @@ impl LiveRuntime {
                 return Err(LiveRuntimeStartError::ActionHookPartitionInvariant);
             }
         }
+        let mut qualified_market_export_partitions = (0..shard_count)
+            .map(|_| Vec::new())
+            .collect::<Vec<Vec<RouteQualifiedMarketExport>>>();
+        for (shard_routes, shard_exports) in partitions
+            .iter()
+            .zip(&mut qualified_market_export_partitions)
+        {
+            for route in shard_routes {
+                if let Some(exporter) = qualified_market_exports.remove(route.route()) {
+                    shard_exports.push(exporter);
+                }
+            }
+        }
+        if !qualified_market_exports.is_empty() {
+            return Err(LiveRuntimeStartError::QualifiedMarketExportPartitionInvariant);
+        }
 
         let initial = initial_snapshots(&config, incarnation, &partitions)?;
         let SnapshotPlaneBundle {
@@ -175,10 +233,12 @@ impl LiveRuntime {
             .try_reserve(route_total)
             .map_err(|_| LiveRuntimeStartError::Allocation)?;
 
-        for ((shard, shard_routes), shard_action_hooks) in shard_ids
-            .into_iter()
-            .zip(partitions)
-            .zip(action_hook_partitions)
+        for (((shard, shard_routes), shard_action_hooks), shard_qualified_market_exports) in
+            shard_ids
+                .into_iter()
+                .zip(partitions)
+                .zip(action_hook_partitions)
+                .zip(qualified_market_export_partitions)
         {
             let shard_index = shard.index();
             let shard_owner = ShardLeaseOwner::new(u64::from(shard_index) + 1);
@@ -231,6 +291,7 @@ impl LiveRuntime {
                 shard_owner,
                 routes: shard_routes,
                 action_hooks: shard_action_hooks,
+                qualified_market_exports: shard_qualified_market_exports,
                 maximum_action_hook_bytes_per_route: config
                     .maximum_action_hook_bytes_per_route()
                     .get(),
@@ -402,6 +463,44 @@ impl LiveRuntime {
             .map_err(LiveRuntimeReplaceError::Start)
     }
 
+    /// Replaces this incarnation with bounded post-decision observation exports.
+    pub async fn replace_with_qualified_market_exports(
+        self,
+        config: LiveRuntimeConfig,
+        routes: Vec<LiveRouteConfig>,
+        qualified_market_exports: Vec<RouteQualifiedMarketExport>,
+    ) -> Result<Self, LiveRuntimeReplaceError> {
+        let shutdown = self.shutdown().await;
+        if !shutdown.is_complete() {
+            return Err(LiveRuntimeReplaceError::Shutdown(shutdown));
+        }
+        Self::start_with_qualified_market_exports(config, routes, qualified_market_exports)
+            .await
+            .map_err(LiveRuntimeReplaceError::Start)
+    }
+
+    /// Replaces this incarnation with action hooks and bounded post-decision exports.
+    pub async fn replace_with_action_hooks_and_qualified_market_exports(
+        self,
+        config: LiveRuntimeConfig,
+        routes: Vec<LiveRouteConfig>,
+        action_hooks: Vec<RouteActionHook>,
+        qualified_market_exports: Vec<RouteQualifiedMarketExport>,
+    ) -> Result<Self, LiveRuntimeReplaceError> {
+        let shutdown = self.shutdown().await;
+        if !shutdown.is_complete() {
+            return Err(LiveRuntimeReplaceError::Shutdown(shutdown));
+        }
+        Self::start_with_action_hooks_and_qualified_market_exports(
+            config,
+            routes,
+            action_hooks,
+            qualified_market_exports,
+        )
+        .await
+        .map_err(LiveRuntimeReplaceError::Start)
+    }
+
     /// Release-invalidates ingress, drains or aborts-and-awaits every actor, and returns outcomes.
     pub async fn shutdown(mut self) -> LiveRuntimeShutdown {
         if let Some(owner) = self.runtime_owner.as_mut() {
@@ -523,6 +622,33 @@ fn validate_action_hooks(
         }
     }
     Ok(Some(validated))
+}
+
+fn validate_qualified_market_exports(
+    routes: &[LiveRouteConfig],
+    exporters: Vec<RouteQualifiedMarketExport>,
+) -> Result<HashMap<ShardKey, RouteQualifiedMarketExport>, LiveRuntimeStartError> {
+    let mut known_routes = std::collections::HashSet::new();
+    known_routes
+        .try_reserve(routes.len())
+        .map_err(|_| LiveRuntimeStartError::Allocation)?;
+    for route in routes {
+        known_routes.insert(route.route().clone());
+    }
+    let mut validated = HashMap::new();
+    validated
+        .try_reserve(exporters.len())
+        .map_err(|_| LiveRuntimeStartError::Allocation)?;
+    for exporter in exporters {
+        let route = exporter.route().clone();
+        if !known_routes.contains(&route) {
+            return Err(LiveRuntimeStartError::UnknownQualifiedMarketExport { route });
+        }
+        if validated.insert(route.clone(), exporter).is_some() {
+            return Err(LiveRuntimeStartError::DuplicateQualifiedMarketExport { route });
+        }
+    }
+    Ok(validated)
 }
 
 fn initial_snapshots(
@@ -727,6 +853,14 @@ pub enum LiveRuntimeStartError {
     },
     #[error("validated action hooks did not preserve deterministic shard partitioning")]
     ActionHookPartitionInvariant,
+    #[error("qualified-market export was configured more than once for route {route:?}")]
+    DuplicateQualifiedMarketExport { route: ShardKey },
+    #[error("qualified-market export was configured for unknown route {route:?}")]
+    UnknownQualifiedMarketExport { route: ShardKey },
+    #[error("qualified-market exports did not preserve deterministic shard partitioning")]
+    QualifiedMarketExportPartitionInvariant,
+    #[error("qualified-market export reservation exceeds the configured runtime memory ceiling")]
+    QualifiedMarketExportMemoryExceeded,
     #[error("snapshot publication plane did not match configured shards")]
     SnapshotPlaneInvariant,
     #[error("bounded cross-venue plane could not initialize")]

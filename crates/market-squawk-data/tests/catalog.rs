@@ -55,7 +55,7 @@ fn catalog_enforces_rights_and_recovers_the_complete_control_record() -> TestRes
     assert!(!health.trusted_schema());
     assert_eq!(health.synchronous(), 2);
     assert_eq!(health.busy_timeout(), Duration::from_millis(750));
-    assert_eq!(health.applied_migrations(), 9);
+    assert_eq!(health.applied_migrations(), 10);
     assert!(matches!(
         CatalogAuthority::open(config.clone()),
         Err(CatalogError::WriterAlreadyOpen)
@@ -74,7 +74,7 @@ fn catalog_enforces_rights_and_recovers_the_complete_control_record() -> TestRes
         CatalogAuthority::open(alias_config),
         Err(CatalogError::UnsafePath)
     ));
-    assert_eq!(catalog.health()?.applied_migrations(), 9);
+    assert_eq!(catalog.health()?.applied_migrations(), 10);
     drop(catalog);
     std::fs::remove_file(alias_location.path())?;
     let catalog = CatalogAuthority::open(config.clone())?;

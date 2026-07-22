@@ -45,6 +45,7 @@ pub(crate) struct ReplayState {
     pub(crate) cash: CurrencyAmounts,
     pub(crate) lots: Vec<Lot>,
     pub(crate) realized_gain: CurrencyAmounts,
+    pub(crate) realized_loss: CurrencyAmounts,
     pub(crate) income: CurrencyAmounts,
     pub(crate) withholding: CurrencyAmounts,
     pub(crate) fees: CurrencyAmounts,
@@ -94,7 +95,7 @@ impl ReplayState {
                 )?;
                 require_complete(disposal.basis_complete)?;
                 self.cash.add(proceeds)?;
-                self.realized_gain.add(
+                self.record_realized(
                     proceeds
                         .checked_sub(disposal.basis)
                         .map_err(|_| PortfolioError::Arithmetic)?,
@@ -128,7 +129,7 @@ impl ReplayState {
                 )?;
                 require_complete(disposal.basis_complete)?;
                 self.cash.subtract(cost)?;
-                self.realized_gain.add(
+                self.record_realized(
                     disposal
                         .basis
                         .checked_sub(cost)
@@ -282,7 +283,7 @@ impl ReplayState {
         }
         self.cash.add(total_distribution)?;
         self.return_of_capital.add(total_distribution)?;
-        self.realized_gain.add(total_excess)?;
+        self.record_realized(total_excess)?;
         Ok(())
     }
 
@@ -405,7 +406,7 @@ impl ReplayState {
                     .checked_sub(proceeds)
                     .map_err(|_| PortfolioError::Arithmetic)?,
             };
-            self.realized_gain.add(gain)?;
+            self.record_realized(gain)?;
         }
         self.lots.retain(|lot| lot.instrument_id != subject);
         Ok(())
@@ -422,6 +423,16 @@ impl ReplayState {
                 };
                 checked_decimal_add(total, quantity)
             })
+    }
+
+    fn record_realized(&mut self, gain: Money) -> Result<(), PortfolioError> {
+        if gain.amount().is_sign_negative() {
+            let loss = Decimal::ZERO
+                .checked_sub(gain.amount())
+                .ok_or(PortfolioError::Arithmetic)?;
+            self.realized_loss.add(Money::new(loss, gain.currency()))?;
+        }
+        self.realized_gain.add(gain)
     }
 }
 

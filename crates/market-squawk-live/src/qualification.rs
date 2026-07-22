@@ -6,17 +6,18 @@
 )]
 
 use market_squawk_domain::{
-    AssessmentValidity, BindingError, BookIntegrity, BookStateBinding, BoundAssessment,
+    AssessmentValidity, BindingError, BookIntegrity, BookLevel, BookStateBinding, BoundAssessment,
     CanonicalStateDigest, CanonicalizationRule, CaptureIntegrityState, ChecksumCapability,
     ChecksumEvidence, ClassificationError, CoverageError, CoverageScope, CoverageStatus,
-    DigestAlgorithm, EvidenceDigest, InitializedSnapshot, IntegrityAssessmentSet,
-    IntegrityCapabilities, LiveEvidenceBinding, LiveProvenance, LiveTimingAssessment,
-    LiveTimingPolicy, MarketAssessmentSet, MarketEvent, MarketEventError, MarketEventTiming,
-    PayloadHash, PayloadReference, PrecisionIntegrity, ProvenanceError, QualificationAssessment,
-    QualificationAssessmentId, QualificationAssessmentInput, QualificationError,
-    RecordedLiveProvenanceInput, RuleVersion, SequenceCapability, SequenceEvidence,
-    SnapshotEvidence, SourceAuthorization, SourceCoverageRecord, SourceIdentifier,
-    SourcePolicyAssessment, StreamIntegrityState, Timestamp, TradingStatus,
+    DataQuality, DigestAlgorithm, EvidenceDigest, InitializedSnapshot, InstrumentExecutionTerms,
+    InstrumentId, IntegrityAssessmentSet, IntegrityCapabilities, LiveEvidenceBinding,
+    LiveProvenance, LiveTimingAssessment, LiveTimingPolicy, MarketAssessmentSet, MarketEvent,
+    MarketEventError, MarketEventTiming, PayloadHash, PayloadReference, PrecisionIntegrity,
+    PriceTicks, ProvenanceError, QualificationAssessment, QualificationAssessmentId,
+    QualificationAssessmentInput, QualificationError, QuantityLots, RecordedLiveProvenanceInput,
+    RuleVersion, SequenceCapability, SequenceEvidence, SnapshotEvidence, SourceAuthorization,
+    SourceCoverageRecord, SourceId, SourceIdentifier, SourcePolicyAssessment, StreamIntegrityState,
+    Timestamp, TradingStatus, VenueId,
 };
 use market_squawk_sources::{
     AuthorizationHealth, ChecksumValidationProfile, CoverageHealth, CurrentProviderObservation,
@@ -54,6 +55,211 @@ pub(crate) struct QualifiedEvent {
     pub(crate) assessment: QualificationAssessment,
     pub(crate) binding_digest: [u8; 32],
     pub(crate) valid_until: Timestamp,
+}
+
+/// Exact price terms carried by a committed, directly verified trade or quote.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QualifiedMarketPrice {
+    /// Executed venue trade.
+    Trade {
+        /// Exact instrument tick count.
+        price: PriceTicks,
+        /// Exact instrument lot count.
+        quantity: QuantityLots,
+    },
+    /// One- or two-sided venue quote.
+    Quote {
+        /// Best bid retained by the committed event.
+        bid: Option<BookLevel>,
+        /// Best ask retained by the committed event.
+        ask: Option<BookLevel>,
+    },
+}
+
+/// Non-forgeable owned export of one post-commit, directly verified market observation.
+///
+/// The export moves the live event and its qualification assessment into a bounded, separately
+/// budgeted channel only after synchronous action processing. It therefore introduces no String
+/// clone or persistence work into the event-to-action path. This type deliberately has no public
+/// constructor, deserializer, or clone implementation.
+#[derive(Debug, Eq, PartialEq)]
+pub struct CommittedQualifiedMarketObservation {
+    event: MarketEvent,
+    assessment: QualificationAssessment,
+    binding_digest: [u8; 32],
+    committed_state_revision: u64,
+    execution_terms: InstrumentExecutionTerms,
+    price: QualifiedMarketPrice,
+}
+
+impl CommittedQualifiedMarketObservation {
+    pub(crate) fn from_committed(
+        event: MarketEvent,
+        assessment: QualificationAssessment,
+        binding_digest: [u8; 32],
+        committed_state_revision: u64,
+        execution_terms: InstrumentExecutionTerms,
+    ) -> Option<Self> {
+        if assessment.recorded_quality() != DataQuality::DirectVerified {
+            return None;
+        }
+        let price = match &event {
+            MarketEvent::Trade(value) => QualifiedMarketPrice::Trade {
+                price: value.price(),
+                quantity: value.quantity(),
+            },
+            MarketEvent::Quote(value) => QualifiedMarketPrice::Quote {
+                bid: value.bid(),
+                ask: value.ask(),
+            },
+            MarketEvent::BookSnapshot(_)
+            | MarketEvent::BookDelta(_)
+            | MarketEvent::Auction(_)
+            | MarketEvent::TradingHalt(_)
+            | MarketEvent::InstrumentStatus(_)
+            | MarketEvent::CorporateAction(_) => return None,
+        };
+        let provenance = event_provenance(&event);
+        let binding = assessment.binding();
+        if provenance.binding() != binding
+            || execution_terms.instrument_id() != binding.instrument_id()
+        {
+            return None;
+        }
+        Some(Self {
+            event,
+            assessment,
+            binding_digest,
+            committed_state_revision,
+            execution_terms,
+            price,
+        })
+    }
+
+    /// Returns the source identity bound by the qualified observation.
+    pub const fn source_id(&self) -> &SourceId {
+        self.assessment.binding().source_id()
+    }
+
+    /// Returns the venue identity bound by the qualified observation.
+    pub const fn venue_id(&self) -> &VenueId {
+        self.assessment.binding().venue_id()
+    }
+
+    /// Returns the stable instrument identity.
+    pub const fn instrument_id(&self) -> InstrumentId {
+        self.assessment.binding().instrument_id()
+    }
+
+    /// Returns the source-native observation identity.
+    pub const fn source_identifier(&self) -> &SourceIdentifier {
+        self.assessment.binding().source_identifier()
+    }
+
+    /// Returns the provider event timestamp when the provider supplied one.
+    pub fn source_timestamp(&self) -> Option<Timestamp> {
+        event_provenance(&self.event).source_timestamp()
+    }
+
+    /// Returns the trusted local receive time.
+    pub fn received_at(&self) -> Timestamp {
+        event_provenance(&self.event).received_at()
+    }
+
+    /// Returns when the observation became available locally.
+    pub fn available_at(&self) -> Timestamp {
+        event_provenance(&self.event).available_at()
+    }
+
+    /// Returns when the canonical observation was ingested.
+    pub fn ingested_at(&self) -> Timestamp {
+        event_provenance(&self.event).ingested_at()
+    }
+
+    /// Returns the recorded live quality; receipts are minted only for `DirectVerified` data.
+    pub const fn recorded_quality(&self) -> DataQuality {
+        self.assessment.recorded_quality()
+    }
+
+    /// Returns the exact source-payload digest.
+    pub const fn payload_digest(&self) -> EvidenceDigest {
+        self.assessment.binding().payload_digest()
+    }
+
+    /// Returns the exact canonical state commitment.
+    pub const fn canonical_state_digest(&self) -> &CanonicalStateDigest {
+        self.assessment.binding().canonical_state_digest()
+    }
+
+    /// Returns the qualification assessment identity.
+    pub const fn assessment_id(&self) -> &QualificationAssessmentId {
+        self.assessment.assessment_id()
+    }
+
+    /// Returns when the complete qualification was evaluated.
+    pub const fn qualification_evaluated_at(&self) -> Timestamp {
+        self.assessment.evaluated_at()
+    }
+
+    /// Returns the inclusive qualification expiry.
+    pub const fn qualification_valid_until(&self) -> Timestamp {
+        self.assessment.valid_until()
+    }
+
+    /// Returns the source authorization result retained in the qualification.
+    pub const fn source_authorization(&self) -> SourceAuthorization {
+        self.assessment
+            .source_policy()
+            .result()
+            .source_authorization()
+    }
+
+    /// Returns the source coverage result retained in the qualification.
+    pub fn coverage_status(&self) -> CoverageStatus {
+        self.assessment
+            .market()
+            .coverage()
+            .result()
+            .status_at(self.assessment.evaluated_at())
+    }
+
+    /// Returns the committed trading status.
+    pub const fn trading_status(&self) -> TradingStatus {
+        *self.assessment.market().trading_status().result()
+    }
+
+    /// Returns the complete live binding digest.
+    pub const fn binding_digest(&self) -> [u8; 32] {
+        self.binding_digest
+    }
+
+    /// Returns the instrument-owned state revision published by the commit.
+    pub const fn committed_state_revision(&self) -> u64 {
+        self.committed_state_revision
+    }
+
+    /// Returns the exact revision-bound execution terms used to normalize the price.
+    pub const fn execution_terms(&self) -> InstrumentExecutionTerms {
+        self.execution_terms
+    }
+
+    /// Returns the exact trade or quote terms retained by the committed event.
+    pub const fn price(&self) -> QualifiedMarketPrice {
+        self.price
+    }
+}
+
+fn event_provenance(event: &MarketEvent) -> &LiveProvenance {
+    match event {
+        MarketEvent::Trade(value) => value.provenance(),
+        MarketEvent::Quote(value) => value.provenance(),
+        MarketEvent::BookSnapshot(value) => value.provenance(),
+        MarketEvent::BookDelta(value) => value.provenance(),
+        MarketEvent::Auction(value) => value.provenance(),
+        MarketEvent::TradingHalt(value) => value.provenance(),
+        MarketEvent::InstrumentStatus(value) => value.provenance(),
+        MarketEvent::CorporateAction(value) => value.provenance(),
+    }
 }
 
 pub(crate) fn build_qualified_event<F>(

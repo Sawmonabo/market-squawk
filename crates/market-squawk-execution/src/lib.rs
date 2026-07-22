@@ -9,6 +9,7 @@ mod dispatcher;
 mod intent;
 mod limits;
 mod live_hook;
+mod portfolio;
 mod risk;
 mod strategy;
 mod task_reaper;
@@ -53,6 +54,10 @@ pub use limits::{
     AccountRiskViolation, MAX_RISK_INSTRUMENTS, RiskLimits, RiskLimitsError, RiskLimitsInput,
 };
 pub use live_hook::{ExecutionLiveActionHook, ExecutionLiveActionHookError};
+pub use portfolio::{
+    PortfolioReadCapability, PortfolioReadError, PortfolioReadLimits, PortfolioRiskBinding,
+    PortfolioServicePublisher, portfolio_execution_state,
+};
 pub use risk::{
     MarketRiskInput, MarketRiskInputError, PreAuthorityRiskOutcome, RiskOutcome, RiskRejection,
     RiskRejectionCode, RiskService, RiskServiceConfig, RiskServiceError,

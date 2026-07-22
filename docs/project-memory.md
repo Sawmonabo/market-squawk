@@ -369,16 +369,58 @@ portfolio core consumes adapter-produced, source-neutral economic evidence rathe
 financial scalars; publishes immutable revisions; performs checked long/short lot accounting,
 income, cash flow, performance, exposure, attribution, risk, scenarios, and proposal-only
 rebalancing; preserves authoritative cumulative corporate-action snapshots; and represents
-unresolved basis as incomplete rather than exact zero. Task 16 remains open until Step 6 binds and
-rechecks the current portfolio revision through risk approval and one-time dispatch.
+unresolved basis as incomplete rather than exact zero.
+
+Task 16 Step 6 is accepted and fast-forwarded into the release branch at exact head `7621552`.
+Execution owns the portfolio capability and loads a complete immutable risk projection under the
+account partition lock immediately before assessment/reservation. Risk derives its financial state
+from that projection, binds the exact revision, content digest, and monotonic publication generation
+into each approval, and rechecks the binding before the one permitted adapter call. Publication is
+serialized and rejects rollback, stale/revoked identities, resurrection, and competing successors.
+The real queued-dispatch regression proves that a revision change after approval rejects the order,
+does not call the adapter, and releases its reservation. Targeted tests, strict Clippy, formatting,
+boundaries, and diff hygiene passed; independent exact-head re-review reported no remaining Critical
+or Important finding.
+
+The Task 16 release checkpoint was pushed and recorded on PR `#26`; issue `#21` was closed and its
+Project 5 item set to `Done`. The completed generated target was cleaned, the clean worktree and
+merged local feature branch were removed, no matching origin branch remained, and Git worktree and
+remote metadata were pruned. The active Python feature lane is intentionally retained until its
+review blockers are corrected, re-reviewed, integrated, and closed out through the same invariant.
 
 After the accepted release state and GitHub evidence were pushed, both completed feature targets
 were cleaned (6.9 GiB total), both clean worktrees were removed, both merged local/origin feature
 branches were deleted, and worktree/remote metadata was pruned. Only the release worktree remains.
 
-The next safe parallel wave is Task 14's Python financial analytics/training product and Task 16
-Step 6's execution-owned portfolio binding. Task 15 ONNX integration begins only against the frozen
-Task 13 contract and must not weaken controlled-root, exact-identity, bounded-runtime, or no-action
-semantics. Issue `#31` remains the mandatory zero-fee provider onboarding portal: it may automate
+Task 14's Python financial analytics/training product and its review remediation are implemented on
+the feature lane but are not yet accepted. Fair value now owns authoritative migration `0010`; the
+Python lane must merge the release branch, renumber dataset admission to `0011`, reconcile the
+combined schema trigger, lockfile, and wheelhouse source closure, run one offline CPython 3.12/3.13
+matrix, freeze the exact commit, and pass remediation rereview before integration.
+Task 15 ONNX integration begins only against the frozen Task 13 contract and must not weaken
+controlled-root, exact-identity, bounded-runtime, or no-action semantics. Issue `#31` remains the
+mandatory zero-fee provider onboarding portal: it may automate
 official provider enrollment and key setup, while preserving and resuming any provider-required
 human consent or verification step.
+
+## 2026-07-22 Task 18 fair-value closeout
+
+Task 18 is accepted at exact feature head `31de1a5`, merged into the release branch at `051ee3c`,
+and lock-reconciled at `5c34b7d`. It delivers durable ASC 820/IFRS 13 measurement, evidence,
+classification, override, approval, revocation, market-access, audit, recovery, and bounded service
+authority. Live evidence crosses a count-and-byte-bounded post-action export rather than the hot
+path; research, feature, and portfolio evidence retain their independent producer authority.
+
+Level 1 requires the complete code-owned conjunction for identical unadjusted quoted evidence in
+an active, accessible market at the measurement cutoff. Historical activity binds source, receive,
+availability, qualification-evaluation, and qualification-validity times. Level 2 and Level 3 do
+not become execution quality, and neither Level 1 nor an `Unclassified` decision can be created by
+override. Catalog writes use one coherent transactional snapshot, stale-writer comparison,
+canonical identities, semantic recovery, audit-chain triggers, and global record/result bounds.
+
+The accepted implementation retained one consolidated fair-value integration executable. Focused
+locked valuation, live-export, catalog/query, strict Clippy, formatting, and diff gates passed on
+the merged release tree. Independent review found two material PIT/override defects; the exact-head
+remediation rereview found no remaining Critical or Important blocker. Closeout requires pushing
+the documentation commit, marking issue `#23` and its Project 5 item Done, then cleaning the 2.9 GiB
+feature target, worktree, and merged local/remote branch.

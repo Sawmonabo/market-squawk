@@ -30,8 +30,8 @@ use market_squawk_execution::{
     ExecutionAuditWriter, ExecutionDispatcher, ExecutionDispatcherConfig, ExecutionDispatcherError,
     ExecutionDispatcherQuiesce, ExecutionDispatcherShutdown, ExecutionLiveActionHook,
     ExecutionLiveActionHookError, ExecutionMarketSink, ExecutionTaskDrain, ExecutionTaskReaper,
-    ExecutionTaskReaperError, ReconciledOrderStatus, RecoveredDispatchOrder, RiskLimits,
-    RiskService, RiskServiceConfig, RiskServiceError, Strategy,
+    ExecutionTaskReaperError, PortfolioReadCapability, ReconciledOrderStatus,
+    RecoveredDispatchOrder, RiskLimits, RiskService, RiskServiceConfig, RiskServiceError, Strategy,
 };
 use market_squawk_live::{
     ActionAuthorityIssueLimit, LiveRouteConfig, LiveRuntimeConfig, LiveSnapshotReader,
@@ -53,15 +53,18 @@ struct ProductionPaperRecovery {
     quarantined: bool,
 }
 
-#[cfg(test)]
-pub(crate) use defaults::local_kraken_paper_bot_with_strategy_for_test;
 pub use defaults::{local_coinbase_paper_bot, local_paper_bot};
+#[cfg(test)]
+pub(crate) use defaults::{
+    local_kraken_paper_bot_with_strategy_for_test, local_paper_portfolio_capability_for_test,
+};
 
 /// Frozen bounded account, risk, dispatch, and paper-worker inputs for one production run.
 #[derive(Debug)]
 pub struct ProductionPaperBotExecutionConfig {
     pub account_coordinator: AccountCoordinatorConfig,
     pub accounts: Vec<AccountBootstrap>,
+    pub portfolio: PortfolioReadCapability,
     pub risk_limits: RiskLimits,
     pub risk_service: RiskServiceConfig,
     pub execution_audit: ExecutionAuditConfig,
@@ -547,6 +550,7 @@ impl ProductionPaperBotComposition {
         for route in strategies {
             let risk = match RiskService::try_new(
                 Arc::clone(&accounts),
+                execution.portfolio.clone(),
                 execution.risk_limits.clone(),
                 execution_audit.clone(),
                 execution.risk_service,
