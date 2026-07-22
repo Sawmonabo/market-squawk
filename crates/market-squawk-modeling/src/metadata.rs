@@ -241,6 +241,7 @@ pub struct BundleExpectations {
     training_period: TrainingPeriod,
     label: FeatureLabelComponentSpec,
     training_code_revision: Box<str>,
+    training_run_hash: Sha256Digest,
 }
 
 impl BundleExpectations {
@@ -262,9 +263,13 @@ impl BundleExpectations {
         training_period: TrainingPeriod,
         label: FeatureLabelComponentSpec,
         training_code_revision: impl AsRef<str>,
+        training_run_hash: Sha256Digest,
     ) -> Result<Self, ModelMetadataError> {
         let training_code_revision = training_code_revision.as_ref();
-        if label.kind() != ComponentKind::Label || !valid_revision(training_code_revision) {
+        if label.kind() != ComponentKind::Label
+            || !valid_revision(training_code_revision)
+            || training_run_hash.bytes() == [0; 32]
+        {
             return Err(ModelMetadataError::InvalidExpectations);
         }
         Ok(Self {
@@ -276,6 +281,7 @@ impl BundleExpectations {
             training_period,
             label,
             training_code_revision: training_code_revision.into(),
+            training_run_hash,
         })
     }
 
@@ -325,6 +331,12 @@ impl BundleExpectations {
     #[must_use]
     pub fn training_code_revision(&self) -> &str {
         &self.training_code_revision
+    }
+
+    /// Returns the independently approved exact training-run provenance identity.
+    #[must_use]
+    pub const fn training_run_hash(&self) -> Sha256Digest {
+        self.training_run_hash
     }
 }
 
@@ -410,6 +422,7 @@ pub struct ModelMetadata {
     bundle_version: NonZeroU64,
     metadata_hash: Sha256Digest,
     artifact_hash: Sha256Digest,
+    training_run_hash: Sha256Digest,
     format: ModelFormat,
     format_version: u32,
     features: Box<[ModelFeatureBinding]>,
@@ -455,6 +468,7 @@ impl ModelMetadata {
             bundle_version: expectations.bundle_version,
             metadata_hash,
             artifact_hash,
+            training_run_hash: expectations.training_run_hash,
             format,
             format_version,
             features: features.into_boxed_slice(),
@@ -504,6 +518,12 @@ impl ModelMetadata {
     #[must_use]
     pub const fn artifact_hash(&self) -> Sha256Digest {
         self.artifact_hash
+    }
+
+    /// Returns the exact admitted training-run provenance identity.
+    #[must_use]
+    pub const fn training_run_hash(&self) -> Sha256Digest {
+        self.training_run_hash
     }
 
     /// Returns the closed native format.

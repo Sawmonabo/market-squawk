@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal
 import hashlib
 import json
 import math
@@ -10,8 +11,10 @@ from pathlib import Path
 import random
 import re
 from typing import Any, Mapping, Sequence
+from uuid import UUID
 
-from .bundle import BundleCandidate, BundleReceipt
+from .bundle import BundleAuthorityRef, BundleCandidate, BundleReceipt
+from .data import ComponentIdentity, DatasetResult
 
 
 MAX_TRAINING_ROWS = 100_000
@@ -36,12 +39,41 @@ class _FittedModel:
 
 
 @dataclass(frozen=True)
+class TrainingProposal:
+    """Deterministic candidate awaiting independent operator/catalog authorization."""
+
+    candidate: BundleCandidate
+    authority_request: Mapping[str, Any]
+
+    @property
+    def authority_bytes(self) -> bytes:
+        return _canonical(self.authority_request)
+
+    @property
+    def authority_sha256(self) -> str:
+        return hashlib.sha256(self.authority_bytes).hexdigest()
+
+    @property
+    def training_run_sha256(self) -> str:
+        return self.candidate.training_run_sha256
+
+    def export(
+        self,
+        output_root: Path | str,
+        authority: BundleAuthorityRef,
+        *,
+        validator: Path | str | None = None,
+    ) -> BundleReceipt:
+        if authority.sha256 != self.authority_sha256:
+            raise TrainingValidationError("operator authority does not match this proposal")
+        return self.candidate.write(output_root, authority, validator=validator)
+
+
+@dataclass(frozen=True)
 class TrainingRun:
-    dataset: Mapping[str, Any]
+    dataset: DatasetResult
     features: Sequence[Mapping[str, Any]]
-    label: Mapping[str, Any]
-    universe_id: str
-    split_sha256: str
+    label: ComponentIdentity | Mapping[str, Any]
     seed: int
     missing_policy: str
     training_code_revision: str
@@ -49,25 +81,13 @@ class TrainingRun:
     model_id: str
     bundle_id: str
     bundle_version: int
-    training_start_unix_nanos: int
-    training_end_unix_nanos: int
 
-    def fit_evaluate_export(
-        self,
-        feature_rows: Sequence[Sequence[float | None]],
-        labels: Sequence[float | None],
-        splits: Sequence[str],
-        output_root: Path | str,
-        *,
-        model_kind: str,
-        validator: Path | str | None = None,
-    ) -> BundleReceipt:
+    def fit_evaluate(self, *, model_kind: str) -> TrainingProposal:
         config = self._validated_config(model_kind)
-        rows, targets, admitted_splits = _admit_rows(
-            feature_rows,
-            labels,
-            splits,
-            len(config["features"]),
+        rows, targets, admitted_splits, split_sha256, split_counts, period = _dataset_matrix(
+            self.dataset,
+            config["features"],
+            config["label"],
             self.missing_policy,
         )
         train = [index for index, split in enumerate(admitted_splits) if split == "train"]
@@ -76,25 +96,31 @@ class TrainingRun:
             raise TrainingValidationError("training and validation boundaries are insufficient")
         fitted = _fit(model_kind, rows, targets, train, validation, self.seed)
         trial = {
-            "schema_version": 1,
+            "bundle_id": self.bundle_id,
+            "bundle_version": self.bundle_version,
             "dataset": dict(config["dataset"]),
+            "dataset_export_sha256": self.dataset.export_sha256,
+            "environment_sha256": self.environment_sha256,
             "features": list(config["features"]),
             "label": dict(config["label"]),
-            "universe_id": self.universe_id,
-            "split_sha256": self.split_sha256,
-            "seed": self.seed,
             "missing_policy": self.missing_policy,
+            "model_id": self.model_id,
+            "model_kind": f"native_{model_kind}",
+            "seed": self.seed,
+            "split_counts": split_counts,
+            "split_sha256": split_sha256,
             "training_code_revision": self.training_code_revision,
-            "environment_sha256": self.environment_sha256,
-            "model_kind": model_kind,
-            "train_rows": len(train),
-            "validation_rows": len(validation),
-            "test_rows": sum(split == "test" for split in admitted_splits),
+            "training_period": period,
+            "universe_id": self.dataset.universe_id,
         }
         trial_sha256 = hashlib.sha256(_canonical(trial)).hexdigest()
-        run_record = dict(trial)
-        run_record["trial_sha256"] = trial_sha256
-        run_record["validation_metrics"] = {fitted.metric_name: fitted.metric_value}
+        metrics = [{"name": fitted.metric_name, "value": fitted.metric_value}]
+        run_record = {
+            "schema_version": 1,
+            "trial": trial,
+            "trial_sha256": trial_sha256,
+            "validation_metrics": metrics,
+        }
         artifact = {
             "schema_version": 1,
             "format": f"native_{model_kind}",
@@ -121,7 +147,7 @@ class TrainingRun:
             else {"negative_max": -0.5, "positive_min": 0.5, "minimum_confidence": 0.0}
         )
         metadata = {
-            "schema_version": 1,
+            "schema_version": 2,
             "bundle_id": self.bundle_id,
             "bundle_version": self.bundle_version,
             "model_id": self.model_id,
@@ -132,36 +158,37 @@ class TrainingRun:
                 "format": f"native_{model_kind}",
                 "format_version": 1,
             },
+            "training_run": {
+                "path": "training-run.json",
+                "sha256": "0" * 64,
+                "size_bytes": 1,
+            },
             "features": feature_metadata,
             "training_dataset": dict(config["dataset"]),
-            "training_universe_id": self.universe_id,
-            "training_period": {
-                "start_unix_nanos": self.training_start_unix_nanos,
-                "end_unix_nanos": self.training_end_unix_nanos,
-            },
+            "training_universe_id": self.dataset.universe_id,
+            "training_period": period,
             "label": dict(config["label"]),
             "training_code_revision": self.training_code_revision,
-            "validation_metrics": [{"name": fitted.metric_name, "value": fitted.metric_value}],
+            "validation_metrics": metrics,
             "decision_thresholds": thresholds,
             "intended_use": "bounded local research trained from one exact point-in-time generation",
             "limitations": ["candidate requires independent Rust admission before production use"],
             "fallback": {"policy": "no_action", "reason": "model contract unavailable"},
         }
-        expectations = {
-            "schema_version": 1,
+        candidate = BundleCandidate(metadata, artifact, run_record)
+        authority = {
+            "schema_version": 2,
             "model_id": self.model_id,
             "bundle_id": self.bundle_id,
             "bundle_version": self.bundle_version,
             "dataset": dict(config["dataset"]),
-            "universe_id": self.universe_id,
-            "training_period": dict(metadata["training_period"]),
+            "universe_id": self.dataset.universe_id,
+            "training_period": period,
             "label": dict(config["label"]),
             "training_code_revision": self.training_code_revision,
+            "training_run_sha256": candidate.training_run_sha256,
         }
-        return BundleCandidate(metadata, artifact, expectations, run_record).write(
-            output_root,
-            validator=validator,
-        )
+        return TrainingProposal(candidate, authority)
 
     def _validated_config(self, model_kind: str) -> dict[str, Any]:
         if model_kind not in {"linear", "logistic"}:
@@ -170,43 +197,21 @@ class TrainingRun:
             raise TrainingValidationError("training seed is invalid")
         if self.missing_policy not in {"reject", "drop_row"}:
             raise TrainingValidationError("missing-value policy is unsupported")
-        if not self.training_start_unix_nanos < self.training_end_unix_nanos:
-            raise TrainingValidationError("training period is invalid")
-        for value in (self.split_sha256, self.environment_sha256):
-            _hex(value)
-        for value in (self.universe_id, self.training_code_revision, self.bundle_id):
+        _hex(self.environment_sha256)
+        for value in (self.training_code_revision, self.bundle_id):
             _identifier(value)
         if not isinstance(self.bundle_version, int) or self.bundle_version <= 0:
             raise TrainingValidationError("bundle version is invalid")
-        if not isinstance(self.model_id, str) or len(self.model_id) != 36:
+        try:
+            parsed_model_id = UUID(self.model_id) if isinstance(self.model_id, str) else None
+        except (ValueError, AttributeError) as error:
+            raise TrainingValidationError("model identity is invalid") from error
+        if parsed_model_id is None or str(parsed_model_id) != self.model_id:
             raise TrainingValidationError("model identity is invalid")
-        dataset_keys = {
-            "dataset_id",
-            "manifest_version",
-            "schema_name",
-            "schema_version",
-            "schema_sha256",
-            "manifest_sha256",
-            "build_spec_sha256",
-            "universe_sha256",
-            "policy_sha256",
-        }
-        dataset = dict(self.dataset)
-        if set(dataset) != dataset_keys:
-            raise TrainingValidationError("training dataset identity is incomplete")
-        _identifier(dataset["dataset_id"])
-        _identifier(dataset["schema_name"])
-        for name in (
-            "schema_sha256",
-            "manifest_sha256",
-            "build_spec_sha256",
-            "universe_sha256",
-            "policy_sha256",
-        ):
-            _hex(dataset[name])
-        if any(not isinstance(dataset[name], int) or dataset[name] <= 0 for name in ("manifest_version", "schema_version")):
-            raise TrainingValidationError("training dataset version is invalid")
-        label = dict(self.label)
+        if not isinstance(self.dataset, DatasetResult) or not self.dataset.complete:
+            raise TrainingValidationError("training requires one complete admitted Task 11 export")
+        dataset = dict(self.dataset.identity.bundle_mapping())
+        label = dict(self.label.mapping() if isinstance(self.label, ComponentIdentity) else self.label)
         if set(label) != {"kind", "scope", "corporate_action_sensitivity", "name", "version"}:
             raise TrainingValidationError("label identity is incomplete")
         if label["kind"] != "label" or label["scope"] not in {"instrument", "account", "global"}:
@@ -216,11 +221,12 @@ class TrainingRun:
         _identifier(label["name"])
         if not isinstance(label["version"], int) or label["version"] <= 0:
             raise TrainingValidationError("label version is invalid")
-        features = [dict(feature) for feature in self.features]
-        if not features or len(features) > MAX_FEATURES:
+        if not self.features or len(self.features) > MAX_FEATURES:
             raise TrainingValidationError("feature count is invalid")
+        features = []
         identities: set[tuple[str, int]] = set()
-        for feature in features:
+        for supplied in self.features:
+            feature = dict(supplied)
             if set(feature) != {"name", "version", "input_schema_sha256", "semantic_sha256"}:
                 raise TrainingValidationError("feature identity is incomplete")
             _identifier(feature["name"])
@@ -230,41 +236,115 @@ class TrainingRun:
             if not isinstance(feature["version"], int) or feature["version"] <= 0 or identity in identities:
                 raise TrainingValidationError("feature identity is invalid or duplicated")
             identities.add(identity)
+            features.append(feature)
+        dataset_components = {
+            (component.kind, component.name, component.version): component
+            for component in self.dataset.components
+        }
+        if ("label", label["name"], label["version"]) not in dataset_components:
+            raise TrainingValidationError("label is absent from the Task 11 component contract")
+        admitted_label = dataset_components[("label", label["name"], label["version"])]
+        if dict(admitted_label.mapping()) != label:
+            raise TrainingValidationError("label differs from the Task 11 component contract")
+        if any(("feature", feature["name"], feature["version"]) not in dataset_components for feature in features):
+            raise TrainingValidationError("feature is absent from the Task 11 component contract")
         return {"dataset": dataset, "label": label, "features": features}
 
 
-def _admit_rows(
-    feature_rows: Sequence[Sequence[float | None]],
-    labels: Sequence[float | None],
-    splits: Sequence[str],
-    feature_count: int,
+def _dataset_matrix(
+    dataset: DatasetResult,
+    features: Sequence[Mapping[str, Any]],
+    label: Mapping[str, Any],
     missing_policy: str,
-) -> tuple[list[list[float]], list[float], list[str]]:
-    if not feature_rows or len(feature_rows) > MAX_TRAINING_ROWS:
+) -> tuple[list[list[float]], list[float], list[str], str, Mapping[str, int], Mapping[str, int]]:
+    if not dataset.rows:
         raise TrainingValidationError("training row count is invalid")
-    if len(labels) != len(feature_rows) or len(splits) != len(feature_rows):
-        raise TrainingValidationError("training columns have different lengths")
-    if len(feature_rows) * feature_count > MAX_CELLS:
+    component_count = len(dataset.components)
+    if len(dataset.rows) % component_count:
+        raise TrainingValidationError("training component rows are incomplete")
+    example_count = len(dataset.rows) // component_count
+    if example_count > MAX_TRAINING_ROWS or example_count * len(features) > MAX_CELLS:
         raise TrainingValidationError("training matrix exceeds its retained-cell bound")
     rows: list[list[float]] = []
     targets: list[float] = []
     admitted: list[str] = []
-    for row, target, split in zip(feature_rows, labels, splits, strict=True):
-        if len(row) != feature_count or split not in {"train", "validation", "test"}:
-            raise TrainingValidationError("training row shape or split is invalid")
-        missing = target is None or any(value is None for value in row)
+    evidence: list[Mapping[str, Any]] = []
+    feature_keys = [("feature", item["name"], item["version"]) for item in features]
+    label_key = ("label", label["name"], label["version"])
+    for offset in range(0, len(dataset.rows), component_count):
+        group = dataset.rows[offset : offset + component_count]
+        values = {
+            (row["component_kind"], row["component_name"], row["component_version"]): _numeric(row)
+            for row in group
+        }
+        feature_row = [values[key] for key in feature_keys]
+        target = values[label_key]
+        split = group[0]["split"]
+        missing = target is None or any(value is None for value in feature_row)
         if missing and missing_policy == "reject":
             raise TrainingValidationError("missing training value was rejected")
         if missing:
             continue
-        numeric = [float(value) for value in row if value is not None]
+        numeric = [float(value) for value in feature_row if value is not None]
         numeric_target = float(target) if target is not None else math.nan
         if any(not math.isfinite(value) for value in numeric) or not math.isfinite(numeric_target):
             raise TrainingValidationError("training values must be finite")
         rows.append(numeric)
         targets.append(numeric_target)
         admitted.append(split)
-    return rows, targets, admitted
+        evidence.append(
+            {
+                "components": [
+                    {
+                        "kind": row["component_kind"],
+                        "lineage_sha256": row["lineage_sha256"].hex(),
+                        "name": row["component_name"],
+                        "version": row["component_version"],
+                    }
+                    for row in group
+                ],
+                "cutoff_unix_nanos": group[0]["cutoff_at"].unix_nanos,
+                "example_id": group[0]["example_id"],
+                "instrument_id": group[0]["instrument_id"],
+                "split": split,
+            }
+        )
+    if not rows:
+        raise TrainingValidationError("missing policy removed every training row")
+    split_sha256 = hashlib.sha256(
+        _canonical(
+            {
+                "dataset_export_sha256": dataset.export_sha256,
+                "examples": evidence,
+                "schema_version": 1,
+            }
+        )
+    ).hexdigest()
+    counts = {name: admitted.count(name) for name in ("train", "validation", "test")}
+    training_cutoffs = [
+        evidence[index]["cutoff_unix_nanos"]
+        for index, split in enumerate(admitted)
+        if split == "train"
+    ]
+    if not training_cutoffs or max(training_cutoffs) >= 2**63 - 1:
+        raise TrainingValidationError("training period cannot be represented exactly")
+    period = {
+        "start_unix_nanos": min(training_cutoffs),
+        "end_unix_nanos": max(training_cutoffs) + 1,
+    }
+    return rows, targets, admitted, split_sha256, counts, period
+
+
+def _numeric(row: Mapping[str, Any]) -> float | None:
+    if row["value_f64"] is not None:
+        return float(row["value_f64"])
+    if row["value_decimal_mantissa"] is not None:
+        value = Decimal(row["value_decimal_mantissa"]).scaleb(-row["value_decimal_scale"])
+        converted = float(value)
+        if not math.isfinite(converted):
+            raise TrainingValidationError("decimal training value exceeds the finite ML domain")
+        return converted
+    return None
 
 
 def _fit(

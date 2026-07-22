@@ -55,6 +55,10 @@ impl Fixture {
     fn artifact_path(&self) -> PathBuf {
         self.temporary.path().join("artifact.json")
     }
+
+    fn training_run_path(&self) -> PathBuf {
+        self.temporary.path().join("training-run.json")
+    }
 }
 
 #[test]
@@ -175,7 +179,7 @@ fn bundle_admission_fails_closed_across_complete_relationships() -> TestResult {
     )?;
     assert_fixture_error(
         valid_fixture("native_linear", 1, 1, |metadata, _| {
-            metadata["schema_version"] = json!(2);
+            metadata["schema_version"] = json!(3);
         })?,
         BundleError::UnsupportedMetadataVersion,
     )?;
@@ -325,6 +329,16 @@ fn bundle_hashes_and_resource_bounds_are_checked_before_use() -> TestResult {
     let fixture = valid_fixture("native_linear", 1, 1, |_, _| {})?;
     fs::write(fixture.artifact_path(), vec![b' '; MAX_ARTIFACT_BYTES + 1])?;
     assert_fixture_error(fixture, BundleError::ArtifactTooLarge)?;
+
+    let fixture = valid_fixture("native_linear", 1, 1, |_, _| {})?;
+    let mut bytes = fs::read(fixture.training_run_path())?;
+    let byte = bytes
+        .iter_mut()
+        .find(|byte| **byte == b'7')
+        .ok_or_else(|| std::io::Error::other("training run had no mutable numeric byte"))?;
+    *byte = b'8';
+    fs::write(fixture.training_run_path(), bytes)?;
+    assert_fixture_error(fixture, BundleError::TrainingRunHashMismatch)?;
     Ok(())
 }
 
@@ -406,6 +420,7 @@ fn valid_fixture_with_identity(
         period,
         label,
         "train-code-abc123",
+        Sha256Digest::new([2; 32]),
     )?;
 
     let feature_json = feature_keys
@@ -463,7 +478,7 @@ fn valid_fixture_with_identity(
         json!({"negative_max": -0.5, "positive_min": 0.5, "minimum_confidence": 0.0})
     };
     let mut metadata = json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "bundle_id": bundle_id,
         "bundle_version": bundle_version,
         "model_id": model_id.to_string(),
@@ -473,6 +488,11 @@ fn valid_fixture_with_identity(
             "size_bytes": 1,
             "format": format,
             "format_version": format_version
+        },
+        "training_run": {
+            "path": "training-run.json",
+            "sha256": hex([2; 32]),
+            "size_bytes": 1
         },
         "features": feature_json,
         "training_dataset": {
@@ -509,10 +529,65 @@ fn valid_fixture_with_identity(
 
     let temporary = TempDir::new()?;
     let artifact_bytes = serde_json::to_vec(&artifact)?;
+    let run_features = metadata["features"]
+        .as_array()
+        .ok_or_else(|| std::io::Error::other("fixture features are not an array"))?
+        .iter()
+        .map(|feature| {
+            json!({
+                "input_schema_sha256": feature["input_schema_sha256"],
+                "name": feature["name"],
+                "semantic_sha256": feature["semantic_sha256"],
+                "version": feature["version"]
+            })
+        })
+        .collect::<Vec<_>>();
+    let trial = json!({
+        "bundle_id": metadata["bundle_id"],
+        "bundle_version": metadata["bundle_version"],
+        "dataset": metadata["training_dataset"],
+        "dataset_export_sha256": hex([35; 32]),
+        "environment_sha256": hex([37; 32]),
+        "features": run_features,
+        "label": metadata["label"],
+        "missing_policy": "reject",
+        "model_id": metadata["model_id"],
+        "model_kind": format,
+        "seed": 17,
+        "split_counts": {"test": 1, "train": 7, "validation": 2},
+        "split_sha256": hex([36; 32]),
+        "training_code_revision": metadata["training_code_revision"],
+        "training_period": metadata["training_period"],
+        "universe_id": metadata["training_universe_id"]
+    });
+    let trial_sha256 = hex(sha256(&serde_json::to_vec(&trial)?));
+    let training_run_bytes = serde_json::to_vec(&json!({
+        "schema_version": 1,
+        "trial": trial,
+        "trial_sha256": trial_sha256,
+        "validation_metrics": metadata["validation_metrics"]
+    }))?;
     metadata["artifact"]["sha256"] = json!(hex(sha256(&artifact_bytes)));
     metadata["artifact"]["size_bytes"] = json!(artifact_bytes.len());
+    metadata["training_run"]["sha256"] = json!(hex(sha256(&training_run_bytes)));
+    metadata["training_run"]["size_bytes"] = json!(training_run_bytes.len());
     let metadata_bytes = serde_json::to_vec(&metadata)?;
+    let expectations = BundleExpectations::try_new(
+        expectations.model_id(),
+        expectations.bundle_id().clone(),
+        expectations.bundle_version(),
+        expectations.dataset().clone(),
+        expectations.universe_id().clone(),
+        expectations.training_period(),
+        expectations.label().clone(),
+        expectations.training_code_revision(),
+        Sha256Digest::new(sha256(&training_run_bytes)),
+    )?;
     fs::write(temporary.path().join("artifact.json"), artifact_bytes)?;
+    fs::write(
+        temporary.path().join("training-run.json"),
+        training_run_bytes,
+    )?;
     fs::write(temporary.path().join("bundle.json"), &metadata_bytes)?;
     let reference =
         BundleMetadataRef::try_new("bundle.json", Sha256Digest::new(sha256(&metadata_bytes)))?;

@@ -4,7 +4,7 @@ use std::num::NonZeroU32;
 
 use market_squawk_analytics::{FeatureKey, FeatureRegistry};
 use market_squawk_data::{ComponentKind, ComponentScope, CorporateActionSensitivity, Sha256Digest};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::BundleError;
 use crate::native::NativeArtifact;
@@ -13,11 +13,14 @@ use crate::{
     ModelFeatureBinding, ModelFormat, ValidationMetric, ValidationMetricName,
 };
 
-pub(super) const METADATA_SCHEMA_VERSION: u32 = 1;
+pub(super) const METADATA_SCHEMA_VERSION: u32 = 2;
 pub(super) const NATIVE_FORMAT_VERSION: u32 = 1;
+pub(super) const NATIVE_ARTIFACT_SCHEMA_VERSION: u32 = 1;
+pub(super) const TRAINING_RUN_SCHEMA_VERSION: u32 = 1;
 const MAX_VALIDATION_METRICS: usize = 32;
 const MAX_LIMITATIONS: usize = 32;
 const MAX_PROSE_BYTES: usize = 512;
+const MAX_TRAINING_RUN_EXAMPLES: usize = 100_000;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -27,6 +30,7 @@ pub(super) struct MetadataWire {
     pub(super) bundle_version: u64,
     pub(super) model_id: String,
     pub(super) artifact: ArtifactRefWire,
+    pub(super) training_run: FileRefWire,
     pub(super) features: Vec<FeatureWire>,
     pub(super) training_dataset: DatasetWire,
     pub(super) training_universe_id: String,
@@ -42,6 +46,14 @@ pub(super) struct MetadataWire {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(super) struct FileRefWire {
+    pub(super) path: String,
+    pub(super) sha256: String,
+    pub(super) size_bytes: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct ArtifactRefWire {
     pub(super) path: String,
     pub(super) sha256: String,
@@ -50,7 +62,7 @@ pub(super) struct ArtifactRefWire {
     pub(super) format_version: u32,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct FeatureWire {
     name: String,
@@ -60,7 +72,7 @@ pub(super) struct FeatureWire {
     normalizer: NormalizerWire,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct NormalizerWire {
     kind: String,
@@ -68,42 +80,89 @@ struct NormalizerWire {
     scale: Option<f64>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct DatasetWire {
-    dataset_id: String,
-    manifest_version: u64,
-    schema_name: String,
-    schema_version: u16,
-    schema_sha256: String,
-    manifest_sha256: String,
     build_spec_sha256: String,
-    universe_sha256: String,
+    dataset_id: String,
+    manifest_sha256: String,
+    manifest_version: u64,
     policy_sha256: String,
+    schema_name: String,
+    schema_sha256: String,
+    schema_version: u16,
+    universe_sha256: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct TrainingPeriodWire {
-    pub(super) start_unix_nanos: i64,
     pub(super) end_unix_nanos: i64,
+    pub(super) start_unix_nanos: i64,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct LabelWire {
-    kind: String,
-    scope: String,
     corporate_action_sensitivity: String,
+    kind: String,
     name: String,
+    scope: String,
     version: u32,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct MetricWire {
     name: String,
     value: f64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct TrainingRunWire {
+    pub(super) schema_version: u32,
+    pub(super) trial: TrainingTrialWire,
+    pub(super) trial_sha256: String,
+    pub(super) validation_metrics: Vec<MetricWire>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct TrainingTrialWire {
+    bundle_id: String,
+    bundle_version: u64,
+    dataset: DatasetWire,
+    dataset_export_sha256: String,
+    environment_sha256: String,
+    features: Vec<TrainingFeatureWire>,
+    label: LabelWire,
+    missing_policy: String,
+    model_id: String,
+    model_kind: String,
+    seed: u64,
+    split_counts: SplitCountsWire,
+    split_sha256: String,
+    training_code_revision: String,
+    training_period: TrainingPeriodWire,
+    universe_id: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct TrainingFeatureWire {
+    input_schema_sha256: String,
+    name: String,
+    semantic_sha256: String,
+    version: u32,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SplitCountsWire {
+    test: usize,
+    train: usize,
+    validation: usize,
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -233,6 +292,84 @@ pub(super) fn validate_label(
     }
 }
 
+pub(super) fn validate_training_run(
+    run: &TrainingRunWire,
+    metadata: &MetadataWire,
+    expectations: &BundleExpectations,
+    format: ModelFormat,
+) -> Result<(), BundleError> {
+    if run.schema_version != TRAINING_RUN_SCHEMA_VERSION {
+        return Err(BundleError::UnsupportedTrainingRunVersion);
+    }
+    let trial_bytes = serde_json::to_vec(&run.trial).map_err(|_| BundleError::TrainingRunSyntax)?;
+    if super::io::sha256_digest(&trial_bytes) != parse_digest(&run.trial_sha256)? {
+        return Err(BundleError::TrainingRunTrialHashMismatch);
+    }
+
+    let trial = &run.trial;
+    validate_dataset(&trial.dataset, expectations)?;
+    validate_label(&trial.label, expectations)?;
+    let expected_kind = match format {
+        ModelFormat::NativeLinear => "native_linear",
+        ModelFormat::NativeLogistic => "native_logistic",
+    };
+    let relationships_match =
+        trial.bundle_id == metadata.bundle_id
+            && trial.bundle_version == metadata.bundle_version
+            && trial.dataset == metadata.training_dataset
+            && trial.features.len() == metadata.features.len()
+            && trial.features.iter().zip(&metadata.features).all(
+                |(run_feature, metadata_feature)| {
+                    run_feature.name == metadata_feature.name
+                        && run_feature.version == metadata_feature.version
+                        && run_feature.input_schema_sha256 == metadata_feature.input_schema_sha256
+                        && run_feature.semantic_sha256 == metadata_feature.semantic_sha256
+                },
+            )
+            && trial.label == metadata.label
+            && trial.model_id == metadata.model_id
+            && trial.model_kind == expected_kind
+            && trial.training_code_revision == metadata.training_code_revision
+            && trial.training_period == metadata.training_period
+            && trial.universe_id == metadata.training_universe_id
+            && run.validation_metrics == metadata.validation_metrics;
+    if !relationships_match {
+        return Err(BundleError::TrainingRunRelationshipMismatch);
+    }
+    for feature in &trial.features {
+        let input = parse_digest(&feature.input_schema_sha256)?;
+        let semantic = parse_digest(&feature.semantic_sha256)?;
+        if input.bytes() == [0; 32] || semantic.bytes() == [0; 32] {
+            return Err(BundleError::TrainingRunRelationshipMismatch);
+        }
+    }
+    for digest in [
+        &trial.dataset_export_sha256,
+        &trial.environment_sha256,
+        &trial.split_sha256,
+    ] {
+        if parse_digest(digest)?.bytes() == [0; 32] {
+            return Err(BundleError::TrainingRunRelationshipMismatch);
+        }
+    }
+    if !matches!(trial.missing_policy.as_str(), "reject" | "drop_row") {
+        return Err(BundleError::TrainingRunRelationshipMismatch);
+    }
+    let counts = &trial.split_counts;
+    let total = counts
+        .train
+        .checked_add(counts.validation)
+        .and_then(|value| value.checked_add(counts.test))
+        .ok_or(BundleError::TrainingRunRelationshipMismatch)?;
+    if counts.train <= trial.features.len()
+        || counts.validation == 0
+        || total > MAX_TRAINING_RUN_EXAMPLES
+    {
+        return Err(BundleError::TrainingRunRelationshipMismatch);
+    }
+    Ok(())
+}
+
 pub(super) fn validate_metrics(
     values: &[MetricWire],
     format: ModelFormat,
@@ -304,8 +441,8 @@ pub(super) fn validate_artifact(
     expected_format: ModelFormat,
     features: &[ModelFeatureBinding],
 ) -> Result<NativeArtifact, BundleError> {
-    if wire.schema_version != METADATA_SCHEMA_VERSION {
-        return Err(BundleError::UnsupportedMetadataVersion);
+    if wire.schema_version != NATIVE_ARTIFACT_SCHEMA_VERSION {
+        return Err(BundleError::UnsupportedArtifactSchemaVersion);
     }
     let format = parse_format(&wire.format)?;
     if format != expected_format {

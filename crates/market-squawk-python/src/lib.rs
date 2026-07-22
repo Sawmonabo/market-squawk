@@ -1,5 +1,6 @@
 //! Stable-ABI Python bindings for bounded pure Rust analytical kernels.
 
+use std::mem::size_of;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::str::FromStr as _;
 
@@ -13,12 +14,90 @@ use market_squawk_analytics::{
 use market_squawk_domain::{Currency, Money, RoundingPolicy, Timestamp};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::types::{PyAny, PySequence, PyString};
 use rust_decimal::Decimal;
 
 const FEATURE_IMPLEMENTATION_REVISION: &str = "task14-python-v1";
+const MAX_ANALYTIC_VALUES: usize = 1_000_000;
+const MAX_ANALYTIC_RETAINED_BYTES: usize = 64 * 1024 * 1024;
+const MAX_DECIMAL_TEXT_BYTES: usize = 128;
+const MAX_FEATURE_CONTRACTS: usize = 1_024;
 
 fn invalid_input() -> PyErr {
     PyValueError::new_err("financial input violates a bounded Rust analytics contract")
+}
+
+fn bounded_len(length: usize, element_bytes: usize) -> PyResult<()> {
+    let retained = length
+        .checked_mul(element_bytes)
+        .ok_or_else(invalid_input)?;
+    if length > MAX_ANALYTIC_VALUES || retained > MAX_ANALYTIC_RETAINED_BYTES {
+        return Err(invalid_input());
+    }
+    Ok(())
+}
+
+fn bounded_f64(values: &Bound<'_, PyAny>) -> PyResult<Vec<f64>> {
+    let sequence = values.cast::<PySequence>().map_err(|_| invalid_input())?;
+    let length = sequence.len().map_err(|_| invalid_input())?;
+    bounded_len(length, size_of::<f64>())?;
+    let mut admitted = Vec::new();
+    admitted
+        .try_reserve_exact(length)
+        .map_err(|_| invalid_input())?;
+    for index in 0..length {
+        admitted.push(
+            sequence
+                .get_item(index)
+                .and_then(|value| value.extract::<f64>())
+                .map_err(|_| invalid_input())?,
+        );
+    }
+    Ok(admitted)
+}
+
+fn bounded_i64(values: &Bound<'_, PyAny>) -> PyResult<Vec<i64>> {
+    let sequence = values.cast::<PySequence>().map_err(|_| invalid_input())?;
+    let length = sequence.len().map_err(|_| invalid_input())?;
+    bounded_len(length, size_of::<i64>())?;
+    let mut admitted = Vec::new();
+    admitted
+        .try_reserve_exact(length)
+        .map_err(|_| invalid_input())?;
+    for index in 0..length {
+        admitted.push(
+            sequence
+                .get_item(index)
+                .and_then(|value| value.extract::<i64>())
+                .map_err(|_| invalid_input())?,
+        );
+    }
+    Ok(admitted)
+}
+
+fn bounded_decimal_strings(values: &Bound<'_, PyAny>) -> PyResult<Vec<String>> {
+    let sequence = values.cast::<PySequence>().map_err(|_| invalid_input())?;
+    let length = sequence.len().map_err(|_| invalid_input())?;
+    bounded_len(length, MAX_DECIMAL_TEXT_BYTES)?;
+    let mut admitted = Vec::new();
+    admitted
+        .try_reserve_exact(length)
+        .map_err(|_| invalid_input())?;
+    for index in 0..length {
+        let item = sequence.get_item(index).map_err(|_| invalid_input())?;
+        let string = item.cast::<PyString>().map_err(|_| invalid_input())?;
+        let text = string.to_str().map_err(|_| invalid_input())?;
+        if text.is_empty() || text.len() > MAX_DECIMAL_TEXT_BYTES {
+            return Err(invalid_input());
+        }
+        admitted.push(text.to_owned());
+    }
+    Ok(admitted)
+}
+
+fn bounded_output(values: Vec<f64>) -> PyResult<Vec<f64>> {
+    bounded_len(values.len(), size_of::<f64>())?;
+    Ok(values)
 }
 
 fn statistical_values(values: Vec<f64>) -> PyResult<Vec<StatisticalInput>> {
@@ -34,12 +113,11 @@ fn statistical_values(values: Vec<f64>) -> PyResult<Vec<StatisticalInput>> {
 fn dated_prices(
     prices: Vec<f64>,
     timestamps: Vec<i64>,
-    currency: &str,
+    currency: Currency,
 ) -> PyResult<Vec<DatedStatisticalInput>> {
     if prices.len() != timestamps.len() {
         return Err(invalid_input());
     }
-    let currency = Currency::try_from(currency).map_err(|_| invalid_input())?;
     prices
         .into_iter()
         .zip(timestamps)
@@ -58,32 +136,36 @@ fn dated_prices(
 #[pyfunction]
 fn price_returns(
     py: Python<'_>,
-    prices: Vec<f64>,
-    timestamps: Vec<i64>,
+    prices: &Bound<'_, PyAny>,
+    timestamps: &Bound<'_, PyAny>,
     currency: &str,
 ) -> PyResult<Vec<f64>> {
-    let currency = currency.to_owned();
+    let prices = bounded_f64(prices)?;
+    let timestamps = bounded_i64(timestamps)?;
+    let currency = Currency::try_from(currency).map_err(|_| invalid_input())?;
     py.detach(move || {
-        let values = simple_returns(&dated_prices(prices, timestamps, &currency)?)
+        let values = simple_returns(&dated_prices(prices, timestamps, currency)?)
             .map_err(|_| invalid_input())?;
-        Ok(values.values().iter().map(|value| value.value()).collect())
+        bounded_output(values.values().iter().map(|value| value.value()).collect())
     })
 }
 
 #[pyfunction]
 fn exact_total_returns(
     py: Python<'_>,
-    prices: Vec<String>,
-    distributions: Vec<String>,
-    timestamps: Vec<i64>,
+    prices: &Bound<'_, PyAny>,
+    distributions: &Bound<'_, PyAny>,
+    timestamps: &Bound<'_, PyAny>,
     currency: &str,
 ) -> PyResult<Vec<f64>> {
-    let currency = currency.to_owned();
+    let prices = bounded_decimal_strings(prices)?;
+    let distributions = bounded_decimal_strings(distributions)?;
+    let timestamps = bounded_i64(timestamps)?;
+    let currency = Currency::try_from(currency).map_err(|_| invalid_input())?;
     py.detach(move || {
         if prices.len() != timestamps.len() {
             return Err(invalid_input());
         }
-        let currency = Currency::try_from(currency.as_str()).map_err(|_| invalid_input())?;
         let prices = prices
             .into_iter()
             .zip(timestamps)
@@ -107,12 +189,13 @@ fn exact_total_returns(
             })
             .collect::<PyResult<Vec<_>>>()?;
         let values = total_returns(&prices, &distributions).map_err(|_| invalid_input())?;
-        Ok(values.values().iter().map(|value| value.value()).collect())
+        bounded_output(values.values().iter().map(|value| value.value()).collect())
     })
 }
 
 #[pyfunction]
-fn compound_returns(py: Python<'_>, values: Vec<f64>) -> PyResult<f64> {
+fn compound_returns(py: Python<'_>, values: &Bound<'_, PyAny>) -> PyResult<f64> {
+    let values = bounded_f64(values)?;
     py.detach(move || {
         cumulative_return(&statistical_values(values)?)
             .map(|result| result.value())
@@ -121,7 +204,12 @@ fn compound_returns(py: Python<'_>, values: Vec<f64>) -> PyResult<f64> {
 }
 
 #[pyfunction]
-fn return_volatility(py: Python<'_>, values: Vec<f64>, periods_per_year: u32) -> PyResult<f64> {
+fn return_volatility(
+    py: Python<'_>,
+    values: &Bound<'_, PyAny>,
+    periods_per_year: u32,
+) -> PyResult<f64> {
+    let values = bounded_f64(values)?;
     py.detach(move || {
         let periods = NonZeroU32::new(periods_per_year).ok_or_else(invalid_input)?;
         let returns = ReturnSeries::try_new(
@@ -142,13 +230,15 @@ fn return_volatility(py: Python<'_>, values: Vec<f64>, periods_per_year: u32) ->
 #[pyfunction]
 fn drawdown(
     py: Python<'_>,
-    prices: Vec<f64>,
-    timestamps: Vec<i64>,
+    prices: &Bound<'_, PyAny>,
+    timestamps: &Bound<'_, PyAny>,
     currency: &str,
 ) -> PyResult<(f64, usize, usize, Option<usize>)> {
-    let currency = currency.to_owned();
+    let prices = bounded_f64(prices)?;
+    let timestamps = bounded_i64(timestamps)?;
+    let currency = Currency::try_from(currency).map_err(|_| invalid_input())?;
     py.detach(move || {
-        maximum_drawdown(&dated_prices(prices, timestamps, &currency)?)
+        maximum_drawdown(&dated_prices(prices, timestamps, currency)?)
             .map(|result| {
                 (
                     result.magnitude().value(),
@@ -162,7 +252,13 @@ fn drawdown(
 }
 
 #[pyfunction]
-fn pearson_correlation(py: Python<'_>, left: Vec<f64>, right: Vec<f64>) -> PyResult<f64> {
+fn pearson_correlation(
+    py: Python<'_>,
+    left: &Bound<'_, PyAny>,
+    right: &Bound<'_, PyAny>,
+) -> PyResult<f64> {
+    let left = bounded_f64(left)?;
+    let right = bounded_f64(right)?;
     py.detach(move || {
         market_squawk_analytics::correlation(
             &statistical_values(left)?,
@@ -174,7 +270,8 @@ fn pearson_correlation(py: Python<'_>, left: Vec<f64>, right: Vec<f64>) -> PyRes
 }
 
 #[pyfunction]
-fn value_at_risk(py: Python<'_>, losses: Vec<f64>, confidence: f64) -> PyResult<f64> {
+fn value_at_risk(py: Python<'_>, losses: &Bound<'_, PyAny>, confidence: f64) -> PyResult<f64> {
+    let losses = bounded_f64(losses)?;
     py.detach(move || {
         historical_var(
             &statistical_values(losses)?,
@@ -186,7 +283,8 @@ fn value_at_risk(py: Python<'_>, losses: Vec<f64>, confidence: f64) -> PyResult<
 }
 
 #[pyfunction]
-fn expected_shortfall(py: Python<'_>, losses: Vec<f64>, confidence: f64) -> PyResult<f64> {
+fn expected_shortfall(py: Python<'_>, losses: &Bound<'_, PyAny>, confidence: f64) -> PyResult<f64> {
+    let losses = bounded_f64(losses)?;
     py.detach(move || {
         discrete_expected_shortfall(
             &statistical_values(losses)?,
@@ -228,6 +326,9 @@ fn canonical_feature_contracts(py: Python<'_>) -> PyResult<Vec<(String, u32, Str
         catalog
             .try_register(&mut registry)
             .map_err(|_| invalid_input())?;
+        if catalog.entries().len() > MAX_FEATURE_CONTRACTS {
+            return Err(invalid_input());
+        }
         Ok(catalog
             .entries()
             .iter()

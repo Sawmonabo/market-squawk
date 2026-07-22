@@ -20,6 +20,7 @@ use market_squawk_modeling::{
     TrainingDatasetIdentity, TrainingPeriod,
 };
 use serde::Deserialize;
+use sha2::{Digest as _, Sha256};
 
 const MAX_EXPECTATIONS_BYTES: u64 = 256 * 1024;
 const FEATURE_IMPLEMENTATION_REVISION: &str = "task14-python-v1";
@@ -36,6 +37,7 @@ struct ExpectationsWire {
     training_period: PeriodWire,
     label: LabelWire,
     training_code_revision: String,
+    training_run_sha256: String,
 }
 
 #[derive(Deserialize)]
@@ -84,16 +86,31 @@ fn main() {
 
 fn run() -> Result<String, ()> {
     let arguments = arguments()?;
-    let expectation_path = controlled_path(&arguments.root, &arguments.expectations)?;
-    let metadata = fs::symlink_metadata(&expectation_path).map_err(|_| ())?;
+    let candidate_root = controlled_root(&arguments.root)?;
+    let authority_root = controlled_root(&arguments.authority_root)?;
+    if candidate_root.starts_with(&authority_root) || authority_root.starts_with(&candidate_root) {
+        return Err(());
+    }
+    let authority_path = controlled_path(&authority_root, &arguments.authority)?;
+    let canonical_authority = fs::canonicalize(&authority_path).map_err(|_| ())?;
+    if !canonical_authority.starts_with(&authority_root)
+        || canonical_authority.starts_with(&candidate_root)
+    {
+        return Err(());
+    }
+    let metadata = fs::symlink_metadata(&authority_path).map_err(|_| ())?;
     if !metadata.file_type().is_file() || metadata.len() > MAX_EXPECTATIONS_BYTES {
         return Err(());
     }
-    let bytes = fs::read(expectation_path).map_err(|_| ())?;
+    let bytes = fs::read(authority_path).map_err(|_| ())?;
+    let observed_authority_hash: [u8; 32] = Sha256::digest(&bytes).into();
+    if observed_authority_hash != parse_hex(&arguments.authority_sha256)? {
+        return Err(());
+    }
     let wire: ExpectationsWire = serde_json::from_slice(&bytes).map_err(|_| ())?;
     let expectations = expectations(&wire)?;
     let registry = feature_registry()?;
-    let root = ControlledModelRoot::open_ambient(&arguments.root).map_err(|_| ())?;
+    let root = ControlledModelRoot::open_ambient(candidate_root).map_err(|_| ())?;
     let reference = BundleMetadataRef::try_new(
         &arguments.metadata,
         Sha256Digest::new(parse_hex(&arguments.metadata_sha256)?),
@@ -107,26 +124,41 @@ struct Arguments {
     root: PathBuf,
     metadata: String,
     metadata_sha256: String,
-    expectations: String,
+    authority_root: PathBuf,
+    authority: String,
+    authority_sha256: String,
 }
 
 fn arguments() -> Result<Arguments, ()> {
     let values = env::args().skip(1).collect::<Vec<_>>();
-    if values.len() != 8
+    if values.len() != 12
         || values[0] != "--root"
         || values[2] != "--metadata"
         || values[4] != "--metadata-sha256"
-        || values[6] != "--expectations"
+        || values[6] != "--authority-root"
+        || values[8] != "--authority"
+        || values[10] != "--authority-sha256"
     {
         return Err(());
     }
     parse_hex(&values[5])?;
+    parse_hex(&values[11])?;
     Ok(Arguments {
         root: PathBuf::from(&values[1]),
         metadata: values[3].clone(),
         metadata_sha256: values[5].clone(),
-        expectations: values[7].clone(),
+        authority_root: PathBuf::from(&values[7]),
+        authority: values[9].clone(),
+        authority_sha256: values[11].clone(),
     })
+}
+
+fn controlled_root(root: &Path) -> Result<PathBuf, ()> {
+    let metadata = fs::symlink_metadata(root).map_err(|_| ())?;
+    if !metadata.file_type().is_dir() {
+        return Err(());
+    }
+    fs::canonicalize(root).map_err(|_| ())
 }
 
 fn controlled_path(root: &Path, relative: &str) -> Result<PathBuf, ()> {
@@ -144,7 +176,7 @@ fn controlled_path(root: &Path, relative: &str) -> Result<PathBuf, ()> {
 }
 
 fn expectations(wire: &ExpectationsWire) -> Result<BundleExpectations, ()> {
-    if wire.schema_version != 1 || wire.label.kind != "label" {
+    if wire.schema_version != 2 || wire.label.kind != "label" {
         return Err(());
     }
     let schema_version = SchemaVersion::new(wire.dataset.schema_version).map_err(|_| ())?;
@@ -201,6 +233,7 @@ fn expectations(wire: &ExpectationsWire) -> Result<BundleExpectations, ()> {
         .map_err(|_| ())?,
         label,
         &wire.training_code_revision,
+        Sha256Digest::new(parse_hex(&wire.training_run_sha256)?),
     )
     .map_err(|_| ())
 }

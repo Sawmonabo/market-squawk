@@ -59,7 +59,8 @@ pub use dataset_builder::{
     DatasetBuildInputs, DatasetBuildLimits, DatasetBuildPolicy, DatasetBuildRequest,
     DatasetBuilder, DatasetBuilderService, DatasetExample, DatasetOutputAuthorization,
     DatasetSplit, DatasetSplitCounts, FeatureLabelComponentInput, FeatureLabelComponentSpec,
-    FeatureLabelDataset, MissingValuePolicy,
+    FeatureLabelDataset, FeatureLabelPythonExport, MAX_FEATURE_LABEL_EXPORT_BYTES,
+    MissingValuePolicy,
 };
 pub use ingest::{
     AnalyticalDataService, CommittedDataset, CompactionRequest, IngestError,

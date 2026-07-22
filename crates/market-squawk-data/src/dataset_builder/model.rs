@@ -996,6 +996,11 @@ pub struct FeatureLabelDataset {
     pub(super) policy_digest: Sha256Digest,
     pub(super) universe_digest: Sha256Digest,
     pub(super) split_counts: DatasetSplitCounts,
+    pub(super) universe_id: UniverseId,
+    pub(super) split_policy: ChronologicalSplitPolicy,
+    pub(super) point_in_time_policy: PointInTimePolicy,
+    pub(super) missing_value_policy: MissingValuePolicy,
+    pub(super) component_specs: Box<[FeatureLabelComponentSpec]>,
 }
 
 impl FeatureLabelDataset {
@@ -1027,6 +1032,13 @@ impl FeatureLabelDataset {
     /// Returns admitted examples by chronological split.
     pub const fn split_counts(&self) -> DatasetSplitCounts {
         self.split_counts
+    }
+
+    /// Produces the bounded canonical Task 11 descriptor consumed by Python research training.
+    pub fn python_export(
+        &self,
+    ) -> Result<super::export::FeatureLabelPythonExport, DatasetBuildError> {
+        super::export::encode(self)
     }
 }
 

@@ -230,6 +230,15 @@ pub(super) async fn build(
         policy_digest: request.policy_digest(),
         universe_digest: request.universe_digest(),
         split_counts: prepared.split_counts,
+        universe_id: request.inputs().universe_id().clone(),
+        split_policy: request.policy().split(),
+        point_in_time_policy: request.policy().point_in_time(),
+        missing_value_policy: request.policy().missing_values(),
+        component_specs: request
+            .inputs()
+            .component_specs()
+            .to_vec()
+            .into_boxed_slice(),
     })
 }
 
@@ -1054,6 +1063,15 @@ fn result_from_existing(
         policy_digest: request.policy_digest(),
         universe_digest: request.universe_digest(),
         split_counts,
+        universe_id: request.inputs().universe_id().clone(),
+        split_policy: request.policy().split(),
+        point_in_time_policy: request.policy().point_in_time(),
+        missing_value_policy: request.policy().missing_values(),
+        component_specs: request
+            .inputs()
+            .component_specs()
+            .to_vec()
+            .into_boxed_slice(),
     }
 }
 

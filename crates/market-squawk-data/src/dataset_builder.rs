@@ -13,8 +13,12 @@ use crate::{AnalyticalDataService, CatalogAuthority};
 mod build;
 #[path = "dataset_builder/canonical.rs"]
 mod canonical;
+#[path = "dataset_builder/export.rs"]
+mod export;
 #[path = "dataset_builder/model.rs"]
 mod model;
+
+pub use export::{FeatureLabelPythonExport, MAX_FEATURE_LABEL_EXPORT_BYTES};
 
 pub use model::{
     ChronologicalSplitPolicy, ComponentAdjustmentEvidence, ComponentKind, ComponentScope,
@@ -118,6 +122,9 @@ pub enum DatasetBuildError {
     /// All examples were removed by the explicit missing-value policy.
     #[error("dataset build produced no rows")]
     EmptyDataset,
+    /// A bounded canonical Python export descriptor could not be encoded.
+    #[error("feature-label export descriptor could not be encoded within its bound")]
+    ExportEncoding,
     /// The caller cancelled before the durable derived-generation commit.
     #[error("dataset build was cancelled")]
     Cancelled,

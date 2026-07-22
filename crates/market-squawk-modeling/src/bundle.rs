@@ -16,9 +16,10 @@ use self::io::{
     is_controlled_relative_path, read_exact_bounded, sha256_digest, validate_json_structure,
 };
 use self::validation::{
-    METADATA_SCHEMA_VERSION, MetadataWire, NATIVE_FORMAT_VERSION, NativeArtifactWire, parse_digest,
-    parse_format, validate_artifact, validate_dataset, validate_features, validate_label,
-    validate_metrics, validate_prose, validate_thresholds,
+    METADATA_SCHEMA_VERSION, MetadataWire, NATIVE_FORMAT_VERSION, NativeArtifactWire,
+    TrainingRunWire, parse_digest, parse_format, validate_artifact, validate_dataset,
+    validate_features, validate_label, validate_metrics, validate_prose, validate_thresholds,
+    validate_training_run,
 };
 use crate::metadata::valid_revision;
 use crate::native::NativeArtifact;
@@ -33,6 +34,8 @@ pub const MAX_CONTROLLED_MODEL_PATH_BYTES: usize = 256;
 pub const MAX_METADATA_BYTES: usize = 256 * 1024;
 /// Maximum exact native artifact bytes admitted before parsing.
 pub const MAX_ARTIFACT_BYTES: usize = 1024 * 1024;
+/// Maximum exact training-run provenance bytes admitted before parsing.
+pub const MAX_TRAINING_RUN_BYTES: usize = 256 * 1024;
 
 /// Exact metadata object expected beneath a controlled model root.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -100,6 +103,7 @@ pub struct ModelBundle {
     native_artifact: NativeArtifact,
     metadata_bytes: Box<[u8]>,
     artifact_bytes: Box<[u8]>,
+    training_run_bytes: Box<[u8]>,
     retained_bytes: usize,
 }
 
@@ -161,6 +165,17 @@ impl ModelBundle {
         if expected_artifact_size > MAX_ARTIFACT_BYTES {
             return Err(BundleError::ArtifactTooLarge);
         }
+        let training_run_hash = parse_digest(&wire.training_run.sha256)?;
+        if training_run_hash != expectations.training_run_hash() {
+            return Err(BundleError::TrainingRunHashMismatch);
+        }
+        let training_run_reference =
+            BundleMetadataRef::try_new(&wire.training_run.path, training_run_hash)?;
+        let expected_training_run_size = usize::try_from(wire.training_run.size_bytes)
+            .map_err(|_| BundleError::TrainingRunTooLarge)?;
+        if expected_training_run_size > MAX_TRAINING_RUN_BYTES {
+            return Err(BundleError::TrainingRunTooLarge);
+        }
 
         let features = validate_features(&wire.features, feature_registry)?;
         validate_dataset(&wire.training_dataset, expectations)?;
@@ -185,6 +200,24 @@ impl ModelBundle {
         validate_prose(&wire.intended_use).map_err(|_| BundleError::InvalidIntendedUse)?;
         validation::validate_limitations(&wire.limitations)?;
         validation::validate_fallback(&wire.fallback)?;
+
+        let training_run_bytes = read_exact_bounded(
+            &root.directory,
+            training_run_reference.relative_path(),
+            MAX_TRAINING_RUN_BYTES,
+            BundleError::TrainingRunTooLarge,
+        )?;
+        if training_run_bytes.len() != expected_training_run_size {
+            return Err(BundleError::TrainingRunSizeMismatch);
+        }
+        if sha256_digest(&training_run_bytes) != training_run_hash {
+            return Err(BundleError::TrainingRunHashMismatch);
+        }
+        validate_json_structure(&training_run_bytes)
+            .map_err(|_| BundleError::TrainingRunStructureLimit)?;
+        let run: TrainingRunWire = serde_json::from_slice(&training_run_bytes)
+            .map_err(|_| BundleError::TrainingRunSyntax)?;
+        validate_training_run(&run, &wire, expectations, format)?;
 
         let artifact_bytes = read_exact_bounded(
             &root.directory,
@@ -226,12 +259,14 @@ impl ModelBundle {
             .and_then(|bytes| bytes.checked_add(artifact.retained_bytes()?))
             .and_then(|bytes| bytes.checked_add(metadata_bytes.len()))
             .and_then(|bytes| bytes.checked_add(artifact_bytes.len()))
+            .and_then(|bytes| bytes.checked_add(training_run_bytes.len()))
             .ok_or(BundleError::RetainedSizeOverflow)?;
         Ok(Self {
             metadata,
             native_artifact: artifact,
             metadata_bytes: metadata_bytes.into_boxed_slice(),
             artifact_bytes: artifact_bytes.into_boxed_slice(),
+            training_run_bytes: training_run_bytes.into_boxed_slice(),
             retained_bytes,
         })
     }
@@ -260,6 +295,12 @@ impl ModelBundle {
         &self.artifact_bytes
     }
 
+    /// Returns the exact admitted training-run provenance bytes.
+    #[must_use]
+    pub fn training_run_bytes(&self) -> &[u8] {
+        &self.training_run_bytes
+    }
+
     pub(crate) const fn native_artifact(&self) -> &NativeArtifact {
         &self.native_artifact
     }
@@ -278,6 +319,8 @@ pub enum BundleError {
     MetadataTooLarge,
     #[error("model artifact exceeds its byte bound")]
     ArtifactTooLarge,
+    #[error("model training-run provenance exceeds its byte bound")]
+    TrainingRunTooLarge,
     #[error("model bundle metadata hash mismatch")]
     MetadataHashMismatch,
     #[error("model metadata exceeds JSON structural bounds")]
@@ -286,6 +329,8 @@ pub enum BundleError {
     MetadataSyntax,
     #[error("model bundle metadata version is unsupported")]
     UnsupportedMetadataVersion,
+    #[error("model artifact schema version is unsupported")]
+    UnsupportedArtifactSchemaVersion,
     #[error("model identity differs from independent expectations")]
     ModelIdentityMismatch,
     #[error("bundle identity differs from independent expectations")]
@@ -332,6 +377,20 @@ pub enum BundleError {
     ArtifactSizeMismatch,
     #[error("model artifact hash mismatch")]
     ArtifactHashMismatch,
+    #[error("model training-run provenance size mismatch")]
+    TrainingRunSizeMismatch,
+    #[error("model training-run provenance hash mismatch")]
+    TrainingRunHashMismatch,
+    #[error("model training-run provenance exceeds JSON structural bounds")]
+    TrainingRunStructureLimit,
+    #[error("model training-run provenance syntax is invalid")]
+    TrainingRunSyntax,
+    #[error("model training-run provenance version is unsupported")]
+    UnsupportedTrainingRunVersion,
+    #[error("model training-run trial identity hash mismatch")]
+    TrainingRunTrialHashMismatch,
+    #[error("model training-run provenance contradicts bundle authority")]
+    TrainingRunRelationshipMismatch,
     #[error("model artifact exceeds JSON structural bounds")]
     ArtifactStructureLimit,
     #[error("model artifact syntax is invalid")]

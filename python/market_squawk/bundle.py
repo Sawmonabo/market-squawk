@@ -16,6 +16,7 @@ from typing import Any, Mapping
 
 MAX_ARTIFACT_BYTES = 1024 * 1024
 MAX_METADATA_BYTES = 256 * 1024
+MAX_AUTHORITY_BYTES = 256 * 1024
 
 
 class BundleExportError(ValueError):
@@ -30,20 +31,64 @@ class BundleReceipt:
     run_record: Path
     metadata_sha256: str
     artifact_sha256: str
+    training_run_sha256: str
+    authority_sha256: str
     validated_by_rust: bool
+
+
+@dataclass(frozen=True)
+class BundleAuthorityRef:
+    """Operator/catalog-owned authority kept outside the untrusted candidate root."""
+
+    root: Path
+    relative_path: str
+    sha256: str
+
+    @classmethod
+    def exact(
+        cls,
+        root: Path | str,
+        relative_path: str,
+        sha256: str,
+    ) -> BundleAuthorityRef:
+        authority_root = Path(root)
+        if authority_root.is_symlink() or not authority_root.is_dir():
+            raise BundleExportError("bundle authority root is not a controlled directory")
+        parts = _relative_parts(relative_path)
+        path = authority_root.joinpath(*parts)
+        if path.is_symlink() or not path.is_file():
+            raise BundleExportError("bundle authority is not a controlled regular file")
+        content = path.read_bytes()
+        if len(content) > MAX_AUTHORITY_BYTES or hashlib.sha256(content).hexdigest() != sha256:
+            raise BundleExportError("bundle authority hash or size mismatch")
+        return cls(authority_root.resolve(), relative_path, sha256)
 
 
 @dataclass(frozen=True)
 class BundleCandidate:
     metadata: Mapping[str, Any]
     artifact: Mapping[str, Any]
-    expectations: Mapping[str, Any]
     run_record: Mapping[str, Any]
 
-    def write(self, output_root: Path | str, *, validator: Path | str | None = None) -> BundleReceipt:
+    @property
+    def training_run_sha256(self) -> str:
+        return hashlib.sha256(_canonical(self.run_record, MAX_METADATA_BYTES)).hexdigest()
+
+    def write(
+        self,
+        output_root: Path | str,
+        authority: BundleAuthorityRef,
+        *,
+        validator: Path | str | None = None,
+    ) -> BundleReceipt:
         output_root = Path(output_root)
         if output_root.is_symlink() or not output_root.is_dir():
             raise BundleExportError("bundle output root is not a controlled directory")
+        resolved_output = output_root.resolve()
+        if resolved_output == authority.root or resolved_output.is_relative_to(authority.root):
+            raise BundleExportError("bundle candidate cannot contain its independent authority")
+        if authority.root.is_relative_to(resolved_output):
+            raise BundleExportError("bundle authority cannot be nested below candidate output")
         final = output_root / "candidate"
         if final.exists() or final.is_symlink():
             raise BundleExportError("bundle candidate generation already exists")
@@ -51,18 +96,22 @@ class BundleCandidate:
         try:
             artifact_bytes = _canonical(self.artifact, MAX_ARTIFACT_BYTES)
             artifact_sha256 = hashlib.sha256(artifact_bytes).hexdigest()
+            run_bytes = _canonical(self.run_record, MAX_METADATA_BYTES)
+            training_run_sha256 = hashlib.sha256(run_bytes).hexdigest()
             metadata = dict(self.metadata)
             metadata["artifact"] = dict(metadata["artifact"])
             metadata["artifact"]["sha256"] = artifact_sha256
             metadata["artifact"]["size_bytes"] = len(artifact_bytes)
+            metadata["training_run"] = dict(metadata["training_run"])
+            metadata["training_run"]["sha256"] = training_run_sha256
+            metadata["training_run"]["size_bytes"] = len(run_bytes)
             metadata_bytes = _canonical(metadata, MAX_METADATA_BYTES)
             metadata_sha256 = hashlib.sha256(metadata_bytes).hexdigest()
             _write_exact(temporary / "artifact.json", artifact_bytes)
             _write_exact(temporary / "bundle.json", metadata_bytes)
-            _write_exact(temporary / "expectations.json", _canonical(self.expectations, MAX_METADATA_BYTES))
-            _write_exact(temporary / "training-run.json", _canonical(self.run_record, MAX_METADATA_BYTES))
+            _write_exact(temporary / "training-run.json", run_bytes)
             _fsync_directory(temporary)
-            _validate_with_rust(temporary, metadata_sha256, validator)
+            _validate_with_rust(temporary, metadata_sha256, authority, validator)
             os.replace(temporary, final)
             _fsync_directory(output_root)
             return BundleReceipt(
@@ -72,6 +121,8 @@ class BundleCandidate:
                 run_record=final / "training-run.json",
                 metadata_sha256=metadata_sha256,
                 artifact_sha256=artifact_sha256,
+                training_run_sha256=training_run_sha256,
+                authority_sha256=authority.sha256,
                 validated_by_rust=True,
             )
         except Exception:
@@ -122,7 +173,7 @@ def _validator_path(configured: Path | str | None) -> Path:
     if configured is not None:
         path = Path(configured)
     else:
-        adjacent = Path(sys.executable).resolve().parent / "market-squawk-model-validator"
+        adjacent = Path(sys.executable).parent / "market-squawk-model-validator"
         discovered = shutil.which("market-squawk-model-validator")
         path = adjacent if adjacent.is_file() else Path(discovered) if discovered else adjacent
     if path.is_symlink() or not path.is_file() or not os.access(path, os.X_OK):
@@ -133,6 +184,7 @@ def _validator_path(configured: Path | str | None) -> Path:
 def _validate_with_rust(
     root: Path,
     metadata_sha256: str,
+    authority: BundleAuthorityRef,
     configured_validator: Path | str | None,
 ) -> None:
     command = [
@@ -143,8 +195,12 @@ def _validate_with_rust(
         "bundle.json",
         "--metadata-sha256",
         metadata_sha256,
-        "--expectations",
-        "expectations.json",
+        "--authority-root",
+        str(authority.root),
+        "--authority",
+        authority.relative_path,
+        "--authority-sha256",
+        authority.sha256,
     ]
     try:
         completed = subprocess.run(
@@ -165,3 +221,17 @@ def _validate_with_rust(
         raise BundleExportError("Rust model bundle validator returned invalid evidence") from error
     if result != {"metadata_sha256": metadata_sha256, "status": "valid"}:
         raise BundleExportError("Rust model bundle validator returned mismatched evidence")
+
+
+def _relative_parts(value: str) -> tuple[str, ...]:
+    path = Path(value)
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value.encode()) > 256
+        or path.is_absolute()
+        or any(part in {"", ".", ".."} for part in path.parts)
+        or any(not all(character.isalnum() or character in "._-" for character in part) for part in path.parts)
+    ):
+        raise BundleExportError("bundle authority path is outside the controlled grammar")
+    return path.parts

@@ -1081,6 +1081,23 @@ async fn point_in_time_builder_publishes_one_authorized_queryable_generation() -
     assert_eq!(built.split_counts().train_examples(), 1);
     assert_eq!(built.split_counts().validation_examples(), 0);
     assert_eq!(built.split_counts().test_examples(), 0);
+    let export = built.python_export()?;
+    assert_eq!(
+        export.content_hash().bytes(),
+        <[u8; 32]>::from(Sha256::digest(export.bytes()))
+    );
+    let export_json: serde_json::Value = serde_json::from_slice(export.bytes())?;
+    assert_eq!(export_json["schema_version"], 1);
+    assert_eq!(
+        export_json["dataset"]["build_spec_sha256"],
+        hex_digest(built.build_spec_digest().digest().bytes())
+    );
+    assert_eq!(
+        export_json["dataset"]["universe_id"],
+        "us-equities.historical"
+    );
+    assert_eq!(export_json["split_policy"]["train_end_unix_nanos"], 100);
+    assert_eq!(export_json["objects"][0]["row_count"], 2);
     let replayed = service
         .dataset_builder()
         .build(request, CancellationToken::new())
@@ -1474,6 +1491,10 @@ fn hash_evidence_digest(hasher: &mut Sha256, digest: EvidenceDigest) {
 fn hash_length_prefixed(hasher: &mut Sha256, value: &[u8]) {
     hasher.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
     hasher.update(value);
+}
+
+fn hex_digest(bytes: [u8; 32]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn test_catalog_config(

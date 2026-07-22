@@ -11,13 +11,19 @@ from market_squawk.visualization import chart_spec
 
 
 FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "pit_example"
-MANIFEST_SHA256 = (FIXTURE / "manifest.sha256").read_text().strip()
-dataset = open_dataset(FIXTURE, MANIFEST_SHA256, UtcNanoseconds(2_500))
-specification = chart_spec(dataset.rows, x="observed_at", y="value", title="Local PIT fixture")
+EXPORT_SHA256 = (FIXTURE / "feature-label-export.sha256").read_text().strip()
+dataset = open_dataset(FIXTURE, EXPORT_SHA256, UtcNanoseconds(120))
+feature_rows = tuple(row for row in dataset.rows if row["component_kind"] == "feature")
+specification = chart_spec(
+    feature_rows,
+    x="cutoff_at",
+    y="value_f64",
+    title="Local PIT fixture",
+)
 encoded = json.dumps(specification, sort_keys=True, separators=(",", ":")).encode()
 RESULT = {
     "dataset": dataset.dataset_id,
-    "rows": len(dataset.rows),
+    "rows": len(feature_rows),
     "chart_sha256": hashlib.sha256(encoded).hexdigest(),
 }
 

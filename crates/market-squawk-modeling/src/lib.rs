@@ -17,7 +17,7 @@ mod registry;
 
 pub use bundle::{
     BundleError, BundleMetadataRef, ControlledModelRoot, MAX_ARTIFACT_BYTES,
-    MAX_CONTROLLED_MODEL_PATH_BYTES, MAX_METADATA_BYTES, ModelBundle,
+    MAX_CONTROLLED_MODEL_PATH_BYTES, MAX_METADATA_BYTES, MAX_TRAINING_RUN_BYTES, ModelBundle,
 };
 pub use input::{
     ModelDecision, ModelFeatureValue, ModelInput, ModelInputError, ModelOutput, ModelOutputIdentity,
@@ -213,6 +213,15 @@ const fn bundle_error_code(error: BundleError) -> u16 {
         BundleError::UnsupportedOutputShape => 36,
         BundleError::NonFiniteArtifact => 37,
         BundleError::RetainedSizeOverflow => 38,
+        BundleError::TrainingRunTooLarge => 39,
+        BundleError::TrainingRunSizeMismatch => 40,
+        BundleError::TrainingRunHashMismatch => 41,
+        BundleError::TrainingRunStructureLimit => 42,
+        BundleError::TrainingRunSyntax => 43,
+        BundleError::UnsupportedTrainingRunVersion => 44,
+        BundleError::TrainingRunTrialHashMismatch => 45,
+        BundleError::TrainingRunRelationshipMismatch => 46,
+        BundleError::UnsupportedArtifactSchemaVersion => 47,
     }
 }
 
