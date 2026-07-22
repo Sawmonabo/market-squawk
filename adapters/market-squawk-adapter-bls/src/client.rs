@@ -117,6 +117,9 @@ pub enum BlsSourceError {
     /// Local source-health synchronization is unavailable.
     #[error("BLS source health is unavailable")]
     HealthUnavailable,
+    /// Bounded locally observed revision evidence could not be constructed.
+    #[error(transparent)]
+    RevisionAuthority(#[from] market_squawk_sources::ObservedRevisionError),
 }
 
 #[derive(Serialize)]
@@ -460,7 +463,8 @@ fn map_source_error(error: BlsSourceError, max_response_bytes: usize) -> SourceE
         | BlsSourceError::InvalidSeriesMetadata
         | BlsSourceError::Protocol
         | BlsSourceError::InvalidMetadata
-        | BlsSourceError::HealthUnavailable => SourceError::InvalidProtocolState,
+        | BlsSourceError::HealthUnavailable
+        | BlsSourceError::RevisionAuthority(_) => SourceError::InvalidProtocolState,
     }
 }
 

@@ -3,9 +3,10 @@
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::{
-    AggressorSide, AuctionPhase, BookChange, BookLevel, CorporateActionKind, HaltTransition,
-    LiveProvenance, MarketDepth, MarketEventError, SequenceNumber, SourceIdentifier, Timestamp,
-    TradingStatus, validate_book, validate_book_depth, validate_market_provenance,
+    AggressorSide, AuctionPhase, BookChange, BookLevel, CorporateActionInvariantError,
+    CorporateActionKind, HaltTransition, LiveProvenance, MarketDepth, MarketEventError,
+    SequenceNumber, SourceIdentifier, Timestamp, TradingStatus, validate_book, validate_book_depth,
+    validate_market_provenance,
 };
 use crate::{PriceTicks, QuantityLots};
 
@@ -495,26 +496,30 @@ impl CorporateActionEvent {
     ) -> Result<Self, MarketEventError> {
         let instrument_id =
             validate_market_provenance(&provenance, false, crate::LiveEventClass::CorporateAction)?;
-        match &action {
-            CorporateActionKind::Merger { successor } if *successor == instrument_id => {
-                return Err(MarketEventError::SelfMerger);
-            }
-            CorporateActionKind::SymbolChange {
-                venue_id,
-                previous,
-                current,
-            } => {
-                let provenance_venue = provenance
-                    .venue_id()
-                    .ok_or(MarketEventError::MissingVenue)?;
-                if provenance_venue != venue_id {
-                    return Err(MarketEventError::CorporateActionVenueMismatch);
+        action
+            .validate_for_instrument(instrument_id)
+            .map_err(|error| match error {
+                CorporateActionInvariantError::SelfMerger => MarketEventError::SelfMerger,
+                CorporateActionInvariantError::SelfSpinoff => MarketEventError::SelfSpinoff,
+                CorporateActionInvariantError::NonPositiveMonetaryAmount => {
+                    MarketEventError::NonPositiveCorporateActionAmount
                 }
-                if previous == current {
-                    return Err(MarketEventError::UnchangedSymbol);
-                }
+            })?;
+        if let CorporateActionKind::SymbolChange {
+            venue_id,
+            previous,
+            current,
+        } = &action
+        {
+            let provenance_venue = provenance
+                .venue_id()
+                .ok_or(MarketEventError::MissingVenue)?;
+            if provenance_venue != venue_id {
+                return Err(MarketEventError::CorporateActionVenueMismatch);
             }
-            _ => {}
+            if previous == current {
+                return Err(MarketEventError::UnchangedSymbol);
+            }
         }
         Ok(Self {
             provenance,

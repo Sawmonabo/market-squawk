@@ -1,10 +1,13 @@
 //! Immutable analytical generation plans and identities.
 
+use std::cmp::Ordering;
 use std::fmt;
 
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
+
+use crate::schema::{DatasetSchemaRef, DatasetSchemaRegistry};
 
 mod catalog;
 
@@ -12,6 +15,29 @@ pub use self::catalog::{
     AnalyticalManifestCatalog, GenerationKind, ManifestCatalogError, PinnedDataset,
     PinnedManifestObject,
 };
+
+/// Fixed maximum number of exact input generations retained by one derived generation.
+pub const MAX_DERIVED_GENERATION_PARENTS: usize = 256;
+
+/// Crate-sealed authority for committing derived lineage after output publication.
+///
+/// No production issuer exists until the research-use authority migration binds this capability
+/// to transitive source permits and independent output-persistence authority.
+#[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "the immediately following ResearchUse authority wiring supplies the sole issuer"
+)]
+pub(crate) struct DerivedGenerationCommitAuthority {
+    _private: (),
+}
+
+#[cfg(test)]
+impl DerivedGenerationCommitAuthority {
+    const fn for_test() -> Self {
+        Self { _private: () }
+    }
+}
 
 /// Stable local analytical dataset identity.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -72,8 +98,133 @@ impl fmt::Debug for Sha256Digest {
 pub struct DatasetManifestRef {
     dataset_id: DatasetId,
     manifest_version: u64,
-    schema_version: market_squawk_domain::SchemaVersion,
+    schema: DatasetSchemaRef,
     content_hash: Sha256Digest,
+}
+
+/// Nonzero canonical SHA-256 identity supplied by the complete dataset-build specification.
+#[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct DatasetBuildSpecDigest(Sha256Digest);
+
+impl DatasetBuildSpecDigest {
+    /// Constructs a non-reserved build-specification identity.
+    pub fn try_new(bytes: [u8; 32]) -> Result<Self, ManifestPlanError> {
+        if bytes == [0; 32] {
+            Err(ManifestPlanError::InvalidBuildSpecDigest)
+        } else {
+            Ok(Self(Sha256Digest::new(bytes)))
+        }
+    }
+
+    /// Returns the exact SHA-256 identity.
+    pub const fn digest(self) -> Sha256Digest {
+        self.0
+    }
+}
+
+impl fmt::Debug for DatasetBuildSpecDigest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("DatasetBuildSpecDigest([SHA-256])")
+    }
+}
+
+/// Typed semantic relationship from one generation to an exact prior generation.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum GenerationParentRelation {
+    /// An ingest appends one object to its immediately preceding generation.
+    AppendPredecessor,
+    /// A compaction replaces its immediately preceding generation without changing semantics.
+    CompactionPredecessor,
+    /// A derived output consumes one explicitly named immutable input generation.
+    DerivedInput,
+}
+
+impl GenerationParentRelation {
+    pub(super) const fn database_name(self) -> &'static str {
+        match self {
+            Self::AppendPredecessor => "append_predecessor",
+            Self::CompactionPredecessor => "compaction_predecessor",
+            Self::DerivedInput => "derived_input",
+        }
+    }
+
+    pub(super) fn from_database_name(value: &str) -> Option<Self> {
+        match value {
+            "append_predecessor" => Some(Self::AppendPredecessor),
+            "compaction_predecessor" => Some(Self::CompactionPredecessor),
+            "derived_input" => Some(Self::DerivedInput),
+            _ => None,
+        }
+    }
+}
+
+/// One immutable, exact generation-parent edge in canonical child order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GenerationParent {
+    relation: GenerationParentRelation,
+    manifest: DatasetManifestRef,
+}
+
+impl GenerationParent {
+    pub(super) const fn new(
+        relation: GenerationParentRelation,
+        manifest: DatasetManifestRef,
+    ) -> Self {
+        Self { relation, manifest }
+    }
+
+    /// Returns why this exact parent contributes to the child generation.
+    pub const fn relation(&self) -> GenerationParentRelation {
+        self.relation
+    }
+
+    /// Returns the complete immutable parent identity.
+    pub const fn manifest(&self) -> &DatasetManifestRef {
+        &self.manifest
+    }
+}
+
+/// Nonempty, bounded, canonical and duplicate-free inputs to one derived generation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DerivedGenerationParents(Box<[DatasetManifestRef]>);
+
+impl DerivedGenerationParents {
+    /// Canonicalizes exact parent identities and rejects duplicates or coordinate conflicts.
+    pub fn try_new(mut parents: Vec<DatasetManifestRef>) -> Result<Self, ManifestPlanError> {
+        if parents.is_empty() || parents.len() > MAX_DERIVED_GENERATION_PARENTS {
+            return Err(ManifestPlanError::InvalidDerivedParentCount);
+        }
+        parents.sort_unstable_by(compare_manifest_refs);
+        for pair in parents.windows(2) {
+            if pair[0].dataset_id == pair[1].dataset_id
+                && pair[0].manifest_version == pair[1].manifest_version
+            {
+                return if pair[0] == pair[1] {
+                    Err(ManifestPlanError::DuplicateDerivedParent)
+                } else {
+                    Err(ManifestPlanError::ConflictingDerivedParent)
+                };
+            }
+        }
+        Ok(Self(parents.into_boxed_slice()))
+    }
+
+    /// Returns parents in stable canonical identity order.
+    pub fn as_slice(&self) -> &[DatasetManifestRef] {
+        &self.0
+    }
+}
+
+pub(crate) fn compare_manifest_refs(
+    left: &DatasetManifestRef,
+    right: &DatasetManifestRef,
+) -> Ordering {
+    left.dataset_id
+        .as_str()
+        .cmp(right.dataset_id.as_str())
+        .then_with(|| left.manifest_version.cmp(&right.manifest_version))
+        .then_with(|| left.schema.cmp(&right.schema))
+        .then_with(|| left.content_hash.cmp(&right.content_hash))
 }
 
 impl DatasetManifestRef {
@@ -84,13 +235,32 @@ impl DatasetManifestRef {
         schema_version: market_squawk_domain::SchemaVersion,
         content_hash: Sha256Digest,
     ) -> Result<Self, ManifestPlanError> {
+        let schema = DatasetSchemaRegistry::local()
+            .canonical_research_observations()
+            .map_err(|_| ManifestPlanError::InvalidDatasetSchema)?;
+        if schema.version() != schema_version {
+            return Err(ManifestPlanError::InvalidDatasetSchema);
+        }
+        Self::try_new_with_schema(dataset_id, manifest_version, schema, content_hash)
+    }
+
+    /// Constructs a nonzero generation pin carrying one complete retained schema identity.
+    ///
+    /// Construction preserves an untrusted retained identity exactly. Catalog readers and query
+    /// registration resolve it through [`DatasetSchemaRegistry`] before use.
+    pub fn try_new_with_schema(
+        dataset_id: DatasetId,
+        manifest_version: u64,
+        schema: DatasetSchemaRef,
+        content_hash: Sha256Digest,
+    ) -> Result<Self, ManifestPlanError> {
         if manifest_version == 0 {
             return Err(ManifestPlanError::InvalidManifestVersion);
         }
         Ok(Self {
             dataset_id,
             manifest_version,
-            schema_version,
+            schema,
             content_hash,
         })
     }
@@ -107,7 +277,12 @@ impl DatasetManifestRef {
 
     /// Returns the exact analytical row-schema version for this immutable generation.
     pub const fn schema_version(&self) -> market_squawk_domain::SchemaVersion {
-        self.schema_version
+        self.schema.version()
+    }
+
+    /// Returns the exact registered dataset-schema identity for this immutable generation.
+    pub const fn schema(&self) -> &DatasetSchemaRef {
+        &self.schema
     }
 
     /// Returns the semantic manifest hash.
@@ -221,6 +396,34 @@ impl ManifestPlan {
         Self::from_objects(previous.dataset_id.clone(), vec![compacted])
     }
 
+    /// Creates one complete derived generation without inheriting a prior physical object set.
+    ///
+    /// Physical objects are retained in deterministic content-identity order. Partition meaning
+    /// remains part of the separately supplied dataset-build specification digest.
+    pub fn derive(
+        dataset_id: DatasetId,
+        mut derived: Vec<ManifestObject>,
+        max_objects: usize,
+    ) -> Result<Self, ManifestPlanError> {
+        if max_objects == 0 || derived.is_empty() || derived.len() > max_objects {
+            return Err(ManifestPlanError::SmallFileCeiling { max_objects });
+        }
+        derived.sort_unstable_by(|left, right| {
+            left.content_hash
+                .cmp(&right.content_hash)
+                .then_with(|| left.row_count.cmp(&right.row_count))
+                .then_with(|| left.size_bytes.cmp(&right.size_bytes))
+                .then_with(|| left.lineage_digest.cmp(&right.lineage_digest))
+        });
+        if derived
+            .windows(2)
+            .any(|pair| pair[0].content_hash == pair[1].content_hash)
+        {
+            return Err(ManifestPlanError::DuplicateDerivedObject);
+        }
+        Self::from_objects(dataset_id, derived)
+    }
+
     /// Returns the dataset identity.
     pub const fn dataset_id(&self) -> &DatasetId {
         &self.dataset_id
@@ -320,6 +523,24 @@ pub enum ManifestPlanError {
     /// Generation zero is reserved.
     #[error("manifest version must be nonzero")]
     InvalidManifestVersion,
+    /// The compatibility constructor was asked to manufacture a noncanonical research identity.
+    #[error("manifest dataset schema identity is invalid")]
+    InvalidDatasetSchema,
+    /// The build specification used the reserved all-zero identity.
+    #[error("dataset build-specification digest is invalid")]
+    InvalidBuildSpecDigest,
+    /// A derived generation must name between one and 256 exact parents.
+    #[error("derived generation parent count is invalid")]
+    InvalidDerivedParentCount,
+    /// One exact derived parent was supplied more than once.
+    #[error("derived generation repeats an exact parent")]
+    DuplicateDerivedParent,
+    /// One dataset/version coordinate carried conflicting retained identities.
+    #[error("derived generation parent identity conflicts")]
+    ConflictingDerivedParent,
+    /// A derived generation repeated one content-addressed physical object.
+    #[error("derived generation repeats a physical object")]
+    DuplicateDerivedObject,
     /// A Parquet object cannot be empty.
     #[error("manifest object must contain rows and bytes")]
     EmptyObject,

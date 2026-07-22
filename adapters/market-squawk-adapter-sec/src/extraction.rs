@@ -12,8 +12,9 @@ use market_squawk_domain::{
 };
 use market_squawk_sources::{
     AvailabilityEvidence as ExtractionAvailabilityEvidence, DiscoveryBatch, DiscoveryRequest,
-    ExtractionAuthority, ExtractionBatch, ExtractionRecord, ExtractionRequest, ExtractionSource,
-    ExtractionSourceError, MAX_EXTRACTION_RECORD_BYTES, SourceError, SourceMetadataProvider,
+    ExtractionAuthority, ExtractionBatch, ExtractionRecord, ExtractionRequest,
+    ExtractionRevisionEvidence, ExtractionRevisionPlan, ExtractionSource, ExtractionSourceError,
+    MAX_EXTRACTION_RECORD_BYTES, ObservedProviderOrder, SourceError, SourceMetadataProvider,
     SourceObject,
 };
 use sha2::{Digest as _, Sha256};
@@ -26,6 +27,47 @@ use crate::{
 };
 
 const RESEARCH_RECORD_SCHEMA: &str = "market-squawk-research-v3";
+
+impl SecEdgarSource {
+    /// Builds provider-owned revision evidence aligned to one extracted SEC batch.
+    ///
+    /// Exact canonical source-record identity is the version token. The SEC acceptance timestamp,
+    /// or filing civil date when no acceptance timestamp is published, is the provider order.
+    /// Neither coordinate is promoted to first-public-availability evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecClientError::RegistrationMismatch`] when the batch belongs to another source
+    /// metadata revision. Returns [`SecClientError::InvalidCompositeRepresentation`] when a record
+    /// lacks provider publication order, and [`SecClientError::RevisionAuthority`] when bounded
+    /// exact-evidence invariants fail.
+    pub fn revision_plan(
+        &self,
+        batch: &ExtractionBatch,
+    ) -> Result<ExtractionRevisionPlan, SecClientError> {
+        if batch.request().object().source_id() != self.metadata().source_id()
+            || batch.request().object().metadata_revision() != self.metadata().revision()
+        {
+            return Err(SecClientError::RegistrationMismatch);
+        }
+        let mut evidence = Vec::new();
+        evidence
+            .try_reserve_exact(batch.records().len())
+            .map_err(|_| SecClientError::AllocationFailed)?;
+        for record in batch.records() {
+            let version = record.revision().as_str().as_bytes();
+            let published = record
+                .published_time()
+                .cloned()
+                .ok_or(SecClientError::InvalidCompositeRepresentation)?;
+            let order = ObservedProviderOrder::try_new(published, version)?;
+            evidence.push(ExtractionRevisionEvidence::provider_supplied(
+                version, order,
+            )?);
+        }
+        ExtractionRevisionPlan::try_new(evidence).map_err(Into::into)
+    }
+}
 
 enum DatasetLocator<'a> {
     Submissions(&'a str),
@@ -259,7 +301,7 @@ fn canonical_record(
     let context = observation_context(&observation)?;
     let time = context.time();
     let availability = extraction_availability(context.provenance().availability());
-    let revision = SourceIdentifier::try_from(time.revision().get().to_string())?;
+    let revision = context.provenance().source_identifier().clone();
     let mut writer = CanonicalRecordWriter::new(cancellation);
     if serde_json::to_writer(&mut writer, &observation).is_err() {
         return if cancellation.is_cancelled() {
@@ -422,6 +464,7 @@ fn map_client_error(error: SecClientError) -> ExtractionSourceError {
         SecClientError::Parser(_)
         | SecClientError::Normalization(_)
         | SecClientError::Xbrl(_)
+        | SecClientError::RevisionAuthority(_)
         | SecClientError::RegistrationMismatch
         | SecClientError::InvalidCompositeRepresentation
         | SecClientError::InvalidCompanionSet => SourceError::InvalidProtocolState,

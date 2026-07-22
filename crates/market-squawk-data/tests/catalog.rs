@@ -4,7 +4,7 @@ use std::time::Duration;
 use market_squawk_data::{
     ArtifactRecord, BackupReceipt, Catalog, CatalogAuthority, CatalogConfig, CatalogError,
     CatalogLimit, CatalogResultLimits, ContractCompletion, DatasetManifestRecord, IngestIdentity,
-    IngestRunState, RightsDecisionInput, RightsError, SourceCursor, SourceOperation,
+    IngestRunState, RightsBasis, RightsDecisionInput, RightsError, SourceCursor, SourceOperation,
 };
 use market_squawk_domain::{
     AuthorizationBasis, ChecksumCapability, ContractRollMapping, CoverageDelay, DataQuality,
@@ -42,17 +42,11 @@ fn catalog_enforces_rights_and_recovers_the_complete_control_record() -> TestRes
     let instrument = test_instrument("e93cb0b3-749f-4efe-a58c-22a788764bc0", "inactive")?;
     let successor = test_instrument("e7c627d2-147c-45ef-b882-10aab0639db0", "active")?;
     let payload = digest(11);
-    let rights_input = test_rights_input(source.source_id().clone(), payload, i64::MAX);
-    let invalid_rights = RightsDecisionInput {
-        source_id: source.source_id().clone(),
-        payload_digest: payload,
-        retrieved_at: Timestamp::from_unix_nanos(15),
-        terms_url: "https://user@example.test/terms#fragment".to_owned(),
-        terms_digest: digest(31),
-        authorization_evidence: digest(32),
-        authorization_expires_at: Some(Timestamp::from_unix_nanos(i64::MAX)),
-        permitted_operations: vec![SourceOperation::Persist],
-    };
+    let rights_input = test_rights_input(source.source_id().clone(), payload, i64::MAX)?;
+    assert!(matches!(
+        RightsBasis::reviewed_terms("https://user@example.test/terms#fragment", digest(31)),
+        Err(RightsError::InvalidTermsReference)
+    ));
 
     let catalog = CatalogAuthority::open(config.clone())?;
     let health = catalog.health()?;
@@ -61,7 +55,7 @@ fn catalog_enforces_rights_and_recovers_the_complete_control_record() -> TestRes
     assert!(!health.trusted_schema());
     assert_eq!(health.synchronous(), 2);
     assert_eq!(health.busy_timeout(), Duration::from_millis(750));
-    assert_eq!(health.applied_migrations(), 5);
+    assert_eq!(health.applied_migrations(), 9);
     assert!(matches!(
         CatalogAuthority::open(config.clone()),
         Err(CatalogError::WriterAlreadyOpen)
@@ -80,7 +74,7 @@ fn catalog_enforces_rights_and_recovers_the_complete_control_record() -> TestRes
         CatalogAuthority::open(alias_config),
         Err(CatalogError::UnsafePath)
     ));
-    assert_eq!(catalog.health()?.applied_migrations(), 5);
+    assert_eq!(catalog.health()?.applied_migrations(), 9);
     drop(catalog);
     std::fs::remove_file(alias_location.path())?;
     let catalog = CatalogAuthority::open(config.clone())?;
@@ -88,13 +82,7 @@ fn catalog_enforces_rights_and_recovers_the_complete_control_record() -> TestRes
     catalog.register_source(&source_v1, Timestamp::from_unix_nanos(9))?;
     catalog.register_source(&source, Timestamp::from_unix_nanos(10))?;
     assert!(matches!(
-        catalog.admit_source_rights(invalid_rights),
-        Err(CatalogError::RightsDenied(
-            RightsError::InvalidTermsReference
-        ))
-    ));
-    assert!(matches!(
-        catalog.admit_source_rights(test_rights_input(source.source_id().clone(), payload, 100,)),
+        catalog.admit_source_rights(test_rights_input(source.source_id().clone(), payload, 100,)?),
         Err(CatalogError::RightsDenied(
             RightsError::AuthorizationExpired
         ))
@@ -177,7 +165,7 @@ fn catalog_enforces_rights_and_recovers_the_complete_control_record() -> TestRes
         source.source_id().clone(),
         conflicting_payload,
         i64::MAX,
-    ))?;
+    )?)?;
     assert!(matches!(
         catalog.reserve_ingest(&conflicting_identity, &conflicting_rights),
         Err(CatalogError::IdempotencyConflict)
@@ -353,7 +341,7 @@ fn catalog_enforces_rights_and_recovers_the_complete_control_record() -> TestRes
             source.source_id().clone(),
             payload,
             i64::MAX,
-        )),
+        )?),
         Err(CatalogError::AuthorityClockRollback)
     ));
     assert!(matches!(
@@ -397,17 +385,16 @@ fn test_rights_input(
     source_id: SourceId,
     payload_digest: EvidenceDigest,
     expires_at: i64,
-) -> RightsDecisionInput {
-    RightsDecisionInput {
+) -> TestResult<RightsDecisionInput> {
+    Ok(RightsDecisionInput {
         source_id,
         payload_digest,
         retrieved_at: Timestamp::from_unix_nanos(15),
-        terms_url: "https://example.test/terms/v1".to_owned(),
-        terms_digest: digest(31),
+        basis: RightsBasis::reviewed_terms("https://example.test/terms/v1", digest(31))?,
         authorization_evidence: digest(32),
         authorization_expires_at: Some(Timestamp::from_unix_nanos(expires_at)),
         permitted_operations: vec![SourceOperation::Retrieve, SourceOperation::Persist],
-    }
+    })
 }
 
 fn shift_timestamp(timestamp: Timestamp, nanoseconds: i64) -> Result<Timestamp, CatalogError> {

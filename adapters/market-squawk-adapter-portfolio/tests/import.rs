@@ -302,6 +302,7 @@ fn observation_revision(observation: &ResearchObservation) -> RevisionNumber {
         ResearchObservation::Transaction(value) => value.context().time().revision(),
         ResearchObservation::CorporateAction(value) => value.context().time().revision(),
         ResearchObservation::AlternativeData(value) => value.context().time().revision(),
+        ResearchObservation::UniverseMembership(value) => value.context().time().revision(),
     }
 }
 

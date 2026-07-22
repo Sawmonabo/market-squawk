@@ -3,7 +3,8 @@
 use std::collections::BTreeSet;
 
 use market_squawk_domain::{
-    ResearchTemporalCoordinate, ResearchTime, RevisionNumber, SourceIdentifier, Timestamp,
+    InstrumentId, ResearchTemporalCoordinate, ResearchTime, RevisionNumber, SourceIdentifier,
+    Timestamp,
 };
 use rust_decimal::Decimal;
 use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
@@ -13,7 +14,7 @@ use std::marker::PhantomData;
 
 use crate::{ExtractionLimits, FileAdapterError};
 
-const MANIFEST_SCHEMA_VERSION: u16 = 2;
+pub(super) const MANIFEST_SCHEMA_VERSION: u16 = 3;
 const MAX_MANIFEST_OBJECTS: usize = 4_096;
 pub(super) const MAX_MAPPINGS: usize = 1_024;
 
@@ -80,7 +81,36 @@ pub(crate) struct FileObjectSpec {
     pub(crate) superseded_at: Option<Timestamp>,
     /// Record coordinates retained independently from the exact discovery-object interval.
     pub(crate) record_time: FileRecordTimeSpec,
+    pub(crate) instrument_binding: InstrumentBinding,
     pub(crate) row_policy: RowPolicy,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum InstrumentBinding {
+    Unscoped,
+    InternalInstrument { instrument_id: InstrumentId },
+}
+
+impl InstrumentBinding {
+    pub(crate) const fn instrument_id(&self) -> Option<InstrumentId> {
+        match self {
+            Self::Unscoped => None,
+            Self::InternalInstrument { instrument_id } => Some(*instrument_id),
+        }
+    }
+
+    pub(crate) fn bind_identity(&self, hasher: &mut sha2::Sha256) {
+        use sha2::Digest as _;
+
+        match self {
+            Self::Unscoped => hasher.update(b"unscoped"),
+            Self::InternalInstrument { instrument_id } => {
+                hasher.update(b"internal-instrument");
+                hasher.update(instrument_id.as_uuid().as_bytes());
+            }
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]

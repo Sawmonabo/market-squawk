@@ -172,6 +172,11 @@ async fn exercise_source(
             CancellationToken::new(),
         )
         .await?;
+    let revisions = source.revision_plan(&extraction)?;
+    assert_eq!(
+        revisions.is_locally_observed(),
+        quality == DataQuality::OfficialDelayed
+    );
     let urls = transport
         .requested_urls
         .lock()

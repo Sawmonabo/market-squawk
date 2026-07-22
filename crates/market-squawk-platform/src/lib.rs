@@ -48,7 +48,8 @@ pub use config::{
 pub use input::{
     BoundedInput, ControlledInputFileError, InputFileCapability, InputFileError, InputFileIdentity,
     InputReadCheckpoint, InputReadControl, InputReadControlError, InputReadPass,
-    UserAuthorizedInputRoot, VerifiedInputFile,
+    UserAuthorizedInputRoot, UserOwnedInputAuthority, UserOwnedInputEvidence,
+    UserOwnedInputRootIdentityDigest, VerifiedInputFile,
 };
 pub use journal::{
     JournalError, JournalReader, JournalReplayAuthority, JournalSinkConstructionError,

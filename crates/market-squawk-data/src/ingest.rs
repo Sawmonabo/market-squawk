@@ -8,10 +8,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use arrow::record_batch::RecordBatch;
-use market_squawk_domain::{
-    DigestAlgorithm, EvidenceDigest, SchemaVersion, SourceIdentifier, Timestamp,
+use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp};
+use market_squawk_sources::{
+    ExtractionBatch, ExtractionContentIdentity, ExtractionError, ExtractionRevisionPlan,
+    ObservedRevisionAuthority, ObservedRevisionError, SourceClass, SourceMetadata,
 };
-use market_squawk_sources::{ExtractionBatch, ExtractionContentIdentity, ExtractionError};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -19,6 +20,7 @@ use tokio_util::sync::CancellationToken;
 use crate::analytical_backup::AnalyticalOperationGate;
 use crate::authority_transition::{AuthorityTransitionError, AuthorityTransitionService};
 use crate::blocking_supervisor::BlockingIoSupervisor;
+use crate::catalog::CatalogObservedRevisionAuthority;
 #[cfg(test)]
 use crate::catalog::QueryArtifactBindCheckpoint;
 use crate::catalog::QueryArtifactPublisher;
@@ -27,14 +29,16 @@ use crate::parquet_store::{ArtifactRootIdentity, QueryArtifactWriterAdmission};
 use crate::query::QueryArtifactMemoryLease;
 use crate::{
     AnalyticalManifestCatalog, ArrowConversionError, ArtifactRecord, CatalogAuthority,
-    CatalogError, ContractCompletion, DatasetId, DatasetManifestRecord, DatasetManifestRef,
-    GenerationKind, IngestReservation, IngestRunState, ManifestCatalogError, ManifestObject,
-    ManifestPlan, ManifestPlanError, ObjectStoreConfig, OrphanRecoveryReport, ParquetObjectStore,
-    ParquetStoreError, PinnedDataset, PublishedObject, QueryArtifactReservation,
-    QueryArtifactReservationInput, ResearchArrowBatch, Sha256Digest, SourceOperation,
+    CatalogError, ContractCompletion, DatasetArrowBatch, DatasetId, DatasetManifestRecord,
+    DatasetManifestRef, DatasetSchemaRef, GenerationKind, IngestIdentity, IngestReservation,
+    IngestRunState, ManifestCatalogError, ManifestObject, ManifestPlan, ManifestPlanError,
+    ObjectStoreConfig, OrphanRecoveryReport, ParquetObjectStore, ParquetStoreError, PinnedDataset,
+    PublishedObject, QueryArtifactReservation, QueryArtifactReservationInput, ResearchArrowBatch,
+    RightsDecisionInput, Sha256Digest, SourceOperation,
 };
 
 const ORPHAN_RECOVERY_DEADLINE: Duration = Duration::from_secs(30);
+const REVISION_ASSIGNMENT_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Exact immutable generation returned after successful reconciliation or commit.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -69,11 +73,14 @@ impl CompactionRequest {
     /// Constructs a request bound to one exact immutable source generation.
     pub fn new(source: DatasetManifestRef) -> Self {
         let mut digest = Sha256::new();
-        digest.update(b"market-squawk/analytical-compaction/v1");
+        digest.update(b"market-squawk/analytical-compaction/v2");
         digest.update((source.dataset_id().as_str().len() as u64).to_be_bytes());
         digest.update(source.dataset_id().as_str().as_bytes());
         digest.update(source.manifest_version().to_be_bytes());
+        digest.update((source.schema().name().len() as u64).to_be_bytes());
+        digest.update(source.schema().name().as_bytes());
         digest.update(source.schema_version().get().to_be_bytes());
+        digest.update(source.schema().fingerprint());
         digest.update(source.content_hash().bytes());
         Self {
             source,
@@ -110,6 +117,15 @@ pub trait ResearchIngestService {
         &self,
         reservation: IngestReservation,
         batch: ExtractionBatch,
+        cancellation: CancellationToken,
+    ) -> Result<CommittedDataset, IngestError>;
+
+    /// Assigns durable revisions from explicit source-specific evidence before publication.
+    async fn ingest_with_revision_plan(
+        &self,
+        reservation: IngestReservation,
+        batch: ExtractionBatch,
+        revisions: ExtractionRevisionPlan,
         cancellation: CancellationToken,
     ) -> Result<CommittedDataset, IngestError>;
 }
@@ -505,6 +521,58 @@ impl AnalyticalDataService {
         Arc::clone(&self.objects)
     }
 
+    /// Returns the rights-bound point-in-time dataset builder for this exact catalog/root pair.
+    pub fn dataset_builder(&self) -> crate::DatasetBuilderService<'_> {
+        crate::DatasetBuilderService::new(
+            self,
+            Arc::clone(&self.authority),
+            self.operation_gate.clone(),
+        )
+    }
+
+    /// Returns object-safe observed-revision authority over this exact shared catalog writer.
+    pub fn observed_revision_authority(&self) -> Arc<dyn ObservedRevisionAuthority> {
+        Arc::new(CatalogObservedRevisionAuthority::new(Arc::clone(
+            &self.authority,
+        )))
+    }
+
+    /// Registers a source and atomically admits and reserves one exact persist operation through
+    /// this service's sole catalog authority.
+    pub async fn reserve_source_ingest(
+        &self,
+        source: &SourceMetadata,
+        registered_at: Timestamp,
+        rights: RightsDecisionInput,
+        identity: &IngestIdentity,
+        cancellation: &CancellationToken,
+    ) -> Result<IngestReservation, IngestError> {
+        if source.source_id() != identity.source_id()
+            || rights.source_id != *identity.source_id()
+            || rights.payload_digest != identity.payload_digest()
+            || identity.operation() != SourceOperation::Persist
+        {
+            return Err(IngestError::ReservationPayloadMismatch);
+        }
+        let _operation = self
+            .operation_gate
+            .acquire(cancellation)
+            .await
+            .ok_or(IngestError::Cancelled)?;
+        let authority = self.lock_authority()?;
+        if authority
+            .source(source.source_id())?
+            .as_ref()
+            .is_none_or(|registered| registered != source)
+        {
+            authority.register_source(source, registered_at)?;
+        }
+        let grant = authority.admit_source_rights(rights)?;
+        authority
+            .reserve_ingest(identity, &grant)
+            .map_err(Into::into)
+    }
+
     /// Returns sealed backup authority for this exact active catalog and artifact root.
     pub fn backup_service(&self) -> crate::AnalyticalBackupService {
         crate::AnalyticalBackupService::new(
@@ -548,6 +616,17 @@ impl AnalyticalDataService {
         Ok(self.manifests.pinned(manifest)?)
     }
 
+    /// Resolves a unique derived generation by its complete immutable build identity.
+    pub(crate) fn matching_derived_build(
+        &self,
+        dataset_id: &DatasetId,
+        build_spec_digest: crate::DatasetBuildSpecDigest,
+    ) -> Result<Option<PinnedDataset>, IngestError> {
+        self.manifests
+            .matching_derived_build(dataset_id, build_spec_digest)
+            .map_err(Into::into)
+    }
+
     /// Rewrites the current pinned generation into one immutable object without changing rows.
     pub async fn compact(
         &self,
@@ -583,7 +662,8 @@ impl AnalyticalDataService {
             request.payload_digest(),
             batches,
         )?;
-        let schema_version = compacted.schema_version()?;
+        let schema = compacted.schema_ref().clone();
+        let compacted = DatasetArrowBatch::from(compacted);
         let _operation = self
             .operation_gate
             .acquire(&cancellation)
@@ -604,7 +684,7 @@ impl AnalyticalDataService {
         let publication = self.objects.begin_publication(&cancellation).await?;
         let published = self
             .objects
-            .publish_under_lease(compacted.record_batch(), &cancellation, &publication)
+            .publish_dataset_under_lease(&compacted, &cancellation, &publication)
             .await?;
         if cancellation.is_cancelled() {
             return Err(IngestError::Cancelled);
@@ -628,7 +708,7 @@ impl AnalyticalDataService {
             &reservation,
             run.state(),
             request.source().dataset_id(),
-            schema_version,
+            &schema,
             &object,
         )? {
             return Ok(committed);
@@ -639,9 +719,9 @@ impl AnalyticalDataService {
         self.commit_plan(
             &authority,
             &reservation,
-            run.state(),
+            &run,
             dataset_name,
-            schema_version,
+            schema,
             plan,
             published,
             GenerationKind::Compaction,
@@ -703,6 +783,7 @@ impl AnalyticalDataService {
         &self,
         reservation: IngestReservation,
         batch: ExtractionBatch,
+        revision_plan: Option<ExtractionRevisionPlan>,
         cancellation: CancellationToken,
     ) -> Result<CommittedDataset, IngestError> {
         let payload_digest = extraction_batch_digest(&batch)?;
@@ -722,11 +803,47 @@ impl AnalyticalDataService {
                 return Ok(committed);
             }
         }
-        let converted = ResearchArrowBatch::try_from_extraction_batch(&batch)?;
-        let schema_version = converted.schema_version()?;
+        let observations = ResearchArrowBatch::validated_extraction_observations(&batch)?;
+        let revision_plan = match revision_plan {
+            Some(plan) => plan,
+            None => {
+                let authority = self.lock_authority()?;
+                let source = authority
+                    .source(&source_id)?
+                    .ok_or(IngestError::UnknownSource)?;
+                if !matches!(
+                    source.source_class(),
+                    SourceClass::LocalFile | SourceClass::PortfolioExport
+                ) {
+                    return Err(IngestError::RevisionEvidenceRequired);
+                }
+                ExtractionRevisionPlan::locally_observed(observations.len())
+                    .map_err(map_revision_error)?
+            }
+        };
+        if revision_plan.len() != observations.len() {
+            return Err(IngestError::RevisionEvidenceMismatch);
+        }
+        let observed_batch = revision_plan
+            .into_observed_batch(source_id.clone(), &observations)
+            .map_err(map_revision_error)?;
+        let deadline = Instant::now()
+            .checked_add(REVISION_ASSIGNMENT_DEADLINE)
+            .ok_or(IngestError::DeadlineExceeded)?;
+        let assignments = self
+            .observed_revision_authority()
+            .assign(observed_batch, deadline, cancellation.clone())
+            .await
+            .map_err(map_revision_error)?;
+        let converted = ResearchArrowBatch::try_from_extraction_batch_with_assigned_revisions(
+            &batch,
+            assignments.as_slice(),
+        )?;
+        let schema = converted.schema_ref().clone();
         let lineage = converted.lineage_digest()?;
+        let converted = DatasetArrowBatch::from(converted);
         self.manifests
-            .validate_append_schema(&dataset_id, schema_version)?;
+            .validate_append_schema(&dataset_id, &schema)?;
         let _operation = self
             .operation_gate
             .acquire(&cancellation)
@@ -743,7 +860,7 @@ impl AnalyticalDataService {
         let publication = self.objects.begin_publication(&cancellation).await?;
         let published = self
             .objects
-            .publish_under_lease(converted.record_batch(), &cancellation, &publication)
+            .publish_dataset_under_lease(&converted, &cancellation, &publication)
             .await?;
         if cancellation.is_cancelled() {
             return Err(IngestError::Cancelled);
@@ -762,20 +879,18 @@ impl AnalyticalDataService {
             &reservation,
             run.state(),
             &dataset_id,
-            schema_version,
+            &schema,
             &object,
         )? {
             return Ok(committed);
         }
-        let plan = self
-            .manifests
-            .preview_append(dataset_id, schema_version, object)?;
+        let plan = self.manifests.preview_append(dataset_id, &schema, object)?;
         self.commit_plan(
             &authority,
             &reservation,
-            run.state(),
+            &run,
             dataset_name,
-            schema_version,
+            schema,
             plan,
             published,
             GenerationKind::Ingest,
@@ -837,7 +952,7 @@ impl AnalyticalDataService {
         reservation: &IngestReservation,
         state: IngestRunState,
         dataset_id: &DatasetId,
-        schema_version: SchemaVersion,
+        schema: &DatasetSchemaRef,
         object: &ManifestObject,
     ) -> Result<Option<CommittedDataset>, IngestError> {
         let Some(existing) = self.manifests.for_run(reservation.run_id())? else {
@@ -848,7 +963,7 @@ impl AnalyticalDataService {
             };
         };
         if existing.manifest().dataset_id() != dataset_id
-            || existing.manifest().schema_version() != schema_version
+            || existing.manifest().schema() != schema
             || existing.plan().objects().last() != Some(object)
         {
             return Err(IngestError::ReplayConflict);
@@ -871,14 +986,14 @@ impl AnalyticalDataService {
         &self,
         authority: &CatalogAuthority,
         reservation: &IngestReservation,
-        state: IngestRunState,
+        run: &crate::IngestRunRecord,
         dataset_name: SourceIdentifier,
-        schema_version: SchemaVersion,
+        schema: DatasetSchemaRef,
         plan: ManifestPlan,
         published: PublishedObject,
         kind: GenerationKind,
     ) -> Result<CommittedDataset, IngestError> {
-        if state != IngestRunState::Reserved {
+        if run.state() != IngestRunState::Reserved {
             return Err(IngestError::TerminalRun);
         }
         let created_at = published.created_at().max(reservation.requested_at());
@@ -890,7 +1005,7 @@ impl AnalyticalDataService {
         )?;
         let anchor = DatasetManifestRecord::try_new(
             dataset_name,
-            schema_version,
+            schema.version(),
             artifact.artifact_id(),
             plan.content_hash().evidence(),
             created_at,
@@ -900,7 +1015,12 @@ impl AnalyticalDataService {
             &plan,
             publication.artifact(),
             publication.manifest(),
+            &schema,
             kind,
+            match kind {
+                GenerationKind::Ingest => Some(run),
+                GenerationKind::Compaction | GenerationKind::Derived => None,
+            },
         )?;
         authority.complete_ingest(reservation, ContractCompletion::Succeeded)?;
         Ok(CommittedDataset::new(self.manifests.pinned(&manifest)?))
@@ -933,6 +1053,14 @@ fn map_authority_transition_error(error: AuthorityTransitionError) -> IngestErro
     }
 }
 
+fn map_revision_error(error: ObservedRevisionError) -> IngestError {
+    match error {
+        ObservedRevisionError::Cancelled => IngestError::Cancelled,
+        ObservedRevisionError::DeadlineExceeded => IngestError::DeadlineExceeded,
+        error => IngestError::RevisionAuthority(error),
+    }
+}
+
 impl ResearchIngestService for AnalyticalDataService {
     async fn ingest(
         &self,
@@ -940,7 +1068,19 @@ impl ResearchIngestService for AnalyticalDataService {
         batch: ExtractionBatch,
         cancellation: CancellationToken,
     ) -> Result<CommittedDataset, IngestError> {
-        self.ingest_batch(reservation, batch, cancellation).await
+        self.ingest_batch(reservation, batch, None, cancellation)
+            .await
+    }
+
+    async fn ingest_with_revision_plan(
+        &self,
+        reservation: IngestReservation,
+        batch: ExtractionBatch,
+        revisions: ExtractionRevisionPlan,
+        cancellation: CancellationToken,
+    ) -> Result<CommittedDataset, IngestError> {
+        self.ingest_batch(reservation, batch, Some(revisions), cancellation)
+            .await
     }
 }
 
@@ -974,6 +1114,18 @@ pub enum IngestError {
     /// Canonical extraction content identity could not be constructed.
     #[error("extraction batch semantic identity construction failed")]
     ContentIdentity(#[source] ExtractionError),
+    /// Source-specific revision evidence or durable assignment failed.
+    #[error("observed revision assignment failed")]
+    RevisionAuthority(#[source] ObservedRevisionError),
+    /// A non-local source omitted mandatory provider version and ordering evidence.
+    #[error("provider extraction requires explicit revision evidence")]
+    RevisionEvidenceRequired,
+    /// Revision evidence did not align one-for-one with normalized extraction records.
+    #[error("revision evidence does not match the extraction batch")]
+    RevisionEvidenceMismatch,
+    /// The extraction source was not registered in the retained catalog.
+    #[error("analytical ingest source is unknown")]
+    UnknownSource,
     /// The reservation does not exist in this authority.
     #[error("analytical ingest reservation is unknown")]
     UnknownReservation,

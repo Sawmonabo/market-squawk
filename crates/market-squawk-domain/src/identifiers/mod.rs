@@ -169,6 +169,13 @@ macro_rules! source_symbol {
             pub fn as_str(&self) -> &str {
                 &self.0
             }
+
+            /// Returns bytes retained by the source symbol's owned string allocation.
+            ///
+            /// This can exceed [`Self::as_str`] length when construction retained spare capacity.
+            pub fn retained_bytes(&self) -> usize {
+                self.0.capacity()
+            }
         }
 
         impl TryFrom<&str> for $name {

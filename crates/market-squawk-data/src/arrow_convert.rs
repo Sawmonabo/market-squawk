@@ -1,5 +1,6 @@
 //! Exact canonical-observation conversion to and from Arrow.
 
+use std::mem::size_of;
 use std::sync::Arc;
 
 use arrow::array::{
@@ -12,11 +13,11 @@ use arrow::record_batch::RecordBatch;
 use market_squawk_domain::{
     AvailabilityEvidence, DataQuality, DigestAlgorithm, EvidenceDigest, ExactPayloadEvidence,
     MetadataRevision, ResearchContext, ResearchObservation, ResearchTemporalCoordinate,
-    SchemaVersion, SourceId, SourceIdentifier, Timestamp,
+    RevisionNumber, SchemaVersion, SourceId, SourceIdentifier, Timestamp,
 };
 use market_squawk_sources::{
-    AvailabilityEvidence as SourceAvailabilityEvidence, DiscoveryRequestId, ExtractionBatch,
-    ExtractionRequestId, payload_matches_exact_evidence,
+    AvailabilityEvidence as SourceAvailabilityEvidence, CanonicalObservationPayload,
+    DiscoveryRequestId, ExtractionBatch, ExtractionRequestId, payload_matches_exact_evidence,
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -25,13 +26,21 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use crate::schema::{
-    DATASET_KEY, REQUEST_DIGEST_KEY, RESEARCH_RECORD_SCHEMA, RESEARCH_SCHEMA_VERSION,
-    SCHEMA_VERSION_KEY, decode_hex, research_schema,
+    DATASET_KEY, REQUEST_DIGEST_KEY, RESEARCH_RECORD_SCHEMA, RESEARCH_SCHEMA_NAME,
+    RESEARCH_SCHEMA_VERSION, SCHEMA_VERSION_KEY, decode_hex, research_schema,
 };
+pub use crate::schema::{
+    DatasetSchemaError, DatasetSchemaRef, DatasetSchemaRegistry, FeatureLabelBatchBindings,
+};
+
+#[path = "arrow_convert/dataset.rs"]
+mod dataset;
+pub use dataset::DatasetArrowBatch;
 
 /// A request- and dataset-bound canonical Arrow record batch.
 #[derive(Clone, Debug)]
 pub struct ResearchArrowBatch {
+    schema_ref: DatasetSchemaRef,
     batch: RecordBatch,
 }
 
@@ -65,13 +74,31 @@ struct ExtractionRowLineage {
     availability: SourceAvailabilityEvidence,
     revision: SourceIdentifier,
     superseded_time: Option<ResearchTemporalCoordinate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    revision_assignment: Option<RevisionAssignmentLineage>,
 }
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct RevisionAssignmentLineage {
+    assigned_revision: RevisionNumber,
+    semantic_payload_identity: EvidenceDigest,
+}
+
+const EXTRACTION_LINEAGE_SCHEMA_VERSION: u16 = 4;
+const LEGACY_EXTRACTION_LINEAGE_SCHEMA_VERSION: u16 = 3;
 
 impl ResearchArrowBatch {
     /// Converts only canonical observations retained by one exact extraction request.
     pub fn try_from_extraction_batch(
         extraction: &ExtractionBatch,
     ) -> Result<Self, ArrowConversionError> {
+        Self::try_from_extraction_batch_with_revisions(extraction, None)
+    }
+
+    /// Returns source-validated canonical observations before durable revision rebinding.
+    pub(crate) fn validated_extraction_observations(
+        extraction: &ExtractionBatch,
+    ) -> Result<Vec<ResearchObservation>, ArrowConversionError> {
         if extraction.records().is_empty() {
             return Err(ArrowConversionError::EmptyBatch);
         }
@@ -79,11 +106,10 @@ impl ResearchArrowBatch {
         let request_digest =
             EvidenceDigest::new(DigestAlgorithm::Sha256, Sha256::digest(request).into());
         let mut observations = Vec::with_capacity(extraction.records().len());
-        let mut lineages = Vec::with_capacity(extraction.records().len());
         for record in extraction.records() {
             let observation: ResearchObservation = serde_json::from_slice(record.payload())?;
             let lineage = RowLineage::Extraction(Box::new(ExtractionRowLineage {
-                schema_version: RESEARCH_SCHEMA_VERSION,
+                schema_version: LEGACY_EXTRACTION_LINEAGE_SCHEMA_VERSION,
                 source_id: record.source_id().clone(),
                 metadata_revision: record.metadata_revision().clone(),
                 dataset: record.dataset().clone(),
@@ -99,6 +125,7 @@ impl ResearchArrowBatch {
                 availability: record.availability().clone(),
                 revision: record.revision().clone(),
                 superseded_time: record.superseded_time().cloned(),
+                revision_assignment: None,
             }));
             validate_row_lineage(
                 &lineage,
@@ -108,7 +135,80 @@ impl ResearchArrowBatch {
                 record.payload(),
             )?;
             observations.push(observation);
-            lineages.push(lineage);
+        }
+        Ok(observations)
+    }
+
+    pub(crate) fn try_from_extraction_batch_with_assigned_revisions(
+        extraction: &ExtractionBatch,
+        revisions: &[RevisionNumber],
+    ) -> Result<Self, ArrowConversionError> {
+        Self::try_from_extraction_batch_with_revisions(extraction, Some(revisions))
+    }
+
+    fn try_from_extraction_batch_with_revisions(
+        extraction: &ExtractionBatch,
+        revisions: Option<&[RevisionNumber]>,
+    ) -> Result<Self, ArrowConversionError> {
+        let original_observations = Self::validated_extraction_observations(extraction)?;
+        if revisions.is_some_and(|values| values.len() != original_observations.len()) {
+            return Err(ArrowConversionError::RevisionAssignmentMismatch);
+        }
+        let request = serde_json::to_vec(extraction.request())?;
+        let request_digest =
+            EvidenceDigest::new(DigestAlgorithm::Sha256, Sha256::digest(request).into());
+        let mut observations = Vec::with_capacity(original_observations.len());
+        let mut lineages = Vec::with_capacity(original_observations.len());
+        for (index, (record, original)) in extraction
+            .records()
+            .iter()
+            .zip(original_observations)
+            .enumerate()
+        {
+            let assignment = revisions
+                .map(
+                    |values| -> Result<RevisionAssignmentLineage, ArrowConversionError> {
+                        let assigned_revision = values
+                            .get(index)
+                            .copied()
+                            .ok_or(ArrowConversionError::RevisionAssignmentMismatch)?;
+                        let payload = CanonicalObservationPayload::try_from_observation(&original)
+                            .map_err(ArrowConversionError::RevisionAuthority)?;
+                        Ok(RevisionAssignmentLineage {
+                            assigned_revision,
+                            semantic_payload_identity: payload.identity(),
+                        })
+                    },
+                )
+                .transpose()?;
+            let observation = match &assignment {
+                Some(assignment) => original.with_revision(assignment.assigned_revision)?,
+                None => original,
+            };
+            lineages.push(RowLineage::Extraction(Box::new(ExtractionRowLineage {
+                schema_version: if assignment.is_some() {
+                    EXTRACTION_LINEAGE_SCHEMA_VERSION
+                } else {
+                    LEGACY_EXTRACTION_LINEAGE_SCHEMA_VERSION
+                },
+                source_id: record.source_id().clone(),
+                metadata_revision: record.metadata_revision().clone(),
+                dataset: record.dataset().clone(),
+                discovery_request_id: record.discovery_request_id(),
+                extraction_request_id: record.extraction_request_id(),
+                request_digest,
+                object_id: record.object_id().clone(),
+                object_evidence: record.object_evidence().clone(),
+                record_schema: record.schema().clone(),
+                record_evidence: record.evidence().clone(),
+                effective_time: record.effective_time().clone(),
+                published_time: record.published_time().cloned(),
+                availability: record.availability().clone(),
+                revision: record.revision().clone(),
+                superseded_time: record.superseded_time().cloned(),
+                revision_assignment: assignment,
+            })));
+            observations.push(observation);
         }
         let request_digests = vec![request_digest.bytes(); observations.len()];
         Self::try_from_observations_with_requests(
@@ -116,7 +216,7 @@ impl ResearchArrowBatch {
             request_digest,
             request_digests,
             lineages,
-            observations,
+            &observations,
         )
     }
 
@@ -144,7 +244,7 @@ impl ResearchArrowBatch {
             request_digest,
             request_digests,
             lineages,
-            observations,
+            &observations,
         )
     }
 
@@ -158,7 +258,7 @@ impl ResearchArrowBatch {
         if batches.is_empty() {
             return Err(ArrowConversionError::EmptyBatch);
         }
-        let target_schema = research_schema(&dataset, compaction_digest);
+        let target_schema = research_schema(&dataset, compaction_digest)?;
         let mut normalized = Vec::with_capacity(batches.len());
         for batch in batches {
             let validated = Self::try_from_record_batch(batch)?;
@@ -186,7 +286,7 @@ impl ResearchArrowBatch {
         batch_digest: EvidenceDigest,
         request_digests: Vec<[u8; 32]>,
         row_lineages: Vec<RowLineage>,
-        observations: Vec<ResearchObservation>,
+        observations: &[ResearchObservation],
     ) -> Result<Self, ArrowConversionError> {
         if !matches!(batch_digest.algorithm(), DigestAlgorithm::Sha256) {
             return Err(ArrowConversionError::RequestDigestNotSha256);
@@ -195,7 +295,7 @@ impl ResearchArrowBatch {
             return Err(ArrowConversionError::InvalidSchema);
         }
         for ((lineage, observation), request_digest) in
-            row_lineages.iter().zip(&observations).zip(&request_digests)
+            row_lineages.iter().zip(observations).zip(&request_digests)
         {
             let payload = serde_json::to_vec(observation)?;
             validate_row_lineage(lineage, &dataset, *request_digest, observation, &payload)?;
@@ -250,7 +350,7 @@ impl ResearchArrowBatch {
         let mut units = Vec::with_capacity(observations.len());
         let mut currencies = Vec::with_capacity(observations.len());
 
-        for observation in &observations {
+        for observation in observations {
             let payload = serde_json::to_vec(observation)?;
             payload_digests.push(Sha256::digest(&payload).to_vec());
             payloads.push(payload);
@@ -391,13 +491,32 @@ impl ResearchArrowBatch {
             Arc::new(BinaryArray::from_iter_values(payload_digests)),
             Arc::new(BinaryArray::from_iter_values(payloads)),
         ];
+        let schema_ref = DatasetSchemaRegistry::local().canonical_research_observations()?;
+        let batch = RecordBatch::try_new(research_schema(&dataset, batch_digest)?, arrays)?;
+        let validated = DatasetArrowBatch::try_new(schema_ref, batch)?;
         Ok(Self {
-            batch: RecordBatch::try_new(research_schema(&dataset, batch_digest), arrays)?,
+            schema_ref: validated.schema_ref,
+            batch: validated.batch,
         })
     }
 
     /// Validates a persisted batch against the complete current schema and every projected value.
     pub fn try_from_record_batch(batch: RecordBatch) -> Result<Self, ArrowConversionError> {
+        Self::validate_and_decode_record_batch(batch, usize::MAX).map(|(candidate, _, _)| candidate)
+    }
+
+    pub(crate) fn decode_record_batch_bounded(
+        batch: RecordBatch,
+        max_additional_bytes: usize,
+    ) -> Result<(Vec<ResearchObservation>, usize), ArrowConversionError> {
+        Self::validate_and_decode_record_batch(batch, max_additional_bytes)
+            .map(|(_, observations, retained)| (observations, retained))
+    }
+
+    fn validate_and_decode_record_batch(
+        batch: RecordBatch,
+        max_additional_bytes: usize,
+    ) -> Result<(Self, Vec<ResearchObservation>, usize), ArrowConversionError> {
         let metadata = batch.schema().metadata().clone();
         let version = metadata
             .get(SCHEMA_VERSION_KEY)
@@ -406,6 +525,11 @@ impl ResearchArrowBatch {
         if version != RESEARCH_SCHEMA_VERSION {
             return Err(ArrowConversionError::UnsupportedSchemaVersion { found: version });
         }
+        let validated = DatasetArrowBatch::try_from_record_batch(batch)?;
+        if validated.schema_ref.name() != RESEARCH_SCHEMA_NAME {
+            return Err(ArrowConversionError::UnexpectedDatasetSchema);
+        }
+        let DatasetArrowBatch { schema_ref, batch } = validated;
         let dataset = metadata
             .get(DATASET_KEY)
             .ok_or(ArrowConversionError::InvalidSchemaMetadata)
@@ -421,12 +545,16 @@ impl ResearchArrowBatch {
             != research_schema(
                 &dataset,
                 EvidenceDigest::new(DigestAlgorithm::Sha256, request_digest),
-            )
+            )?
             .fields()
         {
             return Err(ArrowConversionError::InvalidSchema);
         }
-        let candidate = Self { batch };
+        let candidate = Self { schema_ref, batch };
+        let (working_bytes, observation_bytes) = candidate.decode_admission()?;
+        if working_bytes > max_additional_bytes {
+            return Err(ArrowConversionError::RetainedLimitExceeded);
+        }
         let observations = candidate.decode_payloads()?;
         let request_digests = candidate.decode_request_digests()?;
         let row_lineages = candidate.decode_row_lineages()?;
@@ -435,17 +563,30 @@ impl ResearchArrowBatch {
             EvidenceDigest::new(DigestAlgorithm::Sha256, request_digest),
             request_digests,
             row_lineages,
-            observations,
+            &observations,
         )?;
         if rebuilt.batch != candidate.batch {
             return Err(ArrowConversionError::ProjectionMismatch);
         }
-        Ok(candidate)
+        Ok((candidate, observations, observation_bytes))
     }
 
     /// Returns the immutable Arrow batch.
     pub const fn record_batch(&self) -> &RecordBatch {
         &self.batch
+    }
+
+    /// Returns the complete canonical research dataset-schema identity.
+    pub const fn schema_ref(&self) -> &DatasetSchemaRef {
+        &self.schema_ref
+    }
+
+    /// Returns the generic registered-dataset publication view.
+    pub fn dataset_batch(&self) -> DatasetArrowBatch {
+        DatasetArrowBatch {
+            schema_ref: self.schema_ref.clone(),
+            batch: self.batch.clone(),
+        }
     }
 
     /// Returns the exact analytical row-schema version retained in this batch.
@@ -455,18 +596,13 @@ impl ResearchArrowBatch {
     /// Returns [`ArrowConversionError::InvalidSchemaMetadata`] when the mandatory version is
     /// absent, malformed, or zero.
     pub fn schema_version(&self) -> Result<SchemaVersion, ArrowConversionError> {
-        self.batch
-            .schema()
-            .metadata()
-            .get(SCHEMA_VERSION_KEY)
-            .and_then(|value| value.parse::<u16>().ok())
-            .and_then(|value| SchemaVersion::new(value).ok())
-            .ok_or(ArrowConversionError::InvalidSchemaMetadata)
+        Ok(self.schema_ref.version())
     }
 
     /// Reconstructs canonical observations after validating every projected column.
     pub fn observations(&self) -> Result<Vec<ResearchObservation>, ArrowConversionError> {
-        Self::try_from_record_batch(self.batch.clone())?.decode_payloads()
+        Self::validate_and_decode_record_batch(self.batch.clone(), usize::MAX)
+            .map(|(_, observations, _)| observations)
     }
 
     /// Hashes the ordered canonical row identities independently of Parquet layout.
@@ -520,13 +656,15 @@ impl ResearchArrowBatch {
             .column_by_name("payload_json")
             .and_then(|array| array.as_any().downcast_ref::<BinaryArray>())
             .ok_or(ArrowConversionError::InvalidSchema)?;
-        payloads
-            .iter()
-            .map(|payload| {
-                let payload = payload.ok_or(ArrowConversionError::InvalidSchema)?;
-                serde_json::from_slice(payload).map_err(ArrowConversionError::from)
-            })
-            .collect()
+        let mut decoded = Vec::new();
+        decoded
+            .try_reserve_exact(payloads.len())
+            .map_err(|_| ArrowConversionError::AllocationFailure)?;
+        for payload in payloads {
+            let payload = payload.ok_or(ArrowConversionError::InvalidSchema)?;
+            decoded.push(serde_json::from_slice(payload)?);
+        }
+        Ok(decoded)
     }
 
     fn decode_request_digests(&self) -> Result<Vec<[u8; 32]>, ArrowConversionError> {
@@ -535,15 +673,19 @@ impl ResearchArrowBatch {
             .column_by_name("request_sha256")
             .and_then(|array| array.as_any().downcast_ref::<BinaryArray>())
             .ok_or(ArrowConversionError::InvalidSchema)?;
-        digests
-            .iter()
-            .map(|digest| {
+        let mut decoded = Vec::new();
+        decoded
+            .try_reserve_exact(digests.len())
+            .map_err(|_| ArrowConversionError::AllocationFailure)?;
+        for digest in digests {
+            decoded.push(
                 digest
                     .ok_or(ArrowConversionError::InvalidSchema)?
                     .try_into()
-                    .map_err(|_| ArrowConversionError::InvalidSchema)
-            })
-            .collect()
+                    .map_err(|_| ArrowConversionError::InvalidSchema)?,
+            );
+        }
+        Ok(decoded)
     }
 
     fn decode_row_lineages(&self) -> Result<Vec<RowLineage>, ArrowConversionError> {
@@ -552,13 +694,133 @@ impl ResearchArrowBatch {
             .column_by_name("extraction_lineage_json")
             .and_then(|array| array.as_any().downcast_ref::<BinaryArray>())
             .ok_or(ArrowConversionError::InvalidSchema)?;
-        lineages
-            .iter()
-            .map(|lineage| {
-                let lineage = lineage.ok_or(ArrowConversionError::InvalidSchema)?;
-                serde_json::from_slice(lineage).map_err(ArrowConversionError::from)
-            })
-            .collect()
+        let mut decoded = Vec::new();
+        decoded
+            .try_reserve_exact(lineages.len())
+            .map_err(|_| ArrowConversionError::AllocationFailure)?;
+        for lineage in lineages {
+            let lineage = lineage.ok_or(ArrowConversionError::InvalidSchema)?;
+            decoded.push(serde_json::from_slice(lineage)?);
+        }
+        Ok(decoded)
+    }
+
+    fn decode_admission(&self) -> Result<(usize, usize), ArrowConversionError> {
+        let payloads = self
+            .batch
+            .column_by_name("payload_json")
+            .and_then(|array| array.as_any().downcast_ref::<BinaryArray>())
+            .ok_or(ArrowConversionError::InvalidSchema)?;
+        let lineages = self
+            .batch
+            .column_by_name("extraction_lineage_json")
+            .and_then(|array| array.as_any().downcast_ref::<BinaryArray>())
+            .ok_or(ArrowConversionError::InvalidSchema)?;
+        let payload_bytes = payloads.iter().try_fold(0_usize, |total, payload| {
+            total
+                .checked_add(payload.ok_or(ArrowConversionError::InvalidSchema)?.len())
+                .ok_or(ArrowConversionError::RetainedSizeOverflow)
+        })?;
+        let lineage_bytes = lineages.iter().try_fold(0_usize, |total, lineage| {
+            total
+                .checked_add(lineage.ok_or(ArrowConversionError::InvalidSchema)?.len())
+                .ok_or(ArrowConversionError::RetainedSizeOverflow)
+        })?;
+        let row_count = self.batch.num_rows();
+        let observation_bytes = row_count
+            .checked_mul(size_of::<ResearchObservation>())
+            .and_then(|bytes| bytes.checked_add(payload_bytes.checked_mul(2)?))
+            .ok_or(ArrowConversionError::RetainedSizeOverflow)?;
+        let lineage_retained = row_count
+            .checked_mul(size_of::<RowLineage>())
+            .and_then(|bytes| bytes.checked_add(lineage_bytes.checked_mul(2)?))
+            .ok_or(ArrowConversionError::RetainedSizeOverflow)?;
+        let request_digest_retained = row_count
+            .checked_mul(size_of::<[u8; 32]>())
+            .ok_or(ArrowConversionError::RetainedSizeOverflow)?;
+        let projection_slots = projection_vector_slot_bytes(row_count)?;
+        let projection_dynamic = projection_dynamic_bytes(&self.batch)?
+            .checked_mul(2)
+            .ok_or(ArrowConversionError::RetainedSizeOverflow)?;
+        let rebuilt_arrow = self
+            .batch
+            .get_array_memory_size()
+            .checked_mul(2)
+            .ok_or(ArrowConversionError::RetainedSizeOverflow)?;
+        // Projection validation retains decoded observations, decoded and reserialized lineage,
+        // request digests, every row-oriented projection vector, and the Arrow arrays already
+        // converted from earlier vectors at the same time. The doubled dynamic/Arrow charges
+        // conservatively admit allocator capacity slack and the current-column conversion.
+        let working_bytes = self
+            .batch
+            .num_columns()
+            .checked_mul(size_of::<ArrayRef>() + (2 * size_of::<usize>()))
+            .and_then(|bytes| bytes.checked_add(64 * 1024))
+            .and_then(|bytes| bytes.checked_add(observation_bytes))
+            .and_then(|bytes| bytes.checked_add(lineage_retained))
+            .and_then(|bytes| bytes.checked_add(request_digest_retained))
+            .and_then(|bytes| bytes.checked_add(projection_slots))
+            .and_then(|bytes| bytes.checked_add(projection_dynamic))
+            .and_then(|bytes| bytes.checked_add(rebuilt_arrow))
+            .ok_or(ArrowConversionError::RetainedSizeOverflow)?;
+        Ok((working_bytes, observation_bytes))
+    }
+}
+
+fn projection_dynamic_bytes(batch: &RecordBatch) -> Result<usize, ArrowConversionError> {
+    batch.columns().iter().try_fold(0_usize, |total, column| {
+        if let Some(values) = column.as_any().downcast_ref::<StringArray>() {
+            return values.iter().try_fold(total, |total, value| {
+                total
+                    .checked_add(value.map_or(0, str::len))
+                    .ok_or(ArrowConversionError::RetainedSizeOverflow)
+            });
+        }
+        if let Some(values) = column.as_any().downcast_ref::<BinaryArray>() {
+            return values.iter().try_fold(total, |total, value| {
+                total
+                    .checked_add(value.map_or(0, <[u8]>::len))
+                    .ok_or(ArrowConversionError::RetainedSizeOverflow)
+            });
+        }
+        Ok(total)
+    })
+}
+
+fn projection_vector_slot_bytes(row_count: usize) -> Result<usize, ArrowConversionError> {
+    let string = size_of::<String>();
+    let optional_string = size_of::<Option<String>>();
+    let borrowed_string = size_of::<&'static str>();
+    let optional_i64 = size_of::<Option<i64>>();
+    let optional_i32 = size_of::<Option<i32>>();
+    let optional_u16 = size_of::<Option<u16>>();
+    let optional_i128 = size_of::<Option<i128>>();
+    let optional_u8 = size_of::<Option<u8>>();
+    let bytes = size_of::<Vec<u8>>();
+
+    let slots_per_row = (3 * bytes) // serialized lineage, payload digest, and payload JSON
+        .checked_add(7 * borrowed_string) // kind, availability/precision, quality, value state
+        .and_then(|value| value.checked_add(2 * string)) // source and source identifier
+        .and_then(|value| value.checked_add(14 * optional_string))
+        .and_then(|value| value.checked_add(8 * optional_i64))
+        .and_then(|value| value.checked_add(2 * size_of::<i64>()))
+        .and_then(|value| value.checked_add(3 * optional_i32))
+        .and_then(|value| value.checked_add(6 * optional_u16))
+        .and_then(|value| value.checked_add(size_of::<u32>()))
+        .and_then(|value| value.checked_add(optional_i128))
+        .and_then(|value| value.checked_add(optional_u8))
+        .ok_or(ArrowConversionError::RetainedSizeOverflow)?;
+    row_count
+        .checked_mul(slots_per_row)
+        .ok_or(ArrowConversionError::RetainedSizeOverflow)
+}
+
+impl From<ResearchArrowBatch> for DatasetArrowBatch {
+    fn from(value: ResearchArrowBatch) -> Self {
+        Self {
+            schema_ref: value.schema_ref,
+            batch: value.batch,
+        }
     }
 }
 
@@ -574,8 +836,10 @@ fn validate_row_lineage(
     let time = context.time();
     let matches = match lineage {
         RowLineage::Extraction(lineage) => {
-            lineage.schema_version == RESEARCH_SCHEMA_VERSION
-                && lineage.source_id == *provenance.source_id()
+            matches!(
+                lineage.schema_version,
+                LEGACY_EXTRACTION_LINEAGE_SCHEMA_VERSION | EXTRACTION_LINEAGE_SCHEMA_VERSION
+            ) && lineage.source_id == *provenance.source_id()
                 && lineage.dataset == *dataset
                 && lineage.request_digest.algorithm() == DigestAlgorithm::Sha256
                 && lineage.request_digest.bytes() == request_digest
@@ -584,7 +848,20 @@ fn validate_row_lineage(
                 && lineage.published_time.as_ref() == time.published()
                 && availability_basis_matches(&lineage.availability, provenance.availability())
                 && lineage.superseded_time.as_ref() == time.superseded()
-                && payload_matches_exact_evidence(payload, &lineage.record_evidence)
+                && match &lineage.revision_assignment {
+                    Some(assignment) => {
+                        lineage.schema_version == EXTRACTION_LINEAGE_SCHEMA_VERSION
+                            && assignment.assigned_revision == time.revision()
+                            && CanonicalObservationPayload::try_from_observation(observation)
+                                .is_ok_and(|semantic| {
+                                    semantic.identity() == assignment.semantic_payload_identity
+                                })
+                    }
+                    None => {
+                        lineage.schema_version == LEGACY_EXTRACTION_LINEAGE_SCHEMA_VERSION
+                            && payload_matches_exact_evidence(payload, &lineage.record_evidence)
+                    }
+                }
         }
         RowLineage::CanonicalObservation {
             schema_version,
@@ -705,6 +982,15 @@ pub enum ArrowConversionError {
     /// Canonical provenance or time disagrees with exact extraction lineage.
     #[error("canonical observation does not match its extraction request and record lineage")]
     ExtractionBindingMismatch,
+    /// Durable assignments were not aligned one-for-one with normalized extraction records.
+    #[error("durable revision assignments do not match the extraction batch")]
+    RevisionAssignmentMismatch,
+    /// Exact observed-revision evidence could not be constructed.
+    #[error("observed revision authority rejected canonical evidence")]
+    RevisionAuthority(market_squawk_sources::ObservedRevisionError),
+    /// Rebinding a retained canonical observation exposed invalid source state.
+    #[error("canonical observation revision rebinding failed")]
+    Research(#[from] market_squawk_domain::ResearchError),
     /// The request binding was not SHA-256.
     #[error("Arrow request binding must use SHA-256")]
     RequestDigestNotSha256,
@@ -714,12 +1000,27 @@ pub enum ArrowConversionError {
     /// This reader cannot interpret the retained schema version.
     #[error("unsupported Arrow schema version {found}")]
     UnsupportedSchemaVersion { found: u16 },
-    /// Field names, types, nullability, or order do not match the current schema.
-    #[error("Arrow fields do not match the current research schema")]
+    /// Fields, nullability, stable metadata, or mandatory values violate the registered schema.
+    #[error("Arrow batch does not match its registered dataset schema")]
     InvalidSchema,
+    /// A generic batch used a registered non-research schema where research rows were required.
+    #[error("Arrow batch does not use the canonical research-observation schema")]
+    UnexpectedDatasetSchema,
+    /// A typed feature/label component violates its closed row-level contract.
+    #[error("Arrow feature/label component row is invalid")]
+    InvalidFeatureLabelRow,
     /// Canonical payload and analytical projections disagree.
     #[error("Arrow analytical projection does not match its canonical payload")]
     ProjectionMismatch,
+    /// A caller-selected retained-memory ceiling cannot admit decoding and projection validation.
+    #[error("research Arrow decoding exceeds the retained-memory ceiling")]
+    RetainedLimitExceeded,
+    /// Fallible vector reservation failed before decoding.
+    #[error("research Arrow decoding allocation reservation failed")]
+    AllocationFailure,
+    /// Checked retained-memory accounting overflowed.
+    #[error("research Arrow retained-memory accounting overflowed")]
+    RetainedSizeOverflow,
     /// A decimal scale cannot be represented in the explicit scale column.
     #[error("decimal scale is outside the supported exact range")]
     DecimalScale(#[from] std::num::TryFromIntError),
@@ -729,6 +1030,9 @@ pub enum ArrowConversionError {
     /// Canonical JSON encoding or decoding failed.
     #[error("canonical observation serialization failed")]
     Json(#[from] JsonError),
+    /// Dataset schema identity is unknown, malformed, or fingerprint-inconsistent.
+    #[error("Arrow dataset schema identity is invalid")]
+    DatasetSchema(#[from] DatasetSchemaError),
 }
 
 fn observation_context(observation: &ResearchObservation) -> &ResearchContext {
@@ -739,6 +1043,7 @@ fn observation_context(observation: &ResearchObservation) -> &ResearchContext {
         ResearchObservation::PortfolioPosition(value) => value.context(),
         ResearchObservation::Transaction(value) => value.context(),
         ResearchObservation::CorporateAction(value) => value.context(),
+        ResearchObservation::UniverseMembership(value) => value.context(),
         ResearchObservation::AlternativeData(value) => value.context(),
     }
 }
@@ -751,6 +1056,7 @@ const fn observation_kind(observation: &ResearchObservation) -> &'static str {
         ResearchObservation::PortfolioPosition(_) => "portfolio_position",
         ResearchObservation::Transaction(_) => "transaction",
         ResearchObservation::CorporateAction(_) => "corporate_action",
+        ResearchObservation::UniverseMembership(_) => "universe_membership",
         ResearchObservation::AlternativeData(_) => "alternative_data",
     }
 }

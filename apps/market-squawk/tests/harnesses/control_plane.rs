@@ -6,3 +6,5 @@ mod journal_path_integration;
 mod production_mcp_composition;
 #[path = "../replay.rs"]
 mod replay;
+#[path = "../research_vertical.rs"]
+mod research_vertical;

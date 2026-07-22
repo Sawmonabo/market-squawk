@@ -3,6 +3,8 @@
 mod authority;
 mod backup;
 mod evidence;
+mod migration_preflight;
+mod observed_revisions;
 mod publication;
 mod query_artifacts;
 mod records;
@@ -30,6 +32,8 @@ pub use self::types::{
     CatalogResultLimits, ContractCompletion, DatasetManifestRecord, IngestReservation,
     IngestRunRecord, IngestRunState, ReferenceBundle, SourceCursor,
 };
+pub(crate) use observed_revisions::CatalogObservedRevisionAuthority;
+pub use observed_revisions::StoredObservedRevision;
 pub use publication::PublishedIngest;
 #[cfg(test)]
 pub(crate) use query_artifacts::QueryArtifactBindCheckpoint;

@@ -7,7 +7,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use arrow::compute::concat_batches;
-use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
@@ -18,7 +17,7 @@ use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion::sql::parser::DFParserBuilder;
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use futures_util::StreamExt as _;
-use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier};
+use market_squawk_domain::{DigestAlgorithm, EvidenceDigest};
 use sha2::Digest as _;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -40,7 +39,7 @@ use self::budget::{
 use self::source::{PinnedObjectStoreRegistry, QuerySource, RetainedSourceReceipt};
 use self::validation::{validate_read_only_statement, validate_relations};
 use crate::blocking_supervisor::BlockingIoSupervisor;
-use crate::schema::research_schema;
+use crate::schema::DatasetSchemaRegistry;
 use crate::{
     ArrowConversionError, ArtifactRecord, CatalogError, DatasetManifestRef, ParquetObjectStore,
     ParquetStoreError, PinnedDataset, PublishedObject, QueryArtifactPublication,
@@ -188,6 +187,9 @@ impl QueryRequest {
         manifest: DatasetManifestRef,
         sql: impl Into<String>,
     ) -> Result<Self, QueryError> {
+        DatasetSchemaRegistry::local()
+            .resolve(manifest.schema())
+            .map_err(|_| QueryError::InvalidSource)?;
         let sql = sql.into();
         if sql.is_empty() || sql.len() > MAX_SQL_BYTES || sql.bytes().any(|byte| byte == 0) {
             return Err(QueryError::InvalidSql);
@@ -219,7 +221,7 @@ impl QueryRequest {
     /// Computes the exact SHA-256 identity of manifest, SQL, and every execution limit.
     pub fn artifact_identity(&self, limits: &QueryLimits) -> EvidenceDigest {
         let mut identity = sha2::Sha256::new();
-        identity.update(b"market-squawk/query-artifact-request/v1");
+        identity.update(b"market-squawk/query-artifact-request/v2");
         identity.update(
             u64::try_from(self.manifest.dataset_id().as_str().len())
                 .unwrap_or(u64::MAX)
@@ -227,7 +229,14 @@ impl QueryRequest {
         );
         identity.update(self.manifest.dataset_id().as_str().as_bytes());
         identity.update(self.manifest.manifest_version().to_be_bytes());
+        identity.update(
+            u64::try_from(self.manifest.schema().name().len())
+                .unwrap_or(u64::MAX)
+                .to_be_bytes(),
+        );
+        identity.update(self.manifest.schema().name().as_bytes());
         identity.update(self.manifest.schema_version().get().to_be_bytes());
+        identity.update(self.manifest.schema().fingerprint());
         identity.update(self.manifest.content_hash().bytes());
         identity.update(
             u64::try_from(self.sql.len())
@@ -339,19 +348,9 @@ impl ResearchQueryEngine {
         if !valid_table_name(&table_name) || dataset.objects().is_empty() {
             return Err(QueryError::InvalidSource);
         }
-        let dataset_name = SourceIdentifier::try_from(dataset.manifest().dataset_id().as_str())
+        let schema = DatasetSchemaRegistry::local()
+            .resolve(dataset.manifest().schema())
             .map_err(|_| QueryError::InvalidSource)?;
-        let schema = Arc::new(Schema::new(
-            research_schema(
-                &dataset_name,
-                EvidenceDigest::new(
-                    DigestAlgorithm::Sha256,
-                    dataset.manifest().content_hash().bytes(),
-                ),
-            )
-            .fields()
-            .clone(),
-        ));
         let retained_bytes = dataset
             .retained_bytes()
             .checked_add(schema_retained_bytes(&schema)?)
@@ -362,7 +361,7 @@ impl ResearchQueryEngine {
             manifest: dataset.manifest().clone(),
             table_name,
             source: QuerySource::Pinned {
-                dataset,
+                dataset: Box::new(dataset),
                 store: Arc::clone(&store),
                 schema,
                 receipt: RetainedSourceReceipt::new(retained_bytes),

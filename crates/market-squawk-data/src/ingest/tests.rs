@@ -2,7 +2,6 @@
 
 use std::time::Duration;
 
-use market_squawk_domain::SchemaVersion;
 use market_squawk_platform::LocalPaths;
 use rusqlite::{Connection, params};
 
@@ -11,24 +10,25 @@ use crate::authority_transition::{AuthorityTransitionService, FirstBindCheckpoin
 use crate::migrations::MIGRATIONS;
 use crate::{
     AnalyticalManifestCatalog, CatalogAuthority, CatalogConfig, CatalogError, CatalogLimit,
-    CatalogResultLimits, DatasetId, DatasetManifestRef, ObjectStoreConfig, ParquetObjectStore,
-    Sha256Digest,
+    CatalogResultLimits, DatasetId, DatasetManifestRef, DatasetSchemaRegistry, ObjectStoreConfig,
+    ParquetObjectStore, Sha256Digest,
 };
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 #[test]
 fn compaction_identity_binds_exact_source_schema() -> TestResult {
-    let source_v1 = DatasetManifestRef::try_new(
+    let registry = DatasetSchemaRegistry::local();
+    let source_v1 = DatasetManifestRef::try_new_with_schema(
         DatasetId::try_from("fred-gdp")?,
         4,
-        SchemaVersion::CURRENT,
+        registry.canonical_research_observations()?,
         Sha256Digest::new([7; 32]),
     )?;
-    let source_v2 = DatasetManifestRef::try_new(
+    let source_v2 = DatasetManifestRef::try_new_with_schema(
         DatasetId::try_from("fred-gdp")?,
         4,
-        SchemaVersion::new(2)?,
+        registry.canonical_feature_labels()?,
         Sha256Digest::new([7; 32]),
     )?;
 

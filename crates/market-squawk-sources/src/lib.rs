@@ -53,13 +53,20 @@ pub use decoder::{
     ProviderTimestampEvidence, QuarantineReason, ResynchronizationReason,
 };
 pub use extraction::{
-    AvailabilityEvidence, CURRENT_RESEARCH_RECORD_SCHEMA, DiscoveryBatch, DiscoveryRequest,
-    DiscoveryRequestId, ExtractionAuthorityError, ExtractionBatch, ExtractionBatchAccumulator,
+    AvailabilityEvidence, CURRENT_RESEARCH_RECORD_SCHEMA, CanonicalObservationFamily,
+    CanonicalObservationPayload, DiscoveryBatch, DiscoveryRequest, DiscoveryRequestId,
+    ExtractionAuthorityError, ExtractionBatch, ExtractionBatchAccumulator,
     ExtractionContentIdentity, ExtractionError, ExtractionRecord, ExtractionRedirectPermit,
-    ExtractionRequest, ExtractionRequestId, ExtractionRequestPermit, ExtractionSource,
-    ExtractionSourceError, InFlightExtractionRequest, MAX_DISCOVERY_OBJECTS,
-    MAX_EXTRACTION_BATCH_BYTES, MAX_EXTRACTION_RECORD_BYTES, MAX_EXTRACTION_RECORDS,
-    MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES, SourceObject, payload_matches_exact_evidence,
+    ExtractionRequest, ExtractionRequestId, ExtractionRequestPermit, ExtractionRevisionEvidence,
+    ExtractionRevisionPlan, ExtractionSource, ExtractionSourceError, InFlightExtractionRequest,
+    MAX_DISCOVERY_OBJECTS, MAX_EXTRACTION_BATCH_BYTES, MAX_EXTRACTION_RECORD_BYTES,
+    MAX_EXTRACTION_RECORDS, MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES,
+    MAX_OBSERVED_REVISION_BATCH_BYTES, MAX_OBSERVED_REVISION_BATCH_RECORDS,
+    MAX_OBSERVED_SEMANTIC_PAYLOAD_BYTES, MAX_OBSERVED_VERSION_EVIDENCE_BYTES,
+    ObservedProviderOrder, ObservedRevisionAssignments, ObservedRevisionAuthority,
+    ObservedRevisionBatch, ObservedRevisionError, ObservedRevisionRecord, ObservedSemanticPayload,
+    ObservedVersionEvidence, ObservedVersionKind, PitV1CanonicalEncoder, PitV1EncodingControl,
+    PitV1EncodingError, SourceObject, payload_matches_exact_evidence,
 };
 pub use health::{
     AuthorizationHealth, BudgetHealth, ConnectionLiveness, CoverageHealth, HealthErrorClass,

@@ -15,10 +15,10 @@ use market_squawk_domain::{
 use market_squawk_sources::AuthoritativeSourceRegistry;
 use market_squawk_sources::{
     AuthorizationMode, BudgetWindowSemantics, CoverageDomain, DiscoveryBatch, DiscoveryRequest,
-    ExtractionAuthority, ExtractionBatch, ExtractionRequest, ExtractionSource,
-    ExtractionSourceError, HistoricalCapability, ProviderBudgetPolicy, SourceClass, SourceError,
-    SourceMetadata, SourceMetadataProvider, SourceObject, SourceProtocolProfile,
-    payload_matches_exact_evidence,
+    ExtractionAuthority, ExtractionBatch, ExtractionRequest, ExtractionRevisionPlan,
+    ExtractionSource, ExtractionSourceError, HistoricalCapability, ProviderBudgetPolicy,
+    SourceClass, SourceError, SourceMetadata, SourceMetadataProvider, SourceObject,
+    SourceProtocolProfile, payload_matches_exact_evidence,
 };
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -73,6 +73,29 @@ impl std::fmt::Debug for BlsSource {
 }
 
 impl BlsSource {
+    /// Builds honest local-observation revision authority for a normalized BLS batch.
+    ///
+    /// The BLS timeseries response does not publish a per-observation version or publication
+    /// coordinate. Market Squawk therefore binds revisions to exact canonical content and local
+    /// observation order instead of fabricating provider chronology.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BlsSourceError::InvalidMetadata`] when the batch belongs to another source
+    /// registration and [`BlsSourceError::RevisionAuthority`] when bounded evidence construction
+    /// fails.
+    pub fn revision_plan(
+        &self,
+        batch: &ExtractionBatch,
+    ) -> Result<ExtractionRevisionPlan, BlsSourceError> {
+        if batch.request().object().source_id() != self.metadata.source_id()
+            || batch.request().object().metadata_revision() != self.metadata.revision()
+        {
+            return Err(BlsSourceError::InvalidMetadata);
+        }
+        ExtractionRevisionPlan::locally_observed(batch.records().len()).map_err(Into::into)
+    }
+
     /// Binds a provider configuration to exact immutable metadata.
     ///
     /// # Errors

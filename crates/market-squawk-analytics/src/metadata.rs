@@ -5,6 +5,8 @@ use std::num::{NonZeroU32, NonZeroU64};
 
 use thiserror::Error;
 
+pub(crate) mod digest;
+
 /// Maximum UTF-8 bytes in a stable feature name.
 pub const MAX_FEATURE_NAME_BYTES: usize = 96;
 /// Maximum UTF-8 bytes in an input or parameter field name.
@@ -15,6 +17,59 @@ pub const MAX_FEATURE_INPUTS: usize = 32;
 pub const MAX_FEATURE_PARAMETERS: usize = 32;
 /// Maximum UTF-8 bytes in an implementation revision.
 pub const MAX_IMPLEMENTATION_REVISION_BYTES: usize = 128;
+
+/// Deterministic SHA-256 digest of one ordered feature input schema.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct FeatureInputSchemaDigest([u8; 32]);
+
+impl FeatureInputSchemaDigest {
+    /// Returns the exact SHA-256 bytes.
+    #[must_use]
+    pub const fn as_bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+/// Nonzero SHA-256 identity of code known to the local build.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct FeatureImplementationDigest([u8; 32]);
+
+impl FeatureImplementationDigest {
+    /// Constructs an implementation identity from exact SHA-256 bytes.
+    ///
+    /// This validates representation only. Registration separately requires the digest to appear
+    /// in the code-owned local implementation catalog, so caller-provided metadata cannot grant
+    /// itself implementation authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FeatureMetadataError::ZeroImplementationDigest`] for the all-zero sentinel.
+    pub fn try_from_sha256(bytes: [u8; 32]) -> Result<Self, FeatureMetadataError> {
+        if bytes == [0; 32] {
+            Err(FeatureMetadataError::ZeroImplementationDigest)
+        } else {
+            Ok(Self(bytes))
+        }
+    }
+
+    /// Returns the exact SHA-256 bytes.
+    #[must_use]
+    pub const fn as_bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+/// SHA-256 commitment to every execution-relevant feature metadata field.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct FeatureSemanticDigest([u8; 32]);
+
+impl FeatureSemanticDigest {
+    /// Returns the exact SHA-256 bytes.
+    #[must_use]
+    pub const fn as_bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
 
 /// Stable feature identity consisting of a canonical name and nonzero version.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -87,6 +142,10 @@ pub enum FeatureDataType {
     Boolean,
     /// Finite floating-point statistical input.
     StatisticalF64,
+    /// Exact analytical decimal input.
+    Decimal,
+    /// Exact amount carrying its own currency.
+    Money,
 }
 
 /// Unit attached to an input or output field.
@@ -112,6 +171,10 @@ pub enum FeatureUnit {
     Nanoseconds,
     /// Dimensionless value or identity.
     Unitless,
+    /// Exact or statistical interest, discount, or growth rate.
+    Rate,
+    /// Currency amount whose currency is carried by the Money value.
+    CurrencyAmount,
 }
 
 /// One ordered field in a feature's exact input schema.
@@ -197,6 +260,13 @@ impl FeatureInputSchema {
     #[must_use]
     pub fn fields(&self) -> &[FeatureInput] {
         &self.0
+    }
+
+    /// Returns a deterministic SHA-256 commitment to field order, names, types, units, and
+    /// nullability.
+    #[must_use]
+    pub fn digest(&self) -> FeatureInputSchemaDigest {
+        digest::input_schema_digest(self)
     }
 
     fn checked_dynamic_retained_bytes(&self) -> Option<usize> {
@@ -356,6 +426,10 @@ pub enum FeatureOutputType {
     ExactRatio,
     /// Finite floating point admitted only for statistical calculations.
     StatisticalF64,
+    /// Exact analytical decimal.
+    Decimal,
+    /// Exact amount carrying its own currency.
+    Money,
 }
 
 /// Complete immutable metadata for one feature name and version.
@@ -363,6 +437,7 @@ pub enum FeatureOutputType {
 pub struct FeatureMetadata {
     key: FeatureKey,
     input_schema: FeatureInputSchema,
+    input_schema_digest: FeatureInputSchemaDigest,
     parameters: FeatureParameters,
     time_semantics: FeatureTimeSemantics,
     warm_up: FeatureWarmUp,
@@ -372,6 +447,8 @@ pub struct FeatureMetadata {
     live_compatible: bool,
     point_in_time_compatible: bool,
     implementation_revision: String,
+    implementation_digest: FeatureImplementationDigest,
+    semantic_digest: FeatureSemanticDigest,
 }
 
 impl FeatureMetadata {
@@ -394,6 +471,7 @@ impl FeatureMetadata {
         live_compatible: bool,
         point_in_time_compatible: bool,
         implementation_revision: &str,
+        implementation_digest: FeatureImplementationDigest,
     ) -> Result<Self, FeatureMetadataError> {
         validate_revision(implementation_revision)?;
         if !output_unit_is_compatible(output_type, unit) {
@@ -402,9 +480,25 @@ impl FeatureMetadata {
         if !live_compatible && !point_in_time_compatible {
             return Err(FeatureMetadataError::NoCompatibleExecutionPlane);
         }
+        let input_schema_digest = input_schema.digest();
+        let semantic_digest = digest::semantic_digest(
+            &key,
+            &input_schema,
+            &parameters,
+            time_semantics,
+            warm_up,
+            null_policy,
+            output_type,
+            unit,
+            live_compatible,
+            point_in_time_compatible,
+            implementation_revision,
+            implementation_digest,
+        );
         Ok(Self {
             key,
             input_schema,
+            input_schema_digest,
             parameters,
             time_semantics,
             warm_up,
@@ -414,6 +508,8 @@ impl FeatureMetadata {
             live_compatible,
             point_in_time_compatible,
             implementation_revision: implementation_revision.to_owned(),
+            implementation_digest,
+            semantic_digest,
         })
     }
 
@@ -427,6 +523,12 @@ impl FeatureMetadata {
     #[must_use]
     pub const fn input_schema(&self) -> &FeatureInputSchema {
         &self.input_schema
+    }
+
+    /// Returns the exact ordered input-schema digest bound to this metadata.
+    #[must_use]
+    pub const fn input_schema_digest(&self) -> FeatureInputSchemaDigest {
+        self.input_schema_digest
     }
 
     /// Returns the exact ordered parameter set.
@@ -483,6 +585,18 @@ impl FeatureMetadata {
         &self.implementation_revision
     }
 
+    /// Returns the code identity requested by this metadata.
+    #[must_use]
+    pub const fn implementation_digest(&self) -> FeatureImplementationDigest {
+        self.implementation_digest
+    }
+
+    /// Returns the digest of all execution-relevant metadata semantics.
+    #[must_use]
+    pub const fn semantic_digest(&self) -> FeatureSemanticDigest {
+        self.semantic_digest
+    }
+
     /// Returns the complete exact retained footprint of this owned metadata graph.
     ///
     /// # Errors
@@ -536,6 +650,9 @@ pub enum FeatureMetadataError {
     /// The implementation revision was empty, oversized, or contained unsafe characters.
     #[error("invalid feature implementation revision")]
     InvalidImplementationRevision,
+    /// The implementation digest used the reserved all-zero sentinel.
+    #[error("feature implementation digest must be a nonzero SHA-256 value")]
+    ZeroImplementationDigest,
     /// The metadata was compatible with neither the live nor point-in-time plane.
     #[error("feature metadata must be compatible with at least one execution plane")]
     NoCompatibleExecutionPlane,
@@ -603,11 +720,23 @@ const fn input_unit_is_compatible(data_type: FeatureDataType, unit: FeatureUnit)
                 | FeatureUnit::Return
                 | FeatureUnit::Volatility
                 | FeatureUnit::LotsPerSecond
+                | FeatureUnit::Rate
                 | FeatureUnit::Unitless
         ),
-        FeatureDataType::StatisticalF64 => {
-            !matches!(unit, FeatureUnit::PriceTicks | FeatureUnit::QuantityLots)
-        }
+        FeatureDataType::StatisticalF64 => !matches!(
+            unit,
+            FeatureUnit::PriceTicks | FeatureUnit::QuantityLots | FeatureUnit::CurrencyAmount
+        ),
+        FeatureDataType::Decimal => matches!(
+            unit,
+            FeatureUnit::BasisPoints
+                | FeatureUnit::Ratio
+                | FeatureUnit::Return
+                | FeatureUnit::Volatility
+                | FeatureUnit::Rate
+                | FeatureUnit::Unitless
+        ),
+        FeatureDataType::Money => matches!(unit, FeatureUnit::CurrencyAmount),
     }
 }
 
@@ -632,11 +761,23 @@ const fn output_unit_is_compatible(output_type: FeatureOutputType, unit: Feature
                 | FeatureUnit::Return
                 | FeatureUnit::Volatility
                 | FeatureUnit::LotsPerSecond
+                | FeatureUnit::Rate
                 | FeatureUnit::Unitless
         ),
-        FeatureOutputType::StatisticalF64 => {
-            !matches!(unit, FeatureUnit::PriceTicks | FeatureUnit::QuantityLots)
-        }
+        FeatureOutputType::StatisticalF64 => !matches!(
+            unit,
+            FeatureUnit::PriceTicks | FeatureUnit::QuantityLots | FeatureUnit::CurrencyAmount
+        ),
+        FeatureOutputType::Decimal => matches!(
+            unit,
+            FeatureUnit::BasisPoints
+                | FeatureUnit::Ratio
+                | FeatureUnit::Return
+                | FeatureUnit::Volatility
+                | FeatureUnit::Rate
+                | FeatureUnit::Unitless
+        ),
+        FeatureOutputType::Money => matches!(unit, FeatureUnit::CurrencyAmount),
     }
 }
 

@@ -14,7 +14,8 @@ pub(super) fn map_adapter_error(error: FredSourceError) -> ExtractionSourceError
         FredSourceError::InvalidApiKey
         | FredSourceError::InvalidDataset
         | FredSourceError::Protocol
-        | FredSourceError::InvalidConfiguration => {
+        | FredSourceError::InvalidConfiguration
+        | FredSourceError::RevisionAuthority(_) => {
             ExtractionSourceError::Source(SourceError::InvalidProtocolState)
         }
         FredSourceError::BodyTooLarge | FredSourceError::Network => {
@@ -43,12 +44,11 @@ pub(super) fn evidence_for_payload(
 pub(super) fn page_object_id(
     offset: usize,
     limit: usize,
-    prior_revisions_for_first_observation: u32,
     page_digest: [u8; 32],
     metadata_digest: [u8; 32],
 ) -> Result<SourceIdentifier, FredSourceError> {
     SourceIdentifier::try_from(format!(
-        "fred-page:{offset}:{limit}:{prior_revisions_for_first_observation}:{}:{}",
+        "fred-page:{offset}:{limit}:{}:{}",
         lower_hex(page_digest),
         lower_hex(metadata_digest),
     ))
@@ -58,7 +58,6 @@ pub(super) fn page_object_id(
 pub(super) struct ParsedPageObjectId {
     pub(super) offset: usize,
     pub(super) limit: usize,
-    pub(super) prior_revisions_for_first_observation: u32,
     pub(super) page_digest: [u8; 32],
     pub(super) metadata_digest: [u8; 32],
 }
@@ -80,17 +79,10 @@ pub(super) fn parse_object_id(
         .ok_or(FredSourceError::InvalidDataset)?
         .parse()
         .map_err(|_| FredSourceError::InvalidDataset)?;
-    let prior_revisions_for_first_observation = fields
-        .next()
-        .ok_or(FredSourceError::InvalidDataset)?
-        .parse::<u32>()
-        .map_err(|_| FredSourceError::InvalidDataset)?;
     let page_digest = fields.next().ok_or(FredSourceError::InvalidDataset)?;
     let metadata_digest = fields.next().ok_or(FredSourceError::InvalidDataset)?;
     if fields.next().is_some()
         || limit == 0
-        || usize::try_from(prior_revisions_for_first_observation)
-            .map_or(true, |prior| prior > offset)
         || page_digest.len() != 64
         || metadata_digest.len() != 64
     {
@@ -99,7 +91,6 @@ pub(super) fn parse_object_id(
     Ok(ParsedPageObjectId {
         offset,
         limit,
-        prior_revisions_for_first_observation,
         page_digest: parse_lower_hex(page_digest)?,
         metadata_digest: parse_lower_hex(metadata_digest)?,
     })

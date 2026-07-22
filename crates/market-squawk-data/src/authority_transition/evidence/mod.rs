@@ -78,6 +78,6 @@ pub(crate) enum EvidenceError {
 }
 pub(crate) use catalog::{
     ArtifactEvidenceRow, CatalogEvidenceSnapshot, EvidenceLimits, EvidenceSnapshotRequest,
-    GenerationEvidenceRow, GenerationObjectEvidenceRow, ManifestEvidenceRow,
-    QueryArtifactEvidenceRow,
+    GenerationEvidenceRow, GenerationObjectEvidenceRow, GenerationParentEvidenceRow,
+    ManifestEvidenceRow, QueryArtifactEvidenceRow,
 };

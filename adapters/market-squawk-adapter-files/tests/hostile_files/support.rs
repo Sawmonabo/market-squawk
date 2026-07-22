@@ -228,7 +228,7 @@ pub(super) fn manifest_with_superseded(
         _ => serde_json::json!({ "kind": format }),
     };
     serde_json::to_vec(&serde_json::json!({
-        "schema_version": 2,
+        "schema_version": 3,
         "objects": [{
             "dataset": "alternative-prices",
             "object_id": format!("{format}-fixture"),
@@ -246,6 +246,7 @@ pub(super) fn manifest_with_superseded(
                     ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(value))
                 })
             },
+            "instrument_binding": { "kind": "unscoped" },
             "row_policy": {
                 "identity_field": "id",
                 "fields": [{

@@ -93,9 +93,13 @@ pub fn normalize_filings_with_cancellation(
             availability: retrieved.raw().availability().clone(),
         })?;
         let effective_date = filing.report_date().unwrap_or(filing.filed_on());
+        let published = filing
+            .accepted_at()
+            .map(ResearchTemporalCoordinate::exact)
+            .unwrap_or_else(|| ResearchTemporalCoordinate::calendar_date(filing.filed_on()));
         let time = ResearchTime::try_new_with_coordinates(
             ResearchTemporalCoordinate::calendar_date(effective_date),
-            filing.accepted_at().map(ResearchTemporalCoordinate::exact),
+            Some(published),
             RevisionNumber::new(*revision)?,
             None,
         )?;
@@ -222,7 +226,9 @@ pub fn normalize_company_facts_with_cancellation(
         })?;
         let research_time = ResearchTime::try_new_with_coordinates(
             ResearchTemporalCoordinate::calendar_date(occurrence.period().end()),
-            None,
+            Some(ResearchTemporalCoordinate::calendar_date(
+                occurrence.filed_on(),
+            )),
             RevisionNumber::new(*revision)?,
             None,
         )?;

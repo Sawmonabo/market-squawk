@@ -7,7 +7,14 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{CatalogContentEvidenceDigest, EvidenceError, MAX_PARQUET_METADATA_BYTES};
-use crate::{DatasetId, GenerationKind, ManifestObject, ManifestPlan, Sha256Digest};
+use crate::manifest::{
+    DatasetBuildSpecDigest, GenerationParent, GenerationParentRelation,
+    MAX_DERIVED_GENERATION_PARENTS, compare_manifest_refs,
+};
+use crate::{
+    DatasetId, DatasetManifestRef, DatasetSchemaRef, DatasetSchemaRegistry, GenerationKind,
+    ManifestObject, ManifestPlan, Sha256Digest,
+};
 
 const MAX_EVIDENCE_ARTIFACTS: usize = 100_000;
 const MAX_EVIDENCE_REFERENCES: usize = 400_000;
@@ -265,17 +272,53 @@ impl GenerationObjectEvidenceRow {
 /// Complete immutable historical generation in catalog order.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct GenerationEvidenceRow {
+    generation_sequence: u64,
     dataset_id: DatasetId,
     manifest_version: u64,
     content_hash: Sha256Digest,
     lineage_hash: Sha256Digest,
     row_count: u64,
     total_bytes: u64,
-    schema_version: u32,
+    schema: DatasetSchemaRef,
     anchor_manifest_id: Uuid,
-    parent_version: Option<u64>,
     kind: GenerationKind,
+    build_spec_digest: Option<DatasetBuildSpecDigest>,
+    parents: Vec<GenerationParentEvidenceRow>,
     objects: Vec<GenerationObjectEvidenceRow>,
+}
+
+/// One exact, ordered, relationship-bearing generation parent in backup evidence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GenerationParentEvidenceRow {
+    generation_sequence: u64,
+    parent: GenerationParent,
+}
+
+impl GenerationParentEvidenceRow {
+    pub(crate) fn try_new(
+        generation_sequence: u64,
+        relation: GenerationParentRelation,
+        manifest: DatasetManifestRef,
+    ) -> Result<Self, EvidenceError> {
+        if generation_sequence == 0 {
+            return Err(EvidenceError::InvalidCatalogEvidence);
+        }
+        DatasetSchemaRegistry::local()
+            .resolve(manifest.schema())
+            .map_err(|_| EvidenceError::InvalidCatalogEvidence)?;
+        Ok(Self {
+            generation_sequence,
+            parent: GenerationParent::new(relation, manifest),
+        })
+    }
+
+    pub(super) const fn generation_sequence(&self) -> u64 {
+        self.generation_sequence
+    }
+
+    pub(super) const fn parent(&self) -> &GenerationParent {
+        &self.parent
+    }
 }
 
 impl GenerationEvidenceRow {
@@ -284,42 +327,53 @@ impl GenerationEvidenceRow {
         reason = "the row mirrors independently durable analytical generation columns"
     )]
     pub(crate) fn try_new(
+        generation_sequence: u64,
         dataset_id: DatasetId,
         manifest_version: u64,
         content_hash: Sha256Digest,
         lineage_hash: Sha256Digest,
         row_count: u64,
         total_bytes: u64,
-        schema_version: u32,
+        schema: DatasetSchemaRef,
         anchor_manifest_id: Uuid,
-        parent_version: Option<u64>,
         kind: GenerationKind,
+        build_spec_digest: Option<DatasetBuildSpecDigest>,
+        parents: Vec<GenerationParentEvidenceRow>,
         objects: Vec<GenerationObjectEvidenceRow>,
     ) -> Result<Self, EvidenceError> {
-        if manifest_version == 0
+        if generation_sequence == 0
+            || manifest_version == 0
             || row_count == 0
             || total_bytes == 0
-            || schema_version == 0
             || anchor_manifest_id.is_nil()
             || objects.is_empty()
-            || (manifest_version == 1) != parent_version.is_none()
-            || parent_version.is_some_and(|parent| parent.checked_add(1) != Some(manifest_version))
+            || parents.len() > MAX_DERIVED_GENERATION_PARENTS
+            || (kind == GenerationKind::Derived) != build_spec_digest.is_some()
         {
             return Err(EvidenceError::InvalidCatalogEvidence);
         }
+        DatasetSchemaRegistry::local()
+            .resolve(&schema)
+            .map_err(|_| EvidenceError::InvalidCatalogEvidence)?;
         Ok(Self {
+            generation_sequence,
             dataset_id,
             manifest_version,
             content_hash,
             lineage_hash,
             row_count,
             total_bytes,
-            schema_version,
+            schema,
             anchor_manifest_id,
-            parent_version,
             kind,
+            build_spec_digest,
+            parents,
             objects,
         })
+    }
+
+    pub(super) const fn generation_sequence(&self) -> u64 {
+        self.generation_sequence
     }
 
     pub(super) const fn dataset_id(&self) -> &DatasetId {
@@ -346,20 +400,24 @@ impl GenerationEvidenceRow {
         self.total_bytes
     }
 
-    pub(super) const fn schema_version(&self) -> u32 {
-        self.schema_version
+    pub(super) const fn schema(&self) -> &DatasetSchemaRef {
+        &self.schema
     }
 
     pub(super) const fn anchor_manifest_id(&self) -> Uuid {
         self.anchor_manifest_id
     }
 
-    pub(super) const fn parent_version(&self) -> Option<u64> {
-        self.parent_version
-    }
-
     pub(super) const fn kind(&self) -> GenerationKind {
         self.kind
+    }
+
+    pub(super) const fn build_spec_digest(&self) -> Option<DatasetBuildSpecDigest> {
+        self.build_spec_digest
+    }
+
+    pub(super) fn parents(&self) -> &[GenerationParentEvidenceRow] {
+        &self.parents
     }
 
     pub(super) fn objects(&self) -> &[GenerationObjectEvidenceRow] {
@@ -473,10 +531,16 @@ impl CatalogEvidenceSnapshot {
                 .checked_add(generation.objects.len())
                 .ok_or(EvidenceError::ResourceLimitExceeded)
         })?;
+        let generation_parents = generations.iter().try_fold(0_usize, |count, generation| {
+            count
+                .checked_add(generation.parents.len())
+                .ok_or(EvidenceError::ResourceLimitExceeded)
+        })?;
         let references = artifacts
             .len()
             .checked_add(manifests.len())
             .and_then(|count| count.checked_add(generation_objects))
+            .and_then(|count| count.checked_add(generation_parents))
             .and_then(|count| count.checked_add(query_artifacts.len()))
             .ok_or(EvidenceError::ResourceLimitExceeded)?;
         let physical_artifacts = artifacts
@@ -587,12 +651,13 @@ fn validate_relational_evidence(
 
     let mut generations_by_dataset: BTreeMap<&str, BTreeMap<u64, &GenerationEvidenceRow>> =
         BTreeMap::new();
+    let mut generation_sequences = BTreeSet::new();
     for generation in generations {
         let anchor = manifests_by_id
             .get(&generation.anchor_manifest_id)
             .ok_or(EvidenceError::GenerationSemanticMismatch)?;
         if anchor.dataset_id != generation.dataset_id
-            || anchor.schema_version != generation.schema_version
+            || anchor.schema_version != u32::from(generation.schema.version().get())
             || anchor.content_hash != generation.content_hash
         {
             return Err(EvidenceError::GenerationSemanticMismatch);
@@ -607,14 +672,18 @@ fn validate_relational_evidence(
                 return Err(EvidenceError::GenerationSemanticMismatch);
             }
         }
-        if generations_by_dataset
-            .entry(generation.dataset_id.as_str())
-            .or_default()
-            .insert(generation.manifest_version, generation)
-            .is_some()
+        if !generation_sequences.insert(generation.generation_sequence)
+            || generations_by_dataset
+                .entry(generation.dataset_id.as_str())
+                .or_default()
+                .insert(generation.manifest_version, generation)
+                .is_some()
         {
             return Err(EvidenceError::InvalidCatalogEvidence);
         }
+    }
+    for generation in generations {
+        validate_generation_parents(generation, &generations_by_dataset)?;
     }
     for versions in generations_by_dataset.values() {
         validate_dataset_history(versions)?;
@@ -640,15 +709,67 @@ fn validate_relational_evidence(
     Ok(())
 }
 
+fn validate_generation_parents(
+    child: &GenerationEvidenceRow,
+    generations: &BTreeMap<&str, BTreeMap<u64, &GenerationEvidenceRow>>,
+) -> Result<(), EvidenceError> {
+    for (ordinal, edge) in child.parents.iter().enumerate() {
+        let retained = generations
+            .get(edge.parent.manifest().dataset_id().as_str())
+            .and_then(|versions| versions.get(&edge.parent.manifest().manifest_version()))
+            .ok_or(EvidenceError::GenerationSemanticMismatch)?;
+        if retained.generation_sequence != edge.generation_sequence
+            || retained.generation_sequence >= child.generation_sequence
+            || retained.schema != *edge.parent.manifest().schema()
+            || retained.content_hash != edge.parent.manifest().content_hash()
+            || (ordinal > 0
+                && compare_manifest_refs(
+                    child.parents[ordinal - 1].parent.manifest(),
+                    edge.parent.manifest(),
+                )
+                .is_ge())
+        {
+            return Err(EvidenceError::GenerationSemanticMismatch);
+        }
+    }
+    let predecessor = |relation| match child.parents.as_slice() {
+        [edge] => {
+            edge.parent.relation() == relation
+                && edge.parent.manifest().dataset_id() == &child.dataset_id
+                && edge.parent.manifest().manifest_version().checked_add(1)
+                    == Some(child.manifest_version)
+                && edge.parent.manifest().schema() == &child.schema
+        }
+        _ => false,
+    };
+    let valid = match child.kind {
+        GenerationKind::Ingest if child.manifest_version == 1 => child.parents.is_empty(),
+        GenerationKind::Ingest => predecessor(GenerationParentRelation::AppendPredecessor),
+        GenerationKind::Compaction => predecessor(GenerationParentRelation::CompactionPredecessor),
+        GenerationKind::Derived => {
+            !child.parents.is_empty()
+                && child
+                    .parents
+                    .iter()
+                    .all(|edge| edge.parent.relation() == GenerationParentRelation::DerivedInput)
+        }
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(EvidenceError::GenerationSemanticMismatch)
+    }
+}
+
 fn validate_dataset_history(
     versions: &BTreeMap<u64, &GenerationEvidenceRow>,
 ) -> Result<(), EvidenceError> {
     let mut previous_plan: Option<ManifestPlan> = None;
+    let mut retained_schema: Option<&DatasetSchemaRef> = None;
     let mut expected_version = 1_u64;
     for generation in versions.values() {
         if generation.manifest_version != expected_version
-            || generation.parent_version
-                != expected_version.checked_sub(1).filter(|value| *value > 0)
+            || retained_schema.is_some_and(|schema| schema != &generation.schema)
         {
             return Err(EvidenceError::GenerationSemanticMismatch);
         }
@@ -677,6 +798,16 @@ fn validate_dataset_history(
                 ManifestPlan::compact(previous, generation.objects[0].manifest_object()?)
                     .map_err(|_| EvidenceError::GenerationSemanticMismatch)?
             }
+            GenerationKind::Derived => ManifestPlan::derive(
+                generation.dataset_id.clone(),
+                generation
+                    .objects
+                    .iter()
+                    .map(GenerationObjectEvidenceRow::manifest_object)
+                    .collect::<Result<Vec<_>, _>>()?,
+                generation.objects.len(),
+            )
+            .map_err(|_| EvidenceError::GenerationSemanticMismatch)?,
         };
         if plan.objects().len() != generation.objects.len()
             || plan.content_hash() != generation.content_hash
@@ -697,6 +828,7 @@ fn validate_dataset_history(
             return Err(EvidenceError::GenerationSemanticMismatch);
         }
         previous_plan = Some(plan);
+        retained_schema = Some(&generation.schema);
         expected_version = expected_version
             .checked_add(1)
             .ok_or(EvidenceError::ResourceLimitExceeded)?;

@@ -7,9 +7,9 @@ use futures_util::future::BoxFuture;
 use market_squawk_domain::{DataQuality, SourceIdentifier, Timestamp};
 use market_squawk_sources::{
     AuthorizationMode, CoverageDomain, DiscoveryBatch, DiscoveryRequest, ExtractionAuthority,
-    ExtractionBatch, ExtractionRequest, ExtractionSource, ExtractionSourceError,
-    HistoricalCapability, SourceClass, SourceError, SourceMetadata, SourceMetadataProvider,
-    SourceProtocolProfile,
+    ExtractionBatch, ExtractionRequest, ExtractionRevisionEvidence, ExtractionRevisionPlan,
+    ExtractionSource, ExtractionSourceError, HistoricalCapability, ObservedProviderOrder,
+    SourceClass, SourceError, SourceMetadata, SourceMetadataProvider, SourceProtocolProfile,
 };
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -201,6 +201,56 @@ impl std::fmt::Debug for TreasurySource {
 }
 
 impl TreasurySource {
+    /// Builds the most authoritative truthful revision plan supported by this Treasury profile.
+    ///
+    /// Daily par-yield observations use the provider publication timestamp and exact record token.
+    /// Fiscal Data average-rate rows publish no version chronology, so their revisions are bound to
+    /// exact locally observed canonical content instead of a fabricated provider order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TreasurySourceError::InvalidMetadata`] when the batch belongs to another source
+    /// registration, [`TreasurySourceError::InvalidProtocol`] when a yield record lacks its required
+    /// publication timestamp, and [`TreasurySourceError::RevisionAuthority`] when bounded exact
+    /// evidence construction fails.
+    pub fn revision_plan(
+        &self,
+        batch: &ExtractionBatch,
+    ) -> Result<ExtractionRevisionPlan, TreasurySourceError> {
+        if batch.request().object().source_id() != self.metadata.source_id()
+            || batch.request().object().metadata_revision() != self.metadata.revision()
+        {
+            return Err(TreasurySourceError::InvalidMetadata);
+        }
+        match &self.config {
+            TreasurySourceConfig::AverageInterestRates(_) => {
+                ExtractionRevisionPlan::locally_observed(batch.records().len()).map_err(Into::into)
+            }
+            TreasurySourceConfig::DailyParYieldCurve { .. } => {
+                let mut evidence = Vec::new();
+                evidence
+                    .try_reserve_exact(batch.records().len())
+                    .map_err(|_| {
+                        TreasurySourceError::RevisionAuthority(
+                            market_squawk_sources::ObservedRevisionError::AllocationFailure,
+                        )
+                    })?;
+                for record in batch.records() {
+                    let version = record.revision().as_str().as_bytes();
+                    let published = record
+                        .published_time()
+                        .cloned()
+                        .ok_or(TreasurySourceError::InvalidProtocol)?;
+                    let order = ObservedProviderOrder::try_new(published, version)?;
+                    evidence.push(ExtractionRevisionEvidence::provider_supplied(
+                        version, order,
+                    )?);
+                }
+                ExtractionRevisionPlan::try_new(evidence).map_err(Into::into)
+            }
+        }
+    }
+
     /// Binds immutable metadata to one official Treasury profile.
     ///
     /// # Errors
@@ -661,7 +711,8 @@ fn map_adapter_error(error: TreasurySourceError) -> ExtractionSourceError {
         | TreasurySourceError::InvalidProtocol
         | TreasurySourceError::Protocol(_)
         | TreasurySourceError::Rate(_)
-        | TreasurySourceError::HealthUnavailable => invalid_protocol(),
+        | TreasurySourceError::HealthUnavailable
+        | TreasurySourceError::RevisionAuthority(_) => invalid_protocol(),
         TreasurySourceError::BodyTooLarge => ExtractionSourceError::Source(SourceError::Network),
     }
 }
@@ -703,4 +754,7 @@ pub enum TreasurySourceError {
     /// Average-interest-rate conversion failure.
     #[error("Treasury rate conversion failed: {0}")]
     Rate(#[from] crate::TreasuryRateError),
+    /// Exact provider or locally observed revision evidence violated bounded invariants.
+    #[error(transparent)]
+    RevisionAuthority(#[from] market_squawk_sources::ObservedRevisionError),
 }

@@ -7,29 +7,31 @@ use arrow::record_batch::RecordBatch;
 use market_squawk_domain::{
     AvailabilityEvidence, DataQuality, DigestAlgorithm, EvidenceDigest, MacroObservation,
     PayloadReference, ResearchContext, ResearchObservation, ResearchProvenance,
-    ResearchProvenanceInput, ResearchTime, RevisionNumber, SchemaVersion, SourceId,
-    SourceIdentifier, Timestamp,
+    ResearchProvenanceInput, ResearchTime, RevisionNumber, SourceId, SourceIdentifier, Timestamp,
 };
 use rust_decimal::Decimal;
 use tokio_util::sync::CancellationToken;
 
 use super::{QueryError, QueryLimits, QueryRequest, QueryResult, ResearchQueryEngine};
-use crate::{DatasetId, DatasetManifestRef, ResearchArrowBatch, Sha256Digest};
+use crate::{
+    DatasetId, DatasetManifestRef, DatasetSchemaRegistry, ResearchArrowBatch, Sha256Digest,
+};
 
 type TestResult = Result<(), Box<dyn Error>>;
 
 #[test]
 fn query_artifact_identity_binds_exact_row_schema() -> TestResult {
-    let first = DatasetManifestRef::try_new(
+    let registry = DatasetSchemaRegistry::local();
+    let first = DatasetManifestRef::try_new_with_schema(
         DatasetId::try_from("fred-gdp")?,
         7,
-        SchemaVersion::CURRENT,
+        registry.canonical_research_observations()?,
         Sha256Digest::new([7; 32]),
     )?;
-    let second = DatasetManifestRef::try_new(
+    let second = DatasetManifestRef::try_new_with_schema(
         DatasetId::try_from("fred-gdp")?,
         7,
-        SchemaVersion::new(2)?,
+        registry.canonical_feature_labels()?,
         Sha256Digest::new([7; 32]),
     )?;
     let limits = QueryLimits::try_new(
@@ -189,10 +191,10 @@ fn observation(
 }
 
 fn manifest() -> Result<DatasetManifestRef, Box<dyn Error>> {
-    Ok(DatasetManifestRef::try_new(
+    Ok(DatasetManifestRef::try_new_with_schema(
         DatasetId::try_from("fred-gdp")?,
         7,
-        SchemaVersion::CURRENT,
+        DatasetSchemaRegistry::local().canonical_research_observations()?,
         Sha256Digest::new([7; 32]),
     )?)
 }
