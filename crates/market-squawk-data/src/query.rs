@@ -547,15 +547,7 @@ impl ResearchQueryEngine {
         if self.manifest.schema() != &canonical || row >= MAX_ROWS as usize {
             return Err(QueryError::PinnedQuerySourceRequired);
         }
-        let sql = format!(
-            "SELECT example_id, instrument_id, cutoff_at, component_kind, component_name, \
-             component_version, value_decimal_mantissa, value_decimal_scale, unit, currency, \
-             lineage_sha256 FROM {} WHERE component_kind = 'feature' \
-             AND value_decimal_mantissa IS NOT NULL AND value_decimal_scale IS NOT NULL \
-             AND currency IS NOT NULL ORDER BY example_id, instrument_id, cutoff_at, \
-             component_name, component_version, lineage_sha256 LIMIT 1 OFFSET {row}",
-            self.table_name
-        );
+        let sql = feature_monetary_sql(&self.table_name, row);
         let output = self
             .query_pinned(
                 QueryRequest::try_new(self.manifest.clone(), sql)?,
@@ -831,6 +823,17 @@ impl ResearchQueryEngine {
         io_supervisor.cancel();
         result
     }
+}
+
+fn feature_monetary_sql(table_name: &str, row: usize) -> String {
+    format!(
+        "SELECT example_id, instrument_id, cutoff_at, component_kind, component_name, \
+         component_version, value_decimal_mantissa, value_decimal_scale, unit, currency, \
+         lineage_sha256 FROM {table_name} WHERE component_kind = 1 \
+         AND value_decimal_mantissa IS NOT NULL AND value_decimal_scale IS NOT NULL \
+         AND currency IS NOT NULL ORDER BY example_id, instrument_id, cutoff_at, \
+         component_name, component_version, lineage_sha256 LIMIT 1 OFFSET {row}"
+    )
 }
 
 /// Query validation, resource, execution, or artifact failure.

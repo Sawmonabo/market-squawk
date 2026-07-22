@@ -362,7 +362,6 @@ def expected_source_paths(root: Path) -> tuple[str, ...]:
         "python/market_squawk",
         "python/tests",
         "python/examples",
-        "python/fixtures",
     ):
         paths.update(_regular_files(root, root / relative))
     paths.update(

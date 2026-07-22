@@ -153,7 +153,7 @@ fn python_dataset_row(value: &Bound<'_, PyAny>) -> PyResult<PythonDatasetRow> {
         return Err(invalid_input());
     }
     let cutoff = mapping.get_item("cutoff_at").map_err(|_| invalid_input())?;
-    if !exact_python_type(&cutoff, "market_squawk.data", "UtcNanoseconds")? {
+    if !exact_python_type(&cutoff, "market_squawk._data_validation", "UtcNanoseconds")? {
         return Err(invalid_input());
     }
     let cutoff_at = exact_i64(&cutoff.getattr("unix_nanos").map_err(|_| invalid_input())?)?;

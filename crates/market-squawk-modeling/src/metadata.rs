@@ -151,6 +151,10 @@ impl TrainingDatasetIdentity {
     /// # Errors
     ///
     /// Rejects reserved zero identities.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "all independent catalog, generation, selection, and temporal identities remain explicit"
+    )]
     pub fn try_new(
         manifest: DatasetManifestRef,
         build_spec_digest: DatasetBuildSpecDigest,

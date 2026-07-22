@@ -3,8 +3,8 @@
 use std::num::NonZeroU32;
 
 use arrow::array::{
-    Array as _, Decimal128Array, FixedSizeBinaryArray, StringArray, TimestampNanosecondArray,
-    UInt8Array, UInt32Array,
+    Array as _, Decimal128Array, FixedSizeBinaryArray, TimestampNanosecondArray, UInt8Array,
+    UInt32Array,
 };
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
@@ -12,6 +12,7 @@ use market_squawk_domain::{
     Currency, DigestAlgorithm, EvidenceDigest, InstrumentId, SourceIdentifier, Timestamp,
 };
 use rust_decimal::Decimal;
+use uuid::Uuid;
 
 use super::{PinnedQueryOutput, QueryError, QueryResult};
 use crate::DatasetManifestRef;
@@ -63,24 +64,22 @@ impl PinnedFeatureMonetaryValue {
         };
         let batch = single_result_row(batches)?;
         let row = 0;
-        let kind = required_string(batch, COMPONENT_KIND_COLUMN, row)?;
-        if kind != "feature" {
+        let kinds = array::<UInt8Array>(batch, COMPONENT_KIND_COLUMN)?;
+        if kinds.is_null(row) || kinds.value(row) != 1 {
             return Err(QueryError::InvalidMonetaryCell);
         }
         let example_id =
-            SourceIdentifier::try_from(required_string(batch, EXAMPLE_ID_COLUMN, row)?)
+            SourceIdentifier::try_from(required_fixed_text(batch, EXAMPLE_ID_COLUMN, row)?)
                 .map_err(|_| QueryError::InvalidMonetaryCell)?;
-        let instrument_id = required_string(batch, INSTRUMENT_ID_COLUMN, row)?
-            .parse()
-            .map_err(|_| QueryError::InvalidMonetaryCell)?;
+        let instrument_id = required_instrument(batch, INSTRUMENT_ID_COLUMN, row)?;
         let cutoff_at = required_timestamp(batch, CUTOFF_AT_COLUMN, row)?;
-        let component_name = required_string(batch, COMPONENT_NAME_COLUMN, row)?.to_owned();
+        let component_name = required_fixed_text(batch, COMPONENT_NAME_COLUMN, row)?.to_owned();
         let versions = array::<UInt32Array>(batch, COMPONENT_VERSION_COLUMN)?;
         let component_version =
             NonZeroU32::new(versions.value(row)).ok_or(QueryError::InvalidMonetaryCell)?;
         let values = array::<Decimal128Array>(batch, VALUE_COLUMN)?;
         let scales = array::<UInt8Array>(batch, SCALE_COLUMN)?;
-        let currencies = array::<StringArray>(batch, CURRENCY_COLUMN)?;
+        let currencies = array::<FixedSizeBinaryArray>(batch, CURRENCY_COLUMN)?;
         if values.is_null(row) || scales.is_null(row) || currencies.is_null(row) {
             return Err(QueryError::InvalidMonetaryCell);
         }
@@ -98,10 +97,13 @@ impl PinnedFeatureMonetaryValue {
         let mantissa = values.value(row);
         Decimal::try_from_i128_with_scale(mantissa, u32::from(scale))
             .map_err(|_| QueryError::InvalidMonetaryCell)?;
-        let currency = Currency::try_from(currencies.value(row))
+        let currency = Currency::try_from(fixed_text(currencies, row)?)
             .map_err(|_| QueryError::InvalidMonetaryCell)?;
         let unit = optional_source_identifier(batch, UNIT_COLUMN, row)?;
         let lineages = array::<FixedSizeBinaryArray>(batch, LINEAGE_COLUMN)?;
+        if lineages.is_null(row) {
+            return Err(QueryError::InvalidMonetaryCell);
+        }
         let lineage: [u8; 32] = lineages
             .value(row)
             .try_into()
@@ -234,13 +236,8 @@ fn array<T: 'static>(batch: &RecordBatch, column: usize) -> Result<&T, QueryErro
         .ok_or(QueryError::InvalidMonetaryCell)
 }
 
-fn required_string(batch: &RecordBatch, column: usize, row: usize) -> Result<&str, QueryError> {
-    let values = array::<StringArray>(batch, column)?;
-    if values.is_null(row) {
-        Err(QueryError::InvalidMonetaryCell)
-    } else {
-        Ok(values.value(row))
-    }
+fn required_fixed_text(batch: &RecordBatch, column: usize, row: usize) -> Result<&str, QueryError> {
+    fixed_text(array::<FixedSizeBinaryArray>(batch, column)?, row)
 }
 
 fn optional_source_identifier(
@@ -248,14 +245,45 @@ fn optional_source_identifier(
     column: usize,
     row: usize,
 ) -> Result<Option<SourceIdentifier>, QueryError> {
-    let values = array::<StringArray>(batch, column)?;
+    let values = array::<FixedSizeBinaryArray>(batch, column)?;
     if values.is_null(row) {
         Ok(None)
     } else {
-        SourceIdentifier::try_from(values.value(row))
+        SourceIdentifier::try_from(fixed_text(values, row)?)
             .map(Some)
             .map_err(|_| QueryError::InvalidMonetaryCell)
     }
+}
+
+fn required_instrument(
+    batch: &RecordBatch,
+    column: usize,
+    row: usize,
+) -> Result<InstrumentId, QueryError> {
+    let values = array::<FixedSizeBinaryArray>(batch, column)?;
+    if values.is_null(row) {
+        return Err(QueryError::InvalidMonetaryCell);
+    }
+    let bytes: [u8; 16] = values
+        .value(row)
+        .try_into()
+        .map_err(|_| QueryError::InvalidMonetaryCell)?;
+    InstrumentId::try_from(Uuid::from_bytes(bytes)).map_err(|_| QueryError::InvalidMonetaryCell)
+}
+
+fn fixed_text(values: &FixedSizeBinaryArray, row: usize) -> Result<&str, QueryError> {
+    if values.is_null(row) {
+        return Err(QueryError::InvalidMonetaryCell);
+    }
+    let bytes = values.value(row);
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
+    if end == 0 || bytes[end..].iter().any(|byte| *byte != 0) {
+        return Err(QueryError::InvalidMonetaryCell);
+    }
+    std::str::from_utf8(&bytes[..end]).map_err(|_| QueryError::InvalidMonetaryCell)
 }
 
 fn required_timestamp(

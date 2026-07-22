@@ -6,6 +6,8 @@ use super::export::{FeatureLabelPythonExport, encode};
 use super::{DatasetBuildError, DatasetBuilderService, FeatureLabelDataset};
 use crate::{CatalogEndpointIdentity, GenerationKind, PythonDatasetCatalogError};
 
+type RetainedPythonDatasetAdmission = (Vec<u8>, String, i64, Vec<u8>, i64);
+
 /// Immutable catalog-backed identity of one Task 11 Python export.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PythonDatasetAdmission {
@@ -142,7 +144,7 @@ pub(super) fn register(
                 now.unix_nanos(),
             ],
         )?;
-        let retained: Option<(Vec<u8>, String, i64, Vec<u8>, i64)> = transaction
+        let retained: Option<RetainedPythonDatasetAdmission> = transaction
             .query_row(
                 "SELECT catalog_identity, dataset_id, manifest_version, descriptor_json,
                         selection_digest_version

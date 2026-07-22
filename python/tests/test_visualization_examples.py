@@ -2,14 +2,20 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import runpy
+import tempfile
 import unittest
+from unittest.mock import patch
 
 from market_squawk.visualization import VisualizationError, chart_spec, static_svg
 
 
 ROOT = Path(__file__).resolve().parents[2]
+_fixture = runpy.run_path(
+    str(ROOT / "python" / "tests" / "test_data.py"), run_name="_dataset_fixture"
+)["_fixture"]
 
 
 class VisualizationAndExamplesContracts(unittest.TestCase):
@@ -31,15 +37,27 @@ class VisualizationAndExamplesContracts(unittest.TestCase):
             chart_spec(rows + [{"at": 5, "value": 0.5}], x="at", y="value", max_points=4)
 
     def test_local_example_and_notebook_execute_without_downloads(self) -> None:
-        namespace = runpy.run_path(str(ROOT / "python" / "examples" / "pit_research.py"))
-        self.assertEqual(namespace["RESULT"]["rows"], 2)
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = Path(temporary)
+            export_sha256 = _fixture(fixture)
+            environment = {
+                "MARKET_SQUAWK_EXAMPLE_DATASET_ROOT": str(fixture),
+                "MARKET_SQUAWK_EXAMPLE_EXPORT_SHA256": export_sha256,
+            }
+            with patch.dict(os.environ, environment):
+                namespace = runpy.run_path(
+                    str(ROOT / "python" / "examples" / "pit_research.py")
+                )
+                self.assertEqual(namespace["RESULT"]["rows"], 2)
 
-        notebook = json.loads((ROOT / "python" / "examples" / "pit_research.ipynb").read_text())
-        scope = {"__name__": "__notebook_test__"}
-        for cell in notebook["cells"]:
-            if cell["cell_type"] == "code":
-                exec("".join(cell["source"]), scope, scope)
-        self.assertEqual(scope["RESULT"]["rows"], 2)
+                notebook = json.loads(
+                    (ROOT / "python" / "examples" / "pit_research.ipynb").read_text()
+                )
+                scope = {"__name__": "__notebook_test__"}
+                for cell in notebook["cells"]:
+                    if cell["cell_type"] == "code":
+                        exec("".join(cell["source"]), scope, scope)
+                self.assertEqual(scope["RESULT"]["rows"], 2)
 
 
 if __name__ == "__main__":

@@ -206,7 +206,7 @@ def _install_catalog(
         connection.execute("PRAGMA foreign_keys=ON")
         if connection.execute("PRAGMA journal_mode=WAL").fetchone()[0].lower() != "wal":
             raise RuntimeError("test catalog did not enter WAL mode")
-        connection.execute("PRAGMA application_id=1297301835")
+        connection.execute("PRAGMA application_id=1297305931")
         migration_script = ["BEGIN IMMEDIATE;"]
         for version, migration in enumerate(sorted(MIGRATIONS.glob("*.sql")), start=1):
             sql = migration.read_text(encoding="utf-8")

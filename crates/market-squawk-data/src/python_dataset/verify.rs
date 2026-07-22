@@ -42,6 +42,18 @@ const MAX_ROW_GROUPS: usize = 4_096;
 const HASH_BUFFER_BYTES: usize = 64 * 1024;
 const SQLITE_PROGRESS_OPERATIONS: i32 = 1_000;
 
+type CatalogGenerationRow = (
+    Vec<u8>,
+    String,
+    i64,
+    Vec<u8>,
+    String,
+    i64,
+    Vec<u8>,
+    i64,
+    i64,
+);
+
 pub(super) fn verify(
     local_root: &Path,
     export_sha256: Sha256Digest,
@@ -184,17 +196,7 @@ fn verify_catalog_generation(
 ) -> Result<(), PythonDatasetCatalogError> {
     let dataset = &descriptor.dataset;
     let manifest_version = sql_i64(dataset.manifest_version)?;
-    let generation: Option<(
-        Vec<u8>,
-        String,
-        i64,
-        Vec<u8>,
-        String,
-        i64,
-        Vec<u8>,
-        i64,
-        i64,
-    )> = transaction
+    let generation: Option<CatalogGenerationRow> = transaction
         .query_row(
             "SELECT content_hash, schema_name, schema_version, schema_fingerprint,
                         generation_kind, parent_count, build_spec_digest, row_count, total_bytes
@@ -387,7 +389,8 @@ fn verify_object(
     {
         return Err(PythonDatasetCatalogError::CorruptAdmission);
     }
-    validate_arrow_schema(builder.schema().as_ref(), descriptor)?;
+    let file_schema = builder.schema().clone();
+    validate_arrow_schema(file_schema.as_ref(), descriptor)?;
     let mut maximum_rows = 0_usize;
     for group in metadata.row_groups() {
         let rows = usize::try_from(group.num_rows())
@@ -426,6 +429,16 @@ fn verify_object(
     for batch in reader {
         check_control(deadline, cancellation)?;
         let batch = batch?;
+        let batch_schema = batch.schema();
+        if batch_schema.fields() != file_schema.fields()
+            || (!batch_schema.metadata().is_empty()
+                && batch_schema.metadata() != file_schema.metadata())
+        {
+            return Err(PythonDatasetCatalogError::CorruptAdmission);
+        }
+        // Parquet preserves file-level Arrow metadata on the builder schema but may omit it from
+        // emitted batches. Reattach only the already-validated file schema.
+        let batch = batch.with_schema(file_schema.clone())?;
         let admitted = DatasetArrowBatch::try_from_record_batch(batch)?;
         let batch = admitted.record_batch();
         validate_arrow_schema(batch.schema().as_ref(), descriptor)?;

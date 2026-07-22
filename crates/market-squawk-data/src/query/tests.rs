@@ -1,7 +1,12 @@
 use std::error::Error;
 use std::time::Duration;
 
-use arrow::array::{ArrayRef, Int64Array};
+use std::sync::Arc;
+
+use arrow::array::{
+    ArrayRef, Decimal128Array, FixedSizeBinaryArray, Float64Array, Int64Array,
+    TimestampNanosecondArray, UInt8Array, UInt32Array, builder::FixedSizeBinaryBuilder,
+};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use market_squawk_domain::{
@@ -11,8 +16,12 @@ use market_squawk_domain::{
 };
 use rust_decimal::Decimal;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
-use super::{QueryError, QueryLimits, QueryRequest, QueryResult, ResearchQueryEngine};
+use super::{
+    PinnedFeatureMonetaryValue, PinnedQueryOutput, QueryError, QueryLimits, QueryRequest,
+    QueryResult, ResearchQueryEngine, feature_monetary_sql,
+};
 use crate::{
     DatasetId, DatasetManifestRef, DatasetSchemaRegistry, ResearchArrowBatch, Sha256Digest,
 };
@@ -49,6 +58,81 @@ fn query_artifact_identity_binds_exact_row_schema() -> TestResult {
         QueryRequest::try_new(second, "SELECT 1")?.artifact_identity(&limits)
     );
     Ok(())
+}
+
+#[tokio::test]
+async fn fixed_width_feature_query_issues_exact_monetary_receipt() -> TestResult {
+    let registry = DatasetSchemaRegistry::local();
+    let schema_ref = registry.canonical_feature_labels()?;
+    let manifest = DatasetManifestRef::try_new_with_schema(
+        DatasetId::try_from("training-features")?,
+        1,
+        schema_ref.clone(),
+        Sha256Digest::new([7; 32]),
+    )?;
+    let instrument = Uuid::parse_str("0187f5f1-6fc2-7fa2-bf05-2ce5354c55c1")?;
+    let arrays: Vec<ArrayRef> = vec![
+        Arc::new(fixed(Some(b"example-1"), 256)?),
+        Arc::new(fixed(Some(instrument.as_bytes()), 16)?),
+        Arc::new(TimestampNanosecondArray::from(vec![100]).with_timezone("+00:00")),
+        Arc::new(UInt8Array::from(vec![1])),
+        Arc::new(UInt8Array::from(vec![1])),
+        Arc::new(fixed(Some(b"market-value"), 256)?),
+        Arc::new(UInt32Array::from(vec![1])),
+        Arc::new(Float64Array::from(vec![None])),
+        Arc::new(Decimal128Array::from(vec![Some(123_456)]).with_precision_and_scale(38, 0)?),
+        Arc::new(UInt8Array::from(vec![Some(2)])),
+        Arc::new(fixed(Some(b"currency"), 32)?),
+        Arc::new(fixed(Some(b"USD"), 3)?),
+        Arc::new(fixed(None, 256)?),
+        Arc::new(fixed(Some(&[9; 32]), 32)?),
+    ];
+    let batch = RecordBatch::try_new(registry.resolve(&schema_ref)?, arrays)?;
+    let engine =
+        ResearchQueryEngine::from_pinned_batches(manifest.clone(), "features", vec![batch])?;
+    let result = engine
+        .query(
+            QueryRequest::try_new(manifest.clone(), feature_monetary_sql("features", 0))?,
+            QueryLimits::try_new(
+                1,
+                64 * 1024,
+                8 * 1024 * 1024,
+                1,
+                128,
+                128,
+                Duration::from_secs(1),
+            )?,
+            CancellationToken::new(),
+        )
+        .await?;
+    let output = PinnedQueryOutput::new(
+        manifest,
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [1; 32]),
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [2; 32]),
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [3; 32]),
+        result,
+    );
+    let value = PinnedFeatureMonetaryValue::try_from_output(&output, 0)?;
+
+    assert_eq!(value.component_name(), "market-value");
+    assert_eq!(value.currency().as_str(), "USD");
+    assert_eq!(value.decimal()?, Decimal::new(123_456, 2));
+    Ok(())
+}
+
+fn fixed(value: Option<&[u8]>, width: i32) -> Result<FixedSizeBinaryArray, Box<dyn Error>> {
+    let mut builder = FixedSizeBinaryBuilder::new(width);
+    if let Some(value) = value {
+        let mut padded = vec![0; usize::try_from(width)?];
+        padded
+            .get_mut(..value.len())
+            .ok_or("fixed-width fixture value exceeds its column")?
+            .copy_from_slice(value);
+        builder.append_value(&padded)?;
+    } else {
+        builder.append_null();
+    }
+    Ok(builder.finish())
 }
 
 #[tokio::test]

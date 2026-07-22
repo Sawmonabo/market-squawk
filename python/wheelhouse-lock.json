@@ -82,13 +82,13 @@
   "sources": [
     {
       "path": "Cargo.lock",
-      "sha256": "0bf3a8e58708bb310f03c1f9e4db27cb525f781540f2a6614104cb9c373739ec",
-      "size_bytes": 157483
+      "sha256": "e8a02e26d2cb5244f854caad67d67732c22d7ef53f655a5b40a2dfbf3fea6ee0",
+      "size_bytes": 157952
     },
     {
       "path": "Cargo.toml",
-      "sha256": "4460ccf026c7441f9c3c2f84b14f46b3c4f63697b0acad3f71b5374b63fe67bb",
-      "size_bytes": 5526
+      "sha256": "c952cebe3f22bf92d15022ff6a86f736bec073832d7076e298e4e039ca265428",
+      "size_bytes": 5616
     },
     {
       "path": "crates/market-squawk-analytics/Cargo.toml",
@@ -256,6 +256,16 @@
       "size_bytes": 8904
     },
     {
+      "path": "crates/market-squawk-data/migrations/0010_fair_value.sql",
+      "sha256": "87a6157fd4e2cc85595ccc25a8f80cc5a7c850c10162164506ed7cc917261486",
+      "size_bytes": 11316
+    },
+    {
+      "path": "crates/market-squawk-data/migrations/0011_python_dataset_admissions.sql",
+      "sha256": "2ad9436939bd4c45ab8e74cd87ce82188182a783738a0c430704137ad3a15b12",
+      "size_bytes": 2095
+    },
+    {
       "path": "crates/market-squawk-data/src/analytical_backup.rs",
       "sha256": "cafc48889f2c2fbdcc0ed3f7211c5102446b2db415b732fdeeee6b811609c2b9",
       "size_bytes": 54189
@@ -267,8 +277,8 @@
     },
     {
       "path": "crates/market-squawk-data/src/arrow_convert/dataset.rs",
-      "sha256": "3c2624f7dcbddab55bae78c2bfc545349f259719a732562cdf7512c6e2f24ff2",
-      "size_bytes": 8732
+      "sha256": "75cb97d46592ccf0b30b08a3b7519449cb08e2ea80f923c625928f68a1f284fc",
+      "size_bytes": 9594
     },
     {
       "path": "crates/market-squawk-data/src/authority_transition.rs",
@@ -322,8 +332,8 @@
     },
     {
       "path": "crates/market-squawk-data/src/catalog.rs",
-      "sha256": "d1d780f3c9453e6bbdb5b50d9e13139a303ae6a7797621bdddf1c59b3329df40",
-      "size_bytes": 10772
+      "sha256": "cf7477659b7f21146e3651386517dbc735d2934ae0016b34792389aef469570a",
+      "size_bytes": 11168
     },
     {
       "path": "crates/market-squawk-data/src/catalog/authority.rs",
@@ -344,6 +354,26 @@
       "path": "crates/market-squawk-data/src/catalog/evidence.rs",
       "sha256": "db18f4250b1af419e757407f09a3a1095720b784f081f7e8c910f7ba3391ad5e",
       "size_bytes": 20693
+    },
+    {
+      "path": "crates/market-squawk-data/src/catalog/fair_value.rs",
+      "sha256": "b87f1a35cff9a77ea1e57b211b6b260187440c13bf8f77a6199e4cd7c6fc89b6",
+      "size_bytes": 20661
+    },
+    {
+      "path": "crates/market-squawk-data/src/catalog/fair_value/authority.rs",
+      "sha256": "d32c780dfbdc39851a66c7beeefadb18d6c3aad73b6ac9bcc941cfbe069d7f1b",
+      "size_bytes": 21103
+    },
+    {
+      "path": "crates/market-squawk-data/src/catalog/fair_value/hash.rs",
+      "sha256": "61a4a38bf1ff92b4b35da7150e2eae52264512c9db1c462c6baacffc78c3d474",
+      "size_bytes": 2686
+    },
+    {
+      "path": "crates/market-squawk-data/src/catalog/fair_value/recovery.rs",
+      "sha256": "f11dcdaa37508d2fb9bb644bcf8da9146de6c5da53c5454e93b37ad5a1a76a69",
+      "size_bytes": 12008
     },
     {
       "path": "crates/market-squawk-data/src/catalog/migration_preflight.rs",
@@ -377,8 +407,8 @@
     },
     {
       "path": "crates/market-squawk-data/src/catalog/observed_revisions/tests.rs",
-      "sha256": "35e0e4805162b9f1292fb2a4ff75c8259131f33e509d6ab844930d7892887354",
-      "size_bytes": 9469
+      "sha256": "bc6be394167b9f41c20d3a24c027ac487affd273db6e372941e7d931678c7c44",
+      "size_bytes": 9470
     },
     {
       "path": "crates/market-squawk-data/src/catalog/publication.rs",
@@ -402,18 +432,18 @@
     },
     {
       "path": "crates/market-squawk-data/src/catalog/runs.rs",
-      "sha256": "3e97acbf7660d792eb654e86add304c8dbf916973ccf7ebc778c71b95cd06fcc",
-      "size_bytes": 27481
+      "sha256": "cabac42326a652f749ef69389694d0ff16a0c6d0f9204781d6d1abedec6a2515",
+      "size_bytes": 28163
     },
     {
       "path": "crates/market-squawk-data/src/catalog/storage.rs",
-      "sha256": "1443e6fe26833197ddcb17c399fdcf0dcd460669ee6984b2cace8a398ef02aaf",
-      "size_bytes": 26348
+      "sha256": "171df21251c30e4d60fc1855437ed48d7a7f4d0a68b4b4f4ef4893b57de4ba8c",
+      "size_bytes": 26921
     },
     {
       "path": "crates/market-squawk-data/src/catalog/types.rs",
-      "sha256": "54b266b453ebed005dfc980dbf8a56e93cdb8e7fdc094732802b3e917622c658",
-      "size_bytes": 32453
+      "sha256": "7b8bc35c3cc8f97632c27c0b8cd2d232f4a4887fb1d4e2b8b9d2d74fe8f54909",
+      "size_bytes": 32643
     },
     {
       "path": "crates/market-squawk-data/src/corporate_actions.rs",
@@ -442,13 +472,18 @@
     },
     {
       "path": "crates/market-squawk-data/src/dataset_builder.rs",
-      "sha256": "ec8925d6cd90497aac05110d7085089c14b7b6f28a76b0fdc96fdc07d72ca30d",
-      "size_bytes": 7530
+      "sha256": "ef74b193a35ef872b9c6f922491be7816f24d13587af1bdf4d1e8410ed517aa2",
+      "size_bytes": 8089
+    },
+    {
+      "path": "crates/market-squawk-data/src/dataset_builder/admission.rs",
+      "sha256": "ff32f708fe80a9507881ebf16dc6897f57341b6b02783d5e5aefa2acc2afefbc",
+      "size_bytes": 8281
     },
     {
       "path": "crates/market-squawk-data/src/dataset_builder/build.rs",
-      "sha256": "79c70cb08273163a24deb2195865ae8fa682a8cd5c981d6deac1470629a3bb70",
-      "size_bytes": 42273
+      "sha256": "13656ebbff1e57284e6220fcace90726caf7f0222ef26e88fc0b0889556de763",
+      "size_bytes": 43384
     },
     {
       "path": "crates/market-squawk-data/src/dataset_builder/canonical.rs",
@@ -457,13 +492,13 @@
     },
     {
       "path": "crates/market-squawk-data/src/dataset_builder/export.rs",
-      "sha256": "15ee4cf44892a020800634e2c6e3603d49fa199cf8e72d37534b2599db592b2a",
+      "sha256": "e41ff24d40ba5822bcff5099017d517a229d487bead0f01828dbe1383d978654",
       "size_bytes": 8290
     },
     {
       "path": "crates/market-squawk-data/src/dataset_builder/model.rs",
-      "sha256": "6c26d69e021d4aadbc5c28f233a269b19d5c629ed60d631261f829f3c6dc0455",
-      "size_bytes": 44403
+      "sha256": "c4115adeaca3dae011bd7ad0f4d162d7a7c29f4a94480ee18888a2998f0976ff",
+      "size_bytes": 44236
     },
     {
       "path": "crates/market-squawk-data/src/ingest.rs",
@@ -477,8 +512,8 @@
     },
     {
       "path": "crates/market-squawk-data/src/lib.rs",
-      "sha256": "da6f610c0ad44bd3c167ee40810072daff7e70c45b8162f820c3c11719deddd9",
-      "size_bytes": 5942
+      "sha256": "595f8f7b0e6ff564be2f7b3b66fdc06fd52e75f9012f03bde6442019119edd94",
+      "size_bytes": 6624
     },
     {
       "path": "crates/market-squawk-data/src/manifest.rs",
@@ -492,13 +527,13 @@
     },
     {
       "path": "crates/market-squawk-data/src/migrations.rs",
-      "sha256": "59b1753a91b7a65f4dfe00327542208b2e5462128697cd758215c913be860e96",
-      "size_bytes": 3550
+      "sha256": "d3b855f524bfdf7e71b1a4d9a3494e06b37dd6bf6c15a4b25a798270a91d5aef",
+      "size_bytes": 4297
     },
     {
       "path": "crates/market-squawk-data/src/parquet_store.rs",
-      "sha256": "67a61897c82f940e9cf98a909b8ad4571688282e3c577bdcaac8c3f12693a882",
-      "size_bytes": 47174
+      "sha256": "e8491caf5a08881236708df3bbe8b1514162ee26be28263a2b4e35b9b0d8c4f4",
+      "size_bytes": 47922
     },
     {
       "path": "crates/market-squawk-data/src/parquet_store/authority.rs",
@@ -576,19 +611,44 @@
       "size_bytes": 1553
     },
     {
+      "path": "crates/market-squawk-data/src/python_dataset.rs",
+      "sha256": "9567a07522a5cd97ef3a9f32a6caa23670b5999af6b4dff07c94b92c9599a1bc",
+      "size_bytes": 15684
+    },
+    {
+      "path": "crates/market-squawk-data/src/python_dataset/descriptor.rs",
+      "sha256": "1b986b5bf1e47c1df762f70a06b61d95d9eaf4c201a26cd26467c232423e3569",
+      "size_bytes": 12745
+    },
+    {
+      "path": "crates/market-squawk-data/src/python_dataset/verify.rs",
+      "sha256": "52be2316fbf30a5fae3a2da588e58f533a2231d04f915dbd7cdcefc592a49091",
+      "size_bytes": 29983
+    },
+    {
       "path": "crates/market-squawk-data/src/query.rs",
-      "sha256": "b70e736fab3cff239196ba3d982aab81118285965526920d71acf057120fcda5",
-      "size_bytes": 32273
+      "sha256": "87d29af531e98a6bf167d6b9d5232e887c916b0d91a67815c6d921bdd3d62c78",
+      "size_bytes": 39049
     },
     {
       "path": "crates/market-squawk-data/src/query/budget.rs",
-      "sha256": "24cee787b4e58930451e7bdd9033b879fa4430a3f5389e560ddc815988ccf0e4",
-      "size_bytes": 8347
+      "sha256": "1d43950fc1ee82f9b6961bbc69e53c50167d0bc9c998cb8b258fe4efbd516601",
+      "size_bytes": 8566
+    },
+    {
+      "path": "crates/market-squawk-data/src/query/feature_receipt.rs",
+      "sha256": "415e341413bae3cf88b2c12becb4190bba73d8a1515e8bb9f3199fbef94b539e",
+      "size_bytes": 10372
+    },
+    {
+      "path": "crates/market-squawk-data/src/query/receipt.rs",
+      "sha256": "bfc0c4f81ab553c5957649189b143dba1f65044f94f568589a894fd009a974b2",
+      "size_bytes": 18395
     },
     {
       "path": "crates/market-squawk-data/src/query/source.rs",
-      "sha256": "efbe8ee55b1c463147b42309003c9778505d2ea983183a36ee277fb7fd150d1a",
-      "size_bytes": 16416
+      "sha256": "603757c85c4da671300610fbdf924a7ca79776081b948c54783c20a71287309e",
+      "size_bytes": 16648
     },
     {
       "path": "crates/market-squawk-data/src/query/source/allocation.rs",
@@ -607,13 +667,13 @@
     },
     {
       "path": "crates/market-squawk-data/src/query/source/tests.rs",
-      "sha256": "cccb7c67d2752a284a6c7d377bf8dfff5a36495c5aeb2f6da604854f4c56e7b0",
-      "size_bytes": 25227
+      "sha256": "edac10aa4f54d1af99522818be348cd3820d603204efb951e51c8a872ebc7184",
+      "size_bytes": 27982
     },
     {
       "path": "crates/market-squawk-data/src/query/tests.rs",
-      "sha256": "c9e3885a8af935f3526628e0c078aedc490371fe524737310c7a8976f747e696",
-      "size_bytes": 6620
+      "sha256": "84834267632d77b81129a9bb4bd9574ec7432788633a5354f90c8cf54f6d432b",
+      "size_bytes": 9826
     },
     {
       "path": "crates/market-squawk-data/src/query/validation.rs",
@@ -692,8 +752,8 @@
     },
     {
       "path": "crates/market-squawk-data/src/schema.rs",
-      "sha256": "0087fe9ee247b5266e1cc9e57a77ee324aa87d3f2beba68efb2015baf49e007a",
-      "size_bytes": 19990
+      "sha256": "5e45bf72a14ae025cdb14ca8e6fa2296b660ccaf22bc827a489995276bcfb994",
+      "size_bytes": 20996
     },
     {
       "path": "crates/market-squawk-data/src/universe.rs",
@@ -967,13 +1027,13 @@
     },
     {
       "path": "crates/market-squawk-modeling/Cargo.toml",
-      "sha256": "9d76a0531dfba84259586d6475413da40bd7ba28ac1c207917154dfc5098bcbf",
-      "size_bytes": 839
+      "sha256": "3e5efef4a6a6bab10b50c7bd2d7a229ca7d94c46d867d5095576285132edcbe0",
+      "size_bytes": 867
     },
     {
       "path": "crates/market-squawk-modeling/src/bin/market_squawk_model_validator.rs",
-      "sha256": "138a97411b88ae27db68ef69a498dabf4b333a1c04b35199084ebf24a668d837",
-      "size_bytes": 9597
+      "sha256": "0ab42bc8cc5f40cc4dc799c8c85892342c69ad96e8e3b54d5b620fab33a5ae7a",
+      "size_bytes": 12697
     },
     {
       "path": "crates/market-squawk-modeling/src/bundle.rs",
@@ -987,8 +1047,8 @@
     },
     {
       "path": "crates/market-squawk-modeling/src/bundle/validation.rs",
-      "sha256": "c743486b93997d424d0dc9233b680bcb0f67ccadb6546ba96653ee77700ef399",
-      "size_bytes": 18560
+      "sha256": "f74173adbed17a36a7869544cc2e85033b8b3c2ae4b4877d2616736a9960049b",
+      "size_bytes": 19390
     },
     {
       "path": "crates/market-squawk-modeling/src/input.rs",
@@ -1002,8 +1062,8 @@
     },
     {
       "path": "crates/market-squawk-modeling/src/metadata.rs",
-      "sha256": "a0d45e424819e301c624e33be460b586d3d20eeb038c6d36d2dc129cf4161cb3",
-      "size_bytes": 20831
+      "sha256": "fc4625b50b4c12bf66df345767889ef351f8064c5847d90e33a0a3401acafbd5",
+      "size_bytes": 22585
     },
     {
       "path": "crates/market-squawk-modeling/src/native.rs",
@@ -1307,8 +1367,8 @@
     },
     {
       "path": "crates/market-squawk-platform/src/paths.rs",
-      "sha256": "c628feb6f64a5c90f5bec91c401046405f59946c7f52a93a29b4041b5530a18c",
-      "size_bytes": 36923
+      "sha256": "d065ba31a3e9baa7c47aa6e15661063a1076e174555eb49fa3f0a7063a894e0b",
+      "size_bytes": 39897
     },
     {
       "path": "crates/market-squawk-platform/src/paths/catalog.rs",
@@ -1347,13 +1407,23 @@
     },
     {
       "path": "crates/market-squawk-python/Cargo.toml",
-      "sha256": "76954bc51cdb8c926862dd19a5936be8714b97beb0224e4f518f1718832ccca5",
-      "size_bytes": 573
+      "sha256": "e7fb82e585c2a575254950a53f3b900a284fb19d21353a93da783d40482652e0",
+      "size_bytes": 665
+    },
+    {
+      "path": "crates/market-squawk-python/src/analytics.rs",
+      "sha256": "d1bbe1e91800fca3310583f8365adb175a8d71b9299a255042e0ab47aa7b8ea2",
+      "size_bytes": 16047
+    },
+    {
+      "path": "crates/market-squawk-python/src/dataset.rs",
+      "sha256": "e9b98bd148adc4841357e4d6bab7a7eb94993fdf74efa334292dbaf00e1b3f27",
+      "size_bytes": 10988
     },
     {
       "path": "crates/market-squawk-python/src/lib.rs",
-      "sha256": "85cb7e92191a897f207ea8a315c1430e33e51a3fecf1c8039b2ffff210539afb",
-      "size_bytes": 12766
+      "sha256": "994b7a99a08adbd76e3d8684c6e75b293d13180126dd5ba479a3a3e15f32026f",
+      "size_bytes": 4160
     },
     {
       "path": "crates/market-squawk-sources/Cargo.toml",
@@ -1707,53 +1777,43 @@
     },
     {
       "path": "python/examples/pit_research.ipynb",
-      "sha256": "9741aaa58f7932a933a32ef5fd4cb3ec95624f364b50b4269036dc4c8f6738d0",
-      "size_bytes": 1423
+      "sha256": "30c82570dac63d2877d4adbcc1a33edfd5085524b2ed98d8ee9d0baf04fd8ccf",
+      "size_bytes": 2061
     },
     {
       "path": "python/examples/pit_research.py",
-      "sha256": "5b24118845a3fd98efd510c29c10b52f0ada153ac32776d4dac431f4d50fd376",
-      "size_bytes": 1013
-    },
-    {
-      "path": "python/fixtures/pit_example/feature-label-export.json",
-      "sha256": "ca9d2b2b5819a2ee1feefd4e12712f3ababd272b254d8f6d44b6f82ee78633ae",
-      "size_bytes": 1781
-    },
-    {
-      "path": "python/fixtures/pit_example/feature-label-export.sha256",
-      "sha256": "29a01746fad8371846ce115ef4247c8b9fea761ed6c2b42b310473c0066fe68c",
-      "size_bytes": 65
-    },
-    {
-      "path": "python/fixtures/pit_example/objects/part-000.parquet",
-      "sha256": "ee58963a2fdb0a44f7f1eb71613748aa94311fd0076964214c0277128d8b8d47",
-      "size_bytes": 6477
+      "sha256": "4ad46e00150ebfabc49c57b2f39d0a89fd149085891b40ead1acac99679f86e3",
+      "size_bytes": 1685
     },
     {
       "path": "python/market_squawk/__init__.py",
-      "sha256": "b513db9d84306f07291f1d74c193307bee270cfb2e1622e9c4428cd25151265d",
-      "size_bytes": 409
+      "sha256": "13fc91dc10100c5b2cd9a4cf9baf7b013f796168b533f2134511daac15c78a61",
+      "size_bytes": 471
+    },
+    {
+      "path": "python/market_squawk/_data_validation.py",
+      "sha256": "0b9a7901fc349df3bb129c3af60dd8157c6dae4997c450b0dacf954b7f2cf780",
+      "size_bytes": 24336
     },
     {
       "path": "python/market_squawk/bundle.py",
-      "sha256": "303a4bb565161c9f984afb2118afeec9f39616becfc4857f0daca7b4dddda07e",
-      "size_bytes": 8815
+      "sha256": "5e84996698c7431001f5e83fad8ddab5c6775b55522d3cd0558a5f047b93ac6a",
+      "size_bytes": 9860
     },
     {
       "path": "python/market_squawk/data.py",
-      "sha256": "2f087ddd17aedcb7d60ee8f301d3502ca0182879aebb6a5b84ebe043e360127f",
-      "size_bytes": 29359
+      "sha256": "c760f6b7ed1a6399f42d853e0a5e927a1a1665e10079e1d72b52b057f0ebeab8",
+      "size_bytes": 15055
     },
     {
       "path": "python/market_squawk/finance.py",
-      "sha256": "369bf2420ec08442cda73da40da584fbd339ed4a09d53bc7e0f9b17068abc86a",
-      "size_bytes": 6137
+      "sha256": "c7fd870ffdedd1062807ec81806474cb1dbd5441e86766d304d74ce118f7d5ca",
+      "size_bytes": 6872
     },
     {
       "path": "python/market_squawk/training.py",
-      "sha256": "9617f38fe5261cb0c6cc261b6bbec21ac19c6cc4a5772aa49db050e1b8e72fb1",
-      "size_bytes": 20697
+      "sha256": "c1dd181b01a49584eadd864ed379a4fab489ddf0a3bfd8caca31bb9ff9d71327",
+      "size_bytes": 24881
     },
     {
       "path": "python/market_squawk/visualization.py",
@@ -1772,23 +1832,23 @@
     },
     {
       "path": "python/tests/test_data.py",
-      "sha256": "5fa5aadbc8f881a8c8bf7143bdd783622ca67581b2c49e6231b6c10e673c1df0",
-      "size_bytes": 9677
+      "sha256": "a895a541fb3f504f263852a5fcf7a1a771e1652d4829943ca40118233e06db73",
+      "size_bytes": 18095
     },
     {
       "path": "python/tests/test_finance_parity.py",
-      "sha256": "ae0736ceef2d6fb83b9f3912e9c3d360c22b7cc57f73012bb05c34c927df3b91",
-      "size_bytes": 2634
+      "sha256": "d3a50b19ff9427017016652486bf764d43742263992da5e18f8cc3233dd19b4f",
+      "size_bytes": 3621
     },
     {
       "path": "python/tests/test_training_bundle.py",
-      "sha256": "443a1ca4ae38cb199f438db2ebe9bc4c3fdadde0b69d814fc08c6866216a082b",
-      "size_bytes": 4365
+      "sha256": "0b8eff7542e604c1444162552056ae1188d9999408ea206ff7692dba1d7ef89e",
+      "size_bytes": 5367
     },
     {
       "path": "python/tests/test_visualization_examples.py",
-      "sha256": "8659ccb16e500584f31beff7a1b449a0d3e7af15994180db349c12049a7b7944",
-      "size_bytes": 1884
+      "sha256": "84b57c721e41f9eb13e984c98bb38b36361a92d2db81fc1803ff21a31f78b52d",
+      "size_bytes": 2579
     },
     {
       "path": "rust-toolchain.toml",
@@ -1797,13 +1857,13 @@
     },
     {
       "path": "scripts/build_python_release.py",
-      "sha256": "6bacc4f7e76083d993661d259f815fee91247aeccaea27f3abfa9aa2c50950a9",
-      "size_bytes": 33392
+      "sha256": "5c50b2299ad9bc114d665e43399198d203cbb9d48c41d40dd89e4962d4dd4e6c",
+      "size_bytes": 45899
     },
     {
       "path": "scripts/tests/test_build_python_release.py",
-      "sha256": "c51ee2cf137521fe40bc3e157e37ba54768bd255f34de83266942fe0cdb86daf",
-      "size_bytes": 3855
+      "sha256": "94e8adffef48c431d1a7ed3e5abbe13b9a11f14696c787ed5df110bce4fc3645",
+      "size_bytes": 3898
     }
   ]
 }

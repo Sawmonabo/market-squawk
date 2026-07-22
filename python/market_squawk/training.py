@@ -209,7 +209,7 @@ class TrainingRun:
         }
         candidate = BundleCandidate(metadata, artifact, run_record)
         authority = {
-            "schema_version": 2,
+            "schema_version": 3,
             "model_id": self.model_id,
             "bundle_id": self.bundle_id,
             "bundle_version": self.bundle_version,

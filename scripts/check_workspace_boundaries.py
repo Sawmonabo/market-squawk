@@ -100,6 +100,7 @@ CORE_LOCAL_DEPENDENCIES = {
         "market-squawk-domain",
         "market-squawk-analytics",
         "market-squawk-data",
+        "market-squawk-live",
         "market-squawk-portfolio",
     },
     "market-squawk-mcp": {
@@ -107,7 +108,11 @@ CORE_LOCAL_DEPENDENCIES = {
         "market-squawk-platform",
         "market-squawk-services",
     },
-    "market-squawk-python": {"market-squawk-domain", "market-squawk-analytics"},
+    "market-squawk-python": {
+        "market-squawk-domain",
+        "market-squawk-analytics",
+        "market-squawk-data",
+    },
 }
 PROVIDER_ADAPTERS = {
     "market-squawk-adapter-coinbase",
@@ -140,6 +145,10 @@ DEV_ONLY_LOCAL_DEPENDENCIES = {
     # from Task 11 dataset evidence. Data remains forbidden as a normal execution dependency; the
     # production boundary is execution -> portfolio only.
     "market-squawk-execution": {"market-squawk-data"},
+    # The fair-value integration harness opens a local catalog fixture through retained platform
+    # path authority. Valuation production code remains confined to its declared domain/live/data/
+    # analytics/portfolio inputs.
+    "market-squawk-valuation": {"market-squawk-platform"},
 }
 HOT_PATH_PACKAGES = {"market-squawk-domain", "market-squawk-live"}
 HOT_PATH_FORBIDDEN = {
