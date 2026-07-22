@@ -127,6 +127,7 @@ impl OnnxModelPolicy {
         if Sha256::digest(bytes).as_slice() != self.model_digest.bytes() {
             return Err(OnnxPolicyError::ModelDigestMismatch);
         }
+        super::wire::prescan(bytes)?;
         let proto = tract_onnx::onnx()
             .proto_model_for_read(&mut Cursor::new(bytes))
             .map_err(|_| OnnxPolicyError::InvalidProtobuf)?;
@@ -192,6 +193,8 @@ pub enum OnnxPolicyError {
     ModelDigestMismatch,
     #[error("ONNX protobuf is corrupt or unsupported")]
     InvalidProtobuf,
+    #[error("ONNX protobuf exceeds the pre-decode structural resource ceiling")]
+    ProtobufResourceLimit,
     #[error("ONNX opset is unsupported or differs from policy")]
     UnsupportedOpset,
     #[error("ONNX graph uses a custom operator domain")]

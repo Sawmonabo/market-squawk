@@ -112,6 +112,9 @@ CORE_LOCAL_DEPENDENCIES = {
         "market-squawk-domain",
         "market-squawk-analytics",
         "market-squawk-data",
+        # The sealed native package verifies Python training receipts through modeling's
+        # code-owned environment authority before any mutable Python module is imported.
+        "market-squawk-modeling",
     },
 }
 PROVIDER_ADAPTERS = {

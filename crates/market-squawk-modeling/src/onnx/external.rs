@@ -159,6 +159,21 @@ pub struct ExternalOnnxRuntimeBackend {
     runtime: ExternalOnnxRuntimeAdmission,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RuntimeDeadlines {
+    external: Instant,
+    total: Instant,
+}
+
+impl RuntimeDeadlines {
+    fn from_budget(started_at: Instant, total_budget: std::time::Duration) -> Option<Self> {
+        Some(Self {
+            external: started_at.checked_add(total_budget / 2)?,
+            total: started_at.checked_add(total_budget)?,
+        })
+    }
+}
+
 impl ExternalOnnxRuntimeBackend {
     /// Loads an admitted local ONNX Runtime in a helper and validates tract parity.
     ///
@@ -218,16 +233,15 @@ impl InferenceBackend for ExternalOnnxRuntimeBackend {
 
     fn infer(&self, input: &ModelInput<'_>) -> Result<ModelOutput, InferenceError> {
         let normalized = normalize_input(self.metadata(), input)?;
-        let deadline = Instant::now()
-            .checked_add(self.worker.deadline())
+        let deadlines = RuntimeDeadlines::from_budget(Instant::now(), self.worker.deadline())
             .ok_or(InferenceError::OnnxDeadlineExceeded)?;
         let fallback_input = normalized.clone();
-        let score = match self.worker.execute_until(normalized, deadline) {
+        let score = match self.worker.execute_until(normalized, deadlines.external) {
             Ok(score) => f64::from(score),
             Err(_) => {
                 return self
                     .fallback
-                    .infer_normalized_until(fallback_input, deadline);
+                    .infer_normalized_until(fallback_input, deadlines.total);
             }
         };
         let (decision, confidence) = match decide(score, self.metadata().decision_thresholds()) {
@@ -235,7 +249,7 @@ impl InferenceBackend for ExternalOnnxRuntimeBackend {
             Err(_) => {
                 return self
                     .fallback
-                    .infer_normalized_until(fallback_input, deadline);
+                    .infer_normalized_until(fallback_input, deadlines.total);
             }
         };
         Ok(ModelOutput::new(
@@ -330,4 +344,25 @@ fn decode_digest(value: &str) -> Result<[u8; 32], ExternalOnnxRuntimeError> {
             u8::from_str_radix(pair, 16).map_err(|_| ExternalOnnxRuntimeError::EvidenceSyntax)?;
     }
     Ok(digest)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn external_runtime_reserves_half_of_the_total_deadline_for_tract() {
+        let started_at = Instant::now();
+        let deadlines = RuntimeDeadlines::from_budget(started_at, Duration::from_millis(200));
+
+        assert_eq!(
+            deadlines,
+            Some(RuntimeDeadlines {
+                external: started_at + Duration::from_millis(100),
+                total: started_at + Duration::from_millis(200),
+            })
+        );
+    }
 }

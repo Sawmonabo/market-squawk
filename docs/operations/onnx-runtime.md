@@ -87,9 +87,12 @@ closed sequence:
 5. Publish the optional backend only after external and tract zero-input warm-up results agree.
 
 `try_from_tract` borrows the required `Arc<TractOnnxBackend>`; a construction failure cannot consume
-the fallback. The optional worker is serialized, has a capacity-one request queue and a configured
-deadline, and is quarantined after a timeout or runtime error. The backend then routes that request
-and subsequent requests through tract. Neither backend can emit an order directly; model output
+the fallback. Each request has one configured total deadline. The optional worker receives the
+first half and tract retains the second half, so an optional-runtime timeout cannot exhaust tract's
+reserved execution window. A timeout or runtime error quarantines only the failed optional worker
+generation. An already-expired call is rejected before taking tract's retained generation; if the
+total request deadline is nevertheless exhausted, that request produces no action and the next
+request still has a usable tract fallback. Neither backend can emit an order directly; model output
 still passes through strategy and the sole risk boundary.
 
 ## Failure diagnosis

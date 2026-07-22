@@ -16,6 +16,7 @@ use crate::{
 #[cfg(feature = "onnx-runtime")]
 mod external;
 mod policy;
+mod wire;
 mod worker;
 
 #[cfg(feature = "onnx-runtime")]

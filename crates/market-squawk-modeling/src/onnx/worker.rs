@@ -334,6 +334,9 @@ impl OnnxWorker {
                 .generation
                 .lock()
                 .map_err(|_| WorkerError::Unavailable)?;
+            if Instant::now() >= absolute_deadline {
+                return Err(WorkerError::Deadline);
+            }
             state.take().ok_or(WorkerError::Unavailable)?
         };
         let result = execute_generation(&mut generation, values, absolute_deadline);
@@ -519,4 +522,58 @@ pub enum OnnxWorkerProcessError {
     Resource,
     #[error("ONNX worker process runtime failed")]
     Runtime,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expired_request_preserves_the_retained_generation() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let private_generation = tempfile::tempdir()?;
+        let executable = std::env::current_exe()?;
+        let program_inner = Arc::new(WorkerProgramInner {
+            executable,
+            digest: [1; 32],
+            active_generations: AtomicUsize::new(1),
+            _private_generation: private_generation,
+        });
+        let mut child = Command::new(std::env::current_exe()?)
+            .arg("--list")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let stdin = child.stdin.take();
+        let (responses_sender, responses) = mpsc::sync_channel(1);
+        drop(responses_sender);
+        let worker = OnnxWorker {
+            #[cfg(feature = "onnx-runtime")]
+            program: OnnxWorkerProgram {
+                inner: Arc::clone(&program_inner),
+            },
+            generation: Mutex::new(Some(Generation {
+                child,
+                stdin,
+                responses,
+                reader: None,
+                active_generations: program_inner,
+            })),
+            deadline: Duration::from_millis(10),
+        };
+
+        assert_eq!(
+            worker.execute_until(Vec::new(), Instant::now()),
+            Err(WorkerError::Deadline)
+        );
+        assert!(
+            worker
+                .generation
+                .lock()
+                .map_err(|_| "worker generation lock poisoned")?
+                .is_some()
+        );
+        Ok(())
+    }
 }

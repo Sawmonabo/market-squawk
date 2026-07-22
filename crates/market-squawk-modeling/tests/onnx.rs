@@ -1,6 +1,7 @@
 #[cfg(feature = "onnx-runtime")]
 use std::env;
 use std::fs;
+use std::mem::size_of;
 #[cfg(feature = "onnx-runtime")]
 use std::path::Component;
 use std::path::Path;
@@ -28,15 +29,17 @@ use market_squawk_modeling::{
 ))]
 use market_squawk_modeling::{ExternalOnnxRuntimeError, optional_onnx_runtime_policy_digest};
 use market_squawk_modeling::{
-    InferenceBackend, ModelFeatureValue, ModelInput, OnnxBackendError, OnnxFallbackPolicy,
-    OnnxModelPolicy, OnnxPolicyError, OnnxWorkerProgram, TractOnnxBackend,
+    InferenceBackend, MAX_ONNX_MODEL_BYTES, ModelFeatureValue, ModelInput, OnnxBackendError,
+    OnnxFallbackPolicy, OnnxModelPolicy, OnnxPolicyError, OnnxWorkerProgram, TractOnnxBackend,
 };
 use prost::Message;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 #[cfg(feature = "onnx-runtime")]
 use tempfile::TempDir;
-use tract_onnx::pb::{ModelProto, StringStringEntryProto, tensor_shape_proto};
+use tract_onnx::pb::{
+    AttributeProto, GraphProto, ModelProto, NodeProto, StringStringEntryProto, tensor_shape_proto,
+};
 
 use crate::bundle::{TestResult, valid_onnx_fixture};
 
@@ -139,6 +142,42 @@ fn onnx_policy_rejects_hostile_graphs_before_runtime_load() -> TestResult {
         assert_eq!(policy.preflight(&bytes), Err(expected));
     }
 
+    let mut amplified_metadata = golden.clone();
+    let entry_charge = size_of::<StringStringEntryProto>()
+        .checked_mul(2)
+        .ok_or("metadata entry charge overflowed")?;
+    let amplified_count = MAX_ONNX_MODEL_BYTES
+        .checked_mul(4)
+        .and_then(|budget| budget.checked_div(entry_charge))
+        .and_then(|count| count.checked_add(1))
+        .ok_or("metadata amplification count overflowed")?;
+    amplified_metadata.try_reserve_exact(
+        amplified_count
+            .checked_mul(2)
+            .ok_or("metadata wire size overflowed")?,
+    )?;
+    for _ in 0..amplified_count {
+        amplified_metadata.extend_from_slice(&[0x72, 0x00]);
+    }
+    let amplified_policy = policy_for(&amplified_metadata, 13, &[1, 2], &[1, 1])?;
+    assert_eq!(
+        amplified_policy.preflight(&amplified_metadata),
+        Err(OnnxPolicyError::ProtobufResourceLimit)
+    );
+
+    let mut deeply_nested = ModelProto::decode(golden.as_slice())?;
+    let graph = deeply_nested.graph.as_mut().ok_or("golden graph missing")?;
+    graph.node[0].attribute.push(AttributeProto {
+        g: Some(nested_graph(32)),
+        ..AttributeProto::default()
+    });
+    let deeply_nested = deeply_nested.encode_to_vec();
+    let deeply_nested_policy = policy_for(&deeply_nested, 13, &[1, 2], &[1, 1])?;
+    assert_eq!(
+        deeply_nested_policy.preflight(&deeply_nested),
+        Err(OnnxPolicyError::ProtobufResourceLimit)
+    );
+
     let wrong_digest = OnnxModelPolicy::try_new(
         Sha256Digest::new([9; 32]),
         13,
@@ -191,6 +230,19 @@ fn onnx_policy_rejects_hostile_graphs_before_runtime_load() -> TestResult {
     .ok_or("oversized inferred intermediate was accepted")?;
     assert_eq!(error, OnnxBackendError::IntermediateLimit);
     Ok(())
+}
+
+fn nested_graph(depth: usize) -> GraphProto {
+    (0..depth).fold(GraphProto::default(), |graph, _| GraphProto {
+        node: vec![NodeProto {
+            attribute: vec![AttributeProto {
+                g: Some(graph),
+                ..AttributeProto::default()
+            }],
+            ..NodeProto::default()
+        }],
+        ..GraphProto::default()
+    })
 }
 
 #[test]
