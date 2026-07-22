@@ -411,7 +411,8 @@ impl ExecutionAuditWriter {
         Ok(ExecutionAuditPermit { slot, bytes })
     }
 
-    pub(crate) fn try_record_strategy_no_action(
+    /// Admits an execution-owned strategy no-action fact to the bounded audit stream.
+    pub fn try_record_strategy_no_action(
         &self,
         no_action: StrategyNoAction,
         observed_at: Timestamp,
