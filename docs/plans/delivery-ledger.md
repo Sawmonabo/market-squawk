@@ -1,6 +1,6 @@
 # Market Squawk Delivery Ledger
 
-Last updated: 2026-07-21
+Last updated: 2026-07-22
 
 This is the compact operational handoff required by
 [`project-memory.md`](../project-memory.md). It records integrated work and exact verification
@@ -9,7 +9,7 @@ evidence; it does not replace the README capability truth or the canonical relea
 ## Current integration state
 
 - Release branch: `release/market-squawk-v0.1.0`
-- Task 11 integration head: `8f03d87` (`merge: complete point-in-time research datasets`)
+- Task 12 code integration head: `9702556` (`fix(analytics): bind complete batch semantics`)
 - Integrated and pushed hardening code head: `2d39b0a34eb818f817973210148355c88f8f4b52`
 - Hardening owner: GitHub issue `#30`, Project 5
 - Hardening status: implemented, verified, integrated, pushed, and cleaned up
@@ -17,6 +17,20 @@ evidence; it does not replace the README capability truth or the canonical relea
   canonical complete-release plan
 
 ## Product delivery closeout and next barrier
+
+- Task 12 owner: GitHub issue `#17`, Project 5; closure follows this ledger commit and push.
+- Exact feature and fast-forwarded release code head: `9702556`.
+- Delivered: complete pure-Rust batch returns, risk, factor, fundamental, macro, exposure,
+  attribution, and scenario kernels; exact-rate and monetary-basis contracts; cadence-bound return
+  series; typed statistical location/dispersion; scale-safe correlation; scaled streaming Givens QR
+  factor regression; and a code-owned 43-entry batch registry whose semantic digests bind every
+  execution-relevant input and policy.
+- Verification: both consolidated analytics test executables passed all 24 focused tests; strict
+  all-target/all-feature Clippy passed; three independent Quarter 2 reviewers reported no Critical
+  or Important finding; and `CARGO_INCREMENTAL=0 ./scripts/verify.sh` passed the complete workspace,
+  release, audit, documentation, offline-product, and MCP-smoke gate at exact head `9702556`.
+- Current serialization barrier: Task 13 must consume these immutable feature contracts and Task 11
+  dataset identities through complete model bundles and a bounded native Rust inference backend.
 
 - Task 11 owner: GitHub issue `#16`, Project 5, status `Done`.
 - Exact feature head: `95fbf0e`; exact release integration head: `8f03d87`.
@@ -31,8 +45,6 @@ evidence; it does not replace the README capability truth or the canonical relea
 - Final gates passed: the complete `market-squawk-data` suite, application control-plane suite,
   strict affected-package all-target/all-feature Clippy, full workspace all-target/all-feature
   compile, formatting, and diff hygiene. Focused verification also passed on the merged release tree.
-- Current serialization barrier: Task 12 must compose the existing analytical kernels and feature
-  registry into the Task 11 point-in-time dataset vertical before modeling work consumes them.
 
 ## Rust development and test hardening delivered
 
@@ -102,5 +114,5 @@ application size.
   deleted merged local and origin branch `feature/research-analytics`; and pruned worktree and remote
   metadata.
 
-The next delivery event is Task 12's integrated analytics/feature vertical over the Task 11 dataset
-service. Task 11 completion is not a claim that the Market Squawk product release is complete.
+The next delivery event is Task 13's complete model registry, bundle, and native Rust inference
+vertical. Task 12 completion is not a claim that the Market Squawk product release is complete.

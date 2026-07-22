@@ -50,6 +50,13 @@ work is bound by the single canonical
   exact input generations, source-authored historical-universe evidence, revision selection,
   corporate-action policy, chronological splits, controlled output publication, and replay-safe
   application authority.
+- Complete pure-Rust batch analytics for returns, risk, regression, fundamentals, macro, exposure,
+  attribution, and scenarios. Exact-rate and monetary-basis contracts isolate accounting values
+  from statistical floating-point calculations, while cadence-aware series and typed statistical
+  location/dispersion prevent incompatible units or annualization from crossing model boundaries.
+  A code-owned registry publishes 43 versioned batch-feature contracts and the live-feature
+  contracts with complete input schemas, policies, warm-up/null behavior, time semantics, and
+  semantic digests.
 - A production local-file extraction vertical for CSV/TSV, JSON/NDJSON, entity-safe XML,
   formula- and external-link-constrained Excel, allowlisted read-only SQLite exports, OFX/QFX, and
   Parquet. User-authorized capability roots, bounded parsing and decompression, revocable source
@@ -112,8 +119,6 @@ terminal consumer, focused verification, immutable evidence, and exact commit ex
 | `Missing` | Kraken direct-source qualification | The production transport, decoder, checksum, exact-generation session lifecycle, fresh-snapshot recovery, and canonical risk/no-paper-mutation terminal proof exist; Kraken WebSocket v2 supplies no venue sequence satisfying the current `DirectVerified` execution predicate | Task 20 |
 | `Missing` | FRED/ALFRED durable local consumption | The production vintage-aware adapter is runnable for authorized ephemeral retrieval, but the exact current terms bundle does not establish per-series rights for persistence, caching, archival, or training | Task 9 / Task 20 |
 | `Missing` | portfolio import | The raw-preserving adapter now enforces durable revisions, account/currency authority, reconciliation, supersession, and canonical data-lane output, but no application service or CLI yet composes a real Task 7 local-file/OFX producer into its required portfolio-raw contract | Task 19 |
-| `Missing` | Rust financial analytics | No complete tested batch-analytics implementation | Task 12 |
-| `Missing` | feature registry | Versioned metadata, exact live kernels, and compatibility checks exist, but no production live-route or batch-dataset consumer closes the capability | Task 12 |
 | `Missing` | Python data/financial/training product | No tracked product package or Rust-parity training boundary | Task 14 |
 | `Missing` | complete model bundle | No fully hashed artifact/schema/metadata bundle | Task 13 |
 | `Missing` | native Rust inference | No production local inference backend | Task 13 |

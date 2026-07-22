@@ -341,7 +341,21 @@ post-allocation memory accounting, and unusable application ingest authority—a
 exact implementation only after all three were corrected. The completed feature branch and origin
 branch were deleted, its worktree was removed, and its 18 GiB generated target was reclaimed.
 
-The next serialized product task is Task 12: compose the financial analytics and feature registry
-into the Task 11 point-in-time dataset service. Issue `#31` remains the mandatory zero-fee provider
-onboarding portal: it may automate official provider enrollment and key setup, while preserving and
-resuming any provider-required human consent or verification step.
+## 2026-07-22 Task 12 analytics vertical closeout
+
+Task 12 is integrated on `release/market-squawk-v0.1.0` at code head `9702556`. It delivers the
+complete Rust batch-analytics families, exact financial and statistical boundary types, robust
+factor regression, and the code-owned live/batch feature registry. Every one of the 43 batch
+entries binds its full input schema and execution-relevant policies into the semantic digest.
+
+The implementation retained the two existing consolidated analytics test executables and 24
+focused behavioral tests. Three independent Quarter 2 reviews reported no Critical or Important
+finding, and the full unchanged-head verification gate passed at `9702556`. The completed feature
+worktree, target, and local/origin branch are removed only after the release closeout commit is
+pushed and issue `#17` is closed.
+
+The next serialized product task is Task 13: complete model registry, immutable model bundles, and
+bounded native Rust inference over the Task 11 dataset identities and Task 12 feature contracts.
+Issue `#31` remains the mandatory zero-fee provider onboarding portal: it may automate official
+provider enrollment and key setup, while preserving and resuming any provider-required human
+consent or verification step.
