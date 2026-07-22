@@ -3572,6 +3572,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "market-squawk-portfolio"
+version = "0.1.0"
+dependencies = [
+ "market-squawk-analytics",
+ "market-squawk-data",
+ "market-squawk-domain",
+ "proptest",
+ "rust_decimal",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
 name = "market-squawk-services"
 version = "0.1.0"
 dependencies = [

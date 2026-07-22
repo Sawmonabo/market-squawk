@@ -6,13 +6,16 @@ use market_squawk_domain::{
     AggressorSide, AlternativeDataObservation, AuctionEvent, AuctionPhase, AvailabilityEvidence,
     BookDeltaEvent, BookLevel, BookSnapshotEvent, CorporateActionEvent, CorporateActionKind,
     CorporateActionObservation, CoverageStatus, Currency, DataQuality, DecodedLiveProvenanceInput,
-    FilingObservation, FundamentalObservation, HaltTransition, InstrumentId, InstrumentStatusEvent,
-    LiveEventClass, LiveProvenance, MacroMissingValue, MacroObservation, MarketDepth, MarketEvent,
-    MarketEventError, MarketSide, MergerConsideration, Money, PayloadReference,
-    PositionObservation, PositionSide, PriceTicks, QuantityLots, QuoteEvent, ResearchContext,
-    ResearchError, ResearchObservation, ResearchProvenance, ResearchProvenanceInput, ResearchTime,
-    RevisionNumber, SourceId, SourceIdentifier, Timestamp, TradeEvent, TradingHaltEvent,
-    TradingStatus, TransactionObservation,
+    DigestAlgorithm, EvidenceDigest, FilingObservation, FundamentalObservation, HaltTransition,
+    InstrumentId, InstrumentStatusEvent, LiveEventClass, LiveProvenance, MacroMissingValue,
+    MacroObservation, MarketDepth, MarketEvent, MarketEventError, MarketSide, MergerConsideration,
+    Money, NormalizedPortfolioLotMethod, NormalizedPortfolioTransactionClass,
+    NormalizedPortfolioTransactionError, NormalizedPortfolioTransactionEvidence,
+    NormalizedPortfolioTransactionEvidenceInput, PayloadReference, PositionObservation,
+    PositionSide, PriceTicks, QuantityLots, QuoteEvent, ResearchContext, ResearchError,
+    ResearchObservation, ResearchProvenance, ResearchProvenanceInput, ResearchTime, RevisionNumber,
+    SourceId, SourceIdentifier, Timestamp, TradeEvent, TradingHaltEvent, TradingStatus,
+    TransactionObservation,
 };
 use rust_decimal::Decimal;
 
@@ -285,6 +288,79 @@ fn canonical_research_family_has_non_marker_payloads() -> Result<(), Box<dyn Err
         let decoded: ResearchObservation = serde_json::from_str(&wire)?;
         assert_eq!(decoded, observation);
     }
+    Ok(())
+}
+
+#[test]
+fn normalized_portfolio_transaction_evidence_binds_raw_lineage_and_economic_scalars()
+-> Result<(), Box<dyn Error>> {
+    let account_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".parse()?;
+    let instrument_id = InstrumentId::from_str("0187f5f1-6fc2-7fa2-bf05-2ce5354c55cb")?;
+    let payload_digest = EvidenceDigest::new(DigestAlgorithm::Sha256, [42; 32]);
+    let evidence = NormalizedPortfolioTransactionEvidence::try_new(
+        NormalizedPortfolioTransactionEvidenceInput {
+            source_id: SourceId::try_from("portfolio-file")?,
+            logical_record_id: SourceIdentifier::try_from("record-7")?,
+            source_revision: SourceIdentifier::try_from("statement-2")?,
+            supersedes_source_revision: Some(SourceIdentifier::try_from("statement-1")?),
+            revision: RevisionNumber::new(2)?,
+            raw_source_reference: SourceIdentifier::try_from("portfolio-raw-7")?,
+            raw_payload_digest: payload_digest,
+            broker_transaction_id: SourceIdentifier::try_from("broker-transaction-7")?,
+            account_id,
+            instrument_id: Some(instrument_id),
+            classification: NormalizedPortfolioTransactionClass::Trade,
+            amount: Money::new(Decimal::from(-50), Currency::try_from("USD")?),
+            quantity: Some(Decimal::new(-5, 1)),
+            occurred_at: Timestamp::from_unix_nanos(99),
+            lot_method: Some(NormalizedPortfolioLotMethod::Fifo),
+        },
+    )?;
+
+    assert_eq!(evidence.source_id().as_str(), "portfolio-file");
+    assert_eq!(evidence.logical_record_id().as_str(), "record-7");
+    assert_eq!(evidence.source_revision().as_str(), "statement-2");
+    assert_eq!(
+        evidence
+            .supersedes_source_revision()
+            .ok_or("supersession absent")?
+            .as_str(),
+        "statement-1"
+    );
+    assert_eq!(evidence.revision(), RevisionNumber::new(2)?);
+    assert_eq!(evidence.raw_payload_digest(), payload_digest);
+    assert_eq!(evidence.account_id(), account_id);
+    assert_eq!(evidence.instrument_id(), Some(instrument_id));
+    assert_eq!(evidence.amount().amount(), Decimal::from(-50));
+    assert_eq!(evidence.quantity(), Some(Decimal::new(-5, 1)));
+    assert_eq!(
+        evidence.lot_method(),
+        Some(NormalizedPortfolioLotMethod::Fifo)
+    );
+
+    let invalid = NormalizedPortfolioTransactionEvidence::try_new(
+        NormalizedPortfolioTransactionEvidenceInput {
+            source_id: SourceId::try_from("portfolio-file")?,
+            logical_record_id: SourceIdentifier::try_from("record-8")?,
+            source_revision: SourceIdentifier::try_from("statement-1")?,
+            supersedes_source_revision: None,
+            revision: RevisionNumber::new(1)?,
+            raw_source_reference: SourceIdentifier::try_from("portfolio-raw-8")?,
+            raw_payload_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, [43; 32]),
+            broker_transaction_id: SourceIdentifier::try_from("broker-transaction-8")?,
+            account_id,
+            instrument_id: None,
+            classification: NormalizedPortfolioTransactionClass::CashTransfer,
+            amount: Money::new(Decimal::ONE, Currency::try_from("USD")?),
+            quantity: Some(Decimal::ONE),
+            occurred_at: Timestamp::from_unix_nanos(100),
+            lot_method: None,
+        },
+    );
+    assert_eq!(
+        invalid,
+        Err(NormalizedPortfolioTransactionError::InvalidFieldCombination)
+    );
     Ok(())
 }
 

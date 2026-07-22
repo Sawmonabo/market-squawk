@@ -1,0 +1,28 @@
+[package]
+name = "market-squawk-portfolio"
+description = "Deterministic immutable portfolio accounting, analytics, and read-only revision service"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+license.workspace = true
+repository = "https://github.com/Sawmonabo/market-squawk"
+publish = false
+autotests = false
+
+[dependencies]
+market-squawk-analytics = { workspace = true }
+market-squawk-data = { workspace = true }
+market-squawk-domain = { workspace = true }
+rust_decimal.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[[test]]
+name = "portfolio"
+path = "tests/accounting.rs"
+
+[lints]
+workspace = true
