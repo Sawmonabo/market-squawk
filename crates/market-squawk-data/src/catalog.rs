@@ -24,8 +24,8 @@ pub(crate) use self::backup::{
 };
 use self::storage::{
     apply_migrations, initialize_catalog_identity, pragma_bool, prepare_local_path,
-    verify_integrity, verify_migration_identities,
 };
+pub(crate) use self::storage::{verify_integrity, verify_migration_identities};
 use self::types::WriterPermit;
 pub use self::types::{
     ArtifactRecord, AuditEvent, Catalog, CatalogConfig, CatalogError, CatalogHealth, CatalogLimit,

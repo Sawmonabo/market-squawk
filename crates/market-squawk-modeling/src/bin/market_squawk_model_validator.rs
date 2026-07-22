@@ -5,22 +5,24 @@ use std::fs;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::time::{Duration, Instant};
 
 use market_squawk_analytics::{
     BatchFeatureCatalog, BatchFeatureCatalogConfig, BatchFeaturePolicies, FeatureRegistry,
     MissingValuePolicy, ShockComposition, VarianceConvention, WeightPolicy,
 };
 use market_squawk_data::{
-    ComponentKind, ComponentScope, CorporateActionSensitivity, DatasetBuildSpecDigest, DatasetId,
-    DatasetManifestRef, DatasetSchemaRef, FeatureLabelComponentSpec, Sha256Digest, UniverseId,
+    ComponentKind, ComponentScope, CorporateActionSensitivity, FeatureLabelComponentSpec,
+    PythonDatasetSelection, PythonDatasetVerificationLimits, Sha256Digest, verify_python_dataset,
 };
-use market_squawk_domain::{ModelId, RoundingPolicy, SchemaVersion, Timestamp};
+use market_squawk_domain::{ModelId, RoundingPolicy, Timestamp};
 use market_squawk_modeling::{
     BundleExpectations, BundleId, BundleMetadataRef, ControlledModelRoot, ModelBundle,
     TrainingDatasetIdentity, TrainingPeriod,
 };
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
+use tokio_util::sync::CancellationToken;
 
 const MAX_EXPECTATIONS_BYTES: u64 = 256 * 1024;
 const FEATURE_IMPLEMENTATION_REVISION: &str = "task14-python-v1";
@@ -43,13 +45,18 @@ struct ExpectationsWire {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DatasetWire {
+    catalog_identity_sha256: String,
     dataset_id: String,
+    export_sha256: String,
     manifest_version: u64,
     schema_name: String,
     schema_version: u16,
     schema_sha256: String,
     manifest_sha256: String,
     build_spec_sha256: String,
+    selected_component_rows: u64,
+    selection_as_of_unix_nanos: i64,
+    selection_sha256: String,
     universe_sha256: String,
     policy_sha256: String,
 }
@@ -91,6 +98,28 @@ fn run() -> Result<String, ()> {
     if candidate_root.starts_with(&authority_root) || authority_root.starts_with(&candidate_root) {
         return Err(());
     }
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(20))
+        .ok_or(())?;
+    let cancellation = CancellationToken::new();
+    let selection = verify_python_dataset(
+        &arguments.catalog_root,
+        Sha256Digest::new(parse_hex(&arguments.dataset_export_sha256)?),
+        Timestamp::from_unix_nanos(arguments.dataset_as_of_unix_nanos),
+        PythonDatasetVerificationLimits::try_new(100_000, 256 * 1024 * 1024).map_err(|_| ())?,
+        deadline,
+        &cancellation,
+    )
+    .map_err(|_| ())?;
+    if selection.selection_sha256().bytes() != parse_hex(&arguments.dataset_selection_sha256)?
+        || selection.catalog_identity().bytes() != parse_hex(&arguments.catalog_identity_sha256)?
+        || candidate_root.starts_with(selection.local_root())
+        || selection.local_root().starts_with(&candidate_root)
+        || authority_root.starts_with(selection.local_root())
+        || selection.local_root().starts_with(&authority_root)
+    {
+        return Err(());
+    }
     let authority_path = controlled_path(&authority_root, &arguments.authority)?;
     let canonical_authority = fs::canonicalize(&authority_path).map_err(|_| ())?;
     if !canonical_authority.starts_with(&authority_root)
@@ -108,7 +137,7 @@ fn run() -> Result<String, ()> {
         return Err(());
     }
     let wire: ExpectationsWire = serde_json::from_slice(&bytes).map_err(|_| ())?;
-    let expectations = expectations(&wire)?;
+    let expectations = expectations(&wire, &selection)?;
     let registry = feature_registry()?;
     let root = ControlledModelRoot::open_ambient(candidate_root).map_err(|_| ())?;
     let reference = BundleMetadataRef::try_new(
@@ -127,22 +156,35 @@ struct Arguments {
     authority_root: PathBuf,
     authority: String,
     authority_sha256: String,
+    catalog_root: PathBuf,
+    dataset_export_sha256: String,
+    dataset_as_of_unix_nanos: i64,
+    dataset_selection_sha256: String,
+    catalog_identity_sha256: String,
 }
 
 fn arguments() -> Result<Arguments, ()> {
     let values = env::args().skip(1).collect::<Vec<_>>();
-    if values.len() != 12
+    if values.len() != 22
         || values[0] != "--root"
         || values[2] != "--metadata"
         || values[4] != "--metadata-sha256"
         || values[6] != "--authority-root"
         || values[8] != "--authority"
         || values[10] != "--authority-sha256"
+        || values[12] != "--catalog-root"
+        || values[14] != "--dataset-export-sha256"
+        || values[16] != "--dataset-as-of-unix-nanos"
+        || values[18] != "--dataset-selection-sha256"
+        || values[20] != "--catalog-identity-sha256"
     {
         return Err(());
     }
     parse_hex(&values[5])?;
     parse_hex(&values[11])?;
+    parse_hex(&values[15])?;
+    parse_hex(&values[19])?;
+    parse_hex(&values[21])?;
     Ok(Arguments {
         root: PathBuf::from(&values[1]),
         metadata: values[3].clone(),
@@ -150,6 +192,11 @@ fn arguments() -> Result<Arguments, ()> {
         authority_root: PathBuf::from(&values[7]),
         authority: values[9].clone(),
         authority_sha256: values[11].clone(),
+        catalog_root: PathBuf::from(&values[13]),
+        dataset_export_sha256: values[15].clone(),
+        dataset_as_of_unix_nanos: values[17].parse().map_err(|_| ())?,
+        dataset_selection_sha256: values[19].clone(),
+        catalog_identity_sha256: values[21].clone(),
     })
 }
 
@@ -175,30 +222,28 @@ fn controlled_path(root: &Path, relative: &str) -> Result<PathBuf, ()> {
     Ok(root.join(relative))
 }
 
-fn expectations(wire: &ExpectationsWire) -> Result<BundleExpectations, ()> {
-    if wire.schema_version != 2 || wire.label.kind != "label" {
+fn expectations(
+    wire: &ExpectationsWire,
+    selection: &PythonDatasetSelection,
+) -> Result<BundleExpectations, ()> {
+    if wire.schema_version != 3
+        || wire.label.kind != "label"
+        || !dataset_matches_selection(&wire.dataset, selection)?
+        || wire.universe_id != selection.identity().universe_id().as_str()
+    {
         return Err(());
     }
-    let schema_version = SchemaVersion::new(wire.dataset.schema_version).map_err(|_| ())?;
-    let schema = DatasetSchemaRef::try_new(
-        &wire.dataset.schema_name,
-        schema_version,
-        parse_hex(&wire.dataset.schema_sha256)?,
-    )
-    .map_err(|_| ())?;
-    let manifest = DatasetManifestRef::try_new_with_schema(
-        DatasetId::try_from(wire.dataset.dataset_id.as_str()).map_err(|_| ())?,
-        wire.dataset.manifest_version,
-        schema,
-        Sha256Digest::new(parse_hex(&wire.dataset.manifest_sha256)?),
-    )
-    .map_err(|_| ())?;
+    let identity = selection.identity();
     let dataset = TrainingDatasetIdentity::try_new(
-        manifest,
-        DatasetBuildSpecDigest::try_new(parse_hex(&wire.dataset.build_spec_sha256)?)
-            .map_err(|_| ())?,
-        Sha256Digest::new(parse_hex(&wire.dataset.universe_sha256)?),
-        Sha256Digest::new(parse_hex(&wire.dataset.policy_sha256)?),
+        identity.manifest().clone(),
+        identity.build_spec_digest(),
+        identity.universe_digest(),
+        identity.policy_digest(),
+        selection.catalog_identity(),
+        selection.export_sha256(),
+        selection.selection_sha256(),
+        selection.as_of(),
+        NonZeroU64::new(u64::try_from(selection.selected_rows()).map_err(|_| ())?).ok_or(())?,
     )
     .map_err(|_| ())?;
     let scope = match wire.label.scope.as_str() {
@@ -225,7 +270,7 @@ fn expectations(wire: &ExpectationsWire) -> Result<BundleExpectations, ()> {
         BundleId::try_new(&wire.bundle_id).map_err(|_| ())?,
         NonZeroU64::new(wire.bundle_version).ok_or(())?,
         dataset,
-        UniverseId::try_from(wire.universe_id.as_str()).map_err(|_| ())?,
+        identity.universe_id().clone(),
         TrainingPeriod::try_new(
             Timestamp::from_unix_nanos(wire.training_period.start_unix_nanos),
             Timestamp::from_unix_nanos(wire.training_period.end_unix_nanos),
@@ -236,6 +281,29 @@ fn expectations(wire: &ExpectationsWire) -> Result<BundleExpectations, ()> {
         Sha256Digest::new(parse_hex(&wire.training_run_sha256)?),
     )
     .map_err(|_| ())
+}
+
+fn dataset_matches_selection(
+    wire: &DatasetWire,
+    selection: &PythonDatasetSelection,
+) -> Result<bool, ()> {
+    let identity = selection.identity();
+    let manifest = identity.manifest();
+    Ok(wire.dataset_id == manifest.dataset_id().as_str()
+        && wire.manifest_version == manifest.manifest_version()
+        && wire.schema_name == manifest.schema().name()
+        && wire.schema_version == manifest.schema().version().get()
+        && parse_hex(&wire.schema_sha256)? == manifest.schema().fingerprint()
+        && parse_hex(&wire.manifest_sha256)? == manifest.content_hash().bytes()
+        && parse_hex(&wire.build_spec_sha256)? == identity.build_spec_digest().digest().bytes()
+        && parse_hex(&wire.universe_sha256)? == identity.universe_digest().bytes()
+        && parse_hex(&wire.policy_sha256)? == identity.policy_digest().bytes()
+        && parse_hex(&wire.catalog_identity_sha256)? == selection.catalog_identity().bytes()
+        && parse_hex(&wire.export_sha256)? == selection.export_sha256().bytes()
+        && parse_hex(&wire.selection_sha256)? == selection.selection_sha256().bytes()
+        && wire.selection_as_of_unix_nanos == selection.as_of().unix_nanos()
+        && wire.selected_component_rows
+            == u64::try_from(selection.selected_rows()).map_err(|_| ())?)
 }
 
 fn feature_registry() -> Result<FeatureRegistry, ()> {

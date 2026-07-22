@@ -8,8 +8,8 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use arrow::array::{
-    ArrayRef, Decimal128Array, FixedSizeBinaryArray, Float64Array, StringArray,
-    TimestampNanosecondArray, UInt8Array, UInt32Array,
+    ArrayRef, Decimal128Array, FixedSizeBinaryArray, Float64Array, TimestampNanosecondArray,
+    UInt8Array, UInt32Array, builder::FixedSizeBinaryBuilder,
 };
 use arrow::record_batch::RecordBatch;
 use market_squawk_domain::{
@@ -24,7 +24,11 @@ use super::model::{
     DatasetBuildRequest, DatasetExample, DatasetSplit, DatasetSplitCounts,
     FeatureLabelComponentInput, FeatureLabelDataset, MissingValuePolicy,
 };
-use super::{DatasetBuildError, DatasetBuilderService, canonical};
+use super::{DatasetBuildError, DatasetBuilderService, admission, canonical};
+use crate::schema::{
+    FEATURE_LABEL_COMPONENT_NAME_BYTES, FEATURE_LABEL_CURRENCY_BYTES,
+    FEATURE_LABEL_EXAMPLE_ID_BYTES, FEATURE_LABEL_MISSING_REASON_BYTES, FEATURE_LABEL_UNIT_BYTES,
+};
 use crate::{
     ArtifactRecord, AuthorizedResearchUse, CorporateActionPlan, CorporateActionRecord,
     DatasetArrowBatch, DatasetManifestRecord, DatasetSchemaRegistry, DerivedOutputObjectInput,
@@ -98,11 +102,10 @@ pub(super) async fn build(
     authorize_research_use(builder, &request, &cancellation)?;
     if let Some(existing) = matching_existing(builder, &request)? {
         authorize_existing_output(builder, &request, &existing, &cancellation)?;
-        return Ok(result_from_existing(
-            &request,
-            expected_split_counts(&request)?,
-            existing,
-        ));
+        return admit_result(
+            builder,
+            result_from_existing(&request, expected_split_counts(&request)?, existing),
+        );
     }
     let mut budget = BuildRetainedBudget::new(request.limits().max_retained_bytes());
     budget.charge(request.retained_bytes())?;
@@ -124,11 +127,10 @@ pub(super) async fn build(
     let authorization = authorize_research_use(builder, &request, &cancellation)?;
     if let Some(existing) = matching_existing(builder, &request)? {
         authorize_existing_output(builder, &request, &existing, &cancellation)?;
-        return Ok(result_from_existing(
-            &request,
-            prepared.split_counts,
-            existing,
-        ));
+        return admit_result(
+            builder,
+            result_from_existing(&request, prepared.split_counts, existing),
+        );
     }
     check_control(&cancellation, deadline)?;
     let store = builder.service.object_store();
@@ -224,22 +226,33 @@ pub(super) async fn build(
     drop(publication);
     check_control(&cancellation, deadline)?;
     let pinned = builder.service.pinned(derived.manifest())?;
-    Ok(FeatureLabelDataset {
-        pinned,
-        build_spec_digest: request.build_spec_digest(),
-        policy_digest: request.policy_digest(),
-        universe_digest: request.universe_digest(),
-        split_counts: prepared.split_counts,
-        universe_id: request.inputs().universe_id().clone(),
-        split_policy: request.policy().split(),
-        point_in_time_policy: request.policy().point_in_time(),
-        missing_value_policy: request.policy().missing_values(),
-        component_specs: request
-            .inputs()
-            .component_specs()
-            .to_vec()
-            .into_boxed_slice(),
-    })
+    admit_result(
+        builder,
+        FeatureLabelDataset {
+            pinned,
+            build_spec_digest: request.build_spec_digest(),
+            policy_digest: request.policy_digest(),
+            universe_digest: request.universe_digest(),
+            split_counts: prepared.split_counts,
+            universe_id: request.inputs().universe_id().clone(),
+            split_policy: request.policy().split(),
+            point_in_time_policy: request.policy().point_in_time(),
+            missing_value_policy: request.policy().missing_values(),
+            component_specs: request
+                .inputs()
+                .component_specs()
+                .to_vec()
+                .into_boxed_slice(),
+        },
+    )
+}
+
+fn admit_result(
+    builder: &DatasetBuilderService<'_>,
+    dataset: FeatureLabelDataset,
+) -> Result<FeatureLabelDataset, DatasetBuildError> {
+    admission::register(builder, &dataset)?;
+    Ok(dataset)
 }
 
 async fn read_inputs(
@@ -860,37 +873,55 @@ fn feature_label_batch(
         FixedSizeBinaryArray::try_from_iter(rows.iter().map(|row| row.lineage.bytes().to_vec()))
             .map_err(crate::ArrowConversionError::from)?;
     let arrays: Vec<ArrayRef> = vec![
-        Arc::new(StringArray::from_iter_values(
-            rows.iter().map(|row| row.example.example_id()),
-        )),
-        Arc::new(StringArray::from_iter_values(
-            rows.iter()
-                .map(|row| row.example.instrument_id().to_string()),
-        )),
+        Arc::new(fixed_text_array(
+            rows.iter().map(|row| Some(row.example.example_id())),
+            FEATURE_LABEL_EXAMPLE_ID_BYTES,
+        )?),
+        Arc::new(
+            FixedSizeBinaryArray::try_from_iter(
+                rows.iter()
+                    .map(|row| row.example.instrument_id().as_uuid().into_bytes().to_vec()),
+            )
+            .map_err(crate::ArrowConversionError::from)?,
+        ),
         Arc::new(
             TimestampNanosecondArray::from_iter_values(
                 rows.iter().map(|row| row.example.cutoff_at().unix_nanos()),
             )
             .with_timezone_utc(),
         ),
-        Arc::new(StringArray::from_iter_values(
-            rows.iter().map(|row| row.split.name()),
+        Arc::new(UInt8Array::from_iter_values(rows.iter().map(
+            |row| match row.split {
+                DatasetSplit::Train => 1,
+                DatasetSplit::Validation => 2,
+                DatasetSplit::Test => 3,
+            },
+        ))),
+        Arc::new(UInt8Array::from_iter_values(
+            rows.iter().map(|row| row.component.spec().kind().tag()),
         )),
-        Arc::new(StringArray::from_iter_values(
-            rows.iter().map(|row| row.component.spec().kind().name()),
-        )),
-        Arc::new(StringArray::from_iter_values(
-            rows.iter().map(|row| row.component.spec().name()),
-        )),
+        Arc::new(fixed_text_array(
+            rows.iter().map(|row| Some(row.component.spec().name())),
+            FEATURE_LABEL_COMPONENT_NAME_BYTES,
+        )?),
         Arc::new(UInt32Array::from_iter_values(
             rows.iter().map(|row| row.component.spec().version().get()),
         )),
         Arc::new(Float64Array::from(float_values)),
         Arc::new(decimal),
         Arc::new(UInt8Array::from(decimal_scales)),
-        Arc::new(StringArray::from(units)),
-        Arc::new(StringArray::from(currencies)),
-        Arc::new(StringArray::from(missing)),
+        Arc::new(fixed_text_array(
+            units.iter().map(|value| value.as_deref()),
+            FEATURE_LABEL_UNIT_BYTES,
+        )?),
+        Arc::new(fixed_text_array(
+            currencies.iter().map(|value| value.as_deref()),
+            FEATURE_LABEL_CURRENCY_BYTES,
+        )?),
+        Arc::new(fixed_text_array(
+            missing.iter().map(|value| value.as_deref()),
+            FEATURE_LABEL_MISSING_REASON_BYTES,
+        )?),
         Arc::new(lineages),
     ];
     let record_batch =
@@ -905,6 +936,33 @@ fn feature_label_batch(
     Ok((batch, Sha256Digest::new(hash.finalize().into())))
 }
 
+fn fixed_text_array<'value>(
+    values: impl IntoIterator<Item = Option<&'value str>>,
+    width: i32,
+) -> Result<FixedSizeBinaryArray, DatasetBuildError> {
+    let width = usize::try_from(width).map_err(|_| DatasetBuildError::InvalidRequest)?;
+    let mut builder = FixedSizeBinaryBuilder::new(
+        i32::try_from(width).map_err(|_| DatasetBuildError::InvalidRequest)?,
+    );
+    let mut padded = vec![0_u8; width];
+    for value in values {
+        let Some(value) = value else {
+            builder.append_null();
+            continue;
+        };
+        let bytes = value.as_bytes();
+        if bytes.is_empty() || bytes.len() > width || bytes.contains(&0) {
+            return Err(DatasetBuildError::InvalidRequest);
+        }
+        padded.fill(0);
+        padded[..bytes.len()].copy_from_slice(bytes);
+        builder
+            .append_value(&padded)
+            .map_err(crate::ArrowConversionError::from)?;
+    }
+    Ok(builder.finish())
+}
+
 fn bounded_output_vec<T>(capacity: usize) -> Result<Vec<T>, DatasetBuildError> {
     let mut values = Vec::new();
     values
@@ -916,33 +974,10 @@ fn bounded_output_vec<T>(capacity: usize) -> Result<Vec<T>, DatasetBuildError> {
 fn feature_label_output_admission(rows: &[OutputRow<'_>]) -> Result<usize, DatasetBuildError> {
     let fixed = rows
         .len()
-        .checked_mul(512)
+        .checked_mul(1024)
         .and_then(|bytes| bytes.checked_add(64 * 1024))
         .ok_or(DatasetBuildError::LimitExceeded)?;
-    let dynamic = rows.iter().try_fold(0_usize, |total, row| {
-        let component = row.component;
-        let value_bytes = match component.value() {
-            ComponentValue::Float { unit, currency, .. }
-            | ComponentValue::Decimal { unit, currency, .. } => unit
-                .as_ref()
-                .map_or(0, |value| value.as_str().len())
-                .checked_add(currency.map_or(0, |value| value.as_str().len())),
-            ComponentValue::Missing { reason } => Some(reason.as_str().len()),
-        }
-        .ok_or(DatasetBuildError::LimitExceeded)?;
-        total
-            .checked_add(row.example.example_id().len())
-            .and_then(|bytes| bytes.checked_add(component.spec().name().len()))
-            .and_then(|bytes| bytes.checked_add(value_bytes))
-            .ok_or(DatasetBuildError::LimitExceeded)
-    })?;
-    fixed
-        .checked_add(
-            dynamic
-                .checked_mul(2)
-                .ok_or(DatasetBuildError::LimitExceeded)?,
-        )
-        .ok_or(DatasetBuildError::LimitExceeded)
+    Ok(fixed)
 }
 
 fn matching_existing(

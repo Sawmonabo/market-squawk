@@ -135,6 +135,9 @@ impl PathError {
 /// Invalid artifact reference or confined creation failure.
 #[derive(Debug, Error)]
 pub enum ArtifactPathError {
+    /// The retained prepared root identity changed or could not be revalidated.
+    #[error("artifact root identity is unavailable: {0}")]
+    Root(#[from] PathError),
     /// Artifact references must be relative to the controlled root.
     #[error("artifact path must be relative: {path}")]
     AbsolutePath {
@@ -263,6 +266,34 @@ pub struct ResolvedArtifactPath {
 }
 
 impl ResolvedArtifactPath {
+    /// Opens an existing exact regular artifact for read through the retained root capability.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed path error when the root identity changed, a link would be followed, or
+    /// the resolved entry is not a regular file.
+    pub fn open_read(&self) -> Result<std::fs::File, ArtifactPathError> {
+        self.root.try_clone_directory()?;
+        let mut options = OpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        let file = self
+            .root
+            .directory
+            .open_with(&self.relative, &options)
+            .map_err(|source| classify_capability_error(&self.relative, source))?
+            .into_std();
+        let metadata = file
+            .metadata()
+            .map_err(|source| ArtifactPathError::Io { source })?;
+        if !metadata.is_file() {
+            return Err(ArtifactPathError::EscapesRoot {
+                path: self.relative.clone(),
+            });
+        }
+        self.root.try_clone_directory()?;
+        Ok(file)
+    }
+
     /// Creates a new immutable artifact through the retained directory capability.
     ///
     /// Intermediate traversal and final creation remain relative to the open root directory, so
@@ -580,6 +611,45 @@ impl LocalPaths {
         })?;
         let control_capability = root_capability.open_dir("control").map_err(|source| {
             PathError::io("failed to open control directory capability", source)
+        })?;
+        let root = std::fs::canonicalize(root)
+            .map_err(|source| PathError::io("failed to canonicalize local data root", source))?;
+        let journal_dir = root.join("journal");
+        let artifacts =
+            ArtifactRoot::from_open_directory(root.join("artifacts"), artifact_capability);
+        let control = ControlRoot::from_open_directory(root.join("control"), control_capability);
+        let catalog = CatalogLocation::from_prepared(root.clone(), Arc::clone(&root_capability));
+        Ok(Self {
+            root,
+            journal_dir,
+            control: Some(control),
+            artifacts: Some(artifacts),
+            catalog: Some(catalog),
+            journal_capability: Some(Arc::new(journal_capability)),
+        })
+    }
+
+    /// Opens an already prepared local layout without creating or modifying any entry.
+    pub fn open_existing(root: impl AsRef<Path>) -> Result<Self, PathError> {
+        let root = root.as_ref();
+        let root_capability = Arc::new(open_prepared_root(root)?);
+        let journal_capability = root_capability.open_dir("journal").map_err(|source| {
+            PathError::io(
+                "failed to open existing journal directory capability",
+                source,
+            )
+        })?;
+        let artifact_capability = root_capability.open_dir("artifacts").map_err(|source| {
+            PathError::io(
+                "failed to open existing artifact directory capability",
+                source,
+            )
+        })?;
+        let control_capability = root_capability.open_dir("control").map_err(|source| {
+            PathError::io(
+                "failed to open existing control directory capability",
+                source,
+            )
         })?;
         let root = std::fs::canonicalize(root)
             .map_err(|source| PathError::io("failed to canonicalize local data root", source))?;

@@ -136,7 +136,7 @@ pub(super) fn apply_migrations(
     Ok(())
 }
 
-pub(super) fn verify_migration_identities(connection: &Connection) -> Result<(), CatalogError> {
+pub(crate) fn verify_migration_identities(connection: &Connection) -> Result<(), CatalogError> {
     validate_migration_registry()?;
     let applied = read_applied_migrations(connection)?;
     validate_applied_migrations(&applied)?;
@@ -225,7 +225,7 @@ pub(super) fn initialize_catalog_identity(connection: &Connection) -> Result<(),
     Ok(())
 }
 
-pub(super) fn verify_integrity(connection: &Connection) -> Result<(), CatalogError> {
+pub(crate) fn verify_integrity(connection: &Connection) -> Result<(), CatalogError> {
     let application_id: i64 =
         connection.query_row("PRAGMA application_id", [], |row| row.get(0))?;
     if application_id != CATALOG_APPLICATION_ID {

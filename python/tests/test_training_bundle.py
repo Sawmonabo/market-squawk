@@ -8,12 +8,17 @@ import unittest
 from market_squawk.bundle import BundleAuthorityRef, BundleExportError
 from market_squawk.data import UtcNanoseconds, open_dataset
 from market_squawk.finance import feature_contracts
+from market_squawk.finance import OperationContext
 from market_squawk.training import TrainingRun, TrainingValidationError
 from test_data import _fixture
 
 
 def _run(dataset) -> TrainingRun:
-    feature = next(value for value in feature_contracts() if value["name"] == "research.price-return")
+    feature = next(
+        value
+        for value in feature_contracts(context=OperationContext(60_000, 1_000_000))
+        if value["name"] == "research.price-return"
+    )
     label = next(value for value in dataset.components if value.kind == "label")
     return TrainingRun(
         dataset=dataset,
@@ -38,9 +43,19 @@ class TrainingBundleContracts(unittest.TestCase):
             tempfile.TemporaryDirectory() as right,
         ):
             digest = _fixture(Path(dataset_root))
-            dataset = open_dataset(Path(dataset_root), digest, UtcNanoseconds(600), max_rows=32)
-            first_proposal = _run(dataset).fit_evaluate(model_kind="linear")
-            second_proposal = _run(dataset).fit_evaluate(model_kind="linear")
+            dataset = open_dataset(
+                Path(dataset_root),
+                digest,
+                UtcNanoseconds(600),
+                max_rows=32,
+                context=OperationContext(60_000, 1_000_000),
+            )
+            first_proposal = _run(dataset).fit_evaluate(
+                model_kind="linear", context=OperationContext(60_000, 1_000_000)
+            )
+            second_proposal = _run(dataset).fit_evaluate(
+                model_kind="linear", context=OperationContext(60_000, 1_000_000)
+            )
             self.assertEqual(first_proposal.training_run_sha256, second_proposal.training_run_sha256)
             self.assertEqual(first_proposal.authority_bytes, second_proposal.authority_bytes)
 
@@ -51,8 +66,12 @@ class TrainingBundleContracts(unittest.TestCase):
                 "bundle-authority.json",
                 first_proposal.authority_sha256,
             )
-            first = first_proposal.export(Path(left), authority)
-            second = second_proposal.export(Path(right), authority)
+            first = first_proposal.export(
+                Path(left), authority, context=OperationContext(60_000, 1_000_000)
+            )
+            second = second_proposal.export(
+                Path(right), authority, context=OperationContext(60_000, 1_000_000)
+            )
 
             self.assertTrue(first.validated_by_rust)
             self.assertEqual(first.metadata_sha256, second.metadata_sha256)
@@ -72,12 +91,28 @@ class TrainingBundleContracts(unittest.TestCase):
             tempfile.TemporaryDirectory() as output_root,
         ):
             digest = _fixture(Path(dataset_root))
-            partial = open_dataset(Path(dataset_root), digest, UtcNanoseconds(100), max_rows=8)
+            partial = open_dataset(
+                Path(dataset_root),
+                digest,
+                UtcNanoseconds(100),
+                max_rows=8,
+                context=OperationContext(60_000, 1_000_000),
+            )
             with self.assertRaises(TrainingValidationError):
-                _run(partial).fit_evaluate(model_kind="linear")
+                _run(partial).fit_evaluate(
+                    model_kind="linear", context=OperationContext(60_000, 1_000_000)
+                )
 
-            complete = open_dataset(Path(dataset_root), digest, UtcNanoseconds(600), max_rows=32)
-            proposal = _run(complete).fit_evaluate(model_kind="linear")
+            complete = open_dataset(
+                Path(dataset_root),
+                digest,
+                UtcNanoseconds(600),
+                max_rows=32,
+                context=OperationContext(60_000, 1_000_000),
+            )
+            proposal = _run(complete).fit_evaluate(
+                model_kind="linear", context=OperationContext(60_000, 1_000_000)
+            )
             authority_path = Path(authority_root) / "bundle-authority.json"
             authority_path.write_bytes(proposal.authority_bytes + b" ")
             with self.assertRaises(BundleExportError):

@@ -13,10 +13,10 @@ use crate::{
     ModelFeatureBinding, ModelFormat, ValidationMetric, ValidationMetricName,
 };
 
-pub(super) const METADATA_SCHEMA_VERSION: u32 = 2;
+pub(super) const METADATA_SCHEMA_VERSION: u32 = 3;
 pub(super) const NATIVE_FORMAT_VERSION: u32 = 1;
 pub(super) const NATIVE_ARTIFACT_SCHEMA_VERSION: u32 = 1;
-pub(super) const TRAINING_RUN_SCHEMA_VERSION: u32 = 1;
+pub(super) const TRAINING_RUN_SCHEMA_VERSION: u32 = 2;
 const MAX_VALIDATION_METRICS: usize = 32;
 const MAX_LIMITATIONS: usize = 32;
 const MAX_PROSE_BYTES: usize = 512;
@@ -84,13 +84,18 @@ struct NormalizerWire {
 #[serde(deny_unknown_fields)]
 pub(super) struct DatasetWire {
     build_spec_sha256: String,
+    catalog_identity_sha256: String,
     dataset_id: String,
+    export_sha256: String,
     manifest_sha256: String,
     manifest_version: u64,
     policy_sha256: String,
     schema_name: String,
     schema_sha256: String,
     schema_version: u16,
+    selected_component_rows: u64,
+    selection_as_of_unix_nanos: i64,
+    selection_sha256: String,
     universe_sha256: String,
 }
 
@@ -254,7 +259,15 @@ pub(super) fn validate_dataset(
         && parse_digest_bytes(&wire.universe_sha256)?
             == expectations.dataset().universe_digest().bytes()
         && parse_digest_bytes(&wire.policy_sha256)?
-            == expectations.dataset().policy_digest().bytes();
+            == expectations.dataset().policy_digest().bytes()
+        && parse_digest_bytes(&wire.catalog_identity_sha256)?
+            == expectations.dataset().catalog_identity().bytes()
+        && parse_digest_bytes(&wire.export_sha256)?
+            == expectations.dataset().export_digest().bytes()
+        && parse_digest_bytes(&wire.selection_sha256)?
+            == expectations.dataset().selection_digest().bytes()
+        && wire.selection_as_of_unix_nanos == expectations.dataset().selection_as_of().unix_nanos()
+        && wire.selected_component_rows == expectations.dataset().selected_component_rows().get();
     if matches {
         Ok(())
     } else {
@@ -343,11 +356,10 @@ pub(super) fn validate_training_run(
             return Err(BundleError::TrainingRunRelationshipMismatch);
         }
     }
-    for digest in [
-        &trial.dataset_export_sha256,
-        &trial.environment_sha256,
-        &trial.split_sha256,
-    ] {
+    if parse_digest(&trial.dataset_export_sha256)? != expectations.dataset().export_digest() {
+        return Err(BundleError::TrainingRunRelationshipMismatch);
+    }
+    for digest in [&trial.environment_sha256, &trial.split_sha256] {
         if parse_digest(digest)?.bytes() == [0; 32] {
             return Err(BundleError::TrainingRunRelationshipMismatch);
         }

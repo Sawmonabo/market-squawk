@@ -13,6 +13,8 @@ import sys
 import tempfile
 from typing import Any, Mapping
 
+from . import _native
+
 
 MAX_ARTIFACT_BYTES = 1024 * 1024
 MAX_METADATA_BYTES = 256 * 1024
@@ -33,6 +35,9 @@ class BundleReceipt:
     artifact_sha256: str
     training_run_sha256: str
     authority_sha256: str
+    dataset_export_sha256: str
+    dataset_selection_sha256: str
+    catalog_identity_sha256: str
     validated_by_rust: bool
 
 
@@ -79,8 +84,11 @@ class BundleCandidate:
         output_root: Path | str,
         authority: BundleAuthorityRef,
         *,
+        dataset_receipt: Any,
         validator: Path | str | None = None,
     ) -> BundleReceipt:
+        if type(dataset_receipt) is not _native.DatasetReceipt:
+            raise BundleExportError("bundle publication requires a native dataset receipt")
         output_root = Path(output_root)
         if output_root.is_symlink() or not output_root.is_dir():
             raise BundleExportError("bundle output root is not a controlled directory")
@@ -111,7 +119,13 @@ class BundleCandidate:
             _write_exact(temporary / "bundle.json", metadata_bytes)
             _write_exact(temporary / "training-run.json", run_bytes)
             _fsync_directory(temporary)
-            _validate_with_rust(temporary, metadata_sha256, authority, validator)
+            _validate_with_rust(
+                temporary,
+                metadata_sha256,
+                authority,
+                dataset_receipt,
+                validator,
+            )
             os.replace(temporary, final)
             _fsync_directory(output_root)
             return BundleReceipt(
@@ -123,6 +137,9 @@ class BundleCandidate:
                 artifact_sha256=artifact_sha256,
                 training_run_sha256=training_run_sha256,
                 authority_sha256=authority.sha256,
+                dataset_export_sha256=dataset_receipt.export_sha256,
+                dataset_selection_sha256=dataset_receipt.selection_sha256,
+                catalog_identity_sha256=dataset_receipt.catalog_identity,
                 validated_by_rust=True,
             )
         except Exception:
@@ -185,6 +202,7 @@ def _validate_with_rust(
     root: Path,
     metadata_sha256: str,
     authority: BundleAuthorityRef,
+    dataset_receipt: Any,
     configured_validator: Path | str | None,
 ) -> None:
     command = [
@@ -201,6 +219,16 @@ def _validate_with_rust(
         authority.relative_path,
         "--authority-sha256",
         authority.sha256,
+        "--catalog-root",
+        dataset_receipt.catalog_root,
+        "--dataset-export-sha256",
+        dataset_receipt.export_sha256,
+        "--dataset-as-of-unix-nanos",
+        str(dataset_receipt.as_of_unix_nanos),
+        "--dataset-selection-sha256",
+        dataset_receipt.selection_sha256,
+        "--catalog-identity-sha256",
+        dataset_receipt.catalog_identity,
     ]
     try:
         completed = subprocess.run(

@@ -9,6 +9,8 @@ use tokio_util::sync::CancellationToken;
 use crate::analytical_backup::AnalyticalOperationGate;
 use crate::{AnalyticalDataService, CatalogAuthority};
 
+#[path = "dataset_builder/admission.rs"]
+mod admission;
 #[path = "dataset_builder/build.rs"]
 mod build;
 #[path = "dataset_builder/canonical.rs"]
@@ -18,6 +20,7 @@ mod export;
 #[path = "dataset_builder/model.rs"]
 mod model;
 
+pub use admission::PythonDatasetAdmission;
 pub use export::{FeatureLabelPythonExport, MAX_FEATURE_LABEL_EXPORT_BYTES};
 
 pub use model::{
@@ -56,6 +59,14 @@ impl<'service> DatasetBuilderService<'service> {
             authority,
             operation_gate,
         }
+    }
+
+    /// Re-resolves and returns the immutable catalog admission for one producer-owned result.
+    pub fn python_admission(
+        &self,
+        dataset: &FeatureLabelDataset,
+    ) -> Result<PythonDatasetAdmission, DatasetBuildError> {
+        admission::register(self, dataset)
     }
 }
 
@@ -167,6 +178,9 @@ pub enum DatasetBuildError {
     /// Research-use traversal or publication authority rejected the build.
     #[error("dataset build research-use authority failed: {0}")]
     ResearchUse(#[from] crate::ResearchUseCatalogError),
+    /// Immutable Python dataset admission failed.
+    #[error("dataset build Python admission failed: {0}")]
+    PythonDataset(#[from] crate::PythonDatasetCatalogError),
     /// Dataset schema construction or resolution failed.
     #[error("dataset build schema is invalid: {0}")]
     Schema(#[from] crate::DatasetSchemaError),

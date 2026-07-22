@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 import hashlib
 import json
@@ -14,12 +14,16 @@ from typing import Any, Mapping, Sequence
 from uuid import UUID
 
 from .bundle import BundleAuthorityRef, BundleCandidate, BundleReceipt
-from .data import ComponentIdentity, DatasetResult
+from .data import ComponentIdentity, DatasetIntegrityError, DatasetResult, _verify_dataset_receipt
+from .finance import OperationContext
 
 
 MAX_TRAINING_ROWS = 100_000
 MAX_FEATURES = 1_024
 MAX_CELLS = 2_000_000
+MAX_TRAINING_OPERATIONS = 50_000_000
+LOGISTIC_EPOCHS = 400
+CONTROL_CHECK_INTERVAL = 128
 IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9._-]{0,126}[a-z0-9]$|^[a-z0-9]$")
 HEX = re.compile(r"^[0-9a-f]{64}$")
 
@@ -44,6 +48,7 @@ class TrainingProposal:
 
     candidate: BundleCandidate
     authority_request: Mapping[str, Any]
+    dataset: DatasetResult = field(repr=False, compare=False)
 
     @property
     def authority_bytes(self) -> bytes:
@@ -62,11 +67,21 @@ class TrainingProposal:
         output_root: Path | str,
         authority: BundleAuthorityRef,
         *,
+        context: OperationContext,
         validator: Path | str | None = None,
     ) -> BundleReceipt:
         if authority.sha256 != self.authority_sha256:
             raise TrainingValidationError("operator authority does not match this proposal")
-        return self.candidate.write(output_root, authority, validator=validator)
+        try:
+            _verify_dataset_receipt(self.dataset, context)
+        except DatasetIntegrityError as error:
+            raise TrainingValidationError("dataset receipt failed immediately before export") from error
+        return self.candidate.write(
+            output_root,
+            authority,
+            dataset_receipt=self.dataset._receipt,
+            validator=validator,
+        )
 
 
 @dataclass(frozen=True)
@@ -82,19 +97,36 @@ class TrainingRun:
     bundle_id: str
     bundle_version: int
 
-    def fit_evaluate(self, *, model_kind: str) -> TrainingProposal:
+    def fit_evaluate(
+        self, *, model_kind: str, context: OperationContext
+    ) -> TrainingProposal:
+        try:
+            _verify_dataset_receipt(self.dataset, context)
+        except DatasetIntegrityError as error:
+            raise TrainingValidationError("training dataset receipt is invalid") from error
         config = self._validated_config(model_kind)
+        _admit_operation_context(
+            context,
+            _training_operation_estimate(
+                self.dataset, len(config["features"]), model_kind
+            ),
+        )
         rows, targets, admitted_splits, split_sha256, split_counts, period = _dataset_matrix(
             self.dataset,
             config["features"],
             config["label"],
             self.missing_policy,
+            context,
         )
         train = [index for index, split in enumerate(admitted_splits) if split == "train"]
         validation = [index for index, split in enumerate(admitted_splits) if split == "validation"]
         if len(train) <= len(config["features"]) or not validation:
             raise TrainingValidationError("training and validation boundaries are insufficient")
-        fitted = _fit(model_kind, rows, targets, train, validation, self.seed)
+        try:
+            _verify_dataset_receipt(self.dataset, context)
+        except DatasetIntegrityError as error:
+            raise TrainingValidationError("dataset receipt failed immediately before fit") from error
+        fitted = _fit(model_kind, rows, targets, train, validation, self.seed, context)
         trial = {
             "bundle_id": self.bundle_id,
             "bundle_version": self.bundle_version,
@@ -116,7 +148,7 @@ class TrainingRun:
         trial_sha256 = hashlib.sha256(_canonical(trial)).hexdigest()
         metrics = [{"name": fitted.metric_name, "value": fitted.metric_value}]
         run_record = {
-            "schema_version": 1,
+            "schema_version": 2,
             "trial": trial,
             "trial_sha256": trial_sha256,
             "validation_metrics": metrics,
@@ -147,7 +179,7 @@ class TrainingRun:
             else {"negative_max": -0.5, "positive_min": 0.5, "minimum_confidence": 0.0}
         )
         metadata = {
-            "schema_version": 2,
+            "schema_version": 3,
             "bundle_id": self.bundle_id,
             "bundle_version": self.bundle_version,
             "model_id": self.model_id,
@@ -188,7 +220,7 @@ class TrainingRun:
             "training_code_revision": self.training_code_revision,
             "training_run_sha256": candidate.training_run_sha256,
         }
-        return TrainingProposal(candidate, authority)
+        return TrainingProposal(candidate, authority, self.dataset)
 
     def _validated_config(self, model_kind: str) -> dict[str, Any]:
         if model_kind not in {"linear", "logistic"}:
@@ -256,6 +288,7 @@ def _dataset_matrix(
     features: Sequence[Mapping[str, Any]],
     label: Mapping[str, Any],
     missing_policy: str,
+    context: OperationContext,
 ) -> tuple[list[list[float]], list[float], list[str], str, Mapping[str, int], Mapping[str, int]]:
     if not dataset.rows:
         raise TrainingValidationError("training row count is invalid")
@@ -272,6 +305,8 @@ def _dataset_matrix(
     feature_keys = [("feature", item["name"], item["version"]) for item in features]
     label_key = ("label", label["name"], label["version"])
     for offset in range(0, len(dataset.rows), component_count):
+        if offset % (component_count * CONTROL_CHECK_INTERVAL) == 0:
+            _checkpoint(context)
         group = dataset.rows[offset : offset + component_count]
         values = {
             (row["component_kind"], row["component_name"], row["component_version"]): _numeric(row)
@@ -311,6 +346,7 @@ def _dataset_matrix(
         )
     if not rows:
         raise TrainingValidationError("missing policy removed every training row")
+    _checkpoint(context)
     split_sha256 = hashlib.sha256(
         _canonical(
             {
@@ -354,40 +390,60 @@ def _fit(
     train: list[int],
     validation: list[int],
     seed: int,
+    context: OperationContext,
 ) -> _FittedModel:
     feature_count = len(rows[0])
-    means = tuple(sum(rows[index][column] for index in train) / len(train) for column in range(feature_count))
+    means = []
+    for column in range(feature_count):
+        _checkpoint(context)
+        means.append(sum(rows[index][column] for index in train) / len(train))
+    means = tuple(means)
     scales = []
     for column, mean in enumerate(means):
+        _checkpoint(context)
         variance = sum((rows[index][column] - mean) ** 2 for index in train) / len(train)
         scale = math.sqrt(variance)
         if not math.isfinite(scale) or scale <= 0.0:
             raise TrainingValidationError("training feature has zero or invalid scale")
         scales.append(scale)
-    normalized = [[(value - means[column]) / scales[column] for column, value in enumerate(row)] for row in rows]
+    normalized = []
+    for index, row in enumerate(rows):
+        if index % CONTROL_CHECK_INTERVAL == 0:
+            _checkpoint(context)
+        normalized.append(
+            [(value - means[column]) / scales[column] for column, value in enumerate(row)]
+        )
     if kind == "linear":
-        weights, bias = _linear_fit(normalized, targets, train)
+        weights, bias = _linear_fit(normalized, targets, train, context)
         errors = [(_predict_linear(normalized[index], weights, bias) - targets[index]) ** 2 for index in validation]
         metric_name = "mean_squared_error"
         metric = sum(errors) / len(errors)
     else:
         if any(target not in {0.0, 1.0} for target in targets):
             raise TrainingValidationError("logistic labels must be exactly zero or one")
-        weights, bias = _logistic_fit(normalized, targets, train, seed)
+        weights, bias = _logistic_fit(normalized, targets, train, seed, context)
         correct = sum((_predict_logistic(normalized[index], weights, bias) >= 0.5) == bool(targets[index]) for index in validation)
         metric_name = "accuracy"
         metric = correct / len(validation)
     values = [*weights, bias, metric, *means, *scales]
     if any(not math.isfinite(value) for value in values):
         raise TrainingValidationError("training produced a nonfinite model")
+    _checkpoint(context)
     return _FittedModel(tuple(weights), bias, means, tuple(scales), metric_name, metric)
 
 
-def _linear_fit(rows: list[list[float]], targets: list[float], train: list[int]) -> tuple[list[float], float]:
+def _linear_fit(
+    rows: list[list[float]],
+    targets: list[float],
+    train: list[int],
+    context: OperationContext,
+) -> tuple[list[float], float]:
     width = len(rows[0]) + 1
     matrix = [[0.0 for _ in range(width)] for _ in range(width)]
     vector = [0.0 for _ in range(width)]
-    for index in train:
+    for position, index in enumerate(train):
+        if position % CONTROL_CHECK_INTERVAL == 0:
+            _checkpoint(context)
         augmented = [*rows[index], 1.0]
         for left in range(width):
             vector[left] += augmented[left] * targets[index]
@@ -395,14 +451,17 @@ def _linear_fit(rows: list[list[float]], targets: list[float], train: list[int])
                 matrix[left][right] += augmented[left] * augmented[right]
     for index in range(width - 1):
         matrix[index][index] += 1e-12
-    solution = _solve(matrix, vector)
+    solution = _solve(matrix, vector, context)
     return solution[:-1], solution[-1]
 
 
-def _solve(matrix: list[list[float]], vector: list[float]) -> list[float]:
+def _solve(
+    matrix: list[list[float]], vector: list[float], context: OperationContext
+) -> list[float]:
     size = len(vector)
     augmented = [row[:] + [vector[index]] for index, row in enumerate(matrix)]
     for column in range(size):
+        _checkpoint(context)
         pivot = max(range(column, size), key=lambda row: abs(augmented[row][column]))
         if abs(augmented[pivot][column]) < 1e-15:
             raise TrainingValidationError("training system is singular")
@@ -417,11 +476,18 @@ def _solve(matrix: list[list[float]], vector: list[float]) -> list[float]:
     return [augmented[index][-1] for index in range(size)]
 
 
-def _logistic_fit(rows: list[list[float]], targets: list[float], train: list[int], seed: int) -> tuple[list[float], float]:
+def _logistic_fit(
+    rows: list[list[float]],
+    targets: list[float],
+    train: list[int],
+    seed: int,
+    context: OperationContext,
+) -> tuple[list[float], float]:
     generator = random.Random(seed)
     weights = [generator.uniform(-1e-6, 1e-6) for _ in rows[0]]
     bias = generator.uniform(-1e-6, 1e-6)
-    for _ in range(400):
+    for _ in range(LOGISTIC_EPOCHS):
+        _checkpoint(context)
         gradients = [0.0 for _ in weights]
         bias_gradient = 0.0
         for index in train:
@@ -433,6 +499,61 @@ def _logistic_fit(rows: list[list[float]], targets: list[float], train: list[int
         weights = [weight - rate * gradient for weight, gradient in zip(weights, gradients, strict=True)]
         bias -= rate * bias_gradient
     return weights, bias
+
+
+def _training_operation_estimate(
+    dataset: DatasetResult, feature_count: int, model_kind: str
+) -> int:
+    component_count = len(dataset.components)
+    if component_count == 0:
+        raise TrainingValidationError("training component contract is empty")
+    example_count = (len(dataset.rows) + component_count - 1) // component_count
+    width = _checked_add(feature_count, 1)
+    common = _checked_add(
+        _checked_mul(len(dataset.rows), 8),
+        _checked_mul(_checked_mul(example_count, feature_count), 12),
+    )
+    if model_kind == "linear":
+        fitting = _checked_add(
+            _checked_mul(_checked_mul(example_count, width), _checked_mul(width, 4)),
+            _checked_mul(_checked_mul(width, width), _checked_mul(width, 6)),
+        )
+    else:
+        per_example = _checked_add(_checked_mul(feature_count, 8), 32)
+        fitting = _checked_mul(
+            LOGISTIC_EPOCHS, _checked_mul(example_count, per_example)
+        )
+    return _checked_add(common, fitting)
+
+
+def _checked_add(left: int, right: int) -> int:
+    result = left + right
+    if result <= 0 or result > MAX_TRAINING_OPERATIONS:
+        raise TrainingValidationError("training operation budget is exceeded")
+    return result
+
+
+def _checked_mul(left: int, right: int) -> int:
+    result = left * right
+    if result <= 0 or result > MAX_TRAINING_OPERATIONS:
+        raise TrainingValidationError("training operation budget is exceeded")
+    return result
+
+
+def _admit_operation_context(context: OperationContext, operations: int) -> None:
+    if not isinstance(context, OperationContext):
+        raise TrainingValidationError("training operation context is invalid")
+    try:
+        context.reserve(operations)
+    except ValueError as error:
+        raise TrainingValidationError("training operation context rejected the workload") from error
+
+
+def _checkpoint(context: OperationContext) -> None:
+    try:
+        context.checkpoint()
+    except ValueError as error:
+        raise TrainingValidationError("training operation was cancelled or expired") from error
 
 
 def _predict_linear(row: Sequence[float], weights: Sequence[float], bias: float) -> float:

@@ -1,13 +1,11 @@
 //! Generic registered-dataset Arrow publication contract.
 
-use std::str::FromStr as _;
-
 use arrow::array::{
-    Array as _, Decimal128Array, FixedSizeBinaryArray, Float64Array, StringArray, UInt8Array,
-    UInt32Array,
+    Array as _, Decimal128Array, FixedSizeBinaryArray, Float64Array, UInt8Array, UInt32Array,
 };
 use arrow::record_batch::RecordBatch;
 use market_squawk_domain::{Currency, InstrumentId, SourceIdentifier};
+use uuid::Uuid;
 
 use super::ArrowConversionError;
 use crate::schema::{
@@ -126,19 +124,23 @@ fn validate_batch_metadata(
 }
 
 fn validate_feature_label_batch(batch: &RecordBatch) -> Result<(), ArrowConversionError> {
-    const MAX_COMPONENT_TEXT_BYTES: usize = 256;
-
-    let strings = |name| {
+    let fixed = |name| {
         batch
             .column_by_name(name)
-            .and_then(|array| array.as_any().downcast_ref::<StringArray>())
+            .and_then(|array| array.as_any().downcast_ref::<FixedSizeBinaryArray>())
             .ok_or(ArrowConversionError::InvalidSchema)
     };
-    let example_ids = strings("example_id")?;
-    let instrument_ids = strings("instrument_id")?;
-    let splits = strings("split")?;
-    let kinds = strings("component_kind")?;
-    let names = strings("component_name")?;
+    let example_ids = fixed("example_id")?;
+    let instrument_ids = fixed("instrument_id")?;
+    let names = fixed("component_name")?;
+    let splits = batch
+        .column_by_name("split")
+        .and_then(|array| array.as_any().downcast_ref::<UInt8Array>())
+        .ok_or(ArrowConversionError::InvalidSchema)?;
+    let kinds = batch
+        .column_by_name("component_kind")
+        .and_then(|array| array.as_any().downcast_ref::<UInt8Array>())
+        .ok_or(ArrowConversionError::InvalidSchema)?;
     let versions = batch
         .column_by_name("component_version")
         .and_then(|array| array.as_any().downcast_ref::<UInt32Array>())
@@ -155,18 +157,21 @@ fn validate_feature_label_batch(batch: &RecordBatch) -> Result<(), ArrowConversi
         .column_by_name("value_decimal_scale")
         .and_then(|array| array.as_any().downcast_ref::<UInt8Array>())
         .ok_or(ArrowConversionError::InvalidSchema)?;
-    let units = strings("unit")?;
-    let currencies = strings("currency")?;
-    let missing = strings("missing_reason")?;
+    let units = fixed("unit")?;
+    let currencies = fixed("currency")?;
+    let missing = fixed("missing_reason")?;
     let lineages = batch
         .column_by_name("lineage_sha256")
         .and_then(|array| array.as_any().downcast_ref::<FixedSizeBinaryArray>())
         .ok_or(ArrowConversionError::InvalidSchema)?;
 
     for row in 0..batch.num_rows() {
-        let instrument = instrument_ids.value(row);
-        let parsed_instrument = InstrumentId::from_str(instrument)
-            .map_err(|_| ArrowConversionError::InvalidFeatureLabelRow)?;
+        let example_id = padded_text(example_ids, row)?;
+        let component_name = padded_text(names, row)?;
+        let instrument_is_canonical = Uuid::from_slice(instrument_ids.value(row))
+            .ok()
+            .and_then(|value| InstrumentId::try_from(value).ok())
+            .is_some();
         let has_float = !float_values.is_null(row);
         let has_decimal = !decimal_values.is_null(row);
         let has_missing = !missing.is_null(row);
@@ -175,28 +180,45 @@ fn validate_feature_label_batch(batch: &RecordBatch) -> Result<(), ArrowConversi
             .and_then(|count| count.checked_add(usize::from(has_missing)))
             .ok_or(ArrowConversionError::InvalidFeatureLabelRow)?;
         let currency_is_canonical = currencies.is_null(row) || {
-            let value = currencies.value(row);
-            Currency::try_from(value).is_ok_and(|currency| currency.as_str() == value)
+            padded_text(currencies, row).is_ok_and(|value| {
+                Currency::try_from(value).is_ok_and(|currency| currency.as_str() == value)
+            })
         };
-        if !canonical_identifier(example_ids.value(row), MAX_COMPONENT_TEXT_BYTES)
-            || parsed_instrument.to_string() != instrument
-            || !canonical_identifier(names.value(row), MAX_COMPONENT_TEXT_BYTES)
-            || !matches!(splits.value(row), "train" | "validation" | "test")
-            || !matches!(kinds.value(row), "feature" | "label")
+        let unit_is_canonical =
+            units.is_null(row) || padded_text(units, row).is_ok_and(canonical_unit);
+        let missing_is_canonical = !has_missing
+            || padded_text(missing, row).is_ok_and(|value| canonical_identifier(value, 256));
+        if !canonical_identifier(example_id, 256)
+            || !instrument_is_canonical
+            || !canonical_identifier(component_name, 256)
+            || !matches!(splits.value(row), 1..=3)
+            || !matches!(kinds.value(row), 1..=2)
             || versions.value(row) == 0
             || decimal_values.is_null(row) != decimal_scales.is_null(row)
             || (!decimal_scales.is_null(row) && decimal_scales.value(row) > 28)
             || selected_values != 1
             || (has_float && !float_values.value(row).is_finite())
-            || (!units.is_null(row) && !canonical_unit(units.value(row)))
+            || !unit_is_canonical
             || !currency_is_canonical
-            || (has_missing && !canonical_identifier(missing.value(row), MAX_COMPONENT_TEXT_BYTES))
+            || !missing_is_canonical
             || lineages.value_length() != 32
         {
             return Err(ArrowConversionError::InvalidFeatureLabelRow);
         }
     }
     Ok(())
+}
+
+fn padded_text(array: &FixedSizeBinaryArray, row: usize) -> Result<&str, ArrowConversionError> {
+    let bytes = array.value(row);
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
+    if end == 0 || bytes[end..].iter().any(|byte| *byte != 0) {
+        return Err(ArrowConversionError::InvalidFeatureLabelRow);
+    }
+    std::str::from_utf8(&bytes[..end]).map_err(|_| ArrowConversionError::InvalidFeatureLabelRow)
 }
 
 fn canonical_identifier(value: &str, max_bytes: usize) -> bool {

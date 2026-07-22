@@ -14,9 +14,12 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 market-squawk-analytics = { workspace = true }
+market-squawk-data = { workspace = true }
 market-squawk-domain = { workspace = true }
 pyo3 = { version = "=0.29.0", features = ["abi3-py310"] }
 rust_decimal.workspace = true
+tokio-util.workspace = true
+uuid.workspace = true
 
 [lints]
 workspace = true

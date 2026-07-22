@@ -27,7 +27,10 @@ use crate::blocking_supervisor::{BlockingIoAdmissionError, BlockingIoSupervisor}
 use crate::manifest::{PinnedDataset, Sha256Digest};
 use crate::publication_coordinator::PublicationLease;
 use crate::query::QueryArtifactMemoryLease;
-use crate::schema::{decode_hex, encode_hex};
+use crate::schema::{
+    FEATURE_LABEL_SCHEMA_NAME, FEATURE_LABEL_SCHEMA_VERSION, SCHEMA_NAME_KEY, SCHEMA_VERSION_KEY,
+    decode_hex, encode_hex,
+};
 
 const OBJECTS: &str = "objects/sha256";
 const STAGING: &str = "staging/parquet";
@@ -629,6 +632,16 @@ impl ParquetObjectStore {
         let properties = WriterProperties::builder()
             .set_max_row_group_row_count(Some(self.config.max_row_group_rows))
             .set_write_page_header_statistics(false);
+        let fixed_feature_labels = batch
+            .schema()
+            .metadata()
+            .get(SCHEMA_NAME_KEY)
+            .is_some_and(|name| name == FEATURE_LABEL_SCHEMA_NAME)
+            && batch
+                .schema()
+                .metadata()
+                .get(SCHEMA_VERSION_KEY)
+                .is_some_and(|version| version == &FEATURE_LABEL_SCHEMA_VERSION.to_string());
         let properties = match query_admission {
             Some(admission) => properties
                 .set_compression(Compression::UNCOMPRESSED)
@@ -637,6 +650,10 @@ impl ParquetObjectStore {
                 .set_data_page_size_limit(QUERY_WRITER_PAGE_BYTES)
                 .set_write_batch_size(1024)
                 .set_max_row_group_bytes(Some(admission.active_writer_bytes)),
+            None if fixed_feature_labels => properties
+                .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
+                .set_dictionary_enabled(false)
+                .set_statistics_enabled(EnabledStatistics::Chunk),
             None => properties
                 .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
                 .set_statistics_enabled(EnabledStatistics::Chunk),

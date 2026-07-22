@@ -3533,6 +3533,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror",
+ "tokio-util",
 ]
 
 [[package]]
@@ -3589,9 +3590,12 @@ name = "market-squawk-python"
 version = "0.1.0"
 dependencies = [
  "market-squawk-analytics",
+ "market-squawk-data",
  "market-squawk-domain",
  "pyo3",
  "rust_decimal",
+ "tokio-util",
+ "uuid",
 ]
 
 [[package]]

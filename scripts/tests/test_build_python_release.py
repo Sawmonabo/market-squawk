@@ -84,10 +84,12 @@ class PythonReleaseBuilderContracts(unittest.TestCase):
         ) as admit:
             builder._create_venv(runtime, Path("/owned/release-cp312"), ROOT)
         run.assert_called_once_with(
-            ["/runtime/cp312", "-m", "venv", "/owned/release-cp312"], ROOT
+            ["/runtime/cp312", "-I", "-m", "venv", "/owned/release-cp312"],
+            ROOT,
+            None,
         )
         admit.assert_called_once_with(
-            Path("/owned/release-cp312/bin/python"), (3, 12, 12), ROOT
+            Path("/owned/release-cp312/bin/python"), (3, 12, 12), ROOT, None
         )
 
 

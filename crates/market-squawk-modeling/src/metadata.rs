@@ -5,8 +5,8 @@ use std::num::NonZeroU64;
 
 use market_squawk_analytics::{FeatureInputSchemaDigest, FeatureKey, FeatureSemanticDigest};
 use market_squawk_data::{
-    ComponentKind, DatasetBuildSpecDigest, DatasetManifestRef, FeatureLabelComponentSpec,
-    Sha256Digest, UniverseId,
+    CatalogEndpointIdentity, ComponentKind, DatasetBuildSpecDigest, DatasetManifestRef,
+    FeatureLabelComponentSpec, Sha256Digest, UniverseId,
 };
 use market_squawk_domain::{ModelId, Timestamp};
 use thiserror::Error;
@@ -138,6 +138,11 @@ pub struct TrainingDatasetIdentity {
     build_spec_digest: DatasetBuildSpecDigest,
     universe_digest: Sha256Digest,
     policy_digest: Sha256Digest,
+    catalog_identity: CatalogEndpointIdentity,
+    export_digest: Sha256Digest,
+    selection_digest: Sha256Digest,
+    selection_as_of: Timestamp,
+    selected_component_rows: NonZeroU64,
 }
 
 impl TrainingDatasetIdentity {
@@ -151,10 +156,17 @@ impl TrainingDatasetIdentity {
         build_spec_digest: DatasetBuildSpecDigest,
         universe_digest: Sha256Digest,
         policy_digest: Sha256Digest,
+        catalog_identity: CatalogEndpointIdentity,
+        export_digest: Sha256Digest,
+        selection_digest: Sha256Digest,
+        selection_as_of: Timestamp,
+        selected_component_rows: NonZeroU64,
     ) -> Result<Self, ModelMetadataError> {
         if manifest.content_hash().bytes() == [0; 32]
             || universe_digest.bytes() == [0; 32]
             || policy_digest.bytes() == [0; 32]
+            || export_digest.bytes() == [0; 32]
+            || selection_digest.bytes() == [0; 32]
         {
             return Err(ModelMetadataError::ReservedDigest);
         }
@@ -163,6 +175,11 @@ impl TrainingDatasetIdentity {
             build_spec_digest,
             universe_digest,
             policy_digest,
+            catalog_identity,
+            export_digest,
+            selection_digest,
+            selection_as_of,
+            selected_component_rows,
         })
     }
 
@@ -188,6 +205,36 @@ impl TrainingDatasetIdentity {
     #[must_use]
     pub const fn policy_digest(&self) -> Sha256Digest {
         self.policy_digest
+    }
+
+    /// Returns the operator-selected exact catalog endpoint identity.
+    #[must_use]
+    pub const fn catalog_identity(&self) -> CatalogEndpointIdentity {
+        self.catalog_identity
+    }
+
+    /// Returns the producer-registered Task 11 export identity.
+    #[must_use]
+    pub const fn export_digest(&self) -> Sha256Digest {
+        self.export_digest
+    }
+
+    /// Returns the independently rederived selected-row identity.
+    #[must_use]
+    pub const fn selection_digest(&self) -> Sha256Digest {
+        self.selection_digest
+    }
+
+    /// Returns the exact point-in-time cutoff bound into the selected-row identity.
+    #[must_use]
+    pub const fn selection_as_of(&self) -> Timestamp {
+        self.selection_as_of
+    }
+
+    /// Returns the exact selected component-row count.
+    #[must_use]
+    pub const fn selected_component_rows(&self) -> NonZeroU64 {
+        self.selected_component_rows
     }
 
     pub(crate) fn retained_bytes(&self) -> Option<usize> {

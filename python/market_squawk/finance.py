@@ -9,9 +9,11 @@ from typing import Sequence, TypedDict
 from . import _native
 
 
-MAX_ANALYTIC_VALUES = 1_000_000
+MAX_ANALYTIC_VALUES = 16_384
 MAX_ANALYTIC_RETAINED_BYTES = 64 * 1024 * 1024
 MAX_DECIMAL_TEXT_BYTES = 128
+
+OperationContext = _native.OperationContext
 
 
 class FeatureContract(TypedDict):
@@ -59,9 +61,15 @@ class DrawdownResult:
 
 
 def simple_returns(
-    prices: Sequence[float], timestamps: Sequence[int], currency: str
+    prices: Sequence[Decimal],
+    timestamps: Sequence[int],
+    currency: str,
+    *,
+    context: OperationContext,
 ) -> SeriesResult:
-    values = _native.price_returns(_bounded(prices), _bounded(timestamps), currency)
+    values = _native.price_returns(
+        _decimal_strings(prices), _bounded(timestamps), currency, context
+    )
     return SeriesResult(
         tuple(values),
         AnalyticalPolicy(
@@ -78,11 +86,13 @@ def total_returns(
     distributions: Sequence[Decimal],
     timestamps: Sequence[int],
     currency: str,
+    *,
+    context: OperationContext,
 ) -> SeriesResult:
     price_values = _decimal_strings(prices)
     distribution_values = _decimal_strings(distributions)
     values = _native.exact_total_returns(
-        price_values, distribution_values, _bounded(timestamps), currency
+        price_values, distribution_values, _bounded(timestamps), currency, context
     )
     return SeriesResult(
         tuple(values),
@@ -95,9 +105,11 @@ def total_returns(
     )
 
 
-def cumulative_return(returns: Sequence[float]) -> ScalarResult:
+def cumulative_return(
+    returns: Sequence[float], *, context: OperationContext
+) -> ScalarResult:
     return ScalarResult(
-        _native.compound_returns(_bounded(returns)),
+        _native.compound_returns(_bounded(returns), context),
         AnalyticalPolicy(
             input_unit="return:unit",
             output_unit="return:unit",
@@ -106,9 +118,11 @@ def cumulative_return(returns: Sequence[float]) -> ScalarResult:
     )
 
 
-def volatility(returns: Sequence[float], *, periods_per_year: int) -> ScalarResult:
+def volatility(
+    returns: Sequence[float], *, periods_per_year: int, context: OperationContext
+) -> ScalarResult:
     return ScalarResult(
-        _native.return_volatility(_bounded(returns), periods_per_year),
+        _native.return_volatility(_bounded(returns), periods_per_year, context),
         AnalyticalPolicy(
             input_unit="return:unit",
             output_unit="return:unit",
@@ -119,10 +133,14 @@ def volatility(returns: Sequence[float], *, periods_per_year: int) -> ScalarResu
 
 
 def maximum_drawdown(
-    prices: Sequence[float], timestamps: Sequence[int], currency: str
+    prices: Sequence[Decimal],
+    timestamps: Sequence[int],
+    currency: str,
+    *,
+    context: OperationContext,
 ) -> DrawdownResult:
     magnitude, peak, trough, recovery = _native.drawdown(
-        _bounded(prices), _bounded(timestamps), currency
+        _decimal_strings(prices), _bounded(timestamps), currency, context
     )
     return DrawdownResult(
         magnitude,
@@ -138,9 +156,11 @@ def maximum_drawdown(
     )
 
 
-def correlation(left: Sequence[float], right: Sequence[float]) -> ScalarResult:
+def correlation(
+    left: Sequence[float], right: Sequence[float], *, context: OperationContext
+) -> ScalarResult:
     return ScalarResult(
-        _native.pearson_correlation(_bounded(left), _bounded(right)),
+        _native.pearson_correlation(_bounded(left), _bounded(right), context),
         AnalyticalPolicy(
             input_unit="return:unit",
             output_unit="correlation-coefficient",
@@ -149,9 +169,11 @@ def correlation(left: Sequence[float], right: Sequence[float]) -> ScalarResult:
     )
 
 
-def historical_var(losses: Sequence[float], confidence: float) -> ScalarResult:
+def historical_var(
+    losses: Sequence[float], confidence: float, *, context: OperationContext
+) -> ScalarResult:
     return ScalarResult(
-        _native.value_at_risk(_bounded(losses), confidence),
+        _native.value_at_risk(_bounded(losses), confidence, context),
         AnalyticalPolicy(
             input_unit="return:unit",
             output_unit="loss:return:unit",
@@ -161,9 +183,11 @@ def historical_var(losses: Sequence[float], confidence: float) -> ScalarResult:
     )
 
 
-def expected_shortfall(losses: Sequence[float], confidence: float) -> ScalarResult:
+def expected_shortfall(
+    losses: Sequence[float], confidence: float, *, context: OperationContext
+) -> ScalarResult:
     return ScalarResult(
-        _native.expected_shortfall(_bounded(losses), confidence),
+        _native.expected_shortfall(_bounded(losses), confidence, context),
         AnalyticalPolicy(
             input_unit="return:unit",
             output_unit="loss:return:unit",
@@ -173,7 +197,7 @@ def expected_shortfall(losses: Sequence[float], confidence: float) -> ScalarResu
     )
 
 
-def feature_contracts() -> list[FeatureContract]:
+def feature_contracts(*, context: OperationContext) -> list[FeatureContract]:
     return [
         {
             "name": name,
@@ -181,7 +205,7 @@ def feature_contracts() -> list[FeatureContract]:
             "input_schema_sha256": input_schema,
             "semantic_sha256": semantic,
         }
-        for name, version, input_schema, semantic in _native.canonical_feature_contracts()
+        for name, version, input_schema, semantic in _native.canonical_feature_contracts(context)
     ]
 
 
@@ -202,7 +226,11 @@ def _decimal_strings(values: Sequence[Decimal]) -> list[str]:
     encoded: list[str] = []
     retained_bytes = 0
     for value in admitted:
-        text = str(value)
+        if type(value) is not Decimal:
+            raise TypeError("monetary input must contain exact Decimal values")
+        if not value.is_finite():
+            raise ValueError("monetary input must contain finite Decimal values")
+        text = format(value, "f")
         text_bytes = len(text.encode("utf-8"))
         retained_bytes += text_bytes
         if (

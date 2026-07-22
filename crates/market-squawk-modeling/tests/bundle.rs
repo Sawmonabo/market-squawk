@@ -8,8 +8,9 @@ use market_squawk_analytics::{
     FeatureKey, FeatureMetadata, FeatureRegistry, LiveFeatureCatalog, LiveFeatureCatalogConfig,
 };
 use market_squawk_data::{
-    ComponentKind, ComponentScope, CorporateActionSensitivity, DatasetBuildSpecDigest, DatasetId,
-    DatasetManifestRef, DatasetSchemaRegistry, FeatureLabelComponentSpec, Sha256Digest, UniverseId,
+    CatalogEndpointIdentity, ComponentKind, ComponentScope, CorporateActionSensitivity,
+    DatasetBuildSpecDigest, DatasetId, DatasetManifestRef, DatasetSchemaRegistry,
+    FeatureLabelComponentSpec, Sha256Digest, UniverseId,
 };
 use market_squawk_domain::{ModelId, Timestamp};
 use market_squawk_modeling::{
@@ -179,7 +180,7 @@ fn bundle_admission_fails_closed_across_complete_relationships() -> TestResult {
     )?;
     assert_fixture_error(
         valid_fixture("native_linear", 1, 1, |metadata, _| {
-            metadata["schema_version"] = json!(3);
+            metadata["schema_version"] = json!(4);
         })?,
         BundleError::UnsupportedMetadataVersion,
     )?;
@@ -396,6 +397,13 @@ fn valid_fixture_with_identity(
         DatasetBuildSpecDigest::try_new([32; 32])?,
         Sha256Digest::new([33; 32]),
         Sha256Digest::new([34; 32]),
+        CatalogEndpointIdentity::try_from_bytes([38; 32])
+            .ok_or_else(|| std::io::Error::other("catalog identity must be nonzero"))?,
+        Sha256Digest::new([35; 32]),
+        Sha256Digest::new([39; 32]),
+        Timestamp::from_unix_nanos(600),
+        NonZeroU64::new(30)
+            .ok_or_else(|| std::io::Error::other("selected rows must be nonzero"))?,
     )?;
     let universe = UniverseId::try_from("liquid-us-equities")?;
     let period = TrainingPeriod::try_new(
@@ -478,7 +486,7 @@ fn valid_fixture_with_identity(
         json!({"negative_max": -0.5, "positive_min": 0.5, "minimum_confidence": 0.0})
     };
     let mut metadata = json!({
-        "schema_version": 2,
+        "schema_version": 3,
         "bundle_id": bundle_id,
         "bundle_version": bundle_version,
         "model_id": model_id.to_string(),
@@ -504,7 +512,12 @@ fn valid_fixture_with_identity(
             "manifest_sha256": hex(expectations.dataset().manifest().content_hash().bytes()),
             "build_spec_sha256": hex(expectations.dataset().build_spec_digest().digest().bytes()),
             "universe_sha256": hex(expectations.dataset().universe_digest().bytes()),
-            "policy_sha256": hex(expectations.dataset().policy_digest().bytes())
+            "policy_sha256": hex(expectations.dataset().policy_digest().bytes()),
+            "catalog_identity_sha256": hex(expectations.dataset().catalog_identity().bytes()),
+            "export_sha256": hex(expectations.dataset().export_digest().bytes()),
+            "selection_sha256": hex(expectations.dataset().selection_digest().bytes()),
+            "selection_as_of_unix_nanos": expectations.dataset().selection_as_of().unix_nanos(),
+            "selected_component_rows": expectations.dataset().selected_component_rows().get()
         },
         "training_universe_id": expectations.universe_id().as_str(),
         "training_period": {
@@ -546,7 +559,7 @@ fn valid_fixture_with_identity(
         "bundle_id": metadata["bundle_id"],
         "bundle_version": metadata["bundle_version"],
         "dataset": metadata["training_dataset"],
-        "dataset_export_sha256": hex([35; 32]),
+        "dataset_export_sha256": hex(expectations.dataset().export_digest().bytes()),
         "environment_sha256": hex([37; 32]),
         "features": run_features,
         "label": metadata["label"],
@@ -562,7 +575,7 @@ fn valid_fixture_with_identity(
     });
     let trial_sha256 = hex(sha256(&serde_json::to_vec(&trial)?));
     let training_run_bytes = serde_json::to_vec(&json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "trial": trial,
         "trial_sha256": trial_sha256,
         "validation_metrics": metadata["validation_metrics"]

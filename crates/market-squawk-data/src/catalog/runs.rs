@@ -23,6 +23,7 @@ use crate::authority_transition::{
     AuthorityEvidenceDigest, AuthorityMutationToken, AuthoritySnapshot, BoundAuthorityTransition,
     CatalogEndpointIdentity, PreparedAuthorityTransition, RootEndpointIdentity,
 };
+use crate::python_dataset::PythonDatasetCatalogError;
 use crate::research_use::ResearchUseCatalogError;
 use crate::rights::{RightsBasis, RightsBasisKind, RightsRegistrar, SourceRightsDecision};
 use crate::{IngestIdentity, RegisteredRightsGrant, RightsDecisionInput, SourceOperation};
@@ -85,6 +86,24 @@ impl CatalogAuthority {
         let transaction = self.catalog.connection.unchecked_transaction()?;
         let now = trusted_catalog_now(&transaction)?;
         let result = operation(&transaction, self.catalog.catalog_id, now)?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    /// Runs one Python-dataset admission mutation in a trusted-time transaction.
+    pub(crate) fn with_python_dataset_transaction<T, F>(
+        &self,
+        operation: F,
+    ) -> Result<T, PythonDatasetCatalogError>
+    where
+        F: for<'transaction> FnOnce(
+            &Transaction<'transaction>,
+            Timestamp,
+        ) -> Result<T, PythonDatasetCatalogError>,
+    {
+        let transaction = self.catalog.connection.unchecked_transaction()?;
+        let now = trusted_catalog_now(&transaction)?;
+        let result = operation(&transaction, now)?;
         transaction.commit()?;
         Ok(result)
     }

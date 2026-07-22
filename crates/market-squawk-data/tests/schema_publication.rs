@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::{
-    ArrayRef, Decimal128Array, FixedSizeBinaryArray, Float64Array, StringArray,
-    TimestampNanosecondArray, UInt8Array, UInt32Array,
+    ArrayRef, Decimal128Array, FixedSizeBinaryArray, Float64Array, TimestampNanosecondArray,
+    UInt8Array, UInt32Array, builder::FixedSizeBinaryBuilder,
 };
 use arrow::record_batch::RecordBatch;
 use market_squawk_data::{
@@ -17,6 +17,19 @@ use market_squawk_platform::LocalPaths;
 use rusqlite::{Connection, params};
 
 type TestResult = Result<(), Box<dyn Error>>;
+
+fn fixed_text(value: Option<&str>, width: i32) -> Result<FixedSizeBinaryArray, Box<dyn Error>> {
+    let mut builder = FixedSizeBinaryBuilder::new(width);
+    match value {
+        Some(value) => {
+            let mut padded = vec![0_u8; usize::try_from(width)?];
+            padded[..value.len()].copy_from_slice(value.as_bytes());
+            builder.append_value(padded)?;
+        }
+        None => builder.append_null(),
+    }
+    Ok(builder.finish())
+}
 
 #[test]
 fn schema_identity_is_causal_across_publication_pinning_and_restart() -> TestResult {
@@ -40,21 +53,26 @@ fn schema_identity_is_causal_across_publication_pinning_and_restart() -> TestRes
     let feature_batch = RecordBatch::try_new(
         Arc::clone(&feature_schema),
         vec![
-            Arc::new(StringArray::from(vec!["example-1"])) as ArrayRef,
-            Arc::new(StringArray::from(vec![
-                "018fb5b0-6da1-7d66-9c7a-0f57c5f94ca1",
-            ])) as ArrayRef,
+            Arc::new(fixed_text(Some("example-1"), 256)?) as ArrayRef,
+            Arc::new(FixedSizeBinaryArray::try_from_iter(
+                [
+                    uuid::Uuid::parse_str("018fb5b0-6da1-7d66-9c7a-0f57c5f94ca1")?
+                        .into_bytes()
+                        .to_vec(),
+                ]
+                .into_iter(),
+            )?) as ArrayRef,
             Arc::new(TimestampNanosecondArray::from(vec![1_i64]).with_timezone_utc()) as ArrayRef,
-            Arc::new(StringArray::from(vec!["train"])) as ArrayRef,
-            Arc::new(StringArray::from(vec!["feature"])) as ArrayRef,
-            Arc::new(StringArray::from(vec!["return-1d"])) as ArrayRef,
+            Arc::new(UInt8Array::from(vec![1_u8])) as ArrayRef,
+            Arc::new(UInt8Array::from(vec![1_u8])) as ArrayRef,
+            Arc::new(fixed_text(Some("return-1d"), 256)?) as ArrayRef,
             Arc::new(UInt32Array::from(vec![1_u32])) as ArrayRef,
             Arc::new(Float64Array::from(vec![Some(0.25)])) as ArrayRef,
             Arc::new(decimal) as ArrayRef,
             Arc::new(UInt8Array::from(vec![None::<u8>])) as ArrayRef,
-            Arc::new(StringArray::from(vec![Some("return")])) as ArrayRef,
-            Arc::new(StringArray::from(vec![None::<&str>])) as ArrayRef,
-            Arc::new(StringArray::from(vec![None::<&str>])) as ArrayRef,
+            Arc::new(fixed_text(Some("return"), 32)?) as ArrayRef,
+            Arc::new(fixed_text(None, 3)?) as ArrayRef,
+            Arc::new(fixed_text(None, 256)?) as ArrayRef,
             Arc::new(FixedSizeBinaryArray::try_from_iter(
                 [[9_u8; 32].as_slice()].into_iter(),
             )?) as ArrayRef,

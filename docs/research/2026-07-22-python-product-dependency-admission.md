@@ -6,14 +6,14 @@ remain absent from live and execution dependencies.
 
 ## Runtime and platform decision
 
-- Supported interpreter contract: GIL-enabled CPython 3.10 through 3.14. Apache Arrow 25 lists
-  Python 3.10–3.14 support, and every selected Python dependency has a compatible floor. The
-  extension targets `cp310-abi3`; PyO3 documents that an `abi3-py310` extension is forward
-  compatible with later GIL-enabled CPython versions. Free-threaded `abi3t` is not claimed.
+- Supported release contract: GIL-enabled CPython 3.12 and 3.13. The extension targets
+  `cp310-abi3`, but ABI compatibility alone does not expand the product support claim beyond the
+  two interpreter minors exercised by the locked offline matrix. Free-threaded `abi3t` is not
+  claimed.
 - Reproducible offline binary coverage in version 0.1 is macOS 12 or newer on arm64, with exact
-  PyArrow wheels locked separately for CPython 3.10, 3.11, 3.12, 3.13, and 3.14. This machine's
-  executable gate uses CPython 3.13.7 on macOS 26.5.1 arm64. Other systems may build from source,
-  but no unmeasured binary-platform claim is made.
+  PyArrow wheels locked separately for CPython 3.12 and 3.13. Both interpreters must pass the same
+  focused release matrix. The project wheel must carry the exact `macosx_12_0_arm64` platform tag;
+  no unmeasured interpreter or binary-platform claim is made.
 - The build uses isolated `venv` environments and bundled `ensurepip`; the offline install uses
   pip `--no-index`, `--only-binary :all:`, and `--require-hashes`. The lock verifies filename,
   compatible wheel tags, byte size, SHA-256, and wheel core-metadata license before installation.
@@ -55,5 +55,10 @@ The builder permits network access only in explicitly authorized cache-preparati
 runs `cargo fetch --locked` into an explicitly supplied ignored `CARGO_HOME`; Cargo documents that
 an unfiltered fetch downloads all target dependencies so later Cargo commands can run offline. The
 release gate reuses only that cache with `CARGO_NET_OFFLINE=true`, consumes the committed locks and
-populated ignored wheelhouse, and records exact interpreter, pip, compiler, Cargo, lock,
-dependency-wheel, project-wheel, and Rust-validator hashes.
+populated ignored wheelhouse, and records exact interpreter, pip, direct compiler and Cargo
+binaries, Rust standard-library closure, Xcode linker/tool binaries, SDK settings, explicit macOS
+12.0 deployment target, closed build environment, lock, dependency-wheel, project-wheel, and
+Rust-validator hashes. The evidence records the admitted project-wheel Python, ABI, and platform
+tags. Cargo configuration from either Cargo working-directory ancestry or `CARGO_HOME`, compiler
+wrappers, injected flags, Python user-site configuration, and inherited loader variables are absent
+from the child environment.

@@ -25,6 +25,11 @@ MAX_LOCK_BYTES = 2 * 1024 * 1024
 MAX_ARTIFACTS = 64
 MAX_SOURCES = 2_048
 RUST_TOOLCHAIN = "1.97.1"
+RUST_TOOLCHAIN_FULL = "1.97.1-aarch64-apple-darwin"
+MACOS_DEPLOYMENT_TARGET = "12.0"
+PROJECT_WHEEL_PLATFORM_TAG = (
+    f"macosx_{MACOS_DEPLOYMENT_TARGET.replace('.', '_')}_arm64"
+)
 SUPPORTED_PYTHONS = ((3, 12), (3, 13))
 ROOT_MARKER = ".market-squawk-python-artifacts-v1"
 CHILD_MARKER = ".market-squawk-owned-v1"
@@ -115,6 +120,7 @@ class ArtifactLayout:
     root: Path
     wheelhouse: Path
     cargo_home: Path
+    build_home: Path
     build_venv: Path
     distribution: Path
     releases: tuple[tuple[tuple[int, int], Path], ...]
@@ -247,6 +253,7 @@ def admit_artifact_root(path: Path, repository_root: Path) -> ArtifactLayout:
         canonical,
         canonical / "wheelhouse",
         canonical / "cargo-home",
+        canonical / "build-home",
         canonical / "build-venv",
         canonical / "dist",
         releases,
@@ -320,13 +327,27 @@ def prepare_wheelhouse(
         os.replace(temporary, destination)
 
 
-def prepare_cargo_cache(root: Path, cargo_home: Path) -> None:
+def prepare_cargo_cache(
+    root: Path, cargo_home: Path, toolchain: dict[str, object]
+) -> None:
     """Populate or verify one explicitly owned Cargo cache for the locked graph."""
 
     _admit_owned_child(cargo_home, cargo_home.parent, "cargo-home")
     network = os.environ.get("MARKET_SQUAWK_PYTHON_WHEEL_PREPARE_NETWORK") == "1"
-    environment = _cargo_environment(cargo_home, offline=not network)
-    command = ["cargo", "fetch", "--locked", "--manifest-path", str(root / "Cargo.toml")]
+    environment = _cargo_environment(
+        root,
+        cargo_home,
+        cargo_home,
+        toolchain,
+        offline=not network,
+    )
+    command = [
+        str(_bound_tool(toolchain, "cargo")),
+        "fetch",
+        "--locked",
+        "--manifest-path",
+        str(root / "Cargo.toml"),
+    ]
     if not network:
         command.append("--offline")
     _run(command, root, environment)
@@ -404,18 +425,194 @@ def admit_sources(lock: ReleaseLock, root: Path) -> None:
             raise ReleaseBuildError("Python release source identity mismatch")
 
 
-def admit_toolchain(root: Path) -> dict[str, str]:
-    """Require the exact repository and executing Rust toolchain before mutation."""
+def admit_toolchain(root: Path) -> dict[str, object]:
+    """Bind direct Rust/Xcode executables, stdlib, SDK, and target policy."""
 
-    toolchain = _toml(root / "rust-toolchain.toml")["toolchain"]["channel"]
+    configured = _toml(root / "rust-toolchain.toml")["toolchain"]["channel"]
     rust_version = _toml(root / "Cargo.toml")["workspace"]["package"]["rust-version"]
-    if toolchain != RUST_TOOLCHAIN or rust_version != RUST_TOOLCHAIN:
+    if configured != RUST_TOOLCHAIN or rust_version != RUST_TOOLCHAIN:
         raise ReleaseBuildError("repository Rust policy is not pinned to 1.97.1")
-    rustc = _run_output(["rustc", "-vV"], root)
-    cargo = _run_output(["cargo", "-vV"], root)
-    _require_tool_release(rustc, "rustc", RUST_TOOLCHAIN)
-    _require_tool_release(cargo, "cargo", RUST_TOOLCHAIN)
-    return {"rustc": rustc, "cargo": cargo}
+    evidence_environment = {"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"}
+    rustup_discovered = shutil.which("rustup")
+    if rustup_discovered is None:
+        raise ReleaseBuildError("rustup is required to resolve direct pinned Rust tools")
+    rustup = Path(rustup_discovered).resolve(strict=True)
+    cargo_path = _direct_rust_tool(rustup, "cargo", root, evidence_environment)
+    rustc_path = _direct_rust_tool(rustup, "rustc", root, evidence_environment)
+    cargo_version = _run_output([str(cargo_path), "-vV"], root, evidence_environment)
+    rustc_version = _run_output([str(rustc_path), "-vV"], root, evidence_environment)
+    _require_tool_release(cargo_version, "cargo", RUST_TOOLCHAIN)
+    _require_tool_release(rustc_version, "rustc", RUST_TOOLCHAIN)
+
+    xcrun = Path("/usr/bin/xcrun").resolve(strict=True)
+    clang = _xcode_tool(xcrun, "clang", root, evidence_environment)
+    clangxx = _xcode_tool(xcrun, "clang++", root, evidence_environment)
+    linker = _xcode_tool(xcrun, "ld", root, evidence_environment)
+    archiver = _xcode_tool(xcrun, "ar", root, evidence_environment)
+    ranlib = _xcode_tool(xcrun, "ranlib", root, evidence_environment)
+    xcodebuild = _xcode_tool(xcrun, "xcodebuild", root, evidence_environment)
+    sdk = Path(
+        _run_output(
+            [str(xcrun), "--sdk", "macosx", "--show-sdk-path"],
+            root,
+            evidence_environment,
+        )
+    ).resolve(strict=True)
+    sdk_version = _run_output(
+        [str(xcrun), "--sdk", "macosx", "--show-sdk-version"],
+        root,
+        evidence_environment,
+    )
+    developer_dir = next(
+        (
+            candidate
+            for candidate in (sdk, *sdk.parents)
+            if candidate.name == "Developer" and candidate.parent.name == "Contents"
+        ),
+        None,
+    )
+    if developer_dir is None:
+        raise ReleaseBuildError("macOS SDK is outside a recognized Xcode developer directory")
+    sysroot = Path(
+        _run_output(
+            [str(rustc_path), "--print", "sysroot"], root, evidence_environment
+        )
+    ).resolve(strict=True)
+    if sysroot != rustc_path.parent.parent:
+        raise ReleaseBuildError("direct rustc and reported sysroot identities differ")
+    sdk_settings = tuple(
+        _file_binding(path)
+        for path in (
+            sdk / "SDKSettings.json",
+            sdk / "SDKSettings.plist",
+            sdk / "System/Library/CoreServices/SystemVersion.plist",
+        )
+    )
+    return {
+        "schema_version": 1,
+        "target": "aarch64-apple-darwin",
+        "macos_deployment_target": MACOS_DEPLOYMENT_TARGET,
+        "cargo": _tool_binding(cargo_path, cargo_version),
+        "rustc": _tool_binding(rustc_path, rustc_version),
+        "rust_stdlib": _tree_binding(sysroot / "lib/rustlib/aarch64-apple-darwin/lib"),
+        "rustup": _tool_binding(
+            rustup,
+            _run_output([str(rustup), "--version"], root, evidence_environment),
+        ),
+        "xcrun": _tool_binding(
+            xcrun,
+            _run_output([str(xcrun), "--version"], root, evidence_environment),
+        ),
+        "clang": _tool_binding(
+            clang,
+            _run_output([str(clang), "--version"], root, evidence_environment),
+        ),
+        "clangxx": _tool_binding(
+            clangxx,
+            _run_output([str(clangxx), "--version"], root, evidence_environment),
+        ),
+        "linker": _tool_binding(linker),
+        "archiver": _tool_binding(archiver),
+        "ranlib": _tool_binding(ranlib),
+        "xcode": _tool_binding(
+            xcodebuild,
+            _run_output([str(xcodebuild), "-version"], root, evidence_environment),
+        ),
+        "developer_dir": str(developer_dir),
+        "sdk": {
+            "path": str(sdk),
+            "version": sdk_version,
+            "settings": sdk_settings,
+            "settings_sha256": _mapping_sha256(sdk_settings),
+        },
+    }
+
+
+def _direct_rust_tool(
+    rustup: Path,
+    name: str,
+    root: Path,
+    environment: dict[str, str],
+) -> Path:
+    path = Path(
+        _run_output(
+            [
+                str(rustup),
+                "which",
+                "--toolchain",
+                RUST_TOOLCHAIN_FULL,
+                name,
+            ],
+            root,
+            environment,
+        )
+    ).resolve(strict=True)
+    if path.name != name or not path.is_file():
+        raise ReleaseBuildError("rustup returned an invalid direct Rust tool")
+    return path
+
+
+def _xcode_tool(
+    xcrun: Path,
+    name: str,
+    root: Path,
+    environment: dict[str, str],
+) -> Path:
+    path = Path(
+        _run_output(
+            [str(xcrun), "--sdk", "macosx", "--find", name], root, environment
+        )
+    ).resolve(strict=True)
+    if not path.is_file():
+        raise ReleaseBuildError("xcrun returned an invalid Xcode tool")
+    return path
+
+
+def _tool_binding(path: Path, version: str | None = None) -> dict[str, object]:
+    binding = _file_binding(path)
+    if version is not None:
+        binding["version"] = version
+    return binding
+
+
+def _file_binding(path: Path) -> dict[str, object]:
+    if path.is_symlink() or not path.is_file():
+        raise ReleaseBuildError("release input is not a direct regular file")
+    size, digest = _file_digest(path)
+    return {"path": str(path), "sha256": digest, "size_bytes": size}
+
+
+def _tree_binding(root: Path) -> dict[str, object]:
+    if root.is_symlink() or not root.is_dir():
+        raise ReleaseBuildError("Rust standard-library root is invalid")
+    files = []
+    total = 0
+    digest = hashlib.sha256(b"market-squawk/python-rust-stdlib-tree/v1\0")
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink():
+            raise ReleaseBuildError("Rust standard-library tree contains an unsafe entry")
+        if path.is_dir():
+            continue
+        if not path.is_file():
+            raise ReleaseBuildError("Rust standard-library tree contains an unsafe entry")
+        size, content_sha256 = _file_digest(path)
+        total += size
+        if len(files) >= 512 or total > 512 * 1024 * 1024:
+            raise ReleaseBuildError("Rust standard-library tree exceeds its evidence bound")
+        relative = path.relative_to(root).as_posix()
+        digest.update(len(relative.encode()).to_bytes(8, "big"))
+        digest.update(relative.encode())
+        digest.update(size.to_bytes(8, "big"))
+        digest.update(bytes.fromhex(content_sha256))
+        files.append(relative)
+    if not files:
+        raise ReleaseBuildError("Rust standard-library tree is empty")
+    return {
+        "root": str(root),
+        "file_count": len(files),
+        "size_bytes": total,
+        "sha256": digest.hexdigest(),
+    }
 
 
 def admit_runtimes(paths: tuple[Path, ...], lock: ReleaseLock) -> tuple[PythonRuntime, ...]:
@@ -455,24 +652,52 @@ def build_release(
     lock: ReleaseLock,
     layout: ArtifactLayout,
     runtimes: tuple[PythonRuntime, ...],
-    toolchain: dict[str, str],
+    toolchain: dict[str, object],
 ) -> None:
     admit_sources(lock, root)
     for runtime in runtimes:
         admit_wheelhouse(lock, layout.wheelhouse, runtime.version[:2])
     _admit_owned_child(layout.cargo_home, layout.root, "cargo-home")
+    _reset_owned_child(layout.build_home, layout.root, "build-home")
+    (layout.build_home / "tmp").mkdir()
     _reset_owned_child(layout.build_venv, layout.root, "build-venv")
     _reset_owned_child(layout.distribution, layout.root, "dist")
+    bootstrap_environment = _cargo_environment(
+        root,
+        layout.cargo_home,
+        layout.build_home,
+        toolchain,
+        offline=True,
+    )
     build_runtime = runtimes[0]
-    build_python = _create_venv(build_runtime, layout.build_venv, root)
+    build_python = _create_venv(
+        build_runtime,
+        layout.build_venv,
+        root,
+        bootstrap_environment,
+    )
     build_wheels = admit_wheelhouse(lock, layout.wheelhouse, build_runtime.version[:2])
     maturin = next(path for path in build_wheels if path.name.startswith("maturin-"))
-    _run([build_python, "-m", "pip", "install", "--no-index", "--no-deps", str(maturin)], root)
-    environment = _cargo_environment(layout.cargo_home, offline=True)
+    _run(
+        [
+            build_python,
+            "-I",
+            "-m",
+            "pip",
+            "install",
+            "--no-index",
+            "--no-deps",
+            str(maturin),
+        ],
+        root,
+        bootstrap_environment,
+    )
+    environment = dict(bootstrap_environment)
     environment["PYO3_PYTHON"] = build_python
     _run(
         [
             build_python,
+            "-I",
             "-m",
             "maturin",
             "build",
@@ -489,11 +714,17 @@ def build_release(
         raise ReleaseBuildError("maturin did not create exactly one project wheel")
     project_wheel = project_wheels[0]
     python_tag, abi_tag, platform_tag = _wheel_tags(project_wheel.name)
-    if python_tag != "cp310" or abi_tag != "abi3" or "arm64" not in platform_tag:
-        raise ReleaseBuildError("project wheel is not the pinned cp310-abi3 platform artifact")
+    if (
+        python_tag != "cp310"
+        or abi_tag != "abi3"
+        or platform_tag != PROJECT_WHEEL_PLATFORM_TAG
+    ):
+        raise ReleaseBuildError(
+            "project wheel does not carry the exact pinned cp310-abi3 macOS platform tag"
+        )
     _run(
         [
-            "cargo",
+            str(_bound_tool(toolchain, "cargo")),
             "build",
             "-p",
             "market-squawk-modeling",
@@ -513,10 +744,17 @@ def build_release(
         if runtime.version[:2] != minor:
             raise ReleaseBuildError("release environment and interpreter identity differ")
         _reset_owned_child(release_venv, layout.root, f"release-cp{minor[0]}{minor[1]}")
-        release_python = _create_venv(runtime, release_venv, root)
+        release_python = _create_venv(
+            runtime,
+            release_venv,
+            root,
+            bootstrap_environment,
+        )
+        runtime_environment = dict(bootstrap_environment)
         _run(
             [
                 release_python,
+                "-I",
                 "-m",
                 "pip",
                 "install",
@@ -530,33 +768,70 @@ def build_release(
                 str(root / "python/requirements.lock"),
             ],
             root,
+            runtime_environment,
         )
         _run(
-            [release_python, "-m", "pip", "install", "--no-index", "--no-deps", str(project_wheel)],
+            [
+                release_python,
+                "-I",
+                "-m",
+                "pip",
+                "install",
+                "--no-index",
+                "--no-deps",
+                str(project_wheel),
+            ],
             root,
+            runtime_environment,
         )
         validator_destination = release_venv / "bin/market-squawk-model-validator"
         shutil.copy2(validator, validator_destination)
         validator_destination.chmod(0o755)
-        _run([release_python, "-c", "import market_squawk, market_squawk._native"], root)
         _run(
-            [release_python, "-m", "pytest", *(str(root / path) for path in FOCUSED_TESTS), "-q"],
+            [
+                release_python,
+                "-I",
+                "-c",
+                "import market_squawk, market_squawk._native",
+            ],
             root,
+            runtime_environment,
+        )
+        _run(
+            [
+                release_python,
+                "-I",
+                "-m",
+                "pytest",
+                *(str(root / path) for path in FOCUSED_TESTS),
+                "-q",
+            ],
+            root,
+            runtime_environment,
         )
         matrix_evidence.append(
             {
-                "python": _run_output([release_python, "--version"], root),
+                "python": _run_output(
+                    [release_python, "--version"], root, runtime_environment
+                ),
                 "python_executable_sha256": _file_digest(runtime.executable)[1],
-                "pip": _run_output([release_python, "-m", "pip", "--version"], root),
+                "pip": _run_output(
+                    [release_python, "-I", "-m", "pip", "--version"],
+                    root,
+                    runtime_environment,
+                ),
                 "focused_tests": list(FOCUSED_TESTS),
                 "validator_sha256": _file_digest(validator_destination)[1],
             }
         )
     evidence = {
-        "schema_version": 2,
+        "schema_version": 3,
         "support_matrix": matrix_evidence,
-        "rustc": toolchain["rustc"],
-        "cargo": toolchain["cargo"],
+        "toolchain": toolchain,
+        "build_environment": {
+            "sha256": _mapping_sha256(environment),
+            "values": environment,
+        },
         "cargo_lock_sha256": _file_digest(root / "Cargo.lock")[1],
         "wheelhouse_lock_sha256": _file_digest(lock_path)[1],
         "requirements_lock_sha256": _file_digest(root / "python/requirements.lock")[1],
@@ -564,6 +839,10 @@ def build_release(
         "project_wheel": {
             "filename": project_wheel.name,
             "sha256": _file_digest(project_wheel)[1],
+            "python_tag": python_tag,
+            "abi_tag": abi_tag,
+            "platform_tag": platform_tag,
+            "macos_deployment_target": MACOS_DEPLOYMENT_TARGET,
         },
     }
     (layout.root / "market-squawk-release.json").write_text(
@@ -571,6 +850,7 @@ def build_release(
         encoding="utf-8",
     )
     _remove_owned_child(layout.build_venv, layout.root, "build-venv")
+    _remove_owned_child(layout.build_home, layout.root, "build-home")
 
 
 def _marker_content(path: Path, purpose: str) -> str:
@@ -665,12 +945,17 @@ def _require_tool_release(output: str, tool: str, expected: str) -> None:
         raise ReleaseBuildError(f"{tool} must execute at exact release {expected}")
 
 
-def _create_venv(runtime: PythonRuntime, path: Path, root: Path) -> str:
+def _create_venv(
+    runtime: PythonRuntime,
+    path: Path,
+    root: Path,
+    environment: dict[str, str] | None = None,
+) -> str:
     """Create a venv with its admitted runtime and re-admit the resulting interpreter."""
 
-    _run([str(runtime.executable), "-m", "venv", str(path)], root)
+    _run([str(runtime.executable), "-I", "-m", "venv", str(path)], root, environment)
     executable = Path(_venv_python(path))
-    _admit_created_runtime(executable, runtime.version, root)
+    _admit_created_runtime(executable, runtime.version, root, environment)
     return str(executable)
 
 
@@ -678,8 +963,9 @@ def _admit_created_runtime(
     executable: Path,
     expected: tuple[int, int, int],
     root: Path,
+    environment: dict[str, str] | None = None,
 ) -> None:
-    evidence, version = _interpreter_evidence(executable, root)
+    evidence, version = _interpreter_evidence(executable, root, environment)
     if (
         evidence.get("implementation") != "cpython"
         or evidence.get("system") != "Darwin"
@@ -692,10 +978,12 @@ def _admit_created_runtime(
 def _interpreter_evidence(
     executable: Path,
     root: Path,
+    environment: dict[str, str] | None = None,
 ) -> tuple[dict[str, object], tuple[int, ...]]:
     output = _run_output(
         [
             str(executable),
+            "-I",
             "-c",
             (
                 "import json,platform,sys;"
@@ -705,6 +993,7 @@ def _interpreter_evidence(
             ),
         ],
         root,
+        environment or {"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin", "TZ": "UTC"},
     )
     try:
         evidence = json.loads(output)
@@ -717,16 +1006,113 @@ def _interpreter_evidence(
     return evidence, version
 
 
-def _cargo_environment(cargo_home: Path, *, offline: bool) -> dict[str, str]:
-    environment = os.environ.copy()
-    environment.update(
-        {
-            "CARGO_HOME": str(cargo_home),
-            "CARGO_INCREMENTAL": "0",
-            "CARGO_NET_OFFLINE": "true" if offline else "false",
-        }
+def _cargo_environment(
+    root: Path,
+    cargo_home: Path,
+    build_home: Path,
+    toolchain: dict[str, object],
+    *,
+    offline: bool,
+) -> dict[str, str]:
+    _reject_cargo_configuration((root, root / "python"), cargo_home)
+    cargo = _bound_tool(toolchain, "cargo")
+    rustc = _bound_tool(toolchain, "rustc")
+    clang = _bound_tool(toolchain, "clang")
+    clangxx = _bound_tool(toolchain, "clangxx")
+    archiver = _bound_tool(toolchain, "archiver")
+    ranlib = _bound_tool(toolchain, "ranlib")
+    sdk = toolchain.get("sdk")
+    if (
+        not isinstance(sdk, dict)
+        or not isinstance(sdk.get("path"), str)
+        or toolchain.get("target") != "aarch64-apple-darwin"
+        or toolchain.get("macos_deployment_target") != MACOS_DEPLOYMENT_TARGET
+        or not isinstance(toolchain.get("developer_dir"), str)
+    ):
+        raise ReleaseBuildError("bound macOS build policy is invalid")
+    path = os.pathsep.join(
+        dict.fromkeys(
+            [
+                str(cargo.parent),
+                str(rustc.parent),
+                str(clang.parent),
+                "/usr/bin",
+                "/bin",
+            ]
+        )
     )
+    temporary = build_home / "tmp"
+    if not temporary.is_dir():
+        temporary = Path("/tmp")
+    environment = {
+        "AR": str(archiver),
+        "CARGO_HOME": str(cargo_home),
+        "CARGO_INCREMENTAL": "0",
+        "CARGO_NET_OFFLINE": "true" if offline else "false",
+        "CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER": str(clang),
+        "CARGO_TERM_COLOR": "never",
+        "CC": str(clang),
+        "CXX": str(clangxx),
+        "DEVELOPER_DIR": str(toolchain["developer_dir"]),
+        "HOME": str(build_home),
+        "LANG": "C",
+        "LC_ALL": "C",
+        "MACOSX_DEPLOYMENT_TARGET": MACOS_DEPLOYMENT_TARGET,
+        "PATH": path,
+        "PIP_CONFIG_FILE": os.devnull,
+        "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+        "PIP_NO_INDEX": "1" if offline else "0",
+        "PYTHONHASHSEED": "0",
+        "PYTHONNOUSERSITE": "1",
+        "RANLIB": str(ranlib),
+        "RUSTC": str(rustc),
+        "SDKROOT": sdk["path"],
+        "TMPDIR": str(temporary),
+        "TZ": "UTC",
+    }
+    _mapping_sha256(environment)
     return environment
+
+
+def _bound_tool(toolchain: dict[str, object], name: str) -> Path:
+    binding = toolchain.get(name)
+    if not isinstance(binding, dict):
+        raise ReleaseBuildError("release tool binding is absent")
+    path_value = binding.get("path")
+    digest = binding.get("sha256")
+    size = binding.get("size_bytes")
+    if not isinstance(path_value, str) or not isinstance(digest, str) or not isinstance(size, int):
+        raise ReleaseBuildError("release tool binding is malformed")
+    path = Path(path_value)
+    if _file_digest(path) != (size, digest):
+        raise ReleaseBuildError("release tool changed after admission")
+    return path
+
+
+def _reject_cargo_configuration(
+    cargo_working_directories: tuple[Path, ...], cargo_home: Path
+) -> None:
+    candidates = {cargo_home / "config", cargo_home / "config.toml"}
+    for working_directory in cargo_working_directories:
+        current = working_directory.resolve(strict=True)
+        while True:
+            candidates.update((current / ".cargo/config", current / ".cargo/config.toml"))
+            if current.parent == current:
+                break
+            current = current.parent
+    if any(path.exists() or path.is_symlink() for path in candidates):
+        raise ReleaseBuildError("closed Python release build forbids Cargo configuration overrides")
+
+
+def _mapping_sha256(value: object) -> str:
+    encoded = json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _compatible(filename: str, version: tuple[int, int]) -> bool:
@@ -806,11 +1192,16 @@ def _run(command: list[str], root: Path, environment: dict[str, str] | None = No
         raise ReleaseBuildError("offline Python release subprocess failed")
 
 
-def _run_output(command: list[str], root: Path) -> str:
+def _run_output(
+    command: list[str],
+    root: Path,
+    environment: dict[str, str] | None = None,
+) -> str:
     try:
         completed = subprocess.run(
             command,
             cwd=root,
+            env=environment,
             check=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -849,7 +1240,7 @@ def main() -> int:
             if options.offline:
                 raise ReleaseBuildError("cache preparation and offline build modes are exclusive")
             prepare_wheelhouse(lock, layout.wheelhouse, source_cache)
-            prepare_cargo_cache(root, layout.cargo_home)
+            prepare_cargo_cache(root, layout.cargo_home, toolchain)
             for runtime in runtimes:
                 admit_wheelhouse(lock, layout.wheelhouse, runtime.version[:2])
         else:

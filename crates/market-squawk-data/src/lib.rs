@@ -20,6 +20,7 @@ mod migrations;
 mod parquet_store;
 mod pit;
 mod publication_coordinator;
+mod python_dataset;
 mod query;
 mod research_use;
 mod rights;
@@ -60,7 +61,7 @@ pub use dataset_builder::{
     DatasetBuilder, DatasetBuilderService, DatasetExample, DatasetOutputAuthorization,
     DatasetSplit, DatasetSplitCounts, FeatureLabelComponentInput, FeatureLabelComponentSpec,
     FeatureLabelDataset, FeatureLabelPythonExport, MAX_FEATURE_LABEL_EXPORT_BYTES,
-    MissingValuePolicy,
+    MissingValuePolicy, PythonDatasetAdmission,
 };
 pub use ingest::{
     AnalyticalDataService, CommittedDataset, CompactionRequest, IngestError,
@@ -84,6 +85,11 @@ pub use pit::{
     PointInTimeLimits, PointInTimePolicy, PointInTimeRecord, PointInTimeRequest,
     PointInTimeRevisionCounts, PointInTimeRevisionMode, PointInTimeRevisionState,
     PointInTimeSelection, PointInTimeService,
+};
+pub use python_dataset::{
+    PythonDatasetCatalogError, PythonDatasetIdentity, PythonDatasetRow, PythonDatasetSelection,
+    PythonDatasetSelectionRevalidation, PythonDatasetValue, PythonDatasetVerificationLimits,
+    verify_python_dataset,
 };
 pub use query::{
     QueryError, QueryLimits, QueryRequest, QueryResult, ResearchQueryEngine, ResearchQueryService,

@@ -84,7 +84,7 @@ pub(super) fn encode(
             },
             version: dataset.point_in_time_policy.version().get(),
         },
-        schema_version: 1,
+        schema_version: 2,
         split_counts: split_counts_wire(dataset.split_counts),
         split_policy: SplitPolicyWire {
             test_end_unix_nanos: nanos(test_end),

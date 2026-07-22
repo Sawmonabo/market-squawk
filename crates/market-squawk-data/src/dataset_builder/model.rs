@@ -79,13 +79,6 @@ impl ComponentScope {
 }
 
 impl ComponentKind {
-    pub(super) const fn name(self) -> &'static str {
-        match self {
-            Self::Feature => "feature",
-            Self::Label => "label",
-        }
-    }
-
     pub(super) const fn tag(self) -> u8 {
         match self {
             Self::Feature => 1,

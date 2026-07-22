@@ -22,7 +22,13 @@ pub(crate) const RESEARCH_SCHEMA_NAME: &str = "market_squawk.research_observatio
 pub(crate) const FEATURE_LABEL_SCHEMA_NAME: &str = "market_squawk.feature_label_components";
 pub(crate) const RESEARCH_RECORD_SCHEMA: &str = CURRENT_RESEARCH_RECORD_SCHEMA;
 pub(crate) const RESEARCH_SCHEMA_VERSION: u16 = 3;
-pub(crate) const FEATURE_LABEL_SCHEMA_VERSION: u16 = 1;
+pub(crate) const FEATURE_LABEL_SCHEMA_VERSION: u16 = 2;
+pub(crate) const FEATURE_LABEL_EXAMPLE_ID_BYTES: i32 = 256;
+pub(crate) const FEATURE_LABEL_INSTRUMENT_ID_BYTES: i32 = 16;
+pub(crate) const FEATURE_LABEL_COMPONENT_NAME_BYTES: i32 = 256;
+pub(crate) const FEATURE_LABEL_UNIT_BYTES: i32 = 32;
+pub(crate) const FEATURE_LABEL_CURRENCY_BYTES: i32 = 3;
+pub(crate) const FEATURE_LABEL_MISSING_REASON_BYTES: i32 = 256;
 
 const MAX_SCHEMA_NAME_BYTES: usize = 128;
 
@@ -325,19 +331,43 @@ fn feature_label_schema_definition() -> Schema {
     let timestamp = DataType::Timestamp(TimeUnit::Nanosecond, Some("+00:00".into()));
     Schema::new_with_metadata(
         vec![
-            Field::new("example_id", DataType::Utf8, false),
-            Field::new("instrument_id", DataType::Utf8, false),
+            Field::new(
+                "example_id",
+                DataType::FixedSizeBinary(FEATURE_LABEL_EXAMPLE_ID_BYTES),
+                false,
+            ),
+            Field::new(
+                "instrument_id",
+                DataType::FixedSizeBinary(FEATURE_LABEL_INSTRUMENT_ID_BYTES),
+                false,
+            ),
             Field::new("cutoff_at", timestamp, false),
-            Field::new("split", DataType::Utf8, false),
-            Field::new("component_kind", DataType::Utf8, false),
-            Field::new("component_name", DataType::Utf8, false),
+            Field::new("split", DataType::UInt8, false),
+            Field::new("component_kind", DataType::UInt8, false),
+            Field::new(
+                "component_name",
+                DataType::FixedSizeBinary(FEATURE_LABEL_COMPONENT_NAME_BYTES),
+                false,
+            ),
             Field::new("component_version", DataType::UInt32, false),
             Field::new("value_f64", DataType::Float64, true),
             Field::new("value_decimal_mantissa", DataType::Decimal128(38, 0), true),
             Field::new("value_decimal_scale", DataType::UInt8, true),
-            Field::new("unit", DataType::Utf8, true),
-            Field::new("currency", DataType::Utf8, true),
-            Field::new("missing_reason", DataType::Utf8, true),
+            Field::new(
+                "unit",
+                DataType::FixedSizeBinary(FEATURE_LABEL_UNIT_BYTES),
+                true,
+            ),
+            Field::new(
+                "currency",
+                DataType::FixedSizeBinary(FEATURE_LABEL_CURRENCY_BYTES),
+                true,
+            ),
+            Field::new(
+                "missing_reason",
+                DataType::FixedSizeBinary(FEATURE_LABEL_MISSING_REASON_BYTES),
+                true,
+            ),
             Field::new("lineage_sha256", DataType::FixedSizeBinary(32), false),
         ],
         HashMap::from([
@@ -351,7 +381,7 @@ fn feature_label_schema_definition() -> Schema {
             ),
             (
                 "market_squawk.component_layout".to_owned(),
-                "typed-long-form-v1".to_owned(),
+                "fixed-width-long-form-v2".to_owned(),
             ),
             (
                 "market_squawk.timestamp_timezone".to_owned(),
