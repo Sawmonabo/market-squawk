@@ -21,10 +21,11 @@ use market_squawk_execution::{
 use serde::Serialize;
 use thiserror::Error;
 
-const AUDIT_SCHEMA_VERSION: u16 = 1;
+const EXECUTION_AUDIT_SCHEMA_VERSION: u16 = 2;
+const PAPER_AUDIT_SCHEMA_VERSION: u16 = 1;
 const MAXIMUM_ENCODED_RECORD_BYTES: usize = 64 * 1024;
 const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(1);
-const EXECUTION_AUDIT_FILE: &str = "paper-execution-audit-v1.jsonl";
+const EXECUTION_AUDIT_FILE: &str = "paper-execution-audit-v2.jsonl";
 const PAPER_AUDIT_FILE: &str = "paper-state-audit-v1.jsonl";
 
 /// Sole owner of both mandatory production audit consumers and their durable files.
@@ -251,7 +252,7 @@ fn drain_execution_once(
     }
     match execution.try_next_record() {
         Ok(Some(record)) => {
-            append_durable(execution_file, &ExecutionAuditRecordWire::try_from(record)?)?;
+            append_durable(execution_file, &ExecutionAuditEnvelopeV2::try_from(record)?)?;
             *execution_records = execution_records
                 .checked_add(1)
                 .ok_or(ProductionAuditError::RecordCountOverflow)?;
@@ -329,32 +330,43 @@ fn append_durable(file: &mut File, record: &impl Serialize) -> Result<(), Produc
 }
 
 #[derive(Serialize)]
-#[serde(tag = "recordType", content = "record", rename_all = "camelCase")]
-enum ExecutionAuditRecordWire {
-    Execution(Box<ExecutionAuditEventWire>),
-    StrategyNoAction(StrategyNoActionAuditRecordWire),
+#[serde(rename_all = "camelCase")]
+struct ExecutionAuditEnvelopeV2 {
+    schema_version: u16,
+    #[serde(flatten)]
+    record: ExecutionAuditRecordV2,
 }
 
-impl TryFrom<ExecutionAuditSourceRecord> for ExecutionAuditRecordWire {
+#[derive(Serialize)]
+#[serde(tag = "recordType", content = "record", rename_all = "camelCase")]
+enum ExecutionAuditRecordV2 {
+    Execution(Box<ExecutionAuditEventV2>),
+    StrategyNoAction(StrategyNoActionAuditEventV2),
+}
+
+impl TryFrom<ExecutionAuditSourceRecord> for ExecutionAuditEnvelopeV2 {
     type Error = ProductionAuditError;
 
     fn try_from(record: ExecutionAuditSourceRecord) -> Result<Self, Self::Error> {
-        match (record.execution_event(), record.strategy_no_action_event()) {
-            (Some(event), None) => Ok(Self::Execution(Box::new(ExecutionAuditEventWire::from(
-                &event,
-            )))),
-            (None, Some(event)) => Ok(Self::StrategyNoAction(
-                StrategyNoActionAuditRecordWire::from(event),
+        let record = match (record.execution_event(), record.strategy_no_action_event()) {
+            (Some(event), None) => Ok(ExecutionAuditRecordV2::Execution(Box::new(
+                ExecutionAuditEventV2::from(&event),
+            ))),
+            (None, Some(event)) => Ok(ExecutionAuditRecordV2::StrategyNoAction(
+                StrategyNoActionAuditEventV2::from(event),
             )),
             (Some(_), Some(_)) | (None, None) => Err(ProductionAuditError::Encoding),
-        }
+        }?;
+        Ok(Self {
+            schema_version: EXECUTION_AUDIT_SCHEMA_VERSION,
+            record,
+        })
     }
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ExecutionAuditEventWire {
-    schema_version: u16,
+struct ExecutionAuditEventV2 {
     kind: ExecutionAuditKind,
     approval_id: String,
     order_id: String,
@@ -374,11 +386,10 @@ struct ExecutionAuditEventWire {
     reasons: Vec<ExecutionAuditReason>,
 }
 
-impl From<&ExecutionAuditEvent> for ExecutionAuditEventWire {
+impl From<&ExecutionAuditEvent> for ExecutionAuditEventV2 {
     fn from(event: &ExecutionAuditEvent) -> Self {
         let policy = event.risk_policy();
         Self {
-            schema_version: AUDIT_SCHEMA_VERSION,
             kind: event.kind(),
             approval_id: event.approval_id().to_string(),
             order_id: event.order_id().to_string(),
@@ -402,8 +413,7 @@ impl From<&ExecutionAuditEvent> for ExecutionAuditEventWire {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct StrategyNoActionAuditRecordWire {
-    schema_version: u16,
+struct StrategyNoActionAuditEventV2 {
     domain: StrategyNoActionDomain,
     phase: StrategyNoActionPhase,
     source_code: u16,
@@ -412,11 +422,10 @@ struct StrategyNoActionAuditRecordWire {
     observed_at_unix_nanos: i64,
 }
 
-impl From<StrategyNoActionAuditEvent> for StrategyNoActionAuditRecordWire {
+impl From<StrategyNoActionAuditEvent> for StrategyNoActionAuditEventV2 {
     fn from(event: StrategyNoActionAuditEvent) -> Self {
         let no_action = event.no_action();
         Self {
-            schema_version: AUDIT_SCHEMA_VERSION,
             domain: no_action.domain(),
             phase: no_action.phase(),
             source_code: no_action.source_code().get(),
@@ -445,7 +454,7 @@ struct PaperAuditRecordWire {
 impl From<PaperAuditRecord> for PaperAuditRecordWire {
     fn from(record: PaperAuditRecord) -> Self {
         Self {
-            schema_version: AUDIT_SCHEMA_VERSION,
+            schema_version: PAPER_AUDIT_SCHEMA_VERSION,
             sequence: record.sequence(),
             order_id: record.order_id().map(|order| order.to_string()),
             kind: record.kind(),
@@ -581,6 +590,7 @@ fn configure_private_creation(_options: &mut OpenOptions) {}
 mod tests {
     use std::num::{NonZeroU16, NonZeroU32, NonZeroUsize};
 
+    use cap_std::ambient_authority;
     use market_squawk_domain::Timestamp;
     use market_squawk_execution::{
         ExecutionAuditConfig, ExecutionAuditWriter, StrategyNoAction, StrategyNoActionPhase,
@@ -593,9 +603,13 @@ mod tests {
     #[test]
     fn execution_worker_persists_strategy_no_action_and_continues()
     -> Result<(), Box<dyn std::error::Error>> {
+        const V1_SENTINEL: &[u8] = b"{\"schemaVersion\":1,\"historical\":\"sentinel\"}\n";
+
         let temporary = TempDir::new()?;
-        let path = temporary.path().join("execution.jsonl");
-        let mut file = File::create(&path)?;
+        let v1_path = temporary.path().join("paper-execution-audit-v1.jsonl");
+        std::fs::write(&v1_path, V1_SENTINEL)?;
+        let directory = Dir::open_ambient_dir(temporary.path(), ambient_authority())?;
+        let mut file = open_audit_file(&directory, EXECUTION_AUDIT_FILE)?;
         let (writer, mut reader) = ExecutionAuditWriter::try_new(ExecutionAuditConfig {
             maximum_records: NonZeroUsize::new(2)
                 .ok_or_else(|| std::io::Error::other("record capacity must be nonzero"))?,
@@ -628,16 +642,21 @@ mod tests {
         assert_eq!(records, 2);
         assert!(!closed);
         file.sync_all()?;
+        drop(file);
 
-        let lines = std::fs::read_to_string(path)?
+        assert_eq!(std::fs::read(v1_path)?, V1_SENTINEL);
+        let v2_path = temporary.path().join("paper-execution-audit-v2.jsonl");
+        let lines = std::fs::read_to_string(v2_path)?
             .lines()
             .map(serde_json::from_str::<Value>)
             .collect::<Result<Vec<_>, _>>()?;
         assert_eq!(lines.len(), 2);
         assert!(lines.iter().all(|line| {
-            line["recordType"] == "strategyNoAction"
+            line["schemaVersion"] == 2
+                && line["recordType"] == "strategyNoAction"
                 && line["record"]["phase"] == "inference"
                 && line["record"]["sourceCode"] == 403
+                && line["record"].get("schemaVersion").is_none()
         }));
         assert_eq!(lines[0]["record"]["observedAtUnixNanos"], 11);
         assert_eq!(lines[1]["record"]["observedAtUnixNanos"], 12);
