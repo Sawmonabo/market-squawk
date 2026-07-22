@@ -9,10 +9,7 @@ use rust_decimal::Decimal;
 use crate::evidence::ValuationSet;
 use crate::lots::{Lot, LotDirection, dispose};
 use crate::transaction::{CashFlow, CashFlowKind, LedgerEntry, LedgerEntryKind, Trade, TradeSide};
-use crate::{
-    PortfolioError, checked_decimal_add, checked_decimal_div, checked_decimal_mul,
-    checked_decimal_sub,
-};
+use crate::{PortfolioError, checked_decimal_add, checked_decimal_div, checked_decimal_mul};
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CurrencyAmounts(pub(crate) BTreeMap<Currency, Decimal>);
@@ -238,41 +235,54 @@ impl ReplayState {
         subject: InstrumentId,
         amount: Money,
     ) -> Result<(), PortfolioError> {
-        let quantity = self
+        let affected = self
             .lots
             .iter()
-            .filter(|lot| lot.instrument_id == subject && lot.direction == LotDirection::Long)
-            .try_fold(Decimal::ZERO, |total, lot| {
-                checked_decimal_add(total, lot.quantity)
-            })?;
-        let distribution = amount
-            .checked_mul_decimal(quantity)
-            .map_err(|_| PortfolioError::Arithmetic)?;
-        self.cash.add(distribution)?;
-        self.return_of_capital.add(distribution)?;
-        let mut remaining = distribution.amount();
-        for lot in self
-            .lots
-            .iter_mut()
-            .filter(|lot| lot.instrument_id == subject && lot.direction == LotDirection::Long)
+            .enumerate()
+            .filter(|(_, lot)| lot.instrument_id == subject && lot.direction == LotDirection::Long)
+            .collect::<Vec<_>>();
+        if affected
+            .iter()
+            .any(|(_, lot)| !lot.basis_complete || lot.basis.currency() != amount.currency())
         {
-            if remaining.is_zero() {
-                break;
-            }
-            if lot.basis.currency() != amount.currency() {
-                return Err(PortfolioError::CurrencyMismatch);
-            }
-            let reduction = remaining.min(lot.basis.amount());
-            lot.basis = lot
+            return Err(PortfolioError::UnresolvedCorporateAction);
+        }
+        let mut updates = Vec::new();
+        updates
+            .try_reserve_exact(affected.len())
+            .map_err(|_| PortfolioError::AllocationFailed)?;
+        let mut total_distribution = Money::new(Decimal::ZERO, amount.currency());
+        let mut total_excess = Money::new(Decimal::ZERO, amount.currency());
+        for (index, lot) in affected {
+            let distribution = amount
+                .checked_mul_decimal(lot.quantity)
+                .map_err(|_| PortfolioError::Arithmetic)?;
+            let reduction = distribution.amount().min(lot.basis.amount());
+            let updated_basis = lot
                 .basis
                 .checked_sub(Money::new(reduction, amount.currency()))
                 .map_err(|_| PortfolioError::Arithmetic)?;
-            remaining = checked_decimal_sub(remaining, reduction)?;
+            let excess = distribution
+                .checked_sub(Money::new(reduction, amount.currency()))
+                .map_err(|_| PortfolioError::Arithmetic)?;
+            total_distribution = total_distribution
+                .checked_add(distribution)
+                .map_err(|_| PortfolioError::Arithmetic)?;
+            total_excess = total_excess
+                .checked_add(excess)
+                .map_err(|_| PortfolioError::Arithmetic)?;
+            updates.push((index, updated_basis));
         }
-        if !remaining.is_zero() {
-            self.realized_gain
-                .add(Money::new(remaining, amount.currency()))?;
+        for (index, updated_basis) in updates {
+            let lot = self
+                .lots
+                .get_mut(index)
+                .ok_or(PortfolioError::UnresolvedCorporateAction)?;
+            lot.basis = updated_basis;
         }
+        self.cash.add(total_distribution)?;
+        self.return_of_capital.add(total_distribution)?;
+        self.realized_gain.add(total_excess)?;
         Ok(())
     }
 
@@ -313,6 +323,26 @@ impl ReplayState {
         successor: InstrumentId,
         consideration: MergerConsideration,
     ) -> Result<(), PortfolioError> {
+        let subject_lots = self
+            .lots
+            .iter()
+            .filter(|lot| lot.instrument_id == subject)
+            .collect::<Vec<_>>();
+        if subject_lots.iter().any(|lot| !lot.basis_complete) {
+            return Err(PortfolioError::UnresolvedCorporateAction);
+        }
+        let consideration_currency = match consideration {
+            MergerConsideration::Cash { amount } => Some(amount.currency()),
+            MergerConsideration::Mixed { cash, .. } => Some(cash.currency()),
+            MergerConsideration::Unspecified | MergerConsideration::Stock { .. } => None,
+        };
+        if consideration_currency.is_some_and(|currency| {
+            subject_lots
+                .iter()
+                .any(|lot| lot.basis.currency() != currency)
+        }) {
+            return Err(PortfolioError::CurrencyMismatch);
+        }
         match consideration {
             MergerConsideration::Unspecified => Err(PortfolioError::UnresolvedCorporateAction),
             MergerConsideration::Stock {

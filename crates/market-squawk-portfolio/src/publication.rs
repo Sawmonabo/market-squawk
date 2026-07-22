@@ -5,15 +5,17 @@ use std::mem::size_of;
 
 use market_squawk_data::{AdjustmentStep, CorporateActionPlan};
 use market_squawk_domain::{
-    AccountId, Currency, Money, RevisionNumber, SourceIdentifier, Timestamp,
+    AccountId, Currency, DigestAlgorithm, Money, NormalizedPortfolioLotMethod,
+    NormalizedPortfolioTransactionClass, NormalizedPortfolioTransactionEvidence, RevisionNumber,
+    SourceIdentifier, Timestamp,
 };
 use rust_decimal::Decimal;
 use sha2::{Digest as _, Sha256};
 
 use crate::accounting::{ReplayState, step_index};
 use crate::evidence::{
-    CashBalance, CorporateActionBinding, FeatureBinding, PortfolioRevision, PortfolioRevisionId,
-    Position, RevisionEvidence, ValuationSet,
+    BasisMeasurement, CashBalance, CorporateActionBinding, FeatureBinding, PortfolioRevision,
+    PortfolioRevisionId, Position, RevisionEvidence, ValuationSet,
 };
 use crate::lots::{Lot, LotDirection, LotSelection};
 use crate::transaction::{LedgerEntry, LedgerEntryKind};
@@ -29,7 +31,7 @@ pub(crate) fn build_revision(
     limits: PortfolioLimits,
     active_entries: &BTreeMap<SourceIdentifier, LedgerEntry>,
     seen_revisions: &BTreeSet<(SourceIdentifier, u32)>,
-    plans: &[CorporateActionPlan],
+    plan: Option<&CorporateActionPlan>,
     previous_revision_id: Option<PortfolioRevisionId>,
     valuation: ValuationSet,
     evidence: RevisionEvidence,
@@ -51,7 +53,7 @@ pub(crate) fn build_revision(
         .iter()
         .map(ReplayOperation::Entry)
         .collect::<Vec<_>>();
-    for plan in plans {
+    if let Some(plan) = plan {
         ReplayState::validate_plan(plan)?;
         for step in plan.steps() {
             operations.push(ReplayOperation::Action { plan, step });
@@ -88,18 +90,13 @@ pub(crate) fn build_revision(
             .checked_add(position.market_value)
             .map_err(|_| PortfolioError::Arithmetic)
     })?;
-    let cost_basis = positions.iter().try_fold(zero(), |total, position| {
-        total
-            .checked_add(position.cost_basis)
-            .map_err(|_| PortfolioError::Arithmetic)
+    let cost_basis =
+        aggregate_basis_measurement(&positions, base_currency, |position| position.cost_basis)?;
+    let unrealized_gain = aggregate_basis_measurement(&positions, base_currency, |position| {
+        position.unrealized_gain
     })?;
-    let unrealized_gain = positions.iter().try_fold(zero(), |total, position| {
-        total
-            .checked_add(position.unrealized_gain)
-            .map_err(|_| PortfolioError::Arithmetic)
-    })?;
-    let corporate_actions = plans
-        .iter()
+    let corporate_actions = plan
+        .into_iter()
         .map(CorporateActionBinding::from_plan)
         .collect::<Vec<_>>();
     let id = revision_id(
@@ -115,7 +112,7 @@ pub(crate) fn build_revision(
         &cash_balances,
         active_entries,
         seen_revisions,
-        plans,
+        plan,
         &evidence,
     )?;
     if retained_bytes > limits.max_retained_bytes {
@@ -145,7 +142,7 @@ pub(crate) fn build_revision(
         retained_bytes,
         active_entries: active_entries.clone(),
         seen_revisions: seen_revisions.clone(),
-        plans: plans.to_vec(),
+        plan: plan.cloned(),
         limits,
     })
 }
@@ -220,50 +217,77 @@ fn build_positions(
                 LotDirection::Long => checked_decimal_add(total, lot.quantity),
                 LotDirection::Short => checked_decimal_sub(total, lot.quantity),
             })?;
-        let cost_basis = instrument_lots.iter().try_fold(
-            Money::new(Decimal::ZERO, valuation.base_currency),
-            |total, lot| {
-                total
-                    .checked_add(valuation.convert(lot.basis)?)
-                    .map_err(|_| PortfolioError::Arithmetic)
-            },
-        )?;
         let market_value = valuation.market_value(instrument_id, quantity)?;
-        let unrealized_gain = instrument_lots.iter().try_fold(
-            Money::new(Decimal::ZERO, valuation.base_currency),
-            |total, lot| {
-                let lot_market = valuation.market_value(
-                    instrument_id,
-                    match lot.direction {
-                        LotDirection::Long => lot.quantity,
-                        LotDirection::Short => -lot.quantity,
-                    },
-                )?;
-                let lot_basis = valuation.convert(lot.basis)?;
-                let gain = match lot.direction {
-                    LotDirection::Long => lot_market
-                        .checked_sub(lot_basis)
-                        .map_err(|_| PortfolioError::Arithmetic)?,
-                    LotDirection::Short => lot_basis
-                        .checked_add(lot_market)
-                        .map_err(|_| PortfolioError::Arithmetic)?,
-                };
-                total
-                    .checked_add(gain)
-                    .map_err(|_| PortfolioError::Arithmetic)
-            },
-        )?;
+        let basis_complete = instrument_lots.iter().all(Lot::basis_complete);
+        let (cost_basis, unrealized_gain) = if basis_complete {
+            let cost_basis = instrument_lots.iter().try_fold(
+                Money::new(Decimal::ZERO, valuation.base_currency),
+                |total, lot| {
+                    total
+                        .checked_add(valuation.convert(lot.basis)?)
+                        .map_err(|_| PortfolioError::Arithmetic)
+                },
+            )?;
+            let unrealized_gain = instrument_lots.iter().try_fold(
+                Money::new(Decimal::ZERO, valuation.base_currency),
+                |total, lot| {
+                    let lot_market = valuation.market_value(
+                        instrument_id,
+                        match lot.direction {
+                            LotDirection::Long => lot.quantity,
+                            LotDirection::Short => -lot.quantity,
+                        },
+                    )?;
+                    let lot_basis = valuation.convert(lot.basis)?;
+                    let gain = match lot.direction {
+                        LotDirection::Long => lot_market
+                            .checked_sub(lot_basis)
+                            .map_err(|_| PortfolioError::Arithmetic)?,
+                        LotDirection::Short => lot_basis
+                            .checked_add(lot_market)
+                            .map_err(|_| PortfolioError::Arithmetic)?,
+                    };
+                    total
+                        .checked_add(gain)
+                        .map_err(|_| PortfolioError::Arithmetic)
+                },
+            )?;
+            (
+                BasisMeasurement::Complete(cost_basis),
+                BasisMeasurement::Complete(unrealized_gain),
+            )
+        } else {
+            (BasisMeasurement::Incomplete, BasisMeasurement::Incomplete)
+        };
         positions.push(Position {
             instrument_id,
             quantity,
             cost_basis,
             market_value,
             unrealized_gain,
-            basis_complete: instrument_lots.iter().all(Lot::basis_complete),
             lots: instrument_lots,
         });
     }
     Ok(positions)
+}
+
+fn aggregate_basis_measurement(
+    positions: &[Position],
+    currency: Currency,
+    measurement: impl Fn(&Position) -> BasisMeasurement,
+) -> Result<BasisMeasurement, PortfolioError> {
+    positions.iter().try_fold(
+        BasisMeasurement::Complete(Money::new(Decimal::ZERO, currency)),
+        |total, position| match (total, measurement(position)) {
+            (BasisMeasurement::Complete(total), BasisMeasurement::Complete(value)) => total
+                .checked_add(value)
+                .map(BasisMeasurement::Complete)
+                .map_err(|_| PortfolioError::Arithmetic),
+            (BasisMeasurement::Incomplete, _) | (_, BasisMeasurement::Incomplete) => {
+                Ok(BasisMeasurement::Incomplete)
+            }
+        },
+    )
 }
 
 fn revision_id(
@@ -308,6 +332,11 @@ fn revision_id(
         );
         digest.update(entry.occurred_at.unix_nanos().to_be_bytes());
         hash_bytes(&mut digest, entry.source.as_str().as_bytes());
+        if let Some(normalized) = &entry.normalized_evidence {
+            hash_normalized_transaction_evidence(&mut digest, normalized);
+        } else {
+            digest.update([0]);
+        }
         match &entry.kind {
             LedgerEntryKind::Trade(trade) => {
                 digest.update([trade.side as u8]);
@@ -358,6 +387,60 @@ fn revision_id(
     PortfolioRevisionId(digest.finalize().into())
 }
 
+fn hash_normalized_transaction_evidence(
+    digest: &mut Sha256,
+    evidence: &NormalizedPortfolioTransactionEvidence,
+) {
+    digest.update([1]);
+    hash_bytes(digest, evidence.source_id().as_str().as_bytes());
+    hash_bytes(digest, evidence.logical_record_id().as_str().as_bytes());
+    hash_bytes(digest, evidence.source_revision().as_str().as_bytes());
+    if let Some(prior) = evidence.supersedes_source_revision() {
+        digest.update([1]);
+        hash_bytes(digest, prior.as_str().as_bytes());
+    } else {
+        digest.update([0]);
+    }
+    digest.update(evidence.revision().get().to_be_bytes());
+    hash_bytes(digest, evidence.raw_source_reference().as_str().as_bytes());
+    let raw_digest = evidence.raw_payload_digest();
+    digest.update([match raw_digest.algorithm() {
+        DigestAlgorithm::Sha256 => 0,
+        DigestAlgorithm::Blake3 => 1,
+    }]);
+    digest.update(raw_digest.bytes());
+    hash_bytes(digest, evidence.broker_transaction_id().as_str().as_bytes());
+    digest.update(evidence.account_id().as_uuid().as_bytes());
+    if let Some(instrument_id) = evidence.instrument_id() {
+        digest.update([1]);
+        digest.update(instrument_id.as_uuid().as_bytes());
+    } else {
+        digest.update([0]);
+    }
+    digest.update([match evidence.classification() {
+        NormalizedPortfolioTransactionClass::Trade => 0,
+        NormalizedPortfolioTransactionClass::CashTransfer => 1,
+        NormalizedPortfolioTransactionClass::Income => 2,
+        NormalizedPortfolioTransactionClass::Fee => 3,
+        NormalizedPortfolioTransactionClass::CorporateAction => 4,
+    }]);
+    hash_money(digest, evidence.amount());
+    if let Some(quantity) = evidence.quantity() {
+        digest.update([1]);
+        hash_decimal(digest, quantity);
+    } else {
+        digest.update([0]);
+    }
+    digest.update(evidence.occurred_at().unix_nanos().to_be_bytes());
+    digest.update([match evidence.lot_method() {
+        None => 0,
+        Some(NormalizedPortfolioLotMethod::Fifo) => 1,
+        Some(NormalizedPortfolioLotMethod::Lifo) => 2,
+        Some(NormalizedPortfolioLotMethod::SpecificIdentification) => 3,
+        Some(NormalizedPortfolioLotMethod::AverageCost) => 4,
+    }]);
+}
+
 fn hash_money(digest: &mut Sha256, money: Money) {
     hash_decimal(digest, money.amount());
     hash_bytes(digest, money.currency().as_str().as_bytes());
@@ -377,7 +460,7 @@ fn estimate_retained(
     cash_balances: &[CashBalance],
     active_entries: &BTreeMap<SourceIdentifier, LedgerEntry>,
     seen_revisions: &BTreeSet<(SourceIdentifier, u32)>,
-    plans: &[CorporateActionPlan],
+    plan: Option<&CorporateActionPlan>,
     evidence: &RevisionEvidence,
 ) -> Result<usize, PortfolioError> {
     let lot_count = positions.iter().try_fold(0_usize, |total, position| {
@@ -421,7 +504,7 @@ fn estimate_retained(
             .checked_add(bytes)
             .ok_or(PortfolioError::Arithmetic)?;
     }
-    for plan in plans {
+    if let Some(plan) = plan {
         retained = retained
             .checked_add(plan.retained_bytes())
             .ok_or(PortfolioError::Arithmetic)?;

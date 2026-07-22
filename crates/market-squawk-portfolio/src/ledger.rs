@@ -1,17 +1,20 @@
 //! Deterministic immutable portfolio revision publication.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::str::FromStr;
 
 use crate::evidence::{CorporateActionBinding, PortfolioRevision, RevisionEvidence, ValuationSet};
 use crate::publication::build_revision;
 use crate::transaction::{
     CashFlow, CashFlowKind, LedgerEntry, LedgerEntryKind, Task10EconomicKind,
-    Task10TransactionInstruction, TransactionRevision,
+    Task10TransactionInstruction, Trade, TradeSide, TransactionRevision,
 };
-use crate::{PortfolioError, PortfolioLimits};
+use crate::{PortfolioError, PortfolioLimits, checked_decimal_div};
 use market_squawk_data::CorporateActionPlan;
-use market_squawk_domain::{AccountId, Currency, Money, SourceIdentifier, TransactionObservation};
+use market_squawk_domain::{
+    AccountId, Currency, Money, NormalizedPortfolioLotMethod, NormalizedPortfolioTransactionClass,
+    NormalizedPortfolioTransactionEvidence, SourceIdentifier,
+};
+use rust_decimal::Decimal;
 
 /// Deterministic immutable-revision publisher for one canonical account.
 #[derive(Clone, Debug)]
@@ -21,7 +24,7 @@ pub struct PortfolioLedger {
     pub(crate) limits: PortfolioLimits,
     pub(crate) active_entries: BTreeMap<SourceIdentifier, LedgerEntry>,
     pub(crate) seen_revisions: BTreeSet<(SourceIdentifier, u32)>,
-    pub(crate) plans: Vec<CorporateActionPlan>,
+    pub(crate) plan: Option<CorporateActionPlan>,
     pub(crate) history: Vec<PortfolioRevision>,
 }
 
@@ -45,7 +48,7 @@ impl PortfolioLedger {
             limits,
             active_entries: BTreeMap::new(),
             seen_revisions: BTreeSet::new(),
-            plans: Vec::new(),
+            plan: None,
             history: Vec::new(),
         })
     }
@@ -68,7 +71,8 @@ impl PortfolioLedger {
         valuation: ValuationSet,
         evidence: RevisionEvidence,
     ) -> Result<PortfolioRevision, PortfolioError> {
-        self.validate_bindings(&entries, corporate_actions, &valuation, &evidence)?;
+        let candidate_plan = next_plan(self.plan.as_ref(), corporate_actions)?;
+        self.validate_bindings(&entries, candidate_plan.as_ref(), &valuation, &evidence)?;
         if entries.len() > self.limits.max_transactions {
             return Err(PortfolioError::LimitExceeded {
                 resource: "transactions",
@@ -103,18 +107,6 @@ impl PortfolioLedger {
                 self.limits,
             )?;
         }
-        let mut candidate_plans = self.plans.clone();
-        if let Some(plan) = corporate_actions {
-            let binding = CorporateActionBinding::from_plan(plan);
-            if candidate_plans
-                .iter()
-                .any(|prior| prior.content_hash() == binding.content_identity)
-            {
-                return Err(PortfolioError::EvidenceMismatch);
-            }
-            candidate_plans.push(plan.clone());
-            candidate_plans.sort_unstable_by_key(CorporateActionPlan::valuation_cutoff);
-        }
         let previous_revision_id = self.history.last().map(PortfolioRevision::id);
         let revision = build_revision(
             self.account_id,
@@ -122,7 +114,7 @@ impl PortfolioLedger {
             self.limits,
             &candidate_entries,
             &candidate_seen,
-            &candidate_plans,
+            candidate_plan.as_ref(),
             previous_revision_id,
             valuation,
             evidence,
@@ -136,17 +128,16 @@ impl PortfolioLedger {
         }
         self.active_entries = candidate_entries;
         self.seen_revisions = candidate_seen;
-        self.plans = candidate_plans;
+        self.plan = candidate_plan;
         self.history.push(revision.clone());
         Ok(revision)
     }
 
-    /// Applies normalized Task 10 transactions under explicit revision/economic instructions.
+    /// Applies checked normalized Task 10 evidence under ambiguity-only caller policies.
     ///
-    /// Task 10 intentionally preserves source classifications that do not distinguish dividend
-    /// from interest or buy from cover. Therefore every normalized broker transaction requires one
-    /// matching instruction. Corporate-action markers are not interpreted economically; their
-    /// economics must be supplied by the Task 11 plan passed to this method.
+    /// Source amount, quantity, instrument, occurrence, lot method, raw digest, and correction
+    /// lineage are accepted only from the shared evidence contract. Instructions may resolve only
+    /// income classification and buy/sell versus short/cover lifecycle ambiguity.
     ///
     /// # Errors
     ///
@@ -154,13 +145,13 @@ impl PortfolioLedger {
     /// amounts, missing Task 11 action plans, or any error from [`Self::try_apply`].
     pub fn try_apply_import(
         &mut self,
-        transactions: &[TransactionObservation],
+        transactions: &[NormalizedPortfolioTransactionEvidence],
         instructions: &[Task10TransactionInstruction],
         corporate_actions: Option<&CorporateActionPlan>,
         valuation: ValuationSet,
         evidence: RevisionEvidence,
     ) -> Result<PortfolioRevision, PortfolioError> {
-        if transactions.len() != instructions.len()
+        if transactions.len() > self.limits.max_transactions
             || instructions.len() > self.limits.max_transactions
         {
             return Err(PortfolioError::AmbiguousNormalizedRecord);
@@ -172,20 +163,55 @@ impl PortfolioLedger {
         if instruction_map.len() != instructions.len() {
             return Err(PortfolioError::AmbiguousNormalizedRecord);
         }
+        let mut used_instructions = BTreeSet::new();
         let mut entries = Vec::new();
         entries
             .try_reserve_exact(transactions.len())
             .map_err(|_| PortfolioError::AllocationFailed)?;
         for transaction in transactions {
             let instruction = instruction_map
-                .get(transaction.source_record_id())
-                .copied()
-                .ok_or(PortfolioError::AmbiguousNormalizedRecord)?;
-            if let Some(entry) = translate_task10(transaction, instruction, corporate_actions)? {
+                .get(transaction.broker_transaction_id())
+                .copied();
+            if instruction.is_some() {
+                used_instructions.insert(transaction.broker_transaction_id());
+            }
+            let supersedes = self.import_supersession(transaction)?;
+            if let Some(entry) = translate_task10(
+                transaction,
+                instruction,
+                supersedes,
+                corporate_actions.or(self.plan.as_ref()),
+            )? {
                 entries.push(entry);
             }
         }
+        if used_instructions.len() != instruction_map.len() {
+            return Err(PortfolioError::AmbiguousNormalizedRecord);
+        }
         self.try_apply(entries, corporate_actions, valuation, evidence)
+    }
+
+    fn import_supersession(
+        &self,
+        evidence: &NormalizedPortfolioTransactionEvidence,
+    ) -> Result<Option<market_squawk_domain::RevisionNumber>, PortfolioError> {
+        let Some(prior_source_revision) = evidence.supersedes_source_revision() else {
+            return Ok(None);
+        };
+        let current = self
+            .active_entries
+            .get(evidence.broker_transaction_id())
+            .ok_or(PortfolioError::SupersessionMismatch)?;
+        let current_evidence = current
+            .normalized_evidence
+            .as_ref()
+            .ok_or(PortfolioError::SupersessionMismatch)?;
+        if current_evidence.logical_record_id() != evidence.logical_record_id()
+            || current_evidence.source_revision() != prior_source_revision
+        {
+            return Err(PortfolioError::SupersessionMismatch);
+        }
+        Ok(Some(current.transaction.revision))
     }
 
     /// Returns immutable published revision history in publication order.
@@ -220,27 +246,99 @@ impl PortfolioLedger {
     }
 }
 
+fn next_plan(
+    current: Option<&CorporateActionPlan>,
+    supplied: Option<&CorporateActionPlan>,
+) -> Result<Option<CorporateActionPlan>, PortfolioError> {
+    let Some(candidate) = supplied else {
+        return Ok(current.cloned());
+    };
+    let Some(current) = current else {
+        return Ok(Some(candidate.clone()));
+    };
+    if candidate == current {
+        return Ok(Some(current.clone()));
+    }
+    if candidate.policy() != current.policy()
+        || candidate.knowledge_cutoff() < current.knowledge_cutoff()
+        || candidate.valuation_cutoff() < current.valuation_cutoff()
+        || current
+            .admitted()
+            .iter()
+            .any(|prior| !candidate.admitted().contains(prior))
+    {
+        return Err(PortfolioError::EvidenceMismatch);
+    }
+    Ok(Some(candidate.clone()))
+}
+
 fn translate_task10(
-    transaction: &TransactionObservation,
-    instruction: &Task10TransactionInstruction,
+    transaction: &NormalizedPortfolioTransactionEvidence,
+    instruction: Option<&Task10TransactionInstruction>,
+    supersedes: Option<market_squawk_domain::RevisionNumber>,
     corporate_actions: Option<&CorporateActionPlan>,
 ) -> Result<Option<LedgerEntry>, PortfolioError> {
-    if instruction.broker_transaction_id() != transaction.source_record_id()
-        || instruction.revision() != transaction.context().time().revision()
+    if instruction
+        .is_some_and(|policy| policy.broker_transaction_id() != transaction.broker_transaction_id())
     {
         return Err(PortfolioError::AmbiguousNormalizedRecord);
     }
-    let classification = transaction.transaction_type().as_str();
-    let context_instrument = transaction.context().provenance().instrument_id();
-    let kind = match (classification, instruction.economic_kind()) {
-        ("trade", Task10EconomicKind::Trade { trade })
-            if context_instrument == Some(trade.instrument_id()) =>
-        {
-            LedgerEntryKind::Trade(trade.clone())
+    let amount = transaction.amount();
+    let magnitude = Money::new(amount.amount().abs(), amount.currency());
+    let kind = match (
+        transaction.classification(),
+        instruction.map(|value| value.economic_kind()),
+    ) {
+        (
+            NormalizedPortfolioTransactionClass::Trade,
+            Some(Task10EconomicKind::Trade {
+                side,
+                lot_selection,
+            }),
+        ) => {
+            let signed_quantity = transaction
+                .quantity()
+                .ok_or(PortfolioError::AmbiguousNormalizedRecord)?;
+            let side_matches_sign = if signed_quantity.is_sign_positive() {
+                matches!(side, TradeSide::Buy | TradeSide::BuyToCover)
+            } else {
+                matches!(side, TradeSide::Sell | TradeSide::SellShort)
+            };
+            let method_matches = match transaction.lot_method() {
+                Some(NormalizedPortfolioLotMethod::Fifo) => {
+                    matches!(lot_selection, crate::LotSelection::Fifo)
+                }
+                Some(NormalizedPortfolioLotMethod::SpecificIdentification) => {
+                    matches!(
+                        lot_selection,
+                        crate::LotSelection::SpecificIdentification(_)
+                    )
+                }
+                Some(
+                    NormalizedPortfolioLotMethod::Lifo | NormalizedPortfolioLotMethod::AverageCost,
+                )
+                | None => false,
+            };
+            if !side_matches_sign || !method_matches {
+                return Err(PortfolioError::AmbiguousNormalizedRecord);
+            }
+            let quantity = signed_quantity.abs();
+            let price = Money::new(
+                checked_decimal_div(magnitude.amount(), quantity)?,
+                amount.currency(),
+            );
+            LedgerEntryKind::Trade(Trade::try_new(
+                *side,
+                transaction
+                    .instrument_id()
+                    .ok_or(PortfolioError::AmbiguousNormalizedRecord)?,
+                quantity,
+                price,
+                Money::new(Decimal::ZERO, amount.currency()),
+                lot_selection.clone(),
+            )?)
         }
-        ("cash_transfer", Task10EconomicKind::CashTransfer { amount })
-            if context_instrument.is_none() =>
-        {
+        (NormalizedPortfolioTransactionClass::CashTransfer, None) => {
             if amount.amount().is_zero() {
                 return Err(PortfolioError::AmbiguousNormalizedRecord);
             }
@@ -249,65 +347,33 @@ fn translate_task10(
             } else {
                 CashFlowKind::Withdrawal
             };
-            LedgerEntryKind::CashFlow(CashFlow::try_new(
-                flow_kind,
-                Money::new(amount.amount().abs(), amount.currency()),
-                None,
-            )?)
+            LedgerEntryKind::CashFlow(CashFlow::try_new(flow_kind, magnitude, None)?)
         }
-        (
-            "income",
-            Task10EconomicKind::Dividend {
-                amount,
-                instrument_id,
-            },
-        ) if context_instrument == Some(*instrument_id) && !amount.amount().is_zero() => {
+        (NormalizedPortfolioTransactionClass::Income, Some(Task10EconomicKind::Dividend)) => {
             LedgerEntryKind::CashFlow(CashFlow::try_new(
                 CashFlowKind::Dividend,
-                *amount,
-                Some(*instrument_id),
+                magnitude,
+                transaction.instrument_id(),
             )?)
         }
-        (
-            "income",
-            Task10EconomicKind::Interest {
-                amount,
-                instrument_id,
-            },
-        ) if context_instrument == *instrument_id && !amount.amount().is_zero() => {
+        (NormalizedPortfolioTransactionClass::Income, Some(Task10EconomicKind::Interest)) => {
             LedgerEntryKind::CashFlow(CashFlow::try_new(
                 CashFlowKind::Interest,
-                *amount,
-                *instrument_id,
+                magnitude,
+                transaction.instrument_id(),
             )?)
         }
-        (
-            "income",
-            Task10EconomicKind::Withholding {
-                amount,
-                instrument_id,
-            },
-        ) if context_instrument == *instrument_id && !amount.amount().is_zero() => {
+        (NormalizedPortfolioTransactionClass::Income, Some(Task10EconomicKind::Withholding)) => {
             LedgerEntryKind::CashFlow(CashFlow::try_new(
                 CashFlowKind::Withholding,
-                *amount,
-                *instrument_id,
+                magnitude,
+                transaction.instrument_id(),
             )?)
         }
-        (
-            "fee",
-            Task10EconomicKind::Fee {
-                amount,
-                instrument_id,
-            },
-        ) if context_instrument == *instrument_id && !amount.amount().is_zero() => {
-            LedgerEntryKind::CashFlow(CashFlow::try_new(
-                CashFlowKind::Fee,
-                *amount,
-                *instrument_id,
-            )?)
-        }
-        ("corporate_action", Task10EconomicKind::CorporateActionMarker) => {
+        (NormalizedPortfolioTransactionClass::Fee, None) => LedgerEntryKind::CashFlow(
+            CashFlow::try_new(CashFlowKind::Fee, magnitude, transaction.instrument_id())?,
+        ),
+        (NormalizedPortfolioTransactionClass::CorporateAction, None) => {
             if corporate_actions.is_none() {
                 return Err(PortfolioError::AmbiguousNormalizedRecord);
             }
@@ -315,29 +381,15 @@ fn translate_task10(
         }
         _ => return Err(PortfolioError::AmbiguousNormalizedRecord),
     };
-    let account_id = AccountId::from_str(transaction.account_id().as_str())
-        .map_err(|_| PortfolioError::AmbiguousNormalizedRecord)?;
-    let occurred_at = transaction
-        .context()
-        .time()
-        .effective()
-        .exact_timestamp()
-        .ok_or(PortfolioError::AmbiguousNormalizedRecord)?;
-    Ok(Some(LedgerEntry::try_new(
-        account_id,
+    Ok(Some(LedgerEntry::from_normalized_evidence(
         TransactionRevision::try_new(
-            transaction.source_record_id().clone(),
-            instruction.revision(),
-            instruction.supersedes(),
+            transaction.broker_transaction_id().clone(),
+            transaction.revision(),
+            supersedes,
         )?,
-        occurred_at,
-        transaction
-            .context()
-            .provenance()
-            .source_identifier()
-            .clone(),
         kind,
-    )?))
+        transaction.clone(),
+    )))
 }
 
 fn admit_entry(

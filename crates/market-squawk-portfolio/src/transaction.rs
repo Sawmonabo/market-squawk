@@ -1,7 +1,8 @@
 //! Normalized transaction, cash-flow, and source-revision models.
 
 use market_squawk_domain::{
-    AccountId, InstrumentId, Money, RevisionNumber, SourceIdentifier, Timestamp,
+    AccountId, InstrumentId, Money, NormalizedPortfolioTransactionEvidence, RevisionNumber,
+    SourceIdentifier, Timestamp,
 };
 use rust_decimal::Decimal;
 
@@ -223,6 +224,7 @@ pub struct LedgerEntry {
     pub(crate) occurred_at: Timestamp,
     pub(crate) source: SourceIdentifier,
     pub(crate) kind: LedgerEntryKind,
+    pub(crate) normalized_evidence: Option<NormalizedPortfolioTransactionEvidence>,
 }
 
 impl LedgerEntry {
@@ -244,7 +246,23 @@ impl LedgerEntry {
             occurred_at,
             source,
             kind,
+            normalized_evidence: None,
         })
+    }
+
+    pub(crate) fn from_normalized_evidence(
+        transaction: TransactionRevision,
+        kind: LedgerEntryKind,
+        evidence: NormalizedPortfolioTransactionEvidence,
+    ) -> Self {
+        Self {
+            account_id: evidence.account_id(),
+            occurred_at: evidence.occurred_at(),
+            source: evidence.raw_source_reference().clone(),
+            transaction,
+            kind,
+            normalized_evidence: Some(evidence),
+        }
     }
 
     /// Returns account binding.
@@ -276,43 +294,25 @@ impl LedgerEntry {
 /// Explicit economic interpretation for one normalized Task 10 transaction.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Task10EconomicKind {
-    /// Fully evidenced trade derived from Task 10 amount, quantity, instrument, and lot fields.
+    /// Resolves only the lifecycle ambiguity left by signed Task 10 trade evidence.
     Trade {
-        /// Closed accounting trade constructed from normalized scalars.
-        trade: Trade,
+        /// Buy/sell/short/cover interpretation consistent with the evidenced quantity sign.
+        side: TradeSide,
+        /// Disposal policy constrained by the evidenced source lot method.
+        lot_selection: LotSelection,
     },
-    /// Signed external transfer; sign chooses deposit or withdrawal.
-    CashTransfer { amount: Money },
-    /// Positive dividend magnitude and optional instrument binding.
-    Dividend {
-        amount: Money,
-        instrument_id: InstrumentId,
-    },
-    /// Positive interest magnitude and optional instrument binding.
-    Interest {
-        amount: Money,
-        instrument_id: Option<InstrumentId>,
-    },
-    /// Positive tax-withholding magnitude and optional instrument binding.
-    Withholding {
-        amount: Money,
-        instrument_id: Option<InstrumentId>,
-    },
-    /// Positive standalone fee magnitude and optional instrument binding.
-    Fee {
-        amount: Money,
-        instrument_id: Option<InstrumentId>,
-    },
-    /// Task 10 marker whose economics must come from the supplied Task 11 action plan.
-    CorporateActionMarker,
+    /// Resolves source-classified income as dividend income.
+    Dividend,
+    /// Resolves source-classified income as interest income.
+    Interest,
+    /// Resolves source-classified income as tax withholding.
+    Withholding,
 }
 
 /// Source-revision and economic policy for one Task 10 broker transaction.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Task10TransactionInstruction {
     broker_transaction_id: SourceIdentifier,
-    revision: RevisionNumber,
-    supersedes: Option<RevisionNumber>,
     economic_kind: Task10EconomicKind,
 }
 
@@ -321,20 +321,16 @@ impl Task10TransactionInstruction {
     ///
     /// # Errors
     ///
-    /// Rejects non-advancing supersession.
+    /// Retains only a genuine classification/lot-policy interpretation.
     pub fn try_new(
         broker_transaction_id: SourceIdentifier,
-        revision: RevisionNumber,
-        supersedes: Option<RevisionNumber>,
         economic_kind: Task10EconomicKind,
     ) -> Result<Self, PortfolioError> {
-        if supersedes.is_some_and(|prior| prior.get() >= revision.get()) {
-            return Err(PortfolioError::NonIncreasingRevision);
+        if let Task10EconomicKind::Trade { lot_selection, .. } = &economic_kind {
+            lot_selection.validate()?;
         }
         Ok(Self {
             broker_transaction_id,
-            revision,
-            supersedes,
             economic_kind,
         })
     }
@@ -342,16 +338,6 @@ impl Task10TransactionInstruction {
     /// Returns the stable Task 10 broker identity.
     pub const fn broker_transaction_id(&self) -> &SourceIdentifier {
         &self.broker_transaction_id
-    }
-
-    /// Returns explicit source revision.
-    pub const fn revision(&self) -> RevisionNumber {
-        self.revision
-    }
-
-    /// Returns exact correction predecessor.
-    pub const fn supersedes(&self) -> Option<RevisionNumber> {
-        self.supersedes
     }
 
     /// Returns the economic interpretation policy.

@@ -26,9 +26,9 @@ use thiserror::Error;
 
 pub use attribution::{AttributionInput, AttributionLine, AttributionReport};
 pub use evidence::{
-    CashBalance, CorporateActionBinding, FeatureBinding, FxRateEvidence, PortfolioRevision,
-    PortfolioRevisionId, PortfolioRevisionToken, Position, PriceEvidence, RevisionEvidence,
-    ValuationSet,
+    BasisMeasurement, CashBalance, CorporateActionBinding, FeatureBinding, FxRateEvidence,
+    PortfolioRevision, PortfolioRevisionId, PortfolioRevisionToken, Position, PriceEvidence,
+    RevisionEvidence, ValuationSet,
 };
 pub use exposure::{ExposureLine, ExposureReport, FactorLoading, InstrumentClassification};
 pub use ledger::PortfolioLedger;

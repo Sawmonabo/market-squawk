@@ -176,7 +176,9 @@ impl PortfolioRevision {
                 totals,
                 ReconciliationField::CostBasis,
                 totals.cost_basis,
-                self.cost_basis(),
+                self.cost_basis()
+                    .complete()
+                    .ok_or(PortfolioError::Reconciliation)?,
                 limits,
             )?;
         }

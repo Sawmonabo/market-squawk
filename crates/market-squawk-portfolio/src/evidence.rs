@@ -427,6 +427,30 @@ pub struct CashBalance {
     pub(crate) amount: Money,
 }
 
+/// Basis-dependent value that is either exact or explicitly unavailable pending allocation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BasisMeasurement {
+    /// Every contributing lot has complete basis evidence.
+    Complete(Money),
+    /// At least one contributing lot lacks an evidenced basis allocation.
+    Incomplete,
+}
+
+impl BasisMeasurement {
+    /// Returns the exact value only when every contributing basis is complete.
+    pub const fn complete(self) -> Option<Money> {
+        match self {
+            Self::Complete(value) => Some(value),
+            Self::Incomplete => None,
+        }
+    }
+
+    /// Returns whether an exact value is available.
+    pub const fn is_complete(self) -> bool {
+        matches!(self, Self::Complete(_))
+    }
+}
+
 impl CashBalance {
     /// Returns balance currency.
     pub const fn currency(self) -> Currency {
@@ -444,10 +468,9 @@ impl CashBalance {
 pub struct Position {
     pub(crate) instrument_id: InstrumentId,
     pub(crate) quantity: Decimal,
-    pub(crate) cost_basis: Money,
+    pub(crate) cost_basis: BasisMeasurement,
     pub(crate) market_value: Money,
-    pub(crate) unrealized_gain: Money,
-    pub(crate) basis_complete: bool,
+    pub(crate) unrealized_gain: BasisMeasurement,
     pub(crate) lots: Vec<Lot>,
 }
 
@@ -463,7 +486,7 @@ impl Position {
     }
 
     /// Returns aggregate long basis plus retained short opening proceeds.
-    pub const fn cost_basis(&self) -> Money {
+    pub const fn cost_basis(&self) -> BasisMeasurement {
         self.cost_basis
     }
 
@@ -473,13 +496,13 @@ impl Position {
     }
 
     /// Returns exact reporting-currency unrealized gain.
-    pub const fn unrealized_gain(&self) -> Money {
+    pub const fn unrealized_gain(&self) -> BasisMeasurement {
         self.unrealized_gain
     }
 
     /// Returns whether every component lot has completely allocated basis evidence.
     pub const fn basis_complete(&self) -> bool {
-        self.basis_complete
+        self.cost_basis.is_complete()
     }
 
     /// Returns open lots in deterministic opening order.
@@ -499,9 +522,9 @@ pub struct PortfolioRevision {
     pub(crate) cash_balances: Vec<CashBalance>,
     pub(crate) positions: Vec<Position>,
     pub(crate) market_value: Money,
-    pub(crate) cost_basis: Money,
+    pub(crate) cost_basis: BasisMeasurement,
     pub(crate) realized_gain: Money,
-    pub(crate) unrealized_gain: Money,
+    pub(crate) unrealized_gain: BasisMeasurement,
     pub(crate) income: Money,
     pub(crate) withholding: Money,
     pub(crate) fees: Money,
@@ -511,7 +534,7 @@ pub struct PortfolioRevision {
     pub(crate) retained_bytes: usize,
     pub(crate) active_entries: BTreeMap<SourceIdentifier, LedgerEntry>,
     pub(crate) seen_revisions: BTreeSet<(SourceIdentifier, u32)>,
-    pub(crate) plans: Vec<CorporateActionPlan>,
+    pub(crate) plan: Option<CorporateActionPlan>,
     pub(crate) limits: PortfolioLimits,
 }
 
@@ -570,7 +593,7 @@ impl PortfolioRevision {
     }
 
     /// Returns aggregate open long basis and short opening proceeds.
-    pub const fn cost_basis(&self) -> Money {
+    pub const fn cost_basis(&self) -> BasisMeasurement {
         self.cost_basis
     }
 
@@ -580,7 +603,7 @@ impl PortfolioRevision {
     }
 
     /// Returns current valuation gain over open basis/proceeds.
-    pub const fn unrealized_gain(&self) -> Money {
+    pub const fn unrealized_gain(&self) -> BasisMeasurement {
         self.unrealized_gain
     }
 
@@ -636,7 +659,7 @@ impl PortfolioRevision {
             limits: self.limits,
             active_entries: self.active_entries,
             seen_revisions: self.seen_revisions,
-            plans: self.plans,
+            plan: self.plan,
             history,
         })
     }

@@ -5,8 +5,8 @@ use std::fmt;
 
 use bytes::Bytes;
 use market_squawk_domain::{
-    AccountId, Currency, DataQuality, EvidenceDigest, MetadataRevision, RevisionNumber, SourceId,
-    SourceIdentifier,
+    AccountId, Currency, DataQuality, EvidenceDigest, MetadataRevision,
+    NormalizedPortfolioTransactionEvidence, RevisionNumber, SourceId, SourceIdentifier,
 };
 use market_squawk_platform::{LocalAuthorityStateStore, SecretReference};
 use market_squawk_sources::{ExtractionBatch, ExtractionRecord};
@@ -127,6 +127,7 @@ pub struct PortfolioImport {
     accounts: Vec<AccountObservation>,
     holdings: Vec<HoldingObservation>,
     transactions: Vec<PortfolioTransaction>,
+    transaction_evidence: Vec<NormalizedPortfolioTransactionEvidence>,
     cash_flows: Vec<CashFlowObservation>,
     cost_bases: Vec<CostBasisObservation>,
     supplied_totals: Vec<SuppliedTotals>,
@@ -154,6 +155,10 @@ impl PortfolioImport {
     /// Returns checked transactions in source order.
     pub fn transactions(&self) -> &[PortfolioTransaction] {
         &self.transactions
+    }
+    /// Returns source-neutral transaction evidence bound to exact raw bytes and revision lineage.
+    pub fn transaction_evidence(&self) -> &[NormalizedPortfolioTransactionEvidence] {
+        &self.transaction_evidence
     }
     /// Returns cash flows derived exactly from transaction amounts.
     pub fn cash_flows(&self) -> &[CashFlowObservation] {
@@ -186,6 +191,7 @@ impl fmt::Debug for PortfolioImport {
             .field("accounts", &self.accounts.len())
             .field("holdings", &self.holdings.len())
             .field("transactions", &self.transactions.len())
+            .field("transaction_evidence", &self.transaction_evidence.len())
             .field("discrepancies", &self.discrepancies.len())
             .field("payloads", &"[REDACTED]")
             .finish()
@@ -689,6 +695,7 @@ fn portfolio_import(
         accounts: normalized.accounts,
         holdings: normalized.holdings,
         transactions: normalized.transactions,
+        transaction_evidence: normalized.transaction_evidence,
         cash_flows: normalized.cash_flows,
         cost_bases: normalized.cost_bases,
         supplied_totals: normalized.supplied_totals,

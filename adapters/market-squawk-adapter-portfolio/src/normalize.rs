@@ -4,9 +4,11 @@ use std::collections::BTreeMap;
 use std::str::FromStr;
 
 use market_squawk_domain::{
-    AccountId, Currency, DataQuality, InstrumentId, LotSize, Money, PositionObservation,
-    PositionSide, QuantityLots, ResearchObservation, RevisionNumber, SourceId, SourceIdentifier,
-    Timestamp, TransactionObservation,
+    AccountId, Currency, DataQuality, InstrumentId, LotSize, Money, NormalizedPortfolioLotMethod,
+    NormalizedPortfolioTransactionClass, NormalizedPortfolioTransactionEvidence,
+    NormalizedPortfolioTransactionEvidenceInput, PositionObservation, PositionSide, QuantityLots,
+    ResearchObservation, RevisionNumber, SourceId, SourceIdentifier, Timestamp,
+    TransactionObservation,
 };
 use market_squawk_sources::ExtractionBatch;
 use rust_decimal::Decimal;
@@ -43,6 +45,7 @@ pub(crate) struct NormalizedImport {
     pub(crate) accounts: Vec<AccountObservation>,
     pub(crate) holdings: Vec<HoldingObservation>,
     pub(crate) transactions: Vec<PortfolioTransaction>,
+    pub(crate) transaction_evidence: Vec<NormalizedPortfolioTransactionEvidence>,
     pub(crate) cash_flows: Vec<CashFlowObservation>,
     pub(crate) cost_bases: Vec<CostBasisObservation>,
     pub(crate) supplied_totals: Vec<SuppliedTotals>,
@@ -64,6 +67,7 @@ pub(crate) fn normalize_batch(
         accounts: Vec::new(),
         holdings: Vec::new(),
         transactions: Vec::new(),
+        transaction_evidence: Vec::new(),
         cash_flows: Vec::new(),
         cost_bases: Vec::new(),
         supplied_totals: Vec::new(),
@@ -328,6 +332,28 @@ pub(crate) fn normalize_batch(
                     lot_method,
                     raw.source_reference().clone(),
                 ));
+                normalized.transaction_evidence.push(
+                    NormalizedPortfolioTransactionEvidence::try_new(
+                        NormalizedPortfolioTransactionEvidenceInput {
+                            source_id: source_id.clone(),
+                            logical_record_id: record_id.clone(),
+                            source_revision: record.revision().clone(),
+                            supersedes_source_revision: state.supersedes_revision.clone(),
+                            revision: revision_number,
+                            raw_source_reference: raw.source_reference().clone(),
+                            raw_payload_digest: raw.payload_hash(),
+                            broker_transaction_id: broker_transaction_id.clone(),
+                            account_id,
+                            instrument_id,
+                            classification: normalized_transaction_class(kind),
+                            amount,
+                            quantity: quantity.map(SignedQuantity::as_decimal),
+                            occurred_at,
+                            lot_method: lot_method.map(normalized_lot_method),
+                        },
+                    )
+                    .map_err(|_| PortfolioImportError::InvalidTransaction)?,
+                );
                 state.broker_account_id = Some(account_id);
                 state.broker_transaction_id = Some(broker_transaction_id);
             }
@@ -501,6 +527,27 @@ fn transaction_kind_identifier(
         TransactionKind::Fee => "fee",
         TransactionKind::CorporateAction => "corporate_action",
     })
+}
+
+const fn normalized_transaction_class(
+    kind: TransactionKind,
+) -> NormalizedPortfolioTransactionClass {
+    match kind {
+        TransactionKind::Trade => NormalizedPortfolioTransactionClass::Trade,
+        TransactionKind::CashTransfer => NormalizedPortfolioTransactionClass::CashTransfer,
+        TransactionKind::Income => NormalizedPortfolioTransactionClass::Income,
+        TransactionKind::Fee => NormalizedPortfolioTransactionClass::Fee,
+        TransactionKind::CorporateAction => NormalizedPortfolioTransactionClass::CorporateAction,
+    }
+}
+
+const fn normalized_lot_method(method: LotMethod) -> NormalizedPortfolioLotMethod {
+    match method {
+        LotMethod::Fifo => NormalizedPortfolioLotMethod::Fifo,
+        LotMethod::Lifo => NormalizedPortfolioLotMethod::Lifo,
+        LotMethod::SpecificIdentification => NormalizedPortfolioLotMethod::SpecificIdentification,
+        LotMethod::AverageCost => NormalizedPortfolioLotMethod::AverageCost,
+    }
 }
 
 const fn cash_flow_kind(kind: TransactionKind) -> Option<CashFlowKind> {

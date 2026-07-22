@@ -10,8 +10,9 @@ use market_squawk_adapter_portfolio::{
 use market_squawk_data::{ResearchArrowBatch, extraction_batch_digest};
 use market_squawk_domain::{
     AccountId, DataQuality, DigestAlgorithm, EffectiveInterval, EvidenceDigest,
-    ExactPayloadEvidence, InstrumentId, MetadataRevision, ResearchObservation, RevisionNumber,
-    SourceId, SourceIdentifier, Timestamp,
+    ExactPayloadEvidence, InstrumentId, MetadataRevision, NormalizedPortfolioLotMethod,
+    NormalizedPortfolioTransactionClass, ResearchObservation, RevisionNumber, SourceId,
+    SourceIdentifier, Timestamp,
 };
 use market_squawk_platform::{LocalAuthorityStateStore, SecretReference};
 use market_squawk_sources::{
@@ -62,6 +63,7 @@ fn import_preserves_exact_records_normalizes_typed_portfolio_and_replays_for_dat
     assert_eq!(imported.accounts().len(), 2);
     assert_eq!(imported.holdings().len(), 4);
     assert_eq!(imported.transactions().len(), 5);
+    assert_eq!(imported.transaction_evidence().len(), 5);
     assert_eq!(imported.cash_flows().len(), 3);
     assert_eq!(imported.cost_bases().len(), 2);
     assert_eq!(imported.supplied_totals().len(), 2);
@@ -128,6 +130,40 @@ fn import_preserves_exact_records_normalizes_typed_portfolio_and_replays_for_dat
         imported.transactions()[0].lot_method(),
         Some(LotMethod::Fifo)
     );
+    let transaction_evidence = &imported.transaction_evidence()[0];
+    assert_eq!(
+        transaction_evidence.classification(),
+        NormalizedPortfolioTransactionClass::Trade
+    );
+    assert_eq!(
+        transaction_evidence.logical_record_id().as_str(),
+        "transaction-trade"
+    );
+    assert_eq!(
+        transaction_evidence.source_revision().as_str(),
+        "statement-1"
+    );
+    assert_eq!(transaction_evidence.supersedes_source_revision(), None);
+    assert_eq!(transaction_evidence.revision(), RevisionNumber::new(1)?);
+    assert_eq!(
+        transaction_evidence.amount(),
+        imported.transactions()[0].amount()
+    );
+    assert_eq!(
+        transaction_evidence
+            .quantity()
+            .ok_or("normalized transaction quantity absent")?
+            .to_string(),
+        "-0.5"
+    );
+    assert_eq!(
+        transaction_evidence.lot_method(),
+        Some(NormalizedPortfolioLotMethod::Fifo)
+    );
+    assert!(imported.raw_records().iter().any(|raw| {
+        raw.source_reference() == transaction_evidence.raw_source_reference()
+            && raw.payload_hash() == transaction_evidence.raw_payload_digest()
+    }));
 
     let data_batch = ResearchArrowBatch::try_from_extraction_batch(imported.normalized_batch())?;
     assert_eq!(
@@ -249,6 +285,17 @@ fn duplicate_broker_ids_fail_after_raw_archive_and_corrections_supersede_without
         corrected.transactions()[0].amount().amount().to_string(),
         "10.25"
     );
+    let corrected_evidence = &corrected.transaction_evidence()[0];
+    assert_eq!(corrected_evidence.logical_record_id(), &stable_record_id);
+    assert_eq!(corrected_evidence.source_revision().as_str(), "statement-2");
+    assert_eq!(
+        corrected_evidence
+            .supersedes_source_revision()
+            .ok_or("corrected evidence predecessor absent")?
+            .as_str(),
+        "statement-1"
+    );
+    assert_eq!(corrected_evidence.revision(), revision_two);
     let corrected_lineage = transaction_lineage(corrected.normalized_batch())?;
     assert_eq!(corrected_lineage.len(), 2);
     assert!(

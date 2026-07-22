@@ -8,20 +8,23 @@ use market_squawk_data::{
     CorporateActionAdjustment, CorporateActionLimits, CorporateActionPlan, CorporateActionPolicy,
 };
 use market_squawk_domain::{
-    AvailabilityEvidence, Currency, DataQuality, Money, PayloadReference, ResearchContext,
-    ResearchProvenance, ResearchProvenanceInput, ResearchTime, RevisionNumber, SourceId,
-    SourceIdentifier, Timestamp, TransactionObservation,
+    CorporateActionKind, Currency, DigestAlgorithm, EvidenceDigest, Money,
+    NormalizedPortfolioTransactionClass, NormalizedPortfolioTransactionEvidence,
+    NormalizedPortfolioTransactionEvidenceInput, RevisionNumber, SourceId, SourceIdentifier,
+    Timestamp,
 };
 use market_squawk_portfolio::{
-    CashFlow, CashFlowKind, FxRateEvidence, LedgerEntry, LedgerEntryKind, LotSelection,
-    PortfolioError, PortfolioLedger, PortfolioLimitInput, PortfolioLimits, PriceEvidence,
-    ReconciliationTolerance, RevisionEvidence, SourcePortfolioTotals, Task10EconomicKind,
-    Task10TransactionInstruction, Trade, TradeSide, TransactionRevision, ValuationSet,
+    BasisMeasurement, CashFlow, CashFlowKind, FxRateEvidence, LedgerEntry, LedgerEntryKind,
+    LotSelection, PortfolioError, PortfolioLedger, PortfolioLimitInput, PortfolioLimits,
+    PriceEvidence, ReconciliationTolerance, RevisionEvidence, SourcePortfolioTotals, Trade,
+    TradeSide, TransactionRevision, ValuationSet,
 };
 use proptest::prelude::*;
 use rust_decimal::Decimal;
 
-use analytics::{account, corporate_action_records, dataset, instrument, money, source};
+use analytics::{
+    account, action_record, corporate_action_records, dataset, instrument, money, source,
+};
 
 type TestResult = Result<(), Box<dyn Error>>;
 
@@ -48,6 +51,24 @@ fn revision_evidence(marker: u8, at: i64) -> TestResultEvidence {
         vec![source(&format!("ledger-source-{marker}"))?],
         Vec::new(),
         None,
+    )?)
+}
+
+fn revision_evidence_with_plan(
+    marker: u8,
+    at: i64,
+    plan: &CorporateActionPlan,
+) -> TestResultEvidence {
+    Ok(RevisionEvidence::try_new(
+        Timestamp::from_unix_nanos(at),
+        dataset(marker)?,
+        market_squawk_data::Sha256Digest::new([marker; 32]),
+        market_squawk_data::Sha256Digest::new([marker.wrapping_add(1); 32]),
+        vec![source("corporate-actions")?],
+        Vec::new(),
+        Some(market_squawk_portfolio::CorporateActionBinding::from_plan(
+            plan,
+        )),
     )?)
 }
 
@@ -108,56 +129,211 @@ fn entry(
 
 #[test]
 fn normalized_task10_transaction_flows_through_the_immutable_ledger() -> TestResult {
-    let imported = task10_cash_transaction()?;
+    let imported = task10_cash_transaction(1)?;
     let usd = Currency::try_from("USD")?;
     let mut ledger = PortfolioLedger::try_new(account()?, usd, limits()?)?;
-    let instruction = Task10TransactionInstruction::try_new(
-        source("broker-deposit")?,
-        RevisionNumber::new(1)?,
-        None,
-        Task10EconomicKind::CashTransfer {
-            amount: money(100, usd),
-        },
-    )?;
     let revision = ledger.try_apply_import(
         &[imported],
-        &[instruction],
+        &[],
         None,
         valuation(10, 110, &[])?,
         revision_evidence(10, 110)?,
     )?;
     assert_eq!(revision.cash().amount(), Decimal::from(100_u32));
     assert_eq!(revision.evidence().dataset().manifest_version(), 10);
+
+    let mut different_ledger = PortfolioLedger::try_new(account()?, usd, limits()?)?;
+    let different_revision = different_ledger.try_apply_import(
+        &[task10_cash_transaction(2)?],
+        &[],
+        None,
+        valuation(10, 110, &[])?,
+        revision_evidence(10, 110)?,
+    )?;
+    assert_ne!(revision.id(), different_revision.id());
     Ok(())
 }
 
-fn task10_cash_transaction() -> Result<TransactionObservation, Box<dyn Error>> {
-    let occurred_at = Timestamp::from_unix_nanos(99);
-    let source_reference = source("task10-deposit-record")?;
-    let context = ResearchContext::new(
-        ResearchProvenance::try_new(ResearchProvenanceInput {
+fn task10_cash_transaction(
+    digest_marker: u8,
+) -> Result<NormalizedPortfolioTransactionEvidence, Box<dyn Error>> {
+    Ok(NormalizedPortfolioTransactionEvidence::try_new(
+        NormalizedPortfolioTransactionEvidenceInput {
             source_id: SourceId::try_from("portfolio-task10")?,
+            logical_record_id: source("deposit-record")?,
+            source_revision: source("statement-1")?,
+            supersedes_source_revision: None,
+            revision: RevisionNumber::new(1)?,
+            raw_source_reference: source(&format!("task10-deposit-record-{digest_marker}"))?,
+            raw_payload_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, [digest_marker; 32]),
+            broker_transaction_id: source("broker-deposit")?,
+            account_id: account()?,
             instrument_id: None,
-            venue_id: None,
-            source_identifier: source_reference.clone(),
-            source_timestamp: Some(occurred_at),
-            received_at: Timestamp::from_unix_nanos(103),
-            ingested_at: Timestamp::from_unix_nanos(104),
-            quality: DataQuality::DirectUnverified,
-            payload_reference: PayloadReference::SourceReference(source_reference.clone()),
-            availability: AvailabilityEvidence::evidenced(
-                Timestamp::from_unix_nanos(102),
-                source_reference,
-            ),
-        })?,
-        ResearchTime::new(occurred_at, None, RevisionNumber::new(1)?, None)?,
+            classification: NormalizedPortfolioTransactionClass::CashTransfer,
+            amount: money(100, Currency::try_from("USD")?),
+            quantity: None,
+            occurred_at: Timestamp::from_unix_nanos(99),
+            lot_method: None,
+        },
+    )?)
+}
+
+fn action_plan(
+    records: Vec<market_squawk_data::CorporateActionRecord>,
+    valuation_cutoff: i64,
+) -> Result<CorporateActionPlan, Box<dyn Error>> {
+    Ok(CorporateActionPlan::try_build(
+        CorporateActionPolicy::new(CorporateActionAdjustment::TotalReturn, NonZeroU32::MIN),
+        Timestamp::from_unix_nanos(20),
+        Timestamp::from_unix_nanos(valuation_cutoff),
+        records,
+        CorporateActionLimits::try_new(
+            NonZeroUsize::new(16).ok_or("actions")?,
+            NonZeroUsize::new(1024 * 1024).ok_or("bytes")?,
+        )?,
+    )?)
+}
+
+#[test]
+fn cumulative_corporate_action_plan_replaces_prior_snapshot_without_replaying_steps() -> TestResult
+{
+    let usd = Currency::try_from("USD")?;
+    let instrument_id = instrument(1)?;
+    let records = corporate_action_records(instrument_id, usd)?;
+    let first_plan = action_plan(records.clone(), 6)?;
+    let cumulative_plan = action_plan(records, 7)?;
+    let mut ledger = PortfolioLedger::try_new(account()?, usd, limits()?)?;
+
+    let first = ledger.try_apply(
+        vec![entry(
+            "cumulative-buy",
+            1,
+            None,
+            1,
+            1,
+            LedgerEntryKind::Trade(Trade::try_new(
+                TradeSide::Buy,
+                instrument_id,
+                Decimal::TEN,
+                money(10, usd),
+                money(0, usd),
+                LotSelection::Fifo,
+            )?),
+        )?],
+        Some(&first_plan),
+        valuation(12, 20, &[(1, 5)])?,
+        revision_evidence_with_plan(12, 20, &first_plan)?,
     )?;
-    Ok(TransactionObservation::new(
-        context,
-        source(&account()?.to_string())?,
-        source("cash_transfer")?,
-        source("broker-deposit")?,
-    ))
+    assert_eq!(
+        first
+            .position(instrument_id)
+            .ok_or("first position")?
+            .quantity(),
+        Decimal::from(20_u32)
+    );
+
+    let cumulative = ledger.try_apply(
+        Vec::new(),
+        Some(&cumulative_plan),
+        valuation(13, 20, &[(1, 5)])?,
+        revision_evidence_with_plan(13, 20, &cumulative_plan)?,
+    )?;
+    assert_eq!(
+        cumulative
+            .position(instrument_id)
+            .ok_or("cumulative position")?
+            .quantity(),
+        Decimal::from(20_u32)
+    );
+    assert_eq!(cumulative.cash().amount(), Decimal::from(-80_i32));
+    assert_eq!(cumulative.corporate_action_bindings().len(), 1);
+    assert_eq!(
+        first
+            .corporate_action_binding()
+            .ok_or("first action binding")?
+            .content_identity(),
+        first_plan.content_hash()
+    );
+    assert!(matches!(
+        ledger.try_apply(
+            Vec::new(),
+            Some(&first_plan),
+            valuation(14, 21, &[(1, 5)])?,
+            revision_evidence_with_plan(14, 21, &first_plan)?,
+        ),
+        Err(PortfolioError::EvidenceMismatch)
+    ));
+    Ok(())
+}
+
+#[test]
+fn return_of_capital_reduces_each_complete_lot_and_realizes_each_excess() -> TestResult {
+    let usd = Currency::try_from("USD")?;
+    let instrument_id = instrument(1)?;
+    let plan = action_plan(
+        vec![action_record(
+            4,
+            instrument_id,
+            CorporateActionKind::ReturnOfCapital {
+                amount: money(10, usd),
+            },
+        )?],
+        20,
+    )?;
+    let mut ledger = PortfolioLedger::try_new(account()?, usd, limits()?)?;
+    let revision = ledger.try_apply(
+        vec![
+            entry(
+                "cheap-lot",
+                1,
+                None,
+                1,
+                1,
+                LedgerEntryKind::Trade(Trade::try_new(
+                    TradeSide::Buy,
+                    instrument_id,
+                    Decimal::ONE,
+                    money(1, usd),
+                    money(0, usd),
+                    LotSelection::Fifo,
+                )?),
+            )?,
+            entry(
+                "expensive-lot",
+                1,
+                None,
+                2,
+                2,
+                LedgerEntryKind::Trade(Trade::try_new(
+                    TradeSide::Buy,
+                    instrument_id,
+                    Decimal::ONE,
+                    money(100, usd),
+                    money(0, usd),
+                    LotSelection::Fifo,
+                )?),
+            )?,
+        ],
+        Some(&plan),
+        valuation(15, 20, &[(1, 10)])?,
+        revision_evidence_with_plan(15, 20, &plan)?,
+    )?;
+    let position = revision.position(instrument_id).ok_or("ROC position")?;
+    let cheap = position
+        .lots()
+        .iter()
+        .find(|lot| lot.id().as_str() == "cheap-lot")
+        .ok_or("cheap lot")?;
+    let expensive = position
+        .lots()
+        .iter()
+        .find(|lot| lot.id().as_str() == "expensive-lot")
+        .ok_or("expensive lot")?;
+    assert_eq!(cheap.basis().amount(), Decimal::ZERO);
+    assert_eq!(expensive.basis().amount(), Decimal::from(90_u32));
+    assert_eq!(revision.return_of_capital().amount(), Decimal::from(20_u32));
+    assert_eq!(revision.realized_gain().amount(), Decimal::from(9_u32));
+    Ok(())
 }
 
 #[test]
@@ -302,7 +478,14 @@ fn accounting_vertical_is_exact_revisioned_and_reconciles_without_overwrite() ->
         -Decimal::ONE
     );
     assert_eq!(revision.realized_gain().amount(), Decimal::new(226, 1));
-    assert_eq!(revision.unrealized_gain().amount(), Decimal::new(134, 1));
+    assert_eq!(
+        revision
+            .unrealized_gain()
+            .complete()
+            .ok_or("complete unrealized gain")?
+            .amount(),
+        Decimal::new(134, 1)
+    );
     assert!(revision.cash().amount().is_sign_positive());
     assert_eq!(revision.previous_revision_id(), None);
     assert_eq!(revision.evidence().dataset().manifest_version(), 1);
@@ -428,7 +611,14 @@ fn specific_lots_corporate_actions_negative_cash_and_overflow_fail_closed() -> T
         revision_evidence(4, 4)?,
     )?;
     assert_eq!(first.cash().amount(), Decimal::from(-30_i32));
-    assert_eq!(first.cost_basis().amount(), Decimal::from(40_u32));
+    assert_eq!(
+        first
+            .cost_basis()
+            .complete()
+            .ok_or("complete cost basis")?
+            .amount(),
+        Decimal::from(40_u32)
+    );
     assert_eq!(first.realized_gain().amount(), Decimal::TEN);
 
     let records = corporate_action_records(instrument_a, usd)?;
@@ -467,8 +657,39 @@ fn specific_lots_corporate_actions_negative_cash_and_overflow_fail_closed() -> T
     );
     assert!(adjusted.position(instrument(3)?).is_some());
     assert!(adjusted.position(instrument(4)?).is_some());
+    let incomplete = adjusted
+        .position(instrument(3)?)
+        .ok_or("spinoff position")?;
+    assert_eq!(incomplete.cost_basis(), BasisMeasurement::Incomplete);
+    assert_eq!(incomplete.unrealized_gain(), BasisMeasurement::Incomplete);
+    assert_eq!(adjusted.cost_basis(), BasisMeasurement::Incomplete);
+    assert_eq!(adjusted.unrealized_gain(), BasisMeasurement::Incomplete);
     assert!(adjusted.return_of_capital().amount().is_sign_positive());
     assert!(adjusted.income().amount().is_sign_positive());
+
+    assert!(matches!(
+        ledger.try_apply(
+            vec![entry(
+                "sell-incomplete-spinoff",
+                1,
+                None,
+                21,
+                22,
+                LedgerEntryKind::Trade(Trade::try_new(
+                    TradeSide::Sell,
+                    instrument(3)?,
+                    Decimal::ONE,
+                    money(8, usd),
+                    money(0, usd),
+                    LotSelection::Fifo,
+                )?),
+            )?],
+            None,
+            valuation(6, 21, &[(3, 8), (4, 12)])?,
+            revision_evidence_with_plan(6, 21, &plan)?,
+        ),
+        Err(PortfolioError::UnresolvedCorporateAction)
+    ));
 
     let eur = Currency::try_from("EUR")?;
     let fx_revision = ledger.try_apply(
@@ -513,7 +734,7 @@ fn specific_lots_corporate_actions_negative_cash_and_overflow_fail_closed() -> T
             )?],
             limits()?,
         )?,
-        revision_evidence(11, 21)?,
+        revision_evidence_with_plan(11, 21, &plan)?,
     )?;
     assert!(
         fx_revision.cash_balances().iter().any(|balance| {
@@ -574,7 +795,14 @@ proptest! {
             )?;
             let remaining = Decimal::from(acquired - disposed);
             assert_eq!(revision.position(instrument(1)?).ok_or("position")?.quantity(), remaining);
-            assert_eq!(revision.cost_basis().amount(), remaining * Decimal::from(7_u32));
+            assert_eq!(
+                revision
+                    .cost_basis()
+                    .complete()
+                    .ok_or("complete property cost basis")?
+                    .amount(),
+                remaining * Decimal::from(7_u32)
+            );
             assert_eq!(revision.realized_gain().amount(), sold * Decimal::from(4_u32));
             Ok(())
         })();

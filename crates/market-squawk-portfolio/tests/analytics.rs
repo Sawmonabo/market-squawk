@@ -52,7 +52,7 @@ pub(super) fn dataset(marker: u8) -> Result<DatasetManifestRef, Box<dyn Error>> 
     )?)
 }
 
-fn action_record(
+pub(super) fn action_record(
     marker: u8,
     subject: InstrumentId,
     action: CorporateActionKind,

@@ -12,6 +12,8 @@ use crate::{
 
 #[path = "research/observations.rs"]
 mod observations;
+#[path = "research/portfolio_transactions.rs"]
+mod portfolio_transactions;
 #[path = "research/xbrl.rs"]
 mod xbrl;
 
@@ -19,6 +21,11 @@ pub use observations::{
     AlternativeDataObservation, CorporateActionObservation, FilingObservation,
     FundamentalObservation, MacroMissingValue, MacroObservation, MacroValue, PositionObservation,
     TransactionObservation, UniverseMembershipObservation,
+};
+pub use portfolio_transactions::{
+    NormalizedPortfolioLotMethod, NormalizedPortfolioTransactionClass,
+    NormalizedPortfolioTransactionError, NormalizedPortfolioTransactionEvidence,
+    NormalizedPortfolioTransactionEvidenceInput,
 };
 pub use xbrl::{
     MAX_XBRL_DIMENSIONS, MAX_XBRL_GRAPH_EVENTS, MAX_XBRL_RELATIONSHIP_REFS, MAX_XBRL_RELATIONSHIPS,
