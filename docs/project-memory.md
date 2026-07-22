@@ -369,16 +369,29 @@ portfolio core consumes adapter-produced, source-neutral economic evidence rathe
 financial scalars; publishes immutable revisions; performs checked long/short lot accounting,
 income, cash flow, performance, exposure, attribution, risk, scenarios, and proposal-only
 rebalancing; preserves authoritative cumulative corporate-action snapshots; and represents
-unresolved basis as incomplete rather than exact zero. Task 16 remains open until Step 6 binds and
-rechecks the current portfolio revision through risk approval and one-time dispatch.
+unresolved basis as incomplete rather than exact zero.
+
+Task 16 Step 6 is accepted and fast-forwarded into the release branch at exact head `7621552`.
+Execution owns the portfolio capability and loads a complete immutable risk projection under the
+account partition lock immediately before assessment/reservation. Risk derives its financial state
+from that projection, binds the exact revision, content digest, and monotonic publication generation
+into each approval, and rechecks the binding before the one permitted adapter call. Publication is
+serialized and rejects rollback, stale/revoked identities, resurrection, and competing successors.
+The real queued-dispatch regression proves that a revision change after approval rejects the order,
+does not call the adapter, and releases its reservation. Targeted tests, strict Clippy, formatting,
+boundaries, and diff hygiene passed; independent exact-head re-review reported no remaining Critical
+or Important finding.
 
 After the accepted release state and GitHub evidence were pushed, both completed feature targets
 were cleaned (6.9 GiB total), both clean worktrees were removed, both merged local/origin feature
 branches were deleted, and worktree/remote metadata was pruned. Only the release worktree remains.
 
-The next safe parallel wave is Task 14's Python financial analytics/training product and Task 16
-Step 6's execution-owned portfolio binding. Task 15 ONNX integration begins only against the frozen
-Task 13 contract and must not weaken controlled-root, exact-identity, bounded-runtime, or no-action
-semantics. Issue `#31` remains the mandatory zero-fee provider onboarding portal: it may automate
+Task 14's Python financial analytics/training product is implemented on its feature lane but is not
+accepted: exact-head review found release-blocking gaps in Task 11 provenance, PIT/split binding,
+bounded native admission, safe artifact cleanup, authenticated training-run identity, and
+independent Rust expectations. Those findings must be corrected and re-reviewed before integration.
+Task 15 ONNX integration begins only against the frozen Task 13 contract and must not weaken
+controlled-root, exact-identity, bounded-runtime, or no-action semantics. Issue `#31` remains the
+mandatory zero-fee provider onboarding portal: it may automate
 official provider enrollment and key setup, while preserving and resuming any provider-required
 human consent or verification step.

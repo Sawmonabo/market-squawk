@@ -9,9 +9,9 @@ evidence; it does not replace the README capability truth or the canonical relea
 ## Current integration state
 
 - Release branch: `release/market-squawk-v0.1.0`
-- Current integrated code head: `9a26be4` (`merge: portfolio accounting and analytics core`)
+- Current integrated capability code head: `7621552` (`fix(execution): harden portfolio risk authority`)
 - Task 13 accepted feature and release head: `59ba05c`
-- Task 16 Steps 1–5 accepted feature head: `e124722`; release merge head: `9a26be4`
+- Task 16 accepted core head: `e124722`; accepted execution-binding and release head: `7621552`
 - Task 12 code integration head: `9702556` (`fix(analytics): bind complete batch semantics`)
 - Integrated and pushed hardening code head: `2d39b0a34eb818f817973210148355c88f8f4b52`
 - Hardening owner: GitHub issue `#30`, Project 5
@@ -31,8 +31,7 @@ evidence; it does not replace the README capability truth or the canonical relea
   Clippy, workspace boundaries, formatting, and diff checks passed. Independent review rejected
   three material implementation defects and two audit-consumer/wire ripples; each was fixed, and the
   final exact-head re-review reported no remaining Critical or Important finding.
-- Task 16 owner: GitHub issue `#21`, Project 5, remains `In Progress` until the serialized Step 6
-  execution integration is complete.
+- Task 16 owner: GitHub issue `#21`, Project 5; closure follows this ledger commit and push.
 - Delivered through Steps 1–5 at accepted head `e124722`: source-evidenced normalized portfolio
   transactions, immutable revisions, long/short lots, FIFO/specific identification, cash flows,
   exact gains, explicit incomplete-basis measurements, authoritative corporate-action snapshots,
@@ -42,11 +41,19 @@ evidence; it does not replace the README capability truth or the canonical relea
   consolidated 8-test portfolio executable, strict affected-package Clippy, boundaries, formatting,
   and diff checks passed. Independent review rejected four financial/evidence defects; exact-head
   re-review at `e124722` confirmed all four closed with no remaining Critical or Important finding.
-- Integrated-head verification at `9a26be4`: the combined modeling, execution, portfolio, and
-  portfolio-adapter test gate passed, as did workspace boundaries, formatting, and diff hygiene.
-- Current implementation barrier: complete Task 16 Step 6 by binding the immutable current
-  portfolio revision into risk decisions and approved orders and rechecking it at one-time dispatch.
-  Task 14's Python product may proceed in parallel because Task 13's bundle contract is now frozen.
+- Task 16 Step 6 is accepted at exact head `7621552`: execution owns an immutable portfolio read
+  capability; risk derives settlement cash, position, gross exposure, marked and peak equity,
+  realized/unrealized loss, leverage, and drawdown from the current complete portfolio projection;
+  approvals bind the exact revision, snapshot digest, and monotonic publication generation; and the
+  dispatcher rechecks that authority before its sole adapter call. Publication rejects rollback,
+  sibling races, identity resurrection, and stale or revoked revisions.
+- Task 16 Step 6 verification: portfolio 8/8, execution 34/34, application risk-dispatch 6/6,
+  strict affected-package Clippy, workspace boundaries, formatting, and diff hygiene passed.
+  Independent exact-head re-review confirmed all three earlier authority/concurrency/dispatch
+  findings closed with no remaining Critical or Important finding.
+- Current implementation barrier: Task 14's Python product is implemented on its feature lane but
+  remains outside the release branch while confirmed producer/consumer provenance, bounded-input,
+  destructive-path, and independent-admission findings are corrected and re-reviewed.
 
 - Task 12 owner: GitHub issue `#17`, Project 5, status `Done`.
 - Exact feature and fast-forwarded release code head: `9702556`.
@@ -148,9 +155,10 @@ application size.
   closed and its Project 5 item is `Done`.
 - Removed the accepted model-bundle worktree after reclaiming 4.1 GiB and the accepted portfolio
   core worktree after reclaiming 2.8 GiB; deleted both merged local and origin product branches and
-  pruned worktree/remote metadata. Only the release worktree remains. Issue `#18` is closed and its
-  Project 5 item is `Done`; issue `#21` remains `In Progress` solely for Task 16 Step 6.
+  pruned worktree/remote metadata. At that closeout, only the release worktree remained and issue
+  `#18` was closed with its Project 5 item `Done`. Issue `#21` subsequently completed at `7621552`
+  and awaits this release-ledger push before GitHub closeout.
 
-The next delivery events are Task 16 Step 6's portfolio-bound execution authority and Task 14's
-Python financial analytics/training product. Tasks 13 and 16 Steps 1–5 do not claim that the Market
-Squawk product release is complete.
+The next delivery event is acceptance of Task 14's corrected Python financial analytics/training
+product, followed by Task 15's bounded local ONNX inference. Completed Tasks 13 and 16 do not claim
+that the Market Squawk product release is complete.

@@ -103,8 +103,10 @@ work is bound by the single canonical
   long/short lots, FIFO and specific identification, cash flows, income, exact gains, explicit
   complete/incomplete basis measurements, corporate-action snapshots, source-total reconciliation,
   performance, exposure, attribution, portfolio risk, scenarios, and proposal-only rebalancing.
-  The bounded read service requires current opaque revision tokens. Binding those revisions into
-  execution approval and one-time dispatch remains the final Task 16 integration barrier.
+  Execution-owned risk loads the current opaque portfolio revision immediately before approval,
+  derives financial limits from its complete projection, binds the exact revision and publication
+  generation into the approved order, and rechecks that authority immediately before one-time
+  dispatch. Missing, stale, retired, or revoked portfolio state fails closed before adapter access.
 - A hardened five-tool local stdio MCP surface with typed schemas, bounded admission, deadlines,
   cancellation, result limits, controlled artifacts, durable audit, and bounded worker shutdown.
   Audit, artifacts, capture, and configured journal reads derive from the same prepared local
@@ -131,10 +133,9 @@ terminal consumer, focused verification, immutable evidence, and exact commit ex
 | `Missing` | Kraken direct-source qualification | The production transport, decoder, checksum, exact-generation session lifecycle, fresh-snapshot recovery, and canonical risk/no-paper-mutation terminal proof exist; Kraken WebSocket v2 supplies no venue sequence satisfying the current `DirectVerified` execution predicate | Task 20 |
 | `Missing` | FRED/ALFRED durable local consumption | The production vintage-aware adapter is runnable for authorized ephemeral retrieval, but the exact current terms bundle does not establish per-series rights for persistence, caching, archival, or training | Task 9 / Task 20 |
 | `Missing` | portfolio import | The raw-preserving adapter now enforces durable revisions, account/currency authority, reconciliation, supersession, and canonical data-lane output, but no application service or CLI yet composes a real Task 7 local-file/OFX producer into its required portfolio-raw contract | Task 19 |
-| `Missing` | Python data/financial/training product | No tracked product package or Rust-parity training boundary | Task 14 |
+| `Missing` | Python data/financial/training product | A feature-lane implementation exists, but release review found unresolved Task 11/PIT provenance, bounded-input, safe artifact-root, authenticated training-run, and independent-admission defects; it is not integrated or runnable from this release branch | Task 14 |
 | `Missing` | constrained ONNX inference | No validated, bounded, fail-closed ONNX-compatible backend | Task 15 |
 | `Missing` | research backtesting | No point-in-time research-dataset backtester | Task 17 |
-| `Missing` | portfolio-bound execution risk | Portfolio accounting and analytics are implemented, but approvals and one-time dispatch do not yet bind and recheck the current immutable portfolio revision | Task 16 |
 | `Missing` | strategies and comprehensive risk | Bounded account/risk coordination, actor-owned authority consumption, private approval, one-time dispatch, price-bound reconciliation, and terminal audit exist; a production order-producing strategy and its controlled user-facing configuration do not | Task 2 |
 | `Missing` | realistic paper execution | The bounded engine implements lifecycle, fees, latency, slippage, partial fills, rejection, cancellation, accounting, checkpoint recovery, and reconciliation; no execution-eligible source/strategy currently drives orders through the user-facing production composition | Task 2 |
 | `Missing` | ASC 820/IFRS 13 fair value | No ruleset, evidence, override, approval, or classification service | Task 18 |
