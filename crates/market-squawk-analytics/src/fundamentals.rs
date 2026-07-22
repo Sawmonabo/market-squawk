@@ -1,18 +1,17 @@
 //! Exact fundamental, valuation, free-cash-flow, and earnings-surprise kernels.
 
-use market_squawk_domain::Money;
 use rust_decimal::Decimal;
 
 use crate::batch::checked_decimal_ratio;
-use crate::{AnalyticsError, DecimalPolicy};
+use crate::{AnalyticsError, DecimalPolicy, ExactDecimalResult, ExactDecimalUnit, MonetaryValue};
 
 /// Minimal exact financial period consumed by reusable fundamental kernels.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FundamentalPeriod {
-    revenue: Money,
-    operating_income: Money,
-    operating_cash_flow: Money,
-    capital_expenditure: Money,
+    revenue: MonetaryValue,
+    operating_income: MonetaryValue,
+    operating_cash_flow: MonetaryValue,
+    capital_expenditure: MonetaryValue,
 }
 
 impl FundamentalPeriod {
@@ -22,19 +21,15 @@ impl FundamentalPeriod {
     ///
     /// Rejects mixed currencies or negative capital expenditure.
     pub fn try_new(
-        revenue: Money,
-        operating_income: Money,
-        operating_cash_flow: Money,
-        capital_expenditure: Money,
+        revenue: MonetaryValue,
+        operating_income: MonetaryValue,
+        operating_cash_flow: MonetaryValue,
+        capital_expenditure: MonetaryValue,
     ) -> Result<Self, AnalyticsError> {
-        let currency = revenue.currency();
-        if operating_income.currency() != currency
-            || operating_cash_flow.currency() != currency
-            || capital_expenditure.currency() != currency
-        {
-            return Err(AnalyticsError::CurrencyMismatch);
-        }
-        if capital_expenditure.amount() < Decimal::ZERO {
+        ensure_same_measurement(revenue, operating_income)?;
+        ensure_same_measurement(revenue, operating_cash_flow)?;
+        ensure_same_measurement(revenue, capital_expenditure)?;
+        if capital_expenditure.money().amount() < Decimal::ZERO {
             return Err(AnalyticsError::NegativeCapitalExpenditure);
         }
         Ok(Self {
@@ -47,25 +42,25 @@ impl FundamentalPeriod {
 
     /// Returns revenue.
     #[must_use]
-    pub const fn revenue(self) -> Money {
+    pub const fn revenue(self) -> MonetaryValue {
         self.revenue
     }
 
     /// Returns operating income.
     #[must_use]
-    pub const fn operating_income(self) -> Money {
+    pub const fn operating_income(self) -> MonetaryValue {
         self.operating_income
     }
 
     /// Returns operating cash flow.
     #[must_use]
-    pub const fn operating_cash_flow(self) -> Money {
+    pub const fn operating_cash_flow(self) -> MonetaryValue {
         self.operating_cash_flow
     }
 
     /// Returns capital expenditure represented as a nonnegative cash outflow amount.
     #[must_use]
-    pub const fn capital_expenditure(self) -> Money {
+    pub const fn capital_expenditure(self) -> MonetaryValue {
         self.capital_expenditure
     }
 
@@ -74,11 +69,14 @@ impl FundamentalPeriod {
     /// # Errors
     ///
     /// Rejects currency mismatch or unrepresentable exact subtraction.
-    pub fn free_cash_flow(self) -> Result<Money, AnalyticsError> {
-        ensure_same_currency(self.operating_cash_flow, self.capital_expenditure)?;
-        self.operating_cash_flow
-            .checked_sub(self.capital_expenditure)
-            .map_err(|_| AnalyticsError::DecimalArithmetic)
+    pub fn free_cash_flow(self) -> Result<MonetaryValue, AnalyticsError> {
+        ensure_same_measurement(self.operating_cash_flow, self.capital_expenditure)?;
+        let money = self
+            .operating_cash_flow
+            .money()
+            .checked_sub(self.capital_expenditure.money())
+            .map_err(|_| AnalyticsError::DecimalArithmetic)?;
+        Ok(MonetaryValue::new(money, self.operating_cash_flow.basis()))
     }
 }
 
@@ -88,15 +86,21 @@ impl FundamentalPeriod {
 ///
 /// Rejects currency mismatch, zero prior value, checked arithmetic failure, or unsupported policy.
 pub fn fundamental_growth(
-    current: Money,
-    prior: Money,
+    current: MonetaryValue,
+    prior: MonetaryValue,
     policy: DecimalPolicy,
-) -> Result<Decimal, AnalyticsError> {
-    ensure_same_currency(current, prior)?;
+) -> Result<ExactDecimalResult, AnalyticsError> {
+    ensure_same_measurement(current, prior)?;
     let change = current
-        .checked_sub(prior)
+        .money()
+        .checked_sub(prior.money())
         .map_err(|_| AnalyticsError::DecimalArithmetic)?;
-    checked_decimal_ratio(change.amount(), prior.amount().abs(), policy)
+    ratio_result(
+        change.amount(),
+        prior.money().amount().abs(),
+        ExactDecimalUnit::Rate,
+        policy,
+    )
 }
 
 /// Computes a component margin `component / denominator` with explicit decimal rounding.
@@ -105,12 +109,17 @@ pub fn fundamental_growth(
 ///
 /// Rejects currency mismatch, zero denominator, or checked decimal failure.
 pub fn margin(
-    component: Money,
-    denominator: Money,
+    component: MonetaryValue,
+    denominator: MonetaryValue,
     policy: DecimalPolicy,
-) -> Result<Decimal, AnalyticsError> {
-    ensure_same_currency(component, denominator)?;
-    checked_decimal_ratio(component.amount(), denominator.amount(), policy)
+) -> Result<ExactDecimalResult, AnalyticsError> {
+    ensure_same_measurement(component, denominator)?;
+    ratio_result(
+        component.money().amount(),
+        denominator.money().amount(),
+        ExactDecimalUnit::Ratio,
+        policy,
+    )
 }
 
 /// Computes an exact-money valuation multiple `market_value / metric`.
@@ -119,12 +128,17 @@ pub fn margin(
 ///
 /// Rejects currency mismatch, zero metric, or checked decimal failure.
 pub fn valuation_multiple(
-    market_value: Money,
-    metric: Money,
+    market_value: MonetaryValue,
+    metric: MonetaryValue,
     policy: DecimalPolicy,
-) -> Result<Decimal, AnalyticsError> {
-    ensure_same_currency(market_value, metric)?;
-    checked_decimal_ratio(market_value.amount(), metric.amount(), policy)
+) -> Result<ExactDecimalResult, AnalyticsError> {
+    ensure_same_measurement(market_value, metric)?;
+    ratio_result(
+        market_value.money().amount(),
+        metric.money().amount(),
+        ExactDecimalUnit::Ratio,
+        policy,
+    )
 }
 
 /// Computes free-cash-flow yield `free_cash_flow / market_value`.
@@ -133,11 +147,17 @@ pub fn valuation_multiple(
 ///
 /// Rejects currency mismatch, zero market value, or checked decimal failure.
 pub fn free_cash_flow_yield(
-    free_cash_flow: Money,
-    market_value: Money,
+    free_cash_flow: MonetaryValue,
+    market_value: MonetaryValue,
     policy: DecimalPolicy,
-) -> Result<Decimal, AnalyticsError> {
-    margin(free_cash_flow, market_value, policy)
+) -> Result<ExactDecimalResult, AnalyticsError> {
+    ensure_same_measurement(free_cash_flow, market_value)?;
+    ratio_result(
+        free_cash_flow.money().amount(),
+        market_value.money().amount(),
+        ExactDecimalUnit::Rate,
+        policy,
+    )
 }
 
 /// Computes normalized earnings surprise `(actual - consensus) / abs(consensus)`.
@@ -146,21 +166,45 @@ pub fn free_cash_flow_yield(
 ///
 /// Rejects currency mismatch, zero consensus, or checked decimal failure.
 pub fn earnings_surprise(
-    actual: Money,
-    consensus: Money,
+    actual: MonetaryValue,
+    consensus: MonetaryValue,
     policy: DecimalPolicy,
-) -> Result<Decimal, AnalyticsError> {
-    ensure_same_currency(actual, consensus)?;
+) -> Result<ExactDecimalResult, AnalyticsError> {
+    ensure_same_measurement(actual, consensus)?;
     let difference = actual
-        .checked_sub(consensus)
+        .money()
+        .checked_sub(consensus.money())
         .map_err(|_| AnalyticsError::DecimalArithmetic)?;
-    checked_decimal_ratio(difference.amount(), consensus.amount().abs(), policy)
+    ratio_result(
+        difference.amount(),
+        consensus.money().amount().abs(),
+        ExactDecimalUnit::Ratio,
+        policy,
+    )
 }
 
-fn ensure_same_currency(left: Money, right: Money) -> Result<(), AnalyticsError> {
-    if left.currency() == right.currency() {
-        Ok(())
-    } else {
-        Err(AnalyticsError::CurrencyMismatch)
+fn ensure_same_measurement(
+    left: MonetaryValue,
+    right: MonetaryValue,
+) -> Result<(), AnalyticsError> {
+    if left.money().currency() != right.money().currency() {
+        return Err(AnalyticsError::CurrencyMismatch);
     }
+    if left.basis() != right.basis() {
+        return Err(AnalyticsError::MeasurementUnitMismatch);
+    }
+    Ok(())
+}
+
+fn ratio_result(
+    numerator: Decimal,
+    denominator: Decimal,
+    unit: ExactDecimalUnit,
+    policy: DecimalPolicy,
+) -> Result<ExactDecimalResult, AnalyticsError> {
+    Ok(ExactDecimalResult::new(
+        checked_decimal_ratio(numerator, denominator, policy)?,
+        unit,
+        policy,
+    ))
 }

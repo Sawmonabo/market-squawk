@@ -1,10 +1,12 @@
 //! Bounded exact feature values and immutable registry contracts.
 
 mod batch;
+mod batch_catalog;
 mod book;
 mod catalog;
 mod catalog_config;
 mod cross_venue;
+mod exact;
 mod factors;
 mod fundamentals;
 mod liquidity;
@@ -21,9 +23,12 @@ mod value;
 pub use batch::{
     AnalyticsError, AnalyticsPolicy, Annualization, DatedMoney, DatedStatisticalInput,
     DecimalPolicy, InsufficientHistoryPolicy, MAX_ANALYTICS_IDENTIFIER_BYTES,
-    MAX_BATCH_OBSERVATIONS, MAX_FACTOR_COUNT, MissingValuePolicy, Quantile, StatisticalInput,
-    StatisticalResult, StatisticalScale, StatisticalSeries, StatisticalUnit, VarianceConvention,
-    WeightPolicy, WeightedStatisticalInput, resolve_optional_inputs,
+    MAX_BATCH_OBSERVATIONS, MAX_FACTOR_COUNT, MissingValuePolicy, Quantile, ReturnSeries,
+    StatisticalInput, StatisticalResult, StatisticalScale, StatisticalSeries, StatisticalUnit,
+    VarianceConvention, WeightPolicy, WeightedStatisticalInput, resolve_optional_inputs,
+};
+pub use batch_catalog::{
+    BatchFeatureCatalog, BatchFeatureCatalogConfig, REQUIRED_BATCH_FEATURE_COUNT,
 };
 pub use book::{
     BookDepthView, BookFeatureError, HalfTickPrice, MAX_BOOK_FEATURE_LEVELS, PriceLevelView,
@@ -38,6 +43,10 @@ pub use catalog_config::{LiveFeatureCatalogConfig, LiveFeatureCatalogConfigError
 pub use cross_venue::{
     CrossVenueFeatureError, ExpectedVenueSet, MAX_CROSS_VENUE_OBSERVATIONS,
     VenueFeatureObservation, cross_venue_divergence,
+};
+pub use exact::{
+    DecimalMeasurement, ExactDecimalResult, ExactDecimalScale, ExactDecimalUnit, ExactRate,
+    MeasurementUnit, MonetaryBasis, MonetaryValue,
 };
 pub use factors::{FactorObservation, FactorRegressionResult, factor_regression};
 pub use fundamentals::{

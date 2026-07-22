@@ -205,12 +205,13 @@ pub(super) const fn required_live_implementation(
 }
 
 pub(crate) fn is_known_local_implementation(metadata: &FeatureMetadata) -> bool {
-    KnownFeatureImplementation::ALL
-        .into_iter()
-        .any(|implementation| {
-            implementation.permits_key(metadata.key())
-                && implementation
-                    .implementation_digest()
-                    .is_ok_and(|digest| digest == metadata.implementation_digest())
-        })
+    metadata.is_code_owned()
+        && KnownFeatureImplementation::ALL
+            .into_iter()
+            .any(|implementation| {
+                implementation.permits_key(metadata.key())
+                    && implementation
+                        .implementation_digest()
+                        .is_ok_and(|digest| digest == metadata.implementation_digest())
+            })
 }

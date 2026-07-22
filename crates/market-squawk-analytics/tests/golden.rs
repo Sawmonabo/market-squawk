@@ -1,16 +1,18 @@
 use std::num::NonZeroU32;
 
 use market_squawk_analytics::{
-    AnalyticsError, Annualization, DatedMoney, DatedStatisticalInput, DecimalPolicy,
-    FactorObservation, FundamentalPeriod, MissingValuePolicy, PortfolioAllocation, Quantile,
-    RatePoint, ScenarioShock, ShockComposition, StatisticalInput, StatisticalScale,
-    StatisticalUnit, VarianceConvention, WeightPolicy, WeightedStatisticalInput, alpha_beta,
-    correlation, cumulative_return, discrete_expected_shortfall, earnings_surprise,
-    factor_regression, free_cash_flow_yield, fundamental_growth, historical_var, information_ratio,
-    macro_surprise, margin, maximum_drawdown, parametric_var, portfolio_attribution,
-    portfolio_exposure, resolve_optional_inputs, scenario_impact, sharpe_ratio, simple_returns,
-    sortino_ratio, total_returns, tracking_error, valuation_multiple, volatility,
-    weighted_expected_shortfall, yield_curve_change, yield_curve_features,
+    AnalyticsError, Annualization, DatedMoney, DatedStatisticalInput, DecimalMeasurement,
+    DecimalPolicy, ExactDecimalScale, ExactDecimalUnit, ExactRate, FactorObservation,
+    FundamentalPeriod, MeasurementUnit, MissingValuePolicy, MonetaryBasis, MonetaryValue,
+    PortfolioAllocation, Quantile, RatePoint, ReturnSeries, ScenarioShock, ShockComposition,
+    StatisticalInput, StatisticalScale, StatisticalUnit, VarianceConvention, WeightPolicy,
+    WeightedStatisticalInput, alpha_beta, correlation, cumulative_return,
+    discrete_expected_shortfall, earnings_surprise, factor_regression, free_cash_flow_yield,
+    fundamental_growth, historical_var, information_ratio, macro_surprise, margin,
+    maximum_drawdown, parametric_var, portfolio_attribution, portfolio_exposure,
+    resolve_optional_inputs, scenario_impact, sharpe_ratio, simple_returns, sortino_ratio,
+    total_returns, tracking_error, valuation_multiple, volatility, weighted_expected_shortfall,
+    yield_curve_change, yield_curve_features,
 };
 use market_squawk_domain::{Currency, Money, RoundingPolicy, Timestamp};
 use rust_decimal::Decimal;
@@ -30,6 +32,14 @@ fn dated(
         Timestamp::from_unix_nanos(at),
         input(value, unit)?,
     ))
+}
+
+fn rate(value: Decimal) -> Result<ExactRate, AnalyticsError> {
+    ExactRate::try_new(value, ExactDecimalScale::Unit)
+}
+
+const fn monetary(value: Money, basis: MonetaryBasis) -> MonetaryValue {
+    MonetaryValue::new(value, basis)
 }
 
 #[test]
@@ -110,10 +120,10 @@ fn risk_statistics_disclose_sampling_annualization_and_singularities() -> TestRe
         input(0.03, StatisticalUnit::Return)?,
     ];
     let annualization = Annualization::PeriodsPerYear(NonZeroU32::new(4).ok_or("periods")?);
+    let periodic_observations = ReturnSeries::try_new(observations.to_vec(), annualization)?;
     let sigma = volatility(
-        &observations,
+        &periodic_observations,
         VarianceConvention::Sample,
-        annualization,
         MissingValuePolicy::Reject,
     )?;
     assert!((sigma.value() - 0.02).abs() < 1e-12);
@@ -136,24 +146,32 @@ fn risk_statistics_disclose_sampling_annualization_and_singularities() -> TestRe
         correlation(&asset, &[input(1.0, StatisticalUnit::Return)?; 3]),
         Err(AnalyticsError::ZeroVariance)
     );
+    let extreme = [
+        input(-1e100, StatisticalUnit::Return)?,
+        input(1e100, StatisticalUnit::Return)?,
+    ];
+    assert!((correlation(&extreme, &extreme)?.value() - 1.0).abs() < 1e-12);
 
     let ratios = [
         input(-0.02, StatisticalUnit::Return)?,
         input(0.01, StatisticalUnit::Return)?,
         input(0.04, StatisticalUnit::Return)?,
     ];
+    let periodic_ratios = ReturnSeries::try_new(ratios.to_vec(), annualization)?;
+    let periodic_asset = ReturnSeries::try_new(asset.to_vec(), annualization)?;
+    let periodic_benchmark = ReturnSeries::try_new(benchmark.to_vec(), annualization)?;
     assert!(
-        sharpe_ratio(&ratios, input(0.0, StatisticalUnit::Return)?, annualization,)?
+        sharpe_ratio(&periodic_ratios, input(0.0, StatisticalUnit::Return)?)?
             .value()
             .is_finite()
     );
     assert!(
-        sortino_ratio(&ratios, input(0.0, StatisticalUnit::Return)?, annualization,)?
+        sortino_ratio(&periodic_ratios, input(0.0, StatisticalUnit::Return)?)?
             .value()
             .is_finite()
     );
-    assert!(tracking_error(&asset, &benchmark, annualization)?.value() > 0.0);
-    assert!(information_ratio(&asset, &benchmark, annualization)?.value() > 0.0);
+    assert!(tracking_error(&periodic_asset, &periodic_benchmark)?.value() > 0.0);
+    assert!(information_ratio(&periodic_asset, &periodic_benchmark)?.value() > 0.0);
     Ok(())
 }
 
@@ -240,6 +258,18 @@ fn factor_regression_recovers_exposure_and_rejects_rank_deficiency() -> TestResu
     assert!((fit.intercept().value() - 0.03).abs() < 1e-10);
     assert!((fit.exposures()[0].value() - 1.0).abs() < 1e-10);
     assert!((fit.exposures()[1].value() - 2.0).abs() < 1e-10);
+
+    let heterogeneous_scale = [
+        factor_observation(0.062, &[1e-12, 0.01])?,
+        factor_observation(-0.026, &[2e-12, -0.02])?,
+        factor_observation(0.126, &[3e-12, 0.03])?,
+        factor_observation(0.008, &[4e-12, -0.01])?,
+        factor_observation(0.160, &[5e-12, 0.04])?,
+    ];
+    let scaled_fit = factor_regression(&heterogeneous_scale)?;
+    assert!((scaled_fit.intercept().value() - 0.03).abs() < 1e-10);
+    assert!((scaled_fit.exposures()[0].value() / 2e9 - 1.0).abs() < 1e-10);
+    assert!((scaled_fit.exposures()[1].value() - 3.0).abs() < 1e-10);
     Ok(())
 }
 
@@ -258,68 +288,79 @@ fn exact_fundamental_kernels_preserve_currency_and_signs() -> TestResult {
     let usd = Currency::try_from("USD")?;
     let eur = Currency::try_from("EUR")?;
     let prior = FundamentalPeriod::try_new(
-        Money::new(Decimal::new(100, 0), usd),
-        Money::new(Decimal::new(20, 0), usd),
-        Money::new(Decimal::new(15, 0), usd),
-        Money::new(Decimal::new(5, 0), usd),
+        monetary(Money::new(Decimal::new(100, 0), usd), MonetaryBasis::Total),
+        monetary(Money::new(Decimal::new(20, 0), usd), MonetaryBasis::Total),
+        monetary(Money::new(Decimal::new(15, 0), usd), MonetaryBasis::Total),
+        monetary(Money::new(Decimal::new(5, 0), usd), MonetaryBasis::Total),
     )?;
     let current = FundamentalPeriod::try_new(
-        Money::new(Decimal::new(125, 0), usd),
-        Money::new(Decimal::new(25, 0), usd),
-        Money::new(Decimal::new(18, 0), usd),
-        Money::new(Decimal::new(6, 0), usd),
+        monetary(Money::new(Decimal::new(125, 0), usd), MonetaryBasis::Total),
+        monetary(Money::new(Decimal::new(25, 0), usd), MonetaryBasis::Total),
+        monetary(Money::new(Decimal::new(18, 0), usd), MonetaryBasis::Total),
+        monetary(Money::new(Decimal::new(6, 0), usd), MonetaryBasis::Total),
     )?;
     let policy = DecimalPolicy::try_new(6, RoundingPolicy::NearestEven)?;
     assert_eq!(
-        fundamental_growth(current.revenue(), prior.revenue(), policy)?,
+        fundamental_growth(current.revenue(), prior.revenue(), policy)?.value(),
         Decimal::new(25, 2)
     );
     assert_eq!(
-        margin(current.operating_income(), current.revenue(), policy)?,
+        margin(current.operating_income(), current.revenue(), policy)?.value(),
         Decimal::new(2, 1)
     );
     assert_eq!(
-        current.free_cash_flow()?,
+        current.free_cash_flow()?.money(),
         Money::new(Decimal::new(12, 0), usd)
     );
     assert_eq!(
         valuation_multiple(
-            Money::new(Decimal::new(250, 0), usd),
+            monetary(Money::new(Decimal::new(250, 0), usd), MonetaryBasis::Total),
             current.operating_income(),
             policy,
-        )?,
+        )?
+        .value(),
         Decimal::new(10, 0)
     );
     assert_eq!(
         free_cash_flow_yield(
             current.free_cash_flow()?,
-            Money::new(Decimal::new(250, 0), usd),
+            monetary(Money::new(Decimal::new(250, 0), usd), MonetaryBasis::Total),
             policy,
-        )?,
+        )?
+        .value(),
         Decimal::new(48, 3)
     );
     assert_eq!(
         earnings_surprise(
-            Money::new(Decimal::new(110, 0), usd),
-            Money::new(Decimal::new(100, 0), usd),
+            monetary(Money::new(Decimal::new(110, 0), usd), MonetaryBasis::Total),
+            monetary(Money::new(Decimal::new(100, 0), usd), MonetaryBasis::Total),
             policy,
-        )?,
+        )?
+        .value(),
         Decimal::new(1, 1)
     );
     assert!(
         valuation_multiple(
-            Money::new(Decimal::new(250, 0), eur),
+            monetary(Money::new(Decimal::new(250, 0), eur), MonetaryBasis::Total),
             current.operating_income(),
             policy,
         )
         .is_err()
     );
     assert_eq!(
+        margin(
+            monetary(Money::new(Decimal::ONE, usd), MonetaryBasis::Total),
+            monetary(Money::new(Decimal::ONE, usd), MonetaryBasis::PerShare),
+            policy,
+        ),
+        Err(AnalyticsError::MeasurementUnitMismatch)
+    );
+    assert_eq!(
         FundamentalPeriod::try_new(
-            Money::new(Decimal::new(125, 0), usd),
-            Money::new(Decimal::new(25, 0), usd),
-            Money::new(Decimal::new(18, 0), usd),
-            Money::new(Decimal::new(-6, 0), usd),
+            monetary(Money::new(Decimal::new(125, 0), usd), MonetaryBasis::Total),
+            monetary(Money::new(Decimal::new(25, 0), usd), MonetaryBasis::Total),
+            monetary(Money::new(Decimal::new(18, 0), usd), MonetaryBasis::Total),
+            monetary(Money::new(Decimal::new(-6, 0), usd), MonetaryBasis::Total),
         ),
         Err(AnalyticsError::NegativeCapitalExpenditure)
     );
@@ -329,36 +370,48 @@ fn exact_fundamental_kernels_preserve_currency_and_signs() -> TestResult {
 #[test]
 fn yield_curve_requires_ordering_and_exposes_rate_shape() -> TestResult {
     let curve = [
-        RatePoint::try_new(30, Decimal::new(4, 2))?,
-        RatePoint::try_new(365, Decimal::new(45, 3))?,
-        RatePoint::try_new(3_650, Decimal::new(5, 2))?,
+        RatePoint::try_new(
+            30,
+            ExactRate::try_new(Decimal::new(4, 0), ExactDecimalScale::Percent)?,
+        )?,
+        RatePoint::try_new(365, rate(Decimal::new(45, 3))?)?,
+        RatePoint::try_new(3_650, rate(Decimal::new(5, 2))?)?,
     ];
     let features = yield_curve_features(&curve)?;
-    assert_eq!(features.slope(), Decimal::new(1, 2));
-    assert_eq!(features.curvature(), Decimal::ZERO);
+    assert_eq!(features.slope().value(), Decimal::new(1, 2));
+    assert_eq!(features.curvature().value(), Decimal::ZERO);
     assert_eq!(
         yield_curve_features(&[curve[1], curve[0], curve[2]]),
         Err(AnalyticsError::MaturityNotStrictlyIncreasing)
     );
     let shifted = [
-        RatePoint::try_new(30, Decimal::new(5, 2))?,
-        RatePoint::try_new(365, Decimal::new(55, 3))?,
-        RatePoint::try_new(3_650, Decimal::new(6, 2))?,
+        RatePoint::try_new(30, rate(Decimal::new(5, 2))?)?,
+        RatePoint::try_new(365, rate(Decimal::new(55, 3))?)?,
+        RatePoint::try_new(3_650, rate(Decimal::new(6, 2))?)?,
     ];
     let policy = DecimalPolicy::try_new(6, RoundingPolicy::NearestEven)?;
     assert_eq!(
-        yield_curve_change(&curve, &shifted, policy)?.average_parallel_shift(),
+        yield_curve_change(&curve, &shifted, policy)?
+            .average_parallel_shift()
+            .value(),
         Decimal::new(1, 2)
     );
-    assert_eq!(
-        macro_surprise(
-            Decimal::new(105, 0),
-            Decimal::new(100, 0),
-            Decimal::new(2, 0),
-            policy,
-        )?,
-        Decimal::new(25, 1)
-    );
+    let release_unit = MeasurementUnit::try_new("macro.release")?;
+    let actual = DecimalMeasurement::try_new(
+        Decimal::new(105, 0),
+        release_unit.clone(),
+        ExactDecimalScale::Unit,
+    )?;
+    let consensus = DecimalMeasurement::try_new(
+        Decimal::new(100, 0),
+        release_unit.clone(),
+        ExactDecimalScale::Unit,
+    )?;
+    let surprise_scale =
+        DecimalMeasurement::try_new(Decimal::new(2, 0), release_unit, ExactDecimalScale::Unit)?;
+    let surprise = macro_surprise(&actual, &consensus, &surprise_scale, policy)?;
+    assert_eq!(surprise.value(), Decimal::new(25, 1));
+    assert_eq!(surprise.unit(), ExactDecimalUnit::Standardized);
     Ok(())
 }
 
@@ -368,30 +421,49 @@ fn portfolio_attribution_and_composed_scenarios_remain_exact() -> TestResult {
     let allocations = [
         PortfolioAllocation::try_new(
             "equity",
-            Money::new(Decimal::new(600, 0), usd),
-            Decimal::new(1, 1),
+            monetary(Money::new(Decimal::new(600, 0), usd), MonetaryBasis::Total),
+            rate(Decimal::new(1, 1))?,
         )?,
         PortfolioAllocation::try_new(
             "rates",
-            Money::new(Decimal::new(400, 0), usd),
-            Decimal::new(-5, 2),
+            monetary(Money::new(Decimal::new(400, 0), usd), MonetaryBasis::Total),
+            rate(Decimal::new(-5, 2))?,
         )?,
     ];
     let attribution = portfolio_attribution(&allocations)?;
-    assert_eq!(attribution.total(), Money::new(Decimal::new(40, 0), usd));
+    assert_eq!(
+        attribution.total().money(),
+        Money::new(Decimal::new(40, 0), usd)
+    );
     assert_eq!(attribution.contributions().len(), 2);
     let exposure = portfolio_exposure(&allocations)?;
-    assert_eq!(exposure.net(), Money::new(Decimal::new(1_000, 0), usd));
-    assert_eq!(exposure.gross(), Money::new(Decimal::new(1_000, 0), usd));
+    assert_eq!(
+        exposure.net().money(),
+        Money::new(Decimal::new(1_000, 0), usd)
+    );
+    assert_eq!(
+        exposure.gross().money(),
+        Money::new(Decimal::new(1_000, 0), usd)
+    );
 
     let shocks = [
-        ScenarioShock::try_new("equity", Decimal::new(-1, 1))?,
-        ScenarioShock::try_new("equity", Decimal::new(-5, 2))?,
-        ScenarioShock::try_new("rates", Decimal::new(2, 2))?,
+        ScenarioShock::try_new("equity", rate(Decimal::new(-1, 1))?)?,
+        ScenarioShock::try_new("equity", rate(Decimal::new(-5, 2))?)?,
+        ScenarioShock::try_new("rates", rate(Decimal::new(2, 2))?)?,
     ];
     let impact = scenario_impact(&allocations, &shocks, ShockComposition::Additive)?;
-    assert_eq!(impact.total(), Money::new(Decimal::new(-82, 0), usd));
+    assert_eq!(
+        impact.total().money(),
+        Money::new(Decimal::new(-82, 0), usd)
+    );
     let compounded = scenario_impact(&allocations, &shocks, ShockComposition::Compounded)?;
-    assert_eq!(compounded.total(), Money::new(Decimal::new(-79, 0), usd));
+    assert_eq!(
+        compounded.total().money(),
+        Money::new(Decimal::new(-79, 0), usd)
+    );
+    assert_eq!(
+        ScenarioShock::try_new("equity", rate(Decimal::new(-15, 1))?),
+        Err(AnalyticsError::ReturnBelowFloor)
+    );
     Ok(())
 }

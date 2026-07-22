@@ -3,15 +3,15 @@
 use market_squawk_domain::{Currency, Money};
 use rust_decimal::Decimal;
 
-use crate::AnalyticsError;
 use crate::batch::{validate_count, validate_identifier};
+use crate::{AnalyticsError, ExactRate, MonetaryBasis, MonetaryValue};
 
 /// One exact portfolio amount and realized/forecast return assigned to a named dimension.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PortfolioAllocation {
     dimension: String,
-    market_value: Money,
-    return_rate: Decimal,
+    market_value: MonetaryValue,
+    return_rate: ExactRate,
 }
 
 impl PortfolioAllocation {
@@ -22,8 +22,8 @@ impl PortfolioAllocation {
     /// Rejects an empty, oversized, or non-canonical dimension identifier.
     pub fn try_new(
         dimension: &str,
-        market_value: Money,
-        return_rate: Decimal,
+        market_value: MonetaryValue,
+        return_rate: ExactRate,
     ) -> Result<Self, AnalyticsError> {
         validate_identifier(dimension)?;
         Ok(Self {
@@ -41,13 +41,13 @@ impl PortfolioAllocation {
 
     /// Returns exact market value.
     #[must_use]
-    pub const fn market_value(&self) -> Money {
+    pub const fn market_value(&self) -> MonetaryValue {
         self.market_value
     }
 
     /// Returns exact realized or forecast return rate.
     #[must_use]
-    pub const fn return_rate(&self) -> Decimal {
+    pub const fn return_rate(&self) -> ExactRate {
         self.return_rate
     }
 }
@@ -56,7 +56,7 @@ impl PortfolioAllocation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AttributionContribution {
     dimension: String,
-    amount: Money,
+    amount: MonetaryValue,
 }
 
 impl AttributionContribution {
@@ -68,7 +68,7 @@ impl AttributionContribution {
 
     /// Returns exact contribution amount.
     #[must_use]
-    pub const fn amount(&self) -> Money {
+    pub const fn amount(&self) -> MonetaryValue {
         self.amount
     }
 }
@@ -77,7 +77,7 @@ impl AttributionContribution {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PortfolioAttribution {
     contributions: Box<[AttributionContribution]>,
-    total: Money,
+    total: MonetaryValue,
 }
 
 impl PortfolioAttribution {
@@ -89,7 +89,7 @@ impl PortfolioAttribution {
 
     /// Returns exact total.
     #[must_use]
-    pub const fn total(&self) -> Money {
+    pub const fn total(&self) -> MonetaryValue {
         self.total
     }
 }
@@ -98,7 +98,7 @@ impl PortfolioAttribution {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScenarioShock {
     dimension: String,
-    return_shock: Decimal,
+    return_shock: ExactRate,
 }
 
 impl ScenarioShock {
@@ -107,8 +107,11 @@ impl ScenarioShock {
     /// # Errors
     ///
     /// Rejects an invalid dimension identifier.
-    pub fn try_new(dimension: &str, return_shock: Decimal) -> Result<Self, AnalyticsError> {
+    pub fn try_new(dimension: &str, return_shock: ExactRate) -> Result<Self, AnalyticsError> {
         validate_identifier(dimension)?;
+        if return_shock.value() < -Decimal::ONE {
+            return Err(AnalyticsError::ReturnBelowFloor);
+        }
         Ok(Self {
             dimension: dimension.to_owned(),
             return_shock,
@@ -123,7 +126,7 @@ impl ScenarioShock {
 
     /// Returns exact return shock.
     #[must_use]
-    pub const fn return_shock(&self) -> Decimal {
+    pub const fn return_shock(&self) -> ExactRate {
         self.return_shock
     }
 }
@@ -140,20 +143,20 @@ pub enum ShockComposition {
 /// Exact gross and net portfolio exposure in one currency.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PortfolioExposure {
-    net: Money,
-    gross: Money,
+    net: MonetaryValue,
+    gross: MonetaryValue,
 }
 
 impl PortfolioExposure {
     /// Returns signed net exposure.
     #[must_use]
-    pub const fn net(self) -> Money {
+    pub const fn net(self) -> MonetaryValue {
         self.net
     }
 
     /// Returns absolute gross exposure.
     #[must_use]
-    pub const fn gross(self) -> Money {
+    pub const fn gross(self) -> MonetaryValue {
         self.gross
     }
 }
@@ -167,16 +170,17 @@ pub fn portfolio_exposure(
     allocations: &[PortfolioAllocation],
 ) -> Result<PortfolioExposure, AnalyticsError> {
     validate_count(allocations.len(), 1)?;
-    let currency = common_currency(allocations)?;
+    let (currency, basis) = common_measurement(allocations)?;
     let (net, gross) = allocations.iter().try_fold(
         (
             Money::new(Decimal::ZERO, currency),
             Money::new(Decimal::ZERO, currency),
         ),
         |(net, gross), allocation| {
-            let absolute = Money::new(allocation.market_value.amount().abs(), currency);
+            let market_value = allocation.market_value.money();
+            let absolute = Money::new(market_value.amount().abs(), currency);
             let net = net
-                .checked_add(allocation.market_value)
+                .checked_add(market_value)
                 .map_err(|_| AnalyticsError::DecimalArithmetic)?;
             let gross = gross
                 .checked_add(absolute)
@@ -184,7 +188,10 @@ pub fn portfolio_exposure(
             Ok::<_, AnalyticsError>((net, gross))
         },
     )?;
-    Ok(PortfolioExposure { net, gross })
+    Ok(PortfolioExposure {
+        net: MonetaryValue::new(net, basis),
+        gross: MonetaryValue::new(gross, basis),
+    })
 }
 
 /// Computes exact contribution `market_value * return_rate` for every allocation.
@@ -196,21 +203,22 @@ pub fn portfolio_attribution(
     allocations: &[PortfolioAllocation],
 ) -> Result<PortfolioAttribution, AnalyticsError> {
     validate_count(allocations.len(), 1)?;
-    let currency = common_currency(allocations)?;
+    let (currency, basis) = common_measurement(allocations)?;
     let contributions = allocations
         .iter()
         .map(|allocation| {
             allocation
                 .market_value
-                .checked_mul_decimal(allocation.return_rate)
+                .money()
+                .checked_mul_decimal(allocation.return_rate.value())
                 .map(|amount| AttributionContribution {
                     dimension: allocation.dimension.clone(),
-                    amount,
+                    amount: MonetaryValue::new(amount, basis),
                 })
                 .map_err(|_| AnalyticsError::DecimalArithmetic)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    attribution_from_contributions(contributions, currency)
+    attribution_from_contributions(contributions, currency, basis)
 }
 
 /// Applies all shocks with an explicit composition rule and exact currency arithmetic.
@@ -231,7 +239,7 @@ pub fn scenario_impact(
     if shocks.len() > crate::MAX_BATCH_OBSERVATIONS {
         return Err(AnalyticsError::ObservationLimitExceeded);
     }
-    let currency = common_currency(allocations)?;
+    let (currency, basis) = common_measurement(allocations)?;
     if shocks.iter().any(|shock| {
         !allocations
             .iter()
@@ -246,49 +254,55 @@ pub fn scenario_impact(
                 shocks
                     .iter()
                     .filter(|shock| shock.dimension == allocation.dimension)
-                    .map(|shock| shock.return_shock),
+                    .map(|shock| shock.return_shock.value()),
                 composition,
             )?;
             allocation
                 .market_value
+                .money()
                 .checked_mul_decimal(rate)
                 .map(|amount| AttributionContribution {
                     dimension: allocation.dimension.clone(),
-                    amount,
+                    amount: MonetaryValue::new(amount, basis),
                 })
                 .map_err(|_| AnalyticsError::DecimalArithmetic)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    attribution_from_contributions(contributions, currency)
+    attribution_from_contributions(contributions, currency, basis)
 }
 
-fn common_currency(allocations: &[PortfolioAllocation]) -> Result<Currency, AnalyticsError> {
-    let currency = allocations[0].market_value.currency();
-    if allocations
-        .iter()
-        .any(|allocation| allocation.market_value.currency() != currency)
-    {
-        Err(AnalyticsError::CurrencyMismatch)
-    } else {
-        Ok(currency)
+fn common_measurement(
+    allocations: &[PortfolioAllocation],
+) -> Result<(Currency, MonetaryBasis), AnalyticsError> {
+    let currency = allocations[0].market_value.money().currency();
+    let basis = allocations[0].market_value.basis();
+    for allocation in allocations {
+        if allocation.market_value.money().currency() != currency {
+            return Err(AnalyticsError::CurrencyMismatch);
+        }
+        if allocation.market_value.basis() != basis {
+            return Err(AnalyticsError::MeasurementUnitMismatch);
+        }
     }
+    Ok((currency, basis))
 }
 
 fn attribution_from_contributions(
     contributions: Vec<AttributionContribution>,
     currency: Currency,
+    basis: MonetaryBasis,
 ) -> Result<PortfolioAttribution, AnalyticsError> {
     let total = contributions.iter().try_fold(
         Money::new(Decimal::ZERO, currency),
         |total, contribution| {
             total
-                .checked_add(contribution.amount)
+                .checked_add(contribution.amount.money())
                 .map_err(|_| AnalyticsError::DecimalArithmetic)
         },
     )?;
     Ok(PortfolioAttribution {
         contributions: contributions.into_boxed_slice(),
-        total,
+        total: MonetaryValue::new(total, basis),
     })
 }
 

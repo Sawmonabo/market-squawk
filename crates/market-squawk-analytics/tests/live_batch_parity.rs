@@ -41,10 +41,10 @@ fn live_rolling_and_batch_return_kernels_share_identical_semantics() -> TestResu
     let live_values = live_values.ok_or("missing live result")?;
     let batch_returns = simple_returns(&batch_prices)?;
     let batch_cumulative = cumulative_return(batch_returns.values())?;
+    let periodic_returns = batch_returns.try_into_returns(Annualization::None)?;
     let batch_volatility = volatility(
-        batch_returns.values(),
+        &periodic_returns,
         VarianceConvention::Population,
-        Annualization::None,
         MissingValuePolicy::Reject,
     )?;
     let live_return = live_values

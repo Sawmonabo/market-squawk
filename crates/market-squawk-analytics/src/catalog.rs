@@ -657,7 +657,7 @@ fn metadata(
     unit: FeatureUnit,
     revision: &str,
 ) -> Result<FeatureMetadata, FeatureMetadataError> {
-    FeatureMetadata::try_new(
+    FeatureMetadata::try_new_code_owned(
         FeatureKey::try_new(feature.name(), NonZeroU32::MIN)?,
         FeatureInputSchema::try_new(inputs)?,
         FeatureParameters::try_new(parameters)?,

@@ -449,6 +449,7 @@ pub struct FeatureMetadata {
     implementation_revision: String,
     implementation_digest: FeatureImplementationDigest,
     semantic_digest: FeatureSemanticDigest,
+    code_owned: bool,
 }
 
 impl FeatureMetadata {
@@ -472,6 +473,71 @@ impl FeatureMetadata {
         point_in_time_compatible: bool,
         implementation_revision: &str,
         implementation_digest: FeatureImplementationDigest,
+    ) -> Result<Self, FeatureMetadataError> {
+        Self::try_new_with_authority(
+            key,
+            input_schema,
+            parameters,
+            time_semantics,
+            warm_up,
+            null_policy,
+            output_type,
+            unit,
+            live_compatible,
+            point_in_time_compatible,
+            implementation_revision,
+            implementation_digest,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn try_new_code_owned(
+        key: FeatureKey,
+        input_schema: FeatureInputSchema,
+        parameters: FeatureParameters,
+        time_semantics: FeatureTimeSemantics,
+        warm_up: FeatureWarmUp,
+        null_policy: FeatureNullPolicy,
+        output_type: FeatureOutputType,
+        unit: FeatureUnit,
+        live_compatible: bool,
+        point_in_time_compatible: bool,
+        implementation_revision: &str,
+        implementation_digest: FeatureImplementationDigest,
+    ) -> Result<Self, FeatureMetadataError> {
+        Self::try_new_with_authority(
+            key,
+            input_schema,
+            parameters,
+            time_semantics,
+            warm_up,
+            null_policy,
+            output_type,
+            unit,
+            live_compatible,
+            point_in_time_compatible,
+            implementation_revision,
+            implementation_digest,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_new_with_authority(
+        key: FeatureKey,
+        input_schema: FeatureInputSchema,
+        parameters: FeatureParameters,
+        time_semantics: FeatureTimeSemantics,
+        warm_up: FeatureWarmUp,
+        null_policy: FeatureNullPolicy,
+        output_type: FeatureOutputType,
+        unit: FeatureUnit,
+        live_compatible: bool,
+        point_in_time_compatible: bool,
+        implementation_revision: &str,
+        implementation_digest: FeatureImplementationDigest,
+        code_owned: bool,
     ) -> Result<Self, FeatureMetadataError> {
         validate_revision(implementation_revision)?;
         if !output_unit_is_compatible(output_type, unit) {
@@ -510,6 +576,7 @@ impl FeatureMetadata {
             implementation_revision: implementation_revision.to_owned(),
             implementation_digest,
             semantic_digest,
+            code_owned,
         })
     }
 
@@ -597,6 +664,10 @@ impl FeatureMetadata {
         self.semantic_digest
     }
 
+    pub(crate) const fn is_code_owned(&self) -> bool {
+        self.code_owned
+    }
+
     /// Returns the complete exact retained footprint of this owned metadata graph.
     ///
     /// # Errors
@@ -659,6 +730,9 @@ pub enum FeatureMetadataError {
     /// Checked retained-size arithmetic overflowed.
     #[error("feature metadata retained-byte accounting overflowed")]
     RetainedSizeOverflow,
+    /// A code-owned batch catalog policy is outside its closed bounds.
+    #[error("batch feature catalog policy is invalid")]
+    InvalidBatchCatalogPolicy,
 }
 
 fn validate_identifier(value: &str, maximum_bytes: usize) -> Result<(), ()> {

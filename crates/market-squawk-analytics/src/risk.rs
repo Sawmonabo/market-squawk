@@ -3,8 +3,8 @@
 use crate::batch::{neumaier_sum, validate_count, validate_homogeneous};
 use crate::{
     AnalyticsError, Annualization, DatedStatisticalInput, MissingValuePolicy, Quantile,
-    StatisticalInput, StatisticalResult, StatisticalUnit, VarianceConvention, WeightPolicy,
-    WeightedStatisticalInput,
+    ReturnSeries, StatisticalInput, StatisticalResult, StatisticalUnit, VarianceConvention,
+    WeightPolicy, WeightedStatisticalInput,
 };
 
 /// Maximum drawdown and the first complete peak/trough/recovery path that realizes it.
@@ -73,17 +73,17 @@ impl AlphaBetaResult {
 /// Rejects fewer than two observations, heterogeneous units, non-return inputs, excessive input,
 /// zero/non-finite arithmetic, or invalid statistical output.
 pub fn volatility(
-    returns: &[StatisticalInput],
+    returns: &ReturnSeries,
     convention: VarianceConvention,
-    annualization: Annualization,
     _missing_policy: MissingValuePolicy,
 ) -> Result<StatisticalResult, AnalyticsError> {
-    ensure_returns(returns, 2)?;
-    let variance = variance(returns, convention)?;
+    ensure_returns(returns.values(), 2)?;
+    let variance = variance(returns.values(), convention)?;
+    let annualization = returns.annualization();
     StatisticalResult::try_new(
         variance.sqrt() * annualization.volatility_multiplier(),
-        StatisticalUnit::Return,
-        returns.len(),
+        StatisticalUnit::Volatility,
+        returns.observations(),
         Some(convention),
         annualization,
         None,
@@ -174,25 +174,34 @@ pub fn correlation(
     validate_pair(left, right, 2)?;
     let left_mean = mean(left);
     let right_mean = mean(right);
-    let covariance = neumaier_sum(
-        left.iter()
-            .zip(right)
-            .map(|(left, right)| (left.value() - left_mean) * (right.value() - right_mean)),
-    );
+    let left_scale = left
+        .iter()
+        .map(|value| (value.value() - left_mean).abs())
+        .fold(0.0_f64, f64::max);
+    let right_scale = right
+        .iter()
+        .map(|value| (value.value() - right_mean).abs())
+        .fold(0.0_f64, f64::max);
+    if left_scale == 0.0 || right_scale == 0.0 {
+        return Err(AnalyticsError::ZeroVariance);
+    }
+    let covariance = neumaier_sum(left.iter().zip(right).map(|(left, right)| {
+        ((left.value() - left_mean) / left_scale) * ((right.value() - right_mean) / right_scale)
+    }));
     let left_sum_squares = neumaier_sum(left.iter().map(|value| {
-        let centered = value.value() - left_mean;
+        let centered = (value.value() - left_mean) / left_scale;
         centered * centered
     }));
     let right_sum_squares = neumaier_sum(right.iter().map(|value| {
-        let centered = value.value() - right_mean;
+        let centered = (value.value() - right_mean) / right_scale;
         centered * centered
     }));
-    let denominator = (left_sum_squares * right_sum_squares).sqrt();
-    if denominator == 0.0 {
+    let denominator = left_sum_squares.sqrt() * right_sum_squares.sqrt();
+    if denominator == 0.0 || !denominator.is_finite() {
         return Err(AnalyticsError::ZeroVariance);
     }
     StatisticalResult::try_new(
-        covariance / denominator,
+        (covariance / denominator).clamp(-1.0, 1.0),
         StatisticalUnit::Unitless,
         left.len(),
         Some(VarianceConvention::Sample),
@@ -252,11 +261,10 @@ pub fn alpha_beta(
 /// Rejects invalid returns, fewer than two observations, non-finite risk-free input, or zero
 /// excess-return variance.
 pub fn sharpe_ratio(
-    returns: &[StatisticalInput],
+    returns: &ReturnSeries,
     risk_free_return: StatisticalInput,
-    annualization: Annualization,
 ) -> Result<StatisticalResult, AnalyticsError> {
-    ratio_over_sample_deviation(returns, risk_free_return, annualization, false)
+    ratio_over_sample_deviation(returns, risk_free_return, false)
 }
 
 /// Annualized Sortino ratio using population target downside deviation.
@@ -266,11 +274,10 @@ pub fn sharpe_ratio(
 /// Rejects invalid returns, fewer than two observations, non-finite target, or no downside
 /// deviation.
 pub fn sortino_ratio(
-    returns: &[StatisticalInput],
+    returns: &ReturnSeries,
     target_return: StatisticalInput,
-    annualization: Annualization,
 ) -> Result<StatisticalResult, AnalyticsError> {
-    ratio_over_sample_deviation(returns, target_return, annualization, true)
+    ratio_over_sample_deviation(returns, target_return, true)
 }
 
 /// Annualized sample standard deviation of active returns.
@@ -279,15 +286,15 @@ pub fn sortino_ratio(
 ///
 /// Rejects invalid paired return series or zero/non-finite arithmetic.
 pub fn tracking_error(
-    portfolio: &[StatisticalInput],
-    benchmark: &[StatisticalInput],
-    annualization: Annualization,
+    portfolio: &ReturnSeries,
+    benchmark: &ReturnSeries,
 ) -> Result<StatisticalResult, AnalyticsError> {
     let active = active_returns(portfolio, benchmark)?;
     let variance = numeric_sample_variance(&active)?;
+    let annualization = portfolio.annualization();
     StatisticalResult::try_new(
         variance.sqrt() * annualization.volatility_multiplier(),
-        StatisticalUnit::Return,
+        StatisticalUnit::Volatility,
         active.len(),
         Some(VarianceConvention::Sample),
         annualization,
@@ -301,9 +308,8 @@ pub fn tracking_error(
 ///
 /// Rejects invalid paired returns or zero tracking-error denominator.
 pub fn information_ratio(
-    portfolio: &[StatisticalInput],
-    benchmark: &[StatisticalInput],
-    annualization: Annualization,
+    portfolio: &ReturnSeries,
+    benchmark: &ReturnSeries,
 ) -> Result<StatisticalResult, AnalyticsError> {
     let active = active_returns(portfolio, benchmark)?;
     let deviation = numeric_sample_variance(&active)?.sqrt();
@@ -311,6 +317,7 @@ pub fn information_ratio(
         return Err(AnalyticsError::ZeroVariance);
     }
     let mean_active = neumaier_sum(active.iter().copied()) / active.len() as f64;
+    let annualization = portfolio.annualization();
     StatisticalResult::try_new(
         mean_active / deviation * annualization.volatility_multiplier(),
         StatisticalUnit::Unitless,
@@ -499,16 +506,16 @@ fn variance_denominator(len: usize, convention: VarianceConvention) -> f64 {
 }
 
 fn ratio_over_sample_deviation(
-    returns: &[StatisticalInput],
+    returns: &ReturnSeries,
     target: StatisticalInput,
-    annualization: Annualization,
     downside_only: bool,
 ) -> Result<StatisticalResult, AnalyticsError> {
-    ensure_returns(returns, 2)?;
+    ensure_returns(returns.values(), 2)?;
     if target.unit() != StatisticalUnit::Return {
         return Err(AnalyticsError::UnitMismatch);
     }
     let excess = returns
+        .values()
         .iter()
         .map(|value| value.value() - target.value())
         .collect::<Vec<_>>();
@@ -522,10 +529,11 @@ fn ratio_over_sample_deviation(
     if deviation == 0.0 {
         return Err(AnalyticsError::ZeroVariance);
     }
+    let annualization = returns.annualization();
     StatisticalResult::try_new(
         numerator / deviation * annualization.volatility_multiplier(),
         StatisticalUnit::Unitless,
-        returns.len(),
+        returns.observations(),
         Some(if downside_only {
             VarianceConvention::Population
         } else {
@@ -537,14 +545,18 @@ fn ratio_over_sample_deviation(
 }
 
 fn active_returns(
-    portfolio: &[StatisticalInput],
-    benchmark: &[StatisticalInput],
+    portfolio: &ReturnSeries,
+    benchmark: &ReturnSeries,
 ) -> Result<Vec<f64>, AnalyticsError> {
-    validate_pair(portfolio, benchmark, 2)?;
-    ensure_returns(portfolio, 2)?;
+    if portfolio.annualization() != benchmark.annualization() {
+        return Err(AnalyticsError::AnnualizationMismatch);
+    }
+    validate_pair(portfolio.values(), benchmark.values(), 2)?;
+    ensure_returns(portfolio.values(), 2)?;
     Ok(portfolio
+        .values()
         .iter()
-        .zip(benchmark)
+        .zip(benchmark.values())
         .map(|(portfolio, benchmark)| portfolio.value() - benchmark.value())
         .collect())
 }

@@ -24,6 +24,8 @@ pub enum StatisticalUnit {
     Unitless,
     /// Dimensionless holding-period return.
     Return,
+    /// Dispersion of dimensionless returns over a declared cadence.
+    Volatility,
     /// Dimensionless rate.
     Rate,
     /// Amount denominated in one currency.
@@ -408,6 +410,71 @@ impl StatisticalSeries {
     pub const fn unit(&self) -> StatisticalUnit {
         self.unit
     }
+
+    /// Binds a return series to an explicit annualization contract.
+    ///
+    /// The caller must select [`Annualization::None`] for irregular intervals. Selecting
+    /// [`Annualization::PeriodsPerYear`] is an explicit assertion that every retained return is one
+    /// comparable period at the declared cadence; annualized kernels accept only this bound type.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a non-return series.
+    pub fn try_into_returns(
+        self,
+        annualization: Annualization,
+    ) -> Result<ReturnSeries, AnalyticsError> {
+        ReturnSeries::try_new(self.values.into_vec(), annualization)
+    }
+}
+
+/// Homogeneous return observations bound to an explicit cadence policy.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReturnSeries {
+    values: Box<[StatisticalInput]>,
+    annualization: Annualization,
+}
+
+impl ReturnSeries {
+    /// Admits already-computed comparable period returns with an explicit annualization contract.
+    ///
+    /// # Errors
+    ///
+    /// Rejects empty, excessive, heterogeneous, or non-return inputs.
+    pub fn try_new(
+        values: Vec<StatisticalInput>,
+        annualization: Annualization,
+    ) -> Result<Self, AnalyticsError> {
+        validate_count(values.len(), 1)?;
+        if values
+            .iter()
+            .any(|value| value.unit() != StatisticalUnit::Return)
+        {
+            return Err(AnalyticsError::UnitMismatch);
+        }
+        Ok(Self {
+            values: values.into_boxed_slice(),
+            annualization,
+        })
+    }
+
+    /// Returns normalized period returns.
+    #[must_use]
+    pub fn values(&self) -> &[StatisticalInput] {
+        &self.values
+    }
+
+    /// Returns the explicit cadence/annualization contract.
+    #[must_use]
+    pub const fn annualization(&self) -> Annualization {
+        self.annualization
+    }
+
+    /// Returns the number of observations.
+    #[must_use]
+    pub const fn observations(&self) -> usize {
+        self.values.len()
+    }
 }
 
 /// One typed scalar statistical result with disclosed sample size and conventions.
@@ -497,6 +564,9 @@ pub enum AnalyticsError {
     /// Input currencies differ.
     #[error("money currencies differ")]
     CurrencyMismatch,
+    /// Inputs use incompatible financial or macro measurement units.
+    #[error("analytical measurement units differ")]
+    MeasurementUnitMismatch,
     /// A required value was absent.
     #[error("missing observation is rejected by policy")]
     MissingObservation,
@@ -520,6 +590,9 @@ pub enum AnalyticsError {
     /// Paired input lengths differ.
     #[error("paired analytical inputs have different lengths")]
     LengthMismatch,
+    /// Paired period-return series use different cadence contracts.
+    #[error("paired return series use different annualization contracts")]
+    AnnualizationMismatch,
     /// Probability is not finite and strictly between zero and one.
     #[error("quantile must be finite and strictly between zero and one")]
     InvalidQuantile,
@@ -553,6 +626,9 @@ pub enum AnalyticsError {
     /// A scenario shock does not map to a portfolio exposure.
     #[error("scenario shock has no matching portfolio exposure")]
     UnknownShockDimension,
+    /// A multiplicatively compounded asset return was below total loss.
+    #[error("return shock cannot be below negative one")]
+    ReturnBelowFloor,
 }
 
 pub(crate) fn validate_count(actual: usize, required: usize) -> Result<(), AnalyticsError> {
