@@ -94,6 +94,26 @@ fn durable_workflow_recovers_exact_state_and_blocks_level_one_override() -> Test
 }
 
 #[test]
+fn unclassified_evidence_cannot_be_override_promoted() -> TestResult {
+    let fixture = CatalogFixture::open()?;
+    let mut service = fixture.service(4)?;
+    let base = service.classify(measurement(1_001, 5)?, ClassificationRuleset::current(100)?)?;
+    assert_eq!(base.hierarchy(), FairValueHierarchy::Unclassified);
+    assert!(matches!(
+        service.propose_override(
+            base.id(),
+            FairValueHierarchy::Level3,
+            "inadmissible evidence requires a new measurement",
+            actor("override-preparer")?,
+            Timestamp::from_unix_nanos(1_300),
+            Timestamp::from_unix_nanos(1_800),
+        ),
+        Err(FairValueError::InvalidOverride)
+    ));
+    Ok(())
+}
+
+#[test]
 fn stale_service_position_rejects_before_any_second_durable_append() -> TestResult {
     let fixture = CatalogFixture::open()?;
     let mut first = fixture.service(4)?;
