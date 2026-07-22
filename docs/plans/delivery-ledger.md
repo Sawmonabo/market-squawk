@@ -113,6 +113,10 @@ application size.
 - Removed the completed `.worktrees/research-analytics` worktree and its 18 GiB generated target;
   deleted merged local and origin branch `feature/research-analytics`; and pruned worktree and remote
   metadata.
+- Removed the completed `.worktrees/analytics-feature-vertical` worktree after reclaiming its
+  9.8 GiB generated target; deleted merged local and origin branch
+  `feature/analytics-feature-vertical`; and pruned worktree and remote metadata. Issue `#17` is
+  closed and its Project 5 item is `Done`.
 
 The next delivery event is Task 13's complete model registry, bundle, and native Rust inference
 vertical. Task 12 completion is not a claim that the Market Squawk product release is complete.

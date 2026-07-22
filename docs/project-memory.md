@@ -350,9 +350,9 @@ entries binds its full input schema and execution-relevant policies into the sem
 
 The implementation retained the two existing consolidated analytics test executables and 24
 focused behavioral tests. Three independent Quarter 2 reviews reported no Critical or Important
-finding, and the full unchanged-head verification gate passed at `9702556`. The completed feature
-worktree, target, and local/origin branch are removed only after the release closeout commit is
-pushed and issue `#17` is closed.
+finding, and the full unchanged-head verification gate passed at `9702556`. After the release
+closeout was pushed and issue `#17` was closed, its 9.8 GiB generated target, clean worktree, and
+merged local/origin feature branches were removed and metadata was pruned.
 
 The next serialized product task is Task 13: complete model registry, immutable model bundles, and
 bounded native Rust inference over the Task 11 dataset identities and Task 12 feature contracts.
