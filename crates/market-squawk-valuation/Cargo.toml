@@ -1,0 +1,26 @@
+[package]
+name = "market-squawk-valuation"
+description = "Deterministic ASC 820 and IFRS 13 fair-value classification and approval"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+license.workspace = true
+repository = "https://github.com/Sawmonabo/market-squawk"
+publish = false
+autotests = false
+
+[dependencies]
+market-squawk-analytics = { workspace = true }
+market-squawk-data = { workspace = true }
+market-squawk-domain = { workspace = true }
+market-squawk-portfolio = { workspace = true }
+rust_decimal.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[[test]]
+name = "fair_value"
+path = "tests/fair_value.rs"
+
+[lints]
+workspace = true
