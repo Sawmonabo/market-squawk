@@ -1,5 +1,6 @@
 """Local point-in-time research, Rust analytics, and deterministic model training."""
 
+from . import _native as _native
 from .bundle import BundleAuthorityRef
 from .data import DatasetResult, UtcNanoseconds, open_dataset
 from .finance import OperationContext

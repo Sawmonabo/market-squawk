@@ -31,6 +31,28 @@ impl TrainingEnvironmentReceipt {
 
 #[pyfunction]
 fn training_environment_receipt(py: Python<'_>) -> PyResult<TrainingEnvironmentReceipt> {
+    let module = py
+        .import("market_squawk._native")
+        .map_err(|_| invalid_receipt())?;
+    let native_extension: String = module
+        .filename()
+        .and_then(|value| value.extract())
+        .map_err(|_| invalid_receipt())?;
+    verify_training_environment(py, Path::new(&native_extension))
+}
+
+pub(super) fn verify_at_import(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    let native_extension: String = module
+        .filename()
+        .and_then(|value| value.extract())
+        .map_err(|_| invalid_receipt())?;
+    verify_training_environment(module.py(), Path::new(&native_extension)).map(drop)
+}
+
+fn verify_training_environment(
+    py: Python<'_>,
+    native_extension: &Path,
+) -> PyResult<TrainingEnvironmentReceipt> {
     let sys = py.import("sys").map_err(|_| invalid_receipt())?;
     let root: String = sys
         .getattr("prefix")
@@ -58,13 +80,6 @@ fn training_environment_receipt(py: Python<'_>) -> PyResult<TrainingEnvironmentR
         .and_then(|value| value.getattr("name"))
         .and_then(|value| value.extract())
         .map_err(|_| invalid_receipt())?;
-    let module = py
-        .import("market_squawk._native")
-        .map_err(|_| invalid_receipt())?;
-    let native_extension: String = module
-        .getattr("__file__")
-        .and_then(|value| value.extract())
-        .map_err(|_| invalid_receipt())?;
     let version = format!("{major}.{minor}.{micro}");
     let python_tag = format!("cp{major}{minor}");
     let verified = verify_python_training_environment(
@@ -73,7 +88,7 @@ fn training_environment_receipt(py: Python<'_>) -> PyResult<TrainingEnvironmentR
         &implementation,
         &version,
         &python_tag,
-        Path::new(&native_extension),
+        native_extension,
     )
     .map_err(|_| invalid_receipt())?;
     Ok(TrainingEnvironmentReceipt {

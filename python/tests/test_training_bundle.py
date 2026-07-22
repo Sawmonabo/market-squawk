@@ -8,6 +8,7 @@ import io
 import json
 from pathlib import Path
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -57,14 +58,30 @@ class TrainingBundleContracts(unittest.TestCase):
         dependency_source = Path(pa.__file__)
         dependency_content = dependency_source.read_bytes()
         dependency_mode = stat.S_IMODE(dependency_source.stat().st_mode)
-        try:
-            dependency_source.chmod(dependency_mode | stat.S_IWUSR)
-            dependency_source.write_bytes(dependency_content + b"\n# untrusted mutation\n")
-            with self.assertRaises(ValueError):
-                training_environment_receipt()
-        finally:
-            dependency_source.write_bytes(dependency_content)
-            dependency_source.chmod(dependency_mode)
+        with tempfile.TemporaryDirectory() as temporary:
+            sentinel = Path(temporary) / "dependency-executed"
+            replacement = (
+                "from pathlib import Path\n"
+                f"Path({str(sentinel)!r}).write_text('executed', encoding='ascii')\n"
+            ).encode("utf-8")
+            try:
+                dependency_source.chmod(dependency_mode | stat.S_IWUSR)
+                dependency_source.write_bytes(replacement)
+                with self.assertRaises(ValueError):
+                    training_environment_receipt()
+                completed = subprocess.run(
+                    [sys.executable, "-I", "-B", "-c", "import market_squawk"],
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    timeout=30,
+                )
+                self.assertNotEqual(completed.returncode, 0, completed.stdout)
+                self.assertFalse(sentinel.exists(), completed.stdout)
+            finally:
+                dependency_source.write_bytes(dependency_content)
+                dependency_source.chmod(dependency_mode)
         self.assertEqual(training_environment_receipt().sha256, baseline)
 
         added_dependency = dependency_source.parent / "_market_squawk_unrecorded.py"

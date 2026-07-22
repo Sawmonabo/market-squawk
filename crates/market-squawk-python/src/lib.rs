@@ -13,6 +13,14 @@ use pyo3::prelude::*;
 use tokio_util::sync::CancellationToken;
 
 const FEATURE_IMPLEMENTATION_REVISION: &str = "task14-python-v1";
+const SEALED_PYTHON_BUILD: bool =
+    option_env!("MARKET_SQUAWK_TRAINING_FOUNDATION_RECEIPT").is_some();
+const PYTHON_BUILD_IDENTITY: &str = if SEALED_PYTHON_BUILD {
+    "sealed-release-v1"
+} else {
+    "development-unsealed-v1"
+};
+const PYTHON_BUILD_IDENTITY_ATTRIBUTE: &str = "__market_squawk_build_identity__";
 // Analytics kernels do not yet accept a cancellation callback internally. Keep every
 // non-preemptible section small and charge a conservative worst-case operation bound first.
 const MAX_ANALYTIC_VALUES: usize = 16_384;
@@ -146,6 +154,10 @@ fn expected_model_validator_sha256() -> PyResult<&'static str> {
 
 #[pymodule]
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    if SEALED_PYTHON_BUILD {
+        receipt::verify_at_import(module)?;
+    }
+    module.add(PYTHON_BUILD_IDENTITY_ATTRIBUTE, PYTHON_BUILD_IDENTITY)?;
     module.add_class::<OperationContext>()?;
     module.add_function(wrap_pyfunction!(expected_model_validator_sha256, module)?)?;
     dataset::register(module)?;

@@ -1020,16 +1020,6 @@ def _build_release(
         validator_destination.chmod(0o755)
         if _file_digest(validator_destination)[1] != validator_sha256:
             raise ReleaseBuildError("installed model validator identity changed")
-        _run(
-            [
-                release_python,
-                "-I",
-                "-c",
-                "import market_squawk, market_squawk._native",
-            ],
-            root,
-            runtime_environment,
-        )
         distribution = inspect_installed_distribution(
             release_venv,
             runtime,
@@ -1054,6 +1044,18 @@ def _build_release(
             distribution,
             runtime_distributions,
             signer,
+        )
+        _run(
+            [
+                release_python,
+                "-I",
+                "-c",
+                "import market_squawk._native as native;"
+                "raise SystemExit(0 if getattr(native, "
+                "'__market_squawk_build_identity__', None) == 'sealed-release-v1' else 2)",
+            ],
+            root,
+            runtime_environment,
         )
         _run(
             [
