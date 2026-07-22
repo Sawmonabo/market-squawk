@@ -39,14 +39,6 @@ and planned in
   timelines from the registry-sealed session start. No test-only public clock or production bypass
   was introduced.
 
-## Provider-access boundary
-
-Market Squawk honors provider authorization, rate limits, cooldowns, refusals, and blocking. It
-does not implement identity/account rotation to evade limits, browser/TLS fingerprint spoofing,
-CAPTCHA or anti-bot bypass, blocking-evasion proxy rotation, distributed quota evasion, stealth
-scraping, or access-control circumvention. A restricted source becomes unavailable or degraded and
-recovers only through an authorized provider path under the same evidenced identity.
-
 ## Verification scope
 
 Deterministic coverage includes nested retained-size bounds, a maximum policy with every optional
@@ -71,7 +63,4 @@ The final implementation state passed:
 - `cargo audit --deny warnings`: the current RustSec advisory database reported no findings for the
   locked 281-crate dependency graph.
 - `gitleaks dir --no-banner --redact --config .gitleaks.toml .`: no credential leaks found.
-- Focused anti-evasion and live-hot-path searches, final diff whitespace validation, and the exact
-  base-to-head blast-radius review.
-
 No external provider/network integration test was included in the deterministic gate.

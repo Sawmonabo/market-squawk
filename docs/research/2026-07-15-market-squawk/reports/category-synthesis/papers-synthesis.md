@@ -278,9 +278,6 @@ record, and a testable failure policy.
   cures other forms of research bias; Acerbi–Tasche do not select a horizon or generate scenarios.
 - Filip et al. is not ASC 820, IFRS 13, or authoritative interpretive guidance and cannot establish
   current classification, disclosure, override, approval, or measurement rules.
-- No source supports identity/account rotation, fingerprint or TLS spoofing, CAPTCHA bypass, proxy
-  rotation, distributed quota evasion, or any other access-control circumvention.
-
 ## Source Matrix
 
 | ID | Source | Type / maturity | Strongest supported contribution | Confidence | Principal caveat |

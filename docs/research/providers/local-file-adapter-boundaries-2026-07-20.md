@@ -181,8 +181,7 @@ currency must exactly match manifest policy. Transaction `FITID` values must be 
 The original transaction fields and statement context contribute to the canonical row digest.
 
 FDX also notes that an open format does not imply public or unrestricted connectivity to every
-financial institution. This adapter reads user-authorized local exports only; it does not discover
-proprietary endpoints or attempt access-control, identity, quota, or bot-defense evasion.
+financial institution. This adapter reads user-authorized local exports only.
 
 ## Verified producer-to-consumer contract
 

@@ -345,12 +345,6 @@ The application remains local-first with no mandatory paid software/API, cloud, 
 container runtime, telemetry, or OpenTelemetry dependency. Outbound source connections are explicit;
 there is no analytics beacon.
 
-Identity/account rotation to evade limits, TLS/browser fingerprint concealment, CAPTCHA or
-anti-bot bypass, proxy rotation intended to defeat blocking, and distributed quota evasion are
-classified as unsafe and are absent from production schemas and implementation. Provider access is
-designed around declared identity, authorization, shared budgets, bounded retry, caching in the
-future research plane, explicit coverage, and fail-closed source health.
-
 ## Current conclusion
 
 The cross-cutting live foundation is substantial and tested, and Q2-R01–R15 remain closed as

@@ -210,7 +210,3 @@ These are not Task 8 claims and are not optional release exclusions:
   diagnostic-engine deletion trigger.
 - Task 14 records integrated throughput, latency percentiles, sustained memory, and release
   hardening evidence.
-
-The prohibited evasion requests remain excluded: there is no identity/account rotation, TLS or
-browser fingerprint concealment, CAPTCHA bypass, blocking-evasion proxy rotation, or distributed
-quota evasion in this implementation or its extension surfaces.

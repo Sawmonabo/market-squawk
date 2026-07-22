@@ -37,12 +37,6 @@ unchanged clean-head full gate and grouped independent quarter review confer app
 self-signed baseline literals do not. Same-UID compiler/build-script hostility and independent
 reproducible-build attestation are outside this measurement trust model and must not be implied.
 
-Identity/account rotation to evade limits, browser or TLS fingerprint spoofing, CAPTCHA or
-anti-bot bypass, proxy rotation intended to defeat blocking, distributed quota evasion, stealth
-scraping, and access-control circumvention are permanently prohibited. Provider constraints are
-handled through authorized identities, shared authoritative budgets, persistence, caching,
-backoff, source health, failover, and explicit coverage metadata.
-
 ## Planning and implementation are separate deliverables
 
 An implementation plan, design, or research report that is independently useful must be delivered
@@ -319,8 +313,8 @@ The terminal condition requires all of the following at one clean, unchanged exa
    backtesting, portfolio, execution/risk, valuation, CLI, and MCP capability is a working bounded
    producer-to-consumer vertical slice.
 2. The integrated local demonstration exercises the required CLI and complete typed MCP surfaces
-   without a mandatory paid API, cloud service, external database, container runtime, telemetry
-   service, or provider-access evasion.
+   without a mandatory paid API, cloud service, external database, container runtime, or telemetry
+   service.
 3. Deterministic tests, separately gated authorized network smokes, parser/model/MCP fuzz targets,
    measured performance, and security, dependency, vulnerability, license, credential, and
    generated-artifact checks provide fresh exact-head evidence.

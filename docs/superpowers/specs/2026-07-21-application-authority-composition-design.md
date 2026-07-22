@@ -10,7 +10,7 @@ production source through the canonical capture/live/risk/paper graph, and make 
 MCP command use the hardened transport with durable audit and controlled artifact ownership.
 
 The existing `DirectUnverified` ceilings remain unchanged. This remediation adds no execution
-eligibility and no provider-access evasion mechanism.
+eligibility.
 
 ## Exact-generation authority
 

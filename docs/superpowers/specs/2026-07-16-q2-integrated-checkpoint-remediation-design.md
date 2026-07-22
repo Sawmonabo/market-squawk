@@ -19,18 +19,7 @@ record.
 
 The correction must preserve the already-closed Q2 invariants. In particular, no remedy may make
 live authority serializable or clonable, move control-plane I/O into the event-to-action path,
-weaken bounded queues, detach workers, or make provider restrictions avoidable.
-
-## Security and provider-access boundary
-
-Provider access is limited to user-authorized and published interfaces. Identity/account rotation,
-browser or TLS fingerprint concealment, CAPTCHA or anti-bot bypass, proxy rotation intended to
-defeat blocking, distributed quota evasion, stealth scraping, and access-control circumvention are
-permanently prohibited.
-
-Canonical identity exists to make one legitimate quota harder to multiply. It must not create or
-select alternate identities. Retry-After, refusal, disable, and terminal states remain authoritative
-fail-closed transitions.
+weaken bounded queues, or detach workers.
 
 ## Remediation map
 
@@ -100,8 +89,7 @@ caller key. Source metadata retains display provenance separately. Deserialized 
 rederived and checked rather than trusted.
 
 This design prevents accidental or intentional alias multiplication within Market Squawk's trusted
-configuration. It does not claim to identify credentials outside the configured credential store,
-and it never probes, rotates, or compares credentials by making provider requests.
+configuration. It does not claim to identify credentials outside the configured credential store.
 
 ## Restart-durable provider budgets
 

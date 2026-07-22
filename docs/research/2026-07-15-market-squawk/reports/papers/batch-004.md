@@ -119,7 +119,7 @@ trail.
 - **Inference:** It does not validate any Market Squawk valuation, classifier, market-data adapter,
   data-quality transition, or execution gate.
 - **Inference:** It provides no basis for treating Level 2/3 values as Level 1 evidence or
-  `DirectVerified` data, and no support for quota/access-control evasion.
+  `DirectVerified` data.
 
 ## Source List
 

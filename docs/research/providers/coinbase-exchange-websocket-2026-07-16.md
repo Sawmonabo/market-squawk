@@ -35,10 +35,9 @@ delivery relationship of `ws-direct`. See the official
 One registry-coordinated provider budget governs connection/subscription attempts. The source opens
 one connection generation and returns terminally to the supervisor on refusal, closure, timeout, or
 network error. A reconnect requires a new registry session, generation, raw-frame factory, and
-capture authority. The implementation contains no account, identity, endpoint, proxy, TLS
-fingerprint, CAPTCHA, or quota rotation. Provider refusals use the shared backoff policy documented
-by the platform. Coinbase's published limits are treated as shared constraints, not identities to
-shard around; see [Exchange WebSocket rate limits](https://docs.cdp.coinbase.com/exchange/websocket-feed/rate-limits)
+capture authority. Provider refusals use the shared backoff policy documented by the platform.
+Coinbase's published limits are treated as shared constraints; see
+[Exchange WebSocket rate limits](https://docs.cdp.coinbase.com/exchange/websocket-feed/rate-limits)
 and [Exchange WebSocket errors](https://docs.cdp.coinbase.com/exchange/websocket-feed/errors).
 
 All connect, subscription-write, read, pong-write, and close-response operations are cancellable

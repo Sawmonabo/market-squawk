@@ -41,8 +41,7 @@ key. ([SEC developer FAQ](https://www.sec.gov/about/webmaster-frequently-asked-q
 **Inference.** Use one process-wide SEC token bucket configured below the published
 ceiling, a truthful stable user agent, bounded concurrency, response caching, and
 capped exponential backoff with jitter for throttling or transient failures. Stop and
-degrade source health after a retry budget; do not rotate identities, IPs, proxies, or
-headers to evade blocking. Cache raw response bodies by payload hash and retain the
+degrade source health after a retry budget. Cache raw response bodies by payload hash and retain the
 request URL as mutable locator metadata, not as immutable identity. Prefer bulk
 archives for backfill to reduce load.
 
@@ -65,8 +64,7 @@ query, and 10 years per query. Registered v2 allows 500 daily queries, 50 series
 
 **Inference.** The default zero-mandatory-cost adapter can use v1 within its limits;
 v2 is an optional user-authorized free-key configuration. Track daily and rolling
-windows locally before sending, batch within series/year caps, and never obtain or
-rotate registrations to evade limits.
+windows locally before sending and batch within series/year caps.
 
 ### 2. Endpoint and bulk choices should minimize requests without losing provenance
 

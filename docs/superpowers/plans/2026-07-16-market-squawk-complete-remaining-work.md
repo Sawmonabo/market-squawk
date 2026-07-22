@@ -32,8 +32,6 @@ the Rust project subsequently classified and corrected its LLVM miscompilation i
 
 - No paid software, paid API, cloud service, external database service, mandatory container
   runtime, mandatory telemetry infrastructure, or OpenTelemetry version-1 dependency.
-- No identity/account rotation to evade limits, fingerprint spoofing, CAPTCHA bypass,
-  blocking-evasion proxy rotation, distributed quota evasion, or other access-control evasion.
 - Only current, registry-owned `DirectVerified` authority can permit immediate automated action by
   default. A quality enum, archived assessment, modeled value, CLI value, or MCP request is never
   execution authority.
@@ -350,7 +348,7 @@ Run disjoint adapter lanes after Q4.2 freezes schemas:
 - [ ] OFX/QFX and broker exports with raw-record preservation, account/currency validation,
   duplicate detection, cost-basis fields, and supplied-total reconciliation.
 - [ ] Generic user-owned/licensed and alternative datasets through explicit authorization,
-  provenance, coverage, schema, and lineage—not access-control circumvention.
+  provenance, coverage, schema, and lineage.
 
 ### Task Q4.4: Implement official filings and macroeconomic adapters
 
@@ -594,12 +592,10 @@ The following are not missing first-release work:
   architecture.
 - Optional future OpenTelemetry adapter. Local tracing is mandatory; OpenTelemetry infrastructure
   is deliberately absent from version 1.
-- Every evasion mechanism listed in Global Constraints is permanently prohibited, not deferred.
-
 ## Complete-release exit condition
 
 Market Squawk is complete only when Q2 through Q7 are approved on exact commits; every required
 functional adapter works; every required dataset and analytical/modeling/portfolio/fair-value/MCP/
 CLI capability is demonstrated; all deterministic, property, fuzz, security, release-build, and
 performance gates pass; no mandatory requirement remains Partial, Missing, Incorrect, or Unsafe;
-and the product retains no paid/cloud/container/telemetry/evasion requirement.
+and the product retains no paid/cloud/container/telemetry requirement.

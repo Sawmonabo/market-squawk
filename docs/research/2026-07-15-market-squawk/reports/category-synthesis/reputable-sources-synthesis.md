@@ -77,8 +77,8 @@ price.
 **Confirmed:** SEC currently limits access to 10 requests/second in aggregate regardless of the
 number of machines, requires a declared organization/contact user agent, may limit excessive
 requests, and recommends bulk data for large retrievals. BLS v1 and registered v2 have different
-daily, series, and year limits, while both allow 50 requests per 10 seconds; BLS may block attempted
-circumvention. V2 requires user registration, CAPTCHA, a key, and annual renewal.
+daily, series, and year limits, while both allow 50 requests per 10 seconds. V2 requires user
+registration, CAPTCHA, a key, and annual renewal.
 [SEC policy](https://www.sec.gov/about/privacy-information),
 [SEC bulk guidance](https://www.sec.gov/search-filings/edgar-application-programming-interfaces),
 [BLS FAQ](https://www.bls.gov/developers/api_faqs.htm),
@@ -87,9 +87,7 @@ circumvention. V2 requires user registration, CAPTCHA, a key, and annual renewal
 **Inference:** Each extraction provider needs a single supervised local budget across its workers
 and processes, bounded concurrency, request coalescing/batching, cache and manifests, backoff, and
 health states such as healthy, degraded, rate-limited, and unavailable. On rejection or blocking,
-stop and wait. Identity/account rotation, browser or TLS fingerprint spoofing, CAPTCHA or anti-bot
-bypass, blocking-evasion proxy rotation, and distributed quota evasion are prohibited capabilities,
-not backlog items. Separate hosts running under the same identity remain a documented coordination
+stop and wait. Separate hosts running under the same identity remain a documented coordination
 responsibility because a purely local installation cannot enforce a provider's cross-machine total.
 
 **Confirmed:** SEC acceptance time is not the exact public-availability time; typical lag is not
@@ -215,7 +213,7 @@ decision process, independent challenge, and controlled exceptions. Repeated pat
 | Market Squawk area | Required local artifact/control | Fail-closed gate |
 |---|---|---|
 | Domain and valuation | Separate hierarchy/depth/quality types; versioned valuation inputs, method, evidence, rules, overrides, approvals | No Level 1 without every authoritative criterion and lowest-significant-input analysis |
-| SEC/BLS adapters | Provider policy/version, declared identity, shared budget, batching/cache, cursor, health, response/audit metadata | Stop on exhausted quota, 429, blocking, or policy uncertainty; no evasion path |
+| SEC/BLS adapters | Provider policy/version, declared identity, shared budget, batching/cache, cursor, health, response/audit metadata | Stop on exhausted quota, 429, blocking, or policy uncertainty |
 | Live execution | Direct source/venue/instrument coverage plus sequence, checksum, timestamp, freshness, precision, and status validation | Only `DirectVerified`; quarantine and resynchronize on integrity failure |
 | Model registry | Purpose-bound immutable bundle, dependency graph, validation status, thresholds, limitations, fallback, change lineage | No automated action for invalid, changed, stale, failed, or out-of-scope bundle |
 | Stress analytics | Versioned scenario manifest, coherent shocks/correlations, aggregation and reconciliation evidence, approvals | Reject missing material exposures, inconsistent units/currencies, or stale approval |
@@ -248,7 +246,7 @@ decision process, independent challenge, and controlled exceptions. Repeated pat
 |---|---|---|---|---|
 | [FASB ASC 820 material](https://storage.fasb.org/ASU2011-04.pdf) / [IFRS 13](https://www.ifrs.org/issued-standards/list-of-standards/ifrs-13-fair-value-measurement/) | Primary authority; ASU is amendment material | Exit-price objective and Level 1/2/3 input hierarchy | Accounting measurement, not feed/execution qualification; full current standards and judgment still required | 001 |
 | [SEC access policy](https://www.sec.gov/about/webmaster-frequently-asked-questions) | First-party current operational guidance in batch | Declared identity, aggregate cap, bulk access, timestamp limitation | Policy can change; no technical support or exact public-availability timestamp | 001 |
-| [BLS API policy](https://www.bls.gov/developers/api_faqs.htm) | First-party API limits/terms | Registered/unregistered limits and anti-circumvention boundary | Not a vintage database or license for quota evasion | 001 |
+| [BLS API policy](https://www.bls.gov/developers/api_faqs.htm) | First-party API limits/terms | Registered/unregistered limits | Not a vintage database | 001 |
 | [NIST SSDF 1.1](https://csrc.nist.gov/pubs/sp/800/218/final) | Assigned final publication | Secure-development lifecycle and vulnerability-response practices | High-level guidance, not certification or tool mandate | 001 |
 | [OWASP ASVS 5.0.0](https://owasp.org/www-project-application-security-verification-standard/) | Stable version in batch | Versioned testable application-security requirements | Architecture-specific applicability; stdio is not a browser app | 001 |
 | [SLSA 1.2](https://slsa.dev/spec/v1.2/) | Approved/current specification in batch | Source/build levels, provenance and tamper-resistance requirements | Artifact/platform-specific; does not replace SBOM, audits, or runtime security | 001 |

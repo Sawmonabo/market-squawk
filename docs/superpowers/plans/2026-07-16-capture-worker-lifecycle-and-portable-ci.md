@@ -17,7 +17,7 @@
 - Both worker and owner destination guards must be gone before the weak registry permits reuse.
 - Preserve bounded queue accounting and persist late completed writes in the final reap report.
 - Do not edit source/live production files unless compilation makes it unavoidable; report all overlap.
-- No `unwrap`, `expect`, intentional panic, identity/account rotation, fingerprint/proxy spoofing, CAPTCHA bypass, or quota evasion.
+- No `unwrap`, `expect`, or intentional panic.
 - Cloud CI is optional evidence; local scripts remain authoritative.
 
 ---

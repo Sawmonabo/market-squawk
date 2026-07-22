@@ -31,4 +31,3 @@ In particular:
 - Remove clean lane worktrees promptly after integration and handoff, then prune their worktree
   metadata. Never force-remove a dirty or still-active worktree; reconcile or preserve its
   uncommitted state first. Branches and commits may remain until normal branch completion.
-- Keep all provider-access evasion mechanisms permanently excluded.

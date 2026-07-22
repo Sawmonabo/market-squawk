@@ -267,24 +267,6 @@ tests; the documentation specifies no plan-level threading or resource guarantee
 Any load, warm-up, or inference error produces no automated action. Another backend is
 a fallback only after independent validation against the same bundle.
 
-### 8. Provider limits must be honored; evasion is outside the product
-
-**Confirmed.** The reviewed documentation supplies ordinary configuration mechanisms
-such as Reqwest proxy selection, SEC user-agent identification, FRED per-user keys,
-and BLS registered/unregistered limits. It does not authorize concealment or quota
-avoidance
-([Reqwest](https://docs.rs/reqwest/latest/reqwest/),
-[SEC FAQ](https://www.sec.gov/about/webmaster-frequently-asked-questions),
-[FRED keys](https://fred.stlouisfed.org/docs/api/api_key.html),
-[BLS FAQ](https://www.bls.gov/developers/api_faqs.htm)).
-
-**Inference.** Market Squawk should explicitly reject identity/account rotation to
-evade limits, TLS or browser fingerprint spoofing, CAPTCHA/anti-bot bypass, concealment
-proxy rotation, and distributed quota evasion. Legitimate configured proxies,
-user-owned keys, and optional licensed adapters remain possible when disclosed and
-provider-authorized. When a budget is exhausted or access is blocked, the correct
-state is cached/degraded/unavailable with bounded retry—not concealed traffic.
-
 ## Medium- and Low-Confidence Findings
 
 ### Medium confidence

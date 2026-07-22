@@ -193,9 +193,6 @@ a plausible price or decision.
   survivorship correction or direction under every selection rule.
 - **Inference:** This batch establishes no implemented Market Squawk capability and no measured
   throughput, latency, memory, or backtest performance.
-- **Inference:** It provides no support for account rotation, fingerprint spoofing, CAPTCHA bypass,
-  proxy rotation, or quota/blocking evasion; those behaviors remain out of scope.
-
 ## Source List
 
 1. Noble, Patrick; Rosenbaum, Mathieu; Souilmi, Saad. “Bridging the Reality Gap in Limit Order Book

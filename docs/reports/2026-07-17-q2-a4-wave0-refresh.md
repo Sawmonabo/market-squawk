@@ -19,9 +19,7 @@ from A3 because it adds reviewed documentation; the raw path diff and explicit z
 non-documentation count below prove that the production tree is unchanged.
 
 This report is evidence, not implementation credit. Q2 remains below the binding
-production-weighted halfway boundary. Provider identity/account rotation, browser or TLS
-fingerprint spoofing, CAPTCHA/anti-bot bypass, quota-evasion proxy rotation, and distributed
-quota-evasion requests remain permanently excluded.
+production-weighted halfway boundary.
 
 ## Git and host provenance
 

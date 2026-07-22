@@ -34,11 +34,6 @@ materials are banking guidance, and their use for a personal/local platform is a
 inference, not a claim that Market Squawk is subject to those regimes. Similarly, OWASP ASVS is
 used as a verification checklist, not as proof that a Rust CLI or MCP server is a web application.
 
-Provider controls are hard constraints. Identity or account rotation, CAPTCHA bypass,
-browser/TLS fingerprint spoofing, concealment proxy rotation, and distributed requests intended
-to evade quotas or blocking are explicitly rejected. The compliant design is source-specific
-rate limiting, declared identity where required, bounded retries with jitter, `Retry-After`
-handling, caching, bulk downloads, local persistence, coverage metadata, and adapter failover.
 Access date for every selected source is **2026-07-15**.
 
 ## Search Queries Used
@@ -87,9 +82,6 @@ approved SLSA v1.2 specification.
 - **Limits:** the SEC can change its access policy, and a nominal request rate does not guarantee
   availability or timely acceptance. The adapter needs bounded concurrency, exponential backoff,
   circuit breaking, and source-health reporting.
-- **Evasion boundary:** adding machines, accounts, IPs, proxies, or misleading identity to escape
-  the aggregate policy is not a supported design.
-
 ### R02 — BLS quotas and registration
 
 - **Claim/evidence:** The [BLS API FAQ](https://www.bls.gov/developers/api_faqs.htm)
@@ -99,12 +91,9 @@ approved SLSA v1.2 specification.
 - **Implementation inference:** operate without registration by default within v1 limits; accept
   an explicitly user-supplied v2 registration key as an optional capability; split date ranges
   within documented bounds; persist results and only refresh mutable observations.
-- **Limits:** registration includes a human CAPTCHA and annual renewal. That workflow must remain
-  outside the adapter. Limits and registration terms can change, so configuration must not hard
-  code entitlement assumptions without coverage metadata.
-- **Evasion boundary:** CAPTCHA automation, synthetic identities, key/account rotation, and
-  distributed requests to multiply quotas are excluded.
-
+- **Limits:** registration includes a human CAPTCHA and annual renewal. Limits and registration
+  terms can change, so configuration must not hard code entitlement assumptions without coverage
+  metadata.
 ### R03 — NIST SSDF
 
 - **Claim/evidence:** [NIST SP 800-218](https://csrc.nist.gov/pubs/sp/800/218/final)
@@ -206,7 +195,6 @@ approved SLSA v1.2 specification.
 | OpenSSF S2C2F announcement blog | https://openssf.org/blog/2022/11/16/openssf-expands-supply-chain-integrity-efforts-with-s2c2f/ | Useful context, but the approved SLSA v1.2 specification provides a clearer versioned release-integrity baseline for this bounded inventory. |
 | OWASP Top Ten | https://owasp.org/www-project-top-ten/ | Awareness list rather than the testable, version-addressable control catalog needed here; ASVS was selected. |
 | Accounting-firm ASC 820/IFRS 13 summaries | — | Secondary interpretations were unnecessary because standard-setter sources were available; such summaries also cannot establish authority. |
-| Provider-limit bypass guides, CAPTCHA services, fingerprint-spoofing tools, and proxy-rotation services | — | Conflict with provider policies and the specification's lawful adapter/caching/failover model; no implementation relevance was accepted. |
 | Generic cybersecurity listicles and product marketing | — | Lack primary evidence, versioned control requirements, or vendor-neutral credibility. |
 
 ## Coverage Gaps

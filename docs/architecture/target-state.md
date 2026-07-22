@@ -439,8 +439,7 @@ Each provider has one local shared request budget. All workers for the same prov
 that budget. The HTTP client uses explicit connect/read/total timeouts, redirect policy, proxy
 policy, user agent, TLS roots, response-size bounds, and retry classification. HTTP 429 and provider
 block responses trigger `Retry-After` or capped exponential backoff with jitter and a source-health
-transition. Adapters never rotate identity, account, fingerprint, proxy, or hosts to defeat limits.
-
+transition.
 ## Live execution plane
 
 ### Event flow
@@ -721,8 +720,7 @@ overrides. Effective configuration is validated and can be printed with secrets 
 
 Credentialed adapters use OS keyring storage where available and an encrypted local fallback.
 Secret values never implement `Display`, never enter tracing fields, and never appear in MCP or
-artifacts. Source and execution endpoints are allowlisted; unsafe TLS and concealment proxy options
-are absent from production configuration.
+artifacts. Source and execution endpoints are allowlisted.
 
 ## Compatibility and migration
 
@@ -750,12 +748,6 @@ The complete release measures decoder throughput, sequence/checksum validation, 
 book/features/strategy/risk latency, event-to-decision percentiles, Arrow/Parquet/DataFusion
 throughput, and peak memory on documented hardware. The 100,000 events/s and sub-millisecond warmed
 p99 targets are claims only after those measurements pass.
-
-## Security boundary
-
-Market Squawk does not implement identity/account rotation to evade limits, browser/TLS fingerprint
-concealment, CAPTCHA/anti-bot bypass, blocking-evasion proxies, or distributed quota evasion. These
-behaviors are prohibited by design review, configuration schemas, tests, and source policy.
 
 ## Exact identity evidence invariant
 

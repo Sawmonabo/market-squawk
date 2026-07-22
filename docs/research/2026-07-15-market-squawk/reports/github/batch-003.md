@@ -55,9 +55,7 @@ limits are server-authoritative: it does not pre-throttle and returns enriched r
 [REST client](https://github.com/krakenfx/kraken-cli/blob/aa32814cea70913a70c9909693a7abd762963e83/src/client.rs),
 [README](https://github.com/krakenfx/kraken-cli/blob/aa32814cea70913a70c9909693a7abd762963e83/README.md)
 **Inference:** Reuse the idempotency-aware retry policy and error taxonomy in a native adapter, but
-add a lawful local limiter, bounded queues, source-health transitions, and explicit cooldowns. Never
-use identity/account rotation, fingerprint spoofing, CAPTCHA bypass, concealment proxies, or
-distributed requests to evade provider limits.
+add a local limiter, bounded queues, source-health transitions, and explicit cooldowns.
 
 **Confirmed:** Spot and futures WebSocket commands implement bounded reconnect, exponential backoff
 with jitter, a 12-attempt stream-lifecycle limit, a 120-reconnect/600-second safety budget, and

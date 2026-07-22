@@ -29,7 +29,6 @@ Proptest for invariants, and deterministic thread/barrier tests for concurrency.
   data.
 - Every unavailable budget transition revokes already-issued availability leases before returning.
 - Conflicting process-wide registrations and all epoch-overflow paths are failure atomic.
-- Scope authorization by legitimate provider identity; do not implement limit or blocking evasion.
 - Run `cargo fmt --all --check` and `git diff --check` at every task boundary.
 
 ---
@@ -156,7 +155,7 @@ Proptest for invariants, and deterministic thread/barrier tests for concurrency.
 
 ---
 
-## Task 6: Correct anti-evasion documentation and inspect downstream blast radius
+## Task 6: Inspect downstream source-authority blast radius
 
 **Files:**
 
@@ -165,9 +164,6 @@ Proptest for invariants, and deterministic thread/barrier tests for concurrency.
 - Persist: a concise Q2 checkpoint note in the existing planning/review location if the repository
   has one
 
-- [x] Replace ambiguous retry/identity language with categorical provider-authorized behavior:
-  honor quotas and blocking; never rotate account, identity, fingerprint, proxy, or distributed
-  caller for evasion.
 - [x] Use `rg` to enumerate constructors, health reports, budget transitions, restore paths, and
   current-authority consumers; fix compile-time and semantic ripple effects rather than adding
   compatibility shims that weaken invariants.

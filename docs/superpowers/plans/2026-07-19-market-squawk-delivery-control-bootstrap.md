@@ -58,9 +58,6 @@ capture benchmark harness, and Codex subagents/worktrees.
   cohesive lane, not a checklist item.
 - Preserve dirty worktrees. Remove a worktree only after its work is integrated or handed off, the
   owner is inactive, and `git status --short` is empty.
-- Identity/account rotation, browser/TLS concealment, CAPTCHA or anti-bot bypass, blocking-evasion
-  proxy rotation, stealth scraping, distributed quota evasion, and access-control circumvention
-  remain prohibited.
 - Tests remain thin, concise, and behavior-critical. Do not add tests for the tracker or prose.
 
 ---

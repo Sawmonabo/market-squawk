@@ -86,14 +86,6 @@ and tests close them. They are not accepted as documentation-only limitations.
 The lanes work in isolated worktrees from `20ad084`; none may use the shared root as an unreviewed
 merge surface. Every lane is test-first and must report exact commit and command evidence.
 
-## Prohibited-capability review
-
-Neither reviewer found identity/account rotation, TLS/browser fingerprint concealment, CAPTCHA or
-anti-bot bypass, blocking-evasion proxy rotation, or distributed quota-evasion machinery. However,
-Q2-R04 and Q2-R05 prevent certification of the stronger structural “quotas cannot be multiplied”
-claim until the process-wide coordinator and audited account binding are implemented. The remedy is
-one authoritative identity and budget scope, never rotation or circumvention.
-
 ## Persisted tool references
 
 - [Cargo-deny checks and configuration](https://embarkstudios.github.io/cargo-deny/)
@@ -139,8 +131,7 @@ reports, deduplicated into thirteen remediation contracts:
 
 Q2-I08 incorporates the separate Minor raw-capture capacity undercount because both require one
 closed capture object-graph accounting contract. No reviewer found an execution-authority bypass,
-provider-access evasion implementation, hot-path analytical I/O, or reopening of an original
-R01–R15 defect as framed.
+hot-path analytical I/O, or reopening of an original R01–R15 defect as framed.
 
 The controlling design and TDD/DAG plan are:
 
