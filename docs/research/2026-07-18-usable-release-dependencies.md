@@ -123,6 +123,20 @@ hashed, and validated for that filing.
 | [`tract-onnx`](https://docs.rs/crate/tract-onnx/0.23.4) | `=0.23.4`, `default-features = false` | MIT OR Apache-2.0; Rust 1.91 | Required self-contained ONNX-compatible backend. It has no default feature or native runtime download. Bundle admission still allowlists supported operators, dimensions, tensor bytes, model bytes, threads, warm-up, and deadlines; any parse or inference error produces no automated action. |
 | [`ort`](https://docs.rs/crate/ort/2.0.0-rc.12) | Optional `=2.0.0-rc.12`, `default-features = false`, `features = ["api-24", "load-dynamic", "std"]` | MIT OR Apache-2.0; Rust 1.88; no stable 2.x release | Optional isolated backend only. Explicitly exclude `download-binaries`, `copy-dylibs`, `fetch-models`, TLS, training, tracing, ndarray, and every hardware execution-provider feature. Load only an operator-provided local ONNX Runtime 1.24 library after exact version/platform/license/hash verification from a confined no-follow path. Run it behind a failure-isolated worker and keep `tract-onnx` as the stable fallback. ONNX Runtime is MIT licensed; its C/C++ shared library is a separately inventoried native artifact. See the [`ort` feature manifest](https://github.com/pykeio/ort/blob/9c840a386acc808aaaf5ac28ae0fc13ee164678c/Cargo.toml) and [ONNX Runtime compatibility table](https://onnxruntime.ai/docs/reference/compatibility.html). |
 
+Revalidated on 2026-07-22: crates.io still publishes `tract-onnx` 0.23.4, whose
+[tagged workspace manifest](https://github.com/sonos/tract/blob/v0.23.4/Cargo.toml) declares Rust
+1.91, and `ort` 2.0.0-rc.12 remains the latest published `ort` release. The
+[`ort` release manifest](https://github.com/pykeio/ort/blob/v2.0.0-rc.12/Cargo.toml) confirms that
+its defaults enable downloads, native-library copying, and TLS while the admitted
+`std`/`load-dynamic`/`api-24` set disables build-time linking and fetching. ONNX Runtime's
+[model-validation guidance](https://onnxruntime.ai/docs/) explicitly warns that spec-valid hostile
+models can consume excessive memory or compute, so runtime parsing is not an admission boundary.
+Market Squawk therefore rejects external tensor data entirely despite
+ONNX's newer [external-data containment guidance](https://onnx.ai/onnx/repo-docs/ExternalDataSecurity.html),
+preflights the closed operator/shape/resource policy before either runtime, bounds runtime threads,
+and disables ONNX Runtime telemetry through its documented
+[`DisableTelemetryEvents`](https://onnxruntime.ai/docs/api/c/struct_ort_api.html) API.
+
 The Python lock contains only actual product consumers and their hash-locked transitives. It must
 not add a broad notebook stack to satisfy the release. Statistical kernels may use floating point
 behind explicit conversion boundaries; accounting, money, fees, cost basis, and portfolio ledgers
