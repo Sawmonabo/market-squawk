@@ -372,6 +372,10 @@ rebalancing; preserves authoritative cumulative corporate-action snapshots; and 
 unresolved basis as incomplete rather than exact zero. Task 16 remains open until Step 6 binds and
 rechecks the current portfolio revision through risk approval and one-time dispatch.
 
+After the accepted release state and GitHub evidence were pushed, both completed feature targets
+were cleaned (6.9 GiB total), both clean worktrees were removed, both merged local/origin feature
+branches were deleted, and worktree/remote metadata was pruned. Only the release worktree remains.
+
 The next safe parallel wave is Task 14's Python financial analytics/training product and Task 16
 Step 6's execution-owned portfolio binding. Task 15 ONNX integration begins only against the frozen
 Task 13 contract and must not weaken controlled-root, exact-identity, bounded-runtime, or no-action

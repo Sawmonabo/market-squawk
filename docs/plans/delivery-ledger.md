@@ -146,6 +146,10 @@ application size.
   9.8 GiB generated target; deleted merged local and origin branch
   `feature/analytics-feature-vertical`; and pruned worktree and remote metadata. Issue `#17` is
   closed and its Project 5 item is `Done`.
+- Removed the accepted model-bundle worktree after reclaiming 4.1 GiB and the accepted portfolio
+  core worktree after reclaiming 2.8 GiB; deleted both merged local and origin product branches and
+  pruned worktree/remote metadata. Only the release worktree remains. Issue `#18` is closed and its
+  Project 5 item is `Done`; issue `#21` remains `In Progress` solely for Task 16 Step 6.
 
 The next delivery events are Task 16 Step 6's portfolio-bound execution authority and Task 14's
 Python financial analytics/training product. Tasks 13 and 16 Steps 1–5 do not claim that the Market
