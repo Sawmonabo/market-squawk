@@ -40,6 +40,10 @@ exceptions = [
     { allow = ["MITNFA"], crate = "hex_lit@0.1.1" },
     { allow = ["CDLA-Permissive-2.0"], crate = "webpki-roots@0.26.11" },
     { allow = ["CDLA-Permissive-2.0"], crate = "webpki-roots@1.0.8" },
+    # Required tract-onnx 0.23.4 transitively compiles dyn-eq into the local ONNX backend.
+    # Keep the weak-copyleft admission exact; distribution obligations and source are recorded in
+    # docs/licenses/tract-onnx-notice.md.
+    { allow = ["MPL-2.0"], crate = "dyn-eq@0.1.3" },
     # Exact transitive DataFusion 54 dependency versions; keep Zlib scoped to these crates.
     { allow = ["Zlib"], crate = "foldhash@0.1.5" },
     { allow = ["Zlib"], crate = "foldhash@0.2.0" },

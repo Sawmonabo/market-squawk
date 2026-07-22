@@ -3,6 +3,9 @@
 Market Squawk's required ONNX implementation is `TractOnnxBackend`. It is self-contained Rust,
 loads only an admitted in-memory model bundle, and requires no external native library, Python
 process, account, service, or network request. Build the modeling crate with `onnx-tract` to use it.
+The required tract dependency inventory includes one exact MPL-2.0 transitive component; its source
+and distribution notice are recorded in
+[`tract-onnx-notice.md`](../licenses/tract-onnx-notice.md).
 
 The `onnx-runtime` feature is an optional CPU acceleration path. It adds the pinned Rust `ort`
 binding with default features disabled and dynamic loading enabled. It does not bundle, download,
@@ -102,3 +105,6 @@ still passes through strategy and the sole risk boundary.
 
 Replacing the runtime library, policy, notice, evidence, model generation, version, or platform
 invalidates the previous optional admission. Generate new evidence; never reuse an earlier tuple.
+
+Release packaging must retain both ONNX notices: the tract notice whenever the required backend is
+shipped, and the native-runtime notice only when the optional operator-supplied library is included.
