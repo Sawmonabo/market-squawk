@@ -936,12 +936,18 @@ fn feature_label_batch(
     Ok((batch, Sha256Digest::new(hash.finalize().into())))
 }
 
-fn fixed_text_array<'value>(
-    values: impl IntoIterator<Item = Option<&'value str>>,
+fn fixed_text_array<'value, Values>(
+    values: Values,
     width: i32,
-) -> Result<FixedSizeBinaryArray, DatasetBuildError> {
+) -> Result<FixedSizeBinaryArray, DatasetBuildError>
+where
+    Values: IntoIterator<Item = Option<&'value str>>,
+    Values::IntoIter: ExactSizeIterator,
+{
     let width = usize::try_from(width).map_err(|_| DatasetBuildError::InvalidRequest)?;
-    let mut builder = FixedSizeBinaryBuilder::new(
+    let values = values.into_iter();
+    let mut builder = FixedSizeBinaryBuilder::with_capacity(
+        values.len(),
         i32::try_from(width).map_err(|_| DatasetBuildError::InvalidRequest)?,
     );
     let mut padded = vec![0_u8; width];

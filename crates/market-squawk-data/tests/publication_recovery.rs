@@ -1087,7 +1087,7 @@ async fn point_in_time_builder_publishes_one_authorized_queryable_generation() -
         <[u8; 32]>::from(Sha256::digest(export.bytes()))
     );
     let export_json: serde_json::Value = serde_json::from_slice(export.bytes())?;
-    assert_eq!(export_json["schema_version"], 1);
+    assert_eq!(export_json["schema_version"], 2);
     assert_eq!(
         export_json["dataset"]["build_spec_sha256"],
         hex_digest(built.build_spec_digest().digest().bytes())
