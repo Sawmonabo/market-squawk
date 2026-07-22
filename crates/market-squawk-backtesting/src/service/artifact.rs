@@ -17,6 +17,10 @@ struct ArtifactWire {
     result_digest: String,
     accounting_reconciliation: &'static str,
     no_action_count: usize,
+    sharpe: f64,
+    return_observations: usize,
+    return_skewness: f64,
+    return_excess_kurtosis: f64,
     fills: Vec<FillWire>,
     portfolio: PortfolioWire,
 }
@@ -99,7 +103,7 @@ pub(super) fn encode(
         })
         .collect();
     let wire = ArtifactWire {
-        schema_version: 1,
+        schema_version: 2,
         dataset_identity: hex(request.dataset_identity().bytes()),
         object_graph_digest: hex(request.dataset.object_graph_digest().bytes()),
         execution_assumption_digest: hex(request.assumption_digest().bytes()),
@@ -107,11 +111,12 @@ pub(super) fn encode(
         result_digest: hex(run.result_digest().bytes()),
         accounting_reconciliation: match run.accounting_reconciliation() {
             AccountingReconciliation::Independent => "independent",
-            AccountingReconciliation::Task16AuthoritativeCorporateActions => {
-                "task16_authoritative_corporate_actions"
-            }
         },
         no_action_count: run.no_action_count(),
+        sharpe: run.performance().sharpe,
+        return_observations: run.performance().observations,
+        return_skewness: run.performance().skewness,
+        return_excess_kurtosis: run.performance().excess_kurtosis,
         fills,
         portfolio: PortfolioWire {
             revision_id: hex(portfolio.token().bytes()),

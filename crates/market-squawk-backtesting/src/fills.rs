@@ -13,6 +13,16 @@ use rand_core::{RngCore as _, SeedableRng as _};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
+/// Current complete semantic version of the research execution policy.
+pub const RESEARCH_EXECUTION_POLICY_VERSION: u32 = 2;
+
+/// Deterministic precedence applied when multiple eligible intents compete for one snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResearchLiquidityPriority {
+    /// Earlier signals win, with canonical order identity breaking exact-time ties.
+    SignalTimeThenOrderId,
+}
+
 /// Untrusted research-fill policy input.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ResearchExecutionAssumptionsInput {
@@ -26,6 +36,8 @@ pub struct ResearchExecutionAssumptionsInput {
     pub maximum_random_slippage_basis_points: BasisPoints,
     /// Maximum share of evidenced executable depth consumed by one order.
     pub maximum_participation_basis_points: BasisPoints,
+    /// Deterministic precedence for the shared aggregate snapshot-depth budget.
+    pub liquidity_priority: ResearchLiquidityPriority,
     /// Minimum event-time delay between signal and execution.
     pub latency_nanos: i64,
     /// Whether an order may terminate with less than its requested quantity filled.
@@ -42,6 +54,7 @@ pub struct ResearchExecutionAssumptions {
     slippage_basis_points: BasisPoints,
     maximum_random_slippage_basis_points: BasisPoints,
     maximum_participation_basis_points: BasisPoints,
+    liquidity_priority: ResearchLiquidityPriority,
     latency_nanos: i64,
     allow_partial_fills: bool,
     fee_decimal_scale: u32,
@@ -58,9 +71,10 @@ impl ResearchExecutionAssumptions {
             input.maximum_random_slippage_basis_points,
             input.maximum_participation_basis_points,
         ];
-        if rates
-            .into_iter()
-            .any(|rate| !(0..=10_000).contains(&rate.get()))
+        if version.get() != RESEARCH_EXECUTION_POLICY_VERSION
+            || rates
+                .into_iter()
+                .any(|rate| !(0..=10_000).contains(&rate.get()))
             || input.maximum_participation_basis_points.get() == 0
             || input.latency_nanos <= 0
             || input.fee_decimal_scale > 28
@@ -68,7 +82,7 @@ impl ResearchExecutionAssumptions {
             return Err(ResearchFillError::InvalidPolicy);
         }
         let mut hash = Sha256::new();
-        hash.update(b"market-squawk/research-execution-assumptions/v1");
+        hash.update(b"market-squawk/research-execution-assumptions/v2");
         hash.update(version.get().to_be_bytes());
         hash.update(input.fee_basis_points.get().to_be_bytes());
         hash.update(input.slippage_basis_points.get().to_be_bytes());
@@ -79,6 +93,9 @@ impl ResearchExecutionAssumptions {
                 .to_be_bytes(),
         );
         hash.update(input.maximum_participation_basis_points.get().to_be_bytes());
+        hash.update([match input.liquidity_priority {
+            ResearchLiquidityPriority::SignalTimeThenOrderId => 1,
+        }]);
         hash.update(input.latency_nanos.to_be_bytes());
         hash.update([u8::from(input.allow_partial_fills)]);
         hash.update(input.fee_decimal_scale.to_be_bytes());
@@ -88,6 +105,7 @@ impl ResearchExecutionAssumptions {
             slippage_basis_points: input.slippage_basis_points,
             maximum_random_slippage_basis_points: input.maximum_random_slippage_basis_points,
             maximum_participation_basis_points: input.maximum_participation_basis_points,
+            liquidity_priority: input.liquidity_priority,
             latency_nanos: input.latency_nanos,
             allow_partial_fills: input.allow_partial_fills,
             fee_decimal_scale: input.fee_decimal_scale,
@@ -109,6 +127,10 @@ impl ResearchExecutionAssumptions {
 
     pub(crate) const fn latency_nanos(self) -> i64 {
         self.latency_nanos
+    }
+
+    pub(crate) const fn liquidity_priority(self) -> ResearchLiquidityPriority {
+        self.liquidity_priority
     }
 }
 
@@ -214,15 +236,13 @@ impl ResearchFillSimulator {
         executed_at: Timestamp,
         mid_price: PriceTicks,
         spread: BasisPoints,
-        depth: QuantityLots,
+        available_capacity: QuantityLots,
     ) -> Result<Option<ResearchFill>, ResearchFillError> {
-        let capacity =
-            participation_capacity(depth, self.assumptions.maximum_participation_basis_points)?;
-        if capacity.get() == 0 {
+        if available_capacity.get() == 0 {
             return Ok(None);
         }
         let requested = intent.quantity();
-        let fill_lots = requested.get().min(capacity.get());
+        let fill_lots = requested.get().min(available_capacity.get());
         if fill_lots < requested.get() && !self.assumptions.allow_partial_fills {
             return Ok(None);
         }
@@ -275,6 +295,13 @@ impl ResearchFillSimulator {
             partial: fill_lots < requested.get(),
             assumption_digest: self.assumptions.digest,
         }))
+    }
+
+    pub(crate) fn observation_capacity(
+        &self,
+        depth: QuantityLots,
+    ) -> Result<QuantityLots, ResearchFillError> {
+        participation_capacity(depth, self.assumptions.maximum_participation_basis_points)
     }
 }
 

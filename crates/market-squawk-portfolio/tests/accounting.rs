@@ -8,7 +8,7 @@ use market_squawk_data::{
     CorporateActionAdjustment, CorporateActionLimits, CorporateActionPlan, CorporateActionPolicy,
 };
 use market_squawk_domain::{
-    CorporateActionKind, Currency, DigestAlgorithm, EvidenceDigest, Money,
+    CorporateActionKind, Currency, DigestAlgorithm, EvidenceDigest, MergerConsideration, Money,
     NormalizedPortfolioTransactionClass, NormalizedPortfolioTransactionEvidence,
     NormalizedPortfolioTransactionEvidenceInput, RevisionNumber, SourceId, SourceIdentifier,
     Timestamp,
@@ -262,6 +262,105 @@ fn cumulative_corporate_action_plan_replaces_prior_snapshot_without_replaying_st
             revision_evidence_with_plan(14, 21, &first_plan)?,
         ),
         Err(PortfolioError::EvidenceMismatch)
+    ));
+    Ok(())
+}
+
+#[test]
+fn opposing_lots_preserve_gross_exposure_and_merger_cash_direction() -> TestResult {
+    let usd = Currency::try_from("USD")?;
+    let subject = instrument(1)?;
+    let successor = instrument(2)?;
+    let entries = vec![
+        entry(
+            "merger-long",
+            1,
+            None,
+            1,
+            1,
+            LedgerEntryKind::Trade(Trade::try_new(
+                TradeSide::Buy,
+                subject,
+                Decimal::TEN,
+                money(10, usd),
+                money(0, usd),
+                LotSelection::Fifo,
+            )?),
+        )?,
+        entry(
+            "merger-short",
+            1,
+            None,
+            2,
+            2,
+            LedgerEntryKind::Trade(Trade::try_new(
+                TradeSide::SellShort,
+                subject,
+                Decimal::from(4_u32),
+                money(10, usd),
+                money(0, usd),
+                LotSelection::Fifo,
+            )?),
+        )?,
+    ];
+    let mut cash_ledger = PortfolioLedger::try_new(account()?, usd, limits()?)?;
+    let before = cash_ledger.try_apply(
+        entries.clone(),
+        None,
+        valuation(21, 8, &[(1, 12)])?,
+        revision_evidence(21, 8)?,
+    )?;
+    assert_eq!(before.market_value().amount(), Decimal::from(72_u32));
+    assert_eq!(before.gross_exposure().amount(), Decimal::from(168_u32));
+
+    let cash_plan = action_plan(
+        vec![action_record(
+            4,
+            subject,
+            CorporateActionKind::Merger {
+                successor,
+                consideration: MergerConsideration::Cash {
+                    amount: money(15, usd),
+                },
+            },
+        )?],
+        20,
+    )?;
+    let cash_result = cash_ledger.try_apply(
+        Vec::new(),
+        Some(&cash_plan),
+        valuation(22, 20, &[])?,
+        revision_evidence_with_plan(22, 20, &cash_plan)?,
+    )?;
+    assert_eq!(cash_result.cash().amount(), Decimal::from(30_u32));
+    assert_eq!(cash_result.realized_gain().amount(), Decimal::from(30_u32));
+    assert_eq!(cash_result.realized_loss().amount(), Decimal::from(20_u32));
+    assert!(cash_result.positions().is_empty());
+
+    let mixed_plan = action_plan(
+        vec![action_record(
+            5,
+            subject,
+            CorporateActionKind::Merger {
+                successor,
+                consideration: MergerConsideration::Mixed {
+                    numerator: NonZeroU32::MIN,
+                    denominator: NonZeroU32::new(2).ok_or("two")?,
+                    cash: money(5, usd),
+                },
+            },
+        )?],
+        20,
+    )?;
+    let mut mixed_ledger = PortfolioLedger::try_new(account()?, usd, limits()?)?;
+    assert!(matches!(
+        mixed_ledger.try_apply(
+            entries,
+            Some(&mixed_plan),
+            valuation(23, 20, &[(2, 20)])?,
+            revision_evidence_with_plan(23, 20, &mixed_plan)?,
+        ),
+        Err(PortfolioError::UnresolvedCorporateAction)
     ));
     Ok(())
 }

@@ -1,10 +1,13 @@
 //! Manifest-pinned point-in-time orchestration and portfolio reconciliation.
 
 use market_squawk_data::{CorporateActionPlan, Sha256Digest};
+use std::collections::BTreeMap;
+
 use market_squawk_domain::{
-    AccountId, InstrumentExecutionTerms, Money, SourceIdentifier, Timestamp,
+    AccountId, InstrumentExecutionTerms, InstrumentId, Money, QuantityLots, SourceIdentifier,
+    Timestamp,
 };
-use market_squawk_execution::{BoundedOrderIntents, OrderIntent, StrategyError};
+use market_squawk_execution::{OrderIntent, StrategyError};
 use market_squawk_portfolio::{PortfolioError, PortfolioLimits, PortfolioRevision};
 use rust_decimal::Decimal;
 use sha2::{Digest as _, Sha256};
@@ -19,6 +22,7 @@ use crate::dataset::{
 use crate::fills::{
     ResearchExecutionAssumptions, ResearchFill, ResearchFillError, ResearchFillSimulator,
 };
+use crate::strategy::BacktestStrategy;
 
 mod accounting;
 
@@ -183,15 +187,6 @@ impl BacktestContext<'_> {
     }
 }
 
-/// Research strategy contract sharing execution's bounded, validated order-intent output.
-pub trait BacktestStrategy: Send + std::fmt::Debug {
-    /// Evaluates only the current immutable point-in-time observation.
-    fn on_observation(
-        &mut self,
-        context: &BacktestContext<'_>,
-    ) -> Result<BoundedOrderIntents, StrategyError>;
-}
-
 /// Detailed bounded run result retained before controlled artifact publication.
 #[derive(Clone, Debug)]
 pub struct BacktestRun {
@@ -199,6 +194,7 @@ pub struct BacktestRun {
     portfolio: PortfolioRevision,
     no_action_count: usize,
     accounting_reconciliation: AccountingReconciliation,
+    performance: BacktestPerformanceStatistics,
     result_digest: Sha256Digest,
 }
 
@@ -232,6 +228,92 @@ impl BacktestRun {
     pub const fn result_digest(&self) -> Sha256Digest {
         self.result_digest
     }
+
+    pub(crate) const fn performance(&self) -> BacktestPerformanceStatistics {
+        self.performance
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BacktestPerformanceStatistics {
+    pub(crate) sharpe: f64,
+    pub(crate) observations: usize,
+    pub(crate) skewness: f64,
+    pub(crate) excess_kurtosis: f64,
+}
+
+impl BacktestPerformanceStatistics {
+    fn from_equity_marks(marks: &[Decimal]) -> Result<Self, BacktestError> {
+        let returns = marks
+            .windows(2)
+            .map(|window| {
+                let opening = window[0];
+                if opening.is_zero() {
+                    return Err(BacktestError::PerformanceMetrics);
+                }
+                window[1]
+                    .checked_sub(opening)
+                    .and_then(|change| change.checked_div(opening))
+                    .and_then(|value| rust_decimal::prelude::ToPrimitive::to_f64(&value))
+                    .filter(|value| value.is_finite())
+                    .ok_or(BacktestError::PerformanceMetrics)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if returns.len() < 3 {
+            return Ok(Self {
+                sharpe: 0.0,
+                observations: returns.len(),
+                skewness: 0.0,
+                excess_kurtosis: 0.0,
+            });
+        }
+        let count = returns.len() as f64;
+        let mean = returns.iter().sum::<f64>() / count;
+        let squared = returns
+            .iter()
+            .map(|value| {
+                let deviation = value - mean;
+                deviation * deviation
+            })
+            .sum::<f64>();
+        let sample_variance = squared / (count - 1.0);
+        let population_variance = squared / count;
+        let standard_deviation = sample_variance.sqrt();
+        let sharpe = if standard_deviation > 0.0 {
+            mean / standard_deviation
+        } else {
+            0.0
+        };
+        let (skewness, excess_kurtosis) = if population_variance > 0.0 {
+            let population_standard_deviation = population_variance.sqrt();
+            let third = returns
+                .iter()
+                .map(|value| ((value - mean) / population_standard_deviation).powi(3))
+                .sum::<f64>()
+                / count;
+            let fourth = returns
+                .iter()
+                .map(|value| ((value - mean) / population_standard_deviation).powi(4))
+                .sum::<f64>()
+                / count;
+            (third, fourth - 3.0)
+        } else {
+            (0.0, 0.0)
+        };
+        if [sharpe, skewness, excess_kurtosis]
+            .into_iter()
+            .all(f64::is_finite)
+        {
+            Ok(Self {
+                sharpe,
+                observations: returns.len(),
+                skewness,
+                excess_kurtosis,
+            })
+        } else {
+            Err(BacktestError::PerformanceMetrics)
+        }
+    }
 }
 
 /// Explicit strength of the accounting verification performed for one run.
@@ -239,8 +321,6 @@ impl BacktestRun {
 pub enum AccountingReconciliation {
     /// Independent fill shadow cash/positions/fees agreed exactly with Task 16.
     Independent,
-    /// Task 16 applied a typed corporate-action plan that the fill-only shadow cannot reproduce.
-    Task16AuthoritativeCorporateActions,
 }
 
 /// Deterministic research engine; it owns no live adapter, broker, or journal capability.
@@ -258,14 +338,32 @@ impl BacktestEngine {
         let mut simulator = ResearchFillSimulator::new(request.assumptions, request.seed);
         let mut pending = Vec::<OrderIntent>::new();
         let mut fills = Vec::<ResearchFill>::new();
-        let mut shadow = ShadowPortfolio::new(request.portfolio.initial_cash);
         let mut no_action_count = 0_usize;
+        let mut latest_prices = BTreeMap::<InstrumentId, (Money, Timestamp)>::new();
+        let mut equity_marks = vec![request.portfolio.initial_cash.amount()];
 
         for observation in &request.dataset.observations {
             if cancellation.is_cancelled() {
                 return Err(BacktestError::Cancelled);
             }
             clock.advance(observation.decision_at)?;
+            let mut shadow = ShadowPortfolio::replay(request, &fills, observation.decision_at)?;
+            if observation.stale_at >= observation.decision_at
+                && let Some(mid_price) = observation.mid_price
+            {
+                let terms = observation.execution_terms;
+                let amount = mid_price
+                    .checked_to_decimal(terms.price_tick())?
+                    .checked_mul(terms.contract_multiplier())
+                    .ok_or(BacktestError::AccountingMismatch)?;
+                latest_prices.insert(
+                    observation.instrument_id(),
+                    (
+                        Money::new(amount, terms.quote_currency()),
+                        observation.stale_at,
+                    ),
+                );
+            }
             pending.retain(|intent| intent.expires_at() >= observation.decision_at);
             if observation.universe == HistoricalUniverseStatus::Delisted {
                 pending.retain(|intent| {
@@ -276,6 +374,14 @@ impl BacktestEngine {
                 && observation.stale_at >= observation.decision_at
                 && let Some(mid_price) = observation.mid_price
             {
+                match request.assumptions.liquidity_priority() {
+                    crate::ResearchLiquidityPriority::SignalTimeThenOrderId => {
+                        pending
+                            .sort_unstable_by_key(|intent| (intent.signal_at(), intent.order_id()));
+                    }
+                }
+                let capacity = simulator.observation_capacity(observation.executable_depth)?;
+                let mut remaining_capacity = capacity;
                 let mut index = 0_usize;
                 while index < pending.len() {
                     if pending[index].execution_terms().instrument_id()
@@ -293,13 +399,18 @@ impl BacktestEngine {
                         observation.decision_at,
                         mid_price,
                         observation.spread_basis_points,
-                        observation.executable_depth,
+                        remaining_capacity,
                     )?;
                     let Some(fill) = outcome else {
                         index += 1;
                         continue;
                     };
                     shadow.apply(&fill, pending[index].execution_terms())?;
+                    let remaining_lots = remaining_capacity
+                        .get()
+                        .checked_sub(fill.quantity().get())
+                        .ok_or(BacktestError::AccountingMismatch)?;
+                    remaining_capacity = QuantityLots::new(remaining_lots)?;
                     if fills.len() >= request.limits.max_fills {
                         return Err(BacktestError::LimitExceeded);
                     }
@@ -330,21 +441,31 @@ impl BacktestEngine {
                     pending.push(intent);
                 }
             }
+            if let Some(equity) = shadow.marked_equity(&latest_prices, observation.decision_at)? {
+                equity_marks.push(equity.amount());
+            }
         }
         let portfolio = reconcile(request, &fills)?;
-        let accounting_reconciliation = if request.corporate_actions.is_some() {
-            AccountingReconciliation::Task16AuthoritativeCorporateActions
-        } else if shadow.matches_revision(&portfolio) {
+        let final_at = request
+            .dataset
+            .observations
+            .last()
+            .ok_or(BacktestError::InvalidDataset)?
+            .decision_at;
+        let shadow = ShadowPortfolio::replay(request, &fills, final_at)?;
+        let accounting_reconciliation = if shadow.matches_revision(&portfolio) {
             AccountingReconciliation::Independent
         } else {
             return Err(BacktestError::AccountingMismatch);
         };
+        let performance = BacktestPerformanceStatistics::from_equity_marks(&equity_marks)?;
         let result_digest = result_digest(request, &fills, &portfolio, no_action_count);
         Ok(BacktestRun {
             fills: fills.into_boxed_slice(),
             portfolio,
             no_action_count,
             accounting_reconciliation,
+            performance,
             result_digest,
         })
     }
@@ -406,6 +527,8 @@ pub enum BacktestError {
     AccountingMismatch,
     #[error("open inventory lacks a fresh final valuation")]
     MissingFinalPrice,
+    #[error("backtest equity path cannot produce finite performance diagnostics")]
+    PerformanceMetrics,
     #[error("event-time clock failed: {0}")]
     Clock(#[from] EventTimeClockError),
     #[error("research fill failed: {0}")]

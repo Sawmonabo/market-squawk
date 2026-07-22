@@ -91,8 +91,10 @@ pub(crate) fn build_revision(
             .checked_add(position.market_value)
             .map_err(|_| PortfolioError::Arithmetic)
     })?;
-    let gross_exposure = positions.iter().try_fold(zero(), |total, position| {
-        let amount = position.market_value.amount();
+    let gross_exposure = state.lots.iter().try_fold(zero(), |total, lot| {
+        let amount = valuation
+            .market_value(lot.instrument_id, lot.quantity)?
+            .amount();
         let magnitude = if amount.is_sign_negative() {
             Decimal::ZERO
                 .checked_sub(amount)
@@ -204,9 +206,9 @@ enum ReplayOperation<'a> {
 }
 
 impl ReplayOperation<'_> {
-    fn key(&self) -> (Timestamp, &str, u8) {
+    fn key(&self) -> (Timestamp, u8, &str) {
         match self {
-            Self::Entry(entry) => (entry.occurred_at, entry.source.as_str(), 0),
+            Self::Entry(entry) => (entry.occurred_at, 1, entry.source.as_str()),
             Self::Action { plan, step } => {
                 let record = plan.admitted().get(step_index(step));
                 let at = record
@@ -227,7 +229,7 @@ impl ReplayOperation<'_> {
                         .source_identifier()
                         .as_str()
                 });
-                (at, source, 1)
+                (at, 0, source)
             }
         }
     }
@@ -347,7 +349,7 @@ fn revision_id(
     evidence: &RevisionEvidence,
 ) -> PortfolioRevisionId {
     let mut digest = Sha256::new();
-    digest.update(b"market-squawk-portfolio-revision-v1\0");
+    digest.update(b"market-squawk-portfolio-revision-v2\0action-before-entry\0");
     digest.update(account_id.as_uuid().as_bytes());
     digest.update(previous.map_or([0_u8; 32], |revision_id| revision_id.0));
     digest.update(evidence.as_of.unix_nanos().to_be_bytes());

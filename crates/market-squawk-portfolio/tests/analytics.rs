@@ -191,12 +191,14 @@ fn analytics_reports_are_policy_explicit_bounded_and_revision_bound() -> TestRes
     let usd = Currency::try_from("USD")?;
     let periods = vec![
         PerformancePeriod::try_new(
+            Timestamp::from_unix_nanos(0),
             Timestamp::from_unix_nanos(1),
             money(1_000, usd),
             money(1_100, usd),
             money(0, usd),
         )?,
         PerformancePeriod::try_new(
+            Timestamp::from_unix_nanos(1),
             Timestamp::from_unix_nanos(2),
             money(1_100, usd),
             money(1_260, usd),
@@ -221,6 +223,22 @@ fn analytics_reports_are_policy_explicit_bounded_and_revision_bound() -> TestRes
     assert_eq!(
         performance.money_weighted_return().value(),
         Decimal::new(16, 2)
+    );
+    let start_weighted = PerformanceReport::try_calculate(
+        &revision,
+        &periods,
+        PerformancePolicy::new(
+            market_squawk_portfolio::CashFlowTiming::StartOfPeriod,
+            MoneyWeightedMethod::ModifiedDietz,
+            NonZeroU32::MIN,
+        ),
+        super::limits()?,
+    )?;
+    assert_eq!(
+        start_weighted.money_weighted_return().value(),
+        Decimal::from(16_u32)
+            .checked_div(Decimal::from(105_u32))
+            .ok_or("modified Dietz expectation")?
     );
 
     let classifications = vec![

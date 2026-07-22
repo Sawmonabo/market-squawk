@@ -1,10 +1,10 @@
 //! Application-owned authority composition for governed point-in-time backtests.
 
 use market_squawk_backtesting::{
-    BacktestDataset, BacktestEvaluation, BacktestLimits, BacktestOutcome, BacktestRequest,
-    BacktestService, BacktestServiceError, BacktestStrategy, ExperimentInventory, ExperimentLimits,
-    PortfolioSeed, ResearchExecutionAssumptions, TrialComponentBinding, TrialParameter,
-    TrialSearchDimension, TrialSpec, TrialSpecInput,
+    BacktestAdmissionError, BacktestDataset, BacktestLimits, BacktestOutcome, BacktestRequest,
+    BacktestService, BacktestServiceError, BacktestStrategyRegistry, BacktestTrialPlan,
+    ExperimentInventory, ExperimentLimits, PortfolioSeed, ResearchExecutionAssumptions,
+    TrialParameter, TrialSearchDimension,
 };
 use market_squawk_data::{CorporateActionPlan, PinnedQueryOutput};
 use market_squawk_domain::{InstrumentExecutionTerms, SourceIdentifier};
@@ -12,13 +12,9 @@ use market_squawk_platform::{LocalPaths, PathError};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-/// Model, strategy, code, configuration, parameter, and selection bindings for one trial.
+/// Parameter, search-space, and selection bindings combined with strategy-owned identity.
 #[derive(Clone, Debug)]
-pub struct BacktestGovernanceBindings {
-    pub model: Option<TrialComponentBinding>,
-    pub strategy: TrialComponentBinding,
-    pub code: TrialComponentBinding,
-    pub configuration_digest: market_squawk_data::Sha256Digest,
+pub struct BacktestExperimentPlan {
     pub parameters: Vec<TrialParameter>,
     pub search_space: Vec<TrialSearchDimension>,
     pub selection_criterion: SourceIdentifier,
@@ -35,14 +31,14 @@ pub struct PinnedBacktestInput {
     pub sources: Vec<SourceIdentifier>,
     pub seed: u64,
     pub limits: BacktestLimits,
-    pub governance: BacktestGovernanceBindings,
-    pub evaluation: BacktestEvaluation,
+    pub experiment: BacktestExperimentPlan,
 }
 
 /// Sole application composition for controlled local backtesting artifacts and inventory.
 #[derive(Debug)]
 pub struct ProductionBacktestService {
     inner: BacktestService,
+    strategies: BacktestStrategyRegistry,
 }
 
 impl ProductionBacktestService {
@@ -50,40 +46,30 @@ impl ProductionBacktestService {
     pub fn initialize(
         paths: &LocalPaths,
         limits: ExperimentLimits,
+        strategies: BacktestStrategyRegistry,
     ) -> Result<Self, ProductionBacktestServiceError> {
         let root = paths.artifacts()?.try_clone_directory()?;
         let inventory = ExperimentInventory::try_new(root, limits)?;
         Ok(Self {
             inner: BacktestService::new(inventory),
+            strategies,
         })
     }
 
-    /// Admits the pinned query, derives the trial identity, then runs the governed service.
+    /// Resolves the registered build, admits the pinned query, and runs the governed service.
     pub fn run(
         &self,
         input: PinnedBacktestInput,
-        strategy: &mut dyn BacktestStrategy,
+        build_id: &SourceIdentifier,
         cancellation: &CancellationToken,
     ) -> Result<BacktestOutcome, ProductionBacktestServiceError> {
+        let mut strategy = self.strategies.admit(build_id)?;
         let dataset = BacktestDataset::try_from_pinned_query(
             input.query,
             input.execution_terms,
             input.limits,
         )?;
-        let governance = input.governance;
-        let spec = TrialSpec::try_new(TrialSpecInput {
-            dataset_identity: dataset.identity(),
-            object_graph_digest: dataset.object_graph_digest(),
-            execution_assumption_digest: input.execution_assumptions.digest(),
-            model: governance.model,
-            strategy: governance.strategy,
-            code: governance.code,
-            configuration_digest: governance.configuration_digest,
-            seed: input.seed,
-            parameters: governance.parameters,
-            search_space: governance.search_space,
-            selection_criterion: governance.selection_criterion,
-        })?;
+        let experiment = input.experiment;
         let request = BacktestRequest::try_new(
             dataset,
             input.execution_assumptions,
@@ -94,7 +80,16 @@ impl ProductionBacktestService {
             input.limits,
         )?;
         self.inner
-            .run(spec, request, strategy, input.evaluation, cancellation)
+            .run(
+                request,
+                &mut strategy,
+                BacktestTrialPlan::new(
+                    experiment.parameters,
+                    experiment.search_space,
+                    experiment.selection_criterion,
+                ),
+                cancellation,
+            )
             .map_err(Into::into)
     }
 }
@@ -114,4 +109,7 @@ pub enum ProductionBacktestServiceError {
     /// Governed execution or terminal publication failed.
     #[error("backtest service failed: {0}")]
     Service(#[from] BacktestServiceError),
+    /// Application-owned build registration or admission failed.
+    #[error("backtest strategy admission failed: {0}")]
+    Admission(#[from] BacktestAdmissionError),
 }

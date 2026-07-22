@@ -68,6 +68,7 @@ impl PerformancePolicy {
 /// One ordered valuation subperiod and its signed external flow.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PerformancePeriod {
+    starts_at: Timestamp,
     ends_at: Timestamp,
     opening_value: Money,
     closing_value: Money,
@@ -81,23 +82,31 @@ impl PerformancePeriod {
     ///
     /// Rejects mixed currencies or nonpositive opening value.
     pub fn try_new(
+        starts_at: Timestamp,
         ends_at: Timestamp,
         opening_value: Money,
         closing_value: Money,
         external_flow: Money,
     ) -> Result<Self, PortfolioError> {
-        if opening_value.amount() <= Decimal::ZERO
+        if starts_at >= ends_at
+            || opening_value.amount() <= Decimal::ZERO
             || opening_value.currency() != closing_value.currency()
             || opening_value.currency() != external_flow.currency()
         {
             return Err(PortfolioError::InvalidPolicy);
         }
         Ok(Self {
+            starts_at,
             ends_at,
             opening_value,
             closing_value,
             external_flow,
         })
+    }
+
+    /// Returns period start.
+    pub const fn starts_at(self) -> Timestamp {
+        self.starts_at
     }
 
     /// Returns period end.
@@ -152,7 +161,7 @@ impl PerformanceReport {
         }
         if periods
             .windows(2)
-            .any(|window| window[0].ends_at >= window[1].ends_at)
+            .any(|window| window[0].ends_at != window[1].starts_at)
             || periods.iter().any(|period| {
                 period.opening_value.currency() != revision.base_currency()
                     || period.closing_value.currency() != revision.base_currency()
@@ -192,10 +201,36 @@ impl PerformanceReport {
         let flows = periods.iter().try_fold(Decimal::ZERO, |total, period| {
             checked_decimal_add(total, period.external_flow.amount())
         })?;
-        let weighted_flows = match policy.cash_flow_timing {
-            CashFlowTiming::StartOfPeriod => flows,
-            CashFlowTiming::EndOfPeriod => Decimal::ZERO,
-        };
+        let horizon_start = periods
+            .first()
+            .map(|period| period.starts_at.unix_nanos())
+            .ok_or(PortfolioError::InvalidPolicy)?;
+        let horizon_end = periods
+            .last()
+            .map(|period| period.ends_at.unix_nanos())
+            .ok_or(PortfolioError::InvalidPolicy)?;
+        let horizon_nanos = i128::from(horizon_end)
+            .checked_sub(i128::from(horizon_start))
+            .ok_or(PortfolioError::Arithmetic)?;
+        if horizon_nanos <= 0 {
+            return Err(PortfolioError::InvalidPolicy);
+        }
+        let duration = Decimal::from_i128_with_scale(horizon_nanos, 0);
+        let weighted_flows = periods.iter().try_fold(Decimal::ZERO, |total, period| {
+            let flow_at = match policy.cash_flow_timing {
+                CashFlowTiming::StartOfPeriod => period.starts_at.unix_nanos(),
+                CashFlowTiming::EndOfPeriod => period.ends_at.unix_nanos(),
+            };
+            let remaining = i128::from(horizon_end)
+                .checked_sub(i128::from(flow_at))
+                .ok_or(PortfolioError::Arithmetic)?;
+            let weight =
+                checked_decimal_div(Decimal::from_i128_with_scale(remaining, 0), duration)?;
+            checked_decimal_add(
+                total,
+                checked_decimal_mul(period.external_flow.amount(), weight)?,
+            )
+        })?;
         let money_weighted = checked_decimal_div(
             checked_decimal_sub(checked_decimal_sub(closing, opening)?, flows)?,
             checked_decimal_add(opening, weighted_flows)?,

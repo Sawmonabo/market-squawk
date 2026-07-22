@@ -1,19 +1,23 @@
 use std::error::Error;
 use std::num::{NonZeroU32, NonZeroUsize};
+use std::sync::Arc;
 
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
 
 use crate::dataset::{BacktestDatasetInput, BacktestObservationInput};
 use crate::{
-    AccountingReconciliation, BacktestDataset, BacktestEngine, BacktestEvaluation, BacktestLimits,
-    BacktestLimitsInput, BacktestModelDecisionMapper, BacktestModelStrategy, BacktestObservation,
-    BacktestOutcome, BacktestOverfittingDiagnostic, BacktestOverfittingFold,
-    BacktestOverfittingInput, BacktestOverfittingScore, BacktestRequest, BacktestService,
-    BacktestStrategy, DeflatedPerformanceDiagnostic, DeflatedPerformanceInput, ExperimentInventory,
+    AccountingReconciliation, BacktestAdmissionError, BacktestBuildReceipt,
+    BacktestBuildRegistration, BacktestCohortCandidate, BacktestCohortFold, BacktestCohortPlan,
+    BacktestDataset, BacktestEngine, BacktestLimits, BacktestLimitsInput,
+    BacktestModelDecisionMapper, BacktestModelStrategy, BacktestObservation, BacktestOutcome,
+    BacktestRequest, BacktestService, BacktestServiceError, BacktestStrategy,
+    BacktestStrategyClass, BacktestStrategyFactory, BacktestStrategyInstance,
+    BacktestStrategyRegistry, BacktestTrialPlan, ExperimentError, ExperimentInventory,
     ExperimentLimits, ExperimentLimitsInput, HistoricalUniverseStatus, PortfolioSeed,
-    ResearchExecutionAssumptions, ResearchExecutionAssumptionsInput, TrialComponentBinding,
-    TrialMetric, TrialSpec, TrialSpecInput, TrialStatus,
+    RESEARCH_EXECUTION_POLICY_VERSION, ResearchExecutionAssumptions,
+    ResearchExecutionAssumptionsInput, ResearchLiquidityPriority, TrialComponentBinding, TrialId,
+    TrialParameter, TrialSearchDimension, TrialSpec, TrialSpecInput, TrialStatus,
 };
 use market_squawk_data::{
     CorporateActionAdjustment, CorporateActionLimits, CorporateActionPlan, CorporateActionPolicy,
@@ -39,6 +43,7 @@ type TestResult = Result<(), Box<dyn Error>>;
 struct BuyOnce {
     account_id: AccountId,
     emitted: bool,
+    last_position: Decimal,
 }
 
 impl BacktestStrategy for BuyOnce {
@@ -46,45 +51,103 @@ impl BacktestStrategy for BuyOnce {
         &mut self,
         context: &crate::BacktestContext<'_>,
     ) -> Result<BoundedOrderIntents, StrategyError> {
+        self.last_position = context.position();
         let mut output = BoundedOrderIntents::new();
         if !self.emitted {
-            output.try_push(
-                OrderIntent::try_new(OrderIntentInput {
-                    order_id: "00000000-0000-0000-0000-000000000040"
-                        .parse()
-                        .map_err(|_| StrategyError::Evaluation)?,
-                    client_order_id: ClientOrderId::try_from("backtest-buy-1")
-                        .map_err(|_| StrategyError::Evaluation)?,
-                    strategy_id: "00000000-0000-0000-0000-000000000041"
-                        .parse()
-                        .map_err(|_| StrategyError::Evaluation)?,
-                    model_id: None,
-                    account_id: self.account_id,
-                    execution_terms: context.execution_terms(),
-                    side: OrderSide::Buy,
-                    order_type: OrderType::Market,
-                    quantity: QuantityLots::new(4).map_err(|_| StrategyError::Evaluation)?,
-                    limit_price: None,
-                    stop_price: None,
-                    time_in_force: TimeInForce::Day,
-                    signal_at: context.decision_at(),
-                    expires_at: context
-                        .decision_at()
-                        .checked_add_nanos(100)
-                        .map_err(|_| StrategyError::Evaluation)?,
-                    reason_codes: vec![
-                        OrderReasonCode::try_from("research-signal")
-                            .map_err(|_| StrategyError::Evaluation)?,
-                    ],
-                    maximum_slippage: BasisPoints::new(100),
-                    required_quality: DataQuality::DirectVerified,
-                })
-                .map_err(|_| StrategyError::Evaluation)?,
-            )?;
+            output.try_push(buy_intent(
+                context,
+                self.account_id,
+                "00000000-0000-0000-0000-000000000040",
+                "backtest-buy-1",
+                4,
+            )?)?;
             self.emitted = true;
         }
         Ok(output)
     }
+}
+
+#[derive(Debug)]
+struct BuyOnceFactory {
+    account_id: AccountId,
+}
+
+impl BacktestStrategyFactory for BuyOnceFactory {
+    fn build(&self) -> Result<BacktestStrategyInstance, BacktestAdmissionError> {
+        Ok(BacktestStrategyInstance::RuleBased(Box::new(BuyOnce {
+            account_id: self.account_id,
+            emitted: false,
+            last_position: Decimal::ZERO,
+        })))
+    }
+}
+
+#[derive(Debug)]
+struct BuyTwice {
+    account_id: AccountId,
+    emitted: bool,
+}
+
+impl BacktestStrategy for BuyTwice {
+    fn on_observation(
+        &mut self,
+        context: &crate::BacktestContext<'_>,
+    ) -> Result<BoundedOrderIntents, StrategyError> {
+        let mut output = BoundedOrderIntents::new();
+        if !self.emitted {
+            for (order_id, client_order_id) in [
+                ("00000000-0000-0000-0000-000000000040", "depth-buy-1"),
+                ("00000000-0000-0000-0000-000000000042", "depth-buy-2"),
+            ] {
+                output.try_push(buy_intent(
+                    context,
+                    self.account_id,
+                    order_id,
+                    client_order_id,
+                    2,
+                )?)?;
+            }
+            self.emitted = true;
+        }
+        Ok(output)
+    }
+}
+
+fn buy_intent(
+    context: &crate::BacktestContext<'_>,
+    account_id: AccountId,
+    order_id: &str,
+    client_order_id: &str,
+    quantity: i64,
+) -> Result<OrderIntent, StrategyError> {
+    OrderIntent::try_new(OrderIntentInput {
+        order_id: order_id.parse().map_err(|_| StrategyError::Evaluation)?,
+        client_order_id: ClientOrderId::try_from(client_order_id)
+            .map_err(|_| StrategyError::Evaluation)?,
+        strategy_id: "00000000-0000-0000-0000-000000000041"
+            .parse()
+            .map_err(|_| StrategyError::Evaluation)?,
+        model_id: None,
+        account_id,
+        execution_terms: context.execution_terms(),
+        side: OrderSide::Buy,
+        order_type: OrderType::Market,
+        quantity: QuantityLots::new(quantity).map_err(|_| StrategyError::Evaluation)?,
+        limit_price: None,
+        stop_price: None,
+        time_in_force: TimeInForce::Day,
+        signal_at: context.decision_at(),
+        expires_at: context
+            .decision_at()
+            .checked_add_nanos(100)
+            .map_err(|_| StrategyError::Evaluation)?,
+        reason_codes: vec![
+            OrderReasonCode::try_from("research-signal").map_err(|_| StrategyError::Evaluation)?,
+        ],
+        maximum_slippage: BasisPoints::new(100),
+        required_quality: DataQuality::DirectVerified,
+    })
+    .map_err(|_| StrategyError::Evaluation)
 }
 
 #[derive(Debug)]
@@ -114,6 +177,7 @@ fn signal_executes_only_on_next_eligible_snapshot_and_reconciles_partial_fill() 
     let mut strategy = BuyOnce {
         account_id,
         emitted: false,
+        last_position: Decimal::ZERO,
     };
 
     let result = BacktestEngine::run(&request, &mut strategy, &CancellationToken::new())?;
@@ -140,6 +204,33 @@ fn signal_executes_only_on_next_eligible_snapshot_and_reconciles_partial_fill() 
 }
 
 #[test]
+fn competing_intents_share_one_observation_liquidity_budget() -> TestResult {
+    let account_id: AccountId = "00000000-0000-0000-0000-000000000030".parse()?;
+    let request = request(account_id, dataset(execution_terms()?)?, None)?;
+    let mut strategy = BuyTwice {
+        account_id,
+        emitted: false,
+    };
+
+    let result = BacktestEngine::run(&request, &mut strategy, &CancellationToken::new())?;
+
+    let contested_fills = result
+        .fills()
+        .iter()
+        .filter(|fill| fill.executed_at() == Timestamp::from_unix_nanos(20))
+        .collect::<Vec<_>>();
+    assert_eq!(contested_fills.len(), 1);
+    assert_eq!(
+        contested_fills
+            .iter()
+            .map(|fill| fill.quantity().get())
+            .sum::<i64>(),
+        2
+    );
+    Ok(())
+}
+
+#[test]
 fn governed_service_reserves_before_run_and_publishes_one_immutable_terminal() -> TestResult {
     let temporary = tempfile::tempdir()?;
     let root = Dir::open_ambient_dir(temporary.path(), ambient_authority())?;
@@ -155,73 +246,16 @@ fn governed_service_reserves_before_run_and_publishes_one_immutable_terminal() -
     let service = BacktestService::new(inventory);
     let account_id: AccountId = "00000000-0000-0000-0000-000000000030".parse()?;
     let request = request(account_id, dataset(execution_terms()?)?, None)?;
-    let spec = TrialSpec::try_new(TrialSpecInput {
-        dataset_identity: request.dataset_identity(),
-        object_graph_digest: request.object_graph_digest(),
-        execution_assumption_digest: request.assumption_digest(),
-        model: Some(binding("model-v1", 4)?),
-        strategy: binding("strategy-v1", 5)?,
-        code: binding("code-revision", 6)?,
-        configuration_digest: Sha256Digest::new([7; 32]),
-        seed: request.seed(),
-        parameters: Vec::new(),
-        search_space: Vec::new(),
-        selection_criterion: SourceIdentifier::try_from("deflated-sharpe")?,
-    })?;
-    let overfitting = BacktestOverfittingDiagnostic::try_compute(&BacktestOverfittingInput {
-        folds: vec![
-            BacktestOverfittingFold {
-                candidates: vec![
-                    BacktestOverfittingScore {
-                        in_sample: 2.0,
-                        out_of_sample: 0.1,
-                    },
-                    BacktestOverfittingScore {
-                        in_sample: 1.0,
-                        out_of_sample: 0.2,
-                    },
-                ],
-            },
-            BacktestOverfittingFold {
-                candidates: vec![
-                    BacktestOverfittingScore {
-                        in_sample: 1.0,
-                        out_of_sample: 0.3,
-                    },
-                    BacktestOverfittingScore {
-                        in_sample: 2.0,
-                        out_of_sample: 0.2,
-                    },
-                ],
-            },
-        ],
-    })?;
-    let deflated = DeflatedPerformanceDiagnostic::try_compute(DeflatedPerformanceInput {
-        observed_sharpe: 1.2,
-        independent_trials: 4,
-        observations: 252,
-        trial_sharpe_variance: 0.04,
-        return_skewness: 0.0,
-        return_excess_kurtosis: 0.0,
-    })?;
-    let evaluation = BacktestEvaluation::try_new(
-        vec![TrialMetric::try_new(
-            SourceIdentifier::try_from("sharpe")?,
-            1.2,
-        )?],
-        overfitting,
-        deflated,
-        false,
-    )?;
-    let mut strategy = BuyOnce {
-        account_id,
-        emitted: false,
-    };
+    let (registry, build_id) = strategy_registry(account_id)?;
+    let mut strategy = registry.admit(&build_id)?;
     let outcome = service.run(
-        spec,
         request,
         &mut strategy,
-        evaluation,
+        BacktestTrialPlan::new(
+            Vec::new(),
+            Vec::new(),
+            SourceIdentifier::try_from("total-return")?,
+        ),
         &CancellationToken::new(),
     )?;
     let BacktestOutcome::Completed(result) = outcome else {
@@ -231,6 +265,14 @@ fn governed_service_reserves_before_run_and_publishes_one_immutable_terminal() -
         return Err("expected completed terminal".into());
     };
     assert_eq!(result.run().fills().len(), 1);
+    assert_eq!(completion.metrics().len(), 7);
+    assert_eq!(
+        completion
+            .dataset_partition()
+            .ok_or("missing dataset partition")?
+            .ends_at(),
+        Timestamp::from_unix_nanos(30)
+    );
     assert!(
         temporary
             .path()
@@ -241,7 +283,113 @@ fn governed_service_reserves_before_run_and_publishes_one_immutable_terminal() -
 }
 
 #[test]
-fn corporate_action_accounting_is_explicitly_task16_authoritative() -> TestResult {
+fn cohort_evaluation_uses_completed_metrics_and_publishes_one_immutable_record() -> TestResult {
+    let temporary = tempfile::tempdir()?;
+    let root = Dir::open_ambient_dir(temporary.path(), ambient_authority())?;
+    let inventory = ExperimentInventory::try_new(
+        root,
+        ExperimentLimits::try_new(ExperimentLimitsInput {
+            max_trials: 16,
+            max_record_bytes: 64 * 1024,
+            max_artifact_bytes: 64 * 1024,
+            max_metrics: 8,
+        })?,
+    )?;
+    let service = BacktestService::new(inventory);
+    let account_id: AccountId = "00000000-0000-0000-0000-000000000030".parse()?;
+    let (registry, build_id) = strategy_registry(account_id)?;
+    let (first_fold, selection_candidates) =
+        completed_cohort_fold(&service, &registry, &build_id, account_id, 10, 40)?;
+    let (second_fold, second_selection) =
+        completed_cohort_fold(&service, &registry, &build_id, account_id, 70, 100)?;
+    let invalid_plan = BacktestCohortPlan::try_new(
+        vec![first_fold.clone(), second_fold.clone()],
+        selection_candidates
+            .iter()
+            .chain(&second_selection)
+            .copied()
+            .collect(),
+        SourceIdentifier::try_from("total-return")?,
+    )?;
+    assert!(matches!(
+        service.evaluate_cohort(invalid_plan),
+        Err(BacktestServiceError::InvalidCohort)
+    ));
+    assert_eq!(
+        std::fs::read_dir(temporary.path().join("backtesting/v1/cohorts"))?.count(),
+        0
+    );
+    let plan = BacktestCohortPlan::try_new(
+        vec![first_fold, second_fold],
+        selection_candidates.clone(),
+        SourceIdentifier::try_from("total-return")?,
+    )?;
+
+    let evaluation = service.evaluate_cohort(plan.clone())?;
+    let repeated = service.evaluate_cohort(plan)?;
+
+    assert_eq!(evaluation.id(), repeated.id());
+    assert_eq!(evaluation.members().len(), 8);
+    assert!(selection_candidates.contains(&evaluation.selected().trial_id()));
+    assert!(
+        (0.0..=1.0).contains(
+            &evaluation
+                .probability_of_backtest_overfitting()
+                .probability()
+        )
+    );
+    assert!((0.0..=1.0).contains(&evaluation.deflated_performance().probability()));
+    assert_eq!(
+        std::fs::read_dir(temporary.path().join("backtesting/v1/cohorts"))?.count(),
+        1
+    );
+    Ok(())
+}
+
+#[test]
+fn expired_trial_attempt_can_be_recovered_without_overlapping_an_active_lease() -> TestResult {
+    let temporary = tempfile::tempdir()?;
+    let root = Dir::open_ambient_dir(temporary.path(), ambient_authority())?;
+    let inventory = ExperimentInventory::try_new(
+        root,
+        ExperimentLimits::try_new(ExperimentLimitsInput {
+            max_trials: 8,
+            max_record_bytes: 64 * 1024,
+            max_artifact_bytes: 64 * 1024,
+            max_metrics: 8,
+        })?,
+    )?;
+    let account_id: AccountId = "00000000-0000-0000-0000-000000000030".parse()?;
+    let request = request(account_id, dataset(execution_terms()?)?, None)?;
+    let spec = TrialSpec::try_new(TrialSpecInput {
+        dataset_identity: request.dataset_identity(),
+        object_graph_digest: request.object_graph_digest(),
+        execution_assumption_digest: request.assumption_digest(),
+        model: None,
+        strategy: binding("strategy-v1", 5)?,
+        code: binding("code-revision", 6)?,
+        configuration_digest: Sha256Digest::new([7; 32]),
+        seed: request.seed(),
+        parameters: Vec::new(),
+        search_space: Vec::new(),
+        selection_criterion: SourceIdentifier::try_from("total-return")?,
+    })?;
+
+    let _first = inventory.reserve_at(spec.clone(), Timestamp::from_unix_nanos(100), 10)?;
+    assert!(matches!(
+        inventory.reserve_at(spec.clone(), Timestamp::from_unix_nanos(105), 10),
+        Err(ExperimentError::TrialInProgress)
+    ));
+    let _recovered = inventory.reserve_at(spec.clone(), Timestamp::from_unix_nanos(110), 10)?;
+    assert!(matches!(
+        inventory.reserve_at(spec, Timestamp::from_unix_nanos(111), 10),
+        Err(ExperimentError::TrialInProgress)
+    ));
+    Ok(())
+}
+
+#[test]
+fn corporate_action_state_is_visible_at_event_time_and_independently_reconciled() -> TestResult {
     let account_id: AccountId = "00000000-0000-0000-0000-000000000030".parse()?;
     let terms = execution_terms()?;
     let plan = split_plan(terms.instrument_id())?;
@@ -249,14 +397,16 @@ fn corporate_action_accounting_is_explicitly_task16_authoritative() -> TestResul
     let mut strategy = BuyOnce {
         account_id,
         emitted: false,
+        last_position: Decimal::ZERO,
     };
 
     let result = BacktestEngine::run(&request, &mut strategy, &CancellationToken::new())?;
 
     assert_eq!(
         result.accounting_reconciliation(),
-        AccountingReconciliation::Task16AuthoritativeCorporateActions
+        AccountingReconciliation::Independent
     );
+    assert_eq!(strategy.last_position, Decimal::from(4));
     assert_eq!(
         result
             .portfolio()
@@ -271,10 +421,10 @@ fn corporate_action_accounting_is_explicitly_task16_authoritative() -> TestResul
 fn typed_model_failure_is_audited_no_action() -> TestResult {
     let account_id: AccountId = "00000000-0000-0000-0000-000000000030".parse()?;
     let request = request(account_id, dataset(execution_terms()?)?, None)?;
-    let mut strategy = BacktestModelStrategy::new(
+    let mut strategy = BacktestModelStrategy::try_new(
         Err(ModelFailure::from(InferenceError::NonFiniteComputation)),
         Box::new(RejectMapper),
-    );
+    )?;
 
     let result = BacktestEngine::run(&request, &mut strategy, &CancellationToken::new())?;
 
@@ -282,6 +432,97 @@ fn typed_model_failure_is_audited_no_action() -> TestResult {
     assert_eq!(result.no_action_count(), 3);
     assert!(result.portfolio().positions().is_empty());
     Ok(())
+}
+
+fn strategy_registry(
+    account_id: AccountId,
+) -> Result<(BacktestStrategyRegistry, SourceIdentifier), Box<dyn Error>> {
+    let build_id = SourceIdentifier::try_from("buy-once-v1")?;
+    let receipt = BacktestBuildReceipt::try_from_evidence(
+        build_id.clone(),
+        BacktestStrategyClass::RuleBased,
+        SourceIdentifier::try_from("buy-once")?,
+        b"buy-once-source-closure-v1",
+        b"buy-once-executable-v1",
+        b"{\"quantity_lots\":4}",
+    )?;
+    let registry = BacktestStrategyRegistry::try_new(vec![BacktestBuildRegistration::new(
+        receipt,
+        Arc::new(BuyOnceFactory { account_id }),
+    )])?;
+    Ok((registry, build_id))
+}
+
+fn completed_cohort_fold(
+    service: &BacktestService,
+    registry: &BacktestStrategyRegistry,
+    build_id: &SourceIdentifier,
+    account_id: AccountId,
+    in_sample_start: i64,
+    out_of_sample_start: i64,
+) -> Result<(BacktestCohortFold, Vec<TrialId>), Box<dyn Error>> {
+    let mut candidates = Vec::new();
+    let mut selection = Vec::new();
+    for parameter in ["fast", "slow"] {
+        let in_sample = run_governed_trial(
+            service,
+            registry,
+            build_id,
+            account_id,
+            in_sample_start,
+            parameter,
+        )?;
+        let out_of_sample = run_governed_trial(
+            service,
+            registry,
+            build_id,
+            account_id,
+            out_of_sample_start,
+            parameter,
+        )?;
+        candidates.push(BacktestCohortCandidate::new(in_sample, out_of_sample));
+        selection.push(out_of_sample);
+    }
+    Ok((BacktestCohortFold::try_new(candidates)?, selection))
+}
+
+fn run_governed_trial(
+    service: &BacktestService,
+    registry: &BacktestStrategyRegistry,
+    build_id: &SourceIdentifier,
+    account_id: AccountId,
+    dataset_start: i64,
+    parameter: &str,
+) -> Result<TrialId, Box<dyn Error>> {
+    let mut strategy = registry.admit(build_id)?;
+    let parameter_name = SourceIdentifier::try_from("speed")?;
+    let outcome = service.run(
+        request(
+            account_id,
+            dataset_at(execution_terms()?, dataset_start)?,
+            None,
+        )?,
+        &mut strategy,
+        BacktestTrialPlan::new(
+            vec![TrialParameter::new(
+                parameter_name.clone(),
+                SourceIdentifier::try_from(parameter)?,
+            )],
+            vec![TrialSearchDimension::try_new(
+                parameter_name,
+                vec![
+                    SourceIdentifier::try_from("fast")?,
+                    SourceIdentifier::try_from("slow")?,
+                ],
+            )?],
+            SourceIdentifier::try_from("total-return")?,
+        ),
+        &CancellationToken::new(),
+    )?;
+    let BacktestOutcome::Completed(result) = outcome else {
+        return Err("expected completed cohort member".into());
+    };
+    Ok(result.trial().spec().id())
 }
 
 fn binding(name: &str, byte: u8) -> Result<TrialComponentBinding, Box<dyn Error>> {
@@ -292,15 +533,22 @@ fn binding(name: &str, byte: u8) -> Result<TrialComponentBinding, Box<dyn Error>
 }
 
 fn dataset(terms: InstrumentExecutionTerms) -> Result<BacktestDataset, Box<dyn Error>> {
+    dataset_at(terms, 10)
+}
+
+fn dataset_at(
+    terms: InstrumentExecutionTerms,
+    starts_at: i64,
+) -> Result<BacktestDataset, Box<dyn Error>> {
     Ok(BacktestDataset::try_new(BacktestDatasetInput {
         manifest: feature_manifest()?,
         object_graph_digest: Sha256Digest::new([2; 32]),
         point_in_time_content: Sha256Digest::new([3; 32]),
         point_in_time_audit: Sha256Digest::new([4; 32]),
         observations: vec![
-            observation(terms, 10, 100, 10)?,
-            observation(terms, 20, 110, 2)?,
-            observation(terms, 30, 120, 10)?,
+            observation(terms, starts_at, 100, 10)?,
+            observation(terms, starts_at + 10, 110, 2)?,
+            observation(terms, starts_at + 20, 120, 10)?,
         ],
     })?)
 }
@@ -313,11 +561,12 @@ fn request(
     Ok(BacktestRequest::try_new(
         dataset,
         ResearchExecutionAssumptions::try_new(ResearchExecutionAssumptionsInput {
-            version: 1,
+            version: RESEARCH_EXECUTION_POLICY_VERSION,
             fee_basis_points: BasisPoints::new(10),
             slippage_basis_points: BasisPoints::new(5),
             maximum_random_slippage_basis_points: BasisPoints::new(0),
             maximum_participation_basis_points: BasisPoints::new(10_000),
+            liquidity_priority: ResearchLiquidityPriority::SignalTimeThenOrderId,
             latency_nanos: 1,
             allow_partial_fills: true,
             fee_decimal_scale: 4,

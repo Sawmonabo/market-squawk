@@ -8,6 +8,7 @@ mod experiments;
 mod fills;
 mod model_strategy;
 mod service;
+mod strategy;
 
 pub use clock::EventTimeClock;
 pub use dataset::{
@@ -18,21 +19,31 @@ pub use dataset::{
 };
 pub use engine::{
     AccountingReconciliation, BacktestContext, BacktestEngine, BacktestError, BacktestRequest,
-    BacktestRun, BacktestStrategy, PortfolioSeed,
+    BacktestRun, PortfolioSeed,
 };
 pub use experiments::{
-    BacktestArtifact, BacktestOverfittingDiagnostic, BacktestOverfittingFold,
-    BacktestOverfittingInput, BacktestOverfittingScore, DeflatedPerformanceDiagnostic,
+    BacktestArtifact, BacktestCohortCandidate, BacktestCohortEvaluation,
+    BacktestCohortEvaluationId, BacktestCohortFold, BacktestCohortPlan, BacktestExecutableIdentity,
+    BacktestOverfittingDiagnostic, BacktestOverfittingFold, BacktestOverfittingInput,
+    BacktestOverfittingScore, CohortMemberBinding, DeflatedPerformanceDiagnostic,
     DeflatedPerformanceInput, ExperimentError, ExperimentInventory, ExperimentLimits,
-    ExperimentLimitsInput, TrialCompletion, TrialCompletionInput, TrialComponentBinding,
+    ExperimentLimitsInput, TrialCompletion, TrialComponentBinding, TrialDatasetPartition,
     TrialFailure, TrialId, TrialMetric, TrialParameter, TrialRecord, TrialReservation,
     TrialSearchDimension, TrialSpec, TrialSpecInput, TrialStatus,
 };
-pub use fills::{ResearchExecutionAssumptions, ResearchExecutionAssumptionsInput, ResearchFill};
+pub use fills::{
+    RESEARCH_EXECUTION_POLICY_VERSION, ResearchExecutionAssumptions,
+    ResearchExecutionAssumptionsInput, ResearchFill, ResearchLiquidityPriority,
+};
 pub use model_strategy::{BacktestModelDecisionMapper, BacktestModelStrategy};
 pub use service::{
-    BacktestEvaluation, BacktestFailure, BacktestOutcome, BacktestResult, BacktestService,
-    BacktestServiceError,
+    BacktestFailure, BacktestOutcome, BacktestResult, BacktestService, BacktestServiceError,
+    BacktestTrialPlan,
+};
+pub use strategy::{
+    AdmittedBacktestStrategy, BacktestAdmissionError, BacktestBuildReceipt,
+    BacktestBuildRegistration, BacktestStrategy, BacktestStrategyClass, BacktestStrategyFactory,
+    BacktestStrategyInstance, BacktestStrategyRegistry,
 };
 
 #[cfg(test)]

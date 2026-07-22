@@ -6,14 +6,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use super::ExperimentError;
-use super::diagnostics::{BacktestOverfittingDiagnostic, DeflatedPerformanceDiagnostic};
 use super::model::{
     BacktestArtifact, ExperimentLimits, TrialCompletion, TrialCompletionInput,
-    TrialComponentBinding, TrialFailure, TrialId, TrialMetric, TrialParameter,
-    TrialSearchDimension, TrialSpec, TrialSpecInput, TrialStatus,
+    TrialComponentBinding, TrialDatasetPartition, TrialFailure, TrialId, TrialMetric,
+    TrialParameter, TrialSearchDimension, TrialSpec, TrialSpecInput, TrialStatus,
 };
 
-const TRIAL_SCHEMA_VERSION: u16 = 1;
+const RESERVATION_SCHEMA_VERSION: u16 = 1;
+const TERMINAL_SCHEMA_VERSION: u16 = 2;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -87,11 +87,20 @@ struct CompletedWire {
     artifact_digest: String,
     artifact_bytes: u64,
     metrics: Vec<MetricWire>,
-    probability_of_backtest_overfitting: f64,
-    probability_fold_count: usize,
-    deflated_performance_probability: f64,
-    expected_maximum_sharpe: f64,
-    selected: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dataset_partition_start: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dataset_partition_end: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    probability_of_backtest_overfitting: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    probability_fold_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    deflated_performance_probability: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_maximum_sharpe: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    selected: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -110,7 +119,7 @@ struct MetricWire {
 
 pub(super) fn encode_reservation(spec: &TrialSpec) -> Result<Vec<u8>, ExperimentError> {
     serde_json::to_vec(&ReservationWire {
-        schema_version: TRIAL_SCHEMA_VERSION,
+        schema_version: RESERVATION_SCHEMA_VERSION,
         trial_id: encode_hex(spec.id().digest().bytes()),
         spec: TrialSpecWire::from(spec),
     })
@@ -120,7 +129,7 @@ pub(super) fn encode_reservation(spec: &TrialSpec) -> Result<Vec<u8>, Experiment
 pub(super) fn decode_reservation(bytes: &[u8]) -> Result<TrialSpec, ExperimentError> {
     let wire: ReservationWire =
         serde_json::from_slice(bytes).map_err(|_| ExperimentError::CorruptRecord)?;
-    if wire.schema_version != TRIAL_SCHEMA_VERSION {
+    if wire.schema_version != RESERVATION_SCHEMA_VERSION {
         return Err(ExperimentError::CorruptRecord);
     }
     let expected = TrialId(decode_hex(&wire.trial_id)?);
@@ -138,7 +147,7 @@ pub(super) fn encode_terminal(
     let wire = match status {
         TrialStatus::Reserved => return Err(ExperimentError::InvalidCompletion),
         TrialStatus::Completed(value) => TerminalWire {
-            schema_version: TRIAL_SCHEMA_VERSION,
+            schema_version: TERMINAL_SCHEMA_VERSION,
             trial_id: encode_hex(id.digest().bytes()),
             status: TerminalStatusWire::Completed,
             completed: Some(CompletedWire {
@@ -154,18 +163,22 @@ pub(super) fn encode_terminal(
                         value: metric.value,
                     })
                     .collect(),
-                probability_of_backtest_overfitting: value
-                    .probability_of_backtest_overfitting
-                    .probability,
-                probability_fold_count: value.probability_of_backtest_overfitting.folds,
-                deflated_performance_probability: value.deflated_performance.probability,
-                expected_maximum_sharpe: value.deflated_performance.expected_maximum_sharpe,
-                selected: value.selected,
+                dataset_partition_start: value
+                    .dataset_partition
+                    .map(|partition| partition.starts_at().unix_nanos()),
+                dataset_partition_end: value
+                    .dataset_partition
+                    .map(|partition| partition.ends_at().unix_nanos()),
+                probability_of_backtest_overfitting: None,
+                probability_fold_count: None,
+                deflated_performance_probability: None,
+                expected_maximum_sharpe: None,
+                selected: None,
             }),
             failed: None,
         },
         TrialStatus::Failed(value) => TerminalWire {
-            schema_version: TRIAL_SCHEMA_VERSION,
+            schema_version: TERMINAL_SCHEMA_VERSION,
             trial_id: encode_hex(id.digest().bytes()),
             status: TerminalStatusWire::Failed,
             completed: None,
@@ -185,7 +198,8 @@ pub(super) fn decode_terminal(
 ) -> Result<TrialStatus, ExperimentError> {
     let wire: TerminalWire =
         serde_json::from_slice(bytes).map_err(|_| ExperimentError::CorruptRecord)?;
-    require_terminal_header(wire.schema_version, &wire.trial_id, expected_id)?;
+    let schema_version = wire.schema_version;
+    require_terminal_header(schema_version, &wire.trial_id, expected_id)?;
     match (wire.status, wire.completed, wire.failed) {
         (
             TerminalStatusWire::Completed,
@@ -195,6 +209,8 @@ pub(super) fn decode_terminal(
                 artifact_digest,
                 artifact_bytes,
                 metrics,
+                dataset_partition_start,
+                dataset_partition_end,
                 probability_of_backtest_overfitting,
                 probability_fold_count,
                 deflated_performance_probability,
@@ -203,14 +219,31 @@ pub(super) fn decode_terminal(
             }),
             None,
         ) => {
+            let legacy_diagnostics = [
+                probability_of_backtest_overfitting,
+                deflated_performance_probability,
+                expected_maximum_sharpe,
+            ];
+            let valid_legacy = legacy_diagnostics.iter().all(Option::is_some)
+                && probability_fold_count.is_some_and(|folds| folds >= 2)
+                && selected.is_some()
+                && dataset_partition_start.is_none()
+                && dataset_partition_end.is_none()
+                && probability_of_backtest_overfitting
+                    .is_some_and(|value| value.is_finite() && (0.0..=1.0).contains(&value))
+                && deflated_performance_probability
+                    .is_some_and(|value| value.is_finite() && (0.0..=1.0).contains(&value))
+                && expected_maximum_sharpe.is_some_and(f64::is_finite);
+            let valid_current = legacy_diagnostics.iter().all(Option::is_none)
+                && probability_fold_count.is_none()
+                && selected.is_none()
+                && dataset_partition_start
+                    .zip(dataset_partition_end)
+                    .is_some_and(|(start, end)| start < end);
             if artifact_reference.is_empty()
                 || artifact_bytes == 0
-                || !probability_of_backtest_overfitting.is_finite()
-                || !(0.0..=1.0).contains(&probability_of_backtest_overfitting)
-                || probability_fold_count < 2
-                || !deflated_performance_probability.is_finite()
-                || !(0.0..=1.0).contains(&deflated_performance_probability)
-                || !expected_maximum_sharpe.is_finite()
+                || (schema_version == 1 && !valid_legacy)
+                || (schema_version == TERMINAL_SCHEMA_VERSION && !valid_current)
             {
                 return Err(ExperimentError::CorruptRecord);
             }
@@ -230,15 +263,16 @@ pub(super) fn decode_terminal(
                         byte_count: artifact_bytes,
                     },
                     metrics,
-                    probability_of_backtest_overfitting: BacktestOverfittingDiagnostic {
-                        probability: probability_of_backtest_overfitting,
-                        folds: probability_fold_count,
-                    },
-                    deflated_performance: DeflatedPerformanceDiagnostic {
-                        probability: deflated_performance_probability,
-                        expected_maximum_sharpe,
-                    },
-                    selected,
+                    dataset_partition: dataset_partition_start
+                        .zip(dataset_partition_end)
+                        .map(|(start, end)| {
+                            TrialDatasetPartition::try_new(
+                                market_squawk_domain::Timestamp::from_unix_nanos(start),
+                                market_squawk_domain::Timestamp::from_unix_nanos(end),
+                            )
+                        })
+                        .transpose()
+                        .map_err(|_| ExperimentError::CorruptRecord)?,
                 },
                 limits,
             )
@@ -265,7 +299,9 @@ fn require_terminal_header(
     trial_id: &str,
     expected_id: TrialId,
 ) -> Result<(), ExperimentError> {
-    if schema_version != TRIAL_SCHEMA_VERSION || TrialId(decode_hex(trial_id)?) != expected_id {
+    if !matches!(schema_version, 1 | TERMINAL_SCHEMA_VERSION)
+        || TrialId(decode_hex(trial_id)?) != expected_id
+    {
         return Err(ExperimentError::CorruptRecord);
     }
     Ok(())
@@ -389,7 +425,7 @@ pub(super) fn encode_hex(bytes: [u8; 32]) -> String {
     output
 }
 
-fn decode_hex(value: &str) -> Result<Sha256Digest, ExperimentError> {
+pub(super) fn decode_hex(value: &str) -> Result<Sha256Digest, ExperimentError> {
     if value.len() != 64 {
         return Err(ExperimentError::CorruptRecord);
     }

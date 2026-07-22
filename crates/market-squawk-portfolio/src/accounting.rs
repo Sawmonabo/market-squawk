@@ -324,6 +324,9 @@ impl ReplayState {
         successor: InstrumentId,
         consideration: MergerConsideration,
     ) -> Result<(), PortfolioError> {
+        if matches!(&consideration, MergerConsideration::Mixed { .. }) {
+            return Err(PortfolioError::UnresolvedCorporateAction);
+        }
         let subject_lots = self
             .lots
             .iter()
@@ -349,20 +352,15 @@ impl ReplayState {
             MergerConsideration::Stock {
                 numerator,
                 denominator,
-            } => self.convert_merger_lots(subject, successor, numerator.get(), denominator.get()),
+            } => self.convert_merger_lots(
+                subject,
+                successor,
+                numerator.get(),
+                denominator.get(),
+                true,
+            ),
             MergerConsideration::Cash { amount } => self.cash_merger(subject, amount),
-            MergerConsideration::Mixed {
-                numerator,
-                denominator,
-                cash,
-            } => {
-                let quantity = self.signed_quantity(subject)?;
-                let cash_total = cash
-                    .checked_mul_decimal(quantity)
-                    .map_err(|_| PortfolioError::Arithmetic)?;
-                self.cash.add(cash_total)?;
-                self.convert_merger_lots(subject, successor, numerator.get(), denominator.get())
-            }
+            MergerConsideration::Mixed { .. } => Err(PortfolioError::UnresolvedCorporateAction),
         }
     }
 
@@ -372,6 +370,7 @@ impl ReplayState {
         successor: InstrumentId,
         numerator: u32,
         denominator: u32,
+        preserve_basis: bool,
     ) -> Result<(), PortfolioError> {
         let factor = checked_decimal_div(Decimal::from(numerator), Decimal::from(denominator))?;
         for lot in self
@@ -381,6 +380,7 @@ impl ReplayState {
         {
             lot.instrument_id = successor;
             lot.quantity = checked_decimal_mul(lot.quantity, factor)?;
+            lot.basis_complete &= preserve_basis;
         }
         Ok(())
     }
@@ -396,15 +396,19 @@ impl ReplayState {
             let proceeds = amount
                 .checked_mul_decimal(lot.quantity)
                 .map_err(|_| PortfolioError::Arithmetic)?;
-            self.cash.add(proceeds)?;
             let gain = match lot.direction {
-                LotDirection::Long => proceeds
-                    .checked_sub(lot.basis)
-                    .map_err(|_| PortfolioError::Arithmetic)?,
-                LotDirection::Short => lot
-                    .basis
-                    .checked_sub(proceeds)
-                    .map_err(|_| PortfolioError::Arithmetic)?,
+                LotDirection::Long => {
+                    self.cash.add(proceeds)?;
+                    proceeds
+                        .checked_sub(lot.basis)
+                        .map_err(|_| PortfolioError::Arithmetic)?
+                }
+                LotDirection::Short => {
+                    self.cash.subtract(proceeds)?;
+                    lot.basis
+                        .checked_sub(proceeds)
+                        .map_err(|_| PortfolioError::Arithmetic)?
+                }
             };
             self.record_realized(gain)?;
         }

@@ -1,5 +1,7 @@
 //! Reserve-before-run application service for governed point-in-time experiments.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use market_squawk_data::Sha256Digest;
 use market_squawk_domain::SourceIdentifier;
 use sha2::{Digest as _, Sha256};
@@ -7,43 +9,40 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 use crate::experiments::{
-    BacktestOverfittingDiagnostic, DeflatedPerformanceDiagnostic, ExperimentError,
-    ExperimentInventory, TrialCompletionInput, TrialFailure, TrialMetric, TrialRecord, TrialSpec,
+    BacktestCohortEvaluation, BacktestCohortPlan, BacktestOverfittingDiagnostic,
+    BacktestOverfittingFold, BacktestOverfittingInput, BacktestOverfittingScore,
+    CohortEvaluationInput, CohortMemberBinding, DeflatedPerformanceDiagnostic,
+    DeflatedPerformanceInput, ExperimentError, ExperimentInventory, TrialCompletionInput,
+    TrialDatasetPartition, TrialFailure, TrialId, TrialMetric, TrialParameter, TrialRecord,
+    TrialSearchDimension, TrialSpec, TrialSpecInput, TrialStatus,
 };
-use crate::{BacktestEngine, BacktestError, BacktestRequest, BacktestRun, BacktestStrategy};
+use crate::{
+    AdmittedBacktestStrategy, BacktestEngine, BacktestError, BacktestRequest, BacktestRun,
+};
 
 mod artifact;
 
-/// Precomputed bounded evaluation evidence committed with one completed trial.
+/// Search and selection contract combined with strategy-owned executable identity by the service.
 #[derive(Clone, Debug)]
-pub struct BacktestEvaluation {
-    metrics: Box<[TrialMetric]>,
-    probability_of_backtest_overfitting: BacktestOverfittingDiagnostic,
-    deflated_performance: DeflatedPerformanceDiagnostic,
-    selected: bool,
+pub struct BacktestTrialPlan {
+    parameters: Vec<TrialParameter>,
+    search_space: Vec<TrialSearchDimension>,
+    selection_criterion: SourceIdentifier,
 }
 
-impl BacktestEvaluation {
-    /// Canonicalizes named metrics and rejects duplicate identities before a run is reserved.
-    pub fn try_new(
-        mut metrics: Vec<TrialMetric>,
-        probability_of_backtest_overfitting: BacktestOverfittingDiagnostic,
-        deflated_performance: DeflatedPerformanceDiagnostic,
-        selected: bool,
-    ) -> Result<Self, BacktestServiceError> {
-        metrics.sort_unstable_by(|left, right| left.name().cmp(right.name()));
-        if metrics
-            .windows(2)
-            .any(|pair| pair[0].name() == pair[1].name())
-        {
-            return Err(BacktestServiceError::InvalidEvaluation);
+impl BacktestTrialPlan {
+    /// Owns the bounded experiment dimensions that are independent of executable identity.
+    #[must_use]
+    pub const fn new(
+        parameters: Vec<TrialParameter>,
+        search_space: Vec<TrialSearchDimension>,
+        selection_criterion: SourceIdentifier,
+    ) -> Self {
+        Self {
+            parameters,
+            search_space,
+            selection_criterion,
         }
-        Ok(Self {
-            metrics: metrics.into_boxed_slice(),
-            probability_of_backtest_overfitting,
-            deflated_performance,
-            selected,
-        })
     }
 }
 
@@ -111,25 +110,28 @@ impl BacktestService {
         Self { inventory }
     }
 
-    /// Runs one trial only after validating exact request/spec bindings and durable reservation.
+    /// Derives one exact trial from the request and strategy capability before durable reservation.
     pub fn run(
         &self,
-        spec: TrialSpec,
         request: BacktestRequest,
-        strategy: &mut dyn BacktestStrategy,
-        evaluation: BacktestEvaluation,
+        strategy: &mut AdmittedBacktestStrategy,
+        plan: BacktestTrialPlan,
         cancellation: &CancellationToken,
     ) -> Result<BacktestOutcome, BacktestServiceError> {
-        if spec.dataset_identity() != request.dataset_identity()
-            || spec.object_graph_digest() != request.object_graph_digest()
-            || spec.execution_assumption_digest() != request.assumption_digest()
-            || spec.seed() != request.seed()
-        {
-            return Err(BacktestServiceError::BindingMismatch);
-        }
-        if evaluation.metrics.len() > self.inventory.limits().max_metrics() {
-            return Err(BacktestServiceError::InvalidEvaluation);
-        }
+        let executable = strategy.identity();
+        let spec = TrialSpec::try_new(TrialSpecInput {
+            dataset_identity: request.dataset_identity(),
+            object_graph_digest: request.object_graph_digest(),
+            execution_assumption_digest: request.assumption_digest(),
+            model: executable.model().cloned(),
+            strategy: executable.strategy().clone(),
+            code: executable.code().clone(),
+            configuration_digest: executable.configuration_digest(),
+            seed: request.seed(),
+            parameters: plan.parameters,
+            search_space: plan.search_space,
+            selection_criterion: plan.selection_criterion,
+        })?;
         let reservation = self.inventory.reserve(spec)?;
         let run = match BacktestEngine::run(&request, strategy, cancellation) {
             Ok(run) => run,
@@ -170,16 +172,170 @@ impl BacktestService {
             TrialCompletionInput {
                 result_digest: run.result_digest(),
                 artifact,
-                metrics: evaluation.metrics.into_vec(),
-                probability_of_backtest_overfitting: evaluation.probability_of_backtest_overfitting,
-                deflated_performance: evaluation.deflated_performance,
-                selected: evaluation.selected,
+                metrics: run_metrics(&request, &run)?,
+                dataset_partition: Some(TrialDatasetPartition::try_new(
+                    request
+                        .dataset
+                        .observations
+                        .first()
+                        .ok_or(BacktestServiceError::InvalidCohort)?
+                        .decision_at,
+                    request
+                        .dataset
+                        .observations
+                        .last()
+                        .ok_or(BacktestServiceError::InvalidCohort)?
+                        .decision_at,
+                )?),
             },
         )?;
         Ok(BacktestOutcome::Completed(Box::new(BacktestResult {
             run,
             trial,
         })))
+    }
+
+    /// Computes and appends authoritative diagnostics from immutable completed-trial metrics.
+    pub fn evaluate_cohort(
+        &self,
+        plan: BacktestCohortPlan,
+    ) -> Result<BacktestCohortEvaluation, BacktestServiceError> {
+        let member_ids = plan
+            .folds()
+            .iter()
+            .flat_map(|fold| fold.candidates())
+            .flat_map(|candidate| [candidate.in_sample(), candidate.out_of_sample()])
+            .chain(plan.selection_candidates().iter().copied())
+            .collect::<BTreeSet<_>>();
+        let mut records = BTreeMap::new();
+        let mut design = None;
+        for id in member_ids {
+            let record = self.inventory.trial(id)?;
+            if record.spec().selection_criterion() != plan.selection_criterion()
+                || !matches!(record.status(), TrialStatus::Completed(_))
+            {
+                return Err(BacktestServiceError::InvalidCohort);
+            }
+            let candidate_design = record.spec().experiment_design_digest()?;
+            if design.is_some_and(|expected| expected != candidate_design) {
+                return Err(BacktestServiceError::InvalidCohort);
+            }
+            design = Some(candidate_design);
+            records.insert(id, record);
+        }
+        validate_cohort_folds(&plan, &records)?;
+        validate_selection_candidates(&plan, &records)?;
+        let overfitting_input = BacktestOverfittingInput {
+            folds: plan
+                .folds()
+                .iter()
+                .map(|fold| {
+                    Ok(BacktestOverfittingFold {
+                        candidates: fold
+                            .candidates()
+                            .iter()
+                            .map(|candidate| {
+                                Ok(BacktestOverfittingScore {
+                                    in_sample: trial_metric(
+                                        &records,
+                                        candidate.in_sample(),
+                                        plan.selection_criterion(),
+                                    )?,
+                                    out_of_sample: trial_metric(
+                                        &records,
+                                        candidate.out_of_sample(),
+                                        plan.selection_criterion(),
+                                    )?,
+                                })
+                            })
+                            .collect::<Result<Vec<_>, BacktestServiceError>>()?,
+                    })
+                })
+                .collect::<Result<Vec<_>, BacktestServiceError>>()?,
+        };
+        let probability_of_backtest_overfitting =
+            BacktestOverfittingDiagnostic::try_compute(&overfitting_input)?;
+        let selection_scores = plan
+            .selection_candidates()
+            .iter()
+            .map(|id| {
+                Ok((
+                    *id,
+                    trial_metric(&records, *id, plan.selection_criterion())?,
+                ))
+            })
+            .collect::<Result<Vec<_>, BacktestServiceError>>()?;
+        let selected_id = selection_scores
+            .iter()
+            .max_by(|(left_id, left_score), (right_id, right_score)| {
+                left_score
+                    .total_cmp(right_score)
+                    .then_with(|| right_id.cmp(left_id))
+            })
+            .map(|(id, _)| *id)
+            .ok_or(BacktestServiceError::InvalidCohort)?;
+        let selected = member_binding(&records, selected_id)?;
+        let sharpes = plan
+            .selection_candidates()
+            .iter()
+            .map(|id| trial_metric(&records, *id, &SourceIdentifier::try_from("sharpe")?))
+            .collect::<Result<Vec<_>, BacktestServiceError>>()?;
+        let sharpe_count = sharpes.len() as f64;
+        let sharpe_mean = sharpes.iter().sum::<f64>() / sharpe_count;
+        let trial_sharpe_variance = sharpes
+            .iter()
+            .map(|value| {
+                let deviation = value - sharpe_mean;
+                deviation * deviation
+            })
+            .sum::<f64>()
+            / (sharpe_count - 1.0);
+        let observations = trial_metric(
+            &records,
+            selected_id,
+            &SourceIdentifier::try_from("return-observations")?,
+        )?;
+        if observations.fract() != 0.0 || observations < 3.0 || observations > usize::MAX as f64 {
+            return Err(BacktestServiceError::InvalidCohort);
+        }
+        let deflated_performance =
+            DeflatedPerformanceDiagnostic::try_compute(DeflatedPerformanceInput {
+                observed_sharpe: trial_metric(
+                    &records,
+                    selected_id,
+                    &SourceIdentifier::try_from("sharpe")?,
+                )?,
+                independent_trials: sharpes.len(),
+                observations: observations as usize,
+                trial_sharpe_variance,
+                return_skewness: trial_metric(
+                    &records,
+                    selected_id,
+                    &SourceIdentifier::try_from("return-skewness")?,
+                )?,
+                return_excess_kurtosis: trial_metric(
+                    &records,
+                    selected_id,
+                    &SourceIdentifier::try_from("return-excess-kurtosis")?,
+                )?,
+            })?;
+        let evaluator = cohort_evaluator_binding()?;
+        let evaluation = BacktestCohortEvaluation::try_new(CohortEvaluationInput {
+            evaluator,
+            experiment_design_digest: design.ok_or(BacktestServiceError::InvalidCohort)?,
+            selection_criterion: plan.selection_criterion().clone(),
+            members: records
+                .keys()
+                .map(|id| member_binding(&records, *id))
+                .collect::<Result<Vec<_>, _>>()?,
+            folds: plan.folds().to_vec(),
+            selection_candidates: plan.selection_candidates().to_vec(),
+            probability_of_backtest_overfitting,
+            deflated_performance,
+            selected,
+        })?;
+        self.inventory.publish_cohort_evaluation(&evaluation)?;
+        Ok(evaluation)
     }
 
     fn commit_failure(
@@ -203,15 +359,198 @@ impl BacktestService {
     }
 }
 
+fn run_metrics(
+    request: &BacktestRequest,
+    run: &BacktestRun,
+) -> Result<Vec<TrialMetric>, BacktestServiceError> {
+    let initial = request.portfolio.initial_cash.amount();
+    let ending = run.portfolio().marked_equity().amount();
+    let total_return = ending
+        .checked_sub(initial)
+        .and_then(|value| value.checked_div(initial))
+        .and_then(|value| rust_decimal::prelude::ToPrimitive::to_f64(&value))
+        .ok_or(BacktestServiceError::MetricEncoding)?;
+    let performance = run.performance();
+    Ok(vec![
+        TrialMetric::try_new(
+            SourceIdentifier::try_from("ending-equity")?,
+            rust_decimal::prelude::ToPrimitive::to_f64(&ending)
+                .ok_or(BacktestServiceError::MetricEncoding)?,
+        )?,
+        TrialMetric::try_new(
+            SourceIdentifier::try_from("fill-count")?,
+            run.fills().len() as f64,
+        )?,
+        TrialMetric::try_new(SourceIdentifier::try_from("total-return")?, total_return)?,
+        TrialMetric::try_new(SourceIdentifier::try_from("sharpe")?, performance.sharpe)?,
+        TrialMetric::try_new(
+            SourceIdentifier::try_from("return-observations")?,
+            performance.observations as f64,
+        )?,
+        TrialMetric::try_new(
+            SourceIdentifier::try_from("return-skewness")?,
+            performance.skewness,
+        )?,
+        TrialMetric::try_new(
+            SourceIdentifier::try_from("return-excess-kurtosis")?,
+            performance.excess_kurtosis,
+        )?,
+    ])
+}
+
+fn trial_metric(
+    records: &BTreeMap<TrialId, TrialRecord>,
+    id: TrialId,
+    name: &SourceIdentifier,
+) -> Result<f64, BacktestServiceError> {
+    let record = records
+        .get(&id)
+        .ok_or(BacktestServiceError::InvalidCohort)?;
+    let TrialStatus::Completed(completion) = record.status() else {
+        return Err(BacktestServiceError::InvalidCohort);
+    };
+    completion
+        .metrics()
+        .iter()
+        .find(|metric| metric.name() == name)
+        .map(TrialMetric::value)
+        .ok_or(BacktestServiceError::InvalidCohort)
+}
+
+fn member_binding(
+    records: &BTreeMap<TrialId, TrialRecord>,
+    id: TrialId,
+) -> Result<CohortMemberBinding, BacktestServiceError> {
+    let record = records
+        .get(&id)
+        .ok_or(BacktestServiceError::InvalidCohort)?;
+    let TrialStatus::Completed(completion) = record.status() else {
+        return Err(BacktestServiceError::InvalidCohort);
+    };
+    Ok(CohortMemberBinding::new(
+        id,
+        completion.result_digest(),
+        record.spec().dataset_identity(),
+        completion
+            .dataset_partition()
+            .ok_or(BacktestServiceError::InvalidCohort)?,
+        record.spec().parameter_digest()?,
+    ))
+}
+
+fn validate_cohort_folds(
+    plan: &BacktestCohortPlan,
+    records: &BTreeMap<TrialId, TrialRecord>,
+) -> Result<(), BacktestServiceError> {
+    let mut expected_parameters = None::<BTreeSet<[u8; 32]>>;
+    let mut seen_partitions = BTreeSet::new();
+    for fold in plan.folds() {
+        let mut fold_parameters = BTreeSet::new();
+        let mut fold_identity = None;
+        for candidate in fold.candidates() {
+            let in_record = records
+                .get(&candidate.in_sample())
+                .ok_or(BacktestServiceError::InvalidCohort)?;
+            let out_record = records
+                .get(&candidate.out_of_sample())
+                .ok_or(BacktestServiceError::InvalidCohort)?;
+            let TrialStatus::Completed(in_completion) = in_record.status() else {
+                return Err(BacktestServiceError::InvalidCohort);
+            };
+            let TrialStatus::Completed(out_completion) = out_record.status() else {
+                return Err(BacktestServiceError::InvalidCohort);
+            };
+            let in_partition = in_completion
+                .dataset_partition()
+                .ok_or(BacktestServiceError::InvalidCohort)?;
+            let out_partition = out_completion
+                .dataset_partition()
+                .ok_or(BacktestServiceError::InvalidCohort)?;
+            let parameter_digest = in_record.spec().parameter_digest()?;
+            if parameter_digest != out_record.spec().parameter_digest()?
+                || in_record.spec().dataset_identity() == out_record.spec().dataset_identity()
+                || in_partition.ends_at() >= out_partition.starts_at()
+            {
+                return Err(BacktestServiceError::InvalidCohort);
+            }
+            if !fold_parameters.insert(parameter_digest.bytes()) {
+                return Err(BacktestServiceError::InvalidCohort);
+            }
+            let identity = (
+                in_record.spec().dataset_identity().bytes(),
+                in_partition.starts_at().unix_nanos(),
+                in_partition.ends_at().unix_nanos(),
+                out_record.spec().dataset_identity().bytes(),
+                out_partition.starts_at().unix_nanos(),
+                out_partition.ends_at().unix_nanos(),
+            );
+            if fold_identity.is_some_and(|expected| expected != identity) {
+                return Err(BacktestServiceError::InvalidCohort);
+            }
+            fold_identity = Some(identity);
+        }
+        if expected_parameters
+            .as_ref()
+            .is_some_and(|expected| expected != &fold_parameters)
+            || !seen_partitions.insert(fold_identity.ok_or(BacktestServiceError::InvalidCohort)?)
+        {
+            return Err(BacktestServiceError::InvalidCohort);
+        }
+        expected_parameters = Some(fold_parameters);
+    }
+    Ok(())
+}
+
+fn validate_selection_candidates(
+    plan: &BacktestCohortPlan,
+    records: &BTreeMap<TrialId, TrialRecord>,
+) -> Result<(), BacktestServiceError> {
+    let mut expected_dataset = None;
+    let mut parameter_digests = BTreeSet::new();
+    for candidate in plan.selection_candidates() {
+        let record = records
+            .get(candidate)
+            .ok_or(BacktestServiceError::InvalidCohort)?;
+        let TrialStatus::Completed(completion) = record.status() else {
+            return Err(BacktestServiceError::InvalidCohort);
+        };
+        let dataset = (
+            record.spec().dataset_identity(),
+            completion
+                .dataset_partition()
+                .ok_or(BacktestServiceError::InvalidCohort)?,
+        );
+        if expected_dataset.is_some_and(|expected| expected != dataset)
+            || !parameter_digests.insert(record.spec().parameter_digest()?.bytes())
+        {
+            return Err(BacktestServiceError::InvalidCohort);
+        }
+        expected_dataset = Some(dataset);
+    }
+    expected_dataset
+        .map(|_| ())
+        .ok_or(BacktestServiceError::InvalidCohort)
+}
+
+fn cohort_evaluator_binding() -> Result<crate::TrialComponentBinding, BacktestServiceError> {
+    let name = SourceIdentifier::try_from("backtest-cohort-evaluator-v1")?;
+    let mut hash = Sha256::new();
+    hash.update(b"market-squawk/backtest-cohort-evaluator/v1");
+    Ok(crate::TrialComponentBinding::try_new(
+        name,
+        Sha256Digest::new(hash.finalize().into()),
+    )?)
+}
+
 /// Binding, evaluation, inventory, or bounded artifact failure outside engine domain outcomes.
 #[derive(Debug, Error)]
 pub enum BacktestServiceError {
-    /// The trial specification does not identify the exact request inputs.
-    #[error("backtest trial and request bindings differ")]
-    BindingMismatch,
-    /// Trial evaluation evidence is duplicate or exceeds the inventory ceiling.
-    #[error("backtest evaluation evidence is invalid")]
-    InvalidEvaluation,
+    /// Exact post-run values could not be represented as finite analytical metrics.
+    #[error("backtest post-run metrics could not be encoded")]
+    MetricEncoding,
+    /// Completed trials did not form one consistent bounded cohort.
+    #[error("backtest cohort evidence is incomplete or inconsistent")]
+    InvalidCohort,
     /// A fixed internal failure identity could not be encoded.
     #[error("backtest failure evidence could not be encoded")]
     FailureEncoding,
@@ -221,4 +560,7 @@ pub enum BacktestServiceError {
     /// Immutable inventory or artifact publication failed.
     #[error("backtest experiment inventory failed: {0}")]
     Experiment(#[from] ExperimentError),
+    /// A fixed metric identity could not be represented.
+    #[error("backtest metric identity could not be encoded: {0}")]
+    MetricIdentity(#[from] market_squawk_domain::IdentityError),
 }

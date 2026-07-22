@@ -6,8 +6,11 @@ use market_squawk_execution::{BoundedOrderIntents, StrategyError};
 use market_squawk_modeling::{
     InferenceBackend, ModelFailure, ModelFeatureValue, ModelInput, ModelOutput,
 };
+use sha2::{Digest as _, Sha256};
 
-use crate::{BacktestContext, BacktestStrategy};
+use crate::{BacktestContext, BacktestStrategy, ExperimentError, TrialComponentBinding};
+use market_squawk_data::Sha256Digest;
+use market_squawk_domain::SourceIdentifier;
 
 /// Strategy-owned mapping from one successful model output to bounded typed intents.
 pub trait BacktestModelDecisionMapper: Send + fmt::Debug {
@@ -21,18 +24,27 @@ pub trait BacktestModelDecisionMapper: Send + fmt::Debug {
 
 /// Research strategy adapter that converts every typed model failure into audited no-action.
 pub struct BacktestModelStrategy {
+    model: Option<TrialComponentBinding>,
     backend: Result<Box<dyn InferenceBackend>, ModelFailure>,
     mapper: Box<dyn BacktestModelDecisionMapper>,
 }
 
 impl BacktestModelStrategy {
-    /// Owns either one admitted immutable backend generation or its typed admission failure.
-    #[must_use]
-    pub fn new(
+    /// Owns an admitted backend and derives its model binding from the actual bundle metadata.
+    pub fn try_new(
         backend: Result<Box<dyn InferenceBackend>, ModelFailure>,
         mapper: Box<dyn BacktestModelDecisionMapper>,
-    ) -> Self {
-        Self { backend, mapper }
+    ) -> Result<Self, ExperimentError> {
+        let model = backend
+            .as_ref()
+            .ok()
+            .map(|backend| model_binding(backend.as_ref()))
+            .transpose()?;
+        Ok(Self {
+            model,
+            backend,
+            mapper,
+        })
     }
 }
 
@@ -48,6 +60,7 @@ impl fmt::Debug for BacktestModelStrategy {
                 },
             )
             .field("mapper", &self.mapper)
+            .field("model", &self.model)
             .finish()
     }
 }
@@ -90,4 +103,26 @@ impl BacktestStrategy for BacktestModelStrategy {
         };
         self.mapper.map(context, &output)
     }
+}
+
+impl BacktestModelStrategy {
+    pub(crate) const fn model_binding(&self) -> Option<&TrialComponentBinding> {
+        self.model.as_ref()
+    }
+}
+
+fn model_binding(backend: &dyn InferenceBackend) -> Result<TrialComponentBinding, ExperimentError> {
+    let metadata = backend.metadata();
+    let name = SourceIdentifier::try_from(format!(
+        "model-{}-{}-{}",
+        metadata.model_id(),
+        metadata.bundle_id().as_str(),
+        metadata.bundle_version()
+    ))
+    .map_err(|_| ExperimentError::InvalidSpec)?;
+    let mut hash = Sha256::new();
+    hash.update(b"market-squawk/backtest-model-binding/v1");
+    hash.update(metadata.metadata_hash().bytes());
+    hash.update(metadata.artifact_hash().bytes());
+    TrialComponentBinding::try_new(name, Sha256Digest::new(hash.finalize().into()))
 }

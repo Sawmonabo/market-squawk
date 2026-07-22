@@ -1,11 +1,10 @@
 //! Immutable trial specification and terminal record model.
 
 use market_squawk_data::Sha256Digest;
-use market_squawk_domain::SourceIdentifier;
+use market_squawk_domain::{SourceIdentifier, Timestamp};
 use sha2::{Digest as _, Sha256};
 
 use super::ExperimentError;
-use super::diagnostics::{BacktestOverfittingDiagnostic, DeflatedPerformanceDiagnostic};
 
 const HARD_MAX_TRIALS: usize = 1_000_000;
 const HARD_MAX_RECORD_BYTES: usize = 4 * 1024 * 1024;
@@ -39,6 +38,57 @@ impl TrialComponentBinding {
     #[must_use]
     pub const fn digest(&self) -> Sha256Digest {
         self.digest
+    }
+}
+
+/// Immutable model, strategy, code, and configuration identity owned by an executable strategy.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BacktestExecutableIdentity {
+    model: Option<TrialComponentBinding>,
+    strategy: TrialComponentBinding,
+    code: TrialComponentBinding,
+    configuration_digest: Sha256Digest,
+}
+
+impl BacktestExecutableIdentity {
+    /// Binds every executable component before the strategy can enter a governed run.
+    pub(crate) fn try_new(
+        model: Option<TrialComponentBinding>,
+        strategy: TrialComponentBinding,
+        code: TrialComponentBinding,
+        configuration_digest: Sha256Digest,
+    ) -> Result<Self, ExperimentError> {
+        require_digest(configuration_digest)?;
+        Ok(Self {
+            model,
+            strategy,
+            code,
+            configuration_digest,
+        })
+    }
+
+    /// Returns the actual admitted model generation, when this strategy performs inference.
+    #[must_use]
+    pub const fn model(&self) -> Option<&TrialComponentBinding> {
+        self.model.as_ref()
+    }
+
+    /// Returns the executable strategy implementation identity.
+    #[must_use]
+    pub const fn strategy(&self) -> &TrialComponentBinding {
+        &self.strategy
+    }
+
+    /// Returns the compiled code revision identity.
+    #[must_use]
+    pub const fn code(&self) -> &TrialComponentBinding {
+        &self.code
+    }
+
+    /// Returns the exact strategy configuration identity.
+    #[must_use]
+    pub const fn configuration_digest(&self) -> Sha256Digest {
+        self.configuration_digest
     }
 }
 
@@ -242,6 +292,45 @@ impl TrialSpec {
     pub const fn seed(&self) -> u64 {
         self.seed
     }
+
+    /// Returns the exact selection criterion bound into this trial.
+    #[must_use]
+    pub const fn selection_criterion(&self) -> &SourceIdentifier {
+        &self.selection_criterion
+    }
+
+    /// Hashes the declared search space and criterion independently of one selected parameter set.
+    pub fn experiment_design_digest(&self) -> Result<Sha256Digest, ExperimentError> {
+        let mut hash = Sha256::new();
+        hash.update(b"market-squawk/backtest-cohort-family/v1");
+        hash.update(self.execution_assumption_digest.bytes());
+        update_optional_binding(&mut hash, self.model.as_ref())?;
+        update_binding(&mut hash, &self.strategy)?;
+        update_binding(&mut hash, &self.code)?;
+        hash.update(self.configuration_digest.bytes());
+        update_length(&mut hash, self.search_space.len())?;
+        for dimension in &self.search_space {
+            update_bytes(&mut hash, dimension.name.as_str().as_bytes())?;
+            update_length(&mut hash, dimension.candidates.len())?;
+            for candidate in &dimension.candidates {
+                update_bytes(&mut hash, candidate.as_str().as_bytes())?;
+            }
+        }
+        update_bytes(&mut hash, self.selection_criterion.as_str().as_bytes())?;
+        Ok(Sha256Digest::new(hash.finalize().into()))
+    }
+
+    /// Hashes the candidate's exact parameter vector independently of its data partition.
+    pub fn parameter_digest(&self) -> Result<Sha256Digest, ExperimentError> {
+        let mut hash = Sha256::new();
+        hash.update(b"market-squawk/backtest-parameter-vector/v1");
+        update_length(&mut hash, self.parameters.len())?;
+        for parameter in &self.parameters {
+            update_bytes(&mut hash, parameter.name.as_str().as_bytes())?;
+            update_bytes(&mut hash, parameter.value.as_str().as_bytes())?;
+        }
+        Ok(Sha256Digest::new(hash.finalize().into()))
+    }
 }
 
 /// Content identity of one immutable trial specification.
@@ -299,10 +388,6 @@ impl ExperimentLimits {
     pub(crate) const fn max_artifact_bytes(self) -> usize {
         self.max_artifact_bytes
     }
-
-    pub(crate) const fn max_metrics(self) -> usize {
-        self.max_metrics
-    }
 }
 
 /// One finite named trial metric.
@@ -342,6 +427,35 @@ pub struct BacktestArtifact {
     pub(super) byte_count: u64,
 }
 
+/// Exact event-time interval represented by one completed trial dataset.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TrialDatasetPartition {
+    starts_at: Timestamp,
+    ends_at: Timestamp,
+}
+
+impl TrialDatasetPartition {
+    /// Requires a nonempty exact timestamp interval.
+    pub fn try_new(starts_at: Timestamp, ends_at: Timestamp) -> Result<Self, ExperimentError> {
+        if starts_at >= ends_at {
+            return Err(ExperimentError::InvalidCompletion);
+        }
+        Ok(Self { starts_at, ends_at })
+    }
+
+    /// Returns the first admitted decision instant.
+    #[must_use]
+    pub const fn starts_at(self) -> Timestamp {
+        self.starts_at
+    }
+
+    /// Returns the last admitted decision instant.
+    #[must_use]
+    pub const fn ends_at(self) -> Timestamp {
+        self.ends_at
+    }
+}
+
 impl BacktestArtifact {
     /// Returns the capability-relative controlled reference.
     #[must_use]
@@ -368,20 +482,16 @@ pub struct TrialCompletion {
     pub(super) result_digest: Sha256Digest,
     pub(super) artifact: BacktestArtifact,
     pub(super) metrics: Box<[TrialMetric]>,
-    pub(super) probability_of_backtest_overfitting: BacktestOverfittingDiagnostic,
-    pub(super) deflated_performance: DeflatedPerformanceDiagnostic,
-    pub(super) selected: bool,
+    pub(super) dataset_partition: Option<TrialDatasetPartition>,
 }
 
 /// Untrusted successful terminal trial input.
 #[derive(Clone, Debug)]
-pub struct TrialCompletionInput {
-    pub result_digest: Sha256Digest,
-    pub artifact: BacktestArtifact,
-    pub metrics: Vec<TrialMetric>,
-    pub probability_of_backtest_overfitting: BacktestOverfittingDiagnostic,
-    pub deflated_performance: DeflatedPerformanceDiagnostic,
-    pub selected: bool,
+pub(crate) struct TrialCompletionInput {
+    pub(crate) result_digest: Sha256Digest,
+    pub(crate) artifact: BacktestArtifact,
+    pub(crate) metrics: Vec<TrialMetric>,
+    pub(crate) dataset_partition: Option<TrialDatasetPartition>,
 }
 
 impl TrialCompletion {
@@ -407,9 +517,7 @@ impl TrialCompletion {
             result_digest: input.result_digest,
             artifact: input.artifact,
             metrics: input.metrics.into_boxed_slice(),
-            probability_of_backtest_overfitting: input.probability_of_backtest_overfitting,
-            deflated_performance: input.deflated_performance,
-            selected: input.selected,
+            dataset_partition: input.dataset_partition,
         })
     }
 
@@ -423,6 +531,18 @@ impl TrialCompletion {
     #[must_use]
     pub const fn artifact(&self) -> &BacktestArtifact {
         &self.artifact
+    }
+
+    /// Returns canonical metrics computed by the backtest service after the run completed.
+    #[must_use]
+    pub fn metrics(&self) -> &[TrialMetric] {
+        &self.metrics
+    }
+
+    /// Returns the exact dataset interval, or `None` only for migrated schema-v1 terminals.
+    #[must_use]
+    pub const fn dataset_partition(&self) -> Option<TrialDatasetPartition> {
+        self.dataset_partition
     }
 }
 

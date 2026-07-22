@@ -26,7 +26,7 @@ pub mod journal {
 }
 
 pub use backtest_service::{
-    BacktestGovernanceBindings, PinnedBacktestInput, ProductionBacktestService,
+    BacktestExperimentPlan, PinnedBacktestInput, ProductionBacktestService,
     ProductionBacktestServiceError,
 };
 pub use diagnostic_engine::{
