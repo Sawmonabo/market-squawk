@@ -4,6 +4,8 @@ use rust_decimal::Decimal;
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::EffectiveInterval;
+
 use super::{
     CorporateActionKind, PositionSide, QuantityLots, ResearchContext, ResearchError,
     SourceIdentifier, XbrlFactEvidence, require_instrument, validate_corporate_action,
@@ -535,6 +537,67 @@ impl<'de> Deserialize<'de> for CorporateActionObservation {
     {
         let wire = CorporateActionObservationWire::deserialize(deserializer)?;
         Self::new(wire.context, wire.action).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Source-authored membership in one named instrument universe over a half-open interval.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct UniverseMembershipObservation {
+    context: ResearchContext,
+    universe: SourceIdentifier,
+    effective_interval: EffectiveInterval,
+}
+
+impl UniverseMembershipObservation {
+    /// Constructs instrument-scoped membership whose interval start equals its effective time.
+    pub fn new(
+        context: ResearchContext,
+        universe: SourceIdentifier,
+        effective_interval: EffectiveInterval,
+    ) -> Result<Self, ResearchError> {
+        require_instrument(&context)?;
+        if context.time().effective().exact_timestamp() != Some(effective_interval.starts_at()) {
+            return Err(ResearchError::UniverseIntervalStartMismatch);
+        }
+        Ok(Self {
+            context,
+            universe,
+            effective_interval,
+        })
+    }
+
+    /// Returns point-in-time context and provenance.
+    pub const fn context(&self) -> &ResearchContext {
+        &self.context
+    }
+
+    /// Returns the source-authored universe identity.
+    pub const fn universe(&self) -> &SourceIdentifier {
+        &self.universe
+    }
+
+    /// Returns the source-authored half-open membership interval.
+    pub const fn effective_interval(&self) -> EffectiveInterval {
+        self.effective_interval
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UniverseMembershipObservationWire {
+    context: ResearchContext,
+    universe: SourceIdentifier,
+    effective_interval: EffectiveInterval,
+}
+
+impl<'de> Deserialize<'de> for UniverseMembershipObservation {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = UniverseMembershipObservationWire::deserialize(deserializer)?;
+        Self::new(wire.context, wire.universe, wire.effective_interval)
+            .map_err(serde::de::Error::custom)
     }
 }
 

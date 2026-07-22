@@ -102,6 +102,64 @@ pub struct PublishedObject {
     created_at: Timestamp,
 }
 
+/// Exact encoded object retained only in the controlled staging namespace.
+#[derive(Debug)]
+pub(crate) struct StagedObject {
+    cleanup: OwnedStagingCleanup,
+    content_hash: Sha256Digest,
+    size_bytes: u64,
+    row_count: u64,
+    created_at: Timestamp,
+}
+
+impl StagedObject {
+    pub(crate) const fn content_hash(&self) -> Sha256Digest {
+        self.content_hash
+    }
+
+    pub(crate) const fn created_at(&self) -> Timestamp {
+        self.created_at
+    }
+}
+
+#[derive(Debug)]
+struct OwnedStagingCleanup {
+    directory: Dir,
+    reference: Option<String>,
+}
+
+impl OwnedStagingCleanup {
+    fn reference(&self) -> Result<&str, ParquetStoreError> {
+        self.reference
+            .as_deref()
+            .ok_or(ParquetStoreError::InvalidStagedObject)
+    }
+
+    fn remove(&mut self) -> Result<(), ParquetStoreError> {
+        let reference = self
+            .reference
+            .take()
+            .ok_or(ParquetStoreError::InvalidStagedObject)?;
+        self.directory.remove_file(reference)?;
+        Ok(())
+    }
+
+    fn disarm(&mut self) -> Result<(), ParquetStoreError> {
+        self.reference
+            .take()
+            .map(|_| ())
+            .ok_or(ParquetStoreError::InvalidStagedObject)
+    }
+}
+
+impl Drop for OwnedStagingCleanup {
+    fn drop(&mut self) {
+        if let Some(reference) = self.reference.take() {
+            let _ignored = self.directory.remove_file(reference);
+        }
+    }
+}
+
 /// Pre-construction receipt for the bounded uncompressed query-artifact writer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct QueryArtifactWriterAdmission {
@@ -395,6 +453,55 @@ impl ParquetObjectStore {
             .await
     }
 
+    /// Encodes and hashes a registered dataset while retaining it outside the final namespace.
+    pub(crate) async fn stage_dataset_under_lease(
+        &self,
+        batch: &DatasetArrowBatch,
+        cancellation: &CancellationToken,
+        lease: &PublicationLease,
+    ) -> Result<StagedObject, ParquetStoreError> {
+        if !self.authority.publication.owns(lease) {
+            return Err(ParquetStoreError::InvalidPublicationLease);
+        }
+        let store = Self {
+            root: self.root.clone(),
+            directory: self.directory.try_clone()?,
+            config: self.config,
+            blocking_tasks: Arc::clone(&self.blocking_tasks),
+            authority: Arc::clone(&self.authority),
+        };
+        let batch = batch.record_batch().clone();
+        let permit = self.acquire_blocking_permit(cancellation).await?;
+        let operation_cancellation = cancellation.child_token();
+        let worker_cancellation = operation_cancellation.clone();
+        let mut worker = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            store.stage_blocking(&batch, &worker_cancellation, None)
+        });
+        tokio::select! {
+            result = &mut worker => {
+                result.map_err(|_| ParquetStoreError::BlockingTaskFailed)?
+            }
+            _ = cancellation.cancelled() => {
+                operation_cancellation.cancel();
+                worker.await.map_err(|_| ParquetStoreError::BlockingTaskFailed)??;
+                Err(ParquetStoreError::Cancelled)
+            }
+        }
+    }
+
+    /// Atomically moves an exact staged object into the immutable content-addressed namespace.
+    pub(crate) fn finalize_staged_under_lease(
+        &self,
+        staged: StagedObject,
+        lease: &PublicationLease,
+    ) -> Result<PublishedObject, ParquetStoreError> {
+        if !self.authority.publication.owns(lease) {
+            return Err(ParquetStoreError::InvalidPublicationLease);
+        }
+        self.finalize_staged(staged)
+    }
+
     /// Publishes a query artifact only after a checked uncompressed-writer admission.
     #[allow(
         clippy::too_many_arguments,
@@ -491,6 +598,16 @@ impl ParquetObjectStore {
         cancellation: &CancellationToken,
         query_admission: Option<QueryArtifactWriterAdmission>,
     ) -> Result<PublishedObject, ParquetStoreError> {
+        let staged = self.stage_blocking(batch, cancellation, query_admission)?;
+        self.finalize_staged(staged)
+    }
+
+    fn stage_blocking(
+        &self,
+        batch: &RecordBatch,
+        cancellation: &CancellationToken,
+        query_admission: Option<QueryArtifactWriterAdmission>,
+    ) -> Result<StagedObject, ParquetStoreError> {
         if cancellation.is_cancelled() {
             return Err(ParquetStoreError::Cancelled);
         }
@@ -504,9 +621,10 @@ impl ParquetObjectStore {
         options.read(true).write(true).create_new(true);
         configure_private_staging(&mut options);
         let staged = self.directory.open_with(&stage, &options)?.into_std();
-        let _cleanup = StagingCleanup {
+        let mut cleanup = StagingCleanup {
             directory: &self.directory,
             reference: &stage,
+            active: true,
         };
         let properties = WriterProperties::builder()
             .set_max_row_group_row_count(Some(self.config.max_row_group_rows))
@@ -581,30 +699,73 @@ impl ParquetObjectStore {
             self.directory.remove_file(&stage)?;
             return Err(ParquetStoreError::Cancelled);
         }
-        let digest = encode_hex(content_hash.bytes());
+        let created_at = timestamp_from_system_time(
+            self.directory
+                .open(&stage)?
+                .into_std()
+                .metadata()?
+                .modified()?,
+        )?;
+        let cleanup_directory = self.directory.try_clone()?;
+        cleanup.disarm();
+        drop(cleanup);
+        let owned_cleanup = OwnedStagingCleanup {
+            directory: cleanup_directory,
+            reference: Some(stage),
+        };
+        Ok(StagedObject {
+            cleanup: owned_cleanup,
+            content_hash,
+            size_bytes,
+            row_count: u64::try_from(batch.num_rows())
+                .map_err(|_| ParquetStoreError::SizeOverflow)?,
+            created_at,
+        })
+    }
+
+    fn finalize_staged(
+        &self,
+        mut staged: StagedObject,
+    ) -> Result<PublishedObject, ParquetStoreError> {
+        let digest = encode_hex(staged.content_hash.bytes());
         let destination = format!("{OBJECTS}/{}/{}.parquet", &digest[..2], digest);
         self.directory
             .create_dir_all(format!("{OBJECTS}/{}", &digest[..2]))?;
-        match self.publish_no_replace(&stage, &destination) {
+        match self.publish_no_replace(staged.cleanup.reference()?, &destination) {
             Ok(()) => {
+                staged.cleanup.disarm()?;
                 sync_directory(&self.directory, &format!("{OBJECTS}/{}", &digest[..2]))?;
                 sync_directory(&self.directory, OBJECTS)?;
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                self.directory.remove_file(&stage)?;
-                let existing =
-                    object_from_reference(&self.directory, &destination, batch.num_rows())?;
-                if existing.content_hash != content_hash || existing.size_bytes != size_bytes {
+                staged.cleanup.remove()?;
+                let existing = object_from_reference(
+                    &self.directory,
+                    &destination,
+                    usize::try_from(staged.row_count)
+                        .map_err(|_| ParquetStoreError::SizeOverflow)?,
+                )?;
+                if existing.content_hash != staged.content_hash
+                    || existing.size_bytes != staged.size_bytes
+                {
                     return Err(ParquetStoreError::ContentAddressConflict);
                 }
                 return Ok(existing);
             }
-            Err(error) => {
-                let _ignored = self.directory.remove_file(&stage);
-                return Err(error.into());
-            }
+            Err(error) => return Err(error.into()),
         }
-        object_from_reference(&self.directory, &destination, batch.num_rows())
+        let published = object_from_reference(
+            &self.directory,
+            &destination,
+            usize::try_from(staged.row_count).map_err(|_| ParquetStoreError::SizeOverflow)?,
+        )?;
+        if published.content_hash != staged.content_hash
+            || published.size_bytes != staged.size_bytes
+            || published.created_at != staged.created_at
+        {
+            return Err(ParquetStoreError::ObjectMetadataMismatch);
+        }
+        Ok(published)
     }
 
     /// Re-hashes a published object through the retained root capability.
@@ -629,13 +790,30 @@ impl ParquetObjectStore {
         dataset: &PinnedDataset,
         cancellation: &CancellationToken,
     ) -> Result<Vec<RecordBatch>, ParquetStoreError> {
+        self.read_pinned_with_limits(dataset, u64::MAX, usize::MAX, cancellation)
+    }
+
+    fn read_pinned_with_limits(
+        &self,
+        dataset: &PinnedDataset,
+        max_rows: u64,
+        max_retained_bytes: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<RecordBatch>, ParquetStoreError> {
         let mut batches = Vec::new();
         let mut generation_rows = 0_u64;
+        let mut retained_bytes = 0_usize;
         for pinned in dataset.objects() {
             if cancellation.is_cancelled() {
                 return Err(ParquetStoreError::Cancelled);
             }
             let object = pinned.object();
+            if generation_rows
+                .checked_add(object.row_count())
+                .is_none_or(|rows| rows > max_rows)
+            {
+                return Err(ParquetStoreError::ReadLimitExceeded);
+            }
             let digest = encode_hex(object.content_hash().bytes());
             let expected_reference = format!("{OBJECTS}/{}/{}.parquet", &digest[..2], digest);
             if pinned.relative_reference() != expected_reference {
@@ -652,6 +830,32 @@ impl ParquetObjectStore {
             }
             file.seek(SeekFrom::Start(0))?;
             let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+            let row_groups = builder.metadata().row_groups();
+            let object_estimate = row_groups.iter().try_fold(0_usize, |total, row_group| {
+                row_group.columns().iter().try_fold(total, |total, column| {
+                    total
+                        .checked_add(
+                            usize::try_from(column.uncompressed_size())
+                                .map_err(|_| ParquetStoreError::SizeOverflow)?,
+                        )
+                        .ok_or(ParquetStoreError::SizeOverflow)
+                })
+            })?;
+            let structural = usize::try_from(object.row_count())
+                .ok()
+                .and_then(|rows| rows.checked_mul(builder.schema().fields().len()))
+                .and_then(|cells| cells.checked_mul(std::mem::size_of::<u64>()))
+                .ok_or(ParquetStoreError::SizeOverflow)?;
+            let estimated_peak = retained_bytes
+                .checked_add(object_estimate)
+                .and_then(|bytes| bytes.checked_add(structural))
+                .ok_or(ParquetStoreError::SizeOverflow)?;
+            if estimated_peak > max_retained_bytes {
+                return Err(ParquetStoreError::ReadLimitExceeded);
+            }
+            batches
+                .try_reserve(row_groups.len())
+                .map_err(|_| ParquetStoreError::ReadLimitExceeded)?;
             let schema = Arc::clone(builder.schema());
             let reader = builder
                 .with_batch_size(self.config.max_row_group_rows)
@@ -662,10 +866,18 @@ impl ParquetObjectStore {
                     return Err(ParquetStoreError::Cancelled);
                 }
                 let batch = batch?;
-                batches.push(RecordBatch::try_new(
-                    Arc::clone(&schema),
-                    batch.columns().to_vec(),
-                )?);
+                retained_bytes = retained_bytes
+                    .checked_add(batch.get_array_memory_size())
+                    .ok_or(ParquetStoreError::SizeOverflow)?;
+                if retained_bytes > max_retained_bytes {
+                    return Err(ParquetStoreError::ReadLimitExceeded);
+                }
+                let mut columns = Vec::new();
+                columns
+                    .try_reserve_exact(batch.num_columns())
+                    .map_err(|_| ParquetStoreError::ReadLimitExceeded)?;
+                columns.extend(batch.columns().iter().cloned());
+                batches.push(RecordBatch::try_new(Arc::clone(&schema), columns)?);
             }
             let object_rows = batches[first_index..]
                 .iter()
@@ -710,6 +922,49 @@ impl ParquetObjectStore {
         let mut worker = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             store.read_pinned(&dataset, &worker_cancellation)
+        });
+        tokio::select! {
+            result = &mut worker => {
+                result.map_err(|_| ParquetStoreError::BlockingTaskFailed)?
+            }
+            _ = cancellation.cancelled() => {
+                operation_cancellation.cancel();
+                Err(ParquetStoreError::Cancelled)
+            }
+        }
+    }
+
+    /// Reads one immutable generation only after caller-selected row and Arrow-memory admission.
+    pub(crate) async fn read_pinned_bounded_async(
+        &self,
+        dataset: &PinnedDataset,
+        max_rows: usize,
+        max_retained_bytes: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<RecordBatch>, ParquetStoreError> {
+        if max_rows == 0 || max_retained_bytes == 0 {
+            return Err(ParquetStoreError::ReadLimitExceeded);
+        }
+        let store = Self {
+            root: self.root.clone(),
+            directory: self.directory.try_clone()?,
+            config: self.config,
+            blocking_tasks: Arc::clone(&self.blocking_tasks),
+            authority: Arc::clone(&self.authority),
+        };
+        let dataset = dataset.clone();
+        let permit = self.acquire_blocking_permit(cancellation).await?;
+        let operation_cancellation = cancellation.child_token();
+        let worker_cancellation = operation_cancellation.clone();
+        let max_rows = u64::try_from(max_rows).map_err(|_| ParquetStoreError::SizeOverflow)?;
+        let mut worker = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            store.read_pinned_with_limits(
+                &dataset,
+                max_rows,
+                max_retained_bytes,
+                &worker_cancellation,
+            )
         });
         tokio::select! {
             result = &mut worker => {
@@ -800,6 +1055,13 @@ impl ParquetObjectStore {
 struct StagingCleanup<'a> {
     directory: &'a Dir,
     reference: &'a str,
+    active: bool,
+}
+
+impl StagingCleanup<'_> {
+    fn disarm(&mut self) {
+        self.active = false;
+    }
 }
 
 fn map_artifact_root_clone_error(error: PathError) -> ParquetStoreError {
@@ -818,7 +1080,9 @@ fn map_artifact_root_clone_error(error: PathError) -> ParquetStoreError {
 
 impl Drop for StagingCleanup<'_> {
     fn drop(&mut self) {
-        let _ignored = self.directory.remove_file(self.reference);
+        if self.active {
+            let _ignored = self.directory.remove_file(self.reference);
+        }
     }
 }
 
@@ -853,9 +1117,15 @@ pub enum ParquetStoreError {
     /// A lease belongs to a different publication/recovery coordinator.
     #[error("Parquet publication lease does not own this object store")]
     InvalidPublicationLease,
+    /// A staged receipt was already consumed or does not retain its controlled temporary object.
+    #[error("Parquet staged-object receipt is invalid")]
+    InvalidStagedObject,
     /// A batch or object exceeds the configured bounded staging area.
     #[error("Parquet staging byte limit exceeded")]
     StagingLimitExceeded,
+    /// A bounded reader would exceed its caller-selected row or retained-memory ceiling.
+    #[error("Parquet reader resource limit exceeded")]
+    ReadLimitExceeded,
     /// A byte or row count could not be represented.
     #[error("Parquet size conversion overflow")]
     SizeOverflow,

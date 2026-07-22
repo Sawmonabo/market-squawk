@@ -281,6 +281,7 @@ pub enum ObservationFamilyKey {
     },
     Transaction {
         source_id: SourceId,
+        instrument_id: Option<InstrumentId>,
         account_id: SourceIdentifier,
         source_record_id: SourceIdentifier,
     },
@@ -288,6 +289,12 @@ pub enum ObservationFamilyKey {
         source_id: SourceId,
         instrument_id: InstrumentId,
         source_record: SourceIdentifier,
+    },
+    UniverseMembership {
+        source_id: SourceId,
+        instrument_id: InstrumentId,
+        source_record: SourceIdentifier,
+        universe: SourceIdentifier,
     },
     AlternativeData {
         source_id: SourceId,
@@ -337,6 +344,7 @@ impl ObservationFamilyKey {
             }),
             ResearchObservation::Transaction(value) => Ok(Self::Transaction {
                 source_id,
+                instrument_id: provenance.instrument_id(),
                 account_id: value.account_id().clone(),
                 source_record_id: value.source_record_id().clone(),
             }),
@@ -344,6 +352,12 @@ impl ObservationFamilyKey {
                 source_id,
                 instrument_id: required_instrument()?,
                 source_record: provenance.source_identifier().clone(),
+            }),
+            ResearchObservation::UniverseMembership(value) => Ok(Self::UniverseMembership {
+                source_id,
+                instrument_id: required_instrument()?,
+                source_record: provenance.source_identifier().clone(),
+                universe: value.universe().clone(),
             }),
             ResearchObservation::AlternativeData(value) => Ok(Self::AlternativeData {
                 source_id,
@@ -366,6 +380,7 @@ impl fmt::Display for ObservationFamilyKey {
             Self::PortfolioPosition { .. } => "portfolio_position",
             Self::Transaction { .. } => "transaction",
             Self::CorporateAction { .. } => "corporate_action",
+            Self::UniverseMembership { .. } => "universe_membership",
             Self::AlternativeData { .. } => "alternative_data",
         })
     }
@@ -379,6 +394,7 @@ pub(super) const fn observation_context(observation: &ResearchObservation) -> &R
         ResearchObservation::PortfolioPosition(value) => value.context(),
         ResearchObservation::Transaction(value) => value.context(),
         ResearchObservation::CorporateAction(value) => value.context(),
+        ResearchObservation::UniverseMembership(value) => value.context(),
         ResearchObservation::AlternativeData(value) => value.context(),
     }
 }

@@ -6,7 +6,8 @@ use std::num::NonZeroU32;
 use std::time::Duration;
 
 use market_squawk_domain::{
-    Currency, DigestAlgorithm, EvidenceDigest, InstrumentId, SourceId, SourceIdentifier, Timestamp,
+    AvailabilityEvidence, Currency, DigestAlgorithm, EvidenceDigest, InstrumentId,
+    ResearchTemporalCoordinate, SourceId, SourceIdentifier, Timestamp,
 };
 use rust_decimal::Decimal;
 
@@ -38,6 +39,45 @@ pub enum ComponentKind {
     Label,
 }
 
+/// Closed ownership scope for one component's selected source evidence.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ComponentScope {
+    /// Evidence must include this example's instrument and may include global context.
+    Instrument,
+    /// Evidence must include an account-scoped record and may include global context.
+    Account,
+    /// Evidence must be independent of instrument and account identity.
+    Global,
+}
+
+/// Whether corporate-action economics can change a component's meaning or value.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum CorporateActionSensitivity {
+    /// The component is independent of instrument lifecycle and distribution economics.
+    NotApplicable,
+    /// Non-raw policies require exact producer evidence for the selected action plan.
+    RequiresAdjustment,
+}
+
+impl CorporateActionSensitivity {
+    pub(super) const fn tag(self) -> u8 {
+        match self {
+            Self::NotApplicable => 1,
+            Self::RequiresAdjustment => 2,
+        }
+    }
+}
+
+impl ComponentScope {
+    pub(super) const fn tag(self) -> u8 {
+        match self {
+            Self::Instrument => 1,
+            Self::Account => 2,
+            Self::Global => 3,
+        }
+    }
+}
+
 impl ComponentKind {
     pub(super) const fn name(self) -> &'static str {
         match self {
@@ -58,6 +98,8 @@ impl ComponentKind {
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct FeatureLabelComponentSpec {
     kind: ComponentKind,
+    scope: ComponentScope,
+    corporate_actions: CorporateActionSensitivity,
     name: Box<str>,
     version: NonZeroU32,
 }
@@ -66,6 +108,8 @@ impl FeatureLabelComponentSpec {
     /// Constructs a component contract using the stable output-identifier grammar.
     pub fn try_new(
         kind: ComponentKind,
+        scope: ComponentScope,
+        corporate_actions: CorporateActionSensitivity,
         name: impl AsRef<str>,
         version: NonZeroU32,
     ) -> Result<Self, DatasetBuildError> {
@@ -75,6 +119,8 @@ impl FeatureLabelComponentSpec {
         }
         Ok(Self {
             kind,
+            scope,
+            corporate_actions,
             name: name.into(),
             version,
         })
@@ -85,6 +131,16 @@ impl FeatureLabelComponentSpec {
         self.kind
     }
 
+    /// Returns the closed source-evidence ownership scope.
+    pub const fn scope(&self) -> ComponentScope {
+        self.scope
+    }
+
+    /// Returns whether this component requires corporate-action treatment evidence.
+    pub const fn corporate_actions(&self) -> CorporateActionSensitivity {
+        self.corporate_actions
+    }
+
     /// Returns the stable component name.
     pub fn name(&self) -> &str {
         &self.name
@@ -93,6 +149,50 @@ impl FeatureLabelComponentSpec {
     /// Returns the nonzero semantic version.
     pub const fn version(&self) -> NonZeroU32 {
         self.version
+    }
+}
+
+/// Exact producer attestation for the corporate-action treatment of one component value.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ComponentAdjustmentEvidence {
+    /// The producer retained the value in raw terms.
+    Raw,
+    /// The component contract declares corporate-action economics inapplicable.
+    NotApplicable,
+    /// The producer transformed the value using the exact selected plan and implementation.
+    Applied {
+        /// Non-raw policy implemented by the producer.
+        policy: CorporateActionPolicy,
+        /// Canonical identity of admitted actions and typed adjustment steps.
+        plan_content: Sha256Digest,
+        /// Canonical identity of the complete plan admission/exclusion audit.
+        plan_audit: Sha256Digest,
+        /// Immutable identity of the producer implementation that performed the transformation.
+        implementation_evidence: EvidenceDigest,
+    },
+}
+
+impl ComponentAdjustmentEvidence {
+    /// Constructs non-reserved evidence for a producer-applied non-raw action plan.
+    pub fn try_applied(
+        policy: CorporateActionPolicy,
+        plan_content: Sha256Digest,
+        plan_audit: Sha256Digest,
+        implementation_evidence: EvidenceDigest,
+    ) -> Result<Self, DatasetBuildError> {
+        if policy.adjustment() == crate::CorporateActionAdjustment::Raw
+            || plan_content.bytes() == [0; 32]
+            || plan_audit.bytes() == [0; 32]
+            || implementation_evidence.bytes() == [0; 32]
+        {
+            return Err(DatasetBuildError::InvalidRequest);
+        }
+        Ok(Self::Applied {
+            policy,
+            plan_content,
+            plan_audit,
+            implementation_evidence,
+        })
     }
 }
 
@@ -228,6 +328,7 @@ pub struct FeatureLabelComponentInput {
     spec: FeatureLabelComponentSpec,
     value: ComponentValue,
     selectors: Box<[ComponentSelector]>,
+    adjustment: ComponentAdjustmentEvidence,
 }
 
 impl FeatureLabelComponentInput {
@@ -236,6 +337,7 @@ impl FeatureLabelComponentInput {
         spec: FeatureLabelComponentSpec,
         value: ComponentValue,
         mut selectors: Vec<ComponentSelector>,
+        adjustment: ComponentAdjustmentEvidence,
     ) -> Result<Self, DatasetBuildError> {
         if selectors.is_empty() || selectors.len() > MAX_COMPONENT_SELECTORS {
             return Err(DatasetBuildError::InvalidRequest);
@@ -251,6 +353,7 @@ impl FeatureLabelComponentInput {
             spec,
             value,
             selectors: selectors.into_boxed_slice(),
+            adjustment,
         })
     }
 
@@ -267,6 +370,11 @@ impl FeatureLabelComponentInput {
     /// Returns canonical, duplicate-free natural-family selectors.
     pub fn selectors(&self) -> &[ComponentSelector] {
         &self.selectors
+    }
+
+    /// Returns exact producer evidence for this value's corporate-action treatment.
+    pub const fn adjustment(&self) -> &ComponentAdjustmentEvidence {
+        &self.adjustment
     }
 }
 
@@ -527,12 +635,10 @@ impl DatasetBuildInputs {
                         .iter()
                         .zip(&component_specs)
                         .any(|(component, spec)| component.spec != *spec)
-                    || example.components.iter().any(|component| {
-                        component.selectors.iter().any(|selector| {
-                            selector_instrument(selector.family())
-                                .is_some_and(|instrument| instrument != example.instrument_id)
-                        })
-                    })
+                    || example
+                        .components
+                        .iter()
+                        .any(|component| !component_scope_matches(component, example.instrument_id))
             })
         {
             return Err(DatasetBuildError::InvalidRequest);
@@ -782,6 +888,7 @@ impl DatasetBuildRequest {
                 &output_dataset,
                 &inputs,
                 intended_use,
+                output_authorization.source_id(),
                 policy_digest,
                 universe_digest,
             )
@@ -931,7 +1038,7 @@ fn compare_examples(left: &DatasetExample, right: &DatasetExample) -> Ordering {
 }
 
 fn request_retained_bytes(inputs: &DatasetBuildInputs) -> Result<usize, DatasetBuildError> {
-    let mut retained = size_of::<DatasetBuildInputs>();
+    let mut retained = size_of::<DatasetBuildRequest>();
     for additional in [
         retained_array_bytes::<DatasetManifestRef>(inputs.parents().len())?,
         retained_array_bytes::<UniverseMembership>(inputs.universe_memberships.len())?,
@@ -942,28 +1049,185 @@ fn request_retained_bytes(inputs: &DatasetBuildInputs) -> Result<usize, DatasetB
             .checked_add(additional)
             .ok_or(DatasetBuildError::LimitExceeded)?;
     }
+    retained = retained
+        .checked_add(inputs.universe_id().as_str().len())
+        .ok_or(DatasetBuildError::LimitExceeded)?;
+    for parent in inputs.parents() {
+        retained = retained
+            .checked_add(manifest_dynamic_bytes(parent)?)
+            .ok_or(DatasetBuildError::LimitExceeded)?;
+    }
+    for membership in &inputs.universe_memberships {
+        retained = retained
+            .checked_add(manifest_dynamic_bytes(membership.source_manifest())?)
+            .and_then(|bytes| {
+                bytes.checked_add(availability_dynamic_bytes(membership.availability()))
+            })
+            .ok_or(DatasetBuildError::LimitExceeded)?;
+    }
     for spec in &inputs.component_specs {
         retained = retained
             .checked_add(spec.name.len())
             .ok_or(DatasetBuildError::LimitExceeded)?;
     }
     for example in &inputs.examples {
-        let selector_bytes = example.components.iter().try_fold(
-            0_usize,
-            |total, component| -> Result<usize, DatasetBuildError> {
-                total
-                    .checked_add(retained_array_bytes::<ComponentSelector>(
-                        component.selectors.len(),
-                    )?)
-                    .ok_or(DatasetBuildError::LimitExceeded)
-            },
-        )?;
         retained = retained
             .checked_add(example.example_id.len())
-            .and_then(|value| value.checked_add(selector_bytes))
+            .and_then(|value| {
+                retained_array_bytes::<FeatureLabelComponentInput>(example.components.len())
+                    .ok()
+                    .and_then(|bytes| value.checked_add(bytes))
+            })
+            .ok_or(DatasetBuildError::LimitExceeded)?;
+        for component in &example.components {
+            retained = retained
+                .checked_add(component.spec.name.len())
+                .and_then(|bytes| {
+                    bytes.checked_add(component_value_dynamic_bytes(&component.value))
+                })
+                .and_then(|bytes| {
+                    retained_array_bytes::<ComponentSelector>(component.selectors.len())
+                        .ok()
+                        .and_then(|selectors| bytes.checked_add(selectors))
+                })
+                .ok_or(DatasetBuildError::LimitExceeded)?;
+            for selector in &component.selectors {
+                retained = retained
+                    .checked_add(family_dynamic_bytes(selector.family())?)
+                    .ok_or(DatasetBuildError::LimitExceeded)?;
+            }
+        }
+    }
+    Ok(retained)
+}
+
+fn manifest_dynamic_bytes(manifest: &DatasetManifestRef) -> Result<usize, DatasetBuildError> {
+    manifest
+        .dataset_id()
+        .as_str()
+        .len()
+        .checked_add(manifest.schema().name().len())
+        .ok_or(DatasetBuildError::LimitExceeded)
+}
+
+fn availability_dynamic_bytes(availability: &AvailabilityEvidence) -> usize {
+    match availability {
+        AvailabilityEvidence::Evidenced { evidence, .. } => evidence.as_str().len(),
+        AvailabilityEvidence::Inferred { method, .. } => method.as_str().len(),
+        AvailabilityEvidence::LocalFirstObserved { .. } | AvailabilityEvidence::Unknown => 0,
+    }
+}
+
+fn component_value_dynamic_bytes(value: &ComponentValue) -> usize {
+    match value {
+        ComponentValue::Float { unit, .. } | ComponentValue::Decimal { unit, .. } => {
+            unit.as_ref().map_or(0, |value| value.as_str().len())
+        }
+        ComponentValue::Missing { reason } => reason.as_str().len(),
+    }
+}
+
+fn family_dynamic_bytes(family: &ObservationFamilyKey) -> Result<usize, DatasetBuildError> {
+    match family {
+        ObservationFamilyKey::Filing {
+            source_id,
+            accession,
+            ..
+        } => checked_family_dynamic(source_id, &[accession.as_str()], None),
+        ObservationFamilyKey::Fundamental {
+            source_id,
+            source_record,
+            concept,
+            unit,
+            effective,
+            ..
+        } => checked_family_dynamic(
+            source_id,
+            &[source_record.as_str(), concept.as_str(), unit.as_str()],
+            Some(effective),
+        ),
+        ObservationFamilyKey::Macro {
+            source_id,
+            series,
+            effective,
+        } => checked_family_dynamic(source_id, &[series.as_str()], Some(effective)),
+        ObservationFamilyKey::PortfolioPosition {
+            source_id,
+            account_id,
+            effective,
+            ..
+        } => checked_family_dynamic(source_id, &[account_id.as_str()], Some(effective)),
+        ObservationFamilyKey::Transaction {
+            source_id,
+            account_id,
+            source_record_id,
+            ..
+        } => checked_family_dynamic(
+            source_id,
+            &[account_id.as_str(), source_record_id.as_str()],
+            None,
+        ),
+        ObservationFamilyKey::CorporateAction {
+            source_id,
+            source_record,
+            ..
+        } => checked_family_dynamic(source_id, &[source_record.as_str()], None),
+        ObservationFamilyKey::UniverseMembership {
+            source_id,
+            source_record,
+            universe,
+            ..
+        } => checked_family_dynamic(
+            source_id,
+            &[source_record.as_str(), universe.as_str()],
+            None,
+        ),
+        ObservationFamilyKey::AlternativeData {
+            source_id,
+            source_record,
+            dataset,
+            field,
+            effective,
+            ..
+        } => checked_family_dynamic(
+            source_id,
+            &[source_record.as_str(), dataset.as_str(), field.as_str()],
+            Some(effective),
+        ),
+    }
+}
+
+fn checked_family_dynamic(
+    source: &SourceId,
+    fields: &[&str],
+    coordinate: Option<&ResearchTemporalCoordinate>,
+) -> Result<usize, DatasetBuildError> {
+    let mut retained = source.as_str().len();
+    for field in fields {
+        retained = retained
+            .checked_add(field.len())
+            .ok_or(DatasetBuildError::LimitExceeded)?;
+    }
+    if let Some(coordinate) = coordinate {
+        retained = retained
+            .checked_add(coordinate_dynamic_bytes(coordinate)?)
             .ok_or(DatasetBuildError::LimitExceeded)?;
     }
     Ok(retained)
+}
+
+fn coordinate_dynamic_bytes(
+    coordinate: &ResearchTemporalCoordinate,
+) -> Result<usize, DatasetBuildError> {
+    let Some(period) = coordinate.source_period_value() else {
+        return Ok(0);
+    };
+    period
+        .scheme()
+        .as_str()
+        .len()
+        .checked_add(period.code().as_str().len())
+        .ok_or(DatasetBuildError::LimitExceeded)
 }
 
 fn retained_array_bytes<T>(len: usize) -> Result<usize, DatasetBuildError> {
@@ -976,10 +1240,58 @@ const fn selector_instrument(family: &ObservationFamilyKey) -> Option<Instrument
         ObservationFamilyKey::Filing { instrument_id, .. }
         | ObservationFamilyKey::Fundamental { instrument_id, .. }
         | ObservationFamilyKey::PortfolioPosition { instrument_id, .. }
-        | ObservationFamilyKey::CorporateAction { instrument_id, .. } => Some(*instrument_id),
-        ObservationFamilyKey::AlternativeData { instrument_id, .. } => *instrument_id,
-        ObservationFamilyKey::Macro { .. } | ObservationFamilyKey::Transaction { .. } => None,
+        | ObservationFamilyKey::CorporateAction { instrument_id, .. }
+        | ObservationFamilyKey::UniverseMembership { instrument_id, .. } => Some(*instrument_id),
+        ObservationFamilyKey::AlternativeData { instrument_id, .. }
+        | ObservationFamilyKey::Transaction { instrument_id, .. } => *instrument_id,
+        ObservationFamilyKey::Macro { .. } => None,
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SelectorScope {
+    Instrument(InstrumentId),
+    Account,
+    Global,
+}
+
+const fn selector_scope(family: &ObservationFamilyKey) -> SelectorScope {
+    if let Some(instrument) = selector_instrument(family) {
+        return SelectorScope::Instrument(instrument);
+    }
+    match family {
+        ObservationFamilyKey::Transaction { .. } => SelectorScope::Account,
+        ObservationFamilyKey::Macro { .. } | ObservationFamilyKey::AlternativeData { .. } => {
+            SelectorScope::Global
+        }
+        ObservationFamilyKey::Filing { .. }
+        | ObservationFamilyKey::Fundamental { .. }
+        | ObservationFamilyKey::PortfolioPosition { .. }
+        | ObservationFamilyKey::CorporateAction { .. }
+        | ObservationFamilyKey::UniverseMembership { .. } => SelectorScope::Global,
+    }
+}
+
+fn component_scope_matches(
+    component: &FeatureLabelComponentInput,
+    example_instrument: InstrumentId,
+) -> bool {
+    let mut has_declared_scope = component.spec.scope == ComponentScope::Global;
+    for selector in component.selectors() {
+        match (component.spec.scope, selector_scope(selector.family())) {
+            (ComponentScope::Instrument, SelectorScope::Instrument(instrument))
+                if instrument == example_instrument =>
+            {
+                has_declared_scope = true;
+            }
+            (ComponentScope::Instrument, SelectorScope::Global)
+            | (ComponentScope::Account, SelectorScope::Global)
+            | (ComponentScope::Global, SelectorScope::Global) => {}
+            (ComponentScope::Account, SelectorScope::Account) => has_declared_scope = true,
+            _ => return false,
+        }
+    }
+    has_declared_scope
 }
 
 fn canonical_identifier(value: &str, max_bytes: usize) -> bool {

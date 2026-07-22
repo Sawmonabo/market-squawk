@@ -14,6 +14,7 @@ pub mod order_book;
 pub mod paper_bot;
 pub mod quality;
 pub mod replay;
+pub mod research_service;
 pub mod risk;
 pub mod source;
 pub mod source_supervisor;
@@ -48,3 +49,4 @@ pub use paper_bot::{
     ProductionPaperBotShutdown, ProductionPaperBotStartError, ProductionPaperCheckpointError,
     ProductionPaperCheckpointEvidence,
 };
+pub use research_service::{ResearchIngestRequest, ResearchService, ResearchServiceError};

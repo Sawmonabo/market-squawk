@@ -209,6 +209,20 @@ impl CanonicalObservationPayload {
                     encoder.serializable(value.action())
                 })
             }
+            ResearchObservation::UniverseMembership(value) => {
+                Self::encode_with_control(control, &|encoder| {
+                    encoder.u8(8)?;
+                    encoder.str(value.universe().as_str())?;
+                    encoder.i64(value.effective_interval().starts_at().unix_nanos())?;
+                    match value.effective_interval().ends_at() {
+                        Some(end) => {
+                            encoder.u8(1)?;
+                            encoder.i64(end.unix_nanos())
+                        }
+                        None => encoder.u8(0),
+                    }
+                })
+            }
             ResearchObservation::AlternativeData(value) => {
                 Self::encode_with_control(control, &|encoder| {
                     encoder.u8(7)?;

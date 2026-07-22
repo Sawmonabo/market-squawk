@@ -1,13 +1,13 @@
 //! Stable identities for build specifications, selectors, policies, and output rows.
 
 use market_squawk_domain::{
-    AvailabilityEvidence, EvidenceDigest, ResearchTemporalCoordinate, SourceIdentifier,
+    AvailabilityEvidence, EvidenceDigest, ResearchTemporalCoordinate, SourceId, SourceIdentifier,
 };
 use sha2::{Digest as _, Sha256};
 
 use super::model::{
-    ComponentValue, DatasetBuildInputs, DatasetBuildPolicy, DatasetBuildRequest, DatasetExample,
-    DatasetSplit, FeatureLabelComponentInput,
+    ComponentAdjustmentEvidence, ComponentValue, DatasetBuildInputs, DatasetBuildPolicy,
+    DatasetBuildRequest, DatasetExample, DatasetSplit, FeatureLabelComponentInput,
 };
 use crate::{
     CorporateActionAdjustment, DatasetId, DatasetManifestRef, ObservationFamilyKey, ResearchUse,
@@ -16,7 +16,7 @@ use crate::{
 
 pub(super) fn family_key_digest(family: &ObservationFamilyKey) -> Sha256Digest {
     let mut hash = Sha256::new();
-    hash.update(b"market-squawk/dataset-component-selector/v1");
+    hash.update(b"market-squawk/dataset-component-selector/v2");
     encode_family(&mut hash, family);
     Sha256Digest::new(hash.finalize().into())
 }
@@ -68,12 +68,14 @@ pub(super) fn build_spec_digest(
     output_dataset: &DatasetId,
     inputs: &DatasetBuildInputs,
     intended_use: ResearchUse,
+    output_source: &SourceId,
     policy_digest: Sha256Digest,
     universe_digest: Sha256Digest,
 ) -> Sha256Digest {
     let mut hash = Sha256::new();
-    hash.update(b"market-squawk/feature-label-build-spec/v1");
+    hash.update(b"market-squawk/feature-label-build-spec/v2");
     put_str(&mut hash, output_dataset.as_str());
+    put_str(&mut hash, output_source.as_str());
     hash.update(policy_digest.bytes());
     hash.update(universe_digest.bytes());
     hash.update([research_use_tag(intended_use)]);
@@ -84,6 +86,8 @@ pub(super) fn build_spec_digest(
     put_len(&mut hash, inputs.component_specs().len());
     for spec in inputs.component_specs() {
         hash.update([spec.kind().tag()]);
+        hash.update([spec.scope().tag()]);
+        hash.update([spec.corporate_actions().tag()]);
         put_str(&mut hash, spec.name());
         hash.update(spec.version().get().to_be_bytes());
     }
@@ -119,7 +123,7 @@ pub(super) fn row_lineage_digest(
     action_audit: Sha256Digest,
 ) -> Sha256Digest {
     let mut hash = Sha256::new();
-    hash.update(b"market-squawk/feature-label-row-lineage/v1");
+    hash.update(b"market-squawk/feature-label-row-lineage/v2");
     hash.update(request.build_spec_digest().digest().bytes());
     hash.update(request.policy_digest().bytes());
     hash.update(request.universe_digest().bytes());
@@ -142,20 +146,6 @@ pub(super) fn row_lineage_digest(
     Sha256Digest::new(hash.finalize().into())
 }
 
-pub(super) fn corporate_action_evidence(
-    manifest: &DatasetManifestRef,
-    payload_identity: EvidenceDigest,
-) -> EvidenceDigest {
-    let mut hash = Sha256::new();
-    hash.update(b"market-squawk/dataset-corporate-action-evidence/v1");
-    encode_manifest(&mut hash, manifest);
-    encode_evidence(&mut hash, payload_identity);
-    EvidenceDigest::new(
-        market_squawk_domain::DigestAlgorithm::Sha256,
-        hash.finalize().into(),
-    )
-}
-
 fn membership_digest(membership: &UniverseMembership) -> Sha256Digest {
     let mut hash = Sha256::new();
     hash.update(b"market-squawk/dataset-universe-membership/v1");
@@ -171,6 +161,8 @@ fn membership_digest(membership: &UniverseMembership) -> Sha256Digest {
 
 fn encode_component(hash: &mut Sha256, component: &FeatureLabelComponentInput) {
     hash.update([component.spec().kind().tag()]);
+    hash.update([component.spec().scope().tag()]);
+    hash.update([component.spec().corporate_actions().tag()]);
     put_str(hash, component.spec().name());
     hash.update(component.spec().version().get().to_be_bytes());
     match component.value() {
@@ -203,6 +195,27 @@ fn encode_component(hash: &mut Sha256, component: &FeatureLabelComponentInput) {
     put_len(hash, component.selectors().len());
     for selector in component.selectors() {
         hash.update(selector.identity().bytes());
+    }
+    match component.adjustment() {
+        ComponentAdjustmentEvidence::Raw => hash.update([1]),
+        ComponentAdjustmentEvidence::NotApplicable => hash.update([2]),
+        ComponentAdjustmentEvidence::Applied {
+            policy,
+            plan_content,
+            plan_audit,
+            implementation_evidence,
+        } => {
+            hash.update([3]);
+            hash.update(policy.version().get().to_be_bytes());
+            hash.update([match policy.adjustment() {
+                CorporateActionAdjustment::Raw => 1,
+                CorporateActionAdjustment::SplitAdjusted => 2,
+                CorporateActionAdjustment::TotalReturn => 3,
+            }]);
+            hash.update(plan_content.bytes());
+            hash.update(plan_audit.bytes());
+            encode_evidence(hash, *implementation_evidence);
+        }
     }
 }
 
@@ -258,11 +271,19 @@ fn encode_family(hash: &mut Sha256, family: &ObservationFamilyKey) {
         }
         ObservationFamilyKey::Transaction {
             source_id,
+            instrument_id,
             account_id,
             source_record_id,
         } => {
             hash.update([5]);
             put_str(hash, source_id.as_str());
+            match instrument_id {
+                Some(instrument_id) => {
+                    hash.update([1]);
+                    hash.update(instrument_id.as_uuid().as_bytes());
+                }
+                None => hash.update([0]),
+            }
             put_str(hash, account_id.as_str());
             put_str(hash, source_record_id.as_str());
         }
@@ -276,6 +297,18 @@ fn encode_family(hash: &mut Sha256, family: &ObservationFamilyKey) {
             hash.update(instrument_id.as_uuid().as_bytes());
             put_str(hash, source_record.as_str());
         }
+        ObservationFamilyKey::UniverseMembership {
+            source_id,
+            instrument_id,
+            source_record,
+            universe,
+        } => {
+            hash.update([7]);
+            put_str(hash, source_id.as_str());
+            hash.update(instrument_id.as_uuid().as_bytes());
+            put_str(hash, source_record.as_str());
+            put_str(hash, universe.as_str());
+        }
         ObservationFamilyKey::AlternativeData {
             source_id,
             instrument_id,
@@ -284,7 +317,7 @@ fn encode_family(hash: &mut Sha256, family: &ObservationFamilyKey) {
             field,
             effective,
         } => {
-            hash.update([7]);
+            hash.update([8]);
             put_str(hash, source_id.as_str());
             match instrument_id {
                 Some(instrument_id) => {

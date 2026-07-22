@@ -122,6 +122,14 @@ pub(super) fn payload_identity<'a>(
             encoder.u8(6).map_err(map_error)?;
             encoder.serializable(value.action()).map_err(map_error)?;
         }
+        ResearchObservation::UniverseMembership(value) => {
+            encoder.u8(8).map_err(map_error)?;
+            encoder.str(value.universe().as_str()).map_err(map_error)?;
+            encode_timestamp(&mut encoder, value.effective_interval().starts_at())
+                .map_err(map_error)?;
+            encode_optional_timestamp(&mut encoder, value.effective_interval().ends_at())
+                .map_err(map_error)?;
+        }
         ResearchObservation::AlternativeData(value) => {
             encoder.u8(7).map_err(map_error)?;
             encoder.str(value.dataset().as_str()).map_err(map_error)?;
@@ -277,8 +285,17 @@ fn encode_candidate_family(
             encode_coordinate(encoder, context.time().effective())?;
         }
         ResearchObservation::Transaction(value) => {
-            encoder.u8(5)?;
-            encoder.str(provenance.source_id().as_str())?;
+            match provenance.instrument_id() {
+                Some(instrument) => {
+                    encoder.u8(9)?;
+                    encoder.str(provenance.source_id().as_str())?;
+                    encoder.bytes(instrument.as_uuid().as_bytes())?;
+                }
+                None => {
+                    encoder.u8(5)?;
+                    encoder.str(provenance.source_id().as_str())?;
+                }
+            }
             encoder.str(value.account_id().as_str())?;
             encoder.str(value.source_record_id().as_str())?;
         }
@@ -287,6 +304,13 @@ fn encode_candidate_family(
             encoder.str(provenance.source_id().as_str())?;
             encoder.bytes(required_instrument()?.as_uuid().as_bytes())?;
             encoder.str(provenance.source_identifier().as_str())?;
+        }
+        ResearchObservation::UniverseMembership(value) => {
+            encoder.u8(8)?;
+            encoder.str(provenance.source_id().as_str())?;
+            encoder.bytes(required_instrument()?.as_uuid().as_bytes())?;
+            encoder.str(provenance.source_identifier().as_str())?;
+            encoder.str(value.universe().as_str())?;
         }
         ResearchObservation::AlternativeData(value) => {
             encoder.u8(7)?;

@@ -99,8 +99,19 @@ impl CanonicalObservationFamily {
                     encode_coordinate(encoder, context.time().effective())
                 }
                 ResearchObservation::Transaction(value) => {
-                    encoder.u8(5)?;
-                    encoder.str(provenance.source_id().as_str())?;
+                    match provenance.instrument_id() {
+                        Some(instrument) => {
+                            // Tag 9 extends PIT-v1 with instrument-scoped transactions while
+                            // preserving tag 5 byte-for-byte for legacy account-scoped records.
+                            encoder.u8(9)?;
+                            encoder.str(provenance.source_id().as_str())?;
+                            encoder.bytes(instrument.as_uuid().as_bytes())?;
+                        }
+                        None => {
+                            encoder.u8(5)?;
+                            encoder.str(provenance.source_id().as_str())?;
+                        }
+                    }
                     encoder.str(value.account_id().as_str())?;
                     encoder.str(value.source_record_id().as_str())
                 }
@@ -109,6 +120,13 @@ impl CanonicalObservationFamily {
                     encoder.str(provenance.source_id().as_str())?;
                     encoder.bytes(required_instrument()?.as_uuid().as_bytes())?;
                     encoder.str(provenance.source_identifier().as_str())
+                }
+                ResearchObservation::UniverseMembership(value) => {
+                    encoder.u8(8)?;
+                    encoder.str(provenance.source_id().as_str())?;
+                    encoder.bytes(required_instrument()?.as_uuid().as_bytes())?;
+                    encoder.str(provenance.source_identifier().as_str())?;
+                    encoder.str(value.universe().as_str())
                 }
                 ResearchObservation::AlternativeData(value) => {
                     encoder.u8(7)?;
@@ -182,6 +200,7 @@ fn observation_context(observation: &ResearchObservation) -> &ResearchContext {
         ResearchObservation::PortfolioPosition(value) => value.context(),
         ResearchObservation::Transaction(value) => value.context(),
         ResearchObservation::CorporateAction(value) => value.context(),
+        ResearchObservation::UniverseMembership(value) => value.context(),
         ResearchObservation::AlternativeData(value) => value.context(),
     }
 }

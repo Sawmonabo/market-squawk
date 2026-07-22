@@ -17,7 +17,8 @@ mod canonical;
 mod model;
 
 pub use model::{
-    ChronologicalSplitPolicy, ComponentKind, ComponentSelector, ComponentValue, DatasetBuildInputs,
+    ChronologicalSplitPolicy, ComponentAdjustmentEvidence, ComponentKind, ComponentScope,
+    ComponentSelector, ComponentValue, CorporateActionSensitivity, DatasetBuildInputs,
     DatasetBuildLimits, DatasetBuildPolicy, DatasetBuildRequest, DatasetExample,
     DatasetOutputAuthorization, DatasetSplit, DatasetSplitCounts, FeatureLabelComponentInput,
     FeatureLabelComponentSpec, FeatureLabelDataset, MissingValuePolicy,
@@ -96,6 +97,9 @@ pub enum DatasetBuildError {
     /// A feature or label could not prove its requested point-in-time source family.
     #[error("dataset component selector does not match point-in-time evidence")]
     ComponentEvidenceMismatch,
+    /// A value's producer evidence does not prove the requested corporate-action treatment.
+    #[error("dataset component does not prove its requested corporate-action treatment")]
+    ComponentAdjustmentMismatch,
     /// A missing component was forbidden by the selected missing-value policy.
     #[error("dataset build encountered a forbidden missing component")]
     MissingValueRejected,
@@ -105,6 +109,9 @@ pub enum DatasetBuildError {
     /// Historical universe evidence excluded the requested example instrument.
     #[error("dataset example instrument is absent from its historical universe")]
     InstrumentOutsideUniverse,
+    /// A claimed historical membership did not resolve to one exact pinned source observation.
+    #[error("dataset historical-universe evidence does not match its pinned parent")]
+    UniverseEvidenceMismatch,
     /// Corporate-action policy retained unresolved economic terms.
     #[error("corporate-action treatment contains unresolved economics")]
     UnresolvedCorporateAction,

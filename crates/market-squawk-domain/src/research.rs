@@ -18,7 +18,7 @@ mod xbrl;
 pub use observations::{
     AlternativeDataObservation, CorporateActionObservation, FilingObservation,
     FundamentalObservation, MacroMissingValue, MacroObservation, MacroValue, PositionObservation,
-    TransactionObservation,
+    TransactionObservation, UniverseMembershipObservation,
 };
 pub use xbrl::{
     MAX_XBRL_DIMENSIONS, MAX_XBRL_GRAPH_EVENTS, MAX_XBRL_RELATIONSHIP_REFS, MAX_XBRL_RELATIONSHIPS,
@@ -61,6 +61,8 @@ pub enum ResearchObservation {
     Transaction(TransactionObservation),
     /// Corporate action obtained through research ingestion.
     CorporateAction(CorporateActionObservation),
+    /// Source-authored historical instrument-universe membership.
+    UniverseMembership(UniverseMembershipObservation),
     /// User-owned, licensed, or public alternative dataset observation.
     AlternativeData(AlternativeDataObservation),
 }
@@ -135,6 +137,12 @@ impl ResearchObservation {
                 value.action().clone(),
             )
             .map(Self::CorporateAction),
+            Self::UniverseMembership(value) => UniverseMembershipObservation::new(
+                value.context().with_revision(revision),
+                value.universe().clone(),
+                value.effective_interval(),
+            )
+            .map(Self::UniverseMembership),
             Self::AlternativeData(value) => {
                 Ok(Self::AlternativeData(AlternativeDataObservation::new(
                     value.context().with_revision(revision),
@@ -169,6 +177,8 @@ pub enum ResearchError {
     UnchangedSymbol,
     /// A symbol-change action's venue disagrees with research provenance.
     CorporateActionVenueMismatch,
+    /// A universe membership interval does not start at the observation's exact effective time.
+    UniverseIntervalStartMismatch,
     /// XBRL evidence failed validation or did not bind the canonical value.
     XbrlEvidence(XbrlEvidenceError),
 }
@@ -197,6 +207,9 @@ impl fmt::Display for ResearchError {
             Self::UnchangedSymbol => formatter.write_str("symbol change requires distinct symbols"),
             Self::CorporateActionVenueMismatch => {
                 formatter.write_str("symbol-change venue must match research provenance")
+            }
+            Self::UniverseIntervalStartMismatch => {
+                formatter.write_str("universe membership interval must start at its effective time")
             }
             Self::XbrlEvidence(error) => error.fmt(formatter),
         }

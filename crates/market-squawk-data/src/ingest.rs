@@ -11,7 +11,7 @@ use arrow::record_batch::RecordBatch;
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp};
 use market_squawk_sources::{
     ExtractionBatch, ExtractionContentIdentity, ExtractionError, ExtractionRevisionPlan,
-    ObservedRevisionAuthority, ObservedRevisionError, SourceClass,
+    ObservedRevisionAuthority, ObservedRevisionError, SourceClass, SourceMetadata,
 };
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -30,11 +30,11 @@ use crate::query::QueryArtifactMemoryLease;
 use crate::{
     AnalyticalManifestCatalog, ArrowConversionError, ArtifactRecord, CatalogAuthority,
     CatalogError, ContractCompletion, DatasetArrowBatch, DatasetId, DatasetManifestRecord,
-    DatasetManifestRef, DatasetSchemaRef, GenerationKind, IngestReservation, IngestRunState,
-    ManifestCatalogError, ManifestObject, ManifestPlan, ManifestPlanError, ObjectStoreConfig,
-    OrphanRecoveryReport, ParquetObjectStore, ParquetStoreError, PinnedDataset, PublishedObject,
-    QueryArtifactReservation, QueryArtifactReservationInput, ResearchArrowBatch, Sha256Digest,
-    SourceOperation,
+    DatasetManifestRef, DatasetSchemaRef, GenerationKind, IngestIdentity, IngestReservation,
+    IngestRunState, ManifestCatalogError, ManifestObject, ManifestPlan, ManifestPlanError,
+    ObjectStoreConfig, OrphanRecoveryReport, ParquetObjectStore, ParquetStoreError, PinnedDataset,
+    PublishedObject, QueryArtifactReservation, QueryArtifactReservationInput, ResearchArrowBatch,
+    RightsDecisionInput, Sha256Digest, SourceOperation,
 };
 
 const ORPHAN_RECOVERY_DEADLINE: Duration = Duration::from_secs(30);
@@ -535,6 +535,42 @@ impl AnalyticalDataService {
         Arc::new(CatalogObservedRevisionAuthority::new(Arc::clone(
             &self.authority,
         )))
+    }
+
+    /// Registers a source and atomically admits and reserves one exact persist operation through
+    /// this service's sole catalog authority.
+    pub async fn reserve_source_ingest(
+        &self,
+        source: &SourceMetadata,
+        registered_at: Timestamp,
+        rights: RightsDecisionInput,
+        identity: &IngestIdentity,
+        cancellation: &CancellationToken,
+    ) -> Result<IngestReservation, IngestError> {
+        if source.source_id() != identity.source_id()
+            || rights.source_id != *identity.source_id()
+            || rights.payload_digest != identity.payload_digest()
+            || identity.operation() != SourceOperation::Persist
+        {
+            return Err(IngestError::ReservationPayloadMismatch);
+        }
+        let _operation = self
+            .operation_gate
+            .acquire(cancellation)
+            .await
+            .ok_or(IngestError::Cancelled)?;
+        let authority = self.lock_authority()?;
+        if authority
+            .source(source.source_id())?
+            .as_ref()
+            .is_none_or(|registered| registered != source)
+        {
+            authority.register_source(source, registered_at)?;
+        }
+        let grant = authority.admit_source_rights(rights)?;
+        authority
+            .reserve_ingest(identity, &grant)
+            .map_err(Into::into)
     }
 
     /// Returns sealed backup authority for this exact active catalog and artifact root.

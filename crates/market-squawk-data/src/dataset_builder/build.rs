@@ -1,9 +1,11 @@
 //! Bounded read, temporal admission, Arrow construction, and derived publication.
 
 use std::future::Future;
+use std::io;
 use std::mem::size_of;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use arrow::array::{
     ArrayRef, Decimal128Array, FixedSizeBinaryArray, Float64Array, StringArray,
@@ -11,16 +13,16 @@ use arrow::array::{
 };
 use arrow::record_batch::RecordBatch;
 use market_squawk_domain::{
-    DigestAlgorithm, EvidenceDigest, InstrumentId, ResearchObservation, ResearchTemporalCoordinate,
-    SourceIdentifier,
+    AvailabilityEvidence, CorporateActionObservation, DigestAlgorithm, EvidenceDigest,
+    ResearchObservation, ResearchTemporalCoordinate, SourceIdentifier,
 };
-use market_squawk_sources::CanonicalObservationPayload;
 use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use super::model::{
-    ComponentKind, ComponentValue, DatasetBuildRequest, DatasetExample, DatasetSplit,
-    DatasetSplitCounts, FeatureLabelComponentInput, FeatureLabelDataset, MissingValuePolicy,
+    ComponentAdjustmentEvidence, ComponentKind, ComponentValue, CorporateActionSensitivity,
+    DatasetBuildRequest, DatasetExample, DatasetSplit, DatasetSplitCounts,
+    FeatureLabelComponentInput, FeatureLabelDataset, MissingValuePolicy,
 };
 use super::{DatasetBuildError, DatasetBuilderService, canonical};
 use crate::{
@@ -46,6 +48,44 @@ struct OutputRow<'request> {
     lineage: Sha256Digest,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct BuildRetainedBudget {
+    limit: usize,
+    retained: usize,
+}
+
+impl BuildRetainedBudget {
+    const fn new(limit: usize) -> Self {
+        Self { limit, retained: 0 }
+    }
+
+    fn charge(&mut self, bytes: usize) -> Result<(), DatasetBuildError> {
+        let retained = self
+            .retained
+            .checked_add(bytes)
+            .ok_or(DatasetBuildError::LimitExceeded)?;
+        if retained > self.limit {
+            return Err(DatasetBuildError::LimitExceeded);
+        }
+        self.retained = retained;
+        Ok(())
+    }
+
+    fn release(&mut self, bytes: usize) -> Result<(), DatasetBuildError> {
+        self.retained = self
+            .retained
+            .checked_sub(bytes)
+            .ok_or(DatasetBuildError::LimitExceeded)?;
+        Ok(())
+    }
+
+    fn remaining(self) -> Result<usize, DatasetBuildError> {
+        self.limit
+            .checked_sub(self.retained)
+            .ok_or(DatasetBuildError::LimitExceeded)
+    }
+}
+
 pub(super) async fn build(
     builder: &DatasetBuilderService<'_>,
     request: DatasetBuildRequest,
@@ -57,43 +97,24 @@ pub(super) async fn build(
     check_control(&cancellation, deadline)?;
     authorize_research_use(builder, &request, &cancellation)?;
     if let Some(existing) = matching_existing(builder, &request)? {
+        authorize_existing_output(builder, &request, &existing, &cancellation)?;
         return Ok(result_from_existing(
             &request,
             expected_split_counts(&request)?,
             existing,
         ));
     }
-    let (candidates, actions, input_bytes) =
-        read_inputs(builder, &request, &cancellation, deadline).await?;
-    ensure_retained_limit(
-        &request,
-        [
-            input_bytes,
-            input_bytes,
-            request.retained_bytes(),
-            candidates
-                .capacity()
-                .checked_mul(size_of::<PointInTimeCandidate>())
-                .ok_or(DatasetBuildError::LimitExceeded)?,
-        ],
-    )?;
-    let prepared = prepare_rows(&request, &candidates, &actions, &cancellation, deadline).await?;
-    let row_bytes = prepared
-        .rows
-        .capacity()
-        .checked_mul(size_of::<OutputRow<'_>>())
-        .ok_or(DatasetBuildError::LimitExceeded)?;
-    ensure_retained_limit(&request, [input_bytes, request.retained_bytes(), row_bytes])?;
+    let mut budget = BuildRetainedBudget::new(request.limits().max_retained_bytes());
+    budget.charge(request.retained_bytes())?;
+    let candidates = read_inputs(builder, &request, &cancellation, deadline, &mut budget).await?;
+    let prepared =
+        prepare_rows(&request, &candidates, &cancellation, deadline, &mut budget).await?;
+    let output_admission = feature_label_output_admission(&prepared.rows)?;
+    budget.charge(output_admission)?;
     let (batch, lineage_digest) = feature_label_batch(&request, &prepared.rows)?;
-    ensure_retained_limit(
-        &request,
-        [
-            input_bytes,
-            request.retained_bytes(),
-            row_bytes,
-            batch.record_batch().get_array_memory_size(),
-        ],
-    )?;
+    if batch.record_batch().get_array_memory_size() > output_admission {
+        return Err(DatasetBuildError::LimitExceeded);
+    }
     check_control(&cancellation, deadline)?;
 
     let _operation = await_deadline(deadline, builder.operation_gate.acquire(&cancellation))
@@ -102,6 +123,7 @@ pub(super) async fn build(
     check_control(&cancellation, deadline)?;
     let authorization = authorize_research_use(builder, &request, &cancellation)?;
     if let Some(existing) = matching_existing(builder, &request)? {
+        authorize_existing_output(builder, &request, &existing, &cancellation)?;
         return Ok(result_from_existing(
             &request,
             prepared.split_counts,
@@ -111,11 +133,33 @@ pub(super) async fn build(
     check_control(&cancellation, deadline)?;
     let store = builder.service.object_store();
     let publication = await_deadline(deadline, store.begin_publication(&cancellation)).await??;
-    let published = await_deadline(
+    let staged = await_deadline(
         deadline,
-        store.publish_dataset_under_lease(&batch, &cancellation, &publication),
+        store.stage_dataset_under_lease(&batch, &cancellation, &publication),
     )
     .await??;
+    let reservation = {
+        let authority = builder
+            .authority
+            .lock()
+            .map_err(|_| DatasetBuildError::AuthorityLockPoisoned)?;
+        let rights = authority.admit_source_rights(
+            request
+                .output_authorization()
+                .rights_decision(staged.content_hash(), staged.created_at()),
+        )?;
+        authority.reserve_ingest(
+            &IngestIdentity::try_new(
+                request.output_authorization().source_id().clone(),
+                EvidenceDigest::new(DigestAlgorithm::Sha256, staged.content_hash().bytes()),
+                SourceOperation::Persist,
+                output_idempotency_key(&request),
+            )?,
+            &rights,
+        )?
+    };
+    check_control(&cancellation, deadline)?;
+    let published = store.finalize_staged_under_lease(staged, &publication)?;
     if !store.verify(&published)? {
         return Err(DatasetBuildError::Parquet(
             crate::ParquetStoreError::ObjectMetadataMismatch,
@@ -142,20 +186,6 @@ pub(super) async fn build(
             .authority
             .lock()
             .map_err(|_| DatasetBuildError::AuthorityLockPoisoned)?;
-        let rights = authority.admit_source_rights(
-            request
-                .output_authorization()
-                .rights_decision(published.content_hash(), published.created_at()),
-        )?;
-        let reservation = authority.reserve_ingest(
-            &IngestIdentity::try_new(
-                request.output_authorization().source_id().clone(),
-                EvidenceDigest::new(DigestAlgorithm::Sha256, published.content_hash().bytes()),
-                SourceOperation::Persist,
-                output_idempotency_key(&request),
-            )?,
-            &rights,
-        )?;
         let created_at = published.created_at().max(reservation.requested_at());
         let artifact = ArtifactRecord::try_new(
             published.relative_reference(),
@@ -208,12 +238,11 @@ async fn read_inputs(
     request: &DatasetBuildRequest,
     cancellation: &CancellationToken,
     deadline: Instant,
-) -> Result<(Vec<PointInTimeCandidate>, Vec<CorporateActionRecord>, usize), DatasetBuildError> {
+    budget: &mut BuildRetainedBudget,
+) -> Result<Vec<PointInTimeCandidate>, DatasetBuildError> {
     let research_schema = DatasetSchemaRegistry::local().canonical_research_observations()?;
     let mut candidates = Vec::new();
-    let mut actions = Vec::new();
     let mut input_rows = 0_usize;
-    let mut retained_bytes = 0_usize;
     let store = builder.service.object_store();
     for parent in request.inputs().parents() {
         check_control(cancellation, deadline)?;
@@ -221,56 +250,202 @@ async fn read_inputs(
         if pinned.manifest().schema() != &research_schema {
             return Err(DatasetBuildError::InvalidInputGeneration);
         }
-        let batches =
-            await_deadline(deadline, store.read_pinned_async(&pinned, cancellation)).await??;
+        let remaining_rows = request
+            .limits()
+            .max_input_rows()
+            .checked_sub(input_rows)
+            .ok_or(DatasetBuildError::LimitExceeded)?;
+        let remaining_bytes = budget.remaining()?;
+        let read_budget = remaining_bytes / 2;
+        if remaining_rows == 0 || read_budget == 0 {
+            return Err(DatasetBuildError::LimitExceeded);
+        }
+        let batches = await_deadline(
+            deadline,
+            store.read_pinned_bounded_async(&pinned, remaining_rows, read_budget, cancellation),
+        )
+        .await?
+        .map_err(|error| match error {
+            crate::ParquetStoreError::ReadLimitExceeded => DatasetBuildError::LimitExceeded,
+            other => DatasetBuildError::Parquet(other),
+        })?;
+        let batch_bytes = batches.iter().try_fold(0_usize, |total, batch| {
+            record_batch_retained_bytes(batch).and_then(|bytes| {
+                total
+                    .checked_add(bytes)
+                    .ok_or(DatasetBuildError::LimitExceeded)
+            })
+        })?;
+        budget.charge(batch_bytes)?;
         for batch in batches {
             input_rows = input_rows
                 .checked_add(batch.num_rows())
                 .ok_or(DatasetBuildError::LimitExceeded)?;
-            retained_bytes = retained_bytes
-                .checked_add(batch.get_array_memory_size())
-                .ok_or(DatasetBuildError::LimitExceeded)?;
-            if input_rows > request.limits().max_input_rows()
-                || retained_bytes > request.limits().max_retained_bytes()
-            {
+            if input_rows > request.limits().max_input_rows() {
                 return Err(DatasetBuildError::LimitExceeded);
             }
-            let observations = ResearchArrowBatch::try_from_record_batch(batch)?.observations()?;
+            let batch_retained = record_batch_retained_bytes(&batch)?;
+            reserve_candidate_capacity(&mut candidates, batch.num_rows(), budget)?;
+            let manifest_bytes = manifest_dynamic_bytes(parent).and_then(|bytes| {
+                bytes
+                    .checked_mul(batch.num_rows())
+                    .ok_or(DatasetBuildError::LimitExceeded)
+            })?;
+            budget.charge(manifest_bytes)?;
+            let (observations, observation_bytes) =
+                ResearchArrowBatch::decode_record_batch_bounded(batch, budget.remaining()?)
+                    .map_err(|error| match error {
+                        crate::ArrowConversionError::RetainedLimitExceeded
+                        | crate::ArrowConversionError::AllocationFailure
+                        | crate::ArrowConversionError::RetainedSizeOverflow => {
+                            DatasetBuildError::LimitExceeded
+                        }
+                        other => DatasetBuildError::Arrow(other),
+                    })?;
+            budget.charge(observation_bytes)?;
             candidates
-                .try_reserve(observations.len())
-                .map_err(|_| DatasetBuildError::LimitExceeded)?;
+                .len()
+                .checked_add(observations.len())
+                .ok_or(DatasetBuildError::LimitExceeded)?;
             for observation in observations {
-                if let ResearchObservation::CorporateAction(action) = &observation {
-                    if actions.len() >= request.limits().corporate_actions().max_actions().get() {
-                        return Err(DatasetBuildError::LimitExceeded);
-                    }
-                    actions
-                        .try_reserve(1)
-                        .map_err(|_| DatasetBuildError::LimitExceeded)?;
-                    let payload = CanonicalObservationPayload::try_from_observation(&observation)
-                        .map_err(|_| DatasetBuildError::PointInTime)?;
-                    actions.push(CorporateActionRecord::new(
-                        action.clone(),
-                        parent.clone(),
-                        canonical::corporate_action_evidence(parent, payload.identity()),
-                    ));
-                }
                 candidates.push(PointInTimeCandidate::new(observation, parent.clone()));
             }
+            budget.release(batch_retained)?;
         }
     }
     if candidates.is_empty() {
         return Err(DatasetBuildError::InvalidInputGeneration);
     }
-    Ok((candidates, actions, retained_bytes))
+    Ok(candidates)
+}
+
+fn record_batch_retained_bytes(batch: &RecordBatch) -> Result<usize, DatasetBuildError> {
+    batch
+        .get_array_memory_size()
+        .checked_add(size_of::<RecordBatch>())
+        .and_then(|bytes| {
+            batch
+                .num_columns()
+                .checked_mul(size_of::<ArrayRef>())
+                .and_then(|columns| bytes.checked_add(columns))
+        })
+        .ok_or(DatasetBuildError::LimitExceeded)
+}
+
+fn reserve_candidate_capacity(
+    candidates: &mut Vec<PointInTimeCandidate>,
+    additional: usize,
+    budget: &mut BuildRetainedBudget,
+) -> Result<(), DatasetBuildError> {
+    let required = candidates
+        .len()
+        .checked_add(additional)
+        .ok_or(DatasetBuildError::LimitExceeded)?;
+    let admitted_capacity = required.saturating_sub(candidates.capacity());
+    let admitted_bytes = admitted_capacity
+        .checked_mul(size_of::<PointInTimeCandidate>())
+        .ok_or(DatasetBuildError::LimitExceeded)?;
+    budget.charge(admitted_bytes)?;
+    let previous_capacity = candidates.capacity();
+    candidates
+        .try_reserve_exact(additional)
+        .map_err(|_| DatasetBuildError::LimitExceeded)?;
+    let actual_growth = candidates
+        .capacity()
+        .checked_sub(previous_capacity)
+        .and_then(|capacity| capacity.checked_mul(size_of::<PointInTimeCandidate>()))
+        .ok_or(DatasetBuildError::LimitExceeded)?;
+    if actual_growth > admitted_bytes {
+        budget.charge(actual_growth - admitted_bytes)?;
+    }
+    Ok(())
+}
+
+fn manifest_dynamic_bytes(
+    manifest: &crate::DatasetManifestRef,
+) -> Result<usize, DatasetBuildError> {
+    manifest
+        .dataset_id()
+        .as_str()
+        .len()
+        .checked_add(manifest.schema().name().len())
+        .ok_or(DatasetBuildError::LimitExceeded)
+}
+
+fn membership_vector_admission(
+    memberships: &[crate::UniverseMembership],
+) -> Result<usize, DatasetBuildError> {
+    memberships.iter().try_fold(
+        memberships
+            .len()
+            .checked_mul(size_of::<crate::UniverseMembership>())
+            .ok_or(DatasetBuildError::LimitExceeded)?,
+        |total, membership| {
+            let availability = match membership.availability() {
+                AvailabilityEvidence::Evidenced { evidence, .. } => evidence.as_str().len(),
+                AvailabilityEvidence::Inferred { method, .. } => method.as_str().len(),
+                AvailabilityEvidence::LocalFirstObserved { .. } | AvailabilityEvidence::Unknown => {
+                    0
+                }
+            };
+            total
+                .checked_add(manifest_dynamic_bytes(membership.source_manifest())?)
+                .and_then(|bytes| bytes.checked_add(availability))
+                .ok_or(DatasetBuildError::LimitExceeded)
+        },
+    )
+}
+
+fn bounded_universe_limits(
+    request: &DatasetBuildRequest,
+    remaining_bytes: usize,
+) -> Result<crate::UniverseLimits, DatasetBuildError> {
+    let configured = request.limits().universe();
+    crate::UniverseLimits::try_new(
+        configured.max_candidates(),
+        configured.max_retained_bytes().min(remaining_bytes),
+    )
+    .map_err(|_| DatasetBuildError::LimitExceeded)
+}
+
+fn corporate_action_record_admission(
+    observation: &CorporateActionObservation,
+    manifest: &crate::DatasetManifestRef,
+) -> Result<usize, DatasetBuildError> {
+    let mut writer = CountingWriter::default();
+    serde_json::to_writer(&mut writer, observation)
+        .map_err(|_| DatasetBuildError::InvalidRequest)?;
+    size_of::<CorporateActionRecord>()
+        .checked_add(writer.bytes)
+        .and_then(|bytes| bytes.checked_add(manifest_dynamic_bytes(manifest).ok()?))
+        .ok_or(DatasetBuildError::LimitExceeded)
+}
+
+#[derive(Default)]
+struct CountingWriter {
+    bytes: usize,
+}
+
+impl io::Write for CountingWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.bytes = self
+            .bytes
+            .checked_add(buffer.len())
+            .ok_or_else(|| io::Error::other("retained-byte count overflow"))?;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 async fn prepare_rows<'request>(
     request: &'request DatasetBuildRequest,
     candidates: &[PointInTimeCandidate],
-    actions: &[CorporateActionRecord],
     cancellation: &CancellationToken,
     deadline: Instant,
+    budget: &mut BuildRetainedBudget,
 ) -> Result<PreparedRows<'request>, DatasetBuildError> {
     let mut rows = Vec::new();
     let row_capacity = request
@@ -279,7 +454,11 @@ async fn prepare_rows<'request>(
         .len()
         .checked_mul(request.inputs().component_specs().len())
         .ok_or(DatasetBuildError::LimitExceeded)?;
-    rows.try_reserve(row_capacity)
+    let row_bytes = row_capacity
+        .checked_mul(size_of::<OutputRow<'_>>())
+        .ok_or(DatasetBuildError::LimitExceeded)?;
+    budget.charge(row_bytes)?;
+    rows.try_reserve_exact(row_capacity)
         .map_err(|_| DatasetBuildError::LimitExceeded)?;
     let mut split_counts = DatasetSplitCounts::default();
     let selector = PointInTimeService::new();
@@ -290,52 +469,59 @@ async fn prepare_rows<'request>(
             .split()
             .split_for(example.cutoff_at())
             .ok_or(DatasetBuildError::TemporalLeakage)?;
-        let universe = UniverseSnapshot::try_build(
-            request.inputs().universe_id().clone(),
-            example.cutoff_at(),
-            request.inputs().universe_memberships().to_vec(),
-            request.limits().universe(),
-        )?;
-        if !universe.contains(example.instrument_id()) {
-            return Err(DatasetBuildError::InstrumentOutsideUniverse);
-        }
-        let relevant_actions = actions_for_instrument(actions, example.instrument_id())?;
-        let feature_actions = CorporateActionPlan::try_build(
-            request.policy().corporate_actions(),
-            example.cutoff_at(),
-            example.cutoff_at(),
-            relevant_actions.clone(),
-            request.limits().corporate_actions(),
-        )?;
-        let label_actions = CorporateActionPlan::try_build(
-            request.policy().corporate_actions(),
-            example.label_cutoff_at(),
-            example.label_cutoff_at(),
-            relevant_actions,
-            request.limits().corporate_actions(),
-        )?;
-        if !feature_actions.conflicts().is_empty() || !label_actions.conflicts().is_empty() {
-            return Err(DatasetBuildError::UnresolvedCorporateAction);
-        }
-        let feature_request =
-            point_in_time_request(request, example.cutoff_at(), example.cutoff_at(), None)?;
-        let label_request = point_in_time_request(
+        let feature_request = point_in_time_request(
             request,
-            example.label_cutoff_at(),
             example.cutoff_at(),
-            Some(example.label_cutoff_at()),
+            example.cutoff_at(),
+            None,
+            budget.remaining()?,
         )?;
         let features = selector
             .select(&feature_request, candidates, cancellation, deadline)
             .await
             .map_err(|_| DatasetBuildError::PointInTime)?;
+        budget.charge(features.retained_bytes())?;
+        let label_request = point_in_time_request(
+            request,
+            example.label_cutoff_at(),
+            example.cutoff_at(),
+            Some(example.label_cutoff_at()),
+            budget.remaining()?,
+        )?;
         let labels = selector
             .select(&label_request, candidates, cancellation, deadline)
             .await
             .map_err(|_| DatasetBuildError::PointInTime)?;
+        budget.charge(labels.retained_bytes())?;
+        let universe_limits = bounded_universe_limits(request, budget.remaining()?)?;
+        let universe = UniverseSnapshot::try_build(
+            request.inputs().universe_id().clone(),
+            example.cutoff_at(),
+            validated_universe_memberships(request, &features, budget.remaining()?)?,
+            universe_limits,
+        )?;
+        budget.charge(universe.retained_bytes())?;
+        if !universe.contains(example.instrument_id()) {
+            return Err(DatasetBuildError::InstrumentOutsideUniverse);
+        }
+        let feature_actions =
+            action_plan_from_selection(request, example, &features, false, budget.remaining()?)?;
+        budget.charge(feature_actions.retained_bytes())?;
+        let label_actions =
+            action_plan_from_selection(request, example, &labels, true, budget.remaining()?)?;
+        budget.charge(label_actions.retained_bytes())?;
+        if !feature_actions.conflicts().is_empty() || !label_actions.conflicts().is_empty() {
+            return Err(DatasetBuildError::UnresolvedCorporateAction);
+        }
         let mut example_rows = Vec::new();
+        let example_row_bytes = example
+            .components()
+            .len()
+            .checked_mul(size_of::<OutputRow<'_>>())
+            .ok_or(DatasetBuildError::LimitExceeded)?;
+        budget.charge(example_row_bytes)?;
         example_rows
-            .try_reserve(example.components().len())
+            .try_reserve_exact(example.components().len())
             .map_err(|_| DatasetBuildError::LimitExceeded)?;
         let mut drop_example = false;
         for component in example.components() {
@@ -343,6 +529,17 @@ async fn prepare_rows<'request>(
                 ComponentKind::Feature => (&features, &feature_actions),
                 ComponentKind::Label => (&labels, &label_actions),
             };
+            validate_component_adjustment(
+                component,
+                action_plan,
+                request.policy().corporate_actions(),
+            )?;
+            let evidence_bytes = component
+                .selectors()
+                .len()
+                .checked_mul(size_of::<Sha256Digest>())
+                .ok_or(DatasetBuildError::LimitExceeded)?;
+            budget.charge(evidence_bytes)?;
             let evidence = resolve_component_evidence(component, selection)?;
             if component.value().is_missing() {
                 match request.policy().missing_values() {
@@ -366,6 +563,7 @@ async fn prepare_rows<'request>(
                 action_plan.content_hash(),
                 action_plan.audit_hash(),
             );
+            budget.release(evidence_bytes)?;
             example_rows.push(OutputRow {
                 example,
                 split,
@@ -380,6 +578,12 @@ async fn prepare_rows<'request>(
         if rows.len() > request.limits().max_output_rows() {
             return Err(DatasetBuildError::LimitExceeded);
         }
+        budget.release(example_row_bytes)?;
+        budget.release(label_actions.retained_bytes())?;
+        budget.release(feature_actions.retained_bytes())?;
+        budget.release(universe.retained_bytes())?;
+        budget.release(labels.retained_bytes())?;
+        budget.release(features.retained_bytes())?;
     }
     if rows.is_empty() {
         return Err(DatasetBuildError::EmptyDataset);
@@ -387,37 +591,168 @@ async fn prepare_rows<'request>(
     Ok(PreparedRows { rows, split_counts })
 }
 
+fn validated_universe_memberships(
+    request: &DatasetBuildRequest,
+    selection: &PointInTimeSelection<'_>,
+    max_retained_bytes: usize,
+) -> Result<Vec<crate::UniverseMembership>, DatasetBuildError> {
+    let admission = membership_vector_admission(request.inputs().universe_memberships())?;
+    if admission > max_retained_bytes {
+        return Err(DatasetBuildError::LimitExceeded);
+    }
+    let mut validated = Vec::new();
+    validated
+        .try_reserve_exact(request.inputs().universe_memberships().len())
+        .map_err(|_| DatasetBuildError::LimitExceeded)?;
+    for claimed in request.inputs().universe_memberships() {
+        let mut matches = selection.records().iter().filter(|record| {
+            let ResearchObservation::UniverseMembership(observed) =
+                record.candidate().observation()
+            else {
+                return false;
+            };
+            let context = observed.context();
+            record.candidate().source_manifest() == claimed.source_manifest()
+                && context.provenance().instrument_id() == Some(claimed.instrument_id())
+                && observed.universe().as_str() == request.inputs().universe_id().as_str()
+                && observed.effective_interval() == claimed.effective_interval()
+                && context.provenance().availability() == claimed.availability()
+                && record.payload_identity().bytes() == claimed.evidence_digest().bytes()
+        });
+        if matches.next().is_none() || matches.next().is_some() {
+            return Err(DatasetBuildError::UniverseEvidenceMismatch);
+        }
+        validated.push(claimed.clone());
+    }
+    Ok(validated)
+}
+
+fn validate_component_adjustment(
+    component: &FeatureLabelComponentInput,
+    plan: &CorporateActionPlan,
+    policy: crate::CorporateActionPolicy,
+) -> Result<(), DatasetBuildError> {
+    let valid = match (component.spec().corporate_actions(), component.adjustment()) {
+        (CorporateActionSensitivity::NotApplicable, ComponentAdjustmentEvidence::NotApplicable) => {
+            true
+        }
+        (CorporateActionSensitivity::RequiresAdjustment, ComponentAdjustmentEvidence::Raw) => {
+            policy.adjustment() == crate::CorporateActionAdjustment::Raw
+        }
+        (
+            CorporateActionSensitivity::RequiresAdjustment,
+            ComponentAdjustmentEvidence::Applied {
+                policy: applied_policy,
+                plan_content,
+                plan_audit,
+                ..
+            },
+        ) => {
+            policy.adjustment() != crate::CorporateActionAdjustment::Raw
+                && *applied_policy == policy
+                && *plan_content == plan.content_hash()
+                && *plan_audit == plan.audit_hash()
+        }
+        _ => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(DatasetBuildError::ComponentAdjustmentMismatch)
+    }
+}
+
 fn point_in_time_request(
     request: &DatasetBuildRequest,
     as_of: market_squawk_domain::Timestamp,
     effective_cutoff: market_squawk_domain::Timestamp,
     label_cutoff: Option<market_squawk_domain::Timestamp>,
+    remaining_bytes: usize,
 ) -> Result<PointInTimeRequest, DatasetBuildError> {
+    let configured = request.limits().point_in_time();
+    let retained_bytes = configured.max_retained_bytes().min(remaining_bytes);
+    let limits = crate::PointInTimeLimits::try_new(
+        configured.max_candidates(),
+        configured.max_families(),
+        configured.max_conflicts(),
+        configured.max_result_rows(),
+        retained_bytes,
+    )
+    .map_err(|_| DatasetBuildError::LimitExceeded)?;
     PointInTimeRequest::try_new(
         request.policy().point_in_time(),
         as_of,
         Some(ResearchTemporalCoordinate::exact(as_of)),
         ResearchTemporalCoordinate::exact(effective_cutoff),
         label_cutoff.map(ResearchTemporalCoordinate::exact),
-        request.limits().point_in_time(),
+        limits,
     )
     .map_err(|_| DatasetBuildError::InvalidRequest)
 }
 
-fn actions_for_instrument(
-    actions: &[CorporateActionRecord],
-    instrument_id: InstrumentId,
-) -> Result<Vec<CorporateActionRecord>, DatasetBuildError> {
+fn action_plan_from_selection(
+    request: &DatasetBuildRequest,
+    example: &DatasetExample,
+    selection: &PointInTimeSelection<'_>,
+    label: bool,
+    remaining_bytes: usize,
+) -> Result<CorporateActionPlan, DatasetBuildError> {
     let mut relevant = Vec::new();
-    for action in actions {
-        if action.observation().context().provenance().instrument_id() == Some(instrument_id) {
+    let mut admission = 0_usize;
+    for record in selection.records() {
+        let ResearchObservation::CorporateAction(action) = record.candidate().observation() else {
+            continue;
+        };
+        if action.context().provenance().instrument_id() == Some(example.instrument_id()) {
+            admission = admission
+                .checked_add(corporate_action_record_admission(
+                    action,
+                    record.candidate().source_manifest(),
+                )?)
+                .ok_or(DatasetBuildError::LimitExceeded)?;
+        }
+    }
+    if admission > remaining_bytes {
+        return Err(DatasetBuildError::LimitExceeded);
+    }
+    for record in selection.records() {
+        let ResearchObservation::CorporateAction(action) = record.candidate().observation() else {
+            continue;
+        };
+        if action.context().provenance().instrument_id() == Some(example.instrument_id()) {
+            if relevant.len() >= request.limits().corporate_actions().max_actions().get() {
+                return Err(DatasetBuildError::LimitExceeded);
+            }
             relevant
                 .try_reserve(1)
                 .map_err(|_| DatasetBuildError::LimitExceeded)?;
-            relevant.push(action.clone());
+            relevant.push(CorporateActionRecord::new(
+                action.clone(),
+                record.candidate().source_manifest().clone(),
+                EvidenceDigest::new(DigestAlgorithm::Sha256, record.evidence_identity().bytes()),
+            ));
         }
     }
-    Ok(relevant)
+    let cutoff = if label {
+        example.label_cutoff_at()
+    } else {
+        example.cutoff_at()
+    };
+    let configured = request.limits().corporate_actions();
+    let retained_bytes = configured.max_retained_bytes().get().min(remaining_bytes);
+    let limits = crate::CorporateActionLimits::try_new(
+        configured.max_actions(),
+        NonZeroUsize::new(retained_bytes).ok_or(DatasetBuildError::LimitExceeded)?,
+    )
+    .map_err(|_| DatasetBuildError::LimitExceeded)?;
+    CorporateActionPlan::try_build(
+        request.policy().corporate_actions(),
+        cutoff,
+        cutoff,
+        relevant,
+        limits,
+    )
+    .map_err(DatasetBuildError::from)
 }
 
 fn resolve_component_evidence(
@@ -465,12 +800,12 @@ fn feature_label_batch(
             request.policy_digest().bytes(),
         ),
     )?;
-    let mut float_values = Vec::with_capacity(rows.len());
-    let mut decimal_values = Vec::with_capacity(rows.len());
-    let mut decimal_scales = Vec::with_capacity(rows.len());
-    let mut units = Vec::with_capacity(rows.len());
-    let mut currencies = Vec::with_capacity(rows.len());
-    let mut missing = Vec::with_capacity(rows.len());
+    let mut float_values = bounded_output_vec(rows.len())?;
+    let mut decimal_values = bounded_output_vec(rows.len())?;
+    let mut decimal_scales = bounded_output_vec(rows.len())?;
+    let mut units = bounded_output_vec(rows.len())?;
+    let mut currencies = bounded_output_vec(rows.len())?;
+    let mut missing = bounded_output_vec(rows.len())?;
     for row in rows {
         match row.component.value() {
             ComponentValue::Float {
@@ -561,6 +896,46 @@ fn feature_label_batch(
     Ok((batch, Sha256Digest::new(hash.finalize().into())))
 }
 
+fn bounded_output_vec<T>(capacity: usize) -> Result<Vec<T>, DatasetBuildError> {
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(capacity)
+        .map_err(|_| DatasetBuildError::LimitExceeded)?;
+    Ok(values)
+}
+
+fn feature_label_output_admission(rows: &[OutputRow<'_>]) -> Result<usize, DatasetBuildError> {
+    let fixed = rows
+        .len()
+        .checked_mul(512)
+        .and_then(|bytes| bytes.checked_add(64 * 1024))
+        .ok_or(DatasetBuildError::LimitExceeded)?;
+    let dynamic = rows.iter().try_fold(0_usize, |total, row| {
+        let component = row.component;
+        let value_bytes = match component.value() {
+            ComponentValue::Float { unit, currency, .. }
+            | ComponentValue::Decimal { unit, currency, .. } => unit
+                .as_ref()
+                .map_or(0, |value| value.as_str().len())
+                .checked_add(currency.map_or(0, |value| value.as_str().len())),
+            ComponentValue::Missing { reason } => Some(reason.as_str().len()),
+        }
+        .ok_or(DatasetBuildError::LimitExceeded)?;
+        total
+            .checked_add(row.example.example_id().len())
+            .and_then(|bytes| bytes.checked_add(component.spec().name().len()))
+            .and_then(|bytes| bytes.checked_add(value_bytes))
+            .ok_or(DatasetBuildError::LimitExceeded)
+    })?;
+    fixed
+        .checked_add(
+            dynamic
+                .checked_mul(2)
+                .ok_or(DatasetBuildError::LimitExceeded)?,
+        )
+        .ok_or(DatasetBuildError::LimitExceeded)
+}
+
 fn matching_existing(
     builder: &DatasetBuilderService<'_>,
     request: &DatasetBuildRequest,
@@ -608,6 +983,38 @@ fn authorize_research_use(
         .map_err(Into::into)
 }
 
+fn authorize_existing_output(
+    builder: &DatasetBuilderService<'_>,
+    request: &DatasetBuildRequest,
+    existing: &PinnedDataset,
+    cancellation: &CancellationToken,
+) -> Result<(), DatasetBuildError> {
+    if cancellation.is_cancelled() {
+        return Err(DatasetBuildError::Cancelled);
+    }
+    let [object] = existing.objects() else {
+        return Err(DatasetBuildError::InvalidInputGeneration);
+    };
+    let authority = builder
+        .authority
+        .lock()
+        .map_err(|_| DatasetBuildError::AuthorityLockPoisoned)?;
+    authority.admit_source_rights(
+        request
+            .output_authorization()
+            .rights_decision(object.object().content_hash(), current_timestamp()?),
+    )?;
+    Ok(())
+}
+
+fn current_timestamp() -> Result<market_squawk_domain::Timestamp, DatasetBuildError> {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| DatasetBuildError::InvalidRequest)?;
+    let nanos = i64::try_from(elapsed.as_nanos()).map_err(|_| DatasetBuildError::InvalidRequest)?;
+    Ok(market_squawk_domain::Timestamp::from_unix_nanos(nanos))
+}
+
 fn expected_split_counts(
     request: &DatasetBuildRequest,
 ) -> Result<DatasetSplitCounts, DatasetBuildError> {
@@ -634,22 +1041,6 @@ fn expected_split_counts(
         counts.record(split);
     }
     Ok(counts)
-}
-
-fn ensure_retained_limit(
-    request: &DatasetBuildRequest,
-    retained: impl IntoIterator<Item = usize>,
-) -> Result<(), DatasetBuildError> {
-    let total = retained.into_iter().try_fold(0_usize, |total, value| {
-        total
-            .checked_add(value)
-            .ok_or(DatasetBuildError::LimitExceeded)
-    })?;
-    if total > request.limits().max_retained_bytes() {
-        Err(DatasetBuildError::LimitExceeded)
-    } else {
-        Ok(())
-    }
 }
 
 fn result_from_existing(

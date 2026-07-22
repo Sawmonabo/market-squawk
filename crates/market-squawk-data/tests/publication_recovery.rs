@@ -11,15 +11,17 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use market_squawk_data::{
     AnalyticalDataService, AnalyticalManifestCatalog, CatalogAuthority, CatalogConfig,
     CatalogError, CatalogLimit, CatalogResultLimits, ChronologicalSplitPolicy, CommittedDataset,
-    CompactionRequest, ComponentKind, ComponentSelector, ComponentValue, CorporateActionAdjustment,
-    CorporateActionLimits, CorporateActionPolicy, DatasetBuildInputs, DatasetBuildLimits,
-    DatasetBuildPolicy, DatasetBuildRequest, DatasetBuilder, DatasetOutputAuthorization,
+    CompactionRequest, ComponentAdjustmentEvidence, ComponentKind, ComponentScope,
+    ComponentSelector, ComponentValue, CorporateActionAdjustment, CorporateActionLimits,
+    CorporateActionPolicy, CorporateActionSensitivity, DatasetBuildError, DatasetBuildInputs,
+    DatasetBuildLimits, DatasetBuildPolicy, DatasetBuildRequest, DatasetBuilder, DatasetId,
+    DatasetManifestRef, DatasetOutputAuthorization, DatasetSchemaRegistry,
     FeatureLabelComponentInput, FeatureLabelComponentSpec, IngestError, IngestIdentity,
     MissingValuePolicy, ObjectStoreConfig, ObservationFamilyKey, ParquetStoreError,
     PointInTimeLimits, PointInTimePolicy, PointInTimeRevisionMode, QueryArtifactReservationInput,
     QueryError, QueryLimits, QueryRequest, QueryResult, ResearchArrowBatch, ResearchIngestService,
     ResearchQueryEngine, ResearchUse, ResearchUseGrantInput, ResearchUseLimits, ResearchUseSet,
-    RightsBasis, RightsDecisionInput, SourceOperation, UniverseId, UniverseLimits,
+    RightsBasis, RightsDecisionInput, Sha256Digest, SourceOperation, UniverseId, UniverseLimits,
     UniverseMembership, extraction_batch_digest,
 };
 use market_squawk_domain::{
@@ -28,15 +30,16 @@ use market_squawk_domain::{
     MacroObservation, MetadataRevision, PayloadReference, ResearchContext, ResearchObservation,
     ResearchProvenance, ResearchProvenanceInput, ResearchTemporalCoordinate, ResearchTime,
     RevisionBoundPayloadEvidence, RevisionNumber, SchemaVersion, SequenceCapability, SourceId,
-    SourceIdentifier, Timestamp,
+    SourceIdentifier, Timestamp, UniverseMembershipObservation,
 };
 use market_squawk_platform::LocalPaths;
 use market_squawk_sources::{
     AuthorizationGrant, AuthorizationMode, AvailabilityEvidence as SourceAvailabilityEvidence,
-    CoverageDomain, DiscoveryRequest, ExtractionBatch, ExtractionRecord, ExtractionRequest,
-    ExtractionRevisionEvidence, ExtractionRevisionPlan, FreshnessPolicy, HistoricalCapability,
-    NetworkAccessPolicy, ObservedProviderOrder, SourceCapabilities, SourceClass, SourceCoverage,
-    SourceMetadata, SourceMetadataInput, SourceObject, SourceProtocolProfile,
+    CanonicalObservationPayload, CoverageDomain, DiscoveryRequest, ExtractionBatch,
+    ExtractionRecord, ExtractionRequest, ExtractionRevisionEvidence, ExtractionRevisionPlan,
+    FreshnessPolicy, HistoricalCapability, NetworkAccessPolicy, ObservedProviderOrder,
+    SourceCapabilities, SourceClass, SourceCoverage, SourceMetadata, SourceMetadataInput,
+    SourceObject, SourceProtocolProfile,
 };
 use rusqlite::params;
 use rust_decimal::Decimal;
@@ -847,6 +850,62 @@ async fn rights_bound_ingest_replays_one_complete_pinned_generation() -> TestRes
     Ok(())
 }
 
+#[test]
+fn dataset_inputs_reject_a_transaction_from_another_instrument() -> TestResult {
+    let instrument = InstrumentId::from_str("0187f5f1-6fc2-7fa2-bf05-2ce5354c55c1")?;
+    let other_instrument = InstrumentId::from_str("0187f5f1-6fc2-7fa2-bf05-2ce5354c55c2")?;
+    let parent = DatasetManifestRef::try_new_with_schema(
+        DatasetId::try_from("transaction-observations")?,
+        1,
+        DatasetSchemaRegistry::local().canonical_research_observations()?,
+        Sha256Digest::new([91; 32]),
+    )?;
+    let component_spec = FeatureLabelComponentSpec::try_new(
+        ComponentKind::Feature,
+        ComponentScope::Instrument,
+        CorporateActionSensitivity::NotApplicable,
+        "transaction-score",
+        NonZeroU32::MIN,
+    )?;
+    let component = FeatureLabelComponentInput::try_new(
+        component_spec.clone(),
+        ComponentValue::missing(SourceIdentifier::try_from("not-observed")?),
+        vec![ComponentSelector::new(ObservationFamilyKey::Transaction {
+            source_id: SourceId::try_from("broker-export")?,
+            instrument_id: Some(other_instrument),
+            account_id: SourceIdentifier::try_from("taxable-account")?,
+            source_record_id: SourceIdentifier::try_from("broker-transaction-1")?,
+        })],
+        ComponentAdjustmentEvidence::NotApplicable,
+    )?;
+    let example = market_squawk_data::DatasetExample::try_new(
+        "transaction-example",
+        instrument,
+        Timestamp::from_unix_nanos(80),
+        Timestamp::from_unix_nanos(100),
+        vec![component],
+    )?;
+    let result = DatasetBuildInputs::try_new(
+        vec![parent.clone()],
+        UniverseId::try_from("us-equities.historical")?,
+        vec![UniverseMembership::new(
+            instrument,
+            EffectiveInterval::new(Timestamp::from_unix_nanos(1), None)?,
+            market_squawk_domain::AvailabilityEvidence::evidenced(
+                Timestamp::from_unix_nanos(1),
+                SourceIdentifier::try_from("constituent-publication")?,
+            ),
+            parent,
+            digest(92),
+        )],
+        vec![component_spec],
+        vec![example],
+    );
+
+    assert!(matches!(result, Err(DatasetBuildError::InvalidRequest)));
+    Ok(())
+}
+
 #[tokio::test]
 async fn point_in_time_builder_publishes_one_authorized_queryable_generation() -> TestResult {
     let directory = tempfile::tempdir()?;
@@ -855,15 +914,19 @@ async fn point_in_time_builder_publishes_one_authorized_queryable_generation() -
     let catalog_config = test_catalog_config(location)?;
     let store_config = ObjectStoreConfig::try_new(8 * 1024 * 1024, 1024, Duration::from_secs(60))?;
     let (service, source) =
-        initialized_service_with_dataset(&paths, catalog_config, store_config).await?;
+        initialized_service_with_universe(&paths, catalog_config, store_config).await?;
     let instrument = InstrumentId::from_str("0187f5f1-6fc2-7fa2-bf05-2ce5354c55c1")?;
     let feature = FeatureLabelComponentSpec::try_new(
         ComponentKind::Feature,
+        ComponentScope::Global,
+        CorporateActionSensitivity::NotApplicable,
         "cpi-surprise",
         NonZeroU32::MIN,
     )?;
     let label = FeatureLabelComponentSpec::try_new(
         ComponentKind::Label,
+        ComponentScope::Global,
+        CorporateActionSensitivity::NotApplicable,
         "gdp-next-release",
         NonZeroU32::MIN,
     )?;
@@ -875,6 +938,7 @@ async fn point_in_time_builder_publishes_one_authorized_queryable_generation() -
             series: SourceIdentifier::try_from("CPI")?,
             effective: ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(90)),
         })],
+        ComponentAdjustmentEvidence::NotApplicable,
     )?;
     let observed_label = FeatureLabelComponentInput::try_new(
         label.clone(),
@@ -888,6 +952,7 @@ async fn point_in_time_builder_publishes_one_authorized_queryable_generation() -
             series: SourceIdentifier::try_from("GDP")?,
             effective: ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(90)),
         })],
+        ComponentAdjustmentEvidence::NotApplicable,
     )?;
     let cutoff = Timestamp::from_unix_nanos(80);
     let label_cutoff = Timestamp::from_unix_nanos(100);
@@ -897,19 +962,21 @@ async fn point_in_time_builder_publishes_one_authorized_queryable_generation() -
         vec![UniverseMembership::new(
             instrument,
             EffectiveInterval::new(Timestamp::from_unix_nanos(1), None)?,
-            market_squawk_domain::AvailabilityEvidence::local_first_observed(
+            market_squawk_domain::AvailabilityEvidence::evidenced(
                 Timestamp::from_unix_nanos(1),
+                SourceIdentifier::try_from("constituent-publication")?,
             ),
             source.manifest().clone(),
-            digest(61),
+            CanonicalObservationPayload::try_from_observation(&universe_membership_observation()?)?
+                .identity(),
         )],
-        vec![feature, label],
+        vec![feature.clone(), label.clone()],
         vec![market_squawk_data::DatasetExample::try_new(
             "us-gdp-example-1",
             instrument,
             cutoff,
             label_cutoff,
-            vec![missing_feature, observed_label],
+            vec![missing_feature.clone(), observed_label.clone()],
         )?],
     )?;
     let split = ChronologicalSplitPolicy::try_new(
@@ -948,18 +1015,61 @@ async fn point_in_time_builder_publishes_one_authorized_queryable_generation() -
             NonZeroUsize::new(1024 * 1024).ok_or("nonzero action byte limit")?,
         )?,
     )?;
+    let output_authorization = DatasetOutputAuthorization::try_new(
+        SourceId::try_from("market-squawk.derived")?,
+        RightsBasis::reviewed_terms("https://example.test/local-derived/v1", digest(62))?,
+        digest(63),
+        None,
+    )?;
+    let fabricated_inputs = DatasetBuildInputs::try_new(
+        vec![source.manifest().clone()],
+        UniverseId::try_from("us-equities.historical")?,
+        vec![UniverseMembership::new(
+            instrument,
+            EffectiveInterval::new(Timestamp::from_unix_nanos(1), None)?,
+            market_squawk_domain::AvailabilityEvidence::evidenced(
+                Timestamp::from_unix_nanos(1),
+                SourceIdentifier::try_from("constituent-publication")?,
+            ),
+            source.manifest().clone(),
+            digest(61),
+        )],
+        vec![feature, label],
+        vec![market_squawk_data::DatasetExample::try_new(
+            "us-gdp-example-1",
+            instrument,
+            cutoff,
+            label_cutoff,
+            vec![missing_feature, observed_label],
+        )?],
+    )?;
+    let fabricated = DatasetBuildRequest::try_new(
+        market_squawk_data::DatasetId::try_from("derived.feature-labels.gdp-v1")?,
+        fabricated_inputs,
+        policy.clone(),
+        ResearchUse::LocalAnalysis,
+        research_limits,
+        output_authorization.clone(),
+        limits,
+    )?;
+    let fabricated_result = service
+        .dataset_builder()
+        .build(fabricated, CancellationToken::new())
+        .await;
+    assert!(
+        matches!(
+            fabricated_result,
+            Err(DatasetBuildError::UniverseEvidenceMismatch)
+        ),
+        "unexpected fabricated-membership result: {fabricated_result:?}"
+    );
     let request = DatasetBuildRequest::try_new(
         market_squawk_data::DatasetId::try_from("derived.feature-labels.gdp-v1")?,
         inputs,
         policy,
         ResearchUse::LocalAnalysis,
         research_limits,
-        DatasetOutputAuthorization::try_new(
-            SourceId::try_from("market-squawk.derived")?,
-            RightsBasis::reviewed_terms("https://example.test/local-derived/v1", digest(62))?,
-            digest(63),
-            None,
-        )?,
+        output_authorization,
         limits,
     )?;
 
@@ -1003,6 +1113,29 @@ async fn initialized_service_with_dataset(
     catalog_config: CatalogConfig,
     store_config: ObjectStoreConfig,
 ) -> Result<(AnalyticalDataService, CommittedDataset), Box<dyn Error>> {
+    initialized_service_with_batch(paths, catalog_config, store_config, extraction_batch()?).await
+}
+
+async fn initialized_service_with_universe(
+    paths: &LocalPaths,
+    catalog_config: CatalogConfig,
+    store_config: ObjectStoreConfig,
+) -> Result<(AnalyticalDataService, CommittedDataset), Box<dyn Error>> {
+    initialized_service_with_batch(
+        paths,
+        catalog_config,
+        store_config,
+        dataset_extraction_batch()?,
+    )
+    .await
+}
+
+async fn initialized_service_with_batch(
+    paths: &LocalPaths,
+    catalog_config: CatalogConfig,
+    store_config: ObjectStoreConfig,
+    batch: ExtractionBatch,
+) -> Result<(AnalyticalDataService, CommittedDataset), Box<dyn Error>> {
     let location = paths.catalog()?.clone();
     let authority = CatalogAuthority::open(catalog_config)?;
     let source = local_source()?;
@@ -1011,7 +1144,6 @@ async fn initialized_service_with_dataset(
         &local_source_for("market-squawk.derived")?,
         Timestamp::from_unix_nanos(10),
     )?;
-    let batch = extraction_batch()?;
     let payload_digest = extraction_batch_digest(&batch)?;
     let rights = authority.admit_source_rights(RightsDecisionInput {
         source_id: source.source_id().clone(),
@@ -1050,6 +1182,16 @@ async fn initialized_service_with_dataset(
 }
 
 fn extraction_batch() -> Result<ExtractionBatch, Box<dyn Error>> {
+    extraction_batch_with_membership(false)
+}
+
+fn dataset_extraction_batch() -> Result<ExtractionBatch, Box<dyn Error>> {
+    extraction_batch_with_membership(true)
+}
+
+fn extraction_batch_with_membership(
+    include_membership: bool,
+) -> Result<ExtractionBatch, Box<dyn Error>> {
     let discovery = DiscoveryRequest::try_new(
         SourceIdentifier::try_from("fred-gdp")?,
         Some(Timestamp::from_unix_nanos(90)),
@@ -1069,13 +1211,13 @@ fn extraction_batch() -> Result<ExtractionBatch, Box<dyn Error>> {
     )?;
     let request = ExtractionRequest::try_new(
         object,
-        NonZeroU32::new(1).ok_or("nonzero record limit")?,
+        NonZeroU32::new(if include_membership { 2 } else { 1 }).ok_or("nonzero record limit")?,
         NonZeroU64::new(1024 * 1024).ok_or("nonzero byte limit")?,
         Timestamp::from_unix_nanos(1_000),
     )?;
     let payload = serde_json::to_vec(&macro_observation()?)?;
     let evidence = EvidenceDigest::new(DigestAlgorithm::Sha256, Sha256::digest(&payload).into());
-    let record = ExtractionRecord::try_new(
+    let macro_record = ExtractionRecord::try_new(
         &request,
         SourceIdentifier::try_from("market-squawk-research-v3")?,
         ExactPayloadEvidence::from_content_digest(evidence),
@@ -1089,7 +1231,31 @@ fn extraction_batch() -> Result<ExtractionBatch, Box<dyn Error>> {
         Some(Timestamp::from_unix_nanos(200)),
         payload.into(),
     )?;
-    Ok(ExtractionBatch::try_new(&request, vec![record])?)
+    let mut records = vec![macro_record];
+    if !include_membership {
+        return Ok(ExtractionBatch::try_new(&request, records)?);
+    }
+    let membership_payload = serde_json::to_vec(&universe_membership_observation()?)?;
+    let membership_evidence = EvidenceDigest::new(
+        DigestAlgorithm::Sha256,
+        Sha256::digest(&membership_payload).into(),
+    );
+    let membership_record = ExtractionRecord::try_new(
+        &request,
+        SourceIdentifier::try_from("market-squawk-research-v3")?,
+        ExactPayloadEvidence::from_content_digest(membership_evidence),
+        Timestamp::from_unix_nanos(1),
+        Some(Timestamp::from_unix_nanos(1)),
+        SourceAvailabilityEvidence::Observed {
+            available_at: Timestamp::from_unix_nanos(1),
+            evidence: SourceIdentifier::try_from("constituent-publication")?,
+        },
+        SourceIdentifier::try_from("revision-1")?,
+        None,
+        membership_payload.into(),
+    )?;
+    records.push(membership_record);
+    Ok(ExtractionBatch::try_new(&request, records)?)
 }
 
 fn provider_revision_plan(
@@ -1143,6 +1309,42 @@ fn macro_observation() -> Result<ResearchObservation, Box<dyn Error>> {
         Decimal::new(123_456, 2),
         SourceIdentifier::try_from("USD")?,
     )))
+}
+
+fn universe_membership_observation() -> Result<ResearchObservation, Box<dyn Error>> {
+    let instrument = InstrumentId::from_str("0187f5f1-6fc2-7fa2-bf05-2ce5354c55c1")?;
+    let context = ResearchContext::new(
+        ResearchProvenance::try_new(ResearchProvenanceInput {
+            source_id: SourceId::try_from("fred-local-fixture")?,
+            instrument_id: Some(instrument),
+            venue_id: None,
+            source_identifier: SourceIdentifier::try_from("us-equities:member:fixture")?,
+            source_timestamp: None,
+            received_at: Timestamp::from_unix_nanos(1),
+            ingested_at: Timestamp::from_unix_nanos(1),
+            quality: DataQuality::OfficialDelayed,
+            payload_reference: PayloadReference::SourceReference(SourceIdentifier::try_from(
+                "constituents:us-equities:fixture",
+            )?),
+            availability: market_squawk_domain::AvailabilityEvidence::evidenced(
+                Timestamp::from_unix_nanos(1),
+                SourceIdentifier::try_from("constituent-publication")?,
+            ),
+        })?,
+        ResearchTime::new(
+            Timestamp::from_unix_nanos(1),
+            Some(Timestamp::from_unix_nanos(1)),
+            RevisionNumber::new(1)?,
+            None,
+        )?,
+    )?;
+    Ok(ResearchObservation::UniverseMembership(
+        UniverseMembershipObservation::new(
+            context,
+            SourceIdentifier::try_from("us-equities.historical")?,
+            EffectiveInterval::new(Timestamp::from_unix_nanos(1), None)?,
+        )?,
+    ))
 }
 
 fn local_source() -> Result<SourceMetadata, Box<dyn Error>> {

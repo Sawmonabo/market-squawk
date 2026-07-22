@@ -54,7 +54,8 @@ pub use corporate_actions::{
     MAX_CORPORATE_ACTION_RETAINED_BYTES, MAX_CORPORATE_ACTIONS,
 };
 pub use dataset_builder::{
-    ChronologicalSplitPolicy, ComponentKind, ComponentSelector, ComponentValue, DatasetBuildError,
+    ChronologicalSplitPolicy, ComponentAdjustmentEvidence, ComponentKind, ComponentScope,
+    ComponentSelector, ComponentValue, CorporateActionSensitivity, DatasetBuildError,
     DatasetBuildInputs, DatasetBuildLimits, DatasetBuildPolicy, DatasetBuildRequest,
     DatasetBuilder, DatasetBuilderService, DatasetExample, DatasetOutputAuthorization,
     DatasetSplit, DatasetSplitCounts, FeatureLabelComponentInput, FeatureLabelComponentSpec,

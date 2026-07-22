@@ -52,6 +52,7 @@ market-squawk-adapter-coinbase = { workspace = true }
 market-squawk-adapter-kraken = { workspace = true }
 market-squawk-adapter-paper = { workspace = true }
 market-squawk-analytics = { workspace = true }
+market-squawk-data = { workspace = true }
 market-squawk-execution = { workspace = true }
 market-squawk-live = { workspace = true }
 market-squawk-mcp = { workspace = true }

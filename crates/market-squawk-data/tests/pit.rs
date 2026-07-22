@@ -11,17 +11,59 @@ use market_squawk_data::{
 };
 use market_squawk_domain::{
     AlternativeDataObservation, AvailabilityEvidence, CalendarDate, CorporateActionKind,
-    CorporateActionObservation, DataQuality, DigestAlgorithm, FilingObservation,
+    CorporateActionObservation, DataQuality, DigestAlgorithm, EffectiveInterval, FilingObservation,
     FundamentalObservation, InstrumentId, MacroObservation, PayloadHash, PayloadReference,
     PositionObservation, PositionSide, QuantityLots, ResearchContext, ResearchObservation,
     ResearchProvenance, ResearchProvenanceInput, ResearchTemporalCoordinate, ResearchTime,
     RevisionNumber, SourceId, SourceIdentifier, Timestamp, TransactionObservation,
+    UniverseMembershipObservation,
 };
 use market_squawk_sources::{CanonicalObservationFamily, CanonicalObservationPayload};
 use rust_decimal::Decimal;
 use tokio_util::sync::CancellationToken;
 
 type TestResult = Result<(), Box<dyn Error>>;
+
+#[test]
+fn transaction_family_identity_preserves_the_provenance_instrument() -> TestResult {
+    let first_instrument = InstrumentId::from_str("0187f5f1-6fc2-7fa2-bf05-2ce5354c55c1")?;
+    let second_instrument = InstrumentId::from_str("0187f5f1-6fc2-7fa2-bf05-2ce5354c55c2")?;
+    let transaction = |instrument_id| -> Result<PointInTimeCandidate, Box<dyn Error>> {
+        let context = ResearchContext::new(
+            ResearchProvenance::try_new(ResearchProvenanceInput {
+                source_id: SourceId::try_from("broker-export")?,
+                instrument_id: Some(instrument_id),
+                venue_id: None,
+                source_identifier: SourceIdentifier::try_from("transaction-provenance")?,
+                source_timestamp: None,
+                received_at: timestamp(10),
+                ingested_at: timestamp(11),
+                quality: DataQuality::OfficialDelayed,
+                payload_reference: PayloadReference::ContentHash(PayloadHash::new(
+                    DigestAlgorithm::Sha256,
+                    [7; 32],
+                )),
+                availability: AvailabilityEvidence::local_first_observed(timestamp(10)),
+            })?,
+            ResearchTime::try_new_with_coordinates(exact(50), None, RevisionNumber::new(1)?, None)?,
+        )?;
+        Ok(PointInTimeCandidate::new(
+            ResearchObservation::Transaction(TransactionObservation::new(
+                context,
+                SourceIdentifier::try_from("taxable-account")?,
+                SourceIdentifier::try_from("trade")?,
+                SourceIdentifier::try_from("broker-transaction-1")?,
+            )),
+            manifest(1, 1)?,
+        ))
+    };
+
+    let first = transaction(first_instrument)?.family_key()?;
+    let second = transaction(second_instrument)?.family_key()?;
+
+    assert_ne!(first, second);
+    Ok(())
+}
 
 #[tokio::test]
 async fn source_revision_encodings_match_pit_for_every_observation_variant() -> TestResult {
@@ -83,6 +125,11 @@ async fn source_revision_encodings_match_pit_for_every_observation_variant() -> 
             context("corporate-action-record", Some(instrument))?,
             CorporateActionKind::Delisting,
         )?),
+        ResearchObservation::UniverseMembership(UniverseMembershipObservation::new(
+            context("universe-membership-record", Some(instrument))?,
+            SourceIdentifier::try_from("us-equities.historical")?,
+            EffectiveInterval::new(timestamp(50), None)?,
+        )?),
         ResearchObservation::AlternativeData(AlternativeDataObservation::new(
             context("alternative-record", None)?,
             SourceIdentifier::try_from("local-factors")?,
@@ -128,6 +175,17 @@ async fn source_revision_encodings_match_pit_for_every_observation_variant() -> 
             payload.identity().bytes(),
             record.payload_identity().bytes()
         );
+        if let ResearchObservation::AlternativeData(value) = observation {
+            assert_eq!(
+                payload,
+                CanonicalObservationPayload::alternative_data(
+                    value.dataset(),
+                    value.field(),
+                    value.value(),
+                    value.unit(),
+                )?
+            );
+        }
     }
 
     Ok(())
