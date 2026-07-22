@@ -46,8 +46,10 @@ work is bound by the single canonical
   authority history, backup/restore recovery, and tamper-evident catalog state.
 - Versioned Arrow analytical interchange plus authority-bound immutable Parquet publication,
   manifests, lineage, compaction, recovery, and bounded read-only DataFusion queries with
-  point-in-time availability filtering. Other required extraction adapters and the complete
-  point-in-time dataset builder remain release-blocking below.
+  point-in-time availability filtering. The leakage-bounded feature/label dataset builder composes
+  exact input generations, source-authored historical-universe evidence, revision selection,
+  corporate-action policy, chronological splits, controlled output publication, and replay-safe
+  application authority.
 - A production local-file extraction vertical for CSV/TSV, JSON/NDJSON, entity-safe XML,
   formula- and external-link-constrained Excel, allowlisted read-only SQLite exports, OFX/QFX, and
   Parquet. User-authorized capability roots, bounded parsing and decompression, revocable source
@@ -110,7 +112,6 @@ terminal consumer, focused verification, immutable evidence, and exact commit ex
 | `Missing` | Kraken direct-source qualification | The production transport, decoder, checksum, exact-generation session lifecycle, fresh-snapshot recovery, and canonical risk/no-paper-mutation terminal proof exist; Kraken WebSocket v2 supplies no venue sequence satisfying the current `DirectVerified` execution predicate | Task 20 |
 | `Missing` | FRED/ALFRED durable local consumption | The production vintage-aware adapter is runnable for authorized ephemeral retrieval, but the exact current terms bundle does not establish per-series rights for persistence, caching, archival, or training | Task 9 / Task 20 |
 | `Missing` | portfolio import | The raw-preserving adapter now enforces durable revisions, account/currency authority, reconciliation, supersession, and canonical data-lane output, but no application service or CLI yet composes a real Task 7 local-file/OFX producer into its required portfolio-raw contract | Task 19 |
-| `Missing` | point-in-time datasets | No availability-aware joins or leakage-checked builder | Task 11 |
 | `Missing` | Rust financial analytics | No complete tested batch-analytics implementation | Task 12 |
 | `Missing` | feature registry | Versioned metadata, exact live kernels, and compatibility checks exist, but no production live-route or batch-dataset consumer closes the capability | Task 12 |
 | `Missing` | Python data/financial/training product | No tracked product package or Rust-parity training boundary | Task 14 |
@@ -295,9 +296,11 @@ architecture or a completion dependency.
 
 The research plane currently has a working local SQLite catalog, versioned Arrow interchange,
 authority-bound immutable Parquet publication and compaction, manifests, lineage, recovery, and
-bounded read-only DataFusion queries. Production extraction/provider verticals and the complete
-point-in-time dataset builder remain mandatory missing capabilities bound to the complete-release
-plan; the release cannot pass without their real producers and terminal consumers.
+bounded read-only DataFusion queries. Its point-in-time dataset service performs revision-aware,
+availability-bounded selection over exact parent manifests, validates source-authored historical
+universe membership, applies explicit corporate-action policy, produces leakage-bounded
+feature/label generations, and exposes the same application authority to ingestion and analytical
+consumers. The remaining mandatory capabilities are listed below and still block release.
 
 ## Diagnostic compatibility data path
 
@@ -387,8 +390,8 @@ The raw envelope preserves:
 
 Optional MSJ journal-format evolution may add segmentation, cryptographic segment manifests, or
 compression while retaining independent compatibility. That diagnostic-journal evolution is
-separate from the already-runnable research Parquet compaction service and from the still-mandatory
-provider-ingestion and point-in-time dataset-construction verticals.
+separate from the runnable research ingestion, point-in-time dataset, and Parquet compaction
+services.
 
 ## Paper execution modes
 

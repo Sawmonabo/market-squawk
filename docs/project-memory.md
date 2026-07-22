@@ -326,3 +326,22 @@ The terminal condition requires all of the following at one clean, unchanged exa
 Only then may implementation stop for complete-release handoff. A user-approved scope change may
 alter the product contract, but progress percentage or elapsed time cannot waive a mandatory
 capability or release gate.
+
+## 2026-07-21 Task 11 research vertical closeout
+
+Task 11 is integrated on `release/market-squawk-v0.1.0` at merge head `8f03d87`. The delivered
+vertical includes provider/local revision authority, source-authored universe membership,
+point-in-time selection, corporate-action evidence, leakage-bounded feature/label datasets,
+authority-before-publication Arrow/Parquet storage, bounded DataFusion access, and the application
+research service that owns source registration, rights admission, ingest reservation, ingestion,
+dataset construction, and analytical access.
+
+The grouped checkpoint review rejected three material defects—canonical identity compatibility,
+post-allocation memory accounting, and unusable application ingest authority—and approved the
+exact implementation only after all three were corrected. The completed feature branch and origin
+branch were deleted, its worktree was removed, and its 18 GiB generated target was reclaimed.
+
+The next serialized product task is Task 12: compose the financial analytics and feature registry
+into the Task 11 point-in-time dataset service. Issue `#31` remains the mandatory zero-fee provider
+onboarding portal: it may automate official provider enrollment and key setup, while preserving and
+resuming any provider-required human consent or verification step.
