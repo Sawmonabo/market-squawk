@@ -28,3 +28,7 @@ path = "tests/modeling_contracts.rs"
 
 [lints]
 workspace = true
+
+[[bin]]
+name = "market-squawk-model-validator"
+path = "src/bin/market_squawk_model_validator.rs"

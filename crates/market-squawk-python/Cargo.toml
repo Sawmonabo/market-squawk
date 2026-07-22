@@ -1,0 +1,22 @@
+[package]
+name = "market-squawk-python"
+description = "Offline Python research bindings for Market Squawk analytics"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+license.workspace = true
+repository = "https://github.com/Sawmonabo/market-squawk"
+publish = false
+
+[lib]
+name = "_native"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+market-squawk-analytics = { workspace = true }
+market-squawk-domain = { workspace = true }
+pyo3 = { version = "=0.29.0", features = ["abi3-py310"] }
+rust_decimal.workspace = true
+
+[lints]
+workspace = true
