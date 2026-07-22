@@ -1,0 +1,2299 @@
+{
+
+  "report_id": "task-19a-zero-fee-provider-onboarding-decision-v2",
+  "title": "Task 19A Decision Report: Zero-Fee Provider Onboarding and Local Secret Activation",
+  "as_of": "2026-07-22",
+  "audit_base": "fe600f7c50af34482bb95feacacf6d0fdc2dbb03",
+  "decision": {
+    "status": "conditional_proceed",
+    "summary": "Implement Task 19A as a capability-gated local portal that automatically configures admitted no-secret surfaces and resumes official provider-controlled credential or authorization flows. Do not claim universal automatic signup, universal zero-fee eligibility, or release readiness for every provider surface.",
+    "hard_blocks": [
+      "FRED/ALFRED durable ingestion, persistence, modeling, export, and AI-facing use pending qualified rights resolution",
+      "Treasury daily-rate XML durable publication pending feed-specific rights admission",
+      "Coinbase and Kraken durable storage, modeling, and redistribution claims pending surface-specific rights evidence",
+      "provider OAuth, device authorization, and DCR until exact provider deployment and client eligibility are admitted",
+      "portable encrypted-fallback release claim until the existing repository vault passes independent Task 19A admission review",
+      "any active provider or OS-backend claim until bounded runtime evidence exists"
+    ],
+    "conditional_gates": [
+      "BLS activation requires exact provenance, access-date citation, disclaimer, truthful-representation, limit-compliance, third-party-rights scope, and bounded runtime evidence",
+      "SEC and Fiscal Data activation require bounded runtime evidence despite documentation-ready no-secret status"
+    ]
+  },
+  "scope": {
+    "topic": "Zero-fee provider onboarding portal for Market Squawk: official user authorization, account and API credential issuance, local secret activation, and automation boundaries",
+    "completed_batches": [
+      "docs-batch-001",
+      "docs-batch-002",
+      "docs-batch-003",
+      "docs-batch-004",
+      "github-batch-001",
+      "papers-batch-001",
+      "reputable-sources-batch-001"
+    ],
+    "completed_categories": [
+      "docs",
+      "github",
+      "papers",
+      "reputable-sources"
+    ],
+    "source_count": 60,
+    "runtime_provider_or_store_operations": 0,
+    "new_web_research": true,
+    "legal_conclusion": false
+  },
+  "methodology": {
+    "principles": [
+      "Semantically deduplicate completed batch and category evidence rather than concatenate reports.",
+      "Use primary provider, government, IETF, and operating-system sources.",
+      "Keep endpoint accessibility, price evidence, credential authority, data-use rights, and runtime readiness as independent decisions.",
+      "Preserve conflicts and bounded non-findings.",
+      "Bind mutable provider evidence to retrieval time, digest, and refresh trigger.",
+      "Distinguish confirmed source facts, formal or empirical results, engineering inferences, and project architecture requirements.",
+      "Use GitHub exact-commit evidence only for implementation fit, never for provider capability or rights."
+    ],
+    "workspace_source_inventory_status": "complete",
+    "source_lineage_resolution": "The canonical root inventory contains 60 selected first-class sources, 17 explicit exclusions, seven batch assignments, per-source access state, and digest or stable-reference metadata. Four canonical category syntheses feed the final report."
+  },
+  "implementation_context": {
+    "origin": "project context supplied for Task 19A; not an external research finding",
+    "existing_candidate": "market-squawk-platform::secrets",
+    "reported_properties": [
+      "Argon2id",
+      "XChaCha20-Poly1305",
+      "capability confinement",
+      "crash consistency",
+      "rotation and recovery",
+      "authority generations"
+    ],
+    "decision": "Independently audit and admit the existing implementation against the complete fallback criteria. Do not invent a replacement cryptosystem unless the existing candidate fails with documented evidence.",
+    "external_research_limitation": "The reviewed external sources did not select or validate a portable encrypted-vault construction."
+  },
+  "provider_release_matrix": [
+    {
+      "provider": "coinbase",
+      "surface": "advanced_trade_public_market_data",
+      "setup_mode": "NoCredential",
+      "human_boundary": "none",
+      "verification": "bounded product/book schema, freshness, and transport probe",
+      "zero_fee_evidence": "no key; durable zero-fee commitment not positively established",
+      "rights": "storage, modeling, and redistribution not established",
+      "release_status": "onboarding_ready_rights_limited",
+      "refresh_trigger": "CB-PUBLIC",
+      "source_ids": [
+        "DOC-001",
+        "DOC-007",
+        "DOC-009"
+      ],
+      "confidence": "medium_high",
+      "evidence_classification": "confirmed official facts plus explicitly scoped engineering inference"
+    },
+    {
+      "provider": "coinbase",
+      "surface": "private_own_account_data",
+      "setup_mode": "ManualApiKeyImport; approved-partner OAuth is separate",
+      "human_boundary": "provider login, permission and portfolio selection, one-time secret handling; approved OAuth adds partner approval and browser consent",
+      "verification": "GET /api/v3/brokerage/key_permissions; require view and expected portfolio; reject trade, transfer, and receive",
+      "zero_fee_evidence": "private cost and eligibility not positively established",
+      "rights": "durable-use rights not established",
+      "release_status": "optional_private_path_evidence_incomplete",
+      "refresh_trigger": "CB-PRIVATE",
+      "source_ids": [
+        "DOC-002",
+        "DOC-003",
+        "DOC-004",
+        "DOC-005",
+        "DOC-006",
+        "DOC-007",
+        "DOC-008",
+        "DOC-009",
+        "DOC-010"
+      ],
+      "confidence": "medium_high",
+      "evidence_classification": "confirmed official facts plus explicitly scoped engineering inference"
+    },
+    {
+      "provider": "kraken",
+      "surface": "spot_public_market_data",
+      "setup_mode": "NoCredential",
+      "human_boundary": "none",
+      "verification": "bounded instrument/book/freshness/sequence/checksum probe as applicable",
+      "zero_fee_evidence": "no key; durable zero-fee commitment not positively established",
+      "rights": "storage, modeling, and redistribution not established",
+      "release_status": "onboarding_ready_rights_limited",
+      "refresh_trigger": "KR-PUBLIC",
+      "source_ids": [
+        "DOC-011",
+        "DOC-015",
+        "DOC-016"
+      ],
+      "confidence": "medium_high",
+      "evidence_classification": "confirmed official facts plus explicitly scoped engineering inference"
+    },
+    {
+      "provider": "kraken",
+      "surface": "private_own_account_data",
+      "setup_mode": "ManualApiKeyImport",
+      "human_boundary": "Kraken Pro login, permission and restriction selection, optional API-key 2FA, and secret handoff",
+      "verification": "POST /0/private/GetApiKeyInfo; exact query-only permissions, restrictions, expiry/query bounds, and IP allowlist; redact sensitive fields",
+      "zero_fee_evidence": "private cost and eligibility not positively established",
+      "rights": "durable-use rights not established",
+      "release_status": "optional_private_path_evidence_incomplete",
+      "refresh_trigger": "KR-PRIVATE",
+      "source_ids": [
+        "DOC-012",
+        "DOC-013",
+        "DOC-014",
+        "DOC-016",
+        "DOC-017",
+        "DOC-018"
+      ],
+      "confidence": "medium_high",
+      "evidence_classification": "confirmed official facts plus explicitly scoped engineering inference"
+    },
+    {
+      "provider": "sec",
+      "surface": "edgar_public_submissions_and_xbrl",
+      "setup_mode": "NoCredential with declared non-secret User-Agent identity",
+      "human_boundary": "user confirms administrative contact",
+      "verification": "bounded known-CIK or accession semantic probe",
+      "zero_fee_evidence": "affirmative free access and reuse for scoped public EDGAR and Government-created SEC content",
+      "rights": "durable storage and analytics supported for exact public EDGAR scope with lineage",
+      "release_status": "documentation_ready_no_secret_runtime_smoke_pending",
+      "refresh_trigger": "SEC",
+      "source_ids": [
+        "DOC-019",
+        "DOC-020"
+      ],
+      "confidence": "high",
+      "evidence_classification": "confirmed official facts plus explicitly scoped engineering inference"
+    },
+    {
+      "provider": "fred_alfred",
+      "surface": "api_v1_and_v2",
+      "setup_mode": "ManualApiKeyImport; ingestion disabled until rights admission",
+      "human_boundary": "free-account registration or login and key request/view",
+      "verification": "minimal read proves only request acceptance; no introspection",
+      "zero_fee_evidence": "account described as free; API requires key",
+      "rights": "current evidence conflicts with mandatory storage/database and AI/ML use and leaves third-party-series rights with user",
+      "release_status": "blocked_pending_qualified_rights_resolution",
+      "refresh_trigger": "FRED",
+      "source_ids": [
+        "DOC-021",
+        "DOC-022",
+        "DOC-023",
+        "DOC-024",
+        "DOC-025",
+        "DOC-FRED-RT-001"
+      ],
+      "confidence": "high",
+      "evidence_classification": "confirmed official terms/key facts plus engineering release gate"
+    },
+    {
+      "provider": "bls",
+      "surface": "v1_unregistered",
+      "setup_mode": "NoCredential",
+      "human_boundary": "none",
+      "verification": "bounded known-series semantic v1 probe after exact signature refresh",
+      "zero_fee_evidence": "unregistered path documented; API price not separately established",
+      "rights": "official terms provide affirmative secondary-use language with access-date citation, disclaimer, truthful-representation, limit-compliance, and third-party-rights duties; admission is scoped to exact BLS provenance and intended operations",
+      "release_status": "documentation_ready_no_secret_scoped_rights_runtime_smoke_pending",
+      "refresh_trigger": "BLS-V1",
+      "source_ids": [
+        "DOC-026",
+        "DOC-029"
+      ],
+      "confidence": "medium_high",
+      "evidence_classification": "confirmed official access/terms facts plus scoped-admission engineering inference"
+    },
+    {
+      "provider": "bls",
+      "surface": "v2_registered",
+      "setup_mode": "ManualApiKeyImport optional higher-quota tier",
+      "human_boundary": "organization/email, CAPTCHA, terms acceptance, emailed-key retrieval, annual renewal",
+      "verification": "bounded one-series, one-year JSON POST with registrationkey; ordinary read, not introspection",
+      "zero_fee_evidence": "API price not separately established",
+      "rights": "same scoped BLS secondary-use evidence and duties as v1; the key changes quota/features, not rights scope",
+      "release_status": "optional_human_resumed_scoped_rights_runtime_smoke_pending",
+      "refresh_trigger": "BLS-V2",
+      "source_ids": [
+        "DOC-026",
+        "DOC-027",
+        "DOC-028",
+        "DOC-029"
+      ],
+      "confidence": "medium_high",
+      "evidence_classification": "confirmed official access/terms facts plus scoped-admission engineering inference"
+    },
+    {
+      "provider": "us_treasury",
+      "surface": "daily_interest_rate_xml",
+      "setup_mode": "NoCredential",
+      "human_boundary": "none",
+      "verification": "one family/recent month; validate XML/OData, dates, values, bounds, and pagination",
+      "zero_fee_evidence": "no credential parameter; price not separately stated",
+      "rights": "feed-specific storage, modeling, and reuse rights not established",
+      "release_status": "technically_available_no_secret_durable_rights_pending",
+      "refresh_trigger": "TREASURY-XML",
+      "source_ids": [
+        "DOC-030"
+      ],
+      "confidence": "medium",
+      "evidence_classification": "confirmed official facts plus explicitly scoped engineering inference"
+    },
+    {
+      "provider": "us_treasury",
+      "surface": "fiscal_data_api",
+      "setup_mode": "NoCredential",
+      "human_boundary": "none",
+      "verification": "one record/minimal fields; validate data, meta, links, version, and bounds",
+      "zero_fee_evidence": "explicit no account/token and free API data",
+      "rights": "affirmative unrestricted copy, adaptation, redistribution, and commercial/noncommercial use for exact API provenance absent dataset override",
+      "release_status": "documentation_ready_no_secret_runtime_smoke_pending",
+      "refresh_trigger": "FISCAL",
+      "source_ids": [
+        "DOC-031"
+      ],
+      "confidence": "high",
+      "evidence_classification": "confirmed official facts plus explicitly scoped engineering inference"
+    }
+  ],
+  "authorization_decisions": [
+    {
+      "capability": "OAuthAuthorizationCodePkce",
+      "status": "standards_supported_provider_admission_required",
+      "requirements": [
+        "exact provider native or public-client admission",
+        "external system browser",
+        "registered native redirect",
+        "transaction-specific PKCE S256",
+        "exact state or equivalent CSRF, issuer, redirect, expiry, and initiation-session binding",
+        "one callback consumption",
+        "granted-scope and issuer/audience/resource/account verification",
+        "sender-constrained or provider-rotated refresh tokens with replay detection"
+      ],
+      "source_ids": [
+        "PAPER-001",
+        "PAPER-005",
+        "PAPER-006",
+        "PAPER-007"
+      ]
+    },
+    {
+      "capability": "OAuthDevice",
+      "status": "standards_supported_provider_admission_required",
+      "requirements": [
+        "provider-advertised device grant and endpoint for exact client",
+        "explicit user start and external human approval",
+        "provider interval or five-second default",
+        "cumulative five-second slow_down",
+        "timeout backoff, absolute expiry, cancellation, and no automatic restart",
+        "no durable device code, user code, or complete verification URI"
+      ],
+      "source_ids": [
+        "PAPER-002",
+        "PAPER-005",
+        "PAPER-006",
+        "PAPER-007"
+      ]
+    },
+    {
+      "capability": "DynamicClientRegistration",
+      "status": "disabled_until_provider_specific_support",
+      "requirements": [
+        "allowlisted exact HTTPS issuer and registration endpoint",
+        "provider authorization and prerequisites",
+        "native/public-client and redirect policy",
+        "exact returned metadata verification",
+        "registration credentials stored in secure store",
+        "RFC 7592 management only where explicitly supported",
+        "indeterminate-state reconciliation after mutating timeout"
+      ],
+      "source_ids": [
+        "PAPER-003",
+        "PAPER-004",
+        "PAPER-005"
+      ]
+    },
+    {
+      "capability": "ManualApiKeyImport",
+      "status": "provider_contract_required",
+      "requirements": [
+        "official deep link and provider-controlled user action",
+        "no provider password collection",
+        "direct secure-store import without durable plaintext staging",
+        "exact minimum and maximum authority verification",
+        "separate remote and local lifecycle state",
+        "account, rate, and rights admission"
+      ],
+      "source_ids": [
+        "DOC-002",
+        "DOC-004",
+        "DOC-012",
+        "DOC-013",
+        "DOC-014",
+        "DOC-021",
+        "DOC-026",
+        "DOC-027",
+        "PAPER-006",
+        "PAPER-007"
+      ]
+    }
+  ],
+  "secure_store_decisions": [
+    {
+      "backend": "apple_keychain",
+      "status": "design_supported_runtime_platform_validation_required",
+      "opaque_reference": "exact persistent reference or exact Market Squawk namespace",
+      "critical_requirements": [
+        "deliberate accessibility policy",
+        "exact match bounds",
+        "typed OSStatus",
+        "prompt and cancellation",
+        "no broad update or delete"
+      ],
+      "source_ids": [
+        "DOC-032",
+        "DOC-033",
+        "DOC-034"
+      ]
+    },
+    {
+      "backend": "windows_credential_manager",
+      "status": "design_supported_runtime_platform_validation_required",
+      "opaque_reference": "exact Market Squawk TargetName plus CRED_TYPE_GENERIC",
+      "critical_requirements": [
+        "same-user/same-machine persistence",
+        "no enterprise roaming default",
+        "typed logon-session errors",
+        "exact delete",
+        "secret buffer clearing"
+      ],
+      "source_ids": [
+        "DOC-035",
+        "DOC-036"
+      ]
+    },
+    {
+      "backend": "windows_dpapi_protected_file",
+      "status": "windows_only_evidence_implementation_validation_required",
+      "opaque_reference": "versioned envelope generation reference",
+      "critical_requirements": [
+        "normal per-user protection",
+        "no CRYPTPROTECT_LOCAL_MACHINE default",
+        "atomic envelope persistence",
+        "corruption and wrong-generation detection",
+        "crash recovery"
+      ],
+      "source_ids": [
+        "DOC-037"
+      ]
+    },
+    {
+      "backend": "freedesktop_secret_service",
+      "status": "draft_backend_runtime_implementation_validation_required",
+      "opaque_reference": "safe unique non-sensitive attributes, not durable D-Bus object path",
+      "critical_requirements": [
+        "attributes treated as unencrypted",
+        "lock and prompt partial outcomes",
+        "session loss",
+        "headless unavailable state",
+        "no access-control overstatement"
+      ],
+      "source_ids": [
+        "DOC-038"
+      ]
+    },
+    {
+      "backend": "existing_market_squawk_encrypted_vault",
+      "status": "implemented_candidate_pending_independent_task19a_admission",
+      "opaque_reference": "repository authority and credential generation",
+      "critical_requirements": [
+        "versioned Argon2id parameters and salts",
+        "XChaCha20-Poly1305 nonce uniqueness, associated-data binding, and authentication failure behavior",
+        "unlock and key custody",
+        "bounded secret memory and capability confinement",
+        "atomic crash-consistent persistence",
+        "authority and credential generations",
+        "rotation and recovery",
+        "corruption and wrong-key failure",
+        "migration and backup policy",
+        "rollback detection or explicit residual risk",
+        "file permissions and no plaintext downgrade"
+      ],
+      "source_ids": [],
+      "context_note": "Existing repository implementation supplied as project context; external research did not validate it."
+    }
+  ],
+  "cross_source_invariants": [
+    "A surface becomes ActiveScoped only after provider capability, human boundary, runtime, least privilege, secure storage when needed, rate, and rights admissions all pass.",
+    "NoCredential, free, and durable-use rights are separate fields.",
+    "Runtime metadata can narrow but not broaden the adapter's reviewed capabilities.",
+    "Credential capture or secure storage never equals permission or rights verification.",
+    "Remote provider validity and local possession are separate systems of record.",
+    "Cancellation prevents later activation but cannot prove external side effects were rolled back.",
+    "Secret bytes and one-time authorization material never enter SQLite, analytical storage, logs, MCP results, command lines, URLs, or durable audit.",
+    "All onboarding and secret operations remain outside the live event-to-action path."
+  ],
+  "portal_states": [
+    "Unavailable",
+    "AnonymousAvailable",
+    "UserActionRequired",
+    "CredentialImportedUnverified",
+    "ProtocolValidated",
+    "StoredUnverified",
+    "VerifiedLeastPrivilege",
+    "RightsAdmissionPending",
+    "RuntimeVerificationPending",
+    "ActiveScoped",
+    "RefreshRequired",
+    "RotationPending",
+    "RevocationUnconfirmed",
+    "IndeterminateRemoteState",
+    "CleanupRequired",
+    "Blocked"
+  ],
+  "acceptance_criteria": [
+    {
+      "id": "T19A-AC-01",
+      "requirement": "Every provider surface has a versioned evidence-backed capability record with setup, human boundary, authority, verifier, rate, rights, lifecycle, source digests, and refresh trigger; runtime metadata can only narrow it.",
+      "evidence": "Catalog/config schema and focused invariant evidence for all ten surfaces.",
+      "blocking_scope": "all_activation",
+      "source_ids": [
+        "DOC-001",
+        "DOC-011",
+        "DOC-019",
+        "DOC-021",
+        "DOC-026",
+        "DOC-030",
+        "DOC-031",
+        "PAPER-005"
+      ],
+      "basis_type": "external_evidence_derived_engineering_requirement"
+    },
+    {
+      "id": "T19A-AC-02",
+      "requirement": "Expose five distinct setup modes and hide or mark unsupported provider modes; no generic library may create a provider capability.",
+      "evidence": "End-to-end service, CLI, and portal state evidence.",
+      "blocking_scope": "affected_capability",
+      "source_ids": [
+        "PAPER-001",
+        "PAPER-002",
+        "PAPER-003",
+        "PAPER-005"
+      ],
+      "basis_type": "external_evidence_derived_engineering_requirement"
+    },
+    {
+      "id": "T19A-AC-03",
+      "requirement": "Provider-controlled steps use durable UserActionRequired/resume with exact official deep link and permissions; cancellation cannot loop or fabricate completion.",
+      "evidence": "Focused manual, browser, and device state-transition evidence.",
+      "blocking_scope": "credentialed_onboarding",
+      "source_ids": [
+        "DOC-002",
+        "DOC-013",
+        "DOC-021",
+        "DOC-027",
+        "PAPER-001",
+        "PAPER-002"
+      ],
+      "basis_type": "external_evidence_derived_engineering_requirement"
+    },
+    {
+      "id": "T19A-AC-04",
+      "requirement": "Coinbase public asks for no secret; private requires view and expected portfolio and rejects trade, transfer, and receive.",
+      "evidence": "Bounded authorized permission evidence with redacted audit.",
+      "blocking_scope": "coinbase_private",
+      "source_ids": [
+        "DOC-001",
+        "DOC-002",
+        "DOC-003",
+        "DOC-004"
+      ],
+      "basis_type": "external_evidence_derived_engineering_requirement"
+    },
+    {
+      "id": "T19A-AC-05",
+      "requirement": "Kraken public asks for no secret; private enforces an exact query-only key-info profile and redacts sensitive response fields.",
+      "evidence": "Bounded authorized key-info evidence and exact permission comparison.",
+      "blocking_scope": "kraken_private",
+      "source_ids": [
+        "DOC-011",
+        "DOC-012",
+        "DOC-013",
+        "DOC-014"
+      ],
+      "basis_type": "external_evidence_derived_engineering_requirement"
+    },
+    {
+      "id": "T19A-AC-06",
+      "requirement": "SEC uses no credential, declared User-Agent identity/contact, one aggregate limiter at or below current 10/s, semantic probe, and scoped EDGAR rights lineage.",
+      "evidence": "Known-CIK/accession smoke, limiter evidence, and rights record.",
+      "blocking_scope": "sec",
+      "source_ids": [
+        "DOC-019",
+        "DOC-020"
+      ],
+      "basis_type": "external_evidence_derived_engineering_requirement"
+    },
+    {
+      "id": "T19A-AC-07",
+      "requirement": "FRED cannot activate persistence, modeling, export, or AI-facing use without qualified scope-bound rights admission and required permissions; a valid key never bypasses the gate.",
+      "evidence": "Service-boundary denial evidence, rights schema, and refreshed terms digest.",
+      "blocking_scope": "fred_alfred",
+      "source_ids": [
+        "DOC-021",
+        "DOC-022",
+        "DOC-023",
+        "DOC-024",
+        "DOC-025",
+        "DOC-FRED-RT-001"
+      ],
+      "basis_type": "external_evidence_derived_engineering_requirement"
+    },
+    {
+      "id": "T19A-AC-08",
+      "requirement": "BLS v1 enforces all lower-tier limits. BLS v2 requires human registration/key import, enforces higher-tier limits, tracks at-least-annual renewal, and never assumes anonymous v2. Both bind exact BLS provenance, access-date citation, required disclaimer, truthful representation, limit compliance, and third-party-rights boundaries.",
+      "evidence": "Exact quota and renewal policy, terms-duty record, scope rejection, and bounded semantic runtime evidence.",
+      "blocking_scope": "bls",
+      "source_ids": [
+        "DOC-026",
+        "DOC-027",
+        "DOC-028",
+        "DOC-029"
+      ],
+      "basis_type": "external_evidence_derived_engineering_requirement"
+    },
+    {
+      "id": "T19A-AC-09",
+      "requirement": "Treasury XML validates bounded anonymous XML and remains rights-blocked; Fiscal Data validates anonymous response metadata and binds license to exact dataset provenance.",
+      "evidence": "Two bounded smokes and distinct rights records.",
+      "blocking_scope": "treasury",
+      "source_ids": [
+        "DOC-030",
+        "DOC-031"
+      ],
+      "basis_type": "external_evidence_derived_engineering_requirement"
+    },
+    {
+      "id": "T19A-AC-10",
+      "requirement": "Native OAuth cannot enable without provider public-client, redirect, issuer/endpoints, PKCE S256, scope, and refresh-replay admission; it uses external browser and one exact callback consumption.",
+      "evidence": "Focused protocol state tests and provider capability fixture.",
+      "blocking_scope": "oauth",
+      "source_ids": [
+        "PAPER-001",
+        "PAPER-005",
+        "PAPER-006"
+      ],
+      "basis_type": "external_evidence_derived_engineering_requirement"
+    },
+    {
+      "id": "T19A-AC-11",
+      "requirement": "Device flow cannot enable without provider support and honors interval, default, slow_down, timeout backoff, expiry, cancellation, explicit restart, and durable redaction.",
+      "evidence": "Deterministic protocol-state and redaction evidence.",
+      "blocking_scope": "device_flow",
+      "source_ids": [
+        "PAPER-002",
+        "PAPER-005",
+        "PAPER-006"
+      ],
+      "basis_type": "external_evidence_derived_engineering_requirement"
+    },
+    {
+      "id": "T19A-AC-12",
+      "requirement": "DCR/RFC7592 remains disabled without exact provider support; mutating timeout becomes indeterminate; registration credentials go directly to secure storage; UI never calls DCR account creation.",
+      "evidence": "Capability gate, reconciliation, secret routing, and terminology review.",
+      "blocking_scope": "dcr",
+      "source_ids": [
+        "PAPER-003",
+        "PAPER-004",
+        "PAPER-005"
+      ],
+      "basis_type": "external_evidence_derived_engineering_requirement"
+    },
+    {
+      "id": "T19A-AC-13",
+      "requirement": "Apple, Windows, and Secret Service backends provide exact CRUD, probe, prompt/cancel/deadline, and typed failures without flattening platform states.",
+      "evidence": "Focused validation on every claimed OS/backend including locked and headless states.",
+      "blocking_scope": "platform_secret_activation",
+      "source_ids": [
+        "DOC-032",
+        "DOC-033",
+        "DOC-034",
+        "DOC-035",
+        "DOC-036",
+        "DOC-038"
+      ],
+      "basis_type": "external_evidence_derived_engineering_requirement"
+    },
+    {
+      "id": "T19A-AC-14",
+      "requirement": "Independently admit the existing market-squawk-platform::secrets vault for Argon2id, XChaCha20-Poly1305, key custody, capability confinement, crash consistency, generations, rotation/recovery, corruption, migration/backup, rollback, permissions, and no plaintext fallback; invent a replacement only after documented failure.",
+      "evidence": "Exact-commit code/design review, focused format/invariant tests, fault injection, migration fixture, and threat-model decision.",
+      "blocking_scope": "encrypted_fallback_claim",
+      "source_ids": [],
+      "context_note": "Repository implementation context, not externally validated evidence.",
+      "basis_type": "project_context_existing_implementation_admission"
+    },
+    {
+      "id": "T19A-AC-15",
+      "requirement": "Only opaque SecretRef and non-secret metadata may enter catalog/log/artifact/MCP; all credential and one-time authorization material is excluded.",
+      "evidence": "Targeted success/failure persistence, logging, audit, and MCP inspection.",
+      "blocking_scope": "all_credentials",
+      "source_ids": [
+        "DOC-032",
+        "DOC-035",
+        "DOC-038"
+      ],
+      "basis_type": "external_evidence_derived_engineering_requirement"
+    },
+    {
+      "id": "T19A-AC-16",
+      "requirement": "Store/catalog activation is generation-bound and crash-recoverable with exact selectors and orphan reconciliation.",
+      "evidence": "Fault injection at each boundary and idempotent restart evidence.",
+      "blocking_scope": "all_durable_credentials",
+      "source_ids": [
+        "DOC-033",
+        "DOC-036",
+        "DOC-038"
+      ],
+      "basis_type": "external_evidence_derived_engineering_requirement"
+    },
+    {
+      "id": "T19A-AC-17",
+      "requirement": "Permission verification records requested versus observed authority and required bindings; missing or excess authority fails closed.",
+      "evidence": "Focused exact, missing, excess, mismatch, expiry, and semantic-error cases.",
+      "blocking_scope": "credential_activation",
+      "source_ids": [
+        "DOC-004",
+        "DOC-014",
+        "DOC-024",
+        "DOC-028",
+        "PAPER-005",
+        "PAPER-006"
+      ],
+      "basis_type": "external_evidence_derived_engineering_requirement"
+    },
+    {
+      "id": "T19A-AC-18",
+      "requirement": "Rotation/revocation separates replacement, verification, cutover, remote result, local deletion, retirement, and cleanup; local delete is never shown as confirmed remote revoke.",
+      "evidence": "State-machine and crash-recovery evidence for overlapping and revoke-first orders.",
+      "blocking_scope": "credential_lifecycle",
+      "source_ids": [
+        "DOC-002",
+        "DOC-006",
+        "DOC-010",
+        "DOC-012",
+        "DOC-017",
+        "PAPER-004",
+        "PAPER-006",
+        "PAPER-007"
+      ],
+      "basis_type": "external_evidence_derived_engineering_requirement"
+    },
+    {
+      "id": "T19A-AC-19",
+      "requirement": "Every browser, device, provider, prompt/store, and cleanup operation has one owner, monotonic deadline, cancellation, terminal state, and bounded retry; cancellation cannot erase indeterminate side effects.",
+      "evidence": "Focused cancellation/deadline tests and no orphan worker/listener evidence.",
+      "blocking_scope": "all_operations",
+      "source_ids": [
+        "PAPER-001",
+        "PAPER-002",
+        "PAPER-003",
+        "PAPER-004",
+        "PAPER-007",
+        "DOC-032",
+        "DOC-035",
+        "DOC-038"
+      ],
+      "basis_type": "external_evidence_derived_engineering_requirement"
+    },
+    {
+      "id": "T19A-AC-20",
+      "requirement": "Audit records actor, opaque IDs/generations, revisions, human boundary, non-secret authority summary, deadlines, timestamps, and lifecycle results without secret material or echoing raw errors.",
+      "evidence": "Redaction evidence on success, failure, cancellation, and provider-error paths.",
+      "blocking_scope": "all_operations",
+      "source_ids": [
+        "DOC-032",
+        "DOC-035",
+        "DOC-038",
+        "PAPER-006"
+      ],
+      "basis_type": "external_evidence_derived_engineering_requirement"
+    },
+    {
+      "id": "T19A-AC-21",
+      "requirement": "Rate policy is provider/product/protocol/endpoint/version specific, enforces every dimension, treats unknown conservatively, and refreshes on 429 or evidence change. Separately, the Market Squawk project requires heartbeat/connection health never to masquerade as market-data freshness.",
+      "evidence": "Policy fixtures and bounded runtime observations; no unlimited default.",
+      "blocking_scope": "provider_calls",
+      "source_ids": [
+        "DOC-007",
+        "DOC-016",
+        "DOC-020",
+        "DOC-024",
+        "DOC-026",
+        "DOC-030",
+        "DOC-031"
+      ],
+      "basis_type": "mixed_external_rate_evidence_and_project_architecture_requirement",
+      "project_requirement_note": "The heartbeat-versus-market-freshness clause is internal project architecture, not externally established by provider pages."
+    },
+    {
+      "id": "T19A-AC-22",
+      "requirement": "Rights admission binds exact source/surface/dataset/version, terms digest/time, operations, retention, derivatives, modeling/export/redistribution, attribution, third-party rights, reviewer, and refresh trigger. BLS preserves affirmative secondary-use evidence and its duties; network success cannot bypass any rights decision.",
+      "evidence": "Rights registry and service-boundary evidence for FRED hard denial, scoped BLS admission/duties, Treasury XML and exchange unknowns, and Fiscal Data provenance.",
+      "blocking_scope": "persistence_modeling_export",
+      "source_ids": [
+        "DOC-009",
+        "DOC-020",
+        "DOC-025",
+        "DOC-029",
+        "DOC-030",
+        "DOC-031"
+      ],
+      "basis_type": "external_evidence_derived_engineering_requirement"
+    },
+    {
+      "id": "T19A-AC-23",
+      "requirement": "Separately authorized bounded runtime smokes prove every claimed provider and OS-backend capability; deterministic default tests remain offline.",
+      "evidence": "Exact-commit, time-bound, redacted semantic smoke artifacts.",
+      "blocking_scope": "release_claim",
+      "source_ids": [
+        "DOC-001",
+        "DOC-011",
+        "DOC-019",
+        "DOC-026",
+        "DOC-030",
+        "DOC-031",
+        "DOC-032",
+        "DOC-035",
+        "DOC-038"
+      ],
+      "basis_type": "external_evidence_derived_engineering_requirement"
+    },
+    {
+      "id": "T19A-AC-24",
+      "requirement": "Onboarding, OAuth, MCP, catalog, persistence, and secure-store work stays outside the live event-to-action path; no consumer can use authority below ActiveScoped.",
+      "evidence": "Architecture trace and focused authority-boundary evidence.",
+      "blocking_scope": "whole_product_safety",
+      "source_ids": [],
+      "basis_type": "project_architecture_and_authority_requirement",
+      "project_requirement_note": "Hot-path exclusion and ActiveScoped authority are Market Squawk requirements; external sources neither establish nor replace them."
+    }
+  ],
+  "conflicts": [
+    {
+      "id": "FINAL-CF-001",
+      "description": "BLS newer FAQ requires v2 registration while older examples omit a key.",
+      "resolution": "Require the key and treat anonymous v2 as unknown.",
+      "source_ids": [
+        "DOC-026",
+        "DOC-028"
+      ]
+    },
+    {
+      "id": "FINAL-CF-002",
+      "description": "Fiscal Data says no token is required while its 403 description mentions an invalid API key.",
+      "resolution": "Do not invent a key; monitor bounded anonymous behavior.",
+      "source_ids": [
+        "DOC-031"
+      ]
+    },
+    {
+      "id": "FINAL-CF-003",
+      "description": "SEC API and filing delays describe distinct paths and are not service-level guarantees.",
+      "resolution": "Track endpoint class and observed freshness separately.",
+      "source_ids": [
+        "DOC-019",
+        "DOC-020"
+      ]
+    },
+    {
+      "id": "FINAL-CF-004",
+      "description": "FRED short permission summaries cannot override broader storage, AI/ML, attribution, and third-party content terms.",
+      "resolution": "Keep durable use blocked pending qualified scope-specific admission.",
+      "source_ids": [
+        "DOC-025"
+      ]
+    },
+    {
+      "id": "FINAL-CF-005",
+      "description": "Exact OAuth redirects and variable native loopback ports appear to conflict.",
+      "resolution": "Only the registered literal-loopback port may vary; every other component remains exact.",
+      "source_ids": [
+        "PAPER-001",
+        "PAPER-006"
+      ]
+    },
+    {
+      "id": "FINAL-CF-006",
+      "description": "Credential Manager local-machine persistence and DPAPI CRYPTPROTECT_LOCAL_MACHINE have different access semantics.",
+      "resolution": "Use same-user persistence and reject the broader DPAPI flag as the per-user default.",
+      "source_ids": [
+        "DOC-035",
+        "DOC-037"
+      ]
+    },
+    {
+      "id": "FINAL-CF-007",
+      "description": "BLS affirmative secondary-use language coexists with attribution/disclaimer, truthful-representation, limit-compliance, and third-party-rights duties.",
+      "resolution": "Bind both permission signal and duties to exact BLS provenance and requested operations; do not represent BLS as a pure rights non-finding or a blanket grant.",
+      "source_ids": [
+        "DOC-029"
+      ]
+    }
+  ],
+  "gaps": [
+    {
+      "id": "FINAL-GAP-001",
+      "severity": "release_blocking",
+      "description": "FRED qualified rights resolution and any required written permissions."
+    },
+    {
+      "id": "FINAL-GAP-002",
+      "severity": "durable_use_blocking",
+      "description": "Coinbase/Kraken surface-specific storage, modeling, and reuse rights evidence."
+    },
+    {
+      "id": "FINAL-GAP-003",
+      "severity": "durable_use_blocking",
+      "description": "Treasury XML feed-specific rights evidence; BLS uses outside the scoped official terms/provenance record require separate admission."
+    },
+    {
+      "id": "FINAL-GAP-004",
+      "severity": "encrypted_fallback_claim_blocking",
+      "description": "Independent admission of the existing market-squawk-platform::secrets vault at the candidate commit."
+    },
+    {
+      "id": "FINAL-GAP-005",
+      "severity": "provider_capability_blocking",
+      "description": "Exact provider OAuth, device, DCR, introspection, revocation, and refresh replay support where requested."
+    },
+    {
+      "id": "FINAL-GAP-006",
+      "severity": "release_evidence",
+      "description": "Bounded provider and supported-platform runtime smokes."
+    },
+    {
+      "id": "FINAL-GAP-007",
+      "severity": "product_policy",
+      "description": "Measured browser, provider, prompt, store, and cleanup deadlines."
+    }
+  ],
+  "explicit_non_findings": [
+    "No official evidence establishes universal automatic provider account or personal API-key creation.",
+    "No generally available retail Coinbase/Kraken device flow or DCR capability is admitted.",
+    "No universal zero-fee commitment is established for every Coinbase/Kraken activity or private account.",
+    "No provider or platform runtime behavior was observed during this research.",
+    "No source proves local deletion remotely revokes a provider credential.",
+    "No cross-platform secure-store equivalence is established.",
+    "No external source validates the existing Market Squawk encrypted vault implementation.",
+    "No legal conclusion is offered."
+  ],
+  "artifacts": {
+    "inputs": [
+      "reports/docs/batch-001.md",
+      "reports/docs/batch-002.md",
+      "reports/docs/batch-003.md",
+      "reports/docs/batch-004.md",
+      "reports/github/batch-001.md",
+      "reports/papers/batch-001.md",
+      "reports/reputable-sources/batch-001.md",
+      "reports/category-synthesis/docs-synthesis.md",
+      "reports/category-synthesis/github-synthesis.md",
+      "reports/category-synthesis/papers-synthesis.md",
+      "reports/category-synthesis/reputable-sources-synthesis.md"
+    ],
+    "outputs": [
+      "source-inventory.json",
+      "final-report.md",
+      "final-report.json",
+      "reports/verification/evidence-audit.md"
+    ]
+  },
+  "sources": [
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "retrieved"
+      },
+      "assigned_batch": "docs-batch-001",
+      "category": "docs",
+      "content_digest": "sha256:ff5f02fb90a3bf7b77d309190423d7c54f4217adea74745689b1ff3661f4dbc5",
+      "content_reference": "https://docs.cdp.coinbase.com/coinbase-app/advanced-trade-apis/rest-api",
+      "credibility_signals": "Published on Coinbase Developer Platform's official documentation domain for Coinbase App Advanced Trade.",
+      "digest_status": "captured",
+      "freshness_signals": "Current live documentation accessed 2026-07-22.",
+      "id": "DOC-001",
+      "priority": "P0",
+      "provider": "coinbase",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Establishes the public no-auth market-data baseline and the private endpoint authentication boundary.",
+      "source_type": "official product API documentation",
+      "status": "assigned",
+      "title": "Coinbase Advanced Trade REST API",
+      "url": "https://docs.cdp.coinbase.com/coinbase-app/advanced-trade-apis/rest-api"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "retrieved"
+      },
+      "assigned_batch": "docs-batch-001",
+      "category": "docs",
+      "content_digest": "sha256:bcc7c98da018d1f3b1fee70c59e531194d8dd16b8a9cf085709851d0a40d6fdc",
+      "content_reference": "https://docs.cdp.coinbase.com/coinbase-app/authentication-authorization/api-key-authentication",
+      "credibility_signals": "Published by Coinbase Developer Platform for Coinbase App API authentication.",
+      "digest_status": "captured",
+      "freshness_signals": "Current live documentation accessed 2026-07-22.",
+      "id": "DOC-002",
+      "priority": "P0",
+      "provider": "coinbase",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Defines human portal issuance, key/JWT use, restrictions, secure storage, and enable, regenerate, or disable lifecycle controls.",
+      "source_type": "official authentication guide",
+      "status": "assigned",
+      "title": "Coinbase API-key authentication",
+      "url": "https://docs.cdp.coinbase.com/coinbase-app/authentication-authorization/api-key-authentication"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "retrieved"
+      },
+      "assigned_batch": "docs-batch-001",
+      "category": "docs",
+      "content_digest": "sha256:f5001c6dc8f4fa17b677f46d2ec1f3a53446ac508df42927cfaf0b5517267be7",
+      "content_reference": "https://docs.cdp.coinbase.com/coinbase-app/authentication-authorization/authorization",
+      "credibility_signals": "Published by Coinbase Developer Platform for Coinbase App key permissions and OAuth scopes.",
+      "digest_status": "captured",
+      "freshness_signals": "Current live documentation accessed 2026-07-22.",
+      "id": "DOC-003",
+      "priority": "P0",
+      "provider": "coinbase",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Defines View, Trade, Transfer, and Receive key capabilities and granular OAuth scopes needed for least-privilege activation.",
+      "source_type": "official authorization guide",
+      "status": "assigned",
+      "title": "Coinbase authorization and permissions",
+      "url": "https://docs.cdp.coinbase.com/coinbase-app/authentication-authorization/authorization"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "retrieved"
+      },
+      "assigned_batch": "docs-batch-001",
+      "category": "docs",
+      "content_digest": "sha256:5fc561229765d7623c08b4d9ca7f2d7c4c5fb8dcf345057fa039ba17500e1308",
+      "content_reference": "https://docs.cdp.coinbase.com/api-reference/advanced-trade-api/rest-api/data-api/get-api-key-permissions",
+      "credibility_signals": "Coinbase-generated Advanced Trade API reference on the official CDP domain.",
+      "digest_status": "captured",
+      "freshness_signals": "Current live API reference accessed 2026-07-22.",
+      "id": "DOC-004",
+      "priority": "P0",
+      "provider": "coinbase",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Supplies the documented non-mutating key capability and portfolio verification endpoint for activation.",
+      "source_type": "official REST endpoint reference",
+      "status": "assigned",
+      "title": "Coinbase Get API Key Permissions",
+      "url": "https://docs.cdp.coinbase.com/api-reference/advanced-trade-api/rest-api/data-api/get-api-key-permissions"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "retrieved"
+      },
+      "assigned_batch": "docs-batch-001",
+      "category": "docs",
+      "content_digest": "sha256:84fcaaf3d2d3e0ca0be9a7b5f2bb23902f80a20fbf111222b58519503bc4bb2b",
+      "content_reference": "https://docs.cdp.coinbase.com/coinbase-app/oauth2-integration/overview",
+      "credibility_signals": "Published by Coinbase Developer Platform for Coinbase App delegated authorization.",
+      "digest_status": "captured",
+      "freshness_signals": "Current live documentation accessed 2026-07-22.",
+      "id": "DOC-005",
+      "priority": "P0",
+      "provider": "coinbase",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Establishes the delegated-access use case and the current approved-partner restriction on OAuth client creation.",
+      "source_type": "official OAuth product guide",
+      "status": "assigned",
+      "title": "Coinbase OAuth overview",
+      "url": "https://docs.cdp.coinbase.com/coinbase-app/oauth2-integration/overview"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "retrieved"
+      },
+      "assigned_batch": "docs-batch-001",
+      "category": "docs",
+      "content_digest": "sha256:a16cf55cb95181a6510466baa13f464eccba570e1988b025c43aeafc1382246e",
+      "content_reference": "https://docs.cdp.coinbase.com/coinbase-app/oauth2-integration/reference",
+      "credibility_signals": "Coinbase Developer Platform protocol reference for its authorization, token, refresh, and revoke endpoints.",
+      "digest_status": "captured",
+      "freshness_signals": "Current live documentation accessed 2026-07-22.",
+      "id": "DOC-006",
+      "priority": "P0",
+      "provider": "coinbase",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Defines unavoidable browser authorization and the supported refresh-token rotation and token-revocation mechanics.",
+      "source_type": "official OAuth endpoint reference",
+      "status": "assigned",
+      "title": "Coinbase OAuth reference",
+      "url": "https://docs.cdp.coinbase.com/coinbase-app/oauth2-integration/reference"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "retrieved"
+      },
+      "assigned_batch": "docs-batch-001",
+      "category": "docs",
+      "content_digest": "sha256:dd7801d857f7a64b11966b30a4b6e7085af2cc7b04d35d00b892412a87935a73",
+      "content_reference": "https://docs.cdp.coinbase.com/coinbase-app/api-architecture/rate-limiting",
+      "credibility_signals": "Coinbase Developer Platform documentation for Coinbase App request limits.",
+      "digest_status": "captured",
+      "freshness_signals": "Current live documentation accessed 2026-07-22.",
+      "id": "DOC-007",
+      "priority": "P0",
+      "provider": "coinbase",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Provides the documented default API-key or OAuth-user quota and HTTP 429 behavior.",
+      "source_type": "official API policy documentation",
+      "status": "assigned",
+      "title": "Coinbase App rate limiting",
+      "url": "https://docs.cdp.coinbase.com/coinbase-app/api-architecture/rate-limiting"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "retrieved"
+      },
+      "assigned_batch": "docs-batch-001",
+      "category": "docs",
+      "content_digest": "sha256:007259a94d1210df8f9fc1309ebed9bcf1339e049c6fa0368ab76232941fe10e",
+      "content_reference": "https://docs.cdp.coinbase.com/get-started/build-with-ai/cdp-for-agents",
+      "credibility_signals": "Published by Coinbase Developer Platform for its official CDP command-line tooling.",
+      "digest_status": "captured",
+      "freshness_signals": "Current live documentation accessed 2026-07-22.",
+      "id": "DOC-008",
+      "priority": "P1",
+      "provider": "coinbase",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Shows that the official CLI imports and verifies a manually created portal key rather than issuing one and preserves the CDP-versus-Coinbase-App product boundary.",
+      "source_type": "official CLI and agent integration guide",
+      "status": "assigned",
+      "title": "CDP for agents and official CLI",
+      "url": "https://docs.cdp.coinbase.com/get-started/build-with-ai/cdp-for-agents"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "official_source_reviewed_body_digest_unavailable"
+      },
+      "assigned_batch": "docs-batch-001",
+      "category": "docs",
+      "content_digest": null,
+      "content_reference": "official page states last modified 2026-06-23; automated response body unavailable",
+      "credibility_signals": "Published on Coinbase's official legal domain as the governing Developer Platform terms.",
+      "digest_status": "reference_only_refresh_required",
+      "freshness": "last modified 2026-06-23",
+      "freshness_signals": "Page states last modified 2026-06-23; accessed 2026-07-22.",
+      "id": "DOC-009",
+      "priority": "P0",
+      "provider": "coinbase",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Governs API-limit changes, limit circumvention, platform access, and other release-relevant obligations.",
+      "source_type": "official provider legal terms",
+      "status": "assigned",
+      "title": "Coinbase Developer Platform Terms of Service",
+      "url": "https://www.coinbase.com/legal/developer-platform/terms-of-service"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "official_source_reviewed_body_digest_unavailable"
+      },
+      "assigned_batch": "docs-batch-001",
+      "category": "docs",
+      "content_digest": null,
+      "content_reference": "official Coinbase Exchange help route accessed 2026-07-22; automated response body unavailable",
+      "credibility_signals": "Published by Coinbase Help and explicitly scoped to Coinbase Exchange.",
+      "digest_status": "reference_only_refresh_required",
+      "freshness_signals": "Current official help page accessed 2026-07-22; product-scope caveat retained.",
+      "id": "DOC-010",
+      "priority": "P1",
+      "provider": "coinbase",
+      "retrieval_date": "2026-07-22",
+      "scope_note": "Coinbase Exchange",
+      "selection_rationale": "Documents manual revoke, replacement creation, least privilege, one-time secret capture, update, and verification steps without assuming identical behavior for every Coinbase product.",
+      "source_type": "official provider support procedure",
+      "status": "assigned",
+      "title": "Coinbase Exchange API-key rotation",
+      "url": "https://help.coinbase.com/en/exchange/managing-my-account/how-to-rotate-your-api-key"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "retrieved"
+      },
+      "assigned_batch": "docs-batch-001",
+      "category": "docs",
+      "content_digest": "sha256:9b5184839e2d0cec569d70326a669bad6f95712fb0b450d37d791505e90ab45a",
+      "content_reference": "https://docs.kraken.com/exchange/guides/overview",
+      "credibility_signals": "Published by Kraken Developers for its Exchange public and private workflows.",
+      "digest_status": "captured",
+      "freshness_signals": "Current redesigned documentation accessed 2026-07-22.",
+      "id": "DOC-011",
+      "priority": "P0",
+      "provider": "kraken",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Establishes that Spot public REST and WebSocket market data need no credential while account and order workflows are private.",
+      "source_type": "official product API guide",
+      "status": "assigned",
+      "title": "Kraken Exchange overview",
+      "url": "https://docs.kraken.com/exchange/guides/overview"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "retrieved"
+      },
+      "assigned_batch": "docs-batch-001",
+      "category": "docs",
+      "content_digest": "sha256:716e6de0a72f00a312cfd627fb34fafabe055024949fdf1b356792251ba7a6e1",
+      "content_reference": "https://docs.kraken.com/exchange/guides/rest/api-keys",
+      "credibility_signals": "Published by Kraken Developers for Exchange REST API-key use and security.",
+      "digest_status": "captured",
+      "freshness_signals": "Current redesigned documentation accessed 2026-07-22.",
+      "id": "DOC-012",
+      "priority": "P0",
+      "provider": "kraken",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Defines use-case permissions, IP allowlisting, purpose-bound keys, minimum privilege, WebSocket token prerequisites, and rotation guidance.",
+      "source_type": "official authentication and permission guide",
+      "status": "assigned",
+      "title": "Kraken REST API keys",
+      "url": "https://docs.kraken.com/exchange/guides/rest/api-keys"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "retrieved"
+      },
+      "assigned_batch": "docs-batch-002",
+      "category": "docs",
+      "content_digest": "sha256:0e1bf258b4e3a74076278ab43028169d21bc9800ff607722b697fa2541759e1f",
+      "content_reference": "https://support.kraken.com/articles/360000919966-how-to-create-an-api-key",
+      "credibility_signals": "Published on Kraken's official support domain for Kraken Pro account holders.",
+      "digest_status": "captured",
+      "freshness": "updated 2025-08-08",
+      "freshness_signals": "Page states last updated 2025-08-08; accessed 2026-07-22.",
+      "id": "DOC-013",
+      "priority": "P0",
+      "provider": "kraken",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Proves the human settings flow and documents permissions, IP whitelist, expiration, time bounds, 2FA, and secret storage.",
+      "source_type": "official provider support procedure",
+      "status": "assigned",
+      "title": "Kraken API-key creation",
+      "url": "https://support.kraken.com/articles/360000919966-how-to-create-an-api-key"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "retrieved"
+      },
+      "assigned_batch": "docs-batch-002",
+      "category": "docs",
+      "content_digest": "sha256:e958a460ad24cf8cd0038197d4d23b4e33583ab2e961c8f83ddd01250e33198d",
+      "content_reference": "https://docs.kraken.com/home/cli",
+      "credibility_signals": "Published by Kraken Developers for Kraken's official single-binary CLI.",
+      "digest_status": "captured",
+      "freshness_signals": "Current 2026 documentation accessed 2026-07-22.",
+      "id": "DOC-015",
+      "priority": "P0",
+      "provider": "kraken",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Distinguishes no-auth public and paper operation from interactive setup that consumes a key generated in Kraken Settings.",
+      "source_type": "official command-line tool documentation",
+      "status": "assigned",
+      "title": "Kraken CLI",
+      "url": "https://docs.kraken.com/home/cli"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "retrieved"
+      },
+      "assigned_batch": "docs-batch-002",
+      "category": "docs",
+      "content_digest": "sha256:992b64006433607f0d783c3073def777755fe586a4abfda76579adfdd4ef833b",
+      "content_reference": "https://support.kraken.com/articles/206548367-what-are-the-api-rate-limits-",
+      "credibility_signals": "Published by Kraken Support for public and private API limits.",
+      "digest_status": "captured",
+      "freshness": "updated 2026-03-27",
+      "freshness_signals": "Page states last updated 2026-03-27; accessed 2026-07-22.",
+      "id": "DOC-016",
+      "priority": "P0",
+      "provider": "kraken",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Supplies current public IP/currency-pair guidance and the separate private limit model.",
+      "source_type": "official provider support policy",
+      "status": "assigned",
+      "title": "Kraken API rate limits",
+      "url": "https://support.kraken.com/articles/206548367-what-are-the-api-rate-limits-"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "retrieved"
+      },
+      "assigned_batch": "docs-batch-002",
+      "category": "docs",
+      "content_digest": "sha256:1e6de1293a44f6fc3c0d4ef1d5a02676c4d3f337ec8e2852837365048e00059f",
+      "content_reference": "https://support.kraken.com/articles/api-key-security",
+      "credibility_signals": "Published by Kraken Support specifically for API-key security and lifecycle.",
+      "digest_status": "captured",
+      "freshness": "updated 2025-03-31",
+      "freshness_signals": "Page states last updated 2025-03-31; accessed 2026-07-22.",
+      "id": "DOC-017",
+      "priority": "P0",
+      "provider": "kraken",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Covers encrypted storage, minimum permissions, 2FA, regular replacement, deletion of obsolete keys, and provider revocation conditions.",
+      "source_type": "official provider security guidance",
+      "status": "assigned",
+      "title": "Kraken API-key security",
+      "url": "https://support.kraken.com/articles/api-key-security"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "retrieved"
+      },
+      "assigned_batch": "docs-batch-002",
+      "category": "docs",
+      "content_digest": "sha256:3b3133e22426ee2d3f10cbec94a19a7a0b72b207a88e8c92a215e3b4b04d4029",
+      "content_reference": "https://docs.kraken.com/llms.txt",
+      "credibility_signals": "Served directly by docs.kraken.com and maps Kraken's Exchange, Institutional, Embed, and developer-tooling surfaces.",
+      "digest_status": "captured",
+      "freshness_signals": "Live index accessed 2026-07-22 and describes the current Kraken documentation structure.",
+      "id": "DOC-018",
+      "priority": "P1",
+      "provider": "kraken",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Records the product boundary between retail Exchange and OAuth-capable Embed, whose access requires B2B partner approval.",
+      "source_type": "official provider-published documentation index",
+      "status": "assigned",
+      "title": "Kraken Developers documentation index",
+      "url": "https://docs.kraken.com/llms.txt"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "official_source_reviewed_body_digest_unavailable"
+      },
+      "assigned_batch": "docs-batch-002",
+      "category": "docs",
+      "content_digest": null,
+      "content_reference": "official SEC page states last reviewed or updated 2025-04-08; automated response body unavailable",
+      "credibility_signals": "SEC .gov primary documentation for data.sec.gov submissions, XBRL, and bulk public data.",
+      "digest_status": "reference_only_refresh_required",
+      "freshness": "last reviewed or updated 2025-04-08",
+      "freshness_signals": "Page states last reviewed 2025-04-08; accessed 2026-07-22.",
+      "id": "DOC-019",
+      "priority": "P0",
+      "provider": "sec",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Establishes no-auth public-data access, update and bulk patterns, and the CORS limitation.",
+      "source_type": "official U.S. government API documentation",
+      "status": "assigned",
+      "title": "SEC EDGAR Application Programming Interfaces",
+      "url": "https://www.sec.gov/search-filings/edgar-application-programming-interfaces"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "official_source_reviewed_body_digest_unavailable"
+      },
+      "assigned_batch": "docs-batch-002",
+      "category": "docs",
+      "content_digest": null,
+      "content_reference": "official SEC page states last reviewed or updated 2024-08-23; automated response body unavailable",
+      "credibility_signals": "SEC .gov primary policy page for automated access to SEC public content.",
+      "digest_status": "reference_only_refresh_required",
+      "freshness": "last reviewed or updated 2024-08-23",
+      "freshness_signals": "Page states last reviewed 2024-08-23; current page accessed 2026-07-22.",
+      "id": "DOC-020",
+      "priority": "P0",
+      "provider": "sec",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Defines the declared User-Agent requirement, 10 requests-per-second ceiling, programmatic access, and public-data reuse.",
+      "source_type": "official U.S. government access policy",
+      "status": "assigned",
+      "title": "SEC Webmaster Frequently Asked Questions",
+      "url": "https://www.sec.gov/about/webmaster-frequently-asked-questions"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "retrieved"
+      },
+      "assigned_batch": "docs-batch-002",
+      "category": "docs",
+      "content_digest": "sha256:bce730baa12ec581bd7b303441a2f0f04b2c73131b78908b79188845db3cd8eb",
+      "content_reference": "https://fred.stlouisfed.org/docs/api/api_key.html",
+      "credibility_signals": "FRED primary documentation published by the Federal Reserve Bank of St. Louis.",
+      "digest_status": "captured",
+      "freshness_signals": "Current live documentation accessed 2026-07-22.",
+      "id": "DOC-021",
+      "priority": "P0",
+      "provider": "fred_alfred",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Defines the account and per-application key requirement, key form, and v1 query-parameter transport.",
+      "source_type": "official Federal Reserve Bank API documentation",
+      "status": "assigned",
+      "title": "FRED API keys for v1",
+      "url": "https://fred.stlouisfed.org/docs/api/api_key.html"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "retrieved"
+      },
+      "assigned_batch": "docs-batch-002",
+      "category": "docs",
+      "content_digest": "sha256:11582d634017d4c46969d4218b68720c8d87fbb88437edf756566476a4865e8d",
+      "content_reference": "https://fred.stlouisfed.org/docs/api/fred/v2/api_key.html",
+      "credibility_signals": "FRED v2 primary API documentation published by the Federal Reserve Bank of St. Louis.",
+      "digest_status": "captured",
+      "freshness_signals": "Current v2 documentation accessed 2026-07-22.",
+      "id": "DOC-022",
+      "priority": "P0",
+      "provider": "fred_alfred",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Defines the v2 key requirement and Bearer Authorization transport that avoids query-string secret exposure.",
+      "source_type": "official Federal Reserve Bank API documentation",
+      "status": "assigned",
+      "title": "FRED API v2 keys",
+      "url": "https://fred.stlouisfed.org/docs/api/fred/v2/api_key.html"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "retrieved"
+      },
+      "assigned_batch": "docs-batch-002",
+      "category": "docs",
+      "content_digest": "sha256:4d32507f27801991c9bf41f00c9199477adb29ed0f27ddd7de492fe580e3ebe1",
+      "content_reference": "https://fredhelp.stlouisfed.org/fred/account/fred-account-features/register/",
+      "credibility_signals": "Federal Reserve Bank of St. Louis FRED Help page for account registration and features.",
+      "digest_status": "captured",
+      "freshness_signals": "Current live help page accessed 2026-07-22.",
+      "id": "DOC-023",
+      "priority": "P0",
+      "provider": "fred_alfred",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Confirms that the account is free, API access is an account feature, and registration is an unavoidable human web step.",
+      "source_type": "official provider account help",
+      "status": "assigned",
+      "title": "Register for a FRED account",
+      "url": "https://fredhelp.stlouisfed.org/fred/account/fred-account-features/register/"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "retrieved"
+      },
+      "assigned_batch": "docs-batch-002",
+      "category": "docs",
+      "content_digest": "sha256:58642bc2ee502e2d6e354ee06f81ed34a49f56423bef331ae812dca1b25cf098",
+      "content_reference": "https://fred.stlouisfed.org/docs/api/fred/errors.html",
+      "credibility_signals": "FRED primary error documentation published by the Federal Reserve Bank of St. Louis.",
+      "digest_status": "captured",
+      "freshness_signals": "Current live documentation accessed 2026-07-22.",
+      "id": "DOC-024",
+      "priority": "P1",
+      "provider": "fred_alfred",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Supports a bounded read-based key validation flow and records missing or invalid key and HTTP 429 behavior without inventing an unpublished numeric quota.",
+      "source_type": "official API error reference",
+      "status": "assigned",
+      "title": "FRED API errors",
+      "url": "https://fred.stlouisfed.org/docs/api/fred/errors.html"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "retrieved"
+      },
+      "assigned_batch": "docs-batch-002",
+      "category": "docs",
+      "content_digest": "sha256:ba8d74f007b17f4e7732a3cd24c3824b63baf856e5e7548d557a506b6a3dd0f4",
+      "content_reference": "https://fred.stlouisfed.org/legal/",
+      "credibility_signals": "Federal Reserve Bank of St. Louis legal page governing FRED accounts, API, and content.",
+      "digest_status": "captured",
+      "freshness_signals": "Current terms page accessed 2026-07-22.",
+      "id": "DOC-025",
+      "priority": "P0",
+      "provider": "fred_alfred",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Contains release-critical restrictions on storage, caching, databases, AI or ML development and training, attribution, third-party rights, and request limits.",
+      "source_type": "official provider legal terms",
+      "status": "assigned",
+      "title": "FRED Terms of Use, Privacy Policy, and Disclaimers",
+      "url": "https://fred.stlouisfed.org/legal/"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "retrieved"
+      },
+      "assigned_batch": "docs-batch-003",
+      "category": "docs",
+      "content_digest": "sha256:73139bde2145a81cdffecb19eb07d031a97a6baaf541ab70f7f471914b885d51",
+      "content_reference": "https://fred.stlouisfed.org/docs/api/fred/realtime_period.html",
+      "credibility_signals": "FRED primary API documentation published by the Federal Reserve Bank of St. Louis.",
+      "digest_status": "captured",
+      "freshness_signals": "Current live documentation accessed 2026-07-22.",
+      "id": "DOC-FRED-RT-001",
+      "priority": "P0",
+      "provider": "fred_alfred",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Defines real-time period and vintage semantics required for FRED/ALFRED point-in-time admission.",
+      "source_type": "official API time-semantics documentation",
+      "status": "assigned",
+      "title": "FRED API Real-Time Periods",
+      "url": "https://fred.stlouisfed.org/docs/api/fred/realtime_period.html"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "official_source_reviewed_body_digest_unavailable"
+      },
+      "assigned_batch": "docs-batch-003",
+      "category": "docs",
+      "content_digest": null,
+      "content_reference": "official BLS page states last modified 2023-08-30; automated response body unavailable",
+      "credibility_signals": "Bureau of Labor Statistics .gov primary developer documentation.",
+      "digest_status": "reference_only_refresh_required",
+      "freshness": "last modified 2023-08-30",
+      "freshness_signals": "Page states last modified 2023-08-30; current page accessed 2026-07-22.",
+      "id": "DOC-026",
+      "priority": "P0",
+      "provider": "bls",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Defines no-key v1, optional-key v2, exact quotas, CAPTCHA and email issuance, annual renewal, and HTTP 429 behavior.",
+      "source_type": "official U.S. government API documentation",
+      "status": "assigned",
+      "title": "BLS API Frequently Asked Questions",
+      "url": "https://www.bls.gov/developers/api_FAQs.htm"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "retrieved"
+      },
+      "assigned_batch": "docs-batch-003",
+      "category": "docs",
+      "content_digest": "sha256:ab7e2321273f44d685cdedade97e99b1946fa3219a3f21d0ae56e242f0bdc4d9",
+      "content_reference": "https://data.bls.gov/registrationEngine/",
+      "credibility_signals": "Live registration page hosted on BLS's official data subdomain.",
+      "digest_status": "captured",
+      "freshness_signals": "Live form inspected without submission on 2026-07-22.",
+      "id": "DOC-027",
+      "priority": "P0",
+      "provider": "bls",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Proves organization and email collection, CAPTCHA, and terms acceptance as non-automatable human boundaries.",
+      "source_type": "official U.S. government registration form",
+      "status": "assigned",
+      "title": "BLS API registration",
+      "url": "https://data.bls.gov/registrationEngine/"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "official_source_reviewed_body_digest_unavailable"
+      },
+      "assigned_batch": "docs-batch-003",
+      "category": "docs",
+      "content_digest": null,
+      "content_reference": "official BLS page states last modified 2020-10-05; automated response body unavailable",
+      "credibility_signals": "BLS .gov primary request-schema and example documentation.",
+      "digest_status": "reference_only_refresh_required",
+      "freshness": "last modified 2020-10-05",
+      "freshness_signals": "Current live documentation accessed 2026-07-22.",
+      "id": "DOC-028",
+      "priority": "P0",
+      "provider": "bls",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Defines the registrationkey request field needed for a minimal non-mutating activation probe.",
+      "source_type": "official API request reference",
+      "status": "assigned",
+      "title": "BLS API v2 signatures",
+      "url": "https://www.bls.gov/developers/api_signature_v2.htm"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "official_source_reviewed_body_digest_unavailable"
+      },
+      "assigned_batch": "docs-batch-003",
+      "category": "docs",
+      "content_digest": null,
+      "content_reference": "official BLS page states last modified 2023-08-30; full terms text independently retrieved through web index on 2026-07-22",
+      "credibility_signals": "BLS .gov primary terms page governing Public Data API use.",
+      "digest_status": "reference_only_refresh_required",
+      "freshness": "last modified 2023-08-30",
+      "freshness_signals": "Page states last modified 2023-08-30; current page accessed 2026-07-22.",
+      "id": "DOC-029",
+      "priority": "P0",
+      "provider": "bls",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Defines attribution and disclaimer context, false-representation limits, and enforcement against usage-limit circumvention.",
+      "source_type": "official U.S. government API terms",
+      "status": "assigned",
+      "title": "BLS Public Data API Terms of Service",
+      "url": "https://www.bls.gov/developers/termsOfService.htm"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "retrieved"
+      },
+      "assigned_batch": "docs-batch-003",
+      "category": "docs",
+      "content_digest": "sha256:1edb22d56d8cf67e1e534f746d761b500a6e70eec2544bc8f4e7ae81e638337f",
+      "content_reference": "https://home.treasury.gov/treasury-daily-interest-rate-xml-feed",
+      "credibility_signals": "U.S. Department of the Treasury .gov primary documentation for official daily rate feeds.",
+      "digest_status": "captured",
+      "freshness_signals": "Current page and 2026 feed context accessed 2026-07-22.",
+      "id": "DOC-030",
+      "priority": "P0",
+      "provider": "us_treasury",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Establishes direct no-auth access to Treasury rate data with filters, pagination, and documented response behavior.",
+      "source_type": "official U.S. government data-feed documentation",
+      "status": "assigned",
+      "title": "Treasury Daily Interest Rate XML Feed",
+      "url": "https://home.treasury.gov/treasury-daily-interest-rate-xml-feed"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "retrieved"
+      },
+      "assigned_batch": "docs-batch-003",
+      "category": "docs",
+      "content_digest": "sha256:a9fd1abe4638164a711642b93c43606c47d3029b5d52679335a46f88ddd4afc2",
+      "content_reference": "https://fiscaldata.treasury.gov/api-documentation/",
+      "credibility_signals": "U.S. Treasury Fiscal Data primary documentation for its open API and licensing.",
+      "digest_status": "captured",
+      "freshness_signals": "Current live documentation accessed 2026-07-22.",
+      "id": "DOC-031",
+      "priority": "P0",
+      "provider": "us_treasury",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Explicitly establishes no account or token requirement, GET and JSON integration, and unrestricted reuse licensing while exposing a response-code inconsistency to test.",
+      "source_type": "official U.S. government API documentation",
+      "status": "assigned",
+      "title": "Fiscal Data API Documentation",
+      "url": "https://fiscaldata.treasury.gov/api-documentation/"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "retrieved"
+      },
+      "assigned_batch": "docs-batch-003",
+      "category": "docs",
+      "content_digest": "sha256:dd694406aa8ef7c470f0abf4e8aa2b1b8468859e18c7bf32d5d950cfda3c3aee",
+      "content_reference": "https://www.rfc-editor.org/info/rfc8252/",
+      "credibility_signals": "IETF consensus Best Current Practice for native-app OAuth; published by the RFC Editor.",
+      "digest_status": "captured",
+      "freshness_signals": "Published October 2017; remains the native-app BCP; retrieved 2026-07-22.",
+      "id": "PAPER-001",
+      "notes": "Reclassified from papers discovery to official documentation because an RFC is a normative standard, not an academic paper.",
+      "priority": "P0",
+      "provider": "ietf",
+      "published": "2017-10",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Defines the portal's browser and PKCE boundary for installed applications.",
+      "source_type": "IETF Best Current Practice",
+      "status": "assigned",
+      "title": "RFC 8252: OAuth 2.0 for Native Apps",
+      "url": "https://www.rfc-editor.org/info/rfc8252/"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "retrieved"
+      },
+      "assigned_batch": "docs-batch-003",
+      "category": "docs",
+      "content_digest": "sha256:527ead0617bfe85811ac0b61ffb4e0eb34580a45e2394f77f6d0159d92c35113",
+      "content_reference": "https://www.rfc-editor.org/info/rfc8628/",
+      "credibility_signals": "IETF standards-track protocol published by the RFC Editor.",
+      "digest_status": "captured",
+      "freshness_signals": "Published August 2019; retrieved 2026-07-22.",
+      "id": "PAPER-002",
+      "notes": "Reclassified from papers discovery to official documentation because an RFC is a normative standard, not an academic paper.",
+      "priority": "P0",
+      "provider": "ietf",
+      "published": "2019-08",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Defines the only standard browser-on-another-device flow relevant to a local CLI/portal.",
+      "source_type": "IETF Proposed Standard",
+      "status": "assigned",
+      "title": "RFC 8628: OAuth 2.0 Device Authorization Grant",
+      "url": "https://www.rfc-editor.org/info/rfc8628/"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "retrieved"
+      },
+      "assigned_batch": "docs-batch-003",
+      "category": "docs",
+      "content_digest": "sha256:ae058c7b388217ddb8c7ff7ce888d3cc9998a44b0e7bd29a3f2843bd6590dcfe",
+      "content_reference": "https://www.rfc-editor.org/info/rfc7591/",
+      "credibility_signals": "IETF standards-track protocol published by the RFC Editor.",
+      "digest_status": "captured",
+      "freshness_signals": "Published July 2015; retrieved 2026-07-22.",
+      "id": "PAPER-003",
+      "notes": "Reclassified from papers discovery to official documentation because an RFC is a normative standard, not an academic paper.",
+      "priority": "P0",
+      "provider": "ietf",
+      "published": "2015-07",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Defines what OAuth client-registration automation can and cannot accomplish.",
+      "source_type": "IETF Proposed Standard",
+      "status": "assigned",
+      "title": "RFC 7591: OAuth 2.0 Dynamic Client Registration",
+      "url": "https://www.rfc-editor.org/info/rfc7591/"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "retrieved"
+      },
+      "assigned_batch": "docs-batch-003",
+      "category": "docs",
+      "content_digest": "sha256:32d6a50d066db0160f2e669bd0a51aae3c8591a274968a488b1dfc426864e0cc",
+      "content_reference": "https://www.rfc-editor.org/info/rfc7592/",
+      "credibility_signals": "IETF-published Experimental protocol for registration management.",
+      "digest_status": "captured",
+      "freshness_signals": "Published July 2015; retrieved 2026-07-22.",
+      "id": "PAPER-004",
+      "notes": "Reclassified from papers discovery to official documentation because an RFC is a normative standard, not an academic paper.",
+      "priority": "P1",
+      "provider": "ietf",
+      "published": "2015-07",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Covers lifecycle operations after dynamic client registration, including deletion and rotation.",
+      "source_type": "IETF Experimental RFC",
+      "status": "assigned",
+      "title": "RFC 7592: OAuth 2.0 Dynamic Client Registration Management",
+      "url": "https://www.rfc-editor.org/info/rfc7592/"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "retrieved"
+      },
+      "assigned_batch": "docs-batch-003",
+      "category": "docs",
+      "content_digest": "sha256:8fe9ad47f0e417ac345da0967a27c95a01d12206b0ca1c83ec2b8b07532f4e17",
+      "content_reference": "https://www.rfc-editor.org/info/rfc8414/",
+      "credibility_signals": "IETF standards-track discovery protocol published by the RFC Editor.",
+      "digest_status": "captured",
+      "freshness_signals": "Published June 2018; retrieved 2026-07-22.",
+      "id": "PAPER-005",
+      "notes": "Reclassified from papers discovery to official documentation because an RFC is a normative standard, not an academic paper.",
+      "priority": "P0",
+      "provider": "ietf",
+      "published": "2018-06",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Defines authenticated discovery inputs for issuer, endpoints, capabilities, and optional registration endpoint.",
+      "source_type": "IETF Proposed Standard",
+      "status": "assigned",
+      "title": "RFC 8414: OAuth 2.0 Authorization Server Metadata",
+      "url": "https://www.rfc-editor.org/info/rfc8414/"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "retrieved"
+      },
+      "assigned_batch": "docs-batch-004",
+      "category": "docs",
+      "content_digest": "sha256:c8c34ddfb82c249ef9cacde956ef019839eed222a8f79798fa49883f1a85b27c",
+      "content_reference": "https://www.rfc-editor.org/info/rfc9700/",
+      "credibility_signals": "Current IETF OAuth security BCP; consensus-reviewed and published by the RFC Editor.",
+      "digest_status": "captured",
+      "freshness_signals": "Published January 2025; retrieved 2026-07-22.",
+      "id": "PAPER-006",
+      "notes": "Reclassified from papers discovery to official documentation because an RFC is a normative standard, not an academic paper.",
+      "priority": "P0",
+      "provider": "ietf",
+      "published": "2025-01",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Current baseline for OAuth threat mitigations and deprecated modes.",
+      "source_type": "IETF Best Current Practice",
+      "status": "assigned",
+      "title": "RFC 9700 / BCP 240: Best Current Practice for OAuth 2.0 Security",
+      "url": "https://www.rfc-editor.org/info/rfc9700/"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "retrieved"
+      },
+      "assigned_batch": "docs-batch-004",
+      "category": "docs",
+      "content_digest": "sha256:4785789cd4e4ec70f9b19468fa3c171942ff916ade1d03cfd4353d17f9755d72",
+      "content_reference": "https://www.rfc-editor.org/info/rfc7009/",
+      "credibility_signals": "IETF standards-track token lifecycle protocol published by the RFC Editor.",
+      "digest_status": "captured",
+      "freshness_signals": "Published August 2013; retrieved 2026-07-22.",
+      "id": "PAPER-007",
+      "notes": "Reclassified from papers discovery to official documentation because an RFC is a normative standard, not an academic paper.",
+      "priority": "P0",
+      "provider": "ietf",
+      "published": "2013-08",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Defines the remote credential closeout operation required for complete deactivation.",
+      "source_type": "IETF Proposed Standard",
+      "status": "assigned",
+      "title": "RFC 7009: OAuth 2.0 Token Revocation",
+      "url": "https://www.rfc-editor.org/info/rfc7009/"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "retrieved"
+      },
+      "assigned_batch": "docs-batch-004",
+      "category": "docs",
+      "content_digest": "sha256:dd7e564b0fe2dfa98eac66166deab0e828888936f4d726ea900f1207c85e5fa1",
+      "content_reference": "https://developer.apple.com/documentation/security/keychain-services/",
+      "credibility_signals": "Apple Developer primary documentation for Security framework Keychain Services.",
+      "digest_status": "captured",
+      "freshness_signals": "Current platform documentation accessed 2026-07-22.",
+      "id": "DOC-032",
+      "priority": "P0",
+      "provider": "apple",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Defines the native encrypted storage and retrieval boundary for small provider secrets on Apple platforms.",
+      "source_type": "official OS security API documentation",
+      "status": "assigned",
+      "title": "Apple Keychain Services",
+      "url": "https://developer.apple.com/documentation/security/keychain-services/"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "retrieved"
+      },
+      "assigned_batch": "docs-batch-004",
+      "category": "docs",
+      "content_digest": "sha256:fb5610fa504b3ed301ff0ec660f05b988fe85a5e41b9f1589dbd5886ce0a9803",
+      "content_reference": "https://developer.apple.com/documentation/security/updating-and-deleting-keychain-items",
+      "credibility_signals": "Apple Developer primary Security framework guidance.",
+      "digest_status": "captured",
+      "freshness_signals": "Current platform documentation accessed 2026-07-22.",
+      "id": "DOC-033",
+      "priority": "P0",
+      "provider": "apple",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Supplies native replacement and deletion operations needed for two-phase activation, rotation, and local revocation.",
+      "source_type": "official OS security API documentation",
+      "status": "assigned",
+      "title": "Apple updating and deleting keychain items",
+      "url": "https://developer.apple.com/documentation/security/updating-and-deleting-keychain-items"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "retrieved"
+      },
+      "assigned_batch": "docs-batch-004",
+      "category": "docs",
+      "content_digest": "sha256:21bdf0660f12f40fc727c0be555096844519cf74d2eb4b763c55ae77e328d3b7",
+      "content_reference": "https://developer.apple.com/documentation/security/restricting-keychain-item-accessibility",
+      "credibility_signals": "Apple Developer primary Security framework access-control guidance.",
+      "digest_status": "captured",
+      "freshness_signals": "Current platform documentation accessed 2026-07-22.",
+      "id": "DOC-034",
+      "priority": "P0",
+      "provider": "apple",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Defines device-lock, passcode, device-only, and user-presence tradeoffs for local secret activation.",
+      "source_type": "official OS security API documentation",
+      "status": "assigned",
+      "title": "Apple keychain-item accessibility",
+      "url": "https://developer.apple.com/documentation/security/restricting-keychain-item-accessibility"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "retrieved"
+      },
+      "assigned_batch": "docs-batch-004",
+      "category": "docs",
+      "content_digest": "sha256:eb836dce268369c83a6586d5b4f2648e87c81651f4919c48c798853c3d1fde8a",
+      "content_reference": "https://learn.microsoft.com/en-us/windows/win32/secauthn/credentials-management",
+      "credibility_signals": "Microsoft Learn primary Win32 documentation for Credential Management APIs.",
+      "digest_status": "captured",
+      "freshness_signals": "Current platform documentation accessed 2026-07-22.",
+      "id": "DOC-035",
+      "priority": "P0",
+      "provider": "microsoft",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Establishes user-logon-session native credential storage and the Windows integration family.",
+      "source_type": "official OS security API documentation",
+      "status": "assigned",
+      "title": "Windows Credentials Management",
+      "url": "https://learn.microsoft.com/en-us/windows/win32/secauthn/credentials-management"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "retrieved"
+      },
+      "assigned_batch": "docs-batch-004",
+      "category": "docs",
+      "content_digest": "sha256:863cebde0f355fe7d35b50ef276ad23187b11f345739c212391de3ba01524452",
+      "content_reference": "https://learn.microsoft.com/en-us/windows/win32/api/wincred/nf-wincred-credwritew",
+      "credibility_signals": "Microsoft Learn primary Win32 Credential Management API reference; the selected page links the same official API family.",
+      "digest_status": "captured",
+      "freshness_signals": "Current platform documentation accessed 2026-07-22.",
+      "id": "DOC-036",
+      "priority": "P0",
+      "provider": "microsoft",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Supplies native create or update semantics; companion CredDeleteW supplies deletion for rotation and local revocation.",
+      "source_type": "official OS security API reference",
+      "status": "assigned",
+      "title": "Windows CredWriteW and CredDeleteW API family",
+      "url": "https://learn.microsoft.com/en-us/windows/win32/api/wincred/nf-wincred-credwritew"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "retrieved"
+      },
+      "assigned_batch": "docs-batch-004",
+      "category": "docs",
+      "content_digest": "sha256:a1aabe32b51967684d40e04358204eabc72611260cf47aff31c7f54935477391",
+      "content_reference": "https://learn.microsoft.com/en-us/windows/win32/api/dpapi/nf-dpapi-cryptprotectdata",
+      "credibility_signals": "Microsoft Learn primary Win32 Data Protection API reference.",
+      "digest_status": "captured",
+      "freshness": "updated 2026-05-15",
+      "freshness_signals": "Page states updated 2026-05-15; accessed 2026-07-22.",
+      "id": "DOC-037",
+      "priority": "P1",
+      "provider": "microsoft",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Documents same-user and normally same-machine protection plus the broader LOCAL_MACHINE flag that must not become the per-user default.",
+      "source_type": "official OS cryptographic API reference",
+      "status": "assigned",
+      "title": "Windows CryptProtectData",
+      "url": "https://learn.microsoft.com/en-us/windows/win32/api/dpapi/nf-dpapi-cryptprotectdata"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "retrieved"
+      },
+      "assigned_batch": "docs-batch-004",
+      "category": "docs",
+      "content_digest": "sha256:836c1151617235b4b145d6af78c0131cc546facc16d75301c3005fe0e39f81e9",
+      "content_reference": "https://specifications.freedesktop.org/secret-service/latest-single/",
+      "credibility_signals": "Primary specification published by freedesktop.org for desktop Secret Service implementations.",
+      "digest_status": "captured",
+      "freshness_signals": "Version 0.2 DRAFT states publication date 2026-04-08; accessed 2026-07-22.",
+      "id": "DOC-038",
+      "priority": "P0",
+      "provider": "freedesktop",
+      "published": "2026-04-08",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Defines Linux secret items, sessions, locks and prompts, create or replace and delete operations, and the rule that attributes are not secret.",
+      "source_type": "official desktop interoperability specification",
+      "status": "assigned",
+      "title": "freedesktop Secret Service API 0.2 DRAFT",
+      "url": "https://specifications.freedesktop.org/secret-service/latest-single/"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "official_source_reviewed_body_digest_unavailable"
+      },
+      "assigned_batch": "docs-batch-004",
+      "category": "docs",
+      "content_digest": null,
+      "content_reference": "canonical Kraken API-reference route accessed 2026-07-22; automated response body unavailable",
+      "credibility_signals": "Kraken-generated Spot REST API reference on its official developer domain.",
+      "digest_status": "reference_only_refresh_required",
+      "freshness_signals": "Current live API reference accessed 2026-07-22.",
+      "id": "DOC-014",
+      "notes": "",
+      "priority": "P0",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Provides read-only verification of key identity, permissions, restrictions, expiry, IP allowlist, and last use.",
+      "source_type": "official REST endpoint reference",
+      "status": "assigned",
+      "title": "Kraken Get API Key Info",
+      "url": "https://docs.kraken.com/api/docs/rest-api/get-api-key-info"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "retrieved"
+      },
+      "assigned_batch": "github-batch-001",
+      "category": "github",
+      "content_digest": "git:efe3f165dd297c85fff11473dbf586f2d39fbf86",
+      "content_reference": "https://github.com/cli/cli",
+      "credibility_signals": "Official GitHub CLI organization repository; MIT licensed; mature cross-platform authentication implementation.",
+      "digest_status": "captured",
+      "freshness_signals": "Public GitHub metadata showed activity through 2026-07-22; retrieved 2026-07-22.",
+      "id": "GH-001",
+      "notes": "",
+      "priority": "P0",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Provides a production reference for device/web OAuth orchestration, multiple accounts, secure-store references, logout, and bounded keyring calls.",
+      "source_type": "official open-source CLI implementation",
+      "status": "assigned",
+      "title": "GitHub CLI",
+      "url": "https://github.com/cli/cli"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "retrieved"
+      },
+      "assigned_batch": "github-batch-001",
+      "category": "github",
+      "content_digest": "git:2fe99b867b710265e3273b48da7513d91e6ef8eb",
+      "content_reference": "https://github.com/git-ecosystem/git-credential-manager",
+      "credibility_signals": "Maintained under the Git ecosystem organization; broad production use; repository README states MIT licensing.",
+      "digest_status": "captured",
+      "freshness_signals": "Public GitHub metadata showed activity through 2026-07-20 and a 2026 release; retrieved 2026-07-22.",
+      "id": "GH-003",
+      "notes": "",
+      "priority": "P0",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Documents real cross-platform credential-store behavior and browser/device authorization choices, including Linux and headless limitations.",
+      "source_type": "official open-source credential manager",
+      "status": "assigned",
+      "title": "Git Credential Manager",
+      "url": "https://github.com/git-ecosystem/git-credential-manager"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "retrieved"
+      },
+      "assigned_batch": "github-batch-001",
+      "category": "github",
+      "content_digest": "git:17054f05971a4e8eabbcd5970ad37bcfa7e61048",
+      "content_reference": "https://github.com/open-source-cooperative/keyring-rs",
+      "credibility_signals": "Maintained upstream project with native macOS, Windows, and Unix-store backends; Apache-2.0/MIT licensing.",
+      "digest_status": "captured",
+      "freshness_signals": "Public GitHub metadata showed activity through 2026-07-20; retrieved 2026-07-22.",
+      "id": "GH-004",
+      "notes": "",
+      "priority": "P0",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Most directly relevant Rust integration candidate for native secure-store set/get/delete operations without introducing a mandatory service.",
+      "source_type": "upstream Rust secure-storage library",
+      "status": "assigned",
+      "title": "keyring-rs",
+      "url": "https://github.com/open-source-cooperative/keyring-rs"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "retrieved"
+      },
+      "assigned_batch": "github-batch-001",
+      "category": "github",
+      "content_digest": "git:72ce74401c26eb4dc85dcbfde587bbcfc149e3ae",
+      "content_reference": "https://github.com/ramosbugs/oauth2-rs",
+      "credibility_signals": "Mature typed Rust OAuth library; Apache-2.0/MIT licensing; supports major OAuth protocol extensions.",
+      "digest_status": "captured",
+      "freshness_signals": "Public GitHub metadata showed 2026 activity; reviewed source revision 72ce74401c26eb4dc85dcbfde587bbcfc149e3ae on 2026-07-22.",
+      "id": "GH-005",
+      "notes": "",
+      "priority": "P0",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Provides Rust-native authorization-code/PKCE, device authorization, introspection, and revocation primitives suitable for an adapter policy layer.",
+      "source_type": "upstream Rust OAuth 2.0 library",
+      "status": "assigned",
+      "title": "oauth2-rs",
+      "url": "https://github.com/ramosbugs/oauth2-rs"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "retrieved"
+      },
+      "assigned_batch": "github-batch-001",
+      "category": "github",
+      "content_digest": "git:aa32814cea70913a70c9909693a7abd762963e83",
+      "content_reference": "https://github.com/krakenfx/kraken-cli",
+      "credibility_signals": "Published by the official Kraken organization; MIT licensed; Rust CLI for public, private, and paper workflows.",
+      "digest_status": "captured",
+      "freshness_signals": "Public GitHub metadata showed activity through 2026-04-20; retrieved 2026-07-22.",
+      "id": "GH-008",
+      "notes": "",
+      "priority": "P0",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Shows the provider-supported public/paper no-key path and the exact boundary where a human-created private key is consumed.",
+      "source_type": "official provider CLI",
+      "status": "assigned",
+      "title": "Kraken CLI",
+      "url": "https://github.com/krakenfx/kraken-cli"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "retrieved"
+      },
+      "assigned_batch": "papers-batch-001",
+      "category": "papers",
+      "content_digest": "sha256:cb0b1305b74a26a4048b81edb38a4e605aaa57d0c77b415963603dcaf42e2304",
+      "content_reference": "https://arxiv.org/abs/1601.01229",
+      "credibility_signals": "Original work by Daniel Fett, Ralf Küsters, and Guido Schmitz with a formal web model and proofs.",
+      "digest_status": "captured",
+      "freshness_signals": "Published 2016; foundational attack/proof analysis; retrieved 2026-07-22.",
+      "id": "PAPER-009",
+      "notes": "",
+      "priority": "P0",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Provides rigorous evidence that individually familiar OAuth checks are insufficient without complete participant and session binding.",
+      "source_type": "original formal security research paper",
+      "status": "assigned",
+      "title": "A Comprehensive Formal Security Analysis of OAuth 2.0",
+      "url": "https://arxiv.org/abs/1601.01229"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "retrieved"
+      },
+      "assigned_batch": "papers-batch-001",
+      "category": "papers",
+      "content_digest": "sha256:dc49427ae309538058b8b4d90a6f462cdb2eb6dafaf542f568668fa9c3e5a998",
+      "content_reference": "https://www.usenix.org/conference/usenixsecurity25/presentation/luo-kaixuan",
+      "credibility_signals": "Published in the USENIX Security 2025 technical program with original empirical platform analysis.",
+      "digest_status": "captured",
+      "freshness_signals": "Published 2025; retrieved 2026-07-22.",
+      "id": "PAPER-010",
+      "notes": "",
+      "priority": "P0",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Directly studies multi-provider integration platforms, the closest architectural analogue to the portal.",
+      "source_type": "peer-reviewed original security research",
+      "status": "assigned",
+      "title": "Universal Cross-app Attacks: Exploiting and Securing OAuth 2.0 in Integration Platforms",
+      "url": "https://www.usenix.org/conference/usenixsecurity25/presentation/luo-kaixuan"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "retrieved"
+      },
+      "assigned_batch": "papers-batch-001",
+      "category": "papers",
+      "content_digest": "sha256:f70cb733eb918e02a29f413cd6029a3c064a13a27c3fe5ec84d6c14f3c3786d9",
+      "content_reference": "https://arxiv.org/abs/1901.11520",
+      "credibility_signals": "Original formal analysis by Daniel Fett, Pedram Hosseyni, and Ralf Küsters of a financial-grade authorization profile.",
+      "digest_status": "captured",
+      "freshness_signals": "Published 2019; retrieved 2026-07-22.",
+      "id": "PAPER-012",
+      "notes": "",
+      "priority": "P1",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Financial-domain evidence that a high-assurance profile must be adopted as a coherent protocol, not as isolated controls.",
+      "source_type": "original formal security research paper",
+      "status": "assigned",
+      "title": "An Extensive Formal Security Analysis of the OpenID Financial-grade API",
+      "url": "https://arxiv.org/abs/1901.11520"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "retrieved"
+      },
+      "assigned_batch": "reputable-sources-batch-001",
+      "category": "reputable-sources",
+      "content_digest": "sha256:4d3ff0743659793968ddca06b7d385abdd8cbe99a627a626ca7fc5ff05908874",
+      "content_reference": "https://cheatsheetseries.owasp.org/cheatsheets/OAuth2_Cheat_Sheet.html",
+      "credibility_signals": "OWASP-maintained security guidance with explicit references to current OAuth Security BCP material.",
+      "digest_status": "captured",
+      "freshness_signals": "Live page accessed 2026-07-22; content incorporates RFC 9700-era recommendations and deprecates the implicit grant.",
+      "id": "REP-001",
+      "notes": "",
+      "priority": "P0",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Directly informs the portal's native-client OAuth boundary without relying on a commercial identity vendor.",
+      "source_type": "vendor-neutral application-security guidance",
+      "status": "assigned",
+      "title": "OWASP OAuth2 Cheat Sheet",
+      "url": "https://cheatsheetseries.owasp.org/cheatsheets/OAuth2_Cheat_Sheet.html"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "retrieved"
+      },
+      "assigned_batch": "reputable-sources-batch-001",
+      "category": "reputable-sources",
+      "content_digest": "sha256:f9e9ea50d18ffef83280b3a50037d3f2e26bc13a82d380272fe854c568e903a0",
+      "content_reference": "https://www.ncsc.gov.uk/collection/securing-http-based-apis/2-api-authentication-and-authorisation",
+      "credibility_signals": "NCSC-authored guidance dedicated to HTTP API authentication, delegated access, authorization, OAuth, and OIDC.",
+      "digest_status": "captured",
+      "freshness_signals": "Published and reviewed 2025-04-03; accessed 2026-07-22.",
+      "id": "REP-002",
+      "notes": "",
+      "priority": "P0",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Directly addresses API onboarding and delegated user access in a vendor-neutral way.",
+      "source_type": "public-sector cyber-security guidance",
+      "status": "assigned",
+      "title": "API authentication and authorisation",
+      "url": "https://www.ncsc.gov.uk/collection/securing-http-based-apis/2-api-authentication-and-authorisation"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "retrieved"
+      },
+      "assigned_batch": "reputable-sources-batch-001",
+      "category": "reputable-sources",
+      "content_digest": "sha256:5b064ed64cdf2e2a060cfc8b714d49ad845ed6cc98822bf6332824b29ddf3f7f",
+      "content_reference": "https://pages.nist.gov/800-63-4/sp800-63b.html",
+      "credibility_signals": "Final NIST Special Publication with documented authorship, revision history, and DOI.",
+      "digest_status": "captured",
+      "freshness_signals": "Finalized 2025-07-31; supersedes SP 800-63B; accessed 2026-07-22.",
+      "id": "REP-003",
+      "notes": "",
+      "priority": "P0",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Provides current, high-assurance context for user presence, local key storage, and lifecycle invalidation.",
+      "source_type": "final U.S. government digital-identity standard",
+      "status": "assigned",
+      "title": "NIST SP 800-63B-4: Digital Identity Guidelines — Authentication and Authenticator Management",
+      "url": "https://pages.nist.gov/800-63-4/sp800-63b.html"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "retrieved"
+      },
+      "assigned_batch": "reputable-sources-batch-001",
+      "category": "reputable-sources",
+      "content_digest": "sha256:16d92ef515246ac3739692afe7bdf80a36e07daa9d532afb53eeb5e0f6eea61c",
+      "content_reference": "https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html",
+      "credibility_signals": "OWASP-maintained guidance covering API keys, access control, auditing, lifecycle, incident response, and multi-provider differences.",
+      "digest_status": "captured",
+      "freshness_signals": "Live page accessed 2026-07-22.",
+      "id": "REP-004",
+      "notes": "",
+      "priority": "P0",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Most direct cross-provider source for the full API-credential lifecycle.",
+      "source_type": "vendor-neutral secrets-management guidance",
+      "status": "assigned",
+      "title": "OWASP Secrets Management Cheat Sheet",
+      "url": "https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "retrieved"
+      },
+      "assigned_batch": "reputable-sources-batch-001",
+      "category": "reputable-sources",
+      "content_digest": "sha256:76f039b34217acf024b1a44b51374ac11d41e90dda5d228ec3cc4615c357b672",
+      "content_reference": "https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html",
+      "credibility_signals": "OWASP-maintained guidance on security events, event attributes, legal opt-ins, log integrity, and sensitive-data exclusion.",
+      "digest_status": "captured",
+      "freshness_signals": "Live page accessed 2026-07-22.",
+      "id": "REP-007",
+      "notes": "",
+      "priority": "P0",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Directly defines the portal's non-secret audit boundary.",
+      "source_type": "vendor-neutral security-logging guidance",
+      "status": "assigned",
+      "title": "OWASP Logging Cheat Sheet",
+      "url": "https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html"
+    },
+    {
+      "access": {
+        "date": "2026-07-22",
+        "status": "retrieved"
+      },
+      "assigned_batch": "reputable-sources-batch-001",
+      "category": "reputable-sources",
+      "content_digest": "sha256:6c1d357253a0dc79b8f8ac308e820788d342983459fb8aaa7727556009957784",
+      "content_reference": "https://nvlpubs.nist.gov/nistpubs/SpecialPublications/1500-18/NIST.SP.1500-18r2.html",
+      "credibility_signals": "Final NIST Special Publication with named authors, DOI, and stakeholder-derived version 2.0 framework.",
+      "digest_status": "captured",
+      "freshness_signals": "Published 2024-02; accessed 2026-07-22.",
+      "id": "REP-009",
+      "notes": "",
+      "priority": "P0",
+      "retrieval_date": "2026-07-22",
+      "selection_rationale": "Most direct reputable source for a structured data-rights and terms-admission record.",
+      "source_type": "U.S. government research-data governance framework",
+      "status": "assigned",
+      "title": "NIST Research Data Framework (RDaF) Version 2.0, SP 1500-18r2",
+      "url": "https://nvlpubs.nist.gov/nistpubs/SpecialPublications/1500-18/NIST.SP.1500-18r2.html"
+    }
+  ],
+  "category_evidence": [
+    {
+      "category": "github",
+      "classification": "exact_commit_ecosystem_facts_and_engineering_inference",
+      "finding": "Maintained implementation candidates exist for typed Rust OAuth and native stores; repository evidence does not establish provider capability, rights, or release fitness.",
+      "source_ids": [
+        "GH-001",
+        "GH-003",
+        "GH-004",
+        "GH-005",
+        "GH-008"
+      ]
+    },
+    {
+      "category": "papers",
+      "classification": "formal_and_empirical_results_plus_engineering_inference",
+      "finding": "OAuth composition and cross-app differentiation require complete participant and transaction binding; the papers do not directly evaluate Market Squawk or provider support.",
+      "source_ids": [
+        "PAPER-009",
+        "PAPER-010",
+        "PAPER-012"
+      ]
+    },
+    {
+      "category": "reputable-sources",
+      "classification": "vendor_neutral_guidance_and_scoped_engineering_inference",
+      "finding": "Least privilege, no provider-password collection, complete secret lifecycle, redacted audit, user intent, and provenance-specific rights records are cross-provider controls; guidance does not override provider terms.",
+      "source_ids": [
+        "REP-001",
+        "REP-002",
+        "REP-003",
+        "REP-004",
+        "REP-007",
+        "REP-009"
+      ]
+    }
+  ]
+}

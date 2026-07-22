@@ -48,6 +48,9 @@ decisions can be audited without relying on conversation history.
 - [Rust development/test storage hardening](2026-07-21-rust-dev-test-storage-hardening.md) — Cargo
   profile, worktree-local output, test-target, CI cache, and measurement decisions for the storage
   hardening plan.
+- [Zero-fee provider onboarding and local secret activation](2026-07-22-zero-fee-provider-onboarding/final-report.md)
+  — capability-gated provider setup, human authorization boundaries, rights admission, credential
+  lifecycle, 24 implementation acceptance criteria, and the complete source/evidence package.
 
 ## Evidence policy
 
