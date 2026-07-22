@@ -3297,6 +3297,7 @@ dependencies = [
  "market-squawk-adapter-kraken",
  "market-squawk-adapter-paper",
  "market-squawk-analytics",
+ "market-squawk-backtesting",
  "market-squawk-data",
  "market-squawk-domain",
  "market-squawk-execution",
@@ -3530,6 +3531,31 @@ dependencies = [
  "rust_decimal",
  "sha2",
  "thiserror",
+]
+
+[[package]]
+name = "market-squawk-backtesting"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "cap-fs-ext",
+ "cap-std",
+ "market-squawk-analytics",
+ "market-squawk-data",
+ "market-squawk-domain",
+ "market-squawk-execution",
+ "market-squawk-modeling",
+ "market-squawk-portfolio",
+ "rand_chacha 0.9.0",
+ "rand_core 0.9.5",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "tokio-util",
+ "uuid",
 ]
 
 [[package]]
