@@ -444,11 +444,15 @@ remediation rereview found no remaining Critical or Important blocker. The close
 issue `#23` and its Project 5 item were marked Done, and the 2.9 GiB feature target, clean worktree,
 merged local branch, and remote metadata were removed.
 
-## 2026-07-22 Quarter 3 integrated candidate
+## 2026-07-22 Quarter 3 remediation state
 
-Tasks 13–18 are integrated on `release/market-squawk-v0.1.0` at candidate head `daf183a`. This is an
-integration state, not checkpoint approval: one grouped exact-head review and one clean
-`CARGO_INCREMENTAL=0 ./scripts/verify.sh` run remain before Tasks 15 and 17 close.
+Tasks 13–18 reached pre-status capability-code head `daf183a` on
+`release/market-squawk-v0.1.0`. That durable milestone is not the moving release-branch head; obtain
+the current exact head from Git and pull request `#26`. The frozen grouped review rejected the
+candidate with thirteen Important findings. Three focused remediation lanes are active for model
+runtime, backtest/portfolio experiment integrity, and fair-value evidence authority. Closure review,
+integration, one grouped exact-head rereview, and one clean
+`CARGO_INCREMENTAL=0 ./scripts/verify.sh` run remain before Tasks 15 and 17 can close.
 
 Task 15 provides required zero-service ONNX inference through the self-contained Rust
 `TractOnnxBackend`. It admits exact bounded graphs and tensors, runs through a bounded model-owned
@@ -471,11 +475,11 @@ governance, immutable artifacts and exactly one success/failure terminal. Cohort
 performance and overfitting diagnostics remain research evidence and cannot mint execution
 authority. Task 18 retains the accepted fair-value closeout above.
 
-The model lane rebased with an exact 1:1 range-diff, fast-forwarded, and closed cleanly. Its 7.1 GiB
-target, worktree and merged local branch were removed; no matching origin branch existed. Only the
-release worktree remains, `.worktrees` is empty, the three protected stashes and `bundle-backup`
+The earlier model-containment lane rebased with an exact 1:1 range-diff, fast-forwarded, and closed
+cleanly. Its 7.1 GiB target, worktree and merged local branch were removed; no matching origin branch
+existed. Three new product-named remediation worktrees are now active and must be cleaned only after
+their exact commits are accepted and integrated. The three protected stashes and `bundle-backup`
 remain. The root target remains generated cache only and must be cleaned immediately before the
-planned Quarter 3 gate. The canonical plan now defines Quarter 4 as Tasks 19, 19A and 20, preserves
-the descriptor-driven shared CLI/MCP architecture, adds the evidence-bound local onboarding portal,
-and forbids the previously proposed proliferation of redundant standalone test executables and
-checker scripts.
+planned Quarter 3 full gate. The canonical plan defines the final delivery quarter as Tasks 19, 19A
+and 20, preserves the descriptor-driven shared CLI/MCP architecture, adds the evidence-bound local
+onboarding portal, and rejects redundant standalone test executables and checker scripts.

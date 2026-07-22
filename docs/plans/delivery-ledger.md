@@ -9,9 +9,15 @@ evidence; it does not replace the README capability truth or the canonical relea
 ## Current integration state
 
 - Release branch: `release/market-squawk-v0.1.0`
-- Current integrated candidate head: `daf183a` (`fix(python): make native module the sealed package root`)
-- Quarter 3 status: Tasks 13–18 are integrated; the grouped exact-head review and single clean full
-  gate have not yet accepted the checkpoint.
+- Pre-status Quarter 3 capability-code head: `daf183a`
+  (`fix(python): make native module the sealed package root`). This is a durable milestone, not the
+  moving release-branch head.
+- Current exact integration head: obtain it from `git rev-parse HEAD` and pull request `#26`.
+  Tracked prose does not self-pin the commit that contains that prose.
+- Quarter 3 status: Tasks 13–18 are integrated, but the frozen grouped review rejected the candidate
+  with thirteen Important findings. Three focused remediation lanes are active for model runtime,
+  backtest/portfolio experiment integrity, and fair-value evidence authority. The checkpoint has
+  not been accepted and the single clean full gate has not run on the remediated exact head.
 - Task 14 accepted feature and fast-forwarded release head: `02ab5cd`
 - Task 18 release merge head: `051ee3c`; reconciled lock head: `5c34b7d`
 - Task 13 accepted feature and release head: `59ba05c`
@@ -93,9 +99,10 @@ evidence; it does not replace the README capability truth or the canonical relea
   closes. The integrated application-owned PIT backtesting service binds exact dataset partitions,
   executable/model/configuration identities, research execution assumptions, reconciled portfolio
   accounting, immutable success/failure terminals, artifacts, cohorts and overfitting diagnostics.
-- The next barrier is one grouped review of the exact integrated Quarter 3 head followed by one clean
+- The next barrier is closure review and integration of all three remediation lanes, followed by a
+  grouped review of that exact integrated Quarter 3 head and one clean
   `CARGO_INCREMENTAL=0 ./scripts/verify.sh` run. Tasks 15/17 remain open until that evidence passes;
-  focused lane gates and pre-rebase release artifacts do not substitute for the checkpoint.
+  focused lane gates and prior release artifacts do not substitute for the checkpoint.
 
 - Task 12 owner: GitHub issue `#17`, Project 5, status `Done`.
 - Exact feature and fast-forwarded release code head: `9702556`.
@@ -211,8 +218,10 @@ application size.
   `.worktrees/model-runtime-containment` worktree; deleted merged local branch
   `feature/model-runtime-containment`; confirmed no matching origin branch existed; and pruned
   worktree/remote metadata. The three protected stashes, `bundle-backup`, main/release branches and
-  Dependabot branches remain. `.worktrees` is empty.
+  Dependabot branches remain. At that closeout boundary, `.worktrees` was empty; the three active
+  Quarter 3 remediation worktrees were created afterward.
 
-The next delivery event is the frozen Quarter 3 grouped review and one exact-head full gate. If that
-passes, issues `#20` and `#22` can close and Quarter 4 Tasks 19, 19A and 20 begin. Integrated Tasks
-13–18 do not claim that the Market Squawk product release is complete.
+The next delivery event is closure review and integration of the three active Quarter 3 remediation
+lanes, then one grouped exact-head rereview and one full gate. If those pass, issues `#20` and `#22`
+can close and Tasks 19, 19A and 20 begin. Integrated Tasks 13–18 do not claim that the Market Squawk
+product release is complete.
