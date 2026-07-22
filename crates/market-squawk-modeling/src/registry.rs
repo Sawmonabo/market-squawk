@@ -95,6 +95,18 @@ impl ModelRegistry {
             .state
             .write()
             .map_err(|_| ModelRegistryError::RegistryUnavailable)?;
+        for existing in state.slots[..state.len].iter().filter_map(Option::as_ref) {
+            if existing.metadata().bundle_id() == bundle.metadata().bundle_id()
+                && existing.metadata().model_id() != bundle.metadata().model_id()
+            {
+                return Err(ModelRegistryError::BundleSeriesConflict);
+            }
+            if existing.metadata().model_id() == bundle.metadata().model_id()
+                && existing.metadata().bundle_id() != bundle.metadata().bundle_id()
+            {
+                return Err(ModelRegistryError::ModelSeriesConflict);
+            }
+        }
         let position = position(
             &state,
             bundle.metadata().bundle_id(),
@@ -242,6 +254,12 @@ pub enum ModelRegistryError {
     /// An immutable coordinate was reused with different exact bytes or model identity.
     #[error("model registry immutable generation conflicts")]
     GenerationConflict,
+    /// One bundle series was associated with more than one model identity.
+    #[error("model registry bundle series changed model identity")]
+    BundleSeriesConflict,
+    /// One model identity was associated with more than one bundle series.
+    #[error("model registry model identity changed bundle series")]
+    ModelSeriesConflict,
     /// Checked retained-byte arithmetic overflowed.
     #[error("model registry retained-byte accounting overflowed")]
     RetainedSizeOverflow,

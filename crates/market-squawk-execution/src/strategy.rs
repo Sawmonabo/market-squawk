@@ -2,10 +2,13 @@
 
 use std::num::NonZeroU16;
 
-use market_squawk_analytics::LiveFeatureView;
+use market_squawk_analytics::{FeatureScalar, LiveFeatureView};
 use market_squawk_domain::{MarketEvent, QualificationAssessmentId};
 use market_squawk_live::ShardKey;
-use market_squawk_modeling::{ModelFailure, ModelFailurePhase};
+use market_squawk_modeling::{
+    InferenceBackend, ModelFailure, ModelFailurePhase, ModelFeatureValue, ModelInput,
+    ModelInputError, ModelOutput, NativeLinearBackend,
+};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -71,6 +74,16 @@ impl StrategyNoAction {
             source_digest,
             audit_digest: hash.finalize().into(),
         }
+    }
+
+    fn from_model_failure(failure: ModelFailure) -> Self {
+        let evidence = failure.audit();
+        let phase = match evidence.phase() {
+            ModelFailurePhase::Validation => StrategyNoActionPhase::Validation,
+            ModelFailurePhase::Load => StrategyNoActionPhase::Load,
+            ModelFailurePhase::Inference => StrategyNoActionPhase::Inference,
+        };
+        Self::model(phase, evidence.source_code(), evidence.source_digest())
     }
 
     /// Returns the closed producer domain.
@@ -173,17 +186,7 @@ impl BoundedOrderIntents {
     /// Maps an exact model failure to an audited output with no order authority.
     #[must_use]
     pub fn from_model_failure(failure: ModelFailure) -> Self {
-        let evidence = failure.audit();
-        let phase = match evidence.phase() {
-            ModelFailurePhase::Validation => StrategyNoActionPhase::Validation,
-            ModelFailurePhase::Load => StrategyNoActionPhase::Load,
-            ModelFailurePhase::Inference => StrategyNoActionPhase::Inference,
-        };
-        Self::from_no_action(StrategyNoAction::model(
-            phase,
-            evidence.source_code(),
-            evidence.source_digest(),
-        ))
+        Self::from_no_action(StrategyNoAction::from_model_failure(failure))
     }
 
     /// Appends one validated authority-free intent.
@@ -276,6 +279,164 @@ pub trait Strategy: Send + std::fmt::Debug {
     fn retained_bytes(&self) -> Result<usize, StrategyError>;
 }
 
+/// Execution-owned admitted model path that produces one identity-bound result from live features.
+pub trait ModelInferencePath: Send + std::fmt::Debug {
+    /// Evaluates current allocation-free live feature state.
+    fn infer_live(&mut self, features: &dyn LiveFeatureView) -> Result<ModelOutput, ModelFailure>;
+
+    /// Returns the complete retained path charge.
+    fn retained_bytes(&self) -> Result<usize, StrategyError>;
+}
+
+/// Strategy-specific mapping applied only after successful model inference.
+pub trait ModelDecisionMapper: Send + std::fmt::Debug {
+    /// Maps a successful exact model output to bounded authority-free intents.
+    fn map(
+        &mut self,
+        context: &StrategyContext<'_>,
+        event: &MarketEvent,
+        output: &ModelOutput,
+    ) -> Result<BoundedOrderIntents, StrategyError>;
+
+    /// Returns the complete retained mapper charge.
+    fn retained_bytes(&self) -> Result<usize, StrategyError>;
+}
+
+/// Native backend plus reusable coefficient-ordered live input slots.
+#[derive(Debug)]
+pub struct NativeModelInferencePath {
+    backend: NativeLinearBackend,
+    values: Box<[ModelFeatureValue]>,
+    retained_bytes: usize,
+}
+
+impl NativeModelInferencePath {
+    /// Creates one reusable live path from an already admitted native backend.
+    pub fn try_new(backend: NativeLinearBackend) -> Result<Self, StrategyError> {
+        let values: Box<[_]> = backend
+            .metadata()
+            .features()
+            .iter()
+            .map(ModelFeatureValue::from_binding)
+            .collect();
+        let dynamic_values = std::mem::size_of::<ModelFeatureValue>()
+            .checked_mul(values.len())
+            .ok_or(StrategyError::RetainedSize)?;
+        let key_bytes = values.iter().try_fold(0usize, |total, value| {
+            total
+                .checked_add(value.key().name().len())
+                .ok_or(StrategyError::RetainedSize)
+        })?;
+        let retained_bytes = std::mem::size_of::<Self>()
+            .checked_add(backend.retained_bytes())
+            .and_then(|total| total.checked_add(dynamic_values))
+            .and_then(|total| total.checked_add(key_bytes))
+            .ok_or(StrategyError::RetainedSize)?;
+        Ok(Self {
+            backend,
+            values,
+            retained_bytes,
+        })
+    }
+}
+
+impl ModelInferencePath for NativeModelInferencePath {
+    fn infer_live(&mut self, features: &dyn LiveFeatureView) -> Result<ModelOutput, ModelFailure> {
+        for value in &mut self.values {
+            let scalar = features
+                .feature(value.key())
+                .and_then(|feature| feature.ready_value())
+                .ok_or(ModelInputError::FeatureUnavailable)?;
+            value.try_set_value(
+                model_scalar(scalar).ok_or(ModelInputError::UnsupportedFeatureScalar)?,
+            )?;
+        }
+        let input = ModelInput::try_new(self.backend.metadata(), &self.values)?;
+        self.backend.infer(&input).map_err(ModelFailure::from)
+    }
+
+    fn retained_bytes(&self) -> Result<usize, StrategyError> {
+        Ok(self.retained_bytes)
+    }
+}
+
+/// Production strategy adapter that makes every model-path error an audited empty output.
+#[derive(Debug)]
+pub struct ModelStrategy {
+    path: Result<Box<dyn ModelInferencePath>, ModelFailure>,
+    mapper: Box<dyn ModelDecisionMapper>,
+    retained_bytes: usize,
+}
+
+impl ModelStrategy {
+    /// Owns either one admitted model path or its exact load/validation failure.
+    pub fn try_new(
+        path: Result<Box<dyn ModelInferencePath>, ModelFailure>,
+        mapper: Box<dyn ModelDecisionMapper>,
+    ) -> Result<Self, StrategyError> {
+        let path_bytes = match &path {
+            Ok(path) => path.retained_bytes()?,
+            Err(_) => 0,
+        };
+        let mapper_bytes = mapper.retained_bytes()?;
+        let retained_bytes = std::mem::size_of::<Self>()
+            .checked_add(path_bytes)
+            .and_then(|total| total.checked_add(mapper_bytes))
+            .ok_or(StrategyError::RetainedSize)?;
+        Ok(Self {
+            path,
+            mapper,
+            retained_bytes,
+        })
+    }
+
+    /// Runs only the owned model path and maps any error before decision mapping can run.
+    pub fn evaluate_model(
+        &mut self,
+        features: &dyn LiveFeatureView,
+    ) -> Result<ModelOutput, StrategyNoAction> {
+        let output = match &mut self.path {
+            Ok(path) => path.infer_live(features),
+            Err(failure) => Err(*failure),
+        };
+        output.map_err(StrategyNoAction::from_model_failure)
+    }
+}
+
+impl Strategy for ModelStrategy {
+    fn on_market_event(
+        &mut self,
+        context: &StrategyContext<'_>,
+        event: &MarketEvent,
+    ) -> Result<BoundedOrderIntents, StrategyError> {
+        let output = match self.evaluate_model(context.features()) {
+            Ok(output) => output,
+            Err(no_action) => return Ok(BoundedOrderIntents::from_no_action(no_action)),
+        };
+        self.mapper.map(context, event, &output)
+    }
+
+    fn retained_bytes(&self) -> Result<usize, StrategyError> {
+        Ok(self.retained_bytes)
+    }
+}
+
+fn model_scalar(value: FeatureScalar) -> Option<f64> {
+    let value = match value {
+        FeatureScalar::PriceTicks(value) => value.get() as f64,
+        FeatureScalar::HalfTickPrice(value) => value.half_ticks() as f64 / 2.0,
+        FeatureScalar::QuantityLots(value) => value.get() as f64,
+        FeatureScalar::BasisPoints(value) => f64::from(value.get()),
+        FeatureScalar::SignedInteger(value) => value as f64,
+        FeatureScalar::UnsignedInteger(value) => value as f64,
+        FeatureScalar::ExactRatio(value) => {
+            value.numerator() as f64 / value.denominator().get() as f64
+        }
+        FeatureScalar::Statistical(value) => value.get(),
+    };
+    value.is_finite().then_some(value)
+}
+
 /// Closed strategy-boundary failure.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum StrategyError {
@@ -291,12 +452,78 @@ pub enum StrategyError {
 
 #[cfg(test)]
 mod tests {
+    use std::num::{NonZeroU32, NonZeroUsize};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use market_squawk_analytics::{
+        FeatureError, FeatureKey, FeatureScalar, FeatureValue, LiveFeatureView,
+    };
+    use market_squawk_domain::{MarketEvent, Timestamp};
     use market_squawk_modeling::{
-        BundleError, InferenceError, ModelFailure, ModelInputError, ModelRegistryError,
-        NativeBackendError,
+        BundleError, InferenceError, ModelFailure, ModelInputError, ModelOutput,
+        ModelRegistryError, NativeBackendError,
     };
 
-    use super::{BoundedOrderIntents, StrategyNoActionDomain, StrategyNoActionPhase};
+    use crate::live_hook::record_audited_no_action;
+    use crate::{
+        ExecutionAuditConfig, ExecutionAuditWriter, StrategyNoActionDomain, StrategyNoActionPhase,
+    };
+
+    use super::{
+        BoundedOrderIntents, ModelDecisionMapper, ModelInferencePath, ModelStrategy,
+        StrategyContext, StrategyError,
+    };
+
+    #[derive(Debug)]
+    struct EmptyFeatureView;
+
+    impl LiveFeatureView for EmptyFeatureView {
+        fn feature(&self, _key: &FeatureKey) -> Option<&FeatureValue<FeatureScalar>> {
+            None
+        }
+
+        fn retained_bytes(&self) -> Result<usize, FeatureError> {
+            Ok(std::mem::size_of::<Self>())
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailingInferencePath;
+
+    impl ModelInferencePath for FailingInferencePath {
+        fn infer_live(
+            &mut self,
+            _features: &dyn LiveFeatureView,
+        ) -> Result<ModelOutput, ModelFailure> {
+            Err(ModelFailure::from(InferenceError::NonFiniteComputation))
+        }
+
+        fn retained_bytes(&self) -> Result<usize, StrategyError> {
+            Ok(std::mem::size_of::<Self>())
+        }
+    }
+
+    #[derive(Debug)]
+    struct UnreachableDecisionMapper {
+        called: Arc<AtomicBool>,
+    }
+
+    impl ModelDecisionMapper for UnreachableDecisionMapper {
+        fn map(
+            &mut self,
+            _context: &StrategyContext<'_>,
+            _event: &MarketEvent,
+            _output: &ModelOutput,
+        ) -> Result<BoundedOrderIntents, StrategyError> {
+            self.called.store(true, Ordering::Release);
+            Ok(BoundedOrderIntents::new())
+        }
+
+        fn retained_bytes(&self) -> Result<usize, StrategyError> {
+            Ok(std::mem::size_of::<Self>())
+        }
+    }
 
     #[test]
     fn every_model_failure_plane_becomes_audited_no_action()
@@ -347,5 +574,43 @@ mod tests {
                 Some(expected)
             );
         }
+    }
+
+    #[test]
+    fn failing_backend_reaches_live_hook_as_bounded_audited_no_action()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mapper_called = Arc::new(AtomicBool::new(false));
+        let mut strategy = ModelStrategy::try_new(
+            Ok(Box::new(FailingInferencePath)),
+            Box::new(UnreachableDecisionMapper {
+                called: Arc::clone(&mapper_called),
+            }),
+        )?;
+        let no_action = strategy
+            .evaluate_model(&EmptyFeatureView)
+            .err()
+            .ok_or_else(|| std::io::Error::other("failing backend produced a model output"))?;
+        let intents = BoundedOrderIntents::from_no_action(no_action);
+        assert!(!mapper_called.load(Ordering::Acquire));
+
+        let (audit, mut reader) = ExecutionAuditWriter::try_new(ExecutionAuditConfig {
+            maximum_records: NonZeroUsize::MIN,
+            maximum_bytes: NonZeroU32::new(64 * 1024)
+                .ok_or_else(|| std::io::Error::other("audit bytes must be nonzero"))?,
+        })?;
+        assert_eq!(
+            record_audited_no_action(&audit, &intents, Timestamp::from_unix_nanos(7))?,
+            Some(market_squawk_live::ActionHookDisposition::NoAction)
+        );
+        let record = reader
+            .try_next_record()?
+            .ok_or_else(|| std::io::Error::other("live hook did not forward model no-action"))?;
+        let event = record
+            .strategy_no_action_event()
+            .ok_or_else(|| std::io::Error::other("unexpected execution audit record"))?;
+        assert_eq!(Some(event.no_action()), intents.no_action());
+        assert_eq!(event.observed_at(), Timestamp::from_unix_nanos(7));
+        assert!(reader.try_next_record()?.is_none());
+        Ok(())
     }
 }

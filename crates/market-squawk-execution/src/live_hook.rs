@@ -9,9 +9,10 @@ use market_squawk_live::{
 use thiserror::Error;
 
 use crate::{
-    ExecutionDispatcherConfig, ExecutionDispatcherError, ExecutionDispatcherHandle,
-    ExecutionMarketReference, ExecutionMarketSink, ExecutionMarketUpdate, RiskLimits, RiskOutcome,
-    RiskService, RiskServiceError, Strategy, StrategyContext,
+    ExecutionAuditError, ExecutionAuditWriter, ExecutionDispatcherConfig, ExecutionDispatcherError,
+    ExecutionDispatcherHandle, ExecutionMarketReference, ExecutionMarketSink,
+    ExecutionMarketUpdate, RiskLimits, RiskOutcome, RiskService, RiskServiceError, Strategy,
+    StrategyContext,
 };
 
 /// Route-owned execution graph invoked synchronously at the committed actor point.
@@ -21,6 +22,7 @@ pub struct ExecutionLiveActionHook {
     risk: RiskService,
     dispatcher: ExecutionDispatcherHandle,
     market_sink: Arc<dyn ExecutionMarketSink>,
+    audit: ExecutionAuditWriter,
     maximum_intents: ActionAuthorityIssueLimit,
     declared_retained_bytes: usize,
 }
@@ -54,11 +56,13 @@ impl ExecutionLiveActionHook {
     ) -> Result<Self, ExecutionLiveActionHookError> {
         let declared_retained_bytes =
             hook_retained_bytes(strategy.as_ref(), &risk, &dispatcher, market_sink.as_ref())?;
+        let audit = risk.audit_writer();
         Ok(Self {
             strategy,
             risk,
             dispatcher,
             market_sink,
+            audit,
             maximum_intents,
             declared_retained_bytes,
         })
@@ -89,6 +93,11 @@ impl LiveActionHook for ExecutionLiveActionHook {
             Ok(intents) => intents,
             Err(_) => return ActionHookDisposition::Failed,
         };
+        match record_audited_no_action(&self.audit, &intents, context.received_at()) {
+            Ok(Some(disposition)) => return disposition,
+            Ok(None) => {}
+            Err(_) => return ActionHookDisposition::Failed,
+        }
         if intents.is_empty() {
             return ActionHookDisposition::NoAction;
         }
@@ -140,6 +149,18 @@ impl LiveActionHook for ExecutionLiveActionHook {
     fn maximum_authority_issues(&self) -> ActionAuthorityIssueLimit {
         self.maximum_intents
     }
+}
+
+pub(crate) fn record_audited_no_action(
+    audit: &ExecutionAuditWriter,
+    intents: &crate::BoundedOrderIntents,
+    observed_at: market_squawk_domain::Timestamp,
+) -> Result<Option<ActionHookDisposition>, ExecutionAuditError> {
+    let Some(no_action) = intents.no_action() else {
+        return Ok(None);
+    };
+    audit.try_record_strategy_no_action(no_action, observed_at)?;
+    Ok(Some(ActionHookDisposition::NoAction))
 }
 
 fn hook_retained_bytes(

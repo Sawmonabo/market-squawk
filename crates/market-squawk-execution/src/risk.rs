@@ -279,6 +279,10 @@ impl RiskService {
         self.retained_bytes
     }
 
+    pub(crate) fn audit_writer(&self) -> ExecutionAuditWriter {
+        self.audit.clone()
+    }
+
     /// Returns the exact checked risk graph charge used before runtime ownership transfer.
     pub fn retained_bytes_for_limits(limits: &RiskLimits) -> Result<usize, RiskServiceError> {
         let limits_bytes = limits

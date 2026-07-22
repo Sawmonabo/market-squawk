@@ -190,7 +190,7 @@ impl TrainingDatasetIdentity {
         self.policy_digest
     }
 
-    fn retained_bytes(&self) -> Option<usize> {
+    pub(crate) fn retained_bytes(&self) -> Option<usize> {
         size_of::<Self>()
             .checked_add(self.manifest.dataset_id().as_str().len())?
             .checked_add(self.manifest.schema().name().len())

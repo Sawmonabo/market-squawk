@@ -19,7 +19,9 @@ pub use bundle::{
     BundleError, BundleMetadataRef, ControlledModelRoot, MAX_ARTIFACT_BYTES,
     MAX_CONTROLLED_MODEL_PATH_BYTES, MAX_METADATA_BYTES, ModelBundle,
 };
-pub use input::{ModelDecision, ModelFeatureValue, ModelInput, ModelInputError, ModelOutput};
+pub use input::{
+    ModelDecision, ModelFeatureValue, ModelInput, ModelInputError, ModelOutput, ModelOutputIdentity,
+};
 pub use metadata::{
     BundleExpectations, BundleId, DecisionThresholds, FeatureNormalizer, MAX_BUNDLE_ID_BYTES,
     MAX_MODEL_FEATURES, MAX_TRAINING_CODE_REVISION_BYTES, ModelFeatureBinding, ModelFormat,
@@ -222,8 +224,10 @@ const fn registry_error_code(error: ModelRegistryError) -> u16 {
         ModelRegistryError::RegistryFull => 104,
         ModelRegistryError::RetainedByteLimitExceeded => 105,
         ModelRegistryError::GenerationConflict => 106,
-        ModelRegistryError::RetainedSizeOverflow => 107,
-        ModelRegistryError::RegistryUnavailable => 108,
+        ModelRegistryError::BundleSeriesConflict => 107,
+        ModelRegistryError::ModelSeriesConflict => 108,
+        ModelRegistryError::RetainedSizeOverflow => 109,
+        ModelRegistryError::RegistryUnavailable => 110,
     }
 }
 
@@ -232,5 +236,7 @@ const fn input_error_code(error: ModelInputError) -> u16 {
         ModelInputError::NonFiniteValue => 201,
         ModelInputError::FeatureShapeMismatch => 202,
         ModelInputError::FeatureIdentityMismatch => 203,
+        ModelInputError::FeatureUnavailable => 204,
+        ModelInputError::UnsupportedFeatureScalar => 205,
     }
 }

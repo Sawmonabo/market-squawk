@@ -8,7 +8,7 @@ use thiserror::Error;
 
 use crate::{
     DecisionThresholds, ModelBundle, ModelDecision, ModelFormat, ModelInput, ModelMetadata,
-    ModelOutput,
+    ModelOutput, ModelOutputIdentity,
 };
 
 /// Immutable native tensor admitted together with a complete bundle.
@@ -67,13 +67,14 @@ pub trait InferenceBackend: Send + Sync {
     /// # Errors
     ///
     /// Returns a typed contract or finite-arithmetic failure and never substitutes a score.
-    fn infer(&self, input: &ModelInput) -> Result<ModelOutput, InferenceError>;
+    fn infer(&self, input: &ModelInput<'_>) -> Result<ModelOutput, InferenceError>;
 }
 
 /// Native affine backend supporting the closed linear and logistic link families.
 #[derive(Clone, Debug)]
 pub struct NativeLinearBackend {
     bundle: Arc<ModelBundle>,
+    output_identity: Arc<ModelOutputIdentity>,
 }
 
 impl NativeLinearBackend {
@@ -89,7 +90,19 @@ impl NativeLinearBackend {
         ) {
             return Err(NativeBackendError::UnsupportedBundleFormat);
         }
-        Ok(Self { bundle })
+        let output_identity = Arc::new(ModelOutputIdentity::from_metadata(bundle.metadata()));
+        Ok(Self {
+            bundle,
+            output_identity,
+        })
+    }
+
+    /// Returns the complete retained graph charge for one owned backend path.
+    #[must_use]
+    pub fn retained_bytes(&self) -> usize {
+        size_of::<Self>()
+            .saturating_add(self.bundle.retained_bytes())
+            .saturating_add(self.output_identity.retained_bytes())
     }
 }
 
@@ -98,7 +111,7 @@ impl InferenceBackend for NativeLinearBackend {
         self.bundle.metadata()
     }
 
-    fn infer(&self, input: &ModelInput) -> Result<ModelOutput, InferenceError> {
+    fn infer(&self, input: &ModelInput<'_>) -> Result<ModelOutput, InferenceError> {
         let metadata = self.bundle.metadata();
         if !input.matches(metadata) {
             return Err(InferenceError::BundleMismatch);
@@ -135,7 +148,12 @@ impl InferenceBackend for NativeLinearBackend {
             score = stable_logistic(score).ok_or(InferenceError::NonFiniteComputation)?;
         }
         let (decision, confidence) = decide(score, metadata.decision_thresholds())?;
-        Ok(ModelOutput::new(metadata, score, confidence, decision))
+        Ok(ModelOutput::new(
+            Arc::clone(&self.output_identity),
+            score,
+            confidence,
+            decision,
+        ))
     }
 }
 

@@ -37,7 +37,8 @@ pub use approval::{
 };
 pub use audit::{
     ExecutionAuditConfig, ExecutionAuditError, ExecutionAuditEvent, ExecutionAuditKind,
-    ExecutionAuditReader, ExecutionAuditReason, ExecutionAuditWriter, MAX_EXECUTION_AUDIT_REASONS,
+    ExecutionAuditReader, ExecutionAuditReason, ExecutionAuditRecord, ExecutionAuditWriter,
+    MAX_EXECUTION_AUDIT_REASONS, StrategyNoActionAuditEvent,
 };
 pub use dispatcher::{
     ExecutionDispatchError, ExecutionDispatcher, ExecutionDispatcherConfig,
@@ -57,7 +58,8 @@ pub use risk::{
     RiskRejectionCode, RiskService, RiskServiceConfig, RiskServiceError,
 };
 pub use strategy::{
-    BoundedOrderIntentIterator, BoundedOrderIntents, MAX_STRATEGY_ORDER_INTENTS, Strategy,
+    BoundedOrderIntentIterator, BoundedOrderIntents, MAX_STRATEGY_ORDER_INTENTS,
+    ModelDecisionMapper, ModelInferencePath, ModelStrategy, NativeModelInferencePath, Strategy,
     StrategyContext, StrategyError, StrategyNoAction, StrategyNoActionDomain,
     StrategyNoActionPhase,
 };

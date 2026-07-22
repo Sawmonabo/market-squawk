@@ -126,6 +126,35 @@ fn exact_bundle_load_and_registry_retain_immutable_generations() -> TestResult {
     assert_eq!(first_retained.metadata().bundle_version().get(), 1);
     assert_eq!(latest.metadata().bundle_version().get(), 2);
     assert_eq!(registry.len()?, 2);
+    let retained_before_series_conflicts = registry.retained_bytes()?;
+    let wrong_model_same_series = valid_fixture_with_identity(
+        "native_linear",
+        1,
+        3,
+        "alpha-signal",
+        "018f3c2a-91ab-7ccd-b3de-123456789abd",
+        |_, _| {},
+    )?;
+    assert_eq!(
+        registry.try_register(wrong_model_same_series.load()?),
+        Err(ModelRegistryError::BundleSeriesConflict)
+    );
+    assert_eq!(registry.len()?, 2);
+    assert_eq!(registry.retained_bytes()?, retained_before_series_conflicts);
+    let competing_series_same_model = valid_fixture_with_identity(
+        "native_linear",
+        1,
+        99,
+        "competing-alpha-signal",
+        "018f3c2a-91ab-7ccd-b3de-123456789abc",
+        |_, _| {},
+    )?;
+    assert_eq!(
+        registry.try_register(competing_series_same_model.load()?),
+        Err(ModelRegistryError::ModelSeriesConflict)
+    );
+    assert_eq!(registry.len()?, 2);
+    assert_eq!(registry.retained_bytes()?, retained_before_series_conflicts);
     let third_fixture = valid_fixture("native_linear", 1, 3, |_, _| {})?;
     assert_eq!(
         registry.try_register(third_fixture.load()?),
@@ -314,6 +343,24 @@ pub(crate) fn valid_fixture(
     bundle_version: u64,
     mutate: impl FnOnce(&mut Value, &mut Value),
 ) -> TestResult<Fixture> {
+    valid_fixture_with_identity(
+        format,
+        format_version,
+        bundle_version,
+        "alpha-signal",
+        "018f3c2a-91ab-7ccd-b3de-123456789abc",
+        mutate,
+    )
+}
+
+fn valid_fixture_with_identity(
+    format: &str,
+    format_version: u32,
+    bundle_version: u64,
+    bundle_id: &str,
+    model_id: &str,
+    mutate: impl FnOnce(&mut Value, &mut Value),
+) -> TestResult<Fixture> {
     let catalog = LiveFeatureCatalog::try_new(live_catalog_config()?, "task12-live-revision")?;
     let feature_keys = [
         catalog.entries()[0].key().clone(),
@@ -348,10 +395,10 @@ pub(crate) fn valid_fixture(
         "forward-return",
         NonZeroU32::MIN,
     )?;
-    let model_id = ModelId::from_str("018f3c2a-91ab-7ccd-b3de-123456789abc")?;
+    let model_id = ModelId::from_str(model_id)?;
     let expectations = BundleExpectations::try_new(
         model_id,
-        BundleId::try_new("alpha-signal")?,
+        BundleId::try_new(bundle_id)?,
         NonZeroU64::new(bundle_version)
             .ok_or_else(|| std::io::Error::other("bundle version must be nonzero"))?,
         dataset,
@@ -417,7 +464,7 @@ pub(crate) fn valid_fixture(
     };
     let mut metadata = json!({
         "schema_version": 1,
-        "bundle_id": "alpha-signal",
+        "bundle_id": bundle_id,
         "bundle_version": bundle_version,
         "model_id": model_id.to_string(),
         "artifact": {

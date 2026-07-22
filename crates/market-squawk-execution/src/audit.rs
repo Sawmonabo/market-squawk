@@ -15,7 +15,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
 use crate::{
     ExecutionMarketReference, ExecutionPriceBound, OrderIntent, OrderIntentDigest,
-    RiskPolicyIdentity, RiskRejectionCode,
+    RiskPolicyIdentity, RiskRejectionCode, StrategyNoAction,
 };
 
 /// Maximum typed rejection reasons retained in a single fixed audit fact.
@@ -185,6 +185,58 @@ pub struct ExecutionAuditEvent {
     observed_at: Timestamp,
     reasons: [Option<ExecutionAuditReason>; MAX_EXECUTION_AUDIT_REASONS],
     reason_count: u8,
+}
+
+/// Exact audited strategy no-action forwarded by the live execution hook.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StrategyNoActionAuditEvent {
+    no_action: StrategyNoAction,
+    observed_at: Timestamp,
+}
+
+impl StrategyNoActionAuditEvent {
+    /// Returns the exact typed no-action fact produced by the strategy boundary.
+    pub const fn no_action(self) -> StrategyNoAction {
+        self.no_action
+    }
+
+    /// Returns the trusted committed observation time attached by the live hook.
+    pub const fn observed_at(self) -> Timestamp {
+        self.observed_at
+    }
+}
+
+/// Unified fixed-size bounded execution-audit record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExecutionAuditRecord {
+    execution: Option<ExecutionAuditEvent>,
+    strategy_no_action: Option<StrategyNoActionAuditEvent>,
+}
+
+impl ExecutionAuditRecord {
+    const fn execution(event: ExecutionAuditEvent) -> Self {
+        Self {
+            execution: Some(event),
+            strategy_no_action: None,
+        }
+    }
+
+    const fn strategy_no_action(event: StrategyNoActionAuditEvent) -> Self {
+        Self {
+            execution: None,
+            strategy_no_action: Some(event),
+        }
+    }
+
+    /// Returns the order/risk/dispatch audit event when present.
+    pub const fn execution_event(self) -> Option<ExecutionAuditEvent> {
+        self.execution
+    }
+
+    /// Returns the model-strategy no-action event when present.
+    pub const fn strategy_no_action_event(self) -> Option<StrategyNoActionAuditEvent> {
+        self.strategy_no_action
+    }
 }
 
 impl ExecutionAuditEvent {
@@ -359,6 +411,21 @@ impl ExecutionAuditWriter {
         Ok(ExecutionAuditPermit { slot, bytes })
     }
 
+    pub(crate) fn try_record_strategy_no_action(
+        &self,
+        no_action: StrategyNoAction,
+        observed_at: Timestamp,
+    ) -> Result<(), ExecutionAuditError> {
+        let permit = self.try_reserve()?;
+        permit.commit_record(ExecutionAuditRecord::strategy_no_action(
+            StrategyNoActionAuditEvent {
+                no_action,
+                observed_at,
+            },
+        ));
+        Ok(())
+    }
+
     /// Returns the fixed record-envelope charge used by the byte semaphore.
     pub const fn retained_bytes_per_record() -> usize {
         audit_envelope_bytes()
@@ -374,8 +441,19 @@ pub struct ExecutionAuditReader {
 impl ExecutionAuditReader {
     /// Reads one queued fact without waiting.
     pub fn try_next(&mut self) -> Result<Option<ExecutionAuditEvent>, ExecutionAuditError> {
+        match self.try_next_record()? {
+            Some(record) => record
+                .execution_event()
+                .map(Some)
+                .ok_or(ExecutionAuditError::UnexpectedRecordKind),
+            None => Ok(None),
+        }
+    }
+
+    /// Reads one unified queued execution or strategy no-action fact without waiting.
+    pub fn try_next_record(&mut self) -> Result<Option<ExecutionAuditRecord>, ExecutionAuditError> {
         match self.receiver.try_recv() {
-            Ok(envelope) => Ok(Some(envelope.event)),
+            Ok(envelope) => Ok(Some(envelope.record)),
             Err(mpsc::error::TryRecvError::Empty) => Ok(None),
             Err(mpsc::error::TryRecvError::Disconnected) => Err(ExecutionAuditError::Closed),
         }
@@ -384,7 +462,7 @@ impl ExecutionAuditReader {
 
 #[derive(Debug)]
 struct AuditEnvelope {
-    event: ExecutionAuditEvent,
+    record: ExecutionAuditRecord,
     _bytes: OwnedSemaphorePermit,
 }
 
@@ -396,9 +474,13 @@ pub(crate) struct ExecutionAuditPermit {
 
 impl ExecutionAuditPermit {
     pub(crate) fn commit(self, event: ExecutionAuditEvent) {
+        self.commit_record(ExecutionAuditRecord::execution(event));
+    }
+
+    fn commit_record(self, record: ExecutionAuditRecord) {
         let Self { slot, bytes } = self;
         drop(slot.send(AuditEnvelope {
-            event,
+            record,
             _bytes: bytes,
         }));
     }
@@ -417,6 +499,8 @@ pub enum ExecutionAuditError {
     RecordSizeUnsupported,
     #[error("execution audit record exceeds configured byte capacity")]
     RecordExceedsCapacity,
+    #[error("execution audit reader encountered a non-execution record")]
+    UnexpectedRecordKind,
 }
 
 const fn overflow_reasons() -> [Option<ExecutionAuditReason>; MAX_EXECUTION_AUDIT_REASONS] {
