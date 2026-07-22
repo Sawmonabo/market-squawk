@@ -325,6 +325,7 @@ pub(super) fn validate_training_run(
     let expected_kind = match format {
         ModelFormat::NativeLinear => "native_linear",
         ModelFormat::NativeLogistic => "native_logistic",
+        ModelFormat::Onnx => "onnx",
     };
     let relationships_match =
         trial.bundle_id == metadata.bundle_id
@@ -419,6 +420,7 @@ pub(super) fn validate_metrics(
     let required = match format {
         ModelFormat::NativeLinear => ValidationMetricName::MeanSquaredError,
         ModelFormat::NativeLogistic => ValidationMetricName::Accuracy,
+        ModelFormat::Onnx => ValidationMetricName::MeanSquaredError,
     };
     if !metrics.iter().any(|metric| metric.name() == required) {
         return Err(BundleError::InvalidValidationMetrics);
@@ -453,6 +455,9 @@ pub(super) fn validate_artifact(
     expected_format: ModelFormat,
     features: &[ModelFeatureBinding],
 ) -> Result<NativeArtifact, BundleError> {
+    if expected_format == ModelFormat::Onnx {
+        return Err(BundleError::UnsupportedFormat);
+    }
     if wire.schema_version != NATIVE_ARTIFACT_SCHEMA_VERSION {
         return Err(BundleError::UnsupportedArtifactSchemaVersion);
     }
@@ -516,6 +521,7 @@ pub(super) fn parse_format(value: &str) -> Result<ModelFormat, BundleError> {
     match value {
         "native_linear" => Ok(ModelFormat::NativeLinear),
         "native_logistic" => Ok(ModelFormat::NativeLogistic),
+        "onnx" => Ok(ModelFormat::Onnx),
         _ => Err(BundleError::UnsupportedFormat),
     }
 }

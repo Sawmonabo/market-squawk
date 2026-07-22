@@ -1,4 +1,4 @@
-//! Closed model bundles, immutable generations, and bounded native inference.
+//! Closed model bundles, immutable generations, and bounded native or admitted ONNX inference.
 //!
 //! Bundle and registry operations are control-plane work. [`InferenceBackend::infer`] consumes
 //! already admitted in-memory state and performs no filesystem, database, network, plugin,
@@ -13,11 +13,14 @@ mod bundle;
 mod input;
 mod metadata;
 mod native;
+#[cfg(feature = "onnx-tract")]
+mod onnx;
 mod registry;
 
 pub use bundle::{
     BundleError, BundleMetadataRef, ControlledModelRoot, MAX_ARTIFACT_BYTES,
-    MAX_CONTROLLED_MODEL_PATH_BYTES, MAX_METADATA_BYTES, MAX_TRAINING_RUN_BYTES, ModelBundle,
+    MAX_CONTROLLED_MODEL_PATH_BYTES, MAX_METADATA_BYTES, MAX_ONNX_ARTIFACT_BYTES,
+    MAX_TRAINING_RUN_BYTES, ModelBundle,
 };
 pub use input::{
     ModelDecision, ModelFeatureValue, ModelInput, ModelInputError, ModelOutput, ModelOutputIdentity,
@@ -29,6 +32,18 @@ pub use metadata::{
     ValidationMetricName,
 };
 pub use native::{InferenceBackend, InferenceError, NativeBackendError, NativeLinearBackend};
+#[cfg(feature = "onnx-runtime")]
+pub use onnx::{
+    ControlledOnnxRuntimeRoot, ExternalOnnxRuntimeAdmission, ExternalOnnxRuntimeBackend,
+    ExternalOnnxRuntimeError, ExternalOnnxRuntimeReference, ExternalRuntimePlatform,
+    OPTIONAL_ONNX_RUNTIME_VERSION, optional_onnx_runtime_policy_digest,
+};
+#[cfg(feature = "onnx-tract")]
+pub use onnx::{
+    MAX_ONNX_MODEL_BYTES, MAX_ONNX_NODES, MAX_ONNX_REQUEST_ELEMENTS, MAX_ONNX_TENSORS,
+    OnnxBackendError, OnnxFallbackPolicy, OnnxModelPolicy, OnnxPolicyError, OnnxRuntimeEvidence,
+    TractOnnxBackend, ValidatedOnnxModel,
+};
 pub use registry::{
     BundleRegistration, MAX_MODEL_REGISTRY_GENERATIONS, MAX_MODEL_REGISTRY_RETAINED_BYTES,
     ModelRegistry, ModelRegistryError,
@@ -49,8 +64,12 @@ pub enum ModelFailure {
     /// Native backend construction failed.
     #[error("native model backend failed closed: {0}")]
     Backend(NativeBackendError),
-    /// Pure native inference failed.
-    #[error("native model inference failed closed: {0}")]
+    /// ONNX policy, load, or warm-up failed before publication.
+    #[cfg(feature = "onnx-tract")]
+    #[error("ONNX model backend failed closed: {0}")]
+    OnnxBackend(OnnxBackendError),
+    /// Native or ONNX inference failed.
+    #[error("model inference failed closed: {0}")]
     Inference(InferenceError),
 }
 
@@ -61,7 +80,7 @@ pub enum ModelFailurePhase {
     Validation,
     /// A controlled read, immutable registry operation, or backend load failed.
     Load,
-    /// Finite input construction or pure native inference failed.
+    /// Finite input construction or admitted model inference failed.
     Inference,
 }
 
@@ -106,6 +125,16 @@ impl ModelFailure {
             )
             | Self::Registry(_)
             | Self::Backend(_) => ModelFailurePhase::Load,
+            #[cfg(feature = "onnx-tract")]
+            Self::OnnxBackend(OnnxBackendError::Policy(_)) => ModelFailurePhase::Validation,
+            #[cfg(feature = "onnx-tract")]
+            Self::OnnxBackend(
+                OnnxBackendError::UnsupportedBundleFormat
+                | OnnxBackendError::FeatureShapeMismatch
+                | OnnxBackendError::RuntimeLoad
+                | OnnxBackendError::IntermediateLimit
+                | OnnxBackendError::WarmUp,
+            ) => ModelFailurePhase::Load,
             Self::Bundle(_) => ModelFailurePhase::Validation,
             Self::Input(_) | Self::Inference(_) => ModelFailurePhase::Inference,
         }
@@ -136,9 +165,15 @@ impl ModelFailure {
             Self::Registry(error) => registry_error_code(error),
             Self::Input(error) => input_error_code(error),
             Self::Backend(NativeBackendError::UnsupportedBundleFormat) => 301,
+            #[cfg(feature = "onnx-tract")]
+            Self::OnnxBackend(error) => onnx_backend_error_code(error),
             Self::Inference(InferenceError::BundleMismatch) => 401,
             Self::Inference(InferenceError::FeatureShapeMismatch) => 402,
             Self::Inference(InferenceError::NonFiniteComputation) => 403,
+            Self::Inference(InferenceError::ArtifactUnavailable) => 404,
+            Self::Inference(InferenceError::OnnxWorkerUnavailable) => 405,
+            Self::Inference(InferenceError::OnnxDeadlineExceeded) => 406,
+            Self::Inference(InferenceError::OnnxRuntimeFailure) => 407,
         }
     }
 }
@@ -170,6 +205,25 @@ impl From<NativeBackendError> for ModelFailure {
 impl From<InferenceError> for ModelFailure {
     fn from(value: InferenceError) -> Self {
         Self::Inference(value)
+    }
+}
+
+#[cfg(feature = "onnx-tract")]
+impl From<OnnxBackendError> for ModelFailure {
+    fn from(value: OnnxBackendError) -> Self {
+        Self::OnnxBackend(value)
+    }
+}
+
+#[cfg(feature = "onnx-tract")]
+const fn onnx_backend_error_code(error: OnnxBackendError) -> u16 {
+    match error {
+        OnnxBackendError::UnsupportedBundleFormat => 501,
+        OnnxBackendError::Policy(_) => 502,
+        OnnxBackendError::FeatureShapeMismatch => 503,
+        OnnxBackendError::RuntimeLoad => 504,
+        OnnxBackendError::IntermediateLimit => 505,
+        OnnxBackendError::WarmUp => 506,
     }
 }
 

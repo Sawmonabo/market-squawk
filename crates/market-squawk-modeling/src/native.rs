@@ -57,12 +57,14 @@ impl NativeArtifact {
     }
 }
 
-/// Pure native inference contract.
+/// Bounded inference contract shared by native and admitted graph runtimes.
 pub trait InferenceBackend: Send + Sync {
     /// Returns complete immutable metadata for this exact backend generation.
     fn metadata(&self) -> &ModelMetadata;
 
-    /// Evaluates one exact, bounded input without I/O, registry access, or allocation.
+    /// Evaluates one exact, bounded input without filesystem, network, or registry access.
+    /// Pure native implementations remain allocation-free; admitted graph runtimes may use only
+    /// their documented bounded, preallocated, or request-owned memory.
     ///
     /// # Errors
     ///
@@ -116,7 +118,10 @@ impl InferenceBackend for NativeLinearBackend {
         if !input.matches(metadata) {
             return Err(InferenceError::BundleMismatch);
         }
-        let artifact = self.bundle.native_artifact();
+        let artifact = self
+            .bundle
+            .native_artifact()
+            .ok_or(InferenceError::ArtifactUnavailable)?;
         if input.values().len() != artifact.weights().len()
             || input.values().len() != metadata.features().len()
         {
@@ -175,8 +180,20 @@ pub enum InferenceError {
     #[error("model input and native tensor shapes differ")]
     FeatureShapeMismatch,
     /// Normalization, affine arithmetic, link, or confidence became nonfinite.
-    #[error("native inference produced a nonfinite intermediate")]
+    #[error("model inference produced a nonfinite intermediate")]
     NonFiniteComputation,
+    /// The admitted bundle did not retain the artifact required by this backend.
+    #[error("model artifact is unavailable for this backend")]
+    ArtifactUnavailable,
+    /// A bounded ONNX worker was unavailable or already occupied.
+    #[error("ONNX inference worker is unavailable")]
+    OnnxWorkerUnavailable,
+    /// The bounded ONNX inference deadline elapsed.
+    #[error("ONNX inference exceeded its deadline")]
+    OnnxDeadlineExceeded,
+    /// The admitted ONNX runtime failed or returned an invalid tensor.
+    #[error("ONNX runtime failed closed")]
+    OnnxRuntimeFailure,
 }
 
 fn stable_logistic(value: f64) -> Option<f64> {
@@ -190,7 +207,7 @@ fn stable_logistic(value: f64) -> Option<f64> {
     result.is_finite().then_some(result)
 }
 
-fn decide(
+pub(crate) fn decide(
     score: f64,
     thresholds: DecisionThresholds,
 ) -> Result<(ModelDecision, f64), InferenceError> {

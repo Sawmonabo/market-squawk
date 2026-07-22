@@ -34,6 +34,8 @@ pub const MAX_CONTROLLED_MODEL_PATH_BYTES: usize = 256;
 pub const MAX_METADATA_BYTES: usize = 256 * 1024;
 /// Maximum exact native artifact bytes admitted before parsing.
 pub const MAX_ARTIFACT_BYTES: usize = 1024 * 1024;
+/// Maximum exact ONNX protobuf bytes admitted before parsing.
+pub const MAX_ONNX_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
 /// Maximum exact training-run provenance bytes admitted before parsing.
 pub const MAX_TRAINING_RUN_BYTES: usize = 256 * 1024;
 
@@ -100,11 +102,17 @@ impl ControlledModelRoot {
 #[derive(Debug)]
 pub struct ModelBundle {
     metadata: ModelMetadata,
-    native_artifact: NativeArtifact,
+    artifact: BundleArtifact,
     metadata_bytes: Box<[u8]>,
     artifact_bytes: Box<[u8]>,
     training_run_bytes: Box<[u8]>,
     retained_bytes: usize,
+}
+
+#[derive(Debug)]
+enum BundleArtifact {
+    Native(NativeArtifact),
+    Onnx,
 }
 
 impl ModelBundle {
@@ -167,7 +175,13 @@ impl ModelBundle {
         let artifact_reference = BundleMetadataRef::try_new(&wire.artifact.path, artifact_hash)?;
         let expected_artifact_size =
             usize::try_from(wire.artifact.size_bytes).map_err(|_| BundleError::ArtifactTooLarge)?;
-        if expected_artifact_size > MAX_ARTIFACT_BYTES {
+        let artifact_byte_limit = match format {
+            crate::ModelFormat::Onnx => MAX_ONNX_ARTIFACT_BYTES,
+            crate::ModelFormat::NativeLinear | crate::ModelFormat::NativeLogistic => {
+                MAX_ARTIFACT_BYTES
+            }
+        };
+        if expected_artifact_size > artifact_byte_limit {
             return Err(BundleError::ArtifactTooLarge);
         }
         let training_run_hash = parse_digest(&wire.training_run.sha256)?;
@@ -227,7 +241,7 @@ impl ModelBundle {
         let artifact_bytes = read_exact_bounded(
             &root.directory,
             artifact_reference.relative_path(),
-            MAX_ARTIFACT_BYTES,
+            artifact_byte_limit,
             BundleError::ArtifactTooLarge,
         )?;
         if artifact_bytes.len() != expected_artifact_size {
@@ -236,11 +250,15 @@ impl ModelBundle {
         if sha256_digest(&artifact_bytes) != artifact_hash {
             return Err(BundleError::ArtifactHashMismatch);
         }
-        validate_json_structure(&artifact_bytes)
-            .map_err(|_| BundleError::ArtifactStructureLimit)?;
-        let artifact_wire: NativeArtifactWire =
-            serde_json::from_slice(&artifact_bytes).map_err(|_| BundleError::ArtifactSyntax)?;
-        let artifact = validate_artifact(artifact_wire, format, &features)?;
+        let artifact = if format == crate::ModelFormat::Onnx {
+            BundleArtifact::Onnx
+        } else {
+            validate_json_structure(&artifact_bytes)
+                .map_err(|_| BundleError::ArtifactStructureLimit)?;
+            let artifact_wire: NativeArtifactWire =
+                serde_json::from_slice(&artifact_bytes).map_err(|_| BundleError::ArtifactSyntax)?;
+            BundleArtifact::Native(validate_artifact(artifact_wire, format, &features)?)
+        };
 
         let metadata = ModelMetadata::new(
             expectations,
@@ -261,14 +279,17 @@ impl ModelBundle {
                     .retained_bytes()
                     .ok_or(BundleError::RetainedSizeOverflow)?,
             )
-            .and_then(|bytes| bytes.checked_add(artifact.retained_bytes()?))
+            .and_then(|bytes| match &artifact {
+                BundleArtifact::Native(artifact) => bytes.checked_add(artifact.retained_bytes()?),
+                BundleArtifact::Onnx => Some(bytes),
+            })
             .and_then(|bytes| bytes.checked_add(metadata_bytes.len()))
             .and_then(|bytes| bytes.checked_add(artifact_bytes.len()))
             .and_then(|bytes| bytes.checked_add(training_run_bytes.len()))
             .ok_or(BundleError::RetainedSizeOverflow)?;
         Ok(Self {
             metadata,
-            native_artifact: artifact,
+            artifact,
             metadata_bytes: metadata_bytes.into_boxed_slice(),
             artifact_bytes: artifact_bytes.into_boxed_slice(),
             training_run_bytes: training_run_bytes.into_boxed_slice(),
@@ -306,8 +327,19 @@ impl ModelBundle {
         &self.training_run_bytes
     }
 
-    pub(crate) const fn native_artifact(&self) -> &NativeArtifact {
-        &self.native_artifact
+    pub(crate) const fn native_artifact(&self) -> Option<&NativeArtifact> {
+        match &self.artifact {
+            BundleArtifact::Native(artifact) => Some(artifact),
+            BundleArtifact::Onnx => None,
+        }
+    }
+
+    #[cfg(feature = "onnx-tract")]
+    pub(crate) fn onnx_artifact_bytes(&self) -> Option<&[u8]> {
+        match self.artifact {
+            BundleArtifact::Onnx => Some(&self.artifact_bytes),
+            BundleArtifact::Native(_) => None,
+        }
     }
 }
 

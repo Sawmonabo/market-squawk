@@ -50,9 +50,11 @@ pub enum ModelFormat {
     NativeLinear,
     /// One-output deterministic affine model with a logistic link.
     NativeLogistic,
+    /// ONNX protobuf admitted under the Task 15 closed graph policy.
+    Onnx,
 }
 
-/// Validated feature normalization performed immediately before native arithmetic.
+/// Validated feature normalization performed immediately before model arithmetic.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum FeatureNormalizer {
     /// Preserve the admitted finite value exactly.

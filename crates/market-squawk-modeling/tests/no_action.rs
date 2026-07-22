@@ -5,13 +5,20 @@ use market_squawk_modeling::{
 
 #[test]
 fn every_model_failure_plane_maps_to_typed_nonzero_audit_evidence() {
-    let failures = [
+    let mut failures = vec![
         ModelFailure::from(BundleError::MetadataHashMismatch),
         ModelFailure::from(ModelRegistryError::RegistryFull),
         ModelFailure::from(ModelInputError::FeatureShapeMismatch),
         ModelFailure::from(NativeBackendError::UnsupportedBundleFormat),
         ModelFailure::from(InferenceError::NonFiniteComputation),
     ];
+    #[cfg(feature = "onnx-tract")]
+    failures.extend([
+        ModelFailure::from(market_squawk_modeling::OnnxBackendError::Policy(
+            market_squawk_modeling::OnnxPolicyError::ExternalData,
+        )),
+        ModelFailure::from(market_squawk_modeling::OnnxBackendError::WarmUp),
+    ]);
 
     for failure in failures {
         let expected_phase = failure.phase();
@@ -36,4 +43,18 @@ fn validation_load_and_inference_failures_keep_distinct_no_action_phases() {
         ModelFailure::from(InferenceError::BundleMismatch).phase(),
         ModelFailurePhase::Inference
     );
+    #[cfg(feature = "onnx-tract")]
+    {
+        assert_eq!(
+            ModelFailure::from(market_squawk_modeling::OnnxBackendError::Policy(
+                market_squawk_modeling::OnnxPolicyError::DisallowedOperator,
+            ))
+            .phase(),
+            ModelFailurePhase::Validation
+        );
+        assert_eq!(
+            ModelFailure::from(market_squawk_modeling::OnnxBackendError::WarmUp).phase(),
+            ModelFailurePhase::Load
+        );
+    }
 }

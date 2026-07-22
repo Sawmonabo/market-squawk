@@ -1,6 +1,6 @@
 [package]
 name = "market-squawk-modeling"
-description = "Closed model bundles, immutable registry generations, and bounded native inference"
+description = "Closed model bundles, immutable generations, and bounded native or ONNX inference"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,6 +8,11 @@ license.workspace = true
 repository = "https://github.com/Sawmonabo/market-squawk"
 publish = false
 autotests = false
+
+[features]
+default = []
+onnx-tract = ["dep:tract-onnx"]
+onnx-runtime = ["onnx-tract", "dep:ort"]
 
 [dependencies]
 cap-std.workspace = true
@@ -19,9 +24,16 @@ serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tokio-util.workspace = true
+tract-onnx = { version = "=0.23.4", default-features = false, optional = true }
+ort = { version = "=2.0.0-rc.12", default-features = false, features = [
+    "api-24",
+    "load-dynamic",
+    "std",
+], optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true
+prost = "=0.14.3"
 
 [[test]]
 name = "modeling_contracts"

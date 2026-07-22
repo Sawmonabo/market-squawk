@@ -159,6 +159,7 @@ fn exact_bundle_load_and_registry_retain_immutable_generations() -> TestResult {
         "alpha-signal",
         "018f3c2a-91ab-7ccd-b3de-123456789abd",
         |_, _| {},
+        None,
     )?;
     assert_eq!(
         registry.try_register(wrong_model_same_series.load()?),
@@ -173,6 +174,7 @@ fn exact_bundle_load_and_registry_retain_immutable_generations() -> TestResult {
         "competing-alpha-signal",
         "018f3c2a-91ab-7ccd-b3de-123456789abc",
         |_, _| {},
+        None,
     )?;
     assert_eq!(
         registry.try_register(competing_series_same_model.load()?),
@@ -205,7 +207,7 @@ fn bundle_admission_fails_closed_across_complete_relationships() -> TestResult {
         BundleError::UnsupportedMetadataVersion,
     )?;
     assert_fixture_error(
-        valid_fixture("onnx", 1, 1, |_, _| {})?,
+        valid_fixture("pickle", 1, 1, |_, _| {})?,
         BundleError::UnsupportedFormat,
     )?;
     assert_fixture_error(
@@ -413,6 +415,20 @@ pub(crate) fn valid_fixture(
         "alpha-signal",
         "018f3c2a-91ab-7ccd-b3de-123456789abc",
         mutate,
+        None,
+    )
+}
+
+#[cfg(feature = "onnx-tract")]
+pub(crate) fn valid_onnx_fixture(artifact_bytes: &[u8]) -> TestResult<Fixture> {
+    valid_fixture_with_identity(
+        "onnx",
+        1,
+        1,
+        "alpha-signal-onnx",
+        "018f3c2a-91ab-7ccd-b3de-123456789abe",
+        |_, _| {},
+        Some(artifact_bytes),
     )
 }
 
@@ -423,6 +439,7 @@ fn valid_fixture_with_identity(
     bundle_id: &str,
     model_id: &str,
     mutate: impl FnOnce(&mut Value, &mut Value),
+    artifact_override: Option<&[u8]>,
 ) -> TestResult<Fixture> {
     let catalog = LiveFeatureCatalog::try_new(live_catalog_config()?, "task12-live-revision")?;
     let feature_keys = [
@@ -541,7 +558,7 @@ fn valid_fixture_with_identity(
         "bundle_version": bundle_version,
         "model_id": model_id.to_string(),
         "artifact": {
-            "path": "artifact.json",
+            "path": if artifact_override.is_some() { "model.onnx" } else { "artifact.json" },
             "sha256": hex([1; 32]),
             "size_bytes": 1,
             "format": format,
@@ -591,7 +608,10 @@ fn valid_fixture_with_identity(
     mutate(&mut metadata, &mut artifact);
 
     let temporary = TempDir::new()?;
-    let artifact_bytes = serde_json::to_vec(&artifact)?;
+    let artifact_bytes = match artifact_override {
+        Some(bytes) => bytes.to_vec(),
+        None => serde_json::to_vec(&artifact)?,
+    };
     let run_features = metadata["features"]
         .as_array()
         .ok_or_else(|| std::io::Error::other("fixture features are not an array"))?
@@ -651,7 +671,12 @@ fn valid_fixture_with_identity(
         Sha256Digest::new(artifact_sha256),
         Sha256Digest::new(training_run_sha256),
     )?;
-    fs::write(temporary.path().join("artifact.json"), artifact_bytes)?;
+    let artifact_name = if artifact_override.is_some() {
+        "model.onnx"
+    } else {
+        "artifact.json"
+    };
+    fs::write(temporary.path().join(artifact_name), artifact_bytes)?;
     fs::write(
         temporary.path().join("training-run.json"),
         training_run_bytes,
