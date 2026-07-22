@@ -385,18 +385,38 @@ or Important finding.
 The Task 16 release checkpoint was pushed and recorded on PR `#26`; issue `#21` was closed and its
 Project 5 item set to `Done`. The completed generated target was cleaned, the clean worktree and
 merged local feature branch were removed, no matching origin branch remained, and Git worktree and
-remote metadata were pruned. The active Python feature lane is intentionally retained until its
-review blockers are corrected, re-reviewed, integrated, and closed out through the same invariant.
+remote metadata were pruned.
 
 After the accepted release state and GitHub evidence were pushed, both completed feature targets
 were cleaned (6.9 GiB total), both clean worktrees were removed, both merged local/origin feature
 branches were deleted, and worktree/remote metadata was pruned. Only the release worktree remains.
 
-Task 14's Python financial analytics/training product and its review remediation are implemented on
-the feature lane but are not yet accepted. Fair value now owns authoritative migration `0010`; the
-Python lane must merge the release branch, renumber dataset admission to `0011`, reconcile the
-combined schema trigger, lockfile, and wheelhouse source closure, run one offline CPython 3.12/3.13
-matrix, freeze the exact commit, and pass remediation rereview before integration.
+Task 14's Python financial analytics/training product is accepted and fast-forwarded into the
+release branch at exact code head `02ab5cd`. Fair value retains migration `0010`; Python dataset
+admission is `0011`; both research-v3 and feature-label-v2 catalog triggers coexist; and the combined
+workspace lock and 357-path source closure are reconciled. The product admits only catalog-backed
+Task 11 point-in-time exports, preserves Decimal128 as `decimal.Decimal`, exposes bounded Rust
+financial kernels, performs deterministic training, and publishes only finalized model candidates.
+
+The first exact-head review rejected two model-publication authority defects. Remediation freezes
+artifact, training-run, and final metadata bytes before authority issuance; authority schema v4
+binds all three digests plus the existing dataset/model identities; Rust expectations enforce those
+independent hashes; and the public API cannot select a validator executable. The only admitted
+validator is adjacent to the active interpreter and must match the bounded pre/post SHA-256 compiled
+into `_native`. Exact-head rereview accepted `02ab5cd` with no remaining Critical or Important
+finding.
+
+The single sealed offline matrix at `02ab5cd` passed 9/9 contracts on CPython 3.12.12 and 9/9 on
+3.13.7 without retry. The persisted release-evidence identities are: manifest
+`5403a73fbfe03d715b192e9da19cf9e7cfc8b7aa31f773bdd39586534b44618d`, wheel
+`f19be320abd91ed73637f6d7edfa8df133ff5149cfaa8804663dadcd4134a25c`, validator
+`2b8576c3e6f219f34d958c863e08cf2b68599306faa2668ba8cf348f705e1b1c`, source/wheelhouse lock
+`92657a32099c7b309e9b73b674ae1ecee26f8c70d71e69e1a72f225a5e510f9a`, and build environment
+`d0a9479dae9eb8024e5a4c6bfb1e5fa606a03e0858530ca3a1622b2580379931`. After fast-forward
+integration, the clean Python worktree, its 5.5 GiB target and 1.2 GiB ignored release evidence, and
+the merged local feature branch were removed; no origin feature branch existed; metadata was
+pruned; and only the release worktree remains.
+
 Task 15 ONNX integration begins only against the frozen Task 13 contract and must not weaken
 controlled-root, exact-identity, bounded-runtime, or no-action semantics. Issue `#31` remains the
 mandatory zero-fee provider onboarding portal: it may automate
@@ -421,6 +441,6 @@ canonical identities, semantic recovery, audit-chain triggers, and global record
 The accepted implementation retained one consolidated fair-value integration executable. Focused
 locked valuation, live-export, catalog/query, strict Clippy, formatting, and diff gates passed on
 the merged release tree. Independent review found two material PIT/override defects; the exact-head
-remediation rereview found no remaining Critical or Important blocker. Closeout requires pushing
-the documentation commit, marking issue `#23` and its Project 5 item Done, then cleaning the 2.9 GiB
-feature target, worktree, and merged local/remote branch.
+remediation rereview found no remaining Critical or Important blocker. The closeout was pushed,
+issue `#23` and its Project 5 item were marked Done, and the 2.9 GiB feature target, clean worktree,
+merged local branch, and remote metadata were removed.

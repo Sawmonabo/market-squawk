@@ -1804,6 +1804,13 @@ fail-closed and no action is produced.
 
 ### Task 14: Implement the Python financial analytics and training product
 
+**Status:** Complete at accepted and fast-forwarded release code head `02ab5cd`. The exact-head
+read-only rereview accepted the catalog, memory, Decimal, runtime, cancellation, migration, model-
+authority, and validator boundaries with no remaining Critical or Important finding. The single
+sealed offline release matrix admitted 357 source paths and passed 9/9 product contracts on both
+CPython 3.12.12 and 3.13.7. GitHub issue `#19` and its Project 5 item close as Done with this
+documentation push.
+
 **Files:**
 
 - Create: `crates/market-squawk-python/Cargo.toml`
@@ -1831,12 +1838,13 @@ fail-closed and no action is produced.
 - Consumes: Task 11 manifest/PIT dataset, Task 12 analytics, Task 13 bundle schema, Task 1 exact Python
   dependency/runtime policy.
 - Produces Python APIs `open_dataset(root, manifest_sha256, as_of)`, `market_squawk.finance` PyO3
-bindings to Rust kernels, `TrainingRun.fit_evaluate_export`, and `BundleCandidate.write`, returning
+bindings to Rust kernels, `TrainingRun.fit_evaluate`, `TrainingProposal.export`, and
+`BundleCandidate.write`, returning
 only verified local paths/content hashes and exact Decimal/time/provenance metadata. The research API
 also produces bounded self-contained chart specifications/static SVG from already loaded local
 results; the executable notebook uses the same APIs with no download or release authority.
 
-- [ ] **Step 1: Write RED packaging/data/parity/training tests**
+- [x] **Step 1: Write RED packaging/data/parity/training tests**
 
 Test deterministic source/wheel lock parsing, clean offline hash-locked install, supported interpreter
 matrix, package import without network,
@@ -1848,25 +1856,27 @@ to prove no Python/PyO3 import. Execute the example script and notebook in the c
 assert fixed hashes for chart specifications, no external resource URLs, bounded point counts and no
 secret/path leakage.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 ```bash
-python3 -m unittest scripts.tests.test_build_python_release -v
-python3 scripts/build_python_release.py \
+python3 -I scripts/build_python_release.py \
+  --offline \
   --lock python/wheelhouse-lock.json \
-  --wheelhouse .agents/tmp/python-wheelhouse \
-  --venv .agents/tmp/python-release-venv
+  --artifact-root .agents/tmp/python-release \
+  --python /absolute/path/to/python3.12 \
+  --python /absolute/path/to/python3.13
 ```
 
 Expected: FAIL because the Python product, lock, native extension and release builder do not exist.
 
-- [ ] **Step 3: Implement manifest-bound data access and native finance bindings**
+- [x] **Step 3: Implement manifest-bound data access and native finance bindings**
 
 Use PyArrow only after validating the catalog-exported manifest digest, schema version, object hashes
 and as-of policy; never scan directories for datasets. Convert accounting values to `Decimal`, not
 float. Build a `market_squawk._native` PyO3 extension from `market-squawk-python`, which depends only
-on domain/analytics and exposes typed arrays/policies/results. Release the GIL only around bounded
-pure Rust computation; translate typed errors without leaking paths/secrets.
+on domain, analytics, and catalog/data admission crates and exposes typed arrays/policies/results.
+Release the GIL only around bounded pure Rust computation; translate typed errors without leaking
+paths/secrets.
 
 `scripts/build_python_release.py` verifies every source/wheel filename, SHA-256, Python/platform tag
 and license from `wheelhouse-lock.json`; populates the ignored wheelhouse from an explicitly supplied
@@ -1876,29 +1886,28 @@ the `abi3` project wheel to the run manifest, creates a clean venv, installs dep
 project wheel with `pip --no-index --find-links`, and records interpreter, compiler, Cargo, wheel and
 lock digests. It never downloads during the offline verification mode used by Task 20.
 
-- [ ] **Step 4: Implement deterministic training, evaluation, and export**
+- [x] **Step 4: Implement deterministic training, evaluation, and export**
 
 Require dataset/feature/label/universe/split hashes, seed, code/environment lock digest and explicit
 missing policy. Record metrics and trial identity; export a size-bounded model plus normalization and
 complete Task 13 metadata. Re-open and validate the candidate with the Rust bundle validator before
 success. Examples use local fixtures and perform no hidden download.
 
-- [ ] **Step 5: Run GREEN and commit**
+- [x] **Step 5: Run GREEN and commit**
 
 ```bash
-python3 -m unittest scripts.tests.test_build_python_release -v
-MARKET_SQUAWK_PYTHON_WHEEL_PREPARE_NETWORK=1 \
-  python3 scripts/build_python_release.py --prepare-cache-only \
+python3 -I scripts/build_python_release.py \
   --lock python/wheelhouse-lock.json \
-  --wheelhouse .agents/cache/python-wheelhouse
-python3 scripts/build_python_release.py \
+  --artifact-root .agents/tmp/python-release \
+  --python /absolute/path/to/python3.12 \
+  --python /absolute/path/to/python3.13 \
+  --prepare-cache-only
+python3 -I scripts/build_python_release.py \
   --offline \
   --lock python/wheelhouse-lock.json \
-  --wheelhouse .agents/cache/python-wheelhouse \
-  --venv .agents/tmp/python-release-venv
-.agents/tmp/python-release-venv/bin/python -m pytest python/tests -q
-cargo test -p market-squawk-python --all-features
-cargo build --workspace --all-features
+  --artifact-root .agents/tmp/python-release \
+  --python /absolute/path/to/python3.12 \
+  --python /absolute/path/to/python3.13
 python3 scripts/check_workspace_boundaries.py
 git diff --check
 git commit -m "feat(python): add financial research and training product"
@@ -2183,7 +2192,8 @@ reproducible backtest without capture replay.
 ### Task 18: Implement ASC 820/IFRS 13 fair-value analysis
 
 **Status:** Complete at accepted feature head `31de1a5`; release merge `051ee3c`, lock reconciliation
-`5c34b7d`. GitHub closeout follows the release documentation commit and push.
+`5c34b7d`. GitHub issue `#23` is closed and its Project 5 item is Done; the feature worktree and
+merged branch are cleaned.
 
 **Files:**
 

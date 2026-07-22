@@ -63,6 +63,15 @@ work is bound by the single canonical
   borrowed, successful inference does not allocate output identity, every model failure maps to
   zero order intents, and the paper-bot audit worker durably records the typed no-action evidence in
   an explicit v2 stream without modifying historical v1 audit files.
+- An offline Python financial-research and deterministic-training product for GIL-enabled CPython
+  3.12 and 3.13 on macOS 12+ arm64. The tracked `python/` package opens only catalog-authorized,
+  manifest-bound point-in-time Parquet exports; preserves Decimal128 as `decimal.Decimal` with exact
+  scale; exposes bounded Rust financial kernels; produces deterministic native linear/logistic
+  candidates; and validates publication through an exact, digest-bound Rust validator. Final model
+  metadata, artifact, training-run, dataset, feature, label, universe, split, code, and environment
+  identities are bound before external authority is accepted. The sealed builder verifies the
+  357-file source closure, hash-locked wheels, CPython runtimes, toolchain, SDK, validator, and
+  project wheel, then installs and tests without network access.
 - A production local-file extraction vertical for CSV/TSV, JSON/NDJSON, entity-safe XML,
   formula- and external-link-constrained Excel, allowlisted read-only SQLite exports, OFX/QFX, and
   Parquet. User-authorized capability roots, bounded parsing and decompression, revocable source
@@ -141,7 +150,6 @@ terminal consumer, focused verification, immutable evidence, and exact commit ex
 | `Missing` | Kraken direct-source qualification | The production transport, decoder, checksum, exact-generation session lifecycle, fresh-snapshot recovery, and canonical risk/no-paper-mutation terminal proof exist; Kraken WebSocket v2 supplies no venue sequence satisfying the current `DirectVerified` execution predicate | Task 20 |
 | `Missing` | FRED/ALFRED durable local consumption | The production vintage-aware adapter is runnable for authorized ephemeral retrieval, but the exact current terms bundle does not establish per-series rights for persistence, caching, archival, or training | Task 9 / Task 20 |
 | `Missing` | portfolio import | The raw-preserving adapter now enforces durable revisions, account/currency authority, reconciliation, supersession, and canonical data-lane output, but no application service or CLI yet composes a real Task 7 local-file/OFX producer into its required portfolio-raw contract | Task 19 |
-| `Missing` | Python data/financial/training product | The feature-lane remediation is implemented but not yet accepted: it must merge the now-authoritative fair-value migration as `0010`, renumber its dataset-admission migration to `0011`, reconcile the combined schema/lock/source closure, run one offline CPython 3.12/3.13 matrix, and pass exact-head rereview | Task 14 |
 | `Missing` | constrained ONNX inference | No validated, bounded, fail-closed ONNX-compatible backend | Task 15 |
 | `Missing` | research backtesting | No point-in-time research-dataset backtester | Task 17 |
 | `Missing` | strategies and comprehensive risk | Bounded account/risk coordination, actor-owned authority consumption, private approval, one-time dispatch, price-bound reconciliation, and terminal audit exist; a production order-producing strategy and its controlled user-facing configuration do not | Task 2 |
@@ -151,9 +159,9 @@ terminal consumer, focused verification, immutable evidence, and exact commit ex
 | `Missing` | release security/fuzz/performance gate | No exact-head release evidence or final integrated demonstration | Task 20 |
 
 Production-hardened Coinbase and Kraken source crates are tracked under `adapters/`; their
-execution-qualification verticals remain release-blocking above. The checkout has no tracked
-`python/` product package. Python files under `scripts/` are repository-verification and
-protocol-smoke utilities, not financial-analytics or model-training product code.
+execution-qualification verticals remain release-blocking above. The tracked `python/` product is
+runnable through the sealed release builder described below. Python files under `scripts/` remain
+build, verification, and protocol-smoke utilities rather than financial product APIs.
 
 ## Release blocked until implemented
 
@@ -171,17 +179,61 @@ commercial consolidated-feed coverage, and OpenTelemetry infrastructure are not 
 ## Why Rust
 
 The live path needs predictable memory use, native execution, safe concurrency, fixed-point
-financial values, and a single local binary. The required Python research, financial-analytics, and
-model-training product is currently missing and release-blocking. Its specified boundary consumes
-point-in-time Arrow/Parquet data and pure Rust analytical kernels outside the live path; Python is
-never placed between a live event and an automated decision.
+financial values, and a single local binary. Python research, financial analytics, visualization,
+and deterministic training consume point-in-time Arrow/Parquet data and bounded pure-Rust kernels
+outside the live path. Python is never placed between a live event and an automated decision.
+
+## Python research and training quick start
+
+The supported `v0.1.0` Python release target is GIL-enabled CPython 3.12 and 3.13 on macOS 12 or
+newer on arm64. Supply absolute paths to both interpreters. The first command performs the explicit
+one-time preparation of free, hash-pinned public dependency caches; the second build is fully
+offline and produces isolated release environments plus a machine-readable evidence manifest.
+
+```bash
+python3 -I scripts/build_python_release.py \
+  --lock python/wheelhouse-lock.json \
+  --artifact-root .agents/python-release \
+  --python /absolute/path/to/python3.12 \
+  --python /absolute/path/to/python3.13 \
+  --prepare-cache-only
+
+python3 -I scripts/build_python_release.py \
+  --lock python/wheelhouse-lock.json \
+  --artifact-root .agents/python-release \
+  --python /absolute/path/to/python3.12 \
+  --python /absolute/path/to/python3.13 \
+  --offline
+```
+
+After the offline build, a local financial-kernel call is available immediately:
+
+```bash
+.agents/python-release/release-cp312/bin/python -I - <<'PY'
+from decimal import Decimal
+from market_squawk.finance import OperationContext, simple_returns
+
+result = simple_returns(
+    [Decimal("100.00"), Decimal("101.25")],
+    [1_000_000_000, 2_000_000_000],
+    "USD",
+    context=OperationContext(60_000, 100_000),
+)
+print(result.values)
+PY
+```
+
+For point-in-time dataset access and visualization, see `python/examples/pit_research.py`; it
+requires an existing locally admitted Task 11 dataset root and exact export SHA-256. Training uses
+the same admitted dataset receipt and returns a finalized model proposal that must match an external
+authority file before the digest-bound Rust validator will publish it.
 
 ## Diagnostic foundation quick start
 
-These commands demonstrate only the authority-free diagnostic entry points. They do not demonstrate
-production execution quality, Python model training, ONNX inference, portfolio or fair-value
-workflows through the CLI, or complete MCP coverage. The Rust research datasets, native model
-inference, and portfolio-accounting libraries listed above are independently runnable now.
+These Rust commands demonstrate only the authority-free diagnostic entry points. They do not
+demonstrate production execution quality, ONNX inference, portfolio or fair-value workflows through
+the CLI, or complete MCP coverage. The research datasets, native model inference, Python product,
+and portfolio-accounting libraries listed above are independently runnable now.
 
 Prerequisites:
 
@@ -475,13 +527,24 @@ crates/
 ├── market-squawk-execution/       typed intents and bounded pre-authority account/risk coordination
 ├── market-squawk-live/            production authority, sharding, books, and bounded snapshots
 ├── market-squawk-mcp/             bounded local stdio MCP protocol and lifecycle foundation
+├── market-squawk-modeling/        immutable bundles, native inference, registry, and validator
 ├── market-squawk-platform/        local paths, lifecycle, capture, persistence, and operations
+├── market-squawk-portfolio/       immutable accounting, reconciliation, analytics, and risk state
+├── market-squawk-python/          stable-ABI bindings for bounded research and dataset admission
 ├── market-squawk-services/        shared application-service contracts
-└── market-squawk-sources/         source contracts, registry, budgets, health, and supervision
+├── market-squawk-sources/         source contracts, registry, budgets, health, and supervision
+└── market-squawk-valuation/       ASC 820/IFRS 13 evidence, classification, and approval workflow
 adapters/
-├── market-squawk-adapter-coinbase/ bounded Coinbase Exchange v1 source and protocol fixtures
-├── market-squawk-adapter-kraken/   bounded Kraken v2 transport, decoder, checksum, and session source
-└── market-squawk-adapter-paper/    bounded realistic paper execution, accounting, audit, and recovery
+├── market-squawk-adapter-bls/       BLS public and registered-tier extraction
+├── market-squawk-adapter-coinbase/  Coinbase Exchange v1 source and protocol fixtures
+├── market-squawk-adapter-files/     CSV/TSV/JSON/NDJSON/XML/Excel/SQLite/OFX/QFX/Parquet extraction
+├── market-squawk-adapter-fred/      FRED/ALFRED observations and vintage extraction
+├── market-squawk-adapter-kraken/    Kraken v2 transport, decoder, checksum, and session source
+├── market-squawk-adapter-paper/     realistic paper execution, accounting, audit, and recovery
+├── market-squawk-adapter-portfolio/ raw-preserving holdings and transaction normalization
+├── market-squawk-adapter-sec/       SEC submissions, filings, Company Facts, and inline XBRL
+└── market-squawk-adapter-treasury/  Fiscal Data and official yield-feed extraction
+python/                             local PIT data, finance, visualization, training, and examples
 scripts/                            deterministic local/CI policy and smoke gates
 docs/                               architecture, plans, research, and verification evidence
 ```
@@ -515,8 +578,8 @@ exactly four production-weighted review quarters:
 2. **Quarter 2 of 4 — Stage 2 / Waves 2–3:** implement file, SEC, macro, and portfolio adapters;
    compose research ingestion, point-in-time datasets, corporate actions, and batch analytics.
 3. **Quarter 3 of 4 — Stage 3 / Waves 4A–4B:** model bundles, native inference, portfolio accounting,
-   portfolio/execution binding, and fair-value analysis are integrated; complete the Python
-   product, ONNX inference, and backtesting.
+   portfolio/execution binding, fair-value analysis, and the Python product are integrated; complete
+   ONNX inference and backtesting.
 4. **Quarter 4 of 4 — Stages 4–5 / Waves 5–6:** complete shared services, CLI, and typed MCP domains;
    then run integrated demonstrations, provider evidence, fuzzing, measured performance, security,
    supply-chain gates, grouped review, publication, and cleanup.

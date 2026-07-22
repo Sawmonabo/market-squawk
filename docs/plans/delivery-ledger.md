@@ -9,7 +9,8 @@ evidence; it does not replace the README capability truth or the canonical relea
 ## Current integration state
 
 - Release branch: `release/market-squawk-v0.1.0`
-- Current integrated capability code head: `31de1a5` (`fix(valuation): enforce point-in-time override authority`)
+- Current integrated capability code head: `02ab5cd` (`fix(python): bind model publication authority`)
+- Task 14 accepted feature and fast-forwarded release head: `02ab5cd`
 - Task 18 release merge head: `051ee3c`; reconciled lock head: `5c34b7d`
 - Task 13 accepted feature and release head: `59ba05c`
 - Task 16 accepted core head: `e124722`; accepted execution-binding and release head: `7621552`
@@ -52,7 +53,7 @@ evidence; it does not replace the README capability truth or the canonical relea
   strict affected-package Clippy, workspace boundaries, formatting, and diff hygiene passed.
   Independent exact-head re-review confirmed all three earlier authority/concurrency/dispatch
   findings closed with no remaining Critical or Important finding.
-- Task 18 owner: GitHub issue `#23`, Project 5; closure follows this ledger commit and push.
+- Task 18 owner: GitHub issue `#23`, Project 5, status `Done`.
 - Delivered at accepted feature head `31de1a5`: nonforgeable producer receipts; point-in-time market
   activity and evidence admission; strict Level 1 classification; usable Level 2/Level 3 input
   judgments; non-promotable `Unclassified` evidence; durable dual-approved market access,
@@ -62,10 +63,27 @@ evidence; it does not replace the README capability truth or the canonical relea
   formatting, and diff hygiene passed on the integrated locked tree. Exact-head review rejected two
   point-in-time/override defects; remediation-only rereview accepted `31de1a5` with no remaining
   Critical or Important finding.
-- Current implementation barrier: Task 14's Python remediation is implemented but intentionally
-  parked outside the release branch. It must now consume fair value's authoritative migration
-  `0010`, move dataset admission to `0011`, reconcile the combined schema/lock/source closure, run
-  one offline CPython 3.12/3.13 matrix, and pass exact-head rereview.
+- Task 14 owner: GitHub issue `#19`, Project 5, status `Done` after this closeout push.
+- Delivered at accepted and fast-forwarded release head `02ab5cd`: catalog-authorized Task 11
+  point-in-time dataset access; fixed-width Arrow/Parquet schema-v2 validation; exact
+  `decimal.Decimal` accounting inputs; bounded Rust financial kernels; visualization; deterministic
+  native linear/logistic training; and finalized model-bundle publication. External authority v4
+  independently binds final metadata, artifact, training-run, catalog, export, selection, feature,
+  label, universe, split, code, and environment identities. The production API cannot select a
+  validator executable; the adjacent Rust validator is size/type bounded and its pre/post hash must
+  match the identity compiled into the native wheel.
+- Task 14 verification: exact-head rereview accepted `02ab5cd` after the original catalog, memory,
+  Decimal, runtime, cancellation, migration, schema, model-authority, and validator findings were
+  closed. The single sealed offline release matrix admitted 357 source paths and passed 9/9 product
+  contracts on CPython 3.12.12 and 9/9 on 3.13.7 with no retry. Exact evidence: release manifest
+  `5403a73fbfe03d715b192e9da19cf9e7cfc8b7aa31f773bdd39586534b44618d`, project wheel
+  `f19be320abd91ed73637f6d7edfa8df133ff5149cfaa8804663dadcd4134a25c`, validator
+  `2b8576c3e6f219f34d958c863e08cf2b68599306faa2668ba8cf348f705e1b1c`, wheelhouse/source lock
+  `92657a32099c7b309e9b73b674ae1ecee26f8c70d71e69e1a72f225a5e510f9a`, and sealed build
+  environment `d0a9479dae9eb8024e5a4c6bfb1e5fa606a03e0858530ca3a1622b2580379931`.
+- The next implementation barrier is the parallel-compatible Task 15 constrained local ONNX backend
+  and Task 17 point-in-time backtesting engine. Neither may weaken the accepted Task 11–14 or Task
+  16 authority contracts.
 
 - Task 12 owner: GitHub issue `#17`, Project 5, status `Done`.
 - Exact feature and fast-forwarded release code head: `9702556`.
@@ -171,8 +189,12 @@ application size.
   `#18` was closed with its Project 5 item `Done`. Issue `#21` subsequently completed at `7621552`,
   was closed, and its Project 5 item was set to `Done`. Its generated target was cleaned, its clean
   worktree and merged local feature branch were removed, no matching origin branch remained, and
-  worktree/remote metadata was pruned. The Python feature worktree is the only active feature lane.
+  worktree/remote metadata was pruned.
+- Fast-forwarded Task 14 to `02ab5cd`, removed the clean Python feature worktree and its 5.5 GiB
+  target plus 1.2 GiB ignored release evidence, deleted merged local branch
+  `feature/python-financial-training`, confirmed no matching origin branch existed, and pruned
+  worktree/remote metadata. Only the release worktree remains.
 
-The next delivery event is acceptance of Task 14's corrected Python financial analytics/training
-product, followed by Task 15's bounded local ONNX inference. Completed Tasks 13 and 16 do not claim
-that the Market Squawk product release is complete.
+The next delivery event is parallel implementation of Task 15's bounded local ONNX inference and
+Task 17's point-in-time research backtesting, followed by their shared integration checkpoint.
+Completed Tasks 13, 14, 16, and 18 do not claim that the Market Squawk product release is complete.
