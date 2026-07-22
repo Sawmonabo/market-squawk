@@ -13,7 +13,7 @@ use market_squawk_live::{CurrentAuthorityGate, LiveExecutionCapability};
 use serde::Serialize;
 
 use crate::approval::approved_order_from_risk;
-use crate::audit::{ExecutionAuditContext, ExecutionAuditPermit};
+use crate::audit::{ExecutionAuditContext, ExecutionAuditEvidence, ExecutionAuditPermit};
 use crate::clock::{monotonic_deadline, system_now};
 use crate::{
     AccountReservationError, AccountRiskCoordinator, AccountRiskReservation, AccountRiskViolation,
@@ -169,6 +169,8 @@ pub enum RiskRejectionCode {
     PriceDeviationLimit,
     /// Authoritative account state produced a typed violation.
     Account(AccountRiskViolation),
+    /// Authoritative portfolio state or its execution binding is invalid.
+    Portfolio(crate::PortfolioReadError),
 }
 
 /// Nonempty stable ordered risk rejection.
@@ -244,6 +246,7 @@ pub enum RiskServiceError {
 #[derive(Debug)]
 pub struct RiskService {
     accounts: Arc<AccountRiskCoordinator>,
+    portfolio: crate::PortfolioReadCapability,
     limits: RiskLimits,
     audit: ExecutionAuditWriter,
     config: RiskServiceConfig,
@@ -255,6 +258,7 @@ impl RiskService {
     /// Creates a risk service over authoritative account state and mandatory bounded audit.
     pub fn try_new(
         accounts: Arc<AccountRiskCoordinator>,
+        portfolio: crate::PortfolioReadCapability,
         limits: RiskLimits,
         audit: ExecutionAuditWriter,
         config: RiskServiceConfig,
@@ -265,6 +269,7 @@ impl RiskService {
         let retained_bytes = Self::retained_bytes_for_limits(&limits)?;
         Ok(Self {
             accounts,
+            portfolio,
             limits,
             audit,
             config,
@@ -329,8 +334,7 @@ impl RiskService {
                     approval_id,
                     &intent,
                     *market,
-                    None,
-                    None,
+                    ExecutionAuditEvidence::new(None, None, None),
                     self.config.policy,
                     intent.expires_at().min(self.config.policy_valid_until),
                 );
@@ -353,8 +357,7 @@ impl RiskService {
                     approval_id,
                     &intent,
                     *market,
-                    None,
-                    None,
+                    ExecutionAuditEvidence::new(None, None, None),
                     self.config.policy,
                     intent.expires_at().min(self.config.policy_valid_until),
                 );
@@ -369,6 +372,8 @@ impl RiskService {
             }
         };
         let mut reasons = Vec::new();
+        let mut portfolio_binding = None;
+        let mut portfolio_snapshot = None;
         let previous = self
             .last_wall_nanos
             .fetch_max(now.wall.unix_nanos(), Ordering::AcqRel);
@@ -391,6 +396,22 @@ impl RiskService {
                 AccountRiskViolation::ArithmeticOverflow,
             ));
         }
+        match self.portfolio.bind_current(
+            intent.account_id(),
+            intent.execution_terms().instrument_id(),
+            intent.side(),
+            self.limits.currency(),
+        ) {
+            Ok((binding, snapshot)) => {
+                portfolio_binding = Some(binding);
+                if let Err(rejection) = self.accounts.assess_portfolio(&intent, &snapshot) {
+                    extend_account_reasons(&mut reasons, &rejection);
+                } else {
+                    portfolio_snapshot = Some(snapshot);
+                }
+            }
+            Err(error) => reasons.push(RiskRejectionCode::Portfolio(error)),
+        }
         if let Some(execution_price_bound) = execution_price_bound
             && let Err(rejection) =
                 self.accounts
@@ -403,8 +424,11 @@ impl RiskService {
                 approval_id,
                 &intent,
                 *market,
-                Some(&authority),
-                execution_price_bound,
+                ExecutionAuditEvidence::new(
+                    Some(&authority),
+                    execution_price_bound,
+                    portfolio_binding.as_ref(),
+                ),
                 self.config.policy,
                 intent
                     .expires_at()
@@ -426,8 +450,7 @@ impl RiskService {
                 approval_id,
                 &intent,
                 *market,
-                Some(&authority),
-                None,
+                ExecutionAuditEvidence::new(Some(&authority), None, portfolio_binding.as_ref()),
                 self.config.policy,
                 intent
                     .expires_at()
@@ -443,10 +466,89 @@ impl RiskService {
             );
             return RiskOutcome::Rejected(RiskRejection::new(reasons.to_vec()));
         };
-        let reservation = match self.accounts.try_reserve(
+        let Some(portfolio_binding) = portfolio_binding else {
+            let reasons = [RiskRejectionCode::Portfolio(
+                crate::PortfolioReadError::ContentMismatch,
+            )];
+            let context = ExecutionAuditContext::from_risk(
+                approval_id,
+                &intent,
+                *market,
+                ExecutionAuditEvidence::new(Some(&authority), Some(execution_price_bound), None),
+                self.config.policy,
+                intent
+                    .expires_at()
+                    .min(authority.valid_until())
+                    .min(self.config.policy_valid_until),
+            );
+            commit_audit(
+                audit,
+                ExecutionAuditKind::RiskRejected,
+                context,
+                now.wall,
+                &reasons,
+            );
+            return RiskOutcome::Rejected(RiskRejection::new(reasons.to_vec()));
+        };
+        let Some(portfolio_snapshot) = portfolio_snapshot else {
+            let reasons = [RiskRejectionCode::Portfolio(
+                crate::PortfolioReadError::ContentMismatch,
+            )];
+            let context = ExecutionAuditContext::from_risk(
+                approval_id,
+                &intent,
+                *market,
+                ExecutionAuditEvidence::new(
+                    Some(&authority),
+                    Some(execution_price_bound),
+                    Some(&portfolio_binding),
+                ),
+                self.config.policy,
+                intent
+                    .expires_at()
+                    .min(authority.valid_until())
+                    .min(self.config.policy_valid_until),
+            );
+            commit_audit(
+                audit,
+                ExecutionAuditKind::RiskRejected,
+                context,
+                now.wall,
+                &reasons,
+            );
+            return RiskOutcome::Rejected(RiskRejection::new(reasons.to_vec()));
+        };
+        if let Err(error) = self.portfolio.recheck(&portfolio_binding) {
+            let reasons = [RiskRejectionCode::Portfolio(error)];
+            let context = ExecutionAuditContext::from_risk(
+                approval_id,
+                &intent,
+                *market,
+                ExecutionAuditEvidence::new(
+                    Some(&authority),
+                    Some(execution_price_bound),
+                    Some(&portfolio_binding),
+                ),
+                self.config.policy,
+                intent
+                    .expires_at()
+                    .min(authority.valid_until())
+                    .min(self.config.policy_valid_until),
+            );
+            commit_audit(
+                audit,
+                ExecutionAuditKind::RiskRejected,
+                context,
+                now.wall,
+                &reasons,
+            );
+            return RiskOutcome::Rejected(RiskRejection::new(reasons.to_vec()));
+        }
+        let reservation = match self.accounts.try_reserve_for_portfolio(
             &intent,
             execution_price_bound.maximum_price(),
             &self.limits,
+            &portfolio_snapshot,
         ) {
             Ok(reservation) => reservation,
             Err(rejection) => {
@@ -455,8 +557,11 @@ impl RiskService {
                     approval_id,
                     &intent,
                     *market,
-                    Some(&authority),
-                    Some(execution_price_bound),
+                    ExecutionAuditEvidence::new(
+                        Some(&authority),
+                        Some(execution_price_bound),
+                        Some(&portfolio_binding),
+                    ),
                     self.config.policy,
                     intent
                         .expires_at()
@@ -492,8 +597,11 @@ impl RiskService {
                     approval_id,
                     &intent,
                     *market,
-                    Some(&authority),
-                    Some(execution_price_bound),
+                    ExecutionAuditEvidence::new(
+                        Some(&authority),
+                        Some(execution_price_bound),
+                        Some(&portfolio_binding),
+                    ),
                     self.config.policy,
                     valid_until,
                 );
@@ -511,8 +619,11 @@ impl RiskService {
             approval_id,
             &intent,
             *market,
-            Some(&authority),
-            Some(execution_price_bound),
+            ExecutionAuditEvidence::new(
+                Some(&authority),
+                Some(execution_price_bound),
+                Some(&portfolio_binding),
+            ),
             self.config.policy,
             valid_until,
         );
@@ -530,6 +641,8 @@ impl RiskService {
             execution_price_bound,
             authority,
             reservation,
+            self.portfolio.clone(),
+            portfolio_binding,
             self.config.policy,
             valid_until,
             monotonic_deadline,
@@ -555,6 +668,8 @@ impl RiskService {
             }
         };
         let mut reasons = Vec::new();
+        let mut portfolio_binding = None;
+        let mut portfolio_snapshot = None;
         let wall = now.wall.unix_nanos();
         let previous = self.last_wall_nanos.fetch_max(wall, Ordering::AcqRel);
         if wall < previous {
@@ -567,6 +682,22 @@ impl RiskService {
             reasons.push(RiskRejectionCode::Account(
                 AccountRiskViolation::ArithmeticOverflow,
             ));
+        }
+        match self.portfolio.bind_current(
+            intent.account_id(),
+            intent.execution_terms().instrument_id(),
+            intent.side(),
+            self.limits.currency(),
+        ) {
+            Ok((binding, snapshot)) => {
+                portfolio_binding = Some(binding);
+                if let Err(rejection) = self.accounts.assess_portfolio(intent, &snapshot) {
+                    extend_account_reasons(&mut reasons, &rejection);
+                } else {
+                    portfolio_snapshot = Some(snapshot);
+                }
+            }
+            Err(error) => reasons.push(RiskRejectionCode::Portfolio(error)),
         }
         if let Some(execution_price_bound) = execution_price_bound
             && let Err(rejection) =
@@ -584,10 +715,25 @@ impl RiskService {
             ]));
         };
 
-        match self
-            .accounts
-            .try_reserve(intent, execution_price_bound.maximum_price(), &self.limits)
-        {
+        let (Some(portfolio_binding), Some(portfolio_snapshot)) =
+            (portfolio_binding, portfolio_snapshot)
+        else {
+            return PreAuthorityRiskOutcome::Rejected(RiskRejection::new(vec![
+                RiskRejectionCode::Portfolio(crate::PortfolioReadError::ContentMismatch),
+            ]));
+        };
+        if let Err(error) = self.portfolio.recheck(&portfolio_binding) {
+            return PreAuthorityRiskOutcome::Rejected(RiskRejection::new(vec![
+                RiskRejectionCode::Portfolio(error),
+            ]));
+        }
+
+        match self.accounts.try_reserve_for_portfolio(
+            intent,
+            execution_price_bound.maximum_price(),
+            &self.limits,
+            &portfolio_snapshot,
+        ) {
             Ok(reservation) => PreAuthorityRiskOutcome::Reserved(reservation),
             Err(rejection) => {
                 extend_account_reasons(&mut reasons, &rejection);

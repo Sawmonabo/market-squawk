@@ -17,8 +17,9 @@ use market_squawk_domain::{
 use market_squawk_execution::{
     AccountBootstrap, AccountCoordinatorConfig, AccountIdempotencyBootstrap,
     AccountRiskCoordinator, ExecutionAuditConfig, ExecutionAuditWriter, MarketRiskInput,
-    OrderIntent, OrderIntentInput, PreAuthorityRiskOutcome, RiskLimits, RiskLimitsInput,
-    RiskPolicyIdentity, RiskRejectionCode, RiskService, RiskServiceConfig,
+    OrderIntent, OrderIntentInput, PortfolioReadCapability, PortfolioReadError,
+    PortfolioReadLimits, PreAuthorityRiskOutcome, RiskLimits, RiskLimitsInput, RiskPolicyIdentity,
+    RiskRejectionCode, RiskService, RiskServiceConfig,
 };
 use market_squawk_sources::{
     AuthorizationGrant, AuthorizationMode, BackoffPolicy, BudgetScope, ChecksumValidationProfile,
@@ -192,6 +193,7 @@ fn kraken_quality_is_rejected_before_paper_state_mutation() -> Result<(), Box<dy
     })?;
     let risk = RiskService::try_new(
         coordinator,
+        PortfolioReadCapability::unavailable(PortfolioReadLimits::default())?,
         limits,
         audit,
         RiskServiceConfig {
@@ -255,7 +257,13 @@ fn kraken_quality_is_rejected_before_paper_state_mutation() -> Result<(), Box<dy
     assert_eq!(paper.position_lots(account, instrument)?, position_before);
     assert_eq!(paper.account_risk(account)?, risk_before);
     let rejection = rejection.ok_or("Kraken quality unexpectedly passed canonical risk")?;
-    assert_eq!(rejection.reasons(), &[RiskRejectionCode::SourceQuality]);
+    assert_eq!(
+        rejection.reasons(),
+        &[
+            RiskRejectionCode::SourceQuality,
+            RiskRejectionCode::Portfolio(PortfolioReadError::MissingAccount),
+        ]
+    );
     Ok(())
 }
 

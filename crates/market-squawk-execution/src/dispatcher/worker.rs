@@ -267,6 +267,22 @@ async fn process_command(
         );
         return;
     }
+    if parts
+        .portfolio_capability
+        .recheck(&parts.portfolio)
+        .is_err()
+    {
+        parts.reservation.mark_known_not_accepted();
+        mark_terminal(registry, approval_id, final_now.wall);
+        commit_dispatch_audit(
+            audit,
+            ExecutionAuditKind::DispatchRejected,
+            context,
+            final_now.wall,
+            &[ExecutionAuditReason::PortfolioRevisionInvalid],
+        );
+        return;
+    }
     let fail_safe = match parts
         .reservation
         .begin_submission(parts.valid_until, parts.monotonic_deadline)
@@ -348,6 +364,7 @@ async fn process_command(
         parts.valid_until,
         final_now.wall,
         account_revision,
+        parts.portfolio,
         ExecutionOperation::new(operation_deadline, operation_cancellation.clone()),
     );
     let (result, deadline_exceeded) = attempt_submit(

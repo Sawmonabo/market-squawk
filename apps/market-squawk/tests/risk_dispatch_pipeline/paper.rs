@@ -406,8 +406,13 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
         &SourceIdentifier::try_from("risk-paper-production")?,
         RuleVersion::new(1)?,
     );
+    let (portfolio_publisher, portfolio) = portfolio_state_for_cash_accounts(&[(
+        account_id,
+        Money::new(Decimal::new(10_000, 0), usd),
+    )])?;
     let risk = RiskService::try_new(
         Arc::clone(&accounts),
+        portfolio,
         limits,
         execution_audit,
         RiskServiceConfig {
@@ -755,6 +760,11 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
             ),
         "the final sell probe must increase an existing short exposure"
     );
+    portfolio_publisher.publish(portfolio_service_for_reconciled_account(
+        &accounts.snapshot_recovery_state(account_id)?,
+        terms,
+        90,
+    )?)?;
     let (_, subsequent) = source.batch_with_price("paper-subsequent-order", 7, "97.00")?;
     ingress.try_publish(subsequent)?;
     accepted_digests.insert(

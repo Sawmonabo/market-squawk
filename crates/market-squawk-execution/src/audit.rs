@@ -58,6 +58,7 @@ pub enum ExecutionAuditReason {
     RegistryUnavailable,
     ClockFailure,
     ApprovalInvalid,
+    PortfolioRevisionInvalid,
     AdapterRejected,
     AdapterKnownFailure,
     AdapterUncertain,
@@ -85,9 +86,33 @@ pub(crate) struct ExecutionAuditContext {
     evidence_binding_digest: [u8; 32],
     evidence_present: bool,
     execution_price_bound: Option<ExecutionPriceBound>,
+    portfolio_content_digest: [u8; 32],
+    portfolio_present: bool,
     policy: RiskPolicyIdentity,
     market_observed_at: Timestamp,
     valid_until: Timestamp,
+}
+
+/// Cohesive optional evidence captured while risk constructs one audit context.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ExecutionAuditEvidence<'evidence> {
+    authority: Option<&'evidence ConsumedLiveAuthority>,
+    execution_price_bound: Option<ExecutionPriceBound>,
+    portfolio: Option<&'evidence crate::PortfolioRiskBinding>,
+}
+
+impl<'evidence> ExecutionAuditEvidence<'evidence> {
+    pub(crate) const fn new(
+        authority: Option<&'evidence ConsumedLiveAuthority>,
+        execution_price_bound: Option<ExecutionPriceBound>,
+        portfolio: Option<&'evidence crate::PortfolioRiskBinding>,
+    ) -> Self {
+        Self {
+            authority,
+            execution_price_bound,
+            portfolio,
+        }
+    }
 }
 
 impl ExecutionAuditContext {
@@ -95,13 +120,13 @@ impl ExecutionAuditContext {
         approval_id: ApprovalId,
         intent: &OrderIntent,
         market: ExecutionMarketReference,
-        authority: Option<&ConsumedLiveAuthority>,
-        execution_price_bound: Option<ExecutionPriceBound>,
+        evidence: ExecutionAuditEvidence<'_>,
         policy: RiskPolicyIdentity,
         valid_until: Timestamp,
     ) -> Self {
-        let (assessment_digest, evidence_binding_digest, evidence_present) =
-            authority.map_or(([0; 32], [0; 32], false), |authority| {
+        let (assessment_digest, evidence_binding_digest, evidence_present) = evidence
+            .authority
+            .map_or(([0; 32], [0; 32], false), |authority| {
                 let mut assessment = Sha256::new();
                 assessment.update(b"market-squawk/qualification-assessment\0");
                 assessment.update(
@@ -117,6 +142,9 @@ impl ExecutionAuditContext {
                     true,
                 )
             });
+        let (portfolio_content_digest, portfolio_present) = evidence
+            .portfolio
+            .map_or(([0; 32], false), |binding| (binding.content_digest(), true));
         Self {
             approval_id,
             order_id: intent.order_id(),
@@ -128,7 +156,9 @@ impl ExecutionAuditContext {
             assessment_digest,
             evidence_binding_digest,
             evidence_present,
-            execution_price_bound,
+            execution_price_bound: evidence.execution_price_bound,
+            portfolio_content_digest,
+            portfolio_present,
             policy,
             market_observed_at: market.observed_at(),
             valid_until,
@@ -154,6 +184,7 @@ impl ExecutionAuditContext {
         assessment_digest: [u8; 32],
         evidence_binding_digest: [u8; 32],
         execution_price_bound: ExecutionPriceBound,
+        portfolio_content_digest: [u8; 32],
         policy: RiskPolicyIdentity,
         market_observed_at: Timestamp,
         valid_until: Timestamp,
@@ -170,6 +201,8 @@ impl ExecutionAuditContext {
             evidence_binding_digest,
             evidence_present: true,
             execution_price_bound: Some(execution_price_bound),
+            portfolio_content_digest,
+            portfolio_present: true,
             policy,
             market_observed_at,
             valid_until,
@@ -311,11 +344,26 @@ impl ExecutionAuditEvent {
     pub const fn execution_price_bound(&self) -> Option<ExecutionPriceBound> {
         self.context.execution_price_bound
     }
+    /// Returns the stable portfolio content identity when risk established a current binding.
+    pub const fn portfolio_content_digest(&self) -> Option<[u8; 32]> {
+        if self.context.portfolio_present {
+            Some(self.context.portfolio_content_digest)
+        } else {
+            None
+        }
+    }
     /// Returns the versioned identity binding the canonical intent to its exact execution ceiling.
     pub fn execution_identity_digest(&self) -> Option<[u8; 32]> {
-        self.context
-            .execution_price_bound
-            .map(|bound| bound.order_audit_digest(self.context.intent_digest))
+        match (
+            self.context.execution_price_bound,
+            self.context.portfolio_present,
+        ) {
+            (Some(bound), true) => Some(bound.portfolio_bound_audit_digest(
+                self.context.intent_digest,
+                self.context.portfolio_content_digest,
+            )),
+            _ => None,
+        }
     }
     pub const fn risk_policy(&self) -> RiskPolicyIdentity {
         self.context.policy

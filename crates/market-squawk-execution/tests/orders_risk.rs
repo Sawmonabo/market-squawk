@@ -4,6 +4,8 @@ mod account_reservations;
 mod contracts;
 #[path = "intent.rs"]
 mod intent;
+#[path = "portfolio_state_integration.rs"]
+mod portfolio_state_integration;
 #[path = "risk_matrix.rs"]
 mod risk_matrix;
 #[path = "risk_properties.rs"]

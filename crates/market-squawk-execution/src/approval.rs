@@ -10,7 +10,7 @@ use market_squawk_live::{CommittedActionContext, ConsumedLiveAuthority};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::audit::ExecutionAuditContext;
+use crate::audit::{ExecutionAuditContext, ExecutionAuditEvidence};
 use crate::clock::{ClockReading, deadline_expired};
 use crate::{AccountRiskReservation, OrderIntent};
 
@@ -55,12 +55,17 @@ impl ExecutionPriceBound {
         price.get() > 0 && price.get() <= self.maximum_price.get()
     }
 
-    /// Returns the versioned execution-audit identity binding this exact ceiling to an intent.
-    pub fn order_audit_digest(self, intent_digest: crate::OrderIntentDigest) -> [u8; 32] {
+    /// Returns the versioned audit identity binding intent, ceiling, and portfolio content.
+    pub fn portfolio_bound_audit_digest(
+        self,
+        intent_digest: crate::OrderIntentDigest,
+        portfolio_content_digest: [u8; 32],
+    ) -> [u8; 32] {
         let mut digest = Sha256::new();
-        digest.update(b"market-squawk/approved-execution-audit-identity/v1\0");
+        digest.update(b"market-squawk/portfolio-bound-approval/v1\0");
         digest.update(intent_digest.as_bytes());
         digest.update(self.maximum_price.get().to_be_bytes());
+        digest.update(portfolio_content_digest);
         digest.finalize().into()
     }
 }
@@ -253,6 +258,8 @@ pub struct ApprovedOrder {
     execution_price_bound: ExecutionPriceBound,
     authority: ConsumedLiveAuthority,
     reservation: AccountRiskReservation,
+    portfolio_capability: crate::PortfolioReadCapability,
+    portfolio: crate::PortfolioRiskBinding,
     policy: RiskPolicyIdentity,
     valid_until: Timestamp,
     monotonic_deadline: Instant,
@@ -281,6 +288,22 @@ impl ApprovedOrder {
         self.reservation.expected_account_revision()
     }
 
+    /// Returns the exact opaque portfolio revision bound by risk.
+    pub const fn portfolio_revision(&self) -> &market_squawk_portfolio::PortfolioRevisionToken {
+        self.portfolio.revision()
+    }
+
+    /// Returns the stable bounded portfolio content identity used by audit.
+    pub const fn portfolio_content_digest(&self) -> [u8; 32] {
+        self.portfolio.content_digest()
+    }
+
+    /// Returns the stable approval identity over intent, price ceiling, and portfolio content.
+    pub fn approval_digest(&self) -> [u8; 32] {
+        self.portfolio
+            .approval_digest(self.intent.digest(), self.execution_price_bound)
+    }
+
     pub(crate) const fn retained_byte_ceiling(&self) -> usize {
         APPROVAL_COMMAND_RETAINED_BYTE_CEILING
     }
@@ -290,8 +313,11 @@ impl ApprovedOrder {
             self.approval_id,
             &self.intent,
             self.market,
-            Some(&self.authority),
-            Some(self.execution_price_bound),
+            ExecutionAuditEvidence::new(
+                Some(&self.authority),
+                Some(self.execution_price_bound),
+                Some(&self.portfolio),
+            ),
             self.policy,
             self.valid_until,
         )
@@ -329,6 +355,8 @@ impl ApprovedOrder {
             execution_price_bound,
             authority,
             reservation,
+            portfolio_capability,
+            portfolio,
             policy,
             valid_until,
             monotonic_deadline,
@@ -340,6 +368,8 @@ impl ApprovedOrder {
             execution_price_bound,
             authority,
             reservation,
+            portfolio_capability,
+            portfolio,
             policy,
             valid_until,
             monotonic_deadline,
@@ -358,6 +388,8 @@ pub(crate) fn approved_order_from_risk(
     execution_price_bound: ExecutionPriceBound,
     authority: ConsumedLiveAuthority,
     reservation: AccountRiskReservation,
+    portfolio_capability: crate::PortfolioReadCapability,
+    portfolio: crate::PortfolioRiskBinding,
     policy: RiskPolicyIdentity,
     valid_until: Timestamp,
     monotonic_deadline: Instant,
@@ -369,6 +401,8 @@ pub(crate) fn approved_order_from_risk(
         execution_price_bound,
         authority,
         reservation,
+        portfolio_capability,
+        portfolio,
         policy,
         valid_until,
         monotonic_deadline,
@@ -383,6 +417,8 @@ pub(crate) struct ApprovedOrderParts {
     pub(crate) execution_price_bound: ExecutionPriceBound,
     pub(crate) authority: ConsumedLiveAuthority,
     pub(crate) reservation: AccountRiskReservation,
+    pub(crate) portfolio_capability: crate::PortfolioReadCapability,
+    pub(crate) portfolio: crate::PortfolioRiskBinding,
     pub(crate) policy: RiskPolicyIdentity,
     pub(crate) valid_until: Timestamp,
     pub(crate) monotonic_deadline: Instant,

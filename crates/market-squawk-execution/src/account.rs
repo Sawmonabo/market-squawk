@@ -25,11 +25,12 @@ pub use reservation::{
 use std::collections::{HashMap, VecDeque};
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, TryLockError};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use market_squawk_domain::{
     AccountId, Currency, InstrumentId, Money, OrderSide, PriceTicks, Timestamp,
 };
+use market_squawk_portfolio::{BasisMeasurement, PortfolioSnapshot};
 use rust_decimal::Decimal;
 
 use crate::clock::{AccountReservationLease, ClockReading, monotonic_deadline, system_now};
@@ -192,6 +193,52 @@ impl AccountRiskCoordinator {
         result
     }
 
+    /// Reconciles the order's account economics against the authoritative portfolio snapshot.
+    pub(crate) fn assess_portfolio(
+        &self,
+        intent: &OrderIntent,
+        snapshot: &PortfolioSnapshot,
+    ) -> Result<(), AccountReservationError> {
+        let index = partition_index(intent.account_id(), self.config.partition_count.get());
+        let partition = try_partition(&self.partitions[index])?;
+        let account = partition
+            .accounts
+            .get(&intent.account_id())
+            .ok_or_else(|| {
+                AccountReservationError::from_reason(AccountRiskViolation::AccountNotFound)
+            })?;
+        account.assess_portfolio(intent, snapshot)
+    }
+
+    pub(crate) fn try_reserve_for_portfolio(
+        &self,
+        intent: &OrderIntent,
+        reservation_price: PriceTicks,
+        limits: &RiskLimits,
+        snapshot: &PortfolioSnapshot,
+    ) -> Result<AccountRiskReservation, AccountReservationError> {
+        let now = system_now().map_err(|_| {
+            AccountReservationError::from_reason(AccountRiskViolation::ClockFailure)
+        })?;
+        let index = partition_index(intent.account_id(), self.config.partition_count.get());
+        let mut partition = try_partition(&self.partitions[index])?;
+        let account = partition
+            .accounts
+            .get_mut(&intent.account_id())
+            .ok_or_else(|| {
+                AccountReservationError::from_reason(AccountRiskViolation::AccountNotFound)
+            })?;
+        account.assess_portfolio(intent, snapshot)?;
+        account.try_reserve(
+            intent,
+            reservation_price,
+            limits,
+            now,
+            self.config,
+            &self.reconciliation,
+        )
+    }
+
     /// Atomically reserves account cash, position, exposure, rate, and idempotency capacity.
     ///
     /// The method uses nonblocking partition acquisition. It accepts no caller-authored account
@@ -206,24 +253,13 @@ impl AccountRiskCoordinator {
             AccountReservationError::from_reason(AccountRiskViolation::ClockFailure)
         })?;
         let index = partition_index(intent.account_id(), self.config.partition_count.get());
-        let mut partition = match self.partitions[index].try_lock() {
-            Ok(partition) => partition,
-            Err(TryLockError::WouldBlock) => {
-                return Err(AccountReservationError::from_reason(
-                    AccountRiskViolation::AccountCoordinatorBusy,
-                ));
-            }
-            Err(TryLockError::Poisoned(_)) => {
-                return Err(AccountReservationError::from_reason(
-                    AccountRiskViolation::AccountCoordinatorPoisoned,
-                ));
-            }
-        };
-        let Some(account) = partition.accounts.get_mut(&intent.account_id()) else {
-            return Err(AccountReservationError::from_reason(
-                AccountRiskViolation::AccountNotFound,
-            ));
-        };
+        let mut partition = try_partition(&self.partitions[index])?;
+        let account = partition
+            .accounts
+            .get_mut(&intent.account_id())
+            .ok_or_else(|| {
+                AccountReservationError::from_reason(AccountRiskViolation::AccountNotFound)
+            })?;
         account.try_reserve(
             intent,
             reservation_price,
@@ -587,6 +623,52 @@ impl AccountState {
         })
     }
 
+    fn assess_portfolio(
+        &self,
+        intent: &OrderIntent,
+        snapshot: &PortfolioSnapshot,
+    ) -> Result<(), AccountReservationError> {
+        let terms = intent.execution_terms();
+        let instrument_id = terms.instrument_id();
+        let expected_quantity =
+            Decimal::from(self.positions.get(&instrument_id).copied().unwrap_or(0))
+                .checked_mul(terms.lot_size().as_decimal())
+                .ok_or_else(|| {
+                    AccountReservationError::from_reason(AccountRiskViolation::ArithmeticOverflow)
+                })?;
+        let zero_basis = Money::new(Decimal::ZERO, self.currency);
+        let expected_basis = self
+            .position_cost_basis
+            .get(&instrument_id)
+            .copied()
+            .unwrap_or(zero_basis);
+        let position = snapshot
+            .holdings()
+            .iter()
+            .find(|position| position.instrument_id() == instrument_id);
+        let observed_quantity = position.map_or(Decimal::ZERO, |position| position.quantity());
+        let observed_basis = position.map_or(BasisMeasurement::Complete(zero_basis), |position| {
+            position.cost_basis()
+        });
+        let basis_matches = match observed_basis {
+            BasisMeasurement::Complete(basis) => basis == expected_basis,
+            BasisMeasurement::Incomplete => intent.side() == OrderSide::Buy,
+        };
+
+        if snapshot.account_id() != intent.account_id()
+            || snapshot.base_currency() != self.currency
+            || snapshot.cash().currency() != self.currency
+            || snapshot.cash() != self.cash
+            || observed_quantity != expected_quantity
+            || !basis_matches
+        {
+            return Err(AccountReservationError::from_reason(
+                AccountRiskViolation::PortfolioStateMismatch,
+            ));
+        }
+        Ok(())
+    }
+
     fn compact_expired_idempotency(&mut self, now: Timestamp) -> Result<(), ()> {
         if !self
             .idempotency_tombstones
@@ -816,6 +898,20 @@ impl AccountState {
             }
         }
         Ok(totals)
+    }
+}
+
+fn try_partition(
+    partition: &Mutex<AccountPartition>,
+) -> Result<MutexGuard<'_, AccountPartition>, AccountReservationError> {
+    match partition.try_lock() {
+        Ok(partition) => Ok(partition),
+        Err(TryLockError::WouldBlock) => Err(AccountReservationError::from_reason(
+            AccountRiskViolation::AccountCoordinatorBusy,
+        )),
+        Err(TryLockError::Poisoned(_)) => Err(AccountReservationError::from_reason(
+            AccountRiskViolation::AccountCoordinatorPoisoned,
+        )),
     }
 }
 

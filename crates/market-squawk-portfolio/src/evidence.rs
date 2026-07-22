@@ -20,6 +20,13 @@ pub struct PortfolioRevisionId(pub(crate) [u8; 32]);
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct PortfolioRevisionToken(PortfolioRevisionId);
 
+impl PortfolioRevisionToken {
+    /// Returns the stable bytes of the revision identity carried by this precondition.
+    pub const fn bytes(&self) -> [u8; 32] {
+        self.0.0
+    }
+}
+
 /// One exact feature contract bound into revision evidence.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FeatureBinding {

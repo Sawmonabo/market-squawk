@@ -47,6 +47,7 @@ pub(crate) struct PaperOrder {
     pub(crate) model_id: Option<ModelId>,
     pub(crate) assessment_digest: [u8; 32],
     pub(crate) evidence_binding_digest: [u8; 32],
+    pub(crate) portfolio_content_digest: [u8; 32],
     pub(crate) risk_policy: RiskPolicyIdentity,
     pub(crate) market_observed_at: Timestamp,
     pub(crate) valid_until: Timestamp,
@@ -89,6 +90,7 @@ pub(crate) struct PaperOrderRecoveryWire {
     model_id: Option<ModelId>,
     assessment_digest: [u8; 32],
     evidence_binding_digest: [u8; 32],
+    portfolio_content_digest: [u8; 32],
     risk_policy_digest: [u8; 32],
     risk_policy_version: RuleVersion,
     market_observed_at: Timestamp,
@@ -144,6 +146,7 @@ impl PaperOrder {
             model_id: dispatch.model_id(),
             assessment_digest: dispatch.assessment_digest(),
             evidence_binding_digest: dispatch.evidence_binding_digest(),
+            portfolio_content_digest: dispatch.portfolio_content_digest(),
             risk_policy: dispatch.risk_policy(),
             market_observed_at: dispatch.market().observed_at(),
             valid_until: dispatch.valid_until(),
@@ -215,7 +218,7 @@ impl PaperOrder {
 
     pub(crate) fn input_digest(&self) -> [u8; 32] {
         self.execution_price_bound
-            .order_audit_digest(self.intent_digest)
+            .portfolio_bound_audit_digest(self.intent_digest, self.portfolio_content_digest)
     }
 
     pub(crate) fn recovery_wire(&self) -> PaperOrderRecoveryWire {
@@ -254,6 +257,7 @@ impl PaperOrder {
             model_id: self.model_id,
             assessment_digest: self.assessment_digest,
             evidence_binding_digest: self.evidence_binding_digest,
+            portfolio_content_digest: self.portfolio_content_digest,
             risk_policy_digest: self.risk_policy.digest(),
             risk_policy_version: self.risk_policy.ruleset_version(),
             market_observed_at: self.market_observed_at,
@@ -316,6 +320,7 @@ impl PaperOrder {
             || wire.account_revision == 0
             || wire.assessment_digest == [0; 32]
             || wire.evidence_binding_digest == [0; 32]
+            || wire.portfolio_content_digest == [0; 32]
             || wire.valid_until < wire.market_observed_at
             || wire.state == PaperOrderState::New
             || (matches!(wire.order_type, OrderType::Market | OrderType::Limit) && !wire.triggered)
@@ -361,6 +366,7 @@ impl PaperOrder {
             model_id: wire.model_id,
             assessment_digest: wire.assessment_digest,
             evidence_binding_digest: wire.evidence_binding_digest,
+            portfolio_content_digest: wire.portfolio_content_digest,
             risk_policy,
             market_observed_at: wire.market_observed_at,
             valid_until: wire.valid_until,
@@ -388,6 +394,7 @@ impl PaperOrder {
             self.account_revision,
             self.quantity,
             self.execution_price_bound,
+            self.portfolio_content_digest,
             self.terms.settlement_currency(),
             lifecycle,
             self.strategy_id,

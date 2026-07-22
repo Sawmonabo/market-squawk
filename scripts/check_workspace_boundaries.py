@@ -136,6 +136,10 @@ DEV_ONLY_LOCAL_DEPENDENCIES = {
         "market-squawk-execution",
         "market-squawk-adapter-paper",
     },
+    # The Task 16 execution integration harness constructs genuine immutable portfolio revisions
+    # from Task 11 dataset evidence. Data remains forbidden as a normal execution dependency; the
+    # production boundary is execution -> portfolio only.
+    "market-squawk-execution": {"market-squawk-data"},
 }
 HOT_PATH_PACKAGES = {"market-squawk-domain", "market-squawk-live"}
 HOT_PATH_FORBIDDEN = {
