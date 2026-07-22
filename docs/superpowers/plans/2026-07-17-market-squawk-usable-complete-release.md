@@ -2182,6 +2182,9 @@ reproducible backtest without capture replay.
 
 ### Task 18: Implement ASC 820/IFRS 13 fair-value analysis
 
+**Status:** Complete at accepted feature head `31de1a5`; release merge `051ee3c`, lock reconciliation
+`5c34b7d`. GitHub closeout follows the release documentation commit and push.
+
 **Files:**
 
 - Create: `crates/market-squawk-valuation/Cargo.toml`
@@ -2191,9 +2194,8 @@ reproducible backtest without capture replay.
 - Create: `crates/market-squawk-valuation/src/rules.rs`
 - Create: `crates/market-squawk-valuation/src/approval.rs`
 - Create: `crates/market-squawk-valuation/src/service.rs`
-- Create: `crates/market-squawk-valuation/tests/level1.rs`
-- Create: `crates/market-squawk-valuation/tests/no_promotion.rs`
-- Create: `crates/market-squawk-valuation/tests/override_approval.rs`
+- Create: `crates/market-squawk-valuation/tests/fair_value.rs`
+- Create: `crates/market-squawk-valuation/tests/cases/`
 
 **Interfaces:**
 
@@ -2203,7 +2205,7 @@ reproducible backtest without capture replay.
   versioned `ClassificationRuleset`, `ClassificationDecision`, `ValuationOverride`,
   `ValuationApproval`, and bounded `FairValueService`.
 
-- [ ] **Step 1: Write RED Level 1 decision-table/property tests**
+- [x] **Step 1: Write RED Level 1 decision-table/property tests**
 
 Require identical instrument, quoted unadjusted price, active market, accessible market,
 measurement-date relevance, valid source/venue evidence and sufficient freshness. Missing evidence ->
@@ -2211,7 +2213,7 @@ measurement-date relevance, valid source/venue evidence and sufficient freshness
 qualify. Test market closure, thin/inactive market, inaccessible venue, post-measurement quote,
 currency/scale mismatch and disqualifying adjustment.
 
-- [ ] **Step 2: Write RED no-promotion and workflow tests; run RED**
+- [x] **Step 2: Write RED no-promotion and workflow tests; run RED**
 
 Compile-fail and Serde tests prevent substitution among `FairValueHierarchy`, `MarketDepth`,
 `DataQuality`, assessment and execution capability. Level 2/3 inputs remain analytical only. Test
@@ -2224,14 +2226,14 @@ cargo test --manifest-path crates/market-squawk-valuation/Cargo.toml --all-featu
 
 Expected: FAIL because valuation package, rules and service are absent.
 
-- [ ] **Step 3: Implement deterministic classification and workflow**
+- [x] **Step 3: Implement deterministic classification and workflow**
 
 Construct measurements only from validated typed inputs; evaluate every ruleset predicate and retain
 the complete truth table/reasons/evidence hashes. An override creates a new immutable decision and
 never edits source evidence. Approval binds measurement/ruleset/override/reviewer/version and cannot
 alter market data quality or execution eligibility.
 
-- [ ] **Step 4: Run GREEN and commit**
+- [x] **Step 4: Run GREEN and commit**
 
 ```bash
 cargo test --manifest-path crates/market-squawk-valuation/Cargo.toml --all-features

@@ -392,12 +392,35 @@ After the accepted release state and GitHub evidence were pushed, both completed
 were cleaned (6.9 GiB total), both clean worktrees were removed, both merged local/origin feature
 branches were deleted, and worktree/remote metadata was pruned. Only the release worktree remains.
 
-Task 14's Python financial analytics/training product is implemented on its feature lane but is not
-accepted: exact-head review found release-blocking gaps in Task 11 provenance, PIT/split binding,
-bounded native admission, safe artifact cleanup, authenticated training-run identity, and
-independent Rust expectations. Those findings must be corrected and re-reviewed before integration.
+Task 14's Python financial analytics/training product and its review remediation are implemented on
+the feature lane but are not yet accepted. Fair value now owns authoritative migration `0010`; the
+Python lane must merge the release branch, renumber dataset admission to `0011`, reconcile the
+combined schema trigger, lockfile, and wheelhouse source closure, run one offline CPython 3.12/3.13
+matrix, freeze the exact commit, and pass remediation rereview before integration.
 Task 15 ONNX integration begins only against the frozen Task 13 contract and must not weaken
 controlled-root, exact-identity, bounded-runtime, or no-action semantics. Issue `#31` remains the
 mandatory zero-fee provider onboarding portal: it may automate
 official provider enrollment and key setup, while preserving and resuming any provider-required
 human consent or verification step.
+
+## 2026-07-22 Task 18 fair-value closeout
+
+Task 18 is accepted at exact feature head `31de1a5`, merged into the release branch at `051ee3c`,
+and lock-reconciled at `5c34b7d`. It delivers durable ASC 820/IFRS 13 measurement, evidence,
+classification, override, approval, revocation, market-access, audit, recovery, and bounded service
+authority. Live evidence crosses a count-and-byte-bounded post-action export rather than the hot
+path; research, feature, and portfolio evidence retain their independent producer authority.
+
+Level 1 requires the complete code-owned conjunction for identical unadjusted quoted evidence in
+an active, accessible market at the measurement cutoff. Historical activity binds source, receive,
+availability, qualification-evaluation, and qualification-validity times. Level 2 and Level 3 do
+not become execution quality, and neither Level 1 nor an `Unclassified` decision can be created by
+override. Catalog writes use one coherent transactional snapshot, stale-writer comparison,
+canonical identities, semantic recovery, audit-chain triggers, and global record/result bounds.
+
+The accepted implementation retained one consolidated fair-value integration executable. Focused
+locked valuation, live-export, catalog/query, strict Clippy, formatting, and diff gates passed on
+the merged release tree. Independent review found two material PIT/override defects; the exact-head
+remediation rereview found no remaining Critical or Important blocker. Closeout requires pushing
+the documentation commit, marking issue `#23` and its Project 5 item Done, then cleaning the 2.9 GiB
+feature target, worktree, and merged local/remote branch.

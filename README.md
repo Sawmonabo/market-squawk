@@ -107,6 +107,14 @@ work is bound by the single canonical
   derives financial limits from its complete projection, binds the exact revision and publication
   generation into the approved order, and rechecks that authority immediately before one-time
   dispatch. Missing, stale, retired, or revoked portfolio state fails closed before adapter access.
+- Durable ASC 820/IFRS 13 fair-value analysis over producer-issued live, research, feature, and
+  portfolio evidence. The code-owned ruleset enforces point-in-time availability, strict Level 1
+  identity/quotation/adjustment/activity/access/freshness predicates, and separate Level 2, Level 3,
+  and `Unclassified` outcomes. Reporting-entity market access requires durable dual approval and
+  separation of duties; immutable overrides cannot promote Level 1 or cure `Unclassified`
+  evidence. Approvals, revocations, audit chains, stale-writer protection, bounded recovery, and
+  global catalog limits persist in SQLite. User-facing FairValue CLI and MCP composition remains
+  part of Task 19.
 - A hardened five-tool local stdio MCP surface with typed schemas, bounded admission, deadlines,
   cancellation, result limits, controlled artifacts, durable audit, and bounded worker shutdown.
   Audit, artifacts, capture, and configured journal reads derive from the same prepared local
@@ -133,12 +141,11 @@ terminal consumer, focused verification, immutable evidence, and exact commit ex
 | `Missing` | Kraken direct-source qualification | The production transport, decoder, checksum, exact-generation session lifecycle, fresh-snapshot recovery, and canonical risk/no-paper-mutation terminal proof exist; Kraken WebSocket v2 supplies no venue sequence satisfying the current `DirectVerified` execution predicate | Task 20 |
 | `Missing` | FRED/ALFRED durable local consumption | The production vintage-aware adapter is runnable for authorized ephemeral retrieval, but the exact current terms bundle does not establish per-series rights for persistence, caching, archival, or training | Task 9 / Task 20 |
 | `Missing` | portfolio import | The raw-preserving adapter now enforces durable revisions, account/currency authority, reconciliation, supersession, and canonical data-lane output, but no application service or CLI yet composes a real Task 7 local-file/OFX producer into its required portfolio-raw contract | Task 19 |
-| `Missing` | Python data/financial/training product | A feature-lane implementation exists, but release review found unresolved Task 11/PIT provenance, bounded-input, safe artifact-root, authenticated training-run, and independent-admission defects; it is not integrated or runnable from this release branch | Task 14 |
+| `Missing` | Python data/financial/training product | The feature-lane remediation is implemented but not yet accepted: it must merge the now-authoritative fair-value migration as `0010`, renumber its dataset-admission migration to `0011`, reconcile the combined schema/lock/source closure, run one offline CPython 3.12/3.13 matrix, and pass exact-head rereview | Task 14 |
 | `Missing` | constrained ONNX inference | No validated, bounded, fail-closed ONNX-compatible backend | Task 15 |
 | `Missing` | research backtesting | No point-in-time research-dataset backtester | Task 17 |
 | `Missing` | strategies and comprehensive risk | Bounded account/risk coordination, actor-owned authority consumption, private approval, one-time dispatch, price-bound reconciliation, and terminal audit exist; a production order-producing strategy and its controlled user-facing configuration do not | Task 2 |
 | `Missing` | realistic paper execution | The bounded engine implements lifecycle, fees, latency, slippage, partial fills, rejection, cancellation, accounting, checkpoint recovery, and reconciliation; no execution-eligible source/strategy currently drives orders through the user-facing production composition | Task 2 |
-| `Missing` | ASC 820/IFRS 13 fair value | No ruleset, evidence, override, approval, or classification service | Task 18 |
 | `Missing` | complete local CLI | No complete command hierarchy over shared application services | Task 19 |
 | `Missing` | complete typed local MCP | No complete bounded tool domains over shared application services | Task 19 |
 | `Missing` | release security/fuzz/performance gate | No exact-head release evidence or final integrated demonstration | Task 20 |
@@ -172,8 +179,8 @@ never placed between a live event and an automated decision.
 ## Diagnostic foundation quick start
 
 These commands demonstrate only the authority-free diagnostic entry points. They do not demonstrate
-production execution quality, Python model training, ONNX inference, portfolio workflows through
-the CLI, fair-value analysis, or complete MCP coverage. The Rust research datasets, native model
+production execution quality, Python model training, ONNX inference, portfolio or fair-value
+workflows through the CLI, or complete MCP coverage. The Rust research datasets, native model
 inference, and portfolio-accounting libraries listed above are independently runnable now.
 
 Prerequisites:
@@ -507,9 +514,9 @@ exactly four production-weighted review quarters:
    SQLite, Arrow/Parquet/DataFusion, bounded MCP protocol, and Kraken.
 2. **Quarter 2 of 4 — Stage 2 / Waves 2–3:** implement file, SEC, macro, and portfolio adapters;
    compose research ingestion, point-in-time datasets, corporate actions, and batch analytics.
-3. **Quarter 3 of 4 — Stage 3 / Waves 4A–4B:** model bundles, native inference, and the portfolio
-   core are integrated; complete the Python product, ONNX inference, portfolio/execution binding,
-   backtesting, and fair-value analysis.
+3. **Quarter 3 of 4 — Stage 3 / Waves 4A–4B:** model bundles, native inference, portfolio accounting,
+   portfolio/execution binding, and fair-value analysis are integrated; complete the Python
+   product, ONNX inference, and backtesting.
 4. **Quarter 4 of 4 — Stages 4–5 / Waves 5–6:** complete shared services, CLI, and typed MCP domains;
    then run integrated demonstrations, provider evidence, fuzzing, measured performance, security,
    supply-chain gates, grouped review, publication, and cleanup.

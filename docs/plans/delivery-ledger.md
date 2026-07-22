@@ -9,7 +9,8 @@ evidence; it does not replace the README capability truth or the canonical relea
 ## Current integration state
 
 - Release branch: `release/market-squawk-v0.1.0`
-- Current integrated capability code head: `7621552` (`fix(execution): harden portfolio risk authority`)
+- Current integrated capability code head: `31de1a5` (`fix(valuation): enforce point-in-time override authority`)
+- Task 18 release merge head: `051ee3c`; reconciled lock head: `5c34b7d`
 - Task 13 accepted feature and release head: `59ba05c`
 - Task 16 accepted core head: `e124722`; accepted execution-binding and release head: `7621552`
 - Task 12 code integration head: `9702556` (`fix(analytics): bind complete batch semantics`)
@@ -51,9 +52,20 @@ evidence; it does not replace the README capability truth or the canonical relea
   strict affected-package Clippy, workspace boundaries, formatting, and diff hygiene passed.
   Independent exact-head re-review confirmed all three earlier authority/concurrency/dispatch
   findings closed with no remaining Critical or Important finding.
-- Current implementation barrier: Task 14's Python product is implemented on its feature lane but
-  remains outside the release branch while confirmed producer/consumer provenance, bounded-input,
-  destructive-path, and independent-admission findings are corrected and re-reviewed.
+- Task 18 owner: GitHub issue `#23`, Project 5; closure follows this ledger commit and push.
+- Delivered at accepted feature head `31de1a5`: nonforgeable producer receipts; point-in-time market
+  activity and evidence admission; strict Level 1 classification; usable Level 2/Level 3 input
+  judgments; non-promotable `Unclassified` evidence; durable dual-approved market access,
+  overrides, approvals, revocations, audit chains, catalog CAS, bounded recovery, and global limits.
+- Task 18 verification: the complete valuation package, four-case consolidated fair-value harness,
+  bounded live-export route, catalog recovery/query regressions, strict affected-package Clippy,
+  formatting, and diff hygiene passed on the integrated locked tree. Exact-head review rejected two
+  point-in-time/override defects; remediation-only rereview accepted `31de1a5` with no remaining
+  Critical or Important finding.
+- Current implementation barrier: Task 14's Python remediation is implemented but intentionally
+  parked outside the release branch. It must now consume fair value's authoritative migration
+  `0010`, move dataset admission to `0011`, reconcile the combined schema/lock/source closure, run
+  one offline CPython 3.12/3.13 matrix, and pass exact-head rereview.
 
 - Task 12 owner: GitHub issue `#17`, Project 5, status `Done`.
 - Exact feature and fast-forwarded release code head: `9702556`.
