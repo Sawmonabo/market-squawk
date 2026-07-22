@@ -3626,6 +3626,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "market-squawk-valuation"
+version = "0.1.0"
+dependencies = [
+ "market-squawk-analytics",
+ "market-squawk-data",
+ "market-squawk-domain",
+ "market-squawk-live",
+ "market-squawk-platform",
+ "market-squawk-portfolio",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "matchers"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
