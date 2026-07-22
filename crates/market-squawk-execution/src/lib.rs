@@ -58,7 +58,8 @@ pub use risk::{
 };
 pub use strategy::{
     BoundedOrderIntentIterator, BoundedOrderIntents, MAX_STRATEGY_ORDER_INTENTS, Strategy,
-    StrategyContext, StrategyError,
+    StrategyContext, StrategyError, StrategyNoAction, StrategyNoActionDomain,
+    StrategyNoActionPhase,
 };
 pub use task_reaper::{
     ExecutionTask, ExecutionTaskDrain, ExecutionTaskPermit, ExecutionTaskReaper,

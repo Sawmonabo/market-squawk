@@ -1,0 +1,30 @@
+[package]
+name = "market-squawk-modeling"
+description = "Closed model bundles, immutable registry generations, and bounded native inference"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository = "https://github.com/Sawmonabo/market-squawk"
+publish = false
+autotests = false
+
+[dependencies]
+cap-std.workspace = true
+market-squawk-analytics.workspace = true
+market-squawk-data.workspace = true
+market-squawk-domain.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[[test]]
+name = "modeling_contracts"
+path = "tests/modeling_contracts.rs"
+
+[lints]
+workspace = true

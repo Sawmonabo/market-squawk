@@ -3470,6 +3470,7 @@ dependencies = [
  "market-squawk-analytics",
  "market-squawk-domain",
  "market-squawk-live",
+ "market-squawk-modeling",
  "proptest",
  "rust_decimal",
  "serde",
@@ -3517,6 +3518,21 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "market-squawk-modeling"
+version = "0.1.0"
+dependencies = [
+ "cap-std",
+ "market-squawk-analytics",
+ "market-squawk-data",
+ "market-squawk-domain",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]

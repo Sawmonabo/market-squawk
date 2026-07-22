@@ -13,6 +13,7 @@ autotests = false
 market-squawk-analytics.workspace = true
 market-squawk-domain.workspace = true
 market-squawk-live.workspace = true
+market-squawk-modeling.workspace = true
 rust_decimal.workspace = true
 serde.workspace = true
 sha2.workspace = true
