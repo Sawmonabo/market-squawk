@@ -75,6 +75,7 @@ impl Fixture {
             self.expectations.training_period(),
             self.expectations.label().clone(),
             self.expectations.training_code_revision(),
+            self.expectations.training_environment_hash(),
             bundle_metadata_hash,
             artifact_hash,
             self.expectations.training_run_hash(),
@@ -202,7 +203,7 @@ fn bundle_admission_fails_closed_across_complete_relationships() -> TestResult {
     )?;
     assert_fixture_error(
         valid_fixture("native_linear", 1, 1, |metadata, _| {
-            metadata["schema_version"] = json!(4);
+            metadata["schema_version"] = json!(3);
         })?,
         BundleError::UnsupportedMetadataVersion,
     )?;
@@ -493,6 +494,7 @@ fn valid_fixture_with_identity(
         period,
         label,
         "train-code-abc123",
+        Sha256Digest::new([37; 32]),
         Sha256Digest::new([3; 32]),
         Sha256Digest::new([4; 32]),
         Sha256Digest::new([2; 32]),
@@ -553,7 +555,7 @@ fn valid_fixture_with_identity(
         json!({"negative_max": -0.5, "positive_min": 0.5, "minimum_confidence": 0.0})
     };
     let mut metadata = json!({
-        "schema_version": 3,
+        "schema_version": 4,
         "bundle_id": bundle_id,
         "bundle_version": bundle_version,
         "model_id": model_id.to_string(),
@@ -599,6 +601,7 @@ fn valid_fixture_with_identity(
             "version": 1
         },
         "training_code_revision": "train-code-abc123",
+        "training_environment_sha256": hex(expectations.training_environment_hash().bytes()),
         "validation_metrics": metrics,
         "decision_thresholds": thresholds,
         "intended_use": "bounded directional ranking for verified market features",
@@ -667,6 +670,7 @@ fn valid_fixture_with_identity(
         expectations.training_period(),
         expectations.label().clone(),
         expectations.training_code_revision(),
+        expectations.training_environment_hash(),
         Sha256Digest::new(bundle_metadata_sha256),
         Sha256Digest::new(artifact_sha256),
         Sha256Digest::new(training_run_sha256),

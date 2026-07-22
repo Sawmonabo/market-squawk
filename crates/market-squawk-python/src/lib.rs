@@ -2,6 +2,7 @@
 
 mod analytics;
 mod dataset;
+mod receipt;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -148,5 +149,6 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<OperationContext>()?;
     module.add_function(wrap_pyfunction!(expected_model_validator_sha256, module)?)?;
     dataset::register(module)?;
-    analytics::register(module)
+    analytics::register(module)?;
+    receipt::register(module)
 }

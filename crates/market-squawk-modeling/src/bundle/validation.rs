@@ -13,7 +13,7 @@ use crate::{
     ModelFeatureBinding, ModelFormat, ValidationMetric, ValidationMetricName,
 };
 
-pub(super) const METADATA_SCHEMA_VERSION: u32 = 3;
+pub(super) const METADATA_SCHEMA_VERSION: u32 = 4;
 pub(super) const NATIVE_FORMAT_VERSION: u32 = 1;
 pub(super) const NATIVE_ARTIFACT_SCHEMA_VERSION: u32 = 1;
 pub(super) const TRAINING_RUN_SCHEMA_VERSION: u32 = 2;
@@ -37,6 +37,7 @@ pub(super) struct MetadataWire {
     pub(super) training_period: TrainingPeriodWire,
     pub(super) label: LabelWire,
     pub(super) training_code_revision: String,
+    pub(super) training_environment_sha256: String,
     pub(super) validation_metrics: Vec<MetricWire>,
     pub(super) decision_thresholds: ThresholdWire,
     pub(super) intended_use: String,
@@ -344,6 +345,7 @@ pub(super) fn validate_training_run(
             && trial.model_id == metadata.model_id
             && trial.model_kind == expected_kind
             && trial.training_code_revision == metadata.training_code_revision
+            && trial.environment_sha256 == metadata.training_environment_sha256
             && trial.training_period == metadata.training_period
             && trial.universe_id == metadata.training_universe_id
             && run.validation_metrics == metadata.validation_metrics;
@@ -360,10 +362,10 @@ pub(super) fn validate_training_run(
     if parse_digest(&trial.dataset_export_sha256)? != expectations.dataset().export_digest() {
         return Err(BundleError::TrainingRunRelationshipMismatch);
     }
-    for digest in [&trial.environment_sha256, &trial.split_sha256] {
-        if parse_digest(digest)?.bytes() == [0; 32] {
-            return Err(BundleError::TrainingRunRelationshipMismatch);
-        }
+    if parse_digest(&trial.environment_sha256)? != expectations.training_environment_hash()
+        || parse_digest(&trial.split_sha256)?.bytes() == [0; 32]
+    {
+        return Err(BundleError::TrainingRunRelationshipMismatch);
     }
     if !matches!(trial.missing_policy.as_str(), "reject" | "drop_row") {
         return Err(BundleError::TrainingRunRelationshipMismatch);

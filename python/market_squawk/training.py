@@ -13,6 +13,7 @@ import re
 from typing import Any, Mapping, Sequence
 from uuid import UUID
 
+from . import _native
 from .bundle import BundleAuthorityRef, BundleCandidate, BundleReceipt
 from .data import ComponentIdentity, DatasetIntegrityError, DatasetResult, _verify_dataset_receipt
 from .finance import OperationContext
@@ -30,6 +31,15 @@ HEX = re.compile(r"^[0-9a-f]{64}$")
 
 class TrainingValidationError(ValueError):
     """A reproducibility, input, resource, or finite-arithmetic contract failed."""
+
+
+TrainingEnvironmentReceipt = _native.TrainingEnvironmentReceipt
+
+
+def training_environment_receipt() -> TrainingEnvironmentReceipt:
+    """Return the builder-authored native training environment for this wheel."""
+
+    return _native.training_environment_receipt()
 
 
 @dataclass(frozen=True)
@@ -94,11 +104,18 @@ class TrainingRun:
     label: ComponentIdentity | Mapping[str, Any]
     seed: int
     missing_policy: str
-    training_code_revision: str
-    environment_sha256: str
+    environment: TrainingEnvironmentReceipt
     model_id: str
     bundle_id: str
     bundle_version: int
+
+    @property
+    def training_code_revision(self) -> str:
+        return self.environment.training_code_revision
+
+    @property
+    def environment_sha256(self) -> str:
+        return self.environment.sha256
 
     def fit_evaluate(
         self, *, model_kind: str, context: OperationContext
@@ -182,7 +199,7 @@ class TrainingRun:
             else {"negative_max": -0.5, "positive_min": 0.5, "minimum_confidence": 0.0}
         )
         metadata = {
-            "schema_version": 3,
+            "schema_version": 4,
             "bundle_id": self.bundle_id,
             "bundle_version": self.bundle_version,
             "model_id": self.model_id,
@@ -204,6 +221,7 @@ class TrainingRun:
             "training_period": period,
             "label": dict(config["label"]),
             "training_code_revision": self.training_code_revision,
+            "training_environment_sha256": self.environment_sha256,
             "validation_metrics": metrics,
             "decision_thresholds": thresholds,
             "intended_use": "bounded local research trained from one exact point-in-time generation",
@@ -212,7 +230,7 @@ class TrainingRun:
         }
         candidate = BundleCandidate(metadata, artifact, run_record)
         authority = {
-            "schema_version": 4,
+            "schema_version": 5,
             "model_id": self.model_id,
             "bundle_id": self.bundle_id,
             "bundle_version": self.bundle_version,
@@ -223,11 +241,21 @@ class TrainingRun:
             "training_period": period,
             "label": dict(config["label"]),
             "training_code_revision": self.training_code_revision,
+            "training_environment_sha256": self.environment_sha256,
             "training_run_sha256": candidate.training_run_sha256,
         }
         return TrainingProposal(candidate, authority, self.dataset)
 
     def _validated_config(self, model_kind: str) -> dict[str, Any]:
+        if not isinstance(self.environment, TrainingEnvironmentReceipt):
+            raise TypeError("training environment must be the native builder-authored receipt")
+        current_environment = training_environment_receipt()
+        if (
+            self.environment.sha256 != current_environment.sha256
+            or self.environment.training_code_revision
+            != current_environment.training_code_revision
+        ):
+            raise TrainingValidationError("training environment changed after receipt admission")
         if model_kind not in {"linear", "logistic"}:
             raise TrainingValidationError("model kind is unsupported")
         if not isinstance(self.seed, int) or isinstance(self.seed, bool) or not 0 <= self.seed < 2**64:

@@ -294,6 +294,7 @@ pub struct BundleExpectations {
     training_period: TrainingPeriod,
     label: FeatureLabelComponentSpec,
     training_code_revision: Box<str>,
+    training_environment_hash: Sha256Digest,
     bundle_metadata_hash: Sha256Digest,
     artifact_hash: Sha256Digest,
     training_run_hash: Sha256Digest,
@@ -318,6 +319,7 @@ impl BundleExpectations {
         training_period: TrainingPeriod,
         label: FeatureLabelComponentSpec,
         training_code_revision: impl AsRef<str>,
+        training_environment_hash: Sha256Digest,
         bundle_metadata_hash: Sha256Digest,
         artifact_hash: Sha256Digest,
         training_run_hash: Sha256Digest,
@@ -325,6 +327,7 @@ impl BundleExpectations {
         let training_code_revision = training_code_revision.as_ref();
         if label.kind() != ComponentKind::Label
             || !valid_revision(training_code_revision)
+            || training_environment_hash.bytes() == [0; 32]
             || bundle_metadata_hash.bytes() == [0; 32]
             || artifact_hash.bytes() == [0; 32]
             || training_run_hash.bytes() == [0; 32]
@@ -340,6 +343,7 @@ impl BundleExpectations {
             training_period,
             label,
             training_code_revision: training_code_revision.into(),
+            training_environment_hash,
             bundle_metadata_hash,
             artifact_hash,
             training_run_hash,
@@ -392,6 +396,12 @@ impl BundleExpectations {
     #[must_use]
     pub fn training_code_revision(&self) -> &str {
         &self.training_code_revision
+    }
+
+    /// Returns the builder-authored native training-environment identity.
+    #[must_use]
+    pub const fn training_environment_hash(&self) -> Sha256Digest {
+        self.training_environment_hash
     }
 
     /// Returns the independently approved exact final bundle-metadata identity.
@@ -505,6 +515,7 @@ pub struct ModelMetadata {
     training_period: TrainingPeriod,
     label: FeatureLabelComponentSpec,
     training_code_revision: Box<str>,
+    training_environment_hash: Sha256Digest,
     validation_metrics: Box<[ValidationMetric]>,
     decision_thresholds: DecisionThresholds,
     intended_use: Box<str>,
@@ -551,6 +562,7 @@ impl ModelMetadata {
             training_period: expectations.training_period,
             label: expectations.label.clone(),
             training_code_revision: expectations.training_code_revision.clone(),
+            training_environment_hash: expectations.training_environment_hash,
             validation_metrics: validation_metrics.into_boxed_slice(),
             decision_thresholds,
             intended_use: intended_use.into_boxed_str(),
@@ -651,6 +663,12 @@ impl ModelMetadata {
     #[must_use]
     pub fn training_code_revision(&self) -> &str {
         &self.training_code_revision
+    }
+
+    /// Returns the exact builder-authored training-environment identity.
+    #[must_use]
+    pub const fn training_environment_hash(&self) -> Sha256Digest {
+        self.training_environment_hash
     }
 
     /// Returns the bounded finite validation evidence.

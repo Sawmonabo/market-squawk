@@ -4,6 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import base64
+from contextlib import ExitStack
+import csv
 from dataclasses import dataclass
 from email.parser import BytesParser
 import hashlib
@@ -30,6 +33,8 @@ MACOS_DEPLOYMENT_TARGET = "12.0"
 PROJECT_WHEEL_PLATFORM_TAG = (
     f"macosx_{MACOS_DEPLOYMENT_TARGET.replace('.', '_')}_arm64"
 )
+RELEASE_MANIFEST_DOMAIN = b"market-squawk-release-manifest-v1\0"
+ENVIRONMENT_RECEIPT_DOMAIN = b"market-squawk-training-environment-v1\0"
 SUPPORTED_PYTHONS = ((3, 12), (3, 13))
 ROOT_MARKER = ".market-squawk-python-artifacts-v1"
 CHILD_MARKER = ".market-squawk-owned-v1"
@@ -124,6 +129,103 @@ class ArtifactLayout:
     build_venv: Path
     distribution: Path
     releases: tuple[tuple[tuple[int, int], Path], ...]
+
+
+@dataclass(frozen=True)
+class InstalledDistribution:
+    native_extension: Path
+    native_extension_sha256: str
+    native_extension_size: int
+    record: Path
+    record_sha256: str
+    record_size: int
+    file_count: int
+    file_set_sha256: str
+
+
+class ReleaseSigner:
+    """Ephemeral release key mediated only by the exact Rust signing helper."""
+
+    def __init__(
+        self,
+        helper: Path,
+        helper_sha256: str,
+        root: Path,
+        environment: dict[str, str],
+    ) -> None:
+        self._helper = helper
+        self._helper_sha256 = helper_sha256
+        self._root = root
+        self._environment = environment
+        self._key = bytearray(os.urandom(32))
+
+    def public_key(self) -> str:
+        return self._invoke("public", b"").hex()
+
+    def sign(self, domain: bytes, payload: bytes) -> str:
+        message = domain + payload
+        if not payload or len(message) > 64 * 1024:
+            raise ReleaseBuildError("release signature payload exceeds its byte bound")
+        return self._invoke("sign", message).hex()
+
+    def close(self) -> None:
+        for index in range(len(self._key)):
+            self._key[index] = 0
+        self._key.clear()
+
+    def __enter__(self) -> ReleaseSigner:
+        return self
+
+    def __exit__(
+        self,
+        _exception_type: object,
+        _exception: object,
+        _traceback: object,
+    ) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        self.close()
+
+    def _invoke(self, mode: str, message: bytes) -> bytes:
+        if len(self._key) != 32 or _file_digest(self._helper)[1] != self._helper_sha256:
+            raise ReleaseBuildError("release signing authority changed or was destroyed")
+        expected_size = 32
+        request_size = 32
+        if mode == "sign":
+            request_size += 4 + len(message)
+            expected_size = 64
+        request = bytearray(request_size)
+        request[:32] = self._key
+        if mode == "sign":
+            request[32:36] = len(message).to_bytes(4, "big")
+            request[36:] = message
+        try:
+            try:
+                completed = subprocess.run(
+                    [str(self._helper), mode],
+                    cwd=self._root,
+                    env=self._environment,
+                    input=request,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=10,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired) as error:
+                raise ReleaseBuildError("release signing helper could not complete") from error
+        finally:
+            for index in range(len(request)):
+                request[index] = 0
+            request.clear()
+        if (
+            completed.returncode != 0
+            or len(completed.stdout) != expected_size
+            or len(completed.stderr) > 4096
+            or _file_digest(self._helper)[1] != self._helper_sha256
+        ):
+            raise ReleaseBuildError("release signing helper rejected the request")
+        return completed.stdout
 
 
 def load_lock(path: Path) -> ReleaseLock:
@@ -653,6 +755,19 @@ def build_release(
     runtimes: tuple[PythonRuntime, ...],
     toolchain: dict[str, object],
 ) -> None:
+    with ExitStack() as cleanup:
+        _build_release(root, lock_path, lock, layout, runtimes, toolchain, cleanup)
+
+
+def _build_release(
+    root: Path,
+    lock_path: Path,
+    lock: ReleaseLock,
+    layout: ArtifactLayout,
+    runtimes: tuple[PythonRuntime, ...],
+    toolchain: dict[str, object],
+    cleanup: ExitStack,
+) -> None:
     admit_sources(lock, root)
     for runtime in runtimes:
         admit_wheelhouse(lock, layout.wheelhouse, runtime.version[:2])
@@ -675,6 +790,51 @@ def build_release(
             "-p",
             "market-squawk-modeling",
             "--bin",
+            "market-squawk-release-signer",
+            "--release",
+            "--locked",
+        ],
+        root,
+        bootstrap_environment,
+    )
+    signer_helper = root / "target/release/market-squawk-release-signer"
+    if not signer_helper.is_file():
+        raise ReleaseBuildError("Rust release signing helper was not produced")
+    signer_helper_sha256 = _file_digest(signer_helper)[1]
+    signer = cleanup.enter_context(
+        ReleaseSigner(
+            signer_helper,
+            signer_helper_sha256,
+            root,
+            bootstrap_environment,
+        )
+    )
+    release_public_key = signer.public_key()
+    build_runtime = runtimes[0]
+    foundation, foundation_sha256 = build_training_foundation_receipt(
+        root,
+        root / "python/requirements.lock",
+        lock_path,
+        lock,
+        build_runtime,
+        toolchain,
+        release_public_key,
+        signer_helper_sha256,
+    )
+    training_code_revision = json.loads(foundation)["training_code_revision"]
+    if not isinstance(training_code_revision, str):
+        raise ReleaseBuildError("training foundation revision is invalid")
+    (layout.root / "training-foundation.json").write_bytes(foundation)
+    bootstrap_environment["MARKET_SQUAWK_TRAINING_FOUNDATION_RECEIPT"] = foundation.decode(
+        "ascii"
+    )
+    _run(
+        [
+            str(_bound_tool(toolchain, "cargo")),
+            "build",
+            "-p",
+            "market-squawk-modeling",
+            "--bin",
             "market-squawk-model-validator",
             "--release",
             "--locked",
@@ -685,8 +845,7 @@ def build_release(
     validator = root / "target/release/market-squawk-model-validator"
     if not validator.is_file():
         raise ReleaseBuildError("Rust model validator executable was not produced")
-    validator_sha256 = _file_digest(validator)[1]
-    build_runtime = runtimes[0]
+    validator_size, validator_sha256 = _file_digest(validator)
     build_python = _create_venv(
         build_runtime,
         layout.build_venv,
@@ -740,6 +899,17 @@ def build_release(
         raise ReleaseBuildError(
             "project wheel does not carry the exact pinned cp310-abi3 macOS platform tag"
         )
+    release_manifest, release_manifest_sha256 = build_release_manifest(
+        foundation_sha256,
+        project_wheel,
+        python_tag,
+        abi_tag,
+        platform_tag,
+        validator_size,
+        validator_sha256,
+        signer,
+    )
+    (layout.root / "market-squawk-release.json").write_bytes(release_manifest)
     matrix_evidence = []
     for runtime, (minor, release_venv) in zip(runtimes, layout.releases, strict=True):
         if runtime.version[:2] != minor:
@@ -800,6 +970,20 @@ def build_release(
             root,
             runtime_environment,
         )
+        distribution = inspect_installed_distribution(release_venv, runtime)
+        environment_sha256 = install_training_environment(
+            release_venv,
+            release_python,
+            runtime,
+            foundation_sha256,
+            training_code_revision,
+            release_manifest,
+            release_manifest_sha256,
+            project_wheel,
+            validator_sha256,
+            distribution,
+            signer,
+        )
         _run(
             [
                 release_python,
@@ -824,11 +1008,12 @@ def build_release(
                     runtime_environment,
                 ),
                 "focused_tests": list(FOCUSED_TESTS),
+                "training_environment_sha256": environment_sha256,
                 "validator_sha256": validator_sha256,
             }
         )
     evidence = {
-        "schema_version": 3,
+        "schema_version": 4,
         "support_matrix": matrix_evidence,
         "toolchain": toolchain,
         "build_environment": {
@@ -838,6 +1023,14 @@ def build_release(
         "cargo_lock_sha256": _file_digest(root / "Cargo.lock")[1],
         "wheelhouse_lock_sha256": _file_digest(lock_path)[1],
         "requirements_lock_sha256": _file_digest(root / "python/requirements.lock")[1],
+        "training_foundation": {
+            "path": "training-foundation.json",
+            "sha256": foundation_sha256,
+        },
+        "release_manifest": {
+            "path": "market-squawk-release.json",
+            "sha256": release_manifest_sha256,
+        },
         "source_closure_count": len(lock.sources),
         "project_wheel": {
             "filename": project_wheel.name,
@@ -848,7 +1041,7 @@ def build_release(
             "macos_deployment_target": MACOS_DEPLOYMENT_TARGET,
         },
     }
-    (layout.root / "market-squawk-release.json").write_text(
+    (layout.root / "market-squawk-release-evidence.json").write_text(
         json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n",
         encoding="utf-8",
     )
@@ -882,6 +1075,12 @@ def _admit_owned_child(path: Path, root: Path, purpose: str) -> None:
 
 def _reset_owned_child(path: Path, root: Path, purpose: str) -> None:
     _admit_owned_child(path, root, purpose)
+    if purpose in {"release-cp312", "release-cp313"}:
+        authority = path / "share/market-squawk"
+        if authority.exists() or authority.is_symlink():
+            if authority.is_symlink() or not authority.is_dir():
+                raise ReleaseBuildError("sealed release authority is invalid")
+            authority.chmod(0o700)
     shutil.rmtree(path)
     path.mkdir()
     (path / CHILD_MARKER).write_text(_marker_content(path, purpose), encoding="utf-8")
@@ -1116,6 +1315,315 @@ def _mapping_sha256(value: object) -> str:
         separators=(",", ":"),
     ).encode("ascii")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def build_training_foundation_receipt(
+    root: Path,
+    requirements_lock: Path,
+    wheelhouse_lock: Path,
+    lock: ReleaseLock,
+    runtime: PythonRuntime,
+    toolchain: dict[str, object],
+    release_public_key: str,
+    release_signer_sha256: str,
+) -> tuple[bytes, str]:
+    """Return the canonical build foundation embedded in both native executables."""
+
+    _sha256(release_public_key)
+    _sha256(release_signer_sha256)
+    source_closure = [
+        {"path": source.path, "sha256": source.sha256, "size_bytes": source.size_bytes}
+        for source in sorted(lock.sources, key=lambda value: value.path)
+    ]
+    source_closure_sha256 = _mapping_sha256(source_closure)
+    receipt = {
+        "build_python_sha256": _file_digest(runtime.executable)[1],
+        "build_python_version": ".".join(str(value) for value in runtime.version),
+        "cargo_lock_sha256": _file_digest(root / "Cargo.lock")[1],
+        "requirements_lock_sha256": _file_digest(requirements_lock)[1],
+        "release_public_key": release_public_key,
+        "release_signer_sha256": release_signer_sha256,
+        "schema_version": 1,
+        "source_closure_sha256": source_closure_sha256,
+        "toolchain_sha256": _mapping_sha256(toolchain),
+        "training_code_revision": source_closure_sha256,
+        "wheelhouse_lock_sha256": _file_digest(wheelhouse_lock)[1],
+    }
+    encoded = json.dumps(
+        receipt,
+        allow_nan=False,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    return encoded, hashlib.sha256(encoded).hexdigest()
+
+
+def build_release_manifest(
+    foundation_sha256: str,
+    project_wheel: Path,
+    python_tag: str,
+    abi_tag: str,
+    platform_tag: str,
+    validator_size: int,
+    validator_sha256: str,
+    signer: ReleaseSigner,
+) -> tuple[bytes, str]:
+    """Bind the exact wheel and validator without a self-referential wheel digest."""
+
+    _sha256(foundation_sha256)
+    _sha256(validator_sha256)
+    wheel_size, wheel_sha256 = _file_digest(project_wheel)
+    payload = {
+        "foundation_sha256": foundation_sha256,
+        "project_wheel": {
+            "abi_tag": abi_tag,
+            "filename": project_wheel.name,
+            "macos_deployment_target": MACOS_DEPLOYMENT_TARGET,
+            "platform_tag": platform_tag,
+            "python_tag": python_tag,
+            "sha256": wheel_sha256,
+            "size_bytes": wheel_size,
+        },
+        "schema_version": 1,
+        "validator": {
+            "sha256": validator_sha256,
+            "size_bytes": validator_size,
+        },
+    }
+    payload_bytes = json.dumps(
+        payload,
+        allow_nan=False,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    manifest = {
+        "payload": payload,
+        "schema_version": 1,
+        "signature": signer.sign(RELEASE_MANIFEST_DOMAIN, payload_bytes),
+    }
+    encoded = json.dumps(
+        manifest,
+        allow_nan=False,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    return encoded, hashlib.sha256(encoded).hexdigest()
+
+
+def inspect_installed_distribution(
+    release_root: Path, runtime: PythonRuntime
+) -> InstalledDistribution:
+    """Verify the installed project RECORD and return its canonical file-set identity."""
+
+    site_packages = (
+        release_root
+        / "lib"
+        / f"python{runtime.version[0]}.{runtime.version[1]}"
+        / "site-packages"
+    )
+    if site_packages.is_symlink() or not site_packages.is_dir():
+        raise ReleaseBuildError("installed project site-packages root is invalid")
+    records = list(site_packages.glob("market_squawk-0.1.0.dist-info/RECORD"))
+    if len(records) != 1 or records[0].is_symlink() or not records[0].is_file():
+        raise ReleaseBuildError("installed project has no unique wheel RECORD")
+    record = records[0]
+    record_name = record.relative_to(site_packages).as_posix()
+    entries: dict[str, tuple[str, int]] = {}
+    saw_record = False
+    total_size = 0
+    try:
+        with record.open("r", encoding="utf-8", newline="") as stream:
+            for row in csv.reader(stream):
+                if len(row) != 3 or len(entries) >= 256:
+                    raise ReleaseBuildError("installed project RECORD exceeds its bounds")
+                name, encoded_digest, encoded_size = row
+                if name == record_name:
+                    if saw_record or encoded_digest or encoded_size:
+                        raise ReleaseBuildError("installed project RECORD self-entry is invalid")
+                    saw_record = True
+                    continue
+                relative = _safe_record_path(name)
+                path = site_packages / relative
+                if path.is_symlink() or not path.is_file():
+                    raise ReleaseBuildError("installed project RECORD path is unavailable")
+                observed_size, observed_sha256 = _file_digest(path)
+                if not encoded_digest and not encoded_size:
+                    size = observed_size
+                else:
+                    if not encoded_digest.startswith("sha256="):
+                        raise ReleaseBuildError("installed project RECORD hash is unsupported")
+                    try:
+                        size = int(encoded_size)
+                    except ValueError as error:
+                        raise ReleaseBuildError(
+                            "installed project RECORD size is invalid"
+                        ) from error
+                    expected = base64.urlsafe_b64encode(
+                        bytes.fromhex(observed_sha256)
+                    ).rstrip(b"=")
+                    if (
+                        observed_size != size
+                        or encoded_digest.removeprefix("sha256=").encode("ascii")
+                        != expected
+                    ):
+                        raise ReleaseBuildError(
+                            "installed project RECORD identity mismatch"
+                        )
+                if size < 0 or size > 128 * 1024 * 1024:
+                    raise ReleaseBuildError("installed project file exceeds its byte bound")
+                total_size += size
+                if total_size > 256 * 1024 * 1024 or name in entries:
+                    raise ReleaseBuildError("installed project RECORD is duplicated or oversized")
+                entries[name] = (observed_sha256, size)
+    except (OSError, UnicodeError, csv.Error) as error:
+        raise ReleaseBuildError("installed project RECORD is unreadable") from error
+    if not saw_record or not entries:
+        raise ReleaseBuildError("installed project RECORD is incomplete")
+    native_entries = [
+        name
+        for name in entries
+        if name.startswith("market_squawk/_native.") and name.endswith(".so")
+    ]
+    if len(native_entries) != 1:
+        raise ReleaseBuildError("installed project has no unique native extension")
+    native_name = native_entries[0]
+    native = site_packages / _safe_record_path(native_name)
+    native_sha256, native_size = entries[native_name]
+    record_size, record_sha256 = _file_digest(record)
+    return InstalledDistribution(
+        native_extension=native.relative_to(release_root),
+        native_extension_sha256=native_sha256,
+        native_extension_size=native_size,
+        record=record.relative_to(release_root),
+        record_sha256=record_sha256,
+        record_size=record_size,
+        file_count=len(entries),
+        file_set_sha256=_record_set_sha256(entries),
+    )
+
+
+def install_training_environment(
+    release_root: Path,
+    release_python: str,
+    runtime: PythonRuntime,
+    foundation_sha256: str,
+    training_code_revision: str,
+    release_manifest: bytes,
+    release_manifest_sha256: str,
+    project_wheel: Path,
+    validator_sha256: str,
+    distribution: InstalledDistribution,
+    signer: ReleaseSigner,
+) -> str:
+    """Install one fixed-path release receipt outside the wheel's RECORD file set."""
+
+    for digest in (
+        foundation_sha256,
+        training_code_revision,
+        release_manifest_sha256,
+        validator_sha256,
+    ):
+        _sha256(digest)
+    interpreter = Path(release_python)
+    try:
+        interpreter_relative = interpreter.relative_to(release_root).as_posix()
+    except ValueError as error:
+        raise ReleaseBuildError("release interpreter escapes its environment") from error
+    if interpreter_relative != "bin/python":
+        raise ReleaseBuildError("release interpreter path is not canonical")
+    interpreter_size, interpreter_sha256 = _file_digest(interpreter)
+    authority_parent = release_root / "share"
+    if authority_parent.is_symlink() or (
+        authority_parent.exists() and not authority_parent.is_dir()
+    ):
+        raise ReleaseBuildError("release authority parent is invalid")
+    authority_parent.mkdir(exist_ok=True)
+    authority = authority_parent / "market-squawk"
+    if authority.exists() or authority.is_symlink():
+        raise ReleaseBuildError("release training authority already exists")
+    authority.mkdir(mode=0o700)
+    wheel_destination = authority / project_wheel.name
+    shutil.copyfile(project_wheel, wheel_destination)
+    manifest_path = authority / "market-squawk-release.json"
+    manifest_path.write_bytes(release_manifest)
+    payload = {
+        "foundation_sha256": foundation_sha256,
+        "interpreter": {
+            "executable_relative_path": "bin/python",
+            "implementation": "cpython",
+            "python_tag": f"cp{runtime.version[0]}{runtime.version[1]}",
+            "sha256": interpreter_sha256,
+            "size_bytes": interpreter_size,
+            "version": ".".join(str(value) for value in runtime.version),
+        },
+        "native_extension": {
+            "relative_path": distribution.native_extension.as_posix(),
+            "sha256": distribution.native_extension_sha256,
+            "size_bytes": distribution.native_extension_size,
+        },
+        "project_distribution": {
+            "file_count": distribution.file_count,
+            "file_set_sha256": distribution.file_set_sha256,
+            "record_relative_path": distribution.record.as_posix(),
+            "record_sha256": distribution.record_sha256,
+            "record_size_bytes": distribution.record_size,
+        },
+        "release_manifest_sha256": release_manifest_sha256,
+        "training_code_revision": training_code_revision,
+        "validator_sha256": validator_sha256,
+    }
+    payload_bytes = json.dumps(
+        payload,
+        allow_nan=False,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    receipt = {
+        "payload": payload,
+        "schema_version": 1,
+        "signature": signer.sign(ENVIRONMENT_RECEIPT_DOMAIN, payload_bytes),
+    }
+    encoded = json.dumps(
+        receipt,
+        allow_nan=False,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    receipt_path = authority / "training-environment.json"
+    receipt_path.write_bytes(encoded)
+    for path in (wheel_destination, manifest_path, receipt_path):
+        path.chmod(0o444)
+    authority.chmod(0o555)
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _safe_record_path(value: str) -> Path:
+    path = Path(value)
+    if (
+        not value
+        or len(value.encode("utf-8")) > 1024
+        or "\\" in value
+        or path.is_absolute()
+        or any(part in {"", ".", ".."} for part in path.parts)
+    ):
+        raise ReleaseBuildError("installed project RECORD path is invalid")
+    return path
+
+
+def _record_set_sha256(entries: dict[str, tuple[str, int]]) -> str:
+    digest = hashlib.sha256(b"market-squawk-record-set-v1\0")
+    for path, (sha256, size) in sorted(entries.items()):
+        encoded = path.encode("utf-8")
+        digest.update(len(encoded).to_bytes(4, "big"))
+        digest.update(encoded)
+        digest.update(size.to_bytes(8, "big"))
+        digest.update(bytes.fromhex(sha256))
+    return digest.hexdigest()
 
 
 def _compatible(filename: str, version: tuple[int, int]) -> bool:

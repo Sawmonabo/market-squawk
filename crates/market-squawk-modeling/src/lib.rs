@@ -16,6 +16,7 @@ mod native;
 #[cfg(feature = "onnx-tract")]
 mod onnx;
 mod registry;
+mod training_environment;
 
 pub use bundle::{
     BundleError, BundleMetadataRef, ControlledModelRoot, MAX_ARTIFACT_BYTES,
@@ -42,11 +43,16 @@ pub use onnx::{
 pub use onnx::{
     MAX_ONNX_MODEL_BYTES, MAX_ONNX_NODES, MAX_ONNX_REQUEST_ELEMENTS, MAX_ONNX_TENSORS,
     OnnxBackendError, OnnxFallbackPolicy, OnnxModelPolicy, OnnxPolicyError, OnnxRuntimeEvidence,
-    TractOnnxBackend, ValidatedOnnxModel,
+    OnnxWorkerProcessError, OnnxWorkerProgram, OnnxWorkerProgramError, TractOnnxBackend,
+    ValidatedOnnxModel, run_onnx_worker_process,
 };
 pub use registry::{
     BundleRegistration, MAX_MODEL_REGISTRY_GENERATIONS, MAX_MODEL_REGISTRY_RETAINED_BYTES,
     ModelRegistry, ModelRegistryError,
+};
+pub use training_environment::{
+    TrainingEnvironmentError, VerifiedTrainingEnvironment, verify_python_training_environment,
+    verify_validator_training_environment,
 };
 
 /// Exact typed model failure before an execution strategy can create an order intent.

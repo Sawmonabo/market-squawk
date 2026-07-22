@@ -18,7 +18,8 @@ use market_squawk_data::{
 use market_squawk_domain::{ModelId, RoundingPolicy, Timestamp};
 use market_squawk_modeling::{
     BundleExpectations, BundleId, BundleMetadataRef, ControlledModelRoot, ModelBundle,
-    TrainingDatasetIdentity, TrainingPeriod,
+    TrainingDatasetIdentity, TrainingPeriod, VerifiedTrainingEnvironment,
+    verify_validator_training_environment,
 };
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
@@ -39,6 +40,7 @@ struct ExpectationsWire {
     training_period: PeriodWire,
     label: LabelWire,
     training_code_revision: String,
+    training_environment_sha256: String,
     bundle_metadata_sha256: String,
     artifact_sha256: String,
     training_run_sha256: String,
@@ -95,6 +97,10 @@ fn main() {
 
 fn run() -> Result<String, ()> {
     let arguments = arguments()?;
+    let validator = env::current_exe().map_err(|_| ())?;
+    let release_root = validator.parent().and_then(Path::parent).ok_or(())?;
+    let training_environment =
+        verify_validator_training_environment(release_root, &validator).map_err(|_| ())?;
     let candidate_root = controlled_root(&arguments.root)?;
     let authority_root = controlled_root(&arguments.authority_root)?;
     if candidate_root.starts_with(&authority_root) || authority_root.starts_with(&candidate_root) {
@@ -139,7 +145,7 @@ fn run() -> Result<String, ()> {
         return Err(());
     }
     let wire: ExpectationsWire = serde_json::from_slice(&bytes).map_err(|_| ())?;
-    let expectations = expectations(&wire, &selection)?;
+    let expectations = expectations(&wire, &selection, &training_environment)?;
     let registry = feature_registry()?;
     let root = ControlledModelRoot::open_ambient(candidate_root).map_err(|_| ())?;
     let reference = BundleMetadataRef::try_new(
@@ -227,11 +233,14 @@ fn controlled_path(root: &Path, relative: &str) -> Result<PathBuf, ()> {
 fn expectations(
     wire: &ExpectationsWire,
     selection: &PythonDatasetSelection,
+    training_environment: &VerifiedTrainingEnvironment,
 ) -> Result<BundleExpectations, ()> {
-    if wire.schema_version != 4
+    if wire.schema_version != 5
         || wire.label.kind != "label"
         || !dataset_matches_selection(&wire.dataset, selection)?
         || wire.universe_id != selection.identity().universe_id().as_str()
+        || wire.training_code_revision != training_environment.training_code_revision()
+        || parse_hex(&wire.training_environment_sha256)? != training_environment.receipt_sha256()
     {
         return Err(());
     }
@@ -279,7 +288,8 @@ fn expectations(
         )
         .map_err(|_| ())?,
         label,
-        &wire.training_code_revision,
+        training_environment.training_code_revision(),
+        Sha256Digest::new(training_environment.receipt_sha256()),
         Sha256Digest::new(parse_hex(&wire.bundle_metadata_sha256)?),
         Sha256Digest::new(parse_hex(&wire.artifact_sha256)?),
         Sha256Digest::new(parse_hex(&wire.training_run_sha256)?),

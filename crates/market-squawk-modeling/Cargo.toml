@@ -16,12 +16,15 @@ onnx-runtime = ["onnx-tract", "dep:ort"]
 
 [dependencies]
 cap-std.workspace = true
+csv.workspace = true
+ed25519-dalek = { version = "=3.0.0", features = ["signature"] }
 market-squawk-analytics.workspace = true
 market-squawk-data.workspace = true
 market-squawk-domain.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 tokio-util.workspace = true
 tract-onnx = { version = "=0.23.4", default-features = false, optional = true }
@@ -31,8 +34,13 @@ ort = { version = "=2.0.0-rc.12", default-features = false, features = [
     "std",
 ], optional = true }
 
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+win32job = "=2.0.3"
+
 [dev-dependencies]
-tempfile.workspace = true
 prost = "=0.14.3"
 
 [[test]]
@@ -45,3 +53,12 @@ workspace = true
 [[bin]]
 name = "market-squawk-model-validator"
 path = "src/bin/market_squawk_model_validator.rs"
+
+[[bin]]
+name = "market-squawk-release-signer"
+path = "src/bin/market_squawk_release_signer.rs"
+
+[[bin]]
+name = "market-squawk-onnx-worker"
+path = "src/bin/market_squawk_onnx_worker.rs"
+required-features = ["onnx-tract"]

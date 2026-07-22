@@ -214,6 +214,11 @@ impl ModelBundle {
         {
             return Err(BundleError::TrainingCodeRevisionMismatch);
         }
+        if parse_digest(&wire.training_environment_sha256)?
+            != expectations.training_environment_hash()
+        {
+            return Err(BundleError::TrainingRunRelationshipMismatch);
+        }
         let validation_metrics = validate_metrics(&wire.validation_metrics, format)?;
         let thresholds = validate_thresholds(wire.decision_thresholds, format)?;
         validate_prose(&wire.intended_use).map_err(|_| BundleError::InvalidIntendedUse)?;

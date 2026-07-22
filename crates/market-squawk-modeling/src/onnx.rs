@@ -2,6 +2,7 @@
 
 use std::mem::size_of;
 use std::sync::Arc;
+use std::time::Instant;
 
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -28,6 +29,9 @@ pub use policy::{
     OnnxFallbackPolicy, OnnxModelPolicy, OnnxPolicyError, ValidatedOnnxModel,
 };
 use worker::{OnnxWorker, WorkerError};
+pub use worker::{
+    OnnxWorkerProcessError, OnnxWorkerProgram, OnnxWorkerProgramError, run_onnx_worker_process,
+};
 
 /// Immutable tract runtime admission evidence for one exact bundle and policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -83,6 +87,7 @@ impl TractOnnxBackend {
     pub fn try_from_bundle(
         bundle: Arc<ModelBundle>,
         policy: OnnxModelPolicy,
+        program: &OnnxWorkerProgram,
     ) -> Result<Self, OnnxBackendError> {
         if bundle.metadata().format() != ModelFormat::Onnx {
             return Err(OnnxBackendError::UnsupportedBundleFormat);
@@ -97,6 +102,7 @@ impl TractOnnxBackend {
             return Err(OnnxBackendError::FeatureShapeMismatch);
         }
         let (worker, warm_up) = OnnxWorker::start_tract(
+            program,
             artifact,
             policy.input_shape(),
             preflight.input_elements(),
@@ -151,27 +157,17 @@ impl TractOnnxBackend {
             .saturating_add(self.bundle.retained_bytes())
             .saturating_add(self.output_identity.retained_bytes())
     }
-}
 
-impl InferenceBackend for TractOnnxBackend {
-    fn metadata(&self) -> &ModelMetadata {
-        self.bundle.metadata()
-    }
-
-    fn infer(&self, input: &ModelInput<'_>) -> Result<ModelOutput, InferenceError> {
+    pub(crate) fn infer_normalized_until(
+        &self,
+        normalized: Vec<f32>,
+        absolute_deadline: Instant,
+    ) -> Result<ModelOutput, InferenceError> {
         let metadata = self.bundle.metadata();
-        let normalized = normalize_input(metadata, input)?;
         let score = f64::from(
             self.worker
-                .execute(normalized)
-                .map_err(|error| match error {
-                    WorkerError::Unavailable | WorkerError::Load => {
-                        InferenceError::OnnxWorkerUnavailable
-                    }
-                    WorkerError::Resource => InferenceError::OnnxRuntimeFailure,
-                    WorkerError::Deadline => InferenceError::OnnxDeadlineExceeded,
-                    WorkerError::Runtime => InferenceError::OnnxRuntimeFailure,
-                })?,
+                .execute_until(normalized, absolute_deadline)
+                .map_err(worker_inference_error)?,
         );
         if !score.is_finite() {
             return Err(InferenceError::OnnxRuntimeFailure);
@@ -183,6 +179,28 @@ impl InferenceBackend for TractOnnxBackend {
             confidence,
             decision,
         ))
+    }
+}
+
+impl InferenceBackend for TractOnnxBackend {
+    fn metadata(&self) -> &ModelMetadata {
+        self.bundle.metadata()
+    }
+
+    fn infer(&self, input: &ModelInput<'_>) -> Result<ModelOutput, InferenceError> {
+        let normalized = normalize_input(self.bundle.metadata(), input)?;
+        let deadline = Instant::now()
+            .checked_add(self.worker.deadline())
+            .ok_or(InferenceError::OnnxDeadlineExceeded)?;
+        self.infer_normalized_until(normalized, deadline)
+    }
+}
+
+fn worker_inference_error(error: WorkerError) -> InferenceError {
+    match error {
+        WorkerError::Unavailable | WorkerError::Load => InferenceError::OnnxWorkerUnavailable,
+        WorkerError::Resource | WorkerError::Runtime => InferenceError::OnnxRuntimeFailure,
+        WorkerError::Deadline => InferenceError::OnnxDeadlineExceeded,
     }
 }
 
