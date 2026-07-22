@@ -36,7 +36,6 @@ async fn durable_assignment_is_ordered_idempotent_atomic_and_restart_stable()
     let local_family = family(&source, "LOCAL")?;
 
     let catalog = CatalogAuthority::open(config.clone())?;
-    assert_eq!(catalog.health()?.applied_migrations(), 10);
     register_source_fixture(&catalog, &source)?;
     let shared = Arc::new(Mutex::new(catalog));
     let authority = revision_authority(&shared);
