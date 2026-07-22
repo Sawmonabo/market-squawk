@@ -404,18 +404,18 @@ impl RiskService {
         ) {
             Ok((binding, snapshot)) => {
                 portfolio_binding = Some(binding);
-                if let Err(rejection) = self.accounts.assess_portfolio(&intent, &snapshot) {
-                    extend_account_reasons(&mut reasons, &rejection);
-                } else {
-                    portfolio_snapshot = Some(snapshot);
-                }
+                portfolio_snapshot = Some(snapshot);
             }
             Err(error) => reasons.push(RiskRejectionCode::Portfolio(error)),
         }
-        if let Some(execution_price_bound) = execution_price_bound
-            && let Err(rejection) =
-                self.accounts
-                    .assess(&intent, execution_price_bound.maximum_price(), &self.limits)
+        if let (Some(execution_price_bound), Some(snapshot)) =
+            (execution_price_bound, portfolio_snapshot.as_ref())
+            && let Err(rejection) = self.accounts.assess_for_portfolio(
+                &intent,
+                execution_price_bound.maximum_price(),
+                &self.limits,
+                snapshot,
+            )
         {
             extend_account_reasons(&mut reasons, &rejection);
         }
@@ -691,18 +691,18 @@ impl RiskService {
         ) {
             Ok((binding, snapshot)) => {
                 portfolio_binding = Some(binding);
-                if let Err(rejection) = self.accounts.assess_portfolio(intent, &snapshot) {
-                    extend_account_reasons(&mut reasons, &rejection);
-                } else {
-                    portfolio_snapshot = Some(snapshot);
-                }
+                portfolio_snapshot = Some(snapshot);
             }
             Err(error) => reasons.push(RiskRejectionCode::Portfolio(error)),
         }
-        if let Some(execution_price_bound) = execution_price_bound
-            && let Err(rejection) =
-                self.accounts
-                    .assess(intent, execution_price_bound.maximum_price(), &self.limits)
+        if let (Some(execution_price_bound), Some(snapshot)) =
+            (execution_price_bound, portfolio_snapshot.as_ref())
+            && let Err(rejection) = self.accounts.assess_for_portfolio(
+                intent,
+                execution_price_bound.maximum_price(),
+                &self.limits,
+                snapshot,
+            )
         {
             extend_account_reasons(&mut reasons, &rejection);
         }

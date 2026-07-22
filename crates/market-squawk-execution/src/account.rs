@@ -187,18 +187,24 @@ impl AccountRiskCoordinator {
             ));
         };
         let result = account
-            .assess(intent, reservation_price, limits, now, self.config)
+            .assess(intent, reservation_price, limits, now, self.config, None)
             .map(|_| ());
         self.require_reconciled()?;
         result
     }
 
-    /// Reconciles the order's account economics against the authoritative portfolio snapshot.
-    pub(crate) fn assess_portfolio(
+    /// Evaluates against financial state derived from the authoritative portfolio revision.
+    pub(crate) fn assess_for_portfolio(
         &self,
         intent: &OrderIntent,
+        reservation_price: PriceTicks,
+        limits: &RiskLimits,
         snapshot: &PortfolioSnapshot,
     ) -> Result<(), AccountReservationError> {
+        self.require_reconciled()?;
+        let now = system_now().map_err(|_| {
+            AccountReservationError::from_reason(AccountRiskViolation::ClockFailure)
+        })?;
         let index = partition_index(intent.account_id(), self.config.partition_count.get());
         let partition = try_partition(&self.partitions[index])?;
         let account = partition
@@ -207,7 +213,19 @@ impl AccountRiskCoordinator {
             .ok_or_else(|| {
                 AccountReservationError::from_reason(AccountRiskViolation::AccountNotFound)
             })?;
-        account.assess_portfolio(intent, snapshot)
+        let financial = account.assess_portfolio(intent, snapshot)?;
+        let result = account
+            .assess(
+                intent,
+                reservation_price,
+                limits,
+                now,
+                self.config,
+                Some(financial),
+            )
+            .map(|_| ());
+        self.require_reconciled()?;
+        result
     }
 
     pub(crate) fn try_reserve_for_portfolio(
@@ -228,13 +246,16 @@ impl AccountRiskCoordinator {
             .ok_or_else(|| {
                 AccountReservationError::from_reason(AccountRiskViolation::AccountNotFound)
             })?;
-        account.assess_portfolio(intent, snapshot)?;
+        let financial = account.assess_portfolio(intent, snapshot)?;
         account.try_reserve(
             intent,
-            reservation_price,
-            limits,
-            now,
-            self.config,
+            ReservationAssessment {
+                price: reservation_price,
+                limits,
+                now,
+                config: self.config,
+                portfolio: Some(financial),
+            },
             &self.reconciliation,
         )
     }
@@ -262,10 +283,13 @@ impl AccountRiskCoordinator {
             })?;
         account.try_reserve(
             intent,
-            reservation_price,
-            limits,
-            now,
-            self.config,
+            ReservationAssessment {
+                price: reservation_price,
+                limits,
+                now,
+                config: self.config,
+                portfolio: None,
+            },
             &self.reconciliation,
         )
     }
@@ -402,6 +426,26 @@ struct AccountState {
     last_reconciliation: Option<replacement::AccountReplacementSource>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PortfolioFinancialState {
+    cash: Money,
+    capital: Money,
+    gross_exposure: Money,
+    unrealized_pnl: Money,
+    realized_loss: Money,
+    drawdown: Money,
+    current_position: i64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ReservationAssessment<'a> {
+    price: PriceTicks,
+    limits: &'a RiskLimits,
+    now: ClockReading,
+    config: AccountCoordinatorConfig,
+    portfolio: Option<PortfolioFinancialState>,
+}
+
 impl AccountState {
     fn try_from_bootstrap(
         bootstrap: AccountBootstrap,
@@ -520,10 +564,7 @@ impl AccountState {
     fn try_reserve(
         &mut self,
         intent: &OrderIntent,
-        reservation_price: PriceTicks,
-        limits: &RiskLimits,
-        now: ClockReading,
-        config: AccountCoordinatorConfig,
+        assessment: ReservationAssessment<'_>,
         reconciliation: &AccountRiskReconciliationFence,
     ) -> Result<AccountRiskReservation, AccountReservationError> {
         if !reconciliation.is_current() {
@@ -531,16 +572,24 @@ impl AccountState {
                 AccountRiskViolation::ReconciliationRequired,
             ));
         }
-        let oldest = now
+        let oldest = assessment
+            .now
             .wall
             .unix_nanos()
-            .checked_sub(limits.order_rate_window_nanos())
+            .checked_sub(assessment.limits.order_rate_window_nanos())
             .unwrap_or(i64::MIN);
-        let calculation = self.assess(intent, reservation_price, limits, now, config)?;
+        let calculation = self.assess(
+            intent,
+            assessment.price,
+            assessment.limits,
+            assessment.now,
+            assessment.config,
+            assessment.portfolio,
+        )?;
         let removes_expired = self
             .idempotency_tombstones
             .iter()
-            .any(|tombstone| now.wall > tombstone.intent_expires_at);
+            .any(|tombstone| assessment.now.wall > tombstone.intent_expires_at);
         let revision_steps = 1_u64 + u64::from(removes_expired);
         let next_idempotency_revision = self
             .idempotency_revision
@@ -554,16 +603,18 @@ impl AccountState {
             })?;
         let terms = intent.execution_terms();
         let wall_expiry = intent.expires_at().min(
-            now.wall
-                .checked_add_nanos(limits.reservation_ttl_nanos())
+            assessment
+                .now
+                .wall
+                .checked_add_nanos(assessment.limits.reservation_ttl_nanos())
                 .map_err(|_| {
                     AccountReservationError::from_reason(AccountRiskViolation::ArithmeticOverflow)
                 })?,
         );
         let monotonic_expiry =
-            monotonic_deadline(now, limits.reservation_ttl_nanos()).map_err(|_| {
-                AccountReservationError::from_reason(AccountRiskViolation::ClockFailure)
-            })?;
+            monotonic_deadline(assessment.now, assessment.limits.reservation_ttl_nanos()).map_err(
+                |_| AccountReservationError::from_reason(AccountRiskViolation::ClockFailure),
+            )?;
         let lease = Arc::new(AccountReservationLease::new(
             Arc::clone(&self.account_revision),
             Arc::clone(&self.reconciliation_required),
@@ -587,7 +638,7 @@ impl AccountState {
         // the reservation, tombstone, revision, and rate event as one infallible lock-owned step.
         if removes_expired {
             self.idempotency_tombstones
-                .retain(|tombstone| now.wall <= tombstone.intent_expires_at);
+                .retain(|tombstone| assessment.now.wall <= tombstone.intent_expires_at);
         }
         self.reservations.retain(ReservationRecord::retained);
         while self
@@ -614,7 +665,7 @@ impl AccountState {
                 intent.expires_at(),
             ));
         self.idempotency_revision = next_idempotency_revision;
-        self.rate_events.push_back(now.wall.unix_nanos());
+        self.rate_events.push_back(assessment.now.wall.unix_nanos());
         Ok(AccountRiskReservation {
             account_id: intent.account_id(),
             intent_digest: intent.digest(),
@@ -627,7 +678,7 @@ impl AccountState {
         &self,
         intent: &OrderIntent,
         snapshot: &PortfolioSnapshot,
-    ) -> Result<(), AccountReservationError> {
+    ) -> Result<PortfolioFinancialState, AccountReservationError> {
         let terms = intent.execution_terms();
         let instrument_id = terms.instrument_id();
         let expected_quantity =
@@ -652,21 +703,70 @@ impl AccountState {
         });
         let basis_matches = match observed_basis {
             BasisMeasurement::Complete(basis) => basis == expected_basis,
-            BasisMeasurement::Incomplete => intent.side() == OrderSide::Buy,
+            BasisMeasurement::Incomplete => false,
         };
+
+        let account_position_count = self
+            .positions
+            .iter()
+            .filter(|(_, quantity)| **quantity != 0)
+            .count();
+        let holdings_match = account_position_count == snapshot.holdings().len()
+            && snapshot.holdings().iter().all(|holding| {
+                self.positions
+                    .get(&holding.instrument_id())
+                    .is_some_and(|quantity| *quantity != 0)
+                    && holding.cost_basis().complete().is_some_and(|basis| {
+                        self.position_cost_basis.get(&holding.instrument_id()) == Some(&basis)
+                    })
+            });
+        let projection = snapshot.risk_projection();
+        let Some(unrealized_pnl) = projection.unrealized_pnl().complete() else {
+            return Err(AccountReservationError::from_reason(
+                AccountRiskViolation::PortfolioStateMismatch,
+            ));
+        };
+        let financial_values = [
+            projection.settlement_available_cash(),
+            projection.gross_exposure(),
+            projection.marked_equity(),
+            projection.peak_marked_equity(),
+            unrealized_pnl,
+            projection.realized_loss(),
+            projection.drawdown(),
+        ];
+        let expected_drawdown = projection
+            .peak_marked_equity()
+            .checked_sub(projection.marked_equity());
 
         if snapshot.account_id() != intent.account_id()
             || snapshot.base_currency() != self.currency
-            || snapshot.cash().currency() != self.currency
-            || snapshot.cash() != self.cash
+            || financial_values
+                .into_iter()
+                .any(|value| value.currency() != self.currency)
+            || projection.settlement_available_cash() != self.cash
             || observed_quantity != expected_quantity
             || !basis_matches
+            || !holdings_match
+            || projection.gross_exposure().amount().is_sign_negative()
+            || projection.realized_loss().amount().is_sign_negative()
+            || projection.drawdown().amount().is_sign_negative()
+            || projection.peak_marked_equity().amount() < projection.marked_equity().amount()
+            || expected_drawdown.ok() != Some(projection.drawdown())
         {
             return Err(AccountReservationError::from_reason(
                 AccountRiskViolation::PortfolioStateMismatch,
             ));
         }
-        Ok(())
+        Ok(PortfolioFinancialState {
+            cash: projection.settlement_available_cash(),
+            capital: projection.marked_equity(),
+            gross_exposure: projection.gross_exposure(),
+            unrealized_pnl,
+            realized_loss: projection.realized_loss(),
+            drawdown: projection.drawdown(),
+            current_position: self.positions.get(&instrument_id).copied().unwrap_or(0),
+        })
     }
 
     fn compact_expired_idempotency(&mut self, now: Timestamp) -> Result<(), ()> {
@@ -696,6 +796,7 @@ impl AccountState {
         limits: &RiskLimits,
         now: ClockReading,
         config: AccountCoordinatorConfig,
+        portfolio: Option<PortfolioFinancialState>,
     ) -> Result<ReservationCalculation, AccountReservationError> {
         let mut reasons = Vec::new();
         if limits.kill_switch() {
@@ -775,9 +876,24 @@ impl AccountState {
             reasons.push(AccountRiskViolation::OrderRateLimit);
         }
 
+        let financial = portfolio.unwrap_or_else(|| PortfolioFinancialState {
+            cash: self.cash,
+            capital: self.capital,
+            gross_exposure: self.gross_exposure,
+            unrealized_pnl: self.unrealized_pnl,
+            realized_loss: self.realized_loss,
+            drawdown: self.drawdown,
+            current_position: self
+                .positions
+                .get(&terms.instrument_id())
+                .copied()
+                .unwrap_or(0),
+        });
         let calculation = ReservationCalculation::for_intent(intent, reservation_price, limits);
         match &calculation {
-            Ok(calculation) => self.evaluate_calculation(intent, limits, calculation, &mut reasons),
+            Ok(calculation) => {
+                self.evaluate_calculation(intent, limits, financial, calculation, &mut reasons);
+            }
             Err(()) => reasons.push(AccountRiskViolation::ArithmeticOverflow),
         }
         if !reasons.is_empty() {
@@ -792,6 +908,7 @@ impl AccountState {
         &self,
         intent: &OrderIntent,
         limits: &RiskLimits,
+        financial: PortfolioFinancialState,
         calculation: &ReservationCalculation,
         reasons: &mut Vec<AccountRiskViolation>,
     ) {
@@ -806,18 +923,14 @@ impl AccountState {
             }
         };
         if intent.side() == OrderSide::Buy {
-            match checked_reserved_cash(active.cash, calculation.cash, self.cash) {
+            match checked_reserved_cash(active.cash, calculation.cash, financial.cash) {
                 Ok(true) => reasons.push(AccountRiskViolation::InsufficientCash),
                 Ok(false) => {}
                 Err(()) => reasons.push(AccountRiskViolation::ArithmeticOverflow),
             }
         }
-        let current_position = self
-            .positions
-            .get(&intent.execution_terms().instrument_id())
-            .copied()
-            .unwrap_or(0);
-        let projected_position = current_position
+        let projected_position = financial
+            .current_position
             .checked_add(active.signed_quantity)
             .and_then(|value| value.checked_add(calculation.signed_quantity));
         match projected_position {
@@ -831,7 +944,7 @@ impl AccountState {
             }
             None => reasons.push(AccountRiskViolation::ArithmeticOverflow),
         }
-        let projected_exposure = self
+        let projected_exposure = financial
             .gross_exposure
             .checked_add(active.exposure)
             .and_then(|value| value.checked_add(calculation.exposure));
@@ -840,17 +953,17 @@ impl AccountState {
                 if exposure.amount() > limits.maximum_gross_exposure().amount() {
                     reasons.push(AccountRiskViolation::ExposureLimit);
                 }
-                if limits.leverage_exceeded(exposure, self.capital) {
+                if limits.leverage_exceeded(exposure, financial.capital) {
                     reasons.push(AccountRiskViolation::LeverageLimit);
                 }
             }
             Err(_) => reasons.push(AccountRiskViolation::ArithmeticOverflow),
         }
-        if self.capital.amount() < limits.minimum_capital().amount() {
+        if financial.capital.amount() < limits.minimum_capital().amount() {
             reasons.push(AccountRiskViolation::CapitalLimit);
         }
-        let unrealized_loss_amount = if self.unrealized_pnl.amount().is_sign_negative() {
-            match Decimal::ZERO.checked_sub(self.unrealized_pnl.amount()) {
+        let unrealized_loss_amount = if financial.unrealized_pnl.amount().is_sign_negative() {
+            match Decimal::ZERO.checked_sub(financial.unrealized_pnl.amount()) {
                 Some(value) => value,
                 None => {
                     reasons.push(AccountRiskViolation::ArithmeticOverflow);
@@ -861,14 +974,14 @@ impl AccountState {
             Decimal::ZERO
         };
         let unrealized_loss = Money::new(unrealized_loss_amount, self.currency);
-        match self.realized_loss.checked_add(unrealized_loss) {
+        match financial.realized_loss.checked_add(unrealized_loss) {
             Ok(loss) if loss.amount() > limits.maximum_loss().amount() => {
                 reasons.push(AccountRiskViolation::LossLimit);
             }
             Ok(_) => {}
             Err(_) => reasons.push(AccountRiskViolation::ArithmeticOverflow),
         }
-        if self.drawdown.amount() > limits.maximum_drawdown().amount() {
+        if financial.drawdown.amount() > limits.maximum_drawdown().amount() {
             reasons.push(AccountRiskViolation::DrawdownLimit);
         }
     }

@@ -406,10 +406,23 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
         &SourceIdentifier::try_from("risk-paper-production")?,
         RuleVersion::new(1)?,
     );
-    let (portfolio_publisher, portfolio) = portfolio_state_for_cash_accounts(&[(
-        account_id,
-        Money::new(Decimal::new(10_000, 0), usd),
-    )])?;
+    let portfolio_accounts = [(account_id, Money::new(Decimal::new(10_000, 0), usd))];
+    let initial_portfolio_service = portfolio_service_for_cash_accounts(&portfolio_accounts, None)?;
+    let initial_portfolio_revision = initial_portfolio_service
+        .current_revisions()
+        .next()
+        .cloned()
+        .ok_or("initial portfolio revision is missing")?;
+    let portfolio_retained_bytes =
+        NonZeroUsize::new(4 * 1024 * 1024).ok_or("portfolio byte bound")?;
+    let (portfolio_publisher, portfolio) = portfolio_execution_state(
+        initial_portfolio_service,
+        PortfolioReadLimits::new(
+            NonZeroUsize::MIN,
+            portfolio_retained_bytes,
+            NonZeroUsize::new(64).ok_or("portfolio publication history")?,
+        ),
+    )?;
     let risk = RiskService::try_new(
         Arc::clone(&accounts),
         portfolio,
@@ -764,6 +777,7 @@ async fn committed_live_authority_reaches_realistic_paper_fill_and_reconcile() -
         &accounts.snapshot_recovery_state(account_id)?,
         terms,
         90,
+        &initial_portfolio_revision,
     )?)?;
     let (_, subsequent) = source.batch_with_price("paper-subsequent-order", 7, "97.00")?;
     ingress.try_publish(subsequent)?;

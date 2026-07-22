@@ -32,10 +32,11 @@ pub(crate) fn build_revision(
     active_entries: &BTreeMap<SourceIdentifier, LedgerEntry>,
     seen_revisions: &BTreeSet<(SourceIdentifier, u32)>,
     plan: Option<&CorporateActionPlan>,
-    previous_revision_id: Option<PortfolioRevisionId>,
+    previous_revision: Option<&PortfolioRevision>,
     valuation: ValuationSet,
     evidence: RevisionEvidence,
 ) -> Result<PortfolioRevision, PortfolioError> {
+    let previous_revision_id = previous_revision.map(PortfolioRevision::id);
     let mut ordered = active_entries.values().cloned().collect::<Vec<_>>();
     ordered.sort_unstable_by(|left, right| {
         left.account_id
@@ -90,6 +91,48 @@ pub(crate) fn build_revision(
             .checked_add(position.market_value)
             .map_err(|_| PortfolioError::Arithmetic)
     })?;
+    let gross_exposure = positions.iter().try_fold(zero(), |total, position| {
+        let amount = position.market_value.amount();
+        let magnitude = if amount.is_sign_negative() {
+            Decimal::ZERO
+                .checked_sub(amount)
+                .ok_or(PortfolioError::Arithmetic)?
+        } else {
+            amount
+        };
+        total
+            .checked_add(Money::new(magnitude, base_currency))
+            .map_err(|_| PortfolioError::Arithmetic)
+    })?;
+    let marked_equity = cash
+        .checked_add(market_value)
+        .map_err(|_| PortfolioError::Arithmetic)?;
+    let prior_peak = previous_revision
+        .map(PortfolioRevision::peak_marked_equity)
+        .unwrap_or(marked_equity);
+    if prior_peak.currency() != base_currency {
+        return Err(PortfolioError::CurrencyMismatch);
+    }
+    let peak_marked_equity = if marked_equity.amount() > prior_peak.amount() {
+        marked_equity
+    } else {
+        prior_peak
+    };
+    let drawdown = peak_marked_equity
+        .checked_sub(marked_equity)
+        .map_err(|_| PortfolioError::Arithmetic)?;
+    let replay_realized_loss = state.realized_loss.total(&valuation)?;
+    let prior_realized_loss = previous_revision
+        .map(PortfolioRevision::realized_loss)
+        .unwrap_or(replay_realized_loss);
+    if prior_realized_loss.currency() != base_currency {
+        return Err(PortfolioError::CurrencyMismatch);
+    }
+    let realized_loss = if replay_realized_loss.amount() > prior_realized_loss.amount() {
+        replay_realized_loss
+    } else {
+        prior_realized_loss
+    };
     let cost_basis =
         aggregate_basis_measurement(&positions, base_currency, |position| position.cost_basis)?;
     let unrealized_gain = aggregate_basis_measurement(&positions, base_currency, |position| {
@@ -130,9 +173,14 @@ pub(crate) fn build_revision(
         cash_balances,
         positions,
         market_value,
+        gross_exposure,
+        marked_equity,
+        peak_marked_equity,
         cost_basis,
         realized_gain: state.realized_gain.total(&valuation)?,
+        realized_loss,
         unrealized_gain,
+        drawdown,
         income: state.income.total(&valuation)?,
         withholding: state.withholding.total(&valuation)?,
         fees: state.fees.total(&valuation)?,

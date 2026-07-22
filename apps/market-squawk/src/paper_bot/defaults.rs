@@ -240,6 +240,7 @@ where
     let portfolio = PortfolioReadCapability::unavailable(PortfolioReadLimits::new(
         portfolio_results,
         portfolio_retained_bytes,
+        nonzero_usize(4_096)?,
     ))?;
     let risk_limits = RiskLimits::try_new(RiskLimitsInput {
         currency,
@@ -435,8 +436,12 @@ fn local_paper_portfolio_capability(
     )?;
     Ok(portfolio_execution_state(
         service,
-        PortfolioReadLimits::new(nonzero_usize(maximum_instruments)?, retained_bytes),
-    )
+        PortfolioReadLimits::new(
+            nonzero_usize(maximum_instruments)?,
+            retained_bytes,
+            nonzero_usize(4_096)?,
+        ),
+    )?
     .1)
 }
 

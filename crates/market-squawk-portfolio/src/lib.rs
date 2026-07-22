@@ -300,6 +300,55 @@ impl PortfolioQuery {
     }
 }
 
+/// Financial state derived from one immutable portfolio revision for pre-trade risk.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PortfolioRiskProjection {
+    settlement_available_cash: Money,
+    gross_exposure: Money,
+    marked_equity: Money,
+    peak_marked_equity: Money,
+    unrealized_pnl: BasisMeasurement,
+    realized_loss: Money,
+    drawdown: Money,
+}
+
+impl PortfolioRiskProjection {
+    /// Returns cash available before execution reservations.
+    pub const fn settlement_available_cash(self) -> Money {
+        self.settlement_available_cash
+    }
+
+    /// Returns the sum of absolute current position market values.
+    pub const fn gross_exposure(self) -> Money {
+        self.gross_exposure
+    }
+
+    /// Returns cash plus signed current position market value.
+    pub const fn marked_equity(self) -> Money {
+        self.marked_equity
+    }
+
+    /// Returns high-water marked equity across the immutable revision lineage.
+    pub const fn peak_marked_equity(self) -> Money {
+        self.peak_marked_equity
+    }
+
+    /// Returns current unrealized profit or loss when every open basis is complete.
+    pub const fn unrealized_pnl(self) -> BasisMeasurement {
+        self.unrealized_pnl
+    }
+
+    /// Returns cumulative loss magnitude from negative realized outcomes.
+    pub const fn realized_loss(self) -> Money {
+        self.realized_loss
+    }
+
+    /// Returns current high-water marked-equity drawdown.
+    pub const fn drawdown(self) -> Money {
+        self.drawdown
+    }
+}
+
 /// One bounded, read-only portfolio DTO.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PortfolioSnapshot {
@@ -307,6 +356,7 @@ pub struct PortfolioSnapshot {
     account_id: AccountId,
     base_currency: Currency,
     cash: Money,
+    risk: PortfolioRiskProjection,
     holdings: Vec<Position>,
     retained_bytes: usize,
 }
@@ -330,6 +380,11 @@ impl PortfolioSnapshot {
     /// Returns base-currency cash, including explicit FX valuation.
     pub const fn cash(&self) -> Money {
         self.cash
+    }
+
+    /// Returns the complete immutable-revision projection used by portfolio-wide risk limits.
+    pub const fn risk_projection(&self) -> PortfolioRiskProjection {
+        self.risk
     }
 
     /// Returns bounded position DTOs in stable instrument order.
@@ -454,6 +509,16 @@ impl PortfolioService {
             .ok_or(PortfolioServiceError::MissingAccount)
     }
 
+    /// Iterates the single current immutable revision for every published account.
+    pub fn current_revisions(&self) -> impl ExactSizeIterator<Item = &PortfolioRevision> {
+        self.current.values()
+    }
+
+    /// Iterates every revision token explicitly revoked by this service image.
+    pub fn revoked_revisions(&self) -> impl ExactSizeIterator<Item = &PortfolioRevisionToken> {
+        self.revoked.iter()
+    }
+
     /// Returns a bounded immutable snapshot after validating a current revision precondition.
     ///
     /// # Errors
@@ -481,32 +546,68 @@ impl PortfolioService {
                 limit,
             });
         }
+        let retained_bytes = snapshot_retained_bytes(revision.positions())?;
+        let byte_limit = query.max_retained_bytes.min(self.limits.max_retained_bytes);
+        if retained_bytes > byte_limit {
+            return Err(PortfolioServiceError::RetainedBytesExceeded);
+        }
         let mut holdings = Vec::new();
         holdings
             .try_reserve_exact(revision.positions().len())
             .map_err(|_| PortfolioServiceError::AllocationFailed)?;
         holdings.extend_from_slice(revision.positions());
-        let retained_bytes = std::mem::size_of::<PortfolioSnapshot>()
-            .checked_add(
-                holdings
-                    .capacity()
-                    .checked_mul(std::mem::size_of::<Position>())
-                    .ok_or(PortfolioServiceError::Arithmetic)?,
-            )
-            .ok_or(PortfolioServiceError::Arithmetic)?;
-        let byte_limit = query.max_retained_bytes.min(self.limits.max_retained_bytes);
-        if retained_bytes > byte_limit {
-            return Err(PortfolioServiceError::RetainedBytesExceeded);
-        }
         Ok(PortfolioSnapshot {
             revision: revision.token(),
             account_id: revision.account_id(),
             base_currency: revision.base_currency(),
             cash: revision.cash(),
+            risk: PortfolioRiskProjection {
+                settlement_available_cash: revision
+                    .cash_balances()
+                    .iter()
+                    .find(|balance| balance.currency() == revision.base_currency())
+                    .map(|balance| balance.amount())
+                    .unwrap_or(Money::new(Decimal::ZERO, revision.base_currency())),
+                gross_exposure: revision.gross_exposure(),
+                marked_equity: revision.marked_equity(),
+                peak_marked_equity: revision.peak_marked_equity(),
+                unrealized_pnl: revision.unrealized_gain(),
+                realized_loss: revision.realized_loss(),
+                drawdown: revision.drawdown(),
+            },
             holdings,
             retained_bytes,
         })
     }
+}
+
+fn snapshot_retained_bytes(positions: &[Position]) -> Result<usize, PortfolioServiceError> {
+    let position_bytes = positions
+        .len()
+        .checked_mul(std::mem::size_of::<Position>())
+        .ok_or(PortfolioServiceError::Arithmetic)?;
+    positions.iter().try_fold(
+        std::mem::size_of::<PortfolioSnapshot>()
+            .checked_add(position_bytes)
+            .ok_or(PortfolioServiceError::Arithmetic)?,
+        |retained, position| {
+            let lot_bytes = position
+                .lots()
+                .len()
+                .checked_mul(std::mem::size_of::<Lot>())
+                .ok_or(PortfolioServiceError::Arithmetic)?;
+            position.lots().iter().try_fold(
+                retained
+                    .checked_add(lot_bytes)
+                    .ok_or(PortfolioServiceError::Arithmetic)?,
+                |retained, lot| {
+                    retained
+                        .checked_add(lot.id().retained_bytes())
+                        .ok_or(PortfolioServiceError::Arithmetic)
+                },
+            )
+        },
+    )
 }
 
 pub(crate) fn checked_decimal_add(
