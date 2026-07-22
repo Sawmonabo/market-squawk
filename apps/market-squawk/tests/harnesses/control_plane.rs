@@ -1,3 +1,5 @@
+#[path = "../backtest_vertical.rs"]
+mod backtest_vertical;
 #[path = "../journal.rs"]
 mod journal;
 #[path = "../journal_path_integration.rs"]

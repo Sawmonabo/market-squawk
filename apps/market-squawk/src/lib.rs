@@ -3,6 +3,7 @@
 //! Production live batches enter only [`live_runtime::LiveRuntimeComposition`]. The legacy local
 //! event model is explicitly diagnostic and remains isolated from current execution authority.
 
+pub mod backtest_service;
 pub mod bot;
 pub mod diagnostic_engine;
 mod domain;
@@ -24,6 +25,10 @@ pub mod journal {
     pub use market_squawk_platform::{JournalError, JournalReader, JournalWriter};
 }
 
+pub use backtest_service::{
+    BacktestGovernanceBindings, PinnedBacktestInput, ProductionBacktestService,
+    ProductionBacktestServiceError,
+};
 pub use diagnostic_engine::{
     DiagnosticEngine, DiagnosticEngineSnapshot, DiagnosticProductSnapshot, SharedDiagnosticEngine,
 };
