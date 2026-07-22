@@ -776,6 +776,9 @@ pub enum CatalogError {
     /// A repeated idempotency key named different immutable input.
     #[error("catalog idempotency identity conflicts with a prior run")]
     IdempotencyConflict,
+    /// Fair-value append preconditions no longer match the durable catalog head.
+    #[error("fair-value catalog position changed; reopen before appending")]
+    FairValuePositionConflict,
     /// A cursor update attempted to move durable progress backwards.
     #[error("catalog cursor update is older than durable progress")]
     StaleCursor,

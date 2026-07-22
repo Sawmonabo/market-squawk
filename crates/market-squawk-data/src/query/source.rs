@@ -193,6 +193,14 @@ impl QuerySource {
         }
     }
 
+    pub(super) fn pinned_dataset(&self) -> Option<&PinnedDataset> {
+        match self {
+            Self::Pinned { dataset, .. } => Some(dataset),
+            #[cfg(test)]
+            Self::Batches { .. } => None,
+        }
+    }
+
     pub(super) fn retained_bytes(&self) -> Result<usize, QueryError> {
         match self {
             Self::Pinned { receipt, .. } => Ok(receipt.bytes()),

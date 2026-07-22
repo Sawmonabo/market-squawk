@@ -72,6 +72,7 @@ impl ShardActor {
         let mut publish_after_batch = false;
         let mut feature_unavailable = false;
         let mut action_failed = false;
+        let mut qualified_market_export_dropped = false;
         {
             let Some(owner) = self.routes.get_mut(&key) else {
                 admission.invalidate_on_admission_failure();
@@ -99,9 +100,11 @@ impl ShardActor {
                         return Err(error.into());
                     }
                 };
-                let disposition = process_applied_observation(&key, owner, applied)?;
+                let disposition =
+                    process_applied_observation(&key, owner, applied, _retained_bytes)?;
                 feature_unavailable |= disposition.feature_unavailable;
                 action_failed |= disposition.action_failed;
+                qualified_market_export_dropped |= disposition.qualified_market_export_dropped;
                 self.events_since_snapshot = self.events_since_snapshot.saturating_add(1);
                 self.dirty = true;
                 publish_after_batch |= self.events_since_snapshot >= self.snapshot_event_trigger;
@@ -115,6 +118,13 @@ impl ShardActor {
             self.health_revision = self.health_revision.saturating_add(1);
             self.emit_health(LiveRuntimeHealthKind::ActionFailed, Some(key.clone()));
         }
+        if qualified_market_export_dropped {
+            self.health_revision = self.health_revision.saturating_add(1);
+            self.emit_health(
+                LiveRuntimeHealthKind::QualifiedMarketExportDropped,
+                Some(key.clone()),
+            );
+        }
         if publish_after_batch {
             self.publish_snapshot(ShardLifecycleSnapshot::Ready)?;
         }
@@ -126,6 +136,7 @@ fn process_applied_observation(
     route: &crate::ShardKey,
     owner: &mut RouteOwner,
     applied: AppliedLiveObservation,
+    conservative_retained_bytes: u32,
 ) -> Result<AppliedObservationDisposition, ActorError> {
     if let Some(authority) = applied.authority.as_ref() {
         owner.processor.validate_applied_current(authority)?;
@@ -137,6 +148,7 @@ fn process_applied_observation(
             processor,
             features,
             action_hook: _,
+            qualified_market_export: _,
             generations: _,
             cross_venue_publisher: _,
             cross_venue_reader: _,
@@ -248,9 +260,27 @@ fn process_applied_observation(
             }
         }
     }
+    let qualified_market_export_dropped =
+        if let Some(exporter) = owner.qualified_market_export.as_ref() {
+            let observation = crate::CommittedQualifiedMarketObservation::from_committed(
+                applied.event,
+                applied.assessment,
+                applied.binding_digest,
+                applied.committed_state_revision,
+                owner.processor.execution_terms(),
+            );
+            observation.is_some_and(|observation| {
+                exporter
+                    .try_export(observation, conservative_retained_bytes)
+                    .is_err()
+            })
+        } else {
+            false
+        };
     Ok(AppliedObservationDisposition {
         feature_unavailable: unavailable,
         action_failed,
+        qualified_market_export_dropped,
     })
 }
 
@@ -258,6 +288,7 @@ fn process_applied_observation(
 struct AppliedObservationDisposition {
     feature_unavailable: bool,
     action_failed: bool,
+    qualified_market_export_dropped: bool,
 }
 
 fn event_received_at(event: &market_squawk_domain::MarketEvent) -> market_squawk_domain::Timestamp {

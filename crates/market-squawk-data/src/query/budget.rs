@@ -9,6 +9,7 @@ use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion::error::DataFusionError;
 use datafusion::execution::memory_pool::MemoryReservation;
+use sha2::{Digest as _, Sha256};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
@@ -94,9 +95,16 @@ impl PlanningReceipt {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(super) struct CountingWriter {
     pub(super) byte_count: u64,
+    digest: Sha256,
+}
+
+impl CountingWriter {
+    pub(super) fn digest(&self) -> [u8; 32] {
+        self.digest.clone().finalize().into()
+    }
 }
 
 impl Write for CountingWriter {
@@ -106,6 +114,7 @@ impl Write for CountingWriter {
             .byte_count
             .checked_add(bytes)
             .ok_or_else(|| std::io::Error::other("IPC byte count overflow"))?;
+        self.digest.update(buffer);
         Ok(buffer.len())
     }
 

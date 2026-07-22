@@ -9,9 +9,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use market_squawk_analytics::RequiredLiveFeature;
+use market_squawk_domain::DataQuality;
 use market_squawk_live::{
     ActionAuthorityIssueLimit, ActionHookDisposition, CommittedActionContext, CurrentAuthorityGate,
-    CurrentAuthorityGateError, LiveActionHook, LiveActionHookError, LiveRuntime, RouteActionHook,
+    CurrentAuthorityGateError, LiveActionHook, LiveActionHookError, LiveRuntime,
+    QualifiedMarketPrice, RouteActionHook, RouteQualifiedMarketExport,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -66,11 +68,14 @@ async fn action_enabled_runtime_owns_and_invokes_the_exact_bounded_route_hook() 
         vec![RequiredLiveFeature::RollingVwap],
     )?;
     assert_eq!(Arc::strong_count(&calls), 2);
+    let (exporter, mut exports) =
+        RouteQualifiedMarketExport::try_new(route(INSTRUMENT_ONE)?, 8, 64 * 1024)?;
 
-    let runtime = LiveRuntime::start_with_action_hooks(
+    let runtime = LiveRuntime::start_with_action_hooks_and_qualified_market_exports(
         runtime_config(8, 8 * 1024 * 1024, 4 * 1024 * 1024)?,
         vec![route_config(INSTRUMENT_ONE)?],
         vec![hook],
+        vec![exporter],
     )
     .await?;
     let mut source = SourceHarness::try_new("action-source", 1, INSTRUMENT_ONE)?;
@@ -99,7 +104,21 @@ async fn action_enabled_runtime_owns_and_invokes_the_exact_bounded_route_hook() 
     })
     .await?;
     assert_eq!(calls.load(Ordering::Relaxed), 1);
-
+    let exported = tokio::time::timeout(Duration::from_secs(1), exports.recv())
+        .await?
+        .ok_or("qualified export closed before delivery")?;
+    assert_eq!(
+        exported.observation().recorded_quality(),
+        DataQuality::DirectVerified
+    );
+    assert_eq!(
+        exported.observation().instrument_id(),
+        INSTRUMENT_ONE.parse()?
+    );
+    assert!(matches!(
+        exported.observation().price(),
+        QualifiedMarketPrice::Trade { .. }
+    ));
     assert!(runtime.shutdown().await.is_complete());
     assert_eq!(Arc::strong_count(&calls), 1);
     Ok(())
