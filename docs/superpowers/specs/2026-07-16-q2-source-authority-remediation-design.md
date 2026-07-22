@@ -11,14 +11,6 @@ The design preserves the separation between source decoding, source qualificatio
 and the live hot path. Coordination and accounting occur at source registration, health reporting,
 and bounded command admission rather than per book update.
 
-## Security boundary
-
-The system supports provider-authorized use only. It must never rotate identities, accounts,
-fingerprints, proxies, or request origins to avoid a provider limit; bypass CAPTCHA or anti-bot
-controls; or distribute requests to evade quotas. Provider responses that reduce or revoke
-availability are authoritative fail-closed transitions. The implementation may coordinate multiple
-legitimate callers so they share one stricter budget, but it may not manufacture extra capacity.
-
 ## Retained-memory accounting
 
 Live admission uses closed-shape retained-size accounting. A routed command is charged for:

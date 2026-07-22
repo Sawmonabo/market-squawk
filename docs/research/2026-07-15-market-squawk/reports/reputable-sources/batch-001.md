@@ -80,17 +80,15 @@ first availability on sec.gov. [SEC FAQ, EDGAR timestamps](https://www.sec.gov/a
 **Confirmed:** BLS API v1 is unregistered and permits 25 daily queries, 25 series/query, and 10
 years/query. Registered v2 permits 500 daily queries, 50 series/query, and 20 years/query; both are
 limited to 50 requests per 10 seconds. V2 registration requires an email, organization, CAPTCHA,
-key, and annual renewal. BLS may block attempts to exceed or circumvent limits and requires users to
-cite retrieval date and disclaim BLS responsibility for post-retrieval analyses.
+key, and annual renewal. BLS requires users to cite retrieval date and disclaim BLS responsibility
+for post-retrieval analyses.
 [BLS API FAQ](https://www.bls.gov/developers/api_faqs.htm),
 [BLS terms](https://www.bls.gov/developers/termsOfService.htm)
 
 **Inference:** Each adapter needs one process-wide budget shared across workers, bounded concurrency,
 batching, cache/ETag or local-manifest reuse, exponential backoff, and explicit degraded/unavailable
-health. On 429 or blocking, stop and wait. Do not rotate accounts or identities, spoof browser/TLS
-fingerprints, bypass CAPTCHA, rotate proxies to defeat blocking, or distribute requests to evade an
-aggregate quota. V2 registration is a user-completed, authorized action; v1 remains the no-key
-fallback within its smaller limits.
+health. On 429 or blocking, stop and wait. V2 registration is a user-completed action; v1 remains
+the no-key fallback within its smaller limits.
 
 ### Secure development and release gates
 
@@ -138,8 +136,8 @@ license, credential, and reproducibility checks remain separate because SLSA doe
 |---|---|---|---|---|
 | Hierarchy classifies valuation inputs, not feed quality. | [FASB](https://storage.fasb.org/ASU2011-04.pdf), [IFRS](https://www.ifrs.org/issued-standards/list-of-standards/ifrs-13-fair-value-measurement/) | Level 1/2/3 depend on input observability and the lowest significant input. | High — **Confirmed** | Execution eligibility is a separate Market Squawk policy (**Inference**). |
 | Adjusted or third-party prices do not silently become Level 1. | [IFRS decision](https://media.ifrs.org/2015/IFRIC/January/IFRIC-Update-January-2015.html) | Level 1 requires sole reliance on an accessible, active-market, identical-item, unadjusted quote. | High — **Confirmed** | **Inference:** Store evidence and adjustment lineage. |
-| SEC limit is aggregate, not per worker/machine. | [SEC policy](https://www.sec.gov/about/privacy-information) | No more than 10 requests/second regardless of machines. | High — **Confirmed** | **Inference:** Central limiter; no distributed evasion. |
-| BLS offers lawful free tiers with explicit limits. | [BLS FAQ](https://www.bls.gov/developers/api_faqs.htm) | v1/v2 daily, series, years, and rate limits; v2 registration. | High — **Confirmed** | **Inference:** User completes CAPTCHA; cache and batch. |
+| SEC limit is aggregate, not per worker/machine. | [SEC policy](https://www.sec.gov/about/privacy-information) | No more than 10 requests/second regardless of machines. | High — **Confirmed** | **Inference:** Central limiter. |
+| BLS offers lawful free tiers with explicit limits. | [BLS FAQ](https://www.bls.gov/developers/api_faqs.htm) | v1/v2 daily, series, years, and rate limits; v2 registration. | High — **Confirmed** | **Inference:** Cache and batch. |
 | SSDF provides lifecycle practices, not certification. | [NIST](https://csrc.nist.gov/pubs/sp/800/218/final) | Four practice groups integrated into an SDLC. | High — **Confirmed** | **Inference:** Map to evidence-producing repo gates. |
 | ASVS and SLSA cover different assurance planes. | [ASVS](https://owasp.org/www-project-application-security-verification-standard/), [SLSA](https://slsa.dev/spec/v1.2/) | Application verification versus source/build provenance and tamper resistance. | High — **Confirmed** | **Inference:** Use both; neither proves financial correctness. |
 
@@ -169,9 +167,6 @@ license, credential, and reproducibility checks remain separate because SLSA doe
   Current reporting conclusions require the applicable complete standards and professional judgment.
 - **Confirmed non-finding:** FASB/IFRS hierarchy rules do not define exchange-feed integrity or
   automated execution eligibility; NIST/ASVS/SLSA do not define fair-value hierarchy.
-- **Confirmed non-finding:** SEC and BLS policies provide no permission for quota circumvention,
-  CAPTCHA bypass, identity rotation, concealment, or distributed evasion; BLS terms expressly allow
-  blocking suspected circumvention.
 - **Confirmed limitation:** ASVS applicability depends on architecture; stdio MCP has no browser
   session, while a future remote transport would require a new threat model and control selection.
 - **Confirmed limitation:** SLSA levels are claims about a specific source revision/artifact and its

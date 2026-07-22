@@ -130,7 +130,7 @@
       "selection_rationale": "Documents JSON/XML macro-series retrieval and the real-time/vintage semantics required for point-in-time datasets and revision preservation.",
       "priority": "P0",
       "status": "selected",
-      "notes": "Related pages: https://fred.stlouisfed.org/docs/api/fred/realtime_period.html and https://fred.stlouisfed.org/docs/api/fred/series_vintagedates.html . A free registered API key is required. HTTP 429 is documented, but a stable numeric quota was not found; use explicit vintages, conservative backoff, caching, and no identity rotation. Accessed 2026-07-15."
+      "notes": "Related pages: https://fred.stlouisfed.org/docs/api/fred/realtime_period.html and https://fred.stlouisfed.org/docs/api/fred/series_vintagedates.html . A free registered API key is required. HTTP 429 is documented, but a stable numeric quota was not found; use explicit vintages, conservative backoff, and caching. Accessed 2026-07-15."
     },
     {
       "category": "docs",
@@ -142,7 +142,7 @@
       "selection_rationale": "Proves a free unregistered v1 baseline and documents optional registered v2 capabilities, request shapes, metadata differences, and exact quotas.",
       "priority": "P0",
       "status": "selected",
-      "notes": "Related limits page: https://www.bls.gov/developers/api_faqs.htm . v1/v2 daily limits are 25/500; series limits 25/50; year limits 10/20; both allow 50 requests per 10 seconds. v2 registration includes a CAPTCHA and annual renewal, which must remain manual user steps. Batch and cache within limits; never bypass registration or rotate accounts. Accessed 2026-07-15."
+      "notes": "Related limits page: https://www.bls.gov/developers/api_faqs.htm . v1/v2 daily limits are 25/500; series limits 25/50; year limits 10/20; both allow 50 requests per 10 seconds. v2 registration includes a CAPTCHA and annual renewal. Batch and cache within limits. Accessed 2026-07-15."
     },
     {
       "category": "docs",

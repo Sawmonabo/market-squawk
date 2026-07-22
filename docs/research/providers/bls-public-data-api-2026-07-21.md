@@ -41,9 +41,7 @@ response schema. Network smoke tests remain opt-in; deterministic fixtures are t
   cancellation, and exact series/year response binding all fail closed before normalization.
 - Registry authority must enforce every applicable window atomically for the same canonical
   public or registered allocation: 25 requests per rolling day plus 50 per 10 seconds for v1, and
-  500 requests per rolling day plus 50 per 10 seconds for v2. This preserves lawful v2 capacity
-  without identity or account rotation and without an adapter-local limiter that aliases could
-  bypass.
+  500 requests per rolling day plus 50 per 10 seconds for v2.
 - Automatic redirects, ambient proxies, implicit retries, and compression are disabled. The
   adapter requests and accepts identity encoding only, then counts every streamed response byte.
 - Partial responses, missing or extra series, duplicates, out-of-window observations, changed

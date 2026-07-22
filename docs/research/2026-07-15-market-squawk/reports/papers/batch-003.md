@@ -156,8 +156,7 @@ collapse them into one “risk-adjusted return” score.
   coefficient, execution horizon, or production strategy.
 - **Inference:** Almgren–Chriss alone does not complete the required realistic paper adapter, and no
   source here supports bypassing risk, live-data quality gates, or order-state reconciliation.
-- **Inference:** This batch provides no measured Market Squawk performance and no support for
-  identity/account rotation, fingerprint spoofing, CAPTCHA bypass, or quota/blocking evasion.
+- **Inference:** This batch provides no measured Market Squawk performance.
 
 ## Source List
 

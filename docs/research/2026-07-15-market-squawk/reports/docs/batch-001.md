@@ -255,9 +255,7 @@ coverage. Those checks must precede `DirectVerified` and any immediate automated
   ([Reqwest](https://docs.rs/reqwest/latest/reqwest/),
   [Tokio-Tungstenite](https://docs.rs/tokio-tungstenite/latest/tokio_tungstenite/)).
 - **Security relevance (Inference):** explicitly decide proxy behavior, forbid invalid-certificate
-  and invalid-hostname modes in production, do not enable TLS key logging by default, and do not
-  use proxies or TLS/browser fingerprint manipulation to conceal traffic or evade provider
-  controls.
+  and invalid-hostname modes in production, and do not enable TLS key logging by default.
 
 ## Cross-Source Patterns
 
@@ -311,10 +309,6 @@ coverage. Those checks must precede `DirectVerified` and any immediate automated
 - **No Serde schema-versioning system.** Attributes control serialization behavior but do not
   supply provenance schemas, version negotiation, compatibility policy, or provider drift
   monitoring.
-- **No permission for concealment or quota evasion.** Proxy and TLS configurability are transport
-  capabilities, not authorization for identity rotation, fingerprint spoofing, CAPTCHA bypass,
-  concealment proxies, or distributed quota evasion. Those behaviors were not adopted.
-
 ## Source List
 
 All sources were accessed on **2026-07-15**.

@@ -13,8 +13,8 @@ Source clients must use a checked profile with these fail-closed defaults:
 
 - Automatic redirects are disabled unless every resolved target is reauthorized against the same
   structural endpoint policy and the redirect count remains bounded.
-- Ambient system proxies are disabled. A legitimate proxy requires a separate explicit,
-  allowlisted configuration; rotating proxies or using them to evade blocking remains prohibited.
+- Ambient system proxies are disabled. A proxy requires a separate explicit, allowlisted
+  configuration.
 - Implicit client retries are disabled unless every physical attempt reserves the same shared
   provider/account budget and the method is safe under the adapter's idempotency policy.
 - Automatic `Referer` generation is disabled for source API clients.
@@ -41,8 +41,7 @@ defaults are convenient for general clients but are not safe implicit behavior f
 allowlist-and-budget-enforced source adapter.
 
 RFC 9110 defines `Retry-After` as either an HTTP-date or a non-negative delay in seconds. Both forms
-need bounded parsing; neither grants permission to rotate accounts, endpoints, identities, or
-proxies.
+need bounded parsing.
 
 Rust 1.97 documents `std::time::Instant` as monotonically nondecreasing and opaque. It also warns
 that direct instant arithmetic can panic when a result is not representable, while

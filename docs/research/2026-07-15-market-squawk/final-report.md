@@ -281,12 +281,6 @@ features, models, portfolios, and backtests; (5) shared risk and realistic paper
 fair-value evidence and bounded MCP; (7) fuzzing, benchmarks, audits, and release hardening. Each
 stage remains runnable and advances only on deterministic tests plus separate opt-in network tests.
 
-Provider rejection must transition to cached/degraded/unavailable with bounded retry. Market Squawk
-must not implement identity/account rotation, browser or TLS fingerprint spoofing, CAPTCHA or
-anti-bot bypass, proxy rotation intended to defeat blocking, or distributed requests intended to
-evade quotas. Authorized user keys, disclosed proxies, and optional licensed feeds are distinct
-legitimate configurations.
-
 ## Risks, Gaps, and Open Questions
 
 - **Implementation:** no reviewed source proves that the repository currently implements or passes

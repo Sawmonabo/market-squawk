@@ -33,8 +33,7 @@ used as one adoption signal, not as a quality ranking. The ten selected reposito
 This is source discovery, not a recommendation to import any repository wholesale. Market Squawk's
 strict separation of live and research planes, `DirectVerified` qualification, bounded queues,
 risk non-bypass, point-in-time semantics, and fair-value evidence model remain product-specific
-requirements. No repositories related to quota evasion, identity rotation, anti-bot bypass,
-fingerprint concealment, or blocking circumvention were considered.
+requirements.
 
 ## Search Queries Used
 
@@ -263,9 +262,7 @@ not accepted as satisfying realistic fill requirements without its own tests and
 7. **Benchmarks are not portable claims.** Upstream performance claims cannot establish Market
    Squawk's 100,000 events/s or sub-millisecond warmed p99 targets. Those require the specified
    fixture and target-hardware measurements.
-8. **Provider-compliant access only.** Source health, caching, failover, and bounded backoff are
-   appropriate; identity rotation, CAPTCHA bypass, fingerprint spoofing, concealment, or distributed
-   quota evasion are neither coverage solutions nor admissible implementation techniques.
+8. Source health, caching, failover, and bounded backoff are appropriate.
 
 ## Source List
 

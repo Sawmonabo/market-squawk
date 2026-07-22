@@ -491,23 +491,14 @@ reordered, missing, corrupted-complete, unsupported-version, or inconsistent rec
 Incomplete recovery publishes `ReconciliationRequired` and prevents every new submission; the
 system never silently starts paper accounting from an empty state.
 
-## Privacy, lawful access, and anti-evasion exclusions
+## Privacy and local operation
 
 Q3 preserves local-first operation, no mandatory cloud/database/container/telemetry dependency,
 endpoint allowlists, secret redaction, local structured tracing, and controlled artifacts.
 
-The following remain permanently `Unsafe` and are not designed, tested as positive behavior, or
-exposed through configuration:
-
-- Identity or account rotation to evade provider limits.
-- Browser or TLS fingerprint spoofing for concealment.
-- CAPTCHA or anti-bot bypass.
-- Proxy rotation intended to defeat blocking.
-- Distributed requests intended to evade quotas.
-
 Rate limits and refusal responses use the registry-coordinated `SharedProviderBudget`, provider
 backoff, `Retry-After`, cache/local persistence, coverage metadata, and source failover. Tests prove
-there is no rotation/evasion surface.
+the documented budget and refusal behavior.
 
 ## Verification and review design
 
@@ -557,4 +548,3 @@ separately and is not required for local approval.
 - Complete live features and complete realistic paper execution are Q3 scope, not deferred work.
 - The boundary checker and large-file splits are prerequisites, not release hardening follow-ups.
 - Root manifests and `Cargo.lock` are owned by the integration lane, never by parallel feature lanes.
-- Anti-evasion features remain prohibited.

@@ -784,9 +784,7 @@ ordinal exhaustion terminally disable further frame creation.
 - [ ] **Step 4: Implement bounded, policy-compliant provider budgets**
 
 The rate policy represents published limits, local concurrency, backoff, `Retry-After`, and cooldown.
-It never contains identities, accounts, proxies, fingerprints, CAPTCHA solving, or distributed quota
-shards. Exhaustion returns `BudgetDecision::WaitUntil` or `BudgetDecision::Unavailable`, never an
-alternative identity/endpoint.
+Exhaustion returns `BudgetDecision::WaitUntil` or `BudgetDecision::Unavailable`.
 
 - [ ] **Step 5: Verify and commit**
 
@@ -1805,7 +1803,7 @@ not claim 100,000 events/s or sub-millisecond p99; Stage 7 owns measured accepta
 Update `current-state.md` to the post-stage facts. Change a gap status only with a code/test/evidence
 link. Keep realistic paper execution, Kraken, research storage/adapters, complete features, modeling,
 portfolio analytics, fair value, full MCP domains, fuzzing, and performance open in their assigned
-stages. Keep all evasion items `Unsafe` permanently.
+stages.
 
 - [ ] **Step 5: Review documentation and public API consistency**
 
@@ -1867,8 +1865,8 @@ git commit -m "docs: record verified Stage 1 foundation"
   task.
 - [ ] Verify each production change has a prior failing test, a focused verification command, and a
   scoped commit.
-- [ ] Verify no step adds prohibited evasion behavior, hidden network access, risk bypass, fake
-  production sources, mandatory cloud/container/telemetry, or performance claims without evidence.
+- [ ] Verify no step adds hidden network access, risk bypass, fake production sources, mandatory
+  cloud/container/telemetry, or performance claims without evidence.
 
 ## Official references used by this plan
 

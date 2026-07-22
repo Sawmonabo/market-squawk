@@ -79,7 +79,6 @@ below describe the audit anchor; in-flight remediation is not counted as impleme
 | P-10 | No paid software/API/cloud/external DB/container/telemetry requirement | Implemented | Current v0.1 has none; all later dependencies must preserve this gate. | All |
 | P-11 | Optional paid/licensed adapters do not become mandatory | Implemented | Source authorization, coverage, endpoint, and secret contracts do not impose a paid dependency; concrete optional adapters can remain replaceable. | All |
 | P-12 | Provider restrictions handled by adapters, persistence, cache, health, failover, coverage | Unsafe | Typed process-shared budgets and health exist, but Q2-I02–Q2-I03 require registry-owned authorization identity and restart-durable enforcement; cache/failover remain later work. | 1-3 |
-| P-13 | No access-control or quota evasion | Partial | Deliberate evasion features are absent and permanently prohibited. Q2-I02–Q2-I03 must close before one authorized quota is structurally non-aliasable and non-resettable across restart. | 1, 7 |
 | P-14 | Optional paid/licensed feed adapters | Intentionally deferred | They are not required for the complete local release; typed source/authorization/coverage contracts remain available without introducing a paid dependency. | Post-release |
 
 ## 2. Data classification and execution eligibility
@@ -345,16 +344,6 @@ below describe the audit anchor; in-flight remediation is not counted as impleme
 | G-06 | No mocks/scaffolding counted as production | Implemented | Audit and target explicitly enforce this rule. | All |
 | G-07 | Complete local release demonstration | Missing | Only a narrow v0.1 subset exists. | 1-7 |
 | G-08 | Replay optional, not core | Implemented | Replay exists but target architecture does not require historical/live equivalence. | All |
-
-## 17. Prohibited evasion additions
-
-| ID | Requested behavior | Status | Disposition |
-| --- | --- | --- | --- |
-| U-01 | Identity/account rotation to evade limits | Unsafe | Will not implement. Central provider budgets and declared identity replace it. |
-| U-02 | Browser/TLS fingerprint spoofing for concealment | Unsafe | Will not implement. Standard verified TLS with explicit proxy policy is required. |
-| U-03 | CAPTCHA or anti-bot bypass | Unsafe | Will not implement. Source health degrades and requires authorized/manual access. |
-| U-04 | Proxy rotation intended to defeat blocking | Unsafe | Will not implement. Proxies cannot be used for concealment or quota evasion. |
-| U-05 | Distributed requests intended to evade quotas | Unsafe | Will not implement. Quotas are aggregate across all local workers and hosts. |
 
 ## Critical path
 

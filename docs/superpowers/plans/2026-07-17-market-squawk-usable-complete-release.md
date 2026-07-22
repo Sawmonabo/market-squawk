@@ -53,9 +53,7 @@ primary sources, Rust 1.97.1, licenses, and the locked dependency graph before a
 - No unsafe Rust. Production paths contain no `unwrap`, `expect`, `panic!`, `todo!`, or
   `unimplemented!`. Libraries return typed `thiserror` results; `anyhow` remains at application
   boundaries.
-- Identity/account rotation to evade limits, browser/TLS fingerprint concealment, CAPTCHA or
-  anti-bot bypass, blocking-evasion proxy rotation, stealth scraping, distributed quota evasion,
-  access-control circumvention, and synthetic sources represented as production are prohibited.
+- Synthetic sources must not be represented as production sources.
 - Provider access uses one authorized identity, a shared authoritative budget, durable cursors and
   caches where rights allow, conditional requests, `Retry-After`, bounded backoff, source health,
   authorized failover, and explicit coverage. Rights are enforced per retrieve/display/persist/cache/
@@ -682,7 +680,7 @@ evidence change only in that integration commit.
 Update the README to distinguish `Runnable now`, `Required but missing`, and
 `Release blocked until implemented`. Name every mandatory producer-to-consumer vertical and its
 closing task. Correct the diagnostic capture receipt, current-authority, five-tool MCP, adapter,
-Python-product, and Parquet-compaction descriptions. Preserve zero-cost, no-evasion, journal,
+Python-product, and Parquet-compaction descriptions. Preserve zero-cost, journal,
 coverage, security, and financial-use warnings.
 
 - [x] **Step 2: Remove competing delivery authority**
@@ -768,7 +766,7 @@ app -> composition dependencies
 Use current official sources. Record exact compatible versions, enabled features, licenses, Rust and
 Python floors, native artifacts, transitive risks, provider rights, coverage, quotas, retrieval date,
 and stable fallback. Reject dependencies incompatible with Rust 1.97.1, local zero-mandatory-cost
-operation, or the no-evasion boundary.
+operation.
 
 - [x] **Step 3: Freeze parallel ownership**
 
@@ -1484,7 +1482,7 @@ Before persistence, independently verify the exact current terms bytes and opera
 If retrieve is permitted but persist/cache/archive/train is not affirmatively evidenced, run only the
 permitted ephemeral operation, reject `Catalog::reserve_ingest`, record the fail-closed disposition,
 and keep the usable release gate blocked. Do not treat user acknowledgement as rights, infer a bulk-
-download exception, evade controls, or count an ephemeral stub as the durable FRED/ALFRED capability.
+download exception, or count an ephemeral stub as the durable FRED/ALFRED capability.
 Release unblocks only when exact lawful source/use evidence supports the required local consumer or
 the user explicitly revises the product requirement.
 
@@ -2381,7 +2379,7 @@ explicit source smoke command.
 
 Map typed service errors to stable MCP/CLI errors without provider payloads/secrets. No shell,
 arbitrary filesystem, unrestricted SQL, credential read, remote code/model loading, unchecked order,
-risk bypass, audit deletion or provider-evasion tool exists in registration or hidden dispatch. Bot/
+risk bypass, or audit deletion exists in registration or hidden dispatch. Bot/
 Execution accept intents/controlled commands only; risk constructs approvals and dispatcher consumes
 them once.
 

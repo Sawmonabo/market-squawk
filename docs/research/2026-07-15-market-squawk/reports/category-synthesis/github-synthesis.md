@@ -310,8 +310,7 @@ The following are consolidated **Inferences**:
   pins, fuzzing, credential scanning, license checks, checksum/provenance artifacts, secret
   redaction, and documented response. No telemetry, cloud, container, or outbound fetch is required.
 - Respect provider limits through local throttles, `Retry-After`, bounded retry, caching,
-  coalescing, cooldown and health degradation. Do not implement identity/account rotation,
-  fingerprint/TLS spoofing, CAPTCHA bypass, concealment proxies, or distributed quota evasion.
+  coalescing, cooldown and health degradation.
 
 ## Gaps
 

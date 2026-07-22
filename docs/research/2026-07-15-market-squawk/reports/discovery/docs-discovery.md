@@ -35,11 +35,6 @@ search-result snippets. Access date for every selected source is **2026-07-15**.
 about architectural fit are labeled or phrased as implementation inferences; documented API
 facts are linked to their official source.
 
-Provider access controls and quotas are treated as requirements. Identity/account rotation,
-fingerprint spoofing, CAPTCHA bypass, concealment proxies, and distributed quota evasion were
-not researched as implementation capabilities. They conflict with the product's stated
-replaceable-adapter/caching approach and with documented equitable-access controls.
-
 ## Search Queries Used
 
 The following query families were used; individual results were then opened on the official
@@ -245,7 +240,7 @@ site and followed to related official pages.
   today's view when building historical datasets.
 - **Limits/prerequisites:** a free registered API key is required for documented calls. The error
   documentation returns HTTP 429 when rate-limited but does not publish a stable numeric quota;
-  implement conservative backoff/caching and never rotate identities to exceed service policy.
+  implement conservative backoff/caching.
 - **Relevance:** is the strongest official basis for leakage-resistant macro point-in-time data.
 
 ### D12 — BLS
@@ -257,8 +252,8 @@ site and followed to related official pages.
 - **Integration pattern:** make v1 a zero-registration baseline, optionally accept a user-owned v2
   key, batch series within documented limits, cache results, and import BLS downloadable text
   files for bulk/history where appropriate.
-- **Limits/prerequisites:** v2 registration includes a CAPTCHA and annual renewal; these are manual
-  user steps, not adapter automation targets. v1 lacks catalog metadata and has small daily limits.
+- **Limits/prerequisites:** v2 registration includes a CAPTCHA and annual renewal. v1 lacks catalog
+  metadata and has small daily limits.
 - **Relevance:** proves a compliant no-paid baseline while making coverage and freshness explicit.
 
 ### D13 — U.S. Treasury APIs and files
@@ -322,8 +317,6 @@ site and followed to related official pages.
 | ONNX Runtime Rust link as implementation authority | https://onnxruntime.ai/docs/get-started/community-projects.html | Official Microsoft page is valuable to prove Rust is external/community-maintained, but it is not a first-party Rust API contract. Retained as D14 context. |
 | IFRS educational examples as requirements | https://www.ifrs.org/supporting-implementation/supporting-materials-by-ifrs-standards/ifrs-13/ | IFRS itself says the educational material does not constitute official IASB requirements. Retained only as support/context under D15. |
 | Blogs, SEO explainers, unofficial API wrappers, and documentation mirrors | N/A | Lower authority than available project/provider/government primary documentation; often omit limits, versioning, or licensing constraints. |
-| Quota-evasion and anti-bot bypass material | N/A | Intentionally excluded: it would undermine documented equitable-access restrictions and is not a legitimate adapter capability. |
-
 ## Coverage Gaps
 
 1. **Coinbase executable qualification:** official Exchange docs provide useful integrity rules,

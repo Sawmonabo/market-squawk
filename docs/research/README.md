@@ -56,6 +56,3 @@ decisions can be audited without relying on conversation history.
 - Record the research date and version when behavior can change.
 - Separate a source-backed fact from a Market Squawk design inference.
 - Persist direct links beside the decision they support.
-- Never use research to justify access-control, CAPTCHA, identity, proxy, fingerprint, or provider
-  quota evasion. Provider restrictions are handled through authorized adapters, shared budgets,
-  local caching, failover, coverage metadata, and explicit unavailability.

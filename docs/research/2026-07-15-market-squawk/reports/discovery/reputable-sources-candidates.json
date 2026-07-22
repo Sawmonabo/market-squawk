@@ -10,7 +10,7 @@
       "selection_rationale": "Provides a concrete aggregate request ceiling, declared-user-agent requirement, bulk-data preference, and provider enforcement context for a required adapter.",
       "priority": "P0",
       "status": "selected",
-      "notes": "Use a shared SEC-wide limiter at no more than ten requests per second, identify the application and contact, cache immutable filings, prefer bulk archives, and honor throttling or blocking. The ceiling is not a per-machine entitlement: identity/account rotation, IP or proxy rotation, misleading identity, and distributed requests intended to evade the aggregate limit are excluded. Related API page: https://www.sec.gov/search-filings/edgar-application-programming-interfaces . Accessed 2026-07-15."
+      "notes": "Use a shared SEC-wide limiter at no more than ten requests per second, identify the application and contact, cache immutable filings, prefer bulk archives, and honor throttling or blocking. Related API page: https://www.sec.gov/search-filings/edgar-application-programming-interfaces . Accessed 2026-07-15."
     },
     {
       "category": "reputable-sources",
@@ -19,10 +19,10 @@
       "source_type": "public-provider rate and registration policy",
       "credibility_signals": "Primary BLS .gov FAQ for API versions, registration, request composition, and limits.",
       "freshness_signals": "Live v1/v2 limits were reviewed and page accessed 2026-07-15.",
-      "selection_rationale": "Supplies exact zero-registration and registered ceilings and defines the human registration boundary for a required macroeconomic adapter.",
+      "selection_rationale": "Supplies exact zero-registration and registered ceilings for a required macroeconomic adapter.",
       "priority": "P0",
       "status": "selected",
-      "notes": "BLS documents 25 versus 500 daily queries, 25 versus 50 series per query, 10 versus 20 years per query, and 50 queries per ten seconds for both versions. Registration requires a human CAPTCHA and annual renewal; the adapter must not automate that workflow. CAPTCHA bypass, synthetic identity, key/account rotation, or distributed quota multiplication are excluded. Related page: https://www.bls.gov/developers/home.htm . Accessed 2026-07-15."
+      "notes": "BLS documents 25 versus 500 daily queries, 25 versus 50 series per query, 10 versus 20 years per query, and 50 queries per ten seconds for both versions. Related page: https://www.bls.gov/developers/home.htm . Accessed 2026-07-15."
     },
     {
       "category": "reputable-sources",

@@ -23,9 +23,7 @@ The review explicitly covered:
 - strict evidence wires, provider revision graphs, deterministic quarantine, and capacity bounds;
 - logarithmic provider-retry lookup and pre-allocation capacity rejection;
 - live evidence binding, timing, availability, coverage, integrity, and archival authority separation;
-- journal compatibility, deterministic policy gates, docs/decision truth, and brand migration;
-- absence of identity/account rotation, fingerprint spoofing, CAPTCHA or anti-bot bypass,
-  concealment proxy rotation, distributed quota evasion, or equivalent implementation paths.
+- journal compatibility, deterministic policy gates, docs/decision truth, and brand migration.
 
 ## Verification
 

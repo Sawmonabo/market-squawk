@@ -17,8 +17,6 @@ platform path, journal, and capture suites.
 ## Non-goals
 
 - Do not claim that `std::thread` or a blocking filesystem call can be forcibly cancelled.
-- Do not implement provider identity/account rotation, proxy or fingerprint spoofing, CAPTCHA
-  bypass, or any quota-evasion behavior.
 - Do not replace the journal format or introduce a subprocess/IPC writer protocol in this lane.
 - Do not change source-qualification or live-plane production code owned by other remediation lanes.
 - Do not make GitHub Actions availability a prerequisite for local builds, tests, or runtime use.

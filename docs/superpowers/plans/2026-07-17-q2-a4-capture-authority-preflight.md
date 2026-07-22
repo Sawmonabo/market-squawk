@@ -236,8 +236,6 @@ support feature remains `capture-benchmark`, consistent with
 - There are no accounting waivers. A known undercount, manual early release, unbounded sink,
   unresolved race, failed performance criterion, or unmeasured claim blocks historical A4/Q2
   approval at the Quarter 1 of 4 checkpoint.
-- Provider-access evasion mechanisms remain permanently excluded.
-
 ### Canonical GitHub publication target
 
 Every lookup and comment in this plan targets the same repository and PR explicitly; branch-relative

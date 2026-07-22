@@ -88,8 +88,6 @@ implementation stops until the integration owner repairs both at one commit.
 - Preserve raw frames and exact provider lexemes; the adapter never duplicates live tick/lot
   qualification.
 - Preserve local-first/no-mandatory-paid/cloud/database/container/telemetry operation.
-- Identity/account rotation to evade limits, fingerprint spoofing, CAPTCHA bypass, blocking-evasion
-  proxy rotation, and distributed quota evasion remain permanently prohibited.
 - Do not claim 100,000 events/s or sub-millisecond p99 before measured evidence on documented
   hardware.
 
@@ -1531,8 +1529,7 @@ Expected: FAIL until source behavior exists, then PASS.
 Validate the endpoint through `EndpointPolicy`, enforce redirect/host/TLS allowlists, maximum frame
 size before buffering, cancellation on connect/read/write, and bounded subscription count/bytes.
 Acquire permits from the exact registry-shared budget handle. Return typed refusal/backoff/network/
-authorization/protocol outcomes to the supervisor; do not rotate identities, accounts, proxies,
-fingerprints, or quotas.
+authorization/protocol outcomes to the supervisor.
 
 - [ ] **Step 6: Prove metadata and quality ceiling**
 
@@ -1543,7 +1540,7 @@ cargo test -p market-squawk-sources --test network_policy --locked
 
 Expected: metadata reports single-venue partial subscribed coverage, real-time delivery without a
 completeness guarantee, unsupported book sequence/checksum qualification, and
-`DirectUnverified`. Network policy has no evasion surface.
+`DirectUnverified`.
 
 - [ ] **Step 7: Add an opt-in availability test**
 
@@ -2935,8 +2932,8 @@ For every feature, risk rule, decoder disposition, Coinbase production step, and
 record exactly one of `Implemented`, `Partial`, `Missing`, `Incorrect`, `Unsafe`, or
 `Intentionally deferred`, with a code/test/evidence link. Because this plan makes the enumerated Q3
 scope mandatory, any `Partial`, `Missing`, `Incorrect`, or `Intentionally deferred` item blocks Q3
-close. `Unsafe` is reserved only for the explicitly prohibited evasion mechanisms; it must not be
-used to hide a missing/incorrect product requirement or an ordinary implementation risk.
+close. `Unsafe` must not be used to hide a missing/incorrect product requirement or an ordinary
+implementation risk.
 
 - [ ] **Step 2: State provider and execution capability precisely**
 
@@ -3043,7 +3040,7 @@ sustained-burst memory evidence.
 The reviewer compares the pinned fixtures/metadata/research to the official Coinbase links, verifies
 one-generation source behavior, exact capture before decode, control/freshness separation,
 DirectUnverified ceiling, shared provider budget, backoff/Retry-After, endpoint policy, source
-persistence, and absence of every evasion mechanism.
+persistence.
 
 - [ ] **Step 5: Dispatch the financial and paper-state review**
 

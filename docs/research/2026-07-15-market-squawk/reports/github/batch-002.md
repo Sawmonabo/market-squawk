@@ -89,10 +89,8 @@ tests use recorded HTTP fixtures, which is a useful pattern for deterministic de
 **Confirmed:** The inspected FRED utility implements bounded retry behavior, respects `Retry-After`,
 rate-spaces requests, caches results, coalesces duplicate in-flight requests, and excludes the API
 key from the cache key. [FRED rate limiter](https://github.com/OpenBB-finance/OpenBB/blob/c78488d7d18b9f9f89d2f897e58bcdbbd9ddb690/openbb_platform/providers/fred/openbb_fred/utils/rate_limiter.py)
-**Inference:** Those are lawful resilience patterns worth independently implementing. They must not
-be extended into identity rotation, fingerprint spoofing, CAPTCHA bypass, proxy rotation to defeat
-blocking, or distributed quota evasion; source health should degrade explicitly when lawful limits
-are reached.
+**Inference:** Those are resilience patterns worth independently implementing; source health should
+degrade explicitly when documented limits are reached.
 
 ### MCP Rust SDK
 

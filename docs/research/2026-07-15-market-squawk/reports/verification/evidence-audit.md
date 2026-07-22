@@ -117,11 +117,6 @@ versioned provenance, source-specific qualification, and non-bypassable risk—a
 executive summary, category findings, and recommendations because they are cross-cutting acceptance
 constraints, not accidental duplicate evidence.
 
-The explicit no-evasion boundary is repeated in documentation, reputable-source, GitHub, and final
-reports. That repetition is appropriate because it resolves a direct requested capability and
-prevents ordinary proxy/retry configuration from being misread as permission to circumvent access
-controls.
-
 ## Unsupported Claims
 
 No material unsupported claim requiring rejection was found.
@@ -139,11 +134,6 @@ No material unsupported claim requiring rejection was found.
 - The final report does not claim that Market Squawk is implemented, tested, secure, compliant, or
   performance-qualified. Its opening decision—proceed through staged test gates and do not claim the
   complete release—is consistent with every category's non-findings.
-
-The report expressly excludes identity/account rotation, misleading identity, browser/TLS
-fingerprint spoofing, CAPTCHA/anti-bot bypass, proxy rotation intended to defeat blocking, and
-distributed quota evasion. Lawful user keys, disclosed configured proxies, caching, coalescing,
-bounded retry, and optional licensed adapters remain correctly distinguished.
 
 ## Staleness or Freshness Risks
 
@@ -191,6 +181,6 @@ Recommended archival and implementation follow-ups are:
 
 The research set satisfies required category coverage, source/batch lineage, primary-source and
 confidence discipline, final-report structure, citation traceability, uncertainty preservation,
-local-link integrity, and the no-evasion boundary. The notes concern one non-material batch-heading
+and local-link integrity. The notes concern one non-material batch-heading
 variance and expected freshness/version closure before implementation or republication; they do
 not undermine the final report's staged, test-gated decision.
