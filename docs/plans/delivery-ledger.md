@@ -9,6 +9,9 @@ evidence; it does not replace the README capability truth or the canonical relea
 ## Current integration state
 
 - Release branch: `release/market-squawk-v0.1.0`
+- Current integrated code head: `9a26be4` (`merge: portfolio accounting and analytics core`)
+- Task 13 accepted feature and release head: `59ba05c`
+- Task 16 Steps 1–5 accepted feature head: `e124722`; release merge head: `9a26be4`
 - Task 12 code integration head: `9702556` (`fix(analytics): bind complete batch semantics`)
 - Integrated and pushed hardening code head: `2d39b0a34eb818f817973210148355c88f8f4b52`
 - Hardening owner: GitHub issue `#30`, Project 5
@@ -18,7 +21,34 @@ evidence; it does not replace the README capability truth or the canonical relea
 
 ## Product delivery closeout and next barrier
 
-- Task 12 owner: GitHub issue `#17`, Project 5; closure follows this ledger commit and push.
+- Task 13 owner: GitHub issue `#18`, Project 5; closure follows this ledger commit and push.
+- Delivered at exact accepted head `59ba05c`: capability-scoped immutable bundles; complete
+  dataset, label, universe, feature, artifact, and code-revision validation; atomic bounded model
+  generations; allocation-free deterministic native linear/logistic inference; execution-owned
+  fail-closed model strategy; and durable typed no-action audit through the versioned paper-bot
+  consumer.
+- Task 13 verification: modeling 9/9, execution 32/32, paper-bot audit 2/2, strict affected-package
+  Clippy, workspace boundaries, formatting, and diff checks passed. Independent review rejected
+  three material implementation defects and two audit-consumer/wire ripples; each was fixed, and the
+  final exact-head re-review reported no remaining Critical or Important finding.
+- Task 16 owner: GitHub issue `#21`, Project 5, remains `In Progress` until the serialized Step 6
+  execution integration is complete.
+- Delivered through Steps 1–5 at accepted head `e124722`: source-evidenced normalized portfolio
+  transactions, immutable revisions, long/short lots, FIFO/specific identification, cash flows,
+  exact gains, explicit incomplete-basis measurements, authoritative corporate-action snapshots,
+  reconciliation, performance, exposure, attribution, risk, scenarios, and proposal-only
+  rebalancing.
+- Task 16 Steps 1–5 verification: full domain tests, four portfolio-adapter integrations, the single
+  consolidated 8-test portfolio executable, strict affected-package Clippy, boundaries, formatting,
+  and diff checks passed. Independent review rejected four financial/evidence defects; exact-head
+  re-review at `e124722` confirmed all four closed with no remaining Critical or Important finding.
+- Integrated-head verification at `9a26be4`: the combined modeling, execution, portfolio, and
+  portfolio-adapter test gate passed, as did workspace boundaries, formatting, and diff hygiene.
+- Current implementation barrier: complete Task 16 Step 6 by binding the immutable current
+  portfolio revision into risk decisions and approved orders and rechecking it at one-time dispatch.
+  Task 14's Python product may proceed in parallel because Task 13's bundle contract is now frozen.
+
+- Task 12 owner: GitHub issue `#17`, Project 5, status `Done`.
 - Exact feature and fast-forwarded release code head: `9702556`.
 - Delivered: complete pure-Rust batch returns, risk, factor, fundamental, macro, exposure,
   attribution, and scenario kernels; exact-rate and monetary-basis contracts; cadence-bound return
@@ -29,8 +59,7 @@ evidence; it does not replace the README capability truth or the canonical relea
   all-target/all-feature Clippy passed; three independent Quarter 2 reviewers reported no Critical
   or Important finding; and `CARGO_INCREMENTAL=0 ./scripts/verify.sh` passed the complete workspace,
   release, audit, documentation, offline-product, and MCP-smoke gate at exact head `9702556`.
-- Current serialization barrier: Task 13 must consume these immutable feature contracts and Task 11
-  dataset identities through complete model bundles and a bounded native Rust inference backend.
+- The former Task 13 serialization barrier is satisfied at accepted head `59ba05c`.
 
 - Task 11 owner: GitHub issue `#16`, Project 5, status `Done`.
 - Exact feature head: `95fbf0e`; exact release integration head: `8f03d87`.
@@ -118,5 +147,6 @@ application size.
   `feature/analytics-feature-vertical`; and pruned worktree and remote metadata. Issue `#17` is
   closed and its Project 5 item is `Done`.
 
-The next delivery event is Task 13's complete model registry, bundle, and native Rust inference
-vertical. Task 12 completion is not a claim that the Market Squawk product release is complete.
+The next delivery events are Task 16 Step 6's portfolio-bound execution authority and Task 14's
+Python financial analytics/training product. Tasks 13 and 16 Steps 1–5 do not claim that the Market
+Squawk product release is complete.

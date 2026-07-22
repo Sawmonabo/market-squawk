@@ -57,6 +57,12 @@ work is bound by the single canonical
   A code-owned registry publishes 43 versioned batch-feature contracts and the live-feature
   contracts with complete input schemas, policies, warm-up/null behavior, time semantics, and
   semantic digests.
+- Capability-scoped, immutable model bundles with bounded metadata/artifact admission, complete
+  Task 11 dataset and Task 12 feature-identity validation, SHA-256 evidence, atomic retained-model
+  registry limits, and deterministic native linear/logistic inference. Live inputs are reusable and
+  borrowed, successful inference does not allocate output identity, every model failure maps to
+  zero order intents, and the paper-bot audit worker durably records the typed no-action evidence in
+  an explicit v2 stream without modifying historical v1 audit files.
 - A production local-file extraction vertical for CSV/TSV, JSON/NDJSON, entity-safe XML,
   formula- and external-link-constrained Excel, allowlisted read-only SQLite exports, OFX/QFX, and
   Parquet. User-authorized capability roots, bounded parsing and decompression, revocable source
@@ -93,6 +99,12 @@ work is bound by the single canonical
   one-time dispatcher, and paper worker under one lifecycle. Coinbase remains `DirectUnverified`,
   and the command installs a no-intent strategy, so this runnable ownership path cannot authorize or
   place an order.
+- Immutable portfolio accounting revisions over source-evidenced normalized transactions, with
+  long/short lots, FIFO and specific identification, cash flows, income, exact gains, explicit
+  complete/incomplete basis measurements, corporate-action snapshots, source-total reconciliation,
+  performance, exposure, attribution, portfolio risk, scenarios, and proposal-only rebalancing.
+  The bounded read service requires current opaque revision tokens. Binding those revisions into
+  execution approval and one-time dispatch remains the final Task 16 integration barrier.
 - A hardened five-tool local stdio MCP surface with typed schemas, bounded admission, deadlines,
   cancellation, result limits, controlled artifacts, durable audit, and bounded worker shutdown.
   Audit, artifacts, capture, and configured journal reads derive from the same prepared local
@@ -120,11 +132,9 @@ terminal consumer, focused verification, immutable evidence, and exact commit ex
 | `Missing` | FRED/ALFRED durable local consumption | The production vintage-aware adapter is runnable for authorized ephemeral retrieval, but the exact current terms bundle does not establish per-series rights for persistence, caching, archival, or training | Task 9 / Task 20 |
 | `Missing` | portfolio import | The raw-preserving adapter now enforces durable revisions, account/currency authority, reconciliation, supersession, and canonical data-lane output, but no application service or CLI yet composes a real Task 7 local-file/OFX producer into its required portfolio-raw contract | Task 19 |
 | `Missing` | Python data/financial/training product | No tracked product package or Rust-parity training boundary | Task 14 |
-| `Missing` | complete model bundle | No fully hashed artifact/schema/metadata bundle | Task 13 |
-| `Missing` | native Rust inference | No production local inference backend | Task 13 |
 | `Missing` | constrained ONNX inference | No validated, bounded, fail-closed ONNX-compatible backend | Task 15 |
 | `Missing` | research backtesting | No point-in-time research-dataset backtester | Task 17 |
-| `Missing` | portfolio accounting/analytics | No lots, gains, performance, exposure, attribution, risk, or scenarios | Task 16 |
+| `Missing` | portfolio-bound execution risk | Portfolio accounting and analytics are implemented, but approvals and one-time dispatch do not yet bind and recheck the current immutable portfolio revision | Task 16 |
 | `Missing` | strategies and comprehensive risk | Bounded account/risk coordination, actor-owned authority consumption, private approval, one-time dispatch, price-bound reconciliation, and terminal audit exist; a production order-producing strategy and its controlled user-facing configuration do not | Task 2 |
 | `Missing` | realistic paper execution | The bounded engine implements lifecycle, fees, latency, slippage, partial fills, rejection, cancellation, accounting, checkpoint recovery, and reconciliation; no execution-eligible source/strategy currently drives orders through the user-facing production composition | Task 2 |
 | `Missing` | ASC 820/IFRS 13 fair value | No ruleset, evidence, override, approval, or classification service | Task 18 |
@@ -160,9 +170,10 @@ never placed between a live event and an automated decision.
 
 ## Diagnostic foundation quick start
 
-These commands demonstrate only the current authority-free diagnostic foundation. They do not
-provide production execution quality, research datasets, model training or inference, portfolio
-accounting, fair-value analysis, or complete MCP coverage.
+These commands demonstrate only the authority-free diagnostic entry points. They do not demonstrate
+production execution quality, Python model training, ONNX inference, portfolio workflows through
+the CLI, fair-value analysis, or complete MCP coverage. The Rust research datasets, native model
+inference, and portfolio-accounting libraries listed above are independently runnable now.
 
 Prerequisites:
 
@@ -495,8 +506,9 @@ exactly four production-weighted review quarters:
    SQLite, Arrow/Parquet/DataFusion, bounded MCP protocol, and Kraken.
 2. **Quarter 2 of 4 — Stage 2 / Waves 2–3:** implement file, SEC, macro, and portfolio adapters;
    compose research ingestion, point-in-time datasets, corporate actions, and batch analytics.
-3. **Quarter 3 of 4 — Stage 3 / Waves 4A–4B:** implement model bundles, native and ONNX inference,
-   the Python product, portfolio accounting, backtesting, and fair-value analysis.
+3. **Quarter 3 of 4 — Stage 3 / Waves 4A–4B:** model bundles, native inference, and the portfolio
+   core are integrated; complete the Python product, ONNX inference, portfolio/execution binding,
+   backtesting, and fair-value analysis.
 4. **Quarter 4 of 4 — Stages 4–5 / Waves 5–6:** complete shared services, CLI, and typed MCP domains;
    then run integrated demonstrations, provider evidence, fuzzing, measured performance, security,
    supply-chain gates, grouped review, publication, and cleanup.

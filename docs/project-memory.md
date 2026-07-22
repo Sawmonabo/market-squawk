@@ -354,8 +354,27 @@ finding, and the full unchanged-head verification gate passed at `9702556`. Afte
 closeout was pushed and issue `#17` was closed, its 9.8 GiB generated target, clean worktree, and
 merged local/origin feature branches were removed and metadata was pruned.
 
-The next serialized product task is Task 13: complete model registry, immutable model bundles, and
-bounded native Rust inference over the Task 11 dataset identities and Task 12 feature contracts.
-Issue `#31` remains the mandatory zero-fee provider onboarding portal: it may automate official
-provider enrollment and key setup, while preserving and resuming any provider-required human
-consent or verification step.
+## 2026-07-22 Task 13 and Task 16 core integration
+
+Task 13 is accepted at exact head `59ba05c`. Complete immutable model bundles bind Task 11 dataset,
+universe, label, and code-revision identities to Task 12 ordered feature semantics and exact artifact
+hashes. The bounded registry preserves stable bundle/model series, and reusable borrowed inputs plus
+shared immutable output identity keep native linear/logistic inference allocation-free. Execution
+owns the model strategy boundary: every model failure produces zero intents and a typed audit fact.
+The paper-bot consumer persists the mixed execution/no-action stream using an explicit v2 envelope
+and never appends the new wire shape to historical v1 files.
+
+Task 16 Steps 1–5 are accepted at exact feature head `e124722` and integrated at `9a26be4`. The
+portfolio core consumes adapter-produced, source-neutral economic evidence rather than caller-made
+financial scalars; publishes immutable revisions; performs checked long/short lot accounting,
+income, cash flow, performance, exposure, attribution, risk, scenarios, and proposal-only
+rebalancing; preserves authoritative cumulative corporate-action snapshots; and represents
+unresolved basis as incomplete rather than exact zero. Task 16 remains open until Step 6 binds and
+rechecks the current portfolio revision through risk approval and one-time dispatch.
+
+The next safe parallel wave is Task 14's Python financial analytics/training product and Task 16
+Step 6's execution-owned portfolio binding. Task 15 ONNX integration begins only against the frozen
+Task 13 contract and must not weaken controlled-root, exact-identity, bounded-runtime, or no-action
+semantics. Issue `#31` remains the mandatory zero-fee provider onboarding portal: it may automate
+official provider enrollment and key setup, while preserving and resuming any provider-required
+human consent or verification step.
