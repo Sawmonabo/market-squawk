@@ -54,6 +54,7 @@ pub(crate) struct QualifiedEvent {
     pub(crate) event: MarketEvent,
     pub(crate) assessment: QualificationAssessment,
     pub(crate) binding_digest: [u8; 32],
+    pub(crate) stable_trade_id: Option<SourceIdentifier>,
     pub(crate) valid_until: Timestamp,
 }
 
@@ -89,6 +90,7 @@ pub struct CommittedQualifiedMarketObservation {
     binding_digest: [u8; 32],
     committed_state_revision: u64,
     execution_terms: InstrumentExecutionTerms,
+    stable_trade_id: Option<SourceIdentifier>,
     price: QualifiedMarketPrice,
 }
 
@@ -99,25 +101,28 @@ impl CommittedQualifiedMarketObservation {
         binding_digest: [u8; 32],
         committed_state_revision: u64,
         execution_terms: InstrumentExecutionTerms,
+        stable_trade_id: Option<SourceIdentifier>,
     ) -> Option<Self> {
         if assessment.recorded_quality() != DataQuality::DirectVerified {
             return None;
         }
-        let price = match &event {
-            MarketEvent::Trade(value) => QualifiedMarketPrice::Trade {
+        let price = match (&event, stable_trade_id.as_ref()) {
+            (MarketEvent::Trade(value), Some(_)) => QualifiedMarketPrice::Trade {
                 price: value.price(),
                 quantity: value.quantity(),
             },
-            MarketEvent::Quote(value) => QualifiedMarketPrice::Quote {
+            (MarketEvent::Quote(value), None) => QualifiedMarketPrice::Quote {
                 bid: value.bid(),
                 ask: value.ask(),
             },
-            MarketEvent::BookSnapshot(_)
-            | MarketEvent::BookDelta(_)
-            | MarketEvent::Auction(_)
-            | MarketEvent::TradingHalt(_)
-            | MarketEvent::InstrumentStatus(_)
-            | MarketEvent::CorporateAction(_) => return None,
+            (MarketEvent::BookSnapshot(_), _)
+            | (MarketEvent::BookDelta(_), _)
+            | (MarketEvent::Auction(_), _)
+            | (MarketEvent::TradingHalt(_), _)
+            | (MarketEvent::InstrumentStatus(_), _)
+            | (MarketEvent::CorporateAction(_), _)
+            | (MarketEvent::Trade(_), None)
+            | (MarketEvent::Quote(_), Some(_)) => return None,
         };
         let provenance = event_provenance(&event);
         let binding = assessment.binding();
@@ -132,6 +137,7 @@ impl CommittedQualifiedMarketObservation {
             binding_digest,
             committed_state_revision,
             execution_terms,
+            stable_trade_id,
             price,
         })
     }
@@ -154,6 +160,11 @@ impl CommittedQualifiedMarketObservation {
     /// Returns the source-native observation identity.
     pub const fn source_identifier(&self) -> &SourceIdentifier {
         self.assessment.binding().source_identifier()
+    }
+
+    /// Returns the provider's stable economic trade identity for trade receipts.
+    pub const fn stable_trade_id(&self) -> Option<&SourceIdentifier> {
+        self.stable_trade_id.as_ref()
     }
 
     /// Returns the provider event timestamp when the provider supplied one.
@@ -273,6 +284,18 @@ where
 {
     current.current_lease().validate_at(evaluated_at)?;
     let observation = current.observation();
+    let stable_trade_id = match observation.payload() {
+        market_squawk_sources::ProviderObservationPayload::Trade { trade_id, .. } => {
+            Some(trade_id.clone())
+        }
+        market_squawk_sources::ProviderObservationPayload::Quote { .. }
+        | market_squawk_sources::ProviderObservationPayload::BookSnapshot(_)
+        | market_squawk_sources::ProviderObservationPayload::BookDelta(_)
+        | market_squawk_sources::ProviderObservationPayload::Auction { .. }
+        | market_squawk_sources::ProviderObservationPayload::TradingHalt { .. }
+        | market_squawk_sources::ProviderObservationPayload::InstrumentStatus { .. }
+        | market_squawk_sources::ProviderObservationPayload::CorporateAction { .. } => None,
+    };
     let policy = current.policy();
     let frame = current.frame_evidence();
     let frame_binding = frame.binding();
@@ -402,6 +425,7 @@ where
         event,
         assessment,
         binding_digest,
+        stable_trade_id,
         valid_until,
     })
 }

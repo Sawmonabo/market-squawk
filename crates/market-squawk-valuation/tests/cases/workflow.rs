@@ -43,6 +43,17 @@ fn durable_workflow_recovers_exact_state_and_blocks_level_one_override() -> Test
             Timestamp::from_unix_nanos(1_300),
             Timestamp::from_unix_nanos(1_800),
         )?;
+        assert!(matches!(
+            service.propose_override(
+                proposal.decision().id(),
+                FairValueHierarchy::Level2,
+                "an override cannot become the basis for another override",
+                actor("nested-override-preparer")?,
+                Timestamp::from_unix_nanos(1_350),
+                Timestamp::from_unix_nanos(1_750),
+            ),
+            Err(FairValueError::InvalidOverride)
+        ));
         let approval = service.approve(
             proposal.decision().id(),
             actor("independent-approver")?,

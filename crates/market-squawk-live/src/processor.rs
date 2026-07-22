@@ -101,6 +101,7 @@ pub(crate) struct AppliedLiveObservation {
     pub(crate) event: MarketEvent,
     pub(crate) assessment: QualificationAssessment,
     pub(crate) binding_digest: [u8; 32],
+    pub(crate) stable_trade_id: Option<market_squawk_domain::SourceIdentifier>,
     pub(crate) committed_state_revision: u64,
     pub(crate) authority: Option<AppliedObservationAuthority>,
 }
@@ -351,6 +352,7 @@ impl<C: TrustedClock> InstrumentLiveProcessor<C> {
             event: qualified.event,
             assessment: qualified.assessment,
             binding_digest: qualified.binding_digest,
+            stable_trade_id: qualified.stable_trade_id,
             committed_state_revision: committed.expected_revision,
             authority,
         }))

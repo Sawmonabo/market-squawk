@@ -5,7 +5,7 @@ use std::mem::size_of;
 use market_squawk_domain::{FairValueHierarchy, Timestamp};
 
 use crate::measurement::{ActorId, MeasurementId};
-use crate::rules::{ClassificationDecision, DecisionId};
+use crate::rules::{ClassificationDecision, DecisionBasis, DecisionId};
 use crate::{CanonicalHasher, FairValueError, checked_add};
 
 const MAX_EXPLANATION_BYTES: usize = 4_096;
@@ -71,6 +71,7 @@ impl ValuationOverride {
     ) -> Result<Self, FairValueError> {
         if requested_hierarchy == FairValueHierarchy::Level1
             || requested_hierarchy == FairValueHierarchy::Unclassified
+            || base.basis() != DecisionBasis::Rules
             || base.hierarchy() == FairValueHierarchy::Unclassified
             || requested_hierarchy == base.hierarchy()
             || expires_at <= prepared_at

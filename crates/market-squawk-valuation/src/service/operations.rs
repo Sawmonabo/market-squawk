@@ -140,6 +140,9 @@ impl<'catalog> FairValueService<'catalog> {
             .get(&base_decision_id)
             .cloned()
             .ok_or(FairValueError::DecisionNotFound)?;
+        if base.basis() != DecisionBasis::Rules {
+            return Err(FairValueError::InvalidOverride);
+        }
         let measurement = self
             .measurements
             .get(&base.measurement_id())

@@ -268,6 +268,7 @@ fn process_applied_observation(
                 applied.binding_digest,
                 applied.committed_state_revision,
                 owner.processor.execution_terms(),
+                applied.stable_trade_id,
             );
             observation.is_some_and(|observation| {
                 exporter

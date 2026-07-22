@@ -107,6 +107,9 @@ pub(crate) fn recover(
         let base = decisions
             .get(&DecisionId(payload.base_decision_id))
             .ok_or(FairValueError::CorruptPersistence)?;
+        if base.basis() != DecisionBasis::Rules {
+            return Err(FairValueError::CorruptPersistence);
+        }
         let measurement = measurements
             .get(&base.measurement_id())
             .ok_or(FairValueError::CorruptPersistence)?;
