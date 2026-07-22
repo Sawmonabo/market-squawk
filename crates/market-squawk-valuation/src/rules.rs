@@ -183,6 +183,7 @@ pub enum DecisionBasis {
 pub struct ClassificationRuleset {
     version: u32,
     max_quote_age_nanos: u64,
+    market_activity_policy: crate::MarketActivityPolicy,
     hash: RulesetHash,
 }
 
@@ -196,9 +197,12 @@ impl ClassificationRuleset {
         if max_quote_age_nanos == 0 || max_quote_age_nanos > i64::MAX as u64 {
             return Err(FairValueError::InvalidRuleset);
         }
+        let market_activity_policy =
+            crate::MarketActivityPolicy::try_new(10, 1_000, 4_096, 300_000_000_000)?;
         let mut hash = CanonicalHasher::new(b"market-squawk/asc820-ifrs13-ruleset/v1");
         hash.u32(CURRENT_RULESET_VERSION);
         hash.u64(max_quote_age_nanos);
+        hash.fixed(market_activity_policy.hash().bytes());
         for predicate in Predicate::ALL {
             hash.u8(predicate_tag(predicate));
         }
@@ -208,6 +212,7 @@ impl ClassificationRuleset {
         Ok(Self {
             version: CURRENT_RULESET_VERSION,
             max_quote_age_nanos,
+            market_activity_policy,
             hash: RulesetHash(hash.finish()),
         })
     }
@@ -225,6 +230,11 @@ impl ClassificationRuleset {
     /// Returns maximum accepted source age at the measurement instant.
     pub const fn max_quote_age_nanos(&self) -> u64 {
         self.max_quote_age_nanos
+    }
+
+    /// Returns the code-owned activity assessment policy bound into this ruleset.
+    pub const fn market_activity_policy(&self) -> crate::MarketActivityPolicy {
+        self.market_activity_policy
     }
 
     pub(crate) fn classify(
@@ -462,23 +472,39 @@ fn evaluate_input(
     measurement: &ValuationMeasurement,
     input: &ValuationInput,
 ) -> [PredicateResult; Predicate::ALL.len()] {
-    let source_time = input.evidence().source_timestamp().unix_nanos();
     let measurement_time = measurement.measurement_at().unix_nanos();
-    let relevant = source_time <= measurement_time;
-    let age = i128::from(measurement_time) - i128::from(source_time);
-    let fresh = relevant && age <= i128::from(ruleset.max_quote_age_nanos());
+    let evidence_time = input.evidence().relevance_timestamp();
+    let evidence = input.evidence();
+    let relevant = evidence
+        .available_at()
+        .is_some_and(|value| value.unix_nanos() <= measurement_time)
+        && [
+            evidence.source_timestamp(),
+            evidence.effective_at(),
+            evidence.published_at(),
+        ]
+        .into_iter()
+        .flatten()
+        .all(|value| value.unix_nanos() <= measurement_time);
+    let fresh = evidence_time.is_some_and(|value| {
+        relevant
+            && i128::from(measurement_time) - i128::from(value.unix_nanos())
+                <= i128::from(ruleset.max_quote_age_nanos())
+    });
     let values = [
         input.significance() == InputSignificance::Significant,
         input.subject_instrument_id() == measurement.instrument_id(),
         input.relationship() == InputInstrumentRelation::Identical,
         input.observability() == InputObservability::QuotedPrice,
         input.adjustment() == PriceAdjustment::None,
-        input.market_activity() == MarketActivity::Active,
+        input.market_activity() == MarketActivity::Active
+            && input.evidence().origin().market_activity_policy_hash()
+                == Some(ruleset.market_activity_policy().hash().bytes()),
         input.market_access() == MarketAccess::Accessible,
         relevant,
         fresh,
         input.evidence().verification() == crate::EvidenceVerification::Verified,
-        input.evidence().origin().venue_id().is_some(),
+        input.evidence().origin().is_market() && input.evidence().origin().venue_id().is_some(),
         input.amount().money().currency() == measurement.amount().money().currency(),
         input.amount().scale() == measurement.amount().scale(),
         input.amount() == measurement.amount(),
@@ -501,17 +527,12 @@ fn input_hierarchy(
             .find(|result| result.predicate() == predicate)
             .is_some_and(|result| result.passed())
     };
-    let common_valid = pass(Predicate::SubjectInstrumentMatches)
+    let usable = pass(Predicate::SubjectInstrumentMatches)
         && pass(Predicate::MeasurementDateRelevant)
-        && pass(Predicate::WithinFreshnessLimit)
-        && pass(Predicate::SourceEvidenceVerified)
         && pass(Predicate::CurrencyMatches)
         && pass(Predicate::ScaleMatches)
-        && !matches!(
-            input.data_quality(),
-            DataQuality::Stale | DataQuality::Quarantined
-        );
-    if !common_valid {
+        && input.data_quality() != DataQuality::Quarantined;
+    if !usable {
         FairValueHierarchy::Unclassified
     } else if Predicate::ALL
         .into_iter()

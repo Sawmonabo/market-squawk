@@ -1,22 +1,144 @@
 //! Exact valuation inputs and measurements.
 
+mod activity;
+mod input;
+
 use std::mem::size_of;
 use std::sync::Arc;
 
-use market_squawk_domain::{DataQuality, InstrumentId, Money, Timestamp};
+use market_squawk_analytics::{
+    FeatureCompatibility, FeatureKey, FeatureOutputType, FeatureRegistry, FeatureUnit,
+};
+use market_squawk_data::{PinnedFeatureMonetaryValue, PinnedMonetaryValue};
+use market_squawk_domain::{
+    AccountId, CoverageStatus, DataQuality, DigestAlgorithm, EvidenceDigest, InstrumentId, Money,
+    SourceAuthorization, SourceId, SourceIdentifier, Timestamp, TradingStatus,
+};
+use market_squawk_live::{CommittedQualifiedMarketObservation, QualifiedMarketPrice};
+use market_squawk_portfolio::PortfolioRevision;
 use rust_decimal::Decimal;
 
+use crate::evidence::FairValueEvidenceParts;
 use crate::{
-    CanonicalHasher, FairValueError, FairValueEvidence, FairValueEvidenceHash, checked_add,
+    ApprovedMarketAccess, CanonicalHasher, EvidenceOrigin, EvidenceVerification, FairValueError,
+    FairValueEvidence, FairValueEvidenceHash, InputUseAssessment, checked_add,
 };
 
 const MAX_ACTOR_ID_BYTES: usize = 128;
 const HARD_MAX_MEASUREMENT_INPUTS: usize = 4_096;
+const HARD_MAX_ACTIVITY_RECEIPTS: usize = 4_096;
 
 digest_id!(
     /// SHA-256 content identity of one valuation input.
     InputId
 );
+digest_id!(
+    /// SHA-256 identity of one bounded market-activity policy.
+    MarketActivityPolicyHash
+);
+
+/// Exact trade or quote-side selected from a committed market observation.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum MarketPriceSelection {
+    /// Executed trade price.
+    Trade,
+    /// Quoted bid price.
+    Bid,
+    /// Quoted ask price.
+    Ask,
+}
+
+/// Bounded selection and reporting context for one committed market-derived input.
+#[derive(Clone, Copy, Debug)]
+pub struct CommittedMarketInputRequest<'a> {
+    /// Post-commit observations considered by the activity policy.
+    pub receipts: &'a [CommittedQualifiedMarketObservation],
+    /// Index of the exact observation supplying the selected price.
+    pub selected_index: usize,
+    /// Trade or quote side selected from that observation.
+    pub selection: MarketPriceSelection,
+    /// Significance of the input to the measurement in its entirety.
+    pub significance: InputSignificance,
+    /// Reporting account whose market access is being evaluated.
+    pub account_id: AccountId,
+    /// Fair-value measurement instant.
+    pub measurement_at: Timestamp,
+    /// Code-owned classification rules and market-activity policy.
+    pub ruleset: &'a crate::ClassificationRuleset,
+    /// Optional dual-approved reporting-entity market-access conclusion.
+    pub market_access_assessment: Option<&'a ApprovedMarketAccess>,
+}
+
+/// Bounded policy used to derive active-market evidence from genuine committed receipts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MarketActivityPolicy {
+    minimum_observations: usize,
+    minimum_aggregate_quantity_lots: u64,
+    maximum_receipts: usize,
+    lookback_nanos: u64,
+    hash: MarketActivityPolicyHash,
+}
+
+impl MarketActivityPolicy {
+    /// Constructs a positive bounded activity policy and derives its immutable identity.
+    ///
+    /// # Errors
+    ///
+    /// Rejects zero values, a minimum above the receipt ceiling, or values above hard bounds.
+    pub(crate) fn try_new(
+        minimum_observations: usize,
+        minimum_aggregate_quantity_lots: u64,
+        maximum_receipts: usize,
+        lookback_nanos: u64,
+    ) -> Result<Self, FairValueError> {
+        if minimum_observations == 0
+            || minimum_aggregate_quantity_lots == 0
+            || maximum_receipts < minimum_observations
+            || maximum_receipts > HARD_MAX_ACTIVITY_RECEIPTS
+            || lookback_nanos == 0
+            || lookback_nanos > i64::MAX as u64
+        {
+            return Err(FairValueError::InvalidProducerEvidence);
+        }
+        let mut hash = CanonicalHasher::new(b"market-squawk/market-activity-policy/v1");
+        hash.u64(u64::try_from(minimum_observations).map_err(|_| FairValueError::Arithmetic)?);
+        hash.u64(minimum_aggregate_quantity_lots);
+        hash.u64(u64::try_from(maximum_receipts).map_err(|_| FairValueError::Arithmetic)?);
+        hash.u64(lookback_nanos);
+        Ok(Self {
+            minimum_observations,
+            minimum_aggregate_quantity_lots,
+            maximum_receipts,
+            lookback_nanos,
+            hash: MarketActivityPolicyHash(hash.finish()),
+        })
+    }
+
+    /// Returns the minimum distinct qualifying receipts required for `Active`.
+    pub const fn minimum_observations(self) -> usize {
+        self.minimum_observations
+    }
+
+    /// Returns the minimum aggregate executed quantity required for `Active`.
+    pub const fn minimum_aggregate_quantity_lots(self) -> u64 {
+        self.minimum_aggregate_quantity_lots
+    }
+
+    /// Returns the maximum submitted receipt count.
+    pub const fn maximum_receipts(self) -> usize {
+        self.maximum_receipts
+    }
+
+    /// Returns the inclusive activity lookback interval.
+    pub const fn lookback_nanos(self) -> u64 {
+        self.lookback_nanos
+    }
+
+    /// Returns the exact policy identity.
+    pub const fn hash(self) -> MarketActivityPolicyHash {
+        self.hash
+    }
+}
 digest_id!(
     /// SHA-256 content identity of one immutable valuation measurement.
     MeasurementId
@@ -170,31 +292,35 @@ pub enum ValuationMethod {
     CostApproach,
 }
 
-/// Untrusted fields used to construct one immutable valuation input.
+/// Crate-private fully derived fields used to construct one immutable valuation input.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ValuationInputSpec {
+pub(crate) struct ValuationInputSpec {
     /// Instrument being measured.
-    pub subject_instrument_id: InstrumentId,
+    pub(crate) subject_instrument_id: InstrumentId,
     /// Instrument named by the source evidence.
-    pub reference_instrument_id: InstrumentId,
+    pub(crate) reference_instrument_id: InstrumentId,
     /// Relationship between the two instrument identities.
-    pub relationship: InputInstrumentRelation,
+    pub(crate) relationship: InputInstrumentRelation,
     /// Exact input amount and accounting scale.
-    pub amount: ValuationAmount,
+    pub(crate) amount: ValuationAmount,
     /// Significance to the measurement in its entirety.
-    pub significance: InputSignificance,
+    pub(crate) significance: InputSignificance,
     /// Accounting observability.
-    pub observability: InputObservability,
+    pub(crate) observability: InputObservability,
     /// Source-input adjustment.
-    pub adjustment: PriceAdjustment,
+    pub(crate) adjustment: PriceAdjustment,
     /// Market activity conclusion.
-    pub market_activity: MarketActivity,
+    pub(crate) market_activity: MarketActivity,
     /// Reporting-entity market access conclusion.
-    pub market_access: MarketAccess,
+    pub(crate) market_access: MarketAccess,
+    /// Dual-approved reporting-entity access evidence when assessed.
+    pub(crate) market_access_assessment: Option<ApprovedMarketAccess>,
     /// Independent source quality classification.
-    pub data_quality: DataQuality,
+    pub(crate) data_quality: DataQuality,
     /// Complete immutable source evidence.
-    pub evidence: FairValueEvidence,
+    pub(crate) evidence: FairValueEvidence,
+    /// Optional governed non-Level-1 use judgment.
+    pub(crate) use_assessment: Option<InputUseAssessment>,
 }
 
 /// One immutable valuation input.
@@ -210,121 +336,18 @@ pub struct ValuationInput {
     adjustment: PriceAdjustment,
     market_activity: MarketActivity,
     market_access: MarketAccess,
+    market_access_assessment: Option<ApprovedMarketAccess>,
     data_quality: DataQuality,
     evidence: FairValueEvidence,
+    use_assessment: Option<InputUseAssessment>,
     retained_bytes: usize,
-}
-
-impl ValuationInput {
-    /// Checks relationship invariants and derives an immutable content identity.
-    ///
-    /// # Errors
-    ///
-    /// Rejects an `Identical` relation across different identities or a non-identical relation
-    /// that reuses the measured identity.
-    pub fn try_new(spec: ValuationInputSpec) -> Result<Self, FairValueError> {
-        let same = spec.subject_instrument_id == spec.reference_instrument_id;
-        if same != (spec.relationship == InputInstrumentRelation::Identical) {
-            return Err(FairValueError::InvalidInstrumentRelationship);
-        }
-        let retained_bytes = checked_add(size_of::<Self>(), spec.evidence.retained_bytes())?;
-        let mut hash = CanonicalHasher::new(b"market-squawk/valuation-input/v1");
-        hash.bytes(spec.subject_instrument_id.as_uuid().as_bytes());
-        hash.bytes(spec.reference_instrument_id.as_uuid().as_bytes());
-        hash.u8(relation_tag(spec.relationship));
-        spec.amount.hash_into(&mut hash);
-        hash.u8(significance_tag(spec.significance));
-        hash.u8(observability_tag(spec.observability));
-        hash.u8(adjustment_tag(spec.adjustment));
-        hash.u8(activity_tag(spec.market_activity));
-        hash.u8(access_tag(spec.market_access));
-        hash.u8(quality_tag(spec.data_quality));
-        hash.fixed(spec.evidence.hash().bytes());
-        Ok(Self {
-            id: InputId(hash.finish()),
-            subject_instrument_id: spec.subject_instrument_id,
-            reference_instrument_id: spec.reference_instrument_id,
-            relationship: spec.relationship,
-            amount: spec.amount,
-            significance: spec.significance,
-            observability: spec.observability,
-            adjustment: spec.adjustment,
-            market_activity: spec.market_activity,
-            market_access: spec.market_access,
-            data_quality: spec.data_quality,
-            evidence: spec.evidence,
-            retained_bytes,
-        })
-    }
-
-    /// Returns immutable input identity.
-    pub const fn id(&self) -> InputId {
-        self.id
-    }
-
-    /// Returns measured instrument identity.
-    pub const fn subject_instrument_id(&self) -> InstrumentId {
-        self.subject_instrument_id
-    }
-
-    /// Returns referenced instrument identity.
-    pub const fn reference_instrument_id(&self) -> InstrumentId {
-        self.reference_instrument_id
-    }
-
-    /// Returns instrument relationship.
-    pub const fn relationship(&self) -> InputInstrumentRelation {
-        self.relationship
-    }
-
-    /// Returns exact input amount.
-    pub const fn amount(&self) -> ValuationAmount {
-        self.amount
-    }
-
-    /// Returns input significance.
-    pub const fn significance(&self) -> InputSignificance {
-        self.significance
-    }
-
-    /// Returns accounting observability.
-    pub const fn observability(&self) -> InputObservability {
-        self.observability
-    }
-
-    /// Returns source-input adjustment.
-    pub const fn adjustment(&self) -> PriceAdjustment {
-        self.adjustment
-    }
-
-    /// Returns market activity conclusion.
-    pub const fn market_activity(&self) -> MarketActivity {
-        self.market_activity
-    }
-
-    /// Returns market access conclusion.
-    pub const fn market_access(&self) -> MarketAccess {
-        self.market_access
-    }
-
-    /// Returns independent data-quality classification.
-    pub const fn data_quality(&self) -> DataQuality {
-        self.data_quality
-    }
-
-    /// Returns immutable source evidence.
-    pub const fn evidence(&self) -> &FairValueEvidence {
-        &self.evidence
-    }
-
-    pub(crate) const fn retained_bytes(&self) -> usize {
-        self.retained_bytes
-    }
 }
 
 /// Untrusted fields used to construct an immutable measurement.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ValuationMeasurementSpec {
+    /// Reporting account for which the valuation and market access are evaluated.
+    pub account_id: AccountId,
     /// Instrument being measured.
     pub instrument_id: InstrumentId,
     /// Resulting exact amount and accounting scale.
@@ -346,6 +369,7 @@ pub struct ValuationMeasurementSpec {
 pub struct ValuationMeasurement {
     id: MeasurementId,
     evidence_hash: FairValueEvidenceHash,
+    account_id: AccountId,
     instrument_id: InstrumentId,
     amount: ValuationAmount,
     measurement_at: Timestamp,
@@ -373,6 +397,19 @@ impl ValuationMeasurement {
         if spec.inputs.iter().any(|input| {
             input.subject_instrument_id() != spec.instrument_id
                 || input.evidence().ingested_at() > spec.prepared_at
+                || input
+                    .use_assessment()
+                    .is_some_and(|assessment| assessment.assessed_at() > spec.prepared_at)
+                || input.market_access_assessment().is_some_and(|assessment| {
+                    assessment
+                        .validate_for(
+                            spec.account_id,
+                            assessment.venue_id(),
+                            input.reference_instrument_id(),
+                            spec.measurement_at,
+                        )
+                        .is_err()
+                })
         }) {
             return Err(FairValueError::InvalidMeasurement);
         }
@@ -394,6 +431,7 @@ impl ValuationMeasurement {
         let evidence_hash = FairValueEvidenceHash(evidence_hash.finish());
 
         let mut hash = CanonicalHasher::new(b"market-squawk/valuation-measurement/v1");
+        hash.bytes(spec.account_id.as_uuid().as_bytes());
         hash.bytes(spec.instrument_id.as_uuid().as_bytes());
         spec.amount.hash_into(&mut hash);
         hash.i64(spec.measurement_at.unix_nanos());
@@ -417,6 +455,7 @@ impl ValuationMeasurement {
         Ok(Self {
             id: MeasurementId(hash.finish()),
             evidence_hash,
+            account_id: spec.account_id,
             instrument_id: spec.instrument_id,
             amount: spec.amount,
             measurement_at: spec.measurement_at,
@@ -441,6 +480,11 @@ impl ValuationMeasurement {
     /// Returns measured instrument.
     pub const fn instrument_id(&self) -> InstrumentId {
         self.instrument_id
+    }
+
+    /// Returns the reporting account for this measurement.
+    pub const fn account_id(&self) -> AccountId {
+        self.account_id
     }
 
     /// Returns exact measurement amount.

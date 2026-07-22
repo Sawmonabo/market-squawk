@@ -10,6 +10,7 @@ mod normalization;
 mod processor;
 mod provider_book;
 mod qualification;
+mod qualified_export;
 mod runtime;
 mod sharding;
 mod snapshot;
@@ -36,6 +37,11 @@ pub use integrity::{
 };
 pub use normalization::{
     NormalizationError, normalize_delta_quantity, normalize_positive_quantity, normalize_price,
+};
+pub use qualification::{CommittedQualifiedMarketObservation, QualifiedMarketPrice};
+pub use qualified_export::{
+    QualifiedMarketExportError, QualifiedMarketObservationLease,
+    QualifiedMarketObservationReceiver, RouteQualifiedMarketExport,
 };
 pub use runtime::{
     BoundShardIngress, DormantRouteIngress, LiveIngressBindError, LiveIngressError,

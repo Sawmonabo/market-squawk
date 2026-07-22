@@ -1,141 +1,186 @@
 mod classification;
 mod workflow;
 
+use std::error::Error;
+use std::time::Duration;
+
+use market_squawk_data::{
+    CatalogAuthority, CatalogConfig, CatalogLimit, CatalogResultLimits, DatasetId,
+    DatasetManifestRef, DatasetSchemaRegistry, Sha256Digest,
+};
 use market_squawk_domain::{
-    Currency, DataQuality, DigestAlgorithm, EvidenceDigest, InstrumentId, Money, SourceId,
-    SourceIdentifier, Timestamp, VenueId,
+    AccountId, Currency, InstrumentId, Money, RevisionNumber, SourceIdentifier, Timestamp,
+};
+use market_squawk_platform::LocalPaths;
+use market_squawk_portfolio::{
+    CashFlow, CashFlowKind, LedgerEntry, LedgerEntryKind, LotSelection, PortfolioLedger,
+    PortfolioLimitInput, PortfolioLimits, PortfolioRevision, PriceEvidence, RevisionEvidence,
+    Trade, TradeSide, TransactionRevision, ValuationSet,
 };
 use market_squawk_valuation::{
-    ActorId, EvidenceOrigin, EvidenceVerification, FairValueEvidence, FairValueEvidenceInput,
-    FairValueLimitInput, FairValueLimits, FairValueService, InputInstrumentRelation,
-    InputObservability, InputSignificance, MarketAccess, MarketActivity, PriceAdjustment,
-    ValuationAmount, ValuationInput, ValuationInputSpec, ValuationMeasurement,
-    ValuationMeasurementSpec, ValuationMethod,
+    ActorId, FairValueLimitInput, FairValueLimits, FairValueService, InputSignificance,
+    ValuationInput, ValuationMeasurement, ValuationMeasurementSpec, ValuationMethod,
 };
 use rust_decimal::Decimal;
 
-#[derive(Clone, Copy)]
-struct Scenario {
-    relation: InputInstrumentRelation,
-    observability: InputObservability,
-    adjustment: PriceAdjustment,
-    activity: MarketActivity,
-    access: MarketAccess,
-    quality: DataQuality,
-    verification: EvidenceVerification,
-    source_timestamp: i64,
-    input_currency: &'static str,
-    input_scale: u8,
-    input_amount: i64,
+type TestResult<T = ()> = Result<T, Box<dyn Error>>;
+
+const MEASUREMENT_AT: i64 = 1_000;
+const PREPARED_AT: i64 = 1_200;
+
+fn account() -> Result<AccountId, Box<dyn Error>> {
+    Ok("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".parse()?)
 }
 
-impl Default for Scenario {
-    fn default() -> Self {
-        Self {
-            relation: InputInstrumentRelation::Identical,
-            observability: InputObservability::QuotedPrice,
-            adjustment: PriceAdjustment::None,
-            activity: MarketActivity::Active,
-            access: MarketAccess::Accessible,
-            quality: DataQuality::DirectUnverified,
-            verification: EvidenceVerification::Verified,
-            source_timestamp: 950,
-            input_currency: "USD",
-            input_scale: 2,
-            input_amount: 100,
-        }
-    }
+fn instrument() -> Result<InstrumentId, Box<dyn Error>> {
+    Ok("9f3914d3-9ef4-42f7-a707-3f2dcde861d1".parse()?)
 }
 
-fn instrument() -> InstrumentId {
-    "9f3914d3-9ef4-42f7-a707-3f2dcde861d1"
-        .parse()
-        .expect("static non-nil instrument UUID")
+fn actor(value: &str) -> Result<ActorId, Box<dyn Error>> {
+    Ok(ActorId::try_from(value)?)
 }
 
-fn other_instrument() -> InstrumentId {
-    "d2505fc4-c26f-45ce-a596-5b2d0769b3fe"
-        .parse()
-        .expect("static non-nil instrument UUID")
+fn source(value: &str) -> Result<SourceIdentifier, Box<dyn Error>> {
+    Ok(SourceIdentifier::try_from(value)?)
 }
 
-fn actor(value: &str) -> ActorId {
-    ActorId::try_from(value).expect("static actor identity")
+fn portfolio_limits() -> Result<PortfolioLimits, Box<dyn Error>> {
+    Ok(PortfolioLimits::try_new(PortfolioLimitInput {
+        max_accounts: 1,
+        max_instruments: 2,
+        max_lots: 4,
+        max_transactions: 4,
+        max_factors: 1,
+        max_scenarios: 1,
+        max_history: 2,
+        max_results: 4,
+        max_retained_bytes: 256 * 1024,
+    })?)
 }
 
-fn amount(value: i64, currency: &str, scale: u8) -> ValuationAmount {
-    ValuationAmount::try_new(
-        Money::new(
-            Decimal::from(value),
-            Currency::try_from(currency).expect("static currency"),
-        ),
-        scale,
-    )
-    .expect("valid valuation amount")
+fn dataset(marker: u8) -> Result<DatasetManifestRef, Box<dyn Error>> {
+    Ok(DatasetManifestRef::try_new_with_schema(
+        DatasetId::try_from("fair-value-test")?,
+        u64::from(marker),
+        DatasetSchemaRegistry::local().canonical_research_observations()?,
+        Sha256Digest::new([marker; 32]),
+    )?)
 }
 
-fn input(scenario: Scenario, payload_byte: u8, significance: InputSignificance) -> ValuationInput {
-    let reference = if scenario.relation == InputInstrumentRelation::Identical {
-        instrument()
-    } else {
-        other_instrument()
-    };
-    let source_timestamp = Timestamp::from_unix_nanos(scenario.source_timestamp);
-    let evidence = FairValueEvidence::try_new(FairValueEvidenceInput {
-        source_id: SourceId::try_from("test.market").expect("static source"),
-        source_identifier: SourceIdentifier::try_from("quote-1").expect("static record"),
-        payload_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, [payload_byte; 32]),
-        origin: EvidenceOrigin::Market {
-            venue_id: VenueId::try_from("XNYS").expect("static venue"),
-        },
-        source_timestamp,
-        available_at: Timestamp::from_unix_nanos(scenario.source_timestamp + 10),
-        ingested_at: Timestamp::from_unix_nanos(scenario.source_timestamp + 20),
-        verification: scenario.verification,
-    })
-    .expect("valid evidence");
-
-    ValuationInput::try_new(ValuationInputSpec {
-        subject_instrument_id: instrument(),
-        reference_instrument_id: reference,
-        relationship: scenario.relation,
-        amount: amount(
-            scenario.input_amount,
-            scenario.input_currency,
-            scenario.input_scale,
-        ),
-        significance,
-        observability: scenario.observability,
-        adjustment: scenario.adjustment,
-        market_activity: scenario.activity,
-        market_access: scenario.access,
-        data_quality: scenario.quality,
-        evidence,
-    })
-    .expect("valid valuation input")
+fn portfolio_revision(as_of: i64, marker: u8) -> Result<PortfolioRevision, Box<dyn Error>> {
+    let account = account()?;
+    let instrument = instrument()?;
+    let currency = Currency::try_from("USD")?;
+    let limits = portfolio_limits()?;
+    let manifest = dataset(marker)?;
+    let mut ledger = PortfolioLedger::try_new(account, currency, limits)?;
+    let entries = vec![
+        LedgerEntry::try_new(
+            account,
+            TransactionRevision::try_new(source("deposit")?, RevisionNumber::new(1)?, None)?,
+            Timestamp::from_unix_nanos(1),
+            source("cash-source")?,
+            LedgerEntryKind::CashFlow(CashFlow::try_new(
+                CashFlowKind::Deposit,
+                Money::new(Decimal::from(1_000), currency),
+                None,
+            )?),
+        )?,
+        LedgerEntry::try_new(
+            account,
+            TransactionRevision::try_new(source("buy")?, RevisionNumber::new(1)?, None)?,
+            Timestamp::from_unix_nanos(2),
+            source("trade-source")?,
+            LedgerEntryKind::Trade(Trade::try_new(
+                TradeSide::Buy,
+                instrument,
+                Decimal::TEN,
+                Money::new(Decimal::TEN, currency),
+                Money::new(Decimal::ZERO, currency),
+                LotSelection::Fifo,
+            )?),
+        )?,
+    ];
+    let valuation = ValuationSet::try_new(
+        currency,
+        Timestamp::from_unix_nanos(as_of),
+        manifest.clone(),
+        Sha256Digest::new([marker; 32]),
+        vec![PriceEvidence::try_new(
+            instrument,
+            Money::new(Decimal::TEN, currency),
+            Timestamp::from_unix_nanos(as_of),
+            source("price-source")?,
+        )?],
+        Vec::new(),
+        limits,
+    )?;
+    let evidence = RevisionEvidence::try_new(
+        Timestamp::from_unix_nanos(as_of),
+        manifest,
+        Sha256Digest::new([marker; 32]),
+        Sha256Digest::new([marker.wrapping_add(1); 32]),
+        vec![source("ledger-source")?],
+        Vec::new(),
+        None,
+    )?;
+    Ok(ledger.try_apply(entries, None, valuation, evidence)?)
 }
 
-fn measurement(inputs: Vec<ValuationInput>) -> ValuationMeasurement {
-    ValuationMeasurement::try_new(ValuationMeasurementSpec {
-        instrument_id: instrument(),
-        amount: amount(100, "USD", 2),
-        measurement_at: Timestamp::from_unix_nanos(1_000),
-        prepared_at: Timestamp::from_unix_nanos(1_100),
-        prepared_by: actor("preparer-1"),
-        method: ValuationMethod::QuotedMarketPrice,
-        inputs,
-    })
-    .expect("valid measurement")
+fn measurement(as_of: i64, marker: u8) -> Result<ValuationMeasurement, Box<dyn Error>> {
+    let revision = portfolio_revision(as_of, marker)?;
+    let input = ValuationInput::from_portfolio_position(
+        &revision,
+        instrument()?,
+        InputSignificance::Significant,
+    )?;
+    Ok(ValuationMeasurement::try_new(ValuationMeasurementSpec {
+        account_id: account()?,
+        instrument_id: instrument()?,
+        amount: input.amount(),
+        measurement_at: Timestamp::from_unix_nanos(MEASUREMENT_AT),
+        prepared_at: Timestamp::from_unix_nanos(PREPARED_AT),
+        prepared_by: actor("preparer")?,
+        method: ValuationMethod::MarketApproach,
+        inputs: vec![input],
+    })?)
 }
 
-fn service(max_query_results: usize) -> FairValueService {
-    let limits = FairValueLimits::try_new(FairValueLimitInput {
-        max_measurements: 64,
-        max_inputs_per_measurement: 16,
-        max_records_per_family: 128,
+fn fair_value_limits(max_query_results: usize) -> Result<FairValueLimits, Box<dyn Error>> {
+    Ok(FairValueLimits::try_new(FairValueLimitInput {
+        max_measurements: 16,
+        max_inputs_per_measurement: 4,
+        max_records_per_family: 32,
         max_query_results,
         max_retained_bytes: 2 * 1024 * 1024,
-    })
-    .expect("valid service limits");
-    FairValueService::new(limits)
+    })?)
+}
+
+struct CatalogFixture {
+    _directory: tempfile::TempDir,
+    authority: CatalogAuthority,
+}
+
+impl CatalogFixture {
+    fn open() -> Result<Self, Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let paths = LocalPaths::prepare(directory.path().join("local"))?;
+        let config = CatalogConfig::try_new(
+            paths.catalog()?.clone(),
+            Duration::from_millis(750),
+            CatalogLimit::new(32)?,
+            CatalogResultLimits::try_new(1024 * 1024, 16 * 1024 * 1024)?,
+        )?;
+        Ok(Self {
+            _directory: directory,
+            authority: CatalogAuthority::open(config)?,
+        })
+    }
+
+    fn service(&self, max_query_results: usize) -> Result<FairValueService<'_>, Box<dyn Error>> {
+        Ok(FairValueService::open(
+            &self.authority,
+            fair_value_limits(max_query_results)?,
+        )?)
+    }
 }

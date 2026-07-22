@@ -39,6 +39,7 @@ struct RouteOwner {
     generations: GenerationAuthorityRegistry,
     features: RouteFeatureState,
     action_hook: Option<crate::RouteActionHook>,
+    qualified_market_export: Option<crate::RouteQualifiedMarketExport>,
     cross_venue_publisher: Option<CrossVenueRoutePublisher>,
     cross_venue_reader: Option<CrossVenueRuntimeReader>,
 }
@@ -53,6 +54,7 @@ pub(crate) struct ShardActorInput {
     pub(crate) shard_owner: ShardLeaseOwner,
     pub(crate) routes: Vec<LiveRouteConfig>,
     pub(crate) action_hooks: Vec<crate::RouteActionHook>,
+    pub(crate) qualified_market_exports: Vec<crate::RouteQualifiedMarketExport>,
     pub(crate) maximum_action_hook_bytes_per_route: usize,
     pub(crate) maximum_sources_per_route: usize,
     pub(crate) maximum_streams_per_route: usize,
@@ -214,6 +216,16 @@ impl ShardActor {
                 return Err(ActorError::DuplicateActionHook);
             }
         }
+        let mut qualified_market_exports = HashMap::new();
+        qualified_market_exports
+            .try_reserve(input.qualified_market_exports.len())
+            .map_err(|_| ActorError::Allocation)?;
+        for exporter in input.qualified_market_exports {
+            let route = exporter.route().clone();
+            if qualified_market_exports.insert(route, exporter).is_some() {
+                return Err(ActorError::DuplicateQualifiedMarketExport);
+            }
+        }
         for route in input.routes {
             let cross_venue = input.cross_venue.route(route.route());
             let generations =
@@ -232,6 +244,7 @@ impl ShardActor {
             let features = RouteFeatureState::try_new(input.feature_capacity, route.depth())?;
             let route_key = route.route().clone();
             let action_hook = action_hooks.remove(&route_key);
+            let qualified_market_export = qualified_market_exports.remove(&route_key);
             if routes
                 .insert(
                     route_key.clone(),
@@ -240,6 +253,7 @@ impl ShardActor {
                         generations,
                         features,
                         action_hook,
+                        qualified_market_export,
                         cross_venue_publisher: cross_venue
                             .as_ref()
                             .map(|(publisher, _)| publisher.clone()),
@@ -253,6 +267,9 @@ impl ShardActor {
         }
         if !action_hooks.is_empty() {
             return Err(ActorError::UnknownActionHook);
+        }
+        if !qualified_market_exports.is_empty() {
+            return Err(ActorError::UnknownQualifiedMarketExport);
         }
         let book_scratch = BookProcessingScratch::try_new(input.maximum_book_items_per_message)
             .map_err(|_| ActorError::Allocation)?;
@@ -406,6 +423,10 @@ pub(crate) enum ActorError {
     DuplicateActionHook,
     #[error("actor received action hook ownership for an unknown route")]
     UnknownActionHook,
+    #[error("actor received duplicate qualified-market export ownership")]
+    DuplicateQualifiedMarketExport,
+    #[error("actor received qualified-market export ownership for an unknown route")]
+    UnknownQualifiedMarketExport,
     #[error("actor received a command for an unknown route")]
     UnknownRoute,
     #[error("actor received a command whose generation is no longer current")]
@@ -441,6 +462,8 @@ impl ActorError {
             | Self::DuplicateRoute
             | Self::DuplicateActionHook
             | Self::UnknownActionHook
+            | Self::DuplicateQualifiedMarketExport
+            | Self::UnknownQualifiedMarketExport
             | Self::UnknownRoute
             | Self::RuntimeClosed
             | Self::ShardClosed

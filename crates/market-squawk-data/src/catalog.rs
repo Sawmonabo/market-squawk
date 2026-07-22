@@ -3,6 +3,7 @@
 mod authority;
 mod backup;
 mod evidence;
+mod fair_value;
 mod migration_preflight;
 mod observed_revisions;
 mod publication;
@@ -21,6 +22,12 @@ pub(crate) use self::authority::exact_catalog_file_binding;
 pub use self::backup::BackupReceipt;
 pub(crate) use self::backup::{
     InstalledBackupCatalog, InstalledCatalogState, VerifiedBackupCatalog,
+};
+pub use self::fair_value::{
+    FairValueCatalogAuditEvent, FairValueCatalogCommit, FairValueCatalogLink,
+    FairValueCatalogOperation, FairValueCatalogPosition, FairValueCatalogRecord,
+    FairValueCatalogSnapshot, FairValueCatalogSnapshotLimits, FairValueCommitDisposition,
+    FairValueLinkRelation, FairValueOperationKind, FairValueRecordKind,
 };
 use self::storage::{
     apply_migrations, initialize_catalog_identity, pragma_bool, prepare_local_path,

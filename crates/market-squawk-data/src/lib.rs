@@ -43,9 +43,13 @@ pub use authority_transition::{
 pub use catalog::{
     ArtifactRecord, AuditEvent, BackupReceipt, Catalog, CatalogAuthority, CatalogConfig,
     CatalogError, CatalogHealth, CatalogLimit, CatalogResultLimits, ContractCompletion,
-    DatasetManifestRecord, IngestReservation, IngestRunRecord, IngestRunState, PublishedIngest,
-    QueryArtifactReservation, QueryArtifactReservationInput, QueryArtifactResult, ReferenceBundle,
-    ResumedIngest, SourceCursor, StoredObservedRevision,
+    DatasetManifestRecord, FairValueCatalogAuditEvent, FairValueCatalogCommit,
+    FairValueCatalogLink, FairValueCatalogOperation, FairValueCatalogPosition,
+    FairValueCatalogRecord, FairValueCatalogSnapshot, FairValueCatalogSnapshotLimits,
+    FairValueCommitDisposition, FairValueLinkRelation, FairValueOperationKind, FairValueRecordKind,
+    IngestReservation, IngestRunRecord, IngestRunState, PublishedIngest, QueryArtifactReservation,
+    QueryArtifactReservationInput, QueryArtifactResult, ReferenceBundle, ResumedIngest,
+    SourceCursor, StoredObservedRevision,
 };
 pub use corporate_actions::{
     AdjustmentConflict, AdjustmentRatio, AdjustmentStep, CorporateActionAdjustment,
@@ -85,7 +89,8 @@ pub use pit::{
     PointInTimeSelection, PointInTimeService,
 };
 pub use query::{
-    QueryError, QueryLimits, QueryRequest, QueryResult, ResearchQueryEngine, ResearchQueryService,
+    PinnedFeatureMonetaryValue, PinnedMonetaryValue, PinnedQueryOutput, QueryError, QueryLimits,
+    QueryRequest, QueryResult, ResearchQueryEngine, ResearchQueryService,
 };
 pub use research_use::{
     AuthorizedResearchUse, DerivedOutputObjectInput, DerivedPublicationDigest,

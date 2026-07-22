@@ -24,6 +24,10 @@ use tokio_util::sync::CancellationToken;
 
 #[path = "query/budget.rs"]
 mod budget;
+#[path = "query/feature_receipt.rs"]
+mod feature_receipt;
+#[path = "query/receipt.rs"]
+mod receipt;
 #[path = "query/source.rs"]
 mod source;
 #[cfg(test)]
@@ -36,6 +40,9 @@ use self::budget::{
     CountingWriter, PlanningReceipt, map_datafusion, record_batch_retained_bytes, reserve_memory,
     resize_memory, schema_retained_bytes, valid_table_name,
 };
+pub use self::feature_receipt::PinnedFeatureMonetaryValue;
+pub use self::receipt::{PinnedMonetaryValue, PinnedQueryOutput};
+use self::receipt::{RESEARCH_MONETARY_COLUMNS, pinned_object_graph_digest};
 use self::source::{PinnedObjectStoreRegistry, QuerySource, RetainedSourceReceipt};
 use self::validation::{validate_read_only_statement, validate_relations};
 use crate::blocking_supervisor::BlockingIoSupervisor;
@@ -298,6 +305,12 @@ pub enum QueryResult {
     },
 }
 
+#[derive(Debug)]
+struct ExecutedQuery {
+    result: QueryResult,
+    result_digest: EvidenceDigest,
+}
+
 /// Bounded read-only analytical query service boundary.
 #[allow(
     async_fn_in_trait,
@@ -442,6 +455,123 @@ impl ResearchQueryEngine {
         limits: QueryLimits,
         cancellation: CancellationToken,
     ) -> Result<QueryResult, QueryError> {
+        self.execute(request, limits, cancellation)
+            .await
+            .map(|executed| executed.result)
+    }
+
+    /// Executes against a catalog-resolved pinned dataset and returns a non-forgeable result
+    /// receipt binding the complete object graph, query, limits, and exact Arrow IPC output.
+    pub async fn query_pinned(
+        &self,
+        request: QueryRequest,
+        limits: QueryLimits,
+        cancellation: CancellationToken,
+    ) -> Result<PinnedQueryOutput, QueryError> {
+        let dataset = self
+            .source
+            .pinned_dataset()
+            .ok_or(QueryError::PinnedQuerySourceRequired)?;
+        let manifest = dataset.manifest().clone();
+        let object_graph_digest = pinned_object_graph_digest(dataset);
+        let query_identity = request.artifact_identity(&limits);
+        let executed = self.execute(request, limits, cancellation).await?;
+        Ok(PinnedQueryOutput::new(
+            manifest,
+            object_graph_digest,
+            query_identity,
+            executed.result_digest,
+            executed.result,
+        ))
+    }
+
+    /// Reads one stable row from the canonical research-observation schema using an engine-owned
+    /// direct base-column projection and returns a producer-issued monetary evidence receipt.
+    ///
+    /// Caller SQL and caller-selected semantic columns are deliberately absent from this API.
+    ///
+    /// # Errors
+    ///
+    /// Rejects noncanonical schemas, excessive row selectors, missing rows, nonmonetary rows, or
+    /// any ordinary bounded query failure.
+    pub async fn canonical_research_monetary_value(
+        &self,
+        row: usize,
+        limits: QueryLimits,
+        cancellation: CancellationToken,
+    ) -> Result<PinnedMonetaryValue, QueryError> {
+        let canonical = DatasetSchemaRegistry::local()
+            .canonical_research_observations()
+            .map_err(|_| QueryError::InvalidSource)?;
+        if self.manifest.schema() != &canonical || row >= MAX_ROWS as usize {
+            return Err(QueryError::PinnedQuerySourceRequired);
+        }
+        let sql = format!(
+            "SELECT value_mantissa, value_scale, currency, source_id, instrument_id, \
+             venue_id, source_identifier, source_timestamp, received_at, available_at, \
+             ingested_at, effective_at, published_at, revision, quality, payload_sha256 \
+             FROM {} ORDER BY source_id, source_identifier, revision, payload_sha256 \
+             LIMIT 1 OFFSET {row}",
+            self.table_name
+        );
+        let output = self
+            .query_pinned(
+                QueryRequest::try_new(self.manifest.clone(), sql)?,
+                limits,
+                cancellation,
+            )
+            .await?;
+        output.monetary_value(0, row, RESEARCH_MONETARY_COLUMNS)
+    }
+
+    /// Reads one exact monetary feature from the canonical feature/label dataset using an
+    /// engine-owned direct base-column projection.
+    ///
+    /// The selector is an offset within canonical, non-null decimal feature rows. Caller SQL,
+    /// labels, floating-point outputs, and caller-selected semantic columns cannot enter the
+    /// receipt-producing path.
+    ///
+    /// # Errors
+    ///
+    /// Rejects noncanonical schemas, excessive selectors, missing rows, nonmonetary feature rows,
+    /// or any ordinary bounded query failure.
+    pub async fn canonical_feature_monetary_value(
+        &self,
+        row: usize,
+        limits: QueryLimits,
+        cancellation: CancellationToken,
+    ) -> Result<PinnedFeatureMonetaryValue, QueryError> {
+        let canonical = DatasetSchemaRegistry::local()
+            .canonical_feature_labels()
+            .map_err(|_| QueryError::InvalidSource)?;
+        if self.manifest.schema() != &canonical || row >= MAX_ROWS as usize {
+            return Err(QueryError::PinnedQuerySourceRequired);
+        }
+        let sql = format!(
+            "SELECT example_id, instrument_id, cutoff_at, component_kind, component_name, \
+             component_version, value_decimal_mantissa, value_decimal_scale, unit, currency, \
+             lineage_sha256 FROM {} WHERE component_kind = 'feature' \
+             AND value_decimal_mantissa IS NOT NULL AND value_decimal_scale IS NOT NULL \
+             AND currency IS NOT NULL ORDER BY example_id, instrument_id, cutoff_at, \
+             component_name, component_version, lineage_sha256 LIMIT 1 OFFSET {row}",
+            self.table_name
+        );
+        let output = self
+            .query_pinned(
+                QueryRequest::try_new(self.manifest.clone(), sql)?,
+                limits,
+                cancellation,
+            )
+            .await?;
+        PinnedFeatureMonetaryValue::try_from_output(&output, row)
+    }
+
+    async fn execute(
+        &self,
+        request: QueryRequest,
+        limits: QueryLimits,
+        cancellation: CancellationToken,
+    ) -> Result<ExecutedQuery, QueryError> {
         if request.manifest != self.manifest {
             return Err(QueryError::ManifestPinMismatch);
         }
@@ -613,9 +743,15 @@ impl ResearchQueryEngine {
                 if execution_cancellation.is_cancelled() {
                     return Err(QueryError::Cancelled);
                 }
-                return Ok(QueryResult::Inline {
-                    batches,
-                    byte_count,
+                return Ok(ExecutedQuery {
+                    result: QueryResult::Inline {
+                        batches,
+                        byte_count,
+                    },
+                    result_digest: EvidenceDigest::new(
+                        DigestAlgorithm::Sha256,
+                        ipc.get_ref().digest(),
+                    ),
                 });
             }
             let publication = self
@@ -660,10 +796,13 @@ impl ResearchQueryEngine {
                     &execution_durable_bound,
                 )
                 .await?;
-            Ok(QueryResult::Artifact {
-                object,
-                artifact: Box::new(artifact),
-                ownership,
+            Ok(ExecutedQuery {
+                result: QueryResult::Artifact {
+                    object,
+                    artifact: Box::new(artifact),
+                    ownership,
+                },
+                result_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, ipc.get_ref().digest()),
             })
         };
         tokio::pin!(execution);
@@ -724,6 +863,21 @@ pub enum QueryError {
     /// Request and engine manifest pins differ.
     #[error("query manifest pin mismatch")]
     ManifestPinMismatch,
+    /// The receipt-producing query path requires a catalog-resolved immutable dataset.
+    #[error("pinned query output requires a catalog-resolved dataset source")]
+    PinnedQuerySourceRequired,
+    /// Monetary cells can only be derived from retained inline Arrow output.
+    #[error("monetary value extraction requires an inline query result")]
+    MonetaryValueRequiresInlineResult,
+    /// A requested monetary row or column coordinate is outside the bounded result.
+    #[error("monetary cell coordinate is outside the query result")]
+    MonetaryCellOutOfBounds,
+    /// Monetary cell types, nullability, physical scale, currency, or numeric range are invalid.
+    #[error("query result does not contain a valid exact monetary cell")]
+    InvalidMonetaryCell,
+    /// The semantic monetary scale exceeds the exact analytical decimal representation.
+    #[error("query monetary scale is unsupported")]
+    UnsupportedMonetaryScale,
     /// SQL AST exceeded its configured node cap.
     #[error("query AST limit exceeded")]
     AstLimitExceeded,

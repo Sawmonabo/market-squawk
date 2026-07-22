@@ -69,7 +69,8 @@ impl ValuationOverride {
         prepared_at: Timestamp,
         expires_at: Timestamp,
     ) -> Result<Self, FairValueError> {
-        if requested_hierarchy == FairValueHierarchy::Unclassified
+        if requested_hierarchy == FairValueHierarchy::Level1
+            || requested_hierarchy == FairValueHierarchy::Unclassified
             || requested_hierarchy == base.hierarchy()
             || expires_at <= prepared_at
         {

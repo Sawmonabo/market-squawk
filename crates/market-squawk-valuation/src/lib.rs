@@ -49,6 +49,18 @@ pub enum FairValueError {
     /// Instrument identity and relationship fields contradict one another.
     #[error("fair-value instrument relationship is invalid")]
     InvalidInstrumentRelationship,
+    /// A producer receipt is missing, incompatible, or fails its authority contract.
+    #[error("fair-value producer evidence is invalid")]
+    InvalidProducerEvidence,
+    /// The selected producer object does not contain an instrument-scoped value.
+    #[error("fair-value producer evidence has no selected instrument")]
+    MissingProducerInstrument,
+    /// A comparable, proxy, adjusted, or unobservable input-use assessment is inconsistent.
+    #[error("fair-value input-use assessment is invalid")]
+    InvalidInputAssessment,
+    /// A reporting-entity market-access assessment is incomplete or does not match the market.
+    #[error("fair-value market-access assessment is invalid")]
+    InvalidMarketAccessAssessment,
     /// A measurement is empty, inconsistent, or not in canonical form.
     #[error("fair-value measurement is invalid")]
     InvalidMeasurement,
@@ -111,26 +123,38 @@ pub enum FairValueError {
         /// Configured maximum rows.
         limit: usize,
     },
+    /// The local catalog rejected an otherwise validated fair-value operation.
+    #[error("fair-value catalog persistence failed")]
+    Persistence,
+    /// Durable fair-value records failed canonical decode or semantic recomputation.
+    #[error("durable fair-value state is corrupt or incomplete")]
+    CorruptPersistence,
 }
 
+mod access;
 mod approval;
+mod assessment;
 mod evidence;
 mod measurement;
+mod persistence;
 mod rules;
 mod service;
 
+pub use access::{ApprovedMarketAccess, MarketAccessAssessmentId};
 pub use approval::{
     ApprovalRevocation, ApprovalRevocationId, ApprovalStatus, OverrideId, OverrideProposal,
     ValuationApproval, ValuationApprovalId, ValuationOverride,
 };
+pub use assessment::{InputUseAssessment, InputUseAssessmentHash};
 pub use evidence::{
     EvidenceOrigin, EvidenceVerification, FairValueEvidence, FairValueEvidenceHash,
-    FairValueEvidenceInput,
 };
 pub use measurement::{
-    ActorId, InputId, InputInstrumentRelation, InputObservability, InputSignificance, MarketAccess,
-    MarketActivity, MeasurementId, PriceAdjustment, ValuationAmount, ValuationInput,
-    ValuationInputSpec, ValuationMeasurement, ValuationMeasurementSpec, ValuationMethod,
+    ActorId, CommittedMarketInputRequest, InputId, InputInstrumentRelation, InputObservability,
+    InputSignificance, MarketAccess, MarketActivity, MarketActivityPolicy,
+    MarketActivityPolicyHash, MarketPriceSelection, MeasurementId, PriceAdjustment,
+    ValuationAmount, ValuationInput, ValuationMeasurement, ValuationMeasurementSpec,
+    ValuationMethod,
 };
 pub use rules::{
     ClassificationDecision, ClassificationRuleset, DecisionBasis, DecisionId, DecisionReason,

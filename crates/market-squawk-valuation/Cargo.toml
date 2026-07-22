@@ -13,10 +13,17 @@ autotests = false
 market-squawk-analytics = { workspace = true }
 market-squawk-data = { workspace = true }
 market-squawk-domain = { workspace = true }
+market-squawk-live = { workspace = true }
 market-squawk-portfolio = { workspace = true }
 rust_decimal.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+market-squawk-platform = { workspace = true }
+tempfile.workspace = true
 
 [[test]]
 name = "fair_value"
