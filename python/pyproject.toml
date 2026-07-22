@@ -16,6 +16,6 @@ test = ["pytest==9.1.1"]
 [tool.maturin]
 manifest-path = "../crates/market-squawk-python/Cargo.toml"
 python-source = "."
-module-name = "market_squawk._native"
+module-name = "market_squawk.market_squawk"
 bindings = "pyo3"
 strip = true

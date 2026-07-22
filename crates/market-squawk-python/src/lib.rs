@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::types::PyList;
 use tokio_util::sync::CancellationToken;
 
 const FEATURE_IMPLEMENTATION_REVISION: &str = "task14-python-v1";
@@ -21,6 +22,18 @@ const PYTHON_BUILD_IDENTITY: &str = if SEALED_PYTHON_BUILD {
     "development-unsealed-v1"
 };
 const PYTHON_BUILD_IDENTITY_ATTRIBUTE: &str = "__market_squawk_build_identity__";
+const NATIVE_MODULE_ALIAS: &str = "market_squawk._native";
+const PUBLIC_API: &[&str] = &[
+    "BundleAuthorityRef",
+    "DatasetResult",
+    "OperationContext",
+    "TrainingProposal",
+    "TrainingRun",
+    "TrainingEnvironmentReceipt",
+    "UtcNanoseconds",
+    "open_dataset",
+    "training_environment_receipt",
+];
 // Analytics kernels do not yet accept a cancellation callback internally. Keep every
 // non-preemptible section small and charge a conservative worst-case operation bound first.
 const MAX_ANALYTIC_VALUES: usize = 16_384;
@@ -152,8 +165,38 @@ fn expected_model_validator_sha256() -> PyResult<&'static str> {
     Ok(value)
 }
 
+fn add_native_alias(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    let modules = module.py().import("sys")?.getattr("modules")?;
+    modules.set_item(NATIVE_MODULE_ALIAS, module)?;
+    module.add("_native", module.clone())
+}
+
+fn add_exports(module: &Bound<'_, PyModule>, source_name: &str, names: &[&str]) -> PyResult<()> {
+    let source = module.py().import(source_name)?;
+    for name in names {
+        module.add(*name, source.getattr(*name)?)?;
+    }
+    Ok(())
+}
+
+fn add_public_api(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    add_exports(module, "market_squawk.bundle", &["BundleAuthorityRef"])?;
+    add_exports(
+        module,
+        "market_squawk.data",
+        &["DatasetResult", "UtcNanoseconds", "open_dataset"],
+    )?;
+    add_exports(
+        module,
+        "market_squawk.training",
+        &["TrainingProposal", "TrainingRun"],
+    )?;
+    module.add("__all__", PyList::new(module.py(), PUBLIC_API)?)?;
+    module.add("__version__", "0.1.0")
+}
+
 #[pymodule]
-fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
+fn market_squawk(module: &Bound<'_, PyModule>) -> PyResult<()> {
     if SEALED_PYTHON_BUILD {
         receipt::verify_at_import(module)?;
     }
@@ -162,5 +205,10 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(expected_model_validator_sha256, module)?)?;
     dataset::register(module)?;
     analytics::register(module)?;
-    receipt::register(module)
+    receipt::register(module)?;
+    add_native_alias(module)?;
+    if SEALED_PYTHON_BUILD {
+        add_public_api(module)?;
+    }
+    Ok(())
 }

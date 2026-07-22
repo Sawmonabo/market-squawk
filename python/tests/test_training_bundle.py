@@ -55,18 +55,15 @@ class TrainingBundleContracts(unittest.TestCase):
             [value["name"] for value in envelope["payload"]["runtime_distributions"]],
             ["pyarrow"],
         )
-        dependency_source = Path(pa.__file__)
-        dependency_content = dependency_source.read_bytes()
-        dependency_mode = stat.S_IMODE(dependency_source.stat().st_mode)
-        with tempfile.TemporaryDirectory() as temporary:
-            sentinel = Path(temporary) / "dependency-executed"
-            replacement = (
-                "from pathlib import Path\n"
-                f"Path({str(sentinel)!r}).write_text('executed', encoding='ascii')\n"
-            ).encode("utf-8")
+
+        def reject_before_fresh_import(
+            source: Path, replacement: bytes, sentinel: Path
+        ) -> None:
+            content = source.read_bytes()
+            mode = stat.S_IMODE(source.stat().st_mode)
             try:
-                dependency_source.chmod(dependency_mode | stat.S_IWUSR)
-                dependency_source.write_bytes(replacement)
+                source.chmod(mode | stat.S_IWUSR)
+                source.write_bytes(replacement)
                 with self.assertRaises(ValueError):
                     training_environment_receipt()
                 completed = subprocess.run(
@@ -80,9 +77,39 @@ class TrainingBundleContracts(unittest.TestCase):
                 self.assertNotEqual(completed.returncode, 0, completed.stdout)
                 self.assertFalse(sentinel.exists(), completed.stdout)
             finally:
-                dependency_source.write_bytes(dependency_content)
-                dependency_source.chmod(dependency_mode)
-        self.assertEqual(training_environment_receipt().sha256, baseline)
+                source.write_bytes(content)
+                source.chmod(mode)
+            self.assertEqual(training_environment_receipt().sha256, baseline)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            sentinel = Path(temporary) / "project-code-executed"
+            payload = (
+                "from pathlib import Path\n"
+                f"Path({str(sentinel)!r}).write_text('executed', encoding='ascii')\n"
+            ).encode("utf-8")
+            package_source = Path(sys.modules["market_squawk"].__file__)
+            implementation_source = (
+                package_source
+                if package_source.suffix == ".py"
+                else Path(installed_training.__file__)
+            )
+            implementation_content = implementation_source.read_bytes()
+            if implementation_source == package_source:
+                replacement = payload + implementation_content
+            else:
+                future = b"from __future__ import annotations\n"
+                self.assertIn(future, implementation_content)
+                replacement = implementation_content.replace(future, future + payload, 1)
+            reject_before_fresh_import(implementation_source, replacement, sentinel)
+
+        dependency_source = Path(pa.__file__)
+        with tempfile.TemporaryDirectory() as temporary:
+            sentinel = Path(temporary) / "dependency-executed"
+            replacement = (
+                "from pathlib import Path\n"
+                f"Path({str(sentinel)!r}).write_text('executed', encoding='ascii')\n"
+            ).encode("utf-8")
+            reject_before_fresh_import(dependency_source, replacement, sentinel)
 
         added_dependency = dependency_source.parent / "_market_squawk_unrecorded.py"
         self.assertFalse(added_dependency.exists())

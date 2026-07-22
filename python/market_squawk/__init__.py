@@ -1,6 +1,6 @@
 """Local point-in-time research, Rust analytics, and deterministic model training."""
 
-from . import _native as _native
+from . import market_squawk as _native
 from .bundle import BundleAuthorityRef
 from .data import DatasetResult, UtcNanoseconds, open_dataset
 from .finance import OperationContext
@@ -23,3 +23,4 @@ __all__ = [
     "training_environment_receipt",
 ]
 __version__ = "0.1.0"
+__market_squawk_build_identity__ = _native.__market_squawk_build_identity__

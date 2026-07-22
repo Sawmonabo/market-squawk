@@ -5,17 +5,20 @@ from __future__ import annotations
 
 import argparse
 import base64
+import copy
 from contextlib import ExitStack
 import csv
 from dataclasses import dataclass
 from email.parser import BytesParser
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
 import platform
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tomllib
@@ -950,6 +953,7 @@ def _build_release(
     if len(project_wheels) != 1:
         raise ReleaseBuildError("maturin did not create exactly one project wheel")
     project_wheel = project_wheels[0]
+    harden_project_wheel(project_wheel)
     python_tag, abi_tag, platform_tag = _wheel_tags(project_wheel.name)
     if (
         python_tag != "cp310"
@@ -1024,7 +1028,7 @@ def _build_release(
             release_venv,
             runtime,
             RuntimeRequirement("market-squawk", "0.1.0"),
-            native_prefix="market_squawk/_native.",
+            native_prefix="market_squawk/__init__.",
         )
         runtime_distributions = tuple(
             inspect_installed_distribution(release_venv, runtime, requirement)
@@ -1050,7 +1054,7 @@ def _build_release(
                 release_python,
                 "-I",
                 "-c",
-                "import market_squawk._native as native;"
+                "import market_squawk as native;"
                 "raise SystemExit(0 if getattr(native, "
                 "'__market_squawk_build_identity__', None) == 'sealed-release-v1' else 2)",
             ],
@@ -1525,6 +1529,136 @@ def build_release_manifest(
         separators=(",", ":"),
     ).encode("ascii")
     return encoded, hashlib.sha256(encoded).hexdigest()
+
+
+def harden_project_wheel(project_wheel: Path) -> None:
+    """Replace Maturin's Python bootstrap with the independently loaded native initializer."""
+
+    if (
+        project_wheel.is_symlink()
+        or not project_wheel.is_file()
+        or project_wheel.stat().st_size > MAX_DISTRIBUTION_BYTES
+    ):
+        raise ReleaseBuildError("project wheel is not a bounded regular file")
+    mutable_bootstrap = "market_squawk/__init__.py"
+    nested_native_prefix = "market_squawk/market_squawk."
+    temporary = project_wheel.with_name(f".{project_wheel.name}.native-bootstrap")
+    if temporary.exists() or temporary.is_symlink():
+        raise ReleaseBuildError("project wheel hardening output already exists")
+    wheel_mode = stat.S_IMODE(project_wheel.stat().st_mode)
+    entries: dict[str, tuple[str, int]] = {}
+    try:
+        with zipfile.ZipFile(project_wheel, "r") as source:
+            members = source.infolist()
+            if not members or len(members) > MAX_DISTRIBUTION_FILES:
+                raise ReleaseBuildError("project wheel file count exceeds its bound")
+            names = [member.filename for member in members]
+            if len(names) != len(set(names)):
+                raise ReleaseBuildError("project wheel contains duplicate paths")
+            records = [
+                member
+                for member in members
+                if member.filename.endswith(".dist-info/RECORD")
+            ]
+            nested_native = [
+                member
+                for member in members
+                if member.filename.startswith(nested_native_prefix)
+                and member.filename.endswith(".so")
+            ]
+            if (
+                mutable_bootstrap not in names
+                or len(records) != 1
+                or len(nested_native) != 1
+                or any(
+                    name.startswith("market_squawk/__init__.")
+                    and name != mutable_bootstrap
+                    for name in names
+                )
+            ):
+                raise ReleaseBuildError("project wheel bootstrap layout is invalid")
+            native_suffix = nested_native[0].filename.removeprefix(nested_native_prefix)
+            if native_suffix != "abi3.so":
+                raise ReleaseBuildError("project wheel native initializer ABI is invalid")
+            native_initializer = f"market_squawk/__init__.{native_suffix}"
+            if native_initializer in names:
+                raise ReleaseBuildError("project wheel native initializer is duplicated")
+
+            with zipfile.ZipFile(temporary, "x", allowZip64=True) as destination:
+                total_size = 0
+                for member in members:
+                    name = member.filename
+                    path = _safe_record_path(name)
+                    mode = member.external_attr >> 16
+                    if (
+                        path.as_posix() != name
+                        or "\0" in name
+                        or member.is_dir()
+                        or member.flag_bits & 0x1
+                        or stat.S_IFMT(mode) not in (0, stat.S_IFREG)
+                        or member.file_size < 0
+                        or member.file_size > MAX_DISTRIBUTION_FILE_BYTES
+                    ):
+                        raise ReleaseBuildError("project wheel contains an invalid file")
+                    if member == records[0] or name == mutable_bootstrap:
+                        continue
+                    output_name = (
+                        native_initializer if member == nested_native[0] else name
+                    )
+                    output_info = copy.copy(member)
+                    output_info.filename = output_name
+                    output_info.orig_filename = output_name
+                    digest = hashlib.sha256()
+                    copied = 0
+                    with source.open(member, "r") as reader, destination.open(
+                        output_info, "w", force_zip64=True
+                    ) as writer:
+                        while True:
+                            chunk = reader.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            copied += len(chunk)
+                            total_size += len(chunk)
+                            if total_size > MAX_DISTRIBUTION_BYTES:
+                                raise ReleaseBuildError(
+                                    "project wheel expanded size exceeds its bound"
+                                )
+                            digest.update(chunk)
+                            writer.write(chunk)
+                    if copied != member.file_size or output_name in entries:
+                        raise ReleaseBuildError("project wheel file changed during hardening")
+                    entries[output_name] = (digest.hexdigest(), copied)
+
+                rendered = io.StringIO(newline="")
+                record_writer = csv.writer(rendered, lineterminator="\n")
+                for name, (digest, size) in sorted(entries.items()):
+                    encoded = base64.urlsafe_b64encode(bytes.fromhex(digest)).rstrip(b"=")
+                    record_writer.writerow(
+                        [name, f"sha256={encoded.decode('ascii')}", str(size)]
+                    )
+                record_writer.writerow([records[0].filename, "", ""])
+                record_bytes = rendered.getvalue().encode("utf-8")
+                if len(record_bytes) > MAX_RECORD_BYTES:
+                    raise ReleaseBuildError("project wheel RECORD exceeds its bound")
+                record_info = copy.copy(records[0])
+                destination.writestr(record_info, record_bytes)
+        temporary.chmod(wheel_mode)
+        os.replace(temporary, project_wheel)
+    except ReleaseBuildError:
+        raise
+    except (
+        OSError,
+        EOFError,
+        KeyError,
+        RuntimeError,
+        UnicodeError,
+        ValueError,
+        zipfile.BadZipFile,
+        csv.Error,
+    ) as error:
+        raise ReleaseBuildError("project wheel hardening failed") from error
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def inspect_installed_distribution(

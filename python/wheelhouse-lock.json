@@ -1462,8 +1462,8 @@
     },
     {
       "path": "crates/market-squawk-python/Cargo.toml",
-      "sha256": "c046c19063f47091c94f86b7f611e4385b208b470d7039263f78a27b8d4032c4",
-      "size_bytes": 711
+      "sha256": "a968d921f2b9b93e30836a109ab4b704fcd70f4dc322f8e691c8efa0cb410e82",
+      "size_bytes": 717
     },
     {
       "path": "crates/market-squawk-python/src/analytics.rs",
@@ -1477,8 +1477,8 @@
     },
     {
       "path": "crates/market-squawk-python/src/lib.rs",
-      "sha256": "04b284bc78bcbf7067306c3420927277c548a67e5301bb20975031b1969eb867",
-      "size_bytes": 5297
+      "sha256": "7c99321265892d8762844445a577e91bd1709824391f4ccd9b99ffed4f5971bc",
+      "size_bytes": 6739
     },
     {
       "path": "crates/market-squawk-python/src/receipt.rs",
@@ -1847,8 +1847,8 @@
     },
     {
       "path": "python/market_squawk/__init__.py",
-      "sha256": "3188aba792824a99fbf755351c56e388f72e650324b5c921c7ac5c7f28be965e",
-      "size_bytes": 653
+      "sha256": "53661a0979f2007c3baddc8e7ede8fe4ea1c45c463e312059c30fd610da9281e",
+      "size_bytes": 735
     },
     {
       "path": "python/market_squawk/_data_validation.py",
@@ -1882,8 +1882,8 @@
     },
     {
       "path": "python/pyproject.toml",
-      "sha256": "052a354162d0fb9e3781c5ef9855822df1a783be3233d3159e7270d137530729",
-      "size_bytes": 533
+      "sha256": "e709f41544f3737640408bde398fd255eb125c3ba2f54aef20c92a8b522e54fb",
+      "size_bytes": 539
     },
     {
       "path": "python/requirements.lock",
@@ -1902,8 +1902,8 @@
     },
     {
       "path": "python/tests/test_training_bundle.py",
-      "sha256": "167316ee00e6c2909a4617de480622ad9893fa0993ad76c77ce5f0ddc1a8214d",
-      "size_bytes": 12354
+      "sha256": "583cce8da31973e2ab671476f458c36c09dc590c91e7b3dc45d0beb89e63eaed",
+      "size_bytes": 13528
     },
     {
       "path": "python/tests/test_visualization_examples.py",
@@ -1917,8 +1917,8 @@
     },
     {
       "path": "scripts/build_python_release.py",
-      "sha256": "daa06474518de7ce258cb245cadc808c9fd040a1532e1a8b49c2195d83b7170e",
-      "size_bytes": 74447
+      "sha256": "1114d64f3bc2e0b2cecdad9aa5fb5ab9e6c57b7f4e57c6d3760edd798b4efcfd",
+      "size_bytes": 80658
     },
     {
       "path": "scripts/tests/test_build_python_release.py",
