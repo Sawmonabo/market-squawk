@@ -21,6 +21,7 @@ const MAX_FEATURE_CONTRACTS: usize = 1_024;
 const MAX_OPERATION_TIMEOUT_MILLISECONDS: u64 = 24 * 60 * 60 * 1_000;
 const MAX_OPERATION_BUDGET: u64 = 100_000_000;
 const CONTROL_CHECK_INTERVAL: usize = 1_024;
+const MODEL_VALIDATOR_SHA256: Option<&str> = option_env!("MARKET_SQUAWK_MODEL_VALIDATOR_SHA256");
 
 fn invalid_input() -> PyErr {
     PyValueError::new_err("financial input violates a bounded Rust analytics contract")
@@ -128,9 +129,24 @@ fn encode_hex(bytes: [u8; 32]) -> String {
     encoded
 }
 
+#[pyfunction]
+fn expected_model_validator_sha256() -> PyResult<&'static str> {
+    let value = MODEL_VALIDATOR_SHA256.ok_or_else(invalid_input)?;
+    if value.len() != 64
+        || value == "0000000000000000000000000000000000000000000000000000000000000000"
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(invalid_input());
+    }
+    Ok(value)
+}
+
 #[pymodule]
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<OperationContext>()?;
+    module.add_function(wrap_pyfunction!(expected_model_validator_sha256, module)?)?;
     dataset::register(module)?;
     analytics::register(module)
 }

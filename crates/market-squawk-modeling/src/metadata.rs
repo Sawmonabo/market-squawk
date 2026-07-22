@@ -292,6 +292,8 @@ pub struct BundleExpectations {
     training_period: TrainingPeriod,
     label: FeatureLabelComponentSpec,
     training_code_revision: Box<str>,
+    bundle_metadata_hash: Sha256Digest,
+    artifact_hash: Sha256Digest,
     training_run_hash: Sha256Digest,
 }
 
@@ -314,11 +316,15 @@ impl BundleExpectations {
         training_period: TrainingPeriod,
         label: FeatureLabelComponentSpec,
         training_code_revision: impl AsRef<str>,
+        bundle_metadata_hash: Sha256Digest,
+        artifact_hash: Sha256Digest,
         training_run_hash: Sha256Digest,
     ) -> Result<Self, ModelMetadataError> {
         let training_code_revision = training_code_revision.as_ref();
         if label.kind() != ComponentKind::Label
             || !valid_revision(training_code_revision)
+            || bundle_metadata_hash.bytes() == [0; 32]
+            || artifact_hash.bytes() == [0; 32]
             || training_run_hash.bytes() == [0; 32]
         {
             return Err(ModelMetadataError::InvalidExpectations);
@@ -332,6 +338,8 @@ impl BundleExpectations {
             training_period,
             label,
             training_code_revision: training_code_revision.into(),
+            bundle_metadata_hash,
+            artifact_hash,
             training_run_hash,
         })
     }
@@ -382,6 +390,18 @@ impl BundleExpectations {
     #[must_use]
     pub fn training_code_revision(&self) -> &str {
         &self.training_code_revision
+    }
+
+    /// Returns the independently approved exact final bundle-metadata identity.
+    #[must_use]
+    pub const fn bundle_metadata_hash(&self) -> Sha256Digest {
+        self.bundle_metadata_hash
+    }
+
+    /// Returns the independently approved exact native-artifact identity.
+    #[must_use]
+    pub const fn artifact_hash(&self) -> Sha256Digest {
+        self.artifact_hash
     }
 
     /// Returns the independently approved exact training-run provenance identity.

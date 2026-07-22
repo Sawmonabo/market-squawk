@@ -668,6 +668,24 @@ def build_release(
         toolchain,
         offline=True,
     )
+    _run(
+        [
+            str(_bound_tool(toolchain, "cargo")),
+            "build",
+            "-p",
+            "market-squawk-modeling",
+            "--bin",
+            "market-squawk-model-validator",
+            "--release",
+            "--locked",
+        ],
+        root,
+        bootstrap_environment,
+    )
+    validator = root / "target/release/market-squawk-model-validator"
+    if not validator.is_file():
+        raise ReleaseBuildError("Rust model validator executable was not produced")
+    validator_sha256 = _file_digest(validator)[1]
     build_runtime = runtimes[0]
     build_python = _create_venv(
         build_runtime,
@@ -693,6 +711,7 @@ def build_release(
     )
     environment = dict(bootstrap_environment)
     environment["PYO3_PYTHON"] = build_python
+    environment["MARKET_SQUAWK_MODEL_VALIDATOR_SHA256"] = validator_sha256
     _run(
         [
             build_python,
@@ -721,23 +740,6 @@ def build_release(
         raise ReleaseBuildError(
             "project wheel does not carry the exact pinned cp310-abi3 macOS platform tag"
         )
-    _run(
-        [
-            str(_bound_tool(toolchain, "cargo")),
-            "build",
-            "-p",
-            "market-squawk-modeling",
-            "--bin",
-            "market-squawk-model-validator",
-            "--release",
-            "--locked",
-        ],
-        root,
-        environment,
-    )
-    validator = root / "target/release/market-squawk-model-validator"
-    if not validator.is_file():
-        raise ReleaseBuildError("Rust model validator executable was not produced")
     matrix_evidence = []
     for runtime, (minor, release_venv) in zip(runtimes, layout.releases, strict=True):
         if runtime.version[:2] != minor:
@@ -786,6 +788,8 @@ def build_release(
         validator_destination = release_venv / "bin/market-squawk-model-validator"
         shutil.copy2(validator, validator_destination)
         validator_destination.chmod(0o755)
+        if _file_digest(validator_destination)[1] != validator_sha256:
+            raise ReleaseBuildError("installed model validator identity changed")
         _run(
             [
                 release_python,
@@ -820,7 +824,7 @@ def build_release(
                     runtime_environment,
                 ),
                 "focused_tests": list(FOCUSED_TESTS),
-                "validator_sha256": _file_digest(validator_destination)[1],
+                "validator_sha256": validator_sha256,
             }
         )
     evidence = {

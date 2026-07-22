@@ -60,6 +60,26 @@ impl Fixture {
     fn training_run_path(&self) -> PathBuf {
         self.temporary.path().join("training-run.json")
     }
+
+    fn expectations_with_hashes(
+        &self,
+        bundle_metadata_hash: Sha256Digest,
+        artifact_hash: Sha256Digest,
+    ) -> TestResult<BundleExpectations> {
+        Ok(BundleExpectations::try_new(
+            self.expectations.model_id(),
+            self.expectations.bundle_id().clone(),
+            self.expectations.bundle_version(),
+            self.expectations.dataset().clone(),
+            self.expectations.universe_id().clone(),
+            self.expectations.training_period(),
+            self.expectations.label().clone(),
+            self.expectations.training_code_revision(),
+            bundle_metadata_hash,
+            artifact_hash,
+            self.expectations.training_run_hash(),
+        )?)
+    }
 }
 
 #[test]
@@ -317,6 +337,34 @@ fn bundle_hashes_and_resource_bounds_are_checked_before_use() -> TestResult {
     .ok_or_else(|| std::io::Error::other("wrong metadata hash was accepted"))?;
     assert_eq!(error, BundleError::MetadataHashMismatch);
 
+    let wrong_metadata_expectations = fixture.expectations_with_hashes(
+        Sha256Digest::new([9; 32]),
+        fixture.expectations.artifact_hash(),
+    )?;
+    let error = ModelBundle::load(
+        &fixture.root,
+        &fixture.reference,
+        &wrong_metadata_expectations,
+        &fixture.registry,
+    )
+    .err()
+    .ok_or_else(|| std::io::Error::other("unapproved metadata hash was accepted"))?;
+    assert_eq!(error, BundleError::MetadataHashMismatch);
+
+    let wrong_artifact_expectations = fixture.expectations_with_hashes(
+        fixture.expectations.bundle_metadata_hash(),
+        Sha256Digest::new([9; 32]),
+    )?;
+    let error = ModelBundle::load(
+        &fixture.root,
+        &fixture.reference,
+        &wrong_artifact_expectations,
+        &fixture.registry,
+    )
+    .err()
+    .ok_or_else(|| std::io::Error::other("unapproved artifact hash was accepted"))?;
+    assert_eq!(error, BundleError::ArtifactHashMismatch);
+
     let fixture = valid_fixture("native_linear", 1, 1, |_, _| {})?;
     let mut bytes = fs::read(fixture.artifact_path())?;
     let byte = bytes
@@ -428,6 +476,8 @@ fn valid_fixture_with_identity(
         period,
         label,
         "train-code-abc123",
+        Sha256Digest::new([3; 32]),
+        Sha256Digest::new([4; 32]),
         Sha256Digest::new([2; 32]),
     )?;
 
@@ -580,11 +630,14 @@ fn valid_fixture_with_identity(
         "trial_sha256": trial_sha256,
         "validation_metrics": metadata["validation_metrics"]
     }))?;
-    metadata["artifact"]["sha256"] = json!(hex(sha256(&artifact_bytes)));
+    let artifact_sha256 = sha256(&artifact_bytes);
+    metadata["artifact"]["sha256"] = json!(hex(artifact_sha256));
     metadata["artifact"]["size_bytes"] = json!(artifact_bytes.len());
-    metadata["training_run"]["sha256"] = json!(hex(sha256(&training_run_bytes)));
+    let training_run_sha256 = sha256(&training_run_bytes);
+    metadata["training_run"]["sha256"] = json!(hex(training_run_sha256));
     metadata["training_run"]["size_bytes"] = json!(training_run_bytes.len());
     let metadata_bytes = serde_json::to_vec(&metadata)?;
+    let bundle_metadata_sha256 = sha256(&metadata_bytes);
     let expectations = BundleExpectations::try_new(
         expectations.model_id(),
         expectations.bundle_id().clone(),
@@ -594,7 +647,9 @@ fn valid_fixture_with_identity(
         expectations.training_period(),
         expectations.label().clone(),
         expectations.training_code_revision(),
-        Sha256Digest::new(sha256(&training_run_bytes)),
+        Sha256Digest::new(bundle_metadata_sha256),
+        Sha256Digest::new(artifact_sha256),
+        Sha256Digest::new(training_run_sha256),
     )?;
     fs::write(temporary.path().join("artifact.json"), artifact_bytes)?;
     fs::write(

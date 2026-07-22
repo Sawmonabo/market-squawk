@@ -41,6 +41,7 @@ class TrainingBundleContracts(unittest.TestCase):
             tempfile.TemporaryDirectory() as authority_root,
             tempfile.TemporaryDirectory() as left,
             tempfile.TemporaryDirectory() as right,
+            tempfile.TemporaryDirectory() as rejected,
         ):
             digest = _fixture(Path(dataset_root))
             dataset = open_dataset(
@@ -66,6 +67,13 @@ class TrainingBundleContracts(unittest.TestCase):
                 "bundle-authority.json",
                 first_proposal.authority_sha256,
             )
+            with self.assertRaises(TypeError):
+                first_proposal.export(
+                    Path(rejected),
+                    authority,
+                    context=OperationContext(60_000, 1_000_000),
+                    validator="/tmp/fake-validator",
+                )
             first = first_proposal.export(
                 Path(left), authority, context=OperationContext(60_000, 1_000_000)
             )

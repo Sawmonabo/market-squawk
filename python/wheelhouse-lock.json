@@ -1032,13 +1032,13 @@
     },
     {
       "path": "crates/market-squawk-modeling/src/bin/market_squawk_model_validator.rs",
-      "sha256": "0ab42bc8cc5f40cc4dc799c8c85892342c69ad96e8e3b54d5b620fab33a5ae7a",
-      "size_bytes": 12697
+      "sha256": "edcfa15c651165336ee39265802dc4080f905088a943aede45f6f7494d562eba",
+      "size_bytes": 12893
     },
     {
       "path": "crates/market-squawk-modeling/src/bundle.rs",
-      "sha256": "5dd470afde7ffe386521140eb3055658e87132ba8a0a22f44a57b97124a33e96",
-      "size_bytes": 16526
+      "sha256": "9c2297921aa7cf36d42fe5ccbfc6870d1ffc0df4ea2f47d4aaf7450198d5f175",
+      "size_bytes": 16730
     },
     {
       "path": "crates/market-squawk-modeling/src/bundle/io.rs",
@@ -1062,8 +1062,8 @@
     },
     {
       "path": "crates/market-squawk-modeling/src/metadata.rs",
-      "sha256": "fc4625b50b4c12bf66df345767889ef351f8064c5847d90e33a0a3401acafbd5",
-      "size_bytes": 22585
+      "sha256": "d07758bcd0db4ba77f5024bd2df2e0799c3c1199fc4d086d6a870fc346a112b4",
+      "size_bytes": 23285
     },
     {
       "path": "crates/market-squawk-modeling/src/native.rs",
@@ -1422,8 +1422,8 @@
     },
     {
       "path": "crates/market-squawk-python/src/lib.rs",
-      "sha256": "994b7a99a08adbd76e3d8684c6e75b293d13180126dd5ba479a3a3e15f32026f",
-      "size_bytes": 4160
+      "sha256": "186d0764c6599c3b76e846f39fa8e511fdb3e603bcd726332e01f3efdf5536ad",
+      "size_bytes": 4785
     },
     {
       "path": "crates/market-squawk-sources/Cargo.toml",
@@ -1797,8 +1797,8 @@
     },
     {
       "path": "python/market_squawk/bundle.py",
-      "sha256": "5e84996698c7431001f5e83fad8ddab5c6775b55522d3cd0558a5f047b93ac6a",
-      "size_bytes": 9860
+      "sha256": "2325cdd50be02443318745391234b92a7d0268b17d7b7cde8d7644ce3fec1090",
+      "size_bytes": 13123
     },
     {
       "path": "python/market_squawk/data.py",
@@ -1812,8 +1812,8 @@
     },
     {
       "path": "python/market_squawk/training.py",
-      "sha256": "c1dd181b01a49584eadd864ed379a4fab489ddf0a3bfd8caca31bb9ff9d71327",
-      "size_bytes": 24881
+      "sha256": "8af47a57b5a13657f4390e9558a311e1f859a880b3690ea746679da500c7bfc5",
+      "size_bytes": 25242
     },
     {
       "path": "python/market_squawk/visualization.py",
@@ -1842,8 +1842,8 @@
     },
     {
       "path": "python/tests/test_training_bundle.py",
-      "sha256": "0b8eff7542e604c1444162552056ae1188d9999408ea206ff7692dba1d7ef89e",
-      "size_bytes": 5367
+      "sha256": "4aa12982b5d3c39d0bb213e5662a3ab69feaf2871ab78a7c71584660ae2612ea",
+      "size_bytes": 5711
     },
     {
       "path": "python/tests/test_visualization_examples.py",
@@ -1857,8 +1857,8 @@
     },
     {
       "path": "scripts/build_python_release.py",
-      "sha256": "5c50b2299ad9bc114d665e43399198d203cbb9d48c41d40dd89e4962d4dd4e6c",
-      "size_bytes": 45899
+      "sha256": "f2272aa7ba949f2b3e134dcfc354f4a1455fa6af51094d5451437584684a75c7",
+      "size_bytes": 46165
     },
     {
       "path": "scripts/tests/test_build_python_release.py",

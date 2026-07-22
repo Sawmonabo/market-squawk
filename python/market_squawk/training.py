@@ -42,21 +42,26 @@ class _FittedModel:
     metric_value: float
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class TrainingProposal:
     """Deterministic candidate awaiting independent operator/catalog authorization."""
 
     candidate: BundleCandidate
-    authority_request: Mapping[str, Any]
+    authority_bytes: bytes = field(repr=False)
+    authority_sha256: str
     dataset: DatasetResult = field(repr=False, compare=False)
 
-    @property
-    def authority_bytes(self) -> bytes:
-        return _canonical(self.authority_request)
-
-    @property
-    def authority_sha256(self) -> str:
-        return hashlib.sha256(self.authority_bytes).hexdigest()
+    def __init__(
+        self,
+        candidate: BundleCandidate,
+        authority_request: Mapping[str, Any],
+        dataset: DatasetResult,
+    ) -> None:
+        authority_bytes = _canonical(authority_request)
+        object.__setattr__(self, "candidate", candidate)
+        object.__setattr__(self, "authority_bytes", authority_bytes)
+        object.__setattr__(self, "authority_sha256", hashlib.sha256(authority_bytes).hexdigest())
+        object.__setattr__(self, "dataset", dataset)
 
     @property
     def training_run_sha256(self) -> str:
@@ -68,7 +73,6 @@ class TrainingProposal:
         authority: BundleAuthorityRef,
         *,
         context: OperationContext,
-        validator: Path | str | None = None,
     ) -> BundleReceipt:
         if authority.sha256 != self.authority_sha256:
             raise TrainingValidationError("operator authority does not match this proposal")
@@ -80,7 +84,6 @@ class TrainingProposal:
             output_root,
             authority,
             dataset_receipt=self.dataset._receipt,
-            validator=validator,
         )
 
 
@@ -209,10 +212,12 @@ class TrainingRun:
         }
         candidate = BundleCandidate(metadata, artifact, run_record)
         authority = {
-            "schema_version": 3,
+            "schema_version": 4,
             "model_id": self.model_id,
             "bundle_id": self.bundle_id,
             "bundle_version": self.bundle_version,
+            "bundle_metadata_sha256": candidate.metadata_sha256,
+            "artifact_sha256": candidate.artifact_sha256,
             "dataset": dict(config["dataset"]),
             "universe_id": self.dataset.universe_id,
             "training_period": period,

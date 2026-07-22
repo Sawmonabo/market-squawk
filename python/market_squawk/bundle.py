@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -19,6 +20,8 @@ from . import _native
 MAX_ARTIFACT_BYTES = 1024 * 1024
 MAX_METADATA_BYTES = 256 * 1024
 MAX_AUTHORITY_BYTES = 256 * 1024
+MAX_VALIDATOR_BYTES = 128 * 1024 * 1024
+VALIDATOR_READ_BYTES = 1024 * 1024
 
 
 class BundleExportError(ValueError):
@@ -69,15 +72,46 @@ class BundleAuthorityRef:
         return cls(authority_root.resolve(), relative_path, sha256)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class BundleCandidate:
-    metadata: Mapping[str, Any]
-    artifact: Mapping[str, Any]
-    run_record: Mapping[str, Any]
+    """Final immutable candidate bytes awaiting independent authorization."""
 
-    @property
-    def training_run_sha256(self) -> str:
-        return hashlib.sha256(_canonical(self.run_record, MAX_METADATA_BYTES)).hexdigest()
+    metadata_bytes: bytes = field(repr=False)
+    artifact_bytes: bytes = field(repr=False)
+    training_run_bytes: bytes = field(repr=False)
+    metadata_sha256: str
+    artifact_sha256: str
+    training_run_sha256: str
+
+    def __init__(
+        self,
+        metadata: Mapping[str, Any],
+        artifact: Mapping[str, Any],
+        run_record: Mapping[str, Any],
+    ) -> None:
+        artifact_bytes = _canonical(artifact, MAX_ARTIFACT_BYTES)
+        training_run_bytes = _canonical(run_record, MAX_METADATA_BYTES)
+        artifact_sha256 = hashlib.sha256(artifact_bytes).hexdigest()
+        training_run_sha256 = hashlib.sha256(training_run_bytes).hexdigest()
+        try:
+            finalized_metadata = dict(metadata)
+            finalized_artifact = dict(finalized_metadata["artifact"])
+            finalized_training_run = dict(finalized_metadata["training_run"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise BundleExportError("bundle metadata references are invalid") from error
+        finalized_artifact["sha256"] = artifact_sha256
+        finalized_artifact["size_bytes"] = len(artifact_bytes)
+        finalized_training_run["sha256"] = training_run_sha256
+        finalized_training_run["size_bytes"] = len(training_run_bytes)
+        finalized_metadata["artifact"] = finalized_artifact
+        finalized_metadata["training_run"] = finalized_training_run
+        metadata_bytes = _canonical(finalized_metadata, MAX_METADATA_BYTES)
+        object.__setattr__(self, "metadata_bytes", metadata_bytes)
+        object.__setattr__(self, "artifact_bytes", artifact_bytes)
+        object.__setattr__(self, "training_run_bytes", training_run_bytes)
+        object.__setattr__(self, "metadata_sha256", hashlib.sha256(metadata_bytes).hexdigest())
+        object.__setattr__(self, "artifact_sha256", artifact_sha256)
+        object.__setattr__(self, "training_run_sha256", training_run_sha256)
 
     def write(
         self,
@@ -85,7 +119,6 @@ class BundleCandidate:
         authority: BundleAuthorityRef,
         *,
         dataset_receipt: Any,
-        validator: Path | str | None = None,
     ) -> BundleReceipt:
         if type(dataset_receipt) is not _native.DatasetReceipt:
             raise BundleExportError("bundle publication requires a native dataset receipt")
@@ -102,29 +135,15 @@ class BundleCandidate:
             raise BundleExportError("bundle candidate generation already exists")
         temporary = Path(tempfile.mkdtemp(prefix=".candidate-", dir=output_root))
         try:
-            artifact_bytes = _canonical(self.artifact, MAX_ARTIFACT_BYTES)
-            artifact_sha256 = hashlib.sha256(artifact_bytes).hexdigest()
-            run_bytes = _canonical(self.run_record, MAX_METADATA_BYTES)
-            training_run_sha256 = hashlib.sha256(run_bytes).hexdigest()
-            metadata = dict(self.metadata)
-            metadata["artifact"] = dict(metadata["artifact"])
-            metadata["artifact"]["sha256"] = artifact_sha256
-            metadata["artifact"]["size_bytes"] = len(artifact_bytes)
-            metadata["training_run"] = dict(metadata["training_run"])
-            metadata["training_run"]["sha256"] = training_run_sha256
-            metadata["training_run"]["size_bytes"] = len(run_bytes)
-            metadata_bytes = _canonical(metadata, MAX_METADATA_BYTES)
-            metadata_sha256 = hashlib.sha256(metadata_bytes).hexdigest()
-            _write_exact(temporary / "artifact.json", artifact_bytes)
-            _write_exact(temporary / "bundle.json", metadata_bytes)
-            _write_exact(temporary / "training-run.json", run_bytes)
+            _write_exact(temporary / "artifact.json", self.artifact_bytes)
+            _write_exact(temporary / "bundle.json", self.metadata_bytes)
+            _write_exact(temporary / "training-run.json", self.training_run_bytes)
             _fsync_directory(temporary)
             _validate_with_rust(
                 temporary,
-                metadata_sha256,
+                self.metadata_sha256,
                 authority,
                 dataset_receipt,
-                validator,
             )
             os.replace(temporary, final)
             _fsync_directory(output_root)
@@ -133,9 +152,9 @@ class BundleCandidate:
                 metadata=final / "bundle.json",
                 artifact=final / "artifact.json",
                 run_record=final / "training-run.json",
-                metadata_sha256=metadata_sha256,
-                artifact_sha256=artifact_sha256,
-                training_run_sha256=training_run_sha256,
+                metadata_sha256=self.metadata_sha256,
+                artifact_sha256=self.artifact_sha256,
+                training_run_sha256=self.training_run_sha256,
                 authority_sha256=authority.sha256,
                 dataset_export_sha256=dataset_receipt.export_sha256,
                 dataset_selection_sha256=dataset_receipt.selection_sha256,
@@ -186,16 +205,64 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-def _validator_path(configured: Path | str | None) -> Path:
-    if configured is not None:
-        path = Path(configured)
-    else:
-        adjacent = Path(sys.executable).parent / "market-squawk-model-validator"
-        discovered = shutil.which("market-squawk-model-validator")
-        path = adjacent if adjacent.is_file() else Path(discovered) if discovered else adjacent
-    if path.is_symlink() or not path.is_file() or not os.access(path, os.X_OK):
-        raise BundleExportError("Rust model bundle validator is unavailable")
-    return path
+def _expected_validator_sha256() -> str:
+    try:
+        value = _native.expected_model_validator_sha256()
+    except Exception as error:
+        raise BundleExportError("native validator identity is unavailable") from error
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or value == "0" * 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise BundleExportError("native validator identity is invalid")
+    return value
+
+
+def _validator_digest(path: Path) -> str:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise BundleExportError("Rust model bundle validator is unavailable") from error
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_size <= 0
+            or before.st_size > MAX_VALIDATOR_BYTES
+            or before.st_mode & 0o111 == 0
+        ):
+            raise BundleExportError("Rust model bundle validator is not a bounded executable")
+        digest = hashlib.sha256()
+        observed = 0
+        while True:
+            chunk = os.read(descriptor, VALIDATOR_READ_BYTES)
+            if not chunk:
+                break
+            observed += len(chunk)
+            if observed > before.st_size or observed > MAX_VALIDATOR_BYTES:
+                raise BundleExportError("Rust model bundle validator changed during admission")
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+    except OSError as error:
+        raise BundleExportError("Rust model bundle validator could not be admitted") from error
+    finally:
+        os.close(descriptor)
+    identity_before = (before.st_dev, before.st_ino, before.st_mode, before.st_size, before.st_mtime_ns)
+    identity_after = (after.st_dev, after.st_ino, after.st_mode, after.st_size, after.st_mtime_ns)
+    if observed != before.st_size or identity_before != identity_after:
+        raise BundleExportError("Rust model bundle validator changed during admission")
+    return digest.hexdigest()
+
+
+def _validator_path() -> tuple[Path, str]:
+    expected_sha256 = _expected_validator_sha256()
+    path = Path(sys.executable).parent / "market-squawk-model-validator"
+    if _validator_digest(path) != expected_sha256:
+        raise BundleExportError("Rust model bundle validator identity mismatch")
+    return path, expected_sha256
 
 
 def _validate_with_rust(
@@ -203,10 +270,10 @@ def _validate_with_rust(
     metadata_sha256: str,
     authority: BundleAuthorityRef,
     dataset_receipt: Any,
-    configured_validator: Path | str | None,
 ) -> None:
+    validator, validator_sha256 = _validator_path()
     command = [
-        str(_validator_path(configured_validator)),
+        str(validator),
         "--root",
         str(root),
         "--metadata",
@@ -238,9 +305,14 @@ def _validate_with_rust(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=30,
+            env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin", "TZ": "UTC"},
         )
     except (OSError, subprocess.TimeoutExpired) as error:
+        if _validator_digest(validator) != validator_sha256:
+            raise BundleExportError("Rust model bundle validator identity changed") from error
         raise BundleExportError("Rust model bundle validation could not complete") from error
+    if _validator_digest(validator) != validator_sha256:
+        raise BundleExportError("Rust model bundle validator identity changed")
     if completed.returncode != 0 or len(completed.stdout) > 4096 or len(completed.stderr) > 4096:
         raise BundleExportError("Rust model bundle validation rejected the candidate")
     try:

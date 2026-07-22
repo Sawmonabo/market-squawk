@@ -39,6 +39,8 @@ struct ExpectationsWire {
     training_period: PeriodWire,
     label: LabelWire,
     training_code_revision: String,
+    bundle_metadata_sha256: String,
+    artifact_sha256: String,
     training_run_sha256: String,
 }
 
@@ -226,7 +228,7 @@ fn expectations(
     wire: &ExpectationsWire,
     selection: &PythonDatasetSelection,
 ) -> Result<BundleExpectations, ()> {
-    if wire.schema_version != 3
+    if wire.schema_version != 4
         || wire.label.kind != "label"
         || !dataset_matches_selection(&wire.dataset, selection)?
         || wire.universe_id != selection.identity().universe_id().as_str()
@@ -278,6 +280,8 @@ fn expectations(
         .map_err(|_| ())?,
         label,
         &wire.training_code_revision,
+        Sha256Digest::new(parse_hex(&wire.bundle_metadata_sha256)?),
+        Sha256Digest::new(parse_hex(&wire.artifact_sha256)?),
         Sha256Digest::new(parse_hex(&wire.training_run_sha256)?),
     )
     .map_err(|_| ())

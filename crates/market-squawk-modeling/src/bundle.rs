@@ -130,7 +130,9 @@ impl ModelBundle {
             BundleError::MetadataTooLarge,
         )?;
         let metadata_hash = sha256_digest(&metadata_bytes);
-        if metadata_hash != reference.content_hash() {
+        if metadata_hash != reference.content_hash()
+            || metadata_hash != expectations.bundle_metadata_hash()
+        {
             return Err(BundleError::MetadataHashMismatch);
         }
         validate_json_structure(&metadata_bytes)
@@ -159,6 +161,9 @@ impl ModelBundle {
             return Err(BundleError::UnsupportedFormatVersion);
         }
         let artifact_hash = parse_digest(&wire.artifact.sha256)?;
+        if artifact_hash != expectations.artifact_hash() {
+            return Err(BundleError::ArtifactHashMismatch);
+        }
         let artifact_reference = BundleMetadataRef::try_new(&wire.artifact.path, artifact_hash)?;
         let expected_artifact_size =
             usize::try_from(wire.artifact.size_bytes).map_err(|_| BundleError::ArtifactTooLarge)?;
