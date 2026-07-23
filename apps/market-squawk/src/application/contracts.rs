@@ -3,6 +3,7 @@
 use std::collections::HashSet;
 
 use chrono::DateTime;
+use market_squawk_execution::MAX_PAPER_FEE_BASIS_POINTS;
 use market_squawk_services::{
     ScopeRequirement, ServiceCapabilities, ServiceCapabilityError, ServiceDomain,
     SourceEvidencePolicy, ToolArtifactPolicy, ToolAuthorization, ToolContract, ToolDescriptor,
@@ -126,7 +127,7 @@ const BOT_START_ARGUMENTS: &[ArgumentSpec] = &[
         "feeBasisPoints",
         ArgumentKind::Unsigned {
             minimum: 0,
-            maximum: 10_000,
+            maximum: MAX_PAPER_FEE_BASIS_POINTS,
         },
     ),
 ];
