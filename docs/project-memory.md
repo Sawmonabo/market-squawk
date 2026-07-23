@@ -501,9 +501,15 @@ remain unchanged. The grouped review of frozen exact head `797a359` accepted the
 cross-plane boundaries with zero finding but rejected the portfolio slice on three Important
 defects: reporting currency is absent from the immutable revision digest; Attribution and Risk do
 not admit complete aggregate work or consistently enforce the instrument ceiling; and Exposure's
-temporary `BTreeMap` nodes allocate infallibly. One grouped portfolio remediation must close those
-three defects, after which the corrected exact head requires portfolio and cross-plane rereview.
-The root full gate remains prohibited until that review accepts the candidate.
+temporary `BTreeMap` nodes allocate infallibly. One grouped portfolio lane closed those defects at
+integrated head `e468d01`: revision identity v3 binds reporting currency plus schema name, version,
+and fingerprint; Attribution and Risk admit complete aggregate work and instrument counts; and
+Exposure uses fallibly reserved deterministic vectors with UTF-8-safe in-place ASCII
+normalization. The first task review found omitted schema name/version and byte-wise UTF-8
+corruption; the follow-up fixed both, and exact-head rereview accepted with zero finding. The fresh
+integrated portfolio harness passed 15/15. The corrected exact head now requires portfolio and
+cross-plane Quarter 3 rereview. The root full gate remains prohibited until that review accepts the
+candidate.
 
 Task 15 provides required zero-service ONNX inference through the self-contained Rust
 `TractOnnxBackend`. It admits exact bounded graphs and tensors, runs through a bounded model-owned
@@ -539,3 +545,8 @@ canonical plan defines the final delivery
 quarter as Tasks 19, 19A and 20, preserves the descriptor-driven shared CLI/MCP architecture, adds
 the evidence-bound local onboarding portal, and rejects redundant standalone test executables and
 checker scripts.
+
+The portfolio revision/resource closeout fast-forwarded the exact two-commit lane through
+`e468d01`, reclaimed its 1.7 GiB generated target, removed its clean worktree, deleted the merged
+local product branch, confirmed no matching origin branch existed, and pruned metadata. Only the
+release worktree remains; the protected stashes, `bundle-backup`, and Dependabot refs remain intact.

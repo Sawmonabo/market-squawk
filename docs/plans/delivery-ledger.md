@@ -22,10 +22,15 @@ evidence; it does not replace the README capability truth or the canonical relea
   `797a359` accepted the backtest slice and cross-plane boundaries with no finding, but rejected the
   portfolio slice on three Important blockers: the immutable revision identity omits base currency,
   Attribution and Risk omit complete aggregate-work and instrument admissions, and Exposure still
-  uses infallibly allocating temporary maps. One cohesive portfolio lane must close those exact
-  blockers before a new frozen-head review. The proposed coupling of a pure cohort plan to one
-  inventory's configured trial limit remains rejected as a layering regression. No rejected
-  candidate received or may receive the clean full gate.
+  uses infallibly allocating temporary maps. One cohesive portfolio lane closed those blockers at
+  integrated exact head `e468d01`: revision v3 binds reporting currency and the complete retained
+  schema identity, Attribution and Risk admit aggregate work and instrument counts, and Exposure
+  uses fallibly reserved deterministic vectors with UTF-8-safe key normalization. Independent task
+  rereview accepted the exact head with no finding, and the fresh integrated portfolio harness
+  passed 15/15. A corrected frozen-head Quarter 3 portfolio and cross-plane rereview is now required.
+  The proposed coupling of a pure cohort plan to one inventory's configured trial limit remains
+  rejected as a layering regression. No rejected candidate received or may receive the clean full
+  gate.
 - Task 14 accepted feature and fast-forwarded release head: `02ab5cd`
 - Task 18 release merge head: `051ee3c`; reconciled lock head: `5c34b7d`
 - Task 13 accepted feature and release head: `59ba05c`
@@ -86,8 +91,12 @@ evidence; it does not replace the README capability truth or the canonical relea
   review found three remaining cross-contract defects outside that focused acceptance: reporting
   currency is absent from revision identity, Attribution and Risk do not bound their total temporary
   and result work under one checked admission or consistently enforce `max_instruments`, and
-  Exposure's temporary `BTreeMap` nodes allocate infallibly. Task 16 remains rejected until those
-  three defects are fixed and the corrected exact candidate is independently accepted.
+  Exposure's temporary `BTreeMap` nodes allocate infallibly. The grouped correction is integrated
+  through `e468d01`. Its first task review found omitted retained-schema identity and unsafe UTF-8
+  byte lowercasing; both were fixed without adding a test target, and exact-head rereview accepted
+  the two-commit lane with no remaining finding. The fresh integrated consolidated portfolio gate
+  passed 15/15. The 1.7 GiB generated target, clean worktree, and merged local branch were removed;
+  no matching origin branch existed.
 - Task 18 owner: GitHub issue `#23`, Project 5, status `Done`.
 - Delivered at accepted feature head `31de1a5`: nonforgeable producer receipts; point-in-time market
   activity and evidence admission; strict Level 1 classification; usable Level 2/Level 3 input
@@ -140,10 +149,9 @@ evidence; it does not replace the README capability truth or the canonical relea
   minting, public backtest admission, strategy-visible revisions, and exact receipt coverage.
   Independent task review approved the final lane with no remaining finding. Fresh integrated
   gates passed catalog 3/3, backtesting 12/12, and the filtered application vertical 1/1.
-- The next barrier is one cohesive portfolio remediation for the three exact-head findings,
-  followed by a corrected frozen-head portfolio and cross-plane rereview. Only after that review
-  accepts the candidate will the integration owner clean the root target and run one
-  `CARGO_INCREMENTAL=0 ./scripts/verify.sh` gate. Tasks 15–17 remain open until the grouped
+- The next barrier is a corrected frozen-head Quarter 3 portfolio and cross-plane rereview. Only
+  after that review accepts the candidate will the integration owner clean the root target and run
+  one `CARGO_INCREMENTAL=0 ./scripts/verify.sh` gate. Tasks 15–17 remain open until the grouped
   checkpoint passes; focused evidence does not substitute for it.
 
 - Task 12 owner: GitHub issue `#17`, Project 5, status `Done`.
@@ -274,8 +282,13 @@ application size.
   local feature branches, confirmed no matching origin branches existed, and pruned worktree and
   remote metadata. Only the release worktree remains; the three protected stashes,
   `bundle-backup`, and Dependabot branches remain intact.
+- Integrated the independently accepted portfolio revision/resource series unchanged through
+  `e468d01`; the fresh consolidated portfolio gate passed 15/15. Reclaimed 1.7 GiB of generated
+  target state, removed the clean `.worktrees/portfolio-revision-resource-authority` worktree,
+  deleted the merged local product branch, confirmed no matching origin branch existed, and pruned
+  worktree and remote metadata. Only the release worktree remains.
 
-The next delivery event is the grouped portfolio identity, aggregate-work, and fallible-allocation
-remediation followed by a corrected exact-candidate rereview. If it accepts the candidate, one clean
-full gate will run; only then may issues `#20`, `#21`, and `#22` close and Tasks 19, 19A, and 20
-begin. Integrated Tasks 13–18 do not claim that the Market Squawk product release is complete.
+The next delivery event is the corrected frozen-head Quarter 3 portfolio and cross-plane rereview.
+If it accepts the candidate, one clean full gate will run; only then may issues `#20`, `#21`, and
+`#22` close and Tasks 19, 19A, and 20 begin. Integrated Tasks 13–18 do not claim that the Market
+Squawk product release is complete.
