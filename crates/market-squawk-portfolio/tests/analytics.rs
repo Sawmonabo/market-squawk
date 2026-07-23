@@ -307,6 +307,44 @@ fn analytics_work_is_rejected_before_report_allocation() -> TestResult {
 }
 
 #[test]
+fn exposure_rejects_factor_index_before_report_allocation() -> TestResult {
+    let revision = analytics_revision()?;
+    let evidence = analytics_evidence(&revision, 4, 4)?;
+    let usd = Currency::try_from("USD")?;
+    let limits = analytics_limits(1, 16, 128, 1024 * 1024)?;
+    let classification = |marker, sector, issuer, venue| -> TestResultClassification {
+        Ok(InstrumentClassification::try_new(
+            instrument(marker)?,
+            source(sector)?,
+            source(issuer)?,
+            VenueId::try_from(venue)?,
+            usd,
+            vec![FactorLoading::try_new(
+                FeatureKey::try_new("market.beta", NonZeroU32::MIN)?,
+                ExactRate::try_new(Decimal::ONE, ExactDecimalScale::Unit)?,
+            )?],
+            limits,
+        )?)
+    };
+    let classifications = [
+        classification(1, "technology", "issuer-a", "XNAS")?,
+        classification(2, "financials", "issuer-b", "XNYS")?,
+    ];
+
+    assert!(matches!(
+        ExposureReport::try_calculate(&revision, &evidence, &classifications, limits),
+        Err(PortfolioError::LimitExceeded {
+            resource: "factor occurrences",
+            observed: 2,
+            limit: 1,
+        })
+    ));
+    Ok(())
+}
+
+type TestResultClassification = Result<InstrumentClassification, Box<dyn Error>>;
+
+#[test]
 fn analytics_reports_are_policy_explicit_bounded_and_revision_bound() -> TestResult {
     let revision = analytics_revision()?;
     let evidence = analytics_evidence(&revision, 4, 4)?;

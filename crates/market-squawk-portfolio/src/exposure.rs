@@ -205,6 +205,13 @@ impl ExposureReport {
                     }
                     checked_usize_add(total, classification.factors.len())
                 })?;
+        if factor_occurrences > limits.max_factors {
+            return Err(PortfolioError::LimitExceeded {
+                resource: "factor occurrences",
+                observed: factor_occurrences,
+                limit: limits.max_factors,
+            });
+        }
         if factor_occurrences > limits.max_results {
             return Err(PortfolioError::LimitExceeded {
                 resource: "factor occurrences",
@@ -220,10 +227,15 @@ impl ExposureReport {
                 limit: limits.max_results,
             });
         }
-        let work_rows = checked_usize_add(
-            checked_usize_add(worst_lines, positions)?,
+        let factor_index_rows = factor_occurrences;
+        let work_rows = [
+            worst_lines,
+            positions,
             classifications.len(),
-        )?;
+            factor_index_rows,
+        ]
+        .into_iter()
+        .try_fold(0_usize, checked_usize_add)?;
         if work_rows > limits.max_results {
             return Err(PortfolioError::LimitExceeded {
                 resource: "exposure work",
