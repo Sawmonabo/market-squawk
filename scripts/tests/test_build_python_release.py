@@ -59,6 +59,11 @@ class PythonReleaseBuilderContracts(unittest.TestCase):
             with self.assertRaises(builder.ReleaseBuildError):
                 builder.load_lock(lock_path)
 
+    def test_repository_lock_admits_the_complete_source_closure(self) -> None:
+        lock = builder.load_lock(ROOT / "python" / "wheelhouse-lock.json")
+
+        builder.admit_sources(lock, ROOT)
+
     def test_offline_admission_never_fetches_a_missing_wheel(self) -> None:
         lock = builder.ReleaseLock.for_test(
             filename="fixture-1.0-py3-none-any.whl",
