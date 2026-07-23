@@ -767,6 +767,8 @@ pub enum ExecutionDispatchError {
     PendingReconciliationCapacity,
     #[error("execution operation exceeded its monotonic deadline")]
     OperationDeadlineExceeded,
+    #[error("execution operation was cancelled by its caller")]
+    OperationCancelled,
     #[error("execution task ownership capacity is saturated")]
     TaskOwnershipUnavailable,
     #[error(transparent)]
@@ -800,10 +802,60 @@ fn operation(
     deadline: Duration,
     cancellation: CancellationToken,
 ) -> Result<ExecutionOperation, ExecutionDispatchError> {
-    let deadline = tokio::time::Instant::now()
-        .checked_add(deadline)
+    operation_with_caller(deadline, cancellation, None)
+}
+
+fn operation_with_caller(
+    maximum_duration: Duration,
+    cancellation: CancellationToken,
+    caller: Option<&CallerExecutionControl>,
+) -> Result<ExecutionOperation, ExecutionDispatchError> {
+    let now = tokio::time::Instant::now();
+    let configured_deadline = now
+        .checked_add(maximum_duration)
         .ok_or(ExecutionDispatchError::OperationDeadlineExceeded)?;
-    Ok(ExecutionOperation::new(deadline, cancellation))
+    let Some(caller) = caller else {
+        return Ok(ExecutionOperation::new(configured_deadline, cancellation));
+    };
+    if caller.cancellation.is_cancelled() {
+        return Err(ExecutionDispatchError::OperationCancelled);
+    }
+    if caller.deadline <= now {
+        return Err(ExecutionDispatchError::OperationDeadlineExceeded);
+    }
+    Ok(ExecutionOperation::new_with_caller(
+        configured_deadline.min(caller.deadline),
+        cancellation,
+        caller.cancellation.child_token(),
+    ))
+}
+
+#[derive(Clone, Debug)]
+struct CallerExecutionControl {
+    deadline: tokio::time::Instant,
+    cancellation: CancellationToken,
+}
+
+impl CallerExecutionControl {
+    fn try_new(
+        deadline: tokio::time::Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Self, ExecutionDispatchError> {
+        if cancellation.is_cancelled() {
+            return Err(ExecutionDispatchError::OperationCancelled);
+        }
+        if deadline <= tokio::time::Instant::now() {
+            return Err(ExecutionDispatchError::OperationDeadlineExceeded);
+        }
+        Ok(Self {
+            deadline,
+            cancellation: cancellation.child_token(),
+        })
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancellation.is_cancelled()
+    }
 }
 
 /// Bounded worker shutdown outcome.
@@ -826,11 +878,32 @@ pub enum ExecutionDispatcherQuiesce {
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr as _;
+    use std::{str::FromStr as _, time::Duration};
 
     use market_squawk_domain::OrderId;
+    use tokio_util::sync::CancellationToken;
 
-    use super::{PendingReconciliationScope, reconciliation_scope};
+    use super::{
+        CallerExecutionControl, PendingReconciliationScope, operation_with_caller,
+        reconciliation_scope,
+    };
+
+    #[test]
+    fn caller_control_narrows_and_cancels_the_private_operation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let cancellation = CancellationToken::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let control = CallerExecutionControl::try_new(deadline, &cancellation)?;
+        let operation = operation_with_caller(
+            Duration::from_secs(2),
+            CancellationToken::new(),
+            Some(&control),
+        )?;
+        cancellation.cancel();
+
+        assert!(operation.deadline() == deadline && operation.is_cancelled());
+        Ok(())
+    }
 
     #[test]
     fn only_complete_account_reconciliation_may_acknowledge_a_financial_sequence()

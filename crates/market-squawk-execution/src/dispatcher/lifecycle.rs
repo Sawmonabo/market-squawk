@@ -5,13 +5,15 @@ mod cancel;
 use std::sync::{Arc, Mutex};
 
 use market_squawk_domain::{ApprovalId, OrderId, Timestamp};
+use tokio_util::sync::CancellationToken;
 
 use super::attempt::attempt_adapter_call;
 use super::{
-    DispatchOutcomeFailSafe, DispatchRecord, DispatchRegistry, DispatchReservation, DispatchState,
-    ExecutionDispatchError, ExecutionDispatcher, ExecutionDispatcherQuiesce,
-    ExecutionDispatcherShutdown, PendingReconciliation, PendingReconciliationScope,
-    PendingReconciliationStatus, adapter_reason, commit_dispatch_audit, try_registry,
+    CallerExecutionControl, DispatchOutcomeFailSafe, DispatchRecord, DispatchRegistry,
+    DispatchReservation, DispatchState, ExecutionDispatchError, ExecutionDispatcher,
+    ExecutionDispatcherQuiesce, ExecutionDispatcherShutdown, PendingReconciliation,
+    PendingReconciliationScope, PendingReconciliationStatus, adapter_reason, commit_dispatch_audit,
+    try_registry,
 };
 use crate::audit::{ExecutionAuditContext, ExecutionAuditPermit};
 use crate::clock::system_now;
@@ -160,12 +162,32 @@ impl ExecutionDispatcher {
     /// Fill-bearing outcomes remain reconciliation-required until authoritative account state is
     /// replaced with matching balances, positions, fees, and revision.
     pub async fn reconcile(&self) -> Result<ExecutionState, ExecutionDispatchError> {
+        self.reconcile_inner(None).await
+    }
+
+    /// Reconciles tracked orders under an earlier caller deadline and cancellation signal.
+    ///
+    /// The caller bound applies to backend observation and its required persistence
+    /// acknowledgement, and may never extend the configured dispatcher lifetime.
+    pub async fn reconcile_before(
+        &self,
+        deadline: tokio::time::Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<ExecutionState, ExecutionDispatchError> {
+        let control = CallerExecutionControl::try_new(deadline, cancellation)?;
+        self.reconcile_inner(Some(control)).await
+    }
+
+    async fn reconcile_inner(
+        &self,
+        control: Option<CallerExecutionControl>,
+    ) -> Result<ExecutionState, ExecutionDispatchError> {
         let has_pending = {
             let registry = try_registry(&self.registry)?;
             registry.pending_reconciliation.is_some()
         };
         if has_pending {
-            return self.retry_pending_reconciliation().await;
+            return self.retry_pending_reconciliation(control.as_ref()).await;
         }
         let task_permit = self.try_reserve_adapter_task()?;
         let (admissions, order_ids, invoked) = {
@@ -276,9 +298,10 @@ impl ExecutionDispatcher {
             (admissions, order_ids, invoked)
         };
 
-        let operation = super::operation(
+        let operation = super::operation_with_caller(
             self.operation_deadline,
             self.control_cancellation.child_token(),
+            control.as_ref(),
         )?;
         let deadline = operation.deadline();
         let cancellation = operation.cancellation();
@@ -291,6 +314,18 @@ impl ExecutionDispatcher {
             move |adapter| async move { adapter.reconcile(request).await },
         )
         .await;
+        if control
+            .as_ref()
+            .is_some_and(CallerExecutionControl::is_cancelled)
+        {
+            cancellation.cancel();
+            fail_all(
+                admissions,
+                invoked.wall,
+                ExecutionAuditReason::ReconciliationRequired,
+            );
+            return Err(ExecutionDispatchError::OperationCancelled);
+        }
         if deadline_exceeded {
             fail_all(
                 admissions,
@@ -353,6 +388,18 @@ impl ExecutionDispatcher {
                 return Err(ExecutionDispatchError::ClockUnavailable);
             }
         };
+        if control
+            .as_ref()
+            .is_some_and(CallerExecutionControl::is_cancelled)
+        {
+            cancellation.cancel();
+            fail_all(
+                admissions,
+                post_call.wall,
+                ExecutionAuditReason::ReconciliationRequired,
+            );
+            return Err(ExecutionDispatchError::OperationCancelled);
+        }
         if cancellation.is_cancelled() || tokio::time::Instant::now() >= deadline {
             cancellation.cancel();
             fail_all(
@@ -476,6 +523,19 @@ impl ExecutionDispatcher {
                     return Err(ExecutionDispatchError::PendingReconciliationCapacity);
                 }
             };
+            if control
+                .as_ref()
+                .is_some_and(CallerExecutionControl::is_cancelled)
+            {
+                cancellation.cancel();
+                drop(registry);
+                fail_all(
+                    admissions,
+                    post_call.wall,
+                    ExecutionAuditReason::ReconciliationRequired,
+                );
+                return Err(ExecutionDispatchError::OperationCancelled);
+            }
             if cancellation.is_cancelled() || tokio::time::Instant::now() >= deadline {
                 cancellation.cancel();
                 drop(registry);
@@ -557,7 +617,7 @@ impl ExecutionDispatcher {
                 .retain(|_, record| record.state != DispatchState::Terminal);
             registry.pending_reconciliation = Some(pending);
         }
-        self.retry_pending_reconciliation().await
+        self.retry_pending_reconciliation(control.as_ref()).await
     }
 
     /// Reconciles complete backend account state when no accepted-order reservation can serve as
@@ -569,7 +629,7 @@ impl ExecutionDispatcher {
             registry.pending_reconciliation.is_some()
         };
         if has_pending {
-            return self.retry_pending_reconciliation().await;
+            return self.retry_pending_reconciliation(None).await;
         }
         let task_permit = self.try_reserve_adapter_task()?;
         let invoked = system_now().map_err(|_| ExecutionDispatchError::ClockUnavailable)?;
@@ -628,10 +688,13 @@ impl ExecutionDispatcher {
             }
             registry.pending_reconciliation = Some(pending);
         }
-        self.retry_pending_reconciliation().await
+        self.retry_pending_reconciliation(None).await
     }
 
-    async fn retry_pending_reconciliation(&self) -> Result<ExecutionState, ExecutionDispatchError> {
+    async fn retry_pending_reconciliation(
+        &self,
+        control: Option<&CallerExecutionControl>,
+    ) -> Result<ExecutionState, ExecutionDispatchError> {
         let task_permit = self.try_reserve_adapter_task()?;
         let (batch, order_ids) = {
             let mut registry = try_registry(&self.registry)?;
@@ -658,9 +721,10 @@ impl ExecutionDispatcher {
             pending.status = PendingReconciliationStatus::InFlight;
             (pending.batch, order_ids.into_boxed_slice())
         };
-        let operation = match super::operation(
+        let operation = match super::operation_with_caller(
             self.operation_deadline,
             self.control_cancellation.child_token(),
+            control,
         ) {
             Ok(operation) => operation,
             Err(error) => {
@@ -679,7 +743,17 @@ impl ExecutionDispatcher {
             move |adapter| async move { adapter.acknowledge_reconciliation(acknowledgement).await },
         )
         .await;
+        if control.is_some_and(CallerExecutionControl::is_cancelled) {
+            cancellation.cancel();
+            restore_pending_acknowledgement(&self.registry, batch);
+            return Err(ExecutionDispatchError::OperationCancelled);
+        }
         if deadline_exceeded {
+            restore_pending_acknowledgement(&self.registry, batch);
+            return Err(ExecutionDispatchError::OperationDeadlineExceeded);
+        }
+        if cancellation.is_cancelled() || tokio::time::Instant::now() >= deadline {
+            cancellation.cancel();
             restore_pending_acknowledgement(&self.registry, batch);
             return Err(ExecutionDispatchError::OperationDeadlineExceeded);
         }

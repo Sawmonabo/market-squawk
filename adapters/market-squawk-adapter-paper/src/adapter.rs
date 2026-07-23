@@ -41,6 +41,17 @@ impl PaperControlContext {
         let deadline = tokio::time::Instant::now()
             .checked_add(timeout)
             .ok_or(PaperControlError::InvalidDeadline)?;
+        Self::try_new_before(deadline, cancellation)
+    }
+
+    /// Creates one bounded control lifetime ending at an absolute monotonic deadline.
+    pub fn try_new_before(
+        deadline: tokio::time::Instant,
+        cancellation: CancellationToken,
+    ) -> Result<Self, PaperControlError> {
+        if deadline <= tokio::time::Instant::now() {
+            return Err(PaperControlError::InvalidDeadline);
+        }
         Ok(Self {
             deadline,
             cancellation,

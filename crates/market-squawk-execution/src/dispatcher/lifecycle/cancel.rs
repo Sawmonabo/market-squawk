@@ -8,8 +8,8 @@ use super::LifecycleOutcomeFailSafe;
 use crate::clock::system_now;
 use crate::dispatcher::attempt::attempt_adapter_call;
 use crate::dispatcher::{
-    DispatchRecord, DispatchState, ExecutionDispatchError, ExecutionDispatcher, adapter_reason,
-    commit_dispatch_audit, try_registry,
+    CallerExecutionControl, DispatchRecord, DispatchState, ExecutionDispatchError,
+    ExecutionDispatcher, adapter_reason, commit_dispatch_audit, try_registry,
 };
 use crate::{
     CancelOrder, CancelReceipt, CancelStatus, ExecutionAdapterError, ExecutionAuditKind,
@@ -19,6 +19,32 @@ use crate::{
 impl ExecutionDispatcher {
     /// Cancels a tracked accepted order without exposing the adapter.
     pub async fn cancel(&self, order_id: OrderId) -> Result<CancelReceipt, ExecutionDispatchError> {
+        self.cancel_inner(order_id, None).await
+    }
+
+    /// Cancels a tracked accepted order under an earlier caller deadline and cancellation signal.
+    ///
+    /// The caller bound may narrow but never extend the dispatcher-configured operation lifetime.
+    pub async fn cancel_before(
+        &self,
+        order_id: OrderId,
+        deadline: tokio::time::Instant,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<CancelReceipt, ExecutionDispatchError> {
+        let control = CallerExecutionControl::try_new(deadline, cancellation)?;
+        self.cancel_inner(order_id, Some(control)).await
+    }
+
+    async fn cancel_inner(
+        &self,
+        order_id: OrderId,
+        control: Option<CallerExecutionControl>,
+    ) -> Result<CancelReceipt, ExecutionDispatchError> {
+        let operation = super::super::operation_with_caller(
+            self.operation_deadline,
+            self.control_cancellation.child_token(),
+            control.as_ref(),
+        )?;
         let task_permit = self.try_reserve_adapter_task()?;
         let audit = self
             .audit
@@ -64,10 +90,6 @@ impl ExecutionDispatcher {
             (fail_safe, invoked)
         };
         let (fail_safe, invoked) = fail_safe;
-        let operation = super::super::operation(
-            self.operation_deadline,
-            self.control_cancellation.child_token(),
-        )?;
         let deadline = operation.deadline();
         let cancellation = operation.cancellation();
         let (result, deadline_exceeded) =
@@ -81,6 +103,17 @@ impl ExecutionDispatcher {
                 },
             )
             .await;
+        if control
+            .as_ref()
+            .is_some_and(CallerExecutionControl::is_cancelled)
+        {
+            cancellation.cancel();
+            fail_safe.fail_uncertain(
+                invoked.wall,
+                &[ExecutionAuditReason::ReconciliationRequired],
+            );
+            return Err(ExecutionDispatchError::OperationCancelled);
+        }
         if deadline_exceeded {
             fail_safe.fail_uncertain(
                 invoked.wall,
@@ -99,6 +132,17 @@ impl ExecutionDispatcher {
                 return Err(ExecutionDispatchError::ClockUnavailable);
             }
         };
+        if control
+            .as_ref()
+            .is_some_and(CallerExecutionControl::is_cancelled)
+        {
+            cancellation.cancel();
+            fail_safe.fail_uncertain(
+                post_call.wall,
+                &[ExecutionAuditReason::ReconciliationRequired],
+            );
+            return Err(ExecutionDispatchError::OperationCancelled);
+        }
         if cancellation.is_cancelled() || tokio::time::Instant::now() >= deadline {
             cancellation.cancel();
             fail_safe.fail_uncertain(

@@ -15,7 +15,12 @@ pub use audit::{
     ProductionAuditShutdown, ProductionAuditShutdownStatus,
 };
 
-use std::{num::NonZeroUsize, sync::Arc, time::Duration};
+use std::{
+    future::Future,
+    num::NonZeroUsize,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use market_squawk_adapter_paper::{
     PaperAccountBootstrap, PaperAccountReplaySnapshot, PaperCheckpointError,
@@ -24,12 +29,14 @@ use market_squawk_adapter_paper::{
     PaperStartError,
 };
 use market_squawk_analytics::RequiredLiveFeature;
+use market_squawk_domain::OrderId;
 use market_squawk_execution::{
     AccountBootstrap, AccountCoordinatorConfig, AccountCoordinatorError, AccountRecoveryBootstrap,
-    AccountRiskCoordinator, ExecutionAdapter, ExecutionAuditConfig, ExecutionAuditError,
-    ExecutionAuditWriter, ExecutionDispatcher, ExecutionDispatcherConfig, ExecutionDispatcherError,
-    ExecutionDispatcherQuiesce, ExecutionDispatcherShutdown, ExecutionLiveActionHook,
-    ExecutionLiveActionHookError, ExecutionMarketSink, ExecutionTaskDrain, ExecutionTaskReaper,
+    AccountRiskCoordinator, CancelReceipt, ExecutionAdapter, ExecutionAuditConfig,
+    ExecutionAuditError, ExecutionAuditWriter, ExecutionDispatchError, ExecutionDispatcher,
+    ExecutionDispatcherConfig, ExecutionDispatcherError, ExecutionDispatcherQuiesce,
+    ExecutionDispatcherShutdown, ExecutionLiveActionHook, ExecutionLiveActionHookError,
+    ExecutionMarketSink, ExecutionState, ExecutionTaskDrain, ExecutionTaskReaper,
     ExecutionTaskReaperError, PortfolioReadCapability, ReconciledOrderStatus,
     RecoveredDispatchOrder, RiskLimits, RiskService, RiskServiceConfig, RiskServiceError, Strategy,
 };
@@ -678,6 +685,90 @@ impl ProductionPaperBotRuntime {
         self.accounts.reconciliation_fence().is_current()
     }
 
+    /// Returns a complete paper state image without exposing the paper adapter.
+    ///
+    /// The effective deadline is the earlier of the caller deadline and the startup-configured
+    /// paper control bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProductionPaperControlError::Cancelled`] when caller cancellation wins,
+    /// [`ProductionPaperControlError::DeadlineExceeded`] when either deadline expires, or the
+    /// bounded paper-worker failure otherwise.
+    pub async fn paper_snapshot(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<PaperExecutionSnapshot, ProductionPaperControlError> {
+        let deadline =
+            bounded_paper_control_deadline(self.paper_control_timeout, deadline, cancellation)?;
+        let control = PaperControlContext::try_new_before(
+            tokio::time::Instant::from_std(deadline),
+            cancellation.child_token(),
+        )?;
+        let adapter = self.paper.adapter();
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => Err(ProductionPaperControlError::Cancelled),
+            () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                Err(ProductionPaperControlError::DeadlineExceeded)
+            }
+            result = adapter.snapshot(control) => result.map_err(Into::into),
+        }
+    }
+
+    /// Cancels one accepted order already tracked by the risk-enforced dispatcher.
+    ///
+    /// Caller cancellation or deadline expiry never transfers execution authority. If either wins
+    /// after lifecycle admission, the dispatcher's armed fail-safe marks the order for
+    /// reconciliation before this future returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded control error or the exact dispatcher rejection. An untracked order is
+    /// rejected by the dispatcher and no adapter-specific cancellation surface is available.
+    pub async fn cancel_tracked_order(
+        &self,
+        order_id: OrderId,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<CancelReceipt, ProductionPaperControlError> {
+        let deadline =
+            bounded_paper_control_deadline(self.paper_control_timeout, deadline, cancellation)?;
+        await_paper_dispatch(
+            self.dispatcher.cancel_before(
+                order_id,
+                tokio::time::Instant::from_std(deadline),
+                cancellation,
+            ),
+            deadline,
+            cancellation,
+        )
+        .await
+    }
+
+    /// Reconciles the authoritative backend state for dispatcher-tracked paper orders.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded control error or the exact dispatcher reconciliation failure. In-flight
+    /// work remains owned by the dispatcher's fail-safe when caller cancellation or expiry wins.
+    pub async fn reconcile_tracked_orders(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<ExecutionState, ProductionPaperControlError> {
+        let deadline =
+            bounded_paper_control_deadline(self.paper_control_timeout, deadline, cancellation)?;
+        await_paper_dispatch(
+            self.dispatcher
+                .reconcile_before(tokio::time::Instant::from_std(deadline), cancellation),
+            deadline,
+            cancellation,
+        )
+        .await
+    }
+
     /// Stops the source and live actors before dispatch and paper execution, attempting every
     /// barrier even when an earlier barrier fails.
     pub async fn shutdown(self) -> ProductionPaperBotShutdown {
@@ -760,6 +851,41 @@ impl ProductionPaperBotRuntime {
             paper,
             task_drain,
             audit,
+        }
+    }
+}
+
+/// Bounded production paper snapshot or dispatcher-control failure.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum ProductionPaperControlError {
+    #[error("production paper control operation was cancelled")]
+    Cancelled,
+    #[error("production paper control operation exceeded its deadline")]
+    DeadlineExceeded,
+    #[error(transparent)]
+    Paper(PaperControlError),
+    #[error(transparent)]
+    Dispatch(ExecutionDispatchError),
+}
+
+impl From<PaperControlError> for ProductionPaperControlError {
+    fn from(error: PaperControlError) -> Self {
+        match error {
+            PaperControlError::Cancelled => Self::Cancelled,
+            PaperControlError::InvalidDeadline | PaperControlError::DeadlineExceeded => {
+                Self::DeadlineExceeded
+            }
+            error => Self::Paper(error),
+        }
+    }
+}
+
+impl From<ExecutionDispatchError> for ProductionPaperControlError {
+    fn from(error: ExecutionDispatchError) -> Self {
+        match error {
+            ExecutionDispatchError::OperationDeadlineExceeded => Self::DeadlineExceeded,
+            ExecutionDispatchError::OperationCancelled => Self::Cancelled,
+            error => Self::Dispatch(error),
         }
     }
 }
@@ -1327,6 +1453,42 @@ async fn shutdown_paper(
 ) -> Result<PaperExecutionSnapshot, PaperControlError> {
     let control = PaperControlContext::try_new(timeout, CancellationToken::new())?;
     paper.shutdown(control).await
+}
+
+fn bounded_paper_control_deadline(
+    maximum: Duration,
+    caller_deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<Instant, ProductionPaperControlError> {
+    if cancellation.is_cancelled() {
+        return Err(ProductionPaperControlError::Cancelled);
+    }
+    let now = Instant::now();
+    if caller_deadline <= now {
+        return Err(ProductionPaperControlError::DeadlineExceeded);
+    }
+    let configured_deadline = now
+        .checked_add(maximum)
+        .ok_or(ProductionPaperControlError::DeadlineExceeded)?;
+    Ok(caller_deadline.min(configured_deadline))
+}
+
+async fn await_paper_dispatch<T, F>(
+    operation: F,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<T, ProductionPaperControlError>
+where
+    F: Future<Output = Result<T, ExecutionDispatchError>>,
+{
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => Err(ProductionPaperControlError::Cancelled),
+        () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+            Err(ProductionPaperControlError::DeadlineExceeded)
+        }
+        result = operation => result.map_err(Into::into),
+    }
 }
 
 fn with_rollback(

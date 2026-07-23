@@ -395,6 +395,7 @@ pub enum RecoveredDispatchOrderError {
 pub struct ExecutionOperation {
     deadline: Instant,
     cancellation: CancellationToken,
+    caller_cancellation: Option<CancellationToken>,
 }
 
 /// Private-construction authority to clear one backend recovery quarantine.
@@ -422,6 +423,19 @@ impl ExecutionOperation {
         Self {
             deadline,
             cancellation,
+            caller_cancellation: None,
+        }
+    }
+
+    pub(crate) fn new_with_caller(
+        deadline: Instant,
+        cancellation: CancellationToken,
+        caller_cancellation: CancellationToken,
+    ) -> Self {
+        Self {
+            deadline,
+            cancellation,
+            caller_cancellation: Some(caller_cancellation),
         }
     }
 
@@ -433,11 +447,23 @@ impl ExecutionOperation {
     /// Returns whether cancellation has already been requested.
     pub fn is_cancelled(&self) -> bool {
         self.cancellation.is_cancelled()
+            || self
+                .caller_cancellation
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
     }
 
     /// Waits for cooperative cancellation.
     pub async fn cancelled(&self) {
-        self.cancellation.cancelled().await;
+        match self.caller_cancellation.as_ref() {
+            Some(caller_cancellation) => {
+                tokio::select! {
+                    () = self.cancellation.cancelled() => {}
+                    () = caller_cancellation.cancelled() => {}
+                }
+            }
+            None => self.cancellation.cancelled().await,
+        }
     }
 
     pub(crate) fn cancellation(&self) -> CancellationToken {
