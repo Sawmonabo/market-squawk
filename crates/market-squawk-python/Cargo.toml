@@ -9,7 +9,7 @@ repository = "https://github.com/Sawmonabo/market-squawk"
 publish = false
 
 [lib]
-name = "market_squawk"
+name = "market_squawk_python"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
