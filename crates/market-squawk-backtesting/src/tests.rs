@@ -6,18 +6,21 @@ use cap_std::ambient_authority;
 use cap_std::fs::Dir;
 
 use crate::dataset::{BacktestDatasetInput, BacktestObservationInput};
+use crate::experiments::TrialCompletionInput;
 use crate::{
     AccountingReconciliation, BacktestAdmissionError, BacktestBuildReceipt,
-    BacktestBuildRegistration, BacktestCohortCandidate, BacktestCohortFold, BacktestCohortPlan,
-    BacktestDataset, BacktestEngine, BacktestError, BacktestLimits, BacktestLimitsInput,
-    BacktestModelDecisionMapper, BacktestModelStrategy, BacktestObservation, BacktestOutcome,
-    BacktestRequest, BacktestService, BacktestServiceError, BacktestStrategy,
+    BacktestBuildRegistration, BacktestCohortCandidate, BacktestCohortFold,
+    BacktestCohortFoldPartition, BacktestCohortPartition, BacktestCohortPlan,
+    BacktestCohortUniverse, BacktestDataset, BacktestEngine, BacktestError, BacktestLimits,
+    BacktestLimitsInput, BacktestModelDecisionMapper, BacktestModelStrategy, BacktestObservation,
+    BacktestOutcome, BacktestRequest, BacktestService, BacktestServiceError, BacktestStrategy,
     BacktestStrategyClass, BacktestStrategyFactory, BacktestStrategyInstance,
     BacktestStrategyRegistry, BacktestTrialPlan, ExperimentError, ExperimentInventory,
     ExperimentLimits, ExperimentLimitsInput, HistoricalUniverseStatus, PortfolioSeed,
     RESEARCH_EXECUTION_POLICY_VERSION, ResearchExecutionAssumptions,
-    ResearchExecutionAssumptionsInput, ResearchLiquidityPriority, TrialComponentBinding, TrialId,
-    TrialParameter, TrialSearchDimension, TrialSpec, TrialSpecInput, TrialStatus,
+    ResearchExecutionAssumptionsInput, ResearchLiquidityPriority, TrialComponentBinding,
+    TrialDatasetPartition, TrialId, TrialMetric, TrialParameter, TrialSearchDimension, TrialSpec,
+    TrialSpecInput, TrialStatus,
 };
 use market_squawk_data::{
     CorporateActionAdjustment, CorporateActionLimits, CorporateActionPlan, CorporateActionPolicy,
@@ -193,7 +196,7 @@ fn signal_executes_only_on_next_eligible_snapshot_and_reconciles_partial_fill() 
 
     let result = BacktestEngine::run(&request, &mut strategy, &CancellationToken::new())?;
 
-    assert_eq!(result.fills().len(), 1);
+    assert_eq!(result.fills().len(), 2);
     let fill = &result.fills()[0];
     assert_eq!(fill.signal_at(), Timestamp::from_unix_nanos(10));
     assert_eq!(fill.executed_at(), Timestamp::from_unix_nanos(20));
@@ -204,9 +207,16 @@ fn signal_executes_only_on_next_eligible_snapshot_and_reconciles_partial_fill() 
             .portfolio()
             .position(terms.instrument_id())
             .map(|p| p.quantity()),
-        Some(Decimal::from(2))
+        Some(Decimal::from(4))
     );
-    assert_eq!(result.portfolio().fees(), fill.fee());
+    assert_eq!(
+        result.portfolio().fees().amount(),
+        result
+            .fills()
+            .iter()
+            .map(|fill| fill.fee().amount())
+            .sum::<Decimal>()
+    );
     assert_eq!(
         result.accounting_reconciliation(),
         AccountingReconciliation::Independent
@@ -267,6 +277,32 @@ fn immediate_time_in_force_is_terminal_while_gtc_survives_an_unfilled_attempt() 
         good_til_cancelled_result.fills()[0].executed_at(),
         Timestamp::from_unix_nanos(30)
     );
+
+    let partial_liquidity = dataset_with_depths(terms, [10, 2, 2])?;
+    for time_in_force in [TimeInForce::Day, TimeInForce::GoodTilCancelled] {
+        let result = run_with_time_in_force(account_id, partial_liquidity.clone(), time_in_force)?;
+        assert_eq!(result.fills().len(), 2);
+        assert_eq!(
+            result
+                .fills()
+                .iter()
+                .map(|fill| fill.quantity().get())
+                .sum::<i64>(),
+            4
+        );
+    }
+    let immediate = run_with_time_in_force(
+        account_id,
+        partial_liquidity.clone(),
+        TimeInForce::ImmediateOrCancel,
+    )?;
+    assert_eq!(immediate.fills().len(), 1);
+    assert_eq!(immediate.fills()[0].quantity(), QuantityLots::new(2)?);
+    assert!(
+        run_with_time_in_force(account_id, partial_liquidity, TimeInForce::FillOrKill)?
+            .fills()
+            .is_empty()
+    );
     Ok(())
 }
 
@@ -322,7 +358,7 @@ fn governed_service_reserves_before_run_and_publishes_one_immutable_terminal() -
     let TrialStatus::Completed(completion) = result.trial().status() else {
         return Err("expected completed terminal".into());
     };
-    assert_eq!(result.run().fills().len(), 1);
+    assert_eq!(result.run().fills().len(), 2);
     assert_eq!(completion.metrics().len(), 7);
     assert_eq!(
         completion
@@ -392,6 +428,8 @@ fn governed_trial_identity_binds_every_immutable_request_input() -> TestResult {
                 object_graph_digest: request.object_graph_digest(),
                 execution_assumption_digest: request.assumption_digest(),
                 run_input_digest: request.run_input_digest(),
+                cohort_authority_digest: request.cohort_authority_digest(),
+                cohort_universe_digest: None,
                 model: None,
                 strategy: binding("strategy-v1", 5)?,
                 code: binding("code-revision", 6)?,
@@ -481,27 +519,27 @@ fn post_reservation_validation_fails_terminally_before_artifact_publication() ->
 #[test]
 fn cohort_evaluation_uses_completed_metrics_and_publishes_one_immutable_record() -> TestResult {
     let temporary = tempfile::tempdir()?;
+    let limits = ExperimentLimits::try_new(ExperimentLimitsInput {
+        max_trials: 16,
+        max_record_bytes: 64 * 1024,
+        max_artifact_bytes: 64 * 1024,
+        max_metrics: 8,
+    })?;
     let root = Dir::open_ambient_dir(temporary.path(), ambient_authority())?;
-    let inventory = ExperimentInventory::try_new(
-        root,
-        ExperimentLimits::try_new(ExperimentLimitsInput {
-            max_trials: 16,
-            max_record_bytes: 64 * 1024,
-            max_artifact_bytes: 64 * 1024,
-            max_metrics: 8,
-        })?,
-    )?;
+    let inventory = ExperimentInventory::try_new(root, limits)?;
     let service = BacktestService::new(inventory);
     let account_id: AccountId = "00000000-0000-0000-0000-000000000030".parse()?;
     let (registry, build_id) = strategy_registry(account_id)?;
     let parameters = &["fast", "medium", "slow"];
+    let universe = cohort_universe(&[(10, 40), (70, 100)], 40)?;
     let (first_fold, selection_candidates, first_candidates) = completed_cohort_fold(
-        &service, &registry, &build_id, account_id, 10, 40, parameters,
+        &service, &registry, &build_id, account_id, 10, 40, parameters, &universe,
     )?;
     let (second_fold, second_selection, second_candidates) = completed_cohort_fold(
-        &service, &registry, &build_id, account_id, 70, 100, parameters,
+        &service, &registry, &build_id, account_id, 70, 100, parameters, &universe,
     )?;
     let incomplete_plan = BacktestCohortPlan::try_new(
+        universe.clone(),
         vec![
             BacktestCohortFold::try_new(first_candidates[..2].to_vec())?,
             BacktestCohortFold::try_new(second_candidates[..2].to_vec())?,
@@ -513,7 +551,17 @@ fn cohort_evaluation_uses_completed_metrics_and_publishes_one_immutable_record()
         service.evaluate_cohort(incomplete_plan),
         Err(BacktestServiceError::InvalidCohort)
     ));
+    assert!(matches!(
+        BacktestCohortPlan::try_new(
+            cohort_universe(&[(10, 40), (70, 100), (130, 160)], 40)?,
+            vec![first_fold.clone(), second_fold.clone()],
+            selection_candidates.clone(),
+            SourceIdentifier::try_from("total-return")?,
+        ),
+        Err(ExperimentError::InvalidDiagnostic)
+    ));
     let invalid_plan = BacktestCohortPlan::try_new(
+        universe.clone(),
         vec![first_fold.clone(), second_fold.clone()],
         selection_candidates
             .iter()
@@ -526,11 +574,45 @@ fn cohort_evaluation_uses_completed_metrics_and_publishes_one_immutable_record()
         service.evaluate_cohort(invalid_plan),
         Err(BacktestServiceError::InvalidCohort)
     ));
+    let mut changed_request = request(account_id, dataset_at(execution_terms()?, 40)?, None)?;
+    changed_request.limits = BacktestLimits::try_new(BacktestLimitsInput {
+        max_observations: 99,
+        max_pending_intents: 16,
+        max_fills: 16,
+        max_retained_bytes: 1_000_000,
+    })?;
+    let changed_authority = run_governed_request(
+        &service,
+        &registry,
+        &build_id,
+        changed_request,
+        "fast",
+        &universe,
+    )?;
+    let mut authority_candidates = first_candidates.clone();
+    authority_candidates[0] =
+        BacktestCohortCandidate::new(authority_candidates[0].in_sample(), changed_authority);
+    let mut authority_selection = selection_candidates.clone();
+    authority_selection[0] = changed_authority;
+    let authority_plan = BacktestCohortPlan::try_new(
+        universe.clone(),
+        vec![
+            BacktestCohortFold::try_new(authority_candidates)?,
+            second_fold.clone(),
+        ],
+        authority_selection,
+        SourceIdentifier::try_from("total-return")?,
+    )?;
+    assert!(matches!(
+        service.evaluate_cohort(authority_plan),
+        Err(BacktestServiceError::InvalidCohort)
+    ));
     assert_eq!(
         std::fs::read_dir(temporary.path().join("backtesting/v1/cohorts"))?.count(),
         0
     );
     let plan = BacktestCohortPlan::try_new(
+        universe,
         vec![first_fold, second_fold],
         selection_candidates.clone(),
         SourceIdentifier::try_from("total-return")?,
@@ -554,22 +636,45 @@ fn cohort_evaluation_uses_completed_metrics_and_publishes_one_immutable_record()
         std::fs::read_dir(temporary.path().join("backtesting/v1/cohorts"))?.count(),
         1
     );
+    let evaluation_id = evaluation.id();
+    drop(service);
+    let reopened_root = Dir::open_ambient_dir(temporary.path(), ambient_authority())?;
+    let reopened = ExperimentInventory::try_new(reopened_root, limits)?;
+    assert_eq!(reopened.cohort_evaluation(evaluation_id)?, evaluation);
     Ok(())
 }
 
 #[test]
 fn expired_trial_attempt_can_be_recovered_without_overlapping_an_active_lease() -> TestResult {
     let temporary = tempfile::tempdir()?;
+    let limits = ExperimentLimits::try_new(ExperimentLimitsInput {
+        max_trials: 8,
+        max_record_bytes: 64 * 1024,
+        max_artifact_bytes: 64 * 1024,
+        max_metrics: 8,
+    })?;
     let root = Dir::open_ambient_dir(temporary.path(), ambient_authority())?;
-    let inventory = ExperimentInventory::try_new(
-        root,
-        ExperimentLimits::try_new(ExperimentLimitsInput {
-            max_trials: 8,
-            max_record_bytes: 64 * 1024,
-            max_artifact_bytes: 64 * 1024,
-            max_metrics: 8,
-        })?,
+    let inventory = ExperimentInventory::try_new(root, limits)?;
+    let competing_root = Dir::open_ambient_dir(temporary.path(), ambient_authority())?;
+    assert!(matches!(
+        ExperimentInventory::try_new(competing_root, limits),
+        Err(ExperimentError::Unavailable)
+    ));
+
+    const V1_TRIAL_ID: [u8; 32] = [
+        204, 192, 179, 164, 28, 112, 23, 169, 97, 98, 112, 138, 90, 51, 232, 124, 231, 70, 161,
+        146, 67, 140, 231, 172, 104, 88, 18, 93, 39, 92, 71, 221,
+    ];
+    const V1_RESERVATION: &str = r#"{"schema_version":1,"trial_id":"ccc0b3a41c7017a96162708a5a33e87ce746a192438ce7ac6858125d275c47dd","spec":{"dataset_identity":"0101010101010101010101010101010101010101010101010101010101010101","object_graph_digest":"0202020202020202020202020202020202020202020202020202020202020202","execution_assumption_digest":"0303030303030303030303030303030303030303030303030303030303030303","model":null,"strategy":{"name":"strategy-v1","digest":"0505050505050505050505050505050505050505050505050505050505050505"},"code":{"name":"code-revision","digest":"0606060606060606060606060606060606060606060606060606060606060606"},"configuration_digest":"0707070707070707070707070707070707070707070707070707070707070707","seed":7,"parameters":[],"search_space":[],"selection_criterion":"total-return"}}"#;
+    std::fs::write(
+        temporary
+            .path()
+            .join("backtesting/v1/reservations/ccc0b3a41c7017a96162708a5a33e87ce746a192438ce7ac6858125d275c47dd.json"),
+        V1_RESERVATION,
     )?;
+    let legacy_id = TrialId::from_digest(Sha256Digest::new(V1_TRIAL_ID));
+    assert_eq!(inventory.trial(legacy_id)?.spec().id(), legacy_id);
+
     let account_id: AccountId = "00000000-0000-0000-0000-000000000030".parse()?;
     let request = request(account_id, dataset(execution_terms()?)?, None)?;
     let spec = TrialSpec::try_new(TrialSpecInput {
@@ -577,6 +682,8 @@ fn expired_trial_attempt_can_be_recovered_without_overlapping_an_active_lease() 
         object_graph_digest: request.object_graph_digest(),
         execution_assumption_digest: request.assumption_digest(),
         run_input_digest: request.run_input_digest(),
+        cohort_authority_digest: request.cohort_authority_digest(),
+        cohort_universe_digest: None,
         model: None,
         strategy: binding("strategy-v1", 5)?,
         code: binding("code-revision", 6)?,
@@ -589,13 +696,59 @@ fn expired_trial_attempt_can_be_recovered_without_overlapping_an_active_lease() 
 
     let _first = inventory.reserve_at(spec.clone(), Timestamp::from_unix_nanos(100), 10)?;
     assert!(matches!(
-        inventory.reserve_at(spec.clone(), Timestamp::from_unix_nanos(105), 10),
+        inventory.reserve_at(spec.clone(), Timestamp::from_unix_nanos(110), 10),
         Err(ExperimentError::TrialInProgress)
     ));
-    let _recovered = inventory.reserve_at(spec.clone(), Timestamp::from_unix_nanos(110), 10)?;
+    drop(_first);
+    let recovered = inventory.reserve_at(spec.clone(), Timestamp::from_unix_nanos(110), 10)?;
+    let artifact_bytes = br#"{"recovered":true}"#;
+    let artifact = inventory.prepare_artifact(artifact_bytes)?;
+    let completion = inventory.prepare_completion(
+        &recovered,
+        TrialCompletionInput {
+            result_digest: Sha256Digest::new([9; 32]),
+            artifact: artifact.clone(),
+            metrics: vec![TrialMetric::try_new(
+                SourceIdentifier::try_from("total-return")?,
+                0.1,
+            )?],
+            dataset_partition: Some(TrialDatasetPartition::try_new(
+                Timestamp::from_unix_nanos(10),
+                Timestamp::from_unix_nanos(30),
+            )?),
+        },
+    )?;
+    inventory.complete(recovered, completion, artifact_bytes)?;
+
+    let final_path = temporary.path().join(artifact.reference());
+    let trial_hex = spec
+        .id()
+        .digest()
+        .bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let pending_path = temporary
+        .path()
+        .join("backtesting/v1/pending")
+        .join(trial_hex)
+        .join("00000000000000000002.json");
+    std::fs::create_dir_all(pending_path.parent().ok_or("missing pending parent")?)?;
+    std::fs::copy(&final_path, &pending_path)?;
+    std::fs::remove_file(&final_path)?;
     assert!(matches!(
-        inventory.reserve_at(spec, Timestamp::from_unix_nanos(111), 10),
-        Err(ExperimentError::TrialInProgress)
+        inventory.trial(spec.id())?.status(),
+        TrialStatus::Completed(_)
+    ));
+    assert!(final_path.is_file());
+    assert!(!pending_path.exists());
+
+    drop(inventory);
+    let reopened_root = Dir::open_ambient_dir(temporary.path(), ambient_authority())?;
+    let reopened = ExperimentInventory::try_new(reopened_root, limits)?;
+    assert!(matches!(
+        reopened.trial(spec.id())?.status(),
+        TrialStatus::Completed(_)
     ));
     Ok(())
 }
@@ -672,6 +825,10 @@ type CompletedCohortFold = (
     Vec<BacktestCohortCandidate>,
 );
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the existing cohort harness keeps each authority and exact partition explicit"
+)]
 fn completed_cohort_fold(
     service: &BacktestService,
     registry: &BacktestStrategyRegistry,
@@ -680,6 +837,7 @@ fn completed_cohort_fold(
     in_sample_start: i64,
     out_of_sample_start: i64,
     parameters: &[&str],
+    universe: &BacktestCohortUniverse,
 ) -> Result<CompletedCohortFold, Box<dyn Error>> {
     let mut candidates = Vec::new();
     let mut selection = Vec::new();
@@ -691,6 +849,7 @@ fn completed_cohort_fold(
             account_id,
             in_sample_start,
             parameter,
+            universe,
         )?;
         let out_of_sample = run_governed_trial(
             service,
@@ -699,6 +858,7 @@ fn completed_cohort_fold(
             account_id,
             out_of_sample_start,
             parameter,
+            universe,
         )?;
         candidates.push(BacktestCohortCandidate::new(in_sample, out_of_sample));
         selection.push(out_of_sample);
@@ -717,15 +877,34 @@ fn run_governed_trial(
     account_id: AccountId,
     dataset_start: i64,
     parameter: &str,
+    universe: &BacktestCohortUniverse,
 ) -> Result<TrialId, Box<dyn Error>> {
-    let mut strategy = registry.admit(build_id)?;
-    let parameter_name = SourceIdentifier::try_from("speed")?;
-    let outcome = service.run(
+    run_governed_request(
+        service,
+        registry,
+        build_id,
         request(
             account_id,
             dataset_at(execution_terms()?, dataset_start)?,
             None,
         )?,
+        parameter,
+        universe,
+    )
+}
+
+fn run_governed_request(
+    service: &BacktestService,
+    registry: &BacktestStrategyRegistry,
+    build_id: &SourceIdentifier,
+    request: BacktestRequest,
+    parameter: &str,
+    universe: &BacktestCohortUniverse,
+) -> Result<TrialId, Box<dyn Error>> {
+    let mut strategy = registry.admit(build_id)?;
+    let parameter_name = SourceIdentifier::try_from("speed")?;
+    let outcome = service.run(
+        request,
         &mut strategy,
         BacktestTrialPlan::new(
             vec![TrialParameter::new(
@@ -741,13 +920,54 @@ fn run_governed_trial(
                 ],
             )?],
             SourceIdentifier::try_from("total-return")?,
-        ),
+        )
+        .with_cohort_universe(universe.clone()),
         &CancellationToken::new(),
     )?;
     let BacktestOutcome::Completed(result) = outcome else {
         return Err("expected completed cohort member".into());
     };
     Ok(result.trial().spec().id())
+}
+
+fn cohort_universe(
+    fold_starts: &[(i64, i64)],
+    selection_start: i64,
+) -> Result<BacktestCohortUniverse, Box<dyn Error>> {
+    let folds = fold_starts
+        .iter()
+        .map(|(in_sample, out_of_sample)| {
+            BacktestCohortFoldPartition::try_new(
+                cohort_partition(*in_sample)?,
+                cohort_partition(*out_of_sample)?,
+            )
+        })
+        .collect::<Result<Vec<_>, ExperimentError>>()?;
+    Ok(BacktestCohortUniverse::try_new(
+        SourceIdentifier::try_from("walk-forward-generator-v1")?,
+        vec![TrialParameter::new(
+            SourceIdentifier::try_from("fold-count")?,
+            SourceIdentifier::try_from(format!("{}-folds", fold_starts.len()))?,
+        )],
+        folds,
+        cohort_partition(selection_start)?,
+    )?)
+}
+
+fn cohort_partition(starts_at: i64) -> Result<BacktestCohortPartition, ExperimentError> {
+    let dataset = dataset_at(
+        execution_terms().map_err(|_| ExperimentError::InvalidDiagnostic)?,
+        starts_at,
+    )
+    .map_err(|_| ExperimentError::InvalidDiagnostic)?;
+    BacktestCohortPartition::try_new(
+        dataset.identity(),
+        dataset.object_graph_digest(),
+        TrialDatasetPartition::try_new(
+            Timestamp::from_unix_nanos(starts_at),
+            Timestamp::from_unix_nanos(starts_at + 20),
+        )?,
+    )
 }
 
 fn binding(name: &str, byte: u8) -> Result<TrialComponentBinding, Box<dyn Error>> {

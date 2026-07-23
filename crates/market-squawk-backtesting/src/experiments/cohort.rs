@@ -9,8 +9,15 @@ use sha2::{Digest as _, Sha256};
 
 use super::ExperimentError;
 use super::diagnostics::{BacktestOverfittingDiagnostic, DeflatedPerformanceDiagnostic};
-use super::model::{TrialComponentBinding, TrialDatasetPartition, TrialId};
+use super::model::{
+    TrialComponentBinding, TrialDatasetPartition, TrialId, TrialParameter, require_digest,
+};
 use super::wire::{decode_hex, encode_hex};
+
+const HARD_MAX_COHORT_FOLDS: usize = 1_024;
+const HARD_MAX_GENERATOR_PARAMETERS: usize = 1_024;
+type PartitionSortKey = ([u8; 32], [u8; 32], i64, i64);
+type FoldPartitionSortKey = (PartitionSortKey, PartitionSortKey);
 
 /// Exact in-sample/out-of-sample completed-trial pair for one fold candidate.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -42,6 +49,206 @@ impl BacktestCohortCandidate {
     }
 }
 
+/// Exact dataset generation and interval admitted as one generated cohort partition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BacktestCohortPartition {
+    dataset_identity: Sha256Digest,
+    object_graph_digest: Sha256Digest,
+    interval: TrialDatasetPartition,
+}
+
+impl BacktestCohortPartition {
+    /// Binds a generated partition to immutable data and object-graph identities.
+    pub fn try_new(
+        dataset_identity: Sha256Digest,
+        object_graph_digest: Sha256Digest,
+        interval: TrialDatasetPartition,
+    ) -> Result<Self, ExperimentError> {
+        require_digest(dataset_identity)?;
+        require_digest(object_graph_digest)?;
+        Ok(Self {
+            dataset_identity,
+            object_graph_digest,
+            interval,
+        })
+    }
+
+    /// Returns the exact partition dataset identity.
+    #[must_use]
+    pub const fn dataset_identity(self) -> Sha256Digest {
+        self.dataset_identity
+    }
+
+    /// Returns the partition's pinned object graph.
+    #[must_use]
+    pub const fn object_graph_digest(self) -> Sha256Digest {
+        self.object_graph_digest
+    }
+
+    /// Returns the exact event-time interval.
+    #[must_use]
+    pub const fn interval(self) -> TrialDatasetPartition {
+        self.interval
+    }
+}
+
+/// One exact generated in-sample/out-of-sample partition pair.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BacktestCohortFoldPartition {
+    in_sample: BacktestCohortPartition,
+    out_of_sample: BacktestCohortPartition,
+}
+
+impl BacktestCohortFoldPartition {
+    /// Requires disjoint, time-ordered, independently identified partitions.
+    pub fn try_new(
+        in_sample: BacktestCohortPartition,
+        out_of_sample: BacktestCohortPartition,
+    ) -> Result<Self, ExperimentError> {
+        if in_sample.dataset_identity == out_of_sample.dataset_identity
+            || in_sample.interval.ends_at() >= out_of_sample.interval.starts_at()
+        {
+            return Err(ExperimentError::InvalidDiagnostic);
+        }
+        Ok(Self {
+            in_sample,
+            out_of_sample,
+        })
+    }
+
+    /// Returns the generated in-sample partition.
+    #[must_use]
+    pub const fn in_sample(self) -> BacktestCohortPartition {
+        self.in_sample
+    }
+
+    /// Returns the generated out-of-sample partition.
+    #[must_use]
+    pub const fn out_of_sample(self) -> BacktestCohortPartition {
+        self.out_of_sample
+    }
+}
+
+/// Pre-run canonical fold-generation authority shared by every cohort member.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BacktestCohortUniverse {
+    generator_version: SourceIdentifier,
+    generation_parameters: Box<[TrialParameter]>,
+    folds: Box<[BacktestCohortFoldPartition]>,
+    selection_partition: BacktestCohortPartition,
+    digest: Sha256Digest,
+}
+
+impl BacktestCohortUniverse {
+    /// Canonicalizes generator parameters and the complete generated partition universe.
+    pub fn try_new(
+        generator_version: SourceIdentifier,
+        mut generation_parameters: Vec<TrialParameter>,
+        mut folds: Vec<BacktestCohortFoldPartition>,
+        selection_partition: BacktestCohortPartition,
+    ) -> Result<Self, ExperimentError> {
+        generation_parameters.sort_unstable();
+        if generation_parameters.is_empty()
+            || generation_parameters.len() > HARD_MAX_GENERATOR_PARAMETERS
+            || generation_parameters
+                .windows(2)
+                .any(|pair| pair[0].name() == pair[1].name())
+            || folds.len() < 2
+            || folds.len() > HARD_MAX_COHORT_FOLDS
+        {
+            return Err(ExperimentError::InvalidDiagnostic);
+        }
+        folds.sort_unstable_by_key(fold_partition_key);
+        if folds.windows(2).any(|pair| pair[0] == pair[1])
+            || !folds
+                .iter()
+                .any(|fold| fold.out_of_sample == selection_partition)
+        {
+            return Err(ExperimentError::InvalidDiagnostic);
+        }
+        let mut value = Self {
+            generator_version,
+            generation_parameters: generation_parameters.into_boxed_slice(),
+            folds: folds.into_boxed_slice(),
+            selection_partition,
+            digest: Sha256Digest::new([0; 32]),
+        };
+        value.digest = universe_digest(&value)?;
+        Ok(value)
+    }
+
+    /// Returns the canonical universe identity bound before any member run.
+    #[must_use]
+    pub const fn digest(&self) -> Sha256Digest {
+        self.digest
+    }
+
+    /// Returns the versioned generator implementation identifier.
+    #[must_use]
+    pub const fn generator_version(&self) -> &SourceIdentifier {
+        &self.generator_version
+    }
+
+    /// Returns the canonical generator parameters.
+    #[must_use]
+    pub fn generation_parameters(&self) -> &[TrialParameter] {
+        &self.generation_parameters
+    }
+
+    /// Returns every exact generated fold partition.
+    #[must_use]
+    pub fn folds(&self) -> &[BacktestCohortFoldPartition] {
+        &self.folds
+    }
+
+    /// Returns the exact dataset partition used for final candidate selection.
+    #[must_use]
+    pub const fn selection_partition(&self) -> BacktestCohortPartition {
+        self.selection_partition
+    }
+}
+
+fn fold_partition_key(fold: &BacktestCohortFoldPartition) -> FoldPartitionSortKey {
+    (
+        partition_sort_key(fold.in_sample),
+        partition_sort_key(fold.out_of_sample),
+    )
+}
+
+fn partition_sort_key(partition: BacktestCohortPartition) -> PartitionSortKey {
+    (
+        partition.dataset_identity.bytes(),
+        partition.object_graph_digest.bytes(),
+        partition.interval.starts_at().unix_nanos(),
+        partition.interval.ends_at().unix_nanos(),
+    )
+}
+
+fn universe_digest(value: &BacktestCohortUniverse) -> Result<Sha256Digest, ExperimentError> {
+    let mut hash = Sha256::new();
+    hash.update(b"market-squawk/backtest-cohort-universe/v1");
+    hash_bytes(&mut hash, value.generator_version.as_str().as_bytes())?;
+    hash_length(&mut hash, value.generation_parameters.len())?;
+    for parameter in &value.generation_parameters {
+        hash_bytes(&mut hash, parameter.name().as_str().as_bytes())?;
+        hash_bytes(&mut hash, parameter.value().as_str().as_bytes())?;
+    }
+    hash_length(&mut hash, value.folds.len())?;
+    for fold in &value.folds {
+        hash_partition(&mut hash, fold.in_sample);
+        hash_partition(&mut hash, fold.out_of_sample);
+    }
+    hash_partition(&mut hash, value.selection_partition);
+    Ok(Sha256Digest::new(hash.finalize().into()))
+}
+
+fn hash_partition(hash: &mut Sha256, partition: BacktestCohortPartition) {
+    hash.update(partition.dataset_identity.bytes());
+    hash.update(partition.object_graph_digest.bytes());
+    hash.update(partition.interval.starts_at().unix_nanos().to_be_bytes());
+    hash.update(partition.interval.ends_at().unix_nanos().to_be_bytes());
+}
+
 /// One canonical candidate set used by the PBO evaluator.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BacktestCohortFold {
@@ -70,6 +277,7 @@ impl BacktestCohortFold {
 /// Bounded cohort design; it contains identities and criterion but no caller-authored scores.
 #[derive(Clone, Debug)]
 pub struct BacktestCohortPlan {
+    universe: BacktestCohortUniverse,
     folds: Box<[BacktestCohortFold]>,
     selection_candidates: Box<[TrialId]>,
     selection_criterion: SourceIdentifier,
@@ -78,12 +286,13 @@ pub struct BacktestCohortPlan {
 impl BacktestCohortPlan {
     /// Canonicalizes the candidate set and rejects an underidentified cohort.
     pub fn try_new(
+        universe: BacktestCohortUniverse,
         folds: Vec<BacktestCohortFold>,
         mut selection_candidates: Vec<TrialId>,
         selection_criterion: SourceIdentifier,
     ) -> Result<Self, ExperimentError> {
         selection_candidates.sort_unstable();
-        if folds.len() < 2
+        if folds.len() != universe.folds.len()
             || selection_candidates.len() < 2
             || selection_candidates
                 .windows(2)
@@ -103,10 +312,17 @@ impl BacktestCohortPlan {
             return Err(ExperimentError::InvalidDiagnostic);
         }
         Ok(Self {
+            universe,
             folds: folds.into_boxed_slice(),
             selection_candidates: selection_candidates.into_boxed_slice(),
             selection_criterion,
         })
+    }
+
+    /// Returns the complete fold universe bound before member execution.
+    #[must_use]
+    pub const fn universe(&self) -> &BacktestCohortUniverse {
+        &self.universe
     }
 
     pub(crate) fn folds(&self) -> &[BacktestCohortFold] {
@@ -198,6 +414,7 @@ pub struct BacktestCohortEvaluation {
     id: BacktestCohortEvaluationId,
     evaluator: TrialComponentBinding,
     experiment_design_digest: Sha256Digest,
+    cohort_universe_digest: Option<Sha256Digest>,
     selection_criterion: SourceIdentifier,
     members: Box<[CohortMemberBinding]>,
     folds: Box<[BacktestCohortFold]>,
@@ -210,6 +427,7 @@ pub struct BacktestCohortEvaluation {
 pub(crate) struct CohortEvaluationInput {
     pub evaluator: TrialComponentBinding,
     pub experiment_design_digest: Sha256Digest,
+    pub cohort_universe_digest: Sha256Digest,
     pub selection_criterion: SourceIdentifier,
     pub members: Vec<CohortMemberBinding>,
     pub folds: Vec<BacktestCohortFold>,
@@ -221,6 +439,7 @@ pub(crate) struct CohortEvaluationInput {
 
 impl BacktestCohortEvaluation {
     pub(crate) fn try_new(mut input: CohortEvaluationInput) -> Result<Self, ExperimentError> {
+        require_digest(input.cohort_universe_digest)?;
         input.members.sort_unstable_by_key(|member| member.trial_id);
         if input.members.len() < 2
             || input
@@ -236,6 +455,36 @@ impl BacktestCohortEvaluation {
             id: BacktestCohortEvaluationId(Sha256Digest::new([0; 32])),
             evaluator: input.evaluator,
             experiment_design_digest: input.experiment_design_digest,
+            cohort_universe_digest: Some(input.cohort_universe_digest),
+            selection_criterion: input.selection_criterion,
+            members: input.members.into_boxed_slice(),
+            folds: input.folds.into_boxed_slice(),
+            selection_candidates: input.selection_candidates.into_boxed_slice(),
+            probability_of_backtest_overfitting: input.probability_of_backtest_overfitting,
+            deflated_performance: input.deflated_performance,
+            selected: input.selected,
+        };
+        value.id = BacktestCohortEvaluationId(evaluation_digest(&value)?);
+        Ok(value)
+    }
+
+    fn try_new_legacy(mut input: CohortEvaluationInput) -> Result<Self, ExperimentError> {
+        input.members.sort_unstable_by_key(|member| member.trial_id);
+        if input.members.len() < 2
+            || input
+                .members
+                .windows(2)
+                .any(|pair| pair[0].trial_id == pair[1].trial_id)
+            || !input.members.contains(&input.selected)
+        {
+            return Err(ExperimentError::InvalidDiagnostic);
+        }
+        input.selection_candidates.sort_unstable();
+        let mut value = Self {
+            id: BacktestCohortEvaluationId(Sha256Digest::new([0; 32])),
+            evaluator: input.evaluator,
+            experiment_design_digest: input.experiment_design_digest,
+            cohort_universe_digest: None,
             selection_criterion: input.selection_criterion,
             members: input.members.into_boxed_slice(),
             folds: input.folds.into_boxed_slice(),
@@ -252,6 +501,12 @@ impl BacktestCohortEvaluation {
     #[must_use]
     pub const fn id(&self) -> BacktestCohortEvaluationId {
         self.id
+    }
+
+    /// Returns the pre-run universe identity, or `None` for schema-v1 records.
+    #[must_use]
+    pub const fn cohort_universe_digest(&self) -> Option<Sha256Digest> {
+        self.cohort_universe_digest
     }
 
     /// Returns exact member and completed-result bindings.
@@ -281,7 +536,13 @@ impl BacktestCohortEvaluation {
 
 fn evaluation_digest(value: &BacktestCohortEvaluation) -> Result<Sha256Digest, ExperimentError> {
     let mut hash = Sha256::new();
-    hash.update(b"market-squawk/backtest-cohort-evaluation/v1");
+    match value.cohort_universe_digest {
+        Some(digest) => {
+            hash.update(b"market-squawk/backtest-cohort-evaluation/v2");
+            hash.update(digest.bytes());
+        }
+        None => hash.update(b"market-squawk/backtest-cohort-evaluation/v1"),
+    }
     hash_bytes(&mut hash, value.evaluator.name().as_str().as_bytes())?;
     hash.update(value.evaluator.digest().bytes());
     hash.update(value.experiment_design_digest.bytes());
@@ -369,6 +630,8 @@ struct EvaluationWire {
     evaluator_name: String,
     evaluator_digest: String,
     experiment_design_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cohort_universe_digest: Option<String>,
     selection_criterion: String,
     members: Vec<MemberWire>,
     folds: Vec<Vec<CandidateWire>>,
@@ -403,11 +666,14 @@ pub(super) fn encode_evaluation(
     value: &BacktestCohortEvaluation,
 ) -> Result<Vec<u8>, ExperimentError> {
     serde_json::to_vec(&EvaluationWire {
-        schema_version: 1,
+        schema_version: 2,
         evaluation_id: encode_hex(value.id.digest().bytes()),
         evaluator_name: value.evaluator.name().as_str().to_owned(),
         evaluator_digest: encode_hex(value.evaluator.digest().bytes()),
         experiment_design_digest: encode_hex(value.experiment_design_digest.bytes()),
+        cohort_universe_digest: value
+            .cohort_universe_digest
+            .map(|digest| encode_hex(digest.bytes())),
         selection_criterion: value.selection_criterion.as_str().to_owned(),
         members: value
             .members
@@ -455,7 +721,7 @@ pub(super) fn decode_evaluation(
 ) -> Result<BacktestCohortEvaluation, ExperimentError> {
     let wire: EvaluationWire =
         serde_json::from_slice(bytes).map_err(|_| ExperimentError::CorruptRecord)?;
-    if wire.schema_version != 1
+    if !matches!(wire.schema_version, 1 | 2)
         || decode_hex(&wire.evaluation_id)? != expected.digest()
         || !wire.probability_of_backtest_overfitting.is_finite()
         || !(0.0..=1.0).contains(&wire.probability_of_backtest_overfitting)
@@ -494,13 +760,22 @@ pub(super) fn decode_evaluation(
         })
         .copied()
         .ok_or(ExperimentError::CorruptRecord)?;
-    let value = BacktestCohortEvaluation::try_new(CohortEvaluationInput {
+    let universe_digest = wire
+        .cohort_universe_digest
+        .as_deref()
+        .map(decode_hex)
+        .transpose()?;
+    if (wire.schema_version == 1) != universe_digest.is_none() {
+        return Err(ExperimentError::CorruptRecord);
+    }
+    let input = CohortEvaluationInput {
         evaluator: TrialComponentBinding::try_new(
             SourceIdentifier::try_from(wire.evaluator_name)
                 .map_err(|_| ExperimentError::CorruptRecord)?,
             decode_hex(&wire.evaluator_digest)?,
         )?,
         experiment_design_digest: decode_hex(&wire.experiment_design_digest)?,
+        cohort_universe_digest: universe_digest.unwrap_or(Sha256Digest::new([0; 32])),
         selection_criterion: SourceIdentifier::try_from(wire.selection_criterion)
             .map_err(|_| ExperimentError::CorruptRecord)?,
         members,
@@ -534,7 +809,12 @@ pub(super) fn decode_evaluation(
             expected_maximum_sharpe: wire.expected_maximum_sharpe,
         },
         selected,
-    })?;
+    };
+    let value = if wire.schema_version == 1 {
+        BacktestCohortEvaluation::try_new_legacy(input)?
+    } else {
+        BacktestCohortEvaluation::try_new(input)?
+    };
     if value.id != expected {
         return Err(ExperimentError::CorruptRecord);
     }

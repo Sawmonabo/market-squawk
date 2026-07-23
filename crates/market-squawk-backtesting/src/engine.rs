@@ -4,8 +4,8 @@ use market_squawk_data::{CorporateActionPlan, Sha256Digest};
 use std::collections::BTreeMap;
 
 use market_squawk_domain::{
-    AccountId, InstrumentExecutionTerms, InstrumentId, Money, QuantityLots, SourceIdentifier,
-    TimeInForce, Timestamp,
+    AccountId, AvailabilityEvidence, InstrumentExecutionTerms, InstrumentId, Money, QuantityLots,
+    SourceIdentifier, TimeInForce, Timestamp,
 };
 use market_squawk_execution::{OrderIntent, StrategyError};
 use market_squawk_portfolio::{PortfolioError, PortfolioLimits, PortfolioRevision};
@@ -141,6 +141,41 @@ impl BacktestRequest {
         hash.update(b"market-squawk/backtest-run-input/v1");
         hash.update(self.dataset.identity.bytes());
         hash.update(self.dataset.object_graph_digest().bytes());
+        hash.update(self.assumptions.digest().bytes());
+        hash.update(self.portfolio.account_id.as_uuid().as_bytes());
+        update_decimal(&mut hash, self.portfolio.initial_cash.amount());
+        update_text(&mut hash, self.portfolio.initial_cash.currency().as_str());
+        hash.update(self.portfolio.limits.semantic_digest().bytes());
+        match &self.corporate_actions {
+            Some(plan) => {
+                hash.update([1]);
+                hash.update(plan.content_hash().bytes());
+                hash.update(plan.audit_hash().bytes());
+                hash.update(plan.knowledge_cutoff().unix_nanos().to_be_bytes());
+                hash.update(plan.valuation_cutoff().unix_nanos().to_be_bytes());
+            }
+            None => hash.update([0]),
+        }
+        update_usize(&mut hash, self.sources.len());
+        for source in &self.sources {
+            update_text(&mut hash, source.as_str());
+        }
+        hash.update(self.seed.to_be_bytes());
+        for limit in [
+            self.limits.max_observations,
+            self.limits.max_pending_intents,
+            self.limits.max_fills,
+            self.limits.max_retained_bytes,
+        ] {
+            update_usize(&mut hash, limit);
+        }
+        Sha256Digest::new(hash.finalize().into())
+    }
+
+    /// Binds every run authority that must remain invariant across dataset partitions.
+    pub(crate) fn cohort_authority_digest(&self) -> Sha256Digest {
+        let mut hash = Sha256::new();
+        hash.update(b"market-squawk/backtest-cohort-authority/v1");
         hash.update(self.assumptions.digest().bytes());
         hash.update(self.portfolio.account_id.as_uuid().as_bytes());
         update_decimal(&mut hash, self.portfolio.initial_cash.amount());
@@ -381,6 +416,12 @@ pub enum AccountingReconciliation {
 #[derive(Debug)]
 pub struct BacktestEngine;
 
+#[derive(Debug)]
+struct PendingIntent {
+    intent: OrderIntent,
+    remaining: QuantityLots,
+}
+
 impl BacktestEngine {
     /// Streams the exact PIT input in event-time order and reconciles all fills through Task 16.
     pub fn run(
@@ -390,7 +431,7 @@ impl BacktestEngine {
     ) -> Result<BacktestRun, BacktestError> {
         let mut clock = EventTimeClock::default();
         let mut simulator = ResearchFillSimulator::new(request.assumptions, request.seed);
-        let mut pending = Vec::<OrderIntent>::new();
+        let mut pending = Vec::<PendingIntent>::new();
         let mut fills = Vec::<ResearchFill>::new();
         let mut no_action_count = 0_usize;
         let mut latest_prices = BTreeMap::<InstrumentId, (Money, Timestamp)>::new();
@@ -418,10 +459,20 @@ impl BacktestEngine {
                     ),
                 );
             }
-            pending.retain(|intent| intent.expires_at() >= observation.decision_at);
+            pending.retain(|pending| pending.intent.expires_at() >= observation.decision_at);
+            if let Some(plan) = &request.corporate_actions {
+                pending.retain(|pending| {
+                    !corporate_action_invalidates_pending(
+                        plan,
+                        pending.intent.execution_terms().instrument_id(),
+                        pending.intent.signal_at(),
+                        observation.decision_at,
+                    )
+                });
+            }
             if observation.universe == HistoricalUniverseStatus::Delisted {
-                pending.retain(|intent| {
-                    intent.execution_terms().instrument_id() != observation.instrument_id()
+                pending.retain(|pending| {
+                    pending.intent.execution_terms().instrument_id() != observation.instrument_id()
                 });
             }
             if observation.universe == HistoricalUniverseStatus::Eligible
@@ -430,18 +481,19 @@ impl BacktestEngine {
             {
                 match request.assumptions.liquidity_priority() {
                     crate::ResearchLiquidityPriority::SignalTimeThenOrderId => {
-                        pending
-                            .sort_unstable_by_key(|intent| (intent.signal_at(), intent.order_id()));
+                        pending.sort_unstable_by_key(|pending| {
+                            (pending.intent.signal_at(), pending.intent.order_id())
+                        });
                     }
                 }
                 let capacity = simulator.observation_capacity(observation.executable_depth)?;
                 let mut remaining_capacity = capacity;
                 let mut index = 0_usize;
                 while index < pending.len() {
-                    if pending[index].execution_terms().instrument_id()
+                    if pending[index].intent.execution_terms().instrument_id()
                         != observation.instrument_id()
                         || !clock.is_execution_eligible(
-                            pending[index].signal_at(),
+                            pending[index].intent.signal_at(),
                             request.assumptions.latency_nanos(),
                         )?
                     {
@@ -449,11 +501,12 @@ impl BacktestEngine {
                         continue;
                     }
                     let immediate = matches!(
-                        pending[index].time_in_force(),
+                        pending[index].intent.time_in_force(),
                         TimeInForce::ImmediateOrCancel | TimeInForce::FillOrKill
                     );
                     let outcome = simulator.simulate(
-                        &pending[index],
+                        &pending[index].intent,
+                        pending[index].remaining,
                         observation.decision_at,
                         mid_price,
                         observation.spread_basis_points,
@@ -467,7 +520,7 @@ impl BacktestEngine {
                         }
                         continue;
                     };
-                    shadow.apply(&fill, pending[index].execution_terms())?;
+                    shadow.apply(&fill, pending[index].intent.execution_terms())?;
                     let remaining_lots = remaining_capacity
                         .get()
                         .checked_sub(fill.quantity().get())
@@ -476,8 +529,18 @@ impl BacktestEngine {
                     if fills.len() >= request.limits.max_fills {
                         return Err(BacktestError::LimitExceeded);
                     }
+                    let residual = pending[index]
+                        .remaining
+                        .get()
+                        .checked_sub(fill.quantity().get())
+                        .ok_or(BacktestError::AccountingMismatch)?;
                     fills.push(fill);
-                    pending.remove(index);
+                    if residual == 0 || immediate {
+                        pending.remove(index);
+                    } else {
+                        pending[index].remaining = QuantityLots::new(residual)?;
+                        index += 1;
+                    }
                 }
                 let context = BacktestContext {
                     observation,
@@ -500,7 +563,8 @@ impl BacktestEngine {
                     if pending.len() >= request.limits.max_pending_intents {
                         return Err(BacktestError::LimitExceeded);
                     }
-                    pending.push(intent);
+                    let remaining = intent.quantity();
+                    pending.push(PendingIntent { intent, remaining });
                 }
             }
             if let Some(equity) = shadow.marked_equity(&latest_prices, observation.decision_at)? {
@@ -533,6 +597,29 @@ impl BacktestEngine {
     }
 }
 
+fn corporate_action_invalidates_pending(
+    plan: &CorporateActionPlan,
+    instrument_id: InstrumentId,
+    signal_at: Timestamp,
+    decision_at: Timestamp,
+) -> bool {
+    plan.admitted().iter().any(|record| {
+        let context = record.observation().context();
+        let available = match context.provenance().availability() {
+            AvailabilityEvidence::Evidenced { available_at, .. } => *available_at <= decision_at,
+            AvailabilityEvidence::LocalFirstObserved { observed_at } => *observed_at <= decision_at,
+            AvailabilityEvidence::Inferred { .. } | AvailabilityEvidence::Unknown => false,
+        };
+        available
+            && context.provenance().instrument_id() == Some(instrument_id)
+            && context
+                .time()
+                .effective()
+                .exact_timestamp()
+                .is_some_and(|effective_at| effective_at > signal_at && effective_at <= decision_at)
+    })
+}
+
 fn result_digest(
     request: &BacktestRequest,
     fills: &[ResearchFill],
@@ -540,7 +627,7 @@ fn result_digest(
     no_action_count: usize,
 ) -> Sha256Digest {
     let mut hash = Sha256::new();
-    hash.update(b"market-squawk/backtest-result/v2");
+    hash.update(b"market-squawk/backtest-result/v3");
     hash.update(request.run_input_digest().bytes());
     for fill in fills {
         hash.update(fill.intent_digest().as_bytes());

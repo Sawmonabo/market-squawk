@@ -14,7 +14,7 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 /// Current complete semantic version of the research execution policy.
-pub const RESEARCH_EXECUTION_POLICY_VERSION: u32 = 2;
+pub const RESEARCH_EXECUTION_POLICY_VERSION: u32 = 3;
 
 /// Deterministic precedence applied when multiple eligible intents compete for one snapshot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -82,7 +82,7 @@ impl ResearchExecutionAssumptions {
             return Err(ResearchFillError::InvalidPolicy);
         }
         let mut hash = Sha256::new();
-        hash.update(b"market-squawk/research-execution-assumptions/v2");
+        hash.update(b"market-squawk/research-execution-assumptions/v3");
         hash.update(version.get().to_be_bytes());
         hash.update(input.fee_basis_points.get().to_be_bytes());
         hash.update(input.slippage_basis_points.get().to_be_bytes());
@@ -233,6 +233,7 @@ impl ResearchFillSimulator {
     pub(crate) fn simulate(
         &mut self,
         intent: &OrderIntent,
+        requested: QuantityLots,
         executed_at: Timestamp,
         mid_price: PriceTicks,
         spread: BasisPoints,
@@ -241,7 +242,6 @@ impl ResearchFillSimulator {
         if available_capacity.get() == 0 {
             return Ok(None);
         }
-        let requested = intent.quantity();
         if intent.time_in_force() == TimeInForce::FillOrKill
             && available_capacity.get() < requested.get()
         {

@@ -8,12 +8,13 @@ use sha2::{Digest as _, Sha256};
 use super::ExperimentError;
 use super::model::{
     BacktestArtifact, ExperimentLimits, TrialCompletion, TrialCompletionInput,
-    TrialComponentBinding, TrialDatasetPartition, TrialFailure, TrialId, TrialMetric,
-    TrialParameter, TrialSearchDimension, TrialSpec, TrialSpecInput, TrialStatus,
+    TrialComponentBinding, TrialDatasetPartition, TrialFailure, TrialId, TrialIdentityVersion,
+    TrialMetric, TrialParameter, TrialSearchDimension, TrialSpec, TrialStatus,
+    VersionedTrialSpecInput,
 };
 
-const RESERVATION_SCHEMA_VERSION: u16 = 2;
-const TERMINAL_SCHEMA_VERSION: u16 = 2;
+const RESERVATION_SCHEMA_VERSION: u16 = 3;
+const TERMINAL_SCHEMA_VERSION: u16 = 3;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -29,7 +30,12 @@ struct TrialSpecWire {
     dataset_identity: String,
     object_graph_digest: String,
     execution_assumption_digest: String,
-    run_input_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    run_input_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cohort_authority_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cohort_universe_digest: Option<String>,
     model: Option<BindingWire>,
     strategy: BindingWire,
     code: BindingWire,
@@ -130,15 +136,23 @@ pub(super) fn encode_reservation(spec: &TrialSpec) -> Result<Vec<u8>, Experiment
 pub(super) fn decode_reservation(bytes: &[u8]) -> Result<TrialSpec, ExperimentError> {
     let wire: ReservationWire =
         serde_json::from_slice(bytes).map_err(|_| ExperimentError::CorruptRecord)?;
-    if wire.schema_version != RESERVATION_SCHEMA_VERSION {
-        return Err(ExperimentError::CorruptRecord);
-    }
+    let identity_version = match wire.schema_version {
+        1 => TrialIdentityVersion::V1,
+        2 => TrialIdentityVersion::V2,
+        RESERVATION_SCHEMA_VERSION => TrialIdentityVersion::V3,
+        _ => return Err(ExperimentError::CorruptRecord),
+    };
     let expected = TrialId(decode_hex(&wire.trial_id)?);
-    let spec = TrialSpec::try_from(wire.spec)?;
+    let spec = wire.spec.try_into_spec(identity_version)?;
     if spec.id() != expected {
         return Err(ExperimentError::CorruptRecord);
     }
     Ok(spec)
+}
+
+pub(super) struct DecodedTerminal {
+    pub schema_version: u16,
+    pub status: TrialStatus,
 }
 
 pub(super) fn encode_terminal(
@@ -196,7 +210,7 @@ pub(super) fn decode_terminal(
     bytes: &[u8],
     expected_id: TrialId,
     limits: ExperimentLimits,
-) -> Result<TrialStatus, ExperimentError> {
+) -> Result<DecodedTerminal, ExperimentError> {
     let wire: TerminalWire =
         serde_json::from_slice(bytes).map_err(|_| ExperimentError::CorruptRecord)?;
     let schema_version = wire.schema_version;
@@ -244,7 +258,7 @@ pub(super) fn decode_terminal(
             if artifact_reference.is_empty()
                 || artifact_bytes == 0
                 || (schema_version == 1 && !valid_legacy)
-                || (schema_version == TERMINAL_SCHEMA_VERSION && !valid_current)
+                || (matches!(schema_version, 2 | TERMINAL_SCHEMA_VERSION) && !valid_current)
             {
                 return Err(ExperimentError::CorruptRecord);
             }
@@ -278,7 +292,10 @@ pub(super) fn decode_terminal(
                 limits,
             )
             .map_err(|_| ExperimentError::CorruptRecord)?;
-            Ok(TrialStatus::Completed(completion))
+            Ok(DecodedTerminal {
+                schema_version,
+                status: TrialStatus::Completed(completion),
+            })
         }
         (
             TerminalStatusWire::Failed,
@@ -287,10 +304,13 @@ pub(super) fn decode_terminal(
                 code,
                 evidence_digest,
             }),
-        ) => Ok(TrialStatus::Failed(
-            TrialFailure::try_new(parse_identifier(code)?, decode_hex(&evidence_digest)?)
-                .map_err(|_| ExperimentError::CorruptRecord)?,
-        )),
+        ) => Ok(DecodedTerminal {
+            schema_version,
+            status: TrialStatus::Failed(
+                TrialFailure::try_new(parse_identifier(code)?, decode_hex(&evidence_digest)?)
+                    .map_err(|_| ExperimentError::CorruptRecord)?,
+            ),
+        }),
         _ => Err(ExperimentError::CorruptRecord),
     }
 }
@@ -300,7 +320,7 @@ fn require_terminal_header(
     trial_id: &str,
     expected_id: TrialId,
 ) -> Result<(), ExperimentError> {
-    if !matches!(schema_version, 1 | TERMINAL_SCHEMA_VERSION)
+    if !matches!(schema_version, 1 | 2 | TERMINAL_SCHEMA_VERSION)
         || TrialId(decode_hex(trial_id)?) != expected_id
     {
         return Err(ExperimentError::CorruptRecord);
@@ -314,7 +334,15 @@ impl From<&TrialSpec> for TrialSpecWire {
             dataset_identity: encode_hex(value.dataset_identity.bytes()),
             object_graph_digest: encode_hex(value.object_graph_digest.bytes()),
             execution_assumption_digest: encode_hex(value.execution_assumption_digest.bytes()),
-            run_input_digest: encode_hex(value.run_input_digest.bytes()),
+            run_input_digest: value
+                .run_input_digest
+                .map(|digest| encode_hex(digest.bytes())),
+            cohort_authority_digest: value
+                .cohort_authority_digest
+                .map(|digest| encode_hex(digest.bytes())),
+            cohort_universe_digest: value
+                .cohort_universe_digest
+                .map(|digest| encode_hex(digest.bytes())),
             model: value.model.as_ref().map(BindingWire::from),
             strategy: BindingWire::from(&value.strategy),
             code: BindingWire::from(&value.code),
@@ -354,49 +382,70 @@ impl From<&TrialComponentBinding> for BindingWire {
     }
 }
 
-impl TryFrom<TrialSpecWire> for TrialSpec {
-    type Error = ExperimentError;
-
-    fn try_from(value: TrialSpecWire) -> Result<Self, Self::Error> {
-        TrialSpec::try_new(TrialSpecInput {
-            dataset_identity: decode_hex(&value.dataset_identity)?,
-            object_graph_digest: decode_hex(&value.object_graph_digest)?,
-            execution_assumption_digest: decode_hex(&value.execution_assumption_digest)?,
-            run_input_digest: decode_hex(&value.run_input_digest)?,
-            model: value
-                .model
-                .map(TrialComponentBinding::try_from)
-                .transpose()?,
-            strategy: TrialComponentBinding::try_from(value.strategy)?,
-            code: TrialComponentBinding::try_from(value.code)?,
-            configuration_digest: decode_hex(&value.configuration_digest)?,
-            seed: value.seed,
-            parameters: value
-                .parameters
-                .into_iter()
-                .map(|parameter| {
-                    Ok(TrialParameter::new(
-                        parse_identifier(parameter.name)?,
-                        parse_identifier(parameter.value)?,
-                    ))
-                })
-                .collect::<Result<Vec<_>, ExperimentError>>()?,
-            search_space: value
-                .search_space
-                .into_iter()
-                .map(|dimension| {
-                    TrialSearchDimension::try_new(
-                        parse_identifier(dimension.name)?,
-                        dimension
-                            .candidates
-                            .into_iter()
-                            .map(parse_identifier)
-                            .collect::<Result<Vec<_>, _>>()?,
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-            selection_criterion: parse_identifier(value.selection_criterion)?,
-        })
+impl TrialSpecWire {
+    fn try_into_spec(
+        self,
+        identity_version: TrialIdentityVersion,
+    ) -> Result<TrialSpec, ExperimentError> {
+        let run_input_digest = self
+            .run_input_digest
+            .as_deref()
+            .map(decode_hex)
+            .transpose()?;
+        let cohort_authority_digest = self
+            .cohort_authority_digest
+            .as_deref()
+            .map(decode_hex)
+            .transpose()?;
+        let cohort_universe_digest = self
+            .cohort_universe_digest
+            .as_deref()
+            .map(decode_hex)
+            .transpose()?;
+        TrialSpec::try_new_versioned(
+            VersionedTrialSpecInput {
+                dataset_identity: decode_hex(&self.dataset_identity)?,
+                object_graph_digest: decode_hex(&self.object_graph_digest)?,
+                execution_assumption_digest: decode_hex(&self.execution_assumption_digest)?,
+                run_input_digest,
+                cohort_authority_digest,
+                cohort_universe_digest,
+                model: self
+                    .model
+                    .map(TrialComponentBinding::try_from)
+                    .transpose()?,
+                strategy: TrialComponentBinding::try_from(self.strategy)?,
+                code: TrialComponentBinding::try_from(self.code)?,
+                configuration_digest: decode_hex(&self.configuration_digest)?,
+                seed: self.seed,
+                parameters: self
+                    .parameters
+                    .into_iter()
+                    .map(|parameter| {
+                        Ok(TrialParameter::new(
+                            parse_identifier(parameter.name)?,
+                            parse_identifier(parameter.value)?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, ExperimentError>>()?,
+                search_space: self
+                    .search_space
+                    .into_iter()
+                    .map(|dimension| {
+                        TrialSearchDimension::try_new(
+                            parse_identifier(dimension.name)?,
+                            dimension
+                                .candidates
+                                .into_iter()
+                                .map(parse_identifier)
+                                .collect::<Result<Vec<_>, _>>()?,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+                selection_criterion: parse_identifier(self.selection_criterion)?,
+            },
+            identity_version,
+        )
         .map_err(|_| ExperimentError::CorruptRecord)
     }
 }

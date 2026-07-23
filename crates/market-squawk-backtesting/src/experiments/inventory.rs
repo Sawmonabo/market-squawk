@@ -1,13 +1,16 @@
 //! Capability-confined immutable inventory and content-addressed publication.
 
+use std::collections::BTreeSet;
+use std::fs::File;
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cap_fs_ext::{DirExt as _, FollowSymlinks, OpenOptionsFollowExt as _};
 use cap_std::fs::{Dir, OpenOptions};
+use fs2::FileExt as _;
 use market_squawk_data::Sha256Digest;
 use market_squawk_domain::Timestamp;
 use serde::{Deserialize, Serialize};
@@ -29,8 +32,10 @@ const NAMESPACE: &str = "backtesting/v1";
 const RESERVATIONS: &str = "backtesting/v1/reservations";
 const TERMINALS: &str = "backtesting/v1/terminals";
 const ATTEMPTS: &str = "backtesting/v1/attempts";
+const PENDING: &str = "backtesting/v1/pending";
 const COHORTS: &str = "backtesting/v1/cohorts";
 const ARTIFACTS: &str = "backtesting/v1/artifacts/sha256";
+const AUTHORITY_LOCK: &str = "backtesting/v1/inventory.lock";
 const DEFAULT_LEASE_NANOS: i64 = 60 * 60 * 1_000_000_000;
 const MAX_ATTEMPTS_PER_TRIAL: usize = 1_024;
 const MAX_STAGE_NAME_ATTEMPTS: usize = 32;
@@ -44,6 +49,15 @@ pub struct TrialReservation {
     record_digest: Sha256Digest,
     attempt: u64,
     attempt_digest: Sha256Digest,
+    active_attempts: Arc<Mutex<BTreeSet<(TrialId, u64)>>>,
+}
+
+impl Drop for TrialReservation {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.active_attempts.lock() {
+            active.remove(&(self.spec.id(), self.attempt));
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -62,6 +76,8 @@ struct AttemptRecord {
 pub struct ExperimentInventory {
     root: Dir,
     limits: ExperimentLimits,
+    _authority_lock: File,
+    active_attempts: Arc<Mutex<BTreeSet<(TrialId, u64)>>>,
     writer: Mutex<()>,
 }
 
@@ -74,15 +90,19 @@ impl ExperimentInventory {
             RESERVATIONS,
             TERMINALS,
             ATTEMPTS,
+            PENDING,
             COHORTS,
             "backtesting/v1/artifacts",
             ARTIFACTS,
         ] {
             ensure_directory(&root, Path::new(path))?;
         }
+        let authority_lock = acquire_authority_lock(&root)?;
         Ok(Self {
             root,
             limits,
+            _authority_lock: authority_lock,
+            active_attempts: Arc::new(Mutex::new(BTreeSet::new())),
             writer: Mutex::new(()),
         })
     }
@@ -131,30 +151,6 @@ impl ExperimentInventory {
             return Err(ExperimentError::TrialAlreadyExists);
         }
         self.acquire_attempt(spec, digest_bytes(&bytes), acquired_at, lease_nanos)
-    }
-
-    /// Publishes a bounded content-addressed detailed result. Exact retries are idempotent.
-    pub(crate) fn publish_artifact(
-        &self,
-        bytes: &[u8],
-    ) -> Result<BacktestArtifact, ExperimentError> {
-        let artifact = self.prepare_artifact(bytes)?;
-        let reference = artifact.reference().to_owned();
-        let parent = Path::new(&reference)
-            .parent()
-            .ok_or(ExperimentError::Encoding)?;
-        let _guard = self
-            .writer
-            .lock()
-            .map_err(|_| ExperimentError::Unavailable)?;
-        ensure_directory(&self.root, parent)?;
-        publish_immutable(
-            &self.root,
-            Path::new(&reference),
-            bytes,
-            ExistingPolicy::AcceptExact,
-        )?;
-        Ok(artifact)
     }
 
     pub(crate) fn prepare_artifact(
@@ -212,8 +208,61 @@ impl ExperimentInventory {
         &self,
         reservation: TrialReservation,
         completion: TrialCompletion,
+        artifact_bytes: &[u8],
     ) -> Result<TrialRecord, ExperimentError> {
-        self.commit_terminal(reservation, TrialStatus::Completed(completion))
+        let expected_artifact = self.prepare_artifact(artifact_bytes)?;
+        if completion.artifact() != &expected_artifact {
+            return Err(ExperimentError::InvalidCompletion);
+        }
+        let status = TrialStatus::Completed(completion);
+        let terminal = encode_terminal(reservation.spec.id(), &status)?;
+        if terminal.len() > self.limits.max_record_bytes {
+            return Err(ExperimentError::LimitExceeded);
+        }
+        let _guard = self
+            .writer
+            .lock()
+            .map_err(|_| ExperimentError::Unavailable)?;
+        self.validate_active_attempt(&reservation)?;
+
+        let pending_path = pending_artifact_path(reservation.spec.id(), reservation.attempt);
+        ensure_directory(
+            &self.root,
+            pending_path.parent().ok_or(ExperimentError::Encoding)?,
+        )?;
+        publish_or_confirm_exact(
+            &self.root,
+            &pending_path,
+            artifact_bytes,
+            ExistingPolicy::AcceptExact,
+        )?;
+        self.validate_active_attempt(&reservation)?;
+
+        let terminal_path = attempt_terminal_path(reservation.spec.id(), reservation.attempt);
+        ensure_directory(&self.root, &terminal_attempt_parent(reservation.spec.id()))?;
+        publish_or_confirm_exact(
+            &self.root,
+            &terminal_path,
+            &terminal,
+            ExistingPolicy::Reject,
+        )?;
+
+        let artifact_path = Path::new(expected_artifact.reference());
+        ensure_directory(
+            &self.root,
+            artifact_path.parent().ok_or(ExperimentError::Encoding)?,
+        )?;
+        publish_or_confirm_exact(
+            &self.root,
+            artifact_path,
+            artifact_bytes,
+            ExistingPolicy::AcceptExact,
+        )?;
+        cleanup_optional(&self.root, &pending_path);
+        Ok(TrialRecord {
+            spec: reservation.spec.clone(),
+            status,
+        })
     }
 
     pub(crate) fn prepare_completion(
@@ -262,7 +311,11 @@ impl ExperimentInventory {
             self.limits.max_record_bytes,
         )?;
         let status = if let Some(bytes) = legacy {
-            decode_terminal(&bytes, id, self.limits)?
+            let decoded = decode_terminal(&bytes, id, self.limits)?;
+            if decoded.schema_version == 3 {
+                return Err(ExperimentError::CorruptRecord);
+            }
+            decoded.status
         } else if let Some(attempt) = latest_attempt(&self.root, id, self.limits.max_record_bytes)?
         {
             match read_optional_bounded(
@@ -270,13 +323,66 @@ impl ExperimentInventory {
                 &attempt_terminal_path(id, attempt.attempt),
                 self.limits.max_record_bytes,
             )? {
-                Some(bytes) => decode_terminal(&bytes, id, self.limits)?,
+                Some(bytes) => {
+                    let decoded = decode_terminal(&bytes, id, self.limits)?;
+                    self.reconcile_terminal_artifact(id, attempt.attempt, decoded)?
+                }
                 None => TrialStatus::Reserved,
             }
         } else {
             TrialStatus::Reserved
         };
         Ok(TrialRecord { spec, status })
+    }
+
+    fn reconcile_terminal_artifact(
+        &self,
+        id: TrialId,
+        attempt: u64,
+        decoded: super::wire::DecodedTerminal,
+    ) -> Result<TrialStatus, ExperimentError> {
+        if decoded.schema_version != 3 {
+            return Ok(decoded.status);
+        }
+        let TrialStatus::Completed(completion) = &decoded.status else {
+            return Ok(decoded.status);
+        };
+        let artifact = completion.artifact();
+        let expected_reference = artifact_reference(artifact.digest())?;
+        if artifact.reference() != expected_reference {
+            return Err(ExperimentError::CorruptRecord);
+        }
+        let maximum =
+            usize::try_from(artifact.byte_count()).map_err(|_| ExperimentError::CorruptRecord)?;
+        if maximum == 0 || maximum > self.limits.max_artifact_bytes {
+            return Err(ExperimentError::CorruptRecord);
+        }
+        let final_path = Path::new(artifact.reference());
+        let pending_path = pending_artifact_path(id, attempt);
+        let final_bytes = read_optional_bounded(&self.root, final_path, maximum)?;
+        let pending_bytes = read_optional_bounded(&self.root, &pending_path, maximum)?;
+        if let Some(bytes) = &final_bytes {
+            validate_artifact_bytes(bytes, artifact)?;
+            if let Some(pending) = &pending_bytes {
+                validate_artifact_bytes(pending, artifact)?;
+            }
+            cleanup_optional(&self.root, &pending_path);
+            return Ok(decoded.status);
+        }
+        let pending = pending_bytes.ok_or(ExperimentError::CorruptRecord)?;
+        validate_artifact_bytes(&pending, artifact)?;
+        ensure_directory(
+            &self.root,
+            final_path.parent().ok_or(ExperimentError::Encoding)?,
+        )?;
+        publish_or_confirm_exact(
+            &self.root,
+            final_path,
+            &pending,
+            ExistingPolicy::AcceptExact,
+        )?;
+        cleanup_optional(&self.root, &pending_path);
+        Ok(decoded.status)
     }
 
     fn commit_terminal(
@@ -288,6 +394,29 @@ impl ExperimentInventory {
             .writer
             .lock()
             .map_err(|_| ExperimentError::Unavailable)?;
+        self.validate_active_attempt(&reservation)?;
+        let terminal = encode_terminal(reservation.spec.id(), &status)?;
+        if terminal.len() > self.limits.max_record_bytes {
+            return Err(ExperimentError::LimitExceeded);
+        }
+        let terminal_parent = terminal_attempt_parent(reservation.spec.id());
+        ensure_directory(&self.root, &terminal_parent)?;
+        publish_or_confirm_exact(
+            &self.root,
+            &attempt_terminal_path(reservation.spec.id(), reservation.attempt),
+            &terminal,
+            ExistingPolicy::Reject,
+        )?;
+        Ok(TrialRecord {
+            spec: reservation.spec.clone(),
+            status,
+        })
+    }
+
+    fn validate_active_attempt(
+        &self,
+        reservation: &TrialReservation,
+    ) -> Result<(), ExperimentError> {
         let completed_at = current_timestamp()?;
         let reservation_bytes = read_bounded(
             &self.root,
@@ -308,6 +437,11 @@ impl ExperimentInventory {
         if digest_bytes(&attempt_bytes) != reservation.attempt_digest
             || attempt.attempt != reservation.attempt
             || attempt.reservation_digest != encode_hex(reservation.record_digest.bytes())
+            || !self
+                .active_attempts
+                .lock()
+                .map_err(|_| ExperimentError::Unavailable)?
+                .contains(&(reservation.spec.id(), reservation.attempt))
             || latest_attempt(
                 &self.root,
                 reservation.spec.id(),
@@ -316,36 +450,10 @@ impl ExperimentInventory {
             .map(|value| value.attempt)
                 != Some(reservation.attempt)
             || completed_at.unix_nanos() < attempt.acquired_at
-            || completed_at.unix_nanos() >= attempt.expires_at
         {
             return Err(ExperimentError::ReservationLeaseLost);
         }
-        let terminal = encode_terminal(reservation.spec.id(), &status)?;
-        if terminal.len() > self.limits.max_record_bytes {
-            return Err(ExperimentError::LimitExceeded);
-        }
-        let terminal_parent = terminal_attempt_parent(reservation.spec.id());
-        ensure_directory(&self.root, &terminal_parent)?;
-        publish_immutable(
-            &self.root,
-            &attempt_terminal_path(reservation.spec.id(), reservation.attempt),
-            &terminal,
-            ExistingPolicy::Reject,
-        )?;
-        if latest_attempt(
-            &self.root,
-            reservation.spec.id(),
-            self.limits.max_record_bytes,
-        )?
-        .map(|value| value.attempt)
-            != Some(reservation.attempt)
-        {
-            return Err(ExperimentError::ReservationLeaseLost);
-        }
-        Ok(TrialRecord {
-            spec: reservation.spec,
-            status,
-        })
+        Ok(())
     }
 
     fn acquire_attempt(
@@ -358,6 +466,15 @@ impl ExperimentInventory {
         let trial_id = spec.id();
         let parent = attempt_parent(trial_id);
         ensure_directory(&self.root, &parent)?;
+        if self
+            .active_attempts
+            .lock()
+            .map_err(|_| ExperimentError::Unavailable)?
+            .iter()
+            .any(|(active_id, _)| *active_id == trial_id)
+        {
+            return Err(ExperimentError::TrialInProgress);
+        }
         for _ in 0..3 {
             let latest = latest_attempt(&self.root, trial_id, self.limits.max_record_bytes)?;
             if let Some(attempt) = &latest
@@ -375,6 +492,12 @@ impl ExperimentInventory {
                 .is_some_and(|attempt| attempt.expires_at > acquired_at.unix_nanos())
             {
                 return Err(ExperimentError::TrialInProgress);
+            }
+            if let Some(attempt) = &latest {
+                remove_optional(
+                    &self.root,
+                    &pending_artifact_path(trial_id, attempt.attempt),
+                )?;
             }
             let number = latest.map_or(1, |attempt| attempt.attempt.saturating_add(1));
             if number == 0
@@ -406,11 +529,16 @@ impl ExperimentInventory {
                 ExistingPolicy::Reject,
             ) {
                 Ok(()) => {
+                    self.active_attempts
+                        .lock()
+                        .map_err(|_| ExperimentError::Unavailable)?
+                        .insert((trial_id, number));
                     return Ok(TrialReservation {
                         spec,
                         record_digest,
                         attempt: number,
                         attempt_digest: digest_bytes(&attempt_bytes),
+                        active_attempts: Arc::clone(&self.active_attempts),
                     });
                 }
                 Err(ExperimentError::TrialAlreadyExists) => continue,
@@ -478,6 +606,40 @@ fn publish_immutable(
     Ok(())
 }
 
+fn publish_or_confirm_exact(
+    root: &Dir,
+    final_path: &Path,
+    bytes: &[u8],
+    policy: ExistingPolicy,
+) -> Result<(), ExperimentError> {
+    match publish_immutable(root, final_path, bytes, policy) {
+        Ok(()) => Ok(()),
+        Err(error) => match read_optional_bounded(root, final_path, bytes.len().max(1)) {
+            Ok(Some(existing)) if existing == bytes => Ok(()),
+            _ => Err(error),
+        },
+    }
+}
+
+fn validate_artifact_bytes(
+    bytes: &[u8],
+    artifact: &BacktestArtifact,
+) -> Result<(), ExperimentError> {
+    if u64::try_from(bytes.len()).map_err(|_| ExperimentError::CorruptRecord)?
+        != artifact.byte_count()
+        || digest_bytes(bytes) != artifact.digest()
+    {
+        return Err(ExperimentError::CorruptRecord);
+    }
+    Ok(())
+}
+
+fn artifact_reference(digest: Sha256Digest) -> Result<String, ExperimentError> {
+    let hex = encode_hex(digest.bytes());
+    let prefix = hex.get(..2).ok_or(ExperimentError::Encoding)?;
+    Ok(format!("{ARTIFACTS}/{prefix}/{hex}.json"))
+}
+
 fn create_unique_stage(
     root: &Dir,
     final_path: &Path,
@@ -509,6 +671,20 @@ fn remove_stage(root: &Dir, stage_path: &Path) -> Result<(), ExperimentError> {
         Ok(()) => synchronize_parent(root, stage_path),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(ExperimentError::Io(error)),
+    }
+}
+
+fn remove_optional(root: &Dir, path: &Path) -> Result<(), ExperimentError> {
+    match root.remove_file(path) {
+        Ok(()) => synchronize_parent(root, path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(ExperimentError::Io(error)),
+    }
+}
+
+fn cleanup_optional(root: &Dir, path: &Path) {
+    match remove_optional(root, path) {
+        Ok(()) | Err(_) => {}
     }
 }
 
@@ -606,6 +782,38 @@ fn configure_private_creation(options: &mut OpenOptions) {
 #[cfg(not(unix))]
 fn configure_private_creation(_options: &mut OpenOptions) {}
 
+fn acquire_authority_lock(root: &Dir) -> Result<File, ExperimentError> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    options.follow(FollowSymlinks::No);
+    configure_private_creation(&mut options);
+    let lock = root.open_with(AUTHORITY_LOCK, &options)?.into_std();
+    validate_authority_lock(&lock)?;
+    lock.try_lock_exclusive()
+        .map_err(|_| ExperimentError::Unavailable)?;
+    validate_authority_lock(&lock)?;
+    Ok(lock)
+}
+
+#[cfg(unix)]
+fn validate_authority_lock(lock: &File) -> Result<(), ExperimentError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = lock.metadata()?;
+    if !metadata.is_file() || metadata.nlink() != 1 || metadata.mode() & 0o077 != 0 {
+        return Err(ExperimentError::Unavailable);
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_authority_lock(lock: &File) -> Result<(), ExperimentError> {
+    if !lock.metadata()?.is_file() {
+        return Err(ExperimentError::Unavailable);
+    }
+    Ok(())
+}
+
 fn reservation_path(id: TrialId) -> std::path::PathBuf {
     Path::new(RESERVATIONS).join(format!("{}.json", encode_hex(id.digest().bytes())))
 }
@@ -620,6 +828,12 @@ fn terminal_attempt_parent(id: TrialId) -> PathBuf {
 
 fn attempt_terminal_path(id: TrialId, attempt: u64) -> PathBuf {
     terminal_attempt_parent(id).join(format!("{attempt:020}.json"))
+}
+
+fn pending_artifact_path(id: TrialId, attempt: u64) -> PathBuf {
+    Path::new(PENDING)
+        .join(encode_hex(id.digest().bytes()))
+        .join(format!("{attempt:020}.json"))
 }
 
 fn cohort_path(id: BacktestCohortEvaluationId) -> PathBuf {
@@ -639,7 +853,11 @@ fn latest_attempt(
     id: TrialId,
     maximum: usize,
 ) -> Result<Option<AttemptRecord>, ExperimentError> {
-    let directory = root.open_dir_nofollow(attempt_parent(id))?;
+    let directory = match root.open_dir_nofollow(attempt_parent(id)) {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(ExperimentError::Io(error)),
+    };
     let mut latest = None::<AttemptRecord>;
     let mut count = 0_usize;
     for entry in directory.entries()? {

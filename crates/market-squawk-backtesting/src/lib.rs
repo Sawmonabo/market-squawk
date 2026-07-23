@@ -23,13 +23,14 @@ pub use engine::{
 };
 pub use experiments::{
     BacktestArtifact, BacktestCohortCandidate, BacktestCohortEvaluation,
-    BacktestCohortEvaluationId, BacktestCohortFold, BacktestCohortPlan, BacktestExecutableIdentity,
-    BacktestOverfittingDiagnostic, BacktestOverfittingFold, BacktestOverfittingInput,
-    BacktestOverfittingScore, CohortMemberBinding, DeflatedPerformanceDiagnostic,
-    DeflatedPerformanceInput, ExperimentError, ExperimentInventory, ExperimentLimits,
-    ExperimentLimitsInput, TrialCompletion, TrialComponentBinding, TrialDatasetPartition,
-    TrialFailure, TrialId, TrialMetric, TrialParameter, TrialRecord, TrialReservation,
-    TrialSearchDimension, TrialSpec, TrialSpecInput, TrialStatus,
+    BacktestCohortEvaluationId, BacktestCohortFold, BacktestCohortFoldPartition,
+    BacktestCohortPartition, BacktestCohortPlan, BacktestCohortUniverse,
+    BacktestExecutableIdentity, BacktestOverfittingDiagnostic, BacktestOverfittingFold,
+    BacktestOverfittingInput, BacktestOverfittingScore, CohortMemberBinding,
+    DeflatedPerformanceDiagnostic, DeflatedPerformanceInput, ExperimentError, ExperimentInventory,
+    ExperimentLimits, ExperimentLimitsInput, TrialCompletion, TrialComponentBinding,
+    TrialDatasetPartition, TrialFailure, TrialId, TrialMetric, TrialParameter, TrialRecord,
+    TrialReservation, TrialSearchDimension, TrialSpec, TrialSpecInput, TrialStatus,
 };
 pub use fills::{
     RESEARCH_EXECUTION_POLICY_VERSION, ResearchExecutionAssumptions,

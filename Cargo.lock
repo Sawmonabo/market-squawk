@@ -3606,6 +3606,7 @@ dependencies = [
  "arrow",
  "cap-fs-ext",
  "cap-std",
+ "fs2",
  "market-squawk-analytics",
  "market-squawk-data",
  "market-squawk-domain",

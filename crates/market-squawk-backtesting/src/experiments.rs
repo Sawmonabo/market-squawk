@@ -9,7 +9,8 @@ mod wire;
 pub(crate) use cohort::CohortEvaluationInput;
 pub use cohort::{
     BacktestCohortCandidate, BacktestCohortEvaluation, BacktestCohortEvaluationId,
-    BacktestCohortFold, BacktestCohortPlan, CohortMemberBinding,
+    BacktestCohortFold, BacktestCohortFoldPartition, BacktestCohortPartition, BacktestCohortPlan,
+    BacktestCohortUniverse, CohortMemberBinding,
 };
 pub use diagnostics::{
     BacktestOverfittingDiagnostic, BacktestOverfittingFold, BacktestOverfittingInput,

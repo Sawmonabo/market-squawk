@@ -9,12 +9,12 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 use crate::experiments::{
-    BacktestCohortEvaluation, BacktestCohortPlan, BacktestOverfittingDiagnostic,
-    BacktestOverfittingFold, BacktestOverfittingInput, BacktestOverfittingScore,
-    CohortEvaluationInput, CohortMemberBinding, DeflatedPerformanceDiagnostic,
-    DeflatedPerformanceInput, ExperimentError, ExperimentInventory, TrialCompletionInput,
-    TrialDatasetPartition, TrialFailure, TrialId, TrialMetric, TrialParameter, TrialRecord,
-    TrialSearchDimension, TrialSpec, TrialSpecInput, TrialStatus,
+    BacktestCohortEvaluation, BacktestCohortPlan, BacktestCohortUniverse,
+    BacktestOverfittingDiagnostic, BacktestOverfittingFold, BacktestOverfittingInput,
+    BacktestOverfittingScore, CohortEvaluationInput, CohortMemberBinding,
+    DeflatedPerformanceDiagnostic, DeflatedPerformanceInput, ExperimentError, ExperimentInventory,
+    TrialCompletionInput, TrialDatasetPartition, TrialFailure, TrialId, TrialMetric,
+    TrialParameter, TrialRecord, TrialSearchDimension, TrialSpec, TrialSpecInput, TrialStatus,
 };
 use crate::{
     AdmittedBacktestStrategy, BacktestEngine, BacktestError, BacktestRequest, BacktestRun,
@@ -28,6 +28,7 @@ pub struct BacktestTrialPlan {
     parameters: Vec<TrialParameter>,
     search_space: Vec<TrialSearchDimension>,
     selection_criterion: SourceIdentifier,
+    cohort_universe: Option<BacktestCohortUniverse>,
 }
 
 impl BacktestTrialPlan {
@@ -42,7 +43,15 @@ impl BacktestTrialPlan {
             parameters,
             search_space,
             selection_criterion,
+            cohort_universe: None,
         }
+    }
+
+    /// Binds a complete code-generated cohort universe before this member is reserved.
+    #[must_use]
+    pub fn with_cohort_universe(mut self, universe: BacktestCohortUniverse) -> Self {
+        self.cohort_universe = Some(universe);
+        self
     }
 }
 
@@ -138,6 +147,11 @@ impl BacktestService {
             object_graph_digest: request.object_graph_digest(),
             execution_assumption_digest: request.assumption_digest(),
             run_input_digest: request.run_input_digest(),
+            cohort_authority_digest: request.cohort_authority_digest(),
+            cohort_universe_digest: plan
+                .cohort_universe
+                .as_ref()
+                .map(BacktestCohortUniverse::digest),
             model: executable.model().cloned(),
             strategy: executable.strategy().clone(),
             code: executable.code().clone(),
@@ -208,15 +222,9 @@ impl BacktestService {
                 return Err(error.into());
             }
         };
-        if let Err(error) = self.inventory.publish_artifact(&artifact_bytes) {
-            self.commit_failure(
-                reservation,
-                "backtest-artifact-publication",
-                &error.to_string(),
-            )?;
-            return Err(error.into());
-        }
-        let trial = self.inventory.complete(reservation, completion)?;
+        let trial = self
+            .inventory
+            .complete(reservation, completion, &artifact_bytes)?;
         Ok(BacktestOutcome::Completed(Box::new(BacktestResult {
             run,
             trial,
@@ -238,13 +246,23 @@ impl BacktestService {
         let mut records = BTreeMap::new();
         let mut design = None;
         let mut design_cardinality = None;
+        let mut cohort_authority = None;
         for id in member_ids {
             let record = self.inventory.trial(id)?;
             if record.spec().selection_criterion() != plan.selection_criterion()
+                || record.spec().cohort_universe_digest() != Some(plan.universe().digest())
                 || !matches!(record.status(), TrialStatus::Completed(_))
             {
                 return Err(BacktestServiceError::InvalidCohort);
             }
+            let candidate_authority = record
+                .spec()
+                .cohort_authority_digest()
+                .ok_or(BacktestServiceError::InvalidCohort)?;
+            if cohort_authority.is_some_and(|expected| expected != candidate_authority) {
+                return Err(BacktestServiceError::InvalidCohort);
+            }
+            cohort_authority = Some(candidate_authority);
             let candidate_design = record.spec().experiment_design_digest()?;
             if design.is_some_and(|expected| expected != candidate_design) {
                 return Err(BacktestServiceError::InvalidCohort);
@@ -358,6 +376,7 @@ impl BacktestService {
         let evaluation = BacktestCohortEvaluation::try_new(CohortEvaluationInput {
             evaluator,
             experiment_design_digest: design.ok_or(BacktestServiceError::InvalidCohort)?,
+            cohort_universe_digest: plan.universe().digest(),
             selection_criterion: plan.selection_criterion().clone(),
             members: records
                 .keys()
@@ -517,9 +536,11 @@ fn validate_cohort_folds(
             }
             let identity = (
                 in_record.spec().dataset_identity().bytes(),
+                in_record.spec().object_graph_digest().bytes(),
                 in_partition.starts_at().unix_nanos(),
                 in_partition.ends_at().unix_nanos(),
                 out_record.spec().dataset_identity().bytes(),
+                out_record.spec().object_graph_digest().bytes(),
                 out_partition.starts_at().unix_nanos(),
                 out_partition.ends_at().unix_nanos(),
             );
@@ -536,6 +557,28 @@ fn validate_cohort_folds(
             return Err(BacktestServiceError::InvalidCohort);
         }
         expected_parameters = Some(fold_parameters);
+    }
+    let expected_partitions = plan
+        .universe()
+        .folds()
+        .iter()
+        .map(|fold| {
+            let in_sample = fold.in_sample();
+            let out_of_sample = fold.out_of_sample();
+            (
+                in_sample.dataset_identity().bytes(),
+                in_sample.object_graph_digest().bytes(),
+                in_sample.interval().starts_at().unix_nanos(),
+                in_sample.interval().ends_at().unix_nanos(),
+                out_of_sample.dataset_identity().bytes(),
+                out_of_sample.object_graph_digest().bytes(),
+                out_of_sample.interval().starts_at().unix_nanos(),
+                out_of_sample.interval().ends_at().unix_nanos(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    if seen_partitions != expected_partitions {
+        return Err(BacktestServiceError::InvalidCohort);
     }
     Ok(())
 }
@@ -559,6 +602,7 @@ fn validate_selection_candidates(
         };
         let dataset = (
             record.spec().dataset_identity(),
+            record.spec().object_graph_digest(),
             completion
                 .dataset_partition()
                 .ok_or(BacktestServiceError::InvalidCohort)?,
@@ -570,9 +614,18 @@ fn validate_selection_candidates(
         }
         expected_dataset = Some(dataset);
     }
-    expected_dataset
-        .map(|_| ())
-        .ok_or(BacktestServiceError::InvalidCohort)
+    let expected_dataset = expected_dataset.ok_or(BacktestServiceError::InvalidCohort)?;
+    let selection = plan.universe().selection_partition();
+    if expected_dataset
+        != (
+            selection.dataset_identity(),
+            selection.object_graph_digest(),
+            selection.interval(),
+        )
+    {
+        return Err(BacktestServiceError::InvalidCohort);
+    }
+    Ok(())
 }
 
 fn cohort_evaluator_binding() -> Result<crate::TrialComponentBinding, BacktestServiceError> {
