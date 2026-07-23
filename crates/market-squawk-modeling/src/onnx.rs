@@ -120,7 +120,7 @@ impl TractOnnxBackend {
             return Err(OnnxBackendError::WarmUp);
         }
         let mut warm_up_digest = Sha256::new();
-        warm_up_digest.update(b"market-squawk/onnx-warm-up/v1");
+        warm_up_digest.update(b"market-squawk/onnx-warm-up/v2");
         warm_up_digest.update(policy.policy_digest());
         warm_up_digest.update(warm_up.to_bits().to_be_bytes());
         let evidence = OnnxRuntimeEvidence {

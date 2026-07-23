@@ -2,15 +2,16 @@
 //!
 //! The decoded-heap charge covers the generated Prost object model rather than estimating from
 //! wire bytes alone. [`ModelProto`] charges its complete inline representation up front. Repeated
-//! messages charge twice their concrete element width for `Vec` capacity growth and are then
-//! scanned recursively; repeated strings and bytes additionally charge their payload; packed and
-//! unpacked numerics charge twice their decoded scalar width. Singular message, string, and bytes
-//! handles are already inline in their charged parent, so only their nested fields or payload are
-//! added. The fixed field-count and depth ceilings separately bound allocator bookkeeping and stack
-//! use. Unknown fields are discarded by Prost and this scanner skips them without allocating.
+//! containers charge the conservative Rust 1.97.1 `Vec` allocation peak, including minimum
+//! non-zero capacity and old-plus-new growth; their elements are then scanned recursively. String
+//! and byte payloads use the same allocation model. Singular message, string, and bytes handles are
+//! already inline in their charged parent, so only their nested fields or payload are added. The
+//! fixed field-count and depth ceilings separately bound allocator bookkeeping and stack use.
+//! Unknown fields are discarded by Prost and this scanner skips them without allocating.
 
 use std::mem::size_of;
 
+use sha2::{Digest, Sha256};
 use tract_onnx::pb::{
     AttributeProto, FunctionProto, GraphProto, ModelProto, NodeProto, OperatorSetIdProto,
     SparseTensorProto, StringStringEntryProto, TensorAnnotation, TensorProto, TensorShapeProto,
@@ -21,14 +22,20 @@ use super::policy::MAX_ONNX_MODEL_BYTES;
 use super::policy::{MAX_ONNX_NODES, MAX_ONNX_REQUEST_ELEMENTS, MAX_ONNX_TENSORS, OnnxPolicyError};
 
 const MAX_SCHEMA_TAG: usize = 25;
+const SCANNER_REVISION: u32 = 2;
+const RUST_VEC_BYTE_MIN_CAPACITY: usize = 8;
+const RUST_VEC_MODERATE_MIN_CAPACITY: usize = 4;
+const RUST_VEC_LARGE_MIN_CAPACITY: usize = 1;
+const RUST_VEC_MODERATE_ELEMENT_MAX_BYTES: usize = 1_024;
+const RUST_VEC_GROWTH_FACTOR: usize = 2;
 // The admitted non-recursive schema reaches depth five. Three additional levels preserve forward
 // scalar/message compatibility without admitting recursively nested GraphProto allocation.
 const MAX_NESTING_DEPTH: usize = 8;
 // Every protobuf field occupies at least a one-byte key and one-byte value or length. This is the
 // maximum possible field count under the existing wire-byte ceiling, including unpacked numerics.
 const MAX_WIRE_FIELDS: usize = MAX_ONNX_MODEL_BYTES.div_ceil(2);
-// Prost container growth can approach twice the logical payload. Charging repeated containers at
-// twice their element width inside four wire images leaves a conservative, finite decode ceiling.
+// The scanner charges each observed allocation by its own old-plus-new growth peak. Summing those
+// peaks overcharges the actual decode peak but preserves a finite, conservative admission ceiling.
 const MAX_DECODED_HEAP_BYTES: usize = MAX_ONNX_MODEL_BYTES * 4;
 const MAX_GRAPH_VALUES: usize = MAX_ONNX_TENSORS;
 const MAX_ONNX_RANK: usize = 8;
@@ -53,6 +60,50 @@ enum MessageKind {
     Type,
     TypeTensor,
     ValueInfo,
+}
+
+impl MessageKind {
+    const ALL: [Self; 17] = [
+        Self::Attribute,
+        Self::Dimension,
+        Self::Function,
+        Self::Graph,
+        Self::Model,
+        Self::Node,
+        Self::OperatorSet,
+        Self::Segment,
+        Self::SparseTensor,
+        Self::StringEntry,
+        Self::Tensor,
+        Self::TensorAnnotation,
+        Self::TensorShape,
+        Self::TrainingInfo,
+        Self::Type,
+        Self::TypeTensor,
+        Self::ValueInfo,
+    ];
+
+    const fn wire_id(self) -> u8 {
+        match self {
+            Self::Attribute => 1,
+            Self::Dimension => 2,
+            Self::Function => 3,
+            Self::Graph => 4,
+            Self::Model => 5,
+            Self::Node => 6,
+            Self::OperatorSet => 7,
+            Self::Segment => 8,
+            Self::SparseTensor => 9,
+            Self::StringEntry => 10,
+            Self::Tensor => 11,
+            Self::TensorAnnotation => 12,
+            Self::TensorShape => 13,
+            Self::TrainingInfo => 14,
+            Self::Type => 15,
+            Self::TypeTensor => 16,
+            Self::ValueInfo => 17,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -141,17 +192,46 @@ impl Budget {
         Ok(())
     }
 
-    fn charge_repeated(
+    fn charge_vec_peak(
         &mut self,
         items: usize,
         element_bytes: usize,
     ) -> Result<(), OnnxPolicyError> {
-        let bytes = items
-            .checked_mul(element_bytes)
-            .and_then(|bytes| bytes.checked_mul(2))
-            .ok_or(OnnxPolicyError::ProtobufResourceLimit)?;
-        self.charge(bytes)
+        self.charge(vec_peak_allocation(items, element_bytes)?)
     }
+}
+
+fn vec_peak_allocation(items: usize, element_bytes: usize) -> Result<usize, OnnxPolicyError> {
+    if items == 0 || element_bytes == 0 {
+        return Ok(0);
+    }
+    let minimum_capacity = if element_bytes == 1 {
+        RUST_VEC_BYTE_MIN_CAPACITY
+    } else if element_bytes <= RUST_VEC_MODERATE_ELEMENT_MAX_BYTES {
+        RUST_VEC_MODERATE_MIN_CAPACITY
+    } else {
+        RUST_VEC_LARGE_MIN_CAPACITY
+    };
+    let mut capacity = 0_usize;
+    let mut peak_elements = 0_usize;
+    while capacity < items {
+        let required = capacity
+            .checked_add(1)
+            .ok_or(OnnxPolicyError::ProtobufResourceLimit)?;
+        let next = capacity
+            .checked_mul(RUST_VEC_GROWTH_FACTOR)
+            .map(|doubled| doubled.max(required).max(minimum_capacity))
+            .ok_or(OnnxPolicyError::ProtobufResourceLimit)?;
+        peak_elements = peak_elements.max(
+            capacity
+                .checked_add(next)
+                .ok_or(OnnxPolicyError::ProtobufResourceLimit)?,
+        );
+        capacity = next;
+    }
+    peak_elements
+        .checked_mul(element_bytes)
+        .ok_or(OnnxPolicyError::ProtobufResourceLimit)
 }
 
 pub(super) fn prescan(bytes: &[u8]) -> Result<(), OnnxPolicyError> {
@@ -217,13 +297,13 @@ fn scan_value(
             require_wire(wire_type, 2)?;
             let payload = take_length_delimited(bytes, cursor)?;
             std::str::from_utf8(payload).map_err(|_| OnnxPolicyError::InvalidProtobuf)?;
-            budget.charge(payload.len())?;
+            budget.charge_vec_peak(payload.len(), 1)?;
             Ok(1)
         }
         ValueKind::Bytes => {
             require_wire(wire_type, 2)?;
             let payload = take_length_delimited(bytes, cursor)?;
-            budget.charge(payload.len())?;
+            budget.charge_vec_peak(payload.len(), 1)?;
             Ok(1)
         }
         ValueKind::Message(kind) => {
@@ -241,38 +321,38 @@ fn scan_value(
                 read_varint(bytes, cursor)?;
                 1
             };
-            budget.charge_repeated(items, element_bytes)?;
+            budget.charge_vec_peak(items, element_bytes)?;
             Ok(items)
         }
         ValueKind::RepeatedFixed32 => {
             let items = scan_repeated_fixed(bytes, cursor, wire_type, 5, 4)?;
-            budget.charge_repeated(items, 4)?;
+            budget.charge_vec_peak(items, 4)?;
             Ok(items)
         }
         ValueKind::RepeatedFixed64 => {
             let items = scan_repeated_fixed(bytes, cursor, wire_type, 1, 8)?;
-            budget.charge_repeated(items, 8)?;
+            budget.charge_vec_peak(items, 8)?;
             Ok(items)
         }
         ValueKind::RepeatedString => {
             require_wire(wire_type, 2)?;
             let payload = take_length_delimited(bytes, cursor)?;
             std::str::from_utf8(payload).map_err(|_| OnnxPolicyError::InvalidProtobuf)?;
-            budget.charge_repeated(1, size_of::<String>())?;
-            budget.charge(payload.len())?;
+            budget.charge_vec_peak(1, size_of::<String>())?;
+            budget.charge_vec_peak(payload.len(), 1)?;
             Ok(1)
         }
         ValueKind::RepeatedBytes => {
             require_wire(wire_type, 2)?;
             let payload = take_length_delimited(bytes, cursor)?;
-            budget.charge_repeated(1, size_of::<Vec<u8>>())?;
-            budget.charge(payload.len())?;
+            budget.charge_vec_peak(1, size_of::<Vec<u8>>())?;
+            budget.charge_vec_peak(payload.len(), 1)?;
             Ok(1)
         }
         ValueKind::RepeatedMessage(kind) => {
             require_wire(wire_type, 2)?;
             let payload = take_length_delimited(bytes, cursor)?;
-            budget.charge_repeated(1, message_size(kind))?;
+            budget.charge_vec_peak(1, message_size(kind))?;
             scan_message(kind, payload, depth + 1, budget)?;
             Ok(1)
         }
@@ -397,6 +477,160 @@ fn message_size(message: MessageKind) -> usize {
         MessageKind::TypeTensor => size_of::<type_proto::Tensor>(),
         MessageKind::ValueInfo => size_of::<ValueInfoProto>(),
     }
+}
+
+pub(super) fn admission_semantics_digest() -> [u8; 32] {
+    let mut digest = Sha256::new();
+    bind_bytes(
+        &mut digest,
+        b"namespace",
+        b"market-squawk/onnx-wire-admission/v2",
+    );
+    bind_u128(
+        &mut digest,
+        b"scanner-revision",
+        u128::from(SCANNER_REVISION),
+    );
+    bind_bytes(
+        &mut digest,
+        b"rust-vec-semantics",
+        b"rustc-1.97.1/alloc/raw_vec/grow_amortized",
+    );
+    bind_bytes(
+        &mut digest,
+        b"tract-onnx-crate",
+        b"0.23.4/a3215dd27bddd2a041a20fee750013b400135186d3485501c9274c755b19ceb0",
+    );
+    bind_bytes(
+        &mut digest,
+        b"onnx-proto3",
+        b"12ec4e4a1ec0a707827e0fde751512ce849b41600ed3edc68563a2faa7220fae",
+    );
+    bind_bytes(
+        &mut digest,
+        b"generated-onnx-prost",
+        b"2ab8a70959912929c568dba8536840034317894cd430c1defd28c099ca72b8d2",
+    );
+    bind_bytes(
+        &mut digest,
+        b"prost-decoder",
+        b"prost-0.14.3/d2ea70524a2f82d518bce41317d0fae74151505651af45faf1ffbd6fd33f0568",
+    );
+    for (name, value) in [
+        (b"max-schema-tag".as_slice(), MAX_SCHEMA_TAG),
+        (b"max-nesting-depth".as_slice(), MAX_NESTING_DEPTH),
+        (b"max-wire-fields".as_slice(), MAX_WIRE_FIELDS),
+        (b"max-decoded-heap-bytes".as_slice(), MAX_DECODED_HEAP_BYTES),
+        (b"max-graph-values".as_slice(), MAX_GRAPH_VALUES),
+        (b"max-onnx-rank".as_slice(), MAX_ONNX_RANK),
+        (
+            b"max-unsupported-records".as_slice(),
+            MAX_UNSUPPORTED_RECORDS,
+        ),
+        (b"max-onnx-model-bytes".as_slice(), MAX_ONNX_MODEL_BYTES),
+        (b"max-onnx-nodes".as_slice(), MAX_ONNX_NODES),
+        (b"max-onnx-tensors".as_slice(), MAX_ONNX_TENSORS),
+        (
+            b"max-onnx-request-elements".as_slice(),
+            MAX_ONNX_REQUEST_ELEMENTS,
+        ),
+        (
+            b"vec-byte-min-capacity".as_slice(),
+            RUST_VEC_BYTE_MIN_CAPACITY,
+        ),
+        (
+            b"vec-moderate-min-capacity".as_slice(),
+            RUST_VEC_MODERATE_MIN_CAPACITY,
+        ),
+        (
+            b"vec-large-min-capacity".as_slice(),
+            RUST_VEC_LARGE_MIN_CAPACITY,
+        ),
+        (
+            b"vec-moderate-element-max-bytes".as_slice(),
+            RUST_VEC_MODERATE_ELEMENT_MAX_BYTES,
+        ),
+        (b"vec-growth-factor".as_slice(), RUST_VEC_GROWTH_FACTOR),
+        (b"target-usize-bytes".as_slice(), size_of::<usize>()),
+        (b"target-string-bytes".as_slice(), size_of::<String>()),
+        (b"target-byte-vec-bytes".as_slice(), size_of::<Vec<u8>>()),
+    ] {
+        bind_usize(&mut digest, name, value);
+    }
+    bind_usize(&mut digest, b"message-kind-count", MessageKind::ALL.len());
+    for message in MessageKind::ALL {
+        digest.update([message.wire_id()]);
+        bind_usize(&mut digest, b"message-layout-bytes", message_size(message));
+        for tag in 1..=MAX_SCHEMA_TAG {
+            bind_usize(&mut digest, b"tag", tag);
+            match field_spec(message, tag) {
+                Some(spec) => {
+                    digest.update([1]);
+                    bind_value_kind(&mut digest, spec.value);
+                    bind_usize(&mut digest, b"max-items", spec.max_items);
+                    digest.update([policy_error_id(spec.limit_error)]);
+                }
+                None => digest.update([0]),
+            }
+        }
+    }
+    digest.finalize().into()
+}
+
+fn bind_value_kind(digest: &mut Sha256, value: ValueKind) {
+    match value {
+        ValueKind::Varint => digest.update([1]),
+        ValueKind::Fixed32 => digest.update([2]),
+        ValueKind::String => digest.update([3]),
+        ValueKind::Bytes => digest.update([4]),
+        ValueKind::Message(message) => digest.update([5, message.wire_id()]),
+        ValueKind::RepeatedVarint { element_bytes } => {
+            digest.update([6]);
+            bind_usize(digest, b"element-bytes", element_bytes);
+        }
+        ValueKind::RepeatedFixed32 => digest.update([7]),
+        ValueKind::RepeatedFixed64 => digest.update([8]),
+        ValueKind::RepeatedString => digest.update([9]),
+        ValueKind::RepeatedBytes => digest.update([10]),
+        ValueKind::RepeatedMessage(message) => digest.update([11, message.wire_id()]),
+    }
+}
+
+const fn policy_error_id(error: OnnxPolicyError) -> u8 {
+    match error {
+        OnnxPolicyError::InvalidPolicy => 1,
+        OnnxPolicyError::ModelByteLimit => 2,
+        OnnxPolicyError::ModelDigestMismatch => 3,
+        OnnxPolicyError::InvalidProtobuf => 4,
+        OnnxPolicyError::ProtobufResourceLimit => 5,
+        OnnxPolicyError::UnsupportedOpset => 6,
+        OnnxPolicyError::CustomDomain => 7,
+        OnnxPolicyError::DisallowedOperator => 8,
+        OnnxPolicyError::ExternalData => 9,
+        OnnxPolicyError::DynamicShape => 10,
+        OnnxPolicyError::ShapeMismatch => 11,
+        OnnxPolicyError::NodeLimit => 12,
+        OnnxPolicyError::TensorLimit => 13,
+        OnnxPolicyError::ElementLimit => 14,
+        OnnxPolicyError::NonFiniteTensor => 15,
+        OnnxPolicyError::UnsupportedGraphState => 16,
+    }
+}
+
+fn bind_usize(digest: &mut Sha256, name: &[u8], value: usize) {
+    bind_u128(digest, name, value as u128);
+}
+
+fn bind_u128(digest: &mut Sha256, name: &[u8], value: u128) {
+    bind_bytes(digest, b"field", name);
+    digest.update(value.to_be_bytes());
+}
+
+fn bind_bytes(digest: &mut Sha256, name: &[u8], value: &[u8]) {
+    digest.update((name.len() as u128).to_be_bytes());
+    digest.update(name);
+    digest.update((value.len() as u128).to_be_bytes());
+    digest.update(value);
 }
 
 #[allow(
@@ -583,5 +817,59 @@ fn field_spec(message: MessageKind, tag: usize) -> Option<FieldSpec> {
             1,
         )),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prescan_rejects_many_nested_minimum_capacity_vectors()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let annotation_bytes = size_of::<TensorAnnotation>();
+        let entry_bytes = size_of::<StringStringEntryProto>();
+        assert!((1..=RUST_VEC_MODERATE_ELEMENT_MAX_BYTES).contains(&annotation_bytes));
+        assert!((1..=RUST_VEC_MODERATE_ELEMENT_MAX_BYTES).contains(&entry_bytes));
+        let per_annotation = annotation_bytes
+            .checked_add(entry_bytes)
+            .and_then(|bytes| bytes.checked_mul(RUST_VEC_MODERATE_MIN_CAPACITY))
+            .ok_or("nested allocation charge overflowed")?;
+        let count = MAX_DECODED_HEAP_BYTES
+            .checked_div(per_annotation)
+            .and_then(|count| count.checked_add(1))
+            .ok_or("nested annotation count overflowed")?;
+        let outer_only = count
+            .checked_mul(annotation_bytes)
+            .and_then(|bytes| bytes.checked_mul(RUST_VEC_MODERATE_MIN_CAPACITY))
+            .ok_or("outer allocation charge overflowed")?;
+        assert!(outer_only < MAX_DECODED_HEAP_BYTES);
+
+        let mut graph = Vec::new();
+        graph.try_reserve_exact(
+            count
+                .checked_mul(4)
+                .ok_or("nested annotation wire size overflowed")?,
+        )?;
+        for _ in 0..count {
+            graph.extend_from_slice(&[0x72, 0x02, 0x12, 0x00]);
+        }
+        let mut model = vec![0x3a];
+        append_varint(
+            u64::try_from(graph.len()).map_err(|_| "graph length does not fit protobuf")?,
+            &mut model,
+        );
+        model.extend_from_slice(&graph);
+
+        assert_eq!(prescan(&model), Err(OnnxPolicyError::ProtobufResourceLimit));
+        Ok(())
+    }
+
+    fn append_varint(mut value: u64, bytes: &mut Vec<u8>) {
+        while value >= 0x80 {
+            bytes.push((value as u8 & 0x7f) | 0x80);
+            value >>= 7;
+        }
+        bytes.push(value as u8);
     }
 }

@@ -44,6 +44,10 @@ use tract_onnx::pb::{
 use crate::bundle::{TestResult, valid_onnx_fixture};
 
 const FIXTURE_MANIFEST: &str = include_str!("../fixtures/onnx/manifest.json");
+const LEGACY_GOLDEN_POLICY_DIGEST: [u8; 32] = [
+    58, 248, 107, 240, 109, 197, 29, 39, 62, 176, 162, 191, 188, 222, 172, 185, 87, 141, 160, 83,
+    195, 203, 155, 166, 96, 70, 200, 218, 125, 114, 162, 118,
+];
 
 #[derive(Deserialize)]
 struct FixtureManifest {
@@ -262,6 +266,10 @@ fn tract_backend_runs_the_exact_bundle_with_finite_bounded_output() -> TestResul
     let output = backend.infer(&input)?;
     assert_eq!(output.score().to_bits(), 4.5_f64.to_bits());
     assert!(output.confidence().is_finite());
+    assert_ne!(
+        backend.runtime_evidence().policy_digest(),
+        LEGACY_GOLDEN_POLICY_DIGEST
+    );
     assert_ne!(backend.runtime_evidence().warm_up_digest(), [0; 32]);
     drop(backend);
     assert_eq!(program.active_generations(), 0);

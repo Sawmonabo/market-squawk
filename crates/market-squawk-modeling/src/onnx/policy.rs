@@ -445,22 +445,85 @@ fn digest_policy(
     fallback: OnnxFallbackPolicy,
 ) -> [u8; 32] {
     let mut digest = Sha256::new();
-    digest.update(b"market-squawk/onnx-policy/v1");
-    digest.update(model_digest.bytes());
-    digest.update(opset.to_be_bytes());
-    for shape in [input_shape, output_shape] {
-        digest.update(shape.len().to_be_bytes());
+    bind_bytes(&mut digest, b"namespace", b"market-squawk/onnx-policy/v2");
+    bind_bytes(
+        &mut digest,
+        b"wire-admission",
+        &super::wire::admission_semantics_digest(),
+    );
+    bind_bytes(&mut digest, b"model-digest", &model_digest.bytes());
+    bind_u128(&mut digest, b"opset", u128::from(opset));
+    for (name, value) in [
+        (b"max-model-bytes".as_slice(), MAX_ONNX_MODEL_BYTES),
+        (b"max-nodes".as_slice(), MAX_ONNX_NODES),
+        (b"max-tensors".as_slice(), MAX_ONNX_TENSORS),
+        (
+            b"max-request-elements".as_slice(),
+            MAX_ONNX_REQUEST_ELEMENTS,
+        ),
+        (b"max-rank".as_slice(), MAX_ONNX_RANK),
+    ] {
+        bind_usize(&mut digest, name, value);
+    }
+    bind_u128(&mut digest, b"min-opset", u128::from(MIN_ONNX_OPSET));
+    bind_u128(&mut digest, b"max-opset", u128::from(MAX_ONNX_OPSET));
+    bind_u128(
+        &mut digest,
+        b"max-deadline-nanoseconds",
+        MAX_INFERENCE_DEADLINE.as_nanos(),
+    );
+    for (name, shape) in [
+        (b"input-shape".as_slice(), input_shape),
+        (b"output-shape".as_slice(), output_shape),
+    ] {
+        bind_usize(&mut digest, name, shape.len());
         for dimension in shape {
-            digest.update(dimension.to_be_bytes());
+            bind_usize(&mut digest, b"dimension", *dimension);
         }
     }
-    digest.update(deadline.as_nanos().to_be_bytes());
-    digest.update([match fallback {
-        OnnxFallbackPolicy::NoAction => 0,
-    }]);
+    bind_u128(&mut digest, b"deadline-nanoseconds", deadline.as_nanos());
+    bind_u128(
+        &mut digest,
+        b"fallback",
+        u128::from(match fallback {
+            OnnxFallbackPolicy::NoAction => 1_u8,
+        }),
+    );
+    bind_usize(
+        &mut digest,
+        b"allowed-operator-count",
+        ALLOWED_OPERATORS.len(),
+    );
     for operator in ALLOWED_OPERATORS {
-        digest.update(operator.as_bytes());
-        digest.update([0]);
+        bind_bytes(&mut digest, b"allowed-operator", operator.as_bytes());
     }
     digest.finalize().into()
+}
+
+fn bind_usize(digest: &mut Sha256, name: &[u8], value: usize) {
+    bind_u128(
+        digest,
+        name,
+        u128::try_from(value).map_or(u128::MAX, |value| value),
+    );
+}
+
+fn bind_u128(digest: &mut Sha256, name: &[u8], value: u128) {
+    bind_bytes(digest, b"field", name);
+    digest.update(value.to_be_bytes());
+}
+
+fn bind_bytes(digest: &mut Sha256, name: &[u8], value: &[u8]) {
+    digest.update(
+        u128::try_from(name.len())
+            .map_or(u128::MAX, |length| length)
+            .to_be_bytes(),
+    );
+    digest.update(name);
+    digest.update(
+        u128::try_from(value.len())
+            .map_or(u128::MAX, |length| length)
+            .to_be_bytes(),
+    );
+    digest.update(value);
 }
