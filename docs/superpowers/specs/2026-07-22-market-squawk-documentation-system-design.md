@@ -9,6 +9,7 @@
 | Design approved | 2026-07-22 |
 | Written specification status | Awaiting user review before implementation planning |
 | Last substantive review | 2026-07-22 |
+| Audit base | `46f86d9496287e1995f584537153ecb3fcb271ac` |
 | Release boundary | Required for the first complete local release on `release/market-squawk-v0.1.0` |
 | Governing product memory | [`docs/project-memory.md`](../../project-memory.md) |
 | Delivery status authority | [`docs/plans/delivery-ledger.md`](../../plans/delivery-ledger.md) |
@@ -17,6 +18,9 @@ This specification defines the production documentation system for Market Squawk
 current small collection of architecture and operations artifacts into a navigable, GitHub-native
 portal without inventing behavior that the application does not provide. The design is approved;
 the committed written specification must be reviewed before a concrete migration plan is produced.
+The audit base above is an evidence anchor for this specification, not implementation approval or
+release approval. Because the product remains under active integration, execution must begin with
+the accepted-head refresh barrier defined below.
 
 ## Contents
 
@@ -410,10 +414,16 @@ audit, but no new repository script is added for that audit.
 ## Implementation sequencing and ownership
 
 The documentation work is one cohesive release lane with internal slices, not one worktree or agent
-per page.
+per page. Before any documentation writer starts, the release owner must fix the accepted integrated
+head and refresh this specification's implementation inventory against it. The refresh must cover
+repository paths and line anchors, CLI/MCP/configuration schemas and interfaces, dependency
+relationships, source metadata, runnable-capability evidence, and release-blocker state. Planned
+capabilities and implemented capabilities remain distinct throughout the refresh. Operations and
+reference pages cannot be marked `Current` until that refreshed head has been recorded.
 
-1. Freeze the accepted code head used for factual documentation and inventory maintained links,
-   current commands, schemas, configuration, source metadata, and local paths.
+1. Record the accepted integrated head and complete the mandatory refresh barrier above; inventory
+   maintained links, current commands, schemas, configuration, source metadata, local paths,
+   dependency edges, runnable evidence, and release blockers at that exact head.
 2. Perform the three history-preserving moves and create the documentation and section indexes.
 3. Build architecture overview, building blocks, plane pages, trust/deployment/quality pages, and
    the five ADRs from reconciled accepted code and target invariants.
