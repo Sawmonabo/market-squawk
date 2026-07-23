@@ -227,11 +227,18 @@ fn update_usize(hash: &mut Sha256, value: usize) {
 #[derive(Debug)]
 pub struct BacktestContext<'observation> {
     observation: &'observation BacktestObservation,
+    account_id: AccountId,
     cash: Money,
     position: Decimal,
 }
 
 impl BacktestContext<'_> {
+    /// Returns the exact research account owned by the admitted portfolio seed.
+    #[must_use]
+    pub const fn account_id(&self) -> AccountId {
+        self.account_id
+    }
+
     /// Returns the cutoff at which every exposed value was available.
     #[must_use]
     pub const fn decision_at(&self) -> Timestamp {
@@ -544,6 +551,7 @@ impl BacktestEngine {
                 }
                 let context = BacktestContext {
                     observation,
+                    account_id: request.portfolio.account_id,
                     cash: shadow.cash,
                     position: shadow.position(observation.instrument_id()),
                 };
