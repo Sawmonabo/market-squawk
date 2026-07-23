@@ -590,5 +590,54 @@ capability/onboarding portal and secure credential lifecycle. Task 20 owns the i
 vertical demonstration, benchmark/fuzz/security/release evidence, final review, exact-head gate,
 publication, and closeout. Open prerequisite issues `#7`, `#9`, `#10`, and `#11` must be reconciled
 through these product slices or closed with exact evidence; none may be silently ignored. The
-approved production documentation-system design remains a release blocker and still requires its
-written-spec review before migration work begins.
+approved production documentation-system design and committed implementation plan control the
+required migration before Task 20 closeout.
+
+## 2026-07-23 Task 19/19A provider-activation checkpoint
+
+The approved documentation-system design and implementation plan are committed at `a4ba164` and
+`4bcd654`; the design-review gate is complete. The production migration remains required before
+Task 20 release closeout.
+
+Provider activation is pushed through `ae94d6c`. Code-owned onboarding profiles now bind the full
+rights decision, the selected exact persistence evidence, duties, release state, capability
+revision and current evidence digests. Research adapters can no longer receive independently
+caller-constructed persistence authority. SEC, BLS and Treasury Fiscal Data portal requests build
+provider-specific adapter configuration, publish digest-bound evidence and the desired restart
+recipe before registration, and serialize publication per provider surface. Exact retries are
+idempotent; a rejected candidate can disable only its compare-and-swap-matched recipe. Invalid or
+superseded restart state disables only the affected provider while unrelated product domains keep
+starting.
+
+Platform-managed credential work is admitted through one shared blocking-operation permit. The
+permit is retained until the worker exits, cancellation is rechecked after backend serialization,
+and an early-returning request hands the worker to a runtime reaper. Restart restoration performs
+no secret read or platform interaction: registered BLS and FRED recipes remain desired but disabled
+until an explicit foreground resume. The independent provider-evidence audit passed with zero
+Critical, Important or Minor finding; its tracked validation record and exact hashes are in
+`docs/research/2026-07-23-provider-activation-evidence-validation.md`.
+
+Measured macOS debug-link classification is pushed at `0521d0e`. It remains limited to the exact
+oversized debug/test roots; release diagnostics and generated code are unchanged. The locked
+optimized application build succeeded, and the release MCP process started and stopped cleanly
+twice against the same fresh local state root.
+
+The shipping MCP contract is corrected at `8f82483`: `market-squawk mcp serve` and the compatibility
+`market-squawk mcp` form use the sole production application composition. The removed diagnostic
+five-tool journal server is no longer advertised or tested. One existing consolidated composition
+test compares the complete served tool list to the application capability registry and verifies
+durable audit, controlled artifacts and a governed mutation.
+
+Fresh focused evidence on the committed tree passed: application `control_plane` 23/23; BLS 13/13;
+FRED 15 passed with one controlled local-evidence test ignored by contract; shared
+sources 205/205 including doctests; app all-target/all-feature Clippy with warnings denied;
+formatting; diff integrity; the locked all-feature release application build; and two same-root
+release MCP startup cycles. Root generated output is 15 GiB, below the enforced 20 GiB ceiling.
+Only the release worktree exists, `.worktrees` is empty, local branches are `main` and the release
+branch, and local/origin release heads match.
+
+Issues `#24` and `#31` remain In Progress. Task 19A still requires its clean-machine final
+demonstration and closure of every required provider workflow; Task 19 remains open until its
+application/CLI/MCP acceptance evidence and prerequisite issue reconciliation are recorded. Task
+20 remains Todo and owns the final exact-head proof, release review, documentation migration
+acceptance, publication and repository cleanup.
