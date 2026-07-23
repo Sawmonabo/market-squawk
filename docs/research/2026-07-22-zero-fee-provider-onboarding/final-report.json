@@ -2,8 +2,75 @@
 
   "report_id": "task-19a-zero-fee-provider-onboarding-decision-v2",
   "title": "Task 19A Decision Report: Zero-Fee Provider Onboarding and Local Secret Activation",
-  "as_of": "2026-07-22",
+  "as_of": "2026-07-23",
   "audit_base": "fe600f7c50af34482bb95feacacf6d0fdc2dbb03",
+  "mutable_source_refresh": {
+    "as_of": "2026-07-23",
+    "retrieval_window_utc": {
+      "started_at": "2026-07-23T06:44:03Z",
+      "completed_at": "2026-07-23T06:47:15Z"
+    },
+    "admission_policy": "Only an HTTP 200 response containing exact official source content may close the content-digest gate. Access-denial and not-found response digests are retained as retrieval-health or URL-migration evidence only.",
+    "blocked_route_assessment": "Official-source search and standard alternate representations found no authorized exact-content HTTP 200 route for DOC-019, DOC-020, DOC-026, DOC-028, or DOC-029; semantically adjacent endpoints were not substituted.",
+    "semantic_changes": [],
+    "provider_surface_changes": [
+      {
+        "source_id": "DOC-014",
+        "change": "canonical_documentation_url_migrated",
+        "prior_url": "https://docs.kraken.com/api/docs/rest-api/get-api-key-info",
+        "current_url": "https://docs.kraken.com/api-reference/account-data/get-api-key-info",
+        "contract_effect": "none; endpoint and verifier semantics unchanged"
+      }
+    ],
+    "content_digest_satisfied": [
+      "DOC-009",
+      "DOC-010",
+      "DOC-014"
+    ],
+    "content_digest_blocked": [
+      "DOC-019",
+      "DOC-020",
+      "DOC-026",
+      "DOC-028",
+      "DOC-029"
+    ],
+    "capability_effects": [
+      {
+        "provider_surface": "sec.edgar_public_submissions_and_xbrl",
+        "state": "RefreshRequired",
+        "activation_available": false,
+        "blocking_source_ids": [
+          "DOC-019",
+          "DOC-020"
+        ]
+      },
+      {
+        "provider_surface": "bls.v1_unregistered",
+        "state": "RefreshRequired",
+        "activation_available": false,
+        "blocking_source_ids": [
+          "DOC-026",
+          "DOC-029"
+        ]
+      },
+      {
+        "provider_surface": "bls.v2_registered",
+        "state": "RefreshRequired",
+        "activation_available": false,
+        "blocking_source_ids": [
+          "DOC-026",
+          "DOC-028",
+          "DOC-029"
+        ]
+      }
+    ],
+    "acceptance_effects": [
+      "T19A-AC-01 remains unsatisfied for the SEC and BLS records until exact official content digests are captured.",
+      "T19A-AC-06 remains unsatisfied for SEC activation.",
+      "T19A-AC-08 remains unsatisfied for BLS activation and publication.",
+      "T19A-AC-21 and T19A-AC-22 remain unsatisfied for the affected SEC/BLS rate and rights evidence."
+    ]
+  },
   "decision": {
     "status": "conditional_proceed",
     "summary": "Implement Task 19A as a capability-gated local portal that automatically configures admitted no-secret surfaces and resumes official provider-controlled credential or authorization flows. Do not claim universal automatic signup, universal zero-fee eligibility, or release readiness for every provider surface.",
@@ -13,11 +80,12 @@
       "Coinbase and Kraken durable storage, modeling, and redistribution claims pending surface-specific rights evidence",
       "provider OAuth, device authorization, and DCR until exact provider deployment and client eligibility are admitted",
       "portable encrypted-fallback release claim until the existing repository vault passes independent Task 19A admission review",
+      "SEC and BLS activation until exact official source content is captured with HTTP 200 and admitted by digest",
       "any active provider or OS-backend claim until bounded runtime evidence exists"
     ],
     "conditional_gates": [
-      "BLS activation requires exact provenance, access-date citation, disclaimer, truthful-representation, limit-compliance, third-party-rights scope, and bounded runtime evidence",
-      "SEC and Fiscal Data activation require bounded runtime evidence despite documentation-ready no-secret status"
+      "BLS activation requires exact provenance, access-date citation, disclaimer, truthful-representation, limit-compliance, third-party-rights scope, a successful source-digest refresh, and bounded runtime evidence",
+      "SEC activation requires a successful source-digest refresh and bounded runtime evidence; Fiscal Data requires bounded runtime evidence"
     ]
   },
   "scope": {
@@ -161,6 +229,12 @@
       "rights": "durable storage and analytics supported for exact public EDGAR scope with lineage",
       "release_status": "documentation_ready_no_secret_runtime_smoke_pending",
       "refresh_trigger": "SEC",
+      "refresh_state": "RefreshRequired",
+      "activation_available": false,
+      "refresh_blocking_source_ids": [
+        "DOC-019",
+        "DOC-020"
+      ],
       "source_ids": [
         "DOC-019",
         "DOC-020"
@@ -199,6 +273,12 @@
       "rights": "official terms provide affirmative secondary-use language with access-date citation, disclaimer, truthful-representation, limit-compliance, and third-party-rights duties; admission is scoped to exact BLS provenance and intended operations",
       "release_status": "documentation_ready_no_secret_scoped_rights_runtime_smoke_pending",
       "refresh_trigger": "BLS-V1",
+      "refresh_state": "RefreshRequired",
+      "activation_available": false,
+      "refresh_blocking_source_ids": [
+        "DOC-026",
+        "DOC-029"
+      ],
       "source_ids": [
         "DOC-026",
         "DOC-029"
@@ -216,6 +296,13 @@
       "rights": "same scoped BLS secondary-use evidence and duties as v1; the key changes quota/features, not rights scope",
       "release_status": "optional_human_resumed_scoped_rights_runtime_smoke_pending",
       "refresh_trigger": "BLS-V2",
+      "refresh_state": "RefreshRequired",
+      "activation_available": false,
+      "refresh_blocking_source_ids": [
+        "DOC-026",
+        "DOC-028",
+        "DOC-029"
+      ],
       "source_ids": [
         "DOC-026",
         "DOC-027",
@@ -878,6 +965,11 @@
       "id": "FINAL-GAP-007",
       "severity": "product_policy",
       "description": "Measured browser, provider, prompt, store, and cleanup deadlines."
+    },
+    {
+      "id": "FINAL-GAP-008",
+      "severity": "provider_capability_blocking",
+      "description": "Successful HTTP 200 capture and admission of the exact official content bodies for DOC-019, DOC-020, DOC-026, DOC-028, and DOC-029; current 403 digests are retrieval-health evidence only."
     }
   ],
   "explicit_non_findings": [
@@ -1090,21 +1182,31 @@
     },
     {
       "access": {
-        "date": "2026-07-22",
-        "status": "official_source_reviewed_body_digest_unavailable"
+        "date": "2026-07-23",
+        "status": "retrieved"
       },
       "assigned_batch": "docs-batch-001",
       "category": "docs",
-      "content_digest": null,
-      "content_reference": "official page states last modified 2026-06-23; automated response body unavailable",
+      "content_digest": "sha256:dc6dad1fc5690b345c9d95436d72abd8864cd8c6315ebfe65fbbd010a6fe4273",
+      "content_reference": "https://www.coinbase.com/legal/developer-platform/terms-of-service",
       "credibility_signals": "Published on Coinbase's official legal domain as the governing Developer Platform terms.",
-      "digest_status": "reference_only_refresh_required",
+      "digest_status": "captured",
       "freshness": "last modified 2026-06-23",
-      "freshness_signals": "Page states last modified 2026-06-23; accessed 2026-07-22.",
+      "freshness_signals": "Page states last modified 2026-06-23; exact official response body retrieved 2026-07-23.",
       "id": "DOC-009",
+      "last_refresh": {
+        "retrieved_at": "2026-07-23T06:44:57Z",
+        "requested_url": "https://coinbase.com/legal/developer-platform/terms-of-service",
+        "final_url": "https://www.coinbase.com/legal/developer-platform/terms-of-service",
+        "http_status": 200,
+        "response_bytes": 589518,
+        "response_body_sha256": "sha256:dc6dad1fc5690b345c9d95436d72abd8864cd8c6315ebfe65fbbd010a6fe4273",
+        "response_body_scope": "official_page_content",
+        "semantic_assessment": "no semantic or provider-surface change observed"
+      },
       "priority": "P0",
       "provider": "coinbase",
-      "retrieval_date": "2026-07-22",
+      "retrieval_date": "2026-07-23",
       "selection_rationale": "Governs API-limit changes, limit circumvention, platform access, and other release-relevant obligations.",
       "source_type": "official provider legal terms",
       "status": "assigned",
@@ -1113,20 +1215,30 @@
     },
     {
       "access": {
-        "date": "2026-07-22",
-        "status": "official_source_reviewed_body_digest_unavailable"
+        "date": "2026-07-23",
+        "status": "retrieved"
       },
       "assigned_batch": "docs-batch-001",
       "category": "docs",
-      "content_digest": null,
-      "content_reference": "official Coinbase Exchange help route accessed 2026-07-22; automated response body unavailable",
+      "content_digest": "sha256:79ec908d39947c2476b43643565cdee6619b07a75848c1dab0a20578f8110a92",
+      "content_reference": "https://help.coinbase.com/en/exchange/managing-my-account/how-to-rotate-your-api-key",
       "credibility_signals": "Published by Coinbase Help and explicitly scoped to Coinbase Exchange.",
-      "digest_status": "reference_only_refresh_required",
-      "freshness_signals": "Current official help page accessed 2026-07-22; product-scope caveat retained.",
+      "digest_status": "captured",
+      "freshness_signals": "Exact official response body retrieved 2026-07-23; Exchange product-scope caveat retained.",
       "id": "DOC-010",
+      "last_refresh": {
+        "retrieved_at": "2026-07-23T06:44:58Z",
+        "requested_url": "https://help.coinbase.com/en/exchange/managing-my-account/how-to-rotate-your-api-key/",
+        "final_url": "https://help.coinbase.com/en/exchange/managing-my-account/how-to-rotate-your-api-key",
+        "http_status": 200,
+        "response_bytes": 86513,
+        "response_body_sha256": "sha256:79ec908d39947c2476b43643565cdee6619b07a75848c1dab0a20578f8110a92",
+        "response_body_scope": "official_page_content",
+        "semantic_assessment": "no semantic or provider-surface change observed; guidance remains Exchange-specific and revoke-first"
+      },
       "priority": "P1",
       "provider": "coinbase",
-      "retrieval_date": "2026-07-22",
+      "retrieval_date": "2026-07-23",
       "scope_note": "Coinbase Exchange",
       "selection_rationale": "Documents manual revoke, replacement creation, least privilege, one-time secret capture, update, and verification steps without assuming identical behavior for every Coinbase product.",
       "source_type": "official provider support procedure",
@@ -1293,21 +1405,33 @@
     },
     {
       "access": {
-        "date": "2026-07-22",
-        "status": "official_source_reviewed_body_digest_unavailable"
+        "date": "2026-07-23",
+        "status": "official_source_reviewed_direct_content_digest_unavailable_http_403"
       },
       "assigned_batch": "docs-batch-002",
       "category": "docs",
       "content_digest": null,
-      "content_reference": "official SEC page states last reviewed or updated 2025-04-08; automated response body unavailable",
+      "content_reference": "official rendered page states last reviewed 2025-04-08; direct HTTP returned an SEC rate-threshold denial body, which is not content authority",
       "credibility_signals": "SEC .gov primary documentation for data.sec.gov submissions, XBRL, and bulk public data.",
       "digest_status": "reference_only_refresh_required",
       "freshness": "last reviewed or updated 2025-04-08",
-      "freshness_signals": "Page states last reviewed 2025-04-08; accessed 2026-07-22.",
+      "freshness_signals": "Official rendered page still states last reviewed 2025-04-08 on 2026-07-23; exact content-body digest remains unavailable.",
       "id": "DOC-019",
+      "last_refresh": {
+        "retrieved_at": "2026-07-23T06:45:13Z",
+        "requested_url": "https://www.sec.gov/search-filings/edgar-application-programming-interfaces",
+        "final_url": "https://www.sec.gov/search-filings/edgar-application-programming-interfaces",
+        "http_status": 403,
+        "response_bytes": 1925,
+        "response_body_sha256": "sha256:2a6cea3a1a230d6aa30b151ff80e844fc3007c1d1b0996536bfa6e60f79606b4",
+        "response_body_scope": "retrieval_health_access_denial_only",
+        "semantic_review_method": "official page rendering; no raw response-body digest available",
+        "semantic_assessment": "no semantic or provider-surface change observed",
+        "digest_gate": "blocked_until_http_200_official_content_capture"
+      },
       "priority": "P0",
       "provider": "sec",
-      "retrieval_date": "2026-07-22",
+      "retrieval_date": "2026-07-23",
       "selection_rationale": "Establishes no-auth public-data access, update and bulk patterns, and the CORS limitation.",
       "source_type": "official U.S. government API documentation",
       "status": "assigned",
@@ -1316,21 +1440,33 @@
     },
     {
       "access": {
-        "date": "2026-07-22",
-        "status": "official_source_reviewed_body_digest_unavailable"
+        "date": "2026-07-23",
+        "status": "official_source_reviewed_direct_content_digest_unavailable_http_403"
       },
       "assigned_batch": "docs-batch-002",
       "category": "docs",
       "content_digest": null,
-      "content_reference": "official SEC page states last reviewed or updated 2024-08-23; automated response body unavailable",
+      "content_reference": "official rendered page states last reviewed 2024-08-23; direct HTTP returned an SEC rate-threshold denial body, which is not content authority",
       "credibility_signals": "SEC .gov primary policy page for automated access to SEC public content.",
       "digest_status": "reference_only_refresh_required",
       "freshness": "last reviewed or updated 2024-08-23",
-      "freshness_signals": "Page states last reviewed 2024-08-23; current page accessed 2026-07-22.",
+      "freshness_signals": "Official rendered page still states last reviewed 2024-08-23 on 2026-07-23; exact content-body digest remains unavailable.",
       "id": "DOC-020",
+      "last_refresh": {
+        "retrieved_at": "2026-07-23T06:45:13Z",
+        "requested_url": "https://www.sec.gov/about/webmaster-frequently-asked-questions",
+        "final_url": "https://www.sec.gov/about/webmaster-frequently-asked-questions",
+        "http_status": 403,
+        "response_bytes": 1925,
+        "response_body_sha256": "sha256:e901cf48f0dd1d287d5009182ad4f0479550d06f6518f096271a88dc4a7d70ee",
+        "response_body_scope": "retrieval_health_access_denial_only",
+        "semantic_review_method": "official page rendering; no raw response-body digest available",
+        "semantic_assessment": "no semantic or provider-surface change observed",
+        "digest_gate": "blocked_until_http_200_official_content_capture"
+      },
       "priority": "P0",
       "provider": "sec",
-      "retrieval_date": "2026-07-22",
+      "retrieval_date": "2026-07-23",
       "selection_rationale": "Defines the declared User-Agent requirement, 10 requests-per-second ceiling, programmatic access, and public-data reuse.",
       "source_type": "official U.S. government access policy",
       "status": "assigned",
@@ -1471,21 +1607,33 @@
     },
     {
       "access": {
-        "date": "2026-07-22",
-        "status": "official_source_reviewed_body_digest_unavailable"
+        "date": "2026-07-23",
+        "status": "official_source_reviewed_direct_content_digest_unavailable_http_403"
       },
       "assigned_batch": "docs-batch-003",
       "category": "docs",
       "content_digest": null,
-      "content_reference": "official BLS page states last modified 2023-08-30; automated response body unavailable",
+      "content_reference": "official rendered page states last modified 2023-08-30; direct HTTP returned a BLS access-denial body, which is not content authority",
       "credibility_signals": "Bureau of Labor Statistics .gov primary developer documentation.",
       "digest_status": "reference_only_refresh_required",
       "freshness": "last modified 2023-08-30",
-      "freshness_signals": "Page states last modified 2023-08-30; current page accessed 2026-07-22.",
+      "freshness_signals": "Official rendered page still states last modified 2023-08-30 on 2026-07-23; exact content-body digest remains unavailable.",
       "id": "DOC-026",
+      "last_refresh": {
+        "retrieved_at": "2026-07-23T06:45:13Z",
+        "requested_url": "https://www.bls.gov/developers/api_FAQs.htm",
+        "final_url": "https://www.bls.gov/developers/api_FAQs.htm",
+        "http_status": 403,
+        "response_bytes": 1325,
+        "response_body_sha256": "sha256:6ce8eef3fca865c1a9c21812cfd44b9b3ca7d45c00223ccc10e87775241a3758",
+        "response_body_scope": "retrieval_health_access_denial_only",
+        "semantic_review_method": "official page rendering; no raw response-body digest available",
+        "semantic_assessment": "no semantic or provider-surface change observed",
+        "digest_gate": "blocked_until_http_200_official_content_capture"
+      },
       "priority": "P0",
       "provider": "bls",
-      "retrieval_date": "2026-07-22",
+      "retrieval_date": "2026-07-23",
       "selection_rationale": "Defines no-key v1, optional-key v2, exact quotas, CAPTCHA and email issuance, annual renewal, and HTTP 429 behavior.",
       "source_type": "official U.S. government API documentation",
       "status": "assigned",
@@ -1516,21 +1664,33 @@
     },
     {
       "access": {
-        "date": "2026-07-22",
-        "status": "official_source_reviewed_body_digest_unavailable"
+        "date": "2026-07-23",
+        "status": "official_source_reviewed_direct_content_digest_unavailable_http_403"
       },
       "assigned_batch": "docs-batch-003",
       "category": "docs",
       "content_digest": null,
-      "content_reference": "official BLS page states last modified 2020-10-05; automated response body unavailable",
+      "content_reference": "official rendered page states last modified 2020-10-05; direct HTTP returned a BLS access-denial body, which is not content authority",
       "credibility_signals": "BLS .gov primary request-schema and example documentation.",
       "digest_status": "reference_only_refresh_required",
       "freshness": "last modified 2020-10-05",
-      "freshness_signals": "Current live documentation accessed 2026-07-22.",
+      "freshness_signals": "Official rendered page still states last modified 2020-10-05 on 2026-07-23; exact content-body digest remains unavailable.",
       "id": "DOC-028",
+      "last_refresh": {
+        "retrieved_at": "2026-07-23T06:45:14Z",
+        "requested_url": "https://www.bls.gov/developers/api_signature_v2.htm",
+        "final_url": "https://www.bls.gov/developers/api_signature_v2.htm",
+        "http_status": 403,
+        "response_bytes": 1325,
+        "response_body_sha256": "sha256:d80a450b4a840e7552e0602bff40419f935c72092500d709259d3428160091cd",
+        "response_body_scope": "retrieval_health_access_denial_only",
+        "semantic_review_method": "official page rendering; no raw response-body digest available",
+        "semantic_assessment": "no semantic or provider-surface change observed",
+        "digest_gate": "blocked_until_http_200_official_content_capture"
+      },
       "priority": "P0",
       "provider": "bls",
-      "retrieval_date": "2026-07-22",
+      "retrieval_date": "2026-07-23",
       "selection_rationale": "Defines the registrationkey request field needed for a minimal non-mutating activation probe.",
       "source_type": "official API request reference",
       "status": "assigned",
@@ -1539,21 +1699,33 @@
     },
     {
       "access": {
-        "date": "2026-07-22",
-        "status": "official_source_reviewed_body_digest_unavailable"
+        "date": "2026-07-23",
+        "status": "official_source_reviewed_direct_content_digest_unavailable_http_403"
       },
       "assigned_batch": "docs-batch-003",
       "category": "docs",
       "content_digest": null,
-      "content_reference": "official BLS page states last modified 2023-08-30; full terms text independently retrieved through web index on 2026-07-22",
+      "content_reference": "official rendered page states last modified 2023-08-30; direct HTTP returned a BLS access-denial body, which is not terms authority",
       "credibility_signals": "BLS .gov primary terms page governing Public Data API use.",
       "digest_status": "reference_only_refresh_required",
       "freshness": "last modified 2023-08-30",
-      "freshness_signals": "Page states last modified 2023-08-30; current page accessed 2026-07-22.",
+      "freshness_signals": "Official rendered page still states last modified 2023-08-30 on 2026-07-23; exact content-body digest remains unavailable.",
       "id": "DOC-029",
+      "last_refresh": {
+        "retrieved_at": "2026-07-23T06:45:14Z",
+        "requested_url": "https://www.bls.gov/developers/termsOfService.htm",
+        "final_url": "https://www.bls.gov/developers/termsOfService.htm",
+        "http_status": 403,
+        "response_bytes": 1325,
+        "response_body_sha256": "sha256:ad9ae09da74dca957f90a59469c6784b2789155d7fc29e87a70c57ba51110820",
+        "response_body_scope": "retrieval_health_access_denial_only",
+        "semantic_review_method": "official page rendering; no raw response-body digest available",
+        "semantic_assessment": "no semantic or provider-surface change observed",
+        "digest_gate": "blocked_until_http_200_official_content_capture"
+      },
       "priority": "P0",
       "provider": "bls",
-      "retrieval_date": "2026-07-22",
+      "retrieval_date": "2026-07-23",
       "selection_rationale": "Defines attribution and disclaimer context, false-representation limits, and enforcement against usage-limit circumvention.",
       "source_type": "official U.S. government API terms",
       "status": "assigned",
@@ -1930,25 +2102,50 @@
     },
     {
       "access": {
-        "date": "2026-07-22",
-        "status": "official_source_reviewed_body_digest_unavailable"
+        "date": "2026-07-23",
+        "status": "retrieved"
       },
       "assigned_batch": "docs-batch-004",
       "category": "docs",
-      "content_digest": null,
-      "content_reference": "canonical Kraken API-reference route accessed 2026-07-22; automated response body unavailable",
+      "content_digest": "sha256:60e3b211ba2c5d94f03d73a767022149e2d29203d334487080aff8360bcadd0c",
+      "content_reference": "https://docs.kraken.com/api-reference/account-data/get-api-key-info.md",
       "credibility_signals": "Kraken-generated Spot REST API reference on its official developer domain.",
-      "digest_status": "reference_only_refresh_required",
-      "freshness_signals": "Current live API reference accessed 2026-07-22.",
+      "digest_status": "captured",
+      "freshness_signals": "Current canonical HTML and official Markdown representation retrieved 2026-07-23; former route now returns 404.",
       "id": "DOC-014",
+      "last_refresh": {
+        "retrieved_at": "2026-07-23T06:47:15Z",
+        "requested_url": "https://docs.kraken.com/api-reference/account-data/get-api-key-info.md",
+        "final_url": "https://docs.kraken.com/api-reference/account-data/get-api-key-info.md",
+        "http_status": 200,
+        "response_bytes": 9700,
+        "response_body_sha256": "sha256:60e3b211ba2c5d94f03d73a767022149e2d29203d334487080aff8360bcadd0c",
+        "response_body_scope": "official_machine_readable_page_content",
+        "canonical_page": {
+          "retrieved_at": "2026-07-23T06:44:03Z",
+          "final_url": "https://docs.kraken.com/api-reference/account-data/get-api-key-info",
+          "http_status": 200,
+          "response_bytes": 500328,
+          "response_body_sha256": "sha256:2850d341b212b88fe38ba1d754175a707c0500e553213a727f59e5841137a275"
+        },
+        "superseded_url_check": {
+          "retrieved_at": "2026-07-23T06:47:13Z",
+          "url": "https://docs.kraken.com/api/docs/rest-api/get-api-key-info",
+          "http_status": 404,
+          "response_bytes": 109882,
+          "response_body_sha256": "sha256:e37756d4f2a2e9cc0cd430a952a0ed4822e97e05576e6c01ed2e9bcba655b31d",
+          "response_body_scope": "url_migration_not_found_only"
+        },
+        "semantic_assessment": "canonical documentation URL changed; endpoint and verifier semantics unchanged"
+      },
       "notes": "",
       "priority": "P0",
-      "retrieval_date": "2026-07-22",
+      "retrieval_date": "2026-07-23",
       "selection_rationale": "Provides read-only verification of key identity, permissions, restrictions, expiry, IP allowlist, and last use.",
       "source_type": "official REST endpoint reference",
       "status": "assigned",
       "title": "Kraken Get API Key Info",
-      "url": "https://docs.kraken.com/api/docs/rest-api/get-api-key-info"
+      "url": "https://docs.kraken.com/api-reference/account-data/get-api-key-info"
     },
     {
       "access": {

@@ -6,6 +6,7 @@
 - [Executive Summary](#executive-summary)
 - [Research Scope and Date](#research-scope-and-date)
 - [Methodology](#methodology)
+- [Mutable Source Refresh (2026-07-23)](#mutable-source-refresh-2026-07-23)
 - [Source Coverage](#source-coverage)
 - [Key Findings](#key-findings)
 - [Provider Release Matrix](#provider-release-matrix)
@@ -37,9 +38,11 @@ terms acceptance, or manual key issuance where the provider retains those contro
 The provider decision is surface-specific:
 
 - **SEC EDGAR and Treasury Fiscal Data** have documented no-secret access and affirmative scoped
-  reuse evidence. They are documentation-ready for Task 19A after bounded runtime smoke evidence.
-  The SEC additionally requires a declared application/company and administrative contact in the
-  `User-Agent` and currently limits automated access to 10 requests per second.
+  reuse evidence. Fiscal Data remains documentation-ready after bounded runtime smoke evidence. The
+  SEC record is now `RefreshRequired` because its exact official content could not be captured with
+  HTTP 200 during the mandatory digest refresh; activation remains unavailable until that evidence
+  gap is closed. The last reviewed SEC content requires a declared application/company and
+  administrative contact in the `User-Agent` and limits automated access to 10 requests per second.
   [SEC APIs](https://www.sec.gov/search-filings/edgar-application-programming-interfaces),
   [SEC fair-access/reuse FAQ](https://www.sec.gov/about/webmaster-frequently-asked-questions),
   [Fiscal Data API](https://fiscaldata.treasury.gov/api-documentation/)
@@ -53,14 +56,15 @@ The provider decision is surface-specific:
   exposes exact permissions, restrictions, expiry, query bounds, and IP allowlisting. Private cost,
   account eligibility, durable-use rights, and automatic remote lifecycle remain incomplete.
   [Coinbase key permissions](https://docs.cdp.coinbase.com/api-reference/advanced-trade-api/rest-api/data-api/get-api-key-permissions),
-  [Kraken key information](https://docs.kraken.com/api/docs/rest-api/get-api-key-info)
+  [Kraken key information](https://docs.kraken.com/api-reference/account-data/get-api-key-info)
 - **BLS v1** has a documented no-key path and **BLS v2** is an optional human-resumed higher-quota
   path with CAPTCHA, email delivery, and annual renewal. The official BLS terms provide affirmative
   secondary-use language while imposing access-date citation, disclaimer, truthful-representation,
   limit-compliance, and third-party-rights duties. Both tiers can proceed as scoped, documentation-
   ready capabilities after those duties are bound and runtime smokes pass; neither receives a
-  blanket grant for out-of-scope or third-party material. The **Treasury daily-rate XML feed** still
-  lacks feed-specific durable-use evidence.
+  blanket grant for out-of-scope or third-party material. Both BLS records are currently
+  `RefreshRequired` because the mandatory exact-content digest capture remains unresolved. The
+  **Treasury daily-rate XML feed** still lacks feed-specific durable-use evidence.
   [BLS FAQ](https://www.bls.gov/developers/api_FAQs.htm),
   [BLS terms](https://www.bls.gov/developers/termsOfService.htm),
   [Treasury XML feed](https://home.treasury.gov/treasury-daily-interest-rate-xml-feed)
@@ -103,7 +107,8 @@ gates.
 **Topic:** Zero-fee provider onboarding portal for Market Squawk: official user authorization,
 account and API credential issuance, local secret activation, and automation boundaries.
 
-**As-of date:** 2026-07-22.
+**As-of date:** 2026-07-23. The original multi-category research completed on 2026-07-22; the
+mutable-source refresh below is anchored to 2026-07-23.
 
 **Decision context:** Design mandatory Task 19A so users can activate useful zero-fee sources with
 the least possible setup burden, while preserving provider-controlled human actions, least privilege,
@@ -146,11 +151,42 @@ Conflicts and explicit non-findings are retained rather than resolved by assumpt
 source has category, priority, assigned batch, retrieval/access state, and a response digest, exact
 Git commit, or explicit stable reference plus mandatory refresh status.
 
+## Mutable Source Refresh (2026-07-23)
+
+Task 19A's mandatory pre-implementation refresh covered `DOC-009`, `DOC-010`, `DOC-014`,
+`DOC-019`, `DOC-020`, `DOC-026`, `DOC-028`, and `DOC-029`. Retrieval used the current official
+provider or government URL, normal HTTP content negotiation, and a declared Market Squawk research
+user agent. A response-body digest is content authority only when the response contains the official
+source. A `403` access-denial body or a `404` body is retained only as retrieval-health or URL-
+migration evidence and is never substituted for a terms, policy, or schema digest.
+Official-source search and standard alternate representations found no authorized exact-content
+HTTP 200 route for the five SEC/BLS pages; semantically adjacent endpoints were not substituted.
+
+| ID | Retrieved at (UTC) | Final official URL | HTTP | Response-body SHA-256 | Change assessment |
+| --- | --- | --- | ---: | --- | --- |
+| `DOC-009` | `2026-07-23T06:44:57Z` | [Coinbase Developer Platform Terms](https://www.coinbase.com/legal/developer-platform/terms-of-service) | 200 | `dc6dad1fc5690b345c9d95436d72abd8864cd8c6315ebfe65fbbd010a6fe4273` | No semantic change observed. The page still states June 23, 2026 and preserves the mutable fees, limits, storage/use, and third-party-content boundaries. |
+| `DOC-010` | `2026-07-23T06:44:58Z` | [Coinbase Exchange key rotation](https://help.coinbase.com/en/exchange/managing-my-account/how-to-rotate-your-api-key) | 200 | `79ec908d39947c2476b43643565cdee6619b07a75848c1dab0a20578f8110a92` | No semantic change observed. It remains Exchange-specific, revoke-first, human-controlled rotation guidance. |
+| `DOC-014` | `2026-07-23T06:44:03Z` | [Kraken Get API Key Info](https://docs.kraken.com/api-reference/account-data/get-api-key-info) | 200 | `2850d341b212b88fe38ba1d754175a707c0500e553213a727f59e5841137a275` | The former `/api/docs/rest-api/get-api-key-info` route returned 404 at `2026-07-23T06:47:13Z` (`e37756d4f2a2e9cc0cd430a952a0ed4822e97e05576e6c01ed2e9bcba655b31d`). The official canonical URL changed, but the endpoint, permission, restriction, expiry, query-bound, IP-allowlist, and sensitive-response semantics did not. The official [Markdown representation](https://docs.kraken.com/api-reference/account-data/get-api-key-info.md) returned 200 at `2026-07-23T06:47:15Z`; its admitted content digest is `60e3b211ba2c5d94f03d73a767022149e2d29203d334487080aff8360bcadd0c`. |
+| `DOC-019` | `2026-07-23T06:45:13Z` | [SEC EDGAR APIs](https://www.sec.gov/search-filings/edgar-application-programming-interfaces) | 403 | `2a6cea3a1a230d6aa30b151ff80e844fc3007c1d1b0996536bfa6e60f79606b4` | Digest is the SEC rate-threshold denial body, not documentation content. The official rendered page still states no-key `data.sec.gov` access and April 8, 2025 review, but the content-digest gate remains open. |
+| `DOC-020` | `2026-07-23T06:45:13Z` | [SEC Webmaster FAQ](https://www.sec.gov/about/webmaster-frequently-asked-questions) | 403 | `e901cf48f0dd1d287d5009182ad4f0479550d06f6518f096271a88dc4a7d70ee` | Digest is the SEC rate-threshold denial body, not policy content. The official rendered page still states the declared `User-Agent`, 10 requests/second, and August 23, 2024 review; the content-digest gate remains open. |
+| `DOC-026` | `2026-07-23T06:45:13Z` | [BLS API FAQ](https://www.bls.gov/developers/api_FAQs.htm) | 403 | `6ce8eef3fca865c1a9c21812cfd44b9b3ca7d45c00223ccc10e87775241a3758` | Digest is the BLS access-denial body, not documentation content. The official rendered page still shows the v1/v2 limits, registration, annual renewal, `429`, and August 30, 2023 modification date; the content-digest gate remains open. |
+| `DOC-028` | `2026-07-23T06:45:14Z` | [BLS v2 signatures](https://www.bls.gov/developers/api_signature_v2.htm) | 403 | `d80a450b4a840e7552e0602bff40419f935c72092500d709259d3428160091cd` | Digest is the BLS access-denial body, not request-schema content. The official rendered page still includes `registrationkey` and the October 5, 2020 modification date; the content-digest gate remains open. |
+| `DOC-029` | `2026-07-23T06:45:14Z` | [BLS API terms](https://www.bls.gov/developers/termsOfService.htm) | 403 | `ad9ae09da74dca957f90a59469c6784b2789155d7fc29e87a70c57ba51110820` | Digest is the BLS access-denial body, not terms content. The official rendered page still contains the secondary-use language and its citation, disclaimer, representation, limit, and third-party duties, with the August 30, 2023 modification date; the content-digest gate remains open. |
+
+The Coinbase records and the migrated Kraken record now have admissible official response-body
+digests. No provider-capability or acceptance-criterion semantics changed. The SEC surface and both
+BLS surfaces nevertheless remain `RefreshRequired` and cannot reach `ActiveScoped`: their exact
+official content bodies were not captured successfully. `T19A-AC-01`, `T19A-AC-06`,
+`T19A-AC-08`, `T19A-AC-21`, and `T19A-AC-22` therefore remain unsatisfied for those affected
+records until an authorized retrieval returns the official content with HTTP 200 and its digest is
+recorded. This is an evidence-availability narrowing, not evidence that the documented SEC or BLS
+provider behavior itself changed.
+
 ## Source Coverage
 
 | Evidence class | Completed coverage | Final use | Limitation |
 | --- | --- | --- | --- |
-| Official provider/government documentation | 32 source IDs across Coinbase, Kraken, SEC, FRED/ALFRED, BLS, and Treasury | Provider capabilities, human boundaries, quotas, rights evidence, lifecycle, release states | No runtime probe; provider terms and limits are mutable |
+| Official provider/government documentation | 32 source IDs across Coinbase, Kraken, SEC, FRED/ALFRED, BLS, and Treasury | Provider capabilities, human boundaries, quotas, rights evidence, lifecycle, release states | No runtime probe; provider terms and limits are mutable; five SEC/BLS content digests remain refresh-blocked |
 | IETF/RFC Editor standards | 7 distinct RFC source IDs | Native OAuth, device flow, issuer metadata, DCR, DCR management, current OAuth security, revocation | Standards do not establish provider support or client eligibility |
 | Official OS/platform documentation | 7 distinct source IDs | Apple, Windows, DPAPI, and Secret Service storage contracts | No platform runtime validation; Secret Service 0.2 is a draft |
 | Exact-commit GitHub repositories | 5 | Candidate library/product architecture and maintenance evidence | Not provider capability, rights, or release evidence |
@@ -214,7 +250,7 @@ FRED/BLS minimal reads show request acceptance only and do not prove identity, l
 rights. Every credential passes exact secure-store write/read, provider permission, account/issuer,
 expiry, rights, and rate admission before `ActiveScoped`.
 [Coinbase key permissions](https://docs.cdp.coinbase.com/api-reference/advanced-trade-api/rest-api/data-api/get-api-key-permissions),
-[Kraken key information](https://docs.kraken.com/api/docs/rest-api/get-api-key-info),
+[Kraken key information](https://docs.kraken.com/api-reference/account-data/get-api-key-info),
 [FRED errors](https://fred.stlouisfed.org/docs/api/fred/errors.html),
 [BLS v2 signatures](https://www.bls.gov/developers/api_signature_v2.htm)
 
@@ -270,6 +306,11 @@ surface-specific limiter and explicit unknown state.
 | **BLS v2 registered** | Optional emailed registration key | Organization/email, CAPTCHA, terms, email retrieval, annual renewal | Same BLS rights record; exact higher-tier limits; bounded keyed POST; key changes quota/features only | Confirmed registration/terms facts plus scoped-admission inference | Medium-high | `optional_human_resumed_scoped_rights_runtime_smoke_pending` |
 | **Treasury daily-rate XML** | No documented credential | None | Feed-specific durable-use evidence incomplete; bounded XML/OData/date/value/pagination probe | Confirmed access fact plus conservative rights inference | Medium | `technically_available_no_secret_durable_rights_pending` |
 | **Treasury Fiscal Data** | Explicit no-account/no-token | None | Bind broad reuse terms to exact API/dataset; validate data/meta/links/version | Confirmed official facts; provenance binding is engineering policy | High | `documentation_ready_no_secret_runtime_smoke_pending` |
+
+The table preserves each surface's underlying semantic decision. `RefreshRequired` is a
+higher-priority evidence state: SEC and both BLS rows are currently unavailable despite those
+baseline decisions. The machine-readable matrix records that override with `refresh_state`,
+`activation_available`, and the exact blocking source IDs.
 
 Provider matrix evidence:
 [Coinbase public/private boundary](https://docs.cdp.coinbase.com/coinbase-app/advanced-trade-apis/rest-api),
@@ -623,19 +664,24 @@ duplicative prose checks or a separate test for every documentation sentence.
 
 ### Release-blocking or capability-blocking
 
-1. **FRED rights:** qualified, scope-specific review and any required written Bank/series-owner
+1. **SEC/BLS mutable-source digests:** `DOC-019`, `DOC-020`, `DOC-026`, `DOC-028`, and
+   `DOC-029` remain `RefreshRequired` after standards-compliant direct retrieval returned CDN access
+   denials. SEC and both BLS capability records remain unavailable until exact official content is
+   captured with HTTP 200; denial-body hashes are retrieval health only.
+2. **FRED rights:** qualified, scope-specific review and any required written Bank/series-owner
    permissions remain unresolved. FRED stays blocked.
-2. **Exchange durable-use rights:** Coinbase/Kraken public and private storage/modeling/reuse evidence
+3. **Exchange durable-use rights:** Coinbase/Kraken public and private storage/modeling/reuse evidence
    remains incomplete.
-3. **Treasury XML rights:** technical availability does not yet admit durable publication. BLS is
+4. **Treasury XML rights:** technical availability does not yet admit durable publication. BLS is
    separately blocked only until the scoped terms duties and provenance boundary are implemented
-   and its runtime smoke passes; it is not blocked for lack of any affirmative secondary-use text.
-4. **Existing encrypted vault admission:** the implementation exists, but Task 19A has not yet
+   and its source refresh and runtime smoke pass; it is not blocked for lack of any affirmative
+   secondary-use text.
+5. **Existing encrypted vault admission:** the implementation exists, but Task 19A has not yet
    independently established that it satisfies every T19A-AC-14 requirement at the release commit.
-5. **Provider OAuth/device/DCR:** no generally available capability for current mandatory provider
+6. **Provider OAuth/device/DCR:** no generally available capability for current mandatory provider
    paths is admitted solely by this evidence. Coinbase OAuth is approved-partner constrained; Kraken
    Embed OAuth is a separate B2B surface.
-6. **Runtime verification:** no provider endpoint, OAuth flow, credential, or OS store was exercised.
+7. **Runtime verification:** no provider endpoint, OAuth flow, credential, or OS store was exercised.
 
 ### Documentation conflicts to preserve
 
@@ -644,7 +690,8 @@ duplicative prose checks or a separate test for every documentation sentence.
 - Fiscal Data says no token is required but its `403` description mentions an invalid API key: do
   not invent a credential; monitor anonymous behavior.
 - SEC typical filing/API delays describe different paths and are not SLAs.
-- Kraken’s key-info documentation moved to a new canonical URL: URL/schema drift triggers refresh.
+- Kraken’s key-info documentation moved from the now-404 `/api/docs/rest-api/` route to
+  `/api-reference/account-data/` on 2026-07-23; URL/schema drift triggers refresh.
 - Coinbase Exchange rotation guidance is supporting evidence and is not assumed to define every
   Coinbase App key lifecycle.
 - Windows Credential Manager “local machine” persistence must not be confused with DPAPI’s broader
@@ -674,8 +721,9 @@ report. A fresh independent verifier must still decide whether the repaired evid
 
 ## Source Matrix
 
-All sources were accessed or retrieved on 2026-07-22 unless another freshness date is shown. The
-matrix is deduplicated by source ID and URL.
+The original source set was accessed or retrieved on 2026-07-22 unless another freshness date is
+shown. The eight mutable records listed above were refreshed on 2026-07-23. The matrix is
+deduplicated by source ID and URL.
 
 ### Coinbase
 
@@ -699,7 +747,7 @@ matrix is deduplicated by source ID and URL.
 | DOC-011 | [Exchange overview](https://docs.kraken.com/exchange/guides/overview) | Public/private workflow and public endpoints |
 | DOC-012 | [REST API keys](https://docs.kraken.com/exchange/guides/rest/api-keys) | Minimum privilege, purpose-bound keys, allowlisting, rotation guidance |
 | DOC-013 | [Create a Spot API key](https://support.kraken.com/articles/360000919966-how-to-create-an-api-key) | Human UI, restrictions, secret form, optional 2FA; updated 2025-08-08 |
-| DOC-014 | [Get API Key Info](https://docs.kraken.com/api/docs/rest-api/get-api-key-info) | Exact permission/restriction/expiry verification; canonical URL |
+| DOC-014 | [Get API Key Info](https://docs.kraken.com/api-reference/account-data/get-api-key-info) | Exact permission/restriction/expiry verification; canonical URL refreshed 2026-07-23 |
 | DOC-015 | [Kraken CLI](https://docs.kraken.com/home/cli) | Public/paper mode and manual-key setup boundary |
 | DOC-016 | [API rate limits](https://support.kraken.com/articles/206548367-what-are-the-api-rate-limits-) | Public IP/pair guidance and private distinctions; updated 2026-03-27 |
 | DOC-017 | [API-key security](https://support.kraken.com/articles/api-key-security) | Replacement/deletion and provider revocation/dormancy; updated 2025-03-31 |
