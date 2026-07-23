@@ -82,8 +82,8 @@
   "sources": [
     {
       "path": "Cargo.lock",
-      "sha256": "a50797fc0e2bc4ca3e66751eb5ead96a4a1e4064b084e5e55ed27b24c88183c1",
-      "size_bytes": 176963
+      "sha256": "2b51acab6307423199fe644621af20075c2c93a28ea966c5fb0e137e08264fb7",
+      "size_bytes": 176971
     },
     {
       "path": "Cargo.toml",
@@ -332,8 +332,8 @@
     },
     {
       "path": "crates/market-squawk-data/src/catalog.rs",
-      "sha256": "cf7477659b7f21146e3651386517dbc735d2934ae0016b34792389aef469570a",
-      "size_bytes": 11168
+      "sha256": "efdca6c4b11eb54f3e673d30fe8e2fd8b1e04a7b40db274b29b1c9d1a7a208db",
+      "size_bytes": 11197
     },
     {
       "path": "crates/market-squawk-data/src/catalog/authority.rs",
@@ -422,8 +422,8 @@
     },
     {
       "path": "crates/market-squawk-data/src/catalog/records.rs",
-      "sha256": "d3f712819491510c57e26651c73415243ad3ae7fcd65d967259a9a9aa3d3c957",
-      "size_bytes": 24427
+      "sha256": "2a9be4a7277272d1c93255201c24ad9299aebdcfde83b5d7832e9527c8fac9f7",
+      "size_bytes": 31475
     },
     {
       "path": "crates/market-squawk-data/src/catalog/restore_logical.rs",
@@ -442,8 +442,8 @@
     },
     {
       "path": "crates/market-squawk-data/src/catalog/types.rs",
-      "sha256": "7b8bc35c3cc8f97632c27c0b8cd2d232f4a4887fb1d4e2b8b9d2d74fe8f54909",
-      "size_bytes": 32643
+      "sha256": "6afc11ec3f52f1ad965f8f4112d7a28cdd583c1e92dd8cc430996b9607cf7e96",
+      "size_bytes": 36236
     },
     {
       "path": "crates/market-squawk-data/src/corporate_actions.rs",
@@ -512,8 +512,8 @@
     },
     {
       "path": "crates/market-squawk-data/src/lib.rs",
-      "sha256": "595f8f7b0e6ff564be2f7b3b66fdc06fd52e75f9012f03bde6442019119edd94",
-      "size_bytes": 6624
+      "sha256": "5807dc42ecee2771bfa0366192280b8b3f2624f689ad6099c374d48bd932bddc",
+      "size_bytes": 6653
     },
     {
       "path": "crates/market-squawk-data/src/manifest.rs",
@@ -1082,13 +1082,13 @@
     },
     {
       "path": "crates/market-squawk-modeling/src/onnx.rs",
-      "sha256": "a030a8565f2e9ebef3c0564d9a4e0fa45af859b770379fb5f2abb9130dacd4ff",
-      "size_bytes": 8317
+      "sha256": "02bd708dc70db3d392401f424e90bbefdcb45fe4ae4450cd13a21acda4dd2a29",
+      "size_bytes": 8900
     },
     {
       "path": "crates/market-squawk-modeling/src/onnx/external.rs",
-      "sha256": "06e6c529c6dae7e5d095389209704a7acd4b940b52532a9e32a42056bb11d262",
-      "size_bytes": 12051
+      "sha256": "4742ec9ddb32a6c323f01f25e17a6ceff1617c6e1ee4a30cc4d08e31deb73564",
+      "size_bytes": 13729
     },
     {
       "path": "crates/market-squawk-modeling/src/onnx/external/seal.rs",
@@ -1097,28 +1097,33 @@
     },
     {
       "path": "crates/market-squawk-modeling/src/onnx/policy.rs",
-      "sha256": "05c5d562dab1b7463bf38864a45ab1e6b4db2c4b6a365326d35dfd8ab913440a",
-      "size_bytes": 15373
+      "sha256": "7daeb34fce0c466d452c95988a73e50d0c0487ba9f83a371c08a2183436acddd",
+      "size_bytes": 17420
+    },
+    {
+      "path": "crates/market-squawk-modeling/src/onnx/wire.rs",
+      "sha256": "8c195296428afc7ab553431e285ce08932709d99efa57bc3b8d5f1976360c627",
+      "size_bytes": 34093
     },
     {
       "path": "crates/market-squawk-modeling/src/onnx/worker.rs",
-      "sha256": "de00359a817ea9b0006dc62c6855eeb41efc1860fae9b5efb4346a6d1d5ca5d5",
-      "size_bytes": 17308
+      "sha256": "cb6aa1bb1eb138645608499e09de25dd8c95d6f027f6a52afe99de8da550043e",
+      "size_bytes": 45679
     },
     {
       "path": "crates/market-squawk-modeling/src/onnx/worker/process.rs",
-      "sha256": "a285153eb99cab0c313f84205cf5020f0dbf83d043bafc77a61b47272f8c2562",
-      "size_bytes": 13289
+      "sha256": "fa76bbea07dd88383326767231948e2ae50678394643622dbadeb0a66f98411a",
+      "size_bytes": 15383
     },
     {
       "path": "crates/market-squawk-modeling/src/onnx/worker/protocol.rs",
-      "sha256": "68bb3d34fa6ec716a5f5a4348e8eca84960a0c33d6991847fd059609d2008279",
-      "size_bytes": 11031
+      "sha256": "5a5fcbe1d37d1917c49f7e025a7eaed917b3904e6235b1748c650b114f54b6dd",
+      "size_bytes": 13345
     },
     {
       "path": "crates/market-squawk-modeling/src/onnx/worker/resources.rs",
-      "sha256": "9e1da1b67bc5214ae50c205ca9f5d5ef313a75d71ec70818fa50ccc927b17d6c",
-      "size_bytes": 2763
+      "sha256": "8da172cc0a7de4c888acbd40f1a90c99eef2764d2f421d91148fd1dbee60f744",
+      "size_bytes": 5055
     },
     {
       "path": "crates/market-squawk-modeling/src/registry.rs",
@@ -1462,8 +1467,8 @@
     },
     {
       "path": "crates/market-squawk-python/Cargo.toml",
-      "sha256": "a968d921f2b9b93e30836a109ab4b704fcd70f4dc322f8e691c8efa0cb410e82",
-      "size_bytes": 717
+      "sha256": "00f27a003db26251ba30b617d57848f0395796ae7533118485650b07872cb0a2",
+      "size_bytes": 724
     },
     {
       "path": "crates/market-squawk-python/src/analytics.rs",
