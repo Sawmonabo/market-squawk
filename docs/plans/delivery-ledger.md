@@ -399,3 +399,22 @@ The next delivery event is the open Task 19/19A acceptance work, followed by Tas
 demonstration, evidence, final review, exact-head release gate, publication, and cleanup. Neither
 Quarter 3 acceptance nor the completed documentation portal claims that the Market Squawk product
 release is complete.
+
+## Active Quarter 4 implementation wave
+
+The release head after documentation closeout is the common start barrier. Three grouped product
+lanes may proceed in parallel; the integration owner retains every shared composition and manifest
+hotspot.
+
+| Lane | Start dependency | Owned implementation surface | Reserved integration hotspots | Focused gate | Merge order |
+| --- | --- | --- | --- | --- | --- |
+| Provider first use | Current onboarding/activation authority and code-owned provider evidence | Platform secret backends, source onboarding state, SEC/FRED/BLS/Treasury adapters, provider portal/activation modules | Workspace manifests/lock, `main.rs`, `local_product/mod.rs`, application descriptor registry, README/ledger | Affected platform/sources/adapters and consolidated provider/control-plane cases only | 1 |
+| Research/model first use | Current catalog, dataset, Python release, and model authority | Data/analytics/modeling/Python internals, dataset cursor/export handoff, feature publication, bounded artifact retrieval implementation | Workspace manifests/lock, global CLI enum, application descriptor registry/composition, README/ledger | Affected data/analytics/modeling/Python suites and existing control-plane cases only | 2 |
+| Execution/paper readiness | Current risk/dispatch/paper authority; final executable demo waits for provider qualification | Execution/live/paper modules, controlled strategy, paper lifecycle, effective fee bound | Workspace manifests/lock, application descriptor registry/composition, source qualification policy, README/ledger | Existing execution/live/paper and consolidated risk-execution cases only | 3 |
+| Integration owner | Accepted commits from all three lanes | Shared application/CLI/MCP wiring, conflict resolution, lockfile, release truth and issue state | Sole writer for every reserved hotspot | One affected integration gate after each merge; Task 20 owns the only full exact-head release gate | serialized |
+
+Every worker uses `CARGO_INCREMENTAL=0`, its worktree-local default `target/`, and no broad workspace
+gate. Each lane stops before a reserved hotspot, reports the exact required integration change, and
+keeps tests to the smallest behavioral proof of a real authority or producer-to-consumer defect.
+The integration owner monitors all targets, stops a lane at its measured cache ceiling, and removes
+each clean worktree plus local/origin feature branch after accepted integration.
