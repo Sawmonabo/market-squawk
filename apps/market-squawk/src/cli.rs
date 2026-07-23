@@ -266,6 +266,9 @@ pub enum IngestCommand {
         provider: String,
         /// Provider object or series identifier.
         object: String,
+        /// Destination dataset identity.
+        #[arg(long)]
+        dataset: String,
         /// Explicit local mutation confirmation.
         #[arg(long)]
         confirm: bool,
@@ -369,15 +372,15 @@ pub enum PortfolioCommand {
     },
     /// Report current holdings.
     Holdings {
-        /// Optional account filter.
+        /// Exact account identity.
         #[arg(long)]
-        account: Option<String>,
+        account: String,
     },
     /// Report normalized transactions.
     Transactions {
-        /// Optional account filter.
+        /// Exact account identity.
         #[arg(long)]
-        account: Option<String>,
+        account: String,
     },
     /// Measure point-in-time portfolio performance.
     Performance {
@@ -465,6 +468,8 @@ pub enum ExecutionCommand {
 /// Fair-value operation.
 #[derive(Debug, Subcommand)]
 pub enum FairValueCommand {
+    /// List bounded immutable measurements.
+    List,
     /// Create an immutable evidence-bound measurement.
     Measure {
         /// Confined JSON request file.
@@ -491,16 +496,30 @@ pub enum FairValueCommand {
         /// Measurement identity.
         measurement: String,
     },
+    /// Return approval and revocation status at one exact instant.
+    ApprovalStatus {
+        /// Measurement identity.
+        measurement: String,
+        /// RFC 3339 status instant.
+        #[arg(long)]
+        at: String,
+    },
     /// Approve an eligible measurement through the controlled workflow.
     Approve {
         /// Measurement identity.
         measurement: String,
+        /// Exact classification decision identity.
+        #[arg(long)]
+        decision: String,
         /// Distinct reviewer identity.
         #[arg(long)]
         reviewer: String,
-        /// Required approval reason.
+        /// RFC 3339 approval instant.
         #[arg(long)]
-        reason: String,
+        approved_at: String,
+        /// RFC 3339 approval expiry.
+        #[arg(long)]
+        expires_at: String,
         /// Explicit local mutation confirmation.
         #[arg(long)]
         confirm: bool,
