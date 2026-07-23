@@ -12,6 +12,11 @@ and worktree cleanup. It supersedes every earlier complete-remaining-work or Q-n
 plan as execution authority. Historical filenames and finding identifiers remain immutable audit
 locators only.
 
+The current bounded correction for canonical Tasks 16–17 is the
+[Quarter 3 portfolio/backtest authority remediation plan](../superpowers/plans/2026-07-22-quarter-3-portfolio-backtest-authority-remediation.md).
+It is a task-scoped execution addendum to the canonical plan, not another release plan or delivery
+quarter.
+
 ## Current execution rule
 
 - Exact pushed heads, active worktrees, blockers, next release events, issue state, and cleanup
