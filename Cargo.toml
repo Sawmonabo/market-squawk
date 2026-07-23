@@ -72,6 +72,7 @@ market-squawk-platform = { path = "crates/market-squawk-platform", version = "=0
 market-squawk-portfolio = { path = "crates/market-squawk-portfolio", version = "=0.1.0" }
 market-squawk-services = { path = "crates/market-squawk-services", version = "=0.1.0" }
 market-squawk-sources = { path = "crates/market-squawk-sources", version = "=0.1.0" }
+market-squawk-valuation = { path = "crates/market-squawk-valuation", version = "=0.1.0" }
 memory-stats = "=1.2.0"
 num-bigint = "0.4"
 parking_lot = "0.12"

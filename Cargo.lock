@@ -3382,6 +3382,7 @@ dependencies = [
  "market-squawk-portfolio",
  "market-squawk-services",
  "market-squawk-sources",
+ "market-squawk-valuation",
  "parking_lot",
  "rust_decimal",
  "rustix 1.1.4",

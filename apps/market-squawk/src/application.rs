@@ -20,11 +20,16 @@ use thiserror::Error;
 pub mod analysis;
 mod contracts;
 mod domain_support;
+pub mod fair_value;
 pub mod model;
 mod paper;
 mod research;
 
 pub use contracts::{APPLICATION_CONTRACT_VERSION, application_capabilities};
+pub use fair_value::{
+    FairValueDomainService, FairValueInputResolutionError, FairValueInputResolutionRequest,
+    FairValueInputResolver, FairValueProducerKind,
+};
 pub use paper::PaperApplicationServices;
 pub use research::{
     ManagedResearchExtractionSource, ProductionResearchIngestCoordinator,

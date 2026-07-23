@@ -70,6 +70,7 @@ market-squawk-platform = { workspace = true }
 market-squawk-portfolio = { workspace = true }
 market-squawk-services = { workspace = true }
 market-squawk-sources = { workspace = true }
+market-squawk-valuation = { workspace = true }
 rust_decimal = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
