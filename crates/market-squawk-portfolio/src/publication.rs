@@ -358,6 +358,8 @@ fn revision_id(
     digest.update(evidence.as_of.unix_nanos().to_be_bytes());
     digest.update(evidence.dataset.dataset_id().as_str().as_bytes());
     digest.update(evidence.dataset.manifest_version().to_be_bytes());
+    hash_bytes(&mut digest, evidence.dataset.schema().name().as_bytes());
+    digest.update(evidence.dataset.schema_version().get().to_be_bytes());
     digest.update(evidence.dataset.schema().fingerprint());
     digest.update(evidence.dataset.content_hash().bytes());
     digest.update(evidence.point_in_time_content.bytes());

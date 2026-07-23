@@ -7,13 +7,14 @@ use market_squawk_analytics::{
     ShockComposition, StatisticalInput, StatisticalScale, StatisticalUnit,
 };
 use market_squawk_data::{
-    CorporateActionRecord, DatasetId, DatasetManifestRef, DatasetSchemaRegistry, Sha256Digest,
+    CorporateActionRecord, DatasetId, DatasetManifestRef, DatasetSchemaRef, DatasetSchemaRegistry,
+    Sha256Digest,
 };
 use market_squawk_domain::{
     AccountId, AvailabilityEvidence, CorporateActionKind, CorporateActionObservation, Currency,
     DataQuality, DigestAlgorithm, EvidenceDigest, InstrumentId, MergerConsideration, Money,
     PayloadReference, ResearchContext, ResearchProvenance, ResearchProvenanceInput, ResearchTime,
-    RevisionNumber, SourceId, SourceIdentifier, Timestamp, VenueId,
+    RevisionNumber, SchemaVersion, SourceId, SourceIdentifier, Timestamp, VenueId,
 };
 use market_squawk_portfolio::{
     AnalyticsPolicyBinding, AttributionInput, AttributionReport, CashFlow, CashFlowKind,
@@ -21,8 +22,8 @@ use market_squawk_portfolio::{
     LotSelection, MoneyWeightedMethod, PerformancePeriod, PerformancePolicy, PerformanceReport,
     PortfolioAnalyticsEvidence, PortfolioError, PortfolioLedger, PortfolioLimitInput,
     PortfolioLimits, PortfolioRevision, PortfolioRiskReport, RebalanceConstraintInput,
-    RebalanceConstraints, RebalanceProposal, RebalanceTarget, ScenarioDefinition, Trade, TradeSide,
-    TransactionRevision, ValuationSet,
+    RebalanceConstraints, RebalanceProposal, RebalanceTarget, RevisionEvidence, ScenarioDefinition,
+    Trade, TradeSide, TransactionRevision, ValuationSet,
 };
 use rust_decimal::Decimal;
 
@@ -237,7 +238,10 @@ fn analytics_limits_with_instruments(
     })
 }
 
-fn empty_revision(currency: Currency) -> Result<PortfolioRevision, Box<dyn Error>> {
+fn empty_revision(
+    currency: Currency,
+    dataset: DatasetManifestRef,
+) -> Result<PortfolioRevision, Box<dyn Error>> {
     let limits = super::limits()?;
     let mut ledger = PortfolioLedger::try_new(account()?, currency, limits)?;
     Ok(ledger.try_apply(
@@ -246,22 +250,53 @@ fn empty_revision(currency: Currency) -> Result<PortfolioRevision, Box<dyn Error
         ValuationSet::try_new(
             currency,
             Timestamp::from_unix_nanos(4),
-            dataset(9)?,
+            dataset.clone(),
             Sha256Digest::new([9; 32]),
             Vec::new(),
             Vec::new(),
             limits,
         )?,
-        super::revision_evidence(9, 4)?,
+        RevisionEvidence::try_new(
+            Timestamp::from_unix_nanos(4),
+            dataset,
+            Sha256Digest::new([9; 32]),
+            Sha256Digest::new([10; 32]),
+            vec![source("ledger-source-9")?],
+            Vec::new(),
+            None,
+        )?,
     )?)
 }
 
 #[test]
-fn currency_distinct_revisions_reject_shared_analytics_evidence() -> TestResult {
+fn currency_and_schema_distinct_revisions_reject_shared_analytics_evidence() -> TestResult {
     let usd = Currency::try_from("USD")?;
     let eur = Currency::try_from("EUR")?;
-    let usd_revision = empty_revision(usd)?;
-    let eur_revision = empty_revision(eur)?;
+    let manifest = dataset(9)?;
+    let schema_name_manifest = DatasetManifestRef::try_new_with_schema(
+        manifest.dataset_id().clone(),
+        manifest.manifest_version(),
+        DatasetSchemaRef::try_new(
+            "market_squawk.research_observations_alt",
+            manifest.schema_version(),
+            manifest.schema().fingerprint(),
+        )?,
+        manifest.content_hash(),
+    )?;
+    let schema_version_manifest = DatasetManifestRef::try_new_with_schema(
+        manifest.dataset_id().clone(),
+        manifest.manifest_version(),
+        DatasetSchemaRef::try_new(
+            manifest.schema().name(),
+            SchemaVersion::new(4)?,
+            manifest.schema().fingerprint(),
+        )?,
+        manifest.content_hash(),
+    )?;
+    let usd_revision = empty_revision(usd, manifest.clone())?;
+    let eur_revision = empty_revision(eur, manifest)?;
+    let schema_name_revision = empty_revision(usd, schema_name_manifest)?;
+    let schema_version_revision = empty_revision(usd, schema_version_manifest)?;
     let evidence = analytics_evidence(&usd_revision, 4, 4)?;
     let limits = super::limits()?;
     let policy = PerformancePolicy::new(
@@ -279,6 +314,9 @@ fn currency_distinct_revisions_reject_shared_analytics_evidence() -> TestResult 
     )?;
 
     assert_ne!(usd_revision.id(), eur_revision.id());
+    assert_ne!(usd_revision.id(), schema_name_revision.id());
+    assert_ne!(usd_revision.id(), schema_version_revision.id());
+    assert_ne!(schema_name_revision.id(), schema_version_revision.id());
     assert!(matches!(
         PerformanceReport::try_calculate(&eur_revision, &evidence, &[], policy, limits),
         Err(PortfolioError::RevisionMismatch)
@@ -302,6 +340,10 @@ fn currency_distinct_revisions_reject_shared_analytics_evidence() -> TestResult 
             &[],
             limits,
         ),
+        Err(PortfolioError::RevisionMismatch)
+    ));
+    assert!(matches!(
+        ExposureReport::try_calculate(&schema_version_revision, &evidence, &[], limits),
         Err(PortfolioError::RevisionMismatch)
     ));
     Ok(())
@@ -595,7 +637,7 @@ fn analytics_reports_are_policy_explicit_bounded_and_revision_bound() -> TestRes
             instrument(1)?,
             source("technology")?,
             source("issuer-a")?,
-            VenueId::try_from("XNAS")?,
+            VenueId::try_from("XÉ")?,
             usd,
             vec![FactorLoading::try_new(
                 FeatureKey::try_new("market.beta", NonZeroU32::MIN)?,
@@ -625,6 +667,7 @@ fn analytics_reports_are_policy_explicit_bounded_and_revision_bound() -> TestRes
     assert_eq!(exposure.currency().len(), 1);
     assert_eq!(exposure.issuer().len(), 2);
     assert_eq!(exposure.venue().len(), 2);
+    assert!(exposure.venue().iter().any(|line| line.dimension() == "xÉ"));
     assert_eq!(exposure.allocation_total().amount(), Decimal::from(210_u32));
     assert_eq!(exposure.gross().amount(), Decimal::from(210_u32));
 

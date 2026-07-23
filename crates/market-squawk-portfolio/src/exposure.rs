@@ -537,15 +537,8 @@ fn try_owned_string(value: &str) -> Result<String, PortfolioError> {
 }
 
 fn try_ascii_lowercase(value: &str) -> Result<String, PortfolioError> {
-    let mut lowercase = String::new();
-    lowercase
-        .try_reserve_exact(value.len())
-        .map_err(|_| PortfolioError::AllocationFailed)?;
-    lowercase.extend(
-        value
-            .bytes()
-            .map(|byte| char::from(byte.to_ascii_lowercase())),
-    );
+    let mut lowercase = try_owned_string(value)?;
+    lowercase.make_ascii_lowercase();
     Ok(lowercase)
 }
 
