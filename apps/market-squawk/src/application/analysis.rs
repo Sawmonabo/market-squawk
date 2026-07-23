@@ -25,8 +25,11 @@ mod catalog;
 mod serialization;
 
 pub use backtest::{
-    BacktestScope, GovernedBacktestAuthority, GovernedBacktestCommand, GovernedBacktestRecord,
-    GovernedBacktestRepository, ProductionBacktestAuthority,
+    BacktestScope, GovernedBacktestAuthority, GovernedBacktestCommand,
+    GovernedBacktestInputResolver, GovernedBacktestRecord, GovernedBacktestRepository,
+    GovernedBacktestRepositoryLimits, ProductionBacktestAuthority,
+    ProductionGovernedBacktestRepository, ProductionGovernedBacktestRepositoryError,
+    ResolvedGovernedBacktestInput,
 };
 pub use catalog::{
     AnalysisCatalog, AnalysisCatalogError, AnalysisDataset, AnalysisDatasetScope,

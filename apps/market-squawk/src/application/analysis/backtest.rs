@@ -15,7 +15,17 @@ use crate::{
     application::domain_support::encode_hex,
 };
 
+mod repository;
+
+pub use repository::{
+    GovernedBacktestInputResolver, GovernedBacktestRepositoryLimits,
+    ProductionGovernedBacktestRepository, ProductionGovernedBacktestRepositoryError,
+    ResolvedGovernedBacktestInput,
+};
+
 const MAXIMUM_BACKTEST_RECORD_BYTES: usize = 1024 * 1024;
+const MAXIMUM_BACKTEST_RECORD_METRICS: usize = 4_096;
+const BACKTEST_RECORD_VERSION: u16 = 1;
 
 /// Optional exact scope attached to one governed backtest request.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -144,6 +154,7 @@ impl GovernedBacktestRecord {
             TrialStatus::Failed(_) => json!({"state": "failed"}),
         };
         let content = json!({
+            "recordVersion": BACKTEST_RECORD_VERSION,
             "runId": run_id,
             "datasetIdentity": encode_hex(spec.dataset_identity().bytes()),
             "objectGraphDigest": encode_hex(spec.object_graph_digest().bytes()),
@@ -175,6 +186,25 @@ impl GovernedBacktestRecord {
             return Err(ServiceError::ResourceExhausted);
         }
         let object = content.as_object().ok_or(ServiceError::InvalidResult)?;
+        if !has_exact_fields(
+            object,
+            &[
+                "recordVersion",
+                "runId",
+                "datasetIdentity",
+                "objectGraphDigest",
+                "executionAssumptionDigest",
+                "cohortAuthorityDigest",
+                "cohortUniverseDigest",
+                "seed",
+                "selectionCriterion",
+                "status",
+            ],
+        ) || object.get("recordVersion").and_then(Value::as_u64)
+            != Some(u64::from(BACKTEST_RECORD_VERSION))
+        {
+            return Err(ServiceError::InvalidResult);
+        }
         let run_id = object
             .get("runId")
             .and_then(Value::as_str)
@@ -191,13 +221,23 @@ impl GovernedBacktestRecord {
                 .filter(|value| canonical_run_id(value))
                 .ok_or(ServiceError::InvalidResult)?;
         }
-        let state = object
-            .get("status")
-            .and_then(Value::as_object)
-            .and_then(|status| status.get("state"))
-            .and_then(Value::as_str)
+        for field in ["cohortAuthorityDigest", "cohortUniverseDigest"] {
+            if !optional_digest(object.get(field)) {
+                return Err(ServiceError::InvalidResult);
+            }
+        }
+        object
+            .get("seed")
+            .and_then(Value::as_u64)
             .ok_or(ServiceError::InvalidResult)?;
-        if !matches!(state, "completed" | "failed") {
+        object
+            .get("selectionCriterion")
+            .and_then(Value::as_str)
+            .ok_or(ServiceError::InvalidResult)
+            .and_then(|value| {
+                SourceIdentifier::try_from(value).map_err(|_| ServiceError::InvalidResult)
+            })?;
+        if !valid_terminal_status(object.get("status")) {
             return Err(ServiceError::InvalidResult);
         }
         Ok(Self {
@@ -243,6 +283,7 @@ pub trait GovernedBacktestRepository: Send + Sync + 'static {
     /// Publishes the stable application index after the underlying inventory is terminal.
     async fn publish(
         &self,
+        command: &GovernedBacktestCommand,
         record: GovernedBacktestRecord,
         cancellation: CancellationToken,
         deadline: Instant,
@@ -363,7 +404,7 @@ impl GovernedBacktestAuthority for ProductionBacktestAuthority {
         let outcome = join_backtest(worker, linked.token(), deadline).await?;
         let record = GovernedBacktestRecord::from_outcome(&outcome)?;
         self.repository
-            .publish(record.clone(), linked.token().clone(), deadline)
+            .publish(&command, record.clone(), linked.token().clone(), deadline)
             .await?;
         self.ensure_live(linked.token(), deadline)?;
         Ok(record)
@@ -482,9 +523,148 @@ pub(super) fn experiment_input_id(
         })
 }
 
-fn canonical_run_id(value: &str) -> bool {
+pub(super) fn canonical_run_id(value: &str) -> bool {
     value.len() == 64
+        && value.bytes().any(|byte| byte != b'0')
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn optional_digest(value: Option<&Value>) -> bool {
+    value.is_some_and(|value| value.is_null() || value.as_str().is_some_and(canonical_run_id))
+}
+
+fn valid_terminal_status(value: Option<&Value>) -> bool {
+    let Some(status) = value.and_then(Value::as_object) else {
+        return false;
+    };
+    match status.get("state").and_then(Value::as_str) {
+        Some("failed") => has_exact_fields(status, &["state"]),
+        Some("completed") => valid_completed_status(status),
+        _ => false,
+    }
+}
+
+fn valid_completed_status(status: &Map<String, Value>) -> bool {
+    if !has_exact_fields(
+        status,
+        &[
+            "state",
+            "resultDigest",
+            "artifact",
+            "metrics",
+            "datasetPartition",
+            "fillCount",
+            "noActionCount",
+            "accountingReconciliation",
+        ],
+    ) || !status
+        .get("resultDigest")
+        .and_then(Value::as_str)
+        .is_some_and(canonical_run_id)
+        || status.get("fillCount").and_then(Value::as_u64).is_none()
+        || status
+            .get("noActionCount")
+            .and_then(Value::as_u64)
+            .is_none()
+        || status
+            .get("accountingReconciliation")
+            .and_then(Value::as_str)
+            != Some("independent")
+    {
+        return false;
+    }
+    let Some(artifact) = status.get("artifact").and_then(Value::as_object) else {
+        return false;
+    };
+    if !has_exact_fields(artifact, &["reference", "digest", "byteCount"])
+        || !artifact
+            .get("reference")
+            .and_then(Value::as_str)
+            .is_some_and(canonical_artifact_reference)
+        || !artifact
+            .get("digest")
+            .and_then(Value::as_str)
+            .is_some_and(canonical_run_id)
+        || !artifact
+            .get("byteCount")
+            .and_then(Value::as_u64)
+            .is_some_and(|bytes| bytes > 0)
+    {
+        return false;
+    }
+    let Some(metrics) = status.get("metrics").and_then(Value::as_array) else {
+        return false;
+    };
+    if !valid_metrics(metrics) {
+        return false;
+    }
+    valid_dataset_partition(status.get("datasetPartition"))
+}
+
+fn valid_metrics(metrics: &[Value]) -> bool {
+    if metrics.len() > MAXIMUM_BACKTEST_RECORD_METRICS {
+        return false;
+    }
+    let mut previous = None;
+    for metric in metrics {
+        let Some(metric) = metric.as_object() else {
+            return false;
+        };
+        let Some(name) = metric.get("name").and_then(Value::as_str) else {
+            return false;
+        };
+        if !has_exact_fields(metric, &["name", "value"])
+            || SourceIdentifier::try_from(name).is_err()
+            || previous.is_some_and(|previous| previous >= name)
+            || metric
+                .get("value")
+                .and_then(Value::as_f64)
+                .is_none_or(|value| !value.is_finite())
+        {
+            return false;
+        }
+        previous = Some(name);
+    }
+    true
+}
+
+fn valid_dataset_partition(value: Option<&Value>) -> bool {
+    value.is_some_and(|value| {
+        if value.is_null() {
+            return true;
+        }
+        let Some(partition) = value.as_object() else {
+            return false;
+        };
+        if !has_exact_fields(partition, &["startsAtUnixNanos", "endsAtUnixNanos"]) {
+            return false;
+        }
+        let Some(starts_at) = partition.get("startsAtUnixNanos").and_then(Value::as_i64) else {
+            return false;
+        };
+        partition
+            .get("endsAtUnixNanos")
+            .and_then(Value::as_i64)
+            .is_some_and(|ends_at| starts_at < ends_at)
+    })
+}
+
+fn canonical_artifact_reference(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 8_192
+        && !value.starts_with('/')
+        && !value.contains('\\')
+        && value.split('/').all(|component| {
+            !component.is_empty()
+                && !matches!(component, "." | "..")
+                && component
+                    .chars()
+                    .all(|character| !character.is_control() && !character.is_whitespace())
+        })
+}
+
+fn has_exact_fields(object: &Map<String, Value>, fields: &[&str]) -> bool {
+    object.len() == fields.len() && fields.iter().all(|field| object.contains_key(*field))
 }
