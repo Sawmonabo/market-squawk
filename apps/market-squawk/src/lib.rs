@@ -3,6 +3,7 @@
 //! Production live batches enter only [`live_runtime::LiveRuntimeComposition`]. The legacy local
 //! event model is explicitly diagnostic and remains isolated from current execution authority.
 
+pub mod application;
 pub mod backtest_service;
 pub mod bot;
 pub mod diagnostic_engine;
