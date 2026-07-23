@@ -198,7 +198,10 @@ memory, partitions, syntax-tree nodes, plan nodes, elapsed time, and cancellatio
 
 General read-only DataFusion SQL is a CLI-only operator capability. MCP exposes typed application
 operations with closed schemas and bounded results; it does not expose a general SQL operation.
-Large query outputs use controlled artifact publication rather than an unbounded inline response.
+The query engine has an authority-gated artifact-publication mode for large results. The reviewed
+public CLI and fixed-template application/MCP query compositions do not supply that authority:
+they return inline results within their configured bounds and reject a result that would require
+artifact publication with `ArtifactAuthorityRequired`.
 
 ### Python
 

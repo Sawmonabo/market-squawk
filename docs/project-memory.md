@@ -517,10 +517,11 @@ gate. The terminal outcome is recorded in the 2026-07-23 section below.
 Task 15 provides required zero-service ONNX inference through the self-contained Rust
 `TractOnnxBackend`. It admits exact bounded graphs and tensors, runs through a bounded model-owned
 helper process, binds warm-up evidence, and maps every policy/runtime/deadline failure to no action.
-The operator-supplied ONNX Runtime 1.24.4 path is optional and Linux-only; it admits an exact
-descriptor-verified ELF library through immutable sealed memory and requires warm-up parity.
-Cleanup ownership exists before helper spawn, blocking reap/join work remains asynchronous and
-bounded, and uncertain helper termination denies tract fallback and produces no output.
+The modeling library's operator-supplied ONNX Runtime 1.24.4 path is optional and Linux-only; it
+admits an exact descriptor-verified ELF library through immutable sealed memory and requires
+warm-up parity. The reviewed product composition does not select that backend and always constructs
+tract. Cleanup ownership exists before helper spawn, blocking reap/join work remains asynchronous
+and bounded, and uncertain helper termination denies tract fallback and produces no output.
 
 The sealed Python package now installs its native extension as `market_squawk/__init__.abi3.so`.
 Native signed-environment verification of the complete Market Squawk, PyArrow, interpreter and
@@ -657,18 +658,23 @@ empty and the existing root `target/` is 15 GiB, below the enforced 20 GiB ceili
 content commits are recorded in the delivery ledger and pushed to
 `origin/docs/product-documentation`.
 
-The runbook review corrected command-level defects before integration and exposed mandatory product
-gaps that remain release blockers: provider discovery object IDs are not publicly returned for
-FRED/BLS/Treasury first-use ingestion; the dataset export digest needed by Python is not exposed;
-feature builds do not populate the public feature-dataset registry; the sealed Python builder does
-not construct the matching final application bundle; and no supported production training driver
-or ONNX candidate producer/demo exists. Optional external ONNX Runtime remains a library-level path
-that the current product composition does not select. These gaps belong to Tasks 19/19A/20 and must
-not be described as a complete operator workflow.
+The first frozen candidate `b0ed3e9` completed its bounded content, navigation, GitHub Mermaid, and
+three-scope grouped review gates but was rejected on substantiated findings. The correction pass
+repairs authority diagrams, fail-fast no-overwrite installation and recovery procedures, explicit
+restore coordinates, historical/current navigation, and public product truth. It also records
+mandatory product gaps that remain release blockers: provider discovery object IDs are not publicly
+returned for FRED/BLS/Treasury first-use ingestion; `dataset list` cannot consume its cursor; the
+dataset export digest needed by Python is not exposed; feature builds do not populate the public
+feature-dataset registry; no typed public operation resolves MCP overflow artifacts; `Bot.Start`
+fee admission differs between its descriptor and paper runtime; the shipping secret composition
+lacks the platform's encrypted-file fallback; the sealed Python builder does not construct the
+matching final application bundle; and no supported production training driver or ONNX candidate
+producer/demo exists. Optional external ONNX Runtime remains a library-level path that the current
+product composition does not select. These gaps belong to Tasks 19/19A/20 and must not be described
+as a complete operator workflow.
 
-Documentation-migration Tasks 1–6 are complete. Task 7 now owns one frozen-candidate grouped review
-covering architecture/authority, operational runnability/recovery, and factual
-reference/navigation/history/source truth; remediation of every substantiated finding; GitHub
-Mermaid inspection; fast-forward integration into the unchanged release branch; evidence
-publication; and deletion of the completed documentation branch locally and on origin. Product
-issues and Project 5 items remain open until their separate acceptance evidence exists.
+Documentation-migration Tasks 1–6 and Task 7's initial frozen-candidate gates are complete. Task 7
+now owns exact-head re-review of the correction candidate, fast-forward integration into the
+unchanged release branch, evidence publication, and deletion of the completed documentation branch
+locally and on origin. Product issues and Project 5 items remain open until their separate
+acceptance evidence exists.

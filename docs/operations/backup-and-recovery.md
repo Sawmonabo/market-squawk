@@ -112,38 +112,60 @@ state before designating the copy as a known-clean backup.
 
 ### 2. Create a private no-overwrite archive
 
-Set canonical absolute paths. `BACKUP_ARCHIVE` must not already exist and must not be inside
-`DATA_ROOT`:
+Set canonical absolute paths. `BACKUP_PARENT` must already exist on independent private storage;
+`BACKUP_DIR` must be new and must not be inside `DATA_ROOT`. The fresh directory makes the archive,
+digest, and retained metadata a single no-overwrite recovery point:
 
 ```bash
-DATA_ROOT="/absolute/path/to/.market-squawk"
-BACKUP_ARCHIVE="/independent/private/storage/market-squawk-2026-07-23.tar"
+(
+  set -eu
+  umask 077
 
-test -d "$DATA_ROOT"
-test ! -e "$BACKUP_ARCHIVE"
-case "$BACKUP_ARCHIVE" in "$DATA_ROOT"/*) exit 1 ;; esac
+  DATA_ROOT="/absolute/path/to/.market-squawk"
+  BACKUP_PARENT="/independent/private/storage"
+  BACKUP_DIR="$BACKUP_PARENT/market-squawk-2026-07-23"
+  BACKUP_ARCHIVE="$BACKUP_DIR/data-root.tar"
 
-umask 077
-tar -C "$(dirname "$DATA_ROOT")" \
-  -cpf "$BACKUP_ARCHIVE" \
-  "$(basename "$DATA_ROOT")"
+  test -d "$DATA_ROOT"
+  test -d "$BACKUP_PARENT"
+  test ! -e "$BACKUP_DIR"
+  case "$BACKUP_DIR" in "$DATA_ROOT"|"$DATA_ROOT"/*) exit 1 ;; esac
+
+  mkdir -m 0700 "$BACKUP_DIR"
+  tar -C "$(dirname "$DATA_ROOT")" \
+    -cpf "$BACKUP_ARCHIVE" \
+    "$(basename "$DATA_ROOT")"
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$BACKUP_ARCHIVE" > "$BACKUP_DIR/data-root.tar.sha256"
+    shasum -a 256 -c "$BACKUP_DIR/data-root.tar.sha256"
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$BACKUP_ARCHIVE" > "$BACKUP_DIR/data-root.tar.sha256"
+    sha256sum -c "$BACKUP_DIR/data-root.tar.sha256"
+  else
+    exit 1
+  fi
+)
 ```
 
-The `tar` process must exit successfully. An archive created while the source root changed is not a
-supported recovery point; discard it and repeat after a clean shutdown.
+The subshell must exit successfully. A failed `test`, `mkdir`, `tar`, digest write, or digest check
+stops the procedure. Never reuse the failed `BACKUP_DIR`; inspect it, remove it only after confirming
+that it contains no accepted recovery point, and repeat with another new directory after a clean
+shutdown. An archive created while the source root changed is not a supported recovery point.
 
 ### 3. Record and verify the archive digest
 
-On macOS:
+The macOS commands above create and verify the digest inside the fresh recovery-point directory.
+To verify it again later:
 
 ```bash
-shasum -a 256 "$BACKUP_ARCHIVE" > "$BACKUP_ARCHIVE.sha256"
-shasum -a 256 -c "$BACKUP_ARCHIVE.sha256"
+BACKUP_DIR="/independent/private/storage/market-squawk-2026-07-23"
+shasum -a 256 -c "$BACKUP_DIR/data-root.tar.sha256"
 ```
 
-On systems that provide GNU Coreutils, use `sha256sum` for the equivalent operation. Protect the
-digest record from replacement with the archive. A digest detects changed bytes; it does not prove
-that the source was quiescent or that an untrusted archive is safe to extract.
+On systems that provide GNU Coreutils, use `sha256sum` for both creation and verification inside the
+same fresh directory. Protect the entire recovery-point directory from replacement. A digest
+detects changed bytes; it does not prove that the source was quiescent or that an untrusted archive
+is safe to extract.
 
 ### 4. Retain success evidence
 
@@ -165,8 +187,9 @@ new empty parent, validate it, then explicitly point configuration at that resto
 ### 1. Verify before extraction
 
 ```bash
-BACKUP_ARCHIVE="/independent/private/storage/market-squawk-2026-07-23.tar"
-shasum -a 256 -c "$BACKUP_ARCHIVE.sha256"
+BACKUP_DIR="/independent/private/storage/market-squawk-2026-07-23"
+BACKUP_ARCHIVE="$BACKUP_DIR/data-root.tar"
+shasum -a 256 -c "$BACKUP_DIR/data-root.tar.sha256"
 tar -tf "$BACKUP_ARCHIVE" >/dev/null
 ```
 
@@ -176,16 +199,24 @@ paths before extracting data received from another trust boundary.
 ### 2. Extract into an empty private parent
 
 ```bash
-RESTORE_PARENT="/absolute/path/to/fresh-restore-parent"
+(
+  set -eu
+  umask 077
 
-test ! -e "$RESTORE_PARENT"
-umask 077
-mkdir -p "$RESTORE_PARENT"
-tar -C "$RESTORE_PARENT" -xpf "$BACKUP_ARCHIVE"
+  BACKUP_ARCHIVE="/independent/private/storage/market-squawk-2026-07-23/data-root.tar"
+  RESTORE_PARENT="/absolute/path/to/fresh-restore-parent"
+
+  test -f "$BACKUP_ARCHIVE"
+  test ! -e "$RESTORE_PARENT"
+  mkdir -m 0700 "$RESTORE_PARENT"
+  tar -C "$RESTORE_PARENT" -xpf "$BACKUP_ARCHIVE"
+)
 ```
 
-Set `RESTORED_DATA_ROOT` to the extracted top-level directory. Preserve ownership and permissions;
-do not resolve a startup failure by making the root broadly writable.
+The parent of `RESTORE_PARENT` must already exist. Plain `mkdir` and fail-fast execution make an
+occupied restore path a hard failure; extraction never overlays an existing directory. Set
+`RESTORED_DATA_ROOT` to the extracted top-level directory. Preserve ownership and permissions; do
+not resolve a startup failure by making the root broadly writable.
 
 ### 3. Re-establish external dependencies
 
@@ -206,11 +237,29 @@ Point only the validation process at the restored root:
 
 ```bash
 RESTORED_DATA_ROOT="/absolute/path/to/fresh-restore-parent/.market-squawk"
+RESTORED_CONFIG="/absolute/path/to/restored-market-squawk.toml"
+RESTORED_TRAINING_RELEASE_ROOT="/absolute/path/to/restored-python-release"
 
-market-squawk --data-dir "$RESTORED_DATA_ROOT" config validate
-market-squawk --data-dir "$RESTORED_DATA_ROOT" doctor
-market-squawk --data-dir "$RESTORED_DATA_ROOT" dataset list
+market-squawk \
+  --config "$RESTORED_CONFIG" \
+  --data-dir "$RESTORED_DATA_ROOT" \
+  --training-release-root "$RESTORED_TRAINING_RELEASE_ROOT" \
+  config validate
+market-squawk \
+  --config "$RESTORED_CONFIG" \
+  --data-dir "$RESTORED_DATA_ROOT" \
+  --training-release-root "$RESTORED_TRAINING_RELEASE_ROOT" \
+  doctor
+market-squawk \
+  --config "$RESTORED_CONFIG" \
+  --data-dir "$RESTORED_DATA_ROOT" \
+  --training-release-root "$RESTORED_TRAINING_RELEASE_ROOT" \
+  dataset list
 ```
+
+If the restored root has no durable model admission, omit `--training-release-root`; otherwise it
+must name the exact separately restored and verified release. Use the same explicit `--config`,
+`--data-dir`, and applicable `--training-release-root` coordinates for every domain command below.
 
 Then validate the domains actually present in the backup:
 

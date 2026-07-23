@@ -199,7 +199,7 @@ MCP uses stdio. Stdout is reserved for protocol frames; local tracing belongs on
 | Unknown tool | Name differs from the exact 59-tool registry | Read `tools/list` or the MCP reference; do not derive names from CLI labels |
 | Tool argument rejected | Closed JSON schema, identifier, range, confirmation, or result limit failed | Correct the typed arguments; unknown fields are not accepted as extensions |
 | Mutation is unavailable after valid schema | Durable audit admission, local confirmation, domain authority, or risk failed | Repair the owning authority; transport validity does not grant mutation authority |
-| Large result is returned by reference | Inline item/byte ceiling selected artifact publication | Resolve only the controlled artifact reference through the documented client workflow |
+| Large result is returned by reference | Inline item/byte ceiling selected artifact publication | Retain and report the opaque reference; no current MCP operation resolves it, so narrow or rerun the read when inline content is required |
 | Session shutdown is incomplete | One domain/helper failed its bounded drain | Preserve stderr and audit evidence, reconcile the named domain, and start a fresh session only after ownership is resolved |
 
 Do not send ordinary CLI output through an MCP client's protocol stdout stream.

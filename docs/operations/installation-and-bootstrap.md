@@ -67,8 +67,10 @@ The repository pins Rust `1.97.1` in `rust-toolchain.toml`, with the minimal rus
 - enough operator-owned disk space for Cargo build output, the installed binaries, and the chosen
   data root.
 
-The source and full all-feature test matrix is exercised on Linux, macOS, and Windows. This
-runbook's shell examples use a POSIX shell; the binary names end in `.exe` on Windows.
+The tracked CI workflow declares Linux, macOS, and Windows jobs. A configured matrix is not
+successful execution evidence; cross-platform acceptance requires completed exact-head jobs and is
+recorded only in the delivery ledger. This runbook's shell examples use a POSIX shell; binary names
+end in `.exe` on Windows.
 
 ### Optional Python product
 
@@ -89,9 +91,12 @@ The required ONNX backend is the Rust `tract` implementation and is compiled int
 The installed bundle also includes `market-squawk-onnx-worker`, which isolates admitted model
 work. No external ONNX library is needed for this required path.
 
-ONNX Runtime `1.24.4` is an optional acceleration path on admitted Linux arm64 and x86-64 targets.
-The application never downloads it. If that path is required, finish the core installation first,
-then follow [Local ONNX inference operations](model-inference.md).
+The modeling library contains an optional ONNX Runtime `1.24.4` implementation for admitted Linux
+arm64 and x86-64 targets, but the reviewed product composition does not select it. The shipping
+application always constructs the required tract backend. The
+[model-inference runbook](model-inference.md#optional-external-onnx-runtime-evidence) documents the
+external runtime only for library-integration or retained release evidence, not as a currently
+selectable installation path.
 
 ## Safety and authority
 
@@ -192,12 +197,31 @@ Choose an absolute directory owned by the runtime operator. Keep the version in 
 upgrade never overwrites executables underneath a running process:
 
 ```bash
-INSTALL_ROOT=/absolute/operator-owned/market-squawk/0.1.0-836aae6
-mkdir -p "$INSTALL_ROOT/bin"
-install -m 0755 target/release/market-squawk "$INSTALL_ROOT/bin/"
-install -m 0755 target/release/market-squawk-capture-helper "$INSTALL_ROOT/bin/"
-install -m 0755 target/release/market-squawk-onnx-worker "$INSTALL_ROOT/bin/"
+(
+  set -eu
+  umask 022
+
+  INSTALL_PARENT=/absolute/operator-owned/market-squawk
+  INSTALL_ROOT="$INSTALL_PARENT/0.1.0-836aae6"
+
+  test -d "$INSTALL_PARENT"
+  test ! -e "$INSTALL_ROOT"
+  mkdir -m 0755 "$INSTALL_ROOT"
+  mkdir -m 0755 "$INSTALL_ROOT/bin"
+  install -m 0755 target/release/market-squawk \
+    "$INSTALL_ROOT/bin/market-squawk"
+  install -m 0755 target/release/market-squawk-capture-helper \
+    "$INSTALL_ROOT/bin/market-squawk-capture-helper"
+  install -m 0755 target/release/market-squawk-onnx-worker \
+    "$INSTALL_ROOT/bin/market-squawk-onnx-worker"
+)
 ```
+
+The subshell exits on the first failed precondition or install. Plain `mkdir` makes an occupied
+version root a hard failure; never rerun against a partially created root. If installation fails,
+inspect and remove only that new, inactive version root, then restart the whole bundle installation
+with a new empty path. Do not point a service or operator command at the version until all three
+siblings pass the checks below.
 
 Inspect the installed files before use:
 

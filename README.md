@@ -77,10 +77,10 @@ work is bound by the single canonical
 - Required local ONNX inference through the self-contained Rust `TractOnnxBackend`. Exact graph,
   operator, tensor, shape, artifact, compute, queue, process, deadline, warm-up, and output contracts
   are validated before a model generation is published; runtime failure is quarantined and produces
-  no action. An operator-supplied ONNX Runtime 1.24.4 backend is optional on Linux arm64/x86-64: it
-  admits an exact descriptor-verified library through an immutable sealed memory file, proves
-  warm-up parity, and fails back to the already-constructed tract generation. No external runtime,
-  account, service, download, or network call is required for ONNX support.
+  no action. The modeling library also contains a descriptor-verified ONNX Runtime 1.24.4
+  implementation for Linux arm64/x86-64, but the current product composition does not select it;
+  tract is the shipping ONNX path. No external runtime, account, service, download, or network call
+  is required for ONNX support.
 - Implemented offline Python financial-research and deterministic-training components for
   GIL-enabled CPython
   3.12 and 3.13 on macOS 12+ arm64. The tracked `python/` package opens only catalog-authorized,
@@ -180,10 +180,12 @@ terminal consumer, focused verification, immutable evidence, and exact commit ex
 | `Missing` | FRED/ALFRED durable local consumption | The vintage-aware adapter implementation can support scoped retrieval after an admitted profile revision, but the current profile is `rights_blocked` and the terms bundle does not establish per-series rights for persistence, caching, archival, or training | Task 9 / Task 20 |
 | `Missing` | production order-producing strategy | Bounded risk, private approval, one-time dispatch, reconciliation, and terminal audit are runnable, but no controlled production strategy can emit an executable intent against a currently `DirectVerified` source | Issue `#7` / Task 20 |
 | `Missing` | execution-eligible paper demonstration | The realistic engine and user-facing composition are runnable, but no execution-eligible source/strategy can yet drive a risk-approved order through the complete local path | Issues `#7`, `#11` / Task 20 |
-| `Missing` | complete provider-onboarding acceptance | Provider-specific onboarding/activation machinery is implemented, but only Treasury Fiscal Data is currently release-available; SEC and BLS require refreshed code-owned evidence, FRED is rights-blocked, and the clean-machine activation/recovery demonstration is not accepted | Issue `#31` / Task 19A |
+| `Missing` | complete provider-onboarding acceptance | Provider-specific onboarding/activation machinery is implemented, but only Treasury Fiscal Data is currently release-available; SEC and BLS require refreshed code-owned evidence, FRED is rights-blocked, the shipping secret store does not activate the platform's encrypted-file fallback, and the clean-machine activation/recovery demonstration is not accepted | Issue `#31` / Task 19A |
 | `Missing` | complete official research-provider workflows | SEC EDGAR and BLS profiles are `refresh_required`, FRED/ALFRED is `rights_blocked`, and Treasury daily XML lacks durable persistence authority; their implemented adapters therefore do not yet form supported first-use local workflows | Issues `#24`, `#31` / Tasks 19–20 |
 | `Missing` | complete provider discovery-to-ingestion workflow | FRED/ALFRED, BLS, and Treasury adapters validate digest-bearing object identities, but no public command returns the discovery batch needed to select those exact object IDs | Issues `#24`, `#31` / Tasks 19–20 |
-| `Missing` | complete dataset-to-Python training handoff | Dataset publication registers a Python export descriptor, but CLI output exposes neither its `exportSha256` nor a retrieval operation; `feature build` also does not populate the public feature-dataset registry | Issues `#24`, `#25` / Tasks 19–20 |
+| `Missing` | complete dataset discovery and dataset-to-Python training handoff | `dataset list` cannot consume its service cursor after the first 64 identities; dataset publication registers a Python export descriptor, but CLI output exposes neither its `exportSha256` nor a retrieval operation; `feature build` also does not populate the public feature-dataset registry | Issues `#24`, `#25` / Tasks 19–20 |
+| `Missing` | complete bounded artifact retrieval | MCP can return an opaque overflow-artifact reference, but no typed public operation resolves it; public analytical query compositions also omit the engine's artifact-publication authority and therefore reject non-inline results | Issue `#25` / Task 20 |
+| `Missing` | consistent `Bot.Start` fee admission | The application descriptor admits `feeBasisPoints` through `100000`, while the paper runtime accepts only `0..=10000`; values above the runtime bound fail after schema admission | Issue `#25` / Task 20 |
 | `Missing` | supported end-to-end model release demonstration | The Python release builder does not build and bind the final application bundle, the repository has no supported production training driver, and no supported ONNX candidate producer/demo exists | Issue `#25` / Task 20 |
 | `Missing` | release security/fuzz/performance gate | No final unchanged-head integrated demonstration, measured release evidence, grouped review, publication, or closeout exists | Issue `#25` / Task 20 |
 
@@ -608,8 +610,8 @@ exactly four production-weighted review quarters:
    supply-chain gates, grouped review, publication, and cleanup still block the complete release.
 
 Every item is mandatory unless the product contract is explicitly changed. Each quarter ends at one
-clean exact commit with grouped independent review and remediation of every substantiated Critical
-or Important release blocker.
+clean exact commit with grouped independent review and remediation of every substantiated Critical,
+Important, or Minor finding.
 No per-task review rounds or fifth delivery quarter are part of the plan. Stage, Wave, and percentage
 describe progress; none authorizes a partial-release stop.
 

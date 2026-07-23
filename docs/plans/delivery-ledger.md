@@ -29,8 +29,10 @@ evidence; it does not replace the README capability truth or the canonical relea
 - Pre-status Quarter 3 capability-code head: `daf183a`
   (`fix(python): make native module the sealed package root`). This is a durable milestone, not the
   moving release-branch head.
-- Current exact integration head: obtain it from `git rev-parse HEAD` and pull request `#26`.
-  Tracked prose does not self-pin the commit that contains that prose.
+- Current documentation candidate: obtain it from `git rev-parse HEAD` while the checked-out branch
+  is `docs/product-documentation`; tracked prose does not self-pin the commit that contains it.
+  Pull request `#26` identifies the separate pre-fast-forward release/product head. The term
+  "integrated release head" is reserved for the commit after the release branch is fast-forwarded.
 - Quarter 3 status: terminally accepted at exact pushed head
   `c6f0124c2b27c4777947de8c42b6a5f97868aaf5`. The earlier grouped reviews accepted Tasks 13–15,
   Task 18, backtest authority, and the cross-plane boundaries while rejecting substantiated
@@ -54,9 +56,11 @@ evidence; it does not replace the README capability truth or the canonical relea
   written design is
   [`2026-07-22-market-squawk-documentation-system-design.md`](../superpowers/specs/2026-07-22-market-squawk-documentation-system-design.md).
   Architecture, operations, reference, ADR, and dated-audit pages now satisfy the approved content
-  tree against product head `836aae6`. Documentation-migration Tasks 1–6 are complete; Task 7's
-  frozen-candidate review, GitHub Mermaid inspection, release fast-forward, evidence publication,
-  and branch cleanup remain before the documentation blocker closes.
+  tree against product head `836aae6`. Documentation-migration Tasks 1–6 are complete. Task 7's
+  first frozen candidate `b0ed3e9` completed content, navigation, GitHub Mermaid, and grouped review
+  gates but was rejected on substantiated documentation findings. The current correction candidate
+  still requires exact-head re-review, release fast-forward, evidence publication, and branch
+  cleanup before the documentation blocker closes.
 - Product release status: runnable product capabilities exist across every required domain, but the
   release remains blocked on provider qualification and rights outcomes, complete onboarding
   workflows and clean-machine evidence, provider discovery-to-ingestion, the public
@@ -106,15 +110,23 @@ procedures:
   exists.
 - Optional external ONNX Runtime support exists at library/evidence level but is not selectable by
   the current product composition; required tract inference remains the shipping ONNX path.
+- MCP overflow-artifact publication returns an opaque reference without a typed public retrieval
+  operation; the public analytical query paths also do not compose query artifact authority.
+- `Bot.Start` descriptor admission accepts `feeBasisPoints` through `100000`, while the paper
+  runtime accepts only `0..=10000`; the public contract must be made consistent.
+- The reviewed `LocalProduct` composes only the OS-keyring backend. The platform encrypted-file
+  fallback and unlock contract are not activated by the shipping application, so complete
+  credential setup and recovery remain part of the onboarding blocker.
 
 As verified through GitHub on 2026-07-23, issues `#7`, `#9`, `#10`, `#11`, `#24`, `#25`, and `#31`
 remain open. Project 5 marks `#7`, `#9`, `#10`, `#11`, `#24`, and `#31` In Progress and `#25` Todo.
 They remain open until exact closing evidence is reconciled. The next documentation barrier is Task
-7's one-candidate grouped review; the next product barriers remain Tasks 19/19A and Task 20.
+7's corrected-candidate exact-head re-review; the next product barriers remain Tasks 19/19A and
+Task 20.
 
 ## Product delivery closeout and next barrier
 
-- Task 13 owner: GitHub issue `#18`, Project 5; closure follows this ledger commit and push.
+- Task 13 owner: GitHub issue `#18`, closed with its Project 5 item `Done`.
 - Delivered at exact accepted head `59ba05c`: capability-scoped immutable bundles; complete
   dataset, label, universe, feature, artifact, and code-revision validation; atomic bounded model
   generations; allocation-free deterministic native linear/logistic inference; execution-owned
@@ -379,10 +391,9 @@ application size.
   deleted the merged local product branch, confirmed no matching origin branch existed, and pruned
   worktree and remote metadata. Only the release worktree remains.
 
-The next delivery event is documentation Task 7: freeze one exact portal candidate, perform the
-grouped Quarter 4 documentation review, remediate substantiated findings, inspect GitHub Mermaid
-rendering, fast-forward the unchanged release source, publish evidence, and remove the completed
-documentation branch. Product work then resumes on the open Task 19/19A acceptance gaps and Task
-20's integrated demonstration, evidence, final review, exact-head release gate, publication, and
-cleanup. Neither Quarter 3 acceptance nor the documentation portal claims that the Market Squawk
-product release is complete.
+The next delivery event is documentation Task 7's corrected-candidate exact-head re-review, followed
+by the unchanged release-source fast-forward, evidence publication, and completed documentation-
+branch cleanup. Product work then resumes on the open Task 19/19A acceptance gaps and Task 20's
+integrated demonstration, evidence, final review, exact-head release gate, publication, and cleanup.
+Neither Quarter 3 acceptance nor the documentation portal claims that the Market Squawk product
+release is complete.

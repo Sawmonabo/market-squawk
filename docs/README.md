@@ -20,7 +20,7 @@ delivery status, research, and historical evidence so each page has one clear jo
 | Install, configure, ingest, query, model, or operate it | [Operations](operations/README.md) |
 | Look up an exact command, setting, MCP tool, source capability, quality class, or time field | [Reference](reference/README.md) |
 | See what is runnable and what still blocks the first complete release | [Delivery ledger](plans/delivery-ledger.md) |
-| Review the current requirements audit | [Gap analysis](plans/gap-analysis.md) |
+| Review the original dated requirement classification | [Historical gap analysis](plans/gap-analysis.md) |
 | Follow the approved implementation sequence | [Implementation plan](plans/implementation-plan.md) |
 | Inspect original research and primary-source decisions | [Research](research/) |
 | Inspect historical architecture baselines | [Architecture audits](audits/architecture/) |
@@ -74,8 +74,9 @@ bounds, exact names, schemas, classifications, and failure behavior without beco
 ### Delivery authority
 
 The [delivery ledger](plans/delivery-ledger.md) is the sole mutable summary of accepted product
-evidence, active work, blockers, and release checkpoints. The
-[gap analysis](plans/gap-analysis.md) classifies every product requirement, and the
+evidence, active work, blockers, and release checkpoints. The dated
+[gap analysis](plans/gap-analysis.md) preserves the original requirement-by-requirement
+classification at its stated audit anchor; it is not current capability authority. The
 [implementation plan](plans/implementation-plan.md) retains the approved delivery sequence.
 
 Use only these release-status labels in maintained product summaries:

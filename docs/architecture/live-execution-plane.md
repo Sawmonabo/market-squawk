@@ -60,6 +60,7 @@ sequenceDiagram
     participant Shard as Instrument-owned shard
     participant Features as Online features
     participant Strategy as Strategy or model
+    participant Gate as Execution-owned live action gate
     participant Risk as Central risk
     participant Dispatch as Bounded dispatcher
     participant Paper as Paper adapter
@@ -78,13 +79,14 @@ sequenceDiagram
     Shard->>Features: committed market observation
     Features->>Strategy: committed state and feature context
     alt DirectVerified, fresh, eligible, and action ready
-        Strategy->>Risk: typed intent and single-use capability
+        Strategy->>Gate: typed intent only
+        Gate->>Risk: typed intent and current single-use capability
         Risk->>Risk: quality, account, exposure, loss, and order limits
         Risk->>Dispatch: approved order
         Dispatch->>Paper: adapter-only submission
         Paper-->>Dispatch: receipt and state transition
     else no executable authority
-        Strategy-->>Shard: no action or typed failure
+        Strategy-->>Gate: no action or typed failure
     end
 ```
 

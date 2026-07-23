@@ -139,7 +139,7 @@ subdirectories, and retains directory capabilities.
 ├── journal/                        bounded raw-capture journals
 ├── artifacts/                      immutable analytical and result artifacts
 │   ├── Parquet dataset objects and authority records
-│   ├── query and Python dataset exports
+│   ├── Python dataset exports and other authority-published results
 │   ├── portfolio import evidence
 │   ├── paper-checkpoints/v1/
 │   ├── governed backtest artifacts
@@ -158,6 +158,12 @@ The diagram is a responsibility map, not a promise that every optional directory
 empty installation. A service creates its namespace when it first obtains that authority.
 Artifact names are relative, portable references under an already-open root capability. A caller
 must supply a reference that validates within that retained capability.
+
+The analytical query engine supports controlled export only when its caller supplies publication
+and reservation authority. The reviewed public CLI and fixed-template application/MCP query paths
+do not compose that authority, so they remain inline-only and fail closed when a result would
+require an artifact. The layout above therefore does not claim a currently runnable public query-
+export workflow.
 
 Configuration files are operator-selected and need not live under the data root. Effective
 configuration retains the origin of each value and redacts secret references from reports.

@@ -716,8 +716,9 @@ v0.1 commands retain tested compatibility aliases during migration.
 MCP uses the official protocol contracts over local stdio, enforces lifecycle and negotiated
 capabilities, keeps stdout protocol-clean, validates typed schemas, propagates cancellation and
 deadlines, limits instruments/time/results, records audits, and writes large results only to the
-controlled artifact directory. It exposes no shell, arbitrary paths, unrestricted SQL, credentials,
-remote code, unchecked orders, risk bypass, or audit deletion.
+controlled artifact directory. MCP exposes only typed application operations; filesystem
+publication, credential handling, risk evaluation, execution dispatch, and audit retention remain
+owned by their bounded domain authorities.
 
 ## Configuration and secrets
 

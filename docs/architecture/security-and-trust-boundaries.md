@@ -94,7 +94,9 @@ flowchart LR
 
     subgraph Authority["Application and domain authorities"]
         App["Application services<br/>closed descriptors, bounds, cancellation, deadlines"]
-        Secrets["Secret authority<br/>OS keyring or explicit encrypted fallback"]
+        Onboarding["Provider onboarding service<br/>session and credential workflow"]
+        Activation["Provider activation authority<br/>adapter-specific durable activation"]
+        Secrets["Current secret authority<br/>OS keyring-backed"]
         Source["Authoritative source registry<br/>rights, metadata, coverage, session, capture"]
         Live["Instrument-owned live shards<br/>integrity, quality, process-local capability"]
         Research["Research authority<br/>catalog, manifests, publication, point-in-time"]
@@ -102,6 +104,7 @@ flowchart LR
         FairValue["Producer-bound fair-value evidence and approval"]
         Model["Admitted immutable model and bounded inference"]
         Strategy["Bounded strategy intent or audited no-action"]
+        ActionGate["Execution-owned live action gate<br/>current single-use capability"]
         Risk["Central risk<br/>live authority, portfolio binding, account reservation, audit"]
         Dispatch["Execution dispatcher<br/>one-use approval and adapter-only order"]
     end
@@ -121,8 +124,10 @@ flowchart LR
     Files -->|untrusted bundle/runtime bytes| ModelAdmission
     CLI -->|admitted operation| App
     MCP -->|admitted operation| App
-    Portal -->|onboarding request and secret value| App
-    App -->|generation-bound operation| Secrets
+    Portal -->|session and credential request| Onboarding
+    Portal -->|verified activation request| Activation
+    Onboarding -->|generation-bound credential operation| Secrets
+    Activation -->|provider-specific activation| Source
     Parser -->|validated candidate plus evidence| Source
     Parser -->|normalized research observation| Research
     Source -->|captured current batch| Live
@@ -132,8 +137,10 @@ flowchart LR
     Live -->|post-commit bounded evidence export| FairValue
     Portfolio -->|immutable revision evidence| FairValue
     Model -->|score, decision, or typed failure| Strategy
-    Live -->|committed market context and capability| Strategy
-    Strategy -->|validated intent only| Risk
+    Live -->|committed market context| Strategy
+    Strategy -->|validated intent only| ActionGate
+    Live -->|current executable authority| ActionGate
+    ActionGate -->|intent and single-use capability| Risk
     Portfolio -->|current revision binding| Risk
     Risk -->|non-serializable approved order| Dispatch
     Dispatch -->|private dispatch order| Adapter
@@ -179,9 +186,9 @@ Credential material is not ordinary configuration:
   catalog-safe metadata.
 - Creation, read, replacement, and deletion use exact generations. Replacement does not silently
   erase the current generation before the candidate is known.
-- The preferred store probes the operating-system keyring before mutation. It uses the encrypted
-  fallback only when the OS provider is unavailable and the operator supplied an explicit unlock
-  capability.
+- The reviewed `LocalProduct` composes the operating-system keyring and no encrypted-file fallback.
+  The platform-level preferred-store contract can route to an explicit encrypted fallback only
+  when a caller supplies that backend and its unlock capability; the shipping application does not.
 - Once a reference exists, its backend is authoritative. The router does not probe another backend
   with that reference or copy secret bytes between stores.
 - Interaction policy distinguishes a forbidden prompt from an explicitly permitted

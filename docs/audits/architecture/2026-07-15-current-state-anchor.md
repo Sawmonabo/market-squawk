@@ -1,14 +1,11 @@
 # Market Squawk Current-State Audit (Historical Anchor)
 
-> **Status: Historical audit. No current execution authority.** This document is frozen to the
-> rejected `651a01e120dfe27a598b9475296733d238d870b7` audit anchor for traceability. It is not an
-> exact-head inventory and must not be used to approve, schedule, or stop current delivery. Current
-> user-facing capability truth lives in the [README](../../../README.md) and
-> [release baseline](../../verification/usable-release-baseline.md); current execution authority lives
-> only in the
-> [canonical complete-release plan](../../superpowers/plans/2026-07-17-market-squawk-usable-complete-release.md).
-> The detailed audit is refreshed after the active Q2 closure is independently approved at
-> one clean exact commit.
+> **Status: Historical audit.** This document is frozen to the rejected
+> `651a01e120dfe27a598b9475296733d238d870b7` audit anchor for traceability. It carries no current
+> capability, scheduling, approval, or execution authority. Use the maintained
+> [architecture portal](../../architecture/README.md) for current system boundaries and the
+> [delivery ledger](../../plans/delivery-ledger.md) for accepted evidence, blockers, and active
+> delivery state.
 
 <!-- q2-checkpoint-state
 candidate-id: q2-integrated-remediation-2026-07-16

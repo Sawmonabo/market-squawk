@@ -613,7 +613,7 @@ before committing.
 accepted implementation sources. No planned edit occurs in this task; any material fix creates a new
 candidate and restarts the gate.
 
-- [ ] **Freeze a clean exact candidate**
+- [x] **Freeze a clean exact candidate**
 
 ```bash
 git status --short
@@ -623,7 +623,7 @@ git show -s --format='%H %T %cI %s' HEAD
 
 Expected: clean `docs/product-documentation` and one exact committed candidate.
 
-- [ ] **Verify moves and maintained navigation**
+- [x] **Verify moves and maintained navigation**
 
 ```bash
 git log --follow --oneline -- \
@@ -639,7 +639,7 @@ git grep -n -E \
 Expected: useful pre-move ancestry and no maintained old-path link. Historical literals and the
 approved migration description remain historical.
 
-- [ ] **Perform the bounded content gate**
+- [x] **Perform the bounded content gate**
 
 Manually follow every link from the root and four section indexes. At the frozen head compare:
 
@@ -652,7 +652,7 @@ Manually follow every link from the root and four section indexes. At the frozen
 
 Inspect Mermaid blocks in GitHub-rendered Markdown after push. Do not add a checker or prose test.
 
-- [ ] **Run repository hygiene only**
+- [x] **Run repository hygiene only**
 
 ```bash
 documentation_base_sha=$(
