@@ -17,7 +17,10 @@ use market_squawk_services::{
 use serde_json::{Map, Value};
 use thiserror::Error;
 
+pub mod analysis;
 mod contracts;
+mod domain_support;
+pub mod model;
 mod paper;
 
 pub use contracts::{APPLICATION_CONTRACT_VERSION, application_capabilities};
