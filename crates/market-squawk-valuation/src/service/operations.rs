@@ -426,6 +426,18 @@ impl FairValueService {
         assessment: &ApprovedMarketAccess,
         at: Timestamp,
     ) -> Result<(), FairValueError> {
+        if self.market_access_is_current(assessment, at)? {
+            Ok(())
+        } else {
+            Err(FairValueError::InvalidMarketAccessAssessment)
+        }
+    }
+
+    fn market_access_is_current(
+        &self,
+        assessment: &ApprovedMarketAccess,
+        at: Timestamp,
+    ) -> Result<bool, FairValueError> {
         if self.market_access.get(&assessment.id()).map(AsRef::as_ref) != Some(assessment) {
             return Err(FairValueError::InvalidMarketAccessAssessment);
         }
@@ -434,16 +446,12 @@ impl FairValueService {
             .values()
             .filter(|value| value.supersedes() == Some(assessment.id()));
         let Some(successor) = children.next() else {
-            return Ok(());
+            return Ok(true);
         };
         if children.next().is_some() {
             return Err(FairValueError::CorruptPersistence);
         }
-        if successor.approved_at() <= at && successor.effective_from() <= at {
-            Err(FairValueError::InvalidMarketAccessAssessment)
-        } else {
-            Ok(())
-        }
+        Ok(successor.approved_at() > at || successor.effective_from() > at)
     }
 
     /// Evaluates immutable approval and revocation times at one query instant.
@@ -501,6 +509,37 @@ impl FairValueService {
     /// Returns one independently approved market-access assessment.
     pub fn market_access(&self, id: MarketAccessAssessmentId) -> Option<Arc<ApprovedMarketAccess>> {
         self.market_access.get(&id).map(Arc::clone)
+    }
+
+    /// Returns the sole approved assessment current for an exact market at a historical cutoff.
+    ///
+    /// The result observes both approval and effective timestamps and excludes a predecessor only
+    /// when its immutable successor was both approved and effective by `at`.
+    pub fn current_market_access(
+        &self,
+        account_id: AccountId,
+        venue_id: &VenueId,
+        instrument_id: InstrumentId,
+        at: Timestamp,
+    ) -> Result<Option<Arc<ApprovedMarketAccess>>, FairValueError> {
+        let mut current = None;
+        for candidate in self
+            .market_access
+            .values()
+            .filter(|value| value.has_market(account_id, venue_id, instrument_id))
+        {
+            if candidate
+                .validate_for(account_id, venue_id, instrument_id, at)
+                .is_err()
+                || !self.market_access_is_current(candidate, at)?
+            {
+                continue;
+            }
+            if current.replace(Arc::clone(candidate)).is_some() {
+                return Err(FairValueError::CorruptPersistence);
+            }
+        }
+        Ok(current)
     }
 
     /// Returns decisions for one instrument in deterministic ID order under an explicit bound.

@@ -226,7 +226,7 @@ fn origin_value(origin: &EvidenceOrigin) -> Value {
     }
 }
 
-fn market_access_assessment_value(
+pub(super) fn market_access_assessment_value(
     assessment: &market_squawk_valuation::ApprovedMarketAccess,
 ) -> Value {
     json!({

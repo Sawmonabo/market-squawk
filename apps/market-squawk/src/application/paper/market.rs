@@ -150,9 +150,15 @@ impl PaperController {
         let reader = {
             let state =
                 bounded_lock(&self.state, context.deadline(), context.cancellation()).await?;
-            let PaperState::Running { runtime, .. } = &*state else {
+            let PaperState::Running {
+                runtime, exports, ..
+            } = &*state
+            else {
                 return Err(ServiceError::Unavailable);
             };
+            if !exports.is_healthy() {
+                return Err(ServiceError::Unavailable);
+            }
             runtime.snapshots()
         };
         ensure_live(context)?;

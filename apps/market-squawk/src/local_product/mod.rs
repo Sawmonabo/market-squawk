@@ -1,10 +1,14 @@
 //! Complete local product composition shared by CLI and MCP transports.
 
+mod cli_backtest;
 mod cli_dataset;
 mod cli_model;
 mod cli_portfolio;
+mod cli_provider;
 mod cli_transport;
 mod executable;
+mod fair_value_producer;
+mod provider_activation_state;
 
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
@@ -23,18 +27,23 @@ use market_squawk_sources::AuthoritativeSourceRegistry;
 use market_squawk_valuation::{FairValueLimitInput, FairValueLimits, FairValueService};
 use thiserror::Error;
 
+pub use self::cli_backtest::CliBacktestRegistrationError;
 pub use self::cli_dataset::CliDatasetError;
 pub use self::cli_model::CliModelAdmissionError;
 pub use self::cli_portfolio::CliPortfolioImportError;
+pub use self::cli_provider::CliProviderActivationError;
 pub use self::cli_transport::{CliProductError, CliProductResult, execute_cli_command};
 use self::executable::{
     ExecutableIdentityError, admit_installed_onnx_worker, current_executable_sha256,
 };
+use self::fair_value_producer::ProductionFairValueProducerSelectionAuthority;
+use self::provider_activation_state::DurableProviderActivationState;
 use crate::application::analysis::{
     AnalysisCatalog, AnalysisDomainService, GovernedBacktestAuthority,
-    GovernedBacktestInputAuthorityLimits, GovernedBacktestInputResolver,
-    GovernedBacktestRepository, GovernedBacktestRepositoryLimits, ProductionBacktestAuthority,
-    ProductionGovernedBacktestInputAuthority, ProductionGovernedBacktestRepository,
+    GovernedBacktestInputAuthorityLimits, GovernedBacktestInputRegistrar,
+    GovernedBacktestInputResolver, GovernedBacktestRepository, GovernedBacktestRepositoryLimits,
+    ProductionBacktestAuthority, ProductionGovernedBacktestInputAuthority,
+    ProductionGovernedBacktestRepository,
 };
 use crate::application::model::runtime::{
     ProductionModelRuntime, ProductionModelRuntimeError, ProductionModelRuntimeLimits,
@@ -42,7 +51,9 @@ use crate::application::model::runtime::{
 use crate::application::model::{ModelDomainService, ModelDomainServiceError};
 use crate::application::{
     Application, ApplicationCompositionError, ApplicationDomainService, FairValueDomainService,
-    FairValueInputAuthorityError, FairValueInputAuthorityLimits, PaperApplicationServices,
+    FairValueInputAuthorityError, FairValueInputAuthorityLimits,
+    FairValueProducerSelectionAuthority, LiveFairValueObservationBuffer,
+    LiveFairValueObservationBufferError, PaperApplicationServices,
     ProductionFairValueInputAuthority, ProductionResearchIngestCoordinator,
     ResearchApplicationServices, ResearchExtractionLimits, SourceDomainService,
 };
@@ -76,8 +87,8 @@ pub struct LocalProduct {
     research_ingest: Arc<ProductionResearchIngestCoordinator>,
     provider_onboarding: Arc<ProviderOnboardingService>,
     provider_activation: Arc<ProviderAdapterActivation>,
+    provider_activation_state: DurableProviderActivationState,
     portfolio: Arc<PortfolioApplicationService>,
-    backtest_inputs: Arc<ProductionGovernedBacktestInputAuthority>,
     model_runtime: Option<Arc<ProductionModelRuntime>>,
     fair_value_inputs: ProductionFairValueInputAuthority,
 }
@@ -115,8 +126,19 @@ impl LocalProduct {
             Arc::clone(&research_ingest),
             config.clone(),
         ));
+        let provider_activation_state =
+            DurableProviderActivationState::new(paths.control_root()?.root().to_path_buf());
+        cli_provider::restore_research_providers(
+            &paths,
+            &onboarding,
+            &provider_activation,
+            &provider_activation_state,
+        )?;
 
-        let paper = PaperApplicationServices::new(config.clone());
+        let live_fair_value = Arc::new(LiveFairValueObservationBuffer::try_new(
+            maximum_live_route_count(&config)?,
+        )?);
+        let paper = PaperApplicationServices::new(config.clone(), Arc::clone(&live_fair_value));
         let source: Arc<dyn ApplicationDomainService> = Arc::new(SourceDomainService::try_new(
             Arc::clone(&onboarding),
             paper.source_runtime_view(),
@@ -152,8 +174,10 @@ impl LocalProduct {
         let backtests: Arc<dyn GovernedBacktestAuthority> = Arc::new(
             ProductionBacktestAuthority::new(backtest_service, repository),
         );
+        let backtest_registrar: Arc<dyn GovernedBacktestInputRegistrar> = backtest_inputs.clone();
         let analysis = Arc::new(AnalysisDomainService::new(
             Arc::new(analysis_catalog()?),
+            backtest_registrar,
             backtests,
         ));
 
@@ -165,11 +189,22 @@ impl LocalProduct {
         let fair_value_limits = fair_value_limits()?;
         let fair_value_service =
             FairValueService::open(research.fair_value_catalog(), fair_value_limits)?;
+        let selection_authority: Arc<dyn FairValueProducerSelectionAuthority> =
+            Arc::new(ProductionFairValueProducerSelectionAuthority::new(
+                research.analytical_reader(),
+                portfolio.fair_value_reader(),
+                live_fair_value,
+                fair_value_inputs.live_publisher(),
+                fair_value_inputs.research_publisher(),
+                fair_value_inputs.analytics_publisher(),
+                fair_value_inputs.portfolio_publisher(),
+            ));
         let maximum_quote_age_nanos = u64::try_from(config.stale_after().as_nanos())
             .map_err(|_| LocalProductError::InvalidCodeOwnedLimit)?;
         let fair_value = Arc::new(FairValueDomainService::try_new(
             fair_value_service,
             fair_value_inputs.resolver(),
+            selection_authority,
             maximum_quote_age_nanos,
         )?);
 
@@ -189,8 +224,8 @@ impl LocalProduct {
             research_ingest,
             provider_onboarding: onboarding,
             provider_activation,
+            provider_activation_state,
             portfolio,
-            backtest_inputs,
             model_runtime,
             fair_value_inputs,
         })
@@ -226,14 +261,15 @@ impl LocalProduct {
         Arc::clone(&self.provider_onboarding)
     }
 
+    pub(in crate::local_product) const fn provider_activation_state(
+        &self,
+    ) -> &DurableProviderActivationState {
+        &self.provider_activation_state
+    }
+
     /// Returns the durable portfolio service used by direct CLI publication boundaries.
     pub fn portfolio(&self) -> Arc<PortfolioApplicationService> {
         Arc::clone(&self.portfolio)
-    }
-
-    /// Returns the durable governed-input registration authority.
-    pub fn backtest_inputs(&self) -> Arc<ProductionGovernedBacktestInputAuthority> {
-        Arc::clone(&self.backtest_inputs)
     }
 
     /// Returns model-admission authority when a signed training release was configured.
@@ -256,8 +292,8 @@ impl std::fmt::Debug for LocalProduct {
             .field("research", &"[ANALYTICAL AUTHORITY]")
             .field("provider_onboarding", &"[ONBOARDING AUTHORITY]")
             .field("provider_activation", &"[ADAPTER ACTIVATION AUTHORITY]")
+            .field("provider_activation_state", &"[DURABLE ACTIVATION RECIPES]")
             .field("portfolio", &"[PORTFOLIO AUTHORITY]")
-            .field("backtest_inputs", &"[BACKTEST INPUT AUTHORITY]")
             .field("model_runtime_configured", &self.model_runtime.is_some())
             .field("fair_value_inputs", &self.fair_value_inputs)
             .finish()
@@ -313,6 +349,14 @@ fn fair_value_limits() -> Result<FairValueLimits, LocalProductError> {
         max_retained_bytes: 64 * 1024 * 1024,
     })
     .map_err(Into::into)
+}
+
+fn maximum_live_route_count(config: &AppConfig) -> Result<NonZeroUsize, LocalProductError> {
+    let coinbase = config
+        .coinbase()
+        .map_or(0, |source| source.instruments().len());
+    let kraken = usize::from(config.kraken().is_some());
+    NonZeroUsize::new(coinbase.max(kraken).max(1)).ok_or(LocalProductError::InvalidCodeOwnedLimit)
 }
 
 fn open_model_domain(
@@ -391,6 +435,9 @@ pub enum LocalProductError {
     /// Provider onboarding construction failed.
     #[error(transparent)]
     Onboarding(#[from] ProviderOnboardingError),
+    /// Restart recovery of a durable research-provider activation failed.
+    #[error(transparent)]
+    ProviderActivationRecovery(#[from] CliProviderActivationError),
     /// Source-domain lifecycle construction failed.
     #[error(transparent)]
     Source(#[from] crate::application::SourceApplicationError),
@@ -437,6 +484,9 @@ pub enum LocalProductError {
     /// Fair-value input authority construction failed.
     #[error(transparent)]
     FairValueInput(#[from] FairValueInputAuthorityError),
+    /// Live fair-value observation handoff construction failed.
+    #[error(transparent)]
+    LiveFairValue(#[from] LiveFairValueObservationBufferError),
     /// Fair-value catalog, limits, or ruleset construction failed.
     #[error(transparent)]
     FairValue(#[from] market_squawk_valuation::FairValueError),

@@ -51,7 +51,16 @@ impl SourceRuntimeView for PaperSourceRuntimeView {
                 PaperState::Starting | PaperState::Stopping => {
                     return Err(SourceRuntimeViewError::Unavailable);
                 }
-                PaperState::Running { provider, runtime } => Some((*provider, runtime.snapshots())),
+                PaperState::Running {
+                    provider,
+                    runtime,
+                    exports,
+                } => {
+                    if !exports.is_healthy() {
+                        return Err(SourceRuntimeViewError::Unavailable);
+                    }
+                    Some((*provider, runtime.snapshots()))
+                }
             }
         };
         let Some((provider, reader)) = active else {

@@ -4,7 +4,7 @@ use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use market_squawk::{
     AppConfig, AppPaths, DiagnosticEngine, DiagnosticEngineSnapshot, LocalProduct,
-    cli::{Cli, Command, ConfigCommand, McpCommand, OutputFormat},
+    cli::{Cli, Command, ConfigCommand, McpCommand, OutputFormat, SourceCommand},
     local_product::execute_cli_command,
     mcp::LocalMcpComposition,
     paper_bot::local_paper_bot,
@@ -259,18 +259,81 @@ async fn run_product_command(
     command: Command,
     output: OutputFormat,
 ) -> Result<()> {
+    let opens_onboarding_portal = matches!(
+        &command,
+        Command::Source {
+            command: SourceCommand::Setup { .. }
+        }
+    );
     let product = LocalProduct::try_new(config)?;
     let application = product.application();
     let result = execute_cli_command(&product, command).await;
+    let portal_outcome = match &result {
+        Ok(result) if opens_onboarding_portal => {
+            match emit_result(output, result.summary(), result.value()) {
+                Ok(()) => hold_onboarding_portal(result.value()).await,
+                Err(error) => Err(error),
+            }
+        }
+        Ok(_) | Err(_) => Ok(()),
+    };
     let deadline = std::time::Instant::now()
         .checked_add(Duration::from_secs(10))
         .ok_or_else(|| anyhow!("application shutdown deadline overflow"))?;
     let shutdown = application.shutdown(deadline).await;
     let result = result.map_err(anyhow::Error::from)?;
+    portal_outcome?;
     if !shutdown.is_complete() {
         anyhow::bail!("local application shutdown was incomplete: {shutdown:?}");
     }
-    emit_result(output, result.summary(), result.value())
+    if opens_onboarding_portal {
+        Ok(())
+    } else {
+        emit_result(output, result.summary(), result.value())
+    }
+}
+
+async fn hold_onboarding_portal(result: &serde_json::Value) -> Result<()> {
+    let portal_url = result
+        .pointer("/data/portal/url")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow!("source setup omitted the local portal URL"))?;
+    let parsed =
+        url::Url::parse(portal_url).context("source setup returned an invalid portal URL")?;
+    if parsed.scheme() != "http"
+        || parsed.host_str() != Some("127.0.0.1")
+        || parsed.port().is_none()
+        || parsed.username() != ""
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        anyhow::bail!("source setup returned a portal URL outside the loopback trust boundary");
+    }
+    let lifetime_seconds = result
+        .pointer("/data/portal/expiresInSeconds")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|seconds| (30..=60 * 60).contains(seconds))
+        .ok_or_else(|| anyhow!("source setup returned an invalid portal lifetime"))?;
+
+    if let Err(error) = webbrowser::open(portal_url) {
+        warn!(
+            error = %error,
+            portal_url,
+            "could not launch the system browser; the bounded local portal remains available at the emitted URL"
+        );
+    }
+    info!(
+        portal_url,
+        lifetime_seconds,
+        "provider onboarding portal is active; press Ctrl-C after setup or wait for expiry"
+    );
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => {
+            result.context("failed to observe the provider-onboarding stop signal")
+        }
+        () = tokio::time::sleep(Duration::from_secs(lifetime_seconds)) => Ok(()),
+    }
 }
 
 async fn run_doctor(config: AppConfig, output: OutputFormat) -> Result<()> {
@@ -310,12 +373,10 @@ async fn run_doctor(config: AppConfig, output: OutputFormat) -> Result<()> {
             "error": composition_error,
         },
         "release_blockers": [
-            "typed activation requests for SEC, BLS, Treasury, and permitted FRED/ALFRED research adapters",
-            "governed backtest input registration through CLI and MCP",
-            "automatic research feature/example materialization over persisted point-in-time observations",
-            "producer-issued fair-value input publication and account-specific market-access assessment",
-            "complete MCP coverage for dataset, model-admission, portfolio-import, and fair-value producer workflows",
-            "Python financial analytics and model-training release interface",
+            "release-approved activation evidence and portal-driven adapter registration for every required research provider",
+            "governed backtest input registration through MCP",
+            "execution-qualified live fair-value input publication with account-specific market-access authority",
+            "verified fail-closed local MCP startup authority on every supported operating system",
             "release security, fuzz, benchmark, documentation, and full-workspace verification evidence",
         ],
     });

@@ -84,6 +84,19 @@ impl QueryLimitsWire {
         .map_err(|_| RecipeError::Invalid)
     }
 
+    pub(super) fn into_input(self) -> Result<GovernedBacktestQueryLimitsInput, RecipeError> {
+        self.build()?;
+        Ok(GovernedBacktestQueryLimitsInput {
+            max_rows: self.max_rows,
+            max_bytes: self.max_bytes,
+            max_memory_bytes: self.max_memory_bytes,
+            max_partitions: self.max_partitions,
+            max_ast_nodes: self.max_ast_nodes,
+            max_plan_nodes: self.max_plan_nodes,
+            deadline: Duration::from_nanos(self.deadline_nanos),
+        })
+    }
+
     pub(super) const fn max_bytes(self) -> u64 {
         self.max_bytes
     }
@@ -139,6 +152,25 @@ impl ExecutionAssumptionsWire {
             fee_decimal_scale: self.fee_decimal_scale,
         })
         .map_err(|_| RecipeError::Invalid)
+    }
+
+    pub(super) fn into_input(self) -> Result<ResearchExecutionAssumptionsInput, RecipeError> {
+        self.build()?;
+        Ok(ResearchExecutionAssumptionsInput {
+            version: self.version,
+            fee_basis_points: BasisPoints::new(self.fee_basis_points),
+            slippage_basis_points: BasisPoints::new(self.slippage_basis_points),
+            maximum_random_slippage_basis_points: BasisPoints::new(
+                self.maximum_random_slippage_basis_points,
+            ),
+            maximum_participation_basis_points: BasisPoints::new(
+                self.maximum_participation_basis_points,
+            ),
+            liquidity_priority: self.liquidity_priority.into(),
+            latency_nanos: self.latency_nanos,
+            allow_partial_fills: self.allow_partial_fills,
+            fee_decimal_scale: self.fee_decimal_scale,
+        })
     }
 }
 
@@ -203,6 +235,19 @@ impl PortfolioSeedWire {
             PortfolioLimits::try_new(self.limits.into()).map_err(|_| RecipeError::Invalid)?;
         PortfolioSeed::try_new(self.account_id, Money::new(amount, currency), limits)
             .map_err(|_| RecipeError::Invalid)
+    }
+
+    pub(super) fn into_input(self) -> Result<GovernedBacktestPortfolioSeedInput, RecipeError> {
+        self.build()?;
+        let amount =
+            Decimal::from_str(&self.initial_cash_amount).map_err(|_| RecipeError::Invalid)?;
+        let currency = Currency::try_from(self.initial_cash_currency.as_str())
+            .map_err(|_| RecipeError::Invalid)?;
+        Ok(GovernedBacktestPortfolioSeedInput {
+            account_id: self.account_id,
+            initial_cash: Money::new(amount, currency),
+            limits: self.limits.into(),
+        })
     }
 }
 
@@ -281,6 +326,16 @@ impl BacktestLimitsWire {
             max_retained_bytes: self.max_retained_bytes,
         })
         .map_err(|_| RecipeError::Invalid)
+    }
+
+    pub(super) fn into_input(self) -> Result<BacktestLimitsInput, RecipeError> {
+        self.build()?;
+        Ok(BacktestLimitsInput {
+            max_observations: self.max_observations,
+            max_pending_intents: self.max_pending_intents,
+            max_fills: self.max_fills,
+            max_retained_bytes: self.max_retained_bytes,
+        })
     }
 }
 

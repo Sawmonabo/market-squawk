@@ -17,7 +17,7 @@ pub use audit::{
 
 use std::{
     future::Future,
-    num::NonZeroUsize,
+    num::{NonZeroU32, NonZeroUsize},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -42,7 +42,7 @@ use market_squawk_execution::{
 };
 use market_squawk_live::{
     ActionAuthorityIssueLimit, LiveRouteConfig, LiveRuntimeConfig, LiveSnapshotReader,
-    RouteActionHook, RouteActionHookError, ShardKey,
+    RouteActionHook, RouteActionHookError, RouteQualifiedMarketExport, ShardKey,
 };
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -149,6 +149,16 @@ impl ProductionPaperBotComposition {
         })
     }
 
+    /// Returns the complete immutable route set used to create bounded post-action exports.
+    pub fn live_routes(&self) -> &[LiveRouteConfig] {
+        self.source.routes()
+    }
+
+    /// Returns the admitted conservative retained-byte charge ceiling for one source message.
+    pub const fn maximum_message_bytes(&self) -> NonZeroU32 {
+        self.runtime_config.maximum_message_bytes()
+    }
+
     #[cfg(all(test, debug_assertions))]
     pub(crate) fn with_local_kraken_endpoint_for_test(
         mut self,
@@ -166,6 +176,36 @@ impl ProductionPaperBotComposition {
     /// retained in [`ProductionPaperBotStartError::Rollback`].
     pub async fn start(
         self,
+        cancellation: CancellationToken,
+    ) -> Result<ProductionPaperBotRuntime, ProductionPaperBotStartError> {
+        self.start_inner(None, cancellation).await
+    }
+
+    /// Starts the complete paper path with one bounded qualified-market export per live route.
+    ///
+    /// Export route ownership is validated before any paper, audit, dispatcher, supervisor, live,
+    /// or provider worker starts. Receiver ownership remains with the caller that created each
+    /// route export; this composition transfers only the sender side into the live runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns an exact route-set or ordinary startup failure. If a later worker has already
+    /// started, the existing inspected rollback contract remains in force.
+    pub async fn start_with_qualified_market_exports(
+        self,
+        qualified_market_exports: Vec<RouteQualifiedMarketExport>,
+        cancellation: CancellationToken,
+    ) -> Result<ProductionPaperBotRuntime, ProductionPaperBotStartError> {
+        self.source
+            .validate_qualified_market_export_routes(&qualified_market_exports)
+            .map_err(ProductionPaperBotStartError::Source)?;
+        self.start_inner(Some(qualified_market_exports), cancellation)
+            .await
+    }
+
+    async fn start_inner(
+        self,
+        qualified_market_exports: Option<Vec<RouteQualifiedMarketExport>>,
         cancellation: CancellationToken,
     ) -> Result<ProductionPaperBotRuntime, ProductionPaperBotStartError> {
         let Self {
@@ -624,10 +664,24 @@ impl ProductionPaperBotComposition {
             };
             action_hooks.push(route_hook);
         }
-        let live = match source
-            .start_with_action_hooks(runtime_config, action_hooks, cancellation)
-            .await
-        {
+        let live_result = match qualified_market_exports {
+            Some(qualified_market_exports) => {
+                source
+                    .start_with_action_hooks_and_qualified_market_exports(
+                        runtime_config,
+                        action_hooks,
+                        qualified_market_exports,
+                        cancellation,
+                    )
+                    .await
+            }
+            None => {
+                source
+                    .start_with_action_hooks(runtime_config, action_hooks, cancellation)
+                    .await
+            }
+        };
+        let live = match live_result {
             Ok(live) => live,
             Err(error) => {
                 let startup = ProductionPaperBotStartError::Source(error);

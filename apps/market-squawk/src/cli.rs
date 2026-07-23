@@ -227,6 +227,14 @@ pub enum SourceCommand {
         #[arg(long)]
         confirm: bool,
     },
+    /// Activate one evidence-bound provider adapter after onboarding verification.
+    Activate {
+        /// Confined versioned provider-activation request file.
+        request: PathBuf,
+        /// Explicit local mutation confirmation.
+        #[arg(long)]
+        confirm: bool,
+    },
 }
 
 /// Direct capture arguments.

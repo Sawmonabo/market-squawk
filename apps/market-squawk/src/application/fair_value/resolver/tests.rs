@@ -26,6 +26,7 @@ async fn restart_starts_without_receipt_authority() -> Result<(), Box<dyn Error>
             instrument_id: InstrumentId::try_from(Uuid::from_u128(2))?,
             measurement_at: Timestamp::from_unix_nanos(1_000),
             ruleset: ClassificationRuleset::current(1_000)?,
+            market_access_assessment: None,
             cancellation: CancellationToken::new(),
             deadline: Instant::now() + Duration::from_secs(1),
         })

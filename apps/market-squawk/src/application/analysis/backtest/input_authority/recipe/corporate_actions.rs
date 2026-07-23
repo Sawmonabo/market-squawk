@@ -108,6 +108,32 @@ impl CorporateActionsWire {
             .map(|record| record.source_manifest.to_manifest())
             .collect()
     }
+
+    pub(super) fn into_input(self) -> Result<GovernedBacktestCorporateActionsInput, RecipeError> {
+        let policy = CorporateActionPolicy::new(
+            self.adjustment.into(),
+            NonZeroU32::new(self.policy_version).ok_or(RecipeError::Invalid)?,
+        );
+        let limits = CorporateActionLimits::try_new(
+            NonZeroUsize::new(self.maximum_actions).ok_or(RecipeError::Invalid)?,
+            NonZeroUsize::new(self.maximum_retained_bytes).ok_or(RecipeError::Invalid)?,
+        )
+        .map_err(|_| RecipeError::Invalid)?;
+        let mut actions = Vec::new();
+        actions
+            .try_reserve_exact(self.actions.len())
+            .map_err(|_| RecipeError::ResourceExhausted)?;
+        for action in self.actions {
+            actions.push(action.into_record()?);
+        }
+        Ok(GovernedBacktestCorporateActionsInput {
+            policy,
+            knowledge_cutoff: Timestamp::from_unix_nanos(self.knowledge_cutoff_unix_nanos),
+            valuation_cutoff: Timestamp::from_unix_nanos(self.valuation_cutoff_unix_nanos),
+            actions,
+            limits,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -158,6 +184,14 @@ impl CorporateActionRecordWire {
     fn to_record(&self) -> Result<CorporateActionRecord, RecipeError> {
         Ok(CorporateActionRecord::new(
             self.observation.clone(),
+            self.source_manifest.to_manifest()?,
+            self.evidence_digest,
+        ))
+    }
+
+    fn into_record(self) -> Result<CorporateActionRecord, RecipeError> {
+        Ok(CorporateActionRecord::new(
+            self.observation,
             self.source_manifest.to_manifest()?,
             self.evidence_digest,
         ))

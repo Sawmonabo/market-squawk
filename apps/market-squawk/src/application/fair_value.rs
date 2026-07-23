@@ -4,14 +4,16 @@ use std::{collections::HashSet, fmt, str::FromStr, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use chrono::DateTime;
-use market_squawk_domain::{AccountId, Currency, InstrumentId, Money, Timestamp};
+use market_squawk_data::DatasetId;
+use market_squawk_domain::{AccountId, Currency, InstrumentId, Money, Timestamp, VenueId};
 use market_squawk_services::{
     RequestContext, ServiceDomain, ServiceError, ToolResultMetadata, TypedToolRequest,
     TypedToolResult,
 };
 use market_squawk_valuation::{
-    ActorId, ClassificationRuleset, DecisionId, EvidenceOrigin, FairValueError, FairValueService,
-    InputSignificance, MeasurementId, ValuationAmount, ValuationInput, ValuationMeasurement,
+    ActorId, ApprovedMarketAccess, ClassificationRuleset, DecisionId, EvidenceOrigin,
+    FairValueError, FairValueService, InputSignificance, MarketAccess, MarketAccessAssessmentId,
+    MarketPriceSelection, MeasurementId, ValuationAmount, ValuationInput, ValuationMeasurement,
     ValuationMeasurementSpec, ValuationMethod,
 };
 use rust_decimal::Decimal;
@@ -37,7 +39,7 @@ pub use resolver::{
 };
 use serialization::{
     approval_value, classification_value, evidence_value, explanation_reason_value,
-    measurement_value, predicate_result_value, timestamp_value,
+    market_access_assessment_value, measurement_value, predicate_result_value, timestamp_value,
 };
 
 const LIST_MEASUREMENTS: &str = "FairValue.ListMeasurements";
@@ -48,6 +50,8 @@ const GET_APPROVAL_STATUS: &str = "FairValue.GetApprovalStatus";
 const MEASURE: &str = "FairValue.Measure";
 const CLASSIFY: &str = "FairValue.Classify";
 const APPROVE: &str = "FairValue.Approve";
+const APPROVE_MARKET_ACCESS: &str = "FairValue.ApproveMarketAccess";
+const GET_MARKET_ACCESS: &str = "FairValue.GetMarketAccess";
 
 /// Producer family named by one opaque, application-resolved receipt selector.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -60,6 +64,172 @@ pub enum FairValueProducerKind {
     Analytics,
     /// Immutable portfolio revision and selected real position.
     Portfolio,
+}
+
+/// Closed caller selection for one genuine producer-owned fair-value input.
+///
+/// Financial values, currency, quality, timestamps, provenance, physical paths, SQL, and
+/// hierarchy classifications are deliberately absent. Live requests select only an exact venue
+/// and trade or quote side; the genuine post-action observation remains producer-owned. Research
+/// and analytics select one bounded canonical row from a catalog-resolved immutable generation.
+/// Portfolio selects the measurement account's current immutable revision.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum FairValueProducerSelection {
+    /// Latest retained post-action observation for one exact venue and price family.
+    Live {
+        /// Exact venue whose directly verified observation is required.
+        venue_id: VenueId,
+        /// Trade, bid, or ask selected from the genuine retained observation.
+        selection: MarketPriceSelection,
+        /// Whether the resulting input is significant to the measurement.
+        significance: InputSignificance,
+    },
+    /// Canonical research monetary row from the current generation pinned at admission.
+    Research {
+        /// Stable local dataset identity.
+        dataset_id: DatasetId,
+        /// Zero-based canonical row offset.
+        row: usize,
+        /// Whether the resulting input is significant to the measurement.
+        significance: InputSignificance,
+    },
+    /// Registered analytical monetary-feature row from the current generation pinned at admission.
+    Analytics {
+        /// Stable local feature-dataset identity.
+        dataset_id: DatasetId,
+        /// Zero-based canonical monetary-feature row offset.
+        row: usize,
+        /// Whether the resulting input is significant to the measurement.
+        significance: InputSignificance,
+    },
+    /// Current immutable revision for the measurement account and subject instrument.
+    Portfolio {
+        /// Whether the resulting input is significant to the measurement.
+        significance: InputSignificance,
+    },
+}
+
+impl FairValueProducerSelection {
+    /// Returns the producer family selected by this closed request.
+    pub const fn producer(&self) -> FairValueProducerKind {
+        match self {
+            Self::Live { .. } => FairValueProducerKind::Live,
+            Self::Research { .. } => FairValueProducerKind::Research,
+            Self::Analytics { .. } => FairValueProducerKind::Analytics,
+            Self::Portfolio { .. } => FairValueProducerKind::Portfolio,
+        }
+    }
+
+    /// Returns whether the selected input is significant to the measurement.
+    pub const fn significance(&self) -> InputSignificance {
+        match self {
+            Self::Live { significance, .. }
+            | Self::Research { significance, .. }
+            | Self::Analytics { significance, .. }
+            | Self::Portfolio { significance } => *significance,
+        }
+    }
+}
+
+/// Complete bounded authority context for one in-process producer selection.
+#[derive(Clone)]
+pub struct FairValueProducerSelectionRequest {
+    selection: FairValueProducerSelection,
+    account_id: AccountId,
+    instrument_id: InstrumentId,
+    measurement_at: Timestamp,
+    cancellation: CancellationToken,
+    deadline: Instant,
+}
+
+impl FairValueProducerSelectionRequest {
+    /// Returns the closed producer selector.
+    pub const fn selection(&self) -> &FairValueProducerSelection {
+        &self.selection
+    }
+
+    /// Returns the reporting account from the enclosing measurement.
+    pub const fn account_id(&self) -> AccountId {
+        self.account_id
+    }
+
+    /// Returns the subject instrument from the enclosing measurement.
+    pub const fn instrument_id(&self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    /// Returns the exact fair-value measurement cutoff.
+    pub const fn measurement_at(&self) -> Timestamp {
+        self.measurement_at
+    }
+
+    /// Returns cancellation owned by the admitted measurement request.
+    pub const fn cancellation(&self) -> &CancellationToken {
+        &self.cancellation
+    }
+
+    /// Returns the admitted absolute monotonic deadline.
+    pub const fn deadline(&self) -> Instant {
+        self.deadline
+    }
+}
+
+impl fmt::Debug for FairValueProducerSelectionRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FairValueProducerSelectionRequest")
+            .field("selection", &self.selection)
+            .field("account_id", &self.account_id)
+            .field("instrument_id", &self.instrument_id)
+            .field("measurement_at", &self.measurement_at)
+            .field("deadline", &self.deadline)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Genuine producer selection or receipt-publication failure.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum FairValueProducerSelectionError {
+    /// The selected dataset, row, producer schema, or immutable value is invalid.
+    #[error("fair-value producer selection is invalid")]
+    InvalidSelection,
+    /// The selected dataset generation or portfolio revision does not exist.
+    #[error("fair-value selected producer was not found")]
+    NotFound,
+    /// The selected producer does not belong to the measurement account or instrument.
+    #[error("fair-value selected producer is not authorized")]
+    Unauthorized,
+    /// A producer-owned count, memory, query, or retained-byte ceiling was reached.
+    #[error("fair-value producer selection resource limit was exceeded")]
+    ResourceExhausted,
+    /// Request cancellation won the selection race.
+    #[error("fair-value producer selection was cancelled")]
+    Cancelled,
+    /// The admitted request deadline elapsed.
+    #[error("fair-value producer selection deadline elapsed")]
+    DeadlineExceeded,
+    /// Required producer authority is not currently available.
+    #[error("fair-value producer selection authority is unavailable")]
+    Unavailable,
+    /// Producer selection failed without caller-safe details.
+    #[error("fair-value producer selection failed")]
+    Internal,
+}
+
+/// Least-authority bridge from closed selections to genuine process-local producer receipts.
+///
+/// Implementations may consume only non-forgeable live leases or immutable analytical and
+/// portfolio producer capabilities, then publish through separated fair-value receipt handles.
+/// They must not accept or reconstruct financial values from transport data. Publication is
+/// bounded and idempotent; cancellation that races after a successful authority commit may leave
+/// only the genuine process-local receipt, never a partially persisted measurement.
+#[async_trait]
+pub trait FairValueProducerSelectionAuthority: Send + Sync + 'static {
+    /// Pins, reads, validates, and publishes one genuine producer receipt.
+    async fn publish(
+        &self,
+        request: FairValueProducerSelectionRequest,
+    ) -> Result<FairValueReceiptRegistration, FairValueProducerSelectionError>;
 }
 
 /// Least-authority request for one producer-derived valuation input.
@@ -76,6 +246,7 @@ pub struct FairValueInputResolutionRequest {
     instrument_id: InstrumentId,
     measurement_at: Timestamp,
     ruleset: ClassificationRuleset,
+    market_access_assessment: Option<Arc<ApprovedMarketAccess>>,
     cancellation: CancellationToken,
     deadline: Instant,
 }
@@ -116,6 +287,11 @@ impl FairValueInputResolutionRequest {
         &self.ruleset
     }
 
+    /// Returns the durable assessment selected inside the fair-value authority boundary.
+    pub fn market_access_assessment(&self) -> Option<&ApprovedMarketAccess> {
+        self.market_access_assessment.as_deref()
+    }
+
     /// Returns cancellation owned by the admitted request.
     pub const fn cancellation(&self) -> &CancellationToken {
         &self.cancellation
@@ -138,6 +314,13 @@ impl fmt::Debug for FairValueInputResolutionRequest {
             .field("instrument_id", &self.instrument_id)
             .field("measurement_at", &self.measurement_at)
             .field("ruleset", &self.ruleset)
+            .field(
+                "market_access_assessment",
+                &self
+                    .market_access_assessment
+                    .as_ref()
+                    .map(|value| value.id()),
+            )
             .field("deadline", &self.deadline)
             .finish_non_exhaustive()
     }
@@ -192,6 +375,7 @@ pub trait FairValueInputResolver: Send + Sync + 'static {
 pub struct FairValueDomainService {
     state: Mutex<FairValueService>,
     resolver: Arc<dyn FairValueInputResolver>,
+    selection_authority: Arc<dyn FairValueProducerSelectionAuthority>,
     ruleset: ClassificationRuleset,
     maximum_inputs: usize,
     maximum_query_results: usize,
@@ -199,7 +383,7 @@ pub struct FairValueDomainService {
 }
 
 impl FairValueDomainService {
-    /// Binds one durable service to the current code-owned rules and a read-only receipt resolver.
+    /// Binds one durable service to code-owned rules, genuine selection, and receipt resolution.
     ///
     /// # Errors
     ///
@@ -207,12 +391,14 @@ impl FairValueDomainService {
     pub fn try_new(
         service: FairValueService,
         resolver: Arc<dyn FairValueInputResolver>,
+        selection_authority: Arc<dyn FairValueProducerSelectionAuthority>,
         maximum_quote_age_nanos: u64,
     ) -> Result<Self, FairValueError> {
         let limits = service.limits();
         Ok(Self {
             state: Mutex::new(service),
             resolver,
+            selection_authority,
             ruleset: ClassificationRuleset::current(maximum_quote_age_nanos)?,
             maximum_inputs: limits.max_inputs_per_measurement(),
             maximum_query_results: limits.max_query_results(),
@@ -417,10 +603,15 @@ impl FairValueDomainService {
             prepared_by,
             method,
             receipts,
+            selections,
         } = parsed;
+        let input_count = receipts
+            .len()
+            .checked_add(selections.len())
+            .ok_or(ServiceError::ResourceExhausted)?;
         let mut inputs = Vec::new();
         inputs
-            .try_reserve_exact(receipts.len())
+            .try_reserve_exact(input_count)
             .map_err(|_| ServiceError::ResourceExhausted)?;
         for receipt in receipts {
             let resolution = FairValueInputResolutionRequest {
@@ -431,16 +622,69 @@ impl FairValueDomainService {
                 instrument_id,
                 measurement_at,
                 ruleset: self.ruleset.clone(),
+                market_access_assessment: None,
                 cancellation: context.cancellation().clone(),
                 deadline: context.deadline(),
             };
             let input = self.resolve_input(resolution, context).await?;
-            if input.subject_instrument_id() != instrument_id
-                || input.significance() != receipt.significance
-                || !origin_matches(receipt.producer, input.evidence().origin(), account_id)
-            {
-                return Err(ServiceError::InvalidRequest);
-            }
+            validate_resolved_input(
+                &input,
+                receipt.producer,
+                receipt.significance,
+                account_id,
+                instrument_id,
+            )?;
+            inputs.push(input);
+        }
+        for selection in selections {
+            let producer = selection.producer();
+            let significance = selection.significance();
+            let market_access_assessment = match &selection {
+                FairValueProducerSelection::Live { venue_id, .. } => Some(
+                    self.current_accessible_market(
+                        account_id,
+                        venue_id,
+                        instrument_id,
+                        measurement_at,
+                        context,
+                    )
+                    .await?,
+                ),
+                FairValueProducerSelection::Research { .. }
+                | FairValueProducerSelection::Analytics { .. }
+                | FairValueProducerSelection::Portfolio { .. } => None,
+            };
+            let registration = self
+                .publish_selection(
+                    FairValueProducerSelectionRequest {
+                        selection,
+                        account_id,
+                        instrument_id,
+                        measurement_at,
+                        cancellation: context.cancellation().clone(),
+                        deadline: context.deadline(),
+                    },
+                    context,
+                )
+                .await?;
+            let input = self
+                .resolve_input(
+                    FairValueInputResolutionRequest {
+                        producer,
+                        receipt_id: registration.reference().as_str().into(),
+                        significance,
+                        account_id,
+                        instrument_id,
+                        measurement_at,
+                        ruleset: self.ruleset.clone(),
+                        market_access_assessment,
+                        cancellation: context.cancellation().clone(),
+                        deadline: context.deadline(),
+                    },
+                    context,
+                )
+                .await?;
+            validate_resolved_input(&input, producer, significance, account_id, instrument_id)?;
             inputs.push(input);
         }
         let measurement = ValuationMeasurement::try_new(ValuationMeasurementSpec {
@@ -547,6 +791,98 @@ impl FairValueDomainService {
         )
     }
 
+    async fn approve_market_access(
+        &self,
+        request: &TypedToolRequest,
+        context: &RequestContext,
+    ) -> Result<TypedToolResult, ServiceError> {
+        let account_id = AccountId::from_str(required_string(request.arguments(), "accountId")?)
+            .map_err(|_| ServiceError::InvalidRequest)?;
+        let venue_id = VenueId::try_from(required_string(request.arguments(), "venueId")?)
+            .map_err(|_| ServiceError::InvalidRequest)?;
+        let instrument_id =
+            InstrumentId::from_str(required_string(request.arguments(), "instrumentId")?)
+                .map_err(|_| ServiceError::InvalidRequest)?;
+        let conclusion = match required_string(request.arguments(), "conclusion")? {
+            "accessible" => MarketAccess::Accessible,
+            "inaccessible" => MarketAccess::Inaccessible,
+            _ => return Err(ServiceError::InvalidRequest),
+        };
+        let effective_from = admitted_timestamp(request.arguments(), "effectiveFrom")?;
+        let effective_until = admitted_timestamp(request.arguments(), "effectiveUntil")?;
+        let rationale = required_string(request.arguments(), "rationale")?;
+        let prepared_by = ActorId::try_from(required_string(request.arguments(), "preparedBy")?)
+            .map_err(map_fair_value_error)?;
+        let prepared_at = admitted_timestamp(request.arguments(), "preparedAt")?;
+        let approved_by = ActorId::try_from(required_string(request.arguments(), "approvedBy")?)
+            .map_err(map_fair_value_error)?;
+        let approved_at = admitted_timestamp(request.arguments(), "approvedAt")?;
+        let mut state = self.lock_state(context).await?;
+        let assessment = state
+            .approve_market_access(
+                account_id,
+                venue_id,
+                instrument_id,
+                conclusion,
+                effective_from,
+                effective_until,
+                rationale,
+                prepared_by,
+                prepared_at,
+                approved_by,
+                approved_at,
+            )
+            .map_err(map_fair_value_error)?;
+        drop(state);
+        one_result(
+            json!({"marketAccess": market_access_assessment_value(&assessment)}),
+            request,
+            context,
+        )
+    }
+
+    async fn market_access(
+        &self,
+        request: &TypedToolRequest,
+        context: &RequestContext,
+    ) -> Result<TypedToolResult, ServiceError> {
+        let assessment_id = MarketAccessAssessmentId::from_str(required_string(
+            request.arguments(),
+            "assessmentId",
+        )?)
+        .map_err(|_| ServiceError::InvalidRequest)?;
+        let state = self.lock_state(context).await?;
+        let assessment = state
+            .market_access(assessment_id)
+            .ok_or(ServiceError::NotFound)?;
+        drop(state);
+        one_result(
+            json!({"marketAccess": market_access_assessment_value(&assessment)}),
+            request,
+            context,
+        )
+    }
+
+    async fn current_accessible_market(
+        &self,
+        account_id: AccountId,
+        venue_id: &VenueId,
+        instrument_id: InstrumentId,
+        measurement_at: Timestamp,
+        context: &RequestContext,
+    ) -> Result<Arc<ApprovedMarketAccess>, ServiceError> {
+        let state = self.lock_state(context).await?;
+        let assessment = state
+            .current_market_access(account_id, venue_id, instrument_id, measurement_at)
+            .map_err(map_fair_value_error)?
+            .ok_or(ServiceError::Unauthorized)?;
+        if assessment.conclusion() != MarketAccess::Accessible {
+            return Err(ServiceError::Unauthorized);
+        }
+        drop(state);
+        Ok(assessment)
+    }
+
     async fn resolve_input(
         &self,
         request: FairValueInputResolutionRequest,
@@ -570,6 +906,29 @@ impl FairValueDomainService {
         Ok(resolved)
     }
 
+    async fn publish_selection(
+        &self,
+        request: FairValueProducerSelectionRequest,
+        context: &RequestContext,
+    ) -> Result<FairValueReceiptRegistration, ServiceError> {
+        ensure_request_live(context, &self.lifecycle)?;
+        let deadline = tokio::time::Instant::from_std(context.deadline());
+        let registration = tokio::select! {
+            biased;
+            _ = context.cancellation().cancelled() => return Err(ServiceError::Cancelled),
+            _ = self.lifecycle.shutdown_token().cancelled() => {
+                return Err(ServiceError::Unavailable);
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                return Err(ServiceError::DeadlineExceeded);
+            }
+            registration = self.selection_authority.publish(request) => registration,
+        }
+        .map_err(map_selection_error)?;
+        ensure_request_live(context, &self.lifecycle)?;
+        Ok(registration)
+    }
+
     async fn lock_state(
         &self,
         context: &RequestContext,
@@ -591,6 +950,10 @@ impl fmt::Debug for FairValueDomainService {
         formatter
             .debug_struct("FairValueDomainService")
             .field("resolver", &"[LEAST-AUTHORITY PRODUCER RESOLVER]")
+            .field(
+                "selection_authority",
+                &"[GENUINE PRODUCER SELECTION AUTHORITY]",
+            )
             .field("ruleset_version", &self.ruleset.version())
             .field("ruleset_hash", &self.ruleset.hash())
             .field("maximum_inputs", &self.maximum_inputs)
@@ -624,6 +987,8 @@ impl ApplicationDomainService for FairValueDomainService {
             MEASURE => self.measure(&request, &context).await,
             CLASSIFY => self.classify(&request, &context).await,
             APPROVE => self.approve(&request, &context).await,
+            APPROVE_MARKET_ACCESS => self.approve_market_access(&request, &context).await,
+            GET_MARKET_ACCESS => self.market_access(&request, &context).await,
             _ => Err(ServiceError::NotFound),
         }?;
         ensure_request_live(&context, &self.lifecycle)?;
@@ -654,6 +1019,7 @@ struct ParsedMeasurement {
     prepared_by: ActorId,
     method: ValuationMethod,
     receipts: Vec<ParsedReceipt>,
+    selections: Vec<FairValueProducerSelection>,
 }
 
 impl ParsedMeasurement {
@@ -692,11 +1058,13 @@ impl ParsedMeasurement {
             "cost_approach" => ValuationMethod::CostApproach,
             _ => return Err(ServiceError::InvalidRequest),
         };
-        let receipt_values = measurement
-            .get("producerReceipts")
-            .and_then(Value::as_array)
-            .ok_or(ServiceError::InvalidRequest)?;
-        if receipt_values.is_empty() || receipt_values.len() > maximum_inputs {
+        let receipt_values = optional_array(measurement, "producerReceipts")?;
+        let selection_values = optional_array(measurement, "producerSelections")?;
+        let input_count = receipt_values
+            .len()
+            .checked_add(selection_values.len())
+            .ok_or(ServiceError::ResourceExhausted)?;
+        if input_count == 0 || input_count > maximum_inputs {
             return Err(ServiceError::ResourceExhausted);
         }
         let mut receipts = Vec::new();
@@ -716,6 +1084,23 @@ impl ParsedMeasurement {
         {
             return Err(ServiceError::InvalidRequest);
         }
+        let mut selections = Vec::new();
+        selections
+            .try_reserve_exact(selection_values.len())
+            .map_err(|_| ServiceError::ResourceExhausted)?;
+        for value in selection_values {
+            selections.push(FairValueProducerSelection::try_from(value)?);
+        }
+        let mut unique_selections = HashSet::new();
+        unique_selections
+            .try_reserve(selections.len())
+            .map_err(|_| ServiceError::ResourceExhausted)?;
+        if selections
+            .iter()
+            .any(|selection| !unique_selections.insert(selection_coordinate(selection)))
+        {
+            return Err(ServiceError::InvalidRequest);
+        }
         Ok(Self {
             account_id,
             instrument_id,
@@ -725,7 +1110,111 @@ impl ParsedMeasurement {
             prepared_by,
             method,
             receipts,
+            selections,
         })
+    }
+}
+
+#[derive(Eq, Hash, PartialEq)]
+enum SelectionCoordinate<'selection> {
+    Live(&'selection VenueId, MarketPriceSelection),
+    Dataset(FairValueProducerKind, &'selection DatasetId, usize),
+    Portfolio,
+}
+
+fn selection_coordinate(selection: &FairValueProducerSelection) -> SelectionCoordinate<'_> {
+    match selection {
+        FairValueProducerSelection::Live {
+            venue_id,
+            selection,
+            ..
+        } => SelectionCoordinate::Live(venue_id, *selection),
+        FairValueProducerSelection::Research {
+            dataset_id, row, ..
+        }
+        | FairValueProducerSelection::Analytics {
+            dataset_id, row, ..
+        } => SelectionCoordinate::Dataset(selection.producer(), dataset_id, *row),
+        FairValueProducerSelection::Portfolio { .. } => SelectionCoordinate::Portfolio,
+    }
+}
+
+impl TryFrom<&Value> for FairValueProducerSelection {
+    type Error = ServiceError;
+
+    fn try_from(value: &Value) -> Result<Self, Self::Error> {
+        let value = value.as_object().ok_or(ServiceError::InvalidRequest)?;
+        let significance = admitted_significance(value)?;
+        match required_string(value, "producer")? {
+            "live" => {
+                if value.len() != 4
+                    || value.keys().any(|key| {
+                        !matches!(
+                            key.as_str(),
+                            "producer" | "venueId" | "selection" | "significance"
+                        )
+                    })
+                {
+                    return Err(ServiceError::InvalidRequest);
+                }
+                let venue_id = VenueId::try_from(required_string(value, "venueId")?)
+                    .map_err(|_| ServiceError::InvalidRequest)?;
+                let selection = match required_string(value, "selection")? {
+                    "trade" => MarketPriceSelection::Trade,
+                    "bid" => MarketPriceSelection::Bid,
+                    "ask" => MarketPriceSelection::Ask,
+                    _ => return Err(ServiceError::InvalidRequest),
+                };
+                Ok(Self::Live {
+                    venue_id,
+                    selection,
+                    significance,
+                })
+            }
+            "research" | "analytics" => {
+                if value.len() != 4
+                    || value.keys().any(|key| {
+                        !matches!(
+                            key.as_str(),
+                            "producer" | "datasetId" | "row" | "significance"
+                        )
+                    })
+                {
+                    return Err(ServiceError::InvalidRequest);
+                }
+                let dataset_id = DatasetId::try_from(required_string(value, "datasetId")?)
+                    .map_err(|_| ServiceError::InvalidRequest)?;
+                let row = value
+                    .get("row")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .ok_or(ServiceError::InvalidRequest)?;
+                if required_string(value, "producer")? == "research" {
+                    Ok(Self::Research {
+                        dataset_id,
+                        row,
+                        significance,
+                    })
+                } else {
+                    Ok(Self::Analytics {
+                        dataset_id,
+                        row,
+                        significance,
+                    })
+                }
+            }
+            "portfolio" => {
+                if value.len() != 2
+                    || value
+                        .keys()
+                        .any(|key| !matches!(key.as_str(), "producer" | "significance"))
+                {
+                    return Err(ServiceError::InvalidRequest);
+                }
+                Ok(Self::Portfolio { significance })
+            }
+            _ => Err(ServiceError::InvalidRequest),
+        }
     }
 }
 
@@ -741,23 +1230,41 @@ impl TryFrom<&Value> for ParsedReceipt {
     fn try_from(value: &Value) -> Result<Self, Self::Error> {
         let value = value.as_object().ok_or(ServiceError::InvalidRequest)?;
         let producer = match required_string(value, "producer")? {
-            "live" => FairValueProducerKind::Live,
             "research" => FairValueProducerKind::Research,
             "analytics" => FairValueProducerKind::Analytics,
             "portfolio" => FairValueProducerKind::Portfolio,
             _ => return Err(ServiceError::InvalidRequest),
         };
         let receipt_id = required_string(value, "receiptId")?.into();
-        let significance = match required_string(value, "significance")? {
-            "significant" => InputSignificance::Significant,
-            "not_significant" => InputSignificance::NotSignificant,
-            _ => return Err(ServiceError::InvalidRequest),
-        };
+        let significance = admitted_significance(value)?;
         Ok(Self {
             producer,
             receipt_id,
             significance,
         })
+    }
+}
+
+fn optional_array<'value>(
+    arguments: &'value Map<String, Value>,
+    field: &str,
+) -> Result<&'value [Value], ServiceError> {
+    arguments.get(field).map_or(Ok(&[][..]), |value| {
+        value
+            .as_array()
+            .filter(|values| !values.is_empty())
+            .map(Vec::as_slice)
+            .ok_or(ServiceError::InvalidRequest)
+    })
+}
+
+fn admitted_significance(
+    arguments: &Map<String, Value>,
+) -> Result<InputSignificance, ServiceError> {
+    match required_string(arguments, "significance")? {
+        "significant" => Ok(InputSignificance::Significant),
+        "not_significant" => Ok(InputSignificance::NotSignificant),
+        _ => Err(ServiceError::InvalidRequest),
     }
 }
 
@@ -820,6 +1327,23 @@ fn bounded_result(
     TypedToolResult::try_new(content, returned.max(1), metadata, limits).map_err(Into::into)
 }
 
+fn validate_resolved_input(
+    input: &ValuationInput,
+    producer: FairValueProducerKind,
+    significance: InputSignificance,
+    account_id: AccountId,
+    instrument_id: InstrumentId,
+) -> Result<(), ServiceError> {
+    if input.subject_instrument_id() != instrument_id
+        || input.significance() != significance
+        || !origin_matches(producer, input.evidence().origin(), account_id)
+    {
+        Err(ServiceError::InvalidRequest)
+    } else {
+        Ok(())
+    }
+}
+
 fn origin_matches(
     expected: FairValueProducerKind,
     origin: &EvidenceOrigin,
@@ -837,6 +1361,19 @@ fn origin_matches(
             },
         ) => *evidence_account == account_id,
         _ => false,
+    }
+}
+
+fn map_selection_error(error: FairValueProducerSelectionError) -> ServiceError {
+    match error {
+        FairValueProducerSelectionError::InvalidSelection => ServiceError::InvalidRequest,
+        FairValueProducerSelectionError::NotFound => ServiceError::NotFound,
+        FairValueProducerSelectionError::Unauthorized => ServiceError::Unauthorized,
+        FairValueProducerSelectionError::ResourceExhausted => ServiceError::ResourceExhausted,
+        FairValueProducerSelectionError::Cancelled => ServiceError::Cancelled,
+        FairValueProducerSelectionError::DeadlineExceeded => ServiceError::DeadlineExceeded,
+        FairValueProducerSelectionError::Unavailable => ServiceError::Unavailable,
+        FairValueProducerSelectionError::Internal => ServiceError::Internal,
     }
 }
 

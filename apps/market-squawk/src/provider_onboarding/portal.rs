@@ -736,6 +736,10 @@ async function mutate(path, body, type) {
   return result;
 }
 async function start(profile, organization, email) {
+  if (profile.credential_requirement === 'required_provider_controlled' ||
+      profile.account_requirement === 'required_provider_controlled') {
+    window.open(profile.official_handoff_url, '_blank', 'noopener,noreferrer');
+  }
   const request = {surface_id: profile.id};
   if (profile.administrative_contact_requirement === 'required_non_secret') {
     request.organization = organization.value;
@@ -756,7 +760,12 @@ async function start(profile, organization, email) {
       input.value = '';
       input.remove();
       submit.remove();
-      if (value) await mutate('/api/v1/sessions/' + session.session_id + '/secret', value, 'application/octet-stream');
+      if (value) {
+        const stored = await mutate('/api/v1/sessions/' + session.session_id + '/secret', value, 'application/octet-stream');
+        if (stored.next_action === 'verify_and_activate') {
+          await mutate('/api/v1/sessions/' + session.session_id + '/activate', '{}', 'application/json');
+        }
+      }
     });
     status.before(input, submit);
   }

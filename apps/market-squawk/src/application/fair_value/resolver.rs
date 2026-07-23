@@ -7,7 +7,9 @@ use market_squawk_data::{PinnedFeatureMonetaryValue, PinnedMonetaryValue};
 use market_squawk_live::CommittedQualifiedMarketObservation;
 use market_squawk_modeling::{ModelAdmissionError, ProductionFeatureRegistry};
 use market_squawk_portfolio::PortfolioRevision;
-use market_squawk_valuation::{CommittedMarketInputRequest, MarketPriceSelection, ValuationInput};
+use market_squawk_valuation::{
+    CommittedMarketInputRequest, MarketAccess, MarketPriceSelection, ValuationInput,
+};
 use thiserror::Error;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -394,6 +396,11 @@ impl FairValueInputResolver for ProductionFairValueInputResolver {
         if entry.producer.kind() != request.producer() {
             return Err(FairValueInputResolutionError::InvalidReference);
         }
+        if entry.producer.kind() != FairValueProducerKind::Live
+            && request.market_access_assessment().is_some()
+        {
+            return Err(FairValueInputResolutionError::InvalidReference);
+        }
         let resolved = resolve_entry(
             &entry.producer,
             &request,
@@ -472,6 +479,12 @@ fn resolve_entry(
             selected_index,
             selection,
         } => {
+            let market_access = request
+                .market_access_assessment()
+                .ok_or(FairValueInputResolutionError::Unauthorized)?;
+            if market_access.conclusion() != MarketAccess::Accessible {
+                return Err(FairValueInputResolutionError::Unauthorized);
+            }
             if observations.len()
                 > request
                     .ruleset()
@@ -499,7 +512,7 @@ fn resolve_entry(
                 account_id: request.account_id(),
                 measurement_at: request.measurement_at(),
                 ruleset: request.ruleset(),
-                market_access_assessment: None,
+                market_access_assessment: Some(market_access),
             })
         }
         ProducerReceipt::Research(value) => {

@@ -94,6 +94,37 @@ impl ProviderAdapterActivation {
         if cancellation.is_cancelled() {
             return Err(ProviderAdapterActivationError::Cancelled);
         }
+        self.activate_with_lease(lease, request, cancellation)
+    }
+
+    /// Reconstructs an adapter only from an already-active durable onboarding lease.
+    ///
+    /// Unlike [`Self::activate_ready_profile`], restart recovery never performs provider
+    /// verification or changes onboarding state. Expired, refresh-required, or otherwise inactive
+    /// sessions fail closed.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed when the durable session is not active or when the retained adapter request
+    /// no longer satisfies its exact provider contract.
+    pub fn restore_active_profile(
+        &self,
+        session_id: Uuid,
+        request: ProviderAdapterActivationRequest,
+    ) -> Result<ProviderActivationOutcome, ProviderAdapterActivationError> {
+        let lease = self.onboarding.activation_lease(session_id)?;
+        self.activate_with_lease(lease, request, CancellationToken::new())
+    }
+
+    fn activate_with_lease(
+        &self,
+        lease: ProviderActivationLease,
+        request: ProviderAdapterActivationRequest,
+        cancellation: CancellationToken,
+    ) -> Result<ProviderActivationOutcome, ProviderAdapterActivationError> {
+        if cancellation.is_cancelled() {
+            return Err(ProviderAdapterActivationError::Cancelled);
+        }
         match request {
             ProviderAdapterActivationRequest::Live(routes) => {
                 self.activate_live(lease, routes).map(Into::into)

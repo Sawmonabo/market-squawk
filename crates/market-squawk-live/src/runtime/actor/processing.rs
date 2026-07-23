@@ -124,6 +124,7 @@ impl ShardActor {
                 LiveRuntimeHealthKind::QualifiedMarketExportDropped,
                 Some(key.clone()),
             );
+            return Err(ActorError::QualifiedMarketExportUnavailable);
         }
         if publish_after_batch {
             self.publish_snapshot(ShardLifecycleSnapshot::Ready)?;

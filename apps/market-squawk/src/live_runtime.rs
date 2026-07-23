@@ -12,7 +12,8 @@
 use market_squawk_live::{
     BoundShardIngress, LiveIngressBindError, LiveRouteConfig, LiveRuntime, LiveRuntimeConfig,
     LiveRuntimeHealthEvent, LiveRuntimeIngress, LiveRuntimeReplaceError, LiveRuntimeShutdown,
-    LiveRuntimeStartError, LiveSnapshotReader, RouteActionHook, ShardId, ShardKey,
+    LiveRuntimeStartError, LiveSnapshotReader, RouteActionHook, RouteQualifiedMarketExport,
+    ShardId, ShardKey,
 };
 use market_squawk_sources::CurrentSourceAuthorityLease;
 use thiserror::Error;
@@ -48,6 +49,33 @@ impl LiveRuntimeComposition {
     ) -> Result<Self, LiveRuntimeCompositionError> {
         Ok(Self {
             runtime: LiveRuntime::start_with_action_hooks(config, routes, action_hooks).await?,
+        })
+    }
+
+    /// Starts every shard with exact action hooks and bounded post-decision market exports.
+    ///
+    /// Export route validation and complete retained-memory accounting remain owned by the live
+    /// runtime. Sender ownership transfers into live actors; this composition never owns or
+    /// spawns a consumer for the independently returned receivers.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed startup error when routes, hooks, exports, resource bounds, or actor startup
+    /// are invalid. A failed startup does not leave detached live actors.
+    pub async fn start_with_action_hooks_and_qualified_market_exports(
+        config: LiveRuntimeConfig,
+        routes: Vec<LiveRouteConfig>,
+        action_hooks: Vec<RouteActionHook>,
+        qualified_market_exports: Vec<RouteQualifiedMarketExport>,
+    ) -> Result<Self, LiveRuntimeCompositionError> {
+        Ok(Self {
+            runtime: LiveRuntime::start_with_action_hooks_and_qualified_market_exports(
+                config,
+                routes,
+                action_hooks,
+                qualified_market_exports,
+            )
+            .await?,
         })
     }
 

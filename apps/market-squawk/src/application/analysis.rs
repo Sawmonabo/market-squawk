@@ -8,7 +8,7 @@ use market_squawk_analytics::{
     ExactDecimalUnit, FactorRegressionResult, MonetaryBasis, PortfolioAttribution,
     StatisticalResult,
 };
-use market_squawk_domain::{InstrumentId, RoundingPolicy, SourceId, SourceIdentifier, Timestamp};
+use market_squawk_domain::{InstrumentId, RoundingPolicy, SourceId, Timestamp};
 use market_squawk_services::{
     RequestContext, ServiceDomain, ServiceError, ToolResultMetadata, TypedToolRequest,
     TypedToolResult,
@@ -27,13 +27,14 @@ mod serialization;
 pub use backtest::{
     BacktestScope, GovernedBacktestAuthority, GovernedBacktestCommand,
     GovernedBacktestCorporateActionsInput, GovernedBacktestInputAuthorityLimits,
-    GovernedBacktestInputRegistrationInput, GovernedBacktestInputRegistrationReceipt,
+    GovernedBacktestInputRegistrar, GovernedBacktestInputRegistrationInput,
+    GovernedBacktestInputRegistrationJsonError, GovernedBacktestInputRegistrationReceipt,
     GovernedBacktestInputResolver, GovernedBacktestPortfolioSeedInput,
     GovernedBacktestQueryLimitsInput, GovernedBacktestRecord, GovernedBacktestRepository,
-    GovernedBacktestRepositoryLimits, ProductionBacktestAuthority,
-    ProductionGovernedBacktestInputAuthority, ProductionGovernedBacktestInputAuthorityError,
-    ProductionGovernedBacktestRepository, ProductionGovernedBacktestRepositoryError,
-    ResolvedGovernedBacktestInput,
+    GovernedBacktestRepositoryLimits, MAX_GOVERNED_BACKTEST_REGISTRATION_REQUEST_BYTES,
+    ProductionBacktestAuthority, ProductionGovernedBacktestInputAuthority,
+    ProductionGovernedBacktestInputAuthorityError, ProductionGovernedBacktestRepository,
+    ProductionGovernedBacktestRepositoryError, ResolvedGovernedBacktestInput,
 };
 pub use catalog::{
     AnalysisCatalog, AnalysisCatalogError, AnalysisDataset, AnalysisDatasetScope,
@@ -41,7 +42,6 @@ pub use catalog::{
     ValuationAnalysisInput,
 };
 
-use backtest::experiment_input_id;
 use catalog::FeatureDatasetRegistration as FeatureDataset;
 use serialization::{feature_dataset_value, feature_metadata_value, manifest_value};
 
@@ -56,6 +56,7 @@ const RUN_BACKTEST: &str = "Analysis.RunBacktest";
 /// Application-owned analytical surface over immutable inputs and governed experiment authority.
 pub struct AnalysisDomainService {
     catalog: Arc<AnalysisCatalog>,
+    backtest_inputs: Arc<dyn GovernedBacktestInputRegistrar>,
     backtests: Arc<dyn GovernedBacktestAuthority>,
     lifecycle: Arc<DomainLifecycle>,
 }
@@ -65,10 +66,12 @@ impl AnalysisDomainService {
     #[must_use]
     pub fn new(
         catalog: Arc<AnalysisCatalog>,
+        backtest_inputs: Arc<dyn GovernedBacktestInputRegistrar>,
         backtests: Arc<dyn GovernedBacktestAuthority>,
     ) -> Self {
         Self {
             catalog,
+            backtest_inputs,
             backtests,
             lifecycle: DomainLifecycle::new(),
         }
@@ -286,25 +289,31 @@ impl AnalysisDomainService {
         request: &TypedToolRequest,
         context: &RequestContext,
     ) -> Result<TypedToolResult, ServiceError> {
-        let strategy_id = request
+        let registration = request
             .arguments()
-            .get("strategyId")
-            .and_then(Value::as_str)
-            .ok_or(ServiceError::InvalidRequest)
-            .and_then(|value| {
-                SourceIdentifier::try_from(value).map_err(|_| ServiceError::InvalidRequest)
-            })?;
-        let experiment = request
-            .arguments()
-            .get("experiment")
+            .get("registration")
             .and_then(Value::as_object)
             .ok_or(ServiceError::InvalidRequest)?;
-        let input_id = experiment_input_id(experiment)?;
-        let scope = ReadScope::from_arguments(request.arguments())?.into_backtest();
+        let encoded = serde_json::to_vec(registration).map_err(|_| ServiceError::InvalidRequest)?;
+        let input =
+            GovernedBacktestInputRegistrationInput::try_from_json(&encoded).map_err(|error| {
+                match error {
+                    GovernedBacktestInputRegistrationJsonError::Invalid => {
+                        ServiceError::InvalidRequest
+                    }
+                    GovernedBacktestInputRegistrationJsonError::ResourceExhausted => {
+                        ServiceError::ResourceExhausted
+                    }
+                }
+            })?;
+        let registration = self
+            .backtest_inputs
+            .register_input(input, context.cancellation().clone(), context.deadline())
+            .await?;
         let record = self
             .backtests
             .run(
-                GovernedBacktestCommand::new(strategy_id, input_id, scope),
+                registration.into_command(),
                 context.cancellation().clone(),
                 context.deadline(),
             )
@@ -338,6 +347,10 @@ impl fmt::Debug for AnalysisDomainService {
         formatter
             .debug_struct("AnalysisDomainService")
             .field("catalog", &self.catalog)
+            .field(
+                "backtest_inputs",
+                &"[GOVERNED INPUT REGISTRATION AUTHORITY]",
+            )
             .field("backtests", &"[GOVERNED BACKTEST AUTHORITY]")
             .field("lifecycle", &self.lifecycle)
             .finish()
@@ -470,14 +483,6 @@ impl ReadScope {
 
     const fn has_filter(&self) -> bool {
         self.instruments.is_some() || self.time_range.is_some() || self.sources.is_some()
-    }
-
-    fn into_backtest(self) -> BacktestScope {
-        BacktestScope::new(
-            self.instruments.unwrap_or_default(),
-            self.time_range,
-            self.sources.unwrap_or_default(),
-        )
     }
 }
 

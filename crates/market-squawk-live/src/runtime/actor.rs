@@ -427,6 +427,8 @@ pub(crate) enum ActorError {
     DuplicateQualifiedMarketExport,
     #[error("actor received qualified-market export ownership for an unknown route")]
     UnknownQualifiedMarketExport,
+    #[error("actor lost a required qualified-market export")]
+    QualifiedMarketExportUnavailable,
     #[error("actor received a command for an unknown route")]
     UnknownRoute,
     #[error("actor received a command whose generation is no longer current")]
@@ -464,6 +466,7 @@ impl ActorError {
             | Self::UnknownActionHook
             | Self::DuplicateQualifiedMarketExport
             | Self::UnknownQualifiedMarketExport
+            | Self::QualifiedMarketExportUnavailable
             | Self::UnknownRoute
             | Self::RuntimeClosed
             | Self::ShardClosed

@@ -133,6 +133,8 @@ pub enum OnboardingNextAction {
     CompleteProviderHandoff,
     /// Import one provider-created secret through the write-only endpoint.
     ImportSecret,
+    /// Verify the securely stored credential and activate its exact admitted authority.
+    VerifyAndActivate,
     /// Refresh the named mutable official evidence.
     RefreshEvidence,
     /// Resolve the exact rights conflict before credential handling.
@@ -317,10 +319,8 @@ pub(super) fn session_view(
         .and_then(|generation| lifecycle.generation_reference(generation))
         .is_some();
     let next_action = match lifecycle.state() {
-        OnboardingState::UserActionRequired if credential_stored => {
-            OnboardingNextAction::CompleteProviderHandoff
-        }
         OnboardingState::UserActionRequired => OnboardingNextAction::ImportSecret,
+        OnboardingState::StoredUnverified => OnboardingNextAction::VerifyAndActivate,
         OnboardingState::RefreshRequired => OnboardingNextAction::RefreshEvidence,
         OnboardingState::Unavailable => OnboardingNextAction::StartNewSession,
         OnboardingState::ActiveScoped => OnboardingNextAction::Active,

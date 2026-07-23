@@ -22,6 +22,7 @@ const MAXIMUM_AUDIT_RECORDS: usize = 16_384;
 const MAXIMUM_ENCODED_RECORD_BYTES: usize = 8 * 1024;
 const MAXIMUM_AUDIT_FILE_BYTES: u64 =
     MAXIMUM_AUDIT_RECORDS as u64 * (MAXIMUM_ENCODED_RECORD_BYTES as u64 + 1);
+const AUDIT_FILE_NAME: &str = "mcp-audit.jsonl";
 
 /// One-session bounded audit sink retained by the production composition.
 #[derive(Debug)]
@@ -31,14 +32,7 @@ pub(super) struct DurableAuditSink {
 
 impl DurableAuditSink {
     pub(super) fn try_new(control: Dir) -> Result<Self, LocalAuditError> {
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).append(true).create(true);
-        options.follow(FollowSymlinks::No);
-        configure_private_creation(&mut options);
-        let file = control
-            .open_with("mcp-audit.jsonl", &options)
-            .map_err(LocalAuditError::Io)?
-            .into_std();
+        let file = open_audit_file(&control)?;
         validate_private_file_identity(&control, &file)?;
         file.try_lock_exclusive().map_err(|source| {
             if source.kind() == std::io::ErrorKind::WouldBlock {
@@ -48,7 +42,7 @@ impl DurableAuditSink {
             }
         })?;
         validate_private_file_identity(&control, &file)?;
-        synchronize_parent_directory(&control)?;
+        synchronize_parent_directory(&control, &file)?;
         recover_audit_file(&file)?;
         validate_private_file_identity(&control, &file)?;
         let mut records = Vec::new();
@@ -360,7 +354,7 @@ fn validate_private_file_identity(control: &Dir, file: &File) -> Result<(), Loca
 
     let opened = file.metadata().map_err(LocalAuditError::Io)?;
     let named = control
-        .symlink_metadata("mcp-audit.jsonl")
+        .symlink_metadata(AUDIT_FILE_NAME)
         .map_err(LocalAuditError::Io)?;
     if !opened.is_file()
         || !named.is_file()
@@ -370,11 +364,14 @@ fn validate_private_file_identity(control: &Dir, file: &File) -> Result<(), Loca
     {
         return Err(LocalAuditError::UnsafeFileIdentity);
     }
-    validate_private_permissions(&opened)
+    validate_private_permissions(&opened, file)
 }
 
 #[cfg(unix)]
-fn validate_private_permissions(metadata: &std::fs::Metadata) -> Result<(), LocalAuditError> {
+fn validate_private_permissions(
+    metadata: &std::fs::Metadata,
+    _file: &File,
+) -> Result<(), LocalAuditError> {
     use std::os::unix::fs::MetadataExt as _;
 
     if metadata.uid() != rustix::process::geteuid().as_raw() {
@@ -388,8 +385,17 @@ fn validate_private_permissions(metadata: &std::fs::Metadata) -> Result<(), Loca
 }
 
 #[cfg(windows)]
-fn validate_private_permissions(metadata: &std::fs::Metadata) -> Result<(), LocalAuditError> {
+fn validate_private_permissions(
+    metadata: &std::fs::Metadata,
+    file: &File,
+) -> Result<(), LocalAuditError> {
     use std::os::windows::fs::MetadataExt as _;
+    use win_security_identifier::{GetCurrentSid as _, SecurityIdentifier};
+    use windows_permissions::{
+        WindowsSecure as _,
+        constants::{AccessRights, AceType, SecurityInformation},
+        wrappers::ConvertSecurityDescriptorToStringSecurityDescriptor,
+    };
 
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
     if metadata.number_of_links() != Some(1)
@@ -397,11 +403,53 @@ fn validate_private_permissions(metadata: &std::fs::Metadata) -> Result<(), Loca
     {
         return Err(LocalAuditError::UnsafeFileIdentity);
     }
-    Err(LocalAuditError::PermissionProofUnavailable)
+
+    let current_user = SecurityIdentifier::get_current_user_sid()
+        .map_err(|_| LocalAuditError::PermissionProofUnavailable)?
+        .to_string();
+    let security = file
+        .security_descriptor(SecurityInformation::Owner | SecurityInformation::Dacl)
+        .map_err(LocalAuditError::Io)?;
+    let owner = security
+        .owner()
+        .ok_or(LocalAuditError::PermissionProofUnavailable)?;
+    if owner.to_string() != current_user {
+        return Err(LocalAuditError::OwnerMismatch);
+    }
+
+    let dacl = security
+        .dacl()
+        .ok_or(LocalAuditError::InsecurePermissions)?;
+    if dacl.len() != 1 {
+        return Err(LocalAuditError::InsecurePermissions);
+    }
+    let ace = dacl
+        .get_ace(0)
+        .ok_or(LocalAuditError::PermissionProofUnavailable)?;
+    if ace.ace_type() != AceType::ACCESS_ALLOWED_ACE_TYPE
+        || !ace.flags().is_empty()
+        || ace.mask() != AccessRights::FileAllAccess
+        || ace
+            .sid()
+            .is_none_or(|allowed| allowed.to_string() != current_user)
+    {
+        return Err(LocalAuditError::InsecurePermissions);
+    }
+
+    let dacl_sddl =
+        ConvertSecurityDescriptorToStringSecurityDescriptor(&security, SecurityInformation::Dacl)
+            .map_err(LocalAuditError::Io)?;
+    if !dacl_sddl.to_string_lossy().starts_with("D:P") {
+        return Err(LocalAuditError::InsecurePermissions);
+    }
+    Ok(())
 }
 
 #[cfg(not(any(unix, windows)))]
-fn validate_private_permissions(_metadata: &std::fs::Metadata) -> Result<(), LocalAuditError> {
+fn validate_private_permissions(
+    _metadata: &std::fs::Metadata,
+    _file: &File,
+) -> Result<(), LocalAuditError> {
     Err(LocalAuditError::PermissionProofUnavailable)
 }
 
@@ -511,6 +559,99 @@ const fn result_name(result: AuditResultClass) -> &'static str {
     }
 }
 
+#[cfg(not(windows))]
+fn open_audit_file(control: &Dir) -> Result<File, LocalAuditError> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).append(true).create(true);
+    options.follow(FollowSymlinks::No);
+    configure_private_creation(&mut options);
+    control
+        .open_with(AUDIT_FILE_NAME, &options)
+        .map(cap_std::fs::File::into_std)
+        .map_err(LocalAuditError::Io)
+}
+
+#[cfg(windows)]
+fn open_audit_file(control: &Dir) -> Result<File, LocalAuditError> {
+    let mut create_options = windows_audit_open_options(0);
+    create_options.create_new(true);
+    match control.open_with(AUDIT_FILE_NAME, &create_options) {
+        Ok(file) => {
+            let mut file = file.into_std();
+            if let Err(error) = initialize_private_windows_file(&mut file) {
+                drop(file);
+                let _ = control.remove_file(AUDIT_FILE_NAME);
+                return Err(error);
+            }
+            drop(file);
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(source) => return Err(LocalAuditError::Io(source)),
+    }
+
+    // Permit metadata and lock coordination handles, but never share delete access. That keeps
+    // the named endpoint stable for the lifetime of the audit sink.
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    let existing_options = windows_audit_open_options(FILE_SHARE_READ | FILE_SHARE_WRITE);
+    control
+        .open_with(AUDIT_FILE_NAME, &existing_options)
+        .map(cap_std::fs::File::into_std)
+        .map_err(LocalAuditError::Io)
+}
+
+#[cfg(windows)]
+fn windows_audit_open_options(share_mode: u32) -> OpenOptions {
+    use cap_std::fs::OpenOptionsExt as _;
+    use windows_permissions::constants::AccessRights;
+
+    let access = AccessRights::GenericRead
+        | AccessRights::GenericWrite
+        | AccessRights::ReadControl
+        | AccessRights::WriteDac
+        | AccessRights::WriteOwner;
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).append(true);
+    options.follow(FollowSymlinks::No);
+    options.access_mode(access.bits()).share_mode(share_mode);
+    options
+}
+
+#[cfg(windows)]
+fn initialize_private_windows_file(file: &mut File) -> Result<(), LocalAuditError> {
+    use win_security_identifier::{GetCurrentSid as _, SecurityIdentifier};
+    use windows_permissions::{
+        LocalBox, SecurityDescriptor,
+        constants::{SeObjectType, SecurityInformation},
+        wrappers::SetSecurityInfo,
+    };
+
+    let current_user = SecurityIdentifier::get_current_user_sid()
+        .map_err(|_| LocalAuditError::PermissionProofUnavailable)?
+        .to_string();
+    let descriptor: LocalBox<SecurityDescriptor> =
+        format!("O:{current_user}D:P(A;;FA;;;{current_user})")
+            .parse()
+            .map_err(LocalAuditError::Io)?;
+    let owner = descriptor
+        .owner()
+        .ok_or(LocalAuditError::PermissionProofUnavailable)?;
+    let dacl = descriptor
+        .dacl()
+        .ok_or(LocalAuditError::PermissionProofUnavailable)?;
+    SetSecurityInfo(
+        file,
+        SeObjectType::SE_FILE_OBJECT,
+        SecurityInformation::Owner | SecurityInformation::Dacl | SecurityInformation::ProtectedDacl,
+        Some(owner),
+        None,
+        Some(dacl),
+        None,
+    )
+    .map_err(LocalAuditError::Io)?;
+    file.sync_all().map_err(LocalAuditError::Io)
+}
+
 #[cfg(unix)]
 fn configure_private_creation(options: &mut OpenOptions) {
     use cap_std::fs::OpenOptionsExt as _;
@@ -524,7 +665,7 @@ fn configure_private_creation(options: &mut OpenOptions) {
 fn configure_private_creation(_options: &mut OpenOptions) {}
 
 #[cfg(unix)]
-fn synchronize_parent_directory(control: &Dir) -> Result<(), LocalAuditError> {
+fn synchronize_parent_directory(control: &Dir, _file: &File) -> Result<(), LocalAuditError> {
     use cap_std::fs::OpenOptionsExt as _;
 
     let mut options = OpenOptions::new();
@@ -537,8 +678,16 @@ fn synchronize_parent_directory(control: &Dir) -> Result<(), LocalAuditError> {
     directory.sync_all().map_err(LocalAuditError::Io)
 }
 
-#[cfg(not(unix))]
-fn synchronize_parent_directory(_control: &Dir) -> Result<(), LocalAuditError> {
+#[cfg(windows)]
+fn synchronize_parent_directory(_control: &Dir, file: &File) -> Result<(), LocalAuditError> {
+    // FlushFileBuffers commits the file's buffered data and metadata on Windows. The file has a
+    // fixed name and is opened without delete sharing, so no separate directory-handle flush is
+    // needed for endpoint identity during this session.
+    file.sync_all().map_err(LocalAuditError::Io)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn synchronize_parent_directory(_control: &Dir, _file: &File) -> Result<(), LocalAuditError> {
     Err(LocalAuditError::DirectoryDurabilityUnavailable)
 }
 
@@ -705,18 +854,15 @@ mod windows_tests {
 
     use market_squawk_platform::LocalPaths;
 
-    use super::{DurableAuditSink, LocalAuditError};
+    use super::DurableAuditSink;
 
     #[test]
-    fn audit_open_reports_unavailable_private_permission_proof() -> Result<(), Box<dyn Error>> {
+    fn audit_open_establishes_private_handle_permissions() -> Result<(), Box<dyn Error>> {
         let temporary = tempfile::tempdir()?;
         let paths = LocalPaths::prepare(temporary.path())?;
         let control = paths.control_root()?;
 
-        assert!(matches!(
-            DurableAuditSink::try_new(control.try_clone_directory()?),
-            Err(LocalAuditError::PermissionProofUnavailable)
-        ));
+        let _sink = DurableAuditSink::try_new(control.try_clone_directory()?)?;
         Ok(())
     }
 }

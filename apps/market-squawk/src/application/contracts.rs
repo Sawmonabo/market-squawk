@@ -22,6 +22,7 @@ const MAXIMUM_IDENTIFIER_BYTES: usize = 256;
 const MAXIMUM_TEXT_BYTES: usize = 4 * 1024;
 const MAXIMUM_FAIR_VALUE_INPUTS: usize = 4_096;
 const MAXIMUM_FAIR_VALUE_ACTOR_BYTES: usize = 128;
+const MAXIMUM_FAIR_VALUE_ROW_OFFSET: u64 = 999_999;
 
 const LOCAL_SCOPE: ToolScope = ToolScope::new(
     ScopeRequirement::NotApplicable,
@@ -92,10 +93,28 @@ const FAIR_VALUE_APPROVAL_ARGUMENTS: &[ArgumentSpec] = &[
     ArgumentSpec::required("approvedAt", ArgumentKind::Timestamp),
     ArgumentSpec::required("expiresAt", ArgumentKind::Timestamp),
 ];
-const BACKTEST_RUN_ARGUMENTS: &[ArgumentSpec] = &[
-    ArgumentSpec::required("strategyId", ArgumentKind::Identifier),
-    ArgumentSpec::required("experiment", ArgumentKind::Object),
+const MARKET_ACCESS_ARGUMENT: &[ArgumentSpec] = &[ArgumentSpec::required(
+    "assessmentId",
+    ArgumentKind::Identifier,
+)];
+const FAIR_VALUE_MARKET_ACCESS_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("accountId", ArgumentKind::Identifier),
+    ArgumentSpec::required("venueId", ArgumentKind::Identifier),
+    ArgumentSpec::required("instrumentId", ArgumentKind::Identifier),
+    ArgumentSpec::required(
+        "conclusion",
+        ArgumentKind::Enumeration(&["accessible", "inaccessible"]),
+    ),
+    ArgumentSpec::required("effectiveFrom", ArgumentKind::Timestamp),
+    ArgumentSpec::required("effectiveUntil", ArgumentKind::Timestamp),
+    ArgumentSpec::required("rationale", ArgumentKind::Text),
+    ArgumentSpec::required("preparedBy", ArgumentKind::Identifier),
+    ArgumentSpec::required("preparedAt", ArgumentKind::Timestamp),
+    ArgumentSpec::required("approvedBy", ArgumentKind::Identifier),
+    ArgumentSpec::required("approvedAt", ArgumentKind::Timestamp),
 ];
+const BACKTEST_RUN_ARGUMENTS: &[ArgumentSpec] =
+    &[ArgumentSpec::required("registration", ArgumentKind::Object)];
 const RUN_ARGUMENT: &[ArgumentSpec] = &[ArgumentSpec::required("runId", ArgumentKind::Identifier)];
 const BOT_START_ARGUMENTS: &[ArgumentSpec] = &[
     ArgumentSpec::required(
@@ -325,7 +344,7 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         "Analysis.RunBacktest",
         "Run one governed point-in-time backtest experiment.",
         ServiceDomain::Analysis,
-        DATA_SCOPE,
+        LOCAL_SCOPE,
         BACKTEST_RUN_ARGUMENTS,
         ToolAuthorization::LocalConfirmation,
     ),
@@ -424,6 +443,22 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         LOCAL_SCOPE,
         FAIR_VALUE_APPROVAL_ARGUMENTS,
         ToolAuthorization::LocalConfirmation,
+    ),
+    idempotent_mutation(
+        "FairValue.ApproveMarketAccess",
+        "Create or supersede one dual-approved account, venue, and instrument access assessment.",
+        ServiceDomain::FairValue,
+        LOCAL_SCOPE,
+        FAIR_VALUE_MARKET_ACCESS_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    read(
+        "FairValue.GetMarketAccess",
+        "Return one immutable dual-approved market-access assessment.",
+        ServiceDomain::FairValue,
+        LOCAL_SCOPE,
+        MARKET_ACCESS_ARGUMENT,
+        SourceEvidencePolicy::NotApplicable,
     ),
     read(
         "Bot.GetStatus",
@@ -1081,7 +1116,7 @@ fn fair_value_measurement_schema() -> Value {
                     "properties": {
                         "producer": {
                             "type": "string",
-                            "enum": ["live", "research", "analytics", "portfolio"]
+                            "enum": ["research", "analytics", "portfolio"]
                         },
                         "receiptId": {
                             "type": "string",
@@ -1096,6 +1131,73 @@ fn fair_value_measurement_schema() -> Value {
                     "required": ["producer", "receiptId", "significance"],
                     "additionalProperties": false
                 }
+            },
+            "producerSelections": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": MAXIMUM_FAIR_VALUE_INPUTS,
+                "items": {
+                    "oneOf": [
+                        {
+                            "type": "object",
+                            "properties": {
+                                "producer": {"type": "string", "const": "live"},
+                                "venueId": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": MAXIMUM_IDENTIFIER_BYTES
+                                },
+                                "selection": {
+                                    "type": "string",
+                                    "enum": ["trade", "bid", "ask"]
+                                },
+                                "significance": {
+                                    "type": "string",
+                                    "enum": ["significant", "not_significant"]
+                                }
+                            },
+                            "required": ["producer", "venueId", "selection", "significance"],
+                            "additionalProperties": false
+                        },
+                        {
+                            "type": "object",
+                            "properties": {
+                                "producer": {
+                                    "type": "string",
+                                    "enum": ["research", "analytics"]
+                                },
+                                "datasetId": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": MAXIMUM_IDENTIFIER_BYTES
+                                },
+                                "row": {
+                                    "type": "integer",
+                                    "minimum": 0,
+                                    "maximum": MAXIMUM_FAIR_VALUE_ROW_OFFSET
+                                },
+                                "significance": {
+                                    "type": "string",
+                                    "enum": ["significant", "not_significant"]
+                                }
+                            },
+                            "required": ["producer", "datasetId", "row", "significance"],
+                            "additionalProperties": false
+                        },
+                        {
+                            "type": "object",
+                            "properties": {
+                                "producer": {"type": "string", "const": "portfolio"},
+                                "significance": {
+                                    "type": "string",
+                                    "enum": ["significant", "not_significant"]
+                                }
+                            },
+                            "required": ["producer", "significance"],
+                            "additionalProperties": false
+                        }
+                    ]
+                }
             }
         },
         "required": [
@@ -1107,8 +1209,11 @@ fn fair_value_measurement_schema() -> Value {
             "measurementAt",
             "preparedAt",
             "preparedBy",
-            "method",
-            "producerReceipts"
+            "method"
+        ],
+        "anyOf": [
+            {"required": ["producerReceipts"]},
+            {"required": ["producerSelections"]}
         ],
         "additionalProperties": false
     })
@@ -1124,7 +1229,7 @@ fn admit_timestamp(value: &Value) -> Result<(), ToolInputError> {
 }
 
 fn admit_fair_value_measurement(value: &Value) -> Result<(), ToolInputError> {
-    const REQUIRED: [&str; 10] = [
+    const REQUIRED: [&str; 9] = [
         "accountId",
         "instrumentId",
         "amount",
@@ -1134,13 +1239,27 @@ fn admit_fair_value_measurement(value: &Value) -> Result<(), ToolInputError> {
         "preparedAt",
         "preparedBy",
         "method",
-        "producerReceipts",
     ];
     let measurement = value.as_object().ok_or(ToolInputError::Invalid)?;
-    if measurement.len() != REQUIRED.len()
-        || REQUIRED
-            .iter()
-            .any(|required| !measurement.contains_key(*required))
+    if REQUIRED
+        .iter()
+        .any(|required| !measurement.contains_key(*required))
+        || measurement.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "accountId"
+                    | "instrumentId"
+                    | "amount"
+                    | "currency"
+                    | "scale"
+                    | "measurementAt"
+                    | "preparedAt"
+                    | "preparedBy"
+                    | "method"
+                    | "producerReceipts"
+                    | "producerSelections"
+            )
+        })
     {
         return Err(ToolInputError::Invalid);
     }
@@ -1207,43 +1326,124 @@ fn admit_fair_value_measurement(value: &Value) -> Result<(), ToolInputError> {
     {
         return Err(ToolInputError::Invalid);
     }
-    let receipts = measurement
-        .get("producerReceipts")
-        .and_then(Value::as_array)
+    let receipts = optional_fair_value_array(measurement, "producerReceipts")?;
+    let selections = optional_fair_value_array(measurement, "producerSelections")?;
+    let input_count = receipts
+        .len()
+        .checked_add(selections.len())
         .ok_or(ToolInputError::Invalid)?;
-    if receipts.is_empty() || receipts.len() > MAXIMUM_FAIR_VALUE_INPUTS {
+    if input_count == 0 || input_count > MAXIMUM_FAIR_VALUE_INPUTS {
         return Err(ToolInputError::Invalid);
     }
     for receipt in receipts {
-        let receipt = receipt.as_object().ok_or(ToolInputError::Invalid)?;
-        if receipt.len() != 3
-            || receipt
-                .keys()
-                .any(|key| !matches!(key.as_str(), "producer" | "receiptId" | "significance"))
-        {
-            return Err(ToolInputError::Invalid);
-        }
-        if receipt
-            .get("producer")
-            .and_then(Value::as_str)
-            .is_none_or(|producer| {
-                !matches!(producer, "live" | "research" | "analytics" | "portfolio")
-            })
-            || receipt
-                .get("receiptId")
-                .and_then(Value::as_str)
-                .is_none_or(|identifier| !valid_identifier(identifier))
-            || receipt
-                .get("significance")
-                .and_then(Value::as_str)
-                .is_none_or(|significance| {
-                    !matches!(significance, "significant" | "not_significant")
-                })
-        {
-            return Err(ToolInputError::Invalid);
-        }
+        admit_fair_value_receipt(receipt)?;
+    }
+    for selection in selections {
+        admit_fair_value_selection(selection)?;
     }
     Ok(())
+}
+
+fn optional_fair_value_array<'value>(
+    measurement: &'value Map<String, Value>,
+    field: &str,
+) -> Result<&'value [Value], ToolInputError> {
+    measurement.get(field).map_or(Ok(&[][..]), |value| {
+        value
+            .as_array()
+            .filter(|values| !values.is_empty())
+            .map(Vec::as_slice)
+            .ok_or(ToolInputError::Invalid)
+    })
+}
+
+fn admit_fair_value_receipt(value: &Value) -> Result<(), ToolInputError> {
+    let receipt = value.as_object().ok_or(ToolInputError::Invalid)?;
+    if receipt.len() != 3
+        || receipt
+            .keys()
+            .any(|key| !matches!(key.as_str(), "producer" | "receiptId" | "significance"))
+        || receipt
+            .get("producer")
+            .and_then(Value::as_str)
+            .is_none_or(|producer| !matches!(producer, "research" | "analytics" | "portfolio"))
+        || receipt
+            .get("receiptId")
+            .and_then(Value::as_str)
+            .is_none_or(|identifier| !valid_identifier(identifier))
+    {
+        return Err(ToolInputError::Invalid);
+    }
+    admit_fair_value_significance(receipt)
+}
+
+fn admit_fair_value_selection(value: &Value) -> Result<(), ToolInputError> {
+    let selection = value.as_object().ok_or(ToolInputError::Invalid)?;
+    match selection.get("producer").and_then(Value::as_str) {
+        Some("live") => {
+            if selection.len() != 4
+                || selection.keys().any(|key| {
+                    !matches!(
+                        key.as_str(),
+                        "producer" | "venueId" | "selection" | "significance"
+                    )
+                })
+                || selection
+                    .get("venueId")
+                    .and_then(Value::as_str)
+                    .is_none_or(|identifier| !valid_identifier(identifier))
+                || selection
+                    .get("selection")
+                    .and_then(Value::as_str)
+                    .is_none_or(|selection| !matches!(selection, "trade" | "bid" | "ask"))
+            {
+                return Err(ToolInputError::Invalid);
+            }
+        }
+        Some("research" | "analytics") => {
+            if selection.len() != 4
+                || selection.keys().any(|key| {
+                    !matches!(
+                        key.as_str(),
+                        "producer" | "datasetId" | "row" | "significance"
+                    )
+                })
+                || selection
+                    .get("datasetId")
+                    .and_then(Value::as_str)
+                    .is_none_or(|identifier| !valid_identifier(identifier))
+                || selection
+                    .get("row")
+                    .and_then(Value::as_u64)
+                    .is_none_or(|row| row > MAXIMUM_FAIR_VALUE_ROW_OFFSET)
+            {
+                return Err(ToolInputError::Invalid);
+            }
+        }
+        Some("portfolio") => {
+            if selection.len() != 2
+                || selection
+                    .keys()
+                    .any(|key| !matches!(key.as_str(), "producer" | "significance"))
+            {
+                return Err(ToolInputError::Invalid);
+            }
+        }
+        _ => return Err(ToolInputError::Invalid),
+    }
+    admit_fair_value_significance(selection)
+}
+
+fn admit_fair_value_significance(value: &Map<String, Value>) -> Result<(), ToolInputError> {
+    if value
+        .get("significance")
+        .and_then(Value::as_str)
+        .is_some_and(|value| matches!(value, "significant" | "not_significant"))
+    {
+        Ok(())
+    } else {
+        Err(ToolInputError::Invalid)
+    }
 }
 
 fn valid_identifier(value: &str) -> bool {

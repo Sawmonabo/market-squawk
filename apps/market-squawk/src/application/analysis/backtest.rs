@@ -20,9 +20,11 @@ mod repository;
 
 pub use input_authority::{
     GovernedBacktestCorporateActionsInput, GovernedBacktestInputAuthorityLimits,
-    GovernedBacktestInputRegistrationInput, GovernedBacktestInputRegistrationReceipt,
+    GovernedBacktestInputRegistrar, GovernedBacktestInputRegistrationInput,
+    GovernedBacktestInputRegistrationJsonError, GovernedBacktestInputRegistrationReceipt,
     GovernedBacktestPortfolioSeedInput, GovernedBacktestQueryLimitsInput,
-    ProductionGovernedBacktestInputAuthority, ProductionGovernedBacktestInputAuthorityError,
+    MAX_GOVERNED_BACKTEST_REGISTRATION_REQUEST_BYTES, ProductionGovernedBacktestInputAuthority,
+    ProductionGovernedBacktestInputAuthorityError,
 };
 pub use repository::{
     GovernedBacktestInputResolver, GovernedBacktestRepositoryLimits,
@@ -513,21 +515,6 @@ fn map_backtest_error(error: ProductionBacktestServiceError) -> ServiceError {
         | ProductionBacktestServiceError::Experiment(_)
         | ProductionBacktestServiceError::Service(_) => ServiceError::Internal,
     }
-}
-
-pub(super) fn experiment_input_id(
-    experiment: &Map<String, Value>,
-) -> Result<SourceIdentifier, ServiceError> {
-    if experiment.len() != 1 || !experiment.contains_key("inputId") {
-        return Err(ServiceError::InvalidRequest);
-    }
-    experiment
-        .get("inputId")
-        .and_then(Value::as_str)
-        .ok_or(ServiceError::InvalidRequest)
-        .and_then(|value| {
-            SourceIdentifier::try_from(value).map_err(|_| ServiceError::InvalidRequest)
-        })
 }
 
 pub(super) fn canonical_run_id(value: &str) -> bool {

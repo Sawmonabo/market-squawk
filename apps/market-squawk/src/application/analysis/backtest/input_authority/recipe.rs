@@ -35,7 +35,11 @@ use policy::{
 };
 
 const INPUT_RECIPE_SCHEMA_VERSION: u16 = 1;
+const INPUT_REGISTRATION_SCHEMA_VERSION: u16 = 1;
 const MAX_INLINE_QUERY_BYTES: u64 = 256 * 1024;
+
+/// Maximum accepted encoded size of one governed-backtest registration request.
+pub const MAX_GOVERNED_BACKTEST_REGISTRATION_REQUEST_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Complete untrusted registration request for one immutable governed-backtest input.
 pub struct GovernedBacktestInputRegistrationInput {
@@ -57,6 +61,34 @@ pub struct GovernedBacktestInputRegistrationInput {
     pub experiment: BacktestExperimentPlan,
 }
 
+impl GovernedBacktestInputRegistrationInput {
+    /// Decodes one versioned closed JSON request through the durable recipe wire contract.
+    ///
+    /// Collection order, financial representations, point-in-time scope, query policy, and all
+    /// resource limits must already be canonical. Unknown fields and unsupported schema versions
+    /// are rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GovernedBacktestInputRegistrationJsonError::Invalid`] when JSON or any nested
+    /// domain value violates the closed registration contract. Returns
+    /// [`GovernedBacktestInputRegistrationJsonError::ResourceExhausted`] before decoding an
+    /// oversized request or when canonical reconstruction cannot reserve bounded memory.
+    pub fn try_from_json(bytes: &[u8]) -> Result<Self, GovernedBacktestInputRegistrationJsonError> {
+        let encoded_bytes = u64::try_from(bytes.len())
+            .map_err(|_| GovernedBacktestInputRegistrationJsonError::ResourceExhausted)?;
+        if bytes.is_empty() || encoded_bytes > MAX_GOVERNED_BACKTEST_REGISTRATION_REQUEST_BYTES {
+            return Err(GovernedBacktestInputRegistrationJsonError::ResourceExhausted);
+        }
+        let wire: InputRegistrationWire = serde_json::from_slice(bytes)
+            .map_err(|_| GovernedBacktestInputRegistrationJsonError::Invalid)?;
+        if wire.schema_version != INPUT_REGISTRATION_SCHEMA_VERSION {
+            return Err(GovernedBacktestInputRegistrationJsonError::Invalid);
+        }
+        wire.input.into_registration_input().map_err(Into::into)
+    }
+}
+
 impl fmt::Debug for GovernedBacktestInputRegistrationInput {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -68,6 +100,26 @@ impl fmt::Debug for GovernedBacktestInputRegistrationInput {
             .field("instrument_count", &self.instruments.len())
             .field("source_count", &self.sources.len())
             .finish_non_exhaustive()
+    }
+}
+
+/// Closed JSON decoding failure at the governed-backtest registration boundary.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum GovernedBacktestInputRegistrationJsonError {
+    /// JSON, schema version, canonical ordering, or a nested domain invariant was invalid.
+    #[error("governed-backtest registration JSON is invalid or noncanonical")]
+    Invalid,
+    /// The encoded request or bounded canonical reconstruction exceeded its resource contract.
+    #[error("governed-backtest registration JSON exceeded its resource contract")]
+    ResourceExhausted,
+}
+
+impl From<RecipeError> for GovernedBacktestInputRegistrationJsonError {
+    fn from(value: RecipeError) -> Self {
+        match value {
+            RecipeError::Invalid => Self::Invalid,
+            RecipeError::ResourceExhausted => Self::ResourceExhausted,
+        }
     }
 }
 
@@ -175,6 +227,13 @@ struct InputRecipeWire {
     expected: ExpectedEvidenceWire,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct InputRegistrationWire {
+    schema_version: u16,
+    input: InputCoreWire,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct InputCoreWire {
@@ -222,6 +281,40 @@ impl InputCoreWire {
         self.limits()?;
         self.experiment()?;
         Ok(())
+    }
+
+    fn into_registration_input(
+        self,
+    ) -> Result<GovernedBacktestInputRegistrationInput, RecipeError> {
+        self.validate()?;
+        let manifest = self.manifest.to_manifest()?;
+        let query_limits = self.query_limits.into_input()?;
+        let execution_assumptions = self.execution_assumptions.into_input()?;
+        let portfolio = self.portfolio.into_input()?;
+        let corporate_actions = self
+            .corporate_actions
+            .map(CorporateActionsWire::into_input)
+            .transpose()?;
+        let limits = self.limits.into_input()?;
+        let experiment = self.experiment.build()?;
+        Ok(GovernedBacktestInputRegistrationInput {
+            strategy_id: self.strategy_id,
+            manifest,
+            table_name: self.table_name,
+            sql: self.sql,
+            query_limits,
+            instruments: self.instruments,
+            starts_at: Timestamp::from_unix_nanos(self.starts_at_unix_nanos),
+            ends_at: Timestamp::from_unix_nanos(self.ends_at_unix_nanos),
+            definition_history_limit: self.definition_history_limit,
+            execution_assumptions,
+            portfolio,
+            corporate_actions,
+            sources: self.sources,
+            seed: self.seed,
+            limits,
+            experiment,
+        })
     }
 
     pub(super) fn manifest(&self) -> Result<DatasetManifestRef, RecipeError> {

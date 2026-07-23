@@ -21,6 +21,7 @@ pub mod analysis;
 mod contracts;
 mod domain_support;
 pub mod fair_value;
+mod live_fair_value;
 pub mod model;
 mod paper;
 mod research;
@@ -31,11 +32,13 @@ pub use fair_value::{
     AnalyticsFairValueInputPublisher, FairValueDomainService, FairValueInputAuthorityError,
     FairValueInputAuthorityLimitInput, FairValueInputAuthorityLimits,
     FairValueInputResolutionError, FairValueInputResolutionRequest, FairValueInputResolver,
-    FairValueProducerKind, FairValueReceiptReference, FairValueReceiptRegistration,
-    LiveFairValueInputPublisher, PortfolioFairValueInputPublisher,
+    FairValueProducerKind, FairValueProducerSelection, FairValueProducerSelectionAuthority,
+    FairValueProducerSelectionError, FairValueProducerSelectionRequest, FairValueReceiptReference,
+    FairValueReceiptRegistration, LiveFairValueInputPublisher, PortfolioFairValueInputPublisher,
     ProductionFairValueInputAuthority, ProductionFairValueInputResolver,
     ResearchFairValueInputPublisher,
 };
+pub use live_fair_value::{LiveFairValueObservationBuffer, LiveFairValueObservationBufferError};
 pub use paper::PaperApplicationServices;
 pub use research::{
     ManagedResearchExtractionSource, ProductionResearchIngestCoordinator,

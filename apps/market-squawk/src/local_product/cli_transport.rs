@@ -13,7 +13,7 @@ use serde_json::{Map, Value, json};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-use super::{LocalProduct, cli_dataset, cli_model, cli_portfolio};
+use super::{LocalProduct, cli_backtest, cli_dataset, cli_model, cli_portfolio, cli_provider};
 use crate::cli::{
     BacktestCommand, BotCommand, Command, DatasetCommand, ExecutionCommand, FairValueCommand,
     FeatureCommand, IngestCommand, ModelCommand, PortfolioCommand, QueryCommand, SourceCommand,
@@ -74,6 +74,12 @@ pub enum CliProductError {
     /// A production model bundle failed closed admission.
     #[error("{0}")]
     ModelAdmission(#[from] cli_model::CliModelAdmissionError),
+    /// A governed backtest input failed closed registration.
+    #[error("{0}")]
+    BacktestRegistration(#[from] cli_backtest::CliBacktestRegistrationError),
+    /// A verified provider activation request failed closed.
+    #[error("{0}")]
+    ProviderActivation(#[from] cli_provider::CliProviderActivationError),
     /// CLI-owned request limits are invalid.
     #[error("CLI request limits are invalid")]
     Limits,
@@ -143,6 +149,16 @@ async fn source(
             json_object(json!({"provider": provider, "confirm": confirm}))?,
             "source setup opened",
         ),
+        SourceCommand::Activate { request, confirm } => {
+            let value = cli_provider::activate_research_provider(
+                product,
+                &request,
+                confirm,
+                CancellationToken::new(),
+            )
+            .await?;
+            return direct_result(value, "source adapter activated");
+        }
     };
     invoke(product, operation, &mut arguments, None, summary).await
 }
@@ -350,8 +366,8 @@ async fn backtest(
 ) -> Result<CliProductResult, CliProductError> {
     let (operation, mut arguments, summary) = match command {
         BacktestCommand::Run { request, confirm } => {
-            let mut arguments = read_json_object(&request)?;
-            arguments.insert("confirm".to_owned(), Value::Bool(confirm));
+            let value = cli_backtest::register_backtest_input(&request, confirm).await?;
+            let arguments = json_object(value)?;
             ("Analysis.RunBacktest", arguments, "backtest completed")
         }
         BacktestCommand::Show { run } => (

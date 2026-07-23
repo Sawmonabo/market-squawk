@@ -14,7 +14,8 @@ use market_squawk_domain::{
     MetadataRevision, RevisionBoundPayloadEvidence, SourceId, SourceIdentifier, Timestamp,
 };
 use market_squawk_live::{
-    LiveRouteConfig, LiveRuntimeConfig, LiveSnapshotReader, RouteActionHook, ShardKey,
+    LiveRouteConfig, LiveRuntimeConfig, LiveSnapshotReader, RouteActionHook,
+    RouteQualifiedMarketExport, ShardKey,
 };
 use market_squawk_platform::{
     AppConfig, CaptureProcessInfrastructure, CaptureProcessInfrastructureLimits,
@@ -133,6 +134,34 @@ impl ProductionLiveSourceComposition {
         &self.routes
     }
 
+    pub(crate) fn validate_qualified_market_export_routes(
+        &self,
+        qualified_market_exports: &[RouteQualifiedMarketExport],
+    ) -> Result<(), ProductionLiveSourceRuntimeError> {
+        for (index, export) in qualified_market_exports.iter().enumerate() {
+            if qualified_market_exports[index.saturating_add(1)..]
+                .iter()
+                .any(|other| other.route() == export.route())
+            {
+                return Err(
+                    ProductionLiveSourceRuntimeError::DuplicateQualifiedMarketExportRoute {
+                        route: export.route().clone(),
+                    },
+                );
+            }
+        }
+        if self.routes.len() != qualified_market_exports.len()
+            || self.routes.iter().any(|route| {
+                !qualified_market_exports
+                    .iter()
+                    .any(|export| export.route() == route.route())
+            })
+        {
+            return Err(ProductionLiveSourceRuntimeError::QualifiedMarketExportRouteSetMismatch);
+        }
+        Ok(())
+    }
+
     #[cfg(all(test, debug_assertions))]
     pub(crate) fn with_local_kraken_endpoint_for_test(
         mut self,
@@ -218,6 +247,51 @@ impl ProductionLiveSourceComposition {
         .await
     }
 
+    /// Starts the sealed source with exact action hooks and one bounded export for every route.
+    ///
+    /// Route-set validation completes before local-path or capture initialization. Live-runtime
+    /// startup retains the complete export memory reservation and transfers every sender to its
+    /// exact route before source supervision can open the provider connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed route, startup, or rollback failure without leaving an unowned source,
+    /// export sender, or live runtime.
+    pub async fn start_with_action_hooks_and_qualified_market_exports(
+        self,
+        runtime_config: LiveRuntimeConfig,
+        action_hooks: Vec<RouteActionHook>,
+        qualified_market_exports: Vec<RouteQualifiedMarketExport>,
+        cancellation: CancellationToken,
+    ) -> Result<ProductionLiveSourceRuntime, ProductionLiveSourceRuntimeError> {
+        self.validate_qualified_market_export_routes(&qualified_market_exports)?;
+        let route_buffer_limits = RouteBufferLimits::new(
+            runtime_config.mailbox_count_per_shard(),
+            runtime_config.maximum_message_bytes(),
+        );
+        let paths = LocalPaths::prepare(self.config.data_dir())?;
+        let capture_process =
+            initialize_capture_process_infrastructure(CaptureProcessInfrastructureLimits::new(
+                self.config
+                    .capture_destination_registry_memory_ceiling_bytes(),
+            ))?;
+        let live = LiveRuntimeComposition::start_with_action_hooks_and_qualified_market_exports(
+            runtime_config,
+            self.routes.clone(),
+            action_hooks,
+            qualified_market_exports,
+        )
+        .await?;
+        self.start_on_live_runtime(
+            live,
+            route_buffer_limits,
+            paths,
+            capture_process,
+            cancellation,
+        )
+        .await
+    }
+
     async fn start_on_live_runtime(
         self,
         live: LiveRuntimeComposition,
@@ -246,7 +320,7 @@ impl ProductionLiveSourceComposition {
                     Ok(_shutdown) => Err(ProductionLiveSourceRuntimeError::Supervisor(source)),
                     Err(rollback) => Err(
                         ProductionLiveSourceRuntimeError::SupervisorStartupRollback {
-                            source,
+                            source: Box::new(source),
                             rollback,
                         },
                     ),
@@ -796,6 +870,10 @@ pub enum ProductionLiveSourceRuntimeError {
     Paths(#[from] PathError),
     #[error(transparent)]
     CaptureInfrastructure(#[from] DestinationFenceRegistryInitializationError),
+    #[error("qualified-market exports do not exactly cover every production source route")]
+    QualifiedMarketExportRouteSetMismatch,
+    #[error("qualified-market exports contain duplicate ownership for route {route:?}")]
+    DuplicateQualifiedMarketExportRoute { route: ShardKey },
     #[error(transparent)]
     LiveRuntime(#[from] LiveRuntimeCompositionError),
     #[error(transparent)]
@@ -805,7 +883,7 @@ pub enum ProductionLiveSourceRuntimeError {
     #[error("source supervisor startup failed and live-runtime rollback also failed")]
     SupervisorStartupRollback {
         #[source]
-        source: ProductionSupervisorError,
+        source: Box<ProductionSupervisorError>,
         rollback: LiveRuntimeCompositionError,
     },
     #[error("source startup task failed and live-runtime rollback also failed")]

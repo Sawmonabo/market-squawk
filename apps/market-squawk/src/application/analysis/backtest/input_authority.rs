@@ -33,7 +33,8 @@ use resolution::BacktestInputMaterializer;
 
 pub use recipe::{
     GovernedBacktestCorporateActionsInput, GovernedBacktestInputRegistrationInput,
-    GovernedBacktestPortfolioSeedInput, GovernedBacktestQueryLimitsInput,
+    GovernedBacktestInputRegistrationJsonError, GovernedBacktestPortfolioSeedInput,
+    GovernedBacktestQueryLimitsInput, MAX_GOVERNED_BACKTEST_REGISTRATION_REQUEST_BYTES,
 };
 
 const INPUT_INDEX_DIRECTORY: &str = "analysis/governed-backtest-inputs";
@@ -96,6 +97,18 @@ impl GovernedBacktestInputAuthorityLimits {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GovernedBacktestInputRegistrationReceipt {
     command: GovernedBacktestCommand,
+}
+
+/// Least-authority registration capability consumed by the Analysis application service.
+#[async_trait]
+pub trait GovernedBacktestInputRegistrar: Send + Sync + 'static {
+    /// Materializes and durably registers one complete immutable input recipe.
+    async fn register_input(
+        &self,
+        input: GovernedBacktestInputRegistrationInput,
+        cancellation: CancellationToken,
+        deadline: Instant,
+    ) -> Result<GovernedBacktestInputRegistrationReceipt, ServiceError>;
 }
 
 impl GovernedBacktestInputRegistrationReceipt {
@@ -204,6 +217,18 @@ impl ProductionGovernedBacktestInputAuthority {
         worker.await.map_err(|_| ServiceError::Internal)??;
         ensure_operation_live(&cancellation, &self.lifecycle, deadline)?;
         Ok(GovernedBacktestInputRegistrationReceipt { command })
+    }
+}
+
+#[async_trait]
+impl GovernedBacktestInputRegistrar for ProductionGovernedBacktestInputAuthority {
+    async fn register_input(
+        &self,
+        input: GovernedBacktestInputRegistrationInput,
+        cancellation: CancellationToken,
+        deadline: Instant,
+    ) -> Result<GovernedBacktestInputRegistrationReceipt, ServiceError> {
+        self.register(input, cancellation, deadline).await
     }
 }
 
