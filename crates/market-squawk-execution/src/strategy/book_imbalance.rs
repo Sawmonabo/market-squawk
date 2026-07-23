@@ -24,6 +24,10 @@ pub const PAPER_BOOK_IMBALANCE_MAXIMUM_SLIPPAGE_BASIS_POINTS: i32 = 100;
 /// The built-in paper signal emits exactly one instrument lot.
 pub const PAPER_BOOK_IMBALANCE_ORDER_QUANTITY_LOTS: i64 = 1;
 
+const PAPER_BOOK_IMBALANCE_MAXIMUM_SPREAD_TICKS: i64 = 5;
+const PAPER_BOOK_IMBALANCE_MINIMUM_MAGNITUDE_NUMERATOR: i128 = 1;
+const PAPER_BOOK_IMBALANCE_MINIMUM_MAGNITUDE_DENOMINATOR: u128 = 5;
+
 /// Untrusted identities and exact guards for one route-owned built-in paper strategy.
 #[derive(Debug)]
 pub struct BookImbalancePaperStrategyConfigInput {
@@ -74,6 +78,9 @@ impl BookImbalancePaperStrategyConfig {
         if input.maximum_spread.get() <= 0 {
             return Err(BookImbalancePaperStrategyConfigError::NonPositiveMaximumSpread);
         }
+        if input.maximum_spread.get() > PAPER_BOOK_IMBALANCE_MAXIMUM_SPREAD_TICKS {
+            return Err(BookImbalancePaperStrategyConfigError::MaximumSpreadAboveCodeOwnedLimit);
+        }
         let minimum_numerator = u128::try_from(input.minimum_book_imbalance.numerator())
             .map_err(|_| BookImbalancePaperStrategyConfigError::NonPositiveBookImbalance)?;
         if minimum_numerator == 0 {
@@ -81,6 +88,14 @@ impl BookImbalancePaperStrategyConfig {
         }
         if minimum_numerator > input.minimum_book_imbalance.denominator().get() {
             return Err(BookImbalancePaperStrategyConfigError::BookImbalanceAboveOne);
+        }
+        let code_owned_minimum = ExactFeatureRatio::try_new(
+            PAPER_BOOK_IMBALANCE_MINIMUM_MAGNITUDE_NUMERATOR,
+            PAPER_BOOK_IMBALANCE_MINIMUM_MAGNITUDE_DENOMINATOR,
+        )
+        .map_err(|_| BookImbalancePaperStrategyConfigError::BuiltInFeatureIdentity)?;
+        if ratio_magnitude_cmp(input.minimum_book_imbalance, code_owned_minimum) == Ordering::Less {
+            return Err(BookImbalancePaperStrategyConfigError::BookImbalanceBelowCodeOwnedMinimum);
         }
         let spread_key =
             FeatureKey::try_new(RequiredLiveFeature::Spread.name(), NonZeroU32::MIN)
@@ -146,12 +161,18 @@ pub enum BookImbalancePaperStrategyConfigError {
     /// The maximum accepted spread must be a positive tick count.
     #[error("paper strategy maximum spread must be positive")]
     NonPositiveMaximumSpread,
+    /// The configured spread guard would permit a signal above the code-owned five-tick ceiling.
+    #[error("paper strategy maximum spread exceeds the code-owned limit")]
+    MaximumSpreadAboveCodeOwnedLimit,
     /// The required buy-side imbalance must be strictly positive.
     #[error("paper strategy book-imbalance threshold must be positive")]
     NonPositiveBookImbalance,
     /// Top-of-book imbalance cannot exceed its exact mathematical maximum.
     #[error("paper strategy book-imbalance threshold must not exceed one")]
     BookImbalanceAboveOne,
+    /// The configured magnitude guard would weaken the code-owned one-fifth threshold.
+    #[error("paper strategy book-imbalance threshold is below the code-owned minimum")]
+    BookImbalanceBelowCodeOwnedMinimum,
     /// A code-owned required feature name or version became invalid.
     #[error("paper strategy built-in feature identity is invalid")]
     BuiltInFeatureIdentity,
@@ -216,7 +237,7 @@ impl BookImbalancePaperStrategy {
         let FeatureScalar::ExactRatio(imbalance) = imbalance else {
             return Err(StrategyError::Evaluation);
         };
-        Ok(nonnegative_ratio_cmp(imbalance, self.config.minimum_book_imbalance) != Ordering::Less)
+        Ok(ratio_magnitude_cmp(imbalance, self.config.minimum_book_imbalance) != Ordering::Less)
     }
 
     fn try_emit(
@@ -293,13 +314,9 @@ impl Strategy for BookImbalancePaperStrategy {
     }
 }
 
-fn nonnegative_ratio_cmp(left: ExactFeatureRatio, right: ExactFeatureRatio) -> Ordering {
-    let Ok(mut left_numerator) = u128::try_from(left.numerator()) else {
-        return Ordering::Less;
-    };
-    let Ok(mut right_numerator) = u128::try_from(right.numerator()) else {
-        return Ordering::Greater;
-    };
+fn ratio_magnitude_cmp(left: ExactFeatureRatio, right: ExactFeatureRatio) -> Ordering {
+    let mut left_numerator = left.numerator().unsigned_abs();
+    let mut right_numerator = right.numerator().unsigned_abs();
     let mut left_denominator = left.denominator().get();
     let mut right_denominator = right.denominator().get();
     let mut reversed = false;
@@ -338,7 +355,7 @@ const fn maybe_reverse(ordering: Ordering, reversed: bool) -> Ordering {
 
 #[cfg(test)]
 mod tests {
-    use std::{num::NonZeroU32, str::FromStr};
+    use std::{cmp::Ordering, num::NonZeroU32, str::FromStr};
 
     use market_squawk_analytics::{FeatureError, FeatureValue};
     use market_squawk_domain::{
@@ -361,6 +378,7 @@ mod tests {
         BookImbalancePaperStrategy, BookImbalancePaperStrategyConfig,
         BookImbalancePaperStrategyConfigError, BookImbalancePaperStrategyConfigInput,
         ExactFeatureRatio, FeatureKey, FeatureScalar, LiveFeatureView, RequiredLiveFeature,
+        ratio_magnitude_cmp,
     };
 
     #[derive(Debug)]
@@ -553,6 +571,14 @@ mod tests {
             paper_strategy_config(5, 6, 5)?,
             Err(BookImbalancePaperStrategyConfigError::BookImbalanceAboveOne)
         ));
+        assert!(matches!(
+            paper_strategy_config(6, 1, 5)?,
+            Err(BookImbalancePaperStrategyConfigError::MaximumSpreadAboveCodeOwnedLimit)
+        ));
+        assert!(matches!(
+            paper_strategy_config(5, 1, 100)?,
+            Err(BookImbalancePaperStrategyConfigError::BookImbalanceBelowCodeOwnedMinimum)
+        ));
         Ok(())
     }
 
@@ -575,8 +601,16 @@ mod tests {
         let assessment = QualificationAssessmentId::new(SourceIdentifier::try_from(
             "paper-strategy-assessment",
         )?);
-        let ready_features = PaperSignalFeatureView::try_ready(5, 1, 3)?;
+        let ready_features = PaperSignalFeatureView::try_ready(5, -1, 5)?;
         let book = paper_market_event(LiveEventClass::BookSnapshot)?;
+
+        assert_eq!(
+            ratio_magnitude_cmp(
+                ExactFeatureRatio::try_new(i128::MIN, u128::MAX)?,
+                ExactFeatureRatio::try_new(1, 5)?,
+            ),
+            Ordering::Greater
+        );
 
         let wrong_route = market_squawk_live::ShardKey::new(
             VenueId::try_from("wrong-paper-route")?,
@@ -593,7 +627,7 @@ mod tests {
         let trade = paper_market_event(LiveEventClass::Trade)?;
         assert!(strategy.on_market_event(&context, &trade)?.is_empty());
 
-        let below_threshold = PaperSignalFeatureView::try_ready(5, 1, 6)?;
+        let below_threshold = PaperSignalFeatureView::try_ready(5, -1, 6)?;
         let below_context =
             StrategyContext::from_committed(&route, &assessment, market, &below_threshold);
         assert!(strategy.on_market_event(&below_context, &book)?.is_empty());
