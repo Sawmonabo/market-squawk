@@ -7,10 +7,13 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 
 use crate::{
-    JsonStructureLimits, ProgressError, RequestContext, ServiceContractError, TypedToolResult,
-    validate_json_contract,
+    JsonStructureLimits, ProgressError, RequestContext, ScopeRequirement, ServiceContractError,
+    TOOL_CONFIRMATION_FIELD, TOOL_INSTRUMENT_IDS_FIELD, TOOL_RESULT_LIMITS_FIELD,
+    TOOL_SOURCE_COVERAGE_FIELD, TOOL_TIME_RANGE_FIELD, ToolAuthorization, ToolContract, ToolScope,
+    TypedToolResult, validate_json_contract,
 };
 
+const CONTRACT_METADATA_KEY: &str = "org.market-squawk/tool-contract";
 const MAXIMUM_TOOL_NAME_BYTES: usize = 128;
 const MAXIMUM_TOOL_VERSION_BYTES: usize = 64;
 const MAXIMUM_TOOL_DESCRIPTION_BYTES: usize = 1024;
@@ -27,6 +30,7 @@ pub struct ToolDescriptor {
     description: Arc<str>,
     input_schema: Map<String, Value>,
     input_schema_bytes: usize,
+    contract: ToolContract,
     metadata: Map<String, Value>,
     effects: ToolEffects,
     input_admission: Arc<dyn ToolInputAdmission>,
@@ -41,6 +45,7 @@ impl fmt::Debug for ToolDescriptor {
             .field("description", &self.description)
             .field("input_schema", &"[INPUT SCHEMA REDACTED]")
             .field("input_schema_bytes", &self.input_schema_bytes)
+            .field("contract", &self.contract)
             .field("metadata", &"[PUBLIC METADATA REDACTED]")
             .field("effects", &self.effects)
             .field("input_admission", &"[TYPED ADMISSION REDACTED]")
@@ -59,6 +64,7 @@ impl ToolDescriptor {
         version: impl Into<Arc<str>>,
         description: impl Into<Arc<str>>,
         input_schema: Value,
+        contract: ToolContract,
         effects: ToolEffects,
         input_admission: A,
     ) -> Result<Self, ServiceCapabilityError>
@@ -100,19 +106,45 @@ impl ToolDescriptor {
         let Value::Object(input_schema) = bounded_schema else {
             return Err(ServiceCapabilityError::InvalidSchema);
         };
+        if !contract.is_compatible_with_effects(effects.read_only())
+            || !schema_matches_scope(&input_schema, contract.scope())
+            || (!matches!(contract.authorization(), ToolAuthorization::ReadOnly)
+                && !schema_requires_confirmation(&input_schema))
+        {
+            return Err(ServiceCapabilityError::InvalidContract);
+        }
+        let contract_metadata = contract
+            .metadata_value()
+            .map_err(|_| ServiceCapabilityError::InvalidContract)?;
+        if !contract_metadata.is_object() {
+            return Err(ServiceCapabilityError::InvalidContract);
+        }
+        let mut metadata = Map::new();
+        metadata.insert(CONTRACT_METADATA_KEY.to_owned(), contract_metadata);
+        let metadata_limits = JsonStructureLimits::try_new(8, 4 * 1024, 128, 128)
+            .map_err(|_| ServiceCapabilityError::InvalidContract)?;
+        validate_json_contract(
+            &Value::Object(metadata.clone()),
+            metadata_limits,
+            MAXIMUM_DESCRIPTOR_METADATA_BYTES,
+        )
+        .map_err(|_| ServiceCapabilityError::InvalidContract)?;
         Ok(Self {
             name,
             version,
             description,
             input_schema,
             input_schema_bytes,
-            metadata: Map::new(),
+            contract,
+            metadata,
             effects,
             input_admission: Arc::new(input_admission),
         })
     }
 
     /// Adds bounded public extension metadata advertised with this operation.
+    ///
+    /// The code-owned operation contract remains reserved and cannot be replaced by callers.
     ///
     /// # Errors
     ///
@@ -121,16 +153,19 @@ impl ToolDescriptor {
     pub fn try_with_metadata(mut self, metadata: Value) -> Result<Self, ServiceCapabilityError> {
         let metadata_limits = JsonStructureLimits::try_new(8, 4 * 1024, 128, 128)
             .map_err(|_| ServiceCapabilityError::InvalidMetadata)?;
+        let Value::Object(metadata) = metadata else {
+            return Err(ServiceCapabilityError::InvalidMetadata);
+        };
+        if metadata.contains_key(CONTRACT_METADATA_KEY) {
+            return Err(ServiceCapabilityError::ReservedMetadata);
+        }
+        self.metadata.extend(metadata);
         validate_json_contract(
-            &metadata,
+            &Value::Object(self.metadata.clone()),
             metadata_limits,
             MAXIMUM_DESCRIPTOR_METADATA_BYTES,
         )
         .map_err(|_| ServiceCapabilityError::InvalidMetadata)?;
-        let Value::Object(metadata) = metadata else {
-            return Err(ServiceCapabilityError::InvalidMetadata);
-        };
-        self.metadata = metadata;
         Ok(self)
     }
 
@@ -156,6 +191,12 @@ impl ToolDescriptor {
     #[must_use]
     pub const fn input_schema(&self) -> &Map<String, Value> {
         &self.input_schema
+    }
+
+    /// Complete typed operation contract carried into dispatch.
+    #[must_use]
+    pub const fn contract(&self) -> ToolContract {
+        self.contract
     }
 
     /// Bounded public extension metadata for transport capability discovery.
@@ -189,11 +230,18 @@ impl ToolDescriptor {
         let Value::Object(arguments) = bounded_arguments else {
             return Err(ServiceError::Internal);
         };
+        if !matches!(self.contract.authorization(), ToolAuthorization::ReadOnly)
+            && arguments.get(TOOL_CONFIRMATION_FIELD) != Some(&Value::Bool(true))
+        {
+            return Err(ServiceError::InvalidRequest);
+        }
         self.input_admission
             .admit(&arguments)
             .map_err(|_| ServiceError::InvalidRequest)?;
         Ok(TypedToolRequest {
             name: Arc::clone(&self.name),
+            version: Arc::clone(&self.version),
+            contract: self.contract,
             arguments,
         })
     }
@@ -308,6 +356,67 @@ fn valid_tool_name(name: &str) -> bool {
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
+fn schema_requires_confirmation(schema: &Map<String, Value>) -> bool {
+    let required = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .is_some_and(|required| {
+            required
+                .iter()
+                .any(|field| field == TOOL_CONFIRMATION_FIELD)
+        });
+    let confirms_true = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .and_then(|properties| properties.get(TOOL_CONFIRMATION_FIELD))
+        .and_then(Value::as_object)
+        .and_then(|confirmation| confirmation.get("const"))
+        == Some(&Value::Bool(true));
+    required && confirms_true
+}
+
+fn schema_matches_scope(schema: &Map<String, Value>, scope: ToolScope) -> bool {
+    let properties = match schema.get("properties") {
+        Some(Value::Object(properties)) => Some(properties),
+        Some(_) => return false,
+        None => None,
+    };
+    let mut required_fields = HashSet::new();
+    match schema.get("required") {
+        Some(Value::Array(required)) => {
+            for field in required {
+                let Some(field) = field.as_str() else {
+                    return false;
+                };
+                if !required_fields.insert(field)
+                    || !properties.is_some_and(|properties| properties.contains_key(field))
+                {
+                    return false;
+                }
+            }
+        }
+        Some(_) => return false,
+        None => {}
+    }
+
+    [
+        (TOOL_INSTRUMENT_IDS_FIELD, scope.instruments()),
+        (TOOL_TIME_RANGE_FIELD, scope.time_range()),
+        (TOOL_RESULT_LIMITS_FIELD, scope.result_limits()),
+        (TOOL_SOURCE_COVERAGE_FIELD, scope.source_coverage()),
+    ]
+    .into_iter()
+    .all(|(field, requirement)| {
+        let declared = properties.is_some_and(|properties| properties.contains_key(field));
+        let required = required_fields.contains(field);
+        match requirement {
+            ScopeRequirement::Required => declared && required,
+            ScopeRequirement::Optional => declared && !required,
+            ScopeRequirement::NotApplicable => !declared,
+        }
+    })
+}
+
 /// Validated, deterministic application-service capability set.
 #[derive(Clone, Debug, Default)]
 pub struct ServiceCapabilities {
@@ -382,6 +491,12 @@ pub enum ServiceCapabilityError {
     /// Public descriptor metadata is not a bounded JSON object.
     #[error("service tool metadata must be a bounded object")]
     InvalidMetadata,
+    /// Public metadata attempted to replace the code-owned operation contract.
+    #[error("service tool contract metadata is reserved")]
+    ReservedMetadata,
+    /// Contract authority or typed confirmation contradicts the operation effects or schema.
+    #[error("service tool contract is inconsistent")]
+    InvalidContract,
     /// Side-effect annotations contradict each other.
     #[error("service tool effect annotations are inconsistent")]
     InvalidEffects,
@@ -400,6 +515,8 @@ pub enum ServiceCapabilityError {
 #[derive(Clone)]
 pub struct TypedToolRequest {
     name: Arc<str>,
+    version: Arc<str>,
+    contract: ToolContract,
     arguments: Map<String, Value>,
 }
 
@@ -408,6 +525,18 @@ impl TypedToolRequest {
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Exact descriptor version admitted with this request.
+    #[must_use]
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+
+    /// Complete operation contract admitted with this request.
+    #[must_use]
+    pub const fn contract(&self) -> ToolContract {
+        self.contract
     }
 
     /// Schema-admitted argument object.
@@ -422,6 +551,8 @@ impl fmt::Debug for TypedToolRequest {
         formatter
             .debug_struct("TypedToolRequest")
             .field("name", &self.name)
+            .field("version", &self.version)
+            .field("contract", &self.contract)
             .field("arguments", &"[ARGUMENTS REDACTED]")
             .finish()
     }

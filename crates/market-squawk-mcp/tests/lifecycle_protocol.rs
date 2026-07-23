@@ -18,8 +18,12 @@ use market_squawk_mcp::{
     MutationAuditBundle, MutationAuditReservation, ServerError, ServerExit,
 };
 use market_squawk_services::{
-    ProgressError, RequestContext, ServiceCapabilities, ServiceError, ToolDescriptor, ToolEffects,
-    ToolInputError, ToolServices, TypedToolRequest, TypedToolResult,
+    ProgressError, RequestContext, ScopeRequirement, ServiceCapabilities, ServiceCapabilityError,
+    ServiceDomain, ServiceError, SourceEvidencePolicy, TOOL_INSTRUMENT_IDS_FIELD,
+    TOOL_RESULT_LIMITS_FIELD, TOOL_SOURCE_COVERAGE_FIELD, TOOL_TIME_RANGE_FIELD,
+    ToolArtifactPolicy, ToolAuthorization, ToolContract, ToolDescriptor, ToolEffects,
+    ToolInputError, ToolResultMetadata, ToolResultPolicy, ToolScope, ToolServices,
+    TypedToolRequest, TypedToolResult,
 };
 use rmcp::model::{
     Notification, NumberOrString, ProgressNotificationParam, ProgressToken, ServerJsonRpcMessage,
@@ -425,6 +429,194 @@ struct WaitingService {
     calls: AtomicUsize,
 }
 
+#[derive(Clone, Copy)]
+struct RegistryEntry {
+    name: &'static str,
+    domain: ServiceDomain,
+    scope: ToolScope,
+}
+
+const NO_SCOPE: ToolScope = ToolScope::new(
+    ScopeRequirement::NotApplicable,
+    ScopeRequirement::NotApplicable,
+    ScopeRequirement::NotApplicable,
+    ScopeRequirement::NotApplicable,
+);
+
+const COMPLETE_REGISTRY: [RegistryEntry; 11] = [
+    RegistryEntry {
+        name: "Analysis.Test",
+        domain: ServiceDomain::Analysis,
+        scope: ToolScope::new(
+            ScopeRequirement::Required,
+            ScopeRequirement::Required,
+            ScopeRequirement::Required,
+            ScopeRequirement::Required,
+        ),
+    },
+    RegistryEntry {
+        name: "Bot.Test",
+        domain: ServiceDomain::Bot,
+        scope: NO_SCOPE,
+    },
+    RegistryEntry {
+        name: "Execution.Test",
+        domain: ServiceDomain::Execution,
+        scope: ToolScope::new(
+            ScopeRequirement::Required,
+            ScopeRequirement::NotApplicable,
+            ScopeRequirement::Required,
+            ScopeRequirement::Required,
+        ),
+    },
+    RegistryEntry {
+        name: "FairValue.Test",
+        domain: ServiceDomain::FairValue,
+        scope: ToolScope::new(
+            ScopeRequirement::Required,
+            ScopeRequirement::Required,
+            ScopeRequirement::Optional,
+            ScopeRequirement::Required,
+        ),
+    },
+    RegistryEntry {
+        name: "Fundamental.Test",
+        domain: ServiceDomain::Fundamental,
+        scope: ToolScope::new(
+            ScopeRequirement::Optional,
+            ScopeRequirement::Required,
+            ScopeRequirement::Optional,
+            ScopeRequirement::Required,
+        ),
+    },
+    RegistryEntry {
+        name: "Macro.Test",
+        domain: ServiceDomain::Macro,
+        scope: ToolScope::new(
+            ScopeRequirement::NotApplicable,
+            ScopeRequirement::Required,
+            ScopeRequirement::Optional,
+            ScopeRequirement::Required,
+        ),
+    },
+    RegistryEntry {
+        name: "Market.Wait",
+        domain: ServiceDomain::Market,
+        scope: NO_SCOPE,
+    },
+    RegistryEntry {
+        name: "Model.Test",
+        domain: ServiceDomain::Model,
+        scope: ToolScope::new(
+            ScopeRequirement::Optional,
+            ScopeRequirement::Optional,
+            ScopeRequirement::Optional,
+            ScopeRequirement::Required,
+        ),
+    },
+    RegistryEntry {
+        name: "Portfolio.Test",
+        domain: ServiceDomain::Portfolio,
+        scope: ToolScope::new(
+            ScopeRequirement::Optional,
+            ScopeRequirement::Required,
+            ScopeRequirement::Optional,
+            ScopeRequirement::Required,
+        ),
+    },
+    RegistryEntry {
+        name: "Research.Test",
+        domain: ServiceDomain::Research,
+        scope: ToolScope::new(
+            ScopeRequirement::Optional,
+            ScopeRequirement::Required,
+            ScopeRequirement::Required,
+            ScopeRequirement::Required,
+        ),
+    },
+    RegistryEntry {
+        name: "Source.Test",
+        domain: ServiceDomain::Source,
+        scope: ToolScope::new(
+            ScopeRequirement::NotApplicable,
+            ScopeRequirement::NotApplicable,
+            ScopeRequirement::Optional,
+            ScopeRequirement::Required,
+        ),
+    },
+];
+
+fn read_only_contract(domain: ServiceDomain, scope: ToolScope) -> ToolContract {
+    let source_evidence = match scope.source_coverage() {
+        ScopeRequirement::NotApplicable => SourceEvidencePolicy::NotApplicable,
+        ScopeRequirement::Required | ScopeRequirement::Optional => SourceEvidencePolicy::Required,
+    };
+    ToolContract::new(
+        domain,
+        ToolAuthorization::ReadOnly,
+        scope,
+        ToolResultPolicy::new(source_evidence, ToolArtifactPolicy::OpaqueOnOverflow),
+    )
+}
+
+fn registry_schema(scope: ToolScope) -> Value {
+    let mut properties = serde_json::Map::new();
+    let mut required = Vec::new();
+    for (name, requirement) in [
+        (TOOL_INSTRUMENT_IDS_FIELD, scope.instruments()),
+        (TOOL_TIME_RANGE_FIELD, scope.time_range()),
+        (TOOL_RESULT_LIMITS_FIELD, scope.result_limits()),
+        (TOOL_SOURCE_COVERAGE_FIELD, scope.source_coverage()),
+    ] {
+        if !matches!(requirement, ScopeRequirement::NotApplicable) {
+            properties.insert(name.to_owned(), json!({"type":"object"}));
+        }
+        if matches!(requirement, ScopeRequirement::Required) {
+            required.push(Value::String(name.to_owned()));
+        }
+    }
+    let mut schema = serde_json::Map::new();
+    schema.insert("type".to_owned(), Value::String("object".to_owned()));
+    schema.insert("properties".to_owned(), Value::Object(properties));
+    if !required.is_empty() {
+        schema.insert("required".to_owned(), Value::Array(required));
+    }
+    schema.insert("additionalProperties".to_owned(), Value::Bool(false));
+    Value::Object(schema)
+}
+
+fn admit_registry_scope(
+    arguments: &serde_json::Map<String, Value>,
+    scope: ToolScope,
+) -> Result<(), ToolInputError> {
+    for (name, requirement) in [
+        (TOOL_INSTRUMENT_IDS_FIELD, scope.instruments()),
+        (TOOL_TIME_RANGE_FIELD, scope.time_range()),
+        (TOOL_RESULT_LIMITS_FIELD, scope.result_limits()),
+        (TOOL_SOURCE_COVERAGE_FIELD, scope.source_coverage()),
+    ] {
+        if matches!(requirement, ScopeRequirement::Required) && !arguments.contains_key(name) {
+            return Err(ToolInputError::Invalid);
+        }
+        if matches!(requirement, ScopeRequirement::NotApplicable) && arguments.contains_key(name) {
+            return Err(ToolInputError::Invalid);
+        }
+    }
+    arguments
+        .keys()
+        .all(|name| {
+            [
+                TOOL_INSTRUMENT_IDS_FIELD,
+                TOOL_TIME_RANGE_FIELD,
+                TOOL_RESULT_LIMITS_FIELD,
+                TOOL_SOURCE_COVERAGE_FIELD,
+            ]
+            .contains(&name.as_str())
+        })
+        .then_some(())
+        .ok_or(ToolInputError::Invalid)
+}
+
 #[derive(Debug, Default)]
 struct ProgressService {
     calls: AtomicUsize,
@@ -439,6 +631,7 @@ impl ToolServices for ProgressService {
             "1",
             "Report bounded progress for a test-only operation.",
             json!({"type":"object","properties":{},"additionalProperties":false}),
+            read_only_contract(ServiceDomain::Analysis, NO_SCOPE),
             ToolEffects::read_only_closed_world(),
             |arguments: &serde_json::Map<String, Value>| {
                 arguments
@@ -486,7 +679,13 @@ impl ToolServices for ProgressService {
         ) {
             self.rejected_bounds.fetch_add(1, Ordering::SeqCst);
         }
-        TypedToolResult::try_new(json!({"done": true}), 1, context.limits()).map_err(Into::into)
+        TypedToolResult::try_new(
+            json!({"done": true}),
+            1,
+            ToolResultMetadata::complete_not_applicable(),
+            context.limits(),
+        )
+        .map_err(Into::into)
     }
 }
 
@@ -510,6 +709,7 @@ impl ToolServices for TerminalProgressService {
                 "required":["wait"],
                 "additionalProperties":false
             }),
+            read_only_contract(ServiceDomain::Analysis, NO_SCOPE),
             ToolEffects::read_only_closed_world(),
             |arguments: &serde_json::Map<String, Value>| {
                 arguments
@@ -547,34 +747,50 @@ impl ToolServices for TerminalProgressService {
             context.cancellation().cancel();
             return Err(ServiceError::Cancelled);
         }
-        TypedToolResult::try_new(json!({"done": true}), 1, context.limits()).map_err(Into::into)
+        TypedToolResult::try_new(
+            json!({"done": true}),
+            1,
+            ToolResultMetadata::complete_not_applicable(),
+            context.limits(),
+        )
+        .map_err(Into::into)
     }
 }
 
 #[async_trait]
 impl ToolServices for WaitingService {
     fn capabilities(&self) -> ServiceCapabilities {
-        let descriptor = ToolDescriptor::try_new(
-            "test.wait",
-            "1",
-            "Wait until the transport cancels this test-only operation.",
-            json!({
-                "type": "object",
-                "description": "x".repeat(8 * 1_024),
-                "examples": ["y".repeat(8 * 1_024)],
-                "properties": {},
-                "additionalProperties": false
-            }),
-            ToolEffects::read_only_closed_world(),
-            |arguments: &serde_json::Map<String, Value>| {
-                arguments
-                    .is_empty()
-                    .then_some(())
-                    .ok_or(ToolInputError::Invalid)
-            },
-        );
-        ServiceCapabilities::try_new(descriptor.into_iter().collect())
-            .unwrap_or_else(|_| ServiceCapabilities::empty())
+        let descriptors = COMPLETE_REGISTRY
+            .into_iter()
+            .filter_map(|entry| {
+                let mut schema = registry_schema(entry.scope);
+                if entry.name == "Market.Wait"
+                    && let Value::Object(schema) = &mut schema
+                {
+                    schema.insert(
+                        "description".to_owned(),
+                        Value::String("x".repeat(8 * 1_024)),
+                    );
+                    schema.insert(
+                        "examples".to_owned(),
+                        Value::Array(vec![Value::String("y".repeat(8 * 1_024))]),
+                    );
+                }
+                ToolDescriptor::try_new(
+                    entry.name,
+                    "1",
+                    "Exercise one complete generic registry domain.",
+                    schema,
+                    read_only_contract(entry.domain, entry.scope),
+                    ToolEffects::read_only_closed_world(),
+                    move |arguments: &serde_json::Map<String, Value>| {
+                        admit_registry_scope(arguments, entry.scope)
+                    },
+                )
+                .ok()
+            })
+            .collect();
+        ServiceCapabilities::try_new(descriptors).unwrap_or_else(|_| ServiceCapabilities::empty())
     }
 
     async fn call(
@@ -592,7 +808,87 @@ impl ToolServices for WaitingService {
 #[tokio::test]
 async fn duplicate_active_ids_are_rejected_and_cancellation_reaches_the_service()
 -> Result<(), Box<dyn Error>> {
+    let required_instrument = ToolScope::new(
+        ScopeRequirement::Required,
+        ScopeRequirement::NotApplicable,
+        ScopeRequirement::NotApplicable,
+        ScopeRequirement::NotApplicable,
+    );
+    let optional_instrument = ToolScope::new(
+        ScopeRequirement::Optional,
+        ScopeRequirement::NotApplicable,
+        ScopeRequirement::NotApplicable,
+        ScopeRequirement::NotApplicable,
+    );
+    let invalid_schemas = [
+        (
+            json!({"type":"object","properties":{},"additionalProperties":false}),
+            required_instrument,
+        ),
+        (
+            json!({
+                "type":"object",
+                "properties":{TOOL_INSTRUMENT_IDS_FIELD:{"type":"array"}},
+                "required":[TOOL_INSTRUMENT_IDS_FIELD,TOOL_INSTRUMENT_IDS_FIELD],
+                "additionalProperties":false
+            }),
+            required_instrument,
+        ),
+        (
+            json!({
+                "type":"object",
+                "properties":{TOOL_INSTRUMENT_IDS_FIELD:{"type":"array"}},
+                "required":[7],
+                "additionalProperties":false
+            }),
+            required_instrument,
+        ),
+        (
+            json!({
+                "type":"object",
+                "properties":{TOOL_INSTRUMENT_IDS_FIELD:{"type":"array"}},
+                "required":["undeclared"],
+                "additionalProperties":false
+            }),
+            required_instrument,
+        ),
+        (
+            json!({
+                "type":"object",
+                "properties":{TOOL_INSTRUMENT_IDS_FIELD:{"type":"array"}},
+                "required":[TOOL_INSTRUMENT_IDS_FIELD],
+                "additionalProperties":false
+            }),
+            optional_instrument,
+        ),
+        (
+            json!({
+                "type":"object",
+                "properties":{TOOL_INSTRUMENT_IDS_FIELD:{"type":"array"}},
+                "additionalProperties":false
+            }),
+            NO_SCOPE,
+        ),
+    ];
+    for (schema, scope) in invalid_schemas {
+        assert!(matches!(
+            ToolDescriptor::try_new(
+                "Analysis.Invalid",
+                "1",
+                "Reject an inconsistent scope schema.",
+                schema,
+                read_only_contract(ServiceDomain::Analysis, scope),
+                ToolEffects::read_only_closed_world(),
+                |_arguments: &serde_json::Map<String, Value>| Ok(()),
+            ),
+            Err(ServiceCapabilityError::InvalidContract)
+        ));
+    }
     let service = Arc::new(WaitingService::default());
+    assert_eq!(
+        service.capabilities().tools().len(),
+        COMPLETE_REGISTRY.len()
+    );
     let constrained = McpLimits::try_from(McpLimitSpec {
         maximum_frame_bytes: 20 * 1024,
         maximum_body_bytes: 20 * 1024,
@@ -638,7 +934,21 @@ async fn duplicate_active_ids_are_rejected_and_cancellation_reaches_the_service(
         .send(json!({"jsonrpc":"2.0","id":"list","method":"tools/list"}))
         .await?;
     let listed = harness.receive().await?;
-    assert_eq!(listed["result"]["tools"][0]["name"], "test.wait");
+    let listed_tools = listed["result"]["tools"]
+        .as_array()
+        .ok_or("tools/list did not return an array")?;
+    assert_eq!(listed_tools.len(), COMPLETE_REGISTRY.len());
+    for (tool, expected) in listed_tools.iter().zip(COMPLETE_REGISTRY) {
+        assert_eq!(tool["name"], expected.name);
+        assert_eq!(
+            tool["_meta"]["org.market-squawk/tool-contract"]["domain"],
+            expected.domain.as_str()
+        );
+        assert_eq!(
+            tool["_meta"]["org.market-squawk/tool-contract"]["schemaVersion"],
+            1
+        );
+    }
     assert_eq!(
         listed["result"]["tools"][0]["annotations"]["readOnlyHint"],
         true
@@ -653,7 +963,7 @@ async fn duplicate_active_ids_are_rejected_and_cancellation_reaches_the_service(
             "jsonrpc":"2.0",
             "id":"invalid-arguments",
             "method":"tools/call",
-            "params":{"name":"test.wait","arguments":{"unknown":true}}
+            "params":{"name":"Market.Wait","arguments":{"unknown":true}}
         }))
         .await?;
     assert_eq!(harness.receive().await?["error"]["code"], -32602);
@@ -663,7 +973,7 @@ async fn duplicate_active_ids_are_rejected_and_cancellation_reaches_the_service(
         "jsonrpc": "2.0",
         "id": "active-id",
         "method": "tools/call",
-        "params": { "name": "test.wait", "arguments": {} }
+        "params": { "name": "Market.Wait", "arguments": {} }
     });
     harness.send(call.clone()).await?;
     service.started.notified().await;
@@ -695,7 +1005,7 @@ async fn duplicate_active_ids_are_rejected_and_cancellation_reaches_the_service(
         harness
             .send(json!({
                 "jsonrpc":"2.0","id":id.clone(),"method":"tools/call",
-                "params":{"name":"test.wait","arguments":{}}
+                "params":{"name":"Market.Wait","arguments":{}}
             }))
             .await?;
         tokio::time::timeout(Duration::from_secs(1), started).await?;
@@ -805,7 +1115,11 @@ async fn progress_tokens_bridge_through_a_bounded_transport_neutral_reporter()
     assert_eq!(second["params"]["progress"], 2.0);
     assert_eq!(second["params"]["message"], "phase two");
     assert_eq!(result["id"], "progress");
-    assert_eq!(result["result"]["structuredContent"]["done"], true);
+    assert_eq!(result["result"]["structuredContent"]["data"]["done"], true);
+    assert_eq!(
+        result["result"]["structuredContent"]["metadata"]["completeness"],
+        "complete"
+    );
     assert_eq!(service.rejected_bounds.load(Ordering::SeqCst), 3);
     harness
         .send(json!({

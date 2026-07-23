@@ -12,7 +12,7 @@ use std::{
 
 use market_squawk_services::{
     RequestContext as ServiceRequestContext, RequestId as ServiceRequestId, ServiceCapabilities,
-    ServiceError, ServiceErrorClass, ToolDescriptor, ToolServices,
+    ServiceError, ServiceErrorClass, ToolArtifactPolicy, ToolDescriptor, ToolServices,
 };
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
@@ -422,6 +422,7 @@ impl<S: ToolServices> ServiceHandler<S> {
                 .await
                 .map_err(service_error)?;
             self.render_result(
+                descriptor,
                 result,
                 ArtifactPublicationContext::new(request_cancellation.clone(), deadline),
             )
@@ -452,6 +453,7 @@ impl<S: ToolServices> ServiceHandler<S> {
 
     async fn render_result(
         &self,
+        descriptor: &ToolDescriptor,
         result: market_squawk_services::TypedToolResult,
         artifact_context: ArtifactPublicationContext,
     ) -> Result<CallToolResult, McpError> {
@@ -459,13 +461,23 @@ impl<S: ToolServices> ServiceHandler<S> {
         result
             .validate_against(limits)
             .map_err(|_| service_error(ServiceError::InvalidResult))?;
+        result
+            .validate_for(descriptor)
+            .map_err(|_| service_error(ServiceError::InvalidResult))?;
         let inline = result.encoded_bytes() <= limits.maximum_inline_bytes()
             && result.item_count() <= limits.maximum_inline_items();
-        let (structured, _items, _encoded_bytes) = result.into_parts();
         if inline {
-            return Ok(structured_result(structured));
+            return Ok(structured_result(result.into_envelope()));
+        }
+        if matches!(
+            descriptor.contract().result().artifact(),
+            ToolArtifactPolicy::InlineOnly
+        ) {
+            return Err(service_error(ServiceError::ResourceExhausted));
         }
 
+        let metadata = result.metadata_value();
+        let structured = result.into_envelope();
         let encoded = serde_json::to_vec(&structured)
             .map_err(|_| McpError::internal_error("result encoding failed", None))?;
         let publication = ArtifactPublication::try_json(encoded).map_err(artifact_error)?;
@@ -482,7 +494,9 @@ impl<S: ToolServices> ServiceHandler<S> {
         }
         let value = serde_json::to_value(reference)
             .map_err(|_| McpError::internal_error("artifact reference encoding failed", None))?;
-        Ok(structured_result(json!({ "artifact": value })))
+        Ok(structured_result(
+            json!({ "artifact": value, "metadata": metadata }),
+        ))
     }
 }
 

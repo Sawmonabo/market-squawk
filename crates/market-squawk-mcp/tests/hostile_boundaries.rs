@@ -18,8 +18,11 @@ use market_squawk_mcp::{
     MutationAuditBundle, MutationAuditReservation, ServerExit,
 };
 use market_squawk_services::{
-    JsonStructureLimits, RequestContext, ServiceCapabilities, ServiceError, ServiceLimits,
-    ToolDescriptor, ToolEffects, ToolInputError, ToolServices, TypedToolRequest, TypedToolResult,
+    JsonStructureLimits, RequestContext, ScopeRequirement, ServiceCapabilities, ServiceDomain,
+    ServiceError, ServiceLimits, SourceEvidencePolicy, TOOL_SOURCE_COVERAGE_FIELD,
+    ToolArtifactPolicy, ToolAuthorization, ToolContract, ToolDescriptor, ToolEffects,
+    ToolInputError, ToolResultMetadata, ToolResultPolicy, ToolScope, ToolServices,
+    TypedToolRequest, TypedToolResult,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
@@ -297,32 +300,108 @@ struct BoundaryService {
     calls: AtomicUsize,
 }
 
+fn boundary_contract(source_evidence: SourceEvidencePolicy) -> ToolContract {
+    let source_coverage = match source_evidence {
+        SourceEvidencePolicy::Required => ScopeRequirement::Required,
+        SourceEvidencePolicy::NotApplicable => ScopeRequirement::NotApplicable,
+    };
+    ToolContract::new(
+        ServiceDomain::Research,
+        ToolAuthorization::ReadOnly,
+        ToolScope::new(
+            ScopeRequirement::NotApplicable,
+            ScopeRequirement::NotApplicable,
+            ScopeRequirement::NotApplicable,
+            source_coverage,
+        ),
+        ToolResultPolicy::new(source_evidence, ToolArtifactPolicy::OpaqueOnOverflow),
+    )
+}
+
+fn confirmed_mutation_contract() -> ToolContract {
+    ToolContract::new(
+        ServiceDomain::Bot,
+        ToolAuthorization::LocalConfirmation,
+        ToolScope::new(
+            ScopeRequirement::NotApplicable,
+            ScopeRequirement::NotApplicable,
+            ScopeRequirement::NotApplicable,
+            ScopeRequirement::NotApplicable,
+        ),
+        ToolResultPolicy::new(
+            SourceEvidencePolicy::NotApplicable,
+            ToolArtifactPolicy::InlineOnly,
+        ),
+    )
+}
+
+fn boundary_schema(source_evidence: SourceEvidencePolicy) -> Value {
+    match source_evidence {
+        SourceEvidencePolicy::Required => json!({
+            "type":"object",
+            "properties":{TOOL_SOURCE_COVERAGE_FIELD:{"type":"object"}},
+            "required":[TOOL_SOURCE_COVERAGE_FIELD],
+            "additionalProperties":false
+        }),
+        SourceEvidencePolicy::NotApplicable => {
+            json!({"type":"object","properties":{},"additionalProperties":false})
+        }
+    }
+}
+
+fn admit_boundary_scope(
+    arguments: &serde_json::Map<String, Value>,
+    source_evidence: SourceEvidencePolicy,
+) -> Result<(), ToolInputError> {
+    match source_evidence {
+        SourceEvidencePolicy::Required => (arguments.len() == 1
+            && arguments
+                .get(TOOL_SOURCE_COVERAGE_FIELD)
+                .is_some_and(Value::is_object))
+        .then_some(())
+        .ok_or(ToolInputError::Invalid),
+        SourceEvidencePolicy::NotApplicable => arguments
+            .is_empty()
+            .then_some(())
+            .ok_or(ToolInputError::Invalid),
+    }
+}
+
 impl BoundaryService {
     fn capabilities() -> ServiceCapabilities {
         let descriptors = [
             (
                 "test.large",
                 "Return a result larger than the inline ceiling.",
+                SourceEvidencePolicy::Required,
             ),
             (
                 "test.loose",
                 "Return a result constructed under a looser service contract.",
+                SourceEvidencePolicy::NotApplicable,
             ),
-            ("test.block", "Wait until the transport deadline expires."),
+            (
+                "test.block",
+                "Wait until the transport deadline expires.",
+                SourceEvidencePolicy::NotApplicable,
+            ),
+            (
+                "test.invalid-evidence",
+                "Return a result that violates its declared source-evidence policy.",
+                SourceEvidencePolicy::Required,
+            ),
         ]
         .into_iter()
-        .filter_map(|(name, description)| {
+        .filter_map(|(name, description, source_evidence)| {
             ToolDescriptor::try_new(
                 name,
                 "1",
                 description,
-                json!({"type":"object","properties":{},"additionalProperties":false}),
+                boundary_schema(source_evidence),
+                boundary_contract(source_evidence),
                 ToolEffects::read_only_closed_world(),
-                |arguments: &serde_json::Map<String, Value>| {
-                    arguments
-                        .is_empty()
-                        .then_some(())
-                        .ok_or(ToolInputError::Invalid)
+                move |arguments: &serde_json::Map<String, Value>| {
+                    admit_boundary_scope(arguments, source_evidence)
                 },
             )
             .ok()
@@ -348,6 +427,11 @@ impl ToolServices for BoundaryService {
             "test.large" => TypedToolResult::try_new(
                 json!({"privatePayload": "sensitive-value".repeat(64)}),
                 1,
+                ToolResultMetadata::try_truncated(
+                    2,
+                    json!({"status":"partial","venues":["test"]}),
+                    json!(["aggregated"]),
+                )?,
                 context.limits(),
             )
             .map_err(Into::into),
@@ -356,13 +440,25 @@ impl ToolServices for BoundaryService {
                     .map_err(|_| ServiceError::Internal)?;
                 let loose = ServiceLimits::try_new(64, 1, 16 * 1024, 16, structure)
                     .map_err(|_| ServiceError::Internal)?;
-                TypedToolResult::try_new(json!({"items": ["x".repeat(8 * 1024)]}), 1, loose)
-                    .map_err(Into::into)
+                TypedToolResult::try_new(
+                    json!({"items": ["x".repeat(8 * 1024)]}),
+                    1,
+                    ToolResultMetadata::complete_not_applicable(),
+                    loose,
+                )
+                .map_err(Into::into)
             }
             "test.block" => {
                 context.cancellation().cancelled().await;
                 Err(ServiceError::Cancelled)
             }
+            "test.invalid-evidence" => TypedToolResult::try_new(
+                json!({"invalid": true}),
+                1,
+                ToolResultMetadata::complete_not_applicable(),
+                context.limits(),
+            )
+            .map_err(Into::into),
             _ => Err(ServiceError::NotFound),
         }
     }
@@ -405,14 +501,15 @@ impl ToolServices for KillSwitchService {
                 "test.kill-switch",
                 "1",
                 "Irreversibly trigger the test-only kill switch.",
-                json!({"type":"object","properties":{},"additionalProperties":false}),
+                json!({
+                    "type":"object",
+                    "properties":{"confirm":{"type":"boolean","const":true}},
+                    "required":["confirm"],
+                    "additionalProperties":false
+                }),
+                confirmed_mutation_contract(),
                 effects,
-                |arguments: &serde_json::Map<String, Value>| {
-                    arguments
-                        .is_empty()
-                        .then_some(())
-                        .ok_or(ToolInputError::Invalid)
-                },
+                |_arguments: &serde_json::Map<String, Value>| Ok(()),
             )
             .ok()
         });
@@ -438,7 +535,13 @@ impl ToolServices for KillSwitchService {
             return Err(ServiceError::Internal);
         }
         self.mutations.fetch_add(1, Ordering::SeqCst);
-        TypedToolResult::try_new(json!({"triggered":true}), 1, context.limits()).map_err(Into::into)
+        TypedToolResult::try_new(
+            json!({"triggered":true}),
+            1,
+            ToolResultMetadata::complete_not_applicable(),
+            context.limits(),
+        )
+        .map_err(Into::into)
     }
 }
 
@@ -455,6 +558,7 @@ impl ToolServices for TraceService {
                 "required":["secret"],
                 "additionalProperties":false
             }),
+            boundary_contract(SourceEvidencePolicy::NotApplicable),
             ToolEffects::read_only_closed_world(),
             |arguments: &serde_json::Map<String, Value>| {
                 (arguments.len() == 1 && arguments.get("secret").is_some_and(Value::is_string))
@@ -476,7 +580,13 @@ impl ToolServices for TraceService {
             .get("secret")
             .cloned()
             .ok_or(ServiceError::InvalidRequest)?;
-        TypedToolResult::try_new(json!({"echo": secret}), 1, context.limits()).map_err(Into::into)
+        TypedToolResult::try_new(
+            json!({"echo": secret}),
+            1,
+            ToolResultMetadata::complete_not_applicable(),
+            context.limits(),
+        )
+        .map_err(Into::into)
     }
 }
 
@@ -751,6 +861,7 @@ impl ToolServices for NonCooperativeService {
                 "required":["artifact"],
                 "additionalProperties":false
             }),
+            boundary_contract(SourceEvidencePolicy::NotApplicable),
             ToolEffects::read_only_closed_world(),
             |arguments: &serde_json::Map<String, Value>| {
                 arguments
@@ -775,8 +886,13 @@ impl ToolServices for NonCooperativeService {
             .and_then(Value::as_bool)
             .ok_or(ServiceError::InvalidRequest)?;
         if artifact {
-            TypedToolResult::try_new(json!({"payload":"x".repeat(512)}), 1, context.limits())
-                .map_err(Into::into)
+            TypedToolResult::try_new(
+                json!({"payload":"x".repeat(512)}),
+                1,
+                ToolResultMetadata::complete_not_applicable(),
+                context.limits(),
+            )
+            .map_err(Into::into)
         } else {
             let observer = self
                 .drop_observer
@@ -788,8 +904,13 @@ impl ToolServices for NonCooperativeService {
                 observer,
             };
             self.work.hold().await;
-            TypedToolResult::try_new(json!({"released":true}), 1, context.limits())
-                .map_err(Into::into)
+            TypedToolResult::try_new(
+                json!({"released":true}),
+                1,
+                ToolResultMetadata::complete_not_applicable(),
+                context.limits(),
+            )
+            .map_err(Into::into)
         }
     }
 }
@@ -944,6 +1065,23 @@ async fn rejected_completion_audit_releases_no_response_bytes() -> Result<(), Bo
 #[tokio::test]
 async fn mutation_audit_is_atomic_and_output_failure_cannot_rewrite_service_success()
 -> Result<(), Box<dyn Error>> {
+    let audit = Arc::new(AtomicMutationAudit::new(MutationAuditFault::None));
+    let service = Arc::new(KillSwitchService::new(Arc::clone(&audit)));
+    let (mut reader, mut writer, task) =
+        initialized_mutation_session(Arc::clone(&service), Arc::clone(&audit), false).await?;
+    send(
+        &mut writer,
+        json!({
+            "jsonrpc":"2.0","id":"kill-unconfirmed","method":"tools/call",
+            "params":{"name":"test.kill-switch","arguments":{"confirm":false}}
+        }),
+    )
+    .await?;
+    assert_eq!(receive(&mut reader).await?["error"]["code"], -32602);
+    assert_eq!(service.mutations.load(Ordering::SeqCst), 0);
+    writer.shutdown().await?;
+    assert_eq!(task.await??, ServerExit::EndOfInput);
+
     for fault in [
         MutationAuditFault::Reservation,
         MutationAuditFault::AdmissionPersist,
@@ -956,7 +1094,7 @@ async fn mutation_audit_is_atomic_and_output_failure_cannot_rewrite_service_succ
             &mut writer,
             json!({
                 "jsonrpc":"2.0","id":"kill-rejected","method":"tools/call",
-                "params":{"name":"test.kill-switch","arguments":{}}
+                "params":{"name":"test.kill-switch","arguments":{"confirm":true}}
             }),
         )
         .await?;
@@ -978,7 +1116,7 @@ async fn mutation_audit_is_atomic_and_output_failure_cannot_rewrite_service_succ
         &mut writer,
         json!({
             "jsonrpc":"2.0","id":"kill-terminal-audit-fails","method":"tools/call",
-            "params":{"name":"test.kill-switch","arguments":{}}
+            "params":{"name":"test.kill-switch","arguments":{"confirm":true}}
         }),
     )
     .await?;
@@ -1013,12 +1151,15 @@ async fn mutation_audit_is_atomic_and_output_failure_cannot_rewrite_service_succ
         &mut writer,
         json!({
             "jsonrpc":"2.0","id":"kill-delivery-audit-fails","method":"tools/call",
-            "params":{"name":"test.kill-switch","arguments":{}}
+            "params":{"name":"test.kill-switch","arguments":{"confirm":true}}
         }),
     )
     .await?;
     let response = tokio::time::timeout(Duration::from_secs(1), receive(&mut reader)).await??;
-    assert_eq!(response["result"]["structuredContent"]["triggered"], true);
+    assert_eq!(
+        response["result"]["structuredContent"]["data"]["triggered"],
+        true
+    );
     assert_eq!(task.await??, ServerExit::AuditFailed);
     assert_eq!(service.mutations.load(Ordering::SeqCst), 1);
     let events = audit.events()?;
@@ -1051,7 +1192,7 @@ async fn mutation_audit_is_atomic_and_output_failure_cannot_rewrite_service_succ
         &mut writer,
         json!({
             "jsonrpc":"2.0","id":"kill-delivery-fails","method":"tools/call",
-            "params":{"name":"test.kill-switch","arguments":{}}
+            "params":{"name":"test.kill-switch","arguments":{"confirm":true}}
         }),
     )
     .await?;
@@ -1114,7 +1255,7 @@ async fn post_dispatch_cancellation_preserves_the_authoritative_mutation_outcome
         &mut writer,
         json!({
             "jsonrpc":"2.0","id":"cancelled-after-dispatch","method":"tools/call",
-            "params":{"name":"test.kill-switch","arguments":{}}
+            "params":{"name":"test.kill-switch","arguments":{"confirm":true}}
         }),
     )
     .await?;
@@ -1225,7 +1366,7 @@ async fn sdk_tracing_cannot_emit_protocol_payloads_to_the_host_subscriber()
     )
     .await?;
     assert_eq!(
-        receive(&mut client_reader).await?["result"]["structuredContent"]["echo"],
+        receive(&mut client_reader).await?["result"]["structuredContent"]["data"]["echo"],
         TRACE_SENTINEL
     );
     send(
@@ -1268,7 +1409,10 @@ async fn deadline_and_large_output_fail_closed_or_return_an_opaque_artifact()
         &mut writer,
         json!({
             "jsonrpc":"2.0","id":"large","method":"tools/call",
-            "params":{"name":"test.large","arguments":{}}
+            "params":{
+                "name":"test.large",
+                "arguments":{"sourceCoverage":{"status":"partial"}}
+            }
         }),
     )
     .await?;
@@ -1277,6 +1421,22 @@ async fn deadline_and_large_output_fail_closed_or_return_an_opaque_artifact()
     assert_eq!(
         large["result"]["structuredContent"]["artifact"]["mediaType"],
         "application/json"
+    );
+    assert_eq!(
+        large["result"]["structuredContent"]["metadata"]["completeness"],
+        "truncated"
+    );
+    assert_eq!(
+        large["result"]["structuredContent"]["metadata"]["returnedItems"],
+        1
+    );
+    assert_eq!(
+        large["result"]["structuredContent"]["metadata"]["availableItems"],
+        2
+    );
+    assert_eq!(
+        large["result"]["structuredContent"]["metadata"]["sourceCoverage"]["status"],
+        "partial"
     );
     assert!(!encoded.contains("sensitive-value"));
     assert!(!encoded.contains("path"));
@@ -1287,6 +1447,20 @@ async fn deadline_and_large_output_fail_closed_or_return_an_opaque_artifact()
         json!({
             "jsonrpc":"2.0","id":"loose","method":"tools/call",
             "params":{"name":"test.loose","arguments":{}}
+        }),
+    )
+    .await?;
+    assert_eq!(receive(&mut reader).await?["error"]["code"], -32010);
+    assert_eq!(artifacts.publication_count()?, 1);
+
+    send(
+        &mut writer,
+        json!({
+            "jsonrpc":"2.0","id":"invalid-evidence","method":"tools/call",
+            "params":{
+                "name":"test.invalid-evidence",
+                "arguments":{"sourceCoverage":{"status":"partial"}}
+            }
         }),
     )
     .await?;
