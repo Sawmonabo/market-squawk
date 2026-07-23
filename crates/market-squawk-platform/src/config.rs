@@ -14,6 +14,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zeroize::Zeroize;
 
+mod report;
+
+pub use report::{EffectiveConfigView, EffectiveSettingView};
+
 mod instruments;
 
 pub use instruments::{

@@ -41,9 +41,10 @@ pub use config::{
     AppConfig, COINBASE_EXCHANGE_ENDPOINT, CoinbaseAuthorizationAttestation,
     CoinbaseConfigurationError, CoinbaseControlLimits, CoinbaseInstrumentMapping,
     CoinbaseSourceConfig, ConfigError, ConfigOrigin, ConfigOverrides, ConfigProvenance,
-    ConfigSetting, ConfigSources, EffectiveConfig, KRAKEN_WEBSOCKET_V2_ENDPOINT,
-    KrakenAuthorizationAttestation, KrakenConfigurationError, KrakenInstrumentMapping,
-    KrakenSourceConfig, SecretError, SecretProvider, SecretReference, SecretValue,
+    ConfigSetting, ConfigSources, EffectiveConfig, EffectiveConfigView, EffectiveSettingView,
+    KRAKEN_WEBSOCKET_V2_ENDPOINT, KrakenAuthorizationAttestation, KrakenConfigurationError,
+    KrakenInstrumentMapping, KrakenSourceConfig, SecretError, SecretProvider, SecretReference,
+    SecretValue,
 };
 pub use input::{
     BoundedInput, ControlledInputFileError, InputFileCapability, InputFileError, InputFileIdentity,
