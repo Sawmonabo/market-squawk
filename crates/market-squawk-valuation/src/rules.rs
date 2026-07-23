@@ -146,6 +146,8 @@ pub enum DecisionReasonCode {
     UnobservableSignificantInput,
     /// A separately governed override selected the hierarchy.
     OverrideApplied,
+    /// Legacy analytical evidence has no actor-attributed input-use assessment.
+    InputUseAssessmentMissing,
 }
 
 /// One reason tied to an input when applicable.
@@ -301,6 +303,12 @@ impl ClassificationRuleset {
                     code: DecisionReasonCode::EvidenceQuarantined,
                 }),
                 _ => {}
+            }
+            if self.version > 1 && input.is_legacy_unassessed_analytics() {
+                reasons.push(DecisionReason {
+                    input_id: Some(input.id()),
+                    code: DecisionReasonCode::InputUseAssessmentMissing,
+                });
             }
 
             let input_hierarchy = input_hierarchy(self.version, input, &results);
@@ -555,7 +563,10 @@ fn input_hierarchy(
             || (pass(Predicate::WithinFreshnessLimit) && pass(Predicate::SourceEvidenceVerified)))
         && pass(Predicate::CurrencyMatches)
         && pass(Predicate::ScaleMatches)
-        && input.data_quality() != DataQuality::Quarantined;
+        && input.data_quality() != DataQuality::Quarantined
+        && (ruleset_version == 1
+            || (input.data_quality() != DataQuality::Stale
+                && !input.is_legacy_unassessed_analytics()));
     if !usable {
         FairValueHierarchy::Unclassified
     } else if Predicate::ALL

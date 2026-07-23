@@ -46,6 +46,38 @@ fn incomplete_or_unverified_evidence_is_unclassified_while_complete_observable_e
 }
 
 #[test]
+fn explicitly_stale_quality_is_usable_only_under_legacy_rules() -> TestResult {
+    let input = ValuationInput::try_from_spec(input_spec(
+        evidence(
+            research_origin()?,
+            Some(Timestamp::from_unix_nanos(950)),
+            EvidenceVerification::Verified,
+        )?,
+        InputObservability::Observable,
+        MarketActivity::NotAssessed,
+        None,
+        DataQuality::Stale,
+    )?)?;
+    let measurement = measurement(input)?;
+
+    assert_eq!(
+        ClassificationRuleset::versioned(1, 100)?
+            .classify(&measurement)?
+            .hierarchy(),
+        FairValueHierarchy::Level2
+    );
+    let current = ClassificationRuleset::current(100)?.classify(&measurement)?;
+    assert_eq!(current.hierarchy(), FairValueHierarchy::Unclassified);
+    assert!(
+        current
+            .reasons()
+            .iter()
+            .any(|reason| reason.code() == DecisionReasonCode::EvidenceStale)
+    );
+    Ok(())
+}
+
+#[test]
 fn expired_selected_market_observation_cannot_reach_level_one() -> TestResult {
     let rules = ClassificationRuleset::current(100)?;
     let input = market_input(&rules)?;

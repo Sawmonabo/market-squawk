@@ -351,7 +351,7 @@ fn input_from_payload(
                 .ok_or(FairValueError::CorruptPersistence)
         })
         .transpose()?;
-    ValuationInput::try_from_spec(ValuationInputSpec {
+    ValuationInput::try_from_persisted_v1_spec(ValuationInputSpec {
         subject_instrument_id: instrument(&payload.subject_instrument_id)?,
         reference_instrument_id: instrument(&payload.reference_instrument_id)?,
         relationship: relation_from_tag(payload.relationship)?,
@@ -660,6 +660,9 @@ fn access_from_tag(value: u8) -> Result<MarketAccess, FairValueError> {
         _ => Err(FairValueError::CorruptPersistence),
     }
 }
+
+#[cfg(test)]
+mod tests;
 
 fn method_from_tag(value: u8) -> Result<ValuationMethod, FairValueError> {
     match value {

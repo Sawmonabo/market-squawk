@@ -393,14 +393,26 @@ impl ValuationInput {
     /// Rejects an `Identical` relation across different identities or a non-identical relation
     /// that reuses the measured identity.
     pub(crate) fn try_from_spec(spec: ValuationInputSpec) -> Result<Self, FairValueError> {
+        if is_unassessed_analytics(&spec) {
+            return Err(FairValueError::InvalidInputAssessment);
+        }
+        Self::try_from_validated_spec(spec)
+    }
+
+    /// Reconstructs the exact v1 shape emitted before analytical use assessments were mandatory.
+    pub(crate) fn try_from_persisted_v1_spec(
+        spec: ValuationInputSpec,
+    ) -> Result<Self, FairValueError> {
+        if !is_unassessed_analytics(&spec) {
+            return Self::try_from_spec(spec);
+        }
+        Self::try_from_validated_spec(spec)
+    }
+
+    fn try_from_validated_spec(spec: ValuationInputSpec) -> Result<Self, FairValueError> {
         let same = spec.subject_instrument_id == spec.reference_instrument_id;
         if same != (spec.relationship == InputInstrumentRelation::Identical) {
             return Err(FairValueError::InvalidInstrumentRelationship);
-        }
-        if matches!(spec.evidence.origin(), EvidenceOrigin::Analytics { .. })
-            && spec.use_assessment.is_none()
-        {
-            return Err(FairValueError::InvalidInputAssessment);
         }
         if (spec.market_access == MarketAccess::NotAssessed)
             != spec.market_access_assessment.is_none()
@@ -489,6 +501,11 @@ impl ValuationInput {
             use_assessment: spec.use_assessment,
             retained_bytes,
         })
+    }
+
+    pub(crate) fn is_legacy_unassessed_analytics(&self) -> bool {
+        matches!(self.evidence.origin(), EvidenceOrigin::Analytics { .. })
+            && self.use_assessment.is_none()
     }
 
     /// Returns immutable input identity.
@@ -580,6 +597,11 @@ fn portfolio_evidence_digest(revision: &PortfolioRevision) -> [u8; 32] {
         hash.bytes(source.as_str().as_bytes());
     }
     hash.finish()
+}
+
+fn is_unassessed_analytics(spec: &ValuationInputSpec) -> bool {
+    matches!(spec.evidence.origin(), EvidenceOrigin::Analytics { .. })
+        && spec.use_assessment.is_none()
 }
 
 fn digest_identifier(prefix: &str, digest: [u8; 32]) -> Result<SourceIdentifier, FairValueError> {
