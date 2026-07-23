@@ -4,8 +4,8 @@ use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 
 use market_squawk_domain::{
-    ConnectionGeneration, InstrumentId, PriceTicks, ProviderChannel, ProviderProduct, QuantityLots,
-    SequenceNumber, SourceId, Timestamp, TradingStatus, VenueId,
+    ConnectionGeneration, DataQuality, InstrumentId, PriceTicks, ProviderChannel, ProviderProduct,
+    QuantityLots, SequenceNumber, SourceId, Timestamp, TradingStatus, VenueId,
 };
 use serde::Serialize;
 use thiserror::Error;
@@ -211,6 +211,7 @@ pub struct StreamSnapshot {
     pub(crate) source_timestamp: Option<Timestamp>,
     pub(crate) received_at: Timestamp,
     pub(crate) evaluated_at: Timestamp,
+    pub(crate) quality: DataQuality,
     pub(crate) trading_status: Option<TradingStatus>,
     pub(crate) trading_status_revision: Option<u64>,
     pub(crate) configured_depth: u32,
@@ -273,6 +274,9 @@ impl StreamSnapshot {
     }
     pub const fn evaluated_at(&self) -> Timestamp {
         self.evaluated_at
+    }
+    pub const fn quality(&self) -> DataQuality {
+        self.quality
     }
     pub const fn trading_status(&self) -> Option<TradingStatus> {
         self.trading_status

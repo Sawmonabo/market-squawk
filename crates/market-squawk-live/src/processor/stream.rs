@@ -2,8 +2,8 @@
 
 use market_squawk_domain::{
     BookStateBinding, ChecksumCapability, ChecksumEvidence, ChecksumScope, ChecksumValue,
-    ConnectionGeneration, InstrumentDefinition, SnapshotApplicability, SourceIdentifier, Timestamp,
-    TradingStatus,
+    ConnectionGeneration, DataQuality, InstrumentDefinition, SnapshotApplicability,
+    SourceIdentifier, Timestamp, TradingStatus,
 };
 use market_squawk_sources::{
     ChecksumValidationProfile, CurrentProviderObservation, ProviderChecksumEvidence,
@@ -34,6 +34,7 @@ pub(super) struct StreamState {
     source_timestamp: Option<Timestamp>,
     received_at: Option<Timestamp>,
     evaluated_at: Option<Timestamp>,
+    quality: DataQuality,
 }
 
 impl StreamState {
@@ -65,6 +66,7 @@ impl StreamState {
             source_timestamp: None,
             received_at: None,
             evaluated_at: None,
+            quality: DataQuality::Quarantined,
         })
     }
 
@@ -104,11 +106,15 @@ impl StreamState {
     pub(super) const fn evaluated_at(&self) -> Option<Timestamp> {
         self.evaluated_at
     }
+    pub(super) const fn quality(&self) -> DataQuality {
+        self.quality
+    }
 
     pub(super) fn quarantine(&mut self) {
         self.generation.invalidate();
         self.revision.invalidate();
         self.phase.quarantine();
+        self.quality = DataQuality::Quarantined;
     }
 
     /// Quarantines a rejected observation while retaining complete, truthful diagnostics.
@@ -169,6 +175,7 @@ pub(super) struct StreamCandidate<'a> {
     source_timestamp_target: &'a mut Option<Timestamp>,
     received_at_target: &'a mut Option<Timestamp>,
     evaluated_at_target: &'a mut Option<Timestamp>,
+    quality_target: &'a mut DataQuality,
     health_epoch: u64,
     source_valid_until: Timestamp,
     source_timestamp: Option<Timestamp>,
@@ -193,7 +200,7 @@ impl StreamCandidate<'_> {
     }
 
     /// Commits revision, candidate book, cursors, and provenance in one single-writer step.
-    pub(super) fn commit(self) -> Result<CommittedState, LiveApplyError> {
+    pub(super) fn commit(self, quality: DataQuality) -> Result<CommittedState, LiveApplyError> {
         let revision = self
             .revision_target
             .advance()
@@ -214,6 +221,7 @@ impl StreamCandidate<'_> {
         *self.source_timestamp_target = self.source_timestamp;
         *self.received_at_target = Some(self.received_at);
         *self.evaluated_at_target = Some(self.evaluated_at);
+        *self.quality_target = quality;
         Ok(CommittedState {
             generation: self.generation,
             revision: self.revision_target.lease(),
@@ -397,6 +405,7 @@ pub(super) fn preview_stream<'a>(
         source_timestamp_target: &mut state.source_timestamp,
         received_at_target: &mut state.received_at,
         evaluated_at_target: &mut state.evaluated_at,
+        quality_target: &mut state.quality,
         health_epoch: current.current_lease().health_epoch(),
         source_valid_until: current.current_lease().valid_until(),
         source_timestamp,

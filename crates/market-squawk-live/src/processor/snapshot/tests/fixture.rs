@@ -128,7 +128,7 @@ pub(super) fn populated_state() -> TestResult<PopulatedState> {
             timeline.evaluated_at,
             &mut scratch,
         )?;
-        let committed = candidate.commit()?;
+        let committed = candidate.commit(DataQuality::DirectVerified)?;
         assert_eq!(committed.expected_revision, 1);
         let binding = statuses.commit(staged_status);
         assert_eq!(binding.status, status);

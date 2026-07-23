@@ -3,7 +3,9 @@ mod fixture;
 
 use std::time::{Duration, Instant};
 
-use market_squawk_domain::{SourceId, SourceIdentifier, Timestamp, TradingStatus, VenueId};
+use market_squawk_domain::{
+    DataQuality, SourceId, SourceIdentifier, Timestamp, TradingStatus, VenueId,
+};
 use market_squawk_sources::{CurrentDecodedProviderBatch, ProviderSnapshotEvidence, RegistryError};
 
 use self::fixture::{
@@ -347,6 +349,7 @@ fn committed_seed_is_sorted_truncated_and_exactly_base_charged() -> TestResult {
     assert_eq!(stream.source_valid_until, source_a.timestamp(VALID_UNTIL)?);
     assert_eq!(stream.received_at, source_a_received_at);
     assert_eq!(stream.evaluated_at, evaluated_at);
+    assert_eq!(stream.quality, DataQuality::DirectVerified);
     let expected_retained = std::mem::size_of::<ProcessorSnapshotSeed>()
         + std::mem::size_of::<StreamSnapshotSeed>()
         + SourceId::MAX_LENGTH
@@ -417,6 +420,7 @@ fn late_delta_expiry_rolls_back_book_sequence_revision_and_status() -> TestResul
     let after = processor.snapshot_seed(limits)?;
     let after_stream = after.streams.first().ok_or("missing rolled-back stream")?;
     assert_eq!(after_stream.phase, StreamPhaseSnapshot::Quarantined);
+    assert_eq!(after_stream.quality, DataQuality::Quarantined);
     assert!(!after_stream.generation_current);
     assert_eq!(after_stream.state_revision, before_revision);
     assert_eq!(after_stream.last_sequence, before_sequence);

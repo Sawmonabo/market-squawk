@@ -309,7 +309,7 @@ impl<C: TrustedClock> InstrumentLiveProcessor<C> {
                 .validate()
                 .map_err(AuthorityError::from)?;
             self.statuses.validate_staged(&staged_status)?;
-            let committed = candidate.commit()?;
+            let committed = candidate.commit(qualified.assessment.recorded_quality())?;
             Ok::<_, LiveApplyError>((qualified, capability_deadline, committed))
         })();
         let (qualified, capability_deadline, committed) = match outcome {

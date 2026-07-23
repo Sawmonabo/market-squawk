@@ -180,6 +180,7 @@ pub(super) fn build_snapshot_seed(
             evaluated_at: state
                 .evaluated_at()
                 .ok_or(SnapshotBuildError::IncompleteStreamProvenance)?,
+            quality: state.quality(),
             trading_status,
             trading_status_revision,
             configured_depth: u32::try_from(configured_depth)
