@@ -730,6 +730,21 @@ impl std::fmt::Debug for ProductionResearchIngestCoordinator {
 
 #[async_trait]
 impl ResearchSourceDiscoveryCoordinator for ProductionResearchIngestCoordinator {
+    fn maximum_discovery_objects(&self) -> NonZeroU16 {
+        self.limits.discovery_objects
+    }
+
+    fn revoke_discovery_receipts(
+        &self,
+        discovery: &ResearchSourceDiscovery,
+    ) -> Result<(), ServiceError> {
+        self.authority
+            .lock()
+            .map_err(|_error| ServiceError::Unavailable)?
+            .selections
+            .revoke(discovery)
+    }
+
     async fn discover_registered_objects(
         &self,
         profile: &SourceIdentifier,

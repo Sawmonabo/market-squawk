@@ -1,4 +1,7 @@
+use std::collections::BTreeMap;
 use std::error::Error;
+use std::ffi::OsString;
+use std::fs;
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 use std::sync::{
     Arc,
@@ -8,17 +11,23 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use clap::Parser;
 use futures_util::future::BoxFuture;
 use market_squawk::application::{
-    ManagedResearchExtractionSource, ProductionResearchIngestCoordinator, ResearchExtractionLimits,
-    ResearchIngestCoordinator, ResearchRevisionPlanError, ResearchRightsAuthority,
-    ResearchSourceDiscoveryCoordinator, application_capabilities,
+    ApplicationDomainService, ManagedResearchExtractionSource, ProductionResearchIngestCoordinator,
+    ResearchExtractionLimits, ResearchIngestCoordinator, ResearchRevisionPlanError,
+    ResearchRightsAuthority, ResearchSourceDiscoveryCoordinator, SourceDomainService,
+    SourceRuntimeRequest, SourceRuntimeSnapshotBatch, SourceRuntimeView, SourceRuntimeViewError,
+    application_capabilities,
 };
 use market_squawk::{
-    ProviderOnboardingPortal, ProviderOnboardingService, ProviderPortalActivationAuthority,
-    ProviderPortalActivationError, ProviderPortalActivationRequest, ProviderPortalActivationView,
-    ProviderPortalConfig, ProviderProfileRegistrationOutcome, ResearchService,
-    ResearchServiceError, StartOnboardingRequest,
+    LocalProduct, ProviderOnboardingPortal, ProviderOnboardingService,
+    ProviderPortalActivationAuthority, ProviderPortalActivationError,
+    ProviderPortalActivationRequest, ProviderPortalActivationView, ProviderPortalConfig,
+    ProviderProfileRegistrationOutcome, ResearchService, ResearchServiceError,
+    StartOnboardingRequest,
+    cli::{Cli, Command, IngestCommand},
+    local_product::execute_cli_command,
 };
 use market_squawk_data::{
     CatalogConfig, CatalogLimit, CatalogResultLimits, ObjectStoreConfig, RightsBasis,
@@ -31,11 +40,13 @@ use market_squawk_domain::{
     RevisionNumber, SchemaVersion, SequenceCapability, SourceId, SourceIdentifier, Timestamp,
 };
 use market_squawk_platform::{
-    EncryptedFileFallbackStatus, EncryptedFileSecretStore, LocalAuthorityStateStore, LocalPaths,
-    PreferredSecretStore, SecretValue,
+    AppConfig, ConfigOverrides, ConfigSources, EncryptedFileFallbackStatus,
+    EncryptedFileSecretStore, LocalAuthorityStateStore, LocalPaths, PreferredSecretStore,
+    SecretValue,
 };
 use market_squawk_services::{
-    JsonStructureLimits, RequestContext, RequestId, ServiceError, ServiceLimits, TypedToolRequest,
+    JsonStructureLimits, RequestContext, RequestId, ServiceError, ServiceLimits,
+    SourceEvidencePolicy, ToolArtifactPolicy, ToolAuthorization, TypedToolRequest,
 };
 use market_squawk_sources::{
     AuthorizationGrant, AuthorizationMode, AvailabilityEvidence as SourceAvailabilityEvidence,
@@ -64,6 +75,19 @@ impl ProviderPortalActivationAuthority for UnusedAdapterActivation {
         _cancellation: CancellationToken,
     ) -> Result<ProviderPortalActivationView, ProviderPortalActivationError> {
         Err(ProviderPortalActivationError::Unavailable)
+    }
+}
+
+#[derive(Debug)]
+struct EmptySourceRuntime;
+
+#[async_trait]
+impl SourceRuntimeView for EmptySourceRuntime {
+    async fn current(
+        &self,
+        _request: SourceRuntimeRequest,
+    ) -> Result<SourceRuntimeSnapshotBatch, SourceRuntimeViewError> {
+        SourceRuntimeSnapshotBatch::try_new(Vec::new())
     }
 }
 
@@ -118,16 +142,30 @@ async fn registered_provider_discovery_returns_exact_ingestible_object_and_right
                 .join("discovery-source-authority"),
         )?,
     )?;
-    let coordinator = ProductionResearchIngestCoordinator::new(
+    let coordinator = Arc::new(ProductionResearchIngestCoordinator::new(
         registry,
-        research,
+        Arc::clone(&research),
         ResearchExtractionLimits::try_new(
             NonZeroU16::new(8).ok_or("discovery bound is zero")?,
             NonZeroU32::new(16).ok_or("record bound is zero")?,
             NonZeroU64::new(64 * 1024).ok_or("byte bound is zero")?,
             Duration::from_secs(60),
         )?,
-    );
+    ));
+    let onboarding = Arc::new(ProviderOnboardingService::try_new(
+        research.onboarding_catalog(),
+        Arc::new(EncryptedFileSecretStore::try_open(
+            directory.path().join("discovery-provider-secrets"),
+            SecretValue::new("discovery test unlock".to_owned())?,
+        )?),
+    )?);
+    let discovery: Arc<dyn ResearchSourceDiscoveryCoordinator> = Arc::clone(&coordinator) as Arc<_>;
+    let source_service = SourceDomainService::try_new(
+        onboarding,
+        Arc::new(EmptySourceRuntime),
+        discovery,
+        Arc::new(UnusedAdapterActivation),
+    )?;
     let profile = SourceIdentifier::try_from("treasury.fiscal-data")?;
     let dataset = SourceIdentifier::try_from("average-interest-rates")?;
     let source = DiscoveryFixtureSource::try_new(
@@ -150,24 +188,98 @@ async fn registered_provider_discovery_returns_exact_ingestible_object_and_right
             None,
         )?,
     )?;
-    let context = discovery_context()?;
-
-    let discovery_authority: &dyn ResearchSourceDiscoveryCoordinator = &coordinator;
-    let discovered = discovery_authority
-        .discover_registered_objects(
-            &profile,
-            &dataset,
-            None,
-            NonZeroU16::new(4).ok_or("discovery bound is zero")?,
-            &context,
+    let capabilities = application_capabilities()?;
+    let discover = capabilities
+        .find("Source.Discover")
+        .ok_or("Source.Discover is not registered")?;
+    let effects = discover.effects();
+    assert!(
+        discover.contract().authorization() == ToolAuthorization::LocalConfirmation
+            && discover.contract().result().source_evidence() == SourceEvidencePolicy::Required
+            && discover.contract().result().artifact() == ToolArtifactPolicy::InlineOnly
+            && !effects.read_only()
+            && !effects.destructive()
+            && !effects.idempotent()
+            && effects.open_world()
+    );
+    let ingest = capabilities
+        .find("Research.IngestSource")
+        .ok_or("Research.IngestSource is not registered")?;
+    let effects = ingest.effects();
+    assert!(
+        ingest.contract().authorization() == ToolAuthorization::LocalConfirmation
+            && ingest.contract().result().source_evidence() == SourceEvidencePolicy::Required
+            && ingest.contract().result().artifact() == ToolArtifactPolicy::InlineOnly
+            && !effects.read_only()
+            && !effects.destructive()
+            && effects.idempotent()
+            && effects.open_world()
+    );
+    assert!(
+        discover
+            .admit(
+                json!({
+                    "provider": profile,
+                    "dataset": dataset,
+                    "sourceCoverage": [profile],
+                    "resultLimits": {"maximumItems": 64, "maximumBytes": 1024 * 1024},
+                })
+                .as_object()
+                .cloned()
+                .ok_or("unconfirmed discovery arguments must be an object")?,
+            )
+            .is_err()
+    );
+    let mismatched_scope = discover.admit(
+        json!({
+            "provider": profile,
+            "dataset": dataset,
+            "confirm": true,
+            "sourceCoverage": ["substituted-provider"],
+            "resultLimits": {"maximumItems": 64, "maximumBytes": 1024 * 1024},
+        })
+        .as_object()
+        .cloned()
+        .ok_or("discovery arguments must be an object")?,
+    )?;
+    assert!(matches!(
+        source_service
+            .call(mismatched_scope, discovery_context()?)
+            .await,
+        Err(ServiceError::InvalidRequest)
+    ));
+    let discovered = source_service
+        .call(
+            discover.admit(
+                json!({
+                    "provider": profile,
+                    "dataset": dataset,
+                    "confirm": true,
+                    "sourceCoverage": [profile],
+                    "resultLimits": {"maximumItems": 64, "maximumBytes": 1024 * 1024},
+                })
+                .as_object()
+                .cloned()
+                .ok_or("discovery arguments must be an object")?,
+            )?,
+            discovery_context()?,
         )
         .await?;
-    let selected = discovered
-        .objects()
-        .first()
+    let wire = discovered.structured_content();
+    let selected = wire["objects"]
+        .as_array()
+        .and_then(|objects| objects.first())
         .ok_or("fixture discovery returned no object")?;
-    let exact_object = selected.source_object().object_id().clone();
-    let receipt = selected.discovery_receipt().to_owned();
+    let exact_object = SourceIdentifier::try_from(
+        selected["object_id"]
+            .as_str()
+            .ok_or("fixture discovery omitted exact object identity")?,
+    )?;
+    let receipt = selected["discovery_receipt"]
+        .as_str()
+        .ok_or("fixture discovery omitted its receipt")?
+        .to_owned();
+    let context = discovery_context()?;
     let mismatched = admitted_ingest(
         &profile,
         &dataset,
@@ -175,34 +287,57 @@ async fn registered_provider_discovery_returns_exact_ingestible_object_and_right
         &receipt,
     )?;
     assert!(matches!(
-        ResearchIngestCoordinator::ingest(&coordinator, &mismatched, &context, context.limits())
-            .await,
+        ResearchIngestCoordinator::ingest(
+            coordinator.as_ref(),
+            &mismatched,
+            &context,
+            context.limits(),
+        )
+        .await,
         Err(ServiceError::InvalidRequest)
     ));
     let request = admitted_ingest(&profile, &dataset, &exact_object, &receipt)?;
-    let ingested =
-        ResearchIngestCoordinator::ingest(&coordinator, &request, &context, context.limits())
-            .await?;
+    let ingested = ResearchIngestCoordinator::ingest(
+        coordinator.as_ref(),
+        &request,
+        &context,
+        context.limits(),
+    )
+    .await?;
     assert!(matches!(
-        ResearchIngestCoordinator::ingest(&coordinator, &request, &context, context.limits()).await,
+        ResearchIngestCoordinator::ingest(
+            coordinator.as_ref(),
+            &request,
+            &context,
+            context.limits(),
+        )
+        .await,
         Err(ServiceError::NotFound)
     ));
 
     assert!(
-        discovered.profile() == &profile
-            && discovered.metadata().provider().as_str() == "treasury"
-            && discovered.metadata().coverage().domain() == CoverageDomain::Macroeconomic
-            && discovered.rights().persistence_operation_admitted()
-            && discovered.rights().basis_digest() == evidence(41)
-            && discovered.rights().authorization_evidence() == evidence(42)
-            && discovered.objects().len() == 1
+        discovered.item_count() == 1
+            && wire["profile"] == profile.as_str()
+            && wire["metadata"]["provider"] == "treasury"
+            && wire["metadata"]["coverage"]["domain"] == "macroeconomic"
+            && wire["metadata"]["quality_ceiling"] == "official_delayed"
+            && wire["rights"]["persistence_operation_admitted"] == true
+            && wire["objects"]
+                .as_array()
+                .is_some_and(|objects| objects.len() == 1)
+            && wire["request"]["max_results"] == 8
             && exact_object.as_str() == "average-interest-rates:sha256:fixture"
-            && !discovered.receipts_survive_restart()
-            && selected.discovery_receipt_expires_at().unix_nanos()
-                > Timestamp::from_unix_nanos(0).unix_nanos()
+            && wire["receipts_survive_restart"] == false
+            && selected["discovery_receipt_expires_at"]
+                .as_i64()
+                .is_some_and(|expires_at| expires_at > 0)
+            && discovered.metadata().source_coverage()["provider"] == profile.as_str()
+            && discovered.metadata().source_coverage()["coverageDomain"] == "macroeconomic"
+            && discovered.metadata().source_coverage()["coverageEvidence"]
+                == wire["metadata"]["coverage"]["evidence"]
+            && discovered.metadata().data_quality()["qualityCeiling"] == "official_delayed"
             && ingested.structured_content()["rowCount"] == 1
     );
-    let wire = serde_json::to_value(&discovered)?;
     assert!(
         wire["objects"][0]["object_id"] == exact_object.as_str()
             && wire["objects"][0]["discovery_receipt"] == receipt
@@ -226,9 +361,45 @@ async fn registered_provider_discovery_returns_exact_ingestible_object_and_right
         fixture_rights(capacity_source_id, 71)?,
     )?;
     let capacity_context = long_context("receipt-capacity", Duration::from_secs(60))?;
-    let mut first_capacity_selection = None;
-    for index in 0..MAX_DISCOVERY_OBJECTS {
-        let discovered = coordinator
+    let first_capacity_discovery = coordinator
+        .discover_registered_objects(
+            &capacity_profile,
+            &capacity_dataset,
+            None,
+            NonZeroU16::MIN,
+            &capacity_context,
+        )
+        .await?;
+    let first_capacity_selection = first_capacity_discovery
+        .objects()
+        .first()
+        .map(|selection| {
+            (
+                selection.source_object().object_id().clone(),
+                selection.discovery_receipt().to_owned(),
+            )
+        })
+        .ok_or("capacity discovery returned no object")?;
+    let rejected_publication = discover.admit(
+        json!({
+            "provider": capacity_profile,
+            "dataset": capacity_dataset,
+            "confirm": true,
+            "sourceCoverage": [capacity_profile],
+            "resultLimits": {"maximumItems": 1, "maximumBytes": 1},
+        })
+        .as_object()
+        .cloned()
+        .ok_or("constrained discovery arguments must be an object")?,
+    )?;
+    assert!(matches!(
+        source_service
+            .call(rejected_publication, discovery_context()?)
+            .await,
+        Err(ServiceError::ResourceExhausted)
+    ));
+    for _index in 1..MAX_DISCOVERY_OBJECTS {
+        coordinator
             .discover_registered_objects(
                 &capacity_profile,
                 &capacity_dataset,
@@ -237,16 +408,6 @@ async fn registered_provider_discovery_returns_exact_ingestible_object_and_right
                 &capacity_context,
             )
             .await?;
-        if index == 0 {
-            let selection = discovered
-                .objects()
-                .first()
-                .ok_or("capacity discovery returned no object")?;
-            first_capacity_selection = Some((
-                selection.source_object().object_id().clone(),
-                selection.discovery_receipt().to_owned(),
-            ));
-        }
     }
     assert!(matches!(
         coordinator
@@ -260,8 +421,7 @@ async fn registered_provider_discovery_returns_exact_ingestible_object_and_right
             .await,
         Err(ServiceError::ResourceExhausted)
     ));
-    let (capacity_object, capacity_receipt) =
-        first_capacity_selection.ok_or("capacity selection was not retained")?;
+    let (capacity_object, capacity_receipt) = first_capacity_selection;
     let capacity_ingest = admitted_ingest(
         &capacity_profile,
         &capacity_dataset,
@@ -270,7 +430,7 @@ async fn registered_provider_discovery_returns_exact_ingestible_object_and_right
     )?;
     assert!(
         ResearchIngestCoordinator::ingest(
-            &coordinator,
+            coordinator.as_ref(),
             &capacity_ingest,
             &capacity_context,
             capacity_context.limits(),
@@ -279,7 +439,6 @@ async fn registered_provider_discovery_returns_exact_ingestible_object_and_right
         .structured_content()["rowCount"]
             == 1
     );
-
     let expiry_profile = SourceIdentifier::try_from("treasury.receipt-expiry")?;
     let expiry_dataset = SourceIdentifier::try_from("receipt-expiry-dataset")?;
     let expiry_source = DiscoveryFixtureSource::try_new(
@@ -329,7 +488,7 @@ async fn registered_provider_discovery_returns_exact_ingestible_object_and_right
     tokio::time::sleep(Duration::from_millis(2_100)).await;
     assert!(matches!(
         ResearchIngestCoordinator::ingest(
-            &coordinator,
+            coordinator.as_ref(),
             &expiry_ingest,
             &capacity_context,
             capacity_context.limits(),
@@ -338,12 +497,137 @@ async fn registered_provider_discovery_returns_exact_ingestible_object_and_right
         Err(ServiceError::NotFound)
     ));
 
-    ResearchIngestCoordinator::begin_shutdown(&coordinator);
+    source_service.begin_shutdown();
+    source_service
+        .finish_shutdown(Instant::now() + Duration::from_secs(5))
+        .await?;
+    ResearchIngestCoordinator::begin_shutdown(coordinator.as_ref());
     ResearchIngestCoordinator::finish_shutdown(
-        &coordinator,
+        coordinator.as_ref(),
         Instant::now() + Duration::from_secs(5),
     )
     .await?;
+
+    assert!(
+        Cli::try_parse_from([
+            "market-squawk",
+            "source",
+            "discover",
+            "treasury.fiscal-data",
+            "--dataset",
+            "average-interest-rates",
+            "--confirm",
+        ])
+        .is_ok()
+    );
+    assert!(
+        Cli::try_parse_from([
+            "market-squawk",
+            "ingest",
+            "source",
+            "treasury.fiscal-data",
+            "average-interest-rates:sha256:fixture",
+            "--dataset",
+            "average-interest-rates",
+            "--confirm",
+        ])
+        .is_err()
+    );
+    assert!(
+        Cli::try_parse_from([
+            "market-squawk",
+            "ingest",
+            "source",
+            "treasury.fiscal-data",
+            "average-interest-rates:sha256:fixture",
+            "--dataset",
+            "average-interest-rates",
+            "--discovery-receipt",
+            "11111111-1111-4111-8111-111111111111",
+            "--confirm",
+        ])
+        .is_ok()
+    );
+
+    let local_input = directory.path().join("local-input");
+    fs::create_dir_all(&local_input)?;
+    fs::write(local_input.join("prices.csv"), b"id,value\nrow-1,123.45\n")?;
+    let local_input = fs::canonicalize(local_input)?;
+    let manifest_path = local_input.join("manifest.json");
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec(&json!({
+            "schema_version": 3,
+            "objects": [{
+                "dataset": "local-alternative-prices",
+                "object_id": "local-price-object",
+                "path": "prices.csv",
+                "format": {"kind": "csv", "delimiter": 44},
+                "effective_at": 100,
+                "published_at": 150,
+                "revision": "local-price-revision-1",
+                "revision_number": 1,
+                "superseded_at": null,
+                "record_time": {
+                    "effective": {
+                        "schema_version": 2,
+                        "coordinate": {"precision": "exact_timestamp", "value": 100}
+                    },
+                    "published": {
+                        "schema_version": 2,
+                        "coordinate": {"precision": "exact_timestamp", "value": 150}
+                    },
+                    "superseded": null
+                },
+                "instrument_binding": {"kind": "unscoped"},
+                "row_policy": {
+                    "identity_field": "id",
+                    "fields": [{
+                        "source": "value",
+                        "field": "price",
+                        "decimal_scale": 2,
+                        "unit": "USD"
+                    }]
+                }
+            }]
+        }))?,
+    )?;
+    let environment = BTreeMap::<OsString, OsString>::new();
+    let config = AppConfig::load(ConfigSources::new(
+        None,
+        &environment,
+        ConfigOverrides {
+            data_dir: Some(directory.path().join("local-product")),
+            ..ConfigOverrides::default()
+        },
+    ))?;
+    let product = LocalProduct::try_new(config)?;
+    assert_eq!(
+        product
+            .provider_onboarding()
+            .encrypted_file_fallback_status()?,
+        EncryptedFileFallbackStatus::Locked
+    );
+    let local_ingest = execute_cli_command(
+        &product,
+        Command::Ingest {
+            command: IngestCommand::File {
+                manifest: manifest_path,
+                object: "local-price-object".to_owned(),
+                dataset: "local-alternative-prices".to_owned(),
+                confirm: true,
+            },
+        },
+    )
+    .await?;
+    assert_eq!(local_ingest.value()["data"]["rowCount"], 1);
+    assert!(
+        product
+            .application()
+            .shutdown(Instant::now() + Duration::from_secs(5))
+            .await
+            .is_complete()
+    );
     Ok(())
 }
 

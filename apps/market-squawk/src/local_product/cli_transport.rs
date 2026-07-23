@@ -149,6 +149,20 @@ async fn source(
             json_object(json!({"provider": provider, "confirm": confirm}))?,
             "source setup opened",
         ),
+        SourceCommand::Discover {
+            provider,
+            dataset,
+            confirm,
+        } => (
+            "Source.Discover",
+            json_object(json!({
+                "provider": provider,
+                "dataset": dataset,
+                "confirm": confirm,
+                "sourceCoverage": [provider],
+            }))?,
+            "source objects discovered",
+        ),
         SourceCommand::Activate { request, confirm } => {
             let value = cli_provider::activate_research_provider(
                 product,
@@ -172,12 +186,14 @@ async fn ingest(
             provider,
             object,
             dataset,
+            discovery_receipt,
             confirm,
         } => {
             let mut arguments = json_object(json!({
                 "provider": provider,
                 "object": object,
                 "dataset": dataset,
+                "discoveryReceipt": discovery_receipt,
                 "confirm": confirm,
                 "sourceCoverage": [provider],
             }))?;

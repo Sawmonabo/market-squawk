@@ -77,12 +77,25 @@ pub trait ResearchIngestCoordinator: Send + Sync + 'static {
     async fn finish_shutdown(&self, deadline: Instant) -> Result<(), ServiceError>;
 }
 
-/// Read-only discovery authority shared with the Source domain.
+/// Receipt-minting discovery authority shared with the Source domain.
 ///
-/// This narrow trait exposes registered adapter discovery without granting source registration,
-/// raw adapter access, credential access, extraction, or analytical publication authority.
+/// This narrow trait exposes registered adapter discovery and exact-batch rollback without
+/// granting source registration, raw adapter access, credential access, extraction, or analytical
+/// publication authority.
 #[async_trait]
 pub trait ResearchSourceDiscoveryCoordinator: Send + Sync + 'static {
+    /// Hard object ceiling configured on this exact coordinator.
+    fn maximum_discovery_objects(&self) -> NonZeroU16;
+
+    /// Revokes exactly one discovery batch that could not be published to its caller.
+    ///
+    /// Implementations must leave every receipt outside `discovery` unchanged. This operation is
+    /// idempotent so shutdown may clear the same receipts before application rollback runs.
+    fn revoke_discovery_receipts(
+        &self,
+        discovery: &ResearchSourceDiscovery,
+    ) -> Result<(), ServiceError>;
+
     /// Discovers bounded exact objects for one active registered provider profile.
     async fn discover_registered_objects(
         &self,

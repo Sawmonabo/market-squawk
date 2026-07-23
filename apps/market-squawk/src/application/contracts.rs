@@ -36,6 +36,12 @@ const SOURCE_SCOPE: ToolScope = ToolScope::new(
     ScopeRequirement::Required,
     ScopeRequirement::Optional,
 );
+const SOURCE_DISCOVERY_SCOPE: ToolScope = ToolScope::new(
+    ScopeRequirement::NotApplicable,
+    ScopeRequirement::NotApplicable,
+    ScopeRequirement::Required,
+    ScopeRequirement::Required,
+);
 const DATA_SCOPE: ToolScope = ToolScope::new(
     ScopeRequirement::Optional,
     ScopeRequirement::Optional,
@@ -60,6 +66,10 @@ const OPTIONAL_DATASET_ARGUMENT: &[ArgumentSpec] =
     &[ArgumentSpec::optional("dataset", ArgumentKind::Identifier)];
 const PROVIDER_ARGUMENT: &[ArgumentSpec] =
     &[ArgumentSpec::required("provider", ArgumentKind::Identifier)];
+const SOURCE_DISCOVERY_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("provider", ArgumentKind::Identifier),
+    ArgumentSpec::required("dataset", ArgumentKind::Identifier),
+];
 const ACCOUNT_ARGUMENT: &[ArgumentSpec] = &[ArgumentSpec::required(
     "accountId",
     ArgumentKind::Identifier,
@@ -181,6 +191,13 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         PROVIDER_ARGUMENT,
         ToolAuthorization::LocalConfirmation,
     ),
+    source_discovery(
+        "Source.Discover",
+        "Discover bounded exact provider objects and receipt-bound ingestion authority.",
+        ServiceDomain::Source,
+        SOURCE_DISCOVERY_SCOPE,
+        SOURCE_DISCOVERY_ARGUMENTS,
+    ),
     read(
         "Market.GetSnapshot",
         "Return current bounded market state with explicit coverage and quality evidence.",
@@ -236,7 +253,7 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         DATASET_ARGUMENT,
         SourceEvidencePolicy::Required,
     ),
-    mutation(
+    source_ingest(
         "Research.IngestSource",
         "Extract and ingest one configured provider object under retained rights authority.",
         ServiceDomain::Research,
@@ -544,7 +561,7 @@ pub fn application_capabilities() -> Result<ServiceCapabilities, ServiceCapabili
         let effects = if matches!(spec.authorization, ToolAuthorization::ReadOnly) {
             ToolEffects::read_only_closed_world()
         } else {
-            ToolEffects::try_new(false, spec.destructive, spec.idempotent, false)?
+            ToolEffects::try_new(false, spec.destructive, spec.idempotent, spec.open_world)?
         };
         let contract = ToolContract::new(
             spec.domain,
@@ -578,6 +595,7 @@ struct OperationSpec {
     artifact: ToolArtifactPolicy,
     destructive: bool,
     idempotent: bool,
+    open_world: bool,
 }
 
 const fn read(
@@ -599,6 +617,7 @@ const fn read(
         artifact: ToolArtifactPolicy::OpaqueOnOverflow,
         destructive: false,
         idempotent: true,
+        open_world: false,
     }
 }
 
@@ -621,6 +640,7 @@ const fn mutation(
         artifact: ToolArtifactPolicy::InlineOnly,
         destructive: true,
         idempotent: false,
+        open_world: false,
     }
 }
 
@@ -643,6 +663,52 @@ const fn idempotent_mutation(
         artifact: ToolArtifactPolicy::InlineOnly,
         destructive: true,
         idempotent: true,
+        open_world: false,
+    }
+}
+
+const fn source_discovery(
+    name: &'static str,
+    description: &'static str,
+    domain: ServiceDomain,
+    scope: ToolScope,
+    arguments: &'static [ArgumentSpec],
+) -> OperationSpec {
+    OperationSpec {
+        name,
+        description,
+        domain,
+        scope,
+        arguments,
+        authorization: ToolAuthorization::LocalConfirmation,
+        source_evidence: SourceEvidencePolicy::Required,
+        artifact: ToolArtifactPolicy::InlineOnly,
+        destructive: false,
+        idempotent: false,
+        open_world: true,
+    }
+}
+
+const fn source_ingest(
+    name: &'static str,
+    description: &'static str,
+    domain: ServiceDomain,
+    scope: ToolScope,
+    arguments: &'static [ArgumentSpec],
+    authorization: ToolAuthorization,
+) -> OperationSpec {
+    OperationSpec {
+        name,
+        description,
+        domain,
+        scope,
+        arguments,
+        authorization,
+        source_evidence: SourceEvidencePolicy::Required,
+        artifact: ToolArtifactPolicy::InlineOnly,
+        destructive: false,
+        idempotent: true,
+        open_world: true,
     }
 }
 

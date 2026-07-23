@@ -25,6 +25,8 @@ use super::{
 pub struct ResearchSourceDiscoveryObject {
     #[serde(flatten)]
     source_object: SourceObject,
+    #[serde(skip)]
+    receipt: Uuid,
     discovery_receipt: String,
     discovery_receipt_expires_at: Timestamp,
 }
@@ -192,6 +194,7 @@ impl RetainedDiscoverySelections {
             });
             objects.push(ResearchSourceDiscoveryObject {
                 source_object: object.clone(),
+                receipt,
                 discovery_receipt: receipt_text,
                 discovery_receipt_expires_at: receipt_expiry,
             });
@@ -218,6 +221,42 @@ impl RetainedDiscoverySelections {
         self.entries.retain(|selection| {
             selection.monotonic_expiry > observed_monotonic && selection.wall_expiry > observed_wall
         });
+    }
+
+    pub(super) fn revoke(
+        &mut self,
+        discovery: &ResearchSourceDiscovery,
+    ) -> Result<(), ServiceError> {
+        if discovery.objects.iter().enumerate().any(|(index, object)| {
+            discovery.objects[index.saturating_add(1)..]
+                .iter()
+                .any(|candidate| candidate.receipt == object.receipt)
+        }) {
+            return Err(ServiceError::InvalidResult);
+        }
+        for selection in &self.entries {
+            let Some(object) = discovery
+                .objects
+                .iter()
+                .find(|object| object.receipt == selection.receipt)
+            else {
+                continue;
+            };
+            if selection.profile != discovery.profile
+                || selection.metadata != discovery.metadata
+                || selection.request != discovery.request
+                || selection.object != object.source_object
+            {
+                return Err(ServiceError::InvalidResult);
+            }
+        }
+        self.entries.retain(|selection| {
+            !discovery
+                .objects
+                .iter()
+                .any(|object| object.receipt == selection.receipt)
+        });
+        Ok(())
     }
 
     pub(super) fn clear(&mut self) {
