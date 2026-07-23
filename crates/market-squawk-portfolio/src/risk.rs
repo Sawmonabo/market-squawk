@@ -147,11 +147,11 @@ impl PortfolioRiskReport {
                 limit: limits.max_history,
             });
         }
-        if scenarios.len() > limits.max_scenarios || scenarios.len() > limits.max_results {
+        if scenarios.len() > limits.max_scenarios {
             return Err(PortfolioError::LimitExceeded {
                 resource: "risk scenarios",
                 observed: scenarios.len(),
-                limit: limits.max_scenarios.min(limits.max_results),
+                limit: limits.max_scenarios,
             });
         }
         let total_shocks = scenarios.iter().try_fold(0_usize, |total, scenario| {
@@ -164,26 +164,30 @@ impl PortfolioRiskReport {
             }
             checked_usize_add(total, scenario.shocks.len())
         })?;
-        if total_shocks > limits.max_results {
-            return Err(PortfolioError::LimitExceeded {
-                resource: "scenario shocks",
-                observed: total_shocks,
-                limit: limits.max_results,
-            });
-        }
         let allocation_rows = revision.positions().len();
-        if allocation_rows > limits.max_results {
+        if allocation_rows > limits.max_instruments {
             return Err(PortfolioError::LimitExceeded {
                 resource: "risk allocation rows",
                 observed: allocation_rows,
-                limit: limits.max_results,
+                limit: limits.max_instruments,
             });
         }
         let scenario_work = checked_usize_mul(allocation_rows, total_shocks)?;
-        if scenario_work > limits.max_results {
+        let kernel_contribution_rows = checked_usize_mul(allocation_rows, scenarios.len())?;
+        let work_rows = [
+            scenarios.len(),
+            allocation_rows,
+            total_shocks,
+            scenario_work,
+            kernel_contribution_rows,
+            scenarios.len(),
+        ]
+        .into_iter()
+        .try_fold(0_usize, checked_usize_add)?;
+        if work_rows > limits.max_results {
             return Err(PortfolioError::LimitExceeded {
-                resource: "scenario work",
-                observed: scenario_work,
+                resource: "risk work",
+                observed: work_rows,
                 limit: limits.max_results,
             });
         }

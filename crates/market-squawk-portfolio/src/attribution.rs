@@ -82,10 +82,25 @@ impl AttributionReport {
     ) -> Result<Self, PortfolioError> {
         let report_through = revision.evidence().as_of();
         analytics_evidence.validate_report(revision, report_through, report_through)?;
-        if inputs.is_empty() || inputs.len() > limits.max_results {
+        if inputs.is_empty() {
             return Err(PortfolioError::LimitExceeded {
                 resource: "attribution inputs",
                 observed: inputs.len(),
+                limit: limits.max_results,
+            });
+        }
+        if inputs.len() > limits.max_instruments {
+            return Err(PortfolioError::LimitExceeded {
+                resource: "attribution instruments",
+                observed: inputs.len(),
+                limit: limits.max_instruments,
+            });
+        }
+        let work_rows = checked_usize_mul(inputs.len(), 4)?;
+        if work_rows > limits.max_results {
+            return Err(PortfolioError::LimitExceeded {
+                resource: "attribution work",
+                observed: work_rows,
                 limit: limits.max_results,
             });
         }

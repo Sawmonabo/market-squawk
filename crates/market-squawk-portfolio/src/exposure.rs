@@ -1,6 +1,5 @@
 //! Revision-bound allocation and multi-dimensional exposure.
 
-use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use market_squawk_analytics::{
@@ -228,9 +227,12 @@ impl ExposureReport {
             });
         }
         let factor_index_rows = factor_occurrences;
+        let allocation_rows = positions;
+        let kernel_rows = positions;
         let work_rows = [
             worst_lines,
-            positions,
+            allocation_rows,
+            kernel_rows,
             classifications.len(),
             factor_index_rows,
         ]
@@ -284,15 +286,12 @@ impl ExposureReport {
         {
             return Err(PortfolioError::InvalidDimension);
         }
-        let mut instrument = Vec::new();
-        instrument
-            .try_reserve_exact(positions)
-            .map_err(|_| PortfolioError::AllocationFailed)?;
-        let mut sector = BTreeMap::new();
-        let mut factor = BTreeMap::new();
-        let mut currency = BTreeMap::new();
-        let mut issuer = BTreeMap::new();
-        let mut venue = BTreeMap::new();
+        let mut instrument = try_exposure_lines(positions)?;
+        let mut sector = try_exposure_lines(positions)?;
+        let mut factor = try_exposure_lines(factor_occurrences)?;
+        let mut currency = try_exposure_lines(positions)?;
+        let mut issuer = try_exposure_lines(positions)?;
+        let mut venue = try_exposure_lines(positions)?;
         let mut allocations = Vec::new();
         allocations
             .try_reserve_exact(positions)
@@ -366,11 +365,6 @@ impl ExposureReport {
                     .map_err(|_| PortfolioError::Arithmetic)
             },
         )?;
-        let sector = lines(sector)?;
-        let factor = lines(factor)?;
-        let currency = lines(currency)?;
-        let issuer = lines(issuer)?;
-        let venue = lines(venue)?;
         let retained_bytes = exposure_retained_bytes([
             (&instrument, instrument.capacity()),
             (&sector, sector.capacity()),
@@ -470,45 +464,66 @@ pub(crate) fn try_instrument_dimension(
 }
 
 fn aggregate(
-    values: &mut BTreeMap<String, Money>,
+    values: &mut Vec<ExposureLine>,
     key: &str,
     amount: Money,
 ) -> Result<(), PortfolioError> {
-    if let Some(current) = values.get_mut(key) {
-        *current = current
-            .checked_add(amount)
-            .map_err(|_| PortfolioError::Arithmetic)?;
-    } else {
-        values.insert(try_owned_string(key)?, amount);
+    match values.binary_search_by(|line| line.dimension.as_str().cmp(key)) {
+        Ok(index) => {
+            let current = &mut values[index].amount;
+            *current = current
+                .checked_add(amount)
+                .map_err(|_| PortfolioError::Arithmetic)?;
+        }
+        Err(index) => {
+            if values.len() == values.capacity() {
+                return Err(PortfolioError::AllocationFailed);
+            }
+            values.insert(
+                index,
+                ExposureLine {
+                    dimension: try_owned_string(key)?,
+                    amount,
+                },
+            );
+        }
     }
     Ok(())
 }
 
 fn aggregate_owned(
-    values: &mut BTreeMap<String, Money>,
+    values: &mut Vec<ExposureLine>,
     key: String,
     amount: Money,
 ) -> Result<(), PortfolioError> {
-    if let Some(current) = values.get_mut(key.as_str()) {
-        *current = current
-            .checked_add(amount)
-            .map_err(|_| PortfolioError::Arithmetic)?;
-    } else {
-        values.insert(key, amount);
+    match values.binary_search_by(|line| line.dimension.as_str().cmp(key.as_str())) {
+        Ok(index) => {
+            let current = &mut values[index].amount;
+            *current = current
+                .checked_add(amount)
+                .map_err(|_| PortfolioError::Arithmetic)?;
+        }
+        Err(index) => {
+            if values.len() == values.capacity() {
+                return Err(PortfolioError::AllocationFailed);
+            }
+            values.insert(
+                index,
+                ExposureLine {
+                    dimension: key,
+                    amount,
+                },
+            );
+        }
     }
     Ok(())
 }
 
-fn lines(values: BTreeMap<String, Money>) -> Result<Vec<ExposureLine>, PortfolioError> {
+fn try_exposure_lines(capacity: usize) -> Result<Vec<ExposureLine>, PortfolioError> {
     let mut lines = Vec::new();
     lines
-        .try_reserve_exact(values.len())
+        .try_reserve_exact(capacity)
         .map_err(|_| PortfolioError::AllocationFailed)?;
-    lines.extend(
-        values
-            .into_iter()
-            .map(|(dimension, amount)| ExposureLine { dimension, amount }),
-    );
     Ok(lines)
 }
 

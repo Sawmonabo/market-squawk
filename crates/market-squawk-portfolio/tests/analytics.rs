@@ -20,8 +20,9 @@ use market_squawk_portfolio::{
     ExposureReport, FactorLoading, InstrumentClassification, LedgerEntry, LedgerEntryKind,
     LotSelection, MoneyWeightedMethod, PerformancePeriod, PerformancePolicy, PerformanceReport,
     PortfolioAnalyticsEvidence, PortfolioError, PortfolioLedger, PortfolioLimitInput,
-    PortfolioLimits, PortfolioRiskReport, RebalanceConstraintInput, RebalanceConstraints,
-    RebalanceProposal, RebalanceTarget, ScenarioDefinition, Trade, TradeSide, TransactionRevision,
+    PortfolioLimits, PortfolioRevision, PortfolioRiskReport, RebalanceConstraintInput,
+    RebalanceConstraints, RebalanceProposal, RebalanceTarget, ScenarioDefinition, Trade, TradeSide,
+    TransactionRevision, ValuationSet,
 };
 use rust_decimal::Decimal;
 
@@ -207,9 +208,25 @@ fn analytics_limits(
     max_results: usize,
     max_retained_bytes: usize,
 ) -> Result<PortfolioLimits, PortfolioError> {
+    analytics_limits_with_instruments(
+        16,
+        max_factors,
+        max_scenarios,
+        max_results,
+        max_retained_bytes,
+    )
+}
+
+fn analytics_limits_with_instruments(
+    max_instruments: usize,
+    max_factors: usize,
+    max_scenarios: usize,
+    max_results: usize,
+    max_retained_bytes: usize,
+) -> Result<PortfolioLimits, PortfolioError> {
     PortfolioLimits::try_new(PortfolioLimitInput {
         max_accounts: 4,
-        max_instruments: 16,
+        max_instruments,
         max_lots: 64,
         max_transactions: 128,
         max_factors,
@@ -218,6 +235,176 @@ fn analytics_limits(
         max_results,
         max_retained_bytes,
     })
+}
+
+fn empty_revision(currency: Currency) -> Result<PortfolioRevision, Box<dyn Error>> {
+    let limits = super::limits()?;
+    let mut ledger = PortfolioLedger::try_new(account()?, currency, limits)?;
+    Ok(ledger.try_apply(
+        Vec::new(),
+        None,
+        ValuationSet::try_new(
+            currency,
+            Timestamp::from_unix_nanos(4),
+            dataset(9)?,
+            Sha256Digest::new([9; 32]),
+            Vec::new(),
+            Vec::new(),
+            limits,
+        )?,
+        super::revision_evidence(9, 4)?,
+    )?)
+}
+
+#[test]
+fn currency_distinct_revisions_reject_shared_analytics_evidence() -> TestResult {
+    let usd = Currency::try_from("USD")?;
+    let eur = Currency::try_from("EUR")?;
+    let usd_revision = empty_revision(usd)?;
+    let eur_revision = empty_revision(eur)?;
+    let evidence = analytics_evidence(&usd_revision, 4, 4)?;
+    let limits = super::limits()?;
+    let policy = PerformancePolicy::new(
+        market_squawk_portfolio::CashFlowTiming::EndOfPeriod,
+        MoneyWeightedMethod::ModifiedDietz,
+        NonZeroU32::MIN,
+    );
+    let returns = ReturnSeries::try_new(
+        vec![StatisticalInput::try_new(
+            0.0,
+            StatisticalUnit::Return,
+            StatisticalScale::Unit,
+        )?],
+        Annualization::PeriodsPerYear(NonZeroU32::MIN),
+    )?;
+
+    assert_ne!(usd_revision.id(), eur_revision.id());
+    assert!(matches!(
+        PerformanceReport::try_calculate(&eur_revision, &evidence, &[], policy, limits),
+        Err(PortfolioError::RevisionMismatch)
+    ));
+    assert!(matches!(
+        ExposureReport::try_calculate(&eur_revision, &evidence, &[], limits),
+        Err(PortfolioError::RevisionMismatch)
+    ));
+    assert!(matches!(
+        AttributionReport::try_calculate(&eur_revision, &evidence, &[], limits),
+        Err(PortfolioError::RevisionMismatch)
+    ));
+    assert!(matches!(
+        PortfolioRiskReport::try_calculate(
+            &eur_revision,
+            &evidence,
+            &returns,
+            &returns,
+            &[],
+            Quantile::try_new(0.5)?,
+            &[],
+            limits,
+        ),
+        Err(PortfolioError::RevisionMismatch)
+    ));
+    Ok(())
+}
+
+#[test]
+fn analytics_work_admission_covers_all_temporary_and_output_rows() -> TestResult {
+    let revision = analytics_revision()?;
+    let evidence = analytics_evidence(&revision, 4, 4)?;
+    let usd = Currency::try_from("USD")?;
+    let inputs = [
+        AttributionInput::try_new(
+            instrument(1)?,
+            money(120, usd),
+            ExactRate::try_new(Decimal::ZERO, ExactDecimalScale::Unit)?,
+        )?,
+        AttributionInput::try_new(
+            instrument(2)?,
+            money(90, usd),
+            ExactRate::try_new(Decimal::ZERO, ExactDecimalScale::Unit)?,
+        )?,
+    ];
+
+    assert_eq!(
+        AttributionReport::try_calculate(
+            &revision,
+            &evidence,
+            &inputs,
+            analytics_limits_with_instruments(16, 16, 16, 7, 1024 * 1024)?,
+        ),
+        Err(PortfolioError::LimitExceeded {
+            resource: "attribution work",
+            observed: 8,
+            limit: 7,
+        })
+    );
+    assert_eq!(
+        AttributionReport::try_calculate(
+            &revision,
+            &evidence,
+            &inputs,
+            analytics_limits_with_instruments(1, 16, 16, 128, 1024 * 1024)?,
+        ),
+        Err(PortfolioError::LimitExceeded {
+            resource: "attribution instruments",
+            observed: 2,
+            limit: 1,
+        })
+    );
+
+    let returns = ReturnSeries::try_new(
+        vec![StatisticalInput::try_new(
+            0.0,
+            StatisticalUnit::Return,
+            StatisticalScale::Unit,
+        )?],
+        Annualization::PeriodsPerYear(NonZeroU32::MIN),
+    )?;
+    let scenarios = [ScenarioDefinition::try_new(
+        source("single-shock")?,
+        ShockComposition::Additive,
+        vec![market_squawk_analytics::ScenarioShock::try_new(
+            &format!("instrument-{}", instrument(1)?),
+            ExactRate::try_new(Decimal::NEGATIVE_ONE, ExactDecimalScale::Unit)?,
+        )?],
+        super::limits()?,
+    )?];
+
+    assert_eq!(
+        PortfolioRiskReport::try_calculate(
+            &revision,
+            &evidence,
+            &returns,
+            &returns,
+            &[],
+            Quantile::try_new(0.5)?,
+            &scenarios,
+            analytics_limits_with_instruments(16, 16, 16, 8, 1024 * 1024)?,
+        ),
+        Err(PortfolioError::LimitExceeded {
+            resource: "risk work",
+            observed: 9,
+            limit: 8,
+        })
+    );
+    assert_eq!(
+        PortfolioRiskReport::try_calculate(
+            &revision,
+            &evidence,
+            &returns,
+            &returns,
+            &[],
+            Quantile::try_new(0.5)?,
+            &scenarios,
+            analytics_limits_with_instruments(1, 16, 16, 128, 1024 * 1024)?,
+        ),
+        Err(PortfolioError::LimitExceeded {
+            resource: "risk allocation rows",
+            observed: 2,
+            limit: 1,
+        })
+    );
+    Ok(())
 }
 
 #[test]

@@ -146,6 +146,7 @@ pub(crate) fn build_revision(
         .collect::<Vec<_>>();
     let id = revision_id(
         account_id,
+        base_currency,
         previous_revision_id,
         &ordered,
         &corporate_actions,
@@ -342,6 +343,7 @@ fn aggregate_basis_measurement(
 
 fn revision_id(
     account_id: AccountId,
+    base_currency: Currency,
     previous: Option<PortfolioRevisionId>,
     entries: &[LedgerEntry],
     actions: &[CorporateActionBinding],
@@ -349,8 +351,9 @@ fn revision_id(
     evidence: &RevisionEvidence,
 ) -> PortfolioRevisionId {
     let mut digest = Sha256::new();
-    digest.update(b"market-squawk-portfolio-revision-v2\0action-before-entry\0");
+    digest.update(b"market-squawk-portfolio-revision-v3\0action-before-entry\0");
     digest.update(account_id.as_uuid().as_bytes());
+    hash_bytes(&mut digest, base_currency.as_str().as_bytes());
     digest.update(previous.map_or([0_u8; 32], |revision_id| revision_id.0));
     digest.update(evidence.as_of.unix_nanos().to_be_bytes());
     digest.update(evidence.dataset.dataset_id().as_str().as_bytes());
