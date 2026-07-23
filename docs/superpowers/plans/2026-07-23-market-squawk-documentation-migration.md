@@ -32,7 +32,7 @@ documentation-only work and adds no runtime dependency, generator, test, or chec
 | Execution source head | `836aae662dfbbc3cf40e94e6da6c5c37cd3b57bd` |
 | Execution source tree | `774a7bc9f4f26eb437fa1ab061dc4b557d20d0bc` |
 | Accepted-head refresh | 2026-07-23 against a clean worktree and the locked release binary |
-| Refresh commit | Pending the Task 1 barrier commit; Task 2 cannot start until this row is pinned |
+| Refresh commit | `93cd746664f28d5f1fd42f1308136ce566d867a2` |
 | Release boundary | Required for the first complete local `v0.1.0` release |
 | Delivery-state authority | `docs/plans/delivery-ledger.md` |
 
@@ -271,7 +271,7 @@ return it to the product owner. This refresh used that authority for the removed
 complete CLI/MCP, portfolio import, FairValue composition, source-closure cardinality, and Quarter
 3 gate statements.
 
-- [ ] **Record, verify, and commit the barrier**
+- [x] **Record, verify, and commit the barrier**
 
 Update the ledger with accepted source head, design blob, refresh outcome, allowed runnable scope,
 blockers, ownership, and Task 2 as the next barrier.

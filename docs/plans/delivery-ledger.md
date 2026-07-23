@@ -16,8 +16,8 @@ evidence; it does not replace the README capability truth or the canonical relea
   `7fdb58ece5b41211493cd4026773974ff30ce240` when the migration branch was created.
 - Active documentation branch: `docs/product-documentation`. It uses the one existing worktree;
   no per-page branch, worktree, Cargo invocation, or build-cache duplicate is authorized.
-- Documentation refresh commit: pending the first Task 1 barrier commit. Task 2 cannot start until
-  the exact commit is pinned here and in the implementation plan.
+- Documentation refresh commit: `93cd746664f28d5f1fd42f1308136ce566d867a2`. Task 1 is closed;
+  Task 2 is the active history-preserving move and maintained-link inventory barrier.
 - Pre-status Quarter 3 capability-code head: `daf183a`
   (`fix(python): make native module the sealed package root`). This is a durable milestone, not the
   moving release-branch head.
