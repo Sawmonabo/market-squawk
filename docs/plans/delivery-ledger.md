@@ -14,10 +14,18 @@ evidence; it does not replace the README capability truth or the canonical relea
   `774a7bc9f4f26eb437fa1ab061dc4b557d20d0bc`. The source worktree was clean, the release
   branch matched `origin`, and the approved design blob was
   `7fdb58ece5b41211493cd4026773974ff30ce240` when the migration branch was created.
-- Active documentation branch: `docs/product-documentation`. It uses the one existing worktree;
-  no per-page branch, worktree, Cargo invocation, or build-cache duplicate is authorized.
-- Documentation refresh commit: `93cd746664f28d5f1fd42f1308136ce566d867a2`. Task 1 is closed;
-  Task 2 is the active history-preserving move and maintained-link inventory barrier.
+- Active documentation branch: `docs/product-documentation`. It uses the one root worktree; no
+  per-page branch, worktree, Cargo invocation, or duplicate build cache was created.
+- Documentation authority/history commits: accepted-head refresh `93cd746`, pinned execution
+  barrier `6a06b34`, and history-preserving model-runbook move `c3b3512`.
+- Documentation architecture/reference commits: tool-inventory correction `97383df`, CLI/config
+  reference `c863df1`, time/trust/ADR content `f2a6331`, quality/time reference `b29d13a`, runtime
+  planes `c31a7a3`, context/deployment/quality `6d44f8e`, archived baselines `bc46da3`, portal/ADR
+  indexes `27b30af`, and MCP/source reference `ee0f32e`.
+- Documentation operations commits: bootstrap/configuration/sources `03d44ad`,
+  research/datasets/models `593c5ee`, and portfolio/recovery/troubleshooting `531a7df`. The portal,
+  root navigation, plan state, memory, and this ledger are finalized by the commit containing this
+  record.
 - Pre-status Quarter 3 capability-code head: `daf183a`
   (`fix(python): make native module the sealed package root`). This is a durable milestone, not the
   moving release-branch head.
@@ -42,20 +50,22 @@ evidence; it does not replace the README capability truth or the canonical relea
 - Integrated and pushed hardening code head: `2d39b0a34eb818f817973210148355c88f8f4b52`
 - Hardening owner: GitHub issue `#30`, Project 5
 - Hardening status: implemented, verified, integrated, pushed, and cleaned up
-- Documentation-system lane: the production documentation information architecture is approved and
-  is a release blocker for the first complete local release. The canonical written design is
+- Documentation-system lane: the approved GitHub-native portal content is assembled. The canonical
+  written design is
   [`2026-07-22-market-squawk-documentation-system-design.md`](../superpowers/specs/2026-07-22-market-squawk-documentation-system-design.md).
-  Its written-spec review and concrete implementation plan are complete. The accepted-head refresh
-  is active, and the existing ONNX runbook is ready for its history-preserving move after the Task 1
-  barrier is committed. The complete architecture/reference/operations portal remains mandatory
-  before Task 20 closeout.
+  Architecture, operations, reference, ADR, and dated-audit pages now satisfy the approved content
+  tree against product head `836aae6`. Documentation-migration Tasks 1–6 are complete; Task 7's
+  frozen-candidate review, GitHub Mermaid inspection, release fast-forward, evidence publication,
+  and branch cleanup remain before the documentation blocker closes.
 - Product release status: runnable product capabilities exist across every required domain, but the
   release remains blocked on provider qualification and rights outcomes, complete onboarding
-  workflows and clean-machine evidence, documentation migration, prerequisite-issue
-  reconciliation, and Task 20's integrated demonstration, performance/fuzz/security evidence,
-  final grouped review, exact-head gate, publication, and cleanup.
+  workflows and clean-machine evidence, provider discovery-to-ingestion, the public
+  dataset-to-Python export handoff, a supported application-bound Python/model first-use workflow,
+  an ONNX candidate producer/demo, prerequisite-issue reconciliation, documentation Task 7, and
+  Task 20's integrated demonstration, performance/fuzz/security evidence, final grouped review,
+  exact-head gate, publication, and cleanup.
 
-## Documentation accepted-head refresh
+## Documentation candidate and accepted-head truth
 
 The 2026-07-23 refresh inspected code, the locked exact-head release binary, accepted evidence, the
 README, this ledger, open GitHub issues, and Project 5. It established the following current scope
@@ -68,21 +78,39 @@ for documentation writers:
   and 59 code-owned tool descriptors. The removed five-tool diagnostic server is neither a current
   capability nor a reference source.
 - Arrow/Parquet/DataFusion research storage, point-in-time dataset construction, Python financial
-  analytics/training, immutable model bundles, native and tract ONNX inference, governed
+  and training components, immutable model bundles, native and tract ONNX inference, governed
   backtesting, portfolio accounting/analytics, realistic paper execution, and fair-value analysis
-  are runnable product capabilities at the source head.
-- SEC, BLS, and Treasury Fiscal Data have evidence-bound onboarding and adapter-activation paths.
-  Remaining provider workflows and the clean-machine Task 19A demonstration are not yet accepted.
+  are implemented product capabilities at the source head. Their missing public first-use handoffs
+  remain explicit below.
+- SEC, BLS, and Treasury Fiscal Data have evidence-bound onboarding and adapter-activation
+  implementations. Only Treasury Fiscal Data is release-available at this head. SEC and BLS require
+  refreshed code-owned evidence, FRED is rights-blocked, and the clean-machine Task 19A
+  demonstration is not accepted.
 - Coinbase and Kraken remain capped at `DirectUnverified`; no current provider observation can
   satisfy the default `DirectVerified` automated-execution gate. FRED/ALFRED durable use remains
   fail-closed without affirmative per-series rights.
 
-The refresh found stale README status statements for the removed diagnostic MCP, complete CLI/MCP,
+The migration corrected stale README statements for the removed diagnostic MCP, complete CLI/MCP,
 portfolio import, FairValue composition, Python source-closure cardinality, and the Quarter 3 gate.
-Those statements are corrected in the same barrier change from the implementation and accepted
-evidence; no unavailable procedure is promoted to runnable. Open issues `#7`, `#9`, `#10`, `#11`,
-`#24`, `#25`, and `#31` retain their current GitHub state until their exact closing outcomes are
-reconciled. Task 2—the model-runbook Git move and maintained-link inventory—is the next barrier.
+Source-derived runbooks then exposed additional mandatory product gaps instead of writing fictional
+procedures:
+
+- FRED/ALFRED, BLS, and Treasury adapters validate digest-bearing object identities, but no public
+  discovery command returns the exact IDs needed for a first-use ingestion.
+- `dataset list` does not expose its service cursor after the first 64 dataset identities, and
+  `feature build` does not populate the public feature-dataset registry.
+- Dataset publication registers a Python export descriptor but exposes neither `exportSha256` nor
+  a public retrieval operation.
+- The Python release builder does not build and bind the final application bundle, no supported
+  production training driver completes that handoff, and no supported ONNX candidate producer/demo
+  exists.
+- Optional external ONNX Runtime support exists at library/evidence level but is not selectable by
+  the current product composition; required tract inference remains the shipping ONNX path.
+
+As verified through GitHub on 2026-07-23, issues `#7`, `#9`, `#10`, `#11`, `#24`, `#25`, and `#31`
+remain open. Project 5 marks `#7`, `#9`, `#10`, `#11`, `#24`, and `#31` In Progress and `#25` Todo.
+They remain open until exact closing evidence is reconciled. The next documentation barrier is Task
+7's one-candidate grouped review; the next product barriers remain Tasks 19/19A and Task 20.
 
 ## Product delivery closeout and next barrier
 
@@ -231,7 +259,7 @@ reconciled. Task 2—the model-runbook Git move and maintained-link inventory—
 - Consolidated existing integration tests from 115 separately linked executables to 41 without
   adding behavioral tests or removing the inventoried assertions, ignored network tests, Loom
   models, or Trybuild privacy checks.
-- Scoped Rust 1.97's macOS compact-unwind linker diagnostic only at the four measured affected test
+- Scoped Rust 1.97's macOS compact-unwind linker diagnostic only at the five measured affected test
   crates. The production binary and workspace-wide diagnostics remain unsuppressed; unsafe linker
   workarounds were not introduced.
 - Corrected the stdio MCP smoke client's required initialization handshake and published bounded,
@@ -293,6 +321,10 @@ application size.
 
 ## Cleanup state
 
+- Current documentation checkpoint: one root worktree on `docs/product-documentation`, no linked
+  worktrees under `.worktrees`, no documentation lane branch fan-out, and a 15 GiB root `target/`
+  below the enforced 20 GiB ceiling. The documentation lane ran no Cargo command.
+
 - After the terminal Quarter 3 gate, recorded the 15,131,260 KiB peak and removed 36,502 generated
   files/14.3 GiB with `cargo clean`. The root target is absent, about 125 GiB is free, only the
   release worktree remains, local and origin release heads match, and issues `#20`, `#21`, and `#22`
@@ -347,7 +379,10 @@ application size.
   deleted the merged local product branch, confirmed no matching origin branch existed, and pruned
   worktree and remote metadata. Only the release worktree remains.
 
-The next delivery event is Quarter 4 implementation of Tasks 19 and 19A in nonconflicting product
-lanes, followed by Task 20's integrated demonstration, evidence, final review, exact-head release
-gate, publication, and cleanup. Quarter 3 acceptance does not claim that the Market Squawk product
-release is complete.
+The next delivery event is documentation Task 7: freeze one exact portal candidate, perform the
+grouped Quarter 4 documentation review, remediate substantiated findings, inspect GitHub Mermaid
+rendering, fast-forward the unchanged release source, publish evidence, and remove the completed
+documentation branch. Product work then resumes on the open Task 19/19A acceptance gaps and Task
+20's integrated demonstration, evidence, final review, exact-head release gate, publication, and
+cleanup. Neither Quarter 3 acceptance nor the documentation portal claims that the Market Squawk
+product release is complete.

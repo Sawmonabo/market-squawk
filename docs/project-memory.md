@@ -59,18 +59,18 @@ They converge only at the plan's explicit approved-base refresh barrier.
 
 The approved documentation system in
 [`2026-07-22-market-squawk-documentation-system-design.md`](superpowers/specs/2026-07-22-market-squawk-documentation-system-design.md)
-is required for the first complete local release. `docs/README.md` will route readers into focused
+is required for the first complete local release. `docs/README.md` routes readers into focused
 architecture, operations, reference, ADR, audit, plan, report, research, testing, and verification
 areas. Architecture explains system boundaries and decisions; operations documents only runnable
 procedures; reference describes exact current interfaces; the delivery ledger alone owns mutable
 release state.
 
-The documentation migration preserves the current architecture documents as dated audit evidence,
-preserves the ONNX runbook's history when it becomes the broader model-inference runbook, uses
-stable GitHub-rendered Mermaid forms with accompanying prose, and records direct relevant sources
-with substantive review dates. Mandatory unfinished capabilities remain release blockers and do not
-receive fictional operating instructions. Do not add redirect-only pages, empty section shells,
-documentation checker scripts, prose tests, or new Rust test targets for this work.
+The documentation migration preserved the architecture source documents as dated audit evidence
+and preserved the ONNX runbook's history in the broader model-inference runbook. Current pages use
+stable GitHub-rendered Mermaid forms with accompanying prose and record direct relevant sources
+with substantive review dates. Mandatory unfinished capabilities remain release blockers and do
+not receive fictional operating instructions. Do not add redirect-only pages, empty section shells,
+documentation checker scripts, prose tests, or new Rust test targets for documentation work.
 
 ## Maximum-safe parallelism
 
@@ -639,5 +639,36 @@ branch, and local/origin release heads match.
 Issues `#24` and `#31` remain In Progress. Task 19A still requires its clean-machine final
 demonstration and closure of every required provider workflow; Task 19 remains open until its
 application/CLI/MCP acceptance evidence and prerequisite issue reconciliation are recorded. Task
-20 remains Todo and owns the final exact-head proof, release review, documentation migration
-acceptance, publication and repository cleanup.
+20 remains Todo and owns the final exact-head product proof, release review, publication, and
+repository cleanup after the documentation candidate is accepted.
+
+## 2026-07-23 product documentation candidate
+
+The GitHub-native documentation portal is assembled on `docs/product-documentation` against frozen
+product head `836aae662dfbbc3cf40e94e6da6c5c37cd3b57bd` and tree
+`774a7bc9f4f26eb437fa1ab061dc4b557d20d0bc`. The migration preserved the two architecture
+baselines as dated audit evidence, preserved the model runbook's `git log --follow` ancestry, and
+added focused architecture, ADR, operations, and reference pages plus reader-oriented indexes. The
+published content waves through `531a7df` contain no product/build-input delta from the frozen head.
+
+Documentation work used one shared root worktree and no per-page branch, worktree, Cargo command,
+test, checker, generator, or build-cache duplicate. At the candidate checkpoint, `.worktrees` is
+empty and the existing root `target/` is 15 GiB, below the enforced 20 GiB ceiling. Completed
+content commits are recorded in the delivery ledger and pushed to
+`origin/docs/product-documentation`.
+
+The runbook review corrected command-level defects before integration and exposed mandatory product
+gaps that remain release blockers: provider discovery object IDs are not publicly returned for
+FRED/BLS/Treasury first-use ingestion; the dataset export digest needed by Python is not exposed;
+feature builds do not populate the public feature-dataset registry; the sealed Python builder does
+not construct the matching final application bundle; and no supported production training driver
+or ONNX candidate producer/demo exists. Optional external ONNX Runtime remains a library-level path
+that the current product composition does not select. These gaps belong to Tasks 19/19A/20 and must
+not be described as a complete operator workflow.
+
+Documentation-migration Tasks 1–6 are complete. Task 7 now owns one frozen-candidate grouped review
+covering architecture/authority, operational runnability/recovery, and factual
+reference/navigation/history/source truth; remediation of every substantiated finding; GitHub
+Mermaid inspection; fast-forward integration into the unchanged release branch; evidence
+publication; and deletion of the completed documentation branch locally and on origin. Product
+issues and Project 5 items remain open until their separate acceptance evidence exists.

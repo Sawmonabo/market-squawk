@@ -23,7 +23,7 @@ documentation-only work and adds no runtime dependency, generator, test, or chec
 
 | Field | Value |
 | --- | --- |
-| Plan status | Task 1 accepted-head refresh complete; Task 2 is the next barrier |
+| Plan status | Tasks 1–6 complete; Task 7 exact-candidate review and release integration are next |
 | Planning audit base | `46f86d9496287e1995f584537153ecb3fcb271ac` |
 | Audit-base meaning | Evidence anchor only; not implementation or release approval |
 | Approved design | `docs/superpowers/specs/2026-07-22-market-squawk-documentation-system-design.md` |
@@ -368,13 +368,13 @@ architecture source documents still present. This commit is the common base for 
 
 **Produces:** complete architecture content except indexes.
 
-- [ ] **Dispatch three disjoint lanes from the Task 2 commit**
+- [x] **Dispatch three disjoint lanes from the Task 2 commit**
 
 Each lane follows the global page contract and derives claims from Task 1 anchors. It may read other
 lanes but must edit only its assigned files. The integration owner does not edit lane files while
 workers are active.
 
-- [ ] **Require the architecture invariants**
+- [x] **Require the architecture invariants**
 
 Across the wave, ensure:
 
@@ -388,7 +388,7 @@ Across the wave, ensure:
 - no database, Parquet, Python, MCP, LLM, arbitrary filesystem, or unrelated network work in the
   live event-to-action path.
 
-- [ ] **Self-review and commit one cohesive change per lane**
+- [x] **Self-review and commit one cohesive change per lane**
 
 ```bash
 git diff --check -- docs/architecture
@@ -406,12 +406,12 @@ docs(architecture): record data trust and binding decisions
 Each handoff includes exact commit and manual source/diagram review evidence; no tests or checker are
 added.
 
-- [ ] **Integrate A1, A2, A3 in order and clean each lane**
+- [x] **Integrate A1, A2, A3 in order and clean each lane**
 
 Verify exclusive ownership, integrate unchanged, record commits in the ledger, push
 `docs/product-documentation`, then remove clean worktrees and merged/patch-equivalent branches.
 
-- [ ] **Archive the reconciled architecture baselines after all three lanes are integrated**
+- [x] **Archive the reconciled architecture baselines after all three lanes are integrated**
 
 The integration owner, not a lane writer, performs the history-bearing moves only after the new
 architecture pages have reconciled the durable content from both sources:
@@ -461,12 +461,12 @@ maintained link grants either archive current authority.
 
 **Produces:** complete factual reference except its index.
 
-- [ ] **Dispatch three disjoint lanes**
+- [x] **Dispatch three disjoint lanes**
 
 Writers derive tables from accepted public types, Clap/application definitions, configuration
 parsing, MCP descriptors, source metadata, and accepted bounds—not target prose.
 
-- [ ] **Enforce factual authority**
+- [x] **Enforce factual authority**
 
 - B1 lists no command without a real handler and marks DataFusion SQL CLI-only.
 - B2 lists no MCP tool without a registered descriptor/handler. Provider account/key requirements
@@ -475,7 +475,7 @@ parsing, MCP descriptors, source metadata, and accepted bounds—not target pros
 - B3 uses exact accepted type/field names and never collapses fair-value hierarchy, market depth, and
   data quality.
 
-- [ ] **Self-review and commit one cohesive change per lane**
+- [x] **Self-review and commit one cohesive change per lane**
 
 ```bash
 git diff --check -- docs/reference
@@ -490,7 +490,7 @@ docs(reference): document MCP and source coverage
 docs(reference): define quality time and provenance
 ```
 
-- [ ] **Integrate B1, B2, B3 in order and clean each lane**
+- [x] **Integrate B1, B2, B3 in order and clean each lane**
 
 Verify each table directly against Task 1 sources, integrate unchanged, update the ledger, push,
 then clean worktrees/branches.
@@ -503,19 +503,19 @@ then clean worktrees/branches.
 
 | Lane | Files | Runnable outcomes |
 | --- | --- | --- |
-| C1 | `docs/operations/installation-and-bootstrap.md`, `configuration-and-secrets.md`, `source-operations.md` | Install/bootstrap/doctor; precedence and opaque-secret lifecycle/redaction; source register/setup/start/status/coverage/health/stop/resynchronize using accepted commands |
+| C1 | `docs/operations/installation-and-bootstrap.md`, `configuration-and-secrets.md`, `source-operations.md` | Install/bootstrap/doctor; precedence and the composed secret-store boundary; source register/setup/status/coverage/health plus the exact absence of generic start/stop/resynchronize commands and provider-owned recovery boundaries |
 | C2 | `docs/operations/research-ingestion.md`, `datasets-and-query.md`, moved `model-inference.md` | Idempotent extraction/ingestion/provenance; manifests/PIT/compaction/bounded CLI query/Python export; preserved and broadened native/tract/optional ONNX bundle operations and recovery |
 | C3 | `docs/operations/portfolio-and-paper-execution.md`, `backup-and-recovery.md`, `troubleshooting.md` | Portfolio import/reconciliation/analytics; risk-enforced paper lifecycle; consistent catalog/dataset/journal/model/artifact backup/restore; bounded diagnosis across supported planes |
 
 **Consumes:** completed reference pages and the exact accepted release artifact/evidence.
 
-- [ ] **Dispatch three disjoint operations lanes**
+- [x] **Dispatch three disjoint operations lanes**
 
 Each writer exercises current procedures against a disposable controlled local instance or exact
 accepted fixture/evidence without rebuilding. A missing handler or unverifiable recovery path stops
 that lane and returns a product blocker.
 
-- [ ] **Enforce operational safety and truth**
+- [x] **Enforce operational safety and truth**
 
 - Mutations use accepted confirmation/authority and describe effect, success evidence, rollback, and
   recovery.
@@ -528,7 +528,7 @@ that lane and returns a product blocker.
   broker enablement.
 - Backup/recovery never exposes secret values or deletes unique state.
 
-- [ ] **Self-review and commit one cohesive change per lane**
+- [x] **Self-review and commit one cohesive change per lane**
 
 ```bash
 git diff --check -- docs/operations
@@ -544,7 +544,7 @@ docs(operations): document research datasets and models
 docs(operations): document portfolio recovery and diagnosis
 ```
 
-- [ ] **Integrate C1, C2, C3 in order and clean each lane**
+- [x] **Integrate C1, C2, C3 in order and clean each lane**
 
 Confirm every command exists in reference and every success/failure claim has accepted evidence.
 Integrate unchanged, update the ledger, push, then clean worktrees/branches.
@@ -564,7 +564,7 @@ Integrate unchanged, update the ledger, push, then clean worktrees/branches.
 - Modify: `docs/plans/delivery-ledger.md`
 - Modify maintained pages only for final cross-links/review metadata
 
-- [ ] **Write substantive reader-oriented indexes**
+- [x] **Write substantive reader-oriented indexes**
 
 - `docs/README.md` routes by intent to architecture, operations, reference, audits, plans, reports,
   research, testing, and verification; it distinguishes current product docs, historical evidence,
@@ -575,20 +575,20 @@ Integrate unchanged, update the ledger, push, then clean worktrees/branches.
 - Operations routes operator outcomes and safety conventions without duplicating procedures.
 - Reference states version/source-of-truth rules and links all factual pages.
 
-- [ ] **Complete cross-links and metadata**
+- [x] **Complete cross-links and metadata**
 
 Every maintained page links relevant architecture/operations/reference/ADR/code/evidence and
 records the exact reviewed source head/date. No page is reachable only through a circular peer link.
 Do not add evidence-area indexes merely for symmetry.
 
-- [ ] **Reconcile README and ledger**
+- [x] **Reconcile README and ledger**
 
 Add the docs portal to root navigation and use archived audit paths. Change capability status only
 when Task 1 evidence supports it. Update the ledger with all integrated commits, accepted source
 head, remaining blockers, Quarter 4 review state, cleanup disposition, and the exact-head gate as
 the next barrier.
 
-- [ ] **Verify and commit the integrated portal**
+- [x] **Verify and commit the integrated portal**
 
 ```bash
 git diff --check

@@ -17,6 +17,17 @@ The sections below are the current product inventory and user-facing truth. All 
 work is bound by the single canonical
 [usable complete-release implementation plan](docs/superpowers/plans/2026-07-17-market-squawk-usable-complete-release.md).
 
+## Documentation
+
+- [Documentation portal](docs/README.md) — route by reader intent and document type.
+- [Architecture](docs/architecture/README.md) — context, runtime planes, trust boundaries,
+  deployment, quality attributes, and decisions.
+- [Operations](docs/operations/README.md) — current runnable local procedures and recovery.
+- [Reference](docs/reference/README.md) — exact CLI, configuration, MCP, source, quality, and time
+  contracts.
+- [Delivery ledger](docs/plans/delivery-ledger.md) — accepted evidence, active blockers, and the next
+  release barrier.
+
 ## Runnable now
 
 - Rust 1.97.1 workspace with invariant-preserving domain, identity, time, financial, quality,
@@ -70,7 +81,8 @@ work is bound by the single canonical
   admits an exact descriptor-verified library through an immutable sealed memory file, proves
   warm-up parity, and fails back to the already-constructed tract generation. No external runtime,
   account, service, download, or network call is required for ONNX support.
-- An offline Python financial-research and deterministic-training product for GIL-enabled CPython
+- Implemented offline Python financial-research and deterministic-training components for
+  GIL-enabled CPython
   3.12 and 3.13 on macOS 12+ arm64. The tracked `python/` package opens only catalog-authorized,
   manifest-bound point-in-time Parquet exports; preserves Decimal128 as `decimal.Decimal` with exact
   scale; exposes bounded Rust financial kernels; produces deterministic native linear/logistic
@@ -80,34 +92,21 @@ work is bound by the single canonical
   370-file source closure, hash-locked wheels, CPython runtimes, toolchain, SDK, validator, and
   project wheel, then installs and tests without network access. A native package-root initializer
   verifies the signed Market Squawk, PyArrow, interpreter, and native-library file sets before any
-  shipped mutable Python module executes.
+  shipped mutable Python module executes. Prior exact-head evidence proves these components, but a
+  new operator cannot yet complete the application-integrated first-use handoff because the public
+  dataset export digest and matching application/release construction are missing below.
 - A production local-file extraction vertical for CSV/TSV, JSON/NDJSON, entity-safe XML,
   formula- and external-link-constrained Excel, allowlisted read-only SQLite exports, OFX/QFX, and
   Parquet. User-authorized capability roots, bounded parsing and decompression, revocable source
   authority, precision-preserving research time, immutable representation evidence, and the
   analytical ingestion service are composed end to end.
-- A production SEC EDGAR extraction vertical for submissions, filing history, Company Facts, and
-  bounded inline XBRL evidence. It uses an allowlisted HTTPS client with an identified User-Agent,
-  shared request and response budgets, revocable current-source authority through publication,
-  immutable payload evidence, revision-preserving filing and fact normalization, calendar-date
-  precision, and point-in-time availability semantics without invented midnight timestamps or
-  supersession dates.
-- Production macro extraction adapters for FRED/ALFRED, BLS, and U.S. Treasury. They use hardened
-  allowlisted HTTPS clients, revocable registry authority, shared conjunctive provider budgets,
-  bounded responses, exact provider metadata and payload evidence, conservative availability, and
-  precision-preserving `market-squawk-research-v3` observations. FRED/ALFRED retains vintages and
-  deterministic revision ordering; BLS enforces both the published short-window and daily limits
-  for its public and user-registered tiers; Treasury validates Fiscal Data pagination and official
-  yield-feed schemas. FRED/ALFRED durable persistence, caching, archival, and training remain
-  fail-closed until exact per-series rights affirmatively authorize those operations.
-
-  This product uses the FRED® API but is not endorsed or certified by the Federal Reserve Bank of
-  St. Louis.
-- Evidence-bound local provider onboarding and adapter activation for SEC EDGAR, BLS, and Treasury
-  Fiscal Data. Code-owned profiles preserve provider evidence, duties, rights decisions,
-  credential state, exact persistence authority, durable desired state, provider-isolated restart
-  recovery, and explicit foreground resume for credentialed sources. The remaining provider
-  workflows and clean-machine release demonstration are still required below.
+- Evidence-bound Treasury Fiscal Data onboarding, activation, and average-interest-rates
+  extraction through the current local portal. It uses an allowlisted HTTPS client, bounded
+  pagination, exact provider metadata and payload evidence, conservative availability, durable
+  desired state, provider-isolated restart recovery, and precision-preserving
+  `market-squawk-research-v3` observations without an account, key, or paid service. SEC EDGAR,
+  FRED/ALFRED, BLS, and Treasury daily-yield adapter implementations exist behind the release and
+  rights blockers listed below; they are not presented as current first-use workflows.
 - Authority-free midpoint, spread, spread-basis-point, microprice, imbalance, feed-quality,
   pre-trade calculation, and paper-only momentum diagnostics.
 - Immutable typed order intents plus fixed-capacity, nonblocking account risk coordination with
@@ -178,17 +177,24 @@ terminal consumer, focused verification, immutable evidence, and exact commit ex
 | --- | --- | --- | --- |
 | `Missing` | Coinbase direct-source qualification | The bounded source-to-live-to-risk-to-dispatch-to-paper ownership path is runnable, but Coinbase remains capped at `DirectUnverified`; it cannot satisfy the `DirectVerified` execution gate, and the CLI adds a no-intent strategy | Task 2 |
 | `Missing` | Kraken direct-source qualification | The production transport, decoder, checksum, exact-generation session lifecycle, fresh-snapshot recovery, and canonical risk/no-paper-mutation terminal proof exist; Kraken WebSocket v2 supplies no venue sequence satisfying the current `DirectVerified` execution predicate | Task 20 |
-| `Missing` | FRED/ALFRED durable local consumption | The production vintage-aware adapter is runnable for authorized ephemeral retrieval, but the exact current terms bundle does not establish per-series rights for persistence, caching, archival, or training | Task 9 / Task 20 |
+| `Missing` | FRED/ALFRED durable local consumption | The vintage-aware adapter implementation can support scoped retrieval after an admitted profile revision, but the current profile is `rights_blocked` and the terms bundle does not establish per-series rights for persistence, caching, archival, or training | Task 9 / Task 20 |
 | `Missing` | production order-producing strategy | Bounded risk, private approval, one-time dispatch, reconciliation, and terminal audit are runnable, but no controlled production strategy can emit an executable intent against a currently `DirectVerified` source | Issue `#7` / Task 20 |
 | `Missing` | execution-eligible paper demonstration | The realistic engine and user-facing composition are runnable, but no execution-eligible source/strategy can yet drive a risk-approved order through the complete local path | Issues `#7`, `#11` / Task 20 |
-| `Missing` | complete provider-onboarding acceptance | SEC, BLS, and Treasury Fiscal Data activation are implemented; remaining required provider workflows and the clean-machine activation/recovery demonstration are not yet accepted | Issue `#31` / Task 19A |
-| `Missing` | production documentation portal | The information architecture and migration plan are approved, but the indexed architecture, operations, reference, ADR, and historical-audit tree is not yet published | Documentation lane / Task 20 |
+| `Missing` | complete provider-onboarding acceptance | Provider-specific onboarding/activation machinery is implemented, but only Treasury Fiscal Data is currently release-available; SEC and BLS require refreshed code-owned evidence, FRED is rights-blocked, and the clean-machine activation/recovery demonstration is not accepted | Issue `#31` / Task 19A |
+| `Missing` | complete official research-provider workflows | SEC EDGAR and BLS profiles are `refresh_required`, FRED/ALFRED is `rights_blocked`, and Treasury daily XML lacks durable persistence authority; their implemented adapters therefore do not yet form supported first-use local workflows | Issues `#24`, `#31` / Tasks 19–20 |
+| `Missing` | complete provider discovery-to-ingestion workflow | FRED/ALFRED, BLS, and Treasury adapters validate digest-bearing object identities, but no public command returns the discovery batch needed to select those exact object IDs | Issues `#24`, `#31` / Tasks 19–20 |
+| `Missing` | complete dataset-to-Python training handoff | Dataset publication registers a Python export descriptor, but CLI output exposes neither its `exportSha256` nor a retrieval operation; `feature build` also does not populate the public feature-dataset registry | Issues `#24`, `#25` / Tasks 19–20 |
+| `Missing` | supported end-to-end model release demonstration | The Python release builder does not build and bind the final application bundle, the repository has no supported production training driver, and no supported ONNX candidate producer/demo exists | Issue `#25` / Task 20 |
 | `Missing` | release security/fuzz/performance gate | No final unchanged-head integrated demonstration, measured release evidence, grouped review, publication, or closeout exists | Issue `#25` / Task 20 |
 
+This product includes a FRED/ALFRED adapter implementation. This product uses the FRED® API but is
+not endorsed or certified by the Federal Reserve Bank of St. Louis.
+
 Production-hardened Coinbase and Kraken source crates are tracked under `adapters/`; their
-execution-qualification verticals remain release-blocking above. The tracked `python/` product is
-runnable through the sealed release builder described below. Python files under `scripts/` remain
-build, verification, and protocol-smoke utilities rather than financial product APIs.
+execution-qualification verticals remain release-blocking above. The tracked Python package and
+sealed-release components have accepted focused evidence, while the supported first-use
+application handoff remains release-blocking above. Python files under `scripts/` remain build,
+verification, and protocol-smoke utilities rather than financial product APIs.
 
 ## Release blocked until implemented
 
@@ -558,15 +564,17 @@ adapters/
 └── market-squawk-adapter-treasury/  Fiscal Data and official yield-feed extraction
 python/                             local PIT data, finance, visualization, training, and examples
 scripts/                            deterministic local/CI policy and smoke gates
-docs/                               architecture, plans, research, and verification evidence
+docs/                               architecture, operations, reference, plans, research, and evidence
 ```
 
-The release baseline records current tracked adapter and Python-package state; required
-implementations are listed under **Required but missing**.
+The [documentation portal](docs/README.md) owns current architecture, operations, and reference
+navigation. Required implementations are listed under **Required but missing**.
 
 ## Zero-cost boundary
 
-The project has no mandatory paid software, API, cloud, telemetry, or hosted database. Existing hardware, storage, electricity, and internet access are outside the software-cost claim. External market providers retain their own coverage, availability, licensing, and rate constraints.
+The project has no mandatory paid software, API, cloud, telemetry, or hosted database. Existing
+hardware, storage, electricity, and internet access are outside the software-cost claim. External
+market providers retain their own coverage, availability, licensing, and rate constraints.
 
 The architecture removes avoidable vendor dependence through adapters, local persistence, caching,
 explicit coverage, source health, and fail-closed degradation.
@@ -594,10 +602,10 @@ exactly four production-weighted review quarters:
    product, point-in-time backtesting, fair-value analysis, grouped exact-head review, and the full
    nonincremental release gate passed.
 4. **Quarter 4 of 4 — Stages 4–5 / Waves 5–6:** shared services, the complete CLI and typed MCP
-   domains, and the first evidence-bound provider activations are implemented. Remaining provider
-   workflows, clean-machine activation evidence, production documentation, prerequisite-issue
-   reconciliation, integrated demonstrations, fuzzing, measured performance, security and supply-
-   chain gates, grouped review, publication, and cleanup still block the complete release.
+   domains, the first evidence-bound provider activations, and the product documentation portal are
+   implemented. Remaining provider workflows, clean-machine activation evidence, prerequisite-
+   issue reconciliation, integrated demonstrations, fuzzing, measured performance, security and
+   supply-chain gates, grouped review, publication, and cleanup still block the complete release.
 
 Every item is mandatory unless the product contract is explicitly changed. Each quarter ends at one
 clean exact commit with grouped independent review and remediation of every substantiated Critical
@@ -607,11 +615,14 @@ describe progress; none authorizes a partial-release stop.
 
 ## Primary references
 
-- Coinbase Exchange WebSocket channels: `https://docs.cdp.coinbase.com/exchange/websocket-feed/channels`
-- Kraken WebSocket v2 book checksum guide: `https://docs.kraken.com/exchange/guides/websockets/book-checksum-v2`
-- MCP stdio transport specification: `https://modelcontextprotocol.io/specification/2025-11-25/basic/transports`
-- Rust installation: `https://rustup.rs/`
+- [Coinbase Exchange WebSocket channels](https://docs.cdp.coinbase.com/exchange/websocket-feed/channels)
+- [Kraken Spot WebSocket v2 book checksum guide](https://docs.kraken.com/api/docs/guides/spot-ws-book-v2/)
+- [MCP stdio transport specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports)
+- [Rust installation](https://rustup.rs/)
 
 ## Financial-use warning
 
-This project is research infrastructure. Free market data may be incomplete, delayed, venue-specific, revised, or unavailable. Validate data rights, source quality, execution assumptions, fees, slippage, liquidity, and risk controls before relying on any result. No software can guarantee investment outcomes or universal market-data accuracy.
+This project is research infrastructure. Free market data may be incomplete, delayed,
+venue-specific, revised, or unavailable. Validate data rights, source quality, execution
+assumptions, fees, slippage, liquidity, and risk controls before relying on any result. No software
+can guarantee investment outcomes or universal market-data accuracy.
