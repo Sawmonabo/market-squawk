@@ -8,7 +8,7 @@ pub(super) fn recovered_retained_bytes(
     record_ids: usize,
     operation_ids: usize,
 ) -> Result<usize, FairValueError> {
-    let mut total = size_of::<FairValueService<'static>>();
+    let mut total = size_of::<FairValueService>();
     for value in state.measurements.values() {
         total = checked_add(total, value.retained_bytes())?;
     }

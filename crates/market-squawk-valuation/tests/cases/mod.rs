@@ -5,8 +5,9 @@ use std::error::Error;
 use std::time::Duration;
 
 use market_squawk_data::{
-    CatalogAuthority, CatalogConfig, CatalogLimit, CatalogResultLimits, DatasetId,
-    DatasetManifestRef, DatasetSchemaRegistry, Sha256Digest,
+    AnalyticalDataService, AnalyticalManifestCatalog, CatalogAuthority, CatalogConfig,
+    CatalogLimit, CatalogResultLimits, DatasetId, DatasetManifestRef, DatasetSchemaRegistry,
+    ObjectStoreConfig, Sha256Digest,
 };
 use market_squawk_domain::{
     AccountId, Currency, InstrumentId, Money, RevisionNumber, SourceIdentifier, Timestamp,
@@ -158,7 +159,7 @@ fn fair_value_limits(max_query_results: usize) -> Result<FairValueLimits, Box<dy
 
 struct CatalogFixture {
     _directory: tempfile::TempDir,
-    authority: CatalogAuthority,
+    analytical: AnalyticalDataService,
 }
 
 impl CatalogFixture {
@@ -171,15 +172,23 @@ impl CatalogFixture {
             CatalogLimit::new(32)?,
             CatalogResultLimits::try_new(1024 * 1024, 16 * 1024 * 1024)?,
         )?;
+        let authority = CatalogAuthority::open(config)?;
+        let manifests = AnalyticalManifestCatalog::open(paths.catalog()?, 8)?;
+        let analytical = AnalyticalDataService::initialize(
+            authority,
+            manifests,
+            paths.artifacts()?.clone(),
+            ObjectStoreConfig::try_new(1024 * 1024, 32, Duration::from_secs(60))?,
+        )?;
         Ok(Self {
             _directory: directory,
-            authority: CatalogAuthority::open(config)?,
+            analytical,
         })
     }
 
-    fn service(&self, max_query_results: usize) -> Result<FairValueService<'_>, Box<dyn Error>> {
+    fn service(&self, max_query_results: usize) -> Result<FairValueService, Box<dyn Error>> {
         Ok(FairValueService::open(
-            &self.authority,
+            self.analytical.fair_value_catalog(),
             fair_value_limits(max_query_results)?,
         )?)
     }

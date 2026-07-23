@@ -4,7 +4,7 @@ use super::memory::{incremental_index_bytes, recovered_retained_bytes};
 use super::recovery::recover_audit;
 use super::*;
 
-impl<'catalog> FairValueService<'catalog> {
+impl FairValueService {
     /// Opens and semantically reconstructs complete fair-value state from the local catalog.
     ///
     /// # Errors
@@ -12,7 +12,7 @@ impl<'catalog> FairValueService<'catalog> {
     /// Fails closed on bounded recovery, canonical decode, identity recomputation, audit-chain,
     /// relationship, configured-family, or retained-memory violations.
     pub fn open(
-        catalog: &'catalog CatalogAuthority,
+        catalog: FairValueCatalogCapability,
         limits: FairValueLimits,
     ) -> Result<Self, FairValueError> {
         let snapshot = catalog

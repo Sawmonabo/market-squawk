@@ -9,7 +9,7 @@ use std::mem::size_of;
 use std::sync::Arc;
 
 use market_squawk_data::{
-    CatalogAuthority, FairValueCatalogAuditEvent, FairValueCatalogCommit,
+    FairValueCatalogAuditEvent, FairValueCatalogCapability, FairValueCatalogCommit,
     FairValueCatalogOperation, FairValueCatalogPosition, FairValueCatalogSnapshot,
     FairValueCatalogSnapshotLimits, FairValueCommitDisposition, FairValueLinkRelation,
     FairValueOperationKind, FairValueRecordKind,
@@ -293,8 +293,8 @@ impl AuditDraft {
 
 /// Bounded single-writer service over append-only local catalog state.
 #[derive(Debug)]
-pub struct FairValueService<'catalog> {
-    catalog: &'catalog CatalogAuthority,
+pub struct FairValueService {
+    catalog: FairValueCatalogCapability,
     limits: FairValueLimits,
     measurements: BTreeMap<MeasurementId, Arc<ValuationMeasurement>>,
     decisions: BTreeMap<DecisionId, Arc<ClassificationDecision>>,

@@ -6,10 +6,12 @@ use std::error::Error;
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::str::FromStr as _;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use arrow::array::{StringArray, TimestampNanosecondArray, UInt32Array};
 use market_squawk_data::{
-    AnalyticalDataService, AnalyticalManifestCatalog, CatalogAuthority, CatalogConfig,
+    AnalyticalDataService, AnalyticalManifestCatalog, AnalyticalObservationReadRequest,
+    AnalyticalObservationTemplate, AnalyticalReadLimit, CatalogAuthority, CatalogConfig,
     CatalogError, CatalogLimit, CatalogResultLimits, ChronologicalSplitPolicy, CommittedDataset,
     CompactionRequest, ComponentAdjustmentEvidence, ComponentKind, ComponentScope,
     ComponentSelector, ComponentValue, CorporateActionAdjustment, CorporateActionLimits,
@@ -17,12 +19,13 @@ use market_squawk_data::{
     DatasetBuildLimits, DatasetBuildPolicy, DatasetBuildRequest, DatasetBuilder, DatasetId,
     DatasetManifestRef, DatasetOutputAuthorization, DatasetSchemaRegistry,
     FeatureLabelComponentInput, FeatureLabelComponentSpec, IngestError, IngestIdentity,
-    MissingValuePolicy, ObjectStoreConfig, ObservationFamilyKey, ParquetStoreError,
-    PointInTimeLimits, PointInTimePolicy, PointInTimeRevisionMode, QueryArtifactReservationInput,
-    QueryError, QueryLimits, QueryRequest, QueryResult, ResearchArrowBatch, ResearchIngestService,
-    ResearchQueryEngine, ResearchUse, ResearchUseGrantInput, ResearchUseLimits, ResearchUseSet,
-    RightsBasis, RightsDecisionInput, Sha256Digest, SourceOperation, UniverseId, UniverseLimits,
-    UniverseMembership, extraction_batch_digest,
+    MissingValuePolicy, ObjectStoreConfig, ObservationFamilyKey, ObservationKnowledgeRange,
+    ParquetStoreError, PointInTimeLimits, PointInTimePolicy, PointInTimeRevisionMode,
+    QueryArtifactReservationInput, QueryError, QueryLimits, QueryRequest, QueryResult,
+    ResearchArrowBatch, ResearchIngestService, ResearchQueryEngine, ResearchUse,
+    ResearchUseGrantInput, ResearchUseLimits, ResearchUseSet, RightsBasis, RightsDecisionInput,
+    Sha256Digest, SourceOperation, UniverseId, UniverseLimits, UniverseMembership,
+    extraction_batch_digest,
 };
 use market_squawk_domain::{
     AuthorizationBasis, ChecksumCapability, CoverageDelay, DataQuality, DeliveryEvidence,
@@ -1122,6 +1125,118 @@ async fn point_in_time_builder_publishes_one_authorized_queryable_generation() -
         )
         .await?;
     assert!(matches!(result, QueryResult::Inline { .. }));
+    Ok(())
+}
+
+#[tokio::test]
+async fn analytical_reader_keeps_manifest_authority_and_observation_evidence_closed() -> TestResult
+{
+    let directory = tempfile::tempdir()?;
+    let paths = LocalPaths::prepare(directory.path().join("reader"))?;
+    let (service, committed) = initialized_service_with_dataset(
+        &paths,
+        test_catalog_config(paths.catalog()?.clone())?,
+        ObjectStoreConfig::try_new(1024 * 1024, 32, Duration::from_secs(60))?,
+    )
+    .await?;
+    let reader = service.analytical_reader();
+    let limit = AnalyticalReadLimit::try_new(1)?;
+    let cancellation = CancellationToken::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
+
+    let datasets = reader.datasets(None, limit, deadline, &cancellation)?;
+    assert!(!datasets.has_more());
+    assert_eq!(datasets.generations().len(), 1);
+    let listed = &datasets.generations()[0];
+    assert_eq!(listed.manifest(), committed.manifest());
+    assert_eq!(listed.source_id().as_str(), "fred-local-fixture");
+    assert_eq!(
+        reader
+            .latest(committed.manifest().dataset_id(), deadline, &cancellation)?
+            .ok_or("missing latest generation")?
+            .manifest(),
+        committed.manifest()
+    );
+    assert_eq!(
+        reader
+            .exact(committed.manifest(), deadline, &cancellation)?
+            .source_id(),
+        listed.source_id()
+    );
+    let history = reader.history(
+        committed.manifest().dataset_id(),
+        None,
+        limit,
+        deadline,
+        &cancellation,
+    )?;
+    assert_eq!(history.generations().len(), 1);
+    assert_eq!(
+        reader.source_owner(committed.manifest(), deadline, &cancellation)?,
+        *listed.source_id()
+    );
+
+    let request = AnalyticalObservationReadRequest::try_new(
+        committed.manifest().clone(),
+        AnalyticalObservationTemplate::Macro,
+        Vec::new(),
+        Some(ObservationKnowledgeRange::try_new(
+            Timestamp::from_unix_nanos(90),
+            Timestamp::from_unix_nanos(110),
+        )?),
+    )?;
+    let observed = reader
+        .read_observations(
+            request,
+            QueryLimits::try_new(
+                1,
+                64 * 1024,
+                8 * 1024 * 1024,
+                1,
+                128,
+                128,
+                Duration::from_secs(10),
+            )?,
+            deadline,
+            cancellation,
+        )
+        .await?;
+    assert_eq!(observed.source_id().as_str(), "fred-local-fixture");
+    let QueryResult::Inline { batches, .. } = observed.output().result() else {
+        return Err("expected one inline fixed-template result".into());
+    };
+    let batch = batches.first().ok_or("missing fixed-template batch")?;
+    assert_eq!(batch.num_rows(), 1);
+    let schema = batch.schema();
+    let string = |name| -> Result<&StringArray, Box<dyn Error>> {
+        Ok(batch
+            .column(schema.index_of(name)?)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or("fixed-template string column changed")?)
+    };
+    assert_eq!(string("observation_kind")?.value(0), "macro");
+    assert_eq!(string("source_id")?.value(0), "fred-local-fixture");
+    assert_eq!(string("quality")?.value(0), "official_delayed");
+    let revisions = batch
+        .column(schema.index_of("revision")?)
+        .as_any()
+        .downcast_ref::<UInt32Array>()
+        .ok_or("fixed-template revision column changed")?;
+    assert_eq!(revisions.value(0), 1);
+    for (name, expected) in [
+        ("available_at", 100),
+        ("effective_at", 90),
+        ("published_at", 100),
+        ("superseded_at", 200),
+    ] {
+        let values = batch
+            .column(schema.index_of(name)?)
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .ok_or("fixed-template time column changed")?;
+        assert_eq!(values.value(0), expected);
+    }
     Ok(())
 }
 

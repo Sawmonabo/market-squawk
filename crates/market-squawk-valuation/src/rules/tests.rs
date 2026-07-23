@@ -2,8 +2,9 @@ use std::{num::NonZeroU32, sync::Arc, time::Duration};
 
 use market_squawk_analytics::FeatureKey;
 use market_squawk_data::{
-    CatalogAuthority, CatalogConfig, CatalogLimit, CatalogResultLimits, DatasetId,
-    DatasetManifestRef, DatasetSchemaRegistry, Sha256Digest,
+    AnalyticalDataService, AnalyticalManifestCatalog, CatalogAuthority, CatalogConfig,
+    CatalogLimit, CatalogResultLimits, DatasetId, DatasetManifestRef, DatasetSchemaRegistry,
+    ObjectStoreConfig, Sha256Digest,
 };
 use market_squawk_domain::{
     AccountId, Currency, DataQuality, DigestAlgorithm, EvidenceDigest, FairValueHierarchy,
@@ -108,10 +109,10 @@ fn modeled_analytics_requires_an_explicit_input_use_assessment() -> TestResult {
 #[test]
 fn later_inaccessible_access_supersedes_stale_access_across_recovery() -> TestResult {
     let directory = tempfile::tempdir()?;
-    let (catalog, limits) = catalog_fixture(directory.path())?;
+    let (analytical, limits) = catalog_fixture(directory.path())?;
     let rules = ClassificationRuleset::current(100)?;
     let stale_measurement = {
-        let mut service = FairValueService::open(&catalog, limits)?;
+        let mut service = FairValueService::open(analytical.fair_value_catalog(), limits)?;
         let accessible = approve_access(
             &mut service,
             MarketAccess::Accessible,
@@ -132,7 +133,7 @@ fn later_inaccessible_access_supersedes_stale_access_across_recovery() -> TestRe
         value
     };
 
-    let mut reopened = FairValueService::open(&catalog, limits)?;
+    let mut reopened = FairValueService::open(analytical.fair_value_catalog(), limits)?;
     assert!(matches!(
         reopened.classify(stale_measurement, rules),
         Err(FairValueError::InvalidMarketAccessAssessment)
@@ -140,7 +141,7 @@ fn later_inaccessible_access_supersedes_stale_access_across_recovery() -> TestRe
     Ok(())
 }
 
-fn catalog_fixture(root: &std::path::Path) -> TestResult<(CatalogAuthority, FairValueLimits)> {
+fn catalog_fixture(root: &std::path::Path) -> TestResult<(AnalyticalDataService, FairValueLimits)> {
     let paths = LocalPaths::prepare(root.join("local"))?;
     let catalog = CatalogAuthority::open(CatalogConfig::try_new(
         paths.catalog()?.clone(),
@@ -148,6 +149,12 @@ fn catalog_fixture(root: &std::path::Path) -> TestResult<(CatalogAuthority, Fair
         CatalogLimit::new(32)?,
         CatalogResultLimits::try_new(1024 * 1024, 16 * 1024 * 1024)?,
     )?)?;
+    let analytical = AnalyticalDataService::initialize(
+        catalog,
+        AnalyticalManifestCatalog::open(paths.catalog()?, 8)?,
+        paths.artifacts()?.clone(),
+        ObjectStoreConfig::try_new(1024 * 1024, 32, Duration::from_secs(60))?,
+    )?;
     let limits = FairValueLimits::try_new(FairValueLimitInput {
         max_measurements: 4,
         max_inputs_per_measurement: 2,
@@ -155,11 +162,11 @@ fn catalog_fixture(root: &std::path::Path) -> TestResult<(CatalogAuthority, Fair
         max_query_results: 8,
         max_retained_bytes: 512 * 1024,
     })?;
-    Ok((catalog, limits))
+    Ok((analytical, limits))
 }
 
 fn approve_access(
-    service: &mut FairValueService<'_>,
+    service: &mut FairValueService,
     conclusion: MarketAccess,
     times: (i64, i64, i64),
     actor_prefix: &str,

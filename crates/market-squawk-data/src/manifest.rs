@@ -11,6 +11,7 @@ use crate::schema::{DatasetSchemaRef, DatasetSchemaRegistry};
 
 mod catalog;
 
+pub(crate) use self::catalog::CatalogGenerationPage;
 pub use self::catalog::{
     AnalyticalManifestCatalog, GenerationKind, ManifestCatalogError, PinnedDataset,
     PinnedManifestObject,

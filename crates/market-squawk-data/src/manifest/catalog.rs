@@ -109,6 +109,12 @@ pub struct AnalyticalManifestCatalog {
     catalog_file: CatalogFileGuard,
 }
 
+#[derive(Debug)]
+pub(crate) struct CatalogGenerationPage {
+    pub(crate) generations: Vec<(PinnedDataset, SourceId)>,
+    pub(crate) has_more: bool,
+}
+
 impl fmt::Debug for AnalyticalManifestCatalog {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -671,6 +677,165 @@ impl AnalyticalManifestCatalog {
         generation_source(&connection, manifest)
     }
 
+    pub(crate) fn read_exact(
+        &self,
+        manifest: &DatasetManifestRef,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(PinnedDataset, SourceId), ManifestCatalogError> {
+        check_read_operation(deadline, cancellation)?;
+        let connection = self.lock()?;
+        let pinned = load_pinned(&connection, manifest, self.max_objects_per_generation)?;
+        let source_id = generation_source(&connection, manifest)?;
+        check_read_operation(deadline, cancellation)?;
+        Ok((pinned, source_id))
+    }
+
+    pub(crate) fn read_latest(
+        &self,
+        dataset_id: &DatasetId,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<(PinnedDataset, SourceId)>, ManifestCatalogError> {
+        check_read_operation(deadline, cancellation)?;
+        let connection = self.lock()?;
+        let Some(pinned) = load_latest(&connection, dataset_id, self.max_objects_per_generation)?
+        else {
+            check_read_operation(deadline, cancellation)?;
+            return Ok(None);
+        };
+        let source_id = generation_source(&connection, pinned.manifest())?;
+        check_read_operation(deadline, cancellation)?;
+        Ok(Some((pinned, source_id)))
+    }
+
+    pub(crate) fn read_latest_page(
+        &self,
+        after: Option<&DatasetId>,
+        limit: usize,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<CatalogGenerationPage, ManifestCatalogError> {
+        check_read_operation(deadline, cancellation)?;
+        let retrieval_limit = limit
+            .checked_add(1)
+            .ok_or(ManifestCatalogError::CountOverflow)?;
+        let retrieval_limit =
+            i64::try_from(retrieval_limit).map_err(|_| ManifestCatalogError::CountOverflow)?;
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "WITH latest AS (
+                 SELECT dataset_id, MAX(manifest_version) AS manifest_version
+                 FROM analytical_generations
+                 WHERE dataset_id>?1
+                 GROUP BY dataset_id
+                 ORDER BY dataset_id
+                 LIMIT ?2
+             )
+             SELECT generations.dataset_id, generations.manifest_version,
+                    generations.schema_name, generations.schema_version,
+                    generations.schema_fingerprint, generations.content_hash
+             FROM analytical_generations AS generations
+             JOIN latest USING (dataset_id, manifest_version)
+             ORDER BY generations.dataset_id",
+        )?;
+        let rows = statement.query_map(
+            params![
+                after.map(DatasetId::as_str).unwrap_or_default(),
+                retrieval_limit
+            ],
+            manifest_reference_from_row,
+        )?;
+        let mut references = Vec::new();
+        references
+            .try_reserve_exact(
+                usize::try_from(retrieval_limit)
+                    .map_err(|_| ManifestCatalogError::CountOverflow)?,
+            )
+            .map_err(|_| ManifestCatalogError::CountOverflow)?;
+        for row in rows {
+            check_read_operation(deadline, cancellation)?;
+            references.push(row??);
+        }
+        drop(statement);
+        let has_more = references.len() > limit;
+        references.truncate(limit);
+        let mut generations = Vec::new();
+        generations
+            .try_reserve_exact(references.len())
+            .map_err(|_| ManifestCatalogError::CountOverflow)?;
+        for reference in references {
+            check_read_operation(deadline, cancellation)?;
+            let pinned = load_pinned(&connection, &reference, self.max_objects_per_generation)?;
+            let source_id = generation_source(&connection, &reference)?;
+            generations.push((pinned, source_id));
+        }
+        check_read_operation(deadline, cancellation)?;
+        Ok(CatalogGenerationPage {
+            generations,
+            has_more,
+        })
+    }
+
+    pub(crate) fn read_history(
+        &self,
+        dataset_id: &DatasetId,
+        before_version: Option<u64>,
+        limit: usize,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<CatalogGenerationPage, ManifestCatalogError> {
+        check_read_operation(deadline, cancellation)?;
+        let retrieval_limit = limit
+            .checked_add(1)
+            .ok_or(ManifestCatalogError::CountOverflow)?;
+        let retrieval_limit =
+            i64::try_from(retrieval_limit).map_err(|_| ManifestCatalogError::CountOverflow)?;
+        let before_version = before_version.map(to_i64).transpose()?;
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT dataset_id, manifest_version, schema_name, schema_version,
+                    schema_fingerprint, content_hash
+             FROM analytical_generations
+             WHERE dataset_id=?1 AND (?2 IS NULL OR manifest_version<?2)
+             ORDER BY manifest_version DESC
+             LIMIT ?3",
+        )?;
+        let rows = statement.query_map(
+            params![dataset_id.as_str(), before_version, retrieval_limit],
+            manifest_reference_from_row,
+        )?;
+        let mut references = Vec::new();
+        references
+            .try_reserve_exact(
+                usize::try_from(retrieval_limit)
+                    .map_err(|_| ManifestCatalogError::CountOverflow)?,
+            )
+            .map_err(|_| ManifestCatalogError::CountOverflow)?;
+        for row in rows {
+            check_read_operation(deadline, cancellation)?;
+            references.push(row??);
+        }
+        drop(statement);
+        let has_more = references.len() > limit;
+        references.truncate(limit);
+        let mut generations = Vec::new();
+        generations
+            .try_reserve_exact(references.len())
+            .map_err(|_| ManifestCatalogError::CountOverflow)?;
+        for reference in references {
+            check_read_operation(deadline, cancellation)?;
+            let pinned = load_pinned(&connection, &reference, self.max_objects_per_generation)?;
+            let source_id = generation_source(&connection, &reference)?;
+            generations.push((pinned, source_id));
+        }
+        check_read_operation(deadline, cancellation)?;
+        Ok(CatalogGenerationPage {
+            generations,
+            has_more,
+        })
+    }
+
     /// Resolves only candidate reachability in bounded chunks under one consistent read snapshot.
     pub(crate) fn referenced_candidates<I>(
         &self,
@@ -683,7 +848,7 @@ impl AnalyticalManifestCatalog {
     where
         I: ExactSizeIterator<Item = Sha256Digest>,
     {
-        check_reference_operation(deadline, cancellation)?;
+        check_read_operation(deadline, cancellation)?;
         let expected = candidates.len();
         if expected > max_candidates {
             return Err(ManifestCatalogError::ReferenceWorkLimitExceeded { max_candidates });
@@ -696,7 +861,7 @@ impl AnalyticalManifestCatalog {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
         let mut candidates = candidates.peekable();
         while candidates.peek().is_some() {
-            check_reference_operation(deadline, cancellation)?;
+            check_read_operation(deadline, cancellation)?;
             let mut chunk = Vec::new();
             chunk
                 .try_reserve_exact(REFERENCE_MEMBERSHIP_CHUNK.min(expected))
@@ -730,7 +895,7 @@ impl AnalyticalManifestCatalog {
         if membership.len() != expected {
             return Err(ManifestCatalogError::CorruptCatalog);
         }
-        check_reference_operation(deadline, cancellation)?;
+        check_read_operation(deadline, cancellation)?;
         transaction.commit()?;
         Ok(membership)
     }
@@ -907,7 +1072,7 @@ fn append_reference_membership(
     let mut rows = statement.raw_query();
     let membership_start = membership.len();
     while let Some(row) = rows.next()? {
-        check_reference_operation(deadline, cancellation)?;
+        check_read_operation(deadline, cancellation)?;
         let expected_ordinal = membership
             .len()
             .checked_sub(membership_start)
@@ -925,7 +1090,7 @@ fn append_reference_membership(
     Ok(())
 }
 
-fn check_reference_operation(
+fn check_read_operation(
     deadline: Instant,
     cancellation: &CancellationToken,
 ) -> Result<(), ManifestCatalogError> {
@@ -936,6 +1101,26 @@ fn check_reference_operation(
     } else {
         Ok(())
     }
+}
+
+fn manifest_reference_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<Result<DatasetManifestRef, ManifestCatalogError>> {
+    let dataset = row.get::<_, String>(0)?;
+    let version = row.get::<_, i64>(1)?;
+    let schema_name = row.get::<_, String>(2)?;
+    let schema_version = row.get::<_, i64>(3)?;
+    let fingerprint = row.get::<_, Vec<u8>>(4)?;
+    let content = row.get::<_, Vec<u8>>(5)?;
+    Ok((|| {
+        DatasetManifestRef::try_new_with_schema(
+            DatasetId::try_from(dataset.as_str())?,
+            from_i64(version)?,
+            parse_schema_identity(&schema_name, schema_version, &fingerprint)?,
+            parse_digest(&content)?,
+        )
+        .map_err(ManifestCatalogError::from)
+    })())
 }
 
 fn load_latest(

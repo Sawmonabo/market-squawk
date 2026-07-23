@@ -1,9 +1,10 @@
 //! Application-owned composition for local research ingestion and point-in-time datasets.
 
 use market_squawk_data::{
-    AnalyticalDataService, AnalyticalManifestCatalog, CatalogAuthority, CatalogConfig,
-    CommittedDataset, DatasetBuildError, DatasetBuildRequest, DatasetBuilder, FeatureLabelDataset,
-    IngestError, IngestIdentity, ManifestCatalogError, ObjectStoreConfig, ResearchIngestService,
+    AnalyticalDataService, AnalyticalManifestCatalog, AnalyticalReadCapability, CatalogAuthority,
+    CatalogConfig, CommittedDataset, DatasetBuildError, DatasetBuildRequest, DatasetBuilder,
+    FairValueCatalogCapability, FeatureLabelDataset, IngestError, IngestIdentity,
+    ManifestCatalogError, ObjectStoreConfig, OnboardingCatalogCapability, ResearchIngestService,
     RightsDecisionInput, RightsError, SourceOperation, extraction_batch_digest,
 };
 use market_squawk_platform::{LocalPaths, PathError};
@@ -162,6 +163,21 @@ impl ResearchService {
     /// Returns the manifest-pinned analytical service for bounded query composition.
     pub const fn analytical(&self) -> &AnalyticalDataService {
         &self.analytical
+    }
+
+    /// Returns immutable bounded analytical metadata and fixed-template observation reads.
+    pub fn analytical_reader(&self) -> AnalyticalReadCapability {
+        self.analytical.analytical_reader()
+    }
+
+    /// Returns fair-value persistence authority over this service's sole catalog writer.
+    pub fn fair_value_catalog(&self) -> FairValueCatalogCapability {
+        self.analytical.fair_value_catalog()
+    }
+
+    /// Returns provider-onboarding authority over this service's sole catalog writer.
+    pub fn onboarding_catalog(&self) -> OnboardingCatalogCapability {
+        self.analytical.onboarding_catalog()
     }
 }
 

@@ -8,10 +8,12 @@
 //! event-to-action path.
 
 mod analytical_backup;
+mod analytical_read;
 mod arrow_convert;
 mod authority_transition;
 mod blocking_supervisor;
 mod catalog;
+mod catalog_capabilities;
 mod corporate_actions;
 mod dataset_builder;
 mod ingest;
@@ -31,6 +33,11 @@ pub use analytical_backup::{
     AnalyticalBackupBundleReceipt, AnalyticalBackupError, AnalyticalBackupLimits,
     AnalyticalBackupLocation, AnalyticalBackupReceiptError, AnalyticalBackupService,
     AnalyticalRestoreMode, AnalyticalRestoreTarget, VerifiedAnalyticalBackup,
+};
+pub use analytical_read::{
+    AnalyticalGeneration, AnalyticalGenerationPage, AnalyticalObservationOutput,
+    AnalyticalObservationReadRequest, AnalyticalObservationTemplate, AnalyticalReadCapability,
+    AnalyticalReadError, AnalyticalReadLimit, ObservationKnowledgeRange,
 };
 pub use arrow_convert::{
     ArrowConversionError, DatasetArrowBatch, DatasetSchemaError, DatasetSchemaRef,
@@ -54,6 +61,7 @@ pub use catalog::{
     ReferenceBundle, ResumedIngest, ResumedProviderOnboarding, SourceCursor,
     StoredObservedRevision,
 };
+pub use catalog_capabilities::{FairValueCatalogCapability, OnboardingCatalogCapability};
 pub use corporate_actions::{
     AdjustmentConflict, AdjustmentRatio, AdjustmentStep, CorporateActionAdjustment,
     CorporateActionError, CorporateActionExclusion, CorporateActionExclusionReason,

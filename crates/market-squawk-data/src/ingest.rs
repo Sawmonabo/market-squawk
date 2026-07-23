@@ -135,7 +135,7 @@ pub trait ResearchIngestService {
 pub struct AnalyticalDataService {
     authority: Arc<Mutex<CatalogAuthority>>,
     catalog_id: uuid::Uuid,
-    manifests: AnalyticalManifestCatalog,
+    manifests: Arc<AnalyticalManifestCatalog>,
     objects: Arc<ParquetObjectStore>,
     operation_gate: AnalyticalOperationGate,
 }
@@ -510,7 +510,7 @@ impl AnalyticalDataService {
         Self {
             authority: Arc::new(Mutex::new(authority)),
             catalog_id,
-            manifests,
+            manifests: Arc::new(manifests),
             objects: Arc::new(objects),
             operation_gate: AnalyticalOperationGate::default(),
         }
@@ -519,6 +519,21 @@ impl AnalyticalDataService {
     /// Returns the controlled object capability for manifest-pinned query construction.
     pub fn object_store(&self) -> Arc<ParquetObjectStore> {
         Arc::clone(&self.objects)
+    }
+
+    /// Returns a cloneable immutable manifest and fixed-template observation read capability.
+    pub fn analytical_reader(&self) -> crate::AnalyticalReadCapability {
+        crate::AnalyticalReadCapability::new(Arc::clone(&self.manifests), Arc::clone(&self.objects))
+    }
+
+    /// Returns fair-value persistence authority over this service's sole catalog writer.
+    pub fn fair_value_catalog(&self) -> crate::FairValueCatalogCapability {
+        crate::FairValueCatalogCapability::new(Arc::clone(&self.authority))
+    }
+
+    /// Returns provider-onboarding authority over this service's sole catalog writer.
+    pub fn onboarding_catalog(&self) -> crate::OnboardingCatalogCapability {
+        crate::OnboardingCatalogCapability::new(Arc::clone(&self.authority))
     }
 
     /// Returns the rights-bound point-in-time dataset builder for this exact catalog/root pair.
