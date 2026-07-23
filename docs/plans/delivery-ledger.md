@@ -14,8 +14,10 @@ evidence; it does not replace the README capability truth or the canonical relea
   `774a7bc9f4f26eb437fa1ab061dc4b557d20d0bc`. The source worktree was clean, the release
   branch matched `origin`, and the approved design blob was
   `7fdb58ece5b41211493cd4026773974ff30ce240` when the migration branch was created.
-- Active documentation branch: `docs/product-documentation`. It uses the one root worktree; no
-  per-page branch, worktree, Cargo invocation, or duplicate build cache was created.
+- Completed documentation branch: `docs/product-documentation` was fast-forwarded into the release
+  branch at accepted content head `a2596a6`, then deleted locally and on origin. The lane used only
+  the root worktree; no per-page branch, worktree, Cargo invocation, or duplicate build cache was
+  created.
 - Documentation authority/history commits: accepted-head refresh `93cd746`, pinned execution
   barrier `6a06b34`, and history-preserving model-runbook move `c3b3512`.
 - Documentation architecture/reference commits: tool-inventory correction `97383df`, CLI/config
@@ -25,14 +27,13 @@ evidence; it does not replace the README capability truth or the canonical relea
 - Documentation operations commits: bootstrap/configuration/sources `03d44ad`,
   research/datasets/models `593c5ee`, and portfolio/recovery/troubleshooting `531a7df`. The portal,
   root navigation, plan state, memory, and this ledger are finalized by the commit containing this
-  record.
+  record. Grouped-review corrections are `e063419` and accepted closeout head `a2596a6`.
 - Pre-status Quarter 3 capability-code head: `daf183a`
   (`fix(python): make native module the sealed package root`). This is a durable milestone, not the
   moving release-branch head.
-- Current documentation candidate: obtain it from `git rev-parse HEAD` while the checked-out branch
-  is `docs/product-documentation`; tracked prose does not self-pin the commit that contains it.
-  Pull request `#26` identifies the separate pre-fast-forward release/product head. The term
-  "integrated release head" is reserved for the commit after the release branch is fast-forwarded.
+- Accepted documentation content head: `a2596a6ae4dafa9915d2b42cac71635c77c632f8`, tree
+  `56969cc0d585cbd207237f6b724de9adb8270ce5`. Pull request `#26` identifies the moving integrated
+  release head; tracked prose does not self-pin the status commit that contains it.
 - Quarter 3 status: terminally accepted at exact pushed head
   `c6f0124c2b27c4777947de8c42b6a5f97868aaf5`. The earlier grouped reviews accepted Tasks 13–15,
   Task 18, backtest authority, and the cross-plane boundaries while rejecting substantiated
@@ -52,23 +53,24 @@ evidence; it does not replace the README capability truth or the canonical relea
 - Integrated and pushed hardening code head: `2d39b0a34eb818f817973210148355c88f8f4b52`
 - Hardening owner: GitHub issue `#30`, Project 5
 - Hardening status: implemented, verified, integrated, pushed, and cleaned up
-- Documentation-system lane: the approved GitHub-native portal content is assembled. The canonical
+- Documentation-system lane: complete, reviewed, integrated, published, and cleaned. The canonical
   written design is
   [`2026-07-22-market-squawk-documentation-system-design.md`](../superpowers/specs/2026-07-22-market-squawk-documentation-system-design.md).
   Architecture, operations, reference, ADR, and dated-audit pages now satisfy the approved content
   tree against product head `836aae6`. Documentation-migration Tasks 1–6 are complete. Task 7's
   first frozen candidate `b0ed3e9` completed content, navigation, GitHub Mermaid, and grouped review
-  gates but was rejected on substantiated documentation findings. The current correction candidate
-  follows correction head `e063419`, whose architecture and reference findings closed but whose
-  operations re-review exposed three remaining runbook ripples. It still requires exact-head
-  re-review, release fast-forward, evidence publication, and branch cleanup before the
-  documentation blocker closes.
+  gates but was rejected on substantiated documentation findings. First correction head `e063419`
+  closed the architecture and reference findings, but its operations re-review exposed three
+  remaining runbook ripples. Accepted exact head `a2596a6`
+  closed those findings; all three final scopes reported zero Critical, Important, or Minor
+  findings. The release fast-forward, PR evidence comment, local/origin branch deletion, and
+  metadata prune are complete.
 - Product release status: runnable product capabilities exist across every required domain, but the
   release remains blocked on provider qualification and rights outcomes, complete onboarding
   workflows and clean-machine evidence, provider discovery-to-ingestion, the public
   dataset-to-Python export handoff, a supported application-bound Python/model first-use workflow,
-  an ONNX candidate producer/demo, prerequisite-issue reconciliation, documentation Task 7, and
-  Task 20's integrated demonstration, performance/fuzz/security evidence, final grouped review,
+  an ONNX candidate producer/demo, prerequisite-issue reconciliation, and Task 20's integrated
+  demonstration, performance/fuzz/security evidence, final grouped review,
   exact-head gate, publication, and cleanup.
 
 ## Documentation candidate and accepted-head truth
@@ -122,9 +124,8 @@ procedures:
 
 As verified through GitHub on 2026-07-23, issues `#7`, `#9`, `#10`, `#11`, `#24`, `#25`, and `#31`
 remain open. Project 5 marks `#7`, `#9`, `#10`, `#11`, `#24`, and `#31` In Progress and `#25` Todo.
-They remain open until exact closing evidence is reconciled. The next documentation barrier is Task
-7's corrected-candidate exact-head re-review; the next product barriers remain Tasks 19/19A and
-Task 20.
+They remain open until exact closing evidence is reconciled. The documentation barrier is closed;
+the next product barriers remain Tasks 19/19A and Task 20.
 
 ## Product delivery closeout and next barrier
 
@@ -393,9 +394,7 @@ application size.
   deleted the merged local product branch, confirmed no matching origin branch existed, and pruned
   worktree and remote metadata. Only the release worktree remains.
 
-The next delivery event is documentation Task 7's corrected-candidate exact-head re-review, followed
-by the unchanged release-source fast-forward, evidence publication, and completed documentation-
-branch cleanup. Product work then resumes on the open Task 19/19A acceptance gaps and Task 20's
-integrated demonstration, evidence, final review, exact-head release gate, publication, and cleanup.
-Neither Quarter 3 acceptance nor the documentation portal claims that the Market Squawk product
+The next delivery event is the open Task 19/19A acceptance work, followed by Task 20's integrated
+demonstration, evidence, final review, exact-head release gate, publication, and cleanup. Neither
+Quarter 3 acceptance nor the completed documentation portal claims that the Market Squawk product
 release is complete.

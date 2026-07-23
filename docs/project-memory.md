@@ -655,17 +655,16 @@ published content waves through `531a7df` contain no product/build-input delta f
 Documentation work used one shared root worktree and no per-page branch, worktree, Cargo command,
 test, checker, generator, or build-cache duplicate. At the candidate checkpoint, `.worktrees` is
 empty and the existing root `target/` is 15 GiB, below the enforced 20 GiB ceiling. Completed
-content commits are recorded in the delivery ledger and pushed to
-`origin/docs/product-documentation`.
+content and closeout commits are recorded in the delivery ledger.
 
 The first frozen candidate `b0ed3e9` completed its bounded content, navigation, GitHub Mermaid, and
 three-scope grouped review gates but was rejected on substantiated findings. Correction head
 `e063419` closed the architecture and reference findings; operations re-review rejected three
-remaining copy/paste and public-query ripples, which the current candidate corrects. The complete
+remaining copy/paste and public-query ripples, which accepted head `a2596a6` corrected. The complete
 correction set repairs authority diagrams, fail-fast no-overwrite installation and recovery
 procedures, explicit restore coordinates, historical/current navigation, and public product truth.
-It also records
-mandatory product gaps that remain release blockers: provider discovery object IDs are not publicly
+It also records mandatory product gaps that remain release blockers: provider discovery object IDs
+are not publicly
 returned for FRED/BLS/Treasury first-use ingestion; `dataset list` cannot consume its cursor; the
 dataset export digest needed by Python is not exposed; feature builds do not populate the public
 feature-dataset registry; no typed public operation resolves MCP overflow artifacts; `Bot.Start`
@@ -676,8 +675,9 @@ producer/demo exists. Optional external ONNX Runtime remains a library-level pat
 product composition does not select. These gaps belong to Tasks 19/19A/20 and must not be described
 as a complete operator workflow.
 
-Documentation-migration Tasks 1–6 and Task 7's initial frozen-candidate gates are complete. Task 7
-now owns exact-head re-review of the correction candidate, fast-forward integration into the
-unchanged release branch, evidence publication, and deletion of the completed documentation branch
-locally and on origin. Product issues and Project 5 items remain open until their separate
-acceptance evidence exists.
+Accepted exact head `a2596a6ae4dafa9915d2b42cac71635c77c632f8` closed every review finding;
+all three final scopes reported zero Critical, Important, or Minor findings. Documentation Tasks
+1–7 are complete. The accepted head was fast-forwarded to `release/market-squawk-v0.1.0`, published
+to PR `#26`, and the completed `docs/product-documentation` branch was deleted locally and on
+origin before metadata was pruned. Product issues and Project 5 items remain open until their
+separate acceptance evidence exists. Work resumes with Tasks 19/19A, then Task 20.

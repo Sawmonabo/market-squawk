@@ -667,14 +667,14 @@ git status --short
 Do not run Cargo. The product owner runs the normal exact-head release gate only when product/build
 inputs change.
 
-- [ ] **Submit one integrated documentation domain to Quarter 4 review**
+- [x] **Submit one integrated documentation domain to Quarter 4 review**
 
 Give all reviewers the same commit and non-mutating scopes: architecture/authority, operational
 runnability/recovery, factual reference correspondence, and navigation/history/source truth. Freeze
 the candidate across batches; union/deduplicate findings; remediate every substantiated Critical,
 Important, or Minor finding and re-review the new exact head.
 
-- [ ] **Fast-forward release, publish evidence, and clean**
+- [x] **Fast-forward release, publish evidence, and clean**
 
 After approval, confirm the release branch has not advanced from Task 1's source head. Fast-forward
 it to the accepted documentation commit from the release owner's clean worktree, not from an active
