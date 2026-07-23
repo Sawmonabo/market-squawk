@@ -12,14 +12,16 @@ use std::{
 use async_trait::async_trait;
 use market_squawk_services::{
     RequestContext, ServiceCapabilities, ServiceCapabilityError, ServiceDomain, ServiceError,
-    ToolServices, TypedToolRequest, TypedToolResult,
+    ServiceLimits, ToolServices, TypedToolRequest, TypedToolResult,
 };
 use serde_json::{Map, Value};
 use thiserror::Error;
 
 mod contracts;
+mod paper;
 
 pub use contracts::{APPLICATION_CONTRACT_VERSION, application_capabilities};
+pub use paper::PaperApplicationServices;
 
 const REQUIRED_DOMAINS: [ServiceDomain; 11] = [
     ServiceDomain::Source,
@@ -310,6 +312,37 @@ fn ensure_request_live(context: &RequestContext) -> Result<(), ServiceError> {
         return Err(ServiceError::DeadlineExceeded);
     }
     Ok(())
+}
+
+fn effective_service_limits(
+    request: &TypedToolRequest,
+    context: &RequestContext,
+) -> Result<ServiceLimits, ServiceError> {
+    let requested = request
+        .arguments()
+        .get("resultLimits")
+        .and_then(Value::as_object)
+        .ok_or(ServiceError::InvalidRequest)?;
+    let maximum_items = requested
+        .get("maximumItems")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or(ServiceError::InvalidRequest)?
+        .min(context.limits().maximum_result_items());
+    let maximum_bytes = requested
+        .get("maximumBytes")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or(ServiceError::InvalidRequest)?
+        .min(context.limits().maximum_result_bytes());
+    ServiceLimits::try_new(
+        context.limits().maximum_inline_bytes().min(maximum_bytes),
+        context.limits().maximum_inline_items().min(maximum_items),
+        maximum_bytes,
+        maximum_items,
+        context.limits().result_structure(),
+    )
+    .map_err(|_error| ServiceError::InvalidRequest)
 }
 
 const fn domain_index(domain: ServiceDomain) -> usize {
