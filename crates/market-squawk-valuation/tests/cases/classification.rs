@@ -4,8 +4,7 @@ use market_squawk_valuation::{ClassificationRuleset, DecisionReasonCode};
 use super::{CatalogFixture, TestResult, measurement};
 
 #[test]
-fn producer_time_semantics_prevent_lookahead_without_discarding_usable_stale_inputs() -> TestResult
-{
+fn producer_time_semantics_fail_closed_on_stale_or_post_measurement_inputs() -> TestResult {
     let fixture = CatalogFixture::open()?;
     let mut service = fixture.service(8)?;
     let rules = ClassificationRuleset::current(100)?;
@@ -23,7 +22,10 @@ fn producer_time_semantics_prevent_lookahead_without_discarding_usable_stale_inp
     );
 
     let stale_but_available = service.classify(measurement(800, 2)?, rules.clone())?;
-    assert_eq!(stale_but_available.hierarchy(), FairValueHierarchy::Level2);
+    assert_eq!(
+        stale_but_available.hierarchy(),
+        FairValueHierarchy::Unclassified
+    );
     assert!(
         stale_but_available
             .reasons()

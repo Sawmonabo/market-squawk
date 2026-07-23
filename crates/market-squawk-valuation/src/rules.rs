@@ -12,7 +12,10 @@ use crate::measurement::{
 };
 use crate::{CanonicalHasher, FairValueError, FairValueEvidenceHash, checked_add};
 
-const CURRENT_RULESET_VERSION: u32 = 1;
+#[cfg(test)]
+mod tests;
+
+const CURRENT_RULESET_VERSION: u32 = 2;
 
 digest_id!(
     /// SHA-256 commitment to the exact code-owned classification semantics and parameters.
@@ -194,13 +197,25 @@ impl ClassificationRuleset {
     ///
     /// Rejects zero or values above signed timestamp arithmetic range.
     pub fn current(max_quote_age_nanos: u64) -> Result<Self, FairValueError> {
+        Self::versioned(CURRENT_RULESET_VERSION, max_quote_age_nanos)
+    }
+
+    pub(crate) fn versioned(
+        version: u32,
+        max_quote_age_nanos: u64,
+    ) -> Result<Self, FairValueError> {
         if max_quote_age_nanos == 0 || max_quote_age_nanos > i64::MAX as u64 {
             return Err(FairValueError::InvalidRuleset);
         }
+        let domain = match version {
+            1 => b"market-squawk/asc820-ifrs13-ruleset/v1".as_slice(),
+            2 => b"market-squawk/asc820-ifrs13-ruleset/v2".as_slice(),
+            _ => return Err(FairValueError::InvalidRuleset),
+        };
         let market_activity_policy =
             crate::MarketActivityPolicy::try_new(10, 1_000, 4_096, 300_000_000_000)?;
-        let mut hash = CanonicalHasher::new(b"market-squawk/asc820-ifrs13-ruleset/v1");
-        hash.u32(CURRENT_RULESET_VERSION);
+        let mut hash = CanonicalHasher::new(domain);
+        hash.u32(version);
         hash.u64(max_quote_age_nanos);
         hash.fixed(market_activity_policy.hash().bytes());
         for predicate in Predicate::ALL {
@@ -210,7 +225,7 @@ impl ClassificationRuleset {
         hash.u8(1); // DirectVerified is admissible evidence.
         hash.u8(2); // DirectUnverified may be independently verified for fair-value use.
         Ok(Self {
-            version: CURRENT_RULESET_VERSION,
+            version,
             max_quote_age_nanos,
             market_activity_policy,
             hash: RulesetHash(hash.finish()),
@@ -288,7 +303,7 @@ impl ClassificationRuleset {
                 _ => {}
             }
 
-            let input_hierarchy = input_hierarchy(input, &results);
+            let input_hierarchy = input_hierarchy(self.version, input, &results);
             if input_hierarchy == FairValueHierarchy::Level3 {
                 reasons.push(DecisionReason {
                     input_id: Some(input.id()),
@@ -503,7 +518,13 @@ fn evaluate_input(
         input.market_access() == MarketAccess::Accessible,
         relevant,
         fresh,
-        input.evidence().verification() == crate::EvidenceVerification::Verified,
+        if ruleset.version() == 1 {
+            input.evidence().verification() == crate::EvidenceVerification::Verified
+        } else {
+            input
+                .evidence()
+                .producer_verification_is_current_at(measurement.measurement_at())
+        },
         input.evidence().origin().is_market() && input.evidence().origin().venue_id().is_some(),
         input.amount().money().currency() == measurement.amount().money().currency(),
         input.amount().scale() == measurement.amount().scale(),
@@ -518,6 +539,7 @@ fn evaluate_input(
 }
 
 fn input_hierarchy(
+    ruleset_version: u32,
     input: &ValuationInput,
     results: &[PredicateResult; Predicate::ALL.len()],
 ) -> FairValueHierarchy {
@@ -529,6 +551,8 @@ fn input_hierarchy(
     };
     let usable = pass(Predicate::SubjectInstrumentMatches)
         && pass(Predicate::MeasurementDateRelevant)
+        && (ruleset_version == 1
+            || (pass(Predicate::WithinFreshnessLimit) && pass(Predicate::SourceEvidenceVerified)))
         && pass(Predicate::CurrencyMatches)
         && pass(Predicate::ScaleMatches)
         && input.data_quality() != DataQuality::Quarantined;

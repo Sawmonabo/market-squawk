@@ -71,6 +71,7 @@ pub(crate) fn recover(
             }
         }
     }
+    crate::access::validate_market_access_lineage(&market_access)?;
     let mut inputs = BTreeMap::new();
     for (id, payload) in input_payloads {
         let value = input_from_payload(payload, &evidence, &market_access)?;
@@ -89,14 +90,18 @@ pub(crate) fn recover(
             version,
             measurement_id,
             max_quote_age_nanos,
+            ruleset_version,
         } = payload
         {
             ensure_version(*version)?;
             let measurement = measurements
                 .get(&MeasurementId(*measurement_id))
                 .ok_or(FairValueError::CorruptPersistence)?;
-            let value =
-                ClassificationRuleset::current(*max_quote_age_nanos)?.classify(measurement)?;
+            let value = ClassificationRuleset::versioned(
+                ruleset_version.unwrap_or(1),
+                *max_quote_age_nanos,
+            )?
+            .classify(measurement)?;
             ensure_id(value.id().bytes(), id.bytes())?;
             insert_unique(&mut decisions, *id, std::sync::Arc::new(value))?;
         }
@@ -234,6 +239,8 @@ fn evidence_from_payload(payload: EvidencePayload) -> Result<FairValueEvidence, 
         published_at: time(payload.published_at_ns),
         available_at: time(payload.available_at_ns),
         received_at: time(payload.received_at_ns),
+        qualification_evaluated_at: time(payload.qualification_evaluated_at_ns),
+        qualification_valid_until: time(payload.qualification_valid_until_ns),
         ingested_at: Timestamp::from_unix_nanos(payload.ingested_at_ns),
         verification: match payload.verification {
             1 => EvidenceVerification::Verified,
@@ -417,6 +424,7 @@ fn access_from_payload(
         Timestamp::from_unix_nanos(payload.prepared_at_ns),
         actor(&payload.approved_by)?,
         Timestamp::from_unix_nanos(payload.approved_at_ns),
+        payload.supersedes_id.map(MarketAccessAssessmentId),
     )
 }
 

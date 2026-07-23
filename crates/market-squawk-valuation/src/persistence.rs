@@ -65,6 +65,10 @@ struct EvidencePayload {
     published_at_ns: Option<i64>,
     available_at_ns: Option<i64>,
     received_at_ns: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    qualification_evaluated_at_ns: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    qualification_valid_until_ns: Option<i64>,
     ingested_at_ns: i64,
     verification: u8,
 }
@@ -189,6 +193,8 @@ enum DecisionPayload {
         version: u16,
         measurement_id: [u8; 32],
         max_quote_age_nanos: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ruleset_version: Option<u32>,
     },
     Override {
         version: u16,
@@ -244,4 +250,6 @@ struct MarketAccessPayload {
     prepared_at_ns: i64,
     approved_by: String,
     approved_at_ns: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    supersedes_id: Option<[u8; 32]>,
 }

@@ -73,10 +73,14 @@ impl<'catalog> FairValueService<'catalog> {
             });
         }
         for input in measurement.inputs() {
-            if let Some(access) = input.market_access_assessment()
-                && self.market_access.get(&access.id()).map(AsRef::as_ref) != Some(access)
-            {
-                return Err(FairValueError::InvalidMarketAccessAssessment);
+            if let Some(access) = input.market_access_assessment() {
+                access.validate_for(
+                    measurement.account_id(),
+                    access.venue_id(),
+                    input.reference_instrument_id(),
+                    measurement.measurement_at(),
+                )?;
+                self.validate_market_access_authority(access, measurement.measurement_at())?;
             }
         }
         let decision = Arc::new(ruleset.classify(&measurement)?);
@@ -299,7 +303,8 @@ impl<'catalog> FairValueService<'catalog> {
         Ok(revocation)
     }
 
-    /// Creates and durably records a dual-approved reporting-entity market-access conclusion.
+    /// Creates the first dual-approved market-access conclusion or appends its immutable successor.
+    /// Exact retries return the current revision; every changed conclusion is linked to that head.
     #[allow(clippy::too_many_arguments)]
     pub fn approve_market_access(
         &mut self,
@@ -315,19 +320,57 @@ impl<'catalog> FairValueService<'catalog> {
         approved_by: ActorId,
         approved_at: Timestamp,
     ) -> Result<Arc<ApprovedMarketAccess>, FairValueError> {
-        let access = Arc::new(ApprovedMarketAccess::try_new(
-            account_id,
-            venue_id,
-            instrument_id,
-            conclusion,
-            effective_from,
-            effective_until,
-            rationale,
-            prepared_by,
-            prepared_at,
-            approved_by,
-            approved_at,
-        )?);
+        let head = self.market_access_head(account_id, &venue_id, instrument_id)?;
+        let access = if let Some(head) = head {
+            let replay = ApprovedMarketAccess::try_new(
+                account_id,
+                venue_id.clone(),
+                instrument_id,
+                conclusion,
+                effective_from,
+                effective_until,
+                rationale,
+                prepared_by.clone(),
+                prepared_at,
+                approved_by.clone(),
+                approved_at,
+                head.supersedes(),
+            )?;
+            if replay.id() == head.id() {
+                return Ok(head);
+            }
+            let successor = ApprovedMarketAccess::try_new(
+                account_id,
+                venue_id,
+                instrument_id,
+                conclusion,
+                effective_from,
+                effective_until,
+                rationale,
+                prepared_by,
+                prepared_at,
+                approved_by,
+                approved_at,
+                Some(head.id()),
+            )?;
+            successor.validate_successor(&head)?;
+            Arc::new(successor)
+        } else {
+            Arc::new(ApprovedMarketAccess::try_new(
+                account_id,
+                venue_id,
+                instrument_id,
+                conclusion,
+                effective_from,
+                effective_until,
+                rationale,
+                prepared_by,
+                prepared_at,
+                approved_by,
+                approved_at,
+                None,
+            )?)
+        };
         if let Some(existing) = self.market_access.get(&access.id()) {
             return Ok(Arc::clone(existing));
         }
@@ -343,6 +386,64 @@ impl<'catalog> FairValueService<'catalog> {
         self.persist(operation, draft, access.retained_bytes(), 1)?;
         self.market_access.insert(access.id(), Arc::clone(&access));
         Ok(access)
+    }
+
+    fn market_access_head(
+        &self,
+        account_id: AccountId,
+        venue_id: &VenueId,
+        instrument_id: InstrumentId,
+    ) -> Result<Option<Arc<ApprovedMarketAccess>>, FairValueError> {
+        let mut candidates = BTreeSet::new();
+        let mut superseded = BTreeSet::new();
+        for candidate in self
+            .market_access
+            .values()
+            .filter(|value| value.has_market(account_id, venue_id, instrument_id))
+        {
+            candidates.insert(candidate.id());
+            if let Some(predecessor_id) = candidate.supersedes() {
+                superseded.insert(predecessor_id);
+            }
+        }
+        candidates.retain(|id| !superseded.contains(id));
+        let mut heads = candidates.into_iter();
+        let Some(head_id) = heads.next() else {
+            return Ok(None);
+        };
+        if heads.next().is_some() {
+            return Err(FairValueError::CorruptPersistence);
+        }
+        self.market_access
+            .get(&head_id)
+            .cloned()
+            .ok_or(FairValueError::CorruptPersistence)
+            .map(Some)
+    }
+
+    fn validate_market_access_authority(
+        &self,
+        assessment: &ApprovedMarketAccess,
+        at: Timestamp,
+    ) -> Result<(), FairValueError> {
+        if self.market_access.get(&assessment.id()).map(AsRef::as_ref) != Some(assessment) {
+            return Err(FairValueError::InvalidMarketAccessAssessment);
+        }
+        let mut children = self
+            .market_access
+            .values()
+            .filter(|value| value.supersedes() == Some(assessment.id()));
+        let Some(successor) = children.next() else {
+            return Ok(());
+        };
+        if children.next().is_some() {
+            return Err(FairValueError::CorruptPersistence);
+        }
+        if successor.approved_at() <= at && successor.effective_from() <= at {
+            Err(FairValueError::InvalidMarketAccessAssessment)
+        } else {
+            Ok(())
+        }
     }
 
     /// Evaluates immutable approval and revocation times at one query instant.

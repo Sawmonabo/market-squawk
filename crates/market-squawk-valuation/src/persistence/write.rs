@@ -47,6 +47,7 @@ pub(crate) fn classify_operation(
             version: PAYLOAD_VERSION,
             measurement_id: measurement.id().bytes(),
             max_quote_age_nanos: ruleset.max_quote_age_nanos(),
+            ruleset_version: Some(ruleset.version()),
         },
     )?);
     links.push(link(
@@ -260,6 +261,7 @@ fn market_access_record(
             prepared_at_ns: value.prepared_at().unix_nanos(),
             approved_by: value.approved_by().as_str().to_owned(),
             approved_at_ns: value.approved_at().unix_nanos(),
+            supersedes_id: value.supersedes().map(MarketAccessAssessmentId::bytes),
         },
     )
 }
@@ -277,6 +279,10 @@ fn evidence_payload(value: &FairValueEvidence) -> Result<EvidencePayload, FairVa
         published_at_ns: value.published_at().map(Timestamp::unix_nanos),
         available_at_ns: value.available_at().map(Timestamp::unix_nanos),
         received_at_ns: value.received_at().map(Timestamp::unix_nanos),
+        qualification_evaluated_at_ns: value
+            .qualification_evaluated_at()
+            .map(Timestamp::unix_nanos),
+        qualification_valid_until_ns: value.qualification_valid_until().map(Timestamp::unix_nanos),
         ingested_at_ns: value.ingested_at().unix_nanos(),
         verification: match value.verification() {
             EvidenceVerification::Verified => 1,

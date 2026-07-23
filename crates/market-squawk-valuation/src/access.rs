@@ -1,6 +1,8 @@
 //! Dual-approved reporting-entity market-access assessments.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::mem::size_of;
+use std::sync::Arc;
 
 use market_squawk_domain::{AccountId, InstrumentId, Timestamp, VenueId};
 
@@ -28,6 +30,7 @@ pub struct ApprovedMarketAccess {
     prepared_at: Timestamp,
     approved_by: ActorId,
     approved_at: Timestamp,
+    supersedes: Option<MarketAccessAssessmentId>,
     retained_bytes: usize,
 }
 
@@ -45,6 +48,7 @@ impl ApprovedMarketAccess {
         prepared_at: Timestamp,
         approved_by: ActorId,
         approved_at: Timestamp,
+        supersedes: Option<MarketAccessAssessmentId>,
     ) -> Result<Self, FairValueError> {
         if conclusion == MarketAccess::NotAssessed
             || effective_until < effective_from
@@ -60,7 +64,11 @@ impl ApprovedMarketAccess {
                 FairValueError::InvalidMarketAccessAssessment
             });
         }
-        let mut hash = CanonicalHasher::new(b"market-squawk/market-access-assessment/v1");
+        let mut hash = CanonicalHasher::new(if supersedes.is_some() {
+            b"market-squawk/market-access-assessment/v2"
+        } else {
+            b"market-squawk/market-access-assessment/v1"
+        });
         hash.bytes(account_id.as_uuid().as_bytes());
         hash.bytes(venue_id.as_str().as_bytes());
         hash.bytes(instrument_id.as_uuid().as_bytes());
@@ -72,6 +80,9 @@ impl ApprovedMarketAccess {
         hash.i64(prepared_at.unix_nanos());
         hash.bytes(approved_by.as_str().as_bytes());
         hash.i64(approved_at.unix_nanos());
+        if let Some(predecessor_id) = supersedes {
+            hash.fixed(predecessor_id.bytes());
+        }
         let retained_bytes = checked_add(
             size_of::<Self>(),
             checked_add(
@@ -95,6 +106,7 @@ impl ApprovedMarketAccess {
             prepared_at,
             approved_by,
             approved_at,
+            supersedes,
             retained_bytes,
         })
     }
@@ -159,6 +171,38 @@ impl ApprovedMarketAccess {
         self.approved_at
     }
 
+    /// Returns the exact prior assessment replaced by this immutable revision.
+    pub const fn supersedes(&self) -> Option<MarketAccessAssessmentId> {
+        self.supersedes
+    }
+
+    pub(crate) fn has_market(
+        &self,
+        account_id: AccountId,
+        venue_id: &VenueId,
+        instrument_id: InstrumentId,
+    ) -> bool {
+        self.account_id == account_id
+            && &self.venue_id == venue_id
+            && self.instrument_id == instrument_id
+    }
+
+    pub(crate) fn validate_successor(&self, predecessor: &Self) -> Result<(), FairValueError> {
+        if self.supersedes != Some(predecessor.id)
+            || !self.has_market(
+                predecessor.account_id,
+                &predecessor.venue_id,
+                predecessor.instrument_id,
+            )
+            || self.effective_from < predecessor.effective_from
+            || self.prepared_at <= predecessor.approved_at
+            || self.approved_at <= predecessor.approved_at
+        {
+            return Err(FairValueError::InvalidMarketAccessAssessment);
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate_for(
         &self,
         account_id: AccountId,
@@ -180,5 +224,51 @@ impl ApprovedMarketAccess {
 
     pub(crate) const fn retained_bytes(&self) -> usize {
         self.retained_bytes
+    }
+}
+
+pub(crate) fn validate_market_access_lineage(
+    values: &BTreeMap<MarketAccessAssessmentId, Arc<ApprovedMarketAccess>>,
+) -> Result<(), FairValueError> {
+    let mut roots = BTreeMap::new();
+    let mut children = BTreeMap::new();
+    for value in values.values() {
+        let key = (
+            value.account_id(),
+            value.venue_id().clone(),
+            value.instrument_id(),
+        );
+        if let Some(predecessor_id) = value.supersedes() {
+            let predecessor = values
+                .get(&predecessor_id)
+                .ok_or(FairValueError::CorruptPersistence)?;
+            value
+                .validate_successor(predecessor)
+                .map_err(|_| FairValueError::CorruptPersistence)?;
+            if children.insert(predecessor_id, value.id()).is_some() {
+                return Err(FairValueError::CorruptPersistence);
+            }
+        } else if roots.insert(key, value.id()).is_some() {
+            return Err(FairValueError::CorruptPersistence);
+        }
+    }
+
+    let mut visited = BTreeSet::new();
+    for root_id in roots.values() {
+        let mut cursor_id = *root_id;
+        loop {
+            if !visited.insert(cursor_id) {
+                return Err(FairValueError::CorruptPersistence);
+            }
+            let Some(successor_id) = children.get(&cursor_id) else {
+                break;
+            };
+            cursor_id = *successor_id;
+        }
+    }
+    if visited.len() == values.len() {
+        Ok(())
+    } else {
+        Err(FairValueError::CorruptPersistence)
     }
 }

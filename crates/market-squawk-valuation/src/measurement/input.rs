@@ -77,11 +77,14 @@ impl ValuationInput {
         let accessible = selected.source_authorization() == SourceAuthorization::Authorized
             && selected.coverage_status() == CoverageStatus::Sufficient
             && selected.trading_status() == TradingStatus::Active;
-        let verification = if selected.source_timestamp().is_some() && accessible {
-            EvidenceVerification::Verified
-        } else {
-            EvidenceVerification::Unverified
-        };
+        let qualification_current = selected.qualification_evaluated_at() <= measurement_at
+            && measurement_at <= selected.qualification_valid_until();
+        let verification =
+            if selected.source_timestamp().is_some() && accessible && qualification_current {
+                EvidenceVerification::Verified
+            } else {
+                EvidenceVerification::Unverified
+            };
         let evidence = FairValueEvidence::try_from_parts(FairValueEvidenceParts {
             source_id: selected.source_id().clone(),
             source_identifier: selected.source_identifier().clone(),
@@ -101,6 +104,8 @@ impl ValuationInput {
             published_at: None,
             available_at: Some(selected.available_at()),
             received_at: Some(selected.received_at()),
+            qualification_evaluated_at: Some(selected.qualification_evaluated_at()),
+            qualification_valid_until: Some(selected.qualification_valid_until()),
             ingested_at: selected.ingested_at(),
             verification,
         })?;
@@ -164,6 +169,8 @@ impl ValuationInput {
             published_at: value.published_at(),
             available_at: value.available_at(),
             received_at: Some(value.received_at()),
+            qualification_evaluated_at: None,
+            qualification_valid_until: None,
             ingested_at: value.ingested_at(),
             verification,
         })?;
@@ -184,17 +191,11 @@ impl ValuationInput {
         })
     }
 
-    /// Derives an analytical feature input from one exact pinned query cell and registered feature
-    /// metadata. The monetary value and row provenance remain entirely producer-derived.
-    ///
-    /// # Errors
-    ///
-    /// Rejects rows without an instrument identity or exact decimal conversion.
-    pub fn from_analytics(
+    fn analytics_spec(
         value: &PinnedFeatureMonetaryValue,
         registry: &FeatureRegistry,
         significance: InputSignificance,
-    ) -> Result<Self, FairValueError> {
+    ) -> Result<ValuationInputSpec, FairValueError> {
         let feature_key = FeatureKey::try_new(value.component_name(), value.component_version())
             .map_err(|_| FairValueError::InvalidProducerEvidence)?;
         let feature = registry
@@ -235,10 +236,12 @@ impl ValuationInput {
             published_at: None,
             available_at: Some(value.cutoff_at()),
             received_at: None,
+            qualification_evaluated_at: None,
+            qualification_valid_until: None,
             ingested_at: value.cutoff_at(),
             verification: EvidenceVerification::Verified,
         })?;
-        Self::try_from_spec(ValuationInputSpec {
+        Ok(ValuationInputSpec {
             subject_instrument_id: value.instrument_id(),
             reference_instrument_id: value.instrument_id(),
             relationship: InputInstrumentRelation::Identical,
@@ -296,6 +299,8 @@ impl ValuationInput {
             published_at: None,
             available_at: Some(revision_evidence.as_of()),
             received_at: None,
+            qualification_evaluated_at: None,
+            qualification_valid_until: None,
             ingested_at: revision_evidence.as_of(),
             verification: EvidenceVerification::Verified,
         })?;
@@ -334,10 +339,23 @@ impl ValuationInput {
         significance: InputSignificance,
         assessment: InputUseAssessment,
     ) -> Result<Self, FairValueError> {
-        Self::with_use_assessment(
-            Self::from_analytics(value, registry, significance)?,
-            assessment,
-        )
+        let spec = Self::analytics_spec(value, registry, significance)?;
+        assessment.validate_for(spec.reference_instrument_id, spec.evidence.ingested_at())?;
+        Self::try_from_spec(ValuationInputSpec {
+            subject_instrument_id: assessment.subject_instrument_id(),
+            reference_instrument_id: spec.reference_instrument_id,
+            relationship: assessment.relationship(),
+            amount: spec.amount,
+            significance: spec.significance,
+            observability: assessment.observability(),
+            adjustment: assessment.adjustment(),
+            market_activity: spec.market_activity,
+            market_access: spec.market_access,
+            market_access_assessment: spec.market_access_assessment,
+            data_quality: spec.data_quality,
+            evidence: spec.evidence,
+            use_assessment: Some(assessment),
+        })
     }
 
     fn with_use_assessment(
@@ -378,6 +396,11 @@ impl ValuationInput {
         let same = spec.subject_instrument_id == spec.reference_instrument_id;
         if same != (spec.relationship == InputInstrumentRelation::Identical) {
             return Err(FairValueError::InvalidInstrumentRelationship);
+        }
+        if matches!(spec.evidence.origin(), EvidenceOrigin::Analytics { .. })
+            && spec.use_assessment.is_none()
+        {
+            return Err(FairValueError::InvalidInputAssessment);
         }
         if (spec.market_access == MarketAccess::NotAssessed)
             != spec.market_access_assessment.is_none()

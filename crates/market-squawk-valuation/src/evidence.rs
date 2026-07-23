@@ -224,6 +224,8 @@ pub(crate) struct FairValueEvidenceParts {
     pub(crate) published_at: Option<Timestamp>,
     pub(crate) available_at: Option<Timestamp>,
     pub(crate) received_at: Option<Timestamp>,
+    pub(crate) qualification_evaluated_at: Option<Timestamp>,
+    pub(crate) qualification_valid_until: Option<Timestamp>,
     pub(crate) ingested_at: Timestamp,
     pub(crate) verification: EvidenceVerification,
 }
@@ -240,6 +242,8 @@ pub struct FairValueEvidence {
     published_at: Option<Timestamp>,
     available_at: Option<Timestamp>,
     received_at: Option<Timestamp>,
+    qualification_evaluated_at: Option<Timestamp>,
+    qualification_valid_until: Option<Timestamp>,
     ingested_at: Timestamp,
     verification: EvidenceVerification,
     hash: FairValueEvidenceHash,
@@ -272,6 +276,14 @@ impl FairValueEvidence {
         let verified_incomplete = parts.verification == EvidenceVerification::Verified
             && (available.is_none()
                 || (parts.source_timestamp.is_none() && parts.effective_at.is_none()));
+        let qualification_incomplete =
+            parts.qualification_evaluated_at.is_some() != parts.qualification_valid_until.is_some();
+        let qualification_invalid = (!parts.origin.is_market()
+            && parts.qualification_evaluated_at.is_some())
+            || parts
+                .qualification_evaluated_at
+                .zip(parts.qualification_valid_until)
+                .is_some_and(|(evaluated_at, valid_until)| evaluated_at > valid_until);
         if parts.payload_digest.bytes() == [0; 32]
             || origin_order_invalid
             || receive_order_invalid
@@ -284,6 +296,8 @@ impl FairValueEvidence {
                 .received_at
                 .is_some_and(|value| value > parts.ingested_at)
             || verified_incomplete
+            || qualification_incomplete
+            || qualification_invalid
         {
             return Err(FairValueError::InvalidTime);
         }
@@ -307,6 +321,14 @@ impl FairValueEvidence {
         hash_optional_time(&mut hash, parts.published_at);
         hash_optional_time(&mut hash, parts.available_at);
         hash_optional_time(&mut hash, parts.received_at);
+        if let (Some(evaluated_at), Some(valid_until)) = (
+            parts.qualification_evaluated_at,
+            parts.qualification_valid_until,
+        ) {
+            hash.u8(1);
+            hash.i64(evaluated_at.unix_nanos());
+            hash.i64(valid_until.unix_nanos());
+        }
         hash.i64(parts.ingested_at.unix_nanos());
         hash.u8(match parts.verification {
             EvidenceVerification::Verified => 1,
@@ -322,6 +344,8 @@ impl FairValueEvidence {
             published_at: parts.published_at,
             available_at: parts.available_at,
             received_at: parts.received_at,
+            qualification_evaluated_at: parts.qualification_evaluated_at,
+            qualification_valid_until: parts.qualification_valid_until,
             ingested_at: parts.ingested_at,
             verification: parts.verification,
             hash: FairValueEvidenceHash(hash.finish()),
@@ -374,6 +398,16 @@ impl FairValueEvidence {
         self.received_at
     }
 
+    /// Returns when the selected market observation's complete qualification was evaluated.
+    pub const fn qualification_evaluated_at(&self) -> Option<Timestamp> {
+        self.qualification_evaluated_at
+    }
+
+    /// Returns the selected market observation's inclusive qualification expiry.
+    pub const fn qualification_valid_until(&self) -> Option<Timestamp> {
+        self.qualification_valid_until
+    }
+
     /// Returns the producer ingestion or immutable-publication timestamp.
     pub const fn ingested_at(&self) -> Timestamp {
         self.ingested_at
@@ -394,6 +428,18 @@ impl FairValueEvidence {
             Some(value) => Some(value),
             None => self.effective_at,
         }
+    }
+
+    pub(crate) fn producer_verification_is_current_at(&self, at: Timestamp) -> bool {
+        if self.verification != EvidenceVerification::Verified {
+            return false;
+        }
+        if !self.origin.is_market() {
+            return true;
+        }
+        self.qualification_evaluated_at
+            .zip(self.qualification_valid_until)
+            .is_some_and(|(evaluated_at, valid_until)| evaluated_at <= at && at <= valid_until)
     }
 
     pub(crate) const fn retained_bytes(&self) -> usize {
