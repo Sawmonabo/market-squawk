@@ -401,6 +401,7 @@ impl BacktestService {
             evaluator,
             experiment_design_digest: design.ok_or(BacktestServiceError::InvalidCohort)?,
             cohort_universe_digest: plan.universe().digest(),
+            expected_candidate_count: Some(expected_candidates),
             selection_criterion: plan.selection_criterion().clone(),
             members,
             folds: plan.folds().to_vec(),

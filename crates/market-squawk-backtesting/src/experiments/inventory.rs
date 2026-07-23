@@ -270,10 +270,9 @@ impl ExperimentInventory {
             ExistingPolicy::AcceptExact,
         )?;
         cleanup_optional(&self.root, &pending_path);
-        Ok(TrialRecord {
-            spec: reservation.spec.clone(),
-            status,
-        })
+        let id = reservation.spec.id();
+        drop(_guard);
+        self.trial(id)
     }
 
     pub(crate) fn prepare_completion(
@@ -320,6 +319,14 @@ impl ExperimentInventory {
             return Err(ExperimentError::CorruptRecord);
         }
         let identity_version = spec.identity_version();
+        let latest = latest_attempt(&self.root, id, self.limits.max_record_bytes)?;
+        let attempt_terminal = authoritative_attempt_terminal(
+            &self.root,
+            id,
+            identity_version,
+            latest.as_ref(),
+            self.limits.max_record_bytes,
+        )?;
         let legacy = read_optional_bounded(
             &self.root,
             &legacy_terminal_path(id),
@@ -327,16 +334,6 @@ impl ExperimentInventory {
         )?;
         let status = match identity_version {
             TrialIdentityVersion::V1 | TrialIdentityVersion::V2 => {
-                if let Some(attempt) = latest_attempt(&self.root, id, self.limits.max_record_bytes)?
-                    && read_optional_bounded(
-                        &self.root,
-                        &attempt_terminal_path(id, attempt.attempt),
-                        self.limits.max_record_bytes,
-                    )?
-                    .is_some()
-                {
-                    return Err(ExperimentError::CorruptRecord);
-                }
                 if let Some(bytes) = legacy {
                     let decoded = decode_terminal(
                         &bytes,
@@ -353,26 +350,18 @@ impl ExperimentInventory {
                 if legacy.is_some() {
                     return Err(ExperimentError::CorruptRecord);
                 }
-                if let Some(attempt) = latest_attempt(&self.root, id, self.limits.max_record_bytes)?
-                {
-                    match read_optional_bounded(
-                        &self.root,
-                        &attempt_terminal_path(id, attempt.attempt),
-                        self.limits.max_record_bytes,
-                    )? {
-                        Some(bytes) => {
-                            let decoded = decode_terminal(
-                                &bytes,
-                                id,
-                                identity_version.terminal_schema_version(),
-                                self.limits,
-                            )?;
-                            self.reconcile_terminal_artifact(id, attempt.attempt, decoded)?
-                        }
-                        None => TrialStatus::Reserved,
+                match (latest, attempt_terminal) {
+                    (Some(attempt), Some(bytes)) => {
+                        let decoded = decode_terminal(
+                            &bytes,
+                            id,
+                            identity_version.terminal_schema_version(),
+                            self.limits,
+                        )?;
+                        self.reconcile_terminal_artifact(id, attempt.attempt, decoded)?
                     }
-                } else {
-                    TrialStatus::Reserved
+                    (Some(_), None) | (None, None) => TrialStatus::Reserved,
+                    (None, Some(_)) => return Err(ExperimentError::CorruptRecord),
                 }
             }
         };
@@ -472,10 +461,9 @@ impl ExperimentInventory {
             &terminal,
             ExistingPolicy::Reject,
         )?;
-        Ok(TrialRecord {
-            spec: reservation.spec.clone(),
-            status,
-        })
+        let id = reservation.spec.id();
+        drop(_guard);
+        self.trial(id)
     }
 
     fn validate_active_attempt(
@@ -911,6 +899,64 @@ fn attempt_parent(id: TrialId) -> PathBuf {
 
 fn attempt_path(id: TrialId, attempt: u64) -> PathBuf {
     attempt_parent(id).join(format!("{attempt:020}.json"))
+}
+
+fn authoritative_attempt_terminal(
+    root: &Dir,
+    id: TrialId,
+    identity_version: TrialIdentityVersion,
+    latest_attempt: Option<&AttemptRecord>,
+    maximum: usize,
+) -> Result<Option<Vec<u8>>, ExperimentError> {
+    let parent = terminal_attempt_parent(id);
+    let directory = match root.open_dir_nofollow(&parent) {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(ExperimentError::Io(error)),
+    };
+    let mut count = 0_usize;
+    let mut candidate = None::<u64>;
+    let mut invalid = false;
+    for entry in directory.entries()? {
+        let entry = entry?;
+        count = count.checked_add(1).ok_or(ExperimentError::LimitExceeded)?;
+        if count > MAX_ATTEMPTS_PER_TRIAL {
+            return Err(ExperimentError::LimitExceeded);
+        }
+        let number = entry
+            .file_name()
+            .to_str()
+            .and_then(decode_attempt_terminal_name);
+        if !entry.file_type()?.is_file() || number.is_none() || candidate.is_some() {
+            invalid = true;
+            continue;
+        }
+        candidate = number;
+    }
+    if count == 0 {
+        return Ok(None);
+    }
+    if identity_version != TrialIdentityVersion::V3 || invalid {
+        return Err(ExperimentError::CorruptRecord);
+    }
+    let number = candidate.ok_or(ExperimentError::CorruptRecord)?;
+    if latest_attempt.map(|attempt| attempt.attempt) != Some(number) {
+        return Err(ExperimentError::CorruptRecord);
+    }
+    read_bounded(root, &attempt_terminal_path(id, number), maximum).map(Some)
+}
+
+fn decode_attempt_terminal_name(name: &str) -> Option<u64> {
+    let number = name.strip_suffix(".json")?;
+    if number.len() != 20 || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let number = number.parse::<u64>().ok()?;
+    (number != 0
+        && usize::try_from(number)
+            .ok()
+            .is_some_and(|number| number <= MAX_ATTEMPTS_PER_TRIAL))
+    .then_some(number)
 }
 
 fn latest_attempt(

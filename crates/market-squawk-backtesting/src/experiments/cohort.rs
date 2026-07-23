@@ -1,10 +1,13 @@
 //! Append-only cohort diagnostics and selection evidence bound to completed trial results.
 
 use std::collections::BTreeSet;
+use std::fmt;
+use std::marker::PhantomData;
 
 use market_squawk_data::Sha256Digest;
 use market_squawk_domain::SourceIdentifier;
-use serde::{Deserialize, Serialize};
+use serde::de::{self, DeserializeSeed, IgnoredAny, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use super::ExperimentError;
@@ -495,6 +498,7 @@ pub struct BacktestCohortEvaluation {
     evaluator: TrialComponentBinding,
     experiment_design_digest: Sha256Digest,
     cohort_universe_digest: Option<Sha256Digest>,
+    expected_candidate_count: Option<usize>,
     selection_criterion: SourceIdentifier,
     members: Box<[CohortMemberBinding]>,
     folds: Box<[BacktestCohortFold]>,
@@ -508,6 +512,7 @@ pub(crate) struct CohortEvaluationInput {
     pub evaluator: TrialComponentBinding,
     pub experiment_design_digest: Sha256Digest,
     pub cohort_universe_digest: Sha256Digest,
+    pub expected_candidate_count: Option<usize>,
     pub selection_criterion: SourceIdentifier,
     pub members: Vec<CohortMemberBinding>,
     pub folds: Vec<BacktestCohortFold>,
@@ -518,56 +523,56 @@ pub(crate) struct CohortEvaluationInput {
 }
 
 impl BacktestCohortEvaluation {
-    pub(crate) fn try_new(mut input: CohortEvaluationInput) -> Result<Self, ExperimentError> {
-        require_digest(input.cohort_universe_digest)?;
-        validate_cohort_materialization_counts(
-            input.members.len(),
-            input.folds.len(),
-            input.selection_candidates.len(),
-            input.folds.iter().map(|fold| fold.candidates.len()),
-        )?;
-        input.members.sort_unstable_by_key(|member| member.trial_id);
-        if input.members.len() < 2
-            || input
-                .members
-                .windows(2)
-                .any(|pair| pair[0].trial_id == pair[1].trial_id)
-            || !input.members.contains(&input.selected)
-        {
-            return Err(ExperimentError::InvalidDiagnostic);
-        }
-        input.selection_candidates.sort_unstable();
-        if input
-            .selection_candidates
-            .windows(2)
-            .any(|pair| pair[0] == pair[1])
-        {
-            return Err(ExperimentError::InvalidDiagnostic);
-        }
-        let mut value = Self {
-            id: BacktestCohortEvaluationId(Sha256Digest::new([0; 32])),
-            evaluator: input.evaluator,
-            experiment_design_digest: input.experiment_design_digest,
-            cohort_universe_digest: Some(input.cohort_universe_digest),
-            selection_criterion: input.selection_criterion,
-            members: input.members.into_boxed_slice(),
-            folds: input.folds.into_boxed_slice(),
-            selection_candidates: input.selection_candidates.into_boxed_slice(),
-            probability_of_backtest_overfitting: input.probability_of_backtest_overfitting,
-            deflated_performance: input.deflated_performance,
-            selected: input.selected,
-        };
-        value.id = BacktestCohortEvaluationId(evaluation_digest(&value)?);
-        Ok(value)
+    pub(crate) fn try_new(input: CohortEvaluationInput) -> Result<Self, ExperimentError> {
+        Self::try_new_versioned(input, CohortEvaluationVersion::V3)
     }
 
-    fn try_new_legacy(mut input: CohortEvaluationInput) -> Result<Self, ExperimentError> {
+    fn try_new_v2(input: CohortEvaluationInput) -> Result<Self, ExperimentError> {
+        Self::try_new_versioned(input, CohortEvaluationVersion::V2)
+    }
+
+    fn try_new_legacy(input: CohortEvaluationInput) -> Result<Self, ExperimentError> {
+        Self::try_new_versioned(input, CohortEvaluationVersion::V1)
+    }
+
+    fn try_new_versioned(
+        mut input: CohortEvaluationInput,
+        version: CohortEvaluationVersion,
+    ) -> Result<Self, ExperimentError> {
+        if version != CohortEvaluationVersion::V1 {
+            require_digest(input.cohort_universe_digest)?;
+        }
         validate_cohort_materialization_counts(
             input.members.len(),
             input.folds.len(),
             input.selection_candidates.len(),
             input.folds.iter().map(|fold| fold.candidates.len()),
         )?;
+        let expected_candidate_count = match version {
+            CohortEvaluationVersion::V1 | CohortEvaluationVersion::V2 => {
+                if input.expected_candidate_count.is_some() {
+                    return Err(ExperimentError::InvalidDiagnostic);
+                }
+                None
+            }
+            CohortEvaluationVersion::V3 => {
+                let expected = input
+                    .expected_candidate_count
+                    .ok_or(ExperimentError::InvalidDiagnostic)?;
+                if !(2..=MAX_COHORT_CANDIDATES_PER_FOLD).contains(&expected)
+                    || expected > MAX_COHORT_SELECTION_CANDIDATES
+                    || input.selection_candidates.len() != expected
+                    || input
+                        .folds
+                        .iter()
+                        .any(|fold| fold.candidates.len() != expected)
+                {
+                    return Err(ExperimentError::InvalidDiagnostic);
+                }
+                cohort_member_reference_count(input.folds.len(), expected)?;
+                Some(expected)
+            }
+        };
         input.members.sort_unstable_by_key(|member| member.trial_id);
         if input.members.len() < 2
             || input
@@ -590,7 +595,9 @@ impl BacktestCohortEvaluation {
             id: BacktestCohortEvaluationId(Sha256Digest::new([0; 32])),
             evaluator: input.evaluator,
             experiment_design_digest: input.experiment_design_digest,
-            cohort_universe_digest: None,
+            cohort_universe_digest: (version != CohortEvaluationVersion::V1)
+                .then_some(input.cohort_universe_digest),
+            expected_candidate_count,
             selection_criterion: input.selection_criterion,
             members: input.members.into_boxed_slice(),
             folds: input.folds.into_boxed_slice(),
@@ -613,6 +620,12 @@ impl BacktestCohortEvaluation {
     #[must_use]
     pub const fn cohort_universe_digest(&self) -> Option<Sha256Digest> {
         self.cohort_universe_digest
+    }
+
+    /// Returns the exact V3 search-space cardinality, or `None` for legacy records.
+    #[must_use]
+    pub const fn expected_candidate_count(&self) -> Option<usize> {
+        self.expected_candidate_count
     }
 
     /// Returns exact member and completed-result bindings.
@@ -638,6 +651,13 @@ impl BacktestCohortEvaluation {
     pub const fn deflated_performance(&self) -> DeflatedPerformanceDiagnostic {
         self.deflated_performance
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CohortEvaluationVersion {
+    V1,
+    V2,
+    V3,
 }
 
 fn validate_cohort_materialization_counts(
@@ -672,12 +692,18 @@ fn validate_cohort_materialization_counts(
 
 fn evaluation_digest(value: &BacktestCohortEvaluation) -> Result<Sha256Digest, ExperimentError> {
     let mut hash = Sha256::new();
-    match value.cohort_universe_digest {
-        Some(digest) => {
+    match (value.cohort_universe_digest, value.expected_candidate_count) {
+        (Some(digest), Some(expected_candidate_count)) => {
+            hash.update(b"market-squawk/backtest-cohort-evaluation/v3");
+            hash.update(digest.bytes());
+            hash_length(&mut hash, expected_candidate_count)?;
+        }
+        (Some(digest), None) => {
             hash.update(b"market-squawk/backtest-cohort-evaluation/v2");
             hash.update(digest.bytes());
         }
-        None => hash.update(b"market-squawk/backtest-cohort-evaluation/v1"),
+        (None, None) => hash.update(b"market-squawk/backtest-cohort-evaluation/v1"),
+        (None, Some(_)) => return Err(ExperimentError::Encoding),
     }
     hash_bytes(&mut hash, value.evaluator.name().as_str().as_bytes())?;
     hash.update(value.evaluator.digest().bytes());
@@ -758,6 +784,198 @@ fn hash_length(hash: &mut Sha256, length: usize) -> Result<(), ExperimentError> 
     Ok(())
 }
 
+#[derive(Debug, Serialize)]
+#[serde(transparent)]
+struct BoundedWireSequence<T, const MAXIMUM: usize>(Vec<T>);
+
+impl<T, const MAXIMUM: usize> BoundedWireSequence<T, MAXIMUM> {
+    fn into_inner(self) -> Vec<T> {
+        self.0
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+impl<'de, T, const MAXIMUM: usize> Deserialize<'de> for BoundedWireSequence<T, MAXIMUM>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        BoundedSequenceSeed::<T>::new(MAXIMUM)
+            .deserialize(deserializer)
+            .map(Self)
+    }
+}
+
+struct BoundedSequenceSeed<T> {
+    maximum: usize,
+    marker: PhantomData<fn() -> T>,
+}
+
+impl<T> BoundedSequenceSeed<T> {
+    const fn new(maximum: usize) -> Self {
+        Self {
+            maximum,
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<'de, T> DeserializeSeed<'de> for BoundedSequenceSeed<T>
+where
+    T: Deserialize<'de>,
+{
+    type Value = Vec<T>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(BoundedSequenceVisitor::<T> {
+            maximum: self.maximum,
+            marker: PhantomData,
+        })
+    }
+}
+
+struct BoundedSequenceVisitor<T> {
+    maximum: usize,
+    marker: PhantomData<fn() -> T>,
+}
+
+impl<'de, T> Visitor<'de> for BoundedSequenceVisitor<T>
+where
+    T: Deserialize<'de>,
+{
+    type Value = Vec<T>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "a sequence containing at most {} elements",
+            self.maximum
+        )
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        if sequence
+            .size_hint()
+            .is_some_and(|length| length > self.maximum)
+        {
+            return Err(de::Error::custom("bounded sequence exceeds its limit"));
+        }
+        let mut values = Vec::new();
+        loop {
+            if values.len() == self.maximum {
+                if sequence.next_element::<IgnoredAny>()?.is_some() {
+                    return Err(de::Error::custom("bounded sequence exceeds its limit"));
+                }
+                break;
+            }
+            reserve_next_wire_element(&mut values, self.maximum)?;
+            let Some(value) = sequence.next_element()? else {
+                break;
+            };
+            values.push(value);
+        }
+        Ok(values)
+    }
+}
+
+fn reserve_next_wire_element<T, E>(values: &mut Vec<T>, maximum: usize) -> Result<(), E>
+where
+    E: de::Error,
+{
+    if values.len() < values.capacity() {
+        return Ok(());
+    }
+    let remaining = maximum.saturating_sub(values.len());
+    let growth = if values.capacity() == 0 {
+        remaining.min(4)
+    } else {
+        values.capacity().min(remaining)
+    };
+    values
+        .try_reserve_exact(growth)
+        .map_err(|_| de::Error::custom("bounded sequence allocation failed"))
+}
+
+const MAX_COHORT_FOLD_CANDIDATES_BY_REFERENCE: usize =
+    (MAX_COHORT_MEMBER_REFERENCES - MAX_COHORT_SELECTION_CANDIDATES) / 2;
+const MAX_DECODED_COHORT_FOLD_CANDIDATES: usize =
+    if MAX_COHORT_FOLD_CANDIDATES < MAX_COHORT_FOLD_CANDIDATES_BY_REFERENCE {
+        MAX_COHORT_FOLD_CANDIDATES
+    } else {
+        MAX_COHORT_FOLD_CANDIDATES_BY_REFERENCE
+    };
+
+#[derive(Debug, Serialize)]
+#[serde(transparent)]
+struct BoundedFolds(Vec<BoundedWireSequence<CandidateWire, MAX_COHORT_CANDIDATES_PER_FOLD>>);
+
+impl<'de> Deserialize<'de> for BoundedFolds {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(BoundedFoldsVisitor)
+    }
+}
+
+struct BoundedFoldsVisitor;
+
+impl<'de> Visitor<'de> for BoundedFoldsVisitor {
+    type Value = BoundedFolds;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a bounded sequence of bounded cohort folds")
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        if sequence
+            .size_hint()
+            .is_some_and(|length| length > HARD_MAX_COHORT_FOLDS)
+        {
+            return Err(de::Error::custom("cohort fold sequence exceeds its limit"));
+        }
+        let mut folds = Vec::new();
+        let mut candidate_count = 0_usize;
+        loop {
+            if folds.len() == HARD_MAX_COHORT_FOLDS {
+                if sequence.next_element::<IgnoredAny>()?.is_some() {
+                    return Err(de::Error::custom("cohort fold sequence exceeds its limit"));
+                }
+                break;
+            }
+            reserve_next_wire_element(&mut folds, HARD_MAX_COHORT_FOLDS)?;
+            let remaining = MAX_DECODED_COHORT_FOLD_CANDIDATES
+                .checked_sub(candidate_count)
+                .ok_or_else(|| de::Error::custom("cohort candidate count overflowed"))?;
+            let maximum = remaining.min(MAX_COHORT_CANDIDATES_PER_FOLD);
+            let Some(fold) = sequence.next_element_seed(BoundedSequenceSeed::new(maximum))? else {
+                break;
+            };
+            candidate_count = candidate_count
+                .checked_add(fold.len())
+                .filter(|count| *count <= MAX_DECODED_COHORT_FOLD_CANDIDATES)
+                .ok_or_else(|| de::Error::custom("cohort candidate count overflowed"))?;
+            folds.push(BoundedWireSequence(fold));
+        }
+        Ok(BoundedFolds(folds))
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct EvaluationWire {
@@ -768,10 +986,12 @@ struct EvaluationWire {
     experiment_design_digest: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cohort_universe_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_candidate_count: Option<usize>,
     selection_criterion: String,
-    members: Vec<MemberWire>,
-    folds: Vec<Vec<CandidateWire>>,
-    selection_candidates: Vec<String>,
+    members: BoundedWireSequence<MemberWire, MAX_COHORT_UNIQUE_MEMBERS>,
+    folds: BoundedFolds,
+    selection_candidates: BoundedWireSequence<String, MAX_COHORT_SELECTION_CANDIDATES>,
     probability_of_backtest_overfitting: f64,
     probability_fold_count: usize,
     deflated_performance_probability: f64,
@@ -801,46 +1021,62 @@ struct CandidateWire {
 pub(super) fn encode_evaluation(
     value: &BacktestCohortEvaluation,
 ) -> Result<Vec<u8>, ExperimentError> {
+    let cohort_universe_digest = value
+        .cohort_universe_digest
+        .ok_or(ExperimentError::Encoding)?;
+    let expected_candidate_count = value
+        .expected_candidate_count
+        .ok_or(ExperimentError::Encoding)?;
+    let mut members = Vec::new();
+    members
+        .try_reserve_exact(value.members.len())
+        .map_err(|_| ExperimentError::LimitExceeded)?;
+    for member in &value.members {
+        members.push(MemberWire {
+            trial_id: encode_hex(member.trial_id.digest().bytes()),
+            result_digest: encode_hex(member.result_digest.bytes()),
+            dataset_identity: encode_hex(member.dataset_identity.bytes()),
+            dataset_partition_start: member.dataset_partition.starts_at().unix_nanos(),
+            dataset_partition_end: member.dataset_partition.ends_at().unix_nanos(),
+            parameter_digest: encode_hex(member.parameter_digest.bytes()),
+        });
+    }
+    let mut folds = Vec::new();
+    folds
+        .try_reserve_exact(value.folds.len())
+        .map_err(|_| ExperimentError::LimitExceeded)?;
+    for fold in &value.folds {
+        let mut candidates = Vec::new();
+        candidates
+            .try_reserve_exact(fold.candidates.len())
+            .map_err(|_| ExperimentError::LimitExceeded)?;
+        for candidate in &fold.candidates {
+            candidates.push(CandidateWire {
+                in_sample: encode_hex(candidate.in_sample.digest().bytes()),
+                out_of_sample: encode_hex(candidate.out_of_sample.digest().bytes()),
+            });
+        }
+        folds.push(BoundedWireSequence(candidates));
+    }
+    let mut selection_candidates = Vec::new();
+    selection_candidates
+        .try_reserve_exact(value.selection_candidates.len())
+        .map_err(|_| ExperimentError::LimitExceeded)?;
+    for trial in &value.selection_candidates {
+        selection_candidates.push(encode_hex(trial.digest().bytes()));
+    }
     serde_json::to_vec(&EvaluationWire {
-        schema_version: 2,
+        schema_version: 3,
         evaluation_id: encode_hex(value.id.digest().bytes()),
         evaluator_name: value.evaluator.name().as_str().to_owned(),
         evaluator_digest: encode_hex(value.evaluator.digest().bytes()),
         experiment_design_digest: encode_hex(value.experiment_design_digest.bytes()),
-        cohort_universe_digest: value
-            .cohort_universe_digest
-            .map(|digest| encode_hex(digest.bytes())),
+        cohort_universe_digest: Some(encode_hex(cohort_universe_digest.bytes())),
+        expected_candidate_count: Some(expected_candidate_count),
         selection_criterion: value.selection_criterion.as_str().to_owned(),
-        members: value
-            .members
-            .iter()
-            .map(|member| MemberWire {
-                trial_id: encode_hex(member.trial_id.digest().bytes()),
-                result_digest: encode_hex(member.result_digest.bytes()),
-                dataset_identity: encode_hex(member.dataset_identity.bytes()),
-                dataset_partition_start: member.dataset_partition.starts_at().unix_nanos(),
-                dataset_partition_end: member.dataset_partition.ends_at().unix_nanos(),
-                parameter_digest: encode_hex(member.parameter_digest.bytes()),
-            })
-            .collect(),
-        folds: value
-            .folds
-            .iter()
-            .map(|fold| {
-                fold.candidates
-                    .iter()
-                    .map(|candidate| CandidateWire {
-                        in_sample: encode_hex(candidate.in_sample.digest().bytes()),
-                        out_of_sample: encode_hex(candidate.out_of_sample.digest().bytes()),
-                    })
-                    .collect()
-            })
-            .collect(),
-        selection_candidates: value
-            .selection_candidates
-            .iter()
-            .map(|trial| encode_hex(trial.digest().bytes()))
-            .collect(),
+        members: BoundedWireSequence(members),
+        folds: BoundedFolds(folds),
+        selection_candidates: BoundedWireSequence(selection_candidates),
         probability_of_backtest_overfitting: value.probability_of_backtest_overfitting.probability,
         probability_fold_count: value.probability_of_backtest_overfitting.folds,
         deflated_performance_probability: value.deflated_performance.probability,
@@ -857,7 +1093,7 @@ pub(super) fn decode_evaluation(
 ) -> Result<BacktestCohortEvaluation, ExperimentError> {
     let wire: EvaluationWire =
         serde_json::from_slice(bytes).map_err(|_| ExperimentError::CorruptRecord)?;
-    if !matches!(wire.schema_version, 1 | 2)
+    if !matches!(wire.schema_version, 1..=3)
         || decode_hex(&wire.evaluation_id)? != expected.digest()
         || !wire.probability_of_backtest_overfitting.is_finite()
         || !(0.0..=1.0).contains(&wire.probability_of_backtest_overfitting)
@@ -870,32 +1106,78 @@ pub(super) fn decode_evaluation(
     }
     validate_cohort_materialization_counts(
         wire.members.len(),
-        wire.folds.len(),
+        wire.folds.0.len(),
         wire.selection_candidates.len(),
-        wire.folds.iter().map(Vec::len),
+        wire.folds.0.iter().map(BoundedWireSequence::len),
     )
     .map_err(|_| ExperimentError::CorruptRecord)?;
-    let members = wire
-        .members
-        .into_iter()
-        .map(|member| {
-            Ok(CohortMemberBinding::new(
-                TrialId(decode_hex(&member.trial_id)?),
-                decode_hex(&member.result_digest)?,
-                decode_hex(&member.dataset_identity)?,
-                TrialDatasetPartition::try_new(
-                    market_squawk_domain::Timestamp::from_unix_nanos(
-                        member.dataset_partition_start,
-                    ),
-                    market_squawk_domain::Timestamp::from_unix_nanos(member.dataset_partition_end),
-                )
-                .map_err(|_| ExperimentError::CorruptRecord)?,
-                decode_hex(&member.parameter_digest)?,
-            ))
-        })
-        .collect::<Result<Vec<_>, ExperimentError>>()?;
-    let selected_id = TrialId(decode_hex(&wire.selected_trial_id)?);
-    let selected_result_digest = decode_hex(&wire.selected_result_digest)?;
+    let universe_digest = wire
+        .cohort_universe_digest
+        .as_deref()
+        .map(decode_hex)
+        .transpose()?;
+    let version = match (
+        wire.schema_version,
+        universe_digest,
+        wire.expected_candidate_count,
+    ) {
+        (1, None, None) => CohortEvaluationVersion::V1,
+        (2, Some(_), None) => CohortEvaluationVersion::V2,
+        (3, Some(_), Some(expected_candidate_count))
+            if (2..=MAX_COHORT_CANDIDATES_PER_FOLD).contains(&expected_candidate_count)
+                && expected_candidate_count <= MAX_COHORT_SELECTION_CANDIDATES
+                && wire.selection_candidates.len() == expected_candidate_count
+                && wire
+                    .folds
+                    .0
+                    .iter()
+                    .all(|fold| fold.len() == expected_candidate_count) =>
+        {
+            cohort_member_reference_count(wire.folds.0.len(), expected_candidate_count)
+                .map_err(|_| ExperimentError::CorruptRecord)?;
+            CohortEvaluationVersion::V3
+        }
+        _ => return Err(ExperimentError::CorruptRecord),
+    };
+
+    let EvaluationWire {
+        evaluator_name,
+        evaluator_digest,
+        experiment_design_digest,
+        expected_candidate_count,
+        selection_criterion,
+        members: member_wires,
+        folds: fold_wires,
+        selection_candidates: selection_wires,
+        probability_of_backtest_overfitting,
+        probability_fold_count,
+        deflated_performance_probability,
+        expected_maximum_sharpe,
+        selected_trial_id,
+        selected_result_digest,
+        ..
+    } = wire;
+
+    let member_wires = member_wires.into_inner();
+    let mut members = Vec::new();
+    members
+        .try_reserve_exact(member_wires.len())
+        .map_err(|_| ExperimentError::LimitExceeded)?;
+    for member in member_wires {
+        members.push(CohortMemberBinding::new(
+            TrialId(decode_hex(&member.trial_id)?),
+            decode_hex(&member.result_digest)?,
+            decode_hex(&member.dataset_identity)?,
+            TrialDatasetPartition::try_new(
+                market_squawk_domain::Timestamp::from_unix_nanos(member.dataset_partition_start),
+                market_squawk_domain::Timestamp::from_unix_nanos(member.dataset_partition_end),
+            )
+            .map_err(|_| ExperimentError::CorruptRecord)?,
+            decode_hex(&member.parameter_digest)?,
+        ));
+    }
+    let selected_id = TrialId(decode_hex(&selected_trial_id)?);
+    let selected_result_digest = decode_hex(&selected_result_digest)?;
     let selected = members
         .iter()
         .find(|member| {
@@ -903,60 +1185,64 @@ pub(super) fn decode_evaluation(
         })
         .copied()
         .ok_or(ExperimentError::CorruptRecord)?;
-    let universe_digest = wire
-        .cohort_universe_digest
-        .as_deref()
-        .map(decode_hex)
-        .transpose()?;
-    if (wire.schema_version == 1) != universe_digest.is_none() {
-        return Err(ExperimentError::CorruptRecord);
+
+    let fold_wires = fold_wires.0;
+    let mut folds = Vec::new();
+    folds
+        .try_reserve_exact(fold_wires.len())
+        .map_err(|_| ExperimentError::LimitExceeded)?;
+    for fold in fold_wires {
+        let candidate_wires = fold.into_inner();
+        let mut candidates = Vec::new();
+        candidates
+            .try_reserve_exact(candidate_wires.len())
+            .map_err(|_| ExperimentError::LimitExceeded)?;
+        for candidate in candidate_wires {
+            candidates.push(BacktestCohortCandidate::new(
+                TrialId(decode_hex(&candidate.in_sample)?),
+                TrialId(decode_hex(&candidate.out_of_sample)?),
+            ));
+        }
+        folds.push(BacktestCohortFold::try_new(candidates)?);
     }
+
+    let selection_wires = selection_wires.into_inner();
+    let mut selection_candidates = Vec::new();
+    selection_candidates
+        .try_reserve_exact(selection_wires.len())
+        .map_err(|_| ExperimentError::LimitExceeded)?;
+    for trial in selection_wires {
+        selection_candidates.push(TrialId(decode_hex(&trial)?));
+    }
+
     let input = CohortEvaluationInput {
         evaluator: TrialComponentBinding::try_new(
-            SourceIdentifier::try_from(wire.evaluator_name)
+            SourceIdentifier::try_from(evaluator_name)
                 .map_err(|_| ExperimentError::CorruptRecord)?,
-            decode_hex(&wire.evaluator_digest)?,
+            decode_hex(&evaluator_digest)?,
         )?,
-        experiment_design_digest: decode_hex(&wire.experiment_design_digest)?,
+        experiment_design_digest: decode_hex(&experiment_design_digest)?,
         cohort_universe_digest: universe_digest.unwrap_or(Sha256Digest::new([0; 32])),
-        selection_criterion: SourceIdentifier::try_from(wire.selection_criterion)
+        expected_candidate_count,
+        selection_criterion: SourceIdentifier::try_from(selection_criterion)
             .map_err(|_| ExperimentError::CorruptRecord)?,
         members,
-        folds: wire
-            .folds
-            .into_iter()
-            .map(|fold| {
-                BacktestCohortFold::try_new(
-                    fold.into_iter()
-                        .map(|candidate| {
-                            Ok(BacktestCohortCandidate::new(
-                                TrialId(decode_hex(&candidate.in_sample)?),
-                                TrialId(decode_hex(&candidate.out_of_sample)?),
-                            ))
-                        })
-                        .collect::<Result<Vec<_>, ExperimentError>>()?,
-                )
-            })
-            .collect::<Result<Vec<_>, ExperimentError>>()?,
-        selection_candidates: wire
-            .selection_candidates
-            .into_iter()
-            .map(|trial| decode_hex(&trial).map(TrialId))
-            .collect::<Result<Vec<_>, ExperimentError>>()?,
+        folds,
+        selection_candidates,
         probability_of_backtest_overfitting: BacktestOverfittingDiagnostic {
-            probability: wire.probability_of_backtest_overfitting,
-            folds: wire.probability_fold_count,
+            probability: probability_of_backtest_overfitting,
+            folds: probability_fold_count,
         },
         deflated_performance: DeflatedPerformanceDiagnostic {
-            probability: wire.deflated_performance_probability,
-            expected_maximum_sharpe: wire.expected_maximum_sharpe,
+            probability: deflated_performance_probability,
+            expected_maximum_sharpe,
         },
         selected,
     };
-    let value = if wire.schema_version == 1 {
-        BacktestCohortEvaluation::try_new_legacy(input)?
-    } else {
-        BacktestCohortEvaluation::try_new(input)?
+    let value = match version {
+        CohortEvaluationVersion::V1 => BacktestCohortEvaluation::try_new_legacy(input)?,
+        CohortEvaluationVersion::V2 => BacktestCohortEvaluation::try_new_v2(input)?,
+        CohortEvaluationVersion::V3 => BacktestCohortEvaluation::try_new(input)?,
     };
     if value.id != expected {
         return Err(ExperimentError::CorruptRecord);

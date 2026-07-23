@@ -742,8 +742,49 @@ fn cohort_evaluation_uses_completed_metrics_and_publishes_one_immutable_record()
         ))
     ));
     drop(constrained);
+    let evaluation_hex = evaluation_id
+        .digest()
+        .bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let evaluation_path = temporary
+        .path()
+        .join("backtesting/v1/cohorts")
+        .join(format!("{evaluation_hex}.json"));
+    let original_evaluation = std::fs::read(&evaluation_path)?;
+    let mut cardinality_mismatch: serde_json::Value = serde_json::from_slice(&original_evaluation)?;
+    assert_eq!(cardinality_mismatch["schema_version"], 3);
+    assert_eq!(cardinality_mismatch["expected_candidate_count"], 3);
+
     let reopened_root = Dir::open_ambient_dir(temporary.path(), ambient_authority())?;
-    let reopened = ExperimentInventory::try_new(reopened_root, limits)?;
+    let reopened = ExperimentInventory::try_new(
+        reopened_root,
+        ExperimentLimits::try_new(ExperimentLimitsInput {
+            max_trials: 16,
+            max_record_bytes: 4 * 1024 * 1024,
+            max_artifact_bytes: 64 * 1024,
+            max_metrics: 8,
+        })?,
+    )?;
+
+    cardinality_mismatch["expected_candidate_count"] = serde_json::json!(2);
+    std::fs::write(&evaluation_path, serde_json::to_vec(&cardinality_mismatch)?)?;
+    assert!(reopened.cohort_evaluation(evaluation_id).is_err());
+
+    let mut oversized_nested: serde_json::Value = serde_json::from_slice(&original_evaluation)?;
+    let candidate = oversized_nested["folds"][0][0].clone();
+    oversized_nested["folds"][0] =
+        serde_json::Value::Array(vec![candidate; MAX_COHORT_CANDIDATES_PER_FOLD + 1]);
+    let oversized_nested = serde_json::to_vec(&oversized_nested)?;
+    assert!(oversized_nested.len() < 4 * 1024 * 1024);
+    std::fs::write(&evaluation_path, oversized_nested)?;
+    assert!(matches!(
+        reopened.cohort_evaluation(evaluation_id),
+        Err(ExperimentError::CorruptRecord)
+    ));
+
+    std::fs::write(evaluation_path, original_evaluation)?;
     assert_eq!(reopened.cohort_evaluation(evaluation_id)?, evaluation);
     Ok(())
 }
@@ -778,6 +819,18 @@ fn expired_trial_attempt_can_be_recovered_without_overlapping_an_active_lease() 
     )?;
     let legacy_id = TrialId::from_digest(Sha256Digest::new(V1_TRIAL_ID));
     assert_eq!(inventory.trial(legacy_id)?.spec().id(), legacy_id);
+
+    let legacy_attempt_terminal_parent = temporary.path().join(
+        "backtesting/v1/terminals/ccc0b3a41c7017a96162708a5a33e87ce746a192438ce7ac6858125d275c47dd",
+    );
+    std::fs::create_dir(&legacy_attempt_terminal_parent)?;
+    let legacy_attempt_terminal = legacy_attempt_terminal_parent.join("00000000000000000001.json");
+    std::fs::write(&legacy_attempt_terminal, b"{}")?;
+    assert!(matches!(
+        inventory.trial(legacy_id),
+        Err(ExperimentError::CorruptRecord)
+    ));
+    std::fs::remove_file(legacy_attempt_terminal)?;
 
     let legacy_artifact = br#"{"legacy":true}"#;
     let legacy_artifact_reference = "backtesting/v1/artifacts/sha256/60/600bfa81b1561fa6281505a8630327ec94da208976f36c142c781b0b46a95725.json";
@@ -892,6 +945,18 @@ fn expired_trial_attempt_can_be_recovered_without_overlapping_an_active_lease() 
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
+    let current_attempt_terminals = temporary
+        .path()
+        .join("backtesting/v1/terminals")
+        .join(&current_trial_hex);
+    std::fs::create_dir(&current_attempt_terminals)?;
+    let orphan_terminal = current_attempt_terminals.join("00000000000000000003.json");
+    std::fs::write(&orphan_terminal, b"{}")?;
+    assert!(matches!(
+        inventory.trial(spec.id()),
+        Err(ExperimentError::CorruptRecord)
+    ));
+    std::fs::remove_file(orphan_terminal)?;
     let current_legacy_terminal = temporary
         .path()
         .join(format!("backtesting/v1/terminals/{current_trial_hex}.json"));
@@ -919,6 +984,13 @@ fn expired_trial_attempt_can_be_recovered_without_overlapping_an_active_lease() 
     ));
     drop(_first);
     let recovered = inventory.reserve_at(spec.clone(), Timestamp::from_unix_nanos(110), 10)?;
+    let non_latest_terminal = current_attempt_terminals.join("00000000000000000001.json");
+    std::fs::write(&non_latest_terminal, b"{}")?;
+    assert!(matches!(
+        inventory.trial(spec.id()),
+        Err(ExperimentError::CorruptRecord)
+    ));
+    std::fs::remove_file(non_latest_terminal)?;
     let artifact_bytes = br#"{"recovered":true}"#;
     let artifact = inventory.prepare_artifact(artifact_bytes)?;
     let completion = inventory.prepare_completion(
