@@ -4,8 +4,9 @@ use market_squawk_data::{
     AnalyticalDataService, AnalyticalManifestCatalog, AnalyticalReadCapability, CatalogAuthority,
     CatalogConfig, CommittedDataset, DatasetBuildError, DatasetBuildRequest, DatasetBuilder,
     FairValueCatalogCapability, FeatureLabelDataset, IngestError, IngestIdentity,
-    ManifestCatalogError, ObjectStoreConfig, OnboardingCatalogCapability, ResearchIngestService,
-    RightsDecisionInput, RightsError, SourceOperation, extraction_batch_digest,
+    InstrumentDefinitionReadCapability, ManifestCatalogError, ObjectStoreConfig,
+    OnboardingCatalogCapability, ResearchIngestService, RightsDecisionInput, RightsError,
+    SourceOperation, extraction_batch_digest,
 };
 use market_squawk_platform::{LocalPaths, PathError};
 use market_squawk_sources::{ExtractionBatch, ExtractionRevisionPlan, SourceMetadata};
@@ -198,6 +199,11 @@ impl ResearchService {
     /// Returns provider-onboarding authority over this service's sole catalog writer.
     pub fn onboarding_catalog(&self) -> OnboardingCatalogCapability {
         self.analytical.onboarding_catalog()
+    }
+
+    /// Returns bounded point-in-time definition reads over this service's sole catalog session.
+    pub fn instrument_definitions(&self) -> InstrumentDefinitionReadCapability {
+        self.analytical.instrument_definitions()
     }
 }
 

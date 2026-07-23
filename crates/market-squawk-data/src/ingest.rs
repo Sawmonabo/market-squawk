@@ -536,6 +536,11 @@ impl AnalyticalDataService {
         crate::OnboardingCatalogCapability::new(Arc::clone(&self.authority))
     }
 
+    /// Returns bounded point-in-time definition reads over this service's sole catalog session.
+    pub fn instrument_definitions(&self) -> crate::InstrumentDefinitionReadCapability {
+        crate::InstrumentDefinitionReadCapability::new(Arc::clone(&self.authority))
+    }
+
     /// Returns the rights-bound point-in-time dataset builder for this exact catalog/root pair.
     pub fn dataset_builder(&self) -> crate::DatasetBuilderService<'_> {
         crate::DatasetBuilderService::new(

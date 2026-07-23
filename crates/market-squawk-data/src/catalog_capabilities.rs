@@ -2,16 +2,67 @@
 
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Instant;
 
+use market_squawk_domain::{InstrumentId, Timestamp};
 use market_squawk_sources::{CapabilityRegistrationOutcome, OnboardingEvent, ProviderCapability};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
     CatalogAuthority, CatalogError, CatalogLimit, FairValueCatalogCommit,
     FairValueCatalogOperation, FairValueCatalogPosition, FairValueCatalogSnapshot,
     FairValueCatalogSnapshotLimits, OnboardingAppendOutcome, OnboardingReservation,
-    OnboardingReservationRequest, ResumedProviderOnboarding,
+    OnboardingReservationRequest, PinnedInstrumentDefinitions, ResumedProviderOnboarding,
 };
+
+/// Cloneable point-in-time instrument-definition reader without general catalog authority.
+#[derive(Clone)]
+pub struct InstrumentDefinitionReadCapability {
+    authority: Arc<Mutex<CatalogAuthority>>,
+}
+
+impl fmt::Debug for InstrumentDefinitionReadCapability {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InstrumentDefinitionReadCapability")
+            .field(
+                "authority",
+                &"[SEALED INSTRUMENT-DEFINITION READ AUTHORITY]",
+            )
+            .finish()
+    }
+}
+
+impl InstrumentDefinitionReadCapability {
+    pub(crate) fn new(authority: Arc<Mutex<CatalogAuthority>>) -> Self {
+        Self { authority }
+    }
+
+    /// Mints one exact bounded receipt from the sole catalog session.
+    pub fn pin(
+        &self,
+        instrument_ids: &[InstrumentId],
+        as_of: Timestamp,
+        limit: CatalogLimit,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<PinnedInstrumentDefinitions, CatalogError> {
+        self.lock()?.pin_instrument_definitions_bounded(
+            instrument_ids,
+            as_of,
+            limit,
+            deadline,
+            cancellation,
+        )
+    }
+
+    fn lock(&self) -> Result<MutexGuard<'_, CatalogAuthority>, CatalogError> {
+        self.authority
+            .lock()
+            .map_err(|_| CatalogError::AuthorityLockPoisoned)
+    }
+}
 
 /// Cloneable fair-value persistence authority without general catalog or SQLite access.
 #[derive(Clone)]

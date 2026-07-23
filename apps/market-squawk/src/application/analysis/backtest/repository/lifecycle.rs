@@ -16,14 +16,14 @@ use tokio_util::sync::CancellationToken;
 const SHUTDOWN_BIT: usize = 1_usize << (usize::BITS - 1);
 const ACTIVE_MASK: usize = SHUTDOWN_BIT - 1;
 
-pub(super) struct RepositoryLifecycle {
+pub(in crate::application::analysis::backtest) struct RepositoryLifecycle {
     state: AtomicUsize,
     shutdown: CancellationToken,
     drained: Notify,
 }
 
 impl RepositoryLifecycle {
-    pub(super) fn new() -> Arc<Self> {
+    pub(in crate::application::analysis::backtest) fn new() -> Arc<Self> {
         Arc::new(Self {
             state: AtomicUsize::new(0),
             shutdown: CancellationToken::new(),
@@ -31,7 +31,7 @@ impl RepositoryLifecycle {
         })
     }
 
-    pub(super) fn enter(
+    pub(in crate::application::analysis::backtest) fn enter(
         lifecycle: &Arc<Self>,
         cancellation: &CancellationToken,
         deadline: Instant,
@@ -61,7 +61,7 @@ impl RepositoryLifecycle {
         }
     }
 
-    pub(super) fn begin_shutdown(&self) {
+    pub(in crate::application::analysis::backtest) fn begin_shutdown(&self) {
         let previous = self.state.fetch_or(SHUTDOWN_BIT, Ordering::AcqRel);
         self.shutdown.cancel();
         if previous & ACTIVE_MASK == 0 {
@@ -69,7 +69,10 @@ impl RepositoryLifecycle {
         }
     }
 
-    pub(super) async fn finish_shutdown(&self, deadline: Instant) -> Result<(), ServiceError> {
+    pub(in crate::application::analysis::backtest) async fn finish_shutdown(
+        &self,
+        deadline: Instant,
+    ) -> Result<(), ServiceError> {
         self.begin_shutdown();
         let deadline = tokio::time::Instant::from_std(deadline);
         loop {
@@ -86,7 +89,9 @@ impl RepositoryLifecycle {
         }
     }
 
-    pub(super) const fn shutdown_token(&self) -> &CancellationToken {
+    pub(in crate::application::analysis::backtest) const fn shutdown_token(
+        &self,
+    ) -> &CancellationToken {
         &self.shutdown
     }
 
@@ -109,7 +114,7 @@ impl fmt::Debug for RepositoryLifecycle {
     }
 }
 
-pub(super) struct RepositoryCall {
+pub(in crate::application::analysis::backtest) struct RepositoryCall {
     lifecycle: Arc<RepositoryLifecycle>,
 }
 
@@ -119,7 +124,7 @@ impl Drop for RepositoryCall {
     }
 }
 
-pub(super) fn ensure_operation_live(
+pub(in crate::application::analysis::backtest) fn ensure_operation_live(
     cancellation: &CancellationToken,
     lifecycle: &RepositoryLifecycle,
     deadline: Instant,
@@ -136,7 +141,7 @@ pub(super) fn ensure_operation_live(
     Ok(())
 }
 
-pub(super) async fn await_blocking<T>(
+pub(in crate::application::analysis::backtest) async fn await_blocking<T>(
     mut worker: JoinHandle<Result<T, ServiceError>>,
     cancellation: &CancellationToken,
     shutdown: &CancellationToken,
@@ -153,13 +158,13 @@ pub(super) async fn await_blocking<T>(
     }
 }
 
-pub(super) struct LinkedOperation {
+pub(in crate::application::analysis::backtest) struct LinkedOperation {
     token: CancellationToken,
     monitor: JoinHandle<()>,
 }
 
 impl LinkedOperation {
-    pub(super) fn new(
+    pub(in crate::application::analysis::backtest) fn new(
         request: CancellationToken,
         shutdown: CancellationToken,
         deadline: Instant,
@@ -178,7 +183,7 @@ impl LinkedOperation {
         Self { token, monitor }
     }
 
-    pub(super) const fn token(&self) -> &CancellationToken {
+    pub(in crate::application::analysis::backtest) const fn token(&self) -> &CancellationToken {
         &self.token
     }
 }

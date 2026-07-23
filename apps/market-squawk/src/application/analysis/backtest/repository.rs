@@ -24,7 +24,7 @@ use super::{
 use crate::PinnedBacktestInput;
 
 mod index;
-mod lifecycle;
+pub(in crate::application::analysis::backtest) mod lifecycle;
 
 use index::{StoredTerminal, TerminalIndex, command_digest, value_digest};
 use lifecycle::{LinkedOperation, RepositoryLifecycle, await_blocking, ensure_operation_live};

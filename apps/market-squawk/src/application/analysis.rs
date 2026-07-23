@@ -26,8 +26,12 @@ mod serialization;
 
 pub use backtest::{
     BacktestScope, GovernedBacktestAuthority, GovernedBacktestCommand,
-    GovernedBacktestInputResolver, GovernedBacktestRecord, GovernedBacktestRepository,
+    GovernedBacktestCorporateActionsInput, GovernedBacktestInputAuthorityLimits,
+    GovernedBacktestInputRegistrationInput, GovernedBacktestInputRegistrationReceipt,
+    GovernedBacktestInputResolver, GovernedBacktestPortfolioSeedInput,
+    GovernedBacktestQueryLimitsInput, GovernedBacktestRecord, GovernedBacktestRepository,
     GovernedBacktestRepositoryLimits, ProductionBacktestAuthority,
+    ProductionGovernedBacktestInputAuthority, ProductionGovernedBacktestInputAuthorityError,
     ProductionGovernedBacktestRepository, ProductionGovernedBacktestRepositoryError,
     ResolvedGovernedBacktestInput,
 };

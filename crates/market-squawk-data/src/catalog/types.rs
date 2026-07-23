@@ -925,6 +925,12 @@ pub enum CatalogError {
     /// Distinct instrument definitions carried the same observation time.
     #[error("catalog instrument revisions conflict at the same timestamp")]
     InstrumentRevisionConflict,
+    /// Cancellation was observed while point-in-time instrument definitions were being pinned.
+    #[error("catalog instrument-definition read was cancelled")]
+    InstrumentDefinitionReadCancelled,
+    /// The caller's monotonic deadline elapsed while instrument definitions were being pinned.
+    #[error("catalog instrument-definition read deadline elapsed")]
+    InstrumentDefinitionReadDeadlineExceeded,
     /// An append identity already names different immutable evidence.
     #[error("catalog append identity conflicts with retained evidence")]
     EvidenceConflict,

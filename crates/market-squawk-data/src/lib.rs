@@ -61,7 +61,9 @@ pub use catalog::{
     ReferenceBundle, ResumedIngest, ResumedProviderOnboarding, SourceCursor,
     StoredObservedRevision,
 };
-pub use catalog_capabilities::{FairValueCatalogCapability, OnboardingCatalogCapability};
+pub use catalog_capabilities::{
+    FairValueCatalogCapability, InstrumentDefinitionReadCapability, OnboardingCatalogCapability,
+};
 pub use corporate_actions::{
     AdjustmentConflict, AdjustmentRatio, AdjustmentStep, CorporateActionAdjustment,
     CorporateActionError, CorporateActionExclusion, CorporateActionExclusionReason,

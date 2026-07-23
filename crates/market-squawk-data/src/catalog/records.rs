@@ -2,6 +2,7 @@
 
 use std::collections::BTreeSet;
 use std::mem::size_of;
+use std::time::Instant;
 
 use market_squawk_domain::{
     ContractRollMapping, CorporateActionObservation, InstrumentDefinition, InstrumentId,
@@ -11,6 +12,7 @@ use market_squawk_sources::SourceMetadata;
 use rusqlite::{OptionalExtension as _, params};
 use serde::de::DeserializeOwned;
 use sha2::{Digest as _, Sha256};
+use tokio_util::sync::CancellationToken;
 
 use super::storage::{
     AppendOutcome, ResultBudget, append_audit, persist_instrument_children, persist_symbol,
@@ -519,6 +521,31 @@ impl Catalog {
         as_of: Timestamp,
         limit: CatalogLimit,
     ) -> Result<PinnedInstrumentDefinitions, CatalogError> {
+        self.pin_instrument_definitions_checked(instrument_ids, as_of, limit, || Ok(()))
+    }
+
+    /// Pins complete definitions while observing one cancellation token and absolute deadline.
+    pub fn pin_instrument_definitions_bounded(
+        &self,
+        instrument_ids: &[InstrumentId],
+        as_of: Timestamp,
+        limit: CatalogLimit,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<PinnedInstrumentDefinitions, CatalogError> {
+        self.pin_instrument_definitions_checked(instrument_ids, as_of, limit, || {
+            check_instrument_definition_read(deadline, cancellation)
+        })
+    }
+
+    fn pin_instrument_definitions_checked(
+        &self,
+        instrument_ids: &[InstrumentId],
+        as_of: Timestamp,
+        limit: CatalogLimit,
+        mut check_operation: impl FnMut() -> Result<(), CatalogError>,
+    ) -> Result<PinnedInstrumentDefinitions, CatalogError> {
+        check_operation()?;
         self.enforce_limit(limit)?;
         if instrument_ids.is_empty() {
             return Err(CatalogError::InvalidRecord);
@@ -545,6 +572,7 @@ impl Catalog {
              LIMIT ?3",
         )?;
         for instrument_id in requested {
+            check_operation()?;
             let remaining = limit
                 .get()
                 .checked_sub(total_rows)
@@ -565,6 +593,7 @@ impl Catalog {
             )?;
             let mut definitions = Vec::<PinnedInstrumentDefinition>::new();
             for row in rows {
+                check_operation()?;
                 if total_rows == limit.get() {
                     return Err(CatalogError::ResultRowLimitExceeded);
                 }
@@ -612,6 +641,7 @@ impl Catalog {
                 definitions: definitions.into_boxed_slice(),
             });
         }
+        check_operation()?;
         let content_identity = pinned_definition_identity(
             b"market-squawk/instrument-definitions/content/v1",
             None,
@@ -729,6 +759,19 @@ impl Catalog {
             .optional()?;
         row.map(|(value, digest)| deserialize_verified(&value, &digest, budget))
             .transpose()
+    }
+}
+
+fn check_instrument_definition_read(
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<(), CatalogError> {
+    if cancellation.is_cancelled() {
+        Err(CatalogError::InstrumentDefinitionReadCancelled)
+    } else if Instant::now() >= deadline {
+        Err(CatalogError::InstrumentDefinitionReadDeadlineExceeded)
+    } else {
+        Ok(())
     }
 }
 

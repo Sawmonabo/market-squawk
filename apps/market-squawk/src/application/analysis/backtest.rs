@@ -15,8 +15,15 @@ use crate::{
     application::domain_support::encode_hex,
 };
 
+mod input_authority;
 mod repository;
 
+pub use input_authority::{
+    GovernedBacktestCorporateActionsInput, GovernedBacktestInputAuthorityLimits,
+    GovernedBacktestInputRegistrationInput, GovernedBacktestInputRegistrationReceipt,
+    GovernedBacktestPortfolioSeedInput, GovernedBacktestQueryLimitsInput,
+    ProductionGovernedBacktestInputAuthority, ProductionGovernedBacktestInputAuthorityError,
+};
 pub use repository::{
     GovernedBacktestInputResolver, GovernedBacktestRepositoryLimits,
     ProductionGovernedBacktestRepository, ProductionGovernedBacktestRepositoryError,
