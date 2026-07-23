@@ -85,6 +85,8 @@ pub enum ConfigSetting {
     CaptureShutdown,
     /// Source shutdown deadline.
     SourceShutdown,
+    /// Optional verified Python training-release root.
+    TrainingReleaseDirectory,
     /// Redacted source-secret reference.
     SourceSecret,
     /// Coinbase production profile.
@@ -94,7 +96,7 @@ pub enum ConfigSetting {
 }
 
 impl ConfigSetting {
-    const ALL: [Self; 13] = [
+    const ALL: [Self; 14] = [
         Self::DataDirectory,
         Self::Products,
         Self::StaleAfter,
@@ -105,6 +107,7 @@ impl ConfigSetting {
         Self::CaptureFlushInterval,
         Self::CaptureShutdown,
         Self::SourceShutdown,
+        Self::TrainingReleaseDirectory,
         Self::SourceSecret,
         Self::Coinbase,
         Self::Kraken,
@@ -200,6 +203,11 @@ impl ConfigProvenance {
             ConfigOrigin::LocalFile,
         );
         self.mark_if(
+            file.training_release_root.is_some(),
+            ConfigSetting::TrainingReleaseDirectory,
+            ConfigOrigin::LocalFile,
+        );
+        self.mark_if(
             file.source_secret.is_some(),
             ConfigSetting::SourceSecret,
             ConfigOrigin::LocalFile,
@@ -235,6 +243,9 @@ impl ConfigProvenance {
                 }
                 "MARKET_SQUAWK_CAPTURE_SHUTDOWN_MS" => Some(ConfigSetting::CaptureShutdown),
                 "MARKET_SQUAWK_SOURCE_SHUTDOWN_MS" => Some(ConfigSetting::SourceShutdown),
+                "MARKET_SQUAWK_TRAINING_RELEASE_ROOT" => {
+                    Some(ConfigSetting::TrainingReleaseDirectory)
+                }
                 "MARKET_SQUAWK_SOURCE_SECRET" => Some(ConfigSetting::SourceSecret),
                 "MARKET_SQUAWK_COINBASE_JSON" => Some(ConfigSetting::Coinbase),
                 "MARKET_SQUAWK_KRAKEN_JSON" => Some(ConfigSetting::Kraken),
@@ -296,6 +307,11 @@ impl ConfigProvenance {
         self.mark_if(
             cli.source_shutdown_ms.is_some(),
             ConfigSetting::SourceShutdown,
+            ConfigOrigin::Cli,
+        );
+        self.mark_if(
+            cli.training_release_root.is_some(),
+            ConfigSetting::TrainingReleaseDirectory,
             ConfigOrigin::Cli,
         );
         self.mark_if(
@@ -439,6 +455,8 @@ pub struct ConfigOverrides {
     pub capture_shutdown_ms: Option<u64>,
     /// Source-supervisor shutdown deadline in milliseconds.
     pub source_shutdown_ms: Option<u64>,
+    /// Absolute installed Python training-release root.
+    pub training_release_root: Option<PathBuf>,
     /// Redacted secret locator.
     pub source_secret: Option<SecretReference>,
     /// Complete validated production Coinbase source profile.
@@ -500,6 +518,7 @@ struct FileConfig {
     capture_flush_interval_ms: Option<u64>,
     capture_shutdown_ms: Option<u64>,
     source_shutdown_ms: Option<u64>,
+    training_release_root: Option<PathBuf>,
     source_secret: Option<String>,
     coinbase: Option<CoinbaseSourceConfig>,
     kraken: Option<KrakenSourceConfig>,
@@ -518,6 +537,7 @@ pub struct AppConfig {
     capture_flush_interval: Duration,
     capture_shutdown: Duration,
     source_shutdown: Duration,
+    training_release_root: Option<PathBuf>,
     source_secret: Option<SecretReference>,
     coinbase: Option<CoinbaseSourceConfig>,
     kraken: Option<KrakenSourceConfig>,
@@ -547,6 +567,7 @@ impl fmt::Debug for AppConfig {
             .field("capture_flush_interval", &self.capture_flush_interval)
             .field("capture_shutdown", &self.capture_shutdown)
             .field("source_shutdown", &self.source_shutdown)
+            .field("training_release_root", &self.training_release_root)
             .field(
                 "source_secret",
                 &self.source_secret.as_ref().map(|_| "[REDACTED]"),
@@ -584,6 +605,7 @@ impl Default for AppConfig {
             capture_flush_interval: Duration::from_millis(DEFAULT_FLUSH_INTERVAL_MS),
             capture_shutdown: Duration::from_millis(DEFAULT_SHUTDOWN_MS),
             source_shutdown: Duration::from_millis(DEFAULT_SOURCE_SHUTDOWN_MS),
+            training_release_root: None,
             source_secret: None,
             coinbase: None,
             kraken: None,
@@ -672,6 +694,11 @@ impl AppConfig {
         self.source_shutdown
     }
 
+    /// Returns the optional absolute installed Python training-release root.
+    pub fn training_release_root(&self) -> Option<&Path> {
+        self.training_release_root.as_deref()
+    }
+
     /// Returns the optional redacted source-secret reference.
     pub const fn source_secret(&self) -> Option<&SecretReference> {
         self.source_secret.as_ref()
@@ -710,6 +737,7 @@ impl From<AppConfig> for ConfigOverrides {
             capture_flush_interval_ms: Some(duration_millis(config.capture_flush_interval)),
             capture_shutdown_ms: Some(duration_millis(config.capture_shutdown)),
             source_shutdown_ms: Some(duration_millis(config.source_shutdown)),
+            training_release_root: config.training_release_root,
             source_secret: config.source_secret,
             coinbase: config.coinbase,
             kraken: config.kraken,
@@ -761,6 +789,9 @@ impl ConfigOverrides {
         if higher.source_shutdown_ms.is_some() {
             self.source_shutdown_ms = higher.source_shutdown_ms;
         }
+        if higher.training_release_root.is_some() {
+            self.training_release_root = higher.training_release_root;
+        }
         if higher.source_secret.is_some() {
             self.source_secret = higher.source_secret;
         }
@@ -785,6 +816,7 @@ impl ConfigOverrides {
             capture_flush_interval_ms: file.capture_flush_interval_ms,
             capture_shutdown_ms: file.capture_shutdown_ms,
             source_shutdown_ms: file.source_shutdown_ms,
+            training_release_root: file.training_release_root,
             source_secret: file
                 .source_secret
                 .as_deref()
@@ -841,6 +873,9 @@ impl ConfigOverrides {
                 }
                 "MARKET_SQUAWK_SOURCE_SHUTDOWN_MS" => {
                     layer.source_shutdown_ms = Some(parse_environment(value)?);
+                }
+                "MARKET_SQUAWK_TRAINING_RELEASE_ROOT" => {
+                    layer.training_release_root = Some(PathBuf::from(value));
                 }
                 "MARKET_SQUAWK_SOURCE_SECRET" => {
                     layer.source_secret = Some(SecretReference::try_from(value)?);
@@ -929,6 +964,13 @@ impl TryFrom<ConfigOverrides> for AppConfig {
         if source_shutdown_ms.get() > MAX_SOURCE_SHUTDOWN_MS {
             return Err(ConfigError::InvalidSourceShutdownTiming);
         }
+        if values
+            .training_release_root
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty() || !path.is_absolute())
+        {
+            return Err(ConfigError::InvalidTrainingReleaseDirectory);
+        }
         Ok(Self {
             data_dir,
             products,
@@ -942,6 +984,7 @@ impl TryFrom<ConfigOverrides> for AppConfig {
             capture_flush_interval: Duration::from_millis(flush_ms.get()),
             capture_shutdown: Duration::from_millis(shutdown_ms.get()),
             source_shutdown: Duration::from_millis(source_shutdown_ms.get()),
+            training_release_root: values.training_release_root,
             source_secret: values.source_secret,
             coinbase: values.coinbase,
             kraken: values.kraken,
@@ -999,6 +1042,9 @@ pub enum ConfigError {
     /// Source-supervisor shutdown was zero or outside supported limits.
     #[error("source shutdown timing is invalid")]
     InvalidSourceShutdownTiming,
+    /// The optional training release root was empty or not absolute.
+    #[error("training release directory is invalid")]
+    InvalidTrainingReleaseDirectory,
     /// A redacted secret reference was invalid.
     #[error(transparent)]
     Secret(#[from] SecretError),

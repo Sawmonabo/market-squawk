@@ -38,6 +38,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub source_shutdown_ms: Option<u64>,
 
+    /// Absolute installed Python training-release root used to verify admitted models.
+    #[arg(long, global = true)]
+    pub training_release_root: Option<PathBuf>,
+
     /// Fixed raw-capture queue depth.
     #[arg(long, global = true)]
     pub capture_queue_capacity: Option<usize>,
