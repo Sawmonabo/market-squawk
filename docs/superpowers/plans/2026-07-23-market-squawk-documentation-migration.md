@@ -23,7 +23,7 @@ documentation-only work and adds no runtime dependency, generator, test, or chec
 
 | Field | Value |
 | --- | --- |
-| Plan status | Tasks 1–6 complete; Task 7 exact-candidate review and release integration are next |
+| Plan status | Tasks 1–7 complete; accepted content head `a2596a6` is reviewed, integrated, published, and cleaned |
 | Planning audit base | `46f86d9496287e1995f584537153ecb3fcb271ac` |
 | Audit-base meaning | Evidence anchor only; not implementation or release approval |
 | Approved design | `docs/superpowers/specs/2026-07-22-market-squawk-documentation-system-design.md` |

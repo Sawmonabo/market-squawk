@@ -336,9 +336,10 @@ application size.
 
 ## Cleanup state
 
-- Current documentation checkpoint: one root worktree on `docs/product-documentation`, no linked
-  worktrees under `.worktrees`, no documentation lane branch fan-out, and a 15 GiB root `target/`
-  below the enforced 20 GiB ceiling. The documentation lane ran no Cargo command.
+- Documentation lane closeout: the sole root worktree is on
+  `release/market-squawk-v0.1.0`; `docs/product-documentation` is deleted locally and on origin;
+  `.worktrees` is empty; and the 15 GiB root `target/` remains below the enforced 20 GiB ceiling.
+  The documentation lane ran no Cargo command.
 
 - After the terminal Quarter 3 gate, recorded the 15,131,260 KiB peak and removed 36,502 generated
   files/14.3 GiB with `cargo clean`. The root target is absent, about 125 GiB is free, only the
