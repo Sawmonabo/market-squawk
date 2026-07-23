@@ -21,7 +21,10 @@ evidence; it does not replace the README capability truth or the canonical relea
   point-in-time/source authority, analytics resource and retained-byte bounds, historical
   instrument-definition authority in backtests, and canonical reservation-bound attempt recovery.
   The proposed coupling of a pure cohort plan to one inventory's configured trial limit was
-  rejected as a layering regression. The full gate was not run against this rejected candidate.
+  rejected as a layering regression. Both rejected slices are now remediated, independently
+  approved with no remaining finding, range-diffed 1:1 onto the release branch, and freshly
+  verified there. The combined exact-candidate Quarter 3 rereview and clean full gate remain
+  pending; the prior rejected candidate did not receive a full gate.
 - Task 14 accepted feature and fast-forwarded release head: `02ab5cd`
 - Task 18 release merge head: `051ee3c`; reconciled lock head: `5c34b7d`
 - Task 13 accepted feature and release head: `59ba05c`
@@ -72,6 +75,13 @@ evidence; it does not replace the README capability truth or the canonical relea
   strict affected-package Clippy, workspace boundaries, formatting, and diff hygiene passed.
   Independent exact-head re-review confirmed all three earlier authority/concurrency/dispatch
   findings closed with no remaining Critical or Important finding.
+- Task 16 Quarter 3 remediation is integrated through release head `91f9f79`. Portfolio analytics
+  now derives private, non-deserializable point-in-time evidence from the exact immutable revision;
+  binds dataset, source, policy, and time authority; enforces both corporate-action cutoffs; and
+  admits factor, scenario, history, work, output, and retained bytes before allocation. Independent
+  task review approved the final lane with no remaining finding; the fresh integrated consolidated
+  portfolio harness passed 13/13. The generated lane target, clean worktree, and patch-equivalent
+  local branch were removed, and no matching origin branch existed.
 - Task 18 owner: GitHub issue `#23`, Project 5, status `Done`.
 - Delivered at accepted feature head `31de1a5`: nonforgeable producer receipts; point-in-time market
   activity and evidence admission; strict Level 1 classification; usable Level 2/Level 3 input
@@ -117,13 +127,17 @@ evidence; it does not replace the README capability truth or the canonical relea
   accounting, immutable success/failure terminals, artifacts, cohorts and overfitting diagnostics.
   Recovery rejects conflicting attempt-terminal namespaces, parses untrusted cohort collections
   through bounded visitors, and binds exact V3 candidate cardinality while preserving V1/V2 identity.
-  Task 17 remains rejected until instrument execution terms are resolved through historical
-  catalog/PIT authority at each decision cutoff and attempt recovery validates the complete
-  canonical namespace against the actual reservation digest.
-- The next barrier is the two-lane Tasks 16–17 remediation, focused verification, and exact-candidate
-  rereview. Only after that review accepts the candidate will the integration owner clean the root
-  target and run one `CARGO_INCREMENTAL=0 ./scripts/verify.sh` gate. Tasks 15–17 remain open until
-  the grouped checkpoint passes; prior focused evidence does not substitute for it.
+  The Quarter 3 remediation is integrated through release head `c70601a`: catalog-minted historical
+  instrument definitions resolve at each decision cutoff and bind dataset identity, while attempt
+  recovery validates every bounded canonical entry against the actual reservation digest. A real
+  application vertical proves research ingest, feature-label publication, pinned query, receipt
+  minting, public backtest admission, strategy-visible revisions, and exact receipt coverage.
+  Independent task review approved the final lane with no remaining finding. Fresh integrated
+  gates passed catalog 3/3, backtesting 12/12, and the filtered application vertical 1/1.
+- The next barrier is the combined exact-candidate Quarter 3 rereview. Only after that review
+  accepts the candidate will the integration owner clean the root target and run one
+  `CARGO_INCREMENTAL=0 ./scripts/verify.sh` gate. Tasks 15–17 remain open until the grouped
+  checkpoint passes; focused evidence does not substitute for it.
 
 - Task 12 owner: GitHub issue `#17`, Project 5, status `Done`.
 - Exact feature and fast-forwarded release code head: `9702556`.

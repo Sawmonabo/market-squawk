@@ -482,6 +482,25 @@ because service-owned admission already enforces that local limit and adding it 
 would invert the established boundary. Task 16 is reopened; Task 17 remains open. The full gate must
 not run until those five blockers are fixed and the exact-candidate rereview accepts the result.
 
+The two bounded remediation lanes have now closed those five blockers. Portfolio analytics derives
+sealed evidence from the exact revision, binds dataset/source/policy/time authority, enforces both
+corporate-action cutoffs, and admits all configured work and retained storage before allocation.
+Historical backtests now consume a catalog-minted point-in-time instrument-definition receipt,
+resolve terms at every decision cutoff, bind both receipt identities into dataset identity v2, and
+validate the complete fixed-space attempt namespace against the actual canonical reservation. Both
+lanes received independent task review and focused rereview with zero remaining Critical,
+Important, or Minor finding.
+
+The portfolio series range-diffed 1:1 onto release heads `71da30d` and `91f9f79`; its fresh
+integrated harness passed 13/13 before push and cleanup. The backtest series range-diffed 1:1 onto
+release heads `1814b25` and `c70601a`; fresh integrated gates passed catalog 3/3, backtesting 12/12,
+and the real application authority vertical 1/1. That vertical enlarged the existing consolidated
+`control_plane` test executable beyond arm64 compact-unwind's measured limit, so the previously
+approved Rust #159105 classification was scoped to that test root after measuring a 354,986,784-byte
+binary and 23,027,100-byte `__eh_frame`. Workspace-wide linker diagnostics and production linking
+remain unchanged. The combined Quarter 3 exact-candidate rereview is now the sole review barrier;
+the root full gate remains prohibited until it accepts the candidate.
+
 Task 15 provides required zero-service ONNX inference through the self-contained Rust
 `TractOnnxBackend`. It admits exact bounded graphs and tensors, runs through a bounded model-owned
 helper process, binds warm-up evidence, and maps every policy/runtime/deadline failure to no action.
