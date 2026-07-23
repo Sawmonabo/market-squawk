@@ -7,8 +7,8 @@
 | Document type | Product documentation architecture specification |
 | Audience | Maintainers, operators, integrators, reviewers, and research users |
 | Design approved | 2026-07-22 |
-| Written specification status | Awaiting user review before implementation planning |
-| Last substantive review | 2026-07-22 |
+| Written specification status | Reviewed and accepted for implementation planning |
+| Last substantive review | 2026-07-23 |
 | Audit base | `46f86d9496287e1995f584537153ecb3fcb271ac` |
 | Release boundary | Required for the first complete local release on `release/market-squawk-v0.1.0` |
 | Governing product memory | [`docs/project-memory.md`](../../project-memory.md) |
@@ -396,7 +396,8 @@ The migration preserves useful content and Git history:
 2. Move `docs/architecture/current-state.md` with Git history to
    `docs/audits/architecture/2026-07-15-current-state-anchor.md`.
 3. Move the original target-state baseline with Git history to
-   `docs/audits/architecture/2026-07-16-target-state-baseline.md` after reconciliation.
+   `docs/audits/architecture/2026-07-16-target-state-baseline.md` only after the focused current
+   architecture pages have been reconciled from it.
 4. Move `docs/operations/onnx-runtime.md` with Git history to
    `docs/operations/model-inference.md`, then broaden it only with current native/model-bundle and
    accepted optional-runtime operations.
@@ -406,6 +407,12 @@ The migration preserves useful content and Git history:
    part of the historical evidence. Update a historical Markdown link only when preserving its
    navigability does not rewrite the plan's meaning.
 7. Do not leave redirect-only files at the old paths.
+
+The integration owner performs the architecture-audit moves after reconciliation and adds concise
+metadata to both archived documents stating that they are frozen historical evidence, have no
+current execution or capability authority, and defer to the current architecture index and
+delivery ledger. A reader opening either archive directly must not be able to mistake it for the
+maintained architecture or current release state.
 
 Git moves are performed before substantive rewrites where practical so `git log --follow` retains a
 useful ancestry. The implementation plan will include a link inventory and a final maintained-link
@@ -424,9 +431,12 @@ reference pages cannot be marked `Current` until that refreshed head has been re
 1. Record the accepted integrated head and complete the mandatory refresh barrier above; inventory
    maintained links, current commands, schemas, configuration, source metadata, local paths,
    dependency edges, runnable evidence, and release blockers at that exact head.
-2. Perform the three history-preserving moves and create the documentation and section indexes.
-3. Build architecture overview, building blocks, plane pages, trust/deployment/quality pages, and
-   the five ADRs from reconciled accepted code and target invariants.
+2. Create the documentation and section indexes, then build the architecture overview, building
+   blocks, plane pages, trust/deployment/quality pages, and five ADRs from accepted code and the
+   still-present target-state source.
+3. After that reconciliation, have the integration owner perform the two history-preserving
+   architecture-audit moves, add their historical/no-current-authority metadata, and move the model
+   runbook into `model-inference.md` before broadening it with current behavior.
 4. Build reference pages from the same code head; verify command, configuration, MCP, source,
    quality, and time contracts directly against their implementation sources.
 5. Build operations pages from runnable product paths and the completed reference; capture exact
@@ -461,6 +471,9 @@ The documentation lane is accepted only when all of the following are true at on
   described as runnable.
 - Maintained relative Markdown links resolve after the moves; frozen historical literal paths have
   not been rewritten as if their original plans used the new layout.
+- Both archived architecture documents are unmistakably labelled as frozen historical evidence
+  with no current execution or capability authority, and link to the current architecture index
+  and delivery ledger.
 - `git log --follow` retains useful ancestry for the two architecture audit moves and the model
   runbook move.
 - Mermaid blocks render using GitHub-supported stable syntax and are understandable from adjacent
