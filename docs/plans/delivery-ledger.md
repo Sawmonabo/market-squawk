@@ -14,12 +14,14 @@ evidence; it does not replace the README capability truth or the canonical relea
   moving release-branch head.
 - Current exact integration head: obtain it from `git rev-parse HEAD` and pull request `#26`.
   Tracked prose does not self-pin the commit that contains that prose.
-- Quarter 3 status: Tasks 13–18 and all accepted focused remediations are integrated. Fair-value
-  remediation is integrated through `6c114c7`; backtest recovery authority through `a57d5df`; and
-  ONNX lifecycle authority through `3305db6`. Both four-commit remediation series range-diffed 1:1,
-  passed fresh focused tests on the integrated release tree, and were pushed before their generated
-  targets, worktrees, and local branches were removed. The checkpoint has not been accepted: one
-  grouped review of the exact integrated head and one clean full gate remain.
+- Quarter 3 status: Tasks 13–18 and all previously accepted focused remediations are integrated.
+  The grouped review of exact head `a94f33b` accepted the Tasks 13–15 slice and the Task 18 plus
+  cross-plane slice with no Critical or Important finding. It rejected the Tasks 16–17 slice on
+  five substantiated Important blockers: corporate-action knowledge cutoff, portfolio-analytics
+  point-in-time/source authority, analytics resource and retained-byte bounds, historical
+  instrument-definition authority in backtests, and canonical reservation-bound attempt recovery.
+  The proposed coupling of a pure cohort plan to one inventory's configured trial limit was
+  rejected as a layering regression. The full gate was not run against this rejected candidate.
 - Task 14 accepted feature and fast-forwarded release head: `02ab5cd`
 - Task 18 release merge head: `051ee3c`; reconciled lock head: `5c34b7d`
 - Task 13 accepted feature and release head: `59ba05c`
@@ -49,7 +51,8 @@ evidence; it does not replace the README capability truth or the canonical relea
   Clippy, workspace boundaries, formatting, and diff checks passed. Independent review rejected
   three material implementation defects and two audit-consumer/wire ripples; each was fixed, and the
   final exact-head re-review reported no remaining Critical or Important finding.
-- Task 16 owner: GitHub issue `#21`, Project 5, status `Done`.
+- Task 16 owner: GitHub issue `#21`, Project 5, status `In Progress`; the issue was reopened after
+  the exact-head Quarter 3 review found three incomplete Task 16 authority/bounds contracts.
 - Delivered through Steps 1–5 at accepted head `e124722`: source-evidenced normalized portfolio
   transactions, immutable revisions, long/short lots, FIFO/specific identification, cash flows,
   exact gains, explicit incomplete-basis measurements, authoritative corporate-action snapshots,
@@ -114,9 +117,13 @@ evidence; it does not replace the README capability truth or the canonical relea
   accounting, immutable success/failure terminals, artifacts, cohorts and overfitting diagnostics.
   Recovery rejects conflicting attempt-terminal namespaces, parses untrusted cohort collections
   through bounded visitors, and binds exact V3 candidate cardinality while preserving V1/V2 identity.
-- The next barrier is a grouped review of the exact integrated Quarter 3 head followed by one clean
-  `CARGO_INCREMENTAL=0 ./scripts/verify.sh` run. Tasks 15/17 remain open until that evidence passes;
-  focused lane gates and prior release artifacts do not substitute for the checkpoint.
+  Task 17 remains rejected until instrument execution terms are resolved through historical
+  catalog/PIT authority at each decision cutoff and attempt recovery validates the complete
+  canonical namespace against the actual reservation digest.
+- The next barrier is the two-lane Tasks 16–17 remediation, focused verification, and exact-candidate
+  rereview. Only after that review accepts the candidate will the integration owner clean the root
+  target and run one `CARGO_INCREMENTAL=0 ./scripts/verify.sh` gate. Tasks 15–17 remain open until
+  the grouped checkpoint passes; prior focused evidence does not substitute for it.
 
 - Task 12 owner: GitHub issue `#17`, Project 5, status `Done`.
 - Exact feature and fast-forwarded release code head: `9702556`.
@@ -247,7 +254,7 @@ application size.
   remote metadata. Only the release worktree remains; the three protected stashes,
   `bundle-backup`, and Dependabot branches remain intact.
 
-The next delivery event is one grouped exact-head Quarter 3 rereview and one clean full gate. If
-those pass, issues `#20` and `#22`
-can close and Tasks 19, 19A and 20 begin. Integrated Tasks 13–18 do not claim that the Market Squawk
-product release is complete.
+The next delivery event is the bounded portfolio and backtest authority remediation followed by an
+exact-candidate rereview. If it accepts the candidate, one clean full gate will run; only then may
+issues `#20`, `#21`, and `#22` close and Tasks 19, 19A, and 20 begin. Integrated Tasks 13–18 do not
+claim that the Market Squawk product release is complete.

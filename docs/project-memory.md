@@ -465,13 +465,22 @@ merged local branch, and remote metadata were removed.
 
 Tasks 13–18 reached pre-status capability-code head `daf183a` on
 `release/market-squawk-v0.1.0`. That durable milestone is not the moving release-branch head; obtain
-the current exact head from Git and pull request `#26`. The frozen grouped review rejected the
+the current exact head from Git and pull request `#26`. The first frozen grouped review rejected the
 candidate with thirteen Important findings. Fair-value evidence-authority remediation is integrated
 through release head `6c114c7`. Backtest recovery authority is integrated through `a57d5df`, and
 ONNX lifecycle authority is integrated through `3305db6`; both four-commit series range-diffed 1:1
 and passed fresh focused tests on the release tree. Their generated targets, clean worktrees, and
-patch-equivalent local branches were removed after push. One grouped exact-head rereview and one
-clean `CARGO_INCREMENTAL=0 ./scripts/verify.sh` run remain before Tasks 15 and 17 can close.
+patch-equivalent local branches were removed after push.
+
+The subsequent grouped review of exact head `a94f33b` accepted the Tasks 13–15 slice and the Task 18
+plus cross-plane slice with no Critical or Important finding. It rejected the Tasks 16–17 slice on
+five substantiated Important blockers: corporate-action knowledge cutoff, portfolio-analytics
+point-in-time/source authority, portfolio analytics resource and retained-byte bounds, historical
+instrument-definition authority in backtests, and canonical reservation-bound attempt recovery.
+The suggested coupling of a pure cohort plan to one inventory's configured trial limit was rejected
+because service-owned admission already enforces that local limit and adding it to the pure value
+would invert the established boundary. Task 16 is reopened; Task 17 remains open. The full gate must
+not run until those five blockers are fixed and the exact-candidate rereview accepts the result.
 
 Task 15 provides required zero-service ONNX inference through the self-contained Rust
 `TractOnnxBackend`. It admits exact bounded graphs and tensors, runs through a bounded model-owned
@@ -497,10 +506,12 @@ authority. Task 18 retains the accepted fair-value closeout above.
 
 The earlier model-containment lane rebased with an exact 1:1 range-diff, fast-forwarded, and closed
 cleanly. Its 7.1 GiB target, worktree and merged local branch were removed; no matching origin branch
-existed. All three subsequent product-named remediation worktrees are accepted, integrated, pushed,
+existed. All three previous product-named remediation worktrees are accepted, integrated, pushed,
 and removed. Their matching local branches are deleted, no matching origin branches remain, and
-metadata is pruned. The three protected stashes and `bundle-backup` remain. The root target remains
-generated cache only and must be cleaned immediately before the planned Quarter 3 full gate. The
+metadata is pruned. The three protected stashes and `bundle-backup` remain. New remediation uses
+only two cohesive product lanes, reuses consolidated test harnesses, enforces the 10 GiB lane target
+ceiling, and cleans each lane after accepted integration. The root target remains generated cache
+only and must be cleaned immediately before the planned Quarter 3 full gate. The
 canonical plan defines the final delivery
 quarter as Tasks 19, 19A and 20, preserves the descriptor-driven shared CLI/MCP architecture, adds
 the evidence-bound local onboarding portal, and rejects redundant standalone test executables and
