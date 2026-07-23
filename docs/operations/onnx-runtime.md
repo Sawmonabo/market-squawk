@@ -9,9 +9,11 @@ and distribution notice are recorded in
 
 The `onnx-runtime` feature is an optional CPU acceleration path. It adds the pinned Rust `ort`
 binding with default features disabled and dynamic loading enabled. It does not bundle, download,
-copy, discover, or install ONNX Runtime. If the optional library is absent, rejected, fails warm-up,
-or fails inference, the already-constructed tract backend remains available. Optional-runtime
-inference failures automatically use that exact tract generation.
+copy, discover, or install ONNX Runtime. If the optional library is absent, rejected, or fails
+warm-up, the already-constructed tract backend remains available. During inference, tract
+fallback is permitted only when the external request was not dispatched or helper termination was
+confirmed. If termination cannot be confirmed, the request fails with no model output while a
+bounded cleanup owner retains the helper until it is reaped.
 
 ## Admitted native component
 
@@ -90,15 +92,19 @@ closed sequence:
 the fallback. Each request has one configured total deadline. The optional worker receives the first
 half and tract retains the second half. Response receipt, request-writer completion, and final result
 publication each recheck the absolute deadline; a late or uncertain result has no authority. A
-dispatched failure drops the generation's input and signals child termination before transfer to the
-bounded worker-owned reaper, where process waits and thread joins occur. Expiry before dispatch
-restores the retained generation even when it occurs after the caller takes ownership.
+cleanup owner is reserved and running before each helper spawn. A dispatched failure drops the
+generation's input, requests child termination, and transfers the child plus unfinished writer and
+reader threads to that owner; the inference caller never waits for the process or joins those
+threads. Termination is confirmed only when the kill request succeeds or a nonblocking status check
+proves the child already exited. An uncertain disposition denies tract fallback and retains one of
+the globally bounded cleanup slots until reaping completes. Expiry before dispatch restores the
+retained generation even when it occurs after the caller takes ownership.
 `OnnxRuntimeEvidence` binds the exact model and graph policy to a versioned worker-runtime semantics
 digest covering the admitted helper executable, protocol bounds, compute and intermediate limits,
-target resource-containment profile, startup/deadline rules, and reaper behavior. The warm-up identity
-also binds that digest and the finite warm-up score. If the total request deadline is exhausted, that
-request produces no action and the next request still has a usable tract fallback. Neither backend
-can emit an order directly; model output still passes through strategy and the sole risk boundary.
+target resource-containment profile, startup/deadline rules, and cleanup-ownership behavior. The
+warm-up identity also binds that digest and the finite warm-up score. If the total request deadline
+is exhausted, that request produces no action. Neither backend can emit an order directly; model
+output still passes through strategy and the sole risk boundary.
 
 ## Failure diagnosis
 

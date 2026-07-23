@@ -424,11 +424,10 @@ per page.
 6. Repair maintained links, reconcile root README navigation, and perform the manual truth,
    diagram, navigation, history, and diff review.
 
-The active model-runtime remediation currently owns `docs/operations/onnx-runtime.md`. The
-documentation migration must not move or rewrite that file until the remediation is accepted,
-integrated, and its worktree is closed. This avoids parallel edits to one history-bearing file and
-ensures `model-inference.md` documents the accepted runtime contract. Other documentation analysis
-may proceed without touching that path.
+The model-runtime remediation is accepted, integrated, and its worktree is closed. The current
+`docs/operations/onnx-runtime.md` states the accepted runtime contract, so the documentation
+migration may history-preservingly move and reconcile it into `model-inference.md` after this
+written design passes its approval gate.
 
 The implementation plan will group pages by shared source material and edit ownership to maximize
 safe parallelism. Shared indexes, cross-links, the root README, moved history-bearing files, and

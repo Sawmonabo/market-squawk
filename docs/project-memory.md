@@ -466,20 +466,20 @@ merged local branch, and remote metadata were removed.
 Tasks 13–18 reached pre-status capability-code head `daf183a` on
 `release/market-squawk-v0.1.0`. That durable milestone is not the moving release-branch head; obtain
 the current exact head from Git and pull request `#26`. The frozen grouped review rejected the
-candidate with thirteen Important findings. Fair-value evidence-authority remediation passed its
-independent exact-candidate closure review and is integrated through release head `6c114c7`; its
-generated target, clean worktree, and patch-equivalent local branch were removed after push. The
-model-runtime and backtest/portfolio closure reviews rejected their first remediation candidates
-with four and two additional Important findings respectively, and both focused worktrees remain
-active for correction. Closure review, integration, one grouped exact-head rereview, and one clean
-`CARGO_INCREMENTAL=0 ./scripts/verify.sh` run remain before Tasks 15 and 17 can close.
+candidate with thirteen Important findings. Fair-value evidence-authority remediation is integrated
+through release head `6c114c7`. Backtest recovery authority is integrated through `a57d5df`, and
+ONNX lifecycle authority is integrated through `3305db6`; both four-commit series range-diffed 1:1
+and passed fresh focused tests on the release tree. Their generated targets, clean worktrees, and
+patch-equivalent local branches were removed after push. One grouped exact-head rereview and one
+clean `CARGO_INCREMENTAL=0 ./scripts/verify.sh` run remain before Tasks 15 and 17 can close.
 
 Task 15 provides required zero-service ONNX inference through the self-contained Rust
 `TractOnnxBackend`. It admits exact bounded graphs and tensors, runs through a bounded model-owned
 helper process, binds warm-up evidence, and maps every policy/runtime/deadline failure to no action.
 The operator-supplied ONNX Runtime 1.24.4 path is optional and Linux-only; it admits an exact
-descriptor-verified ELF library through immutable sealed memory, requires warm-up parity, and keeps
-the already-constructed tract generation as the fallback.
+descriptor-verified ELF library through immutable sealed memory and requires warm-up parity.
+Cleanup ownership exists before helper spawn, blocking reap/join work remains asynchronous and
+bounded, and uncertain helper termination denies tract fallback and produces no output.
 
 The sealed Python package now installs its native extension as `market_squawk/__init__.abi3.so`.
 Native signed-environment verification of the complete Market Squawk, PyArrow, interpreter and
@@ -497,11 +497,11 @@ authority. Task 18 retains the accepted fair-value closeout above.
 
 The earlier model-containment lane rebased with an exact 1:1 range-diff, fast-forwarded, and closed
 cleanly. Its 7.1 GiB target, worktree and merged local branch were removed; no matching origin branch
-existed. Of the three subsequent product-named remediation worktrees, the fair-value lane is now
-accepted, integrated, pushed, and removed; the model-runtime and backtest-experiment-integrity
-worktrees remain active until their exact commits are accepted and integrated. The three protected
-stashes and `bundle-backup` remain. The root target remains generated cache only and must be cleaned
-immediately before the planned Quarter 3 full gate. The canonical plan defines the final delivery
+existed. All three subsequent product-named remediation worktrees are accepted, integrated, pushed,
+and removed. Their matching local branches are deleted, no matching origin branches remain, and
+metadata is pruned. The three protected stashes and `bundle-backup` remain. The root target remains
+generated cache only and must be cleaned immediately before the planned Quarter 3 full gate. The
+canonical plan defines the final delivery
 quarter as Tasks 19, 19A and 20, preserves the descriptor-driven shared CLI/MCP architecture, adds
 the evidence-bound local onboarding portal, and rejects redundant standalone test executables and
 checker scripts.

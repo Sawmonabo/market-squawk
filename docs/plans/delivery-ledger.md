@@ -14,12 +14,12 @@ evidence; it does not replace the README capability truth or the canonical relea
   moving release-branch head.
 - Current exact integration head: obtain it from `git rev-parse HEAD` and pull request `#26`.
   Tracked prose does not self-pin the commit that contains that prose.
-- Quarter 3 status: Tasks 13–18 are integrated, but the frozen grouped review rejected the candidate
-  with thirteen Important findings. Fair-value evidence-authority remediation passed independent
-  exact-candidate closure review and is integrated through `6c114c7`. Model-runtime and
-  backtest/portfolio closure reviews found four and two additional Important defects respectively;
-  both focused remediation lanes are active. The checkpoint has not been accepted and the single
-  clean full gate has not run on the remediated exact head.
+- Quarter 3 status: Tasks 13–18 and all accepted focused remediations are integrated. Fair-value
+  remediation is integrated through `6c114c7`; backtest recovery authority through `a57d5df`; and
+  ONNX lifecycle authority through `3305db6`. Both four-commit remediation series range-diffed 1:1,
+  passed fresh focused tests on the integrated release tree, and were pushed before their generated
+  targets, worktrees, and local branches were removed. The checkpoint has not been accepted: one
+  grouped review of the exact integrated head and one clean full gate remain.
 - Task 14 accepted feature and fast-forwarded release head: `02ab5cd`
 - Task 18 release merge head: `051ee3c`; reconciled lock head: `5c34b7d`
 - Task 13 accepted feature and release head: `59ba05c`
@@ -32,8 +32,8 @@ evidence; it does not replace the README capability truth or the canonical relea
   is a release blocker for the first complete local release. The canonical written design is
   [`2026-07-22-market-squawk-documentation-system-design.md`](../superpowers/specs/2026-07-22-market-squawk-documentation-system-design.md).
   It is awaiting written-spec review before implementation planning and documentation-tree
-  migration. The active model-runtime remediation retains ownership of
-  `docs/operations/onnx-runtime.md` until it is accepted and integrated.
+  migration. The existing ONNX runbook now states the integrated termination-gated fallback and
+  pre-spawn cleanup-ownership behavior; its planned move remains serialized with that migration.
 - Product release status: still blocked on the mandatory capabilities listed in the README and
   canonical complete-release plan
 
@@ -105,16 +105,17 @@ evidence; it does not replace the README capability truth or the canonical relea
   closes. The integrated implementation provides the required self-contained tract ONNX backend,
   bounded helper-process/resource/deadline contracts, exact graph and warm-up admission, and
   no-action failure. The optional operator-supplied ONNX Runtime path is Linux-only, descriptor-
-  verified, sealed in immutable memory, parity-checked, and cannot replace the required tract
-  fallback.
+  verified, sealed in immutable memory, and parity-checked. Cleanup ownership is reserved before
+  spawn, post-spawn waits and joins are asynchronous and bounded, and uncertain helper termination
+  denies optional tract fallback.
 - Task 17 owner: GitHub issue `#22`, Project 5, status `In Progress` until the Quarter 3 checkpoint
   closes. The integrated application-owned PIT backtesting service binds exact dataset partitions,
   executable/model/configuration identities, research execution assumptions, reconciled portfolio
   accounting, immutable success/failure terminals, artifacts, cohorts and overfitting diagnostics.
-- The next barrier is remediation, closure review, and integration of the two rejected model and
-  backtest candidates, followed by a grouped review of that exact integrated Quarter 3 head and one
-  clean `CARGO_INCREMENTAL=0 ./scripts/verify.sh` run. Tasks 15/17 remain open until that evidence
-  passes;
+  Recovery rejects conflicting attempt-terminal namespaces, parses untrusted cohort collections
+  through bounded visitors, and binds exact V3 candidate cardinality while preserving V1/V2 identity.
+- The next barrier is a grouped review of the exact integrated Quarter 3 head followed by one clean
+  `CARGO_INCREMENTAL=0 ./scripts/verify.sh` run. Tasks 15/17 remain open until that evidence passes;
   focused lane gates and prior release artifacts do not substitute for the checkpoint.
 
 - Task 12 owner: GitHub issue `#17`, Project 5, status `Done`.
@@ -237,10 +238,16 @@ application size.
   `6c114c7`, pushed it, removed 5,496 generated files and 3.4 GiB from its target, removed the clean
   `.worktrees/fair-value-evidence-authority` worktree, deleted the patch-equivalent local feature
   branch, confirmed no matching origin branch existed, and pruned worktree/remote metadata. The
-  model-runtime and backtest-experiment-integrity worktrees remain active and deliberately
-  preserved while their rejected closure findings are remediated.
+  model-runtime and backtest-experiment-integrity worktrees remained active while their closure
+  findings were remediated.
+- Integrated the accepted backtest series through `a57d5df` and model-runtime series through
+  `3305db6`, with exact 1:1 range-diffs and fresh integrated package gates. After push, cleaned 9.8
+  GiB of generated lane targets, removed both clean owned worktrees, deleted both patch-equivalent
+  local feature branches, confirmed no matching origin branches existed, and pruned worktree and
+  remote metadata. Only the release worktree remains; the three protected stashes,
+  `bundle-backup`, and Dependabot branches remain intact.
 
-The next delivery event is closure review and integration of the two active Quarter 3 remediation
-lanes, then one grouped exact-head rereview and one full gate. If those pass, issues `#20` and `#22`
+The next delivery event is one grouped exact-head Quarter 3 rereview and one clean full gate. If
+those pass, issues `#20` and `#22`
 can close and Tasks 19, 19A and 20 begin. Integrated Tasks 13–18 do not claim that the Market Squawk
 product release is complete.
