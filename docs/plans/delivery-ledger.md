@@ -9,6 +9,15 @@ evidence; it does not replace the README capability truth or the canonical relea
 ## Current integration state
 
 - Release branch: `release/market-squawk-v0.1.0`
+- Documentation execution source head:
+  `836aae662dfbbc3cf40e94e6da6c5c37cd3b57bd` with tree
+  `774a7bc9f4f26eb437fa1ab061dc4b557d20d0bc`. The source worktree was clean, the release
+  branch matched `origin`, and the approved design blob was
+  `7fdb58ece5b41211493cd4026773974ff30ce240` when the migration branch was created.
+- Active documentation branch: `docs/product-documentation`. It uses the one existing worktree;
+  no per-page branch, worktree, Cargo invocation, or build-cache duplicate is authorized.
+- Documentation refresh commit: pending the first Task 1 barrier commit. Task 2 cannot start until
+  the exact commit is pinned here and in the implementation plan.
 - Pre-status Quarter 3 capability-code head: `daf183a`
   (`fix(python): make native module the sealed package root`). This is a durable milestone, not the
   moving release-branch head.
@@ -36,11 +45,44 @@ evidence; it does not replace the README capability truth or the canonical relea
 - Documentation-system lane: the production documentation information architecture is approved and
   is a release blocker for the first complete local release. The canonical written design is
   [`2026-07-22-market-squawk-documentation-system-design.md`](../superpowers/specs/2026-07-22-market-squawk-documentation-system-design.md).
-  It is awaiting written-spec review before implementation planning and documentation-tree
-  migration. The existing ONNX runbook now states the integrated termination-gated fallback and
-  pre-spawn cleanup-ownership behavior; its planned move remains serialized with that migration.
-- Product release status: still blocked on the mandatory capabilities listed in the README and
-  canonical complete-release plan
+  Its written-spec review and concrete implementation plan are complete. The accepted-head refresh
+  is active, and the existing ONNX runbook is ready for its history-preserving move after the Task 1
+  barrier is committed. The complete architecture/reference/operations portal remains mandatory
+  before Task 20 closeout.
+- Product release status: runnable product capabilities exist across every required domain, but the
+  release remains blocked on provider qualification and rights outcomes, complete onboarding
+  workflows and clean-machine evidence, documentation migration, prerequisite-issue
+  reconciliation, and Task 20's integrated demonstration, performance/fuzz/security evidence,
+  final grouped review, exact-head gate, publication, and cleanup.
+
+## Documentation accepted-head refresh
+
+The 2026-07-23 refresh inspected code, the locked exact-head release binary, accepted evidence, the
+README, this ledger, open GitHub issues, and Project 5. It established the following current scope
+for documentation writers:
+
+- The shipping CLI exposes the complete public hierarchy from `init` through `mcp serve` and
+  `doctor`, with portfolio import/analytics and fair-value workflows routed through the production
+  `LocalProduct` and shared application services.
+- The shipping stdio MCP surface is the sole production composition over all 11 required domains
+  and 55 code-owned tool descriptors. The removed five-tool diagnostic server is neither a current
+  capability nor a reference source.
+- Arrow/Parquet/DataFusion research storage, point-in-time dataset construction, Python financial
+  analytics/training, immutable model bundles, native and tract ONNX inference, governed
+  backtesting, portfolio accounting/analytics, realistic paper execution, and fair-value analysis
+  are runnable product capabilities at the source head.
+- SEC, BLS, and Treasury Fiscal Data have evidence-bound onboarding and adapter-activation paths.
+  Remaining provider workflows and the clean-machine Task 19A demonstration are not yet accepted.
+- Coinbase and Kraken remain capped at `DirectUnverified`; no current provider observation can
+  satisfy the default `DirectVerified` automated-execution gate. FRED/ALFRED durable use remains
+  fail-closed without affirmative per-series rights.
+
+The refresh found stale README status statements for the removed diagnostic MCP, complete CLI/MCP,
+portfolio import, FairValue composition, Python source-closure cardinality, and the Quarter 3 gate.
+Those statements are corrected in the same barrier change from the implementation and accepted
+evidence; no unavailable procedure is promoted to runnable. Open issues `#7`, `#9`, `#10`, `#11`,
+`#24`, `#25`, and `#31` retain their current GitHub state until their exact closing outcomes are
+reconciled. Task 2—the model-runbook Git move and maintained-link inventory—is the next barrier.
 
 ## Product delivery closeout and next barrier
 

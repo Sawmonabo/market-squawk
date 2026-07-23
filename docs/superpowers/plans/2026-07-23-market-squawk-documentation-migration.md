@@ -23,11 +23,16 @@ documentation-only work and adds no runtime dependency, generator, test, or chec
 
 | Field | Value |
 | --- | --- |
-| Plan status | Ready for accepted-head refresh |
+| Plan status | Task 1 accepted-head refresh complete; Task 2 is the next barrier |
 | Planning audit base | `46f86d9496287e1995f584537153ecb3fcb271ac` |
 | Audit-base meaning | Evidence anchor only; not implementation or release approval |
 | Approved design | `docs/superpowers/specs/2026-07-22-market-squawk-documentation-system-design.md` |
 | Approved design blob | `7fdb58ece5b41211493cd4026773974ff30ce240` |
+| Execution source branch | `release/market-squawk-v0.1.0` |
+| Execution source head | `836aae662dfbbc3cf40e94e6da6c5c37cd3b57bd` |
+| Execution source tree | `774a7bc9f4f26eb437fa1ab061dc4b557d20d0bc` |
+| Accepted-head refresh | 2026-07-23 against a clean worktree and the locked release binary |
+| Refresh commit | Pending the Task 1 barrier commit; Task 2 cannot start until this row is pinned |
 | Release boundary | Required for the first complete local `v0.1.0` release |
 | Delivery-state authority | `docs/plans/delivery-ledger.md` |
 
@@ -73,6 +78,9 @@ relationships, source metadata, runnable evidence, and release blockers.
   produced by the implementation owner.
 - Use product-oriented branches such as `docs/product-documentation`,
   `docs/architecture-guide`, `docs/reference-manual`, and `docs/operator-runbooks`.
+- This execution uses the single `docs/product-documentation` branch and worktree. Disjoint writers
+  own disjoint files in that worktree and do not stage or commit; the integration owner alone
+  stages, commits, pushes, and resolves cross-links. No per-page branch or worktree is created.
 - Fresh independent review remains grouped with Quarter 4 of 4. Lanes self-review before handoff;
   do not create one fresh review round per page.
 - After integration, promptly remove clean lane worktrees, prune metadata, and delete
@@ -129,26 +137,40 @@ docs/
 Existing populated `plans/`, `reports/`, `research/`, `testing/`, and `verification/` areas remain
 in place. `docs/README.md` routes to them without reorganizing historical evidence.
 
-## Audit-base source map
+## Accepted-head source map
 
-Task 1 must refresh this mapping to accepted-head paths and exact line ranges. The absence of
-`apps/market-squawk/src/application.rs` and `apps/market-squawk/src/cli.rs` at the audit base is
-evidence of active Task 19 work, not permission to document the older control plane.
+Task 1 refreshed the planning-audit map against execution source head
+`836aae662dfbbc3cf40e94e6da6c5c37cd3b57bd`. Complete-file ranges below are exact for that head;
+focused declaration ranges identify the authority boundary writers must use. The older audit base
+remains design history and has no factual authority over current pages.
 
-| Subject | Planning-audit source |
+| Subject | Accepted-head source |
 | --- | --- |
-| Capability truth/blockers | `README.md:9-191`; `docs/plans/delivery-ledger.md:9-276` |
-| Historical/target architecture | `docs/architecture/current-state.md:1-353`; `docs/architecture/target-state.md:14-778` |
-| Workspace/dependencies | `Cargo.toml:1-189`, all package manifests, `rust-toolchain.toml`, `.cargo/config.toml` |
-| CLI/application/MCP | `apps/market-squawk/src/main.rs:32-908`; `apps/market-squawk/src/mcp.rs`; `apps/market-squawk/src/mcp/services.rs:64-207`; `crates/market-squawk-mcp/src/` |
-| Configuration/paths/secrets | `crates/market-squawk-platform/src/config.rs:230-559`, `paths.rs:71-300`, `secrets.rs:23-101` |
-| Classification/time/provenance | `crates/market-squawk-domain/src/classification.rs:33-75`, `time.rs`, `provenance.rs`, `provenance/`, `research/` |
-| Sources/live | `crates/market-squawk-sources/src/metadata.rs:25-430`, `health.rs:19-620`, registry/policy/extraction modules; `crates/market-squawk-live/src/` |
-| Research/PIT/storage | `crates/market-squawk-data/src/catalog/`, `manifest.rs`, `parquet_store/`, `query.rs:88-430`, `pit/`, `dataset_builder/`, `python_dataset/` |
-| Analytics/modeling | `crates/market-squawk-analytics/src/`; `crates/market-squawk-modeling/src/bundle.rs:44-520`, `registry.rs`, `native.rs`, `onnx.rs:39-300`, `onnx/` |
-| Portfolio/execution/fair value | `crates/market-squawk-portfolio/src/`; `crates/market-squawk-execution/src/`; `crates/market-squawk-valuation/src/` |
-| Provider coverage | Each `adapters/market-squawk-adapter-*/src/lib.rs` and source/config/rights modules; `docs/research/providers/`; `docs/research/2026-07-22-zero-fee-provider-onboarding/` |
-| Model runbook/release evidence | `docs/operations/onnx-runtime.md:1-146`; accepted release-gate and `docs/verification/` evidence |
+| Capability truth and blockers | `README.md:9-193`; `docs/project-memory.md:549-643`; `docs/plans/delivery-ledger.md:1-311`; GitHub issues `#7`, `#9`, `#10`, `#11`, `#24`, `#25`, and `#31` |
+| Historical and target architecture | `docs/architecture/current-state.md:1-354`; `docs/architecture/target-state.md:1-775` |
+| Workspace and dependencies | `Cargo.toml:1-212`, all package manifests, `rust-toolchain.toml`, `.cargo/config.toml` |
+| CLI and local composition | `apps/market-squawk/src/cli.rs:1-631`; `apps/market-squawk/src/main.rs:1-977`; `apps/market-squawk/src/local_product/cli_transport.rs`; command-specific `cli_*.rs` modules |
+| Application and MCP contracts | `apps/market-squawk/src/application.rs:1-435`; `apps/market-squawk/src/application/contracts.rs:1-1455`, especially `534-566`; `apps/market-squawk/src/mcp.rs:1-243`; `crates/market-squawk-services/src/traits.rs:27-675`; `crates/market-squawk-services/src/contract.rs:207-274`; `crates/market-squawk-mcp/src/server.rs:54-822` |
+| Configuration, paths, and secrets | `crates/market-squawk-platform/src/config.rs:52-1054`; `crates/market-squawk-platform/src/paths.rs:71-1074`; `crates/market-squawk-platform/src/secrets.rs:33-290`; `crates/market-squawk-platform/src/secrets/` |
+| Classification, time, and provenance | `crates/market-squawk-domain/src/classification.rs:33-75`; `crates/market-squawk-domain/src/time.rs`; `crates/market-squawk-domain/src/provenance/live.rs:1-365`; `crates/market-squawk-domain/src/provenance/research.rs:1-797` |
+| Sources and live runtime | `crates/market-squawk-sources/src/metadata.rs:47-347`; `metadata/source.rs:102-525`; `metadata/coverage.rs:4-506`; `health.rs:81-768`; `crates/market-squawk-live/src/`; `apps/market-squawk/src/live_source/` |
+| Research, point-in-time, and storage | `crates/market-squawk-data/src/manifest.rs:1-563`; `query.rs:88-967`; `pit/model.rs:40-400`; `catalog/`, `parquet_store/`, `dataset_builder/`, `python_dataset/`; `apps/market-squawk/src/application/research.rs` |
+| Analytics, modeling, and backtesting | `crates/market-squawk-analytics/src/`; `crates/market-squawk-modeling/src/bundle.rs:109-466`; `native.rs:61-235`; `onnx.rs:1-260`; `crates/market-squawk-backtesting/src/service.rs:28-684`; `apps/market-squawk/src/application/analysis/` |
+| Portfolio, execution, and fair value | `crates/market-squawk-portfolio/src/lib.rs:68-700`; `crates/market-squawk-execution/src/risk.rs:225-970`; `dispatcher.rs:33-923`; `crates/market-squawk-valuation/src/service.rs:51-322`; `apps/market-squawk/src/portfolio_application/`; `apps/market-squawk/src/application/fair_value/` |
+| Provider coverage and activation | Every `adapters/market-squawk-adapter-*/src/lib.rs` plus its source/config/rights modules; `crates/market-squawk-sources/src/onboarding/`; `apps/market-squawk/src/provider_onboarding/portal.rs:1-907`; `apps/market-squawk/src/provider_activation/mod.rs:1-501`; `docs/research/2026-07-23-provider-activation-evidence-validation.md` |
+| Model runbook and release evidence | `docs/operations/onnx-runtime.md:1-126`; `docs/verification/`; Quarter 3 exact-head gate at `c6f0124c2b27c4777947de8c42b6a5f97868aaf5`; Task 19/19A focused evidence recorded in project memory |
+
+### Producer-to-consumer authority map
+
+| Runnable claim | Producer authority | Terminal consumer or proof |
+| --- | --- | --- |
+| Complete local CLI hierarchy | Clap contracts in `cli.rs`; shared operation mapping in `local_product/cli_transport.rs` | Release binary help plus `main.rs` dispatch into the production `LocalProduct` composition |
+| Complete typed local MCP surface | The 55 code-owned descriptors returned by `application_capabilities()` | `LocalMcpComposition` and the hardened MCP server over the same `Application`; exact served-list and governed-mutation composition test |
+| Research ingestion and analytical storage | File, SEC, FRED/ALFRED, BLS, Treasury, and portfolio extraction adapters | Application research coordinator, catalog authority, Arrow/Parquet publication, bounded DataFusion reads, and point-in-time dataset construction |
+| Live market processing | Coinbase and Kraken adapters plus source registry and live qualification evidence | Instrument-owned runtime, book/feature state, risk, dispatcher, and paper engine; both current provider ceilings remain execution-ineligible |
+| Models and backtests | Catalog-authorized datasets, feature registry, immutable model bundles, native/tract inference, and backtest input authority | Model application service, no-action execution boundary, immutable experiment repository, and CLI/MCP analysis operations |
+| Portfolio and fair value | Raw-preserving portfolio adapter and genuine live/research/analytics/portfolio evidence publishers | Portfolio application service, execution-bound risk projection, fair-value catalog/service, and current CLI/MCP operations |
+| Provider onboarding and activation | Code-owned onboarding profiles, provider evidence, secure secret executor, and exact activation recipes | SEC, BLS, and Treasury adapter activation with durable recovery; remaining provider workflows and clean-machine proof stay release blockers |
 
 ## Dependency and ownership schedule
 
@@ -182,6 +204,7 @@ cleanup state.
 
 **Files:**
 
+- Modify: `README.md` only when the refresh proves a current capability-status contradiction
 - Modify:
   `docs/superpowers/plans/2026-07-23-market-squawk-documentation-migration.md`
 - Modify: `docs/plans/delivery-ledger.md`
@@ -190,7 +213,7 @@ cleanup state.
 **Produces:** one committed documentation base with exact accepted source head, refreshed anchors,
 runnable capabilities, blockers, and lane ownership.
 
-- [ ] **Freeze one clean accepted integrated product head**
+- [x] **Freeze one clean accepted integrated product head**
 
 Create `docs/product-documentation` from the exact accepted release commit, then run:
 
@@ -206,7 +229,7 @@ git hash-object \
 Expected: clean worktree, exact accepted product head, and design blob
 `7fdb58ece5b41211493cd4026773974ff30ce240`. Stop if any condition fails.
 
-- [ ] **Refresh all factual anchors**
+- [x] **Refresh all factual anchors**
 
 Use focused source inspection:
 
@@ -229,7 +252,7 @@ Replace audit-base entries with exact accepted paths/line ranges. Identify produ
 consumer for every runnable claim. Retain the planning audit base; add exact `Execution source head`
 and `Refresh commit` rows.
 
-- [ ] **Reconcile runnable truth and blockers**
+- [x] **Reconcile runnable truth and blockers**
 
 Inspect README status sections, ledger, accepted verification, and GitHub:
 
@@ -241,8 +264,12 @@ gh issue list --repo Sawmonabo/market-squawk --state open --limit 100
 gh project item-list 5 --owner Sawmonabo --format json
 ```
 
-Any code/evidence/README/ledger disagreement blocks writing; return it to the product owner rather
-than resolving it through prose.
+Any code/evidence/README/ledger disagreement blocks writing. The approved migration authorizes the
+integration owner to correct a stale status claim only when the accepted producer, terminal
+consumer, focused evidence, and exact source head resolve it without product judgment; otherwise
+return it to the product owner. This refresh used that authority for the removed diagnostic MCP,
+complete CLI/MCP, portfolio import, FairValue composition, source-closure cardinality, and Quarter
+3 gate statements.
 
 - [ ] **Record, verify, and commit the barrier**
 
@@ -251,10 +278,12 @@ blockers, ownership, and Task 2 as the next barrier.
 
 ```bash
 git diff --check -- \
+  README.md \
   docs/superpowers/plans/2026-07-23-market-squawk-documentation-migration.md \
   docs/plans/delivery-ledger.md
 git status --short
 git add \
+  README.md \
   docs/superpowers/plans/2026-07-23-market-squawk-documentation-migration.md \
   docs/plans/delivery-ledger.md
 git commit -m "docs(plan): refresh documentation migration authority"

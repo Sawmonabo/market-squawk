@@ -8,8 +8,8 @@ historical datasets to originate from or reproduce the live feed.
 
 ## Status
 
-`v0.1.0` is a runnable diagnostic foundation. It is not the usable complete Market Squawk release
-and it is not a production brokerage system. The linked
+`v0.1.0` is a runnable local product foundation under final release construction. It is not yet the
+usable complete Market Squawk release and it is not a production brokerage system. The linked
 [historical state audit](docs/architecture/current-state.md) records its own rejected audit anchor;
 it is not an exact-head inventory. The dated
 [release baseline](docs/verification/usable-release-baseline.md) is also historical audit evidence.
@@ -77,7 +77,7 @@ work is bound by the single canonical
   candidates; and validates publication through an exact, digest-bound Rust validator. Final model
   metadata, artifact, training-run, dataset, feature, label, universe, split, code, and environment
   identities are bound before external authority is accepted. The sealed builder verifies the
-  369-file source closure, hash-locked wheels, CPython runtimes, toolchain, SDK, validator, and
+  370-file source closure, hash-locked wheels, CPython runtimes, toolchain, SDK, validator, and
   project wheel, then installs and tests without network access. A native package-root initializer
   verifies the signed Market Squawk, PyArrow, interpreter, and native-library file sets before any
   shipped mutable Python module executes.
@@ -103,6 +103,11 @@ work is bound by the single canonical
 
   This product uses the FRED® API but is not endorsed or certified by the Federal Reserve Bank of
   St. Louis.
+- Evidence-bound local provider onboarding and adapter activation for SEC EDGAR, BLS, and Treasury
+  Fiscal Data. Code-owned profiles preserve provider evidence, duties, rights decisions,
+  credential state, exact persistence authority, durable desired state, provider-isolated restart
+  recovery, and explicit foreground resume for credentialed sources. The remaining provider
+  workflows and clean-machine release demonstration are still required below.
 - Authority-free midpoint, spread, spread-basis-point, microprice, imbalance, feed-quality,
   pre-trade calculation, and paper-only momentum diagnostics.
 - Immutable typed order intents plus fixed-capacity, nonblocking account risk coordination with
@@ -121,6 +126,10 @@ work is bound by the single canonical
   long/short lots, FIFO and specific identification, cash flows, income, exact gains, explicit
   complete/incomplete basis measurements, corporate-action snapshots, source-total reconciliation,
   performance, exposure, attribution, portfolio risk, scenarios, and proposal-only rebalancing.
+  The local CLI imports a confined versioned holdings or transactions manifest through the real
+  portfolio adapter, research-ingestion authority, immutable artifact boundary, and shared
+  `Portfolio.Import` service before exposing bounded holdings, transactions, performance, exposure,
+  and risk reads.
   Execution-owned risk loads the current opaque portfolio revision immediately before approval,
   derives financial limits from its complete projection, binds the exact revision and publication
   generation into the approved order, and rechecks that authority immediately before one-time
@@ -138,12 +147,17 @@ work is bound by the single canonical
   and `Unclassified` outcomes. Reporting-entity market access requires durable dual approval and
   separation of duties; immutable overrides cannot promote Level 1 or cure `Unclassified`
   evidence. Approvals, revocations, audit chains, stale-writer protection, bounded recovery, and
-  global catalog limits persist in SQLite. User-facing FairValue CLI and MCP composition remains
-  part of Task 19.
-- A hardened five-tool local stdio MCP surface with typed schemas, bounded admission, deadlines,
-  cancellation, result limits, controlled artifacts, durable audit, and bounded worker shutdown.
-  Audit, artifacts, capture, and configured journal reads derive from the same prepared local
-  capability graph. This is not the complete typed MCP product.
+  global catalog limits persist in SQLite. The current CLI and shared application service expose
+  bounded measurement, classification, explanation, evidence, approval-status, and approval
+  workflows over genuine live, research, analytics, or portfolio producers.
+- A complete local CLI hierarchy over the production `LocalProduct` composition for configuration,
+  sources, capture, ingestion, datasets, queries, features, models, portfolios, backtests, bots,
+  paper execution, fair value, MCP, and readiness diagnosis. Mutating operations retain explicit
+  confirmation, typed request admission, shared application-service authority, and bounded output.
+- A sole production local stdio MCP composition spanning all 11 required domains and 55 code-owned
+  typed tools. The shared application descriptors enforce schemas, authorization, evidence and
+  artifact policy, bounds, deadlines, cancellation, durable audit, controlled artifacts, and
+  lifecycle-owned shutdown. The CLI and MCP call the same transport-neutral application services.
 - A deterministic mock source for offline diagnostic verification. It is never represented as a
   production source.
 
@@ -165,13 +179,11 @@ terminal consumer, focused verification, immutable evidence, and exact commit ex
 | `Missing` | Coinbase direct-source qualification | The bounded source-to-live-to-risk-to-dispatch-to-paper ownership path is runnable, but Coinbase remains capped at `DirectUnverified`; it cannot satisfy the `DirectVerified` execution gate, and the CLI adds a no-intent strategy | Task 2 |
 | `Missing` | Kraken direct-source qualification | The production transport, decoder, checksum, exact-generation session lifecycle, fresh-snapshot recovery, and canonical risk/no-paper-mutation terminal proof exist; Kraken WebSocket v2 supplies no venue sequence satisfying the current `DirectVerified` execution predicate | Task 20 |
 | `Missing` | FRED/ALFRED durable local consumption | The production vintage-aware adapter is runnable for authorized ephemeral retrieval, but the exact current terms bundle does not establish per-series rights for persistence, caching, archival, or training | Task 9 / Task 20 |
-| `Missing` | portfolio import | The raw-preserving adapter now enforces durable revisions, account/currency authority, reconciliation, supersession, and canonical data-lane output, but no application service or CLI yet composes a real Task 7 local-file/OFX producer into its required portfolio-raw contract | Task 19 |
-| `Missing` | strategies and comprehensive risk | Bounded account/risk coordination, actor-owned authority consumption, private approval, one-time dispatch, price-bound reconciliation, and terminal audit exist; a production order-producing strategy and its controlled user-facing configuration do not | Task 2 |
-| `Missing` | realistic paper execution | The bounded engine implements lifecycle, fees, latency, slippage, partial fills, rejection, cancellation, accounting, checkpoint recovery, and reconciliation; no execution-eligible source/strategy currently drives orders through the user-facing production composition | Task 2 |
-| `Missing` | complete local CLI | No complete command hierarchy over shared application services | Task 19 |
-| `Missing` | complete typed local MCP | No complete bounded tool domains over shared application services | Task 19 |
-| `Missing` | local provider onboarding portal | No capability-gated local portal yet composes no-secret activation, official provider handoff, scoped key import, durable resume, exact secret lifecycle, provider permission verification, and rights admission | Task 19A |
-| `Missing` | release security/fuzz/performance gate | No exact-head release evidence or final integrated demonstration | Task 20 |
+| `Missing` | production order-producing strategy | Bounded risk, private approval, one-time dispatch, reconciliation, and terminal audit are runnable, but no controlled production strategy can emit an executable intent against a currently `DirectVerified` source | Issue `#7` / Task 20 |
+| `Missing` | execution-eligible paper demonstration | The realistic engine and user-facing composition are runnable, but no execution-eligible source/strategy can yet drive a risk-approved order through the complete local path | Issues `#7`, `#11` / Task 20 |
+| `Missing` | complete provider-onboarding acceptance | SEC, BLS, and Treasury Fiscal Data activation are implemented; remaining required provider workflows and the clean-machine activation/recovery demonstration are not yet accepted | Issue `#31` / Task 19A |
+| `Missing` | production documentation portal | The information architecture and migration plan are approved, but the indexed architecture, operations, reference, ADR, and historical-audit tree is not yet published | Documentation lane / Task 20 |
+| `Missing` | release security/fuzz/performance gate | No final unchanged-head integrated demonstration, measured release evidence, grouped review, publication, or closeout exists | Issue `#25` / Task 20 |
 
 Production-hardened Coinbase and Kraken source crates are tracked under `adapters/`; their
 execution-qualification verticals remain release-blocking above. The tracked `python/` product is
@@ -577,14 +589,15 @@ exactly four production-weighted review quarters:
    SQLite, Arrow/Parquet/DataFusion, bounded MCP protocol, and Kraken.
 2. **Quarter 2 of 4 — Stage 2 / Waves 2–3:** implement file, SEC, macro, and portfolio adapters;
    compose research ingestion, point-in-time datasets, corporate actions, and batch analytics.
-3. **Quarter 3 of 4 — Stage 3 / Waves 4A–4B:** model bundles, native/ONNX inference, portfolio
-   accounting and execution binding, the sealed Python product, point-in-time backtesting, and fair-
-   value analysis are integrated; grouped exact-head review and the single full gate remain before
-   the quarter is accepted.
-4. **Quarter 4 of 4 — Stages 4–5 / Waves 5–6:** complete shared services, CLI, typed MCP domains, and
-   the local zero-mandatory-fee provider onboarding portal; then run integrated demonstrations,
-   provider evidence, fuzzing, measured performance, security, supply-chain gates, grouped review,
-   publication, and cleanup.
+3. **Quarter 3 of 4 — Stage 3 / Waves 4A–4B:** accepted at exact pushed head `c6f0124` after model
+   bundles, native/ONNX inference, portfolio accounting and execution binding, the sealed Python
+   product, point-in-time backtesting, fair-value analysis, grouped exact-head review, and the full
+   nonincremental release gate passed.
+4. **Quarter 4 of 4 — Stages 4–5 / Waves 5–6:** shared services, the complete CLI and typed MCP
+   domains, and the first evidence-bound provider activations are implemented. Remaining provider
+   workflows, clean-machine activation evidence, production documentation, prerequisite-issue
+   reconciliation, integrated demonstrations, fuzzing, measured performance, security and supply-
+   chain gates, grouped review, publication, and cleanup still block the complete release.
 
 Every item is mandatory unless the product contract is explicitly changed. Each quarter ends at one
 clean exact commit with grouped independent review and remediation of every substantiated Critical
