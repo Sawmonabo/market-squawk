@@ -30,7 +30,8 @@ docs/tmp/
 Thumbs.db
 Desktop.ini
 .idea/
-.vscode/
+.vscode/*
+!.vscode/settings.json
 *.swp
 *.swo
 *~
@@ -115,7 +116,6 @@ target/
 *.tmp
 .DS_Store
 .idea/
-.vscode/
 .env
 __pycache__/
 *.py[cod]

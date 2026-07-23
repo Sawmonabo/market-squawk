@@ -123,9 +123,12 @@ Normal developer `dev` and `test` builds remain incremental with line-table debu
 non-workspace dependencies carry no debug information. The opt-in `debugging` profile provides full
 workspace debug information with incremental compilation disabled. Agent, CI, benchmark, and
 approval commands export `CARGO_INCREMENTAL=0` so their evidence does not depend on incremental
-state. The verification entry point enforces a 20 GiB hard ceiling on its local `target/` before and
-after the gate. Reclaim only ignored reproducible Cargo output after checking active processes and
-preserving every dirty or unique worktree state.
+state. VS Code rust-analyzer on-save flycheck is disabled for this workspace because its default
+workspace/all-target invocation duplicates explicit gates; analyzer-owned Cargo invocations also
+disable incremental state. Run focused diagnostics or the repository verification entry point on
+demand. The verification entry point enforces a 20 GiB hard ceiling on its local `target/` before
+and after the gate. Reclaim only ignored reproducible Cargo output after checking active processes
+and preserving every dirty or unique worktree state.
 
 ### Worktree lifecycle
 

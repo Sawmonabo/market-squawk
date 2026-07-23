@@ -1,0 +1,11 @@
+{
+    "rust-analyzer.cargo.allTargets": false,
+    "rust-analyzer.cargo.extraEnv": {
+        "CARGO_INCREMENTAL": "0"
+    },
+    "rust-analyzer.check.allTargets": false,
+    "rust-analyzer.check.extraEnv": {
+        "CARGO_INCREMENTAL": "0"
+    },
+    "rust-analyzer.checkOnSave": false
+}

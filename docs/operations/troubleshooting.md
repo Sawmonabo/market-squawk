@@ -234,6 +234,9 @@ Generated Cargo output is not product size. Each active Git worktree owns one de
 Routine dev/test profiles use line-table debug information, no dependency debug information, and
 incremental compilation. Agent, CI, benchmark, and approval gates set `CARGO_INCREMENTAL=0`.
 Full variable-level debugging is opt-in through `cargo build --profile debugging`.
+The tracked VS Code workspace settings disable rust-analyzer's automatic on-save
+workspace/all-target flycheck and incremental analyzer builds; use focused on-demand diagnostics so
+editor background work does not duplicate release gates or silently expand `target/`.
 
 Monitor generated storage at meaningful integration boundaries:
 
