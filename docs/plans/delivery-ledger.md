@@ -105,8 +105,7 @@ procedures:
 
 - FRED/ALFRED, BLS, and Treasury adapters validate digest-bearing object identities, but no public
   discovery command returns the exact IDs needed for a first-use ingestion.
-- `dataset list` does not expose its service cursor after the first 64 dataset identities, and
-  `feature build` does not populate the public feature-dataset registry.
+- `feature build` does not populate the public feature-dataset registry.
 - Dataset publication registers a Python export descriptor but exposes neither `exportSha256` nor
   a public retrieval operation.
 - The Python release builder does not build and bind the final application bundle, no supported
@@ -116,8 +115,6 @@ procedures:
   the current product composition; required tract inference remains the shipping ONNX path.
 - MCP overflow-artifact publication returns an opaque reference without a typed public retrieval
   operation; the public analytical query paths also do not compose query artifact authority.
-- `Bot.Start` descriptor admission accepts `feeBasisPoints` through `100000`, while the paper
-  runtime accepts only `0..=10000`; the public contract must be made consistent.
 - The reviewed `LocalProduct` composes only the OS-keyring backend. The platform encrypted-file
   fallback and unlock contract are not activated by the shipping application, so complete
   credential setup and recovery remain part of the onboarding blocker.

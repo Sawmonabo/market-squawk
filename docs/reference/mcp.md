@@ -345,11 +345,8 @@ identifiers. All fair-value tools use Local scope and not-applicable source evid
 | `Bot.Stop` | `reason` | Confirm | Stop the current local paper operation and durably reconcile it |
 
 `Bot.Start.provider` is `coinbase` or `kraken`; `initialCash` is a decimal string; and
-`feeBasisPoints` passes the current application descriptor when it is an integer in `0..=100000`,
-but the paper runtime has the stricter effective limit `0..=10000`. A larger admitted value cannot
-start the runtime and is reported as service unavailable. This contract mismatch is release-
-blocking and tracked in the [delivery ledger](../plans/delivery-ledger.md); callers must use
-`0..=10000`. All bot tools use Local scope.
+`feeBasisPoints` must be an integer in `0..=10000`. The application descriptor and paper runtime
+enforce the same bound. All bot tools use Local scope.
 
 ### Execution — 4 tools
 

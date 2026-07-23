@@ -287,7 +287,11 @@ pub enum IngestCommand {
 #[derive(Debug, Subcommand)]
 pub enum DatasetCommand {
     /// List bounded immutable datasets.
-    List,
+    List {
+        /// Continue after this dataset identity from the preceding bounded page.
+        #[arg(long)]
+        after_dataset: Option<String>,
+    },
     /// Inspect one exact dataset manifest.
     Manifest {
         /// Dataset identity.

@@ -126,7 +126,7 @@ const BOT_START_ARGUMENTS: &[ArgumentSpec] = &[
         "feeBasisPoints",
         ArgumentKind::Unsigned {
             minimum: 0,
-            maximum: 100_000,
+            maximum: 10_000,
         },
     ),
 ];

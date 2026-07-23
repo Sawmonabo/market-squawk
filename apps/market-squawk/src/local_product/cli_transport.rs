@@ -204,8 +204,11 @@ async fn dataset(
     command: DatasetCommand,
 ) -> Result<CliProductResult, CliProductError> {
     match command {
-        DatasetCommand::List => {
+        DatasetCommand::List { after_dataset } => {
             let mut arguments = Map::new();
+            if let Some(after_dataset) = after_dataset {
+                arguments.insert("afterDataset".to_owned(), Value::String(after_dataset));
+            }
             invoke(
                 product,
                 "Research.ListDatasets",

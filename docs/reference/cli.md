@@ -98,7 +98,7 @@ command result and local log.
 | --- | --- | --- |
 | `ingest file <MANIFEST> --object <ID> --dataset <ID> --confirm` | Confined file-adapter manifest and exact object/dataset identities | File adapter, research-ingestion authority, then immutable publication |
 | `ingest source <PROVIDER> <OBJECT> --dataset <DATASET> --confirm` | Provider and object are positional; dataset is a required named option | `Research.IngestSource` |
-| `dataset list` | None | `Research.ListDatasets` |
+| `dataset list` | Optional `--after-dataset <DATASET>` cursor from the preceding bounded page | `Research.ListDatasets` |
 | `dataset manifest <DATASET>` | Dataset identity is positional | `Research.GetManifest` |
 | `dataset build <REQUEST> --confirm` | Closed point-in-time build request, at most 8 MiB | Research dataset builder and immutable publication |
 | `query dataset <DATASET>` | `--maximum-rows <USIZE>` defaults to `1000` | `Research.GetHistory` with the requested result-count ceiling |

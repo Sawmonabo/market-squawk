@@ -116,9 +116,16 @@ generation for each identity. A nonempty result has:
 - `hasMore`; and
 - `nextAfterDataset` when another page exists.
 
-The typed service supports an `afterDataset` cursor, but the reviewed CLI does not expose that
-argument. Therefore `hasMore: true` means `dataset list` is not a complete operator inventory at
-this commit. Address a known dataset directly with `dataset manifest`.
+When `hasMore` is true, request the next bounded page with the returned cursor:
+
+```bash
+market-squawk --data-dir "$DATA_ROOT" --output json \
+  dataset list --after-dataset '<nextAfterDataset>'
+```
+
+Continue until `hasMore` is false. The cursor is a dataset identity from the preceding page; do not
+construct or modify it. Address a known dataset directly with `dataset manifest` when a full
+inventory is unnecessary.
 
 Each listed generation includes:
 
