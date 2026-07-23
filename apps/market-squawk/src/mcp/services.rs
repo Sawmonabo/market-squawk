@@ -5,8 +5,10 @@ use std::time::Instant;
 use async_trait::async_trait;
 use market_squawk_platform::ConfiguredJournalReadTarget;
 use market_squawk_services::{
-    RequestContext, ServiceCapabilities, ServiceCapabilityError, ServiceError, ToolDescriptor,
-    ToolEffects, ToolInputError, ToolServices, TypedToolRequest, TypedToolResult,
+    RequestContext, ScopeRequirement, ServiceCapabilities, ServiceCapabilityError, ServiceDomain,
+    ServiceError, SourceEvidencePolicy, ToolArtifactPolicy, ToolAuthorization, ToolContract,
+    ToolDescriptor, ToolEffects, ToolInputError, ToolResultMetadata, ToolResultPolicy, ToolScope,
+    ToolServices, TypedToolRequest, TypedToolResult,
 };
 use serde_json::{Map, Value, json};
 use thiserror::Error;
@@ -24,6 +26,12 @@ const JOURNAL_GET_SUMMARY: &str = "Journal.GetSummary";
 const RISK_TRIGGER_KILL_SWITCH: &str = "Risk.TriggerKillSwitch";
 const MAXIMUM_PRODUCT_BYTES: usize = 128;
 const MAXIMUM_REASON_BYTES: usize = 500;
+const LOCAL_SCOPE: ToolScope = ToolScope::new(
+    ScopeRequirement::NotApplicable,
+    ScopeRequirement::NotApplicable,
+    ScopeRequirement::NotApplicable,
+    ScopeRequirement::NotApplicable,
+);
 
 /// Frozen application state retained by the hardened MCP composition.
 #[derive(Debug)]
@@ -72,6 +80,7 @@ impl ToolServices for LocalToolServices {
         context: RequestContext,
     ) -> Result<TypedToolResult, ServiceError> {
         ensure_request_live(&context)?;
+        let source_derived = matches!(request.name(), MARKET_GET_SNAPSHOT | MARKET_GET_QUALITY);
         let (content, item_count) = match request.name() {
             MARKET_GET_SNAPSHOT => self.market_snapshot(&request)?,
             MARKET_GET_QUALITY => self.market_quality()?,
@@ -91,7 +100,22 @@ impl ToolServices for LocalToolServices {
             }
             _ => return Err(ServiceError::NotFound),
         };
-        TypedToolResult::try_new(content, item_count, context.limits()).map_err(Into::into)
+        let metadata = if source_derived {
+            ToolResultMetadata::try_complete(
+                json!({
+                    "source": "coinbase-exchange",
+                    "coverage": "single_venue_partial_diagnostic"
+                }),
+                json!({
+                    "maximumQuality": "direct_unverified",
+                    "executionEligible": false
+                }),
+            )?
+        } else {
+            ToolResultMetadata::complete_not_applicable()
+        };
+        TypedToolResult::try_new(content, item_count, metadata, context.limits())
+            .map_err(Into::into)
     }
 }
 
@@ -143,33 +167,35 @@ impl LocalToolServices {
 
 fn diagnostic_capabilities() -> Result<ServiceCapabilities, ServiceCapabilityError> {
     let mut tools = Vec::with_capacity(5);
-    tools.push(
-        ToolDescriptor::try_new(
-            MARKET_GET_SNAPSHOT,
-            CONTRACT_VERSION,
-            "Get the latest diagnostic and authority-free compatibility snapshot from Coinbase Exchange single-venue, partial coverage. Omit product to return all observed products. Diagnostic values cannot mint production live authority.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "product": {"type": "string", "minLength": 1, "maxLength": 128}
-                },
-                "additionalProperties": false
-            }),
-            ToolEffects::read_only_closed_world(),
-            |arguments: &Map<String, Value>| admit_optional_string(arguments, "product", MAXIMUM_PRODUCT_BYTES),
-        )?
-        .try_with_metadata(json!({
-            "org.market-squawk/tool-contract": {
-                "maximumDataQuality": "direct_unverified",
-                "executionAuthority": "none"
-            }
-        }))?,
-    );
+    tools.push(ToolDescriptor::try_new(
+        MARKET_GET_SNAPSHOT,
+        CONTRACT_VERSION,
+        "Get the latest diagnostic and authority-free compatibility snapshot from Coinbase Exchange single-venue, partial coverage. Omit product to return all observed products. Diagnostic values cannot mint production live authority.",
+        json!({
+            "type": "object",
+            "properties": {
+                "product": {"type": "string", "minLength": 1, "maxLength": 128}
+            },
+            "additionalProperties": false
+        }),
+        contract(
+            ServiceDomain::Market,
+            ToolAuthorization::ReadOnly,
+            SourceEvidencePolicy::Required,
+        ),
+        ToolEffects::read_only_closed_world(),
+        |arguments: &Map<String, Value>| admit_optional_string(arguments, "product", MAXIMUM_PRODUCT_BYTES),
+    )?);
     tools.push(ToolDescriptor::try_new(
         MARKET_GET_QUALITY,
         CONTRACT_VERSION,
         "Get the app-local diagnostic `QualityState`, book and heartbeat timestamps, sequence information, and gap counters; diagnostic `VALID` is not canonical `DataQuality` and can never establish `DataQuality::DirectVerified`. This state cannot mint production live authority.",
         empty_schema(),
+        contract(
+            ServiceDomain::Market,
+            ToolAuthorization::ReadOnly,
+            SourceEvidencePolicy::Required,
+        ),
         ToolEffects::read_only_closed_world(),
         admit_empty,
     )?);
@@ -178,6 +204,11 @@ fn diagnostic_capabilities() -> Result<ServiceCapabilities, ServiceCapabilityErr
         CONTRACT_VERSION,
         "Get diagnostic positions, fills, cash flow, and current risk state. This is paper simulation only, with no production order authority; this server never submits live orders.",
         empty_schema(),
+        contract(
+            ServiceDomain::Bot,
+            ToolAuthorization::ReadOnly,
+            SourceEvidencePolicy::NotApplicable,
+        ),
         ToolEffects::read_only_closed_world(),
         admit_empty,
     )?);
@@ -186,43 +217,56 @@ fn diagnostic_capabilities() -> Result<ServiceCapabilities, ServiceCapabilityErr
         CONTRACT_VERSION,
         "Validate and summarize the configured immutable local raw-data journal without accepting arbitrary filesystem paths.",
         empty_schema(),
+        contract(
+            ServiceDomain::Research,
+            ToolAuthorization::ReadOnly,
+            SourceEvidencePolicy::NotApplicable,
+        ),
         ToolEffects::read_only_closed_world(),
         admit_empty,
     )?);
-    tools.push(
-        ToolDescriptor::try_new(
-            RISK_TRIGGER_KILL_SWITCH,
-            CONTRACT_VERSION,
-            "Irreversibly stop the compatibility paper simulation only for the current run. It has no production order authority and cannot control production execution. Requires explicit confirmation and a reason.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "confirm": {"type": "boolean", "const": true},
-                    "reason": {"type": "string", "minLength": 1, "maxLength": 500}
-                },
-                "required": ["confirm", "reason"],
-                "additionalProperties": false
-            }),
-            ToolEffects::try_new(false, true, true, false)?,
-            |arguments: &Map<String, Value>| {
-                if arguments.len() != 2 || arguments.get("confirm") != Some(&Value::Bool(true)) {
-                    return Err(ToolInputError::Invalid);
-                }
-                admitted_string(arguments, "reason", MAXIMUM_REASON_BYTES)
-                    .map(|_reason| ())
-                    .map_err(|_error| ToolInputError::Invalid)
+    tools.push(ToolDescriptor::try_new(
+        RISK_TRIGGER_KILL_SWITCH,
+        CONTRACT_VERSION,
+        "Irreversibly stop the compatibility paper simulation only for the current run. It has no production order authority and cannot control production execution. Requires explicit confirmation and a reason.",
+        json!({
+            "type": "object",
+            "properties": {
+                "confirm": {"type": "boolean", "const": true},
+                "reason": {"type": "string", "minLength": 1, "maxLength": 500}
             },
-        )?
-        .try_with_metadata(json!({
-            "org.market-squawk/tool-contract": {
-                "executionAuthority": "none",
-                "simulationAccess": "none",
-                "controlAuthority": "paper_simulation_stop_only",
-                "resourceScope": "current_paper_simulation_run"
+            "required": ["confirm", "reason"],
+            "additionalProperties": false
+        }),
+        contract(
+            ServiceDomain::Bot,
+            ToolAuthorization::LocalConfirmation,
+            SourceEvidencePolicy::NotApplicable,
+        ),
+        ToolEffects::try_new(false, true, true, false)?,
+        |arguments: &Map<String, Value>| {
+            if arguments.len() != 2 || arguments.get("confirm") != Some(&Value::Bool(true)) {
+                return Err(ToolInputError::Invalid);
             }
-        }))?,
-    );
+            admitted_string(arguments, "reason", MAXIMUM_REASON_BYTES)
+                .map(|_reason| ())
+                .map_err(|_error| ToolInputError::Invalid)
+        },
+    )?);
     ServiceCapabilities::try_new(tools)
+}
+
+const fn contract(
+    domain: ServiceDomain,
+    authorization: ToolAuthorization,
+    evidence: SourceEvidencePolicy,
+) -> ToolContract {
+    ToolContract::new(
+        domain,
+        authorization,
+        LOCAL_SCOPE,
+        ToolResultPolicy::new(evidence, ToolArtifactPolicy::OpaqueOnOverflow),
+    )
 }
 
 fn empty_schema() -> Value {
