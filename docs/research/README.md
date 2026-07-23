@@ -54,6 +54,9 @@ decisions can be audited without relying on conversation history.
 
 ## Provider decisions
 
+- [FRED and ALFRED API rights decision](providers/fred-alfred-rights-2026-07-22.md) — current API
+  key contract, durable-storage and model-use restrictions, third-party-series boundary, and exact
+  release gate.
 - [Coinbase Direct Market Data execution-quality candidate](providers/coinbase-direct-market-data-2026-07-22.md)
   — authenticated direct endpoint, full-channel snapshot/sequence contract, free-tier bound, and
   the exact evidence still required before `DirectVerified` qualification.
