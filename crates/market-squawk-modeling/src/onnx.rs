@@ -119,9 +119,10 @@ impl TractOnnxBackend {
         .map_err(|error| match error {
             WorkerError::Load => OnnxBackendError::RuntimeLoad,
             WorkerError::Resource => OnnxBackendError::IntermediateLimit,
-            WorkerError::Unavailable | WorkerError::Deadline | WorkerError::Runtime => {
-                OnnxBackendError::WarmUp
-            }
+            WorkerError::Unavailable
+            | WorkerError::Deadline
+            | WorkerError::Runtime
+            | WorkerError::TerminationUncertain => OnnxBackendError::WarmUp,
         })?;
         if !warm_up.is_finite() {
             return Err(OnnxBackendError::WarmUp);
@@ -210,7 +211,9 @@ impl InferenceBackend for TractOnnxBackend {
 fn worker_inference_error(error: WorkerError) -> InferenceError {
     match error {
         WorkerError::Unavailable | WorkerError::Load => InferenceError::OnnxWorkerUnavailable,
-        WorkerError::Resource | WorkerError::Runtime => InferenceError::OnnxRuntimeFailure,
+        WorkerError::Resource | WorkerError::Runtime | WorkerError::TerminationUncertain => {
+            InferenceError::OnnxRuntimeFailure
+        }
         WorkerError::Deadline => InferenceError::OnnxDeadlineExceeded,
     }
 }

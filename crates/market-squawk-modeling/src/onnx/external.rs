@@ -1,4 +1,4 @@
-//! Optional, explicitly admitted ONNX Runtime acceleration with mandatory tract fallback.
+//! Optional ONNX Runtime acceleration with tract fallback after a safe terminal disposition.
 
 use std::path::{Component, Path};
 use std::sync::Arc;
@@ -13,8 +13,8 @@ use crate::{
     InferenceBackend, InferenceError, ModelInput, ModelMetadata, ModelOutput, ModelOutputIdentity,
 };
 
-use super::worker::OnnxWorker;
-use super::{OnnxPolicyError, TractOnnxBackend, normalize_input};
+use super::worker::{OnnxWorker, WorkerError};
+use super::{OnnxPolicyError, TractOnnxBackend, normalize_input, worker_inference_error};
 
 mod seal;
 
@@ -150,7 +150,7 @@ impl ExternalOnnxRuntimeReference {
     }
 }
 
-/// Optional external ONNX Runtime backend with mandatory tract fallback.
+/// Optional external ONNX Runtime backend with termination-gated tract fallback.
 #[derive(Debug)]
 pub struct ExternalOnnxRuntimeBackend {
     fallback: Arc<TractOnnxBackend>,
@@ -238,7 +238,8 @@ impl InferenceBackend for ExternalOnnxRuntimeBackend {
         let fallback_input = normalized.clone();
         let score = match self.worker.execute_until(normalized, deadlines.external) {
             Ok(score) => f64::from(score),
-            Err(_) => {
+            Err(error) => {
+                authorize_optional_fallback(error)?;
                 return self
                     .fallback
                     .infer_normalized_until(fallback_input, deadlines.total);
@@ -258,6 +259,17 @@ impl InferenceBackend for ExternalOnnxRuntimeBackend {
             confidence,
             decision,
         ))
+    }
+}
+
+fn authorize_optional_fallback(error: WorkerError) -> Result<(), InferenceError> {
+    match error {
+        WorkerError::TerminationUncertain => Err(worker_inference_error(error)),
+        WorkerError::Load
+        | WorkerError::Resource
+        | WorkerError::Unavailable
+        | WorkerError::Deadline
+        | WorkerError::Runtime => Ok(()),
     }
 }
 
@@ -363,6 +375,14 @@ mod tests {
                 external: started_at + Duration::from_millis(100),
                 total: started_at + Duration::from_millis(200),
             })
+        );
+    }
+
+    #[test]
+    fn uncertain_worker_termination_denies_optional_fallback() {
+        assert_eq!(
+            authorize_optional_fallback(WorkerError::TerminationUncertain),
+            Err(InferenceError::OnnxRuntimeFailure)
         );
     }
 }

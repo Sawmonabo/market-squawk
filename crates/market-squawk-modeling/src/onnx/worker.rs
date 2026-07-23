@@ -5,8 +5,8 @@ use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -23,10 +23,13 @@ use protocol::{WorkerInitialization, response_loop};
 
 const MAX_WORKER_PROGRAM_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_GENERATION_STARTUP: Duration = Duration::from_secs(15);
-const MAX_REAPER_REQUESTS: usize = 1;
+const MAX_GENERATION_CLEANUP_OWNERS: usize = 16;
 const RESPONSE_QUEUE_CAPACITY: usize = 1;
 const WRITER_POLL_INTERVAL: Duration = Duration::from_millis(1);
-const WORKER_RUNTIME_REVISION: u32 = 1;
+const CLEANUP_WAIT_RETRY: Duration = Duration::from_millis(10);
+const WORKER_RUNTIME_REVISION: u32 = 2;
+
+static ACTIVE_GENERATION_CLEANUP_OWNERS: AtomicUsize = AtomicUsize::new(0);
 
 /// Exact private helper executable admitted by application composition.
 #[derive(Clone, Debug)]
@@ -180,8 +183,7 @@ fn set_worker_permissions(_path: &Path) -> Result<(), OnnxWorkerProgramError> {
 pub(crate) struct OnnxWorker {
     #[cfg(feature = "onnx-runtime")]
     program: OnnxWorkerProgram,
-    generation: Mutex<Option<Generation>>,
-    reaper: GenerationReaper,
+    generation: Mutex<Option<OwnedGeneration>>,
     deadline: Duration,
     runtime_semantics_digest: [u8; 32],
 }
@@ -198,20 +200,87 @@ struct Generation {
 type WriterHandle = JoinHandle<Result<ChildStdin, WorkerError>>;
 
 #[derive(Debug)]
+struct OwnedGeneration {
+    state: Option<OwnedGenerationState>,
+}
+
+#[derive(Debug)]
+struct OwnedGenerationState {
+    generation: Generation,
+    cleanup: GenerationCleanupOwner,
+}
+
+impl OwnedGeneration {
+    fn new(generation: Generation, cleanup: GenerationCleanupOwner) -> Self {
+        Self {
+            state: Some(OwnedGenerationState {
+                generation,
+                cleanup,
+            }),
+        }
+    }
+
+    fn generation(&self) -> Result<&Generation, WorkerError> {
+        self.state
+            .as_ref()
+            .map(|state| &state.generation)
+            .ok_or(WorkerError::Unavailable)
+    }
+
+    fn generation_mut(&mut self) -> Result<&mut Generation, WorkerError> {
+        self.state
+            .as_mut()
+            .map(|state| &mut state.generation)
+            .ok_or(WorkerError::Unavailable)
+    }
+
+    fn handoff(mut self, writer: Option<WriterHandle>) -> TerminationDisposition {
+        let Some(state) = self.state.take() else {
+            return TerminationDisposition::Uncertain;
+        };
+        state.cleanup.handoff(ReapRequest {
+            generation: state.generation,
+            writer,
+        })
+    }
+}
+
+impl Drop for OwnedGeneration {
+    fn drop(&mut self) {
+        if let Some(state) = self.state.take() {
+            match state.cleanup.handoff(ReapRequest {
+                generation: state.generation,
+                writer: None,
+            }) {
+                TerminationDisposition::Confirmed | TerminationDisposition::Uncertain => {}
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
 struct ReapRequest {
     generation: Generation,
     writer: Option<WriterHandle>,
 }
 
 impl ReapRequest {
-    fn signal_termination(&mut self) {
+    fn request_termination(&mut self) -> TerminationDisposition {
         self.generation.stdin.take();
-        let _ = self.generation.child.kill();
+        match self.generation.child.kill() {
+            Ok(()) => TerminationDisposition::Confirmed,
+            Err(_) => match self.generation.child.try_wait() {
+                Ok(Some(_)) => TerminationDisposition::Confirmed,
+                Ok(None) | Err(_) => TerminationDisposition::Uncertain,
+            },
+        }
     }
 
-    fn terminate(mut self) {
-        self.signal_termination();
-        let _ = self.generation.child.wait();
+    fn reap(mut self) {
+        match self.request_termination() {
+            TerminationDisposition::Confirmed | TerminationDisposition::Uncertain => {}
+        }
+        wait_until_reaped(&mut self.generation.child);
         if let Some(writer) = self.writer.take() {
             let _ = writer.join();
         }
@@ -225,63 +294,135 @@ impl ReapRequest {
     }
 }
 
+#[must_use = "termination disposition governs whether inference fallback is safe"]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TerminationDisposition {
+    Confirmed,
+    Uncertain,
+}
+
 #[derive(Debug)]
-struct GenerationReaper {
-    sender: Option<SyncSender<ReapRequest>>,
-    observer: Option<JoinHandle<()>>,
-    failed_handoff: Mutex<Vec<ReapRequest>>,
+struct GenerationCleanupOwner {
+    state: Arc<GenerationCleanupState>,
+    armed: bool,
 }
 
-impl GenerationReaper {
+#[derive(Debug)]
+struct GenerationCleanupState {
+    command: Mutex<GenerationCleanupCommand>,
+    ready: Condvar,
+}
+
+#[derive(Debug)]
+struct GenerationCleanupCommand {
+    request: Option<ReapRequest>,
+    cancelled: bool,
+}
+
+impl GenerationCleanupOwner {
     fn start() -> Result<Self, WorkerError> {
-        let (sender, receiver) = mpsc::sync_channel::<ReapRequest>(MAX_REAPER_REQUESTS);
-        let observer = thread::Builder::new()
-            .name("market-squawk-onnx-reaper".to_owned())
-            .spawn(move || {
-                while let Ok(request) = receiver.recv() {
-                    request.terminate();
-                }
-            })
-            .map_err(|_| WorkerError::Unavailable)?;
-        Ok(Self {
-            sender: Some(sender),
-            observer: Some(observer),
-            // One worker owns one generation, so only one handoff can occur. Reserving the sole
-            // fallback slot keeps the disconnected-channel disposition allocation-free.
-            failed_handoff: Mutex::new(Vec::with_capacity(MAX_REAPER_REQUESTS)),
-        })
+        reserve_generation_cleanup_owner()?;
+        let state = Arc::new(GenerationCleanupState {
+            command: Mutex::new(GenerationCleanupCommand {
+                request: None,
+                cancelled: false,
+            }),
+            ready: Condvar::new(),
+        });
+        let observer_state = Arc::clone(&state);
+        let observer = match thread::Builder::new()
+            .name("market-squawk-onnx-cleanup".to_owned())
+            .spawn(move || run_generation_cleanup_owner(&observer_state))
+        {
+            Ok(observer) => observer,
+            Err(_) => {
+                ACTIVE_GENERATION_CLEANUP_OWNERS.fetch_sub(1, Ordering::AcqRel);
+                return Err(WorkerError::Unavailable);
+            }
+        };
+        drop(observer);
+        Ok(Self { state, armed: true })
     }
 
-    fn handoff(&self, mut request: ReapRequest) {
-        request.signal_termination();
-        let failed = match self.sender.as_ref() {
-            Some(sender) => match sender.try_send(request) {
-                Ok(()) => return,
-                Err(TrySendError::Full(request) | TrySendError::Disconnected(request)) => request,
-            },
-            None => request,
-        };
-        let mut retained = match self.failed_handoff.lock() {
-            Ok(retained) => retained,
+    fn handoff(mut self, mut request: ReapRequest) -> TerminationDisposition {
+        let disposition = request.request_termination();
+        let mut command = match self.state.command.lock() {
+            Ok(command) => command,
             Err(poisoned) => poisoned.into_inner(),
         };
-        retained.push(failed);
+        command.request = Some(request);
+        drop(command);
+        self.armed = false;
+        self.state.ready.notify_one();
+        disposition
     }
 }
 
-impl Drop for GenerationReaper {
+impl Drop for GenerationCleanupOwner {
     fn drop(&mut self) {
-        self.sender.take();
-        if let Some(observer) = self.observer.take() {
-            let _ = observer.join();
+        if !self.armed {
+            return;
         }
-        let retained = match self.failed_handoff.get_mut() {
-            Ok(retained) => retained,
+        let mut command = match self.state.command.lock() {
+            Ok(command) => command,
             Err(poisoned) => poisoned.into_inner(),
         };
-        for request in retained.drain(..) {
-            request.terminate();
+        command.cancelled = true;
+        drop(command);
+        self.state.ready.notify_one();
+    }
+}
+
+fn reserve_generation_cleanup_owner() -> Result<(), WorkerError> {
+    ACTIVE_GENERATION_CLEANUP_OWNERS
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            (active < MAX_GENERATION_CLEANUP_OWNERS).then_some(active + 1)
+        })
+        .map(|_| ())
+        .map_err(|_| WorkerError::Unavailable)
+}
+
+fn run_generation_cleanup_owner(state: &GenerationCleanupState) {
+    let request = {
+        let mut command = match state.command.lock() {
+            Ok(command) => command,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        while command.request.is_none() && !command.cancelled {
+            command = match state.ready.wait(command) {
+                Ok(command) => command,
+                Err(poisoned) => poisoned.into_inner(),
+            };
         }
+        command.request.take()
+    };
+    if let Some(request) = request {
+        request.reap();
+    }
+    ACTIVE_GENERATION_CLEANUP_OWNERS.fetch_sub(1, Ordering::AcqRel);
+}
+
+fn wait_until_reaped(child: &mut Child) {
+    loop {
+        match child.wait() {
+            Ok(_) => return,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => match child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) | Err(_) => thread::park_timeout(CLEANUP_WAIT_RETRY),
+            },
+        }
+    }
+}
+
+fn handoff_generation_failure(
+    generation: OwnedGeneration,
+    writer: Option<WriterHandle>,
+    error: WorkerError,
+) -> WorkerError {
+    match generation.handoff(writer) {
+        TerminationDisposition::Confirmed => error,
+        TerminationDisposition::Uncertain => WorkerError::TerminationUncertain,
     }
 }
 
@@ -362,7 +503,13 @@ impl OnnxWorker {
         if Instant::now() >= startup_deadline {
             return Err(WorkerError::Deadline);
         }
-        let mut child = Command::new(&program.inner.executable)
+        let cleanup = GenerationCleanupOwner::start()?;
+        if Instant::now() >= startup_deadline {
+            return Err(WorkerError::Deadline);
+        }
+        let active_generations = Arc::clone(&program.inner);
+        let (responses_sender, responses) = mpsc::sync_channel(RESPONSE_QUEUE_CAPACITY);
+        let child = Command::new(&program.inner.executable)
             .arg("--stdio-worker")
             .env_clear()
             .stdin(Stdio::piped())
@@ -370,102 +517,128 @@ impl OnnxWorker {
             .stderr(Stdio::null())
             .spawn()
             .map_err(|_| WorkerError::Load)?;
-        let Some(stdin) = child.stdin.take() else {
-            kill_and_reap(&mut child);
-            return Err(WorkerError::Load);
-        };
-        let Some(stdout) = child.stdout.take() else {
-            drop(stdin);
-            kill_and_reap(&mut child);
-            return Err(WorkerError::Load);
-        };
-        program
-            .inner
+        active_generations
             .active_generations
             .fetch_add(1, Ordering::AcqRel);
-        let (responses_sender, responses) = mpsc::sync_channel(RESPONSE_QUEUE_CAPACITY);
+        let mut generation = OwnedGeneration::new(
+            Generation {
+                child,
+                stdin: None,
+                responses,
+                reader: None,
+                active_generations,
+            },
+            cleanup,
+        );
+        let stdin = {
+            let generation = generation.generation_mut()?;
+            generation.child.stdin.take()
+        };
+        let Some(stdin) = stdin else {
+            return Err(handoff_generation_failure(
+                generation,
+                None,
+                WorkerError::Load,
+            ));
+        };
+        {
+            let generation = generation.generation_mut()?;
+            generation.stdin = Some(stdin);
+        }
+        let stdout = {
+            let generation = generation.generation_mut()?;
+            generation.child.stdout.take()
+        };
+        let Some(stdout) = stdout else {
+            return Err(handoff_generation_failure(
+                generation,
+                None,
+                WorkerError::Load,
+            ));
+        };
         let reader = match thread::Builder::new()
             .name("market-squawk-onnx-response".to_owned())
             .spawn(move || response_loop(stdout, responses_sender))
         {
             Ok(reader) => reader,
             Err(_) => {
-                kill_and_reap(&mut child);
-                program
-                    .inner
-                    .active_generations
-                    .fetch_sub(1, Ordering::AcqRel);
-                return Err(WorkerError::Load);
+                return Err(handoff_generation_failure(
+                    generation,
+                    None,
+                    WorkerError::Load,
+                ));
             }
         };
-        let mut generation = Generation {
-            child,
-            stdin: None,
-            responses,
-            reader: Some(reader),
-            active_generations: Arc::clone(&program.inner),
+        {
+            let generation = generation.generation_mut()?;
+            generation.reader = Some(reader);
+        }
+        let stdin = {
+            let generation = generation.generation_mut()?;
+            generation.stdin.take()
+        };
+        let Some(stdin) = stdin else {
+            return Err(handoff_generation_failure(
+                generation,
+                None,
+                WorkerError::Load,
+            ));
         };
         let writer = match spawn_writer(stdin, initialization.bytes) {
             Ok(writer) => writer,
             Err(error) => {
-                terminate_generation(generation, None);
-                return Err(error);
+                return Err(handoff_generation_failure(generation, None, error));
             }
         };
         let mut now = Instant::now;
-        let response =
-            receive_until_with_time_source(&generation.responses, startup_deadline, &mut now);
+        let response = {
+            let generation = generation.generation()?;
+            receive_until_with_time_source(&generation.responses, startup_deadline, &mut now)
+        };
         match response {
             Ok(_) => {
                 let stdin = match join_writer_until(writer, startup_deadline, &mut now) {
                     DeadlineJoin::Complete(stdin) => stdin,
                     DeadlineJoin::Failed(error) => {
-                        terminate_generation(generation, None);
-                        return Err(error);
+                        return Err(handoff_generation_failure(generation, None, error));
                     }
                     DeadlineJoin::Deadline(writer) => {
-                        terminate_generation(generation, Some(writer));
-                        return Err(WorkerError::Deadline);
+                        return Err(handoff_generation_failure(
+                            generation,
+                            Some(writer),
+                            WorkerError::Deadline,
+                        ));
                     }
                 };
-                generation.stdin = Some(stdin);
-                if now() >= startup_deadline {
-                    terminate_generation(generation, None);
-                    return Err(WorkerError::Deadline);
+                {
+                    let generation = generation.generation_mut()?;
+                    generation.stdin = Some(stdin);
                 }
-                let reaper = match GenerationReaper::start() {
-                    Ok(reaper) => reaper,
-                    Err(error) => {
-                        terminate_generation(generation, None);
-                        return Err(error);
-                    }
-                };
                 if now() >= startup_deadline {
-                    reaper.handoff(ReapRequest {
+                    return Err(handoff_generation_failure(
                         generation,
-                        writer: None,
-                    });
-                    return Err(WorkerError::Deadline);
+                        None,
+                        WorkerError::Deadline,
+                    ));
                 }
                 let worker = Self {
                     #[cfg(feature = "onnx-runtime")]
                     program: program.clone(),
                     generation: Mutex::new(Some(generation)),
-                    reaper,
                     deadline,
                     runtime_semantics_digest,
                 };
                 let warm_up_values = vec![0.0; input_elements];
-                let warm_up_deadline = Instant::now()
-                    .checked_add(deadline)
-                    .ok_or(WorkerError::Deadline)?;
-                let warm_up = worker.execute_until(warm_up_values, warm_up_deadline)?;
+                let Some(warm_up_deadline) = Instant::now().checked_add(deadline) else {
+                    return Err(worker.stop_after_failure(WorkerError::Deadline));
+                };
+                let warm_up = match worker.execute_until(warm_up_values, warm_up_deadline) {
+                    Ok(warm_up) => warm_up,
+                    Err(error) => return Err(worker.stop_after_failure(error)),
+                };
                 Ok((worker, warm_up))
             }
-            Err(error) => {
-                terminate_generation(generation, Some(writer));
-                Err(error)
-            }
+            Err(error) => Err(handoff_generation_failure(generation, Some(writer), error)),
         }
     }
 
@@ -499,31 +672,36 @@ impl OnnxWorker {
             }
             state.take().ok_or(WorkerError::Unavailable)?
         };
-        match execute_generation(&mut generation, values, absolute_deadline, &mut now) {
+        let execution = {
+            let inner = generation.generation_mut()?;
+            execute_generation(inner, values, absolute_deadline, &mut now)
+        };
+        match execution {
             GenerationExecution::Complete(score) => {
                 if now() >= absolute_deadline {
-                    self.reaper.handoff(ReapRequest {
+                    Err(handoff_generation_failure(
                         generation,
-                        writer: None,
-                    });
-                    Err(WorkerError::Deadline)
+                        None,
+                        WorkerError::Deadline,
+                    ))
                 } else {
-                    self.restore_generation(generation);
+                    self.restore_generation(generation)?;
                     Ok(score)
                 }
             }
             GenerationExecution::RetainedFailure(error) => {
-                self.restore_generation(generation);
-                Err(error)
+                match self.restore_generation(generation) {
+                    Ok(()) => Err(error),
+                    Err(cleanup_error) => Err(cleanup_error),
+                }
             }
             GenerationExecution::TerminalFailure { error, writer } => {
-                self.reaper.handoff(ReapRequest { generation, writer });
-                Err(error)
+                Err(handoff_generation_failure(generation, writer, error))
             }
         }
     }
 
-    fn restore_generation(&self, generation: Generation) {
+    fn restore_generation(&self, generation: OwnedGeneration) -> Result<(), WorkerError> {
         let mut state = match self.generation.lock() {
             Ok(state) => state,
             Err(poisoned) => poisoned.into_inner(),
@@ -531,11 +709,26 @@ impl OnnxWorker {
         let displaced = state.replace(generation);
         drop(state);
         if let Some(generation) = displaced {
-            self.reaper.handoff(ReapRequest {
+            return Err(handoff_generation_failure(
                 generation,
-                writer: None,
-            });
+                None,
+                WorkerError::Unavailable,
+            ));
         }
+        Ok(())
+    }
+
+    fn stop_after_failure(&self, error: WorkerError) -> WorkerError {
+        let generation = {
+            let mut state = match self.generation.lock() {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            state.take()
+        };
+        generation.map_or(error, |generation| {
+            handoff_generation_failure(generation, None, error)
+        })
     }
 
     pub(crate) const fn deadline(&self) -> Duration {
@@ -559,7 +752,9 @@ impl Drop for OnnxWorker {
             Err(poisoned) => poisoned.into_inner(),
         };
         if let Some(generation) = state.take() {
-            terminate_generation(generation, None);
+            match generation.handoff(None) {
+                TerminationDisposition::Confirmed | TerminationDisposition::Uncertain => {}
+            }
         }
     }
 }
@@ -707,10 +902,6 @@ where
     }
 }
 
-fn terminate_generation(generation: Generation, writer: Option<WriterHandle>) {
-    ReapRequest { generation, writer }.terminate();
-}
-
 fn worker_runtime_semantics_digest(
     program: &OnnxWorkerProgram,
     inference_deadline: Duration,
@@ -719,7 +910,7 @@ fn worker_runtime_semantics_digest(
     bind_runtime_bytes(
         &mut digest,
         b"namespace",
-        b"market-squawk/onnx-worker-runtime/v1",
+        b"market-squawk/onnx-worker-runtime/v2",
     );
     bind_runtime_u128(
         &mut digest,
@@ -756,8 +947,8 @@ fn worker_runtime_semantics_digest(
             inference_deadline.as_nanos(),
         ),
         (
-            b"reaper-queue-capacity".as_slice(),
-            MAX_REAPER_REQUESTS as u128,
+            b"maximum-generation-cleanup-owners".as_slice(),
+            MAX_GENERATION_CLEANUP_OWNERS as u128,
         ),
         (
             b"response-queue-capacity".as_slice(),
@@ -766,6 +957,10 @@ fn worker_runtime_semantics_digest(
         (
             b"writer-poll-nanoseconds".as_slice(),
             WRITER_POLL_INTERVAL.as_nanos(),
+        ),
+        (
+            b"cleanup-wait-retry-nanoseconds".as_slice(),
+            CLEANUP_WAIT_RETRY.as_nanos(),
         ),
     ] {
         bind_runtime_u128(&mut digest, name, value);
@@ -782,8 +977,8 @@ fn worker_runtime_semantics_digest(
     );
     bind_runtime_bytes(
         &mut digest,
-        b"reaper-semantics",
-        b"drop-generation-stdin/child-kill-before-bounded-enqueue/async-wait-and-join/v1",
+        b"cleanup-semantics",
+        b"bounded-owner-before-spawn/drop-generation-stdin/kill-or-confirm-exited/async-wait-and-join/uncertain-denies-fallback/v2",
     );
     digest.finalize().into()
 }
@@ -829,11 +1024,6 @@ fn hash_open_file(file: &mut File, limit: u64) -> io::Result<[u8; 32]> {
     Ok(digest.finalize().into())
 }
 
-fn kill_and_reap(child: &mut Child) {
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
 fn encode_digest(digest: [u8; 32]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut encoded = String::with_capacity(64);
@@ -851,6 +1041,7 @@ pub(crate) enum WorkerError {
     Unavailable,
     Deadline,
     Runtime,
+    TerminationUncertain,
 }
 
 /// Private helper startup or protocol failure.
@@ -871,6 +1062,7 @@ mod tests {
     #[test]
     fn post_take_expiry_preserves_the_retained_generation() -> Result<(), Box<dyn std::error::Error>>
     {
+        let cleanup = GenerationCleanupOwner::start().map_err(|_| "cleanup unavailable")?;
         let private_generation = tempfile::tempdir()?;
         let executable = std::env::current_exe()?;
         let program_inner = Arc::new(WorkerProgramInner {
@@ -893,14 +1085,16 @@ mod tests {
             program: OnnxWorkerProgram {
                 inner: Arc::clone(&program_inner),
             },
-            generation: Mutex::new(Some(Generation {
-                child,
-                stdin,
-                responses,
-                reader: None,
-                active_generations: program_inner,
-            })),
-            reaper: GenerationReaper::start().map_err(|_| "reaper unavailable")?,
+            generation: Mutex::new(Some(OwnedGeneration::new(
+                Generation {
+                    child,
+                    stdin,
+                    responses,
+                    reader: None,
+                    active_generations: program_inner,
+                },
+                cleanup,
+            ))),
             deadline: Duration::from_millis(10),
             runtime_semantics_digest: [1; 32],
         };
@@ -929,6 +1123,7 @@ mod tests {
     #[test]
     fn dispatched_failure_hands_cleanup_off_before_reader_join()
     -> Result<(), Box<dyn std::error::Error>> {
+        let cleanup = GenerationCleanupOwner::start().map_err(|_| "cleanup unavailable")?;
         let private_generation = tempfile::tempdir()?;
         let executable = std::env::current_exe()?;
         let program_inner = Arc::new(WorkerProgramInner {
@@ -955,14 +1150,16 @@ mod tests {
             program: OnnxWorkerProgram {
                 inner: Arc::clone(&program_inner),
             },
-            generation: Mutex::new(Some(Generation {
-                child,
-                stdin,
-                responses,
-                reader: Some(reader),
-                active_generations: Arc::clone(&program_inner),
-            })),
-            reaper: GenerationReaper::start().map_err(|_| "reaper unavailable")?,
+            generation: Mutex::new(Some(OwnedGeneration::new(
+                Generation {
+                    child,
+                    stdin,
+                    responses,
+                    reader: Some(reader),
+                    active_generations: Arc::clone(&program_inner),
+                },
+                cleanup,
+            ))),
             deadline: Duration::from_secs(1),
             runtime_semantics_digest: [1; 32],
         });
@@ -981,6 +1178,68 @@ mod tests {
         cleanup_release.send(())?;
         request.join().map_err(|_| "request thread panicked")?;
         drop(worker);
+        let cleanup_deadline = Instant::now() + Duration::from_secs(1);
+        while program_inner.active_generations.load(Ordering::Acquire) != 0
+            && Instant::now() < cleanup_deadline
+        {
+            thread::yield_now();
+        }
+        assert_eq!(program_inner.active_generations.load(Ordering::Acquire), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn startup_failure_returns_while_reader_cleanup_remains_owned()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let cleanup = GenerationCleanupOwner::start().map_err(|_| "cleanup unavailable")?;
+        let program_inner = Arc::new(WorkerProgramInner {
+            executable: std::env::current_exe()?,
+            digest: [1; 32],
+            active_generations: AtomicUsize::new(1),
+            _private_generation: tempfile::tempdir()?,
+        });
+        let mut child = Command::new(std::env::current_exe()?)
+            .arg("--list")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let stdin = child.stdin.take();
+        let (responses_sender, responses) = mpsc::sync_channel(1);
+        drop(responses_sender);
+        let (cleanup_release, cleanup_wait) = mpsc::sync_channel(1);
+        let reader = thread::spawn(move || {
+            let _ = cleanup_wait.recv();
+        });
+        let owned = OwnedGeneration::new(
+            Generation {
+                child,
+                stdin,
+                responses,
+                reader: Some(reader),
+                active_generations: Arc::clone(&program_inner),
+            },
+            cleanup,
+        );
+        let (result_sender, result_receiver) = mpsc::sync_channel(1);
+        let startup = thread::spawn(move || {
+            let result = handoff_generation_failure(owned, None, WorkerError::Deadline);
+            let _ = result_sender.send(result);
+        });
+
+        assert_eq!(
+            result_receiver.recv_timeout(Duration::from_secs(1))?,
+            WorkerError::Deadline
+        );
+        assert_eq!(program_inner.active_generations.load(Ordering::Acquire), 1);
+        cleanup_release.send(())?;
+        startup.join().map_err(|_| "startup thread panicked")?;
+        let cleanup_deadline = Instant::now() + Duration::from_secs(1);
+        while program_inner.active_generations.load(Ordering::Acquire) != 0
+            && Instant::now() < cleanup_deadline
+        {
+            thread::yield_now();
+        }
         assert_eq!(program_inner.active_generations.load(Ordering::Acquire), 0);
         Ok(())
     }
@@ -1030,8 +1289,9 @@ mod tests {
     }
 
     #[test]
-    fn reaper_handoff_signals_before_a_successful_enqueue() -> Result<(), Box<dyn std::error::Error>>
+    fn cleanup_handoff_confirms_termination_before_return() -> Result<(), Box<dyn std::error::Error>>
     {
+        let cleanup = GenerationCleanupOwner::start().map_err(|_| "cleanup unavailable")?;
         let private_generation = tempfile::tempdir()?;
         let executable = std::env::current_exe()?;
         let program_inner = Arc::new(WorkerProgramInner {
@@ -1049,26 +1309,25 @@ mod tests {
         let stdin = child.stdin.take();
         let (responses_sender, responses) = mpsc::sync_channel(1);
         drop(responses_sender);
-        let (sender, receiver) = mpsc::sync_channel(1);
-        let reaper = GenerationReaper {
-            sender: Some(sender),
-            observer: None,
-            failed_handoff: Mutex::new(Vec::with_capacity(MAX_REAPER_REQUESTS)),
-        };
-
-        reaper.handoff(ReapRequest {
-            generation: Generation {
+        let disposition = OwnedGeneration::new(
+            Generation {
                 child,
                 stdin,
                 responses,
                 reader: None,
                 active_generations: Arc::clone(&program_inner),
             },
-            writer: None,
-        });
-        let request = receiver.recv_timeout(Duration::from_secs(1))?;
-        assert!(request.generation.stdin.is_none());
-        request.terminate();
+            cleanup,
+        )
+        .handoff(None);
+
+        assert_eq!(disposition, TerminationDisposition::Confirmed);
+        let cleanup_deadline = Instant::now() + Duration::from_secs(1);
+        while program_inner.active_generations.load(Ordering::Acquire) != 0
+            && Instant::now() < cleanup_deadline
+        {
+            thread::yield_now();
+        }
         assert_eq!(program_inner.active_generations.load(Ordering::Acquire), 0);
         Ok(())
     }

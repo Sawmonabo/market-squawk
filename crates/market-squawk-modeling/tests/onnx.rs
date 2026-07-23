@@ -6,7 +6,8 @@ use std::mem::size_of;
 use std::path::Component;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use market_squawk_data::Sha256Digest;
 #[cfg(feature = "onnx-runtime")]
@@ -48,6 +49,21 @@ const LEGACY_GOLDEN_POLICY_DIGEST: [u8; 32] = [
     58, 248, 107, 240, 109, 197, 29, 39, 62, 176, 162, 191, 188, 222, 172, 185, 87, 141, 160, 83,
     195, 203, 155, 166, 96, 70, 200, 218, 125, 114, 162, 118,
 ];
+
+fn wait_for_active_generations(program: &OnnxWorkerProgram, expected: usize) -> TestResult {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while program.active_generations() != expected && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(1));
+    }
+    if program.active_generations() != expected {
+        return Err(format!(
+            "expected {expected} active ONNX generations, observed {}",
+            program.active_generations()
+        )
+        .into());
+    }
+    Ok(())
+}
 
 #[derive(Deserialize)]
 struct FixtureManifest {
@@ -276,7 +292,7 @@ fn tract_backend_runs_the_exact_bundle_with_finite_bounded_output() -> TestResul
     );
     assert_ne!(backend.runtime_evidence().warm_up_digest(), [0; 32]);
     drop(backend);
-    assert_eq!(program.active_generations(), 0);
+    wait_for_active_generations(&program, 0)?;
     Ok(())
 }
 
@@ -299,7 +315,7 @@ fn tract_worker_deadline_terminates_and_reaps_failed_generation() -> TestResult 
         .ok_or("expired worker generation was published")?;
 
     assert_eq!(error, OnnxBackendError::WarmUp);
-    assert_eq!(program.active_generations(), 0);
+    wait_for_active_generations(&program, 0)?;
     Ok(())
 }
 
@@ -315,7 +331,7 @@ fn tract_worker_rejects_graph_over_compute_budget_before_warm_up() -> TestResult
         .ok_or("compute-heavy graph was published")?;
 
     assert_eq!(error, OnnxBackendError::IntermediateLimit);
-    assert_eq!(program.active_generations(), 0);
+    wait_for_active_generations(&program, 0)?;
     Ok(())
 }
 
@@ -385,7 +401,7 @@ fn external_runtime_matches_tract_when_explicitly_configured() -> TestResult {
     assert!((external_output.score() - required_output.score()).abs() <= 1.0e-5);
     assert_eq!(program.active_generations(), 2);
     drop(external);
-    assert_eq!(program.active_generations(), 1);
+    wait_for_active_generations(&program, 1)?;
     Ok(())
 }
 

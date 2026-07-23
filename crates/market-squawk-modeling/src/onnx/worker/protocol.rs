@@ -275,9 +275,13 @@ pub(super) fn write_response(
         Ok(value) if value.is_finite() => (RESPONSE_OK, value),
         Err(WorkerError::Load) => (RESPONSE_LOAD, 0.0),
         Err(WorkerError::Resource) => (RESPONSE_RESOURCE, 0.0),
-        Err(WorkerError::Unavailable | WorkerError::Deadline | WorkerError::Runtime) | Ok(_) => {
-            (RESPONSE_RUNTIME, 0.0)
-        }
+        Err(
+            WorkerError::Unavailable
+            | WorkerError::Deadline
+            | WorkerError::Runtime
+            | WorkerError::TerminationUncertain,
+        )
+        | Ok(_) => (RESPONSE_RUNTIME, 0.0),
     };
     let value = value.to_bits().to_be_bytes();
     writer
