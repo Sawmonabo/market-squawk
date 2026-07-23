@@ -4,6 +4,11 @@
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
+/// Invalid canonical text representation of a fair-value content identity.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[error("fair-value identity must be exactly 64 lowercase hexadecimal characters")]
+pub struct FairValueIdParseError;
+
 macro_rules! digest_id {
     ($(#[$metadata:meta])* $name:ident) => {
         $(#[$metadata])*
@@ -23,6 +28,23 @@ macro_rules! digest_id {
                 formatter: &mut ::std::fmt::Formatter<'_>,
             ) -> ::std::fmt::Result {
                 formatter.write_str(concat!(stringify!($name), "([SHA-256])"))
+            }
+        }
+
+        impl ::std::fmt::Display for $name {
+            fn fmt(
+                &self,
+                formatter: &mut ::std::fmt::Formatter<'_>,
+            ) -> ::std::fmt::Result {
+                crate::format_digest_id(self.0, formatter)
+            }
+        }
+
+        impl ::std::str::FromStr for $name {
+            type Err = crate::FairValueIdParseError;
+
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                crate::parse_digest_id(value).map(Self)
             }
         }
     };
@@ -207,4 +229,32 @@ impl CanonicalHasher {
 
 pub(crate) fn checked_add(left: usize, right: usize) -> Result<usize, FairValueError> {
     left.checked_add(right).ok_or(FairValueError::Arithmetic)
+}
+
+fn format_digest_id(digest: [u8; 32], formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    for byte in digest {
+        write!(formatter, "{byte:02x}")?;
+    }
+    Ok(())
+}
+
+fn parse_digest_id(value: &str) -> Result<[u8; 32], FairValueIdParseError> {
+    if value.len() != 64 {
+        return Err(FairValueIdParseError);
+    }
+    let mut digest = [0_u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let high = decode_lower_hex(pair[0])?;
+        let low = decode_lower_hex(pair[1])?;
+        digest[index] = (high << 4) | low;
+    }
+    Ok(digest)
+}
+
+const fn decode_lower_hex(value: u8) -> Result<u8, FairValueIdParseError> {
+    match value {
+        b'0'..=b'9' => Ok(value - b'0'),
+        b'a'..=b'f' => Ok(value - b'a' + 10),
+        _ => Err(FairValueIdParseError),
+    }
 }

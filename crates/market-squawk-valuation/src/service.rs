@@ -2,6 +2,7 @@
 
 mod memory;
 mod operations;
+mod queries;
 mod recovery;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -151,6 +152,16 @@ impl FairValueLimits {
             max_retained_bytes: input.max_retained_bytes,
             catalog_limits,
         })
+    }
+
+    /// Returns the maximum number of producer-derived inputs in one measurement.
+    pub const fn max_inputs_per_measurement(self) -> usize {
+        self.max_inputs_per_measurement
+    }
+
+    /// Returns the maximum number of records exposed by one bounded query.
+    pub const fn max_query_results(self) -> usize {
+        self.max_query_results
     }
 }
 

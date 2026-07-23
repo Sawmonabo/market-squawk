@@ -693,7 +693,7 @@ impl FairValueService {
         Ok(())
     }
 
-    fn validate_query_limit(&self, requested: usize) -> Result<(), FairValueError> {
+    pub(super) fn validate_query_limit(&self, requested: usize) -> Result<(), FairValueError> {
         if requested == 0 || requested > self.limits.max_query_results {
             Err(FairValueError::QueryLimitExceeded {
                 requested,

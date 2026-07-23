@@ -20,6 +20,8 @@ const MAXIMUM_RESULT_ITEMS: u64 = 100_000;
 const MAXIMUM_RESULT_BYTES: u64 = 256 * 1024 * 1024;
 const MAXIMUM_IDENTIFIER_BYTES: usize = 256;
 const MAXIMUM_TEXT_BYTES: usize = 4 * 1024;
+const MAXIMUM_FAIR_VALUE_INPUTS: usize = 4_096;
+const MAXIMUM_FAIR_VALUE_ACTOR_BYTES: usize = 128;
 
 const LOCAL_SCOPE: ToolScope = ToolScope::new(
     ScopeRequirement::NotApplicable,
@@ -75,12 +77,20 @@ const MEASUREMENT_ARGUMENT: &[ArgumentSpec] = &[ArgumentSpec::required(
     "measurementId",
     ArgumentKind::Identifier,
 )];
-const FAIR_VALUE_MEASUREMENT_ARGUMENTS: &[ArgumentSpec] =
-    &[ArgumentSpec::required("measurement", ArgumentKind::Object)];
+const FAIR_VALUE_STATUS_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("measurementId", ArgumentKind::Identifier),
+    ArgumentSpec::required("at", ArgumentKind::Timestamp),
+];
+const FAIR_VALUE_MEASUREMENT_ARGUMENTS: &[ArgumentSpec] = &[ArgumentSpec::required(
+    "measurement",
+    ArgumentKind::FairValueMeasurement,
+)];
 const FAIR_VALUE_APPROVAL_ARGUMENTS: &[ArgumentSpec] = &[
     ArgumentSpec::required("measurementId", ArgumentKind::Identifier),
-    ArgumentSpec::required("reviewerId", ArgumentKind::Identifier),
-    ArgumentSpec::required("reason", ArgumentKind::Text),
+    ArgumentSpec::required("decisionId", ArgumentKind::Identifier),
+    ArgumentSpec::required("approvedBy", ArgumentKind::Identifier),
+    ArgumentSpec::required("approvedAt", ArgumentKind::Timestamp),
+    ArgumentSpec::required("expiresAt", ArgumentKind::Timestamp),
 ];
 const BACKTEST_RUN_ARGUMENTS: &[ArgumentSpec] = &[
     ArgumentSpec::required("strategyId", ArgumentKind::Identifier),
@@ -388,10 +398,10 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         "Return approval and revocation status for one measurement.",
         ServiceDomain::FairValue,
         LOCAL_SCOPE,
-        MEASUREMENT_ARGUMENT,
+        FAIR_VALUE_STATUS_ARGUMENTS,
         SourceEvidencePolicy::NotApplicable,
     ),
-    mutation(
+    idempotent_mutation(
         "FairValue.Measure",
         "Create one immutable fair-value measurement from admitted evidence.",
         ServiceDomain::FairValue,
@@ -399,7 +409,7 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         FAIR_VALUE_MEASUREMENT_ARGUMENTS,
         ToolAuthorization::LocalConfirmation,
     ),
-    mutation(
+    idempotent_mutation(
         "FairValue.Classify",
         "Classify one immutable measurement using the code-owned hierarchy ruleset.",
         ServiceDomain::FairValue,
@@ -407,7 +417,7 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         MEASUREMENT_ARGUMENT,
         ToolAuthorization::LocalConfirmation,
     ),
-    mutation(
+    idempotent_mutation(
         "FairValue.Approve",
         "Approve an eligible measurement through the controlled review workflow.",
         ServiceDomain::FairValue,
@@ -578,6 +588,28 @@ const fn mutation(
     }
 }
 
+const fn idempotent_mutation(
+    name: &'static str,
+    description: &'static str,
+    domain: ServiceDomain,
+    scope: ToolScope,
+    arguments: &'static [ArgumentSpec],
+    authorization: ToolAuthorization,
+) -> OperationSpec {
+    OperationSpec {
+        name,
+        description,
+        domain,
+        scope,
+        arguments,
+        authorization,
+        source_evidence: SourceEvidencePolicy::NotApplicable,
+        artifact: ToolArtifactPolicy::InlineOnly,
+        destructive: true,
+        idempotent: true,
+    }
+}
+
 const fn read_data(name: &'static str, description: &'static str) -> OperationSpec {
     read(
         name,
@@ -657,6 +689,8 @@ enum ArgumentKind {
     Text,
     Decimal,
     Object,
+    Timestamp,
+    FairValueMeasurement,
     Enumeration(&'static [&'static str]),
     Unsigned { minimum: u64, maximum: u64 },
 }
@@ -793,6 +827,8 @@ fn argument_schema(kind: ArgumentKind) -> Value {
             "maxLength": 128
         }),
         ArgumentKind::Object => json!({"type": "object", "minProperties": 1}),
+        ArgumentKind::Timestamp => json!({"type": "string", "format": "date-time"}),
+        ArgumentKind::FairValueMeasurement => fair_value_measurement_schema(),
         ArgumentKind::Enumeration(values) => json!({"type": "string", "enum": values}),
         ArgumentKind::Unsigned { minimum, maximum } => json!({
             "type": "integer",
@@ -991,6 +1027,8 @@ fn admit_argument(value: &Value, kind: ArgumentKind) -> Result<(), ToolInputErro
             .filter(|value| !value.is_empty())
             .map(|_| ())
             .ok_or(ToolInputError::Invalid),
+        ArgumentKind::Timestamp => admit_timestamp(value),
+        ArgumentKind::FairValueMeasurement => admit_fair_value_measurement(value),
         ArgumentKind::Enumeration(values) => value
             .as_str()
             .filter(|value| values.contains(value))
@@ -1002,6 +1040,210 @@ fn admit_argument(value: &Value, kind: ArgumentKind) -> Result<(), ToolInputErro
             .map(|_| ())
             .ok_or(ToolInputError::Invalid),
     }
+}
+
+fn fair_value_measurement_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "accountId": {"type": "string", "format": "uuid"},
+            "instrumentId": {"type": "string", "format": "uuid"},
+            "amount": {"type": "string", "minLength": 1, "maxLength": 128},
+            "currency": {
+                "type": "string",
+                "minLength": 3,
+                "maxLength": 3,
+                "pattern": "^[A-Za-z]{3}$"
+            },
+            "scale": {"type": "integer", "minimum": 0, "maximum": 28},
+            "measurementAt": {"type": "string", "format": "date-time"},
+            "preparedAt": {"type": "string", "format": "date-time"},
+            "preparedBy": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": MAXIMUM_FAIR_VALUE_ACTOR_BYTES
+            },
+            "method": {
+                "type": "string",
+                "enum": [
+                    "quoted_market_price",
+                    "market_approach",
+                    "income_approach",
+                    "cost_approach"
+                ]
+            },
+            "producerReceipts": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": MAXIMUM_FAIR_VALUE_INPUTS,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "producer": {
+                            "type": "string",
+                            "enum": ["live", "research", "analytics", "portfolio"]
+                        },
+                        "receiptId": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": MAXIMUM_IDENTIFIER_BYTES
+                        },
+                        "significance": {
+                            "type": "string",
+                            "enum": ["significant", "not_significant"]
+                        }
+                    },
+                    "required": ["producer", "receiptId", "significance"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": [
+            "accountId",
+            "instrumentId",
+            "amount",
+            "currency",
+            "scale",
+            "measurementAt",
+            "preparedAt",
+            "preparedBy",
+            "method",
+            "producerReceipts"
+        ],
+        "additionalProperties": false
+    })
+}
+
+fn admit_timestamp(value: &Value) -> Result<(), ToolInputError> {
+    value
+        .as_str()
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .filter(|value| value.timestamp_nanos_opt().is_some())
+        .map(|_| ())
+        .ok_or(ToolInputError::Invalid)
+}
+
+fn admit_fair_value_measurement(value: &Value) -> Result<(), ToolInputError> {
+    const REQUIRED: [&str; 10] = [
+        "accountId",
+        "instrumentId",
+        "amount",
+        "currency",
+        "scale",
+        "measurementAt",
+        "preparedAt",
+        "preparedBy",
+        "method",
+        "producerReceipts",
+    ];
+    let measurement = value.as_object().ok_or(ToolInputError::Invalid)?;
+    if measurement.len() != REQUIRED.len()
+        || REQUIRED
+            .iter()
+            .any(|required| !measurement.contains_key(*required))
+    {
+        return Err(ToolInputError::Invalid);
+    }
+    for identity in ["accountId", "instrumentId"] {
+        if measurement
+            .get(identity)
+            .and_then(Value::as_str)
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .filter(|value| !value.is_nil())
+            .is_none()
+        {
+            return Err(ToolInputError::Invalid);
+        }
+    }
+    admit_argument(
+        measurement.get("amount").ok_or(ToolInputError::Invalid)?,
+        ArgumentKind::Decimal,
+    )?;
+    let currency = measurement
+        .get("currency")
+        .and_then(Value::as_str)
+        .ok_or(ToolInputError::Invalid)?;
+    if currency.len() != 3 || !currency.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+        return Err(ToolInputError::Invalid);
+    }
+    if measurement
+        .get("scale")
+        .and_then(Value::as_u64)
+        .is_none_or(|scale| scale > 28)
+    {
+        return Err(ToolInputError::Invalid);
+    }
+    admit_timestamp(
+        measurement
+            .get("measurementAt")
+            .ok_or(ToolInputError::Invalid)?,
+    )?;
+    admit_timestamp(
+        measurement
+            .get("preparedAt")
+            .ok_or(ToolInputError::Invalid)?,
+    )?;
+    let prepared_by = measurement
+        .get("preparedBy")
+        .and_then(Value::as_str)
+        .ok_or(ToolInputError::Invalid)?;
+    if prepared_by.is_empty()
+        || prepared_by.len() > MAXIMUM_FAIR_VALUE_ACTOR_BYTES
+        || prepared_by
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+    {
+        return Err(ToolInputError::Invalid);
+    }
+    if measurement
+        .get("method")
+        .and_then(Value::as_str)
+        .is_none_or(|method| {
+            !matches!(
+                method,
+                "quoted_market_price" | "market_approach" | "income_approach" | "cost_approach"
+            )
+        })
+    {
+        return Err(ToolInputError::Invalid);
+    }
+    let receipts = measurement
+        .get("producerReceipts")
+        .and_then(Value::as_array)
+        .ok_or(ToolInputError::Invalid)?;
+    if receipts.is_empty() || receipts.len() > MAXIMUM_FAIR_VALUE_INPUTS {
+        return Err(ToolInputError::Invalid);
+    }
+    for receipt in receipts {
+        let receipt = receipt.as_object().ok_or(ToolInputError::Invalid)?;
+        if receipt.len() != 3
+            || receipt
+                .keys()
+                .any(|key| !matches!(key.as_str(), "producer" | "receiptId" | "significance"))
+        {
+            return Err(ToolInputError::Invalid);
+        }
+        if receipt
+            .get("producer")
+            .and_then(Value::as_str)
+            .is_none_or(|producer| {
+                !matches!(producer, "live" | "research" | "analytics" | "portfolio")
+            })
+            || receipt
+                .get("receiptId")
+                .and_then(Value::as_str)
+                .is_none_or(|identifier| !valid_identifier(identifier))
+            || receipt
+                .get("significance")
+                .and_then(Value::as_str)
+                .is_none_or(|significance| {
+                    !matches!(significance, "significant" | "not_significant")
+                })
+        {
+            return Err(ToolInputError::Invalid);
+        }
+    }
+    Ok(())
 }
 
 fn valid_identifier(value: &str) -> bool {
