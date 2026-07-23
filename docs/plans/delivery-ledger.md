@@ -28,6 +28,12 @@ evidence; it does not replace the README capability truth or the canonical relea
 - Integrated and pushed hardening code head: `2d39b0a34eb818f817973210148355c88f8f4b52`
 - Hardening owner: GitHub issue `#30`, Project 5
 - Hardening status: implemented, verified, integrated, pushed, and cleaned up
+- Documentation-system lane: the production documentation information architecture is approved and
+  is a release blocker for the first complete local release. The canonical written design is
+  [`2026-07-22-market-squawk-documentation-system-design.md`](../superpowers/specs/2026-07-22-market-squawk-documentation-system-design.md).
+  It is awaiting written-spec review before implementation planning and documentation-tree
+  migration. The active model-runtime remediation retains ownership of
+  `docs/operations/onnx-runtime.md` until it is accepted and integrated.
 - Product release status: still blocked on the mandatory capabilities listed in the README and
   canonical complete-release plan
 

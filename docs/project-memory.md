@@ -55,6 +55,23 @@ When an upstream implementation head is not yet approved, the planning artifact 
 Preparing a valid future plan and repairing the current implementation may proceed in parallel.
 They converge only at the plan's explicit approved-base refresh barrier.
 
+## Documentation is a release product
+
+The approved documentation system in
+[`2026-07-22-market-squawk-documentation-system-design.md`](superpowers/specs/2026-07-22-market-squawk-documentation-system-design.md)
+is required for the first complete local release. `docs/README.md` will route readers into focused
+architecture, operations, reference, ADR, audit, plan, report, research, testing, and verification
+areas. Architecture explains system boundaries and decisions; operations documents only runnable
+procedures; reference describes exact current interfaces; the delivery ledger alone owns mutable
+release state.
+
+The documentation migration preserves the current architecture documents as dated audit evidence,
+preserves the ONNX runbook's history when it becomes the broader model-inference runbook, uses
+stable GitHub-rendered Mermaid forms with accompanying prose, and records direct relevant sources
+with substantive review dates. Mandatory unfinished capabilities remain release blockers and do not
+receive fictional operating instructions. Do not add redirect-only pages, empty section shells,
+documentation checker scripts, prose tests, or new Rust test targets for this work.
+
 ## Maximum-safe parallelism
 
 Parallelism follows dependencies and ownership, not raw agent count.
