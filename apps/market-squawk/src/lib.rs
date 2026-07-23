@@ -13,6 +13,7 @@ mod domain;
 pub mod features;
 pub mod live_runtime;
 mod live_source;
+pub mod local_product;
 pub mod mcp;
 pub mod order_book;
 pub mod paper_bot;
@@ -49,6 +50,7 @@ pub use live_source::{
     ProductionLiveSourceCompositionError, ProductionLiveSourceRuntime,
     ProductionLiveSourceRuntimeError, ProductionSourceProvider, ProductionSupervisorError,
 };
+pub use local_product::{LocalProduct, LocalProductError};
 pub use market_squawk_platform::{
     AppConfig, JournalFileFormat, JournalSelectionError, LocalPaths as AppPaths,
 };
