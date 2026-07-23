@@ -1236,6 +1236,18 @@ impl OnboardingLifecycle {
             .and_then(|record| record.verification.as_ref())
     }
 
+    /// Returns the exact rights-decision digest retained for the active authority.
+    pub fn admitted_rights_digest(&self) -> Option<EvidenceDigest> {
+        if let Some(generation) = self.active_generation {
+            return self
+                .generations
+                .iter()
+                .find(|record| record.generation == generation)
+                .and_then(|record| record.rights_digest);
+        }
+        self.anonymous_rights_digest
+    }
+
     /// Returns whether this exact generation currently has scoped authority.
     pub fn generation_is_active_scoped(&self, generation: SecretGeneration) -> bool {
         !matches!(

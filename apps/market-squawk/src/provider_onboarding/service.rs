@@ -24,7 +24,7 @@ use market_squawk_sources::{
 use sha2::{Digest as _, Sha256};
 use subtle::ConstantTimeEq as _;
 use thiserror::Error;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -35,6 +35,7 @@ use super::contracts::{
 
 const SESSION_DURATION: Duration = Duration::from_secs(15 * 60);
 const SECRET_OPERATION_DURATION: Duration = Duration::from_secs(30);
+const MAXIMUM_CONCURRENT_SECRET_OPERATIONS: usize = 1;
 const MAX_PROBE_BODY_BYTES: usize = 1024 * 1024;
 const MAX_CONTACT_BYTES: usize = 128;
 
@@ -85,6 +86,7 @@ pub struct ProviderOnboardingService {
     secrets: Arc<dyn SecretStore>,
     client: reqwest::Client,
     activation: AsyncMutex<()>,
+    secret_operations: Arc<Semaphore>,
 }
 
 impl ProviderOnboardingService {
@@ -121,6 +123,7 @@ impl ProviderOnboardingService {
             secrets,
             client,
             activation: AsyncMutex::new(()),
+            secret_operations: Arc::new(Semaphore::new(MAXIMUM_CONCURRENT_SECRET_OPERATIONS)),
         })
     }
 
@@ -232,8 +235,23 @@ impl ProviderOnboardingService {
         self.resume(reservation.session_id())
     }
 
-    /// Imports one secret directly into the selected store and records only opaque evidence.
-    pub fn submit_secret(
+    /// Imports one secret through the bounded blocking-operation executor.
+    pub async fn submit_secret(
+        self: &Arc<Self>,
+        session_id: Uuid,
+        secret: SecretValue,
+        cancellation: CancellationToken,
+    ) -> Result<OnboardingSessionView, ProviderOnboardingError> {
+        let service = Arc::clone(self);
+        await_blocking_secret_operation(
+            Arc::clone(&self.secret_operations),
+            cancellation,
+            move |operation| service.submit_secret_blocking(session_id, secret, operation),
+        )
+        .await
+    }
+
+    fn submit_secret_blocking(
         &self,
         session_id: Uuid,
         secret: SecretValue,
@@ -408,7 +426,7 @@ impl ProviderOnboardingService {
         let resumed = self.catalog.resume_provider_onboarding(session_id)?;
         let profile = self.profile_for(&resumed)?;
         if resumed.lifecycle().state() == OnboardingState::ActiveScoped {
-            return self.lease_from_resumed(&resumed);
+            return self.lease_from_resumed(&resumed, profile);
         }
         match profile.release_state() {
             ProfileReleaseState::RightsBlocked => {
@@ -429,13 +447,23 @@ impl ProviderOnboardingService {
         let reference = resumed
             .lifecycle()
             .generation_reference(generation)
+            .cloned()
             .ok_or(ProviderOnboardingError::InvalidSessionState)?;
-        let secret = self.read_reference(
-            session_id,
-            reference,
-            SecretCancellation::new(),
-            SecretInteractionPolicy::AllowPlatformPrompt,
-        )?;
+        let secrets = Arc::clone(&self.secrets);
+        let secret = await_blocking_secret_operation(
+            Arc::clone(&self.secret_operations),
+            cancellation.clone(),
+            move |operation| {
+                read_secret_reference(
+                    secrets.as_ref(),
+                    session_id,
+                    &reference,
+                    operation,
+                    SecretInteractionPolicy::AllowPlatformPrompt,
+                )
+            },
+        )
+        .await?;
         let verified_at = system_timestamp()?;
         let response_evidence = self
             .run_credential_probe(profile, &secret, cancellation)
@@ -446,7 +474,7 @@ impl ProviderOnboardingService {
             AuthorityVerificationInput {
                 requested: requested.clone(),
                 observed: requested,
-                restrictions_digest: profile_rights_digest(profile),
+                restrictions_digest: profile.rights_decision_digest(),
                 bindings: AuthorityBindings::new(
                     None,
                     None,
@@ -476,7 +504,7 @@ impl ProviderOnboardingService {
             sequence,
             OnboardingEvent::RightsAdmitted {
                 generation: Some(generation),
-                decision_digest: profile_rights_digest(profile),
+                decision_digest: profile.rights_decision_digest(),
             },
         )?;
         sequence = checked_next(sequence)?;
@@ -519,8 +547,33 @@ impl ProviderOnboardingService {
         session_id: Uuid,
     ) -> Result<ProviderActivationLease, ProviderOnboardingError> {
         let resumed = self.catalog.resume_provider_onboarding(session_id)?;
-        self.profile_for(&resumed)?;
-        self.lease_from_resumed(&resumed)
+        let profile = self.profile_for(&resumed)?;
+        self.lease_from_resumed(&resumed, profile)
+    }
+
+    /// Disables one retained adapter recipe whose authority can no longer be reconstructed.
+    ///
+    /// The evidence digest names the exact quarantined durable state. Other provider sessions and
+    /// product domains remain available, while this session requires a new onboarding activation.
+    pub(crate) fn invalidate_activation_recipe(
+        &self,
+        session_id: Uuid,
+        evidence_digest: EvidenceDigest,
+    ) -> Result<OnboardingSessionView, ProviderOnboardingError> {
+        if evidence_digest.bytes() == [0; 32] {
+            return Err(ProviderOnboardingError::InvalidSessionState);
+        }
+        let mut resumed = self.catalog.resume_provider_onboarding(session_id)?;
+        let profile = self.profile_for(&resumed)?;
+        if resumed.lifecycle().state() != OnboardingState::Blocked {
+            self.append(
+                resumed.reservation(),
+                resumed.next_sequence(),
+                OnboardingEvent::Blocked { evidence_digest },
+            )?;
+            resumed = self.catalog.resume_provider_onboarding(session_id)?;
+        }
+        Ok(session_view(profile, &resumed))
     }
 
     /// Replays one exact durable session, closes safe refresh recovery, and returns status.
@@ -578,7 +631,7 @@ impl ProviderOnboardingService {
             1,
             OnboardingEvent::RightsAdmitted {
                 generation: None,
-                decision_digest: profile_rights_digest(profile),
+                decision_digest: profile.rights_decision_digest(),
             },
         )?;
         self.append(
@@ -641,7 +694,7 @@ impl ProviderOnboardingService {
     ) -> Result<EvidenceDigest, ProviderOnboardingError> {
         let probe = profile.probe();
         if probe.transport() == ProbeTransport::Local {
-            return Ok(profile_rights_digest(profile));
+            return Ok(profile.rights_decision_digest());
         }
         let endpoint = probe
             .endpoint()
@@ -778,57 +831,64 @@ impl ProviderOnboardingService {
         Ok(body)
     }
 
-    fn read_reference(
-        &self,
-        session_id: Uuid,
-        reference: &market_squawk_platform::SecretRef,
-        cancellation: SecretCancellation,
-        interaction: SecretInteractionPolicy,
-    ) -> Result<SecretValue, ProviderOnboardingError> {
-        let deadline = Instant::now()
-            .checked_add(SECRET_OPERATION_DURATION)
-            .ok_or(ProviderOnboardingError::Clock)?;
-        let control = SecretOperationControl::try_new(
-            format!("provider-activation-{session_id}"),
-            deadline,
-            0,
-            interaction,
-            cancellation,
-        )?;
-        self.secrets.read(reference, &control).map_err(Into::into)
-    }
-
-    pub(crate) fn read_active_secret(
+    /// Reads one active secret without blocking the asynchronous request executor.
+    pub(crate) async fn read_active_secret_for_request(
         &self,
         lease: &ProviderActivationLease,
-        cancellation: SecretCancellation,
+        cancellation: CancellationToken,
     ) -> Result<SecretValue, ProviderOnboardingError> {
+        let (session_id, reference) = self.active_secret_reference(lease)?;
+        let secrets = Arc::clone(&self.secrets);
+        await_blocking_secret_operation(
+            Arc::clone(&self.secret_operations),
+            cancellation,
+            move |operation| {
+                read_secret_reference(
+                    secrets.as_ref(),
+                    session_id,
+                    &reference,
+                    operation,
+                    SecretInteractionPolicy::AllowPlatformPrompt,
+                )
+            },
+        )
+        .await
+    }
+
+    fn active_secret_reference(
+        &self,
+        lease: &ProviderActivationLease,
+    ) -> Result<(Uuid, market_squawk_platform::SecretRef), ProviderOnboardingError> {
         let current = self.activation_lease(lease.session_id())?;
-        if current.surface_id() != lease.surface_id()
-            || current.capability_digest() != lease.capability_digest()
-            || current.generation() != lease.generation()
-            || current.secret_reference() != lease.secret_reference()
-        {
-            return Err(ProviderOnboardingError::InvalidSessionState);
-        }
+        require_same_active_lease(&current, lease)?;
         let reference = current
             .secret_reference()
+            .cloned()
             .ok_or(ProviderOnboardingError::ActivationUnavailable)?;
-        self.read_reference(
-            current.session_id(),
-            reference,
-            cancellation,
-            SecretInteractionPolicy::AllowPlatformPrompt,
-        )
+        Ok((current.session_id(), reference))
     }
 
     fn lease_from_resumed(
         &self,
         resumed: &ResumedProviderOnboarding,
+        profile: &ProviderOnboardingProfile,
     ) -> Result<ProviderActivationLease, ProviderOnboardingError> {
         let lifecycle = resumed.lifecycle();
         if lifecycle.state() != OnboardingState::ActiveScoped {
             return Err(ProviderOnboardingError::ActivationUnavailable);
+        }
+        match profile.release_state() {
+            ProfileReleaseState::RightsBlocked => {
+                return Err(ProviderOnboardingError::RightsBlocked);
+            }
+            ProfileReleaseState::RefreshRequired => {
+                return Err(ProviderOnboardingError::EvidenceRefreshRequired);
+            }
+            ProfileReleaseState::Available | ProfileReleaseState::RightsLimited => {}
+        }
+        let rights_decision_digest = profile.rights_decision_digest();
+        if lifecycle.admitted_rights_digest() != Some(rights_decision_digest) {
+            return Err(ProviderOnboardingError::InvalidSessionState);
         }
         let issued_at = system_timestamp()?;
         let (generation, secret_reference, verification_expires_at) =
@@ -843,9 +903,10 @@ impl ProviderOnboardingService {
                 let verification = lifecycle
                     .generation_verification(generation)
                     .ok_or(ProviderOnboardingError::InvalidSessionState)?;
-                if verification
-                    .expires_at()
-                    .is_some_and(|expires_at| expires_at <= issued_at)
+                if verification.restrictions_digest() != rights_decision_digest
+                    || verification
+                        .expires_at()
+                        .is_some_and(|expires_at| expires_at <= issued_at)
                 {
                     return Err(ProviderOnboardingError::ActivationExpired);
                 }
@@ -858,6 +919,9 @@ impl ProviderOnboardingService {
             surface_id: lifecycle.surface_id().clone(),
             capability_revision: lifecycle.capability_revision(),
             capability_digest: lifecycle.capability_digest(),
+            rights_decision_digest,
+            rights: profile.rights().0.to_vec(),
+            persistence_evidence: profile.persistence_evidence(),
             public_configuration_digest: resumed.reservation().public_configuration_digest(),
             public_configuration: resumed.public_configuration().clone(),
             generation,
@@ -906,6 +970,93 @@ impl ProviderOnboardingService {
                     .map(|profile| session_view(profile, resumed))
             })
             .collect()
+    }
+}
+
+async fn await_blocking_secret_operation<T, F>(
+    admission: Arc<Semaphore>,
+    cancellation: CancellationToken,
+    operation: F,
+) -> Result<T, ProviderOnboardingError>
+where
+    T: Send + 'static,
+    F: FnOnce(SecretCancellation) -> Result<T, ProviderOnboardingError> + Send + 'static,
+{
+    if cancellation.is_cancelled() {
+        return Err(ProviderOnboardingError::OperationCancelled);
+    }
+    let permit = tokio::select! {
+        biased;
+        () = cancellation.cancelled() => {
+            return Err(ProviderOnboardingError::OperationCancelled);
+        }
+        permit = admission.acquire_owned() => {
+            permit.map_err(|_| ProviderOnboardingError::SecretOperationUnavailable)?
+        }
+    };
+    let secret_cancellation = SecretCancellation::new();
+    let operation_cancellation = secret_cancellation.clone();
+    let mut task = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        operation(operation_cancellation)
+    });
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => {
+            secret_cancellation.cancel();
+            reap_secret_operation(task);
+            Err(ProviderOnboardingError::OperationCancelled)
+        }
+        result = &mut task => {
+            result.map_err(|_| ProviderOnboardingError::SecretOperationUnavailable)?
+        }
+    }
+}
+
+fn reap_secret_operation<T>(task: tokio::task::JoinHandle<Result<T, ProviderOnboardingError>>)
+where
+    T: Send + 'static,
+{
+    std::mem::drop(tokio::spawn(async move {
+        if task.await.is_err() {
+            tracing::error!("blocking secret worker failed while being reaped");
+        }
+    }));
+}
+
+fn read_secret_reference(
+    secrets: &dyn SecretStore,
+    session_id: Uuid,
+    reference: &market_squawk_platform::SecretRef,
+    cancellation: SecretCancellation,
+    interaction: SecretInteractionPolicy,
+) -> Result<SecretValue, ProviderOnboardingError> {
+    let deadline = Instant::now()
+        .checked_add(SECRET_OPERATION_DURATION)
+        .ok_or(ProviderOnboardingError::Clock)?;
+    let control = SecretOperationControl::try_new(
+        format!("provider-activation-{session_id}"),
+        deadline,
+        0,
+        interaction,
+        cancellation,
+    )?;
+    secrets.read(reference, &control).map_err(Into::into)
+}
+
+fn require_same_active_lease(
+    current: &ProviderActivationLease,
+    expected: &ProviderActivationLease,
+) -> Result<(), ProviderOnboardingError> {
+    if current.surface_id() == expected.surface_id()
+        && current.capability_digest() == expected.capability_digest()
+        && current.rights_decision_digest() == expected.rights_decision_digest()
+        && current.generation() == expected.generation()
+        && current.secret_reference() == expected.secret_reference()
+    {
+        Ok(())
+    } else {
+        Err(ProviderOnboardingError::InvalidSessionState)
     }
 }
 
@@ -1093,19 +1244,6 @@ fn validate_probe_semantics(profile_id: &str, body: &[u8]) -> Result<(), Provide
     }
 }
 
-fn profile_rights_digest(profile: &ProviderOnboardingProfile) -> EvidenceDigest {
-    let mut hasher = Sha256::new();
-    hasher.update(b"market-squawk-provider-rights-v1\0");
-    hasher.update(profile.id().as_bytes());
-    for right in profile.rights().0 {
-        hasher.update(right.operation().evidence_name().as_bytes());
-        hasher.update([0]);
-        hasher.update(right.admission().evidence_name().as_bytes());
-        hasher.update([0]);
-    }
-    EvidenceDigest::new(DigestAlgorithm::Sha256, hasher.finalize().into())
-}
-
 fn event_digest(
     domain: &[u8],
     session_id: Uuid,
@@ -1233,6 +1371,9 @@ pub enum ProviderOnboardingError {
     /// Cooperative cancellation completed before activation.
     #[error("provider onboarding operation was cancelled")]
     OperationCancelled,
+    /// The isolated blocking secret operation could not be joined safely.
+    #[error("provider onboarding secret operation is unavailable")]
+    SecretOperationUnavailable,
     /// Wall-clock conversion failed.
     #[error("provider onboarding clock is unavailable")]
     Clock,
@@ -1254,4 +1395,68 @@ pub enum ProviderOnboardingError {
     /// The process TLS provider was unavailable.
     #[error(transparent)]
     Tls(#[from] market_squawk_sources::TlsProviderError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[tokio::test]
+    async fn cancelled_secret_work_remains_bounded_until_the_worker_is_reaped() -> TestResult {
+        let admission = Arc::new(Semaphore::new(1));
+        let cancellation = CancellationToken::new();
+        let trigger = cancellation.clone();
+        let (first_started_tx, mut first_started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let first = tokio::spawn(await_blocking_secret_operation(
+            Arc::clone(&admission),
+            cancellation,
+            move |_secret_cancellation| {
+                first_started_tx
+                    .send(())
+                    .map_err(|_| ProviderOnboardingError::SecretOperationUnavailable)?;
+                release_rx
+                    .recv()
+                    .map_err(|_| ProviderOnboardingError::SecretOperationUnavailable)?;
+                Ok(())
+            },
+        ));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_millis(250), first_started_rx.recv()).await,
+            Ok(Some(()))
+        ));
+        trigger.cancel();
+
+        let first_result = tokio::time::timeout(Duration::from_millis(250), first).await??;
+        assert!(matches!(
+            first_result,
+            Err(ProviderOnboardingError::OperationCancelled)
+        ));
+
+        let (second_started_tx, mut second_started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let second = tokio::spawn(await_blocking_secret_operation(
+            Arc::clone(&admission),
+            CancellationToken::new(),
+            move |_secret_cancellation| {
+                second_started_tx
+                    .send(())
+                    .map_err(|_| ProviderOnboardingError::SecretOperationUnavailable)?;
+                Ok(())
+            },
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), second_started_rx.recv())
+                .await
+                .is_err()
+        );
+        release_tx.send(())?;
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_millis(250), second_started_rx.recv()).await,
+            Ok(Some(()))
+        ));
+        tokio::time::timeout(Duration::from_millis(250), second).await???;
+        Ok(())
+    }
 }

@@ -6,7 +6,11 @@ mod service;
 
 pub use contracts::{
     OnboardingNextAction, OnboardingSessionView, ProviderActivationLease,
-    ProviderProfileRegistration, ProviderProfileRegistrationOutcome, ProviderProfileView,
+    ProviderPortalActivationRequest, ProviderPortalActivationView, ProviderProfileRegistration,
+    ProviderProfileRegistrationOutcome, ProviderProfileView,
 };
-pub use portal::{ProviderOnboardingPortal, ProviderPortalConfig, ProviderPortalError};
+pub use portal::{
+    ProviderOnboardingPortal, ProviderPortalActivationAuthority, ProviderPortalActivationError,
+    ProviderPortalConfig, ProviderPortalError,
+};
 pub use service::{ProviderOnboardingError, ProviderOnboardingService, StartOnboardingRequest};

@@ -1,7 +1,10 @@
 use bytes::Bytes;
-use market_squawk_domain::{ExactPayloadEvidence, SourceIdentifier};
+use market_squawk_domain::{
+    DigestAlgorithm, EvidenceDigest, ExactPayloadEvidence, SourceIdentifier,
+};
 use market_squawk_sources::payload_matches_exact_evidence;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 use crate::BlsSourceError;
 use crate::chunks::is_valid_identifier_byte;
@@ -29,6 +32,18 @@ pub struct BlsSeriesMetadata {
     authorization_reference: SourceIdentifier,
 }
 
+/// Explicit user-verified semantic fields for one BLS series.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlsSeriesMetadataInput {
+    series_id: String,
+    title: String,
+    unit: SourceIdentifier,
+    frequency: SourceIdentifier,
+    seasonal_adjustment: SourceIdentifier,
+    measure: SourceIdentifier,
+}
+
 impl std::fmt::Debug for BlsSeriesMetadata {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -47,6 +62,39 @@ impl std::fmt::Debug for BlsSeriesMetadata {
 }
 
 impl BlsSeriesMetadata {
+    /// Canonically encodes explicit user-verified fields and binds them to an authorization record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BlsSourceError::InvalidSeriesMetadata`] when canonical encoding fails or any field
+    /// violates the same exact-payload contract used by file-based activation.
+    pub fn from_verified_input(
+        input: BlsSeriesMetadataInput,
+        authorization_reference: SourceIdentifier,
+    ) -> Result<Self, BlsSourceError> {
+        let wire = BlsSeriesMetadataWire {
+            schema_version: SERIES_METADATA_SCHEMA_VERSION,
+            series_id: input.series_id,
+            title: input.title,
+            unit: input.unit,
+            frequency: input.frequency,
+            seasonal_adjustment: input.seasonal_adjustment,
+            measure: input.measure,
+        };
+        let exact_payload = serde_json::to_vec(&wire)
+            .map(Bytes::from)
+            .map_err(|_error| BlsSourceError::InvalidSeriesMetadata)?;
+        let digest = EvidenceDigest::new(
+            DigestAlgorithm::Sha256,
+            Sha256::digest(&exact_payload).into(),
+        );
+        Self::parse_exact(
+            exact_payload,
+            ExactPayloadEvidence::from_content_digest(digest),
+            authorization_reference,
+        )
+    }
+
     /// Parses a bounded metadata record and binds its exact bytes to caller authorization.
     ///
     /// # Errors
@@ -132,7 +180,7 @@ impl BlsSeriesMetadata {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct BlsSeriesMetadataWire {
     schema_version: u16,

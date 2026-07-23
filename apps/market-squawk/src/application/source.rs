@@ -26,7 +26,8 @@ use super::{
     domain_support::{DomainLifecycle, admitted_result_limits, ensure_request_live},
 };
 use crate::{
-    ProviderOnboardingPortal, ProviderOnboardingService, ProviderPortalConfig, ProviderPortalError,
+    ProviderOnboardingPortal, ProviderOnboardingService, ProviderPortalActivationAuthority,
+    ProviderPortalConfig, ProviderPortalError,
 };
 
 mod results;
@@ -70,6 +71,7 @@ impl SourceDomainService {
     pub fn try_new(
         onboarding: Arc<ProviderOnboardingService>,
         runtime: Arc<dyn SourceRuntimeView>,
+        portal_activation: Arc<dyn ProviderPortalActivationAuthority>,
     ) -> Result<Self, SourceApplicationError> {
         let handle = tokio::runtime::Handle::try_current()
             .map_err(|_error| SourceApplicationError::AsyncRuntimeUnavailable)?;
@@ -83,6 +85,7 @@ impl SourceDomainService {
             controller: Arc::new(SourceController {
                 onboarding,
                 runtime,
+                portal_activation,
                 lifecycle: DomainLifecycle::new(),
                 session_limit: CatalogLimit::new(MAX_CURRENT_SESSIONS)
                     .map_err(|_error| SourceApplicationError::InvalidCodeOwnedLimit)?,
@@ -156,6 +159,7 @@ impl Drop for SourceDomainService {
 struct SourceController {
     onboarding: Arc<ProviderOnboardingService>,
     runtime: Arc<dyn SourceRuntimeView>,
+    portal_activation: Arc<dyn ProviderPortalActivationAuthority>,
     lifecycle: Arc<DomainLifecycle>,
     session_limit: CatalogLimit,
     portal_state: Arc<Mutex<PortalState>>,
@@ -387,8 +391,9 @@ impl SourceController {
             match &mut *state {
                 PortalState::Empty => {
                     let onboarding = Arc::clone(&self.onboarding);
+                    let activation = Arc::clone(&self.portal_activation);
                     *state = PortalState::Starting(tokio::spawn(async move {
-                        ProviderOnboardingPortal::start(onboarding, config).await
+                        ProviderOnboardingPortal::start(onboarding, activation, config).await
                     }));
                 }
                 PortalState::Starting(task) => {
@@ -485,6 +490,7 @@ impl fmt::Debug for SourceController {
             .debug_struct("SourceController")
             .field("onboarding", &self.onboarding)
             .field("runtime", &"[AUTHORITY-FREE RUNTIME VIEW]")
+            .field("portal_activation", &"[DURABLE ADAPTER AUTHORITY]")
             .field("lifecycle", &self.lifecycle)
             .field("session_limit", &self.session_limit)
             .finish_non_exhaustive()

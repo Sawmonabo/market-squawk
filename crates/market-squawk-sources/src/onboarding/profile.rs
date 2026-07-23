@@ -5,6 +5,7 @@ use std::num::NonZeroU64;
 
 use market_squawk_domain::{DataQuality, EvidenceDigest};
 use serde::Serialize;
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use super::{CredentialKind, ProviderCapability, RightsAdmissionState, SetupMode};
@@ -64,6 +65,17 @@ pub enum ProfileReleaseState {
     RefreshRequired,
     /// An affirmative rights conflict blocks activation.
     RightsBlocked,
+}
+
+impl ProfileReleaseState {
+    const fn evidence_name(self) -> &'static str {
+        match self {
+            Self::Available => "available",
+            Self::RightsLimited => "rights_limited",
+            Self::RefreshRequired => "refresh_required",
+            Self::RightsBlocked => "rights_blocked",
+        }
+    }
 }
 
 /// One data operation whose rights are evaluated independently.
@@ -312,6 +324,7 @@ pub struct ProviderOnboardingProfile {
     probe: VerificationProbe,
     rights: &'static [DataUseRight],
     rights_duties: &'static [&'static str],
+    persistence_evidence_source_id: Option<&'static str>,
     rotation: &'static str,
     revocation: &'static str,
     recovery: &'static [&'static str],
@@ -337,6 +350,7 @@ pub(crate) struct ProviderOnboardingProfileInput {
     pub probe: VerificationProbe,
     pub rights: &'static [DataUseRight],
     pub rights_duties: &'static [&'static str],
+    pub persistence_evidence_source_id: Option<&'static str>,
     pub rotation: &'static str,
     pub revocation: &'static str,
     pub recovery: &'static [&'static str],
@@ -348,6 +362,30 @@ impl ProviderOnboardingProfile {
         input: ProviderOnboardingProfileInput,
     ) -> Result<Self, ProviderProfileError> {
         let credentialed = input.capability.credential_kind() != CredentialKind::None;
+        let persistence_admitted = input.rights.iter().any(|right| {
+            right.operation == DataUseOperation::Persist
+                && right.admission == OperationAdmission::Admitted
+        });
+        let persistence_evidence = input.persistence_evidence_source_id.and_then(|source_id| {
+            input
+                .evidence
+                .iter()
+                .find(|evidence| evidence.source_id == source_id)
+        });
+        let invalid_evidence = input.evidence.iter().enumerate().any(|(index, evidence)| {
+            evidence.source_id.is_empty()
+                || evidence.official_url.is_empty()
+                || evidence.reviewed_on.is_empty()
+                || evidence
+                    .content_digest
+                    .is_some_and(|digest| digest.bytes() == [0; 32])
+                || input.evidence[index + 1..]
+                    .iter()
+                    .any(|candidate| candidate.source_id == evidence.source_id)
+        });
+        let exact_current_persistence_evidence = persistence_evidence.is_some_and(|evidence| {
+            evidence.content_digest.is_some() && !evidence.refresh_required
+        });
         if input.id.is_empty()
             || input.display_name.is_empty()
             || input.id != input.capability.surface_id().as_str()
@@ -358,6 +396,12 @@ impl ProviderOnboardingProfile {
                 .rights
                 .windows(2)
                 .any(|pair| pair[0].operation >= pair[1].operation)
+            || invalid_evidence
+            || persistence_admitted != input.persistence_evidence_source_id.is_some()
+            || input.persistence_evidence_source_id.is_some() && persistence_evidence.is_none()
+            || (input.release_state == ProfileReleaseState::Available
+                && persistence_admitted
+                && !exact_current_persistence_evidence)
             || credentialed != (input.credential == Requirement::RequiredProviderControlled)
             || credentialed != (input.activation_mode == ProfileActivationMode::ManualSecretImport)
             || (input.release_state == ProfileReleaseState::RightsBlocked
@@ -387,6 +431,7 @@ impl ProviderOnboardingProfile {
             probe: input.probe,
             rights: input.rights,
             rights_duties: input.rights_duties,
+            persistence_evidence_source_id: input.persistence_evidence_source_id,
             rotation: input.rotation,
             revocation: input.revocation,
             recovery: input.recovery,
@@ -454,6 +499,54 @@ impl ProviderOnboardingProfile {
         (self.rights, self.rights_duties)
     }
 
+    /// Returns the exact code-owned evidence selected to authorize durable persistence.
+    pub fn persistence_evidence(&self) -> Option<ProfileEvidence> {
+        let source_id = self.persistence_evidence_source_id?;
+        self.evidence
+            .iter()
+            .copied()
+            .find(|evidence| evidence.source_id == source_id)
+    }
+
+    /// Returns the canonical digest of the complete code-owned rights decision.
+    pub fn rights_decision_digest(&self) -> EvidenceDigest {
+        let mut hasher = Sha256::new();
+        hasher.update(b"market-squawk/provider-rights/v2\0");
+        update_hash_part(&mut hasher, self.id.as_bytes());
+        hasher.update(self.capability.revision().get().to_be_bytes());
+        update_evidence_digest(&mut hasher, self.capability.content_digest());
+        update_hash_part(&mut hasher, self.release_state.evidence_name().as_bytes());
+        for right in self.rights {
+            update_hash_part(&mut hasher, right.operation.evidence_name().as_bytes());
+            update_hash_part(&mut hasher, right.admission.evidence_name().as_bytes());
+        }
+        for duty in self.rights_duties {
+            update_hash_part(&mut hasher, duty.as_bytes());
+        }
+        update_hash_part(
+            &mut hasher,
+            self.persistence_evidence_source_id
+                .unwrap_or_default()
+                .as_bytes(),
+        );
+        for evidence in self.evidence {
+            update_hash_part(&mut hasher, evidence.source_id.as_bytes());
+            update_hash_part(&mut hasher, evidence.official_url.as_bytes());
+            update_hash_part(&mut hasher, evidence.reviewed_on.as_bytes());
+            hasher.update([u8::from(evidence.refresh_required)]);
+            if let Some(digest) = evidence.content_digest {
+                hasher.update([1]);
+                update_evidence_digest(&mut hasher, digest);
+            } else {
+                hasher.update([0]);
+            }
+        }
+        EvidenceDigest::new(
+            market_squawk_domain::DigestAlgorithm::Sha256,
+            hasher.finalize().into(),
+        )
+    }
+
     /// Returns rotation, revocation, and recovery guidance.
     pub const fn lifecycle(&self) -> (&'static str, &'static str, &'static [&'static str]) {
         (self.rotation, self.revocation, self.recovery)
@@ -463,6 +556,19 @@ impl ProviderOnboardingProfile {
     pub const fn evidence(&self) -> &'static [ProfileEvidence] {
         self.evidence
     }
+}
+
+fn update_hash_part(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
+    hasher.update(value);
+}
+
+fn update_evidence_digest(hasher: &mut Sha256, digest: EvidenceDigest) {
+    hasher.update(match digest.algorithm() {
+        market_squawk_domain::DigestAlgorithm::Sha256 => [1],
+        market_squawk_domain::DigestAlgorithm::Blake3 => [2],
+    });
+    hasher.update(digest.bytes());
 }
 
 /// Bounded immutable registry of built-in profiles.

@@ -1,14 +1,17 @@
 //! Secret-free status contracts shared by local portal and CLI transports.
 
+use market_squawk_adapter_bls::BlsSeriesMetadataInput;
 use market_squawk_data::ResumedProviderOnboarding;
-use market_squawk_domain::{DataQuality, EvidenceDigest, SourceIdentifier, Timestamp};
+use market_squawk_domain::{
+    CalendarDate, DataQuality, EvidenceDigest, SourceIdentifier, Timestamp,
+};
 use market_squawk_platform::{SecretGeneration, SecretRef};
 use market_squawk_sources::{
-    CapabilityRegistrationOutcome, DataUseRight, OnboardingState, ProfileEvidence,
-    ProfileReleaseState, ProviderCapabilityRevision, ProviderOnboardingProfile,
-    ProviderPublicConfiguration, Requirement, ZeroFeeStatus,
+    CapabilityRegistrationOutcome, DataUseOperation, DataUseRight, OnboardingState,
+    OperationAdmission, ProfileEvidence, ProfileReleaseState, ProviderCapabilityRevision,
+    ProviderOnboardingProfile, ProviderPublicConfiguration, Requirement, ZeroFeeStatus,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Serializable code-owned profile facts for CLI and portal clients.
@@ -28,6 +31,8 @@ pub struct ProviderProfileView {
     quality_ceiling: DataQuality,
     rights: Vec<DataUseRight>,
     rights_duties: &'static [&'static str],
+    rights_decision_digest: EvidenceDigest,
+    persistence_evidence: Option<ProfileEvidence>,
     rotation: &'static str,
     revocation: &'static str,
     recovery: &'static [&'static str],
@@ -73,6 +78,8 @@ impl From<&ProviderOnboardingProfile> for ProviderProfileView {
             quality_ceiling,
             rights: rights.to_vec(),
             rights_duties,
+            rights_decision_digest: profile.rights_decision_digest(),
+            persistence_evidence: profile.persistence_evidence(),
             rotation,
             revocation,
             recovery,
@@ -147,6 +154,64 @@ pub enum OnboardingNextAction {
     None,
 }
 
+/// Closed provider-specific configuration accepted by the local onboarding portal.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
+pub enum ProviderPortalActivationRequest {
+    /// SEC EDGAR needs only the declared contact already retained by onboarding.
+    Sec,
+    /// BLS needs explicit user-verified series semantics and a bounded year range.
+    Bls {
+        /// Exact series semantics; units and frequency are never inferred.
+        series: Vec<BlsSeriesMetadataInput>,
+        /// Inclusive first observation year.
+        start_year: u16,
+        /// Inclusive final observation year.
+        end_year: u16,
+    },
+    /// Treasury Fiscal Data average-interest-rate query.
+    TreasuryFiscal {
+        /// Inclusive first record date.
+        first_record_date: CalendarDate,
+        /// Inclusive final record date.
+        last_record_date: CalendarDate,
+        /// Bounded provider page size.
+        page_size: u16,
+    },
+}
+
+/// Secret-free evidence returned after durable adapter registration succeeds.
+#[derive(Clone, Debug, Serialize)]
+pub struct ProviderPortalActivationView {
+    profile: SourceIdentifier,
+    session_id: Uuid,
+    capability_revision: u64,
+    capability_digest: EvidenceDigest,
+    rights_decision_digest: EvidenceDigest,
+    persistence_evidence: Option<ProfileEvidence>,
+    public_configuration_digest: EvidenceDigest,
+    credential_generation: Option<u64>,
+    verification_expires_at: Option<Timestamp>,
+    issued_at: Timestamp,
+}
+
+impl ProviderPortalActivationView {
+    pub(crate) fn from_lease(profile: SourceIdentifier, lease: &ProviderActivationLease) -> Self {
+        Self {
+            profile,
+            session_id: lease.session_id(),
+            capability_revision: lease.capability_revision().get(),
+            capability_digest: lease.capability_digest(),
+            rights_decision_digest: lease.rights_decision_digest(),
+            persistence_evidence: lease.persistence_evidence(),
+            public_configuration_digest: lease.public_configuration_digest(),
+            credential_generation: lease.generation().map(SecretGeneration::get),
+            verification_expires_at: lease.verification_expires_at(),
+            issued_at: lease.issued_at(),
+        }
+    }
+}
+
 /// Secret-free durable status returned by every service and portal operation.
 #[derive(Clone, Debug, Serialize)]
 pub struct OnboardingSessionView {
@@ -172,6 +237,9 @@ pub struct ProviderActivationLease {
     surface_id: SourceIdentifier,
     capability_revision: ProviderCapabilityRevision,
     capability_digest: EvidenceDigest,
+    rights_decision_digest: EvidenceDigest,
+    rights: Vec<DataUseRight>,
+    persistence_evidence: Option<ProfileEvidence>,
     public_configuration_digest: EvidenceDigest,
     public_configuration: ProviderPublicConfiguration,
     generation: Option<SecretGeneration>,
@@ -187,6 +255,9 @@ impl ProviderActivationLease {
             surface_id: input.surface_id,
             capability_revision: input.capability_revision,
             capability_digest: input.capability_digest,
+            rights_decision_digest: input.rights_decision_digest,
+            rights: input.rights,
+            persistence_evidence: input.persistence_evidence,
             public_configuration_digest: input.public_configuration_digest,
             public_configuration: input.public_configuration,
             generation: input.generation,
@@ -214,6 +285,23 @@ impl ProviderActivationLease {
     /// Returns the exact canonical capability digest.
     pub const fn capability_digest(&self) -> EvidenceDigest {
         self.capability_digest
+    }
+
+    /// Returns the exact code-owned rights decision admitted by the durable lifecycle.
+    pub const fn rights_decision_digest(&self) -> EvidenceDigest {
+        self.rights_decision_digest
+    }
+
+    /// Returns whether the admitted decision authorizes one exact data-use operation.
+    pub fn admits(&self, operation: DataUseOperation) -> bool {
+        self.rights.iter().any(|right| {
+            right.operation() == operation && right.admission() == OperationAdmission::Admitted
+        })
+    }
+
+    /// Returns exact official evidence selected to authorize durable persistence, when admitted.
+    pub const fn persistence_evidence(&self) -> Option<ProfileEvidence> {
+        self.persistence_evidence
     }
 
     /// Returns the exact public-configuration digest retained by the catalog.
@@ -254,6 +342,7 @@ impl std::fmt::Debug for ProviderActivationLease {
             .field("session_id", &self.session_id)
             .field("surface_id", &self.surface_id)
             .field("capability_revision", &self.capability_revision)
+            .field("rights_decision_digest", &self.rights_decision_digest)
             .field("generation", &self.generation)
             .field("secret_reference", &"[OPAQUE]")
             .field("verification_expires_at", &self.verification_expires_at)
@@ -267,6 +356,9 @@ pub(super) struct ProviderActivationLeaseInput {
     pub surface_id: SourceIdentifier,
     pub capability_revision: ProviderCapabilityRevision,
     pub capability_digest: EvidenceDigest,
+    pub rights_decision_digest: EvidenceDigest,
+    pub rights: Vec<DataUseRight>,
+    pub persistence_evidence: Option<ProfileEvidence>,
     pub public_configuration_digest: EvidenceDigest,
     pub public_configuration: ProviderPublicConfiguration,
     pub generation: Option<SecretGeneration>,

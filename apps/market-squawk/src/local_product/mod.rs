@@ -72,7 +72,7 @@ const CATALOG_BUSY_TIMEOUT: Duration = Duration::from_millis(750);
 const CATALOG_MAXIMUM_ROWS: usize = 10_000;
 const CATALOG_MAXIMUM_RECORD_BYTES: usize = 1024 * 1024;
 const CATALOG_MAXIMUM_RESULT_BYTES: usize = 64 * 1024 * 1024;
-const MAXIMUM_DATASET_GENERATIONS: usize = 4_096;
+const MAXIMUM_OBJECTS_PER_DATASET_GENERATION: usize = 1_024;
 const MAXIMUM_STAGING_BYTES: u64 = 256 * 1024 * 1024;
 const MAXIMUM_ROW_GROUP_ROWS: usize = 65_536;
 const ORPHAN_GRACE: Duration = Duration::from_secs(60);
@@ -133,7 +133,13 @@ impl LocalProduct {
             &onboarding,
             &provider_activation,
             &provider_activation_state,
-        )?;
+        );
+        let portal_activation = Arc::new(cli_provider::ProviderResearchActivationService::new(
+            paths.clone(),
+            Arc::clone(&onboarding),
+            Arc::clone(&provider_activation),
+            provider_activation_state.clone(),
+        ));
 
         let live_fair_value = Arc::new(LiveFairValueObservationBuffer::try_new(
             maximum_live_route_count(&config)?,
@@ -142,6 +148,7 @@ impl LocalProduct {
         let source: Arc<dyn ApplicationDomainService> = Arc::new(SourceDomainService::try_new(
             Arc::clone(&onboarding),
             paper.source_runtime_view(),
+            portal_activation,
         )?);
         let research_domains = ResearchApplicationServices::new(
             Arc::clone(&research),
@@ -309,8 +316,13 @@ fn open_research(paths: &LocalPaths) -> Result<ResearchService, LocalProductErro
     )?;
     let objects =
         ObjectStoreConfig::try_new(MAXIMUM_STAGING_BYTES, MAXIMUM_ROW_GROUP_ROWS, ORPHAN_GRACE)?;
-    ResearchService::open_or_initialize(paths, catalog, MAXIMUM_DATASET_GENERATIONS, objects)
-        .map_err(Into::into)
+    ResearchService::open_or_initialize(
+        paths,
+        catalog,
+        MAXIMUM_OBJECTS_PER_DATASET_GENERATION,
+        objects,
+    )
+    .map_err(Into::into)
 }
 
 fn analysis_catalog() -> Result<AnalysisCatalog, LocalProductError> {

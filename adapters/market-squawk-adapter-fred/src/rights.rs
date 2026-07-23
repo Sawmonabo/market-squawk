@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use market_squawk_domain::{SourceIdentifier, Timestamp};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use url::Url;
@@ -55,7 +55,7 @@ fn hex_nibble(value: u8) -> Result<u8, FredRightsError> {
 }
 
 /// A separately authorized operation over FRED or ALFRED material.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FredOperation {
     /// Transient retrieval without durable retention.

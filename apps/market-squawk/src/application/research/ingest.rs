@@ -317,6 +317,24 @@ impl ProductionResearchIngestCoordinator {
         Ok(())
     }
 
+    /// Returns whether this process currently owns a callable adapter for the exact profile.
+    pub fn is_profile_registered(
+        &self,
+        profile: &SourceIdentifier,
+    ) -> Result<bool, ResearchIngestCompositionError> {
+        if self.lifecycle.shutdown_token().is_cancelled() {
+            return Err(ResearchIngestCompositionError::ShuttingDown);
+        }
+        let authority = self
+            .authority
+            .lock()
+            .map_err(|_error| ResearchIngestCompositionError::AuthorityUnavailable)?;
+        if authority.registry.is_none() {
+            return Err(ResearchIngestCompositionError::ShuttingDown);
+        }
+        Ok(authority.sources.contains_key(profile))
+    }
+
     /// Extracts one exact object from an already registered profile without analytical
     /// publication.
     ///

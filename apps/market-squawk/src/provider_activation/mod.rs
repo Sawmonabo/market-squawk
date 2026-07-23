@@ -12,8 +12,8 @@ use market_squawk_adapter_portfolio::PortfolioManifestExtractionSource;
 use market_squawk_adapter_sec::{SecContact, SecEdgarSource};
 use market_squawk_adapter_treasury::{TreasurySource, TreasurySourceConfig};
 use market_squawk_data::RightsBasis;
-use market_squawk_domain::SourceIdentifier;
-use market_squawk_platform::{AppConfig, SecretCancellation};
+use market_squawk_domain::{SourceId, SourceIdentifier};
+use market_squawk_platform::AppConfig;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -24,11 +24,12 @@ use crate::{
     ProductionLiveSourceComposition, ProductionSourceProvider, ProviderActivationLease,
     ProviderOnboardingError, ProviderOnboardingService,
 };
+use market_squawk_sources::DataUseOperation;
 
 pub use specs::{
     BlsAdapterActivation, FredAdapterActivation, LocalFileAdapterActivation,
     PortfolioAdapterActivation, ProviderAdapterActivationError, ProviderAdapterActivationRequest,
-    ReviewedResearchRights, SecAdapterActivation, TreasuryAdapterActivation,
+    SecAdapterActivation, TreasuryAdapterActivation,
 };
 
 const COINBASE_SURFACE: &str = "coinbase.public-market-data";
@@ -94,7 +95,7 @@ impl ProviderAdapterActivation {
         if cancellation.is_cancelled() {
             return Err(ProviderAdapterActivationError::Cancelled);
         }
-        self.activate_with_lease(lease, request, cancellation)
+        self.activate_with_lease(lease, request, cancellation).await
     }
 
     /// Reconstructs an adapter only from an already-active durable onboarding lease.
@@ -113,10 +114,20 @@ impl ProviderAdapterActivation {
         request: ProviderAdapterActivationRequest,
     ) -> Result<ProviderActivationOutcome, ProviderAdapterActivationError> {
         let lease = self.onboarding.activation_lease(session_id)?;
-        self.activate_with_lease(lease, request, CancellationToken::new())
+        self.restore_with_lease(lease, request)
     }
 
-    fn activate_with_lease(
+    /// Returns whether this process already owns the exact research profile.
+    pub(crate) fn is_research_profile_active(
+        &self,
+        profile: &SourceIdentifier,
+    ) -> Result<bool, ProviderAdapterActivationError> {
+        self.research
+            .is_profile_registered(profile)
+            .map_err(Into::into)
+    }
+
+    async fn activate_with_lease(
         &self,
         lease: ProviderActivationLease,
         request: ProviderAdapterActivationRequest,
@@ -132,15 +143,48 @@ impl ProviderAdapterActivation {
             ProviderAdapterActivationRequest::Sec(spec) => {
                 self.activate_sec(lease, spec).map(Into::into)
             }
-            ProviderAdapterActivationRequest::Bls(spec) => {
-                self.activate_bls(lease, spec, cancellation).map(Into::into)
-            }
+            ProviderAdapterActivationRequest::Bls(spec) => self
+                .activate_bls(lease, spec, cancellation)
+                .await
+                .map(Into::into),
             ProviderAdapterActivationRequest::Treasury(spec) => {
                 self.activate_treasury(lease, spec).map(Into::into)
             }
             ProviderAdapterActivationRequest::Fred(spec) => self
                 .activate_fred(lease, spec, cancellation)
+                .await
                 .map(Into::into),
+            ProviderAdapterActivationRequest::LocalFiles(spec) => {
+                self.activate_local_files(lease, spec).map(Into::into)
+            }
+            ProviderAdapterActivationRequest::Portfolio(spec) => {
+                self.activate_portfolio(lease, spec).map(Into::into)
+            }
+        }
+    }
+
+    fn restore_with_lease(
+        &self,
+        lease: ProviderActivationLease,
+        request: ProviderAdapterActivationRequest,
+    ) -> Result<ProviderActivationOutcome, ProviderAdapterActivationError> {
+        match request {
+            ProviderAdapterActivationRequest::Live(routes) => {
+                self.activate_live(lease, routes).map(Into::into)
+            }
+            ProviderAdapterActivationRequest::Sec(spec) => {
+                self.activate_sec(lease, spec).map(Into::into)
+            }
+            ProviderAdapterActivationRequest::Bls(spec) => {
+                self.restore_bls(lease, spec).map(Into::into)
+            }
+            ProviderAdapterActivationRequest::Treasury(spec) => {
+                self.activate_treasury(lease, spec).map(Into::into)
+            }
+            ProviderAdapterActivationRequest::Fred(_spec) => {
+                require_surface(&lease, FRED_SURFACE)?;
+                Err(ProviderAdapterActivationError::ExplicitResumeRequired)
+            }
             ProviderAdapterActivationRequest::LocalFiles(spec) => {
                 self.activate_local_files(lease, spec).map(Into::into)
             }
@@ -183,7 +227,7 @@ impl ProviderAdapterActivation {
             .get("administrative_email")
             .ok_or(ProviderAdapterActivationError::SurfaceMismatch)?;
         let contact = SecContact::try_new(organization, administrative_email)?;
-        let rights = spec.rights.into_authority(spec.metadata.source_id())?;
+        let rights = provider_research_rights(&lease, spec.metadata.source_id())?;
         let source = SecEdgarSource::try_new(
             spec.metadata,
             contact,
@@ -196,7 +240,7 @@ impl ProviderAdapterActivation {
         self.register(lease, source, rights)
     }
 
-    fn activate_bls(
+    async fn activate_bls(
         &self,
         lease: ProviderActivationLease,
         spec: BlsAdapterActivation,
@@ -205,22 +249,36 @@ impl ProviderAdapterActivation {
         let authorization = match lease.surface_id().as_str() {
             BLS_PUBLIC_SURFACE => BlsAuthorization::PublicV1,
             BLS_REGISTERED_SURFACE => {
-                if cancellation.is_cancelled() {
-                    return Err(ProviderAdapterActivationError::Cancelled);
-                }
                 let secret = self
                     .onboarding
-                    .read_active_secret(&lease, SecretCancellation::new())?;
-                if cancellation.is_cancelled() {
-                    return Err(ProviderAdapterActivationError::Cancelled);
-                }
+                    .read_active_secret_for_request(&lease, cancellation)
+                    .await?;
                 BlsAuthorization::RegisteredV2(BlsRegistrationKey::try_new(
                     secret.expose_secret().to_owned(),
                 )?)
             }
             _ => return Err(ProviderAdapterActivationError::SurfaceMismatch),
         };
-        let rights = spec.rights.into_authority(spec.metadata.source_id())?;
+        let rights = provider_research_rights(&lease, spec.metadata.source_id())?;
+        let config =
+            BlsSourceConfig::try_new(authorization, spec.series, spec.start_year, spec.end_year)?;
+        let source = BlsSource::try_new(spec.metadata, config)?;
+        self.register(lease, source, rights)
+    }
+
+    fn restore_bls(
+        &self,
+        lease: ProviderActivationLease,
+        spec: BlsAdapterActivation,
+    ) -> Result<ActivatedResearchProvider, ProviderAdapterActivationError> {
+        let authorization = match lease.surface_id().as_str() {
+            BLS_PUBLIC_SURFACE => BlsAuthorization::PublicV1,
+            BLS_REGISTERED_SURFACE => {
+                return Err(ProviderAdapterActivationError::ExplicitResumeRequired);
+            }
+            _ => return Err(ProviderAdapterActivationError::SurfaceMismatch),
+        };
+        let rights = provider_research_rights(&lease, spec.metadata.source_id())?;
         let config =
             BlsSourceConfig::try_new(authorization, spec.series, spec.start_year, spec.end_year)?;
         let source = BlsSource::try_new(spec.metadata, config)?;
@@ -245,29 +303,24 @@ impl ProviderAdapterActivation {
         if !matches {
             return Err(ProviderAdapterActivationError::SurfaceMismatch);
         }
-        let rights = spec.rights.into_authority(spec.metadata.source_id())?;
+        let rights = provider_research_rights(&lease, spec.metadata.source_id())?;
         let source = TreasurySource::try_new(spec.metadata, spec.config)?;
         self.register(lease, source, rights)
     }
 
-    fn activate_fred(
+    async fn activate_fred(
         &self,
         lease: ProviderActivationLease,
         spec: FredAdapterActivation,
         cancellation: CancellationToken,
     ) -> Result<ActivatedResearchProvider, ProviderAdapterActivationError> {
         require_surface(&lease, FRED_SURFACE)?;
-        if cancellation.is_cancelled() {
-            return Err(ProviderAdapterActivationError::Cancelled);
-        }
         let secret = self
             .onboarding
-            .read_active_secret(&lease, SecretCancellation::new())?;
-        if cancellation.is_cancelled() {
-            return Err(ProviderAdapterActivationError::Cancelled);
-        }
+            .read_active_secret_for_request(&lease, cancellation)
+            .await?;
         let key = FredApiKey::try_new(secret.expose_secret().to_owned())?;
-        let rights = spec.rights.into_authority(spec.metadata.source_id())?;
+        let rights = provider_research_rights(&lease, spec.metadata.source_id())?;
         let source = FredSource::try_new(spec.metadata, key, spec.policy)?;
         self.register(lease, source, rights)
     }
@@ -420,4 +473,29 @@ fn require_surface(
     } else {
         Err(ProviderAdapterActivationError::SurfaceMismatch)
     }
+}
+
+fn provider_research_rights(
+    lease: &ProviderActivationLease,
+    source_id: &SourceId,
+) -> Result<ResearchRightsAuthority, ProviderAdapterActivationError> {
+    if !lease.admits(DataUseOperation::Persist) {
+        return Err(ProviderAdapterActivationError::InvalidRights);
+    }
+    let evidence = lease
+        .persistence_evidence()
+        .filter(|evidence| !evidence.refresh_required())
+        .ok_or(ProviderAdapterActivationError::InvalidRights)?;
+    let terms_digest = evidence
+        .content_digest()
+        .ok_or(ProviderAdapterActivationError::InvalidRights)?;
+    let basis = RightsBasis::reviewed_terms(evidence.official_url(), terms_digest)
+        .map_err(|_error| ProviderAdapterActivationError::InvalidRights)?;
+    ResearchRightsAuthority::try_new(
+        source_id.clone(),
+        basis,
+        lease.rights_decision_digest(),
+        lease.verification_expires_at(),
+    )
+    .map_err(Into::into)
 }

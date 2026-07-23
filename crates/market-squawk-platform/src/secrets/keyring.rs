@@ -66,6 +66,7 @@ impl SecretStore for OsKeyringSecretStore {
         let capabilities = os_capabilities();
         control.preflight(capabilities)?;
         let _lifecycle = self.lock_lifecycle()?;
+        control.preflight(capabilities)?;
         let probe = SecretKey::try_new("market-squawk", "capability-probe")?;
         match self.entry(&probe)?.get_secret() {
             Ok(mut existing) => existing.zeroize(),
@@ -86,6 +87,7 @@ impl SecretStore for OsKeyringSecretStore {
         let capabilities = os_capabilities();
         control.preflight(capabilities)?;
         let _lifecycle = self.lock_lifecycle()?;
+        control.preflight(capabilities)?;
         let reference = SecretRef::from_key(key, capabilities.backend(), generation)?;
         let entry = self.referenced_entry(&reference)?;
         match entry.get_secret() {
@@ -112,6 +114,7 @@ impl SecretStore for OsKeyringSecretStore {
         let capabilities = os_capabilities();
         control.preflight(capabilities)?;
         let _lifecycle = self.lock_lifecycle()?;
+        control.preflight(capabilities)?;
         let bytes = self
             .referenced_entry(reference)?
             .get_secret()
@@ -132,6 +135,7 @@ impl SecretStore for OsKeyringSecretStore {
         let capabilities = os_capabilities();
         control.preflight(capabilities)?;
         let _lifecycle = self.lock_lifecycle()?;
+        control.preflight(capabilities)?;
         if current.backend() != capabilities.backend()
             || candidate_generation <= current.generation()
             || SecretRef::from_key(key, capabilities.backend(), current.generation())? != *current
@@ -169,6 +173,7 @@ impl SecretStore for OsKeyringSecretStore {
         let capabilities = os_capabilities();
         control.preflight(capabilities)?;
         let _lifecycle = self.lock_lifecycle()?;
+        control.preflight(capabilities)?;
         self.referenced_entry(reference)?
             .delete_credential()
             .map_err(map_keyring_mutation_error)?;

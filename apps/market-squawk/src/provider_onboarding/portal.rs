@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use http_body_util::{BodyExt as _, Full};
 use hyper::body::Incoming;
@@ -15,7 +16,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
-use market_squawk_platform::{SecretCancellation, SecretValue};
+use market_squawk_platform::SecretValue;
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq as _;
 use thiserror::Error;
@@ -25,13 +26,44 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use super::contracts::ProviderProfileView;
+use super::contracts::{
+    ProviderPortalActivationRequest, ProviderPortalActivationView, ProviderProfileView,
+};
 use super::service::{ProviderOnboardingError, ProviderOnboardingService, StartOnboardingRequest};
 
-const MAX_JSON_BODY_BYTES: usize = 2 * 1024;
+const MAX_JSON_BODY_BYTES: usize = 1024 * 1024;
 const MAX_SECRET_BODY_BYTES: usize = 8 * 1024;
 const MAX_PATH_BYTES: usize = 256;
 const SESSION_COOKIE_NAME: &str = "msq_onboarding";
+
+/// Application-owned authority that completes onboarding and registers one durable adapter.
+#[async_trait]
+pub trait ProviderPortalActivationAuthority: Send + Sync {
+    /// Activates the exact session and provider-specific configuration.
+    async fn activate(
+        &self,
+        session_id: Uuid,
+        request: ProviderPortalActivationRequest,
+        cancellation: CancellationToken,
+    ) -> Result<ProviderPortalActivationView, ProviderPortalActivationError>;
+}
+
+/// Closed portal-facing adapter activation failure.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum ProviderPortalActivationError {
+    /// The provider configuration or session/surface pairing is invalid.
+    #[error("provider portal adapter request is invalid")]
+    InvalidRequest,
+    /// Onboarding or adapter activation is not currently admitted.
+    #[error("provider portal adapter activation is unavailable")]
+    Unavailable,
+    /// Durable activation state could not be committed.
+    #[error("provider portal adapter state is unavailable")]
+    StateUnavailable,
+    /// The caller or portal lifecycle cancelled the operation.
+    #[error("provider portal adapter activation was cancelled")]
+    Cancelled,
+}
 
 /// Bounded lifetime and request limits for one portal instance.
 #[derive(Clone, Copy, Debug)]
@@ -93,6 +125,7 @@ impl ProviderOnboardingPortal {
     /// Binds only an ephemeral IPv4 loopback port and starts the bounded server.
     pub async fn start(
         service: Arc<ProviderOnboardingService>,
+        activation: Arc<dyn ProviderPortalActivationAuthority>,
         config: ProviderPortalConfig,
     ) -> Result<Self, ProviderPortalError> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
@@ -110,6 +143,7 @@ impl ProviderOnboardingPortal {
         let task = tokio::spawn(run_server(
             listener,
             service,
+            activation,
             Arc::clone(&security),
             config,
             shutdown.clone(),
@@ -196,6 +230,7 @@ impl fmt::Debug for PortalSecurity {
 async fn run_server(
     listener: TcpListener,
     service: Arc<ProviderOnboardingService>,
+    activation: Arc<dyn ProviderPortalActivationAuthority>,
     security: Arc<PortalSecurity>,
     config: ProviderPortalConfig,
     shutdown: CancellationToken,
@@ -222,6 +257,7 @@ async fn run_server(
                     continue;
                 };
                 let service = Arc::clone(&service);
+                let activation = Arc::clone(&activation);
                 let security = Arc::clone(&security);
                 let requests = Arc::clone(&requests);
                 let connection_shutdown = shutdown.clone();
@@ -230,6 +266,7 @@ async fn run_server(
                     serve_connection(
                         stream,
                         service,
+                        activation,
                         security,
                         requests,
                         config,
@@ -254,6 +291,7 @@ async fn run_server(
 async fn serve_connection(
     stream: TcpStream,
     service: Arc<ProviderOnboardingService>,
+    activation: Arc<dyn ProviderPortalActivationAuthority>,
     security: Arc<PortalSecurity>,
     requests: Arc<AtomicU64>,
     config: ProviderPortalConfig,
@@ -264,6 +302,7 @@ async fn serve_connection(
         handle_request(
             request,
             Arc::clone(&service),
+            Arc::clone(&activation),
             Arc::clone(&security),
             Arc::clone(&requests),
             config,
@@ -289,6 +328,7 @@ async fn serve_connection(
 async fn handle_request(
     request: Request<Incoming>,
     service: Arc<ProviderOnboardingService>,
+    activation: Arc<dyn ProviderPortalActivationAuthority>,
     security: Arc<PortalSecurity>,
     requests: Arc<AtomicU64>,
     config: ProviderPortalConfig,
@@ -304,7 +344,13 @@ async fn handle_request(
     let request_cancellation = cancellation.child_token();
     let response = match tokio::time::timeout(
         config.request_timeout,
-        dispatch(request, service, security, request_cancellation.clone()),
+        dispatch(
+            request,
+            service,
+            activation,
+            security,
+            request_cancellation.clone(),
+        ),
     )
     .await
     {
@@ -321,6 +367,7 @@ async fn handle_request(
 async fn dispatch(
     request: Request<Incoming>,
     service: Arc<ProviderOnboardingService>,
+    activation: Arc<dyn ProviderPortalActivationAuthority>,
     security: Arc<PortalSecurity>,
     cancellation: CancellationToken,
 ) -> Result<Response<Full<Bytes>>, PortalRequestError> {
@@ -374,34 +421,18 @@ async fn dispatch(
                 String::from_utf8(body).map_err(|_| PortalRequestError::InvalidSecretBody)?;
             let secret =
                 SecretValue::new(value).map_err(|_| PortalRequestError::InvalidSecretBody)?;
-            let secret_cancellation = SecretCancellation::new();
-            let cancellation_monitor = secret_cancellation.clone();
-            let combined = cancellation;
-            let monitor = tokio::spawn(async move {
-                combined.cancelled().await;
-                cancellation_monitor.cancel();
-            });
-            let service = Arc::clone(&service);
-            let operation_cancellation = secret_cancellation.clone();
-            let operation = tokio::task::spawn_blocking(move || {
-                service.submit_secret(session_id, secret, operation_cancellation)
-            });
-            let result = operation.await.map_err(|_| PortalRequestError::Internal);
-            monitor.abort();
-            let status = result??;
+            let status = service
+                .submit_secret(session_id, secret, cancellation)
+                .await?;
             return Ok(json_response(StatusCode::OK, &status));
         }
         if method == Method::POST && action == Some("activate") {
             validate_mutation(&request, &security, "application/json")?;
             let body = collect_body(request.into_body(), MAX_JSON_BODY_BYTES).await?;
-            if !body.is_empty() && body != b"{}" {
-                return Err(PortalRequestError::InvalidBody);
-            }
-            let lease = service.activate(session_id, cancellation).await?;
-            return Ok(json_response(
-                StatusCode::OK,
-                &service.resume(lease.session_id())?,
-            ));
+            let input: ProviderPortalActivationRequest =
+                serde_json::from_slice(&body).map_err(|_| PortalRequestError::InvalidBody)?;
+            let activated = activation.activate(session_id, input, cancellation).await?;
+            return Ok(json_response(StatusCode::OK, &activated));
         }
         if method == Method::POST && action == Some("cancel") {
             validate_mutation(&request, &security, "application/json")?;
@@ -625,6 +656,21 @@ fn map_error(error: PortalRequestError) -> Response<Full<Bytes>> {
         | PortalRequestError::Application(ProviderOnboardingError::RightsBlocked) => {
             error_response(StatusCode::CONFLICT, "invalid_session_state")
         }
+        PortalRequestError::Activation(ProviderPortalActivationError::InvalidRequest) => {
+            error_response(StatusCode::BAD_REQUEST, "invalid_adapter_request")
+        }
+        PortalRequestError::Activation(ProviderPortalActivationError::Unavailable) => {
+            error_response(StatusCode::CONFLICT, "adapter_activation_unavailable")
+        }
+        PortalRequestError::Activation(ProviderPortalActivationError::Cancelled) => {
+            error_response(StatusCode::REQUEST_TIMEOUT, "operation_cancelled")
+        }
+        PortalRequestError::Activation(ProviderPortalActivationError::StateUnavailable) => {
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "activation_state_unavailable",
+            )
+        }
         PortalRequestError::Application(_) | PortalRequestError::Internal => {
             error_response(StatusCode::SERVICE_UNAVAILABLE, "operation_unavailable")
         }
@@ -684,6 +730,8 @@ enum PortalRequestError {
     Internal,
     #[error(transparent)]
     Application(#[from] ProviderOnboardingError),
+    #[error(transparent)]
+    Activation(#[from] ProviderPortalActivationError),
 }
 
 /// Portal lifecycle failure.
@@ -733,79 +781,127 @@ async function mutate(path, body, type) {
   });
   const result = await response.json();
   document.getElementById('status').textContent = JSON.stringify(result, null, 2);
+  if (!response.ok) throw new Error(result.error || 'operation_failed');
   return result;
 }
-async function start(profile, organization, email) {
+function input(type, placeholder, maximum) {
+  const node = document.createElement('input');
+  node.type = type;
+  node.placeholder = placeholder;
+  node.required = true;
+  if (maximum) node.maxLength = maximum;
+  return node;
+}
+function requiredValue(node) {
+  if (!node.reportValidity()) throw new Error('invalid_input');
+  return node.value;
+}
+function dateValue(node) {
+  const parts = requiredValue(node).split('-').map(Number);
+  return {year: parts[0], month: parts[1], day: parts[2]};
+}
+function blsConfiguration(section) {
+  const start = input('number', 'Start year');
+  const end = input('number', 'End year');
+  start.min = '1913'; start.max = '9999';
+  end.min = '1913'; end.max = '9999';
+  const rows = document.createElement('div');
+  const add = document.createElement('button');
+  add.type = 'button'; add.textContent = 'Add BLS series';
+  const seriesRows = [];
+  function addSeries() {
+    const row = document.createElement('fieldset');
+    const fields = [
+      input('text', 'Series ID', 50), input('text', 'Verified title', 512),
+      input('text', 'Unit', 128), input('text', 'Frequency', 128),
+      input('text', 'Seasonal adjustment', 128), input('text', 'Measure', 128)
+    ];
+    row.append(...fields); rows.append(row); seriesRows.push(fields);
+  }
+  add.addEventListener('click', addSeries); addSeries();
+  section.append(start, end, rows, add);
+  return () => ({
+    kind: 'bls', start_year: Number(requiredValue(start)), end_year: Number(requiredValue(end)),
+    series: seriesRows.map(fields => ({
+      series_id: requiredValue(fields[0]), title: requiredValue(fields[1]),
+      unit: requiredValue(fields[2]), frequency: requiredValue(fields[3]),
+      seasonal_adjustment: requiredValue(fields[4]), measure: requiredValue(fields[5])
+    }))
+  });
+}
+function configuration(profile, section) {
+  if (profile.id === 'sec.edgar-public') return () => ({kind: 'sec'});
+  if (profile.id === 'bls.v1-unregistered' || profile.id === 'bls.v2-registered') {
+    return blsConfiguration(section);
+  }
+  if (profile.id === 'treasury.fiscal-data') {
+    const first = input('date', 'First record date');
+    const last = input('date', 'Last record date');
+    const page = input('number', 'Page size');
+    page.min = '1'; page.max = '10000'; page.value = '1000';
+    section.append(first, last, page);
+    return () => ({kind: 'treasury_fiscal', first_record_date: dateValue(first),
+      last_record_date: dateValue(last), page_size: Number(requiredValue(page))});
+  }
+  return null;
+}
+async function activate(session, adapterRequest) {
+  return mutate('/api/v1/sessions/' + session.session_id + '/activate',
+    JSON.stringify(adapterRequest), 'application/json');
+}
+async function start(profile, organization, email, adapterRequest) {
   if (profile.credential_requirement === 'required_provider_controlled' ||
       profile.account_requirement === 'required_provider_controlled') {
     window.open(profile.official_handoff_url, '_blank', 'noopener,noreferrer');
   }
   const request = {surface_id: profile.id};
   if (profile.administrative_contact_requirement === 'required_non_secret') {
-    request.organization = organization.value;
-    request.administrative_email = email.value;
+    request.organization = requiredValue(organization);
+    request.administrative_email = requiredValue(email);
   }
   const session = await mutate('/api/v1/sessions', JSON.stringify(request), 'application/json');
-  if (session.next_action === 'import_secret') {
-    const status = document.getElementById('status');
-    status.textContent = '';
-    const input = document.createElement('input');
-    input.type = 'password';
-    input.autocomplete = 'off';
-    input.setAttribute('aria-label', 'Provider-created key');
-    const submit = document.createElement('button');
-    submit.textContent = 'Import key into local secure store';
-    submit.addEventListener('click', async () => {
-      const value = input.value;
-      input.value = '';
-      input.remove();
-      submit.remove();
-      if (value) {
-        const stored = await mutate('/api/v1/sessions/' + session.session_id + '/secret', value, 'application/octet-stream');
-        if (stored.next_action === 'verify_and_activate') {
-          await mutate('/api/v1/sessions/' + session.session_id + '/activate', '{}', 'application/json');
-        }
-      }
-    });
-    status.before(input, submit);
-  }
+  if (session.next_action === 'active') return activate(session, adapterRequest);
+  if (session.next_action !== 'import_secret') return session;
+  const status = document.getElementById('status');
+  status.textContent = '';
+  const secret = input('password', 'Provider-created key', 8192);
+  secret.autocomplete = 'off';
+  const submit = document.createElement('button');
+  submit.textContent = 'Import key and activate adapter';
+  submit.addEventListener('click', async () => {
+    const value = requiredValue(secret);
+    secret.value = ''; secret.remove(); submit.remove();
+    const stored = await mutate('/api/v1/sessions/' + session.session_id + '/secret',
+      value, 'application/octet-stream');
+    if (stored.next_action === 'verify_and_activate') await activate(session, adapterRequest);
+  });
+  status.before(secret, submit);
 }
 fetch('/api/v1/bootstrap').then(response => response.json()).then(data => {
   csrf = data.csrf_token;
-  const root = document.getElementById('profiles');
-  root.textContent = '';
+  const root = document.getElementById('profiles'); root.textContent = '';
   for (const profile of data.profiles) {
     const section = document.createElement('section');
-    const title = document.createElement('h2');
-    title.textContent = profile.display_name;
+    const title = document.createElement('h2'); title.textContent = profile.display_name;
     const detail = document.createElement('p');
     detail.textContent = profile.handoff_instruction + ' Release: ' + profile.release_state + '.';
-    const link = document.createElement('a');
-    link.href = profile.official_handoff_url;
-    link.target = '_blank';
-    link.rel = 'noopener noreferrer';
-    link.textContent = 'Official provider page';
-    const button = document.createElement('button');
-    button.textContent = 'Start setup';
-    const organization = document.createElement('input');
-    organization.type = 'text';
-    organization.autocomplete = 'organization';
-    organization.placeholder = 'Organization';
-    organization.maxLength = 128;
-    const email = document.createElement('input');
-    email.type = 'email';
-    email.autocomplete = 'email';
-    email.placeholder = 'Administrative email';
-    email.maxLength = 128;
+    const link = document.createElement('a'); link.href = profile.official_handoff_url;
+    link.target = '_blank'; link.rel = 'noopener noreferrer'; link.textContent = 'Official provider page';
+    const organization = input('text', 'Organization', 128); organization.autocomplete = 'organization';
+    const email = input('email', 'Administrative email', 128); email.autocomplete = 'email';
     if (profile.administrative_contact_requirement !== 'required_non_secret') {
-      organization.hidden = true;
-      email.hidden = true;
-    } else {
-      organization.required = true;
-      email.required = true;
+      organization.hidden = true; email.hidden = true; organization.required = false; email.required = false;
     }
-    button.addEventListener('click', () => start(profile, organization, email));
-    section.append(title, detail, link, document.createTextNode(' '), organization, email, button);
-    root.append(section);
+    section.append(title, detail, link, document.createTextNode(' '), organization, email);
+    const buildConfiguration = configuration(profile, section);
+    const button = document.createElement('button'); button.textContent = 'Activate provider adapter';
+    button.disabled = profile.release_state !== 'available' || buildConfiguration === null;
+    button.addEventListener('click', () => {
+      try { start(profile, organization, email, buildConfiguration()).catch(error => {
+        document.getElementById('status').textContent = String(error);
+      }); }
+      catch (error) { document.getElementById('status').textContent = String(error); }
+    });
+    section.append(button); root.append(section);
   }
 }).catch(() => { document.getElementById('profiles').textContent = 'Portal bootstrap unavailable.'; });"#;

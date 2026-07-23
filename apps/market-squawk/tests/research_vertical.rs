@@ -2,16 +2,33 @@ use std::error::Error;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use market_squawk::{
-    ProviderOnboardingPortal, ProviderOnboardingService, ProviderPortalConfig,
-    ProviderProfileRegistrationOutcome, ResearchService, ResearchServiceError,
-    StartOnboardingRequest,
+    ProviderOnboardingPortal, ProviderOnboardingService, ProviderPortalActivationAuthority,
+    ProviderPortalActivationError, ProviderPortalActivationRequest, ProviderPortalActivationView,
+    ProviderPortalConfig, ProviderProfileRegistrationOutcome, ResearchService,
+    ResearchServiceError, StartOnboardingRequest,
 };
 use market_squawk_data::{CatalogConfig, CatalogLimit, CatalogResultLimits, ObjectStoreConfig};
 use market_squawk_platform::{EncryptedFileSecretStore, LocalPaths, SecretValue};
 use reqwest::header::{CONTENT_TYPE, COOKIE, ORIGIN, SET_COOKIE};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+
+#[derive(Debug)]
+struct UnusedAdapterActivation;
+
+#[async_trait]
+impl ProviderPortalActivationAuthority for UnusedAdapterActivation {
+    async fn activate(
+        &self,
+        _session_id: Uuid,
+        _request: ProviderPortalActivationRequest,
+        _cancellation: CancellationToken,
+    ) -> Result<ProviderPortalActivationView, ProviderPortalActivationError> {
+        Err(ProviderPortalActivationError::Unavailable)
+    }
+}
 
 #[test]
 fn research_service_reopens_the_exact_local_catalog_and_artifact_authority()
@@ -66,9 +83,12 @@ async fn provider_portal_rejects_csrf_and_keeps_imported_secrets_write_only()
     )?);
     let registered = service.register_profile("bls.v2-registered")?;
     let replayed = service.register_profile("bls.v2-registered")?;
-    let portal =
-        ProviderOnboardingPortal::start(Arc::clone(&service), ProviderPortalConfig::default())
-            .await?;
+    let portal = ProviderOnboardingPortal::start(
+        Arc::clone(&service),
+        Arc::new(UnusedAdapterActivation),
+        ProviderPortalConfig::default(),
+    )
+    .await?;
     let base_url = portal.base_url().to_owned();
     let client = reqwest::Client::new();
     let bootstrap_response = client

@@ -6,6 +6,27 @@ use super::*;
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 #[test]
+fn available_persistence_is_bound_to_exact_current_evidence() -> TestResult {
+    for profile in built_in_provider_profiles()?.iter() {
+        let persists = profile.rights().0.iter().any(|right| {
+            right.operation() == DataUseOperation::Persist
+                && right.admission() == OperationAdmission::Admitted
+        });
+        if profile.release_state() == ProfileReleaseState::Available && persists {
+            let evidence = profile
+                .persistence_evidence()
+                .ok_or("available persistence has no selected evidence")?;
+            assert!(evidence.content_digest().is_some());
+            assert!(!evidence.refresh_required());
+            if profile.id() == "treasury.fiscal-data" {
+                assert_eq!(evidence.source_id(), "DOC-031");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn capabilities_only_narrow_and_lifecycle_requires_exact_generation_authority() -> TestResult {
     let capability_v1 = capability(1)?;
     let mut registry = ProviderCapabilityRegistry::new();

@@ -11,5 +11,5 @@ pub use client::{BlsAuthorization, BlsRegistrationKey, BlsSourceError};
 pub use observations::{
     BlsFootnote, BlsObservation, BlsParseError, BlsResponse, BlsSeries, BlsVintageCapability,
 };
-pub use series_metadata::BlsSeriesMetadata;
+pub use series_metadata::{BlsSeriesMetadata, BlsSeriesMetadataInput};
 pub use source::{BlsNormalizedPage, BlsSource, BlsSourceConfig, BlsSourceHealth};

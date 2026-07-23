@@ -9,70 +9,14 @@ use market_squawk_adapter_fred::FredRightsPolicy;
 use market_squawk_adapter_portfolio::PortfolioImportLimits;
 use market_squawk_adapter_sec::{RawEvidenceStore, SecParserLimits, SecRepresentationRegistry};
 use market_squawk_adapter_treasury::TreasurySourceConfig;
-use market_squawk_data::RightsBasis;
-use market_squawk_domain::{EvidenceDigest, ProviderIdentityRegistry, SourceId};
+use market_squawk_domain::ProviderIdentityRegistry;
 use market_squawk_platform::{
     BoundedInput, LocalAuthorityStateStore, SecretReference, UserAuthorizedInputRoot,
     UserOwnedInputEvidence,
 };
 use market_squawk_sources::SourceMetadata;
 
-use crate::application::{ResearchIngestCompositionError, ResearchRightsAuthority};
-
-/// Exact persistence-rights evidence supplied independently of provider runtime verification.
-#[derive(Clone, Debug)]
-pub struct ReviewedResearchRights {
-    source_id: SourceId,
-    basis: RightsBasis,
-    authorization_evidence: EvidenceDigest,
-    authorization_expires_at: Option<market_squawk_domain::Timestamp>,
-}
-
-impl ReviewedResearchRights {
-    /// Binds one exact source to retained reviewed-terms and authorization evidence.
-    ///
-    /// # Errors
-    ///
-    /// Rejects malformed terms references, zero evidence, or mismatched source authority.
-    pub fn try_new(
-        source_id: SourceId,
-        terms_url: impl Into<String>,
-        terms_digest: EvidenceDigest,
-        authorization_evidence: EvidenceDigest,
-        authorization_expires_at: Option<market_squawk_domain::Timestamp>,
-    ) -> Result<Self, ProviderAdapterActivationError> {
-        let basis = RightsBasis::reviewed_terms(terms_url, terms_digest)
-            .map_err(|_| ProviderAdapterActivationError::InvalidRights)?;
-        ResearchRightsAuthority::try_new(
-            source_id.clone(),
-            basis.clone(),
-            authorization_evidence,
-            authorization_expires_at,
-        )?;
-        Ok(Self {
-            source_id,
-            basis,
-            authorization_evidence,
-            authorization_expires_at,
-        })
-    }
-
-    pub(super) fn into_authority(
-        self,
-        expected: &SourceId,
-    ) -> Result<ResearchRightsAuthority, ProviderAdapterActivationError> {
-        if &self.source_id != expected {
-            return Err(ProviderAdapterActivationError::SourceBinding);
-        }
-        ResearchRightsAuthority::try_new(
-            self.source_id,
-            self.basis,
-            self.authorization_evidence,
-            self.authorization_expires_at,
-        )
-        .map_err(Into::into)
-    }
-}
+use crate::application::ResearchIngestCompositionError;
 
 /// SEC adapter construction inputs whose filesystem authority is already capability-confined.
 pub struct SecAdapterActivation {
@@ -81,7 +25,6 @@ pub struct SecAdapterActivation {
     pub(super) representations: SecRepresentationRegistry,
     pub(super) identities: ProviderIdentityRegistry,
     pub(super) parser_limits: SecParserLimits,
-    pub(super) rights: ReviewedResearchRights,
 }
 
 impl SecAdapterActivation {
@@ -93,7 +36,6 @@ impl SecAdapterActivation {
         representations: SecRepresentationRegistry,
         identities: ProviderIdentityRegistry,
         parser_limits: SecParserLimits,
-        rights: ReviewedResearchRights,
     ) -> Self {
         Self {
             metadata,
@@ -101,7 +43,6 @@ impl SecAdapterActivation {
             representations,
             identities,
             parser_limits,
-            rights,
         }
     }
 }
@@ -124,7 +65,6 @@ pub struct BlsAdapterActivation {
     pub(super) series: Vec<BlsSeriesMetadata>,
     pub(super) start_year: u16,
     pub(super) end_year: u16,
-    pub(super) rights: ReviewedResearchRights,
 }
 
 impl BlsAdapterActivation {
@@ -135,14 +75,12 @@ impl BlsAdapterActivation {
         series: Vec<BlsSeriesMetadata>,
         start_year: u16,
         end_year: u16,
-        rights: ReviewedResearchRights,
     ) -> Self {
         Self {
             metadata,
             series,
             start_year,
             end_year,
-            rights,
         }
     }
 }
@@ -152,22 +90,13 @@ impl BlsAdapterActivation {
 pub struct TreasuryAdapterActivation {
     pub(super) metadata: SourceMetadata,
     pub(super) config: TreasurySourceConfig,
-    pub(super) rights: ReviewedResearchRights,
 }
 
 impl TreasuryAdapterActivation {
     /// Retains exact provider configuration, metadata, and persistence-rights evidence.
     #[must_use]
-    pub fn new(
-        metadata: SourceMetadata,
-        config: TreasurySourceConfig,
-        rights: ReviewedResearchRights,
-    ) -> Self {
-        Self {
-            metadata,
-            config,
-            rights,
-        }
+    pub fn new(metadata: SourceMetadata, config: TreasurySourceConfig) -> Self {
+        Self { metadata, config }
     }
 }
 
@@ -176,22 +105,13 @@ impl TreasuryAdapterActivation {
 pub struct FredAdapterActivation {
     pub(super) metadata: SourceMetadata,
     pub(super) policy: FredRightsPolicy,
-    pub(super) rights: ReviewedResearchRights,
 }
 
 impl FredAdapterActivation {
     /// Retains the exact per-series policy, metadata, and independent persistence evidence.
     #[must_use]
-    pub fn new(
-        metadata: SourceMetadata,
-        policy: FredRightsPolicy,
-        rights: ReviewedResearchRights,
-    ) -> Self {
-        Self {
-            metadata,
-            policy,
-            rights,
-        }
+    pub fn new(metadata: SourceMetadata, policy: FredRightsPolicy) -> Self {
+        Self { metadata, policy }
     }
 }
 
@@ -335,6 +255,9 @@ pub enum ProviderAdapterActivationError {
     /// The caller cancelled before a synchronous construction boundary.
     #[error("provider activation was cancelled")]
     Cancelled,
+    /// A platform-managed credential may be read only from an explicit foreground request.
+    #[error("provider activation requires explicit foreground credential resume")]
+    ExplicitResumeRequired,
     /// Provider onboarding has not produced an active immutable lease.
     #[error(transparent)]
     Onboarding(#[from] crate::ProviderOnboardingError),

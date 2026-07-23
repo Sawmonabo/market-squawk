@@ -337,6 +337,7 @@ pub(super) fn map_onboarding_error(error: ProviderOnboardingError) -> ServiceErr
         }
         ProviderOnboardingError::RightsBlocked => ServiceError::Unauthorized,
         ProviderOnboardingError::SecretVerificationFailed
+        | ProviderOnboardingError::SecretOperationUnavailable
         | ProviderOnboardingError::InvalidSessionState
         | ProviderOnboardingError::ClientConfiguration
         | ProviderOnboardingError::ProbeUnavailable

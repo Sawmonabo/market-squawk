@@ -70,12 +70,13 @@ pub use provider_activation::{
     ActivatedResearchProvider, BlsAdapterActivation, FredAdapterActivation, LiveProviderActivation,
     LocalFileAdapterActivation, PortfolioAdapterActivation, ProviderActivationOutcome,
     ProviderAdapterActivation, ProviderAdapterActivationError, ProviderAdapterActivationRequest,
-    ReviewedResearchRights, SecAdapterActivation, TreasuryAdapterActivation,
+    SecAdapterActivation, TreasuryAdapterActivation,
 };
 pub use provider_onboarding::{
     OnboardingNextAction, OnboardingSessionView, ProviderActivationLease, ProviderOnboardingError,
-    ProviderOnboardingPortal, ProviderOnboardingService, ProviderPortalConfig, ProviderPortalError,
-    ProviderProfileRegistration, ProviderProfileRegistrationOutcome, ProviderProfileView,
-    StartOnboardingRequest,
+    ProviderOnboardingPortal, ProviderOnboardingService, ProviderPortalActivationAuthority,
+    ProviderPortalActivationError, ProviderPortalActivationRequest, ProviderPortalActivationView,
+    ProviderPortalConfig, ProviderPortalError, ProviderProfileRegistration,
+    ProviderProfileRegistrationOutcome, ProviderProfileView, StartOnboardingRequest,
 };
 pub use research_service::{ResearchIngestRequest, ResearchService, ResearchServiceError};

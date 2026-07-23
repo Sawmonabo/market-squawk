@@ -51,6 +51,9 @@ decisions can be audited without relying on conversation history.
 - [Zero-fee provider onboarding and local secret activation](2026-07-22-zero-fee-provider-onboarding/final-report.md)
   — capability-gated provider setup, human authorization boundaries, rights admission, credential
   lifecycle, 24 implementation acceptance criteria, and the complete source/evidence package.
+- [Provider activation evidence validation](2026-07-23-provider-activation-evidence-validation.md)
+  — independently audited provider decisions, exact artifact bindings, reconciled probe lineage,
+  source links, and the activation/restart authority consequences implemented on 2026-07-23.
 
 ## Provider decisions
 

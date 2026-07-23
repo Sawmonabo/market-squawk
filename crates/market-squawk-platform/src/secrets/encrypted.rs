@@ -286,6 +286,7 @@ impl SecretStore for EncryptedFileSecretStore {
             .unlocks
             .lock()
             .map_err(|_| LocalSecretStoreError::WriterUnavailable)?;
+        control.preflight(capabilities)?;
         if unlocks.candidate.is_some() {
             return Err(LocalSecretStoreError::RotationRecoveryRequired);
         }
@@ -308,6 +309,7 @@ impl SecretStore for EncryptedFileSecretStore {
             .unlocks
             .lock()
             .map_err(|_| LocalSecretStoreError::WriterUnavailable)?;
+        control.preflight(capabilities)?;
         if unlocks.candidate.is_some() {
             return Err(LocalSecretStoreError::RotationRecoveryRequired);
         }
@@ -340,6 +342,7 @@ impl SecretStore for EncryptedFileSecretStore {
             .unlocks
             .lock()
             .map_err(|_| LocalSecretStoreError::WriterUnavailable)?;
+        control.preflight(capabilities)?;
         if unlocks.candidate.is_some() {
             return Err(LocalSecretStoreError::RotationRecoveryRequired);
         }
@@ -372,6 +375,7 @@ impl SecretStore for EncryptedFileSecretStore {
             .unlocks
             .lock()
             .map_err(|_| LocalSecretStoreError::WriterUnavailable)?;
+        control.preflight(capabilities)?;
         if unlocks.candidate.is_some() {
             return Err(LocalSecretStoreError::RotationRecoveryRequired);
         }
@@ -405,6 +409,7 @@ impl SecretStore for EncryptedFileSecretStore {
             .unlocks
             .lock()
             .map_err(|_| LocalSecretStoreError::WriterUnavailable)?;
+        control.preflight(capabilities)?;
         if unlocks.candidate.is_some() {
             return Err(LocalSecretStoreError::RotationRecoveryRequired);
         }

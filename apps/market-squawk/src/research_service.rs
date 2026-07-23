@@ -94,14 +94,14 @@ impl ResearchService {
     pub fn open_or_initialize(
         paths: &LocalPaths,
         catalog: CatalogConfig,
-        max_generations: usize,
+        max_objects_per_generation: usize,
         objects: ObjectStoreConfig,
     ) -> Result<Self, ResearchServiceError> {
-        match Self::open(paths, catalog.clone(), max_generations, objects) {
+        match Self::open(paths, catalog.clone(), max_objects_per_generation, objects) {
             Ok(service) => Ok(service),
             Err(ResearchServiceError::Ingest(IngestError::Catalog(
                 market_squawk_data::CatalogError::ArtifactRootAuthorityInitializationRequired,
-            ))) => Self::initialize(paths, catalog, max_generations, objects),
+            ))) => Self::initialize(paths, catalog, max_objects_per_generation, objects),
             Err(error) => Err(error),
         }
     }
@@ -110,11 +110,12 @@ impl ResearchService {
     pub fn initialize(
         paths: &LocalPaths,
         catalog: CatalogConfig,
-        max_generations: usize,
+        max_objects_per_generation: usize,
         objects: ObjectStoreConfig,
     ) -> Result<Self, ResearchServiceError> {
         let authority = CatalogAuthority::open(catalog)?;
-        let manifests = AnalyticalManifestCatalog::open(paths.catalog()?, max_generations)?;
+        let manifests =
+            AnalyticalManifestCatalog::open(paths.catalog()?, max_objects_per_generation)?;
         let analytical = AnalyticalDataService::initialize(
             authority,
             manifests,
@@ -128,11 +129,12 @@ impl ResearchService {
     pub fn open(
         paths: &LocalPaths,
         catalog: CatalogConfig,
-        max_generations: usize,
+        max_objects_per_generation: usize,
         objects: ObjectStoreConfig,
     ) -> Result<Self, ResearchServiceError> {
         let authority = CatalogAuthority::open(catalog)?;
-        let manifests = AnalyticalManifestCatalog::open(paths.catalog()?, max_generations)?;
+        let manifests =
+            AnalyticalManifestCatalog::open(paths.catalog()?, max_objects_per_generation)?;
         let analytical =
             AnalyticalDataService::open(authority, manifests, paths.artifacts()?.clone(), objects)?;
         Ok(Self { analytical })

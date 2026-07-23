@@ -1,6 +1,7 @@
 //! Durable, exact retained-root ownership and first-bind recovery.
 
 use std::collections::BTreeSet;
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
@@ -604,8 +605,9 @@ impl PreparedRootAuthority {
 fn require_only_legacy_control_files(directory: &Dir) -> Result<(), ParquetStoreError> {
     for entry in directory.entries()? {
         let entry = entry?;
+        let name = entry.file_name();
         if !matches!(
-            entry.file_name().to_str(),
+            name.to_str(),
             Some(
                 ROOT_AUTHORITY_LOCK
                     | ROOT_IDENTITY_MARKER
@@ -614,7 +616,8 @@ fn require_only_legacy_control_files(directory: &Dir) -> Result<(), ParquetStore
                     | "staging"
                     | "quarantine"
             )
-        ) {
+        ) && !is_safe_shared_artifact_namespace(directory, &name)?
+        {
             return Err(ParquetStoreError::RootCatalogMismatch);
         }
     }
@@ -781,6 +784,9 @@ fn require_only_expected_v2_control_files(
                 == crate::authority_transition::AuthorityTransitionKind::LegacyMigration
                 && data_namespace)
             && !restored_data
+            && !(prepared.kind()
+                == crate::authority_transition::AuthorityTransitionKind::LegacyMigration
+                && is_safe_shared_artifact_namespace(directory, &name)?)
         {
             return Err(ParquetStoreError::RootCatalogMismatch);
         }
@@ -809,11 +815,41 @@ fn require_only_committed_v2_control_files(
             && name != "staging"
             && name != "quarantine"
             && !legacy_control
+            && !is_safe_shared_artifact_namespace(directory, &name)?
         {
             return Err(ParquetStoreError::RootCatalogMismatch);
         }
     }
     Ok(())
+}
+
+fn is_safe_shared_artifact_namespace(
+    directory: &Dir,
+    name: &OsStr,
+) -> Result<bool, ParquetStoreError> {
+    use cap_fs_ext::MetadataExt as _;
+
+    let Some(name_text) = name.to_str() else {
+        return Ok(false);
+    };
+    if name_text.is_empty()
+        || name_text.len() > 255
+        || name_text.starts_with('.')
+        || name_text.chars().any(char::is_control)
+    {
+        return Ok(false);
+    }
+    let metadata = directory.symlink_metadata(name)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Ok(false);
+    }
+    let opened = match directory.open_dir_nofollow(name) {
+        Ok(opened) => opened,
+        Err(_) => return Ok(false),
+    };
+    let opened_metadata = opened.dir_metadata()?;
+    Ok(opened_metadata.is_dir()
+        && (metadata.dev(), metadata.ino()) == (opened_metadata.dev(), opened_metadata.ino()))
 }
 
 #[allow(
