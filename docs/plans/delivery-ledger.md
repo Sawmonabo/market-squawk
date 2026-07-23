@@ -14,14 +14,17 @@ evidence; it does not replace the README capability truth or the canonical relea
   moving release-branch head.
 - Current exact integration head: obtain it from `git rev-parse HEAD` and pull request `#26`.
   Tracked prose does not self-pin the commit that contains that prose.
-- Quarter 3 status: accepted at frozen code/status candidate `053f5e2`. The earlier grouped reviews
-  accepted Tasks 13–15, Task 18, backtest authority, and the cross-plane boundaries, while rejecting
-  substantiated portfolio and backtest gaps. Each accepted remediation was integrated unchanged and
-  freshly verified. The corrected Quarter 3 portfolio and cross-plane reviews of `053f5e2` reported
-  no Critical, Important, or Minor finding. The proposed coupling of a pure cohort plan to one
-  inventory's configured trial limit remains rejected as a layering regression. The sole remaining
-  Quarter 3 closeout barrier is one clean nonincremental full release gate; no rejected candidate
-  received that gate.
+- Quarter 3 status: terminally accepted at exact pushed head
+  `c6f0124c2b27c4777947de8c42b6a5f97868aaf5`. The earlier grouped reviews accepted Tasks 13–15,
+  Task 18, backtest authority, and the cross-plane boundaries while rejecting substantiated
+  portfolio and backtest gaps. Each accepted remediation was integrated unchanged and freshly
+  verified. The corrected portfolio and cross-plane reviews reported no Critical, Important, or
+  Minor finding. The final exact-head review then found a stale sealed Python source authority,
+  rejected the intermediate head, and accepted `c6f0124` only after the 370-file authority was
+  reconciled and the existing release-builder harness was made to exercise production source
+  admission. The exact-head nonincremental full release gate passed, and issues `#20`, `#21`, and
+  `#22` plus their Project 5 items are closed/Done. The proposed coupling of a pure cohort plan to
+  one inventory's configured trial limit remains rejected as a layering regression.
 - Task 14 accepted feature and fast-forwarded release head: `02ab5cd`
 - Task 18 release merge head: `051ee3c`; reconciled lock head: `5c34b7d`
 - Task 13 accepted feature and release head: `59ba05c`
@@ -51,8 +54,8 @@ evidence; it does not replace the README capability truth or the canonical relea
   Clippy, workspace boundaries, formatting, and diff checks passed. Independent review rejected
   three material implementation defects and two audit-consumer/wire ripples; each was fixed, and the
   final exact-head re-review reported no remaining Critical or Important finding.
-- Task 16 owner: GitHub issue `#21`, Project 5, status `In Progress`; the issue was reopened after
-  the exact-head Quarter 3 review found three incomplete Task 16 authority/bounds contracts.
+- Task 16 owner: GitHub issue `#21`, Project 5, status `Done` after the accepted remediation and
+  terminal Quarter 3 gate.
 - Delivered through Steps 1–5 at accepted head `e124722`: source-evidenced normalized portfolio
   transactions, immutable revisions, long/short lots, FIFO/specific identification, cash flows,
   exact gains, explicit incomplete-basis measurements, authoritative corporate-action snapshots,
@@ -120,15 +123,15 @@ evidence; it does not replace the README capability truth or the canonical relea
   `2b8576c3e6f219f34d958c863e08cf2b68599306faa2668ba8cf348f705e1b1c`, wheelhouse/source lock
   `92657a32099c7b309e9b73b674ae1ecee26f8c70d71e69e1a72f225a5e510f9a`, and sealed build
   environment `d0a9479dae9eb8024e5a4c6bfb1e5fa606a03e0858530ca3a1622b2580379931`.
-- Task 15 owner: GitHub issue `#20`, Project 5, status `In Progress` until the Quarter 3 checkpoint
-  closes. The integrated implementation provides the required self-contained tract ONNX backend,
+- Task 15 owner: GitHub issue `#20`, Project 5, status `Done`. The integrated implementation
+  provides the required self-contained tract ONNX backend,
   bounded helper-process/resource/deadline contracts, exact graph and warm-up admission, and
   no-action failure. The optional operator-supplied ONNX Runtime path is Linux-only, descriptor-
   verified, sealed in immutable memory, and parity-checked. Cleanup ownership is reserved before
   spawn, post-spawn waits and joins are asynchronous and bounded, and uncertain helper termination
   denies optional tract fallback.
-- Task 17 owner: GitHub issue `#22`, Project 5, status `In Progress` until the Quarter 3 checkpoint
-  closes. The integrated application-owned PIT backtesting service binds exact dataset partitions,
+- Task 17 owner: GitHub issue `#22`, Project 5, status `Done`. The integrated application-owned PIT
+  backtesting service binds exact dataset partitions,
   executable/model/configuration identities, research execution assumptions, reconciled portfolio
   accounting, immutable success/failure terminals, artifacts, cohorts and overfitting diagnostics.
   Recovery rejects conflicting attempt-terminal namespaces, parses untrusted cohort collections
@@ -140,9 +143,10 @@ evidence; it does not replace the README capability truth or the canonical relea
   minting, public backtest admission, strategy-visible revisions, and exact receipt coverage.
   Independent task review approved the final lane with no remaining finding. Fresh integrated
   gates passed catalog 3/3, backtesting 12/12, and the filtered application vertical 1/1.
-- The next barrier is one clean `CARGO_INCREMENTAL=0 ./scripts/verify.sh` release gate after removing
-  the generated root target. Tasks 15–17 remain open until that gate passes; focused evidence and
-  checkpoint acceptance do not substitute for it.
+- Quarter 3 closed only after `CARGO_INCREMENTAL=0 ./scripts/verify.sh` passed at exact pushed head
+  `c6f0124`. Quarter 4 is now the active delivery quarter: Tasks 19 and 19A, followed by Task 20.
+  Open prerequisite issues `#7`, `#9`, `#10`, and `#11` must be reconciled through those product
+  slices or explicitly closed with exact evidence; they cannot be ignored at release closeout.
 
 - Task 12 owner: GitHub issue `#17`, Project 5, status `Done`.
 - Exact feature and fast-forwarded release code head: `9702556`.
@@ -193,7 +197,26 @@ evidence; it does not replace the README capability truth or the canonical relea
 
 ## Verification evidence
 
-The authoritative full gate ran at exact pushed head
+The Quarter 3 terminal full gate ran at exact pushed head
+`c6f0124c2b27c4777947de8c42b6a5f97868aaf5`:
+
+```text
+CARGO_INCREMENTAL=0 ./scripts/verify.sh
+exit: 0
+Python checks: 103 passed
+sealed Python source authority: 370 of 370 paths admitted
+final target footprint: 15,131,260 KiB
+hard ceiling: 20 GiB
+```
+
+The gate passed dependency policy, vulnerability and credential/history scans, formatting, both
+workspace Clippy modes, complete locked all-feature tests, explicit UI/Trybuild checks, Loom models,
+the locked all-feature release build, rustdoc and compiler-derived contract inventory, offline
+product smoke, and stdio MCP smoke. The final narrow reviewer independently compared every sealed
+source size and SHA-256 to the exact Git blobs and accepted the pushed head with no Critical,
+Important, or Minor finding. Authorized external-network tests remained explicitly opt-in.
+
+The prior development/test-hardening full gate ran at exact pushed head
 `2d39b0a34eb818f817973210148355c88f8f4b52`:
 
 ```text
@@ -228,6 +251,10 @@ application size.
 
 ## Cleanup state
 
+- After the terminal Quarter 3 gate, recorded the 15,131,260 KiB peak and removed 36,502 generated
+  files/14.3 GiB with `cargo clean`. The root target is absent, about 125 GiB is free, only the
+  release worktree remains, local and origin release heads match, and issues `#20`, `#21`, and `#22`
+  plus their Project 5 items are closed/Done.
 - Removed the completed hardening target: 29,662 files and 11.9 GiB.
 - Removed `.worktrees/dev-test-hardening` and pruned worktree metadata.
 - Deleted merged local and origin branch `feature/dev-test-hardening`.
@@ -278,6 +305,7 @@ application size.
   deleted the merged local product branch, confirmed no matching origin branch existed, and pruned
   worktree and remote metadata. Only the release worktree remains.
 
-The next delivery event is the one clean nonincremental full release gate. Only if it passes may
-issues `#20`, `#21`, and `#22` close and Tasks 19, 19A, and 20 begin. Integrated Tasks 13–18 and
-Quarter 3 review acceptance do not claim that the Market Squawk product release is complete.
+The next delivery event is Quarter 4 implementation of Tasks 19 and 19A in nonconflicting product
+lanes, followed by Task 20's integrated demonstration, evidence, final review, exact-head release
+gate, publication, and cleanup. Quarter 3 acceptance does not claim that the Market Squawk product
+release is complete.

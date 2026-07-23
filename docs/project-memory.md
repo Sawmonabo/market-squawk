@@ -509,9 +509,10 @@ normalization. The first task review found omitted schema name/version and byte-
 corruption; the follow-up fixed both, and exact-head rereview accepted with zero finding. The fresh
 integrated portfolio harness passed 15/15. Corrected portfolio and cross-plane Quarter 3 reviews of
 frozen candidate `053f5e2` both accepted with zero Critical, Important, or Minor finding. Together
-with the previously accepted Tasks 13–15, Task 18, and backtest slices, this accepts Quarter 3. The
-root target must now be cleaned before the one nonincremental full release gate; issues `#20`,
-`#21`, and `#22` remain open until that gate passes.
+with the previously accepted Tasks 13–15, Task 18, and backtest slices, this accepted the Quarter 3
+candidate. At that checkpoint, the root target still had to be cleaned before the one
+nonincremental full release gate, and issues `#20`, `#21`, and `#22` remained open pending that
+gate. The terminal outcome is recorded in the 2026-07-23 section below.
 
 Task 15 provides required zero-service ONNX inference through the self-contained Rust
 `TractOnnxBackend`. It admits exact bounded graphs and tensors, runs through a bounded model-owned
@@ -552,3 +553,42 @@ The portfolio revision/resource closeout fast-forwarded the exact two-commit lan
 `e468d01`, reclaimed its 1.7 GiB generated target, removed its clean worktree, deleted the merged
 local product branch, confirmed no matching origin branch existed, and pruned metadata. Only the
 release worktree remains; the protected stashes, `bundle-backup`, and Dependabot refs remain intact.
+
+## 2026-07-23 Quarter 3 terminal gate and Quarter 4 start
+
+Quarter 3 is terminally accepted at exact pushed head
+`c6f0124c2b27c4777947de8c42b6a5f97868aaf5`. This supersedes the earlier operational statements
+that the Quarter 3 full gate was still pending. The final delta review reported no Critical,
+Important, or Minor finding.
+
+The first clean gate attempt exposed a real Cargo/rustdoc target collision between the application
+library and the Python extension. The production fix gives the Rust Python target the unique crate
+name `market_squawk_python` while retaining Maturin module name
+`market_squawk.market_squawk`, the `market_squawk` PyO3 initializer, and the shipped Python import
+identity. The final reviewer then rejected the intermediate head because the sealed wheel source
+authority still bound the old manifest and omitted accepted Quarter 3 source changes. The lock now
+binds 370 sorted, unique paths; the reviewer independently compared all 370 sizes and SHA-256 values
+to the exact Git blobs with zero mismatch. One concise assertion in the existing release-builder
+harness calls the production source-admission path, so the ordinary verification gate now rejects
+future closure drift without adding a test file, target, script, or authority surface.
+
+`CARGO_INCREMENTAL=0 ./scripts/verify.sh` exited zero on the same unchanged exact head. It passed
+103 Python checks, dependency/license/vulnerability and credential-history checks, formatting, both
+workspace Clippy modes, complete locked all-feature tests, UI/Trybuild, Loom, locked all-feature
+release build, rustdoc contract inventory, offline product smoke, and stdio MCP smoke. Generated
+output peaked at 15,131,260 KiB, below the 20 GiB ceiling. `cargo clean` then removed 36,502 files
+and 14.3 GiB; `target/` is absent and approximately 125 GiB is free.
+
+GitHub issues `#20`, `#21`, and `#22` are closed and their Project 5 items are Done. Only the root
+release worktree remains; local and origin release heads match. The three protected stashes,
+`bundle-backup`, and Dependabot refs remain intact.
+
+Quarter 4 is the final delivery quarter and consists only of Tasks 19, 19A, and 20. Task 19 owns the
+shared transport-neutral application services, complete CLI hierarchy, complete bounded typed MCP
+domains, control-plane configuration, and doctor surface. Task 19A owns the zero-fee provider
+capability/onboarding portal and secure credential lifecycle. Task 20 owns the integrated all-
+vertical demonstration, benchmark/fuzz/security/release evidence, final review, exact-head gate,
+publication, and closeout. Open prerequisite issues `#7`, `#9`, `#10`, and `#11` must be reconciled
+through these product slices or closed with exact evidence; none may be silently ignored. The
+approved production documentation-system design remains a release blocker and still requires its
+written-spec review before migration work begins.
