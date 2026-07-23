@@ -507,9 +507,11 @@ and fingerprint; Attribution and Risk admit complete aggregate work and instrume
 Exposure uses fallibly reserved deterministic vectors with UTF-8-safe in-place ASCII
 normalization. The first task review found omitted schema name/version and byte-wise UTF-8
 corruption; the follow-up fixed both, and exact-head rereview accepted with zero finding. The fresh
-integrated portfolio harness passed 15/15. The corrected exact head now requires portfolio and
-cross-plane Quarter 3 rereview. The root full gate remains prohibited until that review accepts the
-candidate.
+integrated portfolio harness passed 15/15. Corrected portfolio and cross-plane Quarter 3 reviews of
+frozen candidate `053f5e2` both accepted with zero Critical, Important, or Minor finding. Together
+with the previously accepted Tasks 13–15, Task 18, and backtest slices, this accepts Quarter 3. The
+root target must now be cleaned before the one nonincremental full release gate; issues `#20`,
+`#21`, and `#22` remain open until that gate passes.
 
 Task 15 provides required zero-service ONNX inference through the self-contained Rust
 `TractOnnxBackend`. It admits exact bounded graphs and tensors, runs through a bounded model-owned

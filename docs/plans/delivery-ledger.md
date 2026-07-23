@@ -1,6 +1,6 @@
 # Market Squawk Delivery Ledger
 
-Last updated: 2026-07-22
+Last updated: 2026-07-23
 
 This is the compact operational handoff required by
 [`project-memory.md`](../project-memory.md). It records integrated work and exact verification
@@ -14,23 +14,14 @@ evidence; it does not replace the README capability truth or the canonical relea
   moving release-branch head.
 - Current exact integration head: obtain it from `git rev-parse HEAD` and pull request `#26`.
   Tracked prose does not self-pin the commit that contains that prose.
-- Quarter 3 status: Tasks 13–18 and all previously accepted focused remediations are integrated.
-  The grouped review of exact head `a94f33b` accepted the Tasks 13–15 slice and the Task 18 plus
-  cross-plane slice with no Critical or Important finding. It rejected the Tasks 16–17 slice on
-  five substantiated Important blockers. The bounded portfolio and backtest remediation lanes were
-  independently approved, integrated, and freshly verified. The grouped rereview of exact head
-  `797a359` accepted the backtest slice and cross-plane boundaries with no finding, but rejected the
-  portfolio slice on three Important blockers: the immutable revision identity omits base currency,
-  Attribution and Risk omit complete aggregate-work and instrument admissions, and Exposure still
-  uses infallibly allocating temporary maps. One cohesive portfolio lane closed those blockers at
-  integrated exact head `e468d01`: revision v3 binds reporting currency and the complete retained
-  schema identity, Attribution and Risk admit aggregate work and instrument counts, and Exposure
-  uses fallibly reserved deterministic vectors with UTF-8-safe key normalization. Independent task
-  rereview accepted the exact head with no finding, and the fresh integrated portfolio harness
-  passed 15/15. A corrected frozen-head Quarter 3 portfolio and cross-plane rereview is now required.
-  The proposed coupling of a pure cohort plan to one inventory's configured trial limit remains
-  rejected as a layering regression. No rejected candidate received or may receive the clean full
-  gate.
+- Quarter 3 status: accepted at frozen code/status candidate `053f5e2`. The earlier grouped reviews
+  accepted Tasks 13–15, Task 18, backtest authority, and the cross-plane boundaries, while rejecting
+  substantiated portfolio and backtest gaps. Each accepted remediation was integrated unchanged and
+  freshly verified. The corrected Quarter 3 portfolio and cross-plane reviews of `053f5e2` reported
+  no Critical, Important, or Minor finding. The proposed coupling of a pure cohort plan to one
+  inventory's configured trial limit remains rejected as a layering regression. The sole remaining
+  Quarter 3 closeout barrier is one clean nonincremental full release gate; no rejected candidate
+  received that gate.
 - Task 14 accepted feature and fast-forwarded release head: `02ab5cd`
 - Task 18 release merge head: `051ee3c`; reconciled lock head: `5c34b7d`
 - Task 13 accepted feature and release head: `59ba05c`
@@ -149,10 +140,9 @@ evidence; it does not replace the README capability truth or the canonical relea
   minting, public backtest admission, strategy-visible revisions, and exact receipt coverage.
   Independent task review approved the final lane with no remaining finding. Fresh integrated
   gates passed catalog 3/3, backtesting 12/12, and the filtered application vertical 1/1.
-- The next barrier is a corrected frozen-head Quarter 3 portfolio and cross-plane rereview. Only
-  after that review accepts the candidate will the integration owner clean the root target and run
-  one `CARGO_INCREMENTAL=0 ./scripts/verify.sh` gate. Tasks 15–17 remain open until the grouped
-  checkpoint passes; focused evidence does not substitute for it.
+- The next barrier is one clean `CARGO_INCREMENTAL=0 ./scripts/verify.sh` release gate after removing
+  the generated root target. Tasks 15–17 remain open until that gate passes; focused evidence and
+  checkpoint acceptance do not substitute for it.
 
 - Task 12 owner: GitHub issue `#17`, Project 5, status `Done`.
 - Exact feature and fast-forwarded release code head: `9702556`.
@@ -288,7 +278,6 @@ application size.
   deleted the merged local product branch, confirmed no matching origin branch existed, and pruned
   worktree and remote metadata. Only the release worktree remains.
 
-The next delivery event is the corrected frozen-head Quarter 3 portfolio and cross-plane rereview.
-If it accepts the candidate, one clean full gate will run; only then may issues `#20`, `#21`, and
-`#22` close and Tasks 19, 19A, and 20 begin. Integrated Tasks 13–18 do not claim that the Market
-Squawk product release is complete.
+The next delivery event is the one clean nonincremental full release gate. Only if it passes may
+issues `#20`, `#21`, and `#22` close and Tasks 19, 19A, and 20 begin. Integrated Tasks 13–18 and
+Quarter 3 review acceptance do not claim that the Market Squawk product release is complete.
