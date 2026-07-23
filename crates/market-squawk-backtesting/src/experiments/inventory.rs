@@ -318,8 +318,14 @@ impl ExperimentInventory {
         if spec.id() != id {
             return Err(ExperimentError::CorruptRecord);
         }
+        let reservation_digest = digest_bytes(&reservation);
         let identity_version = spec.identity_version();
-        let latest = latest_attempt(&self.root, id, self.limits.max_record_bytes)?;
+        let latest = latest_attempt(
+            &self.root,
+            id,
+            reservation_digest,
+            self.limits.max_record_bytes,
+        )?;
         let attempt_terminal = authoritative_attempt_terminal(
             &self.root,
             id,
@@ -498,6 +504,7 @@ impl ExperimentInventory {
             || latest_attempt(
                 &self.root,
                 reservation.spec.id(),
+                reservation.record_digest,
                 self.limits.max_record_bytes,
             )?
             .map(|value| value.attempt)
@@ -529,7 +536,12 @@ impl ExperimentInventory {
             return Err(ExperimentError::TrialInProgress);
         }
         for _ in 0..3 {
-            let latest = latest_attempt(&self.root, trial_id, self.limits.max_record_bytes)?;
+            let latest = latest_attempt(
+                &self.root,
+                trial_id,
+                record_digest,
+                self.limits.max_record_bytes,
+            )?;
             if let Some(attempt) = &latest
                 && read_optional_bounded(
                     &self.root,
@@ -962,6 +974,7 @@ fn decode_attempt_terminal_name(name: &str) -> Option<u64> {
 fn latest_attempt(
     root: &Dir,
     id: TrialId,
+    reservation_digest: Sha256Digest,
     maximum: usize,
 ) -> Result<Option<AttemptRecord>, ExperimentError> {
     let directory = match root.open_dir_nofollow(attempt_parent(id)) {
@@ -971,21 +984,34 @@ fn latest_attempt(
     };
     let mut latest = None::<AttemptRecord>;
     let mut count = 0_usize;
+    let mut seen = [0_u64; MAX_ATTEMPTS_PER_TRIAL.div_ceil(64)];
+    let expected_reservation_digest = encode_hex(reservation_digest.bytes());
     for entry in directory.entries()? {
         let entry = entry?;
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            return Err(ExperimentError::CorruptRecord);
-        };
-        if !name.ends_with(".json") {
-            continue;
-        }
         count = count.checked_add(1).ok_or(ExperimentError::LimitExceeded)?;
         if count > MAX_ATTEMPTS_PER_TRIAL {
             return Err(ExperimentError::LimitExceeded);
         }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return Err(ExperimentError::CorruptRecord);
+        };
+        if !entry.file_type()?.is_file() {
+            return Err(ExperimentError::CorruptRecord);
+        }
+        let number = decode_attempt_terminal_name(name).ok_or(ExperimentError::CorruptRecord)?;
         let bytes = read_bounded(root, &attempt_parent(id).join(name), maximum)?;
         let record = decode_attempt(&bytes, id)?;
+        if record.attempt != number || record.reservation_digest != expected_reservation_digest {
+            return Err(ExperimentError::CorruptRecord);
+        }
+        let index = usize::try_from(number - 1).map_err(|_| ExperimentError::CorruptRecord)?;
+        let word = index / 64;
+        let mask = 1_u64 << (index % 64);
+        if seen[word] & mask != 0 {
+            return Err(ExperimentError::CorruptRecord);
+        }
+        seen[word] |= mask;
         if latest
             .as_ref()
             .is_none_or(|current| record.attempt > current.attempt)
@@ -993,7 +1019,17 @@ fn latest_attempt(
             latest = Some(record);
         }
     }
-    Ok(latest)
+    let Some(latest) = latest else {
+        return Ok(None);
+    };
+    let latest_number =
+        usize::try_from(latest.attempt).map_err(|_| ExperimentError::CorruptRecord)?;
+    if count != latest_number
+        || (0..latest_number).any(|index| seen[index / 64] & (1_u64 << (index % 64)) == 0)
+    {
+        return Err(ExperimentError::CorruptRecord);
+    }
+    Ok(Some(latest))
 }
 
 fn decode_attempt(bytes: &[u8], id: TrialId) -> Result<AttemptRecord, ExperimentError> {

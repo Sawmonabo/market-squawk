@@ -48,9 +48,9 @@ pub use catalog::{
     FairValueCatalogLink, FairValueCatalogOperation, FairValueCatalogPosition,
     FairValueCatalogRecord, FairValueCatalogSnapshot, FairValueCatalogSnapshotLimits,
     FairValueCommitDisposition, FairValueLinkRelation, FairValueOperationKind, FairValueRecordKind,
-    IngestReservation, IngestRunRecord, IngestRunState, PublishedIngest, QueryArtifactReservation,
-    QueryArtifactReservationInput, QueryArtifactResult, ReferenceBundle, ResumedIngest,
-    SourceCursor, StoredObservedRevision,
+    IngestReservation, IngestRunRecord, IngestRunState, PinnedInstrumentDefinitions,
+    PublishedIngest, QueryArtifactReservation, QueryArtifactReservationInput, QueryArtifactResult,
+    ReferenceBundle, ResumedIngest, SourceCursor, StoredObservedRevision,
 };
 pub use corporate_actions::{
     AdjustmentConflict, AdjustmentRatio, AdjustmentStep, CorporateActionAdjustment,

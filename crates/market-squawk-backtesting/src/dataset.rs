@@ -4,7 +4,8 @@ use std::mem::size_of;
 use std::num::NonZeroU32;
 
 use market_squawk_data::{
-    DatasetManifestRef, DatasetSchemaRegistry, PinnedQueryOutput, Sha256Digest,
+    DatasetManifestRef, DatasetSchemaRegistry, PinnedInstrumentDefinitions, PinnedQueryOutput,
+    Sha256Digest,
 };
 use market_squawk_domain::{
     BasisPoints, Denomination, InstrumentExecutionTerms, InstrumentId, PriceTicks, QuantityLots,
@@ -191,6 +192,8 @@ pub(crate) struct BacktestDatasetInput {
     pub object_graph_digest: Sha256Digest,
     pub point_in_time_content: Sha256Digest,
     pub point_in_time_audit: Sha256Digest,
+    pub instrument_definition_content: Sha256Digest,
+    pub instrument_definition_audit: Sha256Digest,
     pub observations: Vec<BacktestObservation>,
 }
 
@@ -207,13 +210,13 @@ pub struct BacktestDataset {
 }
 
 impl BacktestDataset {
-    /// Admits only an owned non-forgeable Task 11 pinned query receipt.
+    /// Admits only owned non-forgeable query and instrument-definition receipts.
     pub fn try_from_pinned_query(
         output: PinnedQueryOutput,
-        execution_terms: Vec<InstrumentExecutionTerms>,
+        instrument_definitions: PinnedInstrumentDefinitions,
         limits: BacktestLimits,
     ) -> Result<Self, BacktestError> {
-        admission::from_pinned_query(output, execution_terms, limits)
+        admission::from_pinned_query(output, instrument_definitions, limits)
     }
 
     pub(crate) fn try_new(mut input: BacktestDatasetInput) -> Result<Self, BacktestError> {
@@ -224,6 +227,8 @@ impl BacktestDataset {
                 input.object_graph_digest,
                 input.point_in_time_content,
                 input.point_in_time_audit,
+                input.instrument_definition_content,
+                input.instrument_definition_audit,
             ]
             .into_iter()
             .any(|digest| digest.bytes() == [0; 32])
@@ -285,13 +290,15 @@ impl BacktestDataset {
 
 fn dataset_identity(input: &BacktestDatasetInput) -> Sha256Digest {
     let mut hash = Sha256::new();
-    hash.update(b"market-squawk/backtest-dataset/v1");
+    hash.update(b"market-squawk/backtest-dataset/v2");
     update_text(&mut hash, input.manifest.dataset_id().as_str());
     hash.update(input.manifest.manifest_version().to_be_bytes());
     hash.update(input.manifest.content_hash().bytes());
     hash.update(input.object_graph_digest.bytes());
     hash.update(input.point_in_time_content.bytes());
     hash.update(input.point_in_time_audit.bytes());
+    hash.update(input.instrument_definition_content.bytes());
+    hash.update(input.instrument_definition_audit.bytes());
     hash.update((input.observations.len() as u64).to_be_bytes());
     for observation in &input.observations {
         update_execution_terms(&mut hash, observation.execution_terms);

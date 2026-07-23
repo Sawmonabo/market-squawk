@@ -352,6 +352,49 @@ fn catalog_enforces_rights_and_recovers_the_complete_control_record() -> TestRes
 }
 
 #[test]
+fn pinned_instrument_definitions_resolve_at_catalog_observation_boundaries() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let paths = LocalPaths::prepare(directory.path().join("definitions"))?;
+    let catalog = CatalogAuthority::open(CatalogConfig::try_new(
+        paths.catalog()?.clone(),
+        Duration::from_millis(250),
+        CatalogLimit::new(8)?,
+        CatalogResultLimits::try_new(1024 * 1024, 8 * 1024 * 1024)?,
+    )?)?;
+    let instrument_id = "00000000-0000-0000-0000-000000000020";
+    let definition_v1 = test_instrument_revision(instrument_id, "active", 1, "0.01")?;
+    let definition_v2 = test_instrument_revision(instrument_id, "active", 2, "0.05")?;
+    catalog.put_instrument(&definition_v1, Timestamp::from_unix_nanos(10))?;
+    catalog.put_instrument(&definition_v2, Timestamp::from_unix_nanos(20))?;
+
+    let pinned = catalog.pin_instrument_definitions(
+        &[definition_v1.instrument_id()],
+        Timestamp::from_unix_nanos(30),
+        CatalogLimit::new(2)?,
+    )?;
+
+    assert_eq!(pinned.as_of(), Timestamp::from_unix_nanos(30));
+    for (decision_at, expected) in [
+        (19, definition_v1.execution_terms()),
+        (20, definition_v2.execution_terms()),
+        (30, definition_v2.execution_terms()),
+    ] {
+        assert_eq!(
+            pinned.execution_terms_at(
+                definition_v1.instrument_id(),
+                Timestamp::from_unix_nanos(decision_at)
+            ),
+            Some(expected)
+        );
+    }
+    assert_eq!(
+        pinned.execution_terms_at(definition_v1.instrument_id(), Timestamp::from_unix_nanos(9)),
+        None
+    );
+    Ok(())
+}
+
+#[test]
 fn catalog_rejects_tampered_migration_identity() -> TestResult {
     let directory = tempfile::tempdir()?;
     let paths = LocalPaths::prepare(directory.path().join("tamper"))?;
@@ -447,14 +490,23 @@ fn local_source(revision: &str, revision_evidence_byte: u8) -> TestResult<Source
 }
 
 fn test_instrument(id: &str, status: &str) -> TestResult<InstrumentDefinition> {
+    test_instrument_revision(id, status, 1, "0.01")
+}
+
+fn test_instrument_revision(
+    id: &str,
+    status: &str,
+    revision: u64,
+    tick_size: &str,
+) -> TestResult<InstrumentDefinition> {
     let _: market_squawk_domain::InstrumentId = id.parse()?;
     Ok(serde_json::from_value(serde_json::json!({
         "instrument_id": id,
-        "definition_revision": 1,
+        "definition_revision": revision,
         "asset_class": "equity",
         "primary_denomination": { "kind": "currency", "value": "USD" },
         "quote_currency": "USD",
-        "tick_size": "0.01",
+        "tick_size": tick_size,
         "lot_size": "1",
         "contract_multiplier": "1",
         "venue_mappings": [],

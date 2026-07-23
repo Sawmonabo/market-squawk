@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use market_squawk_domain::{
     ContractRollMapping, CorporateActionObservation, EvidenceDigest, InstrumentDefinition,
-    LifecycleTransition, SchemaVersion, SourceId, SourceIdentifier, SymbolIdentityRecord,
-    Timestamp,
+    InstrumentDefinitionRevision, InstrumentExecutionTerms, InstrumentId, LifecycleTransition,
+    SchemaVersion, SourceId, SourceIdentifier, SymbolIdentityRecord, Timestamp,
 };
 use market_squawk_platform::{CatalogFileGuard, CatalogLocation, CatalogWriterGuard};
 use market_squawk_sources::SourceMetadataError;
@@ -20,7 +20,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use super::storage::{valid_artifact_reference, valid_text};
-use crate::RightsError;
+use crate::{RightsError, Sha256Digest};
 
 const MAX_QUERY_ROWS: usize = 10_000;
 const MIN_SQLITE_RECORD_BYTES: usize = 8 * 1024;
@@ -127,6 +127,102 @@ impl CatalogLimit {
 
     pub(super) const fn get(self) -> usize {
         self.0.get()
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct PinnedInstrumentDefinition {
+    pub(super) row_digest: Sha256Digest,
+    pub(super) definition_revision: InstrumentDefinitionRevision,
+    pub(super) execution_terms: InstrumentExecutionTerms,
+    pub(super) effective_start: Timestamp,
+    pub(super) effective_end: Option<Timestamp>,
+}
+
+#[derive(Debug)]
+pub(super) struct PinnedInstrumentHistory {
+    pub(super) instrument_id: InstrumentId,
+    pub(super) definitions: Box<[PinnedInstrumentDefinition]>,
+}
+
+/// Catalog-minted, bounded point-in-time instrument-definition authority.
+///
+/// This receipt has private fields, no public constructor, and no deserializer. It can only be
+/// produced after [`Catalog::pin_instrument_definitions`] verifies complete catalog history.
+#[derive(Debug)]
+pub struct PinnedInstrumentDefinitions {
+    as_of: Timestamp,
+    histories: Box<[PinnedInstrumentHistory]>,
+    content_identity: Sha256Digest,
+    audit_identity: Sha256Digest,
+}
+
+impl PinnedInstrumentDefinitions {
+    pub(super) fn new(
+        as_of: Timestamp,
+        histories: Vec<PinnedInstrumentHistory>,
+        content_identity: Sha256Digest,
+        audit_identity: Sha256Digest,
+    ) -> Self {
+        Self {
+            as_of,
+            histories: histories.into_boxed_slice(),
+            content_identity,
+            audit_identity,
+        }
+    }
+
+    /// Returns the inclusive knowledge bound used to mint this receipt.
+    pub const fn as_of(&self) -> Timestamp {
+        self.as_of
+    }
+
+    /// Returns the number of exactly covered stable instrument identities.
+    pub const fn instrument_count(&self) -> usize {
+        self.histories.len()
+    }
+
+    /// Returns the exactly covered stable instrument identities in canonical order.
+    pub fn instrument_ids(&self) -> impl ExactSizeIterator<Item = InstrumentId> + '_ {
+        self.histories.iter().map(|history| history.instrument_id)
+    }
+
+    /// Resolves immutable execution terms at one decision cutoff.
+    ///
+    /// Returns `None` before the first catalog observation, beyond this receipt's knowledge bound,
+    /// or for an instrument outside the exact requested set.
+    pub fn execution_terms_at(
+        &self,
+        instrument_id: InstrumentId,
+        decision_at: Timestamp,
+    ) -> Option<InstrumentExecutionTerms> {
+        if decision_at > self.as_of {
+            return None;
+        }
+        let history = self
+            .histories
+            .binary_search_by_key(&instrument_id, |history| history.instrument_id)
+            .ok()
+            .map(|index| &self.histories[index])?;
+        let index = history
+            .definitions
+            .partition_point(|definition| definition.effective_start <= decision_at)
+            .checked_sub(1)?;
+        let definition = &history.definitions[index];
+        definition
+            .effective_end
+            .is_none_or(|effective_end| decision_at < effective_end)
+            .then_some(definition.execution_terms)
+    }
+
+    /// Returns the versioned identity of the admitted definition content and effective intervals.
+    pub const fn content_identity(&self) -> Sha256Digest {
+        self.content_identity
+    }
+
+    /// Returns the versioned identity of the catalog rows and exact pin request.
+    pub const fn audit_identity(&self) -> Sha256Digest {
+        self.audit_identity
     }
 }
 
@@ -692,6 +788,9 @@ pub enum CatalogError {
     /// Decoded result bytes exceeded the configured per-record or cumulative bound.
     #[error("catalog result byte limit was exceeded")]
     ResultByteLimitExceeded,
+    /// A complete receipt exceeded the caller-selected or configured row bound.
+    #[error("catalog result row limit was exceeded")]
+    ResultRowLimitExceeded,
     /// A durable record violated a bounded invariant.
     #[error("catalog record is invalid")]
     InvalidRecord,

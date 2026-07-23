@@ -37,7 +37,7 @@ use self::types::WriterPermit;
 pub use self::types::{
     ArtifactRecord, AuditEvent, Catalog, CatalogConfig, CatalogError, CatalogHealth, CatalogLimit,
     CatalogResultLimits, ContractCompletion, DatasetManifestRecord, IngestReservation,
-    IngestRunRecord, IngestRunState, ReferenceBundle, SourceCursor,
+    IngestRunRecord, IngestRunState, PinnedInstrumentDefinitions, ReferenceBundle, SourceCursor,
 };
 pub(crate) use observed_revisions::CatalogObservedRevisionAuthority;
 pub use observed_revisions::StoredObservedRevision;

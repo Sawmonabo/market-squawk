@@ -177,6 +177,38 @@ impl BacktestModelDecisionMapper for RejectMapper {
 }
 
 #[test]
+fn pinned_dataset_resolves_historical_instrument_definitions_per_decision() -> TestResult {
+    let definition_v1 = execution_terms_revision(1)?;
+    let definition_v2 = execution_terms_revision(2)?;
+    let admit = |audit_byte| -> Result<BacktestDataset, Box<dyn Error>> {
+        Ok(BacktestDataset::try_new(BacktestDatasetInput {
+            manifest: feature_manifest()?,
+            object_graph_digest: Sha256Digest::new([2; 32]),
+            point_in_time_content: Sha256Digest::new([3; 32]),
+            point_in_time_audit: Sha256Digest::new([4; 32]),
+            instrument_definition_content: Sha256Digest::new([5; 32]),
+            instrument_definition_audit: Sha256Digest::new([audit_byte; 32]),
+            observations: vec![
+                observation(definition_v1, 10, 100, 10)?,
+                observation(definition_v2, 20, 110, 10)?,
+            ],
+        })?)
+    };
+
+    let dataset = admit(6)?;
+    assert_eq!(
+        dataset
+            .observations
+            .iter()
+            .map(|observation| observation.execution_terms.definition_revision().get())
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert_ne!(dataset.identity(), admit(7)?.identity());
+    Ok(())
+}
+
+#[test]
 fn signal_executes_only_on_next_eligible_snapshot_and_reconciles_partial_fill() -> TestResult {
     let account_id: AccountId = "00000000-0000-0000-0000-000000000030".parse()?;
     let terms = execution_terms()?;
@@ -455,6 +487,8 @@ fn request_rejects_a_dataset_that_cannot_form_a_nonempty_trial_partition() -> Te
         object_graph_digest: Sha256Digest::new([2; 32]),
         point_in_time_content: Sha256Digest::new([3; 32]),
         point_in_time_audit: Sha256Digest::new([4; 32]),
+        instrument_definition_content: Sha256Digest::new([5; 32]),
+        instrument_definition_audit: Sha256Digest::new([6; 32]),
         observations: vec![observation(terms, 10, 100, 10)?],
     })?;
     let Err(error) = request(account_id, single_observation, None) else {
@@ -918,24 +952,7 @@ fn expired_trial_attempt_can_be_recovered_without_overlapping_an_active_lease() 
         TrialStatus::Failed(_)
     ));
 
-    let account_id: AccountId = "00000000-0000-0000-0000-000000000030".parse()?;
-    let request = request(account_id, dataset(execution_terms()?)?, None)?;
-    let spec = TrialSpec::try_new(TrialSpecInput {
-        dataset_identity: request.dataset_identity(),
-        object_graph_digest: request.object_graph_digest(),
-        execution_assumption_digest: request.assumption_digest(),
-        run_input_digest: request.run_input_digest(),
-        cohort_authority_digest: request.cohort_authority_digest(),
-        cohort_universe_digest: None,
-        model: None,
-        strategy: binding("strategy-v1", 5)?,
-        code: binding("code-revision", 6)?,
-        configuration_digest: Sha256Digest::new([7; 32]),
-        seed: request.seed(),
-        parameters: Vec::new(),
-        search_space: Vec::new(),
-        selection_criterion: SourceIdentifier::try_from("total-return")?,
-    })?;
+    let spec = test_trial_spec()?;
 
     let _first = inventory.reserve_at(spec.clone(), Timestamp::from_unix_nanos(100), 10)?;
     let current_trial_hex = spec
@@ -1033,6 +1050,63 @@ fn expired_trial_attempt_can_be_recovered_without_overlapping_an_active_lease() 
         reopened.trial(spec.id())?.status(),
         TrialStatus::Completed(_)
     ));
+    Ok(())
+}
+
+#[test]
+fn attempt_recovery_rejects_noncanonical_unbound_or_gapped_namespace() -> TestResult {
+    let temporary = tempfile::tempdir()?;
+    let limits = ExperimentLimits::try_new(ExperimentLimitsInput {
+        max_trials: 8,
+        max_record_bytes: 64 * 1024,
+        max_artifact_bytes: 64 * 1024,
+        max_metrics: 8,
+    })?;
+    let root = Dir::open_ambient_dir(temporary.path(), ambient_authority())?;
+    let inventory = ExperimentInventory::try_new(root, limits)?;
+    let spec = test_trial_spec()?;
+    let _active = inventory.reserve_at(spec.clone(), Timestamp::from_unix_nanos(100), 10)?;
+    let trial_hex = spec
+        .id()
+        .digest()
+        .bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let attempts = temporary
+        .path()
+        .join("backtesting/v1/attempts")
+        .join(trial_hex);
+    let first_path = attempts.join("00000000000000000001.json");
+    let first_bytes = std::fs::read(&first_path)?;
+    let namespace_is_rejected = || {
+        matches!(
+            inventory.trial(spec.id()),
+            Err(ExperimentError::CorruptRecord)
+        )
+    };
+
+    let noncanonical_path = attempts.join("noncanonical");
+    std::fs::write(&noncanonical_path, b"{}")?;
+    assert!(namespace_is_rejected());
+    std::fs::remove_file(noncanonical_path)?;
+
+    let mismatched_path = attempts.join("00000000000000000002.json");
+    std::fs::write(&mismatched_path, &first_bytes)?;
+    assert!(namespace_is_rejected());
+    std::fs::remove_file(mismatched_path)?;
+
+    let mut unbound: serde_json::Value = serde_json::from_slice(&first_bytes)?;
+    unbound["reservation_digest"] = serde_json::json!("00".repeat(32));
+    std::fs::write(&first_path, serde_json::to_vec(&unbound)?)?;
+    assert!(namespace_is_rejected());
+    std::fs::write(&first_path, &first_bytes)?;
+
+    let mut third: serde_json::Value = serde_json::from_slice(&first_bytes)?;
+    third["attempt"] = serde_json::json!(3);
+    let third_path = attempts.join("00000000000000000003.json");
+    std::fs::write(&third_path, serde_json::to_vec(&third)?)?;
+    assert!(namespace_is_rejected());
     Ok(())
 }
 
@@ -1261,6 +1335,27 @@ fn binding(name: &str, byte: u8) -> Result<TrialComponentBinding, Box<dyn Error>
     )?)
 }
 
+fn test_trial_spec() -> Result<TrialSpec, Box<dyn Error>> {
+    let account_id: AccountId = "00000000-0000-0000-0000-000000000030".parse()?;
+    let request = request(account_id, dataset(execution_terms()?)?, None)?;
+    Ok(TrialSpec::try_new(TrialSpecInput {
+        dataset_identity: request.dataset_identity(),
+        object_graph_digest: request.object_graph_digest(),
+        execution_assumption_digest: request.assumption_digest(),
+        run_input_digest: request.run_input_digest(),
+        cohort_authority_digest: request.cohort_authority_digest(),
+        cohort_universe_digest: None,
+        model: None,
+        strategy: binding("strategy-v1", 5)?,
+        code: binding("code-revision", 6)?,
+        configuration_digest: Sha256Digest::new([7; 32]),
+        seed: request.seed(),
+        parameters: Vec::new(),
+        search_space: Vec::new(),
+        selection_criterion: SourceIdentifier::try_from("total-return")?,
+    })?)
+}
+
 fn dataset(terms: InstrumentExecutionTerms) -> Result<BacktestDataset, Box<dyn Error>> {
     dataset_at(terms, 10)
 }
@@ -1274,6 +1369,8 @@ fn dataset_at(
         object_graph_digest: Sha256Digest::new([2; 32]),
         point_in_time_content: Sha256Digest::new([3; 32]),
         point_in_time_audit: Sha256Digest::new([4; 32]),
+        instrument_definition_content: Sha256Digest::new([5; 32]),
+        instrument_definition_audit: Sha256Digest::new([6; 32]),
         observations: vec![
             observation(terms, starts_at, 100, 10)?,
             observation(terms, starts_at + 10, 110, 2)?,
@@ -1291,6 +1388,8 @@ fn dataset_with_depths(
         object_graph_digest: Sha256Digest::new([2; 32]),
         point_in_time_content: Sha256Digest::new([3; 32]),
         point_in_time_audit: Sha256Digest::new([4; 32]),
+        instrument_definition_content: Sha256Digest::new([5; 32]),
+        instrument_definition_audit: Sha256Digest::new([6; 32]),
         observations: [10, 20, 30]
             .into_iter()
             .zip(depths)

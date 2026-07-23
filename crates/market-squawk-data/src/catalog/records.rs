@@ -1,5 +1,8 @@
 //! Durable source, rights, reference, ingest, artifact, manifest, and audit operations.
 
+use std::collections::BTreeSet;
+use std::mem::size_of;
+
 use market_squawk_domain::{
     ContractRollMapping, CorporateActionObservation, InstrumentDefinition, InstrumentId,
     LifecycleTransition, LifecycleTransitionKind, SourceId, SymbolIdentityRecord, Timestamp,
@@ -7,12 +10,14 @@ use market_squawk_domain::{
 use market_squawk_sources::SourceMetadata;
 use rusqlite::{OptionalExtension as _, params};
 use serde::de::DeserializeOwned;
+use sha2::{Digest as _, Sha256};
 
 use super::storage::{
     AppendOutcome, ResultBudget, append_audit, persist_instrument_children, persist_symbol,
     query_records, require_instrument, sha256, trusted_catalog_now,
 };
 use super::types::*;
+use crate::Sha256Digest;
 
 impl Catalog {
     /// Registers exact, validated source metadata and its content digest.
@@ -507,6 +512,126 @@ impl Catalog {
         Ok(history)
     }
 
+    /// Pins complete, verified instrument-definition histories at one catalog knowledge bound.
+    pub fn pin_instrument_definitions(
+        &self,
+        instrument_ids: &[InstrumentId],
+        as_of: Timestamp,
+        limit: CatalogLimit,
+    ) -> Result<PinnedInstrumentDefinitions, CatalogError> {
+        self.enforce_limit(limit)?;
+        if instrument_ids.is_empty() {
+            return Err(CatalogError::InvalidRecord);
+        }
+        if instrument_ids.len() > limit.get() {
+            return Err(CatalogError::ResultRowLimitExceeded);
+        }
+        let requested = instrument_ids.iter().copied().collect::<BTreeSet<_>>();
+        if requested.len() != instrument_ids.len() {
+            return Err(CatalogError::InvalidRecord);
+        }
+
+        let mut budget = ResultBudget::new(self.result_bytes);
+        let mut histories = Vec::new();
+        histories
+            .try_reserve_exact(requested.len())
+            .map_err(|_| CatalogError::Allocation)?;
+        let mut total_rows = 0_usize;
+        let mut statement = self.connection.prepare(
+            "SELECT definition_json, revision_digest, observed_at_ns
+             FROM instrument_revisions
+             WHERE instrument_id=?1 AND observed_at_ns<=?2
+             ORDER BY observed_at_ns, revision_digest
+             LIMIT ?3",
+        )?;
+        for instrument_id in requested {
+            let remaining = limit
+                .get()
+                .checked_sub(total_rows)
+                .ok_or(CatalogError::ResultRowLimitExceeded)?;
+            let probe_limit = remaining
+                .checked_add(1)
+                .and_then(|value| i64::try_from(value).ok())
+                .ok_or(CatalogError::InvalidLimit)?;
+            let rows = statement.query_map(
+                params![instrument_id.to_string(), as_of.unix_nanos(), probe_limit],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )?;
+            let mut definitions = Vec::<PinnedInstrumentDefinition>::new();
+            for row in rows {
+                if total_rows == limit.get() {
+                    return Err(CatalogError::ResultRowLimitExceeded);
+                }
+                let (definition_json, stored_digest, observed_at_ns) = row?;
+                budget.charge([definition_json.len(), stored_digest.len(), size_of::<i64>()])?;
+                if stored_digest.len() != 32
+                    || sha256(definition_json.as_bytes()).as_slice() != stored_digest
+                {
+                    return Err(CatalogError::CorruptCatalog);
+                }
+                let row_digest = <[u8; 32]>::try_from(stored_digest.as_slice())
+                    .map_err(|_| CatalogError::CorruptCatalog)?;
+                let definition: InstrumentDefinition = serde_json::from_str(&definition_json)?;
+                let observed_at = Timestamp::from_unix_nanos(observed_at_ns);
+                if definition.instrument_id() != instrument_id || observed_at > as_of {
+                    return Err(CatalogError::CorruptCatalog);
+                }
+                if let Some(previous) = definitions.last_mut() {
+                    if previous.effective_start >= observed_at
+                        || previous.definition_revision >= definition.definition_revision()
+                    {
+                        return Err(CatalogError::InvalidRecord);
+                    }
+                    previous.effective_end = Some(observed_at);
+                }
+                definitions
+                    .try_reserve(1)
+                    .map_err(|_| CatalogError::Allocation)?;
+                definitions.push(PinnedInstrumentDefinition {
+                    row_digest: Sha256Digest::new(row_digest),
+                    definition_revision: definition.definition_revision(),
+                    execution_terms: definition.execution_terms(),
+                    effective_start: observed_at,
+                    effective_end: None,
+                });
+                total_rows = total_rows
+                    .checked_add(1)
+                    .ok_or(CatalogError::ResultRowLimitExceeded)?;
+            }
+            if definitions.is_empty() {
+                return Err(CatalogError::InvalidRecord);
+            }
+            histories.push(PinnedInstrumentHistory {
+                instrument_id,
+                definitions: definitions.into_boxed_slice(),
+            });
+        }
+        let content_identity = pinned_definition_identity(
+            b"market-squawk/instrument-definitions/content/v1",
+            None,
+            None,
+            &histories,
+        )?;
+        let audit_identity = pinned_definition_identity(
+            b"market-squawk/instrument-definitions/audit/v1",
+            Some(as_of),
+            Some(limit),
+            &histories,
+        )?;
+        Ok(PinnedInstrumentDefinitions::new(
+            as_of,
+            histories,
+            content_identity,
+            audit_identity,
+        ))
+    }
+
     /// Stores a cursor without allowing an older update to overwrite newer progress.
     pub fn set_cursor(&self, cursor: &SourceCursor) -> Result<(), CatalogError> {
         let transaction = self.connection.unchecked_transaction()?;
@@ -605,6 +730,60 @@ impl Catalog {
         row.map(|(value, digest)| deserialize_verified(&value, &digest, budget))
             .transpose()
     }
+}
+
+fn pinned_definition_identity(
+    domain: &[u8],
+    as_of: Option<Timestamp>,
+    limit: Option<CatalogLimit>,
+    histories: &[PinnedInstrumentHistory],
+) -> Result<Sha256Digest, CatalogError> {
+    let mut hash = Sha256::new();
+    hash.update(domain);
+    match as_of {
+        Some(as_of) => {
+            hash.update([1]);
+            hash.update(as_of.unix_nanos().to_be_bytes());
+        }
+        None => hash.update([0]),
+    }
+    match limit {
+        Some(limit) => {
+            hash.update([1]);
+            hash.update(
+                u64::try_from(limit.get())
+                    .map_err(|_| CatalogError::InvalidLimit)?
+                    .to_be_bytes(),
+            );
+        }
+        None => hash.update([0]),
+    }
+    hash.update(
+        u64::try_from(histories.len())
+            .map_err(|_| CatalogError::ResultRowLimitExceeded)?
+            .to_be_bytes(),
+    );
+    for history in histories {
+        hash.update(history.instrument_id.as_uuid().as_bytes());
+        hash.update(
+            u64::try_from(history.definitions.len())
+                .map_err(|_| CatalogError::ResultRowLimitExceeded)?
+                .to_be_bytes(),
+        );
+        for definition in &history.definitions {
+            hash.update(definition.row_digest.bytes());
+            hash.update(definition.definition_revision.get().to_be_bytes());
+            hash.update(definition.effective_start.unix_nanos().to_be_bytes());
+            match definition.effective_end {
+                Some(effective_end) => {
+                    hash.update([1]);
+                    hash.update(effective_end.unix_nanos().to_be_bytes());
+                }
+                None => hash.update([0]),
+            }
+        }
+    }
+    Ok(Sha256Digest::new(hash.finalize().into()))
 }
 
 fn deserialize_verified<T: DeserializeOwned>(

@@ -6,8 +6,8 @@ use market_squawk_backtesting::{
     ExperimentInventory, ExperimentLimits, PortfolioSeed, ResearchExecutionAssumptions,
     TrialParameter, TrialSearchDimension,
 };
-use market_squawk_data::{CorporateActionPlan, PinnedQueryOutput};
-use market_squawk_domain::{InstrumentExecutionTerms, SourceIdentifier};
+use market_squawk_data::{CorporateActionPlan, PinnedInstrumentDefinitions, PinnedQueryOutput};
+use market_squawk_domain::SourceIdentifier;
 use market_squawk_platform::{LocalPaths, PathError};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -20,11 +20,11 @@ pub struct BacktestExperimentPlan {
     pub selection_criterion: SourceIdentifier,
 }
 
-/// Owned production input whose data authority is a non-forgeable Task 11 query receipt.
+/// Owned production input whose data and definition authority are non-forgeable receipts.
 #[derive(Debug)]
 pub struct PinnedBacktestInput {
     pub query: PinnedQueryOutput,
-    pub execution_terms: Vec<InstrumentExecutionTerms>,
+    pub instrument_definitions: PinnedInstrumentDefinitions,
     pub execution_assumptions: ResearchExecutionAssumptions,
     pub portfolio: PortfolioSeed,
     pub corporate_actions: Option<CorporateActionPlan>,
@@ -66,7 +66,7 @@ impl ProductionBacktestService {
         let mut strategy = self.strategies.admit(build_id)?;
         let dataset = BacktestDataset::try_from_pinned_query(
             input.query,
-            input.execution_terms,
+            input.instrument_definitions,
             input.limits,
         )?;
         let experiment = input.experiment;

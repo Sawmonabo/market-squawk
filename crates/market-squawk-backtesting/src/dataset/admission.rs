@@ -9,7 +9,10 @@ use arrow::array::{
 };
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
-use market_squawk_data::{DatasetSchemaRegistry, PinnedQueryOutput, QueryResult, Sha256Digest};
+use market_squawk_data::{
+    DatasetSchemaRegistry, PinnedInstrumentDefinitions, PinnedQueryOutput, QueryResult,
+    Sha256Digest,
+};
 use market_squawk_domain::{
     BasisPoints, DigestAlgorithm, InstrumentExecutionTerms, InstrumentId, PriceTicks, QuantityLots,
     SourceIdentifier, Timestamp,
@@ -50,7 +53,7 @@ const RESERVED_VERSION: u32 = 1;
 
 pub(super) fn from_pinned_query(
     output: PinnedQueryOutput,
-    execution_terms: Vec<InstrumentExecutionTerms>,
+    instrument_definitions: PinnedInstrumentDefinitions,
     limits: BacktestLimits,
 ) -> Result<BacktestDataset, BacktestError> {
     let canonical = DatasetSchemaRegistry::local().canonical_feature_labels()?;
@@ -64,6 +67,8 @@ pub(super) fn from_pinned_query(
     let object_graph_digest = digest(output.object_graph_digest().bytes())?;
     let point_in_time_audit = digest(output.query_identity().bytes())?;
     let point_in_time_content = digest(output.result_digest().bytes())?;
+    let instrument_definition_content = instrument_definitions.content_identity();
+    let instrument_definition_audit = instrument_definitions.audit_identity();
     let manifest = output.manifest().clone();
     let QueryResult::Inline {
         batches,
@@ -77,13 +82,7 @@ pub(super) fn from_pinned_query(
         return Err(BacktestError::LimitExceeded);
     }
 
-    let mut terms = BTreeMap::new();
-    for value in execution_terms {
-        if terms.insert(value.instrument_id(), value).is_some() {
-            return Err(BacktestError::InvalidDataset);
-        }
-    }
-    if terms.is_empty() {
+    if instrument_definitions.instrument_count() == 0 {
         return Err(BacktestError::InvalidDataset);
     }
 
@@ -98,25 +97,25 @@ pub(super) fn from_pinned_query(
         if row_count > limits.max_observations.saturating_mul(1_024) {
             return Err(BacktestError::LimitExceeded);
         }
-        admit_batch(batch, &terms, &mut groups)?;
+        admit_batch(batch, &instrument_definitions, &mut groups)?;
     }
     if groups.is_empty() || groups.len() > limits.max_observations {
         return Err(BacktestError::LimitExceeded);
     }
 
-    let mut used_terms = BTreeSet::new();
+    let mut used_instruments = BTreeSet::new();
     let mut observations = Vec::new();
     observations
         .try_reserve_exact(groups.len())
         .map_err(|_| BacktestError::LimitExceeded)?;
     for (key, group) in groups {
-        used_terms.insert(key.instrument_id);
+        used_instruments.insert(key.instrument_id);
         observations.push(group.finish(key)?);
     }
-    if used_terms.len() != terms.len()
-        || terms
-            .keys()
-            .any(|instrument| !used_terms.contains(instrument))
+    if used_instruments.len() != instrument_definitions.instrument_count()
+        || instrument_definitions
+            .instrument_ids()
+            .any(|instrument| !used_instruments.contains(&instrument))
     {
         return Err(BacktestError::InvalidDataset);
     }
@@ -125,6 +124,8 @@ pub(super) fn from_pinned_query(
         object_graph_digest,
         point_in_time_content,
         point_in_time_audit,
+        instrument_definition_content,
+        instrument_definition_audit,
         observations,
     })
 }
@@ -152,7 +153,7 @@ fn validate_schema(
 
 fn admit_batch(
     batch: &RecordBatch,
-    terms: &BTreeMap<InstrumentId, InstrumentExecutionTerms>,
+    instrument_definitions: &PinnedInstrumentDefinitions,
     groups: &mut BTreeMap<GroupKey, Group>,
 ) -> Result<(), BacktestError> {
     let examples = array::<FixedSizeBinaryArray>(batch, EXAMPLE_ID)?;
@@ -179,12 +180,12 @@ fn admit_batch(
             _ => return Err(BacktestError::InvalidDataset),
         }
         let instrument_id = instrument(instruments, row)?;
-        let execution_terms = terms
-            .get(&instrument_id)
-            .copied()
+        let cutoff = Timestamp::from_unix_nanos(required(cutoffs, row)?);
+        let execution_terms = instrument_definitions
+            .execution_terms_at(instrument_id, cutoff)
             .ok_or(BacktestError::InvalidDataset)?;
         let key = GroupKey {
-            cutoff: Timestamp::from_unix_nanos(required(cutoffs, row)?),
+            cutoff,
             instrument_id,
             example_id: fixed_text(examples, row)?.to_owned(),
         };

@@ -6,6 +6,7 @@ use market_squawk::{
 use market_squawk_backtesting::{
     BacktestOutcome, BacktestStrategyRegistry, ExperimentLimits, ExperimentLimitsInput,
 };
+use market_squawk_data::PinnedInstrumentDefinitions;
 use market_squawk_domain::SourceIdentifier;
 use tokio_util::sync::CancellationToken;
 
@@ -32,6 +33,9 @@ fn production_backtest_inventory_is_confined_to_the_controlled_artifact_root()
         &CancellationToken,
     ) -> Result<BacktestOutcome, ProductionBacktestServiceError> = ProductionBacktestService::run;
     let _ = run_boundary;
+    let input_contract: fn(PinnedBacktestInput) -> PinnedInstrumentDefinitions =
+        |input| input.instrument_definitions;
+    let _ = input_contract;
     assert!(paths.artifacts()?.root().join("backtesting/v1").is_dir());
     Ok(())
 }
