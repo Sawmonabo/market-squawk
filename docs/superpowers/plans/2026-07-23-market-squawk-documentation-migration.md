@@ -158,7 +158,7 @@ remains design history and has no factual authority over current pages.
 | Analytics, modeling, and backtesting | `crates/market-squawk-analytics/src/`; `crates/market-squawk-modeling/src/bundle.rs:109-466`; `native.rs:61-235`; `onnx.rs:1-260`; `crates/market-squawk-backtesting/src/service.rs:28-684`; `apps/market-squawk/src/application/analysis/` |
 | Portfolio, execution, and fair value | `crates/market-squawk-portfolio/src/lib.rs:68-700`; `crates/market-squawk-execution/src/risk.rs:225-970`; `dispatcher.rs:33-923`; `crates/market-squawk-valuation/src/service.rs:51-322`; `apps/market-squawk/src/portfolio_application/`; `apps/market-squawk/src/application/fair_value/` |
 | Provider coverage and activation | Every `adapters/market-squawk-adapter-*/src/lib.rs` plus its source/config/rights modules; `crates/market-squawk-sources/src/onboarding/`; `apps/market-squawk/src/provider_onboarding/portal.rs:1-907`; `apps/market-squawk/src/provider_activation/mod.rs:1-501`; `docs/research/2026-07-23-provider-activation-evidence-validation.md` |
-| Model runbook and release evidence | `docs/operations/onnx-runtime.md:1-126`; `docs/verification/`; Quarter 3 exact-head gate at `c6f0124c2b27c4777947de8c42b6a5f97868aaf5`; Task 19/19A focused evidence recorded in project memory |
+| Model runbook and release evidence | `docs/operations/model-inference.md:1-126`; `docs/verification/`; Quarter 3 exact-head gate at `c6f0124c2b27c4777947de8c42b6a5f97868aaf5`; Task 19/19A focused evidence recorded in project memory |
 
 ### Producer-to-consumer authority map
 
@@ -304,7 +304,18 @@ No lane branches before this commit.
 - Modify for the model-runbook move only: maintained incoming links identified by the inventory
 - Record for Task 3: maintained links to the two architecture source documents
 
-- [ ] **Inventory and classify old-path occurrences**
+Task 2 classified the accepted-head occurrences as follows:
+
+| Occurrence | Disposition after architecture reconciliation |
+| --- | --- |
+| Root `README.md` current-state link | Maintained navigation; point to the dated current-state audit |
+| `docs/plans/gap-analysis.md` current/target links and evidence rows | Maintained release evidence; point to the two dated audits and add current architecture navigation where appropriate |
+| Capture-memory research report current/target links | Preserve historical meaning by pointing to the moved audit files |
+| Stage 1 historical plan's two Markdown links | Preserve navigability to the same moved audit files without rewriting its literal commands or prose |
+| Other plan/design/path occurrences | Frozen literals or migration instructions; leave unchanged |
+| Model-runbook occurrences | No maintained incoming Markdown link existed; active source-map authority now names `model-inference.md`, while historical plan/design literals remain unchanged |
+
+- [x] **Inventory and classify old-path occurrences**
 
 ```bash
 git grep -n -E \
@@ -316,7 +327,7 @@ Separate maintained Markdown links from frozen literal paths, historical command
 descriptions. Record the maintained architecture links for Task 3, but do not move or rewrite the
 architecture source documents in this task. Do not rewrite historical literals.
 
-- [ ] **Move the model runbook and repair only its maintained links**
+- [x] **Move the model runbook and repair only its maintained links**
 
 ```bash
 git mv docs/operations/onnx-runtime.md docs/operations/model-inference.md
@@ -327,7 +338,7 @@ the writers and integration owner in Task 3. Leave
 `docs/verification/usable-release-baseline.md:29` and historical literal source paths unchanged. Do
 not leave the old model-runbook path in place.
 
-- [ ] **Verify, commit, and prove ancestry**
+- [x] **Verify, commit, and prove ancestry**
 
 ```bash
 git diff --check
