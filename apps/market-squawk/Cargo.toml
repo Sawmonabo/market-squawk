@@ -36,6 +36,7 @@ path = "src/bin/market-squawk-capture-helper.rs"
 [dependencies]
 anyhow = { workspace = true }
 arc-swap = { workspace = true }
+arrow = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 cap-fs-ext = { workspace = true }
@@ -49,10 +50,15 @@ getrandom = { workspace = true }
 libc = { workspace = true }
 parking_lot = { workspace = true }
 market-squawk-domain = { workspace = true }
+market-squawk-adapter-bls = { workspace = true }
 market-squawk-adapter-coinbase = { workspace = true }
+market-squawk-adapter-files = { workspace = true }
+market-squawk-adapter-fred = { workspace = true }
 market-squawk-adapter-kraken = { workspace = true }
 market-squawk-adapter-paper = { workspace = true }
 market-squawk-adapter-portfolio = { workspace = true }
+market-squawk-adapter-sec = { workspace = true }
+market-squawk-adapter-treasury = { workspace = true }
 market-squawk-analytics = { workspace = true }
 market-squawk-backtesting = { path = "../../crates/market-squawk-backtesting", version = "=0.1.0" }
 market-squawk-data = { workspace = true }

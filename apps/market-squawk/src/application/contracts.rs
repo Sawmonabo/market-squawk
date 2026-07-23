@@ -47,6 +47,10 @@ const PORTFOLIO_SCOPE: ToolScope = ToolScope::new(
 );
 
 const NO_ARGUMENTS: &[ArgumentSpec] = &[];
+const LIST_DATASETS_ARGUMENTS: &[ArgumentSpec] = &[ArgumentSpec::optional(
+    "afterDataset",
+    ArgumentKind::Identifier,
+)];
 const DATASET_ARGUMENT: &[ArgumentSpec] =
     &[ArgumentSpec::required("dataset", ArgumentKind::Identifier)];
 const OPTIONAL_DATASET_ARGUMENT: &[ArgumentSpec] =
@@ -175,7 +179,7 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         "List immutable local analytical dataset generations.",
         ServiceDomain::Research,
         LOCAL_SCOPE,
-        NO_ARGUMENTS,
+        LIST_DATASETS_ARGUMENTS,
         SourceEvidencePolicy::NotApplicable,
     ),
     read(

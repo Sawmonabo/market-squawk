@@ -149,17 +149,23 @@ impl AnalyticalGenerationPage {
 /// Closed canonical observation family selectable through the read capability.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AnalyticalObservationTemplate {
+    /// Every canonical research observation, including all retained revisions.
+    All,
     /// Reported fundamental and XBRL fact observations.
     Fundamental,
     /// Macroeconomic series observations and revisions.
     Macro,
+    /// User-owned or licensed alternative-data observations.
+    AlternativeData,
 }
 
 impl AnalyticalObservationTemplate {
-    const fn storage_name(self) -> &'static str {
+    const fn storage_name(self) -> Option<&'static str> {
         match self {
-            Self::Fundamental => "fundamental",
-            Self::Macro => "macro",
+            Self::All => None,
+            Self::Fundamental => Some("fundamental"),
+            Self::Macro => Some("macro"),
+            Self::AlternativeData => Some("alternative_data"),
         }
     }
 }
@@ -250,10 +256,11 @@ impl AnalyticalObservationReadRequest {
     }
 
     fn sql(&self) -> String {
-        let mut filters = vec![format!(
-            "observation_kind = '{}'",
-            self.template.storage_name()
-        )];
+        let mut filters = self
+            .template
+            .storage_name()
+            .map(|name| vec![format!("observation_kind = '{name}'")])
+            .unwrap_or_default();
         if !self.instrument_ids.is_empty() {
             let instruments = self
                 .instrument_ids
@@ -272,10 +279,14 @@ impl AnalyticalObservationReadRequest {
                 range.end.unix_nanos()
             ));
         }
+        let predicate = if filters.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", filters.join(" AND "))
+        };
         format!(
-            "SELECT * FROM {OBSERVATION_TABLE} WHERE {} \
-             ORDER BY source_id, source_identifier, revision, payload_sha256",
-            filters.join(" AND ")
+            "SELECT * FROM {OBSERVATION_TABLE}{predicate} \
+             ORDER BY source_id, source_identifier, revision, payload_sha256"
         )
     }
 }

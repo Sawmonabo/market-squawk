@@ -22,9 +22,15 @@ mod contracts;
 mod domain_support;
 pub mod model;
 mod paper;
+mod research;
 
 pub use contracts::{APPLICATION_CONTRACT_VERSION, application_capabilities};
 pub use paper::PaperApplicationServices;
+pub use research::{
+    ManagedResearchExtractionSource, ProductionResearchIngestCoordinator,
+    ResearchApplicationServices, ResearchExtractionLimits, ResearchIngestCompositionError,
+    ResearchIngestCoordinator, ResearchRevisionPlanError, ResearchRightsAuthority,
+};
 
 const REQUIRED_DOMAINS: [ServiceDomain; 11] = [
     ServiceDomain::Source,
