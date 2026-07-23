@@ -1,6 +1,13 @@
 //! Lifecycle-owned, transport-neutral local application services.
 
-use std::{fmt, sync::Arc, time::Instant};
+use std::{
+    fmt,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Instant,
+};
 
 use async_trait::async_trait;
 use market_squawk_services::{
@@ -43,6 +50,18 @@ pub trait ApplicationDomainService: Send + Sync + 'static {
         request: TypedToolRequest,
         context: RequestContext,
     ) -> Result<TypedToolResult, ServiceError>;
+
+    /// Atomically rejects new work and triggers cancellation of owned background activity.
+    ///
+    /// This operation must be nonblocking, idempotent, and safe to call from a fail-safe Drop
+    /// path. Durable reconciliation and task joining belong in [`Self::finish_shutdown`].
+    fn begin_shutdown(&self);
+
+    /// Completes bounded reconciliation and task joining after shutdown has begun.
+    ///
+    /// Implementations must be idempotent and may narrow, but never extend, the shared absolute
+    /// deadline.
+    async fn finish_shutdown(&self, deadline: Instant) -> Result<(), ServiceError>;
 }
 
 /// Complete, immutable set of product-domain implementations.
@@ -104,6 +123,8 @@ impl fmt::Debug for ApplicationDomainServices {
 pub struct Application {
     capabilities: ServiceCapabilities,
     domains: ApplicationDomainServices,
+    accepting_requests: AtomicBool,
+    shutdown: tokio::sync::Mutex<Option<ApplicationShutdownReport>>,
 }
 
 impl Application {
@@ -118,6 +139,8 @@ impl Application {
         Ok(Self {
             capabilities: application_capabilities()?,
             domains,
+            accepting_requests: AtomicBool::new(true),
+            shutdown: tokio::sync::Mutex::new(None),
         })
     }
 
@@ -148,6 +171,44 @@ impl Application {
         let request = self.admit(operation, arguments)?;
         self.call(request, context).await
     }
+
+    /// Synchronously closes request admission and cancels every domain in reverse dependency order.
+    ///
+    /// The operation is nonblocking and idempotent. Call [`Self::shutdown`] to complete bounded
+    /// reconciliation and task joining.
+    pub fn begin_shutdown(&self) {
+        if self.accepting_requests.swap(false, Ordering::AcqRel) {
+            for service in self.domains.services.iter().rev() {
+                service.begin_shutdown();
+            }
+        }
+    }
+
+    /// Completes reverse-order bounded shutdown under one absolute deadline.
+    ///
+    /// The returned report records each domain independently so one failure never prevents the
+    /// remaining services from receiving their shutdown barrier.
+    pub async fn shutdown(&self, deadline: Instant) -> ApplicationShutdownReport {
+        self.begin_shutdown();
+        let deadline = tokio::time::Instant::from_std(deadline);
+        let Ok(mut retained) = tokio::time::timeout_at(deadline, self.shutdown.lock()).await else {
+            return ApplicationShutdownReport::all_failed(ServiceError::DeadlineExceeded);
+        };
+        if let Some(report) = *retained {
+            return report;
+        }
+
+        let mut report = ApplicationShutdownReport::complete();
+        for service in self.domains.services.iter().rev() {
+            let outcome =
+                tokio::time::timeout_at(deadline, service.finish_shutdown(deadline.into_std()))
+                    .await
+                    .unwrap_or(Err(ServiceError::DeadlineExceeded));
+            report.failures[domain_index(service.domain())] = outcome.err();
+        }
+        *retained = Some(report);
+        report
+    }
 }
 
 impl fmt::Debug for Application {
@@ -156,6 +217,10 @@ impl fmt::Debug for Application {
             .debug_struct("Application")
             .field("capabilities", &self.capabilities)
             .field("domains", &self.domains)
+            .field(
+                "accepting_requests",
+                &self.accepting_requests.load(Ordering::Acquire),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -171,6 +236,9 @@ impl ToolServices for Application {
         request: TypedToolRequest,
         context: RequestContext,
     ) -> Result<TypedToolResult, ServiceError> {
+        if !self.accepting_requests.load(Ordering::Acquire) {
+            return Err(ServiceError::Unavailable);
+        }
         ensure_request_live(&context)?;
         let descriptor = self
             .capabilities
@@ -193,6 +261,44 @@ impl ToolServices for Application {
             .validate_for(descriptor)
             .map_err(ServiceError::from)?;
         Ok(result)
+    }
+}
+
+impl Drop for Application {
+    fn drop(&mut self) {
+        self.begin_shutdown();
+    }
+}
+
+/// Terminal shutdown result for every required application domain.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ApplicationShutdownReport {
+    failures: [Option<ServiceError>; REQUIRED_DOMAINS.len()],
+}
+
+impl ApplicationShutdownReport {
+    const fn complete() -> Self {
+        Self {
+            failures: [None; REQUIRED_DOMAINS.len()],
+        }
+    }
+
+    const fn all_failed(error: ServiceError) -> Self {
+        Self {
+            failures: [Some(error); REQUIRED_DOMAINS.len()],
+        }
+    }
+
+    /// True only when every required domain reached its terminal barrier.
+    #[must_use]
+    pub fn is_complete(self) -> bool {
+        self.failures.iter().all(Option::is_none)
+    }
+
+    /// Returns the terminal failure for one domain, if any.
+    #[must_use]
+    pub const fn failure(self, domain: ServiceDomain) -> Option<ServiceError> {
+        self.failures[domain_index(domain)]
     }
 }
 
