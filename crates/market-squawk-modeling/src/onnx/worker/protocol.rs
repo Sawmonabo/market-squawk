@@ -5,9 +5,12 @@ use std::io::{BufReader, Read, Write};
 use std::path::Path;
 use std::sync::mpsc::SyncSender;
 
+use sha2::{Digest, Sha256};
+
 use super::{OnnxWorkerProcessError, WorkerError};
 
 const WORKER_MAGIC: &[u8; 8] = b"MSQONX01";
+const PROTOCOL_REVISION: u32 = 1;
 const BACKEND_TRACT: u8 = 1;
 #[cfg(feature = "onnx-runtime")]
 const BACKEND_EXTERNAL: u8 = 2;
@@ -18,6 +21,7 @@ const RESPONSE_RESOURCE: u8 = 2;
 const RESPONSE_RUNTIME: u8 = 3;
 const MAX_RUNTIME_PATH_BYTES: usize = 1_024;
 const MAX_RUNTIME_VERSION_BYTES: usize = 64;
+const MAX_INPUT_RANK: usize = 8;
 
 #[derive(Debug)]
 pub(super) struct WorkerInitialization {
@@ -79,7 +83,7 @@ impl WorkerInitialization {
         if model.is_empty()
             || model.len() > super::super::MAX_ONNX_MODEL_BYTES
             || input_shape.is_empty()
-            || input_shape.len() > 8
+            || input_shape.len() > MAX_INPUT_RANK
             || input_elements == 0
             || input_elements > super::super::MAX_ONNX_REQUEST_ELEMENTS
         {
@@ -189,7 +193,7 @@ pub(super) fn read_initialization(
     let backend = read_u8(reader)?;
     let rank = read_u8(reader)? as usize;
     let runtime_platform = read_u8(reader)?;
-    if read_u8(reader)? != 0 || rank == 0 || rank > 8 {
+    if read_u8(reader)? != 0 || rank == 0 || rank > MAX_INPUT_RANK {
         return Err(OnnxWorkerProcessError::Protocol);
     }
     let input_elements = read_u32(reader)? as usize;
@@ -328,4 +332,71 @@ fn decode_response(response: [u8; 5]) -> Result<f32, WorkerError> {
         RESPONSE_RUNTIME | RESPONSE_OK => Err(WorkerError::Runtime),
         _ => Err(WorkerError::Unavailable),
     }
+}
+
+pub(super) fn semantics_digest() -> [u8; 32] {
+    let mut digest = Sha256::new();
+    bind_bytes(
+        &mut digest,
+        b"namespace",
+        b"market-squawk/onnx-worker-protocol/v1",
+    );
+    bind_bytes(&mut digest, b"magic", WORKER_MAGIC);
+    bind_u128(
+        &mut digest,
+        b"protocol-revision",
+        u128::from(PROTOCOL_REVISION),
+    );
+    for (name, value) in [
+        (b"backend-tract".as_slice(), BACKEND_TRACT),
+        (b"backend-external".as_slice(), 2),
+        (b"request-infer".as_slice(), REQUEST_INFER),
+        (b"response-ok".as_slice(), RESPONSE_OK),
+        (b"response-load".as_slice(), RESPONSE_LOAD),
+        (b"response-resource".as_slice(), RESPONSE_RESOURCE),
+        (b"response-runtime".as_slice(), RESPONSE_RUNTIME),
+    ] {
+        bind_u128(&mut digest, name, u128::from(value));
+    }
+    for (name, value) in [
+        (b"max-runtime-path-bytes".as_slice(), MAX_RUNTIME_PATH_BYTES),
+        (
+            b"max-runtime-version-bytes".as_slice(),
+            MAX_RUNTIME_VERSION_BYTES,
+        ),
+        (b"max-input-rank".as_slice(), MAX_INPUT_RANK),
+        (
+            b"max-model-bytes".as_slice(),
+            super::super::MAX_ONNX_MODEL_BYTES,
+        ),
+        (
+            b"max-request-elements".as_slice(),
+            super::super::MAX_ONNX_REQUEST_ELEMENTS,
+        ),
+    ] {
+        bind_u128(&mut digest, name, value as u128);
+    }
+    bind_u128(
+        &mut digest,
+        b"external-backend-compiled",
+        u128::from(u8::from(cfg!(feature = "onnx-runtime"))),
+    );
+    bind_bytes(
+        &mut digest,
+        b"framing",
+        b"big-endian/fixed-init-header/u32-shape-and-f32-bits/fixed-five-byte-response",
+    );
+    digest.finalize().into()
+}
+
+fn bind_u128(digest: &mut Sha256, name: &[u8], value: u128) {
+    bind_bytes(digest, b"field", name);
+    digest.update(value.to_be_bytes());
+}
+
+fn bind_bytes(digest: &mut Sha256, name: &[u8], value: &[u8]) {
+    digest.update((name.len() as u128).to_be_bytes());
+    digest.update(name);
+    digest.update((value.len() as u128).to_be_bytes());
+    digest.update(value);
 }

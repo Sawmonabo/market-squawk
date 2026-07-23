@@ -1,13 +1,13 @@
 //! Allocation-free structural admission for the pinned ONNX protobuf schema.
 //!
 //! The decoded-heap charge covers the generated Prost object model rather than estimating from
-//! wire bytes alone. [`ModelProto`] charges its complete inline representation up front. Repeated
-//! containers charge the conservative Rust 1.97.1 `Vec` allocation peak, including minimum
-//! non-zero capacity and old-plus-new growth; their elements are then scanned recursively. String
-//! and byte payloads use the same allocation model. Singular message, string, and bytes handles are
-//! already inline in their charged parent, so only their nested fields or payload are added. The
-//! fixed field-count and depth ceilings separately bound allocator bookkeeping and stack use.
-//! Unknown fields are discarded by Prost and this scanner skips them without allocating.
+//! wire bytes alone. [`ModelProto`] charges its complete inline representation up front. Each
+//! repeated field charges one monotonic Rust 1.97.1 `Vec` allocation-growth peak across every
+//! occurrence and packed segment, including minimum non-zero capacity and old-plus-new growth.
+//! String and byte payloads use the same allocation model. Singular message, string, and bytes
+//! handles are already inline in their charged parent, so only their nested fields or payload are
+//! added. The fixed field-count and depth ceilings separately bound allocator bookkeeping and stack
+//! use. Unknown fields are discarded by Prost and this scanner skips them without allocating.
 
 use std::mem::size_of;
 
@@ -22,7 +22,7 @@ use super::policy::MAX_ONNX_MODEL_BYTES;
 use super::policy::{MAX_ONNX_NODES, MAX_ONNX_REQUEST_ELEMENTS, MAX_ONNX_TENSORS, OnnxPolicyError};
 
 const MAX_SCHEMA_TAG: usize = 25;
-const SCANNER_REVISION: u32 = 2;
+const SCANNER_REVISION: u32 = 3;
 const RUST_VEC_BYTE_MIN_CAPACITY: usize = 8;
 const RUST_VEC_MODERATE_MIN_CAPACITY: usize = 4;
 const RUST_VEC_LARGE_MIN_CAPACITY: usize = 1;
@@ -34,8 +34,8 @@ const MAX_NESTING_DEPTH: usize = 8;
 // Every protobuf field occupies at least a one-byte key and one-byte value or length. This is the
 // maximum possible field count under the existing wire-byte ceiling, including unpacked numerics.
 const MAX_WIRE_FIELDS: usize = MAX_ONNX_MODEL_BYTES.div_ceil(2);
-// The scanner charges each observed allocation by its own old-plus-new growth peak. Summing those
-// peaks overcharges the actual decode peak but preserves a finite, conservative admission ceiling.
+// The scanner charges each container's monotonic old-plus-new growth peak. Payload containers are
+// independently charged, preserving a finite, conservative admission ceiling.
 const MAX_DECODED_HEAP_BYTES: usize = MAX_ONNX_MODEL_BYTES * 4;
 const MAX_GRAPH_VALUES: usize = MAX_ONNX_TENSORS;
 const MAX_ONNX_RANK: usize = 8;
@@ -199,6 +199,21 @@ impl Budget {
     ) -> Result<(), OnnxPolicyError> {
         self.charge(vec_peak_allocation(items, element_bytes)?)
     }
+
+    fn charge_vec_growth(
+        &mut self,
+        prior_items: usize,
+        new_items: usize,
+        element_bytes: usize,
+    ) -> Result<(), OnnxPolicyError> {
+        let prior_peak = vec_peak_allocation(prior_items, element_bytes)?;
+        let new_peak = vec_peak_allocation(new_items, element_bytes)?;
+        self.charge(
+            new_peak
+                .checked_sub(prior_peak)
+                .ok_or(OnnxPolicyError::ProtobufResourceLimit)?,
+        )
+    }
 }
 
 fn vec_peak_allocation(items: usize, element_bytes: usize) -> Result<usize, OnnxPolicyError> {
@@ -263,13 +278,17 @@ fn scan_message(
             continue;
         };
         let items = scan_value(spec.value, bytes, &mut cursor, wire_type, depth, budget)?;
-        let prior = items_by_tag
-            .get_mut(tag)
+        let prior = *items_by_tag
+            .get(tag)
             .ok_or(OnnxPolicyError::InvalidProtobuf)?;
-        *prior = prior
+        let total = prior
             .checked_add(items)
             .filter(|items| *items <= spec.max_items)
             .ok_or(spec.limit_error)?;
+        if let Some(element_bytes) = repeated_element_bytes(spec.value) {
+            budget.charge_vec_growth(prior, total, element_bytes)?;
+        }
+        items_by_tag[tag] = total;
     }
     Ok(())
 }
@@ -312,7 +331,7 @@ fn scan_value(
             scan_message(kind, payload, depth + 1, budget)?;
             Ok(1)
         }
-        ValueKind::RepeatedVarint { element_bytes } => {
+        ValueKind::RepeatedVarint { .. } => {
             let items = if wire_type == 2 {
                 let payload = take_length_delimited(bytes, cursor)?;
                 count_varints(payload)?
@@ -321,41 +340,51 @@ fn scan_value(
                 read_varint(bytes, cursor)?;
                 1
             };
-            budget.charge_vec_peak(items, element_bytes)?;
             Ok(items)
         }
         ValueKind::RepeatedFixed32 => {
             let items = scan_repeated_fixed(bytes, cursor, wire_type, 5, 4)?;
-            budget.charge_vec_peak(items, 4)?;
             Ok(items)
         }
         ValueKind::RepeatedFixed64 => {
             let items = scan_repeated_fixed(bytes, cursor, wire_type, 1, 8)?;
-            budget.charge_vec_peak(items, 8)?;
             Ok(items)
         }
         ValueKind::RepeatedString => {
             require_wire(wire_type, 2)?;
             let payload = take_length_delimited(bytes, cursor)?;
             std::str::from_utf8(payload).map_err(|_| OnnxPolicyError::InvalidProtobuf)?;
-            budget.charge_vec_peak(1, size_of::<String>())?;
             budget.charge_vec_peak(payload.len(), 1)?;
             Ok(1)
         }
         ValueKind::RepeatedBytes => {
             require_wire(wire_type, 2)?;
             let payload = take_length_delimited(bytes, cursor)?;
-            budget.charge_vec_peak(1, size_of::<Vec<u8>>())?;
             budget.charge_vec_peak(payload.len(), 1)?;
             Ok(1)
         }
         ValueKind::RepeatedMessage(kind) => {
             require_wire(wire_type, 2)?;
             let payload = take_length_delimited(bytes, cursor)?;
-            budget.charge_vec_peak(1, message_size(kind))?;
             scan_message(kind, payload, depth + 1, budget)?;
             Ok(1)
         }
+    }
+}
+
+fn repeated_element_bytes(value: ValueKind) -> Option<usize> {
+    match value {
+        ValueKind::RepeatedVarint { element_bytes } => Some(element_bytes),
+        ValueKind::RepeatedFixed32 => Some(size_of::<f32>()),
+        ValueKind::RepeatedFixed64 => Some(size_of::<f64>()),
+        ValueKind::RepeatedString => Some(size_of::<String>()),
+        ValueKind::RepeatedBytes => Some(size_of::<Vec<u8>>()),
+        ValueKind::RepeatedMessage(kind) => Some(message_size(kind)),
+        ValueKind::Varint
+        | ValueKind::Fixed32
+        | ValueKind::String
+        | ValueKind::Bytes
+        | ValueKind::Message(_) => None,
     }
 }
 
@@ -484,7 +513,7 @@ pub(super) fn admission_semantics_digest() -> [u8; 32] {
     bind_bytes(
         &mut digest,
         b"namespace",
-        b"market-squawk/onnx-wire-admission/v2",
+        b"market-squawk/onnx-wire-admission/v3",
     );
     bind_u128(
         &mut digest,
@@ -831,18 +860,14 @@ mod tests {
         let entry_bytes = size_of::<StringStringEntryProto>();
         assert!((1..=RUST_VEC_MODERATE_ELEMENT_MAX_BYTES).contains(&annotation_bytes));
         assert!((1..=RUST_VEC_MODERATE_ELEMENT_MAX_BYTES).contains(&entry_bytes));
-        let per_annotation = annotation_bytes
-            .checked_add(entry_bytes)
-            .and_then(|bytes| bytes.checked_mul(RUST_VEC_MODERATE_MIN_CAPACITY))
+        let per_annotation = entry_bytes
+            .checked_mul(RUST_VEC_MODERATE_MIN_CAPACITY)
             .ok_or("nested allocation charge overflowed")?;
         let count = MAX_DECODED_HEAP_BYTES
             .checked_div(per_annotation)
             .and_then(|count| count.checked_add(1))
             .ok_or("nested annotation count overflowed")?;
-        let outer_only = count
-            .checked_mul(annotation_bytes)
-            .and_then(|bytes| bytes.checked_mul(RUST_VEC_MODERATE_MIN_CAPACITY))
-            .ok_or("outer allocation charge overflowed")?;
+        let outer_only = vec_peak_allocation(count, annotation_bytes)?;
         assert!(outer_only < MAX_DECODED_HEAP_BYTES);
 
         let mut graph = Vec::new();
@@ -862,6 +887,57 @@ mod tests {
         model.extend_from_slice(&graph);
 
         assert_eq!(prescan(&model), Err(OnnxPolicyError::ProtobufResourceLimit));
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_message_larger_than_one_kibibyte_charges_cumulative_growth()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const MESSAGE_COUNT: usize = 3;
+        let element_bytes = size_of::<AttributeProto>();
+        assert!(element_bytes > RUST_VEC_MODERATE_ELEMENT_MAX_BYTES);
+        let mut node = Vec::new();
+        node.try_reserve_exact(MESSAGE_COUNT * 2)?;
+        for _ in 0..MESSAGE_COUNT {
+            node.extend_from_slice(&[0x2a, 0x00]);
+        }
+
+        let mut budget = Budget {
+            fields: 0,
+            decoded_heap_bytes: 0,
+        };
+        scan_message(MessageKind::Node, &node, 0, &mut budget)?;
+
+        assert_eq!(
+            budget.decoded_heap_bytes,
+            vec_peak_allocation(MESSAGE_COUNT, element_bytes)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn segmented_packed_numeric_growth_is_charged_as_one_container()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const ITEMS_PER_SEGMENT: usize = 1_024;
+        const SEGMENTS: usize = 3;
+        let payload_bytes = ITEMS_PER_SEGMENT * size_of::<f32>();
+        let mut tensor = Vec::new();
+        for _ in 0..SEGMENTS {
+            tensor.push(0x22);
+            append_varint(u64::try_from(payload_bytes)?, &mut tensor);
+            tensor.resize(tensor.len() + payload_bytes, 0);
+        }
+
+        let mut budget = Budget {
+            fields: 0,
+            decoded_heap_bytes: 0,
+        };
+        scan_message(MessageKind::Tensor, &tensor, 0, &mut budget)?;
+
+        assert_eq!(
+            budget.decoded_heap_bytes,
+            vec_peak_allocation(ITEMS_PER_SEGMENT * SEGMENTS, size_of::<f32>())?
+        );
         Ok(())
     }
 

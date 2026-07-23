@@ -270,6 +270,10 @@ fn tract_backend_runs_the_exact_bundle_with_finite_bounded_output() -> TestResul
         backend.runtime_evidence().policy_digest(),
         LEGACY_GOLDEN_POLICY_DIGEST
     );
+    assert_ne!(
+        backend.runtime_evidence().worker_runtime_semantics_digest(),
+        [0; 32]
+    );
     assert_ne!(backend.runtime_evidence().warm_up_digest(), [0; 32]);
     drop(backend);
     assert_eq!(program.active_generations(), 0);

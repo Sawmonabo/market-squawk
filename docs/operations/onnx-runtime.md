@@ -88,15 +88,17 @@ closed sequence:
 
 `try_from_tract` borrows the required `Arc<TractOnnxBackend>`; a construction failure cannot consume
 the fallback. Each request has one configured total deadline. The optional worker receives the first
-half and tract retains the second half. A dispatched optional-runtime failure transfers its
-generation to a bounded worker-owned reaper before tract starts; process termination and thread
-joins therefore do not consume tract's reserved window, and backend destruction joins the owned
-reaper. Expiry before dispatch restores the retained generation even when it occurs after the caller
-takes ownership. The v2 runtime evidence identity binds the exact scanner revision, pinned
-ONNX/Prost schema, resource ceilings, and target layouts used by admission. If the total request
-deadline is exhausted, that request produces no action and the next request still has a usable tract
-fallback. Neither backend can emit an order directly; model output still passes through strategy and
-the sole risk boundary.
+half and tract retains the second half. Response receipt, request-writer completion, and final result
+publication each recheck the absolute deadline; a late or uncertain result has no authority. A
+dispatched failure drops the generation's input and signals child termination before transfer to the
+bounded worker-owned reaper, where process waits and thread joins occur. Expiry before dispatch
+restores the retained generation even when it occurs after the caller takes ownership.
+`OnnxRuntimeEvidence` binds the exact model and graph policy to a versioned worker-runtime semantics
+digest covering the admitted helper executable, protocol bounds, compute and intermediate limits,
+target resource-containment profile, startup/deadline rules, and reaper behavior. The warm-up identity
+also binds that digest and the finite warm-up score. If the total request deadline is exhausted, that
+request produces no action and the next request still has a usable tract fallback. Neither backend
+can emit an order directly; model output still passes through strategy and the sole risk boundary.
 
 ## Failure diagnosis
 

@@ -39,6 +39,7 @@ pub use worker::{
 pub struct OnnxRuntimeEvidence {
     model_digest: [u8; 32],
     policy_digest: [u8; 32],
+    worker_runtime_semantics_digest: [u8; 32],
     warm_up_digest: [u8; 32],
     warm_up_score_bits: u32,
 }
@@ -54,6 +55,12 @@ impl OnnxRuntimeEvidence {
     #[must_use]
     pub const fn policy_digest(self) -> [u8; 32] {
         self.policy_digest
+    }
+
+    /// Returns the versioned helper, protocol, limit, containment, and deadline semantics digest.
+    #[must_use]
+    pub const fn worker_runtime_semantics_digest(self) -> [u8; 32] {
+        self.worker_runtime_semantics_digest
     }
 
     /// Returns the exact finite warm-up result identity.
@@ -119,13 +126,16 @@ impl TractOnnxBackend {
         if !warm_up.is_finite() {
             return Err(OnnxBackendError::WarmUp);
         }
+        let worker_runtime_semantics_digest = worker.runtime_semantics_digest();
         let mut warm_up_digest = Sha256::new();
-        warm_up_digest.update(b"market-squawk/onnx-warm-up/v2");
+        warm_up_digest.update(b"market-squawk/onnx-warm-up/v3");
         warm_up_digest.update(policy.policy_digest());
+        warm_up_digest.update(worker_runtime_semantics_digest);
         warm_up_digest.update(warm_up.to_bits().to_be_bytes());
         let evidence = OnnxRuntimeEvidence {
             model_digest: bundle.metadata().artifact_hash().bytes(),
             policy_digest: policy.policy_digest(),
+            worker_runtime_semantics_digest,
             warm_up_digest: warm_up_digest.finalize().into(),
             warm_up_score_bits: warm_up.to_bits(),
         };

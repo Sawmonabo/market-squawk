@@ -1,11 +1,17 @@
 //! Fail-closed operating-system resource containment for helper processes.
 
+use sha2::{Digest, Sha256};
+
 use super::OnnxWorkerProcessError;
 
 #[cfg(any(windows, all(unix, not(target_vendor = "apple"))))]
 const WORKER_ADDRESS_SPACE_BYTES: u64 = 3 * 1024 * 1024 * 1024;
+#[cfg(not(any(windows, all(unix, not(target_vendor = "apple")))))]
+const WORKER_ADDRESS_SPACE_BYTES: u64 = 0;
 #[cfg(unix)]
 const WORKER_FILE_DESCRIPTOR_LIMIT: u64 = 64;
+#[cfg(not(unix))]
+const WORKER_FILE_DESCRIPTOR_LIMIT: u64 = 0;
 
 #[cfg(unix)]
 #[derive(Debug)]
@@ -78,4 +84,73 @@ pub(super) fn apply_resource_limits() -> Result<ResourceGuard, OnnxWorkerProcess
 #[cfg(not(any(unix, windows)))]
 pub(super) fn deny_file_growth() -> Result<(), OnnxWorkerProcessError> {
     Err(OnnxWorkerProcessError::Resource)
+}
+
+pub(super) fn semantics_digest() -> [u8; 32] {
+    let mut digest = Sha256::new();
+    bind_bytes(
+        &mut digest,
+        b"namespace",
+        b"market-squawk/onnx-worker-resource-profile/v1",
+    );
+    bind_bytes(&mut digest, b"target-os", std::env::consts::OS.as_bytes());
+    bind_bytes(
+        &mut digest,
+        b"target-arch",
+        std::env::consts::ARCH.as_bytes(),
+    );
+    bind_bytes(&mut digest, b"profile", resource_profile());
+    bind_u128(
+        &mut digest,
+        b"address-space-or-working-set-bytes",
+        u128::from(WORKER_ADDRESS_SPACE_BYTES),
+    );
+    bind_u128(
+        &mut digest,
+        b"file-descriptor-limit",
+        u128::from(WORKER_FILE_DESCRIPTOR_LIMIT),
+    );
+    for (name, enabled) in [
+        (
+            b"address-space-limit".as_slice(),
+            cfg!(any(windows, all(unix, not(target_vendor = "apple")))),
+        ),
+        (
+            b"core-dump-denial".as_slice(),
+            cfg!(all(unix, not(target_os = "haiku"))),
+        ),
+        (b"file-growth-denial".as_slice(), cfg!(unix)),
+        (b"kill-on-job-close".as_slice(), cfg!(windows)),
+        (
+            b"fail-closed-unsupported-target".as_slice(),
+            !cfg!(any(unix, windows)),
+        ),
+    ] {
+        bind_u128(&mut digest, name, u128::from(u8::from(enabled)));
+    }
+    digest.finalize().into()
+}
+
+const fn resource_profile() -> &'static [u8] {
+    if cfg!(all(unix, target_vendor = "apple")) {
+        b"darwin-rlimit-nofile-core-fsize/v1"
+    } else if cfg!(unix) {
+        b"unix-rlimit-as-nofile-core-fsize/v1"
+    } else if cfg!(windows) {
+        b"windows-job-working-set-kill-on-close/v1"
+    } else {
+        b"unsupported-fail-closed/v1"
+    }
+}
+
+fn bind_u128(digest: &mut Sha256, name: &[u8], value: u128) {
+    bind_bytes(digest, b"field", name);
+    digest.update(value.to_be_bytes());
+}
+
+fn bind_bytes(digest: &mut Sha256, name: &[u8], value: &[u8]) {
+    digest.update((name.len() as u128).to_be_bytes());
+    digest.update(name);
+    digest.update((value.len() as u128).to_be_bytes());
+    digest.update(value);
 }

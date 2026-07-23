@@ -3,6 +3,7 @@
 use std::io::{self, BufReader, BufWriter, Cursor, Read, Write};
 use std::sync::Arc;
 
+use sha2::{Digest, Sha256};
 use tract_onnx::prelude::*;
 use tract_onnx::tract_hir::internal::DimLike;
 
@@ -12,7 +13,20 @@ use super::protocol::{
 use super::resources::{apply_resource_limits, deny_file_growth};
 use super::{OnnxWorkerProcessError, WorkerError};
 
-const MAX_ONNX_COMPUTE_UNITS: usize = 50_000_000;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WorkerComputeLimits {
+    maximum_tensor_elements: usize,
+    maximum_aggregate_intermediate_elements: usize,
+    maximum_intermediate_tensors: usize,
+    maximum_aggregate_compute_units: usize,
+}
+
+const WORKER_COMPUTE_LIMITS: WorkerComputeLimits = WorkerComputeLimits {
+    maximum_tensor_elements: super::super::MAX_ONNX_REQUEST_ELEMENTS,
+    maximum_aggregate_intermediate_elements: super::super::MAX_ONNX_REQUEST_ELEMENTS,
+    maximum_intermediate_tensors: super::super::MAX_ONNX_TENSORS,
+    maximum_aggregate_compute_units: 50_000_000,
+};
 
 /// Runs the private stdio protocol for the packaged helper binary.
 pub fn run_onnx_worker_process() -> Result<(), OnnxWorkerProcessError> {
@@ -296,6 +310,7 @@ fn finite_scalar(mut values: impl ExactSizeIterator<Item = f32>) -> Result<f32, 
 }
 
 fn validate_typed_model(model: &TypedModel) -> Result<(), WorkerError> {
+    let limits = WORKER_COMPUTE_LIMITS;
     let mut aggregate_elements = 0_usize;
     let mut aggregate_compute = 0_usize;
     let mut outlet_count = 0_usize;
@@ -311,7 +326,7 @@ fn validate_typed_model(model: &TypedModel) -> Result<(), WorkerError> {
             let elements = shape.iter().try_fold(1_usize, |product, dimension| {
                 product.checked_mul(*dimension).ok_or(WorkerError::Resource)
             })?;
-            if elements > super::super::MAX_ONNX_REQUEST_ELEMENTS {
+            if elements > limits.maximum_tensor_elements {
                 return Err(WorkerError::Resource);
             }
             node_elements = node_elements
@@ -319,7 +334,7 @@ fn validate_typed_model(model: &TypedModel) -> Result<(), WorkerError> {
                 .ok_or(WorkerError::Resource)?;
             aggregate_elements = aggregate_elements
                 .checked_add(elements)
-                .filter(|elements| *elements <= super::super::MAX_ONNX_REQUEST_ELEMENTS)
+                .filter(|elements| *elements <= limits.maximum_aggregate_intermediate_elements)
                 .ok_or(WorkerError::Resource)?;
         }
         let input_facts = node
@@ -343,11 +358,58 @@ fn validate_typed_model(model: &TypedModel) -> Result<(), WorkerError> {
             })?;
         aggregate_compute = aggregate_compute
             .checked_add(reported_compute.max(node_elements))
-            .filter(|units| *units <= MAX_ONNX_COMPUTE_UNITS)
+            .filter(|units| *units <= limits.maximum_aggregate_compute_units)
             .ok_or(WorkerError::Resource)?;
     }
-    if outlet_count > super::super::MAX_ONNX_TENSORS {
+    if outlet_count > limits.maximum_intermediate_tensors {
         return Err(WorkerError::Resource);
     }
     Ok(())
+}
+
+pub(super) fn compute_semantics_digest() -> [u8; 32] {
+    let mut digest = Sha256::new();
+    bind_bytes(
+        &mut digest,
+        b"namespace",
+        b"market-squawk/onnx-worker-compute-limits/v1",
+    );
+    for (name, value) in [
+        (
+            b"maximum-tensor-elements".as_slice(),
+            WORKER_COMPUTE_LIMITS.maximum_tensor_elements,
+        ),
+        (
+            b"maximum-aggregate-intermediate-elements".as_slice(),
+            WORKER_COMPUTE_LIMITS.maximum_aggregate_intermediate_elements,
+        ),
+        (
+            b"maximum-intermediate-tensors".as_slice(),
+            WORKER_COMPUTE_LIMITS.maximum_intermediate_tensors,
+        ),
+        (
+            b"maximum-aggregate-compute-units".as_slice(),
+            WORKER_COMPUTE_LIMITS.maximum_aggregate_compute_units,
+        ),
+    ] {
+        bind_u128(&mut digest, name, value as u128);
+    }
+    bind_bytes(
+        &mut digest,
+        b"compute-cost-rule",
+        b"tract-node-reported-compute-max-node-output-elements/saturating-fail-closed/v1",
+    );
+    digest.finalize().into()
+}
+
+fn bind_u128(digest: &mut Sha256, name: &[u8], value: u128) {
+    bind_bytes(digest, b"field", name);
+    digest.update(value.to_be_bytes());
+}
+
+fn bind_bytes(digest: &mut Sha256, name: &[u8], value: &[u8]) {
+    digest.update((name.len() as u128).to_be_bytes());
+    digest.update(name);
+    digest.update((value.len() as u128).to_be_bytes());
+    digest.update(value);
 }
