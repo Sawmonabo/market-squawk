@@ -13,7 +13,9 @@ use market_squawk_domain::{
     SchemaVersion, SourceId, SourceIdentifier, SymbolIdentityRecord, Timestamp,
 };
 use market_squawk_platform::{CatalogFileGuard, CatalogLocation, CatalogWriterGuard};
-use market_squawk_sources::{OnboardingStateError, ProviderCapabilityError, SourceMetadataError};
+use market_squawk_sources::{
+    OnboardingStateError, ProviderCapabilityError, PublicConfigurationError, SourceMetadataError,
+};
 use rusqlite::Connection;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -797,6 +799,9 @@ pub enum CatalogError {
     /// A code-owned provider capability failed validation.
     #[error("catalog provider capability is invalid: {0}")]
     ProviderCapability(#[from] ProviderCapabilityError),
+    /// A provider onboarding public configuration failed bounded non-secret validation.
+    #[error("catalog provider public configuration is invalid: {0}")]
+    PublicConfiguration(#[from] PublicConfigurationError),
     /// A provider onboarding event failed pure state validation.
     #[error("catalog provider onboarding transition is invalid: {0}")]
     OnboardingState(#[from] OnboardingStateError),

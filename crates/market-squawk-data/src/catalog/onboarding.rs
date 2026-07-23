@@ -4,15 +4,15 @@ use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier, Ti
 use market_squawk_platform::SecretGeneration;
 use market_squawk_sources::{
     AuthoritySet, CapabilityRegistrationOutcome, OnboardingEvent, OnboardingLifecycle,
-    OnboardingState, ProviderCapability, ProviderCapabilityRevision,
+    OnboardingState, ProviderCapability, ProviderCapabilityRevision, ProviderPublicConfiguration,
 };
 use rusqlite::{OptionalExtension as _, Row, Transaction, params};
 use serde::Serialize;
 use uuid::Uuid;
 
+use super::CatalogError;
 use super::runs::CatalogAuthority;
 use super::storage::{ResultBudget, append_audit, sha256, trusted_catalog_now};
-use super::{CatalogError, CatalogResultLimits};
 
 const MAX_ONBOARDING_EVENTS: u64 = 1_024;
 const MAX_CAPABILITY_JSON_BYTES: usize = 65_536;
@@ -21,11 +21,14 @@ const MAX_EVENT_JSON_BYTES: usize = 65_536;
 const MAX_RETRY_BUDGET: u8 = 8;
 const MAX_PROVIDER_SURFACES: i64 = 64;
 const MAX_PROVIDER_REVISIONS: u64 = 256;
+const LEGACY_RESERVATION_SCHEMA_VERSION: i64 = 1;
+const RESERVATION_SCHEMA_VERSION: i64 = 2;
 
 /// Validated immutable input for one durable onboarding reservation.
 #[derive(Clone, Debug)]
 pub struct OnboardingReservationRequest {
     capability: ProviderCapability,
+    public_configuration: ProviderPublicConfiguration,
     requested_authority: AuthoritySet,
     actor_class: SourceIdentifier,
     operation_owner: SourceIdentifier,
@@ -37,6 +40,7 @@ impl OnboardingReservationRequest {
     /// Binds a reservation to one exact capability revision, owner, deadline, and retry ceiling.
     pub fn try_new(
         capability: &ProviderCapability,
+        public_configuration: ProviderPublicConfiguration,
         requested_authority: AuthoritySet,
         actor_class: SourceIdentifier,
         operation_owner: SourceIdentifier,
@@ -49,6 +53,7 @@ impl OnboardingReservationRequest {
         OnboardingLifecycle::reserve(capability, requested_authority.clone())?;
         Ok(Self {
             capability: capability.clone(),
+            public_configuration,
             requested_authority,
             actor_class,
             operation_owner,
@@ -60,6 +65,11 @@ impl OnboardingReservationRequest {
     /// Returns the immutable capability revision.
     pub const fn capability(&self) -> &ProviderCapability {
         &self.capability
+    }
+
+    /// Returns the bounded canonical non-secret provider configuration.
+    pub const fn public_configuration(&self) -> &ProviderPublicConfiguration {
+        &self.public_configuration
     }
 
     /// Returns exact requested authority.
@@ -94,6 +104,7 @@ pub struct OnboardingReservation {
     catalog_id: Uuid,
     session_id: Uuid,
     capability_digest: EvidenceDigest,
+    public_configuration_digest: EvidenceDigest,
     initial_state: OnboardingState,
     created_at: Timestamp,
     deadline_at: Timestamp,
@@ -108,6 +119,11 @@ impl OnboardingReservation {
     /// Returns the exact capability digest.
     pub const fn capability_digest(&self) -> EvidenceDigest {
         self.capability_digest
+    }
+
+    /// Returns the exact canonical public-configuration digest.
+    pub const fn public_configuration_digest(&self) -> EvidenceDigest {
+        self.public_configuration_digest
     }
 
     /// Returns the reservation's pure initial state.
@@ -139,6 +155,7 @@ pub enum OnboardingAppendOutcome {
 #[derive(Clone, Debug)]
 pub struct ResumedProviderOnboarding {
     reservation: OnboardingReservation,
+    public_configuration: ProviderPublicConfiguration,
     lifecycle: OnboardingLifecycle,
     next_sequence: u64,
 }
@@ -147,6 +164,11 @@ impl ResumedProviderOnboarding {
     /// Returns freshly sealed append authority.
     pub const fn reservation(&self) -> &OnboardingReservation {
         &self.reservation
+    }
+
+    /// Returns the recovered canonical non-secret provider configuration.
+    pub const fn public_configuration(&self) -> &ProviderPublicConfiguration {
+        &self.public_configuration
     }
 
     /// Returns the exact replayed pure lifecycle.
@@ -240,9 +262,17 @@ impl CatalogAuthority {
             return Err(CatalogError::InvalidRecord);
         }
         let authority_digest = sha256(&authority_json);
+        let public_configuration_json = request.public_configuration().canonical_json()?;
+        let public_configuration_digest = sha256(&public_configuration_json);
         let session_id = Uuid::new_v4();
-        let audit_digest =
-            reservation_audit_digest(session_id, request, lifecycle.state(), authority_digest)?;
+        let audit_digest = reservation_audit_digest(
+            RESERVATION_SCHEMA_VERSION,
+            session_id,
+            request,
+            lifecycle.state(),
+            authority_digest,
+            public_configuration_digest,
+        )?;
         append_audit(
             &transaction,
             "provider-onboarding.reserved",
@@ -256,8 +286,10 @@ impl CatalogAuthority {
              (session_id, surface_id, capability_revision, capability_sha256, setup_mode,
               actor_class, operation_owner, requested_authority_sha256,
               requested_authority_json, initial_state, deadline_at_ns, retry_budget,
-              created_at_ns, reservation_audit_sequence)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+              created_at_ns, reservation_audit_sequence, reservation_schema_version,
+              public_configuration_sha256, public_configuration_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                     ?16, ?17)",
             params![
                 session_id.to_string(),
                 request.capability().surface_id().as_str(),
@@ -272,7 +304,10 @@ impl CatalogAuthority {
                 request.deadline_at().unix_nanos(),
                 i64::from(request.retry_budget()),
                 created_at.unix_nanos(),
-                audit_sequence
+                audit_sequence,
+                RESERVATION_SCHEMA_VERSION,
+                public_configuration_digest,
+                public_configuration_json,
             ],
         )?;
         transaction.commit()?;
@@ -280,6 +315,10 @@ impl CatalogAuthority {
             catalog_id: self.session_id(),
             session_id,
             capability_digest: request.capability().content_digest(),
+            public_configuration_digest: EvidenceDigest::new(
+                DigestAlgorithm::Sha256,
+                public_configuration_digest,
+            ),
             initial_state: lifecycle.state(),
             created_at,
             deadline_at: request.deadline_at(),
@@ -305,11 +344,12 @@ impl CatalogAuthority {
         }
         let event_digest = sha256(&event_json);
         let transaction = self.catalog().connection.unchecked_transaction()?;
+        let mut budget = ResultBudget::new(self.catalog().result_bytes);
         let mut resumed = load_session(
             &transaction,
             self.session_id(),
             reservation.session_id,
-            self.catalog().result_bytes,
+            &mut budget,
         )?;
         if &resumed.reservation != reservation {
             return Err(CatalogError::InvalidOnboardingReservationCapability);
@@ -370,20 +410,92 @@ impl CatalogAuthority {
         session_id: Uuid,
     ) -> Result<ResumedProviderOnboarding, CatalogError> {
         let transaction = self.catalog().connection.unchecked_transaction()?;
-        let loaded = load_session(
-            &transaction,
-            self.session_id(),
-            session_id,
-            self.catalog().result_bytes,
-        )?;
+        let mut budget = ResultBudget::new(self.catalog().result_bytes);
+        let loaded = load_session(&transaction, self.session_id(), session_id, &mut budget)?;
         transaction.commit()?;
         Ok(loaded.into_public())
+    }
+
+    /// Returns newest-first durable sessions within one global row and byte bound.
+    pub fn provider_onboarding_sessions(
+        &self,
+        limit: super::CatalogLimit,
+    ) -> Result<Vec<ResumedProviderOnboarding>, CatalogError> {
+        self.list_provider_onboarding_sessions(limit, false)
+    }
+
+    /// Returns the latest durable session for each surface in canonical surface order.
+    pub fn current_provider_onboarding_sessions(
+        &self,
+        limit: super::CatalogLimit,
+    ) -> Result<Vec<ResumedProviderOnboarding>, CatalogError> {
+        self.list_provider_onboarding_sessions(limit, true)
+    }
+
+    fn list_provider_onboarding_sessions(
+        &self,
+        limit: super::CatalogLimit,
+        current_only: bool,
+    ) -> Result<Vec<ResumedProviderOnboarding>, CatalogError> {
+        self.catalog().enforce_limit(limit)?;
+        let transaction = self.catalog().connection.unchecked_transaction()?;
+        let row_limit = i64::try_from(limit.get()).map_err(|_| CatalogError::InvalidLimit)?;
+        let sql = if current_only {
+            "SELECT candidate.session_id
+             FROM provider_onboarding_sessions AS candidate
+             WHERE NOT EXISTS (
+                 SELECT 1
+                 FROM provider_onboarding_sessions AS newer
+                 WHERE newer.surface_id=candidate.surface_id
+                   AND (
+                       newer.created_at_ns > candidate.created_at_ns
+                       OR (
+                           newer.created_at_ns = candidate.created_at_ns
+                           AND newer.session_id > candidate.session_id
+                       )
+                   )
+             )
+             ORDER BY candidate.surface_id, candidate.session_id
+             LIMIT ?1"
+        } else {
+            "SELECT session_id
+             FROM provider_onboarding_sessions
+             ORDER BY created_at_ns DESC, surface_id, session_id
+             LIMIT ?1"
+        };
+        let mut statement = transaction.prepare(sql)?;
+        let rows = statement.query_map([row_limit], |row| row.get::<_, String>(0))?;
+        let mut budget = ResultBudget::new(self.catalog().result_bytes);
+        let mut session_ids = Vec::new();
+        session_ids
+            .try_reserve_exact(budget.bounded_row_capacity(limit.get()))
+            .map_err(|_| CatalogError::Allocation)?;
+        for row in rows {
+            let session_id = row?;
+            budget.charge([session_id.len()])?;
+            session_ids
+                .push(Uuid::parse_str(&session_id).map_err(|_| CatalogError::CorruptCatalog)?);
+        }
+        drop(statement);
+        let mut sessions = Vec::new();
+        sessions
+            .try_reserve_exact(session_ids.len())
+            .map_err(|_| CatalogError::Allocation)?;
+        for session_id in session_ids {
+            sessions.push(
+                load_session(&transaction, self.session_id(), session_id, &mut budget)?
+                    .into_public(),
+            );
+        }
+        transaction.commit()?;
+        Ok(sessions)
     }
 }
 
 struct LoadedOnboarding {
     reservation: OnboardingReservation,
     capability: ProviderCapability,
+    public_configuration: ProviderPublicConfiguration,
     lifecycle: OnboardingLifecycle,
     next_sequence: u64,
 }
@@ -392,6 +504,7 @@ impl LoadedOnboarding {
     fn into_public(self) -> ResumedProviderOnboarding {
         ResumedProviderOnboarding {
             reservation: self.reservation,
+            public_configuration: self.public_configuration,
             lifecycle: self.lifecycle,
             next_sequence: self.next_sequence,
         }
@@ -412,6 +525,9 @@ struct StoredSession {
     retry_budget: i64,
     created_at_ns: i64,
     reservation_audit_sequence: i64,
+    reservation_schema_version: i64,
+    public_configuration_sha256: Vec<u8>,
+    public_configuration_json: Vec<u8>,
     capability_json: Vec<u8>,
 }
 
@@ -431,7 +547,10 @@ impl StoredSession {
             retry_budget: row.get(10)?,
             created_at_ns: row.get(11)?,
             reservation_audit_sequence: row.get(12)?,
-            capability_json: row.get(13)?,
+            reservation_schema_version: row.get(13)?,
+            public_configuration_sha256: row.get(14)?,
+            public_configuration_json: row.get(15)?,
+            capability_json: row.get(16)?,
         })
     }
 }
@@ -440,7 +559,7 @@ fn load_session(
     transaction: &Transaction<'_>,
     catalog_id: Uuid,
     session_id: Uuid,
-    limits: CatalogResultLimits,
+    budget: &mut ResultBudget,
 ) -> Result<LoadedOnboarding, CatalogError> {
     let stored = transaction
         .query_row(
@@ -448,6 +567,8 @@ fn load_session(
                     s.actor_class, s.operation_owner, s.requested_authority_sha256,
                     s.requested_authority_json, s.initial_state, s.deadline_at_ns,
                     s.retry_budget, s.created_at_ns, s.reservation_audit_sequence,
+                    s.reservation_schema_version, s.public_configuration_sha256,
+                    s.public_configuration_json,
                     c.capability_json
              FROM provider_onboarding_sessions s
              JOIN provider_capability_revisions c
@@ -460,24 +581,31 @@ fn load_session(
         )
         .optional()?
         .ok_or(CatalogError::OnboardingSessionNotFound)?;
-    let mut budget = ResultBudget::new(limits);
     budget.charge([
         stored.surface_id.len(),
         stored.actor_class.len(),
         stored.operation_owner.len(),
         stored.authority_sha256.len(),
         stored.authority_json.len(),
+        stored.public_configuration_sha256.len(),
+        stored.public_configuration_json.len(),
         stored.capability_json.len(),
     ])?;
     let capability = ProviderCapability::try_from_json(&stored.capability_json)?;
     let requested_authority: AuthoritySet = serde_json::from_slice(&stored.authority_json)?;
     let canonical_authority = serde_json::to_vec(&requested_authority)?;
+    let public_configuration =
+        ProviderPublicConfiguration::try_from_json(&stored.public_configuration_json)?;
+    let canonical_public_configuration = public_configuration.canonical_json()?;
     let capability_digest = sha256_digest(&stored.capability_sha256)?;
     let authority_digest = exact_sha256(&stored.authority_sha256)?;
+    let public_configuration_digest = exact_sha256(&stored.public_configuration_sha256)?;
     if sha256(&stored.capability_json) != capability.content_digest().bytes()
         || capability.content_digest() != capability_digest
         || sha256(&stored.authority_json) != authority_digest
         || canonical_authority != stored.authority_json
+        || sha256(&stored.public_configuration_json) != public_configuration_digest
+        || canonical_public_configuration != stored.public_configuration_json
         || capability.surface_id().as_str() != stored.surface_id
         || to_sql_u64(capability.revision().get())? != stored.capability_revision
         || capability.setup_mode().database_name() != stored.setup_mode
@@ -485,9 +613,9 @@ fn load_session(
     {
         return Err(CatalogError::CorruptCatalog);
     }
-    let actor_class =
-        SourceIdentifier::try_from(stored.actor_class).map_err(|_| CatalogError::CorruptCatalog)?;
-    let operation_owner = SourceIdentifier::try_from(stored.operation_owner)
+    let actor_class = SourceIdentifier::try_from(stored.actor_class.as_str())
+        .map_err(|_| CatalogError::CorruptCatalog)?;
+    let operation_owner = SourceIdentifier::try_from(stored.operation_owner.as_str())
         .map_err(|_| CatalogError::CorruptCatalog)?;
     let mut lifecycle = OnboardingLifecycle::reserve(&capability, requested_authority.clone())?;
     if lifecycle.state().database_name() != stored.initial_state {
@@ -500,6 +628,7 @@ fn load_session(
     }
     let request = OnboardingReservationRequest::try_new(
         &capability,
+        public_configuration.clone(),
         requested_authority,
         actor_class,
         operation_owner,
@@ -508,31 +637,31 @@ fn load_session(
     )?;
     verify_reservation_audit(
         transaction,
-        stored.reservation_audit_sequence,
+        &stored,
         session_id,
         &request,
         lifecycle.state(),
         authority_digest,
-        created_at,
+        public_configuration_digest,
     )?;
     let reservation = OnboardingReservation {
         catalog_id,
         session_id,
         capability_digest,
+        public_configuration_digest: EvidenceDigest::new(
+            DigestAlgorithm::Sha256,
+            public_configuration_digest,
+        ),
         initial_state: lifecycle.state(),
         created_at,
         deadline_at,
     };
-    let next_sequence = replay_events(
-        transaction,
-        session_id,
-        &capability,
-        &mut lifecycle,
-        &mut budget,
-    )?;
+    let next_sequence =
+        replay_events(transaction, session_id, &capability, &mut lifecycle, budget)?;
     Ok(LoadedOnboarding {
         reservation,
         capability,
+        public_configuration,
         lifecycle,
         next_sequence,
     })
@@ -690,7 +819,7 @@ fn require_registered_capability(
 }
 
 #[derive(Serialize)]
-struct ReservationAudit<'a> {
+struct LegacyReservationAudit<'a> {
     version: u8,
     session_id: Uuid,
     surface_id: &'a SourceIdentifier,
@@ -705,49 +834,96 @@ struct ReservationAudit<'a> {
     retry_budget: u8,
 }
 
+#[derive(Serialize)]
+struct ReservationAudit<'a> {
+    version: u8,
+    session_id: Uuid,
+    surface_id: &'a SourceIdentifier,
+    capability_revision: ProviderCapabilityRevision,
+    capability_digest: EvidenceDigest,
+    setup_mode: market_squawk_sources::SetupMode,
+    actor_class: &'a SourceIdentifier,
+    operation_owner: &'a SourceIdentifier,
+    requested_authority_digest: [u8; 32],
+    public_configuration_digest: [u8; 32],
+    initial_state: OnboardingState,
+    deadline_at: Timestamp,
+    retry_budget: u8,
+}
+
 fn reservation_audit_digest(
+    schema_version: i64,
     session_id: Uuid,
     request: &OnboardingReservationRequest,
     initial_state: OnboardingState,
     authority_digest: [u8; 32],
+    public_configuration_digest: [u8; 32],
 ) -> Result<[u8; 32], CatalogError> {
-    let canonical = serde_json::to_vec(&ReservationAudit {
-        version: 1,
-        session_id,
-        surface_id: request.capability().surface_id(),
-        capability_revision: request.capability().revision(),
-        capability_digest: request.capability().content_digest(),
-        setup_mode: request.capability().setup_mode(),
-        actor_class: request.actor_class(),
-        operation_owner: request.operation_owner(),
-        requested_authority_digest: authority_digest,
-        initial_state,
-        deadline_at: request.deadline_at(),
-        retry_budget: request.retry_budget(),
-    })?;
+    let canonical = match schema_version {
+        LEGACY_RESERVATION_SCHEMA_VERSION if request.public_configuration().is_empty() => {
+            serde_json::to_vec(&LegacyReservationAudit {
+                version: 1,
+                session_id,
+                surface_id: request.capability().surface_id(),
+                capability_revision: request.capability().revision(),
+                capability_digest: request.capability().content_digest(),
+                setup_mode: request.capability().setup_mode(),
+                actor_class: request.actor_class(),
+                operation_owner: request.operation_owner(),
+                requested_authority_digest: authority_digest,
+                initial_state,
+                deadline_at: request.deadline_at(),
+                retry_budget: request.retry_budget(),
+            })?
+        }
+        RESERVATION_SCHEMA_VERSION => serde_json::to_vec(&ReservationAudit {
+            version: 2,
+            session_id,
+            surface_id: request.capability().surface_id(),
+            capability_revision: request.capability().revision(),
+            capability_digest: request.capability().content_digest(),
+            setup_mode: request.capability().setup_mode(),
+            actor_class: request.actor_class(),
+            operation_owner: request.operation_owner(),
+            requested_authority_digest: authority_digest,
+            public_configuration_digest,
+            initial_state,
+            deadline_at: request.deadline_at(),
+            retry_budget: request.retry_budget(),
+        })?,
+        _ => return Err(CatalogError::CorruptCatalog),
+    };
     Ok(sha256(&canonical))
 }
 
 fn verify_reservation_audit(
     transaction: &Transaction<'_>,
-    audit_sequence: i64,
+    stored: &StoredSession,
     session_id: Uuid,
     request: &OnboardingReservationRequest,
     initial_state: OnboardingState,
     authority_digest: [u8; 32],
-    created_at: Timestamp,
+    public_configuration_digest: [u8; 32],
 ) -> Result<(), CatalogError> {
     let (event_type, subject, digest, occurred_at): (String, String, Vec<u8>, i64) = transaction
         .query_row(
             "SELECT event_type, subject_id, details_digest, occurred_at_ns
              FROM audit_events WHERE sequence=?1",
-            [audit_sequence],
+            [stored.reservation_audit_sequence],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )?;
     if event_type != "provider-onboarding.reserved"
         || subject != session_id.to_string()
-        || digest != reservation_audit_digest(session_id, request, initial_state, authority_digest)?
-        || occurred_at != created_at.unix_nanos()
+        || digest
+            != reservation_audit_digest(
+                stored.reservation_schema_version,
+                session_id,
+                request,
+                initial_state,
+                authority_digest,
+                public_configuration_digest,
+            )?
+        || occurred_at != stored.created_at_ns
     {
         return Err(CatalogError::CorruptCatalog);
     }

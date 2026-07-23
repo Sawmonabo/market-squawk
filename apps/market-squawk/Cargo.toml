@@ -47,6 +47,9 @@ crc32fast = { workspace = true }
 fs2 = { workspace = true }
 futures-util = { workspace = true }
 getrandom = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
 libc = { workspace = true }
 parking_lot = { workspace = true }
 market-squawk-domain = { workspace = true }
@@ -72,9 +75,11 @@ market-squawk-services = { workspace = true }
 market-squawk-sources = { workspace = true }
 market-squawk-valuation = { workspace = true }
 rust_decimal = { workspace = true }
+reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+subtle = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

@@ -90,12 +90,18 @@ pub use metadata::{
 };
 pub use onboarding::{
     AuthorityBindings, AuthoritySet, AuthorityVerification, AuthorityVerificationInput,
-    CapabilityRegistrationOutcome, CredentialGenerationState, CredentialKind, EvidenceBinding,
-    HumanBoundary, LifecycleSupport, LocalDeletionOutcome, OnboardingEvent, OnboardingEventKind,
-    OnboardingLifecycle, OnboardingState, OnboardingStateError, ProviderCapability,
-    ProviderCapabilityError, ProviderCapabilityInput, ProviderCapabilityRegistry,
-    ProviderCapabilityRevision, RatePolicyDescriptor, RemoteRevocationOutcome,
-    RightsAdmissionState, RuntimeCapabilityObservation, RuntimeProviderCapability, SetupMode,
+    CapabilityRegistrationOutcome, CredentialGenerationState, CredentialKind, DataUseOperation,
+    DataUseRight, EvidenceBinding, HumanBoundary, LifecycleSupport, LocalDeletionOutcome,
+    MAX_PROVIDER_PUBLIC_CONFIGURATION_BYTES, MAX_PROVIDER_PUBLIC_CONFIGURATION_FIELDS,
+    OnboardingEvent, OnboardingEventKind, OnboardingLifecycle, OnboardingState,
+    OnboardingStateError, OperationAdmission, ProbeTransport, ProfileActivationMode,
+    ProfileEvidence, ProfileReleaseState, ProviderCapability, ProviderCapabilityError,
+    ProviderCapabilityInput, ProviderCapabilityRegistry, ProviderCapabilityRevision,
+    ProviderOnboardingProfile, ProviderProfileError, ProviderProfileRegistry,
+    ProviderPublicConfiguration, PublicConfigurationError, RatePolicyDescriptor,
+    RemoteRevocationOutcome, Requirement, RightsAdmissionState, RuntimeCapabilityObservation,
+    RuntimeProviderCapability, SetupMode, VerificationProbe, ZeroFeeStatus,
+    built_in_provider_profiles,
 };
 pub use policy::{
     ApiEndpointRule, AuthorizedRequest, BackoffPolicy, BudgetDecision, BudgetPermit,

@@ -16,6 +16,7 @@ pub mod mcp;
 pub mod order_book;
 pub mod paper_bot;
 pub mod portfolio_application;
+pub mod provider_onboarding;
 pub mod quality;
 pub mod replay;
 pub mod research_service;
@@ -60,5 +61,11 @@ pub use paper_bot::{
 pub use portfolio_application::{
     PortfolioApplicationLimitInput, PortfolioApplicationLimits, PortfolioApplicationService,
     PortfolioApplicationServiceError,
+};
+pub use provider_onboarding::{
+    OnboardingNextAction, OnboardingSessionView, ProviderOnboardingError, ProviderOnboardingPortal,
+    ProviderOnboardingService, ProviderPortalConfig, ProviderPortalError,
+    ProviderProfileRegistration, ProviderProfileRegistrationOutcome, ProviderProfileView,
+    StartOnboardingRequest,
 };
 pub use research_service::{ResearchIngestRequest, ResearchService, ResearchServiceError};

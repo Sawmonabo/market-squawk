@@ -7,10 +7,10 @@ use market_squawk_sources::{CapabilityRegistrationOutcome, OnboardingEvent, Prov
 use uuid::Uuid;
 
 use crate::{
-    CatalogAuthority, CatalogError, FairValueCatalogCommit, FairValueCatalogOperation,
-    FairValueCatalogPosition, FairValueCatalogSnapshot, FairValueCatalogSnapshotLimits,
-    OnboardingAppendOutcome, OnboardingReservation, OnboardingReservationRequest,
-    ResumedProviderOnboarding,
+    CatalogAuthority, CatalogError, CatalogLimit, FairValueCatalogCommit,
+    FairValueCatalogOperation, FairValueCatalogPosition, FairValueCatalogSnapshot,
+    FairValueCatalogSnapshotLimits, OnboardingAppendOutcome, OnboardingReservation,
+    OnboardingReservationRequest, ResumedProviderOnboarding,
 };
 
 /// Cloneable fair-value persistence authority without general catalog or SQLite access.
@@ -112,6 +112,22 @@ impl OnboardingCatalogCapability {
         session_id: Uuid,
     ) -> Result<ResumedProviderOnboarding, CatalogError> {
         self.lock()?.resume_provider_onboarding(session_id)
+    }
+
+    /// Returns newest-first durable sessions within one global row and byte bound.
+    pub fn provider_onboarding_sessions(
+        &self,
+        limit: CatalogLimit,
+    ) -> Result<Vec<ResumedProviderOnboarding>, CatalogError> {
+        self.lock()?.provider_onboarding_sessions(limit)
+    }
+
+    /// Returns the latest durable session for each surface in canonical surface order.
+    pub fn current_provider_onboarding_sessions(
+        &self,
+        limit: CatalogLimit,
+    ) -> Result<Vec<ResumedProviderOnboarding>, CatalogError> {
+        self.lock()?.current_provider_onboarding_sessions(limit)
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, CatalogAuthority>, CatalogError> {
