@@ -4,19 +4,33 @@ use std::{
     io::{Read as _, Write as _},
     num::NonZeroUsize,
     path::Path,
+    sync::Arc,
 };
 
 use async_trait::async_trait;
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
 use cap_std::fs::{Dir, OpenOptions};
 use market_squawk_mcp::{
-    ArtifactError, ArtifactPublication, ArtifactPublicationContext, ArtifactReference,
-    ArtifactRepository,
+    ArtifactError, ArtifactPublication, ArtifactPublicationContext, ArtifactRead,
+    ArtifactReadContext, ArtifactReadRequest, ArtifactReference, ArtifactRepository,
 };
 use market_squawk_platform::ArtifactRoot;
 use sha2::{Digest, Sha256};
 
 const ARTIFACT_NAMESPACE: &str = "mcp/v1";
+const READ_CHECKPOINT_BYTES: usize = 64 * 1024;
+
+#[allow(
+    dead_code,
+    reason = "the integration-owned shared artifact domain consumes this factory"
+)]
+pub(crate) fn controlled_artifact_repository(
+    root: ArtifactRoot,
+    maximum_bytes: NonZeroUsize,
+) -> Result<Arc<dyn ArtifactRepository>, ArtifactError> {
+    ControlledArtifactRepository::try_new(root, maximum_bytes)
+        .map(|repository| Arc::new(repository) as Arc<dyn ArtifactRepository>)
+}
 
 /// Bounded content-addressed repository under the configured artifact capability.
 #[derive(Debug)]
@@ -125,6 +139,21 @@ impl ArtifactRepository for ControlledArtifactRepository {
     ) -> Result<ArtifactReference, ArtifactError> {
         self.publish_bounded(&publication, &context)
     }
+
+    async fn read(
+        &self,
+        request: ArtifactReadRequest,
+        context: ArtifactReadContext,
+    ) -> Result<ArtifactRead, ArtifactError> {
+        context.ensure_live()?;
+        let root = self.root.clone();
+        let maximum_bytes = self.maximum_bytes;
+        tokio::task::spawn_blocking(move || {
+            read_verified_artifact(&root, maximum_bytes, request, &context)
+        })
+        .await
+        .map_err(|_| ArtifactError::Unavailable)?
+    }
 }
 
 #[derive(Debug)]
@@ -197,6 +226,97 @@ fn read_bounded_regular(
         return Err(ArtifactError::Unavailable);
     }
     Ok(bytes)
+}
+
+fn read_verified_artifact(
+    root: &ArtifactRoot,
+    repository_maximum: NonZeroUsize,
+    request: ArtifactReadRequest,
+    context: &ArtifactReadContext,
+) -> Result<ArtifactRead, ArtifactError> {
+    context.ensure_live()?;
+    let reference = request.reference();
+    if reference.id() != format!("mcp-{}", reference.sha256())
+        || reference.media_type() != "application/json"
+    {
+        return Err(ArtifactError::InvalidReference);
+    }
+    if reference.byte_count() > repository_maximum.get()
+        || reference.byte_count() > request.maximum_bytes().get()
+    {
+        return Err(ArtifactError::ReadLimitExceeded);
+    }
+    let prefix = reference
+        .sha256()
+        .get(..2)
+        .ok_or(ArtifactError::InvalidReference)?;
+    let artifact_reference = format!("{ARTIFACT_NAMESPACE}/{prefix}/{}.json", reference.sha256());
+    let artifact_path = Path::new(&artifact_reference);
+    drop(
+        root.resolve(artifact_path)
+            .map_err(|_| ArtifactError::InvalidReference)?,
+    );
+    let directory = root
+        .try_clone_directory()
+        .map_err(|_| ArtifactError::Unavailable)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    options.follow(FollowSymlinks::No);
+    configure_nonblocking_read(&mut options);
+    let mut file = directory
+        .open_with(artifact_path, &options)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                ArtifactError::NotFound
+            } else {
+                ArtifactError::Unavailable
+            }
+        })?;
+    let metadata = file.metadata().map_err(|_| ArtifactError::Unavailable)?;
+    let size = usize::try_from(metadata.len()).map_err(|_| ArtifactError::Unavailable)?;
+    if !metadata.is_file()
+        || size != reference.byte_count()
+        || size > repository_maximum.get()
+        || size > request.maximum_bytes().get()
+    {
+        return Err(ArtifactError::Unavailable);
+    }
+    let mut content = Vec::new();
+    content
+        .try_reserve_exact(size)
+        .map_err(|_| ArtifactError::ReadLimitExceeded)?;
+    content.resize(size, 0);
+    let mut offset = 0_usize;
+    let mut digest = Sha256::new();
+    while offset < size {
+        context.ensure_live()?;
+        let end = offset
+            .checked_add(READ_CHECKPOINT_BYTES)
+            .map(|end| end.min(size))
+            .ok_or(ArtifactError::ReadLimitExceeded)?;
+        let read = file
+            .read(&mut content[offset..end])
+            .map_err(|_| ArtifactError::Unavailable)?;
+        if read == 0 {
+            return Err(ArtifactError::Unavailable);
+        }
+        let read_end = offset
+            .checked_add(read)
+            .ok_or(ArtifactError::ReadLimitExceeded)?;
+        digest.update(&content[offset..read_end]);
+        offset = read_end;
+    }
+    let mut trailing = [0_u8; 1];
+    if file
+        .read(&mut trailing)
+        .map_err(|_| ArtifactError::Unavailable)?
+        != 0
+        || format!("{:x}", digest.finalize()) != reference.sha256()
+    {
+        return Err(ArtifactError::Unavailable);
+    }
+    context.ensure_live()?;
+    ArtifactRead::try_new(request.into_reference(), content)
 }
 
 fn hex_bytes(bytes: &[u8]) -> String {

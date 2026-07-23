@@ -35,6 +35,7 @@ MAX_RUNTIME_DISTRIBUTIONS = 32
 MAX_DISTRIBUTION_FILES = 8_192
 MAX_DISTRIBUTION_ROOTS = 64
 MAX_DISTRIBUTION_FILE_BYTES = 256 * 1024 * 1024
+MAX_NATIVE_EXECUTABLE_BYTES = 768 * 1024 * 1024
 MAX_DISTRIBUTION_BYTES = 1024 * 1024 * 1024
 MAX_RECORD_BYTES = 2 * 1024 * 1024
 RUST_TOOLCHAIN = "1.97.1"
@@ -160,6 +161,13 @@ class InstalledDistribution:
     native_extension: Path | None
     native_extension_sha256: str | None
     native_extension_size: int | None
+
+
+@dataclass(frozen=True)
+class NativeReleaseExecutables:
+    application: Path
+    onnx_worker: Path
+    validator: Path
 
 
 class ReleaseSigner:
@@ -538,6 +546,7 @@ def expected_source_paths(root: Path) -> tuple[str, ...]:
     workspace = _toml(root / "Cargo.toml")
     workspace_dependencies = workspace["workspace"]["dependencies"]
     pending = [
+        root / "apps/market-squawk/Cargo.toml",
         root / "crates/market-squawk-python/Cargo.toml",
         root / "crates/market-squawk-modeling/Cargo.toml",
     ]
@@ -896,9 +905,15 @@ def _build_release(
             str(_bound_tool(toolchain, "cargo")),
             "build",
             "-p",
+            "market-squawk",
+            "--bin",
+            "market-squawk",
+            "-p",
             "market-squawk-modeling",
             "--bin",
             "market-squawk-model-validator",
+            "--bin",
+            "market-squawk-onnx-worker",
             "--release",
             "--locked",
         ],
@@ -906,9 +921,25 @@ def _build_release(
         bootstrap_environment,
     )
     validator = root / "target/release/market-squawk-model-validator"
-    if not validator.is_file():
-        raise ReleaseBuildError("Rust model validator executable was not produced")
+    application = root / "target/release/market-squawk"
+    onnx_worker = root / "target/release/market-squawk-onnx-worker"
+    executables = NativeReleaseExecutables(
+        application=application,
+        onnx_worker=onnx_worker,
+        validator=validator,
+    )
+    if any(
+        path.is_symlink() or not path.is_file()
+        for path in (
+            executables.application,
+            executables.onnx_worker,
+            executables.validator,
+        )
+    ):
+        raise ReleaseBuildError("bound Rust release executables were not produced")
     validator_size, validator_sha256 = _file_digest(validator)
+    application_size, application_sha256 = _file_digest(application)
+    onnx_worker_size, onnx_worker_sha256 = _file_digest(onnx_worker)
     build_python = _create_venv(
         build_runtime,
         layout.build_venv,
@@ -969,8 +1000,7 @@ def _build_release(
         python_tag,
         abi_tag,
         platform_tag,
-        validator_size,
-        validator_sha256,
+        executables,
         signer,
     )
     (layout.root / "market-squawk-release.json").write_bytes(release_manifest)
@@ -1019,11 +1049,16 @@ def _build_release(
             root,
             runtime_environment,
         )
-        validator_destination = release_venv / "bin/market-squawk-model-validator"
-        shutil.copy2(validator, validator_destination)
-        validator_destination.chmod(0o755)
-        if _file_digest(validator_destination)[1] != validator_sha256:
-            raise ReleaseBuildError("installed model validator identity changed")
+        for executable, expected_identity in (
+            (application, (application_size, application_sha256)),
+            (onnx_worker, (onnx_worker_size, onnx_worker_sha256)),
+            (validator, (validator_size, validator_sha256)),
+        ):
+            destination = release_venv / "bin" / executable.name
+            shutil.copy2(executable, destination)
+            destination.chmod(0o755)
+            if _file_digest(destination) != expected_identity:
+                raise ReleaseBuildError("installed native release identity changed")
         distribution = inspect_installed_distribution(
             release_venv,
             runtime,
@@ -1095,10 +1130,12 @@ def _build_release(
                     for value in runtime_distributions
                 ],
                 "validator_sha256": validator_sha256,
+                "application_sha256": application_sha256,
+                "onnx_worker_sha256": onnx_worker_sha256,
             }
         )
     evidence = {
-        "schema_version": 4,
+        "schema_version": 5,
         "support_matrix": matrix_evidence,
         "toolchain": toolchain,
         "build_environment": {
@@ -1124,6 +1161,11 @@ def _build_release(
             "abi_tag": abi_tag,
             "platform_tag": platform_tag,
             "macos_deployment_target": MACOS_DEPLOYMENT_TARGET,
+        },
+        "native_executables": {
+            "application_sha256": application_sha256,
+            "onnx_worker_sha256": onnx_worker_sha256,
+            "validator_sha256": validator_sha256,
         },
     }
     (layout.root / "market-squawk-release-evidence.json").write_text(
@@ -1483,17 +1525,44 @@ def build_release_manifest(
     python_tag: str,
     abi_tag: str,
     platform_tag: str,
-    validator_size: int,
-    validator_sha256: str,
+    executables: NativeReleaseExecutables,
     signer: ReleaseSigner,
 ) -> tuple[bytes, str]:
-    """Bind the exact wheel and validator without a self-referential wheel digest."""
+    """Bind the exact wheel and native product without a self-referential digest."""
 
     _sha256(foundation_sha256)
-    _sha256(validator_sha256)
     wheel_size, wheel_sha256 = _file_digest(project_wheel)
+    expected_names = {
+        "application": "market-squawk",
+        "onnx_worker": "market-squawk-onnx-worker",
+        "validator": "market-squawk-model-validator",
+    }
+    native_files = {
+        name: getattr(executables, name) for name in expected_names
+    }
+    if any(
+        path.name != expected_names[name] or path.is_symlink() or not path.is_file()
+        for name, path in native_files.items()
+    ):
+        raise ReleaseBuildError("native release executable identity is invalid")
+    native_identities = {
+        name: _file_digest(path) for name, path in native_files.items()
+    }
+    if any(
+        size <= 0 or size > MAX_NATIVE_EXECUTABLE_BYTES
+        for size, _digest in native_identities.values()
+    ):
+        raise ReleaseBuildError("native release executable exceeds its byte bound")
     payload = {
+        "application": {
+            "sha256": native_identities["application"][1],
+            "size_bytes": native_identities["application"][0],
+        },
         "foundation_sha256": foundation_sha256,
+        "onnx_worker": {
+            "sha256": native_identities["onnx_worker"][1],
+            "size_bytes": native_identities["onnx_worker"][0],
+        },
         "project_wheel": {
             "abi_tag": abi_tag,
             "filename": project_wheel.name,
@@ -1503,10 +1572,10 @@ def build_release_manifest(
             "sha256": wheel_sha256,
             "size_bytes": wheel_size,
         },
-        "schema_version": 1,
+        "schema_version": 2,
         "validator": {
-            "sha256": validator_sha256,
-            "size_bytes": validator_size,
+            "sha256": native_identities["validator"][1],
+            "size_bytes": native_identities["validator"][0],
         },
     }
     payload_bytes = json.dumps(
@@ -1518,7 +1587,7 @@ def build_release_manifest(
     ).encode("ascii")
     manifest = {
         "payload": payload,
-        "schema_version": 1,
+        "schema_version": 2,
         "signature": signer.sign(RELEASE_MANIFEST_DOMAIN, payload_bytes),
     }
     encoded = json.dumps(

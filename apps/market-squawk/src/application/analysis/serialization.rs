@@ -5,7 +5,7 @@ use market_squawk_analytics::{
     FeatureTimeSemantics, FeatureUnit, FeatureWarmUp, MissingValuePolicy, ShockComposition,
     VarianceConvention, WeightPolicy,
 };
-use market_squawk_data::{DatasetManifestRef, FeatureLabelDataset};
+use market_squawk_data::{AnalyticalFeatureDataset, DatasetManifestRef, FeatureLabelDataset};
 use serde_json::{Value, json};
 
 use crate::application::domain_support::encode_hex;
@@ -57,6 +57,27 @@ pub(super) fn feature_dataset_value(dataset: &FeatureLabelDataset) -> Value {
         "buildSpecDigest": encode_hex(dataset.build_spec_digest().digest().bytes()),
         "policyDigest": encode_hex(dataset.policy_digest().bytes()),
         "universeDigest": encode_hex(dataset.universe_digest().bytes()),
+        "splitCounts": {
+            "train": split.train_examples(),
+            "validation": split.validation_examples(),
+            "test": split.test_examples()
+        }
+    })
+}
+
+pub(super) fn published_feature_dataset_value(dataset: &AnalyticalFeatureDataset) -> Value {
+    let split = dataset.split_counts();
+    json!({
+        "kind": "feature_dataset",
+        "manifest": manifest_value(dataset.generation().manifest()),
+        "buildSpecDigest": dataset
+            .generation()
+            .build_spec_digest()
+            .map(|digest| encode_hex(digest.digest().bytes())),
+        "policyDigest": encode_hex(dataset.policy_digest().bytes()),
+        "universeId": dataset.universe_id().as_str(),
+        "universeDigest": encode_hex(dataset.universe_digest().bytes()),
+        "pythonExportSha256": encode_hex(dataset.python_export_sha256().bytes()),
         "splitCounts": {
             "train": split.train_examples(),
             "validation": split.validation_examples(),

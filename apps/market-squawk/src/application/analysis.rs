@@ -8,6 +8,10 @@ use market_squawk_analytics::{
     ExactDecimalUnit, FactorRegressionResult, MonetaryBasis, PortfolioAttribution,
     StatisticalResult,
 };
+use market_squawk_data::{
+    AnalyticalFeatureDataset, AnalyticalReadCapability, AnalyticalReadError, AnalyticalReadLimit,
+    DatasetId, ManifestCatalogError, QueryError,
+};
 use market_squawk_domain::{InstrumentId, RoundingPolicy, SourceId, Timestamp};
 use market_squawk_services::{
     RequestContext, ServiceDomain, ServiceError, ToolResultMetadata, TypedToolRequest,
@@ -43,7 +47,9 @@ pub use catalog::{
 };
 
 use catalog::FeatureDatasetRegistration as FeatureDataset;
-use serialization::{feature_dataset_value, feature_metadata_value, manifest_value};
+use serialization::{
+    feature_dataset_value, feature_metadata_value, manifest_value, published_feature_dataset_value,
+};
 
 const GET_RETURNS: &str = "Analysis.GetReturns";
 const GET_FACTORS: &str = "Analysis.GetFactors";
@@ -56,6 +62,7 @@ const RUN_BACKTEST: &str = "Analysis.RunBacktest";
 /// Application-owned analytical surface over immutable inputs and governed experiment authority.
 pub struct AnalysisDomainService {
     catalog: Arc<AnalysisCatalog>,
+    feature_reader: Option<AnalyticalReadCapability>,
     backtest_inputs: Arc<dyn GovernedBacktestInputRegistrar>,
     backtests: Arc<dyn GovernedBacktestAuthority>,
     lifecycle: Arc<DomainLifecycle>,
@@ -71,6 +78,24 @@ impl AnalysisDomainService {
     ) -> Self {
         Self {
             catalog,
+            feature_reader: None,
+            backtest_inputs,
+            backtests,
+            lifecycle: DomainLifecycle::new(),
+        }
+    }
+
+    /// Binds the durable feature-dataset registry in addition to immutable analytical inputs.
+    #[must_use]
+    pub fn new_with_feature_reader(
+        catalog: Arc<AnalysisCatalog>,
+        feature_reader: AnalyticalReadCapability,
+        backtest_inputs: Arc<dyn GovernedBacktestInputRegistrar>,
+        backtests: Arc<dyn GovernedBacktestAuthority>,
+    ) -> Self {
+        Self {
+            catalog,
+            feature_reader: Some(feature_reader),
             backtest_inputs,
             backtests,
             lifecycle: DomainLifecycle::new(),
@@ -216,6 +241,7 @@ impl AnalysisDomainService {
     ) -> Result<TypedToolResult, ServiceError> {
         let scope = ReadScope::from_arguments(request.arguments())?;
         let requested_dataset = request.arguments().get("dataset").and_then(Value::as_str);
+        let limits = admitted_result_limits(request, context)?;
         let mut selected = self
             .catalog
             .feature_datasets()
@@ -226,12 +252,6 @@ impl AnalysisDomainService {
                 }) && scope.matches(dataset.scope())
             })
             .collect::<Vec<_>>();
-        if requested_dataset.is_some() && selected.is_empty() {
-            return Err(ServiceError::NotFound);
-        }
-        if scope.has_filter() && selected.is_empty() {
-            return Err(ServiceError::NotFound);
-        }
         selected.sort_unstable_by(|left, right| {
             left.dataset()
                 .manifest()
@@ -239,14 +259,38 @@ impl AnalysisDomainService {
                 .as_str()
                 .cmp(right.dataset().manifest().dataset_id().as_str())
         });
+        let (mut published, mut published_available, published_has_more) =
+            self.published_feature_datasets(requested_dataset, &scope, limits, context)?;
+        let overlaps = published
+            .iter()
+            .filter(|candidate| {
+                selected.iter().any(|registered| {
+                    registered.dataset().manifest().dataset_id()
+                        == candidate.generation().manifest().dataset_id()
+                })
+            })
+            .count();
+        published.retain(|candidate| {
+            !selected.iter().any(|registered| {
+                registered.dataset().manifest().dataset_id()
+                    == candidate.generation().manifest().dataset_id()
+            })
+        });
+        published_available = published_available.saturating_sub(overlaps);
+        if requested_dataset.is_some() && selected.is_empty() && published.is_empty() {
+            return Err(ServiceError::NotFound);
+        }
+        if scope.has_filter() && selected.is_empty() {
+            return Err(ServiceError::NotFound);
+        }
         let available = self
             .catalog
             .feature_catalog()
             .entries()
             .len()
             .checked_add(selected.len())
+            .and_then(|available| available.checked_add(published_available))
             .ok_or(ServiceError::ResourceExhausted)?;
-        let limits = admitted_result_limits(request, context)?;
         let mut items = Vec::new();
         for metadata in self.catalog.feature_catalog().entries() {
             if items.len() == limits.maximum_result_items() {
@@ -260,10 +304,52 @@ impl AnalysisDomainService {
             }
             items.push(feature_dataset_value(dataset.dataset()));
         }
-        let metadata = combined_feature_metadata(&selected, items.len(), available)?;
+        for dataset in &published {
+            if items.len() == limits.maximum_result_items() {
+                break;
+            }
+            items.push(published_feature_dataset_value(dataset));
+        }
+        let metadata = combined_feature_metadata(&selected, &published, items.len(), available)?;
         let item_count = items.len().max(1);
-        TypedToolResult::try_new(json!({"items": items}), item_count, metadata, limits)
-            .map_err(|_| ServiceError::ResourceExhausted)
+        TypedToolResult::try_new(
+            json!({
+                "items": items,
+                "hasMore": published_has_more || item_count < available
+            }),
+            item_count,
+            metadata,
+            limits,
+        )
+        .map_err(|_| ServiceError::ResourceExhausted)
+    }
+
+    fn published_feature_datasets(
+        &self,
+        requested_dataset: Option<&str>,
+        scope: &ReadScope,
+        limits: market_squawk_services::ServiceLimits,
+        context: &RequestContext,
+    ) -> Result<(Vec<AnalyticalFeatureDataset>, usize, bool), ServiceError> {
+        let Some(reader) = self.feature_reader.as_ref().filter(|_| !scope.has_filter()) else {
+            return Ok((Vec::new(), 0, false));
+        };
+        if let Some(dataset) = requested_dataset {
+            let dataset = DatasetId::try_from(dataset).map_err(|_| ServiceError::InvalidRequest)?;
+            let selected = reader
+                .feature_dataset(&dataset, context.deadline(), context.cancellation())
+                .map_err(map_feature_read_error)?
+                .into_iter()
+                .collect::<Vec<_>>();
+            let available = selected.len();
+            return Ok((selected, available, false));
+        }
+        let limit = AnalyticalReadLimit::try_new(limits.maximum_result_items().min(64))
+            .map_err(map_feature_read_error)?;
+        let page = reader
+            .feature_datasets(None, limit, context.deadline(), context.cancellation())
+            .map_err(map_feature_read_error)?;
+        Ok((page.datasets().to_vec(), page.available(), page.has_more()))
     }
 
     async fn get_backtest(
@@ -552,6 +638,7 @@ fn dataset_metadata(
 
 fn combined_feature_metadata(
     selected: &[&FeatureDataset],
+    published: &[AnalyticalFeatureDataset],
     returned: usize,
     available: usize,
 ) -> Result<ToolResultMetadata, ServiceError> {
@@ -571,9 +658,21 @@ fn combined_feature_metadata(
             }
         }
     }
+    for dataset in published {
+        for source in dataset.source_ids() {
+            if source_set.insert(source.clone()) {
+                sources.push(source.clone());
+            }
+        }
+    }
+    sources.sort_unstable();
+    let dataset_count = selected
+        .len()
+        .checked_add(published.len())
+        .ok_or(ServiceError::ResourceExhausted)?;
     let coverage = json!({
         "sources": sources,
-        "datasetCount": selected.len(),
+        "datasetCount": dataset_count,
         "pointInTime": true
     });
     let quality = json!({
@@ -584,6 +683,42 @@ fn combined_feature_metadata(
         ToolResultMetadata::try_truncated(available, coverage, quality).map_err(Into::into)
     } else {
         ToolResultMetadata::try_complete(coverage, quality).map_err(Into::into)
+    }
+}
+
+fn map_feature_read_error(error: AnalyticalReadError) -> ServiceError {
+    match error {
+        AnalyticalReadError::InvalidLimit
+        | AnalyticalReadError::InstrumentLimitExceeded
+        | AnalyticalReadError::InvalidKnowledgeRange
+        | AnalyticalReadError::InvalidObservationSchema => ServiceError::InvalidRequest,
+        AnalyticalReadError::Manifest(ManifestCatalogError::Cancelled)
+        | AnalyticalReadError::Query(QueryError::Cancelled) => ServiceError::Cancelled,
+        AnalyticalReadError::Manifest(ManifestCatalogError::DeadlineExceeded)
+        | AnalyticalReadError::Query(QueryError::DeadlineExceeded) => {
+            ServiceError::DeadlineExceeded
+        }
+        AnalyticalReadError::Manifest(
+            ManifestCatalogError::ObjectLimitExceeded { .. }
+            | ManifestCatalogError::ReferenceWorkLimitExceeded { .. }
+            | ManifestCatalogError::CountOverflow
+            | ManifestCatalogError::AllocationContract,
+        )
+        | AnalyticalReadError::Query(
+            QueryError::InvalidLimits
+            | QueryError::RowLimitExceeded { .. }
+            | QueryError::ByteLimitExceeded { .. }
+            | QueryError::MemoryLimitExceeded { .. }
+            | QueryError::SizeOverflow
+            | QueryError::DependencyAllocationContract
+            | QueryError::BlockingTaskLimitExceeded
+            | QueryError::ReaderMemoryBoundExceeded
+            | QueryError::ArtifactStoreRequired
+            | QueryError::ArtifactAuthorityRequired,
+        ) => ServiceError::ResourceExhausted,
+        AnalyticalReadError::Manifest(_) | AnalyticalReadError::Query(_) => {
+            ServiceError::Unavailable
+        }
     }
 }
 

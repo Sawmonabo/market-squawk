@@ -57,8 +57,8 @@ pub use registry::{
     ModelRegistry, ModelRegistryError,
 };
 pub use training_environment::{
-    TrainingEnvironmentError, VerifiedTrainingEnvironment, verify_python_training_environment,
-    verify_validator_training_environment,
+    TrainingEnvironmentError, VerifiedTrainingEnvironment, verify_application_training_environment,
+    verify_python_training_environment, verify_validator_training_environment,
 };
 
 /// Exact typed model failure before an execution strategy can create an order intent.

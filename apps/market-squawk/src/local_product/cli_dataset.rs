@@ -34,6 +34,9 @@ pub enum CliDatasetError {
     /// The production research service rejected or failed publication.
     #[error("dataset build failed: {0}")]
     Build(#[from] ResearchServiceError),
+    /// The already admitted dataset could not reproduce its bounded canonical Python descriptor.
+    #[error("dataset Python export could not be reproduced: {0}")]
+    PythonExport(#[from] market_squawk_data::DatasetBuildError),
 }
 
 /// Admits caller-materialized feature/label examples and publishes one immutable PIT dataset.
@@ -60,6 +63,7 @@ pub(super) async fn build_point_in_time_dataset(
         .await?;
     let manifest = built.manifest();
     let splits = built.split_counts();
+    let python_export_sha256 = built.python_export()?.content_hash();
     Ok(json!({
         "manifest": {
             "dataset": manifest.dataset_id().as_str(),
@@ -72,6 +76,7 @@ pub(super) async fn build_point_in_time_dataset(
         "buildSpecSha256": encode_hex(built.build_spec_digest().digest().bytes()),
         "policySha256": encode_hex(built.policy_digest().bytes()),
         "universeSha256": encode_hex(built.universe_digest().bytes()),
+        "pythonExportSha256": encode_hex(python_export_sha256.bytes()),
         "splitExamples": {
             "train": splits.train_examples(),
             "validation": splits.validation_examples(),

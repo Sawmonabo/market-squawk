@@ -9,12 +9,13 @@ use market_squawk_domain::{InstrumentId, SourceId, Timestamp};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-use crate::manifest::CatalogGenerationPage;
+use crate::manifest::{CatalogFeatureDataset, CatalogFeatureDatasetPage, CatalogGenerationPage};
 use crate::{
     AnalyticalManifestCatalog, DatasetBuildSpecDigest, DatasetId, DatasetManifestRef,
-    DatasetSchemaRegistry, GenerationKind, GenerationParent, ManifestCatalogError,
-    ParquetObjectStore, PinnedDataset, PinnedFeatureMonetaryValue, PinnedMonetaryValue,
-    PinnedQueryOutput, QueryError, QueryLimits, QueryRequest, ResearchQueryEngine, Sha256Digest,
+    DatasetSchemaRegistry, DatasetSplitCounts, GenerationKind, GenerationParent,
+    ManifestCatalogError, ParquetObjectStore, PinnedDataset, PinnedFeatureMonetaryValue,
+    PinnedMonetaryValue, PinnedQueryOutput, QueryError, QueryLimits, QueryRequest,
+    ResearchQueryEngine, Sha256Digest, UniverseId,
 };
 
 const MAX_READ_ITEMS: usize = 64;
@@ -51,10 +52,15 @@ pub struct AnalyticalGeneration {
     total_bytes: u64,
     lineage_digest: Sha256Digest,
     object_count: usize,
+    python_export_sha256: Option<Sha256Digest>,
 }
 
 impl AnalyticalGeneration {
-    fn from_pinned(pinned: PinnedDataset, source_id: SourceId) -> Self {
+    fn from_pinned(
+        pinned: PinnedDataset,
+        source_id: SourceId,
+        python_export_sha256: Option<Sha256Digest>,
+    ) -> Self {
         Self {
             manifest: pinned.manifest().clone(),
             source_id,
@@ -65,6 +71,7 @@ impl AnalyticalGeneration {
             total_bytes: pinned.plan().total_bytes(),
             lineage_digest: pinned.plan().lineage_digest(),
             object_count: pinned.objects().len(),
+            python_export_sha256,
         }
     }
 
@@ -112,6 +119,11 @@ impl AnalyticalGeneration {
     pub const fn object_count(&self) -> usize {
         self.object_count
     }
+
+    /// Returns the exact admitted canonical Python descriptor digest for a feature dataset.
+    pub const fn python_export_sha256(&self) -> Option<Sha256Digest> {
+        self.python_export_sha256
+    }
 }
 
 /// One stable bounded page of immutable generations.
@@ -126,7 +138,9 @@ impl AnalyticalGenerationPage {
         let generations = page
             .generations
             .into_iter()
-            .map(|(pinned, source_id)| AnalyticalGeneration::from_pinned(pinned, source_id))
+            .map(|(pinned, source_id, export)| {
+                AnalyticalGeneration::from_pinned(pinned, source_id, export)
+            })
             .collect::<Vec<_>>()
             .into_boxed_slice();
         Self {
@@ -143,6 +157,124 @@ impl AnalyticalGenerationPage {
     /// Returns whether another cursor-bounded page exists.
     pub const fn has_more(&self) -> bool {
         self.has_more
+    }
+}
+
+/// One durable Python-admitted feature/label generation in the public analytical registry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AnalyticalFeatureDataset {
+    generation: AnalyticalGeneration,
+    python_export_sha256: Sha256Digest,
+    policy_digest: Sha256Digest,
+    universe_digest: Sha256Digest,
+    universe_id: UniverseId,
+    split_counts: DatasetSplitCounts,
+    source_ids: Box<[SourceId]>,
+}
+
+impl AnalyticalFeatureDataset {
+    fn from_catalog(dataset: CatalogFeatureDataset) -> Result<Self, AnalyticalReadError> {
+        let summary = crate::python_dataset::feature_dataset_summary(
+            &dataset.descriptor,
+            dataset.export_sha256,
+        )
+        .map_err(|_| AnalyticalReadError::Manifest(ManifestCatalogError::CorruptCatalog))?;
+        let generation = AnalyticalGeneration::from_pinned(
+            dataset.pinned,
+            dataset.source_id,
+            Some(dataset.export_sha256),
+        );
+        if summary.identity.manifest() != generation.manifest()
+            || summary.identity.build_spec_digest()
+                != generation
+                    .build_spec_digest()
+                    .ok_or(ManifestCatalogError::CorruptCatalog)?
+        {
+            return Err(ManifestCatalogError::CorruptCatalog.into());
+        }
+        Ok(Self {
+            generation,
+            python_export_sha256: dataset.export_sha256,
+            policy_digest: summary.identity.policy_digest(),
+            universe_digest: summary.identity.universe_digest(),
+            universe_id: summary.identity.universe_id().clone(),
+            split_counts: summary.split_counts,
+            source_ids: dataset.source_ids,
+        })
+    }
+
+    /// Returns the immutable generation and retained source owner.
+    pub const fn generation(&self) -> &AnalyticalGeneration {
+        &self.generation
+    }
+
+    /// Returns the exact canonical descriptor digest admitted for native Python verification.
+    pub const fn python_export_sha256(&self) -> Sha256Digest {
+        self.python_export_sha256
+    }
+
+    /// Returns the exact point-in-time and transformation-policy identity.
+    pub const fn policy_digest(&self) -> Sha256Digest {
+        self.policy_digest
+    }
+
+    /// Returns the exact historical-universe contract identity.
+    pub const fn universe_digest(&self) -> Sha256Digest {
+        self.universe_digest
+    }
+
+    /// Returns the human-stable historical-universe identity.
+    pub const fn universe_id(&self) -> &UniverseId {
+        &self.universe_id
+    }
+
+    /// Returns admitted example counts by chronological split.
+    pub const fn split_counts(&self) -> DatasetSplitCounts {
+        self.split_counts
+    }
+
+    /// Returns the canonical source-rights owners of all exact input generations.
+    pub fn source_ids(&self) -> &[SourceId] {
+        &self.source_ids
+    }
+}
+
+/// One stable bounded page of durable Python-admitted feature datasets.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AnalyticalFeatureDatasetPage {
+    datasets: Box<[AnalyticalFeatureDataset]>,
+    has_more: bool,
+    available: usize,
+}
+
+impl AnalyticalFeatureDatasetPage {
+    fn from_catalog(page: CatalogFeatureDatasetPage) -> Result<Self, AnalyticalReadError> {
+        let datasets = page
+            .datasets
+            .into_iter()
+            .map(AnalyticalFeatureDataset::from_catalog)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_boxed_slice();
+        Ok(Self {
+            datasets,
+            has_more: page.has_more,
+            available: page.available,
+        })
+    }
+
+    /// Returns feature datasets in stable dataset-id order.
+    pub fn datasets(&self) -> &[AnalyticalFeatureDataset] {
+        &self.datasets
+    }
+
+    /// Returns whether another cursor-bounded page exists.
+    pub const fn has_more(&self) -> bool {
+        self.has_more
+    }
+
+    /// Returns the exact number of latest admitted dataset identities in the catalog snapshot.
+    pub const fn available(&self) -> usize {
+        self.available
     }
 }
 
@@ -349,6 +481,34 @@ impl AnalyticalReadCapability {
             .map_err(Into::into)
     }
 
+    /// Lists one stable dataset-id page of durable Python-admitted feature generations.
+    pub fn feature_datasets(
+        &self,
+        after: Option<&DatasetId>,
+        limit: AnalyticalReadLimit,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<AnalyticalFeatureDatasetPage, AnalyticalReadError> {
+        self.manifests
+            .read_feature_dataset_page(after, limit.get(), deadline, cancellation)
+            .map_err(AnalyticalReadError::from)
+            .and_then(AnalyticalFeatureDatasetPage::from_catalog)
+    }
+
+    /// Resolves the latest durable Python admission for one feature-dataset identity.
+    pub fn feature_dataset(
+        &self,
+        dataset_id: &DatasetId,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<AnalyticalFeatureDataset>, AnalyticalReadError> {
+        self.manifests
+            .read_feature_dataset(dataset_id, deadline, cancellation)
+            .map_err(AnalyticalReadError::from)?
+            .map(AnalyticalFeatureDataset::from_catalog)
+            .transpose()
+    }
+
     /// Resolves the latest immutable generation for one dataset.
     pub fn latest(
         &self,
@@ -359,7 +519,9 @@ impl AnalyticalReadCapability {
         Ok(self
             .manifests
             .read_latest(dataset_id, deadline, cancellation)?
-            .map(|(pinned, source_id)| AnalyticalGeneration::from_pinned(pinned, source_id)))
+            .map(|(pinned, source_id, export)| {
+                AnalyticalGeneration::from_pinned(pinned, source_id, export)
+            }))
     }
 
     /// Resolves only the exact supplied immutable generation identity.
@@ -369,10 +531,10 @@ impl AnalyticalReadCapability {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<AnalyticalGeneration, AnalyticalReadError> {
-        let (pinned, source_id) = self
-            .manifests
-            .read_exact(manifest, deadline, cancellation)?;
-        Ok(AnalyticalGeneration::from_pinned(pinned, source_id))
+        let (pinned, source_id, export) =
+            self.manifests
+                .read_exact(manifest, deadline, cancellation)?;
+        Ok(AnalyticalGeneration::from_pinned(pinned, source_id, export))
     }
 
     /// Returns a newest-first generation-history page below an optional exclusive version cursor.
@@ -405,7 +567,7 @@ impl AnalyticalReadCapability {
     ) -> Result<SourceId, AnalyticalReadError> {
         self.manifests
             .read_exact(manifest, deadline, cancellation)
-            .map(|(_, source_id)| source_id)
+            .map(|(_, source_id, _)| source_id)
             .map_err(Into::into)
     }
 
@@ -417,7 +579,7 @@ impl AnalyticalReadCapability {
         deadline: Instant,
         cancellation: CancellationToken,
     ) -> Result<AnalyticalObservationOutput, AnalyticalReadError> {
-        let (pinned, source_id) =
+        let (pinned, source_id, _) =
             self.manifests
                 .read_exact(request.manifest(), deadline, &cancellation)?;
         let query = QueryRequest::try_new(pinned.manifest().clone(), request.sql())?;
@@ -464,7 +626,7 @@ impl AnalyticalReadCapability {
         deadline: Instant,
         cancellation: CancellationToken,
     ) -> Result<PinnedMonetaryValue, AnalyticalReadError> {
-        let (pinned, _) = self
+        let (pinned, _, _) = self
             .manifests
             .read_exact(manifest, deadline, &cancellation)?;
         let operation_cancellation = cancellation.child_token();
@@ -513,7 +675,7 @@ impl AnalyticalReadCapability {
         deadline: Instant,
         cancellation: CancellationToken,
     ) -> Result<PinnedFeatureMonetaryValue, AnalyticalReadError> {
-        let (pinned, _) = self
+        let (pinned, _, _) = self
             .manifests
             .read_exact(manifest, deadline, &cancellation)?;
         let operation_cancellation = cancellation.child_token();

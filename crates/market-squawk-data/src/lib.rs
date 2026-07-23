@@ -35,9 +35,10 @@ pub use analytical_backup::{
     AnalyticalRestoreMode, AnalyticalRestoreTarget, VerifiedAnalyticalBackup,
 };
 pub use analytical_read::{
-    AnalyticalGeneration, AnalyticalGenerationPage, AnalyticalObservationOutput,
-    AnalyticalObservationReadRequest, AnalyticalObservationTemplate, AnalyticalReadCapability,
-    AnalyticalReadError, AnalyticalReadLimit, ObservationKnowledgeRange,
+    AnalyticalFeatureDataset, AnalyticalFeatureDatasetPage, AnalyticalGeneration,
+    AnalyticalGenerationPage, AnalyticalObservationOutput, AnalyticalObservationReadRequest,
+    AnalyticalObservationTemplate, AnalyticalReadCapability, AnalyticalReadError,
+    AnalyticalReadLimit, ObservationKnowledgeRange,
 };
 pub use arrow_convert::{
     ArrowConversionError, DatasetArrowBatch, DatasetSchemaError, DatasetSchemaRef,

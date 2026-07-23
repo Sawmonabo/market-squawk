@@ -1106,6 +1106,42 @@ async fn point_in_time_builder_publishes_one_authorized_queryable_generation() -
         .build(request, CancellationToken::new())
         .await?;
     assert_eq!(replayed.manifest(), built.manifest());
+    let cancellation = CancellationToken::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let reader = service.analytical_reader();
+    let listed = reader
+        .latest(built.manifest().dataset_id(), deadline, &cancellation)?
+        .ok_or("missing built feature dataset")?;
+    assert_eq!(
+        listed.python_export_sha256(),
+        Some(export.content_hash()),
+        "the public generation record must expose the exact admitted Python export"
+    );
+    let feature_page = reader.feature_datasets(
+        None,
+        AnalyticalReadLimit::try_new(8)?,
+        deadline,
+        &cancellation,
+    )?;
+    assert!(!feature_page.has_more());
+    let registered = feature_page
+        .datasets()
+        .iter()
+        .find(|dataset| dataset.generation().manifest() == built.manifest())
+        .ok_or("built feature dataset is absent from the public registry")?;
+    assert_eq!(registered.python_export_sha256(), export.content_hash());
+    assert_eq!(registered.policy_digest(), built.policy_digest());
+    assert_eq!(registered.universe_digest(), built.universe_digest());
+    assert_eq!(registered.universe_id().as_str(), "us-equities.historical");
+    assert_eq!(registered.split_counts(), built.split_counts());
+    assert_eq!(
+        registered
+            .source_ids()
+            .iter()
+            .map(SourceId::as_str)
+            .collect::<Vec<_>>(),
+        vec!["fred-local-fixture"]
+    );
     let query = ResearchQueryEngine::from_pinned_dataset(
         built.pinned().clone(),
         "components",

@@ -722,9 +722,9 @@ fn artifact_error(error: ArtifactError) -> McpError {
         ArtifactError::DeadlineExceeded => deadline_error(),
         ArtifactError::InvalidPublication
         | ArtifactError::InvalidReference
-        | ArtifactError::Unavailable => {
-            McpError::internal_error("artifact publication failed", None)
-        }
+        | ArtifactError::ReadLimitExceeded
+        | ArtifactError::NotFound
+        | ArtifactError::Unavailable => McpError::internal_error("artifact operation failed", None),
     }
 }
 

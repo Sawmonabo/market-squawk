@@ -111,9 +111,28 @@ pub struct AnalyticalManifestCatalog {
 
 #[derive(Debug)]
 pub(crate) struct CatalogGenerationPage {
-    pub(crate) generations: Vec<(PinnedDataset, SourceId)>,
+    pub(crate) generations: Vec<(PinnedDataset, SourceId, Option<Sha256Digest>)>,
     pub(crate) has_more: bool,
 }
+
+#[derive(Debug)]
+pub(crate) struct CatalogFeatureDataset {
+    pub(crate) pinned: PinnedDataset,
+    pub(crate) source_id: SourceId,
+    pub(crate) export_sha256: Sha256Digest,
+    pub(crate) descriptor: Box<[u8]>,
+    pub(crate) source_ids: Box<[SourceId]>,
+}
+
+#[derive(Debug)]
+pub(crate) struct CatalogFeatureDatasetPage {
+    pub(crate) datasets: Vec<CatalogFeatureDataset>,
+    pub(crate) has_more: bool,
+    pub(crate) available: usize,
+}
+
+type RetainedFeatureDatasetAdmission =
+    (String, i64, String, i64, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
 
 impl fmt::Debug for AnalyticalManifestCatalog {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -682,13 +701,14 @@ impl AnalyticalManifestCatalog {
         manifest: &DatasetManifestRef,
         deadline: Instant,
         cancellation: &CancellationToken,
-    ) -> Result<(PinnedDataset, SourceId), ManifestCatalogError> {
+    ) -> Result<(PinnedDataset, SourceId, Option<Sha256Digest>), ManifestCatalogError> {
         check_read_operation(deadline, cancellation)?;
         let connection = self.lock()?;
         let pinned = load_pinned(&connection, manifest, self.max_objects_per_generation)?;
         let source_id = generation_source(&connection, manifest)?;
+        let python_export_sha256 = generation_python_export(&connection, manifest)?;
         check_read_operation(deadline, cancellation)?;
-        Ok((pinned, source_id))
+        Ok((pinned, source_id, python_export_sha256))
     }
 
     pub(crate) fn read_latest(
@@ -696,7 +716,7 @@ impl AnalyticalManifestCatalog {
         dataset_id: &DatasetId,
         deadline: Instant,
         cancellation: &CancellationToken,
-    ) -> Result<Option<(PinnedDataset, SourceId)>, ManifestCatalogError> {
+    ) -> Result<Option<(PinnedDataset, SourceId, Option<Sha256Digest>)>, ManifestCatalogError> {
         check_read_operation(deadline, cancellation)?;
         let connection = self.lock()?;
         let Some(pinned) = load_latest(&connection, dataset_id, self.max_objects_per_generation)?
@@ -705,8 +725,9 @@ impl AnalyticalManifestCatalog {
             return Ok(None);
         };
         let source_id = generation_source(&connection, pinned.manifest())?;
+        let python_export_sha256 = generation_python_export(&connection, pinned.manifest())?;
         check_read_operation(deadline, cancellation)?;
-        Ok(Some((pinned, source_id)))
+        Ok(Some((pinned, source_id, python_export_sha256)))
     }
 
     pub(crate) fn read_latest_page(
@@ -768,7 +789,8 @@ impl AnalyticalManifestCatalog {
             check_read_operation(deadline, cancellation)?;
             let pinned = load_pinned(&connection, &reference, self.max_objects_per_generation)?;
             let source_id = generation_source(&connection, &reference)?;
-            generations.push((pinned, source_id));
+            let python_export_sha256 = generation_python_export(&connection, &reference)?;
+            generations.push((pinned, source_id, python_export_sha256));
         }
         check_read_operation(deadline, cancellation)?;
         Ok(CatalogGenerationPage {
@@ -827,13 +849,155 @@ impl AnalyticalManifestCatalog {
             check_read_operation(deadline, cancellation)?;
             let pinned = load_pinned(&connection, &reference, self.max_objects_per_generation)?;
             let source_id = generation_source(&connection, &reference)?;
-            generations.push((pinned, source_id));
+            let python_export_sha256 = generation_python_export(&connection, &reference)?;
+            generations.push((pinned, source_id, python_export_sha256));
         }
         check_read_operation(deadline, cancellation)?;
         Ok(CatalogGenerationPage {
             generations,
             has_more,
         })
+    }
+
+    pub(crate) fn read_feature_dataset_page(
+        &self,
+        after: Option<&DatasetId>,
+        limit: usize,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<CatalogFeatureDatasetPage, ManifestCatalogError> {
+        check_read_operation(deadline, cancellation)?;
+        let retrieval_limit = limit
+            .checked_add(1)
+            .ok_or(ManifestCatalogError::CountOverflow)?;
+        let retrieval_limit_sql =
+            i64::try_from(retrieval_limit).map_err(|_| ManifestCatalogError::CountOverflow)?;
+        let connection = self.lock()?;
+        let available_sql: i64 = connection.query_row(
+            "SELECT COUNT(DISTINCT dataset_id) FROM python_dataset_admissions",
+            [],
+            |row| row.get(0),
+        )?;
+        let available =
+            usize::try_from(available_sql).map_err(|_| ManifestCatalogError::CountOverflow)?;
+        let mut statement = connection.prepare(
+            "WITH latest AS (
+                 SELECT dataset_id, MAX(manifest_version) AS manifest_version
+                 FROM python_dataset_admissions
+                 WHERE dataset_id>?1
+                 GROUP BY dataset_id
+                 ORDER BY dataset_id
+                 LIMIT ?2
+             )
+             SELECT generation.dataset_id, generation.manifest_version,
+                    generation.schema_name, generation.schema_version,
+                    generation.schema_fingerprint, generation.content_hash,
+                    admission.export_sha256, admission.descriptor_json
+             FROM latest
+             JOIN analytical_generations AS generation USING (dataset_id, manifest_version)
+             JOIN python_dataset_admissions AS admission USING (dataset_id, manifest_version)
+             ORDER BY generation.dataset_id",
+        )?;
+        let rows = statement.query_map(
+            params![
+                after.map(DatasetId::as_str).unwrap_or_default(),
+                retrieval_limit_sql
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                    row.get::<_, Vec<u8>>(6)?,
+                    row.get::<_, Vec<u8>>(7)?,
+                ))
+            },
+        )?;
+        let mut admissions = Vec::new();
+        admissions
+            .try_reserve_exact(retrieval_limit)
+            .map_err(|_| ManifestCatalogError::CountOverflow)?;
+        for row in rows {
+            check_read_operation(deadline, cancellation)?;
+            admissions.push(row?);
+        }
+        drop(statement);
+        let has_more = admissions.len() > limit;
+        admissions.truncate(limit);
+
+        let mut datasets = Vec::new();
+        datasets
+            .try_reserve_exact(admissions.len())
+            .map_err(|_| ManifestCatalogError::CountOverflow)?;
+        for admission in admissions {
+            check_read_operation(deadline, cancellation)?;
+            datasets.push(load_feature_dataset_admission(
+                &connection,
+                admission,
+                self.max_objects_per_generation,
+                deadline,
+                cancellation,
+            )?);
+        }
+        check_read_operation(deadline, cancellation)?;
+        Ok(CatalogFeatureDatasetPage {
+            datasets,
+            has_more,
+            available,
+        })
+    }
+
+    pub(crate) fn read_feature_dataset(
+        &self,
+        dataset_id: &DatasetId,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<CatalogFeatureDataset>, ManifestCatalogError> {
+        check_read_operation(deadline, cancellation)?;
+        let connection = self.lock()?;
+        let admission: Option<RetainedFeatureDatasetAdmission> = connection
+            .query_row(
+                "SELECT generation.dataset_id, generation.manifest_version,
+                        generation.schema_name, generation.schema_version,
+                        generation.schema_fingerprint, generation.content_hash,
+                        admission.export_sha256, admission.descriptor_json
+                 FROM python_dataset_admissions AS admission
+                 JOIN analytical_generations AS generation
+                   USING (dataset_id, manifest_version)
+                 WHERE generation.dataset_id=?1
+                 ORDER BY generation.manifest_version DESC
+                 LIMIT 1",
+                [dataset_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let dataset = admission
+            .map(|admission| {
+                load_feature_dataset_admission(
+                    &connection,
+                    admission,
+                    self.max_objects_per_generation,
+                    deadline,
+                    cancellation,
+                )
+            })
+            .transpose()?;
+        check_read_operation(deadline, cancellation)?;
+        Ok(dataset)
     }
 
     /// Resolves only candidate reachability in bounded chunks under one consistent read snapshot.
@@ -906,6 +1070,54 @@ impl AnalyticalManifestCatalog {
             .lock()
             .map_err(|_| ManifestCatalogError::LockPoisoned)
     }
+}
+
+fn load_feature_dataset_admission(
+    connection: &Connection,
+    admission: RetainedFeatureDatasetAdmission,
+    max_objects_per_generation: usize,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<CatalogFeatureDataset, ManifestCatalogError> {
+    let (
+        dataset,
+        version,
+        schema_name,
+        schema_version,
+        schema_fingerprint,
+        content_hash,
+        export_sha256,
+        descriptor,
+    ) = admission;
+    let manifest = DatasetManifestRef::try_new_with_schema(
+        DatasetId::try_from(dataset.as_str())?,
+        from_i64(version)?,
+        parse_schema_identity(&schema_name, schema_version, &schema_fingerprint)?,
+        parse_digest(&content_hash)?,
+    )?;
+    let pinned = load_pinned(connection, &manifest, max_objects_per_generation)?;
+    let source_id = generation_source(connection, &manifest)?;
+    let export_sha256 = parse_digest(&export_sha256)?;
+    let mut source_ids = Vec::new();
+    source_ids
+        .try_reserve_exact(pinned.parents().len())
+        .map_err(|_| ManifestCatalogError::CountOverflow)?;
+    for parent in pinned.parents() {
+        check_read_operation(deadline, cancellation)?;
+        source_ids.push(generation_source(connection, parent.manifest())?);
+    }
+    source_ids.sort_unstable();
+    source_ids.dedup();
+    if source_ids.is_empty() {
+        return Err(ManifestCatalogError::CorruptCatalog);
+    }
+    Ok(CatalogFeatureDataset {
+        pinned,
+        source_id,
+        export_sha256,
+        descriptor: descriptor.into_boxed_slice(),
+        source_ids: source_ids.into_boxed_slice(),
+    })
 }
 
 fn ensure_append_schema(
@@ -1642,6 +1854,26 @@ fn generation_source(
         .optional()?
         .ok_or(ManifestCatalogError::GenerationConflict)?;
     SourceId::try_from(source.as_str()).map_err(|_| ManifestCatalogError::CorruptCatalog)
+}
+
+fn generation_python_export(
+    connection: &Connection,
+    manifest: &DatasetManifestRef,
+) -> Result<Option<Sha256Digest>, ManifestCatalogError> {
+    connection
+        .query_row(
+            "SELECT export_sha256
+             FROM python_dataset_admissions
+             WHERE dataset_id=?1 AND manifest_version=?2",
+            params![
+                manifest.dataset_id().as_str(),
+                to_i64(manifest.manifest_version())?
+            ],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()?
+        .map(|digest| parse_digest(&digest))
+        .transpose()
 }
 
 fn source_for_artifact(

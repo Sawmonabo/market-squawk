@@ -1,6 +1,6 @@
 //! Opaque artifact publication contract without filesystem authority.
 
-use std::{fmt, sync::Arc, time::Instant};
+use std::{fmt, num::NonZeroUsize, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use serde::Serialize;
@@ -184,6 +184,174 @@ impl ArtifactReference {
             && self.byte_count == publication.byte_count()
             && self.media_type.as_ref() == publication.media_type()
     }
+
+    /// Returns the path-free repository identifier.
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Returns the lowercase SHA-256 digest of the complete immutable content.
+    #[must_use]
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    /// Returns the exact complete content length.
+    #[must_use]
+    pub const fn byte_count(&self) -> usize {
+        self.byte_count
+    }
+
+    /// Returns the registered media type.
+    #[must_use]
+    pub fn media_type(&self) -> &str {
+        &self.media_type
+    }
+}
+
+/// Path-free, caller-bounded request for one exact opaque artifact.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArtifactReadRequest {
+    reference: ArtifactReference,
+    maximum_bytes: NonZeroUsize,
+}
+
+impl ArtifactReadRequest {
+    /// Binds a complete opaque reference to an explicit caller-selected byte ceiling.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArtifactError::ReadLimitExceeded`] when the reference declares more complete
+    /// content than the caller is willing to retain.
+    pub fn try_new(
+        reference: ArtifactReference,
+        maximum_bytes: NonZeroUsize,
+    ) -> Result<Self, ArtifactError> {
+        if reference.byte_count() > maximum_bytes.get() {
+            return Err(ArtifactError::ReadLimitExceeded);
+        }
+        Ok(Self {
+            reference,
+            maximum_bytes,
+        })
+    }
+
+    /// Returns the exact path-free identity and content metadata supplied by the publisher.
+    #[must_use]
+    pub const fn reference(&self) -> &ArtifactReference {
+        &self.reference
+    }
+
+    /// Returns the caller-selected complete-content byte ceiling.
+    #[must_use]
+    pub const fn maximum_bytes(&self) -> NonZeroUsize {
+        self.maximum_bytes
+    }
+
+    /// Consumes the request and returns its exact opaque reference.
+    #[must_use]
+    pub fn into_reference(self) -> ArtifactReference {
+        self.reference
+    }
+}
+
+/// Request lifecycle authority for one immutable artifact read.
+#[derive(Clone)]
+pub struct ArtifactReadContext {
+    cancellation: CancellationToken,
+    deadline: Instant,
+}
+
+impl ArtifactReadContext {
+    /// Creates lifecycle authority from the shared application request.
+    #[must_use]
+    pub const fn new(cancellation: CancellationToken, deadline: Instant) -> Self {
+        Self {
+            cancellation,
+            deadline,
+        }
+    }
+
+    /// Request cancellation propagated from the transport-neutral service call.
+    #[must_use]
+    pub const fn cancellation(&self) -> &CancellationToken {
+        &self.cancellation
+    }
+
+    /// Absolute monotonic request deadline.
+    #[must_use]
+    pub const fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
+    /// Rejects work after request cancellation or deadline expiry.
+    pub fn ensure_live(&self) -> Result<(), ArtifactError> {
+        if self.cancellation.is_cancelled() {
+            return Err(ArtifactError::Cancelled);
+        }
+        if Instant::now() >= self.deadline {
+            return Err(ArtifactError::DeadlineExceeded);
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for ArtifactReadContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ArtifactReadContext")
+            .field("cancellation", &"[CANCELLATION TOKEN]")
+            .field("deadline", &self.deadline)
+            .finish()
+    }
+}
+
+/// Complete immutable artifact content verified against its opaque reference.
+#[derive(Clone)]
+pub struct ArtifactRead {
+    reference: ArtifactReference,
+    content: Arc<[u8]>,
+}
+
+impl ArtifactRead {
+    /// Validates complete bytes against the reference's digest and length.
+    ///
+    /// Repository implementations use this as the final return boundary after capability-confined
+    /// reads. Content is never included in debug output.
+    pub fn try_new(reference: ArtifactReference, content: Vec<u8>) -> Result<Self, ArtifactError> {
+        if content.len() != reference.byte_count()
+            || format!("{:x}", Sha256::digest(&content)) != reference.sha256()
+        {
+            return Err(ArtifactError::Unavailable);
+        }
+        Ok(Self {
+            reference,
+            content: content.into(),
+        })
+    }
+
+    /// Returns the exact verified path-free identity and content metadata.
+    #[must_use]
+    pub const fn reference(&self) -> &ArtifactReference {
+        &self.reference
+    }
+
+    /// Returns complete immutable content. Callers must never log it.
+    #[must_use]
+    pub fn content(&self) -> &[u8] {
+        &self.content
+    }
+}
+
+impl fmt::Debug for ArtifactRead {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ArtifactRead")
+            .field("reference", &self.reference)
+            .field("content", &"[ARTIFACT CONTENT REDACTED]")
+            .finish()
+    }
 }
 
 /// Capability-confined immutable artifact repository.
@@ -207,6 +375,17 @@ pub trait ArtifactRepository: Send + Sync + 'static {
         publication: ArtifactPublication,
         context: ArtifactPublicationContext,
     ) -> Result<ArtifactReference, ArtifactError>;
+
+    /// Reads complete immutable content through a path-free, caller-bounded reference.
+    ///
+    /// Implementations must verify the identifier, digest, exact byte count, and media type before
+    /// returning. They must observe cancellation and deadline authority while reading and must
+    /// never expose a filesystem path, directory handle, or partially verified content.
+    async fn read(
+        &self,
+        request: ArtifactReadRequest,
+        context: ArtifactReadContext,
+    ) -> Result<ArtifactRead, ArtifactError>;
 }
 
 /// Artifact contract or repository failure.
@@ -218,6 +397,12 @@ pub enum ArtifactError {
     /// Repository returned a path-like or inconsistent reference.
     #[error("artifact reference is invalid")]
     InvalidReference,
+    /// The caller-selected complete-content bound is below the reference's declared size.
+    #[error("artifact read byte limit was exceeded")]
+    ReadLimitExceeded,
+    /// No immutable artifact matches the complete opaque reference.
+    #[error("artifact was not found")]
+    NotFound,
     /// Durable capability-confined repository is unavailable.
     #[error("artifact repository is unavailable")]
     Unavailable,
