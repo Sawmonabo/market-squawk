@@ -35,7 +35,9 @@ MAX_RUNTIME_DISTRIBUTIONS = 32
 MAX_DISTRIBUTION_FILES = 8_192
 MAX_DISTRIBUTION_ROOTS = 64
 MAX_DISTRIBUTION_FILE_BYTES = 256 * 1024 * 1024
-MAX_NATIVE_EXECUTABLE_BYTES = 768 * 1024 * 1024
+MAX_APPLICATION_EXECUTABLE_BYTES = 768 * 1024 * 1024
+MAX_ONNX_WORKER_EXECUTABLE_BYTES = 256 * 1024 * 1024
+MAX_VALIDATOR_EXECUTABLE_BYTES = 256 * 1024 * 1024
 MAX_DISTRIBUTION_BYTES = 1024 * 1024 * 1024
 MAX_RECORD_BYTES = 2 * 1024 * 1024
 RUST_TOOLCHAIN = "1.97.1"
@@ -580,7 +582,229 @@ def expected_source_paths(root: Path) -> tuple[str, ...]:
                 continue
             if isinstance(dependency_path, str):
                 pending.append(package_root / dependency_path / "Cargo.toml")
+    paths.update(_literal_rust_include_paths(root, paths))
     return tuple(sorted(paths))
+
+
+def _literal_rust_include_paths(root: Path, source_paths: set[str]) -> set[str]:
+    """Resolve repository-confined literal Rust include inputs, recursively for include!."""
+
+    root = root.resolve(strict=True)
+    pending = [
+        root / relative for relative in source_paths if Path(relative).suffix == ".rs"
+    ]
+    visited: set[Path] = set()
+    included: set[str] = set()
+    while pending:
+        source = pending.pop()
+        try:
+            canonical_source = source.resolve(strict=True)
+        except OSError as error:
+            raise ReleaseBuildError("Rust source include owner is unavailable") from error
+        if (
+            canonical_source in visited
+            or root not in canonical_source.parents
+            or source.is_symlink()
+            or not canonical_source.is_file()
+        ):
+            if canonical_source in visited:
+                continue
+            raise ReleaseBuildError("Rust source include owner is invalid")
+        visited.add(canonical_source)
+        try:
+            text = canonical_source.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as error:
+            raise ReleaseBuildError("Rust source include owner is unreadable") from error
+        for macro, literal in _rust_literal_includes(text):
+            if not literal or Path(literal).is_absolute() or "\x00" in literal:
+                raise ReleaseBuildError("Rust include path is invalid")
+            lexical = Path(os.path.abspath(canonical_source.parent / literal))
+            if root not in lexical.parents:
+                raise ReleaseBuildError("Rust include path escapes the repository")
+            current = root
+            for component in lexical.relative_to(root).parts:
+                current /= component
+                if current.is_symlink():
+                    raise ReleaseBuildError("Rust include path contains a symbolic link")
+            try:
+                target = lexical.resolve(strict=True)
+            except OSError as error:
+                raise ReleaseBuildError("Rust include input is unavailable") from error
+            if root not in target.parents or not target.is_file():
+                raise ReleaseBuildError("Rust include input is invalid")
+            relative = target.relative_to(root).as_posix()
+            included.add(relative)
+            if macro == "include" and target.suffix == ".rs" and target not in visited:
+                pending.append(target)
+    return included
+
+
+def _rust_literal_includes(source: str) -> tuple[tuple[str, str], ...]:
+    """Return include macro names and literal paths, rejecting non-literal invocations."""
+
+    includes = []
+    offset = 0
+    while offset < len(source):
+        if source.startswith("//", offset):
+            newline = source.find("\n", offset + 2)
+            offset = len(source) if newline < 0 else newline + 1
+            continue
+        if source.startswith("/*", offset):
+            offset = _rust_block_comment_end(source, offset)
+            continue
+        character = _rust_char_literal_end(source, offset)
+        if character is not None:
+            offset = character
+            continue
+        raw = _rust_raw_string(source, offset)
+        if raw is not None:
+            _value, offset = raw
+            continue
+        if source[offset] == '"':
+            offset = _rust_quoted_string_end(source, offset)
+            continue
+        if source[offset].isalpha() or source[offset] == "_":
+            end = offset + 1
+            while end < len(source) and (
+                source[end].isalnum() or source[end] == "_"
+            ):
+                end += 1
+            macro = source[offset:end]
+            if macro in {"include", "include_bytes", "include_str"}:
+                invocation = _rust_include_invocation(source, end)
+                if invocation is not None:
+                    literal, offset = invocation
+                    includes.append((macro, literal))
+                    continue
+            offset = end
+            continue
+        offset += 1
+    return tuple(includes)
+
+
+def _rust_include_invocation(source: str, offset: int) -> tuple[str, int] | None:
+    offset = _skip_rust_trivia(source, offset)
+    if offset >= len(source) or source[offset] != "!":
+        return None
+    offset = _skip_rust_trivia(source, offset + 1)
+    delimiters = {"(": ")", "[": "]", "{": "}"}
+    if offset >= len(source) or source[offset] not in delimiters:
+        raise ReleaseBuildError("Rust include invocation is unresolved")
+    closing = delimiters[source[offset]]
+    offset = _skip_rust_trivia(source, offset + 1)
+    raw = _rust_raw_string(source, offset)
+    if raw is not None:
+        literal, offset = raw
+    elif offset < len(source) and source[offset] == '"':
+        literal, offset = _rust_include_quoted_literal(source, offset)
+    else:
+        raise ReleaseBuildError("Rust include path is not a literal")
+    offset = _skip_rust_trivia(source, offset)
+    if offset < len(source) and source[offset] == ",":
+        offset = _skip_rust_trivia(source, offset + 1)
+    if offset >= len(source) or source[offset] != closing:
+        raise ReleaseBuildError("Rust include invocation is not a lone literal")
+    return literal, offset + 1
+
+
+def _rust_raw_string(source: str, offset: int) -> tuple[str, int] | None:
+    start = offset
+    if source.startswith("br", offset):
+        offset += 2
+    elif offset < len(source) and source[offset] == "r":
+        offset += 1
+    else:
+        return None
+    hashes = 0
+    while offset < len(source) and source[offset] == "#":
+        hashes += 1
+        offset += 1
+    if offset >= len(source) or source[offset] != '"':
+        return None
+    content_start = offset + 1
+    terminator = '"' + ("#" * hashes)
+    content_end = source.find(terminator, content_start)
+    if content_end < 0:
+        raise ReleaseBuildError("Rust raw string literal is unterminated")
+    if source.startswith("br", start):
+        return "", content_end + len(terminator)
+    return source[content_start:content_end], content_end + len(terminator)
+
+
+def _rust_char_literal_end(source: str, offset: int) -> int | None:
+    if offset >= len(source) or source[offset] != "'" or offset + 2 >= len(source):
+        return None
+    end = offset + 1
+    if source[end] == "\\":
+        end += 1
+        if end >= len(source):
+            return None
+        if source[end] == "u" and end + 1 < len(source) and source[end + 1] == "{":
+            end = source.find("}", end + 2)
+            if end < 0:
+                return None
+            end += 1
+        else:
+            end += 1
+    else:
+        end += 1
+    return end + 1 if end < len(source) and source[end] == "'" else None
+
+
+def _rust_include_quoted_literal(source: str, offset: int) -> tuple[str, int]:
+    end = offset + 1
+    while end < len(source):
+        if source[end] == '"':
+            return source[offset + 1 : end], end + 1
+        if source[end] == "\\" or source[end] in "\r\n":
+            raise ReleaseBuildError("Rust include path must be an unescaped literal")
+        end += 1
+    raise ReleaseBuildError("Rust include path literal is unterminated")
+
+
+def _rust_quoted_string_end(source: str, offset: int) -> int:
+    offset += 1
+    while offset < len(source):
+        if source[offset] == '"':
+            return offset + 1
+        if source[offset] == "\\":
+            offset += 2
+        else:
+            offset += 1
+    raise ReleaseBuildError("Rust string literal is unterminated")
+
+
+def _rust_block_comment_end(source: str, offset: int) -> int:
+    depth = 1
+    offset += 2
+    while offset < len(source) and depth:
+        if source.startswith("/*", offset):
+            depth += 1
+            offset += 2
+        elif source.startswith("*/", offset):
+            depth -= 1
+            offset += 2
+        else:
+            offset += 1
+    if depth:
+        raise ReleaseBuildError("Rust block comment is unterminated")
+    return offset
+
+
+def _skip_rust_trivia(source: str, offset: int) -> int:
+    while offset < len(source):
+        if source[offset].isspace():
+            offset += 1
+            continue
+        if source.startswith("//", offset):
+            newline = source.find("\n", offset + 2)
+            offset = len(source) if newline < 0 else newline + 1
+            continue
+        if source.startswith("/*", offset):
+            offset = _rust_block_comment_end(source, offset)
+            continue
+        break
+    return offset
 
 
 def admit_sources(lock: ReleaseLock, root: Path) -> None:
@@ -1545,12 +1769,26 @@ def build_release_manifest(
         for name, path in native_files.items()
     ):
         raise ReleaseBuildError("native release executable identity is invalid")
+    native_limits = {
+        "application": MAX_APPLICATION_EXECUTABLE_BYTES,
+        "onnx_worker": MAX_ONNX_WORKER_EXECUTABLE_BYTES,
+        "validator": MAX_VALIDATOR_EXECUTABLE_BYTES,
+    }
+    try:
+        native_sizes = {name: path.stat().st_size for name, path in native_files.items()}
+    except OSError as error:
+        raise ReleaseBuildError("native release executable identity is invalid") from error
+    if any(
+        size <= 0 or size > native_limits[name]
+        for name, size in native_sizes.items()
+    ):
+        raise ReleaseBuildError("native release executable exceeds its byte bound")
     native_identities = {
         name: _file_digest(path) for name, path in native_files.items()
     }
     if any(
-        size <= 0 or size > MAX_NATIVE_EXECUTABLE_BYTES
-        for size, _digest in native_identities.values()
+        size != native_sizes[name] or size > native_limits[name]
+        for name, (size, _digest) in native_identities.items()
     ):
         raise ReleaseBuildError("native release executable exceeds its byte bound")
     payload = {

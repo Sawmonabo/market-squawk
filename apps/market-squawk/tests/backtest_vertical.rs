@@ -1,10 +1,25 @@
 use std::error::Error;
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64, NonZeroUsize};
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
+use clap::Parser as _;
+use market_squawk::application::analysis::{
+    AnalysisCatalog, AnalysisDomainService, GovernedBacktestAuthority, GovernedBacktestCommand,
+    GovernedBacktestInputRegistrar, GovernedBacktestInputRegistrationInput,
+    GovernedBacktestInputRegistrationReceipt, GovernedBacktestRecord,
+};
+use market_squawk::application::{ApplicationDomainService, application_capabilities};
+use market_squawk::cli::{Cli, Command, FeatureCommand};
 use market_squawk::{
     AppPaths, PinnedBacktestInput, ProductionBacktestService, ProductionBacktestServiceError,
     ResearchIngestRequest, ResearchService,
+};
+use market_squawk_analytics::{
+    BatchFeatureCatalog, BatchFeatureCatalogConfig, BatchFeaturePolicies,
+    MissingValuePolicy as AnalyticsMissingValuePolicy, ShockComposition, VarianceConvention,
+    WeightPolicy,
 };
 use market_squawk_backtesting::{
     AVAILABLE_AT_COMPONENT, BacktestContext, BacktestDataset, BacktestEngine, BacktestError,
@@ -37,6 +52,9 @@ use market_squawk_domain::{
 };
 use market_squawk_execution::{BoundedOrderIntents, StrategyError};
 use market_squawk_portfolio::{PortfolioLimitInput, PortfolioLimits};
+use market_squawk_services::{
+    JsonStructureLimits, RequestContext, RequestId, ServiceError, ServiceLimits, TypedToolRequest,
+};
 use market_squawk_sources::{
     AuthorizationGrant, AuthorizationMode, AvailabilityEvidence as SourceAvailabilityEvidence,
     CanonicalObservationPayload, CoverageDomain, DiscoveryRequest, ExtractionBatch,
@@ -45,10 +63,56 @@ use market_squawk_sources::{
     SourceMetadataInput, SourceObject, SourceProtocolProfile,
 };
 use rust_decimal::Decimal;
+use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
+
+#[derive(Debug)]
+struct UnusedBacktestInputRegistrar;
+
+#[async_trait]
+impl GovernedBacktestInputRegistrar for UnusedBacktestInputRegistrar {
+    async fn register_input(
+        &self,
+        _input: GovernedBacktestInputRegistrationInput,
+        _cancellation: CancellationToken,
+        _deadline: Instant,
+    ) -> Result<GovernedBacktestInputRegistrationReceipt, ServiceError> {
+        Err(ServiceError::Unavailable)
+    }
+}
+
+#[derive(Debug)]
+struct UnusedBacktestAuthority;
+
+#[async_trait]
+impl GovernedBacktestAuthority for UnusedBacktestAuthority {
+    async fn run(
+        &self,
+        _command: GovernedBacktestCommand,
+        _cancellation: CancellationToken,
+        _deadline: Instant,
+    ) -> Result<GovernedBacktestRecord, ServiceError> {
+        Err(ServiceError::Unavailable)
+    }
+
+    async fn get(
+        &self,
+        _run_id: &str,
+        _cancellation: CancellationToken,
+        _deadline: Instant,
+    ) -> Result<Option<GovernedBacktestRecord>, ServiceError> {
+        Err(ServiceError::Unavailable)
+    }
+
+    fn begin_shutdown(&self) {}
+
+    async fn finish_shutdown(&self, _deadline: Instant) -> Result<(), ServiceError> {
+        Ok(())
+    }
+}
 
 #[test]
 fn production_backtest_inventory_is_confined_to_the_controlled_artifact_root()
@@ -146,6 +210,7 @@ async fn pinned_dataset_resolves_historical_instrument_definitions_per_decision(
     let built = service
         .build_dataset(
             fixture_dataset_request(
+                "derived.backtest.reference-authority",
                 source_dataset.manifest().clone(),
                 instrument_id,
                 membership_evidence,
@@ -153,6 +218,105 @@ async fn pinned_dataset_resolves_historical_instrument_definitions_per_decision(
             CancellationToken::new(),
         )
         .await?;
+    let successor = service
+        .build_dataset(
+            fixture_dataset_request(
+                "derived.backtest.reference-authority-successor",
+                source_dataset.manifest().clone(),
+                instrument_id,
+                membership_evidence,
+            )?,
+            CancellationToken::new(),
+        )
+        .await?;
+    let analysis = AnalysisDomainService::new_with_feature_reader(
+        Arc::new(fixture_analysis_catalog()?),
+        service.analytical_reader(),
+        Arc::new(UnusedBacktestInputRegistrar),
+        Arc::new(UnusedBacktestAuthority),
+    );
+    let first = analysis
+        .call(
+            feature_dataset_request(json!({
+                "resultLimits": {"maximumItems": 2, "maximumBytes": 65536}
+            }))?,
+            feature_dataset_context(101)?,
+        )
+        .await?;
+    let first_content = first.structured_content();
+    let first_items = first_content["items"]
+        .as_array()
+        .ok_or("first feature page has no items")?;
+    let cursor = first_content["nextAfterDataset"]
+        .as_str()
+        .ok_or("first feature page has no durable cursor")?
+        .to_owned();
+    assert_eq!(first_items.len(), 2);
+    assert_eq!(first_items[0]["kind"], "feature_contract");
+    assert_eq!(
+        first_items[1]["manifest"]["dataset"],
+        "derived.backtest.reference-authority"
+    );
+    assert_eq!(cursor, "derived.backtest.reference-authority");
+    assert_eq!(first_content["hasMore"], true);
+
+    let cli = Cli::try_parse_from([
+        "market-squawk",
+        "feature",
+        "list",
+        "--after-dataset",
+        cursor.as_str(),
+    ])
+    .map_err(|error| {
+        std::io::Error::other(format!("feature continuation CLI parsing failed: {error}"))
+    })?;
+    assert!(matches!(
+        cli.command,
+        Command::Feature {
+            command: FeatureCommand::List {
+                after_dataset: Some(ref value)
+            }
+        } if value == &cursor
+    ));
+
+    let continued_request = feature_dataset_request(json!({
+        "afterDataset": cursor,
+        "resultLimits": {"maximumItems": 2, "maximumBytes": 65536}
+    }))
+    .map_err(|error| {
+        std::io::Error::other(format!("feature continuation admission failed: {error}"))
+    })?;
+    let continued = analysis
+        .call(continued_request, feature_dataset_context(102)?)
+        .await
+        .map_err(|error| {
+            std::io::Error::other(format!("feature continuation call failed: {error:?}"))
+        })?;
+    let continued_content = continued.structured_content();
+    let continued_items = continued_content["items"]
+        .as_array()
+        .ok_or("continued feature page has no items")?;
+    assert_eq!(continued_items.len(), 1);
+    assert_eq!(continued_items[0]["kind"], "feature_dataset");
+    assert_eq!(
+        continued_items[0]["manifest"]["dataset"],
+        "derived.backtest.reference-authority-successor"
+    );
+    assert_eq!(continued_content["hasMore"], false);
+    assert!(continued_content["nextAfterDataset"].is_null());
+
+    let conflicting = analysis
+        .call(
+            feature_dataset_request(json!({
+                "dataset": "derived.backtest.reference-authority-successor",
+                "afterDataset": "derived.backtest.reference-authority",
+                "resultLimits": {"maximumItems": 2, "maximumBytes": 65536}
+            }))?,
+            feature_dataset_context(103)?,
+        )
+        .await;
+    assert!(matches!(conflicting, Err(ServiceError::InvalidRequest)));
+
     let query = ResearchQueryEngine::from_pinned_dataset(
         built.pinned().clone(),
         "components",
@@ -164,6 +328,8 @@ async fn pinned_dataset_resolves_historical_instrument_definitions_per_decision(
     let changed_identity_output = query_backtest_rows(&query, built.manifest()).await?;
     let coverage_mismatch_output = query_backtest_rows(&query, built.manifest()).await?;
     drop(query);
+    drop(analysis);
+    drop(successor);
     drop(built);
     drop(source_dataset);
     drop(service);
@@ -364,6 +530,7 @@ fn fixture_context(
 }
 
 fn fixture_dataset_request(
+    dataset_id: &str,
     source_manifest: DatasetManifestRef,
     instrument_id: InstrumentId,
     membership_evidence: EvidenceDigest,
@@ -389,7 +556,7 @@ fn fixture_dataset_request(
         ],
     )?;
     Ok(DatasetBuildRequest::try_new(
-        DatasetId::try_from("derived.backtest.reference-authority")?,
+        DatasetId::try_from(dataset_id)?,
         inputs,
         DatasetBuildPolicy::new(
             ChronologicalSplitPolicy::try_new(
@@ -433,6 +600,52 @@ fn fixture_dataset_request(
             )?,
         )?,
     )?)
+}
+
+fn fixture_analysis_catalog() -> TestResult<AnalysisCatalog> {
+    let config = BatchFeatureCatalogConfig::try_new(
+        NonZeroU32::new(252).ok_or("nonzero periods per year")?,
+        NonZeroU32::new(950_000).ok_or("nonzero confidence level")?,
+        6,
+        BatchFeaturePolicies::new(
+            VarianceConvention::Sample,
+            AnalyticsMissingValuePolicy::Reject,
+            WeightPolicy::PositiveNormalized,
+            market_squawk_domain::RoundingPolicy::NearestEven,
+            ShockComposition::Compounded,
+        ),
+    )?;
+    Ok(AnalysisCatalog::try_new(
+        Vec::new(),
+        BatchFeatureCatalog::try_new(config, "feature-pagination-test-v1")?,
+        Vec::new(),
+    )?)
+}
+
+fn feature_dataset_request(arguments: Value) -> TestResult<TypedToolRequest> {
+    let arguments = arguments
+        .as_object()
+        .cloned()
+        .ok_or("feature dataset arguments must be an object")?;
+    Ok(application_capabilities()?
+        .find("Analysis.GetFeatureDatasets")
+        .ok_or("feature dataset operation is not registered")?
+        .admit(arguments)?)
+}
+
+fn feature_dataset_context(id: i64) -> TestResult<RequestContext> {
+    Ok(RequestContext::new(
+        RequestId::Integer(id),
+        CancellationToken::new(),
+        Instant::now() + Duration::from_secs(5),
+        ServiceLimits::try_new(
+            64 * 1024,
+            64,
+            64 * 1024,
+            64,
+            JsonStructureLimits::try_new(16, 16 * 1024, 256, 256)?,
+        )?,
+    ))
 }
 
 fn fixture_component_specs() -> TestResult<Vec<FeatureLabelComponentSpec>> {

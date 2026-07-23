@@ -331,7 +331,11 @@ pub enum QueryCommand {
 #[derive(Debug, Subcommand)]
 pub enum FeatureCommand {
     /// List registered versioned feature definitions.
-    List,
+    List {
+        /// Continue after this durable feature-dataset identity.
+        #[arg(long)]
+        after_dataset: Option<String>,
+    },
     /// Build features from a confined typed request file.
     Build {
         /// Confined JSON request file.

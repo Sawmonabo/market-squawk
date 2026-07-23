@@ -17,7 +17,9 @@ const RELEASE_MANIFEST: &str = "share/market-squawk/market-squawk-release.json";
 const MAX_AUTHORITY_BYTES: u64 = 16 * 1024;
 const MAX_RECORD_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_DISTRIBUTION_FILE_BYTES: u64 = 256 * 1024 * 1024;
-const MAX_NATIVE_EXECUTABLE_BYTES: u64 = 768 * 1024 * 1024;
+const MAX_APPLICATION_EXECUTABLE_BYTES: u64 = 768 * 1024 * 1024;
+const MAX_ONNX_WORKER_EXECUTABLE_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_VALIDATOR_EXECUTABLE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_DISTRIBUTION_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_DISTRIBUTION_FILES: usize = 8_192;
 const MAX_DISTRIBUTION_ROOTS: usize = 64;
@@ -358,7 +360,7 @@ fn verify_installed_files(root: &Path) -> Result<VerifiedFiles, TrainingEnvironm
     let validator = read_controlled(
         &canonical_root,
         Path::new("bin/market-squawk-model-validator"),
-        MAX_DISTRIBUTION_FILE_BYTES,
+        MAX_VALIDATOR_EXECUTABLE_BYTES,
         false,
     )?;
     exact_file(
@@ -371,7 +373,7 @@ fn verify_installed_files(root: &Path) -> Result<VerifiedFiles, TrainingEnvironm
     let application = read_controlled(
         &canonical_root,
         Path::new("bin/market-squawk"),
-        MAX_NATIVE_EXECUTABLE_BYTES,
+        MAX_APPLICATION_EXECUTABLE_BYTES,
         false,
     )?;
     exact_file(
@@ -384,7 +386,7 @@ fn verify_installed_files(root: &Path) -> Result<VerifiedFiles, TrainingEnvironm
     let onnx_worker = read_controlled(
         &canonical_root,
         Path::new("bin/market-squawk-onnx-worker"),
-        MAX_NATIVE_EXECUTABLE_BYTES,
+        MAX_ONNX_WORKER_EXECUTABLE_BYTES,
         false,
     )?;
     exact_file(

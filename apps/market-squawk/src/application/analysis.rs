@@ -240,18 +240,29 @@ impl AnalysisDomainService {
         context: &RequestContext,
     ) -> Result<TypedToolResult, ServiceError> {
         let scope = ReadScope::from_arguments(request.arguments())?;
-        let requested_dataset = request.arguments().get("dataset").and_then(Value::as_str);
+        let requested_dataset = optional_feature_dataset(request, "dataset")?;
+        let after_dataset = optional_feature_dataset(request, "afterDataset")?;
+        if requested_dataset.is_some() && after_dataset.is_some() {
+            return Err(ServiceError::InvalidRequest);
+        }
+        if after_dataset.is_some() && scope.has_filter() {
+            return Err(ServiceError::InvalidRequest);
+        }
+        let continuation = after_dataset.is_some();
         let limits = admitted_result_limits(request, context)?;
-        let mut selected = self
-            .catalog
-            .feature_datasets()
-            .iter()
-            .filter(|dataset| {
-                requested_dataset.is_none_or(|requested| {
-                    dataset.dataset().manifest().dataset_id().as_str() == requested
-                }) && scope.matches(dataset.scope())
-            })
-            .collect::<Vec<_>>();
+        let mut selected = if continuation {
+            Vec::new()
+        } else {
+            self.catalog
+                .feature_datasets()
+                .iter()
+                .filter(|dataset| {
+                    requested_dataset.as_ref().is_none_or(|requested| {
+                        dataset.dataset().manifest().dataset_id() == requested
+                    }) && scope.matches(dataset.scope())
+                })
+                .collect::<Vec<_>>()
+        };
         selected.sort_unstable_by(|left, right| {
             left.dataset()
                 .manifest()
@@ -259,63 +270,79 @@ impl AnalysisDomainService {
                 .as_str()
                 .cmp(right.dataset().manifest().dataset_id().as_str())
         });
-        let (mut published, mut published_available, published_has_more) =
-            self.published_feature_datasets(requested_dataset, &scope, limits, context)?;
-        let overlaps = published
-            .iter()
-            .filter(|candidate| {
-                selected.iter().any(|registered| {
-                    registered.dataset().manifest().dataset_id()
-                        == candidate.generation().manifest().dataset_id()
-                })
-            })
-            .count();
-        published.retain(|candidate| {
-            !selected.iter().any(|registered| {
-                registered.dataset().manifest().dataset_id()
-                    == candidate.generation().manifest().dataset_id()
-            })
-        });
-        published_available = published_available.saturating_sub(overlaps);
+        self.remove_durable_legacy_overlaps(&mut selected, &scope, context)?;
+        let static_available = if continuation {
+            0
+        } else {
+            self.catalog.feature_catalog().entries().len()
+        };
+        let first_page_available = static_available
+            .checked_add(selected.len())
+            .ok_or(ServiceError::ResourceExhausted)?;
+        let published_limit = limits
+            .maximum_result_items()
+            .saturating_sub(first_page_available)
+            .max(1)
+            .min(64);
+        let (published, published_available, published_has_more) = self
+            .published_feature_datasets(
+                requested_dataset.as_ref(),
+                after_dataset.as_ref(),
+                &scope,
+                published_limit,
+                context,
+            )?;
         if requested_dataset.is_some() && selected.is_empty() && published.is_empty() {
             return Err(ServiceError::NotFound);
         }
         if scope.has_filter() && selected.is_empty() {
             return Err(ServiceError::NotFound);
         }
-        let available = self
-            .catalog
-            .feature_catalog()
-            .entries()
-            .len()
+        let available = static_available
             .checked_add(selected.len())
             .and_then(|available| available.checked_add(published_available))
             .ok_or(ServiceError::ResourceExhausted)?;
         let mut items = Vec::new();
-        for metadata in self.catalog.feature_catalog().entries() {
-            if items.len() == limits.maximum_result_items() {
-                break;
+        let context_capacity = limits
+            .maximum_result_items()
+            .saturating_sub(published.len());
+        if !continuation {
+            let selected_reserve = if requested_dataset.is_some() {
+                selected.len()
+            } else {
+                0
+            };
+            let static_capacity = context_capacity.saturating_sub(selected_reserve);
+            for metadata in self
+                .catalog
+                .feature_catalog()
+                .entries()
+                .iter()
+                .take(static_capacity)
+            {
+                items.push(feature_metadata_value(metadata));
             }
-            items.push(feature_metadata_value(metadata));
-        }
-        for dataset in &selected {
-            if items.len() == limits.maximum_result_items() {
-                break;
+            for dataset in selected
+                .iter()
+                .take(context_capacity.saturating_sub(items.len()))
+            {
+                items.push(feature_dataset_value(dataset.dataset()));
             }
-            items.push(feature_dataset_value(dataset.dataset()));
         }
         for dataset in &published {
-            if items.len() == limits.maximum_result_items() {
-                break;
-            }
             items.push(published_feature_dataset_value(dataset));
         }
         let metadata = combined_feature_metadata(&selected, &published, items.len(), available)?;
         let item_count = items.len().max(1);
+        let next_after_dataset = published
+            .last()
+            .filter(|_| published_has_more)
+            .map(|dataset| dataset.generation().manifest().dataset_id().as_str());
         TypedToolResult::try_new(
             json!({
                 "items": items,
-                "hasMore": published_has_more || item_count < available
+                "hasMore": published_has_more,
+                "nextAfterDataset": next_after_dataset
             }),
             item_count,
             metadata,
@@ -326,30 +353,63 @@ impl AnalysisDomainService {
 
     fn published_feature_datasets(
         &self,
-        requested_dataset: Option<&str>,
+        requested_dataset: Option<&DatasetId>,
+        after_dataset: Option<&DatasetId>,
         scope: &ReadScope,
-        limits: market_squawk_services::ServiceLimits,
+        limit: usize,
         context: &RequestContext,
     ) -> Result<(Vec<AnalyticalFeatureDataset>, usize, bool), ServiceError> {
         let Some(reader) = self.feature_reader.as_ref().filter(|_| !scope.has_filter()) else {
+            if after_dataset.is_some() {
+                return Err(ServiceError::Unavailable);
+            }
             return Ok((Vec::new(), 0, false));
         };
         if let Some(dataset) = requested_dataset {
-            let dataset = DatasetId::try_from(dataset).map_err(|_| ServiceError::InvalidRequest)?;
             let selected = reader
-                .feature_dataset(&dataset, context.deadline(), context.cancellation())
+                .feature_dataset(dataset, context.deadline(), context.cancellation())
                 .map_err(map_feature_read_error)?
                 .into_iter()
                 .collect::<Vec<_>>();
             let available = selected.len();
             return Ok((selected, available, false));
         }
-        let limit = AnalyticalReadLimit::try_new(limits.maximum_result_items().min(64))
-            .map_err(map_feature_read_error)?;
+        let limit = AnalyticalReadLimit::try_new(limit).map_err(map_feature_read_error)?;
         let page = reader
-            .feature_datasets(None, limit, context.deadline(), context.cancellation())
+            .feature_datasets(
+                after_dataset,
+                limit,
+                context.deadline(),
+                context.cancellation(),
+            )
             .map_err(map_feature_read_error)?;
         Ok((page.datasets().to_vec(), page.available(), page.has_more()))
+    }
+
+    fn remove_durable_legacy_overlaps(
+        &self,
+        selected: &mut Vec<&FeatureDataset>,
+        scope: &ReadScope,
+        context: &RequestContext,
+    ) -> Result<(), ServiceError> {
+        let Some(reader) = self.feature_reader.as_ref().filter(|_| !scope.has_filter()) else {
+            return Ok(());
+        };
+        let mut legacy_only = Vec::with_capacity(selected.len());
+        for dataset in selected.drain(..) {
+            let durable = reader
+                .feature_dataset(
+                    dataset.dataset().manifest().dataset_id(),
+                    context.deadline(),
+                    context.cancellation(),
+                )
+                .map_err(map_feature_read_error)?;
+            if durable.is_none() {
+                legacy_only.push(dataset);
+            }
+        }
+        *selected = legacy_only;
+        Ok(())
     }
 
     async fn get_backtest(
@@ -570,6 +630,24 @@ impl ReadScope {
     const fn has_filter(&self) -> bool {
         self.instruments.is_some() || self.time_range.is_some() || self.sources.is_some()
     }
+}
+
+fn optional_feature_dataset(
+    request: &TypedToolRequest,
+    name: &str,
+) -> Result<Option<DatasetId>, ServiceError> {
+    request
+        .arguments()
+        .get(name)
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or(ServiceError::InvalidRequest)
+                .and_then(|value| {
+                    DatasetId::try_from(value).map_err(|_| ServiceError::InvalidRequest)
+                })
+        })
+        .transpose()
 }
 
 fn parse_time_range(value: &Value) -> Result<(Timestamp, Timestamp), ServiceError> {

@@ -96,6 +96,11 @@
       "size_bytes": 786
     },
     {
+      "path": "adapters/market-squawk-adapter-bls/fixtures/series.json",
+      "sha256": "392cacf5eac32cbbfd17520aae87833dd472bfd29ff2d460cd019e82aeac4eb8",
+      "size_bytes": 863
+    },
+    {
       "path": "adapters/market-squawk-adapter-bls/src/chunks.rs",
       "sha256": "5798d2a27236ee39cb0ea7d565ba2aeb241354df4cfc713cfbab1b8426fc431b",
       "size_bytes": 6464
@@ -144,6 +149,16 @@
       "path": "adapters/market-squawk-adapter-coinbase/Cargo.toml",
       "sha256": "de198246184ddb1916153d2047b6ede5c1112c40b18956e762584f4672fa8c3b",
       "size_bytes": 842
+    },
+    {
+      "path": "adapters/market-squawk-adapter-coinbase/fixtures/snapshot.json",
+      "sha256": "8f7fc9c411d4c54fa5ac373169b97a38f101e7908a10a74c2db9e22499382e7b",
+      "size_bytes": 101
+    },
+    {
+      "path": "adapters/market-squawk-adapter-coinbase/fixtures/subscriptions.json",
+      "sha256": "9847ef3c2cdd1164456c208d92109fb11cfe72191c5e26b9431c1bcf2ff555f4",
+      "size_bytes": 174
     },
     {
       "path": "adapters/market-squawk-adapter-coinbase/src/config.rs",
@@ -296,6 +311,11 @@
       "size_bytes": 805
     },
     {
+      "path": "adapters/market-squawk-adapter-fred/fixtures/observations.json",
+      "sha256": "810d1431996a3089fd1904472afba2f7e65d0de0af72e71582b65ae1f8ed15ac",
+      "size_bytes": 599
+    },
+    {
       "path": "adapters/market-squawk-adapter-fred/src/client.rs",
       "sha256": "844a5e118c805c5546e593190c5b949c45532858a2c4870f9d3b0c9148006a29",
       "size_bytes": 32147
@@ -349,6 +369,11 @@
       "path": "adapters/market-squawk-adapter-kraken/Cargo.toml",
       "sha256": "768e73af5bb40cdabb9fc41e720deff25bd8547af13058fb4303df9444a3287a",
       "size_bytes": 889
+    },
+    {
+      "path": "adapters/market-squawk-adapter-kraken/fixtures/official_book_checksum.json",
+      "sha256": "dac86e903deed67b1e7ca84eb36a1435f452d1ce4312161993e15b352916bf92",
+      "size_bytes": 1125
     },
     {
       "path": "adapters/market-squawk-adapter-kraken/src/config.rs",
@@ -546,6 +571,16 @@
       "size_bytes": 1024
     },
     {
+      "path": "adapters/market-squawk-adapter-sec/fixtures/submissions-archive.json",
+      "sha256": "849577f7eccf92e4c79ba0e6a43c0f34bc9a8bee0e5464866affe6606ec0b3ae",
+      "size_bytes": 590
+    },
+    {
+      "path": "adapters/market-squawk-adapter-sec/fixtures/submissions-recent.json",
+      "sha256": "3ad503d82403e0e770be2fbd0f763acc0de26db3ad328ca9d4e6fd7870aad852",
+      "size_bytes": 1063
+    },
+    {
       "path": "adapters/market-squawk-adapter-sec/src/client.rs",
       "sha256": "ae9d7e26ded2b1bb0fdfcb6eceb097a93aa9e9fac97eb650f27936d4494b223d",
       "size_bytes": 25832
@@ -636,6 +671,16 @@
       "size_bytes": 851
     },
     {
+      "path": "adapters/market-squawk-adapter-treasury/fixtures/average_interest_rates.json",
+      "sha256": "0657174f6827a50935660f3af28ae2c8df3629f5f258803dcb20e78be42e1225",
+      "size_bytes": 1743
+    },
+    {
+      "path": "adapters/market-squawk-adapter-treasury/fixtures/daily_par_yield_curve.xml",
+      "sha256": "d75b496cb8fcb2a0ad1aaa260d6e53bb30d6e7984fa3fe017289646da3fd9e08",
+      "size_bytes": 1836
+    },
+    {
       "path": "adapters/market-squawk-adapter-treasury/src/client.rs",
       "sha256": "0f002354d448290dab7a4185b9bc632a660961a68763b7db7618ff69b8f61850",
       "size_bytes": 12646
@@ -697,8 +742,8 @@
     },
     {
       "path": "apps/market-squawk/src/application/analysis.rs",
-      "sha256": "688af6dbde9cdccf693a99d067de4e5953d64cbf14898b5d2dd9042fe3e2b990",
-      "size_bytes": 28821
+      "sha256": "faf5a050aa09ea84f0b21bb0ad31e900fbcdb991ba1965c1a48494af5d8e95aa",
+      "size_bytes": 31222
     },
     {
       "path": "apps/market-squawk/src/application/analysis/backtest.rs",
@@ -767,8 +812,8 @@
     },
     {
       "path": "apps/market-squawk/src/application/contracts.rs",
-      "sha256": "c7e1340134f13f15525784873b8b463cd0e3ac6a4631d7f0ff46fdfe3aff7735",
-      "size_bytes": 47866
+      "sha256": "379756c9336b948753936160d2fd81be0a52738b514c4c645a48b43db1bd2ed0",
+      "size_bytes": 48058
     },
     {
       "path": "apps/market-squawk/src/application/domain_support.rs",
@@ -897,8 +942,8 @@
     },
     {
       "path": "apps/market-squawk/src/cli.rs",
-      "sha256": "ccec3cdb5329505d64c1e48997d18b41a66fe3f0e213396f1c50088d3f03b29c",
-      "size_bytes": 17940
+      "sha256": "b8a9a22bd50766586e6e3130dc16de491b52d40832d6683a9f919bbc35a880d0",
+      "size_bytes": 18074
     },
     {
       "path": "apps/market-squawk/src/diagnostic_engine.rs",
@@ -1032,8 +1077,8 @@
     },
     {
       "path": "apps/market-squawk/src/local_product/cli_transport.rs",
-      "sha256": "be78a23c9ed54245ad5b465bc83a5356084b3068f3e92af70344b89dfc463b3d",
-      "size_bytes": 23542
+      "sha256": "d1941a49daa6d72e774ede122c0b60e22ff811296b5dab43020090bde5416924",
+      "size_bytes": 23722
     },
     {
       "path": "apps/market-squawk/src/local_product/cli_transport/files.rs",
@@ -2852,8 +2897,8 @@
     },
     {
       "path": "crates/market-squawk-modeling/src/training_environment.rs",
-      "sha256": "08675e76dc6f65d9a4c115be34c5f358b0f51fa5f3dc3ad263b3839098e2a4e1",
-      "size_bytes": 36874
+      "sha256": "96fc71266ae12724e89738ecdf06323536283beb6fa571cb36eccb43d6283a73",
+      "size_bytes": 37020
     },
     {
       "path": "crates/market-squawk-platform/Cargo.toml",
@@ -3821,6 +3866,16 @@
       "size_bytes": 12449
     },
     {
+      "path": "docs/reports/performance/2026-07-17-q2-a4-writer-runtime-proof.md",
+      "sha256": "4b2aafb34991ac31ef296c42b729b94eb1020de6b4006b28e97304f0e15ca50f",
+      "size_bytes": 4244
+    },
+    {
+      "path": "docs/verification/onnx-runtime-policy.json",
+      "sha256": "86d4ba969e559be6cdae54be78aa079932aa7a918f90a2aaa076bb1939658c07",
+      "size_bytes": 794
+    },
+    {
       "path": "python/examples/pit_research.ipynb",
       "sha256": "30c82570dac63d2877d4adbcc1a33edfd5085524b2ed98d8ee9d0baf04fd8ccf",
       "size_bytes": 2061
@@ -3902,13 +3957,13 @@
     },
     {
       "path": "scripts/build_python_release.py",
-      "sha256": "fbec70916f3f70009146564657553111431fefdb8ea9ad7fb728a983adad5dba",
-      "size_bytes": 83258
+      "sha256": "369db65aef9206472e91d1cf3cd313e4d08fd98168a0b1e74ef5bbe9cd466a7e",
+      "size_bytes": 92539
     },
     {
       "path": "scripts/tests/test_build_python_release.py",
-      "sha256": "fe55e70e2cfa10944332c773bd81fefa8ba812c07acad9d43ff752ec1782ec1a",
-      "size_bytes": 9463
+      "sha256": "4436f9909495970b56ff00f43a072bb69ea719cd98d40605e81b6ef953bcca08",
+      "size_bytes": 11639
     }
   ]
 }
