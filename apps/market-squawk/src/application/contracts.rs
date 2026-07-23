@@ -137,6 +137,7 @@ const INGEST_SOURCE_ARGUMENTS: &[ArgumentSpec] = &[
     ArgumentSpec::required("provider", ArgumentKind::Identifier),
     ArgumentSpec::required("object", ArgumentKind::Identifier),
     ArgumentSpec::required("dataset", ArgumentKind::Identifier),
+    ArgumentSpec::required("discoveryReceipt", ArgumentKind::Identifier),
 ];
 
 const OPERATION_SPECS: &[OperationSpec] = &[

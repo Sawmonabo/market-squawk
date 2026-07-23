@@ -573,34 +573,56 @@ async fn collect_body(mut body: Incoming, max_bytes: usize) -> Result<Vec<u8>, P
 }
 
 async fn collect_secret_body(mut body: Incoming) -> Result<SecretValue, PortalRequestError> {
-    let mut retained = Vec::new();
+    let mut retained = SecretBodyBuffer::try_new()?;
     while let Some(frame) = body.frame().await {
-        let frame = match frame {
-            Ok(frame) => frame,
-            Err(_) => {
-                discard_secret_bytes(retained);
-                return Err(PortalRequestError::InvalidSecretBody);
-            }
-        };
+        let frame = frame.map_err(|_| PortalRequestError::InvalidSecretBody)?;
         let Ok(data) = frame.into_data() else {
             continue;
         };
-        let Some(next) = retained.len().checked_add(data.len()) else {
-            discard_secret_bytes(retained);
-            return Err(PortalRequestError::BodyTooLarge);
-        };
-        if next > MAX_SECRET_BODY_BYTES {
-            discard_secret_bytes(retained);
-            return Err(PortalRequestError::BodyTooLarge);
-        }
-        retained.extend_from_slice(&data);
+        retained.extend_from_slice(&data)?;
     }
-    SecretValue::from_utf8_bytes(retained).map_err(|_| PortalRequestError::InvalidSecretBody)
+    retained.into_secret()
 }
 
-fn discard_secret_bytes(bytes: Vec<u8>) {
-    if let Ok(secret) = SecretValue::from_utf8_bytes(bytes) {
-        drop(secret);
+struct SecretBodyBuffer {
+    bytes: Option<Vec<u8>>,
+}
+
+impl SecretBodyBuffer {
+    fn try_new() -> Result<Self, PortalRequestError> {
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(MAX_SECRET_BODY_BYTES)
+            .map_err(|_error| PortalRequestError::Internal)?;
+        Ok(Self { bytes: Some(bytes) })
+    }
+
+    fn extend_from_slice(&mut self, data: &[u8]) -> Result<(), PortalRequestError> {
+        let bytes = self.bytes.as_mut().ok_or(PortalRequestError::Internal)?;
+        let next = bytes
+            .len()
+            .checked_add(data.len())
+            .ok_or(PortalRequestError::BodyTooLarge)?;
+        if next > MAX_SECRET_BODY_BYTES {
+            return Err(PortalRequestError::BodyTooLarge);
+        }
+        bytes.extend_from_slice(data);
+        Ok(())
+    }
+
+    fn into_secret(mut self) -> Result<SecretValue, PortalRequestError> {
+        let bytes = self.bytes.take().ok_or(PortalRequestError::Internal)?;
+        SecretValue::from_utf8_bytes(bytes).map_err(|_error| PortalRequestError::InvalidSecretBody)
+    }
+}
+
+impl Drop for SecretBodyBuffer {
+    fn drop(&mut self) {
+        if let Some(bytes) = self.bytes.take()
+            && let Ok(secret) = SecretValue::from_utf8_bytes(bytes)
+        {
+            drop(secret);
+        }
     }
 }
 

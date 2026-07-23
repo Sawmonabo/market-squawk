@@ -4,10 +4,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use market_squawk_platform::{
-    EncryptedFileFallbackStatus, EncryptedFileSecretStore, EncryptedFileUnlockCapability,
-    LocalSecretStoreError, PreferredSecretStore, SecretBackend, SecretCancellation,
-    SecretGeneration, SecretInteractionPolicy, SecretKey, SecretOperationControl, SecretStore,
-    SecretValue,
+    EncryptedFileFallbackStatus, EncryptedFileSecretFallback, EncryptedFileSecretStore,
+    EncryptedFileUnlockCapability, LocalSecretStoreError, PreferredSecretStore, SecretBackend,
+    SecretCancellation, SecretGeneration, SecretInteractionPolicy, SecretKey,
+    SecretOperationControl, SecretStore, SecretValue,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -142,6 +142,35 @@ fn preferred_store_requires_explicit_memory_only_fallback_unlock() -> TestResult
             &control,
         )?
     };
+    assert!(matches!(
+        EncryptedFileSecretFallback::try_open(
+            &root,
+            EncryptedFileUnlockCapability::new(SecretValue::new(
+                "incorrect unlock phrase".to_owned()
+            )?),
+            &control,
+        ),
+        Err(LocalSecretStoreError::AuthenticationFailed)
+    ));
+    let preopened = PreferredSecretStore::try_new(
+        "market-squawk-test",
+        Some(EncryptedFileSecretFallback::try_open(
+            &root,
+            EncryptedFileUnlockCapability::new(SecretValue::new(
+                "correct unlock phrase".to_owned(),
+            )?),
+            &control,
+        )?),
+    )?;
+    assert_eq!(
+        preopened.encrypted_file_fallback_status()?,
+        EncryptedFileFallbackStatus::Ready
+    );
+    assert_eq!(
+        preopened.read(&reference, &control)?.expose_secret(),
+        "fallback-only credential"
+    );
+    drop(preopened);
     let preferred = PreferredSecretStore::try_new_with_locked_encrypted_file_fallback(
         "market-squawk-test",
         &root,

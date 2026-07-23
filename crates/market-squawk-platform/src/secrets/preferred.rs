@@ -48,12 +48,12 @@ impl EncryptedFileSecretFallback {
     pub fn try_open(
         root: impl AsRef<Path>,
         unlock: EncryptedFileUnlockCapability,
+        control: &SecretOperationControl,
     ) -> Result<Self, LocalSecretStoreError> {
         let root = root.as_ref().to_path_buf();
-        Ok(Self {
-            store: EncryptedFileSecretStore::try_open(&root, unlock.0)?,
-            root,
-        })
+        let store = EncryptedFileSecretStore::try_open(&root, unlock.0)?;
+        store.validate_current_unlock(control)?;
+        Ok(Self { store, root })
     }
 }
 

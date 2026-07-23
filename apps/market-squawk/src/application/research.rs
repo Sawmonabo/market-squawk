@@ -33,7 +33,7 @@ mod ingest;
 pub use ingest::{
     ManagedResearchExtractionSource, ProductionResearchIngestCoordinator, ResearchExtractionLimits,
     ResearchIngestCompositionError, ResearchRevisionPlanError, ResearchRightsAuthority,
-    ResearchSourceDiscovery, ResearchSourceDiscoveryRights,
+    ResearchSourceDiscovery, ResearchSourceDiscoveryObject, ResearchSourceDiscoveryRights,
 };
 
 const RESEARCH_LIST_DATASETS: &str = "Research.ListDatasets";

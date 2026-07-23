@@ -20,10 +20,10 @@ use market_squawk_services::{
     TypedToolResult,
 };
 use market_squawk_sources::{
-    AuthoritativeSourceRegistry, DiscoveryBatch, DiscoveryRequest, ExtractionBatch,
-    ExtractionRequest, ExtractionRevisionPlan, ExtractionSource, ExtractionSourceError,
-    MAX_DISCOVERY_OBJECTS, MAX_EXTRACTION_RECORDS, MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES,
-    RegisteredSource, RegistryError, SourceError, SourceMetadata, SourceObject,
+    AuthoritativeSourceRegistry, DiscoveryRequest, ExtractionBatch, ExtractionRequest,
+    ExtractionRevisionPlan, ExtractionSource, ExtractionSourceError, MAX_DISCOVERY_OBJECTS,
+    MAX_EXTRACTION_RECORDS, MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES, RegisteredSource, RegistryError,
+    SourceError, SourceMetadata, SourceObject,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -39,6 +39,11 @@ use crate::{ResearchIngestRequest, ResearchService, ResearchServiceError};
 use super::super::domain_support::DomainLifecycle;
 
 const STANDARD_EXTRACTION_DURATION: Duration = Duration::from_secs(60);
+
+mod selection;
+
+use selection::{PreparedRetainedSelection, RetainedDiscoverySelections};
+pub use selection::{ResearchSourceDiscovery, ResearchSourceDiscoveryObject};
 
 /// Fixed operation ceilings applied independently of transport result limits.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -95,7 +100,7 @@ impl Default for ResearchExtractionLimits {
 }
 
 /// Immutable evidence required to admit persistence for one exact source payload.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResearchRightsAuthority {
     source_id: SourceId,
     basis: RightsBasis,
@@ -218,47 +223,6 @@ impl ResearchSourceDiscoveryRights {
     }
 }
 
-/// Bounded, authority-preserving producer contract for one registered research source.
-///
-/// Every object remains bound to the exact discovery request, source identity, metadata revision,
-/// dataset, effective interval, and payload evidence produced by the registered adapter.
-#[derive(Clone, Debug, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ResearchSourceDiscovery {
-    profile: SourceIdentifier,
-    metadata: SourceMetadata,
-    rights: ResearchSourceDiscoveryRights,
-    #[serde(flatten)]
-    discovery: DiscoveryBatch,
-}
-
-impl ResearchSourceDiscovery {
-    /// Returns the active provider profile that owns these objects.
-    pub const fn profile(&self) -> &SourceIdentifier {
-        &self.profile
-    }
-
-    /// Returns exact registered metadata, including coverage and quality ceilings.
-    pub const fn metadata(&self) -> &SourceMetadata {
-        &self.metadata
-    }
-
-    /// Returns retained persistence-rights evidence.
-    pub const fn rights(&self) -> &ResearchSourceDiscoveryRights {
-        &self.rights
-    }
-
-    /// Returns the exact bounded request used by the adapter.
-    pub const fn request(&self) -> &DiscoveryRequest {
-        self.discovery.request()
-    }
-
-    /// Returns request-bound exact objects suitable for the existing ingestion consumer.
-    pub fn objects(&self) -> &[SourceObject] {
-        self.discovery.objects()
-    }
-}
-
 /// Adapter revision evidence failed to align with one normalized extraction batch.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 #[error("research extraction revision evidence is invalid")]
@@ -347,6 +311,7 @@ struct RegisteredExtractionSource {
 struct CoordinatorAuthority {
     registry: Option<AuthoritativeSourceRegistry>,
     sources: BTreeMap<SourceIdentifier, RegisteredExtractionSource>,
+    selections: RetainedDiscoverySelections,
 }
 
 /// Sole production coordinator for source discovery, extraction, and analytical publication.
@@ -372,6 +337,7 @@ impl ProductionResearchIngestCoordinator {
             authority: Mutex::new(CoordinatorAuthority {
                 registry: Some(registry),
                 sources: BTreeMap::new(),
+                selections: RetainedDiscoverySelections::new(),
             }),
         }
     }
@@ -450,12 +416,12 @@ impl ProductionResearchIngestCoordinator {
 
     /// Discovers exact source objects from one already registered provider profile.
     ///
-    /// This is the public producer for [`Self::extract_registered_batch`] and
-    /// [`ResearchIngestCoordinator::ingest`]. It uses the same registry-minted authority and
-    /// returns only bounded, request-bound object identities plus exact metadata and retained
-    /// persistence-rights evidence. The adapter response body and any credential material remain
-    /// behind their owning boundaries. Point-in-time discovery remains closed until the ingestion
-    /// consumer can bind the same effective-time coordinate.
+    /// This is the public producer for [`ResearchIngestCoordinator::ingest`]. It uses the same
+    /// registry-minted authority and returns bounded, request-bound objects with opaque,
+    /// single-use selection receipts plus exact metadata and retained persistence-rights evidence.
+    /// The adapter response body and any credential material remain behind their owning
+    /// boundaries. Point-in-time discovery remains closed until the ingestion consumer can bind
+    /// the same effective-time coordinate.
     ///
     /// # Errors
     ///
@@ -472,13 +438,14 @@ impl ProductionResearchIngestCoordinator {
         context: &RequestContext,
     ) -> Result<ResearchSourceDiscovery, ServiceError> {
         let _call = DomainLifecycle::enter(&self.lifecycle, context)?;
+        let operation_deadline = operation_deadline(context, self.limits.duration)?;
         if effective_at.is_some() || max_results.get() > self.limits.discovery_objects.get() {
             return Err(ServiceError::InvalidRequest);
         }
         let operation = self.lifecycle.shutdown_token().child_token();
         let prepared = self.prepare(profile)?;
         prepared.rights.validate_at(system_timestamp()?)?;
-        let deadline = wall_deadline(context, self.limits.duration)?;
+        let deadline = wall_deadline(operation_deadline, &operation)?;
         let request = DiscoveryRequest::try_new(dataset.clone(), None, max_results, deadline)
             .map_err(|_error| ServiceError::InvalidRequest)?;
         let discovery = await_extraction(
@@ -487,21 +454,39 @@ impl ProductionResearchIngestCoordinator {
                 .discover(prepared.authority, request, operation.clone()),
             context,
             &operation,
+            operation_deadline,
         )
         .await?;
+        ensure_operation_live(operation_deadline, &operation)?;
         if discovery.objects().iter().any(|object| {
             object.source_id() != prepared.metadata.source_id()
                 || object.metadata_revision() != prepared.metadata.revision()
         }) {
             return Err(ServiceError::InvalidResult);
         }
-        let rights = prepared.rights.discovery_evidence(system_timestamp()?)?;
-        Ok(ResearchSourceDiscovery {
-            profile: profile.clone(),
-            metadata: prepared.metadata,
-            rights,
+        let observed_monotonic = Instant::now();
+        let observed_wall = system_timestamp()?;
+        let mut authority = self
+            .authority
+            .lock()
+            .map_err(|_error| ServiceError::Unavailable)?;
+        if authority.registry.is_none() {
+            return Err(ServiceError::Unavailable);
+        }
+        let retained = authority.selections.mint(
+            profile,
+            &prepared.metadata,
+            &prepared.rights,
             discovery,
-        })
+            self.limits.duration,
+            observed_monotonic,
+            observed_wall,
+            operation_deadline,
+        );
+        if matches!(retained, Err(ServiceError::DeadlineExceeded)) {
+            operation.cancel();
+        }
+        retained
     }
 
     /// Extracts one exact object from an already registered profile without analytical
@@ -525,10 +510,18 @@ impl ProductionResearchIngestCoordinator {
         context: &RequestContext,
     ) -> Result<ExtractionBatch, ServiceError> {
         let _call = DomainLifecycle::enter(&self.lifecycle, context)?;
+        let operation_deadline = operation_deadline(context, self.limits.duration)?;
         let operation = self.lifecycle.shutdown_token().child_token();
-        self.extract_exact(profile, dataset, object_id, context, &operation)
-            .await
-            .map(|extracted| extracted.batch)
+        self.extract_exact(
+            profile,
+            dataset,
+            object_id,
+            context,
+            &operation,
+            operation_deadline,
+        )
+        .await
+        .map(|extracted| extracted.batch)
     }
 
     fn prepare(&self, profile: &SourceIdentifier) -> Result<PreparedExtraction, ServiceError> {
@@ -562,9 +555,10 @@ impl ProductionResearchIngestCoordinator {
         object_id: &SourceIdentifier,
         context: &RequestContext,
         operation: &CancellationToken,
+        operation_deadline: Instant,
     ) -> Result<AuthorizedExtraction, ServiceError> {
         let prepared = self.prepare(profile)?;
-        let deadline = wall_deadline(context, self.limits.duration)?;
+        let deadline = wall_deadline(operation_deadline, operation)?;
         let discovery_request = DiscoveryRequest::try_new(
             dataset.clone(),
             None,
@@ -580,6 +574,7 @@ impl ProductionResearchIngestCoordinator {
             ),
             context,
             operation,
+            operation_deadline,
         )
         .await?;
         let mut matches = discovery
@@ -590,7 +585,85 @@ impl ProductionResearchIngestCoordinator {
         if matches.next().is_some() {
             return Err(ServiceError::InvalidResult);
         }
+        self.extract_prepared_object(
+            prepared,
+            object,
+            context,
+            operation,
+            operation_deadline,
+            deadline,
+        )
+        .await
+    }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "single-use receipt coordinates and one operation deadline remain explicit"
+    )]
+    async fn extract_selected(
+        &self,
+        receipt: &str,
+        profile: &SourceIdentifier,
+        dataset: &SourceIdentifier,
+        object_id: &SourceIdentifier,
+        context: &RequestContext,
+        operation: &CancellationToken,
+        operation_deadline: Instant,
+    ) -> Result<AuthorizedExtraction, ServiceError> {
+        ensure_operation_live(operation_deadline, operation)?;
+        let observed_monotonic = Instant::now();
+        let observed_wall = system_timestamp()?;
+        let prepared = {
+            let mut authority = self
+                .authority
+                .lock()
+                .map_err(|_error| ServiceError::Unavailable)?;
+            authority.consume_discovery_selection(
+                receipt,
+                profile,
+                dataset,
+                object_id,
+                observed_monotonic,
+                observed_wall,
+            )?
+        };
+        let deadline = wall_deadline(operation_deadline, operation)?;
+        let PreparedRetainedSelection {
+            source,
+            metadata,
+            rights,
+            authority,
+            object,
+        } = prepared;
+        self.extract_prepared_object(
+            PreparedExtraction {
+                source,
+                metadata,
+                rights,
+                authority,
+            },
+            object,
+            context,
+            operation,
+            operation_deadline,
+            deadline,
+        )
+        .await
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "exact selection and one operation deadline remain explicit"
+    )]
+    async fn extract_prepared_object(
+        &self,
+        prepared: PreparedExtraction,
+        object: SourceObject,
+        context: &RequestContext,
+        operation: &CancellationToken,
+        operation_deadline: Instant,
+        deadline: Timestamp,
+    ) -> Result<AuthorizedExtraction, ServiceError> {
         let extraction_request =
             ExtractionRequest::try_new(object, self.limits.records, self.limits.bytes, deadline)
                 .map_err(|_error| ServiceError::InvalidRequest)?;
@@ -600,6 +673,7 @@ impl ProductionResearchIngestCoordinator {
                 .extract(prepared.authority, extraction_request, operation.clone()),
             context,
             operation,
+            operation_deadline,
         )
         .await?;
         let revisions = prepared
@@ -609,6 +683,7 @@ impl ProductionResearchIngestCoordinator {
         let payload_digest = extraction_batch_digest(&batch).map_err(map_ingest_error)?;
         let retrieved_at = system_timestamp()?;
         let rights = prepared.rights.decision(payload_digest, retrieved_at)?;
+        ensure_operation_live(operation_deadline, operation)?;
         Ok(AuthorizedExtraction {
             metadata: prepared.metadata,
             batch,
@@ -624,6 +699,7 @@ impl ProductionResearchIngestCoordinator {
                 .authority
                 .lock()
                 .map_err(|_error| ServiceError::Unavailable)?;
+            authority.selections.clear();
             authority.sources.clear();
             authority.registry.take()
         };
@@ -698,12 +774,22 @@ impl ResearchIngestCoordinator for ProductionResearchIngestCoordinator {
         limits: ServiceLimits,
     ) -> Result<TypedToolResult, ServiceError> {
         let _call = DomainLifecycle::enter(&self.lifecycle, context)?;
+        let operation_deadline = operation_deadline(context, self.limits.duration)?;
         let profile = required_identifier(request, "provider")?;
         let dataset = required_identifier(request, "dataset")?;
         let object_id = required_identifier(request, "object")?;
+        let receipt = required_string(request, "discoveryReceipt")?;
         let operation = self.lifecycle.shutdown_token().child_token();
         let extracted = self
-            .extract_exact(&profile, &dataset, &object_id, context, &operation)
+            .extract_selected(
+                receipt,
+                &profile,
+                &dataset,
+                &object_id,
+                context,
+                &operation,
+                operation_deadline,
+            )
             .await?;
         let idempotency_key =
             ingest_identity(&profile, &dataset, &object_id, extracted.payload_digest);
@@ -727,6 +813,7 @@ impl ResearchIngestCoordinator for ProductionResearchIngestCoordinator {
             self.research.ingest(ingest, operation.clone()),
             context,
             &operation,
+            operation_deadline,
         )
         .await?;
         let manifest = committed.manifest();
@@ -755,7 +842,9 @@ impl ResearchIngestCoordinator for ProductionResearchIngestCoordinator {
             "objectCount": plan.objects().len(),
             "lineageDigest": encode_hex(plan.lineage_digest().bytes()),
         });
-        TypedToolResult::try_new(content, 1, metadata, limits).map_err(Into::into)
+        let result = TypedToolResult::try_new(content, 1, metadata, limits)?;
+        ensure_operation_live(operation_deadline, &operation)?;
+        Ok(result)
     }
 
     fn begin_shutdown(&self) {
@@ -773,7 +862,12 @@ async fn await_extraction<T>(
     future: impl Future<Output = Result<T, ExtractionSourceError>>,
     context: &RequestContext,
     operation: &CancellationToken,
+    operation_deadline: Instant,
 ) -> Result<T, ServiceError> {
+    if Instant::now() >= operation_deadline {
+        operation.cancel();
+        return Err(ServiceError::DeadlineExceeded);
+    }
     tokio::select! {
         biased;
         () = context.cancellation().cancelled() => {
@@ -781,11 +875,11 @@ async fn await_extraction<T>(
             Err(ServiceError::Cancelled)
         }
         () = operation.cancelled() => Err(ServiceError::Unavailable),
-        result = future => result.map_err(map_extraction_error),
-        () = tokio::time::sleep_until(context.deadline().into()) => {
+        () = tokio::time::sleep_until(operation_deadline.into()) => {
             operation.cancel();
             Err(ServiceError::DeadlineExceeded)
         }
+        result = future => result.map_err(map_extraction_error),
     }
 }
 
@@ -793,7 +887,12 @@ async fn await_publication<T>(
     future: impl Future<Output = Result<T, ResearchServiceError>>,
     context: &RequestContext,
     operation: &CancellationToken,
+    operation_deadline: Instant,
 ) -> Result<T, ServiceError> {
+    if Instant::now() >= operation_deadline {
+        operation.cancel();
+        return Err(ServiceError::DeadlineExceeded);
+    }
     tokio::select! {
         biased;
         () = context.cancellation().cancelled() => {
@@ -801,11 +900,11 @@ async fn await_publication<T>(
             Err(ServiceError::Cancelled)
         }
         () = operation.cancelled() => Err(ServiceError::Unavailable),
-        result = future => result.map_err(map_research_error),
-        () = tokio::time::sleep_until(context.deadline().into()) => {
+        () = tokio::time::sleep_until(operation_deadline.into()) => {
             operation.cancel();
             Err(ServiceError::DeadlineExceeded)
         }
+        result = future => result.map_err(map_research_error),
     }
 }
 
@@ -823,18 +922,52 @@ fn required_identifier(
         })
 }
 
-fn wall_deadline(
+fn required_string<'a>(
+    request: &'a TypedToolRequest,
+    field: &str,
+) -> Result<&'a str, ServiceError> {
+    request
+        .arguments()
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .ok_or(ServiceError::InvalidRequest)
+}
+
+fn operation_deadline(
     context: &RequestContext,
     maximum_duration: Duration,
-) -> Result<Timestamp, ServiceError> {
+) -> Result<Instant, ServiceError> {
     let now = Instant::now();
     if now >= context.deadline() {
         return Err(ServiceError::DeadlineExceeded);
     }
-    let remaining = context
-        .deadline()
-        .saturating_duration_since(now)
-        .min(maximum_duration);
+    let coordinator_deadline = now
+        .checked_add(maximum_duration)
+        .ok_or(ServiceError::Internal)?;
+    Ok(context.deadline().min(coordinator_deadline))
+}
+
+fn ensure_operation_live(
+    operation_deadline: Instant,
+    operation: &CancellationToken,
+) -> Result<(), ServiceError> {
+    if Instant::now() >= operation_deadline {
+        operation.cancel();
+        return Err(ServiceError::DeadlineExceeded);
+    }
+    Ok(())
+}
+
+fn wall_deadline(
+    operation_deadline: Instant,
+    operation: &CancellationToken,
+) -> Result<Timestamp, ServiceError> {
+    let now = Instant::now();
+    if now >= operation_deadline {
+        operation.cancel();
+        return Err(ServiceError::DeadlineExceeded);
+    }
+    let remaining = operation_deadline.saturating_duration_since(now);
     let nanos = i64::try_from(remaining.as_nanos()).map_err(|_error| ServiceError::Internal)?;
     system_timestamp()?
         .checked_add_nanos(nanos)
