@@ -16,18 +16,21 @@ use market_squawk_platform::{
     SecretOperationControl, SecretStore, SecretValue,
 };
 use market_squawk_sources::{
-    OnboardingEvent, OnboardingState, ProbeTransport, ProfileReleaseState,
-    ProviderOnboardingProfile, ProviderProfileError, ProviderProfileRegistry,
-    ProviderPublicConfiguration, built_in_provider_profiles, install_ring_tls_provider,
+    AuthorityBindings, AuthorityVerification, AuthorityVerificationInput, OnboardingEvent,
+    OnboardingState, ProbeTransport, ProfileReleaseState, ProviderOnboardingProfile,
+    ProviderProfileError, ProviderProfileRegistry, ProviderPublicConfiguration,
+    built_in_provider_profiles, install_ring_tls_provider,
 };
 use sha2::{Digest as _, Sha256};
 use subtle::ConstantTimeEq as _;
 use thiserror::Error;
+use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::contracts::{
-    OnboardingSessionView, ProviderProfileRegistration, ProviderProfileView, session_view,
+    OnboardingSessionView, ProviderActivationLease, ProviderActivationLeaseInput,
+    ProviderProfileRegistration, ProviderProfileView, session_view,
 };
 
 const SESSION_DURATION: Duration = Duration::from_secs(15 * 60);
@@ -81,6 +84,7 @@ pub struct ProviderOnboardingService {
     catalog: OnboardingCatalogCapability,
     secrets: Arc<dyn SecretStore>,
     client: reqwest::Client,
+    activation: AsyncMutex<()>,
 }
 
 impl ProviderOnboardingService {
@@ -116,6 +120,7 @@ impl ProviderOnboardingService {
             catalog,
             secrets,
             client,
+            activation: AsyncMutex::new(()),
         })
     }
 
@@ -257,15 +262,6 @@ impl ProviderOnboardingService {
             },
         )?;
         sequence = checked_next(sequence)?;
-        self.append(
-            &reservation,
-            sequence,
-            OnboardingEvent::ProtocolValidated {
-                generation,
-                evidence_digest: event_digest(b"protocol-validated", session_id, Some(generation)),
-            },
-        )?;
-        sequence = checked_next(sequence)?;
 
         let secret_key = SecretKey::try_new(
             "provider-onboarding",
@@ -278,7 +274,7 @@ impl ProviderOnboardingService {
             format!("provider-onboarding-{session_id}"),
             deadline,
             0,
-            SecretInteractionPolicy::Forbid,
+            SecretInteractionPolicy::AllowPlatformPrompt,
             cancellation,
         )?;
         let expected = SecretValue::new(secret.expose_secret().to_owned())
@@ -394,21 +390,137 @@ impl ProviderOnboardingService {
                 return Err(catalog_error);
             }
         }
-        if profile.release_state() == ProfileReleaseState::RefreshRequired {
-            let resumed = self.catalog.resume_provider_onboarding(session_id)?;
-            self.append(
-                resumed.reservation(),
-                resumed.next_sequence(),
-                OnboardingEvent::RefreshRequired {
-                    evidence_digest: event_digest(
-                        b"refresh-required",
-                        session_id,
-                        Some(generation),
-                    ),
-                },
-            )?;
-        }
         self.resume(session_id)
+    }
+
+    /// Verifies one stored credential against its exact provider, admits the retained authority
+    /// evidence, and returns an immutable adapter-construction lease.
+    ///
+    /// Repeated calls after activation recover the same durable generation without repeating the
+    /// provider request. Profiles whose code-owned evidence is rights-blocked or refresh-required
+    /// remain unavailable.
+    pub async fn activate(
+        &self,
+        session_id: Uuid,
+        cancellation: CancellationToken,
+    ) -> Result<ProviderActivationLease, ProviderOnboardingError> {
+        let _activation = self.activation.lock().await;
+        let resumed = self.catalog.resume_provider_onboarding(session_id)?;
+        let profile = self.profile_for(&resumed)?;
+        if resumed.lifecycle().state() == OnboardingState::ActiveScoped {
+            return self.lease_from_resumed(&resumed);
+        }
+        match profile.release_state() {
+            ProfileReleaseState::RightsBlocked => {
+                return Err(ProviderOnboardingError::RightsBlocked);
+            }
+            ProfileReleaseState::RefreshRequired => {
+                return Err(ProviderOnboardingError::EvidenceRefreshRequired);
+            }
+            ProfileReleaseState::Available | ProfileReleaseState::RightsLimited => {}
+        }
+        if resumed.lifecycle().state() != OnboardingState::StoredUnverified {
+            return Err(ProviderOnboardingError::ActivationUnavailable);
+        }
+        let generation = resumed
+            .lifecycle()
+            .candidate_generation()
+            .ok_or(ProviderOnboardingError::InvalidSessionState)?;
+        let reference = resumed
+            .lifecycle()
+            .generation_reference(generation)
+            .ok_or(ProviderOnboardingError::InvalidSessionState)?;
+        let secret = self.read_reference(
+            session_id,
+            reference,
+            SecretCancellation::new(),
+            SecretInteractionPolicy::AllowPlatformPrompt,
+        )?;
+        let verified_at = system_timestamp()?;
+        let response_evidence = self
+            .run_credential_probe(profile, &secret, cancellation)
+            .await?;
+        let requested = resumed.lifecycle().requested_authority().clone();
+        let verification = AuthorityVerification::try_new(
+            profile.capability(),
+            AuthorityVerificationInput {
+                requested: requested.clone(),
+                observed: requested,
+                restrictions_digest: profile_rights_digest(profile),
+                bindings: AuthorityBindings::new(
+                    None,
+                    None,
+                    None,
+                    Some(resumed.reservation().public_configuration_digest()),
+                ),
+                verified_at,
+                expires_at: None,
+                verifier_revision: profile.capability().verifier_revision().clone(),
+                assurance_limitation: credential_assurance(profile)?,
+                evidence_digest: response_evidence,
+            },
+        )
+        .map_err(|_| ProviderOnboardingError::InvalidSessionState)?;
+        let reservation = resumed.reservation();
+        let mut sequence = resumed.next_sequence();
+        self.append(
+            reservation,
+            sequence,
+            OnboardingEvent::AuthorityVerified {
+                verification: Box::new(verification),
+            },
+        )?;
+        sequence = checked_next(sequence)?;
+        self.append(
+            reservation,
+            sequence,
+            OnboardingEvent::RightsAdmitted {
+                generation: Some(generation),
+                decision_digest: profile_rights_digest(profile),
+            },
+        )?;
+        sequence = checked_next(sequence)?;
+        self.append(
+            reservation,
+            sequence,
+            OnboardingEvent::RatePolicyAdmitted {
+                generation: Some(generation),
+                policy_digest: profile.capability().rate_policy().evidence_digest(),
+            },
+        )?;
+        sequence = checked_next(sequence)?;
+        self.append(
+            reservation,
+            sequence,
+            OnboardingEvent::RuntimeVerified {
+                generation: Some(generation),
+                evidence_digest: derived_evidence_digest(
+                    b"credential-runtime",
+                    session_id,
+                    generation,
+                    response_evidence,
+                ),
+            },
+        )?;
+        sequence = checked_next(sequence)?;
+        self.append(
+            reservation,
+            sequence,
+            OnboardingEvent::Activate {
+                generation: Some(generation),
+            },
+        )?;
+        self.activation_lease(session_id)
+    }
+
+    /// Recovers immutable adapter-construction authority for an active durable session.
+    pub fn activation_lease(
+        &self,
+        session_id: Uuid,
+    ) -> Result<ProviderActivationLease, ProviderOnboardingError> {
+        let resumed = self.catalog.resume_provider_onboarding(session_id)?;
+        self.profile_for(&resumed)?;
+        self.lease_from_resumed(&resumed)
     }
 
     /// Replays one exact durable session, closes safe refresh recovery, and returns status.
@@ -419,10 +531,7 @@ impl ProviderOnboardingService {
         let mut resumed = self.catalog.resume_provider_onboarding(session_id)?;
         let mut profile = self.profile_for(&resumed)?;
         if profile.release_state() == ProfileReleaseState::RefreshRequired
-            && matches!(
-                resumed.lifecycle().state(),
-                OnboardingState::AnonymousAvailable | OnboardingState::StoredUnverified
-            )
+            && resumed.lifecycle().state() == OnboardingState::AnonymousAvailable
         {
             self.append(
                 resumed.reservation(),
@@ -559,6 +668,76 @@ impl ProviderOnboardingService {
         } else {
             request
         };
+        let body = self
+            .collect_probe_response(request, policy, cancellation)
+            .await?;
+        validate_probe_semantics(profile.id(), &body)?;
+        Ok(EvidenceDigest::new(
+            DigestAlgorithm::Sha256,
+            Sha256::digest(&body).into(),
+        ))
+    }
+
+    async fn run_credential_probe(
+        &self,
+        profile: &ProviderOnboardingProfile,
+        secret: &SecretValue,
+        cancellation: CancellationToken,
+    ) -> Result<EvidenceDigest, ProviderOnboardingError> {
+        if profile.id() != "bls.v2-registered"
+            || profile.probe().transport() != ProbeTransport::HttpPostJson
+        {
+            return Err(ProviderOnboardingError::InvalidProfile);
+        }
+        let probe = profile.probe();
+        let endpoint = probe
+            .endpoint()
+            .ok_or(ProviderOnboardingError::InvalidProfile)?;
+        let policy = probe
+            .endpoint_policy()
+            .ok_or(ProviderOnboardingError::InvalidProfile)?;
+        policy.authorize_request(endpoint)?;
+        let mut body: serde_json::Value = serde_json::from_str(
+            probe
+                .body()
+                .ok_or(ProviderOnboardingError::InvalidProfile)?,
+        )
+        .map_err(|_| ProviderOnboardingError::InvalidProfile)?;
+        let object = body
+            .as_object_mut()
+            .ok_or(ProviderOnboardingError::InvalidProfile)?;
+        if object
+            .insert(
+                "registrationkey".to_owned(),
+                serde_json::Value::String(secret.expose_secret().to_owned()),
+            )
+            .is_some()
+        {
+            return Err(ProviderOnboardingError::InvalidProfile);
+        }
+        let body =
+            serde_json::to_vec(&body).map_err(|_| ProviderOnboardingError::InvalidProfile)?;
+        let request = self
+            .client
+            .post(endpoint)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body);
+        let response = self
+            .collect_probe_response(request, policy, cancellation)
+            .await?;
+        validate_probe_semantics(profile.id(), &response)?;
+        Ok(EvidenceDigest::new(
+            DigestAlgorithm::Sha256,
+            Sha256::digest(&response).into(),
+        ))
+    }
+
+    async fn collect_probe_response(
+        &self,
+        request: reqwest::RequestBuilder,
+        policy: &market_squawk_sources::EndpointPolicy,
+        cancellation: CancellationToken,
+    ) -> Result<Vec<u8>, ProviderOnboardingError> {
         let response = tokio::select! {
             () = cancellation.cancelled() => {
                 return Err(ProviderOnboardingError::OperationCancelled);
@@ -596,11 +775,96 @@ impl ProviderOnboardingService {
             }
             body.extend_from_slice(&chunk);
         }
-        validate_probe_semantics(profile.id(), &body)?;
-        Ok(EvidenceDigest::new(
-            DigestAlgorithm::Sha256,
-            Sha256::digest(&body).into(),
-        ))
+        Ok(body)
+    }
+
+    fn read_reference(
+        &self,
+        session_id: Uuid,
+        reference: &market_squawk_platform::SecretRef,
+        cancellation: SecretCancellation,
+        interaction: SecretInteractionPolicy,
+    ) -> Result<SecretValue, ProviderOnboardingError> {
+        let deadline = Instant::now()
+            .checked_add(SECRET_OPERATION_DURATION)
+            .ok_or(ProviderOnboardingError::Clock)?;
+        let control = SecretOperationControl::try_new(
+            format!("provider-activation-{session_id}"),
+            deadline,
+            0,
+            interaction,
+            cancellation,
+        )?;
+        self.secrets.read(reference, &control).map_err(Into::into)
+    }
+
+    pub(crate) fn read_active_secret(
+        &self,
+        lease: &ProviderActivationLease,
+        cancellation: SecretCancellation,
+    ) -> Result<SecretValue, ProviderOnboardingError> {
+        let current = self.activation_lease(lease.session_id())?;
+        if current.surface_id() != lease.surface_id()
+            || current.capability_digest() != lease.capability_digest()
+            || current.generation() != lease.generation()
+            || current.secret_reference() != lease.secret_reference()
+        {
+            return Err(ProviderOnboardingError::InvalidSessionState);
+        }
+        let reference = current
+            .secret_reference()
+            .ok_or(ProviderOnboardingError::ActivationUnavailable)?;
+        self.read_reference(
+            current.session_id(),
+            reference,
+            cancellation,
+            SecretInteractionPolicy::AllowPlatformPrompt,
+        )
+    }
+
+    fn lease_from_resumed(
+        &self,
+        resumed: &ResumedProviderOnboarding,
+    ) -> Result<ProviderActivationLease, ProviderOnboardingError> {
+        let lifecycle = resumed.lifecycle();
+        if lifecycle.state() != OnboardingState::ActiveScoped {
+            return Err(ProviderOnboardingError::ActivationUnavailable);
+        }
+        let issued_at = system_timestamp()?;
+        let (generation, secret_reference, verification_expires_at) =
+            if let Some(generation) = lifecycle.active_generation() {
+                if !lifecycle.generation_is_active_scoped(generation) {
+                    return Err(ProviderOnboardingError::InvalidSessionState);
+                }
+                let reference = lifecycle
+                    .generation_reference(generation)
+                    .cloned()
+                    .ok_or(ProviderOnboardingError::InvalidSessionState)?;
+                let verification = lifecycle
+                    .generation_verification(generation)
+                    .ok_or(ProviderOnboardingError::InvalidSessionState)?;
+                if verification
+                    .expires_at()
+                    .is_some_and(|expires_at| expires_at <= issued_at)
+                {
+                    return Err(ProviderOnboardingError::ActivationExpired);
+                }
+                (Some(generation), Some(reference), verification.expires_at())
+            } else {
+                (None, None, None)
+            };
+        Ok(ProviderActivationLease::new(ProviderActivationLeaseInput {
+            session_id: resumed.reservation().session_id(),
+            surface_id: lifecycle.surface_id().clone(),
+            capability_revision: lifecycle.capability_revision(),
+            capability_digest: lifecycle.capability_digest(),
+            public_configuration_digest: resumed.reservation().public_configuration_digest(),
+            public_configuration: resumed.public_configuration().clone(),
+            generation,
+            secret_reference,
+            verification_expires_at,
+            issued_at,
+        }))
     }
 
     fn append(
@@ -812,7 +1076,8 @@ fn validate_probe_semantics(profile_id: &str, body: &[u8]) -> Result<(), Provide
         }
         "sec.edgar-public" => value.get("cik").is_some() && value.get("filings").is_some(),
         "bls.v1-unregistered" | "bls.v2-registered" => {
-            value.get("status").is_some() && value.get("Results").is_some()
+            value.get("status").and_then(serde_json::Value::as_str) == Some("REQUEST_SUCCEEDED")
+                && value.get("Results").is_some()
         }
         "treasury.fiscal-data" => {
             value.get("data").is_some()
@@ -854,6 +1119,40 @@ fn event_digest(
         hasher.update(generation.get().to_be_bytes());
     }
     EvidenceDigest::new(DigestAlgorithm::Sha256, hasher.finalize().into())
+}
+
+fn derived_evidence_digest(
+    domain: &[u8],
+    session_id: Uuid,
+    generation: market_squawk_platform::SecretGeneration,
+    evidence: EvidenceDigest,
+) -> EvidenceDigest {
+    let mut hasher = Sha256::new();
+    hasher.update(b"market-squawk-onboarding-derived-evidence-v1\0");
+    hasher.update(domain);
+    hasher.update(session_id.as_bytes());
+    hasher.update(generation.get().to_be_bytes());
+    hasher.update(evidence.bytes());
+    EvidenceDigest::new(DigestAlgorithm::Sha256, hasher.finalize().into())
+}
+
+fn credential_assurance(
+    profile: &ProviderOnboardingProfile,
+) -> Result<SourceIdentifier, ProviderOnboardingError> {
+    match profile.id() {
+        "bls.v2-registered" => {
+            SourceIdentifier::try_from("bls-timeseries-read-only-verification").map_err(Into::into)
+        }
+        _ => Err(ProviderOnboardingError::InvalidProfile),
+    }
+}
+
+fn system_timestamp() -> Result<Timestamp, ProviderOnboardingError> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| ProviderOnboardingError::Clock)?;
+    let nanos = i64::try_from(now.as_nanos()).map_err(|_| ProviderOnboardingError::Clock)?;
+    Ok(Timestamp::from_unix_nanos(nanos))
 }
 
 fn wall_deadline(duration: Duration) -> Result<Timestamp, ProviderOnboardingError> {
@@ -904,6 +1203,18 @@ pub enum ProviderOnboardingError {
     /// The current session/profile gate does not accept a secret.
     #[error("provider onboarding secret import is unavailable")]
     SecretImportUnavailable,
+    /// Code-owned official evidence must be refreshed before activation can be attempted.
+    #[error("provider onboarding evidence must be refreshed before activation")]
+    EvidenceRefreshRequired,
+    /// The retained provider rights decision blocks activation.
+    #[error("provider onboarding rights block activation")]
+    RightsBlocked,
+    /// The durable session has not completed every activation precondition.
+    #[error("provider onboarding activation is unavailable")]
+    ActivationUnavailable,
+    /// The exact provider verification expired before a lease could be recovered.
+    #[error("provider onboarding activation verification expired")]
+    ActivationExpired,
     /// Exact secure-store readback did not reproduce the submitted value.
     #[error("provider onboarding secret-store verification failed")]
     SecretVerificationFailed,

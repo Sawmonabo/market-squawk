@@ -17,6 +17,7 @@ pub mod mcp;
 pub mod order_book;
 pub mod paper_bot;
 pub mod portfolio_application;
+pub mod provider_activation;
 pub mod provider_onboarding;
 pub mod quality;
 pub mod replay;
@@ -63,9 +64,15 @@ pub use portfolio_application::{
     PortfolioApplicationLimitInput, PortfolioApplicationLimits, PortfolioApplicationService,
     PortfolioApplicationServiceError, PortfolioFairValueReadCapability,
 };
+pub use provider_activation::{
+    ActivatedResearchProvider, BlsAdapterActivation, FredAdapterActivation, LiveProviderActivation,
+    LocalFileAdapterActivation, PortfolioAdapterActivation, ProviderActivationOutcome,
+    ProviderAdapterActivation, ProviderAdapterActivationError, ProviderAdapterActivationRequest,
+    ReviewedResearchRights, SecAdapterActivation, TreasuryAdapterActivation,
+};
 pub use provider_onboarding::{
-    OnboardingNextAction, OnboardingSessionView, ProviderOnboardingError, ProviderOnboardingPortal,
-    ProviderOnboardingService, ProviderPortalConfig, ProviderPortalError,
+    OnboardingNextAction, OnboardingSessionView, ProviderActivationLease, ProviderOnboardingError,
+    ProviderOnboardingPortal, ProviderOnboardingService, ProviderPortalConfig, ProviderPortalError,
     ProviderProfileRegistration, ProviderProfileRegistrationOutcome, ProviderProfileView,
     StartOnboardingRequest,
 };

@@ -1225,6 +1225,17 @@ impl OnboardingLifecycle {
             .and_then(|record| record.reference.as_ref())
     }
 
+    /// Returns retained least-privilege verification for one exact generation.
+    pub fn generation_verification(
+        &self,
+        generation: SecretGeneration,
+    ) -> Option<&AuthorityVerification> {
+        self.generations
+            .iter()
+            .find(|record| record.generation == generation)
+            .and_then(|record| record.verification.as_ref())
+    }
+
     /// Returns whether this exact generation currently has scoped authority.
     pub fn generation_is_active_scoped(&self, generation: SecretGeneration) -> bool {
         !matches!(

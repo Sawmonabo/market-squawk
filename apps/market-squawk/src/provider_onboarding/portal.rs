@@ -391,6 +391,18 @@ async fn dispatch(
             let status = result??;
             return Ok(json_response(StatusCode::OK, &status));
         }
+        if method == Method::POST && action == Some("activate") {
+            validate_mutation(&request, &security, "application/json")?;
+            let body = collect_body(request.into_body(), MAX_JSON_BODY_BYTES).await?;
+            if !body.is_empty() && body != b"{}" {
+                return Err(PortalRequestError::InvalidBody);
+            }
+            let lease = service.activate(session_id, cancellation).await?;
+            return Ok(json_response(
+                StatusCode::OK,
+                &service.resume(lease.session_id())?,
+            ));
+        }
         if method == Method::POST && action == Some("cancel") {
             validate_mutation(&request, &security, "application/json")?;
             let body = collect_body(request.into_body(), MAX_JSON_BODY_BYTES).await?;
@@ -606,7 +618,11 @@ fn map_error(error: PortalRequestError) -> Response<Full<Bytes>> {
             error_response(StatusCode::BAD_REQUEST, "invalid_request")
         }
         PortalRequestError::Application(ProviderOnboardingError::SecretImportUnavailable)
-        | PortalRequestError::Application(ProviderOnboardingError::InvalidSessionState) => {
+        | PortalRequestError::Application(ProviderOnboardingError::InvalidSessionState)
+        | PortalRequestError::Application(ProviderOnboardingError::ActivationUnavailable)
+        | PortalRequestError::Application(ProviderOnboardingError::ActivationExpired)
+        | PortalRequestError::Application(ProviderOnboardingError::EvidenceRefreshRequired)
+        | PortalRequestError::Application(ProviderOnboardingError::RightsBlocked) => {
             error_response(StatusCode::CONFLICT, "invalid_session_state")
         }
         PortalRequestError::Application(_) | PortalRequestError::Internal => {

@@ -4,6 +4,7 @@ mod crypto;
 mod encrypted;
 mod keyring;
 mod managed;
+mod preferred;
 
 use std::fmt;
 
@@ -19,6 +20,9 @@ pub use self::managed::{
     SecretBackend, SecretCancellation, SecretDeadlineCapability, SecretGeneration,
     SecretInteractionCapability, SecretInteractionPolicy, SecretOperationControl, SecretRef,
     SecretStoreCapabilities,
+};
+pub use self::preferred::{
+    EncryptedFileSecretFallback, EncryptedFileUnlockCapability, PreferredSecretStore,
 };
 
 const MAX_SCOPE_BYTES: usize = 64;

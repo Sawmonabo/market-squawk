@@ -213,6 +213,17 @@ impl ManagedResearchExtractionSource for market_squawk_adapter_files::FileExtrac
     }
 }
 
+impl ManagedResearchExtractionSource
+    for market_squawk_adapter_portfolio::PortfolioManifestExtractionSource
+{
+    fn revision_plan(
+        &self,
+        _batch: &ExtractionBatch,
+    ) -> Result<Option<ExtractionRevisionPlan>, ResearchRevisionPlanError> {
+        Ok(None)
+    }
+}
+
 struct RegisteredExtractionSource {
     source: Arc<dyn ManagedResearchExtractionSource>,
     metadata: SourceMetadata,

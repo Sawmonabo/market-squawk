@@ -1,11 +1,12 @@
 //! Secret-free status contracts shared by local portal and CLI transports.
 
 use market_squawk_data::ResumedProviderOnboarding;
-use market_squawk_domain::DataQuality;
+use market_squawk_domain::{DataQuality, EvidenceDigest, SourceIdentifier, Timestamp};
+use market_squawk_platform::{SecretGeneration, SecretRef};
 use market_squawk_sources::{
     CapabilityRegistrationOutcome, DataUseRight, OnboardingState, ProfileEvidence,
-    ProfileReleaseState, ProviderOnboardingProfile, ProviderPublicConfiguration, Requirement,
-    ZeroFeeStatus,
+    ProfileReleaseState, ProviderCapabilityRevision, ProviderOnboardingProfile,
+    ProviderPublicConfiguration, Requirement, ZeroFeeStatus,
 };
 use serde::Serialize;
 use uuid::Uuid;
@@ -156,6 +157,120 @@ pub struct OnboardingSessionView {
     official_handoff_url: &'static str,
     handoff_instruction: &'static str,
     recovery: &'static [&'static str],
+}
+
+/// Immutable in-process authority to construct one exact activated provider adapter.
+///
+/// The lease contains only non-secret catalog evidence and an opaque backend reference. Its
+/// private fields prevent callers from manufacturing activation authority from a profile name or
+/// provider quality ceiling.
+#[derive(Clone)]
+pub struct ProviderActivationLease {
+    session_id: Uuid,
+    surface_id: SourceIdentifier,
+    capability_revision: ProviderCapabilityRevision,
+    capability_digest: EvidenceDigest,
+    public_configuration_digest: EvidenceDigest,
+    public_configuration: ProviderPublicConfiguration,
+    generation: Option<SecretGeneration>,
+    secret_reference: Option<SecretRef>,
+    verification_expires_at: Option<Timestamp>,
+    issued_at: Timestamp,
+}
+
+impl ProviderActivationLease {
+    pub(super) fn new(input: ProviderActivationLeaseInput) -> Self {
+        Self {
+            session_id: input.session_id,
+            surface_id: input.surface_id,
+            capability_revision: input.capability_revision,
+            capability_digest: input.capability_digest,
+            public_configuration_digest: input.public_configuration_digest,
+            public_configuration: input.public_configuration,
+            generation: input.generation,
+            secret_reference: input.secret_reference,
+            verification_expires_at: input.verification_expires_at,
+            issued_at: input.issued_at,
+        }
+    }
+
+    /// Returns the durable onboarding session bound into this lease.
+    pub const fn session_id(&self) -> Uuid {
+        self.session_id
+    }
+
+    /// Returns the exact built-in provider surface.
+    pub const fn surface_id(&self) -> &SourceIdentifier {
+        &self.surface_id
+    }
+
+    /// Returns the exact code-owned capability revision.
+    pub const fn capability_revision(&self) -> ProviderCapabilityRevision {
+        self.capability_revision
+    }
+
+    /// Returns the exact canonical capability digest.
+    pub const fn capability_digest(&self) -> EvidenceDigest {
+        self.capability_digest
+    }
+
+    /// Returns the exact public-configuration digest retained by the catalog.
+    pub const fn public_configuration_digest(&self) -> EvidenceDigest {
+        self.public_configuration_digest
+    }
+
+    /// Returns the recovered non-secret configuration needed by provider constructors.
+    pub const fn public_configuration(&self) -> &ProviderPublicConfiguration {
+        &self.public_configuration
+    }
+
+    /// Returns the activated credential generation, when this surface uses one.
+    pub const fn generation(&self) -> Option<SecretGeneration> {
+        self.generation
+    }
+
+    /// Returns the opaque backend reference without exposing credential bytes.
+    pub const fn secret_reference(&self) -> Option<&SecretRef> {
+        self.secret_reference.as_ref()
+    }
+
+    /// Returns the exclusive provider-verification expiry, when one was observed.
+    pub const fn verification_expires_at(&self) -> Option<Timestamp> {
+        self.verification_expires_at
+    }
+
+    /// Returns the trusted local instant when the lease was issued.
+    pub const fn issued_at(&self) -> Timestamp {
+        self.issued_at
+    }
+}
+
+impl std::fmt::Debug for ProviderActivationLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProviderActivationLease")
+            .field("session_id", &self.session_id)
+            .field("surface_id", &self.surface_id)
+            .field("capability_revision", &self.capability_revision)
+            .field("generation", &self.generation)
+            .field("secret_reference", &"[OPAQUE]")
+            .field("verification_expires_at", &self.verification_expires_at)
+            .field("issued_at", &self.issued_at)
+            .finish()
+    }
+}
+
+pub(super) struct ProviderActivationLeaseInput {
+    pub session_id: Uuid,
+    pub surface_id: SourceIdentifier,
+    pub capability_revision: ProviderCapabilityRevision,
+    pub capability_digest: EvidenceDigest,
+    pub public_configuration_digest: EvidenceDigest,
+    pub public_configuration: ProviderPublicConfiguration,
+    pub generation: Option<SecretGeneration>,
+    pub secret_reference: Option<SecretRef>,
+    pub verification_expires_at: Option<Timestamp>,
+    pub issued_at: Timestamp,
 }
 
 impl OnboardingSessionView {

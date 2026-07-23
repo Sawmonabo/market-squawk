@@ -335,10 +335,14 @@ pub(super) fn map_onboarding_error(error: ProviderOnboardingError) -> ServiceErr
         ProviderOnboardingError::Catalog(CatalogError::OnboardingDeadlineExceeded) => {
             ServiceError::DeadlineExceeded
         }
+        ProviderOnboardingError::RightsBlocked => ServiceError::Unauthorized,
         ProviderOnboardingError::SecretVerificationFailed
         | ProviderOnboardingError::InvalidSessionState
         | ProviderOnboardingError::ClientConfiguration
         | ProviderOnboardingError::ProbeUnavailable
+        | ProviderOnboardingError::EvidenceRefreshRequired
+        | ProviderOnboardingError::ActivationUnavailable
+        | ProviderOnboardingError::ActivationExpired
         | ProviderOnboardingError::Clock
         | ProviderOnboardingError::Profile(_)
         | ProviderOnboardingError::Catalog(_)

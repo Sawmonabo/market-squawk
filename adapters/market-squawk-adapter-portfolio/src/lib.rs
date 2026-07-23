@@ -7,6 +7,7 @@ mod holdings;
 mod normalize;
 mod raw;
 mod reconcile;
+mod source;
 mod transactions;
 mod wire;
 
@@ -26,6 +27,7 @@ pub use reconcile::{
     CalculatedTotals, ReconciliationDiscrepancy, ReconciliationField, ReconciliationLimits,
     ReconciliationTolerance, SuppliedTotals, reconcile_totals,
 };
+pub use source::{PortfolioManifestExtractionSource, PortfolioManifestSourceError};
 pub use transactions::{CashFlowKind, CashFlowObservation, PortfolioTransaction, TransactionKind};
 
 /// Fail-closed portfolio import errors that never include source payloads or credentials.

@@ -151,7 +151,7 @@ async fn provider_portal_rejects_csrf_and_keeps_imported_secrets_write_only()
             && accepted_status == reqwest::StatusCode::OK
             && !accepted_body.contains(secret)
             && resumed.credential_stored()
-            && resumed.state() == market_squawk_sources::OnboardingState::RefreshRequired
+            && resumed.state() == market_squawk_sources::OnboardingState::StoredUnverified
             && resumed.public_configuration().get("registration_mode") == Some("registered_v2")
             && recovered_sec.public_configuration().get("organization") == Some("Market Squawk")
             && recovered_sec
