@@ -9,10 +9,11 @@ history and architecture, operations, and reference content derived from one exa
 head.
 
 **Architecture:** A single integration owner first refreshes the plan against the accepted
-integrated head and performs the history-bearing moves. Three grouped architecture lanes, three
-grouped reference lanes, and three grouped operations lanes then work on disjoint files; the
-integration owner alone owns indexes, root navigation, mutable delivery state, final reconciliation,
-publication, and cleanup.
+integrated head. Three grouped architecture lanes reconcile current pages while the target-state
+source remains in place; only then does the integration owner perform the architecture-audit moves.
+Three grouped reference lanes and three grouped operations lanes work on disjoint files; the
+integration owner alone owns history-bearing moves, indexes, root navigation, mutable delivery
+state, final reconciliation, publication, and cleanup.
 
 **Tech Stack:** GitHub-flavored Markdown, stable Mermaid `flowchart`, `sequenceDiagram`,
 `stateDiagram-v2`, and `erDiagram`, Git, `rg`, and existing source/release evidence. This is
@@ -22,11 +23,11 @@ documentation-only work and adds no runtime dependency, generator, test, or chec
 
 | Field | Value |
 | --- | --- |
-| Plan status | Ready after the written-spec gate |
+| Plan status | Ready for accepted-head refresh |
 | Planning audit base | `46f86d9496287e1995f584537153ecb3fcb271ac` |
 | Audit-base meaning | Evidence anchor only; not implementation or release approval |
 | Approved design | `docs/superpowers/specs/2026-07-22-market-squawk-documentation-system-design.md` |
-| Approved design blob | `a03626c9a2f11d3ab87b4526d0f0c5660afb02db` |
+| Approved design blob | `7fdb58ece5b41211493cd4026773974ff30ce240` |
 | Release boundary | Required for the first complete local `v0.1.0` release |
 | Delivery-state authority | `docs/plans/delivery-ledger.md` |
 
@@ -61,7 +62,9 @@ relationships, source metadata, runnable evidence, and release blockers.
 - Use only stable Mermaid forms named above. Each diagram states its question, keeps one abstraction
   level, labels material relationships, avoids color-only meaning, and has equivalent explanatory
   prose.
-- Perform Git moves before substantive rewrites and verify useful `git log --follow` ancestry.
+- Perform the model-runbook Git move before its substantive rewrite. Reconcile the two architecture
+  sources into current pages before archiving them, then verify useful `git log --follow` ancestry
+  for all three history-bearing moves.
 - Do not add redirect-only files, empty pages/directories, content-free indexes, fictional
   procedures, a documentation site generator, checker/policy script, prose/snapshot/file-existence
   test, or Rust test target.
@@ -149,21 +152,24 @@ evidence of active Task 19 work, not permission to document the older control pl
 
 ## Dependency and ownership schedule
 
-No writer starts before Task 1. No parallel lane starts before Task 2 is integrated.
+No writer starts before Task 1. No parallel lane starts before Task 2 is integrated. Architecture
+and reference lanes may overlap when capacity permits because their ownership is disjoint, but the
+architecture-audit moves wait for all three architecture lanes.
 
 | Wave | Lane | Exclusive files | Dependencies | Merge order |
 | --- | --- | --- | --- | --- |
 | Barrier | Task 1 refresh | This plan, delivery ledger | Approved design | First |
-| Serialized | Task 2 moves | Three moved files and old-link repairs | Task 1 | Second |
+| Preparation | Task 2 move inventory | Model runbook move and architecture-link inventory | Task 1 | Second |
 | A1 | Context/deployment architecture | `overview.md`, `building-blocks.md`, `deployment.md`, `quality-attributes.md` | Task 2 | A1 |
 | A2 | Runtime-plane architecture | `live-execution-plane.md`, `research-data-plane.md`, `control-plane.md` | Task 2 | A2 |
 | A3 | Semantics/trust/ADRs | Two architecture pages and five ADRs | Task 2 | A3 |
-| B1 | CLI/config reference | `reference/cli.md`, `reference/configuration.md` | Tasks 1-2 | B1 |
-| B2 | MCP/source reference | `reference/mcp.md`, `reference/source-coverage.md` | Tasks 1-2 | B2 |
-| B3 | Quality/time reference | `reference/data-quality.md`, `reference/time-and-provenance.md` | Tasks 1-2 | B3 |
-| C1 | Bootstrap/config/source operations | Three operations pages | Wave B | C1 |
-| C2 | Research/dataset/model operations | Two new pages and moved model runbook | Wave B | C2 |
-| C3 | Portfolio/recovery/troubleshooting | Three operations pages | Wave B | C3 |
+| A4 | Architecture audit archive | Two history-bearing architecture moves and maintained-link repairs | A1-A3 | After A3 |
+| B1 | CLI/config reference | `reference/cli.md`, `reference/configuration.md` | Task 2 | B1 |
+| B2 | MCP/source reference | `reference/mcp.md`, `reference/source-coverage.md` | Task 2 | B2 |
+| B3 | Quality/time reference | `reference/data-quality.md`, `reference/time-and-provenance.md` | Task 2 | B3 |
+| C1 | Bootstrap/config/source operations | Three operations pages | A4 and Wave B | C1 |
+| C2 | Research/dataset/model operations | Two new pages and moved model runbook | A4 and Wave B | C2 |
+| C3 | Portfolio/recovery/troubleshooting | Three operations pages | A4 and Wave B | C3 |
 | Integration | Task 6 portal/truth | All indexes, root README, ledger, cross-links | Waves A-C | Last content commit |
 
 The integration owner reserves `README.md`, all five new indexes, the delivery ledger, this plan,
@@ -198,7 +204,7 @@ git hash-object \
 ```
 
 Expected: clean worktree, exact accepted product head, and design blob
-`a03626c9a2f11d3ab87b4526d0f0c5660afb02db`. Stop if any condition fails.
+`7fdb58ece5b41211493cd4026773974ff30ce240`. Stop if any condition fails.
 
 - [ ] **Refresh all factual anchors**
 
@@ -259,18 +265,15 @@ No lane branches before this commit.
 
 ---
 
-### Task 2: Preserve history and repair move-sensitive navigation
+### Task 2: Inventory architecture links and preserve the model runbook
 
 **Files:**
 
-- Move: `docs/architecture/current-state.md` →
-  `docs/audits/architecture/2026-07-15-current-state-anchor.md`
-- Move: `docs/architecture/target-state.md` →
-  `docs/audits/architecture/2026-07-16-target-state-baseline.md`
+- Retain as architecture source authority until Task 3 completes:
+  `docs/architecture/current-state.md`, `docs/architecture/target-state.md`
 - Move: `docs/operations/onnx-runtime.md` → `docs/operations/model-inference.md`
-- Modify for maintained links only: moved audits, `README.md`, `docs/plans/gap-analysis.md`,
-  `docs/research/2026-07-17-capture-retained-memory-and-queue.md`, and the two controlling-document
-  links in `docs/superpowers/plans/2026-07-16-market-squawk-stage-1-foundation.md`
+- Modify for the model-runbook move only: maintained incoming links identified by the inventory
+- Record for Task 3: maintained links to the two architecture source documents
 
 - [ ] **Inventory and classify old-path occurrences**
 
@@ -281,42 +284,35 @@ git grep -n -E \
 ```
 
 Separate maintained Markdown links from frozen literal paths, historical commands, and migration
-descriptions. Do not rewrite the latter.
+descriptions. Record the maintained architecture links for Task 3, but do not move or rewrite the
+architecture source documents in this task. Do not rewrite historical literals.
 
-- [ ] **Move files and repair only affected links**
+- [ ] **Move the model runbook and repair only its maintained links**
 
 ```bash
-mkdir -p docs/audits/architecture
-git mv docs/architecture/current-state.md \
-  docs/audits/architecture/2026-07-15-current-state-anchor.md
-git mv docs/architecture/target-state.md \
-  docs/audits/architecture/2026-07-16-target-state-baseline.md
 git mv docs/operations/onnx-runtime.md docs/operations/model-inference.md
 ```
 
-Adjust the moved audits' relative links for their extra directory depth. Update the maintained
-incoming links named above. Leave `docs/verification/usable-release-baseline.md:29` and historical
-literal source paths unchanged. Do not leave files at old paths.
+Update only maintained incoming links to the model runbook. Leave architecture links unchanged for
+the writers and integration owner in Task 3. Leave
+`docs/verification/usable-release-baseline.md:29` and historical literal source paths unchanged. Do
+not leave the old model-runbook path in place.
 
 - [ ] **Verify, commit, and prove ancestry**
 
 ```bash
 git diff --check
 git grep -n -E \
-  '\\]\\([^)]*(architecture/(current-state|target-state)|operations/onnx-runtime)\\.md[^)]*\\)' \
+  '\\]\\([^)]*operations/onnx-runtime\\.md[^)]*\\)' \
   -- '*.md'
 git add -A -- README.md docs
-git commit -m "docs: preserve architecture and model runbook history"
-git log --follow --oneline -- \
-  docs/audits/architecture/2026-07-15-current-state-anchor.md
-git log --follow --oneline -- \
-  docs/audits/architecture/2026-07-16-target-state-baseline.md
+git commit -m "docs: preserve model runbook history"
 git log --follow --oneline -- docs/operations/model-inference.md
 git push origin docs/product-documentation
 ```
 
-Expected: no maintained old-path link and useful pre-move history for all three files. This commit
-is the common base for Waves A and B.
+Expected: no maintained old model-runbook link, useful pre-move history for that file, and both
+architecture source documents still present. This commit is the common base for Waves A and B.
 
 ---
 
@@ -374,6 +370,42 @@ added.
 
 Verify exclusive ownership, integrate unchanged, record commits in the ledger, push
 `docs/product-documentation`, then remove clean worktrees and merged/patch-equivalent branches.
+
+- [ ] **Archive the reconciled architecture baselines after all three lanes are integrated**
+
+The integration owner, not a lane writer, performs the history-bearing moves only after the new
+architecture pages have reconciled the durable content from both sources:
+
+```bash
+mkdir -p docs/audits/architecture
+git mv docs/architecture/current-state.md \
+  docs/audits/architecture/2026-07-15-current-state-anchor.md
+git mv docs/architecture/target-state.md \
+  docs/audits/architecture/2026-07-16-target-state-baseline.md
+```
+
+Add prominent metadata to both archived documents stating that they are dated historical evidence,
+have no current architecture authority, and link to `docs/architecture/README.md` and
+`docs/plans/delivery-ledger.md`. Adjust their relative links for the extra directory depth and repair
+maintained incoming architecture links identified in Task 2. Preserve frozen literal paths,
+historical commands, and migration descriptions.
+
+```bash
+git diff --check -- docs/architecture docs/audits README.md docs/plans
+git grep -n -E \
+  '\\]\\([^)]*architecture/(current-state|target-state)\\.md[^)]*\\)' \
+  -- '*.md'
+git add -A -- README.md docs
+git commit -m "docs(architecture): archive reconciled architecture baselines"
+git log --follow --oneline -- \
+  docs/audits/architecture/2026-07-15-current-state-anchor.md
+git log --follow --oneline -- \
+  docs/audits/architecture/2026-07-16-target-state-baseline.md
+git push origin docs/product-documentation
+```
+
+Expected: both archives retain useful pre-move ancestry, identify themselves as historical, and no
+maintained link grants either archive current authority.
 
 ---
 
