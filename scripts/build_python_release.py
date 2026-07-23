@@ -563,8 +563,40 @@ def expected_source_paths(root: Path) -> tuple[str, ...]:
         package_root = manifest.parent
         paths.add(manifest.relative_to(root).as_posix())
         build_script = package_root / "build.rs"
-        if build_script.is_file():
-            paths.add(build_script.relative_to(root).as_posix())
+        if build_script.is_symlink():
+            raise ReleaseBuildError(
+                "local Rust package input must not be a symbolic link"
+            )
+        if build_script.exists():
+            if not build_script.is_file():
+                raise ReleaseBuildError("local Rust package input is invalid")
+            try:
+                package_inputs = tuple(package_root.glob("*.rs"))
+            except OSError as error:
+                raise ReleaseBuildError(
+                    "local Rust package inputs are unavailable"
+                ) from error
+        else:
+            package_inputs = ()
+        for package_path in package_inputs:
+            if package_path.is_symlink():
+                raise ReleaseBuildError(
+                    "local Rust package input must not be a symbolic link"
+                )
+            if not package_path.is_file():
+                continue
+            try:
+                canonical_package_path = package_path.resolve(strict=True)
+            except OSError as error:
+                raise ReleaseBuildError(
+                    "local Rust package input is unavailable"
+                ) from error
+            if (
+                root not in canonical_package_path.parents
+                or not canonical_package_path.is_file()
+            ):
+                raise ReleaseBuildError("local Rust package input is invalid")
+            paths.add(canonical_package_path.relative_to(root).as_posix())
         for material in ("src", "build_support", "migrations"):
             directory = package_root / material
             if directory.is_dir():

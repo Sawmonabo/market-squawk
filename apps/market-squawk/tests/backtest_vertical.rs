@@ -18,8 +18,8 @@ use market_squawk::{
 };
 use market_squawk_analytics::{
     BatchFeatureCatalog, BatchFeatureCatalogConfig, BatchFeaturePolicies,
-    MissingValuePolicy as AnalyticsMissingValuePolicy, ShockComposition, VarianceConvention,
-    WeightPolicy,
+    MissingValuePolicy as AnalyticsMissingValuePolicy, REQUIRED_BATCH_FEATURE_COUNT,
+    ShockComposition, VarianceConvention, WeightPolicy,
 };
 use market_squawk_backtesting::{
     AVAILABLE_AT_COMPONENT, BacktestContext, BacktestDataset, BacktestEngine, BacktestError,
@@ -235,12 +235,25 @@ async fn pinned_dataset_resolves_historical_instrument_definitions_per_decision(
         Arc::new(UnusedBacktestInputRegistrar),
         Arc::new(UnusedBacktestAuthority),
     );
-    let first = analysis
+    let undersized = analysis
         .call(
             feature_dataset_request(json!({
                 "resultLimits": {"maximumItems": 2, "maximumBytes": 65536}
             }))?,
             feature_dataset_context(101)?,
+        )
+        .await;
+    assert!(matches!(undersized, Err(ServiceError::ResourceExhausted)));
+
+    let first = analysis
+        .call(
+            feature_dataset_request(json!({
+                "resultLimits": {
+                    "maximumItems": REQUIRED_BATCH_FEATURE_COUNT + 1,
+                    "maximumBytes": 65536
+                }
+            }))?,
+            feature_dataset_context(102)?,
         )
         .await?;
     let first_content = first.structured_content();
@@ -251,10 +264,14 @@ async fn pinned_dataset_resolves_historical_instrument_definitions_per_decision(
         .as_str()
         .ok_or("first feature page has no durable cursor")?
         .to_owned();
-    assert_eq!(first_items.len(), 2);
-    assert_eq!(first_items[0]["kind"], "feature_contract");
+    assert_eq!(first_items.len(), REQUIRED_BATCH_FEATURE_COUNT + 1);
+    assert!(
+        first_items[..REQUIRED_BATCH_FEATURE_COUNT]
+            .iter()
+            .all(|item| item["kind"] == "feature_contract")
+    );
     assert_eq!(
-        first_items[1]["manifest"]["dataset"],
+        first_items[REQUIRED_BATCH_FEATURE_COUNT]["manifest"]["dataset"],
         "derived.backtest.reference-authority"
     );
     assert_eq!(cursor, "derived.backtest.reference-authority");
@@ -287,7 +304,7 @@ async fn pinned_dataset_resolves_historical_instrument_definitions_per_decision(
         std::io::Error::other(format!("feature continuation admission failed: {error}"))
     })?;
     let continued = analysis
-        .call(continued_request, feature_dataset_context(102)?)
+        .call(continued_request, feature_dataset_context(103)?)
         .await
         .map_err(|error| {
             std::io::Error::other(format!("feature continuation call failed: {error:?}"))
@@ -312,7 +329,7 @@ async fn pinned_dataset_resolves_historical_instrument_definitions_per_decision(
                 "afterDataset": "derived.backtest.reference-authority",
                 "resultLimits": {"maximumItems": 2, "maximumBytes": 65536}
             }))?,
-            feature_dataset_context(103)?,
+            feature_dataset_context(104)?,
         )
         .await;
     assert!(matches!(conflicting, Err(ServiceError::InvalidRequest)));

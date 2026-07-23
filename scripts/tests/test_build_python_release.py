@@ -65,6 +65,7 @@ class PythonReleaseBuilderContracts(unittest.TestCase):
         expected = builder.expected_source_paths(ROOT)
         self.assertIn("apps/market-squawk/Cargo.toml", expected)
         self.assertIn("apps/market-squawk/src/main.rs", expected)
+        self.assertIn("crates/market-squawk-platform/build_support.rs", expected)
         self.assertIn("docs/verification/onnx-runtime-policy.json", expected)
         self.assertIn(
             "docs/reports/performance/2026-07-17-q2-a4-writer-runtime-proof.md",

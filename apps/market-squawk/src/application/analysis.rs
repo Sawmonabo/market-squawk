@@ -276,14 +276,18 @@ impl AnalysisDomainService {
         } else {
             self.catalog.feature_catalog().entries().len()
         };
-        let first_page_available = static_available
+        let context_available = static_available
             .checked_add(selected.len())
             .ok_or(ServiceError::ResourceExhausted)?;
-        let published_limit = limits
-            .maximum_result_items()
-            .saturating_sub(first_page_available)
-            .max(1)
-            .min(64);
+        let published_limit = if continuation {
+            limits.maximum_result_items().min(64)
+        } else {
+            limits
+                .maximum_result_items()
+                .saturating_sub(context_available)
+                .max(1)
+                .min(64)
+        };
         let (published, published_available, published_has_more) = self
             .published_feature_datasets(
                 requested_dataset.as_ref(),
@@ -298,34 +302,22 @@ impl AnalysisDomainService {
         if scope.has_filter() && selected.is_empty() {
             return Err(ServiceError::NotFound);
         }
+        let required_first_page_items = context_available
+            .checked_add(usize::from(!published.is_empty()))
+            .ok_or(ServiceError::ResourceExhausted)?;
+        if !continuation && limits.maximum_result_items() < required_first_page_items {
+            return Err(ServiceError::ResourceExhausted);
+        }
         let available = static_available
             .checked_add(selected.len())
             .and_then(|available| available.checked_add(published_available))
             .ok_or(ServiceError::ResourceExhausted)?;
         let mut items = Vec::new();
-        let context_capacity = limits
-            .maximum_result_items()
-            .saturating_sub(published.len());
         if !continuation {
-            let selected_reserve = if requested_dataset.is_some() {
-                selected.len()
-            } else {
-                0
-            };
-            let static_capacity = context_capacity.saturating_sub(selected_reserve);
-            for metadata in self
-                .catalog
-                .feature_catalog()
-                .entries()
-                .iter()
-                .take(static_capacity)
-            {
+            for metadata in self.catalog.feature_catalog().entries() {
                 items.push(feature_metadata_value(metadata));
             }
-            for dataset in selected
-                .iter()
-                .take(context_capacity.saturating_sub(items.len()))
-            {
+            for dataset in &selected {
                 items.push(feature_dataset_value(dataset.dataset()));
             }
         }
