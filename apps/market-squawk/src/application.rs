@@ -24,6 +24,7 @@ pub mod fair_value;
 pub mod model;
 mod paper;
 mod research;
+pub mod source;
 
 pub use contracts::{APPLICATION_CONTRACT_VERSION, application_capabilities};
 pub use fair_value::{
@@ -35,6 +36,11 @@ pub use research::{
     ManagedResearchExtractionSource, ProductionResearchIngestCoordinator,
     ResearchApplicationServices, ResearchExtractionLimits, ResearchIngestCompositionError,
     ResearchIngestCoordinator, ResearchRevisionPlanError, ResearchRightsAuthority,
+};
+pub use source::{
+    SourceApplicationError, SourceDomainService, SourceRuntimeRequest, SourceRuntimeSnapshot,
+    SourceRuntimeSnapshotBatch, SourceRuntimeSnapshotError, SourceRuntimeView,
+    SourceRuntimeViewError,
 };
 
 const REQUIRED_DOMAINS: [ServiceDomain; 11] = [
