@@ -17,14 +17,15 @@ evidence; it does not replace the README capability truth or the canonical relea
 - Quarter 3 status: Tasks 13–18 and all previously accepted focused remediations are integrated.
   The grouped review of exact head `a94f33b` accepted the Tasks 13–15 slice and the Task 18 plus
   cross-plane slice with no Critical or Important finding. It rejected the Tasks 16–17 slice on
-  five substantiated Important blockers: corporate-action knowledge cutoff, portfolio-analytics
-  point-in-time/source authority, analytics resource and retained-byte bounds, historical
-  instrument-definition authority in backtests, and canonical reservation-bound attempt recovery.
-  The proposed coupling of a pure cohort plan to one inventory's configured trial limit was
-  rejected as a layering regression. Both rejected slices are now remediated, independently
-  approved with no remaining finding, range-diffed 1:1 onto the release branch, and freshly
-  verified there. The combined exact-candidate Quarter 3 rereview and clean full gate remain
-  pending; the prior rejected candidate did not receive a full gate.
+  five substantiated Important blockers. The bounded portfolio and backtest remediation lanes were
+  independently approved, integrated, and freshly verified. The grouped rereview of exact head
+  `797a359` accepted the backtest slice and cross-plane boundaries with no finding, but rejected the
+  portfolio slice on three Important blockers: the immutable revision identity omits base currency,
+  Attribution and Risk omit complete aggregate-work and instrument admissions, and Exposure still
+  uses infallibly allocating temporary maps. One cohesive portfolio lane must close those exact
+  blockers before a new frozen-head review. The proposed coupling of a pure cohort plan to one
+  inventory's configured trial limit remains rejected as a layering regression. No rejected
+  candidate received or may receive the clean full gate.
 - Task 14 accepted feature and fast-forwarded release head: `02ab5cd`
 - Task 18 release merge head: `051ee3c`; reconciled lock head: `5c34b7d`
 - Task 13 accepted feature and release head: `59ba05c`
@@ -81,7 +82,12 @@ evidence; it does not replace the README capability truth or the canonical relea
   admits factor, scenario, history, work, output, and retained bytes before allocation. Independent
   task review approved the final lane with no remaining finding; the fresh integrated consolidated
   portfolio harness passed 13/13. The generated lane target, clean worktree, and patch-equivalent
-  local branch were removed, and no matching origin branch existed.
+  local branch were removed, and no matching origin branch existed. The later grouped exact-head
+  review found three remaining cross-contract defects outside that focused acceptance: reporting
+  currency is absent from revision identity, Attribution and Risk do not bound their total temporary
+  and result work under one checked admission or consistently enforce `max_instruments`, and
+  Exposure's temporary `BTreeMap` nodes allocate infallibly. Task 16 remains rejected until those
+  three defects are fixed and the corrected exact candidate is independently accepted.
 - Task 18 owner: GitHub issue `#23`, Project 5, status `Done`.
 - Delivered at accepted feature head `31de1a5`: nonforgeable producer receipts; point-in-time market
   activity and evidence admission; strict Level 1 classification; usable Level 2/Level 3 input
@@ -134,7 +140,8 @@ evidence; it does not replace the README capability truth or the canonical relea
   minting, public backtest admission, strategy-visible revisions, and exact receipt coverage.
   Independent task review approved the final lane with no remaining finding. Fresh integrated
   gates passed catalog 3/3, backtesting 12/12, and the filtered application vertical 1/1.
-- The next barrier is the combined exact-candidate Quarter 3 rereview. Only after that review
+- The next barrier is one cohesive portfolio remediation for the three exact-head findings,
+  followed by a corrected frozen-head portfolio and cross-plane rereview. Only after that review
   accepts the candidate will the integration owner clean the root target and run one
   `CARGO_INCREMENTAL=0 ./scripts/verify.sh` gate. Tasks 15–17 remain open until the grouped
   checkpoint passes; focused evidence does not substitute for it.
@@ -268,7 +275,7 @@ application size.
   remote metadata. Only the release worktree remains; the three protected stashes,
   `bundle-backup`, and Dependabot branches remain intact.
 
-The next delivery event is the bounded portfolio and backtest authority remediation followed by an
-exact-candidate rereview. If it accepts the candidate, one clean full gate will run; only then may
-issues `#20`, `#21`, and `#22` close and Tasks 19, 19A, and 20 begin. Integrated Tasks 13–18 do not
-claim that the Market Squawk product release is complete.
+The next delivery event is the grouped portfolio identity, aggregate-work, and fallible-allocation
+remediation followed by a corrected exact-candidate rereview. If it accepts the candidate, one clean
+full gate will run; only then may issues `#20`, `#21`, and `#22` close and Tasks 19, 19A, and 20
+begin. Integrated Tasks 13–18 do not claim that the Market Squawk product release is complete.
