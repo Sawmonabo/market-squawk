@@ -312,35 +312,46 @@ impl AnalysisDomainService {
             .checked_add(selected.len())
             .and_then(|available| available.checked_add(published_available))
             .ok_or(ServiceError::ResourceExhausted)?;
-        let mut items = Vec::new();
+        let mut context_items = Vec::new();
         if !continuation {
             for metadata in self.catalog.feature_catalog().entries() {
-                items.push(feature_metadata_value(metadata));
+                context_items.push(feature_metadata_value(metadata));
             }
             for dataset in &selected {
-                items.push(feature_dataset_value(dataset.dataset()));
+                context_items.push(feature_dataset_value(dataset.dataset()));
             }
         }
-        for dataset in &published {
-            items.push(published_feature_dataset_value(dataset));
+        let published_items = published
+            .iter()
+            .map(published_feature_dataset_value)
+            .collect::<Vec<_>>();
+        let minimum_published = usize::from(!published.is_empty());
+        for published_count in (minimum_published..=published.len()).rev() {
+            let actual_published = &published[..published_count];
+            let actual_has_more = published_count < published.len() || published_has_more;
+            let next_after_dataset = actual_published
+                .last()
+                .filter(|_| actual_has_more)
+                .map(|dataset| dataset.generation().manifest().dataset_id().as_str());
+            let mut items = context_items.clone();
+            items.extend(published_items[..published_count].iter().cloned());
+            let returned = items.len();
+            let metadata =
+                combined_feature_metadata(&selected, actual_published, returned, available)?;
+            if let Ok(result) = TypedToolResult::try_new(
+                json!({
+                    "items": items,
+                    "hasMore": actual_has_more,
+                    "nextAfterDataset": next_after_dataset
+                }),
+                returned.max(1),
+                metadata,
+                limits,
+            ) {
+                return Ok(result);
+            }
         }
-        let metadata = combined_feature_metadata(&selected, &published, items.len(), available)?;
-        let item_count = items.len().max(1);
-        let next_after_dataset = published
-            .last()
-            .filter(|_| published_has_more)
-            .map(|dataset| dataset.generation().manifest().dataset_id().as_str());
-        TypedToolResult::try_new(
-            json!({
-                "items": items,
-                "hasMore": published_has_more,
-                "nextAfterDataset": next_after_dataset
-            }),
-            item_count,
-            metadata,
-            limits,
-        )
-        .map_err(|_| ServiceError::ResourceExhausted)
+        Err(ServiceError::ResourceExhausted)
     }
 
     fn published_feature_datasets(

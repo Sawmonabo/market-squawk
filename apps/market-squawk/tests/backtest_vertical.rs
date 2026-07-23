@@ -229,6 +229,17 @@ async fn pinned_dataset_resolves_historical_instrument_definitions_per_decision(
             CancellationToken::new(),
         )
         .await?;
+    let terminal = service
+        .build_dataset(
+            fixture_dataset_request(
+                "derived.backtest.reference-authority-terminal",
+                source_dataset.manifest().clone(),
+                instrument_id,
+                membership_evidence,
+            )?,
+            CancellationToken::new(),
+        )
+        .await?;
     let analysis = AnalysisDomainService::new_with_feature_reader(
         Arc::new(fixture_analysis_catalog()?),
         service.analytical_reader(),
@@ -245,7 +256,7 @@ async fn pinned_dataset_resolves_historical_instrument_definitions_per_decision(
         .await;
     assert!(matches!(undersized, Err(ServiceError::ResourceExhausted)));
 
-    let first = analysis
+    let first_page_evidence = analysis
         .call(
             feature_dataset_request(json!({
                 "resultLimits": {
@@ -256,6 +267,31 @@ async fn pinned_dataset_resolves_historical_instrument_definitions_per_decision(
             feature_dataset_context(102)?,
         )
         .await?;
+    let first_page_byte_ceiling = first_page_evidence.encoded_bytes();
+    assert_eq!(
+        first_page_evidence.item_count(),
+        REQUIRED_BATCH_FEATURE_COUNT + 1
+    );
+    assert_eq!(
+        first_page_evidence.structured_content()["nextAfterDataset"],
+        "derived.backtest.reference-authority"
+    );
+    assert_eq!(first_page_evidence.structured_content()["hasMore"], true);
+
+    let first = analysis
+        .call(
+            feature_dataset_request(json!({
+                "resultLimits": {
+                    "maximumItems": REQUIRED_BATCH_FEATURE_COUNT + 3,
+                    "maximumBytes": first_page_byte_ceiling
+                }
+            }))?,
+            feature_dataset_context(103)?,
+        )
+        .await
+        .map_err(|error| {
+            std::io::Error::other(format!("tight-byte first feature page failed: {error:?}"))
+        })?;
     let first_content = first.structured_content();
     let first_items = first_content["items"]
         .as_array()
@@ -276,6 +312,12 @@ async fn pinned_dataset_resolves_historical_instrument_definitions_per_decision(
     );
     assert_eq!(cursor, "derived.backtest.reference-authority");
     assert_eq!(first_content["hasMore"], true);
+    assert_eq!(first.encoded_bytes(), first_page_byte_ceiling);
+    assert_eq!(
+        first.metadata().available_items(),
+        Some(REQUIRED_BATCH_FEATURE_COUNT + 3)
+    );
+    assert_eq!(first.metadata().source_coverage()["datasetCount"], 1);
 
     let cli = Cli::try_parse_from([
         "market-squawk",
@@ -296,31 +338,87 @@ async fn pinned_dataset_resolves_historical_instrument_definitions_per_decision(
         } if value == &cursor
     ));
 
+    let continuation_evidence = analysis
+        .call(
+            feature_dataset_request(json!({
+                "afterDataset": cursor.clone(),
+                "resultLimits": {"maximumItems": 1, "maximumBytes": 65536}
+            }))?,
+            feature_dataset_context(104)?,
+        )
+        .await?;
+    let continuation_byte_ceiling = continuation_evidence.encoded_bytes();
+    assert_eq!(continuation_evidence.item_count(), 1);
+    assert_eq!(
+        continuation_evidence.structured_content()["items"][0]["manifest"]["dataset"],
+        "derived.backtest.reference-authority-successor"
+    );
+    assert_eq!(
+        continuation_evidence.structured_content()["nextAfterDataset"],
+        "derived.backtest.reference-authority-successor"
+    );
+    assert_eq!(continuation_evidence.structured_content()["hasMore"], true);
+
     let continued_request = feature_dataset_request(json!({
         "afterDataset": cursor,
-        "resultLimits": {"maximumItems": 2, "maximumBytes": 65536}
+        "resultLimits": {
+            "maximumItems": 2,
+            "maximumBytes": continuation_byte_ceiling
+        }
     }))
     .map_err(|error| {
         std::io::Error::other(format!("feature continuation admission failed: {error}"))
     })?;
     let continued = analysis
-        .call(continued_request, feature_dataset_context(103)?)
+        .call(continued_request, feature_dataset_context(105)?)
         .await
         .map_err(|error| {
-            std::io::Error::other(format!("feature continuation call failed: {error:?}"))
+            std::io::Error::other(format!("tight-byte feature continuation failed: {error:?}"))
         })?;
     let continued_content = continued.structured_content();
     let continued_items = continued_content["items"]
         .as_array()
         .ok_or("continued feature page has no items")?;
+    let continued_cursor = continued_content["nextAfterDataset"]
+        .as_str()
+        .ok_or("continued feature page has no durable cursor")?
+        .to_owned();
     assert_eq!(continued_items.len(), 1);
     assert_eq!(continued_items[0]["kind"], "feature_dataset");
     assert_eq!(
         continued_items[0]["manifest"]["dataset"],
         "derived.backtest.reference-authority-successor"
     );
-    assert_eq!(continued_content["hasMore"], false);
-    assert!(continued_content["nextAfterDataset"].is_null());
+    assert_eq!(
+        continued_cursor,
+        "derived.backtest.reference-authority-successor"
+    );
+    assert_eq!(continued_content["hasMore"], true);
+    assert_eq!(continued.encoded_bytes(), continuation_byte_ceiling);
+    assert_eq!(continued.metadata().available_items(), Some(3));
+    assert_eq!(continued.metadata().source_coverage()["datasetCount"], 1);
+
+    let final_page = analysis
+        .call(
+            feature_dataset_request(json!({
+                "afterDataset": continued_cursor,
+                "resultLimits": {"maximumItems": 2, "maximumBytes": 65536}
+            }))?,
+            feature_dataset_context(106)?,
+        )
+        .await?;
+    let final_content = final_page.structured_content();
+    let final_items = final_content["items"]
+        .as_array()
+        .ok_or("final feature page has no items")?;
+    assert_eq!(final_items.len(), 1);
+    assert_eq!(final_items[0]["kind"], "feature_dataset");
+    assert_eq!(
+        final_items[0]["manifest"]["dataset"],
+        "derived.backtest.reference-authority-terminal"
+    );
+    assert_eq!(final_content["hasMore"], false);
+    assert!(final_content["nextAfterDataset"].is_null());
 
     let conflicting = analysis
         .call(
@@ -329,7 +427,7 @@ async fn pinned_dataset_resolves_historical_instrument_definitions_per_decision(
                 "afterDataset": "derived.backtest.reference-authority",
                 "resultLimits": {"maximumItems": 2, "maximumBytes": 65536}
             }))?,
-            feature_dataset_context(104)?,
+            feature_dataset_context(107)?,
         )
         .await;
     assert!(matches!(conflicting, Err(ServiceError::InvalidRequest)));
@@ -346,6 +444,7 @@ async fn pinned_dataset_resolves_historical_instrument_definitions_per_decision(
     let coverage_mismatch_output = query_backtest_rows(&query, built.manifest()).await?;
     drop(query);
     drop(analysis);
+    drop(terminal);
     drop(successor);
     drop(built);
     drop(source_dataset);
