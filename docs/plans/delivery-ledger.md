@@ -15,9 +15,11 @@ evidence; it does not replace the README capability truth or the canonical relea
 - Current exact integration head: obtain it from `git rev-parse HEAD` and pull request `#26`.
   Tracked prose does not self-pin the commit that contains that prose.
 - Quarter 3 status: Tasks 13–18 are integrated, but the frozen grouped review rejected the candidate
-  with thirteen Important findings. Three focused remediation lanes are active for model runtime,
-  backtest/portfolio experiment integrity, and fair-value evidence authority. The checkpoint has
-  not been accepted and the single clean full gate has not run on the remediated exact head.
+  with thirteen Important findings. Fair-value evidence-authority remediation passed independent
+  exact-candidate closure review and is integrated through `6c114c7`. Model-runtime and
+  backtest/portfolio closure reviews found four and two additional Important defects respectively;
+  both focused remediation lanes are active. The checkpoint has not been accepted and the single
+  clean full gate has not run on the remediated exact head.
 - Task 14 accepted feature and fast-forwarded release head: `02ab5cd`
 - Task 18 release merge head: `051ee3c`; reconciled lock head: `5c34b7d`
 - Task 13 accepted feature and release head: `59ba05c`
@@ -71,6 +73,10 @@ evidence; it does not replace the README capability truth or the canonical relea
   formatting, and diff hygiene passed on the integrated locked tree. Exact-head review rejected two
   point-in-time/override defects; remediation-only rereview accepted `31de1a5` with no remaining
   Critical or Important finding.
+- Quarter 3 follow-up at reviewed candidate `e59dfca` closed stale-quality classification and
+  legacy-v1 analytical-evidence recovery defects without changing historical identities. The exact
+  two-commit series range-diffed 1:1 onto release commits `6a9a685` and `6c114c7`; the integrated
+  valuation gate passed 8 unit and 4 consolidated integration tests before push and cleanup.
 - Task 14 owner: GitHub issue `#19`, Project 5, status `Done` after this closeout push.
 - Delivered at accepted and fast-forwarded release head `02ab5cd`: catalog-authorized Task 11
   point-in-time dataset access; fixed-width Arrow/Parquet schema-v2 validation; exact
@@ -99,9 +105,10 @@ evidence; it does not replace the README capability truth or the canonical relea
   closes. The integrated application-owned PIT backtesting service binds exact dataset partitions,
   executable/model/configuration identities, research execution assumptions, reconciled portfolio
   accounting, immutable success/failure terminals, artifacts, cohorts and overfitting diagnostics.
-- The next barrier is closure review and integration of all three remediation lanes, followed by a
-  grouped review of that exact integrated Quarter 3 head and one clean
-  `CARGO_INCREMENTAL=0 ./scripts/verify.sh` run. Tasks 15/17 remain open until that evidence passes;
+- The next barrier is remediation, closure review, and integration of the two rejected model and
+  backtest candidates, followed by a grouped review of that exact integrated Quarter 3 head and one
+  clean `CARGO_INCREMENTAL=0 ./scripts/verify.sh` run. Tasks 15/17 remain open until that evidence
+  passes;
   focused lane gates and prior release artifacts do not substitute for the checkpoint.
 
 - Task 12 owner: GitHub issue `#17`, Project 5, status `Done`.
@@ -220,8 +227,14 @@ application size.
   worktree/remote metadata. The three protected stashes, `bundle-backup`, main/release branches and
   Dependabot branches remain. At that closeout boundary, `.worktrees` was empty; the three active
   Quarter 3 remediation worktrees were created afterward.
+- Integrated the independently accepted fair-value evidence-authority series through release head
+  `6c114c7`, pushed it, removed 5,496 generated files and 3.4 GiB from its target, removed the clean
+  `.worktrees/fair-value-evidence-authority` worktree, deleted the patch-equivalent local feature
+  branch, confirmed no matching origin branch existed, and pruned worktree/remote metadata. The
+  model-runtime and backtest-experiment-integrity worktrees remain active and deliberately
+  preserved while their rejected closure findings are remediated.
 
-The next delivery event is closure review and integration of the three active Quarter 3 remediation
+The next delivery event is closure review and integration of the two active Quarter 3 remediation
 lanes, then one grouped exact-head rereview and one full gate. If those pass, issues `#20` and `#22`
 can close and Tasks 19, 19A and 20 begin. Integrated Tasks 13–18 do not claim that the Market Squawk
 product release is complete.

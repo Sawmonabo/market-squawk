@@ -449,9 +449,12 @@ merged local branch, and remote metadata were removed.
 Tasks 13–18 reached pre-status capability-code head `daf183a` on
 `release/market-squawk-v0.1.0`. That durable milestone is not the moving release-branch head; obtain
 the current exact head from Git and pull request `#26`. The frozen grouped review rejected the
-candidate with thirteen Important findings. Three focused remediation lanes are active for model
-runtime, backtest/portfolio experiment integrity, and fair-value evidence authority. Closure review,
-integration, one grouped exact-head rereview, and one clean
+candidate with thirteen Important findings. Fair-value evidence-authority remediation passed its
+independent exact-candidate closure review and is integrated through release head `6c114c7`; its
+generated target, clean worktree, and patch-equivalent local branch were removed after push. The
+model-runtime and backtest/portfolio closure reviews rejected their first remediation candidates
+with four and two additional Important findings respectively, and both focused worktrees remain
+active for correction. Closure review, integration, one grouped exact-head rereview, and one clean
 `CARGO_INCREMENTAL=0 ./scripts/verify.sh` run remain before Tasks 15 and 17 can close.
 
 Task 15 provides required zero-service ONNX inference through the self-contained Rust
@@ -477,9 +480,11 @@ authority. Task 18 retains the accepted fair-value closeout above.
 
 The earlier model-containment lane rebased with an exact 1:1 range-diff, fast-forwarded, and closed
 cleanly. Its 7.1 GiB target, worktree and merged local branch were removed; no matching origin branch
-existed. Three new product-named remediation worktrees are now active and must be cleaned only after
-their exact commits are accepted and integrated. The three protected stashes and `bundle-backup`
-remain. The root target remains generated cache only and must be cleaned immediately before the
-planned Quarter 3 full gate. The canonical plan defines the final delivery quarter as Tasks 19, 19A
-and 20, preserves the descriptor-driven shared CLI/MCP architecture, adds the evidence-bound local
-onboarding portal, and rejects redundant standalone test executables and checker scripts.
+existed. Of the three subsequent product-named remediation worktrees, the fair-value lane is now
+accepted, integrated, pushed, and removed; the model-runtime and backtest-experiment-integrity
+worktrees remain active until their exact commits are accepted and integrated. The three protected
+stashes and `bundle-backup` remain. The root target remains generated cache only and must be cleaned
+immediately before the planned Quarter 3 full gate. The canonical plan defines the final delivery
+quarter as Tasks 19, 19A and 20, preserves the descriptor-driven shared CLI/MCP architecture, adds
+the evidence-bound local onboarding portal, and rejects redundant standalone test executables and
+checker scripts.
